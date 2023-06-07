@@ -139,8 +139,9 @@ function HologrindJediManager:awardJediStatusAndSkill(pCreatureObject)
 		return
 	end
 
-	awardSkill(pCreatureObject, "force_title_jedi_novice")
-	PlayerObject(pGhost):setJediState(1)
+	-- awardSkill(pCreatureObject, "force_title_jedi_novice")
+	awardSkill(pCreatureObject, "jedi_padawan_novice")
+	PlayerObject(pGhost):setJediState(2)
 end
 
 -- Check if the player has mastered all hologrind professions and send sui window and award skills.
