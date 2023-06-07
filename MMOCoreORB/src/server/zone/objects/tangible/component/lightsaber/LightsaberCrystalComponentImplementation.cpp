@@ -282,7 +282,7 @@ void LightsaberCrystalComponentImplementation::fillAttributeList(AttributeListMe
 	}
 
 	PlayerObject* player = object->getPlayerObject();
-	if (object->hasSkill("force_title_jedi_rank_01") || object->hasSkill("jedi_padawan_novice") || player->isPrivileged()) {
+	if (player->hasSkill("force_title_jedi_rank_01") || player->hasSkill("jedi_padawan_novice") || player->isPrivileged()) {
 		if (ownerID == 0) {
 			StringBuffer str;
 			str << "\\#pcontrast2 UNTUNED";

@@ -127,7 +127,8 @@ end
 -- @param pCreatureObject pointer to the creature object of the player who unlocked jedi.
 function HologrindJediManager:sendSuiWindow(pCreatureObject)
 	local suiManager = LuaSuiManager()
-	suiManager:sendMessageBox(pCreatureObject, pCreatureObject, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone...", "@ok", "HologrindJediManager", "notifyOkPressed")
+	--suiManager:sendMessageBox(pCreatureObject, pCreatureObject, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone...", "@ok", "HologrindJediManager", "notifyOkPressed")
+	suiManager:sendMessageBox(pCreatureObject, pCreatureObject, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone... Make sure to drop all skills before meditating.", "@ok", "HologrindJediManager", "notifyOkPressed")
 end
 
 -- Award skill and jedi status to the player.
@@ -140,8 +141,8 @@ function HologrindJediManager:awardJediStatusAndSkill(pCreatureObject)
 	end
 
 	-- awardSkill(pCreatureObject, "force_title_jedi_novice")
-	awardSkill(pCreatureObject, "jedi_padawan_novice")
-	PlayerObject(pGhost):setJediState(2)
+	--awardSkill(pCreatureObject, "jedi_padawan_novice")
+	--PlayerObject(pGhost):setJediState(2)
 end
 
 -- Check if the player has mastered all hologrind professions and send sui window and award skills.
