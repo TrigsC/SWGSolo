@@ -282,7 +282,7 @@ void LightsaberCrystalComponentImplementation::fillAttributeList(AttributeListMe
 	}
 
 	PlayerObject* player = object->getPlayerObject();
-	if (player->hasSkill("force_title_jedi_rank_01") || player->hasSkill("jedi_padawan_novice") || player->isPrivileged()) {
+	if (object->hasSkill("force_title_jedi_rank_01") || object->hasSkill("jedi_padawan_novice") || player->isPrivileged()) {
 		if (ownerID == 0) {
 			StringBuffer str;
 			str << "\\#pcontrast2 UNTUNED";
@@ -427,6 +427,7 @@ void LightsaberCrystalComponentImplementation::tuneCrystal(CreatureObject* playe
 
 		ownerID = player->getObjectID();
 		ownerName = player->getDisplayedName();
+		info(true) << "OwnerID: " << ownerID << " OwnerName: " << ownerName;
 
 		// Color code is lime green.
 		String tuneName = StringIdManager::instance()->getStringId(objectName.getFullPath().hashCode()).toString();
