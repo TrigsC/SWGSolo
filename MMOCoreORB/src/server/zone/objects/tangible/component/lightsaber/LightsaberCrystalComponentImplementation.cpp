@@ -402,9 +402,9 @@ bool LightsaberCrystalComponentImplementation::hasPlayerAsParent(CreatureObject*
 }
 
 void LightsaberCrystalComponentImplementation::tuneCrystal(CreatureObject* player) {
-	if(!player->hasSkill("force_title_jedi_rank_01") || !player->hasSkill("jedi_padawan_novice") || !hasPlayerAsParent(player)) {
-		return;
-	}
+	//if(!player->hasSkill("force_title_jedi_rank_01") || !player->hasSkill("jedi_padawan_novice") || !hasPlayerAsParent(player)) {
+	//	return;
+	//}
 
 	if (getColor() == 31) {
 		ManagedReference<PlayerObject*> ghost = player->getPlayerObject();
