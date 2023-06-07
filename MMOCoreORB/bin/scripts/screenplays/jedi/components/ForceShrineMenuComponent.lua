@@ -8,7 +8,7 @@ function ForceShrineMenuComponent:fillObjectMenuResponse(pSceneObject, pMenuResp
 	end
 
 	-- Hologrind
-	if (CreatureObject(pPlayer):hasSkill("jedi_padawan_novice")) then
+	if (CreatureObject(pPlayer):hasSkill("jedi_padawan")) then
 		menuResponse:addRadialMenuItem(120, 3, "@jedi_trials:meditate") -- Meditate
 	end
 
