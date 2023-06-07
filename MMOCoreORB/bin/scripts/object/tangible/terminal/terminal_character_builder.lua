@@ -1582,7 +1582,8 @@ object_tangible_terminal_terminal_character_builder = object_tangible_terminal_s
 			"Jedi Items",
 			{
 				"Color Crystal", "color_crystals",
-				"Krayt Pearl", "krayt_pearls"
+				"Krayt Pearl", "krayt_pearls",
+				"Jedi Holocron", "object/tangible/jedi/jedi_holocron_light.iff"
 			},
 			--"Attachments",
 			--{
