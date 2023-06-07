@@ -23,7 +23,7 @@ function ForceShrineMenuComponent:handleObjectMenuSelect(pObject, pPlayer, selec
 		return 0
 	end
 
-	if (selectedID == 120 and CreatureObject(pPlayer):hasSkill("force_title_jedi_novice")) then
+	if (selectedID == 120 and (CreatureObject(pPlayer):hasSkill("force_title_jedi_novice") or CreatureObject(pPlayer):hasSkill("jedi_padawan"))) then
 		if (CreatureObject(pPlayer):getPosture() ~= CROUCHED) then
 			CreatureObject(pPlayer):sendSystemMessage("@jedi_trials:show_respect") -- Must respect
 		else
