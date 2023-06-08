@@ -408,7 +408,7 @@ bool PlayerCreationManager::createCharacter(ClientCreateCharacterCallback* callb
 	Locker playerLocker(playerCreature);
 
 	playerCreature->createChildObjects();
-	playerCreature->setHeight(height);
+	playerCreature->setHeight(height/2);
 	playerCreature->setCustomObjectName(characterName, false); //TODO: Validate with Name Manager.
 
 	client->setPlayer(playerCreature);
