@@ -75,19 +75,19 @@ end
 -- Register observer on the player for observing badge awards.
 -- @param pPlayer pointer to the creature object of the player to register observers on.
 function Glowing:registerObservers(pPlayer)
-	--dropObserver(BADGEAWARDED, "Glowing", "badgeAwardedEventHandler", pPlayer)
-	--createObserver(BADGEAWARDED, "Glowing", "badgeAwardedEventHandler", pPlayer)
+	dropObserver(BADGEAWARDED, "Glowing", "badgeAwardedEventHandler", pPlayer)
+	createObserver(BADGEAWARDED, "Glowing", "badgeAwardedEventHandler", pPlayer)
 end
 
 -- Handling of the onPlayerLoggedIn event. The progression of the player will be checked and observers will be registered.
 -- @param pPlayer pointer to the creature object of the player who logged in.
 function Glowing:onPlayerLoggedIn(pPlayer)
-	--if not self:isGlowing(pPlayer) then
+	if not self:isGlowing(pPlayer) then
 	--	if self:hasRequiredBadgeCount(pPlayer) then
 	--		VillageJediManagerCommon.setJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
 	--		FsIntro:startPlayerOnIntro(pPlayer)
 	--	else
-	--		self:registerObservers(pPlayer)
+		self:registerObservers(pPlayer)
 	--	end
 	--end
 end

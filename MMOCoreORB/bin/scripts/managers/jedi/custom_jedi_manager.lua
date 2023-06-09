@@ -84,6 +84,11 @@ function CustomJediManager:awardJediStatusAndSkill(pCreatureObject)
 	PlayerObject(pGhost):setJediState(1)
 end
 
+-- Sui window ok pressed callback function.
+function HologrindJediManager:notifyOkPressed()
+    -- Do nothing.
+end
+
 -- Send a sui window to the player about unlocking jedi and award jedi status and force sensitive skill.
 -- @param pCreatureObject pointer to the creature object of the player who unlocked jedi.
 function CustomJediManager:sendSuiWindow(pCreatureObject)
@@ -95,7 +100,7 @@ end
 -- Register observer on the player for observing badge awards.
 -- @param pCreatureObject pointer to the creature object of the player to register observers on.
 function CustomJediManager:registerObservers(pCreatureObject)
-    dropObserver(BADGEAWARDED, "CustomJediManager", "badgeAwardedEventHandler", pCreatureObject)
+    --dropObserver(BADGEAWARDED, "CustomJediManager", "badgeAwardedEventHandler", pCreatureObject)
 	createObserver(BADGEAWARDED, "CustomJediManager", "badgeAwardedEventHandler", pCreatureObject)
 end
 
@@ -108,10 +113,12 @@ function CustomJediManager:onPlayerLoggedIn(pPlayer)
     CreatureObject(pCreatureObject):clearBuffs(true, false)
 	CreatureObject(pCreatureObject):enhanceCharacter()
 
+    Glowing:onPlayerLoggedIn(pPlayer)
+
     --Glowing:onPlayerLoggedIn(pPlayer)
     self:registerObservers(pCreatureObject)
 
-	--Glowing:onPlayerLoggedIn(pPlayer)
+	
 
 	--if (CustomJediManagerCommon.isVillageEligible(pPlayer) and not CreatureObject(pPlayer):hasSkill("force_title_jedi_novice")) then
 	--	awardSkill(pPlayer, "force_title_jedi_novice")
