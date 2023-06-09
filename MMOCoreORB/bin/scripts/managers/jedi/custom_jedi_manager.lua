@@ -22,10 +22,11 @@ function CustomJediManager:useItem(pSceneObject, itemType, pPlayer)
 		return
 	end
 
-	--Logger:log("useItem called with item type " .. itemType, LT_INFO)
-	--if itemType == ITEMHOLOCRON then
-	--	CustomJediManagerHolocron.useHolocron(pSceneObject, pPlayer)
-	--end
+	Logger:log("useItem called with item type " .. itemType, LT_INFO)
+	if itemType == ITEMHOLOCRON then
+        self:sendSuiWindow(pCreatureObject)
+		--CustomJediManagerHolocron.useHolocron(pSceneObject, pPlayer)
+	end
 	--if itemType == ITEMWAYPOINTDATAPAD then
 	--	SithShadowEncounter:useWaypointDatapad(pSceneObject, pPlayer)
 	--end
