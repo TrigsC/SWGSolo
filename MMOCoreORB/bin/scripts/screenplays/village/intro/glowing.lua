@@ -62,8 +62,11 @@ function Glowing:badgeAwardedEventHandler(pPlayer, pPlayer2, badgeNumber)
 	if (pPlayer == nil) then
 		return 0
 	end
+	local pGhost = CreatureObject(pPlayer):getPlayerObject()
 
 	if self:hasRequiredBadgeCount(pPlayer) and not CreatureObject(pPlayer):hasSkill("force_title_jedi_novice") then
+		awardSkill(pPlayer, "force_title_jedi_novice")
+		PlayerObject(pGhost):setJediState(1)
 		--VillageJediManagerCommon.setJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
 		--FsIntro:startPlayerOnIntro(pPlayer)
 		return 1

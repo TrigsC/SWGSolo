@@ -44,6 +44,11 @@ function CustomJediManager:useItem(pSceneObject, itemType, pPlayer)
 	end
 end
 
+-- Sui window ok pressed callback function.
+function CustomJediManager:notifyOkPressed()
+    -- Do nothing.
+end
+
 -- Send a sui window to the player about unlocking jedi and award jedi status and force sensitive skill.
 -- @param pCreatureObject pointer to the creature object of the player who unlocked jedi.
 function CustomJediManager:sendSuiWindow(pPlayer)
@@ -51,3 +56,17 @@ function CustomJediManager:sendSuiWindow(pPlayer)
 	--suiManager:sendMessageBox(pCreatureObject, pCreatureObject, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone...", "@ok", "HologrindJediManager", "notifyOkPressed")
 	suiManager:sendMessageBox(pPlayer, pPlayer, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone... Make sure to drop all skills before meditating.", "@ok", "CustomJediManager", "notifyOkPressed")
 end
+
+-- Handling of the checkForceStatus command.
+-- @param pPlayer pointer to the creature object of the player who performed the command
+function CustomJediManager:checkForceStatusCommand(pPlayer)
+	if (pPlayer == nil) then
+		return
+	end
+
+	Glowing:checkForceStatusCommand(pPlayer)
+end
+
+registerScreenPlay("CustomJediManager", true)
+
+return CustomJediManager
