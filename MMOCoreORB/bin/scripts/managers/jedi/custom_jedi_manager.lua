@@ -52,7 +52,7 @@ end
 -- Send a sui window to the player about unlocking jedi and award jedi status and force sensitive skill.
 -- @param pCreatureObject pointer to the creature object of the player who unlocked jedi.
 function CustomJediManager:sendSuiWindow(pPlayer)
-    local pGhost = CreatureObject(pCreatureObject):getPlayerObject()
+    local pGhost = CreatureObject(pPlayer):getPlayerObject()
 	local suiManager = LuaSuiManager()
 	--suiManager:sendMessageBox(pCreatureObject, pCreatureObject, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone...", "@ok", "HologrindJediManager", "notifyOkPressed")
 	suiManager:sendMessageBox(pPlayer, pPlayer, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone... Make sure to drop all skills before meditating.", "@ok", "CustomJediManager", "notifyOkPressed")
