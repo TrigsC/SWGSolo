@@ -6,7 +6,7 @@
 #include "server/zone/managers/director/DirectorManager.h"
 
 JediManager::JediManager() : Logger("JediManager") {
-	jediProgressionType = CUSTOMJEDIPROGRESSION;
+	jediProgressionType = NOJEDIPROGRESSION;
 	setJediManagerName("JediManager");
 }
 
