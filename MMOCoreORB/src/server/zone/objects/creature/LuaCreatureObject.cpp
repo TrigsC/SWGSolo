@@ -757,6 +757,17 @@ int LuaCreatureObject::addBankCredits(lua_State* L) {
 	return 0;
 }
 
+int LuaCreatureObject::clearBuffs(lua_State* L) {
+	bool updateClient = lua_toboolean(L, -1);
+	bool removeAll = lua_toboolean(L, -2);
+
+	Locker locker(realObject);
+
+	realObject->clearBuffs(updateClient, removeAll);
+
+	return 0;
+}
+
 int LuaCreatureObject::isAiAgent(lua_State* L) {
 	bool val = realObject->isAiAgent();
 
