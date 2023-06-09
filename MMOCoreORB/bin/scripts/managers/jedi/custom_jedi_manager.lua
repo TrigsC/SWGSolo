@@ -67,6 +67,22 @@ function CustomJediManager:checkForceStatusCommand(pPlayer)
 	Glowing:checkForceStatusCommand(pPlayer)
 end
 
+--Check to ensure force skill prerequisites are maintained
+function CustomJediManager:canSurrenderSkill(pPlayer, skillName)
+
+	if skillName == "force_title_jedi_rank_02" or skillName == "force_title_jedi_novice" then
+		CreatureObject(pPlayer):sendSystemMessage("@jedi_spam:revoke_force_title")
+		return false
+	end
+
+	return true
+end
+
+--Check for force skill prerequisites
+function CustomJediManager:canLearnSkill(pPlayer, skillName)
+	return true
+end
+
 registerScreenPlay("CustomJediManager", true)
 
 return CustomJediManager
