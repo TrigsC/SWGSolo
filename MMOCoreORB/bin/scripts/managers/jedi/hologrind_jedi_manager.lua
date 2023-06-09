@@ -181,8 +181,7 @@ function HologrindJediManager:onPlayerLoggedIn(pCreatureObject)
 	if (pCreatureObject == nil) then
 		return
 	end
-	local pGhost = CreatureObject(pCreatureObject):getPlayerObject()
-	PlayerObject(pGhost):clearBuffs(true, false)
+	CreatureObject(pCreatureObject):clearBuffs(true, false)
 	CreatureObject(pCreatureObject):enhanceCharacter()
 
 	self:checkIfProgressedToJedi(pCreatureObject)
