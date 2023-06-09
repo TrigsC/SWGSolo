@@ -3,11 +3,11 @@ local Logger = require("utils.logger")
 
 Glowing = ScreenPlay:new {
 	requiredBadges = {
-		{ type = "exploration_jedi", amount = 3 },
-		{ type = "exploration_dangerous", amount = 2 },
-		{ type = "exploration_easy", amount = 5 },
-		{ type = "master", amount = 1 },
-		{ type = "content", amount = 5 },
+		{ type = "exploration_jedi", amount = 1 },
+		--{ type = "exploration_dangerous", amount = 2 },
+		--{ type = "exploration_easy", amount = 5 },
+		--{ type = "master", amount = 1 },
+		--{ type = "content", amount = 5 },
 	}
 }
 
@@ -48,7 +48,9 @@ end
 -- Check if the player is glowing or not.
 -- @param pPlayer pointer to the creature object of the player.
 function Glowing:isGlowing(pPlayer)
-	return VillageJediManagerCommon.hasJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
+	awardSkill(pCreatureObject, "force_title_jedi_novice")
+	PlayerObject(pGhost):setJediState(1)
+	return --VillageJediManagerCommon.hasJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
 end
 
 -- Event handler for the BADGEAWARDED event.
@@ -62,8 +64,8 @@ function Glowing:badgeAwardedEventHandler(pPlayer, pPlayer2, badgeNumber)
 	end
 
 	if self:hasRequiredBadgeCount(pPlayer) and not CreatureObject(pPlayer):hasSkill("force_title_jedi_novice") then
-		VillageJediManagerCommon.setJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
-		FsIntro:startPlayerOnIntro(pPlayer)
+		--VillageJediManagerCommon.setJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
+		--FsIntro:startPlayerOnIntro(pPlayer)
 		return 1
 	end
 
@@ -73,21 +75,21 @@ end
 -- Register observer on the player for observing badge awards.
 -- @param pPlayer pointer to the creature object of the player to register observers on.
 function Glowing:registerObservers(pPlayer)
-	dropObserver(BADGEAWARDED, "Glowing", "badgeAwardedEventHandler", pPlayer)
-	createObserver(BADGEAWARDED, "Glowing", "badgeAwardedEventHandler", pPlayer)
+	--dropObserver(BADGEAWARDED, "Glowing", "badgeAwardedEventHandler", pPlayer)
+	--createObserver(BADGEAWARDED, "Glowing", "badgeAwardedEventHandler", pPlayer)
 end
 
 -- Handling of the onPlayerLoggedIn event. The progression of the player will be checked and observers will be registered.
 -- @param pPlayer pointer to the creature object of the player who logged in.
 function Glowing:onPlayerLoggedIn(pPlayer)
-	if not self:isGlowing(pPlayer) then
-		if self:hasRequiredBadgeCount(pPlayer) then
-			VillageJediManagerCommon.setJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
-			FsIntro:startPlayerOnIntro(pPlayer)
-		else
-			self:registerObservers(pPlayer)
-		end
-	end
+	--if not self:isGlowing(pPlayer) then
+	--	if self:hasRequiredBadgeCount(pPlayer) then
+	--		VillageJediManagerCommon.setJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
+	--		FsIntro:startPlayerOnIntro(pPlayer)
+	--	else
+	--		self:registerObservers(pPlayer)
+	--	end
+	--end
 end
 
 -- Handling of the checkForceStatus command.
