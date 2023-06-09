@@ -97,6 +97,7 @@ Luna<LuaCreatureObject>::RegType LuaCreatureObject::Register[] = {
 		{ "subtractBankCredits", &LuaCreatureObject::subtractBankCredits},
 		{ "addCashCredits", &LuaCreatureObject::addCashCredits},
 		{ "addBankCredits", &LuaCreatureObject::addBankCredits},
+		{ "clearBuffs", &LuaCreatureObject::clearBuffs},
 		{ "removeScreenPlayState", &LuaCreatureObject::removeScreenPlayState},
 		{ "isGrouped", &LuaCreatureObject::isGrouped},
 		{ "isGroupedWith", &LuaCreatureObject::isGroupedWith},
