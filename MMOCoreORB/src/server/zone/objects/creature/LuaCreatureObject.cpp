@@ -98,6 +98,8 @@ Luna<LuaCreatureObject>::RegType LuaCreatureObject::Register[] = {
 		{ "addCashCredits", &LuaCreatureObject::addCashCredits},
 		{ "addBankCredits", &LuaCreatureObject::addBankCredits},
 		{ "clearBuffs", &LuaCreatureObject::clearBuffs},
+		{ "setHeight", &LuaCreatureObject::setHeight},
+		{ "getHeight", &LuaCreatureObject::getHeight},
 		{ "removeScreenPlayState", &LuaCreatureObject::removeScreenPlayState},
 		{ "isGrouped", &LuaCreatureObject::isGrouped},
 		{ "isGroupedWith", &LuaCreatureObject::isGroupedWith},
@@ -766,6 +768,25 @@ int LuaCreatureObject::clearBuffs(lua_State* L) {
 	realObject->clearBuffs(updateClient, removeAll);
 
 	return 0;
+}
+
+int LuaCreatureObject::setHeight(lua_State* L) {
+	float height = lua_toboolean(L, -1);
+	bool notifyClient = lua_toboolean(L, -2);
+
+	Locker locker(realObject);
+
+	realObject->clearBuffs(height, notifyClient);
+
+	return 0;
+}
+
+int LuaCreatureObject::getHeight(lua_State* L) {
+	float heightID = realObject->getHeight();
+
+	lua_pushinteger(L, heightID);
+
+	return 1;
 }
 
 int LuaCreatureObject::isAiAgent(lua_State* L) {
