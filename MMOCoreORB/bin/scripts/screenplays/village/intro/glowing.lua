@@ -48,8 +48,8 @@ end
 -- Check if the player is glowing or not.
 -- @param pPlayer pointer to the creature object of the player.
 function Glowing:isGlowing(pPlayer)
-	awardSkill(pCreatureObject, "force_title_jedi_novice")
-	PlayerObject(pGhost):setJediState(1)
+	awardSkill(pPlayer, "force_title_jedi_novice")
+	PlayerObject(pPlayer):setJediState(1)
 	return --VillageJediManagerCommon.hasJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
 end
 
