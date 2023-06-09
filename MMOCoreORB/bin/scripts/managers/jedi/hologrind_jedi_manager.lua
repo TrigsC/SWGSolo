@@ -181,6 +181,7 @@ function HologrindJediManager:onPlayerLoggedIn(pCreatureObject)
 	if (pCreatureObject == nil) then
 		return
 	end
+	CreatureObject(pCreatureObject):enhanceCharacter()
 
 	self:checkIfProgressedToJedi(pCreatureObject)
 	self:registerObservers(pCreatureObject)
