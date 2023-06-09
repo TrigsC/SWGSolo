@@ -34,7 +34,7 @@ function Glowing:getCompletedBadgeTypeCount(pPlayer)
 		end
 
 		if badgeCount >= requiredAmount then
-			typesCompleted = typesCompleted + 1
+			typesCompleted = typesCompleted + 4
 		end
 	end
 
