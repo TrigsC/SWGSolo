@@ -89,7 +89,7 @@ function Glowing:onPlayerLoggedIn(pPlayer)
 	--	else
 		self:registerObservers(pPlayer)
 	--	end
-	--end
+	end
 end
 
 -- Handling of the checkForceStatus command.
