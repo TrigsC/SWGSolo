@@ -776,7 +776,7 @@ int LuaCreatureObject::setHeight(lua_State* L) {
 
 	Locker locker(realObject);
 
-	realObject->clearBuffs(height, notifyClient);
+	realObject->setHeight(height, notifyClient);
 
 	return 0;
 }
@@ -784,7 +784,7 @@ int LuaCreatureObject::setHeight(lua_State* L) {
 int LuaCreatureObject::getHeight(lua_State* L) {
 	float heightID = realObject->getHeight();
 
-	lua_pushinteger(L, heightID);
+	lua_pushnumber(L, heightID);
 
 	return 1;
 }
