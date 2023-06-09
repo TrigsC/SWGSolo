@@ -12,7 +12,7 @@ if _TEST then
 end
 
 --jediProgressionType = VILLAGEJEDIPROGRESSION
-jediProgressionType = HOLOGRINDJEDIPROGRESSION
+jediProgressionType = CUSTOMJEDIPROGRESSION
 
 jediManagerName = "JediManager"
 
