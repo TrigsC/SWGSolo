@@ -6,8 +6,6 @@ jediManagerName = "CustomJediManager"
 
 NOTINABUILDING = 0
 
-NUMBEROFTREESTOMASTER = 6
-
 CustomJediManager = JediManager:new {
 	screenplayName = jediManagerName,
 	jediManagerName = jediManagerName,
@@ -85,7 +83,7 @@ function CustomJediManager:awardJediStatusAndSkill(pCreatureObject)
 end
 
 -- Sui window ok pressed callback function.
-function HologrindJediManager:notifyOkPressed()
+function CustomJediManager:notifyOkPressed()
     -- Do nothing.
 end
 
