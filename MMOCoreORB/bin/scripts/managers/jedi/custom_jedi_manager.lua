@@ -29,36 +29,36 @@ end
 -- @param pCreatureObject2 pointer to the creature object of the player who was awarded with a badge.
 -- @param badgeNumber the badge number that was awarded.
 -- @return 0 to keep the observer active.
-function CustomJediManager:badgeAwardedEventHandler(pCreatureObject, pCreatureObject2, badgeNumber)
-	if (pCreatureObject == nil) then
+function CustomJediManager:badgeAwardedEventHandler(pPlayer, pPlayer2, badgeNumber)
+	if (pPlayer == nil) then
 		return 0
 	end
 
-	self:checkIfProgressedToJedi(pCreatureObject)
+	self:checkIfProgressedToJedi(pPlayer)
 
 	return 0
 end
 
 -- Check if the player has mastered all hologrind professions and send sui window and award skills.
 -- @param pCreatureObject pointer to the creature object of the player to check the jedi progression on.
-function CustomJediManager:checkIfProgressedToJedi(pCreatureObject)
-    if Glowing:hasRequiredBadgeCount(pCreatureObject)
+function CustomJediManager:checkIfProgressedToJedi(pPlayer)
+    if Glowing:hasRequiredBadgeCount(pPlayer)
 	--if self:getNumberOfMasteredProfessions(pCreatureObject) >= NUMBEROFPROFESSIONSTOMASTER and not self:isJedi(pCreatureObject) then
-		self:sendSuiWindow(pCreatureObject)
-		self:awardJediStatusAndSkill(pCreatureObject)
+		self:sendSuiWindow(pPlayer)
+		self:awardJediStatusAndSkill(pPlayer)
 	end
 end
 
 -- Award skill and jedi status to the player.
 -- @param pCreatureObject pointer to the creature object of the player who unlocked jedi.
-function CustomJediManager:awardJediStatusAndSkill(pCreatureObject)
-	local pGhost = CreatureObject(pCreatureObject):getPlayerObject()
+function CustomJediManager:awardJediStatusAndSkill(pPlayer)
+	local pGhost = CreatureObject(pPlayer):getPlayerObject()
 
 	if (pGhost == nil) then
 		return
 	end
 
-	awardSkill(pCreatureObject, "force_title_jedi_novice")
+	awardSkill(pPlayer, "force_title_jedi_novice")
 	PlayerObject(pGhost):setJediState(1)
 end
 
