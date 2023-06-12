@@ -57,7 +57,7 @@ function CustomJediManager:sendSuiWindow(pPlayer)
 	--suiManager:sendMessageBox(pCreatureObject, pCreatureObject, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone...", "@ok", "HologrindJediManager", "notifyOkPressed")
 	suiManager:sendMessageBox(pPlayer, pPlayer, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone... Make sure to drop all skills before meditating.", "@ok", "CustomJediManager", "notifyOkPressed")
     --local currHeight = CreatureObject(pGhost):getHeight(pGhost)
-    CreatureObject(pGhost):setHeight()
+    CreatureObject(pGhost):setHeight(pPlayer)
 end
 
 -- Handling of the checkForceStatus command.
