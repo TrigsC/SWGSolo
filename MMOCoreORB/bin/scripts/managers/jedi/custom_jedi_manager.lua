@@ -40,6 +40,8 @@ function CustomJediManager:useItem(pSceneObject, itemType, pPlayer)
 	Logger:log("useItem called with item type " .. itemType, LT_INFO)
 	if itemType == ITEMHOLOCRON then
         self:sendSuiWindow(pPlayer)
+        local pGhost = CreatureObject(pPlayer):getPlayerObject()
+        CreatureObject(pGhost):setHeight(pPlayer)
 		--CustomJediManagerHolocron.useHolocron(pSceneObject, pPlayer)
 	end
 end
@@ -52,12 +54,12 @@ end
 -- Send a sui window to the player about unlocking jedi and award jedi status and force sensitive skill.
 -- @param pCreatureObject pointer to the creature object of the player who unlocked jedi.
 function CustomJediManager:sendSuiWindow(pPlayer)
-    local pGhost = CreatureObject(pPlayer):getPlayerObject()
+    --local pGhost = CreatureObject(pPlayer):getPlayerObject()
 	local suiManager = LuaSuiManager()
 	--suiManager:sendMessageBox(pCreatureObject, pCreatureObject, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone...", "@ok", "HologrindJediManager", "notifyOkPressed")
 	suiManager:sendMessageBox(pPlayer, pPlayer, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone... Make sure to drop all skills before meditating.", "@ok", "CustomJediManager", "notifyOkPressed")
     --local currHeight = CreatureObject(pGhost):getHeight(pGhost)
-    CreatureObject(pGhost):setHeight(pPlayer)
+    --CreatureObject(pGhost):setHeight(pPlayer)
 end
 
 -- Handling of the checkForceStatus command.
