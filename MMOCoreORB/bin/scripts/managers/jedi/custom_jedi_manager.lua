@@ -56,8 +56,8 @@ function CustomJediManager:sendSuiWindow(pPlayer)
 	local suiManager = LuaSuiManager()
 	--suiManager:sendMessageBox(pCreatureObject, pCreatureObject, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone...", "@ok", "HologrindJediManager", "notifyOkPressed")
 	suiManager:sendMessageBox(pPlayer, pPlayer, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone... Make sure to drop all skills before meditating.", "@ok", "CustomJediManager", "notifyOkPressed")
-    local currHeight = CreatureObject(pGhost):getHeight(pGhost)
-    CreatureObject(pGhost):setHeight(currHeight*1.5, true)
+    --local currHeight = CreatureObject(pGhost):getHeight(pGhost)
+    CreatureObject(pGhost):setHeight()
 end
 
 -- Handling of the checkForceStatus command.

@@ -770,15 +770,42 @@ int LuaCreatureObject::clearBuffs(lua_State* L) {
 	return 0;
 }
 
+//int LuaCreatureObject::setHeight(lua_State* L) {
+//	CreatureObject* player = (CreatureObject*) lua_touserdata(L, -1);
+//
+//	if (realObject == nullptr)
+//		return 0;
+//
+//	float height = lua_toboolean(L, -1);
+//	bool notifyClient = lua_toboolean(L, -2);
+//
+//	Locker locker(realObject);
+//
+//	realObject->setHeight(height, notifyClient);
+//
+//	return 0;
+//}
+
 int LuaCreatureObject::setHeight(lua_State* L) {
-	float height = lua_toboolean(L, -1);
-	bool notifyClient = lua_toboolean(L, -2);
+	
+	CreatureObject* player = (CreatureObject*) lua_touserdata(L, -1);
 
-	Locker locker(realObject);
+	if (realObject == nullptr)
+		return 0;
+	
+	if (player != nullptr) {
+		heightID = player->getHeight();
+	}
 
-	realObject->setHeight(height, notifyClient);
+	//float height = lua_toboolean(L, -1);
+	//bool notifyClient = lua_toboolean(L, -2);
 
-	return 0;
+	//Locker locker(realObject);
+	//player->setHeight(height*1.5, notifyClient);
+	Locker locker(player);
+	player->setHeight(heightID*1.5, false);
+
+	return 1;
 }
 
 int LuaCreatureObject::getHeight(lua_State* L) {
