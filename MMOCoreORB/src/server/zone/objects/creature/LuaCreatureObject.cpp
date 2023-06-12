@@ -793,7 +793,7 @@ int LuaCreatureObject::setHeight(lua_State* L) {
 	if (realObject == nullptr)
 		return 0;
 	
-	float heightID = 0.0
+	float heightID = 0.0;
 	
 	if (player != nullptr) {
 		heightID = player->getHeight();
