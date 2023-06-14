@@ -40,8 +40,9 @@ function CustomJediManager:useItem(pSceneObject, itemType, pPlayer)
 	Logger:log("useItem called with item type " .. itemType, LT_INFO)
 	if itemType == ITEMHOLOCRON then
         self:sendSuiWindow(pPlayer)
-        local pGhost = CreatureObject(pPlayer):getPlayerObject()
-        CreatureObject(pGhost):setHeight(pPlayer)
+        PlayerObject(pPlayer):setHeight(pPlayer)
+        --local pGhost = CreatureObject(pPlayer):getPlayerObject()
+        --CreatureObject(pGhost):setHeight(pPlayer)
 		--CustomJediManagerHolocron.useHolocron(pSceneObject, pPlayer)
 	end
 end
