@@ -760,6 +760,11 @@ object_tangible_terminal_terminal_character_builder = object_tangible_terminal_s
 							"Oppressor I", "force_rank_dark_rank_08",
 							"Oppressor II", "force_rank_dark_rank_09"
 						},
+						"Council",
+						{
+							"The Council", "force_rank_dark_rank_10",
+							"Council Leader", "force_rank_dark_master"
+						},
 					},
 				
 					"Jedi Light Rank",
@@ -782,6 +787,11 @@ object_tangible_terminal_terminal_character_builder = object_tangible_terminal_s
 						{
 							"Arbiter I", "force_rank_light_rank_08",
 							"Arbiter II", "force_rank_light_rank_09"
+						},
+						"Council",
+						{
+							"The Council", "force_rank_light_rank_10",
+							"Council Leader", "force_rank_light_master"
 						},
 					},
 					},
