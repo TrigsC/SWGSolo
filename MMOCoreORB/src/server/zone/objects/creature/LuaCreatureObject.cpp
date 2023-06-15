@@ -99,7 +99,6 @@ Luna<LuaCreatureObject>::RegType LuaCreatureObject::Register[] = {
 		{ "addBankCredits", &LuaCreatureObject::addBankCredits},
 		{ "clearBuffs", &LuaCreatureObject::clearBuffs},
 		{ "setHeight", &LuaCreatureObject::setHeight},
-		//{ "getHeight", &LuaCreatureObject::getHeight},
 		{ "removeScreenPlayState", &LuaCreatureObject::removeScreenPlayState},
 		{ "isGrouped", &LuaCreatureObject::isGrouped},
 		{ "isGroupedWith", &LuaCreatureObject::isGroupedWith},
@@ -770,45 +769,6 @@ int LuaCreatureObject::clearBuffs(lua_State* L) {
 	return 0;
 }
 
-//int LuaCreatureObject::setHeight(lua_State* L) {
-//	CreatureObject* player = (CreatureObject*) lua_touserdata(L, -1);
-//
-//	if (realObject == nullptr)
-//		return 0;
-//
-//	float height = lua_toboolean(L, -1);
-//	bool notifyClient = lua_toboolean(L, -2);
-//
-//	Locker locker(realObject);
-//
-//	realObject->setHeight(height, notifyClient);
-//
-//	return 0;
-//}
-
-//int LuaCreatureObject::setLootRights(lua_State* L) {
-//	CreatureObject* player = (CreatureObject*) lua_touserdata(L, -1);
-//
-//	if (realObject == nullptr)
-//		return 0;
-//
-//	uint64 ownerID = 0;
-//
-//	if (player != nullptr) {
-//		ownerID = player->getObjectID();
-//	}
-//
-//	SceneObject* inventory = realObject->getSlottedObject("inventory");
-//
-//	if (inventory == nullptr)
-//		return 0;
-//
-//	Locker locker(inventory);
-//
-//	inventory->setContainerOwnerID(ownerID);
-//	return 1;
-//}
-
 int LuaCreatureObject::setHeight(lua_State* L) {
 	
 	CreatureObject* player = (CreatureObject*) lua_touserdata(L, -1);
@@ -821,29 +781,10 @@ int LuaCreatureObject::setHeight(lua_State* L) {
 	if (player != nullptr) {
 		heightID = player->getHeight();
 	}
-	realObject->info(heightID);
-
-	//SceneObject* inventory = realObject->getSlottedObject("inventory");
-
-	//float height = lua_toboolean(L, -1);
-	//bool notifyClient = lua_toboolean(L, -2);
-
-	//Locker locker(realObject);
-	//player->setHeight(height*1.5, notifyClient);
-
-	//Locker locker(realObject);
 	realObject->setHeight(heightID*1.5, true);
 
 	return 0;
 }
-
-//int LuaCreatureObject::getHeight(lua_State* L) {
-//	float heightID = realObject->getHeight();
-//
-//	lua_pushnumber(L, heightID);
-//
-//	return 1;
-//}
 
 int LuaCreatureObject::isAiAgent(lua_State* L) {
 	bool val = realObject->isAiAgent();
