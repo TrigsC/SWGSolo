@@ -832,7 +832,7 @@ int LuaCreatureObject::setHeight(lua_State* L) {
 	//player->setHeight(height*1.5, notifyClient);
 
 	//Locker locker(realObject);
-	realObject->setHeight(heightID*1.5, false);
+	realObject->setHeight(heightID*1.5, true);
 
 	return 0;
 }
