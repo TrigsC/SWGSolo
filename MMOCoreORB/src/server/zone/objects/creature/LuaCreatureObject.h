@@ -87,7 +87,7 @@ namespace creature {
 		int addBankCredits(lua_State* L);
 		int clearBuffs(lua_State* L);
 		int setHeight(lua_State* L);
-		int getHeight(lua_State* L);
+		//int getHeight(lua_State* L);
 		int removeScreenPlayState(lua_State* L);
 		int setLootRights(lua_State* L);
 		int isGrouped(lua_State* L);

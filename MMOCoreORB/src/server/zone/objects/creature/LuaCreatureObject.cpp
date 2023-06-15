@@ -99,7 +99,7 @@ Luna<LuaCreatureObject>::RegType LuaCreatureObject::Register[] = {
 		{ "addBankCredits", &LuaCreatureObject::addBankCredits},
 		{ "clearBuffs", &LuaCreatureObject::clearBuffs},
 		{ "setHeight", &LuaCreatureObject::setHeight},
-		{ "getHeight", &LuaCreatureObject::getHeight},
+		//{ "getHeight", &LuaCreatureObject::getHeight},
 		{ "removeScreenPlayState", &LuaCreatureObject::removeScreenPlayState},
 		{ "isGrouped", &LuaCreatureObject::isGrouped},
 		{ "isGroupedWith", &LuaCreatureObject::isGroupedWith},
@@ -812,10 +812,10 @@ int LuaCreatureObject::clearBuffs(lua_State* L) {
 int LuaCreatureObject::setHeight(lua_State* L) {
 	
 	CreatureObject* player = (CreatureObject*) lua_touserdata(L, -1);
-	Locker lock(realObject);
+	
 	if (realObject == nullptr)
 		return 0;
-	
+	Locker lock(realObject);
 	float heightID = 0.0;
 	
 	if (player != nullptr) {
@@ -830,20 +830,20 @@ int LuaCreatureObject::setHeight(lua_State* L) {
 
 	//Locker locker(realObject);
 	//player->setHeight(height*1.5, notifyClient);
-	
+
 	//Locker locker(realObject);
 	realObject->setHeight(heightID*1.5, false);
 
 	return 0;
 }
 
-int LuaCreatureObject::getHeight(lua_State* L) {
-	float heightID = realObject->getHeight();
-
-	lua_pushnumber(L, heightID);
-
-	return 1;
-}
+//int LuaCreatureObject::getHeight(lua_State* L) {
+//	float heightID = realObject->getHeight();
+//
+//	lua_pushnumber(L, heightID);
+//
+//	return 1;
+//}
 
 int LuaCreatureObject::isAiAgent(lua_State* L) {
 	bool val = realObject->isAiAgent();
