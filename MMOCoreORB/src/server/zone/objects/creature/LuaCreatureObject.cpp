@@ -786,10 +786,33 @@ int LuaCreatureObject::clearBuffs(lua_State* L) {
 //	return 0;
 //}
 
+//int LuaCreatureObject::setLootRights(lua_State* L) {
+//	CreatureObject* player = (CreatureObject*) lua_touserdata(L, -1);
+//
+//	if (realObject == nullptr)
+//		return 0;
+//
+//	uint64 ownerID = 0;
+//
+//	if (player != nullptr) {
+//		ownerID = player->getObjectID();
+//	}
+//
+//	SceneObject* inventory = realObject->getSlottedObject("inventory");
+//
+//	if (inventory == nullptr)
+//		return 0;
+//
+//	Locker locker(inventory);
+//
+//	inventory->setContainerOwnerID(ownerID);
+//	return 1;
+//}
+
 int LuaCreatureObject::setHeight(lua_State* L) {
 	
 	CreatureObject* player = (CreatureObject*) lua_touserdata(L, -1);
-
+	Locker lock(realObject);
 	if (realObject == nullptr)
 		return 0;
 	
@@ -798,13 +821,17 @@ int LuaCreatureObject::setHeight(lua_State* L) {
 	if (player != nullptr) {
 		heightID = player->getHeight();
 	}
+	realObject->info(heightID);
+
+	//SceneObject* inventory = realObject->getSlottedObject("inventory");
 
 	//float height = lua_toboolean(L, -1);
 	//bool notifyClient = lua_toboolean(L, -2);
 
 	//Locker locker(realObject);
 	//player->setHeight(height*1.5, notifyClient);
-	Locker locker(realObject);
+	
+	//Locker locker(realObject);
 	realObject->setHeight(heightID*1.5, false);
 
 	return 0;
