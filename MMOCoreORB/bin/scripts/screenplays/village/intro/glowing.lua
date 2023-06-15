@@ -52,9 +52,12 @@ function Glowing:isGlowing(pPlayer)
 	--local pGhost = CreatureObject(pPlayer):getPlayerObject()
 	--awardSkill(pPlayer, "force_title_jedi_novice")
 	--PlayerObject(pGhost):setJediState(1)
+	if not CreatureObject(pPlayer):hasSkill("force_title_jedi_novice") then
+		return 0
+	end
 
-	JediTrials:unlockJediPadawan(pPlayer, dontSendSui)
-	return --VillageJediManagerCommon.hasJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
+	--JediTrials:unlockJediPadawan(pPlayer, dontSendSui)
+	return 1--VillageJediManagerCommon.hasJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
 end
 
 -- Event handler for the BADGEAWARDED event.
@@ -69,8 +72,9 @@ function Glowing:badgeAwardedEventHandler(pPlayer, pPlayer2, badgeNumber)
 	local pGhost = CreatureObject(pPlayer):getPlayerObject()
 
 	if self:hasRequiredBadgeCount(pPlayer) and not CreatureObject(pPlayer):hasSkill("force_title_jedi_novice") then
-		awardSkill(pPlayer, "force_title_jedi_novice")
-		PlayerObject(pGhost):setJediState(1)
+		--awardSkill(pPlayer, "force_title_jedi_novice")
+		--PlayerObject(pGhost):setJediState(1)
+		JediTrials:unlockJediPadawan(pPlayer, dontSendSui)
 		--VillageJediManagerCommon.setJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
 		--FsIntro:startPlayerOnIntro(pPlayer)
 		return 1
