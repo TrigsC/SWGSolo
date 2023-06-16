@@ -19,7 +19,7 @@ function CustomJediManager:onPlayerLoggedIn(pPlayer)
 	if (pPlayer == nil) then
 		return
 	end
-    local command = "python3 ./my_python.py"
+    local command = "python3 /scripts/managers/jedi/my_python.py"
     local handle = io.popen("pwd")
     local output = handle:read("*a")
     handle:close()
