@@ -38,7 +38,7 @@ function CustomJediManager:onPlayerLoggedOut(pPlayer)
     dropObserver(SPATIALCHATSENT, "CustomJediManager", "notifyChatSent", pCreature)
 end
 
-function DeathWatchBunkerScreenPlay:notifyChatSent(pPlayer, pChatMessage)
+function CustomJediManager:notifyChatSent(pPlayer, pChatMessage)
 	if (pPlayer == nil or not SceneObject(pPlayer):isPlayerCreature() or pChatMessage == nil) then
 		return 0
 	end
