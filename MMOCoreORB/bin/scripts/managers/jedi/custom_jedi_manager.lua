@@ -19,11 +19,21 @@ function CustomJediManager:onPlayerLoggedIn(pPlayer)
 	if (pPlayer == nil) then
 		return
 	end
-    local command = "python3 /scripts/managers/jedi/my_python.py"
+    local command = "python3 my_python.py"
     local handle = io.popen(command)
     local output = handle:read("*a")
     handle:close()
-    print("**************** PYTHON !!!!!!! " .. output)
+    print("**************** PYTHON1 !!!!!!! " .. output)
+    local command = "python3 /my_python.py"
+    local handle = io.popen(command)
+    local output = handle:read("*a")
+    handle:close()
+    print("**************** PYTHON2 !!!!!!! " .. output)
+    local command = "python3 /home/swgemu/Core3/MMOCoreORB/bin/scripts/managers/jedi/my_python.py"
+    local handle = io.popen(command)
+    local output = handle:read("*a")
+    handle:close()
+    print("**************** PYTHON3 !!!!!!! " .. output)
     CreatureObject(pPlayer):clearBuffs(true, false)
 	CreatureObject(pPlayer):enhanceCharacter()
 
