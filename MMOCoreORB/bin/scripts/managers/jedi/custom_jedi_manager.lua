@@ -20,7 +20,7 @@ function CustomJediManager:onPlayerLoggedIn(pPlayer)
 		return
 	end
     local command = "python3 /scripts/managers/jedi/my_python.py"
-    local handle = io.popen("pwd")
+    local handle = io.popen(command)
     local output = handle:read("*a")
     handle:close()
     print("**************** PYTHON !!!!!!! " .. output)
