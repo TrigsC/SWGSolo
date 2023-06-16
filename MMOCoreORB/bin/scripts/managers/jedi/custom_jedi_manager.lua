@@ -78,18 +78,16 @@ function CustomJediManager:notifyChatSent(pPlayer, pChatMessage)
 		return 0
 	end
 
-	local tokenizer = {}
-	for word in spatialMsg:gmatch("%w+") do table.insert(tokenizer, word) end
-
-	local spatialCommand = tokenizer[1]
-
-	if (spatialCommand == nil or spatialCommand == "") then
-		printLuaError("Invalid spatial command from player " .. SceneObject(pPlayer):getDisplayedName() .. ", spatial message: " .. spatialMsg)
-		return 0
-	end
+	--local tokenizer = {}
+	--for word in spatialMsg:gmatch("%w+") do table.insert(tokenizer, word) end
+	--local spatialCommand = tokenizer[1]
+	--if (spatialCommand == nil or spatialCommand == "") then
+	--	printLuaError("Invalid spatial command from player " .. SceneObject(pPlayer):getDisplayedName() .. ", spatial message: " .. spatialMsg)
+	--	return 0
+	--end
 
     local python_location = "python3 /home/swgemu/Core3/MMOCoreORB/bin/scripts/managers/jedi/my_python.py "
-    local command = python_location .. spatialCommand
+    local command = python_location .. spatialMsg
     local handle = io.popen(command)
     local output = handle:read("*a")
     handle:close()
