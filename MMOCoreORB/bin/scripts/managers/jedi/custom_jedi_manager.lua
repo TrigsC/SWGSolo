@@ -19,28 +19,101 @@ function CustomJediManager:onPlayerLoggedIn(pPlayer)
 	if (pPlayer == nil) then
 		return
 	end
-    local command = "python3 my_python.py"
-    local handle = io.popen(command)
-    local output = handle:read("*a")
-    handle:close()
-    print("**************** PYTHON1 !!!!!!! " .. output)
-    local command = "python3 /my_python.py"
-    local handle = io.popen(command)
-    local output = handle:read("*a")
-    handle:close()
-    print("**************** PYTHON2 !!!!!!! " .. output)
-    local command = "python3 /home/swgemu/Core3/MMOCoreORB/bin/scripts/managers/jedi/my_python.py"
-    local handle = io.popen(command)
-    local output = handle:read("*a")
-    handle:close()
-    print("**************** PYTHON3 !!!!!!! " .. output)
+    
     CreatureObject(pPlayer):clearBuffs(true, false)
 	CreatureObject(pPlayer):enhanceCharacter()
 
     Glowing:onPlayerLoggedIn(pPlayer)
+    createObserver(SPATIALCHATSENT, "CustomJediManager", "notifyChatSent", pCreature)
 
     --Glowing:onPlayerLoggedIn(pPlayer)
     --self:registerObservers(pPlayer)
+end
+
+function CustomJediManager:onPlayerLoggedOut(pPlayer)
+	if (pPlayer == nil) then
+		return
+	end
+
+    dropObserver(SPATIALCHATSENT, "CustomJediManager", "notifyChatSent", pCreature)
+end
+
+function DeathWatchBunkerScreenPlay:notifyChatSent(pPlayer, pChatMessage)
+	if (pPlayer == nil or not SceneObject(pPlayer):isPlayerCreature() or pChatMessage == nil) then
+		return 0
+	end
+
+    
+
+	--local terminalID = readData("dwb:voiceControlTerminal")
+	--local pTerminal = getSceneObject(terminalID)
+
+	--if (pTerminal == nil or not SceneObject(pTerminal):isInRangeWithObject(pPlayer, 10)) then
+	--	return 0
+	--elseif (not SceneObject(pTerminal):isInRangeWithObject(pPlayer, 3)) then
+	--	CreatureObject(pPlayer):sendSystemMessage("@dungeon/death_watch:too_far_from_terminal")
+	--	return 0
+	--end
+
+	--local bombDroidHandlerID = readData("dwb:bombDroidHandler")
+	--local terminalUserID = CreatureObject(pPlayer):getObjectID()
+	--if (bombDroidHandlerID == 0) then
+	--	writeData("dwb:bombDroidHandler", terminalUserID)
+	--	writeData("dwb:bombDroidHandlerLastUse", os.time())
+	--elseif (bombDroidHandlerID ~= terminalUserID) then
+	--	local lastTerminalUse = readData("dwb:bombDroidHandlerLastUse")
+	--	if (os.difftime(os.time(), lastTerminalUse) < 120) then
+	--		CreatureObject(pPlayer):sendSystemMessage("@dungeon/death_watch:terminal_in_use")
+	--		return 0
+	--	else
+	--		writeData("dwb:bombDroidHandler", terminalUserID)
+	--		writeData("dwb:bombDroidHandlerLastUse", os.time())
+	--	end
+	--end
+
+	local spatialMsg = getChatMessage(pChatMessage)
+
+	if (spatialMsg == nil or spatialMsg == "") then
+		printLuaError("Invalid spatial message from player " .. SceneObject(pPlayer):getDisplayedName())
+		return 0
+	end
+
+	local tokenizer = {}
+	for word in spatialMsg:gmatch("%w+") do table.insert(tokenizer, word) end
+
+	local spatialCommand = tokenizer[1]
+
+	if (spatialCommand == nil or spatialCommand == "") then
+		printLuaError("Invalid spatial command from player " .. SceneObject(pPlayer):getDisplayedName() .. ", spatial message: " .. spatialMsg)
+		return 0
+	end
+
+    local python_location = "python3 /home/swgemu/Core3/MMOCoreORB/bin/scripts/managers/jedi/my_python.py "
+    local command = python_location .. spatialCommand
+    local handle = io.popen(command)
+    local output = handle:read("*a")
+    handle:close()
+    print("**************** PYTHON !!!!!!! " .. output)
+
+	--writeStringData("dwb:bombDroidHandlerLastSpatialCommand", spatialCommand)
+	--local moveDistance = 0
+	--if (tokenizer[2] ~= nil) then
+	--	moveDistance = tonumber(tokenizer[2])
+	--	if (moveDistance == nil) then
+	--		return 0
+	--	end
+	--	if (moveDistance > 10) then
+	--		moveDistance = 10
+	--	elseif (moveDistance <= 0) then
+	--		moveDistance = 1
+	--	end
+	--end
+	--writeData("dwb:bombDroidHandlerLastMoveDistance", moveDistance)
+	--local bombDroidID = readData("dwb:bombDroid")
+	--local pBombDroid = getSceneObject(bombDroidID)
+	--createEvent(500, "DeathWatchBunkerScreenPlay", "doBombDroidAction", pBombDroid, "")
+
+	return 0
 end
 
 -- Handling of the useItem event.
