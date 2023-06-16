@@ -86,8 +86,8 @@ function CustomJediManager:notifyChatSent(pPlayer, pChatMessage)
 	--	return 0
 	--end
 
-    local python_location = "python3 /home/swgemu/Core3/MMOCoreORB/bin/scripts/managers/jedi/my_python.py "
-    local command = python_location .. spatialMsg
+    local command = "python3 /home/swgemu/Core3/MMOCoreORB/bin/scripts/managers/jedi/my_python.py \"" .. spatialMsg .. "\""
+    --local command = python_location .. spatialMsg
     local handle = io.popen(command)
     local output = handle:read("*a")
     handle:close()
