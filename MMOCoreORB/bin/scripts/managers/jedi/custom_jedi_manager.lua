@@ -44,6 +44,7 @@ function CustomJediManager:notifyChatSent1(pPlayer, pChatMessage)
 		return 0
 	end
     ChatAIScreenPlay:notifyChatSent(pPlayer, pChatMessage)
+    return 0
 end
 
 function CustomJediManager:notifyChatSent(pPlayer, pChatMessage)
