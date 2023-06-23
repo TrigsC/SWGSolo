@@ -28,6 +28,7 @@ function ChatAIScreenPlay:onPlayerLoggedIn(pPlayer)
 	end
 
     createObserver(SPATIALCHATSENT, "ChatAIScreenPlay", "notifyChatSent", pPlayer)
+	print("OBSERVER CREATED")
 
     --Glowing:onPlayerLoggedIn(pPlayer)
     --self:registerObservers(pPlayer)
@@ -39,19 +40,25 @@ function ChatAIScreenPlay:onPlayerLoggedOut(pPlayer)
 	end
 
     dropObserver(SPATIALCHATSENT, "ChatAIScreenPlay", "notifyChatSent", pPlayer)
+	print("OBSERVER DROPPED")
 end
 
 function ChatAIScreenPlay:notifyChatSent(pPlayer, pChatMessage)
+	print("Made it to Notify")
 	if (pPlayer == nil or not SceneObject(pPlayer):isPlayerCreature() or pChatMessage == nil) then
 		return 0
 	end
 
     local pID = readData("ai:c4p4")
+	print(pID)
 	local pSceneOb = getSceneObject(pID)
+	print(pSceneOb)
 
 	if (pSceneOb == nil or not SceneObject(pSceneOb):isInRangeWithObject(pPlayer, 10)) then
+		print("NOPE1")
 		return 0
 	elseif (not SceneObject(pSceneOb):isInRangeWithObject(pPlayer, 3)) then
+		print("NOPE2")
 		CreatureObject(pPlayer):sendSystemMessage("You to far sucka")
 		return 0
 	end
