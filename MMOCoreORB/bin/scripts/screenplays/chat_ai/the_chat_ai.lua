@@ -15,6 +15,7 @@ ChatAIScreenPlay = ScreenPlay:new {
 function ChatAIScreenPlay:start()
 	if (isZoneEnabled("tatooine")) then
 		Logger:log("Starting the CHAT AI Screenplay.", LT_INFO)
+		print("**************** CHAT AI Screenplay !!!!!!! ")
 		--self:spawnSceneObjects()
 		self:spawnMobiles()
 
@@ -140,7 +141,7 @@ end
 
 function ChatAIScreenPlay:spawnMobiles()
 
-    local pC4P4 = spawnMobile("tatooine", "chat_ai_c4p4", 3517.78, 5, -4817.56, 0, 0, 0)-- planet, template, x, z, y, yaw, cellID
+    local pC4P4 = spawnMobile("tatooine", "chat_ai_c4p4", 300, 3517.78, 5, -4817.56, 0, 0)-- planet, template, x, z, y, yaw, cellID
 
     if (pC4P4 ~= nil) then
         writeData("ai:c4p4", SceneObject(pC4P4):getObjectID())
