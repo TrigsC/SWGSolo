@@ -3,17 +3,18 @@ ChatAIScreenPlay = ScreenPlay:new {
 
 	screenplayName = "ChatAIScreenPlay",
 
-	states = {
-		1, -- accept_task
-		2, -- completed_task
-		4, -- completed_quest
-	},
+	--states = {
+	--	1, -- accept_task
+	--	2, -- completed_task
+	--	4, -- completed_quest
+	--},
 }
 
-registerScreenPlay("ChatAIScreenPlay", true)
+
 
 function ChatAIScreenPlay:start()
 	if (isZoneEnabled("tatooine")) then
+		Logger:log("Starting the CHAT AI Screenplay.", LT_INFO)
 		--self:spawnSceneObjects()
 		self:spawnMobiles()
 
@@ -234,3 +235,7 @@ end
 --    end
 --    return pConvScreen
 --end
+
+registerScreenPlay("ChatAIScreenPlay", true)
+
+return ChatAIScreenPlay
