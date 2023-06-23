@@ -709,5 +709,7 @@ includeFile("tests/ai_test.lua")
 -- Server Event Automation
 includeFile("events/ServerEventAutomation.lua")
 
+includeFile("chat_ai/the_chat_ai.lua")
+
 -- Custom content - Loads last to allow for overrides
 includeFile("../custom_scripts/screenplays.lua")
