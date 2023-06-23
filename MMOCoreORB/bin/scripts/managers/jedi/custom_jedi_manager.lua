@@ -24,7 +24,7 @@ function CustomJediManager:onPlayerLoggedIn(pPlayer)
 	CreatureObject(pPlayer):enhanceCharacter()
 
     Glowing:onPlayerLoggedIn(pPlayer)
-    createObserver(SPATIALCHATSENT, "CustomJediManager", "notifyChatSent", pPlayer)
+    --createObserver(SPATIALCHATSENT, "CustomJediManager", "notifyChatSent", pPlayer)
 
     --Glowing:onPlayerLoggedIn(pPlayer)
     --self:registerObservers(pPlayer)
@@ -35,7 +35,7 @@ function CustomJediManager:onPlayerLoggedOut(pPlayer)
 		return
 	end
 
-    dropObserver(SPATIALCHATSENT, "CustomJediManager", "notifyChatSent", pPlayer)
+    --dropObserver(SPATIALCHATSENT, "CustomJediManager", "notifyChatSent", pPlayer)
 end
 
 function CustomJediManager:notifyChatSent(pPlayer, pChatMessage)
