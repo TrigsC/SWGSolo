@@ -49,4 +49,4 @@ includeFile("outfits/serverobjects.lua")
 -- Custom content - Loads last to allow for overrides
 includeFile("../custom_scripts/mobile/serverobjects.lua")
 
-includeFile("../custom_content/mobile/serverobjects.lua")
+includeFile("custom_content/serverobjects.lua")
