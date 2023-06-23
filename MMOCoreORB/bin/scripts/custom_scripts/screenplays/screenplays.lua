@@ -1,1 +1,1 @@
-includeFile("chat_ai/the_chat_ai.lua")
+includeFile("screenplays/chat_ai/the_chat_ai.lua")
