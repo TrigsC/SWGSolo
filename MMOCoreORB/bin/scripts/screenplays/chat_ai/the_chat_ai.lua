@@ -111,7 +111,12 @@ function ChatAIScreenPlay:notifyChatSent(pPlayer, pChatMessage)
     local handle = io.popen(command)
     local output = handle:read("*a")
     handle:close()
-    CreatureObject(pPlayer):sendSystemMessage(" \\#FFFF00\\PYTHON:  \\#FFFFFF\\ " .. output)
+
+	--local greetingString = LuaStringIdChatParameter(OLD_MAN_GREETING_STRING)
+	--greetingString:setTT(CreatureObject(pPlayer):getFirstName())
+	spatialChat(pSceneOb, output)
+
+    --CreatureObject(pPlayer):sendSystemMessage(" \\#FFFF00\\PYTHON:  \\#FFFFFF\\ " .. output)
     print("**************** PYTHON !!!!!!! " .. output)
 
 	--writeStringData("dwb:bombDroidHandlerLastSpatialCommand", spatialCommand)
