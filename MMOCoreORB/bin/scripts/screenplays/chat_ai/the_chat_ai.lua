@@ -106,7 +106,7 @@ function ChatAIScreenPlay:notifyChatSent(pPlayer, pChatMessage)
 	--	return 0
 	--end
 
-    local command = "python3 /home/swgemu/Core3/MMOCoreORB/bin/scripts/managers/jedi/my_python.py \"" .. spatialMsg .. "\""
+    local command = "python3.9 /home/swgemu/Core3/MMOCoreORB/bin/scripts/managers/jedi/my_python.py \"" .. spatialMsg .. "\""
     --local command = python_location .. spatialMsg
     local handle = io.popen(command)
     local output = handle:read("*a")

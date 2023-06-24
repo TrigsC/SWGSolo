@@ -3,7 +3,7 @@ import sys
 import openai
 
 def main():
-    openai.api_key = "sk-Ya0zEH6mnbBPR10IT3BlbkFJpwbhUvomhMKaJ0WI"
+    openai.api_key = "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"
     #print(openai.Model.list())
     #args = "What is the capital of France?"
     args = sys.argv[1]
