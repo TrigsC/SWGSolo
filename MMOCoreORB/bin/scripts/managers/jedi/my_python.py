@@ -24,7 +24,7 @@ def main():
     #if PERSIST and os.path.exists("/home/swgemu/Core3/MMOCoreORB/bin/scripts/persist"):
     #if PERSIST and os.path.exists("D:\\DedaFix\\SWGSolo\\MMOCoreORB\\bin\\conf\\persist"):
     if PERSIST and os.path.exists(persist_dir):
-      print("Reusing index...\n")
+      #print("Reusing index...\n")
       vectorstore = Chroma(persist_directory=persist_dir, embedding_function=OpenAIEmbeddings())
       index = VectorStoreIndexWrapper(vectorstore=vectorstore)
     else:
