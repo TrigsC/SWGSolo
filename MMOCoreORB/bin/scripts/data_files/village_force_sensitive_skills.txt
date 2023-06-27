@@ -1,0 +1,174 @@
+FORCE SENSITIVE SKILLS
+
+Unlocking and Purchasing
+As you complete quests for the villagers during the various phases you will unlock Force Sensitive branches. You can then convert most normal types of experience that you have accumulated to Force Sensitive experience types. There are three types of Force Sensitive experience: Combat, Senses, and Crafting. Please refer to Section 4: XP Conversion Ratios to see what experience can be converted to which Force Sensitive experience type and what the conversion ratio is.
+
+There are four Force Sensitive trees in all, each with four branches. As you earn Force Sensitive experience you can purchase boxes in these trees. The cost for the boxes is as follows:
+
+Novice box = 50K FS XP
+Level 1 box = 175k FS XP
+Level 2 box = 250k FS XP
+Level 3 box = 350k FS XP
+Level 4 box = 450k FS XP
+Master box = 620 Apprenticeship XP
+The master level boxes currently do not grant anything (not even a title), and they just seem to be there for structure.
+
+Also, be aware that in order to qualify for the exit quest and the Padawan Trials you must purchase six full lines of FS skills (that's six level 4 boxes).
+
+When deciding to do the villagers' quests, you should also know that Force Sensitive branches are associated with specific types of quests:
+
+Combat Quests = Combat Prowess skills
+Reflex Quests = Enhanced Reflexes skills
+Medic/Survey Quests = Heightened Senses skills
+Crafting Quests = Crafting Master skills
+The Force Sensitive Skills
+
+Combat Prowess:
+
+Ranged Accuracy
+enhanced ranged accuracy +12
+- Increases accuracy with any ranged weapon.
+Ranged Speed
+enhanced ranged speed +12
+- Increases speed with any ranged weapon.
+Melee Accuracy
+enhanced melee accuracy +12
+- Increases accuracy with any melee weapon.
+Melee Speed
+enhanced melee speed +12
+- Increases speed with any melee weapon.
+Enhanced Reflexes:
+
+Ranged Defense
+ranged defense +20
+Increases ranged defense.
+Melee Defense
+melee defense +20
+Increases melee defense.
+Vehicle Control
+force vehicular control +20, force vehicular speed +3
+Vehicle start, stop, & turning.
+Survival
+camping +5, foraging +5, trapping +5, mask scent +5, terrain negotiation +5, creature knowledge +5, creature harvesting +5
+Only camps and terrain negotiation are useable if you're not a Scout or Ranger.
+Heightened Senses:
+
+Healing
+injury treatment +10, injury treatment speed +10, wound healing (dancing) +20, wound healing (music) +20
+Increases healing and enhancement abilities.
+Surveying
+surveying +20
+Increases surveying range: (64x64) if no surveying, (384x384) if you have Artisan: Surveying IV.
+Persuasion
+persuasion +20
+Lowers cost of skill training and appear aligned to any faction (better chance to pass contraband scans).
+Luck
+jedi's luck +4
+Increases your luck while looting, including credits. Unknown if this affects looting item chances.
+Crafting Mastery:
+
+Experimentation
+force experimentation +20
+Increases your chances of getting Amazing Successes while crafting. Does not grant extra points!
+Assembly
+force assembly +20
+Increases your ability to succeed while assembling an item.
+Repair
+force repair bonus +20
+Increases your chances to repair a damaged or broken item.
+Technique
+crafting technique +4
+Decreases you chances of failing (lowering experimental risk) while crafting.
+Phases and FS Skill Availability
+
+Since you can only choose to unlock one FS branch per phase through the quests it is very important to plan ahead so you don't ‘waste' your phases. The following is a list of skills that can be unlocked per phase and vice versa, to help you make these decisions now.
+
+FS Skills per Phase
+
+Phase I:
+Combat Prowess: Ranged Accuracy
+Enhanced Reflexes: Survival
+Heightened Senses: Persuasion
+Crafting Mastery: Assembly
+Phase II:
+Combat Prowess: Melee Speed
+Enhanced Reflexes: Vehicle Control
+Heightened Senses: Surveying
+Crafting Mastery: Technique
+Phase III:
+Combat Prowess: Melee Accuracy
+Enhanced Reflexes: Ranged Defense
+Heightened Senses: Luck
+Crafting Mastery: Experimentation
+Phase IV:
+Combat Prowess: Ranged Speed
+Enhanced Reflexes: Melee Defense
+Heightened Senses: Healing
+Crafting Mastery: Repair
+Phases for FS Skills
+
+Combat Prowess:
+Phase I: Ranged Accuracy
+Phase II: Melee Speed
+Phase III: Melee Accuracy
+Phase IV: Ranged Speed
+Enhanced Reflexes:
+Phase I: Survival
+Phase II: Vehicle Control
+Phase III: Ranged Defense
+Phase IV: Melee Defense
+Heightened Senses:
+Phase I: Persuasion
+Phase II: Surveying
+Phase III: Luck
+Phase IV: Healing
+Crafting Mastery:
+Phase I: Assembly
+Phase II: Technique
+Phase III: Experimentation
+Phase IV: Repair
+Benefits
+The last thing I would like to discuss is the Force Sensitive skills themselves and their usefulness to Jedi and normal professions.
+
+All new Jedi will now have to progress through the village of Aurilia to be allowed to start the Padawan Trials and become a full-fledged Jedi. However, since there are only four possible FS lines per three-week-phase to unlock and you can only unlock one per phase, it is extremely important to know beforehand which ones you want! Not to mention the huge Force Sensitive experience requirements to buy the actual skills once you've unlocked them...
+
+Okay, first of all I'd like to discuss which FS skills are actually beneficial to Jedi... actually, that's somewhat of a contradictive term. The majority of the FS skills are not worth much to Jedi and only serve to limit their available skill points. However, they are required so you should at least pick ones that will serve somewhat of a purpose for your Jedi...
+
+Combat Prowess:
+Ranged Accuracy and Ranged Speed are obviously useless for a Jedi, since they only fight with melee weapons.
+
+Melee Speed, as can be seen from above, is only marginally useful. However, if you plan on Mastering Lightsaber then it will be completely useless to you, since you'll be speed capped for all Lightsaber types. Speed formulas are slated to change in the upcoming Combat Revamp, but we'll see if it'll serve a purpose after that...
+
+Melee Accuracy is probably the most worthwhile FS skill for Jedi out of all of them, since Jedi have such low accuracy (even at Master Lightsaber).
+
+Enhanced Reflexes:
+Ranged Defense is always good to have, but considering how well a Jedi's Saber Block currently works it almost not necessary... still better than most FS skills though.
+
+Melee Defense is another good one to grab. It won't help much in PvP, but it'll be useful while grinding... especially since Jedi can't wear armor.
+
+Vehicle Control does work very well but doesn't really benefit a Jedi that much. Your choice whether you want it or not, more of a "luxury" FS skill... it is nice to have though, as you do notice a difference.
+
+Survival is debatable. You'll get +5 Terrain Negotiation, which is okay for Jedi seeing as they get none from their Disciplines. Other than that you'll be able to place basic camps...
+
+Heightened Senses:
+Healing is completely useless for Jedi, it does not affect the Force Healing discipline at all.
+
+Surveying is only marginally useful for Jedi (64x64 range), since you could just grab Novice Artisan and have the same skills.
+
+Persuasion, hard to tell exactly what it does... it sounds like a very Jedi-like line, but no one really knows exactly what it does. We do know that it allows you to receive a lower cost for training, which is absolutely useless for Jedi since their "training" costs nothing anyway. Other than that it may have an influence on faction recruiters, junk dealers, and contraband scans... but no one really knows. Your choice if you want to pick it up, but it seems sort of like a waste at the moment.
+
+Luck is supposed to make you, well, more lucky at looting. The description talks about increasing your chance to loot more credits, but no one's sure if it increases your chances at looting items as well. It's your call if you want this skill, not bad considering the other options though...
+
+Crafting Mastery:
+Experimentation will increase your chances of getting Amazing Successes while experimenting (not give you more experimentation points). Okay to have, but considering Lightsabers do not decay, a Jedi won't be using this very often.
+
+Assembly increases your chances of succeeding while crafting. Again, this is not going to be used often by Jedi.
+
+Repair does work and would be nice to have, but considering that a Jedi's main items (Lightsaber and Robe) do not decay it's not too useful for Jedi. However, if you wanted to repair things for other people then it might be worth having...
+
+Technique decreases your chances of failing while crafting. Like most of the other Crafting Mastery FS skills, this one is not going to be used very often by a Jedi.
+
+
+Okay, so you read all that and still don't know what to pick? Well, to summarize, Melee Accuracy, Melee Defense, and Ranged Defense are all good picks for a Jedi. After that, Melee Speed, Vehicle Control, Survival, Luck, Persuasion, Experimentation, and Repair are all decent to choose from as well.
+
+As for normal professions, well obviously the FS skills are more geared towards enhancing their skill sets rather than those of Jedi, however, there are some things to be aware of. Survival is useless to a Master Ranger, since they're already capped for most of the skills this adds to. It's unknown if Assembly and Technique are of any use to a master crafter, as there is always supposed to be a 5% chance of failure anyway. If you're already capped at +125 for them, then Melee Defense and Ranged Defense would be useless too. Also, the Melee and Ranged Speed lines won't be beneficial if you're already speed capped.

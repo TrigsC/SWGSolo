@@ -1,0 +1,180 @@
+FORCE SENSITIVE QUESTS
+
+Note: Rewards from the Aurilia quests can be traded.
+
+Note: You do not need your Quest Journal Force Crystal on you to accept quests (but it helps you get through some of them).
+
+Note: Make sure you have space in your Datapad. A lot of the quests require that you have room there for waypoints, and occasionally some other stuff. If you don’t have room it can cause problems, including potentially bugging the quest.
+
+Note: To complete the Aurilian Sculpture, collect all four of the pieces from the various quests, and then stand in a spot in your house and drop them one after another. They will automatically align into a double-pronged sculpture of the Aurilian symbol (like on the banner).
+
+ 
+
+--- PHASE 2 ---
+
+Combat: Search And Destroy
+
+Villager: Dageerin (5238,-4189)
+
+FS Branch Unlocked: Combat Prowess: Melee Speed
+
+Description:
+You will be asked to strike 8 Sith Shadow camps to delay them from attacking Aurilia before the defenses have been rebuilt.
+
+In order to find the camps you will either be given a waypoint or a tracking device to be used with a Radiation Sensor that Dageerin gives you. The waypoints are obviously straight forward and lead you right to the camp, but the Radiation Sensor works by evaluating “threat level”.
+
+To use the Radiation Sensor, you access and “use” it from your Datapad, which will open up a small window. The window will update every few seconds while you’re moving (and only when you’re moving) to display the current “threat level”. Once you reach a constant speed and direction the window will either show a positive (green) or negative (red) number. The larger the positive number is, the closer you are to the direction that the camp is in (and vice versa for negative numbers). Once you get within 64 meters of the camp it will spawn and the Sensor window will let you know that you’re within range of the camp.
+
+At the camp you simply need to kill all the Sith Shadows there to pass that search and destroy mission. The camps are usually filled with Sith Shadow outlaws and pirates, however, the last two missions will have Sith Shadow task masters. These guys have 13K HAM and Light Armor with 70% resists to all (except Lightsaber), and they hit hard... so be prepared! Mission 7 will have one task master and mission 8 will have two of them.
+
+After you complete each mission you will need to return to Dageerin to complete the mission and get the next one. Sometimes he will tell you that they can’t locate any more camps and you will need to check back with him tomorrow for more missions. When he tells you this you’ll have to wait 24 hours (real-time) before you can get more missions from him. This usually seems to happen after the 3rd and 6th missions, so plan on this quest taking you at least 3 days to complete (there is a rumor that Jedi doing this quest do not need to wait [Update: this rumor is false, it takes 3 days for Jedi as well]).
+
+Reward: Durable Lathe, a +30 speed Melee Powerup with 500 uses.
+
+
+Reflexes: Retrieve Supply Crates
+
+Villager: Whip (5283,-4226)
+
+FS Branch Unlocked: Enhanced Reflexes: Vehicle Control
+
+Description:
+Similar to Whip’s Phase 1 quest, however this time you must retrieve 6 crates of Supplies from crashed transport ships on Endor that were attacked by Sith Shadows. Just like before, Whip will give you a waypoint.
+
+The waypoints will always be on Endor so you will have to travel all the way there every time. Once you arrive on Endor the waypoint will update to the approximate location of the crash site (usually 3-4 Km from the Outpost). When you reach the waypoint you will be alerted that you are close to the crashed ship. The ship will spawn somewhere within about 250m of the initial waypoint and will appear as a large rectangle-like object on the overhead map.
+
+When you find the ship you simply need to approach it to salvage the crate of Supplies from it. Sith Shadow pirates and thugs will sometimes spawn around the ship, you can either defeat them or escape. However, be warned that if the Sith Shadows defeat you they will steal the Supplies and you will fail that mission.
+
+To complete the mission you must return to Whip and converse with him to deliver the Supplies, you will also be given a new waypoint for the next mission as you get near him (but don’t forget to drop off the Supplies). Given all the travel time this is a relatively long (and boring) quest, usually taking a few hours, so be prepared.
+
+Reward: Focused Crystal that buffs your Health +2000 for 2 hours (unlimited uses, can be used once every 3 days and cannot be used at the same time as Doc buffs).
+
+
+Senses: Find Village Wall Resources
+
+Villager: Eozlin (5200,-4141)
+
+FS Branch Unlocked: Heightened Senses: Surveying
+
+Description:
+You’re asked to help find 50% concentrations for 8 different resource types to help rebuild the village’s wall.
+
+You must have at least Novice Artisan to be eligible for this quest (though it will go much faster if you have some Surveying as well). You’ll also need Mineral, Gas, and either Wind or Solar Surveying Tools in order to be able to find everything required.
+
+To pass you simply need to Survey for the required resource type at a specific spot where the concentration is greater than or equal to the mission requirements. When you successfully do this your Quest Journal will update and you can simply look there for the next required resource type and concentration (without needing to return to Eozlin).
+
+You will also be given a random single unit of an Aurilian resource container each time you complete a task (except the last one). When you finish the entire quest your reward will also appear directly in your inventory as well.
+
+Note that you can find these concentrations on any planet, you’re not restricted to just Dathomir.
+
+Resource Types and required concentrations:
+
+50% density of Aluminum
+50% density of Gemstone
+50% density of Energy
+50% density of Ore
+50% density of Copper
+50% density of Steel
+50% density of Iron
+50% density of Gas
+Reward: An Inorganic Survey Device (allows you to survey all inorganics), as well as the 8 units of Aurilian resource containers from the survey points.
+
+
+Crafting: Help Build Village Defenses
+
+Villager: Quharek (5247,-4032)
+
+FS Branch Unlocked: Crafting Mastery: Technique
+
+Description:
+Quharek needs help rebuilding the village’s defenses. To do this he is asking many crafters to aid with this community project. If you have at least Novice Artisan you can help him by donating a total of 10 Ingredients to contribute to rebuilding the defenses.
+
+(Note: The number of people that can participate in the quest is limited for a phase.)
+
+Once you accept the quest, Quharek will send you to go see QT-QC (5193,-4196), a binary load lifter responsible for handling the defensive Ingredients as you complete and contribute them. You can talk to it to get the schematics for the required Ingredients. You can also find out the current status of the project by talking to QT-QC or Quharek.
+
+You need to contribute at least 10 of any combination of the following Ingredients to pass this quest:
+
+Refined Endrine
+Refined Rudic
+Refined Ardanium II
+Reinforced Wall Module
+Small Turret
+The raw materials required by the Ingredients are those special Aurilian Resource Containers that can be looted off Sith Shadows, specifically Ardanium II Energy, Rudic Ore, and Endrine Ore. Also, the Ingredients can (and should) be experimented on, meaning you will need access to a weapon, droid, and general item crafting station.
+
+The schematic requirements and experimental properties are as follows:
+
+Refined Endrine
+
+raw materials:
+20 Endrine Ore
+experimentation:
+Malleability = 100% MA
+Quality = 100% OQ
+Toughness = 100% UT
+Refined Rudic
+
+raw materials:
+20 Rudic Ore
+experimentation:
+Conductivity = 100% CD
+Decay Resistance = 100% DR
+Quality = 100% OQ
+Shock Resistance = 100% SR
+Refined Ardanium II
+
+raw materials:
+20 Ardanium II Energy
+experimentation:
+Potential Energy = 100% PE
+Quality = 100% OQ
+Reinforced Wall Module
+
+raw materials:
+10 Endrine Ore
+10 Rudic Ore
+1 Reinforced Wall Module (optional)
+experimentation:
+Kinetic Effectiveness = 100% MA
+Small Turret
+
+raw materials:
+1 Turret Hardware
+1 Turret Electronics
+experimentation:
+none
+Turret Hardware (Small Turret component, cannot be contributed)
+
+raw materials:
+5 Endrine Ore
+experimentation:
+Accuracy = 50% MA, 50% UT
+Turret Electronics (Small Turret component, cannot be contributed)
+
+raw materials:
+5 Rudic Ore
+10 Ardanium II Energy
+1 Turret Electronics (optional)
+experimentation:
+Accuracy = 100% CD
+Speed = 100% OQ
+Village Defenses (cannot be crafted, for reference only)
+
+raw materials:
+1 Refined Endrine
+1 Refined Rudic
+1 Refined Ardanium II
+1 Reinforced Wall Module
+1 Small Turret
+experimentation:
+Armor Effectiveness = 50% OQ, 50% SR
+Armor Integrity = 50% OQ, 50% UT
+Power = 100% PE
+In order to contribute the required 10 Ingredients you will need a total of 200 (specific) Aurilian Resource Containers. Unfortunately, during this phase there is no indefinite supply of these resources. Players doing Eozlin’s quest will get 7 random units as rewards and combatants doing either Dageerin’s or Whip’s quests will also have limited opportunities to gather these resources. However, there are no random spawns of Sith Shadows this Phase. So your only options are to either loot them in another Phase or request them from the players doing the other quests this phase (usually for a price).
+
+Note: You may have noticed that some of the Ingredient schemas have the option for generational crafting, meaning you can put a previous Ingredient into a second Ingredient of the same type, increasing the new Ingredient’s quality. If you have the resources to do this several times, it's a good way to increase the quality of an Ingredient dramatically.
+
+At the end of the Phase, the project will be evaluated. Those that donated the most or highest quality of each of the Ingredients and of the overall project will receive rewards. That’s a total of 12 rewards given out this phase.
+
+
+Reward: A Lightsaber Crafting Toolkit with a “guaranteed critical assembly” (Amazing Success on assembly). The top 2 crafters (quantity and quality) for the overall project get 20 charges on the tool. The top 2 crafters (quantity and quality) for each Ingredient get 5 charges on the tool.

@@ -1,0 +1,29 @@
+FS XP CONVERSION RATIOS
+
+Force-sensitive Combat Experience (Combat Prowess and Enhanced Reflexes):
+Bounty Hunter 1:1
+Combat 3:1
+Weapon (all types) 30:1
+Squad Leader 90:1
+
+Force-sensitive Senses Experience (Heightened Senses):
+DNA Sampling 3:1
+Political 3:1
+Slicing 3:1
+Merchant 4:1
+Wilderness Survival 5:1
+Image Design 7:1
+Scouting 8:1
+Creature Handling 9:1
+Dancer 10:1
+Musician 10:1
+Entertainment Healing 10:1
+Surveying 10:1
+Medical 10:1
+Trapping 25:1
+
+Force-sensitive Crafting Experience (Crafting Mastery):
+Bio-Engineer Crafting 4:1
+All Other Crafting 5:1
+General Crafting 8:1
+Structure Crafting 35:1

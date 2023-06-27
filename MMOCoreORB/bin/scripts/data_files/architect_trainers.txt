@@ -1,0 +1,33 @@
+Architect
+Corellia - 
+Bela Vistal - /waypoint 6851.5 -5409.5
+Coronet - /waypoint 54 -4429
+Doaba Guefel - /waypoint 3098 5293
+Kor Vella - /waypoint -3686 3047.5
+Tyrena - /waypoint -5535 -2690
+
+Naboo - 
+Dee'ja Peak - /waypoint 4720 -1261
+Kaadara - /waypoint 5111 0
+Keren - /waypoint 1775 2579
+Moenia - /waypoint 4779 -4973
+Moenia - /waypoint 4816 -5014
+Theed - /waypoint -4931 4020
+Theed - /waypoint -5440 3982
+
+Rori - 
+Narmle - /waypoint -4999 -2432
+Restuss - /waypoint 5510 5663
+Restuss - /waypoint 5396 5593
+
+Talus - 
+Dearic - /waypoint 627 -3062
+Nashal - /waypoint 4220 5127
+Nashal - /waypoint 4299 5120
+
+Tatooine - 
+Bestine - /waypoint -1272 -3514
+Mos Eisley - /waypoint 3321 -4705
+Mos Entha - /waypoint 1288 3369
+Mos Espa - /waypoint -2872 2159
+Mos Espa - /waypoint -3043 2050

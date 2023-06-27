@@ -1,33 +1,45 @@
+import os
 import sys
 
-import openai
+from langchain.vectorstores import Chroma
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.indexes.vectorstore import VectorStoreIndexWrapper
+from langchain.document_loaders import DirectoryLoader
+from langchain.indexes import VectorstoreIndexCreator
+from langchain.chains import RetrievalQA
+from langchain.chat_models import ChatOpenAI
+
+import constants
+
+os.environ["OPENAI_API_KEY"] = constants.APIKEY
+
 
 def main():
-    openai.api_key = "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"
-    #print(openai.Model.list())
-    #args = "What is the capital of France?"
-    args = sys.argv[1]
-    response = openai.ChatCompletion.create(
-        model='gpt-3.5-turbo',
-        messages=[{"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": args}]
-        #prompt = prompt,
-        #max_tokens=50,
-        #n=1,
-        #stop=None,
-        #temperature=0.7
+    query = sys.argv[1]
+
+    # Enable to save to disk & reuse the model (for repeated queries on the same data)
+    PERSIST = True
+    persist_dir = "D:\\DedaFix\\SWGSolo\\MMOCoreORB\\bin\\scripts\\persist"
+    #if PERSIST and os.path.exists("/home/swgemu/Core3/MMOCoreORB/bin/scripts/persist"):
+    #if PERSIST and os.path.exists("D:\\DedaFix\\SWGSolo\\MMOCoreORB\\bin\\conf\\persist"):
+    if PERSIST and os.path.exists(persist_dir):
+      print("Reusing index...\n")
+      vectorstore = Chroma(persist_directory=persist_dir, embedding_function=OpenAIEmbeddings())
+      index = VectorStoreIndexWrapper(vectorstore=vectorstore)
+    else:
+      #loader = TextLoader("data/data.txt") # Use this line if you only need data.txt
+      #loader = DirectoryLoader("/home/swgemu/Core3/MMOCoreORB/bin/scripts/data_files/")
+      loader = DirectoryLoader("D:\\DedaFix\\SWGSolo\\MMOCoreORB\\bin\\scripts\\data_files\\")
+      if PERSIST:
+        index = VectorstoreIndexCreator(vectorstore_kwargs={"persist_directory":persist_dir}).from_loaders([loader])
+      else:
+        index = VectorstoreIndexCreator().from_loaders([loader])
+
+    chain = RetrievalQA.from_chain_type(
+      llm=ChatOpenAI(model="gpt-3.5-turbo"),
+      retriever=index.vectorstore.as_retriever(search_kwargs={"k": 1}),
     )
-    print(response.choices[0].message["content"])
-    #context = "You are chatting with a customer service representative."
-    #message = "Hi, I have a problem with my account."
-    #response = openai.Completion.create(
-    #  engine="gpt-3.5-turbo",
-    #  prompt=f"Chat:\n{context}\nUser: {message}\n",
-    #  max_tokens=50
-    #)
-    #reply = response.choices[0].text.strip()
-    #args = sys.argv[1]
-    #print(reply)
+    print(chain.run(query))
 
 if __name__ == "__main__":
     main()

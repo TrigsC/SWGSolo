@@ -1,0 +1,227 @@
+FORCE SENSITIVE QUESTS
+
+Note: Rewards from the Aurilia quests can be traded.
+
+Note: You do not need your Quest Journal Force Crystal on you to accept quests (but it helps you get through some of them).
+
+Note: Make sure you have space in your Datapad. A lot of the quests require that you have room there for waypoints, and occasionally some other stuff. If you don’t have room it can cause problems, including potentially bugging the quest.
+
+Note: To complete the Aurilian Sculpture, collect all four of the pieces from the various quests, and then stand in a spot in your house and drop them one after another. They will automatically align into a double-pronged sculpture of the Aurilian symbol (like on the banner).
+
+ 
+
+--- PHASE 3 ---
+
+Combat: Capture Enemy Leadership
+
+Villager: Captain Sarguillos (5313,-4161)
+
+FS Branch Unlocked: Combat Prowess: Melee Accuracy
+
+Description:
+For this quest you are asked to raid an enemy base and capture its Commander, bringing him back to Aurilia for interrogation. There are 25 bases in total, spread out all over Dathomir. Each base is defended by an impassable shield, turrets, and a lot of Sith Shadows.
+
+In order to enter a base you must disable its shields. To do this you need to get a “remote frequency codes” disk. These can be looted off the Sith Shadow patrols within a 250 meter radius around the bases. These patrols are easy to spot, there is usually a large group of them and they are yellow dots on the radar (unlike most Sith Shadows, which are usually red dots). However, be aware that they will be aggressive towards you if you’ve already accepted the Captain’s mission.
+
+You will find Sith Shadow outlaws, pirates, and thugs in these patrols, but they’re not the same ones you’ve been fighting in the other phases, these Sith Shadows are a lot tougher. They all have light armor and fairly high resists to everything (besides Lightsabers). Outlaws have ~13K HAM, pirates have ~15K HAM, and thugs have ~50K HAM. Thugs hit hard and are tough, about equal to some of the lower Corvette mobs, so be careful and be prepared.
+
+Anyway, once you finally loot a frequency code bring it back to the Captain and he will make you a “shield generator remote” to disable a specific base’s shields (found in the remote’s name).
+
+So how do you find where the base is that you have the remote for? Well, you can try searching around all of Dathomir until you stumble across the one you’re looking for (obviously not recommended), or you can try looting “a waypoint datapad” off the Sith Shadow base patrols (turn it into the Captain to get a waypoint to a base, which you can then check out to see if it’s the one), or you can simply check the forums for the base locations on your server.
+
+That’s right, “on your server”. The locations of the bases are different on each server and each time the phase comes around, that’s the tricky part about them. All servers have all 25 of the bases, but in different locations. The good news is that there seems to be set locations where the bases can potentially be located, so you at least have an idea where to look. The bad news is that there are more than 25 set locations, so there will be some “trial and error”, but at least it’s better than wandering around aimlessly.
+
+The 25 base names are:
+alpha, beta, chi, delta, epsilon, eta, gamma, iota, kappa, lamda, mu, omega, omikron, phy, pi, psi, rho, sigma, tau, theta, xi, ypsylon, zed, zeta, nu
+
+The known set locations so far are:
+.---------------------------------------------------------------.
+|  NW QUADRANT  |  SW QUADRANT  |  NE QUADRANT  |  SE QUADRANT  |
+|---------------|---------------|---------------|---------------|
+|  (-392,6004)  |   (-53,-165)  |   (700,750)   |  (3456,-1258) |
+|  (-410,2506)  |  (-362,-1914) |  (1073,1860)  |  (4027,-1402) |
+| (-1000,2300)  |  (-390,-1966) |  (1311,1219)  |  (5313,-1145) |
+| (-1092,2343)  |  (-614,-5290) |  (1369,1217)  |  (5939,-2030) |
+| (-1680,1703)  |  (-737,-5158) |  (2960,45)    |               |
+| (-1977,2234)  | (-1000,-2800) |  (3076,2174)  |               |
+| (-2850,2366)  | (-1017,-2873) |  (3041,787)   |               |
+| (-2932,738)   | (-1721,-4684) |               |               |
+| (-3100,1170)  | (-3824,-3011) |               |               |
+'---------------------------------------------------------------'
+
+Note: To determine the name of a base just look for the little MSE “surveillance droids” near the base, they will have its name in theirs. For example, “a kappa surveillance droid” would indicate that it’s the “kappa” base.
+
+Note: The closest set locations to Aurilia are (5939,-2030), then (5315,-1145), and then (3456,-1258). I would recommend checking out those locations first to see if there are bases there on your server. If there are then make a note of their name(s) and try to get frequency codes for them.
+
+Okay, so you found the base that you have the remote for, now you have to bring down the shields by activating it. As soon as you do a horde of Sith Shadow thugs will begin spawning right in front of the base. Run away and regroup! You need to kill 5 of these thugs, but I highly recommend that you pull one or two out at a time to do it, the whole group of them will likely kill you within a few seconds.
+
+Note: If you die at any time after deactivating the shields (without a partner) you will fail the mission and need to start over.
+
+Once you kill the 5 you will get a message that the Commander has spawned in the base. To get to him in the base you’ll have to destroy a couple of gates (and it wouldn’t be a bad idea to destroy those three turrets now either). You best chance at getting into the base is to have somebody draw away the Sith Shadows guards and then go in. You can also wait for them to de-spawn and sneak in then, but they re-spawn fairly quickly and it can get messy.
+
+After you make it to the Commander you need to select “Capture” from his radial menu, once you do he will begin following you. Get clear of the base and then begin heading back to Aurilia.
+
+On the way back small groups of Sith Shadow pirates (2-3) will constantly try to rescue the Commander. If they get close enough to him he will escape. You will need to then catch up to him and select “Recapture” from his radial menu.
+
+Be aware that he will also take some biotoxins and eventually die from poisoning. It’s unknown exactly how long you have before this happens, but it seems to be accelerated every time he escapes. It could also be that he doesn’t take the biotoxins until the first time he escapes. More info is needed on this one.
+
+Anyway, once you lead the Commander safely back to the Captain you will complete the task, unlocking the FS branch and receiving your reward(s).
+
+Note that there is also the option to do this quest with a partner for an extra reward. If you decide you want to do it with a partner one of you must pick the option to bring down the shields and the other one must pick the option to capture the Commander. If you do not then you won’t both get credit. The person with the shields mission must bring down the base shields with the remote and then help kill five of the Sith Shadow thugs, all without dying until the Commander is captured. The other person must help kill the five thugs as well, and then capture the Commander and lead him back to the village without dying.
+
+
+Reward: If you do this quest all by yourself you will receive a special Color Crystal, named Sunrider’s Destiny (aquamarine color). If you do it with a partner you will receive the same special Color Crystal and a Focused Crystal. The latter gives a +900 mind buff that lasts 1 hour and 30 minutes (cannot be used with other Mind buffs). It appears to be infinitely reusable and can be used once every 4 days.
+
+
+Reflexes: Search And Destroy II
+
+Villager: Dageerin (5238,-4189)
+
+FS Branch Unlocked: Enhanced Reflexes: Ranged Defense
+
+Description:
+You will be asked to strike 8 Sith Shadow camps to delay them from attacking Aurilia before the defenses have been rebuilt.
+
+In order to find the camps you will either be given a waypoint or a tracking device to be used with a Radiation Sensor that Dageerin gives you. The waypoints are obviously straight forward and lead you right to the camp, but the Radiation Sensor works by evaluating “threat level”.
+
+To use the Radiation Sensor, you access and “use” it from your Datapad, which will open up a small window. The window will update every few seconds while you’re moving (and only when you’re moving) to display the current “threat level”. Once you reach a constant speed and direction the window will either show a positive (green) or negative (red) number. The larger the positive number is, the closer you are to the direction that the camp is in (and vice versa for negative numbers). Once you get within 64 meters of the camp it will spawn and the Sensor window will let you know that you’re within range of the camp.
+
+At the camp you simply need to kill all the Sith Shadows there to pass that search and destroy mission. The camps are usually filled with Sith Shadow outlaws and pirates, however, the last two missions will have Sith Shadow task masters. These guys have 13K HAM and Light Armor with 70% resists to all (except Lightsaber), and they hit hard... so be prepared! Mission 7 will have one task master and mission 8 will have two of them.
+
+After you complete each mission you will need to return to Dageerin to complete the mission and get the next one. Sometimes he will tell you that they can’t locate any more camps and you will need to check back with him tomorrow for more missions. When he tells you this you’ll have to wait 24 hours (real-time) before you can get more missions from him. This usually seems to happen after the 3rd and 6th missions, so plan on this quest taking you at least 3 days to complete (there is a rumor that Jedi doing this quest do not need to wait [Update: this rumor is false, it takes 3 days for Jedi as well]).
+
+Reward: Synthesized Muscle Stimulant, a buff item with 5 charges that boosts Ranged Defense by +10 for 5 minutes.
+
+
+Senses: Find Shield Generator Resources
+
+Villager: Eozlin (5200,-4141)
+
+FS Branch Unlocked: Heightened Senses: Luck
+
+Description:
+You’re asked to help find 50% concentrations for 8 different resource types to help rebuild the village’s defenses.
+
+You must have at least Novice Artisan to be eligible for this quest (though it will go much faster if you have some Surveying as well). You’ll also need Mineral, Gas, and either Wind or Solar Surveying Tools in order to be able to find everything required.
+
+To pass you simply need to Survey for the required resource type at a specific spot where the concentration is greater than or equal to the mission requirements. When you successfully do this your Quest Journal will update and you can simply look there for the next required resource type and concentration (without needing to return to Eozlin).
+
+You will also be given a random single unit of an Aurilian resource container each time you complete a task (except the last one). When you finish the entire quest your reward will also appear directly in your inventory as well.
+
+Note that you can find these concentrations on any planet, you’re not restricted to just Dathomir.
+
+Resource Types and required concentrations:
+
+50% density of Iron
+50% density of Gas
+50% density of Energy
+50% density of Aluminum
+50% density of Ore
+50% density of Gemstone
+50% density of Steel
+50% density of Copper
+Reward: An Inorganic Survey Device (allows you to survey all inorganics), as well as the 8 units of Aurilian resource containers from the survey points.
+
+
+Crafting: Help Build Village Shields
+
+Villager: Quharek (5291,-4107)
+
+FS Branch Unlocked: Crafting Mastery: Experimentation
+
+Description:
+Quharek needs help rebuilding the village’s shields, similar to the defenses in Phase 2. To do this he is asking many crafters to aid with this community project. If you have at least Novice Artisan you can help him by donating a total of 20 Ingredients to contribute to rebuilding the shields.
+
+(Note: The number of people that can participate in the quest is limited for a phase.)
+
+Once you accept the quest, Quharek will send you to go see QT-QC (5193,-4196), a binary load lifter responsible for handling the shield Ingredients as you complete and contribute them. You can talk to it to get the schematics for the required Ingredients. You can also find out the current status of the project by talking to QT-QC or Quharek.
+
+You need to contribute at least 20 of any combination of the following Ingredients to pass this quest:
+
+Endrost Alloy
+Shield Housing
+Power Supply
+Unit Computer
+Regulator
+Shield Connections
+Primary Computer
+The raw materials required by the Ingredients are those special Aurilian Resource Containers that can be looted off Sith Shadows, specifically Wind Crystal Energy, Ardanium II Energy, Rudic Ore, Ostrine Ore, and Endrine Ore. Also, the Ingredients can (and should) be experimented on, meaning you will need access to a weapon, droid, and general item crafting station.
+
+The schematic requirements and experimental properties are as follows:
+
+Endrost Alloy
+
+raw materials:
+8 Endrine Ore
+1 Ostrine Ore
+1 Wind Crystal Energy
+experimentation:
+Quality = 50% OQ, 50% PE
+Toughness = 33% MA, 66% UT
+Shield Housing
+
+raw materials:
+6 Endrine Ore
+4 Rudic Ore
+experimentation:
+System Redundancy = 50% DR, 50% UT
+Power Supply
+
+raw materials:
+2 Ostrine Ore
+3 Endrine Ore
+5 Wind Crystal Energy
+1 Power Supply (optional)
+experimentation:
+Energy Resistance = 33% MA, 33% OQ, 33% PE
+Unit Computer
+
+raw materials:
+4 Rudic Ore
+6 Ardanium II Energy
+1 Unit Computer (optional)
+experimentation:
+Armor Effectiveness = 50% CD, 50% PE
+Regulator
+
+raw materials:
+5 Ostrine Ore
+5 Rudic Ore
+1 Regulator (optional)
+experimentation:
+Power Efficiency = 50% CD, 50% OQ
+Shield Connections
+
+raw materials:
+10 Ostrine Ore
+experimentation:
+Grid Stability = 50% MA, 50% OQ
+Primary Computer
+
+raw materials:
+4 Rudic Ore
+3 Ardanium II Energy
+3 Wind Crystal Energy
+1 Primary Computer (optional)
+experimentation:
+System Response = 33% CD, 33% OQ, 33% PE
+Village Shields (cannot be crafted, for reference only)
+
+raw materials:
+1 Endrost Alloy
+1 Shield Housing
+1 Power Supply
+1 Unit Computer
+1 Regulator
+1 Shield Connections
+1 Primary Computer
+experimentation:
+Misc: Armor Integrity = 50% OQ, 50% UT
+In order to contribute the required 20 Ingredients you will need a total of approximately 200 (specific) Aurilian Resource Containers. To get these you can either look to your fellow players or attempt to collect them yourself. Players doing Eozlin’s quest will get 7 random units as rewards and combatants doing either Captain Sarguillos’ or Dageerin’s quests will also have opportunities to gather these resources. However, if you wish to gather them yourself you can go to perimeter of the various Sith Shadow Bases (from Captain Sarguillos’ quest) and look for Sith Shadow patrols to beat up and loot from (warning: they can be tough).
+
+Note: You may have noticed that some of the Ingredient schemas have the option for generational crafting, meaning you can put a previous Ingredient into a second Ingredient of the same type, increasing the new Ingredient’s quality. If you have the resources to do this several times, it's a good way to increase the quality of an Ingredient dramatically.
+
+At the end of the Phase, the project will be evaluated. Those that donated the most or highest quality of each of the Ingredients and of the overall project will receive rewards. That’s a total of 16 rewards given out this phase.
+
+
+Reward: A Lightsaber Crafting Toolkit with a “guaranteed critical assembly” (Amazing Success on assembly). The top 2 crafters (quantity and quality) for the overall project get 20 charges on the tool. The top 2 crafters (quantity and quality) for each Ingredient get 5 charges on the tool.

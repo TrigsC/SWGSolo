@@ -1,0 +1,112 @@
+FORCE SENSITIVE QUESTS
+
+Note: Rewards from the Aurilia quests can be traded.
+
+Note: You do not need your Quest Journal Force Crystal on you to accept quests (but it helps you get through some of them).
+
+Note: Make sure you have space in your Datapad. A lot of the quests require that you have room there for waypoints, and occasionally some other stuff. If you don’t have room it can cause problems, including potentially bugging the quest.
+
+Note: To complete the Aurilian Sculpture, collect all four of the pieces from the various quests, and then stand in a spot in your house and drop them one after another. They will automatically align into a double-pronged sculpture of the Aurilian symbol (like on the banner).
+
+ 
+
+--- PHASE 4 ---
+
+Combat/Reflexes: Village Assault!
+
+Villager: Captain Sarguillos (5313,-4161)
+
+FS Branch Unlocked: Combat Prowess: Ranged Speed OR Enhanced Reflexes: Melee Defense
+
+Description:
+You must defend the village from waves of attacking Sith Shadows. Every 90 minutes Aurilia will be raided by a horde of Sith Shadow outlaws, pirates, and thugs. In order to complete this quest you must kill (or help kill) 50 outlaws and 25 pirates (note that thugs do not give any credit for being killed).
+
+The Sith Shadows will continually spawn inside the village and just outside the North and South gates for 60 minutes. Following that there will be a 30 minute “downtime” before the next 90 minute wave starts.
+
+Be aware that these are the pumped up Phase 3 versions of Sith Shadows. They all have light armor and fairly high resists to everything (besides Lightsabers). Outlaws have ~13K HAM, pirates have ~15K HAM, and thugs have ~50K HAM. Thugs hit hard and are tough, about equal to some of the lower Corvette mobs, so be careful and be prepared.
+
+There are a few good strategies for completing this quest. First off, being in a big group is a big help (especially if you have a few Docs with you), so try to group up with everyone you see there and/or bring some friends to help. Another important thing to remember is that you only need to hit a pirate or outlaw once in order to get credit (and stay within range when it dies), if you have other people looking for what you’re killing give them a chance to hit it (if nearby) so they can get credit as well. Okay, on to the strategies...
+
+One strategy is to set up your party in the center of the village, with the Doc(s) hiding in one of the three central huts (now known as the “healing huts”) to fall back to in-case of trouble. For some reason the Sith Shadows usually won’t enter most huts in the village, so use that to your advantage. Basically, with this strategy you try to keep the group concentrated in the center of the village, clearing all Sith Shadows that come near it. Sometimes you’ll need to “fish” outside of the center for pirates, but try to lead them back to the village center as soon as they’ve switched to melee. Overall, this is a decent approach, but will likely lead to a lot of deaths and a slightly longer time to complete the quest.
+
+Another strategy is to stay outside the village walls and pick off Sith Shadows as they spawn near the North and South gates. Occasionally looking inside the village near the gates for potential targets as well to quickly jump in, kill, and get out. If you play it smart this strategy will not only result in less death, but will also probably have you completing the quest much more quickly. Not to mention that you probably don’t need a group when doing it this way (though it would still be beneficial to have one).
+
+You can unlock either Melee Defense or Ranged Speed with this quest, at the beginning of this quest you will be given the choice of which you wish to pursue. Note that the choice of unlock that you choose will impact the reward item that you receive.
+
+Reward (Combat: Ranged Speed): An Aurilian Sculpture Section (1/4).
+
+Reward (Reflexes: Melee Defense): Nothing
+
+
+Senses: Healing Support
+
+Villager: Sivarra Mecheaux (5159,-4113)
+
+FS Branch Unlocked: Heightened Senses: Healing
+
+Description:
+You need to aid in the defense of the village by assisting its defenders. Every 90 minutes Aurilia will be raided by a wave of Sith Shadow outlaws, pirates, and thugs. To complete this quest you will have to help players doing the “Village Assault” quest by providing medical support for them during their battles with Sith Shadows. If they get credit for a kill (pirates or outlaws) then you will get credit for healing them. Note that if they’ve already completed their quota for either pirates or outlaws you will not get credit for healing them in further encounters (since they’re no longer getting credit). Obviously this also means that you will get no credit for healing anybody during encounters with thugs, unfortunately.
+
+Medical support counts as almost any healing action. For example, healing damage, removing states, stopping bleeding, and resuscitation (as long as they still get credit for the kill) will all count towards healing credit. Note that you only have to perform a healing action once on a player, as long as you are within range when they get credit for the kill you will get credit for the heal.
+
+You can see how many healing credits you have by talking to Sivarra or her medical droid.
+
+Some survival tips for Medics/Docs/CM’s: First off, make sure you’re wearing Composite armor. These guys hit hard and you will likely get their attention sooner or later from healing the defenders, so be prepared for it. Full Dancer and Musician buffs are also extremely helpful, along with Brandy, Canape, and Muon. You will be healing a lot and you will always need your Mind to be in top shape to keep it up. Havla is obviously handy to have around as well, but you should also make sure you leave room for Synthsteak, it comes in very beneficial when you need to fetch a fallen defender from a gang of thugs. Also, carrying a Fishing Rod or Musical Instrument seems to help lower your chances of drawing aggro, but it could just be a matter of perception... it’s your call.
+
+After the initial 50 heals, you will unlock the FS branch and also have the option of doing another extended quest to heal an additional 50 defenders, for a total of 100 heals. Good luck!
+
+Reward: Assist 50 defenders to unlock the FS branch, assist an additional 50 (extended, 100 total) to get a Bacta Tank (decoration).
+
+
+Crafting: Find a Replacement Computer Core for the Village of Aurilia Computers
+
+Villager: Chief Engineer of Aurilia (5388,-4122)
+
+FS Branch Unlocked: Crafting Mastery: Repair
+
+Description:
+Aurilia’s computer core was damaged in the attacks, the new Chief Engineer needs you to locate and configure a replacement one.
+
+This is an involved and multi-step quest:
+
+Find a Gadget Specialist
+Go to Keren on Naboo, Coronet on Corellia, or Mos Entha on Tatooine and speak to a gadget specialist to seek help finding a replacement computer core for the village of Aurilia on Dathomir. The Aurilia chief engineer can provide you with a waypoint to one of these locations if you wish. Simply speak with him. Once you locate the Gadget Specialist you need to purchase a Satellite Tracking Device Assembly Kit from him for 530 credits.
+
+Complete the Tracking Device Kit
+Complete the satellite tracking device kit. Doing so will provide you with the means to find a downed satellite from which you could find a replacement computer core. Some pieces need to be looted off any normal NPC’s, like the other regular loot kits. The other pieces need to be crafted by a Master Artisan. Simply drag the pieces into the loot kit, and when all pieces are inserted it will create the “Downed Satellite Tracking Device”.
+Tracking Device Assembly Kit pieces:
+
+Tracking Device Assembly Bracket - First Segment
+Tracking Device Assembly Bracket - Second Segment
+Tracking Device Assembly Bracket - Third Segment
+Tracking Device Case - First Section
+Tracking Device Case - Second Section
+Tracking Device Case - Third Section
+Control Unit
+Energy Distributor
+Electronics Memory Module
+Micro Sensor Suite
+Obtain the Rights to an Abandoned Satellite
+NOTE: Make sure you complete the Satellite Tracking Device before this step, otherwise you will be bugged and will not be able to continue the quest.
+Go to any major starport “ticket collector” droid and request their assistance to obtain the rights to an abandoned satellite. Doing so will provide you with tracking data for your satellite tracking device and will allow you to locate the fallen satellite. Rights must be purchased for 1100 credits from the droid (“Obtain Satellite Data” option on radial menu). After purchasing the rights your tracking device accesses the Central Satellite Database and retrieves the necessary Satellite information.
+
+Find the Fallen Satellite and Retrieve the Computer Core
+Once you have the data in your tracking device go to it in your inventory and select “Activate Tracking Device” on its radial menu to determine which planet the satellite is on. After arriving on the specified planet use the “Activate Tracking Device” option again for the exact waypoint to the satellite. At the satellite select the “Retrieve Computer Core” menu option to obtain the core.
+
+Reconfigure the Computer Core's Interface
+Modify the replacement computer core's interface so that it will be configured to be used with the computers of Aurilia. Do so by choosing the menu options under "Reconfigure Interface" from the computer core's radial menu.
+
+You will need to rewire the replacement computer core to match that of the village computers. There are four indicators on the core that will be lit when it has been properly configured.
+
+To reconfigure the core, you will need to connect four wires in the proper order to contacts on the core. There are red wires, yellow wires, and blue wires. Each color set of wires connects to a different power source, and any combination of the wires may be used to reconfigure the computer core.
+
+When you have the wires configured the way you desire, you may test the configuration to see if it is correct. For each wire that is connected to the correct contact, one of the four indicators will be lit. If the correct type of wire is used but is connected to the wrong contact, then one of the indicators will flicker. You can use this feedback to determine the final configuration of the interface for the new computer core.
+
+Be careful though... each time you test your configuration, power is sent through the core. An incomplete configuration can damage the core. This is reported as 'Circuit Integrity' which gives the percentage chance that the core is still viable. Be sure to keep an eye on this value. On average, a core can survive 6 - 7 attempts without significant damage, but beyond that you risk frying the computer core's circuits and rendering it useless.
+
+There’s no “easy” way to complete this puzzle. However, there is a decent logical strategy you can follow to eventually narrow down the possibilities until you solve it. First off you need to just try an initial set for a base experiment, so connect all the wires and test it. If you get some indicators lit up then that’s good, if not change all the connections and try the test again until you get some matches. Once you have some indicators lit it’s just a matter of trial and error from here. This time change just one of the connections. If the number of matches goes up then the connection was good. However, if the number goes down then you changed one that was good, change it back (and try changing the next connection as well to save integrity). Also, if the number does not change at all that means the connection you modified was not a good one, but you still have the wrong color wire connected, go back and change it to the third color not tried yet (and try changing the next connection as well to save integrity). The flickering indicators can be used in a similar manner to determine the correct colors, but it’s not as important, paying attention to the lit indicators should be your primary concern. If you work down all the connections this way you should have the core reconfigured within a few attempts.
+
+Bring the New Core to Aurilia's Chief Engineer
+Bring the newly configured computer core to Aurilia's chief engineer so that he may use it to stabilize the village's primary computers and you can complete the quest.
+
+Reward: An Aurilian Sculpture Section (2/4)

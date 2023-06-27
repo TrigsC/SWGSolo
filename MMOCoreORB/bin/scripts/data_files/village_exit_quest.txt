@@ -1,0 +1,15 @@
+EXIT QUEST – DEFEAT MELLICHAE
+
+After unlocking and purchasing six full FS branches you will receive another visit from the Old Man (same rules as before for the visit). This time he has a final mission for you: To go find and defeat Mellichae at his camp!
+
+You will be given a waypoint to his camp. Once you arrive there you will find Mellichae, Daktar Bloodmoon, 2 Sith Shadow thugs, 3 Sith Shadow mercenaries, and 4 Force Crystals embedded in the ground.
+
+Mellichae is a Zabrak with a cyborg arm and evil red eyes. He has 55K HAM, 80% resists to everything (except Lightsaber damage), medium armor, and uses a Lightsaber and Force powers (including Force Lightning)! Daktar also has 80% resists to all and medium armor, with about 25K HAM, but only uses normal weapons and atttacks so he isn’t much of a threat. The Sith Shadow thugs have 10K HAM with 45% resists and the Sith Shadow mercenaries have 11K HAM with 65% resists, so they’re not too difficult either. The real catch however, is the four Force Crystals.
+
+The Force Crystals will constantly heal Mellichae and Daktar in the camp, so you can’t defeat them until you destroy the crystals (40K hit points each). However, they will also heal one another... except one of them. There will always be one crystal that the others do not heal. You need to determine which one it is and destroy them one by one this way. Once they are all destroyed 4-5 more Sith Shadow thugs will spawn and now you can attempt to kill Mellichae. (BTW, rumour has it that you can loot his cyborg arm!)
+
+Be warned that this can be a tough fight, and it wouldn’t hurt to bring some friends to help. If you die you will fail the quest and must wait for another visit from the Old Man**.
+
+However, if you successfully defeat him you will then be eligible to start the Padawan Trials. Congratulations!
+
+**Note: Supposedly if you die and fail the quest you can simply shuttle and a waypoint to a new instance of Mellichae’s camp will be given, so you don’t have to actually wait for another visit from the Old Man.
