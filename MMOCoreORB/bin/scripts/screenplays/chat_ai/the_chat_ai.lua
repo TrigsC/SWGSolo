@@ -18,30 +18,26 @@ function ChatAIScreenPlay:start()
 		print("**************** CHAT AI Screenplay !!!!!!! ")
 		--self:spawnSceneObjects()
 		self:spawnMobiles()
-
+		
 	end
 end
 
-function ChatAIScreenPlay:onPlayerLoggedIn(pPlayer)
-	if (pPlayer == nil) then
-		return
-	end
-
-    createObserver(SPATIALCHATSENT, "ChatAIScreenPlay", "notifyChatSent", pPlayer)
-	print("OBSERVER CREATED")
-
-    --Glowing:onPlayerLoggedIn(pPlayer)
-    --self:registerObservers(pPlayer)
-end
-
-function ChatAIScreenPlay:onPlayerLoggedOut(pPlayer)
-	if (pPlayer == nil) then
-		return
-	end
-
-    dropObserver(SPATIALCHATSENT, "ChatAIScreenPlay", "notifyChatSent", pPlayer)
-	print("OBSERVER DROPPED")
-end
+--function ChatAIScreenPlay:onPlayerLoggedIn(pPlayer)
+--	if (pPlayer == nil) then
+--		return
+--	end
+--    createObserver(SPATIALCHATSENT, "ChatAIScreenPlay", "notifyChatSent", pPlayer)
+--	print("OBSERVER CREATED")
+--    --Glowing:onPlayerLoggedIn(pPlayer)
+--    --self:registerObservers(pPlayer)
+--end
+--function ChatAIScreenPlay:onPlayerLoggedOut(pPlayer)
+--	if (pPlayer == nil) then
+--		return
+--	end
+--    dropObserver(SPATIALCHATSENT, "ChatAIScreenPlay", "notifyChatSent", pPlayer)
+--	print("OBSERVER DROPPED")
+--end
 
 function ChatAIScreenPlay:notifyChatSent(pPlayer, pChatMessage)
 	print("Made it to Notify")
@@ -151,9 +147,28 @@ end
 --	spawnSceneObject("tatooine", "object/static/vehicle/static_yt_1300.iff", 3863, 5, -4856, 0, math.rad(180) )-- planet, template, x, z, y, cellID, yaw
 --end
 
+function ChatAIScreenPlay:notifyEnteredArea(pArea, pPlayer)
+	if (not SceneObject(pPlayer):isPlayerCreature()) then
+		return 0
+	end
+
+	createObserver(SPATIALCHATSENT, "ChatAIScreenPlay", "notifyChatSent", pPlayer)
+
+	--if (not CreatureObject(pPlayer):hasScreenPlayState(1, "death_watch_bunker")) then
+	--	CreatureObject(pPlayer):sendSystemMessage("@dungeon/death_watch:entrance_denied")
+	--end
+
+	return 0
+end
+
 function ChatAIScreenPlay:spawnMobiles()
 
     local pC4P4 = spawnMobile("tatooine", "chat_ai_c4p4", 300, 3517.78, 5, -4817.56, 0, 0)-- planet, template, x, z, y, yaw, cellID
+	local pActiveArea = spawnActiveArea("tatooine", "object/active_area.iff", SceneObject(pC4P4):getWorldPositionX(), SceneObject(pC4P4):getWorldPositionZ(), SceneObject(pC4P4):getWorldPositionY(), 10, SceneObject(pC4P4):getObjectID())
+	-- Outside locked door message
+	if pActiveArea ~= nil then
+		createObserver(ENTEREDAREA, "ChatAIScreenPlay", "notifyEnteredArea", pActiveArea)
+	end
 
     if (pC4P4 ~= nil) then
         writeData("ai:c4p4", SceneObject(pC4P4):getObjectID())
