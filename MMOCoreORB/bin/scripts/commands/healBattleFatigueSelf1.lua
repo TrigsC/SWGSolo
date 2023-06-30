@@ -46,6 +46,12 @@ HealBattleFatigueSelf1Command = {
 	healBattleFatigue = 150,
 	forceCost = 60,
 	forceCostMultiplier = 0.1,
+
+	frsDarkExtraForceCostModifier = -0.003,
+	frsLightExtraForceCostModifier = -0.003,
+	frsLightBuffModifier = 0.25,
+	frsDarkBuffModifier = 0.25,
+	
 	defaultTime = 6,
 }
 

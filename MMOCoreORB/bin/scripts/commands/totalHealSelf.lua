@@ -61,6 +61,12 @@ TotalHealSelfCommand = {
 	healWoundAmount = -1,
 	forceCostMultiplier = 0.05,
 	defaultTime = 3,
+
+	frsDarkExtraForceCostModifier = -0.003,
+	frsLightExtraForceCostModifier = -0.003,
+	frsLightBuffModifier = 0.25,
+	frsDarkBuffModifier = 0.25,
+	
 }
 
 AddCommand(TotalHealSelfCommand)

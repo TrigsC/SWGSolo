@@ -49,6 +49,12 @@ TransferForceCommand = {
 	visMod = 25,
 	animation = "force_transfer_1",
 	combatSpam = "forcetransfer_hit",
+
+	frsDarkExtraForceCostModifier = -0.003,
+	frsLightExtraForceCostModifier = -0.003,
+	frsLightBuffModifier = 0.25,
+	frsDarkBuffModifier = 0.25,
+	
 	range = 32
 }
 

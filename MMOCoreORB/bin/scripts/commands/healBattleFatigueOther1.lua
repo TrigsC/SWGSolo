@@ -47,6 +47,12 @@ HealBattleFatigueOther1Command = {
 	forceCost = 90,
 	forceCostMultiplier = 1,
 	defaultTime = 6,
+
+	frsDarkExtraForceCostModifier = -0.003,
+	frsLightExtraForceCostModifier = -0.003,
+	frsLightBuffModifier = 0.25,
+	frsDarkBuffModifier = 0.25,
+	
 	range = 32,
 }
 
