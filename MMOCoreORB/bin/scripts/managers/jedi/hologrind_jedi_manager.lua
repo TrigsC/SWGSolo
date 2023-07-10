@@ -141,8 +141,9 @@ function HologrindJediManager:awardJediStatusAndSkill(pCreatureObject)
 	end
 
 	-- awardSkill(pCreatureObject, "force_title_jedi_novice")
+	PlayerObject(pGhost):setJediState(2)
 	awardSkill(pCreatureObject, "jedi_padawan")
-	PlayerObject(pGhost):setJediState(1)
+	
 end
 
 -- Check if the player has mastered all hologrind professions and send sui window and award skills.
@@ -237,11 +238,11 @@ function HologrindJediManager:useItem(pSceneObject, itemType, pCreatureObject)
 	end
 
 	if itemType == ITEMHOLOCRON then
-		if VillageJediManagerHolocron.canUseHolocron(pPlayer) then
-			if VillageJediManagerHolocron.canReplenishForce(pPlayer) then
-				VillageJediManagerHolocron.useTheHolocron(pSceneObject, pPlayer)
+		if VillageJediManagerHolocron.canUseHolocron(pCreatureObject) then
+			if VillageJediManagerHolocron.canReplenishForce(pCreatureObject) then
+				VillageJediManagerHolocron.useTheHolocron(pSceneObject, pCreatureObject)
 			else
-				VillageJediManagerHolocron.cannotReplenishForce(pPlayer)
+				VillageJediManagerHolocron.cannotReplenishForce(pCreatureObject)
 			end
 		else
 			local isSilent = self:sendHolocronMessage(pCreatureObject)

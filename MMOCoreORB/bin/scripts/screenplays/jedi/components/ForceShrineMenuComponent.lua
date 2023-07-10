@@ -83,7 +83,7 @@ function ForceShrineMenuComponent:doMeditate(pObject, pPlayer)
 		CreatureObject(pPlayer):sendSystemMessage("@jedi_trials:force_shrine_wisdom_" .. getRandomNumber(1, 15))
 		local pGhost = CreatureObject(pPlayer):getPlayerObject()
 		awardSkill(pPlayer, "jedi_padawan_novice")
-		PlayerObject(pGhost):setJediState(2)
+		--PlayerObject(pGhost):setJediState(2)
 		--CreatureObject(pPlayer):setJediState(2)
 	end
 end
