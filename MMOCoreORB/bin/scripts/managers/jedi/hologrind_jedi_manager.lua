@@ -237,12 +237,20 @@ function HologrindJediManager:useItem(pSceneObject, itemType, pCreatureObject)
 	end
 
 	if itemType == ITEMHOLOCRON then
-		local isSilent = self:sendHolocronMessage(pCreatureObject)
-		if isSilent then
-			return
+		if VillageJediManagerHolocron.canUseHolocron(pPlayer) then
+			if VillageJediManagerHolocron.canReplenishForce(pPlayer) then
+				VillageJediManagerHolocron.useTheHolocron(pSceneObject, pPlayer)
+			else
+				VillageJediManagerHolocron.cannotReplenishForce(pPlayer)
+			end
 		else
-			SceneObject(pSceneObject):destroyObjectFromWorld()
-			SceneObject(pSceneObject):destroyObjectFromDatabase()
+			local isSilent = self:sendHolocronMessage(pCreatureObject)
+			if isSilent then
+				return
+			else
+				SceneObject(pSceneObject):destroyObjectFromWorld()
+				SceneObject(pSceneObject):destroyObjectFromDatabase()
+			end
 		end
 	end
 end
