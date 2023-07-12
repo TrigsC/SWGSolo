@@ -77,8 +77,11 @@ class AiAgent extends CreatureObject {
 	protected transient CellObject targetCellObject;
 
 	protected WeaponObject defaultWeapon;
+
 	protected WeaponObject primaryWeapon;
+
 	protected WeaponObject secondaryWeapon;
+
 	protected WeaponObject thrownWeapon;
 
 	protected WeaponObject currentWeapon;
@@ -715,17 +718,12 @@ class AiAgent extends CreatureObject {
 	@preLocked
 	public abstract native void notifyDespawn(Zone zone);
 
-	public abstract void scheduleDespawn() {
-		//Despawn in 5 minutes.
-		scheduleDespawn(300);
-	}
-
 	/**
 	 * Schedules despawn of the AiAgent.
 	 * @param timeToDespawn the time to despawn the AiAgent in seconds.
 	 */
 	@preLocked
-	public abstract native void scheduleDespawn(int timeToDespawn);
+	public abstract native void scheduleDespawn(int timeToDespawn, boolean force = false);
 
 	/**
 	 * Respawns creature to specified zone with home location position
@@ -1552,6 +1550,21 @@ class AiAgent extends CreatureObject {
 		defaultWeapon = weap;
 	}
 
+	@preLocked
+	public void setPrimaryWeapon(WeaponObject weap) {
+		primaryWeapon = weap;
+	}
+
+	@preLocked
+	public void setSecondaryWeapon(WeaponObject weap) {
+		secondaryWeapon = weap;
+	}
+
+	@preLocked
+	public void setThrownWeapon(WeaponObject weap) {
+		thrownWeapon = weap;
+	}
+
 	@dirty
 	public abstract WeaponObject getPrimaryWeapon() {
 		return primaryWeapon;
@@ -1572,22 +1585,25 @@ class AiAgent extends CreatureObject {
 		return thrownWeapon;
 	}
 
+	@dirty
+	public native WeaponObject getCurrentWeapon() {
+		return currentWeapon;
+	}
+
 	@preLocked
 	public void clearThrownWeapon() {
 		thrownWeapon = null;
 	}
 
-	@dirty
-	public abstract WeaponObject getCurrentWeapon() {
-		return defaultWeapon;
-	}
-
-	public void nullifyWeapons () {
+	public void nullifyWeapons() {
+		currentWeapon = null;
 		primaryWeapon = null;
 		secondaryWeapon = null;
 		thrownWeapon = null;
-		currentWeapon = null;
 	}
+
+	@preLocked
+	public native void destroyAllWeapons();
 
 	@read
 	public int getMobType() {
