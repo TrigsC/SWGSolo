@@ -4,7 +4,7 @@ local ObjectManager = require("managers.object.object_manager")
 jediManagerName = "HologrindJediManager"
 
 NUMBEROFPROFESSIONSTOMASTER = 6
-MAXIMUMNUMBEROFPROFESSIONSTOSHOWWITHHOLOCRON = NUMBEROFPROFESSIONSTOMASTER - 2
+MAXIMUMNUMBEROFPROFESSIONSTOSHOWWITHHOLOCRON = NUMBEROFPROFESSIONSTOMASTER
 
 HologrindJediManager = JediManager:new {
 	screenplayName = jediManagerName,
@@ -127,7 +127,8 @@ end
 -- @param pCreatureObject pointer to the creature object of the player who unlocked jedi.
 function HologrindJediManager:sendSuiWindow(pCreatureObject)
 	local suiManager = LuaSuiManager()
-	suiManager:sendMessageBox(pCreatureObject, pCreatureObject, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone...", "@ok", "HologrindJediManager", "notifyOkPressed")
+	--suiManager:sendMessageBox(pCreatureObject, pCreatureObject, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone...", "@ok", "HologrindJediManager", "notifyOkPressed")
+	suiManager:sendMessageBox(pCreatureObject, pCreatureObject, "@quest/force_sensitive/intro:force_sensitive", "Perhaps you should meditate somewhere alone... Make sure to drop all skills before meditating.", "@ok", "HologrindJediManager", "notifyOkPressed")
 end
 
 -- Award skill and jedi status to the player.
@@ -139,8 +140,10 @@ function HologrindJediManager:awardJediStatusAndSkill(pCreatureObject)
 		return
 	end
 
-	awardSkill(pCreatureObject, "force_title_jedi_novice")
-	PlayerObject(pGhost):setJediState(1)
+	-- awardSkill(pCreatureObject, "force_title_jedi_novice")
+	PlayerObject(pGhost):setJediState(2)
+	awardSkill(pCreatureObject, "jedi_padawan")
+	
 end
 
 -- Check if the player has mastered all hologrind professions and send sui window and award skills.
@@ -179,6 +182,8 @@ function HologrindJediManager:onPlayerLoggedIn(pCreatureObject)
 	if (pCreatureObject == nil) then
 		return
 	end
+	CreatureObject(pCreatureObject):clearBuffs(true, false)
+	CreatureObject(pCreatureObject):enhanceCharacter()
 
 	self:checkIfProgressedToJedi(pCreatureObject)
 	self:registerObservers(pCreatureObject)
@@ -233,12 +238,20 @@ function HologrindJediManager:useItem(pSceneObject, itemType, pCreatureObject)
 	end
 
 	if itemType == ITEMHOLOCRON then
-		local isSilent = self:sendHolocronMessage(pCreatureObject)
-		if isSilent then
-			return
+		if VillageJediManagerHolocron.canUseHolocron(pCreatureObject) then
+			if VillageJediManagerHolocron.canReplenishForce(pCreatureObject) then
+				VillageJediManagerHolocron.useTheHolocron(pSceneObject, pCreatureObject)
+			else
+				VillageJediManagerHolocron.cannotReplenishForce(pCreatureObject)
+			end
 		else
-			SceneObject(pSceneObject):destroyObjectFromWorld()
-			SceneObject(pSceneObject):destroyObjectFromDatabase()
+			local isSilent = self:sendHolocronMessage(pCreatureObject)
+			if isSilent then
+				return
+			else
+				SceneObject(pSceneObject):destroyObjectFromWorld()
+				SceneObject(pSceneObject):destroyObjectFromDatabase()
+			end
 		end
 	end
 end

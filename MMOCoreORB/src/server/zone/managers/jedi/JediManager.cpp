@@ -57,7 +57,8 @@ void JediManager::loadConfiguration(Lua* luaEngine) {
 		luaEngine->runFile("scripts/managers/jedi/village_jedi_manager.lua");
 		break;
 	case CUSTOMJEDIPROGRESSION:
-		luaEngine->runFile(luaEngine->getGlobalString("customJediProgressionFile"));
+		luaEngine->runFile("scripts/managers/jedi/custom_jedi_manager.lua");
+		//luaEngine->runFile(luaEngine->getGlobalString("customJediProgressionFile"));
 		break;
 	default:
 		break;

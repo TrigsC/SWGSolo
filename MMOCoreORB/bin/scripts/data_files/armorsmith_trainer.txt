@@ -1,0 +1,36 @@
+Armorsmith
+
+Corellia - 
+Bela Vistal - 6868.5 -5434.5
+Coronet - 35 -4452
+Doaba Guerfel - 3127 5285.5
+Kor Vella - -3696.5 3075
+Tyrena - -5516 -2667
+Tyrena - -5118 -2337
+
+Naboo - 
+Deeja Peak - 4746 -1275
+Deeja Peak - 4771 -1272
+Kaadara - 5140 6815
+Keren - 1801 2565
+Keren - 1890 2767
+Moenia - 4790 -5000
+Theed - -5467 3996
+
+Rori - 
+Narmle - -5248 -2358
+Narmle - -5026 -2417
+Rebel Outpost - 3676 -6419
+Restuss - 5373 5611
+
+Talus - 
+Dearic - 598 -3066
+Dearic - 351 -2875.9
+Nashal - 4273 5106
+
+Tatooine - 
+Bestine - -1243 -3506
+Mos Eisley - 3349 -4695
+Mos Entha - 1306 3392
+Mos Entha - 1247 3248
+Mos Espa - -3070 2061

@@ -1,0 +1,153 @@
+PADAWAN TRAILS
+
+Introduction
+Once you defeat Mellichae you will receive a waypoint to the nearest Force Shrine. Once there, you can meditate** in front of a Force Shrine to begin the Jedi Padawan Trials. The shrine will then give you various trials (random order), which you must complete. At the eighth trial you will become a Jedi Initiate and gain the ability to craft and use Lightsabers, which in fact will be your trial at that point. If you successfully complete all sixteen of the trials you will pass the trials and become a Jedi Padawan!
+
+Be careful doing the trials, if you fail three trials you will lose all progress and have to start them over again from the beginning.
+
+BTW, you can restart the current trial at any time by revisiting a Force Shrine. Also, if you so wish, you can restart the Padawan Trials all the way from the beginning as well.
+
+**Note: In order to meditate in front of the shrine, kneel and select the "meditate" option from the shrine's radial menu. You do NOT need the TKA meditate skill!
+
+
+Architect Trial
+Trial: A Jedi must gather all possible information before making a decision.
+
+Description: Travel to the planet [planet]. Once there, a waypoint will be uploaded to your datapad leading you to an architect by the name of Kant Graf in the city of [city]. An architect, Kant Graf, has asked you to clear some land so that he may build there.
+
+Solution: Allow the Gungan to keep his land.
+
+
+Artist Trial
+Trial: A Jedi must understand the motivations and desires of others without becoming emotionally involved.
+
+Description: Travel to the planet [planet]. Once there, a waypoint will be uploaded to your datapad leading you to an artist named Sathme Forr in the city of [city]. An artist, Sathme Forr, has requested your help in getting her supplies from her assistant
+
+Solution: Tell Sathme that the assistant is not coming back, but you have her supplies.
+
+
+Bad Cat Trial
+Trial: A Jedi must do everything possible to keep innocent civilians from being in danger.
+
+Description: Travel to the planet [planet]. Once there, a waypoint will be uploaded to your datapad leading you to an actor named Yvana Bailer in the city of [city]. An actor named Yvana Bailer wants you to help put an end to a rampaging predator cat that has escaped.
+
+Solution: Kill the kitty.
+
+
+Chef Trial
+Trial: A Jedi must recognize chaos but not become a part of it.
+
+Description: Travel to the planet [planet]. Once there, a waypoint will be uploaded to your datapad leading you a chef named Seevi Nyed in to the city of [city]. A chef named Seevi Nyed wants you to stop a lowlife who stole his baked goods
+
+Solution: Tell Seevi that you won't do it. A pie is not worth a life, silly chef.
+
+
+Pannaqa Trial
+Trial: A Jedi should always be willing to lend a helping hand whenever possible.
+
+Descrption: Travel to the planet [planet]. Once there, a waypoint will be uploaded to your datapad leading you to a farmer named Pannaqa in the village of [city]. Pannaqa, a farmer, has asked for your help in getting a part he needs for his vibro-tiller.
+
+Solution: Tell the drunken man that you will take it to the farmer and that you don't trust him.
+
+
+Old Musician Trial
+Trial: A Jedi must always display respect and dignity when interacting with others.
+
+Description: Travel to the planet [planet]. Once there, a waypoint will be uploaded to your datapad leading you to a retired musician named Grizzlo the city of [city]. An elderly musician named Grizzlo has asked that you find any remaining members from his long forgotten musical group.
+
+Solution: To successfully complete the quest talk to all the people that you are sent to. One is in Mos Eisley, the next in Lok. After speaking with the man in Lok and getting the ring go back to Grizzlo. Tell Grizzlo Samston wanted him to have the ring and give it to him.
+
+
+People's Soldier Trial
+Trial: A Jedi must put aside personal feelings when aiding someone they might not find appealing.
+
+Description: Travel to the planet [planet]. Once there, a waypoint will be uploaded to your datapad leading you to an old soldier named Torin Gundo in the city of [city].
+
+Solution: Kill the guy that Torin sends you to and return the stuff to him.
+
+
+Sob Story Trial
+Trial: A Jedi should remain calm in the face of emotion.
+
+Description: Travel to the planet [planet]. Once there, a waypoint will be uploaded to your datapad leading you to a young woman named Erim Thelcar in the city of [city]. Erim Thelcar asks that you find her brother... or at least her brothers remains... and retrieve a blaster that is a family heirloom.
+
+Solution: Examine the corpse you are sent to and get the blaster, return it to Erim.
+
+
+Spice Mom Trial
+Trial: A Jedi should always strive for understanding rather than blind faith.
+
+Description: Travel to the planet [planet]. Once there, a waypoint will be uploaded to your datapad leading you to a woman named Sola Nosconda in the city of [city]. Sola Nosconda has asked you to pick up some supplies for her and bring them to her.
+
+Solution: Go to the man that she sends you to. He is obviously a spice dealer, so tell the man you found the wrong guy and then to stay away from Sola, he will eventually give you the spice anyway. Go back to the Sola and do not give her the spice until she tells you about her son being in pain.
+
+
+Surveyor Trial
+Trial: A Jedi should be prepared to undertake that which others will not.
+
+Descrption: Travel to the planet [planet]. Once there, a waypoint will be uploaded to your datapad leading you to a surveyor named Par Doiae in the city of [city]. A surveyor, Par Doiae, has asked your help in clearing a sharnaff bull from a site where he needs to work.
+
+Solution: Kill the Sharnaff Bull.
+
+
+Politician Trial
+Trial: A Jedi should be equally a public servant and a public defender.
+
+Description: Travel to the planet [planet]. Once there, a waypoint will be uploaded to your datapad leading you to a politician named Kaul Dysen in the city of [city]. A politician named Kaul Dysen would like your help destroying a bloodseeker mite that is wreaking havoc in the area.
+
+Solution: Kill the Bloodseeker Mite.
+
+
+The Ring Trial
+Trial: A Jedi must be willing to put himself in danger in order to do what is right.
+
+Description: Travel to the planet [planet]. Once there, a waypoint will be uploaded to your datapad leading you to a man named Keicho in the city of [city]. Keicho wants you to retrieve a ring that he lost. This ring is the wedding ring of his wife's mother.
+
+Solution: To successfully complete the quest either kill the man or don't kill the man if possible, then return the ring to Keicho.
+
+
+Kill Baz Nitch Trial
+Trial: A Jedi must be an able and courageous warrior.
+
+Description: Travel to the planet [planet]. Once there, a waypoint will be uploaded to your datapad leading you to an environmentalist named Menchi in the city of [city]. An environmentalist named Menchi has asked you to kill 20 baz nitches. Total killed so far: ##
+
+Solution: Kill 20 Baz Nitches (of any type) on Dathomir. You can get missions (11k) for them or find them in the wild.
+
+
+Kill Sludge Panther Trial
+Trial: A Jedi must do whatever is possible to protect the natural order of the universe.
+
+Description: Travel to the planet [planet]. Once there, a waypoint will be uploaded to your datapad leading you to an ecologist named Luha Kellaro in the city of [city]. An ecologist named Luha Kellaro has asked you to kill 20 sludge panthers. Total killed so far: ##
+
+Solution: Kill 20 Sludge Panthers (of any type) on Talus. Minor Sludge Panthers spawn around Dearic, not many spawn at once so you will have to circle around the whole city on the outskirts, but eventually you will find them. However, these are usually static spawn cycling points, where several waves of spawns will cycle. If you keep killing the waves eventually a Minor Sludge Panther wave will come. If you stick to one of these points you will complete the trial in no time.
+Here are the waypoints for known ones around Dearic (re-spawn rate is usually less than a minute):
+(158,-2511)
+(72,-3298)
+(-39,-2574)
+(405,-2376)
+(500,-3400)
+(986,-2975)
+
+
+Kill Falumpaset Trial
+Trial: A Jedi must understand that there are times when a greater good outweighs a lesser evil.
+
+Description: Travel to the planet [planet]. Once there, a waypoint will be uploaded to your datapad leading you to a naturalist named Braganta in the city of [city]. A naturalist named Braganta has asked you to kill 20 falumpasets. Total killed so far: ##
+
+Solution: Kill 20 Falumpasets (of any type) on Naboo. The best place for this is southeast of the Gungan Scared Palace POI. Gungan falumpasets also count as ones you can kill for credit so kill them if you like (level 25 Gungan Mercenary missions from Moenia?).
+
+
+Craft Lightsaber Trial
+Trial: Thanks to your progress thus far, you have been granted the rank of Jedi Initiate.
+
+Description 1: With this honor comes the ability to craft your first lightsaber.Such is your next task... to craft yourself a lightsaber.
+
+Description 2: Well done. Your first lightsaber is now complete. Before you may use it, though, it requires a Force crystal. As your next task, obtain and tune a Force crystal for use with your lightsaber.
+
+Solution: The time has come to craft your first Lightsaber! After successfully creating it tune a Color Force Crystal (non-white one) when told to (and only when told to). This is always the eighth trial and you will gain the Jedi Initiate status when given this trial.
+
+
+Conclusion
+After successfully completing all sixteen trials you will gain the Jedi Padawan title, a Padawan Robe, and the ability to start training in the Jedi Disciplines. Also, you'll unlock your second character slot, with which you can do whatever you want, including becoming a Jedi again (but you will not unlock any further slots).
+
+Congratulations, you've earned it!

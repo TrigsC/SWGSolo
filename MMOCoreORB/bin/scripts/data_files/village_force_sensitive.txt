@@ -1,0 +1,15 @@
+Force Sensitivity
+
+You can determine how close you are to becoming eligible for a visit from the Old Man by using the /checkForceStatus command.
+
+This will give you one of six possible messages:
+
+1/6: "You feel no connection with the force."
+2/6: "You barely notice something different about yourself."
+3/6: "You feel a faint sense of the force."
+4/6: "You feel the Force surge within you."
+5/6: "You have a strong sense of the Force within you."
+6/6: "You feel an inner glow. The Force is with you."
+Once you gain the "You feel an inner glow. The Force is with you." status you will be eligible for a visit from the Old Man.
+
+Note: There is a rumour that dying before you receive the visit can lower your level of Force Sensitivity, meaning you'll have to raise it back up in order to be eligible for a visit again. This has yet to be confirmed or proven wrong though.

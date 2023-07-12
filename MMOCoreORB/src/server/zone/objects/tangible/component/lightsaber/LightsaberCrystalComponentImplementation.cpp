@@ -282,7 +282,7 @@ void LightsaberCrystalComponentImplementation::fillAttributeList(AttributeListMe
 	}
 
 	PlayerObject* player = object->getPlayerObject();
-	if (object->hasSkill("force_title_jedi_rank_01") || player->isPrivileged()) {
+	if (object->hasSkill("force_title_jedi_rank_01") || object->hasSkill("jedi_padawan_novice") || player->isPrivileged()) {
 		if (ownerID == 0) {
 			StringBuffer str;
 			str << "\\#pcontrast2 UNTUNED";
@@ -323,7 +323,7 @@ void LightsaberCrystalComponentImplementation::fillAttributeList(AttributeListMe
 }
 
 void LightsaberCrystalComponentImplementation::fillObjectMenuResponse(ObjectMenuResponse* menuResponse, CreatureObject* player) {
-	if (ownerID == 0 && player->hasSkill("force_title_jedi_rank_01") && hasPlayerAsParent(player)) {
+	if (ownerID == 0 && (player->hasSkill("force_title_jedi_rank_01") || player->hasSkill("jedi_padawan_novice")) && hasPlayerAsParent(player)) {
 		String text = "@jedi_spam:tune_crystal";
 		menuResponse->addRadialMenuItem(128, 3, text);
 	}
@@ -343,7 +343,7 @@ void LightsaberCrystalComponentImplementation::fillObjectMenuResponse(ObjectMenu
 }
 
 int LightsaberCrystalComponentImplementation::handleObjectMenuSelect(CreatureObject* player, byte selectedID) {
-	if (selectedID == 128 && player->hasSkill("force_title_jedi_rank_01") && hasPlayerAsParent(player) && ownerID == 0) {
+	if (selectedID == 128 && (player->hasSkill("force_title_jedi_rank_01") || player->hasSkill("jedi_padawan_novice")) && hasPlayerAsParent(player) && ownerID == 0) {
 		ManagedReference<SuiMessageBox*> suiMessageBox = new SuiMessageBox(player, SuiWindowType::TUNE_CRYSTAL);
 
 		suiMessageBox->setPromptTitle("@jedi_spam:confirm_tune_title");
@@ -402,9 +402,9 @@ bool LightsaberCrystalComponentImplementation::hasPlayerAsParent(CreatureObject*
 }
 
 void LightsaberCrystalComponentImplementation::tuneCrystal(CreatureObject* player) {
-	if(!player->hasSkill("force_title_jedi_rank_01") || !hasPlayerAsParent(player)) {
-		return;
-	}
+	//if(!player->hasSkill("force_title_jedi_rank_01") || !player->hasSkill("jedi_padawan_novice") || !hasPlayerAsParent(player)) {
+	//	return;
+	//}
 
 	if (getColor() == 31) {
 		ManagedReference<PlayerObject*> ghost = player->getPlayerObject();
@@ -427,6 +427,7 @@ void LightsaberCrystalComponentImplementation::tuneCrystal(CreatureObject* playe
 
 		ownerID = player->getObjectID();
 		ownerName = player->getDisplayedName();
+		info(true) << "OwnerID: " << ownerID << " OwnerName: " << ownerName;
 
 		// Color code is lime green.
 		String tuneName = StringIdManager::instance()->getStringId(objectName.getFullPath().hashCode()).toString();

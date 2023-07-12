@@ -1,0 +1,122 @@
+FORCE SENSITIVE QUESTS
+
+Note: Rewards from the Aurilia quests can be traded.
+
+Note: You do not need your Quest Journal Force Crystal on you to accept quests (but it helps you get through some of them).
+
+Note: Make sure you have space in your Datapad. A lot of the quests require that you have room there for waypoints, and occasionally some other stuff. If you don’t have room it can cause problems, including potentially bugging the quest.
+
+Note: To complete the Aurilian Sculpture, collect all four of the pieces from the various quests, and then stand in a spot in your house and drop them one after another. They will automatically align into a double-pronged sculpture of the Aurilian symbol (like on the banner).
+
+ 
+
+--- PHASE 1 ---
+
+Combat: Village Patrols
+
+Villager: Captain Sarguillo (5313,-4161)
+
+FS Branch Unlocked: Combat Prowess: Ranged Accuracy
+
+Description:
+You must undertake 10 patrols. When you approach one of the given waypoints you will receive a system message that reveals whether there are any Sith Shadows at that patrol point. If there are 1-3 enemies there you must kill them, if there are more than 3 then do not kill any and just move on to the next point. If you don't follow those rules you will fail the patrol and have to grab another.
+
+After completing 10 patrols you will successfully unlock the FS branch, at which point you can choose to do 10 extra patrols for a reward. Be warned that each successive patrol will get larger and larger, near the end of the 20 patrols the waypoints will be almost 2,000 meters apart! It's quite time consuming...
+
+Reward: If you do the patrols twice (20 total) you will be awarded an Aurilian Banner, a nice banner that blows in the wind like those at the starports.
+
+
+Reflexes: Rescue Missing Villagers
+
+Villager: Whip (5383,-4226)
+
+FS Branch Unlocked: Enhanced Reflexes: Survival
+
+Description:
+During recent raids on the village several inhabitants have gone missing. Whip asks you to aid the village by tracking down these missing villagers. You are asked to rescue 5 in all.
+
+Whip will give you a waypoint. When you reach the waypoint you will be alerted that you are close to a Sith Shadow encampment with a prisoner. The encampment will show up on the overhead map as a small bar (perhaps with a square next to it). It will spawn somewhere within about 250m of the initial waypoint.
+
+The camp will contain three Sith Shadow pirates and a thug. Dispatch these and converse with the captured villager. He will then follow you and you must take him back to the base (you must go the whole way with them). Be aware that Sith Shadows may attack you and the villager on the way back. You need to protect the villager and make sure you both make it back alive.
+
+Reward: An Aurilian Sculpture Section (3/4)
+
+
+Senses: Cure the Sick
+
+Villager: Sivarra Mecheaux (5391,-4075)
+
+FS Branch Unlocked: Heightened Senses: Persuasion
+
+Description:
+You are asked to create medicines with which to treat injured and sick villagers.
+
+You will need a Doctor with Master Doctor's Medicine Crafting (Doc:0004) in order to craft the cures. You’ll also need a droid with a private food & chemical crafting station built in to allow experimentation.
+
+To create the required cures you will need to control the medicine through experimentation and use various qualities of resources. Each cure requires 10 Metal and 5 Flora, with Overall Quality (OQ) weighing 66% and Potential Energy (PE) weighing 33% for experimentation. It's best to bring both high and low quality resources so you can hit all the various experimental ranges.
+
+Through multiple applications of the different medications you'll be able to cure the symptoms of the sick. The medical droids will help you administer the cures to the patients.
+
+Symptoms and the required experimentation for cures (overlap is due to decimals):
+
+fever = 0-8% experimentation
+vomiting = 8-16% experimentation
+open sores = 17-25% experimentation
+puss filled lesions = 25-33% experimentation
+erratic heart rate = 33-41% experimentation
+respiratory failure = 42-50% experimentation
+lost vision = 50-58% experimentation
+partial paralysis = 58-66% experimentation
+violent spasms = 67-75% experimentation
+bloody cough = 75-83% experimentation
+swelling = 83-91% experimentation
+internal bleeding = 92-100% experimentation
+After curing the initial 5 villagers you will unlock the FS branch. You can then cure an additional 5 villagers (extended) for a reward, and even another 5 villagers after that (extra cures) for a very unique reward!
+
+Note: It’s important that you talk to Sivarra every time you cure 5 villagers! There’s no indication when you have completed each set so you must request the reward yourself from her (and ask to help with more so you can get the further rewards).
+
+Reward: Cure 5 villagers to unlock the FS branch, cure 5 more villagers (10 in total) to unlock an Ice Pendant necklace with Combat Medicine Experimentation +5, and finally cure 5 more villagers (15 in total) to unlock an Aurilian Plant for your house that needs Watering and Nutrients. If properly taken care of the plant can grow large and bear special vitalizing fruit (a Force Melon) that you can pick and use (heals Health/Action/Mind +1000, 10 food filling, single use)! However, if you neglect the plant there is a chance that it could die...
+
+
+Crafting: Repair the Sensor Array
+
+Villager: Quharek (5373,-4181)
+
+FS Branch Unlocked: Crafting Mastery: Assembly
+
+Description:
+The Village's Sensor Array was damaged in the attack and their Chief Engineer was killed. Quharek asks you to repair it, directing you to the damaged Sensor Array (5419,-4119). It has four broken components which you must retrieve and bring to the Chief Engineer's hut nearby (5379,-4116). This hut has 2 workstations in it: a Recursive Analyzer that takes the broken components and makes schematics for new ones, and a Multi-phase Calibrator that balances them to work properly.
+
+IMPORTANT: You need to bring these resources with you (quality doesn't matter):
+
+Steel
+Copper
+Aluminum
+Polymer
+Lubricating Oil
+Carbonate Ore
+Extrusive Ore
+Rori Fiberplast
+Talusian Fiberplast
+Nabooian Water Vapor
+Yavinian Wind Energy
+The schematics you get from the Recursive Analyzer are single use only, however, if you need another then you can just request one from the Analyzer's memory (only if you have used up your current one). Once you have the schemas you can craft the replacement components using a Generic Crafting Tool (no crafting skills required). If you critical fail while crafting you will not lose the usage on the schematic or even any of the resources.
+
+After the components are crafted they will need to be balanced using the Multi-phase Calibrator. Each component will have its own unique graphical logic puzzle, which you must complete in order to successfully calibrate the component. Be aware that as you attempt a puzzle the component will lose integrity (displayed in the puzzle's text area), once the component's integrity reaches 0% it will break (don't worry, like I said above, you can craft another with a new schema).
+
+Once all four are calibrated, replace them into the Sensor Array and it will come back online.
+
+Component Calibrations:
+
+Configuration Processor (50 Rori Fiberplast, 30 Copper, 40 Aluminum, 15 Copper)
+Press the small triangular buttons to adjust the configuration setting so that the component configuration (top pattern) matches the expected configuration (bottom pattern). Pressing a button will toggle its illumination state, as well as the state of two other buttons.
+Gyroscopic Receiver (50 Yavinian Wind Energy, 20 Lubricating Oil, 45 Steel, 20 Copper)
+Use the sliders on the right to adjust the geographical resolution so that the component parameters (top shades) matches the expected parameters (bottom shades). Changes made to the sliders will not be reflected in real-time. You must press the "OK" button in order to view your changes.
+Sliders: Longitude Resolution, Latitude Resolution, and Vertical Resolution.
+Signal Amplifier (70 Copper, 20 Carbonate Ore, 25 Talusian Fiberplast, 20 Aluminum)
+Use the sliders on the right to adjust the frequency amplification so that the component output (top graph) matches the expected output (bottom graph). Changes made to the sliders will not be reflected in real-time. You must press the "OK" button in order to view your changes.
+Sliders: Pre-amp Boost, Amplification, and Post-amp Tuning.
+Solid State Array (100 Extrusive Ore, 10 Nabooian Water Vapor, 20 Polymer, 10 Copper)
+Use the sliders on the right to adjust the solid state devices (represented by the horizontal bars) so that they are aligned around the transmission bus (vertical line). Changes made to the sliders will not be reflected in real-time. You must press the "OK" button in order to view your changes.
+Sliders: Element One Alignment, Element Two Alignment, Element Three Alignment, Element Four Alignment, and Element Five Alignment.
+Reward: An Aurilian Sculpture Section (4/4)

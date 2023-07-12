@@ -97,6 +97,8 @@ Luna<LuaCreatureObject>::RegType LuaCreatureObject::Register[] = {
 		{ "subtractBankCredits", &LuaCreatureObject::subtractBankCredits},
 		{ "addCashCredits", &LuaCreatureObject::addCashCredits},
 		{ "addBankCredits", &LuaCreatureObject::addBankCredits},
+		{ "clearBuffs", &LuaCreatureObject::clearBuffs},
+		{ "setHeight", &LuaCreatureObject::setHeight},
 		{ "removeScreenPlayState", &LuaCreatureObject::removeScreenPlayState},
 		{ "isGrouped", &LuaCreatureObject::isGrouped},
 		{ "isGroupedWith", &LuaCreatureObject::isGroupedWith},
@@ -752,6 +754,34 @@ int LuaCreatureObject::addBankCredits(lua_State* L) {
 	TransactionLog trx(TrxCode::LUASCRIPT, realObject, credits, false);
 	trx.addContextFromLua(L);
 	realObject->addBankCredits(credits, notifyClient);
+
+	return 0;
+}
+
+int LuaCreatureObject::clearBuffs(lua_State* L) {
+	bool updateClient = lua_toboolean(L, -1);
+	bool removeAll = lua_toboolean(L, -2);
+
+	Locker locker(realObject);
+
+	realObject->clearBuffs(updateClient, removeAll);
+
+	return 0;
+}
+
+int LuaCreatureObject::setHeight(lua_State* L) {
+	
+	CreatureObject* player = (CreatureObject*) lua_touserdata(L, -1);
+	
+	if (realObject == nullptr)
+		return 0;
+	Locker lock(realObject);
+	float heightID = 0.0;
+	
+	if (player != nullptr) {
+		heightID = player->getHeight();
+	}
+	realObject->setHeight(heightID*1.5, true);
 
 	return 0;
 }

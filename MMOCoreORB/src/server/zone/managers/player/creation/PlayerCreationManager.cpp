@@ -379,8 +379,8 @@ bool PlayerCreationManager::createCharacter(ClientCreateCharacterCallback* callb
 	String profession, customization, hairTemplate, hairCustomization;
 	callback->getSkill(profession);
 
-	if (profession.contains("jedi"))
-		profession = "crafting_artisan";
+	//if (profession.contains("jedi"))
+	//	profession = "crafting_artisan";
 
 	callback->getCustomizationString(customization);
 	callback->getHairObject(hairTemplate);
@@ -408,7 +408,7 @@ bool PlayerCreationManager::createCharacter(ClientCreateCharacterCallback* callb
 	Locker playerLocker(playerCreature);
 
 	playerCreature->createChildObjects();
-	playerCreature->setHeight(height);
+	playerCreature->setHeight(height/1.5);
 	playerCreature->setCustomObjectName(characterName, false); //TODO: Validate with Name Manager.
 
 	client->setPlayer(playerCreature);
