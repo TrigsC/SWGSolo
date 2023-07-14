@@ -17,7 +17,7 @@ function ChatAIScreenPlay:start()
 		Logger:log("Starting the CHAT AI Screenplay.", LT_INFO)
 		print("**************** CHAT AI Screenplay !!!!!!! ")
 		--self:spawnSceneObjects()
-		self:spawnMobiles()
+		--self:spawnMobiles()
 		
 	end
 end
