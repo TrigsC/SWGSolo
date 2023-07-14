@@ -35,3 +35,5 @@ includeFile("trainer/trainer_squadleader.lua")
 includeFile("trainer/trainer_tailor.lua")
 includeFile("trainer/trainer_unarmed.lua")
 includeFile("trainer/trainer_weaponsmith.lua")
+
+includeFile("trainer/trainer_pre9.lua")
