@@ -1,4 +1,4 @@
-noldan = Creature:new {
+trainer_pre9 = Creature:new {
 	customName = "Mysterious Figure",
 	randomNameTag = false,
 	mobType = MOB_NPC,
