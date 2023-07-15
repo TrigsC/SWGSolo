@@ -368,7 +368,7 @@ TatooineMosEisleyScreenPlay = CityScreenPlay:new {
 		{"trainer_rifleman",0,3426,5,-4917,0,0, ""},
 		{"trainer_scout",0,3519.76,5,-4786.9,77,0, ""},
 		{"trainer_smuggler",0,3401,5,-4879,340,0, "worried"},
-		{"trainer_pre9",300,3517.78,5,-4817.56,0, ""}
+		{"trainer_pre9",0,3517.78,5,-4817.56,300,0, ""}
 	}
 }
 
