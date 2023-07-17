@@ -182,7 +182,7 @@ tatooine_regions = {
 	{"@tatooine_region_names:wayfar", -5174, -6582, {CIRCLE, 230}, CITY + NOSPAWNAREA},
 	{"@tatooine_region_names:anchorhead", 102, -5360, {CIRCLE, 125}, CITY + NOSPAWNAREA},
 	{"bestine_nobuild_1", -1218, -3688, {CIRCLE, 700},  NOBUILDZONEAREA + NOWORLDSPAWNAREA},
-	{"mos_eisley_nobuild_1", 3460, -4768, {CIRCLE, 900}, NOBUILDZONEAREA + NOWORLDSPAWNAREA},
+	{"mos_eisley_nobuild_1", 3460, -4768, {CIRCLE, 400}, NOBUILDZONEAREA},
 	{"mos_entha_nobuild_1", 1488, 3256, {CIRCLE, 900}, NOBUILDZONEAREA + NOWORLDSPAWNAREA},
 	{"mos_espa_nobuild_1", -2712, 2464, {CIRCLE, 1100}, NOBUILDZONEAREA + NOWORLDSPAWNAREA},
 	{"mos_taike_nobuild_1", 3832, 2360, {CIRCLE, 500}, NOBUILDZONEAREA + NOWORLDSPAWNAREA},
