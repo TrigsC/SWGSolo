@@ -7,11 +7,6 @@ function ForceShrineMenuComponent:fillObjectMenuResponse(pSceneObject, pMenuResp
 		menuResponse:addRadialMenuItem(120, 3, "@jedi_trials:meditate") -- Meditate
 	end
 
-	-- Hologrind
-	if (CreatureObject(pPlayer):hasSkill("jedi_padawan")) then
-		menuResponse:addRadialMenuItem(120, 3, "@jedi_trials:meditate") -- Meditate
-	end
-
 	if (CreatureObject(pPlayer):hasSkill("force_title_jedi_rank_02")) then
 		menuResponse:addRadialMenuItem(121, 3, "@force_rank:recover_jedi_items") -- Recover Jedi Items
 	end
@@ -23,7 +18,7 @@ function ForceShrineMenuComponent:handleObjectMenuSelect(pObject, pPlayer, selec
 		return 0
 	end
 
-	if (selectedID == 120 and (CreatureObject(pPlayer):hasSkill("force_title_jedi_novice") or CreatureObject(pPlayer):hasSkill("jedi_padawan"))) then
+	if (selectedID == 120 and CreatureObject(pPlayer):hasSkill("force_title_jedi_novice")) then
 		if (CreatureObject(pPlayer):getPosture() ~= CROUCHED) then
 			CreatureObject(pPlayer):sendSystemMessage("@jedi_trials:show_respect") -- Must respect
 		else
@@ -81,10 +76,6 @@ function ForceShrineMenuComponent:doMeditate(pObject, pPlayer)
 		end
 	else
 		CreatureObject(pPlayer):sendSystemMessage("@jedi_trials:force_shrine_wisdom_" .. getRandomNumber(1, 15))
-		local pGhost = CreatureObject(pPlayer):getPlayerObject()
-		awardSkill(pPlayer, "jedi_padawan_novice")
-		--PlayerObject(pGhost):setJediState(2)
-		--CreatureObject(pPlayer):setJediState(2)
 	end
 end
 

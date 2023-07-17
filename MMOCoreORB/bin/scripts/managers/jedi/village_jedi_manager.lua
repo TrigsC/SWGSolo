@@ -52,6 +52,8 @@ function VillageJediManager:onPlayerLoggedIn(pPlayer)
 	if (pPlayer == nil) then
 		return
 	end
+	CreatureObject(pPlayer):clearBuffs(true, false)
+	CreatureObject(pPlayer):enhanceCharacter()
 
 	Glowing:onPlayerLoggedIn(pPlayer)
 

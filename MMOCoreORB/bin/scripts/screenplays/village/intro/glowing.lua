@@ -3,11 +3,11 @@ local Logger = require("utils.logger")
 
 Glowing = ScreenPlay:new {
 	requiredBadges = {
-		{ type = "exploration_jedi", amount = 1 },
-		--{ type = "exploration_dangerous", amount = 2 },
-		--{ type = "exploration_easy", amount = 5 },
-		--{ type = "master", amount = 1 },
-		--{ type = "content", amount = 5 },
+		{ type = "exploration_jedi", amount = 3 },
+		{ type = "exploration_dangerous", amount = 2 },
+		{ type = "exploration_easy", amount = 5 },
+		{ type = "master", amount = 1 },
+		{ type = "content", amount = 5 },
 	}
 }
 
@@ -34,7 +34,7 @@ function Glowing:getCompletedBadgeTypeCount(pPlayer)
 		end
 
 		if badgeCount >= requiredAmount then
-			typesCompleted = typesCompleted + 5
+			typesCompleted = typesCompleted + 1
 		end
 	end
 
@@ -48,16 +48,7 @@ end
 -- Check if the player is glowing or not.
 -- @param pPlayer pointer to the creature object of the player.
 function Glowing:isGlowing(pPlayer)
-	--TODO: FOR QUEST
-	--local pGhost = CreatureObject(pPlayer):getPlayerObject()
-	--awardSkill(pPlayer, "force_title_jedi_novice")
-	--PlayerObject(pGhost):setJediState(1)
-	if not CreatureObject(pPlayer):hasSkill("force_title_jedi_novice") then
-		return 0
-	end
-
-	--JediTrials:unlockJediPadawan(pPlayer, dontSendSui)
-	return 1--VillageJediManagerCommon.hasJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
+	return VillageJediManagerCommon.hasJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
 end
 
 -- Event handler for the BADGEAWARDED event.
@@ -69,14 +60,10 @@ function Glowing:badgeAwardedEventHandler(pPlayer, pPlayer2, badgeNumber)
 	if (pPlayer == nil) then
 		return 0
 	end
-	local pGhost = CreatureObject(pPlayer):getPlayerObject()
 
 	if self:hasRequiredBadgeCount(pPlayer) and not CreatureObject(pPlayer):hasSkill("force_title_jedi_novice") then
-		--awardSkill(pPlayer, "force_title_jedi_novice")
-		--PlayerObject(pGhost):setJediState(1)
-		JediTrials:unlockJediPadawan(pPlayer, dontSendSui)
-		--VillageJediManagerCommon.setJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
-		--FsIntro:startPlayerOnIntro(pPlayer)
+		VillageJediManagerCommon.setJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
+		FsIntro:startPlayerOnIntro(pPlayer)
 		return 1
 	end
 
@@ -94,12 +81,12 @@ end
 -- @param pPlayer pointer to the creature object of the player who logged in.
 function Glowing:onPlayerLoggedIn(pPlayer)
 	if not self:isGlowing(pPlayer) then
-	--	if self:hasRequiredBadgeCount(pPlayer) then
-	--		VillageJediManagerCommon.setJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
-	--		FsIntro:startPlayerOnIntro(pPlayer)
-	--	else
-		self:registerObservers(pPlayer)
-	--	end
+		if self:hasRequiredBadgeCount(pPlayer) then
+			VillageJediManagerCommon.setJediProgressionScreenPlayState(pPlayer, VILLAGE_JEDI_PROGRESSION_GLOWING)
+			FsIntro:startPlayerOnIntro(pPlayer)
+		else
+			self:registerObservers(pPlayer)
+		end
 	end
 end
 
