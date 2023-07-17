@@ -698,7 +698,7 @@ namespace conf {
 
 			if (configVersion.get() > cachedVersion) {
 				Locker guard(&mutex);
-				cachedCovertOvertSystem = getBool("Core3.GCWManager.useCovertOvertSystem", false);
+				cachedCovertOvertSystem = getBool("Core3.GCWManager.useCovertOvertSystem", true);
 				cachedVersion = configVersion.get();
 			}
 
