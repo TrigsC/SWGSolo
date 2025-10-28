@@ -18,6 +18,7 @@ class BoundaryRectangle : public Boundary {
 	float y0;
 	float x1;
 	float y1;
+
 	int var7;
 	int localWaterTableEnabled;
 	float localWaterTableHeight;
@@ -49,7 +50,6 @@ public:
 	}
 
 	~BoundaryRectangle() {
-
 	}
 
 	void executeRule(ProceduralTerrainAppearance* generator) final {
@@ -131,13 +131,14 @@ public:
 		featheringType = iffStream->getInt();
 		featheringAmount = iffStream->getFloat();
 
-		if (featheringAmount < 0)
+		if (featheringAmount < 0) {
 			featheringAmount = 0;
-		else if (featheringAmount > 1)
+		} else if (featheringAmount > 1) {
 			featheringAmount = 1;
+		}
 
-		var7 = iffStream->getInt();
 		localWaterTableEnabled = iffStream->getInt(); // local water table enabled?
+		var7 = iffStream->getInt();
 		localWaterTableHeight = iffStream->getFloat(); // local water table height
 		shaderSize = iffStream->getFloat();
 		iffStream->getString(shaderName);
@@ -259,9 +260,6 @@ public:
 	float getMaxY() const final {
 		return y1;
 	}
-
 };
-
-
 
 #endif /* BOUNDARYRECTANGLE_H_ */

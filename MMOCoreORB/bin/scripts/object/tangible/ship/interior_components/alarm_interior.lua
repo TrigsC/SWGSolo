@@ -42,7 +42,8 @@
 
 
 object_tangible_ship_interior_components_alarm_interior = object_tangible_ship_interior_components_shared_alarm_interior:new {
-
+	objectMenuComponent = "PobShipObjectMenuComponent",
+	gameObjectType = 1073741841,
 }
 
 ObjectTemplates:addTemplate(object_tangible_ship_interior_components_alarm_interior, "object/tangible/ship/interior_components/alarm_interior.iff")

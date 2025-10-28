@@ -21,7 +21,7 @@
 
 CommandQueue::CommandQueue(CreatureObject* creature) {
 #ifdef DEBUG_QUEUE
-	Logger::console.info(true) << __FUNCTION__ << "() called on " << toString();
+	info(true) << __FUNCTION__ << "() called on " << toString();
 #endif // DEBUG_QUEUE
 	if (creature == nullptr) {
 		return;
@@ -32,15 +32,21 @@ CommandQueue::CommandQueue(CreatureObject* creature) {
 	state = WAITING;
 
 	clearQueueActions(false);
+
+	StringBuffer logName;
+	logName << "CommandQueue[" << creature->getDisplayedName() << "]-[" << creature->getObjectID() << "]";
+
+	setLoggingName(logName.toString());
+
 #ifdef DEBUG_QUEUE
 	runNumber = 1;
-	Logger::console.info(true) << __FUNCTION__ << "(" << creature << ") called on " << toString();
+	info(true) << __FUNCTION__ << "(" << creature << ") called on " << toString();
 #endif // DEBUG_QUEUE
 }
 
 CommandQueue::~CommandQueue() {
 #ifdef DEBUG_QUEUE
-	Logger::console.info(true) << __FUNCTION__ << "() called on " << toString();
+	info(true) << __FUNCTION__ << "() called on " << toString();
 #endif // DEBUG_QUEUE
 	if (queueTask != nullptr) {
 		queueTask->cancel();
@@ -61,7 +67,7 @@ void CommandQueue::removeAction(CommandQueueAction* actionToDelete) {
 			queueVector.remove(i);
 
 #ifdef DEBUG_QUEUE
-			Logger::console.info(true) << " Queue action removed from " << toString();
+			info(true) << " Queue action - " << action->getCommand() << " - REMOVED from " << toString();
 #endif
 			break;
 		}
@@ -131,8 +137,10 @@ int CommandQueue::handleRunningState() {
 
 	Locker guard(&queueMutex);
 
+	bool isPet = creature->isPet();
+
 #ifdef DEBUG_QUEUE
-	creature->info(true) << "CommandQueue - handleRunningState called on " << toString();
+	info(true) << "CommandQueue - handleRunningState called on " << toString();
 #endif
 
 	if (queueVector.size() <= 0)
@@ -168,7 +176,7 @@ int CommandQueue::handleRunningState() {
 	int priority = queueCommand->getDefaultPriority();
 
 #ifdef DEBUG_QUEUE
-	creature->info(true) << "Command Name: " << queueCommand->getName() << " with a priority of " << priority;
+	info(true) << "Command Name: " << queueCommand->getName() << " with a priority of " << priority;
 #endif
 
 	Locker lock(creature);
@@ -183,8 +191,9 @@ int CommandQueue::handleRunningState() {
 
 	// Auto attack timer only applies to players
 	if (creature->isPlayerCreature()) {
+
 #ifdef DEBUG_QUEUE
-		creature->info(true) << "Remaining action time = " << remainingActionTime;
+		info(true) << "Remaining action time = " << remainingActionTime;
 #endif
 
 		CooldownTimerMap* cooldownTimerMap = creature->getCooldownTimerMap();
@@ -197,7 +206,7 @@ int CommandQueue::handleRunningState() {
 
 				if (autoTime > remainingActionTime) {
 #ifdef DEBUG_QUEUE
-					creature->info(true) << "Auto attack delay is > than remainingActionTime adding to delay = " << autoTime;
+					info(true) << "Auto attack delay is > than remainingActionTime adding to delay = " << autoTime;
 #endif
 					nextActionTime->addMiliTime(autoTime);
 
@@ -210,7 +219,7 @@ int CommandQueue::handleRunningState() {
 
 	if (priority == QueueCommand::NORMAL && nextActionTime->isFuture()) {
 #ifdef DEBUG_QUEUE
-		creature->info(true) << "Next normal action is future returning time of " << remainingActionTime;
+		info(true) << "Next normal action is future returning time of " << remainingActionTime;
 #endif
 		return remainingActionTime;
 	}
@@ -227,7 +236,7 @@ int CommandQueue::handleRunningState() {
 	}
 
 #ifdef DEBUG_QUEUE
-	creature->info(true) << "Command Queue activateCommand called -- time = " << time;
+	info(true) << "Command Queue activateCommand called -- time = " << time << " ---- Removing Action";
 #endif
 
 	removeAction(action);
@@ -245,7 +254,7 @@ int CommandQueue::handleRunningState() {
 	} else if (time > 0) {
 		uint64 miliTime = time * 1000;
 #ifdef DEBUG_QUEUE
-		creature->info(true) << "Command Delay Time > 0 -- adding to next action time " << miliTime;
+		info(true) << "Command Delay Time > 0 -- adding to next action time " << miliTime;
 #endif
 
 		nextActionTime->addMiliTime(miliTime);
@@ -262,7 +271,7 @@ void CommandQueue::run() {
 
 #ifdef DEBUG_QUEUE
 	auto debugMsg = [&]() -> LoggerHelper {
-		auto msg = creature->info(true);
+		auto msg = info(true);
 		msg << "CommandQueue::run() " << toString() << ": ";
 		return msg;
 	};
@@ -400,16 +409,16 @@ void CommandQueue::enqueueCommand(unsigned int actionCRC, unsigned int actionCou
 
 	if (creature == nullptr) {
 #ifdef DEBUG_QUEUE
-		Logger::console.info(true) << "CommandQueue - enqueueCommand Called but creature == nullptr: " << toString();
+		info(true) << "CommandQueue - enqueueCommand Called but creature == nullptr: " << toString();
 #endif // DEBUG_QUEUE
 		return;
 	}
 
 #ifdef DEBUG_QUEUE
-	creature->info(true) << "CommandQueue - enqueueCommand Called -- " << toString();
+	info(true) << "CommandQueue - enqueueCommand Called -- " << toString();
 #endif // DEBUG_QUEUE
 
-	ZoneServer* zoneServer = creature->getZoneServer();
+	auto zoneServer = creature->getZoneServer();
 
 	if (zoneServer == nullptr) {
 		return;
@@ -449,7 +458,7 @@ void CommandQueue::enqueueCommand(unsigned int actionCRC, unsigned int actionCou
 		action->setCompareToCounter((int)compareCounter);
 
 #ifdef DEBUG_QUEUE
-	creature->info(true) << "Enqueuing Command " << queueCommand->getQueueCommandName() << ": with priority - " << priority << " compareCount of " << compareCounter << " Queue Size = " << queueVector.size();
+	info(true) << "Enqueuing Command " << queueCommand->getQueueCommandName() << ": with priority - " << priority << " compareCount of " << compareCounter << " Queue Size = " << queueVector.size();
 #endif
 
 	if (priority == QueueCommand::FRONT) {
@@ -466,17 +475,27 @@ void CommandQueue::enqueueCommand(unsigned int actionCRC, unsigned int actionCou
 	int oldSize = queueVector.size();
 
 	creature->info() << "Queue Vector size changed from " << oldSize << " to " << queueVector.size();
+
+	if (creature->isPet()) {
+		for (unsigned int i = 0; i < queueVector.size(); i++) {
+			CommandQueueAction* command = queueVector.get(i);
+
+			const QueueCommand* queueCommand = objectController->getQueueCommand(command->getCommand());
+
+			info(true) << creature->getDisplayedName() << " -- Command #" << i << " : " << queueCommand->getQueueCommandName();
+		}
+	}
 #endif
 
 	if (state == WAITING && !queueTask->isScheduled()) {
 #ifdef DEBUG_QUEUE
-		creature->info(true) << "Scheduling for DEFAULTTIME";
+		info(true) << "Scheduling for DEFAULTTIME";
 #endif // DEBUG_QUEUE
 		queueTask->schedule(DEFAULTTIME);
 	}
 
 #ifdef DEBUG_QUEUE
-	creature->info(true) << "enqueueCommand finished: " << toString();
+	info(true) << "enqueueCommand finished: " << toString();
 #endif // DEBUG_QUEUE
 }
 

@@ -100,25 +100,22 @@ end
 function ThemeParkNym:spawnLootObjects()
 	local droidPointer = spawnSceneObject("lok", "object/tangible/container/loot/astromech_container.iff", -64.9, -66.0, -177.7, 5126336, 0, 0, -1, 0)
 	SceneObject(droidPointer):setCustomObjectName("A Defunct Astromech")
-	createObserver(OBJECTRADIALUSED, "ThemeParkNym", "notifyNymContainerUsed", droidPointer)
+	createObserver(OPENCONTAINER, "ThemeParkNym", "notifyNymContainerUsed", droidPointer)
 
 	local afuPointer = spawnSceneObject("lok", "object/tangible/container/loot/gas_filter_container.iff", -94.2, -69.6, -93.5, 5645592, 0.7071067811865476, 0, -0.7071067811865475, 0)
 	SceneObject(afuPointer):setCustomObjectName("Air Filtration Unit")
-	createObserver(OBJECTRADIALUSED, "ThemeParkNym", "notifyNymContainerUsed", afuPointer)
+	createObserver(OPENCONTAINER, "ThemeParkNym", "notifyNymContainerUsed", afuPointer)
 
 	local csuPointer = spawnSceneObject("lok", "object/tangible/container/loot/computer_container.iff", -57.6, -20.0, 46.8, 5126277, 0, 0, 0, 0)
 	SceneObject(csuPointer):setCustomObjectName("A Computer Storage Unit")
-	createObserver(OBJECTRADIALUSED, "ThemeParkNym", "notifyNymContainerUsed", csuPointer)
+	createObserver(OPENCONTAINER, "ThemeParkNym", "notifyNymContainerUsed", csuPointer)
 
 	local cratePointer = spawnSceneObject("lok", "object/tangible/container/loot/loot_crate.iff", -7.9, -20.0, 78.4, 5126291, 0, 0, -1, 0)
 	SceneObject(cratePointer):setCustomObjectName("Supply Crate")
-	createObserver(OBJECTRADIALUSED, "ThemeParkNym", "notifyNymContainerUsed", cratePointer)
+	createObserver(OPENCONTAINER, "ThemeParkNym", "notifyNymContainerUsed", cratePointer)
 end
 
-function ThemeParkNym:notifyNymContainerUsed(pDroid, pPlayer, radialSelected)
-	if (radialSelected ~= 16) then
-		return 0
-	end
+function ThemeParkNym:notifyNymContainerUsed(pDroid, pPlayer)
 
 	if not SceneObject(pPlayer):isPlayerCreature() then
 		return 0
@@ -142,7 +139,7 @@ function ThemeParkNym:notifyNymContainerUsed(pDroid, pPlayer, radialSelected)
 		questItem = "object/tangible/loot/quest/nym_droid_memory_chip.iff"
 		questMsg = "@theme_park_nym/messages:acquired_memory"
 		ThemeParkNym:removeNpcWaypoints(CreatureObject(pPlayer), PlayerObject(pGhost))
-		local jinkinsWaypoint = PlayerObject(pGhost):addWaypoint("lok", "Return the chip to Jinkins", "Return the chip to Jinkins", ThemeParkNym.waypointMap.jinkins.x, ThemeParkNym.waypointMap.jinkins.y, WAYPOINT_COLOR_PURPLE, true, true, 0)
+		local jinkinsWaypoint = PlayerObject(pGhost):addWaypoint("lok", "Return the chip to Jinkins", "Return the chip to Jinkins", ThemeParkNym.waypointMap.jinkins.x, 0, ThemeParkNym.waypointMap.jinkins.y, WAYPOINT_COLOR_PURPLE, true, true, 0)
 		setQuestStatus(CreatureObject(pPlayer):getObjectID() .. ":jinkinsWaypointID", jinkinsWaypoint)
 	elseif (SceneObject(pDroid):getTemplateObjectPath() == "object/tangible/container/loot/gas_filter_container.iff") then
 		if (not CreatureObject(pPlayer):hasScreenPlayState(1, "nym_theme_park_koleNpc") or CreatureObject(pPlayer):hasScreenPlayState(2, "nym_theme_park_koleNpc")) then
@@ -154,7 +151,7 @@ function ThemeParkNym:notifyNymContainerUsed(pDroid, pPlayer, radialSelected)
 		questItem = "object/tangible/loot/quest/nym_filtered_gas.iff"
 		questMsg = "@theme_park_nym/messages:acquired_gas"
 		ThemeParkNym:removeNpcWaypoints(CreatureObject(pPlayer), PlayerObject(pGhost))
-		local koleWaypoint = PlayerObject(pGhost):addWaypoint("lok", "Return the filter to Kole", "Return the filter to Kole", ThemeParkNym.waypointMap.kole.x, ThemeParkNym.waypointMap.kole.y, WAYPOINT_COLOR_PURPLE, true, true, 0)
+		local koleWaypoint = PlayerObject(pGhost):addWaypoint("lok", "Return the filter to Kole", "Return the filter to Kole", ThemeParkNym.waypointMap.kole.x, 0, ThemeParkNym.waypointMap.kole.y, WAYPOINT_COLOR_PURPLE, true, true, 0)
 		setQuestStatus(CreatureObject(pPlayer):getObjectID() .. ":koleWaypointID", koleWaypoint)
 	elseif (SceneObject(pDroid):getTemplateObjectPath() == "object/tangible/container/loot/computer_container.iff") then
 		if (not CreatureObject(pPlayer):hasScreenPlayState(1, "nym_theme_park_nymNpc") or CreatureObject(pPlayer):hasScreenPlayState(8, "nym_theme_park_nymNpc") or CreatureObject(pPlayer):hasScreenPlayState(16, "nym_theme_park_nymNpc")) then
@@ -167,7 +164,7 @@ function ThemeParkNym:notifyNymContainerUsed(pDroid, pPlayer, radialSelected)
 		if (getContainerObjectByTemplate(pInventory, "object/tangible/loot/quest/nym_imggc.iff", true) ~= nil) then
 			questMsg = "@theme_park_nym/messages:all_nym_needed"
 			ThemeParkNym:removeNpcWaypoints(CreatureObject(pPlayer), PlayerObject(pGhost))
-			local nymWaypoint = PlayerObject(pGhost):addWaypoint("lok", "Return the items to Nym", "Return the items to Nym", ThemeParkNym.waypointMap.nym.x, ThemeParkNym.waypointMap.nym.y, WAYPOINT_COLOR_PURPLE, true, true, 0)
+			local nymWaypoint = PlayerObject(pGhost):addWaypoint("lok", "Return the items to Nym", "Return the items to Nym", ThemeParkNym.waypointMap.nym.x, 0, ThemeParkNym.waypointMap.nym.y, WAYPOINT_COLOR_PURPLE, true, true, 0)
 			setQuestStatus(CreatureObject(pPlayer):getObjectID() .. ":nymWaypointID", nymWaypoint)
 		else
 			questMsg = "@theme_park_nym/messages:acquired_hard_drive"
@@ -184,7 +181,7 @@ function ThemeParkNym:notifyNymContainerUsed(pDroid, pPlayer, radialSelected)
 		if (getContainerObjectByTemplate(pInventory, "object/tangible/loot/quest/nym_hard_drive.iff", true) ~= nil) then
 			questMsg = "@theme_park_nym/messages:all_nym_needed"
 			ThemeParkNym:removeNpcWaypoints(CreatureObject(pPlayer), PlayerObject(pGhost))
-			local nymWaypoint = PlayerObject(pGhost):addWaypoint("lok", "Return the items to Nym", "Return the items to Nym", ThemeParkNym.waypointMap.nym.x, ThemeParkNym.waypointMap.nym.y, WAYPOINT_COLOR_PURPLE, true, true, 0)
+			local nymWaypoint = PlayerObject(pGhost):addWaypoint("lok", "Return the items to Nym", "Return the items to Nym", ThemeParkNym.waypointMap.nym.x, 0, ThemeParkNym.waypointMap.nym.y, WAYPOINT_COLOR_PURPLE, true, true, 0)
 			setQuestStatus(CreatureObject(pPlayer):getObjectID() .. ":nymWaypointID", nymWaypoint)
 		else
 			questMsg = "@theme_park_nym/messages:acquired_imggcu"
@@ -383,7 +380,7 @@ function ThemeParkNym:spawnNpcs()
 		local npcSpawnData = self.npcMap[i].spawnData
 		local pNpc = spawnMobile(planetName, npcSpawnData.npcTemplate, 1, npcSpawnData.x, npcSpawnData.z, npcSpawnData.y, npcSpawnData.direction, npcSpawnData.cellID)
 		if npcSpawnData.position == SIT then
-			CreatureObject(pNpc):setState(STATESITTINGONCHAIR)
+			CreatureObject(pNpc):setState(SITTINGONCHAIR)
 		end
 		if (npcSpawnData.npcTemplate == "nym") then
 			SceneObject(pNpc):setContainerComponent("NymContainerComponent")

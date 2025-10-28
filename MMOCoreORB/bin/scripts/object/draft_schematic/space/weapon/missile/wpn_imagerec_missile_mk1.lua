@@ -49,14 +49,14 @@ object_draft_schematic_space_weapon_missile_wpn_imagerec_missile_mk1 = object_dr
 
    craftingToolTab = 131072, -- (See DraftSchematicObjectTemplate.h)
    complexity = 17, 
-   size = 0, 
+   size = 1, 
    factoryCrateType = "object/factory/factory_crate_electronics.iff",
    
    xpType = "shipwright", 
    xp = 125, 
 
    assemblySkill = "weapon_systems", 
-   experimentingSkill = "weapons_systems_experimentation", 
+   experimentingSkill = "weapon_systems_experimentation", 
    customizationSkill = "medicine_customization", 
 
    customizationOptions = {},

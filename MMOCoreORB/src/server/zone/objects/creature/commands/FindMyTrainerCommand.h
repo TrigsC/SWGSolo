@@ -7,14 +7,10 @@
 
 class FindMyTrainerCommand : public QueueCommand {
 public:
-
-	FindMyTrainerCommand(const String& name, ZoneProcessServer* server)
-		: QueueCommand(name, server) {
-
+	FindMyTrainerCommand(const String& name, ZoneProcessServer* server) : QueueCommand(name, server) {
 	}
 
 	int doQueueCommand(CreatureObject* creature, const uint64& target, const UnicodeString& arguments) const {
-
 		if (!checkStateMask(creature))
 			return INVALIDSTATE;
 
@@ -24,7 +20,7 @@ public:
 		if (!creature->isPlayerCreature())
 			return GENERALERROR;
 
-		PlayerObject* ghost = creature->getPlayerObject();
+		auto ghost = creature->getPlayerObject();
 
 		if (ghost == nullptr)
 			return GENERALERROR;
@@ -32,65 +28,83 @@ public:
 		if (ghost->getJediState() < 2 || !creature->hasSkill("force_title_jedi_rank_02"))
 			return GENERALERROR;
 
+		auto zoneServer = server->getZoneServer();
+
+		if (zoneServer == nullptr)
+			return GENERALERROR;
+
 		String planet = ghost->getTrainerZoneName();
 
-		if (planet == "") {
-			setJediTrainer(ghost);
+		if (planet.isEmpty()) {
+			// Pick a trainer for the Jedi
+			setJediTrainer(zoneServer, ghost);
+
+			// Retrieve trainer zone from the player object
 			planet = ghost->getTrainerZoneName();
 		} else {
-			ZoneServer* zoneServer = ServerCore::getZoneServer();
-			Zone* trainerZone = zoneServer->getZone(planet);
+			auto trainerZone = zoneServer->getZone(planet);
 
 			if (trainerZone == nullptr) {
-				setJediTrainer(ghost);
+				setJediTrainer(zoneServer, ghost);
 				planet = ghost->getTrainerZoneName();
 			}
 		}
 
 		uint32 planetCRC = planet.hashCode();
 
-		Vector3 coords = ghost->getTrainerCoordinates();
+		Vector3 coords = ghost->getJediTrainerCoordinates();
 
 		String name = "@jedi_spam:trainer_waypoint_name";
 
-		ManagedReference<WaypointObject*> obj = ( server->getZoneServer()->createObject(0xc456e788, 1)).castTo<WaypointObject*>();
+		ManagedReference<WaypointObject*> waypointObj = (zoneServer->createObject(0xc456e788, 1)).castTo<WaypointObject*>();
 
-		Locker locker(obj);
+		Locker locker(waypointObj);
 
-		obj->setPlanetCRC(planetCRC);
-		obj->setPosition(coords.getX(), 0, coords.getY());
-		obj->setCustomObjectName(name, false);
+		waypointObj->setPlanetCRC(planetCRC);
+		waypointObj->setPosition(coords.getX(), 0, coords.getY());
+		waypointObj->setCustomObjectName(name, false);
 
-		ghost->addWaypoint(obj, true, true);
+		ghost->addWaypoint(waypointObj, true, true);
 
 		creature->sendSystemMessage("@jedi_spam:waypoint_created_to_trainer");
 
 		return SUCCESS;
 	}
 
-	static void setJediTrainer(PlayerObject* ghost) {
-		ZoneServer* zServ = ghost->getZoneServer();
-
-		if (zServ == nullptr)
+	void setJediTrainer(ZoneServer* zoneServer, PlayerObject* ghost) const {
+		if (ghost == nullptr || zoneServer == nullptr)
 			return;
 
-		Vector<ManagedReference<SceneObject*> > trainers;
-		Vector<String> trainerTypes;
+		Vector<ManagedReference<SceneObject*>> trainers;
+		Vector<uint32> trainerTypes = {STRING_HASHCODE("trainer_brawler"), STRING_HASHCODE("trainer_artisan"), STRING_HASHCODE("trainer_scout"), STRING_HASHCODE("trainer_marksman"), STRING_HASHCODE("trainer_entertainer"), STRING_HASHCODE("trainer_medic")};
 
-		// Map categories defined here.
-		trainerTypes.add("trainer_brawler");
-		trainerTypes.add("trainer_artisan");
-		trainerTypes.add("trainer_scout");
-		trainerTypes.add("trainer_marksman");
-		trainerTypes.add("trainer_entertainer");
-		trainerTypes.add("trainer_medic");
+		// Get all trainers in galaxy and build list based on above trainer sub map categories
+		for (int i = 0; i < zoneServer->getZoneCount(); ++i) {
+			auto zone = zoneServer->getZone(i);
 
-		// Trainer number. Pick a random trainer, there are at least 600 in the galaxy.
-		for (int i=0; i < zServ->getZoneCount(); ++i) {
-			Zone* zone = zServ->getZone(i);
-			for (int j=0; j < trainerTypes.size(); ++j) {
-				SortedVector<ManagedReference<SceneObject*> > objectList = zone->getPlanetaryObjectList(trainerTypes.get(j));
-				trainers.addAll(objectList);
+			if (zone == nullptr)
+				continue;
+
+			SortedVector<ManagedReference<SceneObject*>> objectList = zone->getPlanetaryObjectList("trainer");
+
+			for (int j = 0; j < objectList.size(); ++j) {
+				ManagedReference<SceneObject*> trainer = objectList.get(j);
+
+				if (trainer == nullptr)
+					continue;
+
+				uint32 subCatCrc = trainer->getPlanetMapSubCategoryCRC();
+
+				for (int k = 0; k < trainerTypes.size(); ++k) {
+					uint32 typeHash = trainerTypes.get(k);
+
+					if (subCatCrc == 0 || typeHash != subCatCrc)
+						continue;
+
+					trainers.add(trainer);
+
+					break;
+				}
 			}
 		}
 
@@ -130,13 +144,11 @@ public:
 			zoneName = trainerZone->getZoneName();
 			coords = trainerCreo->getWorldPosition();
 			found = true;
-
 		}
 
 		ghost->setTrainerCoordinates(coords);
 		ghost->setTrainerZoneName(zoneName); // For the waypoint.
 	}
-
 };
 
-#endif //FINDMYTRAINERCOMMAND_H_
+#endif // FINDMYTRAINERCOMMAND_H_

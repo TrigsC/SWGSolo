@@ -52,9 +52,6 @@ NabooKerenScreenPlay = CityScreenPlay:new {
 		{"chassis_dealer",60,5.5,0.6,67.4,-2,2125382, "neutral"},
 		{"trainer_shipwright",60,-0.5,0.6,67.2,180,2125382, "neutral"},
 
-		--cantina
-		{"bartender",60,3.6,-0.9,-2.5,163,5, "conversation"},
-
 		--Guild Hall 1720 2613
 		{"trainer_artisan",0,0.0976721,1.13306,-13.6995,0,1396874, ""},
 
@@ -74,7 +71,7 @@ NabooKerenScreenPlay = CityScreenPlay:new {
 
 		--Guild Hall 1851 2613
 		{"trainer_brawler",0,-11,1.13306,-12.5,0,1650535, ""},
-		{"trainer_marksman",0,0,0,-13,0,1650534, ""},
+		{"trainer_marksman", 0, 0, 1.133, -13, 0, 1650534, ""},
 		{"trainer_scout",0,-12.0327,1.13306,4.62955,179,1650532, ""},
 		{"junk_dealer", 0, -14.5, 1.1, 2.9, 119, 1650532, ""},
 
@@ -163,7 +160,7 @@ function NabooKerenScreenPlay:spawnMobiles()
 				CreatureObject(pMobile):setMoodString(mob[8])
 			end
 
-			AiAgent(pMobile):addCreatureFlag(AI_STATIC)
+			AiAgent(pMobile):addObjectFlag(AI_STATIC)
 
 			if CreatureObject(pMobile):getPvpStatusBitmask() == 0 then
 				CreatureObject(pMobile):clearOptionBit(AIENABLED)

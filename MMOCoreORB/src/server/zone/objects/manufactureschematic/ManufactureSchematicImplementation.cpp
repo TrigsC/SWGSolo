@@ -22,6 +22,15 @@
 #include "ingredientslots/ResourceSlot.h"
 #include "ingredientslots/ComponentSlot.h"
 
+void ManufactureSchematicImplementation::initializeTransientMembers() {
+	// Update old Manu Schems data size to parent object variable
+	if (dataSize > 0 && getDataSize() != dataSize) {
+		datapadSize = dataSize;
+	}
+
+	IntangibleObjectImplementation::initializeTransientMembers();
+}
+
 void ManufactureSchematicImplementation::destroyObjectFromDatabase(bool destroyContainedObjects) {
 	if (prototype != nullptr) {
 		prototype->destroyObjectFromDatabase(true);
@@ -32,7 +41,7 @@ void ManufactureSchematicImplementation::destroyObjectFromDatabase(bool destroyC
 }
 
 void ManufactureSchematicImplementation::fillAttributeList(AttributeListMessage* alm, CreatureObject* object) {
-	alm->insertAttribute("data_volume", dataSize);
+	alm->insertAttribute("data_volume", getDataSize());
 
 	try {
 		for (int i = 0; i < factoryBlueprint.getCompleteSize(); ++i) {
@@ -59,6 +68,7 @@ void ManufactureSchematicImplementation::sendTo(SceneObject* player, bool doClos
 		return;
 
 	ManagedReference<SceneObject*> parent = getParent().get();
+
 	if (parent == nullptr)
 		return;
 
@@ -81,25 +91,39 @@ void ManufactureSchematicImplementation::sendTo(SceneObject* player, bool doClos
 	}
 }
 
-void ManufactureSchematicImplementation::sendBaselinesTo(SceneObject* player) {
-	ManagedReference<DraftSchematic*> draftSchematic = this->draftSchematic;
-
-	if (!player->isPlayerCreature() || draftSchematic == nullptr)
+void ManufactureSchematicImplementation::sendBaselinesTo(SceneObject* object) {
+	if (object == nullptr || !object->isPlayerCreature())
 		return;
 
-	CreatureObject* playerCreature = cast<CreatureObject*>(player);
+	CreatureObject* player = object->asCreatureObject();
+
+	if (player == nullptr)
+		return;
+
+	ManagedReference<DraftSchematic*> draftSchematic = getDraftSchematic();
+
+	if (draftSchematic == nullptr)
+		return;
 
 	ManufactureSchematicObjectMessage3* msco3;
 
 	if (prototype != nullptr)
-		msco3 = new ManufactureSchematicObjectMessage3(_this.getReferenceUnsafeStaticCast(), playerCreature->getFirstName());
+		msco3 = new ManufactureSchematicObjectMessage3(_this.getReferenceUnsafeStaticCast(), player->getFirstName());
 	else
-		msco3 = new ManufactureSchematicObjectMessage3(getObjectID(), complexity, playerCreature->getFirstName());
+		msco3 = new ManufactureSchematicObjectMessage3(getObjectID(), complexity, player->getFirstName());
 
 	player->sendMessage(msco3);
 
+	bool activeCraft = false;
+
+	Reference<CraftingSession*> session = player->getActiveSession(SessionFacadeType::CRAFTING).castTo<CraftingSession*>();
+
+	if (session != nullptr && session->getSchematic().get() == _this.getReferenceUnsafeStaticCast()) {
+		activeCraft = true;
+	}
+
 	// MSCO6
-	ManufactureSchematicObjectMessage6* msco6 = new ManufactureSchematicObjectMessage6(getObjectID(), draftSchematic->getClientObjectCRC());
+	ManufactureSchematicObjectMessage6* msco6 = new ManufactureSchematicObjectMessage6(getObjectID(), draftSchematic->getClientObjectCRC(), activeCraft);
 	player->sendMessage(msco6);
 
 	// MSCO8
@@ -120,6 +144,7 @@ void ManufactureSchematicImplementation::synchronizedUIListen(CreatureObject* pl
 		return;
 
 	Reference<CraftingSession*> session = player->getActiveSession(SessionFacadeType::CRAFTING).castTo<CraftingSession*>();
+
 	if (session == nullptr || session->getSchematic().get() != _this.getReferenceUnsafeStaticCast()) {
 		return;
 	}
@@ -537,7 +562,7 @@ void ManufactureSchematicImplementation::setPrototype(TangibleObject* tano) {
 
 	prototype = tano;
 	crafter = nullptr;
-	dataSize = draftSchematic->getSize();
+	datapadSize = draftSchematic->getSize();
 
 	createFactoryBlueprint();
 

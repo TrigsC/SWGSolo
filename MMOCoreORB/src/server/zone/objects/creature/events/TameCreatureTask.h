@@ -171,8 +171,8 @@ public:
 
 		uint32 playerPvpStatusBitmask = player->getPvpStatusBitmask();
 
-		if (playerPvpStatusBitmask & CreatureFlag::PLAYER) {
-			playerPvpStatusBitmask &= ~CreatureFlag::PLAYER;
+		if (playerPvpStatusBitmask & ObjectFlag::PLAYER) {
+			playerPvpStatusBitmask &= ~ObjectFlag::PLAYER;
 
 			creature->setPvpStatusBitmask(playerPvpStatusBitmask, false);
 		} else {
@@ -207,7 +207,7 @@ public:
 
 			agent->setLairTemplateCRC(0);
 
-			agent->setCreatureBitmask(CreatureFlag::PET);
+			agent->setCreatureBitmask(ObjectFlag::PET);
 			agent->setAITemplate();
 			agent->clearPatrolPoints();
 
@@ -250,15 +250,10 @@ public:
 
 		creature->setPvpStatusBitmask(originalMask, true);
 
-		if (creature->isAiAgent()) {
-			AiAgent* agent = cast<AiAgent*>(creature.get());
+		creature->removeObjectFlag(ObjectFlag::STATIONARY);
+		creature->setAITemplate();
 
-			if (agent == nullptr)
-				return;
-
-			agent->clearCreatureBit(CreatureFlag::STATIONARY);
-			agent->setAITemplate();
-		}
+		creature->setMovementState(AiAgent::FOLLOWING);
 	}
 };
 

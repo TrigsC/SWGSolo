@@ -45,7 +45,7 @@ function DarnDroid1:spawnMobiles()
 		local pNpc = spawnMobile("naboo", "c3tc", 0, 4723, 3, -4935, -180, 0)
 
 		if (pNpc ~= nil) then
-			AiAgent(pNpc):addCreatureFlag(AI_STATIONARY)
+			AiAgent(pNpc):addObjectFlag(AI_STATIONARY)
 		end
 
 		spawnMobile("naboo", "selan_ellison", 0, 16, 1, 56, -79, 4215410)
@@ -58,7 +58,7 @@ function DarnDroid1:spawnMobiles()
 	if (isZoneEnabled("talus")) then
 		local pNpc = spawnMobile("talus", "valance_serth", 0, -2389, 23, 2043, 0, 0)
 		if (pNpc ~= nil) then
-			AiAgent(pNpc):addCreatureFlag(AI_STATIONARY)
+			AiAgent(pNpc):addObjectFlag(AI_STATIONARY)
 		end
 
 		spawnMobile("talus", "black_sun_minion", 300, -2389, 23, 2043, 0, 0)
@@ -244,7 +244,7 @@ function DarnDroid1:giveWaypoint(pPlayer, planet, name, x, y)
 		PlayerObject(pGhost):removeWaypoint(oldWaypointID, true)
 		removeQuestStatus(playerID .. ":darnDroid1WaypointID")
 	end
-	local waypointID = PlayerObject(pGhost):addWaypoint(planet, name, "", x, y, WAYPOINTYELLOW, true, true, 0, 0)
+	local waypointID = PlayerObject(pGhost):addWaypoint(planet, name, "", x, 0, y, WAYPOINT_YELLOW, true, true, 0, 0)
 	setQuestStatus(playerID .. ":darnDroid1WaypointID", waypointID)
 end
 

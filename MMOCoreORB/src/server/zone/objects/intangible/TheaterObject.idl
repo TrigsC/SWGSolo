@@ -9,7 +9,7 @@ import server.zone.objects.tangible.DespawnLairOnPlayerDisappear;
 import server.zone.objects.creature.CreatureObject;
 import server.zone.objects.scene.SceneObject;
 include server.zone.CloseObjectsVector;
-import server.zone.QuadTreeEntry;
+import server.zone.TreeEntry;
 include system.thread.atomic.AtomicInteger;
 include engine.log.Logger;
 
@@ -57,37 +57,9 @@ class TheaterObject extends IntangibleObject {
 		shouldFlatten = b;
 	}
 
-	public void notifyInsert(QuadTreeEntry entry) {
-		SceneObject obj = (SceneObject) entry;
+	public native void notifyInsert(TreeEntry entry);
 
-		if (obj == this)
-			return;
-
-		if (obj.isPlayerCreature()) {
-			CreatureObject creo = (CreatureObject) obj;
-			if (!creo.isInvisible()) {
-				numberOfPlayersInRange.increment();
-				clearDespawnEvent();
-			}
-		}
-	}
-
-	public void notifyDissapear(QuadTreeEntry entry) {
-		SceneObject obj = (SceneObject) entry;
-
-		if (obj == this)
-			return;
-
-		if (obj.isPlayerCreature()) {
-			CreatureObject creo = (CreatureObject) obj;
-			if (!creo.isInvisible()) {
-				int val = numberOfPlayersInRange.decrement();
-
-				if (val <= 0 && despawnOnNoPlayersInRange)
-					activateDespawnEvent();
-			}
-		}
-	}
+	public native void notifyDissapear(TreeEntry entry);
 
 	public void activateDespawnEvent() {
 		if (despawnEvent)

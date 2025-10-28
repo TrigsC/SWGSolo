@@ -9,31 +9,36 @@
 #define LOGINPACKETHANDLER_H_
 
 #include "engine/engine.h"
+#include "ClientCore.h"
 #include "LoginSession.h"
 
-class LoginPacketHandler : public Logger {
+class LoginPacketHandler : public Mutex, public Logger {
 	Reference<LoginSession*> loginSession;
+	class ClientCore* core;
+	uint8_t pending_packets;
 
 public:
-	LoginPacketHandler(LoginSession* session) : Logger("LoginPacketHandler") {
+	LoginPacketHandler(LoginSession* session, class ClientCore* clientCore) : Logger("LoginPacketHandler") {
+		pending_packets = 0xF;
 		loginSession = session;
-
-		setLogging(true);
+		core = clientCore;
+		setLogLevel(static_cast<Logger::LogLevel>(ClientCore::getLogLevel()));
 	}
 
 	~LoginPacketHandler() {
 	}
 
+	void loginComplete() {
+		info(true) << __FUNCTION__;
+		loginSession->signalCompletion();
+	}
+
 	void handleMessage(Message* pack);
 	void handleEnumerateCharacterId(Message* pack);
 	void handleLoginClientToken(Message* pack);
+	void handleLoginEnumCluster(Message* pack);
+	void handleLoginClusterStatus(Message* pack);
 	void handleErrorMessage(Message* pack);
-
-	/*void handleSceneObjectCreateMessage(Message* pack);
-
-	void handleCharacterCreateSucessMessage(Message* pack);
-
-	void handleUpdateTransformMessage(Message* pack);*/
 };
 
 #endif /* LOGINPACKETHANDLER_H_ */

@@ -94,7 +94,7 @@ RoriNarmleScreenPlay = CityScreenPlay:new {
 		{"trainer_artisan", 1, -5160.97, 80, -2325.27, 137, 0, ""},
 		{"trainer_artisan", 1, 0, 1.1, -13, 0, 4615384, ""},
 		{"trainer_bountyhunter", 1, -5232, 80, -2241, 120, 0, ""},
-		{"trainer_brawler", 1, -11, 0, -13, 0, 4615375, ""},
+		{"trainer_brawler", 1, -11, 1.133, -13, 0, 4615375, ""},
 		{"trainer_brawler", 1, -5212, 80, -2449, 180, 0, ""},
 		{"trainer_carbine", 1, -5139, 80, -2517, 90, 0, ""},
 		{"trainer_chef", 1, -5169, 80, -2326, 140, 0, ""},
@@ -115,16 +115,19 @@ RoriNarmleScreenPlay = CityScreenPlay:new {
 		{"trainer_politician", 1, -5165, 80, -2463, 90, 0, ""},
 		{"trainer_ranger", 1, -5167, 80, -2535, 180, 0, ""},
 		{"trainer_rifleman", 1, -5215, 80, -2373, 180, 0, ""},
-		{"trainer_scout", 1, -12, 0, 5, 180, 4615372, ""},
+		{"trainer_scout", 1, -12, 1.133, 5, 180, 4615372, ""},
 		{"trainer_scout", 1, -4951.32, 79.9841, -2373.68, 118, 0, ""},
 		{"trainer_scout", 1, -5211, 82.7, -2925, 180, 0, ""},
-		{"trainer_tailor", 1, 11, 0, -13, 0, 4615383, ""},
+		{"trainer_tailor", 1, 11, 1.133, -13, 0, 4615383, ""},
 		{"trainer_unarmed", 1, -5288, 79.0383, -2508, 0, 0, ""},
 		{"trainer_weaponsmith", 1, -5274, 80, -2424, 0, 0, ""},
 		{"trainer_weaponsmith", 1, 0, 1, -13, 0, 4635414, ""},
 		{"trainer_dancer", 0, 18.0876, 2.12874, 53.6634, 1, 4635403, ""},
 		{"theater_manager", 0, 21.5522, 2.12797, 63.5137, 0, 4635403, ""},
-		{"trainer_musician", 0, 21.8, 2.1, 76.4, 180, 4635403, ""}
+		{"trainer_musician", 0, 21.8, 2.1, 76.4, 180, 4635403, ""},
+		{"trainer_entertainer", 0, 29.5159, 2.12878, 73.6413, 88, 4635403, ""},
+		{"trainer_imagedesigner", 0, -21.5126, 2.12878, 74.0536, 181, 4635404, ""},
+		{"trainer_marksman", 0, 0, 1.13306, -13, 0, 4615374, ""}
 	}
 }
 
@@ -158,7 +161,7 @@ function RoriNarmleScreenPlay:spawnMobiles()
 				CreatureObject(pMobile):setMoodString(mob[8])
 			end
 
-			AiAgent(pMobile):addCreatureFlag(AI_STATIC)
+			AiAgent(pMobile):addObjectFlag(AI_STATIC)
 
 			if CreatureObject(pMobile):getPvpStatusBitmask() == 0 then
 				CreatureObject(pMobile):clearOptionBit(AIENABLED)

@@ -104,6 +104,15 @@ public:
 		COMBATCOMMANDENQUEUED,		// ManagedObject arg1 = player, long arg2 = 0
 		FACTIONCHAT,				// ManagedObject arg1 = AiAgent, long arg2 = playerID
 		NOPLAYERSINRANGE,			// ManagedObject arg1 = null, long arg2 = 0
+		SPATIALCHAT,				// ManagedObject arg1 = ChatMessage containing string text, long arg2 = playerID
+		SHIPAGENTDESPAWNED,			// ManagedObject arg1 = ShipAiAgent that despawned, long arg2 = 0
+		SQUADRON,					// ManagedObject arg1 = ShipAiAgent, long arg2 = 0
+		ENTEREDPOBSHIP,				// ManagedObject arg1 = player who entered the ship, long arg2 = 0
+		DESTROYEDSHIP,				// ManagedObject arg1 = shipAgent that was destroyed long arg2 = 0 Uses: Player destroys any ship
+		SHIPDOCKED,					// ManagedObject arg1 = PlayerShip that docked with agent, long arg2 = cargo string hashCode
+		SHIPDISABLED,				// ManagedObject arg1 = playerShip that disabled agent, long arg2 = 0
+		SHIPDESTROYED,				// ManagedObject arg1 = destructing ship long arg2 = current squadron size, Uses: tracking specific ship destruction
+		INSPECTEDSHIP,				// ManagedObject arg1 = shipAgent that was inspected by player long arg2 = cargo string hashCode
 	};
 };
 

@@ -210,7 +210,6 @@ CorelliaCoronetScreenPlay = CityScreenPlay:new {
 		{"entertainer",300,24.3471,1.28309,8.93357,360.011,1855549, "conversation"},
 
 		-- Cantina
-		{"bartender",60,7.60649,-0.894992,1.42464,324.005,8105496, ""},
 		{"bounty_hunter",300,3.61201,-0.894992,-8.73417,135.006,8105496, "conversation"},
 		{"info_broker",300,2.80432,-0.894991,10.6543,180.012,8105496, "conversation"},
 		{"businessman",60,-7.91375,-0.894992,-4.88587,179.995,8105496, "conversation"},
@@ -363,7 +362,7 @@ function CorelliaCoronetScreenPlay:spawnMobiles()
 				CreatureObject(pMobile):setMoodString(mob[8])
 			end
 
-			AiAgent(pMobile):addCreatureFlag(AI_STATIC)
+			AiAgent(pMobile):addObjectFlag(AI_STATIC)
 
 			if CreatureObject(pMobile):getPvpStatusBitmask() == 0 then
 				CreatureObject(pMobile):clearOptionBit(AIENABLED)

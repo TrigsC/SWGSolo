@@ -93,6 +93,9 @@ function TatooineJabbasPalaceMobsScreenPlay:spawnStatics()
 	pNpc = spawnMobile("tatooine", "commoner_tatooine", 60, -15.4, 0.1, 87.7, 42, 1177498)
 	self:setMoodString(pNpc, "nervous")
 
+	pNpc = spawnMobile("tatooine", "smuggler_pilot", 60, -5868.38, 90, -6199.5, 90, 0)
+	self:setMoodString(pNpc, "neutral")
+
 	pNpc = spawnMobile("tatooine", "fringer", 300, -8.7, 2.0, 49.6, 347, 1177487)
 	createEvent(5000, "TatooineJabbasPalaceMobsScreenPlay", "palaceConverse", pNpc, "")
 
@@ -242,12 +245,13 @@ end
 
 
 function TatooineJabbasPalaceMobsScreenPlay:palaceConverse(pMobile)
-	if AiAgent(pMobile):isInCombat() or CreatureObject(pMobile):isDead() then
+	if (pMobile == nil or AiAgent(pMobile):isInCombat() or CreatureObject(pMobile):isDead()) then
 		return 0
 	end
 
 	local action
 	local int = getRandomNumber(1,12)
+
 	if int == 1 then action = "check_wrist_device"
 	elseif int == 2 then action = "angry"
 	elseif int == 3 then action = "cover_mouth"
@@ -266,6 +270,7 @@ function TatooineJabbasPalaceMobsScreenPlay:palaceConverse(pMobile)
 	end
 
 	createEvent(getRandomNumber(40,70) * 100, "TatooineJabbasPalaceMobsScreenPlay", "palaceConverse", pMobile, "")
+
 	return 0
 end
 

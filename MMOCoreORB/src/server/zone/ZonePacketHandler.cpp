@@ -8,7 +8,7 @@
 #include "server/zone/ZoneClientSession.h"
 #include "server/zone/ZoneProcessServer.h"
 
-#include "packets/zone/ClientIDMessageCallback.h"
+#include "packets/zone/ClientIdMessageCallback.h"
 #include "packets/zone/SelectCharacterCallback.h"
 #include "packets/zone/CmdSceneReadyCallback.h"
 #include "packets/zone/ClientInactivityMessage.h"
@@ -47,9 +47,16 @@
 #include "packets/object/CraftingCustomizationCallback.h"
 #include "packets/object/ImageDesignRejectMessageCallback.h"
 #include "packets/object/ImageDesignChangeMessageCallback.h"
-#include "packets/object/InsertedAsPilotCallback.h"
-#include "packets/object/JtlShipListRequestCallback.h"
 #include "packets/object/LotteryWindowCallback.h"
+
+#include "packets/ship/ShipUpdateTransformCallback.h"
+#include "packets/object/JtlShipListRequestCallback.h"
+#include "packets/object/GroupMemberSendSpaceInviteCallback.h"
+#include "packets/object/GroupMemberSpaceInviteResponseCallback.h"
+#include "packets/object/DroidCommandProgrammingCallback.h"
+#include "packets/object/UpdateShipTargetSlot.h"
+
+#include "packets/jtl/CreateProjectileMessage.h"
 
 #include "packets/ui/RequestCategoriesResponseMessage.h"
 #include "packets/ui/NewTicketActivityResponseMessage.h"
@@ -93,8 +100,6 @@
 #include "packets/trade/GiveMoneyMessageCallback.h"
 #include "packets/trade/DenyTradeMessage.h"
 
-#include "packets/ship/ShipUpdateTransformCallback.h"
-
 #include "packets/auction/IsVendorOwnerMessageCallback.h"
 
 ZonePacketHandler::ZonePacketHandler() : Logger() {
@@ -119,7 +124,7 @@ ZonePacketHandler::~ZonePacketHandler() {
 void ZonePacketHandler::registerMessages() {
 	debug("registering Messages");
 
-	messageCallbackFactory.registerObject<ClientIDMessageCallback>(0xD5899226);
+	messageCallbackFactory.registerObject<ClientIdMessageCallback>(0xD5899226);
 	messageCallbackFactory.registerObject<ClientCreateCharacterCallback>(0xB97F3074);
 	messageCallbackFactory.registerObject<ClientRandomNameRequest>(0xD6D1B6D1);
 	messageCallbackFactory.registerObject<SelectCharacterCallback>(0xB5098D76);
@@ -178,6 +183,7 @@ void ZonePacketHandler::registerMessages() {
 	messageCallbackFactory.registerObject<ChatBanFromRoomCallback>(0xD9FA0194);
 	messageCallbackFactory.registerObject<ChatUnbanFromRoomCallback>(0x4C8F94A9);
 	messageCallbackFactory.registerObject<ChatDeleteAllPersistentMessagesCallback>(0x8B1E8E72);
+	messageCallbackFactory.registerObject<CreateProjectileMessageCallback>(STRING_HASHCODE("CreateProjectileMessage"));
 }
 
 void ZonePacketHandler::registerObjectControllerMessages() {
@@ -204,9 +210,14 @@ void ZonePacketHandler::registerObjectControllerMessages() {
 	objectMessageControllerFactory->registerObject<CraftingCustomizationCallback>(0x15A);
 	objectMessageControllerFactory->registerObject<ImageDesignChangeMessageCallback>(0x238);
 	objectMessageControllerFactory->registerObject<ImageDesignRejectMessageCallback>(0x239);
-	objectMessageControllerFactory->registerObject<InsertedAsPilotCallback>(0x3fa);
-	objectMessageControllerFactory->registerObject<JtlShipListRequestCallback>(0x41C);
 	objectMessageControllerFactory->registerObject<LotteryWindowCallback>(0x43f);
+
+	// Space Callbacks
+	objectMessageControllerFactory->registerObject<UpdateShipTargetSlotCallback>(0x3FA);
+	objectMessageControllerFactory->registerObject<JtlShipListRequestCallback>(0x41C);
+	objectMessageControllerFactory->registerObject<DroidCommandProgrammingCallback>(0x435);
+	objectMessageControllerFactory->registerObject<GroupMemberSendSpaceInviteCallback>(0x436);
+	objectMessageControllerFactory->registerObject<GroupMemberSpaceInviteResponseCallback>(0x438);
 }
 
 Task* ZonePacketHandler::generateMessageTask(ZoneClientSession* client, Message* pack) const {

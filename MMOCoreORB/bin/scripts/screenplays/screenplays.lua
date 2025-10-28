@@ -372,6 +372,20 @@ includeFile("tasks/darndroid/darndroid2.lua")
 includeFile("tasks/safety_measures/safety_measures.lua")
 includeFile("tasks/safety_measures/conversations/gerak_vurtimis_conv_handler.lua")
 
+-- Enough Quests
+includeFile("tasks/enough/enough_quest.lua")
+includeFile("tasks/enough/conversations/AcunSolariConvoHandler.lua")
+includeFile("tasks/enough/conversations/CethLaikeConvoHandler.lua")
+
+-- Defector Quests
+includeFile("tasks/defector_quests/defector_quest.lua")
+includeFile("tasks/defector_quests/conversations/JomIrimoreConvoHandler.lua")
+includeFile("tasks/defector_quests/conversations/TesloTendooraConvoHandler.lua")
+includeFile("tasks/defector_quests/conversations/ImperialDefectorConvoHandler.lua")
+includeFile("tasks/defector_quests/conversations/JaekVercetConvoHandler.lua")
+includeFile("tasks/defector_quests/conversations/AllardLissaraConvoHandler.lua")
+includeFile("tasks/defector_quests/conversations/RebelDefectorConvoHandler.lua")
+
 -- Task/Quest
 includeFile("tasks/corellia/blk_sun_tasks.lua")
 includeFile("tasks/corellia/chertyl_ruluwoor.lua")
@@ -568,6 +582,10 @@ includeFile("caves/tatooine_sennex_cave.lua")
 includeFile("caves/tatooine_squill_cave.lua")
 includeFile("caves/tatooine_tusken_bunker.lua")
 
+-- Cantinas
+includeFile("cities/cantinas/bartenders.lua")
+includeFile("cities/cantinas/bartender_conv_handler.lua")
+
 -- Cities
 includeFile("cities/city.lua")
 includeFile("cities/corellia_bela_vistal.lua")
@@ -694,7 +712,10 @@ includeFile("treasure_map/TreasureMapMenuComponent.lua")
 includeFile("racetracks/racetracks.lua")
 
 --Space
-includeFile("space/space_chassis_dealer_conv_handler.lua")
+includeFile("space/screenplays.lua")
+
+--Spawner
+includeFile("spawner/screenplays.lua")
 
 --Record Keepers
 includeFile("record_keepers/record_keepers.lua")

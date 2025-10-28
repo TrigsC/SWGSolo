@@ -28,6 +28,10 @@
 #include "server/zone/objects/player/sui/SuiBoxPage.h"
 #include "server/zone/managers/loot/LootManager.h"
 #include "server/zone/objects/transaction/TransactionLog.h"
+#include "server/zone/managers/ship/ShipManager.h"
+#include "server/zone/managers/crafting/CraftingManager.h"
+#include "server/zone/objects/draftschematic/DraftSchematic.h"
+#include "server/zone/objects/manufactureschematic/ManufactureSchematic.h"
 
 SuiManager::SuiManager() : Logger("SuiManager") {
 	server = nullptr;
@@ -223,7 +227,7 @@ void SuiManager::handleCharacterBuilderSelectItem(CreatureObject* player, SuiBox
 
 	const CharacterBuilderMenuNode* currentNode = cbSui->getCurrentNode();
 
-	PlayerObject* ghost = player->getPlayerObject();
+	auto ghost = player->getPlayerObject();
 
 	//If cancel was pressed then we kill the box/menu.
 	if (cancel != 0 || ghost == nullptr)
@@ -274,7 +278,7 @@ void SuiManager::handleCharacterBuilderSelectItem(CreatureObject* player, SuiBox
 
 			if (templatePath == "unlearn_all_skills") {
 
-				SkillManager::instance()->surrenderAllSkills(player, true, false);
+				SkillManager::instance()->surrenderAllSkills(player, true, false, true);
 				player->sendSystemMessage("All skills unlearned.");
 
 			} else if (templatePath == "cleanse_character") {
@@ -445,7 +449,12 @@ void SuiManager::handleCharacterBuilderSelectItem(CreatureObject* player, SuiBox
 
 			} else if (templatePath == "apply_disease_dot") {
 				player->addDotState(player, CreatureState::DISEASED, scob->getObjectID(), 100, CreatureAttribute::UNKNOWN, 60, -1, 0);
-
+			} else if (templatePath == "apply_disease_dot_health") {
+				player->addDotState(player, CreatureState::DISEASED, scob->getObjectID(), 200, CreatureAttribute::HEALTH, 240, -1, 0);
+			} else if (templatePath == "apply_disease_dot_action") {
+				player->addDotState(player, CreatureState::DISEASED, scob->getObjectID(), 200, CreatureAttribute::ACTION, 240, -1, 0);
+			} else if (templatePath == "apply_disease_dot_mind") {
+				player->addDotState(player, CreatureState::DISEASED, scob->getObjectID(), 200, CreatureAttribute::MIND, 240, -1, 0);
 			} else if (templatePath == "apply_fire_dot") {
 				player->addDotState(player, CreatureState::ONFIRE, scob->getObjectID(), 100, CreatureAttribute::UNKNOWN, 60, -1, 0, 20);
 
@@ -483,17 +492,32 @@ void SuiManager::handleCharacterBuilderSelectItem(CreatureObject* player, SuiBox
 				bluefrog->grantJediInitiate(player);
 
 			// Bio-Engineer Testing
-			} else if (templatePath == "ju6d14qq") {
-				bluefrog->giveDnaTestingSet(player, templatePath);
-			} else if (templatePath == "d5j7caq6") {
-				bluefrog->giveDnaTestingSet(player, templatePath);
+			} else if (templatePath.contains("dna_set:")) {
+				bluefrog->giveDnaTestingSet(player, templatePath.subString(8));
 			} else {
 				if (templatePath.length() > 0) {
 					SkillManager::instance()->awardSkill(templatePath, player, true, true, true);
 
-					if (player->hasSkill(templatePath))
+					if (player->hasSkill(templatePath)) {
 						player->sendSystemMessage("You have learned a skill.");
 
+						// Set pilot tier here
+						if (templatePath.contains("pilot")) {
+							Locker lock(player);
+
+							if (templatePath.contains("_novice") || templatePath.contains("_01")) {
+								ghost->setPilotTier(1);
+							} else if (templatePath.contains("_02")) {
+								ghost->setPilotTier(2);
+							} else if (templatePath.contains("_03")) {
+								ghost->setPilotTier(3);
+							} else if (templatePath.contains("_04")) {
+								ghost->setPilotTier(4);
+							} else {
+								ghost->setPilotTier(5);
+							}
+						}
+					}
 				} else {
 					player->sendSystemMessage("Unknown selection.");
 					return;
@@ -504,7 +528,112 @@ void SuiManager::handleCharacterBuilderSelectItem(CreatureObject* player, SuiBox
 			player->sendMessage(cbSui->generateMessage());
 
 		} else { // Items
-			ManagedReference<SceneObject*> inventory = player->getSlottedObject("inventory");
+			if (templatePath.contains("ship/player/")) {
+				player->sendSystemMessage("Creating player ship: " + node->getDisplayName());
+				ShipManager::instance()->createPlayerShip(player, templatePath, "", true);
+				ghost->addSuiBox(cbSui);
+				return;
+			// Creating Ship Deed from Chassis Token
+			} else if (templatePath.beginsWith("object/draft_schematic/space/chassis/")) {
+				auto shipManager = ShipManager::instance();
+
+				if (shipManager == nullptr) {
+					return;
+				}
+
+				ManagedReference<CraftingManager*> craftingManager = zserv->getCraftingManager();
+
+				if (craftingManager == nullptr) {
+					return;
+				}
+
+				ManagedReference<DraftSchematic*> draftSchematic = zserv->createObject(node->getTemplateCRC(), 0).castTo<DraftSchematic*>();
+
+				if (draftSchematic == nullptr || !draftSchematic->isValidDraftSchematic()) {
+					player->sendSystemMessage("Invalid Chassis Draft Schematic: " + node->getTemplatePath());
+					return;
+				}
+
+				ManagedReference<ManufactureSchematic*> manuSchematic = (draftSchematic->createManufactureSchematic()).castTo<ManufactureSchematic*>();
+
+				if (manuSchematic == nullptr) {
+					player->sendSystemMessage("Error creating ManufactureSchematic from DraftSchematic: " + node->getTemplatePath());
+					return;
+				}
+
+				unsigned int targetTemplate = draftSchematic->getTanoCRC();
+
+				ManagedReference<ShipChassisComponent*> prototypeChassis = (zserv->createObject(targetTemplate, 2)).castTo<ShipChassisComponent*>();
+
+				if (prototypeChassis == nullptr) {
+					player->sendSystemMessage("Unable to create ShipChassisComponent: " + node->getTemplatePath());
+					return;
+				}
+
+				Locker locker(prototypeChassis);
+				Locker mlock(manuSchematic, prototypeChassis);
+
+				craftingManager->setInitialCraftingValues(prototypeChassis, manuSchematic, CraftingManager::GREATSUCCESS);
+
+				Reference<CraftingValues*> craftingValues = manuSchematic->getCraftingValues();
+				craftingValues->setManufactureSchematic(manuSchematic);
+				craftingValues->setPlayer(player);
+
+				int nRows = craftingValues->getTotalVisibleAttributeGroups();
+
+				prototypeChassis->updateCraftingValues(craftingValues, true);
+
+				int quality = 50;
+
+				if (quality > 0) {
+					for (int i = 0; i < nRows; i++) {
+						String visibleGroup = craftingValues->getVisibleAttributeGroup(i);
+
+						for (int j = 0; j < craftingValues->getTotalExperimentalAttributes(); ++j) {
+							String attribute = craftingValues->getAttribute(j);
+							String group = craftingValues->getAttributeGroup(attribute);
+
+							if (group == visibleGroup) {
+								float maxValue = craftingValues->getMaxValue(attribute);
+								float minValue = craftingValues->getMinValue(attribute);
+
+								craftingValues->setCurrentPercentage(attribute, (float)quality / 100.f, 5.f);
+							}
+						}
+					}
+
+					craftingValues->recalculateValues(true);
+					prototypeChassis->updateCraftingValues(craftingValues, true);
+				}
+
+				mlock.release();
+
+				prototypeChassis->createChildObjects();
+
+				// Set Crafter name and generate serial number
+				String name = player->getFirstName();
+
+				prototypeChassis->setCraftersName(name);
+				prototypeChassis->setCraftersID(player->getObjectID());
+
+				StringBuffer customName;
+				customName << prototypeChassis->getDisplayedName() << " (Frog Generated by " << name << ")";
+				prototypeChassis->setCustomObjectName(customName.toString(), false);
+
+				String serial = craftingManager->generateSerial();
+				prototypeChassis->setSerialNumber(serial);
+
+				prototypeChassis->updateToDatabase();
+
+				locker.release();
+
+				shipManager->createDeedFromChassis(player, prototypeChassis, player);
+
+				return;
+			}
+			// END Creating Ship Deed from Chassis Token
+
+			ManagedReference<SceneObject*> inventory = player->getInventory();
 
 			if (inventory == nullptr) {
 				return;

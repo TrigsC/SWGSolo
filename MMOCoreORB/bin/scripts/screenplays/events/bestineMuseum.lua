@@ -94,7 +94,7 @@ function BestineMuseumScreenPlay:spawnMobiles()
 		local npcData = artistMobiles[i]
 		local pNpc = spawnMobile("tatooine", npcData.template, 1, npcData.x, npcData.z, npcData.y, npcData.direction, npcData.cellID)
 		if pNpc ~= nil and npcData.position == SIT then
-			CreatureObject(pNpc):setState(STATESITTINGONCHAIR)
+			CreatureObject(pNpc):setState(SITTINGONCHAIR)
 		end
 	end
 end
@@ -470,7 +470,7 @@ function BestineMuseumScreenPlay:createArtistWaypoint(pPlayer, id)
 
 	if (pGhost ~= nil) then
 		local pWaypoint = PlayerObject(pGhost):getWaypointAt(artistData.x, artistData.y, "tatooine")
-		
+
 		if pWaypoint ~= nil then
 			local waypoint = LuaWaypointObject(pWaypoint)
 
@@ -479,7 +479,7 @@ function BestineMuseumScreenPlay:createArtistWaypoint(pPlayer, id)
 				PlayerObject(pGhost):updateWaypoint(SceneObject(pWaypoint):getObjectID())
 			end
 		else
-			PlayerObject(pGhost):addWaypoint("tatooine", artistName, "", artistData.x, artistData.y, WAYPOINTPURPLE, true, true, 0, 0)
+			PlayerObject(pGhost):addWaypoint("tatooine", artistName, "", artistData.x, 0, artistData.y, WAYPOINT_PURPLE, true, true, 0, 0)
 		end
 	end
 end

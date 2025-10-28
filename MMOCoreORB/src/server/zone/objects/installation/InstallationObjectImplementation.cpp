@@ -27,7 +27,7 @@
 #include "components/TurretDataComponent.h"
 #include "server/zone/objects/player/FactionStatus.h"
 #include "templates/params/OptionBitmask.h"
-#include "templates/params/creature/CreatureFlag.h"
+#include "templates/params/creature/ObjectFlag.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/intangible/PetControlDevice.h"
 #include "server/zone/managers/creature/PetManager.h"
@@ -61,26 +61,16 @@ void InstallationObjectImplementation::sendBaselinesTo(SceneObject* player) {
 }
 
 void InstallationObjectImplementation::fillAttributeList(AttributeListMessage* alm, CreatureObject* object) {
-	//TangibleObjectImplementation::fillAttributeList(alm, object);
+	// TangibleObjectImplementation::fillAttributeList(alm, object);
 
 	if (object != nullptr && isOnAdminList(object)) {
-
-		//Add the owner name to the examine window.
+		// Add the owner name to the examine window.
 		ManagedReference<SceneObject*> obj = object->getZoneServer()->getObject(ownerObjectID);
 
-		if(obj != nullptr) {
+		if (obj != nullptr) {
 			alm->insertAttribute("owner", obj->getDisplayedName());
 		}
 	}
-	if(isTurret() && dataObjectComponent != nullptr){
-
-		TurretDataComponent* turretData = cast<TurretDataComponent*>(dataObjectComponent.get());
-			if(turretData == nullptr)
-				return;
-
-			turretData->fillAttributeList(alm);
-	}
-
 }
 
 void InstallationObjectImplementation::setActive(bool value, bool notifyClient) {
@@ -374,37 +364,40 @@ void InstallationObjectImplementation::updateHopper(Time& workingTime, bool shut
 
 		if (!currentSpawn->inShift() || container->getSpawnID() != currentSpawn->getObjectID()) {
 			errorString = "harvester_resource_depleted"; // Resource has been depleted.  Shutting down.
+			shutdownAfterUpdate = true;
 		}
 	} else {
 		errorString = "harvester_no_resource"; // No resource selected.  Shutting down.
 	}
 
-	if (!errorString.isEmpty()) {
-		if (isActive()) {
-			StringIdChatParameter stringId("shared", errorString);
-			broadcastToOperators(new ChatSystemMessage(stringId));
+	if (!errorString.isEmpty() && isActive()) {
+		StringIdChatParameter stringId("shared", errorString);
+		broadcastToOperators(new ChatSystemMessage(stringId));
 
-			resourceHopperTimestamp.updateToCurrentTime();
-			currentSpawn = nullptr;
-			setActive(false);
-			auto msg = error();
+		resourceHopperTimestamp.updateToCurrentTime();
+		currentSpawn = nullptr;
+		setActive(false);
+		auto msg = info();
 
-			msg << errorString;
+		msg << errorString;
 
-			for (int i = 0; i < operatorList.size(); ++i) {
-				if (i == 0) {
-					msg << "; Operators:";
-				}
-
-				auto player = operatorList.get(i);
-
-				msg << " " << player->getObjectID();
+		for (int i = 0; i < operatorList.size(); ++i) {
+			if (i == 0) {
+				msg << "; Operators:";
 			}
 
-			msg << ".";
-			msg.flush();
+			auto player = operatorList.get(i);
+
+			msg << " " << player->getObjectID();
 		}
 
+		msg << ".";
+		msg.flush();
+	}
+
+	// Invalid state just stop and return
+	if (currentSpawn == nullptr || container == nullptr || container->getSpawnID() != currentSpawn->getObjectID()) {
+		setActive(false);
 		return;
 	}
 
@@ -776,20 +769,25 @@ void InstallationObjectImplementation::updateStructureStatus() {
 	}
 }
 
-bool InstallationObjectImplementation::isAggressiveTo(CreatureObject* target) {
+bool InstallationObjectImplementation::isAggressiveTo(TangibleObject* target) {
 	// info(true) << "InstallationObjectImp isAggressiveTo check called";
 
 	if (target == nullptr || target->isVehicleObject() || target->isInvisible())
 		return false;
 
-	bool targetIsPlayer = target->isPlayerCreature();
-	bool targetIsAgent = target->isAiAgent();
+	auto targetCreo = target->asCreatureObject();
+
+	if (targetCreo == nullptr)
+		return false;
+
+	bool targetIsPlayer = targetCreo->isPlayerCreature();
+	bool targetIsAgent = targetCreo->isAiAgent();
 
 	// Get factions
 	uint32 thisFaction = getFaction();
-	uint32 targetFaction = target->getFaction();
+	uint32 targetFaction = targetCreo->getFaction();
 
-	PlayerObject* ghost = target->getPlayerObject();
+	PlayerObject* ghost = targetCreo->getPlayerObject();
 
 	if (targetIsPlayer && ghost != nullptr) {
 		if (ghost->hasCrackdownTefTowards(thisFaction)) {
@@ -799,7 +797,7 @@ bool InstallationObjectImplementation::isAggressiveTo(CreatureObject* target) {
 		bool covertOvert = ConfigManager::instance()->useCovertOvertSystem();
 
 		if (covertOvert) {
-			if (!ghost->hasGcwTef() && target->getFactionStatus() == FactionStatus::COVERT) {
+			if (!ghost->hasGcwTef() && targetCreo->getFactionStatus() == FactionStatus::COVERT) {
 				return false;
 			}
 		}
@@ -815,13 +813,11 @@ bool InstallationObjectImplementation::isAggressiveTo(CreatureObject* target) {
 
 		if (!factionString.isEmpty()) {
 			if (targetIsAgent) {
-				AiAgent* targetAi = target->asAiAgent();
+				AiAgent* targetAi = targetCreo->asAiAgent();
 
 				if (FactionManager::instance()->isEnemy(factionString, targetAi->getFactionString()))
 					return true;
 			} else if (targetIsPlayer) {
-				PlayerObject* ghost = target->getPlayerObject();
-
 				if (ghost == nullptr)
 					return false;
 
@@ -840,7 +836,7 @@ bool InstallationObjectImplementation::isAggressiveTo(CreatureObject* target) {
 						return true;
 				}
 
-				if (thisFaction == 0 && isAttackableBy(target))
+				if (thisFaction == 0 && isAttackableBy(targetCreo))
 					return true;
 			}
 		}
@@ -857,7 +853,7 @@ bool InstallationObjectImplementation::isAttackableBy(CreatureObject* creature) 
 
 	// info(true) << "InstallationObjectImp isAttackableBy called for " << getObjectID() << "  with attacker creature of " << creature->getObjectID();
 
-	if (!(getPvpStatusBitmask() & CreatureFlag::ATTACKABLE)) {
+	if (!(getPvpStatusBitmask() & ObjectFlag::ATTACKABLE)) {
 		return false;
 	}
 
@@ -902,7 +898,7 @@ bool InstallationObjectImplementation::isAttackableBy(CreatureObject* creature) 
 		bool covertOvert = ConfigManager::instance()->useCovertOvertSystem();
 
 		if (!covertOvert) {
-			if ((getPvpStatusBitmask() & CreatureFlag::OVERT) && creatureStatus != FactionStatus::OVERT) {
+			if ((getPvpStatusBitmask() & ObjectFlag::OVERT) && creatureStatus != FactionStatus::OVERT) {
 				return false;
 			}
 		}
@@ -931,41 +927,15 @@ bool InstallationObjectImplementation::isAttackableBy(CreatureObject* creature) 
 }
 
 void InstallationObjectImplementation::createChildObjects() {
-	if (isTurret()) {
-		SharedInstallationObjectTemplate* inso = dynamic_cast<SharedInstallationObjectTemplate*>(getObjectTemplate());
+	if (isMinefield()) {
+		setContainerDefaultAllowPermission(ContainerPermissions::MOVEIN);
+		setContainerDefaultDenyPermission(ContainerPermissions::MOVEOUT);
+		setContainerDefaultAllowPermission(ContainerPermissions::OPEN);
 
-		if (inso != nullptr) {
-			uint32 defaultWeaponCRC = inso->getWeapon().hashCode();
-
-			if (getZoneServer() != nullptr) {
-				Reference<WeaponObject*> defaultWeapon = (getZoneServer()->createObject(defaultWeaponCRC, getPersistenceLevel())).castTo<WeaponObject*>();
-
-				if (defaultWeapon == nullptr) {
-					return;
-				}
-
-				if (!transferObject(defaultWeapon, 4)) {
-					defaultWeapon->destroyObjectFromDatabase(true);
-					return;
-				}
-
-				if (dataObjectComponent != nullptr) {
-					TurretDataComponent* turretData = cast<TurretDataComponent*>(dataObjectComponent.get());
-
-					if (turretData != nullptr) {
-						turretData->setWeapon(defaultWeapon);
-					}
-				}
-			}
-		}
-	} else if (isMinefield()) {
-		this->setContainerDefaultAllowPermission(ContainerPermissions::MOVEIN);
-		this->setContainerDefaultDenyPermission(ContainerPermissions::MOVEOUT);
-		this->setContainerDefaultAllowPermission(ContainerPermissions::OPEN);
-
-	} else {
-		StructureObjectImplementation::createChildObjects();
+		return;
 	}
+
+	StructureObjectImplementation::createChildObjects();
 }
 
 float InstallationObjectImplementation::getHitChance() const {

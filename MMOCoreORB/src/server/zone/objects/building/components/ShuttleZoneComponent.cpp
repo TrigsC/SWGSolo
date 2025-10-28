@@ -12,7 +12,7 @@
 //#define SHUTTLE_TIMER_DEBUG
 
 void ShuttleZoneComponent::notifyInsertToZone(SceneObject* sceneObject, Zone* zone) const {
-	ZoneComponent::notifyInsertToZone(sceneObject, zone);
+	GroundZoneComponent::notifyInsertToZone(sceneObject, zone);
 
 	if (sceneObject == nullptr) {
 		error() << "ShuttleZoneComponent::notifyInsertToZone -- inserted object is null";
@@ -24,27 +24,42 @@ void ShuttleZoneComponent::notifyInsertToZone(SceneObject* sceneObject, Zone* zo
 		return;
 	}
 
-	CreatureObject* shuttle = cast<CreatureObject*>( sceneObject);
+	auto shuttle = sceneObject->asCreatureObject();
+
+	if (shuttle == nullptr)
+		return;
+
+	auto zoneServer = zone->getZoneServer();
+
+	if (zoneServer == nullptr)
+		return;
 
 	Reference<ScheduleShuttleTask*> task = new ScheduleShuttleTask(shuttle, zone);
 
-	uint32 startDiff = zone->getZoneServer()->getStartTimestamp()->miliDifference();
+	if (task == nullptr)
+		return;
 
-	// Shuttles delayed 5 minutes for server start
-	int bootDelay = ConfigManager::instance()->getInt("Core3.ShuttleZoneComponent.BootDelay", 5 * 60 * 1000);
+	int delay = 500;
 
-	int delay = bootDelay - startDiff;
+	if (zoneServer->isServerLoading()) {
+		uint32 startDiff = zone->getZoneServer()->getStartTimestamp()->miliDifference();
 
-	if (delay <= 0)
-		delay = 50;
+		// Shuttles delayed 5 minutes for server start
+		int bootDelay = ConfigManager::instance()->getInt("Core3.ShuttleZoneComponent.BootDelay", 5 * 60 * 1000);
+
+		delay = bootDelay - startDiff;
+
+		if (delay <= 0)
+			delay = 500;
 
 #ifdef SHUTTLE_TIMER_DEBUG
-	info(true) << "ScheduleShuttleTask for " << zone->getZoneName() << " scheduled due to server loading: militime since server start - " << startDiff << "  shuttle dealy time - " << delay << " miliseconds.";
+		info(true) << "ScheduleShuttleTask for " << zone->getZoneName() << " scheduled due to server loading: militime since server start - " << startDiff << "  shuttle dealy time - " << delay << " miliseconds.";
 #endif
+	}
 
 	task->schedule(delay);
 }
 
 void ShuttleZoneComponent::notifyRemoveFromZone(SceneObject* sceneObject) const {
-	ZoneComponent::notifyRemoveFromZone(sceneObject);
+	GroundZoneComponent::notifyRemoveFromZone(sceneObject);
 }

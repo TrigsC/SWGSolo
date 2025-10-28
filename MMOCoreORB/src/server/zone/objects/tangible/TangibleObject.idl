@@ -11,6 +11,9 @@ include server.zone.packets.scene.AttributeListMessage;
 import server.zone.objects.creature.CreatureObject;
 import server.zone.objects.tangible.tool.repair.RepairTool;
 import server.zone.objects.area.ActiveArea;
+import server.zone.objects.tangible.threat.ThreatMap;
+import engine.util.u3d.Vector3;
+
 include templates.params.OptionBitmask;
 include templates.params.ObserverEventType;
 import server.zone.objects.factorycrate.FactoryCrate;
@@ -20,10 +23,11 @@ include server.zone.objects.scene.variables.DeltaVector;
 include server.zone.objects.manufactureschematic.craftingvalues.CraftingValues;
 include templates.SharedObjectTemplate;
 include system.util.VectorMap;
-import server.zone.objects.tangible.threat.ThreatMap;
 include server.zone.objects.scene.variables.AutoDeltaSet;
 include server.zone.objects.scene.variables.StringId;
 include system.thread.atomic.AtomicInteger;
+include server.zone.TreeEntry;
+include server.zone.objects.cell.CellObject;
 
 @json
 @mock
@@ -150,37 +154,33 @@ class TangibleObject extends SceneObject {
 	 * @param targetObject The targeted object containing the SkillModMap which will be affected.
 	 */
 	@read
+	@arg1preLocked
 	public abstract native void addTemplateSkillMods(TangibleObject targetObject);
-
-	@read
-	public abstract void applySkillModsTo(CreatureObject creature) {
-
-	}
-
-	@dirty
-	public abstract void removeSkillModsFrom(CreatureObject creature) {
-
-	}
-
-	public abstract void addSkillMod(final int skillType, final string skillMod, int value, boolean notifyClient = true) {
-
-	}
-
-	public abstract void removeSkillMod(final int skillType, final string skillMod, int value, boolean notifyClient = true) {
-
-	}
-
-	public abstract void removeAllSkillModsOfType(final int skillType, boolean notifyClient = true) {
-
-	}
 
 	/**
 	 * Removes this object's skill mod map from the target object's skill mod map
 	 * @param targetObject the targeted object containing the SkillModMap which will be affected.
 	 */
-	@local
 	@read
+	@arg1preLocked
 	public abstract native void removeTemplateSkillMods(TangibleObject tangibleObject);
+
+	@read
+	public abstract void applySkillModsTo(CreatureObject creature) {
+	}
+
+	@dirty
+	public abstract void removeSkillModsFrom(CreatureObject creature) {
+	}
+
+	public abstract void addSkillMod(final int skillType, final string skillMod, int value, boolean notifyClient = true) {
+	}
+
+	public abstract void removeSkillMod(final int skillType, final string skillMod, int value, boolean notifyClient = true) {
+	}
+
+	public abstract void removeAllSkillModsOfType(final int skillType, boolean notifyClient = true) {
+	}
 
 	@read
 	@local
@@ -245,6 +245,14 @@ class TangibleObject extends SceneObject {
 	@dirty
 	public native void sendTo(SceneObject player, boolean doClose, boolean forceLoadContainer = true);
 
+	@local
+	public native void notifyInsert(TreeEntry entry);
+
+	@dirty
+	@local
+	@dereferenced
+	public native abstract Vector3 getWorldPosition();
+
 	/**
 	 * Calls the appropriate UI Listener Function
 	 * @pre { this object is locked, object is locked }
@@ -262,6 +270,9 @@ class TangibleObject extends SceneObject {
 	 * @param value value from packet
 	 */
 	public native abstract void synchronizedUIStopListen(CreatureObject player, int value);
+
+	@preLocked
+	public native abstract void removeOutOfRangeObjects();
 
 	/**
 	 * Sets the active defender
@@ -389,7 +400,12 @@ class TangibleObject extends SceneObject {
 	 * @return returns true if its aggressive
 	 */
 	@dirty
-	public abstract boolean isAggressiveTo(CreatureObject object) {
+	public abstract boolean isAggressiveTo(TangibleObject object) {
+		return false;
+	}
+
+	@dirty
+	public abstract boolean isAggressive(TangibleObject object) {
 		return false;
 	}
 
@@ -835,7 +851,7 @@ class TangibleObject extends SceneObject {
 	}
 
 	@dirty
-	public native void broadcastPvpStatusBitmask();
+	public native abstract void broadcastPvpStatusBitmask();
 
 	public native void addActiveArea(ActiveArea area);
 
@@ -909,6 +925,16 @@ class TangibleObject extends SceneObject {
 		return null;
 	}
 
+	@dirty
+	public abstract CellObject getCell(int idx) {
+		return null;
+	}
+
+	@dirty
+	public abstract CellObject getCell(final string name) {
+		return null;
+	}
+
 	@read
 	public abstract boolean isNoTrade() {
 		if (antiDecayKitObject) {
@@ -954,6 +980,10 @@ class TangibleObject extends SceneObject {
 			return adk;
 		}
 		return null;
+	}
+
+	@preLocked
+	public abstract void refreshPaint() {
 	}
 
 	public abstract native void destroyObjectFromDatabase(boolean destroyContainedObjects = false);
@@ -1004,4 +1034,13 @@ class TangibleObject extends SceneObject {
 
 	@dirty
 	public native boolean isInNavMesh();
+
+	@dirty
+	public native boolean isVendor();
+
+	@dirty
+	public native abstract boolean isInvulnerable();
+
+	@dirty
+	public native abstract boolean isDestroying();
 }

@@ -29,7 +29,7 @@ template<> bool CheckDestination::check(AiAgent* agent) const {
 }
 
 template<> bool CheckMovementState::check(AiAgent* agent) const {
-	return agent->getMovementState() == checkVar;
+	return  agent->getMovementState() == checkVar;
 }
 
 template<> bool CheckHasFollow::check(AiAgent* agent) const {
@@ -37,9 +37,7 @@ template<> bool CheckHasFollow::check(AiAgent* agent) const {
 }
 
 template<> bool CheckAggroDelayPast::check(AiAgent* agent) const {
-	Time* delay = agent->getAggroDelay();
-
-	return delay != nullptr && delay->isPast();
+	return agent->isAggroDelayPast();
 }
 
 template<> bool CheckFollowHasState::check(AiAgent* agent) const {
@@ -54,8 +52,10 @@ template<> bool CheckFollowHasState::check(AiAgent* agent) const {
 
 template<> bool CheckProspectInRange::check(AiAgent* agent) const {
 	ManagedReference<SceneObject*> tar = nullptr;
-	if (agent->peekBlackboard("targetProspect"))
+
+	if (agent->peekBlackboard("targetProspect")) {
 		tar = agent->readBlackboard("targetProspect").get<ManagedReference<SceneObject*> >();
+	}
 
 	if (checkVar > 0.f) {
 		return tar != nullptr && agent->isInRange(tar, checkVar);
@@ -63,8 +63,9 @@ template<> bool CheckProspectInRange::check(AiAgent* agent) const {
 		float aggroMod = agent->readBlackboard("aggroMod").get<float>();
 		float radius = agent->getAggroRadius();
 
-		if (radius == 0)
+		if (radius == 0) {
 			radius = AiAgent::DEFAULTAGGRORADIUS;
+		}
 
 		radius = Math::min(96.f, radius * aggroMod);
 
@@ -249,17 +250,25 @@ template<> bool CheckRetreat::check(AiAgent* agent) const {
 }
 
 template<> bool CheckFlee::check(AiAgent* agent) const {
-	if (agent == nullptr || agent->getParent().get() != nullptr || agent->getParentID() > 0)
+	if (agent == nullptr || agent->getParentID() > 0) {
 		return false;
+	}
+
+	int fleeChance = 75;
+
+	if (agent->getPvpStatusBitmask() & ObjectFlag::AGGRESSIVE) {
+		fleeChance = 25;
+	}
+
+	if (System::random(1000) > fleeChance) {
+		return false;
+	}
 
 	Time* fleeDelay = agent->getFleeDelay();
-	int fleeChance = 30;
 
-	if (agent->getPvpStatusBitmask() & CreatureFlag::AGGRESSIVE)
-		fleeChance = 15;
-
-	if (fleeDelay == nullptr || !fleeDelay->isPast() || System::random(100) > fleeChance)
+	if (fleeDelay == nullptr || !fleeDelay->isPast()) {
 		return false;
+	}
 
 	if ((agent->getHAM(CreatureAttribute::HEALTH) < agent->getMaxHAM(CreatureAttribute::HEALTH) * checkVar)
 		|| (agent->getHAM(CreatureAttribute::ACTION) < agent->getMaxHAM(CreatureAttribute::ACTION) * checkVar)
@@ -546,11 +555,11 @@ template<> bool CheckIsDroid::check(AiAgent* agent) const {
 }
 
 template<> bool CheckCrackdownScanner::check(AiAgent* agent) const {
-	return agent->getCreatureBitmask() & CreatureFlag::SCANNING_FOR_CONTRABAND;
+	return agent->getCreatureBitmask() & ObjectFlag::SCANNING_FOR_CONTRABAND;
 }
 
 template<> bool CheckCrackdownFollowTarget::check(AiAgent* agent) const {
-	if (!(agent->getCreatureBitmask() & CreatureFlag::FOLLOW))
+	if (!(agent->getCreatureBitmask() & ObjectFlag::FOLLOW))
 		return false;
 
 	ManagedReference<SceneObject*> followCopy = agent->getFollowObject().get();
@@ -567,7 +576,7 @@ template<> bool CheckCrackdownFollowTarget::check(AiAgent* agent) const {
 }
 
 template<> bool CheckIsStationary::check(AiAgent* agent) const {
-	return agent->getCreatureBitmask() & CreatureFlag::STATIONARY;
+	return agent->getCreatureBitmask() & ObjectFlag::STATIONARY;
 }
 
 template<> bool CheckIsHealer::check(AiAgent* agent) const {
@@ -581,8 +590,9 @@ template<> bool CheckHealChance::check(AiAgent* agent) const {
 		return false;
 	}
 
-	if (System::random(100) < 98)
+	if (System::random(100) < 98) {
 		return false;
+	}
 
 	return true;
 }
@@ -700,7 +710,7 @@ template<> bool CheckStopResting::check(AiAgent* agent) const {
 	if (agent == nullptr)
 		return false;
 
-	if (agent->isInCombat() || agent->getFollowObject() != nullptr)
+	if (agent->isInCombat() || agent->getFollowObject() != nullptr || agent->getMovementState() == AiAgent::STALKING)
 		return true;
 
 	Time* restDelay = agent->getRestDelay();
@@ -740,7 +750,7 @@ template<> bool CheckQueueSize::check(AiAgent* agent) const {
 template<> bool CheckIsEscort::check(AiAgent* agent) const {
 	Locker lock(agent);
 
-	return agent->getCreatureBitmask() & CreatureFlag::ESCORT;
+	return agent->getCreatureBitmask() & ObjectFlag::ESCORT;
 }
 
 template<> bool CheckHasRangedWeapon::check(AiAgent* agent) const {

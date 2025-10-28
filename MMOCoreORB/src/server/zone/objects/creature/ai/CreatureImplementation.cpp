@@ -196,7 +196,7 @@ bool CreatureImplementation::hasDNA() {
 		return false;
 	}
 	// skip droids and anything that doesnt have organic bits or it doesnt eat
-	if (isDroidObject() || !hasOrganics() || getDiet() == CreatureFlag::NONE) {
+	if (isDroidObject() || !hasOrganics() || getDiet() == ObjectFlag::NONE) {
 		return false;
 	}
 	return (dnaState == CreatureManager::HASDNA);
@@ -337,7 +337,7 @@ float CreatureImplementation::getChanceToTame(CreatureObject* player) {
 bool CreatureImplementation::isVicious() {
 	CreatureTemplate* creatureTemplate = npcTemplate.get();
 
-	return creatureTemplate->getPvpBitmask() & CreatureFlag::AGGRESSIVE;
+	return creatureTemplate->getPvpBitmask() & ObjectFlag::AGGRESSIVE;
 }
 
 bool CreatureImplementation::canMilkMe(CreatureObject* player) {
@@ -409,9 +409,28 @@ void CreatureImplementation::loadTemplateDataForBaby(CreatureTemplate* templateD
 
 	setBaby(true);
 
-	clearPvpStatusBit(CreatureFlag::AGGRESSIVE, false);
-	clearPvpStatusBit(CreatureFlag::ENEMY, false);
-	setCreatureBitmask(getCreatureBitmask() + CreatureFlag::BABY);
+	clearPvpStatusBit(ObjectFlag::AGGRESSIVE, false);
+	clearPvpStatusBit(ObjectFlag::ENEMY, false);
+	addObjectFlag(ObjectFlag::BABY);
+
+	/*
+	auto inventory = getInventory();
+	int invSize  = inventory->getContainerObjectsSize();
+
+	if (invSize > 1) {
+		StringBuffer msg;
+		msg << "\033[32m" << getDisplayedName() << " ID: " << getObjectID() << " Inventory size: " << inventory->getContainerObjectsSize() << endl;
+
+
+		for (int i = 0; i < inventory->getContainerObjectsSize(); ++i) {
+			auto object = inventory->getContainerObject(i);
+
+			msg << getDisplayedName() << " ID: " << getObjectID() << "Inventory - #" << i << " Item: " << object->getObjectNameStringIdName() << " -- " << object->getObjectTemplate()->getTemplateFileName() << " ID: " << object->getObjectID() << endl;
+		}
+
+		info(true) << msg.toString() << "\033[0m";
+	}
+	*/
 }
 
 void CreatureImplementation::setPetLevel(int newLevel) {
@@ -475,6 +494,22 @@ void CreatureImplementation::setPetLevel(int newLevel) {
 	for (int i = 0; i < 9; ++i) {
 		setMaxHAM(i, baseHAM.get(i));
 	}
+}
+
+int CreatureImplementation::getAdultLevel() {
+	auto creatureDeed = getPetDeed();
+
+	// Pet Deed is not null, use the level from that
+	if (creatureDeed != nullptr) {
+		return creatureDeed->getLevel();
+	}
+
+	if (npcTemplate != nullptr) {
+		return npcTemplate->getLevel();
+	}
+
+	// Just use the creatures level
+	return getLevel();
 }
 
 bool CreatureImplementation::isMount() {

@@ -74,14 +74,36 @@ void MapLocationEntry::setObject(SceneObject* obj) {
 
 	if (object->isVendor()) {
 		newName = newName.subString(8); // Removes the "Vendor: " prefix
-	} else if (category->getIndex() == MapLocationType::SHUTTLEPORT) { // Shuttleports take on the name of nearest travel point
+	// Shuttleports take on the name of nearest travel point
+	} else if (category->getIndex() == MapLocationType::SHUTTLEPORT) {
 		ManagedReference<PlanetManager*> planetManager = zone->getPlanetManager();
-		PlanetTravelPoint* ptp = planetManager->getNearestPlanetTravelPoint(object, 64.f);
 
-		if (ptp != nullptr) {
-			newName = ptp->getPointName();
+		if (planetManager != nullptr) {
+			PlanetTravelPoint* ptp = planetManager->getNearestPlanetTravelPoint(object, 64.f);
+
+			if (ptp != nullptr) {
+				newName = ptp->getPointName();
+			}
 		}
-	 // Everything else except faction bases, terminals and trainers are just named by the city it's in
+	// Camp's Need to be registered by the owners name
+	} else if (object->isCampStructure()) {
+		auto campStructure = object.castTo<StructureObject*>();
+
+		if (campStructure != nullptr) {
+			SortedVector<ManagedReference<SceneObject*>>* childObjects = campStructure->getChildObjects();
+
+			for (int i = 0; i < childObjects->size(); ++i) {
+				auto child = childObjects->get(i);
+
+				if (child == nullptr || !child->isTerminal())
+					continue;
+
+				newName = child->getDisplayedName();
+
+				break;
+			}
+		}
+	// Everything else except faction bases, terminals and trainers are just named by the city it's in
 	} else if (!object->isGCWBase() && (category->getIndex() != MapLocationType::TERMINAL) && !object->isCreatureObject()) {
 		ManagedReference<PlanetManager*> planetManager = zone->getPlanetManager();
 

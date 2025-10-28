@@ -12,13 +12,12 @@
 class GetAttributesBatchCommand : public QueueCommand {
 public:
 
-	GetAttributesBatchCommand(const String& name, ZoneProcessServer* server)
-		: QueueCommand(name, server) {
+	const int MAXIMUM_BATCH = 999;
 
+	GetAttributesBatchCommand(const String& name, ZoneProcessServer* server) : QueueCommand(name, server) {
 	}
 
 	int doQueueCommand(CreatureObject* creature, const uint64& target, const UnicodeString& arguments) const {
-
 		if (!checkStateMask(creature))
 			return INVALIDSTATE;
 
@@ -30,7 +29,7 @@ public:
 
 		ManagedReference<PlayerObject*> ghost = creature->getPlayerObject();
 
-		if(ghost == nullptr)
+		if (ghost == nullptr)
 			return GENERALERROR;
 
 		StringTokenizer ids(arguments.toString());
@@ -60,9 +59,7 @@ public:
 			if (object != nullptr) {
 				ManagedReference<SceneObject*> parent = object->getParent().get();
 
-				if (parent != nullptr && parent->isCreatureObject() &&
-					!ghost->isPrivileged() && !object->isASubChildOf(creature)) {
-
+				if (parent != nullptr && parent->isCreatureObject() && !ghost->isPrivileged() && !object->isASubChildOf(creature)) {
 					sendEmptyAttributes(creature, objid);
 				} else {
 					int count = (incr == 0 && !ids.hasMoreTokens()) ? 0 : incr;
@@ -74,8 +71,8 @@ public:
 				sendEmptyAttributes(creature, objid);
 			}
 
-			if (++incr > 999) {
-				creature->error("GetAttributesBatchCommand: Objects attribute limit exceeded: arguments: " + arguments.toString());
+			if (++incr > MAXIMUM_BATCH) {
+				creature->error() << creature->getDisplayedName() << " ID: " << creature->getObjectID() << "  GetAttributesBatchCommand -- Objects attribute limit exceeded with more than " << incr << " total objects.";
 
 				return GENERALERROR;
 			}
@@ -94,7 +91,6 @@ public:
 
 		creature->notifyObservers(ObserverEventType::GETATTRIBUTESBATCHCOMMAND, object, incr);
 	}
-
 };
 
-#endif //GETATTRIBUTESBATCHCOMMAND_H_
+#endif // GETATTRIBUTESBATCHCOMMAND_H_

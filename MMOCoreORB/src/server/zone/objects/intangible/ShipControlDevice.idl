@@ -8,71 +8,118 @@ package server.zone.objects.intangible;
 import server.zone.objects.intangible.ControlDevice;
 import server.zone.objects.creature.CreatureObject;
 import server.zone.packets.object.ObjectMenuResponse;
-include server.zone.managers.radial.RadialOptions;
 import server.zone.objects.scene.SceneObject;
+import server.zone.objects.ship.ShipObject;
+import server.zone.packets.scene.AttributeListMessage;
+
+include server.zone.managers.radial.RadialOptions;
+include engine.util.u3d.Vector3;
+include system.util.Vector;
 
 @json
 class ShipControlDevice extends ControlDevice {
+	public static final int LANDSHIP = 1;
+	public static final int LAUNCHSHIP = 128;
+
+	protected int shipType;
+
+	@dereferenced
+	protected string parkingLocation;
+
+	@dereferenced
+	protected string storedZoneName;
+
+	@dereferenced
+	protected Vector3 storedPosition;
+
+	@dereferenced
+	private Vector<string> skillsRequired;
+
 	public ShipControlDevice() {
 		Logger.setLoggingName("ShipControlDevice");
+
+		shipType = 0;
 	}
 
 	@preLocked
-	@arg1preLocked
-	public native void storeObject(CreatureObject player, boolean force = false);
+	public native ShipObject launchShip(CreatureObject player, @dereferenced final string zoneName, @dereferenced final Vector3 position);
 
 	@preLocked
 	@arg1preLocked
-	public native void generateObject(CreatureObject player);
+	public native int handleObjectMenuSelect(CreatureObject player, byte selectedID);
 
-	@preLocked
-	@arg1preLocked
-	public int handleObjectMenuSelect(CreatureObject player, byte selectedID) {
-		Logger.info("selected call");
-
-		if (selectedID == RadialOptions.VEHICLE_GENERATE) {
-
-			if (!super.controlledObject) {
-				Logger.error("null controlled object in vehicle control device");
-				return 1;
-			} else {
-				SceneObject parent = player.getParent();
-
-				if (!parent) {
-					this.generateObject(player);
-				}
-			}
-		} else if (selectedID == RadialOptions.VEHICLE_STORE) {
-			if (!super.controlledObject) {
-				Logger.error("null controlled object in vehicle control device");
-				return 1;
-			} else {
-				if (super.status == 1 && !super.controlledObject.isInQuadTree()) {
-					this.generateObject(player);
-				} else {
-					this.storeObject(player);
-				}
-			}
-		}
-
-		return 0;
-	}
-
-	/**
-	 * Fills the radial options, needs to be overriden
-	 * @pre { this object is locked }
-	 * @post { this object is locked, menuResponse is complete}
-	 * @param menuResponse ObjectMenuResponse that will be sent to the client
-	 */
 	@local
 	@dirty
 	public native void fillObjectMenuResponse(ObjectMenuResponse menuResponse, CreatureObject player);
 
+	@local
+	@dirty
+	public native void fillAttributeList(AttributeListMessage alm, CreatureObject object);
+
 	@dirty
 	public native boolean canBeTradedTo(CreatureObject player, CreatureObject receiver, int numberInTrade);
 
+	@local
+	@dereferenced
+	public native Vector3 getStoredPosition(boolean randomPosition = true);
+
+	@arg1preLocked
+	public native void setStoredLocationData(CreatureObject player);
+
+	/**
+	 * Checks if the object can be destroyed
+	 * @pre { this is locked }
+	 * @post { this is locked }
+	 * @returns 0 on success, != 0 on error
+	 */
 	@dirty
+	public native int canBeDestroyed(CreatureObject player);
+
+	@preLocked
+	public native void destroyObjectFromDatabase(boolean destroyContainedObjects = false);
+
+	// Accessors
+	public native boolean isShipLaunched();
+
 	public boolean isShipControlDevice() {
 		return true;
+	}
+
+	@dereferenced
+	public string getParkingLocation() {
+		return parkingLocation;
+	}
+
+	@dereferenced
+	public string getStoredZoneName() {
+		return storedZoneName;
+	}
+
+	public int getShipType() {
+		return shipType;
+	}
+
+	public int getTotalSkillsRequired() {
+		return skillsRequired.size();
+	}
+
+	public string getSkillRequired(int index) {
+		return skillsRequired.get(index);
+	}
+
+	// Mutators
+	@local
+	@preLocked
+	public void setShipType(int type) {
+		shipType = type;
+	}
+
+	@preLocked
+	public void setParkingLocation(final string cityName) {
+		parkingLocation = cityName;
+	}
+
+	public void addSkillRequired(string skill) {
+		skillsRequired.add(skill);
 	}
 }

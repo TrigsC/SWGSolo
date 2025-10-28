@@ -57,6 +57,7 @@ namespace creature {
 		int isFeigningDeath(lua_State* L);
 		int hasState(lua_State* L);
 		int setState(lua_State* L);
+		int clearState(lua_State* L);
 		int setPosture(lua_State* L);
 		int setMoodString(lua_State* L);
 		int getMoodString(lua_State* L);
@@ -131,6 +132,20 @@ namespace creature {
 		int getWeaponType(lua_State* L);
 		int attemptPeace(lua_State* L);
 		int forcePeace(lua_State* L);
+		int isPilotingShip(lua_State* L);
+		int setSpawnerID(lua_State* L);
+		int getSpawnerID(lua_State* L);
+		int storePets(lua_State* L);
+
+		// JTL
+		int isRebelPilot(lua_State* L);
+		int isImperialPilot(lua_State* L);
+		int isNeutralPilot(lua_State* L);
+		int hasCertifiedShip(lua_State* L);
+		int failQuestMission(lua_State* L);
+		int removeQuestMission(lua_State* L);
+		int addSpaceMissionObject(lua_State* L);
+		int removeSpaceMissionObject(lua_State* L);
 	private:
 		// The pointer to the 'real object' defined in object.cc
 		CreatureObject* realObject;

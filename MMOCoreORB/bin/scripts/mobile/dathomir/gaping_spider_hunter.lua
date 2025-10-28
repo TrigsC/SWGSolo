@@ -20,7 +20,7 @@ gaping_spider_hunter = Creature:new {
 	boneAmount = 0,
 	milk = 0,
 	tamingChance = 0.25,
-	ferocity = 0,
+	ferocity = 5,
 	pvpBitmask = AGGRESSIVE + ATTACKABLE + ENEMY,
 	creatureBitmask = PACK + KILLER + STALKER,
 	optionsBitmask = AIENABLED,
@@ -41,7 +41,7 @@ gaping_spider_hunter = Creature:new {
 	-- primaryAttacks and secondaryAttacks should be separate skill groups specific to the weapon type listed in primaryWeapon and secondaryWeapon
 	-- Use merge() to merge groups in creatureskills.lua together. If a weapon is set to "none", set the attacks variable to empty brackets
 	primaryAttacks = { {"stunattack",""}, {"mediumpoison",""}, },
-	secondaryAttacks = { {"stunattack",""} }
+	secondaryAttacks = { {"stunattack",""}, {"mediumpoison",""}, },
 }
 
 CreatureTemplates:addCreatureTemplate(gaping_spider_hunter, "gaping_spider_hunter")

@@ -94,10 +94,21 @@ void AttributesMap::setHidden(const String& attribute) {
 
 	Reference<Values*> values = attributeValues.get(attribute);
 
-	if (values == nullptr)
+	if (values == nullptr) {
 		return;
+	}
+
+	const auto& experimentalGroup = getAttributeGroup(attribute);
+
+#ifdef DEBUG_ATTRIBUTES_MAP
+	info(true) << "AttributesMap::setHidden called for Attribute: " << attribute << " Group: " << experimentalGroup;
+#endif // DEBUG_ATTRIBUTES_MAP
 
 	values->setFiller(true);
+
+	if (visibleGroups.contains(experimentalGroup)) {
+		visibleGroups.removeElement(experimentalGroup);
+	}
 }
 
 void AttributesMap::unsetHidden(const String& attribute) {
@@ -293,10 +304,6 @@ float AttributesMap::getCurrentVisiblePercentage(const String group) const {
 		const String attribute = attributes.get(i);
 		const String atttributeGroup = getAttributeGroup(attribute);
 
-#ifdef DEBUG_ATTRIBUTES_MAP
-		info(true) << "getCurrentVisiblePercentage -- Checking attribute: " << attribute << " with group: " << atttributeGroup;
-#endif // DEBUG_ATTRIBUTES_MAP
-
 		if (group != atttributeGroup)
 			continue;
 
@@ -305,9 +312,13 @@ float AttributesMap::getCurrentVisiblePercentage(const String group) const {
 		if (values == nullptr || values->isFiller())
 			continue;
 
-		if (values->getMaxPercentage() <= 1.0f) {
+		if ((values->getMinValue() != values->getMaxValue()) && (values->getMaxPercentage() <= 1.0f)) {
 			totalPercentage += values->getPercentage();
 			totalAttributes++;
+
+#ifdef DEBUG_ATTRIBUTES_MAP
+			info(true) << "---- Group: " << group << " Adding Attribute: " << attribute << " with Percent of " << values->getPercentage() << " New Current Percentage: " << totalPercentage << " New Total Attributes: " << totalAttributes;
+#endif // DEBUG_ATTRIBUTES_MAP
 		}
 	}
 
@@ -383,10 +394,6 @@ float AttributesMap::getMaxVisiblePercentage(const int i) const {
 			if (attributeValues.elementAt(k).getKey() != attribute)
 				continue;
 
-#ifdef DEBUG_ATTRIBUTES_MAP
-			info(true) << "---- Group: " << group << " Checking Attribute: " << attribute;
-#endif // DEBUG_ATTRIBUTES_MAP
-
 			const Values* values = attributeValues.get(j);
 
 			if (values == nullptr || values->isFiller())
@@ -394,13 +401,13 @@ float AttributesMap::getMaxVisiblePercentage(const int i) const {
 
 			float maxPercentage = values->getMaxPercentage();
 
-#ifdef DEBUG_ATTRIBUTES_MAP
-			info(true) << "---- Group: " << group << " Checking Attribute: " << attribute;
-#endif // DEBUG_ATTRIBUTES_MAP
-
 			if ((values->getMinValue() != values->getMaxValue()) && (maxPercentage <= 1.0f)) {
 				totalPercentage += maxPercentage;
 				totalAttributes++;
+
+#ifdef DEBUG_ATTRIBUTES_MAP
+				info(true) << "---- Group: " << group << " Adding Attribute to Max: " << attribute << " New Max Percentage: " << maxPercentage << " New Total Attributes: " << totalAttributes;
+#endif // DEBUG_ATTRIBUTES_MAP
 			}
 		}
 	}
@@ -408,7 +415,7 @@ float AttributesMap::getMaxVisiblePercentage(const int i) const {
 	totalPercentage /= totalAttributes;
 
 #ifdef DEBUG_ATTRIBUTES_MAP
-	info(true) << "---- END getMaxVisiblePercentage -- Group: " << group << " Returning: " << totalPercentage << " ----";
+	info(true) << "---- END getMaxVisiblePercentage -- Group: " << group << " Returning: " << totalPercentage << " with from " << totalAttributes << " Total Attributes ----";
 #endif // DEBUG_ATTRIBUTES_MAP
 
 	return totalPercentage;

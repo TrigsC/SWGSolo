@@ -153,7 +153,6 @@ TalusDearicScreenPlay = CityScreenPlay:new {
 		{"trainer_shipwright",60,0.1,0.6,73.0,0,3175353, "neutral"},
 
 		--Cantina
-		{"bartender",60,7.8,-0.9,-1.4,119,3175391, ""},
 		{"businessman",60,-5.0724,-0.894996,21.4966,284.21,3175397, ""},
 		{"medic",60,-44.5373,0.105009,-20.8963,0,3175403, "conversation"},
 		{"pilot",60,-44.5373,0.104709,-19.7963,180.005,3175403, "npc_consoling"},
@@ -177,6 +176,7 @@ TalusDearicScreenPlay = CityScreenPlay:new {
 		{"noble",60,28.93,2.12878,58.19,222.007,3175571, ""},
 		{"noble",60,19.26,2.12847,56.13,266.008,3175572, ""},
 		{"theater_manager",1,22.0619,2.12821,63.5,1,3175572, ""},
+		{"extok_evin", 1, -24.0, 2.1, 73.8, 85, 3175573, "neutral"},
 
 		--Hotel
 		{"bounty_hunter",300,-10.227,1.00006,-2.52106,360.011,3175594, "npc_accusing"},
@@ -248,7 +248,7 @@ function TalusDearicScreenPlay:spawnMobiles()
 				CreatureObject(pMobile):setMoodString(mob[8])
 			end
 
-			AiAgent(pMobile):addCreatureFlag(AI_STATIC)
+			AiAgent(pMobile):addObjectFlag(AI_STATIC)
 
 			if CreatureObject(pMobile):getPvpStatusBitmask() == 0 then
 				CreatureObject(pMobile):clearOptionBit(AIENABLED)

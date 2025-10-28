@@ -59,10 +59,12 @@ enum class TrxCode {
 	ADMINCOMMAND,               // From an admin command
 	ADKAPPLY,                   // Apply and ADK to item
 	ADKREMOVE,                  // Remove ADK from item
+	APPLYATTACHMENT,            // Apply Attachment to item
 	AUCTIONADDSALE,             // addSaleItem()
 	AUCTIONBID,                 // Auction Bid Escrow
 	AUCTIONEXPIRED,             // Never retrieved and expired
 	AUCTIONRETRIEVE,            // retrieveItem()
+	CAMPPLACED,                 // Camp Placed
 	CHARACTERBUILDER,           // Character Builder
 	CHARACTERDELETE,            // Delete Character
 	CITYINCOMETAX,              // City income taxes
@@ -70,6 +72,8 @@ enum class TrxCode {
 	CITYTREASURY,               // City Treasury
 	COMBATSTATS,                // Combat Stats
 	CRAFTINGSESSION,            // Crafting Session
+	CREDITCHIP,             	// Space CreditChip Looted
+	CREDITCHIPCLAIM,            // Space CreditChip Claimed
 	DATABASECOMMIT,             // Database Commit
 	DESTROYSTRUCTURE,           // Structure destroyed by system (maintenance etc)
 	EXPERIENCE,                 // Player experience change
@@ -82,6 +86,7 @@ enum class TrxCode {
 	INSTANTBUY,                 // Instant Buy
 	LOTTERYDROID,               // Lottery Droid
 	LUASCRIPT,                  // LUA Script
+	LUALOOT,                    // Loot from LUA Scripts
 	MINED,                      // Resouces mined by installations
 	MISSIONCOMPLETE,            // Mission Completed Summary
 	NPCLOOTCLAIM,               // NPC Loot Claimed
@@ -96,7 +101,10 @@ enum class TrxCode {
 	PLAYERONLINE,               // Player Online
 	RECYCLED,                   // Recycled Items
 	SERVERDESTROYOBJECT,        // /serverDestroyObject command
+	SHIPDEEDPURCHASE,           // Purchase of a ship deed from chassis dealer
+	SHIPREDEED,                 // ReDeeding a ship from datapad
 	SLICECONTAINER,             // Slicing session on a container
+	SPACELOOTSOLD,              // Selling of space loot to chassis dealer
 	STRUCTUREDEED,              // Structure deed trxs
 	TRANSFERITEMMISC,           // /transferitemmisc command
 	TRANSFERSTRUCT,             // Transfer Structure
@@ -185,6 +193,27 @@ public:
 
 	TransactionLog(const TransactionLog& rhs) {
 		*this = rhs;
+	}
+
+	TransactionLog newChild() {
+		TransactionLog child;
+
+		// Copy limited properties from parent
+		child.mEnabled = mEnabled;
+		child.mDebug = mDebug;
+		child.mExportRelated = mExportRelated;
+		child.mWorldPosition = mWorldPosition;
+		child.mWorldPositionContext = mWorldPositionContext;
+		child.mZoneName = mZoneName;
+		child.mContext = mContext;
+		child.mTransaction["trxId"] = getNewTrxID();
+		child.mTransaction["trxGroup"] = getTrxGroup();
+		child.mTransaction["code"] = mTransaction["code"];
+		child.mTransaction["src"] = mTransaction["src"];
+		child.mTransaction["dst"] = mTransaction["dst"];
+		child.mTransaction["subject"] = mTransaction["subject"];
+
+		return child;
 	}
 
 	TransactionLog& operator=(const TransactionLog& rhs) {
@@ -298,6 +327,10 @@ public:
 		return mDebug;
 	}
 
+	bool isAborted() const {
+		return mAborted;
+	}
+
 	bool isVerbose() const {
 		return getVerbose();
 	}
@@ -341,6 +374,9 @@ public:
 	void exportRelated();
 
 private:
+	TransactionLog() {
+	};
+
 	static AtomicInteger exportBacklog;
 
 	void catchAndLog(const char* functioName, Function<void()> function);

@@ -9,6 +9,7 @@
 #include "server/zone/objects/intangible/ControlDevice.h"
 #include "templates/creature/SharedCreatureObjectTemplate.h"
 #include "server/zone/packets/object/DataTransform.h"
+#include "server/zone/packets/creature/CreatureObjectDeltaMessage3.h"
 
 class DismountCommand : public QueueCommand {
 	Vector<uint32> restrictedBuffCRCs;
@@ -27,20 +28,38 @@ public:
 	}
 
 	int doQueueCommand(CreatureObject* creature, const uint64& target, const UnicodeString& arguments) const {
-		if (!checkStateMask(creature))
+		if (!checkStateMask(creature)) {
 			return INVALIDSTATE;
+		}
 
-		if (!checkInvalidLocomotions(creature))
+		if (!checkInvalidLocomotions(creature)) {
 			return INVALIDLOCOMOTION;
+		}
 
-		if (!creature->hasState(CreatureState::RIDINGMOUNT))
+		if (!creature->hasState(CreatureState::RIDINGMOUNT)) {
 			return INVALIDSTATE;
+		}
 
 		if (!creature->checkCooldownRecovery("mount_dismount")) {
 			return GENERALERROR;
 		}
 
-		creature->clearState(CreatureState::RIDINGMOUNT);
+		auto templateData = creature->getObjectTemplate();
+
+		if (templateData == nullptr) {
+			return GENERALERROR;
+		}
+
+		auto playerTemplate = dynamic_cast<SharedCreatureObjectTemplate*>(templateData);
+
+		if (playerTemplate == nullptr) {
+			return GENERALERROR;
+		}
+
+		float mountedSpeed = creature->getRunSpeed();
+
+		// Remove Mounted combat slow from player
+		creature->removeMountedCombatSlow(false);
 
 		ManagedReference<SceneObject*> mount = creature->getParent().get();
 
@@ -48,6 +67,8 @@ public:
 		if (mount != nullptr && mount->isCreatureObject()) {
 			handleMount(creature, mount);
 		}
+
+		creature->clearState(CreatureState::RIDINGMOUNT);
 
 		// reapply speed buffs if they exist
 		for (int i = 0; i < restrictedBuffCRCs.size(); i++) {
@@ -58,6 +79,7 @@ public:
 
 				if (buff != nullptr) {
 					Locker lock(buff, creature);
+
 					buff->applyAllModifiers();
 				}
 			}
@@ -66,69 +88,131 @@ public:
 		SpeedMultiplierModChanges* changeBuffer = creature->getSpeedMultiplierModChanges();
 		int bufferSize = changeBuffer->size();
 
-		if (bufferSize > 5) {
+		while (changeBuffer->size() > 4) {
 			changeBuffer->remove(0);
 		}
 
-		changeBuffer->add(SpeedModChange(creature->getSpeedMultiplierMod()));
+		changeBuffer->add(SpeedModChange(creature->getRunSpeed()));
 
+ 		// Reset Force Sensitive control mods to default.
+		creature->updateSpeedAndAccelerationMods();
+
+		// Update players stats in the database
 		creature->updateToDatabase();
 
-		SharedObjectTemplate* templateData = creature->getObjectTemplate();
-		SharedCreatureObjectTemplate* playerTemplate = dynamic_cast<SharedCreatureObjectTemplate*>(templateData);
-
-		if (playerTemplate != nullptr) {
-			Vector<FloatParam> speedTempl = playerTemplate->getSpeed();
-			creature->setRunSpeed(speedTempl.get(0));
-			creature->updateSpeedAndAccelerationMods(); // Reset Force Sensitive control mods to default.
-		}
-
+		// Update dismount timer
 		creature->updateCooldownTimer("mount_dismount", 2000);
-		creature->setNextAllowedMoveTime(300);
+		creature->setNextAllowedMoveTime(500);
 
-		creature->removeMountedCombatSlow(false); // these are already removed off the player - Just remove it off the mount
+		creature->updateRunSpeed();
+
+		// Client manipulates player height when dismounting, reset the player height sent to the client
+		auto height = creature->getHeight();
+
+		if (height != 1.f) {
+			CreatureObjectDeltaMessage3* delta3 = new CreatureObjectDeltaMessage3(creature);
+
+			if (delta3 != nullptr) {
+				delta3->addFloatUpdate(0x0E, 1.f);
+				delta3->addFloatUpdate(0x0E, height);
+				delta3->close();
+
+				creature->sendMessage(delta3);
+			}
+		}
 
 		return SUCCESS;
 	}
 
 	void handleMount(CreatureObject* creature, SceneObject* mount) const {
-		if (creature == nullptr || mount == nullptr)
+		if (creature == nullptr || mount == nullptr) {
 			return;
+		}
 
-		CreatureObject* vehicle = mount->asCreatureObject();
+		auto vehicle = mount->asCreatureObject();
 
-		if (vehicle == nullptr)
+		if (vehicle == nullptr) {
 			return;
+		}
+
+		auto zone = vehicle->getZone();
+
+		if (zone == nullptr) {
+			return;
+		}
+
+		auto ghost = creature->getPlayerObject();
+
+		if (ghost == nullptr) {
+			return;
+		}
+
+		auto playerValidated = ghost->getLastValidatedPosition();
+
+		if (playerValidated == nullptr) {
+			return;
+		}
 
 		Locker clocker(vehicle, creature);
 
-		vehicle->clearState(CreatureState::MOUNTEDCREATURE);
-
-		Zone* zone = vehicle->getZone();
-
 		// Handle dismounting player
-		if (zone != nullptr && vehicle == creature->getParent().get()) {
-			ManagedReference<PlanetManager*> planetManager = zone->getPlanetManager();
-			float z = vehicle->getWorldPositionZ();
+		if (vehicle == creature->getParent().get()) {
+			// Player will be sent to the vehicles position in the world
+			Vector3 validatedPosition = playerValidated->getPosition();
+
+			float vehicleSpeed = vehicle->getCurrentSpeed();
+
+			if (vehicleSpeed > 0) {
+				// Get a position 1m back from the vehicles position
+				float angle = vehicle->getDirection()->getRadians();
+
+				angle = M_PI / 2 - angle;
+
+				if (angle < 0) {
+					float a = M_PI + angle;
+					angle = M_PI + a;
+				}
+
+				validatedPosition.setX(validatedPosition.getX() + (Math::cos(angle) * -1.f));
+				validatedPosition.setY(validatedPosition.getY() + (Math::sin(angle) * -1.f));
+			}
+
+			auto planetManager = zone->getPlanetManager();
 
 			if (planetManager != nullptr) {
-				TerrainManager* terrainManager = planetManager->getTerrainManager();
+				auto terrainManager = planetManager->getTerrainManager();
 
 				if (terrainManager != nullptr) {
-					zone->transferObject(creature, -1, false);
-
 					IntersectionResults intersections;
-					CollisionManager::getWorldFloorCollisions(creature->getPositionX(), creature->getPositionY(), zone, &intersections, (CloseObjectsVector*)creature->getCloseObjects());
-					z = planetManager->findClosestWorldFloor(creature->getPositionX(), creature->getPositionY(), creature->getPositionZ(), creature->getSwimHeight(), &intersections, (CloseObjectsVector*)creature->getCloseObjects());
+					CollisionManager::getWorldFloorCollisions(validatedPosition.getX(), validatedPosition.getY(), zone, &intersections, (CloseObjectsVector*)creature->getCloseObjects());
+					validatedPosition.setZ(planetManager->findClosestWorldFloor(validatedPosition.getX(), validatedPosition.getY(), validatedPosition.getZ(), creature->getSwimHeight(), &intersections, (CloseObjectsVector*)creature->getCloseObjects()));
 				}
 			}
 
-			creature->teleport(creature->getPositionX(), z, creature->getPositionY(), 0);
+			// Transfer them into the zone
+			zone->transferObject(creature, -1, false, false, false);
+
+			vehicle->clearState(CreatureState::MOUNTEDCREATURE);
+
+			// Update the players position
+			creature->teleport(validatedPosition.getX(), validatedPosition.getZ(), validatedPosition.getY(), 0);
+
+			/*
+			// debug markers
+			Reference<SceneObject*> movementMarker = creature->getZoneServer()->createObject(STRING_HASHCODE("object/path_waypoint/path_waypoint.iff"), 0);
+
+			Locker moveLock(movementMarker, creature);
+			movementMarker->initializePosition(validatedPosition.getX(), validatedPosition.getZ(), validatedPosition.getY());
+			zone->transferObject(movementMarker, -1, true);
+			moveLock.release();
+			// END debug markers
+			*/
 
 			ManagedReference<PlayerManager*> playerManager = server->getPlayerManager();
 
-			if (playerManager != nullptr)
-				playerManager->updateSwimmingState(creature, z);
+			if (playerManager != nullptr) {
+				playerManager->updateSwimmingState(creature, validatedPosition.getZ());
+			}
 		}
 
 		// Remove gallop from mounts
@@ -149,7 +233,10 @@ public:
 			vehicle->incrementMovementCounter();
 
 			auto data = new DataTransform(vehicle);
-			vehicle->broadcastMessage(data, false);
+
+			if (data != nullptr) {
+				vehicle->broadcastMessage(data, false);
+			}
 		}
 	}
 

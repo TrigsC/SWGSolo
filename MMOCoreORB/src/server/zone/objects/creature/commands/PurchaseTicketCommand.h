@@ -14,10 +14,7 @@
 
 class PurchaseTicketCommand : public QueueCommand {
 public:
-
-	PurchaseTicketCommand(const String& name, ZoneProcessServer* server)
-		: QueueCommand(name, server) {
-
+	PurchaseTicketCommand(const String& name, ZoneProcessServer* server) : QueueCommand(name, server) {
 	}
 
 	int doQueueCommand(CreatureObject* creature, const uint64& target, const UnicodeString& arguments) const {
@@ -27,7 +24,7 @@ public:
 		if (!checkInvalidLocomotions(creature))
 			return INVALIDLOCOMOTION;
 
-		SortedVector<QuadTreeEntry*> closeObjects;
+		SortedVector<TreeEntry*> closeObjects;
 		CloseObjectsVector* vec = (CloseObjectsVector*) creature->getCloseObjects();
 		vec->safeCopyTo(closeObjects);
 
@@ -36,12 +33,14 @@ public:
 
 		for (int i = 0; i < closeObjects.size(); i++) {
 			SceneObject* object = cast<SceneObject*>( closeObjects.get(i));
-			if (object != nullptr && object->getGameObjectType() == SceneObjectType::TRAVELTERMINAL && checkDistance(creature, object, 8)) {
-				nearTravelTerminal = true;
-				travelTerminal = object;
-				break;
+
+			if (object == nullptr || (object->getGameObjectType() != SceneObjectType::TRAVELTERMINAL) || !checkDistance(creature, object, 8.f)) {
+				continue;
 			}
 
+			nearTravelTerminal = true;
+			travelTerminal = object;
+			break;
 		}
 
 		if (!nearTravelTerminal) {
@@ -53,37 +52,41 @@ public:
 
 		int departureTax = 0;
 
-		if (currentCity != nullptr){
+		if (currentCity != nullptr) {
 			if (currentCity->isBanned(creature->getObjectID())) {
-				creature->sendSystemMessage("@city/city:city_cant_purchase_ticket"); //You are banned from using the services of this city. You cannot purchase a ticket.
+				creature->sendSystemMessage("@city/city:city_cant_purchase_ticket"); // You are banned from using the services of this city. You cannot purchase a ticket.
 				return GENERALERROR;
 			}
-			if(!currentCity->isClientRegion()){
+			if (!currentCity->isClientRegion()) {
 				departureTax = currentCity->getTravelTax();
 			}
 		}
 
-		ManagedReference<SceneObject*> inventory = creature->getSlottedObject("inventory");
+		ManagedReference<SceneObject*> inventory = creature->getInventory();
 
-		if (inventory == nullptr)
+		if (inventory == nullptr) {
 			return GENERALERROR;
+		}
 
 		String departurePlanet, departurePoint, arrivalPlanet, arrivalPoint, type;
 		bool roundTrip = true;
 
 		try {
 			UnicodeTokenizer tokenizer(arguments);
+
 			tokenizer.getStringToken(departurePlanet);
 			tokenizer.getStringToken(departurePoint);
 			tokenizer.getStringToken(arrivalPlanet);
 			tokenizer.getStringToken(arrivalPoint);
-			if(tokenizer.hasMoreTokens()) {
-				tokenizer.getStringToken(type);
-				if (type == "single" || type == "0")
-					roundTrip = false;
-			}
 
-		} catch(Exception& e) {
+			if (tokenizer.hasMoreTokens()) {
+				tokenizer.getStringToken(type);
+
+				if (type == "single" || type == "0") {
+					roundTrip = false;
+				}
+			}
+		} catch (Exception& e) {
 			return INVALIDPARAMETERS;
 		}
 
@@ -92,19 +95,18 @@ public:
 		arrivalPlanet = arrivalPlanet.replaceAll("_", " ");
 		arrivalPoint = arrivalPoint.replaceAll("_", " ");
 
-		ZoneServer* zoneServer = server->getZoneServer();
+		auto zoneServer = server->getZoneServer();
 
-		if (zoneServer == nullptr)
+		if (zoneServer == nullptr) {
 			return GENERALERROR;
+		}
 
 		ManagedReference<Zone*> departureZone = zoneServer->getZone(departurePlanet);
 		ManagedReference<Zone*> arrivalZone = zoneServer->getZone(arrivalPlanet);
 
-		if (departureZone == nullptr)
+		if (departureZone == nullptr || arrivalZone == nullptr) {
 			return GENERALERROR;
-
-		if (arrivalZone == nullptr)
-			return GENERALERROR;
+		}
 
 		ManagedReference<PlanetManager*> pmDeparture = departureZone->getPlanetManager();
 		ManagedReference<PlanetManager*> pmArrival = arrivalZone->getPlanetManager();
@@ -121,20 +123,21 @@ public:
 
 		Reference<PlanetTravelPoint*>  destPoint = pmArrival->getPlanetTravelPoint(arrivalPoint);
 
-		if (destPoint == nullptr)
+		if (destPoint == nullptr) {
 			return GENERALERROR;
+		}
 
 		ManagedReference<CreatureObject*> arrivalShuttle = destPoint->getShuttle();
 
-		if (arrivalShuttle == nullptr)
+		if (arrivalShuttle == nullptr) {
 			return GENERALERROR;
-
+		}
 
 		ManagedReference<CityRegion*> destCity = arrivalShuttle->getCityRegion().get();
 
-		if (destCity != nullptr){
+		if (destCity != nullptr) {
 			if (destCity.get()->isBanned(creature->getObjectID())) {
-				creature->sendSystemMessage("@city/city:banned_from_that_city");  // You have been banned from traveling to that city by the city militia
+				creature->sendSystemMessage("@city/city:banned_from_that_city"); // You have been banned from traveling to that city by the city militia
 				return GENERALERROR;
 			}
 		}
@@ -156,10 +159,10 @@ public:
 		//Make sure they have space in the inventory for the tickets before purchasing them.
 		Locker _lock(inventory, creature);
 
-		int inventorySize = inventory->getContainerObjectsSize();
-		int spaceNeeded = roundTrip ? 2 : 1;
+		int inventorySize = inventory->getCountableObjectsRecursive();
+		int spaceNeeded = (roundTrip ? 2 : 1) + inventorySize;
 
-		if ((inventorySize + spaceNeeded) > (inventory->getContainerVolumeLimit() - 1)) {
+		if (spaceNeeded > inventory->getContainerVolumeLimit()) {
 			creature->sendSystemMessage("@error_message:inv_full"); //Your inventory is full.
 			return GENERALERROR;
 		}
@@ -173,7 +176,7 @@ public:
 
 			uint32 couponCRC = STRING_HASHCODE("object/tangible/item/new_player/new_player_travel_coupon.iff");
 
-			for (int i = 0; i < inventorySize; i++) {
+			for (int i = 0; i < inventory->getContainerObjectsSize() - 1; i++) {
 				SceneObject* sceneO = inventory->getContainerObject(i);
 
 				if (sceneO == nullptr)

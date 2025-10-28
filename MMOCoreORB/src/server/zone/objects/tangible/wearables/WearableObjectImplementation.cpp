@@ -13,10 +13,17 @@
 #include "server/zone/objects/tangible/attachment/Attachment.h"
 #include "server/zone/managers/skill/SkillModManager.h"
 #include "server/zone/objects/tangible/wearables/ModSortingHelper.h"
+#include "server/zone/objects/transaction/TransactionLog.h"
 
 void WearableObjectImplementation::initializeTransientMembers() {
 	TangibleObjectImplementation::initializeTransientMembers();
-	setLoggingName("WearableObject");
+
+	// Wearable has too many attachments on it for the allowed socket count
+	while (usedSocketCount > socketCount && wearableSkillMods.size() > 0) {
+		wearableSkillMods.removeElementAt(wearableSkillMods.size() - 1);
+
+		usedSocketCount--;
+	}
 }
 
 void WearableObjectImplementation::fillAttributeList(AttributeListMessage* alm, CreatureObject* object) {
@@ -109,54 +116,69 @@ void WearableObjectImplementation::generateSockets(CraftingValues* craftingValue
 }
 
 void WearableObjectImplementation::applyAttachment(CreatureObject* player, Attachment* attachment) {
-	if (!isASubChildOf(player))
+	if (attachment == nullptr || !isASubChildOf(player)) {
 		return;
+	}
 
-	if (getRemainingSockets() > 0 && wearableSkillMods.size() < 6) {
-		Locker locker(player);
+	if (getRemainingSockets() < 1 || wearableSkillMods.size() > 5) {
+		return;
+	}
 
-		if (isEquipped()) {
-			removeSkillModsFrom(player);
+	if (isEquipped()) {
+		removeSkillModsFrom(player);
+	}
+
+	Locker clocker(attachment, player);
+
+	SortedVector<ModSortingHelper> sortedMods;
+	VectorMap<String, int>* skillModifiers = attachment->getSkillMods();
+
+	for (int i = 0; i < skillModifiers->size(); i++) {
+		auto key = skillModifiers->elementAt(i).getKey();
+		auto value = skillModifiers->elementAt(i).getValue();
+
+		sortedMods.put(ModSortingHelper(key, value));
+	}
+
+	// Select the next mod in the SEA, sorted high-to-low. If that skill mod is already on the
+	// wearable, with higher or equal value, don't apply and continue. Break once one mod
+	// is applied.
+	for (int i = 0; i < sortedMods.size(); i++) {
+		String modName = sortedMods.elementAt(i).getKey();
+		int modValue = sortedMods.elementAt(i).getValue();
+
+		int existingValue = -26;
+
+		if (wearableSkillMods.contains(modName)) {
+			existingValue = wearableSkillMods.get(modName);
 		}
 
-		HashTable<String, int>* mods = attachment->getSkillMods();
-		HashTableIterator<String, int> iterator = mods->iterator();
-
-		String statName;
-		int newValue;
-
-		SortedVector< ModSortingHelper > sortedMods;
-		for( int i = 0; i < mods->size(); i++){
-			iterator.getNextKeyAndValue(statName, newValue);
-			sortedMods.put( ModSortingHelper( statName, newValue));
+		if (modValue > existingValue) {
+			wearableSkillMods.put(modName, modValue);
+			break;
 		}
+	}
 
-		// Select the next mod in the SEA, sorted high-to-low. If that skill mod is already on the
-		// wearable, with higher or equal value, don't apply and continue. Break once one mod
-		// is applied.
-		for (int i = 0; i < sortedMods.size(); i++ ) {
-			String modName = sortedMods.elementAt(i).getKey();
-			int modValue = sortedMods.elementAt(i).getValue();
+	usedSocketCount++;
+	addMagicBit(true);
 
-			int existingValue = -26;
-			if (wearableSkillMods.contains(modName))
-				existingValue = wearableSkillMods.get(modName);
+	TransactionLog trx(player, asSceneObject(), attachment, TrxCode::APPLYATTACHMENT);
 
-			if (modValue > existingValue) {
-				wearableSkillMods.put( modName, modValue );
-				break;
-			}
-		}
+	if (trx.isVerbose()) {
+		// Force a synchronous export because the object will be deleted before we can export it!
+		trx.addRelatedObject(attachment, true);
+		trx.setExportRelatedObjects(true);
+		trx.exportRelated();
+	}
 
-		usedSocketCount++;
-		addMagicBit(true);
-		Locker clocker(attachment, player);
-		attachment->destroyObjectFromWorld(true);
-		attachment->destroyObjectFromDatabase(true);
+	trx.addState("subjectSkillModMap", sortedMods);
+	trx.addState("dstSkillModMap", wearableSkillMods);
 
-		if (isEquipped()) {
-			applySkillModsTo(player);
-		}
+	attachment->destroyObjectFromWorld(true);
+	attachment->destroyObjectFromDatabase(true);
+
+	if (isEquipped()) {
+		applySkillModsTo(player);
 	}
 }
 

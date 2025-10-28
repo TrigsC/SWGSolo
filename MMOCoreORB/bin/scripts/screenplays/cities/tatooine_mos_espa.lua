@@ -177,7 +177,6 @@ TatooineMosEspaScreenPlay = CityScreenPlay:new {
 		{"trainer_artisan",0,-0.0885271,1.13306,-14.0283,2,1256011, ""},
 
 		--Cantina
-		{"bartender",60,-11.1703,-0.894992,1.53149,33.4278,1256058, ""},
 		{"dorn_gestros",60,-6.00754,-0.894992,-5.35219,231.068,1256058, "calm"},
 		{"medic",60,12.1732,-0.894991,3.93609,180.003,1256058, "conversation"},
 		{"sullustan_male",300,12.1732,-0.894992,2.93609,360.011,1256058, "conversation"},
@@ -281,6 +280,7 @@ TatooineMosEspaScreenPlay = CityScreenPlay:new {
 		{"junk_dealer", 0, -2750.9, 5, 2057, 132, 0, ""},
 		{"junk_dealer", 0, -2904.51, 5, 2446.5, -87, 0, ""},
 		{"miner",60,-2918.94,5,2170.6,180.005,0, "conversation"},
+		{"mouse_droid", 0, 8.3, -9.5, -7.3, 135, 1261579, ""},
 		{"noble",60,-2924.82,5,2143.27,127.261,0, ""},
 		{"noble",60,-3081.03,5,2104.52,341.726,0, ""},
 		{"noble",60,-3064.8,5,2095.01,-130,0, ""},
@@ -381,7 +381,6 @@ function TatooineMosEspaScreenPlay:spawnSceneObjects()
 	spawnSceneObject(self.planet, "object/tangible/item/quest/force_sensitive/bacta_tank.iff", -1.9, -9.5, -4.3, 1261579, math.rad(90) )
 	spawnSceneObject(self.planet, "object/tangible/item/quest/force_sensitive/bacta_tank.iff", -1.9, -9.5, -8.6, 1261579, math.rad(90) )
 	spawnSceneObject(self.planet, "object/tangible/item/quest/force_sensitive/bacta_tank.iff", 9.7, -9.5, -10.0, 1261579, math.rad(-45) )
-	spawnSceneObject(self.planet, "object/mobile/mouse_droid.iff", 8.3, -9.5, -7.3, 1261579, math.rad(135) )
 	spawnSceneObject(self.planet, "object/tangible/furniture/technical/armoire_s01.iff", 5.5, -9.5, -11.0, 1261579, math.rad(0) )
 end
 
@@ -399,7 +398,7 @@ function TatooineMosEspaScreenPlay:spawnMobiles()
 				CreatureObject(pMobile):setMoodString(mob[8])
 			end
 
-			AiAgent(pMobile):addCreatureFlag(AI_STATIC)
+			AiAgent(pMobile):addObjectFlag(AI_STATIC)
 
 			if CreatureObject(pMobile):getPvpStatusBitmask() == 0 then
 				CreatureObject(pMobile):clearOptionBit(AIENABLED)

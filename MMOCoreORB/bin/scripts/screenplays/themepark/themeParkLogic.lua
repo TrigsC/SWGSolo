@@ -79,10 +79,13 @@ function ThemeParkLogic:spawnNpcs()
 		end
 
 		if npcSpawnData.position == SIT then
-			CreatureObject(pNpc):setState(STATESITTINGONCHAIR)
+			CreatureObject(pNpc):setState(SITTINGONCHAIR)
 		end
 		if (npcSpawnData.mood ~= nil and npcSpawnData.mood ~= "") then
 			CreatureObject(pNpc):setMoodString(npcSpawnData.mood)
+		end
+		if (npcSpawnData.flags == AI_STATIC) then
+			AiAgent(pNpc):addObjectFlag(AI_STATIC)
 		end
 		if (self.npcMap[i].npcNumber > 0) then
 			CreatureObject(pNpc):setOptionBit(INTERESTING)
@@ -897,7 +900,7 @@ function ThemeParkLogic:spawnMissionNpcs(mission, pConversingPlayer, pActiveArea
 		elseif mission.missionType == "escort" then
 			CreatureObject(pNpc):setOptionBit(INTERESTING)
 			CreatureObject(pNpc):setOptionBit(AIENABLED)
-			AiAgent(pNpc):addCreatureFlag(AI_STATIONARY)
+			AiAgent(pNpc):addObjectFlag(AI_STATIONARY)
 
 			createObserver(OBJECTDESTRUCTION, self.className, "notifyEscortKilled", pNpc)
 
@@ -1599,7 +1602,7 @@ function ThemeParkLogic:updateWaypoint(pConversingPlayer, planetName, x, y, dire
 	local activeNpcNumber = self:getActiveNpcNumber(pConversingPlayer)
 	local missionNumber = self:getCurrentMissionNumber(activeNpcNumber, pConversingPlayer)
 	local stfFile = self:getStfFile(activeNpcNumber)
-	local waypointID = PlayerObject(pGhost):addWaypoint(planetName, self:getMissionDescription(pConversingPlayer, direction), "", x, y, WAYPOINTPURPLE, true, true, WAYPOINTTHEMEPARK, 0)
+	local waypointID = PlayerObject(pGhost):addWaypoint(planetName, self:getMissionDescription(pConversingPlayer, direction), "", x, 0, y, WAYPOINT_PURPLE, true, true, WAYPOINTTHEMEPARK, 0)
 	local pWaypoint = getSceneObject(waypointID)
 	if (pWaypoint == nil) then
 		return
@@ -2132,7 +2135,7 @@ function ThemeParkLogic:followPlayer(pConversingNpc, pConversingPlayer)
 		return
 	end
 
-	local playerFaction = CreatureObject(pConversingPlayer)
+	local playerFaction = CreatureObject(pConversingPlayer):getFaction()
 	if (playerFaction == FACTIONREBEL or playerFaction == FACTIONIMPERIAL) and not CreatureObject(pConversingPlayer):isOnLeave() then
 		CreatureObject(pConversingNpc):setFaction(playerFaction)
 
@@ -2143,9 +2146,9 @@ function ThemeParkLogic:followPlayer(pConversingNpc, pConversingPlayer)
 		end
 	end
 
-	AiAgent(pConversingNpc):removeCreatureFlag(AI_STATIONARY)
-	AiAgent(pConversingNpc):addCreatureFlag(AI_FOLLOW)
-	AiAgent(pConversingNpc):addCreatureFlag(AI_ESCORT)
+	AiAgent(pConversingNpc):removeObjectFlag(AI_STATIONARY)
+	AiAgent(pConversingNpc):addObjectFlag(AI_FOLLOW)
+	AiAgent(pConversingNpc):addObjectFlag(AI_ESCORT)
 	AiAgent(pConversingNpc):setFollowObject(pConversingPlayer)
 
 	AiAgent(pConversingNpc):setAITemplate()

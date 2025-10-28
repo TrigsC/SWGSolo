@@ -129,6 +129,18 @@ includeFile("conversations/themepark/epic_quests/goru_conv.lua")
 includeFile("conversations/themepark/logic/mission_giver_conv.lua")
 includeFile("conversations/themepark/logic/mission_target_conv.lua")
 
+-- Enough Quest
+includeFile("conversations/tasks/enough/acun_solari_conv.lua")
+includeFile("conversations/tasks/enough/ceth_laike_conv.lua")
+
+-- Defector Quests
+includeFile("conversations/tasks/defector_quests/jom_irimore_conv.lua")
+includeFile("conversations/tasks/defector_quests/imperial_defector_conv.lua")
+includeFile("conversations/tasks/defector_quests/teslo_tendoora_conv.lua")
+includeFile("conversations/tasks/defector_quests/jaek_vercet_conv.lua")
+includeFile("conversations/tasks/defector_quests/rebel_defector_conv.lua")
+includeFile("conversations/tasks/defector_quests/allard_lissara_conv.lua")
+
 -- ** DUNGEONS **
 
 -- Corellian Corvette
@@ -290,7 +302,7 @@ includeFile("conversations/racetracks/lokconversation.lua")
 includeFile("conversations/racetracks/nashalconversation.lua")
 
 -- Space
-includeFile("conversations/space/chassis_dealer_conv.lua")
+includeFile("conversations/space/space_conversations.lua")
 
 -- Record Keepers
 includeFile("conversations/record_keepers/planet_record_keeper_dantooine_conv.lua")
@@ -303,6 +315,7 @@ includeFile("conversations/record_keepers/record_keeper_rebel_conv.lua")
 includeFile("conversations/pet/pets_conv.lua")
 
 -- Misc
+includeFile("conversations/misc/bartender_conv.lua")
 includeFile("conversations/misc/philosopher_conv.lua")
 
 -- Junk Dealers

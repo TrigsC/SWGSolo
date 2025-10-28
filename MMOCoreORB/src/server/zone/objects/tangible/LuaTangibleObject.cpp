@@ -21,6 +21,7 @@ Luna<LuaTangibleObject>::RegType LuaTangibleObject::Register[] = {
 		{ "setOptionsBitmask", &LuaTangibleObject::setOptionsBitmask },
 		{ "setPvpStatusBitmask", &LuaTangibleObject::setPvpStatusBitmask },
 		{ "setPvpStatusBit", &LuaTangibleObject::setPvpStatusBit },
+		{ "clearPvpStatusBit", &LuaTangibleObject::clearPvpStatusBit },
 		{ "broadcastPvpStatusBitmask", &LuaTangibleObject::broadcastPvpStatusBitmask },
 		{ "sendPvpStatusTo", &LuaTangibleObject::sendPvpStatusTo },
 		{ "getPvpStatusBitmask", &LuaTangibleObject::getPvpStatusBitmask },
@@ -55,6 +56,8 @@ Luna<LuaTangibleObject>::RegType LuaTangibleObject::Register[] = {
 		{ "isSliced", &LuaTangibleObject::isSliced},
 		{ "isNoTrade", &LuaTangibleObject::isNoTrade},
 		{ "getMainDefender", &LuaTangibleObject::getMainDefender},
+		{ "getConditionDamage", &LuaTangibleObject::getConditionDamage},
+		{ "isActivated", &LuaTangibleObject::isActivated},
 		{ 0, 0 }
 };
 
@@ -161,6 +164,14 @@ int LuaTangibleObject::setPvpStatusBit(lua_State* L) {
 	uint32 bit = lua_tointeger(L, -1);
 
 	realObject->setPvpStatusBit(bit, true);
+
+	return 0;
+}
+
+int LuaTangibleObject::clearPvpStatusBit(lua_State* L) {
+	uint32 bit = lua_tointeger(L, -1);
+
+	realObject->clearPvpStatusBit(bit, true);
 
 	return 0;
 }
@@ -428,6 +439,22 @@ int LuaTangibleObject::getMainDefender(lua_State* L) {
 	}
 
 	lua_pushlightuserdata(L, defender);
+
+	return 1;
+}
+
+int LuaTangibleObject::getConditionDamage(lua_State* L){
+	int conditionDamage = realObject->getConditionDamage();
+
+	lua_pushinteger(L, conditionDamage);
+
+	return 1;
+}
+
+int LuaTangibleObject::isActivated(lua_State* L){
+	bool isActivated = (realObject->getOptionsBitmask() & OptionBitmask::ACTIVATED);
+
+	lua_pushboolean(L, isActivated);
 
 	return 1;
 }

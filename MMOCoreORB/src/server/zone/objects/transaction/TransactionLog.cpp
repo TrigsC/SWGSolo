@@ -904,10 +904,12 @@ const String TransactionLog::trxCodeToString(TrxCode code) {
 	case TrxCode::ADMINCOMMAND:             return "admincommand";              // From an admin command
 	case TrxCode::ADKAPPLY:                 return "adkapply";                  // Apply ADK to an item
 	case TrxCode::ADKREMOVE:                return "adkremove";                 // Remove ADK from item
+	case TrxCode::APPLYATTACHMENT:          return "applyattachment";           // Apply Attachment to an item
 	case TrxCode::AUCTIONADDSALE:           return "auctionaddsale";            // addSaleItem()
 	case TrxCode::AUCTIONBID:               return "auctionbid";                // Auction Bid Escrow
 	case TrxCode::AUCTIONEXPIRED:           return "auctionexpired";            // Never retrieved and expired
 	case TrxCode::AUCTIONRETRIEVE:          return "auctionretrieve";           // retrieveItem()
+	case TrxCode::CAMPPLACED:               return "campplaced";                // Camp placed
 	case TrxCode::CHARACTERBUILDER:         return "characterbuilder";          // Character Builder
 	case TrxCode::CHARACTERDELETE:          return "characterdelete";           // Delete Character
 	case TrxCode::CITYINCOMETAX:            return "cityincometax";             // City income taxes
@@ -915,6 +917,8 @@ const String TransactionLog::trxCodeToString(TrxCode code) {
 	case TrxCode::CITYTREASURY:             return "citytreasury";              // City Treasury
 	case TrxCode::COMBATSTATS:              return "combatstats";               // Combat Stats
 	case TrxCode::CRAFTINGSESSION:          return "craftingsession";           // Crafting Session
+	case TrxCode::CREDITCHIP:               return "creditchip";                // Space CreditChip Looted
+	case TrxCode::CREDITCHIPCLAIM:          return "creditchipclaim";           // Space CreditChip Claimed
 	case TrxCode::DATABASECOMMIT:           return "databasecommit";            // Database Commit
 	case TrxCode::DESTROYSTRUCTURE:         return "destroystructure";          // Server destroyed structure (maintenance)
 	case TrxCode::EXPERIENCE:               return "experience";                // Player experience change
@@ -927,6 +931,7 @@ const String TransactionLog::trxCodeToString(TrxCode code) {
 	case TrxCode::INSTANTBUY:               return "instantbuy";                // Instant Buy
 	case TrxCode::LOTTERYDROID:             return "lotterydroid";              // Lottery Droid
 	case TrxCode::LUASCRIPT:                return "luascript";                 // LUA Script
+	case TrxCode::LUALOOT:                  return "lualoot";                   // Loot from LUA Script
 	case TrxCode::MINED:                    return "mined";                     // Resouces mined by installations
 	case TrxCode::MISSIONCOMPLETE:          return "missioncomplete";           // Mission Completed Summary
 	case TrxCode::NPCLOOTCLAIM:             return "npclootclaim";              // NPC Loot Claimed
@@ -941,7 +946,10 @@ const String TransactionLog::trxCodeToString(TrxCode code) {
 	case TrxCode::PLAYERDIED:               return "playerdied";                // Player Died
 	case TrxCode::RECYCLED:                 return "recycled";                  // Recycled Items
 	case TrxCode::SERVERDESTROYOBJECT:      return "serverdestroyobject";       // /serverDestroyObject command
+	case TrxCode::SHIPDEEDPURCHASE:         return "shipdeedpurchase";          // Purchase of a ship deed from chassis dealer
+	case TrxCode::SHIPREDEED:               return "shipredeed";                // ReDeeding a ship from datapad
 	case TrxCode::SLICECONTAINER:           return "slicecontainer";            // Slicing session on a container
+	case TrxCode::SPACELOOTSOLD:            return "spacelootsold";             // Selling of space loot to chassis dealer
 	case TrxCode::STRUCTUREDEED:            return "structuredeed";             // Structure deed trxs
 	case TrxCode::TRANSFERITEMMISC:         return "transferitemmisc";          // /transferitemmisc command
 	case TrxCode::TRANSFERSTRUCT:           return "transferstruct";            // Transfer Structure

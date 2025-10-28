@@ -70,7 +70,7 @@ void ZoneProcessServerImplementation::initialize() {
 	zonePacketHandler->setLogging(false);
 
 	nameManager = new NameManager(_this.getReferenceUnsafeStaticCast());
-	//nameManager->test();
+
 	holocronManager = new HolocronManager(_this.getReferenceUnsafeStaticCast());
 	suiManager = SuiManager::instance();
 	suiManager->setZoneProcessServer(_this.getReferenceUnsafeStaticCast());
@@ -85,7 +85,4 @@ void ZoneProcessServerImplementation::initialize() {
 
 	forageManager = new ForageManager();
 	forageManager->deploy();
-
-	ShipManager::instance();
-
 }

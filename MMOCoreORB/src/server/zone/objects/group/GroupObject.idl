@@ -6,6 +6,7 @@ package server.zone.objects.group;
 
 import server.zone.objects.scene.SceneObject;
 import server.zone.objects.creature.CreatureObject;
+import server.zone.objects.ship.ShipObject;
 import server.chat.room.ChatRoom;
 import engine.service.proto.BaseMessage;
 include server.zone.objects.group.GroupList;
@@ -14,11 +15,16 @@ include server.zone.objects.group.tasks.UpdateNearestMissionForGroupTask;
 include server.chat.StringIdChatParameter;
 include system.lang.ref.Reference;
 include system.util.VectorMap;
+include server.zone.objects.scene.variables.DeltaVectorMap;
 
 @json
 class GroupObject extends SceneObject {
 	@dereferenced
 	GroupList groupMembers;
+
+	// memberID, shipID
+	@dereferenced
+	protected DeltaVectorMap<unsigned long, unsigned long> groupMemberShips;
 
 	@dereferenced
 	transient VectorMap<unsigned int, Reference<UpdateNearestMissionForGroupTask> > updateNearestMissionForGroupTasks;
@@ -76,6 +82,9 @@ class GroupObject extends SceneObject {
 
 	@preLocked
 	public native void removeMember(CreatureObject member);
+
+	@preLocked
+	public native void updateMemberShip(CreatureObject member, ShipObject ship);
 
 	@preLocked
 	public native void disband();
@@ -157,6 +166,12 @@ class GroupObject extends SceneObject {
 		return groupMembers;
 	}
 
+	@local
+	@dirty
+	public final DeltaVectorMap<unsigned long, unsigned long> getGroupShips() {
+		return groupMemberShips;
+	}
+
 	@dirty
 	public boolean isGroupObject() {
 		return true;
@@ -175,10 +190,16 @@ class GroupObject extends SceneObject {
 	private native void addGroupModifiers(CreatureObject player);
 
 	@preLocked
-	private native void removeGroupModifiers(CreatureObject player);
+	private native void removeGroupModifiers(CreatureObject player, boolean isLeader);
 
 	@dirty
 	public native boolean isOtherMemberPlayingMusic(CreatureObject player);
+
+	@preLocked
+	public native void addSpaceMissionObject(unsigned long missionOwnerID, unsigned long objectID, boolean notifyClient);
+
+	@preLocked
+	public native void removeSpaceMissionObject(unsigned long missionOwnerID, unsigned long objectID, boolean notifyClient);
 
 	@read
 	public int getLootRule() {

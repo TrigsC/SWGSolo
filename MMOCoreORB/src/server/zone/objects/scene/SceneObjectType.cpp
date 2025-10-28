@@ -58,7 +58,7 @@ const String SceneObjectType::typeToString(int gameObjectType) {
 		case DATA2:						return "@got_n:data_fictional";
 		case PETCONTROLDEVICE:			return "@got_n:data_pet_control_device";
 		case VEHICLECONTROLDEVICE:		return "@got_n:data_vehicle_control_device";
-		case SHIPCONTROLDEVICE:			return "@got_n:data_ship_control_deice";
+		case SHIPCONTROLDEVICE:			return "@got_n:data_ship_control_device";
 		case DROIDCONTROLDEVICE:		return "@got_n:data_droid_control_device";
 		case THEATEROBJECT:				return "@got_n:misc";
 		case INSTALLATION:				return "@got_n:installation";
@@ -104,7 +104,7 @@ const String SceneObjectType::typeToString(int gameObjectType) {
 		case PILOTCHAIR:				return "@got_n:misc_pob_ship_pilot_chair";
 		case OPERATIONSCHAIR:			return "@got_n:misc_operations_chair";
 		case TURRETACCESSLADDER:		return "@got_n:misc_turret_access_ladder";
-		case CONTAINER2:				return "@got_n:misc_container_ship_loot";
+		case SHIPCONTAINER:				return "@got_n:misc_container_ship_loot";
 		case CAMOKIT:					return "@got_n:misc";
 		case LOOTKIT:					return "@got_n:misc";
 		case FISH:						return "@got_n:misc";
@@ -125,6 +125,7 @@ const String SceneObjectType::typeToString(int gameObjectType) {
 		case FSBUFFITEM:				return "@got_n:misc";
 		case DEADEYEPROTOTYPE:			return "@got_n:misc";
 		case CONTRACTCRATE:				return "@got_n:misc";
+		case SCHEMATICFRAGMENT:				return "@got_n:misc";
 		case TERMINAL:					return "@got_n:terminal";
 		case BANK:						return "@got_n:terminal_bank";
 		case BAZAAR:					return "@got_n:terminal_bazaar";
@@ -166,6 +167,7 @@ const String SceneObjectType::typeToString(int gameObjectType) {
 		case ARMORUPGRADEKIT:			return "@got_n:tool";
 		case RECYCLETOOL:				return "@got_n:tool";
 		case ANTIDECAYKIT:				return "@got_n:tool";
+		case COMPONENTANALYSISTOOL:			return "@got_n:tool";
 		case VEHICLE:					return "@got_n:vehicle";
 		case HOVERVEHICLE:				return "@got_n:vehicle_hover";
 		case WEAPON:					return "@got_n:weapon";
@@ -239,6 +241,7 @@ const String SceneObjectType::typeToString(int gameObjectType) {
 		case RESOURCEDEED:				return "@got_n:deed";
 		case EVENTPERKDEED:				return "@got_n:deed";
 		case VETHARVESTERDEED:			return "@got_n:deed";
+		case NAVICOMPUTERDEED:				return "@got_n:deed_droid";
 		case CLOTHING:					return "@got_n:clothing";
 		case BANDOLIER:					return "@got_n:clothing_bandolier";
 		case BELT:						return "@got_n:clothing_belt";
@@ -255,7 +258,7 @@ const String SceneObjectType::typeToString(int gameObjectType) {
 		case ROBE:						return "@got_n:clothing_robe";
 		case SHIRT:						return "@got_n:clothing_shirt";
 		case VEST:						return "@got_n:clothing_vest";
-		case WOOKIEGARB:				return "@got_n:clothing_wookiee";
+		case WOOKIEEGARB:				return "@got_n:clothing_wookiee";
 		case MISCCLOTHING:				return "@got_n:clothing_misc";
 		case SKIRT:						return "@got_n:clothing_skirt";
 		case BADGEAREA:					return "@got_n:misc";
@@ -271,8 +274,12 @@ const String SceneObjectType::typeToString(int gameObjectType) {
 		case SHIP:						return "@got_n:ship";
 		case SHIPFIGHTER:				return "@got_n:ship_fighter";
 		case SHIPCAPITAL:				return "@got_n:ship_capital";
-		case SHIPSTATION:				return "@got_n:ship_station";
+		case SPACEOBJECT:				return "@got_n:ship";
 		case SHIPTRANSPORT:				return "@got_n:ship_transport";
+		case SHIPPOB:					return "@got_n:ship";
+		case SHIPMULTIPASSENGER:		return "@got_n:ship";
+		case SHIPAGENT:					return "@got_n:ship";
+		case SPACESTATION:				return "@got_n:ship_station";
 		case SHIPATTACHMENT:			return "@got_n:ship_component";
 		case SHIPREACTOR:				return "@got_n:ship_component_reactor";
 		case SHIPENGINE:				return "@got_n:ship_component_engine";
@@ -281,7 +288,7 @@ const String SceneObjectType::typeToString(int gameObjectType) {
 		case SHIPWEAPON:				return "@got_n:ship_component_weapon";
 		case SHIPWEAPONCAPACITOR:		return "@got_n:ship_component_capacitor";
 		case SHIPBOOSTER:				return "@got_n:ship_component_booster";
-		case SHIPDRIODINTERFACE:		return "@got_n:ship_component_droid_interface";
+		case SHIPDROIDINTERFACE:		return "@got_n:ship_component_droid_interface";
 		case HANGER:					return "@got_n:ship_component_hangar";
 		case TARGETINGSTATION:			return "@got_n:ship_component_targeting_station";
 		case BRIDGE:					return "@got_n:ship_component_bridge";

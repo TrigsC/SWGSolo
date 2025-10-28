@@ -42,16 +42,16 @@
 
 
 object_tangible_ship_crafted_weapon_quick_shot_upgrade_mk1 = object_tangible_ship_crafted_weapon_shared_quick_shot_upgrade_mk1:new {
-
+	gameObjectType = 1073741856,
 
 	numberExperimentalProperties = {1, 1, 2, 2},
 	experimentalProperties = {"XX", "XX", "CD", "OQ", "CD", "OQ"},
 	experimentalWeights = {1, 1, 1, 1, 1, 1},
 	experimentalGroupTitles = {"null", "null", "exp_refire_rate", "exp_energy_per_shot"},
 	experimentalSubGroupTitles = {"null", "null", "refire_rate", "energy_per_shot"},
-	experimentalMin = {0, 0, -33, 2},
-	experimentalMax = {0, 0, -18, 4},
-	experimentalPrecision = {0, 0, 10, 10},
+	experimentalMin = {0, 0, -18, 4},
+	experimentalMax = {0, 0, -33, 2},
+	experimentalPrecision = {0, 0, 3, 1},
 	experimentalCombineType = {0, 0, 1, 1},
 }
 

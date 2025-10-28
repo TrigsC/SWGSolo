@@ -244,6 +244,7 @@ CorelliaKorVellaScreenPlay = CityScreenPlay:new {
 		{"rogue_corsec_trooper", 360, -3332.89, 86, 3303.69, 68.6738, 0, ""},
 		{"rogue_corsec_trooper", 360, -3330.1, 86, 3290.98, 104.099, 0, ""},
 		{"sullustan_male", 360, -3177.78, 31, 2891.03, 180, 0, ""},
+		{"corsec_pilot", 360, -3368.55, 86, 3144.06, 20, 0, "neutral"},
 
 		--misc
 		{"informant_npc_lvl_1", 10, -3563, 86, 3138, 60, 0, ""},
@@ -311,8 +312,8 @@ CorelliaKorVellaScreenPlay = CityScreenPlay:new {
 		{"comm_operator", 400, 48.13, 0.1, 2.47, 292, 3005397, ""},
 		{"artisan", 60, 34.4, 0.1, -8.04, 0, 3005398, ""},
 		{"mercenary", 300, 34.4, 0.1, -6.9, 180, 3005398, ""},
+		{"trainer_dancer", 0,34.5107,0.105,1.79681,89,3005398, ""},
 		{"trainer_entertainer", 1, 26.2, -0.9, 10.25, 260, 3005399, ""},
-		{"bartender", 60, 6.4, -0.9, -2.3, 156, 3005399, ""},
 		{"corellia_times_investigator", 300, 20.6, -0.9, -18.6, 180, 3005400, ""},
 		{"commoner_technician", 300, 20.6, -0.9, -19.6, 0, 3005400, ""},
 		{"brawler", 60, 22.6, -0.9, 19.6, 0, 3005401, ""},
@@ -326,6 +327,7 @@ CorelliaKorVellaScreenPlay = CityScreenPlay:new {
 		{"bounty_hunter", 60, -25.7, -0.5, 11.5, 180, 3005409, ""},
 		{"commoner_naboo", 300, -45.2, 0.1, -20.7, 180, 3005411, ""},
 		{"commoner", 60, -45.2, 0.1, -21.7, 0, 3005411, ""},
+
 
 		--Guild Hall (-3435,3196, ""},
 		{"trainer_tailor", 0, 11, 1.1, -14, 0, 2955415, ""},
@@ -401,7 +403,7 @@ function CorelliaKorVellaScreenPlay:spawnMobiles()
 				CreatureObject(pMobile):setMoodString(mob[8])
 			end
 
-			AiAgent(pMobile):addCreatureFlag(AI_STATIC)
+			AiAgent(pMobile):addObjectFlag(AI_STATIC)
 
 			if CreatureObject(pMobile):getPvpStatusBitmask() == 0 then
 				CreatureObject(pMobile):clearOptionBit(AIENABLED)

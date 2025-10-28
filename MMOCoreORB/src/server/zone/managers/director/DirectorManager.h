@@ -86,8 +86,8 @@ namespace server {
 		void startScreenPlay(CreatureObject* creatureObject, const String& screenPlayName);
 		void reloadScreenPlays();
 		void activateEvent(ScreenPlayTask* task);
-		ConversationScreen* getNextConversationScreen(const String& luaClass, ConversationTemplate* conversationTemplate, CreatureObject* conversingPlayer, int selectedOption, CreatureObject* conversingNPC);
-		ConversationScreen* runScreenHandlers(const String& luaClass, ConversationTemplate* conversationTemplate, CreatureObject* conversingPlayer, CreatureObject* conversingNPC, int selectedOption, ConversationScreen* conversationScreen);
+		ConversationScreen* getNextConversationScreen(const String& luaClass, ConversationTemplate* conversationTemplate, CreatureObject* conversingPlayer, int selectedOption, SceneObject* conversingNPC);
+		ConversationScreen* runScreenHandlers(const String& luaClass, ConversationTemplate* conversationTemplate, CreatureObject* conversingPlayer, SceneObject* conversingNPC, int selectedOption, ConversationScreen* conversationScreen);
 
 		void setQuestStatus(const String& keyString, const String& valString);
 		String getQuestStatus(const String& keyString) const;
@@ -115,6 +115,7 @@ namespace server {
 		static int registerScreenPlay(lua_State* L);
 		static int includeFile(lua_State* L);
 		static int createEvent(lua_State* L);
+		static int cancelEvent(lua_State* L);
 		static int createEventActualTime(lua_State* L);
 		static int createServerEvent(lua_State* L);
 		static int hasServerEvent(lua_State* L);
@@ -124,10 +125,13 @@ namespace server {
 		static int createObserver(lua_State* L);
 		static int dropObserver(lua_State* L);
 		static int hasObserver(lua_State* L);
+		static int hasObserverType(lua_State* L);
 		static int spawnMobile(lua_State* L);
 		static int spawnEventMobile(lua_State* L);
+		static int spawnShipAgent(lua_State* L);
 		static int spawnSceneObject(lua_State* L);
 		static int spawnActiveArea(lua_State* L);
+		static int spawnSpaceActiveArea(lua_State* L);
 		static int spawnBuilding(lua_State* L);
 		static int spawnSecurityPatrol(lua_State* L);
 		static int despawnSecurityPatrol(lua_State* L);
@@ -222,6 +226,13 @@ namespace server {
 		static int broadcastToGalaxy(lua_State* L);
 		static int getWorldFloor(lua_State* L);
 		static int useCovertOvert(lua_State* L);
+		static int drawClientPath(lua_State* L);
+
+		// JTL
+		static int generateShipDeed(lua_State* L);
+		static int sellSpaceLoot(lua_State* L);
+		static int isJtlEnabled(lua_State* L);
+		static int grantStarterShip(lua_State* L);
 
 	private:
 		static void setupLuaPackagePath(Lua* luaEngine);

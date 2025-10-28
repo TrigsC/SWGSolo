@@ -3,7 +3,7 @@
 
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "templates/params/OptionBitmask.h"
-#include "templates/params/creature/CreatureFlag.h"
+#include "templates/params/creature/ObjectFlag.h"
 #include "server/zone/objects/creature/ai/bt/decorator/Decorator.h"
 #include "server/zone/managers/collision/CollisionManager.h"
 
@@ -33,7 +33,7 @@ public:
 #endif // DEBUG_AI
 
 
-		if ((agent->getOptionsBitmask() & OptionBitmask::AIENABLED) == 0 || agent->isDead() || agent->isIncapacitated() || (agent->getPvpStatusBitmask() == CreatureFlag::NONE && !(agent->isDroidObject() && agent->isPet())))
+		if ((agent->getOptionsBitmask() & OptionBitmask::AIENABLED) == 0 || agent->isDead() || agent->isIncapacitated() || (agent->getPvpStatusBitmask() == ObjectFlag::NONE && !(agent->isDroidObject() && agent->isPet())))
 			return FAILURE;
 
 		if ((!alwaysActive && agent->getNumberOfPlayersInRange() <= 0) || agent->isRetreating() || agent->isFleeing() || agent->isInCombat())
@@ -45,7 +45,7 @@ public:
 		ManagedReference<SceneObject*> currObj = agent->getFollowObject().get();
 		if (currObj != nullptr) {
 			if (currObj->isCreatureObject() && isInvalidTarget(currObj->asCreatureObject(), agent)) {
-				if (!(agent->getCreatureBitmask() & CreatureFlag::FOLLOW)) {
+				if (!(agent->getCreatureBitmask() & ObjectFlag::FOLLOW)) {
 					agent->setFollowObject(nullptr);
 					agent->setMovementState(AiAgent::PATHING_HOME);
 				}
@@ -63,20 +63,23 @@ public:
 		if (vec == nullptr)
 			return FAILURE;
 
-		SortedVector<QuadTreeEntry* > closeObjects;
+		SortedVector<TreeEntry* > closeObjects;
 		vec->safeCopyReceiversTo(closeObjects, CloseObjectsVector::CREOTYPE);
 
 		// Shuffle closeobjects to randomize target checks
 		std::shuffle(closeObjects.begin(), closeObjects.end(), *System::getMTRand());
 
 		for (int i = 0; i < closeObjects.size(); ++i) {
-			ManagedReference<SceneObject*> scene = static_cast<SceneObject*>(closeObjects.get(i));
-			if (isInvalidTarget(scene->asCreatureObject(), agent))
-				continue;
+			ManagedReference<SceneObject*> sceneO = static_cast<SceneObject*>(closeObjects.get(i));
 
-			agent->writeBlackboard("targetProspect", scene);
+			if (isInvalidTarget(sceneO->asCreatureObject(), agent)) {
+				continue;
+			}
+
+			agent->writeBlackboard("targetProspect", sceneO);
 
 			Behavior::Status result = child->doAction(agent);
+
 			if (result != FAILURE) {
 				return result;
 			}
@@ -86,23 +89,17 @@ public:
 	}
 
 	bool isInvalidTarget(CreatureObject* target, AiAgent* agent) const {
-		if (target == nullptr || target == agent || target->getPvpStatusBitmask() == CreatureFlag::NONE)
+		if (target == nullptr || target == agent || (!target->isPet() && target->getPvpStatusBitmask() == ObjectFlag::NONE)) {
 			return true;
+		}
 
-		if (target->isDead() || target->isFeigningDeath() || (!agent->isKiller() && target->isIncapacitated()) || target->isInvisible() || !target->isAttackableBy(agent))
+		if (target->isDead() || target->isFeigningDeath() || (!agent->isKiller() && target->isIncapacitated()) || target->isInvisible() || !target->isAttackableBy(agent)) {
 			return true;
+		}
 
-		if (target->isVehicleObject() && !target->hasRidingCreature())
+		if (target->isVehicleObject() && !target->hasRidingCreature()) {
 			return true;
-
-		SceneObject* agentParent = agent->getParent().get();
-		SceneObject* targetParent = target->getParent().get();
-
-		uint64 agentParentID = agentParent != nullptr ? agentParent->getObjectID() : 0;
-		uint64 targetParentID = targetParent != nullptr ? targetParent->getObjectID() : 0;
-
-		if (agentParentID != targetParentID && !CollisionManager::checkLineOfSight(agent, target))
-			return true;
+		}
 
 		return false;
 	}

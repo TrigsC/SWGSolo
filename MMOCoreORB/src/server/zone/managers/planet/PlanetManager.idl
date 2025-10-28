@@ -49,6 +49,17 @@ class PlanetManager extends ManagedService implements Logger {
 
 	protected PlanetTravelPointList planetTravelPointList;
 
+	@dereferenced
+	protected transient string jtlZoneName;
+
+	@dereferenced
+	protected transient Vector3 jtlLaunchLocation;
+
+	@dirty
+	@local
+	@dereferenced
+	public native Vector3 getJtlLaunchLocations();
+
 	//In seconds.
 	protected int shuttleportAwayTime;
 	protected int shuttleportLandedTime;
@@ -148,6 +159,9 @@ class PlanetManager extends ManagedService implements Logger {
 	@local
 	private native void buildRegionNavAreas();
 
+	@local
+	private native void loadJTLData(LuaObject lua);
+
 	public void addNavArea(final string name, NavArea area) {
 		navMeshAreas.put(name, area);
 	}
@@ -181,7 +195,7 @@ class PlanetManager extends ManagedService implements Logger {
 	 * @return Returns a PlanetTravelPoint or NULL if not found in range
 	 */
 	@local
-	public native PlanetTravelPoint getNearestPlanetTravelPoint(SceneObject object, float range = 16000.0);
+	public native PlanetTravelPoint getNearestPlanetTravelPoint(SceneObject object, float range = 16000.0, boolean interplanetaryOnly = false);
 
 	@local
 	public native PlanetTravelPoint getRandomStarport();
@@ -193,7 +207,7 @@ class PlanetManager extends ManagedService implements Logger {
 	 * @return Returns a PlanetTravelPoint or NULL if not found in range
 	 */
 	@local
-	public native PlanetTravelPoint getNearestPlanetTravelPoint(@dereferenced final Vector3 position, float range = 16000.0);
+	public native PlanetTravelPoint getNearestPlanetTravelPoint(@dereferenced final Vector3 position, float range = 16000.0, boolean interplanetaryOnly = false);
 
 	/**
 	 * Get a random spawn point on the planet.
@@ -345,6 +359,11 @@ class PlanetManager extends ManagedService implements Logger {
 	@local
 	public MissionTargetMap getPerformanceLocations() {
 		return performanceLocations;
+	}
+
+	@dirty
+	public string getJtlZoneName() {
+		return jtlZoneName;
 	}
 
 	/**

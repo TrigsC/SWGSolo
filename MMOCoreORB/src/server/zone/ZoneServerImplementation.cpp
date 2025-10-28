@@ -7,8 +7,13 @@
 #include "server/zone/ZoneClientSession.h"
 
 #include "server/zone/Zone.h"
+#include "server/zone/GroundZone.h"
+#include "server/zone/SpaceZone.h"
 
 #include "server/db/ServerDatabase.h"
+#ifdef WITH_SWGREALMS_API
+#include "server/login/SWGRealmsAPI.h"
+#endif
 
 #include "conf/ConfigManager.h"
 
@@ -22,7 +27,9 @@
 #include "server/zone/managers/auction/AuctionManager.h"
 #include "server/zone/managers/mission/MissionManager.h"
 #include "server/zone/managers/creature/AiMap.h"
+#include "server/zone/managers/space/SpaceAiMap.h"
 #include "server/zone/managers/creature/CreatureTemplateManager.h"
+#include "server/zone/managers/ship/ShipAgentTemplateManager.h"
 #include "server/zone/managers/creature/DnaManager.h"
 #include "server/zone/managers/creature/PetManager.h"
 #include "server/zone/managers/guild/GuildManager.h"
@@ -32,13 +39,14 @@
 #include "server/zone/managers/city/CityManager.h"
 #include "server/zone/managers/structure/StructureManager.h"
 #include "server/zone/managers/frs/FrsManager.h"
-
 #include "server/chat/ChatManager.h"
+#include "server/zone/managers/ship/ShipManager.h"
 
 #include "server/zone/ZoneProcessServer.h"
 #include "ZonePacketHandler.h"
 #include "ZoneHandler.h"
 
+#include "SpaceZoneLoadManagersTask.h"
 #include "ZoneLoadManagersTask.h"
 #include "ShutdownTask.h"
 
@@ -71,6 +79,7 @@ ZoneServerImplementation::ZoneServerImplementation(ConfigManager* config) :
 
 	stringIdManager = nullptr;
 	creatureTemplateManager = nullptr;
+	shipAgentTemplateManager = nullptr;
 	guildManager = nullptr;
 	cityManager = nullptr;
 	petManager = nullptr;
@@ -99,6 +108,7 @@ void ZoneServerImplementation::initializeTransientMembers() {
 	ManagedObjectImplementation::initializeTransientMembers();
 }
 
+#ifndef WITH_SWGREALMS_API
 void ZoneServerImplementation::loadGalaxyName() {
 	try {
 		const String query = "SELECT name FROM galaxy WHERE galaxy_id = " + String::valueOf(galaxyID);
@@ -116,6 +126,27 @@ void ZoneServerImplementation::loadGalaxyName() {
 
 	loadLoginMessage();
 }
+#else // WITH_SWGREALMS_API
+void ZoneServerImplementation::loadGalaxyName() {
+	auto swgRealmsAPI = SWGRealmsAPI::instance();
+
+	if (swgRealmsAPI != nullptr) {
+		auto galaxyOpt = swgRealmsAPI->getGalaxyEntry(galaxyID);
+
+		if (galaxyOpt.has_value()) {
+			galaxyName = galaxyOpt.value().getName();
+			setLoggingName("ZoneServer " + galaxyName);
+			loadLoginMessage();
+			return;
+		}
+	}
+
+	error() << "Failed to load galaxy name for galaxy_id " << galaxyID;
+	setLoggingName("ZoneServer UNKNOWN");
+
+	loadLoginMessage();
+}
+#endif // WITH_SWGREALMS_API
 
 void ZoneServerImplementation::initialize() {
 	serverState = LOADING;
@@ -126,7 +157,8 @@ void ZoneServerImplementation::initialize() {
 	processor->deploy("ZoneProcessServer");
 	processor->initialize();
 
-	zones = new VectorMap<String, ManagedReference<Zone*> >();
+	zones = new VectorMap<String, ManagedReference<GroundZone*> >();
+	spaceZones = new VectorMap<String, ManagedReference<SpaceZone*> >();
 
 	objectManager = ObjectManager::instance();
 	objectManager->setZoneProcessor(processor);
@@ -140,7 +172,12 @@ void ZoneServerImplementation::initialize() {
 	creatureTemplateManager = CreatureTemplateManager::instance();
 	creatureTemplateManager->loadTemplates();
 
+	shipAgentTemplateManager = ShipAgentTemplateManager::instance();
+	shipAgentTemplateManager->loadTemplates();
+	shipAgentTemplateManager->loadSpacePatrolPoints();
+
 	AiMap::instance()->loadTemplates();
+	SpaceAiMap::instance()->loadTemplates();
 
 	dnaManager = DnaManager::instance();
 	dnaManager->loadSampleData();
@@ -184,7 +221,11 @@ void ZoneServerImplementation::initialize() {
 	petManager = new PetManager(_this.getReferenceUnsafeStaticCast());
 	petManager->initialize();
 
-	startZones();
+	// Load ship data
+	ShipManager::instance()->initialize();
+
+	startGroundZones();
+	startSpaceZones();
 
 	startManagers();
 
@@ -194,23 +235,34 @@ void ZoneServerImplementation::initialize() {
 	ObjectDatabaseManager::instance()->commitLocalTransaction();
 }
 
-void ZoneServerImplementation::startZones() {
-	info("Loading zones.");
+void ZoneServerImplementation::startGroundZones() {
+	info(true) << "Loading Ground Zones...";
 
 	auto enabledZones = configManager->getEnabledZones();
 
 	StructureManager* structureManager = StructureManager::instance();
 	structureManager->setZoneServer(_this.getReferenceUnsafeStaticCast());
 
-	for (int i = 0; i < enabledZones.size(); ++i) {
+	int totalZones = enabledZones.size();
+
+	info(true) << "Total Enabled Ground Zones: " << totalZones;
+
+	for (int i = 0; i < totalZones; ++i) {
 		String zoneName = enabledZones.get(i);
 
-		info("Loading zone " + zoneName + ".");
+		if (zoneName.toLowerCase().contains("space")) {
+			error() << "Attempting to load Space Zone as a Ground Zone -- Zone: " << zoneName;
+			continue;
+		}
 
-		Zone* zone = new Zone(processor, zoneName);
+		GroundZone* zone = new GroundZone(processor, zoneName);
 		zone->createContainerComponent();
 		zone->initializePrivateData();
-		zone->deploy("Zone " + zoneName);
+		zone->deploy("GroundZone " + zoneName);
+
+		String displayName = zoneName.subString(0,1).toUpperCase() + zoneName.subString(1);
+
+		info(true) << "Ground Zone: " + displayName + " deployed.";
 
 		zones->put(zoneName, zone);
 	}
@@ -218,7 +270,8 @@ void ZoneServerImplementation::startZones() {
 	resourceManager->initialize();
 
 	for (int i = 0; i < zones->size(); ++i) {
-		Zone* zone = zones->get(i);
+		GroundZone* zone = zones->get(i);
+
 		if (zone != nullptr) {
 			ZoneLoadManagersTask* task = new ZoneLoadManagersTask(_this.getReferenceUnsafeStaticCast(), zone);
 			task->execute();
@@ -226,7 +279,7 @@ void ZoneServerImplementation::startZones() {
 	}
 
 	for (int i = 0; i < zones->size(); ++i) {
-		Zone* zone = zones->get(i);
+		GroundZone* zone = zones->get(i);
 
 		if (zone != nullptr) {
 			while (!zone->hasManagersStarted())
@@ -235,8 +288,50 @@ void ZoneServerImplementation::startZones() {
 	}
 }
 
+void ZoneServerImplementation::startSpaceZones() {
+	info(true) << "Loading Space Zones...";
+
+	auto enabledSpaceZones = configManager->getEnabledSpaceZones();
+
+	int totalZones = enabledSpaceZones.size();
+
+	info(true) << "Total Enabled Space Zones: " << totalZones;
+
+	for (int i = 0; i < totalZones; ++i) {
+		String zoneName = enabledSpaceZones.get(i);
+
+		SpaceZone* spaceZone = new SpaceZone(processor, zoneName);
+
+		spaceZone->createContainerComponent();
+		spaceZone->initializePrivateData();
+		spaceZone->deploy("SpaceZone " + zoneName);
+
+		info(true) << "Space Zone: " + zoneName + " deployed.";
+
+		spaceZones->put(zoneName, spaceZone);
+	}
+
+	for (int i = 0; i < spaceZones->size(); ++i) {
+		SpaceZone* zone = spaceZones->get(i);
+
+		if (zone != nullptr) {
+			SpaceZoneLoadManagersTask* task = new SpaceZoneLoadManagersTask(_this.getReferenceUnsafeStaticCast(), zone);
+			task->execute();
+		}
+	}
+
+	for (int i = 0; i < spaceZones->size(); ++i) {
+		SpaceZone* spaceZone = spaceZones->get(i);
+
+		if (spaceZone != nullptr) {
+			while (!spaceZone->hasManagersStarted())
+				Thread::sleep(500);
+		}
+	}
+}
+
 void ZoneServerImplementation::startManagers() {
-	info("loading managers..");
+	info(true) << "ZoneServerImplementation -- Starting Managers...";
 
 	radialManager = new RadialManager(_this.getReferenceUnsafeStaticCast());
 	radialManager->deploy("RadialManager");
@@ -262,6 +357,7 @@ void ZoneServerImplementation::startManagers() {
 
 	for (int i = 0; i < zones->size(); ++i) {
 		Zone* zone = zones->get(i);
+
 		if (zone != nullptr) {
 			zone->updateCityRegions();
 		}
@@ -271,6 +367,8 @@ void ZoneServerImplementation::startManagers() {
 
 	frsManager = new FrsManager(_this.getReferenceUnsafeStaticCast());
 	frsManager->initialize();
+
+	info(true) << "ZoneServerImplementation -- Managers Started.";
 }
 
 void ZoneServerImplementation::start(int p, int mconn) {
@@ -299,10 +397,21 @@ void ZoneServerImplementation::timedShutdown(int minutes, int flags) {
 	} else {
 		task->schedule(60 * 1000);
 
-		String str = "Server will shutdown in " + String::valueOf(minutes) + " minutes";
-		Logger::console.info(str, true);
+		StringBuffer shutdownMsg;
 
-		getChatManager()->broadcastGalaxy(nullptr, str);
+		shutdownMsg << "You will be disconnected in ";
+
+		if (minutes > 1) {
+			shutdownMsg << minutes << " minutes ";
+		} else {
+			shutdownMsg << minutes << " minute ";
+		}
+
+		shutdownMsg << "so the server can perform a final save before shutting down. Please find a safe place to logout.";
+
+		Logger::console.info(shutdownMsg.toString(), true);
+
+		getChatManager()->broadcastGalaxy(nullptr, shutdownMsg.toString());
 	}
 }
 
@@ -311,10 +420,10 @@ void ZoneServerImplementation::shutdown() {
 
 	stopManagers();
 
-	info("shutting down zones", true);
+	info("Shutting Down Ground Zones", true);
 
 	for (int i = 0; i < zones->size(); ++i) {
-		ManagedReference<Zone*> zone = zones->get(i);
+		ManagedReference<GroundZone*> zone = zones->get(i);
 
 		if (zone != nullptr) {
 			zone->stopManagers();
@@ -325,7 +434,23 @@ void ZoneServerImplementation::shutdown() {
 
 	zones->removeAll();
 
-	info("zones shut down", true);
+	info("Ground Zones Shut Down", true);
+
+	info("Shutting Down Space Zones", true);
+
+	for (int i = 0; i < spaceZones->size(); ++i) {
+		ManagedReference<SpaceZone*> spaceZone = spaceZones->get(i);
+
+		if (spaceZone != nullptr) {
+			spaceZone->stopManagers();
+
+			debug() << "zone references " << spaceZone->getReferenceCount();
+		}
+	}
+
+	spaceZones->removeAll();
+
+	info("Space Zones Shut Down", true);
 
 	printInfo();
 
@@ -335,7 +460,7 @@ void ZoneServerImplementation::shutdown() {
 }
 
 void ZoneServerImplementation::stopManagers() {
-	info("stopping managers..", true);
+	info(true) << "ZoneServerImplementation -- Stopping Managers...";
 
 	missionManager = nullptr;
 	radialManager = nullptr;
@@ -344,10 +469,13 @@ void ZoneServerImplementation::stopManagers() {
 	reactionManager = nullptr;
 
 	if (frsManager != nullptr) {
+		frsManager->stop();
 		frsManager = nullptr;
 	}
 
 	creatureTemplateManager = nullptr;
+	shipAgentTemplateManager = nullptr;
+
 	dnaManager = nullptr;
 	stringIdManager = nullptr;
 	zoneHandler = nullptr;
@@ -399,14 +527,16 @@ void ZoneServerImplementation::stopManagers() {
 		objectManager = nullptr;
 	}
 
-	info("managers stopped", true);
+	ShipManager::instance()->stop();
+
+	info(true) << "ZoneServerImplementation -- Managers Stopped";
 }
 
 void ZoneServerImplementation::clearZones() {
 	info("clearing all zones..", true);
-
+	// Clear Ground Zones
 	for (int i = 0; i < zones->size(); ++i) {
-		ManagedReference<Zone*> zone = zones->get(i);
+		ManagedReference<GroundZone*> zone = zones->get(i);
 
 		if (zone != nullptr) {
 			Core::getTaskManager()->executeTask([=] () {
@@ -416,7 +546,7 @@ void ZoneServerImplementation::clearZones() {
 	}
 
 	for (int i = 0; i < zones->size(); ++i) {
-		Zone* zone = zones->get(i);
+		GroundZone* zone = zones->get(i);
 
 		if (zone != nullptr) {
 			while (!zone->isZoneCleared())
@@ -424,7 +554,37 @@ void ZoneServerImplementation::clearZones() {
 		}
 	}
 
-	info("all zones clear", true);
+	info("Ground zones cleared...", true);
+
+	//Clear Space Zones
+	for (int i = 0; i < spaceZones->size(); ++i) {
+		ManagedReference<SpaceZone*> szone = spaceZones->get(i);
+
+		if (szone != nullptr) {
+			Core::getTaskManager()->executeTask([=] () {
+				szone->clearZone();
+			}, "ClearZoneLambda");
+		}
+	}
+
+	for (int i = 0; i < spaceZones->size(); ++i) {
+		SpaceZone* szone = spaceZones->get(i);
+
+		if (szone != nullptr) {
+			while (!szone->isZoneCleared())
+				Thread::sleep(500);
+		}
+	}
+
+	info("Space zones cleared...", true);
+}
+
+Zone* ZoneServerImplementation::getZone(const String& zoneName) const {
+	if (zoneName.beginsWith("space")) {
+		return spaceZones->get(zoneName);
+	}
+
+	return zones->get(zoneName);
 }
 
 ZoneClientSession* ZoneServerImplementation::createConnection(Socket* sock, SocketAddress& addr) {
@@ -446,7 +606,7 @@ ZoneClientSession* ZoneServerImplementation::createConnection(Socket* sock, Sock
 	//client->deploy("ZoneClientSession " + addr.getFullIPAddress());
 	//client->deploy();
 
-	const auto& address = session->getAddress();
+	const auto& address = session->getFullIPAddress();
 
 	debug() << "client connected from \'" << address << "\'";
 
@@ -619,7 +779,7 @@ void ZoneServerImplementation::changeUserCap(int amount) {
 	unlock();
 }
 
-void ZoneServerImplementation::addTotalSentPacket(int count) {
+void ZoneServerImplementation::addTotalSentPacket(unsigned int count) {
 //	lock();
 
 	totalSentPackets += count;
@@ -627,7 +787,7 @@ void ZoneServerImplementation::addTotalSentPacket(int count) {
 //	unlock();
 }
 
-void ZoneServerImplementation::addTotalResentPacket(int count) {
+void ZoneServerImplementation::addTotalResentPacket(unsigned int count) {
 	//lock();
 
 	totalResentPackets += count;

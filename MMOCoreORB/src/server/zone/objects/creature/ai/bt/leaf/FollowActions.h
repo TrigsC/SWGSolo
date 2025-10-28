@@ -269,13 +269,11 @@ public:
 
 class SetMovementState : public Behavior {
 public:
-	SetMovementState(const String& className, const uint32 id, const LuaObject& args)
-			: Behavior(className, id, args), state(0) {
+	SetMovementState(const String& className, const uint32 id, const LuaObject& args) : Behavior(className, id, args), state(0) {
 		parseArgs(args);
 	}
 
-	SetMovementState(const SetMovementState& a)
-			: Behavior(a), state(a.state) {
+	SetMovementState(const SetMovementState& a) : Behavior(a), state(a.state) {
 	}
 
 	SetMovementState& operator=(const SetMovementState& a) {
@@ -288,40 +286,40 @@ public:
 
 	Behavior::Status execute(AiAgent* agent, unsigned int startIdx = 0) const {
 		ManagedReference<SceneObject*> tar = nullptr;
+
 		if (agent->peekBlackboard("targetProspect"))
 			tar = agent->readBlackboard("targetProspect").get<ManagedReference<SceneObject*> >();
 
-		if (tar == nullptr && !(agent->getCreatureBitmask() & CreatureFlag::FOLLOW) && (state == AiAgent::WATCHING || state == AiAgent::STALKING || state == AiAgent::FOLLOWING)) {
+		if (tar == nullptr && !(agent->getCreatureBitmask() & ObjectFlag::FOLLOW) && (state == AiAgent::WATCHING || state == AiAgent::STALKING || state == AiAgent::FOLLOWING)) {
 			agent->setFollowObject(nullptr);
 			return FAILURE;
 		}
 
 		switch (state) {
-		case AiAgent::OBLIVIOUS:
-			agent->setOblivious();
-			break;
-		case AiAgent::WATCHING: {
-			if (tar != nullptr) {
-				Locker clocker(tar, agent);
-				agent->setWatchObject(tar);
+			case AiAgent::OBLIVIOUS:
+				agent->setOblivious();
+				break;
+			case AiAgent::WATCHING: {
+				if (tar != nullptr) {
+					Locker clocker(tar, agent);
+					agent->setWatchObject(tar);
+				}
+				break;
 			}
-			break;
-		}
-		case AiAgent::STALKING: {
-			if (tar != nullptr) {
-				Locker clocker(tar, agent);
-				agent->setStalkObject(tar);
+			case AiAgent::STALKING: {
+				if (tar != nullptr) {
+					Locker clocker(tar, agent);
+					agent->setStalkObject(tar);
+				}
+				break;
 			}
-			break;
-		}
-		case AiAgent::FOLLOWING:
-			break;
-		case AiAgent::PATROLLING:
-		case AiAgent::FLEEING:
-		case AiAgent::LEASHING:
-		default:
-			agent->setMovementState(state);
-			break;
+			case AiAgent::FOLLOWING:
+			case AiAgent::PATROLLING:
+			case AiAgent::FLEEING:
+			case AiAgent::LEASHING:
+			default:
+				agent->setMovementState(state);
+				break;
 		};
 
 		return SUCCESS;
@@ -344,14 +342,13 @@ private:
 
 class CalculateAggroMod : public Behavior {
 public:
-	CalculateAggroMod(const String& className, const uint32 id, const LuaObject& args)
-			: Behavior(className, id, args) {
+	CalculateAggroMod(const String& className, const uint32 id, const LuaObject& args) : Behavior(className, id, args) {
 	}
 
 	Behavior::Status execute(AiAgent* agent, unsigned int startIdx = 0) const {
 		ManagedReference<SceneObject*> tar = nullptr;
 		if (agent->peekBlackboard("targetProspect"))
-			tar = agent->readBlackboard("targetProspect").get<ManagedReference<SceneObject*> >();
+			tar = agent->readBlackboard("targetProspect").get<ManagedReference<SceneObject*>>();
 
 		if (tar == nullptr || !tar->isCreatureObject())
 			return FAILURE;
@@ -361,10 +358,9 @@ public:
 		if (tarCreo == nullptr)
 			return FAILURE;
 
-		Locker clocker(tarCreo, agent);
-
 		float minMod = Math::min(1.f - (tarCreo->getLevel() - agent->getLevel()) / 8.f, 1.5f);
 		float mod = Math::max(0.75f, minMod);
+
 		agent->writeBlackboard("aggroMod", mod);
 
 		return agent->peekBlackboard("aggroMod") ? SUCCESS : FAILURE;
@@ -373,25 +369,24 @@ public:
 
 class RunAway : public Behavior {
 public:
-	RunAway(const String& className, const uint32 id, const LuaObject& args)
-			: Behavior(className, id, args), dist(0.f) {
+	RunAway(const String& className, const uint32 id, const LuaObject& args) : Behavior(className, id, args), delay(15), dist(0.f) {
 		parseArgs(args);
 	}
 
-	RunAway(const RunAway& b)
-			: Behavior(b), dist(b.dist) {
+	RunAway(const RunAway& b) : Behavior(b), delay(b.delay), dist(b.dist) {
 	}
 
 	RunAway& operator=(const RunAway& b) {
 		if (this == &b)
 			return *this;
 		Behavior::operator=(b);
+		delay = b.delay;
 		dist = b.dist;
 		return *this;
 	}
 
 	Behavior::Status execute(AiAgent* agent, unsigned int startIdx = 0) const {
-		if (agent == nullptr || !agent->isMonster() || agent->getPvpStatusBitmask() & CreatureFlag::AGGRESSIVE)
+		if (agent == nullptr || !agent->isMonster() || agent->getPvpStatusBitmask() & ObjectFlag::AGGRESSIVE)
 			return FAILURE;
 
 		ManagedReference<SceneObject*> tar = nullptr;
@@ -416,6 +411,13 @@ public:
 
 		float distance = Math::max(dist, dist - radius * aggroMod);
 
+		Time* fleeDelay = agent->getFleeDelay();
+
+		if (fleeDelay != nullptr) {
+			fleeDelay->updateToCurrentTime();
+			fleeDelay->addMiliTime(delay * 1000);
+		}
+
 		agent->writeBlackboard("fleeRange", distance);
 		agent->runAway(tar->asCreatureObject(), distance, false);
 		agent->showFlyText("npc_reaction/flytext", "afraid", 0xFF, 0, 0);
@@ -424,6 +426,7 @@ public:
 	}
 
 	void parseArgs(const LuaObject& args) {
+		delay = getArg<float>()(args, "delay");
 		dist = getArg<float>()(args, "dist");
 	}
 
@@ -435,6 +438,7 @@ public:
 	}
 
 private:
+	int delay;
 	float dist;
 };
 
@@ -709,21 +713,25 @@ public:
 	}
 
 	Behavior::Status execute(AiAgent* agent, unsigned int startIdx = 0) const {
-		if (agent == nullptr || !agent->isPet())
+		if (agent == nullptr || !agent->isPet()) {
 			return FAILURE;
+		}
 
 		Reference<PetControlDevice*> controlDevice = agent->getControlDevice().castTo<PetControlDevice*>();
 
-		if (controlDevice == nullptr)
+		if (controlDevice == nullptr) {
 			return FAILURE;
+		}
 
 		ManagedReference<SceneObject*> newFollow = controlDevice->getLastCommander();
 		uint32 lastCommand = controlDevice->getLastCommand();
+
 		Locker clocker(controlDevice, agent);
 
 		if (lastCommand == PetManager::PATROL) {
-			if (controlDevice->getPatrolPointSize() == 0)
+			if (controlDevice->getPatrolPointSize() == 0) {
 				return FAILURE;
+			}
 
 			controlDevice->setLastCommandTarget(nullptr);
 
@@ -748,9 +756,9 @@ public:
 		}
 
 		controlDevice->setLastCommandTarget(newFollow);
+
 		clocker.release();
 
-		Locker flocker(newFollow, agent);
 		agent->setFollowObject(newFollow);
 
 		return SUCCESS;
@@ -790,18 +798,23 @@ public:
 
 		AiAgent* squadLeader = squadObserver->getMember(0);
 
-		if (squadLeader == nullptr || squadLeader == agent)
+		if (squadLeader == nullptr)
+			return FAILURE;
+
+		uint64 squadLeaderID = squadLeader->getObjectID();
+
+		if (squadLeaderID == agent->getObjectID())
 			return FAILURE;
 
 		ManagedReference<SceneObject*> followCopy = agent->getFollowObject().get();
 
-		if (followCopy != nullptr && followCopy == squadLeader) {
+		if (followCopy != nullptr && followCopy->getObjectID() == squadLeaderID) {
 			return FAILURE;
 		}
 
 		Locker clocker(squadLeader, agent);
 
-		agent->addCreatureFlag(CreatureFlag::FOLLOW);
+		agent->addObjectFlag(ObjectFlag::FOLLOW);
 		agent->setFollowObject(squadLeader);
 
 		return SUCCESS;
@@ -825,67 +838,90 @@ public:
 	}
 
 	GetHealTarget& operator=(const GetHealTarget& a) {
-		if (this == &a)
+		if (this == &a) {
 			return *this;
+		}
+
 		Behavior::operator=(a);
 		range = a.range;
 		return *this;
 	}
 
 	Behavior::Status execute(AiAgent* agent, unsigned int startIdx = 0) const {
-		ManagedReference<SceneObject*> target = nullptr;
+		// agent->info(true) << "ID: " << agent->getObjectID() << " calling --- GetHealTarget!";
 
-		if (agent->peekBlackboard("targetProspect"))
-			target = agent->readBlackboard("targetProspect").get<ManagedReference<SceneObject*> >().get();
+		ManagedReference<SceneObject*> targetProspect = nullptr;
 
-		if (target == nullptr || !target->isCreatureObject())
-			return FAILURE;
-
-		ManagedReference<CreatureObject*> targetCreo = target->asCreatureObject();
-
-		if (targetCreo != nullptr) {
-			const DeltaVector<ManagedReference<SceneObject*>>* defenderList = targetCreo->getDefenderList();
-
-			if (defenderList != nullptr && defenderList->size() > 0) {
-				int healTar = System::random(defenderList->size() - 1);
-
-				ManagedReference<SceneObject*> healTarget = defenderList->get(healTar);
-
-				if (healTarget == nullptr || !healTarget->isCreatureObject())
-					return FAILURE;
-
-				ManagedReference<CreatureObject*> healCreo = healTarget->asCreatureObject();
-
-				if (healCreo == nullptr || healCreo->isDead())
-					return FAILURE;
-
-				if (healCreo == agent) {
-					agent->writeBlackboard("healTarget", healCreo);
-					return SUCCESS;
-				}
-
-				Locker clocker(healCreo, agent);
-
-				if (healCreo->isAggressiveTo(agent) || agent->isAggressiveTo(healCreo))
-					return FAILURE;
-
-				if (healCreo->getFaction() > 0 && (healCreo->getFaction() != agent->getFaction() && healCreo->getFactionStatus() > FactionStatus::ONLEAVE)) {
-					return FAILURE;
-				}
-
-				float distSq = agent->getPosition().squaredDistanceTo(healCreo->getPosition());
-
-				if (distSq > range * range)
-					return FAILURE;
-
-				agent->setMovementState(AiAgent::MOVING_TO_HEAL);
-				agent->writeBlackboard("healTarget", healCreo);
-
-				return SUCCESS;
-			}
+		if (agent->peekBlackboard("targetProspect")) {
+			targetProspect = agent->readBlackboard("targetProspect").get<ManagedReference<SceneObject*> >().get();
 		}
 
-		return FAILURE;
+		if (targetProspect == nullptr || !targetProspect->isCreatureObject()) {
+			return FAILURE;
+		}
+
+		auto targetTanO = targetProspect->asTangibleObject();
+
+		if (targetTanO == nullptr) {
+			return FAILURE;
+		}
+
+		const DeltaVector<ManagedReference<SceneObject*>>* defenderList = targetTanO->getDefenderList();
+
+		if (defenderList == nullptr || defenderList->size() < 1) {
+			return FAILURE;
+		}
+
+		int healTar = System::random(defenderList->size() - 1);
+
+		ManagedReference<SceneObject*> defenderSceneO = defenderList->get(healTar);
+
+		if (defenderSceneO == nullptr || !defenderSceneO->isCreatureObject()) {
+			return FAILURE;
+		}
+
+		ManagedReference<TangibleObject*> healTarget = defenderSceneO->asTangibleObject();
+
+		if (healTarget == nullptr ) {
+			return FAILURE;
+		}
+
+		if (healTarget->getObjectID() == agent->getObjectID()) {
+			// agent->info(true) << "ID: " << agent->getObjectID() << " Agent setting self as heal target";
+
+			agent->writeBlackboard("healTarget", healTarget);
+			return SUCCESS;
+		}
+
+		auto healCreo = healTarget->asCreatureObject();
+
+		if (healCreo == nullptr || healCreo->isDead()) {
+			// agent->info(true) << "blocked adding a CreO to healTarget";
+			return FAILURE;
+		}
+
+		Locker clocker(healCreo, agent);
+
+		if (healCreo->isAggressiveTo(agent) || agent->isAggressiveTo(healCreo)) {
+			return FAILURE;
+		}
+
+		if (healCreo->getFaction() > 0 && (healCreo->getFaction() != agent->getFaction() && healCreo->getFactionStatus() > FactionStatus::ONLEAVE)) {
+			return FAILURE;
+		}
+
+		if (!agent->isInRange3d(healCreo, range)) {
+			return FAILURE;
+		}
+
+		agent->setMovementState(AiAgent::MOVING_TO_HEAL);
+
+		// This must set the Tangible Object as the target to heal
+		agent->writeBlackboard("healTarget", healTarget);
+
+		// agent->info(true) << "ID: " << agent->getObjectID() << "    Set up a healTarget ---- " << healCreo->getDisplayedName();
+
+		return SUCCESS;
 	}
 
 	void parseArgs(const LuaObject& args) {

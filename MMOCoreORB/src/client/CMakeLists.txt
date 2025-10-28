@@ -3,6 +3,8 @@
 
 include_directories(.)
 
+find_package(Boost REQUIRED COMPONENTS program_options)
+
 file(GLOB_RECURSE core3client_sources "*.cpp")
 file(GLOB_RECURSE core3client_headers "*.h")
 
@@ -11,7 +13,11 @@ add_executable(core3client ${core3client_sources} ${core3client_headers})
 
 add_dependencies(core3client engine3)
 
-target_link_libraries(core3client engine3 ${ZLIB_LIBRARIES} ${GCCLIBATOMIC_LIBRARY} ${PTHREAD_LIB_LINK} ${MYSQL_LIB} ${LUA_LIBRARIES} ${DB_LIBRARIES} ${CMAKE_DL_LIBS} ${OPENSSL_LIBRARIES})
+target_link_libraries(core3client engine3 ${Boost_LIBRARIES} ${ZLIB_LIBRARIES} ${GCCLIBATOMIC_LIBRARY} ${PTHREAD_LIB_LINK} ${MYSQL_LIB} ${LUA_LIBRARIES} ${DB_LIBRARIES} ${CMAKE_DL_LIBS} ${OPENSSL_LIBRARIES})
+
+if (NOT ENABLE_ASAN AND NOT ENABLE_TSAN AND NOT ENABLE_UBSAN AND JEMALLOC_FOUND AND ENABLE_JEMALLOC_LINK)
+	target_link_libraries(core3client ${JEMALLOC_LIBRARIES})
+endif()
 
 if(ENABLE_MULTITHREADED_LINKER)
 	use_gold(core3client)

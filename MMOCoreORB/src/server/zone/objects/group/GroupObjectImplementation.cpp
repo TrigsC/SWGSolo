@@ -15,6 +15,7 @@
 #include "server/zone/managers/group/GroupManager.h"
 #include "server/zone/objects/creature/buffs/SquadLeaderBuff.h"
 #include "server/zone/objects/creature/CreatureObject.h"
+#include "server/zone/objects/ship/ShipObject.h"
 #include "server/zone/ZoneServer.h"
 #include "server/zone/Zone.h"
 #include "server/zone/objects/group/RemovePetsFromGroupTask.h"
@@ -24,6 +25,7 @@
 #include "server/zone/managers/creature/PetManager.h"
 
 //#define DEBUG_GROUPS
+//#define DEBUG_GROUP_LEVEL
 
 void GroupObjectImplementation::sendBaselinesTo(SceneObject* player) {
 	if (player == nullptr)
@@ -103,7 +105,7 @@ void GroupObjectImplementation::updatePvPStatusNearCreature(CreatureObject* crea
 		return;
 
 	CloseObjectsVector* creatureCloseObjects = (CloseObjectsVector*) creature->getCloseObjects();
-	SortedVector<QuadTreeEntry*> closeObjectsVector;
+	SortedVector<TreeEntry*> closeObjectsVector;
 
 	if (creatureCloseObjects == nullptr)
 		return;
@@ -134,15 +136,23 @@ void GroupObjectImplementation::addMember(CreatureObject* newMember, bool notify
 	info(true) << "Group ID: " << getObjectID() << " Adding Member: " << newMember->getDisplayedName();
 #endif
 
-	// Handle player that is piloting ship
-	uint64 shipID = 0;
-
 	// Add the meber to the list
 	groupMembers.add(newMember);
 
+	uint64 shipID = 0;
+
 	if (newMember->isPlayerCreature()) {
-		if (notifyClient)
+		// Handle player that is piloting ship
+		if (newMember->isPilotingShip()) {
+			ManagedReference<SceneObject*> rootParent = newMember->getRootParent();
+
+			if (rootParent != nullptr && rootParent->isShipObject())
+				shipID = rootParent->getObjectID();
+		}
+
+		if (notifyClient) {
 			sendTo(newMember, true);
+		}
 
 		if (hasSquadLeader()) {
 			addGroupModifiers(newMember);
@@ -150,6 +160,9 @@ void GroupObjectImplementation::addMember(CreatureObject* newMember, bool notify
 
 		scheduleUpdateNearestMissionForGroup(newMember->getPlanetCRC());
 	}
+
+	// Add to Ship List
+	groupMemberShips.add(newMember->getObjectID(), shipID);
 
 	calculateGroupLevel();
 
@@ -183,7 +196,7 @@ void GroupObjectImplementation::removeMember(CreatureObject* memberRemoved) {
 		if (wasLeader)
 			removeGroupModifiers();
 		else
-			removeGroupModifiers(memberRemoved);
+			removeGroupModifiers(memberRemoved, false);
 	}
 
 	// remove member from the list
@@ -198,6 +211,9 @@ void GroupObjectImplementation::removeMember(CreatureObject* memberRemoved) {
 		if (groupDelta6 != nullptr) {
 			groupDelta6->startUpdate(0x1);
 			groupMembers.remove(i, groupDelta6);
+
+			groupMemberShips.drop(memberRemoved->getObjectID());
+
 			groupDelta6->close();
 
 			broadcastMessage(groupDelta6);
@@ -234,13 +250,37 @@ void GroupObjectImplementation::removeMember(CreatureObject* memberRemoved) {
 
 		Zone* zone = memberRemoved->getZone();
 
-		if (zone != nullptr) {
+		if (zone != nullptr && !zone->isSpaceZone()) {
 			scheduleUpdateNearestMissionForGroup(zone->getPlanetCRC());
 		}
 	}
 
 	updatePvPStatusNearCreature(memberRemoved);
+
 	calculateGroupLevel();
+}
+
+void GroupObjectImplementation::updateMemberShip(CreatureObject* member, ShipObject* ship) {
+	// Pre: Group is locked
+	if (member == nullptr)
+		return;
+
+	uint64 shipID = (ship != nullptr) ? ship->getObjectID() : 0;
+
+#ifdef DEBUG_GROUPS
+	info(true) << "GroupObjectImplementation::updateMemberShip -- called for GroupMember: " << member->getDisplayedName();
+#endif
+
+	groupMemberShips.add(member->getObjectID(), shipID);
+
+	GroupObjectDeltaMessage6* groupDelta6 = new GroupObjectDeltaMessage6(_this.getReferenceUnsafeStaticCast());
+
+	if (groupDelta6 != nullptr) {
+		groupDelta6->updateMembers();
+		groupDelta6->close();
+
+		broadcastMessage(groupDelta6);
+	}
 }
 
 bool GroupObjectImplementation::hasMember(CreatureObject* player) {
@@ -351,14 +391,16 @@ void GroupObjectImplementation::disband() {
 
 	bool hasSL = hasSquadLeader();
 	int groupSize = groupMembers.size();
+	uint64 leaderID = getLeaderID();
 
 	for (int i = groupSize - 1; i >= 0; --i) {
 		ManagedReference<CreatureObject*> groupMember = getGroupMember(i);
 
 		groupMembers.remove(i);
 
-		if (groupMember == nullptr)
+		if (groupMember == nullptr) {
 			continue;
+		}
 
 		try {
 			Locker clocker(groupMember, _this.getReferenceUnsafeStaticCast());
@@ -370,8 +412,10 @@ void GroupObjectImplementation::disband() {
 					ghost->removeWaypointBySpecialType(WaypointObject::SPECIALTYPE_NEARESTMISSIONFORGROUP);
 				}
 
-				if (hasSL)
-					removeGroupModifiers(groupMember);
+				// Remove SL buffs
+				if (hasSL) {
+					removeGroupModifiers(groupMember, (leaderID == groupMember->getObjectID()));
+				}
 			}
 
 			groupMember->updateGroup(nullptr);
@@ -423,7 +467,7 @@ void GroupObjectImplementation::removeGroupModifiers() {
 		if (!player->isPlayerCreature())
 			continue;
 
-		removeGroupModifiers(player);
+		removeGroupModifiers(player, true);
 	}
 }
 
@@ -459,23 +503,25 @@ void GroupObjectImplementation::addGroupModifiers(CreatureObject* player) {
 	buff->addObservers();
 }
 
-void GroupObjectImplementation::removeGroupModifiers(CreatureObject* player) {
-	if (player == nullptr)
+void GroupObjectImplementation::removeGroupModifiers(CreatureObject* player, bool isLeader) {
+	if (player == nullptr) {
 		return;
+	}
 
-	Reference<CreatureObject*> leader = getLeader();
+	if (!isLeader) {
+		Reference<CreatureObject*> leader = getLeader();
 
-	if (leader == nullptr)
-		return;
-
-	if (!leader->isPlayerCreature())
-		return;
+		if (leader == nullptr || !leader->isPlayerCreature()) {
+			return;
+		}
+	}
 
 	Locker clocker(player, _this.getReferenceUnsafeStaticCast());
 	String action = "squadleader";
 
-	if (player->hasBuff(action.hashCode()))
+	if (player->hasBuff(action.hashCode())) {
 		player->removeBuff(action.hashCode());
+	}
 
 	player->updateSpeedAndAccelerationMods();
 }
@@ -515,31 +561,67 @@ float GroupObjectImplementation::getGroupHarvestModifier(CreatureObject* player)
 
 void GroupObjectImplementation::calculateGroupLevel() {
 	int highestPlayer = 0;
-	groupLevel = 0;
+	float newLevel = 0;
 	factionPetLevel = 0;
+
+#ifdef DEBUG_GROUP_LEVEL
+	StringBuffer levelMsg;
+#endif // DEBUG_GROUP_LEVEL
+
+	/*
+	for (int i = 0; i < 20; i++) {
+		int memberLevel = 25;
+
+		if (memberLevel > highestPlayer) {
+			newLevel += (memberLevel - highestPlayer + (highestPlayer / 5.f));
+			highestPlayer = memberLevel;
+		} else {
+			newLevel += (memberLevel / 5.f);
+		}
+	}
+	*/
 
 	for (int i = 0; i < getGroupSize(); i++) {
 		Reference<CreatureObject*> member = getGroupMember(i);
+
+		if (member == nullptr) {
+			continue;
+		}
+
+		int memberLevel = member->getLevel();
+
+#ifdef DEBUG_GROUP_LEVEL
+		levelMsg << "Member Level: " << memberLevel << endl
+		<< "Highest Player Level: " << highestPlayer << endl;
+#endif // DEBUG_GROUP_LEVEL
 
 		if (member->isPet()) {
 				ManagedReference<PetControlDevice*> pcd = member->getControlDevice().get().castTo<PetControlDevice*>();
 
 				if (pcd != nullptr && pcd->getPetType() == PetManager::FACTIONPET) {
-					factionPetLevel += member->getLevel() / 5;
+					factionPetLevel += (memberLevel / 5.f);
 				}
 
-				groupLevel += member->getLevel() / 5;
+				newLevel += (memberLevel / 5.f);
 		} else if (member->isPlayerCreature()) {
-			int memberLevel = member->getLevel();
-
 			if (memberLevel > highestPlayer) {
-				groupLevel += (memberLevel - highestPlayer + (highestPlayer / 5));
+				newLevel += (memberLevel - highestPlayer + (highestPlayer / 5.f));
 				highestPlayer = memberLevel;
 			} else {
-				groupLevel += memberLevel / 5;
+				newLevel += (memberLevel / 5.f);
 			}
 		}
+#ifdef DEBUG_GROUP_LEVEL
+		levelMsg << "Group Level Adjusted: " << newLevel << endl;
+#endif // DEBUG_GROUP_LEVEL
 	}
+
+#ifdef DEBUG_GROUP_LEVEL
+	levelMsg << "Calculate Group Level Result: " << newLevel << endl;
+	info(true) << levelMsg.toString();
+#endif // DEBUG_GROUP_LEVEL
+
+	groupLevel = round(newLevel);
 }
 
 int GroupObjectImplementation::getNumberOfPlayerMembers() {
@@ -624,6 +706,38 @@ bool GroupObjectImplementation::isOtherMemberPlayingMusic(CreatureObject* player
 	return false;
 }
 
+void GroupObjectImplementation::addSpaceMissionObject(uint64 missionOwnerID, uint64 missionObjectID, bool notifyClient) {
+	auto thisGroup = _this.getReferenceUnsafeStaticCast();
+
+	for (int i = 0; i < getGroupSize(); ++i) {
+		Reference<CreatureObject*> member = getGroupMember(i);
+
+		if (member == nullptr || !member->isPlayerCreature() || missionOwnerID == member->getObjectID()) {
+			continue;
+		}
+
+		Locker memberClock(member, thisGroup);
+
+		member->addSpaceMissionObject(missionOwnerID, missionObjectID, notifyClient, false);
+	}
+}
+
+void GroupObjectImplementation::removeSpaceMissionObject(uint64 missionOwnerID, uint64 missionObjectID, bool notifyClient) {
+	auto thisGroup = _this.getReferenceUnsafeStaticCast();
+
+	for (int i = 0; i < getGroupSize(); ++i) {
+		Reference<CreatureObject*> member = getGroupMember(i);
+
+		if (member == nullptr || !member->isPlayerCreature() || missionOwnerID == member->getObjectID()) {
+			continue;
+		}
+
+		Locker memberClock(member, thisGroup);
+
+		member->removeSpaceMissionObject(missionOwnerID, missionObjectID, notifyClient, false);
+	}
+}
+
 void GroupObjectImplementation::scheduleUpdateNearestMissionForGroup(unsigned int planetCRC) {
 	Reference<UpdateNearestMissionForGroupTask*> task = nullptr;
 
@@ -665,6 +779,26 @@ bool GroupObjectImplementation::initializeLeader(CreatureObject* leader, Creatur
 	setMasterLooterID(leader->getObjectID());
 	setLootRule(GroupManager::FREEFORALL);
 	calculateGroupLevel();
+
+	uint64 leaderShipID = 0;
+	uint64 memberShipID = 0;
+
+	if (leader->isPilotingShip()) {
+		ManagedReference<SceneObject*> leaderRootParent = leader->getRootParent();
+
+		if (leaderRootParent != nullptr && leaderRootParent->isShipObject())
+			leaderShipID = leaderRootParent->getObjectID();
+	}
+
+	if (member->isPilotingShip()) {
+		ManagedReference<SceneObject*> memberRootParent = member->getRootParent();
+
+		if (memberRootParent != nullptr && memberRootParent->isShipObject())
+			memberShipID = memberRootParent->getObjectID();
+	}
+
+	groupMemberShips.add(leader->getObjectID(), leaderShipID, nullptr);
+	groupMemberShips.add(member->getObjectID(), memberShipID, nullptr, 0);
 
 #ifdef DEBUG_GROUPS
 	info(true) << "Initialize Leader called for Leader: " << leader->getDisplayedName() << " with Initial Member: " << member->getDisplayedName();

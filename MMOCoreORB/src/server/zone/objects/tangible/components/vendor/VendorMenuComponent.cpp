@@ -1,9 +1,9 @@
 /*
- * VendorMenuComponent.cpp
- *
- *  Created on: 5/27/2012
- *      Author: kyle
- */
+* VendorMenuComponent.cpp
+*
+*  Created on: 5/27/2012
+*      Author: kyle
+*/
 
 #include "server/zone/objects/creature/CreatureObject.h"
 #include "server/zone/objects/player/PlayerObject.h"
@@ -15,40 +15,45 @@
 #include "server/zone/managers/vendor/VendorManager.h"
 #include "server/zone/ZoneProcessServer.h"
 
-void VendorMenuComponent::fillObjectMenuResponse(SceneObject* sceneObject,
-		ObjectMenuResponse* menuResponse, CreatureObject* player) const {
-
-	if(!sceneObject->isVendor())
-		return;
-
-	if(sceneObject->isASubChildOf(player)) {
-		menuResponse->addRadialMenuItem(14, 3, "@ui:destroy");
+void VendorMenuComponent::fillObjectMenuResponse(SceneObject* sceneObject, ObjectMenuResponse* menuResponse, CreatureObject* player) const {
+	if (sceneObject == nullptr || !sceneObject->isVendor() || player == nullptr) {
 		return;
 	}
 
-	PlayerObject* playerObject = player->getPlayerObject();
+	if (sceneObject->isASubChildOf(player)) {
+		menuResponse->addRadialMenuItem(14, 3, "@ui:destroy");
 
-	if (playerObject == nullptr)
 		return;
+	}
+
+	auto ghost = player->getPlayerObject();
+
+	if (ghost == nullptr) {
+		return;
+	}
 
 	DataObjectComponentReference* data = sceneObject->getDataObjectComponent();
-	if(data == nullptr || data->get() == nullptr || !data->get()->isVendorData()) {
+
+	if (data == nullptr || data->get() == nullptr || !data->get()->isVendorData()) {
 		return;
 	}
 
 	VendorDataComponent* vendorData = cast<VendorDataComponent*>(data->get());
-	if(vendorData == nullptr) {
+
+	if (vendorData == nullptr) {
 		return;
 	}
 
-	bool owner = vendorData->getOwnerId() == player->getObjectID();
+	bool playerIsOwner = (vendorData->getOwnerId() == player->getObjectID());
 
-	if(!owner && !playerObject->isPrivileged())
+	if (!playerIsOwner && !ghost->isPrivileged()) {
 		return;
+	}
 
 	menuResponse->addRadialMenuItem(70, 3, "@player_structure:vendor_control");
 
-	if (!owner) {
+	// Privileged access
+	if (!playerIsOwner) {
 		if (vendorData->isInitialized()) {
 			menuResponse->addRadialMenuItemToRadialID(70, 71, 3, "@player_structure:vendor_status");
 			menuResponse->addRadialMenuItemToRadialID(70, 72, 3, "@player_structure:change_name");
@@ -57,40 +62,42 @@ void VendorMenuComponent::fillObjectMenuResponse(SceneObject* sceneObject,
 		return;
 	}
 
+	// Vendor owner control
 	if (!vendorData->isInitialized()) {
-
 		menuResponse->addRadialMenuItemToRadialID(70, 79, 3, "@player_structure:vendor_init");
 
 		menuResponse->addRadialMenuItem(10, 3, "@ui_radial:item_pickup");
 
-		menuResponse->addRadialMenuItem(51, 1, "@ui_radial:item_rotate"); //Rotate
-		menuResponse->addRadialMenuItemToRadialID(51, 52, 3, "@ui_radial:item_rotate_left"); //Rotate Left
-		menuResponse->addRadialMenuItemToRadialID(51, 53, 3, "@ui_radial:item_rotate_right"); //Rotate Right
+		menuResponse->addRadialMenuItem(51, 1, "@ui_radial:item_rotate");					  // Rotate
+		menuResponse->addRadialMenuItemToRadialID(51, 52, 3, "@ui_radial:item_rotate_left");  // Rotate Left
+		menuResponse->addRadialMenuItemToRadialID(51, 53, 3, "@ui_radial:item_rotate_right"); // Rotate Right
 
 	} else {
-
 		menuResponse->addRadialMenuItemToRadialID(70, 71, 3, "@player_structure:vendor_status");
 
 		menuResponse->addRadialMenuItemToRadialID(70, 73, 3, "@player_structure:pay_vendor_t");
 		menuResponse->addRadialMenuItemToRadialID(70, 74, 3, "@player_structure:withdraw_vendor_t");
 
-		if (vendorData->isVendorSearchEnabled())
+		if (vendorData->isVendorSearchEnabled()) {
 			menuResponse->addRadialMenuItemToRadialID(70, 75, 3, "@player_structure:disable_vendor_search");
-		else if (!vendorData->isOnStrike())
+		} else if (!vendorData->isOnStrike()) {
 			menuResponse->addRadialMenuItemToRadialID(70, 75, 3, "@player_structure:enable_vendor_search");
+		}
 
 		if (player->hasSkill("crafting_merchant_advertising_03")) {
-			if (vendorData->isRegistered())
+			if (vendorData->isRegistered()) {
 				menuResponse->addRadialMenuItemToRadialID(70, 76, 3, "@player_structure:unregister_vendor");
-			else if (!vendorData->isOnStrike())
+			} else if (!vendorData->isOnStrike()) {
 				menuResponse->addRadialMenuItemToRadialID(70, 76, 3, "@player_structure:register_vendor");
+			}
 		}
 
 		if (player->hasSkill("crafting_merchant_advertising_01") && sceneObject->isCreatureObject()) {
-			if (!vendorData->isAdBarkingEnabled())
+			if (!vendorData->isAdBarkingEnabled()) {
 				menuResponse->addRadialMenuItemToRadialID(70, 77, 3, "@player_structure:vendor_areabarks_on");
-			else
+			} else {
 				menuResponse->addRadialMenuItemToRadialID(70, 77, 3, "@player_structure:vendor_areabarks_off");
+			}
 		}
 	}
 
@@ -179,7 +186,7 @@ int VendorMenuComponent::handleObjectMenuSelect(SceneObject* sceneObject,
 					return 0;
 				}
 
-				ManagedReference<VendorAdBarkingSession*> session = new VendorAdBarkingSession(player, sceneObject);
+				ManagedReference<VendorAdBarkingSession*> session = new VendorAdBarkingSession(player, sceneObject->asTangibleObject());
 				session->initializeSession();
 
 			} else {

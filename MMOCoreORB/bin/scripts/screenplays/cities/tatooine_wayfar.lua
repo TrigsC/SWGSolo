@@ -98,7 +98,6 @@ TatooineWayfarScreenPlay = CityScreenPlay:new {
 		{"artisan",60,34.4931,0.104999,-6.47601,180,1134559, "conversation"},
 		{"bounty_hunter",300,34.4931,0.104999,-7.576,0,1134559, "sad"},
 		{"artisan",60,-3.85346,-0.894991,6.73775,0,1134560, "conversation"},
-		{"bartender",60,-11.0018,-0.894992,1.78678,213.433,1134560, ""},
 		{"businessman",60,4.86041,-0.894992,6.38401,249.175,1134560, ""},
 		{"noble",60,-5.69909,-0.894992,-10.4035,79.4873,1134560, ""},
 		{"osweri_hepa",60,11.3838,-0.894992,-2.63465,180.006,1134560, "conversation"},
@@ -115,7 +114,7 @@ TatooineWayfarScreenPlay = CityScreenPlay:new {
 		{"mercenary",300,-25.6591,-0.519991,10.6171,15.7251,1134570, ""},
 
 		{"rebel_recruiter",60,-5295.7,75,-6527.99,39.2298,0, ""},
-		{"smuggler_pilot",60,-5868.38,90,-6199.5,65.5014,0, "neutral"},
+		--{"smuggler_pilot",60,-5868.38,90,-6199.5,65.5014,0, "neutral"},
 		{"trainer_artisan",0,-5274,75,-6547,139,0, ""},
 		{"trainer_commando",0,-5038,75,-6609,226,0, ""},
 		{"trainer_scout",0,-5051.46,75,-6629.48,7,0, ""},
@@ -157,7 +156,7 @@ function TatooineWayfarScreenPlay:spawnMobiles()
 				CreatureObject(pMobile):setMoodString(mob[8])
 			end
 
-			AiAgent(pMobile):addCreatureFlag(AI_STATIC)
+			AiAgent(pMobile):addObjectFlag(AI_STATIC)
 
 			if CreatureObject(pMobile):getPvpStatusBitmask() == 0 then
 				CreatureObject(pMobile):clearOptionBit(AIENABLED)

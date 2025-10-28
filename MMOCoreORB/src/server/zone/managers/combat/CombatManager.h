@@ -188,6 +188,15 @@ public:
 
 	bool areInDuel(CreatureObject* player1, CreatureObject* player2) const;
 
+	/**
+	 * Checks if there is an active challenge
+	 * @param challenger player that is being checked if they have an open challenge for target
+	 * @param targetPlayer target
+	 * @pre { challenger != targetPlayer, challenger is locked }
+	 * @post { challenger is locked }
+	 */
+	bool hasActiveDuelChallenge(CreatureObject* challenger, CreatureObject* targetPlayer) const;
+
 	float calculateWeaponAttackSpeed(CreatureObject* attacker, WeaponObject* weapon, float skillSpeedRatio) const;
 
 	void broadcastCombatAction(CreatureObject * attacker, WeaponObject* weapon, SortedVector<DefenderHitList*> targetDefenders, const CreatureAttackData & data) const;
@@ -197,7 +206,7 @@ public:
 	void sendMitigationCombatSpam(CreatureObject* defender, TangibleObject* item, uint32 damage, int type) const;
 
 	float hitChanceEquation(float attackerAccuracy, float targetDefense) const;
-	float doDroidDetonation(CreatureObject* droid, CreatureObject* defender, float damage) const;
+	float doObjectDetonation(TangibleObject* droid, CreatureObject* defender, float damage, WeaponObject* weapon = nullptr) const;
 
 	void checkForTefs(CreatureObject* attacker, CreatureObject* defender, bool* shouldGcwCrackdownTef, bool* shouldGcwTef, bool* shouldBhTef) const;
 	void getFrsModifiedForceAttackDamage(CreatureObject* attacker, float& minDmg, float& maxDmg, const CreatureAttackData& data) const;

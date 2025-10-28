@@ -232,7 +232,7 @@ void GeneticLabratory::setInitialCraftingValues(TangibleObject* prototype, Manuf
 
 	for (int i = 0; i < manufactureSchematic->getSlotCount(); ++i) {
 		// Dna Component Slots
-		Reference<IngredientSlot* > ingredientSlot = manufactureSchematic->getSlot(i);
+		Reference<IngredientSlot*> ingredientSlot = manufactureSchematic->getSlot(i);
 
 		if (ingredientSlot == nullptr || !ingredientSlot->isComponentSlot())
 			continue;
@@ -271,7 +271,7 @@ void GeneticLabratory::setInitialCraftingValues(TangibleObject* prototype, Manuf
 		}
 	}
 
-	// Ensure none of the components don't have a nullptr
+	// Ensure none of the components have a nullptr
 	if (physique == nullptr || prowess == nullptr || mental == nullptr || psychological == nullptr || aggression == nullptr)
 		return;
 
@@ -492,14 +492,14 @@ void GeneticLabratory::setInitialCraftingValues(TangibleObject* prototype, Manuf
 	//craftingValues->setCurrentValue("dna_comp_armor_saber", (lightsaberSpecial || (lightsaber < 0) || !armorReset) ? lightsaber : 0.f);
 
 	// Store Special Resistances
-	craftingValues->addExperimentalAttribute("kineticeffectiveness", "specials", kineticSpecial ? 1 : 0, 1, 0, true, AttributesMap::OVERRIDECOMBINE);
-	craftingValues->addExperimentalAttribute("energyeffectiveness", "specials", energySpecial ? 1 : 0, 1, 0, true, AttributesMap::OVERRIDECOMBINE);
-	craftingValues->addExperimentalAttribute("blasteffectiveness", "specials", blastSpecial ? 1 : 0, 1, 0, true, AttributesMap::OVERRIDECOMBINE);
-	craftingValues->addExperimentalAttribute("heateffectiveness", "specials", heatSpecial ? 1 : 0, 1, 0, true, AttributesMap::OVERRIDECOMBINE);
-	craftingValues->addExperimentalAttribute("coldeffectiveness", "specials", coldSpecial ? 1 : 0, 1, 0, true, AttributesMap::OVERRIDECOMBINE);
-	craftingValues->addExperimentalAttribute("electricityeffectiveness", "specials", electricSpecial ? 1 : 0, 1, 0, true, AttributesMap::OVERRIDECOMBINE);
-	craftingValues->addExperimentalAttribute("acideffectiveness", "specials", acidSpecial ? 1 : 0, 1, 0, true, AttributesMap::OVERRIDECOMBINE);
-	craftingValues->addExperimentalAttribute("stuneffectiveness", "specials", stunSpecial ? 1 : 0, 1, 0, true, AttributesMap::OVERRIDECOMBINE);
+	craftingValues->addExperimentalAttribute("kineticeffectiveness", "specials", (kineticSpecial ? 1 : 0), 1, 0, true, AttributesMap::OVERRIDECOMBINE);
+	craftingValues->addExperimentalAttribute("energyeffectiveness", "specials", (energySpecial ? 1 : 0), 1, 0, true, AttributesMap::OVERRIDECOMBINE);
+	craftingValues->addExperimentalAttribute("blasteffectiveness", "specials", (blastSpecial ? 1 : 0), 1, 0, true, AttributesMap::OVERRIDECOMBINE);
+	craftingValues->addExperimentalAttribute("heateffectiveness", "specials", (heatSpecial ? 1 : 0), 1, 0, true, AttributesMap::OVERRIDECOMBINE);
+	craftingValues->addExperimentalAttribute("coldeffectiveness", "specials", (coldSpecial ? 1 : 0), 1, 0, true, AttributesMap::OVERRIDECOMBINE);
+	craftingValues->addExperimentalAttribute("electricityeffectiveness", "specials", (electricSpecial ? 1 : 0), 1, 0, true, AttributesMap::OVERRIDECOMBINE);
+	craftingValues->addExperimentalAttribute("acideffectiveness", "specials", (acidSpecial ? 1 : 0), 1, 0, true, AttributesMap::OVERRIDECOMBINE);
+	craftingValues->addExperimentalAttribute("stuneffectiveness", "specials", (stunSpecial ? 1 : 0), 1, 0, true, AttributesMap::OVERRIDECOMBINE);
 	//craftingValues->addExperimentalAttribute("lightsabereffectiveness", "specials", lightsaberSpecial ? 1 : 0, 1, 0, true, AttributesMap::OVERRIDECOMBINE);
 
 	/*

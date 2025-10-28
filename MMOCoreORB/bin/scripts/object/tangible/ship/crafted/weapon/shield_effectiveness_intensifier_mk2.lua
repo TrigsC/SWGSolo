@@ -42,7 +42,7 @@
 
 
 object_tangible_ship_crafted_weapon_shield_effectiveness_intensifier_mk2 = object_tangible_ship_crafted_weapon_shared_shield_effectiveness_intensifier_mk2:new {
-
+	gameObjectType = 1073741856,
 
 	numberExperimentalProperties = {1, 1, 2, 2},
 	experimentalProperties = {"XX", "XX", "OQ", "PE", "OQ", "PE"},
@@ -51,7 +51,7 @@ object_tangible_ship_crafted_weapon_shield_effectiveness_intensifier_mk2 = objec
 	experimentalSubGroupTitles = {"null", "null", "effective_shields", "effective_armor"},
 	experimentalMin = {0, 0, 65, -75},
 	experimentalMax = {0, 0, 75, -65},
-	experimentalPrecision = {0, 0, 0, 0},
+	experimentalPrecision = {0, 0, 3, 3},
 	experimentalCombineType = {0, 0, 1, 1},
 }
 

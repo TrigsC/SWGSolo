@@ -23,6 +23,7 @@ include server.zone.objects.creature.variables.CooldownTimerMap;
 include server.zone.objects.creature.buffs.BuffList;
 include server.zone.objects.creature.damageovertime.DamageOverTimeList;
 include server.zone.objects.scene.variables.DeltaVector;
+include server.zone.objects.scene.variables.DeltaSet;
 include server.zone.objects.creature.variables.SkillList;
 include server.zone.objects.creature.variables.SkillModList;
 include templates.params.creature.CreaturePosture;
@@ -40,11 +41,13 @@ include system.util.SortedVector;
 include system.lang.ref.WeakReference;
 include engine.log.Logger;
 include server.zone.CloseObjectsVector;
-include server.zone.QuadTreeEntry;
+include server.zone.TreeEntry;
 import system.util.SynchronizedVectorMap;
 import server.zone.managers.auction.AuctionSearchTask;
 import server.zone.objects.tangible.Instrument;
 include server.zone.objects.creature.CommandQueue;
+include server.zone.objects.ship.ShipObject;
+include system.lang.String;
 
 @mock
 @json
@@ -134,6 +137,15 @@ class CreatureObject extends TangibleObject {
 	@dereferenced
 	protected DeltaVector<int> maxHamList;
 
+	@dereferenced
+	protected transient DeltaSet<unsigned long, unsigned long> spaceMissionObjects;
+
+	@dereferenced
+	private transient Mutex missionRangeObjectsMutex;
+
+	@dereferenced
+	protected transient SortedVector<unsigned long> missionRangeObjects;
+
 	protected byte frozen;
 
 	protected string templateString;
@@ -201,11 +213,13 @@ class CreatureObject extends TangibleObject {
 
 	protected transient string alternateAppearance;
 
+	protected transient unsigned long spawnerID;
+
 	public static final int HUMAN = 0;
 	public static final int RODIAN = 1;
 	public static final int TRANDOSHAN = 2;
 	public static final int MONCAL = 3;
-	public static final int WOOKIE = 4;
+	public static final int WOOKIEE = 4;
 	public static final int BOTHAN = 5;
 	public static final int TWILEK = 6;
 	public static final int ZABRAK = 7;
@@ -222,6 +236,8 @@ class CreatureObject extends TangibleObject {
 	public static final unsigned long DEAD_TOO_LONG = 1800000; //30 minutes - How long can someone be dead and still be resuscitated in Miliseconds
 
 	public transient unsigned long tradeTargetID;
+
+	public static final int CONVERSATION_MAX_DISTANCE = 7; // Max range for conversations
 
 	/**
 	 * CreatureObject constructor, used to initialized the object
@@ -486,6 +502,8 @@ class CreatureObject extends TangibleObject {
 	 */
 	@preLocked
 	public native void setRunSpeed(float newSpeed, boolean notifyClient = true);
+
+	public native void updateRunSpeed();
 
 	public void setCurrentSpeed(float newSpeed) {
 		currentSpeed = newSpeed;
@@ -754,6 +772,21 @@ class CreatureObject extends TangibleObject {
 		return creatureBuffs.getModifierByName(skillMod);
 	}
 
+	@read
+	public boolean hasBuff(unsigned int buffcrc) {
+		return creatureBuffs.hasBuff(buffcrc);
+	}
+
+	@read
+	public boolean hasSpice() {
+		return creatureBuffs.hasSpice();
+	}
+
+	@read
+	public boolean hasTrapBuff() {
+		return creatureBuffs.hasTrapBuff();
+	}
+
 	@preLocked
 	public abstract int addDotState(CreatureObject attacker,
 				unsigned long dotType,
@@ -790,11 +823,6 @@ class CreatureObject extends TangibleObject {
 	@local
 	public DamageOverTimeList getDamageOverTimeList() {
 		return damageOverTimeList;
-	}
-
-	@read
-	public boolean hasBuff(unsigned int buffcrc) {
-		return creatureBuffs.hasBuff(buffcrc);
 	}
 
 	@preLocked
@@ -1040,6 +1068,11 @@ class CreatureObject extends TangibleObject {
 	@preLocked
 	public native void setAlternateAppearance(final string appearanceTeamplate, boolean notifyClient = true);
 
+	@preLocked
+	public void setSpawnerID(unsigned long spawnID) {
+		spawnerID = spawnID;
+	}
+
 	/**
 	 * Cleares a state from the state bitmask
 	 * @pre { this object is locked }
@@ -1048,6 +1081,9 @@ class CreatureObject extends TangibleObject {
 	 */
 	@preLocked
 	public native boolean clearState(unsigned long state, boolean notifyClient = true);
+
+	@preLocked
+	public native void clearSpaceStates();
 
 	@preLocked
 	public void setControlDevice(ControlDevice device) {
@@ -1090,13 +1126,13 @@ class CreatureObject extends TangibleObject {
 	public native boolean isAttackableBy(TangibleObject object, boolean bypassDeadCheck);
 
 	@dirty
-	public native boolean isHealableBy(CreatureObject object);
+	public abstract native boolean isHealableBy(CreatureObject object);
 
 	@dirty
 	public native boolean healFactionChecks(CreatureObject object, boolean isPlayer);
 
 	@dirty
-	public native boolean isInvulnerable();
+	public native abstract boolean isInvulnerable();
 
 	/**
 	 * Evaluates if the bounty hunter has a mission with the target.
@@ -1105,6 +1141,29 @@ class CreatureObject extends TangibleObject {
 	 */
 	@dirty
 	public native boolean hasBountyMissionFor(CreatureObject target);
+
+	/**
+	 * DeltaVectorMap of objects of CreO and Group for JTL Misisons.
+	 * @param object ID of the mission object to add.
+	 */
+	@preLocked
+	public native void addSpaceMissionObject(unsigned long missionOwnerID, unsigned long objectID, boolean notifyClient, boolean notifyGroup = false);
+
+	/**
+	 * DeltaVectorMap of objects of CreO and Group for JTL Misisons.
+	 * @param object ID of the mission object to remove.
+	 */
+	@preLocked
+	public native void removeSpaceMissionObject(unsigned long missionOwnerID, unsigned long objectID, boolean notifyClient, boolean notifyGroup = false);
+
+	@preLocked
+	public native void removeAllSpaceMissionObjects(boolean notifyClient = false);
+
+	@local
+	@read
+	public final DeltaSet<unsigned long, unsigned long> getSpaceMissionObjects() {
+		return spaceMissionObjects;
+	}
 
 	/**
 	 * sends the conversation list
@@ -1182,7 +1241,7 @@ class CreatureObject extends TangibleObject {
 	 * @return returns true if its aggressive
 	 */
 	@dirty
-	public native boolean isAggressiveTo(CreatureObject object);
+	public native boolean isAggressiveTo(TangibleObject object);
 
 	/**
 	 * Is called when this object is destroyed
@@ -1212,14 +1271,14 @@ class CreatureObject extends TangibleObject {
 	public native void notifyLoadFromDatabase();
 
 	@local
-	public native void notifyInsert(QuadTreeEntry obj);
+	public native void notifyInsert(TreeEntry obj);
 
 	@local
-	public native void notifyDissapear(QuadTreeEntry obj);
+	public abstract native void notifyDissapear(TreeEntry obj);
 
 	@dirty
 	@local
-	public native void notifyPositionUpdate(QuadTreeEntry entry);
+	public native void notifyPositionUpdate(TreeEntry entry);
 
 	/**
 	 * Destroys this object from database
@@ -1380,11 +1439,6 @@ class CreatureObject extends TangibleObject {
 	@local
 	public CooldownTimerMap getCooldownTimerMap() {
 		return cooldownTimerMap;
-	}
-
-	@read
-	public boolean hasSpice() {
-		return creatureBuffs.hasSpice();
 	}
 
 	public void updateLastSuccessfulCombatAction() {
@@ -1715,14 +1769,13 @@ class CreatureObject extends TangibleObject {
 	@read
 	public native float getSlopeModPercent();
 
+	@local
+	@dirty
+	public native float getRunSpeed();
+
 	@read
 	public float getWaterModPercent() {
 		return waterModPercent;
-	}
-
-	@read
-	public float getRunSpeed() {
-		return runSpeed;
 	}
 
 	@read
@@ -1850,11 +1903,6 @@ class CreatureObject extends TangibleObject {
 	}
 
 	@read
-	public float getHeight() {
-		return height;
-	}
-
-	@read
 	public boolean isDroidSpecies() {
 		//Determine if creature is a droid.
 		return getSpecies() >= 203 && getSpecies() <= 225 && getSpecies() != 207;
@@ -1872,10 +1920,10 @@ class CreatureObject extends TangibleObject {
 	}
 
 	@read
-	public native boolean hasEffectImmunity(byte effectType);
+	public abstract native boolean hasEffectImmunity(byte effectType);
 
 	@read
-	public native boolean hasDotImmunity(unsigned int dotType);
+	public abstract native boolean hasDotImmunity(unsigned int dotType);
 
 	@read
 	public abstract native int getSpecies();
@@ -1987,6 +2035,11 @@ class CreatureObject extends TangibleObject {
 	@read
 	public float getSwimHeight() {
 		return swimHeight;
+	}
+
+	@read
+	public unsigned long getSpawnerID() {
+		return spawnerID;
 	}
 
 	@mock
@@ -2148,6 +2201,31 @@ class CreatureObject extends TangibleObject {
 	}
 
 	@read
+	public boolean isPilotingShip() {
+		return (stateBitmask & CreatureState.PILOTINGSHIP) || (stateBitmask & CreatureState.PILOTINGPOBSHIP);
+	}
+
+	@read
+	public boolean isOnboardPobShip() {
+		return (stateBitmask & CreatureState.SHIPINTERIOR) || (stateBitmask & CreatureState.SHIPOPERATIONS) || (stateBitmask & CreatureState.SHIPGUNNER);
+	}
+
+	@read
+	public boolean isInShipStation() {
+		return (stateBitmask & CreatureState.PILOTINGPOBSHIP) || (stateBitmask & CreatureState.SHIPOPERATIONS) || (stateBitmask & CreatureState.SHIPGUNNER);
+	}
+
+	@read
+	public boolean isPobShipOperator() {
+		return stateBitmask & CreatureState.SHIPOPERATIONS;
+	}
+
+	@read
+	public boolean isShipGunner() {
+		return stateBitmask & CreatureState.SHIPGUNNER;
+	}
+
+	@read
 	public boolean isWalking() {
 		return currentSpeed <= walkSpeed;
 	}
@@ -2229,6 +2307,9 @@ class CreatureObject extends TangibleObject {
 
 	@read
 	public native float getAccelerationModifier();
+
+	@read
+	public native float getHeight(boolean postureMod = false);
 
 	@local
 	public native void sendSpeedAndAccelerationMods(SceneObject player);
@@ -2317,4 +2398,18 @@ class CreatureObject extends TangibleObject {
 	public unsigned long getTradeTargetID() {
 		return tradeTargetID;
 	}
+
+	@dirty
+	@local
+	public native boolean checkInConversationRange(SceneObject object);
+
+	@preLocked
+	public native void setQueueCommandDeltaTime(@dereferenced final String commandName, @dereferenced final String commandGroup);
+
+	public native unsigned long getQueueCommandDeltaTime(@dereferenced final String commandName);
+
+	@dirty
+	public native abstract float getOutOfRangeDistance(unsigned long specialRangeObjectID = 0);
+
+	public native boolean isMissionRangeObject(@dereferenced final unsigned long objectID);
 }

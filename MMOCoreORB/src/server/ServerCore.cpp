@@ -13,9 +13,9 @@
 #include "server/chat/ChatManager.h"
 #include "server/login/LoginServer.h"
 #include "system/lang/SignalException.h"
-#ifdef WITH_SESSION_API
-#include "server/login/SessionAPIClient.h"
-#endif // WITH_SESSION_API
+#ifdef WITH_SWGREALMS_API
+#include "server/login/SWGRealmsAPI.h"
+#endif // WITH_SWGREALMS_API
 #include "ping/PingServer.h"
 #include "status/StatusServer.h"
 #include "web/RESTServer.h"
@@ -30,6 +30,7 @@
 #include "server/zone/managers/frs/FrsManager.h"
 
 #include "server/zone/QuadTree.h"
+#include "server/zone/Octree.h"
 
 #include "engine/core/MetricsManager.h"
 #include "engine/service/ServiceThread.h"
@@ -74,9 +75,9 @@ ServerCore::ServerCore(bool truncateDatabases, const SortedVector<String>& args)
 #ifdef WITH_REST_API
 	restServer = nullptr;
 #endif // WITH_REST_API
-#if WITH_SESSION_API
-	sessionAPIClient = nullptr;
-#endif // WITH_SESSION_API
+#if WITH_SWGREALMS_API
+	swgRealmsAPI = nullptr;
+#endif // WITH_SWGREALMS_API
 
 	truncateAllData = truncateDatabases;
 	arguments = args;
@@ -116,8 +117,14 @@ void ServerCore::registerConsoleCommmands() {
 		return SHUTDOWN;
 	});
 
-	addCommand("logQuadTree", [this](const String& arguments) -> CommandResult {
+	addCommand("logQuadtree", [this](const String& arguments) -> CommandResult {
 		QuadTree::setLogging(!QuadTree::doLog());
+
+		return SUCCESS;
+	});
+
+	addCommand("logOctree", [this](const String& arguments) -> CommandResult {
+		Octree::setLogging(!Octree::doLog());
 
 		return SUCCESS;
 	});
@@ -505,14 +512,13 @@ void ServerCore::registerConsoleCommmands() {
 	addCommand("dumpcfg", dumpConfigLambda);
 	addCommand("dumpconfig", dumpConfigLambda);
 
-#ifdef WITH_SESSION_API
-	const auto sessionApiLambda = [this](const String& arguments) -> CommandResult {
-		return SessionAPIClient::instance()->consoleCommand(arguments) ? SUCCESS : ERROR;
+#ifdef WITH_SWGREALMS_API
+	const auto swgRealmsApiLambda = [this](const String& arguments) -> CommandResult {
+		return SWGRealmsAPI::instance()->consoleCommand(arguments) ? SUCCESS : ERROR;
 	};
 
-	addCommand("sessions", sessionApiLambda);
-	addCommand("sessionapi", sessionApiLambda);
-#endif // WITH_SESSION_API
+	addCommand("swgrealms", swgRealmsApiLambda);
+#endif // WITH_SWGREALMS_API
 
 	addCommand("toggleModifiedObjectsDump", [this](const String& arguments) -> CommandResult {
 		DOBObjectManager::setDumpLastModifiedTraces(!DOBObjectManager::getDumpLastModifiedTraces());
@@ -709,11 +715,11 @@ void ServerCore::initialize() {
 		restServer->start();
 #endif // WITH_REST_API
 
-#if WITH_SESSION_API
+#if WITH_SWGREALMS_API
 		if (ConfigManager::instance()->getString("Core3.Login.API.BaseURL", "").length() > 0) {
-			sessionAPIClient = SessionAPIClient::instance();
+			swgRealmsAPI = SWGRealmsAPI::instance();
 		}
-#endif // WITH_SESSION_API
+#endif // WITH_SWGREALMS_API
 
 		ZoneServer* zoneServer = zoneServerRef.get();
 
@@ -736,6 +742,7 @@ void ServerCore::initialize() {
 			int galaxyID = configManager->getZoneGalaxyID();
 
 			try {
+#ifndef WITH_SWGREALMS_API
 				if (zonePort == 0) {
 					const String query = "SELECT port FROM galaxy WHERE galaxy_id = "
 								   + String::valueOf(galaxyID);
@@ -745,6 +752,21 @@ void ServerCore::initialize() {
 						zonePort = result->getInt(0);
 					}
 				}
+#else // WITH_SWGREALMS_API
+				if (zonePort == 0) {
+					auto swgRealmsAPI = SWGRealmsAPI::instance();
+
+					if (swgRealmsAPI != nullptr) {
+						auto galaxyOpt = swgRealmsAPI->getGalaxyEntry(galaxyID);
+
+						if (galaxyOpt.has_value()) {
+							zonePort = galaxyOpt.value().getPort();
+						} else {
+							error("Failed to load galaxy port for galaxy_id " + String::valueOf(galaxyID));
+						}
+					}
+				}
+#endif // WITH_SWGREALMS_API
 
 				database->instance()->executeStatement(
 						"DELETE FROM characters_dirty WHERE galaxy_id = "
@@ -788,13 +810,13 @@ void ServerCore::initialize() {
 
 		System::flushStreams();
 
-#if WITH_SESSION_API
+#if WITH_SWGREALMS_API
 		if (ConfigManager::instance()->getString("Core3.Login.API.BaseURL", "").length() > 0) {
 			if (configManager != nullptr) {
-				sessionAPIClient->notifyGalaxyStart(configManager->getZoneGalaxyID());
+				swgRealmsAPI->notifyGalaxyStart(configManager->getZoneGalaxyID());
 			}
 		}
-#endif // WITH_SESSION_API
+#endif // WITH_SWGREALMS_API
 
 		if (arguments.contains("playercleanup") && zoneServer != nullptr) {
 			zoneServer->getPlayerManager()->cleanupCharacters();
@@ -885,12 +907,6 @@ void ServerCore::shutdown() {
 
 			info("All players disconnected", true);
 		}
-
-		auto frsManager = zoneServer->getFrsManager();
-
-		if (frsManager != nullptr) {
-			frsManager->cancelTasks();
-		}
 	}
 
 	if (pingServer != nullptr) {
@@ -955,15 +971,15 @@ void ServerCore::shutdown() {
 
 	objectManager->finalizeInstance();
 
-#ifdef WITH_SESSION_API
-	if (sessionAPIClient) {
+#ifdef WITH_SWGREALMS_API
+	if (swgRealmsAPI) {
 		if (configManager != nullptr) {
-			sessionAPIClient->notifyGalaxyShutdown();
+			swgRealmsAPI->notifyGalaxyShutdown();
 		}
 
-		sessionAPIClient->finalizeInstance();
+		swgRealmsAPI->finalizeInstance();
 	}
-#endif // WITH_SESSION_API
+#endif // WITH_SWGREALMS_API
 
 	configManager = nullptr;
 	metricsManager = nullptr;

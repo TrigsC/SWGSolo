@@ -35,6 +35,7 @@
 #include "server/zone/objects/player/FactionStatus.h"
 #include "server/zone/managers/visibility/VisibilityManager.h"
 #include "server/zone/objects/building/BuildingObject.h"
+#include "server/zone/managers/director/DirectorManager.h"
 
 void MissionManagerImplementation::loadLuaSettings() {
 	try {
@@ -506,7 +507,27 @@ void MissionManagerImplementation::removeMission(MissionObject* mission, Creatur
 	}
 }
 
-void MissionManagerImplementation::handleMissionAbort(MissionObject* mission, CreatureObject* player) {
+void MissionManagerImplementation::handleMissionFail(MissionObject* mission, CreatureObject* player) {
+	if (mission == nullptr || player == nullptr) {
+		return;
+	}
+
+	ManagedReference<PlayerObject*> ghost = player->getPlayerObject();
+
+	if (ghost != nullptr) {
+		// Space Missions
+		uint32 questCRC = mission->getQuestCRC();
+
+		if (questCRC > 0) {
+			ghost->clearJournalQuest(questCRC, false);
+		}
+	}
+
+	mission->abort();
+	removeMission(mission, player);
+}
+
+void MissionManagerImplementation::handleMissionAbort(MissionObject* mission, CreatureObject* player, bool questMessage) {
 	if (player->isIncapacitated()) {
 		player->sendSystemMessage("You cannot abort a mission while incapacitated.");
 		return;
@@ -517,14 +538,50 @@ void MissionManagerImplementation::handleMissionAbort(MissionObject* mission, Cr
 		return;
 	}
 
+	auto questType = mission->getQuestType();
+	auto questName = mission->getQuestName();
+
 	ManagedReference<PlayerObject*> ghost = player->getPlayerObject();
 
-	if (mission->getTypeCRC() == MissionTypes::BOUNTY && ghost != nullptr && ghost->hasBhTef()) {
-		player->sendSystemMessage("You cannot abort a bounty hunter mission this soon after being in combat with the mission target.");
-		return;
+	if (ghost != nullptr) {
+		if (mission->getTypeCRC() == MissionTypes::BOUNTY && ghost->hasBhTef()) {
+			player->sendSystemMessage("You cannot abort a bounty hunter mission this soon after being in combat with the mission target.");
+			return;
+		}
+
+		// Space Missions
+		uint32 questCRC = mission->getQuestCRC();
+
+		if (questCRC > 0) {
+			ghost->clearJournalQuest(questCRC, false);
+
+			if (questMessage) {
+				String questString = "@spacequest/" + questType + "/" + questName + ":title";
+
+				StringIdChatParameter spaceAbort("space/quest", "quest_aborted");
+				spaceAbort.setTO(questString);
+
+				player->sendSystemMessage(spaceAbort);
+
+				player->playMusicMessage("sound/music_themequest_fail_criminal.snd");
+			}
+		}
 	}
 
 	mission->abort();
+
+	// JTL Mission Abort to clear lua quest data
+	if (!questType.isEmpty()) {
+		Lua* lua = DirectorManager::instance()->getLuaInstance();
+
+		if (lua != nullptr) {
+			Reference<LuaFunction*> abortSpaceMission = lua->createFunction(questType + "_" + questName, "failQuest", 0);
+
+			*abortSpaceMission << player;
+			*abortSpaceMission << "false";
+			abortSpaceMission->callFunction();
+		}
+	}
 
 	removeMission(mission, player);
 }
@@ -824,7 +881,9 @@ void MissionManagerImplementation::randomizeGenericDestroyMission(CreatureObject
 			if (!result || waterHeight <= height) {
 				//Check that the position is outside cities.
 				SortedVector<ManagedReference<ActiveArea* > > activeAreas;
-				zone->getInRangeActiveAreas(startPos.getX(), startPos.getY(), &activeAreas, true);
+
+				zone->getInRangeActiveAreas(startPos.getX(), startPos.getZ(), startPos.getY(), &activeAreas, true);
+
 				for (int i = 0; i < activeAreas.size(); ++i) {
 					ActiveArea* area = activeAreas.get(i);
 

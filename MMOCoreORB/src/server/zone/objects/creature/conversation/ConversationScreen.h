@@ -12,6 +12,7 @@
 #include "server/zone/packets/object/StopNpcConversation.h"
 #include "server/zone/packets/object/StringList.h"
 #include "server/zone/objects/player/sessions/ConversationSession.h"
+#include "server/zone/managers/ship/tasks/SpaceCommTimerTask.h"
 
 namespace server {
 namespace zone {
@@ -72,6 +73,7 @@ class ConversationScreen : public Object {
 	UnicodeString customText;
 
 	String animation;
+	String playerAnimation;
 
 	Vector<Reference<ConversationOption*> > options;
 
@@ -81,6 +83,11 @@ public:
 	ConversationScreen() {
 		stopConversation = false;
 		readOnly = false;
+	}
+
+	ConversationScreen(StringIdChatParameter dialogue, bool stopConv) {
+		dialogText = dialogue;
+		stopConversation = stopConv;
 	}
 
 	/**
@@ -94,6 +101,7 @@ public:
 		readOnly = objectToCopy.readOnly;
 		customText = objectToCopy.customText;
 		animation = objectToCopy.animation;
+		playerAnimation = objectToCopy.playerAnimation;
 	}
 
 	ConversationScreen* cloneScreen() {
@@ -167,7 +175,7 @@ public:
 	 * @param player The player receiving the message.
 	 * @param npc The npc the player is talking to.
 	 */
-	void sendTo(CreatureObject* player, CreatureObject* npc) {
+	void sendTo(CreatureObject* player, SceneObject* npc) {
 		NpcConversationMessage* message;
 
 		if (customText.isEmpty())
@@ -190,19 +198,36 @@ public:
 		player->sendMessage(message);
 		player->sendMessage(optionsList);
 
-		if (!animation.isEmpty())
-			npc->doAnimation(animation);
+		CreatureObject* creo = npc->asCreatureObject();
+
+		if (!animation.isEmpty() && creo != nullptr) {
+			creo->doAnimation(animation);
+		}
+
+		if (!playerAnimation.isEmpty()) {
+			player->doAnimation(playerAnimation);
+		}
 
 		ConversationScreen* screenToSave = this;
 
 		//Check if the conversation should be stopped.
 		if (stopConversation) {
-			player->sendMessage(new StopNpcConversation(player, npc->getObjectID()));
-			npc->notifyObservers(ObserverEventType::STOPCONVERSATION, player);
+			if (npc->isShipAiAgent()) {
+				auto task = new SpaceCommTimerTask(player, npc->getObjectID());
+
+				if (task != nullptr) {
+					player->addPendingTask("SpaceCommTimer", task, 3000);
+				}
+			} else {
+				player->sendMessage(new StopNpcConversation(player, npc->getObjectID()));
+				npc->notifyObservers(ObserverEventType::STOPCONVERSATION, player);
+			}
+
 			screenToSave = nullptr;
 		}
 
 		Reference<ConversationSession*> session = player->getActiveSession(SessionFacadeType::CONVERSATION).castTo<ConversationSession* >();
+
 		if (session != nullptr) {
 			session->setLastConversationScreen(screenToSave);
 		}
@@ -217,6 +242,7 @@ public:
 		dialogText.setStringId(luaObject->getStringField("leftDialog"));
 		customText = luaObject->getStringField("customDialogText");
 		animation = luaObject->getStringField("animation");
+		playerAnimation = luaObject->getStringField("playerAnimation");
 
 		if (luaObject->getStringField("stopConversation").toLowerCase() == "true") {
 			stopConversation = true;

@@ -101,6 +101,7 @@ public:
 	const static int GARAGEINSTALLATION = 0x1006;
 	const static int SHUTTLEINSTALLATION = 0x1007;
 	const static int COVERTSCANNER = 0x1008;
+	const static int TURRET = 0x1009;
 	/// End **************
 
 	const static int TANGIBLE = 0x2000;  // MISC
@@ -142,7 +143,7 @@ public:
 	const static int PILOTCHAIR = 0x2024;
 	const static int OPERATIONSCHAIR = 0x2025;
 	const static int TURRETACCESSLADDER = 0x2026;
-	const static int CONTAINER2 = 0x2027;
+	const static int SHIPCONTAINER = 0x2027;
 
 	/// Not in client *****************
 	const static int CAMOKIT = 0x2028;
@@ -166,6 +167,11 @@ public:
 	const static int FSBUFFITEM = 0x203A;
 	const static int CONTRACTCRATE = 0x203B;
 	const static int DEADEYEPROTOTYPE = 0x203C;
+	const static int LIGHTOBJECT = 0x203D;
+	const static int SPACESPAWNER = 0x203E;
+	const static int CREDITCHIP = 0x203F;
+	const static int COMPONENTANALYSISTOOL = 0x2040;
+	const static int SCHEMATICFRAGMENT = 0x2041;
 	/// End Not in client **************
 
 	const static int TERMINAL = 0x4000;
@@ -180,6 +186,7 @@ public:
 	const static int SHIPPINGTERMINAL = 0x4009;
 	//const static int TRAVELTERMINAL = 0x400A; -- This is in the client, (See 0x4012)
 	const static int SPACETERMINAL = 0x400B;
+	const static int SHIPPERMISSIONS = 0x400C;
 
 	/// Not in client **************
 	const static int INTERACTIVETERMINAL = 0x400C;
@@ -294,6 +301,7 @@ public:
 
 	// Not in client ************
 	const static int RESOURCESPAWN = 0x410000;
+	const static int CREATURESPAWNER = 0x410001;
 	// **************************
 
 	const static int DEED = 0x800000;
@@ -302,11 +310,13 @@ public:
 	const static int PETDEED = 0x800003;
 	const static int DROIDDEED = 0x800004;
 	const static int VEHICLEDEED = 0x800005;
-	const static int RESOURCEDEED = 0x800006;
 
 	// Not in client **********
+	const static int RESOURCEDEED = 0x800006;
 	const static int EVENTPERKDEED = 0x800007;
 	const static int VETHARVESTERDEED = 0x800008;
+	const static int SHIPDEED = 0x800009;
+	const static int NAVICOMPUTERDEED = 0x80000A;
 	// ************************
 
 	const static int CLOTHING = 0x1000000;
@@ -325,15 +335,13 @@ public:
 	const static int ROBE = 0x100000D;
 	const static int SHIRT = 0x100000E;
 	const static int VEST = 0x100000F;
-	const static int WOOKIEGARB = 0x1000010;
+	const static int WOOKIEEGARB = 0x1000010;
 	const static int MISCCLOTHING = 0x1000011;
 	const static int SKIRT = 0x1000012;
 
 	//Seems unused in server and not in client
 	//const static int ITHOGARB = 0x1000013;
 
-
-	// Not in client ************
 	const static int BADGEAREA = 0x2000000;
 	const static int REGIONAREA = 0x2000001;
 	const static int MISSIONSPAWNAREA = 0x2000002;
@@ -343,14 +351,23 @@ public:
 	const static int CAMPAREA = 0x2000009;
 	const static int FSVILLAGEAREA = 0x200000A;
 	const static int SARLACCAREA = 0x200000B;
-
 	const static int NAVMESHAREA = 0x200000C;
+	const static int SPACEACTIVEAREA = 0x200000D;
+	const static int NEBULAAREA = 0x200000E;
+	const static int SPACEREGIONAREA = 0x200000F;
+	const static int SPACESPAWNAREA = 0x2000010;
 
 	const static int SHIP = 0x20000000;
 	const static int SHIPFIGHTER = 0x20000001;
 	const static int SHIPCAPITAL = 0x20000002;
-	const static int SHIPSTATION = 0x20000003;
+	const static int SPACEOBJECT = 0x20000003;
 	const static int SHIPTRANSPORT = 0x20000004;
+
+	// Not in client ************
+	const static int SHIPPOB = 0x20000005;
+	const static int SHIPMULTIPASSENGER = 0x20000006;
+	const static int SHIPAGENT = 0x20000007;
+	const static int SPACESTATION = 0x20000008;
 	//*******************************
 
 	const static int SHIPATTACHMENT = 0x40000000;
@@ -361,7 +378,7 @@ public:
 	const static int SHIPWEAPON = 0x40000005;
 	const static int SHIPWEAPONCAPACITOR = 0x40000006;
 	const static int SHIPBOOSTER = 0x40000007;
-	const static int SHIPDRIODINTERFACE = 0x40000008;
+	const static int SHIPDROIDINTERFACE = 0x40000008;
 	const static int HANGER = 0x40000009;
 	const static int TARGETINGSTATION = 0x4000000A;
 	const static int BRIDGE = 0x4000000B;
@@ -370,6 +387,18 @@ public:
 	const static int SHIPCOUNTERMEASURE = 0x4000000E;
 	const static int SHIPWEAPONLAUNCHER = 0x4000000F;
 	const static int SHIPCOUNTERMEASURELAUNCHER = 0x40000010;
+
+	// Not in client ************
+	const static int SHIPINTERIORCOMPONENT = 0x40000011;
+	const static int SHIPPLASMACONDUIT = 0x40000012;
+	const static int SHIPARMORSUBCOMPONENT = 0x40000013;
+	const static int SHIPBOOSTERSUBCOMPONENT = 0x40000014;
+	const static int SHIPCAPACITORSUBCOMPONENT = 0x40000015;
+	const static int SHIPDROIDINTERFACESUBCOMPONENT = 0x40000016;
+	const static int SHIPENGINESUBCOMPONENT = 0x40000017;
+	const static int SHIPREACTORSUBCOMPONENT = 0x40000018;
+	const static int SHIPSHIELDSUBCOMPONENT = 0x40000019;
+	const static int SHIPWEAPONSUBCOMPONENT = 0x40000020;
 
 public:
 	static const String typeToString(int gameObjectType);

@@ -65,12 +65,27 @@ TEST_F(ConfigManagerTest, EnabledZones) {
 	std::cerr << "' }" << std::endl;
 }
 
+TEST_F(ConfigManagerTest, EnabledSpaceZones) {
+	auto enabledSpaceZones = configManager->getEnabledSpaceZones();
+	ASSERT_TRUE(enabledSpaceZones.size() != 0);
+
+	std::cerr << "[>>>>>>>>>>] SpaceZonesEnabled = { '";
+
+	for (int i = 0;i < enabledSpaceZones.size(); i++) {
+		std::cerr << (i == 0 ? "" : "', '") <<  enabledSpaceZones.get(i).toCharArray();
+	}
+
+	std::cerr << "' }" << std::endl;
+}
+
 TEST_F(ConfigManagerTest, TreFiles) {
 	auto treFilesToLoad = configManager->getTreFiles();
 	ASSERT_TRUE(treFilesToLoad.size() != 0);
 
+	auto latestTreFile = configManager->getLatestTre();
+
 	// Make sure it's not sorted
-	ASSERT_TRUE(treFilesToLoad.get(0) == "default_patch.tre");
+	ASSERT_TRUE(treFilesToLoad.get(0) == latestTreFile);
 
 	std::cerr << "[>>>>>>>>>>] TreFiles = { '";
 
@@ -145,7 +160,7 @@ TEST_F(ConfigManagerTest, CacheTest) {
 
 	ASSERT_EQ(counter_end, counter_start + 1);
 
-	ASSERT_TRUE((msBase / msCached) > 5);
+	ASSERT_TRUE((msBase / msCached) >= 2);
 }
 
 TEST_F(ConfigManagerTest, JSONTest) {

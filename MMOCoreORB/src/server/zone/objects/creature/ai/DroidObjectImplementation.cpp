@@ -13,6 +13,7 @@
 #include "server/zone/objects/tangible/components/droid/DroidCraftingModuleDataComponent.h"
 #include "server/zone/objects/tangible/components/droid/DroidPersonalityModuleDataComponent.h"
 #include "server/zone/objects/tangible/components/droid/DroidMaintenanceModuleDataComponent.h"
+#include "server/zone/objects/tangible/components/droid/DroidDataStorageModuleDataComponent.h"
 #include "server/zone/objects/structure/StructureObject.h"
 #include "server/zone/objects/creature/conversation/ConversationObserver.h"
 #include "server/zone/objects/tangible/weapon/WeaponObject.h"
@@ -42,7 +43,7 @@ void DroidObjectImplementation::fillAttributeList(AttributeListMessage* msg, Cre
 				continue;
 			}
 
-			module->fillAttributeList(msg, object);
+			module->fillAttributeList(msg, _this.getReferenceUnsafeStaticCast());
 		}
 	}
 }
@@ -379,6 +380,18 @@ bool DroidObjectImplementation::isCombatDroid() {
 	return false;
 }
 
+bool DroidObjectImplementation::isBombDroid() {
+	for (int i = 0; i < modules.size(); i++) {
+		auto& module = modules.get(i);
+
+		if (module->isDetonationModule()) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 bool DroidObjectImplementation::isTrapDroid() {
 	for (int i = 0; i < modules.size(); i++) {
 		auto& module = modules.get(i);
@@ -488,7 +501,7 @@ bool DroidObjectImplementation::sendConversationStartTo(SceneObject* player) {
 	broadcastNextPositionUpdate(&current);
 
 	CreatureObject* playerCreature = cast<CreatureObject*>(player);
-	StartNpcConversation* conv = new StartNpcConversation(playerCreature, getObjectID(), "");
+	StartNpcConversation* conv = new StartNpcConversation(playerCreature, getObjectID(), 0, "");
 	player->sendMessage(conv);
 
 	SortedVector<ManagedReference<Observer*> > observers = getObservers(ObserverEventType::STARTCONVERSATION);

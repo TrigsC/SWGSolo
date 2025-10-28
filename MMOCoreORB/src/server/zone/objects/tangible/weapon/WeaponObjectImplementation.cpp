@@ -150,8 +150,6 @@ void WeaponObjectImplementation::createChildObjects() {
 }
 
 void WeaponObjectImplementation::sendBaselinesTo(SceneObject* player) {
-	debug("sending weapon object baselines");
-
 	BaseMessage* weao3 = new WeaponObjectMessage3(_this.getReferenceUnsafeStaticCast());
 	player->sendMessage(weao3);
 
@@ -339,12 +337,15 @@ void WeaponObjectImplementation::fillAttributeList(AttributeListMessage* alm, Cr
 	maxrange << getMaxRangeAccuracy() << " @ " << getMaxRange() << "m";
 	alm->insertAttribute("cat_wpn_rangemods.wpn_range_max", maxrange);
 
-	//Special Attack Costs
-	alm->insertAttribute("cat_wpn_attack_cost.health", getHealthAttackCost());
+	// Show special attack cost for all weapons except mines
+	if (getGameObjectType() != SceneObjectType::MINE) {
+		//Special Attack Costs
+		alm->insertAttribute("cat_wpn_attack_cost.health", getHealthAttackCost());
 
-	alm->insertAttribute("cat_wpn_attack_cost.action", getActionAttackCost());
+		alm->insertAttribute("cat_wpn_attack_cost.action", getActionAttackCost());
 
-	alm->insertAttribute("cat_wpn_attack_cost.mind", getMindAttackCost());
+		alm->insertAttribute("cat_wpn_attack_cost.mind", getMindAttackCost());
+	}
 
 	//Anti Decay Kit
 	if(hasAntiDecayKit()){

@@ -42,7 +42,7 @@
 
 
 object_tangible_ship_crafted_weapon_max_damage_intensifier_mk2 = object_tangible_ship_crafted_weapon_shared_max_damage_intensifier_mk2:new {
-
+	gameObjectType = 1073741856,
 
 	numberExperimentalProperties = {1, 1, 2, 2},
 	experimentalProperties = {"XX", "XX", "CD", "OQ", "CD", "OQ"},
@@ -51,7 +51,7 @@ object_tangible_ship_crafted_weapon_max_damage_intensifier_mk2 = object_tangible
 	experimentalSubGroupTitles = {"null", "null", "damage_min", "damage_max"},
 	experimentalMin = {0, 0, -70, 73},
 	experimentalMax = {0, 0, -52, 99},
-	experimentalPrecision = {0, 0, 0, 0},
+	experimentalPrecision = {0, 0, 1, 1},
 	experimentalCombineType = {0, 0, 1, 1},
 }
 
