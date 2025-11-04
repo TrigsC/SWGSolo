@@ -12,6 +12,10 @@ The SWGEmu project is not only a nostalgic journey for passionate players but al
 
 If you have any questions, need support, or want to contribute to the SWGEmu project, please refer to the documentation and resources provided in this repository.
 
+## Bazaar Market Seeder
+
+An in-band market seeder screenplay is available to create a test listing on the Mos Eisley bazaar. By default it is dormant; to enable it on server boot set `runOnceOnBoot = true` in `MMOCoreORB/bin/scripts/screenplays/custom/market_seeder.lua`. Administrators can trigger it manually in game with `/seed_market test` (requires privileged status). The listing template, price, duration, and bazaar coordinates can be adjusted at the top of the screenplay file.
+
 ## Docker Build
 
 If you have docker (i.e. Linux docker daemon, Windows/MacOS [Docker Desktop](https://www.docker.com/products/docker-desktop/)) you can run the entire development environment and server in a container.
