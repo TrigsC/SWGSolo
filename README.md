@@ -12,6 +12,10 @@ The SWGEmu project is not only a nostalgic journey for passionate players but al
 
 If you have any questions, need support, or want to contribute to the SWGEmu project, please refer to the documentation and resources provided in this repository.
 
+## Bazaar Market Seeder
+
+An in-band market seeder screenplay is available to create a test listing on the Mos Eisley bazaar. By default it is dormant; to enable it on server boot set `runOnceOnBoot = true` in `MMOCoreORB/bin/scripts/screenplays/custom/market_seeder.lua`. Administrators can trigger it manually in game with `/seedmarket test` (requires privileged status). The listing template, price, duration, and bazaar coordinates can be adjusted at the top of the screenplay file.
+
 ## Docker Build
 
 If you have docker (i.e. Linux docker daemon, Windows/MacOS [Docker Desktop](https://www.docker.com/products/docker-desktop/)) you can run the entire development environment and server in a container.
@@ -74,6 +78,23 @@ Inside the container type:
 
 ```
 run
+```
+
+If you lose connection to the container
+
+```
+cd to the docker dir
+source ./env-run
+source ./env-base
+# Check status
+docker ps -a --filter "name=$GALAXY_NAME"
+#if it stopped
+docker start "$GALAXY_NAME"
+docker exec -it "$GALAXY_NAME" bash
+# If running, get back to old shell
+docker start -ai "$GALAXY_NAME"   # attaches to the main process
+If you want to open another connection
+docker exec -it "$GALAXY_NAME" bash    # or /bin/sh if bash isn’t installed
 ```
 
 ## Windows Subsystem for Linux Setup

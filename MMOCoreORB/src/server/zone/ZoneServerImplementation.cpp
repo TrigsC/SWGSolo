@@ -348,6 +348,8 @@ void ZoneServerImplementation::startManagers() {
 	//Loads the FactionManager LUA Config.
 	FactionManager::instance()->loadData();
 
+	auctionManager->initialize();
+
 	//Start global screen plays
 	DirectorManager::instance()->loadPersistentEvents();
 	DirectorManager::instance()->loadPersistentStatus();
@@ -362,8 +364,6 @@ void ZoneServerImplementation::startManagers() {
 			zone->updateCityRegions();
 		}
 	}
-
-	auctionManager->initialize();
 
 	frsManager = new FrsManager(_this.getReferenceUnsafeStaticCast());
 	frsManager->initialize();

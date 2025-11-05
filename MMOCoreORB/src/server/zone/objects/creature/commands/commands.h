@@ -607,6 +607,7 @@
 #include "ScriptCommand.h"
 #include "SearchCorpseCommand.h"
 #include "SecretSpawnSpamCommand.h"
+#include "SeedMarketCommand.h"
 #include "SeGogglesCommand.h"
 #include "SelectDraftSchematicCommand.h"
 #include "ServerCommand.h"
