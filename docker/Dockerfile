@@ -132,7 +132,7 @@ ENV STATUSPORT=${PORT_GROUP}455 \
     ADMIN_USER=admin \
     REPOS='Core3' \
     REPO_PUBLIC_URL=https://github.com/TrigsC/SWGSolo.git \
-    REPO_PUBLIC_BRANCH='main'
+    REPO_PUBLIC_BRANCH='unstable'
 
 ENV PATH=${HOME_DIR}/bin:/usr/local/bin:${PATH}
 
