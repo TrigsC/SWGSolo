@@ -45,8 +45,10 @@ docker run -it \
     -p ${SSHPORT}:${SSHPORT}/tcp \
     -p ${LOGINPORT}:${LOGINPORT}/udp \
     -p ${STATUSPORT}:${STATUSPORT}/tcp \
+    -p ${RESTPORT}:${RESTPORT}/tcp \
     -p ${PINGPORT}:${PINGPORT}/udp \
     -p ${ZONESERVERPORT}:${ZONESERVERPORT}/udp \
+    -p ${WEBPORT}:${WEBPORT}/tcp \
     -v shared-tre:/tre:ro \
     -v swgemu-core3:/home/swgemu \
     ${IMAGE}

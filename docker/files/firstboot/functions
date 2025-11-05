@@ -70,8 +70,17 @@ core3_clone() {
     msg "Setup Core3 source code.."
     mkdir -vp ${HOME_DIR}/workspace
     cd ${HOME_DIR}/workspace
-    git clone --progress ${REPO_PUBLIC_URL}/Core3.git
-    cd Core3
+
+    local repo_dir="Core3"
+    local repo_url="${REPO_PUBLIC_URL}"
+
+    if [[ "${repo_url}" == *.git ]]; then
+        git clone --progress "${repo_url}" "${repo_dir}"
+    else
+        git clone --progress "${repo_url%/}/Core3.git" "${repo_dir}"
+    fi
+
+    cd "${repo_dir}"
     echo 'MMOCoreORB/bin/scripts/managers/resource_manager_spawns.lua' >> .git/info/exclude
     git update-index --assume-unchanged MMOCoreORB/bin/scripts/managers/resource_manager_spawns.lua
     git checkout ${REPO_PUBLIC_BRANCH}

@@ -124,17 +124,19 @@ ENV STATUSPORT=${PORT_GROUP}455 \
     LOGINPORT=${PORT_GROUP}453 \
     PINGPORT=${PORT_GROUP}462 \
     ZONESERVERPORT=${PORT_GROUP}463 \
+    RESTPORT=44443 \
+    WEBPORT=44480 \
     WITH_GDB=true \
     SSHPORT=2222 \
     DBUSER=swgemu \
     ADMIN_USER=admin \
     REPOS='Core3' \
-    REPO_PUBLIC_URL=https://github.com/swgemu \
-    REPO_PUBLIC_BRANCH='unstable'
+    REPO_PUBLIC_URL=https://github.com/TrigsC/SWGSolo.git \
+    REPO_PUBLIC_BRANCH='main'
 
 ENV PATH=${HOME_DIR}/bin:/usr/local/bin:${PATH}
 
-EXPOSE ${STATUSPORT}/tcp ${LOGINPORT}/udp ${PINGPORT}/udp ${ZONESERVERPORT}/udp
+EXPOSE ${STATUSPORT}/tcp ${LOGINPORT}/udp ${PINGPORT}/udp ${ZONESERVERPORT}/udp ${RESTPORT}/tcp ${WEBPORT}/tcp
 
 COPY files /
 
