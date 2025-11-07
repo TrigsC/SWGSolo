@@ -187,8 +187,8 @@ using namespace server::zone::managers::objectcontroller::command;
 
 
 void CommandConfigManager::registerCommands4() {
-        commandFactory.registerCommand<SeedMarketCommand>(String("seed_market").toLowerCase());
-        commandFactory.registerCommand<SuppressionFire1Command>(String("suppressionFire1").toLowerCase());
+    commandFactory.registerCommand<SeedMarketCommand>(String("seedMarket").toLowerCase());
+    commandFactory.registerCommand<SuppressionFire1Command>(String("suppressionFire1").toLowerCase());
 	commandFactory.registerCommand<SuppressionFire2Command>(String("suppressionFire2").toLowerCase());
 	commandFactory.registerCommand<SurpriseShotCommand>(String("surpriseShot").toLowerCase());
 	commandFactory.registerCommand<SurrenderSkillCommand>(String("surrenderSkill").toLowerCase());
@@ -328,3 +328,4 @@ void CommandConfigManager::registerCommands4() {
 	commandFactory.registerCommand<InspacerrCommand>(String("inspacerr").toLowerCase());
 	commandFactory.registerCommand<RequestSpaceTrainerCommand>(String("requestSpaceTrainer").toLowerCase());
 }
+
