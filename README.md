@@ -80,6 +80,23 @@ Inside the container type:
 run
 ```
 
+If you lose connection to the container
+
+```
+cd to the docker dir
+source ./env-run
+source ./env-base
+# Check status
+docker ps -a --filter "name=$GALAXY_NAME"
+#if it stopped
+docker start "$GALAXY_NAME"
+docker exec -it "$GALAXY_NAME" bash
+# If running, get back to old shell
+docker start -ai "$GALAXY_NAME"   # attaches to the main process
+If you want to open another connection
+docker exec -it "$GALAXY_NAME" bash    # or /bin/sh if bash isn’t installed
+```
+
 ## Windows Subsystem for Linux Setup
 
 There is an automated setup available for Windows 10+ with WSL.
