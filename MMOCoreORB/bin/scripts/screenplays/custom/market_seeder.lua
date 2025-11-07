@@ -4,7 +4,7 @@ MarketSeeder = {
     testPrice = 12345,
     testDurationHours = 24,
     template = "/object/tangible/medicine/instant_stimpack/shared_stimpack_b.iff",
-    runOnceOnBoot = false,
+    runOnceOnBoot = true,
     _hasSeeded = false
 }
 
