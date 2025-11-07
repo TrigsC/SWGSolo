@@ -77,9 +77,10 @@ CreatureObject* MarketSeederBridge::ensureSystemSeller(Zone* zone) {
         Locker sellerLocker(created);
 
         ManagedReference<PlayerObject*> ghost = created->getPlayerObject();
+        
         created->setFirstName("MarketSeeder");
         created->setLastName("System");
-        created->setCustomObjectName("Market Seeder", true);
+        bool notifyCustomName = ghost != nullptr;
 
         if (!notifyCustomName) {
                 marketSeederLogger().warning() << "ensureSystemSeller: created creature missing PlayerObject; skipping client custom name update";
