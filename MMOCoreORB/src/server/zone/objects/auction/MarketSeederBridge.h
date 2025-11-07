@@ -8,19 +8,21 @@
 #include "server/zone/objects/scene/SceneObject.h"
 #include "server/zone/objects/creature/CreatureObject.h"
 
+class Zone;
+
 struct lua_State;
 
 class MarketSeederBridge {
 public:
         static bool listOnBazaar(SceneObject* item, CreatureObject* seller, const String& planet, float x, float y, int price, int durationHours);
 
-        static CreatureObject* getSystemSeller();
+        static CreatureObject* getSystemSeller(Zone* zone);
 
         static int luaListOnBazaar(lua_State* L);
         static int luaGetSystemSeller(lua_State* L);
 
 private:
-        static CreatureObject* ensureSystemSeller();
+        static CreatureObject* ensureSystemSeller(Zone* zone);
         static SceneObject* findBazaarTerminal(Zone* zone, float x, float y, float searchRadius);
 };
 

@@ -41,7 +41,7 @@ function MarketSeeder:getSeller()
         return nil
     end
 
-    local pSeller = MarketSeederBridge.getSystemSeller()
+    local pSeller = MarketSeederBridge.getSystemSeller(self.planet)
 
     if pSeller ~= nil then
         self._seller = pSeller

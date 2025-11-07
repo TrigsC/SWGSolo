@@ -34,7 +34,7 @@ static Logger& marketSeederLogger() {
         return logger;
 }
 
-CreatureObject* MarketSeederBridge::ensureSystemSeller() {
+CreatureObject* MarketSeederBridge::ensureSystemSeller(Zone* zone) {
         ManagedReference<CreatureObject*> seller = systemSellerRef;
 
         if (seller != nullptr)
@@ -47,22 +47,25 @@ CreatureObject* MarketSeederBridge::ensureSystemSeller() {
         if (seller != nullptr)
                 return seller.get();
 
-        ZoneServer* zoneServer = ServerCore::getZoneServer();
-
-        if (zoneServer == nullptr) {
-                marketSeederLogger().error() << "ensureSystemSeller: Zone server unavailable";
+        if (zone == nullptr) {
+                marketSeederLogger().error() << "ensureSystemSeller: Zone unavailable";
                 return nullptr;
         }
 
-        ManagedReference<CreatureManager*> creatureManager = zoneServer->getCreatureManager();
+        ManagedReference<CreatureManager*> creatureManager = zone->getCreatureManager();
 
         if (creatureManager == nullptr) {
-                marketSeederLogger().error() << "ensureSystemSeller: CreatureManager unavailable";
+                marketSeederLogger().error() << "ensureSystemSeller: CreatureManager unavailable for zone " << zone->getZoneName();
                 return nullptr;
         }
 
-        const String templatePath("/object/mobile/shared_dressed_commoner_tatooine_male_01.iff");
+        const String templatePath("/object/creature/player/shared_player_human_m.iff");
         uint32 templateCRC = templatePath.hashCode();
+
+        if (TemplateManager::instance()->getTemplate(templateCRC) == nullptr) {
+                marketSeederLogger().error() << "ensureSystemSeller: Template not found " << templatePath;
+                return nullptr;
+        }
 
         ManagedReference<CreatureObject*> created = creatureManager->createCreature(templateCRC, false);
 
@@ -76,8 +79,18 @@ CreatureObject* MarketSeederBridge::ensureSystemSeller() {
         created->setFirstName("MarketSeeder");
         created->setLastName("System");
         created->setCustomObjectName("Market Seeder", true);
-        created->setBankCredits(500000);
-        created->setCashCredits(500000);
+
+        ManagedReference<PlayerObject*> ghost = created->getPlayerObject();
+
+        if (ghost == nullptr) {
+                marketSeederLogger().error() << "ensureSystemSeller: created creature missing PlayerObject";
+                created->destroyObjectFromWorld(true);
+                created->destroyObjectFromDatabase(true);
+                return nullptr;
+        }
+
+        created->addBankCredits(AuctionManager::SALESFEE * 50, false);
+        created->addCashCredits(AuctionManager::SALESFEE * 50, false);
 
         systemSellerRef = created;
 
@@ -86,8 +99,8 @@ CreatureObject* MarketSeederBridge::ensureSystemSeller() {
         return created;
 }
 
-CreatureObject* MarketSeederBridge::getSystemSeller() {
-        return ensureSystemSeller();
+CreatureObject* MarketSeederBridge::getSystemSeller(Zone* zone) {
+        return ensureSystemSeller(zone);
 }
 
 SceneObject* MarketSeederBridge::findBazaarTerminal(Zone* zone, float x, float y, float searchRadius) {
@@ -140,17 +153,24 @@ bool MarketSeederBridge::listOnBazaar(SceneObject* item, CreatureObject* seller,
                 return false;
         }
 
-        CreatureObject* resolvedSeller = seller != nullptr ? seller : getSystemSeller();
+        Zone* zone = zoneServer->getZone(planet);
+
+        if (zone == nullptr) {
+                marketSeederLogger().error() << "listOnBazaar: Unable to resolve zone for planet " << planet;
+                return false;
+        }
+
+        CreatureObject* resolvedSeller = seller != nullptr ? seller : getSystemSeller(zone);
 
         if (resolvedSeller == nullptr) {
                 marketSeederLogger().error() << "listOnBazaar: Unable to resolve seller";
                 return false;
         }
 
-        Zone* zone = zoneServer->getZone(planet);
+        ManagedReference<PlayerObject*> sellerGhost = resolvedSeller->getPlayerObject();
 
-        if (zone == nullptr) {
-                marketSeederLogger().error() << "listOnBazaar: Unable to resolve zone for planet " << planet;
+        if (sellerGhost == nullptr) {
+                marketSeederLogger().error() << "listOnBazaar: Seller " << resolvedSeller->getObjectID() << " missing PlayerObject";
                 return false;
         }
 
@@ -184,13 +204,13 @@ bool MarketSeederBridge::listOnBazaar(SceneObject* item, CreatureObject* seller,
 
         if (resolvedSeller->getBankCredits() < AuctionManager::SALESFEE * 10) {
                 Locker sellerLocker(resolvedSeller);
-                resolvedSeller->setBankCredits(AuctionManager::SALESFEE * 50);
+                resolvedSeller->addBankCredits(AuctionManager::SALESFEE * 50, false);
         }
 
         if (durationHours <= 0)
                 durationHours = 24;
 
-        UnicodeString description(L"Market Seeder test listing");
+        UnicodeString description("Market Seeder test listing");
 
         auctionManager->addSaleItem(resolvedSeller, item->getObjectID(), vendor, description, price, durationHours, false, false);
 
@@ -208,7 +228,34 @@ bool MarketSeederBridge::listOnBazaar(SceneObject* item, CreatureObject* seller,
 }
 
 int MarketSeederBridge::luaGetSystemSeller(lua_State* L) {
-        CreatureObject* seller = getSystemSeller();
+        Zone* zone = nullptr;
+        ZoneServer* zoneServer = ServerCore::getZoneServer();
+
+        if (zoneServer == nullptr) {
+                marketSeederLogger().error() << "luaGetSystemSeller: Zone server unavailable";
+                lua_pushnil(L);
+                return 1;
+        }
+
+        int argumentCount = lua_gettop(L);
+
+        if (argumentCount >= 1 && lua_isstring(L, 1)) {
+                String requestedPlanet = lua_tostring(L, 1);
+
+                if (!requestedPlanet.isEmpty())
+                        zone = zoneServer->getZone(requestedPlanet);
+        }
+
+        if (zone == nullptr)
+                zone = zoneServer->getZone("tatooine");
+
+        if (zone == nullptr) {
+                marketSeederLogger().error() << "luaGetSystemSeller: Unable to resolve zone for system seller";
+                lua_pushnil(L);
+                return 1;
+        }
+
+        CreatureObject* seller = getSystemSeller(zone);
 
         if (seller != nullptr)
                 lua_pushlightuserdata(L, seller);
