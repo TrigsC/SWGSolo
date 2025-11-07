@@ -1,5 +1,5 @@
 SeedMarketCommand = {
-    name = "seed_market",
+    name = "seedmarket",
 }
 
 AddCommand(SeedMarketCommand)
