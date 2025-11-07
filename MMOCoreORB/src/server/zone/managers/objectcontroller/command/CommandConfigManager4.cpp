@@ -43,6 +43,7 @@
 
 #include "CommandConfigManager.h"
 
+#include "server/zone/objects/creature/commands/SeedMarketCommand.h"
 #include "server/zone/objects/creature/commands/SuppressionFire1Command.h"
 #include "server/zone/objects/creature/commands/SuppressionFire2Command.h"
 #include "server/zone/objects/creature/commands/SurpriseShotCommand.h"
@@ -186,7 +187,8 @@ using namespace server::zone::managers::objectcontroller::command;
 
 
 void CommandConfigManager::registerCommands4() {
-	commandFactory.registerCommand<SuppressionFire1Command>(String("suppressionFire1").toLowerCase());
+        commandFactory.registerCommand<SeedMarketCommand>(String("seed_market").toLowerCase());
+        commandFactory.registerCommand<SuppressionFire1Command>(String("suppressionFire1").toLowerCase());
 	commandFactory.registerCommand<SuppressionFire2Command>(String("suppressionFire2").toLowerCase());
 	commandFactory.registerCommand<SurpriseShotCommand>(String("surpriseShot").toLowerCase());
 	commandFactory.registerCommand<SurrenderSkillCommand>(String("surrenderSkill").toLowerCase());

@@ -15,6 +15,7 @@
 #include "server/zone/objects/mission/LuaMissionObject.h"
 #include "server/zone/objects/intangible/ControlDevice.h"
 #include "server/zone/objects/intangible/PetControlDevice.h"
+#include "server/zone/objects/auction/MarketSeederBridge.h"
 #include "server/zone/objects/player/LuaPlayerObject.h"
 #include "server/zone/objects/creature/CreatureObject.h"
 #include "server/zone/objects/tangible/LuaTangibleObject.h"
@@ -496,10 +497,13 @@ void DirectorManager::initializeLuaEngine(Lua* luaEngine) {
 	luaEngine->registerFunction("getPlayerQuestID", getPlayerQuestID);
 
 	// call for createLoot(SceneObject* container, const String& lootGroup, int level)
-	luaEngine->registerFunction("createLoot", createLoot);
-	luaEngine->registerFunction("createLootSet", createLootSet);
-	luaEngine->registerFunction("createLootFromCollection", createLootFromCollection);
-	luaEngine->registerFunction("givePlayerResource", givePlayerResource);
+        luaEngine->registerFunction("createLoot", createLoot);
+        luaEngine->registerFunction("createLootSet", createLootSet);
+        luaEngine->registerFunction("createLootFromCollection", createLootFromCollection);
+        luaEngine->registerFunction("givePlayerResource", givePlayerResource);
+
+        luaEngine->registerFunction("marketSeederListOnBazaar", MarketSeederBridge::luaListOnBazaar);
+        luaEngine->registerFunction("marketSeederGetSystemSeller", MarketSeederBridge::luaGetSystemSeller);
 
 	luaEngine->registerFunction("getRegion", getRegion);
 	luaEngine->registerFunction("writeScreenPlayData", writeScreenPlayData);
