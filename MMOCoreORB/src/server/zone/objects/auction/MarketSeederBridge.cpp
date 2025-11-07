@@ -77,47 +77,17 @@ CreatureObject* MarketSeederBridge::ensureSystemSeller(Zone* zone) {
         Locker sellerLocker(created);
 
         ManagedReference<PlayerObject*> ghost = created->getPlayerObject();
-
-        if (ghost == nullptr) {
-                ZoneServer* zoneServer = zone->getZoneServer();
-
-                if (zoneServer == nullptr) {
-                        marketSeederLogger().error() << "ensureSystemSeller: ZoneServer unavailable while creating PlayerObject for system seller";
-                } else {
-                        const uint32 playerGhostTemplate = String("object/player/player.iff").hashCode();
-                        ManagedReference<SceneObject*> ghostObject = zoneServer->createObject(playerGhostTemplate, false);
-
-                        if (ghostObject == nullptr) {
-                                marketSeederLogger().error() << "ensureSystemSeller: Failed to create PlayerObject child for system seller";
-                        } else if (!ghostObject->isPlayerObject()) {
-                                marketSeederLogger().error() << "ensureSystemSeller: Created ghost child was not a PlayerObject";
-                                ghostObject->destroyObjectFromDatabase(true);
-                        } else {
-                                Locker ghostLocker(ghostObject, created);
-
-                                ghostObject->setContainmentType(4);
-
-                                if (!created->transferObject(ghostObject, 4)) {
-                                        marketSeederLogger().error() << "ensureSystemSeller: Unable to transfer PlayerObject child into system seller";
-                                        ghostObject->destroyObjectFromDatabase(true);
-                                } else {
-                                        ghost = ghostObject.castTo<PlayerObject*>();
-                                }
-                        }
-                }
-
-        }
-
-        if (ghost == nullptr) {
-                marketSeederLogger().error() << "ensureSystemSeller: created creature missing PlayerObject";
-                created->destroyObjectFromWorld(true);
-                created->destroyObjectFromDatabase(true);
-                return nullptr;
-        }
-  
         created->setFirstName("MarketSeeder");
         created->setLastName("System");
         created->setCustomObjectName("Market Seeder", true);
+
+        if (!notifyCustomName) {
+                marketSeederLogger().warning() << "ensureSystemSeller: created creature missing PlayerObject; skipping client custom name update";
+        }
+
+        created->setCustomObjectName("Market Seeder", notifyCustomName);
+  
+
 
         created->addBankCredits(AuctionManager::SALESFEE * 50, false);
         created->addCashCredits(AuctionManager::SALESFEE * 50, false);
@@ -197,11 +167,8 @@ bool MarketSeederBridge::listOnBazaar(SceneObject* item, CreatureObject* seller,
                 return false;
         }
 
-        ManagedReference<PlayerObject*> sellerGhost = resolvedSeller->getPlayerObject();
-
-        if (sellerGhost == nullptr) {
-                marketSeederLogger().error() << "listOnBazaar: Seller " << resolvedSeller->getObjectID() << " missing PlayerObject";
-                return false;
+        if (resolvedSeller->getPlayerObject() == nullptr) {
+                marketSeederLogger().warning() << "listOnBazaar: Seller " << resolvedSeller->getObjectID() << " missing PlayerObject; continuing";
         }
 
         SceneObject* vendor = findBazaarTerminal(zone, x, y, 32.0f);
