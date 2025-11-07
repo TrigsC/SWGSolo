@@ -59,7 +59,7 @@ CreatureObject* MarketSeederBridge::ensureSystemSeller(Zone* zone) {
                 return nullptr;
         }
 
-        const String templatePath("/object/creature/player/shared_player_human_m.iff");
+        const String templatePath("object/creature/player/human_male.iff");
         uint32 templateCRC = templatePath.hashCode();
 
         if (TemplateManager::instance()->getTemplate(templateCRC) == nullptr) {
