@@ -17,13 +17,19 @@ public:
         static bool listOnBazaar(SceneObject* item, CreatureObject* seller, const String& planet, float x, float y, int price, int durationHours);
 
         static CreatureObject* getSystemSeller(server::zone::Zone* zone);
+        static SceneObject* createItemForSeller(CreatureObject* seller, SceneObject* container, const String& templatePath, int slot = -1, bool allowOverflow = false);
 
         static int luaListOnBazaar(lua_State* L);
         static int luaGetSystemSeller(lua_State* L);
+        static int luaTemplateExists(lua_State* L);
+        static int luaCreateItemForSeller(lua_State* L);
 
 private:
     static CreatureObject* ensureSystemSeller(server::zone::Zone* zone);
     static SceneObject*    findBazaarTerminal(server::zone::Zone* zone, float x, float y, float searchRadius);
+    static CreatureObject* ensureSystemSeller(server::zone::Zone* zone);
+    static SceneObject* findBazaarTerminal(server::zone::Zone* zone, float x, float y, float searchRadius);
+    static bool templateExists(const String& templatePath);
 };
 
 
