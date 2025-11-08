@@ -26,8 +26,6 @@ public:
 
 private:
     static CreatureObject* ensureSystemSeller(server::zone::Zone* zone);
-    static SceneObject*    findBazaarTerminal(server::zone::Zone* zone, float x, float y, float searchRadius);
-    static CreatureObject* ensureSystemSeller(server::zone::Zone* zone);
     static SceneObject* findBazaarTerminal(server::zone::Zone* zone, float x, float y, float searchRadius);
     static bool templateExists(const String& templatePath);
 };
