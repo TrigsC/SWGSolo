@@ -504,6 +504,8 @@ void DirectorManager::initializeLuaEngine(Lua* luaEngine) {
 
     luaEngine->registerFunction("marketSeederListOnBazaar", MarketSeederBridge::luaListOnBazaar);
     luaEngine->registerFunction("marketSeederGetSystemSeller", MarketSeederBridge::luaGetSystemSeller);
+    luaEngine->registerFunction("marketSeederTemplateExists", MarketSeederBridge::luaTemplateExists);
+    luaEngine->registerFunction("marketSeederCreateItem", MarketSeederBridge::luaCreateItemForSeller);
 
 	luaEngine->registerFunction("getRegion", getRegion);
 	luaEngine->registerFunction("writeScreenPlayData", writeScreenPlayData);
