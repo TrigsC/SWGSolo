@@ -3,7 +3,7 @@ MarketSeeder = {
     bazaar = { x = -2950.0, y = -4980.0 },
     testPrice = 12345,
     testDurationHours = 24,
-    template = "/object/tangible/medicine/instant_stimpack/shared_stimpack_b.iff",
+    template = "object/tangible/loot/simple_kit/empty_datapad.iff",
     runOnceOnBoot = true,
     _hasSeeded = false
 }
@@ -11,10 +11,23 @@ MarketSeeder = {
 registerScreenPlay("MarketSeeder", true)
 
 local function ensureBridge()
+    MarketSeederBridge = MarketSeederBridge or {}
+
     if marketSeederListOnBazaar ~= nil then
         MarketSeederBridge = MarketSeederBridge or {}
         MarketSeederBridge.listOnBazaar = marketSeederListOnBazaar
+    end
+
+    if marketSeederGetSystemSeller ~= nil then
         MarketSeederBridge.getSystemSeller = marketSeederGetSystemSeller
+    end
+
+    if marketSeederTemplateExists ~= nil then
+        MarketSeederBridge.templateExists = marketSeederTemplateExists
+    end
+
+    if marketSeederCreateItem ~= nil then
+        MarketSeederBridge.createItem = marketSeederCreateItem
     end
 end
 
@@ -110,7 +123,23 @@ function MarketSeeder:seed_once(pInvoker, reason)
         return false
     end
 
-    local pItem = giveItem(pInventory, self.template, -1)
+    if MarketSeederBridge.templateExists ~= nil and not MarketSeederBridge.templateExists(self.template) then
+        self:log("template not found: " .. self.template)
+
+        if pInvoker ~= nil then
+            CreatureObject(pInvoker):sendSystemMessage("[MarketSeeder] Template not found; check template path.")
+        end
+
+        return false
+    end
+
+    local pItem = nil
+
+    if MarketSeederBridge.createItem ~= nil then
+        pItem = MarketSeederBridge.createItem(pSeller, pInventory, self.template, -1, false)
+    else
+        pItem = giveItem(pInventory, self.template, -1)
+    end
 
     if pItem == nil then
         self:log("failed to create test item for template " .. self.template)
