@@ -129,12 +129,12 @@ CreatureObject* MarketSeederBridge::getSystemSeller(Zone* zone) {
         return ensureSystemSeller(zone);
 }
 
-SceneObject* MarketSeederBridge::findBazaarTerminal(Zone* zone, float x, float y, float searchRadius) {
+SceneObject* MarketSeederBridge::findBazaarTerminal(Zone* zone, float x, float z, float y, float searchRadius) {
         if (zone == nullptr)
                 return nullptr;
 
         SortedVector< ManagedReference<TreeEntry*> > nearby;
-        zone->getInRangeObjects(x, 0, y, searchRadius, &nearby, true, true);
+        zone->getInRangeObjects(x, z, y, searchRadius, &nearby, true, true);
 
         SceneObject* closest = nullptr;
         float closestDistanceSq = FLT_MAX;
