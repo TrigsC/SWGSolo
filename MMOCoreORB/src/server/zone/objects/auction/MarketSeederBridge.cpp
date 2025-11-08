@@ -13,6 +13,7 @@
 #include "server/zone/managers/auction/AuctionManager.h"
 #include "server/zone/managers/auction/AuctionsMap.h"
 #include "server/zone/managers/creature/CreatureManager.h"
+#include "server/zone/managers/object/ObjectManager.h"
 #include "server/zone/objects/auction/AuctionItem.h"
 #include "server/zone/objects/scene/SceneObjectType.h"
 #include "server/zone/objects/tangible/TangibleObject.h"
@@ -24,6 +25,7 @@
 #include "system/thread/Mutex.h"
 #include "system/lang/ref/Reference.h"
 #include "templates/manager/TemplateManager.h"
+#include "templates/SharedObjectTemplate.h"
 #include "engine/lua/Lua.h"
 
 static Mutex systemSellerMutex;
@@ -32,6 +34,30 @@ static ManagedReference<CreatureObject*> systemSellerRef;
 static Logger& marketSeederLogger() {
         static Logger logger("MarketSeeder");
         return logger;
+}
+
+bool MarketSeederBridge::templateExists(const String& templatePath) {
+        TemplateManager* templateManager = TemplateManager::instance();
+
+        if (templateManager == nullptr) {
+                marketSeederLogger().error() << "templateExists: TemplateManager unavailable";
+                return false;
+        }
+
+        if (templatePath.isEmpty()) {
+                marketSeederLogger().error() << "templateExists: template path was empty";
+                return false;
+        }
+
+        uint32 templateCRC = templatePath.hashCode();
+
+        if (templateManager->getTemplate(templateCRC) != nullptr)
+                return true;
+
+        marketSeederLogger().error() << "templateExists: unknown template " << templatePath
+                << " (crc=" << String::format("0x%08X", templateCRC) << ")";
+
+        return false;
 }
 
 CreatureObject* MarketSeederBridge::ensureSystemSeller(Zone* zone) {
@@ -87,7 +113,6 @@ CreatureObject* MarketSeederBridge::ensureSystemSeller(Zone* zone) {
         }
 
         created->setCustomObjectName("Market Seeder", notifyCustomName);
-  
 
 
         created->addBankCredits(AuctionManager::SALESFEE * 50, false);
@@ -225,6 +250,79 @@ bool MarketSeederBridge::listOnBazaar(SceneObject* item, CreatureObject* seller,
         return true;
 }
 
+SceneObject* MarketSeederBridge::createItemForSeller(CreatureObject* seller, SceneObject* container, const String& templatePath, int slot, bool allowOverflow) {
+        if (seller == nullptr) {
+                marketSeederLogger().error() << "createItemForSeller: seller was nullptr";
+                return nullptr;
+        }
+
+        if (container == nullptr) {
+                marketSeederLogger().error() << "createItemForSeller: container was nullptr";
+                return nullptr;
+        }
+
+        if (templatePath.isEmpty()) {
+                marketSeederLogger().error() << "createItemForSeller: template path was empty";
+                return nullptr;
+        }
+
+        ZoneServer* zoneServer = seller->getZoneServer();
+
+        if (zoneServer == nullptr) {
+                marketSeederLogger().error() << "createItemForSeller: Zone server unavailable";
+                return nullptr;
+        }
+
+        TemplateManager* templateManager = TemplateManager::instance();
+
+        if (templateManager == nullptr) {
+                marketSeederLogger().error() << "createItemForSeller: TemplateManager unavailable";
+                return nullptr;
+        }
+
+        uint32 templateCRC = templatePath.hashCode();
+        SharedObjectTemplate* templateData = templateManager->getTemplate(templateCRC);
+
+        if (templateData == nullptr) {
+                marketSeederLogger().error() << "createItemForSeller: Template not found " << templatePath
+                        << " (crc=" << String::format("0x%08X", templateCRC) << ")";
+                return nullptr;
+        }
+
+        ManagedReference<SceneObject*> item = zoneServer->createObject(templateCRC, 1);
+
+        if (item == nullptr) {
+                marketSeederLogger().error() << "createItemForSeller: Failed to create object from template " << templatePath;
+                return nullptr;
+        }
+
+        {
+                Locker sellerLocker(seller);
+                Locker containerLocker(container);
+                Locker itemLocker(item);
+
+                if (!container->transferObject(item, slot, true, allowOverflow)) {
+                        marketSeederLogger().error() << "createItemForSeller: Failed to transfer created item into container";
+                        item->destroyObjectFromDatabase(true);
+                        return nullptr;
+                }
+
+                item->_setUpdated(true);
+
+                ManagedReference<SceneObject*> parent = item->getParentRecursively(SceneObjectType::PLAYERCREATURE);
+
+                if (parent != nullptr && parent->isPlayerCreature())
+                        item->sendTo(parent, true);
+        }
+
+        ObjectManager::instance()->persistSceneObjectsRecursively(item, 1);
+
+        marketSeederLogger().info(true) << "createItemForSeller: created item oid=" << item->getObjectID()
+                << " from template " << templatePath;
+
+        return item.get();
+}
+
 int MarketSeederBridge::luaGetSystemSeller(lua_State* L) {
         Zone* zone = nullptr;
         ZoneServer* zoneServer = ServerCore::getZoneServer();
@@ -287,5 +385,45 @@ int MarketSeederBridge::luaListOnBazaar(lua_State* L) {
         bool result = listOnBazaar(item, seller, planet, x, y, price, durationHours);
 
         lua_pushboolean(L, result);
+        return 1;
+}
+
+int MarketSeederBridge::luaTemplateExists(lua_State* L) {
+        int argumentCount = lua_gettop(L);
+
+        if (argumentCount < 1 || !lua_isstring(L, 1)) {
+                lua_pushboolean(L, false);
+                return 1;
+        }
+
+        String templatePath = lua_tostring(L, 1);
+        bool exists = templateExists(templatePath);
+
+        lua_pushboolean(L, exists);
+        return 1;
+}
+
+int MarketSeederBridge::luaCreateItemForSeller(lua_State* L) {
+        int argumentCount = lua_gettop(L);
+
+        if (argumentCount < 3) {
+                marketSeederLogger().error() << "luaCreateItemForSeller: expected at least 3 arguments, received " << argumentCount;
+                lua_pushnil(L);
+                return 1;
+        }
+
+        CreatureObject* seller = static_cast<CreatureObject*>(lua_touserdata(L, 1));
+        SceneObject* container = static_cast<SceneObject*>(lua_touserdata(L, 2));
+        String templatePath = lua_tostring(L, 3);
+        int slot = argumentCount >= 4 ? lua_tointeger(L, 4) : -1;
+        bool allowOverflow = argumentCount >= 5 ? lua_toboolean(L, 5) : false;
+
+        SceneObject* item = createItemForSeller(seller, container, templatePath, slot, allowOverflow);
+
+        if (item != nullptr)
+                lua_pushlightuserdata(L, item);
+        else
+                lua_pushnil(L);
+
         return 1;
 }
