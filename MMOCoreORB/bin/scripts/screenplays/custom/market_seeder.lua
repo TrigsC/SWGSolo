@@ -160,7 +160,7 @@ function MarketSeeder:seed_once(pInvoker, reason)
 
     self:log(string.format("created test item template=%s oid=%s (reason=%s)", self.template, tostring(itemId), context))
 
-    local success = MarketSeederBridge.listOnBazaar(pItem, pSeller, self.planet, self.bazaar.x, self.bazaar.y, self.testPrice, self.testDurationHours)
+    local success = MarketSeederBridge.listOnBazaar(pItem, pSeller, self.planet, self.bazaar.x, self.bazaar.z, self.bazaar.y, self.testPrice, self.testDurationHours)
 
     if success then
         self._hasSeeded = true
