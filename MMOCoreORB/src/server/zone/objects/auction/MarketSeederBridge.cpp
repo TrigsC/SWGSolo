@@ -316,8 +316,8 @@ SceneObject* MarketSeederBridge::createItemForSeller(CreatureObject* seller, Sce
                         item->sendTo(parent, true);
         }
   
-        item->setOwnerID(player->getObjectID());
-	      item->setOwnerName(player->getFirstName());
+        item->setOwnerID(seller->getObjectID());
+	    item->setOwnerName(seller->getFirstName());
 
         ObjectManager::instance()->persistSceneObjectsRecursively(item, 1);
 
