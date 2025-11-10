@@ -148,7 +148,8 @@ SceneObject* MarketSeederBridge::findBazaarTerminal(Zone* zone, float x, float z
 
                 float dx = candidate->getPositionX() - x;
                 float dy = candidate->getPositionY() - y;
-                float distSq = dx * dx + dy * dy;
+                float dz = candidate->getPositionZ() - z;
+                float distSq = dx*dx + dy*dy + dz*dz;
 
                 if (distSq < closestDistanceSq) {
                         closest = candidate;
