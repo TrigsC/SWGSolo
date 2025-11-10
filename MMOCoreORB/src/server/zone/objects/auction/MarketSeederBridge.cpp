@@ -315,7 +315,11 @@ SceneObject* MarketSeederBridge::createItemForSeller(CreatureObject* seller, Sce
                 if (parent != nullptr && parent->isPlayerCreature())
                         item->sendTo(parent, true);
         }
-  
+	
+  		AuctionItem* item  = new AuctionItem(container->getObjectID());
+	
+		Locker locker(item);
+	
         item->setOwnerID(seller->getObjectID());
 	    item->setOwnerName(seller->getFirstName());
 
