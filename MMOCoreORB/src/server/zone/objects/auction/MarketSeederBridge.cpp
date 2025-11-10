@@ -160,7 +160,7 @@ SceneObject* MarketSeederBridge::findBazaarTerminal(Zone* zone, float x, float z
         return closest;
 }
 
-bool MarketSeederBridge::listOnBazaar(SceneObject* item, CreatureObject* seller, const String& planet, float x, float y, int price, int durationHours) {
+bool MarketSeederBridge::listOnBazaar(SceneObject* item, CreatureObject* seller, const String& planet, float x, float z, float y, int price, int durationHours) {
         if (item == nullptr) {
                 marketSeederLogger().error() << "listOnBazaar: item was nullptr";
                 return false;
