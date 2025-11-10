@@ -1036,114 +1036,203 @@ int AuctionManagerImplementation::checkBidAuction(CreatureObject* player, Auctio
 }
 
 void AuctionManagerImplementation::doInstantBuy(CreatureObject* player, AuctionItem* item) {
-    ManagedReference<SceneObject*> vendor = zoneServer->getObject(item->getVendorID());
-    if (vendor == nullptr)
-        return;
+	ManagedReference<SceneObject*> vendor = zoneServer->getObject(item->getVendorID());
 
-    int tax = 0;
-    ManagedReference<CityRegion*> city = nullptr;
-    String vendorPlanetName("@planet_n:" + vendor->getZone()->getZoneName());
-    String vendorRegionName = vendorPlanetName;
+	if (vendor == nullptr)
+		return;
 
-    city = vendor->getCityRegion().get();
-    if (city != nullptr) {
-        tax = item->getPrice() - ( item->getPrice() / ( 1.0f + (city->getSalesTax() / 100.f)));
-        vendorRegionName = city->getCityRegionName();
-    }
+	int tax = 0;
+	ManagedReference<CityRegion*> city = nullptr;
+	String vendorPlanetName("@planet_n:" + vendor->getZone()->getZoneName());
+	String vendorRegionName = vendorPlanetName;
 
-    String playername = player->getFirstName().toLowerCase();
+	city = vendor->getCityRegion().get();
 
-    ManagedReference<ChatManager*> cman = zoneServer->getChatManager();
-    ManagedReference<PlayerManager*> pman = zoneServer->getPlayerManager();
+	if( city != nullptr) {
+		tax = item->getPrice() - ( item->getPrice() / ( 1.0f + (city->getSalesTax() / 100.f)));
+		vendorRegionName = city->getCityRegionName();
+	}
+
+	String playername = player->getFirstName().toLowerCase();
+
+	ManagedReference<ChatManager*> cman = zoneServer->getChatManager();
+	ManagedReference<PlayerManager*> pman = zoneServer->getPlayerManager();
 	ManagedReference<CreatureObject*> seller = pman->getPlayer(item->getOwnerName());
 
-	info() << "[AuctionManager] doInstantBuy: Treated as system seller ["
-               << seller << "], item=" << item->getObjectID();
+	String sender = "auctioner";
+	String sellerName = item->getOwnerName();
 
+	Time expireTime;
+	uint64 currentTime = expireTime.getMiliTime() / 1000;
+	uint64 availableTime = 0;
 
-    // -------- NEW: robust seller resolution (pre-transfer) --------
-    //ManagedReference<CreatureObject*> seller = nullptr;
+	Locker locker(item);
 
-    // Prefer the pre-transfer owner ID (seller) – updateAuctionOwner hasn’t run yet
-    uint64 sellerId = item->getOwnerID();
-    if (sellerId != 0) {
-        seller = zoneServer->getObject(sellerId).castTo<CreatureObject*>();
-    }
-    // Fallback to name lookup (may be offline or headless, so this can still be null)
-    if (seller == nullptr) {
-        seller = pman->getPlayer(item->getOwnerName());
-    }
+	if(item->isOnBazaar() || item->getStatus() == AuctionItem::OFFERED)
+		availableTime = currentTime + AuctionManager::COMMODITYEXPIREPERIOD;
+	else
+		availableTime = currentTime + AuctionManager::VENDOREXPIREPERIOD;
 
-    const bool systemSeller = (seller == nullptr) || (seller->getPlayerObject() == nullptr);
-    // -------------------------------------------------------------
+	updateAuctionOwner(item, player);
 
-    String sender = "auctioner";
-    String sellerName = item->getOwnerName();
+	item->setStatus(AuctionItem::SOLD);
+	item->setExpireTime(availableTime);
+	item->setBuyerID(player->getObjectID());
+	item->setBidderName(playername);
+	item->clearAuctionWithdraw();
 
-    Time expireTime;
-    uint64 currentTime = expireTime.getMiliTime() / 1000;
-    uint64 availableTime = (item->isOnBazaar() || item->getStatus() == AuctionItem::OFFERED)
-                           ? currentTime + AuctionManager::COMMODITYEXPIREPERIOD
-                           : currentTime + AuctionManager::VENDOREXPIREPERIOD;
+	TransactionLog trx(player, seller, TrxCode::INSTANTBUY, item->getPrice(), false);
+	trx.setAutoCommit(false);
+	trx.addRelatedObject(item->getAuctionedItemObjectID(), true);
+	trx.setExportRelatedObjects(true);
+	player->subtractBankCredits(item->getPrice());
 
-    Locker locker(item);
+	BaseMessage* msg = new BidAuctionResponseMessage(item->getAuctionedItemObjectID(), 0);
+	player->sendMessage(msg);
 
-    // Transfer ownership to buyer
-    updateAuctionOwner(item, player);
+	// Waypoint to Vendor / bazaar
+	float waypointX = vendor->getWorldPositionX();
+	float waypointY = vendor->getWorldPositionY();
 
-    item->setStatus(AuctionItem::SOLD);
-    item->setExpireTime(availableTime);
-    item->setBuyerID(player->getObjectID());
-    item->setBidderName(playername);
-    item->clearAuctionWithdraw();
+	WaypointChatParameter waypointParam;
+	waypointParam.set(vendor->getDisplayedName(), waypointX, 0, waypointY, vendor->getPlanetCRC());
 
-    // Build transaction with whatever seller ref we have (can be null)
-    TransactionLog trx(player, seller, TrxCode::INSTANTBUY, item->getPrice(), false);
-    trx.setAutoCommit(false);
-    trx.addRelatedObject(item->getAuctionedItemObjectID(), true);
-    trx.setExportRelatedObjects(true);
-    player->subtractBankCredits(item->getPrice());
+	String itemName = removeColorCodes(item->getItemName());
 
-    // ... [mail composition stays the same] ...
+	if (!item->isOnBazaar()) {
+		//Setup the mail to the vendor owner
 
-    locker.release();
+		PlayerManager* pman = zoneServer->getPlayerManager();
 
-    // Send mails (by name); fine even if seller pointer is null
-    UnicodeString blankBody;
-    // send seller + buyer mail for vendor/bazaar as your existing code does
-    // (omitted here for brevity – no changes required)
+		StringIdChatParameterVector sellerBodyVector;
+		WaypointChatParameterVector sellerWaypointVector;
 
-    // -------- NEW: credit/tax handling for headless/offline seller --------
-    if (!systemSeller) {
-        Locker slocker(seller);
-        seller->addBankCredits(item->getPrice());
-        trx.commit();
+		UnicodeString sellerSubject("@auction:subject_vendor_seller"); // Vendor Sale Complete
+		StringIdChatParameter sellerBodySale("@auction:seller_success_vendor"); // %TU has sold %TO to %TT for %DI credits.
+		sellerBodySale.setTU(vendor->getDisplayedName());
+		sellerBodySale.setTO(itemName);
+		sellerBodySale.setTT(item->getBidderName());
+		sellerBodySale.setDI(item->getPrice());
 
-        if (city != nullptr && tax > 0) {
-            TransactionLog trxFee(seller, TrxCode::CITYSALESTAX, tax, false);
-            trxFee.groupWith(trx);
-            trxFee.addState("cityRegionID", city->getObjectID());
-            seller->subtractBankCredits(tax);
-        }
-        slocker.release();
+		StringIdChatParameter sellerBodyLoc("@auction:seller_success_location"); // The sale took place at %TT, on %TO.
+		sellerBodyLoc.setTO(vendorPlanetName);
+		sellerBodyLoc.setTT(vendorRegionName);
 
-        if (city != nullptr && !city->isClientRegion() && tax) {
-            Locker clock(city);
-            city->addToCityTreasury(tax);
-        }
-    } else {
-        // Headless / unreachable seller:
-        // - No seller credit or tax debit
-        // - Don’t error; just commit the buyer side so the purchase succeeds cleanly
-        trx.errorMessage() << "System/Offline seller; skipping seller credit and tax for sellerName="
-                           << sellerName;
-        trx.commit();
-        // Optionally: route tax nowhere (or implement a house sink if desired)
-        // Optionally: lower to debug if you don’t want a log at all
-        info() << "[AuctionManager] doInstantBuy: seller not available; treated as system seller ["
-               << sellerName << "], item=" << item->getObjectID();
-    }
-    // ----------------------------------------------------------------------
+		sellerBodyVector.add(sellerBodySale);
+		sellerBodyVector.add(sellerBodyLoc);
+
+		sellerWaypointVector.add(waypointParam);
+
+		//Setup the mail to the buyer
+		/*ManagedReference<CreatureObject*> buyer = pman->getPlayer(item->getBidderName());
+
+		Locker _locker2(buyer);*/
+
+		StringIdChatParameterVector buyerBodyVector;
+		WaypointChatParameterVector buyerWaypointVector;
+
+		UnicodeString buyerSubject("@auction:subject_vendor_buyer"); // Vendor Item Purchased
+		StringIdChatParameter buyerBodySale("@auction:buyer_success"); // You have won the auction of "%TO" from "%TT" for %DI credits. See the attached waypoint for location.
+		buyerBodySale.setTO(itemName);
+		buyerBodySale.setTT(sellerName);
+		buyerBodySale.setDI(item->getPrice());
+
+		StringIdChatParameter buyerBodyLoc("@auction:buyer_success_location"); // The sale took place at %TT, on %TO.
+		buyerBodyLoc.setTO(vendorPlanetName);
+		buyerBodyLoc.setTT(vendorRegionName);
+
+		buyerBodyVector.add(buyerBodySale);
+		buyerBodyVector.add(buyerBodyLoc);
+
+		buyerWaypointVector.add(waypointParam);
+
+		//Send the Mail
+		locker.release();
+		UnicodeString blankBody;
+		cman->sendMail(sender, sellerSubject, blankBody, sellerName, &sellerBodyVector, &sellerWaypointVector);
+		cman->sendMail(sender, buyerSubject, blankBody, item->getBidderName(), &buyerBodyVector, &buyerWaypointVector);
+
+		if(auctionMap->getVendorItemCount(vendor, true) == 0)
+			sendVendorUpdateMail(vendor, true);
+
+	} else {
+
+		StringIdChatParameterVector sellerBodyVector;
+		WaypointChatParameterVector sellerWaypointVector;
+
+		// Setup the mail to the seller
+		UnicodeString sellerSubject("@auction:subject_instant_seller"); // Instant Sale Complete
+		StringIdChatParameter sellerBodySale("@auction:seller_success"); // Your auction of %TO has been sold to %TT for %DI credits
+		sellerBodySale.setTO(itemName);
+		sellerBodySale.setTT(item->getBidderName());
+		sellerBodySale.setDI(item->getPrice());
+
+		StringIdChatParameter sellerBodyLoc("@auction:seller_success_location"); // The sale took place at %TT, on %TO.
+		sellerBodyLoc.setTO(vendorPlanetName);
+		sellerBodyLoc.setTT(vendorRegionName);
+
+		sellerBodyVector.add(sellerBodySale);
+		sellerBodyVector.add(sellerBodyLoc);
+
+		sellerWaypointVector.add(waypointParam);
+
+		// Setup the mail to the buyer
+		StringIdChatParameterVector buyerBodyVector;
+		WaypointChatParameterVector buyerWaypointVector;
+
+		UnicodeString buyerSubject("@auction:subject_instant_buyer"); // Instant Sale Item Purchased
+		StringIdChatParameter buyerBodySale("@auction:buyer_success"); // You have won the auction of "%TO" from "%TT" for %DI credits. See the attached waypoint for location.
+		buyerBodySale.setTO(itemName);
+		buyerBodySale.setTT(sellerName);
+		buyerBodySale.setDI(item->getPrice());
+
+		StringIdChatParameter buyerBodyLoc("@auction:buyer_success_location"); // The sale took place at %TT, on %TO.
+		buyerBodyLoc.setTO(vendorPlanetName);
+		buyerBodyLoc.setTT(vendorRegionName);
+
+		buyerBodyVector.add(buyerBodySale);
+		buyerBodyVector.add(buyerBodyLoc);
+
+		locker.release();
+
+		buyerWaypointVector.add(waypointParam);
+
+		//Send the Mail
+		UnicodeString blankBody;
+		cman->sendMail(sender, sellerSubject, blankBody, sellerName, &sellerBodyVector, &sellerWaypointVector);
+		cman->sendMail(sender, buyerSubject, blankBody, item->getBidderName(), &buyerBodyVector, &buyerWaypointVector);
+
+	}
+
+	if (seller == nullptr) {
+		// doInstantBuy(CreatureObject* player, AuctionItem* item)
+		trx.errorMessage() << "Null Seller: " + item->getOwnerName();
+		trx.commit();
+		error("seller null for name " + item->getOwnerName());
+
+		error() << "doInstantBuy(player=" << player->getObjectID() << ", item=" << item->getObjectID() << "): Seller not found [" << item->getOwnerName() << "], auctionItem: " << *item;
+		return;
+	}
+
+	locker.release();
+
+	Locker slocker(seller);
+	seller->addBankCredits(item->getPrice());
+	trx.commit();
+
+	if (city != nullptr && tax > 0) {
+		TransactionLog trxFee(seller, TrxCode::CITYSALESTAX, tax, false);
+		trxFee.groupWith(trx);
+		trxFee.addState("cityRegionID", city->getObjectID());
+		seller->subtractBankCredits(tax);
+	}
+	slocker.release();
+
+	if(city != nullptr && !city->isClientRegion() && tax){
+		Locker clock(city);
+		city->addToCityTreasury(tax);
+	}
+
 }
 
 void AuctionManagerImplementation::doAuctionBid(CreatureObject* player, AuctionItem* item, int price1, int proxyBid) {
