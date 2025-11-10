@@ -1,6 +1,6 @@
 MarketSeeder = {
     planet = "naboo",
-    bazaar = { x = -5145.46, z = 14.0, y = -4143.07 },
+    bazaar = { x = -5145.46, z = 6.55, y = 4143.07 },
     testPrice = 12345,
     testDurationHours = 24,
     template = "object/tangible/loot/simple_kit/empty_datapad.iff",
