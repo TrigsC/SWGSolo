@@ -4,7 +4,7 @@ MarketSeeder = {
     testPrice = 12345,
     testDurationHours = 24,
     template = "object/tangible/loot/simple_kit/empty_datapad.iff",
-    runOnceOnBoot = true,
+    runOnceOnBoot = false,
     _hasSeeded = false
 }
 
