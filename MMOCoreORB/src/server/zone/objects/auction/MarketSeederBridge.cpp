@@ -197,13 +197,13 @@ bool MarketSeederBridge::listOnBazaar(SceneObject* item, CreatureObject* seller,
                 marketSeederLogger().warning() << "listOnBazaar: Seller " << resolvedSeller->getObjectID() << " missing PlayerObject; continuing";
         }
 
-        SceneObject* vendor = findBazaarTerminal(zone, x, y, 32.0f);
+        SceneObject* vendor = findBazaarTerminal(zone, x, z, y, 32.0f);
 
         if (vendor == nullptr)
-                vendor = findBazaarTerminal(zone, x, y, 128.0f);
+                vendor = findBazaarTerminal(zone, x, z, y, 128.0f);
 
         if (vendor == nullptr) {
-                marketSeederLogger().error() << "listOnBazaar: No bazaar terminal found near (" << x << ", " << y << ") on " << planet;
+                marketSeederLogger().error() << "listOnBazaar: No bazaar terminal found near (" << x << ", " << z << ", " << y << ") on " << planet;
                 return false;
         }
 
