@@ -1062,7 +1062,7 @@ void AuctionManagerImplementation::doInstantBuy(CreatureObject* player, AuctionI
 
 
     // -------- NEW: robust seller resolution (pre-transfer) --------
-    ManagedReference<CreatureObject*> seller = nullptr;
+    //ManagedReference<CreatureObject*> seller = nullptr;
 
     // Prefer the pre-transfer owner ID (seller) – updateAuctionOwner hasn’t run yet
     uint64 sellerId = item->getOwnerID();
