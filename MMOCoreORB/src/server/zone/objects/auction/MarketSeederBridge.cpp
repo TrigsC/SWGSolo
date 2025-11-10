@@ -379,9 +379,10 @@ int MarketSeederBridge::luaListOnBazaar(lua_State* L) {
 
         String planet = lua_tostring(L, 3);
         float x = (float) lua_tonumber(L, 4);
-        float y = (float) lua_tonumber(L, 5);
-        int price = lua_tointeger(L, 6);
-        int durationHours = argumentCount >= 7 ? lua_tointeger(L, 7) : 24;
+        float z = (float) lua_tonumber(L, 5);
+        float y = (float) lua_tonumber(L, 6);
+        int price = lua_tointeger(L, 7);
+        int durationHours = argumentCount >= 8 ? lua_tointeger(L, 8) : 24;
 
         bool result = listOnBazaar(item, seller, planet, x, z, y, price, durationHours);
 
