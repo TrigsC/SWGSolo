@@ -1055,6 +1055,11 @@ void AuctionManagerImplementation::doInstantBuy(CreatureObject* player, AuctionI
 
     ManagedReference<ChatManager*> cman = zoneServer->getChatManager();
     ManagedReference<PlayerManager*> pman = zoneServer->getPlayerManager();
+	ManagedReference<CreatureObject*> seller = pman->getPlayer(item->getOwnerName());
+
+	info() << "[AuctionManager] doInstantBuy: Treated as system seller ["
+               << seller << "], item=" << item->getObjectID();
+
 
     // -------- NEW: robust seller resolution (pre-transfer) --------
     ManagedReference<CreatureObject*> seller = nullptr;
