@@ -932,15 +932,7 @@ AuctionItem* AuctionManagerImplementation::createVendorItem(CreatureObject* play
     uint64 vendorExpire    = time(0) + AuctionManager::VENDOREXPIREPERIOD;
     uint64 commodityExpire = time(0) + AuctionManager::COMMODITYEXPIREPERIOD;
 
-    String planetStr = zone->getZoneName();
-    AuctionItem* item = new AuctionItem(objectToSell->getObjectID());
-
-    ManagedReference<CityRegion*> cityRegion = vendor->getCityRegion().get();
-    String region = "@planet_n:" + planetStr;
-    if (cityRegion != nullptr)
-        region = cityRegion->getCityRegionName();
-
-    String name = objectToSell->getDisplayedName();
+    AuctionItem* item  = new AuctionItem(objectToSell->getObjectID());
 
     Locker locker(item);
 
@@ -951,7 +943,7 @@ AuctionItem* AuctionManagerImplementation::createVendorItem(CreatureObject* play
         item->setAuctionPremium();
 
     item->setVendorID(vendor->getObjectID());
-    item->setItemName(name);
+    item->setItemName(objectToSell->getDisplayedName());
     item->setItemDescription(description.toString());
 
     if (objectToSell->isFactoryCrate()) {
@@ -974,15 +966,21 @@ AuctionItem* AuctionManagerImplementation::createVendorItem(CreatureObject* play
     item->setBidderName("");
     item->setSize(objectToSell->getSizeOnVendorRecursive());
 
+    // ---- C++11-safe vendor data lookup (no if-init) ----
     VendorDataComponent* vendorData = nullptr;
-    if (auto* d = vendor->getDataObjectComponent(); d && d->get() && d->get()->isVendorData())
-        vendorData = cast<VendorDataComponent*>(d->get());
+    DataObjectComponentReference* dataRef = vendor->getDataObjectComponent();
+    if (dataRef != nullptr) {
+        DataObjectComponent* comp = dataRef->get();
+        if (comp != nullptr && comp->isVendorData())
+            vendorData = cast<VendorDataComponent*>(comp);
+    }
+    // ----------------------------------------------------
 
     if (!vendor->isBazaarTerminal()) {
         if (vendorData == nullptr)
             return nullptr;
 
-        // Offer vs. vendor listing
+        // Someone else's Vendor (offer) vs vendor listing
         if (vendorData->getOwnershipRightsOf(player) == 1) {
             item->setStatus(AuctionItem::OFFERED);
             item->setOfferToID(vendorData->getOwnerId());
@@ -1000,10 +998,10 @@ AuctionItem* AuctionManagerImplementation::createVendorItem(CreatureObject* play
     // Persist ONCE
     ObjectManager::instance()->persistObject(item, 0, "auctionitems");
 
-    // --- OWNER ASSIGNMENT ---
+    // --- OWNER ASSIGNMENT (headless-safe) ---
     PlayerObject* ghost = player->getPlayerObject();
     if (ghost) {
-        // Normal player path (also handles commodity limit adjustments)
+        // Normal player path: also handles commodity limits
         updateAuctionOwner(item, player);
     } else {
         // Headless/system seller path
@@ -1011,7 +1009,7 @@ AuctionItem* AuctionManagerImplementation::createVendorItem(CreatureObject* play
         item->setOwnerName(player->getFirstName());
         item->setUpdated(true);
 
-        // Mirror updateAuctionOwner behavior: only add to commodity limit for bazaar or offered
+        // Mirror updateAuctionOwner behavior for bazaar/offered
         if (item->isOnBazaar() || item->getStatus() == AuctionItem::OFFERED) {
             auctionMap->addToCommodityLimit(item);
         }
