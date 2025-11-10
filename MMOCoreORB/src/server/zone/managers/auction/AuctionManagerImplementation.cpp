@@ -820,173 +820,205 @@ String AuctionManagerImplementation::getVendorUID(SceneObject* vendor) {
 }
 
 int AuctionManagerImplementation::checkSaleItem(CreatureObject* player, SceneObject* object, SceneObject* vendor, int price, bool premium, bool stockroomSale) {
-	if (vendor == nullptr) {
-		error() << "checkSaleItem(player=" << player->getObjectID() << ", object=" << object->getObjectID() << ", vendor=nullptr): Vendor is null";
-		return ItemSoldMessage::UNKNOWNERROR;
-	}
+	if (!vendor || !player || !object) {
+        error() << "checkSaleItem(player=" << (player ? player->getObjectID() : 0)
+                << ", object=" << (object ? object->getObjectID() : 0)
+                << ", vendor=" << (vendor ? vendor->getObjectID() : 0)
+                << "): null arg";
+        return ItemSoldMessage::UNKNOWNERROR;
+    }
 
-	if (price < 1)
-		return ItemSoldMessage::INVALIDSALEPRICE;
+    PlayerObject* ghost = player->getPlayerObject();
+    const bool systemSeller = (ghost == nullptr);
 
-	if (player->getPlayerObject()->getVendorCount() > player->getSkillMod("manage_vendor"))
-		return ItemSoldMessage::TOOMANYITEMS;
+    if (price < 1)
+        return ItemSoldMessage::INVALIDSALEPRICE;
 
-	auto itemParent = object->getParent().get();
+    // --- Per-player vendor count (needs ghost) ---
+    if (!systemSeller) {
+        if (ghost->getVendorCount() > player->getSkillMod("manage_vendor"))
+            return ItemSoldMessage::TOOMANYITEMS;
+    }
 
-	if (itemParent == nullptr && !stockroomSale) {
-		error() << "checkSaleItem(player=" << player->getObjectID() << ", object=" << object->getObjectID() << ", vendor=" << vendor->getObjectID()
-				<< "): itemParent is null; stockroomSale=" << stockroomSale;
-		return ItemSoldMessage::UNKNOWNERROR;
-	}
+    auto itemParent = object->getParent().get();
 
-	if (itemParent != nullptr && !itemParent->checkContainerPermission(player, ContainerPermissions::MOVEOUT)) {
-		error() << "checkSaleItem(player=" << player->getObjectID() << ", object=" << object->getObjectID() << ", vendor=" << vendor->getObjectID()
-				<< "): No MOVEOUT permission from " << itemParent->getObjectID() << " (" << itemParent->getObjectName()->getFullPath() << ") stockroomSale=" << stockroomSale;
-		return ItemSoldMessage::INVALIDITEM;
-	}
+    if (itemParent == nullptr && !stockroomSale) {
+        error() << "checkSaleItem(player=" << player->getObjectID()
+                << ", object=" << object->getObjectID()
+                << ", vendor=" << vendor->getObjectID()
+                << "): itemParent is null; stockroomSale=" << stockroomSale;
+        return ItemSoldMessage::UNKNOWNERROR;
+    }
 
-	if (vendor->isVendor()) {
-		VendorDataComponent* vendorData = cast<VendorDataComponent*>(vendor->getDataObjectComponent()->get());
+    if (itemParent != nullptr && !itemParent->checkContainerPermission(player, ContainerPermissions::MOVEOUT)) {
+        error() << "checkSaleItem(player=" << player->getObjectID()
+                << ", object=" << object->getObjectID()
+                << ", vendor=" << vendor->getObjectID()
+                << "): No MOVEOUT permission from " << itemParent->getObjectID()
+                << " (" << itemParent->getObjectName()->getFullPath() << ") stockroomSale=" << stockroomSale;
+        return ItemSoldMessage::INVALIDITEM;
+    }
 
-		if (vendorData == nullptr) {
-			return ItemSoldMessage::UNKNOWNERROR;
-		}
+    if (vendor->isVendor()) {
+        VendorDataComponent* vendorData =
+            vendor->getDataObjectComponent() && vendor->getDataObjectComponent()->get() &&
+            vendor->getDataObjectComponent()->get()->isVendorData()
+                ? cast<VendorDataComponent*>(vendor->getDataObjectComponent()->get())
+                : nullptr;
 
-		if (player->getObjectID() == vendorData->getOwnerId()) {
-			if (stockroomSale) {
-				if (auctionMap->getPlayerItemCount(player) > player->getSkillMod("vendor_item_limit"))
-					return ItemSoldMessage::TOOMANYITEMS;
-			} else {
-				if ((auctionMap->getPlayerItemCount(player) + object->getSizeOnVendorRecursive()) > player->getSkillMod("vendor_item_limit"))
-					return ItemSoldMessage::TOOMANYITEMS;
-			}
-		} else {
-			if (auctionMap->getCommodityCount(player) >= MAXSALES)
-				return ItemSoldMessage::TOOMANYITEMS;
-		}
+        if (vendorData == nullptr)
+            return ItemSoldMessage::UNKNOWNERROR;
 
-		if (price > MAXVENDORPRICE)
-			return ItemSoldMessage::INVALIDSALEPRICE;
-	}
+        if (!systemSeller) {
+            if (player->getObjectID() == vendorData->getOwnerId()) {
+                if (stockroomSale) {
+                    if (auctionMap->getPlayerItemCount(player) > player->getSkillMod("vendor_item_limit"))
+                        return ItemSoldMessage::TOOMANYITEMS;
+                } else {
+                    if ((auctionMap->getPlayerItemCount(player) + object->getSizeOnVendorRecursive()) >
+                        player->getSkillMod("vendor_item_limit"))
+                        return ItemSoldMessage::TOOMANYITEMS;
+                }
+            } else {
+                if (auctionMap->getCommodityCount(player) >= MAXSALES)
+                    return ItemSoldMessage::TOOMANYITEMS;
+            }
+        }
+        // Always enforce vendor price cap
+        if (price > MAXVENDORPRICE)
+            return ItemSoldMessage::INVALIDSALEPRICE;
+    }
 
-	if (vendor->isBazaarTerminal()) {
-		if (auctionMap->getCommodityCount(player) >= MAXSALES)
-			return ItemSoldMessage::TOOMANYITEMS;
+    if (vendor->isBazaarTerminal()) {
+        // Skip per-player commodity cap for headless seller; keep it for real players
+        if (!systemSeller) {
+            if (auctionMap->getCommodityCount(player) >= MAXSALES)
+                return ItemSoldMessage::TOOMANYITEMS;
+        }
 
-		if (price > MAXBAZAARPRICE)
-			return ItemSoldMessage::INVALIDSALEPRICE;
+        if (price > MAXBAZAARPRICE)
+            return ItemSoldMessage::INVALIDSALEPRICE;
 
-		if (player->getBankCredits() < SALESFEE)
-			return ItemSoldMessage::NOTENOUGHCREDITS;
+        // Headless still pays fees (you already top up bank credits in seeder)
+        if (player->getBankCredits() < SALESFEE)
+            return ItemSoldMessage::NOTENOUGHCREDITS;
 
-		if (premium && player->getBankCredits() < SALESFEE * 5)
-			return ItemSoldMessage::NOTENOUGHCREDITS;
-	}
+        if (premium && player->getBankCredits() < SALESFEE * 5)
+            return ItemSoldMessage::NOTENOUGHCREDITS;
+    }
 
-	if (object->isIntangibleObject() && !object->isManufactureSchematic())
-		return ItemSoldMessage::INVALIDITEM;
+    if (object->isIntangibleObject() && !object->isManufactureSchematic())
+        return ItemSoldMessage::INVALIDITEM;
 
-	for (int i = 0; i < object->getArrangementDescriptorSize(); ++i) {
-		const Vector<String>* descriptors = object->getArrangementDescriptor(i);
+    for (int i = 0; i < object->getArrangementDescriptorSize(); ++i) {
+        const Vector<String>* descriptors = object->getArrangementDescriptor(i);
+        for (int j = 0; j < descriptors->size(); ++j) {
+            const String& descriptor = descriptors->get(j);
+            if (descriptor == "inventory" || descriptor == "datapad" || descriptor == "default_weapon"
+                || descriptor == "mission_bag" || descriptor == "ghost" || descriptor == "bank" || descriptor == "hair")
+                return ItemSoldMessage::INVALIDITEM;
+        }
+    }
 
-		for (int j = 0; j < descriptors->size(); ++j) {
-			const String& descriptor = descriptors->get(j);
-
-			if (descriptor == "inventory" || descriptor == "datapad" || descriptor == "default_weapon"
-					|| descriptor == "mission_bag" || descriptor == "ghost" || descriptor == "bank" || descriptor == "hair")
-				return ItemSoldMessage::INVALIDITEM;
-		}
-	}
-
-	return ItemSoldMessage::SUCCESS;
+    return ItemSoldMessage::SUCCESS;
 }
 
 AuctionItem* AuctionManagerImplementation::createVendorItem(CreatureObject* player, SceneObject* objectToSell, SceneObject* vendor, const UnicodeString& description, int price, unsigned int duration, bool auction, bool premium) {
 
 	Zone* zone = vendor->getZone();
+    if (zone == nullptr)
+        return nullptr;
 
-	if (zone == nullptr)
-		return nullptr;
+    uint64 vendorExpire    = time(0) + AuctionManager::VENDOREXPIREPERIOD;
+    uint64 commodityExpire = time(0) + AuctionManager::COMMODITYEXPIREPERIOD;
 
-	uint64 vendorExpire = time(0) + AuctionManager::VENDOREXPIREPERIOD;
-	uint64 commodityExpire = time(0) + AuctionManager::COMMODITYEXPIREPERIOD;
+    String planetStr = zone->getZoneName();
+    AuctionItem* item = new AuctionItem(objectToSell->getObjectID());
 
-	String playername = player->getFirstName().toLowerCase();
-	String descr = description.toString();
-	String planetStr = zone->getZoneName();
+    ManagedReference<CityRegion*> cityRegion = vendor->getCityRegion().get();
+    String region = "@planet_n:" + planetStr;
+    if (cityRegion != nullptr)
+        region = cityRegion->getCityRegionName();
 
-	AuctionItem* item  = new AuctionItem(objectToSell->getObjectID());
+    String name = objectToSell->getDisplayedName();
 
-	ManagedReference<CityRegion*> cityRegion = vendor->getCityRegion().get();
-	String region = "@planet_n:" + planetStr;
+    Locker locker(item);
 
-	if (cityRegion != nullptr)
-		region = cityRegion->getCityRegionName();
+    item->setVendorUID(getVendorUID(vendor));
+    item->setOnBazaar(vendor->isBazaarTerminal());
 
-	String name = objectToSell->getDisplayedName();
+    if (premium)
+        item->setAuctionPremium();
 
-	Locker locker(item);
+    item->setVendorID(vendor->getObjectID());
+    item->setItemName(name);
+    item->setItemDescription(description.toString());
 
-	item->setVendorUID(getVendorUID(vendor));
-	item->setOnBazaar(vendor->isBazaarTerminal());
+    if (objectToSell->isFactoryCrate()) {
+        ManagedReference<FactoryCrate*> crate = cast<FactoryCrate*>(objectToSell);
+        if (crate != nullptr) {
+            ManagedReference<TangibleObject*> prototype = crate->getPrototype();
+            if (prototype != nullptr) {
+                item->setFactoryCrate(true);
+                item->setCratedItemType(prototype->getClientGameObjectType());
+                item->setUpdated(true);
+            }
+        }
+    }
 
-	if (premium)
-		item->setAuctionPremium();
+    item->setItemType(objectToSell->getClientGameObjectType());
+    item->setPrice(price);
+    item->setAuction(auction);
+    item->setStatus(AuctionItem::FORSALE);
+    item->setBuyerID(0);
+    item->setBidderName("");
+    item->setSize(objectToSell->getSizeOnVendorRecursive());
 
-	item->setVendorID(vendor->getObjectID());
-	item->setItemName(name);
-	item->setItemDescription(description.toString());
+    VendorDataComponent* vendorData = nullptr;
+    if (auto* d = vendor->getDataObjectComponent(); d && d->get() && d->get()->isVendorData())
+        vendorData = cast<VendorDataComponent*>(d->get());
 
-	if (objectToSell->isFactoryCrate()) {
-		ManagedReference<FactoryCrate*> crate = cast<FactoryCrate*>(objectToSell);
+    if (!vendor->isBazaarTerminal()) {
+        if (vendorData == nullptr)
+            return nullptr;
 
-		if (crate != nullptr) {
-			ManagedReference<TangibleObject*> prototype = crate->getPrototype();
+        // Offer vs. vendor listing
+        if (vendorData->getOwnershipRightsOf(player) == 1) {
+            item->setStatus(AuctionItem::OFFERED);
+            item->setOfferToID(vendorData->getOwnerId());
+            item->setExpireTime(commodityExpire);
+        } else {
+            item->setExpireTime(vendorExpire);
 
-			if (prototype != nullptr) {
-				item->setFactoryCrate(true);
-				item->setCratedItemType(prototype->getClientGameObjectType());
-				item->setUpdated(true);
-			}
-		}
-	}
+            if (auctionMap->getVendorItemCount(vendor, true) == 0)
+                sendVendorUpdateMail(vendor, false);
+        }
+    } else {
+        item->setExpireTime(commodityExpire);
+    }
 
-	item->setItemType(objectToSell->getClientGameObjectType());
-	item->setPrice(price);
-	item->setAuction(auction);
-	item->setStatus(AuctionItem::FORSALE);
-	item->setBuyerID(0);
-	item->setBidderName("");
-	item->setSize(objectToSell->getSizeOnVendorRecursive());
+    // Persist ONCE
+    ObjectManager::instance()->persistObject(item, 0, "auctionitems");
 
-	VendorDataComponent* vendorData = nullptr;
-	DataObjectComponentReference* data = vendor->getDataObjectComponent();
-	if(data != nullptr && data->get() != nullptr && data->get()->isVendorData())
-		vendorData = cast<VendorDataComponent*>(data->get());
+    // --- OWNER ASSIGNMENT ---
+    PlayerObject* ghost = player->getPlayerObject();
+    if (ghost) {
+        // Normal player path (also handles commodity limit adjustments)
+        updateAuctionOwner(item, player);
+    } else {
+        // Headless/system seller path
+        item->setOwnerID(player->getObjectID());
+        item->setOwnerName(player->getFirstName());
+        item->setUpdated(true);
 
-	if (!vendor->isBazaarTerminal()) {
-		if(vendorData == nullptr)
-			return nullptr;
+        // Mirror updateAuctionOwner behavior: only add to commodity limit for bazaar or offered
+        if (item->isOnBazaar() || item->getStatus() == AuctionItem::OFFERED) {
+            auctionMap->addToCommodityLimit(item);
+        }
+    }
+    // --- END OWNER ASSIGNMENT ---
 
-		// Someone else's Vendor (making this sell item an offer)
-		if(vendorData->getOwnershipRightsOf(player) == 1) {
-			item->setStatus(AuctionItem::OFFERED);
-			item->setOfferToID(vendorData->getOwnerId());
-			item->setExpireTime(commodityExpire);
-		} else {
-			item->setExpireTime(vendorExpire);
-
-			if(auctionMap->getVendorItemCount(vendor, true) == 0)
-				sendVendorUpdateMail(vendor, false);
-		}
-	} else {
-		item->setExpireTime(commodityExpire);
-	}
-
-	ObjectManager::instance()->persistObject(item, 0, "auctionitems");
-	updateAuctionOwner(item, player);
-
-	return item;
+    return item;
 }
 
 int AuctionManagerImplementation::checkBidAuction(CreatureObject* player, AuctionItem* item, int price1, int price2) {
