@@ -25,8 +25,6 @@ MarketSeeder = {
     _hasSeeded = false
 }
 
-//includeFile("custom/market_seeder_templates.lua")
-
 registerScreenPlay("MarketSeeder", true)
 
 local function ensureBridge()
