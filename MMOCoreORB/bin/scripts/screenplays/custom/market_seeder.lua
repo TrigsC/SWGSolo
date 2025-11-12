@@ -25,7 +25,7 @@ MarketSeeder = {
     _hasSeeded = false
 }
 
-includeFile("custom/market_seeder_templates.lua")
+//includeFile("custom/market_seeder_templates.lua")
 
 registerScreenPlay("MarketSeeder", true)
 
