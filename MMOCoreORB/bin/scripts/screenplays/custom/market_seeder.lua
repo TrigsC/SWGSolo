@@ -3,21 +3,17 @@ MarketSeeder = {
     bazaar = { x = -5145.46, z = 6.55, y = 4143.07 },
     testPrice = 12345,
     testDurationHours = 24,
-    template = "object/tangible/loot/simple_kit/empty_datapad.iff",
-    templates = nil,
-    templateQuantities = {},
-    templateSource = {
-        type = "character_builder",
-        prefixFilters = {
-            "object/tangible/",
-            "object/weapon/"
-        },
-        excludePrefixes = {
-            "object/tangible/terminal/"
-        },
-        maxTemplates = 250,
-        quantity = 1
+    template = nil,
+    -- Example configuration: list two template paths to seed and override their quantities below.
+    templates = {
+        "object/tangible/loot/simple_kit/empty_datapad.iff",
+        "object/tangible/loot/simple_kit/datapad_connectors.iff"
     },
+    templateQuantities = {
+        ["object/tangible/loot/simple_kit/empty_datapad.iff"] = 2,
+        ["object/tangible/loot/simple_kit/datapad_connectors.iff"] = 4
+    },
+    templateSource = nil,
     defaultQuantity = 1,
     maxListingsPerSeed = 250,
     summaryLogLimit = 10,
