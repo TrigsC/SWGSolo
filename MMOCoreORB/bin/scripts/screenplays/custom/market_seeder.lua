@@ -1,9 +1,22 @@
 MarketSeeder = {
     planet = "naboo",
-    bazaar = { x = -5145.46, z = 6.55, y = 4143.07 },
-    testPrice = 12345,
-    testDurationHours = 24,
-    template = "object/tangible/loot/simple_kit/empty_datapad.iff",
+    bazaar = { x = -5145.46, z = 6.55, y = 4143.07 }, -- Theed
+    testPrice = 20000,
+    testDurationHours = 168, --7 days
+    template = nil, -- If using 1 template
+    -- Example configuration: list two template paths to seed and override their quantities below.
+    templates = {
+        "object/tangible/wearables/armor/composite/armor_composite_helmet.iff",
+        "object/tangible/wearables/armor/composite/armor_composite_chest_plate.iff"
+    },
+    templateQuantities = {
+        ["object/tangible/wearables/armor/composite/armor_composite_helmet.iff"] = 3,
+        ["object/tangible/wearables/armor/composite/armor_composite_chest_plate.iff"] = 3
+    },
+    templateSource = nil,
+    defaultQuantity = 1,
+    maxListingsPerSeed = 250,
+    summaryLogLimit = 10,
     runOnceOnBoot = true,
     _hasSeeded = false
 }
@@ -123,32 +136,216 @@ function MarketSeeder:seed_once(pInvoker, reason)
         return false
     end
 
-    if MarketSeederBridge.templateExists ~= nil and not MarketSeederBridge.templateExists(self.template) then
-        self:log("template not found: " .. self.template)
+    local queue = self:buildSeedQueue()
+
+    if #queue == 0 then
+        self:log("no templates available for seeding")
 
         if pInvoker ~= nil then
-            CreatureObject(pInvoker):sendSystemMessage("[MarketSeeder] Template not found; check template path.")
+            CreatureObject(pInvoker):sendSystemMessage("[MarketSeeder] No templates configured for seeding.")
         end
 
         return false
+    end
+
+    local limit = #queue
+    if self.maxListingsPerSeed ~= nil then
+        local maxListings = tonumber(self.maxListingsPerSeed)
+        if maxListings ~= nil and maxListings >= 0 then
+            limit = math.min(limit, math.floor(maxListings + 0.5))
+        end
+    end
+
+    local summary = {
+        attempted = limit,
+        listed = 0,
+        missingTemplate = 0,
+        creationFailed = 0,
+        listingFailed = 0,
+        samples = {
+            missingTemplate = {},
+            creationFailed = {},
+            listingFailed = {}
+        }
+    }
+
+    local lastItemId = 0
+    local sampleLimit = self.summaryLogLimit or 0
+
+    for index = 1, limit, 1 do
+        local templatePath = queue[index]
+        local success, reason, itemId = self:seedTemplate(pSeller, pInventory, templatePath)
+
+        if success then
+            summary.listed = summary.listed + 1
+            lastItemId = itemId or lastItemId
+        else
+            if reason == "missingTemplate" then
+                summary.missingTemplate = summary.missingTemplate + 1
+            elseif reason == "creationFailed" then
+                summary.creationFailed = summary.creationFailed + 1
+            elseif reason == "listingFailed" then
+                summary.listingFailed = summary.listingFailed + 1
+            end
+
+            if sampleLimit > 0 then
+                local samples = summary.samples[reason]
+                if samples ~= nil and #samples < sampleLimit then
+                    samples[#samples + 1] = templatePath
+                end
+            end
+        end
+    end
+
+    if summary.listed > 0 then
+        self._hasSeeded = true
+        self.lastItemId = lastItemId
+    end
+
+    local details = string.format(
+        "seed summary (reason=%s): listed=%d attempted=%d missing=%d createFailed=%d listFailed=%d",
+        context,
+        summary.listed,
+        summary.attempted,
+        summary.missingTemplate,
+        summary.creationFailed,
+        summary.listingFailed
+    )
+
+    self:log(details)
+
+    for reason, samples in pairs(summary.samples) do
+        if #samples > 0 then
+            self:log(string.format("sample %s templates: %s", reason, table.concat(samples, ", ")))
+        end
+    end
+
+    if pInvoker ~= nil then
+        CreatureObject(pInvoker):sendSystemMessage(string.format(
+            "[MarketSeeder] Bazaar listings created: %d/%d (missing=%d, createFailed=%d, listFailed=%d)",
+            summary.listed,
+            summary.attempted,
+            summary.missingTemplate,
+            summary.creationFailed,
+            summary.listingFailed
+        ))
+    end
+
+    return summary.listed > 0
+end
+
+function MarketSeeder:getTemplateRequests()
+    local requests = {}
+
+    local defaultQuantity = tonumber(self.defaultQuantity) or 1
+    if defaultQuantity < 1 then
+        defaultQuantity = 1
+    end
+
+    local templateQuantities = self.templateQuantities or {}
+
+    local function resolveQuantity(templatePath, quantity)
+        local override = templateQuantities[templatePath]
+
+        if override ~= nil then
+            local overrideNumber = tonumber(override)
+            if overrideNumber ~= nil and overrideNumber >= 1 then
+                return math.floor(overrideNumber + 0.5)
+            end
+        end
+
+        local value = tonumber(quantity)
+        if value ~= nil and value >= 1 then
+            return math.floor(value + 0.5)
+        end
+
+        return defaultQuantity
+    end
+
+    local function addTemplate(templatePath, quantity)
+        if type(templatePath) ~= "string" or templatePath == "" then
+            return
+        end
+
+        local resolvedQuantity = resolveQuantity(templatePath, quantity)
+
+        requests[#requests + 1] = {
+            template = templatePath,
+            count = resolvedQuantity
+        }
+    end
+
+    if self.template ~= nil then
+        addTemplate(self.template, defaultQuantity)
+    end
+
+    if self.templates ~= nil then
+        for _, entry in ipairs(self.templates) do
+            if type(entry) == "string" then
+                addTemplate(entry, defaultQuantity)
+            elseif type(entry) == "table" then
+                local templatePath = entry.template or entry[1]
+                local quantity = entry.count or entry.quantity or entry.amount or entry.copies or entry[2]
+                addTemplate(templatePath, quantity)
+            end
+        end
+    end
+
+    if self.templateSource ~= nil then
+        local sourceQuantity = self.templateSource.quantity or self.templateSource.count or self.templateSource.amount
+
+        if MarketSeederTemplates ~= nil and MarketSeederTemplates.getTemplates ~= nil then
+            local sourceTemplates = MarketSeederTemplates.getTemplates(self.templateSource)
+            for _, templatePath in ipairs(sourceTemplates) do
+                addTemplate(templatePath, sourceQuantity)
+            end
+        else
+            self:log("template source unavailable; unable to load templates from source")
+        end
+    end
+
+    return requests
+end
+
+function MarketSeeder:buildSeedQueue()
+    local queue = {}
+    local requests = self:getTemplateRequests()
+
+    for _, request in ipairs(requests) do
+        local templatePath = request.template
+        local count = request.count or 1
+
+        if type(templatePath) == "string" and templatePath ~= "" then
+            if type(count) ~= "number" then
+                count = tonumber(count) or 1
+            end
+
+            count = math.max(1, math.floor(count + 0.5))
+
+            for _ = 1, count, 1 do
+                queue[#queue + 1] = templatePath
+            end
+        end
+    end
+
+    return queue
+end
+
+function MarketSeeder:seedTemplate(pSeller, pInventory, templatePath)
+    if MarketSeederBridge.templateExists ~= nil and not MarketSeederBridge.templateExists(templatePath) then
+        return false, "missingTemplate"
     end
 
     local pItem = nil
 
     if MarketSeederBridge.createItem ~= nil then
-        pItem = MarketSeederBridge.createItem(pSeller, pInventory, self.template, -1, false)
+        pItem = MarketSeederBridge.createItem(pSeller, pInventory, templatePath, -1, false)
     else
-        pItem = giveItem(pInventory, self.template, -1)
+        pItem = giveItem(pInventory, templatePath, -1)
     end
 
     if pItem == nil then
-        self:log("failed to create test item for template " .. self.template)
-
-        if pInvoker ~= nil then
-            CreatureObject(pInvoker):sendSystemMessage("[MarketSeeder] Failed to create test item; check template path.")
-        end
-
-        return false
+        return false, "creationFailed"
     end
 
     local itemObject = SceneObject(pItem)
@@ -158,33 +355,17 @@ function MarketSeeder:seed_once(pInvoker, reason)
         itemId = itemObject:getObjectID()
     end
 
-    self:log(string.format("created test item template=%s oid=%s (reason=%s)", self.template, tostring(itemId), context))
-
     local success = MarketSeederBridge.listOnBazaar(pItem, pSeller, self.planet, self.bazaar.x, self.bazaar.z, self.bazaar.y, self.testPrice, self.testDurationHours)
 
     if success then
-        self._hasSeeded = true
-        self.lastItemId = itemId
-        self:log(string.format("listed item oid=%s at %s (%.1f, %.1f) price=%d durationHours=%d", tostring(itemId), self.planet, self.bazaar.x, self.bazaar.y, self.testPrice, self.testDurationHours))
-
-        if pInvoker ~= nil then
-            CreatureObject(pInvoker):sendSystemMessage("[MarketSeeder] Test listing created on Mos Eisley bazaar.")
-        end
-
-        return true
+        return true, nil, itemId
     end
-
-    self:log("listing failed; cleaning up item")
 
     if itemObject ~= nil then
         itemObject:destroyObjectFromWorld(true)
         itemObject:destroyObjectFromDatabase()
     end
 
-    if pInvoker ~= nil then
-        CreatureObject(pInvoker):sendSystemMessage("[MarketSeeder] Failed to list bazaar item; check server logs.")
-    end
-
-    return false
+    return false, "listingFailed"
 end
 
