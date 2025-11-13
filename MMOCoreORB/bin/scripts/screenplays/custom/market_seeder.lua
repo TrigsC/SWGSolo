@@ -1,17 +1,17 @@
 MarketSeeder = {
     planet = "naboo",
-    bazaar = { x = -5145.46, z = 6.55, y = 4143.07 },
-    testPrice = 12345,
-    testDurationHours = 24,
-    template = nil,
+    bazaar = { x = -5145.46, z = 6.55, y = 4143.07 }, -- Theed
+    testPrice = 20000,
+    testDurationHours = 168, --7 days
+    template = nil, -- If using 1 template
     -- Example configuration: list two template paths to seed and override their quantities below.
     templates = {
-        "object/tangible/loot/simple_kit/empty_datapad.iff",
-        "object/tangible/loot/simple_kit/datapad_connectors.iff"
+        "object/tangible/wearables/armor/composite/armor_composite_helmet.iff",
+        "object/tangible/wearables/armor/composite/armor_composite_chest_plate.iff"
     },
     templateQuantities = {
-        ["object/tangible/loot/simple_kit/empty_datapad.iff"] = 2,
-        ["object/tangible/loot/simple_kit/datapad_connectors.iff"] = 4
+        ["object/tangible/wearables/armor/composite/armor_composite_helmet.iff"] = 3,
+        ["object/tangible/wearables/armor/composite/armor_composite_chest_plate.iff"] = 3
     },
     templateSource = nil,
     defaultQuantity = 1,
