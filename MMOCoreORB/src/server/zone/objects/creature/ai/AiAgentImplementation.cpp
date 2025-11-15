@@ -3992,18 +3992,18 @@ void AiAgentImplementation::notifyPackMobs(SceneObject* attacker) {
 		Reference<SceneObject*> attackerRef = attacker;
 
 		Core::getTaskManager()->executeTask([agentRef, attackerRef] () {
-			Locker locker(agentRef);
-			Locker clocker(attackerRef, agentRef);
+            Locker locker(agentRef);
+            Locker clocker(attackerRef, agentRef);
 
-			Time* lastNotify = agentRef->getLastPackNotify();
+            Time* lastNotify = agentRef->getLastPackNotify();
 
-			if (lastNotify != nullptr) {
-				lastNotify->updateToCurrentTime();
-				lastNotify->addMiliTime(30000);
-			}
+            if (lastNotify != nullptr) {
+                lastNotify->updateToCurrentTime();
+                lastNotify->addMiliTime(30000);
+            }
 
-			agentRef->showFlyText("npc_reaction/flytext", "threaten", 0xFF, 0, 0);
-			agentRef->setDefender(attackerRef);
+            agentRef->showFlyText("npc_reaction/flytext", "threaten", 0xFF, 0, 0);
+            agentRef->setDefender(attackerRef);
 
 		}, "PackAttackLambda");
 	}
@@ -4035,22 +4035,23 @@ void AiAgentImplementation::notifyPackMobs(SceneObject* attacker) {
         int engagedFriendlies = 0;
 
         {
-                Locker attackerLocker(attackerCreo, selfAgent);
-                const DeltaVector<ManagedReference<SceneObject*> >* defenderList = attackerCreo->getDefenderList();
-
-                if (defenderList != nullptr) {
-                        for (int i = 0; i < defenderList->size(); ++i) {
-                                ManagedReference<SceneObject*> defender = defenderList->get(i);
-
-                                if (defender == nullptr || !defender->isAiAgent())
-                                        continue;
-
-                                AiAgent* defenderAgent = defender->asAiAgent();
-
-                                if (defenderAgent != nullptr && defenderAgent->getFaction() == selfFaction)
-                                        ++engagedFriendlies;
-                        }
+            Locker attackerLocker(attackerCreo, selfAgent);
+            const DeltaVector<ManagedReference<SceneObject*> >* defenderList = attackerCreo->getDefenderList();
+            if (defenderList != nullptr) {
+                for (int i = 0; i < defenderList->size(); ++i) {
+                    ManagedReference<SceneObject*> defender = defenderList->get(i);
+                    if (defender == nullptr || !defender->isAiAgent())
+                        continue;
+                    AiAgent* defenderAgent = defender->asAiAgent();
+					if (defenderAgent == nullptr)
+						continue;
+					if (defenderAgent->isDead() || defenderAgent->isIncapacitated())
+						continue;
+                    if (defenderAgent->getFaction() != selfFaction)
+						continue;
+					++engagedFriendlies;
                 }
+            }
         }
 
         if (engagedFriendlies >= MAX_ALLY_ENGAGERS)
