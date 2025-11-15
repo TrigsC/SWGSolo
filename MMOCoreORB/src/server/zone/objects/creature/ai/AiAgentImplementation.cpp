@@ -97,6 +97,41 @@
 // #define SHOW_NEXT_POSITION
 // #define DEBUG_FINDNEXTPOSITION
 
+namespace {
+
+bool originatesFromDestroyMissionLair(AiAgent* agent) {
+        if (agent == nullptr)
+                return false;
+
+        ManagedReference<SceneObject*> home = agent->getHomeObject().get();
+
+        if (home == nullptr)
+                return false;
+
+        auto hasDestroyMissionObserver = [&](int eventType) -> bool {
+                SortedVector<ManagedReference<Observer*> > observers = home->getObservers(eventType);
+
+                for (int i = 0; i < observers.size(); ++i) {
+                        ManagedReference<SpawnObserver*> spawnObserver = observers.get(i).castTo<SpawnObserver*>();
+
+                        if (spawnObserver != nullptr && spawnObserver->isDestroyMissionLairObserver())
+                                return true;
+                }
+
+                return false;
+        };
+
+        if (hasDestroyMissionObserver(ObserverEventType::CREATUREDESPAWNED))
+                return true;
+
+        if (hasDestroyMissionObserver(ObserverEventType::OBJECTDESTRUCTION))
+                return true;
+
+        return false;
+}
+
+}
+
 void AiAgentImplementation::initializeTransientMembers() {
 	CreatureObjectImplementation::initializeTransientMembers();
 
@@ -3972,6 +4007,149 @@ void AiAgentImplementation::notifyPackMobs(SceneObject* attacker) {
 
 		}, "PackAttackLambda");
 	}
+	// START OF AI FRIEND ASSIST
+	AiAgent* selfAgent = asAiAgent();
+
+        if (selfAgent == nullptr)
+                return;
+
+        if (originatesFromDestroyMissionLair(selfAgent))
+                return;
+
+        // Allow same-faction allies to assist nearby players only when this isn't a destroy-mission lair.
+        // Destroy-mission lairs spawn spin groups where mass assistance would overwhelm players.
+        if (attacker == nullptr || !attacker->isCreatureObject())
+                return;
+
+        CreatureObject* attackerCreo = attacker->asCreatureObject();
+
+        if (attackerCreo == nullptr || !attackerCreo->isPlayerCreature())
+                return;
+
+        uint32 selfFaction = getFaction();
+
+        if (selfFaction == 0)
+                return;
+
+        const int MAX_ALLY_ENGAGERS = 3;
+        int engagedFriendlies = 0;
+
+        {
+                Locker attackerLocker(attackerCreo, selfAgent);
+                const DeltaVector<ManagedReference<SceneObject*> >* defenderList = attackerCreo->getDefenderList();
+
+                if (defenderList != nullptr) {
+                        for (int i = 0; i < defenderList->size(); ++i) {
+                                ManagedReference<SceneObject*> defender = defenderList->get(i);
+
+                                if (defender == nullptr || !defender->isAiAgent())
+                                        continue;
+
+                                AiAgent* defenderAgent = defender->asAiAgent();
+
+                                if (defenderAgent != nullptr && defenderAgent->getFaction() == selfFaction)
+                                        ++engagedFriendlies;
+                        }
+                }
+        }
+
+        if (engagedFriendlies >= MAX_ALLY_ENGAGERS)
+                return;
+
+        const float ASSIST_RANGE = 30.0f;
+        const float ASSIST_RANGE_SQUARED = ASSIST_RANGE * ASSIST_RANGE;
+
+        Vector< Reference<AiAgent*> > assistCandidates;
+
+        for (int i = 0; i < closeObjects.size(); ++i) {
+                SceneObject* object = static_cast<SceneObject*>(closeObjects.get(i));
+
+                if (!object->isCreatureObject())
+                        continue;
+
+                CreatureObject* creature = object->asCreatureObject();
+
+                if (creature == nullptr || creature->getObjectID() == getObjectID())
+                        continue;
+
+                AiAgent* candidateAgent = creature->asAiAgent();
+
+                if (candidateAgent == nullptr || candidateAgent == selfAgent)
+                        continue;
+
+                if (candidateAgent->isDead() || candidateAgent->isIncapacitated())
+                        continue;
+
+                if (candidateAgent->getFaction() != selfFaction)
+                        continue;
+
+                if (originatesFromDestroyMissionLair(candidateAgent))
+                        continue;
+
+                if (candidateAgent->hasDefender(attacker))
+                        continue;
+
+                if (!candidateAgent->isAggressiveTo(attackerCreo))
+                        continue;
+
+                Vector3 candidatePosition = candidateAgent->getWorldPosition();
+                Vector3 attackerPosition = attackerCreo->getWorldPosition();
+
+                if (candidatePosition.squaredDistanceTo(attackerPosition) > ASSIST_RANGE_SQUARED)
+                        continue;
+
+                if (!CollisionManager::checkLineOfSight(candidateAgent, attackerCreo))
+                        continue;
+
+                assistCandidates.add(candidateAgent);
+        }
+
+        if (assistCandidates.isEmpty())
+                return;
+
+        Reference<SceneObject*> attackerRef = attacker;
+
+        for (int i = 0; i < assistCandidates.size() && engagedFriendlies < MAX_ALLY_ENGAGERS; ++i) {
+                Reference<AiAgent*> candidateRef = assistCandidates.get(i);
+
+                if (candidateRef == nullptr)
+                        continue;
+
+                ++engagedFriendlies;
+
+                Core::getTaskManager()->executeTask([candidateRef, attackerRef] () {
+                        Locker locker(candidateRef);
+                        Locker clocker(attackerRef, candidateRef);
+
+                        AiAgent* candidate = candidateRef.get();
+                        SceneObject* enemy = attackerRef.get();
+
+                        if (candidate == nullptr || enemy == nullptr || !enemy->isCreatureObject())
+                                return;
+
+                        CreatureObject* enemyCreo = enemy->asCreatureObject();
+
+                        if (enemyCreo == nullptr || enemyCreo->isDead() || enemyCreo->isIncapacitated())
+                                return;
+
+                        if (candidate->isDead() || candidate->isIncapacitated())
+                                return;
+
+                        if (!candidate->isAggressiveTo(enemyCreo))
+                                return;
+
+                        if (!candidate->isInRange(enemyCreo, 30.0f))
+                                return;
+
+                        if (!candidate->checkLineOfSight(enemyCreo))
+                                return;
+
+                        if (!candidate->hasDefender(enemy))
+                                candidate->addDefender(enemy);
+
+                }, "FactionAssistLambda");
+        }
+	// END OF AI FRIEND ASSIST
 }
 
 
