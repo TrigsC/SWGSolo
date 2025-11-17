@@ -1626,7 +1626,7 @@ bool AiAgentImplementation::selectSpecialAttack() {
 	// Note: All of these are *per decision* chances; no persistence/state.
 
 	// 1) Intimidate – good opener / debuff. Try fairly often if present.
-	if (!intimidateIndices.isEmpty() && System::random(100) < 50) { // 50% chance
+	if (!intimidateIndices.isEmpty() && System::random(100) < 20) { // 20% chance
 		int idx = System::random(intimidateIndices.size() - 1);
 		attackNum = intimidateIndices.get(idx);
 
@@ -1637,7 +1637,7 @@ bool AiAgentImplementation::selectSpecialAttack() {
 	}
 
 	// 2) Knockdown – strong state, use but don't spam every time.
-	if (!kdIndices.isEmpty() && System::random(100) < 30) { // 30% chance
+	if (!kdIndices.isEmpty() && System::random(100) < 10) { // 10% chance
 		int idx = System::random(kdIndices.size() - 1);
 		attackNum = kdIndices.get(idx);
 
@@ -1648,7 +1648,7 @@ bool AiAgentImplementation::selectSpecialAttack() {
 	}
 
 	// 3) Other state attacks – blind/dizzy/stun
-	if (!stateIndices.isEmpty() && System::random(100) < 30) { // 30% chance
+	if (!stateIndices.isEmpty() && System::random(100) < 10) { // 10% chance
 		int idx = System::random(stateIndices.size() - 1);
 		attackNum = stateIndices.get(idx);
 
