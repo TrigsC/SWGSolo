@@ -1762,15 +1762,126 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
 }
 
 bool AiAgentImplementation::selectDefaultAttack() {
-	if (npcTemplate == nullptr)
-		nextActionCRC = STRING_HASHCODE("defaultattack");
-	else
-		nextActionCRC = npcTemplate->getDefaultAttack().hashCode();
+    String cmd;
 
-	nextActionArgs = "";
+    // 1) Template-defined default, if present
+    if (npcTemplate != nullptr) {
+        cmd = npcTemplate->getDefaultAttack();
+    }
 
-	return true;
+    // 2) If template didn't define a default, derive from attack maps (which are already weapon-filtered)
+    if (cmd.isEmpty()) {
+        const CreatureAttackMap* map = primaryAttackMap;
+
+        // If primary map is empty/null, fall back to defaultAttackMap
+        if (map == nullptr || map->isEmpty()) {
+            map = defaultAttackMap;
+        }
+
+        int bestIdx   = -1;
+        int bestScore = -9999;
+
+        if (map != nullptr && !map->isEmpty()) {
+            for (int i = 0; i < map->size(); ++i) {
+                String key   = map->getCommand(i);
+                String lower = key.toLowerCase();
+
+                int score = 0;
+
+                // --- Strong negative for pure utility / state stuff we don't want as "auto" ---
+                if (lower.contains("intimidate") ||
+                    lower.contains("knockdown") ||
+                    lower.contains("blind") ||
+                    lower.contains("dizzy") ||
+                    lower.contains("stun") ||
+                    lower.contains("sweep") ||
+                    lower.contains("area") ||
+                    lower.contains("cone") ||
+                    lower.contains("spray") ||
+                    lower.contains("suppression") ||
+                    lower.contains("warning") ||
+                    lower.contains("confusion") ||
+                    lower.contains("meleedefense")) {
+                    score -= 10;
+                }
+
+                // --- Force nukes ---
+                if (lower.contains("forcelightningsingle2")) score += 9;
+                else if (lower.contains("forcelightningsingle1")) score += 8;
+                else if (lower.contains("mindblast2")) score += 7;
+                else if (lower.contains("mindblast1")) score += 6;
+
+                // --- Saber / lightsaber main hits ---
+                if (lower.contains("saber2hbodyhit3") || lower.contains("saber1hhit3")) score += 9;
+                else if (lower.contains("saber2hbodyhit2") || lower.contains("saber1hheadhit2")) score += 7;
+                else if (lower.contains("saberslash2") || lower.contains("saberslash1")) score += 6;
+
+                // --- Melee body/head/hit tiers (fencer/swordsman/pikeman/brawler/tka) ---
+                if (lower.contains("bodyhit3") || lower.contains("headhit3")) score += 8;
+                else if (lower.contains("bodyhit2") || lower.contains("headhit2")) score += 6;
+                else if (lower.contains("hit3")) score += 5;
+                else if (lower.contains("hit2")) score += 4;
+                else if (lower.contains("hit1")) score += 2;
+
+                // --- Ranged shot tiers (marksman/pistoleer/carbineer/rifleman/bh/commando) ---
+                if (lower.contains("bodyshot3") || lower.contains("headshot3")) score += 8;
+                else if (lower.contains("bodyshot2") || lower.contains("headshot2")) score += 6;
+
+                if (lower.contains("healthshot2") || lower.contains("actionshot2")) score += 6;
+                if (lower.contains("fullautosingle2") || lower.contains("flurryshot2") ||
+                    lower.contains("wildshot2") || lower.contains("strafeshot2")) score += 5;
+                if (lower.contains("fullautosingle1") || lower.contains("flurryshot1") ||
+                    lower.contains("strafeshot1")) score += 3;
+
+                // --- Good melee specials to use as main if no better single-hit ---
+                if (lower.contains("spinattack2") || lower.contains("flurry") ||
+                    lower.contains("lunge2") || lower.contains("dervish2")) {
+                    score += 4;
+                } else if (lower.contains("spinattack1") || lower.contains("lunge1") ||
+                           lower.contains("dervish")) {
+                    score += 2;
+                }
+
+                // Avoid taking a clearly bad candidate as "best"
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestIdx   = i;
+                }
+            }
+
+            if (bestIdx != -1 && bestScore > -5) {
+                cmd = map->getCommand(bestIdx);
+            }
+        }
+    }
+
+    // 3) Final fallback: generic auto-attack if we still didn't pick anything
+    if (cmd.isEmpty()) {
+        cmd = "defaultattack";
+    }
+
+    nextActionCRC  = cmd.hashCode();
+    nextActionArgs = "";
+
+#ifdef DEBUG_AI_ATTACK
+    info(true) << "AI_ATTACK: selectDefaultAttack using cmd=" << cmd
+               << " crc=" << nextActionCRC << " for "
+               << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
+
+    return true;
 }
+
+//bool AiAgentImplementation::selectDefaultAttack() {
+//	if (npcTemplate == nullptr)
+//		nextActionCRC = STRING_HASHCODE("defaultattack");
+//	else
+//		nextActionCRC = npcTemplate->getDefaultAttack().hashCode();
+//
+//	nextActionArgs = "";
+//
+//	return true;
+//}
 
 const QueueCommand* AiAgentImplementation::getNextAction() {
 	auto zoneServer = getZoneServer();
