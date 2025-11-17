@@ -1554,7 +1554,7 @@ void AiAgentImplementation::doRecovery(int latency) {
 */
 
 bool AiAgentImplementation::selectSpecialAttack() {
-	// Handle Thrown Weapons (unchanged)
+	// --- Thrown weapons handling (unchanged) ---
 	if (System::random(100) > 95) {
 		ManagedReference<WeaponObject*> thrownWeapRef = thrownWeapon.get();
 
@@ -1571,7 +1571,10 @@ bool AiAgentImplementation::selectSpecialAttack() {
 
 					Locker lock(strongAgent);
 
-					strongAgent->enqueueCommand(STRING_HASHCODE("throwgrenade"), 0, targetID, String::valueOf(thrownWeapRef->getObjectID()), QueueCommand::NORMAL);
+					strongAgent->enqueueCommand(
+						STRING_HASHCODE("throwgrenade"), 0, targetID,
+						String::valueOf(thrownWeapRef->getObjectID()), QueueCommand::NORMAL
+					);
 
 					if (thrownWeapRef->getUseCount() <= 0) {
 						Locker locker(thrownWeapRef, strongAgent);
@@ -1588,14 +1591,15 @@ bool AiAgentImplementation::selectSpecialAttack() {
 
 	if (attackMap == nullptr) {
 #ifdef DEBUG_AI_ATTACK
-		info(true) << "AI_ATTACK: selectSpecialAttack() - attackMap == nullptr, falling back to selectDefaultAttack() for "
+		info(true) << "AI_ATTACK: selectSpecialAttack() - attackMap == nullptr, "
+		           << "falling back to selectDefaultAttack() for "
 		           << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
 		selectDefaultAttack();
 		return true;
 	}
 
-	// --- Categorize available attacks by role based on command key names ---
+	// --- Categorize attacks by name (stateless) ---
 
 	Vector<int> intimidateIndices;
 	Vector<int> kdIndices;
@@ -1617,80 +1621,44 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		}
 	}
 
-	// --- Read / update simple state from the blackboard ---
-
-	int intimidateTries = 0;
-	if (peekBlackboard("intimidateTries")) {
-		intimidateTries = readBlackboard("intimidateTries").get<int>();
-	}
-
-	int kdLockout = 0;
-	if (peekBlackboard("kdLockout")) {
-		kdLockout = readBlackboard("kdLockout").get<int>();
-	}
-
-	// Decrement KD lockout each decision
-	if (kdLockout > 0) {
-		kdLockout--;
-		writeBlackboard("kdLockout", kdLockout);
-	}
-
 	int attackNum = -1;
 
-	// --- 1) Early priority: Intimidate as opener / debuff ---
+	// Note: All of these are *per decision* chances; no persistence/state.
 
-	// Up to 4 intimidate attempts per fight, high priority
-	if (!intimidateIndices.isEmpty() && intimidateTries < 4) {
-		// Strong bias to use intimidate while still under the cap
-		if (System::random(100) < 70) { // 70% chance when available
-			int idx = System::random(intimidateIndices.size() - 1);
-			attackNum = intimidateIndices.get(idx);
-			intimidateTries++;
-			writeBlackboard("intimidateTries", intimidateTries);
+	// 1) Intimidate – good opener / debuff. Try fairly often if present.
+	if (!intimidateIndices.isEmpty() && System::random(100) < 50) { // 50% chance
+		int idx = System::random(intimidateIndices.size() - 1);
+		attackNum = intimidateIndices.get(idx);
 
 #ifdef DEBUG_AI_ATTACK
-			debugLogSelectedAttack(this, "selectSpecialAttack(prio_intimidate)", attackMap, attackNum);
+		debugLogSelectedAttack(this, "selectSpecialAttack(prio_intimidate)", attackMap, attackNum);
 #endif
-			return selectSpecialAttack(attackNum);
-		}
+		return selectSpecialAttack(attackNum);
 	}
 
-	// --- 2) Try Knockdown sometimes, but not spammed ---
-
-	if (!kdIndices.isEmpty() && kdLockout == 0) {
-		// Don't KD every time; treat it as a special setup move
-		if (System::random(100) < 35) { // ~35% chance when off "cooldown"
-			int idx = System::random(kdIndices.size() - 1);
-			attackNum = kdIndices.get(idx);
-
-			// Set a simple lockout so we don't spam KD
-			kdLockout = 5; // number of decisions before we can KD again
-			writeBlackboard("kdLockout", kdLockout);
+	// 2) Knockdown – strong state, use but don't spam every time.
+	if (!kdIndices.isEmpty() && System::random(100) < 30) { // 30% chance
+		int idx = System::random(kdIndices.size() - 1);
+		attackNum = kdIndices.get(idx);
 
 #ifdef DEBUG_AI_ATTACK
-			debugLogSelectedAttack(this, "selectSpecialAttack(prio_knockdown)", attackMap, attackNum);
+		debugLogSelectedAttack(this, "selectSpecialAttack(prio_knockdown)", attackMap, attackNum);
 #endif
-			return selectSpecialAttack(attackNum);
-		}
+		return selectSpecialAttack(attackNum);
 	}
 
-	// --- 3) Other state attempts (blind/dizzy/stun) ---
-
-	if (!stateIndices.isEmpty()) {
-		// Occasionally try to apply / reapply a disabling state
-		if (System::random(100) < 30) { // ~30% chance
-			int idx = System::random(stateIndices.size() - 1);
-			attackNum = stateIndices.get(idx);
+	// 3) Other state attacks – blind/dizzy/stun
+	if (!stateIndices.isEmpty() && System::random(100) < 30) { // 30% chance
+		int idx = System::random(stateIndices.size() - 1);
+		attackNum = stateIndices.get(idx);
 
 #ifdef DEBUG_AI_ATTACK
-			debugLogSelectedAttack(this, "selectSpecialAttack(prio_state)", attackMap, attackNum);
+		debugLogSelectedAttack(this, "selectSpecialAttack(prio_state)", attackMap, attackNum);
 #endif
-			return selectSpecialAttack(attackNum);
-		}
+		return selectSpecialAttack(attackNum);
 	}
 
-	// --- 4) Default: damage / filler attacks ---
-
+	// 4) Otherwise, just use a generic damage/filler special
 	if (!genericIndices.isEmpty()) {
 		int idx = System::random(genericIndices.size() - 1);
 		attackNum = genericIndices.get(idx);
@@ -1701,8 +1669,7 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		return selectSpecialAttack(attackNum);
 	}
 
-	// --- 5) Absolute fallback: fully random from map (should be rare) ---
-
+	// 5) Absolute fallback: fully random
 	int randomIdx = attackMap->getRandomAttackNumber();
 
 #ifdef DEBUG_AI_ATTACK
