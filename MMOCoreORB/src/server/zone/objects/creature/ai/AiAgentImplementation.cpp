@@ -97,6 +97,36 @@
 // #define SHOW_NEXT_POSITION
 // #define DEBUG_FINDNEXTPOSITION
 
+#ifdef DEBUG_AI_ATTACK
+static void debugLogSelectedAttack(AiAgentImplementation* agent,
+        const String& context,
+        const CreatureAttackMap* attackMap,
+        int attackNum) {
+
+    if (agent == nullptr)
+        return;
+
+    if (attackMap == nullptr) {
+        agent->info(true) << "AI_ATTACK: " << context << " - attackMap == nullptr for "
+                          << agent->getDisplayedName() << " (" << agent->getObjectID() << ")";
+        return;
+    }
+
+    if (attackNum < 0 || attackNum >= attackMap->size()) {
+        agent->info(true) << "AI_ATTACK: " << context << " - invalid attackNum=" << attackNum
+                          << " size=" << attackMap->size() << " for "
+                          << agent->getDisplayedName() << " (" << agent->getObjectID() << ")";
+        return;
+    }
+
+    String cmdKey = attackMap->getCommand(attackNum);
+
+    agent->info(true) << "AI_ATTACK: " << context << " chose index=" << attackNum
+                      << " key=" << cmdKey << " for "
+                      << agent->getDisplayedName() << " (" << agent->getObjectID() << ")";
+}
+#endif // DEBUG_AI_ATTACK
+
 #ifdef DEBUG_AI_WEAPONS
 // Simple debug helper to dump the contents of a CreatureAttackMap
 static void debugLogAttackMap(AiAgentImplementation* agent,
@@ -1556,11 +1586,21 @@ bool AiAgentImplementation::selectSpecialAttack() {
 	const CreatureAttackMap* attackMap = getAttackMap();
 
 	if (attackMap == nullptr) {
+#ifdef DEBUG_AI_ATTACK
+		info(true) << "AI_ATTACK: selectSpecialAttack() - attackMap == nullptr, falling back to selectDefaultAttack() for "
+		           << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
 		selectDefaultAttack();
 		return true;
 	}
 
-	return selectSpecialAttack(attackMap->getRandomAttackNumber());
+	int attackNum = attackMap->getRandomAttackNumber();
+
+#ifdef DEBUG_AI_ATTACK
+	debugLogSelectedAttack(this, "selectSpecialAttack(random)", attackMap, attackNum);
+#endif
+
+	return selectSpecialAttack(attackNum);
 }
 
 bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
@@ -1571,10 +1611,21 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
 		if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
 			info("attackMap == nullptr", true);
 #endif // DEBUG_AI
+
+#ifdef DEBUG_AI_ATTACK
+		info(true) << "AI_ATTACK: selectSpecialAttack(" << attackNum
+		           << ") - attackMap == nullptr for "
+		           << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
 		return false;
 	}
 
 	if (attackNum < 0) {
+#ifdef DEBUG_AI_ATTACK
+		info(true) << "AI_ATTACK: selectSpecialAttack(" << attackNum
+		           << ") - negative attackNum, delegating to selectSpecialAttack() for "
+		           << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
 		return selectSpecialAttack();
 	}
 
@@ -1583,6 +1634,12 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
 		if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
 			info("attackNum >= attackMap->size()", true);
 #endif // DEBUG_AI
+
+#ifdef DEBUG_AI_ATTACK
+		info(true) << "AI_ATTACK: selectSpecialAttack(" << attackNum
+		           << ") - attackNum >= size (" << attackMap->size()
+		           << ") for " << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
 		return false;
 	}
 
@@ -1593,8 +1650,18 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
 		if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
 			info("cmd.isEmpty()", true);
 #endif // DEBUG_AI
+
+#ifdef DEBUG_AI_ATTACK
+		info(true) << "AI_ATTACK: selectSpecialAttack(" << attackNum
+		           << ") - cmd is empty for "
+		           << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
 		return false;
 	}
+
+#ifdef DEBUG_AI_ATTACK
+	debugLogSelectedAttack(this, "selectSpecialAttack(explicit)", attackMap, attackNum);
+#endif
 
 	nextActionCRC = cmd.hashCode();
 	nextActionArgs = attackMap->getArguments(attackNum);
