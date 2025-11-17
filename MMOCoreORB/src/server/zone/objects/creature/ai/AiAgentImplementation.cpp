@@ -97,6 +97,49 @@
 // #define SHOW_NEXT_POSITION
 // #define DEBUG_FINDNEXTPOSITION
 
+#ifdef DEBUG_AI_WEAPONS
+// Simple debug helper to dump the contents of a CreatureAttackMap
+static void debugLogAttackMap(AiAgentImplementation* agent,
+		const String& label,
+		const CreatureAttackMap* map,
+		ObjectController* objectController) {
+
+	if (agent == nullptr) return;
+
+	if (map == nullptr) {
+		agent->info(true) << "AI_WEAPONS: " << label << " is nullptr for "
+		                  << agent->getDisplayedName() << " (" << agent->getObjectID() << ")";
+		return;
+	}
+
+	agent->info(true) << "AI_WEAPONS: " << label << " for "
+	                  << agent->getDisplayedName() << " ("
+	                  << agent->getObjectID() << ") size=" << map->size();
+
+	if (objectController == nullptr || map->isEmpty())
+		return;
+
+	for (int i = 0; i < map->size(); ++i) {
+		// In your code, getCommand(i) is already what getQueueCommand expects,
+		// and it's a String, not a uint32.
+		String cmdKey = map->getCommand(i);
+
+		const CombatQueueCommand* cmd =
+			cast<const CombatQueueCommand*>(objectController->getQueueCommand(cmdKey));
+
+		if (cmd == nullptr) {
+			agent->info(true) << "  [" << i << "] key=" << cmdKey
+			                  << " (NO COMMAND FOUND)";
+			continue;
+		}
+
+		// We don't rely on CombatQueueCommand having getCommandName().
+		// Just log the key from the map, since that's the configured command name.
+		agent->info(true) << "  [" << i << "] key=" << cmdKey;
+	}
+}
+#endif // DEBUG_AI_WEAPONS
+
 namespace {
 
 bool originatesFromDestroyMissionLair(AiAgent* agent) {
@@ -1050,50 +1093,13 @@ void AiAgentImplementation::setWeaponStats() {
 	}
 }
 
-#ifdef DEBUG_AI_WEAPONS
-void AiAgentImplementation::debugLogAttackMap(AiAgentImplementation* agent,
-		const String& label,
-		const CreatureAttackMap* map,
-		ObjectController* objectController) {
-
-	if (agent == nullptr) return;
-
-	if (map == nullptr) {
-		agent->info(true) << "AI_WEAPONS: " << label << " is nullptr for "
-		                  << agent->getDisplayedName() << " (" << agent->getObjectID() << ")";
-		return;
-	}
-
-	agent->info(true) << "AI_WEAPONS: " << label << " for "
-	                  << agent->getDisplayedName() << " (" << agent->getObjectID()
-	                  << ") size=" << map->size();
-
-	if (objectController == nullptr || map->isEmpty())
-		return;
-
-	for (int i = 0; i < map->size(); ++i) {
-		uint32 cmdCrc = map->getCommand(i);
-
-		const CombatQueueCommand* cmd =
-			cast<const CombatQueueCommand*>(objectController->getQueueCommand(cmdCrc));
-
-		if (cmd == nullptr) {
-			agent->info(true) << "  [" << i << "] crc=" << cmdCrc << " (NO COMMAND FOUND)";
-			continue;
-		}
-
-		String cmdName = cmd->getCommandName(); // adjust if your API differs
-		agent->info(true) << "  [" << i << "] crc=" << cmdCrc << " name=" << cmdName;
-	}
-}
-#endif // DEBUG_AI_WEAPONS
-
 void AiAgentImplementation::setupAttackMaps() {
 	if (npcTemplate == nullptr)
 		return;
 
 #ifdef DEBUG_AI_WEAPONS
-	info(true) << "setupAttackMaps - " << getDisplayedName() << " " << getObjectID();
+	info(true) << "AI_WEAPONS: setupAttackMaps for "
+	           << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
 
 	primaryAttackMap = nullptr;
@@ -1112,6 +1118,7 @@ void AiAgentImplementation::setupAttackMaps() {
 
 	const CreatureAttackMap* attackMap;
 
+	// ----- PRIMARY ATTACKS -----
 	if (petDeed != nullptr)
 		attackMap = petDeed->getAttacks();
 	else
@@ -1130,58 +1137,66 @@ void AiAgentImplementation::setupAttackMaps() {
 	secondaryAttackMap = new CreatureAttackMap();
 
 	for (int i = 0; i < attackMap->size(); i++) {
-		const CombatQueueCommand* attack = cast<const CombatQueueCommand*>(objectController->getQueueCommand(attackMap->getCommand(i)));
+		// This String is what getQueueCommand wants
+		String cmdKey = attackMap->getCommand(i);
+
+		const CombatQueueCommand* attack =
+			cast<const CombatQueueCommand*>(objectController->getQueueCommand(cmdKey));
 
 		if (attack == nullptr)
 			continue;
+
 #ifdef DEBUG_AI_WEAPONS
-		String cmdName = attack->getCommandName();
 		info(true) << "AI_WEAPONS: checking primary raw cmd ["
-		           << i << "] " << cmdName;
+		           << i << "] key=" << cmdKey;
 #endif
 
 		if (primaryWeap != nullptr && (attack->getWeaponType() & primaryWeap->getWeaponBitmask())) {
 			primaryAttackMap->add(attackMap->get(i));
-		}
 #ifdef DEBUG_AI_WEAPONS
-		info(true) << "  -> added to primaryAttackMap";
+			info(true) << "  -> added to primaryAttackMap";
 #endif
+		}
 
 		if (defaultWeap != nullptr && (attack->getWeaponType() & defaultWeap->getWeaponBitmask())) {
 			defaultAttackMap->add(attackMap->get(i));
-
 #ifdef DEBUG_AI_WEAPONS
-		info(true) << "  -> added to defaultAttackMap";
+			info(true) << "  -> added to defaultAttackMap";
 #endif
 		}
 	}
 
+	// ----- SECONDARY ATTACKS -----
 	if (petDeed == nullptr) {
 		attackMap = npcTemplate->getSecondaryAttacks();
 
+#ifdef DEBUG_AI_WEAPONS
+		debugLogAttackMap(this, "Template secondaryAttacks (raw)", attackMap, objectController);
+#endif
+
 		for (int i = 0; i < attackMap->size(); i++) {
-			const CombatQueueCommand* attack = cast<const CombatQueueCommand*>(objectController->getQueueCommand(attackMap->getCommand(i)));
+			String cmdKey = attackMap->getCommand(i);
+
+			const CombatQueueCommand* attack =
+				cast<const CombatQueueCommand*>(objectController->getQueueCommand(cmdKey));
 
 			if (attack == nullptr)
 				continue;
 
 #ifdef DEBUG_AI_WEAPONS
-			String cmdName = attack->getCommandName();
 			info(true) << "AI_WEAPONS: checking secondary raw cmd ["
-			           << i << "] " << cmdName;
+			           << i << "] key=" << cmdKey;
 #endif
 
 			if (secondaryWeap != nullptr && (attack->getWeaponType() & secondaryWeap->getWeaponBitmask())) {
 				secondaryAttackMap->add(attackMap->get(i));
-			}
-
 #ifdef DEBUG_AI_WEAPONS
-			info(true) << "  -> added to secondaryAttackMap";
+				info(true) << "  -> added to secondaryAttackMap";
 #endif
+			}
 
 			if (defaultWeap != nullptr && (attack->getWeaponType() & defaultWeap->getWeaponBitmask())) {
 				defaultAttackMap->add(attackMap->get(i));
-
 #ifdef DEBUG_AI_WEAPONS
 				info(true) << "  -> added to defaultAttackMap (from secondary)";
 #endif
@@ -1200,7 +1215,6 @@ void AiAgentImplementation::setupAttackMaps() {
 		secondaryAttackMap = nullptr;
 
 #ifdef DEBUG_AI_WEAPONS
-	// Final state of each map
 	debugLogAttackMap(this, "primaryAttackMap (filtered)", primaryAttackMap, objectController);
 	debugLogAttackMap(this, "secondaryAttackMap (filtered)", secondaryAttackMap, objectController);
 	debugLogAttackMap(this, "defaultAttackMap (filtered)", defaultAttackMap, objectController);
