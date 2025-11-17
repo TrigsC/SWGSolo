@@ -259,22 +259,39 @@ public:
 		if (weapon != nullptr && weapon->getAttackType() ==  SharedWeaponObjectTemplate::FORCEATTACK) {
 			return agent->selectSpecialAttack(-1) ? SUCCESS : FAILURE;
 		}
-
 		if (agent->peekBlackboard("attackType")) {
-			//agent->info("SelectAttack::execute has attackType", true);
-
-			if (agent->readBlackboard("attackType").get<uint32>() == static_cast<uint32>(DataVal::DEFAULT)) {
-				//agent->info("SelectAttack::execute has attackType DEFAULT", true);
-
-				return agent->selectDefaultAttack() ? SUCCESS : FAILURE;
-			}
-
-			if (agent->readBlackboard("attackType").get<uint32>() == static_cast<uint32>(DataVal::RANDOM)) {
-				//agent->info("SelectAttack::execute has attackType RANDOM", true);
-
-				return agent->selectSpecialAttack(-1) ? SUCCESS : FAILURE;
-			}
+		    uint32 atkType = agent->readBlackboard("attackType").get<uint32>();
+		
+		    if (atkType == static_cast<uint32>(DataVal::DEFAULT)) {
+		        return agent->selectDefaultAttack() ? SUCCESS : FAILURE;
+		    }
+		
+		    if (atkType == static_cast<uint32>(DataVal::RANDOM)) {
+		        // 70% of the time: use default/main attack
+		        if (System::random(100) < 70) {
+		            return agent->selectDefaultAttack() ? SUCCESS : FAILURE;
+		        }
+		
+		        // 30%: use a special (intimidate/KD/state/generic) via your new logic
+		        return agent->selectSpecialAttack(-1) ? SUCCESS : FAILURE;
+		    }
 		}
+
+		//if (agent->peekBlackboard("attackType")) {
+		//	//agent->info("SelectAttack::execute has attackType", true);
+//
+		//	if (agent->readBlackboard("attackType").get<uint32>() == static_cast<uint32>(DataVal::DEFAULT)) {
+		//		//agent->info("SelectAttack::execute has attackType DEFAULT", true);
+//
+		//		return agent->selectDefaultAttack() ? SUCCESS : FAILURE;
+		//	}
+//
+		//	if (agent->readBlackboard("attackType").get<uint32>() == static_cast<uint32>(DataVal::RANDOM)) {
+		//		//agent->info("SelectAttack::execute has attackType RANDOM", true);
+//
+		//		return agent->selectSpecialAttack(-1) ? SUCCESS : FAILURE;
+		//	}
+		//}
 
 		//agent->info("SelectAttack::execute has attackType attackNum", true);
 
@@ -310,16 +327,21 @@ public:
 		return *this;
 	}
 
-	Behavior::Status execute(AiAgent* agent, unsigned int startIdx = 0) const {
-		// Using Normal (2) Priority
-		int res = agent->enqueueAttack(2);
-		Behavior::Status returnRes = FAILURE;
+Behavior::Status execute(AiAgent* agent, unsigned int startIdx = 0) const {
+    int res = agent->enqueueAttack(2);
 
-		if (!res)
-			returnRes = SUCCESS;
+#ifdef DEBUG_AI_ATTACK
+    agent->info(true) << "AI_ATTACK: EnqueueAttack called, enqueueAttack(2) returned "
+                      << res << " for " << agent->getDisplayedName()
+                      << " (" << agent->getObjectID() << ")";
+#endif
 
-		return returnRes;
-	}
+    Behavior::Status returnRes = FAILURE;
+    if (!res)
+        returnRes = SUCCESS;
+
+    return returnRes;
+}
 
 	String print() const {
 		StringBuffer msg;
