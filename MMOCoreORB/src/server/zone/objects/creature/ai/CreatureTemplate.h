@@ -202,7 +202,7 @@ public:
 	}
 
 	inline bool isHealer() const {
-		return creatureBitmask & ObjectFlag::HEALER;
+		return creatureBitmask & ObjectFlag::HEALER || !healerType.isEmpty();
 	}
 
 	inline bool isPack() const {
