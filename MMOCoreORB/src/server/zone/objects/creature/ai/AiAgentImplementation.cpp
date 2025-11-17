@@ -1050,12 +1050,50 @@ void AiAgentImplementation::setWeaponStats() {
 	}
 }
 
+#ifdef DEBUG_AI_WEAPONS
+void AiAgentImplementation::debugLogAttackMap(AiAgentImplementation* agent,
+		const String& label,
+		const CreatureAttackMap* map,
+		ObjectController* objectController) {
+
+	if (agent == nullptr) return;
+
+	if (map == nullptr) {
+		agent->info(true) << "AI_WEAPONS: " << label << " is nullptr for "
+		                  << agent->getDisplayedName() << " (" << agent->getObjectID() << ")";
+		return;
+	}
+
+	agent->info(true) << "AI_WEAPONS: " << label << " for "
+	                  << agent->getDisplayedName() << " (" << agent->getObjectID()
+	                  << ") size=" << map->size();
+
+	if (objectController == nullptr || map->isEmpty())
+		return;
+
+	for (int i = 0; i < map->size(); ++i) {
+		uint32 cmdCrc = map->getCommand(i);
+
+		const CombatQueueCommand* cmd =
+			cast<const CombatQueueCommand*>(objectController->getQueueCommand(cmdCrc));
+
+		if (cmd == nullptr) {
+			agent->info(true) << "  [" << i << "] crc=" << cmdCrc << " (NO COMMAND FOUND)";
+			continue;
+		}
+
+		String cmdName = cmd->getCommandName(); // adjust if your API differs
+		agent->info(true) << "  [" << i << "] crc=" << cmdCrc << " name=" << cmdName;
+	}
+}
+#endif // DEBUG_AI_WEAPONS
+
 void AiAgentImplementation::setupAttackMaps() {
 	if (npcTemplate == nullptr)
 		return;
 
 #ifdef DEBUG_AI_WEAPONS
-	//info(true) << "setupAttackMaps - " << getDisplayedName() << " " << getObjectID();
+	info(true) << "setupAttackMaps - " << getDisplayedName() << " " << getObjectID();
 #endif
 
 	primaryAttackMap = nullptr;
@@ -1079,6 +1117,10 @@ void AiAgentImplementation::setupAttackMaps() {
 	else
 		attackMap = npcTemplate->getPrimaryAttacks();
 
+#ifdef DEBUG_AI_WEAPONS
+	debugLogAttackMap(this, "Template primaryAttacks (raw)", attackMap, objectController);
+#endif
+
 	Reference<WeaponObject*> defaultWeap = getDefaultWeapon();
 	Reference<WeaponObject*> primaryWeap = getPrimaryWeapon();
 	Reference<WeaponObject*> secondaryWeap = getSecondaryWeapon();
@@ -1092,13 +1134,25 @@ void AiAgentImplementation::setupAttackMaps() {
 
 		if (attack == nullptr)
 			continue;
+#ifdef DEBUG_AI_WEAPONS
+		String cmdName = attack->getCommandName();
+		info(true) << "AI_WEAPONS: checking primary raw cmd ["
+		           << i << "] " << cmdName;
+#endif
 
 		if (primaryWeap != nullptr && (attack->getWeaponType() & primaryWeap->getWeaponBitmask())) {
 			primaryAttackMap->add(attackMap->get(i));
 		}
+#ifdef DEBUG_AI_WEAPONS
+		info(true) << "  -> added to primaryAttackMap";
+#endif
 
 		if (defaultWeap != nullptr && (attack->getWeaponType() & defaultWeap->getWeaponBitmask())) {
 			defaultAttackMap->add(attackMap->get(i));
+
+#ifdef DEBUG_AI_WEAPONS
+		info(true) << "  -> added to defaultAttackMap";
+#endif
 		}
 	}
 
@@ -1111,12 +1165,26 @@ void AiAgentImplementation::setupAttackMaps() {
 			if (attack == nullptr)
 				continue;
 
+#ifdef DEBUG_AI_WEAPONS
+			String cmdName = attack->getCommandName();
+			info(true) << "AI_WEAPONS: checking secondary raw cmd ["
+			           << i << "] " << cmdName;
+#endif
+
 			if (secondaryWeap != nullptr && (attack->getWeaponType() & secondaryWeap->getWeaponBitmask())) {
 				secondaryAttackMap->add(attackMap->get(i));
 			}
 
+#ifdef DEBUG_AI_WEAPONS
+			info(true) << "  -> added to secondaryAttackMap";
+#endif
+
 			if (defaultWeap != nullptr && (attack->getWeaponType() & defaultWeap->getWeaponBitmask())) {
 				defaultAttackMap->add(attackMap->get(i));
+
+#ifdef DEBUG_AI_WEAPONS
+				info(true) << "  -> added to defaultAttackMap (from secondary)";
+#endif
 			}
 		}
 	}
@@ -1130,6 +1198,13 @@ void AiAgentImplementation::setupAttackMaps() {
 
 	if (secondaryAttackMap != nullptr && secondaryAttackMap->isEmpty())
 		secondaryAttackMap = nullptr;
+
+#ifdef DEBUG_AI_WEAPONS
+	// Final state of each map
+	debugLogAttackMap(this, "primaryAttackMap (filtered)", primaryAttackMap, objectController);
+	debugLogAttackMap(this, "secondaryAttackMap (filtered)", secondaryAttackMap, objectController);
+	debugLogAttackMap(this, "defaultAttackMap (filtered)", defaultAttackMap, objectController);
+#endif
 
 	attackMap = nullptr;
 }
