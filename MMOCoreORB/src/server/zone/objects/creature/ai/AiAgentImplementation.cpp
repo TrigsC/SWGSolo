@@ -91,7 +91,7 @@
 // #define DEBUG
 #define DEBUG_AI_WEAPONS
 #define DEBUG_AI_HEAL
-#define DEBUG_AI_ATTACK
+//#define DEBUG_AI_ATTACK
 
 // #define DEBUG_PATHING
 // #define SHOW_PATH
@@ -1589,94 +1589,230 @@ bool AiAgentImplementation::selectSpecialAttack() {
 
 	const CreatureAttackMap* attackMap = getAttackMap();
 
-	if (attackMap == nullptr) {
+	if (attackMap == nullptr || attackMap->isEmpty()) {
 #ifdef DEBUG_AI_ATTACK
-		info(true) << "AI_ATTACK: selectSpecialAttack() - attackMap == nullptr, "
+		info(true) << "AI_ATTACK: selectSpecialAttack() - attackMap null/empty, "
 		           << "falling back to selectDefaultAttack() for "
 		           << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
-		selectDefaultAttack();
-		return true;
+		// Always have *something* ready
+		return selectDefaultAttack();
 	}
 
-	// --- Categorize attacks by name (stateless) ---
+	// --- Situational context snapshot ---
 
-	Vector<int> intimidateIndices;
-	Vector<int> kdIndices;
-	Vector<int> stateIndices;   // blind/dizzy/stun (excluding intimidate/KD)
-	Vector<int> genericIndices; // everything else
+	ManagedReference<SceneObject*> followCopy = getFollowObject().get();
+	CreatureObject* targetCreo = nullptr;
 
-	for (int i = 0; i < attackMap->size(); ++i) {
-		String key = attackMap->getCommand(i);
-		String lower = key.toLowerCase();
+	if (followCopy != nullptr && followCopy->isCreatureObject())
+		targetCreo = followCopy->asCreatureObject();
 
-		if (lower.contains("intimidate")) {
-			intimidateIndices.add(i);
-		} else if (lower.contains("knockdown")) {
-			kdIndices.add(i);
-		} else if (lower.contains("blind") || lower.contains("dizzy") || lower.contains("stun")) {
-			stateIndices.add(i);
-		} else {
-			genericIndices.add(i);
+	bool hasTarget = (followCopy != nullptr && targetCreo != nullptr && !targetCreo->isDead());
+
+	// Use simple range bands based on isInRange to avoid needing a getDistanceTo()
+	bool meleeRange = false;   // ~lightsaber / melee sweet spot
+	bool midRange   = false;   // good for most ranged/force
+	bool longRange  = false;   // very far, mostly force / rifles
+
+	if (followCopy != nullptr) {
+		meleeRange = isInRange(followCopy, 7.5f);   // close
+		midRange   = isInRange(followCopy, 25.0f);  // mid
+		longRange  = isInRange(followCopy, 40.0f);  // long
+	}
+
+	int targetHpPct = 100;
+
+	if (targetCreo != nullptr) {
+		int curHP = targetCreo->getHAM(CreatureAttribute::HEALTH);
+		int maxHP = targetCreo->getMaxHAM(CreatureAttribute::HEALTH);
+
+		if (maxHP > 0) {
+			targetHpPct = (curHP * 100) / maxHP;
 		}
 	}
 
-	int attackNum = -1;
+	int myActionPct = 100;
+	{
+		int myAct    = getHAM(CreatureAttribute::ACTION);
+		int myActMax = getMaxHAM(CreatureAttribute::ACTION);
 
-	// Note: All of these are *per decision* chances; no persistence/state.
-
-	// 1) Intimidate – good opener / debuff. Try fairly often if present.
-	if (!intimidateIndices.isEmpty() && System::random(100) < 20) { // 20% chance
-		int idx = System::random(intimidateIndices.size() - 1);
-		attackNum = intimidateIndices.get(idx);
-
-#ifdef DEBUG_AI_ATTACK
-		debugLogSelectedAttack(this, "selectSpecialAttack(prio_intimidate)", attackMap, attackNum);
-#endif
-		return selectSpecialAttack(attackNum);
+		if (myActMax > 0)
+			myActionPct = (myAct * 100) / myActMax;
 	}
 
-	// 2) Knockdown – strong state, use but don't spam every time.
-	if (!kdIndices.isEmpty() && System::random(100) < 10) { // 10% chance
-		int idx = System::random(kdIndices.size() - 1);
-		attackNum = kdIndices.get(idx);
+	// --- Score each available special and pick the best like a "human" would ---
+
+	int bestIdx   = -1;
+	int bestScore = -9999;
+
+	for (int i = 0; i < attackMap->size(); ++i) {
+		String key   = attackMap->getCommand(i);
+		if (key.isEmpty())
+			continue;
+
+		String lower = key.toLowerCase();
+		int score    = 0;
+
+		// 1) Big "identity" moves first (top of brain)
+		// Saber / melee "signature" attacks
+		if (lower.contains("saberpolearmdervish2") ||
+		    lower.contains("saber2hfrenzy") ||
+		    lower.contains("saber1hflurry2") ||
+		    lower.contains("saber2hsweep3") ||
+		    lower.contains("saber2hbodyhit3") ||
+		    lower.contains("saber1hhit3")) {
+			score += 40;
+			if (meleeRange) score += 10;
+		}
+
+		if (lower.contains("melee1hhit3") ||
+		    lower.contains("melee2hhit3") ||
+		    lower.contains("unarmedhit3") ||
+		    lower.contains("polearmhit3")) {
+			score += 35;
+			if (meleeRange) score += 8;
+		}
+
+		// Ranged identity moves
+		if (lower.contains("scattershot2") ||
+		    lower.contains("fanshot") ||
+		    lower.contains("strafeshot2") ||
+		    lower.contains("fullautosingle2") ||
+		    lower.contains("flurryshot2")) {
+			score += 35;
+			if (!meleeRange && midRange) score += 8;
+		}
+
+		// Force nukes
+		if (lower.contains("forcelightningcone2")) {
+			score += 40;
+			if (midRange || longRange) score += 10;
+		} else if (lower.contains("forcelightningcone1")) {
+			score += 30;
+			if (midRange || longRange) score += 8;
+		}
+
+		if (lower.contains("forcelightningsingle2")) {
+			score += 32;
+			if (!meleeRange && (midRange || longRange)) score += 6;
+		} else if (lower.contains("forcelightningsingle1")) {
+			score += 26;
+		}
+
+		if (lower.contains("mindblast2")) {
+			score += 28;
+			if (!meleeRange) score += 4;
+		} else if (lower.contains("mindblast1")) {
+			score += 22;
+		}
+
+		// 2) Control / setup abilities (intimidate, KD, dizzy, etc.)
+		bool isIntimidate = lower.contains("intimidate");
+		bool isKD         = lower.contains("knockdown");
+		bool isBlind      = lower.contains("blind");
+		bool isDizzy      = lower.contains("dizzy");
+		bool isStun       = lower.contains("stun");
+
+		if (isIntimidate) {
+			// Great opener / pressure tool
+			score += 24;
+			if (targetHpPct > 60) score += 6;     // like using it early
+			if (!meleeRange)       score -= 6;    // needs to connect
+		}
+
+		if (isKD) {
+			score += 26;
+			if (meleeRange) score += 8;
+			// If they are low, KD is less valuable than just killing them
+			if (targetHpPct < 25) score -= 8;
+		}
+
+		if (isBlind || isDizzy || isStun) {
+			score += 16;
+			if (meleeRange) score += 4;
+		}
+
+		// Avoid control moves as "main filler" when nothing is going on
+		if (!hasTarget) {
+			if (isIntimidate || isKD || isBlind || isDizzy || isStun)
+				score -= 20;
+		}
+
+		// 3) Single-target vs AoE preference
+		bool isCone = lower.contains("cone");
+		bool isArea = lower.contains("area") || lower.contains("spray");
+
+		if (isCone || isArea) {
+			// Assume most PvE is vs 1–3 players; still useful but not spammed
+			score += 6;
+			if (!meleeRange && !midRange) score -= 6;  // too far
+			if (targetHpPct < 20) score -= 6;          // finishing: prefer direct hits
+		}
+
+		// 4) Resource (ACTION) awareness – like a human pacing themselves
+		bool isHeavyCost =
+		    lower.contains("spinattack") ||
+		    lower.contains("flurry") ||
+		    lower.contains("frenzy") ||
+		    lower.contains("fullauto") ||
+		    isCone || isArea;
+
+		if (myActionPct < 30 && isHeavyCost) {
+			score -= 15; // "I'm tired, maybe not this one right now"
+		} else if (myActionPct > 70 && isHeavyCost) {
+			score += 6;  // "Plenty of gas in the tank"
+		}
+
+		// 5) Generic hits / fallback scoring
+		bool looksMeleeHit =
+		    lower.contains("hit") || lower.contains("lunge") || lower.contains("slash");
+		bool looksRangedHit =
+		    lower.contains("shot") || lower.contains("burst") || lower.contains("wildshot");
+
+		if (score == 0) {
+			// If nothing special matched, give them basic "human" instincts:
+			if (meleeRange && looksMeleeHit)
+				score += 10;
+			else if (!meleeRange && looksRangedHit)
+				score += 10;
+			else
+				score += 2; // at least do something
+		}
+
+		// 6) Small random jitter so they don't feel perfectly deterministic
+		score += System::random(7) - 3; // [-3, +3]
 
 #ifdef DEBUG_AI_ATTACK
-		debugLogSelectedAttack(this, "selectSpecialAttack(prio_knockdown)", attackMap, attackNum);
+		info(true) << "AI_ATTACK: selectSpecialAttack scoring idx=" << i
+		           << " key=" << key << " score=" << score
+		           << " for " << getDisplayedName()
+		           << " (" << getObjectID() << ")";
 #endif
-		return selectSpecialAttack(attackNum);
+
+		if (score > bestScore) {
+			bestScore = score;
+			bestIdx   = i;
+		}
 	}
 
-	// 3) Other state attacks – blind/dizzy/stun
-	if (!stateIndices.isEmpty() && System::random(100) < 10) { // 10% chance
-		int idx = System::random(stateIndices.size() - 1);
-		attackNum = stateIndices.get(idx);
-
+	// If for some reason we didn't find anything useful, fall back
+	if (bestIdx == -1) {
 #ifdef DEBUG_AI_ATTACK
-		debugLogSelectedAttack(this, "selectSpecialAttack(prio_state)", attackMap, attackNum);
+		info(true) << "AI_ATTACK: selectSpecialAttack - no bestIdx, falling back to random for "
+		           << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
-		return selectSpecialAttack(attackNum);
+		int randomIdx = attackMap->getRandomAttackNumber();
+		return selectSpecialAttack(randomIdx);
 	}
 
-	// 4) Otherwise, just use a generic damage/filler special
-	if (!genericIndices.isEmpty()) {
-		int idx = System::random(genericIndices.size() - 1);
-		attackNum = genericIndices.get(idx);
-
 #ifdef DEBUG_AI_ATTACK
-		debugLogSelectedAttack(this, "selectSpecialAttack(generic)", attackMap, attackNum);
-#endif
-		return selectSpecialAttack(attackNum);
-	}
-
-	// 5) Absolute fallback: fully random
-	int randomIdx = attackMap->getRandomAttackNumber();
-
-#ifdef DEBUG_AI_ATTACK
-	debugLogSelectedAttack(this, "selectSpecialAttack(fallback_random)", attackMap, randomIdx);
+	info(true) << "AI_ATTACK: selectSpecialAttack(situational) chose idx=" << bestIdx
+	           << " key=" << attackMap->getCommand(bestIdx)
+	           << " score=" << bestScore << " for "
+	           << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
 
-	return selectSpecialAttack(randomIdx);
+	return selectSpecialAttack(bestIdx);
 }
 
 bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
@@ -2022,17 +2158,6 @@ bool AiAgentImplementation::selectDefaultAttack() {
 
     return true;
 }
-
-//bool AiAgentImplementation::selectDefaultAttack() {
-//	if (npcTemplate == nullptr)
-//		nextActionCRC = STRING_HASHCODE("defaultattack");
-//	else
-//		nextActionCRC = npcTemplate->getDefaultAttack().hashCode();
-//
-//	nextActionArgs = "";
-//
-//	return true;
-//}
 
 const QueueCommand* AiAgentImplementation::getNextAction() {
 	auto zoneServer = getZoneServer();

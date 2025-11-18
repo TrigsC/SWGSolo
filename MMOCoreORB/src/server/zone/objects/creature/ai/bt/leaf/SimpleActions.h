@@ -247,56 +247,60 @@ public:
 		attackNum = getArg<int>()(args, "attackNum", -1);
 	}
 
-	Behavior::Status execute(AiAgent* agent, unsigned int startIdx = 0) const {
-		//agent->info("SelectAttack::execute", true);
+	Behavior::Status SelectAttack::execute(AiAgent* agent, unsigned int startIdx) const {
+	//agent->info("SelectAttack::execute", true);
 
-		if (agent->isDead()) {
-			return FAILURE;
-		}
-
-		WeaponObject* weapon = agent->getCurrentWeapon();
-
-		if (weapon != nullptr && weapon->getAttackType() ==  SharedWeaponObjectTemplate::FORCEATTACK) {
-			return agent->selectSpecialAttack(-1) ? SUCCESS : FAILURE;
-		}
-		if (agent->peekBlackboard("attackType")) {
-		    uint32 atkType = agent->readBlackboard("attackType").get<uint32>();
-		
-		    if (atkType == static_cast<uint32>(DataVal::DEFAULT)) {
-		        return agent->selectDefaultAttack() ? SUCCESS : FAILURE;
-		    }
-		
-		    if (atkType == static_cast<uint32>(DataVal::RANDOM)) {
-		        // 70% of the time: use default/main attack
-		        if (System::random(100) < 70) {
-		            return agent->selectDefaultAttack() ? SUCCESS : FAILURE;
-		        }
-		
-		        // 30%: use a special (intimidate/KD/state/generic) via your new logic
-		        return agent->selectSpecialAttack(-1) ? SUCCESS : FAILURE;
-		    }
-		}
-
-		//if (agent->peekBlackboard("attackType")) {
-		//	//agent->info("SelectAttack::execute has attackType", true);
-//
-		//	if (agent->readBlackboard("attackType").get<uint32>() == static_cast<uint32>(DataVal::DEFAULT)) {
-		//		//agent->info("SelectAttack::execute has attackType DEFAULT", true);
-//
-		//		return agent->selectDefaultAttack() ? SUCCESS : FAILURE;
-		//	}
-//
-		//	if (agent->readBlackboard("attackType").get<uint32>() == static_cast<uint32>(DataVal::RANDOM)) {
-		//		//agent->info("SelectAttack::execute has attackType RANDOM", true);
-//
-		//		return agent->selectSpecialAttack(-1) ? SUCCESS : FAILURE;
-		//	}
-		//}
-
-		//agent->info("SelectAttack::execute has attackType attackNum", true);
-
-		return agent->selectSpecialAttack(attackNum) ? SUCCESS : FAILURE;
+	if (agent->isDead()) {
+		return FAILURE;
 	}
+
+	bool ok = false;
+
+	WeaponObject* weapon = agent->getCurrentWeapon();
+
+	// Force attackers tend to lean on specials, but still fall back if nothing chosen
+	if (weapon != nullptr && weapon->getAttackType() == SharedWeaponObjectTemplate::FORCEATTACK) {
+		ok = agent->selectSpecialAttack(-1);
+		if (!ok) {
+			ok = agent->selectDefaultAttack();
+		}
+		return ok ? SUCCESS : FAILURE;
+	}
+
+	// If the behavior tree has written an attackType, respect it
+	if (agent->peekBlackboard("attackType")) {
+		uint32 atkType = agent->readBlackboard("attackType").get<uint32>();
+
+		if (atkType == static_cast<uint32>(DataVal::DEFAULT)) {
+			ok = agent->selectDefaultAttack();
+			return ok ? SUCCESS : FAILURE;
+		}
+
+		if (atkType == static_cast<uint32>(DataVal::RANDOM)) {
+			// 70% of the time: use default/main attack
+			if (System::random(100) < 70) {
+				ok = agent->selectDefaultAttack();
+				return ok ? SUCCESS : FAILURE;
+			}
+
+			// 30%: use a situational special
+			ok = agent->selectSpecialAttack(-1);
+			if (!ok) {
+				// Don't waste the tick – fallback to default
+				ok = agent->selectDefaultAttack();
+			}
+			return ok ? SUCCESS : FAILURE;
+		}
+	}
+
+	// If no attackType was set, defer to the configured attackNum
+	ok = agent->selectSpecialAttack(attackNum);
+	if (!ok) {
+		ok = agent->selectDefaultAttack();
+	}
+
+	return ok ? SUCCESS : FAILURE;
+}
 
 	String print() const {
 		StringBuffer msg;
