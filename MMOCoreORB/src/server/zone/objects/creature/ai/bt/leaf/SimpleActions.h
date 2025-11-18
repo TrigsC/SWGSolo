@@ -226,91 +226,90 @@ private:
 
 class SelectAttack : public Behavior {
 public:
-	SelectAttack(const String& className, const uint32 id, const LuaObject& args)
-			: Behavior(className, id, args), attackNum(-1) {
-		parseArgs(args);
-	}
+    SelectAttack(const String& className, const uint32 id, const LuaObject& args)
+        : Behavior(className, id, args), attackNum(-1) {
+        parseArgs(args);
+    }
 
-	SelectAttack(const SelectAttack& a)
-			: Behavior(a), attackNum(a.attackNum) {
-	}
+    SelectAttack(const SelectAttack& a)
+        : Behavior(a), attackNum(a.attackNum) {
+    }
 
-	SelectAttack& operator=(const SelectAttack& a) {
-		if (this == &a)
-			return *this;
-		Behavior::operator=(a);
-		attackNum = a.attackNum;
-		return *this;
-	}
+    SelectAttack& operator=(const SelectAttack& a) {
+        if (this == &a)
+            return *this;
+        Behavior::operator=(a);
+        attackNum = a.attackNum;
+        return *this;
+    }
 
-	void parseArgs(const LuaObject& args) {
-		attackNum = getArg<int>()(args, "attackNum", -1);
-	}
+    void parseArgs(const LuaObject& args) {
+        attackNum = getArg<int>()(args, "attackNum", -1);
+    }
 
-	Behavior::Status SelectAttack::execute(AiAgent* agent, unsigned int startIdx) const {
-	//agent->info("SelectAttack::execute", true);
+    Behavior::Status execute(AiAgent* agent, unsigned int startIdx = 0) const {
+        //agent->info("SelectAttack::execute", true);
 
-	if (agent->isDead()) {
-		return FAILURE;
-	}
+        if (agent->isDead()) {
+            return FAILURE;
+        }
 
-	bool ok = false;
+        bool ok = false;
 
-	WeaponObject* weapon = agent->getCurrentWeapon();
+        WeaponObject* weapon = agent->getCurrentWeapon();
 
-	// Force attackers tend to lean on specials, but still fall back if nothing chosen
-	if (weapon != nullptr && weapon->getAttackType() == SharedWeaponObjectTemplate::FORCEATTACK) {
-		ok = agent->selectSpecialAttack(-1);
-		if (!ok) {
-			ok = agent->selectDefaultAttack();
-		}
-		return ok ? SUCCESS : FAILURE;
-	}
+        // Force attackers tend to lean on specials, but still fall back if nothing chosen
+        if (weapon != nullptr && weapon->getAttackType() == SharedWeaponObjectTemplate::FORCEATTACK) {
+            ok = agent->selectSpecialAttack(-1);
+            if (!ok) {
+                ok = agent->selectDefaultAttack();
+            }
+            return ok ? SUCCESS : FAILURE;
+        }
 
-	// If the behavior tree has written an attackType, respect it
-	if (agent->peekBlackboard("attackType")) {
-		uint32 atkType = agent->readBlackboard("attackType").get<uint32>();
+        // If the behavior tree has written an attackType, respect it
+        if (agent->peekBlackboard("attackType")) {
+            uint32 atkType = agent->readBlackboard("attackType").get<uint32>();
 
-		if (atkType == static_cast<uint32>(DataVal::DEFAULT)) {
-			ok = agent->selectDefaultAttack();
-			return ok ? SUCCESS : FAILURE;
-		}
+            if (atkType == static_cast<uint32>(DataVal::DEFAULT)) {
+                ok = agent->selectDefaultAttack();
+                return ok ? SUCCESS : FAILURE;
+            }
 
-		if (atkType == static_cast<uint32>(DataVal::RANDOM)) {
-			// 70% of the time: use default/main attack
-			if (System::random(100) < 70) {
-				ok = agent->selectDefaultAttack();
-				return ok ? SUCCESS : FAILURE;
-			}
+            if (atkType == static_cast<uint32>(DataVal::RANDOM)) {
+                // 70% of the time: use default/main attack
+                if (System::random(100) < 70) {
+                    ok = agent->selectDefaultAttack();
+                    return ok ? SUCCESS : FAILURE;
+                }
 
-			// 30%: use a situational special
-			ok = agent->selectSpecialAttack(-1);
-			if (!ok) {
-				// Don't waste the tick – fallback to default
-				ok = agent->selectDefaultAttack();
-			}
-			return ok ? SUCCESS : FAILURE;
-		}
-	}
+                // 30%: use a situational special
+                ok = agent->selectSpecialAttack(-1);
+                if (!ok) {
+                    // Don't waste the tick – fallback to default
+                    ok = agent->selectDefaultAttack();
+                }
+                return ok ? SUCCESS : FAILURE;
+            }
+        }
 
-	// If no attackType was set, defer to the configured attackNum
-	ok = agent->selectSpecialAttack(attackNum);
-	if (!ok) {
-		ok = agent->selectDefaultAttack();
-	}
+        // If no attackType was set, defer to the configured attackNum
+        ok = agent->selectSpecialAttack(attackNum);
+        if (!ok) {
+            ok = agent->selectDefaultAttack();
+        }
 
-	return ok ? SUCCESS : FAILURE;
-}
+        return ok ? SUCCESS : FAILURE;
+    }
 
-	String print() const {
-		StringBuffer msg;
-		msg << className << "-" << attackNum;
-
-		return msg.toString();
-	}
+    String print() const {
+        StringBuffer msg;
+        msg << className << "-" << attackNum;
+        return msg.toString();
+    }
 
 private:
-	int attackNum;
+    int attackNum;
 };
 
 class EnqueueAttack : public Behavior {
