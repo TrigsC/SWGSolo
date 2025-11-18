@@ -1764,21 +1764,48 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
 bool AiAgentImplementation::selectDefaultAttack() {
     String cmd;
 
-    // 1) Template-defined default, if present
+    // 1) Try template-defined default attack (may be "defaultattack" as engine fallback)
     if (npcTemplate != nullptr) {
         cmd = npcTemplate->getDefaultAttack();
+
+#ifdef DEBUG_AI_ATTACK
+        info(true) << "AI_ATTACK: selectDefaultAttack template default raw cmd="
+                   << cmd << " for " << getDisplayedName()
+                   << " (" << getObjectID() << ")";
+#endif
     }
 
-    // 2) If template didn't define a default, derive from attack maps (already weapon-filtered)
-    if (cmd.isEmpty()) {
+    // Treat empty or "defaultattack" as effectively UNSET for NPC AI
+    bool treatAsUnset = cmd.isEmpty()
+        || cmd.hashCode() == STRING_HASHCODE("defaultattack");
+
+    if (treatAsUnset) {
+#ifdef DEBUG_AI_ATTACK
+        info(true) << "AI_ATTACK: selectDefaultAttack template default considered UNSET "
+                   << "(empty or defaultattack) for "
+                   << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
+
+        // 2) Derive from attack maps (already filtered by weapon)
         const CreatureAttackMap* map = primaryAttackMap;
 
         // If primary map is empty/null, fall back to defaultAttackMap
         if (map == nullptr || map->isEmpty()) {
+#ifdef DEBUG_AI_ATTACK
+            info(true) << "AI_ATTACK: primaryAttackMap null/empty, "
+                       << "falling back to defaultAttackMap for "
+                       << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
             map = defaultAttackMap;
         }
 
         if (map != nullptr && !map->isEmpty()) {
+#ifdef DEBUG_AI_ATTACK
+            info(true) << "AI_ATTACK: selectDefaultAttack using map size="
+                       << map->size() << " for "
+                       << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
+
             // --- First pass: look for your "top" player-like main attacks ---
             Vector<int> prioIndices;
 
@@ -1844,7 +1871,7 @@ bool AiAgentImplementation::selectDefaultAttack() {
                 }
             }
 
-            // If we found any high-priority "main" attacks, pick one of them and use it
+            // If we found any high-priority "main" attacks, pick one of them
             if (!prioIndices.isEmpty()) {
                 int idxInList = System::random(prioIndices.size() - 1);
                 int bestIdx   = prioIndices.get(idxInList);
@@ -1858,7 +1885,7 @@ bool AiAgentImplementation::selectDefaultAttack() {
 #endif
             }
 
-            // 2b) If no top attacks found, use a general heuristic to pick a decent main attack
+            // 2b) If no top attacks found, use heuristic to pick a decent main attack
             if (cmd.isEmpty()) {
                 int bestIdx   = -1;
                 int bestScore = -9999;
@@ -1938,9 +1965,28 @@ bool AiAgentImplementation::selectDefaultAttack() {
                                << " index=" << bestIdx << " for "
                                << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
+                } else {
+#ifdef DEBUG_AI_ATTACK
+                    info(true) << "AI_ATTACK: selectDefaultAttack(heuristic) NO good candidate "
+                               << "(bestIdx=" << bestIdx << " bestScore=" << bestScore
+                               << ") for " << getDisplayedName()
+                               << " (" << getObjectID() << ")";
+#endif
                 }
             }
+        } else {
+#ifdef DEBUG_AI_ATTACK
+            info(true) << "AI_ATTACK: selectDefaultAttack - no usable attack map "
+                       << "(primary & default null/empty) for "
+                       << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
         }
+    } else {
+#ifdef DEBUG_AI_ATTACK
+        info(true) << "AI_ATTACK: selectDefaultAttack using template default cmd="
+                   << cmd << " for " << getDisplayedName()
+                   << " (" << getObjectID() << ")";
+#endif
     }
 
     // 3) Final fallback: generic auto-attack if we still didn't pick anything
