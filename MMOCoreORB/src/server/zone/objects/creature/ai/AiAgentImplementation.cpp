@@ -1769,7 +1769,7 @@ bool AiAgentImplementation::selectDefaultAttack() {
         cmd = npcTemplate->getDefaultAttack();
     }
 
-    // 2) If template didn't define a default, derive from attack maps (which are already weapon-filtered)
+    // 2) If template didn't define a default, derive from attack maps (already weapon-filtered)
     if (cmd.isEmpty()) {
         const CreatureAttackMap* map = primaryAttackMap;
 
@@ -1778,79 +1778,167 @@ bool AiAgentImplementation::selectDefaultAttack() {
             map = defaultAttackMap;
         }
 
-        int bestIdx   = -1;
-        int bestScore = -9999;
-
         if (map != nullptr && !map->isEmpty()) {
+            // --- First pass: look for your "top" player-like main attacks ---
+            Vector<int> prioIndices;
+
             for (int i = 0; i < map->size(); ++i) {
                 String key   = map->getCommand(i);
                 String lower = key.toLowerCase();
 
-                int score = 0;
-
-                // --- Strong negative for pure utility / state stuff we don't want as "auto" ---
-                if (lower.contains("intimidate") ||
-                    lower.contains("knockdown") ||
-                    lower.contains("blind") ||
-                    lower.contains("dizzy") ||
-                    lower.contains("stun") ||
-                    lower.contains("sweep") ||
-                    lower.contains("area") ||
-                    lower.contains("cone") ||
-                    lower.contains("spray") ||
-                    lower.contains("suppression") ||
-                    lower.contains("warning") ||
-                    lower.contains("confusion") ||
-                    lower.contains("meleedefense")) {
-                    score -= 10;
+                // Lightsaber master: dervish 2, flurry 2, phantom
+                if (lower.contains("saberpolearmdervish2") ||
+                    lower.contains("saber1hflurry2") ||
+                    lower.contains("saber2hphantom")) {
+                    prioIndices.add(i);
+                    continue;
                 }
 
-                // --- Force nukes ---
-                if (lower.contains("forcelightningsingle2")) score += 9;
-                else if (lower.contains("forcelightningsingle1")) score += 8;
-                else if (lower.contains("mindblast2")) score += 7;
-                else if (lower.contains("mindblast1")) score += 6;
-
-                // --- Saber / lightsaber main hits ---
-                if (lower.contains("saber2hbodyhit3") || lower.contains("saber1hhit3")) score += 9;
-                else if (lower.contains("saber2hbodyhit2") || lower.contains("saber1hheadhit2")) score += 7;
-                else if (lower.contains("saberslash2") || lower.contains("saberslash1")) score += 6;
-
-                // --- Melee body/head/hit tiers (fencer/swordsman/pikeman/brawler/tka) ---
-                if (lower.contains("bodyhit3") || lower.contains("headhit3")) score += 8;
-                else if (lower.contains("bodyhit2") || lower.contains("headhit2")) score += 6;
-                else if (lower.contains("hit3")) score += 5;
-                else if (lower.contains("hit2")) score += 4;
-                else if (lower.contains("hit1")) score += 2;
-
-                // --- Ranged shot tiers (marksman/pistoleer/carbineer/rifleman/bh/commando) ---
-                if (lower.contains("bodyshot3") || lower.contains("headshot3")) score += 8;
-                else if (lower.contains("bodyshot2") || lower.contains("headshot2")) score += 6;
-
-                if (lower.contains("healthshot2") || lower.contains("actionshot2")) score += 6;
-                if (lower.contains("fullautosingle2") || lower.contains("flurryshot2") ||
-                    lower.contains("wildshot2") || lower.contains("strafeshot2")) score += 5;
-                if (lower.contains("fullautosingle1") || lower.contains("flurryshot1") ||
-                    lower.contains("strafeshot1")) score += 3;
-
-                // --- Good melee specials to use as main if no better single-hit ---
-                if (lower.contains("spinattack2") || lower.contains("flurry") ||
-                    lower.contains("lunge2") || lower.contains("dervish2")) {
-                    score += 4;
-                } else if (lower.contains("spinattack1") || lower.contains("lunge1") ||
-                           lower.contains("dervish")) {
-                    score += 2;
+                // Master force: forcelightningcone2
+                if (lower.contains("forcelightningcone2")) {
+                    prioIndices.add(i);
+                    continue;
                 }
 
-                // Avoid taking a clearly bad candidate as "best"
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestIdx   = i;
+                // Fencer: one handed hit 3, one handed scatter hit 2
+                if (lower.contains("melee1hhit3") ||
+                    lower.contains("melee1hscatterhit2")) {
+                    prioIndices.add(i);
+                    continue;
+                }
+
+                // Tera Kasi: unarmed hit 3
+                if (lower.contains("unarmedhit3")) {
+                    prioIndices.add(i);
+                    continue;
+                }
+
+                // Swordsman: two handed hit 3
+                if (lower.contains("melee2hhit3")) {
+                    prioIndices.add(i);
+                    continue;
+                }
+
+                // Pikeman: polearm hit 3
+                if (lower.contains("polearmhit3")) {
+                    prioIndices.add(i);
+                    continue;
+                }
+
+                // Pistols: fanshot
+                if (lower.contains("fanshot")) {
+                    prioIndices.add(i);
+                    continue;
+                }
+
+                // Rifleman: strafeshot2
+                if (lower.contains("strafeshot2")) {
+                    prioIndices.add(i);
+                    continue;
+                }
+
+                // Carbines: scattershot2
+                if (lower.contains("scattershot2")) {
+                    prioIndices.add(i);
+                    continue;
                 }
             }
 
-            if (bestIdx != -1 && bestScore > -5) {
+            // If we found any high-priority "main" attacks, pick one of them and use it
+            if (!prioIndices.isEmpty()) {
+                int idxInList = System::random(prioIndices.size() - 1);
+                int bestIdx   = prioIndices.get(idxInList);
                 cmd = map->getCommand(bestIdx);
+
+#ifdef DEBUG_AI_ATTACK
+                info(true) << "AI_ATTACK: selectDefaultAttack(prio_top_attack) using cmd="
+                           << cmd << " from index=" << bestIdx
+                           << " for " << getDisplayedName() << " ("
+                           << getObjectID() << ")";
+#endif
+            }
+
+            // 2b) If no top attacks found, use a general heuristic to pick a decent main attack
+            if (cmd.isEmpty()) {
+                int bestIdx   = -1;
+                int bestScore = -9999;
+
+                for (int i = 0; i < map->size(); ++i) {
+                    String key   = map->getCommand(i);
+                    String lower = key.toLowerCase();
+
+                    int score = 0;
+
+                    // Strong negative for pure utility / state stuff we don't want as "auto"
+                    if (lower.contains("intimidate") ||
+                        lower.contains("knockdown") ||
+                        lower.contains("blind") ||
+                        lower.contains("dizzy") ||
+                        lower.contains("stun") ||
+                        lower.contains("sweep") ||
+                        lower.contains("area") ||
+                        lower.contains("cone") ||
+                        lower.contains("spray") ||
+                        lower.contains("suppression") ||
+                        lower.contains("warning") ||
+                        lower.contains("confusion") ||
+                        lower.contains("meleedefense")) {
+                        score -= 10;
+                    }
+
+                    // Force nukes
+                    if (lower.contains("forcelightningsingle2")) score += 9;
+                    else if (lower.contains("forcelightningsingle1")) score += 8;
+                    else if (lower.contains("mindblast2")) score += 7;
+                    else if (lower.contains("mindblast1")) score += 6;
+
+                    // Saber main hits
+                    if (lower.contains("saber2hbodyhit3") || lower.contains("saber1hhit3")) score += 9;
+                    else if (lower.contains("saber2hbodyhit2") || lower.contains("saber1hheadhit2")) score += 7;
+                    else if (lower.contains("saberslash2") || lower.contains("saberslash1")) score += 6;
+
+                    // Melee body/head/hit tiers
+                    if (lower.contains("bodyhit3") || lower.contains("headhit3")) score += 8;
+                    else if (lower.contains("bodyhit2") || lower.contains("headhit2")) score += 6;
+                    else if (lower.contains("hit3")) score += 5;
+                    else if (lower.contains("hit2")) score += 4;
+                    else if (lower.contains("hit1")) score += 2;
+
+                    // Ranged shot tiers
+                    if (lower.contains("bodyshot3") || lower.contains("headshot3")) score += 8;
+                    else if (lower.contains("bodyshot2") || lower.contains("headshot2")) score += 6;
+
+                    if (lower.contains("healthshot2") || lower.contains("actionshot2")) score += 6;
+                    if (lower.contains("fullautosingle2") || lower.contains("flurryshot2") ||
+                        lower.contains("wildshot2") || lower.contains("strafeshot2")) score += 5;
+                    if (lower.contains("fullautosingle1") || lower.contains("flurryshot1") ||
+                        lower.contains("strafeshot1")) score += 3;
+
+                    // Good melee/ranged specials that can be used as main if nothing else
+                    if (lower.contains("spinattack2") || lower.contains("flurry") ||
+                        lower.contains("lunge2") || lower.contains("dervish2")) {
+                        score += 4;
+                    } else if (lower.contains("spinattack1") || lower.contains("lunge1") ||
+                               lower.contains("dervish")) {
+                        score += 2;
+                    }
+
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestIdx   = i;
+                    }
+                }
+
+                if (bestIdx != -1 && bestScore > -5) {
+                    cmd = map->getCommand(bestIdx);
+
+#ifdef DEBUG_AI_ATTACK
+                    info(true) << "AI_ATTACK: selectDefaultAttack(heuristic) using cmd="
+                               << cmd << " score=" << bestScore
+                               << " index=" << bestIdx << " for "
+                               << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
+                }
             }
         }
     }
@@ -1858,13 +1946,17 @@ bool AiAgentImplementation::selectDefaultAttack() {
     // 3) Final fallback: generic auto-attack if we still didn't pick anything
     if (cmd.isEmpty()) {
         cmd = "defaultattack";
+#ifdef DEBUG_AI_ATTACK
+        info(true) << "AI_ATTACK: selectDefaultAttack(fallback_defaultattack) for "
+                   << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
     }
 
     nextActionCRC  = cmd.hashCode();
     nextActionArgs = "";
 
 #ifdef DEBUG_AI_ATTACK
-    info(true) << "AI_ATTACK: selectDefaultAttack using cmd=" << cmd
+    info(true) << "AI_ATTACK: selectDefaultAttack final cmd=" << cmd
                << " crc=" << nextActionCRC << " for "
                << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
