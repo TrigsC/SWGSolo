@@ -278,7 +278,7 @@ public:
 
             if (atkType == static_cast<uint32>(DataVal::RANDOM)) {
                 // 70% of the time: use default/main attack
-                if (System::random(100) < 70) {
+                if (System::random(100) < 60) {
                     ok = agent->selectDefaultAttack();
                     return ok ? SUCCESS : FAILURE;
                 }

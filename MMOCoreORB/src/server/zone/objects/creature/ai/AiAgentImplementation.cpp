@@ -1609,28 +1609,39 @@ bool AiAgentImplementation::selectSpecialAttack() {
 
 	bool hasTarget = (followCopy != nullptr && targetCreo != nullptr && !targetCreo->isDead());
 
-	// Use simple range bands based on isInRange to avoid needing a getDistanceTo()
-	bool meleeRange = false;   // ~lightsaber / melee sweet spot
-	bool midRange   = false;   // good for most ranged/force
-	bool longRange  = false;   // very far, mostly force / rifles
+	// Simple range bands
+	bool meleeRange = false;
+	bool midRange   = false;
+	bool longRange  = false;
 
 	if (followCopy != nullptr) {
-		meleeRange = isInRange(followCopy, 7.5f);   // close
-		midRange   = isInRange(followCopy, 25.0f);  // mid
-		longRange  = isInRange(followCopy, 40.0f);  // long
+		meleeRange = isInRange(followCopy, 7.5f);
+		midRange   = isInRange(followCopy, 25.0f);
+		longRange  = isInRange(followCopy, 40.0f);
 	}
 
-	int targetHpPct = 100;
+	// Target HAM awareness
+	int targetHealthPct = 100;
+	int targetActionPct = 100;
+	int targetMindPct   = 100;
 
 	if (targetCreo != nullptr) {
-		int curHP = targetCreo->getHAM(CreatureAttribute::HEALTH);
-		int maxHP = targetCreo->getMaxHAM(CreatureAttribute::HEALTH);
+		int curHP  = targetCreo->getHAM(CreatureAttribute::HEALTH);
+		int maxHP  = targetCreo->getMaxHAM(CreatureAttribute::HEALTH);
+		int curAct = targetCreo->getHAM(CreatureAttribute::ACTION);
+		int maxAct = targetCreo->getMaxHAM(CreatureAttribute::ACTION);
+		int curMind = targetCreo->getHAM(CreatureAttribute::MIND);
+		int maxMind = targetCreo->getMaxHAM(CreatureAttribute::MIND);
 
-		if (maxHP > 0) {
-			targetHpPct = (curHP * 100) / maxHP;
-		}
+		if (maxHP > 0)
+			targetHealthPct = (curHP * 100) / maxHP;
+		if (maxAct > 0)
+			targetActionPct = (curAct * 100) / maxAct;
+		if (maxMind > 0)
+			targetMindPct = (curMind * 100) / maxMind;
 	}
 
+	// My own ACTION only lightly used (no heavy “cost” logic for now)
 	int myActionPct = 100;
 	{
 		int myAct    = getHAM(CreatureAttribute::ACTION);
@@ -1638,6 +1649,22 @@ bool AiAgentImplementation::selectSpecialAttack() {
 
 		if (myActMax > 0)
 			myActionPct = (myAct * 100) / myActMax;
+	}
+
+	// Target control-state awareness (names may need to be adapted to your codebase)
+	bool targetIntimidated = false;
+	bool targetBlinded     = false;
+	bool targetDizzy       = false;
+	bool targetStunned     = false;
+	bool targetKD          = false;
+
+	if (targetCreo != nullptr) {
+		// Assuming CreatureState and CreaturePosture enums exist like this
+		targetIntimidated = targetCreo->hasState(CreatureState::INTIMIDATED);
+		targetBlinded     = targetCreo->hasState(CreatureState::BLINDED);
+		targetDizzy       = targetCreo->hasState(CreatureState::DIZZY);
+		targetStunned     = targetCreo->hasState(CreatureState::STUNNED);
+		targetKD          = (targetCreo->getPosture() == CreaturePosture::KNOCKEDDOWN);
 	}
 
 	// --- Score each available special and pick the best like a "human" would ---
@@ -1653,24 +1680,23 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		String lower = key.toLowerCase();
 		int score    = 0;
 
-		// 1) Big "identity" moves first (top of brain)
-		// Saber / melee "signature" attacks
+		// 1) Big “identity” / signature moves
 		if (lower.contains("saberpolearmdervish2") ||
 		    lower.contains("saber2hfrenzy") ||
 		    lower.contains("saber1hflurry2") ||
 		    lower.contains("saber2hsweep3") ||
 		    lower.contains("saber2hbodyhit3") ||
 		    lower.contains("saber1hhit3")) {
-			score += 40;
-			if (meleeRange) score += 10;
+			score += 35;
+			if (meleeRange) score += 8;
 		}
 
 		if (lower.contains("melee1hhit3") ||
 		    lower.contains("melee2hhit3") ||
 		    lower.contains("unarmedhit3") ||
 		    lower.contains("polearmhit3")) {
-			score += 35;
-			if (meleeRange) score += 8;
+			score += 30;
+			if (meleeRange) score += 6;
 		}
 
 		// Ranged identity moves
@@ -1679,34 +1705,35 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		    lower.contains("strafeshot2") ||
 		    lower.contains("fullautosingle2") ||
 		    lower.contains("flurryshot2")) {
-			score += 35;
-			if (!meleeRange && midRange) score += 8;
+			score += 30;
+			if (!meleeRange && midRange) score += 6;
 		}
 
 		// Force nukes
 		if (lower.contains("forcelightningcone2")) {
-			score += 40;
-			if (midRange || longRange) score += 10;
-		} else if (lower.contains("forcelightningcone1")) {
-			score += 30;
+			score += 34;
 			if (midRange || longRange) score += 8;
+		} else if (lower.contains("forcelightningcone1")) {
+			score += 26;
+			if (midRange || longRange) score += 6;
 		}
 
 		if (lower.contains("forcelightningsingle2")) {
-			score += 32;
-			if (!meleeRange && (midRange || longRange)) score += 6;
-		} else if (lower.contains("forcelightningsingle1")) {
-			score += 26;
-		}
-
-		if (lower.contains("mindblast2")) {
 			score += 28;
-			if (!meleeRange) score += 4;
-		} else if (lower.contains("mindblast1")) {
+			if (!meleeRange && (midRange || longRange)) score += 4;
+		} else if (lower.contains("forcelightningsingle1")) {
 			score += 22;
 		}
 
-		// 2) Control / setup abilities (intimidate, KD, dizzy, etc.)
+		if (lower.contains("mindblast2")) {
+			score += 24;
+			if (!meleeRange) score += 4;
+		} else if (lower.contains("mindblast1")) {
+			score += 18;
+		}
+
+		// 2) Control / setup abilities — only reapply if the target is NOT already affected
+
 		bool isIntimidate = lower.contains("intimidate");
 		bool isKD         = lower.contains("knockdown");
 		bool isBlind      = lower.contains("blind");
@@ -1714,77 +1741,143 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		bool isStun       = lower.contains("stun");
 
 		if (isIntimidate) {
-			// Great opener / pressure tool
-			score += 24;
-			if (targetHpPct > 60) score += 6;     // like using it early
-			if (!meleeRange)       score -= 6;    // needs to connect
+			if (!targetIntimidated) {
+				score += 24;
+				if (targetHealthPct > 60) score += 6;  // good early pressure
+				if (!meleeRange)         score -= 6;  // needs to land
+			} else {
+				// Don't waste a tick reapplying an already-active intimidate
+				score -= 15;
+			}
 		}
 
 		if (isKD) {
-			score += 26;
-			if (meleeRange) score += 8;
-			// If they are low, KD is less valuable than just killing them
-			if (targetHpPct < 25) score -= 8;
+			if (!targetKD) {
+				score += 26;
+				if (meleeRange)        score += 8;
+				if (targetHealthPct < 25) score -= 6; // finishing? maybe just kill
+			} else {
+				// Already on the ground, don't keep spamming KD
+				score -= 15;
+			}
 		}
 
-		if (isBlind || isDizzy || isStun) {
-			score += 16;
-			if (meleeRange) score += 4;
+		bool isControlState = isBlind || isDizzy || isStun;
+
+		if (isBlind) {
+			if (!targetBlinded) {
+				score += 16;
+				if (meleeRange) score += 4;
+			} else {
+				score -= 10;
+			}
 		}
 
-		// Avoid control moves as "main filler" when nothing is going on
-		if (!hasTarget) {
-			if (isIntimidate || isKD || isBlind || isDizzy || isStun)
-				score -= 20;
+		if (isDizzy) {
+			if (!targetDizzy) {
+				score += 16;
+				if (meleeRange) score += 4;
+			} else {
+				score -= 10;
+			}
 		}
 
-		// 3) Single-target vs AoE preference
+		if (isStun) {
+			if (!targetStunned) {
+				score += 16;
+				if (meleeRange) score += 4;
+			} else {
+				score -= 10;
+			}
+		}
+
+		// Avoid control moves as filler when there is no real target
+		if (!hasTarget && (isIntimidate || isKD || isControlState))
+			score -= 25;
+
+		// 3) HAM-pool–aware focus (like a human picking on the weakest bar)
+
+		bool hitsHealth = lower.contains("health") ||
+		                  lower.contains("body") ||
+		                  lower.contains("torso");
+		bool hitsAction = lower.contains("action") ||
+		                  lower.contains("legshot") ||
+		                  lower.contains("crippling");
+		bool hitsMind   = lower.contains("mind") ||
+		                  lower.contains("headshot") ||
+		                  lower.contains("startleshot");
+
+		// thresholds – “below 50%” means focus this pool
+		bool healthLow = (targetHealthPct < 50);
+		bool actionLow = (targetActionPct < 50);
+		bool mindLow   = (targetMindPct   < 50);
+
+		// If *any* pool is low, we like attacks that pressure that specific pool
+		if (hasTarget) {
+			if (hitsHealth && healthLow)
+				score += 12;
+			if (hitsAction && actionLow)
+				score += 12;
+			if (hitsMind && mindLow)
+				score += 12;
+
+			// If all pools are high, no special bonus, they’re all fair game
+			bool allHigh = (targetHealthPct > 80 &&
+			                targetActionPct > 80 &&
+			                targetMindPct   > 80);
+			if (allHigh) {
+				// tiny bias for pure damage / nukes already covered above
+			}
+		}
+
+		// 4) Single-target vs AoE
 		bool isCone = lower.contains("cone");
 		bool isArea = lower.contains("area") || lower.contains("spray");
 
 		if (isCone || isArea) {
-			// Assume most PvE is vs 1–3 players; still useful but not spammed
-			score += 6;
-			if (!meleeRange && !midRange) score -= 6;  // too far
-			if (targetHpPct < 20) score -= 6;          // finishing: prefer direct hits
+			// Useful but don't over-prioritize compared to good single-target
+			score += 4;
+			if (!meleeRange && !midRange) score -= 6;
+			if (targetHealthPct < 20)     score -= 6;  // finishing: prefer direct
 		}
 
-		// 4) Resource (ACTION) awareness – like a human pacing themselves
-		bool isHeavyCost =
+		// 5) Very light “am I exhausted?” behavior (no real cost model yet)
+		bool isHeavyBurst =
 		    lower.contains("spinattack") ||
 		    lower.contains("flurry") ||
 		    lower.contains("frenzy") ||
 		    lower.contains("fullauto") ||
 		    isCone || isArea;
 
-		if (myActionPct < 30 && isHeavyCost) {
-			score -= 15; // "I'm tired, maybe not this one right now"
-		} else if (myActionPct > 70 && isHeavyCost) {
-			score += 6;  // "Plenty of gas in the tank"
+		if (myActionPct < 20 && isHeavyBurst) {
+			// Just a nudge – NPCs can basically spam, but don't go crazy when gassed
+			score -= 5;
 		}
 
-		// 5) Generic hits / fallback scoring
+		// 6) Generic hits / fallback if nothing else matched strongly
 		bool looksMeleeHit =
 		    lower.contains("hit") || lower.contains("lunge") || lower.contains("slash");
 		bool looksRangedHit =
 		    lower.contains("shot") || lower.contains("burst") || lower.contains("wildshot");
 
 		if (score == 0) {
-			// If nothing special matched, give them basic "human" instincts:
 			if (meleeRange && looksMeleeHit)
 				score += 10;
 			else if (!meleeRange && looksRangedHit)
 				score += 10;
 			else
-				score += 2; // at least do something
+				score += 2; // "just do something"
 		}
 
-		// 6) Small random jitter so they don't feel perfectly deterministic
+		// 7) Small random jitter so they don't feel like robots
 		score += System::random(7) - 3; // [-3, +3]
 
 #ifdef DEBUG_AI_ATTACK
 		info(true) << "AI_ATTACK: selectSpecialAttack scoring idx=" << i
 		           << " key=" << key << " score=" << score
+		           << " hp=" << targetHealthPct
+		           << " act=" << targetActionPct
+		           << " mind=" << targetMindPct
 		           << " for " << getDisplayedName()
 		           << " (" << getObjectID() << ")";
 #endif
@@ -1795,7 +1888,7 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		}
 	}
 
-	// If for some reason we didn't find anything useful, fall back
+	// Fallback if somehow nothing wins
 	if (bestIdx == -1) {
 #ifdef DEBUG_AI_ATTACK
 		info(true) << "AI_ATTACK: selectSpecialAttack - no bestIdx, falling back to random for "
