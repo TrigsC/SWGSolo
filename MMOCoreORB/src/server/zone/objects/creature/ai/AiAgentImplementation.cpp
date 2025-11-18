@@ -1553,6 +1553,113 @@ void AiAgentImplementation::doRecovery(int latency) {
 	Attack Handling
 */
 
+String AiAgentImplementation::getWeaponCategory(WeaponObject* weapon) const {
+	if (weapon == nullptr)
+		return "unarmed";
+
+	String wt = weapon->getWeaponType().toLowerCase();
+
+	// Ranged buckets
+	if (wt.contains("pistol") || wt.contains("rifle") || wt.contains("carbine") || wt.contains("heavyweapon"))
+		return "ranged";
+
+	// Melee buckets
+	if (wt.contains("onehandmelee") || wt.contains("twohandmelee") || wt.contains("unarmed"))
+		return "melee";
+
+	// Polearm melee (pike, staff, saber polearm, etc.)
+	if (wt.contains("polearm"))
+		return "polearm";
+
+	// Lightsabers – treat as melee+saber
+	if (wt.contains("lightsaber"))
+		return "saber";
+
+	// Thrown weapon can be treated as ranged
+	if (wt.contains("thrownweapon"))
+		return "ranged";
+
+	// Fallback
+	return "melee";
+}
+
+String AiAgentImplementation::getCommandCategory(const String& lower) const {
+	// Force powers are allowed with basically anything
+	if (lower.contains("force") ||
+	    lower.contains("forcelightning") ||
+	    lower.contains("mindblast"))
+		return "force";
+
+	// Explicit ranged lines: pistol/carbine/rifle/xxxshot
+	if (lower.beginsWith("pistol") ||
+	    lower.beginsWith("carbine") ||
+	    lower.beginsWith("rifle"))
+		return "ranged";
+
+	// Generic ranged "shot" commands (strafeshot, scattershot, fanshot, etc.)
+	if (lower.contains("shot") || lower.contains("burst") || lower.contains("spray"))
+		return "ranged";
+
+	// Saber commands
+	if (lower.beginsWith("saber1h") ||
+	    lower.beginsWith("saber2h") ||
+	    lower.beginsWith("saberpolearm") ||
+	    lower.contains("saberslash"))
+		return "saber";
+
+	// Polearm commands
+	if (lower.beginsWith("polearm"))
+		return "polearm";
+
+	// Generic melee commands
+	if (lower.beginsWith("melee1h") ||
+	    lower.beginsWith("melee2h") ||
+	    lower.beginsWith("unarmed") ||
+	    lower.contains("lunge") ||
+	    lower.contains("slash") ||
+	    lower.contains("spinattack"))
+		return "melee";
+
+	// Default to "any" if we can't classify – better to allow than over-restrict
+	return "any";
+}
+
+bool AiAgentImplementation::commandFitsWeaponType(const String& lower, WeaponObject* weapon) const {
+	String weapCat   = getWeaponCategory(weapon);
+	String cmdCat    = getCommandCategory(lower);
+
+	// If command is "any", don't restrict it
+	if (cmdCat == "any")
+		return true;
+
+	// Force powers can be used with anything (for now)
+	if (cmdCat == "force")
+		return true;
+
+	// Sabers: saber weapon preferred, but also allow generic melee if you want
+	if (cmdCat == "saber") {
+		return (weapCat == "saber");
+	}
+
+	// Polearm commands should not be used with 1H sword or pistol
+	if (cmdCat == "polearm") {
+		return (weapCat == "polearm" || weapCat == "saber"); // allow saber polearm if you want
+	}
+
+	// Melee commands – disallow if weapon is clearly ranged
+	if (cmdCat == "melee") {
+		return (weapCat == "melee" || weapCat == "saber" || weapCat == "polearm");
+	}
+
+	// Ranged commands – disallow if weapon is clearly melee-only
+	if (cmdCat == "ranged") {
+		return (weapCat == "ranged");
+	}
+
+	// Fallback: if we don't understand, allow it
+	return true;
+}
+
 bool AiAgentImplementation::selectSpecialAttack() {
 	// --- Thrown weapons handling (unchanged) ---
 	if (System::random(100) > 95) {
@@ -2042,6 +2149,17 @@ bool AiAgentImplementation::selectDefaultAttack() {
                 String key   = map->getCommand(i);
                 String lower = key.toLowerCase();
 
+				WeaponObject* weapon = getCurrentWeapon();
+        		// Skip commands that obviously don't fit the currently equipped weapon
+        		if (!commandFitsWeaponType(lower, weapon)) {
+#ifdef DEBUG_AI_ATTACK
+            		info(true) << "AI_ATTACK: selectDefaultAttack skipping incompatible cmd="
+                       << key << " for " << getDisplayedName()
+                       << " (" << getObjectID() << ")";
+#endif
+            		continue;
+        		}
+
                 // Lightsaber master
                 if (lower.contains("saberpolearmdervish2") ||
                     lower.contains("saber1hflurry2") ||
@@ -2127,6 +2245,9 @@ bool AiAgentImplementation::selectDefaultAttack() {
                 for (int i = 0; i < map->size(); ++i) {
                     String key   = map->getCommand(i);
                     String lower = key.toLowerCase();
+
+					if (!commandFitsWeaponType(lower, weapon))
+            			continue;
 
                     int score = 0;
 
