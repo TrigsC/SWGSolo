@@ -1764,7 +1764,7 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
 bool AiAgentImplementation::selectDefaultAttack() {
     String cmd;
 
-    // 1) Try template-defined default attack (may be "defaultattack" as engine fallback)
+    // 1) Template default (may be "defaultattack" as engine fallback)
     if (npcTemplate != nullptr) {
         cmd = npcTemplate->getDefaultAttack();
 
@@ -1775,7 +1775,6 @@ bool AiAgentImplementation::selectDefaultAttack() {
 #endif
     }
 
-    // Treat empty or "defaultattack" as effectively UNSET for NPC AI
     bool treatAsUnset = cmd.isEmpty()
         || cmd.hashCode() == STRING_HASHCODE("defaultattack");
 
@@ -1786,10 +1785,11 @@ bool AiAgentImplementation::selectDefaultAttack() {
                    << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
 
-        // 2) Derive from attack maps (already filtered by weapon)
+        // *** IMPORTANT FIX: clear cmd so heuristics can run ***
+        cmd = "";
+
         const CreatureAttackMap* map = primaryAttackMap;
 
-        // If primary map is empty/null, fall back to defaultAttackMap
         if (map == nullptr || map->isEmpty()) {
 #ifdef DEBUG_AI_ATTACK
             info(true) << "AI_ATTACK: primaryAttackMap null/empty, "
@@ -1806,14 +1806,14 @@ bool AiAgentImplementation::selectDefaultAttack() {
                        << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
 
-            // --- First pass: look for your "top" player-like main attacks ---
+            // --- Preferred "top" player-like attacks ---
             Vector<int> prioIndices;
 
             for (int i = 0; i < map->size(); ++i) {
                 String key   = map->getCommand(i);
                 String lower = key.toLowerCase();
 
-                // Lightsaber master: dervish 2, flurry 2, phantom
+                // Lightsaber master
                 if (lower.contains("saberpolearmdervish2") ||
                     lower.contains("saber1hflurry2") ||
                     lower.contains("saber2hphantom")) {
@@ -1821,57 +1821,62 @@ bool AiAgentImplementation::selectDefaultAttack() {
                     continue;
                 }
 
-                // Master force: forcelightningcone2
+                // Master force
                 if (lower.contains("forcelightningcone2")) {
                     prioIndices.add(i);
                     continue;
                 }
 
-                // Fencer: one handed hit 3, one handed scatter hit 2
+                // Fencer
                 if (lower.contains("melee1hhit3") ||
                     lower.contains("melee1hscatterhit2")) {
                     prioIndices.add(i);
                     continue;
                 }
 
-                // Tera Kasi: unarmed hit 3
+                // Tera Kasi
                 if (lower.contains("unarmedhit3")) {
                     prioIndices.add(i);
                     continue;
                 }
 
-                // Swordsman: two handed hit 3
+                // Swordsman
                 if (lower.contains("melee2hhit3")) {
                     prioIndices.add(i);
                     continue;
                 }
 
-                // Pikeman: polearm hit 3
+                // Pikeman
                 if (lower.contains("polearmhit3")) {
                     prioIndices.add(i);
                     continue;
                 }
 
-                // Pistols: fanshot
+                // Pistols
                 if (lower.contains("fanshot")) {
                     prioIndices.add(i);
                     continue;
                 }
 
-                // Rifleman: strafeshot2
+                // Rifleman
                 if (lower.contains("strafeshot2")) {
                     prioIndices.add(i);
                     continue;
                 }
 
-                // Carbines: scattershot2
+                // Carbines
                 if (lower.contains("scattershot2")) {
                     prioIndices.add(i);
                     continue;
                 }
             }
 
-            // If we found any high-priority "main" attacks, pick one of them
+#ifdef DEBUG_AI_ATTACK
+            info(true) << "AI_ATTACK: selectDefaultAttack prioIndices.size="
+                       << prioIndices.size() << " for "
+                       << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
+
             if (!prioIndices.isEmpty()) {
                 int idxInList = System::random(prioIndices.size() - 1);
                 int bestIdx   = prioIndices.get(idxInList);
@@ -1880,12 +1885,12 @@ bool AiAgentImplementation::selectDefaultAttack() {
 #ifdef DEBUG_AI_ATTACK
                 info(true) << "AI_ATTACK: selectDefaultAttack(prio_top_attack) using cmd="
                            << cmd << " from index=" << bestIdx
-                           << " for " << getDisplayedName() << " ("
-                           << getObjectID() << ")";
+                           << " for " << getDisplayedName()
+                           << " (" << getObjectID() << ")";
 #endif
             }
 
-            // 2b) If no top attacks found, use heuristic to pick a decent main attack
+            // 2b) Heuristic if no top attack chosen
             if (cmd.isEmpty()) {
                 int bestIdx   = -1;
                 int bestScore = -9999;
@@ -1896,7 +1901,7 @@ bool AiAgentImplementation::selectDefaultAttack() {
 
                     int score = 0;
 
-                    // Strong negative for pure utility / state stuff we don't want as "auto"
+                    // Avoid using pure control/utility as "white damage"
                     if (lower.contains("intimidate") ||
                         lower.contains("knockdown") ||
                         lower.contains("blind") ||
@@ -1931,7 +1936,7 @@ bool AiAgentImplementation::selectDefaultAttack() {
                     else if (lower.contains("hit2")) score += 4;
                     else if (lower.contains("hit1")) score += 2;
 
-                    // Ranged shot tiers
+                    // Ranged
                     if (lower.contains("bodyshot3") || lower.contains("headshot3")) score += 8;
                     else if (lower.contains("bodyshot2") || lower.contains("headshot2")) score += 6;
 
@@ -1941,7 +1946,7 @@ bool AiAgentImplementation::selectDefaultAttack() {
                     if (lower.contains("fullautosingle1") || lower.contains("flurryshot1") ||
                         lower.contains("strafeshot1")) score += 3;
 
-                    // Good melee/ranged specials that can be used as main if nothing else
+                    // Solid melee specials
                     if (lower.contains("spinattack2") || lower.contains("flurry") ||
                         lower.contains("lunge2") || lower.contains("dervish2")) {
                         score += 4;
@@ -1956,6 +1961,14 @@ bool AiAgentImplementation::selectDefaultAttack() {
                     }
                 }
 
+#ifdef DEBUG_AI_ATTACK
+                info(true) << "AI_ATTACK: selectDefaultAttack heuristic bestIdx="
+                           << bestIdx << " bestScore=" << bestScore
+                           << " for " << getDisplayedName()
+                           << " (" << getObjectID() << ")";
+#endif
+
+                // You can relax this threshold if you want *something* no matter what
                 if (bestIdx != -1 && bestScore > -5) {
                     cmd = map->getCommand(bestIdx);
 
@@ -1989,7 +2002,7 @@ bool AiAgentImplementation::selectDefaultAttack() {
 #endif
     }
 
-    // 3) Final fallback: generic auto-attack if we still didn't pick anything
+    // 3) Final fallback if we somehow still have nothing
     if (cmd.isEmpty()) {
         cmd = "defaultattack";
 #ifdef DEBUG_AI_ATTACK
