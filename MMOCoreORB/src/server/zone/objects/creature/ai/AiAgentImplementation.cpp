@@ -1955,10 +1955,10 @@ bool AiAgentImplementation::selectSpecialAttack() {
                  score -= 50;
 			}
 			else {
-				score += 20;
+				score += 24;
 
 				if (meleeRange)
-					score += 8;
+					score += 6;
 
 				// If target is very low health, KD is okay, but damage might be better.
                 // If target is high health, KD is excellent for control.
@@ -1971,8 +1971,8 @@ bool AiAgentImplementation::selectSpecialAttack() {
 
 		if (isBlind) {
 			if (!targetBlinded) {
-				score += 16;
-				if (meleeRange) score += 4;
+				score += 24;
+				if (meleeRange) score += 6;
 			} else {
 				score -= 10;
 			}
@@ -1980,8 +1980,8 @@ bool AiAgentImplementation::selectSpecialAttack() {
 
 		if (isDizzy) {
 			if (!targetDizzy) {
-				score += 16;
-				if (meleeRange) score += 4;
+				score += 24;
+				if (meleeRange) score += 6;
 			} else {
 				score -= 10;
 			}
@@ -1989,8 +1989,8 @@ bool AiAgentImplementation::selectSpecialAttack() {
 
 		if (isStun) {
 			if (!targetStunned) {
-				score += 16;
-				if (meleeRange) score += 4;
+				score += 24;
+				if (meleeRange) score += 6;
 			} else {
 				score -= 10;
 			}
