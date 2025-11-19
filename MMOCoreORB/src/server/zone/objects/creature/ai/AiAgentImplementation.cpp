@@ -2152,7 +2152,6 @@ bool AiAgentImplementation::selectDefaultAttack() {
 
 				WeaponObject* weapon = getCurrentWeapon();
         		// Skip commands that obviously don't fit the currently equipped weapon
-				if weapon->getWeaponType()
         		if (!isFitsWeaponType(lower, weapon)) {
 #ifdef DEBUG_AI_ATTACK
             		info(true) << "AI_ATTACK: selectDefaultAttack skipping incompatible cmd="
