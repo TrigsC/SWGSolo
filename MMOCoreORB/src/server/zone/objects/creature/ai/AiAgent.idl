@@ -1414,10 +1414,17 @@ class AiAgent extends CreatureObject {
 	@read
 	public native boolean isScoutCreature();
 
+	@local
+	@dirty
+    public abstract native String getWeaponCategory(WeaponObject weapon) {
+		return weaponCategory
+	}
 	
-    public abstract native String getWeaponCategory(WeaponObject weapon);
-	
-    public abstract native String getCommandCategory(String cmd);
+	@local
+	@dirty
+    public abstract native String getCommandCategory(String cmd) {
+		return commandCategory
+	}
 
 	@local
 	@dirty
