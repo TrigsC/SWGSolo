@@ -1583,7 +1583,7 @@ String AiAgentImplementation::getWeaponCategory(WeaponObject* weapon) {
 	return "melee";
 }
 
-String AiAgentImplementation::getCommandCategory(const String& lower) {
+String AiAgentImplementation::getCommandCategory(String& lower) {
 	// Force powers are allowed with basically anything
 	if (lower.contains("force") ||
 	    lower.contains("forcelightning") ||
