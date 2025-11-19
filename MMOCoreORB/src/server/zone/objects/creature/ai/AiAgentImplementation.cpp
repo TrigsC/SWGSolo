@@ -1715,12 +1715,12 @@ bool AiAgentImplementation::selectSpecialAttack() {
 
     // Logic: Pick the map that matches the weapon
     if (weapCat == "ranged") {
-        attackMap = &primaryAttackMap;
+        attackMap = primaryAttackMap.get();
     } else if (weapCat == "melee" || weapCat == "saber" || weapCat == "polearm") {
-        attackMap = &secondaryAttackMap;
+        attackMap = &secondaryAttackMap.get();
     } else {
         // Unarmed or unknown
-        attackMap = &defaultAttackMap;
+        attackMap = &defaultAttackMap.get();
     }
 
     // Fallback: If the selected map is empty, try the Primary one as a hail mary
@@ -2157,10 +2157,9 @@ bool AiAgentImplementation::selectDefaultAttack() {
         cmd = "";
 
         // =================================================================
-        // *** FIX START: DYNAMIC MAP SWITCHING ***
+        // *** FIX START: DYNAMIC MAP SWITCHING (Smart Pointer Corrected) ***
         // =================================================================
         
-        // 1. Get the weapon and its category
         WeaponObject* weapon = getWeapon(); 
         String weapCat = getWeaponCategory(weapon);
         
@@ -2169,26 +2168,30 @@ bool AiAgentImplementation::selectDefaultAttack() {
         // 2. Select the correct map based on the weapon category
         if (weapCat == "melee" || weapCat == "saber" || weapCat == "polearm") {
             // Melee weapons use Secondary map
-            if (secondaryAttackMap.size() > 0) {
-                map = &secondaryAttackMap;
+            // FIX: Use '->' for size and '.get()' for assignment
+            if (secondaryAttackMap != nullptr && secondaryAttackMap->size() > 0) {
+                map = secondaryAttackMap.get();
             } else {
-                // Fallback to default (unarmed/creature attacks) if secondary is empty
-                map = &defaultAttackMap;
+                // Fallback to default (unarmed/creature attacks)
+                map = defaultAttackMap.get();
             }
         } 
         else if (weapCat == "ranged") {
             // Ranged weapons use Primary map
-            if (primaryAttackMap.size() > 0) {
-                map = &primaryAttackMap;
+            if (primaryAttackMap != nullptr && primaryAttackMap->size() > 0) {
+                map = primaryAttackMap.get();
             }
         }
 
         // 3. Safety Fallbacks
-        // If specific map selection failed (e.g. Ranged weapon but Primary is empty), try others
+        // If specific map selection failed, try others in order
         if (map == nullptr || map->isEmpty()) {
-            if (defaultAttackMap.size() > 0) map = &defaultAttackMap;
-            else if (primaryAttackMap.size() > 0) map = &primaryAttackMap;
-            else if (secondaryAttackMap.size() > 0) map = &secondaryAttackMap;
+            if (defaultAttackMap != nullptr && defaultAttackMap->size() > 0) 
+                map = defaultAttackMap.get();
+            else if (primaryAttackMap != nullptr && primaryAttackMap->size() > 0) 
+                map = primaryAttackMap.get();
+            else if (secondaryAttackMap != nullptr && secondaryAttackMap->size() > 0) 
+                map = secondaryAttackMap.get();
         }
         // =================================================================
         // *** FIX END ***
@@ -2210,10 +2213,6 @@ bool AiAgentImplementation::selectDefaultAttack() {
 
                 // Pass the 'weapon' we defined above
                 if (!isFitsWeaponType(lower, weapon)) {
-#ifdef DEBUG_AI_ATTACK
-                    // Commented out to reduce spam, but useful if debugging
-                    // info(true) << "AI_ATTACK: skipping incompatible cmd=" << key;
-#endif
                     continue;
                 }
 
@@ -2274,12 +2273,6 @@ bool AiAgentImplementation::selectDefaultAttack() {
                     continue;
                 }
             }
-
-#ifdef DEBUG_AI_ATTACK
-            info(true) << "AI_ATTACK: selectDefaultAttack prioIndices.size="
-                       << prioIndices.size() << " for "
-                       << getDisplayedName() << " (" << getObjectID() << ")";
-#endif
 
             if (!prioIndices.isEmpty()) {
                 int idxInList = System::random(prioIndices.size() - 1);
@@ -2368,23 +2361,9 @@ bool AiAgentImplementation::selectDefaultAttack() {
                     }
                 }
 
-#ifdef DEBUG_AI_ATTACK
-                info(true) << "AI_ATTACK: selectDefaultAttack heuristic bestIdx="
-                           << bestIdx << " bestScore=" << bestScore
-                           << " for " << getDisplayedName()
-                           << " (" << getObjectID() << ")";
-#endif
-
                 // You can relax this threshold if you want *something* no matter what
                 if (bestIdx != -1 && bestScore > -5) {
                     cmd = map->getCommand(bestIdx);
-
-#ifdef DEBUG_AI_ATTACK
-                    info(true) << "AI_ATTACK: selectDefaultAttack(heuristic) using cmd="
-                               << cmd << " score=" << bestScore
-                               << " index=" << bestIdx << " for "
-                               << getDisplayedName() << " (" << getObjectID() << ")";
-#endif
                 }
             }
         } else {
@@ -2405,10 +2384,6 @@ bool AiAgentImplementation::selectDefaultAttack() {
     // 3) Final fallback if we somehow still have nothing
     if (cmd.isEmpty()) {
         cmd = "defaultattack";
-#ifdef DEBUG_AI_ATTACK
-        info(true) << "AI_ATTACK: selectDefaultAttack(fallback_defaultattack) for "
-                   << getDisplayedName() << " (" << getObjectID() << ")";
-#endif
     }
 
     nextActionCRC  = cmd.hashCode();
