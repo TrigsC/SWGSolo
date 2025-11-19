@@ -1944,12 +1944,12 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		if (isKD) {
 			if (targetKD) {
 				// Already on the ground, dont spam
-				score -= 50
+				score -= 50;
 			}
 			// 2. Check if they are immune (timer has not passed yet)
             // checkKnockdownRecovery returns TRUE if the cooldown is OVER.
             // So if it returns FALSE, they are still recovering (immune).
-			else if (!targetCreO->checkKnockdownRecovery()){
+			else if (!targetCreo->checkKnockdownRecovery()){
 				// Target is standing, but has "immunity" from a recent KD.
                  // Attempting to KD now will likely fail or be wasted.
                  score -= 50;
