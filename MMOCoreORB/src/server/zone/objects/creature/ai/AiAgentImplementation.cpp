@@ -1942,28 +1942,33 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		}
 
 		if (isKD) {
-			if (targetKD) {
-				// Already on the ground, dont spam
-				score -= 50;
-			}
-			// 2. Check if they are immune (timer has not passed yet)
-            // checkKnockdownRecovery returns TRUE if the cooldown is OVER.
-            // So if it returns FALSE, they are still recovering (immune).
-			else if (!targetCreo->checkKnockdownRecovery()){
-				// Target is standing, but has "immunity" from a recent KD.
-                 // Attempting to KD now will likely fail or be wasted.
-                 score -= 50;
+			if (targetCreo == nullptr) {
+				score -= 999;
 			}
 			else {
-				score += 24;
+				if (targetKD) {
+					// Already on the ground, dont spam
+					score -= 50;
+				}
+				// 2. Check if they are immune (timer has not passed yet)
+            	// checkKnockdownRecovery returns TRUE if the cooldown is OVER.
+            	// So if it returns FALSE, they are still recovering (immune).
+				else if (!targetCreo->checkKnockdownRecovery()){
+					// Target is standing, but has "immunity" from a recent KD.
+            	     // Attempting to KD now will likely fail or be wasted.
+            	     score -= 50;
+				}
+				else {
+					score += 24;
 
-				if (meleeRange)
-					score += 6;
+					if (meleeRange)
+						score += 6;
 
-				// If target is very low health, KD is okay, but damage might be better.
-                // If target is high health, KD is excellent for control.
-				if (targetHealthPct < 25)
-					score -= 6;
+					// If target is very low health, KD is okay, but damage might be better.
+            	    // If target is high health, KD is excellent for control.
+					if (targetHealthPct < 25)
+						score -= 6;
+				}
 			}
 		}
 
