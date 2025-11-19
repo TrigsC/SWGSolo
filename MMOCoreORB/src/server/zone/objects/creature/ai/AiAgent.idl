@@ -972,12 +972,6 @@ class AiAgent extends CreatureObject {
 	public abstract native final QueueCommand getNextAction();
 	@mock
 	public abstract native boolean validateStateAttack();
-	@dirty
-    public abstract native String getWeaponCategory(WeaponObject weapon);
-	@dirty
-    public abstract native String getCommandCategory(String cmd);
-	@mdirty
-    public abstract native boolean commandFitsWeaponType(String cmd, WeaponObject weapon);
 
 	@preLocked
 	public native int enqueueAttack(int priority = 2);
@@ -1413,8 +1407,17 @@ class AiAgent extends CreatureObject {
 	@preLocked
 	public native void removeObjectFlag(unsigned int flag);
 
+	
+	@dirty
+    public abstract native boolean commandFitsWeaponType(String cmd, WeaponObject weapon);
+
 	@read
 	public native boolean isScoutCreature();
+
+	
+    public abstract native String getWeaponCategory(WeaponObject weapon)
+	
+    public abstract native String getCommandCategory(String cmd);
 
 	@local
 	@dirty
