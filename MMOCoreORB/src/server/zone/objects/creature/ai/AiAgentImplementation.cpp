@@ -1125,133 +1125,159 @@ void AiAgentImplementation::setWeaponStats() {
 }
 
 void AiAgentImplementation::setupAttackMaps() {
-	if (npcTemplate == nullptr)
-		return;
+    if (npcTemplate == nullptr)
+        return;
 
 #ifdef DEBUG_AI_WEAPONS
-	info(true) << "AI_WEAPONS: setupAttackMaps for "
-	           << getDisplayedName() << " (" << getObjectID() << ")";
+    info(true) << "AI_WEAPONS: setupAttackMaps for "
+               << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
 
-	primaryAttackMap = nullptr;
-	secondaryAttackMap = nullptr;
-	defaultAttackMap = nullptr;
+    primaryAttackMap = nullptr;
+    secondaryAttackMap = nullptr;
+    defaultAttackMap = nullptr;
 
-	ZoneServer* zoneServer = getZoneServer();
+    ZoneServer* zoneServer = getZoneServer();
 
-	if (zoneServer == nullptr)
-		return;
+    if (zoneServer == nullptr)
+        return;
 
-	ObjectController* objectController = zoneServer->getObjectController();
+    ObjectController* objectController = zoneServer->getObjectController();
 
-	if (objectController == nullptr)
-		return;
+    if (objectController == nullptr)
+        return;
 
-	const CreatureAttackMap* attackMap;
+    const CreatureAttackMap* attackMap;
 
-	// ----- PRIMARY ATTACKS -----
-	if (petDeed != nullptr)
-		attackMap = petDeed->getAttacks();
-	else
-		attackMap = npcTemplate->getPrimaryAttacks();
+    // ----- PRIMARY ATTACKS -----
+    if (petDeed != nullptr)
+        attackMap = petDeed->getAttacks();
+    else
+        attackMap = npcTemplate->getPrimaryAttacks();
 
 #ifdef DEBUG_AI_WEAPONS
-	debugLogAttackMap(this, "Template primaryAttacks (raw)", attackMap, objectController);
+    debugLogAttackMap(this, "Template primaryAttacks (raw)", attackMap, objectController);
 #endif
 
-	Reference<WeaponObject*> defaultWeap = getDefaultWeapon();
-	Reference<WeaponObject*> primaryWeap = getPrimaryWeapon();
-	Reference<WeaponObject*> secondaryWeap = getSecondaryWeapon();
+    Reference<WeaponObject*> defaultWeap = getDefaultWeapon();
+    Reference<WeaponObject*> primaryWeap = getPrimaryWeapon();
+    Reference<WeaponObject*> secondaryWeap = getSecondaryWeapon();
 
-	defaultAttackMap = new CreatureAttackMap();
-	primaryAttackMap = new CreatureAttackMap();
-	secondaryAttackMap = new CreatureAttackMap();
+    defaultAttackMap = new CreatureAttackMap();
+    primaryAttackMap = new CreatureAttackMap();
+    secondaryAttackMap = new CreatureAttackMap();
 
-	for (int i = 0; i < attackMap->size(); i++) {
-		// This String is what getQueueCommand wants
-		String cmdKey = attackMap->getCommand(i);
+    for (int i = 0; i < attackMap->size(); i++) {
+        String cmdKey = attackMap->getCommand(i);
 
-		const CombatQueueCommand* attack =
-			cast<const CombatQueueCommand*>(objectController->getQueueCommand(cmdKey));
+        const CombatQueueCommand* attack =
+            cast<const CombatQueueCommand*>(objectController->getQueueCommand(cmdKey));
 
-		if (attack == nullptr)
-			continue;
+        if (attack == nullptr)
+            continue;
 
 #ifdef DEBUG_AI_WEAPONS
-		info(true) << "AI_WEAPONS: checking primary raw cmd ["
-		           << i << "] key=" << cmdKey;
+        info(true) << "AI_WEAPONS: checking primary raw cmd ["
+                   << i << "] key=" << cmdKey;
 #endif
 
-		if (primaryWeap != nullptr && (attack->getWeaponType() & primaryWeap->getWeaponBitmask())) {
-			primaryAttackMap->add(attackMap->get(i));
+        if (primaryWeap != nullptr && (attack->getWeaponType() & primaryWeap->getWeaponBitmask())) {
+            primaryAttackMap->add(attackMap->get(i));
 #ifdef DEBUG_AI_WEAPONS
-			info(true) << "  -> added to primaryAttackMap";
+            info(true) << "  -> added to primaryAttackMap";
 #endif
-		}
+        }
 
-		if (defaultWeap != nullptr && (attack->getWeaponType() & defaultWeap->getWeaponBitmask())) {
-			defaultAttackMap->add(attackMap->get(i));
+        if (defaultWeap != nullptr && (attack->getWeaponType() & defaultWeap->getWeaponBitmask())) {
+            // FIX: Check for duplicates before adding to defaultAttackMap
+            bool alreadyExists = false;
+            for (int k = 0; k < defaultAttackMap->size(); ++k) {
+                if (defaultAttackMap->getCommand(k) == cmdKey) {
+                    alreadyExists = true;
+                    break;
+                }
+            }
+
+            if (!alreadyExists) {
+                defaultAttackMap->add(attackMap->get(i));
 #ifdef DEBUG_AI_WEAPONS
-			info(true) << "  -> added to defaultAttackMap";
+                info(true) << "  -> added to defaultAttackMap";
 #endif
-		}
-	}
+            }
+        }
+    }
 
-	// ----- SECONDARY ATTACKS -----
-	if (petDeed == nullptr) {
-		attackMap = npcTemplate->getSecondaryAttacks();
-
-#ifdef DEBUG_AI_WEAPONS
-		debugLogAttackMap(this, "Template secondaryAttacks (raw)", attackMap, objectController);
-#endif
-
-		for (int i = 0; i < attackMap->size(); i++) {
-			String cmdKey = attackMap->getCommand(i);
-
-			const CombatQueueCommand* attack =
-				cast<const CombatQueueCommand*>(objectController->getQueueCommand(cmdKey));
-
-			if (attack == nullptr)
-				continue;
+    // ----- SECONDARY ATTACKS -----
+    if (petDeed == nullptr) {
+        attackMap = npcTemplate->getSecondaryAttacks();
 
 #ifdef DEBUG_AI_WEAPONS
-			info(true) << "AI_WEAPONS: checking secondary raw cmd ["
-			           << i << "] key=" << cmdKey;
+        debugLogAttackMap(this, "Template secondaryAttacks (raw)", attackMap, objectController);
 #endif
 
-			if (secondaryWeap != nullptr && (attack->getWeaponType() & secondaryWeap->getWeaponBitmask())) {
-				secondaryAttackMap->add(attackMap->get(i));
-#ifdef DEBUG_AI_WEAPONS
-				info(true) << "  -> added to secondaryAttackMap";
-#endif
-			}
+        for (int i = 0; i < attackMap->size(); i++) {
+            String cmdKey = attackMap->getCommand(i);
 
-			if (defaultWeap != nullptr && (attack->getWeaponType() & defaultWeap->getWeaponBitmask())) {
-				defaultAttackMap->add(attackMap->get(i));
-#ifdef DEBUG_AI_WEAPONS
-				info(true) << "  -> added to defaultAttackMap (from secondary)";
-#endif
-			}
-		}
-	}
+            const CombatQueueCommand* attack =
+                cast<const CombatQueueCommand*>(objectController->getQueueCommand(cmdKey));
 
-	// if we didn't get any attacks or the weapon is nullptr, drop the reference to the attack maps
-	if (defaultAttackMap != nullptr && defaultAttackMap->isEmpty())
-		defaultAttackMap = nullptr;
-
-	if (primaryAttackMap != nullptr && primaryAttackMap->isEmpty())
-		primaryAttackMap = nullptr;
-
-	if (secondaryAttackMap != nullptr && secondaryAttackMap->isEmpty())
-		secondaryAttackMap = nullptr;
+            if (attack == nullptr)
+                continue;
 
 #ifdef DEBUG_AI_WEAPONS
-	debugLogAttackMap(this, "primaryAttackMap (filtered)", primaryAttackMap, objectController);
-	debugLogAttackMap(this, "secondaryAttackMap (filtered)", secondaryAttackMap, objectController);
-	debugLogAttackMap(this, "defaultAttackMap (filtered)", defaultAttackMap, objectController);
+            info(true) << "AI_WEAPONS: checking secondary raw cmd ["
+                       << i << "] key=" << cmdKey;
 #endif
 
-	attackMap = nullptr;
+            if (secondaryWeap != nullptr && (attack->getWeaponType() & secondaryWeap->getWeaponBitmask())) {
+                secondaryAttackMap->add(attackMap->get(i));
+#ifdef DEBUG_AI_WEAPONS
+                info(true) << "  -> added to secondaryAttackMap";
+#endif
+            }
+
+            if (defaultWeap != nullptr && (attack->getWeaponType() & defaultWeap->getWeaponBitmask())) {
+                // FIX: Check for duplicates before adding to defaultAttackMap
+                // This is the critical one, as Force powers from Primary are likely already here
+                bool alreadyExists = false;
+                for (int k = 0; k < defaultAttackMap->size(); ++k) {
+                    if (defaultAttackMap->getCommand(k) == cmdKey) {
+                        alreadyExists = true;
+                        break;
+                    }
+                }
+
+                if (!alreadyExists) {
+                    defaultAttackMap->add(attackMap->get(i));
+#ifdef DEBUG_AI_WEAPONS
+                    info(true) << "  -> added to defaultAttackMap (from secondary)";
+#endif
+                } else {
+#ifdef DEBUG_AI_WEAPONS
+                    info(true) << "  -> SKIPPED duplicate in defaultAttackMap";
+#endif
+                }
+            }
+        }
+    }
+
+    // if we didn't get any attacks or the weapon is nullptr, drop the reference to the attack maps
+    if (defaultAttackMap != nullptr && defaultAttackMap->isEmpty())
+        defaultAttackMap = nullptr;
+
+    if (primaryAttackMap != nullptr && primaryAttackMap->isEmpty())
+        primaryAttackMap = nullptr;
+
+    if (secondaryAttackMap != nullptr && secondaryAttackMap->isEmpty())
+        secondaryAttackMap = nullptr;
+
+#ifdef DEBUG_AI_WEAPONS
+    debugLogAttackMap(this, "primaryAttackMap (filtered)", primaryAttackMap, objectController);
+    debugLogAttackMap(this, "secondaryAttackMap (filtered)", secondaryAttackMap, objectController);
+    debugLogAttackMap(this, "defaultAttackMap (filtered)", defaultAttackMap, objectController);
+#endif
+
+    attackMap = nullptr;
 }
 
 void AiAgentImplementation::equipPrimaryWeapon() {
@@ -1834,7 +1860,7 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		    lower.contains("melee2hhit3") ||
 		    lower.contains("unarmedhit3") ||
 		    lower.contains("polearmhit3")) {
-			score += 30;
+			score += 35;
 			if (meleeRange) score += 6;
 		}
 
@@ -1844,7 +1870,7 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		    lower.contains("strafeshot2") ||
 		    lower.contains("fullautosingle2") ||
 		    lower.contains("flurryshot2")) {
-			score += 30;
+			score += 35;
 			if (!meleeRange && midRange) score += 6;
 		}
 
