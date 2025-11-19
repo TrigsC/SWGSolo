@@ -1416,11 +1416,11 @@ class AiAgent extends CreatureObject {
 	public native boolean isScoutCreature();
 
 	@local
-	@dirty
+	@read
     public abstract native string getWeaponCategory(WeaponObject weapon);
 	
 	@local
-	@dirty
+	@read
     public abstract native string getCommandCategory(string cmd);
 
 	@local
