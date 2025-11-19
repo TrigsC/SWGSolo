@@ -1875,27 +1875,27 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		}
 
 		// Force nukes
-		if (lower.contains("forcelightningcone2")) {
-			score += 34;
-			if (midRange || longRange) score += 8;
-		} else if (lower.contains("forcelightningcone1")) {
-			score += 26;
-			if (midRange || longRange) score += 6;
-		}
-
-		if (lower.contains("forcelightningsingle2")) {
-			score += 28;
-			if (!meleeRange && (midRange || longRange)) score += 4;
-		} else if (lower.contains("forcelightningsingle1")) {
-			score += 22;
-		}
-
-		if (lower.contains("mindblast2")) {
-			score += 24;
-			if (!meleeRange) score += 4;
-		} else if (lower.contains("mindblast1")) {
-			score += 18;
-		}
+		//if (lower.contains("forcelightningcone2")) {
+		//	score += 34;
+		//	if (midRange || longRange) score += 8;
+		//} else if (lower.contains("forcelightningcone1")) {
+		//	score += 26;
+		//	if (midRange || longRange) score += 6;
+		//}
+//
+		//if (lower.contains("forcelightningsingle2")) {
+		//	score += 28;
+		//	if (!meleeRange && (midRange || longRange)) score += 4;
+		//} else if (lower.contains("forcelightningsingle1")) {
+		//	score += 22;
+		//}
+//
+		//if (lower.contains("mindblast2")) {
+		//	score += 24;
+		//	if (!meleeRange) score += 4;
+		//} else if (lower.contains("mindblast1")) {
+		//	score += 18;
+		//}
 
 		// 2) Control / setup abilities — only reapply if the target is NOT already affected
 
