@@ -2380,6 +2380,7 @@ bool AiAgentImplementation::selectDefaultAttack() {
                         lower.contains("suppression") ||
                         lower.contains("warning") ||
                         lower.contains("confusion") ||
+						lower.contains("lunge") ||
                         lower.contains("meleedefense")) {
                         score -= 10;
                     }
