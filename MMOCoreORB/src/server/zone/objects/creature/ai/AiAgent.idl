@@ -972,14 +972,12 @@ class AiAgent extends CreatureObject {
 	public abstract native final QueueCommand getNextAction();
 	@mock
 	public abstract native boolean validateStateAttack();
-	@mock
-    @preLocked
+
+    @local
     public String getWeaponCategory(WeaponObject weapon);
-	@mock
-    @preLocked
+	@local
     public String getCommandCategory(String cmd);
-	@mock
-    @preLocked
+	@local
     public boolean commandFitsWeaponType(String cmd, WeaponObject weapon);
 
 	@preLocked
