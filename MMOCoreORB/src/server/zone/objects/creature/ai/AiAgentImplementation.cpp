@@ -1553,7 +1553,7 @@ void AiAgentImplementation::doRecovery(int latency) {
 	Attack Handling
 */
 
-String AiAgentImplementation::getWeaponCategory(WeaponObject* weapon) {
+String AiAgentImplementation::getWeaponCategory(WeaponObject* weapon) const {
 	if (weapon == nullptr)
 		return "unarmed";
 
@@ -1583,7 +1583,7 @@ String AiAgentImplementation::getWeaponCategory(WeaponObject* weapon) {
 	return "melee";
 }
 
-String AiAgentImplementation::getCommandCategory(String& lower) {
+String AiAgentImplementation::getCommandCategory(const String& lower) const {
 	// Force powers are allowed with basically anything
 	if (lower.contains("force") ||
 	    lower.contains("forcelightning") ||
@@ -1624,7 +1624,7 @@ String AiAgentImplementation::getCommandCategory(String& lower) {
 	return "any";
 }
 
-bool AiAgentImplementation::isFitsWeaponType(String& cmd, WeaponObject* weapon) {
+bool AiAgentImplementation::isFitsWeaponType(String& cmd, WeaponObject* weapon) const {
 	String lower = cmd.toLowerCase();
 	String weapCat   = getWeaponCategory(weapon);
 	String cmdCat    = getCommandCategory(lower);
