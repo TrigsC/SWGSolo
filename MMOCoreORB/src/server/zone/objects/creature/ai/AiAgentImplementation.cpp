@@ -1852,15 +1852,15 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		    lower.contains("saber2hsweep3") ||
 		    lower.contains("saber2hbodyhit3") ||
 		    lower.contains("saber1hhit3")) {
-			score += 35;
-			if (meleeRange) score += 8;
+			score += 20;
+			if (meleeRange) score += 6;
 		}
 
 		if (lower.contains("melee1hhit3") ||
 		    lower.contains("melee2hhit3") ||
 		    lower.contains("unarmedhit3") ||
 		    lower.contains("polearmhit3")) {
-			score += 35;
+			score += 20;
 			if (meleeRange) score += 6;
 		}
 
@@ -1870,7 +1870,7 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		    lower.contains("strafeshot2") ||
 		    lower.contains("fullautosingle2") ||
 		    lower.contains("flurryshot2")) {
-			score += 35;
+			score += 20;
 			if (!meleeRange && midRange) score += 6;
 		}
 
