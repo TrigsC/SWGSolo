@@ -2151,7 +2151,7 @@ bool AiAgentImplementation::selectDefaultAttack() {
 
 				WeaponObject* weapon = getCurrentWeapon();
         		// Skip commands that obviously don't fit the currently equipped weapon
-        		if (!commandFitsWeaponType(lower, weapon)) {
+        		if (!commandFitsWeaponType(&lower, weapon)) {
 #ifdef DEBUG_AI_ATTACK
             		info(true) << "AI_ATTACK: selectDefaultAttack skipping incompatible cmd="
                        << key << " for " << getDisplayedName()
@@ -2246,7 +2246,7 @@ bool AiAgentImplementation::selectDefaultAttack() {
                     String key   = map->getCommand(i);
                     String lower = key.toLowerCase();
 
-					if (!commandFitsWeaponType(lower, weapon))
+					if (!commandFitsWeaponType(&lower, weapon))
             			continue;
 
                     int score = 0;
