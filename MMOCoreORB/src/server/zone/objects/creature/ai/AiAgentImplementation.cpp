@@ -1898,17 +1898,42 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		//}
 
 		// 2) Control / setup abilities — only reapply if the target is NOT already affected
-
 		bool isIntimidate = lower.contains("intimidate");
-		bool isKD         = lower.contains("knockdown");
-		bool isBlind      = lower.contains("blind");
-		bool isDizzy      = lower.contains("dizzy");
-		bool isStun       = lower.contains("stun");
+
+		bool isKD         = lower.contains("knockdown") ||
+							lower.contains("sweep") ||
+							lower.contains("lowblow") ||
+							lower.contains("meleedefense") ||
+							lower.contains("charge") ||
+							lower.contains("throw") ||
+							lower.contains("lunge");
+
+		bool isBlind      = lower.contains("blind") ||
+							lower.contains("eye") ||
+							lower.contains("flurry") ||
+							lower.contains("phantom") ||
+							lower.contains("dervish") ||
+							lower.contains("fullauto");
+
+		bool isDizzy      = lower.contains("dizzy") ||
+							lower.contains("flurry") ||
+							lower.contains("spray") ||
+							lower.contains("dervish") ||
+							lower.contains("confusion");
+
+		bool isStun       = lower.contains("stun") ||
+							lower.contains("confusion") ||
+							lower.contains("lastditch") ||
+							lower.contains("forcethrow") ||
+							lower.contains("flurry") ||
+							lower.contains("wildshot") ||
+							lower.contains("flushing") ||
+							lower.contains("fullauto");
 
 		if (isIntimidate) {
 			if (!targetIntimidated) {
 				score += 24;
-				if (targetHealthPct > 60) score += 6;  // good early pressure
+				if (targetHealthPct > 20) score += 6;  // good early pressure
 				if (!meleeRange)         score -= 6;  // needs to land
 			} else {
 				// Don't waste a tick reapplying an already-active intimidate
@@ -1917,13 +1942,28 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		}
 
 		if (isKD) {
-			if (!targetKD) {
-				score += 26;
-				if (meleeRange)        score += 8;
-				if (targetHealthPct < 25) score -= 6; // finishing? maybe just kill
-			} else {
-				// Already on the ground, don't keep spamming KD
-				score -= 15;
+			if (targetKD) {
+				// Already on the ground, dont spam
+				score -= 50
+			}
+			// 2. Check if they are immune (timer has not passed yet)
+            // checkKnockdownRecovery returns TRUE if the cooldown is OVER.
+            // So if it returns FALSE, they are still recovering (immune).
+			else if (!targetCreO->checkKnockdownRecovery()){
+				// Target is standing, but has "immunity" from a recent KD.
+                 // Attempting to KD now will likely fail or be wasted.
+                 score -= 50;
+			}
+			else {
+				score += 20;
+
+				if (meleeRange)
+					score += 8;
+
+				// If target is very low health, KD is okay, but damage might be better.
+                // If target is high health, KD is excellent for control.
+				if (targetHealthPct < 25)
+					score -= 6;
 			}
 		}
 
@@ -1966,10 +2006,10 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		                  lower.contains("body") ||
 		                  lower.contains("torso");
 		bool hitsAction = lower.contains("action") ||
-		                  lower.contains("legshot") ||
+		                  lower.contains("leg") ||
 		                  lower.contains("crippling");
 		bool hitsMind   = lower.contains("mind") ||
-		                  lower.contains("headshot") ||
+		                  lower.contains("head") ||
 		                  lower.contains("startleshot");
 
 		// thresholds – “below 50%” means focus this pool
@@ -1987,9 +2027,9 @@ bool AiAgentImplementation::selectSpecialAttack() {
 				score += 12;
 
 			// If all pools are high, no special bonus, they’re all fair game
-			bool allHigh = (targetHealthPct > 80 &&
-			                targetActionPct > 80 &&
-			                targetMindPct   > 80);
+			bool allHigh = (targetHealthPct > 70 &&
+			                targetActionPct > 70 &&
+			                targetMindPct   > 70);
 			if (allHigh) {
 				// tiny bias for pure damage / nukes already covered above
 			}
@@ -2021,9 +2061,9 @@ bool AiAgentImplementation::selectSpecialAttack() {
 
 		// 6) Generic hits / fallback if nothing else matched strongly
 		bool looksMeleeHit =
-		    lower.contains("hit") || lower.contains("lunge") || lower.contains("slash");
+		    lower.contains("hit");
 		bool looksRangedHit =
-		    lower.contains("shot") || lower.contains("burst") || lower.contains("wildshot");
+		    lower.contains("shot") || lower.contains("burst");
 
 		if (score == 0) {
 			if (meleeRange && looksMeleeHit)
