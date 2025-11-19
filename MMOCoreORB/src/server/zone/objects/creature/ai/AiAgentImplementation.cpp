@@ -1553,112 +1553,121 @@ void AiAgentImplementation::doRecovery(int latency) {
 	Attack Handling
 */
 
+// 1. getWeaponCategory
+// FIX: Added 'const' to the end of the function.
 String AiAgentImplementation::getWeaponCategory(WeaponObject* weapon) const {
-	if (weapon == nullptr)
-		return "unarmed";
+    if (weapon == nullptr)
+        return "unarmed";
 
-	String wt = weapon->getWeaponType().toLowerCase();
+    String wt = weapon->getWeaponType().toLowerCase();
 
-	// Ranged buckets
-	if (wt.contains("pistol") || wt.contains("rifle") || wt.contains("carbine") || wt.contains("heavyweapon"))
-		return "ranged";
+    // Ranged buckets
+    if (wt.contains("pistol") || wt.contains("rifle") || wt.contains("carbine") || wt.contains("heavyweapon"))
+        return "ranged";
 
-	// Melee buckets
-	if (wt.contains("onehandmelee") || wt.contains("twohandmelee") || wt.contains("unarmed"))
-		return "melee";
+    // Melee buckets
+    if (wt.contains("onehandmelee") || wt.contains("twohandmelee") || wt.contains("unarmed"))
+        return "melee";
 
-	// Polearm melee (pike, staff, saber polearm, etc.)
-	if (wt.contains("polearm"))
-		return "polearm";
+    // Polearm melee (pike, staff, saber polearm, etc.)
+    if (wt.contains("polearm"))
+        return "polearm";
 
-	// Lightsabers – treat as melee+saber
-	if (wt.contains("lightsaber"))
-		return "saber";
+    // Lightsabers – treat as melee+saber
+    if (wt.contains("lightsaber"))
+        return "saber";
 
-	// Thrown weapon can be treated as ranged
-	if (wt.contains("thrownweapon"))
-		return "ranged";
+    // Thrown weapon can be treated as ranged
+    if (wt.contains("thrownweapon"))
+        return "ranged";
 
-	// Fallback
-	return "melee";
+    // Fallback
+    return "melee";
 }
 
-String AiAgentImplementation::getCommandCategory(const String& lower) const {
-	// Force powers are allowed with basically anything
-	if (lower.contains("force") ||
-	    lower.contains("forcelightning") ||
-	    lower.contains("mindblast"))
-		return "force";
+// 2. getCommandCategory
+// FIX 1: Removed 'const' from the argument (String& lower). The IDL 'string' generates 'String&'.
+// FIX 2: Added 'const' to the end of the function.
+String AiAgentImplementation::getCommandCategory(String& lower) const {
+    // Force powers are allowed with basically anything
+    if (lower.contains("force") ||
+        lower.contains("forcelightning") ||
+        lower.contains("mindblast"))
+        return "force";
 
-	// Explicit ranged lines: pistol/carbine/rifle/xxxshot
-	if (lower.beginsWith("pistol") ||
-	    lower.beginsWith("carbine") ||
-	    lower.beginsWith("rifle"))
-		return "ranged";
+    // Explicit ranged lines: pistol/carbine/rifle/xxxshot
+    if (lower.beginsWith("pistol") ||
+        lower.beginsWith("carbine") ||
+        lower.beginsWith("rifle"))
+        return "ranged";
 
-	// Generic ranged "shot" commands (strafeshot, scattershot, fanshot, etc.)
-	if (lower.contains("shot") || lower.contains("burst") || lower.contains("spray"))
-		return "ranged";
+    // Generic ranged "shot" commands (strafeshot, scattershot, fanshot, etc.)
+    if (lower.contains("shot") || lower.contains("burst") || lower.contains("spray"))
+        return "ranged";
 
-	// Saber commands
-	if (lower.beginsWith("saber1h") ||
-	    lower.beginsWith("saber2h") ||
-	    lower.beginsWith("saberpolearm") ||
-	    lower.contains("saberslash"))
-		return "saber";
+    // Saber commands
+    if (lower.beginsWith("saber1h") ||
+        lower.beginsWith("saber2h") ||
+        lower.beginsWith("saberpolearm") ||
+        lower.contains("saberslash"))
+        return "saber";
 
-	// Polearm commands
-	if (lower.beginsWith("polearm"))
-		return "polearm";
+    // Polearm commands
+    if (lower.beginsWith("polearm"))
+        return "polearm";
 
-	// Generic melee commands
-	if (lower.beginsWith("melee1h") ||
-	    lower.beginsWith("melee2h") ||
-	    lower.beginsWith("unarmed") ||
-	    lower.contains("lunge") ||
-	    lower.contains("slash") ||
-	    lower.contains("spinattack"))
-		return "melee";
+    // Generic melee commands
+    if (lower.beginsWith("melee1h") ||
+        lower.beginsWith("melee2h") ||
+        lower.beginsWith("unarmed") ||
+        lower.contains("lunge") ||
+        lower.contains("slash") ||
+        lower.contains("spinattack"))
+        return "melee";
 
-	// Default to "any" if we can't classify – better to allow than over-restrict
-	return "any";
+    // Default to "any" if we can't classify – better to allow than over-restrict
+    return "any";
 }
 
+// 3. isFitsWeaponType
+// FIX: Added 'const' to the end of the function.
 bool AiAgentImplementation::isFitsWeaponType(String& cmd, WeaponObject* weapon) const {
-	String lower = cmd.toLowerCase();
-	String weapCat   = getWeaponCategory(weapon);
-	String cmdCat    = getCommandCategory(lower);
+    String lower = cmd.toLowerCase();
+    
+    // Because all 3 functions are now 'const', they can call each other safely.
+    String weapCat   = getWeaponCategory(weapon);
+    String cmdCat    = getCommandCategory(lower);
 
-	// If command is "any", don't restrict it
-	if (cmdCat == "any")
-		return true;
+    // If command is "any", don't restrict it
+    if (cmdCat == "any")
+        return true;
 
-	// Force powers can be used with anything (for now)
-	if (cmdCat == "force")
-		return true;
+    // Force powers can be used with anything (for now)
+    if (cmdCat == "force")
+        return true;
 
-	// Sabers: saber weapon preferred, but also allow generic melee if you want
-	if (cmdCat == "saber") {
-		return (weapCat == "saber");
-	}
+    // Sabers: saber weapon preferred, but also allow generic melee if you want
+    if (cmdCat == "saber") {
+        return (weapCat == "saber");
+    }
 
-	// Polearm commands should not be used with 1H sword or pistol
-	if (cmdCat == "polearm") {
-		return (weapCat == "polearm" || weapCat == "saber"); // allow saber polearm if you want
-	}
+    // Polearm commands should not be used with 1H sword or pistol
+    if (cmdCat == "polearm") {
+        return (weapCat == "polearm" || weapCat == "saber"); 
+    }
 
-	// Melee commands – disallow if weapon is clearly ranged
-	if (cmdCat == "melee") {
-		return (weapCat == "melee" || weapCat == "saber" || weapCat == "polearm");
-	}
+    // Melee commands – disallow if weapon is clearly ranged
+    if (cmdCat == "melee") {
+        return (weapCat == "melee" || weapCat == "saber" || weapCat == "polearm");
+    }
 
-	// Ranged commands – disallow if weapon is clearly melee-only
-	if (cmdCat == "ranged") {
-		return (weapCat == "ranged");
-	}
+    // Ranged commands – disallow if weapon is clearly melee-only
+    if (cmdCat == "ranged") {
+        return (weapCat == "ranged");
+    }
 
-	// Fallback: if we don't understand, allow it
-	return true;
+    // Fallback: if we don't understand, allow it
+    return true;
 }
 
 bool AiAgentImplementation::selectSpecialAttack() {
