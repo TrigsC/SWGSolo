@@ -1717,10 +1717,10 @@ bool AiAgentImplementation::selectSpecialAttack() {
     if (weapCat == "ranged") {
         attackMap = primaryAttackMap.get();
     } else if (weapCat == "melee" || weapCat == "saber" || weapCat == "polearm") {
-        attackMap = &secondaryAttackMap.get();
+        attackMap = secondaryAttackMap.get();
     } else {
         // Unarmed or unknown
-        attackMap = &defaultAttackMap.get();
+        attackMap = defaultAttackMap.get();
     }
 
     // Fallback: If the selected map is empty, try the Primary one as a hail mary
