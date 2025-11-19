@@ -186,6 +186,8 @@ class AiAgent extends CreatureObject {
 	protected transient string templateName;
 	protected unsigned int lairTemplateCRC;
 	protected unsigned int creatureBitmask;
+	protected transient string commandCategory;
+	protected transient string weaponCategory;
 
 	protected float fleeRange;
 
