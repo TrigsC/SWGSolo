@@ -979,9 +979,6 @@ class AiAgent extends CreatureObject {
 	@mdirty
     public abstract native boolean commandFitsWeaponType(String cmd, WeaponObject weapon);
 
-	@dirty
-	public abstract native string getPersonalityStf();
-
 	@preLocked
 	public native int enqueueAttack(int priority = 2);
 
