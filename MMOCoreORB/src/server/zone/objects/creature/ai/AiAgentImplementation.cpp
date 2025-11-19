@@ -1624,7 +1624,7 @@ String AiAgentImplementation::getCommandCategory(const String& lower) {
 	return "any";
 }
 
-bool AiAgentImplementation::commandFitsWeaponType(const String& lower, WeaponObject* weapon) {
+bool AiAgentImplementation::isFitsWeaponType(String& lower, WeaponObject* weapon) {
 	String weapCat   = getWeaponCategory(weapon);
 	String cmdCat    = getCommandCategory(&lower);
 
@@ -2151,7 +2151,8 @@ bool AiAgentImplementation::selectDefaultAttack() {
 
 				WeaponObject* weapon = getCurrentWeapon();
         		// Skip commands that obviously don't fit the currently equipped weapon
-        		if (!commandFitsWeaponType(&lower, weapon)) {
+				if weapon->getWeaponType()
+        		if (!isFitsWeaponType(&lower, weapon)) {
 #ifdef DEBUG_AI_ATTACK
             		info(true) << "AI_ATTACK: selectDefaultAttack skipping incompatible cmd="
                        << key << " for " << getDisplayedName()
@@ -2246,7 +2247,7 @@ bool AiAgentImplementation::selectDefaultAttack() {
                     String key   = map->getCommand(i);
                     String lower = key.toLowerCase();
 
-					if (!commandFitsWeaponType(&lower, weapon))
+					if (!isFitsWeaponType(&lower, weapon))
             			continue;
 
                     int score = 0;

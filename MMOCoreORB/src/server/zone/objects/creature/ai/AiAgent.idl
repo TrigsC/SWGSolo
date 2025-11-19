@@ -1409,9 +1409,8 @@ class AiAgent extends CreatureObject {
 	@preLocked
 	public native void removeObjectFlag(unsigned int flag);
 
-	
-	@dirty
-    public abstract native boolean commandFitsWeaponType(String cmd, WeaponObject weapon);
+	@read
+    public native boolean isFitsWeaponType(String cmd, WeaponObject weapon);
 
 	@read
 	public native boolean isScoutCreature();
