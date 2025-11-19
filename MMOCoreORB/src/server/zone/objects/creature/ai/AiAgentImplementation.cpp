@@ -1602,7 +1602,11 @@ String AiAgentImplementation::getCommandCategory(String& lower) const {
         return "ranged";
 
     // Generic ranged "shot" commands (strafeshot, scattershot, fanshot, etc.)
-    if (lower.contains("shot") || lower.contains("burst") || lower.contains("spray"))
+    if (lower.contains("shot") || 
+		lower.contains("burst") || 
+		lower.contains("spray") ||
+		lower.contains("pointblank") ||
+		lower.contains("suppression"))
         return "ranged";
 
     // Saber commands
@@ -1622,7 +1626,8 @@ String AiAgentImplementation::getCommandCategory(String& lower) const {
         lower.beginsWith("unarmed") ||
         lower.contains("lunge") ||
         lower.contains("slash") ||
-        lower.contains("spinattack"))
+        lower.contains("spinattack") ||
+		lower.contains("hit"))
         return "melee";
 
     // Default to "any" if we can't classify – better to allow than over-restrict
@@ -1704,7 +1709,24 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		}
 	}
 
-	const CreatureAttackMap* attackMap = getAttackMap();
+	WeaponObject* weapon = getWeapon();
+    String weapCat = getWeaponCategory(weapon);
+    const CreatureAttackMap* attackMap = nullptr;
+
+    // Logic: Pick the map that matches the weapon
+    if (weapCat == "ranged") {
+        attackMap = &primaryAttackMap;
+    } else if (weapCat == "melee" || weapCat == "saber" || weapCat == "polearm") {
+        attackMap = &secondaryAttackMap;
+    } else {
+        // Unarmed or unknown
+        attackMap = &defaultAttackMap;
+    }
+
+    // Fallback: If the selected map is empty, try the Primary one as a hail mary
+    if (attackMap == nullptr || attackMap->size() == 0) {
+        attackMap = getAttackMap(); 
+    }
 
 	if (attackMap == nullptr || attackMap->isEmpty()) {
 #ifdef DEBUG_AI_ATTACK
@@ -2134,21 +2156,48 @@ bool AiAgentImplementation::selectDefaultAttack() {
         // *** IMPORTANT FIX: clear cmd so heuristics can run ***
         cmd = "";
 
-        const CreatureAttackMap* map = primaryAttackMap;
+        // =================================================================
+        // *** FIX START: DYNAMIC MAP SWITCHING ***
+        // =================================================================
+        
+        // 1. Get the weapon and its category
+        WeaponObject* weapon = getWeapon(); 
+        String weapCat = getWeaponCategory(weapon);
+        
+        const CreatureAttackMap* map = nullptr;
 
-        if (map == nullptr || map->isEmpty()) {
-#ifdef DEBUG_AI_ATTACK
-            info(true) << "AI_ATTACK: primaryAttackMap null/empty, "
-                       << "falling back to defaultAttackMap for "
-                       << getDisplayedName() << " (" << getObjectID() << ")";
-#endif
-            map = defaultAttackMap;
+        // 2. Select the correct map based on the weapon category
+        if (weapCat == "melee" || weapCat == "saber" || weapCat == "polearm") {
+            // Melee weapons use Secondary map
+            if (secondaryAttackMap.size() > 0) {
+                map = &secondaryAttackMap;
+            } else {
+                // Fallback to default (unarmed/creature attacks) if secondary is empty
+                map = &defaultAttackMap;
+            }
+        } 
+        else if (weapCat == "ranged") {
+            // Ranged weapons use Primary map
+            if (primaryAttackMap.size() > 0) {
+                map = &primaryAttackMap;
+            }
         }
+
+        // 3. Safety Fallbacks
+        // If specific map selection failed (e.g. Ranged weapon but Primary is empty), try others
+        if (map == nullptr || map->isEmpty()) {
+            if (defaultAttackMap.size() > 0) map = &defaultAttackMap;
+            else if (primaryAttackMap.size() > 0) map = &primaryAttackMap;
+            else if (secondaryAttackMap.size() > 0) map = &secondaryAttackMap;
+        }
+        // =================================================================
+        // *** FIX END ***
+        // =================================================================
 
         if (map != nullptr && !map->isEmpty()) {
 #ifdef DEBUG_AI_ATTACK
             info(true) << "AI_ATTACK: selectDefaultAttack using map size="
-                       << map->size() << " for "
+                       << map->size() << " (Cat: " << weapCat << ") for "
                        << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
 
@@ -2159,16 +2208,14 @@ bool AiAgentImplementation::selectDefaultAttack() {
                 String key   = map->getCommand(i);
                 String lower = key.toLowerCase();
 
-				WeaponObject* weapon = getCurrentWeapon();
-        		// Skip commands that obviously don't fit the currently equipped weapon
-        		if (!isFitsWeaponType(lower, weapon)) {
+                // Pass the 'weapon' we defined above
+                if (!isFitsWeaponType(lower, weapon)) {
 #ifdef DEBUG_AI_ATTACK
-            		info(true) << "AI_ATTACK: selectDefaultAttack skipping incompatible cmd="
-                       << key << " for " << getDisplayedName()
-                       << " (" << getObjectID() << ")";
+                    // Commented out to reduce spam, but useful if debugging
+                    // info(true) << "AI_ATTACK: skipping incompatible cmd=" << key;
 #endif
-            		continue;
-        		}
+                    continue;
+                }
 
                 // Lightsaber master
                 if (lower.contains("saberpolearmdervish2") ||
@@ -2256,8 +2303,8 @@ bool AiAgentImplementation::selectDefaultAttack() {
                     String key   = map->getCommand(i);
                     String lower = key.toLowerCase();
 
-					if (!isFitsWeaponType(lower, weapon))
-            			continue;
+                    if (!isFitsWeaponType(lower, weapon))
+                        continue;
 
                     int score = 0;
 
@@ -2337,13 +2384,6 @@ bool AiAgentImplementation::selectDefaultAttack() {
                                << cmd << " score=" << bestScore
                                << " index=" << bestIdx << " for "
                                << getDisplayedName() << " (" << getObjectID() << ")";
-#endif
-                } else {
-#ifdef DEBUG_AI_ATTACK
-                    info(true) << "AI_ATTACK: selectDefaultAttack(heuristic) NO good candidate "
-                               << "(bestIdx=" << bestIdx << " bestScore=" << bestScore
-                               << ") for " << getDisplayedName()
-                               << " (" << getObjectID() << ")";
 #endif
                 }
             }
