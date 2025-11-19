@@ -186,8 +186,8 @@ class AiAgent extends CreatureObject {
 	protected transient string templateName;
 	protected unsigned int lairTemplateCRC;
 	protected unsigned int creatureBitmask;
-	protected transient string commandCategory;
-	protected transient string weaponCategory;
+	//protected transient string commandCategory;
+	//protected transient string weaponCategory;
 
 	protected float fleeRange;
 
@@ -1410,22 +1410,18 @@ class AiAgent extends CreatureObject {
 	public native void removeObjectFlag(unsigned int flag);
 
 	@read
-    public native boolean isFitsWeaponType(String cmd, WeaponObject weapon);
+    public native boolean isFitsWeaponType(string cmd, WeaponObject weapon);
 
 	@read
 	public native boolean isScoutCreature();
 
 	@local
 	@dirty
-    public abstract native String getWeaponCategory(WeaponObject weapon) {
-		return weaponCategory;
-	}
+    public abstract native string getWeaponCategory(WeaponObject weapon);
 	
 	@local
 	@dirty
-    public abstract native String getCommandCategory(String cmd) {
-		return commandCategory;
-	}
+    public abstract native string getCommandCategory(string cmd);
 
 	@local
 	@dirty
