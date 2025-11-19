@@ -1626,7 +1626,7 @@ String AiAgentImplementation::getCommandCategory(const String& lower) {
 
 bool AiAgentImplementation::commandFitsWeaponType(const String& lower, WeaponObject* weapon) {
 	String weapCat   = getWeaponCategory(weapon);
-	String cmdCat    = getCommandCategory(lower);
+	String cmdCat    = getCommandCategory(&lower);
 
 	// If command is "any", don't restrict it
 	if (cmdCat == "any")
