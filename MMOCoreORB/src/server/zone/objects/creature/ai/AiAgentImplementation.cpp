@@ -1664,14 +1664,14 @@ bool AiAgentImplementation::isFitsWeaponType(String& cmd, WeaponObject* weapon) 
     if (cmdCat == "any")
         return true;
 
-    // Force powers can be used with anything (for now)
-    if (cmdCat == "force")
-        return true;
-
     // Sabers: saber weapon preferred, but also allow generic melee if you want
     if (cmdCat == "saber") {
         return (weapCat == "saber");
     }
+
+    // Force powers can be used with anything (for now)
+    if (cmdCat == "force")
+        return true;
 
     // Polearm commands should not be used with 1H sword or pistol
     if (cmdCat == "polearm") {
