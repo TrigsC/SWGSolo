@@ -2441,6 +2441,36 @@ bool AiAgentImplementation::selectDefaultAttack() {
     nextActionCRC  = cmd.hashCode();
     nextActionArgs = "";
 
+	ManagedReference<SceneObject*> target = getFollowObject().get();
+    
+    // Only stuff the queue if we have a valid target
+    if (target != nullptr) {
+        ZoneServer* zoneServer = getZoneServer();
+        if (zoneServer != nullptr) {
+            ObjectController* objectController = zoneServer->getObjectController();
+            
+            if (objectController != nullptr) {
+                // Check the current queue size
+                int currentQSize = objectController->getQueueSize(this);
+                
+                // If the queue is empty (or very low), force a "Double Tap"
+                if (currentQSize < 2) {
+                     #ifdef DEBUG_AI_ATTACK
+                     info(true) << "AI_ATTACK: Queue is low (" << currentQSize 
+                                << "), performing QUEUE STUFF for " << cmd;
+                     #endif
+
+                     // Manually enqueue the first one immediately
+                     enqueueCommand(nextActionCRC, 0, target->getObjectID(), "", QueueCommand::NORMAL);
+                     
+                     // Note: We leave nextActionCRC set. The Behavior Tree (Leaf) will 
+                     // pick this up and enqueue it AGAIN when this function returns true.
+                     // End Result: Queue Size = 2.
+                }
+            }
+        }
+    }
+
 #ifdef DEBUG_AI_ATTACK
     info(true) << "AI_ATTACK: selectDefaultAttack final cmd=" << cmd
                << " crc=" << nextActionCRC << " for "
