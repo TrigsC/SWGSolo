@@ -4844,11 +4844,21 @@ int AiAgentImplementation::inflictDamage(TangibleObject* attacker, int damageTyp
 
 	activateRecovery();
 
-	if (damage > 0) {
-		// This damage is DOT or other types of non direct combat damage, it should not count towards loot and thus not be added to the threat map damage.
-		// Adding aggro should still be done.
-		getThreatMap()->addAggro(attacker, 1);
-	}
+	if (attacker != nullptr && attacker != this && attacker->isTangibleObject() && attacker->isAttackableBy(asAiAgent())) {
+        addDefender(attacker);
+    }
+
+    if (damage > 0) {
+        // This damage is DOT or other types of non direct combat damage, it should not count towards loot and thus not be added to the threat map damage.
+        // Adding aggro should still be done.
+        getThreatMap()->addAggro(attacker, 1);
+    }
+
+	//if (damage > 0) {
+	//	// This damage is DOT or other types of non direct combat damage, it should not count towards loot and thus not be added to the threat map damage.
+	//	// Adding aggro should still be done.
+	//	getThreatMap()->addAggro(attacker, 1);
+	//}
 
 	notifyObservers(ObserverEventType::DAMAGERECEIVED, attacker);
 	return CreatureObjectImplementation::inflictDamage(attacker, damageType, damage, destroy, notifyClient, isCombatAction);
@@ -4859,9 +4869,17 @@ int AiAgentImplementation::inflictDamage(TangibleObject* attacker, int damageTyp
 
 	activateRecovery();
 
-	if (damage > 0) {
-		getThreatMap()->addDamage(attacker, damage, xp);
-	}
+	if (attacker != nullptr && attacker != this && attacker->isTangibleObject() && attacker->isAttackableBy(asAiAgent())) {
+        addDefender(attacker);
+    }
+
+    if (damage > 0) {
+        getThreatMap()->addDamage(attacker, damage, xp);
+    }
+
+	//if (damage > 0) {
+	//	getThreatMap()->addDamage(attacker, damage, xp);
+	//}
 
 	notifyObservers(ObserverEventType::DAMAGERECEIVED, attacker);
 
