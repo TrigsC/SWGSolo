@@ -2445,29 +2445,20 @@ bool AiAgentImplementation::selectDefaultAttack() {
     
     // Only stuff the queue if we have a valid target
     if (target != nullptr) {
-        ZoneServer* zoneServer = getZoneServer();
-        if (zoneServer != nullptr) {
-            ObjectController* objectController = zoneServer->getObjectController();
-            
-            if (objectController != nullptr) {
-                // Check the current queue size
-                int currentQSize = objectController->getQueueSize(this);
-                
-                // If the queue is empty (or very low), force a "Double Tap"
-                if (currentQSize < 2) {
-                     #ifdef DEBUG_AI_ATTACK
-                     info(true) << "AI_ATTACK: Queue is low (" << currentQSize 
-                                << "), performing QUEUE STUFF for " << cmd;
-                     #endif
+        // FIX: Call the IDL helper method directly. 
+        // AiAgent inherits from CreatureObject, so we have direct access.
+        int currentQSize = getCommandQueueSize();
+        
+        // If the queue is empty (or very low), force a "Double Tap"
+        if (currentQSize < 2) {
+             #ifdef DEBUG_AI_ATTACK
+             info(true) << "AI_ATTACK: Queue is low (" << currentQSize 
+                        << "), performing QUEUE STUFF for " << cmd;
+             #endif
 
-                     // Manually enqueue the first one immediately
-                     enqueueCommand(nextActionCRC, 0, target->getObjectID(), "", QueueCommand::NORMAL);
-                     
-                     // Note: We leave nextActionCRC set. The Behavior Tree (Leaf) will 
-                     // pick this up and enqueue it AGAIN when this function returns true.
-                     // End Result: Queue Size = 2.
-                }
-            }
+             // Manually enqueue the first one immediately.
+             // The Behavior Tree will then enqueue 'nextActionCRC' again when we return true.
+             enqueueCommand(nextActionCRC, 0, target->getObjectID(), "", QueueCommand::NORMAL);
         }
     }
 
