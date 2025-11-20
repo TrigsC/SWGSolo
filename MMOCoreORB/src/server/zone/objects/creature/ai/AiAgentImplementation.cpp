@@ -4844,7 +4844,7 @@ int AiAgentImplementation::inflictDamage(TangibleObject* attacker, int damageTyp
 
 	activateRecovery();
 
-	if (attacker != nullptr && attacker != this && attacker->isTangibleObject() && attacker->isAttackableBy(asAiAgent())) {
+	if (attacker != nullptr && attacker->isTangibleObject() && attacker->isAttackableBy(asAiAgent())) {
         addDefender(attacker);
     }
 
@@ -4869,7 +4869,7 @@ int AiAgentImplementation::inflictDamage(TangibleObject* attacker, int damageTyp
 
 	activateRecovery();
 
-	if (attacker != nullptr && attacker != this && attacker->isTangibleObject() && attacker->isAttackableBy(asAiAgent())) {
+	if (attacker != nullptr && attacker->isTangibleObject() && attacker->isAttackableBy(asAiAgent())) {
         addDefender(attacker);
     }
 
