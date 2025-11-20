@@ -590,7 +590,7 @@ template<> bool CheckHealChance::check(AiAgent* agent) const {
 		return false;
 	}
 
-	if (System::random(100) < 98) {
+	if (System::random(100) < 68) {
 		return false;
 	}
 
