@@ -89,9 +89,9 @@
 #include "server/zone/objects/intangible/tasks/PetControlDeviceStoreTask.h"
 
 // #define DEBUG
-#define DEBUG_AI_WEAPONS
+//#define DEBUG_AI_WEAPONS
 #define DEBUG_AI_HEAL
-#define DEBUG_AI_ATTACK
+//#define DEBUG_AI_ATTACK
 
 // #define DEBUG_PATHING
 // #define SHOW_PATH
@@ -1545,9 +1545,6 @@ void AiAgentImplementation::setLevel(int lvl, bool randomHam) {
 
 void AiAgentImplementation::notifyPositionUpdate(TreeEntry* entry) {
 	CreatureObjectImplementation::notifyPositionUpdate(entry);
-
-	//SceneObject* object = static_cast<SceneObject*>(entry);
-	//CreatureObject* creo = object->asCreatureObject();
 }
 
 void AiAgentImplementation::doRecovery(int latency) {
@@ -1578,9 +1575,6 @@ void AiAgentImplementation::doRecovery(int latency) {
 /*
 	Attack Handling
 */
-
-// 1. getWeaponCategory
-// FIX: Added 'const' to the end of the function.
 String AiAgentImplementation::getWeaponCategory(WeaponObject* weapon) const {
     if (weapon == nullptr)
         return "unarmed";
@@ -1611,9 +1605,6 @@ String AiAgentImplementation::getWeaponCategory(WeaponObject* weapon) const {
     return "melee";
 }
 
-// 2. getCommandCategory
-// FIX 1: Removed 'const' from the argument (String& lower). The IDL 'string' generates 'String&'.
-// FIX 2: Added 'const' to the end of the function.
 String AiAgentImplementation::getCommandCategory(String& lower) const {
     // Force powers are allowed with basically anything
     if (lower.contains("force") ||
@@ -1765,7 +1756,6 @@ bool AiAgentImplementation::selectSpecialAttack() {
 	}
 
 	// --- Situational context snapshot ---
-
 	ManagedReference<SceneObject*> followCopy = getFollowObject().get();
 	CreatureObject* targetCreo = nullptr;
 
@@ -2223,13 +2213,7 @@ bool AiAgentImplementation::selectDefaultAttack() {
                    << "(empty or defaultattack) for "
                    << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
-
-        // *** IMPORTANT FIX: clear cmd so heuristics can run ***
         cmd = "";
-
-        // =================================================================
-        // *** FIX START: DYNAMIC MAP SWITCHING (Smart Pointer Corrected) ***
-        // =================================================================
         
         WeaponObject* weapon = getWeapon(); 
         String weapCat = getWeaponCategory(weapon);
@@ -2239,7 +2223,6 @@ bool AiAgentImplementation::selectDefaultAttack() {
         // 2. Select the correct map based on the weapon category
         if (weapCat == "melee" || weapCat == "saber" || weapCat == "polearm") {
             // Melee weapons use Secondary map
-            // FIX: Use '->' for size and '.get()' for assignment
             if (secondaryAttackMap != nullptr && secondaryAttackMap->size() > 0) {
                 map = secondaryAttackMap.get();
             } else {
@@ -2264,9 +2247,6 @@ bool AiAgentImplementation::selectDefaultAttack() {
             else if (secondaryAttackMap != nullptr && secondaryAttackMap->size() > 0) 
                 map = secondaryAttackMap.get();
         }
-        // =================================================================
-        // *** FIX END ***
-        // =================================================================
 
         if (map != nullptr && !map->isEmpty()) {
 #ifdef DEBUG_AI_ATTACK
