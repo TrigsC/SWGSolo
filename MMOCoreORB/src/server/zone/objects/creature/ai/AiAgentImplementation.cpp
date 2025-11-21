@@ -2828,65 +2828,68 @@ bool AiAgentImplementation::stalkProspect(SceneObject* prospect) {
 }
 
 void AiAgentImplementation::healCreatureTarget(CreatureObject* healTarget) {
-	if (healTarget == nullptr || healTarget->isDead()) {
-		return;
-	}
+    if (healTarget == nullptr || healTarget->isDead()) {
+        return;
+    }
 
 #ifdef DEBUG_AI_HEAL
-	ZoneServer* zoneServer = getZoneServer();
+    ZoneServer* zoneServer = getZoneServer();
 
-	ChatManager* chatManager = nullptr;
+    ChatManager* chatManager = nullptr;
 
-	if (zoneServer != nullptr)
-		chatManager = zoneServer->getChatManager();
+    if (zoneServer != nullptr)
+        chatManager = zoneServer->getChatManager();
 #endif
 
-	uint32 socialGroup = getSocialGroup().toLowerCase().hashCode();
+    uint32 socialGroup = getSocialGroup().toLowerCase().hashCode();
 
-	// Types are: force & normal
-	uint32 healerType = getHealerType().toLowerCase().hashCode();
-	uint32 typeForce = STRING_HASHCODE("force");
+    // Types are: force & normal
+    uint32 healerType = getHealerType().toLowerCase().hashCode();
+    uint32 typeForce = STRING_HASHCODE("force");
 
-	if (healerType == typeForce || socialGroup == STRING_HASHCODE("nightsister") || socialGroup == STRING_HASHCODE("mtn_clan") || socialGroup == STRING_HASHCODE("force") || socialGroup == STRING_HASHCODE("spider_nightsister")) {
-		if (healTarget->getObjectID() == getObjectID()) {
-			healTarget->playEffect("clienteffect/pl_force_heal_self.cef");
+    // 1. Handle Animations and Visuals
+    if (healerType == typeForce || socialGroup == STRING_HASHCODE("nightsister") || socialGroup == STRING_HASHCODE("mtn_clan") || socialGroup == STRING_HASHCODE("force") || socialGroup == STRING_HASHCODE("spider_nightsister")) {
+        if (healTarget->getObjectID() == getObjectID()) {
+            healTarget->playEffect("clienteffect/pl_force_heal_self.cef");
 
 #ifdef DEBUG_AI_HEAL
-			if (chatManager != nullptr) {
-				chatManager->broadcastChatMessage(asAiAgent(), "Force Healing myself!", 0, 0, asAiAgent()->getMoodID());
-			}
+            if (chatManager != nullptr) {
+                chatManager->broadcastChatMessage(asAiAgent(), "Force Healing myself!", 0, 0, asAiAgent()->getMoodID());
+            }
 #endif
 
-		} else {
-			doCombatAnimation(healTarget, STRING_HASHCODE("force_healing_1"), 0, 0xFF);
+        } else {
+            doCombatAnimation(healTarget, STRING_HASHCODE("force_healing_1"), 0, 0xFF);
 
 #ifdef DEBUG_AI_HEAL
-			if (chatManager != nullptr)
-				chatManager->broadcastChatMessage(asAiAgent(), "Force Healing target!", 0, 0, asAiAgent()->getMoodID());
+            if (chatManager != nullptr)
+                chatManager->broadcastChatMessage(asAiAgent(), "Force Healing target!", 0, 0, asAiAgent()->getMoodID());
 #endif
-		}
-	} else {
-		if (healTarget->getObjectID() == getObjectID()) {
-			doAnimation("heal_self");
+        }
+    } else {
+        if (healTarget->getObjectID() == getObjectID()) {
+            doAnimation("heal_self");
 
 #ifdef DEBUG_AI_HEAL
-			if (chatManager != nullptr)
-				chatManager->broadcastChatMessage(asAiAgent(), "Healing myself!", 0, 0, asAiAgent()->getMoodID());
+            if (chatManager != nullptr)
+                chatManager->broadcastChatMessage(asAiAgent(), "Healing myself!", 0, 0, asAiAgent()->getMoodID());
 #endif
 
-		} else {
-			doAnimation("heal_other");
+        } else {
+            doAnimation("heal_other");
 
 #ifdef DEBUG_AI_HEAL
-			if (chatManager != nullptr)
-				chatManager->broadcastChatMessage(asAiAgent(), "Healing target!", 0, 0, asAiAgent()->getMoodID());
+            if (chatManager != nullptr)
+                chatManager->broadcastChatMessage(asAiAgent(), "Healing target!", 0, 0, asAiAgent()->getMoodID());
 #endif
-		}
+        }
 
-		healTarget->playEffect("clienteffect/healing_healdamage.cef");
-	}
-	
-    int forceCost = 200; // Set your balance cost here
+        healTarget->playEffect("clienteffect/healing_healdamage.cef");
+    }
+    
+    // 2. Handle Resource Costs
+    int forceCost = 200; 
+
     if (healerType == STRING_HASHCODE("force")) {
         // Deduct the Force
         int newForce = getCurrentForce() - forceCost;
@@ -2894,36 +2897,38 @@ void AiAgentImplementation::healCreatureTarget(CreatureObject* healTarget) {
     } else {
         // Deduct Mind for medics
         int mindCost = 100;
-        inflictDamage(this, CreatureAttribute::MIND, mindCost, false);
+        // FIX: Use asTangibleObject() instead of 'this'
+        inflictDamage(asTangibleObject(), CreatureAttribute::MIND, mindCost, false);
     }
 
-	int healthMax = healTarget->getMaxHAM(CreatureAttribute::HEALTH) - healTarget->getWounds(CreatureAttribute::HEALTH);
-	int actionMax = healTarget->getMaxHAM(CreatureAttribute::ACTION) - healTarget->getWounds(CreatureAttribute::ACTION);
-	int mindMax = healTarget->getMaxHAM(CreatureAttribute::MIND) - healTarget->getWounds(CreatureAttribute::MIND);
+    // 3. Apply Healing Logic
+    int healthMax = healTarget->getMaxHAM(CreatureAttribute::HEALTH) - healTarget->getWounds(CreatureAttribute::HEALTH);
+    int actionMax = healTarget->getMaxHAM(CreatureAttribute::ACTION) - healTarget->getWounds(CreatureAttribute::ACTION);
+    int mindMax = healTarget->getMaxHAM(CreatureAttribute::MIND) - healTarget->getWounds(CreatureAttribute::MIND);
 
-	int healthDam = healthMax - healTarget->getHAM(CreatureAttribute::HEALTH);
-	int actionDam = actionMax - healTarget->getHAM(CreatureAttribute::ACTION);
-	int mindDam = mindMax - healTarget->getHAM(CreatureAttribute::MIND);
+    int healthDam = healthMax - healTarget->getHAM(CreatureAttribute::HEALTH);
+    int actionDam = actionMax - healTarget->getHAM(CreatureAttribute::ACTION);
+    int mindDam = mindMax - healTarget->getHAM(CreatureAttribute::MIND);
 
-	int healAmount = getLevel() * 20;
+    int healAmount = getLevel() * 20;
 
-	if (healAmount > healthDam) {
-		healTarget->healDamage(asAiAgent(), CreatureAttribute::HEALTH, healthMax, true, false);
-	} else {
-		healTarget->healDamage(asAiAgent(), CreatureAttribute::HEALTH, healAmount, true, false);
-	}
+    if (healAmount > healthDam) {
+        healTarget->healDamage(asAiAgent(), CreatureAttribute::HEALTH, healthMax, true, false);
+    } else {
+        healTarget->healDamage(asAiAgent(), CreatureAttribute::HEALTH, healAmount, true, false);
+    }
 
-	if (healAmount > actionDam) {
-		healTarget->healDamage(asAiAgent(), CreatureAttribute::ACTION, actionMax, true, false);
-	} else {
-		healTarget->healDamage(asAiAgent(), CreatureAttribute::ACTION, healAmount, true, false);
-	}
+    if (healAmount > actionDam) {
+        healTarget->healDamage(asAiAgent(), CreatureAttribute::ACTION, actionMax, true, false);
+    } else {
+        healTarget->healDamage(asAiAgent(), CreatureAttribute::ACTION, healAmount, true, false);
+    }
 
-	if (healAmount > mindDam) {
-		healTarget->healDamage(asAiAgent(), CreatureAttribute::MIND, mindMax, true, false);
-	} else {
-		healTarget->healDamage(asAiAgent(), CreatureAttribute::MIND, healAmount, true, false);
-	}
+    if (healAmount > mindDam) {
+        healTarget->healDamage(asAiAgent(), CreatureAttribute::MIND, mindMax, true, false);
+    } else {
+        healTarget->healDamage(asAiAgent(), CreatureAttribute::MIND, healAmount, true, false);
+    }
 }
 
 void AiAgentImplementation::healTangibleTarget(TangibleObject* healTarget) {
