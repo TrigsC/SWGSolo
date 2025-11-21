@@ -1575,6 +1575,7 @@ void AiAgentImplementation::doRecovery(int latency) {
 /*
 	Attack Handling
 */
+
 String AiAgentImplementation::getWeaponCategory(WeaponObject* weapon) const {
     if (weapon == nullptr)
         return "unarmed";
@@ -1589,13 +1590,14 @@ String AiAgentImplementation::getWeaponCategory(WeaponObject* weapon) const {
     if (wt.contains("onehandmelee") || wt.contains("twohandmelee") || wt.contains("unarmed"))
         return "melee";
 
-    // Polearm melee (pike, staff, saber polearm, etc.)
-    if (wt.contains("polearm"))
-        return "polearm";
-
-    // Lightsabers – treat as melee+saber
+    // FIX: Move Lightsaber check ABOVE Polearm check
+    // "saberpolearm" contains both strings, so order matters!
     if (wt.contains("lightsaber"))
         return "saber";
+
+    // Polearm melee (pike, staff, etc.)
+    if (wt.contains("polearm"))
+        return "polearm";
 
     // Thrown weapon can be treated as ranged
     if (wt.contains("thrownweapon"))
@@ -1669,10 +1671,6 @@ bool AiAgentImplementation::isFitsWeaponType(String& cmd, WeaponObject* weapon) 
         return (weapCat == "saber");
     }
 
-    // Force powers can be used with anything (for now)
-    if (cmdCat == "force")
-        return true;
-
     // Polearm commands should not be used with 1H sword or pistol
     if (cmdCat == "polearm") {
         return (weapCat == "polearm" || weapCat == "saber"); 
@@ -1687,6 +1685,10 @@ bool AiAgentImplementation::isFitsWeaponType(String& cmd, WeaponObject* weapon) 
     if (cmdCat == "ranged") {
         return (weapCat == "ranged");
     }
+
+	// Force powers can be used with anything (for now)
+    if (cmdCat == "force")
+        return true;
 
     // Fallback: if we don't understand, allow it
     return true;
@@ -2173,244 +2175,125 @@ bool AiAgentImplementation::selectDefaultAttack() {
     // 1) Template default (may be "defaultattack" as engine fallback)
     if (npcTemplate != nullptr) {
         cmd = npcTemplate->getDefaultAttack();
-
-#ifdef DEBUG_AI_ATTACK
-        info(true) << "AI_ATTACK: selectDefaultAttack template default raw cmd="
-                   << cmd << " for " << getDisplayedName()
-                   << " (" << getObjectID() << ")";
-#endif
     }
 
     bool treatAsUnset = cmd.isEmpty()
         || cmd.hashCode() == STRING_HASHCODE("defaultattack");
 
     if (treatAsUnset) {
-#ifdef DEBUG_AI_ATTACK
-        info(true) << "AI_ATTACK: selectDefaultAttack template default considered UNSET "
-                   << "(empty or defaultattack) for "
-                   << getDisplayedName() << " (" << getObjectID() << ")";
-#endif
         cmd = "";
         
         WeaponObject* weapon = getWeapon(); 
-        String weapCat = getWeaponCategory(weapon);
         
-        const CreatureAttackMap* map = nullptr;
+        // We create a list of maps to iterate over.
+        // We don't care if it's Primary or Secondary, we check them ALL.
+        Vector<const CreatureAttackMap*> mapsToCheck;
+        
+        if (primaryAttackMap != nullptr) mapsToCheck.add(primaryAttackMap.get());
+        if (secondaryAttackMap != nullptr) mapsToCheck.add(secondaryAttackMap.get());
+        if (defaultAttackMap != nullptr) mapsToCheck.add(defaultAttackMap.get());
 
-        // 2. Select the correct map based on the weapon category
-        if (weapCat == "melee" || weapCat == "saber" || weapCat == "polearm") {
-            // Melee weapons use Secondary map
-            if (secondaryAttackMap != nullptr && secondaryAttackMap->size() > 0) {
-                map = secondaryAttackMap.get();
-            } else {
-                // Fallback to default (unarmed/creature attacks)
-                map = defaultAttackMap.get();
-            }
-        } 
-        else if (weapCat == "ranged") {
-            // Ranged weapons use Primary map
-            if (primaryAttackMap != nullptr && primaryAttackMap->size() > 0) {
-                map = primaryAttackMap.get();
-            }
-        }
+        // Containers for our candidates
+        Vector<String> priorityCommands; // High-tier "Identity" moves
+        String bestHeuristicCmd = "";
+        int bestHeuristicScore = -9999;
 
-        // 3. Safety Fallbacks
-        // If specific map selection failed, try others in order
-        if (map == nullptr || map->isEmpty()) {
-            if (defaultAttackMap != nullptr && defaultAttackMap->size() > 0) 
-                map = defaultAttackMap.get();
-            else if (primaryAttackMap != nullptr && primaryAttackMap->size() > 0) 
-                map = primaryAttackMap.get();
-            else if (secondaryAttackMap != nullptr && secondaryAttackMap->size() > 0) 
-                map = secondaryAttackMap.get();
-        }
+        // =================================================================
+        // DYNAMIC ITERATION: Check ALL maps, filter by WEAPON COMPATIBILITY
+        // =================================================================
+        for (int m = 0; m < mapsToCheck.size(); ++m) {
+            const CreatureAttackMap* currentMap = mapsToCheck.get(m);
+            if (currentMap == nullptr || currentMap->isEmpty()) continue;
 
-        if (map != nullptr && !map->isEmpty()) {
-#ifdef DEBUG_AI_ATTACK
-            info(true) << "AI_ATTACK: selectDefaultAttack using map size="
-                       << map->size() << " (Cat: " << weapCat << ") for "
-                       << getDisplayedName() << " (" << getObjectID() << ")";
-#endif
-
-            // --- Preferred "top" player-like attacks ---
-            Vector<int> prioIndices;
-
-            for (int i = 0; i < map->size(); ++i) {
-                String key   = map->getCommand(i);
+            for (int i = 0; i < currentMap->size(); ++i) {
+                String key   = currentMap->getCommand(i);
                 String lower = key.toLowerCase();
 
-                // Pass the 'weapon' we defined above
+                // THE ONLY FILTER THAT MATTERS: Does it fit the weapon?
                 if (!isFitsWeaponType(lower, weapon)) {
                     continue;
                 }
 
-                // Lightsaber master
-                if (lower.contains("saberpolearmdervish2") ||
-                    lower.contains("saber1hflurry2") ||
-                    lower.contains("saber2hphantom")) {
-                    prioIndices.add(i);
-                    continue;
+                // --- 1. Check for "Top Tier" Priority Attacks ---
+                bool isPriority = false;
+
+                // Lightsaber / Polearm / Melee Master Hits
+                if (lower.contains("dervish") || 
+                    lower.contains("flurry") || 
+                    lower.contains("phantom") ||
+                    lower.contains("hit3") ||      // Covers saber, polearm, melee, unarmed hit3
+                    lower.contains("bodyhit3") ||
+                    lower.contains("headhit3") ||
+                    lower.contains("saberslash2")) {
+                    isPriority = true;
+                }
+                // Force Master (Mix in force powers if they are valid)
+                else if (lower.contains("forcelightningcone2")) {
+                    isPriority = true;
+                }
+                // Ranged Master Hits
+                else if (lower.contains("strafeshot2") ||
+                         lower.contains("scattershot2") ||
+                         lower.contains("fanshot")) {
+                    isPriority = true;
                 }
 
-                // Master force
-                //if (lower.contains("forcelightningcone2")) {
-                //    prioIndices.add(i);
-                //    continue;
-                //}
-
-                // Fencer
-                if (lower.contains("melee1hhit3") ||
-                    lower.contains("melee1hscatterhit2")) {
-                    prioIndices.add(i);
-                    continue;
+                if (isPriority) {
+                    priorityCommands.add(key);
+                    continue; // If added to priority, we don't need to score it heuristically
                 }
 
-                // Tera Kasi
-                if (lower.contains("unarmedhit3")) {
-                    prioIndices.add(i);
-                    continue;
+                // --- 2. Heuristic Scoring for "Filler" Attacks ---
+                int score = 0;
+
+                // Penalize control moves for default attacks (save them for specials)
+                if (lower.contains("intimidate") || lower.contains("knockdown") ||
+                    lower.contains("blind") || lower.contains("dizzy") ||
+                    lower.contains("stun") || lower.contains("sweep") ||
+                    lower.contains("suppression") || lower.contains("warning") ||
+                    lower.contains("confusion") || lower.contains("meleedefense")) {
+                    score -= 10;
                 }
 
-                // Swordsman
-                if (lower.contains("melee2hhit3")) {
-                    prioIndices.add(i);
-                    continue;
-                }
+                // Bonus for damage tiers
+                if (lower.contains("hit2") || lower.contains("shot2")) score += 5;
+                else if (lower.contains("hit1") || lower.contains("shot1")) score += 2;
+                
+                // Bonus for Force Nukes (if not top tier)
+                if (lower.contains("mindblast") || lower.contains("forcelightning")) score += 6;
 
-                // Pikeman
-                if (lower.contains("polearmhit3")) {
-                    prioIndices.add(i);
-                    continue;
-                }
-
-                // Pistols
-                if (lower.contains("fanshot")) {
-                    prioIndices.add(i);
-                    continue;
-                }
-
-                // Rifleman
-                if (lower.contains("strafeshot2")) {
-                    prioIndices.add(i);
-                    continue;
-                }
-
-                // Carbines
-                if (lower.contains("scattershot2")) {
-                    prioIndices.add(i);
-                    continue;
+                // Select best heuristic
+                if (score > bestHeuristicScore) {
+                    bestHeuristicScore = score;
+                    bestHeuristicCmd = key;
                 }
             }
-
-            if (!prioIndices.isEmpty()) {
-                int idxInList = System::random(prioIndices.size() - 1);
-                int bestIdx   = prioIndices.get(idxInList);
-                cmd = map->getCommand(bestIdx);
-
-#ifdef DEBUG_AI_ATTACK
-                info(true) << "AI_ATTACK: selectDefaultAttack(prio_top_attack) using cmd="
-                           << cmd << " from index=" << bestIdx
-                           << " for " << getDisplayedName()
-                           << " (" << getObjectID() << ")";
-#endif
-            }
-
-            // 2b) Heuristic if no top attack chosen
-            if (cmd.isEmpty()) {
-                int bestIdx   = -1;
-                int bestScore = -9999;
-
-                for (int i = 0; i < map->size(); ++i) {
-                    String key   = map->getCommand(i);
-                    String lower = key.toLowerCase();
-
-                    if (!isFitsWeaponType(lower, weapon))
-                        continue;
-
-                    int score = 0;
-
-                    // Avoid using pure control/utility as "white damage"
-                    if (lower.contains("intimidate") ||
-                        lower.contains("knockdown") ||
-                        lower.contains("blind") ||
-                        lower.contains("dizzy") ||
-                        lower.contains("stun") ||
-                        lower.contains("sweep") ||
-                        lower.contains("area") ||
-                        lower.contains("cone") ||
-                        lower.contains("spray") ||
-                        lower.contains("suppression") ||
-                        lower.contains("warning") ||
-                        lower.contains("confusion") ||
-						lower.contains("lunge") ||
-                        lower.contains("meleedefense")) {
-                        score -= 10;
-                    }
-
-                    // Force nukes
-                    if (lower.contains("forcelightningsingle2")) score += 9;
-                    else if (lower.contains("forcelightningsingle1")) score += 8;
-                    else if (lower.contains("mindblast2")) score += 7;
-                    else if (lower.contains("mindblast1")) score += 6;
-
-                    // Saber main hits
-                    if (lower.contains("saber2hbodyhit3") || lower.contains("saber1hhit3")) score += 9;
-                    else if (lower.contains("saber2hbodyhit2") || lower.contains("saber1hheadhit2")) score += 7;
-                    else if (lower.contains("saberslash2") || lower.contains("saberslash1")) score += 6;
-
-                    // Melee body/head/hit tiers
-                    if (lower.contains("bodyhit3") || lower.contains("headhit3")) score += 8;
-                    else if (lower.contains("bodyhit2") || lower.contains("headhit2")) score += 6;
-                    else if (lower.contains("hit3")) score += 5;
-                    else if (lower.contains("hit2")) score += 4;
-                    else if (lower.contains("hit1")) score += 2;
-
-                    // Ranged
-                    if (lower.contains("bodyshot3") || lower.contains("headshot3")) score += 8;
-                    else if (lower.contains("bodyshot2") || lower.contains("headshot2")) score += 6;
-
-                    if (lower.contains("healthshot2") || lower.contains("actionshot2")) score += 6;
-                    if (lower.contains("fullautosingle2") || lower.contains("flurryshot2") ||
-                        lower.contains("wildshot2") || lower.contains("strafeshot2")) score += 5;
-                    if (lower.contains("fullautosingle1") || lower.contains("flurryshot1") ||
-                        lower.contains("strafeshot1")) score += 3;
-
-                    // Solid melee specials
-                    if (lower.contains("spinattack2") || lower.contains("flurry") ||
-                        lower.contains("lunge2") || lower.contains("dervish2")) {
-                        score += 4;
-                    } else if (lower.contains("spinattack1") || lower.contains("lunge1") ||
-                               lower.contains("dervish")) {
-                        score += 2;
-                    }
-
-                    if (score > bestScore) {
-                        bestScore = score;
-                        bestIdx   = i;
-                    }
-                }
-
-                // You can relax this threshold if you want *something* no matter what
-                if (bestIdx != -1 && bestScore > -5) {
-                    cmd = map->getCommand(bestIdx);
-                }
-            }
-        } else {
-#ifdef DEBUG_AI_ATTACK
-            info(true) << "AI_ATTACK: selectDefaultAttack - no usable attack map "
-                       << "(primary & default null/empty) for "
-                       << getDisplayedName() << " (" << getObjectID() << ")";
-#endif
         }
-    } else {
-#ifdef DEBUG_AI_ATTACK
-        info(true) << "AI_ATTACK: selectDefaultAttack using template default cmd="
-                   << cmd << " for " << getDisplayedName()
-                   << " (" << getObjectID() << ")";
-#endif
+
+        // =================================================================
+        // FINAL SELECTION
+        // =================================================================
+        
+        // 1. If we found High-Priority moves, pick one randomly
+        if (!priorityCommands.isEmpty()) {
+             int idx = System::random(priorityCommands.size() - 1);
+             cmd = priorityCommands.get(idx);
+             
+             #ifdef DEBUG_AI_ATTACK
+             info(true) << "AI_ATTACK: Selected PRIORITY cmd: " << cmd;
+             #endif
+        }
+        // 2. Otherwise, use the best scored "filler" move
+        else if (!bestHeuristicCmd.isEmpty() && bestHeuristicScore > -5) {
+             cmd = bestHeuristicCmd;
+             
+             #ifdef DEBUG_AI_ATTACK
+             info(true) << "AI_ATTACK: Selected HEURISTIC cmd: " << cmd << " (Score: " << bestHeuristicScore << ")";
+             #endif
+        }
     }
 
-    // 3) Final fallback if we somehow still have nothing
+    // 3) Final fallback
     if (cmd.isEmpty()) {
         cmd = "defaultattack";
     }
@@ -2418,31 +2301,21 @@ bool AiAgentImplementation::selectDefaultAttack() {
     nextActionCRC  = cmd.hashCode();
     nextActionArgs = "";
 
-	ManagedReference<SceneObject*> target = getFollowObject().get();
-    
-    // Only stuff the queue if we have a valid target
+    // --- QUEUE STUFFER FIX (Kept from previous step) ---
+    ManagedReference<SceneObject*> target = getFollowObject().get();
     if (target != nullptr) {
-        // FIX: Call the IDL helper method directly. 
-        // AiAgent inherits from CreatureObject, so we have direct access.
         int currentQSize = getCommandQueueSize();
-        
-        // If the queue is empty (or very low), force a "Double Tap"
         if (currentQSize < 2) {
              #ifdef DEBUG_AI_ATTACK
-             info(true) << "AI_ATTACK: Queue is low (" << currentQSize 
-                        << "), performing QUEUE STUFF for " << cmd;
+             info(true) << "AI_ATTACK: Queue low, stuffing: " << cmd;
              #endif
-
-             // Manually enqueue the first one immediately.
-             // The Behavior Tree will then enqueue 'nextActionCRC' again when we return true.
              enqueueCommand(nextActionCRC, 0, target->getObjectID(), "", QueueCommand::NORMAL);
         }
     }
 
 #ifdef DEBUG_AI_ATTACK
     info(true) << "AI_ATTACK: selectDefaultAttack final cmd=" << cmd
-               << " crc=" << nextActionCRC << " for "
-               << getDisplayedName() << " (" << getObjectID() << ")";
+               << " for " << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
 
     return true;
