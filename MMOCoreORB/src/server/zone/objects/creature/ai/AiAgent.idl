@@ -26,6 +26,7 @@ import server.zone.objects.creature.ai.CreatureTemplate;
 import server.zone.objects.creature.events.DespawnCreatureOnPlayerDissappear;
 include server.zone.objects.creature.ai.variables.CreatureAttackMap;
 import engine.util.Observable;
+include engine.core.Task;
 include system.thread.Mutex;
 include server.zone.managers.loot.lootgroup.LootGroupCollection;
 include server.zone.objects.creature.ai.variables.CreatureTemplateReference;
