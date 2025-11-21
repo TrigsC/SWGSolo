@@ -725,7 +725,7 @@ public:
         	    healDelay->updateToCurrentTime();
 
         	    // This allows ai to "spam" heal if they have the Force.
-        	    healDelay->addMiliTime(4 * 1000); 
+        	    healDelay->addMiliTime(9 * 1000); 
         	}
 
         	agent->eraseBlackboard("healTarget");

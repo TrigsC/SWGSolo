@@ -565,8 +565,7 @@ void AiAgentImplementation::doForceRegen() {
     }
 
     // 1. Default very low (Wait for it to build up)
-    int regenAmount = 50; // 50 Force every 2 seconds.
-                          // It takes ~8 seconds to regenerate ONE heal (200 force).
+    int regenAmount = 10; // 10 Force every 2 seconds.
                           // This makes spending the force expensive!
 
     // 2. Check for "jedi_force_power_regen" skill mod (if you add it to their LUA)
