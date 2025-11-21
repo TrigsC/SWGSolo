@@ -87,6 +87,7 @@
 #include "server/zone/objects/transaction/TransactionLog.h"
 #include "server/chat/ChatManager.h"
 #include "server/zone/objects/intangible/tasks/PetControlDeviceStoreTask.h"
+#include "server/zone/objects/creature/ai/events/AiForceRegenerationEvent.h"
 
 // #define DEBUG
 #define DEBUG_AI_WEAPONS
@@ -240,6 +241,7 @@ void AiAgentImplementation::initializeTransientMembers() {
 
 	setAITemplate();
 	setupAttackMaps();
+	activateForcePowerRegen();
 }
 
 void AiAgentImplementation::notifyLoadFromDatabase() {
@@ -533,6 +535,66 @@ void AiAgentImplementation::reloadTemplate() {
 	if (isMount()) {
 		setOptionBit(OptionBitmask::VEHICLE);
 	}
+}
+
+void AiAgentImplementation::activateForcePowerRegen() {
+    // 1. Basic check: Do we even use Force?
+    if (getMaxForce() <= 0) return;
+    
+    // 2. If the event doesn't exist, create it.
+    if (forceRegenerationEvent == nullptr) {
+        forceRegenerationEvent = new AiForceRegenerationEvent(asAiAgent());
+    }
+
+    // 3. If it's not currently running, schedule it.
+    if (!forceRegenerationEvent->isScheduled()) {
+        // Schedule it to run in 2 seconds (2000ms)
+        forceRegenerationEvent->schedule(2000); 
+    }
+}
+
+void AiAgentImplementation::doForceRegen() {
+    if (isDead() || currentForcePoints >= maxForcePoints) {
+        // If full or dead, stop the loop.
+        // But we might want to check again later if we spend force?
+        // For now, let's keep it running but do nothing if full.
+        if (!isDead()) {
+             forceRegenerationEvent->schedule(10000); // Check again in 10s if full
+        }
+        return;
+    }
+
+    // --- REGEN CALCULATION ---
+    // Mimicking player logic:
+    // Base regen is usually derived from the skill "jedi_force_power_regen"
+    // Since AI might not have that skill, we define a fallback.
+    
+    int regenAmount = (int)getSkillMod("jedi_force_power_regen");
+    
+    if (regenAmount <= 0) {
+        regenAmount = 100; // Default fallback for AI: 100 Force per tick
+    }
+    
+    // Multipliers (optional, if you want to give them "force_control")
+    // int controlMod = getSkillMod("force_control_light");
+    // regenAmount += (controlMod / 10);
+
+    int newForce = currentForcePoints + regenAmount;
+    
+    if (newForce > maxForcePoints) {
+        newForce = maxForcePoints;
+    }
+
+    setCurrentForce(newForce);
+
+    // --- LOGGING (Remove this later if it spams too much) ---
+    // StringBuffer msg;
+    // msg << "AI Force Regen: +" << regenAmount << " (" << newForce << "/" << maxForcePoints << ")";
+    // info(msg.toString(), true);
+
+    // --- RESCHEDULE ---
+    // Run again in 2 seconds
+    forceRegenerationEvent->schedule(2000);
 }
 
 void AiAgentImplementation::fillAttributeList(AttributeListMessage* alm, CreatureObject* player) {
