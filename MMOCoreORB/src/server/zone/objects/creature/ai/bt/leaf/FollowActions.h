@@ -915,14 +915,56 @@ public:
 		}
 
 		agent->setMovementState(AiAgent::MOVING_TO_HEAL);
+				// Inside GetHealTarget execute() method...
 
-		// This must set the Tangible Object as the target to heal
-		agent->writeBlackboard("healTarget", healTarget);
+		ManagedReference<TangibleObject*> bestTarget = nullptr;
+        int highestDamage = 0; 
 
-		// agent->info(true) << "ID: " << agent->getObjectID() << "    Set up a healTarget ---- " << healCreo->getDisplayedName();
+        // Loop through enemies' defender list (our allies)
+        for (int i = 0; i < defenderList->size(); ++i) {
+            ManagedReference<SceneObject*> defenderSceneO = defenderList->get(i);
+            
+            if (defenderSceneO == nullptr || !defenderSceneO->isCreatureObject()) continue;
 
-		return SUCCESS;
-	}
+            CreatureObject* candidate = defenderSceneO->asCreatureObject();
+
+            // Skip dead people
+            if (candidate->isDead()) continue;
+            
+            // Range check (Use the range variable parsed from Lua)
+            if (!agent->isInRange3d(candidate, range)) continue;
+            
+            // Faction/Aggro checks (Prevent healing enemies)
+            if (candidate->isAggressiveTo(agent) || agent->isAggressiveTo(candidate)) continue;
+
+            // Calculate Damage
+            int damage = candidate->getMaxHAM(CreatureAttribute::HEALTH) - candidate->getHAM(CreatureAttribute::HEALTH);
+
+            // Logic: Pick the person with the MOST damage
+            if (damage > highestDamage) {
+                highestDamage = damage;
+                bestTarget = candidate->asTangibleObject();
+            }
+        }
+
+        // SELF PRESERVATION OVERRIDE
+        // Check my own health. If I'm below 30%, I become the priority target.
+        if (agent->getHAM(CreatureAttribute::HEALTH) < (agent->getMaxHAM(CreatureAttribute::HEALTH) * 0.3)) {
+            bestTarget = agent->asTangibleObject();
+        }
+
+        // If nobody is hurt enough, don't heal.
+        if (bestTarget == nullptr || highestDamage < 100) { // Added a small threshold so they don't heal 1 dmg
+            return FAILURE;
+        }
+
+        // --- END OF NEW SMART LOGIC ---
+
+        agent->setMovementState(AiAgent::MOVING_TO_HEAL);
+        agent->writeBlackboard("healTarget", bestTarget);
+
+        return SUCCESS;
+    }
 
 	void parseArgs(const LuaObject& args) {
 		range = (float) (getArg<float>()(args, "range"));

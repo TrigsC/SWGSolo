@@ -241,6 +241,9 @@ class AiAgent extends CreatureObject {
 
 	protected transient int outOfSightCounter;
 
+	protected int currentForcePoints;
+    protected int maxForcePoints;
+
 	public AiAgent() {
 		movementState = OBLIVIOUS;
 
@@ -987,6 +990,25 @@ class AiAgent extends CreatureObject {
 	public boolean isFleeing() {
 		return getMovementState() == FLEEING;
 	}
+
+	// NEW AI HEALING METHODS
+    public void setMaxForce(int value) {
+        maxForcePoints = value;
+    }
+    
+    @dirty
+    public int getMaxForce() {
+        return maxForcePoints;
+    }
+
+    public void setCurrentForce(int value) {
+        currentForcePoints = value;
+    }
+
+    @dirty
+    public int getCurrentForce() {
+        return currentForcePoints;
+    }
 
 	public boolean isResting() {
 		return getMovementState() == RESTING;

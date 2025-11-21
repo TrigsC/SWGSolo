@@ -209,6 +209,12 @@ bool originatesFromDestroyMissionLair(AiAgent* agent) {
 void AiAgentImplementation::initializeTransientMembers() {
 	CreatureObjectImplementation::initializeTransientMembers();
 
+	// -------------------------------------------------------
+    // NEW: Initialize Force/Mana for the AI
+    // -------------------------------------------------------
+    currentForcePoints = 6850; 
+    maxForcePoints = 6850;
+
 	auto aiLogLevel = ConfigManager::instance()->getInt("Core3.AiAgent.LogLevel", LogLevel::WARNING);
 
 	if (aiLogLevel >= 0) {
@@ -2879,6 +2885,17 @@ void AiAgentImplementation::healCreatureTarget(CreatureObject* healTarget) {
 
 		healTarget->playEffect("clienteffect/healing_healdamage.cef");
 	}
+	
+    int forceCost = 200; // Set your balance cost here
+    if (healerType == STRING_HASHCODE("force")) {
+        // Deduct the Force
+        int newForce = getCurrentForce() - forceCost;
+        setCurrentForce(newForce < 0 ? 0 : newForce); 
+    } else {
+        // Deduct Mind for medics
+        int mindCost = 100;
+        inflictDamage(this, CreatureAttribute::MIND, mindCost, false);
+    }
 
 	int healthMax = healTarget->getMaxHAM(CreatureAttribute::HEALTH) - healTarget->getWounds(CreatureAttribute::HEALTH);
 	int actionMax = healTarget->getMaxHAM(CreatureAttribute::ACTION) - healTarget->getWounds(CreatureAttribute::ACTION);
