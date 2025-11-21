@@ -1014,11 +1014,9 @@ class AiAgent extends CreatureObject {
         return currentForcePoints;
     }
 
-	public void activateForcePowerRegen() {
-    }
+	public void activateForcePowerRegen();
 
-    public void doForceRegen() {
-    }
+    public void doForceRegen();
 
 	public boolean isResting() {
 		return getMovementState() == RESTING;
