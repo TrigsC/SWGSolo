@@ -572,7 +572,7 @@ void AiAgentImplementation::doForceRegen() {
     int regenAmount = (int)getSkillMod("jedi_force_power_regen");
     
     if (regenAmount <= 0) {
-        regenAmount = 100; // Default fallback for AI: 100 Force per tick
+        regenAmount = 63; // Default fallback for AI: 63 Force per tick
     }
     
     // Multipliers (optional, if you want to give them "force_control")
