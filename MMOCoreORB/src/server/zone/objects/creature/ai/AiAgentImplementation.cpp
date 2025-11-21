@@ -2890,10 +2890,21 @@ void AiAgentImplementation::healCreatureTarget(CreatureObject* healTarget) {
     // 2. Handle Resource Costs
     int forceCost = 200; 
 
-    if (healerType == STRING_HASHCODE("force")) {
+if (healerType == STRING_HASHCODE("force")) {
+        // --- LOGGING START ---
+        StringBuffer logMsg;
+        logMsg << "AI Force Heal Triggered. Current Force: " << getCurrentForce() 
+               << " / " << getMaxForce() 
+               << " - Cost: " << forceCost;
+        info(logMsg.toString(), true); // 'true' forces this to print to the console
+        // --- LOGGING END ---
+
         // Deduct the Force
         int newForce = getCurrentForce() - forceCost;
         setCurrentForce(newForce < 0 ? 0 : newForce); 
+
+        // Optional: Confirm new total
+        info("AI Force remaining: " + String::valueOf(newForce), true);
     } else {
         // Deduct Mind for medics
         int mindCost = 100;
