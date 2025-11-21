@@ -2088,85 +2088,94 @@ bool AiAgentImplementation::selectSpecialAttack() {
 }
 
 bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
-	const CreatureAttackMap* attackMap = getAttackMap();
+    // =================================================================
+    // FIX: We cannot use generic getAttackMap() here.
+    // We must select the SAME map that the scoring function used,
+    // otherwise "Index 5" might point to a completely different ability.
+    // =================================================================
+    
+    WeaponObject* weapon = getWeapon();
+    String weapCat = getWeaponCategory(weapon);
+    const CreatureAttackMap* attackMap = nullptr;
 
-	if (attackMap == nullptr) {
-#ifdef DEBUG_AI
-		if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
-			info("attackMap == nullptr", true);
-#endif // DEBUG_AI
+    // 1. Select the correct map based on the weapon category
+    // (This matches the logic in your main selectSpecialAttack function)
+    if (weapCat == "saber") {
+        // Jedi Logic: Saber attacks are in Primary
+        if (primaryAttackMap != nullptr && primaryAttackMap->size() > 0) {
+            attackMap = primaryAttackMap.get();
+        } else {
+            attackMap = secondaryAttackMap.get();
+        }
+    }
+    else if (weapCat == "melee" || weapCat == "polearm") {
+        // Melee Mobs (Nightsisters/Tuskens): Special moves usually in Secondary
+        if (secondaryAttackMap != nullptr && secondaryAttackMap->size() > 0) {
+            attackMap = secondaryAttackMap.get();
+        } else {
+            attackMap = defaultAttackMap.get();
+        }
+    } 
+    else if (weapCat == "ranged") {
+        // Ranged Mobs: Primary
+        if (primaryAttackMap != nullptr && primaryAttackMap->size() > 0) {
+            attackMap = primaryAttackMap.get();
+        }
+    }
+
+    // Fallback
+    if (attackMap == nullptr || attackMap->size() == 0) {
+        attackMap = getAttackMap(); 
+    }
+
+    if (attackMap == nullptr) {
+#ifdef DEBUG_AI_ATTACK
+        info(true) << "AI_ATTACK: selectSpecialAttack(" << attackNum
+                   << ") - attackMap == nullptr";
+#endif
+        return false;
+    }
+    // =================================================================
+
+    if (attackNum < 0) {
+        return selectSpecialAttack();
+    }
+
+    if (attackNum >= attackMap->size()) {
+#ifdef DEBUG_AI_ATTACK
+        info(true) << "AI_ATTACK: selectSpecialAttack(" << attackNum
+                   << ") - attackNum >= size (" << attackMap->size()
+                   << ")";
+#endif
+        return false;
+    }
+
+    String cmd = attackMap->getCommand(attackNum);
+
+    if (cmd.isEmpty()) {
+        return false;
+    }
 
 #ifdef DEBUG_AI_ATTACK
-		info(true) << "AI_ATTACK: selectSpecialAttack(" << attackNum
-		           << ") - attackMap == nullptr for "
-		           << getDisplayedName() << " (" << getObjectID() << ")";
-#endif
-		return false;
-	}
-
-	if (attackNum < 0) {
-#ifdef DEBUG_AI_ATTACK
-		info(true) << "AI_ATTACK: selectSpecialAttack(" << attackNum
-		           << ") - negative attackNum, delegating to selectSpecialAttack() for "
-		           << getDisplayedName() << " (" << getObjectID() << ")";
-#endif
-		return selectSpecialAttack();
-	}
-
-	if (attackNum >= attackMap->size()) {
-#ifdef DEBUG_AI
-		if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
-			info("attackNum >= attackMap->size()", true);
-#endif // DEBUG_AI
-
-#ifdef DEBUG_AI_ATTACK
-		info(true) << "AI_ATTACK: selectSpecialAttack(" << attackNum
-		           << ") - attackNum >= size (" << attackMap->size()
-		           << ") for " << getDisplayedName() << " (" << getObjectID() << ")";
-#endif
-		return false;
-	}
-
-	String cmd = attackMap->getCommand(attackNum);
-
-	if (cmd.isEmpty()) {
-#ifdef DEBUG_AI
-		if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
-			info("cmd.isEmpty()", true);
-#endif // DEBUG_AI
-
-#ifdef DEBUG_AI_ATTACK
-		info(true) << "AI_ATTACK: selectSpecialAttack(" << attackNum
-		           << ") - cmd is empty for "
-		           << getDisplayedName() << " (" << getObjectID() << ")";
-#endif
-		return false;
-	}
-
-#ifdef DEBUG_AI_ATTACK
-	debugLogSelectedAttack(this, "selectSpecialAttack(explicit)", attackMap, attackNum);
+    // Updated log to show which command is actually being executed
+    info(true) << "AI_ATTACK: selectSpecialAttack(explicit) EXECUTING index=" 
+               << attackNum << " key=" << cmd;
 #endif
 
-	nextActionCRC = cmd.hashCode();
-	nextActionArgs = attackMap->getArguments(attackNum);
+    nextActionCRC = cmd.hashCode();
+    nextActionArgs = attackMap->getArguments(attackNum);
 
-	ZoneServer* zoneServer = getZoneServer();
+    ZoneServer* zoneServer = getZoneServer();
+    if (zoneServer == nullptr) return false;
+    ObjectController* objectController = zoneServer->getObjectController();
+    if (objectController == nullptr) return false;
+    const QueueCommand* queueCommand = objectController->getQueueCommand(nextActionCRC);
+    ManagedReference<SceneObject*> followCopy = getFollowObject().get();
 
-	if (zoneServer == nullptr)
-		return false;
+    if (queueCommand == nullptr || followCopy == nullptr)
+        return false;
 
-	ObjectController* objectController = zoneServer->getObjectController();
-
-	if (objectController == nullptr)
-		return false;
-
-	const QueueCommand* queueCommand = objectController->getQueueCommand(nextActionCRC);
-	ManagedReference<SceneObject*> followCopy = getFollowObject().get();
-
-	if (queueCommand == nullptr || followCopy == nullptr)
-		return false;
-
-	return true;
+    return true;
 }
 
 bool AiAgentImplementation::selectDefaultAttack() {
