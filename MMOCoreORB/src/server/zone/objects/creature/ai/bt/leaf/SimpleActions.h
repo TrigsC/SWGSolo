@@ -719,14 +719,16 @@ public:
 		}
 
 		if (healExecuted == true) {
-			Time* healDelay = agent->getHealDelay();
+        	Time* healDelay = agent->getHealDelay();
 
-			if (healDelay != nullptr) {
-				healDelay->updateToCurrentTime();
-				healDelay->addMiliTime(20 * 1000);
-			}
+        	if (healDelay != nullptr) {
+        	    healDelay->updateToCurrentTime();
 
-			agent->eraseBlackboard("healTarget");
+        	    // This allows ai to "spam" heal if they have the Force.
+        	    healDelay->addMiliTime(4 * 1000); 
+        	}
+
+        	agent->eraseBlackboard("healTarget");
 		}
 
 		return SUCCESS;

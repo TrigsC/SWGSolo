@@ -564,15 +564,18 @@ void AiAgentImplementation::doForceRegen() {
         return;
     }
 
-    // --- REGEN CALCULATION ---
-    // Mimicking player logic:
-    // Base regen is usually derived from the skill "jedi_force_power_regen"
-    // Since AI might not have that skill, we define a fallback.
+    // 1. Default very low (Wait for it to build up)
+    int regenAmount = 50; // 50 Force every 2 seconds.
+                          // It takes ~8 seconds to regenerate ONE heal (200 force).
+                          // This makes spending the force expensive!
+
+    // 2. Check for "jedi_force_power_regen" skill mod (if you add it to their LUA)
+    // This allows you to make "Boss" Jedi regen faster than "Minion" Jedi.
+    int skillRegen = (int)getSkillMod("jedi_force_power_regen");
     
-    int regenAmount = (int)getSkillMod("jedi_force_power_regen");
-    
-    if (regenAmount <= 0) {
-        regenAmount = 63; // Default fallback for AI: 63 Force per tick
+    if (skillRegen > 0) {
+        // If they have the skill, let's use that per tick
+        regenAmount = skillRegen;
     }
     
     // Multipliers (optional, if you want to give them "force_control")
@@ -588,9 +591,9 @@ void AiAgentImplementation::doForceRegen() {
     setCurrentForce(newForce);
 
     // --- LOGGING (Remove this later if it spams too much) ---
-    // StringBuffer msg;
-    // msg << "AI Force Regen: +" << regenAmount << " (" << newForce << "/" << maxForcePoints << ")";
-    // info(msg.toString(), true);
+    StringBuffer msg;
+    msg << "AI Force Regen: +" << regenAmount << " (" << newForce << "/" << maxForcePoints << ")";
+    info(msg.toString(), true);
 
     // --- RESCHEDULE ---
     // Run again in 2 seconds
