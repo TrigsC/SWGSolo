@@ -8,7 +8,9 @@
 #ifndef AIFORCEREGENERATIONEVENT_H_
 #define AIFORCEREGENERATIONEVENT_H_
 
+// The cycle is broken, so we can safely include AiAgent.h now
 #include "server/zone/objects/creature/ai/AiAgent.h"
+#include "system/thread/Locker.h" 
 
 namespace server {
 namespace zone {
@@ -31,14 +33,14 @@ public:
         if (agent == nullptr) {
             return;
         }
-
-        Locker lock(agent);
+        
+        // This locker will work now because AiAgent is fully defined
+        Locker lock(agent); 
 
         if (agent->isDead() || agent->getZone() == nullptr) {
-            return; // Don't regen if dead or removed from world
+            return; 
         }
 
-        // Call the regen function on the agent
         agent->doForceRegen();
     }
 };
