@@ -1029,6 +1029,9 @@ void AiAgentImplementation::setupCombatStats() {
 		weaponSpeed = globalSpeedOverride;
 	else if (customSpeed > 0.0f)
 		weaponSpeed = customSpeed;
+#ifdef DEBUG_AI_WEAPONS
+	info(true) << "setupCombatStats - WeaponSpeed = " << weaponSpeed;
+#endif
 }
 
 void AiAgentImplementation::createDefaultWeapon() {
