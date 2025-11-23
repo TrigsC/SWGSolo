@@ -15,6 +15,7 @@
 #include "server/zone/managers/collision/CollisionManager.h"
 #include "CombatQueueCommand.h"
 #include "server/zone/managers/visibility/VisibilityManager.h"
+#include "server/zone/objects/creature/ai/AiAgent.h"
 
 class ForcePowersQueueCommand : public CombatQueueCommand {
 public:
@@ -24,64 +25,104 @@ public:
 	}
 
 	int doCombatAction(CreatureObject* creature, const uint64& target, const UnicodeString& arguments = "") const {
-		ManagedReference<SceneObject*> targetObject = server->getZoneServer()->getObject(target);
+        ManagedReference<SceneObject*> targetObject = server->getZoneServer()->getObject(target);
 
-		if (targetObject == nullptr || !targetObject->isTangibleObject() || targetObject == creature)
-			return INVALIDTARGET;
+        if (targetObject == nullptr || !targetObject->isTangibleObject() || targetObject == creature)
+            return INVALIDTARGET;
 
-		float checkRange = range;
+        float checkRange = range;
 
-		if (creature->isProne())
-			return NOPRONE;
+        if (creature->isProne())
+            return NOPRONE;
 
-		if(!checkDistance(creature, targetObject, checkRange))
-			return TOOFAR;
+        if(!checkDistance(creature, targetObject, checkRange))
+            return TOOFAR;
 
-		if (!CollisionManager::checkLineOfSight(creature, targetObject)) {
-			creature->sendSystemMessage("@cbt_spam:los_fail");// "You lost sight of your target."
-			return GENERALERROR;
-		}
+        if (!CollisionManager::checkLineOfSight(creature, targetObject)) {
+            creature->sendSystemMessage("@cbt_spam:los_fail");// "You lost sight of your target."
+            return GENERALERROR;
+        }
 
-		if (!playerEntryCheck(creature, targetObject->asTangibleObject())) {
-			return GENERALERROR;
-		}
+        if (!playerEntryCheck(creature, targetObject->asTangibleObject())) {
+            return GENERALERROR;
+        }
 
-		ManagedReference<PlayerObject*> ghost = creature->getPlayerObject();
+        ManagedReference<PlayerObject*> ghost = creature->getPlayerObject();
 
-		if (ghost != nullptr && ghost->getForcePower() < getFrsModifiedForceCost(creature)) {
-			creature->sendSystemMessage("@jedi_spam:no_force_power"); //"You do not have enough Force Power to peform that action.
-			return GENERALERROR;
-		}
+        // -------------------------------------------------------
+        // 1. PRE-FLIGHT CHECK: Do we have enough Force?
+        // -------------------------------------------------------
+        if (ghost != nullptr && ghost->getForcePower() < getFrsModifiedForceCost(creature)) {
+            creature->sendSystemMessage("@jedi_spam:no_force_power"); 
+            return GENERALERROR;
+        } 
+        else if (creature->isAiAgent()) {
+            AiAgent* ai = creature->asAiAgent();
+            // Safety: If template has 0 cost, default to 50 so they can't spam forever
+            int cost = forceCost;
+            if (cost <= 0) cost = 50;
 
-		CombatManager* combatManager = CombatManager::instance();
+            if (ai != nullptr && ai->getCurrentForce() < cost) {
+                return GENERALERROR; // AI is out of force
+            }
+        }
+        // -------------------------------------------------------
 
-		try {
-			int res = combatManager->doCombatAction(creature, creature->getWeapon(), cast<TangibleObject*>(targetObject.get()), CreatureAttackData(arguments, this, target));
+        CombatManager* combatManager = CombatManager::instance();
 
-			switch (res) {
-			case -1:
-				return INVALIDTARGET;
-			case -3:
-				return GENERALERROR;
-			}
+        try {
+            int res = combatManager->doCombatAction(creature, creature->getWeapon(), cast<TangibleObject*>(targetObject.get()), CreatureAttackData(arguments, this, target));
 
-			if (ghost != nullptr)
-				ghost->setForcePower(ghost->getForcePower() - getFrsModifiedForceCost(creature));
+            switch (res) {
+            case -1:
+                return INVALIDTARGET;
+            case -3:
+                return GENERALERROR;
+            }
 
-		} catch (Exception& e) {
-			error("unreported exception caught in ForcePowersQueueCommand::doCombatAction");
-			error(e.getMessage());
-			e.printStackTrace();
-		}
+            // -------------------------------------------------------
+            // 2. DEDUCTION: Pay the bill
+            // -------------------------------------------------------
+            if (ghost != nullptr) {
+                ghost->setForcePower(ghost->getForcePower() - getFrsModifiedForceCost(creature));
+            } 
+            else if (creature->isAiAgent()) {
+                AiAgent* ai = creature->asAiAgent();
+                if (ai != nullptr) {
+                    int cost = forceCost;
+                    if (cost <= 0) cost = 50;
 
-		// Increase Visibility for Force Power.
-		if (ghost != nullptr)
-			VisibilityManager::instance()->increaseVisibility(creature, visMod);
+                    int newForce = ai->getCurrentForce() - cost;
+                    ai->setCurrentForce(newForce < 0 ? 0 : newForce);
 
-		return SUCCESS;
-	}
+                    // --- DEBUG LOGGING ---
+                    // Uncomment this to verify it works in the console!
+                    StringBuffer msg;
+                    msg << "AI Force Power Used (" << name << "). Cost: " << cost << " Rem: " << newForce;
+                    ai->info(msg.toString(), true);
+                }
+            }
+            // -------------------------------------------------------
+
+        } catch (Exception& e) {
+            error("unreported exception caught in ForcePowersQueueCommand::doCombatAction");
+            error(e.getMessage());
+            e.printStackTrace();
+        }
+
+        // Increase Visibility for Force Power (Players only)
+        if (ghost != nullptr)
+            VisibilityManager::instance()->increaseVisibility(creature, visMod);
+
+        return SUCCESS;
+    }
 
 	int getFrsModifiedForceCost(CreatureObject* creature) const {
+		// AI Check
+		if (creature->isAiAgent()) {
+             return forceCost;
+        }
+
 		ManagedReference<PlayerObject*> ghost = creature->getPlayerObject();
 
 		if (ghost == nullptr)
