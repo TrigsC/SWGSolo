@@ -540,7 +540,7 @@ void AiAgentImplementation::reloadTemplate() {
 	}
 }
 
-int AiAgentImplementation::getSkillMod(const String& skillMod) {
+int AiAgentImplementation::getSkillMod(String& skillMod) {
     // 1. Check if the creature has a specific buff/state modifier first (like players)
     int baseMod = CreatureObjectImplementation::getSkillMod(skillMod);
 
