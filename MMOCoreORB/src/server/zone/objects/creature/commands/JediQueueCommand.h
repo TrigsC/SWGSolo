@@ -46,6 +46,11 @@ protected:
 public:
 	enum { BASE_BUFF, SINGLE_USE_BUFF };
 
+	// For AI to understand Force Cost
+	int getForceCost() const {
+        return forceCost;
+    }
+
 	JediQueueCommand(const String& name, ZoneProcessServer* server) : QueueCommand(name, server) {
 		forceCost = 0;
 		duration = 0;
@@ -246,7 +251,7 @@ public:
         if (creature->isAiAgent()) {
             return forceCost;
         }
-		
+
 		ManagedReference<PlayerObject*> ghost = creature->getPlayerObject();
 
 		if (ghost == nullptr)

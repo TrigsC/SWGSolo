@@ -88,6 +88,9 @@
 #include "server/chat/ChatManager.h"
 #include "server/zone/objects/intangible/tasks/PetControlDeviceStoreTask.h"
 #include "server/zone/objects/creature/ai/events/AiForceRegenerationEvent.h"
+#include "server/zone/managers/objectcontroller/command/CommandConfigManager.h"
+#include "server/zone/objects/creature/commands/ForcePowersQueueCommand.h"
+#include "server/zone/objects/creature/commands/JediQueueCommand.h"
 
 // #define DEBUG
 #define DEBUG_AI_WEAPONS
@@ -1768,40 +1771,40 @@ bool AiAgentImplementation::isFitsWeaponType(String& cmd, WeaponObject* weapon) 
 }
 
 bool AiAgentImplementation::selectSpecialAttack() {
-	// --- Thrown weapons handling (unchanged) ---
-	if (System::random(100) > 95) {
-		ManagedReference<WeaponObject*> thrownWeapRef = thrownWeapon.get();
+    // --- Thrown weapons handling (unchanged) ---
+    if (System::random(100) > 95) {
+        ManagedReference<WeaponObject*> thrownWeapRef = thrownWeapon.get();
 
-		if (thrownWeapRef != nullptr) {
-			Reference<SceneObject*> followCopy = getFollowObject().get();
+        if (thrownWeapRef != nullptr) {
+            Reference<SceneObject*> followCopy = getFollowObject().get();
 
-			if (followCopy != nullptr) {
-				auto targetID = followCopy->getObjectID();
-				Reference<AiAgent*> strongAgent = asAiAgent();
+            if (followCopy != nullptr) {
+                auto targetID = followCopy->getObjectID();
+                Reference<AiAgent*> strongAgent = asAiAgent();
 
-				Core::getTaskManager()->executeTask([strongAgent, targetID, thrownWeapRef] () {
-					if (strongAgent == nullptr || thrownWeapRef == nullptr)
-						return;
+                Core::getTaskManager()->executeTask([strongAgent, targetID, thrownWeapRef] () {
+                    if (strongAgent == nullptr || thrownWeapRef == nullptr)
+                        return;
 
-					Locker lock(strongAgent);
+                    Locker lock(strongAgent);
 
-					strongAgent->enqueueCommand(
-						STRING_HASHCODE("throwgrenade"), 0, targetID,
-						String::valueOf(thrownWeapRef->getObjectID()), QueueCommand::NORMAL
-					);
+                    strongAgent->enqueueCommand(
+                        STRING_HASHCODE("throwgrenade"), 0, targetID,
+                        String::valueOf(thrownWeapRef->getObjectID()), QueueCommand::NORMAL
+                    );
 
-					if (thrownWeapRef->getUseCount() <= 0) {
-						Locker locker(thrownWeapRef, strongAgent);
+                    if (thrownWeapRef->getUseCount() <= 0) {
+                        Locker locker(thrownWeapRef, strongAgent);
 
-						thrownWeapRef->destroyObjectFromWorld(true);
-						strongAgent->clearThrownWeapon();
-					}
-				}, "AiAgentThrowGrenadeLambda");
-			}
-		}
-	}
+                        thrownWeapRef->destroyObjectFromWorld(true);
+                        strongAgent->clearThrownWeapon();
+                    }
+                }, "AiAgentThrowGrenadeLambda");
+            }
+        }
+    }
 
-	WeaponObject* weapon = getWeapon();
+    WeaponObject* weapon = getWeapon();
     String weapCat = getWeaponCategory(weapon);
     const CreatureAttackMap* attackMap = nullptr;
 
@@ -1820,344 +1823,345 @@ bool AiAgentImplementation::selectSpecialAttack() {
         attackMap = getAttackMap(); 
     }
 
-	if (attackMap == nullptr || attackMap->isEmpty()) {
+    if (attackMap == nullptr || attackMap->isEmpty()) {
 #ifdef DEBUG_AI_ATTACK
-		info(true) << "AI_ATTACK: selectSpecialAttack() - attackMap null/empty, "
-		           << "falling back to selectDefaultAttack() for "
-		           << getDisplayedName() << " (" << getObjectID() << ")";
+        info(true) << "AI_ATTACK: selectSpecialAttack() - attackMap null/empty, "
+                   << "falling back to selectDefaultAttack() for "
+                   << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
-		// Always have *something* ready
-		return selectDefaultAttack();
-	}
+        // Always have *something* ready
+        return selectDefaultAttack();
+    }
 
-	// --- Situational context snapshot ---
-	ManagedReference<SceneObject*> followCopy = getFollowObject().get();
-	CreatureObject* targetCreo = nullptr;
+    // --- Situational context snapshot ---
+    ManagedReference<SceneObject*> followCopy = getFollowObject().get();
+    CreatureObject* targetCreo = nullptr;
 
-	if (followCopy != nullptr && followCopy->isCreatureObject())
-		targetCreo = followCopy->asCreatureObject();
+    if (followCopy != nullptr && followCopy->isCreatureObject())
+        targetCreo = followCopy->asCreatureObject();
 
-	bool hasTarget = (followCopy != nullptr && targetCreo != nullptr && !targetCreo->isDead());
+    bool hasTarget = (followCopy != nullptr && targetCreo != nullptr && !targetCreo->isDead());
 
-	// Simple range bands
-	bool meleeRange = false;
-	bool midRange   = false;
-	bool longRange  = false;
+    // Simple range bands
+    bool meleeRange = false;
+    bool midRange   = false;
+    bool longRange  = false;
 
-	if (followCopy != nullptr) {
-		meleeRange = isInRange(followCopy, 7.5f);
-		midRange   = isInRange(followCopy, 25.0f);
-		longRange  = isInRange(followCopy, 40.0f);
-	}
+    if (followCopy != nullptr) {
+        meleeRange = isInRange(followCopy, 7.5f);
+        midRange   = isInRange(followCopy, 25.0f);
+        longRange  = isInRange(followCopy, 40.0f);
+    }
 
-	// Target HAM awareness
-	int targetHealthPct = 100;
-	int targetActionPct = 100;
-	int targetMindPct   = 100;
+    // Target HAM awareness
+    int targetHealthPct = 100;
+    int targetActionPct = 100;
+    int targetMindPct   = 100;
 
-	if (targetCreo != nullptr) {
-		int curHP  = targetCreo->getHAM(CreatureAttribute::HEALTH);
-		int maxHP  = targetCreo->getMaxHAM(CreatureAttribute::HEALTH);
-		int curAct = targetCreo->getHAM(CreatureAttribute::ACTION);
-		int maxAct = targetCreo->getMaxHAM(CreatureAttribute::ACTION);
-		int curMind = targetCreo->getHAM(CreatureAttribute::MIND);
-		int maxMind = targetCreo->getMaxHAM(CreatureAttribute::MIND);
+    if (targetCreo != nullptr) {
+        int curHP  = targetCreo->getHAM(CreatureAttribute::HEALTH);
+        int maxHP  = targetCreo->getMaxHAM(CreatureAttribute::HEALTH);
+        int curAct = targetCreo->getHAM(CreatureAttribute::ACTION);
+        int maxAct = targetCreo->getMaxHAM(CreatureAttribute::ACTION);
+        int curMind = targetCreo->getHAM(CreatureAttribute::MIND);
+        int maxMind = targetCreo->getMaxHAM(CreatureAttribute::MIND);
 
-		if (maxHP > 0)
-			targetHealthPct = (curHP * 100) / maxHP;
-		if (maxAct > 0)
-			targetActionPct = (curAct * 100) / maxAct;
-		if (maxMind > 0)
-			targetMindPct = (curMind * 100) / maxMind;
-	}
+        if (maxHP > 0)
+            targetHealthPct = (curHP * 100) / maxHP;
+        if (maxAct > 0)
+            targetActionPct = (curAct * 100) / maxAct;
+        if (maxMind > 0)
+            targetMindPct = (curMind * 100) / maxMind;
+    }
 
-	// My own ACTION only lightly used (no heavy “cost” logic for now)
-	int myActionPct = 100;
-	{
-		int myAct    = getHAM(CreatureAttribute::ACTION);
-		int myActMax = getMaxHAM(CreatureAttribute::ACTION);
+    // My own ACTION only lightly used (no heavy “cost” logic for now)
+    int myActionPct = 100;
+    {
+        int myAct    = getHAM(CreatureAttribute::ACTION);
+        int myActMax = getMaxHAM(CreatureAttribute::ACTION);
 
-		if (myActMax > 0)
-			myActionPct = (myAct * 100) / myActMax;
-	}
+        if (myActMax > 0)
+            myActionPct = (myAct * 100) / myActMax;
+    }
 
-	// Target control-state awareness (names may need to be adapted to your codebase)
-	bool targetIntimidated = false;
-	bool targetBlinded     = false;
-	bool targetDizzy       = false;
-	bool targetStunned     = false;
-	bool targetKD          = false;
+    // Target control-state awareness
+    bool targetIntimidated = false;
+    bool targetBlinded     = false;
+    bool targetDizzy       = false;
+    bool targetStunned     = false;
+    bool targetKD          = false;
 
-	if (targetCreo != nullptr) {
-		// Assuming CreatureState and CreaturePosture enums exist like this
-		targetIntimidated = targetCreo->hasState(CreatureState::INTIMIDATED);
-		targetBlinded     = targetCreo->hasState(CreatureState::BLINDED);
-		targetDizzy       = targetCreo->hasState(CreatureState::DIZZY);
-		targetStunned     = targetCreo->hasState(CreatureState::STUNNED);
-		targetKD          = (targetCreo->getPosture() == CreaturePosture::KNOCKEDDOWN);
-	}
+    if (targetCreo != nullptr) {
+        targetIntimidated = targetCreo->hasState(CreatureState::INTIMIDATED);
+        targetBlinded     = targetCreo->hasState(CreatureState::BLINDED);
+        targetDizzy       = targetCreo->hasState(CreatureState::DIZZY);
+        targetStunned     = targetCreo->hasState(CreatureState::STUNNED);
+        targetKD          = (targetCreo->getPosture() == CreaturePosture::KNOCKEDDOWN);
+    }
 
-	// --- Score each available special and pick the best like a "human" would ---
+    // --- Score each available special and pick the best like a "human" would ---
 
-	int bestIdx   = -1;
-	int bestScore = -9999;
+    int bestIdx   = -1;
+    int bestScore = -9999;
+    
+    // Prepare for Force Checks
+    ZoneServer* zoneServer = getZoneServer();
+    CommandConfigManager* cmdConfig = nullptr;
+    if (zoneServer != nullptr) {
+        cmdConfig = zoneServer->getCommandConfigManager();
+    }
 
-	for (int i = 0; i < attackMap->size(); ++i) {
-		String key   = attackMap->getCommand(i);
-		if (key.isEmpty())
-			continue;
+    for (int i = 0; i < attackMap->size(); ++i) {
+        String key = attackMap->getCommand(i);
+        if (key.isEmpty())
+            continue;
 
-		String lower = key.toLowerCase();
-		int score    = 0;
+        // =================================================================
+        // [AI FORCE CHECK] - Can I afford this?
+        // =================================================================
+        if (cmdConfig != nullptr) {
+            Reference<QueueCommand*> qCmd = cmdConfig->getCommand(key.hashCode());
+            if (qCmd != nullptr) {
+                int predictedCost = 0;
 
-		// 1) Big “identity” / signature moves
-		if (lower.contains("saberpolearmdervish2") ||
-		    lower.contains("saber2hfrenzy") ||
-		    lower.contains("saber1hflurry2") ||
-		    lower.contains("saber2hsweep3") ||
-		    lower.contains("saber2hbodyhit3") ||
-		    lower.contains("saber1hhit3")) {
-			score += 20;
-			if (meleeRange) score += 6;
-		}
+                // 1. Check if it's a Force Power (Lightning, etc.)
+                ForcePowersQueueCommand* fpCmd = dynamic_cast<ForcePowersQueueCommand*>(qCmd.get());
+                if (fpCmd != nullptr) {
+                    predictedCost = fpCmd->getForceCost();
+                }
+                else {
+                    // 2. Check if it's a Buff/Spell
+                    JediQueueCommand* jCmd = dynamic_cast<JediQueueCommand*>(qCmd.get());
+                    if (jCmd != nullptr) {
+                         predictedCost = jCmd->getForceCost();
+                    }
+                }
 
-		if (lower.contains("melee1hhit3") ||
-		    lower.contains("melee2hhit3") ||
-		    lower.contains("unarmedhit3") ||
-		    lower.contains("polearmhit3")) {
-			score += 20;
-			if (meleeRange) score += 6;
-		}
+                // 3. Fallback for Sabers/Powers with 0 cost in template
+                if (predictedCost <= 0 && (key.contains("force") || key.contains("saber"))) {
+                    predictedCost = 50; 
+                }
 
-		// Ranged identity moves
-		if (lower.contains("scattershot2") ||
-		    lower.contains("fanshot") ||
-		    lower.contains("strafeshot2") ||
-		    lower.contains("fullautosingle2") ||
-		    lower.contains("flurryshot2")) {
-			score += 20;
-			if (!meleeRange && midRange) score += 6;
-		}
+                // 4. THE WALLET CHECK
+                // If I have less Force than this costs, I cannot use it.
+                if (predictedCost > 0 && getCurrentForce() < predictedCost) {
+                    // Skip to next ability in the loop
+                    continue; 
+                }
+            }
+        }
+        // =================================================================
 
-		// 2) Control / setup abilities — only reapply if the target is NOT already affected
-		bool isIntimidate = lower.contains("intimidate");
+        String lower = key.toLowerCase();
+        int score    = 0;
 
-		bool isKD         = lower.contains("knockdown") ||
-							lower.contains("sweep") ||
-							lower.contains("lowblow") ||
-							lower.contains("meleedefense") ||
-							lower.contains("charge") ||
-							lower.contains("throw") ||
-							lower.contains("lunge");
+        // 1) Big “identity” / signature moves
+        if (lower.contains("saberpolearmdervish2") ||
+            lower.contains("saber2hfrenzy") ||
+            lower.contains("saber1hflurry2") ||
+            lower.contains("saber2hsweep3") ||
+            lower.contains("saber2hbodyhit3") ||
+            lower.contains("saber1hhit3")) {
+            score += 20;
+            if (meleeRange) score += 6;
+        }
 
-		bool isBlind      = lower.contains("blind") ||
-							lower.contains("eye") ||
-							lower.contains("flurry") ||
-							lower.contains("phantom") ||
-							lower.contains("dervish") ||
-							lower.contains("fullauto");
+        if (lower.contains("melee1hhit3") ||
+            lower.contains("melee2hhit3") ||
+            lower.contains("unarmedhit3") ||
+            lower.contains("polearmhit3")) {
+            score += 20;
+            if (meleeRange) score += 6;
+        }
 
-		bool isDizzy      = lower.contains("dizzy") ||
-							lower.contains("flurry") ||
-							lower.contains("spray") ||
-							lower.contains("dervish") ||
-							lower.contains("confusion");
+        // Ranged identity moves
+        if (lower.contains("scattershot2") ||
+            lower.contains("fanshot") ||
+            lower.contains("strafeshot2") ||
+            lower.contains("fullautosingle2") ||
+            lower.contains("flurryshot2")) {
+            score += 20;
+            if (!meleeRange && midRange) score += 6;
+        }
 
-		bool isStun       = lower.contains("stun") ||
-							lower.contains("confusion") ||
-							lower.contains("lastditch") ||
-							lower.contains("forcethrow") ||
-							lower.contains("flurry") ||
-							lower.contains("wildshot") ||
-							lower.contains("flushing") ||
-							lower.contains("fullauto");
+        // 2) Control / setup abilities
+        bool isIntimidate = lower.contains("intimidate");
 
-		if (isIntimidate) {
-			if (!targetIntimidated) {
-				score += 24;
-				if (targetHealthPct > 20) score += 6;  // good early pressure
-				if (!meleeRange)         score -= 6;  // needs to land
-			} else {
-				// Don't waste a tick reapplying an already-active intimidate
-				score -= 15;
-			}
-		}
+        bool isKD         = lower.contains("knockdown") ||
+                            lower.contains("sweep") ||
+                            lower.contains("lowblow") ||
+                            lower.contains("meleedefense") ||
+                            lower.contains("charge") ||
+                            lower.contains("throw") ||
+                            lower.contains("lunge");
 
-		if (isKD) {
-			if (targetCreo == nullptr) {
-				score -= 999;
-			}
-			else {
-				if (targetKD) {
-					// Already on the ground, dont spam
-					score -= 50;
-				}
-				// 2. Check if they are immune (timer has not passed yet)
-            	// checkKnockdownRecovery returns TRUE if the cooldown is OVER.
-            	// So if it returns FALSE, they are still recovering (immune).
-				else if (!targetCreo->checkKnockdownRecovery()){
-					// Target is standing, but has "immunity" from a recent KD.
-            	     // Attempting to KD now will likely fail or be wasted.
-            	     score -= 50;
-				}
-				else {
-					score += 24;
+        bool isBlind      = lower.contains("blind") ||
+                            lower.contains("eye") ||
+                            lower.contains("flurry") ||
+                            lower.contains("phantom") ||
+                            lower.contains("dervish") ||
+                            lower.contains("fullauto");
 
-					if (meleeRange)
-						score += 6;
+        bool isDizzy      = lower.contains("dizzy") ||
+                            lower.contains("flurry") ||
+                            lower.contains("spray") ||
+                            lower.contains("dervish") ||
+                            lower.contains("confusion");
 
-					// If target is very low health, KD is okay, but damage might be better.
-            	    // If target is high health, KD is excellent for control.
-					if (targetHealthPct < 25)
-						score -= 6;
-				}
-			}
-		}
+        bool isStun       = lower.contains("stun") ||
+                            lower.contains("confusion") ||
+                            lower.contains("lastditch") ||
+                            lower.contains("forcethrow") ||
+                            lower.contains("flurry") ||
+                            lower.contains("wildshot") ||
+                            lower.contains("flushing") ||
+                            lower.contains("fullauto");
 
-		bool isControlState = isBlind || isDizzy || isStun;
+        if (isIntimidate) {
+            if (!targetIntimidated) {
+                score += 24;
+                if (targetHealthPct > 20) score += 6;  // good early pressure
+                if (!meleeRange)         score -= 6;  // needs to land
+            } else {
+                score -= 15;
+            }
+        }
 
-		if (isBlind) {
-			if (!targetBlinded) {
-				score += 24;
-				if (meleeRange) score += 6;
-			} else {
-				score -= 10;
-			}
-		}
+        if (isKD) {
+            if (targetCreo == nullptr) {
+                score -= 999;
+            }
+            else {
+                if (targetKD) {
+                    score -= 50;
+                }
+                else if (!targetCreo->checkKnockdownRecovery()){
+                     score -= 50;
+                }
+                else {
+                    score += 24;
+                    if (meleeRange) score += 6;
+                    if (targetHealthPct < 25) score -= 6;
+                }
+            }
+        }
 
-		if (isDizzy) {
-			if (!targetDizzy) {
-				score += 24;
-				if (meleeRange) score += 6;
-			} else {
-				score -= 10;
-			}
-		}
+        bool isControlState = isBlind || isDizzy || isStun;
 
-		if (isStun) {
-			if (!targetStunned) {
-				score += 24;
-				if (meleeRange) score += 6;
-			} else {
-				score -= 10;
-			}
-		}
+        if (isBlind) {
+            if (!targetBlinded) {
+                score += 24;
+                if (meleeRange) score += 6;
+            } else {
+                score -= 10;
+            }
+        }
 
-		// Avoid control moves as filler when there is no real target
-		if (!hasTarget && (isIntimidate || isKD || isControlState))
-			score -= 25;
+        if (isDizzy) {
+            if (!targetDizzy) {
+                score += 24;
+                if (meleeRange) score += 6;
+            } else {
+                score -= 10;
+            }
+        }
 
-		// 3) HAM-pool–aware focus (like a human picking on the weakest bar)
+        if (isStun) {
+            if (!targetStunned) {
+                score += 24;
+                if (meleeRange) score += 6;
+            } else {
+                score -= 10;
+            }
+        }
 
-		bool hitsHealth = lower.contains("health") ||
-		                  lower.contains("body") ||
-		                  lower.contains("torso");
-		bool hitsAction = lower.contains("action") ||
-		                  lower.contains("leg") ||
-		                  lower.contains("crippling");
-		bool hitsMind   = lower.contains("mind") ||
-		                  lower.contains("head") ||
-		                  lower.contains("startleshot");
+        if (!hasTarget && (isIntimidate || isKD || isControlState))
+            score -= 25;
 
-		// thresholds – “below 50%” means focus this pool
-		bool healthLow = (targetHealthPct < 50);
-		bool actionLow = (targetActionPct < 50);
-		bool mindLow   = (targetMindPct   < 50);
+        // 3) HAM-pool–aware focus
+        bool hitsHealth = lower.contains("health") || lower.contains("body") || lower.contains("torso");
+        bool hitsAction = lower.contains("action") || lower.contains("leg") || lower.contains("crippling");
+        bool hitsMind   = lower.contains("mind") || lower.contains("head") || lower.contains("startleshot");
 
-		// If *any* pool is low, we like attacks that pressure that specific pool
-		if (hasTarget) {
-			if (hitsHealth && healthLow)
-				score += 12;
-			if (hitsAction && actionLow)
-				score += 12;
-			if (hitsMind && mindLow)
-				score += 12;
+        bool healthLow = (targetHealthPct < 50);
+        bool actionLow = (targetActionPct < 50);
+        bool mindLow   = (targetMindPct   < 50);
 
-			// If all pools are high, no special bonus, they’re all fair game
-			bool allHigh = (targetHealthPct > 70 &&
-			                targetActionPct > 70 &&
-			                targetMindPct   > 70);
-			if (allHigh) {
-				// tiny bias for pure damage / nukes already covered above
-			}
-		}
+        if (hasTarget) {
+            if (hitsHealth && healthLow) score += 12;
+            if (hitsAction && actionLow) score += 12;
+            if (hitsMind && mindLow)     score += 12;
+        }
 
-		// 4) Single-target vs AoE
-		bool isCone = lower.contains("cone");
-		bool isArea = lower.contains("area") || lower.contains("spray");
+        // 4) Single-target vs AoE
+        bool isCone = lower.contains("cone");
+        bool isArea = lower.contains("area") || lower.contains("spray");
 
-		if (isCone || isArea) {
-			// Useful but don't over-prioritize compared to good single-target
-			score += 4;
-			if (!meleeRange && !midRange) score -= 6;
-			if (targetHealthPct < 20)     score -= 6;  // finishing: prefer direct
-		}
+        if (isCone || isArea) {
+            score += 4;
+            if (!meleeRange && !midRange) score -= 6;
+            if (targetHealthPct < 20)     score -= 6;
+        }
 
-		// 5) Very light “am I exhausted?” behavior (no real cost model yet)
-		bool isHeavyBurst =
-		    lower.contains("spinattack") ||
-		    lower.contains("flurry") ||
-		    lower.contains("frenzy") ||
-		    lower.contains("fullauto") ||
-		    isCone || isArea;
+        // 5) Exhaustion logic (Placeholder)
+        bool isHeavyBurst =
+            lower.contains("spinattack") ||
+            lower.contains("flurry") ||
+            lower.contains("frenzy") ||
+            lower.contains("fullauto") ||
+            isCone || isArea;
 
-		if (myActionPct < 20 && isHeavyBurst) {
-			// Just a nudge – NPCs can basically spam, but don't go crazy when gassed
-			score -= 5;
-		}
+        if (myActionPct < 20 && isHeavyBurst) {
+            score -= 5;
+        }
 
-		// 6) Generic hits / fallback if nothing else matched strongly
-		bool looksMeleeHit =
-		    lower.contains("hit");
-		bool looksRangedHit =
-		    lower.contains("shot") || lower.contains("burst");
+        // 6) Generic hits
+        bool looksMeleeHit = lower.contains("hit");
+        bool looksRangedHit = lower.contains("shot") || lower.contains("burst");
 
-		if (score == 0) {
-			if (meleeRange && looksMeleeHit)
-				score += 10;
-			else if (!meleeRange && looksRangedHit)
-				score += 10;
-			else
-				score += 2; // "just do something"
-		}
+        if (score == 0) {
+            if (meleeRange && looksMeleeHit) score += 10;
+            else if (!meleeRange && looksRangedHit) score += 10;
+            else score += 2;
+        }
 
-		// 7) Small random jitter so they don't feel like robots
-		score += System::random(7) - 3; // [-3, +3]
-
-#ifdef DEBUG_AI_ATTACK
-		info(true) << "AI_ATTACK: selectSpecialAttack scoring idx=" << i
-		           << " key=" << key << " score=" << score
-		           << " hp=" << targetHealthPct
-		           << " act=" << targetActionPct
-		           << " mind=" << targetMindPct
-		           << " for " << getDisplayedName()
-		           << " (" << getObjectID() << ")";
-#endif
-
-		if (score > bestScore) {
-			bestScore = score;
-			bestIdx   = i;
-		}
-	}
-
-	// Fallback if somehow nothing wins
-	if (bestIdx == -1) {
-#ifdef DEBUG_AI_ATTACK
-		info(true) << "AI_ATTACK: selectSpecialAttack - no bestIdx, falling back to random for "
-		           << getDisplayedName() << " (" << getObjectID() << ")";
-#endif
-		int randomIdx = attackMap->getRandomAttackNumber();
-		return selectSpecialAttack(randomIdx);
-	}
+        // 7) Random jitter
+        score += System::random(7) - 3; // [-3, +3]
 
 #ifdef DEBUG_AI_ATTACK
-	info(true) << "AI_ATTACK: selectSpecialAttack(situational) chose idx=" << bestIdx
-	           << " key=" << attackMap->getCommand(bestIdx)
-	           << " score=" << bestScore << " for "
-	           << getDisplayedName() << " (" << getObjectID() << ")";
+        info(true) << "AI_ATTACK: selectSpecialAttack scoring idx=" << i
+                   << " key=" << key << " score=" << score
+                   << " hp=" << targetHealthPct
+                   << " act=" << targetActionPct
+                   << " mind=" << targetMindPct
+                   << " for " << getDisplayedName()
+                   << " (" << getObjectID() << ")";
 #endif
 
-	return selectSpecialAttack(bestIdx);
+        if (score > bestScore) {
+            bestScore = score;
+            bestIdx   = i;
+        }
+    }
+
+    // Fallback
+    if (bestIdx == -1) {
+#ifdef DEBUG_AI_ATTACK
+        info(true) << "AI_ATTACK: selectSpecialAttack - no bestIdx, falling back to random for "
+                   << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
+        int randomIdx = attackMap->getRandomAttackNumber();
+        return selectSpecialAttack(randomIdx);
+    }
+
+#ifdef DEBUG_AI_ATTACK
+    info(true) << "AI_ATTACK: selectSpecialAttack(situational) chose idx=" << bestIdx
+               << " key=" << attackMap->getCommand(bestIdx)
+               << " score=" << bestScore << " for "
+               << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
+
+    return selectSpecialAttack(bestIdx);
 }
 
 bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
