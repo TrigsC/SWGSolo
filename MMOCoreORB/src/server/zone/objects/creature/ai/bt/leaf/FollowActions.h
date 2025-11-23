@@ -886,12 +886,11 @@ public:
 			return FAILURE;
 		}
 
-		if (healTarget->getObjectID() == agent->getObjectID()) {
-			// agent->info(true) << "ID: " << agent->getObjectID() << " Agent setting self as heal target";
-
-			agent->writeBlackboard("healTarget", healTarget);
-			return SUCCESS;
-		}
+		//if (healTarget->getObjectID() == agent->getObjectID()) {
+		//	// agent->info(true) << "ID: " << agent->getObjectID() << " Agent setting self as heal target";
+		//	agent->writeBlackboard("healTarget", healTarget);
+		//	return SUCCESS;
+		//}
 
 		auto healCreo = healTarget->asCreatureObject();
 
