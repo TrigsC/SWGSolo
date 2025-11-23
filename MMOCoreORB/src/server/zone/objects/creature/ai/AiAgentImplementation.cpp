@@ -541,28 +541,28 @@ void AiAgentImplementation::reloadTemplate() {
 }
 
 int AiAgentImplementation::getSkillMod(const String& skillMod) const {
-    // 1. Check if the creature has a specific buff/state modifier first (like players)
+    // 1. Check if the creature has a specific buff/state modifier first
     int baseMod = CreatureObjectImplementation::getSkillMod(skillMod);
 
-    // 2. If the base mod is 0, check the Lua Template for "Human-like" stats
+    // 2. If the base mod is 0, check the Lua Template
     if (baseMod == 0 && npcTemplate != nullptr) {
         
-        // This helper would need to be added to NpcTemplate.cpp/h to read that "statistics" table
+        // Check Lua "statistics" map
         int templateMod = npcTemplate->getStatistic(skillMod); 
         
         if (templateMod > 0)
             return templateMod;
 
-        // 3. Fallback: Heuristic Logic (The "Smart" Auto-Calc)
-        // If Lua didn't define it, calculate it based on Level/Class to prevent "dumb" mobs
-        if (skillMod == "saber_block" && getWeapon() != nullptr && getWeapon()->isJediWeapon()) {
-            // Jedi logic: Level 80 Jedi roughly equates to Master, so ~80-100 block
-            return getLevel(); 
+        // 3. Fallback Heuristic Logic
+        ManagedReference<WeaponObject*> weapon = const_cast<AiAgentImplementation*>(this)->getWeapon();
+
+        if (skillMod == "saber_block" && weapon != nullptr && weapon->isJediWeapon()) {
+             // Jedi logic: Level 80 Jedi roughly equates to Master, so ~80-100 block
+             return getLevel(); 
         }
         
         if (skillMod.contains("accuracy")) {
-             // Fallback if "statistics.accuracy" wasn't in Lua
-             // 150 is a decent baseline for a mid-tier mob
+             // Fallback: 150 is a decent baseline for a mid-tier mob
              return 100 + (getLevel() * 2); 
         }
     }
