@@ -19,6 +19,11 @@
 
 class ForcePowersQueueCommand : public CombatQueueCommand {
 public:
+	
+	// For AI to understand Force Cost
+	int getForceCost() const {
+        return forceCost;
+    }
 
 	ForcePowersQueueCommand(const String& name, ZoneProcessServer* server) : CombatQueueCommand(name, server) {
 		visMod = 25;
