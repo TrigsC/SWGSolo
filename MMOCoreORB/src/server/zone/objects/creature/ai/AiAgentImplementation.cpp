@@ -1919,34 +1919,40 @@ bool AiAgentImplementation::selectSpecialAttack() {
         // =================================================================
         // [AI FORCE CHECK] - Can I afford this?
         // =================================================================
-        if (cmdConfig != nullptr) {
-            Reference<QueueCommand*> qCmd = cmdConfig->getCommand(key.hashCode());
-            if (qCmd != nullptr) {
-                int predictedCost = 0;
+        if (zoneServer != nullptr) {
+            ObjectController* objectController = zoneServer->getObjectController();
+            
+            if (objectController != nullptr) {
+                // Look up the command using ObjectController
+                const QueueCommand* qCmd = objectController->getQueueCommand(key.hashCode());
+                
+                if (qCmd != nullptr) {
+                    int predictedCost = 0;
 
-                // 1. Check if it's a Force Power (Lightning, etc.)
-                ForcePowersQueueCommand* fpCmd = dynamic_cast<ForcePowersQueueCommand*>(qCmd.get());
-                if (fpCmd != nullptr) {
-                    predictedCost = fpCmd->getForceCost();
-                }
-                else {
-                    // 2. Check if it's a Buff/Spell
-                    JediQueueCommand* jCmd = dynamic_cast<JediQueueCommand*>(qCmd.get());
-                    if (jCmd != nullptr) {
-                         predictedCost = jCmd->getForceCost();
+                    // Note: getQueueCommand returns a const pointer, so we cast to check types
+                    // 1. Check if it's a Force Power (Lightning, etc.)
+                    const ForcePowersQueueCommand* fpCmd = dynamic_cast<const ForcePowersQueueCommand*>(qCmd);
+                    if (fpCmd != nullptr) {
+                        predictedCost = fpCmd->getForceCost();
                     }
-                }
+                    else {
+                        // 2. Check if it's a Buff/Spell
+                        const JediQueueCommand* jCmd = dynamic_cast<const JediQueueCommand*>(qCmd);
+                        if (jCmd != nullptr) {
+                             predictedCost = jCmd->getForceCost();
+                        }
+                    }
 
-                // 3. Fallback for Sabers/Powers with 0 cost in template
-                if (predictedCost <= 0 && (key.contains("force") || key.contains("saber"))) {
-                    predictedCost = 50; 
-                }
+                    // 3. Fallback for Sabers/Powers with 0 cost in template
+                    if (predictedCost <= 0 && (key.contains("force") || key.contains("saber"))) {
+                        predictedCost = 50; 
+                    }
 
-                // 4. THE WALLET CHECK
-                // If I have less Force than this costs, I cannot use it.
-                if (predictedCost > 0 && getCurrentForce() < predictedCost) {
-                    // Skip to next ability in the loop
-                    continue; 
+                    // 4. THE WALLET CHECK
+                    // If I have less Force than this costs, I cannot use it.
+                    if (predictedCost > 0 && getCurrentForce() < predictedCost) {
+                        continue; // Skip to next ability in the loop
+                    }
                 }
             }
         }

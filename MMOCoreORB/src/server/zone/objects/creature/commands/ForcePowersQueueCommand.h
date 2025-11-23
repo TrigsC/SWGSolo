@@ -16,6 +16,8 @@
 #include "CombatQueueCommand.h"
 #include "server/zone/managers/visibility/VisibilityManager.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
+#include "server/zone/objects/creature/commands/ForcePowersQueueCommand.h"
+#include "server/zone/objects/creature/commands/JediQueueCommand.h"
 
 class ForcePowersQueueCommand : public CombatQueueCommand {
 public:
