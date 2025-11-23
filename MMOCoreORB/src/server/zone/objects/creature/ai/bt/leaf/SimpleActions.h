@@ -723,9 +723,13 @@ public:
 
         	if (healDelay != nullptr) {
         	    healDelay->updateToCurrentTime();
+				// Minimum wait: 8 seconds
+            	// Maximum wait: 20 seconds
+            	// Logic: 8000ms base + random(0 to 12000ms)
+				int delay = 8000 + System::random(12000);
 
         	    // This allows ai to "spam" heal if they have the Force.
-        	    healDelay->addMiliTime(9 * 1000); 
+        	    healDelay->addMiliTime(delay); 
         	}
 
         	agent->eraseBlackboard("healTarget");
