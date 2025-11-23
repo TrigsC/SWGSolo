@@ -1247,7 +1247,7 @@ class AiAgent extends CreatureObject {
 	}
 
 	@dirty
-    public native int getSkillMod(const string skillMod);
+    public int getSkillMod(const string skillMod);
 
 	@dirty
 	public native int getDamageMin();
