@@ -554,17 +554,15 @@ int AiAgentImplementation::getSkillMod(const String& skillMod) const {
             return templateMod;
 
         // 3. Fallback Heuristic Logic
-        // SAFETY CAST: We are in a const function, but we need to get the Weapon (which is not const).
-        // We use const_cast to strip the read-only protection just for this pointer.
+        // We are in a @read function (const), but getWeapon() is not const.
+        // We use const_cast to safely grab the weapon for checking.
         ManagedReference<WeaponObject*> weapon = const_cast<AiAgentImplementation*>(this)->getWeapon();
 
         if (skillMod == "saber_block" && weapon != nullptr && weapon->isJediWeapon()) {
-             // Jedi logic: Level 80 Jedi roughly equates to Master, so ~80-100 block
              return getLevel(); 
         }
         
         if (skillMod.contains("accuracy")) {
-             // Fallback: 100 + level*2 is a decent baseline for a mid-tier mob
              return 100 + (getLevel() * 2); 
         }
     }
