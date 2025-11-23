@@ -13,11 +13,11 @@ light_jedi_sentinel = Creature:new {
         saber_block = 85,    -- % Chance to ricochet (Secondary Defense)
         dodge_attack = 0,   -- Primary Defense
     },
-	damageMin = 2645,
-	damageMax = 5000,
+	damageMin = 500,
+	damageMax = 600,
 	baseXp = 45,
-	baseHAM = 1106000,
-	baseHAMmax = 1352000,
+	baseHAM = 4000,
+	baseHAMmax = 5000,
 	armor = 0,
 	resists = {0,0,0,0,0,0,0,0,-1},
 	meatType = "",
@@ -33,6 +33,7 @@ light_jedi_sentinel = Creature:new {
 	creatureBitmask = KILLER + PACK + HERD,
 	optionsBitmask = AIENABLED,
 	diet = HERBIVORE,
+	healerType = "force",
 	customAiMap = "enclaveSentinel",
 
 	templates = { "light_jedi" },
