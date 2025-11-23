@@ -919,6 +919,7 @@ public:
 
 		ManagedReference<TangibleObject*> bestTarget = nullptr;
         int highestDamage = 0; 
+		float healThreshold = 0.70f;
 
         // Loop through enemies' defender list (our allies)
         for (int i = 0; i < defenderList->size(); ++i) {
@@ -937,28 +938,52 @@ public:
             // Faction/Aggro checks (Prevent healing enemies)
             if (candidate->isAggressiveTo(agent) || agent->isAggressiveTo(candidate)) continue;
 
+			bool needsHeal = false;
+            int totalDamage = 0;
+
+			// Check Health
+            float maxH = (float)candidate->getMaxHAM(CreatureAttribute::HEALTH);
+            float curH = (float)candidate->getHAM(CreatureAttribute::HEALTH);
+            if ((curH / maxH) < healThreshold) needsHeal = true;
+            totalDamage += (int)(maxH - curH);
+
+            // Check Action
+            float maxA = (float)candidate->getMaxHAM(CreatureAttribute::ACTION);
+            float curA = (float)candidate->getHAM(CreatureAttribute::ACTION);
+            if ((curA / maxA) < healThreshold) needsHeal = true;
+            totalDamage += (int)(maxA - curA);
+
+            // Check Mind (Important for non-Force medics)
+            float maxM = (float)candidate->getMaxHAM(CreatureAttribute::MIND);
+            float curM = (float)candidate->getHAM(CreatureAttribute::MIND);
+            if ((curM / maxM) < healThreshold) needsHeal = true;
+            totalDamage += (int)(maxM - curM);
+
             // Calculate Damage
             int damage = candidate->getMaxHAM(CreatureAttribute::HEALTH) - candidate->getHAM(CreatureAttribute::HEALTH);
 
-            // Logic: Pick the person with the MOST damage
-            if (damage > highestDamage) {
-                highestDamage = damage;
+            // If they aren't hurt badly enough, ignore them
+            if (!needsHeal) continue;
+
+            // Pick the person with the HIGHEST total missing points
+            if (totalDamage > highestDamage) {
+                highestDamage = totalDamage;
                 bestTarget = candidate->asTangibleObject();
             }
         }
 
         // SELF PRESERVATION OVERRIDE
-        // Check my own health. If I'm below 30%, I become the priority target.
-        if (agent->getHAM(CreatureAttribute::HEALTH) < (agent->getMaxHAM(CreatureAttribute::HEALTH) * 0.3)) {
-            bestTarget = agent->asTangibleObject();
+        // I care more about myself. If *I* am below 50%, I take priority over everyone.
+        float myMaxH = (float)agent->getMaxHAM(CreatureAttribute::HEALTH);
+        float myCurH = (float)agent->getHAM(CreatureAttribute::HEALTH);
+        
+        if ((myCurH / myMaxH) < 0.50f) {
+             bestTarget = agent->asTangibleObject();
         }
 
-        // If nobody is hurt enough, don't heal.
-        if (bestTarget == nullptr || highestDamage < 100) { // Added a small threshold so they don't heal 1 dmg
-            return FAILURE;
+        if (bestTarget == nullptr) {
+            return FAILURE; 
         }
-
-        // --- END OF NEW SMART LOGIC ---
 
         agent->setMovementState(AiAgent::MOVING_TO_HEAL);
         agent->writeBlackboard("healTarget", bestTarget);
