@@ -1948,7 +1948,23 @@ int CombatManager::calculateTargetPostureModifier(WeaponObject* weapon, Creature
 
 int CombatManager::getAttackerAccuracyModifier(TangibleObject* attacker, CreatureObject* defender, WeaponObject* weapon) const {
 	if (attacker->isAiAgent()) {
-		return cast<AiAgent*>(attacker)->getChanceHit() * 100;
+		AiAgent* agent = cast<AiAgent*>(attacker);
+        
+        // If the AI has a custom accuracy defined in Lua/getSkillMod, use it!
+        int aiAccuracy = agent->getSkillMod("attack_accuracy");
+        
+        if (aiAccuracy > 0) {
+            // If weapon is melee, add melee_accuracy, etc.
+            if (weapon->isMeleeWeapon())
+                aiAccuracy += agent->getSkillMod("melee_accuracy");
+            else
+                aiAccuracy += agent->getSkillMod("ranged_accuracy");
+                
+            return aiAccuracy;
+        }
+
+        // FALLBACK: Old logic if no stats defined
+        return agent->getChanceHit() * 100;
 	} else if (attacker->isInstallationObject()) {
 		return cast<InstallationObject*>(attacker)->getHitChance() * 100;
 	}

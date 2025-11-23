@@ -94,6 +94,8 @@ protected:
 
 	LootGroupCollection lootgroups;
 
+	VectorMap<String, int> statistics;
+
 	String primaryWeapon;
 	String secondaryWeapon;
 	String thrownWeapon;
@@ -316,6 +318,12 @@ public:
 	inline int getLevel() const {
 		return level;
 	}
+
+	inline int getStatistic(const String& statName) const {
+        if (statistics.contains(statName))
+            return statistics.get(statName);
+        return 0;
+    }
 
 	inline float getChanceHit() const {
 		return chanceHit;

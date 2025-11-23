@@ -152,6 +152,23 @@ void CreatureTemplate::readObject(LuaObject* templateData) {
 		milkType = templateData->getStringField("milkType").trim();
 	}
 
+	LuaObject statsTable = templateData->getObjectField("statistics");
+    if (statsTable.isValidTable()) {
+        lua_State* L = statsTable.getLuaState();
+        
+        // Iterate over the Lua table
+        for (lua_pushnil(L); lua_next(L, -2); lua_pop(L, 1)) {
+            // Key is at -2, Value is at -1
+            if (lua_type(L, -2) == LUA_TSTRING && lua_type(L, -1) == LUA_TNUMBER) {
+                String key = lua_tostring(L, -2);
+                int value = (int)lua_tonumber(L, -1);
+                
+                statistics.put(key, value);
+            }
+        }
+    }
+    statsTable.pop();
+
 	LuaObject res = templateData->getObjectField("resists");
 	if (res.getTableSize() == 9) {
 		kinetic = res.getFloatAt(1);
