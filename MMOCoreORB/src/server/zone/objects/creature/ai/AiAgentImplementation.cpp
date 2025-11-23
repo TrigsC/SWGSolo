@@ -1906,10 +1906,6 @@ bool AiAgentImplementation::selectSpecialAttack() {
     
     // Prepare for Force Checks
     ZoneServer* zoneServer = getZoneServer();
-    CommandConfigManager* cmdConfig = nullptr;
-    if (zoneServer != nullptr) {
-        cmdConfig = zoneServer->getCommandConfigManager();
-    }
 
     for (int i = 0; i < attackMap->size(); ++i) {
         String key = attackMap->getCommand(i);
@@ -1929,7 +1925,6 @@ bool AiAgentImplementation::selectSpecialAttack() {
                 if (qCmd != nullptr) {
                     int predictedCost = 0;
 
-                    // Note: getQueueCommand returns a const pointer, so we cast to check types
                     // 1. Check if it's a Force Power (Lightning, etc.)
                     const ForcePowersQueueCommand* fpCmd = dynamic_cast<const ForcePowersQueueCommand*>(qCmd);
                     if (fpCmd != nullptr) {
