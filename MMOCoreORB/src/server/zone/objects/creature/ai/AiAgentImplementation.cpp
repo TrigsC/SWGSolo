@@ -554,6 +554,8 @@ int AiAgentImplementation::getSkillMod(const String& skillMod) const {
             return templateMod;
 
         // 3. Fallback Heuristic Logic
+        // SAFETY CAST: We are in a const function, but we need to get the Weapon (which is not const).
+        // We use const_cast to strip the read-only protection just for this pointer.
         ManagedReference<WeaponObject*> weapon = const_cast<AiAgentImplementation*>(this)->getWeapon();
 
         if (skillMod == "saber_block" && weapon != nullptr && weapon->isJediWeapon()) {
@@ -562,7 +564,7 @@ int AiAgentImplementation::getSkillMod(const String& skillMod) const {
         }
         
         if (skillMod.contains("accuracy")) {
-             // Fallback: 150 is a decent baseline for a mid-tier mob
+             // Fallback: 100 + level*2 is a decent baseline for a mid-tier mob
              return 100 + (getLevel() * 2); 
         }
     }

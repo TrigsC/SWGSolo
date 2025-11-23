@@ -1246,8 +1246,7 @@ class AiAgent extends CreatureObject {
 		return npcTemplate.get().getChanceHit();
 	}
 
-	@dirty
-    public native int getSkillMod(final string skillMod);
+	@dirty public native int getSkillMod(final string skillMod);
 
 	@dirty
 	public native int getDamageMin();
