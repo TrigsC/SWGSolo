@@ -1959,6 +1959,14 @@ int CombatManager::getAttackerAccuracyModifier(TangibleObject* attacker, Creatur
                 aiAccuracy += agent->getSkillMod("melee_accuracy");
             else
                 aiAccuracy += agent->getSkillMod("ranged_accuracy");
+
+			// --- LOGGING START ---
+            StringBuffer msg;
+            msg << "DEBUG COMBAT: Attacker " << attacker->getDisplayedName() 
+                << " Total Accuracy: " << aiAccuracy 
+                << " (Should be Base + WeaponSkill)";
+            agent->info(msg.toString(), true);
+            // --- LOGGING END ---
                 
             return aiAccuracy;
         }
@@ -2174,6 +2182,15 @@ int CombatManager::getHitChance(TangibleObject* attacker, CreatureObject* creoDe
 
 			if ((!attacker->isTurret() && attackMask != WeaponType::GRENADEWEAPON) && (attackType == SharedWeaponObjectTemplate::RANGEDATTACK || attackMask == WeaponType::HEAVYWEAPON)) {
 				evadeTotal = evadeSkill = creoDefender->getSkillMod("saber_block");
+
+				// --- LOGGING START ---
+                if (creoDefender->isAiAgent()) {
+                     StringBuffer msg;
+                     msg << "DEBUG DEFENSE: " << creoDefender->getDisplayedName() 
+                         << " Saber Block Chance: " << evadeTotal;
+                     creoDefender->info(msg.toString(), true);
+                }
+                // --- LOGGING END ---
 
 				if (evadeTotal > 0 && System::random(100) <= evadeTotal) {
 					hitResult = HitStatus::RICOCHET;
