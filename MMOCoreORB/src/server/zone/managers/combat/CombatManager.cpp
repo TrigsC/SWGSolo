@@ -2059,9 +2059,13 @@ int CombatManager::getDefenderDefenseModifier(CreatureObject* defender, WeaponOb
 		targetDefense += defender->getSkillMod("private_group_" + mod);
 	}
 
-	// food bonus goes on top as well
-	targetDefense += defender->getSkillMod("dodge_attack");
-	targetDefense += defender->getSkillMod("private_dodge_attack");
+
+	// Prevent double-dipping stats for AI Agents. 
+    // This section is intended for food/state bonuses which are usually Player only.
+    if (defender->isPlayerCreature()) {
+        targetDefense += defender->getSkillMod("dodge_attack");
+        targetDefense += defender->getSkillMod("private_dodge_attack");
+    }
 
 	debug() << "Target defense after state affects and cap is " << targetDefense;
 

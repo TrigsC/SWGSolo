@@ -543,6 +543,9 @@ void AiAgentImplementation::reloadTemplate() {
 int AiAgentImplementation::getSkillMod(const String& skillMod) const {
     // 1. Check standard game buffs first
     int baseMod = CreatureObjectImplementation::getSkillMod(skillMod);
+	StringBuffer msg;
+    msg << "DEBUG AI DEFENSE: " << getFirstName() << " checking baseMod " << baseMod;
+	info(msg.toString(), true);
 
     // 2. If base is 0, check our Lua "brain"
     if (baseMod == 0 && npcTemplate != nullptr) {
@@ -579,9 +582,15 @@ int AiAgentImplementation::getSkillMod(const String& skillMod) const {
         }
         
         // --- PRIMARY DEFENSE FALLBACK ---
-        // If Lua is empty, do we want to boost their defense?
-        // Let's give "Boss" mobs (Level 80+) a small bump automatically.
         if ((skillMod == "dodge_attack" || skillMod == "block") && getLevel() > 80) {
+            
+            // --- ADD LOGGING HERE ---
+            StringBuffer msg;
+            msg << "DEBUG AI DEFENSE: " << getFirstName() << " using FALLBACK for " << skillMod 
+                << " -> Returning 20 (Total Defense will be " << getLevel() << " + 20)";
+            info(msg.toString(), true);
+            // ------------------------
+
             return 20; // Adds 20 to their base Level defense
         }
     }
