@@ -546,6 +546,11 @@ int AiAgentImplementation::getSkillMod(const String& skillMod) const {
 	StringBuffer msg;
     msg << "DEBUG AI DEFENSE: " << getFirstName() << " checking baseMod " << baseMod;
 	info(msg.toString(), true);
+    if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "saber_block") {
+         StringBuffer msg;
+         msg << "DEBUG INCOMING ATTACK: Engine asking AI for " << skillMod << ". Base is " << baseMod;
+         info(msg.toString(), true);
+    }
 
     // 2. If base is 0, check our Lua "brain"
     if (baseMod == 0 && npcTemplate != nullptr) {

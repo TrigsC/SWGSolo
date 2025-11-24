@@ -2045,6 +2045,9 @@ int CombatManager::getDefenderDefenseModifier(CreatureObject* defender, WeaponOb
 	}
 
 	debug() << "Base target defense is " << targetDefense;
+	StringBuffer msg;
+    msg << "Base target defense is " << targetDefense;
+	info(msg.toString(), true);
 
 	// defense hardcap
 	if (targetDefense > 125)
