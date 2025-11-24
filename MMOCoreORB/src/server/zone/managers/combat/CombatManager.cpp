@@ -2104,6 +2104,23 @@ int CombatManager::getDefenderSecondaryDefenseModifier(CreatureObject* defender)
 		targetDefense += defender->getSkillMod("private_" + mod);
 	}
 
+	if (defender->isAiAgent()) {
+        // If holding a Melee weapon (or Lightsaber), check BLOCK
+        if (weapon->isMeleeWeapon() || weapon->isJediWeapon()) {
+            targetDefense += defender->getSkillMod("block");
+        }
+        // If holding a Ranged weapon, check DODGE
+        else {
+             targetDefense += defender->getSkillMod("dodge");
+        }
+        
+        // Always check Counter Attack (some masters have this)
+        targetDefense += defender->getSkillMod("counter_attack");
+    }
+	StringBuffer msg;
+	msg << "DEBUG AI SECONDARY DEFENSE: " << defender->getFirstName() << " checking defenderDefense " << targetDefense;
+	info(msg.toString(), true);
+
 	if (targetDefense > 125)
 		targetDefense = 125;
 
