@@ -9,7 +9,7 @@ light_jedi_sentinel = Creature:new {
 	--chanceHit = 30,
 	statistics = {
         -- ACCURACY (Attacking)
-        attack_accuracy = 120,
+        attack_accuracy = 100,
         melee_accuracy = 60,  -- Total 180 accuracy
         
         -- PRIMARY DEFENSE (Avoiding the hit)
@@ -18,7 +18,8 @@ light_jedi_sentinel = Creature:new {
         dodge_attack = 40,    -- Used vs Ranged
         block = 40,           -- Used vs Melee
         counter_attack = 40,  -- Chance to counter-hit vs Melee
-        
+        lightsaber_toughness = 55,
+		jedi_toughness = 45,
         -- SECONDARY DEFENSE (Mitigating the hit)
         -- This is a flat % roll. 95 = 95% chance to reduce damage if hit.
         saber_block = 95,
