@@ -2060,7 +2060,7 @@ int CombatManager::getDefenderDefenseModifier(CreatureObject* defender, WeaponOb
 
 	debug() << "Base target defense is " << targetDefense;
 	StringBuffer msg;
-	msg << "DEBUG AI DEFENSE: " << defender->getFirstName() << " checking baseMod " << baseMod;
+	msg << "DEBUG AI DEFENSE: " << defender->getFirstName() << " checking targetDefense " << targetDefense;
 	info(msg.toString(), true);
 
 	// defense hardcap
