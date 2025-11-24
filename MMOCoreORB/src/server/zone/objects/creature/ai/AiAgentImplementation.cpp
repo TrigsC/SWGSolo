@@ -541,35 +541,51 @@ void AiAgentImplementation::reloadTemplate() {
 }
 
 int AiAgentImplementation::getSkillMod(const String& skillMod) const {
-    // 1. Check if the creature has a specific buff/state modifier first
+    // 1. Check standard game buffs first
     int baseMod = CreatureObjectImplementation::getSkillMod(skillMod);
 
-    // 2. If the base mod is 0, check the Lua Template
+    // 2. If base is 0, check our Lua "brain"
     if (baseMod == 0 && npcTemplate != nullptr) {
         
-        // Check Lua "statistics" map
         int templateMod = npcTemplate->getStatistic(skillMod); 
         
-        if (templateMod > 0) {
-			// --- LOGGING START ---
-            StringBuffer msg;
-            msg << "DEBUG AI STATS: " << getFirstName() << " requesting " << skillMod << " -> Found in Lua: " << templateMod;
-            info(msg.toString(), true); // 'true' forces it to print to console
-            // --- LOGGING END ---
+        // --- LOGGING & RETURN LUA VALUE ---
+        if (templateMod > 0) { 
+            // Only log for our test mob to keep console clean
+            if (getFirstName() == "light_jedi_sentinel") {
+                StringBuffer msg;
+                msg << "DEBUG AI DEFENSE: " << getFirstName() << " checking " << skillMod 
+                    << " -> Lua says: " << templateMod;
+                
+                // If it's a primary defense, remind us that Level is added automatically
+                if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "counter_attack") {
+                    msg << " (Total Defense will be " << getLevel() << " + " << templateMod << ")";
+                }
+                
+                info(msg.toString(), true); 
+            }
             return templateMod;
-		}
+        } 
 
-        // 3. Fallback Heuristic Logic
-        // We are in a @read function (const), but getWeapon() is not const.
-        // We use const_cast to safely grab the weapon for checking.
+        // 3. Fallback Heuristic Logic (If Lua is empty)
         ManagedReference<WeaponObject*> weapon = const_cast<AiAgentImplementation*>(this)->getWeapon();
 
+        // --- SECONDARY DEFENSE FALLBACK ---
+        // If Lua didn't specify Saber Block, give them a level-based chance
         if (skillMod == "saber_block" && weapon != nullptr && weapon->isJediWeapon()) {
-             return getLevel(); 
+             return getLevel(); // Level 88 = 88% chance to ricochet
         }
-        
+
+        // --- ACCURACY FALLBACK ---
         if (skillMod.contains("accuracy")) {
              return 100 + (getLevel() * 2); 
+        }
+        
+        // --- PRIMARY DEFENSE FALLBACK ---
+        // If Lua is empty, do we want to boost their defense?
+        // Let's give "Boss" mobs (Level 80+) a small bump automatically.
+        if ((skillMod == "dodge_attack" || skillMod == "block") && getLevel() > 80) {
+            return 20; // Adds 20 to their base Level defense
         }
     }
 

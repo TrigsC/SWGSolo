@@ -8,10 +8,20 @@ light_jedi_sentinel = Creature:new {
 	level = 88,
 	--chanceHit = 30,
 	statistics = {
-        attack_accuracy = 100,      -- High accuracy (Mastery)
-        defense_base = 55,  -- General difficulty to hit
-        saber_block = 85,    -- % Chance to ricochet (Secondary Defense)
-        dodge_attack = 0,   -- Primary Defense
+        -- ACCURACY (Attacking)
+        attack_accuracy = 120,
+        melee_accuracy = 60,  -- Total 180 accuracy
+        
+        -- PRIMARY DEFENSE (Avoiding the hit)
+        -- Game adds Level (88) automatically. 
+        -- 88 + 40 = 128 (Hard Capped at 125).
+        dodge_attack = 40,    -- Used vs Ranged
+        block = 40,           -- Used vs Melee
+        counter_attack = 40,  -- Chance to counter-hit vs Melee
+        
+        -- SECONDARY DEFENSE (Mitigating the hit)
+        -- This is a flat % roll. 95 = 95% chance to reduce damage if hit.
+        saber_block = 95,
     },
 	damageMin = 500,
 	damageMax = 600,
