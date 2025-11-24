@@ -551,19 +551,16 @@ int AiAgentImplementation::getSkillMod(const String& skillMod) const {
         
         // --- LOGGING & RETURN LUA VALUE ---
         if (templateMod > 0) { 
-            // Only log for our test mob to keep console clean
-            if (getFirstName() == "light_jedi_sentinel") {
-                StringBuffer msg;
-                msg << "DEBUG AI DEFENSE: " << getFirstName() << " checking " << skillMod 
-                    << " -> Lua says: " << templateMod;
-                
-                // If it's a primary defense, remind us that Level is added automatically
-                if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "counter_attack") {
-                    msg << " (Total Defense will be " << getLevel() << " + " << templateMod << ")";
-                }
-                
-                info(msg.toString(), true); 
+            StringBuffer msg;
+            msg << "DEBUG AI DEFENSE: " << getFirstName() << " checking " << skillMod 
+                << " -> Lua says: " << templateMod;
+            
+            // If it's a primary defense, remind us that Level is added automatically
+            if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "counter_attack") {
+                msg << " (Total Defense will be " << getLevel() << " + " << templateMod << ")";
             }
+            
+            info(msg.toString(), true); 
             return templateMod;
         } 
 
