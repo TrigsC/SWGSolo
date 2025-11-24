@@ -2053,10 +2053,18 @@ int CombatManager::getDefenderDefenseModifier(CreatureObject* defender, WeaponOb
     }
 
 	for (int i = 0; i < defenseAccMods->size(); ++i) {
-		const String& mod = defenseAccMods->get(i);
-		targetDefense += defender->getSkillMod(mod);
-		targetDefense += defender->getSkillMod("private_" + mod);
-	}
+        const String& mod = defenseAccMods->get(i);
+        // We cast to AiAgent* to force the compiler to use your new code 
+        if (defender->isAiAgent()) {
+            AiAgent* aiDef = cast<AiAgent*>(defender);
+            targetDefense += aiDef->getSkillMod(mod);
+            targetDefense += aiDef->getSkillMod("private_" + mod);
+        } else {
+            // Standard player logic
+            targetDefense += defender->getSkillMod(mod);
+            targetDefense += defender->getSkillMod("private_" + mod);
+        }
+    }
 
 	debug() << "Base target defense is " << targetDefense;
 	StringBuffer msg;
@@ -2099,10 +2107,17 @@ int CombatManager::getDefenderSecondaryDefenseModifier(CreatureObject* defender)
 	const auto defenseAccMods = weapon->getDefenderSecondaryDefenseModifiers();
 
 	for (int i = 0; i < defenseAccMods->size(); ++i) {
-		const String& mod = defenseAccMods->get(i);
-		targetDefense += defender->getSkillMod(mod);
-		targetDefense += defender->getSkillMod("private_" + mod);
-	}
+        const String& mod = defenseAccMods->get(i);
+
+        if (defender->isAiAgent()) {
+            AiAgent* aiDef = cast<AiAgent*>(defender);
+            targetDefense += aiDef->getSkillMod(mod);
+            targetDefense += aiDef->getSkillMod("private_" + mod);
+        } else {
+            targetDefense += defender->getSkillMod(mod);
+            targetDefense += defender->getSkillMod("private_" + mod);
+        }
+    }
 
 	if (defender->isAiAgent()) {
         // If holding a Melee weapon (or Lightsaber), check BLOCK
