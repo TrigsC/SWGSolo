@@ -164,6 +164,10 @@ void CreatureTemplate::readObject(LuaObject* templateData) {
                 int value = (int)lua_tonumber(L, -1);
                 
                 statistics.put(key, value);
+				if (isTargetMob) {
+                    System::out << "TEMPLATE LOAD: light_jedi_sentinel loaded stat [" 
+                                << key << "] = " << value << endl;
+                }
             }
         }
     }
