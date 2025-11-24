@@ -2038,6 +2038,20 @@ int CombatManager::getDefenderDefenseModifier(CreatureObject* defender, WeaponOb
 
 	const auto defenseAccMods = weapon->getDefenderDefenseModifiers();
 
+	if (defender->isAiAgent()) {
+        StringBuffer msg;
+        msg << "DEBUG WEAPON CHECK: Attacker's weapon has " << defenseAccMods->size() << " modifiers.";
+        if (defenseAccMods->size() > 0) {
+            msg << " It will ask for: ";
+            for (int i = 0; i < defenseAccMods->size(); ++i) {
+                msg << defenseAccMods->get(i) << " ";
+            }
+        } else {
+            msg << " (The AI will receive NO bonus defense because the list is empty)";
+        }
+        info(msg.toString(), true);
+    }
+
 	for (int i = 0; i < defenseAccMods->size(); ++i) {
 		const String& mod = defenseAccMods->get(i);
 		targetDefense += defender->getSkillMod(mod);
@@ -2046,7 +2060,7 @@ int CombatManager::getDefenderDefenseModifier(CreatureObject* defender, WeaponOb
 
 	debug() << "Base target defense is " << targetDefense;
 	StringBuffer msg;
-    msg << "Base target defense is " << targetDefense;
+	msg << "DEBUG AI DEFENSE: " << defender->getFirstName() << " checking baseMod " << baseMod;
 	info(msg.toString(), true);
 
 	// defense hardcap
