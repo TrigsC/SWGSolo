@@ -552,10 +552,8 @@ int AiAgentImplementation::getSkillMod(const String& skillMod) const {
         
         if (templateMod > 0)
 			// --- LOGGING START ---
-            // Only log if it's the mob we are testing to prevent spam
             StringBuffer msg;
-            msg << "DEBUG AI STATS: " << getFirstName() << " requesting " << skillMod 
-                << " -> Found in Lua: " << templateMod;
+            msg << "DEBUG AI STATS: " << getFirstName() << " requesting " << skillMod << " -> Found in Lua: " << templateMod;
             info(msg.toString(), true); // 'true' forces it to print to console
             // --- LOGGING END ---
             return templateMod;
