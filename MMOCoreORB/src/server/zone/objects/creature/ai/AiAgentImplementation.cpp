@@ -564,7 +564,7 @@ int AiAgentImplementation::getSkillMod(const String& skillMod) const {
                 << " -> Lua says: " << templateMod;
             
             // If it's a primary defense, remind us that Level is added automatically
-            if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "counter_attack") {
+            if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "melee_defense" || skillMod == "ranged_defense" || skillMod == "jedi_toughness" || skillMod == "lightsaber_toughness") {
                 msg << " (Total Defense will be " << getLevel() << " + " << templateMod << ")";
             }
             
