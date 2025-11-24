@@ -2098,15 +2098,16 @@ int CombatManager::getDefenderDefenseModifier(CreatureObject* defender, WeaponOb
 }
 
 int CombatManager::getDefenderSecondaryDefenseModifier(CreatureObject* defender) const {
-	if (defender->isIntimidated() || defender->isBerserked() || defender->isVehicleObject())
-		return 0;
+    if (defender->isIntimidated() || defender->isBerserked() || defender->isVehicleObject())
+        return 0;
 
-	int targetDefense = defender->getLevel();
-	ManagedReference<WeaponObject*> weapon = defender->getWeapon();
+    int targetDefense = defender->getLevel();
+    ManagedReference<WeaponObject*> weapon = defender->getWeapon();
 
-	const auto defenseAccMods = weapon->getDefenderSecondaryDefenseModifiers();
+    const auto defenseAccMods = weapon->getDefenderSecondaryDefenseModifiers();
 
-	for (int i = 0; i < defenseAccMods->size(); ++i) {
+    // Loop through weapon mods (Standard Logic)
+    for (int i = 0; i < defenseAccMods->size(); ++i) {
         const String& mod = defenseAccMods->get(i);
 
         if (defender->isAiAgent()) {
@@ -2119,27 +2120,33 @@ int CombatManager::getDefenderSecondaryDefenseModifier(CreatureObject* defender)
         }
     }
 
-	if (defender->isAiAgent()) {
+    // --- AI FORCE BLOCK/DODGE ---
+    if (defender->isAiAgent()) {
+        // CRITICAL FIX: Cast to AiAgent* so we call the Child function (Lua stats), not the Parent function (0)
+        AiAgent* aiDef = cast<AiAgent*>(defender); 
+        
         // If holding a Melee weapon (or Lightsaber), check BLOCK
         if (weapon->isMeleeWeapon() || weapon->isJediWeapon()) {
-            targetDefense += defender->getSkillMod("block");
+            targetDefense += aiDef->getSkillMod("block");
         }
         // If holding a Ranged weapon, check DODGE
         else {
-             targetDefense += defender->getSkillMod("dodge");
+             targetDefense += aiDef->getSkillMod("dodge");
         }
         
         // Always check Counter Attack (some masters have this)
-        targetDefense += defender->getSkillMod("counter_attack");
+        targetDefense += aiDef->getSkillMod("counter_attack");
     }
-	StringBuffer msg;
-	msg << "DEBUG AI SECONDARY DEFENSE: " << defender->getFirstName() << " checking defenderDefense " << targetDefense;
-	info(msg.toString(), true);
+    // ----------------------------
 
-	if (targetDefense > 125)
-		targetDefense = 125;
+    StringBuffer msg;
+    msg << "DEBUG AI SECONDARY DEFENSE: " << defender->getFirstName() << " checking defenderDefense " << targetDefense;
+    info(msg.toString(), true);
 
-	return targetDefense;
+    if (targetDefense > 125)
+        targetDefense = 125;
+
+    return targetDefense;
 }
 
 /*
