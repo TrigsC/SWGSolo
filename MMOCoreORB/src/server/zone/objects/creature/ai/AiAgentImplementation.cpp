@@ -550,13 +550,14 @@ int AiAgentImplementation::getSkillMod(const String& skillMod) const {
         // Check Lua "statistics" map
         int templateMod = npcTemplate->getStatistic(skillMod); 
         
-        if (templateMod > 0)
+        if (templateMod > 0) {
 			// --- LOGGING START ---
             StringBuffer msg;
             msg << "DEBUG AI STATS: " << getFirstName() << " requesting " << skillMod << " -> Found in Lua: " << templateMod;
             info(msg.toString(), true); // 'true' forces it to print to console
             // --- LOGGING END ---
             return templateMod;
+		}
 
         // 3. Fallback Heuristic Logic
         // We are in a @read function (const), but getWeapon() is not const.
