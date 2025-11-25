@@ -1137,12 +1137,12 @@ float CombatManager::calculateDamage(CreatureObject* attacker, WeaponObject* wea
 
 	damage += defender->getSkillMod("private_damage_susceptibility");
 
-	if (attacker->isPlayerCreature()) {
-		if (data.isForceAttack() && !defender->isPlayerCreature())
-			damage *= 2 + System::random(1);
-		else if (!data.isForceAttack())
-			damage *= 1.5;
-	}
+	//if (attacker->isPlayerCreature()) {
+	if (data.isForceAttack() && !defender->isPlayerCreature())
+		damage *= 2 + System::random(1);
+	else if (!data.isForceAttack())
+		damage *= 1.5;
+	//}
 
 	if (!data.isForceAttack() && weapon->getAttackType() == SharedWeaponObjectTemplate::MELEEATTACK)
 		damage *= 1.25;
@@ -1171,7 +1171,8 @@ float CombatManager::calculateDamage(CreatureObject* attacker, WeaponObject* wea
 	}
 
 	// PvP Damage Reduction.
-	if (attacker->isPlayerCreature() && defender->isPlayerCreature() && !data.isForceAttack())
+	//if (attacker->isPlayerCreature() && defender->isPlayerCreature() && !data.isForceAttack())
+	if (!data.isForceAttack())
 		damage *= 0.25;
 
 	if (damage < 1)
