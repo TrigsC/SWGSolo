@@ -2377,27 +2377,88 @@ int CombatManager::getSpeedModifier(CreatureObject* attacker, WeaponObject* weap
 	return speedMods;
 }
 
+float CombatManager::getDefenderToughnessModifier(CreatureObject* defender, int attackType, int damType, float damage) const {
+    ManagedReference<WeaponObject*> weapon = defender->getWeapon();
+    const auto defenseToughMods = weapon->getDefenderToughnessModifiers();
+
+    // 1. Check Weapon-specific toughness (Standard Logic)
+    if (attackType == weapon->getAttackType()) {
+        for (int i = 0; i < defenseToughMods->size(); ++i) {
+            String mod = defenseToughMods->get(i);
+            int toughMod = 0;
+
+            // FIX: Force AI Cast to read Lua
+            if (defender->isAiAgent()) {
+                toughMod = cast<AiAgent*>(defender)->getSkillMod(mod);
+            } else {
+                toughMod = defender->getSkillMod(mod);
+            }
+
+            if (toughMod > 0)
+                damage *= 1.f - (toughMod / 100.f);
+        }
+    }
+
+    // 2. Check Jedi Toughness
+    int jediToughness = 0;
+    
+    // FIX: Force AI Cast to read Lua for jedi_toughness
+    if (defender->isAiAgent()) {
+        jediToughness = cast<AiAgent*>(defender)->getSkillMod("jedi_toughness");
+    } else {
+        jediToughness = defender->getSkillMod("jedi_toughness");
+    }
+
+    if (damType != SharedWeaponObjectTemplate::LIGHTSABER && jediToughness > 0)
+        damage *= 1.f - (jediToughness / 100.f);
+
+    // 3. Code for Lightsaber Toughness
+    //if (damType == SharedWeaponObjectTemplate::LIGHTSABER) {
+    //    int lsToughness = 0;
+//
+    //    // FIX: Force AI Cast to read Lua for lightsaber_toughness
+    //    if (defender->isAiAgent()) {
+    //        lsToughness = cast<AiAgent*>(defender)->getSkillMod("lightsaber_toughness");
+    //        
+    //        // Debug Log to prove it works
+    //        if (lsToughness > 0 && (defender->getFirstName().contains("Jedi") || defender->getLastName().contains("Jedi"))) {
+    //             // Uncomment if you want to see it in console:
+    //             // StringBuffer msg;
+    //             // msg << "DEBUG TOUGHNESS: AI " << defender->getFirstName() << " reducing saber damage by " << lsToughness << "%";
+    //             // cast<AiAgent*>(defender)->info(msg.toString(), true);
+    //        }
+    //    } else {
+    //        lsToughness = defender->getSkillMod("lightsaber_toughness");
+    //    }
+//
+    //    if (lsToughness > 0)
+    //         damage *= 1.f - (lsToughness / 100.f);
+    //}
+
+    return damage < 0 ? 0 : damage;
+}
+
 // Toughness Mitigation
 
-float CombatManager::getDefenderToughnessModifier(CreatureObject* defender, int attackType, int damType, float damage) const {
-	ManagedReference<WeaponObject*> weapon = defender->getWeapon();
-
-	const auto defenseToughMods = weapon->getDefenderToughnessModifiers();
-
-	if (attackType == weapon->getAttackType()) {
-		for (int i = 0; i < defenseToughMods->size(); ++i) {
-			int toughMod = defender->getSkillMod(defenseToughMods->get(i));
-			if (toughMod > 0)
-				damage *= 1.f - (toughMod / 100.f);
-		}
-	}
-
-	int jediToughness = defender->getSkillMod("jedi_toughness");
-	if (damType != SharedWeaponObjectTemplate::LIGHTSABER && jediToughness > 0)
-		damage *= 1.f - (jediToughness / 100.f);
-
-	return damage < 0 ? 0 : damage;
-}
+//float CombatManager::getDefenderToughnessModifier(CreatureObject* defender, int attackType, int damType, float damage) const {
+//	ManagedReference<WeaponObject*> weapon = defender->getWeapon();
+//
+//	const auto defenseToughMods = weapon->getDefenderToughnessModifiers();
+//
+//	if (attackType == weapon->getAttackType()) {
+//		for (int i = 0; i < defenseToughMods->size(); ++i) {
+//			int toughMod = defender->getSkillMod(defenseToughMods->get(i));
+//			if (toughMod > 0)
+//				damage *= 1.f - (toughMod / 100.f);
+//		}
+//	}
+//
+//	int jediToughness = defender->getSkillMod("jedi_toughness");
+//	if (damType != SharedWeaponObjectTemplate::LIGHTSABER && jediToughness > 0)
+//		damage *= 1.f - (jediToughness / 100.f);
+//
+//	return damage < 0 ? 0 : damage;
+//}
 
 /*
 
@@ -3227,7 +3288,7 @@ void CombatManager::applyStates(CreatureObject* creature, CreatureObject* target
                         failed = true;
                         
                         // Debugging to see the "Second Chance" save the AI
-                        if (isJediAI && cast<AiAgent*>(targetCreature)->getFirstName().contains("Jedi")) {
+                        if (isJediAI && (cast<AiAgent*>(targetCreature)->getFirstName().contains("Jedi") || cast<AiAgent*>(targetCreature)->getLastName().contains("Jedi"))) {
                              cast<AiAgent*>(targetCreature)->info("DEBUG STATE: Jedi State Defense Triggered! Resisted state via Second Chance.", true);
                         }
                         
