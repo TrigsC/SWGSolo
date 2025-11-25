@@ -3088,7 +3088,6 @@ void CombatManager::applyStates(CreatureObject* creature, CreatureObject* target
 				playerLevel = pManager->calculatePlayerLevel(targetCreature) - 5;
 			}
 		}
-	}
 	} else if (targetCreature->isAiAgent()) {
         // AI Agents get their full level as a defense bonus against states
         defenseLevelBonus = targetCreature->getLevel();
