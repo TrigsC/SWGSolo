@@ -1215,7 +1215,7 @@ float CombatManager::calculateDamage(CreatureObject* attacker, WeaponObject* wea
 
 	damage = applyDamageModifiers(attacker, weapon, damage, data);
 
-	if (attacker->isPlayerCreature())
+	if (attacker->isPlayerCreature() || attacker->isAiAgent())
 		damage *= 1.5;
 
 	if (!data.isForceAttack() && weapon->getAttackType() == SharedWeaponObjectTemplate::MELEEATTACK)
@@ -2068,9 +2068,6 @@ int CombatManager::getDefenderDefenseModifier(CreatureObject* defender, WeaponOb
     }
 
 	debug() << "Base target defense is " << targetDefense;
-	StringBuffer msg;
-	msg << "DEBUG AI DEFENSE: " << defender->getFirstName() << " checking targetDefense " << targetDefense;
-	info(msg.toString(), true);
 
 	// defense hardcap
 	if (targetDefense > 125)
@@ -2094,6 +2091,9 @@ int CombatManager::getDefenderDefenseModifier(CreatureObject* defender, WeaponOb
     }
 
 	debug() << "Target defense after state affects and cap is " << targetDefense;
+	StringBuffer msg;
+	msg << "DEBUG AI DEFENSE: " << defender->getFirstName() << " checking targetDefense " << targetDefense;
+	info(msg.toString(), true);
 
 	return targetDefense;
 }
@@ -3089,6 +3089,10 @@ void CombatManager::applyStates(CreatureObject* creature, CreatureObject* target
 			}
 		}
 	}
+	} else if (targetCreature->isAiAgent()) {
+        // AI Agents get their full level as a defense bonus against states
+        defenseLevelBonus = targetCreature->getLevel();
+    }
 
 #ifdef DEBUG_STATES
 	StringBuffer stateDebug;
@@ -3140,9 +3144,16 @@ void CombatManager::applyStates(CreatureObject* creature, CreatureObject* target
 			const Vector<String>& defenseMods = effect.getDefenderStateDefenseModifiers();
 			// add up all defenses against the state the target has
 			for (int j = 0; j < defenseMods.size(); j++) {
-				targetDefense += targetCreature->getSkillMod(defenseMods.get(j));
-			}
-
+                const String& mod = defenseMods.get(j);
+                
+                if (targetCreature->isAiAgent()) {
+                    AiAgent* aiDef = cast<AiAgent*>(targetCreature);
+                    targetDefense += aiDef->getSkillMod(mod);
+                } else {
+                    targetDefense += targetCreature->getSkillMod(mod);
+                }
+            }
+		
 #ifdef DEBUG_STATES
 			stateDebug << " - Target Defense Base = " << targetDefense << "\n";
 #endif
@@ -3255,7 +3266,12 @@ void CombatManager::applyStates(CreatureObject* creature, CreatureObject* target
 
 		// now check combat equilibrium
 		if (!failed && (effectType == CommandEffect::KNOCKDOWN || effectType == CommandEffect::POSTUREDOWN || effectType == CommandEffect::POSTUREUP)) {
-			int combatEquil = targetCreature->getSkillMod("combat_equillibrium");
+			int combatEquil = 0;
+            if (targetCreature->isAiAgent()) {
+                 combatEquil = cast<AiAgent*>(targetCreature)->getSkillMod("combat_equillibrium");
+            } else {
+                 combatEquil = targetCreature->getSkillMod("combat_equillibrium");
+            }
 
 			if (combatEquil > 100) {
 				combatEquil = 100;
