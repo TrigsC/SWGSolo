@@ -93,9 +93,9 @@
 #include "server/zone/objects/creature/commands/JediQueueCommand.h"
 
 // #define DEBUG
-#define DEBUG_AI_WEAPONS
-#define DEBUG_AI_HEAL
-#define DEBUG_AI_ATTACK
+//#define DEBUG_AI_WEAPONS
+//#define DEBUG_AI_HEAL
+//#define DEBUG_AI_ATTACK
 
 // #define DEBUG_PATHING
 // #define SHOW_PATH
