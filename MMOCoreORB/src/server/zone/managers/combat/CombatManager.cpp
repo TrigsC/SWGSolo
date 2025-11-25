@@ -3220,10 +3220,6 @@ void CombatManager::applyStates(CreatureObject* creature, CreatureObject* target
                     // ---------------------
 
                     targetDefense /= 1.5;
-                    
-                    // Note: Ensure you use the variable name from the previous step 
-                    // (either 'playerLevel' or 'defenseLevelBonus' if you renamed it)
-                    targetDefense += defenseLevelBonus; 
 
                     calc = (int)(accuracyMod - targetDefense);
 
