@@ -79,7 +79,7 @@ rebelRewardData = {
 	hirelingList = {
 		"rebel_trooper", "senior_specforce_heavy_weapons_specialist", "senior_specforce_infiltrator", "senior_specforce_marine", "senior_specforce_pathfinder", "senior_specforce_technician",
 		"senior_specforce_urban_guerrilla", "senior_specforce_wilderness_fighter", "specforce_heavy_weapons_specialist", "specforce_infiltrator", "specforce_interrogator", "specforce_marine",
-		"specforce_procurement_specialist", "specforce_technician",	"specforce_wilderness_operative", "rebel_specforce_guerrilla",
+		"specforce_procurement_specialist", "specforce_technician",	"specforce_wilderness_operative", "rebel_specforce_guerrilla","jedi_padawan_companion",
 	},
 
 	hirelings = {
@@ -99,6 +99,13 @@ rebelRewardData = {
 		specforce_technician = { type=factionRewardType.hireling, display="@mob/creature_names:specforce_technician", item="object/intangible/pet/pet_control.iff", controlledObjectTemplate="specforce_technician", cost=375},
 		specforce_wilderness_operative = { type=factionRewardType.hireling, display="@mob/creature_names:specforce_wilderness_operative", item="object/intangible/pet/pet_control.iff", controlledObjectTemplate="specforce_wilderness_operative", cost=375},
 		rebel_specforce_guerrilla = { type=factionRewardType.hireling, display="@mob/creature_names:rebel_specforce_guerrilla", item="object/intangible/pet/pet_control.iff", controlledObjectTemplate="rebel_specforce_urban_guerrilla", cost=375},
+		jedi_padawan_companion = { 
+			type = factionRewardType.hireling, 
+			display = "Jedi Padawan Companion", -- You can use a raw string here for testing, or a string_id like "@mob/creature_names:padawan"
+			item = "object/intangible/pet/pet_control.iff", -- KEEP THIS AS IS. This puts it in the Datapad.
+			controlledObjectTemplate = "object/mobile/light_jedi_padawan.iff", -- <--- THIS MUST MATCH YOUR CUSTOM FILE
+			cost = 100 -- Cheap for testing
+		},
 	},
 
 	schematicList = {
