@@ -3090,7 +3090,7 @@ void CombatManager::applyStates(CreatureObject* creature, CreatureObject* target
 		}
 	} else if (targetCreature->isAiAgent()) {
         // AI Agents get their full level as a defense bonus against states
-        defenseLevelBonus = targetCreature->getLevel();
+        playerLevel = targetCreature->getLevel() - 5;
     }
 
 #ifdef DEBUG_STATES
@@ -3192,24 +3192,53 @@ void CombatManager::applyStates(CreatureObject* creature, CreatureObject* target
 			}
 
 			// no reason to apply jedi defenses if primary defense was successful
-			// and only perform extra rolls if the character is a Jedi
-			if (!failed && targetCreature->isPlayerCreature() && targetCreature->getPlayerObject()->isJedi()) {
-				const Vector<String>& jediMods = effect.getDefenderJediStateDefenseModifiers();
-				// second chance for jedi, roll against their special defenses jedi_state_defense & resistance_states
-				for (int j = 0; j < jediMods.size(); j++) {
-					targetDefense = targetCreature->getSkillMod(jediMods.get(j));
+            // and only perform extra rolls if the character is a Jedi OR a high-level AI setup as a Jedi
+            bool isJediPlayer = targetCreature->isPlayerCreature() && targetCreature->getPlayerObject()->isJedi();
+            bool isJediAI = false;
+            
+            // For AI, we check if they have the specific "Jedi" state defense stat in their Lua
+            if (targetCreature->isAiAgent()) {
+                 // Check using the override we built
+                 if (cast<AiAgent*>(targetCreature)->getSkillMod("jedi_state_defense") > 0) {
+                     isJediAI = true;
+                 }
+            }
 
-					targetDefense /= 1.5;
-					targetDefense += playerLevel;
+            if (!failed && (isJediPlayer || isJediAI)) {
+                const Vector<String>& jediMods = effect.getDefenderJediStateDefenseModifiers();
+                
+                // second chance for jedi, roll against their special defenses jedi_state_defense & resistance_states
+                for (int j = 0; j < jediMods.size(); j++) {
+                    String mod = jediMods.get(j);
+                    
+                    // --- FORCE AI CAST ---
+                    if (targetCreature->isAiAgent()) {
+                        targetDefense = cast<AiAgent*>(targetCreature)->getSkillMod(mod);
+                    } else {
+                        targetDefense = targetCreature->getSkillMod(mod);
+                    }
+                    // ---------------------
 
-					calc = (int)(accuracyMod - targetDefense);
+                    targetDefense /= 1.5;
+                    
+                    // Note: Ensure you use the variable name from the previous step 
+                    // (either 'playerLevel' or 'defenseLevelBonus' if you renamed it)
+                    targetDefense += defenseLevelBonus; 
 
-					if (roll > calc) {
-						failed = true;
-						break;
-					}
-				}
-			}
+                    calc = (int)(accuracyMod - targetDefense);
+
+                    if (roll > calc) {
+                        failed = true;
+                        
+                        // Debugging to see the "Second Chance" save the AI
+                        if (isJediAI && cast<AiAgent*>(targetCreature)->getFirstName().contains("Jedi")) {
+                             cast<AiAgent*>(targetCreature)->info("DEBUG STATE: Jedi State Defense Triggered! Resisted state via Second Chance.", true);
+                        }
+                        
+                        break;
+                    }
+                }
+            }
 		}
 
 		if (!failed) {
