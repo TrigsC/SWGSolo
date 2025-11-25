@@ -1,5 +1,5 @@
 jedi_padawan = Creature:new {
-    objectName = "@mob/creature_names:light_jedi_sentinel", -- Changed from string_id to raw text for testing
+    objectName = "Jedi Padawan", -- Changed from string_id to raw text for testing
     randomNameType = NAME_GENERIC,
     randomNameTag = true,
     mobType = MOB_NPC,
@@ -79,4 +79,4 @@ jedi_padawan = Creature:new {
     }
 }
 
-CreatureTemplates:addCreatureTemplate(jedi_padawan, "jedi_padawan")
+CreatureTemplates:addCreatureTemplate(jedi_padawan, "object/mobile/light_jedi_sentinel.iff")
