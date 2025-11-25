@@ -1,5 +1,5 @@
 jedi_padawan = Creature:new {
-    objectName = "Jedi Padawan Companion", -- Changed from string_id to raw text for testing
+    objectName = "@mob/creature_names:light_jedi_sentinel", -- Changed from string_id to raw text for testing
     randomNameType = NAME_GENERIC,
     randomNameTag = true,
     mobType = MOB_NPC,
