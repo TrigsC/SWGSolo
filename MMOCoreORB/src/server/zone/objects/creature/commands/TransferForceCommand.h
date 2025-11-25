@@ -1,110 +1,148 @@
-/*
-				Copyright <SWGEmu>
-		See file COPYING for copying conditions.*/
-
 #ifndef TRANSFERFORCECOMMAND_H_
 #define TRANSFERFORCECOMMAND_H_
 
 #include "server/zone/objects/scene/SceneObject.h"
 #include "server/zone/managers/frs/FrsManager.h"
+#include "server/zone/objects/creature/ai/AiAgent.h"
 
 class TransferForceCommand : public CombatQueueCommand {
 public:
 
-	TransferForceCommand(const String& name, ZoneProcessServer* server) : CombatQueueCommand(name, server) {
-	}
+    TransferForceCommand(const String& name, ZoneProcessServer* server) : CombatQueueCommand(name, server) {
+    }
 
-	int doQueueCommand(CreatureObject* creature, const uint64& target, const UnicodeString& arguments) const {
-		if (!checkStateMask(creature))
-			return INVALIDSTATE;
+    int doQueueCommand(CreatureObject* creature, const uint64& target, const UnicodeString& arguments) const {
+        if (!checkStateMask(creature))
+            return INVALIDSTATE;
 
-		if (!checkInvalidLocomotions(creature))
-			return INVALIDLOCOMOTION;
+        if (!checkInvalidLocomotions(creature))
+            return INVALIDLOCOMOTION;
 
-		if (isWearingArmor(creature)) {
-			return NOJEDIARMOR;
-		}
+        if (isWearingArmor(creature)) {
+            return NOJEDIARMOR;
+        }
 
-		ManagedReference<SceneObject*> object = server->getZoneServer()->getObject(target);
+        ManagedReference<SceneObject*> object = server->getZoneServer()->getObject(target);
 
-		// Fail if target is not a player...
-		if (object == nullptr || !object->isPlayerCreature())
-			return INVALIDTARGET;
+        if (object == nullptr || !object->isCreatureObject())
+            return INVALIDTARGET;
 
-		CreatureObject* targetCreature = cast<CreatureObject*>(object.get());
+        CreatureObject* targetCreature = cast<CreatureObject*>(object.get());
 
-		if (targetCreature == nullptr || targetCreature->isDead() || targetCreature->isIncapacitated())
-			return INVALIDTARGET;
+        if (targetCreature == nullptr || targetCreature->isDead() || targetCreature->isIncapacitated())
+            return INVALIDTARGET;
 
-		if (!CollisionManager::checkLineOfSight(creature, targetCreature)) {
-			creature->sendSystemMessage("@combat_effects:cansee_fail");//You cannot see your target.
-			return GENERALERROR;
-		}
+        // Allow Players or AI
+        if (!targetCreature->isPlayerCreature() && !targetCreature->isAiAgent())
+            return INVALIDTARGET;
 
-		if (!checkDistance(creature, targetCreature, range))
-			return TOOFAR;
+        if (!CollisionManager::checkLineOfSight(creature, targetCreature)) {
+            creature->sendSystemMessage("@combat_effects:cansee_fail");
+            return GENERALERROR;
+        }
 
-		if (!playerEntryCheck(creature, targetCreature)) {
-			return GENERALERROR;
-		}
+        if (!checkDistance(creature, targetCreature, range))
+            return TOOFAR;
 
-		Locker clocker(targetCreature, creature);
+        if (targetCreature->isPlayerCreature() && !playerEntryCheck(creature, targetCreature)) {
+            return GENERALERROR;
+        }
 
-		ManagedReference<PlayerObject*> targetGhost = targetCreature->getPlayerObject();
-		ManagedReference<PlayerObject*> playerGhost = creature->getPlayerObject();
+        Locker clocker(targetCreature, creature);
 
-		if (targetGhost == nullptr || playerGhost == nullptr)
-			return GENERALERROR;
+        ManagedReference<PlayerObject*> targetGhost = targetCreature->getPlayerObject();
+        ManagedReference<PlayerObject*> playerGhost = creature->getPlayerObject();
 
-		if (targetGhost == playerGhost)
-			return GENERALERROR;
+        if (creature->isPlayerCreature() && playerGhost == nullptr) return GENERALERROR;
+        if (targetCreature->isPlayerCreature() && targetGhost == nullptr) return GENERALERROR;
+        
+        // Prevent transfer to self
+        if (creature == targetCreature) return GENERALERROR;
 
-		int transfer = System::random(75) + minDamage; //Value set in command lua
+        int transfer = System::random(75) + minDamage; 
 
-		FrsManager* frsManager = server->getZoneServer()->getFrsManager();
+        if (checkForArenaDuel(targetCreature)) {
+            creature->sendSystemMessage("@jedi_spam:no_help_target"); 
+            return GENERALERROR;
+        }
 
-		if (checkForArenaDuel(targetCreature)) {
-			creature->sendSystemMessage("@jedi_spam:no_help_target"); // You are not permitted to help that target.
-			return GENERALERROR;
-		}
+        if (!targetCreature->isHealableBy(creature)) {
+            creature->sendSystemMessage("@healing:pvp_no_help"); 
+            return GENERALERROR;
+        }
 
-		if (!targetCreature->isHealableBy(creature)) {
-			creature->sendSystemMessage("@healing:pvp_no_help"); // It would be unwise to help such a patient.
-			return GENERALERROR;
-		}
+        // 1. CHECK ATTACKER FORCE
+        int attackerForce = 0;
+        if (creature->isPlayerCreature()) {
+            attackerForce = playerGhost->getForcePower();
+        } else if (creature->isAiAgent()) {
+            // AI LOGIC UPDATE
+            attackerForce = cast<AiAgent*>(creature)->getCurrentForce();
+        }
 
-		if (playerGhost->getForcePower() < forceCost) {
-			creature->sendSystemMessage("@jedi_spam:no_force_power"); //You do not have enough force to do that.
-			return GENERALERROR;
-		}
+        if (attackerForce < forceCost) {
+            creature->sendSystemMessage("@jedi_spam:no_force_power"); 
+            return GENERALERROR;
+        }
 
-		int forceSpace = targetGhost->getForcePowerMax() - targetGhost->getForcePower();
-		int forceTransfer = 0;
+        // 2. CHECK TARGET CAPACITY
+        int targetCurrentForce = 0;
+        int targetMaxForce = 0;
 
-		if (forceSpace > 0) { //Only allows amount to be transfered that the target can hold and fails if target has full Force.
-			forceTransfer = forceSpace >= transfer ? transfer : forceSpace;
-		} else {
-			return GENERALERROR;
-		}
+        if (targetCreature->isPlayerCreature()) {
+            targetCurrentForce = targetGhost->getForcePower();
+            targetMaxForce = targetGhost->getForcePowerMax();
+        } else if (targetCreature->isAiAgent()) {
+            // AI LOGIC UPDATE
+            AiAgent* agent = cast<AiAgent*>(targetCreature);
+            targetCurrentForce = agent->getCurrentForce();
+            // TODO: Verify your IDL has getMaxForce(). If not, replace this call.
+            targetMaxForce = agent->getMaxForce();
+        }
 
-		targetGhost->setForcePower(targetGhost->getForcePower() + forceTransfer);
-		playerGhost->setForcePower(playerGhost->getForcePower() - forceCost);
+        int forceSpace = targetMaxForce - targetCurrentForce;
+        int forceTransfer = 0;
 
-		uint32 animCRC = getAnimationString().hashCode();
-		creature->doCombatAnimation(targetCreature, animCRC, 0x1, 0xFF);
-		CombatManager::instance()->broadcastCombatSpam(creature, targetCreature, nullptr, forceTransfer, "cbt_spam", combatSpam, 0);
+        if (forceSpace > 0) { 
+            forceTransfer = forceSpace >= transfer ? transfer : forceSpace;
+        } else {
+            return GENERALERROR; // Target full
+        }
 
-		VisibilityManager::instance()->increaseVisibility(creature, visMod);
+        // 3. APPLY CHANGES
+        
+        // Remove Cost from Caster
+        if (creature->isPlayerCreature()) {
+            playerGhost->setForcePower(attackerForce - forceCost);
+        } else if (creature->isAiAgent()) {
+            // AI LOGIC UPDATE
+            cast<AiAgent*>(creature)->setCurrentForce(attackerForce - forceCost);
+        }
 
-		if (ConfigManager::instance()->useCovertOvertSystem())
-			checkForTef(creature, targetCreature);
+        // Add Transfer to Target
+        if (targetCreature->isPlayerCreature()) {
+            targetGhost->setForcePower(targetCurrentForce + forceTransfer);
+        } else if (targetCreature->isAiAgent()) {
+            // AI LOGIC UPDATE
+            cast<AiAgent*>(targetCreature)->setCurrentForce(targetCurrentForce + forceTransfer);
+        }
 
-		return SUCCESS;
-	}
+        uint32 animCRC = getAnimationString().hashCode();
+        creature->doCombatAnimation(targetCreature, animCRC, 0x1, 0xFF);
+        CombatManager::instance()->broadcastCombatSpam(creature, targetCreature, nullptr, forceTransfer, "cbt_spam", combatSpam, 0);
 
-	float getCommandDuration(CreatureObject* object, const UnicodeString& arguments) const {
-		return defaultTime;
-	}
+        if (creature->isPlayerCreature()) {
+            VisibilityManager::instance()->increaseVisibility(creature, visMod);
+            if (ConfigManager::instance()->useCovertOvertSystem())
+                checkForTef(creature, targetCreature);
+        }
+
+        return SUCCESS;
+    }
+
+    float getCommandDuration(CreatureObject* object, const UnicodeString& arguments) const {
+        return defaultTime;
+    }
 
 };
 
