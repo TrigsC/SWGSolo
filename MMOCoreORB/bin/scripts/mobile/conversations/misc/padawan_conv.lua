@@ -1,21 +1,23 @@
--- Define the Template
+-- Define the Template Object
 padawanConvoTemplate = ConvoTemplate:new {
-    initialScreen = "init_chat",
+    initialScreen = "padawan_init", -- Must match the screen ID below
     templateType = "Lua",
-    luaClassHandler = "padawanConvHandler",
+    luaClassHandler = "padawanConvoHandler", -- Must match the Object name in your Handler file
     screens = {}
 }
 
--- Define the Init Screen (What he says when you click him)
-init_chat = ConvoScreen:new {
-    id = "init_chat",
-    leftDialog = "", -- We will set this dynamically
-    customDialogText = "I am listening, Master. (AI System Online)",
-    stopConversation = "true", -- Close the window immediately, we just needed the trigger
+-- Define the Init Screen
+padawan_init = ConvoScreen:new {
+    id = "padawan_init",
+    leftDialog = "", 
+    customDialogText = "System: AI Neural Link Established.", -- Text shown when you click him
+    stopConversation = "true", -- Close window immediately (we just want the trigger)
     options = {}
 }
 
-padawanConvoTemplate:addScreen(init_chat);
+-- Add Screen to Template
+padawanConvoTemplate:addScreen(padawan_init);
 
--- Register the Template
-addConversationTemplate(padawanConvoTemplate, "padawanConvoTemplate");
+-- Register Template
+-- CRITICAL FIX: Name String FIRST, Object SECOND
+addConversationTemplate("padawanConvoTemplate", padawanConvoTemplate);
