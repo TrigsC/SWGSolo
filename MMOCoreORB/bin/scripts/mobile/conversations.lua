@@ -317,7 +317,7 @@ includeFile("conversations/pet/pets_conv.lua")
 -- Misc
 includeFile("conversations/misc/bartender_conv.lua")
 includeFile("conversations/misc/philosopher_conv.lua")
-includeFile("conversations/misc/padawan_conv.lua")
+--includeFile("conversations/misc/padawan_conv.lua")
 
 -- Junk Dealers
 includeFile("conversations/junk_dealer/junk_dealer_generic_conv.lua")
