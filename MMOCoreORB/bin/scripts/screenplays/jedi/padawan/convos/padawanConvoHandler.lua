@@ -1,5 +1,3 @@
-local ObjectManager = require("managers.object.object_manager")
-
 padawanConvoHandler = Object:new {
 }
 
