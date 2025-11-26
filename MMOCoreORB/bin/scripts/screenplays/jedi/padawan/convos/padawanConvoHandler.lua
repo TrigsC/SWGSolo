@@ -1,3 +1,6 @@
+print("###################################################")
+print("CRITICAL DEBUG: LOADING padawanConvoHandler FILE")
+print("###################################################")
 padawanConvoHandler = Object:new {
 }
 
