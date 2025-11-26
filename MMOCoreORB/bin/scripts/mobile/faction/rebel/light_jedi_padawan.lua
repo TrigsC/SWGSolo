@@ -57,7 +57,7 @@ light_jedi_padawan = Creature:new {
     },
 
     -- VISUALS
-    templates = { "object/mobile/shared_light_jedi_sentinel.iff" },
+    templates = { "light_jedi" },
     lootGroups = {},
 
     -- WEAPONS
