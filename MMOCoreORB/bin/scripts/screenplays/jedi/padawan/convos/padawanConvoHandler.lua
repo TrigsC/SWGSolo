@@ -11,7 +11,7 @@ function padawanConvoHandler:runScreenHandlers(pConvTemplate, pPlayer, pNpc, sel
     local screen = LuaConversationScreen(pConvScreen)
     local screenID = screen:getScreenID()
 
-    if (screenID == "padawan_init") then
+    if (screenID == "init") then
         
         -- DEBUG CHECK: Is the constant nil?
         if (SPATIALCHATRECEIVED == nil) then
