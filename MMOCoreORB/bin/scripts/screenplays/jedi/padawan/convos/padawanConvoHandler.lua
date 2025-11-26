@@ -1,5 +1,5 @@
 -- 1. Include the base class (REQUIRED for the C++ bindings to work right)
-includeFile("conversations/conv_handler.lua")
+local ObjectManager = require("managers.object.object_manager")
 
 -- 2. Define the Handler inheriting from conv_handler
 padawanConvoHandler = conv_handler:new {}
