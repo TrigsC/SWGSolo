@@ -48,8 +48,8 @@ function padawanConvoHandler:notifySpatialChatReceived(pNpc, pObserver, pChatMes
 
     if string.find(string.lower(message), "padawan") then
         local safeMessage = string.gsub(message, "\"", "")
-        local pythonScript = "/home/swgemu/Core3/MMOCoreORB/bin/scripts/managers/jedi/my_python.py"
-        local command = "python3.9 " .. pythonScript .. " \"" .. safeMessage .. "\""
+        --local pythonScript = "/home/swgemu/Core3/MMOCoreORB/bin/scripts/managers/jedi/my_python.py"
+        --local command = "python3.9 " .. pythonScript .. " \"" .. safeMessage .. "\""
         
         print("[PADAWAN] Running Python: " .. command)
         
