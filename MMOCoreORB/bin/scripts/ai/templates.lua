@@ -8,7 +8,6 @@ includeFile("eventControl.lua")
 includeFile("pet.lua")
 includeFile("static.lua")
 includeFile("villageRaider.lua")
-includeFile("padawan_brain.lua")
 
 customMap = {
 	{ "crackdown", {

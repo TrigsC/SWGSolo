@@ -47,21 +47,24 @@ function padawanConvoHandler:notifySpatialChatReceived(pNpc, pObserver, pChatMes
     print("[PADAWAN] Heard: " .. message)
 
     if string.find(string.lower(message), "padawan") then
+        print("[PADAWAN] Keyword Detected! Sending response...")
         local safeMessage = string.gsub(message, "\"", "")
+        spatialChat(pNpc, "Yes Master, I can hear you.")
+        CreatureObject(pNpc):doAnimation("conversation_1")
         --local pythonScript = "/home/swgemu/Core3/MMOCoreORB/bin/scripts/managers/jedi/my_python.py"
         --local command = "python3.9 " .. pythonScript .. " \"" .. safeMessage .. "\""
         
-        print("[PADAWAN] Running Python: " .. command)
+        --print("[PADAWAN] Running Python: " .. command)
         
-        local handle = io.popen(command)
-        if handle then
-            local output = handle:read("*a")
-            handle:close()
-            if output and output ~= "" then
-                spatialChat(pNpc, string.gsub(output, "\n", ""))
-                CreatureObject(pNpc):doAnimation("conversation_1")
-            end
-        end
+        --local handle = io.popen(command)
+        --if handle then
+        --    local output = handle:read("*a")
+        --    handle:close()
+        --    if output and output ~= "" then
+        --        spatialChat(pNpc, string.gsub(output, "\n", ""))
+        --        CreatureObject(pNpc):doAnimation("conversation_1")
+        --    end
+        --end
     end
 
     return 0
