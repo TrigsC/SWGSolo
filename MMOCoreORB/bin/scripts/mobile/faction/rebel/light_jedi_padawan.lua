@@ -79,4 +79,4 @@ light_jedi_padawan = Creature:new {
     }
 }
 
-CreatureTemplates:addCreatureTemplate(jedi_padawan, "light_jedi_padawan")
+CreatureTemplates:addCreatureTemplate(light_jedi_padawan, "light_jedi_padawan")
