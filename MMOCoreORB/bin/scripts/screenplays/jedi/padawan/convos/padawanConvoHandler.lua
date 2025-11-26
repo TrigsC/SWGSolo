@@ -19,8 +19,12 @@ end
 function padawanConvoHandler:runScreenHandlers(pConvTemplate, pPlayer, pNpc, selectedOption, pConvScreen)
     local screen = LuaConversationScreen(pConvScreen)
     local screenID = screen:getScreenID()
+    local pClonedScreen = screen:cloneScreen()
+    local clonedScreen = LuaConversationScreen(pClonedScreen)
     print("[PADAWAN] Notify screen Triggered!" .. tostring(screen))
     print("[PADAWAN] Notify screenID Triggered!" .. tostring(screenID))
+    print("[PADAWAN] Notify pClonedScreen Triggered!" .. tostring(pClonedScreen))
+    print("[PADAWAN] Notify clonedScreen Triggered!" .. tostring(clonedScreen))
 
     if (screenID == "init") then
         
@@ -33,7 +37,8 @@ function padawanConvoHandler:runScreenHandlers(pConvTemplate, pPlayer, pNpc, sel
         end
 
         if (readData(SceneObject(pNpc):getObjectID() .. ":brain_active") == 1) then
-            screen:setCustomDialogText("System: Neural Link is ALREADY active.")
+            clonedScreen:setCustomDialogText("System: Neural Link is ALREADY active.\n(Chat with me in spatial chat)")
+            --screen:setCustomDialogText("System: Neural Link is ALREADY active.")
         else
             writeData(SceneObject(pNpc):getObjectID() .. ":brain_active", 1)
             
