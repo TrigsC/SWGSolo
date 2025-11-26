@@ -27,26 +27,26 @@ function padawanConvoHandler:runScreenHandlers(pConvTemplate, pPlayer, pNpc, sel
     print("[PADAWAN] Notify clonedScreen Triggered!" .. tostring(clonedScreen))
 
     if (screenID == "init") then
-        
-        -- DEBUG CHECK: Is the constant nil?
-        if (SPATIALCHATRECEIVED == nil) then
-            print("CRITICAL ERROR: SPATIALCHATRECEIVED is nil! Defaulting to 15.")
-            SPATIALCHATRECEIVED = 15 -- Force the value (15 is standard for Chat Received)
-        else
-            print("DEBUG: SPATIALCHATRECEIVED Value is: " .. tostring(SPATIALCHATRECEIVED))
-        end
 
         if (readData(SceneObject(pNpc):getObjectID() .. ":brain_active") == 1) then
             clonedScreen:setCustomDialogText("System: Neural Link is ALREADY active.\n(Chat with me in spatial chat)")
             --screen:setCustomDialogText("System: Neural Link is ALREADY active.")
         else
-            writeData(SceneObject(pNpc):getObjectID() .. ":brain_active", 1)
-            
-            -- NOW CREATE IT
-            createObserver(SPATIALCHATRECEIVED, "padawanConvoHandler", "notifySpatialChatReceived", pNpc)
-            
-            screen:setCustomDialogText("System: AI Neural Link Established.")
-            print("[PADAWAN] Brain attached to NPC: " .. SceneObject(pNpc):getObjectID())
+            -- DEBUG CHECK: Is the constant nil?
+            if (SPATIALCHATRECEIVED == nil) then
+                print("CRITICAL ERROR: SPATIALCHATRECEIVED is nil! Defaulting to 15.")
+                SPATIALCHATRECEIVED = 15 -- Force the value (15 is standard for Chat Received)
+            else
+                print("DEBUG: SPATIALCHATRECEIVED Value is: " .. tostring(SPATIALCHATRECEIVED))
+
+                writeData(SceneObject(pNpc):getObjectID() .. ":brain_active", 1)
+
+                -- NOW CREATE IT
+                createObserver(SPATIALCHATRECEIVED, "padawanConvoHandler", "notifySpatialChatReceived", pNpc)
+
+                screen:setCustomDialogText("System: AI Neural Link Established.")
+                print("[PADAWAN] Brain attached to NPC: " .. SceneObject(pNpc):getObjectID())
+        end
         end
     end
 
