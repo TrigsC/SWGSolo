@@ -1,69 +1,89 @@
--- Define the table (Must match the filename)
 padawan_brain = {
 }
 
--- 1. TRIGGER: This runs when the NPC loads into the world
+-- 1. TRIGGER: Runs when the NPC is spawned or loaded
 function padawan_brain:trigger(pObject)
-    if (pObject == nil) then return 0 end
+    print("[PADAWAN-DEBUG] trigger() fired. Script attached to object.")
+    
+    if (pObject == nil) then
+        print("[PADAWAN-DEBUG] ERROR: pObject is nil in trigger()")
+        return 0
+    end
 
-    -- Attach a listener to THIS specific NPC. 
-    -- SPATIALCHATRECEIVED (0) means "Notify me when someone talks nearby"
+    -- Attempt to attach the listener
+    -- Note: 0 is the ID for SPATIALCHATRECEIVED
     createObserver(SPATIALCHATRECEIVED, "padawan_brain", "notifySpatialChatReceived", pObject)
+    print("[PADAWAN-DEBUG] Observer attached to Object ID: " .. SceneObject(pObject):getObjectID())
     
     return 0
 end
 
--- 2. CALLBACK: This runs when chat is heard
+-- 2. CALLBACK: Runs when ANY chat is heard nearby
 function padawan_brain:notifySpatialChatReceived(pObject, pObserver, pChatMessage)
-    -- pObject = The Padawan (The NPC)
-    -- pChatMessage = The message object
+    -- Uncomment this only if you want spam for every single chat message in the area
+    -- print("[PADAWAN-DEBUG] Chat event received.")
 
-    if (pObject == nil or pChatMessage == nil) then return 0 end
+    if (pObject == nil or pChatMessage == nil) then 
+        return 0 
+    end
 
     local pSpeaker = pChatMessage:getOriginator()
-    if (pSpeaker == nil) then return 0 end
-    
-    -- OPTIONAL: Only listen to the owner?
-    -- For now, let's let him talk to anyone to make testing easier.
-    -- local ownerID = CreatureObject(pObject):getOwnerID()
-    -- if (SceneObject(pSpeaker):getObjectID() ~= ownerID) then return 0 end
+    if (pSpeaker == nil) then 
+        return 0 
+    end
 
-    -- Prevent the NPC from talking to itself (Infinite Loop protection)
-    if (SceneObject(pSpeaker):getObjectID() == SceneObject(pObject):getObjectID()) then
+    local speakerID = SceneObject(pSpeaker):getObjectID()
+    local myID = SceneObject(pObject):getObjectID()
+    local message = pChatMessage:getString()
+
+    -- Filter out self-talk early to clean up logs
+    if (speakerID == myID) then
         return 0
     end
 
-    local message = pChatMessage:getString()
+    print("[PADAWAN-DEBUG] Heard message: '" .. message .. "' from SpeakerID: " .. speakerID)
 
-    -- 3. THE PYTHON HOOK (From your old code)
-    -- Only trigger if they say "Padawan" or talk directly to it, otherwise it chats too much
+    -- Check for the Keyword
     if string.find(string.lower(message), "padawan") then
-        
-        -- Sanitize the message so quotes don't break the command
-        local safeMessage = string.gsub(message, "\"", "") 
-        
-        -- WARNING: io.popen blocks the server. It will lag slightly while Python thinks.
+        print("[PADAWAN-DEBUG] Keyword 'padawan' DETECTED. Preparing Python...")
+
+        local safeMessage = string.gsub(message, "\"", "")
         local pythonScript = "/home/swgemu/Core3/MMOCoreORB/bin/scripts/managers/jedi/my_python.py"
+        
+        -- DEBUG: Check if file exists (simple Lua check)
+        local f = io.open(pythonScript, "r")
+        if f ~= nil then 
+            io.close(f) 
+            print("[PADAWAN-DEBUG] Python script file found.")
+        else 
+            print("[PADAWAN-DEBUG] ERROR: Python script NOT found at: " .. pythonScript)
+            return 0
+        end
+
         local command = "python3.9 " .. pythonScript .. " \"" .. safeMessage .. "\""
+        print("[PADAWAN-DEBUG] Executing Command: " .. command)
         
         local handle = io.popen(command)
-        if (handle ~= nil) then
+        
+        if (handle == nil) then
+            print("[PADAWAN-DEBUG] ERROR: io.popen returned nil.")
+        else
             local output = handle:read("*a")
             handle:close()
+            
+            print("[PADAWAN-DEBUG] Raw Python Output: [" .. tostring(output) .. "]")
 
-            -- Clean up output (remove newlines)
             if (output ~= nil and output ~= "") then
-                output = string.gsub(output, "\n", "")
-                
-                -- Make the NPC speak the result
-                spatialChat(pObject, output)
-                
-                -- Optional: Play an animation
+                local cleanOutput = string.gsub(output, "\n", "")
+                spatialChat(pObject, cleanOutput)
                 CreatureObject(pObject):doAnimation("conversation_1")
+                print("[PADAWAN-DEBUG] Chat sent to game.")
+            else
+                print("[PADAWAN-DEBUG] WARNING: Python returned empty string.")
             end
-        else
-            print("PADAWAN BRAIN ERROR: Could not execute Python.")
         end
+    else
+        print("[PADAWAN-DEBUG] Keyword 'padawan' NOT found. Ignoring.")
     end
 
     return 0
