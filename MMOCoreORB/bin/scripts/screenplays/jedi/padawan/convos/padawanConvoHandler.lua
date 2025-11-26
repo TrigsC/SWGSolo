@@ -19,8 +19,8 @@ end
 function padawanConvoHandler:runScreenHandlers(pConvTemplate, pPlayer, pNpc, selectedOption, pConvScreen)
     local screen = LuaConversationScreen(pConvScreen)
     local screenID = screen:getScreenID()
-    print("[PADAWAN] Notify screen Triggered!" .. screen)
-    print("[PADAWAN] Notify screenID Triggered!" .. screenID)
+    print("[PADAWAN] Notify screen Triggered!" .. tostring(screen))
+    print("[PADAWAN] Notify screenID Triggered!" .. tostring(screenID))
 
     if (screenID == "init") then
         
@@ -50,8 +50,8 @@ end
 
 -- 6. The Brain Logic (The Listener)
 function padawanConvoHandler:notifySpatialChatReceived(pNpc, pObserver, pChatMessage)
-    print("[PADAWAN] Notify pNpc Triggered!" .. pNpc)
-    print("[PADAWAN] Notify pChatMessage Triggered!" .. pChatMessage)
+    print("[PADAWAN] Notify pNpc Triggered!" .. tostring(pNpc))
+    print("[PADAWAN] Notify pChatMessage Triggered!" .. tostring(pChatMessage))
 
     if (pNpc == nil or pChatMessage == nil) then return 0 end
 
