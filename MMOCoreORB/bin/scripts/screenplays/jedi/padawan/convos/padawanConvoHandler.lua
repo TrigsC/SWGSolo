@@ -4,10 +4,10 @@ padawanConvoHandler = Object:new {
 }
 
 -- 1. REQUIRED: Tells the engine which screen to start with
-function padawanConvoHandler:getInitialScreen(pPlayer, pNpc, pConvTemplate)
-    local convoTemplate = LuaConversationTemplate(pConvTemplate)
-    return convoTemplate:getScreen("init")
-end
+--function padawanConvoHandler:getInitialScreen(pPlayer, pNpc, pConvTemplate)
+--    local convoTemplate = LuaConversationTemplate(pConvTemplate)
+--    return convoTemplate:getScreen("init")
+--end
 
 -- 2. REQUIRED: Tells the engine what to do when options are clicked
 -- (We were missing this one, causing the error!)
