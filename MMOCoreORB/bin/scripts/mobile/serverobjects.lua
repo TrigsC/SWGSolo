@@ -46,7 +46,7 @@ includeFile("lair/serverobjects.lua")
 -- Outfits
 includeFile("outfits/serverobjects.lua")
 
-includeFile("faction/rebel/light_jedi_padawan.lua")
+includeFile("light_jedi_padawan.lua")
 
 -- Custom content - Loads last to allow for overrides
 includeFile("../custom_scripts/mobile/serverobjects.lua")
