@@ -55,8 +55,7 @@ light_jedi_padawan = Creature:new {
     
     -- 5. SCRIPTS: This is what makes it a pet + your AI hook.
     scripts = {
-        "ai.pet_advance",   -- This enables Follow/Store/Group commands
-        "ai.padawan_brain"  -- This is your RAG Logic (We will create this next)
+        "padawan_brain"  -- This is your RAG Logic (We will create this next)
     },
 
     -- VISUALS
