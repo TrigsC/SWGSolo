@@ -12,7 +12,7 @@ end
 -- 2. REQUIRED: Tells the engine what to do when options are clicked
 -- (We were missing this one, causing the error!)
 function padawanConvoHandler:getNextConversationScreen(pConversationTemplate, pPlayer, selectedOption, pConversationScreen)
-    return nil -- Returning nil ends the conversation or keeps current state
+    return self:getInitialScreen(pPlayer, pNpc, pConvTemplate)
 end
 
 -- 3. REQUIRED: Logic that runs when the screen opens
