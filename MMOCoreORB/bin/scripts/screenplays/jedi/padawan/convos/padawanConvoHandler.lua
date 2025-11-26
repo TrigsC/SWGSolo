@@ -29,7 +29,7 @@ function padawanConvoHandler:runScreenHandlers(pConvTemplate, pPlayer, pNpc, sel
             writeData(SceneObject(pNpc):getObjectID() .. ":brain_active", 1)
             
             -- ATTACH THE LISTENER
-            createObserver(SPATIALCHATRECEIVED, "padawanConvoHandler", "notifySpatialChatReceived", pNpc)
+            createObserver(SPATIALCHATSENT, "padawanConvoHandler", "notifySpatialChatReceived", pNpc)
             
             screen:setCustomDialogText("System: AI Neural Link Established.\n(I am now listening to spatial chat...)")
             print("[PADAWAN] Brain attached to NPC: " .. SceneObject(pNpc):getObjectID())
