@@ -1,29 +1,37 @@
-print("###################################################")
-print("CRITICAL DEBUG: LOADING padawanConvoHandler FILE")
-print("###################################################")
+local ObjectManager = require("managers.object.object_manager")
+
 padawanConvoHandler = Object:new {
 }
 
+-- 1. REQUIRED: Tells the engine which screen to start with
+function padawanConvoHandler:getInitialScreen(pPlayer, pNpc, pConvTemplate)
+    local convoTemplate = LuaConversationTemplate(pConvTemplate)
+    return convoTemplate:getScreen("padawan_init")
+end
+
+-- 2. REQUIRED: Tells the engine what to do when options are clicked
+-- (We were missing this one, causing the error!)
+function padawanConvoHandler:getNextConversationScreen(pConversationTemplate, pPlayer, selectedOption, pConversationScreen)
+    return nil -- Returning nil ends the conversation or keeps current state
+end
+
+-- 3. REQUIRED: Logic that runs when the screen opens
 function padawanConvoHandler:runScreenHandlers(pConvTemplate, pPlayer, pNpc, selectedOption, pConvScreen)
-    -- 1. Get the Screen ID
     local screen = LuaConversationScreen(pConvScreen)
     local screenID = screen:getScreenID()
 
-    -- 2. The Injection Logic
-    if (screenID == "init_chat") then
-        -- This runs every time you right click him.
-        
-        -- Check if we already attached the observer to avoid duplicates
+    if (screenID == "padawan_init") then
+        -- Logic to attach the AI Brain
         if (readData(SceneObject(pNpc):getObjectID() .. ":brain_active") == 1) then
-            screen:setCustomDialogText("I am still listening, Master.")
+            screen:setCustomDialogText("System: Neural Link is ALREADY active.\n(Chat with me in spatial chat)")
         else
             -- MARK AS ACTIVE
             writeData(SceneObject(pNpc):getObjectID() .. ":brain_active", 1)
             
-            -- ATTACH THE LISTENER (The Brain)
+            -- ATTACH THE LISTENER
             createObserver(SPATIALCHATRECEIVED, "padawanConvoHandler", "notifySpatialChatReceived", pNpc)
             
-            screen:setCustomDialogText("Connection established. I am now listening to spatial chat.")
+            screen:setCustomDialogText("System: AI Neural Link Established.\n(I am now listening to spatial chat...)")
             print("[PADAWAN] Brain attached to NPC: " .. SceneObject(pNpc):getObjectID())
         end
     end
@@ -31,7 +39,7 @@ function padawanConvoHandler:runScreenHandlers(pConvTemplate, pPlayer, pNpc, sel
     return pConvScreen
 end
 
--- 3. THE BRAIN LOGIC (Moved here from the old file)
+-- 4. THE BRAIN LOGIC (The Listener)
 function padawanConvoHandler:notifySpatialChatReceived(pNpc, pObserver, pChatMessage)
     if (pNpc == nil or pChatMessage == nil) then return 0 end
 
@@ -43,28 +51,33 @@ function padawanConvoHandler:notifySpatialChatReceived(pNpc, pObserver, pChatMes
 
     local message = pChatMessage:getString()
     
-    -- Debug Print
+    -- Debug Print (Check your console for this!)
     print("[PADAWAN] Heard: " .. message)
 
+    -- KEYWORD CHECK
     if string.find(string.lower(message), "padawan") then
         print("[PADAWAN] Keyword Detected! Sending response...")
-        local safeMessage = string.gsub(message, "\"", "")
-        spatialChat(pNpc, "Yes Master, I can hear you.")
+        
+        -- ECHO TEST (Python commented out for now)
+        spatialChat(pNpc, "Yes Master? I heard you say: " .. message)
         CreatureObject(pNpc):doAnimation("conversation_1")
-        --local pythonScript = "/home/swgemu/Core3/MMOCoreORB/bin/scripts/managers/jedi/my_python.py"
-        --local command = "python3.9 " .. pythonScript .. " \"" .. safeMessage .. "\""
         
-        --print("[PADAWAN] Running Python: " .. command)
+        -- PYTHON SECTION (Uncomment later when Echo Test works)
+        --[[
+        local safeMessage = string.gsub(message, "\"", "")
+        local pythonScript = "/home/swgemu/Core3/MMOCoreORB/bin/scripts/managers/jedi/my_python.py"
+        local command = "python3.9 " .. pythonScript .. " \"" .. safeMessage .. "\""
         
-        --local handle = io.popen(command)
-        --if handle then
-        --    local output = handle:read("*a")
-        --    handle:close()
-        --    if output and output ~= "" then
-        --        spatialChat(pNpc, string.gsub(output, "\n", ""))
-        --        CreatureObject(pNpc):doAnimation("conversation_1")
-        --    end
-        --end
+        local handle = io.popen(command)
+        if handle then
+            local output = handle:read("*a")
+            handle:close()
+            if output and output ~= "" then
+                spatialChat(pNpc, string.gsub(output, "\n", ""))
+                CreatureObject(pNpc):doAnimation("conversation_1")
+            end
+        end
+        ]]--
     end
 
     return 0
