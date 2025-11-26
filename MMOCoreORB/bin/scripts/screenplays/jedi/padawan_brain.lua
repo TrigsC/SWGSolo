@@ -1,4 +1,4 @@
-includeFile("ai/ai.lua")
+--includeFile("ai/ai.lua")
 
 padawan_brain = {
     -- This name must be unique
