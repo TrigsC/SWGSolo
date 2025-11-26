@@ -6,7 +6,7 @@ padawanConvoHandler = Object:new {
 -- 1. REQUIRED: Tells the engine which screen to start with
 function padawanConvoHandler:getInitialScreen(pPlayer, pNpc, pConvTemplate)
     local convoTemplate = LuaConversationTemplate(pConvTemplate)
-    return convoTemplate:getScreen("padawan_init")
+    return convoTemplate:getScreen("init")
 end
 
 -- 2. REQUIRED: Tells the engine what to do when options are clicked
@@ -20,7 +20,7 @@ function padawanConvoHandler:runScreenHandlers(pConvTemplate, pPlayer, pNpc, sel
     local screen = LuaConversationScreen(pConvScreen)
     local screenID = screen:getScreenID()
 
-    if (screenID == "padawan_init") then
+    if (screenID == "init") then
         -- Logic to attach the AI Brain
         if (readData(SceneObject(pNpc):getObjectID() .. ":brain_active") == 1) then
             screen:setCustomDialogText("System: Neural Link is ALREADY active.\n(Chat with me in spatial chat)")
