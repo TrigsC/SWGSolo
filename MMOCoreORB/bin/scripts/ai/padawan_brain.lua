@@ -1,3 +1,6 @@
+print("###################################################")
+print("CRITICAL DEBUG: LOADING PADAWAN BRAIN FILE")
+print("###################################################")
 padawan_brain = {
 }
 
