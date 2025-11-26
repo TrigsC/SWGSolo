@@ -1,7 +1,6 @@
 local ObjectManager = require("managers.object.object_manager")
 
-padawanConvoHandler = Object:new {
-}
+padawanConvoHandler = conv_handler:new { }
 
 -- 1. REQUIRED: Tells the engine which screen to start with
 --function padawanConvoHandler:getInitialScreen(pPlayer, pNpc, pConvTemplate)
