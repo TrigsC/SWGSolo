@@ -103,7 +103,7 @@ rebelRewardData = {
 			type = factionRewardType.hireling, 
 			display = "@mob/creature_names:light_jedi_sentinel", -- You can use a raw string here for testing, or a string_id like "@mob/creature_names:padawan"
 			item = "object/intangible/pet/pet_control.iff", -- KEEP THIS AS IS. This puts it in the Datapad.
-			controlledObjectTemplate = "object/mobile/jedi_padawan.iff", -- <--- THIS MUST MATCH YOUR CUSTOM FILE
+			controlledObjectTemplate = "light_jedi_padawan", -- <--- THIS MUST MATCH YOUR CUSTOM FILE
 			cost = 100 -- Cheap for testing
 		},
 	},

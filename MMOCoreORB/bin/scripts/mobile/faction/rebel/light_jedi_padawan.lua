@@ -1,4 +1,4 @@
-jedi_padawan = Creature:new {
+light_jedi_padawan = Creature:new {
     objectName = "Jedi Padawan", -- Changed from string_id to raw text for testing
     randomNameType = NAME_GENERIC,
     randomNameTag = true,
@@ -79,4 +79,4 @@ jedi_padawan = Creature:new {
     }
 }
 
-CreatureTemplates:addCreatureTemplate(jedi_padawan, "object/mobile/jedi_padawan.iff)
+CreatureTemplates:addCreatureTemplate(jedi_padawan, "light_jedi_padawan")
