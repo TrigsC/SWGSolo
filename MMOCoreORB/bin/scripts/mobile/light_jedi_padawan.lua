@@ -49,14 +49,6 @@ light_jedi_padawan = Creature:new {
     
     diet = HERBIVORE,
     healerType = "force",
-    
-    -- 4. REMOVED customAiMap = "enclaveSentinel"
-    -- We don't want it standing guard. We want it following.
-    
-    -- 5. SCRIPTS: This is what makes it a pet + your AI hook.
-    scripts = {
-        "padawan_brain"  -- This is your RAG Logic (We will create this next)
-    },
 
     -- VISUALS
     templates = { "light_jedi" },
@@ -67,7 +59,7 @@ light_jedi_padawan = Creature:new {
     primaryWeapon = "light_jedi_weapons",
     secondaryWeapon = "light_jedi_weapons_ranged",
     
-    conversationTemplate = "",
+    conversationTemplate = "padawanConvoTemplate",
 
     -- ATTACKS
     -- Downgraded from "lightsabermaster" to standard skills

@@ -275,6 +275,7 @@ includeFile("jedi/padawan/convos/padawan_spice_mom_02_conv_handler.lua")
 includeFile("jedi/padawan/convos/padawan_surveyor_01_conv_handler.lua")
 includeFile("jedi/padawan/convos/padawan_the_ring_01_conv_handler.lua")
 includeFile("jedi/padawan/convos/padawan_the_ring_02_conv_handler.lua")
+includeFile("jedi/padawan/convos/padawanConvoHandler.lua")
 
 -- Jedi Objects
 includeFile("jedi/components/ForceShrineMenuComponent.lua")
