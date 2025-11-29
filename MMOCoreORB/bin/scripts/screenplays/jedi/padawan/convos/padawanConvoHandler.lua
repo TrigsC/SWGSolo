@@ -5,13 +5,26 @@ padawanConvoHandler = conv_handler:new {}
 print("###################################################")
 print("CRITICAL DEBUG: padawanConvoHandler LOADED")
 print("###################################################")
+registerScreenPlay("padawanConvoHandler", true)
+
+function padawanConvoHandler:start()
+    print("###################################################")
+    print("CRITICAL DEBUG: padawanConvoHandler START")
+    print("###################################################")
+end
 
 function padawanConvoHandler:getInitialScreen(pPlayer, pNpc, pConvTemplate)
     local convoTemplate = LuaConversationTemplate(pConvTemplate)
+    print("###################################################")
+    print("CRITICAL DEBUG: padawanConvoHandler getInitialScreen")
+    print("###################################################")
     return convoTemplate:getScreen("init")
 end
 
 function padawanConvoHandler:runScreenHandlers(pConvTemplate, pPlayer, pNpc, selectedOption, pConvScreen)
+    print("###################################################")
+    print("CRITICAL DEBUG: padawanConvoHandler runScreenHandlers")
+    print("###################################################")
     local screen = LuaConversationScreen(pConvScreen)
     local screenID = screen:getScreenID()
     local pClonedScreen = screen:cloneScreen()
