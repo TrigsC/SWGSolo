@@ -95,3 +95,5 @@ function padawanConvoHandler:notifySpatialChatReceived(pNpc, pChatMessage, objec
 
     return 0
 end
+
+registerScreenPlay("padawanConvoHandler", true)
