@@ -51,6 +51,7 @@ function padawanConvoHandler:notifySpatialChatReceived(pNpc, pChatMessage, objec
     -- 1. EXTRACT MESSAGE (The User's Fix)
     -- We pass the userdata pointer to the global C++ helper function
     local spatialMsg = getChatMessage(pChatMessage)
+    print("[PADAWAN] spatialMsg: " .. spatialMsg)
 
     if (spatialMsg == nil or spatialMsg == "") then 
         return 0 
