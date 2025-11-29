@@ -21,7 +21,6 @@ function padawanConvoHandler:runScreenHandlers(pConvTemplate, pPlayer, pNpc, sel
         
         -- Use the ID 15 directly if SPATIALCHAT isn't found, but the Bartender uses SPATIALCHAT
         -- which is typically mapped to 15 in server setups. 
-        local observerID = 15
 
         if (readData(SceneObject(pNpc):getObjectID() .. ":brain_active") == 1) then
             clonedScreen:setCustomDialogText("System: Neural Link is ALREADY active.\n(Chat with me in spatial chat)")
@@ -29,7 +28,7 @@ function padawanConvoHandler:runScreenHandlers(pConvTemplate, pPlayer, pNpc, sel
             writeData(SceneObject(pNpc):getObjectID() .. ":brain_active", 1)
             
             -- ATTACH OBSERVER
-            createObserver(observerID, "padawanConvoHandler", "notifySpatialChatReceived", pNpc)
+            createObserver(SPATIALCHAT, "padawanConvoHandler", "notifySpatialChatReceived", pNpc)
             
             clonedScreen:setCustomDialogText("System: AI Neural Link Established.\n(I am now listening to spatial chat...)")
             print("[PADAWAN] Brain attached to NPC: " .. SceneObject(pNpc):getObjectID())
