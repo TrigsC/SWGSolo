@@ -45,7 +45,10 @@ end
 -- UPDATED FUNCTION SIGNATURE AND EXTRACTION METHOD
 -- Matching the BartenderScreenPlay signature: (pNpc, pChatMessage, objectID)
 function padawanConvoHandler:notifySpatialChatReceived(pNpc, pChatMessage, objectID)
-    
+    print("[PADAWAN] Made it to Padawan notifySpatialChatReceived")
+    print("[PADAWAN] pNpc " .. tostring(pNpc))
+    print("[PADAWAN]pChatMessage " .. tostring(pChatMessage))
+    print("[PADAWAN] objectID " .. tostring(objectID))
     if (pNpc == nil or pChatMessage == nil) then return 0 end
 
     -- 1. EXTRACT MESSAGE (The User's Fix)
