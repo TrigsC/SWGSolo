@@ -1,83 +1,95 @@
--- 1. Include the base class (REQUIRED for the C++ bindings to work right)
 local ObjectManager = require("managers.object.object_manager")
 
--- 2. Define the Handler inheriting from conv_handler
 padawanConvoHandler = conv_handler:new {}
 
--- 3. Debug Print to prove file loaded
 print("###################################################")
 print("CRITICAL DEBUG: padawanConvoHandler LOADED")
 print("###################################################")
 
--- 4. Initial Screen
 function padawanConvoHandler:getInitialScreen(pPlayer, pNpc, pConvTemplate)
     local convoTemplate = LuaConversationTemplate(pConvTemplate)
     return convoTemplate:getScreen("init")
 end
 
--- 5. Screen Handler (The Trigger)
 function padawanConvoHandler:runScreenHandlers(pConvTemplate, pPlayer, pNpc, selectedOption, pConvScreen)
     local screen = LuaConversationScreen(pConvScreen)
     local screenID = screen:getScreenID()
     local pClonedScreen = screen:cloneScreen()
     local clonedScreen = LuaConversationScreen(pClonedScreen)
-    print("[PADAWAN] Notify screen Triggered!" .. tostring(screen))
-    print("[PADAWAN] Notify screenID Triggered!" .. tostring(screenID))
-    print("[PADAWAN] Notify pClonedScreen Triggered!" .. tostring(pClonedScreen))
-    print("[PADAWAN] Notify clonedScreen Triggered!" .. tostring(clonedScreen))
 
     if (screenID == "init") then
+        
+        -- Use the ID 15 directly if SPATIALCHAT isn't found, but the Bartender uses SPATIALCHAT
+        -- which is typically mapped to 15 in server setups. 
+        local observerID = SPATIALCHAT
+        if (observerID == nil) then 
+            observerID = 15 -- Fallback hardcoded ID for Spatial Chat
+        end
 
         if (readData(SceneObject(pNpc):getObjectID() .. ":brain_active") == 1) then
             clonedScreen:setCustomDialogText("System: Neural Link is ALREADY active.\n(Chat with me in spatial chat)")
-            --screen:setCustomDialogText("System: Neural Link is ALREADY active.")
         else
-            -- DEBUG CHECK: Is the constant nil?
-            if (SPATIALCHATRECEIVED == nil) then
-                print("CRITICAL ERROR: SPATIALCHATRECEIVED is nil! Defaulting to 15.")
-                SPATIALCHATRECEIVED = 15 -- Force the value (15 is standard for Chat Received)
-            else
-                print("DEBUG: SPATIALCHATRECEIVED Value is: " .. tostring(SPATIALCHATRECEIVED))
-
-                writeData(SceneObject(pNpc):getObjectID() .. ":brain_active", 1)
-
-                -- NOW CREATE IT
-                createObserver(SPATIALCHATRECEIVED, "padawanConvoHandler", "notifySpatialChatReceived", pNpc)
-
-                screen:setCustomDialogText("System: AI Neural Link Established.")
-                print("[PADAWAN] Brain attached to NPC: " .. SceneObject(pNpc):getObjectID())
-        end
+            writeData(SceneObject(pNpc):getObjectID() .. ":brain_active", 1)
+            
+            -- ATTACH OBSERVER
+            createObserver(observerID, "padawanConvoHandler", "notifySpatialChatReceived", pNpc)
+            
+            clonedScreen:setCustomDialogText("System: AI Neural Link Established.\n(I am now listening to spatial chat...)")
+            print("[PADAWAN] Brain attached to NPC: " .. SceneObject(pNpc):getObjectID())
         end
     end
 
-    return pConvScreen
+    return pClonedScreen
 end
 
--- 6. The Brain Logic (The Listener)
-function padawanConvoHandler:notifySpatialChatReceived(pNpc, pObserver, pChatMessage)
-    print("[PADAWAN] Notify pNpc Triggered!" .. tostring(pNpc))
-    print("[PADAWAN] Notify pChatMessage Triggered!" .. tostring(pChatMessage))
-
+-- UPDATED FUNCTION SIGNATURE AND EXTRACTION METHOD
+-- Matching the BartenderScreenPlay signature: (pNpc, pChatMessage, objectID)
+function padawanConvoHandler:notifySpatialChatReceived(pNpc, pChatMessage, objectID)
+    
     if (pNpc == nil or pChatMessage == nil) then return 0 end
 
-    local pSpeaker = pChatMessage:getOriginator()
+    -- 1. EXTRACT MESSAGE (The User's Fix)
+    -- We pass the userdata pointer to the global C++ helper function
+    local spatialMsg = getChatMessage(pChatMessage)
+
+    if (spatialMsg == nil or spatialMsg == "") then 
+        return 0 
+    end
+
+    -- 2. GET ORIGINATOR (From ID)
+    -- The observer passes the Object ID of the speaker as the 3rd argument
+    local pSpeaker = getSceneObject(objectID)
+    
     if (pSpeaker == nil) then return 0 end
 
-    -- Don't listen to myself
+    -- Infinite Loop Protection
     if (SceneObject(pSpeaker):getObjectID() == SceneObject(pNpc):getObjectID()) then return 0 end
 
-    local message = pChatMessage:getString()
-    
-    -- DEBUG PROOF
-    print("[PADAWAN] Heard: " .. message)
+    print("[PADAWAN] Heard: " .. spatialMsg)
 
-    -- KEYWORD CHECK
-    if string.find(string.lower(message), "padawan") then
-        print("[PADAWAN] Keyword Detected! responding...")
+    -- 3. KEYWORD CHECK
+    if string.find(string.lower(spatialMsg), "padawan") then
+        print("[PADAWAN] Keyword Detected! Responding...")
         
         -- ECHO RESPONSE
-        spatialChat(pNpc, "Yes Master? I heard: " .. message)
+        spatialChat(pNpc, "Yes Master? I heard: " .. spatialMsg)
         CreatureObject(pNpc):doAnimation("conversation_1")
+        
+        -- UNCOMMENT THIS TO ENABLE PYTHON WHEN READY
+        --[[
+        local safeMessage = string.gsub(spatialMsg, "\"", "")
+        local pythonScript = "/home/swgemu/Core3/MMOCoreORB/bin/scripts/managers/jedi/my_python.py"
+        local command = "python3.9 " .. pythonScript .. " \"" .. safeMessage .. "\""
+        
+        local handle = io.popen(command)
+        if handle then
+            local output = handle:read("*a")
+            handle:close()
+            if output and output ~= "" then
+                spatialChat(pNpc, string.gsub(output, "\n", ""))
+            end
+        end
+        ]]--
     end
 
     return 0
