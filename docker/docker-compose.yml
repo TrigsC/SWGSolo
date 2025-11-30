@@ -4,6 +4,8 @@ services:
     container_name: swgemu_server # We are giving it a fixed name
     hostname: swgemu
     restart: unless-stopped
+    stdin_open: true # mimics -i
+    tty: true        # mimics -t
     cap_add:
       - SYS_PTRACE
     # Load your existing environment variables
