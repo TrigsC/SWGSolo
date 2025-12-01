@@ -50,7 +50,7 @@ IDL_DIRECTIVES = -outdir autogen -cp $(IDL_CLASSPATH)
 
 UNITTEST_DIRECTIVES = -Wno-deprecated-literal-operator
 
-CMAKE_ARGS =
+CMAKE_ARGS = -DCMAKE_CXX_FLAGS="-Wno-error=deprecated-literal-operator"
 
 BUILD_PATH = build/unix
 DEFAULT_BUILD_TYPE = RelWithDebInfo
