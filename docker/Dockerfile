@@ -112,7 +112,7 @@ RUN set -xe; \
     apt-get install lua-inspect lua-socket lua-sec lua-filesystem lua-cjson; \
     apt-get install default-jre-headless; \
     apt-get install clang-14; \
-    update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-14 100 --slave /usr/bin/clang clang /usr/bin/clang-14
+    update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-14 100 --slave /usr/bin/clang clang /usr/bin/clang-14; \
     apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/* /var/log/dpkg.log* /var/log/apt/*;
 
