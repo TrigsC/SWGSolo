@@ -48,7 +48,7 @@ IDL_CLASSPATH = ../MMOEngine/include
 #IDL_DIRECTIVES = -noprelocks -outdir autogen -cp $(IDL_CLASSPATH)
 IDL_DIRECTIVES = -outdir autogen -cp $(IDL_CLASSPATH)
 
-UNITTEST_DIRECTIVES =
+UNITTEST_DIRECTIVES = -Wno-deprecated-literal-operator
 
 CMAKE_ARGS =
 

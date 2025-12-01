@@ -17,7 +17,7 @@ The container publishes the LAN ports required by SWGEmu clients:
 If you customise `env-run`, keep these mappings intact so other devices on your network can connect.
 
 docker volume create swgemu-core3
-docker compose up -d
+docker compose up -d --build
 - Immediately attach to catch the passwords
 docker attach swgemu_server
 
