@@ -16,8 +16,10 @@ The container publishes the LAN ports required by SWGEmu clients:
 
 If you customise `env-run`, keep these mappings intact so other devices on your network can connect.
 
+docker volume create swgemu-core3
 docker compose up -d
-docker exec -it ollama_brain ollama pull llama3.2
+- Immediately attach to catch the passwords
+docker attach swgemu_server
 
 - Join console
 docker attach swgemu_server
