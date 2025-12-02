@@ -7,20 +7,28 @@ local AiBrain = {}
 -- logic: The URL of our Docker container
 local brain_url = "http://ollama_brain:11434/api/generate"
 
-function AiBrain.askPadawan(player_input)
+-- Change function name from askPadawan to askBrain
+function AiBrain.askBrain(player_input, npc_profile)
+    
+    -- Default to a generic prompt if the profile is missing
+    local system_instruction = "You are a Star Wars character."
+    if npc_profile and npc_profile.system_prompt then
+        system_instruction = npc_profile.system_prompt
+    end
+
     -- 1. Setup the instructions for the AI
     local payload = {
         model = "llama3.2",
-        -- We give the AI a 'persona' so it knows how to act
-        prompt = "You are a loyal Star Wars Padawan in a game. The player says: '" .. player_input .. "'. Reply briefly (under 20 words). If the player asks for a heal, say 'Yes Master, healing you now!'",
-        stream = false -- We want the whole answer at once, not piece by piece
+        -- SYSTEM PROMPT: Who the NPC is
+        -- USER PROMPT: What the player said
+        prompt = system_instruction .. " The player says: '" .. player_input .. "'.",
+        stream = false
     }
 
-    -- 2. Convert the table to JSON text
+    -- ... (The rest of the HTTP code stays exactly the same) ...
     local request_body = json.encode(payload)
     local response_body = {}
 
-    -- 3. Send the request across the Docker network
     local res, code, response_headers = http.request{
         url = brain_url,
         method = "POST",
@@ -32,13 +40,10 @@ function AiBrain.askPadawan(player_input)
         sink = ltn12.sink.table(response_body)
     }
 
-    -- 4. Check if the Brain is alive
     if code ~= 200 then
-        print("AI Error: Could not connect to Brain. Code: " .. tostring(code))
-        return "I sense a disturbance in the Force... (AI Connection Failed)"
+        return "I have a bad feeling about this... (AI Error)"
     end
 
-    -- 5. Decode the answer
     local response_string = table.concat(response_body)
     local response_data = json.decode(response_string)
 

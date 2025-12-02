@@ -1,5 +1,6 @@
 local ObjectManager = require("managers.object.object_manager")
 local AiBrain = require("custom_scripts.ai_brain")
+local AiRegistry = require("custom_scripts.ai_registry")
 
 padawanConvoHandler = conv_handler:new {}
 
@@ -93,23 +94,43 @@ function padawanConvoHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
     -- print("[PADAWAN] Player Spoke: " .. spatialMsg .. " | Padawan is listening.")
 
     -- 4. KEYWORD CHECK
+    -- In the future, we can make this keyword dynamic too!
     if string.find(string.lower(spatialMsg), "padawan") then
-        print("[PADAWAN] Sending request to AI Brain: " .. spatialMsg)
         
-        -- A. Ask the AI for a response
-        -- This calls the function we wrote in ai_brain.lua
-        local aiResponse = AiBrain.askPadawan(spatialMsg)
+        -- LOAD THE PROFILE
+        -- For now, we hardcode that this specific NPC uses the "padawan" profile.
+        -- Later, we can store this "profile_key" on the NPC object itself using writeData!
+        local profile = AiRegistry.getProfile("padawan")
+        
+        print("[AI] Request for profile: " .. profile.name)
+        
+        -- A. Ask the AI (Passing the profile info now!)
+        local aiResponse = AiBrain.askBrain(spatialMsg, profile)
 
-        -- B. Speak the AI's response in game
+        -- B. Speak response
         spatialChat(pPadawan, aiResponse)
         CreatureObject(pPadawan):doAnimation("conversation_1")
 
-        -- C. LOGIC: CHECK FOR HEAL
-        -- We check if the PLAYER asked for a heal.
-        if string.find(string.lower(spatialMsg), "heal") then
-            print("[PADAWAN] Heal command detected! calling C++ Logic...")
-            -- Note: pPadawan is the 'Agent', pPlayer is the 'Target'
-            LuaAiAgent(pPadawan):healCreatureTarget(pPlayer)
+        -- C. DYNAMIC SKILL CHECK
+        -- Loop through the skills defined in the Registry for this profile
+        for keyword, skillData in pairs(profile.skills) do
+            
+            if string.find(string.lower(spatialMsg), keyword) then
+                print("[AI] Skill Triggered: " .. keyword)
+                
+                -- 1. Perform Animation from config
+                if skillData.animation then
+                    CreatureObject(pPadawan):doAnimation(skillData.animation)
+                end
+
+                -- 2. Call C++ Function dynamically
+                if skillData.cpp_function == "healCreatureTarget" then
+                    LuaAiAgent(pPadawan):healCreatureTarget(pPlayer)
+                end
+                
+                -- Note: To make this truly modular, we would need to expose a generic
+                -- "performAction(name)" to C++, but for now, checking the string is fine.
+            end
         end
     end
 
