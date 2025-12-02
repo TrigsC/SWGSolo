@@ -38,8 +38,8 @@ fi
     sleep 5
     fi
 
-    mysql swgemu -vvvvv -e "update galaxy set address = '${GALAXY_ADDRESS}';select * from galaxy;"
-    mysql swgemu -vvvvv -e "update accounts set salt='', password=sha1('${ADMIN_PASS}') where username = 'admin';"
+    #mysql swgemu -vvvvv -e "update galaxy set address = '${GALAXY_ADDRESS}';select * from galaxy;"
+    #mysql swgemu -vvvvv -e "update accounts set salt='', password=sha1('${ADMIN_PASS}') where username = 'admin';"
 ) 2>&1 | tee screenlog.0
 
 export ASAN_OPTIONS='atexit=1:stats=1:detect_stack_use_after_return=1'
