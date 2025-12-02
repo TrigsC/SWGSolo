@@ -1,5 +1,5 @@
 local ObjectManager = require("managers.object.object_manager")
-local AiBrain = require("custom.ai_brain")
+local AiBrain = require("custom_scripts.ai_brain")
 
 padawanConvoHandler = conv_handler:new {}
 
