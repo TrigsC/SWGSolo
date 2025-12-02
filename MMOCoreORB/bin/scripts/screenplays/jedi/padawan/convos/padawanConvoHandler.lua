@@ -107,20 +107,9 @@ function padawanConvoHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
         -- C. LOGIC: CHECK FOR HEAL
         -- We check if the PLAYER asked for a heal.
         if string.find(string.lower(spatialMsg), "heal") then
-            print("[PADAWAN] Heal command detected! Casting...")
-            
-            -- 1. Play a cool animation
-            CreatureObject(pPadawan):doAnimation("force_healing_1")
-
-            -- 2. Actually Apply the Heal (Heal 500 Health/Action/Mind)
-            -- Argument 2 is the stat type (0=Health, 3=Action, 6=Mind), Argument 3 is amount
-            local pCreature = CreatureObject(pPlayer)
-            pCreature:healDamage(pPlayer, 0, 500) -- Heal Health
-            pCreature:healDamage(pPlayer, 3, 500) -- Heal Action
-            pCreature:healDamage(pPlayer, 6, 500) -- Heal Mind
-            
-            -- Visual effect on the player so you know it worked
-            pCreature:playEffect("clienteffect/pl_force_heal_self.cef", "")
+            print("[PADAWAN] Heal command detected! calling C++ Logic...")
+            -- Note: pPadawan is the 'Agent', pPlayer is the 'Target'
+            LuaAiAgent(pPadawan):healCreatureTarget(pPlayer)
         end
     end
 

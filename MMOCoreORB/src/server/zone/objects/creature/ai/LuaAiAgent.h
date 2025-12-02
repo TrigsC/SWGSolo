@@ -130,6 +130,7 @@ namespace ai {
 		int storePet(lua_State* L);
 		int setEventArea(lua_State* L);
 		int setHamRegenDisabled(lua_State* L);
+		int healCreatureTarget(lua_State* L);
 	private:
 		AiAgent* realObject;
 	};

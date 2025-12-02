@@ -134,6 +134,7 @@ Luna<LuaAiAgent>::RegType LuaAiAgent::Register[] = {
 		{ "storePet", &LuaAiAgent::storePet },
 		{ "setEventArea", &LuaAiAgent::setEventArea },
 		{ "setHamRegenDisabled", &LuaAiAgent::setHamRegenDisabled },
+		{ "healCreatureTarget", &LuaAiAgent::healCreatureTarget },
 		{ 0, 0 }
 };
 
@@ -1070,4 +1071,25 @@ int LuaAiAgent::setHamRegenDisabled(lua_State* L) {
 	realObject->setHamRegenDisabled(regenDisabled);
 
 	return 0;
+}
+
+int LuaAiAgent::healCreatureTarget(lua_State* L) {
+    // 1. The Lua script passes the Player object as an argument.
+    // In the Lua Stack, it is the last item.
+    SceneObject* target = (SceneObject*)lua_touserdata(L, -1);
+
+    // 2. Safety Checks
+    if (realObject == nullptr || target == nullptr) {
+        return 0;
+    }
+
+    // 3. Make sure the target is actually a Creature (Player/Mob)
+    if (!target->isCreatureObject()) {
+        return 0;
+    }
+
+    // 4. Call your specific logic in AiAgentImplementation.cpp
+    realObject->healCreatureTarget(target->asCreatureObject());
+
+    return 0;
 }
