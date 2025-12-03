@@ -103,6 +103,21 @@ function AiGlobalChatHandler:getPlayerContext(pPlayer)
     return context
 end
 
+function AiGlobalChatHandler:getNpcContext(pTarget)
+    if (pTarget == nil) then return "" end
+    
+    -- Get the visible name (e.g., "Ra'He Fiwo" or "Stormtrooper")
+    local name = SceneObject(pTarget):getDisplayedName()
+    
+    local context = "Your name is " .. name .. "."
+
+    -- Optional: Add Location (Planet) so they know where they are
+    local zoneName = SceneObject(pTarget):getZoneName()
+    context = context .. " You are currently on the planet " .. zoneName .. "."
+
+    return context
+end
+
 function AiGlobalChatHandler:registerObservers(pPlayer)
     if (pPlayer == nil) then return end
 
@@ -156,13 +171,15 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
     end
     -- --- NEW CONTEXT BLOCK ---
     local playerContext = self:getPlayerContext(pPlayer)
-    print("[AI Global] Context: " .. playerContext)
+    local npcContext = self:getNpcContext(pTarget)
+    print("[AI Global] Player Context: " .. playerContext)
+    print("[AI Global] Npc Context: " .. npcContext)
     print("[AI Global] Targeted Chat detected for Profile: " .. profile.name)
     -- -------------------------
 
     -- E. TRIGGER THE AI
     -- We pass the context as a 3rd argument now
-    local aiResponse = AiBrain.askBrain(spatialMsg, profile, playerContext)
+    local aiResponse = AiBrain.askBrain(spatialMsg, profile, playerContext, npcContext)
 
     spatialChat(pTarget, aiResponse)
     
