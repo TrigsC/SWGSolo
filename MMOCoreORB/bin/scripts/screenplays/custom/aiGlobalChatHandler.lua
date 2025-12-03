@@ -19,7 +19,7 @@ end
 -- 2. LOGIN HANDLER
 -- Standard Core3 automatically calls "onPlayerLoggedIn" for all registered screenplays.
 -- We use this to attach the ears (Observer) to the player.
-function AiGlobalChatHandler.onPlayerLoggedIn(pPlayer)
+function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
     
     -- Safety Check 1: Did we get a valid object?
     if (pPlayer == nil) then 
