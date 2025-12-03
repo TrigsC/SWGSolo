@@ -137,14 +137,12 @@ end
 ----------------------------------------------------------------------
 -- 2. Nearby LOGIC
 ----------------------------------------------------------------------
-function AiGlobalChatHandler:findNearbyResponder(pPlayer, message)
+function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTargetID)
     
     local pScenePlayer = SceneObject(pPlayer)
     if (pScenePlayer == nil) then return nil end
 
-    -- THIS NOW WORKS THANKS TO YOUR C++ EDIT!
     local nearbyObjects = pScenePlayer:getInRangeObjects()
-    
     if (nearbyObjects == nil) then return nil end
 
     local bestMatch = nil
@@ -153,13 +151,10 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message)
     for i = 1, #nearbyObjects, 1 do
         local pObj = nearbyObjects[i]
         
-        -- Filter: Must be a Creature (NPC/Pet), Not the Player, and Close by
         if (pObj ~= nil and pObj ~= pPlayer and SceneObject(pObj):isCreatureObject()) then
             
-            -- Manual Distance Check (CloseObjects can include things 100m+ away)
             if (pScenePlayer:isInRangeWithObject(pObj, 20)) then
                 
-                -- Check Registry
                 local profile = AiRegistry.getProfile(pObj)
                 
                 if (profile ~= nil) then
@@ -179,11 +174,17 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message)
                         end
                     end
 
-                    -- Check C: Ownership (The "Smart" Check)
                     if (isMatch) then
+                        -- PRIORITY 1: Ownership (My pet always obeys me first)
                         local owner = CreatureObject(pObj):getOwner()
-                        if (owner == pPlayer) then return pObj end -- Priority
+                        if (owner == pPlayer) then return pObj end 
                         
+                        -- PRIORITY 2: Preferred Target (The one I am looking at)
+                        if (preferredTargetID ~= 0 and SceneObject(pObj):getObjectID() == preferredTargetID) then
+                            return pObj
+                        end
+
+                        -- PRIORITY 3: Proximity (Backup)
                         if (bestMatch == nil) then bestMatch = pObj end
                     end
                 end
@@ -204,54 +205,55 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
     local spatialMsg = getChatMessage(pChatMessage)
     if (spatialMsg == nil or spatialMsg == "") then return 0 end
 
-    -- B. DETERMINE THE TARGET
+    -- B. GET TARGET ID (But don't decide yet)
     local pCreature = CreatureObject(pPlayer)
     local targetID = pCreature:getTargetID()
     local pTarget = nil
 
-    -- Priority 1: Use Hard Target
-    if (targetID ~= 0) then
-        local pPossibleTarget = getSceneObject(targetID)
-        if (pPossibleTarget ~= nil and SceneObject(pPossibleTarget):isCreatureObject()) then
-            -- Only use target if it has a valid AI Profile
-            if (AiRegistry.getProfile(pPossibleTarget) ~= nil) then
-                pTarget = pPossibleTarget
-                print("[AI Global] Using Selected Target.")
+    -- C. STRATEGY: KEYWORDS FIRST
+    -- We pass the targetID so the scanner can use it as a tie-breaker, 
+    -- but if the message says "Padawan", the scanner will return the Padawan 
+    -- even if 'targetID' points to a SpecForce Marine.
+    pTarget = self:findNearbyResponder(pPlayer, spatialMsg, targetID)
+
+    if (pTarget ~= nil) then
+        print("[AI Global] Auto-detected responder via keyword.")
+    else
+        -- D. FALLBACK: TARGET
+        -- No keyword matched? Okay, talk to the person we are looking at.
+        if (targetID ~= 0) then
+            local pPossibleTarget = getSceneObject(targetID)
+            
+            if (pPossibleTarget ~= nil and SceneObject(pPossibleTarget):isCreatureObject()) then
+                -- Only use if they have a valid profile
+                if (AiRegistry.getProfile(pPossibleTarget) ~= nil) then
+                    pTarget = pPossibleTarget
+                    print("[AI Global] Using Hard Target (No keyword detected).")
+                end
             end
         end
     end
 
-    -- Priority 2: Scan for Keyword/Name match if no valid target found
-    if (pTarget == nil) then
-        pTarget = self:findNearbyResponder(pPlayer, spatialMsg)
-        if (pTarget ~= nil) then
-            print("[AI Global] Auto-detected responder via keyword/name.")
-        end
-    end
-
-    -- If we still have no target, we give up
+    -- If still no target, we are done.
     if (pTarget == nil) then
         return 0
     end
 
-    -- C. CHECK DISTANCE (15 meters)
+    -- E. CHECK DISTANCE
     if (not SceneObject(pPlayer):isInRangeWithObject(pTarget, 15)) then
         return 0
     end
 
-    -- D. LOAD PROFILE
+    -- F. EXECUTE AI
     local profile = AiRegistry.getProfile(pTarget)
-    if (profile == nil) then return 0 end -- Should catch this above, but safety first
+    if (profile == nil) then return 0 end
 
-    -- E. TRIGGER THE AI
     local playerContext = self:getPlayerContext(pPlayer)
     local npcContext = self:getNpcContext(pTarget)
     
-    -- Send to Brain
     local aiResponse = AiBrain.askBrain(spatialMsg, profile, playerContext, npcContext)
     spatialChat(pTarget, aiResponse)
     
-    -- Handle Skills
     if profile.skills then
         for keyword, skillData in pairs(profile.skills) do
             if string.find(string.lower(spatialMsg), keyword) then
