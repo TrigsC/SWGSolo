@@ -1,6 +1,6 @@
 local ObjectManager = require("managers.object.object_manager")
-local AiBrain = require("custom.ai_brain")
-local AiRegistry = require("custom.ai_registry")
+local AiBrain = require("custom_scripts.ai_brain")
+local AiRegistry = require("custom_scripts.ai_registry")
 
 local FactionRanks = {
     [0] = "Recruit",
