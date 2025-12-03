@@ -11,17 +11,30 @@ local brain_url = "http://ollama_brain:11434/api/generate"
 function AiBrain.askBrain(player_input, npc_profile)
     
     -- Default to a generic prompt if the profile is missing
-    local system_instruction = "You are a Star Wars character."
+    local system_instruction = "You are a Star Wars character between A New Hope and The Empire Strikes Back films."
     if npc_profile and npc_profile.system_prompt then
         system_instruction = npc_profile.system_prompt
     end
 
+    -- Validate context (default to empty string if missing)
+    local context_str = ""
+    if player_context then
+        context_str = " " .. player_context
+    end
+
+    -- GLOBAL RULES:
+    -- We append these strict rules to EVERY request to keep the chat clean.
+    local formatting_rules = " Do not describe actions or use asterisks (*). Speak only the dialogue. Keep the response brief."
+
     -- 1. Setup the instructions for the AI
     local payload = {
         model = "llama3.2",
-        -- SYSTEM PROMPT: Who the NPC is
-        -- USER PROMPT: What the player said
-        prompt = system_instruction .. " The player says: '" .. player_input .. "'.",
+        -- LOGIC:
+        -- 1. Who the NPC is (System Prompt)
+        -- 2. Who the Player is (Context)
+        -- 3. Rules (Formatting)
+        -- 4. Input (Chat)
+        prompt = system_instruction .. context_str .. formatting_rules .. " The player says: '" .. player_input .. "'.",
         stream = false
     }
 

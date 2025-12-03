@@ -41,6 +41,49 @@ function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
     return 0
 end
 
+function AiGlobalChatHandler:getPlayerContext(pPlayer)
+    if (pPlayer == nil) then return "" end
+    
+    local pCreature = CreatureObject(pPlayer)
+    local name = pCreature:getFirstName()
+    
+    -- 1. FACTION
+    local faction = "Civilian"
+    if (pCreature:isRebel()) then faction = "Rebel" end
+    if (pCreature:isImperial()) then faction = "Imperial" end
+
+    -- 2. RANK
+    -- We only care about rank if they are declared
+    local rankTitle = ""
+    if (faction ~= "Civilian") then
+        local rankID = pCreature:getFactionRank()
+        if (FactionRanks[rankID]) then
+            rankTitle = FactionRanks[rankID]
+        else
+            rankTitle = "Rank " .. rankID
+        end
+    end
+
+    -- 3. SPECIES (Optional, requires ID mapping, keeping simple for now)
+    -- local species = "Humanoid"
+
+    -- 4. CONSTRUCT SENTENCE
+    local context = "The player's name is " .. name .. "."
+    
+    if (faction ~= "Civilian") then
+        context = context .. " They are a " .. faction .. " " .. rankTitle .. "."
+    else
+        context = context .. " They are a civilian."
+    end
+
+    -- 5. JEDI CHECK (Fun addition)
+    if (pCreature:hasSkill("force_title_jedi_novice")) then
+        context = context .. " They appear to be force sensitive."
+    end
+    
+    return context
+end
+
 function AiGlobalChatHandler:registerObservers(pPlayer)
     if (pPlayer == nil) then return end
 
@@ -92,11 +135,15 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
     if (profile == nil) then
         return 0
     end
+    -- --- NEW CONTEXT BLOCK ---
+    local playerContext = self:getPlayerContext(pPlayer)
+    print("[AI Global] Context: " .. playerContext)
+    print("[AI Global] Targeted Chat detected for Profile: " .. profile.name)
+    -- -------------------------
 
     -- E. TRIGGER THE AI
-    print("[AI Global] Targeted Chat detected for Profile: " .. profile.name)
-    
-    local aiResponse = AiBrain.askBrain(spatialMsg, profile)
+    -- We pass the context as a 3rd argument now
+    local aiResponse = AiBrain.askBrain(spatialMsg, profile, playerContext)
 
     spatialChat(pTarget, aiResponse)
     
