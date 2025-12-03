@@ -3,7 +3,7 @@ local AiBrain = require("custom_scripts.ai_brain")
 local AiRegistry = require("custom_scripts.ai_registry")
 
 AiGlobalChatHandler = ScreenPlay:new {
-    numberOfActs = 1,
+    --numberOfActs = 1,
 }
 
 --registerScreenPlay("AiGlobalChatHandler", true)
