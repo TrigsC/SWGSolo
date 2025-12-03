@@ -6,31 +6,43 @@ AiGlobalChatHandler = ScreenPlay:new {
     --numberOfActs = 1,
 }
 
---registerScreenPlay("AiGlobalChatHandler", true)
+-- 1. CRITICAL FIX: Uncomment this! 
+registerScreenPlay("AiGlobalChatHandler", true)
 
 ----------------------------------------------------------------------
 -- 1. STARTUP & LOGIN LOGIC
 ----------------------------------------------------------------------
 function AiGlobalChatHandler:start()
-    -- This runs when the server boots up
     print("[AI Global] Handler Started.")
+    
+    -- 2. CRITICAL FIX: Bind the Login Observer
+    -- Since "onPlayerLoggedIn" isn't automatic, we attach an observer to the ZoneServer.
+    -- Event 2 = PLAYERLOGGEDIN
+    local pZoneServer = getZoneServer()
+    if (pZoneServer ~= nil) then
+        createObserver(PLAYERLOGGEDIN, "AiGlobalChatHandler", "onPlayerLoggedIn", pZoneServer)
+        print("[AI Global] Login Observer attached to ZoneServer.")
+    else
+        print("[AI Global] ERROR: Could not find ZoneServer to attach observer.")
+    end
+end
+
+-- This function is now called by the Observer we created in start()
+function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
+    if (pPlayer == nil) then return 0 end
+    
+    self:registerObservers(pPlayer)
+    print("[AI Global] Chat Observer attached to " .. SceneObject(pPlayer):getCustomObjectName())
+    
+    return 0
 end
 
 function AiGlobalChatHandler:registerObservers(pPlayer)
-	createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
-    print("[AI Global] Chat Observer attached to player.")
-end
-
--- This function is automatically called by Core3 when a player logs in
--- We use it to attach the "ears" (Chat Observer) immediately.
-function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
-    if (pPlayer == nil) then return end
-    
     -- Observer 50 = SPATIALCHATSENT
-    -- We attach it to the player so we hear everything they say
-    self:registerObservers(pPlayer)
-    --createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
-    print("[AI Global] Chat Observer.")
+    -- Check if already attached to avoid duplicates (optional but good)
+    if (not hasObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)) then
+        createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
+    end
 end
 
 ----------------------------------------------------------------------
@@ -45,24 +57,26 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
     if (spatialMsg == nil or spatialMsg == "") then return 0 end
 
     -- B. GET THE TARGET
-    -- We check who the player is actually looking at/targeting
     local pCreature = CreatureObject(pPlayer)
+    
+    -- 3. CRITICAL FIX: You were trying to use targetID before defining it!
+    local targetID = pCreature:getTargetID()
+
+    -- Check if they have a target
+    if (targetID == 0) then return 0 end
+
     local pTarget = getSceneObject(targetID)
 
     if (pTarget == nil or not SceneObject(pTarget):isCreatureObject()) then
-		return 0
-	end
+        return 0
+    end
 
-    -- C. VALIDATE THE TARGET
-    --if (pTarget == nil or not pTarget:isCreatureObject()) then return 0 end
-
-    -- Check Distance (Must be within 15 meters)
+    -- C. CHECK DISTANCE (Must be within 15 meters)
     if (not SceneObject(pPlayer):isInRangeWithObject(pTarget, 15)) then
         return 0
     end
 
     -- D. CHECK THE REGISTRY
-    -- Does this NPC have a brain?
     local templatePath = SceneObject(pTarget):getTemplateObjectPath()
     local profile = AiRegistry.getProfileByTemplate(templatePath)
 
@@ -92,7 +106,6 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
 
                 -- Call C++ Function
                 if skillData.cpp_function == "healCreatureTarget" then
-                    -- We use the Bridge function we made earlier!
                     LuaAiAgent(pTarget):healCreatureTarget(pPlayer)
                 end
             end
