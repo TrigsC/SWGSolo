@@ -17,7 +17,7 @@ local FactionRanks = {
     [11] = "Lieutenant",
     [12] = "Captain",
     [13] = "Major",
-    [14] = "Lt. Colonel",
+    [14] = "Lieutenant Colonel",
     [15] = "Colonel",
 }
 
