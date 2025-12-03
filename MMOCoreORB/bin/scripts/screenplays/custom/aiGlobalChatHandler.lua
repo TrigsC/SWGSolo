@@ -146,6 +146,7 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
     if (nearbyObjects == nil) then return nil end
 
     local bestMatch = nil
+    local closestDistance = 999 -- Start with a huge number
     local messageLower = string.lower(message)
 
     for i = 1, #nearbyObjects, 1 do
@@ -153,6 +154,7 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
         
         if (pObj ~= nil and pObj ~= pPlayer and SceneObject(pObj):isCreatureObject()) then
             
+            -- Check if in general range (20m)
             if (pScenePlayer:isInRangeWithObject(pObj, 20)) then
                 
                 local profile = AiRegistry.getProfile(pObj)
@@ -175,17 +177,24 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
                     end
 
                     if (isMatch) then
-                        -- PRIORITY 1: Ownership (My pet always obeys me first)
+                        -- PRIORITY 1: Ownership (Immediate Winner)
                         local owner = CreatureObject(pObj):getOwner()
                         if (owner == pPlayer) then return pObj end 
                         
-                        -- PRIORITY 2: Preferred Target (The one I am looking at)
+                        -- PRIORITY 2: Preferred Target (Immediate Winner)
                         if (preferredTargetID ~= 0 and SceneObject(pObj):getObjectID() == preferredTargetID) then
                             return pObj
                         end
 
-                        -- PRIORITY 3: Proximity (Backup)
-                        if (bestMatch == nil) then bestMatch = pObj end
+                        -- PRIORITY 3: Proximity (The Fix)
+                        -- Calculate exact distance to the player
+                        local dist = pScenePlayer:getDistanceTo(pObj)
+                        
+                        -- If this NPC is closer than the last one we found, make them the winner
+                        if (dist < closestDistance) then
+                            closestDistance = dist
+                            bestMatch = pObj
+                        end
                     end
                 end
             end
