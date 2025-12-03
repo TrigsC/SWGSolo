@@ -51,7 +51,7 @@ function padawanConvoHandler:runScreenHandlers(pConvTemplate, pPlayer, pNpc, sel
             writeData(playerID .. ":linked_padawan_id", petID)
             
             -- ATTACH OBSERVER TO THE PLAYER (pPlayer), NOT THE NPC
-            createObserver(observerID, "padawanConvoHandler", "notifySpatialChatSent", pPlayer)
+            --createObserver(observerID, "padawanConvoHandler", "notifySpatialChatSent", pPlayer)
             
             clonedScreen:setCustomDialogText("System: AI Neural Link Established.\n(I am now listening to YOU...)")
             print("[PADAWAN] Observer attached to PLAYER: " .. playerID)

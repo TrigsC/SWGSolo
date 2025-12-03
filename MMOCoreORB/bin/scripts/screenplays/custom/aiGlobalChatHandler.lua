@@ -62,64 +62,67 @@ end
 ----------------------------------------------------------------------
 function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothing)
     
+    -- DEBUG 1: Did the observer fire at all?
+    -- print("[AI Debug] Observer Triggered by: " .. SceneObject(pPlayer):getCustomObjectName())
+
     if (pPlayer == nil or pChatMessage == nil) then return 0 end
 
     -- A. Decode the message
     local spatialMsg = getChatMessage(pChatMessage)
     if (spatialMsg == nil or spatialMsg == "") then return 0 end
 
+    -- DEBUG 2: What did they say?
+    -- print("[AI Debug] Message: " .. spatialMsg)
+
     -- B. GET THE TARGET
     local pCreature = CreatureObject(pPlayer)
-    
-    -- 3. FIX: Define targetID BEFORE we try to use it
     local targetID = pCreature:getTargetID()
 
+    -- DEBUG 3: Do they have a target?
     if (targetID == 0) then 
-        -- Player is not looking at anyone, ignore.
+        -- print("[AI Debug] Ignored: Player has no target selected.")
         return 0 
     end
 
     local pTarget = getSceneObject(targetID)
 
     if (pTarget == nil or not SceneObject(pTarget):isCreatureObject()) then
+        -- print("[AI Debug] Ignored: Target is not a creature.")
         return 0
     end
 
-    -- C. CHECK DISTANCE (Must be within 15 meters)
+    -- C. CHECK DISTANCE (15 meters)
     if (not SceneObject(pPlayer):isInRangeWithObject(pTarget, 15)) then
+        print("[AI Debug] Ignored: Target is too far away.")
         return 0
     end
 
     -- D. CHECK THE REGISTRY
-    -- Does this NPC have a brain entry in ai_registry.lua?
     local templatePath = SceneObject(pTarget):getTemplateObjectPath()
+    
+    -- DEBUG 4: Check the template path
+    print("[AI Debug] Checking Template: " .. templatePath)
+    
     local profile = AiRegistry.getProfileByTemplate(templatePath)
 
     if (profile == nil) then
-        -- This is just a normal NPC, ignore it.
+        print("[AI Debug] Ignored: No profile found for this template.")
         return 0
     end
 
     -- E. TRIGGER THE AI
-    print("[AI Global] Targeted Chat detected for: " .. profile.name)
+    print("[AI Global] SUCCESS! Targeted Chat detected for: " .. profile.name)
     
-    -- 1. Get Response from Brain
     local aiResponse = AiBrain.askBrain(spatialMsg, profile)
 
-    -- 2. Make the NPC Speak
     spatialChat(pTarget, aiResponse)
     
-    -- 3. Check for Skills (Heals/Buffs)
     if profile.skills then
         for keyword, skillData in pairs(profile.skills) do
             if string.find(string.lower(spatialMsg), keyword) then
-                
-                -- Play Animation
                 if skillData.animation then
                     CreatureObject(pTarget):doAnimation(skillData.animation)
                 end
-
-                -- Call C++ Function
                 if skillData.cpp_function == "healCreatureTarget" then
                     LuaAiAgent(pTarget):healCreatureTarget(pPlayer)
                 end
