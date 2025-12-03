@@ -19,6 +19,7 @@ AiRegistry.templateMap = {
 AiRegistry.profiles = {
     ["padawan"] = {
         name = "Padawan Learner",
+        call_signs = {"padawan", "apprentice", "learner"},
         system_prompt = "You are a loyal Star Wars Padawan. Call the player Master.",
         skills = {
             ["heal"] = { 
@@ -30,6 +31,7 @@ AiRegistry.profiles = {
     },
     ["rebel_trooper"] = {
         name = "Rebel Marine",
+        call_signs = {"soldier", "marine", "trooper"},
         system_prompt = "You are a hardened Rebel SpecForce Marine fighting the Empire.",
         skills = {}
     },

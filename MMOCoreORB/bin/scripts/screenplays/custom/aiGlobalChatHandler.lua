@@ -135,54 +135,130 @@ function AiGlobalChatHandler:registerObservers(pPlayer)
 end
 
 ----------------------------------------------------------------------
+-- 2. Nearby LOGIC
+----------------------------------------------------------------------
+function AiGlobalChatHandler:findNearbyResponder(pPlayer, message)
+    -- 1. Scan area (20 meters)
+    local pZoneServer = getZoneServer()
+    if (pZoneServer == nil) then return nil end
+    
+    local nearbyObjects = pZoneServer:getNearbyCreatures(pPlayer, 20)
+    if (nearbyObjects == nil) then return nil end
+
+    local bestMatch = nil
+    local messageLower = string.lower(message)
+
+    -- 2. Iterate through them
+    for i = 1, #nearbyObjects, 1 do
+        local pCreature = nearbyObjects[i]
+        
+        -- Don't talk to yourself
+        if (pCreature ~= pPlayer) then
+            
+            -- Check Registry Profile
+            local profile = AiRegistry.getProfile(pCreature)
+            
+            if (profile ~= nil) then
+                local isMatch = false
+                
+                -- CHECK A: Is the player saying the NPC's Name?
+                local name = string.lower(SceneObject(pCreature):getDisplayedName())
+                if (string.find(messageLower, name)) then
+                    isMatch = true
+                end
+
+                -- CHECK B: Is the player saying a Call Sign?
+                if (not isMatch and profile.call_signs) then
+                    for k, sign in pairs(profile.call_signs) do
+                        if (string.find(messageLower, sign)) then
+                            isMatch = true
+                            break
+                        end
+                    end
+                end
+
+                if (isMatch) then
+                    -- CHECK C: Ownership Check (The Upgrade)
+                    -- We cast to CreatureObject to ensure we access the method
+                    local owner = CreatureObject(pCreature):getOwner()
+                    
+                    -- If I own this NPC, it is the absolute best match.
+                    -- Return immediately.
+                    if (owner == pPlayer) then
+                        return pCreature 
+                    end
+                    
+                    -- If I don't own it (wild/faction NPC), store as backup.
+                    -- If we already have a backup, we stick with the first one we found (closest)
+                    if (bestMatch == nil) then
+                        bestMatch = pCreature
+                    end
+                end
+            end
+        end
+    end
+
+    return bestMatch
+end
+
+----------------------------------------------------------------------
 -- 2. CHAT LOGIC
 ----------------------------------------------------------------------
 function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothing)
     
     if (pPlayer == nil or pChatMessage == nil) then return 0 end
 
-    -- A. Decode the message
     local spatialMsg = getChatMessage(pChatMessage)
     if (spatialMsg == nil or spatialMsg == "") then return 0 end
 
-    -- B. GET THE TARGET
+    -- B. DETERMINE THE TARGET
     local pCreature = CreatureObject(pPlayer)
     local targetID = pCreature:getTargetID()
+    local pTarget = nil
 
-    if (targetID == 0) then return 0 end
+    -- Priority 1: Use Hard Target
+    if (targetID ~= 0) then
+        local pPossibleTarget = getSceneObject(targetID)
+        if (pPossibleTarget ~= nil and SceneObject(pPossibleTarget):isCreatureObject()) then
+            -- Only use target if it has a valid AI Profile
+            if (AiRegistry.getProfile(pPossibleTarget) ~= nil) then
+                pTarget = pPossibleTarget
+                print("[AI Global] Using Selected Target.")
+            end
+        end
+    end
 
-    local pTarget = getSceneObject(targetID)
+    -- Priority 2: Scan for Keyword/Name match if no valid target found
+    if (pTarget == nil) then
+        pTarget = self:findNearbyResponder(pPlayer, spatialMsg)
+        if (pTarget ~= nil) then
+            print("[AI Global] Auto-detected responder via keyword/name.")
+        end
+    end
 
-    if (pTarget == nil or not SceneObject(pTarget):isCreatureObject()) then
+    -- If we still have no target, we give up
+    if (pTarget == nil) then
         return 0
     end
 
-    -- C. CHECK DISTANCE
+    -- C. CHECK DISTANCE (15 meters)
     if (not SceneObject(pPlayer):isInRangeWithObject(pTarget, 15)) then
         return 0
     end
 
-    -- D. CHECK THE REGISTRY (Simpler now!)
-    -- We pass the whole object to the registry, and it figures out the best match
+    -- D. LOAD PROFILE
     local profile = AiRegistry.getProfile(pTarget)
-
-    if (profile == nil) then
-        return 0
-    end
-    -- --- NEW CONTEXT BLOCK ---
-    local playerContext = self:getPlayerContext(pPlayer)
-    local npcContext = self:getNpcContext(pTarget)
-    print("[AI Global] Player Context: " .. playerContext)
-    print("[AI Global] Npc Context: " .. npcContext)
-    print("[AI Global] Targeted Chat detected for Profile: " .. profile.name)
-    -- -------------------------
+    if (profile == nil) then return 0 end -- Should catch this above, but safety first
 
     -- E. TRIGGER THE AI
-    -- We pass the context as a 3rd argument now
+    local playerContext = self:getPlayerContext(pPlayer)
+    local npcContext = self:getNpcContext(pTarget)
+    
+    -- Send to Brain
     local aiResponse = AiBrain.askBrain(spatialMsg, profile, playerContext, npcContext)
-
     spatialChat(pTarget, aiResponse)
     
+    -- Handle Skills
     if profile.skills then
         for keyword, skillData in pairs(profile.skills) do
             if string.find(string.lower(spatialMsg), keyword) then
