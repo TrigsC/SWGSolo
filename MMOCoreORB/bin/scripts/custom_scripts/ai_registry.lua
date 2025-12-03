@@ -4,9 +4,10 @@ local AiRegistry = {}
 -- This uses the internal name found in scripts/mobile/...
 AiRegistry.mobMap = {
     ["light_jedi_padawan"] = "padawan",
-    ["specforce_marine", "specforce_infiltrator"] = "rebel_trooper", -- Example
-    ["stormtrooper"] = "imperial_trooper", -- Example
-    ["commoner"] = "citizen", -- Example
+    ["specforce_infiltrator"] = "rebel_trooper",
+    ["specforce_marine"] = "rebel_trooper",
+    ["stormtrooper"] = "imperial_trooper",
+    ["commoner"] = "citizen",
 }
 
 -- 2. MAP BY TEMPLATE FILE (Fallback)
