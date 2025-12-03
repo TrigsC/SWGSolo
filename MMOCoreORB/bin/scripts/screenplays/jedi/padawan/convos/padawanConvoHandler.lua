@@ -100,7 +100,7 @@ function padawanConvoHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
         -- LOAD THE PROFILE
         -- For now, we hardcode that this specific NPC uses the "padawan" profile.
         -- Later, we can store this "profile_key" on the NPC object itself using writeData!
-        local profile = AiRegistry.getProfile("padawan")
+        local profile = AiRegistry.getProfileByTemplate("padawan")
         
         print("[AI] Request for profile: " .. profile.name)
         
