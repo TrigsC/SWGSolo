@@ -4,7 +4,7 @@ local AiRegistry = {}
 -- This uses the internal name found in scripts/mobile/...
 AiRegistry.mobMap = {
     ["light_jedi_padawan"] = "padawan",
-    ["specforce_marine"] = "rebel_trooper", -- Example
+    ["specforce_marine", "specforce_infiltrator"] = "rebel_trooper", -- Example
     ["stormtrooper"] = "imperial_trooper", -- Example
     ["commoner"] = "citizen", -- Example
 }
@@ -30,9 +30,9 @@ AiRegistry.profiles = {
         }
     },
     ["rebel_trooper"] = {
-        name = "Rebel Marine",
+        name = "Rebel Special Forces",
         call_signs = {"soldier", "marine", "trooper"},
-        system_prompt = "You are a hardened Rebel SpecForce Marine fighting the Empire.",
+        system_prompt = "You are a hardened Rebel SpecForce fighting the Empire.",
         skills = {}
     },
     ["citizen"] = {
