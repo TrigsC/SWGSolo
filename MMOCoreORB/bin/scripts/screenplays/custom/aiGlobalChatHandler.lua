@@ -48,7 +48,7 @@ function AiGlobalChatHandler.onPlayerLoggedIn(pPlayer)
     
     AiGlobalChatHandler:registerObservers(pPlayer)
     
-    print("[AI Global] Chat Observer attached to player.")
+    print("[AI Global] Attached!")
     
     return 0
 end
