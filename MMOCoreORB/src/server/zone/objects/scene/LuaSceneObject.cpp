@@ -7,12 +7,12 @@
 
 #include "server/zone/objects/scene/LuaSceneObject.h"
 #include "server/zone/objects/scene/SceneObject.h"
-#include "server/zone/objects/scene/CloseObjectsVector.h"
 #include "server/zone/objects/creature/CreatureObject.h"
 #include "server/zone/managers/stringid/StringIdManager.h"
 #include "server/zone/managers/director/DirectorManager.h"
 #include "server/zone/Zone.h"
 #include "server/zone/SpaceZone.h"
+#include "server/zone/CloseObjectsVector.h"
 #include "server/zone/managers/director/ScreenPlayTask.h"
 #include "engine/lua/LuaPanicException.h"
 #include "server/zone/objects/tangible/Container.h"
@@ -1109,4 +1109,46 @@ int LuaSceneObject::isShipComponentRepairKit(lua_State* L) {
 	lua_pushboolean(L, val);
 
 	return 1;
+}
+
+int LuaSceneObject::getInRangeObjects(lua_State* L) {
+    // 1. Check if the underlying object exists
+    if (realObject == nullptr) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    // 2. Get the list of objects the server knows are near this object
+    CloseObjectsVector* closeObjects = (CloseObjectsVector*) realObject->getCloseObjects();
+
+    if (closeObjects == nullptr) {
+        lua_newtable(L); // Return empty table if no vector
+        return 1;
+    }
+
+    lua_newtable(L);
+
+    // 3. Thread-safe read of the objects
+    closeObjects->safeReadLock();
+
+    try {
+        int index = 1;
+        for (int i = 0; i < closeObjects->size(); ++i) {
+            SceneObject* obj = cast<SceneObject*>(closeObjects->get(i).get());
+
+            if (obj != nullptr) {
+                // Push the object to Lua
+                lua_pushlightuserdata(L, obj);
+                // Add to table at index
+                lua_rawseti(L, -2, index++);
+            }
+        }
+    } catch (...) {
+        closeObjects->safeReadUnlock();
+        throw;
+    }
+
+    closeObjects->safeReadUnlock();
+
+    return 1;
 }
