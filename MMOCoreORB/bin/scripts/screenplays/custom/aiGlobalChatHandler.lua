@@ -16,6 +16,11 @@ function AiGlobalChatHandler:start()
     print("[AI Global] Handler Started.")
 end
 
+function AiGlobalChatHandler:registerObservers(pPlayer)
+	createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
+    print("[AI Global] Chat Observer attached to player.")
+end
+
 -- This function is automatically called by Core3 when a player logs in
 -- We use it to attach the "ears" (Chat Observer) immediately.
 function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
@@ -23,8 +28,9 @@ function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
     
     -- Observer 50 = SPATIALCHATSENT
     -- We attach it to the player so we hear everything they say
-    createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
-    print("[AI Global] Chat Observer attached to player.")
+    self:registerObservers(pCreatureObject)
+    --createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
+    print("[AI Global] Chat Observer.")
 end
 
 ----------------------------------------------------------------------
@@ -41,18 +47,14 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
     -- B. GET THE TARGET
     -- We check who the player is actually looking at/targeting
     local pCreature = CreatureObject(pPlayer)
-    local targetID = pCreature:getTargetID()
+    local pTarget = getSceneObject(targetID)
 
-    if (targetID == 0) then 
-        -- Player has no target. 
-        -- Optional: We could check for "Hey Padawan" keywords here and search nearby, 
-        -- but for now, let's stick to the Target requirement.
-        return 0 
-    end
+    if (pTarget == nil or not SceneObject(pTarget):isCreatureObject()) then
+		return 0
+	end
 
     -- C. VALIDATE THE TARGET
-    local pTarget = getSceneObject(targetID)
-    if (pTarget == nil or not pTarget:isCreatureObject()) then return 0 end
+    --if (pTarget == nil or not pTarget:isCreatureObject()) then return 0 end
 
     -- Check Distance (Must be within 15 meters)
     if (not SceneObject(pPlayer):isInRangeWithObject(pTarget, 15)) then
