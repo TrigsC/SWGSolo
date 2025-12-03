@@ -2,6 +2,25 @@ local ObjectManager = require("managers.object.object_manager")
 local AiBrain = require("custom_scripts.ai_brain")
 local AiRegistry = require("custom_scripts.ai_registry")
 
+local FactionRanks = {
+    [0] = "Recruit",
+    [1] = "Private",
+    [2] = "Lance Corporal",
+    [3] = "Corporal",
+    [4] = "Staff Corporal",
+    [5] = "Sergeant",
+    [6] = "Staff Sergeant",
+    [7] = "Master Sergeant",
+    [8] = "Warrent Officer II",
+    [9] = "Warrent Officer I",
+    [10] = "Second Lieutenant",
+    [11] = "Lieutenant",
+    [12] = "Captain",
+    [13] = "Major",
+    [14] = "Lt. Colonel",
+    [15] = "Colonel",
+}
+
 AiGlobalChatHandler = ScreenPlay:new {
     --numberOfActs = 1,
 }
