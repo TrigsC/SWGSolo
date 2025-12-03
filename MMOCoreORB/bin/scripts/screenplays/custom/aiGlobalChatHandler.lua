@@ -11,8 +11,8 @@ local FactionRanks = {
     [5] = "Sergeant",
     [6] = "Staff Sergeant",
     [7] = "Master Sergeant",
-    [8] = "Warrant Officer II",
-    [9] = "Warrant Officer I",
+    [8] = "Warrent Officer II",
+    [9] = "Warrent Officer I",
     [10] = "Second Lieutenant",
     [11] = "Lieutenant",
     [12] = "Captain",
@@ -21,13 +21,11 @@ local FactionRanks = {
     [15] = "Colonel",
 }
 
--- CONFIGURATION
-local AI_RANGE = 20 -- Both Scanner and Chatter will use this now
-
 AiGlobalChatHandler = ScreenPlay:new {
     --numberOfActs = 1,
 }
 
+-- 1. CRITICAL FIX: This registers the script so the server runs it.
 registerScreenPlay("AiGlobalChatHandler", true)
 
 ----------------------------------------------------------------------
@@ -37,41 +35,44 @@ function AiGlobalChatHandler:start()
     print("[AI Global] Handler Started.")
 end
 
-function AiGlobalChatHandler.onPlayerLoggedIn(pPlayer)
+-- 2. LOGIN HANDLER
+-- Standard Core3 automatically calls "onPlayerLoggedIn" for all registered screenplays.
+-- We use this to attach the ears (Observer) to the player.
+function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
+    
+    -- Safety Check 1: Did we get a valid object?
     if (pPlayer == nil) then 
         print("[AI Global] ERROR: onPlayerLoggedIn received nil player!")
         return 0 
     end
 
+    -- Safety Check 2: Is it actually a scene object?
     local pSceneObject = LuaSceneObject(pPlayer)
-    if (pSceneObject == nil) then return 0 end
+    if (pSceneObject == nil) then
+        return 0
+    end
     
+    -- Call the internal function using COLON because we are inside Lua now
     AiGlobalChatHandler:registerObservers(pPlayer)
     
-    print("[AI Global] Attached!")
+    print("[AI Global] Chat Observer attached to " .. pSceneObject:getCustomObjectName())
     
     return 0
 end
 
-function AiGlobalChatHandler:registerObservers(pPlayer)
-    if (pPlayer == nil) then return end
-    dropObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
-    createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
-end
-
-----------------------------------------------------------------------
--- 2. HELPER FUNCTIONS
-----------------------------------------------------------------------
 function AiGlobalChatHandler:getPlayerContext(pPlayer)
     if (pPlayer == nil) then return "" end
     
     local pCreature = CreatureObject(pPlayer)
     local name = pCreature:getFirstName()
     
+    -- 1. FACTION
     local faction = "Civilian"
     if (pCreature:isRebel()) then faction = "Rebel" end
     if (pCreature:isImperial()) then faction = "Imperial" end
 
+    -- 2. RANK
+    -- We only care about rank if they are declared
     local rankTitle = ""
     if (faction ~= "Civilian") then
         local rankID = pCreature:getFactionRank()
@@ -82,6 +83,10 @@ function AiGlobalChatHandler:getPlayerContext(pPlayer)
         end
     end
 
+    -- 3. SPECIES (Optional, requires ID mapping, keeping simple for now)
+    -- local species = "Humanoid"
+
+    -- 4. CONSTRUCT SENTENCE
     local context = "The player's name is " .. name .. "."
     
     if (faction ~= "Civilian") then
@@ -90,6 +95,7 @@ function AiGlobalChatHandler:getPlayerContext(pPlayer)
         context = context .. " They are a civilian."
     end
 
+    -- 5. JEDI CHECK (Fun addition)
     if (pCreature:hasSkill("force_title_jedi_novice")) then
         context = context .. " They appear to be force sensitive."
     end
@@ -100,17 +106,36 @@ end
 function AiGlobalChatHandler:getNpcContext(pTarget)
     if (pTarget == nil) then return "" end
     
+    -- Get the visible name (e.g., "Ra'He Fiwo" or "Stormtrooper")
     local name = SceneObject(pTarget):getDisplayedName()
+    
     local context = "Your name is " .. name .. "."
 
+    -- Optional: Add Location (Planet) so they know where they are
     local zoneName = SceneObject(pTarget):getZoneName()
     context = context .. " You are currently on the planet " .. zoneName .. "."
 
     return context
 end
 
+function AiGlobalChatHandler:registerObservers(pPlayer)
+    if (pPlayer == nil) then return end
+
+    -- FIX: The 'hasObserver' function caused a server crash (SIGSEGV).
+    -- Instead, we use the standard "Drop then Create" pattern.
+    -- This guarantees we never have duplicates and avoids the crashy check.
+    
+    -- 1. Drop any existing observer (Safe to call even if none exists)
+    dropObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
+    
+    -- 2. Create the new observer
+    createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
+    
+    -- print("[AI Global] Chat Observer Refreshed.")
+end
+
 ----------------------------------------------------------------------
--- 3. NEARBY LOGIC
+-- 2. Nearby LOGIC
 ----------------------------------------------------------------------
 function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTargetID)
     
@@ -121,7 +146,7 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
     if (nearbyObjects == nil) then return nil end
 
     local bestMatch = nil
-    local closestDistance = math.huge -- Use standard Infinity
+    local closestDistance = math.huge
     local messageLower = string.lower(message)
 
     for i = 1, #nearbyObjects, 1 do
@@ -129,7 +154,7 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
         
         if (pObj ~= nil and pObj ~= pPlayer and SceneObject(pObj):isCreatureObject()) then
             
-            -- SYNCED: Use the global AI_RANGE constant
+            -- Check if in general range (20m)
             if (pScenePlayer:isInRangeWithObject(pObj, AI_RANGE)) then
                 
                 local profile = AiRegistry.getProfile(pObj)
@@ -137,9 +162,11 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
                 if (profile ~= nil) then
                     local isMatch = false
                     
+                    -- Check A: Name
                     local name = string.lower(SceneObject(pObj):getDisplayedName())
                     if (string.find(messageLower, name)) then isMatch = true end
 
+                    -- Check B: Call Sign
                     if (not isMatch and profile.call_signs) then
                         for k, sign in pairs(profile.call_signs) do
                             if (string.find(messageLower, sign)) then
@@ -150,15 +177,20 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
                     end
 
                     if (isMatch) then
+                        -- PRIORITY 1: Ownership (Immediate Winner)
                         local owner = CreatureObject(pObj):getOwner()
                         if (owner == pPlayer) then return pObj end 
                         
+                        -- PRIORITY 2: Preferred Target (Immediate Winner)
                         if (preferredTargetID ~= 0 and SceneObject(pObj):getObjectID() == preferredTargetID) then
                             return pObj
                         end
 
+                        -- PRIORITY 3: Proximity (The Fix)
+                        -- Calculate exact distance to the player
                         local dist = pScenePlayer:getDistanceTo(pObj)
                         
+                        -- If this NPC is closer than the last one we found, make them the winner
                         if (dist < closestDistance) then
                             closestDistance = dist
                             bestMatch = pObj
@@ -173,7 +205,7 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
 end
 
 ----------------------------------------------------------------------
--- 4. CHAT LOGIC
+-- 2. CHAT LOGIC
 ----------------------------------------------------------------------
 function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothing)
     
@@ -182,21 +214,27 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
     local spatialMsg = getChatMessage(pChatMessage)
     if (spatialMsg == nil or spatialMsg == "") then return 0 end
 
+    -- B. GET TARGET ID (But don't decide yet)
     local pCreature = CreatureObject(pPlayer)
     local targetID = pCreature:getTargetID()
     local pTarget = nil
 
-    -- 1. Scan for Keyword Match first (Highest Priority)
+    -- C. STRATEGY: KEYWORDS FIRST
+    -- We pass the targetID so the scanner can use it as a tie-breaker, 
+    -- but if the message says "Padawan", the scanner will return the Padawan 
+    -- even if 'targetID' points to a SpecForce Marine.
     pTarget = self:findNearbyResponder(pPlayer, spatialMsg, targetID)
 
     if (pTarget ~= nil) then
         print("[AI Global] Auto-detected responder via keyword.")
     else
-        -- 2. Fallback to Hard Target if no keyword found
+        -- D. FALLBACK: TARGET
+        -- No keyword matched? Okay, talk to the person we are looking at.
         if (targetID ~= 0) then
             local pPossibleTarget = getSceneObject(targetID)
             
             if (pPossibleTarget ~= nil and SceneObject(pPossibleTarget):isCreatureObject()) then
+                -- Only use if they have a valid profile
                 if (AiRegistry.getProfile(pPossibleTarget) ~= nil) then
                     pTarget = pPossibleTarget
                     print("[AI Global] Using Hard Target (No keyword detected).")
@@ -205,27 +243,24 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
         end
     end
 
+    -- If still no target, we are done.
     if (pTarget == nil) then
         return 0
     end
 
-    -- 3. FINAL DISTANCE CHECK
-    -- SYNCED: Uses the same AI_RANGE (20) as the scanner
+    -- E. CHECK DISTANCE
     if (not SceneObject(pPlayer):isInRangeWithObject(pTarget, AI_RANGE)) then
         print("[AI Debug] Ignored: Target found, but out of range (" .. AI_RANGE .. "m).")
         return 0
     end
 
-    -- 4. LOAD PROFILE
+    -- F. EXECUTE AI
     local profile = AiRegistry.getProfile(pTarget)
     if (profile == nil) then 
         print("[AI Debug] Ignored: Registry returned nil profile.")
         return 0 
     end
 
-    -- 5. TRIGGER
-    print("[AI Global] Processing Chat for: " .. profile.name)
-    
     local playerContext = self:getPlayerContext(pPlayer)
     local npcContext = self:getNpcContext(pTarget)
     
