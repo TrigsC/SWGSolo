@@ -19,11 +19,13 @@ end
 -- 2. LOGIN HANDLER
 -- Standard Core3 automatically calls "onPlayerLoggedIn" for all registered screenplays.
 -- We use this to attach the ears (Observer) to the player.
-function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
+function AiGlobalChatHandler.onPlayerLoggedIn(pPlayer)
     if (pPlayer == nil) then return 0 end
     
-    self:registerObservers(pPlayer)
-    print("[AI Global] Chat Observer attached to player.")
+    -- NOTICE: Changed 'self' to 'AiGlobalChatHandler' explicitly
+    AiGlobalChatHandler:registerObservers(pPlayer)
+    
+    print("[AI Global] Chat Observer attached to " .. SceneObject(pPlayer):getCustomObjectName())
     
     return 0
 end

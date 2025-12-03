@@ -1723,10 +1723,12 @@ void PlayerObjectImplementation::notifyOnline() {
 	*luaOnPlayerLoggedIn << playerCreature;
 	luaOnPlayerLoggedIn->callFunction();
 
-	playerCreature->notifyObservers(ObserverEventType::LOGGEDIN);
-
 	// AI should listen to the player once logged in
-	DirectorManager::instance()->runScreenPlays("AiGlobalChatHandler", "onPlayerLoggedIn", playerCreature);
+	Reference<LuaFunction*> luaAiChat = lua->createFunction("AiGlobalChatHandler", "onPlayerLoggedIn", 0);
+    *luaAiChat << playerCreature;
+    luaAiChat->callFunction();
+
+	playerCreature->notifyObservers(ObserverEventType::LOGGEDIN);
 
 	// Set speed if player isn't mounted.
 	if (!playerCreature->isRidingMount())
