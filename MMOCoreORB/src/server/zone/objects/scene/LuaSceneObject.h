@@ -57,6 +57,7 @@ namespace scene {
 		int getContainerObject(lua_State* L);
 		int getContainerObjectById(lua_State* L);
 		int getContainerObjectsSize(lua_State* L);
+		int getInRangeObjects(lua_State* L);
 		int getCountableObjectsRecursive(lua_State* L);
 		int getContainerVolumeLimit(lua_State* L);
 		int isContainerFull(lua_State* L);

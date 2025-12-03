@@ -7,6 +7,7 @@
 
 #include "server/zone/objects/scene/LuaSceneObject.h"
 #include "server/zone/objects/scene/SceneObject.h"
+#include "server/zone/objects/scene/CloseObjectsVector.h"
 #include "server/zone/objects/creature/CreatureObject.h"
 #include "server/zone/managers/stringid/StringIdManager.h"
 #include "server/zone/managers/director/DirectorManager.h"
@@ -104,6 +105,7 @@ Luna<LuaSceneObject>::RegType LuaSceneObject::Register[] = {
 		{ "getPlayersInRange", &LuaSceneObject::getPlayersInRange },
 		{ "isInNavMesh", &LuaSceneObject::isInNavMesh },
 		{ "checkInConversationRange", &LuaSceneObject::checkInConversationRange },
+		{ "getInRangeObjects", &LuaSceneObject::getInRangeObjects },
 
 		// JTL
 		{ "isShipObject", &LuaSceneObject::isShipObject },

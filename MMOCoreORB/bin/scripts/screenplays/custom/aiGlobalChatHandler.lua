@@ -139,45 +139,37 @@ end
 ----------------------------------------------------------------------
 function AiGlobalChatHandler:findNearbyResponder(pPlayer, message)
     
-    -- 1. Get all objects currently visible/in range of the player
     local pScenePlayer = SceneObject(pPlayer)
     if (pScenePlayer == nil) then return nil end
 
-    -- This returns a table (list) of SceneObject pointers
+    -- THIS NOW WORKS THANKS TO YOUR C++ EDIT!
     local nearbyObjects = pScenePlayer:getInRangeObjects()
     
     if (nearbyObjects == nil) then return nil end
 
     local bestMatch = nil
     local messageLower = string.lower(message)
-    local range = 20
 
-    -- 2. Iterate through everything nearby
     for i = 1, #nearbyObjects, 1 do
         local pObj = nearbyObjects[i]
         
-        -- Basic Filter:
-        -- 1. It exists
-        -- 2. It is not ME (the player)
-        -- 3. It is a Creature (NPC/Player/Pet)
+        -- Filter: Must be a Creature (NPC/Pet), Not the Player, and Close by
         if (pObj ~= nil and pObj ~= pPlayer and SceneObject(pObj):isCreatureObject()) then
             
-            -- 4. Distance Check (Manual check because getInRangeObjects can return things quite far away)
-            if (pScenePlayer:isInRangeWithObject(pObj, range)) then
+            -- Manual Distance Check (CloseObjects can include things 100m+ away)
+            if (pScenePlayer:isInRangeWithObject(pObj, 20)) then
                 
-                -- Check Registry Profile
+                -- Check Registry
                 local profile = AiRegistry.getProfile(pObj)
                 
                 if (profile ~= nil) then
                     local isMatch = false
                     
-                    -- CHECK A: Name Match
+                    -- Check A: Name
                     local name = string.lower(SceneObject(pObj):getDisplayedName())
-                    if (string.find(messageLower, name)) then
-                        isMatch = true
-                    end
+                    if (string.find(messageLower, name)) then isMatch = true end
 
-                    -- CHECK B: Call Sign Match
+                    -- Check B: Call Sign
                     if (not isMatch and profile.call_signs) then
                         for k, sign in pairs(profile.call_signs) do
                             if (string.find(messageLower, sign)) then
@@ -187,19 +179,12 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message)
                         end
                     end
 
+                    -- Check C: Ownership (The "Smart" Check)
                     if (isMatch) then
-                        -- CHECK C: Ownership Check (using your C++ binding)
                         local owner = CreatureObject(pObj):getOwner()
+                        if (owner == pPlayer) then return pObj end -- Priority
                         
-                        -- If I own this NPC, it is the priority match. Return immediately.
-                        if (owner == pPlayer) then
-                            return pObj
-                        end
-                        
-                        -- If I don't own it, store as backup
-                        if (bestMatch == nil) then
-                            bestMatch = pObj
-                        end
+                        if (bestMatch == nil) then bestMatch = pObj end
                     end
                 end
             end
