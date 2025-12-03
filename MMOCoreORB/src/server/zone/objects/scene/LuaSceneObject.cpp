@@ -1118,37 +1118,36 @@ int LuaSceneObject::getInRangeObjects(lua_State* L) {
         return 1;
     }
 
-    // 2. Get the list of objects the server knows are near this object
+    // 2. Get the CloseObjectsVector
     CloseObjectsVector* closeObjects = (CloseObjectsVector*) realObject->getCloseObjects();
 
     if (closeObjects == nullptr) {
-        lua_newtable(L); // Return empty table if no vector
+        lua_newtable(L); 
         return 1;
     }
 
+    // 3. Create a local copy safely
+    // We use safeCopyTo() which locks the private mutex internally
+    Vector<TreeEntry*> objects;
+    closeObjects->safeCopyTo(objects);
+
     lua_newtable(L);
 
-    // 3. Thread-safe read of the objects
-    closeObjects->safeReadLock();
+    // 4. Iterate over our local copy
+    int index = 1;
+    for (int i = 0; i < objects.size(); ++i) {
+        TreeEntry* entry = objects.get(i);
+        
+        // Cast the TreeEntry to a SceneObject
+        SceneObject* obj = dynamic_cast<SceneObject*>(entry);
 
-    try {
-        int index = 1;
-        for (int i = 0; i < closeObjects->size(); ++i) {
-            SceneObject* obj = cast<SceneObject*>(closeObjects->get(i).get());
-
-            if (obj != nullptr) {
-                // Push the object to Lua
-                lua_pushlightuserdata(L, obj);
-                // Add to table at index
-                lua_rawseti(L, -2, index++);
-            }
+        if (obj != nullptr) {
+            // Push the object to Lua
+            lua_pushlightuserdata(L, obj);
+            // Add to table at index
+            lua_rawseti(L, -2, index++);
         }
-    } catch (...) {
-        closeObjects->safeReadUnlock();
-        throw;
     }
-
-    closeObjects->safeReadUnlock();
 
     return 1;
 }
