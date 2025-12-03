@@ -11,8 +11,8 @@ local FactionRanks = {
     [5] = "Sergeant",
     [6] = "Staff Sergeant",
     [7] = "Master Sergeant",
-    [8] = "Warrent Officer II",
-    [9] = "Warrent Officer I",
+    [8] = "Warrant Officer II",
+    [9] = "Warrant Officer I",
     [10] = "Second Lieutenant",
     [11] = "Lieutenant",
     [12] = "Captain",
@@ -20,6 +20,8 @@ local FactionRanks = {
     [14] = "Lieutenant Colonel",
     [15] = "Colonel",
 }
+
+local AI_RANGE = 20
 
 AiGlobalChatHandler = ScreenPlay:new {
     --numberOfActs = 1,
