@@ -28,7 +28,7 @@ function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
     
     -- Observer 50 = SPATIALCHATSENT
     -- We attach it to the player so we hear everything they say
-    self:registerObservers(pCreatureObject)
+    self:registerObservers(pPlayer)
     --createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
     print("[AI Global] Chat Observer.")
 end
