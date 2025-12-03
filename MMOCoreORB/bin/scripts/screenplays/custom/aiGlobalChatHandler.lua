@@ -62,56 +62,39 @@ end
 ----------------------------------------------------------------------
 function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothing)
     
-    -- DEBUG 1: Did the observer fire at all?
-    -- print("[AI Debug] Observer Triggered by: " .. SceneObject(pPlayer):getCustomObjectName())
-
     if (pPlayer == nil or pChatMessage == nil) then return 0 end
 
     -- A. Decode the message
     local spatialMsg = getChatMessage(pChatMessage)
     if (spatialMsg == nil or spatialMsg == "") then return 0 end
 
-    -- DEBUG 2: What did they say?
-    -- print("[AI Debug] Message: " .. spatialMsg)
-
     -- B. GET THE TARGET
     local pCreature = CreatureObject(pPlayer)
     local targetID = pCreature:getTargetID()
 
-    -- DEBUG 3: Do they have a target?
-    if (targetID == 0) then 
-        -- print("[AI Debug] Ignored: Player has no target selected.")
-        return 0 
-    end
+    if (targetID == 0) then return 0 end
 
     local pTarget = getSceneObject(targetID)
 
     if (pTarget == nil or not SceneObject(pTarget):isCreatureObject()) then
-        -- print("[AI Debug] Ignored: Target is not a creature.")
         return 0
     end
 
-    -- C. CHECK DISTANCE (15 meters)
+    -- C. CHECK DISTANCE
     if (not SceneObject(pPlayer):isInRangeWithObject(pTarget, 15)) then
-        print("[AI Debug] Ignored: Target is too far away.")
         return 0
     end
 
-    -- D. CHECK THE REGISTRY
-    local templatePath = SceneObject(pTarget):getTemplateObjectPath()
-    
-    -- DEBUG 4: Check the template path
-    print("[AI Debug] Checking Template: " .. templatePath)
-    
-    local profile = AiRegistry.getProfileByTemplate(templatePath)
+    -- D. CHECK THE REGISTRY (Simpler now!)
+    -- We pass the whole object to the registry, and it figures out the best match
+    local profile = AiRegistry.getProfile(pTarget)
 
     if (profile == nil) then
-        print("[AI Debug] Ignored: No profile found for this template.")
         return 0
     end
 
     -- E. TRIGGER THE AI
-    print("[AI Global] SUCCESS! Targeted Chat detected for: " .. profile.name)
+    print("[AI Global] Targeted Chat detected for Profile: " .. profile.name)
     
     local aiResponse = AiBrain.askBrain(spatialMsg, profile)
 
