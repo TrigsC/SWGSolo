@@ -1725,6 +1725,9 @@ void PlayerObjectImplementation::notifyOnline() {
 
 	playerCreature->notifyObservers(ObserverEventType::LOGGEDIN);
 
+	// AI should listen to the player once logged in
+	DirectorManager::instance()->runScreenPlays("AiGlobalChatHandler", "onPlayerLoggedIn", playerCreature);
+
 	// Set speed if player isn't mounted.
 	if (!playerCreature->isRidingMount())
 	{
