@@ -981,10 +981,26 @@ int LuaAiAgent::doDespawn(lua_State* L) {
 }
 
 int LuaAiAgent::getCreatureTemplateName(lua_State* L) {
-	String creoTemplName = realObject->getCreatureTemplate()->getTemplateName();
+    // 1. Basic Object Check
+    if (realObject == nullptr) {
+        lua_pushnil(L);
+        return 1;
+    }
 
-	lua_pushstring(L, creoTemplName.toCharArray());
-	return 1;
+    // 2. SAFETY CHECK: Does this agent actually have a template?
+    // If we try to read the name of a null template, the server crashes.
+    if (realObject->getCreatureTemplate() == nullptr) {
+        // Return nil to Lua so the script can handle it gracefully
+        lua_pushnil(L);
+        return 1;
+    }
+
+    // 3. Safe to proceed
+    String name = realObject->getCreatureTemplateName();
+    
+    lua_pushstring(L, name.toCharArray());
+
+    return 1;
 }
 
 int LuaAiAgent::isInRangeOfHome(lua_State* L) {

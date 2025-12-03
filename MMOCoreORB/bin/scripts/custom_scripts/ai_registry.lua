@@ -43,36 +43,31 @@ AiRegistry.profiles = {
 }
 
 -- LOOKUP FUNCTION
--- LOOKUP FUNCTION
 function AiRegistry.getProfile(pCreature)
     if (pCreature == nil) then return nil end
     
     -- 1. SAFETY CHECK: Is this a Player?
-    -- Players are "CreatureObjects" but they are NOT "AiAgents".
-    -- Calling AiAgent methods on them causes a crash.
     if (SceneObject(pCreature):isPlayerCreature()) then
         return nil
     end
 
     -- 2. SAFETY CHECK: Is this an AI?
-    -- Some creatures (like vehicles/mounts) might not be AI agents.
     if (not SceneObject(pCreature):isAiAgent()) then
         return nil
     end
     
-    -- 3. Try to find by Internal Mob Name (e.g., "specforce_marine")
+    -- 3. Try to find by Internal Mob Name
     local agent = LuaAiAgent(pCreature)
     local mobName = agent:getCreatureTemplateName()
     
+    -- CHECK IF NAME IS VALID (New Check)
     if (mobName ~= nil and AiRegistry.mobMap[mobName]) then
-        -- print("[AI Registry] Found match by Name: " .. mobName)
         return AiRegistry.profiles[AiRegistry.mobMap[mobName]]
     end
 
     -- 4. Fallback: Try to find by IFF File Path
     local templatePath = SceneObject(pCreature):getTemplateObjectPath()
     if (templatePath ~= nil and AiRegistry.templateMap[templatePath]) then
-        -- print("[AI Registry] Found match by Template: " .. templatePath)
         return AiRegistry.profiles[AiRegistry.templateMap[templatePath]]
     end
 
