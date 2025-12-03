@@ -138,60 +138,68 @@ end
 -- 2. Nearby LOGIC
 ----------------------------------------------------------------------
 function AiGlobalChatHandler:findNearbyResponder(pPlayer, message)
-    -- 1. Scan area (20 meters)
-    local pZoneServer = getZoneServer()
-    if (pZoneServer == nil) then return nil end
     
-    local nearbyObjects = pZoneServer:getNearbyCreatures(pPlayer, 20)
+    -- 1. Get all objects currently visible/in range of the player
+    local pScenePlayer = SceneObject(pPlayer)
+    if (pScenePlayer == nil) then return nil end
+
+    -- This returns a table (list) of SceneObject pointers
+    local nearbyObjects = pScenePlayer:getInRangeObjects()
+    
     if (nearbyObjects == nil) then return nil end
 
     local bestMatch = nil
     local messageLower = string.lower(message)
+    local range = 20
 
-    -- 2. Iterate through them
+    -- 2. Iterate through everything nearby
     for i = 1, #nearbyObjects, 1 do
-        local pCreature = nearbyObjects[i]
+        local pObj = nearbyObjects[i]
         
-        -- Don't talk to yourself
-        if (pCreature ~= pPlayer) then
+        -- Basic Filter:
+        -- 1. It exists
+        -- 2. It is not ME (the player)
+        -- 3. It is a Creature (NPC/Player/Pet)
+        if (pObj ~= nil and pObj ~= pPlayer and SceneObject(pObj):isCreatureObject()) then
             
-            -- Check Registry Profile
-            local profile = AiRegistry.getProfile(pCreature)
-            
-            if (profile ~= nil) then
-                local isMatch = false
+            -- 4. Distance Check (Manual check because getInRangeObjects can return things quite far away)
+            if (pScenePlayer:isInRangeWithObject(pObj, range)) then
                 
-                -- CHECK A: Is the player saying the NPC's Name?
-                local name = string.lower(SceneObject(pCreature):getDisplayedName())
-                if (string.find(messageLower, name)) then
-                    isMatch = true
-                end
+                -- Check Registry Profile
+                local profile = AiRegistry.getProfile(pObj)
+                
+                if (profile ~= nil) then
+                    local isMatch = false
+                    
+                    -- CHECK A: Name Match
+                    local name = string.lower(SceneObject(pObj):getDisplayedName())
+                    if (string.find(messageLower, name)) then
+                        isMatch = true
+                    end
 
-                -- CHECK B: Is the player saying a Call Sign?
-                if (not isMatch and profile.call_signs) then
-                    for k, sign in pairs(profile.call_signs) do
-                        if (string.find(messageLower, sign)) then
-                            isMatch = true
-                            break
+                    -- CHECK B: Call Sign Match
+                    if (not isMatch and profile.call_signs) then
+                        for k, sign in pairs(profile.call_signs) do
+                            if (string.find(messageLower, sign)) then
+                                isMatch = true
+                                break
+                            end
                         end
                     end
-                end
 
-                if (isMatch) then
-                    -- CHECK C: Ownership Check (The Upgrade)
-                    -- We cast to CreatureObject to ensure we access the method
-                    local owner = CreatureObject(pCreature):getOwner()
-                    
-                    -- If I own this NPC, it is the absolute best match.
-                    -- Return immediately.
-                    if (owner == pPlayer) then
-                        return pCreature 
-                    end
-                    
-                    -- If I don't own it (wild/faction NPC), store as backup.
-                    -- If we already have a backup, we stick with the first one we found (closest)
-                    if (bestMatch == nil) then
-                        bestMatch = pCreature
+                    if (isMatch) then
+                        -- CHECK C: Ownership Check (using your C++ binding)
+                        local owner = CreatureObject(pObj):getOwner()
+                        
+                        -- If I own this NPC, it is the priority match. Return immediately.
+                        if (owner == pPlayer) then
+                            return pObj
+                        end
+                        
+                        -- If I don't own it, store as backup
+                        if (bestMatch == nil) then
+                            bestMatch = pObj
+                        end
                     end
                 end
             end
