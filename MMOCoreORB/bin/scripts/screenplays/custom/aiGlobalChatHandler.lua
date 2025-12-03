@@ -44,11 +44,17 @@ end
 function AiGlobalChatHandler:registerObservers(pPlayer)
     if (pPlayer == nil) then return end
 
-    -- Safety Check 3: Prevent the crash by ensuring pPlayer is valid before calling C++ functions
-    -- Observer 50 = SPATIALCHATSENT
-    if (not hasObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)) then
-        createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
-    end
+    -- FIX: The 'hasObserver' function caused a server crash (SIGSEGV).
+    -- Instead, we use the standard "Drop then Create" pattern.
+    -- This guarantees we never have duplicates and avoids the crashy check.
+    
+    -- 1. Drop any existing observer (Safe to call even if none exists)
+    dropObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
+    
+    -- 2. Create the new observer
+    createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
+    
+    -- print("[AI Global] Chat Observer Refreshed.")
 end
 
 ----------------------------------------------------------------------
