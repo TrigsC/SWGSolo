@@ -20,19 +20,32 @@ end
 -- Standard Core3 automatically calls "onPlayerLoggedIn" for all registered screenplays.
 -- We use this to attach the ears (Observer) to the player.
 function AiGlobalChatHandler.onPlayerLoggedIn(pPlayer)
-    if (pPlayer == nil) then return 0 end
     
-    -- NOTICE: Changed 'self' to 'AiGlobalChatHandler' explicitly
+    -- Safety Check 1: Did we get a valid object?
+    if (pPlayer == nil) then 
+        print("[AI Global] ERROR: onPlayerLoggedIn received nil player!")
+        return 0 
+    end
+
+    -- Safety Check 2: Is it actually a scene object?
+    local pSceneObject = LuaSceneObject(pPlayer)
+    if (pSceneObject == nil) then
+        return 0
+    end
+    
+    -- Call the internal function using COLON because we are inside Lua now
     AiGlobalChatHandler:registerObservers(pPlayer)
     
-    print("[AI Global] Chat Observer attached to " .. SceneObject(pPlayer):getCustomObjectName())
+    print("[AI Global] Chat Observer attached to " .. pSceneObject:getCustomObjectName())
     
     return 0
 end
 
 function AiGlobalChatHandler:registerObservers(pPlayer)
+    if (pPlayer == nil) then return end
+
+    -- Safety Check 3: Prevent the crash by ensuring pPlayer is valid before calling C++ functions
     -- Observer 50 = SPATIALCHATSENT
-    -- We check if it is already attached to avoid duplicates
     if (not hasObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)) then
         createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
     end
