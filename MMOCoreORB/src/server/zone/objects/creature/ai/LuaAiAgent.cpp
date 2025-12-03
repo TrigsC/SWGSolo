@@ -19,6 +19,7 @@
 #include "server/zone/managers/collision/CollisionManager.h"
 #include "server/zone/managers/reaction/ReactionManager.h"
 #include "server/zone/objects/intangible/PetControlDevice.h"
+#include "server/zone/objects/creature/CreatureTemplate.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/intangible/tasks/PetControlDeviceStoreTask.h"
 #include "server/zone/objects/area/ActiveArea.h"
@@ -987,17 +988,21 @@ int LuaAiAgent::getCreatureTemplateName(lua_State* L) {
         return 1;
     }
 
-    // 2. SAFETY CHECK: Does this agent actually have a template?
-    // If we try to read the name of a null template, the server crashes.
-    if (realObject->getCreatureTemplate() == nullptr) {
-        // Return nil to Lua so the script can handle it gracefully
+    // 2. Get the Template Object
+    // We use the getter that already exists on the object
+    CreatureTemplate* templ = realObject->getCreatureTemplate();
+
+    // 3. SAFETY CHECK: Does the template exist?
+    // If it's null (like on a player or vehicle), we return nil to avoid a crash.
+    if (templ == nullptr) {
         lua_pushnil(L);
         return 1;
     }
 
-    // 3. Safe to proceed
-    String name = realObject->getCreatureTemplateName();
-    
+    // 4. Extract the Name from the Template
+    // The method 'getTemplateName()' belongs to the template class, not the agent class.
+    String name = templ->getTemplateName();
+
     lua_pushstring(L, name.toCharArray());
 
     return 1;
