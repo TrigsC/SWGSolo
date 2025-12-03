@@ -989,18 +989,16 @@ int LuaAiAgent::getCreatureTemplateName(lua_State* L) {
     }
 
     // 2. Get the Template Object
-    // We use the getter that already exists on the object
-    CreatureTemplate* templ = realObject->getCreatureTemplate();
+    // FIX: Added 'const' because the engine returns a read-only pointer
+    const CreatureTemplate* templ = realObject->getCreatureTemplate();
 
     // 3. SAFETY CHECK: Does the template exist?
-    // If it's null (like on a player or vehicle), we return nil to avoid a crash.
     if (templ == nullptr) {
         lua_pushnil(L);
         return 1;
     }
 
-    // 4. Extract the Name from the Template
-    // The method 'getTemplateName()' belongs to the template class, not the agent class.
+    // 4. Extract the Name
     String name = templ->getTemplateName();
 
     lua_pushstring(L, name.toCharArray());
