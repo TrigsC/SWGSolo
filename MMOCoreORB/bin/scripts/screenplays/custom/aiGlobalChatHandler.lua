@@ -6,7 +6,7 @@ AiGlobalChatHandler = ScreenPlay:new {
     numberOfActs = 1,
 }
 
-registerScreenPlay("AiGlobalChatHandler", true)
+--registerScreenPlay("AiGlobalChatHandler", true)
 
 ----------------------------------------------------------------------
 -- 1. STARTUP & LOGIN LOGIC
