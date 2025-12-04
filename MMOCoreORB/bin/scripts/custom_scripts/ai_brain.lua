@@ -91,6 +91,11 @@ function AiBrain.getRecruiterIntent(player_input, player_stats_context)
     - "go_covert" (Player wants to be Combatant/Hidden)
     - "chat" (General questions or if they don't qualify)
 
+    CRITICAL RULES FOR "reply":
+    1. If the intent is "promote", "buy", "go_overt", or "go_covert", your reply MUST be a neutral confirmation that you are checking or processing (e.g., "Let me check your service record.", "Checking your status now...", "Accessing inventory.").
+    2. Do NOT state if they succeed or fail. Do NOT do math. The system will handle the result message.
+    3. Only use the "chat" intent for general conversation where no action is taken.
+
     Return JSON ONLY with this format:
     { "intent": "intent_name", "reply": "Your in-character response" }
     ]]

@@ -852,13 +852,20 @@ function recruiterScreenplay:attemptPromotion(pPlayer, pNpc)
     local faction = self:getRecruiterFaction(pNpc)
     local currentStanding = PlayerObject(pGhost):getFactionStanding(faction)
 
-    if (currentStanding < (requiredPoints + self.minimumFactionStanding)) then
-        CreatureObject(pPlayer):sendSystemMessage("You need " .. requiredPoints .. " faction points for the next rank. You only have " .. currentStanding .. ".")
+	if (currentStanding < (requiredPoints + self.minimumFactionStanding)) then
+        -- FAILURE MESSAGE (Handled by Lua, not AI)
+        local missing = (requiredPoints + self.minimumFactionStanding) - currentStanding
+        spatialChat(pNpc, "I can't promote you yet. You need " .. missing .. " more faction points.")
     else
+        -- SUCCESS MESSAGE (Handled by Lua, not AI)
         PlayerObject(pGhost):decreaseFactionStanding(faction, requiredPoints)
         CreatureObject(pPlayer):setFactionRank(nextRank)
-        CreatureObject(pPlayer):sendSystemMessage("Congratulations on your promotion to " .. getRankName(nextRank) .. "!")
-        -- Play a visual effect or animation here if desired
+        CreatureObject(pPlayer):sendSystemMessage("You have been promoted to " .. getRankName(nextRank) .. "!")
+        
+        -- This is the text you see in the chat bubble
+        spatialChat(pNpc, "Congratulations on your promotion, " .. getRankName(nextRank) .. "!")
+        
+        CreatureObject(pPlayer):playEffect("clienteffect/level_up.cef", "")
     end
 end
 
