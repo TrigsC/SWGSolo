@@ -9,12 +9,18 @@
  */
 
 #include "TransactionLog.h"
+
+#ifdef WITH_SWGREALMS_API
+#include "server/login/SWGRealmsAPI.h"
+#endif
+
 #include "server/ServerCore.h"
 #include "server/zone/Zone.h"
 #include "server/zone/ZoneServer.h"
 #include "engine/engine.h"
 #include "system/thread/atomic/AtomicBoolean.h"
 #include "system/thread/atomic/AtomicInteger.h"
+#include "server/zone/ZoneClientSession.h"
 #include "server/zone/objects/player/PlayerObject.h"
 #include "server/zone/objects/scene/SceneObject.h"
 #include "server/zone/objects/structure/StructureObject.h"
@@ -444,6 +450,15 @@ void TransactionLog::initializeCommonSceneObject(const String& key, SceneObject*
 
 	mTransaction[key] = obj->getObjectID();
 
+	// Add galaxyId for ANY object with a zone (not just players)
+	auto zone = obj->getZone();
+	if (zone != nullptr) {
+		auto zoneServer = zone->getZoneServer();
+		if (zoneServer != nullptr) {
+			mTransaction[key + "GalaxyId"] = zoneServer->getGalaxyID();
+		}
+	}
+
 	auto creo = obj->asCreatureObject();
 
 	if (creo == nullptr) {
@@ -459,6 +474,20 @@ void TransactionLog::initializeCommonSceneObject(const String& key, SceneObject*
 
 	if (player != nullptr) {
 		mTransaction[key + "AccountId"] = player->getAccountID();
+
+		String networkIP = "0.0.0.0";
+		uint16 networkPort = 0;
+
+		auto client = creo->getClient();
+
+		if (client != nullptr) {
+			// Use client methods which return EIP-aware IP (after API sets it)
+			networkIP = client->getIPAddress();
+			networkPort = client->getPort();
+		}
+
+		mState[key + "NetworkIP"] = networkIP;
+		mState[key + "NetworkPort"] = networkPort;
 
 		mState[key + "PlayedSeconds"] = (int)(player->getPlayedMiliSecs() / 1000);
 		mState[key + "SessionSeconds"] = (int)(player->getSessionMiliSecs() / 1000);
@@ -793,7 +822,19 @@ void TransactionLog::writeLog() {
 		mState["verbose"] = true;
 	}
 
-	trxLog.info() << composeLogEntry();
+	// Compose log entry (used for both file and streaming)
+	String logEntry = composeLogEntry();
+
+	// Write to local file (always)
+	trxLog.info() << logEntry;
+
+#ifdef WITH_SWGREALMS_API
+	// Stream to SWGRealms (if enabled)
+	auto api = SWGRealmsAPI::instance();
+	if (api != nullptr) {
+		api->publishTrxLog(getTrxID(), logEntry);
+	}
+#endif // WITH_SWGREALMS_API
 }
 
 SceneObject* TransactionLog::getTrxParticipant(SceneObject* obj, SceneObject* defaultValue) {
@@ -945,6 +986,7 @@ const String TransactionLog::trxCodeToString(TrxCode code) {
 	case TrxCode::PLAYERLOGGINGOUT:         return "playerloggingout";          // Player Logging Out
 	case TrxCode::PLAYERDIED:               return "playerdied";                // Player Died
 	case TrxCode::RECYCLED:                 return "recycled";                  // Recycled Items
+	case TrxCode::SESSIONSTATS:             return "sessionstats";              // Session Statistics
 	case TrxCode::SERVERDESTROYOBJECT:      return "serverdestroyobject";       // /serverDestroyObject command
 	case TrxCode::SHIPDEEDPURCHASE:         return "shipdeedpurchase";          // Purchase of a ship deed from chassis dealer
 	case TrxCode::SHIPREDEED:               return "shipredeed";                // ReDeeding a ship from datapad

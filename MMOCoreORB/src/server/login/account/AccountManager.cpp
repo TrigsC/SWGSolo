@@ -33,6 +33,7 @@ AccountManager::AccountManager(LoginServer* loginserv) : Logger("AccountManager"
 	setLogging(false);
 	setGlobalLogging(false);
 
+#ifndef WITH_SWGREALMS_API
 	if (ServerCore::truncateDatabases()) {
 		try {
 			String query = "TRUNCATE TABLE characters";
@@ -44,6 +45,7 @@ AccountManager::AccountManager(LoginServer* loginserv) : Logger("AccountManager"
 			error(e.getMessage());
 		}
 	}
+#endif // !WITH_SWGREALMS_API
 }
 
 AccountManager::~AccountManager() {
@@ -164,8 +166,8 @@ void AccountManager::loginApprovedAccount(LoginClient* client, ManagedReference<
 	try {
 #ifndef WITH_SWGREALMS_API
 		ServerDatabase::instance()->executeStatement(sessionQuery);
-#endif // !WITH_SWGREALMS_API
 		ServerDatabase::instance()->executeStatement(logQuery);
+#endif // !WITH_SWGREALMS_API
 	} catch (const DatabaseException& e) {
 		client->error() << e.getMessage();
 	}
