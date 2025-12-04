@@ -89,10 +89,11 @@ function AiBrain.getRecruiterIntent(player_input, player_stats_context)
     - "buy_structures" (Player wants installations)
     - "go_overt" (Player wants to be Special Forces/Declared)
     - "go_covert" (Player wants to be Combatant/Hidden)
+    - "go_on_leave" (Player wants to resign/go on leave/be civilian)
     - "chat" (General questions or if they don't qualify)
 
     CRITICAL RULES FOR "reply":
-    1. If the intent is "promote", "buy", "go_overt", or "go_covert", your reply MUST be a neutral confirmation that you are checking or processing (e.g., "Let me check your service record.", "Checking your status now...", "Accessing inventory.").
+    1. If the intent is "promote", "buy", "go_overt", or "go_covert", your reply MUST be a neutral confirmation that you are checking or processing (e.g., "Let me check your service record.", "Checking your status now...", "Accessing our inventory.").
     2. Do NOT state if they succeed or fail. Do NOT do math. The system will handle the result message.
     3. Only use the "chat" intent for general conversation where no action is taken.
 

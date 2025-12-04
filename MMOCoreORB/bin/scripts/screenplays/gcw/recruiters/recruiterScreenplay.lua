@@ -880,17 +880,49 @@ function recruiterScreenplay:getPlayerStatusContext(pPlayer, pNpc)
 end
 
 -- INTENT: TOGGLE COVERT/OVERT
+-- Logic to toggle On Leave (0), Covert (1), or Overt (2)
 function recruiterScreenplay:attemptToggleStatus(pPlayer, pNpc, targetStatus) 
-    -- targetStatus: 1 = Covert, 2 = Overt
-    -- Add the logic from accepted_go_overt / accepted_go_covert here
-    -- Reuse your existing handleGoOvert / handleGoCovert events
+    local currentStatus = CreatureObject(pPlayer):getFactionStatus()
+    local futureStatus = CreatureObject(pPlayer):getFutureFactionStatus() -- Check if they are already waiting
     
-    -- Example for Going Overt
+    if (currentStatus == targetStatus) then
+        spatialChat(pNpc, "You are already in that status, soldier.")
+        return
+    end
+
+    -- Check for Jedi (Jedi cannot hide)
+    if (targetStatus ~= 2 and (CreatureObject(pPlayer):hasSkill("force_rank_light_novice") or CreatureObject(pPlayer):hasSkill("force_rank_dark_novice"))) then
+        spatialChat(pNpc, "I cannot hide your presence, Force User. You must remain Special Forces.")
+        return
+    end
+
+    -- Status 2: OVERT (Special Forces) - Fast Transition (30s)
     if targetStatus == 2 then 
          CreatureObject(pPlayer):setFutureFactionStatus(2)
          writeData(CreatureObject(pPlayer):getObjectID() .. ":changingFactionStatus", 1)
          createEvent(30000, "recruiterScreenplay", "handleGoOvert", pPlayer, "")
-         CreatureObject(pPlayer):sendSystemMessage("Your status will be set to Special Forces (Overt) in 30 seconds.")
+         
+         spatialChat(pNpc, "I've updated your files. You will be declared Special Forces in 30 seconds.")
+
+    -- Status 1: COVERT (Combatant) - Slow Transition
+    elseif targetStatus == 1 then
+        CreatureObject(pPlayer):setFutureFactionStatus(1)
+        writeData(CreatureObject(pPlayer):getObjectID() .. ":changingFactionStatus", 1)
+        
+        local timer = self.covertOvertResignTime * 60 * 1000 
+        createEvent(timer, "recruiterScreenplay", "handleGoCovert", pPlayer, "")
+        
+        spatialChat(pNpc, "Understood. You will be stepped down to Combatant status in " .. self.covertOvertResignTime .. " minutes.")
+
+    -- Status 0: ON LEAVE (Civilian) - Slow Transition
+    elseif targetStatus == 0 then
+        CreatureObject(pPlayer):setFutureFactionStatus(0)
+        writeData(CreatureObject(pPlayer):getObjectID() .. ":changingFactionStatus", 1)
+        
+        local timer = self.covertOvertResignTime * 60 * 1000 
+        createEvent(timer, "recruiterScreenplay", "handleGoOnLeave", pPlayer, "")
+        
+        spatialChat(pNpc, "I'll process your leave request. You will be off duty in " .. self.covertOvertResignTime .. " minutes.")
     end
 end
 
