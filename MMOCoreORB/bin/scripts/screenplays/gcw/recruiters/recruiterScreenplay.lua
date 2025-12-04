@@ -886,3 +886,5 @@ function recruiterScreenplay:attemptToggleStatus(pPlayer, pNpc, targetStatus)
          CreatureObject(pPlayer):sendSystemMessage("Your status will be set to Special Forces (Overt) in 30 seconds.")
     end
 end
+
+return recruiterScreenplay
