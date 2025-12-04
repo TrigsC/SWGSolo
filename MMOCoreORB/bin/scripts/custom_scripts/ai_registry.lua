@@ -4,6 +4,7 @@ local AiRegistry = {}
 -- This uses the internal name found in scripts/mobile/...
 AiRegistry.mobMap = {
     ["light_jedi_padawan"] = "padawan",
+    ["rebel_recruiter"] = "rebel_recruiter",
     ["specforce_infiltrator"] = "rebel_trooper",
     ["specforce_marine"] = "rebel_trooper",
     ["stormtrooper"] = "imperial_trooper",
@@ -41,7 +42,7 @@ AiRegistry.profiles = {
         system_prompt = "You are a generic Star Wars citizen. You are busy and slightly annoyed.",
         skills = {}
     },
-    
+
     -- Add the Rebel Recruiter
     ["rebel_recruiter"] = { 
         role = "recruiter", -- CRITICAL: This triggers the logic in ChatHandler
