@@ -151,12 +151,14 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
     local closestDistance = math.huge
     local messageLower = string.lower(message)
 
+    print("[AI Debug] Scanning " .. #nearbyObjects .. " nearby objects for keywords...")
+
     for i = 1, #nearbyObjects, 1 do
         local pObj = nearbyObjects[i]
         
         if (pObj ~= nil and pObj ~= pPlayer and SceneObject(pObj):isCreatureObject()) then
             
-            -- Check if in general range (20m)
+            -- SYNCED: Use the global AI_RANGE constant
             if (pScenePlayer:isInRangeWithObject(pObj, AI_RANGE)) then
                 
                 local profile = AiRegistry.getProfile(pObj)
@@ -164,11 +166,9 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
                 if (profile ~= nil) then
                     local isMatch = false
                     
-                    -- Check A: Name
                     local name = string.lower(SceneObject(pObj):getDisplayedName())
                     if (string.find(messageLower, name)) then isMatch = true end
 
-                    -- Check B: Call Sign
                     if (not isMatch and profile.call_signs) then
                         for k, sign in pairs(profile.call_signs) do
                             if (string.find(messageLower, sign)) then
@@ -179,28 +179,29 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
                     end
 
                     if (isMatch) then
-                        -- PRIORITY 1: Ownership (Immediate Winner)
+                        local currentDist = pScenePlayer:getDistanceTo(pObj)
+                        -- print("[AI Debug] Match Candidate: " .. name .. " Dist: " .. currentDist)
+
                         local owner = CreatureObject(pObj):getOwner()
                         if (owner == pPlayer) then return pObj end 
                         
-                        -- PRIORITY 2: Preferred Target (Immediate Winner)
                         if (preferredTargetID ~= 0 and SceneObject(pObj):getObjectID() == preferredTargetID) then
                             return pObj
                         end
 
-                        -- PRIORITY 3: Proximity (The Fix)
-                        -- Calculate exact distance to the player
-                        local dist = pScenePlayer:getDistanceTo(pObj)
-                        
-                        -- If this NPC is closer than the last one we found, make them the winner
-                        if (dist < closestDistance) then
-                            closestDistance = dist
+                        if (currentDist < closestDistance) then
+                            closestDistance = currentDist
                             bestMatch = pObj
                         end
                     end
                 end
             end
         end
+    end
+    
+    if (bestMatch ~= nil) then
+        local winnerName = SceneObject(bestMatch):getDisplayedName()
+        print("[AI Debug] Scanner Winner: " .. winnerName .. " Dist: " .. closestDistance)
     end
 
     return bestMatch
