@@ -835,3 +835,54 @@ function recruiterScreenplay:handleResign(pPlayer)
 
 	PlayerObject(pGhost):decreaseFactionStanding(oldFactionName, 0)
 end
+
+-- INTENT: ATTEMPT PROMOTION
+function recruiterScreenplay:attemptPromotion(pPlayer, pNpc)
+    local pGhost = CreatureObject(pPlayer):getPlayerObject()
+    local currentRank = CreatureObject(pPlayer):getFactionRank()
+    
+    -- Logic extracted from Handler
+    if isHighestRank(currentRank) then
+        CreatureObject(pPlayer):sendSystemMessage("You are already at the highest rank, soldier.")
+        return
+    end
+
+    local nextRank = currentRank + 1
+    local requiredPoints = getRankCost(nextRank)
+    local faction = self:getRecruiterFaction(pNpc)
+    local currentStanding = PlayerObject(pGhost):getFactionStanding(faction)
+
+    if (currentStanding < (requiredPoints + self.minimumFactionStanding)) then
+        CreatureObject(pPlayer):sendSystemMessage("You need " .. requiredPoints .. " faction points for the next rank. You only have " .. currentStanding .. ".")
+    else
+        PlayerObject(pGhost):decreaseFactionStanding(faction, requiredPoints)
+        CreatureObject(pPlayer):setFactionRank(nextRank)
+        CreatureObject(pPlayer):sendSystemMessage("Congratulations on your promotion to " .. getRankName(nextRank) .. "!")
+        -- Play a visual effect or animation here if desired
+    end
+end
+
+-- INTENT: CHECK ELIGIBILITY (Just data, no action)
+function recruiterScreenplay:getPlayerStatusContext(pPlayer, pNpc)
+    local pGhost = CreatureObject(pPlayer):getPlayerObject()
+    local faction = self:getRecruiterFaction(pNpc)
+    local rank = CreatureObject(pPlayer):getFactionRank()
+    local points = PlayerObject(pGhost):getFactionStanding(faction)
+    
+    return string.format("Rank: %s, Faction Points: %d, Faction: %s", getRankName(rank), points, faction)
+end
+
+-- INTENT: TOGGLE COVERT/OVERT
+function recruiterScreenplay:attemptToggleStatus(pPlayer, pNpc, targetStatus) 
+    -- targetStatus: 1 = Covert, 2 = Overt
+    -- Add the logic from accepted_go_overt / accepted_go_covert here
+    -- Reuse your existing handleGoOvert / handleGoCovert events
+    
+    -- Example for Going Overt
+    if targetStatus == 2 then 
+         CreatureObject(pPlayer):setFutureFactionStatus(2)
+         writeData(CreatureObject(pPlayer):getObjectID() .. ":changingFactionStatus", 1)
+         createEvent(30000, "recruiterScreenplay", "handleGoOvert", pPlayer, "")
+         CreatureObject(pPlayer):sendSystemMessage("Your status will be set to Special Forces (Overt) in 30 seconds.")
+    end
+end

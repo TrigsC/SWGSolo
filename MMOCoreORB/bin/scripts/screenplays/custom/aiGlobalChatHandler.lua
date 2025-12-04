@@ -1,6 +1,7 @@
 local ObjectManager = require("managers.object.object_manager")
 local AiBrain = require("custom_scripts.ai_brain")
 local AiRegistry = require("custom_scripts.ai_registry")
+local recruiterScreenplay = require("screenplays.gcw.recruiters.recruiterScreenplay")
 
 local FactionRanks = {
     [0] = "Recruit",
@@ -36,8 +37,6 @@ function AiGlobalChatHandler:start()
 end
 
 -- 2. LOGIN HANDLER
--- Standard Core3 automatically calls "onPlayerLoggedIn" for all registered screenplays.
--- We use this to attach the ears (Observer) to the player.
 function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
     
     -- Safety Check 1: Did we get a valid object?
@@ -63,17 +62,9 @@ end
 function AiGlobalChatHandler:registerObservers(pPlayer)
     if (pPlayer == nil) then return end
 
-    -- FIX: The 'hasObserver' function caused a server crash (SIGSEGV).
-    -- Instead, we use the standard "Drop then Create" pattern.
-    -- This guarantees we never have duplicates and avoids the crashy check.
-    
-    -- 1. Drop any existing observer (Safe to call even if none exists)
+    -- Drop then Create to avoid duplicates or crashes
     dropObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
-    
-    -- 2. Create the new observer
     createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
-    
-    -- print("[AI Global] Chat Observer Refreshed.")
 end
 
 function AiGlobalChatHandler:getWorldDistance(pObj1, pObj2)
@@ -84,9 +75,6 @@ function AiGlobalChatHandler:getWorldDistance(pObj1, pObj2)
     local scno2 = LuaSceneObject(pObj2)
     
     if (scno1 == nil or scno2 == nil) then return math.huge end
-
-    -- DEBUG: Print WHO we are comparing
-    -- print("[AI Debug] Compare: " .. scno1:getCustomObjectName() .. " vs " .. scno2:getCustomObjectName())
 
     local x1 = scno1:getWorldPositionX()
     local y1 = scno1:getWorldPositionY()
@@ -103,50 +91,6 @@ function AiGlobalChatHandler:getWorldDistance(pObj1, pObj2)
     return math.sqrt(dx*dx + dy*dy + dz*dz)
 end
 
---function AiGlobalChatHandler:getWorldDistance(pObj1, pObj2)
---    if (pObj1 == nil or pObj2 == nil) then return math.huge end
---    
---    local obj1 = SceneObject(pObj1)
---    local obj2 = SceneObject(pObj2)
---    
---    -- Try World Position First (Preferred)
---    local x1 = obj1:getWorldPositionX()
---    local y1 = obj1:getWorldPositionY()
---    local z1 = obj1:getWorldPositionZ()
---    
---    local x2 = obj2:getWorldPositionX()
---    local y2 = obj2:getWorldPositionY()
---    local z2 = obj2:getWorldPositionZ()
---    
---    -- DEBUG: Let's see if World Position is failing (returning 0)
---    if (x1 == 0 and z1 == 0) or (x2 == 0 and z2 == 0) then
---        print("[AI Debug] WARN: WorldPos is 0. Trying local getPosition...")
---        -- Fallback to local position (Works fine if everyone is outdoors)
---        x1 = obj1:getPositionX()
---        y1 = obj1:getPositionY()
---        z1 = obj1:getPositionZ()
---        
---        x2 = obj2:getPositionX()
---        y2 = obj2:getPositionY()
---        z2 = obj2:getPositionZ()
---    end
---
---    local dx = x1 - x2
---    local dy = y1 - y2
---    local dz = z1 - z2
---    
---    local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
---
---    -- DEBUG PRINT: Only print if it's "suspiciously" close (0) or a valid candidate
---    if dist < 1.0 then
---        local n1 = obj1:getCustomObjectName()
---        local n2 = obj2:getCustomObjectName()
---        print(string.format("[AI Debug] COORDS: %s(%.1f, %.1f) vs %s(%.1f, %.1f) = Dist: %.1f", n1, x1, z1, n2, x2, z2, dist))
---    end
---    
---    return dist
---end
---
 function AiGlobalChatHandler:getPlayerContext(pPlayer)
     if (pPlayer == nil) then return "" end
     
@@ -159,7 +103,6 @@ function AiGlobalChatHandler:getPlayerContext(pPlayer)
     if (pCreature:isImperial()) then faction = "Imperial" end
 
     -- 2. RANK
-    -- We only care about rank if they are declared
     local rankTitle = ""
     if (faction ~= "Civilian") then
         local rankID = pCreature:getFactionRank()
@@ -170,10 +113,7 @@ function AiGlobalChatHandler:getPlayerContext(pPlayer)
         end
     end
 
-    -- 3. SPECIES (Optional, requires ID mapping, keeping simple for now)
-    -- local species = "Humanoid"
-
-    -- 4. CONSTRUCT SENTENCE
+    -- 3. CONSTRUCT SENTENCE
     local context = "The player's name is " .. name .. "."
     
     if (faction ~= "Civilian") then
@@ -182,7 +122,7 @@ function AiGlobalChatHandler:getPlayerContext(pPlayer)
         context = context .. " They are a civilian."
     end
 
-    -- 5. JEDI CHECK (Fun addition)
+    -- 4. JEDI CHECK
     if (pCreature:hasSkill("force_title_jedi_novice")) then
         context = context .. " They appear to be force sensitive."
     end
@@ -193,12 +133,9 @@ end
 function AiGlobalChatHandler:getNpcContext(pTarget)
     if (pTarget == nil) then return "" end
     
-    -- Get the visible name (e.g., "Ra'He Fiwo" or "Stormtrooper")
     local name = SceneObject(pTarget):getDisplayedName()
-    
     local context = "Your name is " .. name .. "."
 
-    -- Optional: Add Location (Planet) so they know where they are
     local zoneName = SceneObject(pTarget):getZoneName()
     context = context .. " You are currently on the planet " .. zoneName .. "."
 
@@ -220,20 +157,17 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
     local closestDistance = math.huge
     local messageLower = string.lower(message)
 
-    print("[AI Debug] Scanning " .. #nearbyObjects .. " nearby objects for keywords...")
+    -- print("[AI Debug] Scanning " .. #nearbyObjects .. " nearby objects for keywords...")
 
     for i = 1, #nearbyObjects, 1 do
         local pObj = nearbyObjects[i]
         local objID = SceneObject(pObj):getObjectID()
         
-        --if (pObj ~= nil and pObj ~= pPlayer and SceneObject(pObj):isCreatureObject()) then
-        if (pObj ~= nil and objID ~= playerID and SceneObject(pObj):isCreatureObject()) then
-        --if (pObj ~= nil and SceneObject(pObj):getObjectID() ~= SceneObject(pPlayer):getObjectID() and SceneObject(pObj):isCreatureObject()) then
+        -- Check if it's a creature and not the player
+        if (pObj ~= nil and SceneObject(pObj):getObjectID() ~= SceneObject(pPlayer):getObjectID() and SceneObject(pObj):isCreatureObject()) then
             local dist = self:getWorldDistance(pPlayer, pObj)
 
             if (dist <= AI_RANGE) then
-            -- SYNCED: Use the global AI_RANGE constant
-            --if (pScenePlayer:isInRangeWithObject(pObj, AI_RANGE)) then
                 local profile = AiRegistry.getProfile(pObj)
                 
                 if (profile ~= nil) then
@@ -261,7 +195,7 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
                             return pObj
                         end
                         
-                        print("[AI Debug] Candidate: " .. name .. " WorldDist: " .. dist)
+                        -- print("[AI Debug] Candidate: " .. name .. " WorldDist: " .. dist)
                 
                         if (dist < closestDistance) then
                             closestDistance = dist
@@ -273,17 +207,11 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
         end
     end
     
-    if (bestMatch ~= nil) then
-        print("[AI Debug] Scanner Winner: " .. SceneObject(bestMatch):getDisplayedName() .. " Dist: " .. closestDistance)
-        --local winnerName = SceneObject(bestMatch):getDisplayedName()
-        --print("[AI Debug] Scanner Winner: " .. winnerName .. " Dist: " .. closestDistance)
-    end
-
     return bestMatch
 end
 
 ----------------------------------------------------------------------
--- 2. CHAT LOGIC
+-- 3. CHAT LOGIC (Includes Recruiter & Normal Handling)
 ----------------------------------------------------------------------
 function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothing)
     
@@ -292,22 +220,18 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
     local spatialMsg = getChatMessage(pChatMessage)
     if (spatialMsg == nil or spatialMsg == "") then return 0 end
 
-    -- B. GET TARGET ID (But don't decide yet)
+    -- B. GET TARGET ID
     local pCreature = CreatureObject(pPlayer)
     local targetID = pCreature:getTargetID()
     local pTarget = nil
 
     -- C. STRATEGY: KEYWORDS FIRST
-    -- We pass the targetID so the scanner can use it as a tie-breaker, 
-    -- but if the message says "Padawan", the scanner will return the Padawan 
-    -- even if 'targetID' points to a SpecForce Marine.
     pTarget = self:findNearbyResponder(pPlayer, spatialMsg, targetID)
 
     if (pTarget ~= nil) then
         print("[AI Global] Auto-detected responder via keyword.")
     else
         -- D. FALLBACK: TARGET
-        -- No keyword matched? Okay, talk to the person we are looking at.
         if (targetID ~= 0) then
             local pPossibleTarget = getSceneObject(targetID)
             
@@ -334,19 +258,68 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
         return 0
     end
 
-    -- F. EXECUTE AI
+    -- F. GET PROFILE
     local profile = AiRegistry.getProfile(pTarget)
     if (profile == nil) then 
         print("[AI Debug] Ignored: Registry returned nil profile.")
         return 0 
     end
 
-    local playerContext = self:getPlayerContext(pPlayer)
-    local npcContext = self:getNpcContext(pTarget)
-    
-    local aiResponse = AiBrain.askBrain(spatialMsg, profile, playerContext, npcContext)
-    spatialChat(pTarget, aiResponse)
-    
+    ----------------------------------------------------------------------
+    -- G. DECISION TREE: RECRUITER vs NORMAL
+    ----------------------------------------------------------------------
+    if (profile.role == "recruiter") then
+        -- === PATH 1: RECRUITER AI (JSON LOGIC) ===
+        
+        -- 1. Get Game Context specifically for Recruiters (Rank, Points)
+        local recruiterContext = recruiterScreenplay:getPlayerStatusContext(pPlayer, pTarget)
+        
+        -- 2. Ask Brain for INTENT (Returns a Lua table from JSON)
+        local aiData = AiBrain.getRecruiterIntent(spatialMsg, recruiterContext)
+
+        -- 3. Act on the Result
+        if aiData then
+            -- Speak the flavor text
+            if aiData.reply then
+                spatialChat(pTarget, aiData.reply)
+            end
+
+            -- Trigger Game Mechanics
+            if aiData.intent == "promote" then
+                recruiterScreenplay:attemptPromotion(pPlayer, pTarget)
+                
+            elseif aiData.intent == "buy_armor" then
+                recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_weapons_armor", getGCWDiscount(pPlayer))
+                
+            elseif aiData.intent == "buy_furniture" then
+                recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_furniture", getGCWDiscount(pPlayer))
+                
+            elseif aiData.intent == "buy_structures" then
+                recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_installations", getGCWDiscount(pPlayer))
+
+            elseif aiData.intent == "go_overt" then
+                recruiterScreenplay:attemptToggleStatus(pPlayer, pTarget, 2)
+
+            elseif aiData.intent == "go_covert" then
+                recruiterScreenplay:attemptToggleStatus(pPlayer, pTarget, 1)
+            end
+        else
+            spatialChat(pTarget, "I... I'm not sure what you mean, soldier. (AI Error)")
+        end
+
+    else
+        -- === PATH 2: STANDARD NPC AI (FLAVOR TEXT) ===
+        local playerContext = self:getPlayerContext(pPlayer)
+        local npcContext = self:getNpcContext(pTarget)
+        
+        -- Use the standard Chat Response function
+        local aiResponse = AiBrain.getChatResponse(spatialMsg, profile, playerContext, npcContext)
+        spatialChat(pTarget, aiResponse)
+    end
+
+    ----------------------------------------------------------------------
+    -- H. LEGACY SKILL HANDLER (Optional extras defined in Registry)
+    ----------------------------------------------------------------------
     if profile.skills then
         for keyword, skillData in pairs(profile.skills) do
             if string.find(string.lower(spatialMsg), keyword) then
