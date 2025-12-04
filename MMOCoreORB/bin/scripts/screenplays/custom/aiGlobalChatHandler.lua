@@ -179,18 +179,25 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
                     end
 
                     if (isMatch) then
-                        local currentDist = pScenePlayer:getDistanceTo(pObj)
-                        -- print("[AI Debug] Match Candidate: " .. name .. " Dist: " .. currentDist)
-
+                        -- PRIORITY 1: Ownership
                         local owner = CreatureObject(pObj):getOwner()
                         if (owner == pPlayer) then return pObj end 
                         
+                        -- PRIORITY 2: Preferred Target
                         if (preferredTargetID ~= 0 and SceneObject(pObj):getObjectID() == preferredTargetID) then
                             return pObj
                         end
-
-                        if (currentDist < closestDistance) then
-                            closestDistance = currentDist
+                
+                        -- PRIORITY 3: Proximity (THE FIX)
+                        -- Old Line: local dist = pScenePlayer:getDistanceTo(pObj)  <-- THIS WAS BUGGED
+                        
+                        -- New Line: Calculate True World Distance
+                        local dist = self:getWorldDistance(pPlayer, pObj)
+                        
+                        -- print("[AI Debug] Candidate: " .. name .. " WorldDist: " .. dist)
+                
+                        if (dist < closestDistance) then
+                            closestDistance = dist
                             bestMatch = pObj
                         end
                     end
@@ -205,6 +212,28 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
     end
 
     return bestMatch
+end
+
+function AiGlobalChatHandler:getWorldDistance(pObj1, pObj2)
+    if (pObj1 == nil or pObj2 == nil) then return math.huge end
+    
+    local obj1 = SceneObject(pObj1)
+    local obj2 = SceneObject(pObj2)
+    
+    local x1 = obj1:getWorldPositionX()
+    local y1 = obj1:getWorldPositionY()
+    local z1 = obj1:getWorldPositionZ()
+    
+    local x2 = obj2:getWorldPositionX()
+    local y2 = obj2:getWorldPositionY()
+    local z2 = obj2:getWorldPositionZ()
+    
+    local dx = x1 - x2
+    local dy = y1 - y2
+    local dz = z1 - z2
+    
+    -- standard 3D distance formula
+    return math.sqrt(dx*dx + dy*dy + dz*dz)
 end
 
 ----------------------------------------------------------------------
@@ -252,8 +281,10 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
     end
 
     -- E. CHECK DISTANCE
-    if (not SceneObject(pPlayer):isInRangeWithObject(pTarget, AI_RANGE)) then
-        print("[AI Debug] Ignored: Target found, but out of range (" .. AI_RANGE .. "m).")
+    local finalDist = self:getWorldDistance(pPlayer, pTarget)
+    
+    if (finalDist > AI_RANGE) then
+        print("[AI Debug] Ignored: Target found, but out of range (" .. finalDist .. "m > " .. AI_RANGE .. "m).")
         return 0
     end
 
