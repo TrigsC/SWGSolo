@@ -881,9 +881,15 @@ end
 
 -- INTENT: TOGGLE COVERT/OVERT
 -- Logic to toggle On Leave (0), Covert (1), or Overt (2)
+-- Logic to toggle On Leave (0), Covert (1), or Overt (2)
 function recruiterScreenplay:attemptToggleStatus(pPlayer, pNpc, targetStatus) 
     local currentStatus = CreatureObject(pPlayer):getFactionStatus()
-    local futureStatus = CreatureObject(pPlayer):getFutureFactionStatus() -- Check if they are already waiting
+    
+    -- FIX: Use isChangingFactionStatus() because getFutureFactionStatus() is not exposed to Lua
+    if (CreatureObject(pPlayer):isChangingFactionStatus()) then
+        spatialChat(pNpc, "Your status change is already being processed. Please wait.")
+        return
+    end
     
     if (currentStatus == targetStatus) then
         spatialChat(pNpc, "You are already in that status, soldier.")
