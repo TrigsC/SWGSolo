@@ -75,7 +75,8 @@ end
 --------------------------------------------------------------------------------
 -- PUBLIC FUNCTION 2: Recruiter Logic (Intent Classification)
 --------------------------------------------------------------------------------
-local systemPrompt = [[
+function AiBrain.getRecruiterIntent(player_input, player_stats_context)
+    local systemPrompt = [[
     You are a Star Wars Rebel Recruiter.
     Current Player Stats: ]] .. player_stats_context .. [[
     
@@ -85,10 +86,10 @@ local systemPrompt = [[
     - "buy_armor" (Player wants weapons/armor)
     - "buy_furniture" (Player wants furniture)
     - "buy_structures" (Player wants installations/bases)
-    - "buy_hirelings" (Player wants faction pets/troopers)          <-- NEW
-    - "buy_schematics" (Player wants crafting schematics)           <-- NEW
-    - "buy_uniforms" (Player wants clothing/uniforms)               <-- NEW
-    - "check_war_status" (Player asks about the war score/control)  <-- NEW
+    - "buy_hirelings" (Player wants faction pets/troopers)
+    - "buy_schematics" (Player wants crafting schematics)
+    - "buy_uniforms" (Player wants clothing/uniforms)
+    - "check_war_status" (Player asks about the war score/control)
     - "go_overt" (Player wants to be Special Forces/Declared)
     - "go_covert" (Player wants to be Combatant/Hidden)
     - "go_on_leave" (Player wants to resign/go on leave/be civilian)

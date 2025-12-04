@@ -316,7 +316,7 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
                 recruiterScreenplay:attemptToggleStatus(pPlayer, pTarget, 1)
             end
         else
-            spatialChat(pTarget, "I... I'm not sure what you mean, soldier. (AI Error)")
+            spatialChat(pTarget, "I... I'm not sure what you mean, soldier. Please ask in a different way!")
         end
 
     else
