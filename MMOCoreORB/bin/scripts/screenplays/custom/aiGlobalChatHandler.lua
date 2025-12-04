@@ -79,47 +79,74 @@ end
 function AiGlobalChatHandler:getWorldDistance(pObj1, pObj2)
     if (pObj1 == nil or pObj2 == nil) then return math.huge end
     
-    local obj1 = SceneObject(pObj1)
-    local obj2 = SceneObject(pObj2)
+    -- Force cast to SceneObject safely
+    local scno1 = LuaSceneObject(pObj1)
+    local scno2 = LuaSceneObject(pObj2)
     
-    -- Try World Position First (Preferred)
-    local x1 = obj1:getWorldPositionX()
-    local y1 = obj1:getWorldPositionY()
-    local z1 = obj1:getWorldPositionZ()
-    
-    local x2 = obj2:getWorldPositionX()
-    local y2 = obj2:getWorldPositionY()
-    local z2 = obj2:getWorldPositionZ()
-    
-    -- DEBUG: Let's see if World Position is failing (returning 0)
-    if (x1 == 0 and z1 == 0) or (x2 == 0 and z2 == 0) then
-        print("[AI Debug] WARN: WorldPos is 0. Trying local getPosition...")
-        -- Fallback to local position (Works fine if everyone is outdoors)
-        x1 = obj1:getPositionX()
-        y1 = obj1:getPositionY()
-        z1 = obj1:getPositionZ()
-        
-        x2 = obj2:getPositionX()
-        y2 = obj2:getPositionY()
-        z2 = obj2:getPositionZ()
-    end
+    if (scno1 == nil or scno2 == nil) then return math.huge end
 
+    -- DEBUG: Print WHO we are comparing
+    -- print("[AI Debug] Compare: " .. scno1:getCustomObjectName() .. " vs " .. scno2:getCustomObjectName())
+
+    local x1 = scno1:getWorldPositionX()
+    local y1 = scno1:getWorldPositionY()
+    local z1 = scno1:getWorldPositionZ()
+    
+    local x2 = scno2:getWorldPositionX()
+    local y2 = scno2:getWorldPositionY()
+    local z2 = scno2:getWorldPositionZ()
+    
     local dx = x1 - x2
     local dy = y1 - y2
     local dz = z1 - z2
     
-    local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
-
-    -- DEBUG PRINT: Only print if it's "suspiciously" close (0) or a valid candidate
-    if dist < 1.0 then
-        local n1 = obj1:getCustomObjectName()
-        local n2 = obj2:getCustomObjectName()
-        print(string.format("[AI Debug] COORDS: %s(%.1f, %.1f) vs %s(%.1f, %.1f) = Dist: %.1f", n1, x1, z1, n2, x2, z2, dist))
-    end
-    
-    return dist
+    return math.sqrt(dx*dx + dy*dy + dz*dz)
 end
 
+--function AiGlobalChatHandler:getWorldDistance(pObj1, pObj2)
+--    if (pObj1 == nil or pObj2 == nil) then return math.huge end
+--    
+--    local obj1 = SceneObject(pObj1)
+--    local obj2 = SceneObject(pObj2)
+--    
+--    -- Try World Position First (Preferred)
+--    local x1 = obj1:getWorldPositionX()
+--    local y1 = obj1:getWorldPositionY()
+--    local z1 = obj1:getWorldPositionZ()
+--    
+--    local x2 = obj2:getWorldPositionX()
+--    local y2 = obj2:getWorldPositionY()
+--    local z2 = obj2:getWorldPositionZ()
+--    
+--    -- DEBUG: Let's see if World Position is failing (returning 0)
+--    if (x1 == 0 and z1 == 0) or (x2 == 0 and z2 == 0) then
+--        print("[AI Debug] WARN: WorldPos is 0. Trying local getPosition...")
+--        -- Fallback to local position (Works fine if everyone is outdoors)
+--        x1 = obj1:getPositionX()
+--        y1 = obj1:getPositionY()
+--        z1 = obj1:getPositionZ()
+--        
+--        x2 = obj2:getPositionX()
+--        y2 = obj2:getPositionY()
+--        z2 = obj2:getPositionZ()
+--    end
+--
+--    local dx = x1 - x2
+--    local dy = y1 - y2
+--    local dz = z1 - z2
+--    
+--    local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+--
+--    -- DEBUG PRINT: Only print if it's "suspiciously" close (0) or a valid candidate
+--    if dist < 1.0 then
+--        local n1 = obj1:getCustomObjectName()
+--        local n2 = obj2:getCustomObjectName()
+--        print(string.format("[AI Debug] COORDS: %s(%.1f, %.1f) vs %s(%.1f, %.1f) = Dist: %.1f", n1, x1, z1, n2, x2, z2, dist))
+--    end
+--    
+--    return dist
+--end
+--
 function AiGlobalChatHandler:getPlayerContext(pPlayer)
     if (pPlayer == nil) then return "" end
     
@@ -197,15 +224,16 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
 
     for i = 1, #nearbyObjects, 1 do
         local pObj = nearbyObjects[i]
+        local objID = SceneObject(pObj):getObjectID()
         
         --if (pObj ~= nil and pObj ~= pPlayer and SceneObject(pObj):isCreatureObject()) then
-        if (pObj ~= nil and SceneObject(pObj):getObjectID() ~= SceneObject(pPlayer):getObjectID() and SceneObject(pObj):isCreatureObject()) then
+        if (pObj ~= nil and objID ~= playerID and SceneObject(pObj):isCreatureObject()) then
+        --if (pObj ~= nil and SceneObject(pObj):getObjectID() ~= SceneObject(pPlayer):getObjectID() and SceneObject(pObj):isCreatureObject()) then
             local dist = self:getWorldDistance(pPlayer, pObj)
 
             if (dist <= AI_RANGE) then
             -- SYNCED: Use the global AI_RANGE constant
             --if (pScenePlayer:isInRangeWithObject(pObj, AI_RANGE)) then
-                
                 local profile = AiRegistry.getProfile(pObj)
                 
                 if (profile ~= nil) then
