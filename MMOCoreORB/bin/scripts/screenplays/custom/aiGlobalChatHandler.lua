@@ -297,6 +297,18 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
             elseif aiData.intent == "buy_structures" then
                 recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_installations", getGCWDiscount(pPlayer))
 
+            elseif aiData.intent == "buy_hirelings" then
+                recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_hirelings", getGCWDiscount(pPlayer))
+
+            elseif aiData.intent == "buy_schematics" then
+                recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_schematics", getGCWDiscount(pPlayer))
+
+            elseif aiData.intent == "buy_uniforms" then
+                recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_uniforms", getGCWDiscount(pPlayer))
+
+            elseif aiData.intent == "check_war_status" then
+                recruiterScreenplay:announceGCWScore(pTarget)
+
             elseif aiData.intent == "go_overt" then
                 recruiterScreenplay:attemptToggleStatus(pPlayer, pTarget, 2)
 

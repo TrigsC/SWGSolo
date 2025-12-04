@@ -932,4 +932,25 @@ function recruiterScreenplay:attemptToggleStatus(pPlayer, pNpc, targetStatus)
     end
 end
 
+-- Logic to announce the GCW Score for the planet
+function recruiterScreenplay:announceGCWScore(pNpc)
+    if (pNpc == nil) then return end
+    
+    local zoneName = SceneObject(pNpc):getZoneName()
+    local rebelScore = getRebelScore(zoneName)
+    local imperialScore = getImperialScore(zoneName)
+    
+    local message = "Current Status for " .. zoneName .. ": Rebel: " .. rebelScore .. " / Imperial: " .. imperialScore .. "."
+    
+    if (rebelScore > imperialScore) then
+        message = message .. " We are winning, soldier!"
+    elseif (imperialScore > rebelScore) then
+        message = message .. " The Empire is pushing us back!"
+    else
+        message = message .. " It is a stalemate."
+    end
+    
+    spatialChat(pNpc, message)
+end
+
 return recruiterScreenplay
