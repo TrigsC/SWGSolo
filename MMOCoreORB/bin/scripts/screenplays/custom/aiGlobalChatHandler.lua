@@ -82,6 +82,7 @@ function AiGlobalChatHandler:getWorldDistance(pObj1, pObj2)
     local obj1 = SceneObject(pObj1)
     local obj2 = SceneObject(pObj2)
     
+    -- Try World Position First (Preferred)
     local x1 = obj1:getWorldPositionX()
     local y1 = obj1:getWorldPositionY()
     local z1 = obj1:getWorldPositionZ()
@@ -90,12 +91,33 @@ function AiGlobalChatHandler:getWorldDistance(pObj1, pObj2)
     local y2 = obj2:getWorldPositionY()
     local z2 = obj2:getWorldPositionZ()
     
+    -- DEBUG: Let's see if World Position is failing (returning 0)
+    if (x1 == 0 and z1 == 0) or (x2 == 0 and z2 == 0) then
+        print("[AI Debug] WARN: WorldPos is 0. Trying local getPosition...")
+        -- Fallback to local position (Works fine if everyone is outdoors)
+        x1 = obj1:getPositionX()
+        y1 = obj1:getPositionY()
+        z1 = obj1:getPositionZ()
+        
+        x2 = obj2:getPositionX()
+        y2 = obj2:getPositionY()
+        z2 = obj2:getPositionZ()
+    end
+
     local dx = x1 - x2
     local dy = y1 - y2
     local dz = z1 - z2
     
-    -- standard 3D distance formula
-    return math.sqrt(dx*dx + dy*dy + dz*dz)
+    local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+
+    -- DEBUG PRINT: Only print if it's "suspiciously" close (0) or a valid candidate
+    if dist < 1.0 then
+        local n1 = obj1:getCustomObjectName()
+        local n2 = obj2:getCustomObjectName()
+        print(string.format("[AI Debug] COORDS: %s(%.1f, %.1f) vs %s(%.1f, %.1f) = Dist: %.1f", n1, x1, z1, n2, x2, z2, dist))
+    end
+    
+    return dist
 end
 
 function AiGlobalChatHandler:getPlayerContext(pPlayer)
