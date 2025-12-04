@@ -23,9 +23,7 @@ local FactionRanks = {
 
 local AI_RANGE = 20
 
-AiGlobalChatHandler = ScreenPlay:new {
-    --numberOfActs = 1,
-}
+AiGlobalChatHandler = ScreenPlay:new {}
 
 -- 1. CRITICAL FIX: This registers the script so the server runs it.
 registerScreenPlay("AiGlobalChatHandler", true)
@@ -60,6 +58,44 @@ function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
     print("[AI Global] Chat Observer attached to " .. pSceneObject:getCustomObjectName())
     
     return 0
+end
+
+function AiGlobalChatHandler:registerObservers(pPlayer)
+    if (pPlayer == nil) then return end
+
+    -- FIX: The 'hasObserver' function caused a server crash (SIGSEGV).
+    -- Instead, we use the standard "Drop then Create" pattern.
+    -- This guarantees we never have duplicates and avoids the crashy check.
+    
+    -- 1. Drop any existing observer (Safe to call even if none exists)
+    dropObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
+    
+    -- 2. Create the new observer
+    createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
+    
+    -- print("[AI Global] Chat Observer Refreshed.")
+end
+
+function AiGlobalChatHandler:getWorldDistance(pObj1, pObj2)
+    if (pObj1 == nil or pObj2 == nil) then return math.huge end
+    
+    local obj1 = SceneObject(pObj1)
+    local obj2 = SceneObject(pObj2)
+    
+    local x1 = obj1:getWorldPositionX()
+    local y1 = obj1:getWorldPositionY()
+    local z1 = obj1:getWorldPositionZ()
+    
+    local x2 = obj2:getWorldPositionX()
+    local y2 = obj2:getWorldPositionY()
+    local z2 = obj2:getWorldPositionZ()
+    
+    local dx = x1 - x2
+    local dy = y1 - y2
+    local dz = z1 - z2
+    
+    -- standard 3D distance formula
+    return math.sqrt(dx*dx + dy*dy + dz*dz)
 end
 
 function AiGlobalChatHandler:getPlayerContext(pPlayer)
@@ -120,22 +156,6 @@ function AiGlobalChatHandler:getNpcContext(pTarget)
     return context
 end
 
-function AiGlobalChatHandler:registerObservers(pPlayer)
-    if (pPlayer == nil) then return end
-
-    -- FIX: The 'hasObserver' function caused a server crash (SIGSEGV).
-    -- Instead, we use the standard "Drop then Create" pattern.
-    -- This guarantees we never have duplicates and avoids the crashy check.
-    
-    -- 1. Drop any existing observer (Safe to call even if none exists)
-    dropObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
-    
-    -- 2. Create the new observer
-    createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
-    
-    -- print("[AI Global] Chat Observer Refreshed.")
-end
-
 ----------------------------------------------------------------------
 -- 2. Nearby LOGIC
 ----------------------------------------------------------------------
@@ -156,10 +176,13 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
     for i = 1, #nearbyObjects, 1 do
         local pObj = nearbyObjects[i]
         
-        if (pObj ~= nil and pObj ~= pPlayer and SceneObject(pObj):isCreatureObject()) then
-            
+        --if (pObj ~= nil and pObj ~= pPlayer and SceneObject(pObj):isCreatureObject()) then
+        if (pObj ~= nil and SceneObject(pObj):getObjectID() ~= SceneObject(pPlayer):getObjectID() and SceneObject(pObj):isCreatureObject()) then
+            local dist = self:getWorldDistance(pPlayer, pObj)
+
+            if (dist <= AI_RANGE) then
             -- SYNCED: Use the global AI_RANGE constant
-            if (pScenePlayer:isInRangeWithObject(pObj, AI_RANGE)) then
+            --if (pScenePlayer:isInRangeWithObject(pObj, AI_RANGE)) then
                 
                 local profile = AiRegistry.getProfile(pObj)
                 
@@ -187,14 +210,8 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
                         if (preferredTargetID ~= 0 and SceneObject(pObj):getObjectID() == preferredTargetID) then
                             return pObj
                         end
-                
-                        -- PRIORITY 3: Proximity (THE FIX)
-                        -- Old Line: local dist = pScenePlayer:getDistanceTo(pObj)  <-- THIS WAS BUGGED
                         
-                        -- New Line: Calculate True World Distance
-                        local dist = self:getWorldDistance(pPlayer, pObj)
-                        
-                        -- print("[AI Debug] Candidate: " .. name .. " WorldDist: " .. dist)
+                        print("[AI Debug] Candidate: " .. name .. " WorldDist: " .. dist)
                 
                         if (dist < closestDistance) then
                             closestDistance = dist
@@ -207,33 +224,12 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
     end
     
     if (bestMatch ~= nil) then
-        local winnerName = SceneObject(bestMatch):getDisplayedName()
-        print("[AI Debug] Scanner Winner: " .. winnerName .. " Dist: " .. closestDistance)
+        print("[AI Debug] Scanner Winner: " .. SceneObject(bestMatch):getDisplayedName() .. " Dist: " .. closestDistance)
+        --local winnerName = SceneObject(bestMatch):getDisplayedName()
+        --print("[AI Debug] Scanner Winner: " .. winnerName .. " Dist: " .. closestDistance)
     end
 
     return bestMatch
-end
-
-function AiGlobalChatHandler:getWorldDistance(pObj1, pObj2)
-    if (pObj1 == nil or pObj2 == nil) then return math.huge end
-    
-    local obj1 = SceneObject(pObj1)
-    local obj2 = SceneObject(pObj2)
-    
-    local x1 = obj1:getWorldPositionX()
-    local y1 = obj1:getWorldPositionY()
-    local z1 = obj1:getWorldPositionZ()
-    
-    local x2 = obj2:getWorldPositionX()
-    local y2 = obj2:getWorldPositionY()
-    local z2 = obj2:getWorldPositionZ()
-    
-    local dx = x1 - x2
-    local dy = y1 - y2
-    local dz = z1 - z2
-    
-    -- standard 3D distance formula
-    return math.sqrt(dx*dx + dy*dy + dz*dz)
 end
 
 ----------------------------------------------------------------------
