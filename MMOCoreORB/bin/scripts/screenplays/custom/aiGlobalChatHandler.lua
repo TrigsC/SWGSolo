@@ -26,7 +26,6 @@ local AI_RANGE = 20
 
 AiGlobalChatHandler = ScreenPlay:new {}
 
--- 1. CRITICAL FIX: This registers the script so the server runs it.
 registerScreenPlay("AiGlobalChatHandler", true)
 
 ----------------------------------------------------------------------
@@ -53,7 +52,6 @@ function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
     
     -- Call the internal function using COLON because we are inside Lua now
     AiGlobalChatHandler:registerObservers(pPlayer)
-    
     print("[AI Global] Chat Observer attached to " .. pSceneObject:getCustomObjectName())
     
     return 0
@@ -270,6 +268,18 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
     ----------------------------------------------------------------------
     if (profile.role == "recruiter") then
         -- === PATH 1: RECRUITER AI (JSON LOGIC) ===
+        
+        -- A. STUCK CHECK: If the server restarted while the timer was running, the data might be gone.
+        -- This logic (borrowed from Core3) fixes the player so they aren't stuck forever.
+        if (CreatureObject(pPlayer):isChangingFactionStatus() and readData(CreatureObject(pPlayer):getObjectID() .. ":changingFactionStatus") ~= 1) then
+            recruiterScreenplay:handleGoCovert(pPlayer)
+        end
+
+        -- B. LOCKDOWN CHECK: If they are actively waiting for status change, BLOCK interaction.
+        if (CreatureObject(pPlayer):isChangingFactionStatus()) then
+            spatialChat(pTarget, "Greetings. I see that your status is currently being processed. I won't be able to help you until that is complete. It should not take much longer.")
+            return 0
+        end
         
         -- 1. Get Game Context specifically for Recruiters (Rank, Points)
         local recruiterContext = recruiterScreenplay:getPlayerStatusContext(pPlayer, pTarget)
