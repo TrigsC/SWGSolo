@@ -881,7 +881,6 @@ end
 
 -- INTENT: TOGGLE COVERT/OVERT
 -- Logic to toggle On Leave (0), Covert (1), or Overt (2)
--- Logic to toggle On Leave (0), Covert (1), or Overt (2)
 function recruiterScreenplay:attemptToggleStatus(pPlayer, pNpc, targetStatus) 
     local currentStatus = CreatureObject(pPlayer):getFactionStatus()
     

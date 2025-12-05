@@ -314,6 +314,9 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
 
             elseif aiData.intent == "go_covert" then
                 recruiterScreenplay:attemptToggleStatus(pPlayer, pTarget, 1)
+
+            elseif aiData.intent == "go_on_leave" then
+                recruiterScreenplay:attemptToggleStatus(pPlayer, pTarget, 0)
             end
         else
             spatialChat(pTarget, "I... I'm not sure what you mean, soldier. Please ask in a different way!")
