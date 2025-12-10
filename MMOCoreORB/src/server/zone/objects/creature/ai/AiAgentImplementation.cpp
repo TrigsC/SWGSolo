@@ -2724,9 +2724,9 @@ int AiAgentImplementation::handleObjectMenuSelect(CreatureObject* player, byte s
         PlayerObject* ghost = player->getPlayerObject();
         if (ghost != nullptr && ghost->isAdmin()) {
             
-            // We hijack the 'INSPECT' menu option (usually ID 13 or similar constant)
+            // We hijack the 'EXAMINE' menu option (usually ID 13 or similar constant)
             // If you right-click -> Inspect, this code runs.
-            if (selectedID == RadialOptions::INSPECT) {
+            if (selectedID == RadialOptions::EXAMINE) {
                 player->sendSystemMessage("admin: Toggling SimPlayer AI...");
                 SimPlayerManager::instance()->toggleBot(_this.get());
                 return 0; // Stop the normal Inspect window from opening
