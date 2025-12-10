@@ -7,6 +7,8 @@
 #include "engine/core/TaskManager.h"
 #include "server/zone/managers/collision/PathFinderManager.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h"
+#include "server/zone/Zone.h" 
+#include "server/zone/objects/scene/WorldCoordinates.h"
 
 // --------------------------------------------------------
 // Task Implementation
@@ -50,12 +52,11 @@ void SimPlayerController::goToResource(const String& resourceName) {
 
     state = SEARCHING_RESOURCE;
     
-    // --- STEP 1: Search (Mocked for Prototype) ---
-    // Real implementation would query PlanetManager here.
-    // For now, let's pick a spot 200m away in X direction for testing.
+    // --- STEP 1: Search (Mocked) ---
+    // Get current position
     Vector3 currentPos = agent->getWorldPosition();
     Vector3 targetPos = currentPos;
-    targetPos.setX(currentPos.getX() + 200); // Simple 200m move
+    targetPos.setX(currentPos.getX() + 200); // Move 200m East
 
     Zone* zone = agent->getZone();
     if (zone == nullptr) return;
@@ -63,14 +64,16 @@ void SimPlayerController::goToResource(const String& resourceName) {
     // --- STEP 2: Plan (Async) ---
     state = CALCULATING_PATH;
     
-    WorldCoordinates startCoord = agent->getWorldCoordinates();
-    WorldCoordinates endCoord;
-    endCoord.setPoint(targetPos);
-    endCoord.setZone(zone);
+    // FIX 1: Construct WorldCoordinates using the agent directly
+    WorldCoordinates startCoord(agent);
+
+    // FIX 2: Construct target WorldCoordinates using the Constructor(Vector3, Cell*)
+    // nullptr cell means "Terrain/Outside"
+    WorldCoordinates endCoord(targetPos, nullptr); 
 
     // Launch the background task
     Reference<FindResourcePathTask*> task = new FindResourcePathTask(this, startCoord, endCoord, zone);
-    task->execute(); // Pushes to the thread pool
+    task->execute(); 
 }
 
 void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {

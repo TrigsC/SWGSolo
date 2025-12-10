@@ -92,6 +92,7 @@
 #include "server/zone/objects/creature/commands/ForcePowersQueueCommand.h"
 #include "server/zone/objects/creature/commands/JediQueueCommand.h"
 #include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
+#include "server/zone/packets/object/RadialOptions.h"
 
 // #define DEBUG
 //#define DEBUG_AI_WEAPONS
