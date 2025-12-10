@@ -1,7 +1,7 @@
 #ifndef SIMPLAYERMANAGER_H_
 #define SIMPLAYERMANAGER_H_
 
-#include "engine/core/Singleton.h"
+#include "engine/util/Singleton.h"
 #include "system/util/SynchronizedVectorMap.h"
 #include "SimPlayerController.h"
 
