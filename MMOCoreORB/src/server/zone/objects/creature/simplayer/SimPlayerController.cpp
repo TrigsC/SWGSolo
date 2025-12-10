@@ -47,7 +47,7 @@ void FindResourcePathTask::run() {
 SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     agent = aiAgent;
     state = IDLE;
-    setLoggingName("SimPlayerController"); // Helps identify logs
+    //setLoggingName("SimPlayerController"); // Helps identify logs
 }
 
 SimPlayerController::~SimPlayerController() {
