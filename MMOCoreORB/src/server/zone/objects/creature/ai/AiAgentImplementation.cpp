@@ -91,6 +91,7 @@
 #include "server/zone/managers/objectcontroller/command/CommandConfigManager.h"
 #include "server/zone/objects/creature/commands/ForcePowersQueueCommand.h"
 #include "server/zone/objects/creature/commands/JediQueueCommand.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
 
 // #define DEBUG
 //#define DEBUG_AI_WEAPONS
@@ -2716,6 +2717,21 @@ int AiAgentImplementation::notifyAttack(Observable* observable) {
 }
 
 int AiAgentImplementation::handleObjectMenuSelect(CreatureObject* player, byte selectedID) {
+	// --- START SIMPLAYER HOOK ---
+    // Check if the player is an Admin
+    if (player->isPlayerCreature()) {
+        PlayerObject* ghost = player->getPlayerObject();
+        if (ghost != nullptr && ghost->isAdmin()) {
+            
+            // We hijack the 'INSPECT' menu option (usually ID 13 or similar constant)
+            // If you right-click -> Inspect, this code runs.
+            if (selectedID == RadialOptions::INSPECT) {
+                player->sendSystemMessage("admin: Toggling SimPlayer AI...");
+                SimPlayerManager::instance()->toggleBot(_this.get());
+                return 0; // Stop the normal Inspect window from opening
+            }
+        }
+    }
 	if (isDead() && !isPet()) {
 		switch (selectedID) {
 		case 35:
