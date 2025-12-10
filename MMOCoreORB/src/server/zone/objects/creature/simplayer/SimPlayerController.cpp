@@ -56,7 +56,7 @@ SimPlayerController::~SimPlayerController() {
 
 void SimPlayerController::goToResource(const String& resourceName) {
     if (agent == nullptr) {
-        info("ERROR: Agent is null in goToResource!", true);
+        Logger::console.info("ERROR: Agent is null in goToResource!", true);
         return;
     }
 
@@ -69,7 +69,7 @@ void SimPlayerController::goToResource(const String& resourceName) {
     // DEBUG: Print current position to understand the Axis
     // SWG Standard: X=East/West, Z=North/South, Y=Elevation (Up)
     Vector3 currentPos = agent->getWorldPosition();
-    info("DEBUG: Current Pos -> X:" + String::valueOf(currentPos.getX()) + 
+    Logger::console.info("DEBUG: Current Pos -> X:" + String::valueOf(currentPos.getX()) + 
          " Z(North):" + String::valueOf(currentPos.getZ()) + 
          " Y(Up):" + String::valueOf(currentPos.getY()), true);
 
@@ -77,7 +77,7 @@ void SimPlayerController::goToResource(const String& resourceName) {
     
     Zone* zone = agent->getZone();
     if (zone == nullptr) {
-        info("ERROR: Agent is not in a valid Zone!", true);
+        Logger::console.info("ERROR: Agent is not in a valid Zone!", true);
         return;
     }
 
@@ -92,8 +92,8 @@ void SimPlayerController::goToResource(const String& resourceName) {
     // Core3 Zone::getHeight usually takes (x, y) where y is the North/South axis.
     float terrainHeight = zone->getHeight(targetX, targetZ); 
 
-    info("DEBUG: Target Calculated -> X:" + String::valueOf(targetX) + " Z:" + String::valueOf(targetZ), true);
-    info("DEBUG: Terrain Snap -> Old Y:" + String::valueOf(currentPos.getY()) + " New Y:" + String::valueOf(terrainHeight), true);
+    Logger::console.info("DEBUG: Target Calculated -> X:" + String::valueOf(targetX) + " Z:" + String::valueOf(targetZ), true);
+    Logger::console.info("DEBUG: Terrain Snap -> Old Y:" + String::valueOf(currentPos.getY()) + " New Y:" + String::valueOf(terrainHeight), true);
 
     // Construct the target vector
     // Note: Vector3 constructor is usually (X, Y, Z). 
@@ -108,7 +108,7 @@ void SimPlayerController::goToResource(const String& resourceName) {
     WorldCoordinates startCoord(agent);
     WorldCoordinates endCoord(targetPos, nullptr); // nullptr cell = terrain
 
-    info("DEBUG: Launching Async Path Task...", true);
+    Logger::console.info("DEBUG: Launching Async Path Task...", true);
 
     Reference<FindResourcePathTask*> task = new FindResourcePathTask(this, startCoord, endCoord, zone);
     task->execute(); 
@@ -121,19 +121,19 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     }
     
     if (path == nullptr || path->size() == 0) {
-        info("ERROR: Path returned EMPTY. Destination is unreachable or inside an obstacle.", true);
+        Logger::console.info("ERROR: Path returned EMPTY. Destination is unreachable or inside an obstacle.", true);
         if (path) delete path;
         onPathFailed();
         return;
     }
 
     state = MOVING;
-    info("SUCCESS: Path found with " + String::valueOf(path->size()) + " waypoints. Processing...", true);
+    Logger::console.info("SUCCESS: Path found with " + String::valueOf(path->size()) + " waypoints. Processing...", true);
 
     // Log the first point to sanity check
     if (path->size() > 0) {
         Vector3 firstPt = path->get(0).getPoint();
-        info("DEBUG: First Waypoint -> X:" + String::valueOf(firstPt.getX()) + " Y:" + String::valueOf(firstPt.getY()) + " Z:" + String::valueOf(firstPt.getZ()), true);
+        Logger::console.info("DEBUG: First Waypoint -> X:" + String::valueOf(firstPt.getX()) + " Y:" + String::valueOf(firstPt.getY()) + " Z:" + String::valueOf(firstPt.getZ()), true);
     }
 
     // Clear existing patrol points
@@ -154,7 +154,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     }
 
     // Force the state
-    info("DEBUG: Setting Movement State to PATROLLING and Activating AI.", true);
+    Logger::console.info("DEBUG: Setting Movement State to PATROLLING and Activating AI.", true);
     agent->setMovementState(AiAgent::PATROLLING);
     agent->activateAiBehavior(true); // Force immediate update
     
@@ -163,5 +163,5 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
 void SimPlayerController::onPathFailed() {
     state = IDLE;
-    info("FAILURE: Could not find path to resource.", true);
+    Logger::console.info("FAILURE: Could not find path to resource.", true);
 }
