@@ -3,6 +3,8 @@
  */
 
 #include "SimPlayerController.h"
+#include "engine/core/Core.h"       
+#include "engine/core/TaskManager.h"
 #include "server/zone/managers/collision/PathFinderManager.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h"
 

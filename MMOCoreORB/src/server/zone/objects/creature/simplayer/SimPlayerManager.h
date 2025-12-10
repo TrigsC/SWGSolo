@@ -4,6 +4,9 @@
 #include "engine/util/Singleton.h"
 #include "system/util/SynchronizedVectorMap.h"
 #include "SimPlayerController.h"
+#include "engine/core/Task.h"
+#include "engine/core/ManagedReference.h"
+#include "engine/core/Object.h"
 
 class SimPlayerManager : public Singleton<SimPlayerManager>, public Object, public Logger {
     // Map of Creature ObjectID -> Your Custom Controller
