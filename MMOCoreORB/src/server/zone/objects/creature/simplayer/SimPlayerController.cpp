@@ -15,7 +15,7 @@
 // --------------------------------------------------------
 void FindResourcePathTask::run() {
     // 1. Verify controller still exists (Bot might have despawned)
-    ManagedReference<SimPlayerController*> strongCtrl = controller.get();
+    Reference<SimPlayerController*> strongCtrl = controller.get();
     if (strongCtrl == nullptr) return;
 
     // 2. Perform the heavy math (Blocking call is safe here on background thread)
