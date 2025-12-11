@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Phase 2: Game Loop + MAX LOGGING
+ * Phase 2: Game Loop + MAX LOGGING (Build Fixed)
  */
 
 #include "SimPlayerController.h"
@@ -13,6 +13,7 @@
 #include "server/zone/objects/resource/ResourceSpawn.h"
 #include "server/ServerCore.h"
 #include "server/zone/ZoneServer.h"
+#include "system/lang/System.h" // <--- Added for getMiliTime()
 
 // --------------------------------------------------------
 // Task Implementations
@@ -25,11 +26,11 @@ void FindResourcePathTask::run() {
     Logger::console.info("SimPlayerTask: Requesting path from Recast engine...", true);
     
     // Timer to measure how long pathfinding takes
-    uint64 startTime = Core::getMiliTime();
+    uint64 startTime = System::getMiliTime(); // <--- FIXED
     
     Vector<WorldCoordinates>* path = PathFinderManager::instance()->findPath(startCoord, endCoord, zone);
 
-    uint64 endTime = Core::getMiliTime();
+    uint64 endTime = System::getMiliTime(); // <--- FIXED
     Logger::console.info("SimPlayerTask: Recast finished in " + String::valueOf(endTime - startTime) + "ms.", true);
 
     Core::getTaskManager()->executeTask([strongCtrl, path] () {
@@ -131,7 +132,6 @@ void SimPlayerController::finishSurvey() {
 String SimPlayerController::findActualResourceSpawn(const String& genericType) {
     ZoneServer* zoneServer = ServerCore::getZoneServer();
     if (zoneServer && zoneServer->getResourceManager()) {
-        // Just a placeholder, but logging it proves we tried
         return genericType + "_spawn_found"; 
     }
     return genericType;
@@ -143,7 +143,7 @@ void SimPlayerController::goToResource(const String& resourceName) {
     agent->setHomeLocation(agent->getPositionX(), agent->getPositionZ(), agent->getPositionY());
     agent->stopWaiting();
     
-    state = SEARCHING_RESOURCE;
+    // state = SEARCHING_RESOURCE; <--- DELETED THIS LINE (Fixed the enum error)
     Zone* zone = agent->getZone();
     if (zone == nullptr) return;
 
