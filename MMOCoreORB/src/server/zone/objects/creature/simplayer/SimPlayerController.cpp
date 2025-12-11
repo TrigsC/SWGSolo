@@ -1,17 +1,18 @@
 /*
  * SimPlayerController.cpp
- * Wilderness Capable + Real Resource Names
+ * Final Fixed Version: ZoneServer Access + Wilderness Logic
  */
 
 #include "SimPlayerController.h"
 #include "engine/core/Core.h"
 #include "engine/core/TaskManager.h"
 #include "server/zone/managers/collision/PathFinderManager.h"
-#include "server/zone/managers/collision/CollisionManager.h" 
 #include "server/zone/objects/creature/ai/PatrolPoint.h"
 #include "server/zone/Zone.h"
 #include "server/zone/managers/resource/ResourceManager.h"
 #include "server/zone/objects/resource/ResourceSpawn.h"
+#include "server/ServerCore.h"       // <--- ADDED
+#include "server/zone/ZoneServer.h"  // <--- ADDED
 
 // --------------------------------------------------------
 // Task Implementation
@@ -24,13 +25,13 @@ void FindResourcePathTask::run() {
     Vector<WorldCoordinates>* path = PathFinderManager::instance()->findPath(startCoord, endCoord, zone);
 
     Core::getTaskManager()->executeTask([strongCtrl, path] () {
-        // Validation: We now pass ALL paths to the controller.
-        // The controller will decide if a Size 2 (Straight Line) path is safe.
-        if (path != nullptr && path->size() >= 2) { 
+        // Validation: We accept all paths now. 
+        // We will filter "Size 2" (Straight Line) inside the controller if we want,
+        // but for wilderness blind walking, we need to accept them.
+        if (path != nullptr) { 
             strongCtrl->onPathFound(path);
         } else {
             strongCtrl->onPathFailed();
-            if (path) delete path;
         }
     }, "SimPlayerResultLambda");
 }
@@ -50,17 +51,17 @@ SimPlayerController::~SimPlayerController() {
     agent = nullptr;
 }
 
-// Helper: Find the specific spawn name (e.g., "Cachri") for a generic type (e.g., "iron")
+// Helper: Find the specific spawn name using ZoneServer
 String SimPlayerController::findActualResourceSpawn(const String& genericType) {
-    ResourceManager* resManager = ResourceManager::instance();
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    if (zoneServer == nullptr) return genericType;
+
+    ResourceManager* resManager = zoneServer->getResourceManager();
     if (resManager == nullptr) return genericType;
 
-    // This is a simplified lookup. In a full implementation, we would iterate 
-    // the resource map to find the best spawn. For now, we return a string 
-    // that lets you know we tried.
-    // NOTE: Real resource iteration requires complex locking. 
-    // For this test, we will trust the generic name or use a specific known one if you have it.
-    
+    // In a real implementation, you would use:
+    // resManager->getResourceSpawn(genericType);
+    // For now, we return a placebo string so we know this function ran.
     return genericType + " (Scanning...)"; 
 }
 
@@ -69,7 +70,6 @@ void SimPlayerController::goToResource(const String& resourceName) {
 
     targetResource = resourceName;
 
-    // Anti-Leash: Reset home temporarily
     agent->setHomeLocation(agent->getPositionX(), agent->getPositionZ(), agent->getPositionY());
     agent->stopWaiting();
     
@@ -77,15 +77,12 @@ void SimPlayerController::goToResource(const String& resourceName) {
     Zone* zone = agent->getZone();
     if (zone == nullptr) return;
 
-    // --- RESOURCE NAME LOOKUP ---
-    // Let's try to verify if "iron" exists.
-    // (In the future, we will put the ResourceSpawn lookup here)
     String realName = findActualResourceSpawn(resourceName);
-
     Vector3 currentPos = agent->getWorldPosition();
 
     // --- RANDOM SCOUTING ---
-    int distance = 100 + System::random(200); 
+    // 100m - 200m range
+    int distance = 100 + System::random(100); 
     int angle = System::random(360);
     
     float rads = angle * (M_PI / 180.0f);
@@ -95,11 +92,11 @@ void SimPlayerController::goToResource(const String& resourceName) {
     float targetX = currentPos.getX() + offsetX;
     float targetY = currentPos.getY() + offsetY; 
     
-    // Lift target slightly +1.0m to avoid floor clipping
+    // Lift target slightly +1.0m
     float targetZ = zone->getHeight(targetX, targetY) + 1.0f; 
 
     if (retryCount == 0) {
-        Logger::console.info("SimPlayer: Searching for real spawn of [" + realName + "]...", true);
+        Logger::console.info("SimPlayer: Searching for [" + realName + "]...", true);
     }
 
     Vector3 targetPos(targetX, targetY, targetZ);
@@ -118,24 +115,20 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         return;
     }
     
-    // --- WILDERNESS LOGIC CHECK ---
+    // If path is null, it's a hard failure
+    if (path == nullptr || path->size() == 0) {
+        if (path) delete path;
+        onPathFailed();
+        return;
+    }
+
+    // --- WILDERNESS LOGIC ---
     // If path size is 2, it is a "Straight Line" (Recast failed or no NavMesh).
-    // We must check if there is a rock/tree in the way.
+    // In the previous version, we rejected this. 
+    // NOW, we accept it blindly because we removed the Raycast check.
+    // This allows movement in the desert.
     if (path->size() == 2) {
-        Vector3 start = path->get(0).getPoint();
-        Vector3 end = path->get(1).getPoint();
-        
-        // Raycast Check
-        if (CollisionManager::checkLineOfSight(start, end, agent->getZone(), agent)) {
-            // Path is clear! We accept the blind walk.
-            Logger::console.info("SimPlayer: NavMesh missing (Wilderness), but Raycast is clear. Blind walking.", true);
-        } else {
-            // Obstacle detected. Retry.
-            Logger::console.info("SimPlayer: NavMesh missing and Obstacle detected. Rejecting path.", true);
-            delete path;
-            onPathFailed();
-            return;
-        }
+        Logger::console.info("SimPlayer: NavMesh missing (Wilderness). Attempting blind walk.", true);
     }
 
     retryCount = 0;
@@ -148,8 +141,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         
         Logger::console.info("------------------------------------------------", true);
         Logger::console.info("PATH CONFIRMED:", true);
-        Logger::console.info("First Step: " + String::valueOf(firstPt.getX()) + ", " + String::valueOf(firstPt.getY()) + ", " + String::valueOf(firstPt.getZ()), true);
-        Logger::console.info("Final Dest: " + String::valueOf(endPt.getX()) + ", " + String::valueOf(endPt.getY()) + ", " + String::valueOf(endPt.getZ()), true);
         Logger::console.info("Nodes: " + String::valueOf(path->size()), true);
         Logger::console.info("------------------------------------------------", true);
     }
@@ -173,7 +164,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         agent->addPatrolPoint(pp);
     }
 
-    // 3. Anti-Leash (Set Home to Dest)
+    // 3. Anti-Leash
     if (path->size() > 0) {
         WorldCoordinates lastWc = path->get(path->size() - 1);
         Vector3 lastPt = lastWc.getPoint();
@@ -203,15 +194,15 @@ void SimPlayerController::onPathFailed() {
     
     if (retryCount < 10) {
         retryCount++;
-        Logger::console.info("Path blocked. Retrying attempt " + String::valueOf(retryCount) + "...", true);
+        Logger::console.info("Path calculation failed. Retrying attempt " + String::valueOf(retryCount) + "...", true);
         goToResource(targetResource);
     } else {
-        Logger::console.info("FAILURE: Could not find any valid path after 10 attempts. I am stuck.", true);
+        Logger::console.info("FAILURE: Could not find any valid path after 10 attempts.", true);
         retryCount = 0;
     }
 }
 
-// Stub for header compliance
+// Helper stub for density
 Vector3 SimPlayerController::findNearestHighDensityResource(const String& resourceClass) {
     return Vector3(0,0,0);
 }
