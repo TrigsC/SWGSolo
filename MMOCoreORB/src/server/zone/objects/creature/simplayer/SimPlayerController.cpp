@@ -134,5 +134,5 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
 void SimPlayerController::onPathFailed() {
     state = IDLE;
-    iLogger::console.info("FAILURE: Could not find path.", true);
+    Logger::console.info("FAILURE: Could not find path.", true);
 }
