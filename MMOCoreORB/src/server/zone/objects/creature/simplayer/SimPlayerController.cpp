@@ -102,14 +102,21 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         return;
     }
     
-    // Safety check on path validity
     if (path == nullptr) return;
 
     state = MOVING;
-    Logger::console.info("SUCCESS: Valid path found with " + String::valueOf(path->size()) + " waypoints. Moving...", true);
+    info("SUCCESS: Valid path found with " + String::valueOf(path->size()) + " waypoints. Moving...", true);
 
+    // 1. Wipe the Agent's brain of distractions
+    agent->setFollowObject(nullptr);
+    agent->setWatchObject(nullptr);
+    agent->setTargetObject(nullptr);
+    agent->clearCombatState(true);
+
+    // 2. Load the Path
     agent->clearPatrolPoints();
-
+    
+    // Convert WorldCoordinates to PatrolPoints
     for (int i = 0; i < path->size(); ++i) {
         WorldCoordinates wc = path->get(i);
         Vector3 point = wc.getPoint();
@@ -119,11 +126,24 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         agent->addPatrolPoint(pp);
     }
 
+    // 3. THE TRICK: Set "Home" to the Destination
+    // This prevents the bot from "Leashing" back to where it spawned.
+    // Instead, if it gets confused, it will try to return to the resource location!
+    if (path->size() > 0) {
+        WorldCoordinates lastWc = path->get(path->size() - 1);
+        Vector3 lastPt = lastWc.getPoint();
+        agent->setHomeLocation(lastPt.getX(), lastPt.getZ(), lastPt.getY());
+    }
+
+    // 4. Force Speed and State
     float runSpeed = agent->getRunSpeed();
+    info(true) << "Run Speed: " << agent->getRunSpeed();
     if (runSpeed < 5.0f) runSpeed = 6.0f;
     agent->setRunSpeed(runSpeed);
 
     agent->setMovementState(AiAgent::PATROLLING);
+    
+    // 5. Kick the AI loop hard
     agent->activateAiBehavior(true); 
     
     delete path;
