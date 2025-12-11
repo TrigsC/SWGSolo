@@ -183,7 +183,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     }
     
     // Set speed once
-    float runSpeed = 1f; 
+    float runSpeed = 1.0f; 
     agent->setRunSpeed(runSpeed);
 
     // KICKSTART
