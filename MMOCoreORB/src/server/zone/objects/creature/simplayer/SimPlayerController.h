@@ -19,7 +19,6 @@
 
 class SimPlayerController;
 
-// Background task to calculate the path
 class FindResourcePathTask : public Task {
     WeakReference<SimPlayerController*> controller;
     WorldCoordinates startCoord;
@@ -33,7 +32,6 @@ public:
     void run() override; 
 };
 
-// Background task to check if we arrived at the destination
 class ArrivalCheckTask : public Task {
     WeakReference<SimPlayerController*> controller;
 public:
@@ -41,10 +39,9 @@ public:
     void run() override;
 };
 
-// Background task to handle animation delays (Surveying/Sampling)
 class SimBehaviorTask : public Task {
     WeakReference<SimPlayerController*> controller;
-    int type; // 1 = Finish Survey, 2 = Finish Sample
+    int type; 
 public:
     static const int FINISH_SURVEY = 1;
     static const int FINISH_SAMPLE = 2;
@@ -58,15 +55,20 @@ class SimPlayerController : public Object, public Logger {
     
     String targetResource;
     int retryCount;
-    Vector3 destination; // Store where we are trying to go
+    Vector3 destination;
+    
+    // --- WATCHDOG VARIABLES ---
+    Vector3 lastWatchdogPos;
+    int stuckWatchdogCount; 
+    // --------------------------
 
     enum SimState {
         IDLE,
         DECIDING,
-        SURVEYING,          // Standing still, looking at tool
-        CALCULATING_PATH,   // Waiting for Recast
-        MOVING,             // Running
-        SAMPLING            // Kneeling
+        SURVEYING,
+        CALCULATING_PATH,
+        MOVING,
+        SAMPLING
     };
     SimState state;
 
@@ -74,24 +76,18 @@ public:
     SimPlayerController(AiAgent* aiAgent);
     virtual ~SimPlayerController();
 
-    // The Entry Point
     void startSimLoop();
-
-    // Behavior Chain
     void performSurvey();
     void finishSurvey();
     void goToResource(const String& resourceName);
     
-    // Pathfinding Callbacks
     void onPathFound(Vector<WorldCoordinates>* path);
     void onPathFailed();
 
-    // Arrival Logic
-    void checkArrival();
+    void checkArrival(); // This is now our Watchdog
     void performSample();
     void finishSample();
 
-    // Helpers
     String findActualResourceSpawn(const String& genericType);
     String pickRandomResource();
     Vector3 findNearestHighDensityResource(const String& resourceClass);
