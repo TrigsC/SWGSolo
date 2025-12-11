@@ -81,25 +81,25 @@ void SimPlayerController::goToResource(const String& resourceName) {
         return;
     }
 
-    // --- STEP 1: Search ---
-    // Calculate Target (200m East)
-    // Note: In SWG, X is East/West.
-    float targetX = currentPos.getX() + 200; 
-    float targetZ = currentPos.getZ();       // Stay on same North/South line
+// --- STEP 1: Search ---
+    // Core3 Vector3 Structure confirmed by logs:
+    // X = East/West
+    // Y = North/South
+    // Z = Elevation
     
-    // --- LOGIC FIX 2: SNAP TO TERRAIN ---
-    // We ask the zone for the elevation at the new coordinates.
-    // Core3 Zone::getHeight usually takes (x, y) where y is the North/South axis.
-    float terrainHeight = zone->getHeight(targetX, targetZ); 
+    // 1. Calculate the 2D Destination (X and Y)
+    float targetX = currentPos.getX() + 200;  // Move 200m East
+    float targetY = currentPos.getY();        // Stay on same North/South line (-4700)
+    
+    // 2. Get the correct Elevation (Z) for that spot
+    // zone->getHeight(x, y) expects the map coordinates
+    float targetZ = zone->getHeight(targetX, targetY); 
 
-    Logger::console.info("DEBUG: Target Calculated -> X:" + String::valueOf(targetX) + " Z:" + String::valueOf(targetZ), true);
-    Logger::console.info("DEBUG: Terrain Snap -> Old Y:" + String::valueOf(currentPos.getY()) + " New Y:" + String::valueOf(terrainHeight), true);
+    Logger::console.info("DEBUG: Target Coordinate -> X:" + String::valueOf(targetX) + " Y(North):" + String::valueOf(targetY), true);
+    Logger::console.info("DEBUG: Elevation Snap -> Old Z:" + String::valueOf(currentPos.getZ()) + " New Z:" + String::valueOf(targetZ), true);
 
-    // Construct the target vector
-    // Note: Vector3 constructor is usually (X, Y, Z). 
-    // BUT WorldCoordinates might expect (X, Z, Y). 
-    // Let's rely on standard Core3 Vector3 (X, Y, Z).
-    Vector3 targetPos(targetX, terrainHeight, targetZ);
+    // 3. Construct the target vector (X, Y, Z)
+    Vector3 targetPos(targetX, targetY, targetZ);
 
     // --- STEP 2: Plan (Async) ---
     state = CALCULATING_PATH;
