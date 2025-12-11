@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Final Compilable Version
+ * Tuned for Navigation Reliability (Short Hops + Elevation Fix)
  */
 
 #include "SimPlayerController.h"
@@ -17,17 +17,19 @@ void FindResourcePathTask::run() {
     Reference<SimPlayerController*> strongCtrl = controller.get();
     if (strongCtrl == nullptr) return;
 
-    Logger::console.info("SimPlayerTask: Background task started.", true);
+    Logger::console.info("SimPlayerTask: Calculating path...", true);
 
+    // Perform the heavy math
     Vector<WorldCoordinates>* path = PathFinderManager::instance()->findPath(startCoord, endCoord, zone);
 
     int pathSize = (path != nullptr) ? path->size() : -1;
-    Logger::console.info("SimPlayerTask: Calculation finished. Path size: " + String::valueOf(pathSize), true);
+    Logger::console.info("SimPlayerTask: Finished. Path nodes found: " + String::valueOf(pathSize), true);
 
     Core::getTaskManager()->executeTask([strongCtrl, path] () {
-        if (path != nullptr && path->size() > 0) {
+        if (path != nullptr && path->size() > 2) { // Logic Change: Require > 2 points to count as a valid "Navigated" path
             strongCtrl->onPathFound(path);
         } else {
+            // If size is 2, it's a straight line (Raycast fallback). We treat this as failure to avoid walking through walls.
             strongCtrl->onPathFailed();
             if (path) delete path;
         }
@@ -41,14 +43,13 @@ void FindResourcePathTask::run() {
 SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     agent = aiAgent;
     state = IDLE;
-    setLoggingName("SimPlayerController"); // Now valid because we inherit Logger
+    setLoggingName("SimPlayerController");
 }
 
 SimPlayerController::~SimPlayerController() {
     agent = nullptr;
 }
 
-// Stub method to satisfy the header - we aren't using this yet
 Vector3 SimPlayerController::findNearestHighDensityResource(const String& resourceClass) {
     if (agent != nullptr) return agent->getWorldPosition();
     return Vector3(0, 0, 0);
@@ -57,7 +58,6 @@ Vector3 SimPlayerController::findNearestHighDensityResource(const String& resour
 void SimPlayerController::goToResource(const String& resourceName) {
     if (agent == nullptr) return;
 
-    // Reset Home to prevent leash behavior
     agent->setHomeLocation(agent->getPositionX(), agent->getPositionZ(), agent->getPositionY());
     agent->stopWaiting();
     
@@ -67,9 +67,10 @@ void SimPlayerController::goToResource(const String& resourceName) {
 
     Vector3 currentPos = agent->getWorldPosition();
 
-    // --- SCOUT LOGIC: Random Direction ---
-    // Instead of querying the complex ResourceManager, we simulate scouting
-    int distance = 500 + System::random(1000); // 500m to 1500m
+    // --- TUNED SCOUT LOGIC ---
+    // Fix 1: Reduce distance to ensure NavMesh is loaded.
+    // 100m to 250m is safe for Recast.
+    int distance = 100 + System::random(150); 
     int angle = System::random(360);
     
     float rads = angle * (M_PI / 180.0f);
@@ -78,11 +79,12 @@ void SimPlayerController::goToResource(const String& resourceName) {
 
     float targetX = currentPos.getX() + offsetX;
     float targetY = currentPos.getY() + offsetY; // North/South
-    float targetZ = zone->getHeight(targetX, targetY); 
+    
+    // Fix 2: Lift the target slightly (+1.0m) to ensure it doesn't clip under the NavMesh
+    float targetZ = zone->getHeight(targetX, targetY) + 1.0f; 
 
-    // 'info' is now valid because we inherit from Logger
-    Logger::console.info("SimPlayer: Scouting " + resourceName + " at " + String::valueOf(distance) + "m (Dir: " + String::valueOf(angle) + ")", true);
-    Logger::console.info("DEBUG: Target -> X:" + String::valueOf(targetX) + " Y:" + String::valueOf(targetY) + " Z:" + String::valueOf(targetZ), true);
+    Logger::console.info("SimPlayer: Looking for [" + resourceName + "] - Scouting point " + String::valueOf(distance) + "m away (Dir: " + String::valueOf(angle) + ")", true);
+    Logger::console.info("DEBUG: Target Coords -> X:" + String::valueOf(targetX) + " Y:" + String::valueOf(targetY) + " Z:" + String::valueOf(targetZ), true);
 
     Vector3 targetPos(targetX, targetY, targetZ);
 
@@ -100,15 +102,11 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         return;
     }
     
-    if (path == nullptr || path->size() == 0) {
-        Logger::console.info("ERROR: Path returned EMPTY.", true);
-        if (path) delete path;
-        onPathFailed();
-        return;
-    }
+    // Safety check on path validity
+    if (path == nullptr) return;
 
     state = MOVING;
-    Logger::console.info("SUCCESS: Path found with " + String::valueOf(path->size()) + " waypoints. Moving...", true);
+    Logger::console.info("SUCCESS: Valid path found with " + String::valueOf(path->size()) + " waypoints. Moving...", true);
 
     agent->clearPatrolPoints();
 
@@ -121,7 +119,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         agent->addPatrolPoint(pp);
     }
 
-    // Force Run Speed
     float runSpeed = agent->getRunSpeed();
     if (runSpeed < 5.0f) runSpeed = 6.0f;
     agent->setRunSpeed(runSpeed);
@@ -134,5 +131,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
 void SimPlayerController::onPathFailed() {
     state = IDLE;
-    Logger::console.info("FAILURE: Could not find path.", true);
+    Logger::console.info("FAILURE: Path was too simple (Straight Line) or blocked. Retrying might be needed.", true);
+    
+    // Optional: Auto-retry logic could go here (call goToResource again)
 }
