@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Robust Version: Includes Auto-Retry for bad paths
+ * Debugging Version: Coordinate Verification + Aggressive AI Override
  */
 
 #include "SimPlayerController.h"
@@ -21,7 +21,6 @@ void FindResourcePathTask::run() {
     Vector<WorldCoordinates>* path = PathFinderManager::instance()->findPath(startCoord, endCoord, zone);
 
     Core::getTaskManager()->executeTask([strongCtrl, path] () {
-        // Validation: If size <= 2, it's usually a straight line (failure)
         if (path != nullptr && path->size() > 2) { 
             strongCtrl->onPathFound(path);
         } else {
@@ -38,7 +37,7 @@ void FindResourcePathTask::run() {
 SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     agent = aiAgent;
     state = IDLE;
-    retryCount = 0; // Initialize counter
+    retryCount = 0;
     setLoggingName("SimPlayerController");
 }
 
@@ -54,9 +53,9 @@ Vector3 SimPlayerController::findNearestHighDensityResource(const String& resour
 void SimPlayerController::goToResource(const String& resourceName) {
     if (agent == nullptr) return;
 
-    // Save target for retries
     targetResource = resourceName;
 
+    // Reset Home to current location temporarily so we don't leash while planning
     agent->setHomeLocation(agent->getPositionX(), agent->getPositionZ(), agent->getPositionY());
     agent->stopWaiting();
     
@@ -67,7 +66,7 @@ void SimPlayerController::goToResource(const String& resourceName) {
     Vector3 currentPos = agent->getWorldPosition();
 
     // --- RANDOM SCOUTING ---
-    int distance = 100 + System::random(200); // 100m - 300m range
+    int distance = 100 + System::random(200); 
     int angle = System::random(360);
     
     float rads = angle * (M_PI / 180.0f);
@@ -77,10 +76,9 @@ void SimPlayerController::goToResource(const String& resourceName) {
     float targetX = currentPos.getX() + offsetX;
     float targetY = currentPos.getY() + offsetY; 
     
-    // Lift target slightly to help NavMesh snapping
+    // Lift target slightly +1.0m
     float targetZ = zone->getHeight(targetX, targetY) + 1.0f; 
 
-    // Only log if it's the first try to avoid spamming console on retries
     if (retryCount == 0) {
         Logger::console.info("SimPlayer: Looking for [" + resourceName + "]...", true);
     }
@@ -101,17 +99,32 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         return;
     }
     
-    // Success! Reset retry counter
     retryCount = 0;
-
     state = MOVING;
-    Logger::console.info("SUCCESS: Path found (" + String::valueOf(path->size()) + " nodes). Moving.", true);
 
-    // 1. Clear Distractions
+    // --- COORDINATE LOGGING ---
+    // This answers "Where are they going?"
+    if (path->size() > 0) {
+        Vector3 startPt = agent->getWorldPosition();
+        Vector3 firstPt = path->get(0).getPoint();
+        Vector3 endPt = path->get(path->size() - 1).getPoint();
+        
+        Logger::console.info("------------------------------------------------", true);
+        Logger::console.info("PATH DEBUG:", true);
+        Logger::console.info("Start Pos: " + String::valueOf(startPt.getX()) + ", " + String::valueOf(startPt.getY()) + ", " + String::valueOf(startPt.getZ()), true);
+        Logger::console.info("First Step: " + String::valueOf(firstPt.getX()) + ", " + String::valueOf(firstPt.getY()) + ", " + String::valueOf(firstPt.getZ()), true);
+        Logger::console.info("Final Dest: " + String::valueOf(endPt.getX()) + ", " + String::valueOf(endPt.getY()) + ", " + String::valueOf(endPt.getZ()), true);
+        Logger::console.info("Nodes: " + String::valueOf(path->size()), true);
+        Logger::console.info("------------------------------------------------", true);
+    }
+
+    // 1. Aggressive Lobotomy (Clear Distractions)
     agent->setFollowObject(nullptr);
     agent->setWatchObject(nullptr);
     agent->setTargetObject(nullptr);
-    agent->clearCombatState(true); 
+    agent->clearCombatState(true);
+    // Force OBLIVIOUS first to reset internal aggro timers
+    agent->setMovementState(AiAgent::OBLIVIOUS);
 
     // 2. Load Path
     agent->clearPatrolPoints();
@@ -134,10 +147,18 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     // 4. Force Run
     float runSpeed = agent->getRunSpeed();
-    Logger::console.info("Current Run Speed(" + String::valueOf(runSpeed) + "). Moving.", true);
     if (runSpeed < 5.0f) runSpeed = 6.0f;
     agent->setRunSpeed(runSpeed);
+    Logger::console.info("SimPlayer: Speed set to " + String::valueOf(runSpeed), true);
 
+    // 5. Jumpstart
+    // Explicitly shove the first point into the "Next Step" slot
+    if (path->size() > 0) {
+        PatrolPoint firstPP = agent->getNextPosition(); // Actually gets the 0th point from vector
+        agent->setNextStepPosition(firstPP.getPositionX(), firstPP.getPositionZ(), firstPP.getPositionY(), firstPP.getCell());
+    }
+
+    // 6. Activate
     agent->setMovementState(AiAgent::PATROLLING);
     agent->activateAiBehavior(true); 
     
@@ -149,7 +170,6 @@ void SimPlayerController::onPathFailed() {
     
     if (retryCount < 10) {
         retryCount++;
-        // Try again immediately with a different random spot
         Logger::console.info("Path failed (blocked/straight-line). Retrying attempt " + String::valueOf(retryCount) + "...", true);
         goToResource(targetResource);
     } else {
