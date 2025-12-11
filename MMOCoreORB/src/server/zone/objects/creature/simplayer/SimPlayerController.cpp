@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Phase 9: Puppet Mode (Controller manages path index, forcing updates)
+ * Phase 10: DEBUG MODE (Tracing the "Flying" Bug)
  */
 
 #include "SimPlayerController.h"
@@ -133,9 +133,19 @@ void SimPlayerController::goToResource(const String& resourceName) {
     int distance = 80 + System::random(120); 
     int angle = System::random(360);
     float rads = angle * (M_PI / 180.0f);
+    
+    // Calculate 2D spot
     float targetX = currentPos.getX() + (distance * cos(rads));
     float targetY = currentPos.getY() + (distance * sin(rads));
-    float targetZ = zone->getHeight(targetX, targetY) + 1.0f; 
+    
+    // Get Elevation (Z)
+    float targetZ = zone->getHeight(targetX, targetY); 
+    
+    // DEBUG: Check if we are getting weird elevation
+    Logger::console.info("SimPlayer: Planning Target -> X:" + String::valueOf(targetX) + " Y(North):" + String::valueOf(targetY) + " Z(Elev):" + String::valueOf(targetZ), true);
+
+    // Lift slightly
+    targetZ += 1.0f;
 
     destination.setX(targetX);
     destination.setY(targetY);
@@ -158,8 +168,8 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     retryCount = 0;
     state = MOVING;
 
-    // --- SAVE PATH INTERNALLY (Puppet Mode) ---
-    simPath = *path; // Copy the vector
+    // Save path
+    simPath = *path; 
     simPathIndex = 0;
     
     if (simPath.size() > 0) {
@@ -169,13 +179,13 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     Logger::console.info("SimPlayer: Path Loaded (" + String::valueOf(simPath.size()) + " nodes). Taking control.", true);
 
-    // AI Setup
+    // Reset
     agent->setFollowObject(nullptr);
     agent->setWatchObject(nullptr);
     agent->setTargetObject(nullptr);
     agent->clearCombatState(true);
     agent->setMovementState(AiAgent::OBLIVIOUS);
-    agent->clearPatrolPoints(); // We don't use internal points anymore
+    agent->clearPatrolPoints(); 
 
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
@@ -185,12 +195,19 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (runSpeed < 5.0f) runSpeed = 6.0f;
     agent->setRunSpeed(runSpeed);
 
-    // KICKSTART (Go to Point 0)
+    // KICKSTART
     if (simPath.size() > 0) {
         Vector3 firstPt = simPath.get(0).getPoint();
+        
+        // DEBUG: Verify Coordinate Mapping
+        // If Y is -4000, and we put it in Slot 2 (Z), the bot flies/digs.
+        // Core3 Vector3: X, Y(North), Z(Elev)
+        // setNextStepPosition(X, Z, Y) -> (X, Elev, North)
+        Logger::console.info("SimPlayer: Step 0 -> X:" + String::valueOf(firstPt.getX()) + " Z(Elev):" + String::valueOf(firstPt.getZ()) + " Y(North):" + String::valueOf(firstPt.getY()), true);
+        
         agent->setNextStepPosition(firstPt.getX(), firstPt.getZ(), firstPt.getY(), nullptr);
         
-        PatrolPoint pp; // Only needed for broadcast
+        PatrolPoint pp; 
         pp.setPosition(firstPt.getX(), firstPt.getZ(), firstPt.getY());
         agent->broadcastNextPositionUpdate(&pp);
     }
@@ -200,7 +217,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     
     delete path;
 
-    // Start Puppet Driver (Fast interval: 250ms for smooth updates)
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
     task->schedule(250);
 }
@@ -224,64 +240,88 @@ void SimPlayerController::checkArrival() {
 
     Vector3 currentPos = agent->getWorldPosition();
     
+    // Check Final Dest
+    float dx = currentPos.getX() - destination.getX();
+    float dy = currentPos.getY() - destination.getY();
+    float distSq = (dx*dx) + (dy*dy);
+
+    if (distSq < 16.0f) { 
+        Logger::console.info("SimPlayer: ARRIVED at final target.", true);
+        performSample();
+        return;
+    } 
+
     // Safety check
     if (simPath.size() == 0 || simPathIndex >= simPath.size()) {
-        Logger::console.info("SimPlayer: Path finished.", true);
+        Logger::console.info("SimPlayer: Path exhausted but not at target?", true);
         performSample();
         return;
     }
 
-    // Get current target point
+    // Check Waypoint
     Vector3 targetPt = simPath.get(simPathIndex).getPoint();
+    
+    float wx = targetPt.getX() - currentPos.getX();
+    float wy = targetPt.getY() - currentPos.getY(); // Y is North
+    float waypointDistSq = (wx*wx) + (wy*wy);
 
-    // Calc distance to THIS specific node
-    float dx = targetPt.getX() - currentPos.getX();
-    float dy = targetPt.getY() - currentPos.getY(); // Y is map Z
-    float distSq = (dx*dx) + (dy*dy);
+    // DEBUG: Monitor loop variables every 1 second (approx)
+    if (System::random(4) == 0) { // Don't spam every 250ms
+        // Logger::console.info("SimPlayer: Index " + String::valueOf(simPathIndex) + " Dist: " + String::valueOf(sqrt(waypointDistSq)) + "m", true);
+    }
 
-    // Are we close? (3 meters)
-    if (distSq < 9.0f) {
-        // YES! Advance to next point
+    if (waypointDistSq < 16.0f) {
+        // CLOSE ENOUGH -> NEXT POINT
         simPathIndex++;
         
         if (simPathIndex >= simPath.size()) {
-            // End of path
             performSample();
             return;
         } else {
-            // Feed NEXT point immediately
             Vector3 nextPt = simPath.get(simPathIndex).getPoint();
+            
+            // LOGGING THE CRITICAL UPDATE
+            // If the bot flies here, check Z(Elev) vs Y(North)
+            Logger::console.info("SimPlayer: Advance -> Index " + String::valueOf(simPathIndex) + 
+                " | Target: " + String::valueOf(nextPt.getX()) + ", " + String::valueOf(nextPt.getY()) + ", " + String::valueOf(nextPt.getZ()), true);
+
+            // FORCE UPDATE
             agent->setNextStepPosition(nextPt.getX(), nextPt.getZ(), nextPt.getY(), nullptr);
             
-            // Broadcast so client sees the turn
             PatrolPoint pp;
             pp.setPosition(nextPt.getX(), nextPt.getZ(), nextPt.getY());
             agent->broadcastNextPositionUpdate(&pp);
             
             agent->activateAiBehavior(true);
-            
-            // Reset watchdog because we made progress
             stuckWatchdogCount = 0;
         }
     } else {
-        // Not close yet. Are we stuck?
+        // STUCK CHECK
         float moveDx = currentPos.getX() - lastWatchdogPos.getX();
         float moveDy = currentPos.getY() - lastWatchdogPos.getY();
         float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
 
         if (movedDistSq < 0.01f) {
             stuckWatchdogCount++;
-            if (stuckWatchdogCount > 8) { // Stuck for 2 seconds (8 * 250ms)
-                // STUCK! Teleport slightly towards target node
-                float dist = sqrt(distSq);
+            if (stuckWatchdogCount > 8) { // 2 seconds
+                
+                Logger::console.info("SimPlayer: STUCK. Nudging...", true);
+                
+                float dist = sqrt(waypointDistSq);
                 if (dist > 0) {
-                    float dirX = dx / dist; 
-                    float dirY = dy / dist;
+                    float dirX = wx / dist;
+                    float dirY = wy / dist;
+                    
                     float nudgeX = currentPos.getX() + (dirX * 0.5f);
                     float nudgeY = currentPos.getY() + (dirY * 0.5f);
                     float nudgeZ = currentPos.getZ() + 0.2f;
+                    
+                    // DEBUG TELEPORT
+                    Logger::console.info("SimPlayer: Teleporting to -> " + String::valueOf(nudgeX) + ", " + String::valueOf(nudgeY) + ", " + String::valueOf(nudgeZ), true);
+                    
                     agent->teleport(nudgeX, nudgeZ, nudgeY, 0);
                 }
+                
                 // Re-assert command
                 agent->setNextStepPosition(targetPt.getX(), targetPt.getZ(), targetPt.getY(), nullptr);
                 agent->activateAiBehavior(true);
