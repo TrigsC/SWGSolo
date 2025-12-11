@@ -10,7 +10,7 @@
 
 #include "engine/core/Task.h"
 #include "engine/core/ManagedReference.h"
-#include "engine/core/Object.h"
+#include "system/lang/ref/ReferenceCounter.h" // <--- CHANGED THIS
 #include "engine/log/Logger.h"
 #include "system/util/Vector.h"
 #include "server/zone/objects/scene/WorldCoordinates.h"
@@ -33,13 +33,12 @@ public:
     void run() override; 
 };
 
-class SimPlayerController : public Object, public Logger {
+// Inherit from ReferenceCounter (for smart pointers) and Logger (for info())
+class SimPlayerController : public ReferenceCounter, public Logger { // <--- CHANGED THIS
     ManagedReference<AiAgent*> agent;
     
-    // --- NEW VARIABLES ADDED HERE ---
     String targetResource;
     int retryCount;
-    // --------------------------------
 
     enum SimState {
         IDLE,
