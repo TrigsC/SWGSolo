@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Phase 4: The Nuclear Option (Posture Fix + Physics Shove)
+ * Phase 5: Crash Fix (Teleport implementation)
  */
 
 #include "SimPlayerController.h"
@@ -96,10 +96,8 @@ void SimPlayerController::performSurvey() {
     if (agent == nullptr) return;
     state = SURVEYING;
 
-    // Ensure we are stopped
     agent->setMovementState(AiAgent::OBLIVIOUS);
     
-    // VISUAL FIX: Force Upright before animation, just in case
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
     }
@@ -131,7 +129,6 @@ void SimPlayerController::goToResource(const String& resourceName) {
     stuckWatchdogCount = 0;
     lastWatchdogPos = agent->getWorldPosition();
 
-    // Reset brain
     agent->setHomeLocation(agent->getPositionX(), agent->getPositionZ(), agent->getPositionY());
     agent->stopWaiting();
     
@@ -140,7 +137,6 @@ void SimPlayerController::goToResource(const String& resourceName) {
 
     Vector3 currentPos = agent->getWorldPosition();
     
-    // Short hop for reliability
     int distance = 80 + System::random(120); 
     int angle = System::random(360);
     
@@ -186,8 +182,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     agent->setMovementState(AiAgent::OBLIVIOUS);
     agent->clearPatrolPoints();
 
-    // 2. CRITICAL FIX: FORCE UPRIGHT POSTURE
-    // If they are kneeling, they CANNOT move.
+    // 2. FORCE UPRIGHT
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
     }
@@ -206,7 +201,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (runSpeed < 5.0f) runSpeed = 6.0f;
     agent->setRunSpeed(runSpeed);
 
-    // 5. MANUAL KICKSTART
+    // 5. KICKSTART
     if (path->size() > 0) {
         PatrolPoint firstPP = agent->getNextPosition(); 
         
@@ -236,7 +231,7 @@ void SimPlayerController::onPathFailed() {
 }
 
 // --------------------------------------------------------
-// WATCHDOG
+// WATCHDOG (FIXED)
 // --------------------------------------------------------
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
@@ -260,37 +255,28 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
-    // STALL LOGIC
     if (movedDistSq < 0.01f) {
         stuckWatchdogCount++;
         if (stuckWatchdogCount > 2) { 
-             Logger::console.info("SimPlayer: STALL DETECTED. Forcing Physics Shove...", true);
+             Logger::console.info("SimPlayer: STALL DETECTED. Shoving.", true);
              
-             // 1. Force Upright again (just in case)
              agent->setPosture(CreaturePosture::UPRIGHT, true);
-             
-             // 2. Re-assert Movement State
              agent->setMovementState(AiAgent::PATROLLING);
              
-             // 3. THE SHOVE: Teleport 10cm towards goal to wake up physics
-             // This is a common hack in game dev to unstuck NPCs
-             // Normalized direction vector
+             // --- FIX: USE TELEPORT INSTEAD OF PARENT UPDATE ---
              float dist = sqrt(distSq);
              if (dist > 0) {
-                 float dirX = dx / dist; // pointing TO bot, need pointing TO dest
+                 float dirX = dx / dist; 
                  float dirY = dy / dist;
                  
-                 // Move 0.2m towards destination
-                 // Note: dx is (current - dest), so -dx is vector to dest
                  float nudgeX = currentPos.getX() - (dirX * 0.2f);
                  float nudgeY = currentPos.getY() - (dirY * 0.2f);
-                 float nudgeZ = currentPos.getZ() + 0.1f; // Tiny lift
+                 float nudgeZ = currentPos.getZ() + 0.1f; 
                  
-                 // Use teleport/setPosition
-                 // agent->teleport(nudgeX, nudgeZ, nudgeY); // Careful with teleport vs setPosition
-                 agent->setPosition(nudgeX, nudgeZ, nudgeY);
-                 agent->updateZoneWithParent(agent->getParent().get(), true, true); // Force network update
+                 // ParentID 0 means "World" (Outdoors)
+                 agent->teleport(nudgeX, nudgeZ, nudgeY, 0); 
              }
+             // -------------------------------------------------
 
              agent->activateAiBehavior(true);
              stuckWatchdogCount = 0;
@@ -313,7 +299,6 @@ void SimPlayerController::performSample() {
     agent->clearPatrolPoints();
     agent->setMovementState(AiAgent::OBLIVIOUS);
     
-    // Kneel
     agent->setPosture(CreaturePosture::CROUCHED, true);
     agent->doAnimation("sample"); 
     
@@ -324,7 +309,6 @@ void SimPlayerController::performSample() {
 void SimPlayerController::finishSample() {
     Logger::console.info("SimPlayer: Done sampling.", true);
     
-    // Stand up
     agent->setPosture(CreaturePosture::UPRIGHT, true);
     agent->doAnimation("stop_sample"); 
     
