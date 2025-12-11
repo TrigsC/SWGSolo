@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Phase 13: Aggressive Cornering (15m tolerance for smooth running)
+ * Phase 14: Marathon Runner (32m Look-Ahead + No-Stop Updates)
  */
 
 #include "SimPlayerController.h"
@@ -174,13 +174,15 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     agent->setTargetObject(nullptr);
     agent->clearCombatState(true);
     agent->setMovementState(AiAgent::OBLIVIOUS);
+    
+    // Clear once at start
     agent->clearPatrolPoints(); 
 
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
     }
     
-    // Smooth Speed
+    // Set speed once
     float runSpeed = 5.25f; 
     agent->setRunSpeed(runSpeed);
 
@@ -190,7 +192,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         
         PatrolPoint pp;
         pp.setPosition(firstPt.getX(), firstPt.getZ(), firstPt.getY());
-        agent->addPatrolPoint(pp);
+        agent->addPatrolPoint(pp); // Add to internal list just in case
         
         agent->setNextStepPosition(firstPt.getX(), firstPt.getZ(), firstPt.getY(), nullptr);
         agent->broadcastNextPositionUpdate(&pp);
@@ -202,7 +204,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     delete path;
 
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(250);
+    task->schedule(200);
 }
 
 void SimPlayerController::onPathFailed() {
@@ -216,7 +218,7 @@ void SimPlayerController::onPathFailed() {
 }
 
 // --------------------------------------------------------
-// SMOOTH DRIVER
+// MARATHON DRIVER (Opened up tolerances)
 // --------------------------------------------------------
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
@@ -224,7 +226,7 @@ void SimPlayerController::checkArrival() {
 
     Vector3 currentPos = agent->getWorldPosition();
     
-    // 1. FINAL DESTINATION CHECK (Keep this tight: 4m)
+    // Final check (Keep tight: 4m)
     float dx = currentPos.getX() - destination.getX();
     float dy = currentPos.getY() - destination.getY();
     float distSq = (dx*dx) + (dy*dy);
@@ -240,16 +242,16 @@ void SimPlayerController::checkArrival() {
         return;
     }
 
-    // 2. WAYPOINT CHECK
+    // Waypoint Check
     Vector3 targetPt = simPath.get(simPathIndex).getPoint();
     
     float wx = targetPt.getX() - currentPos.getX();
     float wy = targetPt.getY() - currentPos.getY(); 
     float waypointDistSq = (wx*wx) + (wy*wy);
 
-    // AGGRESSIVE CORNERING: 15m (225 sq) 
-    // Allows the bot to arc towards the next point without stopping.
-    if (waypointDistSq < 225.0f) {
+    // HUGE LOOK-AHEAD: 32 meters (32^2 = 1024)
+    // This allows the bot to switch targets way before it slows down.
+    if (waypointDistSq < 1024.0f) {
         simPathIndex++;
         
         if (simPathIndex >= simPath.size()) {
@@ -258,13 +260,11 @@ void SimPlayerController::checkArrival() {
         } else {
             Vector3 nextPt = simPath.get(simPathIndex).getPoint();
             
-            // FEED NEXT POINT
-            agent->clearPatrolPoints();
-            
+            // NO CLEARING - Just overwrite the next step
             PatrolPoint pp;
             pp.setPosition(nextPt.getX(), nextPt.getZ(), nextPt.getY());
-            agent->addPatrolPoint(pp);
-
+            
+            // Update the internal "Next" pointer without stopping the engine
             agent->setNextStepPosition(nextPt.getX(), nextPt.getZ(), nextPt.getY(), nullptr);
             agent->broadcastNextPositionUpdate(&pp);
             agent->activateAiBehavior(true);
@@ -302,7 +302,7 @@ void SimPlayerController::checkArrival() {
     lastWatchdogPos = currentPos;
 
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(250);
+    task->schedule(200);
 }
 
 void SimPlayerController::performSample() {
