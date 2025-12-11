@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Phase 8: The Path Advancer (Feed points one-by-one to force movement)
+ * Phase 9: Puppet Mode (Controller manages path index, forcing updates)
  */
 
 #include "SimPlayerController.h"
@@ -63,6 +63,7 @@ SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     state = IDLE;
     retryCount = 0;
     stuckWatchdogCount = 0;
+    simPathIndex = 0;
     setLoggingName("SimPlayerController");
 }
 
@@ -71,13 +72,12 @@ SimPlayerController::~SimPlayerController() {
 }
 
 // --------------------------------------------------------
-// LOOP LOGIC
+// LOGIC
 // --------------------------------------------------------
 void SimPlayerController::startSimLoop() {
     state = DECIDING;
     String res = pickRandomResource();
     targetResource = res; 
-    
     Logger::console.info("SimPlayer: Loop -> I want [" + res + "]", true);
     performSurvey();
 }
@@ -95,11 +95,9 @@ void SimPlayerController::performSurvey() {
     state = SURVEYING;
 
     agent->setMovementState(AiAgent::OBLIVIOUS);
-    
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
     }
-    
     agent->doAnimation("manipulate_high"); 
 
     Reference<SimBehaviorTask*> task = new SimBehaviorTask(this, SimBehaviorTask::FINISH_SURVEY);
@@ -110,9 +108,6 @@ void SimPlayerController::finishSurvey() {
     goToResource(targetResource);
 }
 
-// --------------------------------------------------------
-// MOVEMENT
-// --------------------------------------------------------
 String SimPlayerController::findActualResourceSpawn(const String& genericType) {
     ZoneServer* zoneServer = ServerCore::getZoneServer();
     if (zoneServer && zoneServer->getResourceManager()) {
@@ -135,7 +130,6 @@ void SimPlayerController::goToResource(const String& resourceName) {
 
     Vector3 currentPos = agent->getWorldPosition();
     
-    // Scout 100m-200m
     int distance = 80 + System::random(120); 
     int angle = System::random(360);
     float rads = angle * (M_PI / 180.0f);
@@ -164,34 +158,25 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     retryCount = 0;
     state = MOVING;
 
-    if (path->size() > 0) {
-        Vector3 endPt = path->get(path->size() - 1).getPoint();
+    // --- SAVE PATH INTERNALLY (Puppet Mode) ---
+    simPath = *path; // Copy the vector
+    simPathIndex = 0;
+    
+    if (simPath.size() > 0) {
+        Vector3 endPt = simPath.get(simPath.size() - 1).getPoint();
         destination = endPt;
     }
 
-    // 1. BRAIN WIPE
+    Logger::console.info("SimPlayer: Path Loaded (" + String::valueOf(simPath.size()) + " nodes). Taking control.", true);
+
+    // AI Setup
     agent->setFollowObject(nullptr);
     agent->setWatchObject(nullptr);
     agent->setTargetObject(nullptr);
     agent->clearCombatState(true);
     agent->setMovementState(AiAgent::OBLIVIOUS);
-    
-    // 2. Clear Internal Points
-    agent->clearPatrolPoints();
+    agent->clearPatrolPoints(); // We don't use internal points anymore
 
-    // 3. LOAD PATH (But we keep it minimal inside the AI, we drive it)
-    // We load ALL points so the internal vector has data
-    Logger::console.info("SimPlayer: Path Loaded (" + String::valueOf(path->size()) + " nodes). Advancing...", true);
-    
-    for (int i = 0; i < path->size(); ++i) {
-        WorldCoordinates wc = path->get(i);
-        Vector3 point = wc.getPoint();
-        PatrolPoint pp;
-        pp.setPosition(point.getX(), point.getZ(), point.getY());
-        agent->addPatrolPoint(pp);
-    }
-
-    // 4. PHYSICS SETUP
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
     }
@@ -200,11 +185,14 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (runSpeed < 5.0f) runSpeed = 6.0f;
     agent->setRunSpeed(runSpeed);
 
-    // 5. KICKSTART: Force the first point
-    if (path->size() > 0) {
-        PatrolPoint firstPP = agent->getNextPosition(); 
-        agent->setNextStepPosition(firstPP.getPositionX(), firstPP.getPositionZ(), firstPP.getPositionY(), firstPP.getCell());
-        agent->broadcastNextPositionUpdate(&firstPP);
+    // KICKSTART (Go to Point 0)
+    if (simPath.size() > 0) {
+        Vector3 firstPt = simPath.get(0).getPoint();
+        agent->setNextStepPosition(firstPt.getX(), firstPt.getZ(), firstPt.getY(), nullptr);
+        
+        PatrolPoint pp; // Only needed for broadcast
+        pp.setPosition(firstPt.getX(), firstPt.getZ(), firstPt.getY());
+        agent->broadcastNextPositionUpdate(&pp);
     }
 
     agent->setMovementState(AiAgent::PATROLLING);
@@ -212,9 +200,9 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     
     delete path;
 
-    // Start the Active Driver (Interval: 500ms for responsiveness)
+    // Start Puppet Driver (Fast interval: 250ms for smooth updates)
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(500);
+    task->schedule(250);
 }
 
 void SimPlayerController::onPathFailed() {
@@ -228,7 +216,7 @@ void SimPlayerController::onPathFailed() {
 }
 
 // --------------------------------------------------------
-// THE PATH ADVANCER (Replaces Standard Watchdog)
+// PUPPET DRIVER (The Brain)
 // --------------------------------------------------------
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
@@ -236,98 +224,85 @@ void SimPlayerController::checkArrival() {
 
     Vector3 currentPos = agent->getWorldPosition();
     
-    // 1. FINAL DESTINATION CHECK
-    float dx = currentPos.getX() - destination.getX();
-    float dy = currentPos.getY() - destination.getY();
-    float distSq = (dx*dx) + (dy*dy);
-
-    if (distSq < 16.0f) { // 4 meters close enough
-        Logger::console.info("SimPlayer: ARRIVED at final target.", true);
+    // Safety check
+    if (simPath.size() == 0 || simPathIndex >= simPath.size()) {
+        Logger::console.info("SimPlayer: Path finished.", true);
         performSample();
         return;
-    } 
+    }
 
-    // 2. WAYPOINT ADVANCER
-    // Check distance to the CURRENT waypoint
-    if (agent->getPatrolPointSize() > 0) {
-        PatrolPoint currentPP = agent->getNextPosition();
+    // Get current target point
+    Vector3 targetPt = simPath.get(simPathIndex).getPoint();
+
+    // Calc distance to THIS specific node
+    float dx = targetPt.getX() - currentPos.getX();
+    float dy = targetPt.getY() - currentPos.getY(); // Y is map Z
+    float distSq = (dx*dx) + (dy*dy);
+
+    // Are we close? (3 meters)
+    if (distSq < 9.0f) {
+        // YES! Advance to next point
+        simPathIndex++;
         
-        float wx = currentPP.getPositionX() - currentPos.getX();
-        float wy = currentPP.getPositionY() - currentPos.getY(); // Y is Map Z
-        float waypointDistSq = (wx*wx) + (wy*wy);
-
-        // If we are close to the current waypoint (< 4m), POP IT and move to next
-        if (waypointDistSq < 16.0f) {
-            // Remove the reached point
-            agent->erasePatrolPoint(0);
-            
-            // Do we have another one?
-            if (agent->getPatrolPointSize() > 0) {
-                // FORCE THE NEW POINT
-                PatrolPoint nextPP = agent->getNextPosition();
-                agent->setNextStepPosition(nextPP.getPositionX(), nextPP.getPositionZ(), nextPP.getPositionY(), nextPP.getCell());
-                agent->broadcastNextPositionUpdate(&nextPP);
-                agent->activateAiBehavior(true);
-                
-                // Logger::console.info("SimPlayer: Advancing to next waypoint...", true);
-                stuckWatchdogCount = 0; // Reset stuck counter since we made progress
-            }
+        if (simPathIndex >= simPath.size()) {
+            // End of path
+            performSample();
+            return;
         } else {
-            // We haven't reached the waypoint yet. Are we stuck?
-            // Check if we moved since last tick
-            float moveDx = currentPos.getX() - lastWatchdogPos.getX();
-            float moveDy = currentPos.getY() - lastWatchdogPos.getY();
-            float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
+            // Feed NEXT point immediately
+            Vector3 nextPt = simPath.get(simPathIndex).getPoint();
+            agent->setNextStepPosition(nextPt.getX(), nextPt.getZ(), nextPt.getY(), nullptr);
             
-            if (movedDistSq < 0.01f) {
-                stuckWatchdogCount++;
-                if (stuckWatchdogCount > 4) { // Stuck for 2 seconds (4 * 500ms)
-                    // GENTLE NUDGE (0.5m)
-                    // We nudge towards the WAYPOINT, not the final destination
-                    float dist = sqrt(waypointDistSq);
-                    if (dist > 0) {
-                        float dirX = wx / dist;
-                        float dirY = wy / dist;
-                        float nudgeX = currentPos.getX() + (dirX * 0.5f);
-                        float nudgeY = currentPos.getY() + (dirY * 0.5f);
-                        float nudgeZ = currentPos.getZ() + 0.2f;
-                        agent->teleport(nudgeX, nudgeZ, nudgeY, 0);
-                    }
-                    agent->activateAiBehavior(true);
-                    stuckWatchdogCount = 0;
-                }
-            } else {
-                stuckWatchdogCount = 0;
-            }
+            // Broadcast so client sees the turn
+            PatrolPoint pp;
+            pp.setPosition(nextPt.getX(), nextPt.getZ(), nextPt.getY());
+            agent->broadcastNextPositionUpdate(&pp);
+            
+            agent->activateAiBehavior(true);
+            
+            // Reset watchdog because we made progress
+            stuckWatchdogCount = 0;
         }
     } else {
-        // No points left but not at destination? Just run to finish.
-        // This handles the "Empty Path" edge case.
-        // Create a final point
-        PatrolPoint endPP;
-        endPP.setPosition(destination.getX(), destination.getZ(), destination.getY());
-        agent->addPatrolPoint(endPP);
-        agent->setNextStepPosition(destination.getX(), destination.getZ(), destination.getY(), nullptr);
-        agent->broadcastNextPositionUpdate(&endPP);
+        // Not close yet. Are we stuck?
+        float moveDx = currentPos.getX() - lastWatchdogPos.getX();
+        float moveDy = currentPos.getY() - lastWatchdogPos.getY();
+        float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
+
+        if (movedDistSq < 0.01f) {
+            stuckWatchdogCount++;
+            if (stuckWatchdogCount > 8) { // Stuck for 2 seconds (8 * 250ms)
+                // STUCK! Teleport slightly towards target node
+                float dist = sqrt(distSq);
+                if (dist > 0) {
+                    float dirX = dx / dist; 
+                    float dirY = dy / dist;
+                    float nudgeX = currentPos.getX() + (dirX * 0.5f);
+                    float nudgeY = currentPos.getY() + (dirY * 0.5f);
+                    float nudgeZ = currentPos.getZ() + 0.2f;
+                    agent->teleport(nudgeX, nudgeZ, nudgeY, 0);
+                }
+                // Re-assert command
+                agent->setNextStepPosition(targetPt.getX(), targetPt.getZ(), targetPt.getY(), nullptr);
+                agent->activateAiBehavior(true);
+                stuckWatchdogCount = 0;
+            }
+        } else {
+            stuckWatchdogCount = 0;
+        }
     }
 
     lastWatchdogPos = currentPos;
 
-    // Check again soon (500ms)
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(500);
+    task->schedule(250);
 }
 
-// --------------------------------------------------------
-// SAMPLE
-// --------------------------------------------------------
 void SimPlayerController::performSample() {
     state = SAMPLING;
     Logger::console.info("SimPlayer: State -> SAMPLING (15s)", true);
 
-    agent->clearPatrolPoints();
     agent->setMovementState(AiAgent::OBLIVIOUS);
-    
     agent->setPosture(CreaturePosture::CROUCHED, true);
     agent->doAnimation("sample"); 
     

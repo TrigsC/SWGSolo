@@ -55,12 +55,14 @@ class SimPlayerController : public Object, public Logger {
     
     String targetResource;
     int retryCount;
-    Vector3 destination;
+    Vector3 destination; // Final destination
     
-    // --- WATCHDOG VARIABLES ---
-    Vector3 lastWatchdogPos;
+    // --- PUPPET MODE VARIABLES ---
+    Vector<WorldCoordinates> simPath; // We hold the path, not the agent
+    int simPathIndex;                 // We track the progress
+    Vector3 lastWatchdogPos;          // Used to detect stalls
     int stuckWatchdogCount; 
-    // --------------------------
+    // -----------------------------
 
     enum SimState {
         IDLE,
@@ -84,7 +86,7 @@ public:
     void onPathFound(Vector<WorldCoordinates>* path);
     void onPathFailed();
 
-    void checkArrival(); // This is now our Watchdog
+    void checkArrival(); 
     void performSample();
     void finishSample();
 
