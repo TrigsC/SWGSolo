@@ -187,7 +187,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     }
     
     float runSpeed = agent->getRunSpeed();
-    if (runSpeed < 5.0f) runSpeed = 6.0f;
+    if (runSpeed < 4.0f) runSpeed = 4.5f;
     agent->setRunSpeed(runSpeed);
 
     // SINGLE-STEP FEED: Only add Point 0
