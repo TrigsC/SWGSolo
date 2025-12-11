@@ -10,17 +10,15 @@
 
 #include "engine/core/Task.h"
 #include "engine/core/ManagedReference.h"
+#include "engine/core/Object.h"
+#include "engine/log/Logger.h" // <--- Added Logger
 #include "system/util/Vector.h"
 #include "server/zone/objects/scene/WorldCoordinates.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
+#include "server/zone/Zone.h"
 
-// Forward Declaration
 class SimPlayerController;
 
-// --------------------------------------------------------
-// 1. The Background Task
-// --------------------------------------------------------
-// This task runs on a separate thread to avoid lagging the server.
 class FindResourcePathTask : public Task {
     WeakReference<SimPlayerController*> controller;
     WorldCoordinates startCoord;
@@ -32,23 +30,18 @@ public:
         : controller(ctrl), startCoord(start), endCoord(end), zone(z) {
     }
 
-    // The code that runs on the worker thread
     void run() override; 
 };
 
-// --------------------------------------------------------
-// 2. The Controller "Brain"
-// --------------------------------------------------------
-class SimPlayerController : public Object {
-    // The physical bot we are controlling
+// Inherit from Logger to fix the 'info' errors
+class SimPlayerController : public Object, public Logger {
     ManagedReference<AiAgent*> agent;
     
-    // State Machine
     enum SimState {
         IDLE,
-        SEARCHING_RESOURCE, // Querying PlanetManager
-        CALCULATING_PATH,   // Waiting for Recast
-        MOVING              // Actually walking
+        SEARCHING_RESOURCE,
+        CALCULATING_PATH,
+        MOVING
     };
     SimState state;
 
@@ -56,15 +49,12 @@ public:
     SimPlayerController(AiAgent* aiAgent);
     virtual ~SimPlayerController();
 
-    // The main command to start the chain
     void goToResource(const String& resourceName);
-
-    // Callbacks used by the Async Task
     void onPathFound(Vector<WorldCoordinates>* path);
     void onPathFailed();
 
-    // Helper to check if we arrived
-    bool isIdle() { return state == IDLE; }
+    // Added this declaration to fix the error
+    Vector3 findNearestHighDensityResource(const String& resourceClass);
 };
 
-#endif /* SIMPLAYERCONTROLLER_H_ */
+#endif
