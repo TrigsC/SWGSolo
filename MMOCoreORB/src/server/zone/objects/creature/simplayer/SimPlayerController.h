@@ -10,7 +10,7 @@
 
 #include "engine/core/Task.h"
 #include "engine/core/ManagedReference.h"
-#include "system/lang/ref/ReferenceCounter.h" // <--- CHANGED THIS
+#include "system/lang/Object.h"
 #include "engine/log/Logger.h"
 #include "system/util/Vector.h"
 #include "server/zone/objects/scene/WorldCoordinates.h"
@@ -33,10 +33,11 @@ public:
     void run() override; 
 };
 
-// Inherit from ReferenceCounter (for smart pointers) and Logger (for info())
-class SimPlayerController : public ReferenceCounter, public Logger { // <--- CHANGED THIS
+// Inheriting from Object gives us acquire()/release() for Smart Pointers
+class SimPlayerController : public Object, public Logger {
     ManagedReference<AiAgent*> agent;
     
+    // Member variables for the Retry Loop
     String targetResource;
     int retryCount;
 
