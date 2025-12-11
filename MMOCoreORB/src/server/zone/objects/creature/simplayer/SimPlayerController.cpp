@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Phase 12: Smooth Cornering (Look-Ahead Driving)
+ * Phase 13: Aggressive Cornering (15m tolerance for smooth running)
  */
 
 #include "SimPlayerController.h"
@@ -169,7 +169,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     Logger::console.info("SimPlayer: Path Loaded (" + String::valueOf(simPath.size()) + " nodes). Driving...", true);
 
-    // AI Reset
     agent->setFollowObject(nullptr);
     agent->setWatchObject(nullptr);
     agent->setTargetObject(nullptr);
@@ -181,8 +180,8 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
     }
     
-    // STANDARD SPEED (Avoid Rubberbanding)
-    float runSpeed = 4.5f; // Standard player run speed
+    // Smooth Speed
+    float runSpeed = 5.25f; 
     agent->setRunSpeed(runSpeed);
 
     // KICKSTART
@@ -202,9 +201,8 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     
     delete path;
 
-    // Fast Loop (200ms) for responsiveness
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(200);
+    task->schedule(250);
 }
 
 void SimPlayerController::onPathFailed() {
@@ -226,13 +224,13 @@ void SimPlayerController::checkArrival() {
 
     Vector3 currentPos = agent->getWorldPosition();
     
-    // Final check (3D Distance)
+    // 1. FINAL DESTINATION CHECK (Keep this tight: 4m)
     float dx = currentPos.getX() - destination.getX();
     float dy = currentPos.getY() - destination.getY();
     float distSq = (dx*dx) + (dy*dy);
 
-    if (distSq < 16.0f) { // 4 meters from FINAL goal
-        Logger::console.info("SimPlayer: ARRIVED.", true);
+    if (distSq < 16.0f) { 
+        Logger::console.info("SimPlayer: ARRIVED at final target.", true);
         performSample();
         return;
     } 
@@ -242,16 +240,16 @@ void SimPlayerController::checkArrival() {
         return;
     }
 
-    // Check Waypoint (2D Distance - Ignore Z for smoother checks)
+    // 2. WAYPOINT CHECK
     Vector3 targetPt = simPath.get(simPathIndex).getPoint();
     
     float wx = targetPt.getX() - currentPos.getX();
     float wy = targetPt.getY() - currentPos.getY(); 
     float waypointDistSq = (wx*wx) + (wy*wy);
 
-    // CORNER CUTTING: If < 8m, switch to next point immediately
-    // This allows the physics engine to maintain velocity through the turn
-    if (waypointDistSq < 64.0f) {
+    // AGGRESSIVE CORNERING: 15m (225 sq) 
+    // Allows the bot to arc towards the next point without stopping.
+    if (waypointDistSq < 225.0f) {
         simPathIndex++;
         
         if (simPathIndex >= simPath.size()) {
@@ -281,7 +279,6 @@ void SimPlayerController::checkArrival() {
 
         if (movedDistSq < 0.01f) {
             stuckWatchdogCount++;
-            // Relaxed Tolerance (2 sec)
             if (stuckWatchdogCount > 10) { 
                 
                 // Re-broadcast
@@ -291,7 +288,6 @@ void SimPlayerController::checkArrival() {
                 agent->broadcastNextPositionUpdate(&pp);
                 agent->activateAiBehavior(true);
                 
-                // Hard Teleport if REALLY stuck (5 sec)
                 if (stuckWatchdogCount > 25) {
                      Logger::console.info("SimPlayer: HARD STUCK. Teleporting.", true);
                      agent->teleport(targetPt.getX(), targetPt.getZ() + 0.5f, targetPt.getY(), 0);
@@ -306,7 +302,7 @@ void SimPlayerController::checkArrival() {
     lastWatchdogPos = currentPos;
 
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(200);
+    task->schedule(250);
 }
 
 void SimPlayerController::performSample() {
