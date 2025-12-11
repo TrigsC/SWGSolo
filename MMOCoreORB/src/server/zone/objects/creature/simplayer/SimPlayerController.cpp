@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Phase 2: Game Loop + MAX LOGGING (Build Fixed)
+ * Phase 2 Fixed: Movement Kickstart Enabled
  */
 
 #include "SimPlayerController.h"
@@ -13,7 +13,7 @@
 #include "server/zone/objects/resource/ResourceSpawn.h"
 #include "server/ServerCore.h"
 #include "server/zone/ZoneServer.h"
-#include "system/lang/System.h" // <--- Added for getMiliTime()
+#include "system/lang/System.h" 
 
 // --------------------------------------------------------
 // Task Implementations
@@ -25,12 +25,11 @@ void FindResourcePathTask::run() {
 
     Logger::console.info("SimPlayerTask: Requesting path from Recast engine...", true);
     
-    // Timer to measure how long pathfinding takes
-    uint64 startTime = System::getMiliTime(); // <--- FIXED
+    uint64 startTime = System::getMiliTime();
     
     Vector<WorldCoordinates>* path = PathFinderManager::instance()->findPath(startCoord, endCoord, zone);
 
-    uint64 endTime = System::getMiliTime(); // <--- FIXED
+    uint64 endTime = System::getMiliTime();
     Logger::console.info("SimPlayerTask: Recast finished in " + String::valueOf(endTime - startTime) + "ms.", true);
 
     Core::getTaskManager()->executeTask([strongCtrl, path] () {
@@ -112,11 +111,9 @@ void SimPlayerController::performSurvey() {
 
     Logger::console.info("SimPlayer: State -> SURVEYING (4s delay)", true);
 
-    // Visuals
     agent->setMovementState(AiAgent::OBLIVIOUS);
     agent->doAnimation("manipulate_high"); 
 
-    // Schedule finish
     Reference<SimBehaviorTask*> task = new SimBehaviorTask(this, SimBehaviorTask::FINISH_SURVEY);
     task->schedule(4000); 
 }
@@ -143,7 +140,6 @@ void SimPlayerController::goToResource(const String& resourceName) {
     agent->setHomeLocation(agent->getPositionX(), agent->getPositionZ(), agent->getPositionY());
     agent->stopWaiting();
     
-    // state = SEARCHING_RESOURCE; <--- DELETED THIS LINE (Fixed the enum error)
     Zone* zone = agent->getZone();
     if (zone == nullptr) return;
 
@@ -161,13 +157,11 @@ void SimPlayerController::goToResource(const String& resourceName) {
     float targetY = currentPos.getY() + offsetY; 
     float targetZ = zone->getHeight(targetX, targetY) + 1.0f; 
 
-    // LOGGING THE MATH
     if (retryCount == 0) {
         Logger::console.info("SimPlayer: Scouting Math -> Dist: " + String::valueOf(distance) + "m / Angle: " + String::valueOf(angle), true);
         Logger::console.info("SimPlayer: Destination -> " + String::valueOf(targetX) + ", " + String::valueOf(targetY), true);
     }
 
-    // Save Destination
     destination.setX(targetX);
     destination.setY(targetY);
     destination.setZ(targetZ);
@@ -189,7 +183,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     }
     
     if (path == nullptr || path->size() == 0) {
-        Logger::console.info("SimPlayer: Path was NULL/Empty.", true);
         if (path) delete path;
         onPathFailed();
         return;
@@ -236,9 +229,16 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (runSpeed < 5.0f) runSpeed = 6.0f;
     agent->setRunSpeed(runSpeed);
 
+    // --- KICKSTART LOGIC ---
     if (path->size() > 0) {
+        // 1. Manually set the "Next Step" to the first point
         PatrolPoint firstPP = agent->getNextPosition(); 
+        
+        // 2. FORCE UPDATE the internal movement system
         agent->setNextStepPosition(firstPP.getPositionX(), firstPP.getPositionZ(), firstPP.getPositionY(), firstPP.getCell());
+        
+        // 3. BROADCAST to clients (This is the visual "Go" signal)
+        agent->broadcastNextPositionUpdate(&firstPP);
     }
 
     agent->setMovementState(AiAgent::PATROLLING);
@@ -246,7 +246,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     
     delete path;
 
-    // Start checking arrival
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
     task->schedule(1000);
 }
@@ -276,7 +275,6 @@ void SimPlayerController::checkArrival() {
     float distSq = (dx*dx) + (dy*dy);
     float dist = sqrt(distSq);
 
-    // Logging distance to ensure we are actually moving
     Logger::console.info("SimPlayer: Distance to target -> " + String::valueOf(dist) + "m", true);
 
     if (distSq < 25.0f) { // 5 meters
@@ -309,11 +307,9 @@ void SimPlayerController::finishSample() {
     Logger::console.info("SimPlayer: Sampling finished.", true);
     agent->doAnimation("stop_sample"); 
     
-    // Restart
     startSimLoop();
 }
 
-// Helper stub
 Vector3 SimPlayerController::findNearestHighDensityResource(const String& resourceClass) {
     return Vector3(0,0,0);
 }
