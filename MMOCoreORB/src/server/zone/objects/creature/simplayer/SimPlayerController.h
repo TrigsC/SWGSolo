@@ -10,7 +10,8 @@
 
 #include "engine/core/Task.h"
 #include "engine/core/ManagedReference.h"
-#include "engine/log/Logger.h" // <--- Added Logger
+#include "engine/core/Object.h"
+#include "engine/log/Logger.h"
 #include "system/util/Vector.h"
 #include "server/zone/objects/scene/WorldCoordinates.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
@@ -32,10 +33,14 @@ public:
     void run() override; 
 };
 
-// Inherit from Logger to fix the 'info' errors
 class SimPlayerController : public Object, public Logger {
     ManagedReference<AiAgent*> agent;
     
+    // --- NEW VARIABLES ADDED HERE ---
+    String targetResource;
+    int retryCount;
+    // --------------------------------
+
     enum SimState {
         IDLE,
         SEARCHING_RESOURCE,
@@ -52,7 +57,6 @@ public:
     void onPathFound(Vector<WorldCoordinates>* path);
     void onPathFailed();
 
-    // Added this declaration to fix the error
     Vector3 findNearestHighDensityResource(const String& resourceClass);
 };
 

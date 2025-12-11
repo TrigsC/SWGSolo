@@ -111,7 +111,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     agent->setFollowObject(nullptr);
     agent->setWatchObject(nullptr);
     agent->setTargetObject(nullptr);
-    agent->clearCombatState(true);
+    agent->clearCombatState(true); 
 
     // 2. Load Path
     agent->clearPatrolPoints();
