@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Phase 7: The Hybrid (Crash-Safe Teleport + Gentle Nudge)
+ * Phase 8: The Path Advancer (Feed points one-by-one to force movement)
  */
 
 #include "SimPlayerController.h"
@@ -94,11 +94,12 @@ void SimPlayerController::performSurvey() {
     if (agent == nullptr) return;
     state = SURVEYING;
 
-    // Stop and look busy
     agent->setMovementState(AiAgent::OBLIVIOUS);
+    
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
     }
+    
     agent->doAnimation("manipulate_high"); 
 
     Reference<SimBehaviorTask*> task = new SimBehaviorTask(this, SimBehaviorTask::FINISH_SURVEY);
@@ -126,7 +127,6 @@ void SimPlayerController::goToResource(const String& resourceName) {
     stuckWatchdogCount = 0;
     lastWatchdogPos = agent->getWorldPosition();
 
-    // Reset Brain
     agent->setHomeLocation(agent->getPositionX(), agent->getPositionZ(), agent->getPositionY());
     agent->stopWaiting();
     
@@ -136,15 +136,11 @@ void SimPlayerController::goToResource(const String& resourceName) {
     Vector3 currentPos = agent->getWorldPosition();
     
     // Scout 100m-200m
-    int distance = 100 + System::random(100); 
+    int distance = 80 + System::random(120); 
     int angle = System::random(360);
-    
     float rads = angle * (M_PI / 180.0f);
-    float offsetX = distance * cos(rads);
-    float offsetY = distance * sin(rads);
-
-    float targetX = currentPos.getX() + offsetX;
-    float targetY = currentPos.getY() + offsetY; 
+    float targetX = currentPos.getX() + (distance * cos(rads));
+    float targetY = currentPos.getY() + (distance * sin(rads));
     float targetZ = zone->getHeight(targetX, targetY) + 1.0f; 
 
     destination.setX(targetX);
@@ -179,15 +175,13 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     agent->setTargetObject(nullptr);
     agent->clearCombatState(true);
     agent->setMovementState(AiAgent::OBLIVIOUS);
+    
+    // 2. Clear Internal Points
     agent->clearPatrolPoints();
 
-    // 2. FORCE UPRIGHT
-    if (agent->getPosture() != CreaturePosture::UPRIGHT) {
-        agent->setPosture(CreaturePosture::UPRIGHT, true);
-    }
-
-    // 3. LOAD PATH
-    Logger::console.info("SimPlayer: Path Found (" + String::valueOf(path->size()) + " nodes). Loading...", true);
+    // 3. LOAD PATH (But we keep it minimal inside the AI, we drive it)
+    // We load ALL points so the internal vector has data
+    Logger::console.info("SimPlayer: Path Loaded (" + String::valueOf(path->size()) + " nodes). Advancing...", true);
     
     for (int i = 0; i < path->size(); ++i) {
         WorldCoordinates wc = path->get(i);
@@ -197,20 +191,30 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         agent->addPatrolPoint(pp);
     }
 
-    // 4. SPEED (Artisans need a nudge)
+    // 4. PHYSICS SETUP
+    if (agent->getPosture() != CreaturePosture::UPRIGHT) {
+        agent->setPosture(CreaturePosture::UPRIGHT, true);
+    }
+    
     float runSpeed = agent->getRunSpeed();
     if (runSpeed < 5.0f) runSpeed = 6.0f;
     agent->setRunSpeed(runSpeed);
 
-    // 5. ACTIVATE (Natural Method)
-    // We removed the manual broadcast here to stop rubber-banding
+    // 5. KICKSTART: Force the first point
+    if (path->size() > 0) {
+        PatrolPoint firstPP = agent->getNextPosition(); 
+        agent->setNextStepPosition(firstPP.getPositionX(), firstPP.getPositionZ(), firstPP.getPositionY(), firstPP.getCell());
+        agent->broadcastNextPositionUpdate(&firstPP);
+    }
+
     agent->setMovementState(AiAgent::PATROLLING);
     agent->activateAiBehavior(true); 
     
     delete path;
 
+    // Start the Active Driver (Interval: 500ms for responsiveness)
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(1000);
+    task->schedule(500);
 }
 
 void SimPlayerController::onPathFailed() {
@@ -224,7 +228,7 @@ void SimPlayerController::onPathFailed() {
 }
 
 // --------------------------------------------------------
-// WATCHDOG (FIXED: Gentle Nudge)
+// THE PATH ADVANCER (Replaces Standard Watchdog)
 // --------------------------------------------------------
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
@@ -232,56 +236,86 @@ void SimPlayerController::checkArrival() {
 
     Vector3 currentPos = agent->getWorldPosition();
     
+    // 1. FINAL DESTINATION CHECK
     float dx = currentPos.getX() - destination.getX();
     float dy = currentPos.getY() - destination.getY();
     float distSq = (dx*dx) + (dy*dy);
 
-    float moveDx = currentPos.getX() - lastWatchdogPos.getX();
-    float moveDy = currentPos.getY() - lastWatchdogPos.getY();
-    float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
-
-    lastWatchdogPos = currentPos;
-
-    if (distSq < 25.0f) { 
-        Logger::console.info("SimPlayer: ARRIVED at target.", true);
+    if (distSq < 16.0f) { // 4 meters close enough
+        Logger::console.info("SimPlayer: ARRIVED at final target.", true);
         performSample();
         return;
     } 
 
-    // STALL LOGIC
-    if (movedDistSq < 0.01f) {
-        stuckWatchdogCount++;
-        if (stuckWatchdogCount > 3) { // Increased tolerance to 3s
-             Logger::console.info("SimPlayer: STALL DETECTED. Nudging...", true);
-             
-             agent->setPosture(CreaturePosture::UPRIGHT, true);
-             agent->setMovementState(AiAgent::PATROLLING);
-             
-             // GENTLE NUDGE (Teleport 0.5m)
-             // This updates the server position without confusing the client prediction too much
-             float dist = sqrt(distSq);
-             if (dist > 0) {
-                 float dirX = dx / dist; 
-                 float dirY = dy / dist;
-                 
-                 float nudgeX = currentPos.getX() - (dirX * 0.5f);
-                 float nudgeY = currentPos.getY() - (dirY * 0.5f);
-                 float nudgeZ = currentPos.getZ() + 0.2f; // Slight lift to unstuck from floor
-                 
-                 // ParentID 0 = World
-                 agent->teleport(nudgeX, nudgeZ, nudgeY, 0); 
-             }
+    // 2. WAYPOINT ADVANCER
+    // Check distance to the CURRENT waypoint
+    if (agent->getPatrolPointSize() > 0) {
+        PatrolPoint currentPP = agent->getNextPosition();
+        
+        float wx = currentPP.getPositionX() - currentPos.getX();
+        float wy = currentPP.getPositionY() - currentPos.getY(); // Y is Map Z
+        float waypointDistSq = (wx*wx) + (wy*wy);
 
-             // Wake up the brain
-             agent->activateAiBehavior(true);
-             stuckWatchdogCount = 0;
+        // If we are close to the current waypoint (< 4m), POP IT and move to next
+        if (waypointDistSq < 16.0f) {
+            // Remove the reached point
+            agent->erasePatrolPoint(0);
+            
+            // Do we have another one?
+            if (agent->getPatrolPointSize() > 0) {
+                // FORCE THE NEW POINT
+                PatrolPoint nextPP = agent->getNextPosition();
+                agent->setNextStepPosition(nextPP.getPositionX(), nextPP.getPositionZ(), nextPP.getPositionY(), nextPP.getCell());
+                agent->broadcastNextPositionUpdate(&nextPP);
+                agent->activateAiBehavior(true);
+                
+                // Logger::console.info("SimPlayer: Advancing to next waypoint...", true);
+                stuckWatchdogCount = 0; // Reset stuck counter since we made progress
+            }
+        } else {
+            // We haven't reached the waypoint yet. Are we stuck?
+            // Check if we moved since last tick
+            float moveDx = currentPos.getX() - lastWatchdogPos.getX();
+            float moveDy = currentPos.getY() - lastWatchdogPos.getY();
+            float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
+            
+            if (movedDistSq < 0.01f) {
+                stuckWatchdogCount++;
+                if (stuckWatchdogCount > 4) { // Stuck for 2 seconds (4 * 500ms)
+                    // GENTLE NUDGE (0.5m)
+                    // We nudge towards the WAYPOINT, not the final destination
+                    float dist = sqrt(waypointDistSq);
+                    if (dist > 0) {
+                        float dirX = wx / dist;
+                        float dirY = wy / dist;
+                        float nudgeX = currentPos.getX() + (dirX * 0.5f);
+                        float nudgeY = currentPos.getY() + (dirY * 0.5f);
+                        float nudgeZ = currentPos.getZ() + 0.2f;
+                        agent->teleport(nudgeX, nudgeZ, nudgeY, 0);
+                    }
+                    agent->activateAiBehavior(true);
+                    stuckWatchdogCount = 0;
+                }
+            } else {
+                stuckWatchdogCount = 0;
+            }
         }
     } else {
-        stuckWatchdogCount = 0; 
+        // No points left but not at destination? Just run to finish.
+        // This handles the "Empty Path" edge case.
+        // Create a final point
+        PatrolPoint endPP;
+        endPP.setPosition(destination.getX(), destination.getZ(), destination.getY());
+        agent->addPatrolPoint(endPP);
+        agent->setNextStepPosition(destination.getX(), destination.getZ(), destination.getY(), nullptr);
+        agent->broadcastNextPositionUpdate(&endPP);
     }
 
+    lastWatchdogPos = currentPos;
+
+    // Check again soon (500ms)
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(1000);
+    task->schedule(500);
 }
 
 // --------------------------------------------------------
@@ -303,10 +337,8 @@ void SimPlayerController::performSample() {
 
 void SimPlayerController::finishSample() {
     Logger::console.info("SimPlayer: Done sampling.", true);
-    
     agent->setPosture(CreaturePosture::UPRIGHT, true);
     agent->doAnimation("stop_sample"); 
-    
     startSimLoop();
 }
 
