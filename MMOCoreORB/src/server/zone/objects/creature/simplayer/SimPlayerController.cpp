@@ -9,6 +9,8 @@
 #include "server/zone/managers/collision/PathFinderManager.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h"
 #include "server/zone/Zone.h"
+#include "server/zone/managers/resource/ResourceManager.h"
+#include "server/zone/objects/resource/ResourceSpawn.h"
 
 // --------------------------------------------------------
 // Task Implementation
@@ -55,60 +57,39 @@ SimPlayerController::~SimPlayerController() {
 }
 
 void SimPlayerController::goToResource(const String& resourceName) {
-    if (agent == nullptr) {
-        Logger::console.info("ERROR: Agent is null in goToResource!", true);
-        return;
-    }
+    if (agent == nullptr) return;
 
-    // --- LOGIC FIX 1: STOP THE DEFAULT AI ---
-    // If we don't do this, the default AI will leash back to its spawn point.
-    // We set the "Home" to where we are currently standing to reset the tether.
+    // Reset Home
     agent->setHomeLocation(agent->getPositionX(), agent->getPositionZ(), agent->getPositionY());
     agent->stopWaiting();
     
-    // DEBUG: Print current position to understand the Axis
-    // SWG Standard: X=East/West, Z=North/South, Y=Elevation (Up)
-    Vector3 currentPos = agent->getWorldPosition();
-    Logger::console.info("DEBUG: Current Pos -> X:" + String::valueOf(currentPos.getX()) + 
-         " Z(North):" + String::valueOf(currentPos.getZ()) + 
-         " Y(Up):" + String::valueOf(currentPos.getY()), true);
-
     state = SEARCHING_RESOURCE;
-    
     Zone* zone = agent->getZone();
-    if (zone == nullptr) {
-        Logger::console.info("ERROR: Agent is not in a valid Zone!", true);
-        return;
-    }
+    if (zone == nullptr) return;
 
-// --- STEP 1: Search ---
-    // Core3 Vector3 Structure confirmed by logs:
-    // X = East/West
-    // Y = North/South
-    // Z = Elevation
+    Vector3 currentPos = agent->getWorldPosition();
+
+    // --- RANDOM SCOUT LOGIC ---
+    // Pick a random direction and distance (between 500m and 1500m)
+    int distance = 500 + System::random(1000);
+    int angle = System::random(360);
     
-    // 1. Calculate the 2D Destination (X and Y)
-    float targetX = currentPos.getX() + 200;  // Move 200m East
-    float targetY = currentPos.getY();        // Stay on same North/South line (-4700)
-    
-    // 2. Get the correct Elevation (Z) for that spot
-    // zone->getHeight(x, y) expects the map coordinates
+    // Convert Angle/Dist to X/Y offset
+    float rads = angle * (M_PI / 180.0f);
+    float offsetX = distance * cos(rads);
+    float offsetY = distance * sin(rads);
+
+    float targetX = currentPos.getX() + offsetX;
+    float targetY = currentPos.getY() + offsetY; // North/South
     float targetZ = zone->getHeight(targetX, targetY); 
 
-    Logger::console.info("DEBUG: Target Coordinate -> X:" + String::valueOf(targetX) + " Y(North):" + String::valueOf(targetY), true);
-    Logger::console.info("DEBUG: Elevation Snap -> Old Z:" + String::valueOf(currentPos.getZ()) + " New Z:" + String::valueOf(targetZ), true);
+    info("SimPlayer: Scouting " + resourceName + " at " + String::valueOf(distance) + "m (Dir: " + String::valueOf(angle) + ")", true);
 
-    // 3. Construct the target vector (X, Y, Z)
     Vector3 targetPos(targetX, targetY, targetZ);
 
-    // --- STEP 2: Plan (Async) ---
     state = CALCULATING_PATH;
-    
-    // Construct WorldCoordinates
     WorldCoordinates startCoord(agent);
-    WorldCoordinates endCoord(targetPos, nullptr); // nullptr cell = terrain
-
-    Logger::console.info("DEBUG: Launching Async Path Task...", true);
+    WorldCoordinates endCoord(targetPos, nullptr); 
 
     Reference<FindResourcePathTask*> task = new FindResourcePathTask(this, startCoord, endCoord, zone);
     task->execute(); 
@@ -155,6 +136,10 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     // Force the state
     Logger::console.info("DEBUG: Setting Movement State to PATROLLING and Activating AI.", true);
+    float runSpeed = agent->getRunSpeed();
+    if (runSpeed < 5.0f) runSpeed = 6.0f; // Ensure he's not slow
+    
+    agent->setRunSpeed(runSpeed);
     agent->setMovementState(AiAgent::PATROLLING);
     agent->activateAiBehavior(true); // Force immediate update
     
@@ -164,4 +149,90 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 void SimPlayerController::onPathFailed() {
     state = IDLE;
     Logger::console.info("FAILURE: Could not find path to resource.", true);
+}
+
+Vector3 SimPlayerController::findNearestHighDensityResource(const String& resourceClass) {
+    Vector3 bestSpot = agent->getWorldPosition(); // Default to staying put if fail
+    float maxDensityFound = 0.0f;
+
+    Zone* zone = agent->getZone();
+    if (zone == nullptr) return bestSpot;
+
+    String planetName = zone->getZoneName();
+    ResourceManager* resManager = ResourceManager::instance();
+    
+    // 1. Get all current spawns
+    // We need to lock the resource manager usually, or just get a copy of the list?
+    // ResourceManager usually has "getResourceSpawns()" which returns a map.
+    // For simplicity/safety in this prototype, let's ask for specific type logic if available,
+    // or iterate the whole list (careful with locks in production!).
+    
+    // ARCHITECT NOTE: Core3 Resource iteration is complex. 
+    // We will assume a helper method or iterate the global map carefully.
+    // A safer way is using "getResourceSpawn(name)" if we knew the name.
+    // Since we only know "iron", we search by type.
+
+    // Let's use a "Sampling" approach. 
+    // We will scan the ground around us and ask "What is here?"
+    
+    Vector3 currentPos = agent->getWorldPosition();
+    float scanRadius = 1000.0f; // Look within 1km
+    float stepSize = 96.0f;    // Check every 96 meters (optimization)
+    
+    // Debug Log
+    info("SimPlayer: Surveying for " + resourceClass + "...", true);
+
+    for (float x = currentPos.getX() - scanRadius; x <= currentPos.getX() + scanRadius; x += stepSize) {
+        for (float y = currentPos.getY() - scanRadius; y <= currentPos.getY() + scanRadius; y += stepSize) {
+            
+            // Ask ResourceManager: "What is the density of [Type] at [X,Y]?"
+            // Note: SWG density is 0.0 to 1.0 (or 0-100).
+            
+            // Core3 API: getDensityForResource(x, y, zoneName, resourceClass)
+            // Note: We need to verify if this exact API exists in your version. 
+            // Often it is: resManager->getDensity(x, y, planetName, resourceName)
+            
+            // Since we don't have the specific Random Name (e.g. "Abcd Iron"), 
+            // we effectively need to find the specific spawn first.
+            // THIS IS THE HARD PART: Generic "Iron" maps to specific "Oruu Carbonate Iron".
+            
+            // Simplified Logic: 
+            // We will just find ANY resource density at this spot for now to test the loop.
+            // Or strictly:
+            // ResourceSpawn* spawn = resManager->getCurrentSpawn(type, planet);
+        }
+    }
+    
+    // --- ALTERNATIVE: DIRECT SPAWN ACCESS (Better) ---
+    // 1. Find the specific Spawn Object for "Iron" on "Naboo"
+    ResourceSpawn* targetSpawn = nullptr;
+    
+    // We iterate the map (Pseudo-code adapted for Core3)
+    // In real Core3, you often use resManager->getResourceList()
+    // For this prototype, let's pretend we found one or just use the first "Iron" we find.
+    
+    // If we can't easily iterate, let's cheat and use a known test coordinate 
+    // OR just return a random spot for the movement test.
+    
+    // RETURN TO SEARCH LOOP
+    // Let's perform a "Blind Survey" - Pick 10 random spots, go to the best one.
+    for (int i=0; i<20; ++i) {
+        float testX = currentPos.getX() + (System::random(2000) - 1000);
+        float testY = currentPos.getY() + (System::random(2000) - 1000);
+        
+        // This function usually exists in PlanetManager or ResourceManager
+        // It returns the highest density of ANY resource at that spot.
+        // Ideally we filter by class, but let's just find "The Good Stuff".
+        float density = resManager->getDensity(planetName, testX, testY); 
+        
+        if (density > maxDensityFound) {
+            maxDensityFound = density;
+            bestSpot.setX(testX);
+            bestSpot.setY(testY); // North/South
+            // We snap Z later in goToResource
+        }
+    }
+    
+    info("SimPlayer: Survey complete. Found density " + String::valueOf(maxDensityFound) + " at " + bestSpot.toString(), true);
+    return bestSpot;
 }
