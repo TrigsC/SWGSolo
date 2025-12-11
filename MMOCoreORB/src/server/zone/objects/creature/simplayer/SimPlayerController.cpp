@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Phase 5: Crash Fix (Teleport implementation)
+ * Phase 6: The Manual Driver (Fixes Lazy Artisans)
  */
 
 #include "SimPlayerController.h"
@@ -18,7 +18,6 @@
 // --------------------------------------------------------
 // Task Implementations
 // --------------------------------------------------------
-
 void FindResourcePathTask::run() {
     Reference<SimPlayerController*> strongCtrl = controller.get();
     if (strongCtrl == nullptr) return;
@@ -59,7 +58,6 @@ void SimBehaviorTask::run() {
 // --------------------------------------------------------
 // Controller Implementation
 // --------------------------------------------------------
-
 SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     agent = aiAgent;
     state = IDLE;
@@ -137,6 +135,7 @@ void SimPlayerController::goToResource(const String& resourceName) {
 
     Vector3 currentPos = agent->getWorldPosition();
     
+    // Short hop for reliability
     int distance = 80 + System::random(120); 
     int angle = System::random(360);
     
@@ -169,12 +168,13 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     retryCount = 0;
     state = MOVING;
 
+    // Save final destination
     if (path->size() > 0) {
         Vector3 endPt = path->get(path->size() - 1).getPoint();
         destination = endPt;
     }
 
-    // 1. CLEAR BRAIN
+    // 1. BRAIN WIPE
     agent->setFollowObject(nullptr);
     agent->setWatchObject(nullptr);
     agent->setTargetObject(nullptr);
@@ -188,6 +188,8 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     }
 
     // 3. LOAD PATH
+    Logger::console.info("SimPlayer: Path Found (" + String::valueOf(path->size()) + " nodes). Loading...", true);
+    
     for (int i = 0; i < path->size(); ++i) {
         WorldCoordinates wc = path->get(i);
         Vector3 point = wc.getPoint();
@@ -231,7 +233,7 @@ void SimPlayerController::onPathFailed() {
 }
 
 // --------------------------------------------------------
-// WATCHDOG (FIXED)
+// WATCHDOG (MANUAL DRIVER)
 // --------------------------------------------------------
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
@@ -242,7 +244,6 @@ void SimPlayerController::checkArrival() {
     float dx = currentPos.getX() - destination.getX();
     float dy = currentPos.getY() - destination.getY();
     float distSq = (dx*dx) + (dy*dy);
-
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
     float moveDy = currentPos.getY() - lastWatchdogPos.getY();
     float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
@@ -255,30 +256,38 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
+    // STALL LOGIC
     if (movedDistSq < 0.01f) {
         stuckWatchdogCount++;
         if (stuckWatchdogCount > 2) { 
-             Logger::console.info("SimPlayer: STALL DETECTED. Shoving.", true);
+             Logger::console.info("SimPlayer: STALL DETECTED. Manual Drive Engaged.", true);
              
+             // Ensure we are upright
              agent->setPosture(CreaturePosture::UPRIGHT, true);
-             agent->setMovementState(AiAgent::PATROLLING);
              
-             // --- FIX: USE TELEPORT INSTEAD OF PARENT UPDATE ---
-             float dist = sqrt(distSq);
-             if (dist > 0) {
-                 float dirX = dx / dist; 
-                 float dirY = dy / dist;
+             // --- MANUAL DRIVE ---
+             // If the AI refuses to pick the next point, WE pick it for them.
+             PatrolPoint nextPP = agent->getNextPosition();
+             
+             // Check if we actually have a point to go to
+             if (agent->getPatrolPointSize() > 0) {
+                 // Force the internal engine to accept this as the target
+                 agent->setNextStepPosition(nextPP.getPositionX(), nextPP.getPositionZ(), nextPP.getPositionY(), nextPP.getCell());
                  
-                 float nudgeX = currentPos.getX() - (dirX * 0.2f);
-                 float nudgeY = currentPos.getY() - (dirY * 0.2f);
-                 float nudgeZ = currentPos.getZ() + 0.1f; 
+                 // Tell the client "I am here now, go there"
+                 agent->broadcastNextPositionUpdate(&nextPP);
                  
-                 // ParentID 0 means "World" (Outdoors)
-                 agent->teleport(nudgeX, nudgeZ, nudgeY, 0); 
+                 // Spam the Activate to wake up the thread
+                 agent->activateAiBehavior(true);
+             } else {
+                 // No points left but not arrived? Logic gap. Teleport to finish.
+                 Logger::console.info("SimPlayer: No waypoints left. Teleporting to finish.", true);
+                 agent->teleport(destination.getX(), destination.getZ(), destination.getY(), 0);
+                 performSample();
+                 return;
              }
-             // -------------------------------------------------
+             // --------------------
 
-             agent->activateAiBehavior(true);
              stuckWatchdogCount = 0;
         }
     } else {
