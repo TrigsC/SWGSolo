@@ -56,6 +56,7 @@ public:
     void goToResource(const String& resourceName);
     void onPathFound(Vector<WorldCoordinates>* path);
     void onPathFailed();
+    String findActualResourceSpawn(const String& genericType);
 
     Vector3 findNearestHighDensityResource(const String& resourceClass);
 };
