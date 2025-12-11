@@ -10,7 +10,6 @@
 
 #include "engine/core/Task.h"
 #include "engine/core/ManagedReference.h"
-#include "engine/core/Object.h"
 #include "engine/log/Logger.h" // <--- Added Logger
 #include "system/util/Vector.h"
 #include "server/zone/objects/scene/WorldCoordinates.h"
