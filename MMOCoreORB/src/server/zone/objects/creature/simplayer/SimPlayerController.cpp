@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Phase 11: Single-Step Feeding (Forces Lazy AI to focus)
+ * Phase 12: Smooth Cornering (Look-Ahead Driving)
  */
 
 #include "SimPlayerController.h"
@@ -138,9 +138,6 @@ void SimPlayerController::goToResource(const String& resourceName) {
     float targetY = currentPos.getY() + (distance * sin(rads));
     float targetZ = zone->getHeight(targetX, targetY) + 1.0f; 
 
-    // Debug Destination
-    // Logger::console.info("SimPlayer: Dest -> X:" + String::valueOf(targetX) + " Y(North):" + String::valueOf(targetY) + " Z(Elev):" + String::valueOf(targetZ), true);
-
     destination.setX(targetX);
     destination.setY(targetY);
     destination.setZ(targetZ);
@@ -178,19 +175,17 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     agent->setTargetObject(nullptr);
     agent->clearCombatState(true);
     agent->setMovementState(AiAgent::OBLIVIOUS);
-    
-    // Clear ALL internal points
     agent->clearPatrolPoints(); 
 
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
     }
     
-    float runSpeed = agent->getRunSpeed();
-    if (runSpeed < 4.0f) runSpeed = 4.5f;
+    // STANDARD SPEED (Avoid Rubberbanding)
+    float runSpeed = 4.5f; // Standard player run speed
     agent->setRunSpeed(runSpeed);
 
-    // SINGLE-STEP FEED: Only add Point 0
+    // KICKSTART
     if (simPath.size() > 0) {
         Vector3 firstPt = simPath.get(0).getPoint();
         
@@ -198,7 +193,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         pp.setPosition(firstPt.getX(), firstPt.getZ(), firstPt.getY());
         agent->addPatrolPoint(pp);
         
-        // Force Update
         agent->setNextStepPosition(firstPt.getX(), firstPt.getZ(), firstPt.getY(), nullptr);
         agent->broadcastNextPositionUpdate(&pp);
     }
@@ -208,9 +202,9 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     
     delete path;
 
-    // Fast Loop (250ms)
+    // Fast Loop (200ms) for responsiveness
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(250);
+    task->schedule(200);
 }
 
 void SimPlayerController::onPathFailed() {
@@ -224,7 +218,7 @@ void SimPlayerController::onPathFailed() {
 }
 
 // --------------------------------------------------------
-// SINGLE-STEP DRIVER
+// SMOOTH DRIVER
 // --------------------------------------------------------
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
@@ -232,32 +226,32 @@ void SimPlayerController::checkArrival() {
 
     Vector3 currentPos = agent->getWorldPosition();
     
-    // Final check
+    // Final check (3D Distance)
     float dx = currentPos.getX() - destination.getX();
     float dy = currentPos.getY() - destination.getY();
     float distSq = (dx*dx) + (dy*dy);
 
-    if (distSq < 9.0f) { 
-        Logger::console.info("SimPlayer: ARRIVED at final target.", true);
+    if (distSq < 16.0f) { // 4 meters from FINAL goal
+        Logger::console.info("SimPlayer: ARRIVED.", true);
         performSample();
         return;
     } 
 
     if (simPath.size() == 0 || simPathIndex >= simPath.size()) {
-        Logger::console.info("SimPlayer: End of path data.", true);
         performSample();
         return;
     }
 
-    // Check Waypoint
+    // Check Waypoint (2D Distance - Ignore Z for smoother checks)
     Vector3 targetPt = simPath.get(simPathIndex).getPoint();
     
     float wx = targetPt.getX() - currentPos.getX();
     float wy = targetPt.getY() - currentPos.getY(); 
     float waypointDistSq = (wx*wx) + (wy*wy);
 
-    if (waypointDistSq < 16.0f) {
-        // REACHED NODE -> Load Next
+    // CORNER CUTTING: If < 8m, switch to next point immediately
+    // This allows the physics engine to maintain velocity through the turn
+    if (waypointDistSq < 64.0f) {
         simPathIndex++;
         
         if (simPathIndex >= simPath.size()) {
@@ -266,21 +260,13 @@ void SimPlayerController::checkArrival() {
         } else {
             Vector3 nextPt = simPath.get(simPathIndex).getPoint();
             
-            // LOG: Prove we are feeding (X, Elev, North)
-            Logger::console.info("SimPlayer: Feed Step " + String::valueOf(simPathIndex) + 
-                " -> X:" + String::valueOf(nextPt.getX()) + 
-                " Z(Elev):" + String::valueOf(nextPt.getZ()) + 
-                " Y(North):" + String::valueOf(nextPt.getY()), true);
-
-            // 1. Clear old
+            // FEED NEXT POINT
             agent->clearPatrolPoints();
             
-            // 2. Add New
             PatrolPoint pp;
             pp.setPosition(nextPt.getX(), nextPt.getZ(), nextPt.getY());
             agent->addPatrolPoint(pp);
 
-            // 3. Force Engine
             agent->setNextStepPosition(nextPt.getX(), nextPt.getZ(), nextPt.getY(), nullptr);
             agent->broadcastNextPositionUpdate(&pp);
             agent->activateAiBehavior(true);
@@ -295,27 +281,19 @@ void SimPlayerController::checkArrival() {
 
         if (movedDistSq < 0.01f) {
             stuckWatchdogCount++;
-            // Relaxed Tolerance (1.5 sec)
-            if (stuckWatchdogCount > 6) { 
+            // Relaxed Tolerance (2 sec)
+            if (stuckWatchdogCount > 10) { 
                 
-                // Only log sparingly
-                if (stuckWatchdogCount % 10 == 0) {
-                    Logger::console.info("SimPlayer: Stalled. Resending packet...", true);
-                }
-                
-                // Re-broadcast the CURRENT target
-                // We do NOT teleport here anymore to avoid the flying bug.
-                // We just scream at the client "GO HERE!"
+                // Re-broadcast
                 PatrolPoint pp;
                 pp.setPosition(targetPt.getX(), targetPt.getZ(), targetPt.getY());
                 agent->setNextStepPosition(targetPt.getX(), targetPt.getZ(), targetPt.getY(), nullptr);
                 agent->broadcastNextPositionUpdate(&pp);
                 agent->activateAiBehavior(true);
                 
-                // Only use teleport as absolute last resort (5 seconds stuck)
-                if (stuckWatchdogCount > 20) {
-                     Logger::console.info("SimPlayer: HARD STUCK. Emergency Teleport.", true);
-                     // Teleport to the NODE, not the nudge
+                // Hard Teleport if REALLY stuck (5 sec)
+                if (stuckWatchdogCount > 25) {
+                     Logger::console.info("SimPlayer: HARD STUCK. Teleporting.", true);
                      agent->teleport(targetPt.getX(), targetPt.getZ() + 0.5f, targetPt.getY(), 0);
                      stuckWatchdogCount = 0;
                 }
@@ -328,7 +306,7 @@ void SimPlayerController::checkArrival() {
     lastWatchdogPos = currentPos;
 
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(250);
+    task->schedule(200);
 }
 
 void SimPlayerController::performSample() {
