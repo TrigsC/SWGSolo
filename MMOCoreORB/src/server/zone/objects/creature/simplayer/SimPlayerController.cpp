@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Final Fixed Version: ZoneServer Access + Wilderness Logic
+ * Phase 2: Game Loop + MAX LOGGING
  */
 
 #include "SimPlayerController.h"
@@ -11,29 +11,56 @@
 #include "server/zone/Zone.h"
 #include "server/zone/managers/resource/ResourceManager.h"
 #include "server/zone/objects/resource/ResourceSpawn.h"
-#include "server/ServerCore.h"       // <--- ADDED
-#include "server/zone/ZoneServer.h"  // <--- ADDED
+#include "server/ServerCore.h"
+#include "server/zone/ZoneServer.h"
 
 // --------------------------------------------------------
-// Task Implementation
+// Task Implementations
 // --------------------------------------------------------
+
 void FindResourcePathTask::run() {
     Reference<SimPlayerController*> strongCtrl = controller.get();
     if (strongCtrl == nullptr) return;
 
-    // Perform the heavy math
+    Logger::console.info("SimPlayerTask: Requesting path from Recast engine...", true);
+    
+    // Timer to measure how long pathfinding takes
+    uint64 startTime = Core::getMiliTime();
+    
     Vector<WorldCoordinates>* path = PathFinderManager::instance()->findPath(startCoord, endCoord, zone);
 
+    uint64 endTime = Core::getMiliTime();
+    Logger::console.info("SimPlayerTask: Recast finished in " + String::valueOf(endTime - startTime) + "ms.", true);
+
     Core::getTaskManager()->executeTask([strongCtrl, path] () {
-        // Validation: We accept all paths now. 
-        // We will filter "Size 2" (Straight Line) inside the controller if we want,
-        // but for wilderness blind walking, we need to accept them.
         if (path != nullptr) { 
             strongCtrl->onPathFound(path);
         } else {
             strongCtrl->onPathFailed();
         }
     }, "SimPlayerResultLambda");
+}
+
+void ArrivalCheckTask::run() {
+    Reference<SimPlayerController*> strongCtrl = controller.get();
+    if (strongCtrl == nullptr) return;
+    
+    Core::getTaskManager()->executeTask([strongCtrl] () {
+        strongCtrl->checkArrival();
+    }, "SimPlayerArrivalLambda");
+}
+
+void SimBehaviorTask::run() {
+    Reference<SimPlayerController*> strongCtrl = controller.get();
+    if (strongCtrl == nullptr) return;
+
+    int capturedType = type;
+    Core::getTaskManager()->executeTask([strongCtrl, capturedType] () {
+        if (capturedType == SimBehaviorTask::FINISH_SURVEY) 
+            strongCtrl->finishSurvey();
+        else if (capturedType == SimBehaviorTask::FINISH_SAMPLE) 
+            strongCtrl->finishSample();
+    }, "SimPlayerBehaviorLambda");
 }
 
 // --------------------------------------------------------
@@ -51,24 +78,67 @@ SimPlayerController::~SimPlayerController() {
     agent = nullptr;
 }
 
-// Helper: Find the specific spawn name using ZoneServer
+// --------------------------------------------------------
+// STEP 1: START & DECIDE
+// --------------------------------------------------------
+void SimPlayerController::startSimLoop() {
+    state = DECIDING;
+    String res = pickRandomResource();
+    targetResource = res; 
+    
+    Logger::console.info("================================================", true);
+    Logger::console.info("SimPlayer: NEW LOOP STARTED", true);
+    Logger::console.info("SimPlayer: Desire determined -> I want [" + res + "]", true);
+    
+    performSurvey();
+}
+
+String SimPlayerController::pickRandomResource() {
+    int roll = System::random(4);
+    if (roll == 0) return "iron";
+    if (roll == 1) return "gas";
+    if (roll == 2) return "water";
+    if (roll == 3) return "copper";
+    return "steel";
+}
+
+// --------------------------------------------------------
+// STEP 2: SURVEY VISUALS
+// --------------------------------------------------------
+void SimPlayerController::performSurvey() {
+    if (agent == nullptr) return;
+    state = SURVEYING;
+
+    Logger::console.info("SimPlayer: State -> SURVEYING (4s delay)", true);
+
+    // Visuals
+    agent->setMovementState(AiAgent::OBLIVIOUS);
+    agent->doAnimation("manipulate_high"); 
+
+    // Schedule finish
+    Reference<SimBehaviorTask*> task = new SimBehaviorTask(this, SimBehaviorTask::FINISH_SURVEY);
+    task->schedule(4000); 
+}
+
+void SimPlayerController::finishSurvey() {
+    Logger::console.info("SimPlayer: Survey complete. Selected location.", true);
+    goToResource(targetResource);
+}
+
+// --------------------------------------------------------
+// STEP 3: MOVEMENT LOGIC
+// --------------------------------------------------------
 String SimPlayerController::findActualResourceSpawn(const String& genericType) {
     ZoneServer* zoneServer = ServerCore::getZoneServer();
-    if (zoneServer == nullptr) return genericType;
-
-    ResourceManager* resManager = zoneServer->getResourceManager();
-    if (resManager == nullptr) return genericType;
-
-    // In a real implementation, you would use:
-    // resManager->getResourceSpawn(genericType);
-    // For now, we return a placebo string so we know this function ran.
-    return genericType + " (Scanning...)"; 
+    if (zoneServer && zoneServer->getResourceManager()) {
+        // Just a placeholder, but logging it proves we tried
+        return genericType + "_spawn_found"; 
+    }
+    return genericType;
 }
 
 void SimPlayerController::goToResource(const String& resourceName) {
     if (agent == nullptr) return;
-
-    targetResource = resourceName;
 
     agent->setHomeLocation(agent->getPositionX(), agent->getPositionZ(), agent->getPositionY());
     agent->stopWaiting();
@@ -77,12 +147,10 @@ void SimPlayerController::goToResource(const String& resourceName) {
     Zone* zone = agent->getZone();
     if (zone == nullptr) return;
 
-    String realName = findActualResourceSpawn(resourceName);
     Vector3 currentPos = agent->getWorldPosition();
 
-    // --- RANDOM SCOUTING ---
-    // 100m - 200m range
-    int distance = 100 + System::random(100); 
+    // Random Scout Logic
+    int distance = 100 + System::random(200); 
     int angle = System::random(360);
     
     float rads = angle * (M_PI / 180.0f);
@@ -91,13 +159,18 @@ void SimPlayerController::goToResource(const String& resourceName) {
 
     float targetX = currentPos.getX() + offsetX;
     float targetY = currentPos.getY() + offsetY; 
-    
-    // Lift target slightly +1.0m
     float targetZ = zone->getHeight(targetX, targetY) + 1.0f; 
 
+    // LOGGING THE MATH
     if (retryCount == 0) {
-        Logger::console.info("SimPlayer: Searching for [" + realName + "]...", true);
+        Logger::console.info("SimPlayer: Scouting Math -> Dist: " + String::valueOf(distance) + "m / Angle: " + String::valueOf(angle), true);
+        Logger::console.info("SimPlayer: Destination -> " + String::valueOf(targetX) + ", " + String::valueOf(targetY), true);
     }
+
+    // Save Destination
+    destination.setX(targetX);
+    destination.setY(targetY);
+    destination.setZ(targetZ);
 
     Vector3 targetPos(targetX, targetY, targetZ);
 
@@ -115,94 +188,132 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         return;
     }
     
-    // If path is null, it's a hard failure
     if (path == nullptr || path->size() == 0) {
+        Logger::console.info("SimPlayer: Path was NULL/Empty.", true);
         if (path) delete path;
         onPathFailed();
         return;
     }
 
-    // --- WILDERNESS LOGIC ---
-    // If path size is 2, it is a "Straight Line" (Recast failed or no NavMesh).
-    // In the previous version, we rejected this. 
-    // NOW, we accept it blindly because we removed the Raycast check.
-    // This allows movement in the desert.
     if (path->size() == 2) {
-        Logger::console.info("SimPlayer: NavMesh missing (Wilderness). Attempting blind walk.", true);
+        Logger::console.info("SimPlayer: Wilderness blind walk detected (Path Size 2).", true);
+    } else {
+        Logger::console.info("SimPlayer: NavMesh path found (Path Size " + String::valueOf(path->size()) + ").", true);
     }
 
     retryCount = 0;
     state = MOVING;
 
-    // Logging
+    // Update dest to match path end
     if (path->size() > 0) {
-        Vector3 firstPt = path->get(0).getPoint();
         Vector3 endPt = path->get(path->size() - 1).getPoint();
-        
-        Logger::console.info("------------------------------------------------", true);
-        Logger::console.info("PATH CONFIRMED:", true);
-        Logger::console.info("Nodes: " + String::valueOf(path->size()), true);
-        Logger::console.info("------------------------------------------------", true);
+        destination = endPt;
     }
 
-    // 1. Lobotomy
+    // AI Reset
     agent->setFollowObject(nullptr);
     agent->setWatchObject(nullptr);
     agent->setTargetObject(nullptr);
     agent->clearCombatState(true);
     agent->setMovementState(AiAgent::OBLIVIOUS);
-
-    // 2. Load Path
     agent->clearPatrolPoints();
 
     for (int i = 0; i < path->size(); ++i) {
         WorldCoordinates wc = path->get(i);
         Vector3 point = wc.getPoint();
-        
         PatrolPoint pp;
         pp.setPosition(point.getX(), point.getZ(), point.getY());
         agent->addPatrolPoint(pp);
     }
 
-    // 3. Anti-Leash
     if (path->size() > 0) {
         WorldCoordinates lastWc = path->get(path->size() - 1);
         Vector3 lastPt = lastWc.getPoint();
         agent->setHomeLocation(lastPt.getX(), lastPt.getZ(), lastPt.getY());
     }
 
-    // 4. Force Run
     float runSpeed = agent->getRunSpeed();
     if (runSpeed < 5.0f) runSpeed = 6.0f;
     agent->setRunSpeed(runSpeed);
 
-    // 5. Jumpstart
     if (path->size() > 0) {
         PatrolPoint firstPP = agent->getNextPosition(); 
         agent->setNextStepPosition(firstPP.getPositionX(), firstPP.getPositionZ(), firstPP.getPositionY(), firstPP.getCell());
     }
 
-    // 6. Activate
     agent->setMovementState(AiAgent::PATROLLING);
     agent->activateAiBehavior(true); 
     
     delete path;
+
+    // Start checking arrival
+    Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
+    task->schedule(1000);
 }
 
 void SimPlayerController::onPathFailed() {
     state = IDLE;
-    
     if (retryCount < 10) {
         retryCount++;
-        Logger::console.info("Path calculation failed. Retrying attempt " + String::valueOf(retryCount) + "...", true);
+        Logger::console.info("SimPlayer: Path failed. Retrying (" + String::valueOf(retryCount) + "/10)...", true);
         goToResource(targetResource);
     } else {
-        Logger::console.info("FAILURE: Could not find any valid path after 10 attempts.", true);
-        retryCount = 0;
+        Logger::console.info("SimPlayer: FATAL - Stuck after 10 tries. Resetting Loop.", true);
+        startSimLoop(); 
     }
 }
 
-// Helper stub for density
+// --------------------------------------------------------
+// STEP 4: ARRIVAL CHECK
+// --------------------------------------------------------
+void SimPlayerController::checkArrival() {
+    if (agent == nullptr || state != MOVING) return;
+
+    Vector3 currentPos = agent->getWorldPosition();
+    
+    float dx = currentPos.getX() - destination.getX();
+    float dy = currentPos.getY() - destination.getY();
+    float distSq = (dx*dx) + (dy*dy);
+    float dist = sqrt(distSq);
+
+    // Logging distance to ensure we are actually moving
+    Logger::console.info("SimPlayer: Distance to target -> " + String::valueOf(dist) + "m", true);
+
+    if (distSq < 25.0f) { // 5 meters
+        Logger::console.info("SimPlayer: ARRIVED at target.", true);
+        performSample();
+    } else {
+        // Keep checking
+        Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
+        task->schedule(1000);
+    }
+}
+
+// --------------------------------------------------------
+// STEP 5: SAMPLE VISUALS
+// --------------------------------------------------------
+void SimPlayerController::performSample() {
+    state = SAMPLING;
+    Logger::console.info("SimPlayer: State -> SAMPLING (15s delay)", true);
+
+    agent->clearPatrolPoints();
+    agent->setMovementState(AiAgent::OBLIVIOUS);
+    
+    agent->doAnimation("sample"); 
+    
+    Reference<SimBehaviorTask*> task = new SimBehaviorTask(this, SimBehaviorTask::FINISH_SAMPLE);
+    task->schedule(15000);
+}
+
+void SimPlayerController::finishSample() {
+    Logger::console.info("SimPlayer: Sampling finished.", true);
+    agent->doAnimation("stop_sample"); 
+    
+    // Restart
+    startSimLoop();
+}
+
+// Helper stub
 Vector3 SimPlayerController::findNearestHighDensityResource(const String& resourceClass) {
     return Vector3(0,0,0);
 }

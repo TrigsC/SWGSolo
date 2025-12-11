@@ -30,7 +30,7 @@ public:
             controllers.put(oid, ctrl);
             
             // Trigger the logic immediately
-            ctrl->goToResource("Iron");
+            ctrl->startSimLoop();
         }
     }
 };
