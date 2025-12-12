@@ -198,11 +198,19 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
 
     // Give ONE destination (PatrolPoint ctor sets reached=false)
-    agent->setMovementState(AiAgent::PATROLLING);
-    agent->setNextPosition(destination.getX(), destination.getZ(), destination.getY(), nullptr);
+    // Ensure patrol queue has at least 1 valid point
+    agent->clearPatrolPoints();
+    agent->clearSavedPatrolPoints();
+    agent->stopWaiting();
 
-    agent->setPosture(CreaturePosture::UPRIGHT, true);
-    agent->setRunSpeed(5.25f);
+    // IMPORTANT: ctor sets reached=false; the default ctor often leaves reached=true
+    PatrolPoint pp(destination.getX(), destination.getZ(), destination.getY(), nullptr);
+    agent->addPatrolPoint(pp);
+
+    // Optional: keep the “run” intent (safe to leave in)
+    agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
+
+    agent->setMovementState(AiAgent::PATROLLING);
     agent->activateAiBehavior(true);
 
     delete path;
@@ -266,6 +274,8 @@ void SimPlayerController::onPathFailed() {
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
     if (state != MOVING) return;
+    // Keep it running (BT may fall back to walk)
+    agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
     if (agent->isWaiting()) {
         agent->stopWaiting();
     }
@@ -307,6 +317,7 @@ void SimPlayerController::checkArrival() {
              if (stuckWatchdogCount % 5 == 0) { // Log sparingly
                 Logger::console.info("SimPlayer: Lazy Bot detected. Poking...", true);
                 agent->setMovementState(AiAgent::PATROLLING);
+                Logger::console.info("SimPlayer: patrolPoints=" + String::valueOf(agent->getPatrolPointSize()), true);
                 agent->activateAiBehavior(true);
              }
         }
