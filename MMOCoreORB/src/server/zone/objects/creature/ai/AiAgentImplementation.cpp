@@ -4813,9 +4813,6 @@ void AiAgentImplementation::activateAiBehavior(bool reschedule) {
 	ZoneServer* zoneServer = getZoneServer();
 
 	if ((!alwaysActive && numberOfPlayersInRange.get() <= 0 && getFollowObject().get() == nullptr && !isRetreating()) || zoneServer == nullptr || zoneServer->isServerLoading() || zoneServer->isServerShuttingDown()) {
-		Logger::console.info("AI: simAlwaysActive=" + String::valueOf(peekBlackboard("simAlwaysActive")) +
-    		" playersInRange=" + String::valueOf(numberOfPlayersInRange.get()) +
-    		" alwaysActive=" + String::valueOf(alwaysActive), true);
 		cancelBehaviorEvent();
 		return;
 	}
