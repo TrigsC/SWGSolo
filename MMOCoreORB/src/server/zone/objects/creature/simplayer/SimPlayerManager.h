@@ -22,6 +22,7 @@ public:
 
         if (controllers.contains(oid)) {
             info("Stopping SimPlayer for agent " + String::valueOf(oid), true);
+            agent->eraseBlackboard("simAlwaysActive");
             controllers.drop(oid);
             agent->clearPatrolPoints();
             agent->clearSavedPatrolPoints();
@@ -30,6 +31,9 @@ public:
             return;
         } else {
             info("Starting SimPlayer for agent " + String::valueOf(oid), true);
+            // Starting SimPlayer...
+            agent->writeBlackboard("simAlwaysActive", true);
+            agent->setDespawnOnNoPlayerInRange(false); // optional but recommended
             Reference<SimPlayerController*> ctrl = new SimPlayerController(agent);
             controllers.put(oid, ctrl);
             
