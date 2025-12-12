@@ -2728,8 +2728,24 @@ int AiAgentImplementation::handleObjectMenuSelect(CreatureObject* player, byte s
             // If you right-click -> Inspect, this code runs.
             if (selectedID == RadialOptions::EXAMINE) {
                 player->sendSystemMessage("admin: Toggling SimPlayer AI...");
-                SimPlayerManager::instance()->toggleBot(_this.get());
-                return 0; // Stop the normal Inspect window from opening
+    			SimPlayerManager::instance()->toggleBot(_this.get());
+
+    			// Mark as bot (prefer objvar so it survives respawn/template reload)
+    			setObjVar("simplayer_bot", 1);
+
+    			// Prevent auto-despawn-by-no-players
+    			setDespawnOnNoPlayerInRange(false);
+
+    			// Cancel any already scheduled despawn mechanisms
+    			Reference<DespawnCreatureTask*> pending = getPendingTask("despawn").castTo<DespawnCreatureTask*>();
+    			if (pending != nullptr) pending->cancel();
+
+    			if (despawnEvent != nullptr && despawnEvent->isScheduled()) {
+    			    despawnEvent->cancel();
+    			    despawnEvent = nullptr;
+    			}
+
+    			return 0;
             }
         }
     }
@@ -2812,6 +2828,10 @@ bool AiAgentImplementation::validateStateAttack(CreatureObject* target, unsigned
 }
 
 void AiAgentImplementation::setDespawnOnNoPlayerInRange(bool val) {
+	if (isSimPlayerBot()) {
+        despawnOnNoPlayerInRange = false;
+        return;
+    }
 	if (despawnOnNoPlayerInRange == val)
 		return;
 
@@ -3344,8 +3364,14 @@ void AiAgentImplementation::notifyDespawn(Zone* zone) {
 	//info(true) << "ID: " << getObjectID() << " Reference Count: " << getReferenceCount();
 }
 
+bool AiAgentImplementation::isSimPlayerBot() const {
+    return hasObjVar("simplayer_bot"); // or read blackboard/bit/etc
+}
+
 void AiAgentImplementation::scheduleDespawn(int timeToDespawn, bool force) {
 	Reference<DespawnCreatureTask*> despawn = getPendingTask("despawn").castTo<DespawnCreatureTask*>();
+	if (!force && isSimPlayerBot())
+        return;
 
 	if (!force && despawn != nullptr)
 		return;
@@ -3409,7 +3435,7 @@ void AiAgentImplementation::notifyDissapear(TreeEntry* entry) {
 			}
 
 			if (newValue == 0) {
-				if (despawnOnNoPlayerInRange && (despawnEvent == nullptr) && !isPet()) {
+				if (!isSimPlayerBot() && despawnOnNoPlayerInRange && (despawnEvent == nullptr) && !isPet()) {
 					despawnEvent = new DespawnCreatureOnPlayerDissappear(asAiAgent());
 					despawnEvent->schedule(30000);
 				}
@@ -4757,6 +4783,14 @@ bool AiAgentImplementation::isCamouflaged(CreatureObject* creature) {
 	return success;
 }
 
+bool AiAgentImplementation::isAlwaysActive() const {
+    // If you have a member:
+    if (simAlwaysActive) return true;
+
+    // If you store it as objvar:
+    return hasObjVar("simAlwaysActive"); // or getObjVar(...) == 1
+}
+
 void AiAgentImplementation::activateAiBehavior(bool reschedule) {
 	if (getZoneUnsafe() == nullptr || !(getOptionsBitmask() & OptionBitmask::AIENABLED))
 		return;
@@ -4767,13 +4801,19 @@ void AiAgentImplementation::activateAiBehavior(bool reschedule) {
 	bool alwaysActive = false;
 #endif // DEBUG_AI
 
-	if (peekBlackboard("simAlwaysActive") && readBlackboard("simAlwaysActive") == true) {
-	    alwaysActive = true;
+	if (peekBlackboard("simAlwaysActive")) {
+    	auto v = readBlackboard("simAlwaysActive");
+    	if (v == true || v == 1 || v == "true" || v == "1") {
+    	    alwaysActive = true;
+    	}
 	}
 
 	ZoneServer* zoneServer = getZoneServer();
 
 	if ((!alwaysActive && numberOfPlayersInRange.get() <= 0 && getFollowObject().get() == nullptr && !isRetreating()) || zoneServer == nullptr || zoneServer->isServerLoading() || zoneServer->isServerShuttingDown()) {
+		Logger::console.info("AI: simAlwaysActive=" + String::valueOf(peekBlackboard("simAlwaysActive")) +
+    		" playersInRange=" + String::valueOf(numberOfPlayersInRange.get()) +
+    		" alwaysActive=" + String::valueOf(alwaysActive), true);
 		cancelBehaviorEvent();
 		return;
 	}

@@ -316,6 +316,7 @@ void SimPlayerController::checkArrival() {
              // No teleporting. No broadcasting. Just state enforcement.
              if (stuckWatchdogCount % 5 == 0) { // Log sparingly
                 Logger::console.info("SimPlayer: Lazy Bot detected. Poking...", true);
+                agent->stopWaiting();
                 agent->setMovementState(AiAgent::PATROLLING);
                 Logger::console.info("SimPlayer: patrolPoints=" + String::valueOf(agent->getPatrolPointSize()), true);
                 agent->activateAiBehavior(true);
