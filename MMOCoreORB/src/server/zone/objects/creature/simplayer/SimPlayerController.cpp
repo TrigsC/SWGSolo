@@ -130,27 +130,43 @@ void SimPlayerController::goToResource(const String& resourceName) {
 
     Vector3 currentPos = agent->getWorldPosition();
     
-    // Scout 100-200m
-    int distance = 100 + System::random(100); 
-    int angle = System::random(360);
-    float rads = angle * (M_PI / 180.0f);
-    
-    float targetX = currentPos.getX() + (distance * cos(rads));
-    float targetY = currentPos.getY() + (distance * sin(rads));
-    float targetZ = zone->getHeight(targetX, targetY) + 1.0f; 
+    Vector3 targetPos;
+    if (!pickDestinationInNavMesh(zone, currentPos, targetPos)) {
+        // fallback: your old method
+        int distance = 100 + System::random(100);
+        int angle = System::random(360);
+        float rads = angle * (M_PI / 180.0f);
 
-    destination.setX(targetX);
-    destination.setY(targetY);
-    destination.setZ(targetZ);
+        float targetX = currentPos.getX() + (distance * cos(rads));
+        float targetY = currentPos.getY() + (distance * sin(rads));
+        float targetZ = zone->getHeight(targetX, targetY) + 1.0f;
 
-    Vector3 targetPos(targetX, targetY, targetZ);
+        targetPos = Vector3(targetX, targetY, targetZ);
+    }
 
-    state = CALCULATING_PATH;
+    destination = targetPos;
     WorldCoordinates startCoord(agent);
-    WorldCoordinates endCoord(targetPos, nullptr); 
+    WorldCoordinates endCoord(targetPos, nullptr);
+
 
     Reference<FindResourcePathTask*> task = new FindResourcePathTask(this, startCoord, endCoord, zone);
     task->execute(); 
+}
+
+bool SimPlayerController::pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out) {
+    if (zone == nullptr || agent == nullptr) return false;
+    if (!agent->isInNavMesh()) return false;
+
+    int distance = 100 + System::random(100);
+    Sphere area(currentPos, (float)distance);
+
+    Vector3 result;
+    if (PathFinderManager::instance()->getSpawnPointInArea(area, zone, result, true)) {
+        out = result;
+        return true;
+    }
+
+    return false;
 }
 
 void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
@@ -166,51 +182,79 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     }
 
     Logger::console.info("SimPlayer: Path Loaded (" + String::valueOf(path->size()) + " nodes). Using Native Engine.", true);
+    // Store path in controller
+    simPath.removeAll();
+    simPathIndex = 0;
 
-    // 1. BRAIN WIPE
+    for (int i = 0; i < path->size(); ++i) {
+        simPath.add(path->get(i));
+    }
+
+    // Update final destination from last node
+    destination = simPath.get(simPath.size() - 1).getPoint();
+
+    // Reset AI state
     agent->setFollowObject(nullptr);
     agent->setWatchObject(nullptr);
     agent->setTargetObject(nullptr);
     agent->clearCombatState(true);
+    agent->clearPatrolPoints();
+    agent->clearSavedPatrolPoints();
     agent->setMovementState(AiAgent::OBLIVIOUS);
-    
-    // 2. LOAD PATH (Bulk)
-    agent->clearPatrolPoints(); 
-    
-    // We load ALL points into the agent. The engine handles the curves.
-    for (int i = 0; i < path->size(); ++i) {
-        WorldCoordinates wc = path->get(i);
-        Vector3 point = wc.getPoint();
-        PatrolPoint pp;
-        pp.setPosition(point.getX(), point.getZ(), point.getY());
-        agent->addPatrolPoint(pp);
-    }
 
-    // 3. SET HOME TO DESTINATION (Critical for Artisan)
-    // This tricks the lazy AI into thinking it's "lost" and needs to go "home" (which is our goal)
-    if (path->size() > 0) {
-        Vector3 endPt = path->get(path->size() - 1).getPoint();
-        agent->setHomeLocation(endPt.getX(), endPt.getZ(), endPt.getY());
-    }
+    // Queue only first batch (<= 18 points)
+    queueMorePathNodes();
 
-    // 4. SPEED
-    if (agent->getPosture() != CreaturePosture::UPRIGHT) {
-        agent->setPosture(CreaturePosture::UPRIGHT, true);
-    }
-    
-    float runSpeed = 5.25f; // Standard run
-    agent->setRunSpeed(runSpeed);
-
-    // 5. ACTIVATE
-    // We rely on the native PATROLLING state.
+    // Move
+    agent->setPosture(CreaturePosture::UPRIGHT, true);
+    agent->setRunSpeed(5.25f);
     agent->setMovementState(AiAgent::PATROLLING);
-    agent->activateAiBehavior(true); 
-    
+    agent->activateAiBehavior(true);
+
     delete path;
 
     // Check less frequently (1s) to avoid lag
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
     task->schedule(1000);
+}
+
+void SimPlayerController::queueMorePathNodes() {
+    if (agent == nullptr) return;
+
+    int currentQueued = agent->getPatrolPointSize();
+    int slots = MAX_ENGINE_PATROL_POINTS - currentQueued;
+    if (slots <= 0) return;
+
+    // spacing anchor: last point we've queued (or current position)
+    Vector3 last = agent->getWorldPosition();
+    if (simPathIndex > 0) {
+        last = simPath.get(simPathIndex - 1).getPoint();
+    }
+
+    const float minSq = MIN_NODE_SPACING * MIN_NODE_SPACING;
+
+    while (slots > 0 && simPathIndex < simPath.size()) {
+        Vector3 p = simPath.get(simPathIndex).getPoint();
+
+        float dx = p.getX() - last.getX();
+        float dy = p.getY() - last.getY();
+        float d2 = (dx * dx) + (dy * dy);
+
+        // Skip tiny steps (but never skip the final point)
+        bool isFinal = (simPathIndex == simPath.size() - 1);
+        if (!isFinal && d2 < minSq) {
+            simPathIndex++;
+            continue;
+        }
+
+        PatrolPoint pp;
+        pp.setPosition(p.getX(), p.getZ(), p.getY());
+        agent->addPatrolPoint(pp);
+
+        last = p;
+        simPathIndex++;
+        slots--;
+    }
 }
 
 void SimPlayerController::onPathFailed() {
@@ -229,6 +273,11 @@ void SimPlayerController::onPathFailed() {
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
     if (state != MOVING) return;
+
+    // Keep engine fed (prevents empty queue + weird stalls)
+    if (agent->getPatrolPointSize() < 5 && simPathIndex < simPath.size()) {
+        queueMorePathNodes();
+    }
 
     Vector3 currentPos = agent->getWorldPosition();
     
@@ -254,14 +303,16 @@ void SimPlayerController::checkArrival() {
         
         // Give it 3 seconds to think before interfering
         if (stuckWatchdogCount > 3) { 
+            if (agent->getPatrolPointSize() < 3 && simPathIndex < simPath.size()) {
+                queueMorePathNodes();
+            }
              // GENTLE REMINDER: Just tell it to Patrol again.
              // No teleporting. No broadcasting. Just state enforcement.
              if (stuckWatchdogCount % 5 == 0) { // Log sparingly
-                 Logger::console.info("SimPlayer: Lazy Bot detected. Poking...", true);
+                Logger::console.info("SimPlayer: Lazy Bot detected. Poking...", true);
+                agent->setMovementState(AiAgent::PATROLLING);
+                agent->activateAiBehavior(true);
              }
-             
-             agent->setMovementState(AiAgent::PATROLLING);
-             agent->activateAiBehavior(true);
         }
     } else {
         stuckWatchdogCount = 0; // We are moving!

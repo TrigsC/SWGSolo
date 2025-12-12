@@ -74,6 +74,13 @@ class SimPlayerController : public Object, public Logger {
     };
     SimState state;
 
+private:
+    static const int MAX_ENGINE_PATROL_POINTS = 18;   // stay under 20
+    static constexpr float MIN_NODE_SPACING = 4.0f;   // meters between queued nodes
+
+    void queueMorePathNodes();   // feed agent more patrol points
+    bool pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out);
+
 public:
     SimPlayerController(AiAgent* aiAgent);
     virtual ~SimPlayerController();

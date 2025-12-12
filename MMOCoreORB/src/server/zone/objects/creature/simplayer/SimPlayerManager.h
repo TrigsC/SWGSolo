@@ -23,7 +23,11 @@ public:
         if (controllers.contains(oid)) {
             info("Stopping SimPlayer for agent " + String::valueOf(oid), true);
             controllers.drop(oid);
-            // Optional: Reset bot state here
+            agent->clearPatrolPoints();
+            agent->clearSavedPatrolPoints();
+            agent->setMovementState(AiAgent::OBLIVIOUS);
+            agent->activateAiBehavior(true);
+            return;
         } else {
             info("Starting SimPlayer for agent " + String::valueOf(oid), true);
             Reference<SimPlayerController*> ctrl = new SimPlayerController(agent);
