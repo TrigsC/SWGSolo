@@ -14,6 +14,8 @@
 #include "server/ServerCore.h"
 #include "server/zone/ZoneServer.h"
 #include "system/lang/System.h" 
+#include "server/zone/objects/creature/ai/bt/BlackboardData.h"
+using namespace server::zone::objects::creature::ai::bt;
 
 // --------------------------------------------------------
 // Task Implementations
@@ -124,6 +126,7 @@ void SimPlayerController::goToResource(const String& resourceName) {
     // Reset Home to prevent Leashing (Important!)
     agent->setHomeLocation(agent->getPositionX(), agent->getPositionZ(), agent->getPositionY());
     agent->stopWaiting();
+    agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
     
     Zone* zone = agent->getZone();
     if (zone == nullptr) return;
@@ -176,22 +179,11 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     retryCount = 0;
     state = MOVING;
 
-    if (path->size() > 0) {
-        Vector3 endPt = path->get(path->size() - 1).getPoint();
-        destination = endPt;
-    }
+    // Final point only
+    WorldCoordinates endWC = path->get(path->size() - 1);
+    destination = endWC.getPoint(); // (x,y,z) world
 
     Logger::console.info("SimPlayer: Path Loaded (" + String::valueOf(path->size()) + " nodes). Using Native Engine.", true);
-    // Store path in controller
-    simPath.removeAll();
-    simPathIndex = 0;
-
-    for (int i = 0; i < path->size(); ++i) {
-        simPath.add(path->get(i));
-    }
-
-    // Update final destination from last node
-    destination = simPath.get(simPath.size() - 1).getPoint();
 
     // Reset AI state
     agent->setFollowObject(nullptr);
@@ -200,20 +192,21 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     agent->clearCombatState(true);
     agent->clearPatrolPoints();
     agent->clearSavedPatrolPoints();
-    agent->setMovementState(AiAgent::OBLIVIOUS);
+    agent->stopWaiting();
 
-    // Queue only first batch (<= 18 points)
-    queueMorePathNodes();
+    // Force RUN (BT defaults to WALK if moveMode isn't set)
+    agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
 
-    // Move
+    // Give ONE destination (PatrolPoint ctor sets reached=false)
+    agent->setMovementState(AiAgent::PATROLLING);
+    agent->setNextPosition(destination.getX(), destination.getZ(), destination.getY(), nullptr);
+
     agent->setPosture(CreaturePosture::UPRIGHT, true);
     agent->setRunSpeed(5.25f);
-    agent->setMovementState(AiAgent::PATROLLING);
     agent->activateAiBehavior(true);
 
     delete path;
 
-    // Check less frequently (1s) to avoid lag
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
     task->schedule(1000);
 }
@@ -273,6 +266,9 @@ void SimPlayerController::onPathFailed() {
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
     if (state != MOVING) return;
+    if (agent->isWaiting()) {
+        agent->stopWaiting();
+    }
 
     // Keep engine fed (prevents empty queue + weird stalls)
     if (agent->getPatrolPointSize() < 5 && simPathIndex < simPath.size()) {
