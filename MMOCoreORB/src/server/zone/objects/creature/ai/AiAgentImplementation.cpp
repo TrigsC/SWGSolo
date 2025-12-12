@@ -3380,9 +3380,6 @@ void AiAgentImplementation::notifyDespawn(Zone* zone) {
 	//info(true) << "ID: " << getObjectID() << " Reference Count: " << getReferenceCount();
 }
 
-bool AiAgentImplementation::isSimPlayerBot() const {
-    return hasObjVar("simplayer_bot"); // or read blackboard/bit/etc
-}
 
 void AiAgentImplementation::scheduleDespawn(int timeToDespawn, bool force) {
 	Reference<DespawnCreatureTask*> despawn = getPendingTask("despawn").castTo<DespawnCreatureTask*>();
@@ -4797,14 +4794,6 @@ bool AiAgentImplementation::isCamouflaged(CreatureObject* creature) {
 	camoTask->execute();
 
 	return success;
-}
-
-bool AiAgentImplementation::isAlwaysActive() const {
-    // If you have a member:
-    if (simAlwaysActive) return true;
-
-    // If you store it as objvar:
-    return hasObjVar("simAlwaysActive"); // or getObjVar(...) == 1
 }
 
 void AiAgentImplementation::activateAiBehavior(bool reschedule) {
