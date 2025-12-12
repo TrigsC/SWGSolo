@@ -2730,9 +2730,6 @@ int AiAgentImplementation::handleObjectMenuSelect(CreatureObject* player, byte s
                 player->sendSystemMessage("admin: Toggling SimPlayer AI...");
     			SimPlayerManager::instance()->toggleBot(_this.get());
 
-    			// Mark as bot (prefer objvar so it survives respawn/template reload)
-    			setObjVar("simplayer_bot", 1);
-
     			// Prevent auto-despawn-by-no-players
     			setDespawnOnNoPlayerInRange(false);
 
@@ -2828,7 +2825,7 @@ bool AiAgentImplementation::validateStateAttack(CreatureObject* target, unsigned
 }
 
 void AiAgentImplementation::setDespawnOnNoPlayerInRange(bool val) {
-	if (isSimPlayerBot()) {
+	if (getSimAlwaysActive()) {
         despawnOnNoPlayerInRange = false;
         return;
     }
@@ -3383,7 +3380,7 @@ void AiAgentImplementation::notifyDespawn(Zone* zone) {
 
 void AiAgentImplementation::scheduleDespawn(int timeToDespawn, bool force) {
 	Reference<DespawnCreatureTask*> despawn = getPendingTask("despawn").castTo<DespawnCreatureTask*>();
-	if (!force && isSimPlayerBot())
+	if (!force && getSimAlwaysActive())
         return;
 
 	if (!force && despawn != nullptr)
@@ -3448,7 +3445,7 @@ void AiAgentImplementation::notifyDissapear(TreeEntry* entry) {
 			}
 
 			if (newValue == 0) {
-				if (!isSimPlayerBot() && despawnOnNoPlayerInRange && (despawnEvent == nullptr) && !isPet()) {
+				if (!getSimAlwaysActive() && despawnOnNoPlayerInRange && (despawnEvent == nullptr) && !isPet()) {
 					despawnEvent = new DespawnCreatureOnPlayerDissappear(asAiAgent());
 					despawnEvent->schedule(30000);
 				}
