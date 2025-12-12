@@ -1204,6 +1204,19 @@ class AiAgent extends CreatureObject {
 		return despawnOnNoPlayerInRange;
 	}
 
+	private boolean simPlayerBot = false;
+	private boolean simAlwaysActive = false;
+	
+	@local
+	public abstract native boolean getSimPlayerBot();
+	@local
+	public abstract native void setSimPlayerBot(boolean v);
+	
+	@local
+	public abstract native boolean getSimAlwaysActive();
+	@local
+	public abstract native void setSimAlwaysActive(boolean v);
+
 	@mock
 	@dirty
 	public abstract int getNumberOfPlayersInRange() {

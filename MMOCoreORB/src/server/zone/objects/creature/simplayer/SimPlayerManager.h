@@ -33,6 +33,8 @@ public:
             info("Starting SimPlayer for agent " + String::valueOf(oid), true);
             // Starting SimPlayer...
             agent->writeBlackboard("simAlwaysActive", true);
+            agent->setSimAlwaysActive(true);
+            agent->setSimPlayerBot(true);
             agent->setDespawnOnNoPlayerInRange(false); // optional but recommended
             Reference<SimPlayerController*> ctrl = new SimPlayerController(agent);
             controllers.put(oid, ctrl);

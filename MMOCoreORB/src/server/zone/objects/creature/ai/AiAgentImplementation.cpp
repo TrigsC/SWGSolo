@@ -2847,6 +2847,22 @@ void AiAgentImplementation::setDespawnOnNoPlayerInRange(bool val) {
 	}
 }
 
+bool AiAgentImplementation::getSimPlayerBot() {
+    return simPlayerBot;
+}
+
+void AiAgentImplementation::setSimPlayerBot(bool v) {
+    simPlayerBot = v;
+}
+
+bool AiAgentImplementation::getSimAlwaysActive() {
+    return simAlwaysActive;
+}
+
+void AiAgentImplementation::setSimAlwaysActive(bool v) {
+    simAlwaysActive = v;
+}
+
 void AiAgentImplementation::runAway(CreatureObject* target, float range, bool random, bool setTarget) {
 	if (getParent().get() != nullptr || getParentID() > 0 || target == nullptr || target->getParent().get() != nullptr || getZoneUnsafe() == nullptr) {
 		return;
