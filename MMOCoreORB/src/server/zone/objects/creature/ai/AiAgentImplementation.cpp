@@ -4809,6 +4809,9 @@ void AiAgentImplementation::activateAiBehavior(bool reschedule) {
     	    alwaysActive = true;
     	}
 	}
+	if (isSimAlwaysActive() || isSimPlayerBot()) {
+    	alwaysActive = true;
+	}
 
 	ZoneServer* zoneServer = getZoneServer();
 
