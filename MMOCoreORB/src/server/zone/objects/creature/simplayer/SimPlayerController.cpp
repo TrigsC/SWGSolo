@@ -179,9 +179,19 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     retryCount = 0;
     state = MOVING;
 
-    // Final point only
-    WorldCoordinates endWC = path->get(path->size() - 1);
-    destination = endWC.getPoint(); // (x,y,z) world
+    Zone* zone = agent->getZone();
+    if (zone == nullptr) { delete path; return; }
+
+    // --- NEW: store engine path + reset index ---
+    simPath.removeAll();
+    simPathIndex = 0;
+
+    for (int i = 0; i < path->size(); ++i) {
+        simPath.add(path->get(i));
+    }
+
+    // Destination = last node
+    destination = simPath.get(simPath.size() - 1).getPoint();
 
     Logger::console.info("SimPlayer: Path Loaded (" + String::valueOf(path->size()) + " nodes). Using Native Engine.", true);
 
@@ -194,21 +204,19 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     agent->clearSavedPatrolPoints();
     agent->stopWaiting();
 
-    // Force RUN (BT defaults to WALK if moveMode isn't set)
+    // Force RUN
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
 
-    // Give ONE destination (PatrolPoint ctor sets reached=false)
-    // Ensure patrol queue has at least 1 valid point
-    agent->clearPatrolPoints();
-    agent->clearSavedPatrolPoints();
-    agent->stopWaiting();
+    // --- NEW: queue multiple nodes into engine patrol queue ---
+    queueMorePathNodes();
 
-    // IMPORTANT: ctor sets reached=false; the default ctor often leaves reached=true
-    PatrolPoint pp(destination.getX(), destination.getZ(), destination.getY(), nullptr);
-    agent->addPatrolPoint(pp);
-
-    // Optional: keep the “run” intent (safe to leave in)
-    agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
+    // Fallback: if we somehow queued nothing, at least queue final point with corrected height
+    if (agent->getPatrolPointSize() == 0) {
+        Vector3 d = destination;
+        d.setZ(zone->getHeight(d.getX(), d.getY()) + 1.0f);
+        PatrolPoint pp(d.getX(), d.getZ(), d.getY(), nullptr); // (x,z,y)
+        agent->addPatrolPoint(pp);
+    }
 
     agent->setMovementState(AiAgent::PATROLLING);
     agent->activateAiBehavior(true);
@@ -241,8 +249,21 @@ void SimPlayerController::queueMorePathNodes() {
     }
 
     const float minSq = MIN_NODE_SPACING * MIN_NODE_SPACING;
+
     while (slots > 0 && simPathIndex < pathSize) {
         Vector3 p = simPath.get(simPathIndex).getPoint();
+
+        // If the first node is basically "here", skip it (prevents 0-move stalls)
+        if (simPathIndex == 0) {
+            Vector3 cur = agent->getWorldPosition();
+            float dx0 = p.getX() - cur.getX();
+            float dy0 = p.getY() - cur.getY();
+            if ((dx0*dx0 + dy0*dy0) < 1.0f) { // within ~1 meter
+                simPathIndex++;
+                last = cur;       // keep anchor sane
+                continue;
+            }
+        }
 
         float dx = p.getX() - last.getX();
         float dy = p.getY() - last.getY();
