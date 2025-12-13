@@ -312,10 +312,10 @@ void SimPlayerController::checkArrival() {
         queueMorePathNodes();
     }
 
-    if (agent->getPatrolPointSize() > 0 && agent->getMovementState() != AiAgent::PATROLLING) {
-        agent->setMovementState(AiAgent::PATROLLING);
-        agent->activateAiBehavior(true);
-    }
+    //if (agent->getPatrolPointSize() > 0 && agent->getMovementState() != AiAgent::PATROLLING) {
+    //    agent->setMovementState(AiAgent::PATROLLING);
+    //    agent->activateAiBehavior(true);
+    //}
 
     Vector3 currentPos = agent->getWorldPosition();
     
