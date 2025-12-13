@@ -4809,7 +4809,7 @@ void AiAgentImplementation::activateAiBehavior(bool reschedule) {
     	    alwaysActive = true;
     	}
 	}
-	if (isSimAlwaysActive() || isSimPlayerBot()) {
+	if (isSimAlwaysActive() || getSimPlayerBot()) {
     	alwaysActive = true;
 	}
 

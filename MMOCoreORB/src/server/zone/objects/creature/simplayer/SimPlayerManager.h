@@ -35,7 +35,8 @@ public:
             agent->writeBlackboard("simAlwaysActive", true);
             agent->setSimAlwaysActive(true);
             agent->setSimPlayerBot(true);
-            agent->setDespawnOnNoPlayerInRange(false); // optional but recommended
+            agent->setDespawnOnNoPlayerInRange(false);
+            agent->activateAiBehavior(true);
             Reference<SimPlayerController*> ctrl = new SimPlayerController(agent);
             controllers.put(oid, ctrl);
             
