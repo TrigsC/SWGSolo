@@ -222,19 +222,26 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 void SimPlayerController::queueMorePathNodes() {
     if (agent == nullptr) return;
 
+    if (simPathIndex < 0) {
+        Logger::console.info() << "queueMorePathNodes: simPathIndex was negative (" << simPathIndex << "), resetting to 0";
+        simPathIndex = 0;
+    }
+
+    int pathSize = simPath.size();
+    if (simPathIndex >= pathSize) return;
+
     int currentQueued = agent->getPatrolPointSize();
     int slots = MAX_ENGINE_PATROL_POINTS - currentQueued;
     if (slots <= 0) return;
 
     // spacing anchor: last point we've queued (or current position)
     Vector3 last = agent->getWorldPosition();
-    if (simPathIndex > 0) {
+    if (simPathIndex > 0 && simPathIndex - 1 < pathSize) {
         last = simPath.get(simPathIndex - 1).getPoint();
     }
 
     const float minSq = MIN_NODE_SPACING * MIN_NODE_SPACING;
-
-    while (slots > 0 && simPathIndex < simPath.size()) {
+    while (slots > 0 && simPathIndex < pathSize) {
         Vector3 p = simPath.get(simPathIndex).getPoint();
 
         float dx = p.getX() - last.getX();
