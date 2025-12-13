@@ -276,8 +276,7 @@ void SimPlayerController::queueMorePathNodes() {
             continue;
         }
 
-        PatrolPoint pp;
-        pp.setPosition(p.getX(), p.getZ(), p.getY());
+        PatrolPoint pp(p.getX(), p.getZ(), p.getY(), nullptr);
         agent->addPatrolPoint(pp);
 
         last = p;
@@ -311,6 +310,11 @@ void SimPlayerController::checkArrival() {
     // Keep engine fed (prevents empty queue + weird stalls)
     if (agent->getPatrolPointSize() < 5 && simPathIndex < simPath.size()) {
         queueMorePathNodes();
+    }
+
+    if (agent->getPatrolPointSize() > 0 && agent->getMovementState() != AiAgent::PATROLLING) {
+        agent->setMovementState(AiAgent::PATROLLING);
+        agent->activateAiBehavior(true);
     }
 
     Vector3 currentPos = agent->getWorldPosition();
