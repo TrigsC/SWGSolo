@@ -20,12 +20,7 @@ SimPlayerManager::~SimPlayerManager() {
 
 void SimPlayerManager::initialize() {
     info("Initializing SimPlayer Manager...", true);
-
-    // ---------------------------------------------------------
-    // POPULATION CONTROL
-    // ---------------------------------------------------------
-    
-    // Spawn the Jedi (now with a working brain!)
+    // Spawn test
     spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
 }
 
@@ -42,18 +37,16 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     CreatureManager* creatureManager = zone->getCreatureManager();
     if (creatureManager == nullptr) return;
 
-    // 1. GET THE LUA TEMPLATE
-    uint32 luaCRC = templateName.hashCode();
-    CreatureTemplate* tmpl = CreatureTemplateManager::instance()->getTemplate(luaCRC);
+    uint32 templateCRC = templateName.hashCode();
+    CreatureTemplate* tmpl = CreatureTemplateManager::instance()->getTemplate(templateCRC);
     
     if (tmpl == nullptr) {
-        error("Spawn Failed: Template '" + templateName + "' is not loaded in CreatureTemplateManager.");
+        error("Spawn Failed: Template '" + templateName + "' is not loaded.");
         return;
     }
 
-    // 2. EXTRACT THE REAL IFF PATH
     if (tmpl->getTemplates().size() == 0) {
-        error("Spawn Failed: Template '" + templateName + "' has no IFF files defined.");
+        error("Spawn Failed: Template '" + templateName + "' has no IFF files.");
         return;
     }
     
@@ -64,7 +57,6 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
 
     float z = zone->getHeight(x, y);
 
-    // 3. SPAWN
     CreatureObject* creature = creatureManager->spawnCreature(iffCRC, x, z, y, 0);
 
     if (creature == nullptr) {
@@ -80,21 +72,23 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     AiAgent* agent = creature->asAiAgent();
     Locker lock(agent);
 
-    // 4. APPLY TEMPLATE & STATS
     agent->loadTemplateData(tmpl);
 
-    // Force Speed & Stats
     agent->setRunSpeed(6.0f); 
     for (int i=0; i<9; ++i) {
         agent->setMaxHAM(i, 5000, true);
         agent->setHAM(i, 5000);
     }
 
-    // 5. PREVENT LEASHING
     agent->setHomeLocation(x, z, y, nullptr);
-    agent->setCreatureBitmask(agent->getCreatureBitmask() & ~ObjectFlag::PACK & ~ObjectFlag::HERD);
+    
+    // --- PACIFIST MODE ---
+    // Remove behaviors that might block movement logic
+    agent->setCreatureBitmask(agent->getCreatureBitmask() & ~ObjectFlag::PACK & ~ObjectFlag::HERD & ~ObjectFlag::KILLER & ~ObjectFlag::STALKER);
+    
+    // Also remove Aggressive/Enemy flags from PvP mask so it doesn't enter "combat scanning" mode
+    agent->setPvpStatusBitmask(agent->getPvpStatusBitmask() & ~ObjectFlag::AGGRESSIVE & ~ObjectFlag::ENEMY);
 
-    // 6. ATTACH SIMPLAYER
     toggleBot(agent);
 }
 
@@ -111,21 +105,19 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         agent->clearPatrolPoints();
         agent->clearSavedPatrolPoints();
         agent->setMovementState(AiAgent::OBLIVIOUS);
-        
-        // Restore original brain (Optional, but good practice)
-        // If we knew the original map, we'd set it back here.
-        // For now, we just reactivate behavior.
         agent->activateAiBehavior(true);
         return;
     } else {
         info("Starting SimPlayer for agent " + String::valueOf(oid), true);
         
         // --- BRAIN TRANSPLANT ---
-        // Override the 'enclaveSentinel' map with 'default'.
-        // This gives the bot the standard logic needed to process Patrol points.
+        // Force 'default' logic
         agent->setCustomAiMap(String("default").hashCode());
-        agent->setAITemplate(); // Reloads the tree based on the new map
+        agent->setAITemplate(); 
         
+        // LOG IT
+        info("BRAIN TRANSPLANT: Set map to 'default' and reloaded tree.", true);
+
         agent->writeBlackboard("simAlwaysActive", true);
         agent->setSimAlwaysActive(true);
         agent->setSimPlayerBot(true);
