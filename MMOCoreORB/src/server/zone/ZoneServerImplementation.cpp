@@ -41,6 +41,7 @@
 #include "server/zone/managers/frs/FrsManager.h"
 #include "server/chat/ChatManager.h"
 #include "server/zone/managers/ship/ShipManager.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
 
 #include "server/zone/ZoneProcessServer.h"
 #include "ZonePacketHandler.h"
