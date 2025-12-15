@@ -6,8 +6,8 @@
 #include "server/zone/ZoneServer.h"
 #include "server/ServerCore.h"
 #include "server/zone/managers/creature/CreatureManager.h"
-#include "server/zone/managers/creature/CreatureTemplateManager.h"
-#include "server/zone/objects/creature/ai/CreatureTemplate.h"
+#include "server/zone/managers/creature/CreatureTemplateManager.h" 
+#include "server/zone/objects/creature/ai/CreatureTemplate.h" 
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "templates/params/creature/ObjectFlag.h" 
 
@@ -25,7 +25,8 @@ void SimPlayerManager::initialize() {
     // POPULATION CONTROL
     // ---------------------------------------------------------
     
-    // Using 'light_jedi_sentinel' as the test subject since we confirmed it works via commands.
+    // Spawn the Jedi.
+    // This will now look up the correct IFF file before spawning.
     spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
 }
 
@@ -42,24 +43,32 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     CreatureManager* creatureManager = zone->getCreatureManager();
     if (creatureManager == nullptr) return;
 
-    // 1. SAFETY CHECK: Verify template exists
-    // We calculate the hash once.
-    uint32 templateCRC = templateName.hashCode();
+    // 1. GET THE LUA TEMPLATE
+    uint32 luaCRC = templateName.hashCode();
+    CreatureTemplate* tmpl = CreatureTemplateManager::instance()->getTemplate(luaCRC);
     
-    // FIX: Check if the template is actually loaded in memory
-    CreatureTemplate* tmpl = CreatureTemplateManager::instance()->getTemplate(templateCRC);
     if (tmpl == nullptr) {
-        error("Spawn Failed: Template '" + templateName + "' is NOT loaded in CreatureTemplateManager. The server does not know this NPC exists yet.");
+        error("Spawn Failed: Template '" + templateName + "' is not loaded in CreatureTemplateManager.");
         return;
     }
+
+    // 2. EXTRACT THE REAL IFF PATH
+    // The Creature Template holds a list of possible IFFs (e.g. variations). We pick the first one.
+    if (tmpl->getTemplates().size() == 0) {
+        error("Spawn Failed: Template '" + templateName + "' has no IFF files defined in its 'templates' list.");
+        return;
+    }
+    
+    String iffPath = tmpl->getTemplates().get(0);
+    uint32 iffCRC = iffPath.hashCode();
+
+    info("Spawn Info: Mapped '" + templateName + "' -> '" + iffPath + "'", true);
 
     // Find the Z (Height) at this location
     float z = zone->getHeight(x, y);
 
-    info("Attempting to spawn SimPlayer [" + templateName + "] on " + planet + " at " + String::valueOf(x) + ", " + String::valueOf(y), true);
-
-    // 2. SPAWN
-    CreatureObject* creature = creatureManager->spawnCreature(templateCRC, x, z, y, 0);
+    // 3. SPAWN USING THE IFF CRC
+    CreatureObject* creature = creatureManager->spawnCreature(iffCRC, x, z, y, 0);
 
     if (creature == nullptr) {
         error("Failed to spawn creature via CreatureManager (spawnCreature returned null).");
@@ -72,24 +81,21 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     }
 
     AiAgent* agent = creature->asAiAgent();
-
-    // 3. FORCE STATS
     Locker lock(agent);
-    
-    // Force stats so they don't walk slowly or die easily
-    agent->setRunSpeed(6.0f); 
-    for (int i=0; i<9; ++i) {
-        agent->setMaxHAM(i, 5000, true);
-        agent->setHAM(i, 5000);
-    }
 
-    // 4. PREVENT LEASHING
-    agent->setHomeLocation(x, z, y, nullptr);
+    // 4. APPLY THE LUA TEMPLATE STATS
+    // This turns the generic "human" object into a "light_jedi_sentinel" (Level 88, Lightsaber, etc.)
+    agent->loadTemplateData(tmpl);
+
+    // 5. FORCE SIMPLAYER STATS & LOGIC
+    // Force Run Speed (Player speed)
+    agent->setRunSpeed(6.0f); 
     
-    // Remove Pack/Herd behaviors to prevent interference
+    // Prevent Leashing
+    agent->setHomeLocation(x, z, y, nullptr);
     agent->setCreatureBitmask(agent->getCreatureBitmask() & ~ObjectFlag::PACK & ~ObjectFlag::HERD);
 
-    // 5. ATTACH SIMPLAYER
+    // 6. ATTACH SIMPLAYER
     toggleBot(agent);
 }
 
