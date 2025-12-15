@@ -6,9 +6,9 @@
 #include "server/zone/ZoneServer.h"
 #include "server/ServerCore.h"
 #include "server/zone/managers/creature/CreatureManager.h"
+#include "server/zone/managers/creature/CreatureTemplateManager.h" 
 #include "server/zone/objects/creature/ai/AiAgent.h"
-#include "server/zone/objects/region/CityRegion.h"
-#include "templates/params/creature/ObjectFlag.h"
+#include "templates/params/creature/ObjectFlag.h" 
 
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
@@ -22,18 +22,10 @@ void SimPlayerManager::initialize() {
 
     // ---------------------------------------------------------
     // POPULATION CONTROL
-    // Define your test spawns here.
     // ---------------------------------------------------------
     
-    // Test 1: Spawn 1 Artisan on Naboo (Theed outskirts)
-    // Coords roughly based on your log: x:4714, z:3.75, y:-4939
-    // Note: Z is Y in SWG coords usually (X, Z, Y in code vs X, Y, Z in game). 
-    // spawnSimPlayer args: Planet, X, Y (2D coordinates), Template
-    
+    // Attempting to spawn the Jedi Sentinel as a test
     spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
-
-    // Example: Spawn a Jedi nearby
-    // spawnSimPlayer("naboo", 4720.0f, -4935.0f, "light_jedi_sentinel");
 }
 
 void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, const String& templateName) {
@@ -51,54 +43,49 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
 
     // 1. SAFETY CHECK: Verify template exists
     uint32 templateCRC = templateName.hashCode();
+    
     if (CreatureTemplateManager::instance()->getTemplate(templateCRC) == nullptr) {
         error("Spawn Failed: Template '" + templateName + "' (CRC: " + String::valueOf(templateCRC) + ") is not loaded in CreatureTemplateManager.");
         return;
     }
 
-    // Find the Z (Height) at this location so they don't spawn underground
+    // Find the Z (Height) at this location
     float z = zone->getHeight(x, y);
 
-    // 1. Create the Creature
-    // We use a CRC hash of the template string if available, or just the string name logic
-    uint32 templateCRC = templateName.hashCode();
-    
     info("Attempting to spawn SimPlayer [" + templateName + "] on " + planet + " at " + String::valueOf(x) + ", " + String::valueOf(y), true);
 
+    // Use the already calculated templateCRC
     CreatureObject* creature = creatureManager->spawnCreature(templateCRC, x, z, y, 0);
 
     if (creature == nullptr) {
-        error("Failed to spawn creature with template: " + templateName);
+        error("Failed to spawn creature via CreatureManager.");
         return;
     }
 
     if (!creature->isAiAgent()) {
-        error("Spawned entity is not an AiAgent. SimPlayer requires AiAgent.");
+        error("Spawned entity is not an AiAgent.");
         return;
     }
 
     AiAgent* agent = creature->asAiAgent();
 
-    // 2. FORCE STATS (Fixing the 'Artisan walk problem')
+    // 2. FORCE STATS
     Locker lock(agent);
-
-    // Force Run Speed (Artisans are slow, make them efficient)
-    agent->setRunSpeed(6.0f); 
     
-    // Force HAM (Hitpoints) so they don't die to a stiff breeze
+    // Force stats so they don't walk slowly or die easily
+    agent->setRunSpeed(6.0f); 
     for (int i=0; i<9; ++i) {
         agent->setMaxHAM(i, 5000, true);
         agent->setHAM(i, 5000);
     }
 
-    // 3. PREVENT LEASHING & SETUP AI
-    // Set Home Location to current spot (redundant but safe)
+    // 3. PREVENT LEASHING
     agent->setHomeLocation(x, z, y, nullptr);
     
-    // Disable standard AI packs/herds to prevent interference
+    // Remove Pack/Herd behaviors to prevent interference
     agent->setCreatureBitmask(agent->getCreatureBitmask() & ~ObjectFlag::PACK & ~ObjectFlag::HERD);
 
-    // 4. ATTACH SIMPLAYER CONTROLLER
+    // 4. ATTACH SIMPLAYER
     toggleBot(agent);
 }
 
@@ -112,7 +99,6 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         agent->eraseBlackboard("simAlwaysActive");
         controllers.drop(oid);
         
-        // Reset to normal AI
         agent->clearPatrolPoints();
         agent->clearSavedPatrolPoints();
         agent->setMovementState(AiAgent::OBLIVIOUS);
@@ -121,20 +107,14 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
     } else {
         info("Starting SimPlayer for agent " + String::valueOf(oid), true);
         
-        // --- KEY FIX FOR LEASHING ---
-        // We tell the AI logic "I am a SimPlayer, do not leash me."
         agent->writeBlackboard("simAlwaysActive", true);
         agent->setSimAlwaysActive(true);
         agent->setSimPlayerBot(true);
-        
-        // Don't despawn when players leave (we want persistent simulation)
         agent->setDespawnOnNoPlayerInRange(false);
 
-        // Create and store controller
         Reference<SimPlayerController*> ctrl = new SimPlayerController(agent);
         controllers.put(oid, ctrl);
         
-        // Kickoff
         agent->activateAiBehavior(true);
         ctrl->startSimLoop();
     }
