@@ -8,6 +8,7 @@
 #include "server/zone/managers/creature/CreatureManager.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/region/CityRegion.h"
+#include "templates/params/creature/ObjectFlag.h"
 
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
@@ -88,7 +89,7 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     agent->setHomeLocation(x, z, y, nullptr);
     
     // Disable standard AI packs/herds to prevent interference
-    agent->setCreatureBitmask(agent->getCreatureBitmask() & ~Pack & ~Herd);
+    agent->setCreatureBitmask(agent->getCreatureBitmask() & ~ObjectFlag::PACK & ~ObjectFlag::HERD);
 
     // 4. ATTACH SIMPLAYER CONTROLLER
     toggleBot(agent);
