@@ -249,18 +249,19 @@ void SimPlayerController::queueMorePathNodes() {
     }
 
     const float minSq = MIN_NODE_SPACING * MIN_NODE_SPACING;
+    int addedCount = 0; // Debug counter
 
     while (slots > 0 && simPathIndex < pathSize) {
         Vector3 p = simPath.get(simPathIndex).getPoint();
 
-        // If the first node is basically "here", skip it (prevents 0-move stalls)
+        // If the first node is basically "here", skip it
         if (simPathIndex == 0) {
             Vector3 cur = agent->getWorldPosition();
             float dx0 = p.getX() - cur.getX();
             float dy0 = p.getY() - cur.getY();
-            if ((dx0*dx0 + dy0*dy0) < 1.0f) { // within ~1 meter
+            if ((dx0*dx0 + dy0*dy0) < 1.0f) { 
                 simPathIndex++;
-                last = cur;       // keep anchor sane
+                last = cur;       
                 continue;
             }
         }
@@ -271,18 +272,60 @@ void SimPlayerController::queueMorePathNodes() {
 
         // Skip tiny steps (but never skip the final point)
         bool isFinal = (simPathIndex == simPath.size() - 1);
+        
+        // LOGGING: Check why we skip or add
         if (!isFinal && d2 < minSq) {
+            // Logger::console.info("SimPlayer: Skipping node " + String::valueOf(simPathIndex) + " (Too close: " + String::valueOf(sqrt(d2)) + "m)", true);
             simPathIndex++;
             continue;
         }
 
         PatrolPoint pp(p.getX(), p.getZ(), p.getY(), nullptr);
         agent->addPatrolPoint(pp);
+        addedCount++;
 
         last = p;
         simPathIndex++;
         slots--;
     }
+    
+    if (addedCount > 0) {
+        Logger::console.info("SimPlayer: Added " + String::valueOf(addedCount) + " points to engine. Total queued: " + String::valueOf(agent->getPatrolPointSize()), true);
+    }
+    //
+    //while (slots > 0 && simPathIndex < pathSize) {
+    //    Vector3 p = simPath.get(simPathIndex).getPoint();
+//
+    //    // If the first node is basically "here", skip it (prevents 0-move stalls)
+    //    if (simPathIndex == 0) {
+    //        Vector3 cur = agent->getWorldPosition();
+    //        float dx0 = p.getX() - cur.getX();
+    //        float dy0 = p.getY() - cur.getY();
+    //        if ((dx0*dx0 + dy0*dy0) < 1.0f) { // within ~1 meter
+    //            simPathIndex++;
+    //            last = cur;       // keep anchor sane
+    //            continue;
+    //        }
+    //    }
+//
+    //    float dx = p.getX() - last.getX();
+    //    float dy = p.getY() - last.getY();
+    //    float d2 = (dx * dx) + (dy * dy);
+//
+    //    // Skip tiny steps (but never skip the final point)
+    //    bool isFinal = (simPathIndex == simPath.size() - 1);
+    //    if (!isFinal && d2 < minSq) {
+    //        simPathIndex++;
+    //        continue;
+    //    }
+//
+    //    PatrolPoint pp(p.getX(), p.getZ(), p.getY(), nullptr);
+    //    agent->addPatrolPoint(pp);
+//
+    //    last = p;
+    //    simPathIndex++;
+    //    slots--;
+    //}
 }
 
 void SimPlayerController::onPathFailed() {

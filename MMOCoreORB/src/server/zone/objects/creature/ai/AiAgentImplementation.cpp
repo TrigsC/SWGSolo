@@ -3644,7 +3644,10 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 
 	Locker locker(&targetMutex);
 
+	info("findNextPosition: Points=" + String::valueOf(getPatrolPointSize()) + " Dist=" + String::valueOf(maxDistance), true);
+
 	if (isDead() || getPatrolPointSize() <= 0)
+		info("findNextPosition: Empty Queue or Dead. Stopping.", true);
 		return false;
 
 	int posture = getPosture();
@@ -3678,6 +3681,8 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 	float endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
 	float maxSquared = Math::max(0.1f, maxDistance * maxDistance);
 
+	info("findNextPosition: DistToPoint=" + String::valueOf(sqrt(endDistanceSq)) + " MaxAllowed=" + String::valueOf(maxDistance), true);
+
 	float endDistZSq = endDistDiff.getZ() * endDistDiff.getZ();
 	endDistZSq = Math::getPrecision(endDistZSq, 2);
 
@@ -3687,6 +3692,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 
 	if (endDistanceSq <= maxSquared && fabs(endDistZSq) < (maxDistance + 1.f)) {
 		currentFoundPath = nullptr;
+		info("findNextPosition: Reached point! Popping...", true); // Add this
 
 		if (patrolPoints.size() > 0)
 			patrolPoints.remove(0);
