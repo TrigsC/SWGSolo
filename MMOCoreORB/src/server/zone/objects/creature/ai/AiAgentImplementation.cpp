@@ -4794,48 +4794,57 @@ bool AiAgentImplementation::isCamouflaged(CreatureObject* creature) {
 }
 
 void AiAgentImplementation::activateAiBehavior(bool reschedule) {
-	if (getZoneUnsafe() == nullptr || !(getOptionsBitmask() & OptionBitmask::AIENABLED))
-		return;
+    if (getZoneUnsafe() == nullptr || !(getOptionsBitmask() & OptionBitmask::AIENABLED))
+        return;
 
 #ifdef DEBUG_AI
-	bool alwaysActive = ConfigManager::instance()->getAiAgentLoadTesting();
-#else // DEBUG_AI
-	bool alwaysActive = false;
-#endif // DEBUG_AI
+    bool alwaysActive = ConfigManager::instance()->getAiAgentLoadTesting();
+#else
+    bool alwaysActive = false;
+#endif
 
-	if (peekBlackboard("simAlwaysActive")) {
-    	auto v = readBlackboard("simAlwaysActive");
-    	if (v == true || v == 1 || v == "true" || v == "1") {
-    	    alwaysActive = true;
-    	}
-	}
-	if (getSimAlwaysActive() || getSimPlayerBot()) {
-    	alwaysActive = true;
-	}
+    // ✅ Single source of truth: use your IDL flags (reliable)
+    // If this is a sim bot or forced always active, keep AI ticking even with 0 players nearby.
+    if (getSimAlwaysActive() || getSimPlayerBot() || !getDespawnOnNoPlayerInRange()) {
+        alwaysActive = true;
+    }
 
-	ZoneServer* zoneServer = getZoneServer();
+    ZoneServer* zoneServer = getZoneServer();
 
-	if ((!alwaysActive && numberOfPlayersInRange.get() <= 0 && getFollowObject().get() == nullptr && !isRetreating()) || zoneServer == nullptr || zoneServer->isServerLoading() || zoneServer->isServerShuttingDown()) {
-		cancelBehaviorEvent();
-		return;
-	}
+    // Original "no players nearby -> stop AI" gate, but now bypassed for sim bots / always-active.
+    if ((!alwaysActive && numberOfPlayersInRange.get() <= 0 && getFollowObject().get() == nullptr && !isRetreating())
+        || zoneServer == nullptr
+        || zoneServer->isServerLoading()
+        || zoneServer->isServerShuttingDown()) {
 
-	Locker locker(&behaviorEventMutex);
+#ifdef DEBUG_AI
+        info() << "activateAiBehavior CANCEL oid=" << getObjectID()
+               << " playersInRange=" << numberOfPlayersInRange.get()
+               << " follow=" << (getFollowObject().get() != nullptr)
+               << " retreat=" << isRetreating()
+               << " simAlwaysActive=" << getSimAlwaysActive()
+               << " simPlayerBot=" << getSimPlayerBot()
+               << " despawnOnNoPlayerInRange=" << getDespawnOnNoPlayerInRange()
+               << " alwaysActiveVar=" << alwaysActive;
+#endif
+        cancelBehaviorEvent();
+        return;
+    }
 
-	if (behaviorEvent == nullptr) {
-		behaviorEvent = new AiBehaviorEvent(asAiAgent());
-		behaviorEvent->schedule(Math::max(10, nextBehaviorInterval));
-	} else {
-		if (reschedule) {
-			try {
-				if (!behaviorEvent->isScheduled())
-					behaviorEvent->schedule(Math::max(10, nextBehaviorInterval));
-			} catch (IllegalArgumentException& e) {
-			}
-		}
-	}
+    Locker locker(&behaviorEventMutex);
 
-	nextBehaviorInterval = BEHAVIORINTERVAL;
+    if (behaviorEvent == nullptr) {
+        behaviorEvent = new AiBehaviorEvent(asAiAgent());
+        behaviorEvent->schedule(Math::max(10, nextBehaviorInterval));
+    } else if (reschedule) {
+        try {
+            if (!behaviorEvent->isScheduled())
+                behaviorEvent->schedule(Math::max(10, nextBehaviorInterval));
+        } catch (IllegalArgumentException& e) {
+        }
+    }
+
+    nextBehaviorInterval = BEHAVIORINTERVAL;
 }
 
 void AiAgentImplementation::cancelBehaviorEvent() {
