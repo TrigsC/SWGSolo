@@ -25,8 +25,7 @@ void SimPlayerManager::initialize() {
     // POPULATION CONTROL
     // ---------------------------------------------------------
     
-    // Spawn the Jedi.
-    // This will now look up the correct IFF file before spawning.
+    // Spawn the Jedi (now with a working brain!)
     spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
 }
 
@@ -53,9 +52,8 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     }
 
     // 2. EXTRACT THE REAL IFF PATH
-    // The Creature Template holds a list of possible IFFs (e.g. variations). We pick the first one.
     if (tmpl->getTemplates().size() == 0) {
-        error("Spawn Failed: Template '" + templateName + "' has no IFF files defined in its 'templates' list.");
+        error("Spawn Failed: Template '" + templateName + "' has no IFF files defined.");
         return;
     }
     
@@ -64,14 +62,13 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
 
     info("Spawn Info: Mapped '" + templateName + "' -> '" + iffPath + "'", true);
 
-    // Find the Z (Height) at this location
     float z = zone->getHeight(x, y);
 
-    // 3. SPAWN USING THE IFF CRC
+    // 3. SPAWN
     CreatureObject* creature = creatureManager->spawnCreature(iffCRC, x, z, y, 0);
 
     if (creature == nullptr) {
-        error("Failed to spawn creature via CreatureManager (spawnCreature returned null).");
+        error("Failed to spawn creature via CreatureManager.");
         return;
     }
 
@@ -83,15 +80,17 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     AiAgent* agent = creature->asAiAgent();
     Locker lock(agent);
 
-    // 4. APPLY THE LUA TEMPLATE STATS
-    // This turns the generic "human" object into a "light_jedi_sentinel" (Level 88, Lightsaber, etc.)
+    // 4. APPLY TEMPLATE & STATS
     agent->loadTemplateData(tmpl);
 
-    // 5. FORCE SIMPLAYER STATS & LOGIC
-    // Force Run Speed (Player speed)
+    // Force Speed & Stats
     agent->setRunSpeed(6.0f); 
-    
-    // Prevent Leashing
+    for (int i=0; i<9; ++i) {
+        agent->setMaxHAM(i, 5000, true);
+        agent->setHAM(i, 5000);
+    }
+
+    // 5. PREVENT LEASHING
     agent->setHomeLocation(x, z, y, nullptr);
     agent->setCreatureBitmask(agent->getCreatureBitmask() & ~ObjectFlag::PACK & ~ObjectFlag::HERD);
 
@@ -112,10 +111,20 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         agent->clearPatrolPoints();
         agent->clearSavedPatrolPoints();
         agent->setMovementState(AiAgent::OBLIVIOUS);
+        
+        // Restore original brain (Optional, but good practice)
+        // If we knew the original map, we'd set it back here.
+        // For now, we just reactivate behavior.
         agent->activateAiBehavior(true);
         return;
     } else {
         info("Starting SimPlayer for agent " + String::valueOf(oid), true);
+        
+        // --- BRAIN TRANSPLANT ---
+        // Override the 'enclaveSentinel' map with 'default'.
+        // This gives the bot the standard logic needed to process Patrol points.
+        agent->setCustomAiMap(String("default").hashCode());
+        agent->setAITemplate(); // Reloads the tree based on the new map
         
         agent->writeBlackboard("simAlwaysActive", true);
         agent->setSimAlwaysActive(true);
