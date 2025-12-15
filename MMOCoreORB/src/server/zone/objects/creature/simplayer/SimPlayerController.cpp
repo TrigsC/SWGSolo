@@ -123,8 +123,6 @@ void SimPlayerController::goToResource(const String& resourceName) {
     stuckWatchdogCount = 0;
     lastWatchdogPos = agent->getWorldPosition();
 
-    // Reset Home to prevent Leashing (Important!)
-    agent->setHomeLocation(agent->getPositionX(), agent->getPositionZ(), agent->getPositionY());
     agent->stopWaiting();
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
     
@@ -192,6 +190,8 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     // Destination = last node
     destination = simPath.get(simPath.size() - 1).getPoint();
+
+    agent->setHomeLocation(destination.getX(), destination.getZ(), destination.getY(), nullptr);
 
     Logger::console.info("SimPlayer: Path Loaded (" + String::valueOf(path->size()) + " nodes). Using Native Engine.", true);
 
@@ -354,8 +354,9 @@ void SimPlayerController::checkArrival() {
                     , true);
                 Logger::console.info("SimPlayer: Lazy Bot detected. Poking...", true);
                 agent->stopWaiting();
-                agent->setMovementState(AiAgent::PATROLLING);
-                Logger::console.info("SimPlayer: patrolPoints=" + String::valueOf(agent->getPatrolPointSize()), true);
+                if (agent->getMovementState() != AiAgent::PATROLLING) {
+                    agent->setMovementState(AiAgent::PATROLLING);
+                }
                 agent->activateAiBehavior(true);
              }
         }

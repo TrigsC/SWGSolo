@@ -3445,10 +3445,12 @@ void AiAgentImplementation::notifyDissapear(TreeEntry* entry) {
 			}
 
 			if (newValue == 0) {
-				if (!getSimAlwaysActive() && despawnOnNoPlayerInRange && (despawnEvent == nullptr) && !isPet()) {
-					despawnEvent = new DespawnCreatureOnPlayerDissappear(asAiAgent());
-					despawnEvent->schedule(30000);
-				}
+				bool isSim = getSimAlwaysActive() || getSimPlayerBot();
+    
+    			if (!isSim && despawnOnNoPlayerInRange && (despawnEvent == nullptr) && !isPet()) {
+    			    despawnEvent = new DespawnCreatureOnPlayerDissappear(asAiAgent());
+    			    despawnEvent->schedule(30000);
+    			}
 
 				if (isCreature()) {
 					Creature* creature = cast<Creature*>(asAiAgent());
