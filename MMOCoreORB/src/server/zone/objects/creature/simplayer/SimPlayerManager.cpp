@@ -30,7 +30,7 @@ void SimPlayerManager::initialize() {
     // Note: Z is Y in SWG coords usually (X, Z, Y in code vs X, Y, Z in game). 
     // spawnSimPlayer args: Planet, X, Y (2D coordinates), Template
     
-    spawnSimPlayer("naboo", 4714.0f, -4939.0f, "artisan");
+    spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
 
     // Example: Spawn a Jedi nearby
     // spawnSimPlayer("naboo", 4720.0f, -4935.0f, "light_jedi_sentinel");
@@ -48,6 +48,13 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
 
     CreatureManager* creatureManager = zone->getCreatureManager();
     if (creatureManager == nullptr) return;
+
+    // 1. SAFETY CHECK: Verify template exists
+    uint32 templateCRC = templateName.hashCode();
+    if (CreatureTemplateManager::instance()->getTemplate(templateCRC) == nullptr) {
+        error("Spawn Failed: Template '" + templateName + "' (CRC: " + String::valueOf(templateCRC) + ") is not loaded in CreatureTemplateManager.");
+        return;
+    }
 
     // Find the Z (Height) at this location so they don't spawn underground
     float z = zone->getHeight(x, y);
@@ -80,8 +87,8 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     
     // Force HAM (Hitpoints) so they don't die to a stiff breeze
     for (int i=0; i<9; ++i) {
-        agent->setMaxHAM(i, 2000, true);
-        agent->setHAM(i, 2000);
+        agent->setMaxHAM(i, 5000, true);
+        agent->setHAM(i, 5000);
     }
 
     // 3. PREVENT LEASHING & SETUP AI
