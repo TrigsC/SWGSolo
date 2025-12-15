@@ -10,7 +10,14 @@
 #include "system/util/SynchronizedVectorMap.h"
 #include "SimPlayerController.h"
 
-class Zone;
+// FIX: Forward declare Zone inside its correct namespace to avoid ambiguity
+namespace server {
+ namespace zone {
+  class Zone;
+ }
+}
+
+using namespace server::zone;
 
 class SimPlayerManager : public Singleton<SimPlayerManager>, public Object, public Logger {
     // Map of Creature ObjectID -> Your Custom Controller
@@ -26,7 +33,7 @@ public:
     // The main logic to spawn a specific bot
     void spawnSimPlayer(const String& planet, float x, float z, const String& templateName);
 
-    // Toggle logic (keeps your existing examime functionality working if you still want it)
+    // Toggle logic
     void toggleBot(AiAgent* agent);
 };
 
