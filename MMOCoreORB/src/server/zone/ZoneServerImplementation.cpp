@@ -368,6 +368,8 @@ void ZoneServerImplementation::startManagers() {
 	frsManager = new FrsManager(_this.getReferenceUnsafeStaticCast());
 	frsManager->initialize();
 
+	SimPlayerManager::instance()->initialize();
+
 	info(true) << "ZoneServerImplementation -- Managers Started.";
 }
 

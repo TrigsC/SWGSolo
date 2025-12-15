@@ -1,3 +1,8 @@
+/*
+ * SimPlayerManager.h
+ * Manager for handling SimPlayer population and lifecycle.
+ */
+
 #ifndef SIMPLAYERMANAGER_H_
 #define SIMPLAYERMANAGER_H_
 
@@ -5,45 +10,24 @@
 #include "system/util/SynchronizedVectorMap.h"
 #include "SimPlayerController.h"
 
+class Zone;
+
 class SimPlayerManager : public Singleton<SimPlayerManager>, public Object, public Logger {
     // Map of Creature ObjectID -> Your Custom Controller
     SynchronizedVectorMap<uint64, Reference<SimPlayerController*> > controllers;
 
 public:
-    SimPlayerManager() {
-        setLoggingName("SimPlayerManager");
-    }
+    SimPlayerManager();
+    ~SimPlayerManager();
 
-    // Toggle the AI on/off for a specific agent
-    void toggleBot(AiAgent* agent) {
-        if (agent == nullptr) return;
+    // Called by ZoneServer on startup
+    void initialize();
 
-        uint64 oid = agent->getObjectID();
+    // The main logic to spawn a specific bot
+    void spawnSimPlayer(const String& planet, float x, float z, const String& templateName);
 
-        if (controllers.contains(oid)) {
-            info("Stopping SimPlayer for agent " + String::valueOf(oid), true);
-            agent->eraseBlackboard("simAlwaysActive");
-            controllers.drop(oid);
-            agent->clearPatrolPoints();
-            agent->clearSavedPatrolPoints();
-            agent->setMovementState(AiAgent::OBLIVIOUS);
-            agent->activateAiBehavior(true);
-            return;
-        } else {
-            info("Starting SimPlayer for agent " + String::valueOf(oid), true);
-            // Starting SimPlayer...
-            agent->writeBlackboard("simAlwaysActive", true);
-            agent->setSimAlwaysActive(true);
-            agent->setSimPlayerBot(true);
-            agent->setDespawnOnNoPlayerInRange(false);
-            agent->activateAiBehavior(true);
-            Reference<SimPlayerController*> ctrl = new SimPlayerController(agent);
-            controllers.put(oid, ctrl);
-            
-            // Trigger the logic immediately
-            ctrl->startSimLoop();
-        }
-    }
+    // Toggle logic (keeps your existing examime functionality working if you still want it)
+    void toggleBot(AiAgent* agent);
 };
 
 #endif /* SIMPLAYERMANAGER_H_ */
