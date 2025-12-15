@@ -3698,6 +3698,11 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 		if (patrolPoints.size() > 0)
 			patrolPoints.remove(0);
 
+		if (patrolPoints.size() > 0) {
+			info("findNextPosition: Chaining to next point. Remaining: " + String::valueOf(patrolPoints.size()), true);
+			return true;
+		}
+
 		if (movementState != AiAgent::FOLLOWING)
 			notifyObservers(ObserverEventType::DESTINATIONREACHED);
 
