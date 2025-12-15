@@ -3646,9 +3646,10 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 
 	info("findNextPosition: Points=" + String::valueOf(getPatrolPointSize()) + " Dist=" + String::valueOf(maxDistance), true);
 
-	if (isDead() || getPatrolPointSize() <= 0)
+	if (isDead() || getPatrolPointSize() <= 0) {
 		info("findNextPosition: Empty Queue or Dead. Stopping.", true);
 		return false;
+	}
 
 	int posture = getPosture();
 	int movementState = getMovementState();
