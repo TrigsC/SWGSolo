@@ -6,7 +6,8 @@
 #include "server/zone/ZoneServer.h"
 #include "server/ServerCore.h"
 #include "server/zone/managers/creature/CreatureManager.h"
-#include "server/zone/managers/creature/CreatureTemplateManager.h" 
+#include "server/zone/managers/creature/CreatureTemplateManager.h"
+#include "server/zone/objects/creature/ai/CreatureTemplate.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "templates/params/creature/ObjectFlag.h" 
 
@@ -24,7 +25,7 @@ void SimPlayerManager::initialize() {
     // POPULATION CONTROL
     // ---------------------------------------------------------
     
-    // Attempting to spawn the Jedi Sentinel as a test
+    // Using 'light_jedi_sentinel' as the test subject since we confirmed it works via commands.
     spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
 }
 
@@ -42,10 +43,13 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     if (creatureManager == nullptr) return;
 
     // 1. SAFETY CHECK: Verify template exists
+    // We calculate the hash once.
     uint32 templateCRC = templateName.hashCode();
     
-    if (CreatureTemplateManager::instance()->getTemplate(templateCRC) == nullptr) {
-        error("Spawn Failed: Template '" + templateName + "' (CRC: " + String::valueOf(templateCRC) + ") is not loaded in CreatureTemplateManager.");
+    // FIX: Check if the template is actually loaded in memory
+    CreatureTemplate* tmpl = CreatureTemplateManager::instance()->getTemplate(templateCRC);
+    if (tmpl == nullptr) {
+        error("Spawn Failed: Template '" + templateName + "' is NOT loaded in CreatureTemplateManager. The server does not know this NPC exists yet.");
         return;
     }
 
@@ -54,11 +58,11 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
 
     info("Attempting to spawn SimPlayer [" + templateName + "] on " + planet + " at " + String::valueOf(x) + ", " + String::valueOf(y), true);
 
-    // Use the already calculated templateCRC
+    // 2. SPAWN
     CreatureObject* creature = creatureManager->spawnCreature(templateCRC, x, z, y, 0);
 
     if (creature == nullptr) {
-        error("Failed to spawn creature via CreatureManager.");
+        error("Failed to spawn creature via CreatureManager (spawnCreature returned null).");
         return;
     }
 
@@ -69,7 +73,7 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
 
     AiAgent* agent = creature->asAiAgent();
 
-    // 2. FORCE STATS
+    // 3. FORCE STATS
     Locker lock(agent);
     
     // Force stats so they don't walk slowly or die easily
@@ -79,13 +83,13 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
         agent->setHAM(i, 5000);
     }
 
-    // 3. PREVENT LEASHING
+    // 4. PREVENT LEASHING
     agent->setHomeLocation(x, z, y, nullptr);
     
     // Remove Pack/Herd behaviors to prevent interference
     agent->setCreatureBitmask(agent->getCreatureBitmask() & ~ObjectFlag::PACK & ~ObjectFlag::HERD);
 
-    // 4. ATTACH SIMPLAYER
+    // 5. ATTACH SIMPLAYER
     toggleBot(agent);
 }
 
