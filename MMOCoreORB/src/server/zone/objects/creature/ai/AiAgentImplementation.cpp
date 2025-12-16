@@ -3682,6 +3682,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         info(msg.toString(), true);
     }
 
+    // --- ARRIVAL / CORNER CUTTING ---
     if (endDistanceSq <= maxSquared && endDistZ < (maxDistance + 2.5f)) {
         currentFoundPath = nullptr;
         if (patrolPoints.size() > 0) patrolPoints.remove(0);
@@ -3703,6 +3704,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         }
     }
 
+    // --- DIGITAL PHYSICS (NO BRAKING) ---
     if (isSimPlayer) {
         if (patrolPoints.size() > 0) newSpeed = runSpeed; 
         else if (endDistanceSq < 9.0f && newSpeed > 0.4f) newSpeed = Math::max(0.2f, (currentSpeed - 0.8f));
@@ -3718,6 +3720,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     }
     updateLocomotion();
 
+    // --- PATHFINDER ---
     PathFinderManager* pathFinder = PathFinderManager::instance();
     if (pathFinder == nullptr) return false;
 
@@ -3748,13 +3751,14 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 
     if (currentParent != nullptr && endMovementCell != nullptr) pathFinder->filterPastPoints(path, asAiAgent());
 
+    // --- ROBUST MULTI-NODE CONSUMPTION LOOP ---
     WorldCoordinates nextMovementPosition;
     float remainingDist = maxSpeed; 
     bool finalPosSet = false;
-    int pathIndex = 1; 
-
-    while (pathIndex < path->size()) {
-        nextMovementPosition = path->get(pathIndex);
+    
+    // We iterate through the path. Index 1 is the next immediate step.
+    while (path->size() >= 2) {
+        nextMovementPosition = path->get(1);
         
         CellObject* nextMovementCell = nextMovementPosition.getCell();
         uint64 nextParentID = nextMovementCell != nullptr ? nextMovementCell->getObjectID() : 0;
@@ -3768,22 +3772,53 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         Vector3 movementDiff(checkPos - nextMovementPosition.getWorldPosition());
         float distToNode = Math::sqrt(movementDiff.getX() * movementDiff.getX() + movementDiff.getY() * movementDiff.getY());
 
-        if (distToNode < remainingDist || distToNode < 0.5f) {
-            if (pathIndex == path->size() - 1) {
-                finalPosSet = true;
-                break; 
-            }
+        // 1. Handle Duplicate Nodes (Zero Distance) to prevent NaN/Stuck
+        if (distToNode < 0.01f) {
+            path->remove(1); // Consume silently
+            continue;
+        }
+
+        // 2. Out of Movement Budget?
+        if (remainingDist <= 0.001f) {
+            // We are done. We stop at the last 'currentPosition' (which was the previous node).
+            // However, nextMovementPosition is currently holding path->get(1).
+            // We must update it to reflect our actual stop point.
+            
+            // Actually, if we are out of budget, we should have broken out in the previous iteration.
+            // But if we entered with 0 budget, we stop here.
+            nextMovementPosition.setX(currentPosition.getX());
+            nextMovementPosition.setY(currentPosition.getY());
+            nextMovementPosition.setZ(currentPosition.getZ());
+            if (currentParent != nullptr) nextMovementPosition.setCell(currentParent.castTo<CellObject*>());
+            else nextMovementPosition.setCell(nullptr);
+            
+            finalPosSet = true;
+            break;
+        }
+
+        // 3. Can we reach this node? (Strict check)
+        if (distToNode <= remainingDist) {
+            // Consume Node
             remainingDist -= distToNode;
+            
+            // Advance Current Position to this node
             currentPosition = nextMovementPosition.getPoint();
             currentParent = nextMovementCell; 
+            
+            // Remove node from path so we target the next one in the next loop iter
             path->remove(1); 
+            
+            // If that was the last point, we are done
+            if (path->size() < 2) {
+                finalPosSet = true;
+                break;
+            }
         } else {
-            // INTERPOLATE
-            float ratio = remainingDist / distToNode; // How far along the line we can go
+            // 4. Interpolate (Partial Move)
+            float ratio = remainingDist / distToNode;
             
             float dx = nextMovementPosition.getX() - checkPos.getX();
             float dy = nextMovementPosition.getY() - checkPos.getY();
-            // FIX: Interpolate Z as well
             float dz = nextMovementPosition.getZ() - checkPos.getZ();
             
             Vector3 interpPos;
@@ -3793,8 +3828,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
             if (!isInNavMesh() && currentParent == nullptr) {
                 interpPos.setZ(getWorldZ(interpPos));
             } else {
-                // FIX: Linear interpolation for Z
-                interpPos.setZ(checkPos.getZ() + (dz * ratio));
+                interpPos.setZ(checkPos.getZ() + (dz * ratio)); // Linear Z Interp
             }
 
             nextMovementPosition.setX(interpPos.getX());
@@ -3806,8 +3840,13 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         }
     }
 
-    if (!finalPosSet) nextMovementPosition = path->get(1);
+    if (!finalPosSet) {
+        // Fallback (should typically be handled by the loop unless path size < 2 initially)
+        if (path->size() >= 2) nextMovementPosition = path->get(1);
+        else nextMovementPosition.setPoint(currentPosition);
+    }
 
+    // --- FINAL UPDATE ---
     nextStepPosition.setPosition(nextMovementPosition.getX(), nextMovementPosition.getZ(), nextMovementPosition.getY());
     nextStepPosition.setCell(nextMovementPosition.getCell());
 
