@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Phase 20: The Coordinate Fix (Working WITH the System)
+ * Phase 21: Correct Coordinates + Kickstart
  */
 
 #include "SimPlayerController.h"
@@ -20,7 +20,7 @@
 using namespace server::zone::objects::creature::ai::bt;
 
 // --------------------------------------------------------
-// Task Implementations (Unchanged)
+// Task Implementations (Standard)
 // --------------------------------------------------------
 void FindResourcePathTask::run() {
     Reference<SimPlayerController*> strongCtrl = controller.get();
@@ -186,7 +186,8 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     destination = simPath.get(simPath.size() - 1).getPoint();
     
-    // FIX: Ensure we set Home Location correctly (X, Z=North, Y=Up)
+    // FIX: Core3 method signatures use (x, z, y) where z is height
+    // Vector3.getZ() is height. So we pass: X, Z(Height), Y(North)
     agent->setHomeLocation(destination.getX(), destination.getZ(), destination.getY(), nullptr);
 
     Logger::console.info("SimPlayer: [DEBUG] Path Found (" + String::valueOf(path->size()) + " nodes). Dest: " + destination.toString(), true);
@@ -203,9 +204,11 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     queueMorePathNodes();
 
-    // Standard Core3 movement Kickstart
+    // --- KICKSTART: Explicitly Set Next Step ---
+    // This bridges the gap between the blackboard and the physics engine
     if (agent->getPatrolPointSize() > 0) {
         PatrolPoint next = agent->getNextPosition();
+        // Method signature: setNextStepPosition(x, z, y, cell)
         agent->setNextStepPosition(next.getPositionX(), next.getPositionZ(), next.getPositionY(), next.getCell());
     }
 
@@ -215,7 +218,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     delete path;
 
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(1000); 
+    task->schedule(500); // 500ms tick for smooth drive-by-wire
 }
 
 void SimPlayerController::queueMorePathNodes() {
@@ -244,7 +247,7 @@ void SimPlayerController::queueMorePathNodes() {
         if (simPathIndex == 0) {
             Vector3 cur = agent->getWorldPosition();
             float dx0 = p.getX() - cur.getX();
-            float dy0 = p.getY() - cur.getY(); // Use Y for north/south check
+            float dy0 = p.getY() - cur.getY();
             if ((dx0*dx0 + dy0*dy0) < 1.0f) { 
                 simPathIndex++;
                 last = cur;       
@@ -263,12 +266,8 @@ void SimPlayerController::queueMorePathNodes() {
             continue;
         }
 
-        // --- THE CRITICAL FIX ---
-        // Vector3 from PathFinderManager is (X, Y_North, Z_Up).
-        // PatrolPoint expects (X, Z_North, Y_Up).
-        // Therefore, we must pass: X, Y, Z.
-        PatrolPoint pp(p.getX(), p.getY(), p.getZ(), nullptr); 
-        
+        // FIX: PatrolPoint(x, z, y) -> (X, Height, North)
+        PatrolPoint pp(p.getX(), p.getZ(), p.getY(), nullptr); 
         agent->addPatrolPoint(pp);
 
         last = p;
@@ -288,11 +287,13 @@ void SimPlayerController::onPathFailed() {
     }
 }
 
+// --------------------------------------------------------
+// THE DRIVE-BY-WIRE UPDATE LOOP
+// --------------------------------------------------------
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
     if (state != MOVING) return;
 
-    // Enforce Running
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
     
     if (agent->isWaiting()) agent->stopWaiting();
@@ -318,15 +319,23 @@ void SimPlayerController::checkArrival() {
          return;
     }
 
-    // Standard Watchdog (Relaxed)
+    // Manual Propulsion: Force update every 0.5s
+    // Using 0.5f tolerance.
+    agent->findNextPosition(0.5f, false);
+    
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
     float moveDy = currentPos.getY() - lastWatchdogPos.getY();
     float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
 
-    if (movedDistSq < 0.1f) {
+    if (movedDistSq < 0.05f) {
         stuckWatchdogCount++;
-        if (stuckWatchdogCount > 5) { // 5 seconds stuck
+        if (stuckWatchdogCount > 5) { 
              Logger::console.info("SimPlayer: [STUCK] Nudging...", true);
+             // Kickstart again if really stuck
+             if (agent->getPatrolPointSize() > 0) {
+                 PatrolPoint next = agent->getNextPosition();
+                 agent->setNextStepPosition(next.getPositionX(), next.getPositionZ(), next.getPositionY(), next.getCell());
+             }
              agent->activateAiBehavior(true);
         }
     } else {
@@ -336,7 +345,7 @@ void SimPlayerController::checkArrival() {
     lastWatchdogPos = currentPos;
 
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(1000);
+    task->schedule(500);
 }
 
 void SimPlayerController::performSample() {
