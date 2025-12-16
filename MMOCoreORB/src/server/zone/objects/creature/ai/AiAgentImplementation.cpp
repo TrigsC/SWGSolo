@@ -3651,7 +3651,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     Locker locker(&targetMutex);
 
     // Logging only for SimPlayer to keep console clean
-    if (isSimPlayer && isDead() || getPatrolPointSize() <= 0) {
+    if ((isSimPlayer && isDead()) || getPatrolPointSize() <= 0) {
         if (isSimPlayer) info("DEBUG_MOVE: Queue Empty or Dead. Stopping.", true);
         return false;
     }
