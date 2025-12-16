@@ -3682,7 +3682,6 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         info(msg.toString(), true);
     }
 
-    // --- ARRIVAL / CORNER CUTTING ---
     if (endDistanceSq <= maxSquared && endDistZ < (maxDistance + 2.5f)) {
         currentFoundPath = nullptr;
         if (patrolPoints.size() > 0) patrolPoints.remove(0);
@@ -3690,7 +3689,6 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         if (patrolPoints.size() > 0) {
             if (isSimPlayer) info("DEBUG_MOVE: Cornering...", true);
             endMovementPosition = getNextPosition();
-            // Recalculate
             currentPosition = getPosition();
             currentWorldPos = getWorldPosition();
             endDistDiff = Vector3(currentWorldPos - endMovementPosition.getWorldPosition());
@@ -3705,7 +3703,6 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         }
     }
 
-    // --- DIGITAL PHYSICS (NO BRAKING) ---
     if (isSimPlayer) {
         if (patrolPoints.size() > 0) newSpeed = runSpeed; 
         else if (endDistanceSq < 9.0f && newSpeed > 0.4f) newSpeed = Math::max(0.2f, (currentSpeed - 0.8f));
@@ -3721,7 +3718,6 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     }
     updateLocomotion();
 
-    // --- PATHFINDER ---
     PathFinderManager* pathFinder = PathFinderManager::instance();
     if (pathFinder == nullptr) return false;
 
@@ -3752,7 +3748,6 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 
     if (currentParent != nullptr && endMovementCell != nullptr) pathFinder->filterPastPoints(path, asAiAgent());
 
-    // --- MULTI-NODE CONSUMPTION LOOP (FIXED) ---
     WorldCoordinates nextMovementPosition;
     float remainingDist = maxSpeed; 
     bool finalPosSet = false;
@@ -3783,17 +3778,25 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
             currentParent = nextMovementCell; 
             path->remove(1); 
         } else {
+            // INTERPOLATE
+            float ratio = remainingDist / distToNode; // How far along the line we can go
+            
             float dx = nextMovementPosition.getX() - checkPos.getX();
             float dy = nextMovementPosition.getY() - checkPos.getY();
+            // FIX: Interpolate Z as well
+            float dz = nextMovementPosition.getZ() - checkPos.getZ();
             
             Vector3 interpPos;
-            interpPos.setX(checkPos.getX() + (remainingDist * (dx / distToNode)));
-            interpPos.setY(checkPos.getY() + (remainingDist * (dy / distToNode)));
+            interpPos.setX(checkPos.getX() + (dx * ratio));
+            interpPos.setY(checkPos.getY() + (dy * ratio));
             
-            if (!isInNavMesh() && currentParent == nullptr) interpPos.setZ(getWorldZ(interpPos));
-            else interpPos.setZ(nextMovementPosition.getZ());
+            if (!isInNavMesh() && currentParent == nullptr) {
+                interpPos.setZ(getWorldZ(interpPos));
+            } else {
+                // FIX: Linear interpolation for Z
+                interpPos.setZ(checkPos.getZ() + (dz * ratio));
+            }
 
-            // FIX: Replaced setPoint() with setX/Y/Z
             nextMovementPosition.setX(interpPos.getX());
             nextMovementPosition.setY(interpPos.getY());
             nextMovementPosition.setZ(interpPos.getZ());
@@ -3803,11 +3806,8 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         }
     }
 
-    if (!finalPosSet) {
-        nextMovementPosition = path->get(1);
-    }
+    if (!finalPosSet) nextMovementPosition = path->get(1);
 
-    // --- FINAL UPDATE ---
     nextStepPosition.setPosition(nextMovementPosition.getX(), nextMovementPosition.getZ(), nextMovementPosition.getY());
     nextStepPosition.setCell(nextMovementPosition.getCell());
 
