@@ -9,6 +9,7 @@
 #include "server/zone/managers/creature/CreatureTemplateManager.h" 
 #include "server/zone/objects/creature/ai/CreatureTemplate.h" 
 #include "server/zone/objects/creature/ai/AiAgent.h"
+#include "server/zone/objects/creature/ai/PatrolPoint.h"
 #include "templates/params/creature/ObjectFlag.h" 
 
 SimPlayerManager::SimPlayerManager() {
@@ -20,7 +21,6 @@ SimPlayerManager::~SimPlayerManager() {
 
 void SimPlayerManager::initialize() {
     info("Initializing SimPlayer Manager...", true);
-    // Spawn test
     spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
 }
 
@@ -82,11 +82,8 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
 
     agent->setHomeLocation(x, z, y, nullptr);
     
-    // --- PACIFIST MODE ---
-    // Remove behaviors that might block movement logic
+    // PACIFIST MODE
     agent->setCreatureBitmask(agent->getCreatureBitmask() & ~ObjectFlag::PACK & ~ObjectFlag::HERD & ~ObjectFlag::KILLER & ~ObjectFlag::STALKER);
-    
-    // Also remove Aggressive/Enemy flags from PvP mask so it doesn't enter "combat scanning" mode
     agent->setPvpStatusBitmask(agent->getPvpStatusBitmask() & ~ObjectFlag::AGGRESSIVE & ~ObjectFlag::ENEMY);
 
     toggleBot(agent);
@@ -110,13 +107,12 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
     } else {
         info("Starting SimPlayer for agent " + String::valueOf(oid), true);
         
-        // --- BRAIN TRANSPLANT ---
-        // Force 'default' logic
-        agent->setCustomAiMap(String("default").hashCode());
+        // --- BRAIN TRANSPLANT 2.0 ---
+        // 'default' didn't work. 'townsperson' definitely knows how to patrol.
+        agent->setCustomAiMap(String("townsperson").hashCode());
         agent->setAITemplate(); 
         
-        // LOG IT
-        info("BRAIN TRANSPLANT: Set map to 'default' and reloaded tree.", true);
+        info("BRAIN TRANSPLANT: Set map to 'townsperson' and reloaded tree.", true);
 
         agent->writeBlackboard("simAlwaysActive", true);
         agent->setSimAlwaysActive(true);
@@ -126,7 +122,10 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         Reference<SimPlayerController*> ctrl = new SimPlayerController(agent);
         controllers.put(oid, ctrl);
         
+        // --- MOVEMENT PUMP PRIMING ---
+        // Ensure the behavior tree wakes up immediately
         agent->activateAiBehavior(true);
+        
         ctrl->startSimLoop();
     }
 }

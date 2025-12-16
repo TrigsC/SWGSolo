@@ -188,15 +188,13 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         simPath.add(path->get(i));
     }
 
-    // Destination = last node
     destination = simPath.get(simPath.size() - 1).getPoint();
 
-    // Force Home Location Update
+    // Force Home Update
     agent->setHomeLocation(destination.getX(), destination.getZ(), destination.getY(), nullptr);
 
     Logger::console.info("SimPlayer: [DEBUG] Path Found (" + String::valueOf(path->size()) + " nodes). Dest: " + destination.toString(), true);
 
-    // Reset AI state
     agent->setFollowObject(nullptr);
     agent->setWatchObject(nullptr);
     agent->setTargetObject(nullptr);
@@ -209,12 +207,9 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     queueMorePathNodes();
 
-    if (agent->getPatrolPointSize() == 0) {
-        Logger::console.info("SimPlayer: [WARNING] Queue empty after queueMorePathNodes. Forcing final point.", true);
-        Vector3 d = destination;
-        d.setZ(zone->getHeight(d.getX(), d.getY()) + 1.0f);
-        PatrolPoint pp(d.getX(), d.getZ(), d.getY(), nullptr); 
-        agent->addPatrolPoint(pp);
+    if (agent->getPatrolPointSize() > 0) {
+        PatrolPoint next = agent->getNextPosition();
+        agent->setNextStepPosition(next.getPositionX(), next.getPositionZ(), next.getPositionY(), next.getCell());
     }
 
     agent->setMovementState(AiAgent::PATROLLING);
