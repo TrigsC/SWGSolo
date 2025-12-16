@@ -319,10 +319,12 @@ void SimPlayerController::checkArrival() {
          return;
     }
 
-    // Manual Propulsion: Force update every 0.5s
-    // Using 0.5f tolerance.
-    agent->findNextPosition(0.5f, false);
+    // --- SMOOTHER CORNERING ---
+    // Increase tolerance to 2.0f. 
+    // This allows the bot to switch to the next point before stopping on top of the current one.
+    agent->findNextPosition(2.0f, false);
     
+    // Stuck Logic
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
     float moveDy = currentPos.getY() - lastWatchdogPos.getY();
     float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
@@ -331,7 +333,6 @@ void SimPlayerController::checkArrival() {
         stuckWatchdogCount++;
         if (stuckWatchdogCount > 5) { 
              Logger::console.info("SimPlayer: [STUCK] Nudging...", true);
-             // Kickstart again if really stuck
              if (agent->getPatrolPointSize() > 0) {
                  PatrolPoint next = agent->getNextPosition();
                  agent->setNextStepPosition(next.getPositionX(), next.getPositionZ(), next.getPositionY(), next.getCell());

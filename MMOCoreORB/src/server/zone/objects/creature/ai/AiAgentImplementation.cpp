@@ -3633,57 +3633,35 @@ void AiAgentImplementation::checkNewAngle() {
  * range or they have reached their maxDistance to the point.
 */
 bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
-    /*
-     * SETUP: Check speed and posture before attempting to find a path
-     */
+    #ifdef DEBUG_AI
+        if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
+            info("findNextPosition(" + String::valueOf(maxDistance) + ", " + String::valueOf(walk) + ")", true);
+    #endif 
 
-#ifdef DEBUG_AI
-    if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
-        info("findNextPosition(" + String::valueOf(maxDistance) + ", " + String::valueOf(walk) + ")", true);
-#endif // DEBUG_AI
-
-    // ------------------------------------------------------------------
-    // DEBUG: Stutter Diagnostic for light_jedi_sentinel
-    // ------------------------------------------------------------------
+    // DEBUG SETUP
     bool debugMode = false;
-    
-    // FIX: Correct way to check template name
     const CreatureTemplate* tmpl = getCreatureTemplate();
     if (tmpl != nullptr && tmpl->getTemplateName() == "light_jedi_sentinel") {
         debugMode = true;
     }
-    // ------------------------------------------------------------------
 
     Locker locker(&targetMutex);
 
-    if (debugMode) {
-        info("findNextPosition: Points=" + String::valueOf(getPatrolPointSize()) + " Dist=" + String::valueOf(maxDistance), true);
-    }
-
     if (isDead() || getPatrolPointSize() <= 0) {
-        if (debugMode) info("findNextPosition: Empty Queue or Dead. Stopping.", true);
+        if (debugMode) info("DEBUG_MOVE: Queue Empty or Dead. Stopping.", true);
         return false;
     }
 
     int posture = getPosture();
     int movementState = getMovementState();
 
-    if (posture == CreaturePosture::CROUCHED)
-        return false;
+    if (posture == CreaturePosture::CROUCHED) return false;
 
     float newSpeed = runSpeed;
-
-    if (movementState == AiAgent::FLEEING && isInCombat())
-        newSpeed *= 0.7f;
-
-    if ((walk && movementState != AiAgent::FLEEING) || posture == CreaturePosture::PRONE)
-        newSpeed = walkSpeed;
-
-    if (hasState(CreatureState::IMMOBILIZED))
-        newSpeed = newSpeed / 2.f;
-
-    if (hasState(CreatureState::FROZEN))
-        newSpeed = 0.01f;
+    if (movementState == AiAgent::FLEEING && isInCombat()) newSpeed *= 0.7f;
+    if ((walk && movementState != AiAgent::FLEEING) || posture == CreaturePosture::PRONE) newSpeed = walkSpeed;
+    if (hasState(CreatureState::IMMOBILIZED)) newSpeed = newSpeed / 2.f;
+    if (hasState(CreatureState::FROZEN)) newSpeed = 0.01f;
 
     float updateTicks = float(BEHAVIORINTERVAL) / 1000.f;
     float maxSpeed = newSpeed * updateTicks; 
@@ -3692,35 +3670,36 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     Vector3 currentWorldPos = getWorldPosition();
     PatrolPoint endMovementPosition = getNextPosition();
 
+    // 2D Distance Calculation (Horizontal)
     Vector3 endDistDiff(currentWorldPos - endMovementPosition.getWorldPosition());
     float endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
+    
+    // Z Distance Calculation (Vertical)
+    float endDistZ = fabs(endDistDiff.getZ()); // Linear distance, not squared
+
+    // Tolerance Calculation
     float maxSquared = Math::max(0.1f, maxDistance * maxDistance);
 
-    float endDistZSq = endDistDiff.getZ() * endDistDiff.getZ();
-    endDistZSq = Math::getPrecision(endDistZSq, 2);
-
-    // ------------------------------------------------------------------
-    // STUTTER LOGGING (PRE-ARRIVAL)
-    // ------------------------------------------------------------------
+    // DEBUG LOG
     if (debugMode) {
         StringBuffer msg;
-        msg << "DEBUG_MOVE: DistSq=" << endDistanceSq 
-            << " MaxSq=" << maxSquared 
-            << " CurrentSpeed=" << currentSpeed 
-            << " NewSpeed=" << newSpeed;
+        msg << "DEBUG_MOVE: Dist2D=" << sqrt(endDistanceSq) 
+            << "m (Req: " << maxDistance << "m)"
+            << " HeightDiff=" << endDistZ 
+            << "m Speed=" << currentSpeed 
+            << " Pts=" << patrolPoints.size();
         
         if (currentSpeed < 0.1f) msg << " [STALLED]";
         info(msg.toString(), true);
     }
 
     // ------------------------------------------------------------------
-    // ARRIVAL LOGIC
+    // ARRIVAL LOGIC (Fixed Z Check)
     // ------------------------------------------------------------------
-    if (endDistanceSq <= maxSquared && fabs(endDistZSq) < (maxDistance + 1.f)) {
+    // We check if horizontal distance is within range AND if vertical distance is reasonable (2.5m allowance)
+    if (endDistanceSq <= maxSquared && endDistZ < (maxDistance + 2.5f)) {
         
-        if (debugMode) {
-             info("DEBUG_MOVE: Reached Point! Popping...", true);
-        }
+        if (debugMode) info("DEBUG_MOVE: Reached Point! Switching...", true);
 
         currentFoundPath = nullptr;
 
@@ -3728,32 +3707,28 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
             patrolPoints.remove(0);
 
         if (patrolPoints.size() > 0) {
-            // -------------------------------------------------------
-            // STUTTER FIX: CONTINUOUS MOVEMENT
-            // -------------------------------------------------------
-            if (debugMode) {
-                 info("DEBUG_MOVE: Cornering... switching target immediately.", true);
-            }
+            // --- SMOOTH CORNERING ---
+            if (debugMode) info("DEBUG_MOVE: Cornering to next point immediately.", true);
 
-            // 1. Update the target to the NEW point immediately
+            // 1. Update the target
             endMovementPosition = getNextPosition();
             
-            // 2. Recalculate distances for the NEW target
+            // 2. Recalculate Logic for new target
             currentPosition = getPosition();
             currentWorldPos = getWorldPosition();
             
             endDistDiff = Vector3(currentWorldPos - endMovementPosition.getWorldPosition());
             endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
             
-            maxSquared = Math::max(0.1f, maxDistance * maxDistance);
-
-            // FALL THROUGH to calculation logic below instead of returning!
-            
-        } else {
-            // Queue is empty, NOW we stop.
-            if (debugMode) {
-                 info("DEBUG_MOVE: Queue empty. Stopping.", true);
+            // Recalculate max speed for the turn
+            // We want to maintain speed if possible
+            if (newSpeed > 0.4f && currentSpeed < newSpeed) {
+                 newSpeed = currentSpeed + 0.4f; // Accelerate into the turn
             }
+
+        } else {
+            // STOP: No more points
+            if (debugMode) info("DEBUG_MOVE: Path Finished.", true);
 
             if (movementState != AiAgent::FOLLOWING)
                 notifyObservers(ObserverEventType::DESTINATIONREACHED);
@@ -3764,12 +3739,15 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         }
     }
 
-    // Handle speed up and slow down
+    // Acceleration / Deceleration Logic
     if ((((currentSpeed * currentSpeed) * maxSquared) > endDistanceSq) && newSpeed > 0.4f) {
-        newSpeed = Math::max(0.2f, (currentSpeed - 0.4f));
+        // Slow down if we are approaching the final point and have no next point
+        // BUT if we have points remaining, keep running!
+        if (patrolPoints.size() <= 1) {
+             newSpeed = Math::max(0.2f, (currentSpeed - 0.4f));
+        }
     } else if (currentSpeed < newSpeed) {
         float speedDiff = newSpeed - currentSpeed;
-
         if (speedDiff > 0.4f)
             newSpeed = currentSpeed + 0.4f;
     }
