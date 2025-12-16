@@ -3682,7 +3682,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 	float endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
 	float maxSquared = Math::max(0.1f, maxDistance * maxDistance);
 
-	info("findNextPosition: DistToPoint=" + String::valueOf(sqrt(endDistanceSq)) + " MaxAllowed=" + String::valueOf(maxDistance), true);
+	//info("findNextPosition: DistToPoint=" + String::valueOf(sqrt(endDistanceSq)) + " MaxAllowed=" + String::valueOf(maxDistance), true);
 
 	float endDistZSq = endDistDiff.getZ() * endDistDiff.getZ();
 	endDistZSq = Math::getPrecision(endDistZSq, 2);
@@ -3693,13 +3693,13 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 
 	if (endDistanceSq <= maxSquared && fabs(endDistZSq) < (maxDistance + 1.f)) {
 		currentFoundPath = nullptr;
-		info("findNextPosition: Reached point! Popping...", true); // Add this
+		//info("findNextPosition: Reached point! Popping...", true); // Add this
 
 		if (patrolPoints.size() > 0)
 			patrolPoints.remove(0);
 
 		if (patrolPoints.size() > 0) {
-			info("findNextPosition: Chaining to next point. Remaining: " + String::valueOf(patrolPoints.size()), true);
+			//info("findNextPosition: Chaining to next point. Remaining: " + String::valueOf(patrolPoints.size()), true);
 			return true;
 		}
 
@@ -4409,8 +4409,7 @@ int AiAgentImplementation::setDestination() {
 	// info("homeLocation: " + homeLocation.toString(), true);
 
 	if (patrolPoints.size() > 20) {
-		info() << getObjectID() << " Patrol points have overflowed - Total points: " << patrolPoints.size() << " Movement State: " << stateCopy << " Saved Patrol point size: " << savedPatrolPoints.size();
-
+		//info() << getObjectID() << " Patrol points have overflowed - Total points: " << patrolPoints.size() << " Movement State: " << stateCopy << " Saved Patrol point size: " << savedPatrolPoints.size();
 		clearPatrolPoints();
 	}
 
