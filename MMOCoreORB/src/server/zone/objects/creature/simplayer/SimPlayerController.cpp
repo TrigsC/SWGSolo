@@ -1,6 +1,5 @@
 /*
  * SimPlayerController.cpp
- * Phase 16: OVERLOAD LOGGING MODE
  */
 
 #include "SimPlayerController.h"
@@ -15,13 +14,11 @@
 #include "server/zone/ZoneServer.h"
 #include "system/lang/System.h" 
 #include "server/zone/objects/creature/ai/bt/BlackboardData.h"
-#include "templates/params/creature/CreaturePosture.h" // Added for logging
+#include "templates/params/creature/CreaturePosture.h" 
 
 using namespace server::zone::objects::creature::ai::bt;
 
-// --------------------------------------------------------
-// Task Implementations
-// --------------------------------------------------------
+// ... (Task implementations remain the same) ...
 void FindResourcePathTask::run() {
     Reference<SimPlayerController*> strongCtrl = controller.get();
     if (strongCtrl == nullptr) return;
@@ -75,9 +72,6 @@ SimPlayerController::~SimPlayerController() {
     agent = nullptr;
 }
 
-// --------------------------------------------------------
-// LOGIC
-// --------------------------------------------------------
 void SimPlayerController::startSimLoop() {
     state = DECIDING;
     String res = pickRandomResource();
@@ -130,7 +124,6 @@ void SimPlayerController::goToResource(const String& resourceName) {
 
     Vector3 currentPos = agent->getWorldPosition();
     
-    // DEBUG LOG
     Logger::console.info("SimPlayer: [DEBUG] Searching for navmesh dest from: " + currentPos.toString(), true);
 
     Vector3 targetPos;
@@ -190,7 +183,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     destination = simPath.get(simPath.size() - 1).getPoint();
 
-    // Force Home Update
     agent->setHomeLocation(destination.getX(), destination.getZ(), destination.getY(), nullptr);
 
     Logger::console.info("SimPlayer: [DEBUG] Path Found (" + String::valueOf(path->size()) + " nodes). Dest: " + destination.toString(), true);
@@ -231,9 +223,6 @@ void SimPlayerController::queueMorePathNodes() {
 
     int currentQueued = agent->getPatrolPointSize();
     int slots = MAX_ENGINE_PATROL_POINTS - currentQueued;
-    
-    // DEBUG LOG
-    // Logger::console.info("SimPlayer: [DEBUG] Queueing nodes. Index=" + String::valueOf(simPathIndex) + " Queued=" + String::valueOf(currentQueued) + " Slots=" + String::valueOf(slots), true);
 
     if (slots <= 0) return;
 
@@ -278,10 +267,6 @@ void SimPlayerController::queueMorePathNodes() {
         simPathIndex++;
         slots--;
     }
-    
-    if (addedCount > 0) {
-        // Logger::console.info("SimPlayer: [DEBUG] Added " + String::valueOf(addedCount) + " points.", true);
-    }
 }
 
 void SimPlayerController::onPathFailed() {
@@ -295,9 +280,6 @@ void SimPlayerController::onPathFailed() {
     }
 }
 
-// --------------------------------------------------------
-// THE OVERLOADED WATCHDOG
-// --------------------------------------------------------
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
     if (state != MOVING) return;
@@ -323,7 +305,6 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
-    // --- OVERLOAD LOGGING ---
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
     float moveDy = currentPos.getY() - lastWatchdogPos.getY();
     float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
@@ -332,7 +313,6 @@ void SimPlayerController::checkArrival() {
         stuckWatchdogCount++;
         
         if (stuckWatchdogCount > 2) { 
-             // PRINT FULL STATUS
              StringBuffer msg;
              msg << "SimPlayer: [LAZY DETECTED] " << endl;
              msg << "   Pos: " << currentPos.toString() << endl;
@@ -346,25 +326,20 @@ void SimPlayerController::checkArrival() {
              
              Logger::console.info(msg.toString(), true);
 
-             // FORCE KICK
-             // If the behavior tree is stuck, we manually invoke the movement calculator.
              agent->stopWaiting();
-             
-             // 1. Ensure State
              if (agent->getMovementState() != AiAgent::PATROLLING) {
                  agent->setMovementState(AiAgent::PATROLLING);
              }
-             
-             // 2. Ensure Posture
              if (agent->getPosture() != CreaturePosture::UPRIGHT) {
                  agent->setPosture(CreaturePosture::UPRIGHT, true);
              }
 
-             // 3. NUCLEAR OPTION: Manually call findNextPosition logic
-             // This bypasses the Behavior Tree decision making and forces a physics update
-             agent->findNextPosition(50.0f, false); 
+             // --- FIX IS HERE ---
+             // Changed 50.0f to 0.5f. 
+             // This checks: "Are we within 0.5m?" -> NO.
+             // Result: Force Engine to Calculate Physics Movement towards point.
+             agent->findNextPosition(0.5f, false); 
              
-             // 4. Wake up the tree for next tick
              agent->activateAiBehavior(true);
         }
     } else {
@@ -381,7 +356,7 @@ void SimPlayerController::performSample() {
     state = SAMPLING;
     Logger::console.info("SimPlayer: State -> SAMPLING (15s)", true);
 
-    agent->clearPatrolPoints(); // Stop moving
+    agent->clearPatrolPoints(); 
     agent->setMovementState(AiAgent::OBLIVIOUS);
     agent->setPosture(CreaturePosture::CROUCHED, true);
     agent->doAnimation("sample"); 
