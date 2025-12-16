@@ -75,8 +75,8 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     agent->loadTemplateData(tmpl);
 
     // 1. FORCE SPEED & STATS
-    agent->setRunSpeed(3.0f); 
-    agent->setWalkSpeed(3.0f);
+    agent->setRunSpeed(5.0f); 
+    agent->setWalkSpeed(5.0f);
     for (int i=0; i<9; ++i) {
         agent->setMaxHAM(i, 5000, true);
         agent->setHAM(i, 5000);
