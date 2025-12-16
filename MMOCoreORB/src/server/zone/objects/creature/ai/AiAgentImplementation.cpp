@@ -3664,7 +3664,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     if (hasState(CreatureState::FROZEN)) newSpeed = 0.01f;
 
     float updateTicks = float(BEHAVIORINTERVAL) / 1000.f;
-    float maxSpeed = newSpeed * updateTicks; // Max distance we can travel this tick
+    float maxSpeed = newSpeed * updateTicks; 
 
     Vector3 currentPosition = getPosition();
     Vector3 currentWorldPos = getWorldPosition();
@@ -3690,7 +3690,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         if (patrolPoints.size() > 0) {
             if (isSimPlayer) info("DEBUG_MOVE: Cornering...", true);
             endMovementPosition = getNextPosition();
-            // Recalculate context for new target
+            // Recalculate
             currentPosition = getPosition();
             currentWorldPos = getWorldPosition();
             endDistDiff = Vector3(currentWorldPos - endMovementPosition.getWorldPosition());
@@ -3731,7 +3731,6 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     const WorldCoordinates endMovementCoords = endMovementPosition.getCoordinates();
     CellObject* endMovementCell = endMovementPosition.getCell();
 
-    // 1. Get Path
     if (currentFoundPath == nullptr) {
         if (currentParent != nullptr && currentParent->isCellObject()) currentPoint.setCell(currentParent.castTo<CellObject*>());
         path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementCoords, getZoneUnsafe()));
@@ -3753,21 +3752,15 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 
     if (currentParent != nullptr && endMovementCell != nullptr) pathFinder->filterPastPoints(path, asAiAgent());
 
-    // --- MULTI-NODE CONSUMPTION LOOP (THE FIX) ---
-    // We loop through the path nodes. If a node is close enough to be reached 
-    // within this tick's movement budget (maxSpeed), we consume it and aim for the next one.
-    
+    // --- MULTI-NODE CONSUMPTION LOOP (FIXED) ---
     WorldCoordinates nextMovementPosition;
-    float remainingDist = maxSpeed; // Our movement budget for this tick
+    float remainingDist = maxSpeed; 
     bool finalPosSet = false;
-
-    // Start looking from index 1 (0 is current pos)
     int pathIndex = 1; 
 
     while (pathIndex < path->size()) {
         nextMovementPosition = path->get(pathIndex);
         
-        // Transform to model space if needed
         CellObject* nextMovementCell = nextMovementPosition.getCell();
         uint64 nextParentID = nextMovementCell != nullptr ? nextMovementCell->getObjectID() : 0;
         uint64 currentParentID = currentParent != nullptr ? currentParent->getObjectID() : 0;
@@ -3780,29 +3773,16 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         Vector3 movementDiff(checkPos - nextMovementPosition.getWorldPosition());
         float distToNode = Math::sqrt(movementDiff.getX() * movementDiff.getX() + movementDiff.getY() * movementDiff.getY());
 
-        // If we can reach this node and still have movement left (or if it's trivially close)
         if (distToNode < remainingDist || distToNode < 0.5f) {
-            // We reached this node!
             if (pathIndex == path->size() - 1) {
-                // This is the end of the path
                 finalPosSet = true;
                 break; 
             }
-            
-            // Subtract cost and continue to next node
             remainingDist -= distToNode;
-            
-            // Update our "Current" position conceptually to this node for the next distance check
             currentPosition = nextMovementPosition.getPoint();
             currentParent = nextMovementCell; 
-            
-            // Remove the node we just "passed" from the path vector so we don't return to it
             path->remove(1); 
-            // Note: pathIndex stays 1 because we removed the element at 1, shifting everything down
         } else {
-            // We cannot fully reach this node. 
-            // Calculate interpolation point along the line to this node.
-            
             float dx = nextMovementPosition.getX() - checkPos.getX();
             float dy = nextMovementPosition.getY() - checkPos.getY();
             
@@ -3810,18 +3790,20 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
             interpPos.setX(checkPos.getX() + (remainingDist * (dx / distToNode)));
             interpPos.setY(checkPos.getY() + (remainingDist * (dy / distToNode)));
             
-            // Handle Z
             if (!isInNavMesh() && currentParent == nullptr) interpPos.setZ(getWorldZ(interpPos));
             else interpPos.setZ(nextMovementPosition.getZ());
 
-            nextMovementPosition.setPoint(interpPos);
+            // FIX: Replaced setPoint() with setX/Y/Z
+            nextMovementPosition.setX(interpPos.getX());
+            nextMovementPosition.setY(interpPos.getY());
+            nextMovementPosition.setZ(interpPos.getZ());
+            
             finalPosSet = true;
             break;
         }
     }
 
     if (!finalPosSet) {
-        // Fallback if loop didn't set it (shouldn't happen unless path empty)
         nextMovementPosition = path->get(1);
     }
 
@@ -3829,7 +3811,6 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     nextStepPosition.setPosition(nextMovementPosition.getX(), nextMovementPosition.getZ(), nextMovementPosition.getY());
     nextStepPosition.setCell(nextMovementPosition.getCell());
 
-    // Calculate Direction
     float dx = nextMovementPosition.getX() - getPositionX();
     float dy = nextMovementPosition.getY() - getPositionY();
     float directionAngle = atan2(dy, dx);
@@ -3839,12 +3820,10 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     float error = fabs(directionAngle - direction.getRadians());
     if (error >= 0.05) setDirection(directionAngle);
 
-    // Set Interval based on distance traveled
-    float distTraveled = currentPosition.distanceTo(nextMovementPosition.getPoint()); // approx
-    if (distTraveled == 0) distTraveled = maxSpeed; // Prevent divide by zero
+    float distTraveled = currentPosition.distanceTo(nextMovementPosition.getPoint()); 
+    if (distTraveled == 0) distTraveled = maxSpeed;
 
     auto interval = BEHAVIORINTERVAL;
-    // Ensure we don't set a 0ms interval
     nextBehaviorInterval = Math::max((int)50, Math::min((int)((distTraveled / newSpeed) * 1000 + 0.5), interval));
     
     currentSpeed = newSpeed;
