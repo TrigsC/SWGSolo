@@ -3633,107 +3633,125 @@ void AiAgentImplementation::checkNewAngle() {
  * range or they have reached their maxDistance to the point.
 */
 bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
-	/*
-	 * SETUP: Check speed and posture before attempting to find a path
-	 */
+    /*
+     * SETUP: Check speed and posture before attempting to find a path
+     */
 
 #ifdef DEBUG_AI
-	if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
-		info("findNextPosition(" + String::valueOf(maxDistance) + ", " + String::valueOf(walk) + ")", true);
+    if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
+        info("findNextPosition(" + String::valueOf(maxDistance) + ", " + String::valueOf(walk) + ")", true);
 #endif // DEBUG_AI
 
-	Locker locker(&targetMutex);
+    // ------------------------------------------------------------------
+    // DEBUG: Stutter Diagnostic for light_jedi_sentinel
+    // ------------------------------------------------------------------
+    bool debugMode = false;
+    
+    // FIX: Correct way to check template name
+    const CreatureTemplate* tmpl = getCreatureTemplate();
+    if (tmpl != nullptr && tmpl->getTemplateName() == "light_jedi_sentinel") {
+        debugMode = true;
+    }
+    // ------------------------------------------------------------------
 
-	info("findNextPosition: Points=" + String::valueOf(getPatrolPointSize()) + " Dist=" + String::valueOf(maxDistance), true);
+    Locker locker(&targetMutex);
 
-	if (isDead() || getPatrolPointSize() <= 0) {
-		info("findNextPosition: Empty Queue or Dead. Stopping.", true);
-		return false;
-	}
+    if (debugMode) {
+        info("findNextPosition: Points=" + String::valueOf(getPatrolPointSize()) + " Dist=" + String::valueOf(maxDistance), true);
+    }
 
-	int posture = getPosture();
-	int movementState = getMovementState();
+    if (isDead() || getPatrolPointSize() <= 0) {
+        if (debugMode) info("findNextPosition: Empty Queue or Dead. Stopping.", true);
+        return false;
+    }
 
-	if (posture == CreaturePosture::CROUCHED)
-		return false;
+    int posture = getPosture();
+    int movementState = getMovementState();
 
-	float newSpeed = runSpeed;
+    if (posture == CreaturePosture::CROUCHED)
+        return false;
 
-	if (movementState == AiAgent::FLEEING && isInCombat())
-		newSpeed *= 0.7f;
+    float newSpeed = runSpeed;
 
-	if ((walk && movementState != AiAgent::FLEEING) || posture == CreaturePosture::PRONE)
-		newSpeed = walkSpeed;
+    if (movementState == AiAgent::FLEEING && isInCombat())
+        newSpeed *= 0.7f;
 
-	if (hasState(CreatureState::IMMOBILIZED))
-		newSpeed = newSpeed / 2.f;
+    if ((walk && movementState != AiAgent::FLEEING) || posture == CreaturePosture::PRONE)
+        newSpeed = walkSpeed;
 
-	if (hasState(CreatureState::FROZEN))
-		newSpeed = 0.01f;
+    if (hasState(CreatureState::IMMOBILIZED))
+        newSpeed = newSpeed / 2.f;
 
-	float updateTicks = float(BEHAVIORINTERVAL) / 1000.f;
-	float maxSpeed = newSpeed * updateTicks; // maxSpeed is the distance able to travel in time updateTicks
+    if (hasState(CreatureState::FROZEN))
+        newSpeed = 0.01f;
 
-	Vector3 currentPosition = getPosition();
-	Vector3 currentWorldPos = getWorldPosition();
-	PatrolPoint endMovementPosition = getNextPosition();
+    float updateTicks = float(BEHAVIORINTERVAL) / 1000.f;
+    float maxSpeed = newSpeed * updateTicks; 
 
-	Vector3 endDistDiff(currentWorldPos - endMovementPosition.getWorldPosition());
-	float endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
-	float maxSquared = Math::max(0.1f, maxDistance * maxDistance);
+    Vector3 currentPosition = getPosition();
+    Vector3 currentWorldPos = getWorldPosition();
+    PatrolPoint endMovementPosition = getNextPosition();
 
-	//info("findNextPosition: DistToPoint=" + String::valueOf(sqrt(endDistanceSq)) + " MaxAllowed=" + String::valueOf(maxDistance), true);
+    Vector3 endDistDiff(currentWorldPos - endMovementPosition.getWorldPosition());
+    float endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
+    float maxSquared = Math::max(0.1f, maxDistance * maxDistance);
 
-	float endDistZSq = endDistDiff.getZ() * endDistDiff.getZ();
-	endDistZSq = Math::getPrecision(endDistZSq, 2);
+    float endDistZSq = endDistDiff.getZ() * endDistDiff.getZ();
+    endDistZSq = Math::getPrecision(endDistZSq, 2);
 
-#ifdef DEBUG_FINDNEXTPOSITION
-	info(true) << "findNextPosition -- ID: " <<  getObjectID() << " endDistSquared = " << endDistanceSq << "  maxSquared = " << maxSquared << " endDistDiff Z = " << endDistZSq << " Max Distance = " << maxDistance;
-#endif
-
-	if (endDistanceSq <= maxSquared && fabs(endDistZSq) < (maxDistance + 1.f)) {
+    // ------------------------------------------------------------------
+    // STUTTER LOGGING (PRE-ARRIVAL)
+    // ------------------------------------------------------------------
+    if (debugMode) {
+        StringBuffer msg;
+        msg << "DEBUG_MOVE: DistSq=" << endDistanceSq 
+            << " MaxSq=" << maxSquared 
+            << " CurrentSpeed=" << currentSpeed 
+            << " NewSpeed=" << newSpeed;
         
-        // LOGGING: Prove we reached the point
-        if (getCreatureTemplateName() == "light_jedi_sentinel") {
-             info("DEBUG_MOVE: Reached Point! DistSq=" + String::valueOf(endDistanceSq) + " QueueSize=" + String::valueOf(patrolPoints.size()), true);
+        if (currentSpeed < 0.1f) msg << " [STALLED]";
+        info(msg.toString(), true);
+    }
+
+    // ------------------------------------------------------------------
+    // ARRIVAL LOGIC
+    // ------------------------------------------------------------------
+    if (endDistanceSq <= maxSquared && fabs(endDistZSq) < (maxDistance + 1.f)) {
+        
+        if (debugMode) {
+             info("DEBUG_MOVE: Reached Point! Popping...", true);
         }
 
         currentFoundPath = nullptr;
-        
+
         if (patrolPoints.size() > 0)
             patrolPoints.remove(0);
 
         if (patrolPoints.size() > 0) {
-            // --- THE FIX ---
-            // Do NOT return true here. 
-            // Instead, update the target immediately and let the function continue 
-            // to calculate the path/velocity for the NEXT point in this same frame.
-            
-            if (getCreatureTemplateName() == "light_jedi_sentinel") {
+            // -------------------------------------------------------
+            // STUTTER FIX: CONTINUOUS MOVEMENT
+            // -------------------------------------------------------
+            if (debugMode) {
                  info("DEBUG_MOVE: Cornering... switching target immediately.", true);
             }
 
-            // 1. Update the target to the NEW point
+            // 1. Update the target to the NEW point immediately
             endMovementPosition = getNextPosition();
             
-            // 2. Recalculate distances for the NEW target so the rest of the logic works
+            // 2. Recalculate distances for the NEW target
             currentPosition = getPosition();
             currentWorldPos = getWorldPosition();
             
             endDistDiff = Vector3(currentWorldPos - endMovementPosition.getWorldPosition());
             endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
             
-            // 3. Reset maxSquared relative to the new target check (optional, but safe)
             maxSquared = Math::max(0.1f, maxDistance * maxDistance);
-            
-            // 4. Force a new path calculation logic below
-            // (We already set currentFoundPath = nullptr above)
-            
-            // FALL THROUGH -> Do not return! Let it run the pathfinder below!
+
+            // FALL THROUGH to calculation logic below instead of returning!
             
         } else {
             // Queue is empty, NOW we stop.
-            if (getCreatureTemplateName() == "light_jedi_sentinel") {
+            if (debugMode) {
                  info("DEBUG_MOVE: Queue empty. Stopping.", true);
             }
 
@@ -3746,296 +3764,161 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         }
     }
 
-	// Handle speed up and slow down
-	if ((((currentSpeed * currentSpeed) * maxSquared) > endDistanceSq) && newSpeed > 0.4f) {
-		newSpeed = Math::max(0.2f, (currentSpeed - 0.4f));
-	} else if (currentSpeed < newSpeed) {
-		float speedDiff = newSpeed - currentSpeed;
-
-		if (speedDiff > 0.4f)
-			newSpeed = currentSpeed + 0.4f;
-	}
-
-	setCurrentSpeed(newSpeed);
-	updateLocomotion();
-
-#ifdef DEBUG_FINDNEXTPOSITION
-	StringBuffer msg1;
-
-	msg1 << "\n--- !!!!    findNextPosition -- Start -- !!!! ----- " << endl
-	<< "Patrol Points Size = " << patrolPoints.size() << endl
-	<< "Current World Position X = " << currentWorldPos.getX() << " Z = " << currentWorldPos.getZ() << " Y = " << currentWorldPos.getY() << endl
-	<< "End Movement Position X = " << endMovementPosition.getWorldPosition().getX() << " Z = " << endMovementPosition.getWorldPosition().getZ() << " Y = " << endMovementPosition.getWorldPosition().getY() << endl
-
-	<< "endDistanceSq = " << endDistanceSq << endl
-	<< "maxSquared = " << maxSquared << endl
-	<< "max distance = " << maxDistance << endl;
-
-	info(true) << msg1.toString();
-#endif
-
-	PathFinderManager* pathFinder = PathFinderManager::instance();
-
-	if (pathFinder == nullptr) {
-		return false;
-	}
-
-	/*
-	*	STEP 1: If we do not already have a path referenced, find a new path
-	*/
-
-	Reference<Vector<WorldCoordinates>* > path = nullptr;
-	ManagedReference<SceneObject*> currentParent = getParent().get();
-
-	PatrolPoint currentPoint(currentPosition);
-	const WorldCoordinates endMovementCoords = endMovementPosition.getCoordinates();
-	CellObject* endMovementCell = endMovementPosition.getCell();
-
-	if (currentFoundPath == nullptr) {
-		// No prior path or path is null, find new path
-		if (currentParent != nullptr && currentParent->isCellObject()) {
-			currentPoint.setCell(currentParent.castTo<CellObject*>());
-		}
-
-		path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementCoords, getZoneUnsafe()));
-	} else {
-		if (currentParent != nullptr && !currentParent->isCellObject()) {
-			currentParent = nullptr;
-		}
-
-		if ((movementState == AiAgent::FOLLOWING || movementState == AiAgent::PATHING_HOME || movementState == AiAgent::NOTIFY_ALLY || movementState == AiAgent::MOVING_TO_HEAL || movementState == AiAgent::WATCHING || movementState == AiAgent::CRACKDOWN_SCANNING || movementState == AiAgent::LAIR_HEALING)
-			&& endMovementCell == nullptr && currentParent == nullptr && currentFoundPath->get(currentFoundPath->size() - 1).getWorldPosition().squaredDistanceTo(endMovementCoords.getWorldPosition()) > 4 * 4) {
-
-			path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementPosition.getCoordinates(), getZoneUnsafe()));
-		} else {
-			currentFoundPath->set(0, WorldCoordinates(currentPosition, currentParent.castTo<CellObject*>()));
-			path = currentFoundPath;
-		}
-	}
-
-	if (path == nullptr) {
-		currentFoundPath = nullptr;
-
-		return false;
-	} else if (path->size() < 2) {
-		currentFoundPath = nullptr;
-		path == nullptr;
-
-		return false;
-	}
-
-#ifdef SHOW_PATH
-	CreateClientPathMessage* pathMessage = new CreateClientPathMessage();
-	if (getParent() == nullptr && pathMessage != nullptr) {
-		pathMessage->addCoordinate(currentPosition.getX(), currentPosition.getZ(), currentPosition.getY());
-	}
-#endif
-
-	// Filter out duplicate path points
-	if (currentParent != nullptr && endMovementCell != nullptr) {
-		pathFinder->filterPastPoints(path, asAiAgent());
-	}
-
-	// the farthest we will move is one point in the path, and the movement update time will change to reflect that
-	WorldCoordinates nextMovementPosition;
-
-	nextMovementPosition = path->get(1);
-
-	if (nextMovementPosition.getX() == currentPosition.getX() && nextMovementPosition.getY() == currentPosition.getY()) {
-		path->remove(1);
-
-		if (path->size() >= 2) {
-			nextMovementPosition = path->get(1);
-		} else {
-			path = nullptr;
-			currentFoundPath = nullptr;
-
-			return false;
-		}
-	}
-
-	CellObject* nextMovementCell = nextMovementPosition.getCell();
-	uint64 currentParentID = currentParent != nullptr ? currentParent->getObjectID() : 0;
-	uint64 nextParentID = nextMovementCell != nullptr ? nextMovementCell->getObjectID() : 0;
-
-	if (currentParentID != nextParentID && nextParentID > 0) {
-		currentPosition = PathFinderManager::transformToModelSpace(currentPosition, nextMovementCell->getParent().get());
-	}
-
-	Vector3 movementDiff(currentWorldPos - nextMovementPosition.getWorldPosition());
-
-	// Determine the distance to the next point excluding the Z coordnate
-	float nextMovementDistance = Math::sqrt(movementDiff.getX() * movementDiff.getX() + movementDiff.getY() * movementDiff.getY());
-	float maxDist = maxSpeed;
-
-	if (endDistanceSq > maxSquared) {
-		// this is the actual "distance we can travel" calculation. We only want to
-		// go to the edge of the maxDistance radius and stop, so select the minimum
-		// of either our max travel distance (maxSpeed) or the distance from the
-		// maxDistance radius
-		maxDist = Math::min(maxSpeed, endDistanceSq - maxSquared + 0.1f);
-	}
-
-#ifdef DEBUG_AI
-	if (nextMovementDistance <= 0) {
-		/*info(true) << "findNextPosition -- ID: " <<  getObjectID() << " endDistSquared = " << endDistanceSq << "  maxSquared = " << maxSquared << "   For:  " << getObjectID();
-		info(true) << " ----- >>>>>>>> nextMovementDistance = " << nextMovementDistance << "   For: " << getObjectID() << " Movement State = " << movementState << " Path size: " << path->size() << "  Patrol points total = " << getPatrolPointSize() << "  Location: " << currentPosition.toString() << "    Next Position = " << nextMovementPosition.getWorldPosition().toString();*/
-	}
-#endif
-
-#ifdef DEBUG_PATHING
-	printf("findNextPosition - Path Size = %i ---  \n", path->size());
-
-	printf("max speed = %f \n", maxSpeed);
-	printf("max distance = %f \n", maxDist);
-	printf("Current Position x = %f , ", currentPosition.getX());
-	printf(" z = %f \n", currentPosition.getZ());
-	printf(" y = %f \n", currentPosition.getY());
-
-	printf("Next Movement Position X = %f , ", nextMovementPosition.getX());
-	printf(" Z = %f \n", nextMovementPosition.getZ());
-	printf(" Y = %f \n", nextMovementPosition.getY());
-	printf("nextMovementDistance = %f \n", nextMovementDistance);
-
-	/*printf(" - Current Path Points - \n");
-
-	for (int i = 0; i < path->size(); ++i) {
-		WorldCoordinates pos = path->get(i);
-
-		printf("Point # %i ", i);
-		printf(" X = %f , ", pos.getX());
-		printf(" Z = %f ", pos.getZ());
-		printf(" Y = %f \n", pos.getY());
-
-		if (pos.getCell() == nullptr)
-			printf(" Cell is null \n");
-	}*/
-#endif
-	Vector3 newPosition;
-
-	if (nextMovementDistance > maxDist && currentParentID == nextParentID) {
-		// nextMovementPosition is further then the maxDist and both points are in the same parent or in the zone
-		// Calculate the distance we can go and set the new nextMovementPosition
-		float dx = nextMovementPosition.getX() - currentPosition.getX();
-		float dy = nextMovementPosition.getY() - currentPosition.getY();
-
-		newPosition.setX(currentPosition.getX() + (maxDist * (dx / nextMovementDistance)));
-		newPosition.setY(currentPosition.getY() + (maxDist * (dy / nextMovementDistance)));
-	} else {
-		newPosition.setX(nextMovementPosition.getX());
-		newPosition.setY(nextMovementPosition.getY());
-
-		path->remove(1);
-	}
-
-	// Handle next Z coordinate
-	if (!isInNavMesh() && currentParent == nullptr) {
-		newPosition.setZ(getWorldZ(newPosition));
-	} else {
-		newPosition.setZ(nextMovementPosition.getZ());
-	}
-
-	nextMovementPosition.setX(newPosition.getX());
-	nextMovementPosition.setY(newPosition.getY());
-	nextMovementPosition.setZ(newPosition.getZ());
-
-#ifdef SHOW_PATH
-		for (int i = 1; i < path->size(); ++i) { // i = 0 is our position
-			const WorldCoordinates& nextPositionDebug = path->get(i);
-
-			Vector3 nextWorldPos = nextPositionDebug.getWorldPosition();
-
-			if (nextPositionDebug.getCell() == nullptr)
-				pathMessage->addCoordinate(nextWorldPos.getX(), currentPosition.getZ(), nextWorldPos.getY());
-		}
-
-		broadcastMessage(pathMessage, false);
-#endif
-
-#ifdef SHOW_NEXT_POSITION
-		for (int i = 0; i < movementMarkers.size(); ++i) {
-			ManagedReference<SceneObject*> marker = movementMarkers.get(i);
-
-			Core::getTaskManager()->scheduleTask([marker] {
-				Locker clocker(marker);
-				marker->destroyObjectFromWorld(false);
-			}, "DestroyMarker", 2000);
-		}
-
-		movementMarkers.removeAll();
-
-		for (int i = 1; i < path->size(); ++i) { // i = 0 is our position
-			const WorldCoordinates& nextPositionDebug = path->get(i);
-
-			Vector3 nextWorldPos = nextPositionDebug.getWorldPosition();
-
-			Reference<SceneObject*> movementMarker = getZoneServer()->createObject(STRING_HASHCODE("object/path_waypoint/path_waypoint.iff"), 0);
-
-			Locker clocker(movementMarker, asAiAgent());
-
-			movementMarker->initializePosition(nextPositionDebug.getX(), nextPositionDebug.getZ(), nextPositionDebug.getY());
-			StringBuffer msg;
-			msg << "Next Position: path distance: " << nextPositionDebug.getWorldPosition().distanceTo(getWorldPosition()) << " maxDist:" << maxDist;
-			movementMarker->setCustomObjectName(msg.toString(), false);
-
-			CellObject* cellObject = nextPositionDebug.getCell();
-
-			if (cellObject != nullptr) {
-				cellObject->transferObject(movementMarker, -1, true);
-			} else {
-				getZone()->transferObject(movementMarker, -1, true);
-			}
-
-			movementMarkers.add(movementMarker);
-		}
-#endif
-
-	/*
-	* STEP 3: Send the movement updates
-	*/
-
-	// Set the next place we will be if we are to move
-	nextStepPosition.setPosition(nextMovementPosition.getX(), nextMovementPosition.getZ(), nextMovementPosition.getY());
-	nextStepPosition.setCell(nextMovementCell);
-
-	float dx = nextMovementPosition.getX() - getPositionX();
-	float dy = nextMovementPosition.getY() - getPositionY();
-
-	float directionAngle = atan2(dy, dx);
-
-	directionAngle = M_PI / 2 - directionAngle;
-
-	if (directionAngle < 0) {
-		float a = M_PI + directionAngle;
-		directionAngle = M_PI + a;
-	}
-
-	float error = fabs(directionAngle - direction.getRadians());
-
-	if (error >= 0.05) {
-		setDirection(directionAngle);
-	}
-
-	auto interval = BEHAVIORINTERVAL;
-	nextBehaviorInterval = Math::min((int)((Math::min(nextMovementDistance, maxDist) / newSpeed) * 1000 + 0.5), interval);
-	currentSpeed = newSpeed;
-
-	updateCurrentPosition(&nextStepPosition);
-
-	if (isPet()) {
-		updatePetSwimmingState();
-	}
-
-#ifdef DEBUG_AI
-	if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
-		info("findNextPosition - complete returning true", true);
-#endif // DEBUG_AI
-
-#ifdef DEBUG_FINDNEXTPOSITION
-	printf("----   !!!!   findNextPosition -- End --   !!!! -----\n");
-#endif
-
-	return true;
+    // Handle speed up and slow down
+    if ((((currentSpeed * currentSpeed) * maxSquared) > endDistanceSq) && newSpeed > 0.4f) {
+        newSpeed = Math::max(0.2f, (currentSpeed - 0.4f));
+    } else if (currentSpeed < newSpeed) {
+        float speedDiff = newSpeed - currentSpeed;
+
+        if (speedDiff > 0.4f)
+            newSpeed = currentSpeed + 0.4f;
+    }
+
+    setCurrentSpeed(newSpeed);
+    updateLocomotion();
+
+    PathFinderManager* pathFinder = PathFinderManager::instance();
+
+    if (pathFinder == nullptr) {
+        return false;
+    }
+
+    /*
+    * STEP 1: If we do not already have a path referenced, find a new path
+    */
+
+    Reference<Vector<WorldCoordinates>* > path = nullptr;
+    ManagedReference<SceneObject*> currentParent = getParent().get();
+
+    PatrolPoint currentPoint(currentPosition);
+    const WorldCoordinates endMovementCoords = endMovementPosition.getCoordinates();
+    CellObject* endMovementCell = endMovementPosition.getCell();
+
+    if (currentFoundPath == nullptr) {
+        if (currentParent != nullptr && currentParent->isCellObject()) {
+            currentPoint.setCell(currentParent.castTo<CellObject*>());
+        }
+
+        path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementCoords, getZoneUnsafe()));
+    } else {
+        if (currentParent != nullptr && !currentParent->isCellObject()) {
+            currentParent = nullptr;
+        }
+
+        if ((movementState == AiAgent::FOLLOWING || movementState == AiAgent::PATHING_HOME || movementState == AiAgent::NOTIFY_ALLY || movementState == AiAgent::MOVING_TO_HEAL || movementState == AiAgent::WATCHING || movementState == AiAgent::CRACKDOWN_SCANNING || movementState == AiAgent::LAIR_HEALING)
+            && endMovementCell == nullptr && currentParent == nullptr && currentFoundPath->get(currentFoundPath->size() - 1).getWorldPosition().squaredDistanceTo(endMovementCoords.getWorldPosition()) > 4 * 4) {
+
+            path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementPosition.getCoordinates(), getZoneUnsafe()));
+        } else {
+            currentFoundPath->set(0, WorldCoordinates(currentPosition, currentParent.castTo<CellObject*>()));
+            path = currentFoundPath;
+        }
+    }
+
+    if (path == nullptr) {
+        currentFoundPath = nullptr;
+        return false;
+    } else if (path->size() < 2) {
+        currentFoundPath = nullptr;
+        return false;
+    }
+
+    // Filter out duplicate path points
+    if (currentParent != nullptr && endMovementCell != nullptr) {
+        pathFinder->filterPastPoints(path, asAiAgent());
+    }
+
+    WorldCoordinates nextMovementPosition;
+    nextMovementPosition = path->get(1);
+
+    if (nextMovementPosition.getX() == currentPosition.getX() && nextMovementPosition.getY() == currentPosition.getY()) {
+        path->remove(1);
+
+        if (path->size() >= 2) {
+            nextMovementPosition = path->get(1);
+        } else {
+            path = nullptr;
+            currentFoundPath = nullptr;
+            return false;
+        }
+    }
+
+    CellObject* nextMovementCell = nextMovementPosition.getCell();
+    uint64 currentParentID = currentParent != nullptr ? currentParent->getObjectID() : 0;
+    uint64 nextParentID = nextMovementCell != nullptr ? nextMovementCell->getObjectID() : 0;
+
+    if (currentParentID != nextParentID && nextParentID > 0) {
+        currentPosition = PathFinderManager::transformToModelSpace(currentPosition, nextMovementCell->getParent().get());
+    }
+
+    Vector3 movementDiff(currentWorldPos - nextMovementPosition.getWorldPosition());
+    float nextMovementDistance = Math::sqrt(movementDiff.getX() * movementDiff.getX() + movementDiff.getY() * movementDiff.getY());
+    float maxDist = maxSpeed;
+
+    if (endDistanceSq > maxSquared) {
+        maxDist = Math::min(maxSpeed, endDistanceSq - maxSquared + 0.1f);
+    }
+
+    Vector3 newPosition;
+
+    if (nextMovementDistance > maxDist && currentParentID == nextParentID) {
+        float dx = nextMovementPosition.getX() - currentPosition.getX();
+        float dy = nextMovementPosition.getY() - currentPosition.getY();
+
+        newPosition.setX(currentPosition.getX() + (maxDist * (dx / nextMovementDistance)));
+        newPosition.setY(currentPosition.getY() + (maxDist * (dy / nextMovementDistance)));
+    } else {
+        newPosition.setX(nextMovementPosition.getX());
+        newPosition.setY(nextMovementPosition.getY());
+        path->remove(1);
+    }
+
+    if (!isInNavMesh() && currentParent == nullptr) {
+        newPosition.setZ(getWorldZ(newPosition));
+    } else {
+        newPosition.setZ(nextMovementPosition.getZ());
+    }
+
+    nextMovementPosition.setX(newPosition.getX());
+    nextMovementPosition.setY(newPosition.getY());
+    nextMovementPosition.setZ(newPosition.getZ());
+
+    /*
+    * STEP 3: Send the movement updates
+    */
+    nextStepPosition.setPosition(nextMovementPosition.getX(), nextMovementPosition.getZ(), nextMovementPosition.getY());
+    nextStepPosition.setCell(nextMovementCell);
+
+    float dx = nextMovementPosition.getX() - getPositionX();
+    float dy = nextMovementPosition.getY() - getPositionY();
+    float directionAngle = atan2(dy, dx);
+    directionAngle = M_PI / 2 - directionAngle;
+
+    if (directionAngle < 0) {
+        float a = M_PI + directionAngle;
+        directionAngle = M_PI + a;
+    }
+
+    float error = fabs(directionAngle - direction.getRadians());
+    if (error >= 0.05) {
+        setDirection(directionAngle);
+    }
+
+    auto interval = BEHAVIORINTERVAL;
+    nextBehaviorInterval = Math::min((int)((Math::min(nextMovementDistance, maxDist) / newSpeed) * 1000 + 0.5), interval);
+    currentSpeed = newSpeed;
+
+    updateCurrentPosition(&nextStepPosition);
+
+    if (isPet()) {
+        updatePetSwimmingState();
+    }
+
+    if (debugMode) {
+        info("findNextPosition - complete returning true", true);
+    }
+
+    return true;
 }
 
 bool AiAgentImplementation::checkLineOfSight(SceneObject* obj) {
