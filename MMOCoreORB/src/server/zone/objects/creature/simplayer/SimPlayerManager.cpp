@@ -9,7 +9,7 @@
 #include "server/zone/managers/creature/CreatureTemplateManager.h" 
 #include "server/zone/objects/creature/ai/CreatureTemplate.h" 
 #include "server/zone/objects/creature/ai/AiAgent.h"
-#include "server/zone/objects/creature/ai/PatrolPoint.h"
+#include "server/zone/objects/creature/ai/PatrolPoint.h" 
 #include "templates/params/creature/ObjectFlag.h" 
 
 SimPlayerManager::SimPlayerManager() {
@@ -107,12 +107,13 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
     } else {
         info("Starting SimPlayer for agent " + String::valueOf(oid), true);
         
-        // --- BRAIN TRANSPLANT 2.0 ---
-        // 'default' didn't work. 'townsperson' definitely knows how to patrol.
-        agent->setCustomAiMap(String("townsperson").hashCode());
+        // --- BRAIN TRANSPLANT 3.0 ---
+        // "townsperson" was likely not a valid map key, resulting in an empty brain.
+        // "patrol" is a core AI behavior tree designed specifically for following points.
+        agent->setCustomAiMap(String("patrol").hashCode());
         agent->setAITemplate(); 
         
-        info("BRAIN TRANSPLANT: Set map to 'townsperson' and reloaded tree.", true);
+        info("BRAIN TRANSPLANT: Set map to 'patrol' and reloaded tree.", true);
 
         agent->writeBlackboard("simAlwaysActive", true);
         agent->setSimAlwaysActive(true);
@@ -122,8 +123,6 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         Reference<SimPlayerController*> ctrl = new SimPlayerController(agent);
         controllers.put(oid, ctrl);
         
-        // --- MOVEMENT PUMP PRIMING ---
-        // Ensure the behavior tree wakes up immediately
         agent->activateAiBehavior(true);
         
         ctrl->startSimLoop();

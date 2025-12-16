@@ -336,32 +336,35 @@ void SimPlayerController::checkArrival() {
              StringBuffer msg;
              msg << "SimPlayer: [LAZY DETECTED] " << endl;
              msg << "   Pos: " << currentPos.toString() << endl;
-             msg << "   Next Point (Queue[0]): ";
              
              if (agent->getPatrolPointSize() > 0) {
                  PatrolPoint pp = agent->getNextPosition();
-                 msg << pp.getWorldPosition().toString();
+                 msg << "   Next Point: " << pp.getWorldPosition().toString();
              } else {
-                 msg << "EMPTY QUEUE";
+                 msg << "   Queue EMPTY";
              }
-             msg << endl;
-             msg << "   Posture: " << agent->getPosture() << " (Upright=" << CreaturePosture::UPRIGHT << ")" << endl;
-             msg << "   State: " << agent->getMovementState() << " (Patrol=4)" << endl;
-             msg << "   Max Speed: " << agent->getRunSpeed() << endl;
-             msg << "   FollowObject: " << (agent->getFollowObject().get() != nullptr ? "YES" : "NO") << endl;
              
              Logger::console.info(msg.toString(), true);
 
-             // POKE
+             // FORCE KICK
+             // If the behavior tree is stuck, we manually invoke the movement calculator.
              agent->stopWaiting();
+             
+             // 1. Ensure State
              if (agent->getMovementState() != AiAgent::PATROLLING) {
-                 Logger::console.info("SimPlayer: [FIX] Forcing State to PATROLLING", true);
                  agent->setMovementState(AiAgent::PATROLLING);
              }
+             
+             // 2. Ensure Posture
              if (agent->getPosture() != CreaturePosture::UPRIGHT) {
-                 Logger::console.info("SimPlayer: [FIX] Forcing Posture to UPRIGHT", true);
                  agent->setPosture(CreaturePosture::UPRIGHT, true);
              }
+
+             // 3. NUCLEAR OPTION: Manually call findNextPosition logic
+             // This bypasses the Behavior Tree decision making and forces a physics update
+             agent->findNextPosition(50.0f, false); 
+             
+             // 4. Wake up the tree for next tick
              agent->activateAiBehavior(true);
         }
     } else {
