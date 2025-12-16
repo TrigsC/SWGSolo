@@ -182,7 +182,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     }
 
     destination = simPath.get(simPath.size() - 1).getPoint();
-
     agent->setHomeLocation(destination.getX(), destination.getZ(), destination.getY(), nullptr);
 
     Logger::console.info("SimPlayer: [DEBUG] Path Found (" + String::valueOf(path->size()) + " nodes). Dest: " + destination.toString(), true);
@@ -284,7 +283,9 @@ void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
     if (state != MOVING) return;
 
+    // --- ENFORCE RUNNING ---
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
+    
     if (agent->isWaiting()) {
         agent->stopWaiting();
     }
@@ -299,16 +300,25 @@ void SimPlayerController::checkArrival() {
     float dy = currentPos.getY() - destination.getY();
     float distSq = (dx*dx) + (dy*dy);
 
+    // Standard Arrival (Near Target)
     if (distSq < 16.0f) { 
         Logger::console.info("SimPlayer: ARRIVED.", true);
         performSample();
         return;
     } 
 
+    // --- SAFETY CATCH: Queue Ran Dry ---
+    if (agent->getPatrolPointSize() == 0 && simPathIndex >= simPath.size()) {
+         Logger::console.info("SimPlayer: [NOTICE] Path ended before exact destination. Assuming arrival.", true);
+         performSample();
+         return;
+    }
+
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
     float moveDy = currentPos.getY() - lastWatchdogPos.getY();
     float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
 
+    // If moved less than 0.1m in 1 second
     if (movedDistSq < 0.1f) {
         stuckWatchdogCount++;
         
@@ -334,10 +344,7 @@ void SimPlayerController::checkArrival() {
                  agent->setPosture(CreaturePosture::UPRIGHT, true);
              }
 
-             // --- FIX IS HERE ---
-             // Changed 50.0f to 0.5f. 
-             // This checks: "Are we within 0.5m?" -> NO.
-             // Result: Force Engine to Calculate Physics Movement towards point.
+             // Kick logic (0.5f tolerance)
              agent->findNextPosition(0.5f, false); 
              
              agent->activateAiBehavior(true);

@@ -74,7 +74,9 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
 
     agent->loadTemplateData(tmpl);
 
-    agent->setRunSpeed(6.0f); 
+    // 1. FORCE SPEED & STATS
+    agent->setRunSpeed(7.0f); // Slightly faster than default
+    agent->setWalkSpeed(7.0f); // Make walk speed fast too, just in case
     for (int i=0; i<9; ++i) {
         agent->setMaxHAM(i, 5000, true);
         agent->setHAM(i, 5000);
@@ -82,9 +84,14 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
 
     agent->setHomeLocation(x, z, y, nullptr);
     
-    // PACIFIST MODE
+    // 2. PACIFIST & BLIND MODE
     agent->setCreatureBitmask(agent->getCreatureBitmask() & ~ObjectFlag::PACK & ~ObjectFlag::HERD & ~ObjectFlag::KILLER & ~ObjectFlag::STALKER);
     agent->setPvpStatusBitmask(agent->getPvpStatusBitmask() & ~ObjectFlag::AGGRESSIVE & ~ObjectFlag::ENEMY);
+    
+    // --- BLIND THE BOT ---
+    agent->setAggroRadius(0);
+    agent->setMoverType(0); // Standard mover
+    agent->setChanceHit(0); 
 
     toggleBot(agent);
 }
@@ -107,9 +114,7 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
     } else {
         info("Starting SimPlayer for agent " + String::valueOf(oid), true);
         
-        // --- BRAIN TRANSPLANT 3.0 ---
-        // "townsperson" was likely not a valid map key, resulting in an empty brain.
-        // "patrol" is a core AI behavior tree designed specifically for following points.
+        // Use 'patrol' map
         agent->setCustomAiMap(String("patrol").hashCode());
         agent->setAITemplate(); 
         
