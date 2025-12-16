@@ -75,8 +75,8 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     agent->loadTemplateData(tmpl);
 
     // 1. FORCE SPEED & STATS
-    agent->setRunSpeed(7.0f); // Slightly faster than default
-    agent->setWalkSpeed(7.0f); // Make walk speed fast too, just in case
+    agent->setRunSpeed(7.0f); 
+    agent->setWalkSpeed(7.0f);
     for (int i=0; i<9; ++i) {
         agent->setMaxHAM(i, 5000, true);
         agent->setHAM(i, 5000);
@@ -84,14 +84,15 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
 
     agent->setHomeLocation(x, z, y, nullptr);
     
-    // 2. PACIFIST & BLIND MODE
-    agent->setCreatureBitmask(agent->getCreatureBitmask() & ~ObjectFlag::PACK & ~ObjectFlag::HERD & ~ObjectFlag::KILLER & ~ObjectFlag::STALKER);
-    agent->setPvpStatusBitmask(agent->getPvpStatusBitmask() & ~ObjectFlag::AGGRESSIVE & ~ObjectFlag::ENEMY);
+    // 2. PACIFIST & BLIND MODE (The Fix)
+    // Instead of using setters that don't exist, we just WIPE the flags.
+    // Setting these to 0 removes AGGRESSIVE, ENEMY, PACK, KILLER, etc.
+    // This makes the AI "Neutral" and "Oblivious" to the world.
+    agent->setCreatureBitmask(0); 
+    agent->setPvpStatusBitmask(0); 
     
-    // --- BLIND THE BOT ---
-    agent->setAggroRadius(0);
-    agent->setMoverType(0); // Standard mover
-    agent->setChanceHit(0); 
+    // Explicitly prevent any "Observer" distractions
+    agent->setDespawnOnNoPlayerInRange(false);
 
     toggleBot(agent);
 }

@@ -300,14 +300,15 @@ void SimPlayerController::checkArrival() {
     float dy = currentPos.getY() - destination.getY();
     float distSq = (dx*dx) + (dy*dy);
 
-    // Standard Arrival (Near Target)
     if (distSq < 16.0f) { 
         Logger::console.info("SimPlayer: ARRIVED.", true);
         performSample();
         return;
     } 
 
-    // --- SAFETY CATCH: Queue Ran Dry ---
+    // --- FIX: Queue Empty Check ---
+    // If the queue is empty but we aren't at the destination, 
+    // we assume we reached the end of the calculated path.
     if (agent->getPatrolPointSize() == 0 && simPathIndex >= simPath.size()) {
          Logger::console.info("SimPlayer: [NOTICE] Path ended before exact destination. Assuming arrival.", true);
          performSample();
