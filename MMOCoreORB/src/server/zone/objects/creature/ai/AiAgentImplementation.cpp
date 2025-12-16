@@ -3692,25 +3692,59 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 #endif
 
 	if (endDistanceSq <= maxSquared && fabs(endDistZSq) < (maxDistance + 1.f)) {
-		currentFoundPath = nullptr;
-		//info("findNextPosition: Reached point! Popping...", true); // Add this
+        
+        // LOGGING: Prove we reached the point
+        if (getCreatureTemplateName() == "light_jedi_sentinel") {
+             info("DEBUG_MOVE: Reached Point! DistSq=" + String::valueOf(endDistanceSq) + " QueueSize=" + String::valueOf(patrolPoints.size()), true);
+        }
 
-		if (patrolPoints.size() > 0)
-			patrolPoints.remove(0);
+        currentFoundPath = nullptr;
+        
+        if (patrolPoints.size() > 0)
+            patrolPoints.remove(0);
 
-		if (patrolPoints.size() > 0) {
-			//info("findNextPosition: Chaining to next point. Remaining: " + String::valueOf(patrolPoints.size()), true);
-			return true;
-		}
+        if (patrolPoints.size() > 0) {
+            // --- THE FIX ---
+            // Do NOT return true here. 
+            // Instead, update the target immediately and let the function continue 
+            // to calculate the path/velocity for the NEXT point in this same frame.
+            
+            if (getCreatureTemplateName() == "light_jedi_sentinel") {
+                 info("DEBUG_MOVE: Cornering... switching target immediately.", true);
+            }
 
-		if (movementState != AiAgent::FOLLOWING)
-			notifyObservers(ObserverEventType::DESTINATIONREACHED);
+            // 1. Update the target to the NEW point
+            endMovementPosition = getNextPosition();
+            
+            // 2. Recalculate distances for the NEW target so the rest of the logic works
+            currentPosition = getPosition();
+            currentWorldPos = getWorldPosition();
+            
+            endDistDiff = Vector3(currentWorldPos - endMovementPosition.getWorldPosition());
+            endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
+            
+            // 3. Reset maxSquared relative to the new target check (optional, but safe)
+            maxSquared = Math::max(0.1f, maxDistance * maxDistance);
+            
+            // 4. Force a new path calculation logic below
+            // (We already set currentFoundPath = nullptr above)
+            
+            // FALL THROUGH -> Do not return! Let it run the pathfinder below!
+            
+        } else {
+            // Queue is empty, NOW we stop.
+            if (getCreatureTemplateName() == "light_jedi_sentinel") {
+                 info("DEBUG_MOVE: Queue empty. Stopping.", true);
+            }
 
-		setCurrentSpeed(0.f);
-		updateLocomotion();
+            if (movementState != AiAgent::FOLLOWING)
+                notifyObservers(ObserverEventType::DESTINATIONREACHED);
 
-		return false;
-	}
+            setCurrentSpeed(0.f);
+            updateLocomotion();
+            return false;
+        }
+    }
 
 	// Handle speed up and slow down
 	if ((((currentSpeed * currentSpeed) * maxSquared) > endDistanceSq) && newSpeed > 0.4f) {
