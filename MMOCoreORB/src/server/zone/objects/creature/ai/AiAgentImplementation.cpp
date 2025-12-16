@@ -3638,17 +3638,24 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
             info("findNextPosition(" + String::valueOf(maxDistance) + ", " + String::valueOf(walk) + ")", true);
     #endif 
 
-    // DEBUG SETUP
-    bool debugMode = false;
+    // ------------------------------------------------------------------
+    // DEBUG SETUP & TEMPLATE CHECK
+    // ------------------------------------------------------------------
+    bool isSimPlayer = false;
+    // We check the template name safely
     const CreatureTemplate* tmpl = getCreatureTemplate();
     if (tmpl != nullptr && tmpl->getTemplateName() == "light_jedi_sentinel") {
-        debugMode = true;
+        isSimPlayer = true;
     }
 
     Locker locker(&targetMutex);
 
-    if (isDead() || getPatrolPointSize() <= 0) {
-        if (debugMode) info("DEBUG_MOVE: Queue Empty or Dead. Stopping.", true);
+    // Logging only for SimPlayer to keep console clean
+    if (isSimPlayer && isDead() || getPatrolPointSize() <= 0) {
+        if (isSimPlayer) info("DEBUG_MOVE: Queue Empty or Dead. Stopping.", true);
+        return false;
+    }
+    if (!isSimPlayer && (isDead() || getPatrolPointSize() <= 0)) {
         return false;
     }
 
@@ -3670,18 +3677,22 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     Vector3 currentWorldPos = getWorldPosition();
     PatrolPoint endMovementPosition = getNextPosition();
 
-    // 2D Distance Calculation (Horizontal)
+    // ------------------------------------------------------------------
+    // DISTANCE CALCULATIONS (Fixed Z-Axis)
+    // ------------------------------------------------------------------
     Vector3 endDistDiff(currentWorldPos - endMovementPosition.getWorldPosition());
+    
+    // Horizontal Distance Squared
     float endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
     
-    // Z Distance Calculation (Vertical)
-    float endDistZ = fabs(endDistDiff.getZ()); // Linear distance, not squared
+    // Vertical Distance Linear (Fixes the stuck-on-slope bug)
+    float endDistZ = fabs(endDistDiff.getZ()); 
 
     // Tolerance Calculation
     float maxSquared = Math::max(0.1f, maxDistance * maxDistance);
 
-    // DEBUG LOG
-    if (debugMode) {
+    // Debug Logging
+    if (isSimPlayer) {
         StringBuffer msg;
         msg << "DEBUG_MOVE: Dist2D=" << sqrt(endDistanceSq) 
             << "m (Req: " << maxDistance << "m)"
@@ -3694,12 +3705,12 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     }
 
     // ------------------------------------------------------------------
-    // ARRIVAL LOGIC (Fixed Z Check)
+    // ARRIVAL LOGIC (Corner Cutting)
     // ------------------------------------------------------------------
-    // We check if horizontal distance is within range AND if vertical distance is reasonable (2.5m allowance)
+    // Check if horizontal distance is met AND vertical distance is reasonable (2.5m allowance)
     if (endDistanceSq <= maxSquared && endDistZ < (maxDistance + 2.5f)) {
         
-        if (debugMode) info("DEBUG_MOVE: Reached Point! Switching...", true);
+        if (isSimPlayer) info("DEBUG_MOVE: Reached Point! Switching...", true);
 
         currentFoundPath = nullptr;
 
@@ -3708,27 +3719,26 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 
         if (patrolPoints.size() > 0) {
             // --- SMOOTH CORNERING ---
-            if (debugMode) info("DEBUG_MOVE: Cornering to next point immediately.", true);
+            if (isSimPlayer) info("DEBUG_MOVE: Cornering to next point immediately.", true);
 
-            // 1. Update the target
+            // 1. Update the target immediately
             endMovementPosition = getNextPosition();
             
-            // 2. Recalculate Logic for new target
+            // 2. Recalculate Logic for new target so we don't return false below
             currentPosition = getPosition();
             currentWorldPos = getWorldPosition();
             
             endDistDiff = Vector3(currentWorldPos - endMovementPosition.getWorldPosition());
             endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
             
-            // Recalculate max speed for the turn
-            // We want to maintain speed if possible
-            if (newSpeed > 0.4f && currentSpeed < newSpeed) {
-                 newSpeed = currentSpeed + 0.4f; // Accelerate into the turn
-            }
+            // Update tolerance for the new point
+            maxSquared = Math::max(0.1f, maxDistance * maxDistance);
+
+            // FALL THROUGH -> Continue to Movement Logic
 
         } else {
             // STOP: No more points
-            if (debugMode) info("DEBUG_MOVE: Path Finished.", true);
+            if (isSimPlayer) info("DEBUG_MOVE: Path Finished.", true);
 
             if (movementState != AiAgent::FOLLOWING)
                 notifyObservers(ObserverEventType::DESTINATIONREACHED);
@@ -3739,14 +3749,24 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         }
     }
 
-    // Acceleration / Deceleration Logic
-    if ((((currentSpeed * currentSpeed) * maxSquared) > endDistanceSq) && newSpeed > 0.4f) {
-        // Slow down if we are approaching the final point and have no next point
-        // BUT if we have points remaining, keep running!
-        if (patrolPoints.size() <= 1) {
-             newSpeed = Math::max(0.2f, (currentSpeed - 0.4f));
-        }
+    // ------------------------------------------------------------------
+    // PHYSICS ENGINE (The "Flow" Fix)
+    // ------------------------------------------------------------------
+    
+    bool applyBraking = true;
+
+    // For SimPlayer: DO NOT BRAKE if there are points remaining.
+    // This allows it to flow through turns at full speed like a player holding 'W'.
+    // We only brake if we are approaching the final destination.
+    if (isSimPlayer && patrolPoints.size() > 0) {
+        applyBraking = false;
+    }
+
+    if (applyBraking && (((currentSpeed * currentSpeed) * maxSquared) > endDistanceSq) && newSpeed > 0.4f) {
+        // Standard Braking Logic (Applied only at end of path for SimPlayer)
+        newSpeed = Math::max(0.2f, (currentSpeed - 0.4f));
     } else if (currentSpeed < newSpeed) {
+        // Standard Acceleration Logic (Preserves natural ramp-up)
         float speedDiff = newSpeed - currentSpeed;
         if (speedDiff > 0.4f)
             newSpeed = currentSpeed + 0.4f;
@@ -3755,15 +3775,14 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     setCurrentSpeed(newSpeed);
     updateLocomotion();
 
+    // ------------------------------------------------------------------
+    // PATHFINDER (Standard Logic Below)
+    // ------------------------------------------------------------------
     PathFinderManager* pathFinder = PathFinderManager::instance();
 
     if (pathFinder == nullptr) {
         return false;
     }
-
-    /*
-    * STEP 1: If we do not already have a path referenced, find a new path
-    */
 
     Reference<Vector<WorldCoordinates>* > path = nullptr;
     ManagedReference<SceneObject*> currentParent = getParent().get();
@@ -3801,7 +3820,6 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         return false;
     }
 
-    // Filter out duplicate path points
     if (currentParent != nullptr && endMovementCell != nullptr) {
         pathFinder->filterPastPoints(path, asAiAgent());
     }
@@ -3861,9 +3879,6 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     nextMovementPosition.setY(newPosition.getY());
     nextMovementPosition.setZ(newPosition.getZ());
 
-    /*
-    * STEP 3: Send the movement updates
-    */
     nextStepPosition.setPosition(nextMovementPosition.getX(), nextMovementPosition.getZ(), nextMovementPosition.getY());
     nextStepPosition.setCell(nextMovementCell);
 
@@ -3892,7 +3907,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         updatePetSwimmingState();
     }
 
-    if (debugMode) {
+    if (isSimPlayer) {
         info("findNextPosition - complete returning true", true);
     }
 
