@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Modular Implementation
+ * Added Combat Safety Checks
  */
 
 #include "SimPlayerController.h"
@@ -43,7 +43,6 @@ void ArrivalCheckTask::run() {
     }, "SimPlayerArrivalLambda");
 }
 
-// NOTE: We cast up to SimMinerController for specific tasks
 void SimBehaviorTask::run() {
     Reference<SimPlayerController*> baseCtrl = controller.get();
     if (baseCtrl == nullptr) return;
@@ -67,7 +66,7 @@ SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     state = IDLE;
     simPathIndex = 0;
     stuckWatchdogCount = 0;
-    runSpeed = 5.5f; // Default
+    runSpeed = 5.5f; 
     setLoggingName("SimPlayerController");
 }
 
@@ -78,14 +77,24 @@ SimPlayerController::~SimPlayerController() {
 void SimPlayerController::moveTo(Vector3 targetPos) {
     if (agent == nullptr) return;
 
+    // Safety: Don't start pathing if we are fighting
+    if (agent->isInCombat()) {
+        state = IDLE; 
+        return;
+    }
+
     stuckWatchdogCount = 0;
     lastWatchdogPos = agent->getWorldPosition();
-    state = IDLE; // Pause logic until path found
+    state = IDLE; 
 
     Zone* zone = agent->getZone();
     if (zone == nullptr) return;
 
     destination = targetPos;
+    
+    float dist = agent->getWorldPosition().distanceTo(targetPos);
+    Logger::console.info("SimPlayer: Requesting move to " + targetPos.toString() + " (Dist: " + String::valueOf(dist) + "m)", true);
+
     WorldCoordinates startCoord(agent);
     WorldCoordinates endCoord(targetPos, nullptr);
 
@@ -96,8 +105,19 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
 void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (agent == nullptr) { if (path) delete path; return; }
     
+    // --- FIX 1: COMBAT PROTECTION ---
+    // If the bot started fighting while the pathfinder was working,
+    // THROW AWAY the path. Do not override combat state.
+    if (agent->isInCombat()) {
+        Logger::console.info("SimPlayer: Path found but Agent is in Combat. Discarding move.", true);
+        if (path) delete path;
+        return;
+    }
+
+    // Fix 2: Reject invalid short paths
     if (path == nullptr || path->size() < 2) { 
         if (path) delete path; 
+        Logger::console.info("SimPlayer: Path too short (Size < 2). Retrying.", true);
         onPathFailed(); 
         return; 
     }
@@ -111,6 +131,9 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     }
 
     destination = simPath.get(simPath.size() - 1).getPoint();
+    
+    Logger::console.info("SimPlayer: Path Found (" + String::valueOf(path->size()) + " nodes). Moving...", true);
+
     agent->setHomeLocation(destination.getX(), destination.getZ(), destination.getY(), nullptr);
 
     agent->setFollowObject(nullptr);
@@ -125,7 +148,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     queueMorePathNodes();
 
-    // Kickstart
     if (agent->getPatrolPointSize() > 0) {
         PatrolPoint next = agent->getNextPosition();
         agent->setNextStepPosition(next.getPositionX(), next.getPositionZ(), next.getPositionY(), next.getCell());
@@ -136,17 +158,13 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     delete path;
 
-    // Start Drive Loop
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
     task->schedule(500); 
 }
 
 void SimPlayerController::onPathFailed() {
-    Logger::console.info("SimPlayer: Pathfinding failed.", true);
+    Logger::console.info("SimPlayer: Pathfinding failed/unreachable.", true);
     state = IDLE;
-    // Retry or idle? Derived classes might want to handle this differently.
-    // For now, simple retry logic could go here, or we just stop.
-    // Let's rely on the derived class to notice state == IDLE and restart.
     startSimLoop(); 
 }
 
@@ -158,7 +176,6 @@ void SimPlayerController::queueMorePathNodes() {
     if (simPathIndex >= pathSize) return;
 
     int currentQueued = agent->getPatrolPointSize();
-    // Keep queue small for better corner cutting control
     int slots = 18 - currentQueued; 
 
     while (slots > 0 && simPathIndex < pathSize) {
@@ -174,7 +191,6 @@ void SimPlayerController::queueMorePathNodes() {
             }
         }
 
-        // SWG Coords: X, Z(North), Y(Height)
         PatrolPoint pp(p.getX(), p.getZ(), p.getY(), nullptr); 
         agent->addPatrolPoint(pp);
 
@@ -187,8 +203,13 @@ void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
     if (state != MOVING) return;
 
-    // Virtual Tick for PvP Scanning
-    onTick();
+    // --- PVP SCANNER HOOK ---
+    onTick(); 
+
+    // --- FIX 3: RE-CHECK STATE ---
+    // If onTick() found a target and put us in combat, state will now be IDLE.
+    // We must return immediately so we don't overwrite combat movement.
+    if (state != MOVING) return; 
 
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
     if (agent->isWaiting()) agent->stopWaiting();
@@ -199,7 +220,7 @@ void SimPlayerController::checkArrival() {
 
     Vector3 currentPos = agent->getWorldPosition();
     float dx = currentPos.getX() - destination.getX();
-    float dy = currentPos.getY() - destination.getY();
+    float dy = currentPos.getY() - destination.getY(); 
     float distSq = (dx*dx) + (dy*dy);
 
     bool arrived = false;
@@ -208,15 +229,14 @@ void SimPlayerController::checkArrival() {
     if (agent->getPatrolPointSize() == 0 && simPathIndex >= simPath.size()) arrived = true;
 
     if (arrived) {
+        Logger::console.info("SimPlayer: Arrived at destination.", true);
         agent->clearPatrolPoints(); 
-        onArrived(); // Virtual call to specific logic
+        onArrived(); 
         return;
     } 
 
-    // Drive-by-wire
     agent->findNextPosition(2.0f, false);
     
-    // Stuck Check
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
     float moveDy = currentPos.getY() - lastWatchdogPos.getY();
     float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
@@ -224,7 +244,6 @@ void SimPlayerController::checkArrival() {
     if (movedDistSq < 0.05f) {
         stuckWatchdogCount++;
         if (stuckWatchdogCount > 5) { 
-             // info("SimPlayer: [STUCK] Nudging...", true);
              if (agent->getPatrolPointSize() > 0) {
                  PatrolPoint next = agent->getNextPosition();
                  agent->setNextStepPosition(next.getPositionX(), next.getPositionZ(), next.getPositionY(), next.getCell());
@@ -311,11 +330,10 @@ void SimMinerController::goToResource(const String& resourceName) {
     Vector3 targetPos;
 
     if (!pickDestinationInNavMesh(zone, currentPos, targetPos)) {
-        // Fallback random
         float angle = System::random(360) * (M_PI / 180.0f);
         float dist = 100.0f;
         targetPos.setX(currentPos.getX() + (dist * cos(angle)));
-        targetPos.setY(currentPos.getY() + (dist * sin(angle))); // Y is North here for calculation
+        targetPos.setY(currentPos.getY() + (dist * sin(angle))); 
         targetPos.setZ(zone->getHeight(targetPos.getX(), targetPos.getY())); 
     }
 
