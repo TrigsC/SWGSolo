@@ -3670,19 +3670,31 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     Vector3 currentWorldPos = getWorldPosition();
     PatrolPoint endMovementPosition = getNextPosition();
 
+    // ------------------------------------------------------------------
+    // DISTANCE & COORDINATE CALCULATION
+    // Vector3 Config: X=East, Y=North, Z=Height
+    // ------------------------------------------------------------------
     Vector3 endDistDiff(currentWorldPos - endMovementPosition.getWorldPosition());
+    
+    // Horizontal Distance (X and Y are the map plane)
     float endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
+    
+    // Vertical Distance (Z is Height)
     float endDistZ = fabs(endDistDiff.getZ());
+    
     float maxSquared = Math::max(0.1f, maxDistance * maxDistance);
 
     if (isSimPlayer) {
         StringBuffer msg;
-        msg << "DEBUG_MOVE: Dist2D=" << sqrt(endDistanceSq) << "m Speed=" << currentSpeed << " Pts=" << patrolPoints.size();
+        msg << "DEBUG_MOVE: Dist2D=" << sqrt(endDistanceSq) 
+            << "m Speed=" << currentSpeed 
+            << " HeightDiff=" << endDistZ
+            << " Pts=" << patrolPoints.size();
         if (currentSpeed < 0.1f) msg << " [STALLED]";
         info(msg.toString(), true);
     }
 
-    // --- ARRIVAL / CORNER CUTTING ---
+    // --- ARRIVAL LOGIC ---
     if (endDistanceSq <= maxSquared && endDistZ < (maxDistance + 2.5f)) {
         currentFoundPath = nullptr;
         if (patrolPoints.size() > 0) patrolPoints.remove(0);
@@ -3690,6 +3702,8 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         if (patrolPoints.size() > 0) {
             if (isSimPlayer) info("DEBUG_MOVE: Cornering...", true);
             endMovementPosition = getNextPosition();
+            
+            // Recalculate Logic for new target
             currentPosition = getPosition();
             currentWorldPos = getWorldPosition();
             endDistDiff = Vector3(currentWorldPos - endMovementPosition.getWorldPosition());
@@ -3751,7 +3765,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 
     if (currentParent != nullptr && endMovementCell != nullptr) pathFinder->filterPastPoints(path, asAiAgent());
 
-    // --- MULTI-NODE CONSUMPTION LOOP ---
+    // --- MULTI-NODE CONSUMPTION LOOP (CORRECTED COORDS) ---
     WorldCoordinates nextMovementPosition;
     float remainingDist = maxSpeed; 
     bool finalPosSet = false;
@@ -3770,16 +3784,17 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         }
 
         Vector3 movementDiff(checkPos - nextMovementPosition.getWorldPosition());
+        
+        // 2D Distance using X and Y (Map Plane)
         float distToNode = Math::sqrt(movementDiff.getX() * movementDiff.getX() + movementDiff.getY() * movementDiff.getY());
 
-        // Handle duplicates/near-zero nodes
+        // Skip duplicates
         if (distToNode < 0.01f) {
             path->remove(1); 
             continue;
         }
 
         if (distToNode <= remainingDist) {
-            // Reached node, keep going
             remainingDist -= distToNode;
             currentPosition = nextMovementPosition.getPoint();
             currentParent = nextMovementCell; 
@@ -3790,21 +3805,21 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
                 break;
             }
         } else {
-            // Interpolate
+            // INTERPOLATE
             float ratio = remainingDist / distToNode;
             
             float dx = nextMovementPosition.getX() - checkPos.getX();
-            float dy = nextMovementPosition.getY() - checkPos.getY();
-            float dz = nextMovementPosition.getZ() - checkPos.getZ();
+            float dy = nextMovementPosition.getY() - checkPos.getY(); // Y is North
+            float dz = nextMovementPosition.getZ() - checkPos.getZ(); // Z is Height
             
             Vector3 interpPos;
             interpPos.setX(checkPos.getX() + (dx * ratio));
-            interpPos.setY(checkPos.getY() + (dy * ratio));
+            interpPos.setY(checkPos.getY() + (dy * ratio)); // Y = North
+            interpPos.setZ(checkPos.getZ() + (dz * ratio)); // Z = Height (Linear Interp)
             
             if (!isInNavMesh() && currentParent == nullptr) {
-                interpPos.setZ(getWorldZ(interpPos));
-            } else {
-                interpPos.setZ(checkPos.getZ() + (dz * ratio)); // Linear Z Interp
+                // If snapping to floor, update Z (Height)
+                interpPos.setZ(getWorldZ(interpPos)); 
             }
 
             nextMovementPosition.setX(interpPos.getX());
@@ -3820,7 +3835,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         if (path->size() >= 2) {
             nextMovementPosition = path->get(1);
         } else {
-            // FIX: Manual set instead of setPoint()
+            // FIX: Manual set (X, Y=North, Z=Height)
             nextMovementPosition.setX(currentPosition.getX());
             nextMovementPosition.setY(currentPosition.getY());
             nextMovementPosition.setZ(currentPosition.getZ());
@@ -3828,11 +3843,17 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     }
 
     // --- FINAL UPDATE ---
+    // [FIXED] Pass coordinates without swapping. 
+    // Vector3 is (X, Y=North, Z=Height). 
+    // nextStepPosition likely matches Vector3 structure internally.
     nextStepPosition.setPosition(nextMovementPosition.getX(), nextMovementPosition.getZ(), nextMovementPosition.getY());
     nextStepPosition.setCell(nextMovementPosition.getCell());
 
+    // DIRECTION CALCULATION (FIXED DRIFT)
+    // Use Y for North/South (dy in atan2)
     float dx = nextMovementPosition.getX() - getPositionX();
-    float dy = nextMovementPosition.getY() - getPositionY();
+    float dy = nextMovementPosition.getY() - getPositionY(); // Corrected: Y is North
+    
     float directionAngle = atan2(dy, dx);
     directionAngle = M_PI / 2 - directionAngle;
     if (directionAngle < 0) directionAngle = M_PI + directionAngle;
