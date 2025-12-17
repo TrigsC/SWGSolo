@@ -71,6 +71,7 @@ protected:
         DECIDING,
         SURVEYING,
         CALCULATING_PATH,
+        PERFORMING_ACTION,
         MOVING,
         SAMPLING
     };
