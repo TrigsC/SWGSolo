@@ -1,10 +1,10 @@
 /*
  * SimPlayerManager.cpp
- * Updated for PvP
+ * Fixed Attackable Flags
  */
 
 #include "SimPlayerManager.h"
-#include "SimPvPController.h" // <--- Include this
+#include "SimPvPController.h" 
 #include "server/zone/ZoneServer.h"
 #include "server/ServerCore.h"
 #include "server/zone/managers/creature/CreatureManager.h"
@@ -13,6 +13,7 @@
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h" 
 #include "templates/params/creature/ObjectFlag.h" 
+#include "templates/params/creature/CreatureFlag.h" 
 
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
@@ -30,8 +31,7 @@ void SimPlayerManager::initialize() {
     // 2. Miner (Artisan Visual)
     spawnSimPlayer("naboo", 4720.0f, -4945.0f, "artisan");
 
-    // 3. PvP Bot (Stormtrooper) - Spawns at Shuttleport
-    // 4963, 3, -4892
+    // 3. PvP Bot (Stormtrooper)
     spawnSimPlayer("naboo", 4963.0f, -4892.0f, "stormtrooper");
 }
 
@@ -48,7 +48,6 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     CreatureManager* creatureManager = zone->getCreatureManager();
     if (creatureManager == nullptr) return;
 
-    // Use a slight Z offset or terrain height
     float z = zone->getHeight(x, y); 
 
     CreatureObject* creature = creatureManager->spawnCreature(templateName.hashCode(), 0, x, z, y, 0);
@@ -60,9 +59,8 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     AiAgent* agent = creature->asAiAgent();
     if (agent == nullptr) return;
 
-    // Setup basic flags
-    agent->setCreatureBitmask(0); 
-    // PvP Bot needs to be attackable, but we set Overt inside the controller
+    // REMOVED: agent->setCreatureBitmask(0); -> Moved to toggleBot specific logic
+    
     agent->setDespawnOnNoPlayerInRange(false);
 
     toggleBot(agent);
@@ -92,25 +90,28 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         
         agent->writeBlackboard("simAlwaysActive", true);
         agent->setSimAlwaysActive(true);
-        agent->setSimPlayerBot(true); // Enable Physics Fix
+        agent->setSimPlayerBot(true); 
         agent->setDespawnOnNoPlayerInRange(false);
 
-        // --- FACTORY LOGIC ---
         Reference<SimPlayerController*> ctrl = nullptr;
         
         const CreatureTemplate* tmpl = agent->getCreatureTemplate();
         String tName = (tmpl != nullptr) ? tmpl->getTemplateName() : "";
 
         if (tName == "stormtrooper") {
-             // Create IMPERIAL PvP Bot
+             // PvP Bot: Make Attackable
+             agent->setCreatureBitmask(CreatureFlag::ATTACKABLE);
              ctrl = new SimPvPController(agent, true); 
         } 
         else if (tName == "rebel_trooper") {
-             // Create REBEL PvP Bot
+             // PvP Bot: Make Attackable
+             agent->setCreatureBitmask(CreatureFlag::ATTACKABLE);
              ctrl = new SimPvPController(agent, false);
         }
         else {
-             // Default to Miner
+             // Miner: Make Neutral/Unattackable (optional, mostly for immersion)
+             // Using 0 removes all flags including ATTACKABLE
+             agent->setCreatureBitmask(0); 
              ctrl = new SimMinerController(agent);
         }
 
