@@ -13,7 +13,6 @@
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h" 
 #include "templates/params/creature/ObjectFlag.h" 
-#include "templates/params/creature/CreatureFlag.h" 
 
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
