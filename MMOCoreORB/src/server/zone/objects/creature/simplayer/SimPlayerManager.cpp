@@ -133,7 +133,8 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         // We can check template name here to decide:
         const CreatureTemplate* tmpl = agent->getCreatureTemplate();
         if (tmpl && tmpl->getTemplateName() == "rebel_trooper") {
-             ctrl = new SimPvPController(agent);
+             //ctrl = new SimPvPController(agent);
+             ctrl = new SimMinerController(agent);
         } else {
              ctrl = new SimMinerController(agent);
         }
