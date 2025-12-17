@@ -95,7 +95,12 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
 
 void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (agent == nullptr) { if (path) delete path; return; }
-    if (path == nullptr || path->size() == 0) { if (path) delete path; onPathFailed(); return; }
+    
+    if (path == nullptr || path->size() < 2) { 
+        if (path) delete path; 
+        onPathFailed(); 
+        return; 
+    }
 
     state = MOVING;
     simPath.removeAll();
