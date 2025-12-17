@@ -99,12 +99,12 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
 
         if (tName == "stormtrooper") {
              // PvP Bot: Make Attackable
-             agent->setCreatureBitmask(CreatureFlag::ATTACKABLE);
+             agent->setCreatureBitmask(ObjectFlag::ATTACKABLE);
              ctrl = new SimPvPController(agent, true); 
         } 
         else if (tName == "rebel_trooper") {
              // PvP Bot: Make Attackable
-             agent->setCreatureBitmask(CreatureFlag::ATTACKABLE);
+             agent->setCreatureBitmask(ObjectFlag::ATTACKABLE);
              ctrl = new SimPvPController(agent, false);
         }
         else {
