@@ -16,7 +16,7 @@
 SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerController(aiAgent) {
     isImperial = imperial;
     returningToShuttle = false;
-    runSpeed = 6.5f; 
+    runSpeed = 5.5f; 
     setLoggingName("SimPvPController");
 }
 
