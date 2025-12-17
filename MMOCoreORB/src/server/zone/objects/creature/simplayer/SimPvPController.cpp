@@ -1,6 +1,6 @@
 /*
  * SimPvPController.cpp
- * Deadlock Fix + Flags
+ * Final Fixes: Flags & Vector Types
  */
 
 #include "SimPvPController.h"
@@ -16,7 +16,7 @@
 SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerController(aiAgent) {
     isImperial = imperial;
     returningToShuttle = false;
-    runSpeed = 6.5f; 
+    runSpeed = 4.5f; 
     setLoggingName("SimPvPController");
 }
 
@@ -26,12 +26,18 @@ SimPvPController::~SimPvPController() {
 void SimPvPController::startSimLoop() {
     if (agent == nullptr) return;
 
+    // 1. Setup Faction
     agent->setFaction(isImperial ? String("imperial").hashCode() : String("rebel").hashCode());
-    agent->setPvpStatusBitmask(ObjectFlag::OVERT); 
     
+    // FIX: Set BOTH Overt and Attackable flags. 
+    // Without ATTACKABLE, they are a ghost. Without OVERT, they are a civilian.
+    agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE); 
+    
+    // 2. Define Route
     spawnLocation = Vector3(4963.0f, -4892.0f, 3.0f);
     hangoutLocation = Vector3(4807.0f, -4700.0f, 4.0f);
 
+    // 3. Start Patrol
     Logger::console.info("SimPvP: Spawning at Shuttle. Moving to Starport.", true);
     startPatrol();
 }
@@ -78,6 +84,9 @@ void SimPvPController::despawn() {
     }
 }
 
+// ----------------------------------------------------
+// THE PVP SCANNER
+// ----------------------------------------------------
 void SimPvPController::onTick() {
     if (agent == nullptr || agent->isDead()) return;
     if (agent->isInCombat()) return; 
@@ -93,20 +102,22 @@ void SimPvPController::scanForTargets() {
     if (vec == nullptr) return;
 
     Vector<TreeEntry*> objects;
-    vec->safeCopyReceiversTo(objects, 0);
+    
+    // FIX: Use CREOTYPE to only get creatures (Players/NPCs). 
+    // 0 retrieved EVERYTHING (buildings, rocks) which is slow and unsafe.
+    vec->safeCopyReceiversTo(objects, CloseObjectsVector::CREOTYPE);
 
     for (int i = 0; i < objects.size(); ++i) {
-        // Safety check inside loop in case agent dies while iterating
-        if (agent->isDead()) return;
-
         SceneObject* obj = static_cast<SceneObject*>(objects.get(i));
         if (obj == nullptr || !obj->isPlayerCreature()) continue;
 
         CreatureObject* player = obj->asCreatureObject();
         if (player == nullptr || player->isIncapacitated() || player->isDead()) continue;
 
+        // Interior Check
         if (player->getParent() != nullptr) continue; 
 
+        // Check Faction
         bool playerImp = (player->getFaction() == String("imperial").hashCode());
         bool playerReb = (player->getFaction() == String("rebel").hashCode());
         
@@ -115,6 +126,7 @@ void SimPvPController::scanForTargets() {
         if (!isImperial && playerImp) isEnemy = true;
 
         if (isEnemy && player->isAttackableBy(agent)) {
+            
             float dist = agent->getDistanceTo(player);
             if (dist < 40.0f) { 
                 Logger::console.info("SimPvP: ENGAGING TARGET: " + player->getFirstName(), true);

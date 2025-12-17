@@ -58,8 +58,8 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     AiAgent* agent = creature->asAiAgent();
     if (agent == nullptr) return;
 
-    // REMOVED: agent->setCreatureBitmask(0); -> Moved to toggleBot specific logic
-    
+    // Reset default flags to clean slate
+    agent->setCreatureBitmask(0); 
     agent->setDespawnOnNoPlayerInRange(false);
 
     toggleBot(agent);
@@ -98,19 +98,19 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         String tName = (tmpl != nullptr) ? tmpl->getTemplateName() : "";
 
         if (tName == "stormtrooper") {
-             // PvP Bot: Make Attackable
-             agent->setCreatureBitmask(ObjectFlag::ATTACKABLE);
+             // PvP Bot: Make Attackable + Overt
+             // Note: Controller will enforce Overt, but we set Attackable here to be safe
+             agent->setPvpStatusBitmask(ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
              ctrl = new SimPvPController(agent, true); 
         } 
         else if (tName == "rebel_trooper") {
-             // PvP Bot: Make Attackable
-             agent->setCreatureBitmask(ObjectFlag::ATTACKABLE);
+             // PvP Bot: Make Attackable + Overt
+             agent->setPvpStatusBitmask(ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
              ctrl = new SimPvPController(agent, false);
         }
         else {
-             // Miner: Make Neutral/Unattackable (optional, mostly for immersion)
-             // Using 0 removes all flags including ATTACKABLE
-             agent->setCreatureBitmask(0); 
+             // Miner: Make Neutral/Unattackable (0 removes ATTACKABLE flag)
+             agent->setPvpStatusBitmask(0); 
              ctrl = new SimMinerController(agent);
         }
 
