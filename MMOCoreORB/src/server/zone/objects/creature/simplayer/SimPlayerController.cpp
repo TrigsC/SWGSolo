@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Robust Loop & Combat Resume
+ * Debugging Startup Hang + Robust Retry
  */
 
 #include "SimPlayerController.h"
@@ -26,7 +26,21 @@ void SimPathFindTask::run() {
     Reference<SimPlayerController*> strongCtrl = controller.get();
     if (strongCtrl == nullptr) return;
 
-    Vector<WorldCoordinates>* path = PathFinderManager::instance()->findPath(startCoord, endCoord, zone);
+    // DEBUG: Trace start
+    // Logger::console.info("SimPlayer: [Thread] Pathfinding started...", true);
+
+    Vector<WorldCoordinates>* path = nullptr;
+    
+    try {
+        path = PathFinderManager::instance()->findPath(startCoord, endCoord, zone);
+    } catch (...) {
+        Logger::console.info("SimPlayer: [Thread] EXCEPTION in findPath!", true);
+        path = nullptr;
+    }
+
+    // DEBUG: Trace end
+    // if (path != nullptr) Logger::console.info("SimPlayer: [Thread] Pathfinding success. Nodes: " + String::valueOf(path->size()), true);
+    // else Logger::console.info("SimPlayer: [Thread] Pathfinding returned NULL.", true);
 
     Core::getTaskManager()->executeTask([strongCtrl, path] () {
         if (path != nullptr) strongCtrl->onPathFound(path);
@@ -57,6 +71,20 @@ void SimBehaviorTask::run() {
     }, "SimPlayerBehaviorLambda");
 }
 
+class SimRetryTask : public Task {
+    WeakReference<SimPlayerController*> controller;
+public:
+    SimRetryTask(SimPlayerController* ctrl) : controller(ctrl) {}
+    void run() override {
+        Reference<SimPlayerController*> strong = controller.get();
+        if (strong != nullptr) {
+            Core::getTaskManager()->executeTask([strong]() {
+                strong->startSimLoop();
+            }, "SimRetryLambda");
+        }
+    }
+};
+
 // ========================================================
 // BASE SIMPLAYER CONTROLLER
 // ========================================================
@@ -79,7 +107,6 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
     if (agent == nullptr) return;
 
     if (agent->isInCombat()) {
-        // Queue the destination but don't move yet
         destination = targetPos;
         state = IDLE; 
         return;
@@ -87,7 +114,7 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
 
     stuckWatchdogCount = 0;
     lastWatchdogPos = agent->getWorldPosition();
-    state = CALCULATING_PATH; // Prevent multiple requests
+    state = CALCULATING_PATH; 
 
     Zone* zone = agent->getZone();
     if (zone == nullptr) return;
@@ -101,7 +128,10 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
     WorldCoordinates endCoord(targetPos, nullptr);
 
     Reference<SimPathFindTask*> task = new SimPathFindTask(this, startCoord, endCoord, zone);
-    task->execute(); 
+    
+    // FIX: Use schedule(100) instead of execute() to yield to main thread 
+    // and prevent lockups during heavy startup load.
+    task->schedule(100); 
 }
 
 void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
@@ -110,14 +140,13 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (agent->isInCombat()) {
         Logger::console.info("SimPlayer: Path found but Agent is in Combat. Holding.", true);
         if (path) delete path;
-        // We leave destination set, so checkArrival will retry later
         state = IDLE;
         return;
     }
 
     if (path == nullptr || path->size() < 2) { 
         if (path) delete path; 
-        Logger::console.info("SimPlayer: Path too short. Retrying.", true);
+        Logger::console.info("SimPlayer: Path too short. Retrying in 5s.", true);
         onPathFailed(); 
         return; 
     }
@@ -130,10 +159,10 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         simPath.add(path->get(i));
     }
 
-    // Update destination to exact path end
     destination = simPath.get(simPath.size() - 1).getPoint();
     
-    // Set Home to destination so we don't leash back
+    // Logger::console.info("SimPlayer: Path Found (" + String::valueOf(path->size()) + " nodes). Moving...", true);
+
     agent->setHomeLocation(destination.getX(), destination.getZ(), destination.getY(), nullptr);
 
     agent->setFollowObject(nullptr);
@@ -158,15 +187,18 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     delete path;
 
-    // Ensure loop is running (it might already be, but safe to add another if needed, though we rely on the main loop)
+    // Ensure loop is active
+    Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
+    task->schedule(500); 
 }
 
 void SimPlayerController::onPathFailed() {
-    Logger::console.info("SimPlayer: Pathfinding failed/unreachable.", true);
+    Logger::console.info("SimPlayer: Pathfinding failed/unreachable. Retrying in 5s...", true);
     state = IDLE;
-    // Let derived classes decide what to do next tick or immediately
-    // For now, if we fail, we just idle. 
-    // Ideally, we'd trigger startSimLoop() or similar, but let's let checkArrival handle the idle state.
+    
+    // FIX: Don't recurse immediately. Schedule a retry.
+    Reference<SimRetryTask*> task = new SimRetryTask(this);
+    task->schedule(5000); // 5 seconds
 }
 
 void SimPlayerController::queueMorePathNodes() {
@@ -203,32 +235,24 @@ void SimPlayerController::queueMorePathNodes() {
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
 
-    // --- 1. PvP Scan / Tick ---
     onTick(); 
 
-    // --- 2. Combat / State Check ---
     if (agent->isInCombat()) {
-        state = IDLE; // Force state to IDLE so we know to resume later
-        // RESCHEDULE and return. Do not move.
+        state = IDLE; 
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(1000); 
         return;
     }
 
-    // --- 3. Resume Logic (Combat Just Ended) ---
     if (state == IDLE && destination.getX() != 0) {
-        // We have a destination but we are idling. Resume!
         Logger::console.info("SimPlayer: Resuming path to " + destination.toString(), true);
         moveTo(destination);
-        
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(1000);
         return;
     }
 
-    // --- 4. Normal Movement Logic ---
     if (state != MOVING) {
-        // If we are doing an action (SAMPLING/WAITING), just heartbeat
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(1000);
         return;
@@ -248,7 +272,6 @@ void SimPlayerController::checkArrival() {
 
     bool arrived = false;
 
-    // Check distance (16m^2 = 4m)
     if (distSq < 16.0f) arrived = true;
     if (agent->getPatrolPointSize() == 0 && simPathIndex >= simPath.size()) arrived = true;
 
@@ -256,16 +279,13 @@ void SimPlayerController::checkArrival() {
         Logger::console.info("SimPlayer: Arrived at destination.", true);
         agent->clearPatrolPoints(); 
         onArrived(); 
-        // Note: onArrived might change state, so we reschedule to keep checking
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(1000);
         return;
     } 
 
-    // Drive-by-wire
     agent->findNextPosition(2.0f, false);
     
-    // Stuck Check
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
     float moveDy = currentPos.getY() - lastWatchdogPos.getY();
     float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
@@ -273,7 +293,6 @@ void SimPlayerController::checkArrival() {
     if (movedDistSq < 0.05f) {
         stuckWatchdogCount++;
         if (stuckWatchdogCount > 5) { 
-             // Logger::console.info("SimPlayer: [STUCK] Nudging...", true);
              if (agent->getPatrolPointSize() > 0) {
                  PatrolPoint next = agent->getNextPosition();
                  agent->setNextStepPosition(next.getPositionX(), next.getPositionZ(), next.getPositionY(), next.getCell());
@@ -286,7 +305,6 @@ void SimPlayerController::checkArrival() {
 
     lastWatchdogPos = currentPos;
 
-    // ALWAYS RESCHEDULE
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
     task->schedule(500);
 }
