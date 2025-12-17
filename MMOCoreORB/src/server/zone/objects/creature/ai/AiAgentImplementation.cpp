@@ -3638,7 +3638,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
             info("findNextPosition(" + String::valueOf(maxDistance) + ", " + String::valueOf(walk) + ")", true);
     #endif 
 
-    bool isSimPlayer = false;
+    bool isSimPlayer = getSimPlayerBot();
     const CreatureTemplate* tmpl = getCreatureTemplate();
     if (tmpl != nullptr && tmpl->getTemplateName() == "light_jedi_sentinel") {
         isSimPlayer = true;

@@ -1,8 +1,6 @@
 /*
  * SimPlayerController.h
- * Author: Trigues
- * Description: High-level logic controller for SimPlayers.
- * Handles async pathfinding and resource logic.
+ * Modular Controller for SimPlayers
  */
 
 #ifndef SIMPLAYERCONTROLLER_H_
@@ -19,19 +17,21 @@
 
 class SimPlayerController;
 
-class FindResourcePathTask : public Task {
+// Generic Pathfinding Task
+class SimPathFindTask : public Task {
     WeakReference<SimPlayerController*> controller;
     WorldCoordinates startCoord;
     WorldCoordinates endCoord;
     ManagedReference<Zone*> zone;
 
 public:
-    FindResourcePathTask(SimPlayerController* ctrl, WorldCoordinates start, WorldCoordinates end, Zone* z) 
+    SimPathFindTask(SimPlayerController* ctrl, WorldCoordinates start, WorldCoordinates end, Zone* z) 
         : controller(ctrl), startCoord(start), endCoord(end), zone(z) {
     }
     void run() override; 
 };
 
+// Generic Movement Loop Task
 class ArrivalCheckTask : public Task {
     WeakReference<SimPlayerController*> controller;
 public:
@@ -39,6 +39,7 @@ public:
     void run() override;
 };
 
+// Miner Specific: Action Task
 class SimBehaviorTask : public Task {
     WeakReference<SimPlayerController*> controller;
     int type; 
@@ -50,56 +51,72 @@ public:
     void run() override;
 };
 
+// -------------------------------------------------------
+// BASE CONTROLLER (Handles Movement & Physics)
+// -------------------------------------------------------
 class SimPlayerController : public Object, public Logger {
+protected:
     ManagedReference<AiAgent*> agent;
+    Vector<WorldCoordinates> simPath;
+    int simPathIndex;
+    Vector3 lastWatchdogPos;
+    int stuckWatchdogCount;
+    Vector3 destination;
     
-    String targetResource;
-    int retryCount;
-    Vector3 destination; // Final destination
-    
-    // --- PUPPET MODE VARIABLES ---
-    Vector<WorldCoordinates> simPath; // We hold the path, not the agent
-    int simPathIndex;                 // We track the progress
-    Vector3 lastWatchdogPos;          // Used to detect stalls
-    int stuckWatchdogCount; 
-    // -----------------------------
+    // Configurable speed/movement settings
+    float runSpeed;
 
     enum SimState {
         IDLE,
-        DECIDING,
-        SURVEYING,
-        CALCULATING_PATH,
         MOVING,
-        SAMPLING
+        PERFORMING_ACTION, // Generic busy state
+        WAITING
     };
     SimState state;
-
-private:
-    static const int MAX_ENGINE_PATROL_POINTS = 18;   // stay under 20
-    static constexpr float MIN_NODE_SPACING = 4.0f;   // meters between queued nodes
-
-    void queueMorePathNodes();   // feed agent more patrol points
-    bool pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out);
 
 public:
     SimPlayerController(AiAgent* aiAgent);
     virtual ~SimPlayerController();
 
-    void startSimLoop();
-    void performSurvey();
-    void finishSurvey();
-    void goToResource(const String& resourceName);
+    // --- Virtual Interface for Derived Bots ---
+    virtual void startSimLoop() = 0;  // Start the bot's logic
+    virtual void onArrived() = 0;     // Called when destination reached
+    virtual void onTick() {}          // Called every 500ms (Good for PvP scanning)
+
+    // --- Common Movement Logic ---
+    void moveTo(Vector3 targetPos);
+    void checkArrival();
     
     void onPathFound(Vector<WorldCoordinates>* path);
     void onPathFailed();
 
-    void checkArrival(); 
+protected:
+    void queueMorePathNodes();
+    bool pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out);
+};
+
+// -------------------------------------------------------
+// MINER CONTROLLER (Resource Gathering)
+// -------------------------------------------------------
+class SimMinerController : public SimPlayerController {
+    String targetResource;
+    int retryCount;
+
+public:
+    SimMinerController(AiAgent* aiAgent);
+    virtual ~SimMinerController();
+
+    void startSimLoop() override;
+    void onArrived() override;
+
+    // Specific logic
+    void performSurvey();
+    void finishSurvey();
+    void goToResource(const String& resourceName);
     void performSample();
     void finishSample();
 
-    String findActualResourceSpawn(const String& genericType);
     String pickRandomResource();
-    Vector3 findNearestHighDensityResource(const String& resourceClass);
 };
 
 #endif

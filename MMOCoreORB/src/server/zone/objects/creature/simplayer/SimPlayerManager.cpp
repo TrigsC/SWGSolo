@@ -75,8 +75,8 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     agent->loadTemplateData(tmpl);
 
     // 1. FORCE SPEED & STATS
-    agent->setRunSpeed(5.0f); 
-    agent->setWalkSpeed(5.0f);
+    agent->setRunSpeed(5.5f); 
+    agent->setWalkSpeed(5.5f);
     for (int i=0; i<9; ++i) {
         agent->setMaxHAM(i, 5000, true);
         agent->setHAM(i, 5000);
@@ -111,26 +111,36 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         agent->clearSavedPatrolPoints();
         agent->setMovementState(AiAgent::OBLIVIOUS);
         agent->activateAiBehavior(true);
+        
+        // Disable SimBot flag so normal physics apply if it returns to normal AI
+        agent->setSimPlayerBot(false);
         return;
     } else {
         info("Starting SimPlayer for agent " + String::valueOf(oid), true);
         
-        // Use 'patrol' map
+        // Common Setup
         agent->setCustomAiMap(String("patrol").hashCode());
         agent->setAITemplate(); 
         
-        info("BRAIN TRANSPLANT: Set map to 'patrol' and reloaded tree.", true);
-
         agent->writeBlackboard("simAlwaysActive", true);
         agent->setSimAlwaysActive(true);
         agent->setSimPlayerBot(true);
         agent->setDespawnOnNoPlayerInRange(false);
 
-        Reference<SimPlayerController*> ctrl = new SimPlayerController(agent);
+        // --- FACTORY LOGIC ---
+        Reference<SimPlayerController*> ctrl = nullptr;
+        
+        // We can check template name here to decide:
+        const CreatureTemplate* tmpl = agent->getCreatureTemplate();
+        if (tmpl && tmpl->getTemplateName() == "rebel_trooper") {
+             ctrl = new SimPvPController(agent);
+        } else {
+             ctrl = new SimMinerController(agent);
+        }
+
         controllers.put(oid, ctrl);
         
         agent->activateAiBehavior(true);
-        
         ctrl->startSimLoop();
     }
 }
