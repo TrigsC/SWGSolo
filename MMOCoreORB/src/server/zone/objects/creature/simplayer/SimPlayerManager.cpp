@@ -1,8 +1,10 @@
 /*
  * SimPlayerManager.cpp
+ * Updated for PvP
  */
 
 #include "SimPlayerManager.h"
+#include "SimPvPController.h" // <--- Include this
 #include "server/zone/ZoneServer.h"
 #include "server/ServerCore.h"
 #include "server/zone/managers/creature/CreatureManager.h"
@@ -21,7 +23,16 @@ SimPlayerManager::~SimPlayerManager() {
 
 void SimPlayerManager::initialize() {
     info("Initializing SimPlayer Manager...", true);
+    
+    // 1. Miner (Jedi Visual)
     spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
+
+    // 2. Miner (Artisan Visual)
+    spawnSimPlayer("naboo", 4720.0f, -4945.0f, "artisan");
+
+    // 3. PvP Bot (Stormtrooper) - Spawns at Shuttleport
+    // 4963, 3, -4892
+    spawnSimPlayer("naboo", 4963.0f, -4892.0f, "stormtrooper");
 }
 
 void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, const String& templateName) {
@@ -37,61 +48,21 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     CreatureManager* creatureManager = zone->getCreatureManager();
     if (creatureManager == nullptr) return;
 
-    uint32 templateCRC = templateName.hashCode();
-    CreatureTemplate* tmpl = CreatureTemplateManager::instance()->getTemplate(templateCRC);
-    
-    if (tmpl == nullptr) {
-        error("Spawn Failed: Template '" + templateName + "' is not loaded.");
-        return;
-    }
+    // Use a slight Z offset or terrain height
+    float z = zone->getHeight(x, y); 
 
-    if (tmpl->getTemplates().size() == 0) {
-        error("Spawn Failed: Template '" + templateName + "' has no IFF files.");
-        return;
-    }
-    
-    String iffPath = tmpl->getTemplates().get(0);
-    uint32 iffCRC = iffPath.hashCode();
-
-    info("Spawn Info: Mapped '" + templateName + "' -> '" + iffPath + "'", true);
-
-    float z = zone->getHeight(x, y);
-
-    CreatureObject* creature = creatureManager->spawnCreature(iffCRC, x, z, y, 0);
-
+    CreatureObject* creature = creatureManager->spawnCreature(templateName.hashCode(), 0, x, z, y, 0);
     if (creature == nullptr) {
-        error("Failed to spawn creature via CreatureManager.");
-        return;
-    }
-
-    if (!creature->isAiAgent()) {
-        error("Spawned entity is not an AiAgent.");
+        error("Failed to spawn SimPlayer template: " + templateName);
         return;
     }
 
     AiAgent* agent = creature->asAiAgent();
-    Locker lock(agent);
+    if (agent == nullptr) return;
 
-    agent->loadTemplateData(tmpl);
-
-    // 1. FORCE SPEED & STATS
-    agent->setRunSpeed(5.5f); 
-    agent->setWalkSpeed(5.5f);
-    for (int i=0; i<9; ++i) {
-        agent->setMaxHAM(i, 5000, true);
-        agent->setHAM(i, 5000);
-    }
-
-    agent->setHomeLocation(x, z, y, nullptr);
-    
-    // 2. PACIFIST & BLIND MODE (The Fix)
-    // Instead of using setters that don't exist, we just WIPE the flags.
-    // Setting these to 0 removes AGGRESSIVE, ENEMY, PACK, KILLER, etc.
-    // This makes the AI "Neutral" and "Oblivious" to the world.
+    // Setup basic flags
     agent->setCreatureBitmask(0); 
-    agent->setPvpStatusBitmask(0); 
-    
-    // Explicitly prevent any "Observer" distractions
+    // PvP Bot needs to be attackable, but we set Overt inside the controller
     agent->setDespawnOnNoPlayerInRange(false);
 
     toggleBot(agent);
@@ -111,31 +82,35 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         agent->clearSavedPatrolPoints();
         agent->setMovementState(AiAgent::OBLIVIOUS);
         agent->activateAiBehavior(true);
-        
-        // Disable SimBot flag so normal physics apply if it returns to normal AI
         agent->setSimPlayerBot(false);
         return;
     } else {
         info("Starting SimPlayer for agent " + String::valueOf(oid), true);
         
-        // Common Setup
         agent->setCustomAiMap(String("patrol").hashCode());
         agent->setAITemplate(); 
         
         agent->writeBlackboard("simAlwaysActive", true);
         agent->setSimAlwaysActive(true);
-        agent->setSimPlayerBot(true);
+        agent->setSimPlayerBot(true); // Enable Physics Fix
         agent->setDespawnOnNoPlayerInRange(false);
 
         // --- FACTORY LOGIC ---
         Reference<SimPlayerController*> ctrl = nullptr;
         
-        // We can check template name here to decide:
         const CreatureTemplate* tmpl = agent->getCreatureTemplate();
-        if (tmpl && tmpl->getTemplateName() == "rebel_trooper") {
-             //ctrl = new SimPvPController(agent);
-             ctrl = new SimMinerController(agent);
-        } else {
+        String tName = (tmpl != nullptr) ? tmpl->getTemplateName() : "";
+
+        if (tName == "stormtrooper") {
+             // Create IMPERIAL PvP Bot
+             ctrl = new SimPvPController(agent, true); 
+        } 
+        else if (tName == "rebel_trooper") {
+             // Create REBEL PvP Bot
+             ctrl = new SimPvPController(agent, false);
+        }
+        else {
+             // Default to Miner
              ctrl = new SimMinerController(agent);
         }
 
