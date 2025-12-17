@@ -25,10 +25,10 @@ void SimPlayerManager::initialize() {
     info("Initializing SimPlayer Manager...", true);
     
     // 1. Miner (Jedi Visual)
-    spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
+    //spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
 
     // 2. Miner (Artisan Visual)
-    spawnSimPlayer("naboo", 4720.0f, -4945.0f, "artisan");
+    //spawnSimPlayer("naboo", 4720.0f, -4945.0f, "artisan");
 
     // 3. PvP Bot (Stormtrooper)
     spawnSimPlayer("naboo", 4963.0f, -4892.0f, "stormtrooper");
