@@ -1,6 +1,6 @@
 /*
  * SimPvPController.cpp
- * Fixed for TreeEntry
+ * Final Fixes for Build Errors
  */
 
 #include "SimPvPController.h"
@@ -10,7 +10,7 @@
 #include "server/zone/managers/faction/FactionManager.h"
 #include "server/zone/objects/area/ActiveArea.h"
 #include "server/zone/CloseObjectsVector.h"
-#include "server/zone/TreeEntry.h" // <--- CHANGED THIS
+#include "server/zone/TreeEntry.h" 
 #include "templates/params/creature/ObjectFlag.h"
 
 SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerController(aiAgent) {
@@ -28,6 +28,8 @@ void SimPvPController::startSimLoop() {
 
     // 1. Setup Faction
     agent->setFaction(isImperial ? String("imperial").hashCode() : String("rebel").hashCode());
+    
+    // Set Overt status (0x04 is OVERT in standard Core3)
     agent->setPvpStatusBitmask(ObjectFlag::OVERT); 
     
     // 2. Define Route
@@ -40,13 +42,13 @@ void SimPvPController::startSimLoop() {
 }
 
 void SimPvPController::startPatrol() {
-    state = SimPlayerController::MOVING;
+    state = MOVING; // Inherited from Base
     returningToShuttle = false;
     moveTo(hangoutLocation);
 }
 
 void SimPvPController::returnToShuttle() {
-    state = SimPlayerController::MOVING;
+    state = MOVING; // Inherited from Base
     returningToShuttle = true;
     Logger::console.info("SimPvP: Patrol done. Returning to Shuttle.", true);
     moveTo(spawnLocation);
@@ -61,7 +63,8 @@ void SimPvPController::onArrived() {
 }
 
 void SimPvPController::startLoitering() {
-    state = SimPlayerController::WAITING;
+    // FIX: Access WAITING directly (inherited enum)
+    state = WAITING;
     Logger::console.info("SimPvP: Arrived at Starport. Scanning area for 30s...", true);
     
     if (agent != nullptr) agent->doAnimation("look_around");
@@ -98,9 +101,10 @@ void SimPvPController::scanForTargets() {
     CloseObjectsVector* vec = (CloseObjectsVector*) agent->getCloseObjects();
     if (vec == nullptr) return;
 
-    // FIX: Use TreeEntry instead of QuadTreeEntry
     Vector<TreeEntry*> objects;
-    vec->safeCopyReceiversTo(objects, Vector<TreeEntry*>());
+    
+    // FIX: Pass '0' as the second argument (Mask). 0 = Copy All Types.
+    vec->safeCopyReceiversTo(objects, 0);
 
     for (int i = 0; i < objects.size(); ++i) {
         SceneObject* obj = static_cast<SceneObject*>(objects.get(i));
@@ -130,7 +134,7 @@ void SimPvPController::scanForTargets() {
                 agent->addDefender(player);
                 agent->setCombatState();
                 
-                state = SimPlayerController::IDLE; 
+                state = IDLE; 
                 return; 
             }
         }
