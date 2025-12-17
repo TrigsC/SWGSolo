@@ -1,5 +1,6 @@
 /*
  * SimPvPController.cpp
+ * Fixed Includes and Flags
  */
 
 #include "SimPvPController.h"
@@ -8,6 +9,9 @@
 #include "server/zone/objects/player/PlayerObject.h"
 #include "server/zone/managers/faction/FactionManager.h"
 #include "server/zone/objects/area/ActiveArea.h"
+#include "server/zone/CloseObjectsVector.h"
+#include "engine/spatial/QuadTreeEntry.h" 
+#include "templates/params/creature/ObjectFlag.h"
 
 SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerController(aiAgent) {
     isImperial = imperial;
@@ -24,9 +28,11 @@ void SimPvPController::startSimLoop() {
 
     // 1. Setup Faction (Make them Overt)
     agent->setFaction(isImperial ? String("imperial").hashCode() : String("rebel").hashCode());
-    agent->setPvpStatusBitmask(CreatureFlag::OVERT); 
     
-    // 2. Define Route based on your coordinates
+    // FIX: Use ObjectFlag::OVERT
+    agent->setPvpStatusBitmask(ObjectFlag::OVERT); 
+    
+    // 2. Define Route
     // Start: 4963, 3, -4892 (Shuttle)
     // End: 4807, 4, -4700 (Starport)
     spawnLocation = Vector3(4963.0f, -4892.0f, 3.0f);
@@ -38,13 +44,13 @@ void SimPvPController::startSimLoop() {
 }
 
 void SimPvPController::startPatrol() {
-    state = MOVING;
+    state = SimPlayerController::MOVING;
     returningToShuttle = false;
     moveTo(hangoutLocation);
 }
 
 void SimPvPController::returnToShuttle() {
-    state = MOVING;
+    state = SimPlayerController::MOVING;
     returningToShuttle = true;
     Logger::console.info("SimPvP: Patrol done. Returning to Shuttle.", true);
     moveTo(spawnLocation);
@@ -59,7 +65,8 @@ void SimPvPController::onArrived() {
 }
 
 void SimPvPController::startLoitering() {
-    state = WAITING;
+    // FIX: Scope the enum correctly
+    state = SimPlayerController::WAITING;
     Logger::console.info("SimPvP: Arrived at Starport. Scanning area for 30s...", true);
     
     // Look around animation
@@ -98,6 +105,7 @@ void SimPvPController::scanForTargets() {
     CloseObjectsVector* vec = (CloseObjectsVector*) agent->getCloseObjects();
     if (vec == nullptr) return;
 
+    // FIX: Include QuadTreeEntry.h to make this vector valid
     Vector<QuadTreeEntry*> objects;
     vec->safeCopyReceiversTo(objects, Vector<QuadTreeEntry*>());
 
@@ -110,7 +118,6 @@ void SimPvPController::scanForTargets() {
 
         // --- INTERIOR CHECK (The "No NavMesh" Fix) ---
         // If player is inside a building (Parent != null), ignore them.
-        // This prevents the bot from humping the wall of the starport.
         if (player->getParent() != nullptr) continue; 
 
         // Check Faction
@@ -121,8 +128,7 @@ void SimPvPController::scanForTargets() {
         if (isImperial && playerReb) isEnemy = true;
         if (!isImperial && playerImp) isEnemy = true;
 
-        // Check PvP Status (Must be Overt/TEF to attack?)
-        // For simulation fun, let's just check if they are attackable 
+        // Check PvP Status (Simple check for now)
         if (isEnemy && player->isAttackableBy(agent)) {
             
             float dist = agent->getDistanceTo(player);
@@ -134,9 +140,8 @@ void SimPvPController::scanForTargets() {
                 agent->addDefender(player);
                 agent->setCombatState();
                 
-                // IMPORTANT: Stop our patrol logic so we don't try to walk away
-                // The AI Agent standard logic will take over now.
-                state = IDLE; 
+                // Stop patrol logic
+                state = SimPlayerController::IDLE; 
                 return; 
             }
         }
