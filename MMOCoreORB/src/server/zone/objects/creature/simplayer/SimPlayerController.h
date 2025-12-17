@@ -68,9 +68,11 @@ protected:
 
     enum SimState {
         IDLE,
+        DECIDING,
+        SURVEYING,
+        CALCULATING_PATH,
         MOVING,
-        PERFORMING_ACTION, // Generic busy state
-        WAITING
+        SAMPLING
     };
     SimState state;
 
