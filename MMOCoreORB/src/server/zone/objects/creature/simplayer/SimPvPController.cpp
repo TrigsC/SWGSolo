@@ -1,6 +1,6 @@
 /*
  * SimPvPController.cpp
- * Final Fixes for Build Errors
+ * Fixed Includes and Flags
  */
 
 #include "SimPvPController.h"
@@ -29,7 +29,7 @@ void SimPvPController::startSimLoop() {
     // 1. Setup Faction
     agent->setFaction(isImperial ? String("imperial").hashCode() : String("rebel").hashCode());
     
-    // Set Overt status (0x04 is OVERT in standard Core3)
+    // Set Overt status
     agent->setPvpStatusBitmask(ObjectFlag::OVERT); 
     
     // 2. Define Route
@@ -42,13 +42,13 @@ void SimPvPController::startSimLoop() {
 }
 
 void SimPvPController::startPatrol() {
-    state = MOVING; // Inherited from Base
+    state = SimPlayerController::MOVING;
     returningToShuttle = false;
     moveTo(hangoutLocation);
 }
 
 void SimPvPController::returnToShuttle() {
-    state = MOVING; // Inherited from Base
+    state = SimPlayerController::MOVING;
     returningToShuttle = true;
     Logger::console.info("SimPvP: Patrol done. Returning to Shuttle.", true);
     moveTo(spawnLocation);
@@ -63,8 +63,8 @@ void SimPvPController::onArrived() {
 }
 
 void SimPvPController::startLoitering() {
-    // FIX: Access WAITING directly (inherited enum)
-    state = WAITING;
+    // FIX: Explicitly access WAITING from base class
+    state = SimPlayerController::WAITING;
     Logger::console.info("SimPvP: Arrived at Starport. Scanning area for 30s...", true);
     
     if (agent != nullptr) agent->doAnimation("look_around");
@@ -103,7 +103,7 @@ void SimPvPController::scanForTargets() {
 
     Vector<TreeEntry*> objects;
     
-    // FIX: Pass '0' as the second argument (Mask). 0 = Copy All Types.
+    // FIX: Pass '0' as mask to get all object types
     vec->safeCopyReceiversTo(objects, 0);
 
     for (int i = 0; i < objects.size(); ++i) {
@@ -134,7 +134,7 @@ void SimPvPController::scanForTargets() {
                 agent->addDefender(player);
                 agent->setCombatState();
                 
-                state = IDLE; 
+                state = SimPlayerController::IDLE; 
                 return; 
             }
         }

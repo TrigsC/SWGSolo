@@ -73,7 +73,8 @@ protected:
         CALCULATING_PATH,
         PERFORMING_ACTION,
         MOVING,
-        SAMPLING
+        SAMPLING,
+        WAITING
     };
     SimState state;
 
