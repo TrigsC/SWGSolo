@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Debugging Startup Hang + Robust Retry
+ * Fixes: Miner Spin Loop & Deadlock Prevention
  */
 
 #include "SimPlayerController.h"
@@ -26,21 +26,13 @@ void SimPathFindTask::run() {
     Reference<SimPlayerController*> strongCtrl = controller.get();
     if (strongCtrl == nullptr) return;
 
-    // DEBUG: Trace start
-    // Logger::console.info("SimPlayer: [Thread] Pathfinding started...", true);
-
     Vector<WorldCoordinates>* path = nullptr;
     
     try {
         path = PathFinderManager::instance()->findPath(startCoord, endCoord, zone);
     } catch (...) {
-        Logger::console.info("SimPlayer: [Thread] EXCEPTION in findPath!", true);
         path = nullptr;
     }
-
-    // DEBUG: Trace end
-    // if (path != nullptr) Logger::console.info("SimPlayer: [Thread] Pathfinding success. Nodes: " + String::valueOf(path->size()), true);
-    // else Logger::console.info("SimPlayer: [Thread] Pathfinding returned NULL.", true);
 
     Core::getTaskManager()->executeTask([strongCtrl, path] () {
         if (path != nullptr) strongCtrl->onPathFound(path);
@@ -129,8 +121,7 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
 
     Reference<SimPathFindTask*> task = new SimPathFindTask(this, startCoord, endCoord, zone);
     
-    // FIX: Use schedule(100) instead of execute() to yield to main thread 
-    // and prevent lockups during heavy startup load.
+    // YIELD: Use schedule(100) to prevent startup lockups
     task->schedule(100); 
 }
 
@@ -138,7 +129,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (agent == nullptr) { if (path) delete path; return; }
     
     if (agent->isInCombat()) {
-        Logger::console.info("SimPlayer: Path found but Agent is in Combat. Holding.", true);
         if (path) delete path;
         state = IDLE;
         return;
@@ -146,7 +136,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     if (path == nullptr || path->size() < 2) { 
         if (path) delete path; 
-        Logger::console.info("SimPlayer: Path too short. Retrying in 5s.", true);
         onPathFailed(); 
         return; 
     }
@@ -155,14 +144,34 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     simPath.removeAll();
     simPathIndex = 0;
 
+    // --- FIX: PATH SANITIZATION ---
+    // Remove nodes that are too close to each other (< 1.0m).
+    // This prevents the "0m Distance" spin loop in the logs.
+    Vector3 lastAdded = agent->getWorldPosition();
+    
     for (int i = 0; i < path->size(); ++i) {
-        simPath.add(path->get(i));
+        WorldCoordinates wp = path->get(i);
+        Vector3 pt = wp.getPoint();
+        
+        // Always add the last point (destination), check others
+        if (i < path->size() - 1) {
+            float dist = pt.distanceTo(lastAdded);
+            if (dist < 1.0f) continue; // Skip micro-steps
+        }
+        
+        simPath.add(wp);
+        lastAdded = pt;
+    }
+    // ------------------------------
+
+    if (simPath.size() == 0) {
+        delete path;
+        onPathFailed();
+        return;
     }
 
     destination = simPath.get(simPath.size() - 1).getPoint();
     
-    // Logger::console.info("SimPlayer: Path Found (" + String::valueOf(path->size()) + " nodes). Moving...", true);
-
     agent->setHomeLocation(destination.getX(), destination.getZ(), destination.getY(), nullptr);
 
     agent->setFollowObject(nullptr);
@@ -187,7 +196,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     delete path;
 
-    // Ensure loop is active
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
     task->schedule(500); 
 }
@@ -196,9 +204,8 @@ void SimPlayerController::onPathFailed() {
     Logger::console.info("SimPlayer: Pathfinding failed/unreachable. Retrying in 5s...", true);
     state = IDLE;
     
-    // FIX: Don't recurse immediately. Schedule a retry.
     Reference<SimRetryTask*> task = new SimRetryTask(this);
-    task->schedule(5000); // 5 seconds
+    task->schedule(5000); 
 }
 
 void SimPlayerController::queueMorePathNodes() {
@@ -216,9 +223,7 @@ void SimPlayerController::queueMorePathNodes() {
 
         if (simPathIndex == 0) {
             Vector3 cur = agent->getWorldPosition();
-            float dx0 = p.getX() - cur.getX();
-            float dy0 = p.getY() - cur.getY();
-            if ((dx0*dx0 + dy0*dy0) < 1.0f) { 
+            if (p.distanceTo(cur) < 1.0f) { 
                 simPathIndex++;     
                 continue;
             }
@@ -245,7 +250,7 @@ void SimPlayerController::checkArrival() {
     }
 
     if (state == IDLE && destination.getX() != 0) {
-        Logger::console.info("SimPlayer: Resuming path to " + destination.toString(), true);
+        Logger::console.info("SimPlayer: Resuming path...", true);
         moveTo(destination);
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(1000);
@@ -284,8 +289,12 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
-    agent->findNextPosition(2.0f, false);
+    // --- FIX: STOP DOUBLE DRIVING ---
+    // Removed agent->findNextPosition(2.0f, false);
+    // The internal AiAgent behavior loop (activated by activateAiBehavior) is already calling this.
+    // Calling it twice causes race conditions and log spam.
     
+    // Stuck Check
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
     float moveDy = currentPos.getY() - lastWatchdogPos.getY();
     float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
