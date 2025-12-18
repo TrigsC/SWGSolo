@@ -1,6 +1,7 @@
 /*
  * SimPlayerManager.cpp
  * Phase 1: Cosmetics (Colors via FactionStatus) & Startup Safety
+ * Fixed: scheduleTask for startup delay
  */
 
 #include "SimPlayerManager.h"
@@ -14,7 +15,7 @@
 #include "server/zone/objects/creature/ai/PatrolPoint.h" 
 #include "templates/params/creature/ObjectFlag.h" 
 #include "server/zone/managers/name/NameManager.h" 
-#include "server/zone/objects/player/FactionStatus.h" // <--- Added for Colors
+#include "server/zone/objects/player/FactionStatus.h" 
 
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
@@ -27,7 +28,7 @@ void SimPlayerManager::initialize() {
     info("Initializing SimPlayer Manager...", true);
     
     // 1. Miner (Jedi Visual)
-    spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
+    //spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
 
     // 2. Miner (Artisan Visual)
     spawnSimPlayer("naboo", 4720.0f, -4945.0f, "artisan");
@@ -136,7 +137,7 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
 
         // --- STARTUP FIX: 10 Second Warmup ---
         // Prevents pathfinding requests before NavMesh is loaded
-        Core::getTaskManager()->executeTask([ctrl] () {
+        Core::getTaskManager()->scheduleTask([ctrl] () {
             ctrl->startSimLoop();
         }, "SimStartLambda", 10000); 
     }
