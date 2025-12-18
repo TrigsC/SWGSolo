@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * FIXED: Posture Kickstart (Stall Fix) & Path Sanitization
+ * FIXED: Path Sanitization (Prevents Spin) & Posture Kickstart (Prevents Stall)
  */
 
 #include "SimPlayerController.h"
@@ -146,7 +146,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     simPath.removeAll();
     simPathIndex = 0;
 
-    // --- FIX: ROBUST PATH SANITIZATION ---
+    // --- CRITICAL FIX: PATH SANITIZATION (PREVENTS SPIN LOOP) ---
     Vector3 lastAdded = agent->getWorldPosition();
     int droppedNodes = 0;
 
@@ -154,10 +154,11 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         WorldCoordinates wp = path->get(i);
         Vector3 pt = wp.getPoint();
         
-        // Ensure reasonable distance between steps to prevent spin loops
+        // If this point is less than 1.5m from the last one, SKIP IT.
+        // This stops the AI from spinning on stacked points.
         if (i < path->size() - 1) {
             float dist = pt.distanceTo(lastAdded);
-            if (dist < 1.5f) { // Increased to 1.5m to be safe
+            if (dist < 1.5f) { 
                 droppedNodes++;
                 continue; 
             }
@@ -166,8 +167,9 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         simPath.add(wp);
         lastAdded = pt;
     }
-    
-    // Logger::console.info("SimPlayer: Path Found. Raw: " + String::valueOf(path->size()) + " Cleaned: " + String::valueOf(simPath.size()) + " (Dropped " + String::valueOf(droppedNodes) + ")", true);
+    // ------------------------------------------------------------
+
+    Logger::console.info("SimPlayer: Path Found. Raw: " + String::valueOf(path->size()) + " Cleaned: " + String::valueOf(simPath.size()) + " nodes.", true);
 
     if (simPath.size() == 0) {
         delete path;
@@ -272,9 +274,8 @@ void SimPlayerController::checkArrival() {
         return;
     }
 
-    // --- FIX: KICKSTART STALLED AGENTS ---
-    // If the agent thinks it is stuck or speed is 0, force it upright and running.
-    // This fixes the [STALLED] issue where they stay crouched after sampling.
+    // --- CRITICAL FIX: KICKSTART STALLED AGENTS ---
+    // If the bot thinks it's moving but is stuck in a Crouch/Sample pose, force it up.
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
     }
@@ -306,7 +307,7 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
-    // Drive-by-wire
+    // Manual drive backup (kept for safety, but Sanitization handles the spin)
     agent->findNextPosition(2.0f, false);
     
     // Stuck Check
