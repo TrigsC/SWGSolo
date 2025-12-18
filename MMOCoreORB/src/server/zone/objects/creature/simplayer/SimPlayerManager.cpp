@@ -1,6 +1,6 @@
 /*
  * SimPlayerManager.cpp
- * Phase 1: Cosmetics (Colors via FactionStatus)
+ * Phase 1: Cosmetics (Colors via FactionStatus) & Startup Safety
  */
 
 #include "SimPlayerManager.h"
@@ -14,7 +14,7 @@
 #include "server/zone/objects/creature/ai/PatrolPoint.h" 
 #include "templates/params/creature/ObjectFlag.h" 
 #include "server/zone/managers/name/NameManager.h" 
-#include "server/zone/objects/player/FactionStatus.h"
+#include "server/zone/objects/player/FactionStatus.h" // <--- Added for Colors
 
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
@@ -63,24 +63,25 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     // --- COSMETICS ---
     NameManager* nm = zoneServer->getNameManager();
     if (nm != nullptr) {
+        // Type 0 = Generic/Human Name (No "TK-421")
         String name = nm->makeCreatureName(0, creature->getSpecies()); 
         if (!name.isEmpty()) {
             agent->setCustomObjectName(name, true);
         }
     }
 
+    // Rank 1 forces the client to treat them as "Ranked Faction Members" (enables colors)
     agent->setFactionRank(1); 
 
     // --- FLAGS & COLORS ---
-    // Using setFactionStatus ensures the client receives the correct packet for Name Color
     if (templateName == "stormtrooper" || templateName == "rebel_trooper") {
-        // PvP Bot: Red/Purple Name
+        // PvP Bot: OVERT (Purple/Red Name)
         agent->setFactionStatus(FactionStatus::OVERT);
         agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE);
     } else {
-        // Miner: Blue Name (Civilian)
+        // Miner: ONLEAVE (Blue Name)
         agent->setFactionStatus(FactionStatus::ONLEAVE);
-        agent->setPvpStatusBitmask(0); // Neutral
+        agent->setPvpStatusBitmask(0); // Neutral/Covert
     }
 
     agent->setDespawnOnNoPlayerInRange(false);
@@ -131,8 +132,12 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         }
 
         controllers.put(oid, ctrl);
-        
         agent->activateAiBehavior(true);
-        ctrl->startSimLoop();
+
+        // --- STARTUP FIX: 10 Second Warmup ---
+        // Prevents pathfinding requests before NavMesh is loaded
+        Core::getTaskManager()->executeTask([ctrl] () {
+            ctrl->startSimLoop();
+        }, "SimStartLambda", 10000); 
     }
 }
