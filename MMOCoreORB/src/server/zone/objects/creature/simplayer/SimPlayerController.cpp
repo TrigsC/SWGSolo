@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * FIXED: Deadlock Prevention & Path Sanitization
+ * FIXED: Restored Movement + Logging + Sanitization
  */
 
 #include "SimPlayerController.h"
@@ -130,6 +130,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (agent == nullptr) { if (path) delete path; return; }
     
     if (agent->isInCombat()) {
+        Logger::console.info("SimPlayer: Path found but Agent is in Combat. Holding.", true);
         if (path) delete path;
         state = IDLE;
         return;
@@ -170,6 +171,9 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         onPathFailed();
         return;
     }
+
+    // UNCOMMENTED LOG: Now you will see "Path Found" again
+    Logger::console.info("SimPlayer: Path Found (" + String::valueOf(simPath.size()) + " nodes). Moving...", true);
 
     destination = simPath.get(simPath.size() - 1).getPoint();
     
@@ -290,8 +294,10 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
-    // --- FIX: REMOVED DOUBLE DRIVE ---
-    // Removed agent->findNextPosition(2.0f, false); to prevent locking conflicts.
+    // --- FIX: RESTORED MOVEMENT ENGINE ---
+    // We brought this back because removing it caused the bot to stand still.
+    // The "Sanitization" loop in onPathFound protects us from the spin/deadlock.
+    agent->findNextPosition(2.0f, false);
     
     // Stuck Check
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
