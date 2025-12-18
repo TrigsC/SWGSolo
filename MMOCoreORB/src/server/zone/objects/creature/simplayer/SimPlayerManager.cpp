@@ -1,7 +1,6 @@
 /*
  * SimPlayerManager.cpp
- * Phase 1: Cosmetics (Colors via FactionStatus) & Startup Safety
- * Fixed: scheduleTask for startup delay
+ * Fixes: Startup Deadlock & Compiler Error
  */
 
 #include "SimPlayerManager.h"
@@ -28,7 +27,7 @@ void SimPlayerManager::initialize() {
     info("Initializing SimPlayer Manager...", true);
     
     // 1. Miner (Jedi Visual)
-    //spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
+    spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
 
     // 2. Miner (Artisan Visual)
     spawnSimPlayer("naboo", 4720.0f, -4945.0f, "artisan");
@@ -64,25 +63,26 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     // --- COSMETICS ---
     NameManager* nm = zoneServer->getNameManager();
     if (nm != nullptr) {
-        // Type 0 = Generic/Human Name (No "TK-421")
+        // Use Type 0 to generate a Human Name (First Last) instead of TK-123
         String name = nm->makeCreatureName(0, creature->getSpecies()); 
         if (!name.isEmpty()) {
             agent->setCustomObjectName(name, true);
         }
     }
 
-    // Rank 1 forces the client to treat them as "Ranked Faction Members" (enables colors)
+    // Rank 1 tells the client "This is a Private", enabling Faction Colors (Purple/Red)
     agent->setFactionRank(1); 
 
-    // --- FLAGS & COLORS ---
+    // --- FLAGS ---
+    // We set these IMMEDIATELY so the client sees them correct on spawn
     if (templateName == "stormtrooper" || templateName == "rebel_trooper") {
-        // PvP Bot: OVERT (Purple/Red Name)
+        // PvP Bot: OVERT (Purple/Red)
         agent->setFactionStatus(FactionStatus::OVERT);
         agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE);
     } else {
-        // Miner: ONLEAVE (Blue Name)
+        // Miner: ONLEAVE (Blue/White)
         agent->setFactionStatus(FactionStatus::ONLEAVE);
-        agent->setPvpStatusBitmask(0); // Neutral/Covert
+        agent->setPvpStatusBitmask(0); 
     }
 
     agent->setDespawnOnNoPlayerInRange(false);
@@ -136,7 +136,8 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         agent->activateAiBehavior(true);
 
         // --- STARTUP FIX: 10 Second Warmup ---
-        // Prevents pathfinding requests before NavMesh is loaded
+        // Using scheduleTask (Correct API) instead of executeTask
+        // This prevents the bot from asking for a path before the NavMesh is ready
         Core::getTaskManager()->scheduleTask([ctrl] () {
             ctrl->startSimLoop();
         }, "SimStartLambda", 10000); 
