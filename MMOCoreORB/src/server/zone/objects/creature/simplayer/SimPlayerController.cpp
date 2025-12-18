@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Tuning: 1s Tick, Aggressive Kickstart, Safe Sanitization
+ * FIXED: Force Run Speed (Prevents Speed=0 Stall) & Path Sanitization
  */
 
 #include "SimPlayerController.h"
@@ -192,6 +192,8 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
     
+    // FIX: Force Speed and Posture immediately
+    agent->setRunSpeed(runSpeed);
     agent->setPosture(CreaturePosture::UPRIGHT, true);
 
     queueMorePathNodes();
@@ -207,7 +209,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     delete path;
 
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(1000); // 1s tick
+    task->schedule(1000); 
 }
 
 void SimPlayerController::onPathFailed() {
@@ -273,13 +275,21 @@ void SimPlayerController::checkArrival() {
         return;
     }
 
-    // --- AGGRESSIVE KICKSTART ---
+    // --- STALL RECOVERY / KICKSTART ---
     bool needsKick = false;
+    
+    // 1. Posture Check
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
         needsKick = true;
     }
     
+    // 2. Speed Check (Fixes 0m Speed Stall)
+    if (agent->getCurrentSpeed() < 0.1f) {
+        agent->setRunSpeed(runSpeed); // Force the speed back
+        needsKick = true;
+    }
+
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
     
     if (agent->isWaiting()) agent->stopWaiting();
@@ -307,9 +317,8 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
-    // If we kicked posture or speed is suspiciously low, force a move update
-    // But ONLY if we aren't already processing one (to avoid spam)
-    if (needsKick || agent->getCurrentSpeed() < 0.1f) {
+    // Force move update if we detected a stall
+    if (needsKick) {
          agent->findNextPosition(2.0f, false);
     }
     
@@ -334,7 +343,7 @@ void SimPlayerController::checkArrival() {
     lastWatchdogPos = currentPos;
 
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(1000); // Slower tick
+    task->schedule(1000);
 }
 
 bool SimPlayerController::pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out) {
