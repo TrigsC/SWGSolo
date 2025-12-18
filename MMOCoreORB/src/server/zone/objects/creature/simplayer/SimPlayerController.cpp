@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * FIXED: Ruthless Path Sanitization (No sub-1m nodes allowed)
+ * Tuning: 1s Tick, Aggressive Kickstart, Safe Sanitization
  */
 
 #include "SimPlayerController.h"
@@ -128,6 +128,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (agent == nullptr) { if (path) delete path; return; }
     
     if (agent->isInCombat()) {
+        Logger::console.info("SimPlayer: Path found but Agent is in Combat. Holding.", true);
         if (path) delete path;
         state = IDLE;
         return;
@@ -143,34 +144,35 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     simPath.removeAll();
     simPathIndex = 0;
 
-    // --- FIX: RUTHLESS SANITIZATION ---
+    // --- PATH SANITIZATION ---
     Vector3 lastAdded = agent->getWorldPosition();
     
     for (int i = 0; i < path->size(); ++i) {
         WorldCoordinates wp = path->get(i);
         Vector3 pt = wp.getPoint();
-        float dist = pt.distanceTo(lastAdded);
-
-        // ALWAYS check distance, even for the final node.
-        // If the point is < 1.5m from the previous one, we skip it.
-        // UNLESS it is the very last point and the path is empty (start -> end).
-        if (dist < 1.5f) {
-            bool isLast = (i == path->size() - 1);
-            if (!isLast) continue; // Skip intermediate micro-steps
-            
-            // If it IS the last point, but close to the previous one, 
-            // we skip it too, effectively stopping at the previous point (close enough).
-            if (simPath.size() > 0) continue; 
+        
+        if (i < path->size() - 1) {
+            float dist = pt.distanceTo(lastAdded);
+            if (dist < 1.5f) continue; 
         }
         
         simPath.add(wp);
         lastAdded = pt;
     }
-    // ----------------------------------
+    
+    // Ensure destination is added if sanitized out
+    if (path->size() > 0) {
+        WorldCoordinates finalWp = path->get(path->size()-1);
+        Vector3 finalPt = finalWp.getPoint();
+        if (simPath.size() == 0 || simPath.get(simPath.size()-1).getPoint().distanceTo(finalPt) > 0.1f) {
+             simPath.add(finalWp);
+        }
+    }
+    // -------------------------
 
     if (simPath.size() == 0) {
         delete path;
-        onPathFailed(); // Path collapsed to zero length
+        onPathFailed();
         return;
     }
 
@@ -205,7 +207,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     delete path;
 
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(500); 
+    task->schedule(1000); // 1s tick
 }
 
 void SimPlayerController::onPathFailed() {
@@ -271,8 +273,11 @@ void SimPlayerController::checkArrival() {
         return;
     }
 
+    // --- AGGRESSIVE KICKSTART ---
+    bool needsKick = false;
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
+        needsKick = true;
     }
     
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
@@ -302,8 +307,13 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
-    agent->findNextPosition(2.0f, false);
+    // If we kicked posture or speed is suspiciously low, force a move update
+    // But ONLY if we aren't already processing one (to avoid spam)
+    if (needsKick || agent->getCurrentSpeed() < 0.1f) {
+         agent->findNextPosition(2.0f, false);
+    }
     
+    // Stuck Check
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
     float moveDy = currentPos.getY() - lastWatchdogPos.getY();
     float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
@@ -324,7 +334,7 @@ void SimPlayerController::checkArrival() {
     lastWatchdogPos = currentPos;
 
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(500);
+    task->schedule(1000); // Slower tick
 }
 
 bool SimPlayerController::pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out) {
