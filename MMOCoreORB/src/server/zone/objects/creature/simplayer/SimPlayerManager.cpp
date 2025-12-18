@@ -1,6 +1,6 @@
 /*
  * SimPlayerManager.cpp
- * Fixed Attackable Flags
+ * Phase 1 Fix: Colors (Rank 1) & Flags
  */
 
 #include "SimPlayerManager.h"
@@ -12,8 +12,8 @@
 #include "server/zone/objects/creature/ai/CreatureTemplate.h" 
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h" 
-#include "templates/params/creature/ObjectFlag.h"
-#include "server/zone/managers/name/NameManager.h"
+#include "templates/params/creature/ObjectFlag.h" 
+#include "server/zone/managers/name/NameManager.h" 
 
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
@@ -58,25 +58,33 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
 
     AiAgent* agent = creature->asAiAgent();
     if (agent == nullptr) return;
+
+    // --- COSMETIC FIXES ---
     
-    // 1. Generate "Real" Name
+    // 1. Name Generator
     NameManager* nm = zoneServer->getNameManager();
     if (nm != nullptr) {
-        // Use type 0 (Generic) to ensure we get a First/Last name (e.g. "Gary Retski")
-        // avoiding "TK-421" or droid names.
-        int species = creature->getSpecies();
-        String name = nm->makeCreatureName(0, species); 
-        
+        // Type 0 = Generic/Human Name (No "TK-421")
+        String name = nm->makeCreatureName(0, creature->getSpecies()); 
         if (!name.isEmpty()) {
-            // This overrides the default name and removes the (Template Title) suffix
             agent->setCustomObjectName(name, true);
         }
     }
 
-    agent->setFactionRank(0);
+    // 2. Faction Rank (COLOR FIX)
+    // Rank 0 = Civilian (White/Yellow Name)
+    // Rank 1 = Private (Purple/Red Name depending on observer)
+    agent->setFactionRank(1); 
 
-    // Reset default flags
-    agent->setCreatureBitmask(0); 
+    // 3. Pre-set Flags based on Type (Avoids Color Flicker)
+    if (templateName == "stormtrooper" || templateName == "rebel_trooper") {
+        // PvP Bots must be Overt + Attackable
+        agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE);
+    } else {
+        // Miners are Neutral
+        agent->setPvpStatusBitmask(0);
+    }
+
     agent->setDespawnOnNoPlayerInRange(false);
 
     toggleBot(agent);
@@ -115,19 +123,12 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         String tName = (tmpl != nullptr) ? tmpl->getTemplateName() : "";
 
         if (tName == "stormtrooper") {
-             // PvP Bot: Make Attackable + Overt
-             // Note: Controller will enforce Overt, but we set Attackable here to be safe
-             agent->setPvpStatusBitmask(ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
              ctrl = new SimPvPController(agent, true); 
         } 
         else if (tName == "rebel_trooper") {
-             // PvP Bot: Make Attackable + Overt
-             agent->setPvpStatusBitmask(ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
              ctrl = new SimPvPController(agent, false);
         }
         else {
-             // Miner: Make Neutral/Unattackable (0 removes ATTACKABLE flag)
-             agent->setPvpStatusBitmask(0); 
              ctrl = new SimMinerController(agent);
         }
 
