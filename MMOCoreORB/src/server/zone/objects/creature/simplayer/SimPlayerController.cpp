@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * FIXED: Force Run Speed (Prevents Speed=0 Stall) & Path Sanitization
+ * FIXED: Immortal Loop (Survives Zone Hibernation)
  */
 
 #include "SimPlayerController.h"
@@ -160,7 +160,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         lastAdded = pt;
     }
     
-    // Ensure destination is added if sanitized out
     if (path->size() > 0) {
         WorldCoordinates finalWp = path->get(path->size()-1);
         Vector3 finalPt = finalWp.getPoint();
@@ -168,7 +167,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
              simPath.add(finalWp);
         }
     }
-    // -------------------------
 
     if (simPath.size() == 0) {
         delete path;
@@ -191,9 +189,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     agent->stopWaiting();
 
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
-    
-    // FIX: Force Speed and Posture immediately
-    agent->setRunSpeed(runSpeed);
+    agent->setRunSpeed(runSpeed); // Force Speed
     agent->setPosture(CreaturePosture::UPRIGHT, true);
 
     queueMorePathNodes();
@@ -215,7 +211,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 void SimPlayerController::onPathFailed() {
     Logger::console.info("SimPlayer: Pathfinding failed/unreachable. Retrying in 5s...", true);
     state = IDLE;
-    
     Reference<SimRetryTask*> task = new SimRetryTask(this);
     task->schedule(5000); 
 }
@@ -249,8 +244,25 @@ void SimPlayerController::queueMorePathNodes() {
     }
 }
 
+// ----------------------------------------------------------------------
+// THE IMMORTAL LOOP
+// ----------------------------------------------------------------------
 void SimPlayerController::checkArrival() {
-    if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
+    // 1. Basic Existence Check
+    if (agent == nullptr) return; // Agent deleted from memory
+    
+    // 2. Zone/Life Check
+    // If agent is dead or zone is null, we usually stop.
+    // BUT if the zone is just unloaded (hibernating), we want to wait.
+    if (agent->isDead()) return; 
+
+    // --- FIX: Survive Zone Hibernation ---
+    if (agent->getZone() == nullptr) {
+        // Zone is likely unloaded. Sleep for 5s and check again.
+        Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
+        task->schedule(5000);
+        return;
+    }
 
     onTick(); 
 
@@ -275,18 +287,17 @@ void SimPlayerController::checkArrival() {
         return;
     }
 
-    // --- STALL RECOVERY / KICKSTART ---
+    // --- KICKSTART LOGIC ---
     bool needsKick = false;
     
-    // 1. Posture Check
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
         needsKick = true;
     }
     
-    // 2. Speed Check (Fixes 0m Speed Stall)
+    // If speed is zero, force it back
     if (agent->getCurrentSpeed() < 0.1f) {
-        agent->setRunSpeed(runSpeed); // Force the speed back
+        agent->setRunSpeed(runSpeed);
         needsKick = true;
     }
 
@@ -317,7 +328,6 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
-    // Force move update if we detected a stall
     if (needsKick) {
          agent->findNextPosition(2.0f, false);
     }
@@ -329,7 +339,7 @@ void SimPlayerController::checkArrival() {
 
     if (movedDistSq < 0.05f) {
         stuckWatchdogCount++;
-        if (stuckWatchdogCount > 5) { 
+        if (stuckWatchdogCount > 10) { // Increased to 10s tolerance
              if (agent->getPatrolPointSize() > 0) {
                  PatrolPoint next = agent->getNextPosition();
                  agent->setNextStepPosition(next.getPositionX(), next.getPositionZ(), next.getPositionY(), next.getCell());
@@ -342,6 +352,7 @@ void SimPlayerController::checkArrival() {
 
     lastWatchdogPos = currentPos;
 
+    // ALWAYS RESCHEDULE
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
     task->schedule(1000);
 }
