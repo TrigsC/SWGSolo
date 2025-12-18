@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * STABLE: No Manual Driving (Prevents Deadlock) + Speed Enforcement
+ * FIXED: Lambda Reference Capture (Prevents Heap Corruption/Segfault)
  */
 
 #include "SimPlayerController.h"
@@ -50,16 +50,26 @@ void ArrivalCheckTask::run() {
 }
 
 void SimBehaviorTask::run() {
+    // 1. Get Strong Reference
     Reference<SimPlayerController*> baseCtrl = controller.get();
     if (baseCtrl == nullptr) return;
     
-    SimMinerController* miner = dynamic_cast<SimMinerController*>(baseCtrl.get());
-    if (miner == nullptr) return;
+    // 2. Type Check (Safe Dynamic Cast)
+    SimMinerController* minerCheck = dynamic_cast<SimMinerController*>(baseCtrl.get());
+    if (minerCheck == nullptr) return;
 
     int capturedType = type;
-    Core::getTaskManager()->executeTask([miner, capturedType] () {
-        if (capturedType == SimBehaviorTask::FINISH_SURVEY) miner->finishSurvey();
-        else if (capturedType == SimBehaviorTask::FINISH_SAMPLE) miner->finishSample();
+
+    // 3. EXECUTE TASK WITH STRONG REFERENCE CAPTURE
+    // CRITICAL FIX: We capture 'baseCtrl' (Reference), NOT a raw pointer.
+    // This ensures the object cannot be deleted while this lambda is waiting to run.
+    Core::getTaskManager()->executeTask([baseCtrl, capturedType] () {
+        // Re-cast inside the safe context
+        SimMinerController* miner = dynamic_cast<SimMinerController*>(baseCtrl.get());
+        if (miner != nullptr) {
+            if (capturedType == SimBehaviorTask::FINISH_SURVEY) miner->finishSurvey();
+            else if (capturedType == SimBehaviorTask::FINISH_SAMPLE) miner->finishSample();
+        }
     }, "SimPlayerBehaviorLambda");
 }
 
@@ -127,7 +137,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (agent == nullptr) { if (path) delete path; return; }
     
     if (agent->isInCombat()) {
-        Logger::console.info("SimPlayer: Path found but Agent is in Combat. Holding.", true);
         if (path) delete path;
         state = IDLE;
         return;
@@ -149,7 +158,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         WorldCoordinates wp = path->get(i);
         Vector3 pt = wp.getPoint();
         
-        // Don't add points clustered closer than 1.5m
         if (i < path->size() - 1) {
             if (pt.distanceTo(lastAdded) < 1.5f) continue; 
         }
@@ -158,7 +166,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         lastAdded = pt;
     }
     
-    // Always ensure destination is added
     if (path->size() > 0) {
         WorldCoordinates finalWp = path->get(path->size()-1);
         Vector3 finalPt = finalWp.getPoint();
@@ -187,7 +194,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     agent->clearSavedPatrolPoints();
     agent->stopWaiting();
 
-    // --- FORCE MOTION PARAMETERS ---
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
     agent->setRunSpeed(runSpeed); 
     agent->setPosture(CreaturePosture::UPRIGHT, true);
@@ -199,7 +205,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         agent->setNextStepPosition(next.getPositionX(), next.getPositionZ(), next.getPositionY(), next.getCell());
     }
 
-    // ACTIVATE INTERNAL AI ENGINE
     agent->setMovementState(AiAgent::PATROLLING);
     agent->activateAiBehavior(true);
 
@@ -245,22 +250,20 @@ void SimPlayerController::queueMorePathNodes() {
     }
 }
 
-// ----------------------------------------------------------------------
-// THE IMMORTAL LOOP
-// ----------------------------------------------------------------------
 void SimPlayerController::checkArrival() {
-    if (agent == nullptr || agent->isDead()) return; 
-
-    // 1. Hibernation Check
+    if (agent == nullptr) return; 
+    
+    // Survive hibernation
     if (agent->getZone() == nullptr) {
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(5000);
         return;
     }
+    
+    if (agent->isDead()) return; 
 
     onTick(); 
 
-    // 2. Combat Pause
     if (agent->isInCombat()) {
         state = IDLE; 
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
@@ -268,7 +271,6 @@ void SimPlayerController::checkArrival() {
         return;
     }
 
-    // 3. Resume from Interruption
     if (state == IDLE && destination.getX() != 0) {
         Logger::console.info("SimPlayer: Resuming path...", true);
         moveTo(destination);
@@ -284,12 +286,13 @@ void SimPlayerController::checkArrival() {
     }
 
     // --- KICKSTART LOGIC ---
-    // If agent is stopped/crouched, force it to run.
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
+    }
+    if (agent->getCurrentSpeed() < 0.1f) {
         agent->setRunSpeed(runSpeed);
     }
-    
+
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
     
     if (agent->isWaiting()) agent->stopWaiting();
@@ -313,20 +316,17 @@ void SimPlayerController::checkArrival() {
     } 
 
     // --- STUCK MONITOR ---
-    // We do NOT manually drive anymore. We only watch.
+    // Only nudge internal state, do not double-drive physics
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
     float moveDy = currentPos.getY() - lastWatchdogPos.getY();
     float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
 
-    // If we haven't moved 0.05m in 1 second, we assume the AI engine went to sleep.
-    // This is the ONLY time we manually poke it.
     if (movedDistSq < 0.05f) {
         stuckWatchdogCount++;
         if (stuckWatchdogCount > 5) { 
-             // Just nudge the internal state, don't force a physics move
              agent->activateAiBehavior(true);
-             // If REALLY stuck (10s), force a tiny step
-             if (stuckWatchdogCount > 10) {
+             // Last resort nudge
+             if (stuckWatchdogCount > 15) {
                  agent->findNextPosition(2.0f, false);
              }
         }
