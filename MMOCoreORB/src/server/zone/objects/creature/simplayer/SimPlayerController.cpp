@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * Fixes: Miner Spin Loop & Deadlock Prevention
+ * FIXED: Deadlock Prevention & Path Sanitization
  */
 
 #include "SimPlayerController.h"
@@ -31,6 +31,7 @@ void SimPathFindTask::run() {
     try {
         path = PathFinderManager::instance()->findPath(startCoord, endCoord, zone);
     } catch (...) {
+        Logger::console.info("SimPlayer: [Thread] EXCEPTION in findPath!", true);
         path = nullptr;
     }
 
@@ -289,10 +290,8 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
-    // --- FIX: STOP DOUBLE DRIVING ---
-    // Removed agent->findNextPosition(2.0f, false);
-    // The internal AiAgent behavior loop (activated by activateAiBehavior) is already calling this.
-    // Calling it twice causes race conditions and log spam.
+    // --- FIX: REMOVED DOUBLE DRIVE ---
+    // Removed agent->findNextPosition(2.0f, false); to prevent locking conflicts.
     
     // Stuck Check
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
