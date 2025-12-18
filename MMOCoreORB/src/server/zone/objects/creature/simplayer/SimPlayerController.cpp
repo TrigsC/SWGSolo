@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * FIXED: Path Sanitization (Prevents Spin) & Posture Kickstart (Prevents Stall)
+ * FIXED: Ruthless Path Sanitization (No sub-1m nodes allowed)
  */
 
 #include "SimPlayerController.h"
@@ -121,26 +121,13 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
     WorldCoordinates endCoord(targetPos, nullptr);
 
     Reference<SimPathFindTask*> task = new SimPathFindTask(this, startCoord, endCoord, zone);
-    
-    // YIELD: Use schedule(100) to prevent startup lockups
     task->schedule(100); 
 }
 
 void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (agent == nullptr) { if (path) delete path; return; }
     
-    // --- DEBUG: BLACK BOX RECORDER ---
-    String rawLog = "PATHFINDER RAW: ";
-    if (path != nullptr) {
-        for (int i = 0; i < path->size(); ++i) {
-            rawLog = rawLog + "(" + String::valueOf(i) + ")" + path->get(i).getPoint().toString() + " ";
-        }
-    }
-    Logger::console.info(rawLog, true);
-    // ---------------------------------
-
     if (agent->isInCombat()) {
-        Logger::console.info("SimPlayer: Agent in Combat. Discarding path.", true);
         if (path) delete path;
         state = IDLE;
         return;
@@ -148,7 +135,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     if (path == nullptr || path->size() < 2) { 
         if (path) delete path; 
-        Logger::console.info("SimPlayer: Path too short/null.", true);
         onPathFailed(); 
         return; 
     }
@@ -157,41 +143,43 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     simPath.removeAll();
     simPathIndex = 0;
 
-    // --- SANITIZATION & LOGGING ---
+    // --- FIX: RUTHLESS SANITIZATION ---
     Vector3 lastAdded = agent->getWorldPosition();
-    String cleanLog = "PATH SANITIZED: ";
-
+    
     for (int i = 0; i < path->size(); ++i) {
         WorldCoordinates wp = path->get(i);
         Vector3 pt = wp.getPoint();
-        
-        if (i < path->size() - 1) {
-            float dist = pt.distanceTo(lastAdded);
-            // DEBUG: Log why we dropped it
-            if (dist < 1.0f) { 
-               // Logger::console.info("SimPlayer: Dropping Node " + String::valueOf(i) + " (Dist " + String::valueOf(dist) + " < 1.0m)", true);
-               continue; 
-            }
+        float dist = pt.distanceTo(lastAdded);
+
+        // ALWAYS check distance, even for the final node.
+        // If the point is < 1.5m from the previous one, we skip it.
+        // UNLESS it is the very last point and the path is empty (start -> end).
+        if (dist < 1.5f) {
+            bool isLast = (i == path->size() - 1);
+            if (!isLast) continue; // Skip intermediate micro-steps
+            
+            // If it IS the last point, but close to the previous one, 
+            // we skip it too, effectively stopping at the previous point (close enough).
+            if (simPath.size() > 0) continue; 
         }
         
         simPath.add(wp);
         lastAdded = pt;
-        cleanLog = cleanLog + "(" + String::valueOf(simPath.size()-1) + ")" + pt.toString() + " ";
     }
-    
-    Logger::console.info(cleanLog, true);
-    // ------------------------------
+    // ----------------------------------
 
     if (simPath.size() == 0) {
-        Logger::console.info("SimPlayer: Sanitization removed all nodes.", true);
         delete path;
-        onPathFailed();
+        onPathFailed(); // Path collapsed to zero length
         return;
     }
+
+    Logger::console.info("SimPlayer: Path Found (" + String::valueOf(simPath.size()) + " nodes). Moving...", true);
 
     destination = simPath.get(simPath.size() - 1).getPoint();
     
     agent->setHomeLocation(destination.getX(), destination.getZ(), destination.getY(), nullptr);
+
     agent->setFollowObject(nullptr);
     agent->setWatchObject(nullptr);
     agent->setTargetObject(nullptr);
@@ -202,15 +190,12 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
     
-    // Force Upright
     agent->setPosture(CreaturePosture::UPRIGHT, true);
 
     queueMorePathNodes();
 
-    // KICKSTART
     if (agent->getPatrolPointSize() > 0) {
         PatrolPoint next = agent->getNextPosition();
-        Logger::console.info("SimPlayer: Kickstart -> First Point: " + String::valueOf(next.getPositionX()) + "," + String::valueOf(next.getPositionY()), true);
         agent->setNextStepPosition(next.getPositionX(), next.getPositionZ(), next.getPositionY(), next.getCell());
     }
 
@@ -244,7 +229,6 @@ void SimPlayerController::queueMorePathNodes() {
     while (slots > 0 && simPathIndex < pathSize) {
         Vector3 p = simPath.get(simPathIndex).getPoint();
 
-        // Extra check against current position for the very first node
         if (simPathIndex == 0) {
             Vector3 cur = agent->getWorldPosition();
             if (p.distanceTo(cur) < 1.0f) { 
@@ -263,16 +247,6 @@ void SimPlayerController::queueMorePathNodes() {
 
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
-
-    // --- DEBUG: STATE MONITOR ---
-    // Only log if we are suspiciously close or fast to detect spin
-    Vector3 pos = agent->getWorldPosition();
-    float speed = agent->getCurrentSpeed();
-    int queue = agent->getPatrolPointSize();
-    if (state == MOVING) {
-       Logger::console.info("SimPlayer: CheckArrival. Q=" + String::valueOf(queue) + " Spd=" + String::valueOf(speed) + " Pos=" + pos.toString(), true);
-    }
-    // ----------------------------
 
     onTick(); 
 
@@ -297,8 +271,6 @@ void SimPlayerController::checkArrival() {
         return;
     }
 
-    // --- CRITICAL FIX: KICKSTART STALLED AGENTS ---
-    // If the bot thinks it's moving but is stuck in a Crouch/Sample pose, force it up.
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
     }
@@ -330,10 +302,8 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
-    // Manual drive backup (kept for safety, but Sanitization handles the spin)
     agent->findNextPosition(2.0f, false);
     
-    // Stuck Check
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
     float moveDy = currentPos.getY() - lastWatchdogPos.getY();
     float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
