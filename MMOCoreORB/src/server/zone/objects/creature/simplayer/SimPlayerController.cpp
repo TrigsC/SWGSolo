@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * FINAL: Hibernation-Proof, Speed-Enforced, Sanitized
+ * STABLE: No Manual Driving (Prevents Deadlock) + Speed Enforcement
  */
 
 #include "SimPlayerController.h"
@@ -30,6 +30,7 @@ void SimPathFindTask::run() {
     try {
         path = PathFinderManager::instance()->findPath(startCoord, endCoord, zone);
     } catch (...) {
+        Logger::console.info("SimPlayer: [Thread] EXCEPTION in findPath!", true);
         path = nullptr;
     }
 
@@ -85,7 +86,7 @@ SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     state = IDLE;
     simPathIndex = 0;
     stuckWatchdogCount = 0;
-    runSpeed = 6.5f; // Slightly faster to ensure 'Run' state implies movement
+    runSpeed = 6.5f; 
     setLoggingName("SimPlayerController");
     destination = Vector3(0, 0, 0);
 }
@@ -119,7 +120,6 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
     WorldCoordinates endCoord(targetPos, nullptr);
 
     Reference<SimPathFindTask*> task = new SimPathFindTask(this, startCoord, endCoord, zone);
-    // Yield to main thread briefly to prevent startup lockups
     task->schedule(100); 
 }
 
@@ -127,6 +127,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (agent == nullptr) { if (path) delete path; return; }
     
     if (agent->isInCombat()) {
+        Logger::console.info("SimPlayer: Path found but Agent is in Combat. Holding.", true);
         if (path) delete path;
         state = IDLE;
         return;
@@ -143,25 +144,33 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     simPathIndex = 0;
 
     // --- PATH SANITIZATION ---
-    // This logic prevents the "Spin Loop" caused by micro-nodes
     Vector3 lastAdded = agent->getWorldPosition();
     for (int i = 0; i < path->size(); ++i) {
         WorldCoordinates wp = path->get(i);
         Vector3 pt = wp.getPoint();
         
-        // Skip nodes closer than 1m, unless it's the final destination
+        // Don't add points clustered closer than 1.5m
         if (i < path->size() - 1) {
-            if (pt.distanceTo(lastAdded) < 1.0f) continue; 
+            if (pt.distanceTo(lastAdded) < 1.5f) continue; 
         }
         
         simPath.add(wp);
         lastAdded = pt;
     }
     
-    // Safety: Ensure we have a destination
+    // Always ensure destination is added
+    if (path->size() > 0) {
+        WorldCoordinates finalWp = path->get(path->size()-1);
+        Vector3 finalPt = finalWp.getPoint();
+        if (simPath.size() == 0 || simPath.get(simPath.size()-1).getPoint().distanceTo(finalPt) > 0.1f) {
+             simPath.add(finalWp);
+        }
+    }
+
     if (simPath.size() == 0) {
-        if (path->size() > 0) simPath.add(path->get(path->size()-1));
-        else { delete path; onPathFailed(); return; }
+        delete path;
+        onPathFailed();
+        return;
     }
 
     Logger::console.info("SimPlayer: Path Found (" + String::valueOf(simPath.size()) + " nodes). Moving...", true);
@@ -178,7 +187,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     agent->clearSavedPatrolPoints();
     agent->stopWaiting();
 
-    // --- CRITICAL FIX: FORCE SPEED & POSTURE ---
+    // --- FORCE MOTION PARAMETERS ---
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
     agent->setRunSpeed(runSpeed); 
     agent->setPosture(CreaturePosture::UPRIGHT, true);
@@ -190,13 +199,14 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         agent->setNextStepPosition(next.getPositionX(), next.getPositionZ(), next.getPositionY(), next.getCell());
     }
 
+    // ACTIVATE INTERNAL AI ENGINE
     agent->setMovementState(AiAgent::PATROLLING);
     agent->activateAiBehavior(true);
 
     delete path;
 
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(500); 
+    task->schedule(1000); 
 }
 
 void SimPlayerController::onPathFailed() {
@@ -236,13 +246,12 @@ void SimPlayerController::queueMorePathNodes() {
 }
 
 // ----------------------------------------------------------------------
-// THE IMMORTAL LOOP (Survives Hibernation)
+// THE IMMORTAL LOOP
 // ----------------------------------------------------------------------
 void SimPlayerController::checkArrival() {
-    if (agent == nullptr) return; 
-    if (agent->isDead()) return; 
+    if (agent == nullptr || agent->isDead()) return; 
 
-    // 1. Hibernation Check: If zone is null, sleep and retry.
+    // 1. Hibernation Check
     if (agent->getZone() == nullptr) {
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(5000);
@@ -251,6 +260,7 @@ void SimPlayerController::checkArrival() {
 
     onTick(); 
 
+    // 2. Combat Pause
     if (agent->isInCombat()) {
         state = IDLE; 
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
@@ -258,8 +268,9 @@ void SimPlayerController::checkArrival() {
         return;
     }
 
+    // 3. Resume from Interruption
     if (state == IDLE && destination.getX() != 0) {
-        // Resume if we were interrupted
+        Logger::console.info("SimPlayer: Resuming path...", true);
         moveTo(destination);
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(1000);
@@ -272,14 +283,13 @@ void SimPlayerController::checkArrival() {
         return;
     }
 
-    // 2. Stall Kickstart: Force speed if it dropped to 0
+    // --- KICKSTART LOGIC ---
+    // If agent is stopped/crouched, force it to run.
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
-    }
-    if (agent->getCurrentSpeed() < 0.1f) {
         agent->setRunSpeed(runSpeed);
     }
-
+    
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
     
     if (agent->isWaiting()) agent->stopWaiting();
@@ -302,22 +312,23 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
-    // Standard Drive Logic
-    agent->findNextPosition(2.0f, false);
-    
-    // Stuck Logic
+    // --- STUCK MONITOR ---
+    // We do NOT manually drive anymore. We only watch.
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
     float moveDy = currentPos.getY() - lastWatchdogPos.getY();
     float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
 
+    // If we haven't moved 0.05m in 1 second, we assume the AI engine went to sleep.
+    // This is the ONLY time we manually poke it.
     if (movedDistSq < 0.05f) {
         stuckWatchdogCount++;
-        if (stuckWatchdogCount > 10) { 
-             if (agent->getPatrolPointSize() > 0) {
-                 PatrolPoint next = agent->getNextPosition();
-                 agent->setNextStepPosition(next.getPositionX(), next.getPositionZ(), next.getPositionY(), next.getCell());
-             }
+        if (stuckWatchdogCount > 5) { 
+             // Just nudge the internal state, don't force a physics move
              agent->activateAiBehavior(true);
+             // If REALLY stuck (10s), force a tiny step
+             if (stuckWatchdogCount > 10) {
+                 agent->findNextPosition(2.0f, false);
+             }
         }
     } else {
         stuckWatchdogCount = 0; 
@@ -326,7 +337,7 @@ void SimPlayerController::checkArrival() {
     lastWatchdogPos = currentPos;
 
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-    task->schedule(500); // 500ms Tick for responsiveness
+    task->schedule(1000);
 }
 
 bool SimPlayerController::pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out) {
