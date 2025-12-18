@@ -129,8 +129,18 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
 void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (agent == nullptr) { if (path) delete path; return; }
     
+    // --- DEBUG: BLACK BOX RECORDER ---
+    String rawLog = "PATHFINDER RAW: ";
+    if (path != nullptr) {
+        for (int i = 0; i < path->size(); ++i) {
+            rawLog = rawLog + "(" + String::valueOf(i) + ")" + path->get(i).getPoint().toString() + " ";
+        }
+    }
+    Logger::console.info(rawLog, true);
+    // ---------------------------------
+
     if (agent->isInCombat()) {
-        Logger::console.info("SimPlayer: Path found but Agent is in Combat. Holding.", true);
+        Logger::console.info("SimPlayer: Agent in Combat. Discarding path.", true);
         if (path) delete path;
         state = IDLE;
         return;
@@ -138,6 +148,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     if (path == nullptr || path->size() < 2) { 
         if (path) delete path; 
+        Logger::console.info("SimPlayer: Path too short/null.", true);
         onPathFailed(); 
         return; 
     }
@@ -146,32 +157,33 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     simPath.removeAll();
     simPathIndex = 0;
 
-    // --- CRITICAL FIX: PATH SANITIZATION (PREVENTS SPIN LOOP) ---
+    // --- SANITIZATION & LOGGING ---
     Vector3 lastAdded = agent->getWorldPosition();
-    int droppedNodes = 0;
+    String cleanLog = "PATH SANITIZED: ";
 
     for (int i = 0; i < path->size(); ++i) {
         WorldCoordinates wp = path->get(i);
         Vector3 pt = wp.getPoint();
         
-        // If this point is less than 1.5m from the last one, SKIP IT.
-        // This stops the AI from spinning on stacked points.
         if (i < path->size() - 1) {
             float dist = pt.distanceTo(lastAdded);
-            if (dist < 1.5f) { 
-                droppedNodes++;
-                continue; 
+            // DEBUG: Log why we dropped it
+            if (dist < 1.0f) { 
+               // Logger::console.info("SimPlayer: Dropping Node " + String::valueOf(i) + " (Dist " + String::valueOf(dist) + " < 1.0m)", true);
+               continue; 
             }
         }
         
         simPath.add(wp);
         lastAdded = pt;
+        cleanLog = cleanLog + "(" + String::valueOf(simPath.size()-1) + ")" + pt.toString() + " ";
     }
-    // ------------------------------------------------------------
-
-    Logger::console.info("SimPlayer: Path Found. Raw: " + String::valueOf(path->size()) + " Cleaned: " + String::valueOf(simPath.size()) + " nodes.", true);
+    
+    Logger::console.info(cleanLog, true);
+    // ------------------------------
 
     if (simPath.size() == 0) {
+        Logger::console.info("SimPlayer: Sanitization removed all nodes.", true);
         delete path;
         onPathFailed();
         return;
@@ -180,7 +192,6 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     destination = simPath.get(simPath.size() - 1).getPoint();
     
     agent->setHomeLocation(destination.getX(), destination.getZ(), destination.getY(), nullptr);
-
     agent->setFollowObject(nullptr);
     agent->setWatchObject(nullptr);
     agent->setTargetObject(nullptr);
@@ -191,13 +202,15 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
     
-    // Ensure posture is correct immediately
+    // Force Upright
     agent->setPosture(CreaturePosture::UPRIGHT, true);
 
     queueMorePathNodes();
 
+    // KICKSTART
     if (agent->getPatrolPointSize() > 0) {
         PatrolPoint next = agent->getNextPosition();
+        Logger::console.info("SimPlayer: Kickstart -> First Point: " + String::valueOf(next.getPositionX()) + "," + String::valueOf(next.getPositionY()), true);
         agent->setNextStepPosition(next.getPositionX(), next.getPositionZ(), next.getPositionY(), next.getCell());
     }
 
@@ -250,6 +263,16 @@ void SimPlayerController::queueMorePathNodes() {
 
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
+
+    // --- DEBUG: STATE MONITOR ---
+    // Only log if we are suspiciously close or fast to detect spin
+    Vector3 pos = agent->getWorldPosition();
+    float speed = agent->getCurrentSpeed();
+    int queue = agent->getPatrolPointSize();
+    if (state == MOVING) {
+       Logger::console.info("SimPlayer: CheckArrival. Q=" + String::valueOf(queue) + " Spd=" + String::valueOf(speed) + " Pos=" + pos.toString(), true);
+    }
+    // ----------------------------
 
     onTick(); 
 
