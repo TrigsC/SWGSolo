@@ -12,7 +12,8 @@
 #include "server/zone/objects/creature/ai/CreatureTemplate.h" 
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h" 
-#include "templates/params/creature/ObjectFlag.h" 
+#include "templates/params/creature/ObjectFlag.h"
+#include "server/zone/managers/name/NameManager.h"
 
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
@@ -57,8 +58,24 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
 
     AiAgent* agent = creature->asAiAgent();
     if (agent == nullptr) return;
+    
+    // 1. Generate "Real" Name
+    NameManager* nm = zoneServer->getNameManager();
+    if (nm != nullptr) {
+        // Use type 0 (Generic) to ensure we get a First/Last name (e.g. "Gary Retski")
+        // avoiding "TK-421" or droid names.
+        int species = creature->getSpecies();
+        String name = nm->makeCreatureName(0, species); 
+        
+        if (!name.isEmpty()) {
+            // This overrides the default name and removes the (Template Title) suffix
+            agent->setCustomObjectName(name, true);
+        }
+    }
 
-    // Reset default flags to clean slate
+    agent->setFactionRank(0);
+
+    // Reset default flags
     agent->setCreatureBitmask(0); 
     agent->setDespawnOnNoPlayerInRange(false);
 
