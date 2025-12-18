@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * FIXED: Restored Movement + Logging + Sanitization
+ * FIXED: Posture Kickstart (Stall Fix) & Path Sanitization
  */
 
 #include "SimPlayerController.h"
@@ -146,34 +146,34 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     simPath.removeAll();
     simPathIndex = 0;
 
-    // --- FIX: PATH SANITIZATION ---
-    // Remove nodes that are too close to each other (< 1.0m).
-    // This prevents the "0m Distance" spin loop in the logs.
+    // --- FIX: ROBUST PATH SANITIZATION ---
     Vector3 lastAdded = agent->getWorldPosition();
-    
+    int droppedNodes = 0;
+
     for (int i = 0; i < path->size(); ++i) {
         WorldCoordinates wp = path->get(i);
         Vector3 pt = wp.getPoint();
         
-        // Always add the last point (destination), check others
+        // Ensure reasonable distance between steps to prevent spin loops
         if (i < path->size() - 1) {
             float dist = pt.distanceTo(lastAdded);
-            if (dist < 1.0f) continue; // Skip micro-steps
+            if (dist < 1.5f) { // Increased to 1.5m to be safe
+                droppedNodes++;
+                continue; 
+            }
         }
         
         simPath.add(wp);
         lastAdded = pt;
     }
-    // ------------------------------
+    
+    // Logger::console.info("SimPlayer: Path Found. Raw: " + String::valueOf(path->size()) + " Cleaned: " + String::valueOf(simPath.size()) + " (Dropped " + String::valueOf(droppedNodes) + ")", true);
 
     if (simPath.size() == 0) {
         delete path;
         onPathFailed();
         return;
     }
-
-    // UNCOMMENTED LOG: Now you will see "Path Found" again
-    Logger::console.info("SimPlayer: Path Found (" + String::valueOf(simPath.size()) + " nodes). Moving...", true);
 
     destination = simPath.get(simPath.size() - 1).getPoint();
     
@@ -188,6 +188,9 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     agent->stopWaiting();
 
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
+    
+    // Ensure posture is correct immediately
+    agent->setPosture(CreaturePosture::UPRIGHT, true);
 
     queueMorePathNodes();
 
@@ -226,6 +229,7 @@ void SimPlayerController::queueMorePathNodes() {
     while (slots > 0 && simPathIndex < pathSize) {
         Vector3 p = simPath.get(simPathIndex).getPoint();
 
+        // Extra check against current position for the very first node
         if (simPathIndex == 0) {
             Vector3 cur = agent->getWorldPosition();
             if (p.distanceTo(cur) < 1.0f) { 
@@ -268,7 +272,15 @@ void SimPlayerController::checkArrival() {
         return;
     }
 
+    // --- FIX: KICKSTART STALLED AGENTS ---
+    // If the agent thinks it is stuck or speed is 0, force it upright and running.
+    // This fixes the [STALLED] issue where they stay crouched after sampling.
+    if (agent->getPosture() != CreaturePosture::UPRIGHT) {
+        agent->setPosture(CreaturePosture::UPRIGHT, true);
+    }
+    
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
+    
     if (agent->isWaiting()) agent->stopWaiting();
 
     if (agent->getPatrolPointSize() < 5 && simPathIndex < simPath.size()) {
@@ -294,9 +306,7 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
-    // --- FIX: RESTORED MOVEMENT ENGINE ---
-    // We brought this back because removing it caused the bot to stand still.
-    // The "Sanitization" loop in onPathFound protects us from the spin/deadlock.
+    // Drive-by-wire
     agent->findNextPosition(2.0f, false);
     
     // Stuck Check
