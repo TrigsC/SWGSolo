@@ -1,6 +1,6 @@
 /*
  * SimPlayerManager.cpp
- * Phase 1 Fix: Colors (Rank 1) & Flags
+ * Phase 1: Cosmetics (Colors via FactionStatus)
  */
 
 #include "SimPlayerManager.h"
@@ -14,6 +14,7 @@
 #include "server/zone/objects/creature/ai/PatrolPoint.h" 
 #include "templates/params/creature/ObjectFlag.h" 
 #include "server/zone/managers/name/NameManager.h" 
+#include "server/zone/objects/player/FactionStatus.h"
 
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
@@ -26,10 +27,10 @@ void SimPlayerManager::initialize() {
     info("Initializing SimPlayer Manager...", true);
     
     // 1. Miner (Jedi Visual)
-    //spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
+    spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
 
     // 2. Miner (Artisan Visual)
-    //spawnSimPlayer("naboo", 4720.0f, -4945.0f, "artisan");
+    spawnSimPlayer("naboo", 4720.0f, -4945.0f, "artisan");
 
     // 3. PvP Bot (Stormtrooper)
     spawnSimPlayer("naboo", 4963.0f, -4892.0f, "stormtrooper");
@@ -59,30 +60,27 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     AiAgent* agent = creature->asAiAgent();
     if (agent == nullptr) return;
 
-    // --- COSMETIC FIXES ---
-    
-    // 1. Name Generator
+    // --- COSMETICS ---
     NameManager* nm = zoneServer->getNameManager();
     if (nm != nullptr) {
-        // Type 0 = Generic/Human Name (No "TK-421")
         String name = nm->makeCreatureName(0, creature->getSpecies()); 
         if (!name.isEmpty()) {
             agent->setCustomObjectName(name, true);
         }
     }
 
-    // 2. Faction Rank (COLOR FIX)
-    // Rank 0 = Civilian (White/Yellow Name)
-    // Rank 1 = Private (Purple/Red Name depending on observer)
     agent->setFactionRank(1); 
 
-    // 3. Pre-set Flags based on Type (Avoids Color Flicker)
+    // --- FLAGS & COLORS ---
+    // Using setFactionStatus ensures the client receives the correct packet for Name Color
     if (templateName == "stormtrooper" || templateName == "rebel_trooper") {
-        // PvP Bots must be Overt + Attackable
+        // PvP Bot: Red/Purple Name
+        agent->setFactionStatus(FactionStatus::OVERT);
         agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE);
     } else {
-        // Miners are Neutral
-        agent->setPvpStatusBitmask(0);
+        // Miner: Blue Name (Civilian)
+        agent->setFactionStatus(FactionStatus::ONLEAVE);
+        agent->setPvpStatusBitmask(0); // Neutral
     }
 
     agent->setDespawnOnNoPlayerInRange(false);
