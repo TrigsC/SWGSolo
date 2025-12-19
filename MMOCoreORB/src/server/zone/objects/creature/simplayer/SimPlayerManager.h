@@ -1,6 +1,6 @@
 /*
  * SimPlayerManager.h
- * Manager for handling SimPlayer population and lifecycle.
+ * Updated for Lua Configuration Phase 2
  */
 
 #ifndef SIMPLAYERMANAGER_H_
@@ -9,8 +9,8 @@
 #include "engine/util/Singleton.h"
 #include "system/util/SynchronizedVectorMap.h"
 #include "SimPlayerController.h"
+#include "engine/lua/Lua.h" // Added Lua support
 
-// FIX: Forward declare Zone inside its correct namespace to avoid ambiguity
 namespace server {
  namespace zone {
   class Zone;
@@ -20,20 +20,24 @@ namespace server {
 using namespace server::zone;
 
 class SimPlayerManager : public Singleton<SimPlayerManager>, public Object, public Logger {
-    // Map of Creature ObjectID -> Your Custom Controller
+    // Map: ObjectID -> Controller
     SynchronizedVectorMap<uint64, Reference<SimPlayerController*> > controllers;
+    
+    // Lua Helper
+    Lua* lua; 
 
 public:
     SimPlayerManager();
     ~SimPlayerManager();
 
-    // Called by ZoneServer on startup
     void initialize();
 
-    // The main logic to spawn a specific bot
-    void spawnSimPlayer(const String& planet, float x, float z, const String& templateName);
+    // Helper to read Lua config and execute spawns
+    void loadLuaConfig();
 
-    // Toggle logic
+    // Helper to spawn a single bot (Now public so Lua/Methods can call it)
+    void spawnSimPlayer(const String& planet, float x, float y, float z, const String& templateName, int type);
+
     void toggleBot(AiAgent* agent);
 };
 

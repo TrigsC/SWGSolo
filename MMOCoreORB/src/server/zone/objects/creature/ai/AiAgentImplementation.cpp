@@ -3871,7 +3871,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     updateCurrentPosition(&nextStepPosition);
 
     if (isPet()) updatePetSwimmingState();
-    if (isSimPlayer) info("findNextPosition - complete returning true", true);
+    //if (isSimPlayer) info("findNextPosition - complete returning true", true);
 
     return true;
 }
