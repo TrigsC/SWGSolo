@@ -1,7 +1,6 @@
 /*
  * SimPlayerManager.cpp
- * Phase 2: Lua Configuration Reader
- * FIXED: Build Error (Replaced Vector with std::vector)
+ * FIXED: Random Range Logic, Safety Wrappers, and Debug Logging
  */
 
 #include "SimPlayerManager.h"
@@ -16,8 +15,8 @@
 #include "templates/params/creature/ObjectFlag.h" 
 #include "server/zone/managers/name/NameManager.h" 
 #include "server/zone/objects/player/FactionStatus.h" 
-#include "server/zone/managers/director/DirectorManager.h" // For Lua access
-#include <vector> // Standard vector for local lists
+#include "server/zone/managers/director/DirectorManager.h" 
+#include <vector>
 
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
@@ -33,61 +32,50 @@ SimPlayerManager::~SimPlayerManager() {
 }
 
 void SimPlayerManager::initialize() {
-    info("Initializing SimPlayer Manager via Lua...", true);
+    info("Initializing SimPlayer Manager...", true);
     loadLuaConfig();
 }
 
 void SimPlayerManager::loadLuaConfig() {
-    // Run the script
     lua->runFile("scripts/managers/sim_player_manager.lua");
 
-    // Get the main config table
     LuaObject config = lua->getGlobalObject("SimPlayerManagerConfig");
     if (!config.isValidTable()) {
         error("Failed to load SimPlayerManagerConfig from lua!");
         return;
     }
 
-    // Check enabled
     bool enabled = config.getBooleanField("enabled");
     if (!enabled) {
         info("SimPlayer system disabled in Lua.", true);
         return;
     }
 
-    // 1. Load Shuttleports into a flattened list for random picking
     struct LocationEntry {
         String planet;
-        float x, y, z; // Y is North in our Lua, Z is Height
-        float hangX, hangY, hangZ;
+        float x, y, z; 
     };
     
-    // FIX: Use std::vector to avoid Core3 serialization requirements for local structs
     std::vector<LocationEntry> locationList;
 
     LuaObject shuttles = config.getObjectField("shuttleports");
     if (shuttles.isValidTable()) {
-        // Iterate known planets
         const char* planets[] = {"naboo", "tatooine", "corellia", "dantooine", "talus", "rori", "lok", "yavin4", "endor", "dathomir"};
         
         for (const char* pName : planets) {
             LuaObject planetTable = shuttles.getObjectField(pName);
             if (planetTable.isValidTable()) {
-                // Iterate cities in planet
                 for (int j = 1; j <= planetTable.getTableSize(); ++j) {
                     LuaObject city = planetTable.getObjectAt(j);
                     if (city.isValidTable()) {
                         LuaObject spawn = city.getObjectField("spawn");
-                        LuaObject hangout = city.getObjectField("hangout");
                         
                         LocationEntry entry;
                         entry.planet = pName;
-                        // Lua Index 1-based. X, Y(North), Z(Height)
                         entry.x = spawn.getFloatAt(1);
-                        entry.y = spawn.getFloatAt(2); 
-                        entry.z = spawn.getFloatAt(3); 
+                        entry.y = spawn.getFloatAt(2); // North
+                        entry.z = spawn.getFloatAt(3); // Height
                         
-                        // FIX: Use push_back for std::vector
                         locationList.push_back(entry);
                     }
                     city.pop();
@@ -103,7 +91,6 @@ void SimPlayerManager::loadLuaConfig() {
         return;
     }
 
-    // 2. Process Spawn Groups
     LuaObject groups = config.getObjectField("spawnGroups");
     if (groups.isValidTable()) {
         for (int i = 1; i <= groups.getTableSize(); ++i) {
@@ -113,32 +100,29 @@ void SimPlayerManager::loadLuaConfig() {
             int count = group.getIntField("totalCount");
             LuaObject templates = group.getObjectField("templates");
             
-            // Generate the requested number of bots
+            info("Spawning Group: " + type + " Count: " + String::valueOf(count), true);
+
             for (int k = 0; k < count; ++k) {
-                // Pick Random Location
-                int locIndex = System::random(locationList.size() - 1);
-                
-                // FIX: Use .at() for std::vector access
+                // FIX: Use size(), not size()-1. Random(N) returns 0..N-1
+                int locIndex = System::random(locationList.size());
                 LocationEntry loc = locationList.at(locIndex);
 
-                // Pick Random Template
                 String tmpl = "";
                 if (templates.isValidTable() && templates.getTableSize() > 0) {
-                    int tIdx = 1 + System::random(templates.getTableSize() - 1);
+                    // Lua is 1-based. Random(N) -> 0..N-1. Add 1 -> 1..N
+                    int tIdx = 1 + System::random(templates.getTableSize());
                     tmpl = templates.getStringAt(tIdx);
                 }
 
                 if (type == "miner") {
-                    spawnSimPlayer(loc.planet, loc.x, loc.y, loc.z, tmpl, 0); // 0 = Miner
+                    spawnSimPlayer(loc.planet, loc.x, loc.y, loc.z, tmpl, 0); 
                 } 
                 else if (type == "pvp_solo") {
-                    spawnSimPlayer(loc.planet, loc.x, loc.y, loc.z, tmpl, 1); // 1 = PvP Solo
+                    spawnSimPlayer(loc.planet, loc.x, loc.y, loc.z, tmpl, 1); 
                 }
                 else if (type == "pvp_squad") {
-                    // Phase 2.5: For now just spawn them individually at same spot
                     int squadSize = group.getIntField("squadSize");
                     for (int s = 0; s < squadSize; ++s) {
-                        // Offset slightly so they don't stack
                         float offX = loc.x + (s * 1.5f);
                         spawnSimPlayer(loc.planet, offX, loc.y, loc.z, tmpl, 1);
                     }
@@ -154,67 +138,78 @@ void SimPlayerManager::loadLuaConfig() {
 }
 
 void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, float z, const String& templateName, int type) {
-    ZoneServer* zoneServer = ServerCore::getZoneServer();
-    if (zoneServer == nullptr) return;
+    try {
+        ZoneServer* zoneServer = ServerCore::getZoneServer();
+        if (zoneServer == nullptr) return;
 
-    Zone* zone = zoneServer->getZone(planet);
-    if (zone == nullptr) {
-        error("Could not find zone: " + planet);
-        return;
+        Zone* zone = zoneServer->getZone(planet);
+        if (zone == nullptr) {
+            error("Could not find zone: " + planet);
+            return;
+        }
+
+        CreatureManager* creatureManager = zone->getCreatureManager();
+        if (creatureManager == nullptr) return;
+
+        // Safety Height
+        if (z == 0) z = zone->getHeight(x, y); 
+
+        // SPAWN: X, Z (North), Y (Height)
+        CreatureObject* creature = creatureManager->spawnCreature(templateName.hashCode(), 0, x, y, z, 0);
+        
+        if (creature == nullptr) {
+            error("Failed to spawn SimPlayer template: " + templateName);
+            return;
+        }
+
+        AiAgent* agent = creature->asAiAgent();
+        if (agent == nullptr) return;
+
+        // --- NAME GENERATION SAFETY ---
+        try {
+            NameManager* nm = zoneServer->getNameManager();
+            if (nm != nullptr) {
+                // 0 = Generic/Human. 
+                String name = nm->makeCreatureName(0, creature->getSpecies()); 
+                if (!name.isEmpty()) agent->setCustomObjectName(name, true);
+            }
+        } catch (...) {
+            error("SimPlayerManager: Name generation failed for " + templateName);
+            agent->setCustomObjectName("Sim Player", true);
+        }
+
+        agent->setFactionRank(1); 
+        agent->setDespawnOnNoPlayerInRange(false);
+
+        Reference<SimPlayerController*> ctrl = nullptr;
+
+        if (type == 1) { // PvP
+            bool isImp = (templateName.contains("stormtrooper"));
+            agent->setFactionStatus(FactionStatus::OVERT);
+            agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE);
+            ctrl = new SimPvPController(agent, isImp); 
+        } else { // Miner
+            agent->setFactionStatus(FactionStatus::ONLEAVE);
+            agent->setPvpStatusBitmask(0); 
+            ctrl = new SimMinerController(agent);
+        }
+
+        if (controllers.contains(agent->getObjectID())) {
+            controllers.drop(agent->getObjectID());
+        }
+        controllers.put(agent->getObjectID(), ctrl);
+        
+        agent->activateAiBehavior(true);
+        
+        Core::getTaskManager()->scheduleTask([ctrl] () {
+            ctrl->startSimLoop();
+        }, "SimStartLambda", 10000); 
+
+    } catch (Exception& e) {
+        error("SimPlayerManager: Error spawning bot: " + e.getMessage());
+    } catch (...) {
+        error("SimPlayerManager: Unknown error spawning bot.");
     }
-
-    CreatureManager* creatureManager = zone->getCreatureManager();
-    if (creatureManager == nullptr) return;
-
-    // Use provided Z (height) or lookup if 0
-    if (z == 0) z = zone->getHeight(x, y); 
-
-    CreatureObject* creature = creatureManager->spawnCreature(templateName.hashCode(), 0, x, z, y, 0);
-    if (creature == nullptr) {
-        error("Failed to spawn SimPlayer template: " + templateName);
-        return;
-    }
-
-    AiAgent* agent = creature->asAiAgent();
-    if (agent == nullptr) return;
-
-    // --- COSMETICS ---
-    NameManager* nm = zoneServer->getNameManager();
-    if (nm != nullptr) {
-        String name = nm->makeCreatureName(0, creature->getSpecies()); 
-        if (!name.isEmpty()) agent->setCustomObjectName(name, true);
-    }
-    agent->setFactionRank(1); 
-
-    // --- SETUP CONTROLLER ---
-    agent->setDespawnOnNoPlayerInRange(false);
-
-    // Initialize the specific controller based on type INT passed from Lua
-    Reference<SimPlayerController*> ctrl = nullptr;
-
-    if (type == 1) { // PvP
-        bool isImp = (templateName.contains("stormtrooper"));
-        agent->setFactionStatus(FactionStatus::OVERT);
-        agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE);
-        ctrl = new SimPvPController(agent, isImp); 
-    } else { // Miner / Default
-        agent->setFactionStatus(FactionStatus::ONLEAVE);
-        agent->setPvpStatusBitmask(0); 
-        ctrl = new SimMinerController(agent);
-    }
-
-    // Register Controller
-    if (controllers.contains(agent->getObjectID())) {
-        controllers.drop(agent->getObjectID());
-    }
-    controllers.put(agent->getObjectID(), ctrl);
-    
-    agent->activateAiBehavior(true);
-    
-    // Start Loop with delay
-    Core::getTaskManager()->scheduleTask([ctrl] () {
-        ctrl->startSimLoop();
-    }, "SimStartLambda", 10000); 
 }
 
 void SimPlayerManager::toggleBot(AiAgent* agent) {
