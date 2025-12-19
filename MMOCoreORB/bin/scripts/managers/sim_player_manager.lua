@@ -1,6 +1,6 @@
 -- scripts/managers/sim_player_manager.lua
 
-local SimPlayerManagerConfig = {
+SimPlayerManagerConfig = {
     -- MASTER SWITCH
     enabled = true,
 
