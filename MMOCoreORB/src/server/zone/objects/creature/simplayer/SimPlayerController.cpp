@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * FIXED: Lambda Reference Capture (Prevents Heap Corruption/Segfault)
+ * FIXED: Crash Prevention, Math Correction, and Deadlock Removal
  */
 
 #include "SimPlayerController.h"
@@ -34,6 +34,7 @@ void SimPathFindTask::run() {
         path = nullptr;
     }
 
+    // Capture Reference to prevent use-after-free
     Core::getTaskManager()->executeTask([strongCtrl, path] () {
         if (path != nullptr) strongCtrl->onPathFound(path);
         else strongCtrl->onPathFailed();
@@ -50,21 +51,15 @@ void ArrivalCheckTask::run() {
 }
 
 void SimBehaviorTask::run() {
-    // 1. Get Strong Reference
+    // CRITICAL CRASH FIX: Get Strong Reference first
     Reference<SimPlayerController*> baseCtrl = controller.get();
     if (baseCtrl == nullptr) return;
     
-    // 2. Type Check (Safe Dynamic Cast)
-    SimMinerController* minerCheck = dynamic_cast<SimMinerController*>(baseCtrl.get());
-    if (minerCheck == nullptr) return;
-
     int capturedType = type;
 
-    // 3. EXECUTE TASK WITH STRONG REFERENCE CAPTURE
-    // CRITICAL FIX: We capture 'baseCtrl' (Reference), NOT a raw pointer.
-    // This ensures the object cannot be deleted while this lambda is waiting to run.
+    // Capture the REFERENCE (baseCtrl), not the raw pointer
     Core::getTaskManager()->executeTask([baseCtrl, capturedType] () {
-        // Re-cast inside the safe context
+        // Cast safely inside the lambda where we know baseCtrl is alive
         SimMinerController* miner = dynamic_cast<SimMinerController*>(baseCtrl.get());
         if (miner != nullptr) {
             if (capturedType == SimBehaviorTask::FINISH_SURVEY) miner->finishSurvey();
@@ -123,6 +118,7 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
 
     destination = targetPos;
     
+    // Log distance for debug
     float dist = agent->getWorldPosition().distanceTo(targetPos);
     Logger::console.info("SimPlayer: Requesting move to " + targetPos.toString() + " (Dist: " + String::valueOf(dist) + "m)", true);
 
@@ -159,13 +155,15 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         Vector3 pt = wp.getPoint();
         
         if (i < path->size() - 1) {
-            if (pt.distanceTo(lastAdded) < 1.5f) continue; 
+            // Filter nodes that are essentially duplicates to prevent CPU spin
+            if (pt.distanceTo(lastAdded) < 1.0f) continue; 
         }
         
         simPath.add(wp);
         lastAdded = pt;
     }
     
+    // Ensure the final destination is always included
     if (path->size() > 0) {
         WorldCoordinates finalWp = path->get(path->size()-1);
         Vector3 finalPt = finalWp.getPoint();
@@ -253,7 +251,7 @@ void SimPlayerController::queueMorePathNodes() {
 void SimPlayerController::checkArrival() {
     if (agent == nullptr) return; 
     
-    // Survive hibernation
+    // Survival: If zone is hibernating (null), wait patiently.
     if (agent->getZone() == nullptr) {
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(5000);
@@ -286,6 +284,7 @@ void SimPlayerController::checkArrival() {
     }
 
     // --- KICKSTART LOGIC ---
+    // If agent is stopped/crouched but should be moving
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
     }
@@ -315,8 +314,11 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
-    // --- STUCK MONITOR ---
-    // Only nudge internal state, do not double-drive physics
+    // --- DEADLOCK PREVENTION ---
+    // Do NOT call agent->findNextPosition(2.0f, false) here.
+    // The internal AiAgent behavior loop handles movement.
+    
+    // Stuck Monitor: Only nudge if we truly haven't moved.
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
     float moveDy = currentPos.getY() - lastWatchdogPos.getY();
     float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
@@ -325,7 +327,7 @@ void SimPlayerController::checkArrival() {
         stuckWatchdogCount++;
         if (stuckWatchdogCount > 5) { 
              agent->activateAiBehavior(true);
-             // Last resort nudge
+             // Emergency nudge only if stuck for 15s
              if (stuckWatchdogCount > 15) {
                  agent->findNextPosition(2.0f, false);
              }
@@ -412,9 +414,17 @@ void SimMinerController::goToResource(const String& resourceName) {
     if (!pickDestinationInNavMesh(zone, currentPos, targetPos)) {
         float angle = System::random(360) * (M_PI / 180.0f);
         float dist = 100.0f;
-        targetPos.setX(currentPos.getX() + (dist * cos(angle)));
-        targetPos.setY(currentPos.getY() + (dist * sin(angle))); 
-        targetPos.setZ(zone->getHeight(targetPos.getX(), targetPos.getY())); 
+        
+        // --- MATH FIX: Correct Axis for Random Point ---
+        // SWG Vector3: X=East/West, Y=Altitude, Z=North/South
+        float newX = currentPos.getX() + (dist * cos(angle));
+        float newZ = currentPos.getZ() + (dist * sin(angle)); // Use Z for North/South
+        
+        targetPos.setX(newX);
+        targetPos.setZ(newZ); 
+        
+        // Now get height for the correct 2D coords (X, Z)
+        targetPos.setY(zone->getHeight(newX, newZ)); 
     }
 
     moveTo(targetPos);
