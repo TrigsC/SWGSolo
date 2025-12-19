@@ -1,6 +1,7 @@
 /*
  * SimPlayerManager.cpp
  * Phase 2: Lua Configuration Reader
+ * FIXED: Build Error (Replaced Vector with std::vector)
  */
 
 #include "SimPlayerManager.h"
@@ -16,6 +17,7 @@
 #include "server/zone/managers/name/NameManager.h" 
 #include "server/zone/objects/player/FactionStatus.h" 
 #include "server/zone/managers/director/DirectorManager.h" // For Lua access
+#include <vector> // Standard vector for local lists
 
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
@@ -54,54 +56,49 @@ void SimPlayerManager::loadLuaConfig() {
     }
 
     // 1. Load Shuttleports into a flattened list for random picking
-    // We will store them temporarily to pick from
     struct LocationEntry {
         String planet;
         float x, y, z; // Y is North in our Lua, Z is Height
         float hangX, hangY, hangZ;
     };
-    Vector<LocationEntry> locationList;
+    
+    // FIX: Use std::vector to avoid Core3 serialization requirements for local structs
+    std::vector<LocationEntry> locationList;
 
     LuaObject shuttles = config.getObjectField("shuttleports");
     if (shuttles.isValidTable()) {
-        // Iterate Planets (naboo, tatooine...)
-        for (int i = 1; i <= shuttles.getTableSize(); ++i) { // Lua loops usually need care with iterators, strictly speaking LuaObject doesn't iterate keys easily without popping.
-            // Simplified Approach: We assume specific planet keys or we iterate strictly if we write a helper.
-            // For now, let's hardcode the planet lookups to keep C++ simple, or we can use the DirectorManager logic.
-            // Actually, let's just look for known planets to be safe.
-            const char* planets[] = {"naboo", "tatooine", "corellia", "dantooine", "talus", "rori", "lok", "yavin4", "endor", "dathomir"};
-            
-            for (const char* pName : planets) {
-                LuaObject planetTable = shuttles.getObjectField(pName);
-                if (planetTable.isValidTable()) {
-                    // Iterate cities in planet
-                    for (int j = 1; j <= planetTable.getTableSize(); ++j) {
-                        LuaObject city = planetTable.getObjectAt(j);
-                        if (city.isValidTable()) {
-                            LuaObject spawn = city.getObjectField("spawn");
-                            LuaObject hangout = city.getObjectField("hangout");
-                            
-                            LocationEntry entry;
-                            entry.planet = pName;
-                            entry.x = spawn.getFloatAt(1);
-                            entry.y = spawn.getFloatAt(2); // In Lua we put North here
-                            entry.z = spawn.getFloatAt(3); // Height
-                            
-                            // Store hangout if needed for PvP logic later
-                            // ...
-                            
-                            locationList.add(entry);
-                        }
-                        city.pop();
+        // Iterate known planets
+        const char* planets[] = {"naboo", "tatooine", "corellia", "dantooine", "talus", "rori", "lok", "yavin4", "endor", "dathomir"};
+        
+        for (const char* pName : planets) {
+            LuaObject planetTable = shuttles.getObjectField(pName);
+            if (planetTable.isValidTable()) {
+                // Iterate cities in planet
+                for (int j = 1; j <= planetTable.getTableSize(); ++j) {
+                    LuaObject city = planetTable.getObjectAt(j);
+                    if (city.isValidTable()) {
+                        LuaObject spawn = city.getObjectField("spawn");
+                        LuaObject hangout = city.getObjectField("hangout");
+                        
+                        LocationEntry entry;
+                        entry.planet = pName;
+                        // Lua Index 1-based. X, Y(North), Z(Height)
+                        entry.x = spawn.getFloatAt(1);
+                        entry.y = spawn.getFloatAt(2); 
+                        entry.z = spawn.getFloatAt(3); 
+                        
+                        // FIX: Use push_back for std::vector
+                        locationList.push_back(entry);
                     }
+                    city.pop();
                 }
-                planetTable.pop();
             }
+            planetTable.pop();
         }
     }
     shuttles.pop();
 
-    if (locationList.size() == 0) {
+    if (locationList.empty()) {
         error("No shuttleports defined in Lua!");
         return;
     }
@@ -120,7 +117,9 @@ void SimPlayerManager::loadLuaConfig() {
             for (int k = 0; k < count; ++k) {
                 // Pick Random Location
                 int locIndex = System::random(locationList.size() - 1);
-                LocationEntry loc = locationList.get(locIndex);
+                
+                // FIX: Use .at() for std::vector access
+                LocationEntry loc = locationList.at(locIndex);
 
                 // Pick Random Template
                 String tmpl = "";
@@ -137,7 +136,6 @@ void SimPlayerManager::loadLuaConfig() {
                 }
                 else if (type == "pvp_squad") {
                     // Phase 2.5: For now just spawn them individually at same spot
-                    // Later we link them.
                     int squadSize = group.getIntField("squadSize");
                     for (int s = 0; s < squadSize; ++s) {
                         // Offset slightly so they don't stack
@@ -205,13 +203,7 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
         ctrl = new SimMinerController(agent);
     }
 
-    // Lock and Load
-    toggleBot(agent); // This registers existing controllers map
-    
-    // Manually inject the NEW controller if toggleBot didn't (toggleBot usually creates one)
-    // Actually, let's refactor toggleBot or just register here directly.
-    // For Phase 2 cleanliness, we should register here:
-    
+    // Register Controller
     if (controllers.contains(agent->getObjectID())) {
         controllers.drop(agent->getObjectID());
     }
