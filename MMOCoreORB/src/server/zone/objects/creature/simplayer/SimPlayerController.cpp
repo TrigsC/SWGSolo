@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * FIXED: Crash Prevention, Math Correction, and Deadlock Removal
+ * FIXED: Added Thread Locking (Prevents Crashes/Corruption)
  */
 
 #include "SimPlayerController.h"
@@ -15,7 +15,8 @@
 #include "server/zone/ZoneServer.h"
 #include "system/lang/System.h" 
 #include "server/zone/objects/creature/ai/bt/BlackboardData.h"
-#include "templates/params/creature/CreaturePosture.h" 
+#include "templates/params/creature/CreaturePosture.h"
+#include "system/thread/Locker.h" // CRITICAL INCLUDE
 
 using namespace server::zone::objects::creature::ai::bt;
 
@@ -30,11 +31,9 @@ void SimPathFindTask::run() {
     try {
         path = PathFinderManager::instance()->findPath(startCoord, endCoord, zone);
     } catch (...) {
-        Logger::console.info("SimPlayer: [Thread] EXCEPTION in findPath!", true);
         path = nullptr;
     }
 
-    // Capture Reference to prevent use-after-free
     Core::getTaskManager()->executeTask([strongCtrl, path] () {
         if (path != nullptr) strongCtrl->onPathFound(path);
         else strongCtrl->onPathFailed();
@@ -51,15 +50,11 @@ void ArrivalCheckTask::run() {
 }
 
 void SimBehaviorTask::run() {
-    // CRITICAL CRASH FIX: Get Strong Reference first
     Reference<SimPlayerController*> baseCtrl = controller.get();
     if (baseCtrl == nullptr) return;
     
     int capturedType = type;
-
-    // Capture the REFERENCE (baseCtrl), not the raw pointer
     Core::getTaskManager()->executeTask([baseCtrl, capturedType] () {
-        // Cast safely inside the lambda where we know baseCtrl is alive
         SimMinerController* miner = dynamic_cast<SimMinerController*>(baseCtrl.get());
         if (miner != nullptr) {
             if (capturedType == SimBehaviorTask::FINISH_SURVEY) miner->finishSurvey();
@@ -102,10 +97,19 @@ SimPlayerController::~SimPlayerController() {
 
 void SimPlayerController::moveTo(Vector3 targetPos) {
     if (agent == nullptr) return;
+    
+    // LOCKING NOT STRICTLY NEEDED HERE (READ-ONLY) BUT SAFER
+    Locker locker(agent); 
 
     if (agent->isInCombat()) {
         destination = targetPos;
         state = IDLE; 
+        return;
+    }
+    
+    // OPTIMIZATION: Don't pathfind if we are basically there (< 2m)
+    if (agent->getWorldPosition().distanceTo(targetPos) < 2.0f) {
+        onArrived();
         return;
     }
 
@@ -118,9 +122,7 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
 
     destination = targetPos;
     
-    // Log distance for debug
-    float dist = agent->getWorldPosition().distanceTo(targetPos);
-    Logger::console.info("SimPlayer: Requesting move to " + targetPos.toString() + " (Dist: " + String::valueOf(dist) + "m)", true);
+    Logger::console.info("SimPlayer: Requesting move to " + targetPos.toString(), true);
 
     WorldCoordinates startCoord(agent);
     WorldCoordinates endCoord(targetPos, nullptr);
@@ -131,6 +133,9 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
 
 void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (agent == nullptr) { if (path) delete path; return; }
+    
+    // CRITICAL: LOCK THE AGENT BEFORE TOUCHING STATE
+    Locker locker(agent);
     
     if (agent->isInCombat()) {
         if (path) delete path;
@@ -148,26 +153,21 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     simPath.removeAll();
     simPathIndex = 0;
 
-    // --- PATH SANITIZATION ---
+    // --- SANITIZATION ---
     Vector3 lastAdded = agent->getWorldPosition();
     for (int i = 0; i < path->size(); ++i) {
         WorldCoordinates wp = path->get(i);
         Vector3 pt = wp.getPoint();
-        
         if (i < path->size() - 1) {
-            // Filter nodes that are essentially duplicates to prevent CPU spin
             if (pt.distanceTo(lastAdded) < 1.0f) continue; 
         }
-        
         simPath.add(wp);
         lastAdded = pt;
     }
     
-    // Ensure the final destination is always included
     if (path->size() > 0) {
         WorldCoordinates finalWp = path->get(path->size()-1);
-        Vector3 finalPt = finalWp.getPoint();
-        if (simPath.size() == 0 || simPath.get(simPath.size()-1).getPoint().distanceTo(finalPt) > 0.1f) {
+        if (simPath.size() == 0 || simPath.get(simPath.size()-1).getPoint().distanceTo(finalWp.getPoint()) > 0.1f) {
              simPath.add(finalWp);
         }
     }
@@ -178,12 +178,10 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         return;
     }
 
-    Logger::console.info("SimPlayer: Path Found (" + String::valueOf(simPath.size()) + " nodes). Moving...", true);
-
     destination = simPath.get(simPath.size() - 1).getPoint();
     
+    // Setting Home/State requires Lock
     agent->setHomeLocation(destination.getX(), destination.getZ(), destination.getY(), nullptr);
-
     agent->setFollowObject(nullptr);
     agent->setWatchObject(nullptr);
     agent->setTargetObject(nullptr);
@@ -213,13 +211,14 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 }
 
 void SimPlayerController::onPathFailed() {
-    Logger::console.info("SimPlayer: Pathfinding failed/unreachable. Retrying in 5s...", true);
+    Logger::console.info("SimPlayer: Pathfinding failed.", true);
     state = IDLE;
     Reference<SimRetryTask*> task = new SimRetryTask(this);
     task->schedule(5000); 
 }
 
 void SimPlayerController::queueMorePathNodes() {
+    // Helper function called from Locked contexts, no extra lock needed here
     if (agent == nullptr) return;
     if (simPathIndex < 0) simPathIndex = 0;
 
@@ -231,7 +230,6 @@ void SimPlayerController::queueMorePathNodes() {
 
     while (slots > 0 && simPathIndex < pathSize) {
         Vector3 p = simPath.get(simPathIndex).getPoint();
-
         if (simPathIndex == 0) {
             Vector3 cur = agent->getWorldPosition();
             if (p.distanceTo(cur) < 1.0f) { 
@@ -239,26 +237,24 @@ void SimPlayerController::queueMorePathNodes() {
                 continue;
             }
         }
-
         PatrolPoint pp(p.getX(), p.getZ(), p.getY(), nullptr); 
         agent->addPatrolPoint(pp);
-
         simPathIndex++;
         slots--;
     }
 }
 
 void SimPlayerController::checkArrival() {
-    if (agent == nullptr) return; 
+    if (agent == nullptr) return;
     
-    // Survival: If zone is hibernating (null), wait patiently.
-    if (agent->getZone() == nullptr) {
+    // CRITICAL: LOCK BEFORE CHECKING ZONE OR STATE
+    Locker locker(agent); 
+
+    if (agent->getZone() == nullptr || agent->isDead()) {
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(5000);
         return;
     }
-    
-    if (agent->isDead()) return; 
 
     onTick(); 
 
@@ -270,10 +266,7 @@ void SimPlayerController::checkArrival() {
     }
 
     if (state == IDLE && destination.getX() != 0) {
-        Logger::console.info("SimPlayer: Resuming path...", true);
-        moveTo(destination);
-        Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-        task->schedule(1000);
+        moveTo(destination); // Will schedule its own task
         return;
     }
 
@@ -283,15 +276,13 @@ void SimPlayerController::checkArrival() {
         return;
     }
 
-    // --- KICKSTART LOGIC ---
-    // If agent is stopped/crouched but should be moving
+    // Kickstart
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
     }
     if (agent->getCurrentSpeed() < 0.1f) {
         agent->setRunSpeed(runSpeed);
     }
-
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));
     
     if (agent->isWaiting()) agent->stopWaiting();
@@ -306,7 +297,7 @@ void SimPlayerController::checkArrival() {
     float distSq = (dx*dx) + (dy*dy);
 
     if (distSq < 16.0f || (agent->getPatrolPointSize() == 0 && simPathIndex >= simPath.size())) {
-        Logger::console.info("SimPlayer: Arrived at destination.", true);
+        Logger::console.info("SimPlayer: Arrived.", true);
         agent->clearPatrolPoints(); 
         onArrived(); 
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
@@ -314,11 +305,7 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
-    // --- DEADLOCK PREVENTION ---
-    // Do NOT call agent->findNextPosition(2.0f, false) here.
-    // The internal AiAgent behavior loop handles movement.
-    
-    // Stuck Monitor: Only nudge if we truly haven't moved.
+    // Stuck Monitor
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
     float moveDy = currentPos.getY() - lastWatchdogPos.getY();
     float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
@@ -327,7 +314,6 @@ void SimPlayerController::checkArrival() {
         stuckWatchdogCount++;
         if (stuckWatchdogCount > 5) { 
              agent->activateAiBehavior(true);
-             // Emergency nudge only if stuck for 15s
              if (stuckWatchdogCount > 15) {
                  agent->findNextPosition(2.0f, false);
              }
@@ -344,6 +330,7 @@ void SimPlayerController::checkArrival() {
 
 bool SimPlayerController::pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out) {
     if (zone == nullptr || agent == nullptr) return false;
+    // Locker not strictly required here as we just read NavMesh
     if (!agent->isInNavMesh()) return false;
 
     int distance = 100 + System::random(100);
@@ -387,8 +374,11 @@ String SimMinerController::pickRandomResource() {
 
 void SimMinerController::performSurvey() {
     if (agent == nullptr) return;
+    
+    // LOCK AGENT BEFORE ANIMATION
+    Locker locker(agent);
+    
     state = PERFORMING_ACTION;
-
     agent->setMovementState(AiAgent::OBLIVIOUS);
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
@@ -408,25 +398,26 @@ void SimMinerController::goToResource(const String& resourceName) {
     Zone* zone = agent->getZone();
     if (zone == nullptr) return;
 
+    // Lock for reading position
+    Locker locker(agent);
     Vector3 currentPos = agent->getWorldPosition();
+    
     Vector3 targetPos;
 
     if (!pickDestinationInNavMesh(zone, currentPos, targetPos)) {
         float angle = System::random(360) * (M_PI / 180.0f);
         float dist = 100.0f;
         
-        // --- MATH FIX: Correct Axis for Random Point ---
-        // SWG Vector3: X=East/West, Y=Altitude, Z=North/South
+        // Use Z for North/South
         float newX = currentPos.getX() + (dist * cos(angle));
-        float newZ = currentPos.getZ() + (dist * sin(angle)); // Use Z for North/South
+        float newZ = currentPos.getZ() + (dist * sin(angle)); 
         
         targetPos.setX(newX);
         targetPos.setZ(newZ); 
-        
-        // Now get height for the correct 2D coords (X, Z)
         targetPos.setY(zone->getHeight(newX, newZ)); 
     }
 
+    // Unlock logic handled by scope, but moveTo will re-lock safely (recursive locks are allowed)
     moveTo(targetPos);
 }
 
@@ -435,6 +426,9 @@ void SimMinerController::onArrived() {
 }
 
 void SimMinerController::performSample() {
+    // LOCK AGENT
+    Locker locker(agent);
+    
     state = PERFORMING_ACTION;
     Logger::console.info("SimMiner: State -> SAMPLING (15s)", true);
 
@@ -448,6 +442,9 @@ void SimMinerController::performSample() {
 }
 
 void SimMinerController::finishSample() {
+    // LOCK AGENT
+    Locker locker(agent);
+    
     Logger::console.info("SimMiner: Done sampling.", true);
     agent->setPosture(CreaturePosture::UPRIGHT, true);
     agent->doAnimation("stop_sample"); 
