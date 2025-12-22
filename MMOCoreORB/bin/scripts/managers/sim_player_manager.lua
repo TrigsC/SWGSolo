@@ -35,12 +35,12 @@ SimPlayerManagerConfig = {
     spawnGroups = {
         
         -- MINERS: Spread randomly across ALL defined shuttleports
-        {
-            type = "miner",
-            totalCount = 0, 
-            templates = { "light_jedi_sentinel", "artisan", "noble", "architect" }, -- Randomly picks appearance
-            behavior = "gather_resources"
-        },
+        --{
+        --    type = "miner",
+        --    totalCount = 0, 
+        --    templates = { "light_jedi_sentinel", "artisan", "noble", "architect" }, -- Randomly picks appearance
+        --    behavior = "gather_resources"
+        --},
 
         -- SOLO PVP: Single hunters moving between spots
         --{
