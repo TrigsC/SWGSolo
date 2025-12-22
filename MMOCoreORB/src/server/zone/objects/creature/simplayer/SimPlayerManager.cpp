@@ -1,6 +1,6 @@
 /*
  * SimPlayerManager.cpp
- * DEBUG VERSION: Verbose Logging to diagnose startup issues
+ * Cleaned: Duplicate spawn function removed.
  */
 
 #include "SimPlayerManager.h"
@@ -36,13 +36,9 @@ void SimPlayerManager::initialize() {
     loadLuaConfig();
 }
 
-/*
- * PART 1: Update loadLuaConfig to read 'hangout'
- */
 void SimPlayerManager::loadLuaConfig() {
     info("DEBUG: Attempting to run Lua file: scripts/managers/sim_player_manager.lua", true);
     
-    // Updated struct to hold destination
     struct LocationEntry {
         String planet;
         float x, y, z;          // Spawn Loc
@@ -82,18 +78,16 @@ void SimPlayerManager::loadLuaConfig() {
                     LuaObject city = planetTable.getObjectAt(j);
                     if (city.isValidTable()) {
                         LuaObject spawn = city.getObjectField("spawn");
-                        LuaObject hangout = city.getObjectField("hangout"); // READ HANGOUT
+                        LuaObject hangout = city.getObjectField("hangout");
                         
                         if (spawn.isValidTable() && hangout.isValidTable()) {
                             LocationEntry entry;
                             entry.planet = pName;
                             
-                            // Spawn Coords
                             entry.x = spawn.getFloatAt(1);
                             entry.y = spawn.getFloatAt(2); // North
                             entry.z = spawn.getFloatAt(3); // Height
 
-                            // Hangout Coords
                             entry.hx = hangout.getFloatAt(1);
                             entry.hy = hangout.getFloatAt(2); // North
                             entry.hz = hangout.getFloatAt(3); // Height
@@ -140,7 +134,6 @@ void SimPlayerManager::loadLuaConfig() {
 
                 if (tmpl.isEmpty()) continue;
 
-                // PASS HANGOUT COORDS TO SPAWN FUNCTION
                 if (type == "miner") {
                     spawnSimPlayer(loc.planet, loc.x, loc.y, loc.z, loc.hx, loc.hy, loc.hz, tmpl, 0); 
                 } 
@@ -155,9 +148,6 @@ void SimPlayerManager::loadLuaConfig() {
     groups.pop();
 }
 
-/*
- * PART 2: Update spawnSimPlayer to accept hangout coords and write to Blackboard
- */
 void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, float z, float hx, float hy, float hz, const String& templateName, int type) {
     try {
         ZoneServer* zoneServer = ServerCore::getZoneServer();
@@ -183,7 +173,6 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
         float finalZ = z; 
         if (finalZ == 0 || finalZ < -10000 || finalZ > 10000) finalZ = zone->getHeight(x, y); 
 
-        // Spawn
         CreatureObject* creature = creatureManager->spawnCreature(iffCRC, x, finalZ, y, 0);
         if (creature == nullptr) return;
 
@@ -198,12 +187,9 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
         agent->setHomeLocation(x, finalZ, y, nullptr);
         agent->setDespawnOnNoPlayerInRange(false);
 
-        // --- CRITICAL FIX: WRITE DESTINATION TO BLACKBOARD ---
-        // We write the Lua 'hangout' coords to the AI memory so the Controller can find them.
         agent->writeBlackboard("targetX", hx);
         agent->writeBlackboard("targetY", hy); // North
         agent->writeBlackboard("targetZ", hz); // Height
-        // ----------------------------------------------------
 
         Reference<SimPlayerController*> ctrl = nullptr;
 
@@ -229,126 +215,6 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
 
     } catch (Exception& e) {
         error("DEBUG: Exception in spawnSimPlayer: " + e.getMessage());
-    }
-}
-
-void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, float z, const String& templateName, int type) {
-    try {
-        ZoneServer* zoneServer = ServerCore::getZoneServer();
-        if (zoneServer == nullptr) return;
-
-        Zone* zone = zoneServer->getZone(planet);
-        if (zone == nullptr) {
-            error("DEBUG: Could not find zone object for: " + planet);
-            return;
-        }
-
-        CreatureManager* creatureManager = zone->getCreatureManager();
-        if (creatureManager == nullptr) return;
-
-        // ---------------------------------------------------------
-        // 1. TEMPLATE LOOKUP (Logic from your Reference Code)
-        // ---------------------------------------------------------
-        uint32 templateCRC = templateName.hashCode();
-        CreatureTemplate* tmpl = CreatureTemplateManager::instance()->getTemplate(templateCRC);
-
-        if (tmpl == nullptr) {
-            error("DEBUG: Spawn Failed! Template '" + templateName + "' not found in CreatureTemplateManager.");
-            return;
-        }
-
-        if (tmpl->getTemplates().size() == 0) {
-            error("DEBUG: Spawn Failed! Template '" + templateName + "' has no IFF files defined.");
-            return;
-        }
-
-        // Get the actual IFF file path (e.g., object/mobile/shared_rebel_trooper.iff)
-        String iffPath = tmpl->getTemplates().get(0);
-        uint32 iffCRC = iffPath.hashCode();
-
-        // ---------------------------------------------------------
-        // 2. COORDINATE RESOLUTION
-        // ---------------------------------------------------------
-        float finalZ = z; // Height
-        // If Lua didn't provide a valid height, ask the zone
-        if (finalZ == 0 || finalZ < -10000 || finalZ > 10000) {
-            finalZ = zone->getHeight(x, y); 
-        }
-
-        info("DEBUG: Spawning '" + templateName + "' -> IFF: " + iffPath + " @ " + String::valueOf(x) + ", " + String::valueOf(y) + " (H:" + String::valueOf(finalZ) + ")", true);
-
-        // ---------------------------------------------------------
-        // 3. SPAWN (Using IFF CRC)
-        // ---------------------------------------------------------
-        // Core3 standard is (CRC, x, z, y, parent). 
-        // Based on your reference code, 'z' is Height and 'y' is North.
-        CreatureObject* creature = creatureManager->spawnCreature(iffCRC, x, finalZ, y, 0);
-        
-        if (creature == nullptr) {
-            error("DEBUG: Spawn Failed via CreatureManager (Rules mismatch or bad IFF).");
-            return;
-        }
-
-        AiAgent* agent = creature->asAiAgent();
-        if (agent == nullptr) {
-             error("DEBUG: Spawned object is not an AiAgent.");
-             return;
-        }
-
-        // ---------------------------------------------------------
-        // 4. APPLY STATS (Logic from Reference Code)
-        // ---------------------------------------------------------
-        Locker lock(agent);
-
-        // Load the stats (HAM, skills) from the logical template ("rebel_trooper")
-        agent->loadTemplateData(tmpl);
-
-        // Force Speed (Optional, taken from your reference)
-        agent->setRunSpeed(5.0f); 
-        agent->setWalkSpeed(2.0f); // Slightly slower walk than run
-
-        // Heal them up fully
-        for (int i=0; i<9; ++i) {
-            agent->setHAM(i, agent->getMaxHAM(i));
-        }
-        
-        agent->setHomeLocation(x, finalZ, y, nullptr);
-        agent->setDespawnOnNoPlayerInRange(false);
-
-        // ---------------------------------------------------------
-        // 5. ATTACH CONTROLLER
-        // ---------------------------------------------------------
-        Reference<SimPlayerController*> ctrl = nullptr;
-
-        if (type == 1) { // PvP
-            bool isImp = (templateName.contains("stormtrooper") || templateName.contains("imperial"));
-            
-            agent->setFactionStatus(FactionStatus::OVERT);
-            agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE);
-            
-            ctrl = new SimPvPController(agent, isImp); 
-        } else { // Miner
-            agent->setFactionStatus(FactionStatus::ONLEAVE);
-            agent->setPvpStatusBitmask(0); 
-            ctrl = new SimMinerController(agent);
-        }
-
-        if (controllers.contains(agent->getObjectID())) {
-            controllers.drop(agent->getObjectID());
-        }
-        controllers.put(agent->getObjectID(), ctrl);
-        
-        agent->activateAiBehavior(true);
-        
-        // Schedule startup
-        Core::getTaskManager()->scheduleTask([ctrl] () {
-            ctrl->startSimLoop();
-        }, "SimStartLambda", 10000); 
-
-    } catch (Exception& e) {
-        error("DEBUG: Exception in spawnSimPlayer: " + e.getMessage());
-    } catch (...) {
-        error("DEBUG: Unknown Exception in spawnSimPlayer");
     }
 }
 
@@ -397,9 +263,6 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         controllers.put(oid, ctrl);
         agent->activateAiBehavior(true);
 
-        // --- STARTUP FIX: 10 Second Warmup ---
-        // Using scheduleTask (Correct API) instead of executeTask
-        // This prevents the bot from asking for a path before the NavMesh is ready
         Core::getTaskManager()->scheduleTask([ctrl] () {
             ctrl->startSimLoop();
         }, "SimStartLambda", 10000); 
