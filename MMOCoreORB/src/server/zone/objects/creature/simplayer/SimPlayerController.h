@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.h
- * LOGGING BUILD: Added isMiner helper to fix compilation
+ * FIXED: Reordered classes to fix "Incomplete Type" build errors
  */
 
 #ifndef SIMPLAYERCONTROLLER_H_
@@ -15,9 +15,77 @@
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/Zone.h"
 
+// Forward Declarations
 class SimPlayerController;
+class SimPathFindTask;
+class ArrivalCheckTask;
+class SimBehaviorTask;
 
-// Generic Pathfinding Task
+// -------------------------------------------------------
+// BASE CONTROLLER
+// -------------------------------------------------------
+class SimPlayerController : public Reference<SimPlayerController>, public Logger {
+protected:
+    ManagedReference<AiAgent*> agent;
+    
+public:
+    enum SimState {
+        IDLE, DECIDING, SURVEYING, CALCULATING_PATH, PERFORMING_ACTION, MOVING, SAMPLING, WAITING
+    };
+    SimState state;
+
+public:
+    SimPlayerController(AiAgent* aiAgent);
+    virtual ~SimPlayerController();
+
+    virtual void startSimLoop() = 0;
+    virtual void onArrived() = 0;
+    virtual void onTick() {}
+    
+    // Helper to identify type
+    virtual bool isMiner() { return false; }
+
+    void moveTo(Vector3 targetPos);
+    void checkArrival();
+    
+    void onPathFound(Vector<WorldCoordinates>* path);
+    void onPathFailed();
+
+protected:
+    void queueMorePathNodes();
+    bool pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out);
+};
+
+// -------------------------------------------------------
+// MINER CONTROLLER
+// -------------------------------------------------------
+class SimMinerController : public SimPlayerController {
+    String targetResource;
+    int retryCount;
+
+public:
+    SimMinerController(AiAgent* aiAgent);
+    virtual ~SimMinerController();
+
+    // Override
+    bool isMiner() override { return true; }
+
+    void startSimLoop() override;
+    void onArrived() override;
+
+    void performSurvey();
+    void finishSurvey();
+    void goToResource(const String& resourceName);
+    void performSample();
+    void finishSample();
+
+    String pickRandomResource();
+};
+
+// -------------------------------------------------------
+// TASKS (Moved to bottom to fix compilation)
+// -------------------------------------------------------
+
 class SimPathFindTask : public Task {
     WeakReference<SimPlayerController*> controller;
     WorldCoordinates startCoord;
@@ -47,61 +115,6 @@ public:
 
     SimBehaviorTask(SimPlayerController* ctrl, int t) : controller(ctrl), type(t) {}
     void run() override;
-};
-
-class SimPlayerController : public Reference<SimPlayerController>, public Logger {
-protected:
-    ManagedReference<AiAgent*> agent;
-    
-public:
-    enum SimState {
-        IDLE, DECIDING, SURVEYING, CALCULATING_PATH, PERFORMING_ACTION, MOVING, SAMPLING, WAITING
-    };
-    SimState state;
-
-public:
-    SimPlayerController(AiAgent* aiAgent);
-    virtual ~SimPlayerController();
-
-    virtual void startSimLoop() = 0;
-    virtual void onArrived() = 0;
-    virtual void onTick() {}
-    
-    // FIX: Added to resolve "no member named isMiner" error
-    virtual bool isMiner() { return false; }
-
-    void moveTo(Vector3 targetPos);
-    void checkArrival();
-    
-    void onPathFound(Vector<WorldCoordinates>* path);
-    void onPathFailed();
-
-protected:
-    void queueMorePathNodes();
-    bool pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out);
-};
-
-class SimMinerController : public SimPlayerController {
-    String targetResource;
-    int retryCount;
-
-public:
-    SimMinerController(AiAgent* aiAgent);
-    virtual ~SimMinerController();
-
-    // Override
-    bool isMiner() override { return true; }
-
-    void startSimLoop() override;
-    void onArrived() override;
-
-    void performSurvey();
-    void finishSurvey();
-    void goToResource(const String& resourceName);
-    void performSample();
-    void finishSample();
-
-    String pickRandomResource();
 };
 
 #endif
