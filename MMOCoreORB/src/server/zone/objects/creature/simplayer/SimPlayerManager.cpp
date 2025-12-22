@@ -172,45 +172,46 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
         CreatureManager* creatureManager = zone->getCreatureManager();
         if (creatureManager == nullptr) return;
 
-        // 1. Construct Template Path
-        String fullTemplate = templateName;
-        if (!fullTemplate.contains("object/")) {
-            fullTemplate = "object/mobile/" + templateName + ".iff";
-        }
+        // ---------------------------------------------------------
+        // 1. TEMPLATE LOOKUP (Logic from your Reference Code)
+        // ---------------------------------------------------------
+        uint32 templateCRC = templateName.hashCode();
+        CreatureTemplate* tmpl = CreatureTemplateManager::instance()->getTemplate(templateCRC);
 
-        // 2. Calculate CRC (Debug Step)
-        uint32 templateCRC = fullTemplate.hashCode();
-        
-        if (templateCRC == 0) {
-            error("DEBUG: CRITICAL - Hash for string '" + fullTemplate + "' is 0! String might be empty or corrupt.");
+        if (tmpl == nullptr) {
+            error("DEBUG: Spawn Failed! Template '" + templateName + "' not found in CreatureTemplateManager.");
             return;
         }
 
-        // 3. Resolve Height
-        // SWGEmu standard: X (East/West), Z (North/South), Y (Altitude/Height)
-        // Your config: x, y (North), z (Height)
-        // So we pass: x, z (as height), y (as north) ? 
-        // NO: The standard spawnCreature takes (CRC, X, Z, Y, Parent).
-        // Where Z is usually North in 3D, but SWG uses Z as North and Y as Height.
-        // Wait, 'spawnCreature(crc, x, z, y)' -> X, Z(North), Y(Height).
-        
+        if (tmpl->getTemplates().size() == 0) {
+            error("DEBUG: Spawn Failed! Template '" + templateName + "' has no IFF files defined.");
+            return;
+        }
+
+        // Get the actual IFF file path (e.g., object/mobile/shared_rebel_trooper.iff)
+        String iffPath = tmpl->getTemplates().get(0);
+        uint32 iffCRC = iffPath.hashCode();
+
+        // ---------------------------------------------------------
+        // 2. COORDINATE RESOLUTION
+        // ---------------------------------------------------------
         float finalZ = z; // Height
+        // If Lua didn't provide a valid height, ask the zone
         if (finalZ == 0 || finalZ < -10000 || finalZ > 10000) {
             finalZ = zone->getHeight(x, y); 
         }
 
-        info("DEBUG: Spawning " + fullTemplate + " (CRC: " + String::valueOf(templateCRC) + ") @ " 
-             + String::valueOf(x) + ", " + String::valueOf(y) + " (H:" + String::valueOf(finalZ) + ")", true);
+        info("DEBUG: Spawning '" + templateName + "' -> IFF: " + iffPath + " @ " + String::valueOf(x) + ", " + String::valueOf(y) + " (H:" + String::valueOf(finalZ) + ")", true);
 
-        // 4. SPAWN CALL
-        // STANDARD CORE3 SIGNATURE: spawnCreature(uint32 templateCRC, float x, float z, float y, uint64 parentID = 0)
-        // Your previous code had 6 arguments (an extra 0 after hash). I have removed it.
-        // We pass: CRC, x, y (North), finalZ (Height), 0 (Parent)
-        
-        CreatureObject* creature = creatureManager->spawnCreature(templateCRC, x, y, finalZ, 0);
+        // ---------------------------------------------------------
+        // 3. SPAWN (Using IFF CRC)
+        // ---------------------------------------------------------
+        // Core3 standard is (CRC, x, z, y, parent). 
+        // Based on your reference code, 'z' is Height and 'y' is North.
+        CreatureObject* creature = creatureManager->spawnCreature(iffCRC, x, finalZ, y, 0);
         
         if (creature == nullptr) {
-            error("DEBUG: Spawn Failed! Object is null. Template might not exist in .tre files: " + fullTemplate);
+            error("DEBUG: Spawn Failed via CreatureManager (Rules mismatch or bad IFF).");
             return;
         }
 
@@ -220,31 +221,37 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
              return;
         }
 
-        // 5. Setup Name and Controller
-        try {
-            NameManager* nm = zoneServer->getNameManager();
-            if (nm != nullptr) {
-                String name = nm->makeCreatureName(0, creature->getSpecies()); 
-                if (!name.isEmpty()) agent->setCustomObjectName(name, true);
-            }
-        } catch (...) {
-            agent->setCustomObjectName("Sim Player", true);
-        }
+        // ---------------------------------------------------------
+        // 4. APPLY STATS (Logic from Reference Code)
+        // ---------------------------------------------------------
+        Locker lock(agent);
 
-        agent->setFactionRank(1); 
+        // Load the stats (HAM, skills) from the logical template ("rebel_trooper")
+        agent->loadTemplateData(tmpl);
+
+        // Force Speed (Optional, taken from your reference)
+        agent->setRunSpeed(5.0f); 
+        agent->setWalkSpeed(2.0f); // Slightly slower walk than run
+
+        // Heal them up fully
+        for (int i=0; i<9; ++i) {
+            agent->setHAM(i, agent->getMaxHAM(i));
+        }
+        
+        agent->setHomeLocation(x, finalZ, y, nullptr);
         agent->setDespawnOnNoPlayerInRange(false);
 
+        // ---------------------------------------------------------
+        // 5. ATTACH CONTROLLER
+        // ---------------------------------------------------------
         Reference<SimPlayerController*> ctrl = nullptr;
 
         if (type == 1) { // PvP
-            // Check for stormtrooper specifically, else rebel
-            bool isImp = (fullTemplate.contains("stormtrooper"));
+            bool isImp = (templateName.contains("stormtrooper") || templateName.contains("imperial"));
             
-            // Set Faction Status
             agent->setFactionStatus(FactionStatus::OVERT);
             agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE);
             
-            // Create Controller
             ctrl = new SimPvPController(agent, isImp); 
         } else { // Miner
             agent->setFactionStatus(FactionStatus::ONLEAVE);
