@@ -1,6 +1,6 @@
 /*
  * SimPvPController.cpp
- * FIXED: Build Errors (isMoving -> PatrolPoints check, getDistanceTo -> Vector3 math)
+ * FIXED: Build Error (getPatrolPointSize) + Combat Recovery Logic
  */
 
 #include "SimPvPController.h"
@@ -114,18 +114,21 @@ void SimPvPController::onTick() {
     if (agent->isInCombat()) return; 
 
     // 2. STUCK / COMBAT RECOVERY CHECK
+    // If state is MOVING but patrol queue is empty, combat likely wiped our path.
     if (state == SimPlayerController::MOVING) {
-        // If state is MOVING but patrol queue is empty, combat likely wiped our path.
-        if (agent->getPatrolPoints().size() == 0) {
+        
+        // FIXED: Use getPatrolPointSize() instead of .size()
+        if (agent->getPatrolPointSize() == 0) {
              Vector3 dest = returningToShuttle ? spawnLocation : hangoutLocation;
              
-             // FIXED: Use Vector3 math instead of SceneObject::getDistanceTo
+             // Use Vector3 math to check distance
              float dist = agent->getWorldPosition().distanceTo(dest);
              
              if (dist > 5.0f) {
                  Logger::console.info("SimPvP: Movement stopped (Queue Empty). Re-issuing move to destination.", true);
                  moveTo(dest);
              } else {
+                 // Close enough, trigger arrival
                  onArrived();
              }
         }
