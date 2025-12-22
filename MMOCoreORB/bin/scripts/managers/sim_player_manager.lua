@@ -1,5 +1,6 @@
 -- scripts/managers/sim_player_manager.lua
 
+print("LUA DEBUG: SimPlayerManagerConfig Loaded")
 SimPlayerManagerConfig = {
     -- MASTER SWITCH
     enabled = true,
