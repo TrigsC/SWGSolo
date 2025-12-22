@@ -1,6 +1,6 @@
 /*
  * SimPvPController.cpp
- * FIXED: Blackboard String Parsing
+ * FIXED: Replaced non-existent .toFloat() with Float::valueOf()
  */
 
 #include "SimPvPController.h"
@@ -13,6 +13,8 @@
 #include "server/zone/TreeEntry.h" 
 #include "templates/params/creature/ObjectFlag.h"
 #include "server/zone/objects/creature/ai/bt/BlackboardData.h"
+// CRITICAL: Required for Float::valueOf()
+#include "system/lang/Float.h" 
 
 SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerController(aiAgent) {
     isImperial = imperial;
@@ -27,20 +29,24 @@ SimPvPController::~SimPvPController() {
 void SimPvPController::startSimLoop() {
     if (agent == nullptr) return;
 
+    // 1. Faction Setup
     agent->setFaction(isImperial ? String("imperial").hashCode() : String("rebel").hashCode());
     agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE); 
     
+    // 2. DYNAMIC LOCATIONS
     spawnLocation = agent->getWorldPosition();
 
-    // FIXED: Read as String, then parse to Float
+    // 3. READ HANGOUT FROM BLACKBOARD
     try {
+        // Read as String first
         String sX = agent->readBlackboard("targetX").get<String>();
         String sY = agent->readBlackboard("targetY").get<String>();
         String sZ = agent->readBlackboard("targetZ").get<String>();
 
-        float hx = sX.toFloat();
-        float hy = sY.toFloat(); 
-        float hz = sZ.toFloat();
+        // Convert String to Float using static helper
+        float hx = Float::valueOf(sX);
+        float hy = Float::valueOf(sY); 
+        float hz = Float::valueOf(sZ);
 
         if (hx == 0 && hy == 0) {
             Logger::console.info("SimPvP: WARNING - Zero/Null Blackboard Coords. Fallback to spawn.", true);
@@ -89,12 +95,14 @@ void SimPvPController::startLoitering() {
 }
 
 void SimPvPController::finishLoitering() {
+    // Do not leave if in combat. Delay 5s.
     if (agent != nullptr && agent->isInCombat()) {
         Logger::console.info("SimPvP: Combat in progress. Extending loiter...", true);
         Reference<SimPvPBehaviorTask*> task = new SimPvPBehaviorTask(this);
         task->schedule(5000);
         return;
     }
+
     returnToShuttle();
 }
 
@@ -108,6 +116,7 @@ void SimPvPController::despawn() {
 void SimPvPController::onTick() {
     if (agent == nullptr || agent->isDead()) return;
     if (agent->isInCombat()) return; 
+
     scanForTargets();
 }
 
@@ -138,6 +147,7 @@ void SimPvPController::scanForTargets() {
         if (!isImperial && playerImp) isEnemy = true;
 
         if (isEnemy && player->isAttackableBy(agent)) {
+            
             float dist = agent->getDistanceTo(player);
             if (dist < 40.0f) { 
                 Logger::console.info("SimPvP: ENGAGING TARGET: " + player->getFirstName(), true);
@@ -148,6 +158,7 @@ void SimPvPController::scanForTargets() {
                 agent->setTargetObject(player);
                 agent->addDefender(player);
                 agent->setCombatState();
+                
                 state = SimPlayerController::IDLE; 
                 return; 
             }
