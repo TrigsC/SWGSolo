@@ -14,6 +14,7 @@ class SimPvPController : public SimPlayerController {
     Vector3 hangoutLocation;
     bool returningToShuttle;
     bool isImperial;
+    bool initialized;
     
     // TIMERS
     Time spawnTime;       // Total life duration
