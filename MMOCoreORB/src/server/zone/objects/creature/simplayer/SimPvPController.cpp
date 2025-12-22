@@ -1,6 +1,8 @@
 /*
  * SimPvPController.cpp
- * FIXED: Increased Despawn Timeout (45s -> 300s) & Added Posture Reset
+ * FIXED: 
+ * 1. Added Random Offsets to destinations (Prevents collision stacking)
+ * 2. Loosened "Stuck" tolerance (If stopped within 15m, force Arrival)
  */
 
 #include "SimPvPController.h"
@@ -14,7 +16,7 @@
 #include "templates/params/creature/ObjectFlag.h"
 #include "server/zone/objects/creature/ai/bt/BlackboardData.h"
 #include "system/lang/Float.h" 
-// NEW: Needed to force them to stand up
+#include "system/lang/System.h" // Needed for random
 #include "templates/params/creature/CreaturePosture.h"
 
 SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerController(aiAgent) {
@@ -25,6 +27,18 @@ SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerC
 }
 
 SimPvPController::~SimPvPController() {
+}
+
+// Helper to add random jitter to coordinates so bots don't stack on top of each other
+Vector3 SimPvPController::getJitteredPosition(Vector3 pos) {
+    float offsetX = 5.0f - System::random(10); // +/- 5m
+    float offsetY = 5.0f - System::random(10); // +/- 5m
+    
+    Vector3 newPos = pos;
+    newPos.setX(pos.getX() + offsetX);
+    newPos.setY(pos.getY() + offsetY); // Y is North in SWG 3D Vectors
+    
+    return newPos;
 }
 
 void SimPvPController::startSimLoop() {
@@ -61,7 +75,8 @@ void SimPvPController::startSimLoop() {
 void SimPvPController::startPatrol() {
     state = SimPlayerController::MOVING;
     returningToShuttle = false;
-    moveTo(hangoutLocation);
+    // Move to Hangout with Offset
+    moveTo(getJitteredPosition(hangoutLocation));
 }
 
 void SimPvPController::returnToShuttle() {
@@ -69,16 +84,15 @@ void SimPvPController::returnToShuttle() {
     returningToShuttle = true;
     Logger::console.info("SimPvP: Patrol done. Returning to Shuttle.", true);
     
-    // FIX 1: Force Posture Upright & Speed (In case they were stuck crouching from combat)
     if (agent != nullptr) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
         agent->setRunSpeed(runSpeed);
     }
 
-    moveTo(spawnLocation);
+    // Move to Spawn with Offset
+    moveTo(getJitteredPosition(spawnLocation));
 
-    // FIX 2: Increased timeout from 45s -> 300s (5 minutes)
-    // 45s was too short if they decided to walk after combat.
+    // Safety Timeout (5 Minutes)
     Reference<SimPvPDespawnTask*> task = new SimPvPDespawnTask(this);
     task->schedule(300000); 
 }
@@ -125,17 +139,27 @@ void SimPvPController::onTick() {
 
     // 2. STUCK / COMBAT RECOVERY CHECK
     if (state == SimPlayerController::MOVING) {
+        // If the engine has cleared our movement queue (PatrolPointSize == 0)
+        // But we are still in state MOVING...
         if (agent->getPatrolPointSize() == 0) {
              Vector3 dest = returningToShuttle ? spawnLocation : hangoutLocation;
              
+             // Check how far we are from the destination
              float dist = agent->getWorldPosition().distanceTo(dest);
              
-             if (dist > 5.0f) {
-                 Logger::console.info("SimPvP: Movement stopped (Queue Empty). Re-issuing move to destination.", true);
-                 // Force posture again if we have to re-issue
+             // FIXED LOGIC:
+             // If we are VERY far (> 15m), we probably got interrupted by combat halfway. Re-issue move.
+             // If we are CLOSE (< 15m) but stopped, we are likely stuck on a rock or another bot. 
+             // Just accept it as "Arrived" to break the loop.
+             
+             if (dist > 15.0f) {
+                 Logger::console.info("SimPvP: Stopped far from target (" + String::valueOf(dist) + "m). Re-issuing move.", true);
                  agent->setPosture(CreaturePosture::UPRIGHT, true);
-                 moveTo(dest);
+                 
+                 // Re-issue with jitter to try and unstick
+                 moveTo(getJitteredPosition(dest));
              } else {
+                 Logger::console.info("SimPvP: Stopped near target (" + String::valueOf(dist) + "m). Forcing Arrival.", true);
                  onArrived();
              }
         }
