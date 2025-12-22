@@ -1,8 +1,6 @@
 /*
  * SimPvPController.cpp
- * FIXED: 
- * 1. Throttled "Stuck" checks to prevent path thrashing (slow walking)
- * 2. Used CollisionManager to find Building Floors (prevents spawning under shuttle)
+ * FIXED: Added Verbose Logging for Navigation Debugging
  */
 
 #include "SimPvPController.h"
@@ -36,6 +34,10 @@ SimPvPController::~SimPvPController() {
 // HELPERS
 // ---------------------------------------------------------
 Vector3 SimPvPController::getJitteredPosition(Vector3 pos) {
+    // LOGGING START
+    Logger::console.info("SimPvP: getJitteredPosition called. Base Pos: " + pos.toString() + " | ReturningToShuttle: " + String::valueOf(returningToShuttle), true);
+    // LOGGING END
+
     // Increased spread for return trip to avoid shuttle collision
     float range = returningToShuttle ? 8.0f : 5.0f;
     
@@ -49,6 +51,10 @@ Vector3 SimPvPController::getJitteredPosition(Vector3 pos) {
     // Recalculate Z using Physics (Collision) not just Terrain
     newPos.setZ(getWorldZ(newPos.getX(), newPos.getY()));
     
+    // LOGGING START
+    Logger::console.info("SimPvP: Jitter Result -> " + newPos.toString(), true);
+    // LOGGING END
+    
     return newPos;
 }
 
@@ -61,9 +67,17 @@ float SimPvPController::getWorldZ(float x, float y) {
     // We start ray from high up (200m) to find the roof/floor
     // If CollisionManager is missing in your build, revert to zone->getHeight
     try {
-        return CollisionManager::getWorldFloorCollision(x, y, zone, true);
+        float z = CollisionManager::getWorldFloorCollision(x, y, zone, true);
+        // LOGGING START
+        Logger::console.info("SimPvP: getWorldZ(" + String::valueOf(x) + ", " + String::valueOf(y) + ") -> Collision Z: " + String::valueOf(z), true);
+        // LOGGING END
+        return z;
     } catch (...) {
-        return zone->getHeight(x, y);
+        float z = zone->getHeight(x, y);
+        // LOGGING START
+        Logger::console.info("SimPvP: getWorldZ(" + String::valueOf(x) + ", " + String::valueOf(y) + ") -> Terrain Z (Fallback): " + String::valueOf(z), true);
+        // LOGGING END
+        return z;
     }
 }
 
@@ -81,6 +95,7 @@ void SimPvPController::startSimLoop() {
     agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE); 
     
     spawnLocation = agent->getWorldPosition();
+    Logger::console.info("SimPvP: Saved Spawn Location: " + spawnLocation.toString(), true); // LOGGING ADDED
 
     try {
         String sX = agent->readBlackboard("targetX").get<String>();
@@ -93,10 +108,12 @@ void SimPvPController::startSimLoop() {
 
         if (hx == 0 && hy == 0) {
             hangoutLocation = spawnLocation;
+            Logger::console.info("SimPvP: No Blackboard Targets. Hangout = Spawn.", true); // LOGGING ADDED
         } else {
             // Recalculate Z to ensure we are on the floor
             float correctZ = getWorldZ(hx, hy);
             hangoutLocation = Vector3(hx, hy, correctZ);
+            Logger::console.info("SimPvP: Calculated Hangout Location: " + hangoutLocation.toString(), true); // LOGGING ADDED
         }
     } catch (...) {
         Logger::console.error("SimPvP: Blackboard read failed. Defaulting to spawn.");
@@ -110,15 +127,19 @@ void SimPvPController::startSimLoop() {
 void SimPvPController::startPatrol() {
     state = SimPlayerController::MOVING;
     returningToShuttle = false;
+    Logger::console.info("SimPvP: Starting Patrol. Moving to Hangout.", true); // LOGGING ADDED
     moveTo(getJitteredPosition(hangoutLocation));
 }
 
 void SimPvPController::returnToShuttle() {
-    if (returningToShuttle) return; 
+    if (returningToShuttle) {
+        Logger::console.info("SimPvP: returnToShuttle ignored (Already returning).", true); // LOGGING ADDED
+        return; 
+    }
 
     state = SimPlayerController::MOVING;
     returningToShuttle = true;
-    Logger::console.info("SimPvP: Patrol done. Returning to Shuttle.", true);
+    Logger::console.info("SimPvP: Patrol done. Returning to Shuttle at " + spawnLocation.toString(), true);
     
     if (agent != nullptr) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
@@ -127,13 +148,16 @@ void SimPvPController::returnToShuttle() {
         agent->setCreatureBitmask(0); 
     }
 
-    moveTo(getJitteredPosition(spawnLocation));
+    Vector3 dest = getJitteredPosition(spawnLocation); // LOGGING ADDED (Split for logging)
+    Logger::console.info("SimPvP: Requesting Move to Return Destination: " + dest.toString(), true); // LOGGING ADDED
+    moveTo(dest);
 
     Reference<SimPvPDespawnTask*> task = new SimPvPDespawnTask(this);
     task->schedule(300000); 
 }
 
 void SimPvPController::onArrived() {
+    Logger::console.info("SimPvP: onArrived Triggered. ReturningToShuttle: " + String::valueOf(returningToShuttle), true); // LOGGING ADDED
     if (returningToShuttle) {
         despawn();
     } else {
@@ -158,6 +182,7 @@ void SimPvPController::finishLoitering() {
         task->schedule(5000);
         return;
     }
+    Logger::console.info("SimPvP: Loitering finished. Calling returnToShuttle().", true); // LOGGING ADDED
     returnToShuttle();
 }
 
@@ -200,6 +225,12 @@ void SimPvPController::onTick() {
                  float dy = agent->getWorldPosition().getY() - dest.getY(); 
                  float dist2d = sqrt((dx * dx) + (dy * dy));
                  
+                 // LOGGING START
+                 if (returningToShuttle) {
+                     Logger::console.info("SimPvP: Returning Tick. Current Pos: " + agent->getWorldPosition().toString() + " | Dest: " + dest.toString() + " | Dist: " + String::valueOf(dist2d), true);
+                 }
+                 // LOGGING END
+
                  if (dist2d > 15.0f) {
                      // Still far away. Re-issue move.
                      Logger::console.info("SimPvP: Stuck " + String::valueOf(dist2d) + "m from target. Re-issuing.", true);
@@ -251,6 +282,8 @@ void SimPvPController::scanForTargets() {
             if (dist < 40.0f) { 
                 Locker locker(agent);
                 Locker crossLocker(player, agent);
+
+                Logger::console.info("SimPvP: Enemy Detected (" + String::valueOf(player->getObjectID()) + "). Engaging.", true); // LOGGING ADDED
 
                 agent->setTargetObject(player);
                 agent->addDefender(player);
