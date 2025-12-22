@@ -1,6 +1,6 @@
 /*
  * SimPvPController.h
- * PvP Patrol Logic
+ * Updated: Added ForceDespawnTask
  */
 
 #ifndef SIMPVPCONTROLLER_H_
@@ -43,6 +43,21 @@ public:
             Core::getTaskManager()->executeTask([strongRef]() {
                 strongRef->finishLoitering();
             }, "SimPvPLoiterLambda");
+        }
+    }
+};
+
+// NEW: Safety Net Task
+class SimPvPDespawnTask : public Task {
+    WeakReference<SimPvPController*> controller;
+public:
+    SimPvPDespawnTask(SimPvPController* ctrl) : controller(ctrl) {}
+    void run() override {
+        Reference<SimPvPController*> strongRef = controller.get();
+        if (strongRef != nullptr) {
+            Core::getTaskManager()->executeTask([strongRef]() {
+                strongRef->despawn();
+            }, "SimPvPForceDespawn");
         }
     }
 };
