@@ -1,6 +1,6 @@
 /*
  * SimPvPController.h
- * Updated: Added ForceDespawnTask
+ * FIXED: Added declaration for getJitteredPosition
  */
 
 #ifndef SIMPVPCONTROLLER_H_
@@ -13,6 +13,9 @@ class SimPvPController : public SimPlayerController {
     Vector3 hangoutLocation;
     bool returningToShuttle;
     bool isImperial;
+
+    // NEW: Helper for random offsets (Prevents build error)
+    Vector3 getJitteredPosition(Vector3 pos);
 
 public:
     SimPvPController(AiAgent* aiAgent, bool imperial);
@@ -47,7 +50,7 @@ public:
     }
 };
 
-// NEW: Safety Net Task
+// Safety Net Task
 class SimPvPDespawnTask : public Task {
     WeakReference<SimPvPController*> controller;
 public:
