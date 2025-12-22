@@ -1,6 +1,6 @@
 /*
  * SimPlayerManager.cpp
- * FIXED: Config Loader with Deep Debugging & Robust Checks
+ * FIXED: Removed invalid isNil() call that caused build error.
  */
 
 #include "SimPlayerManager.h"
@@ -79,7 +79,6 @@ void SimPlayerManager::loadLuaConfig() {
                     LuaObject city = planetTable.getObjectAt(j);
                     
                     if (city.isValidTable()) {
-                        // DEBUG PROBE: Check if we are looking at the right object
                         String cityName = city.getStringField("name");
                         if (cityName.isEmpty()) cityName = "Unknown/Unnamed";
                         
@@ -89,15 +88,10 @@ void SimPlayerManager::loadLuaConfig() {
                             LocationEntry entry;
                             entry.planet = pName;
                             
-                            // Load Spawn: Lua array {x, z, y} -> C++ {x, z, y} (We map to North/Height later)
-                            // Lua: spawn = {-328.0, -4600.0, 28.0} 
-                            // Index 1 = X, 2 = Z(North), 3 = Y(Height)
+                            // Load Spawn: Lua array {x, z, y} -> C++ {x, z, y}
                             entry.x = spawn.getFloatAt(1);
                             entry.y = spawn.getFloatAt(2); 
                             entry.z = spawn.getFloatAt(3); 
-
-                            // DEBUG: Verify Coords
-                            // info("DEBUG: Loaded " + cityName + " Spawn: " + String::valueOf(entry.x) + ", " + String::valueOf(entry.y), true);
 
                             // Load Hangout (Optional)
                             LuaObject hangout = city.getObjectField("hangout");
@@ -115,10 +109,8 @@ void SimPlayerManager::loadLuaConfig() {
 
                             locationList.push_back(entry);
                         } else {
-                            // Detailed Error Logging
-                            error("DEBUG: Entry #" + String::valueOf(j) + " (" + cityName + ") in " + String(pName) + " is invalid!");
-                            if (spawn.isNil()) error("DEBUG: -> 'spawn' field is NIL.");
-                            else error("DEBUG: -> 'spawn' field exists but is NOT a table.");
+                            // FIXED: Removed isNil() check. Just report invalid.
+                            error("DEBUG: Entry #" + String::valueOf(j) + " (" + cityName + ") in " + String(pName) + " is invalid! Check 'spawn' table.");
                         }
                         spawn.pop();
                     }
@@ -200,7 +192,6 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
         float finalZ = z; 
         if (finalZ == 0 || finalZ < -10000 || finalZ > 10000) finalZ = zone->getHeight(x, y); 
 
-        // Spawn
         CreatureObject* creature = creatureManager->spawnCreature(iffCRC, x, finalZ, y, 0);
         if (creature == nullptr) return;
 
