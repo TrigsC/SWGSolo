@@ -1,6 +1,8 @@
 /*
  * SimPvPController.cpp
- * DEBUG VERSION: Heavy logging for movement diagnosis
+ * FIXED: 
+ * 1. Throttled "Stuck" checks to prevent path thrashing (slow walking)
+ * 2. Used CollisionManager to find Building Floors (prevents spawning under shuttle)
  */
 
 #include "SimPvPController.h"
@@ -17,6 +19,7 @@
 #include "system/lang/System.h" 
 #include "templates/params/creature/CreaturePosture.h"
 #include "server/zone/Zone.h"
+// NEW: For finding floor height inside buildings/platforms
 #include "server/zone/managers/collision/CollisionManager.h" 
 
 SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerController(aiAgent) {
@@ -33,7 +36,9 @@ SimPvPController::~SimPvPController() {
 // HELPERS
 // ---------------------------------------------------------
 Vector3 SimPvPController::getJitteredPosition(Vector3 pos) {
+    // Increased spread for return trip to avoid shuttle collision
     float range = returningToShuttle ? 8.0f : 5.0f;
+    
     float offsetX = range - System::random((int)(range * 2)); 
     float offsetY = range - System::random((int)(range * 2)); 
     
@@ -41,12 +46,8 @@ Vector3 SimPvPController::getJitteredPosition(Vector3 pos) {
     newPos.setX(pos.getX() + offsetX);
     newPos.setY(pos.getY() + offsetY); 
     
-    // Recalculate Z using Physics
-    float z = getWorldZ(newPos.getX(), newPos.getY());
-    newPos.setZ(z);
-    
-    // LOG JITTER
-    Logger::console.info("SimPvP: Jittered Target: " + pos.toString() + " -> " + newPos.toString(), true);
+    // Recalculate Z using Physics (Collision) not just Terrain
+    newPos.setZ(getWorldZ(newPos.getX(), newPos.getY()));
     
     return newPos;
 }
@@ -56,14 +57,14 @@ float SimPvPController::getWorldZ(float x, float y) {
     Zone* zone = agent->getZone();
     if (zone == nullptr) return 0;
     
-    float z = 0;
+    // Attempt to find floor (building/platform)
+    // We start ray from high up (200m) to find the roof/floor
+    // If CollisionManager is missing in your build, revert to zone->getHeight
     try {
-        z = CollisionManager::getWorldFloorCollision(x, y, zone, true);
+        return CollisionManager::getWorldFloorCollision(x, y, zone, true);
     } catch (...) {
-        z = zone->getHeight(x, y);
+        return zone->getHeight(x, y);
     }
-    Logger::console.info("SimPvP: Z-Check @ " + String::valueOf(x) + "," + String::valueOf(y) + " = " + String::valueOf(z), true);
-    return z;
 }
 
 // ---------------------------------------------------------
@@ -74,7 +75,7 @@ void SimPvPController::startSimLoop() {
     if (agent == nullptr) return;
 
     spawnTime.updateToCurrentTime(); 
-    nextMoveCheckTime.updateToCurrentTime(); 
+    nextMoveCheckTime.updateToCurrentTime(); // Init timer
 
     agent->setFaction(isImperial ? String("imperial").hashCode() : String("rebel").hashCode());
     agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE); 
@@ -93,6 +94,7 @@ void SimPvPController::startSimLoop() {
         if (hx == 0 && hy == 0) {
             hangoutLocation = spawnLocation;
         } else {
+            // Recalculate Z to ensure we are on the floor
             float correctZ = getWorldZ(hx, hy);
             hangoutLocation = Vector3(hx, hy, correctZ);
         }
@@ -121,6 +123,7 @@ void SimPvPController::returnToShuttle() {
     if (agent != nullptr) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
         agent->setRunSpeed(runSpeed);
+        // Wipe combat flags to stop them from turning back to fight
         agent->setCreatureBitmask(0); 
     }
 
@@ -167,7 +170,7 @@ void SimPvPController::despawn() {
 void SimPvPController::onTick() {
     if (agent == nullptr || agent->isDead()) return;
     
-    // Life Timer
+    // 1. LIFE TIMER CHECK (10 Min limit)
     if (!returningToShuttle) {
         Time now;
         now.updateToCurrentTime();
@@ -180,34 +183,34 @@ void SimPvPController::onTick() {
 
     if (agent->isInCombat()) return; 
 
-    // STUCK CHECK LOGGING
+    // 2. STUCK / MOVEMENT CHECK (THROTTLED)
     if (state == SimPlayerController::MOVING) {
         
+        // Only check every 3 seconds to prevent "One Step" stuttering
         Time now;
         now.updateToCurrentTime();
         
         if (now.getMiliTime() >= nextMoveCheckTime.getMiliTime()) {
             
-            int queueSize = agent->getPatrolPointSize();
-            
-            if (queueSize == 0) {
+            // Check if queue is empty (Stopped)
+            if (agent->getPatrolPointSize() == 0) {
                  Vector3 dest = returningToShuttle ? spawnLocation : hangoutLocation;
                  
                  float dx = agent->getWorldPosition().getX() - dest.getX();
                  float dy = agent->getWorldPosition().getY() - dest.getY(); 
                  float dist2d = sqrt((dx * dx) + (dy * dy));
                  
-                 Logger::console.info("SimPvP: STUCK CHECK -> Dist: " + String::valueOf(dist2d) + "m | Queue: 0", true);
-
                  if (dist2d > 15.0f) {
-                     Logger::console.info("SimPvP: >>> RE-ISSUING MOVE (Target: " + dest.toString() + ") <<<", true);
+                     // Still far away. Re-issue move.
+                     Logger::console.info("SimPvP: Stuck " + String::valueOf(dist2d) + "m from target. Re-issuing.", true);
                      agent->setPosture(CreaturePosture::UPRIGHT, true);
                      moveTo(getJitteredPosition(dest));
                      
+                     // Set next check to 3 seconds from now
                      nextMoveCheckTime.updateToCurrentTime();
                      nextMoveCheckTime.addMiliTime(3000);
                  } else {
-                     Logger::console.info("SimPvP: Close enough. Forcing Arrival.", true);
+                     Logger::console.info("SimPvP: Within tolerance (" + String::valueOf(dist2d) + "m). Arrived.", true);
                      onArrived();
                  }
             }
