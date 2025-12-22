@@ -1,6 +1,6 @@
 /*
  * SimPvPController.cpp
- * FIXED: Combat Recovery & Safety Despawn Timer
+ * FIXED: Build Errors (isMoving -> PatrolPoints check, getDistanceTo -> Vector3 math)
  */
 
 #include "SimPvPController.h"
@@ -68,8 +68,7 @@ void SimPvPController::returnToShuttle() {
     Logger::console.info("SimPvP: Patrol done. Returning to Shuttle.", true);
     moveTo(spawnLocation);
 
-    // CRITICAL FIX: Schedule a forced despawn in 45 seconds.
-    // If they get stuck on the way back, they vanish anyway.
+    // Safety: Force despawn if stuck for 45s
     Reference<SimPvPDespawnTask*> task = new SimPvPDespawnTask(this);
     task->schedule(45000); 
 }
@@ -103,9 +102,7 @@ void SimPvPController::finishLoitering() {
 }
 
 void SimPvPController::despawn() {
-    // Prevent double despawn calls
     if (agent == nullptr) return;
-    
     Logger::console.info("SimPvP: Despawning Agent: " + String::valueOf(agent->getObjectID()), true);
     agent->destroyObjectFromWorld(true);
 }
@@ -114,28 +111,21 @@ void SimPvPController::onTick() {
     if (agent == nullptr || agent->isDead()) return;
     
     // 1. COMBAT CHECK
-    if (agent->isInCombat()) {
-        // If we are fighting, we aren't "MOVING", we are "FIGHTING"
-        // We leave the state as is, but we return early so we don't spam move commands
-        return; 
-    }
+    if (agent->isInCombat()) return; 
 
     // 2. STUCK / COMBAT RECOVERY CHECK
-    // If we think we are moving, but we aren't moving, re-issue command.
-    // This handles the case where combat ended (clearing the queue) but state is still MOVING
     if (state == SimPlayerController::MOVING) {
-        if (!agent->isMoving()) {
-             // We are supposed to be moving, but we are stopped.
-             // Are we at the destination? 
+        // If state is MOVING but patrol queue is empty, combat likely wiped our path.
+        if (agent->getPatrolPoints().size() == 0) {
              Vector3 dest = returningToShuttle ? spawnLocation : hangoutLocation;
-             float dist = agent->getDistanceTo(dest.getX(), dest.getY(), dest.getZ());
+             
+             // FIXED: Use Vector3 math instead of SceneObject::getDistanceTo
+             float dist = agent->getWorldPosition().distanceTo(dest);
              
              if (dist > 5.0f) {
-                 // We are far away and stopped. Re-issue move.
-                 // Logger::console.info("SimPvP: Bot stopped moving but not at dest. Re-issuing move.", true);
+                 Logger::console.info("SimPvP: Movement stopped (Queue Empty). Re-issuing move to destination.", true);
                  moveTo(dest);
              } else {
-                 // We are close enough (within 5m), trigger arrival manually
                  onArrived();
              }
         }
