@@ -252,56 +252,56 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
     }
 }
 
-//void SimPlayerManager::toggleBot(AiAgent* agent) {
-//    if (agent == nullptr) return;
-//
-//    uint64 oid = agent->getObjectID();
-//
-//    if (controllers.contains(oid)) {
-//        info("Stopping SimPlayer for agent " + String::valueOf(oid), true);
-//        agent->eraseBlackboard("simAlwaysActive");
-//        controllers.drop(oid);
-//        
-//        agent->clearPatrolPoints();
-//        agent->clearSavedPatrolPoints();
-//        agent->setMovementState(AiAgent::OBLIVIOUS);
-//        agent->activateAiBehavior(true);
-//        agent->setSimPlayerBot(false);
-//        return;
-//    } else {
-//        info("Starting SimPlayer for agent " + String::valueOf(oid), true);
-//        
-//        agent->setCustomAiMap(String("patrol").hashCode());
-//        agent->setAITemplate(); 
-//        
-//        agent->writeBlackboard("simAlwaysActive", true);
-//        agent->setSimAlwaysActive(true);
-//        agent->setSimPlayerBot(true); 
-//        agent->setDespawnOnNoPlayerInRange(false);
-//
-//        Reference<SimPlayerController*> ctrl = nullptr;
-//        
-//        const CreatureTemplate* tmpl = agent->getCreatureTemplate();
-//        String tName = (tmpl != nullptr) ? tmpl->getTemplateName() : "";
-//
-//        if (tName == "stormtrooper") {
-//             ctrl = new SimPvPController(agent, true); 
-//        } 
-//        else if (tName == "rebel_trooper") {
-//             ctrl = new SimPvPController(agent, false);
-//        }
-//        else {
-//             ctrl = new SimMinerController(agent);
-//        }
-//
-//        controllers.put(oid, ctrl);
-//        agent->activateAiBehavior(true);
-//
-//        // --- STARTUP FIX: 10 Second Warmup ---
-//        // Using scheduleTask (Correct API) instead of executeTask
-//        // This prevents the bot from asking for a path before the NavMesh is ready
-//        Core::getTaskManager()->scheduleTask([ctrl] () {
-//            ctrl->startSimLoop();
-//        }, "SimStartLambda", 10000); 
-//    }
-//}
+void SimPlayerManager::toggleBot(AiAgent* agent) {
+    if (agent == nullptr) return;
+
+    uint64 oid = agent->getObjectID();
+
+    if (controllers.contains(oid)) {
+        info("Stopping SimPlayer for agent " + String::valueOf(oid), true);
+        agent->eraseBlackboard("simAlwaysActive");
+        controllers.drop(oid);
+        
+        agent->clearPatrolPoints();
+        agent->clearSavedPatrolPoints();
+        agent->setMovementState(AiAgent::OBLIVIOUS);
+        agent->activateAiBehavior(true);
+        agent->setSimPlayerBot(false);
+        return;
+    } else {
+        info("Starting SimPlayer for agent " + String::valueOf(oid), true);
+        
+        agent->setCustomAiMap(String("patrol").hashCode());
+        agent->setAITemplate(); 
+        
+        agent->writeBlackboard("simAlwaysActive", true);
+        agent->setSimAlwaysActive(true);
+        agent->setSimPlayerBot(true); 
+        agent->setDespawnOnNoPlayerInRange(false);
+
+        Reference<SimPlayerController*> ctrl = nullptr;
+        
+        const CreatureTemplate* tmpl = agent->getCreatureTemplate();
+        String tName = (tmpl != nullptr) ? tmpl->getTemplateName() : "";
+
+        if (tName == "stormtrooper") {
+             ctrl = new SimPvPController(agent, true); 
+        } 
+        else if (tName == "rebel_trooper") {
+             ctrl = new SimPvPController(agent, false);
+        }
+        else {
+             ctrl = new SimMinerController(agent);
+        }
+
+        controllers.put(oid, ctrl);
+        agent->activateAiBehavior(true);
+
+        // --- STARTUP FIX: 10 Second Warmup ---
+        // Using scheduleTask (Correct API) instead of executeTask
+        // This prevents the bot from asking for a path before the NavMesh is ready
+        Core::getTaskManager()->scheduleTask([ctrl] () {
+            ctrl->startSimLoop();
+        }, "SimStartLambda", 10000); 
+    }
+}
