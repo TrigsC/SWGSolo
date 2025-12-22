@@ -1,25 +1,28 @@
 /*
  * SimPvPController.h
- * FIXED: Added missing getJitteredPosition declaration and spawnTime
+ * FIXED: Added CollisionManager support and Throttling timers
  */
 
 #ifndef SIMPVPCONTROLLER_H_
 #define SIMPVPCONTROLLER_H_
 
 #include "SimPlayerController.h"
-#include "system/lang/Time.h" // Needed for Time
+#include "system/lang/Time.h" 
 
 class SimPvPController : public SimPlayerController {
     Vector3 spawnLocation;
     Vector3 hangoutLocation;
     bool returningToShuttle;
     bool isImperial;
-    Time spawnTime; // Tracks how long bot has been alive
+    
+    // TIMERS
+    Time spawnTime;       // Total life duration
+    Time nextMoveCheckTime; // Throttle for stuck checks
 
     // Helper to randomize destinations slightly
     Vector3 getJitteredPosition(Vector3 pos);
-    // Helper to get correct ground height
-    float getTerrainHeight(float x, float y);
+    // Helper to get correct floor height (Terrain OR Building)
+    float getWorldZ(float x, float y);
 
 public:
     SimPvPController(AiAgent* aiAgent, bool imperial);
