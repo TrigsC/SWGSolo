@@ -1,6 +1,6 @@
 /*
  * SimPvPController.cpp
- * FIXED: Build Error (getPatrolPointSize) + Combat Recovery Logic
+ * FIXED: Increased Despawn Timeout (45s -> 300s) & Added Posture Reset
  */
 
 #include "SimPvPController.h"
@@ -14,6 +14,8 @@
 #include "templates/params/creature/ObjectFlag.h"
 #include "server/zone/objects/creature/ai/bt/BlackboardData.h"
 #include "system/lang/Float.h" 
+// NEW: Needed to force them to stand up
+#include "templates/params/creature/CreaturePosture.h"
 
 SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerController(aiAgent) {
     isImperial = imperial;
@@ -66,11 +68,19 @@ void SimPvPController::returnToShuttle() {
     state = SimPlayerController::MOVING;
     returningToShuttle = true;
     Logger::console.info("SimPvP: Patrol done. Returning to Shuttle.", true);
+    
+    // FIX 1: Force Posture Upright & Speed (In case they were stuck crouching from combat)
+    if (agent != nullptr) {
+        agent->setPosture(CreaturePosture::UPRIGHT, true);
+        agent->setRunSpeed(runSpeed);
+    }
+
     moveTo(spawnLocation);
 
-    // Safety: Force despawn if stuck for 45s
+    // FIX 2: Increased timeout from 45s -> 300s (5 minutes)
+    // 45s was too short if they decided to walk after combat.
     Reference<SimPvPDespawnTask*> task = new SimPvPDespawnTask(this);
-    task->schedule(45000); 
+    task->schedule(300000); 
 }
 
 void SimPvPController::onArrived() {
@@ -114,21 +124,18 @@ void SimPvPController::onTick() {
     if (agent->isInCombat()) return; 
 
     // 2. STUCK / COMBAT RECOVERY CHECK
-    // If state is MOVING but patrol queue is empty, combat likely wiped our path.
     if (state == SimPlayerController::MOVING) {
-        
-        // FIXED: Use getPatrolPointSize() instead of .size()
         if (agent->getPatrolPointSize() == 0) {
              Vector3 dest = returningToShuttle ? spawnLocation : hangoutLocation;
              
-             // Use Vector3 math to check distance
              float dist = agent->getWorldPosition().distanceTo(dest);
              
              if (dist > 5.0f) {
                  Logger::console.info("SimPvP: Movement stopped (Queue Empty). Re-issuing move to destination.", true);
+                 // Force posture again if we have to re-issue
+                 agent->setPosture(CreaturePosture::UPRIGHT, true);
                  moveTo(dest);
              } else {
-                 // Close enough, trigger arrival
                  onArrived();
              }
         }
