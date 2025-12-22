@@ -1,6 +1,6 @@
 /*
  * SimPvPController.cpp
- * FIXED: BlackboardData type conversion error
+ * FIXED: Replaced .getFloat() with .get<float>() for compatibility
  */
 
 #include "SimPvPController.h"
@@ -32,26 +32,25 @@ void SimPvPController::startSimLoop() {
     agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE); 
     
     // 2. DYNAMIC LOCATIONS
-    // Spawn Location: Wherever we are right now (set by SimPlayerManager)
     spawnLocation = agent->getWorldPosition();
 
-    // Hangout Location: Read from the AI's memory (Blackboard)
+    // 3. READ HANGOUT FROM BLACKBOARD
+    // We use .get<float>() because .getFloat() does not exist in your engine version.
     try {
-        // FIX: Explicitly call .getFloat() to extract the value from BlackboardData wrapper
-        float hx = agent->readBlackboard("targetX").getFloat();
-        float hy = agent->readBlackboard("targetY").getFloat(); // North
-        float hz = agent->readBlackboard("targetZ").getFloat(); // Height
+        float hx = agent->readBlackboard("targetX").get<float>();
+        float hy = agent->readBlackboard("targetY").get<float>(); // North
+        float hz = agent->readBlackboard("targetZ").get<float>(); // Height
 
-        // Safety Check: If Lua failed to pass coords, fallback to current spot (Bot will just loiter)
+        // Safety Check: If coordinates are 0, fallback to spawn
         if (hx == 0 && hy == 0) {
             Logger::console.info("SimPvP: WARNING - No Blackboard Coords found. Loitering at spawn.", true);
             hangoutLocation = spawnLocation;
         } else {
-            // Construct Vector3(X, North, Height) to match your previous hardcoded format
             hangoutLocation = Vector3(hx, hy, hz);
         }
     } catch (...) {
-        Logger::console.error("SimPvP: Error reading blackboard coordinates. Defaulting to spawn.");
+        // If the template cast fails, we catch it here
+        Logger::console.error("SimPvP: Error reading blackboard coordinates (Cast Failed). Defaulting to spawn.");
         hangoutLocation = spawnLocation;
     }
 
