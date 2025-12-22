@@ -1,6 +1,6 @@
 /*
  * SimPvPController.cpp
- * Combat Safety Update + Blackboard Location Fix
+ * FIXED: BlackboardData type conversion error
  */
 
 #include "SimPvPController.h"
@@ -12,7 +12,6 @@
 #include "server/zone/CloseObjectsVector.h"
 #include "server/zone/TreeEntry.h" 
 #include "templates/params/creature/ObjectFlag.h"
-// Include BlackboardData to handle the coordinate reads
 #include "server/zone/objects/creature/ai/bt/BlackboardData.h"
 
 SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerController(aiAgent) {
@@ -38,9 +37,10 @@ void SimPvPController::startSimLoop() {
 
     // Hangout Location: Read from the AI's memory (Blackboard)
     try {
-        float hx = agent->readBlackboard("targetX");
-        float hy = agent->readBlackboard("targetY"); // North
-        float hz = agent->readBlackboard("targetZ"); // Height
+        // FIX: Explicitly call .getFloat() to extract the value from BlackboardData wrapper
+        float hx = agent->readBlackboard("targetX").getFloat();
+        float hy = agent->readBlackboard("targetY").getFloat(); // North
+        float hz = agent->readBlackboard("targetZ").getFloat(); // Height
 
         // Safety Check: If Lua failed to pass coords, fallback to current spot (Bot will just loiter)
         if (hx == 0 && hy == 0) {
