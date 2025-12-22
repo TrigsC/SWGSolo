@@ -1,6 +1,6 @@
 /*
  * SimPlayerManager.cpp
- * Cleaned: Duplicate spawn function removed.
+ * FIXED: Config Loader with Deep Debugging & Robust Checks
  */
 
 #include "SimPlayerManager.h"
@@ -72,43 +72,55 @@ void SimPlayerManager::loadLuaConfig() {
             LuaObject planetTable = shuttles.getObjectField(pName);
             
             if (planetTable.isValidTable()) {
-                info("DEBUG: Found shuttle entries for: " + String(pName), true);
+                int cityCount = planetTable.getTableSize();
+                info("DEBUG: Found " + String::valueOf(cityCount) + " entries for planet: " + String(pName), true);
                 
-                for (int j = 1; j <= planetTable.getTableSize(); ++j) {
+                for (int j = 1; j <= cityCount; ++j) {
                     LuaObject city = planetTable.getObjectAt(j);
+                    
                     if (city.isValidTable()) {
-                        LuaObject spawn = city.getObjectField("spawn");
-                        LuaObject hangout = city.getObjectField("hangout");
+                        // DEBUG PROBE: Check if we are looking at the right object
+                        String cityName = city.getStringField("name");
+                        if (cityName.isEmpty()) cityName = "Unknown/Unnamed";
                         
-                        // RELAXED CHECK: Only 'spawn' is mandatory
+                        LuaObject spawn = city.getObjectField("spawn");
+                        
                         if (spawn.isValidTable()) {
                             LocationEntry entry;
                             entry.planet = pName;
                             
-                            // Load Spawn
+                            // Load Spawn: Lua array {x, z, y} -> C++ {x, z, y} (We map to North/Height later)
+                            // Lua: spawn = {-328.0, -4600.0, 28.0} 
+                            // Index 1 = X, 2 = Z(North), 3 = Y(Height)
                             entry.x = spawn.getFloatAt(1);
                             entry.y = spawn.getFloatAt(2); 
                             entry.z = spawn.getFloatAt(3); 
 
+                            // DEBUG: Verify Coords
+                            // info("DEBUG: Loaded " + cityName + " Spawn: " + String::valueOf(entry.x) + ", " + String::valueOf(entry.y), true);
+
                             // Load Hangout (Optional)
+                            LuaObject hangout = city.getObjectField("hangout");
                             if (hangout.isValidTable()) {
                                 entry.hx = hangout.getFloatAt(1);
                                 entry.hy = hangout.getFloatAt(2); 
                                 entry.hz = hangout.getFloatAt(3);
                             } else {
                                 // Fallback: Hangout = Spawn
-                                info("DEBUG: Note - No 'hangout' table for " + String(pName) + " entry #" + String::valueOf(j) + ". Defaulting to spawn coords.", true);
                                 entry.hx = entry.x;
                                 entry.hy = entry.y;
                                 entry.hz = entry.z;
                             }
+                            hangout.pop();
 
                             locationList.push_back(entry);
                         } else {
-                            error("DEBUG: Entry #" + String::valueOf(j) + " in " + String(pName) + " is missing the 'spawn' table!");
+                            // Detailed Error Logging
+                            error("DEBUG: Entry #" + String::valueOf(j) + " (" + cityName + ") in " + String(pName) + " is invalid!");
+                            if (spawn.isNil()) error("DEBUG: -> 'spawn' field is NIL.");
+                            else error("DEBUG: -> 'spawn' field exists but is NOT a table.");
                         }
                         spawn.pop();
-                        hangout.pop();
                     }
                     city.pop();
                 }
@@ -119,9 +131,11 @@ void SimPlayerManager::loadLuaConfig() {
     shuttles.pop();
 
     if (locationList.empty()) {
-        error("DEBUG: ABORTING - No spawn locations found. Check Lua structure.");
+        error("DEBUG: ABORTING - No valid spawn locations found.");
         return;
     }
+
+    info("DEBUG: Successfully loaded " + String::valueOf(locationList.size()) + " spawn locations.", true);
 
     // --- PROCESS GROUPS ---
     LuaObject groups = config.getObjectField("spawnGroups");
@@ -186,6 +200,7 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
         float finalZ = z; 
         if (finalZ == 0 || finalZ < -10000 || finalZ > 10000) finalZ = zone->getHeight(x, y); 
 
+        // Spawn
         CreatureObject* creature = creatureManager->spawnCreature(iffCRC, x, finalZ, y, 0);
         if (creature == nullptr) return;
 
