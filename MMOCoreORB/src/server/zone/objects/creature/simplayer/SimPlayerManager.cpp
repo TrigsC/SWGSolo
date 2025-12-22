@@ -53,41 +53,13 @@ void SimPlayerManager::loadLuaConfig() {
     }
 
     bool enabled = config.getBooleanField("enabled");
-    info("DEBUG: Config loaded. Enabled status: " + String::valueOf(enabled), true);
-
     if (!enabled) return;
-
-    // ---------------------------------------------------------
-    // CHANGE: Process Spawn Groups FIRST (Avoids stack issues from shuttle loop)
-    // ---------------------------------------------------------
-    LuaObject groups = config.getObjectField("spawnGroups");
-    if (groups.isValidTable()) {
-        int groupCount = groups.getTableSize();
-        info("DEBUG: Found " + String::valueOf(groupCount) + " spawn groups defined.", true);
-
-        // We need locationList to spawn, but we can READ the config now and store it, 
-        // OR just move the Shuttle loading code to run immediately after this check 
-        // but BEFORE we try to loop through groups.
-        
-        // Actually, let's just leave the reading here to verify it works.
-    } else {
-        error("DEBUG: 'spawnGroups' table is missing or invalid!");
-        // We can return here if this fails, as there is no point continuing
-        groups.pop(); 
-        return; 
-    }
-    // Don't pop 'groups' yet if we need it later, but for this test let's pop and re-grab it later 
-    // or structure the code to load Shuttles now.
-    groups.pop();
 
     // ---------------------------------------------------------
     // 1. Load Shuttleports
     // ---------------------------------------------------------
-    struct LocationEntry {
-        String planet;
-        float x, y, z; 
-    };
-    std::vector<LocationEntry> locationList;
+    // Use std::vector to avoid Core3 Vector exceptions for now
+    std::vector<LocationEntry> locationList; 
 
     LuaObject shuttles = config.getObjectField("shuttleports");
     if (shuttles.isValidTable()) {
@@ -95,18 +67,28 @@ void SimPlayerManager::loadLuaConfig() {
         
         for (const char* pName : planets) {
             LuaObject planetTable = shuttles.getObjectField(pName);
+            
+            // Debug print to see if we find the planet table
             if (planetTable.isValidTable()) {
+                info("DEBUG: Found shuttle entries for: " + String(pName), true);
+                
                 for (int j = 1; j <= planetTable.getTableSize(); ++j) {
                     LuaObject city = planetTable.getObjectAt(j);
                     if (city.isValidTable()) {
                         LuaObject spawn = city.getObjectField("spawn");
-                        LocationEntry entry;
-                        entry.planet = pName;
-                        entry.x = spawn.getFloatAt(1);
-                        entry.y = spawn.getFloatAt(2);
-                        entry.z = spawn.getFloatAt(3);
-                        locationList.push_back(entry);
-                        spawn.pop(); // Good practice to pop this too
+                        
+                        // Defensive check for spawn coordinates
+                        if (spawn.isValidTable() && spawn.getTableSize() >= 3) {
+                            LocationEntry entry;
+                            entry.planet = pName;
+                            entry.x = spawn.getFloatAt(1);
+                            entry.y = spawn.getFloatAt(2);
+                            entry.z = spawn.getFloatAt(3);
+                            locationList.push_back(entry);
+                        } else {
+                            error("DEBUG: Invalid 'spawn' coord table for planet: " + String(pName));
+                        }
+                        spawn.pop();
                     }
                     city.pop();
                 }
@@ -118,15 +100,18 @@ void SimPlayerManager::loadLuaConfig() {
     }
     shuttles.pop();
 
+    info("DEBUG: Total Spawn Locations Loaded: " + String::valueOf(locationList.size()), true);
+
+    // CRITICAL CHECK: Stop here if no locations
     if (locationList.empty()) {
-        error("DEBUG: No spawn locations found. Aborting.");
+        error("DEBUG: ABORTING - No spawn locations found. Check Lua 'shuttleports' structure.");
         return;
     }
 
     // ---------------------------------------------------------
-    // 2. Process Spawn Groups (Re-get or use stored)
+    // 2. Process Spawn Groups
     // ---------------------------------------------------------
-    groups = config.getObjectField("spawnGroups"); // Get it again to be safe
+    LuaObject groups = config.getObjectField("spawnGroups");
     if (groups.isValidTable()) {
         int groupCount = groups.getTableSize();
         
@@ -136,22 +121,46 @@ void SimPlayerManager::loadLuaConfig() {
             int count = group.getIntField("totalCount");
             LuaObject templates = group.getObjectField("templates");
             
-            info("DEBUG: Processing Group " + String::valueOf(i) + " (" + type + ")", true);
+            info("DEBUG: Processing Group " + String::valueOf(i) + " (" + type + ") Count: " + String::valueOf(count), true);
 
             for (int k = 0; k < count; ++k) {
-                if (locationList.size() == 0) break;
-                int locIndex = System::random(locationList.size());
+                // Safety Check: Location List
+                if (locationList.empty()) break;
+
+                // Safe Random Index for Location
+                int locIndex = System::random(locationList.size()); 
+                if (locIndex >= locationList.size()) locIndex = 0; // Safety clamp
+                
                 LocationEntry loc = locationList.at(locIndex);
 
+                // Safe Template Selection
                 String tmpl = "";
-                if (templates.isValidTable() && templates.getTableSize() > 0) {
-                    int tIdx = 1 + System::random(templates.getTableSize());
-                    tmpl = templates.getStringAt(tIdx);
+                if (templates.isValidTable()) {
+                    int tSize = templates.getTableSize();
+                    if (tSize > 0) {
+                        // Lua is 1-based, random is 0-based. 
+                        // System::random(max) returns 0 to max-1. 
+                        // We want 1 to max.
+                        int tIdx = 1 + System::random(tSize);
+                        
+                        // Extra safety to prevent "At 3" error if random behaves oddly
+                        if (tIdx > tSize) tIdx = tSize; 
+                        
+                        tmpl = templates.getStringAt(tIdx);
+                    }
                 }
-                
-                // ... Spawn Logic ...
-                if (type == "miner") spawnSimPlayer(loc.planet, loc.x, loc.y, loc.z, tmpl, 0); 
-                else if (type == "pvp_solo") spawnSimPlayer(loc.planet, loc.x, loc.y, loc.z, tmpl, 1);
+
+                if (tmpl.isEmpty()) {
+                    error("DEBUG: Template name is empty! Skipping spawn.");
+                    continue;
+                }
+
+                if (type == "miner") {
+                    spawnSimPlayer(loc.planet, loc.x, loc.y, loc.z, tmpl, 0); 
+                } 
+                else if (type == "pvp_solo") {
+                    spawnSimPlayer(loc.planet, loc.x, loc.y, loc.z, tmpl, 1); 
+                }
             }
             templates.pop();
             group.pop();
@@ -159,8 +168,7 @@ void SimPlayerManager::loadLuaConfig() {
     }
     groups.pop();
     
-    // Final Pop of Config
-    // config.pop(); // LuaObject destructor usually handles this, but if you want to be explicit.
+    // config.pop(); // Optional, let destructor handle it
 }
 
 void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, float z, const String& templateName, int type) {
