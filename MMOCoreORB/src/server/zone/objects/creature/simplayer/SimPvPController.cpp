@@ -125,8 +125,8 @@ void SimPvPController::returnToShuttle() {
     Logger::console.info("SimPvP: Return Logic Triggered.", true);
     
     if (agent != nullptr) {
-        agent->clearCombatState(true); 
-        agent->setCreatureBitmask(0); 
+        //agent->clearCombatState(true); 
+        //agent->setCreatureBitmask(0); 
         
         agent->setPosture(CreaturePosture::UPRIGHT, true);
         
