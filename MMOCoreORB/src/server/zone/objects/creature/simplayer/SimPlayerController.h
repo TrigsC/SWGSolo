@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.h
- * Modular Controller for SimPlayers
+ * LOGGING BUILD: Added isMiner helper to fix compilation
  */
 
 #ifndef SIMPLAYERCONTROLLER_H_
@@ -31,7 +31,6 @@ public:
     void run() override; 
 };
 
-// Generic Movement Loop Task
 class ArrivalCheckTask : public Task {
     WeakReference<SimPlayerController*> controller;
 public:
@@ -39,7 +38,6 @@ public:
     void run() override;
 };
 
-// Miner Specific: Action Task
 class SimBehaviorTask : public Task {
     WeakReference<SimPlayerController*> controller;
     int type; 
@@ -51,30 +49,13 @@ public:
     void run() override;
 };
 
-// -------------------------------------------------------
-// BASE CONTROLLER (Handles Movement & Physics)
-// -------------------------------------------------------
-class SimPlayerController : public Object, public Logger {
+class SimPlayerController : public Reference<SimPlayerController>, public Logger {
 protected:
     ManagedReference<AiAgent*> agent;
-    Vector<WorldCoordinates> simPath;
-    int simPathIndex;
-    Vector3 lastWatchdogPos;
-    int stuckWatchdogCount;
-    Vector3 destination;
     
-    // Configurable speed/movement settings
-    float runSpeed;
-
+public:
     enum SimState {
-        IDLE,
-        DECIDING,
-        SURVEYING,
-        CALCULATING_PATH,
-        PERFORMING_ACTION,
-        MOVING,
-        SAMPLING,
-        WAITING
+        IDLE, DECIDING, SURVEYING, CALCULATING_PATH, PERFORMING_ACTION, MOVING, SAMPLING, WAITING
     };
     SimState state;
 
@@ -82,12 +63,13 @@ public:
     SimPlayerController(AiAgent* aiAgent);
     virtual ~SimPlayerController();
 
-    // --- Virtual Interface for Derived Bots ---
-    virtual void startSimLoop() = 0;  // Start the bot's logic
-    virtual void onArrived() = 0;     // Called when destination reached
-    virtual void onTick() {}          // Called every 500ms (Good for PvP scanning)
+    virtual void startSimLoop() = 0;
+    virtual void onArrived() = 0;
+    virtual void onTick() {}
+    
+    // FIX: Added to resolve "no member named isMiner" error
+    virtual bool isMiner() { return false; }
 
-    // --- Common Movement Logic ---
     void moveTo(Vector3 targetPos);
     void checkArrival();
     
@@ -99,9 +81,6 @@ protected:
     bool pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out);
 };
 
-// -------------------------------------------------------
-// MINER CONTROLLER (Resource Gathering)
-// -------------------------------------------------------
 class SimMinerController : public SimPlayerController {
     String targetResource;
     int retryCount;
@@ -110,10 +89,12 @@ public:
     SimMinerController(AiAgent* aiAgent);
     virtual ~SimMinerController();
 
+    // Override
+    bool isMiner() override { return true; }
+
     void startSimLoop() override;
     void onArrived() override;
 
-    // Specific logic
     void performSurvey();
     void finishSurvey();
     void goToResource(const String& resourceName);

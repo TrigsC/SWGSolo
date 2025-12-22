@@ -1,6 +1,6 @@
 /*
  * SimPvPController.cpp
- * DEBUG VERSION: Heavy Logging in onTick to diagnose "Stutter Step"
+ * LOGGING BUILD: Added detailed movement diagnostics to onTick
  */
 
 #include "SimPvPController.h"
@@ -67,8 +67,7 @@ void SimPvPController::startPatrol() {
 void SimPvPController::returnToShuttle() {
     state = SimPlayerController::MOVING;
     returningToShuttle = true;
-    Logger::console.info("SimPvP: Returning to Shuttle. Destination: " + spawnLocation.toString(), true);
-    
+    Logger::console.info("SimPvP: Patrol done. Returning to Shuttle.", true);
     moveTo(spawnLocation);
 
     Reference<SimPvPDespawnTask*> task = new SimPvPDespawnTask(this);
@@ -111,10 +110,9 @@ void SimPvPController::despawn() {
 
 void SimPvPController::onTick() {
     if (agent == nullptr || agent->isDead()) return;
-    
     if (agent->isInCombat()) return; 
 
-    // LOG 3: DIAGNOSING THE STUTTER
+    // LOGGING: Check why we are stuttering
     if (state == SimPlayerController::MOVING) {
         
         int queueSize = agent->getPatrolPointSize();
@@ -122,23 +120,19 @@ void SimPvPController::onTick() {
         if (queueSize == 0) {
              Vector3 dest = returningToShuttle ? spawnLocation : hangoutLocation;
              
-             // Calculate distances manually to debug
-             Vector3 current = agent->getWorldPosition();
-             float dx = current.getX() - dest.getX();
-             float dy = current.getY() - dest.getY();
-             float dz = current.getZ() - dest.getZ();
-             float dist = sqrt(dx*dx + dy*dy + dz*dz); // 3D Distance
-             float dist2d = sqrt(dx*dx + dy*dy);       // 2D Distance
+             // Manually calc distance to debug
+             float dx = agent->getWorldPosition().getX() - dest.getX();
+             float dy = agent->getWorldPosition().getY() - dest.getY();
+             float dz = agent->getWorldPosition().getZ() - dest.getZ();
+             float dist = sqrt(dx*dx + dy*dy + dz*dz); 
 
-             Logger::console.info("SimPvP [" + String::valueOf(agent->getObjectID()) + "]: TICK DEBUG -> State=MOVING, Queue=0. Dist3D=" + String::valueOf(dist) + ", Dist2D=" + String::valueOf(dist2d), true);
-             Logger::console.info("SimPvP: Current Pos: " + current.toString() + " | Target Pos: " + dest.toString(), true);
+             // Log the "Stuck" state
+             Logger::console.info("SimPvP [" + String::valueOf(agent->getObjectID()) + "]: TICK DEBUG -> Queue Empty. Dist to target: " + String::valueOf(dist) + "m", true);
 
-             // Original Logic (Rolled Back)
+             // Original behavior (re-issue if > 5m)
              if (dist > 5.0f) {
-                 Logger::console.info("SimPvP: Distance > 5.0f -> Re-issuing MOVE command.", true);
                  moveTo(dest);
              } else {
-                 Logger::console.info("SimPvP: Distance < 5.0f -> Calling onArrived.", true);
                  onArrived();
              }
         }

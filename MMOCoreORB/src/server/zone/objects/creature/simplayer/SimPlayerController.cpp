@@ -1,6 +1,6 @@
 /*
  * SimPlayerController.cpp
- * DEBUGGING ONLY: Added logs to track path generation quality
+ * LOGGING BUILD: Fixed Constructors for WorldCoordinates/PatrolPoint
  */
 
 #include "SimPlayerController.h"
@@ -16,7 +16,8 @@
 #include "system/lang/System.h" 
 #include "server/zone/objects/creature/ai/bt/BlackboardData.h"
 #include "templates/params/creature/CreaturePosture.h"
-#include "system/thread/Locker.h" 
+#include "system/thread/Locker.h"
+#include "server/zone/objects/cell/CellObject.h" // Needed for CellObject cast
 
 using namespace server::zone::objects::creature::ai::bt;
 
@@ -53,8 +54,10 @@ void SimBehaviorTask::run() {
 
     Core::getTaskManager()->executeTask([strongCtrl, this] () {
         if (type == FINISH_SURVEY) {
-            // Cast removed for safety in this debug block, assuming logic handles it
-        } 
+            if (strongCtrl->isMiner()) ((SimMinerController*)strongCtrl.get())->finishSurvey();
+        } else if (type == FINISH_SAMPLE) {
+            if (strongCtrl->isMiner()) ((SimMinerController*)strongCtrl.get())->finishSample();
+        }
     }, "SimBehaviorLambda");
 }
 
@@ -76,13 +79,17 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
 
     Locker lock(agent);
     
-    // LOG 1: Request
+    // LOGGING: Track the request
     Logger::console.info("SimPlayer [" + String::valueOf(agent->getObjectID()) + "]: Requesting move to " + targetPos.toString(), true);
 
     state = CALCULATING_PATH;
     
-    WorldCoordinates startCoord(agent->getWorldPosition(), agent->getParentID());
-    WorldCoordinates endCoord(targetPos, 0); 
+    // FIX: Correctly resolve CellObject pointer for constructor
+    SceneObject* parent = agent->getParent().get();
+    CellObject* cell = (parent != nullptr) ? parent->asCellObject() : nullptr;
+
+    WorldCoordinates startCoord(agent->getPosition(), cell);
+    WorldCoordinates endCoord(targetPos, nullptr); // Assume target is outdoor for now
 
     Reference<SimPathFindTask*> task = new SimPathFindTask(this, startCoord, endCoord, zone);
     Core::getTaskManager()->executeTask(task);
@@ -93,7 +100,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     
     Locker lock(agent);
     
-    // LOG 2: Result
+    // LOGGING: Track the result
     int steps = path->size();
     Logger::console.info("SimPlayer [" + String::valueOf(agent->getObjectID()) + "]: Path FOUND. Steps: " + String::valueOf(steps), true);
 
@@ -107,7 +114,9 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     agent->clearPatrolPoints();
     
     for (int i = 0; i < path->size(); ++i) {
-        PatrolPoint point(path->get(i));
+        // FIX: Extract Point and Cell manually for PatrolPoint constructor
+        WorldCoordinates wCoord = path->get(i);
+        PatrolPoint point(wCoord.getPoint(), wCoord.getCell());
         agent->addPatrolPoint(point);
     }
     
