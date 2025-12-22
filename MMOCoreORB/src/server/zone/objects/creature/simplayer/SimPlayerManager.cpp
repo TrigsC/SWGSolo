@@ -1,6 +1,6 @@
 /*
  * SimPlayerManager.cpp
- * FIXED: Random Range Logic, Safety Wrappers, and Debug Logging
+ * FIXED: Template Path Auto-Fix + Verbose Spawning Logs
  */
 
 #include "SimPlayerManager.h"
@@ -72,6 +72,7 @@ void SimPlayerManager::loadLuaConfig() {
                         
                         LocationEntry entry;
                         entry.planet = pName;
+                        // Lua: {X, North, Height}
                         entry.x = spawn.getFloatAt(1);
                         entry.y = spawn.getFloatAt(2); // North
                         entry.z = spawn.getFloatAt(3); // Height
@@ -100,16 +101,14 @@ void SimPlayerManager::loadLuaConfig() {
             int count = group.getIntField("totalCount");
             LuaObject templates = group.getObjectField("templates");
             
-            info("Spawning Group: " + type + " Count: " + String::valueOf(count), true);
+            info("Reading Group: " + type + " Count: " + String::valueOf(count), true);
 
             for (int k = 0; k < count; ++k) {
-                // FIX: Use size(), not size()-1. Random(N) returns 0..N-1
                 int locIndex = System::random(locationList.size());
                 LocationEntry loc = locationList.at(locIndex);
 
                 String tmpl = "";
                 if (templates.isValidTable() && templates.getTableSize() > 0) {
-                    // Lua is 1-based. Random(N) -> 0..N-1. Add 1 -> 1..N
                     int tIdx = 1 + System::random(templates.getTableSize());
                     tmpl = templates.getStringAt(tIdx);
                 }
@@ -151,30 +150,47 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
         CreatureManager* creatureManager = zone->getCreatureManager();
         if (creatureManager == nullptr) return;
 
-        // Safety Height
-        if (z == 0) z = zone->getHeight(x, y); 
+        // Auto-fix template path
+        String fullTemplate = templateName;
+        if (!fullTemplate.contains("object/")) {
+            fullTemplate = "object/mobile/" + templateName + ".iff";
+        }
 
-        // SPAWN: X, Z (North), Y (Height)
-        CreatureObject* creature = creatureManager->spawnCreature(templateName.hashCode(), 0, x, y, z, 0);
+        // SWG Map: X=East, Y=Altitude, Z=North
+        // Our Lua passed: x, y=North, z=Height
+        // Arguments passed to this func: x, y(North), z(Height)
+        
+        // Safety Height Check
+        if (z == 0 || z == -9999) z = zone->getHeight(x, y); 
+
+        // LOGGING: Verify coordinates before spawn
+        info("SimPlayerManager: Attempting spawn " + fullTemplate + " on " + planet + 
+             " at X:" + String::valueOf(x) + " Z(North):" + String::valueOf(y) + " Y(Height):" + String::valueOf(z), true);
+
+        // SPAWN CALL: (CRC, Type, X, Z, Y, Parent) 
+        // NOTE: Core3 standard is X, Z(North), Y(Height).
+        // We pass x, y(North), z(Height).
+        CreatureObject* creature = creatureManager->spawnCreature(fullTemplate.hashCode(), 0, x, y, z, 0);
         
         if (creature == nullptr) {
-            error("Failed to spawn SimPlayer template: " + templateName);
+            error("Failed to spawn SimPlayer template (nullptr returned): " + fullTemplate);
             return;
         }
 
         AiAgent* agent = creature->asAiAgent();
-        if (agent == nullptr) return;
+        if (agent == nullptr) {
+             error("Spawned object is not an AiAgent: " + fullTemplate);
+             return;
+        }
 
-        // --- NAME GENERATION SAFETY ---
+        // --- NAME GENERATION ---
         try {
             NameManager* nm = zoneServer->getNameManager();
             if (nm != nullptr) {
-                // 0 = Generic/Human. 
                 String name = nm->makeCreatureName(0, creature->getSpecies()); 
                 if (!name.isEmpty()) agent->setCustomObjectName(name, true);
             }
         } catch (...) {
-            error("SimPlayerManager: Name generation failed for " + templateName);
             agent->setCustomObjectName("Sim Player", true);
         }
 
@@ -184,7 +200,7 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
         Reference<SimPlayerController*> ctrl = nullptr;
 
         if (type == 1) { // PvP
-            bool isImp = (templateName.contains("stormtrooper"));
+            bool isImp = (fullTemplate.contains("stormtrooper"));
             agent->setFactionStatus(FactionStatus::OVERT);
             agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE);
             ctrl = new SimPvPController(agent, isImp); 
