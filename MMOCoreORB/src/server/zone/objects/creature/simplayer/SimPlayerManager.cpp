@@ -1,6 +1,6 @@
 /*
  * SimPlayerManager.cpp
- * FIXED: Template Path Auto-Fix + Verbose Spawning Logs
+ * DEBUG VERSION: Verbose Logging to diagnose startup issues
  */
 
 #include "SimPlayerManager.h"
@@ -37,20 +37,27 @@ void SimPlayerManager::initialize() {
 }
 
 void SimPlayerManager::loadLuaConfig() {
-    lua->runFile("scripts/managers/sim_player_manager.lua");
+    info("DEBUG: Attempting to run Lua file: scripts/managers/sim_player_manager.lua", true);
+    
+    try {
+        lua->runFile("scripts/managers/sim_player_manager.lua");
+    } catch (Exception& e) {
+        error("DEBUG: CRITICAL LUA ERROR: " + e.getMessage());
+        return;
+    }
 
     LuaObject config = lua->getGlobalObject("SimPlayerManagerConfig");
     if (!config.isValidTable()) {
-        error("Failed to load SimPlayerManagerConfig from lua!");
+        error("DEBUG: 'SimPlayerManagerConfig' table NOT found! Did you remove the word 'local' from the Lua file?");
         return;
     }
 
     bool enabled = config.getBooleanField("enabled");
-    if (!enabled) {
-        info("SimPlayer system disabled in Lua.", true);
-        return;
-    }
+    info("DEBUG: Config loaded. Enabled status: " + String::valueOf(enabled), true);
 
+    if (!enabled) return;
+
+    // 1. Load Shuttleports
     struct LocationEntry {
         String planet;
         float x, y, z; 
@@ -65,6 +72,8 @@ void SimPlayerManager::loadLuaConfig() {
         for (const char* pName : planets) {
             LuaObject planetTable = shuttles.getObjectField(pName);
             if (planetTable.isValidTable()) {
+                info("DEBUG: Found config section for planet: " + String(pName), true);
+                
                 for (int j = 1; j <= planetTable.getTableSize(); ++j) {
                     LuaObject city = planetTable.getObjectAt(j);
                     if (city.isValidTable()) {
@@ -72,7 +81,6 @@ void SimPlayerManager::loadLuaConfig() {
                         
                         LocationEntry entry;
                         entry.planet = pName;
-                        // Lua: {X, North, Height}
                         entry.x = spawn.getFloatAt(1);
                         entry.y = spawn.getFloatAt(2); // North
                         entry.z = spawn.getFloatAt(3); // Height
@@ -84,24 +92,32 @@ void SimPlayerManager::loadLuaConfig() {
             }
             planetTable.pop();
         }
+    } else {
+        error("DEBUG: 'shuttleports' table is missing or invalid!");
     }
     shuttles.pop();
 
+    info("DEBUG: Total Spawn Locations Loaded: " + String::valueOf(locationList.size()), true);
+
     if (locationList.empty()) {
-        error("No shuttleports defined in Lua!");
+        error("DEBUG: No spawn locations found. Aborting.");
         return;
     }
 
+    // 2. Process Spawn Groups
     LuaObject groups = config.getObjectField("spawnGroups");
     if (groups.isValidTable()) {
-        for (int i = 1; i <= groups.getTableSize(); ++i) {
+        int groupCount = groups.getTableSize();
+        info("DEBUG: Found " + String::valueOf(groupCount) + " spawn groups defined.", true);
+
+        for (int i = 1; i <= groupCount; ++i) {
             LuaObject group = groups.getObjectAt(i);
             
             String type = group.getStringField("type");
             int count = group.getIntField("totalCount");
             LuaObject templates = group.getObjectField("templates");
             
-            info("Reading Group: " + type + " Count: " + String::valueOf(count), true);
+            info("DEBUG: Processing Group " + String::valueOf(i) + " (" + type + ") -> Spawning " + String::valueOf(count) + " bots.", true);
 
             for (int k = 0; k < count; ++k) {
                 int locIndex = System::random(locationList.size());
@@ -113,6 +129,7 @@ void SimPlayerManager::loadLuaConfig() {
                     tmpl = templates.getStringAt(tIdx);
                 }
 
+                // Pass Type: 0=Miner, 1=PvP
                 if (type == "miner") {
                     spawnSimPlayer(loc.planet, loc.x, loc.y, loc.z, tmpl, 0); 
                 } 
@@ -131,9 +148,13 @@ void SimPlayerManager::loadLuaConfig() {
             templates.pop();
             group.pop();
         }
+    } else {
+        error("DEBUG: 'spawnGroups' table is missing or invalid!");
     }
     groups.pop();
     config.pop();
+    
+    info("DEBUG: Initialization Complete.", true);
 }
 
 void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, float z, const String& templateName, int type) {
@@ -143,14 +164,13 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
 
         Zone* zone = zoneServer->getZone(planet);
         if (zone == nullptr) {
-            error("Could not find zone: " + planet);
+            error("DEBUG: Could not find zone object for: " + planet);
             return;
         }
 
         CreatureManager* creatureManager = zone->getCreatureManager();
         if (creatureManager == nullptr) return;
 
-        // Auto-fix template path
         String fullTemplate = templateName;
         if (!fullTemplate.contains("object/")) {
             fullTemplate = "object/mobile/" + templateName + ".iff";
@@ -160,30 +180,34 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
         // Our Lua passed: x, y=North, z=Height
         // Arguments passed to this func: x, y(North), z(Height)
         
-        // Safety Height Check
-        if (z == 0 || z == -9999) z = zone->getHeight(x, y); 
+        // Use supplied height if valid, else calculate
+        if (z == 0 || z < -10000 || z > 10000) z = zone->getHeight(x, y); 
 
-        // LOGGING: Verify coordinates before spawn
-        info("SimPlayerManager: Attempting spawn " + fullTemplate + " on " + planet + 
-             " at X:" + String::valueOf(x) + " Z(North):" + String::valueOf(y) + " Y(Height):" + String::valueOf(z), true);
+        // Core3 spawnCreature expects (X, Z-North, Y-Height)
+        // We call it with: x, y(North), z(Height)
+        // Wait, verifying CreatureManager::spawnCreature signature...
+        // It is: spawnCreature(uint32 templateCRC, float x, float z, float y, uint64 parentID)
+        // WHERE Z is usually height in 3D engines, but in SWG Y is Height.
+        // Let's rely on standard map convention: X, Z, Y (where Y is Up).
+        // CreatureManager::spawnCreature(crc, type, x, z, y, parent) usually maps to world coordinates.
+        // Standard call: spawnCreature(hash, 0, x, z, y, 0) -> X, Z(North), Y(Height).
+        // So we should pass: x, y(North), z(Height).
+        
+        info("DEBUG: Spawning " + fullTemplate + " on " + planet + " @ " + String::valueOf(x) + ", " + String::valueOf(y) + " (H:" + String::valueOf(z) + ")", true);
 
-        // SPAWN CALL: (CRC, Type, X, Z, Y, Parent) 
-        // NOTE: Core3 standard is X, Z(North), Y(Height).
-        // We pass x, y(North), z(Height).
         CreatureObject* creature = creatureManager->spawnCreature(fullTemplate.hashCode(), 0, x, y, z, 0);
         
         if (creature == nullptr) {
-            error("Failed to spawn SimPlayer template (nullptr returned): " + fullTemplate);
+            error("DEBUG: Spawn Failed! Could not create object. Check template path: " + fullTemplate);
             return;
         }
 
         AiAgent* agent = creature->asAiAgent();
         if (agent == nullptr) {
-             error("Spawned object is not an AiAgent: " + fullTemplate);
+             error("DEBUG: Spawned object is not an AiAgent. Check template type.");
              return;
         }
 
-        // --- NAME GENERATION ---
         try {
             NameManager* nm = zoneServer->getNameManager();
             if (nm != nullptr) {
@@ -222,62 +246,62 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
         }, "SimStartLambda", 10000); 
 
     } catch (Exception& e) {
-        error("SimPlayerManager: Error spawning bot: " + e.getMessage());
+        error("DEBUG: Exception in spawnSimPlayer: " + e.getMessage());
     } catch (...) {
-        error("SimPlayerManager: Unknown error spawning bot.");
+        error("DEBUG: Unknown Exception in spawnSimPlayer");
     }
 }
 
-void SimPlayerManager::toggleBot(AiAgent* agent) {
-    if (agent == nullptr) return;
-
-    uint64 oid = agent->getObjectID();
-
-    if (controllers.contains(oid)) {
-        info("Stopping SimPlayer for agent " + String::valueOf(oid), true);
-        agent->eraseBlackboard("simAlwaysActive");
-        controllers.drop(oid);
-        
-        agent->clearPatrolPoints();
-        agent->clearSavedPatrolPoints();
-        agent->setMovementState(AiAgent::OBLIVIOUS);
-        agent->activateAiBehavior(true);
-        agent->setSimPlayerBot(false);
-        return;
-    } else {
-        info("Starting SimPlayer for agent " + String::valueOf(oid), true);
-        
-        agent->setCustomAiMap(String("patrol").hashCode());
-        agent->setAITemplate(); 
-        
-        agent->writeBlackboard("simAlwaysActive", true);
-        agent->setSimAlwaysActive(true);
-        agent->setSimPlayerBot(true); 
-        agent->setDespawnOnNoPlayerInRange(false);
-
-        Reference<SimPlayerController*> ctrl = nullptr;
-        
-        const CreatureTemplate* tmpl = agent->getCreatureTemplate();
-        String tName = (tmpl != nullptr) ? tmpl->getTemplateName() : "";
-
-        if (tName == "stormtrooper") {
-             ctrl = new SimPvPController(agent, true); 
-        } 
-        else if (tName == "rebel_trooper") {
-             ctrl = new SimPvPController(agent, false);
-        }
-        else {
-             ctrl = new SimMinerController(agent);
-        }
-
-        controllers.put(oid, ctrl);
-        agent->activateAiBehavior(true);
-
-        // --- STARTUP FIX: 10 Second Warmup ---
-        // Using scheduleTask (Correct API) instead of executeTask
-        // This prevents the bot from asking for a path before the NavMesh is ready
-        Core::getTaskManager()->scheduleTask([ctrl] () {
-            ctrl->startSimLoop();
-        }, "SimStartLambda", 10000); 
-    }
-}
+//void SimPlayerManager::toggleBot(AiAgent* agent) {
+//    if (agent == nullptr) return;
+//
+//    uint64 oid = agent->getObjectID();
+//
+//    if (controllers.contains(oid)) {
+//        info("Stopping SimPlayer for agent " + String::valueOf(oid), true);
+//        agent->eraseBlackboard("simAlwaysActive");
+//        controllers.drop(oid);
+//        
+//        agent->clearPatrolPoints();
+//        agent->clearSavedPatrolPoints();
+//        agent->setMovementState(AiAgent::OBLIVIOUS);
+//        agent->activateAiBehavior(true);
+//        agent->setSimPlayerBot(false);
+//        return;
+//    } else {
+//        info("Starting SimPlayer for agent " + String::valueOf(oid), true);
+//        
+//        agent->setCustomAiMap(String("patrol").hashCode());
+//        agent->setAITemplate(); 
+//        
+//        agent->writeBlackboard("simAlwaysActive", true);
+//        agent->setSimAlwaysActive(true);
+//        agent->setSimPlayerBot(true); 
+//        agent->setDespawnOnNoPlayerInRange(false);
+//
+//        Reference<SimPlayerController*> ctrl = nullptr;
+//        
+//        const CreatureTemplate* tmpl = agent->getCreatureTemplate();
+//        String tName = (tmpl != nullptr) ? tmpl->getTemplateName() : "";
+//
+//        if (tName == "stormtrooper") {
+//             ctrl = new SimPvPController(agent, true); 
+//        } 
+//        else if (tName == "rebel_trooper") {
+//             ctrl = new SimPvPController(agent, false);
+//        }
+//        else {
+//             ctrl = new SimMinerController(agent);
+//        }
+//
+//        controllers.put(oid, ctrl);
+//        agent->activateAiBehavior(true);
+//
+//        // --- STARTUP FIX: 10 Second Warmup ---
+//        // Using scheduleTask (Correct API) instead of executeTask
+//        // This prevents the bot from asking for a path before the NavMesh is ready
+//        Core::getTaskManager()->scheduleTask([ctrl] () {
+//            ctrl->startSimLoop();
+//        }, "SimStartLambda", 10000); 
+//    }
+//}
