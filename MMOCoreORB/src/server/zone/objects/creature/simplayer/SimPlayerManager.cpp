@@ -80,20 +80,33 @@ void SimPlayerManager::loadLuaConfig() {
                         LuaObject spawn = city.getObjectField("spawn");
                         LuaObject hangout = city.getObjectField("hangout");
                         
-                        if (spawn.isValidTable() && hangout.isValidTable()) {
+                        // RELAXED CHECK: Only 'spawn' is mandatory
+                        if (spawn.isValidTable()) {
                             LocationEntry entry;
                             entry.planet = pName;
                             
+                            // Load Spawn
                             entry.x = spawn.getFloatAt(1);
-                            entry.y = spawn.getFloatAt(2); // North
-                            entry.z = spawn.getFloatAt(3); // Height
+                            entry.y = spawn.getFloatAt(2); 
+                            entry.z = spawn.getFloatAt(3); 
 
-                            entry.hx = hangout.getFloatAt(1);
-                            entry.hy = hangout.getFloatAt(2); // North
-                            entry.hz = hangout.getFloatAt(3); // Height
+                            // Load Hangout (Optional)
+                            if (hangout.isValidTable()) {
+                                entry.hx = hangout.getFloatAt(1);
+                                entry.hy = hangout.getFloatAt(2); 
+                                entry.hz = hangout.getFloatAt(3);
+                            } else {
+                                // Fallback: Hangout = Spawn
+                                info("DEBUG: Note - No 'hangout' table for " + String(pName) + " entry #" + String::valueOf(j) + ". Defaulting to spawn coords.", true);
+                                entry.hx = entry.x;
+                                entry.hy = entry.y;
+                                entry.hz = entry.z;
+                            }
 
                             locationList.push_back(entry);
-                        } 
+                        } else {
+                            error("DEBUG: Entry #" + String::valueOf(j) + " in " + String(pName) + " is missing the 'spawn' table!");
+                        }
                         spawn.pop();
                         hangout.pop();
                     }
@@ -106,7 +119,7 @@ void SimPlayerManager::loadLuaConfig() {
     shuttles.pop();
 
     if (locationList.empty()) {
-        error("DEBUG: ABORTING - No spawn locations found.");
+        error("DEBUG: ABORTING - No spawn locations found. Check Lua structure.");
         return;
     }
 
