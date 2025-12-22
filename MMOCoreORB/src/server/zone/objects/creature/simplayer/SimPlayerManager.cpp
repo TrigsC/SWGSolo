@@ -172,43 +172,55 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
         CreatureManager* creatureManager = zone->getCreatureManager();
         if (creatureManager == nullptr) return;
 
+        // 1. Construct Template Path
         String fullTemplate = templateName;
         if (!fullTemplate.contains("object/")) {
             fullTemplate = "object/mobile/" + templateName + ".iff";
         }
 
-        // SWG Map: X=East, Y=Altitude, Z=North
-        // Our Lua passed: x, y=North, z=Height
-        // Arguments passed to this func: x, y(North), z(Height)
+        // 2. Calculate CRC (Debug Step)
+        uint32 templateCRC = fullTemplate.hashCode();
         
-        // Use supplied height if valid, else calculate
-        if (z == 0 || z < -10000 || z > 10000) z = zone->getHeight(x, y); 
+        if (templateCRC == 0) {
+            error("DEBUG: CRITICAL - Hash for string '" + fullTemplate + "' is 0! String might be empty or corrupt.");
+            return;
+        }
 
-        // Core3 spawnCreature expects (X, Z-North, Y-Height)
-        // We call it with: x, y(North), z(Height)
-        // Wait, verifying CreatureManager::spawnCreature signature...
-        // It is: spawnCreature(uint32 templateCRC, float x, float z, float y, uint64 parentID)
-        // WHERE Z is usually height in 3D engines, but in SWG Y is Height.
-        // Let's rely on standard map convention: X, Z, Y (where Y is Up).
-        // CreatureManager::spawnCreature(crc, type, x, z, y, parent) usually maps to world coordinates.
-        // Standard call: spawnCreature(hash, 0, x, z, y, 0) -> X, Z(North), Y(Height).
-        // So we should pass: x, y(North), z(Height).
+        // 3. Resolve Height
+        // SWGEmu standard: X (East/West), Z (North/South), Y (Altitude/Height)
+        // Your config: x, y (North), z (Height)
+        // So we pass: x, z (as height), y (as north) ? 
+        // NO: The standard spawnCreature takes (CRC, X, Z, Y, Parent).
+        // Where Z is usually North in 3D, but SWG uses Z as North and Y as Height.
+        // Wait, 'spawnCreature(crc, x, z, y)' -> X, Z(North), Y(Height).
         
-        info("DEBUG: Spawning " + fullTemplate + " on " + planet + " @ " + String::valueOf(x) + ", " + String::valueOf(y) + " (H:" + String::valueOf(z) + ")", true);
+        float finalZ = z; // Height
+        if (finalZ == 0 || finalZ < -10000 || finalZ > 10000) {
+            finalZ = zone->getHeight(x, y); 
+        }
 
-        CreatureObject* creature = creatureManager->spawnCreature(fullTemplate.hashCode(), 0, x, y, z, 0);
+        info("DEBUG: Spawning " + fullTemplate + " (CRC: " + String::valueOf(templateCRC) + ") @ " 
+             + String::valueOf(x) + ", " + String::valueOf(y) + " (H:" + String::valueOf(finalZ) + ")", true);
+
+        // 4. SPAWN CALL
+        // STANDARD CORE3 SIGNATURE: spawnCreature(uint32 templateCRC, float x, float z, float y, uint64 parentID = 0)
+        // Your previous code had 6 arguments (an extra 0 after hash). I have removed it.
+        // We pass: CRC, x, y (North), finalZ (Height), 0 (Parent)
+        
+        CreatureObject* creature = creatureManager->spawnCreature(templateCRC, x, y, finalZ, 0);
         
         if (creature == nullptr) {
-            error("DEBUG: Spawn Failed! Could not create object. Check template path: " + fullTemplate);
+            error("DEBUG: Spawn Failed! Object is null. Template might not exist in .tre files: " + fullTemplate);
             return;
         }
 
         AiAgent* agent = creature->asAiAgent();
         if (agent == nullptr) {
-             error("DEBUG: Spawned object is not an AiAgent. Check template type.");
+             error("DEBUG: Spawned object is not an AiAgent.");
              return;
         }
 
+        // 5. Setup Name and Controller
         try {
             NameManager* nm = zoneServer->getNameManager();
             if (nm != nullptr) {
@@ -225,9 +237,14 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
         Reference<SimPlayerController*> ctrl = nullptr;
 
         if (type == 1) { // PvP
+            // Check for stormtrooper specifically, else rebel
             bool isImp = (fullTemplate.contains("stormtrooper"));
+            
+            // Set Faction Status
             agent->setFactionStatus(FactionStatus::OVERT);
             agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE);
+            
+            // Create Controller
             ctrl = new SimPvPController(agent, isImp); 
         } else { // Miner
             agent->setFactionStatus(FactionStatus::ONLEAVE);
@@ -242,6 +259,7 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
         
         agent->activateAiBehavior(true);
         
+        // Schedule startup
         Core::getTaskManager()->scheduleTask([ctrl] () {
             ctrl->startSimLoop();
         }, "SimStartLambda", 10000); 
