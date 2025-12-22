@@ -1,6 +1,6 @@
 /*
  * SimPvPController.cpp
- * Combat Safety Update
+ * Combat Safety Update + Blackboard Location Fix
  */
 
 #include "SimPvPController.h"
@@ -12,6 +12,8 @@
 #include "server/zone/CloseObjectsVector.h"
 #include "server/zone/TreeEntry.h" 
 #include "templates/params/creature/ObjectFlag.h"
+// Include BlackboardData to handle the coordinate reads
+#include "server/zone/objects/creature/ai/bt/BlackboardData.h"
 
 SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerController(aiAgent) {
     isImperial = imperial;
@@ -26,13 +28,34 @@ SimPvPController::~SimPvPController() {
 void SimPvPController::startSimLoop() {
     if (agent == nullptr) return;
 
+    // 1. Faction Setup
     agent->setFaction(isImperial ? String("imperial").hashCode() : String("rebel").hashCode());
     agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE); 
     
-    spawnLocation = Vector3(4963.0f, -4892.0f, 3.0f);
-    hangoutLocation = Vector3(4807.0f, -4700.0f, 4.0f);
+    // 2. DYNAMIC LOCATIONS
+    // Spawn Location: Wherever we are right now (set by SimPlayerManager)
+    spawnLocation = agent->getWorldPosition();
 
-    Logger::console.info("SimPvP: Spawning at Shuttle. Moving to Starport.", true);
+    // Hangout Location: Read from the AI's memory (Blackboard)
+    try {
+        float hx = agent->readBlackboard("targetX");
+        float hy = agent->readBlackboard("targetY"); // North
+        float hz = agent->readBlackboard("targetZ"); // Height
+
+        // Safety Check: If Lua failed to pass coords, fallback to current spot (Bot will just loiter)
+        if (hx == 0 && hy == 0) {
+            Logger::console.info("SimPvP: WARNING - No Blackboard Coords found. Loitering at spawn.", true);
+            hangoutLocation = spawnLocation;
+        } else {
+            // Construct Vector3(X, North, Height) to match your previous hardcoded format
+            hangoutLocation = Vector3(hx, hy, hz);
+        }
+    } catch (...) {
+        Logger::console.error("SimPvP: Error reading blackboard coordinates. Defaulting to spawn.");
+        hangoutLocation = spawnLocation;
+    }
+
+    Logger::console.info("SimPvP: Loop Started. Spawn: " + spawnLocation.toString() + " -> Hangout: " + hangoutLocation.toString(), true);
     startPatrol();
 }
 

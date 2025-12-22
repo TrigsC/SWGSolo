@@ -36,7 +36,7 @@ public:
     void loadLuaConfig();
 
     // Helper to spawn a single bot (Now public so Lua/Methods can call it)
-    void spawnSimPlayer(const String& planet, float x, float y, float z, const String& templateName, int type);
+    void spawnSimPlayer(const String& planet, float x, float y, float z, float hx, float hy, float hz, const String& templateName, int type);
 
     void toggleBot(AiAgent* agent);
 };
