@@ -42,23 +42,29 @@ SimPlayerManagerConfig = {
         },
 
         -- SOLO PVP: Single hunters moving between spots
+        --{
+        --    type = "pvp_solo",
+        --    totalCount = 5,
+        --    templates = { "stormtrooper" },  --{ "stormtrooper", "rebel_trooper" },
+        --    faction = "imperial", -- or "imperial", "rebel" ," random"
+        --    behavior = "roam_solo"
+        --},
+
         {
             type = "pvp_solo",
             totalCount = 5,
-            templates = { "stormtrooper" },  --{ "stormtrooper", "rebel_trooper" },
-            faction = "imperial", -- or "imperial", "rebel" ," random"
-            behavior = "roam_solo"
-        },
+            templates = { "rebel_commando", "rebel_trooper" }
+        }
 
         -- SQUAD PVP: Groups of 3 that stick together
-        {
-            type = "pvp_squad",
-            totalCount = 3, -- This means 3 SQUADS (not 3 players)
-            squadSize = 3,  -- 3 players per squad
-            templates = { "stormtrooper" }, 
-            faction = "imperial", -- or "imperial", "rebel" ," random"
-            behavior = "roam_squad"
-        }
+        --{
+        --    type = "pvp_squad",
+        --    totalCount = 3, -- This means 3 SQUADS (not 3 players)
+        --    squadSize = 3,  -- 3 players per squad
+        --    templates = { "stormtrooper" }, 
+        --    faction = "imperial", -- or "imperial", "rebel" ," random"
+        --    behavior = "roam_squad"
+        --}
     }
 }
 
