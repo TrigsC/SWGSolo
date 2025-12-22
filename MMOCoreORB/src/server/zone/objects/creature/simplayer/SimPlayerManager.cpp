@@ -234,9 +234,12 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
         agent->setHomeLocation(x, finalZ, y, nullptr);
         agent->setDespawnOnNoPlayerInRange(false);
 
-        agent->writeBlackboard("targetX", hx);
-        agent->writeBlackboard("targetY", hy); // North
-        agent->writeBlackboard("targetZ", hz); // Height
+        // --- FIXED: WRITE AS STRINGS TO ENSURE SAFETY ---
+        agent->writeBlackboard("targetX", String::valueOf(hx));
+        agent->writeBlackboard("targetY", String::valueOf(hy)); // North
+        agent->writeBlackboard("targetZ", String::valueOf(hz)); // Height
+
+        info("DEBUG: Written Blackboard Dest: " + String::valueOf(hx) + ", " + String::valueOf(hy), true);
 
         Reference<SimPlayerController*> ctrl = nullptr;
 
