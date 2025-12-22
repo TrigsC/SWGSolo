@@ -1,6 +1,6 @@
 /*
  * SimPlayerManager.cpp
- * FIXED: Removed invalid isNil() call that caused build error.
+ * FIXED: Added safety checks and try/catch blocks to prevent loop crashes.
  */
 
 #include "SimPlayerManager.h"
@@ -39,6 +39,7 @@ void SimPlayerManager::initialize() {
 void SimPlayerManager::loadLuaConfig() {
     info("DEBUG: Attempting to run Lua file: scripts/managers/sim_player_manager.lua", true);
     
+    // Local struct definition
     struct LocationEntry {
         String planet;
         float x, y, z;          // Spawn Loc
@@ -109,7 +110,6 @@ void SimPlayerManager::loadLuaConfig() {
 
                             locationList.push_back(entry);
                         } else {
-                            // FIXED: Removed isNil() check. Just report invalid.
                             error("DEBUG: Entry #" + String::valueOf(j) + " (" + cityName + ") in " + String(pName) + " is invalid! Check 'spawn' table.");
                         }
                         spawn.pop();
@@ -140,24 +140,51 @@ void SimPlayerManager::loadLuaConfig() {
             int count = group.getIntField("totalCount");
             LuaObject templates = group.getObjectField("templates");
             
+            info("DEBUG: Processing Group " + String::valueOf(i) + " (" + type + ") Count: " + String::valueOf(count), true);
+
             for (int k = 0; k < count; ++k) {
-                if (locationList.empty()) break;
-                int locIndex = System::random(locationList.size());
-                LocationEntry loc = locationList.at(locIndex);
+                // Inner Try/Catch to prevent one failure from killing the loop
+                try {
+                    if (locationList.empty()) break;
+                    
+                    int locSize = locationList.size();
+                    int locIndex = System::random(locSize);
+                    
+                    if (locIndex < 0 || locIndex >= locSize) locIndex = 0; // Sanity check
+                    
+                    LocationEntry loc = locationList.at(locIndex);
 
-                String tmpl = "";
-                if (templates.isValidTable()) {
-                    int tSize = templates.getTableSize();
-                    if (tSize > 0) tmpl = templates.getStringAt(1 + System::random(tSize));
-                }
+                    String tmpl = "";
+                    if (templates.isValidTable()) {
+                        int tSize = templates.getTableSize();
+                        if (tSize > 0) {
+                            // Lua arrays are 1-based
+                            int randIdx = System::random(tSize); // 0 to size-1
+                            int luaIdx = 1 + randIdx;            // 1 to size
+                            
+                            // Extra safety check for Lua
+                            if (luaIdx > tSize) luaIdx = tSize;
+                            
+                            tmpl = templates.getStringAt(luaIdx);
+                        }
+                    }
 
-                if (tmpl.isEmpty()) continue;
+                    if (tmpl.isEmpty()) {
+                        error("DEBUG: Template list is empty or invalid for group " + String::valueOf(i));
+                        continue;
+                    }
 
-                if (type == "miner") {
-                    spawnSimPlayer(loc.planet, loc.x, loc.y, loc.z, loc.hx, loc.hy, loc.hz, tmpl, 0); 
-                } 
-                else if (type == "pvp_solo") {
-                    spawnSimPlayer(loc.planet, loc.x, loc.y, loc.z, loc.hx, loc.hy, loc.hz, tmpl, 1); 
+                    if (type == "miner") {
+                        spawnSimPlayer(loc.planet, loc.x, loc.y, loc.z, loc.hx, loc.hy, loc.hz, tmpl, 0); 
+                    } 
+                    else if (type == "pvp_solo") {
+                        spawnSimPlayer(loc.planet, loc.x, loc.y, loc.z, loc.hx, loc.hy, loc.hz, tmpl, 1); 
+                    }
+
+                } catch (Exception& e) {
+                    error("DEBUG: Error processing spawn loop #" + String::valueOf(k) + ": " + e.getMessage());
+                } catch (...) {
+                    error("DEBUG: Unknown error in spawn loop #" + String::valueOf(k));
                 }
             }
             templates.pop();
@@ -192,6 +219,7 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, fl
         float finalZ = z; 
         if (finalZ == 0 || finalZ < -10000 || finalZ > 10000) finalZ = zone->getHeight(x, y); 
 
+        // Spawn
         CreatureObject* creature = creatureManager->spawnCreature(iffCRC, x, finalZ, y, 0);
         if (creature == nullptr) return;
 
