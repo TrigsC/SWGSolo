@@ -1,8 +1,6 @@
 /*
  * SimPvPController.cpp
- * FIXED: 
- * 1. Added Random Offsets to destinations (Prevents collision stacking)
- * 2. Loosened "Stuck" tolerance (If stopped within 15m, force Arrival)
+ * FIXED: Z-Correction, 2D Distance Checks, and Life Timer
  */
 
 #include "SimPvPController.h"
@@ -16,8 +14,9 @@
 #include "templates/params/creature/ObjectFlag.h"
 #include "server/zone/objects/creature/ai/bt/BlackboardData.h"
 #include "system/lang/Float.h" 
-#include "system/lang/System.h" // Needed for random
+#include "system/lang/System.h" 
 #include "templates/params/creature/CreaturePosture.h"
+#include "server/zone/Zone.h"
 
 SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerController(aiAgent) {
     isImperial = imperial;
@@ -29,20 +28,40 @@ SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerC
 SimPvPController::~SimPvPController() {
 }
 
-// Helper to add random jitter to coordinates so bots don't stack on top of each other
+// ---------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------
 Vector3 SimPvPController::getJitteredPosition(Vector3 pos) {
     float offsetX = 5.0f - System::random(10); // +/- 5m
-    float offsetY = 5.0f - System::random(10); // +/- 5m
+    float offsetY = 5.0f - System::random(10); 
     
     Vector3 newPos = pos;
     newPos.setX(pos.getX() + offsetX);
-    newPos.setY(pos.getY() + offsetY); // Y is North in SWG 3D Vectors
+    newPos.setY(pos.getY() + offsetY); // Y is North/South in Vector3 logic here
+    
+    // Recalculate Z (Height) for the new randomized spot
+    newPos.setZ(getTerrainHeight(newPos.getX(), newPos.getY()));
     
     return newPos;
 }
 
+float SimPvPController::getTerrainHeight(float x, float y) {
+    if (agent == nullptr) return 0;
+    Zone* zone = agent->getZone();
+    if (zone == nullptr) return 0;
+    
+    // Core3 Zone expects x, y (North)
+    return zone->getHeight(x, y); 
+}
+
+// ---------------------------------------------------------
+// MAIN LOGIC
+// ---------------------------------------------------------
+
 void SimPvPController::startSimLoop() {
     if (agent == nullptr) return;
+
+    spawnTime.updateToCurrentTime(); // Start the clock
 
     agent->setFaction(isImperial ? String("imperial").hashCode() : String("rebel").hashCode());
     agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE); 
@@ -51,8 +70,8 @@ void SimPvPController::startSimLoop() {
 
     try {
         String sX = agent->readBlackboard("targetX").get<String>();
-        String sY = agent->readBlackboard("targetY").get<String>();
-        String sZ = agent->readBlackboard("targetZ").get<String>();
+        String sY = agent->readBlackboard("targetY").get<String>(); // North
+        String sZ = agent->readBlackboard("targetZ").get<String>(); // Height
 
         float hx = Float::valueOf(sX);
         float hy = Float::valueOf(sY); 
@@ -61,38 +80,40 @@ void SimPvPController::startSimLoop() {
         if (hx == 0 && hy == 0) {
             hangoutLocation = spawnLocation;
         } else {
-            hangoutLocation = Vector3(hx, hy, hz);
+            // Correct the Height (Z) from the terrain, ignore the Lua Z if it's bad
+            float correctZ = getTerrainHeight(hx, hy);
+            hangoutLocation = Vector3(hx, hy, correctZ);
         }
     } catch (...) {
         Logger::console.error("SimPvP: Blackboard read failed. Defaulting to spawn.");
         hangoutLocation = spawnLocation;
     }
 
-    Logger::console.info("SimPvP: Loop Started. Spawn: " + spawnLocation.toString() + " -> Hangout: " + hangoutLocation.toString(), true);
+    Logger::console.info("SimPvP: Loop Started.", true);
     startPatrol();
 }
 
 void SimPvPController::startPatrol() {
     state = SimPlayerController::MOVING;
     returningToShuttle = false;
-    // Move to Hangout with Offset
     moveTo(getJitteredPosition(hangoutLocation));
 }
 
 void SimPvPController::returnToShuttle() {
+    if (returningToShuttle) return; // Already going home
+
     state = SimPlayerController::MOVING;
     returningToShuttle = true;
-    Logger::console.info("SimPvP: Patrol done. Returning to Shuttle.", true);
+    Logger::console.info("SimPvP: Patrol done (or Timeout). Returning to Shuttle.", true);
     
     if (agent != nullptr) {
         agent->setPosture(CreaturePosture::UPRIGHT, true);
         agent->setRunSpeed(runSpeed);
     }
 
-    // Move to Spawn with Offset
     moveTo(getJitteredPosition(spawnLocation));
 
-    // Safety Timeout (5 Minutes)
+    // Force Despawn in 5 mins if they get stuck walking back
     Reference<SimPvPDespawnTask*> task = new SimPvPDespawnTask(this);
     task->schedule(300000); 
 }
@@ -134,32 +155,39 @@ void SimPvPController::despawn() {
 void SimPvPController::onTick() {
     if (agent == nullptr || agent->isDead()) return;
     
-    // 1. COMBAT CHECK
+    // 1. LIFE TIMER CHECK (The Fail-Safe)
+    // If bot has been alive > 10 minutes, force them to go home.
+    // This catches bots that got stuck fighting/walking for too long.
+    if (!returningToShuttle) {
+        Time now;
+        now.updateToCurrentTime();
+        if ((now.getMiliTime() - spawnTime.getMiliTime()) > 600000) { // 10 Minutes
+             Logger::console.info("SimPvP: Shift over (10m limit). Forcing return.", true);
+             returnToShuttle();
+             return;
+        }
+    }
+
+    // 2. COMBAT CHECK
     if (agent->isInCombat()) return; 
 
-    // 2. STUCK / COMBAT RECOVERY CHECK
+    // 3. STUCK / MOVEMENT CHECK
     if (state == SimPlayerController::MOVING) {
-        // If the engine has cleared our movement queue (PatrolPointSize == 0)
-        // But we are still in state MOVING...
         if (agent->getPatrolPointSize() == 0) {
              Vector3 dest = returningToShuttle ? spawnLocation : hangoutLocation;
              
-             // Check how far we are from the destination
-             float dist = agent->getWorldPosition().distanceTo(dest);
+             // 2D Distance Check (Ignore Z height differences)
+             float dx = agent->getWorldPosition().getX() - dest.getX();
+             float dy = agent->getWorldPosition().getY() - dest.getY(); // Y is North
+             float dist2d = sqrt((dx * dx) + (dy * dy));
              
-             // FIXED LOGIC:
-             // If we are VERY far (> 15m), we probably got interrupted by combat halfway. Re-issue move.
-             // If we are CLOSE (< 15m) but stopped, we are likely stuck on a rock or another bot. 
-             // Just accept it as "Arrived" to break the loop.
-             
-             if (dist > 15.0f) {
-                 Logger::console.info("SimPvP: Stopped far from target (" + String::valueOf(dist) + "m). Re-issuing move.", true);
+             // 15m tolerance
+             if (dist2d > 15.0f) {
+                 Logger::console.info("SimPvP: Stopped " + String::valueOf(dist2d) + "m from target. Re-issuing.", true);
                  agent->setPosture(CreaturePosture::UPRIGHT, true);
-                 
-                 // Re-issue with jitter to try and unstick
                  moveTo(getJitteredPosition(dest));
              } else {
-                 Logger::console.info("SimPvP: Stopped near target (" + String::valueOf(dist) + "m). Forcing Arrival.", true);
+                 Logger::console.info("SimPvP: Within tolerance (" + String::valueOf(dist2d) + "m). Arrived.", true);
                  onArrived();
              }
         }

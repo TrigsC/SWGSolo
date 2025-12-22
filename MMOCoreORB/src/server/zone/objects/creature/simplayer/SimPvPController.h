@@ -1,21 +1,25 @@
 /*
  * SimPvPController.h
- * FIXED: Added declaration for getJitteredPosition
+ * FIXED: Added missing getJitteredPosition declaration and spawnTime
  */
 
 #ifndef SIMPVPCONTROLLER_H_
 #define SIMPVPCONTROLLER_H_
 
 #include "SimPlayerController.h"
+#include "system/lang/Time.h" // Needed for Time
 
 class SimPvPController : public SimPlayerController {
     Vector3 spawnLocation;
     Vector3 hangoutLocation;
     bool returningToShuttle;
     bool isImperial;
+    Time spawnTime; // Tracks how long bot has been alive
 
-    // NEW: Helper for random offsets (Prevents build error)
+    // Helper to randomize destinations slightly
     Vector3 getJitteredPosition(Vector3 pos);
+    // Helper to get correct ground height
+    float getTerrainHeight(float x, float y);
 
 public:
     SimPvPController(AiAgent* aiAgent, bool imperial);
