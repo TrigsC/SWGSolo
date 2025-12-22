@@ -1,6 +1,9 @@
 /*
  * SimPvPController.cpp
- * FIXED: startSimLoop now preserves state on retries
+ * FIXED: 
+ * 1. Forced CreatureLocomotion::RUNNING to fix "Slow Boat".
+ * 2. Tightened onTick frequency to fix "Stutter" on long paths.
+ * 3. Added state clearing to ensure non-combat bots behave like post-combat bots.
  */
 
 #include "SimPvPController.h"
@@ -16,13 +19,14 @@
 #include "system/lang/Float.h" 
 #include "system/lang/System.h" 
 #include "templates/params/creature/CreaturePosture.h"
+#include "templates/params/creature/CreatureLocomotion.h" // NEW: Required for Locomotion
 #include "server/zone/Zone.h"
 #include "server/zone/managers/collision/CollisionManager.h" 
 
 SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerController(aiAgent) {
     isImperial = imperial;
     returningToShuttle = false;
-    initialized = false; // <--- INIT
+    initialized = false;
     runSpeed = 6.5f; 
     setLoggingName("SimPvPController");
 }
@@ -30,11 +34,9 @@ SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerC
 SimPvPController::~SimPvPController() {
 }
 
-// ... (Keep getJitteredPosition and getWorldZ the same) ...
 Vector3 SimPvPController::getJitteredPosition(Vector3 pos) {
-    Logger::console.info("SimPvP: getJitteredPosition called. Base Pos: " + pos.toString() + " | ReturningToShuttle: " + String::valueOf(returningToShuttle), true);
-
     float range = returningToShuttle ? 8.0f : 5.0f;
+    
     float offsetX = range - System::random((int)(range * 2)); 
     float offsetY = range - System::random((int)(range * 2)); 
     
@@ -43,7 +45,6 @@ Vector3 SimPvPController::getJitteredPosition(Vector3 pos) {
     newPos.setY(pos.getY() + offsetY); 
     newPos.setZ(getWorldZ(newPos.getX(), newPos.getY()));
     
-    Logger::console.info("SimPvP: Jitter Result -> " + newPos.toString(), true);
     return newPos;
 }
 
@@ -67,7 +68,6 @@ float SimPvPController::getWorldZ(float x, float y) {
 void SimPvPController::startSimLoop() {
     if (agent == nullptr) return;
 
-    // ONLY INITIALIZE ONCE
     if (!initialized) {
         spawnTime.updateToCurrentTime(); 
         nextMoveCheckTime.updateToCurrentTime(); 
@@ -76,7 +76,7 @@ void SimPvPController::startSimLoop() {
         agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE); 
         
         spawnLocation = agent->getWorldPosition();
-        Logger::console.info("SimPvP: INIT - Spawn Location: " + spawnLocation.toString(), true);
+        // Logger::console.info("SimPvP: INIT - Spawn Location: " + spawnLocation.toString(), true);
 
         try {
             String sX = agent->readBlackboard("targetX").get<String>();
@@ -89,11 +89,9 @@ void SimPvPController::startSimLoop() {
 
             if (hx == 0 && hy == 0) {
                 hangoutLocation = spawnLocation;
-                Logger::console.info("SimPvP: No Blackboard Targets. Hangout = Spawn.", true);
             } else {
                 float correctZ = getWorldZ(hx, hy);
                 hangoutLocation = Vector3(hx, hy, correctZ);
-                Logger::console.info("SimPvP: Calculated Hangout Location: " + hangoutLocation.toString(), true);
             }
         } catch (...) {
             Logger::console.error("SimPvP: Blackboard read failed. Defaulting to spawn.");
@@ -102,9 +100,6 @@ void SimPvPController::startSimLoop() {
         initialized = true;
     }
 
-    Logger::console.info("SimPvP: Loop Pulse. ReturningToShuttle: " + String::valueOf(returningToShuttle), true);
-
-    // CRITICAL FIX: If we were already going home, keep going home!
     if (returningToShuttle) {
         returnToShuttle();
     } else {
@@ -115,34 +110,43 @@ void SimPvPController::startSimLoop() {
 void SimPvPController::startPatrol() {
     state = SimPlayerController::MOVING;
     returningToShuttle = false;
-    Logger::console.info("SimPvP: Starting Patrol. Moving to Hangout.", true); 
+    
+    // Force running state for patrol too
+    if (agent != nullptr) {
+        agent->setRunSpeed(runSpeed);
+        agent->setLocomotion(CreatureLocomotion::RUNNING);
+    }
+    
+    Logger::console.info("SimPvP: Starting Patrol.", true); 
     moveTo(getJitteredPosition(hangoutLocation));
 }
 
 void SimPvPController::returnToShuttle() {
-    // If we are called recursively or from loop, ensure flags are set
     state = SimPlayerController::MOVING;
     returningToShuttle = true; 
     
-    Logger::console.info("SimPvP: Return Logic. Dest: " + spawnLocation.toString(), true);
+    Logger::console.info("SimPvP: Return Logic Triggered.", true);
     
     if (agent != nullptr) {
+        // MIMIC COMBAT RESET
+        agent->clearCombatState(true); 
+        agent->setCreatureBitmask(0); 
+        
+        // FORCE MOVEMENT PHYSICS
         agent->setPosture(CreaturePosture::UPRIGHT, true);
         agent->setRunSpeed(runSpeed);
-        agent->setCreatureBitmask(0); 
+        agent->setLocomotion(CreatureLocomotion::RUNNING); // <--- CRITICAL FIX
     }
 
     Vector3 dest = getJitteredPosition(spawnLocation); 
     moveTo(dest);
 
-    // Only schedule despawn task if this is the first time we triggered return
-    // (Optional optimization, but safe to reschedule)
     Reference<SimPvPDespawnTask*> task = new SimPvPDespawnTask(this);
     task->schedule(300000); 
 }
 
 void SimPvPController::onArrived() {
-    Logger::console.info("SimPvP: onArrived Triggered. ReturningToShuttle: " + String::valueOf(returningToShuttle), true); 
+    // Logger::console.info("SimPvP: onArrived Triggered. Returning: " + String::valueOf(returningToShuttle), true); 
     if (returningToShuttle) {
         despawn();
     } else {
@@ -152,7 +156,7 @@ void SimPvPController::onArrived() {
 
 void SimPvPController::startLoitering() {
     state = SimPlayerController::WAITING;
-    Logger::console.info("SimPvP: Arrived at Starport. Scanning area for 30s...", true);
+    // Logger::console.info("SimPvP: Arrived at hangout. Loitering...", true);
     
     if (agent != nullptr) agent->doAnimation("look_around");
 
@@ -167,7 +171,7 @@ void SimPvPController::finishLoitering() {
         task->schedule(5000);
         return;
     }
-    Logger::console.info("SimPvP: Loitering finished. Calling returnToShuttle().", true); 
+    // Logger::console.info("SimPvP: Loitering finished. Return Time.", true); 
     returnToShuttle();
 }
 
@@ -180,6 +184,7 @@ void SimPvPController::despawn() {
 void SimPvPController::onTick() {
     if (agent == nullptr || agent->isDead()) return;
     
+    // 1. LIFE TIMER CHECK
     if (!returningToShuttle) {
         Time now;
         now.updateToCurrentTime();
@@ -192,12 +197,16 @@ void SimPvPController::onTick() {
 
     if (agent->isInCombat()) return; 
 
+    // 2. MOVEMENT CHECK
     if (state == SimPlayerController::MOVING) {
+        
         Time now;
         now.updateToCurrentTime();
         
+        // FIX: Check more frequently (every 1s) to prevent stutter between path nodes
         if (now.getMiliTime() >= nextMoveCheckTime.getMiliTime()) {
             
+            // If the queue is empty, we either arrived OR the path ended early
             if (agent->getPatrolPointSize() == 0) {
                  Vector3 dest = returningToShuttle ? spawnLocation : hangoutLocation;
                  
@@ -205,32 +214,38 @@ void SimPvPController::onTick() {
                  float dy = agent->getWorldPosition().getY() - dest.getY(); 
                  float dist2d = sqrt((dx * dx) + (dy * dy));
                  
-                 if (returningToShuttle) {
-                     Logger::console.info("SimPvP: Returning Tick. Dist: " + String::valueOf(dist2d), true);
-                 }
+                 // Logger::console.info("SimPvP: Check Tick. Dist: " + String::valueOf(dist2d), true);
 
                  if (dist2d > 15.0f) {
-                     Logger::console.info("SimPvP: Stuck " + String::valueOf(dist2d) + "m from target. Re-issuing.", true);
+                     // Path ended but we are far away (Partial Path generated)
+                     // Re-issue immediately to avoid stutter
                      agent->setPosture(CreaturePosture::UPRIGHT, true);
+                     agent->setLocomotion(CreatureLocomotion::RUNNING); // Enforce run state again
                      moveTo(getJitteredPosition(dest));
                      
+                     // Short delay for next check to allow path generation
                      nextMoveCheckTime.updateToCurrentTime();
-                     nextMoveCheckTime.addMiliTime(3000);
+                     nextMoveCheckTime.addMiliTime(1000); 
                  } else {
                      Logger::console.info("SimPvP: Within tolerance. Arrived.", true);
                      onArrived();
                  }
+            } else {
+                // We are still moving, check again in 1s just in case
+                nextMoveCheckTime.updateToCurrentTime();
+                nextMoveCheckTime.addMiliTime(1000); 
             }
         }
     }
 
     scanForTargets();
 }
-// ... (scanForTargets remains the same) ...
+
 void SimPvPController::scanForTargets() {
     Zone* zone = agent->getZone();
     if (zone == nullptr) return;
 
+    // Throttle scanning to save CPU? (Optional, kept original logic for now)
     CloseObjectsVector* vec = (CloseObjectsVector*) agent->getCloseObjects();
     if (vec == nullptr) return;
 
