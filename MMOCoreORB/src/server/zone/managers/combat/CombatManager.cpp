@@ -1962,11 +1962,11 @@ int CombatManager::getAttackerAccuracyModifier(TangibleObject* attacker, Creatur
                 aiAccuracy += agent->getSkillMod("ranged_accuracy");
 
 			// --- LOGGING START ---
-            StringBuffer msg;
-            msg << "DEBUG COMBAT: Attacker " << attacker->getDisplayedName() 
-                << " Total Accuracy: " << aiAccuracy 
-                << " (Should be Base + WeaponSkill)";
-            agent->info(msg.toString(), true);
+            //StringBuffer msg;
+            //msg << "DEBUG COMBAT: Attacker " << attacker->getDisplayedName() 
+            //    << " Total Accuracy: " << aiAccuracy 
+            //    << " (Should be Base + WeaponSkill)";
+            //agent->info(msg.toString(), true);
             // --- LOGGING END ---
                 
             return aiAccuracy;
@@ -2039,19 +2039,19 @@ int CombatManager::getDefenderDefenseModifier(CreatureObject* defender, WeaponOb
 
 	const auto defenseAccMods = weapon->getDefenderDefenseModifiers();
 
-	if (defender->isAiAgent()) {
-        StringBuffer msg;
-        msg << "DEBUG WEAPON CHECK: Attacker's weapon has " << defenseAccMods->size() << " modifiers.";
-        if (defenseAccMods->size() > 0) {
-            msg << " It will ask for: ";
-            for (int i = 0; i < defenseAccMods->size(); ++i) {
-                msg << defenseAccMods->get(i) << " ";
-            }
-        } else {
-            msg << " (The AI will receive NO bonus defense because the list is empty)";
-        }
-        info(msg.toString(), true);
-    }
+	//if (defender->isAiAgent()) {
+    //    //StringBuffer msg;
+    //    //msg << "DEBUG WEAPON CHECK: Attacker's weapon has " << defenseAccMods->size() << " modifiers.";
+    //    if (defenseAccMods->size() > 0) {
+    //        //msg << " It will ask for: ";
+    //        for (int i = 0; i < defenseAccMods->size(); ++i) {
+    //            msg << defenseAccMods->get(i) << " ";
+    //        }
+    //    } else {
+    //        msg << " (The AI will receive NO bonus defense because the list is empty)";
+    //    }
+    //    //info(msg.toString(), true);
+    //}
 
 	for (int i = 0; i < defenseAccMods->size(); ++i) {
         const String& mod = defenseAccMods->get(i);
@@ -2091,9 +2091,9 @@ int CombatManager::getDefenderDefenseModifier(CreatureObject* defender, WeaponOb
     }
 
 	debug() << "Target defense after state affects and cap is " << targetDefense;
-	StringBuffer msg;
-	msg << "DEBUG AI DEFENSE: " << defender->getFirstName() << " checking targetDefense " << targetDefense;
-	info(msg.toString(), true);
+	//StringBuffer msg;
+	//msg << "DEBUG AI DEFENSE: " << defender->getFirstName() << " checking targetDefense " << targetDefense;
+	//info(msg.toString(), true);
 
 	return targetDefense;
 }
@@ -2140,9 +2140,9 @@ int CombatManager::getDefenderSecondaryDefenseModifier(CreatureObject* defender)
     }
     // ----------------------------
 
-    StringBuffer msg;
-    msg << "DEBUG AI SECONDARY DEFENSE: " << defender->getFirstName() << " checking defenderDefense " << targetDefense;
-    info(msg.toString(), true);
+    //StringBuffer msg;
+    //msg << "DEBUG AI SECONDARY DEFENSE: " << defender->getFirstName() << " checking defenderDefense " << targetDefense;
+    //info(msg.toString(), true);
 
     if (targetDefense > 125)
         targetDefense = 125;
