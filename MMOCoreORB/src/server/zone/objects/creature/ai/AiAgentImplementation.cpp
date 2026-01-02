@@ -545,14 +545,14 @@ void AiAgentImplementation::reloadTemplate() {
 int AiAgentImplementation::getSkillMod(const String& skillMod) const {
     // 1. Check standard game buffs first
     int baseMod = CreatureObjectImplementation::getSkillMod(skillMod);
-	StringBuffer msg;
-    msg << "DEBUG AI DEFENSE: " << getFirstName() << " checking baseMod " << baseMod;
-	info(msg.toString(), true);
-    if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "saber_block") {
-         StringBuffer msg;
-         msg << "DEBUG INCOMING ATTACK: Engine asking AI for " << skillMod << ". Base is " << baseMod;
-         info(msg.toString(), true);
-    }
+	//StringBuffer msg;
+    //msg << "DEBUG AI DEFENSE: " << getFirstName() << " checking baseMod " << baseMod;
+	//info(msg.toString(), true);
+    //if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "saber_block") {
+    //     StringBuffer msg;
+    //     msg << "DEBUG INCOMING ATTACK: Engine asking AI for " << skillMod << ". Base is " << baseMod;
+    //     info(msg.toString(), true);
+    //}
 
     // 2. If base is 0, check our Lua "brain"
     if (baseMod == 0 && npcTemplate != nullptr) {
@@ -561,16 +561,16 @@ int AiAgentImplementation::getSkillMod(const String& skillMod) const {
         
         // --- LOGGING & RETURN LUA VALUE ---
         if (templateMod > 0) { 
-            StringBuffer msg;
-            msg << "DEBUG AI DEFENSE: " << getFirstName() << " checking " << skillMod 
-                << " -> Lua says: " << templateMod;
+            //StringBuffer msg;
+            //msg << "DEBUG AI DEFENSE: " << getFirstName() << " checking " << skillMod 
+            //    << " -> Lua says: " << templateMod;
             
             // If it's a primary defense, remind us that Level is added automatically
-            if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "melee_defense" || skillMod == "ranged_defense" || skillMod == "jedi_toughness" || skillMod == "lightsaber_toughness") {
-                msg << " (Total Defense will be " << getLevel() << " + " << templateMod << ")";
-            }
+            //if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "melee_defense" || skillMod == "ranged_defense" || skillMod == "jedi_toughness" || skillMod == "lightsaber_toughness") {
+            //    msg << " (Total Defense will be " << getLevel() << " + " << templateMod << ")";
+            //}
             
-            info(msg.toString(), true); 
+            //info(msg.toString(), true); 
             return templateMod;
         } 
 
@@ -592,10 +592,10 @@ int AiAgentImplementation::getSkillMod(const String& skillMod) const {
         if ((skillMod == "dodge_attack" || skillMod == "block") && getLevel() > 80) {
             
             // --- ADD LOGGING HERE ---
-            StringBuffer msg;
-            msg << "DEBUG AI DEFENSE: " << getFirstName() << " using FALLBACK for " << skillMod 
-                << " -> Returning 20 (Total Defense will be " << getLevel() << " + 20)";
-            info(msg.toString(), true);
+            //StringBuffer msg;
+            //msg << "DEBUG AI DEFENSE: " << getFirstName() << " using FALLBACK for " << skillMod 
+            //    << " -> Returning 20 (Total Defense will be " << getLevel() << " + 20)";
+            //info(msg.toString(), true);
             // ------------------------
 
             return 20; // Adds 20 to their base Level defense
@@ -658,9 +658,9 @@ void AiAgentImplementation::doForceRegen() {
     setCurrentForce(newForce);
 
     // --- LOGGING (Remove this later if it spams too much) ---
-    StringBuffer msg;
-    msg << "AI Force Regen: +" << regenAmount << " (" << newForce << "/" << maxForcePoints << ")";
-    info(msg.toString(), true);
+    //StringBuffer msg;
+    //msg << "AI Force Regen: +" << regenAmount << " (" << newForce << "/" << maxForcePoints << ")";
+    //info(msg.toString(), true);
 
     // --- RESCHEDULE ---
     // Run again in 2 seconds
@@ -3077,11 +3077,11 @@ void AiAgentImplementation::healCreatureTarget(CreatureObject* healTarget) {
 
 if (healerType == STRING_HASHCODE("force")) {
         // --- LOGGING START ---
-        StringBuffer logMsg;
-        logMsg << "AI Force Heal Triggered. Current Force: " << getCurrentForce() 
-               << " / " << getMaxForce() 
-               << " - Cost: " << forceCost;
-        info(logMsg.toString(), true); // 'true' forces this to print to the console
+        //StringBuffer logMsg;
+        //logMsg << "AI Force Heal Triggered. Current Force: " << getCurrentForce() 
+        //       << " / " << getMaxForce() 
+        //       << " - Cost: " << forceCost;
+        //info(logMsg.toString(), true); // 'true' forces this to print to the console
         // --- LOGGING END ---
 
         // Deduct the Force
@@ -3089,7 +3089,7 @@ if (healerType == STRING_HASHCODE("force")) {
         setCurrentForce(newForce < 0 ? 0 : newForce); 
 
         // Optional: Confirm new total
-        info("AI Force remaining: " + String::valueOf(newForce), true);
+        //info("AI Force remaining: " + String::valueOf(newForce), true);
     } else {
         // Deduct Mind for medics
         int mindCost = 100;
@@ -3871,7 +3871,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     updateCurrentPosition(&nextStepPosition);
 
     if (isPet()) updatePetSwimmingState();
-    //if (isSimPlayer) info("findNextPosition - complete returning true", true);
+    if (isSimPlayer) info("findNextPosition - complete returning true", true);
 
     return true;
 }
@@ -4166,7 +4166,7 @@ bool AiAgentImplementation::generatePatrol(int num, float dist) {
 		}
 	}
 
-	// info(true) << "ID: " << getObjectID() << " Finished - generatePatrol with a state of " << getMovementState() << " and point size of = " << getPatrolPointSize();
+	info(true) << "ID: " << getObjectID() << " Finished - generatePatrol with a state of " << getMovementState() << " and point size of = " << getPatrolPointSize();
 
 	if (getPatrolPointSize() > 0)
 		return true;
@@ -4277,8 +4277,8 @@ int AiAgentImplementation::setDestination() {
 	ManagedReference<SceneObject*> followCopy = getFollowObject().get();
 	unsigned int stateCopy = getMovementState();
 
-	// info(true) << getDisplayedName() << " - ID: " << getObjectID() << "  setDestination - stateCopy: " << stateCopy << "  Patrol Point Size:" << getPatrolPointSize();
-	// info("homeLocation: " + homeLocation.toString(), true);
+	//info(true) << getDisplayedName() << " - ID: " << getObjectID() << "  setDestination - stateCopy: " << stateCopy << "  Patrol Point Size:" << getPatrolPointSize();
+	//info("homeLocation: " + homeLocation.toString(), true);
 
 	if (patrolPoints.size() > 20) {
 		//info() << getObjectID() << " Patrol points have overflowed - Total points: " << patrolPoints.size() << " Movement State: " << stateCopy << " Saved Patrol point size: " << savedPatrolPoints.size();

@@ -1,6 +1,6 @@
 /*
  * SimPlayerManager.cpp
- * FIXED: Corrected Lua Stack Order (Fixes Hangout Coordinates)
+ * Fixed Attackable Flags
  */
 
 #include "SimPlayerManager.h"
@@ -13,252 +13,56 @@
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h" 
 #include "templates/params/creature/ObjectFlag.h" 
-#include "server/zone/managers/name/NameManager.h" 
-#include "server/zone/objects/player/FactionStatus.h" 
-#include "server/zone/managers/director/DirectorManager.h" 
-#include <vector>
 
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
-    lua = new Lua();
-    lua->init();
 }
 
 SimPlayerManager::~SimPlayerManager() {
-    if (lua != nullptr) {
-        delete lua;
-        lua = nullptr;
-    }
 }
 
 void SimPlayerManager::initialize() {
     info("Initializing SimPlayer Manager...", true);
-    loadLuaConfig();
-}
-
-void SimPlayerManager::loadLuaConfig() {
-    info("DEBUG: Attempting to run Lua file: scripts/managers/sim_player_manager.lua", true);
     
-    struct LocationEntry {
-        String planet;
-        float x, y, z;          // Spawn Loc
-        float hx, hy, hz;       // Hangout Loc
-    };
+    // 1. Miner (Jedi Visual)
+    //spawnSimPlayer("naboo", 4714.0f, -4939.0f, "light_jedi_sentinel");
 
-    try {
-        lua->runFile("scripts/managers/sim_player_manager.lua");
-    } catch (Exception& e) {
-        error("DEBUG: CRITICAL LUA ERROR: " + e.getMessage());
-        return;
-    }
+    // 2. Miner (Artisan Visual)
+    //spawnSimPlayer("naboo", 4720.0f, -4945.0f, "artisan");
 
-    LuaObject config = lua->getGlobalObject("SimPlayerManagerConfig");
-    if (!config.isValidTable()) {
-        error("DEBUG: 'SimPlayerManagerConfig' table NOT found!");
-        return;
-    }
-
-    bool enabled = config.getBooleanField("enabled");
-    if (!enabled) return;
-
-    std::vector<LocationEntry> locationList; 
-
-    // --- LOAD SHUTTLEPORTS ---
-    LuaObject shuttles = config.getObjectField("shuttleports");
-    if (shuttles.isValidTable()) {
-        const char* planets[] = {"naboo", "tatooine", "corellia", "dantooine", "talus", "rori", "lok", "yavin4", "endor", "dathomir"};
-        
-        for (const char* pName : planets) {
-            LuaObject planetTable = shuttles.getObjectField(pName);
-            
-            if (planetTable.isValidTable()) {
-                int cityCount = planetTable.getTableSize();
-                info("DEBUG: Found " + String::valueOf(cityCount) + " entries for planet: " + String(pName), true);
-                
-                for (int j = 1; j <= cityCount; ++j) {
-                    LuaObject city = planetTable.getObjectAt(j);
-                    
-                    if (city.isValidTable()) {
-                        String cityName = city.getStringField("name");
-                        if (cityName.isEmpty()) cityName = "Unknown/Unnamed";
-                        
-                        LocationEntry entry;
-                        entry.planet = pName;
-                        bool validSpawn = false;
-
-                        // 1. READ SPAWN (Then POP it immediately to clear stack)
-                        LuaObject spawn = city.getObjectField("spawn");
-                        if (spawn.isValidTable()) {
-                            entry.x = spawn.getFloatAt(1);
-                            entry.y = spawn.getFloatAt(2); 
-                            entry.z = spawn.getFloatAt(3); 
-                            validSpawn = true;
-                        } else {
-                            error("DEBUG: Entry #" + String::valueOf(j) + " (" + cityName + ") in " + String(pName) + " is invalid! Check 'spawn' table.");
-                        }
-                        spawn.pop(); // CRITICAL: Pop before reading next field
-
-                        // 2. READ HANGOUT (Now 'city' is top of stack again)
-                        if (validSpawn) {
-                            LuaObject hangout = city.getObjectField("hangout");
-                            if (hangout.isValidTable()) {
-                                entry.hx = hangout.getFloatAt(1);
-                                entry.hy = hangout.getFloatAt(2); 
-                                entry.hz = hangout.getFloatAt(3);
-                                // info("DEBUG: Loaded Hangout for " + cityName + ": " + String::valueOf(entry.hx) + "," + String::valueOf(entry.hy), true);
-                            } else {
-                                // Fallback: Hangout = Spawn
-                                info("DEBUG: No 'hangout' table found for " + cityName + ". Defaulting to spawn.", true);
-                                entry.hx = entry.x;
-                                entry.hy = entry.y;
-                                entry.hz = entry.z;
-                            }
-                            hangout.pop(); // Pop hangout
-
-                            locationList.push_back(entry);
-                        }
-                    }
-                    city.pop();
-                }
-            }
-            planetTable.pop();
-        }
-    }
-    shuttles.pop();
-
-    if (locationList.empty()) {
-        error("DEBUG: ABORTING - No valid spawn locations found.");
-        return;
-    }
-
-    info("DEBUG: Successfully loaded " + String::valueOf(locationList.size()) + " spawn locations.", true);
-
-    // --- PROCESS GROUPS ---
-    LuaObject groups = config.getObjectField("spawnGroups");
-    if (groups.isValidTable()) {
-        int groupCount = groups.getTableSize();
-        
-        for (int i = 1; i <= groupCount; ++i) {
-            LuaObject group = groups.getObjectAt(i);
-            String type = group.getStringField("type");
-            int count = group.getIntField("totalCount");
-            LuaObject templates = group.getObjectField("templates");
-            
-            info("DEBUG: Processing Group " + String::valueOf(i) + " (" + type + ") Count: " + String::valueOf(count), true);
-
-            for (int k = 0; k < count; ++k) {
-                try {
-                    if (locationList.empty()) break;
-                    
-                    int locSize = locationList.size();
-                    int locIndex = System::random(locSize);
-                    if (locIndex < 0 || locIndex >= locSize) locIndex = 0;
-                    
-                    LocationEntry loc = locationList.at(locIndex);
-
-                    String tmpl = "";
-                    if (templates.isValidTable()) {
-                        int tSize = templates.getTableSize();
-                        if (tSize > 0) {
-                            int randIdx = System::random(tSize); 
-                            int luaIdx = 1 + randIdx;            
-                            if (luaIdx > tSize) luaIdx = tSize;
-                            tmpl = templates.getStringAt(luaIdx);
-                        }
-                    }
-
-                    if (tmpl.isEmpty()) {
-                        error("DEBUG: Template list is empty or invalid for group " + String::valueOf(i));
-                        continue;
-                    }
-
-                    spawnSimPlayer(loc.planet, loc.x, loc.y, loc.z, loc.hx, loc.hy, loc.hz, tmpl, (type == "miner" ? 0 : 1)); 
-
-                } catch (Exception& e) {
-                    error("DEBUG: Error processing spawn loop #" + String::valueOf(k) + ": " + e.getMessage());
-                } catch (...) {
-                    error("DEBUG: Unknown error in spawn loop #" + String::valueOf(k));
-                }
-            }
-            templates.pop();
-            group.pop();
-        }
-    }
-    groups.pop();
+    // 3. PvP Bot (Stormtrooper)
+    spawnSimPlayer("naboo", 4963.0f, -4892.0f, "stormtrooper");
 }
 
-void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, float z, float hx, float hy, float hz, const String& templateName, int type) {
-    try {
-        ZoneServer* zoneServer = ServerCore::getZoneServer();
-        if (zoneServer == nullptr) return;
+void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, const String& templateName) {
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    if (zoneServer == nullptr) return;
 
-        Zone* zone = zoneServer->getZone(planet);
-        if (zone == nullptr) return;
-
-        CreatureManager* creatureManager = zone->getCreatureManager();
-        if (creatureManager == nullptr) return;
-
-        uint32 templateCRC = templateName.hashCode();
-        CreatureTemplate* tmpl = CreatureTemplateManager::instance()->getTemplate(templateCRC);
-
-        if (tmpl == nullptr || tmpl->getTemplates().size() == 0) {
-            error("DEBUG: Template failure: " + templateName);
-            return;
-        }
-
-        String iffPath = tmpl->getTemplates().get(0);
-        uint32 iffCRC = iffPath.hashCode();
-
-        float finalZ = z; 
-        if (finalZ == 0 || finalZ < -10000 || finalZ > 10000) finalZ = zone->getHeight(x, y); 
-
-        // Spawn
-        CreatureObject* creature = creatureManager->spawnCreature(iffCRC, x, finalZ, y, 0);
-        if (creature == nullptr) return;
-
-        AiAgent* agent = creature->asAiAgent();
-        if (agent == nullptr) return;
-
-        Locker lock(agent);
-        agent->loadTemplateData(tmpl);
-        agent->setRunSpeed(5.0f); 
-        for (int i=0; i<9; ++i) agent->setHAM(i, agent->getMaxHAM(i));
-        
-        agent->setHomeLocation(x, finalZ, y, nullptr);
-        agent->setDespawnOnNoPlayerInRange(false);
-
-        // WRITE AS STRINGS TO ENSURE SAFETY
-        agent->writeBlackboard("targetX", String::valueOf(hx));
-        agent->writeBlackboard("targetY", String::valueOf(hy)); // North
-        agent->writeBlackboard("targetZ", String::valueOf(hz)); // Height
-
-        info("DEBUG: Spawning " + templateName + " -> Spawn: " + String::valueOf(x) + "," + String::valueOf(y) + " | Hangout: " + String::valueOf(hx) + "," + String::valueOf(hy), true);
-
-        Reference<SimPlayerController*> ctrl = nullptr;
-
-        if (type == 1) { 
-            bool isImp = (templateName.contains("stormtrooper") || templateName.contains("imperial"));
-            agent->setFactionStatus(FactionStatus::OVERT);
-            agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE);
-            ctrl = new SimPvPController(agent, isImp); 
-        } else { 
-            agent->setFactionStatus(FactionStatus::ONLEAVE);
-            agent->setPvpStatusBitmask(0); 
-            ctrl = new SimMinerController(agent);
-        }
-
-        if (controllers.contains(agent->getObjectID())) controllers.drop(agent->getObjectID());
-        controllers.put(agent->getObjectID(), ctrl);
-        
-        agent->activateAiBehavior(true);
-        
-        Core::getTaskManager()->scheduleTask([ctrl] () {
-            ctrl->startSimLoop();
-        }, "SimStartLambda", 10000); 
-
-    } catch (Exception& e) {
-        error("DEBUG: Exception in spawnSimPlayer: " + e.getMessage());
+    Zone* zone = zoneServer->getZone(planet);
+    if (zone == nullptr) {
+        error("Could not find zone: " + planet);
+        return;
     }
+
+    CreatureManager* creatureManager = zone->getCreatureManager();
+    if (creatureManager == nullptr) return;
+
+    float z = zone->getHeight(x, y); 
+
+    CreatureObject* creature = creatureManager->spawnCreature(templateName.hashCode(), 0, x, z, y, 0);
+    if (creature == nullptr) {
+        error("Failed to spawn SimPlayer template: " + templateName);
+        return;
+    }
+
+    AiAgent* agent = creature->asAiAgent();
+    if (agent == nullptr) return;
+
+    // Reset default flags to clean slate
+    agent->setCreatureBitmask(0); 
+    agent->setDespawnOnNoPlayerInRange(false);
+
+    toggleBot(agent);
 }
 
 void SimPlayerManager::toggleBot(AiAgent* agent) {
@@ -294,20 +98,25 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         String tName = (tmpl != nullptr) ? tmpl->getTemplateName() : "";
 
         if (tName == "stormtrooper") {
+             // PvP Bot: Make Attackable + Overt
+             // Note: Controller will enforce Overt, but we set Attackable here to be safe
+             agent->setPvpStatusBitmask(ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
              ctrl = new SimPvPController(agent, true); 
         } 
         else if (tName == "rebel_trooper") {
+             // PvP Bot: Make Attackable + Overt
+             agent->setPvpStatusBitmask(ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
              ctrl = new SimPvPController(agent, false);
         }
         else {
+             // Miner: Make Neutral/Unattackable (0 removes ATTACKABLE flag)
+             agent->setPvpStatusBitmask(0); 
              ctrl = new SimMinerController(agent);
         }
 
         controllers.put(oid, ctrl);
+        
         agent->activateAiBehavior(true);
-
-        Core::getTaskManager()->scheduleTask([ctrl] () {
-            ctrl->startSimLoop();
-        }, "SimStartLambda", 10000); 
+        ctrl->startSimLoop();
     }
 }
