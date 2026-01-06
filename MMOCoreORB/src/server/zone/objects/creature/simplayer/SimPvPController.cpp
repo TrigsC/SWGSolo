@@ -1,140 +1,291 @@
 /*
  * SimPvPController.cpp
- * Combat Safety Update
+ * Combat Safety Update + Cycle-to-next-stop
  */
 
 #include "SimPvPController.h"
+#include "SimPlayerManager.h"
+
 #include "engine/core/Core.h"
 #include "server/zone/objects/creature/CreatureObject.h"
-#include "server/zone/objects/player/PlayerObject.h"
-#include "server/zone/managers/faction/FactionManager.h"
-#include "server/zone/objects/area/ActiveArea.h"
+#include "server/zone/objects/creature/ai/CreatureTemplate.h"
 #include "server/zone/CloseObjectsVector.h"
-#include "server/zone/TreeEntry.h" 
+#include "server/zone/TreeEntry.h"
 #include "templates/params/creature/ObjectFlag.h"
 
-SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial) : SimPlayerController(aiAgent) {
-    isImperial = imperial;
-    returningToShuttle = false;
-    runSpeed = 6.5f; 
-    setLoggingName("SimPvPController");
+#include "system/lang/System.h"
+
+// ------------------------------------------------------
+// Task
+// ------------------------------------------------------
+SimPvPBehaviorTask::SimPvPBehaviorTask(SimPvPController* ctrl)
+	: controller(ctrl) {
+}
+
+void SimPvPBehaviorTask::run() {
+	Reference<SimPvPController*> strongRef = controller.get();
+	if (strongRef == nullptr)
+		return;
+
+	Core::getTaskManager()->executeTask([strongRef]() {
+		strongRef->finishLoitering();
+	}, "SimPvPLoiterLambda");
+}
+
+// ------------------------------------------------------
+// Controller
+// ------------------------------------------------------
+SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial)
+	: SimPlayerController(aiAgent) {
+	isImperial = imperial;
+	returningToShuttle = false;
+	cycleRequested = false;
+
+	runSpeed = 4.5f;
+	setLoggingName("SimPvPController");
+
+	// Default route (original behavior)
+	spawnLocation = Vector3(4963.0f, -4892.0f, 3.0f);
+	hangoutLocation = Vector3(4807.0f, -4700.0f, 4.0f);
+}
+
+SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial, const Vector3& spawnLoc, const Vector3& hangoutLoc)
+	: SimPvPController(aiAgent, imperial) {
+	setRoute(spawnLoc, hangoutLoc);
 }
 
 SimPvPController::~SimPvPController() {
 }
 
+void SimPvPController::setRoute(const Vector3& spawnLoc, const Vector3& hangoutLoc) {
+	spawnLocation = spawnLoc;
+	hangoutLocation = hangoutLoc;
+}
+
+void SimPvPController::setCycleContext(SimPlayerManager* mgr,
+                                       const String& tmpl,
+                                       const String& grpType,
+                                       const String& planetName,
+                                       const String& locName) {
+	manager = mgr;
+	templateName = tmpl;
+	groupType = grpType;
+	planet = planetName;
+	locationName = locName;
+}
+
 void SimPvPController::startSimLoop() {
-    if (agent == nullptr) return;
+	if (agent == nullptr)
+		return;
 
-    agent->setFaction(isImperial ? String("imperial").hashCode() : String("rebel").hashCode());
-    agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE); 
-    
-    spawnLocation = Vector3(4963.0f, -4892.0f, 3.0f);
-    hangoutLocation = Vector3(4807.0f, -4700.0f, 4.0f);
+	agent->setFaction(isImperial ? String("imperial").hashCode() : String("rebel").hashCode());
+	agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE);
 
-    Logger::console.info("SimPvP: Spawning at Shuttle. Moving to Starport.", true);
-    startPatrol();
+	Logger::console.info("SimPvP: Spawning at Shuttle. Moving to hangout.", true);
+	startPatrol();
 }
 
 void SimPvPController::startPatrol() {
-    state = SimPlayerController::MOVING;
-    returningToShuttle = false;
-    moveTo(hangoutLocation);
+	state = SimPlayerController::MOVING;
+	returningToShuttle = false;
+	moveTo(hangoutLocation);
 }
 
 void SimPvPController::returnToShuttle() {
-    state = SimPlayerController::MOVING;
-    returningToShuttle = true;
-    Logger::console.info("SimPvP: Patrol done. Returning to Shuttle.", true);
-    moveTo(spawnLocation);
+	state = SimPlayerController::MOVING;
+	returningToShuttle = true;
+	Logger::console.info("SimPvP: Patrol done. Returning to Shuttle.", true);
+	moveTo(spawnLocation);
 }
 
 void SimPvPController::onArrived() {
-    if (returningToShuttle) {
-        despawn();
-    } else {
-        startLoitering();
-    }
+	const uint64 oid = (agent != nullptr) ? agent->getObjectID() : 0;
+
+	Logger::console.info(
+		"SimPvP: onArrived oid=" + String::valueOf(oid) +
+		" returningToShuttle=" + String::valueOf(returningToShuttle) +
+		" cycleRequested=" + String::valueOf(cycleRequested) +
+		" mgrSet=" + String::valueOf(manager != nullptr) +
+		" groupType=" + groupType +
+		" template=" + templateName,
+		true
+	);
+
+	if (returningToShuttle) {
+		// IMPORTANT: prevent spam / repeated cycle requests
+		if (cycleRequested)
+			return;
+
+		cycleRequested = true;
+
+		// Stop SimPlayer movement logic from re-issuing moveTo(spawn) again
+		state = SimPlayerController::WAITING;
+
+		requestCycleToNextStop();
+		return;
+	}
+
+	startLoitering();
 }
 
 void SimPvPController::startLoitering() {
     state = SimPlayerController::WAITING;
-    Logger::console.info("SimPvP: Arrived at Starport. Scanning area for 30s...", true);
-    
-    if (agent != nullptr) agent->doAnimation("look_around");
+
+    // Random loiter between 30s and 180s
+    const int minMs = loiterMs;
+    const int maxMs = 180000;
+    const int randomized = minMs + System::random(maxMs - minMs);
+
+    Logger::console.info("SimPvP: Arrived at Starport. Loitering for " +
+                         String::valueOf(randomized / 1000) + "s...", true);
+
+    if (agent != nullptr)
+        agent->doAnimation("look_around");
 
     Reference<SimPvPBehaviorTask*> task = new SimPvPBehaviorTask(this);
-    task->schedule(30000); 
+    task->schedule(randomized);
 }
 
 void SimPvPController::finishLoitering() {
-    // FIX: Do not leave if in combat. Delay 5s.
-    if (agent != nullptr && agent->isInCombat()) {
-        Logger::console.info("SimPvP: Combat in progress. Extending loiter...", true);
-        Reference<SimPvPBehaviorTask*> task = new SimPvPBehaviorTask(this);
-        task->schedule(5000);
-        return;
-    }
+	if (agent == nullptr)
+		return;
 
-    returnToShuttle();
+	// Don’t leave if in combat; extend loiter a bit
+	if (agent->isInCombat()) {
+		Logger::console.info("SimPvP: Combat in progress. Extending loiter...", true);
+		Reference<SimPvPBehaviorTask*> task = new SimPvPBehaviorTask(this);
+		task->schedule(5000);
+		return;
+	}
+
+	returnToShuttle();
 }
 
-void SimPvPController::despawn() {
-    Logger::console.info("SimPvP: Despawning.", true);
-    if (agent != nullptr) {
-        agent->destroyObjectFromWorld(true);
-    }
+void SimPvPController::requestCycleToNextStop() {
+	const uint64 oid = (agent != nullptr) ? agent->getObjectID() : 0;
+
+	Logger::console.info(
+		"SimPvP: requestCycleToNextStop oid=" + String::valueOf(oid) +
+		" mgrSet=" + String::valueOf(manager != nullptr) +
+		" groupType=" + groupType +
+		" template=" + templateName +
+		" planet=" + planet +
+		" location=" + locationName,
+		true
+	);
+
+	if (agent == nullptr) {
+		Logger::console.info("SimPvP: requestCycleToNextStop failed (agent missing).", true);
+		return;
+	}
+
+	// Self-heal manager if context wasn't set (toggleBot / fallback spawns)
+	if (manager == nullptr) {
+		manager = SimPlayerManager::instance();
+		Logger::console.info("SimPvP: resolved manager via SimPlayerManager::instance() -> mgrSet=" + String::valueOf(manager != nullptr), true);
+	}
+
+	// Self-heal missing context so cycling still works even for fallback stormtroopers
+	if (groupType.isEmpty())
+		groupType = "pvp_solo";
+
+	if (templateName.isEmpty()) {
+		const CreatureTemplate* tmpl = agent->getCreatureTemplate();
+		if (tmpl != nullptr)
+			templateName = tmpl->getTemplateName();
+	}
+
+	if (planet.isEmpty()) {
+		Zone* z = agent->getZone();
+		if (z != nullptr)
+			planet = z->getZoneName();
+	}
+
+	if (locationName.isEmpty())
+		locationName = "unknown";
+
+	if (manager == nullptr) {
+		Logger::console.info("SimPvP: requestCycleToNextStop failed (manager missing).", true);
+		agent->destroyObjectFromWorld(true);
+		return;
+	}
+
+	Logger::console.info(
+		"SimPvP: cycling oid=" + String::valueOf(oid) +
+		" using groupType=" + groupType +
+		" template=" + templateName +
+		" from " + planet + ":" + locationName,
+		true
+	);
+
+	manager->cyclePvPBot(oid, groupType, templateName, isImperial, planet, locationName);
 }
 
 void SimPvPController::onTick() {
-    if (agent == nullptr || agent->isDead()) return;
-    if (agent->isInCombat()) return; 
+	if (agent == nullptr || agent->isDead())
+		return;
 
-    scanForTargets();
+	if (agent->isInCombat())
+		return;
+
+	scanForTargets();
 }
 
 void SimPvPController::scanForTargets() {
-    Zone* zone = agent->getZone();
-    if (zone == nullptr) return;
+	if (agent == nullptr)
+		return;
 
-    CloseObjectsVector* vec = (CloseObjectsVector*) agent->getCloseObjects();
-    if (vec == nullptr) return;
+	Zone* zone = agent->getZone();
+	if (zone == nullptr)
+		return;
 
-    Vector<TreeEntry*> objects;
-    vec->safeCopyReceiversTo(objects, CloseObjectsVector::CREOTYPE);
+	CloseObjectsVector* vec = (CloseObjectsVector*) agent->getCloseObjects();
+	if (vec == nullptr)
+		return;
 
-    for (int i = 0; i < objects.size(); ++i) {
-        SceneObject* obj = static_cast<SceneObject*>(objects.get(i));
-        if (obj == nullptr || !obj->isPlayerCreature()) continue;
+	Vector<TreeEntry*> objects;
+	vec->safeCopyReceiversTo(objects, CloseObjectsVector::CREOTYPE);
 
-        CreatureObject* player = obj->asCreatureObject();
-        if (player == nullptr || player->isIncapacitated() || player->isDead()) continue;
+	for (int i = 0; i < objects.size(); ++i) {
+		SceneObject* obj = static_cast<SceneObject*>(objects.get(i));
+		if (obj == nullptr || !obj->isPlayerCreature())
+			continue;
 
-        if (player->getParent() != nullptr) continue; 
+		CreatureObject* player = obj->asCreatureObject();
+		if (player == nullptr || player->isIncapacitated() || player->isDead())
+			continue;
 
-        bool playerImp = (player->getFaction() == String("imperial").hashCode());
-        bool playerReb = (player->getFaction() == String("rebel").hashCode());
-        
-        bool isEnemy = false;
-        if (isImperial && playerReb) isEnemy = true;
-        if (!isImperial && playerImp) isEnemy = true;
+		// Don’t attack players in buildings/cells
+		if (player->getParent() != nullptr)
+			continue;
 
-        if (isEnemy && player->isAttackableBy(agent)) {
-            
-            float dist = agent->getDistanceTo(player);
-            if (dist < 40.0f) { 
-                Logger::console.info("SimPvP: ENGAGING TARGET: " + player->getFirstName(), true);
-                
-                Locker locker(agent);
-                Locker crossLocker(player, agent);
+		bool playerImp = (player->getFaction() == String("imperial").hashCode());
+		bool playerReb = (player->getFaction() == String("rebel").hashCode());
 
-                agent->setTargetObject(player);
-                agent->addDefender(player);
-                agent->setCombatState();
-                
-                state = SimPlayerController::IDLE; 
-                return; 
-            }
-        }
-    }
+		bool enemy = false;
+		if (isImperial && playerReb) enemy = true;
+		if (!isImperial && playerImp) enemy = true;
+
+		if (!enemy)
+			continue;
+
+		if (!player->isAttackableBy(agent))
+			continue;
+
+		float dist = agent->getDistanceTo(player);
+		if (dist >= 40.0f)
+			continue;
+
+		Logger::console.info("SimPvP: ENGAGING TARGET: " + player->getFirstName(), true);
+
+		Locker locker(agent);
+		Locker crossLocker(player, agent);
+
+		agent->setTargetObject(player);
+		agent->addDefender(player);
+		agent->setCombatState();
+
+		state = SimPlayerController::IDLE;
+		return;
+	}
 }

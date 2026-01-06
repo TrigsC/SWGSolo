@@ -8,33 +8,88 @@
 
 #include "engine/util/Singleton.h"
 #include "system/util/SynchronizedVectorMap.h"
-#include "SimPlayerController.h"
+#include "system/util/Vector.h"
+#include "engine/util/u3d/Vector3.h"
+#include "engine/lua/Lua.h"
 
-// FIX: Forward declare Zone inside its correct namespace to avoid ambiguity
-namespace server {
- namespace zone {
-  class Zone;
- }
-}
+#include "SimPlayerController.h"
 
 using namespace server::zone;
 
 class SimPlayerManager : public Singleton<SimPlayerManager>, public Object, public Logger {
-    // Map of Creature ObjectID -> Your Custom Controller
-    SynchronizedVectorMap<uint64, Reference<SimPlayerController*> > controllers;
+private:
+	// Map of Creature ObjectID -> Controller
+	SynchronizedVectorMap<uint64, Reference<SimPlayerController*> > controllers;
+
+    Lua* lua;
 
 public:
-    SimPlayerManager();
-    ~SimPlayerManager();
+	struct ShuttleportLocation {
+		String planet;
+		String name;
+		Vector3 spawn;
+		Vector3 hangout;
 
-    // Called by ZoneServer on startup
-    void initialize();
+		// Satisfy Vector/TypeInfo template instantiation
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
 
-    // The main logic to spawn a specific bot
-    void spawnSimPlayer(const String& planet, float x, float z, const String& templateName);
+	struct SpawnGroup {
+		String type;
+		int totalCount = 0;
+		String behavior;
+		String faction;
+		Vector<String> templates;
 
-    // Toggle logic
-    void toggleBot(AiAgent* agent);
+		// Satisfy Vector/TypeInfo template instantiation
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+
+private:
+	bool enabled = true;
+	Vector<ShuttleportLocation> allShuttleports;
+	Vector<SpawnGroup> spawnGroups;
+
+	// Lua config loading / spawning
+	void loadLuaConfig();
+	void spawnConfiguredGroups();
+	void startControllerForAgent(AiAgent* agent, Reference<SimPlayerController*> ctrl);
+
+	bool pickRandomShuttleport(ShuttleportLocation& out) const;
+	String pickRandomTemplate(const SpawnGroup& g) const;
+	bool isImperialForSpawn(const SpawnGroup& g, const String& templateName) const;
+
+	void spawnFromConfig(const SpawnGroup& g, const ShuttleportLocation& loc, const String& templateName);
+
+public:
+	SimPlayerManager();
+	~SimPlayerManager();
+
+	// Called by ZoneServer on startup
+	void initialize();
+
+	// The main logic to spawn a specific bot
+	void spawnSimPlayer(const String& planet, float x, float y, const String& templateName);
+
+	// Toggle logic
+	void toggleBot(AiAgent* agent);
+
+	// Cycle logic (called by SimPvPController)
+	void cyclePvPBot(uint64 oldOid,
+	                 const String& groupType,
+	                 const String& templateName,
+	                 bool imperial,
+	                 const String& fromPlanet,
+	                 const String& fromLocation);
+
+	void spawnSimPlayerWithRoute(const String& planet,
+                    			const Vector3& spawn,
+                    			const Vector3& hangout,
+                    			const String& templateName,
+                    			const String& groupType,
+                    			const String& locationName);
 };
 
 #endif /* SIMPLAYERMANAGER_H_ */

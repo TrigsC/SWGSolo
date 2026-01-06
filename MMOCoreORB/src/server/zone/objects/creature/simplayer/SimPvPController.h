@@ -1,6 +1,6 @@
 /*
  * SimPvPController.h
- * PvP Patrol Logic
+ * PvP Patrol Logic + Cycle-to-next-shuttleport support
  */
 
 #ifndef SIMPVPCONTROLLER_H_
@@ -8,43 +8,80 @@
 
 #include "SimPlayerController.h"
 
+#include "engine/core/Task.h"
+#include "system/lang/String.h"
+#include "engine/util/u3d/Vector3.h"
+
+class SimPlayerManager;
+class SimPvPBehaviorTask;
+
 class SimPvPController : public SimPlayerController {
-    Vector3 spawnLocation;
-    Vector3 hangoutLocation;
-    bool returningToShuttle;
-    bool isImperial;
-
 public:
-    SimPvPController(AiAgent* aiAgent, bool imperial);
-    virtual ~SimPvPController();
+	// Backwards-compatible constructor (uses default route)
+	SimPvPController(AiAgent* aiAgent, bool imperial);
 
-    void startSimLoop() override;
-    void onArrived() override;
-    void onTick() override;
+	// Preferred constructor when spawning from Lua config
+	SimPvPController(AiAgent* aiAgent, bool imperial, const Vector3& spawnLoc, const Vector3& hangoutLoc);
 
-    // Specific PvP Logic
-    void scanForTargets();
-    void startPatrol();
-    void returnToShuttle();
-    void despawn();
-    
-    // Loiter behavior
-    void startLoitering();
-    void finishLoitering();
+	virtual ~SimPvPController();
+
+	// Optional: update route after construction
+	void setRoute(const Vector3& spawnLoc, const Vector3& hangoutLoc);
+
+	// Must be called by SimPlayerManager (or toggleBot) so cycling knows what to respawn
+	void setCycleContext(SimPlayerManager* mgr,
+	                     const String& tmpl,
+	                     const String& grpType,
+	                     const String& planetName,
+	                     const String& locName);
+
+	// Called when the bot is done with a stop and wants to go elsewhere
+	void requestCycleToNextStop();
+
+	// SimPlayerController interface
+	void startSimLoop() override;
+	void onArrived() override;
+	void onTick() override;
+
+	// PvP specific
+	void scanForTargets();
+
+private:
+	friend class SimPvPBehaviorTask;
+
+	void startPatrol();
+	void returnToShuttle();
+
+	// Loiter behavior
+	void startLoitering();
+	void finishLoitering();
+
+private:
+	Vector3 spawnLocation;
+	Vector3 hangoutLocation;
+
+	bool returningToShuttle = false;
+	bool isImperial = false;
+
+	// Prevent shuttle-arrival spam (only request cycle once)
+	bool cycleRequested = false;
+
+	// Cycle support
+	SimPlayerManager* manager = nullptr;
+	String templateName;
+	String groupType;
+	String planet;
+	String locationName;
+
+	int loiterMs = 30000;
 };
 
 class SimPvPBehaviorTask : public Task {
-    WeakReference<SimPvPController*> controller;
+	WeakReference<SimPvPController*> controller;
+
 public:
-    SimPvPBehaviorTask(SimPvPController* ctrl) : controller(ctrl) {}
-    void run() override {
-        Reference<SimPvPController*> strongRef = controller.get();
-        if (strongRef != nullptr) {
-            Core::getTaskManager()->executeTask([strongRef]() {
-                strongRef->finishLoitering();
-            }, "SimPvPLoiterLambda");
-        }
-    }
+	SimPvPBehaviorTask(SimPvPController* ctrl);
+	void run() override;
 };
 
-#endif
+#endif /* SIMPVPCONTROLLER_H_ */
