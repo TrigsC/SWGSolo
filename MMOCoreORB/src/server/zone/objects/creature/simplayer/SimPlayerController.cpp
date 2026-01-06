@@ -94,7 +94,7 @@ SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     state = IDLE;
     simPathIndex = 0;
     stuckWatchdogCount = 0;
-    runSpeed = 5.5f; 
+    runSpeed = 4.5f; 
     setLoggingName("SimPlayerController");
     destination = Vector3(0, 0, 0);
 }

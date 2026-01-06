@@ -1,6 +1,6 @@
-print("###################################################")
-print("CRITICAL DEBUG: LOADING LIGHT JEDI PADAWAN FILE")
-print("###################################################")
+--print("###################################################")
+--print("CRITICAL DEBUG: LOADING LIGHT JEDI PADAWAN FILE")
+--print("###################################################")
 light_jedi_padawan = Creature:new {
     objectName = "Jedi Padawan", -- Changed from string_id to raw text for testing
     randomNameType = NAME_GENERIC,

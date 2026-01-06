@@ -20,23 +20,21 @@ SimPlayerManagerConfig = {
         -- MINERS: Spread randomly across ALL defined shuttleports
         {
             type = "miner",
-            totalCount = 1, 
+            totalCount = 0, 
             templates = { "light_jedi_sentinel", "artisan" }, -- Randomly picks appearance
             behavior = "gather_resources"
         },
         {
             type = "pvp_solo",
             totalCount = 1,
-            templates = { "rebel_commando", "rebel_trooper" }
+            templates = { "rebel_commando", "rebel_trooper" },
+            minStaySeconds = 60,
+            maxStaySeconds = 180
         }
     }
 }
 
 -- DEBUG CHECK: Verifies the table exists before passing to C++
-if SimPlayerManagerConfig.spawnGroups then
-    print("LUA DEBUG: spawnGroups table exists in Lua.")
-else
-    print("LUA DEBUG: spawnGroups table is MISSING in Lua.")
-end
+print("LUA DEBUG: SimPlayerManagerConfig.spawnGroups type=", type(SimPlayerManagerConfig.spawnGroups))
 
-return SimPlayerManagerConfig
+-- return SimPlayerManagerConfig
