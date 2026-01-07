@@ -250,14 +250,14 @@ void SimPlayerController::checkArrival() {
 
     Locker locker(agent);
 
+    onTick(); 
+
     if (agent->isDead() || agent->isIncapacitated()) {
         // tell manager to cleanup corpse after a delay
         agent->destroyObjectFromWorld(true);
         agent->destroyObjectFromDatabase(true);
         return;
     }
-
-    onTick(); 
 
     if (agent->isInCombat()) {
         state = IDLE; 
