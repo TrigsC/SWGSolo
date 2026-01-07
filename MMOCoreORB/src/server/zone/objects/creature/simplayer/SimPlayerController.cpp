@@ -19,16 +19,18 @@
 
 using namespace server::zone::objects::creature::ai::bt;
 
+//#define DEBUG_SIMPLAYER
+
 // --------------------------------------------------------
 // TASKS
 // --------------------------------------------------------
 void SimPathFindTask::run() {
     Reference<SimPlayerController*> strongCtrl = controller.get();
     if (strongCtrl == nullptr) return;
-
+#ifdef DEBUG_SIMPVP
     // DEBUG: Trace start
     Logger::console.info("SimPlayer: [Thread] Pathfinding started...", true);
-
+#endif
     Vector<WorldCoordinates>* path = nullptr;
     
     try {
@@ -37,10 +39,15 @@ void SimPathFindTask::run() {
         Logger::console.info("SimPlayer: [Thread] EXCEPTION in findPath!", true);
         path = nullptr;
     }
-
+#ifdef DEBUG_SIMPVP
     // DEBUG: Trace end
-    if (path != nullptr) Logger::console.info("SimPlayer: [Thread] Pathfinding success. Nodes: " + String::valueOf(path->size()), true);
-    else Logger::console.info("SimPlayer: [Thread] Pathfinding returned NULL.", true);
+    if (path != nullptr) {
+        Logger::console.info("SimPlayer: [Thread] Pathfinding success. Nodes: " + String::valueOf(path->size()), true);
+    }
+    else {
+        Logger::console.info("SimPlayer: [Thread] Pathfinding returned NULL.", true);
+    }
+#endif
 
     Core::getTaskManager()->executeTask([strongCtrl, path] () {
         if (path != nullptr) strongCtrl->onPathFound(path);
@@ -94,7 +101,7 @@ SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     state = IDLE;
     simPathIndex = 0;
     stuckWatchdogCount = 0;
-    runSpeed = 4.5f; 
+    runSpeed = 3.0f; 
     setLoggingName("SimPlayerController");
     destination = Vector3(0, 0, 0);
 }
@@ -138,15 +145,19 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (agent == nullptr) { if (path) delete path; return; }
     
     if (agent->isInCombat()) {
+#ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer: Path found but Agent is in Combat. Holding.", true);
+#endif
         if (path) delete path;
         state = IDLE;
         return;
     }
 
     if (path == nullptr || path->size() < 2) { 
-        if (path) delete path; 
+        if (path) delete path;
+#ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer: Path too short. Retrying in 5s.", true);
+#endif
         onPathFailed(); 
         return; 
     }
@@ -160,9 +171,9 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     }
 
     destination = simPath.get(simPath.size() - 1).getPoint();
-    
-    // Logger::console.info("SimPlayer: Path Found (" + String::valueOf(path->size()) + " nodes). Moving...", true);
-
+#ifdef DEBUG_SIMPVP
+    Logger::console.info("SimPlayer: Path Found (" + String::valueOf(path->size()) + " nodes). Moving...", true);
+#endif
     agent->setHomeLocation(destination.getX(), destination.getZ(), destination.getY(), nullptr);
 
     agent->setFollowObject(nullptr);
@@ -193,7 +204,9 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 }
 
 void SimPlayerController::onPathFailed() {
+#ifdef DEBUG_SIMPVP
     Logger::console.info("SimPlayer: Pathfinding failed/unreachable. Retrying in 5s...", true);
+#endif
     state = IDLE;
     
     // FIX: Don't recurse immediately. Schedule a retry.
@@ -233,9 +246,16 @@ void SimPlayerController::queueMorePathNodes() {
 }
 
 void SimPlayerController::checkArrival() {
-    if (agent == nullptr || agent->isDead() || agent->getZone() == nullptr) return;
+    if (agent == nullptr || agent->getZone() == nullptr) return;
 
     Locker locker(agent);
+
+    if (agent->isDead() || agent->isIncapacitated()) {
+        // tell manager to cleanup corpse after a delay
+        agent->destroyObjectFromWorld(true);
+        agent->destroyObjectFromDatabase(true);
+        return;
+    }
 
     onTick(); 
 
@@ -247,7 +267,9 @@ void SimPlayerController::checkArrival() {
     }
 
     if (state == IDLE && destination.getX() != 0) {
+#ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer: Resuming path to " + destination.toString(), true);
+#endif
         moveTo(destination);
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(1000);

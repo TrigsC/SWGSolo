@@ -9,11 +9,15 @@
 #include "server/ServerCore.h"
 #include "server/zone/managers/creature/CreatureManager.h"
 #include "server/zone/managers/creature/CreatureTemplateManager.h" 
+#include "server/zone/managers/name/NameManager.h" 
 #include "server/zone/objects/creature/ai/CreatureTemplate.h" 
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h" 
 #include "templates/params/creature/ObjectFlag.h"
+#include "server/zone/managers/planet/PlanetManager.h"
+#include "server/zone/managers/planet/PlanetTravelPoint.h"
 
+//#define DEBUG_POWERUPS
 
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
@@ -70,9 +74,6 @@ void SimPlayerManager::loadLuaConfig() {
         return;
     }
 
-    //bool enabled = config.getBooleanField("enabled");
-    //info("DEBUG: Enabled == " + String::valueOf(enabled) + " For Load", true);
-    //if (!enabled) return;
     this->enabled = config.getBooleanField("enabled");
     info("DEBUG: Enabled == " + String::valueOf(this->enabled) + " For Load", true);
     if (!this->enabled) {
@@ -80,11 +81,8 @@ void SimPlayerManager::loadLuaConfig() {
         return;
     }
 
-    // IMPORTANT: populate member config used by cyclePvPBot/spawnConfiguredGroups
     allShuttleports.removeAll();
     spawnGroups.removeAll();
-
-    // std::vector<LocationEntry> locationList; 
 
     // --- LOAD SHUTTLEPORTS ---
     LuaObject shuttles = config.getObjectField("shuttleports");
@@ -121,9 +119,9 @@ void SimPlayerManager::loadLuaConfig() {
                         } else {
                             error("DEBUG: Entry #" + String::valueOf(j) + " (" + cityName + ") in " + String(pName) + " is invalid! Check 'spawn' table.");
                         }
-                        spawn.pop(); // CRITICAL: Pop before reading next field
+                        spawn.pop();
 
-                        // 2. READ HANGOUT (Now 'city' is top of stack again)
+                        // 2. READ HANGOUT
                         if (validSpawn) {
                             LuaObject hangout = city.getObjectField("hangout");
                             if (hangout.isValidTable()) {
@@ -172,52 +170,6 @@ void SimPlayerManager::loadLuaConfig() {
         for (int i = 1; i <= groupCount; ++i) {
             LuaObject group = groups.getObjectAt(i);
             String type = group.getStringField("type");
-            //int count = group.getIntField("totalCount");
-            //LuaObject templates = group.getObjectField("templates");
-            //
-            //info("DEBUG: Processing Group " + String::valueOf(i) + " (" + type + ") Count: " + String::valueOf(count), true);
-//
-            //for (int k = 0; k < count; ++k) {
-            //    try {
-            //        if (locationList.empty()) break;
-            //        
-            //        int locSize = locationList.size();
-            //        int locIndex = System::random(locSize - 1);
-            //        if (locIndex < 0 || locIndex >= locSize) locIndex = 0;
-            //        
-            //        LocationEntry loc = locationList.at(locIndex);
-//
-            //        String tmpl = "";
-            //        if (templates.isValidTable()) {
-            //            int tSize = templates.getTableSize();
-            //            if (tSize > 0) {
-            //                int luaIdx = 1 + System::random(tSize - 1);
-            //                tmpl = templates.getStringAt(luaIdx);
-            //                //int randIdx = System::random(tSize); 
-            //                //int luaIdx = 1 + randIdx;            
-            //                //if (luaIdx > tSize) luaIdx = tSize;
-            //                //tmpl = templates.getStringAt(luaIdx);
-            //            }
-            //        }
-//
-            //        if (tmpl.isEmpty()) {
-            //            error("DEBUG: Template list is empty or invalid for group " + String::valueOf(i));
-            //            continue;
-            //        }
-//
-            //        //spawnSimPlayer(loc.planet, loc.x, loc.y, tmpl); 
-            //        Vector3 spawn(loc.x, loc.y, loc.z);
-            //        Vector3 hangout(loc.hx, loc.hy, loc.hz);
-            //        
-            //        spawnSimPlayerWithRoute(loc.planet, spawn, hangout, tmpl, type, loc.name);
-//
-            //    } catch (Exception& e) {
-            //        error("DEBUG: Error processing spawn loop #" + String::valueOf(k) + ": " + e.getMessage());
-            //    } catch (...) {
-            //        error("DEBUG: Unknown error in spawn loop #" + String::valueOf(k));
-            //    }
-            //}
-            //templates.pop();
             SpawnGroup g;
             g.type = group.getStringField("type");
             g.totalCount = group.getIntField("totalCount");
@@ -266,6 +218,16 @@ void SimPlayerManager::spawnSimPlayer(const String& planet, float x, float y, co
     AiAgent* agent = creature->asAiAgent();
     if (agent == nullptr) return;
 
+    // --- COSMETICS ---
+    NameManager* nm = zoneServer->getNameManager();
+    if (nm != nullptr) {
+        // Use Type 0 to generate a Human Name (First Last) instead of TK-123
+        String name = nm->makeCreatureName(0, creature->getSpecies()); 
+        if (!name.isEmpty()) {
+            agent->setCustomObjectName(name, true);
+        }
+    }
+
     // Reset default flags to clean slate
     agent->setCreatureBitmask(0); 
     agent->setDespawnOnNoPlayerInRange(false);
@@ -313,8 +275,8 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         // NOTE: Keep this logic broad so new PvP templates (e.g. rebel_commando)
         // still get the correct controller when spawned via spawnSimPlayer().
         String lower = tName.toLowerCase();
-        bool looksRebel = lower.beginsWith("rebel");
-        bool looksImperial = lower.beginsWith("imperial") || lower.contains("stormtrooper");
+        bool looksRebel = lower.beginsWith("rebel") || lower.contains("specforce") || lower.contains("light");
+        bool looksImperial = lower.beginsWith("imperial") || lower.contains("stormtrooper") || lower.contains("dark");
 
         if (looksImperial) {
             agent->setPvpStatusBitmask(ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
@@ -611,6 +573,95 @@ void SimPlayerManager::spawnFromConfig(const SpawnGroup& g, const ShuttleportLoc
         ctrl->startSimLoop();
     }
 
+void SimPlayerManager::cyclePvPBotWhenShuttleReady(uint64 oldOid,
+                                                   const String& groupType,
+                                                   const String& templateName,
+                                                   bool imperial,
+                                                   const String& fromPlanet,
+                                                   const String& fromLocation,
+                                                   int attempts) {
+    // Safety: don’t wait forever
+    if (attempts >= 24) { // 24 * 5s = ~2 minutes
+        info("cyclePvPBotWhenShuttleReady: timeout waiting for shuttle; cycling anyway oldOid=" +
+             String::valueOf(oldOid), true);
+        cyclePvPBot(oldOid, groupType, templateName, imperial, fromPlanet, fromLocation);
+        return;
+    }
+
+    // Re-acquire the old agent by OID (don’t capture oldAgent across tasks)
+    ManagedReference<SceneObject*> obj = ServerCore::getZoneServer()->getObject(oldOid);
+    ManagedReference<AiAgent*> oldAgent = cast<AiAgent*>(obj.get());
+
+    if (oldAgent == nullptr) {
+        info("cyclePvPBotWhenShuttleReady: oldAgent null, abort oldOid=" + String::valueOf(oldOid), true);
+        return;
+    }
+
+    {
+        Locker locker(oldAgent);
+        // If the bot died while waiting, stop the loop and clean up.
+        if (oldAgent->isDead() || oldAgent->isIncapacitated()) {
+            info("cyclePvPBotWhenShuttleReady: old bot is dead/incap; cleaning up oldOid=" +
+                 String::valueOf(oldOid), true);
+
+            controllers.drop(oldOid);
+
+            // If you want NO corpses/loot for simplayers:
+            oldAgent->destroyObjectFromWorld(true);
+            oldAgent->destroyObjectFromDatabase(true);
+
+            return;
+        }
+
+        if (!isNearestShuttleBoardable(oldAgent)) {
+            // Optional: make it look like it’s waiting
+            oldAgent->setMovementState(AiAgent::OBLIVIOUS);
+            oldAgent->activateAiBehavior(true);
+
+            Core::getTaskManager()->scheduleTask(
+                [this, oldOid, groupType, templateName, imperial, fromPlanet, fromLocation, attempts]() {
+                    this->cyclePvPBotWhenShuttleReady(oldOid, groupType, templateName, imperial, fromPlanet, fromLocation, attempts + 1);
+                },
+                "SimPvPWaitForShuttle",
+                5000
+            );
+
+            return;
+        }
+    }
+
+    // Shuttle is boardable now — do the real cycle
+    cyclePvPBot(oldOid, groupType, templateName, imperial, fromPlanet, fromLocation);
+}
+
+bool SimPlayerManager::isNearestShuttleBoardable(CreatureObject* creature) {
+    if (creature == nullptr)
+        return false;
+
+    Zone* zone = creature->getZone();
+    if (zone == nullptr)
+        return false;
+
+    PlanetManager* pm = zone->getPlanetManager();
+    if (pm == nullptr)
+        return false;
+
+    Reference<PlanetTravelPoint*> ptp = pm->getNearestPlanetTravelPoint(creature, 128.f);
+    if (ptp == nullptr)
+        return false;
+
+    ManagedReference<CreatureObject*> shuttle = ptp->getShuttle();
+    if (shuttle == nullptr)
+        return false;
+
+    // Match BoardShuttleCommand behavior (don’t special-case Theed Spaceport unless you want to)
+    if (!ptp->isPoint("naboo", "Theed Spaceport")) {
+        return pm->checkShuttleStatus(creature, shuttle);
+    }
+
+    return true;
+}
+
 void SimPlayerManager::cyclePvPBot(uint64 oldOid,
                                    const String& groupType,
                                    const String& templateName,
@@ -731,6 +782,14 @@ void SimPlayerManager::cyclePvPBot(uint64 oldOid,
             return;
 
         Locker locker(oldAgent);
+        if (oldAgent->isDead() || oldAgent->isIncapacitated()) {
+            info("cyclePvPBot: old bot already dead/incap; destroying oldOid=" + String::valueOf(oldOid), true);
+            controllers.drop(oldOid);
+            oldAgent->destroyObjectFromWorld(true);
+            oldAgent->destroyObjectFromDatabase(true);
+            return;
+        }
+
         info("cyclePvPBot: destroying oldOid=" + String::valueOf(oldOid), true);
         oldAgent->destroyObjectFromWorld(true);
         info("cyclePvPBot: destroyObjectFromWorld done oldOid=" + String::valueOf(oldOid), true);

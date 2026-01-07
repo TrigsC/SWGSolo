@@ -15,6 +15,8 @@
 
 #include "system/lang/System.h"
 
+//#define DEBUG_SIMPVP
+
 // ------------------------------------------------------
 // Task
 // ------------------------------------------------------
@@ -41,7 +43,7 @@ SimPvPController::SimPvPController(AiAgent* aiAgent, bool imperial)
 	returningToShuttle = false;
 	cycleRequested = false;
 
-	runSpeed = 4.5f;
+	runSpeed = 3.0f;
 	setLoggingName("SimPvPController");
 
 	// Default route (original behavior)
@@ -80,8 +82,9 @@ void SimPvPController::startSimLoop() {
 
 	agent->setFaction(isImperial ? String("imperial").hashCode() : String("rebel").hashCode());
 	agent->setPvpStatusBitmask(ObjectFlag::OVERT | ObjectFlag::ATTACKABLE);
-
+#ifdef DEBUG_SIMPVP
 	Logger::console.info("SimPvP: Spawning at Shuttle. Moving to hangout.", true);
+#endif
 	startPatrol();
 }
 
@@ -94,13 +97,15 @@ void SimPvPController::startPatrol() {
 void SimPvPController::returnToShuttle() {
 	state = SimPlayerController::MOVING;
 	returningToShuttle = true;
+#ifdef DEBUG_SIMPVP
 	Logger::console.info("SimPvP: Patrol done. Returning to Shuttle.", true);
+#endif
 	moveTo(spawnLocation);
 }
 
 void SimPvPController::onArrived() {
 	const uint64 oid = (agent != nullptr) ? agent->getObjectID() : 0;
-
+#ifdef DEBUG_SIMPVP
 	Logger::console.info(
 		"SimPvP: onArrived oid=" + String::valueOf(oid) +
 		" returningToShuttle=" + String::valueOf(returningToShuttle) +
@@ -110,7 +115,7 @@ void SimPvPController::onArrived() {
 		" template=" + templateName,
 		true
 	);
-
+#endif
 	if (returningToShuttle) {
 		// IMPORTANT: prevent spam / repeated cycle requests
 		if (cycleRequested)
@@ -135,10 +140,10 @@ void SimPvPController::startLoitering() {
     const int minMs = loiterMs;
     const int maxMs = 180000;
     const int randomized = minMs + System::random(maxMs - minMs);
-
+#ifdef DEBUG_SIMPVP
     Logger::console.info("SimPvP: Arrived at Starport. Loitering for " +
                          String::valueOf(randomized / 1000) + "s...", true);
-
+#endif
     if (agent != nullptr)
         agent->doAnimation("look_around");
 
@@ -163,7 +168,7 @@ void SimPvPController::finishLoitering() {
 
 void SimPvPController::requestCycleToNextStop() {
 	const uint64 oid = (agent != nullptr) ? agent->getObjectID() : 0;
-
+#ifdef DEBUG_SIMPVP
 	Logger::console.info(
 		"SimPvP: requestCycleToNextStop oid=" + String::valueOf(oid) +
 		" mgrSet=" + String::valueOf(manager != nullptr) +
@@ -173,16 +178,20 @@ void SimPvPController::requestCycleToNextStop() {
 		" location=" + locationName,
 		true
 	);
-
+#endif
 	if (agent == nullptr) {
+#ifdef DEBUG_SIMPVP
 		Logger::console.info("SimPvP: requestCycleToNextStop failed (agent missing).", true);
+#endif
 		return;
 	}
 
 	// Self-heal manager if context wasn't set (toggleBot / fallback spawns)
 	if (manager == nullptr) {
 		manager = SimPlayerManager::instance();
+#ifdef DEBUG_SIMPVP
 		Logger::console.info("SimPvP: resolved manager via SimPlayerManager::instance() -> mgrSet=" + String::valueOf(manager != nullptr), true);
+#endif
 	}
 
 	// Self-heal missing context so cycling still works even for fallback stormtroopers
@@ -209,7 +218,7 @@ void SimPvPController::requestCycleToNextStop() {
 		agent->destroyObjectFromWorld(true);
 		return;
 	}
-
+#ifdef DEBUG_SIMPVP
 	Logger::console.info(
 		"SimPvP: cycling oid=" + String::valueOf(oid) +
 		" using groupType=" + groupType +
@@ -217,8 +226,9 @@ void SimPvPController::requestCycleToNextStop() {
 		" from " + planet + ":" + locationName,
 		true
 	);
-
-	manager->cyclePvPBot(oid, groupType, templateName, isImperial, planet, locationName);
+#endif
+	// manager->cyclePvPBot(oid, groupType, templateName, isImperial, planet, locationName);
+	manager->cyclePvPBotWhenShuttleReady(oid, groupType, templateName, isImperial, planet, locationName, 0);
 }
 
 void SimPvPController::onTick() {
@@ -275,9 +285,9 @@ void SimPvPController::scanForTargets() {
 		float dist = agent->getDistanceTo(player);
 		if (dist >= 40.0f)
 			continue;
-
+#ifdef DEBUG_SIMPVP
 		Logger::console.info("SimPvP: ENGAGING TARGET: " + player->getFirstName(), true);
-
+#endif
 		Locker locker(agent);
 		Locker crossLocker(player, agent);
 
