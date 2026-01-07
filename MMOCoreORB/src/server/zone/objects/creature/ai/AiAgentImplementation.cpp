@@ -103,6 +103,7 @@
 // #define SHOW_PATH
 // #define SHOW_NEXT_POSITION
 // #define DEBUG_FINDNEXTPOSITION
+// #define DEBUG_MOVE
 
 #ifdef DEBUG_AI_ATTACK
 static void debugLogSelectedAttack(AiAgentImplementation* agent,
@@ -3647,7 +3648,9 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     Locker locker(&targetMutex);
 
     if (isSimPlayer && (isDead() || getPatrolPointSize() <= 0)) {
+		#ifdef DEBUG_MOVE
         if (isSimPlayer) info("DEBUG_MOVE: Queue Empty or Dead. Stopping.", true);
+		#endif 
         return false;
     }
     if (!isSimPlayer && (isDead() || getPatrolPointSize() <= 0)) return false;
@@ -3683,7 +3686,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     float endDistZ = fabs(endDistDiff.getZ());
     
     float maxSquared = Math::max(0.1f, maxDistance * maxDistance);
-
+#ifdef DEBUG_MOVE
     if (isSimPlayer) {
         StringBuffer msg;
         msg << "DEBUG_MOVE: Dist2D=" << sqrt(endDistanceSq) 
@@ -3693,14 +3696,16 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         if (currentSpeed < 0.1f) msg << " [STALLED]";
         info(msg.toString(), true);
     }
-
+#endif 
     // --- ARRIVAL LOGIC ---
     if (endDistanceSq <= maxSquared && endDistZ < (maxDistance + 2.5f)) {
         currentFoundPath = nullptr;
         if (patrolPoints.size() > 0) patrolPoints.remove(0);
 
         if (patrolPoints.size() > 0) {
+#ifdef DEBUG_MOVE
             if (isSimPlayer) info("DEBUG_MOVE: Cornering...", true);
+#endif 
             endMovementPosition = getNextPosition();
             
             // Recalculate Logic for new target
@@ -3710,7 +3715,9 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
             endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
             maxSquared = Math::max(0.1f, maxDistance * maxDistance);
         } else {
+#ifdef DEBUG_MOVE
             if (isSimPlayer) info("DEBUG_MOVE: Arrived.", true);
+#endif 
             if (movementState != AiAgent::FOLLOWING) notifyObservers(ObserverEventType::DESTINATIONREACHED);
             setCurrentSpeed(0.f);
             updateLocomotion();
@@ -3871,8 +3878,9 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     updateCurrentPosition(&nextStepPosition);
 
     if (isPet()) updatePetSwimmingState();
+#ifdef DEBUG_FINDNEXTPOSITION
     if (isSimPlayer) info("findNextPosition - complete returning true", true);
-
+#endif
     return true;
 }
 
@@ -4166,7 +4174,7 @@ bool AiAgentImplementation::generatePatrol(int num, float dist) {
 		}
 	}
 
-	info(true) << "ID: " << getObjectID() << " Finished - generatePatrol with a state of " << getMovementState() << " and point size of = " << getPatrolPointSize();
+	//info(true) << "ID: " << getObjectID() << " Finished - generatePatrol with a state of " << getMovementState() << " and point size of = " << getPatrolPointSize();
 
 	if (getPatrolPointSize() > 0)
 		return true;

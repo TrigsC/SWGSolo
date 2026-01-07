@@ -47,6 +47,14 @@ public:
 		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 	};
 
+	void cyclePvPBotWhenShuttleReady(uint64 oldOid,
+                                const String& groupType,
+                                const String& templateName,
+                                bool imperial,
+                                const String& fromPlanet,
+                                const String& fromLocation,
+                                int attempts = 0);
+
 private:
 	bool enabled = true;
 	Vector<ShuttleportLocation> allShuttleports;
@@ -58,6 +66,8 @@ private:
 	void startControllerForAgent(AiAgent* agent, Reference<SimPlayerController*> ctrl);
 
 	bool pickRandomShuttleport(ShuttleportLocation& out) const;
+	bool isNearestShuttleBoardable(CreatureObject* c);
+	
 	String pickRandomTemplate(const SpawnGroup& g) const;
 	bool isImperialForSpawn(const SpawnGroup& g, const String& templateName) const;
 
