@@ -232,14 +232,94 @@ void SimPvPController::requestCycleToNextStop() {
 }
 
 void SimPvPController::onTick() {
-	if (agent == nullptr || agent->isDead())
+	if (agent == nullptr)
 		return;
+
+	// NEW: If the bot dies (killed by player/NPC/etc.), recycle it.
+	if (agent->isDead()) {
+		if (cycleRequested)
+			return;
+
+		cycleRequested = true;
+		state = SimPlayerController::WAITING;
+
+		const uint64 oid = agent->getObjectID();
+
+		// Resolve manager if missing
+		if (manager == nullptr)
+			manager = SimPlayerManager::instance();
+
+		// Self-heal context so recycle works even from toggleBot spawns
+		if (groupType.isEmpty())
+			groupType = "pvp_solo";
+
+		if (templateName.isEmpty()) {
+			const CreatureTemplate* tmpl = agent->getCreatureTemplate();
+			if (tmpl != nullptr)
+				templateName = tmpl->getTemplateName();
+		}
+
+		if (planet.isEmpty()) {
+			Zone* z = agent->getZone();
+			if (z != nullptr)
+				planet = z->getZoneName();
+		}
+
+		if (locationName.isEmpty())
+			locationName = "unknown";
+
+		// Give a little time for loot/corpse to exist before we replace + cleanup.
+		const int recycleDelayMs = 15000;
+
+#ifdef DEBUG_SIMPVP
+		Logger::console.info(
+			"SimPvP: detected dead bot; scheduling recycle oid=" + String::valueOf(oid) +
+			" delayMs=" + String::valueOf(recycleDelayMs) +
+			" mgrSet=" + String::valueOf(manager != nullptr) +
+			" groupType=" + groupType +
+			" template=" + templateName +
+			" planet=" + planet +
+			" location=" + locationName,
+			true
+		);
+#endif
+
+		if (manager == nullptr)
+			return;
+
+		SimPlayerManager* mgr = manager;
+		String grp = groupType;
+		String tmpl = templateName;
+		String fromPlanet = planet;
+		String fromLoc = locationName;
+		bool imperial = isImperial;
+
+		Core::getTaskManager()->scheduleTask([mgr, oid, grp, tmpl, imperial, fromPlanet, fromLoc]() {
+			if (mgr == nullptr)
+				return;
+
+			// For death, do NOT use *WhenShuttleReady* (it may never become "shuttle ready").
+			mgr->cyclePvPBot(oid, grp, tmpl, imperial, fromPlanet, fromLoc);
+		}, "SimPvPRecycleOnDeath", recycleDelayMs);
+
+		return;
+	}
 
 	if (agent->isInCombat())
 		return;
 
 	scanForTargets();
 }
+
+//void SimPvPController::onTick() {
+//	if (agent == nullptr || agent->isDead())
+//		return;
+//
+//	if (agent->isInCombat())
+//		return;
+//
+//	scanForTargets();
+//}
 
 void SimPvPController::scanForTargets() {
 	if (agent == nullptr)

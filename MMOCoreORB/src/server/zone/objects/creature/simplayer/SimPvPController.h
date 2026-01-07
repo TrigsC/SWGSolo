@@ -63,7 +63,7 @@ private:
 	bool returningToShuttle = false;
 	bool isImperial = false;
 
-	// Prevent shuttle-arrival spam (only request cycle once)
+	// Prevent repeated recycle requests (used for shuttle-arrival spam AND death recycle)
 	bool cycleRequested = false;
 
 	// Cycle support
@@ -73,6 +73,7 @@ private:
 	String planet;
 	String locationName;
 
+	// Base loiter min; actual loiter is randomized in cpp (30s..180s)
 	int loiterMs = 30000;
 };
 
