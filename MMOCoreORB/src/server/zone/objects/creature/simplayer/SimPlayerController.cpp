@@ -248,9 +248,9 @@ void SimPlayerController::queueMorePathNodes() {
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->getZone() == nullptr) return;
 
-    Locker locker(agent);
-
     onTick(); 
+    
+    Locker locker(agent);
 
     if (agent->isDead() || agent->isIncapacitated()) {
         // tell manager to cleanup corpse after a delay

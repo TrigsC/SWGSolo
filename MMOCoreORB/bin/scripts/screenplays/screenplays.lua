@@ -734,4 +734,5 @@ includeFile("events/ServerEventAutomation.lua")
 -- Custom content - Loads last to allow for overrides
 includeFile("custom/market_seeder.lua")
 includeFile("custom/aiGlobalChatHandler.lua")
+includeFile("custom/smartDoctorBuffer.lua")
 includeFile("../custom_scripts/screenplays/screenplays.lua")

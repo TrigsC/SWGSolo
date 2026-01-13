@@ -68,6 +68,10 @@
 #include "templates/params/creature/ObjectFlag.h"
 #include "templates/params/creature/CreaturePosture.h"
 #include "templates/params/creature/CreatureState.h"
+#include "server/zone/objects/creature/buffs/Buff.h"
+#include "server/zone/objects/creature/BuffAttribute.h"
+#include "server/zone/objects/creature/buffs/BuffType.h"
+#include "server/zone/objects/creature/buffs/BuffCRC.h"
 #include "server/zone/objects/creature/damageovertime/DamageOverTimeList.h"
 #include "server/zone/objects/creature/ai/events/AiBehaviorEvent.h"
 #include "server/zone/objects/creature/ai/events/AiRecoveryEvent.h"
@@ -4181,6 +4185,61 @@ bool AiAgentImplementation::generatePatrol(int num, float dist) {
 
 	setMovementState(savedState);
 	return false;
+}
+
+void AiAgentImplementation::healEnhanceCreatureTarget(CreatureObject* target, String* statKey) {
+    if (target == nullptr || statKey == nullptr)
+        return;
+
+    if (isDead() || target->isDead())
+        return;
+
+    if (target->isInCombat() || isInCombat())
+        return;
+
+    String key = statKey->toLowerCase();
+
+    int attributeIdx = -1;
+    if (key == "health") attributeIdx = 0;
+    else if (key == "strength") attributeIdx = 1;
+    else if (key == "constitution") attributeIdx = 2;
+    else if (key == "action") attributeIdx = 3;
+    else if (key == "quickness") attributeIdx = 4;
+    else if (key == "stamina") attributeIdx = 5;
+    else return;
+
+    const uint32 crc = BuffCRC::getMedicalBuff(attributeIdx);
+
+    // tune these however you want for your server:
+    const int amount = 1200;          // buff strength
+    const float duration = 3600.0f;        // seconds
+    const int buffType = BuffType::MEDICAL;
+
+    Locker locker(target);
+
+    if (target->hasBuff(crc))
+        return;
+
+    ManagedReference<Buff*> buff = new Buff(target, crc, duration, buffType);
+
+    Locker buffLock(buff);
+    buff->setAttributeModifier((uint8)attributeIdx, amount);
+
+    target->addBuff(buff);
+	target->playEffect("clienteffect/healing_healenhance.cef", "");
+	
+}
+
+void AiAgentImplementation::wipeMedicalEnhanceBuffs(CreatureObject* target) {
+    if (target == nullptr)
+        return;
+
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_HEALTH);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_STRENGTH);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_CONSTITUTION);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_ACTION);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_QUICKNESS);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_STAMINA);
 }
 
 float AiAgentImplementation::getMaxDistance() {

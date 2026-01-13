@@ -25,6 +25,8 @@
 #include "server/zone/objects/area/ActiveArea.h"
 #include "server/zone/managers/creature/PetManager.h"
 
+#define DEBUG
+
 const char LuaAiAgent::className[] = "LuaAiAgent";
 
 Luna<LuaAiAgent>::RegType LuaAiAgent::Register[] = {
@@ -136,6 +138,8 @@ Luna<LuaAiAgent>::RegType LuaAiAgent::Register[] = {
 		{ "setEventArea", &LuaAiAgent::setEventArea },
 		{ "setHamRegenDisabled", &LuaAiAgent::setHamRegenDisabled },
 		{ "healCreatureTarget", &LuaAiAgent::healCreatureTarget },
+		{"healEnhanceCreatureTarget", &LuaAiAgent::healEnhanceCreatureTarget},
+		{"wipeMedicalEnhanceBuffs", &LuaAiAgent::wipeMedicalEnhanceBuffs},
 		{ 0, 0 }
 };
 
@@ -1109,6 +1113,95 @@ int LuaAiAgent::healCreatureTarget(lua_State* L) {
 
     // 4. Call your specific logic in AiAgentImplementation.cpp
     realObject->healCreatureTarget(target->asCreatureObject());
+
+    return 0;
+}
+
+int LuaAiAgent::healEnhanceCreatureTarget(lua_State* L) {
+    // Expected Lua call: ai:healEnhanceCreatureTarget(pTarget, "health")
+    // Stack (top): [self][target][key]
+#ifdef DEBUG
+Logger::console.info(true) << "healEnhanceCreatureTarget -- ";
+#endif //DEBUG
+    const int numberOfArguments = lua_gettop(L);
+    if (numberOfArguments < 3) {
+#ifdef DEBUG
+Logger::console.info(true) << "healEnhanceCreatureTarget -- < 3";
+#endif //DEBUG
+		return 0;
+	}
+
+	SceneObject* target = (SceneObject*) lua_touserdata(L, -2);
+
+	const char* keyC = lua_tostring(L, -1);
+	if (realObject == nullptr || target == nullptr || keyC == nullptr) {
+#ifdef DEBUG
+	    Logger::console.info(true) << "healEnhanceCreatureTarget -- Something null";
+#endif
+	    return 0;
+	}
+
+	String key(keyC);
+	if (key.isEmpty()) {
+#ifdef DEBUG
+	    Logger::console.info(true) << "healEnhanceCreatureTarget -- key empty";
+#endif
+	    return 0;
+	}
+        
+    if (!target->isCreatureObject()) {
+#ifdef DEBUG
+Logger::console.info(true) << "healEnhanceCreatureTarget -- not isCreatureObject";
+#endif //DEBUG
+		return 0;
+	}
+
+    // Delegate to AiAgentImplementation for the actual buff application logic.
+    // NOTE: Auto-generated Core3 signatures typically use String*.
+    //String keyStr(key);
+    realObject->healEnhanceCreatureTarget(target->asCreatureObject(), &key);
+#ifdef DEBUG
+Logger::console.info(true) << "healEnhanceCreatureTarget -- made it!";
+#endif //DEBUG
+    return 0;
+}
+
+int LuaAiAgent::wipeMedicalEnhanceBuffs(lua_State* L) {
+    // Expected Lua call: ai:wipeMedicalEnhanceBuffs(pTarget)
+    // Stack (top): [self][target]
+#ifdef DEBUG
+    Logger::console.info(true) << "wipeMedicalEnhanceBuffs -- ";
+#endif // DEBUG
+
+    const int numberOfArguments = lua_gettop(L);
+    if (numberOfArguments < 2) {
+#ifdef DEBUG
+        Logger::console.info(true) << "wipeMedicalEnhanceBuffs -- < 2";
+#endif // DEBUG
+        return 0;
+    }
+
+    SceneObject* target = (SceneObject*) lua_touserdata(L, -1);
+
+    if (realObject == nullptr || target == nullptr) {
+#ifdef DEBUG
+        Logger::console.info(true) << "wipeMedicalEnhanceBuffs -- Something null";
+#endif // DEBUG
+        return 0;
+    }
+
+    if (!target->isCreatureObject()) {
+#ifdef DEBUG
+        Logger::console.info(true) << "wipeMedicalEnhanceBuffs -- not isCreatureObject";
+#endif // DEBUG
+        return 0;
+    }
+
+    realObject->wipeMedicalEnhanceBuffs(target->asCreatureObject());
+
+#ifdef DEBUG
+    Logger::console.info(true) << "wipeMedicalEnhanceBuffs -- made it!";
+#endif // DEBUG
 
     return 0;
 }
