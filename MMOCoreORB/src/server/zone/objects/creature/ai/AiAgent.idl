@@ -769,6 +769,11 @@ class AiAgent extends CreatureObject {
 	@local
 	public abstract native void wipeMedicalEnhanceBuffs(CreatureObject target);
 
+	@mock
+	@preLocked
+	@local
+	public abstract native void wipeEnhanceBuffs(CreatureObject target, unsigned int flags); 
+
 	/**
 	 * Gets called when the creature was despawned
 	 */

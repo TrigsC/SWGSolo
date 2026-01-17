@@ -133,6 +133,11 @@ namespace ai {
 		int healCreatureTarget(lua_State* L);
 		int healEnhanceCreatureTarget(lua_State* L);
 		int wipeMedicalEnhanceBuffs(lua_State* L);
+		int wipeEnhanceBuffs(lua_State* L);
+		int startDancingByName(lua_State* L);
+		int applyDanceMindBuff(lua_State* L);
+		int startPlayingMusicByName(lua_State* L);
+		int applyMusicBuffs(lua_State* L);
 	private:
 		AiAgent* realObject;
 	};

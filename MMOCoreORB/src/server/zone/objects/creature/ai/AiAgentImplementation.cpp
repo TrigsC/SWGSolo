@@ -182,6 +182,12 @@ static void debugLogAttackMap(AiAgentImplementation* agent,
 }
 #endif // DEBUG_AI_WEAPONS
 
+namespace EnhanceWipeFlags {
+    static const uint32 MEDICAL = 1 << 0;
+    static const uint32 DANCE   = 1 << 1; // mind performance buff
+    static const uint32 MUSIC   = 1 << 2; // focus+will performance buffs
+}
+
 namespace {
 
 bool originatesFromDestroyMissionLair(AiAgent* agent) {
@@ -4240,6 +4246,56 @@ void AiAgentImplementation::wipeMedicalEnhanceBuffs(CreatureObject* target) {
     target->removeBuff(BuffCRC::MEDICAL_ENHANCE_ACTION);
     target->removeBuff(BuffCRC::MEDICAL_ENHANCE_QUICKNESS);
     target->removeBuff(BuffCRC::MEDICAL_ENHANCE_STAMINA);
+}
+
+void AiAgentImplementation::wipeEnhanceBuffs(CreatureObject* target, uint32 flags) {
+    if (target == nullptr)
+        return;
+
+    if (flags & EnhanceWipeFlags::MEDICAL) {
+        wipeMedicalEnhanceBuffs(target); // reuse your existing stable behavior
+    }
+
+    if (flags & EnhanceWipeFlags::DANCE) {
+        target->removeBuff(0x11C1772E); // performance_enhance_dance_mind
+    }
+
+    if (flags & EnhanceWipeFlags::MUSIC) {
+        target->removeBuff(0x2E77F586); // performance_enhance_music_focus
+        target->removeBuff(0x3EC6FCB6); // performance_enhance_music_willpower
+    }
+
+    // Battle fatigue + mind/focus/willpower wounds are "performance side"
+    if (flags & (EnhanceWipeFlags::DANCE | EnhanceWipeFlags::MUSIC)) {
+        // Lock just the target; AiAgentImplementation isn't Lockable.
+		Locker clocker(target);
+
+		// Use the AI creature itself as the healer attribution.
+		// (AiAgentImplementation is the implementation of a CreatureObject)
+		//TangibleObject* healer = cast<TangibleObject*>(_this.get());
+		//TangibleObject* healer = cast<TangibleObject*>(realObject.get());
+		TangibleObject* healer = nullptr;
+
+		float shock = target->getShockWounds();
+		if (shock > 0) {
+		    target->addShockWounds(-shock, true, false);
+		}
+
+		int mindW = target->getWounds(CreatureAttribute::MIND);
+		if (mindW > 0) {
+		    target->healWound(healer, CreatureAttribute::MIND, mindW, true, false);
+		}
+
+		int focusW = target->getWounds(CreatureAttribute::FOCUS);
+		if (focusW > 0) {
+		    target->healWound(healer, CreatureAttribute::FOCUS, focusW, true, false);
+		}
+
+		int willW = target->getWounds(CreatureAttribute::WILLPOWER);
+		if (willW > 0) {
+		    target->healWound(healer, CreatureAttribute::WILLPOWER, willW, true, false);
+		}
+	}
 }
 
 float AiAgentImplementation::getMaxDistance() {
