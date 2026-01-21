@@ -9,10 +9,6 @@
 --  2) This drop-in version removes ALL uses of setCustomObjectName(name, true) and uses name-only.
 --  3) This drop-in version wraps ALL createEvent calls to ensure delay_ms >= 1 and args are strings.
 
-print("###################################################")
-print("CRITICAL DEBUG: SmartDoctorBuffer LOADED")
-print("###################################################")
-
 local ObjectManager = require("managers.object.object_manager")
 
 SmartDoctorConfig = SmartDoctorConfig or {}
@@ -22,27 +18,15 @@ SmartDoctorConfig.pause_grace_ms = SmartDoctorConfig.pause_grace_ms or 8000
 _G.__smartDocLoadCount = (_G.__smartDocLoadCount or 0) + 1
 _G.__smartDocChunkId = _G.__smartDocChunkId or tostring(os.time()) .. "-" .. tostring(math.random(100000, 999999))
 
-print(string.format("### [SmartDoctor][LOAD] count=%d chunkId=%s file=%s",
-    _G.__smartDocLoadCount,
-    tostring(_G.__smartDocChunkId),
-    "smartDoctorBuffer.lua"
-))
-print("### [SmartDoctor][DEBUG] smartDoctorBuffer.lua load count = " .. tostring(_G.__smartDocLoadCount) ..
-      " ScreenPlay=" .. tostring(_G.ScreenPlay) ..
-      " SmartDoctorBuffer=" .. tostring(_G.SmartDoctorBuffer))
-
-print("### [SmartDoctor][DEBUG] _G.ScreenPlay = " .. tostring(ScreenPlay) .. " type=" .. type(ScreenPlay) .. " ###")
-print("### [SmartDoctor][DEBUG] _G.SmartDoctorBuffer (pre-create) = " .. tostring(SmartDoctorBuffer) .. " type=" .. type(SmartDoctorBuffer) .. " ###")
-print("### [SmartDoctor][DEBUG] About to run: SmartDoctorBuffer = ScreenPlay:new{ numberOfActs = 1 } ###")
-
 if SmartDoctorBuffer == nil then
-    print("### [SmartDoctor][DEBUG] Creating ScreenPlay SmartDoctorBuffer ###")
+    --print("### [SmartDoctor][DEBUG] Creating ScreenPlay SmartDoctorBuffer ###")
     SmartDoctorBuffer = ScreenPlay:new { numberOfActs = 1 }
 else
-    print("### [SmartDoctor][DEBUG] SmartDoctorBuffer already exists; type=" .. type(SmartDoctorBuffer) .. " ###")
+    --print("### [SmartDoctor][DEBUG] SmartDoctorBuffer already exists; type=" .. type(SmartDoctorBuffer) .. " ###")
+    SmartDoctorBuffer = { numberOfActs = 1 }
 end
-
-print("### [SmartDoctor][DEBUG] _G.SmartDoctorBuffer (post-create) = " .. tostring(SmartDoctorBuffer) .. " type=" .. type(SmartDoctorBuffer) .. " ###")
+-- 
+-- print("### [SmartDoctor][DEBUG] _G.SmartDoctorBuffer (post-create) = " .. tostring(SmartDoctorBuffer) .. " type=" .. type(SmartDoctorBuffer) .. " ###")
 
 -- ========= Config normalization (safe defaults) =========
 SmartDoctorConfig.buff_steps = SmartDoctorConfig.buff_steps or {
@@ -60,16 +44,49 @@ SmartDoctorConfig.price = SmartDoctorConfig.price or 5000
 SmartDoctorConfig.doctor_custom_name = SmartDoctorConfig.doctor_custom_name or "Doctor"
 
 SmartDoctorConfig.spawn_points = SmartDoctorConfig.spawn_points or {
+    -- coronet
     {
         planet = "corellia",
-        x = -153,
-        z = 28,
-        y = -4723,
+        x = -18.54,
+        z = 26,
+        y = 3.33,
         heading = 90,
-        cell = 0,
-        customName = "Doc Buffer"
+        cell = 1855535,
+        customName = "Doctor Buffer"
+    },
+    -- moenia
+    {
+        planet = "naboo",
+        x = -18.57,
+        z = 0.26,
+        y = 3.02,
+        heading = 0,
+        cell = 1717506,
+        customName = "Doctor Buffer"
+    },
+    -- theed
+    {
+        planet = "naboo",
+        x = -18.46,
+        z = 0.26,
+        y = 3.39,
+        heading = 0,
+        cell = 1697364,
+        customName = "Doctor Buffer"
+    },
+    -- mos eisly
+    {
+        planet = "tatooine",
+        x = 7.45,
+        z = 0.18,
+        y = 2.29,
+        heading = 180,
+        cell = 9655496,
+        customName = "Doctor Buffer"
     }
 }
+
+SmartDoctorConfig._spawn_registry_prefix = SmartDoctorConfig._spawn_registry_prefix or "SmartDoctorBuffer:spawned:"
 
 -- Optional dialogue module hook
 local SmartDoctorDialogue = nil
@@ -82,6 +99,20 @@ end
 local function logInfo(msg) print("[SmartDoctor] " .. tostring(msg)) end
 local function logWarn(msg) print("[SmartDoctor][WARN] " .. tostring(msg)) end
 local function nowSec() return os.time() end
+
+local function spawnRegistryKey(sp)
+    return SmartDoctorConfig._spawn_registry_prefix .. tostring(sp.key or "")
+end
+
+local function getSpawnedDoctorId(sp)
+    if sp == nil or sp.key == nil or sp.key == "" then return 0 end
+    return readData(spawnRegistryKey(sp)) or 0
+end
+
+local function setSpawnedDoctorId(sp, did)
+    if sp == nil or sp.key == nil or sp.key == "" then return end
+    writeData(spawnRegistryKey(sp), did or 0)
+end
 -- ===== Persistence (C++ datastore) =====
 local STATE_IDLE        = 0
 local STATE_NEGOTIATING = 1
@@ -201,13 +232,13 @@ local function inRange(pDoctor, pPlayer)
 end
 
 local function isValidBuffTarget(pDoctor, pPlayer)
-    logInfo("isValidBuffTarget")
+    --logInfo("isValidBuffTarget")
     if pDoctor == nil or pPlayer == nil then return false, "invalid" end
     if CreatureObject(pDoctor):isDead() then return false, "doctor_dead" end
     if CreatureObject(pPlayer):isDead() then return false, "player_dead" end
     if not inRange(pDoctor, pPlayer) then return false, "out_of_range" end
     if CreatureObject(pPlayer):isInCombat() then return false, "in_combat" end
-    logInfo("isValidBuffTarget true")
+    --logInfo("isValidBuffTarget true")
     return true, "ok"
 end
 
@@ -267,7 +298,7 @@ local function normalizeMsg(msg)
 end
 
 local function isBuffRequest(msg)
-    logInfo("isBuffRequest")
+    --logInfo("isBuffRequest")
     msg = normalizeMsg(msg)
     if msg == "" then return false end
     if string.find(msg, "need a buff") then return true end
@@ -277,7 +308,7 @@ local function isBuffRequest(msg)
     if string.find(msg, "doctor buff") then return true end
     if msg == "buff" or msg == "buffs" then return true end
     if string.find(msg, "can i get") and string.find(msg, "buff") then return true end
-    logInfo("isBuffRequest false")
+    --logInfo("isBuffRequest false")
     return false
 end
 
@@ -310,7 +341,7 @@ local function safeCreateEvent(delayMs, screenplayName, methodName, pObj, arg)
     local args = arg
     if args == nil then args = "" end
     if type(args) ~= "string" then args = tostring(args) end
-    logInfo("createEvent")
+    --logInfo("createEvent")
     createEvent(ms, screenplayName, methodName, pObj, args)
 end
 
@@ -339,7 +370,7 @@ local function buildSlots(pDoctor, pPlayer, doctorState, extra)
 end
 
 local function pickDeterministicLine(key, slots, memoryTopic)
-    logInfo("pickDeterministicLine")
+    --logInfo("pickDeterministicLine")
     if key == "quote" then
         return string.format("%s, that'll be %s credits for a full set. Sound good?", slots.playerName, slots.price)
     elseif key == "busy" then
@@ -378,20 +409,20 @@ local function pickDeterministicLine(key, slots, memoryTopic)
 end
 
 local function dialogueLine(key, pDoctor, pPlayer, doctorState, extra, memoryTopic)
-    logInfo("dialogueLine " .. tostring(key))
+    --logInfo("dialogueLine " .. tostring(key))
     local slots = buildSlots(pDoctor, pPlayer, doctorState, extra)
-    logInfo("dialogueLine slots: " .. tostring(slots))
+    --logInfo("dialogueLine slots: " .. tostring(slots))
 
     if SmartDoctorDialogue ~= nil and SmartDoctorDialogue.getLine ~= nil then
-        logInfo("dialogueLine if SmartDoctorDialogue ~= nil and SmartDoctorDialogue.getLine ~= nil then")
+        --logInfo("dialogueLine if SmartDoctorDialogue ~= nil and SmartDoctorDialogue.getLine ~= nil then")
         local ok, line = pcall(SmartDoctorDialogue.getLine, key, slots, memoryTopic)
-        logInfo("dialogueLine slots: " .. tostring(line))
+        --logInfo("dialogueLine slots: " .. tostring(line))
         if ok and line ~= nil and line ~= "" then
-            logInfo("dialogueLine line: " .. tostring(line))
+            --logInfo("dialogueLine line: " .. tostring(line))
             return line
         end
     end
-    logInfo("dialogueLine pickDeterministicLine")
+    --logInfo("dialogueLine pickDeterministicLine")
     return pickDeterministicLine(key, slots, memoryTopic)
 end
 
@@ -437,7 +468,7 @@ local function getDoctorState(pDoctor)
     if did == 0 then return nil end
 
     if Doctor[did] == nil then
-        print("[SmartDoctor][DEBUG] getDoctorState INIT did=" .. tostring(did))
+        --print("[SmartDoctor][DEBUG] getDoctorState INIT did=" .. tostring(did))
         Doctor[did] = {
             state = "IDLE",
             queue = {},
@@ -452,11 +483,11 @@ local function getDoctorState(pDoctor)
     -- IMPORTANT: Always refresh from datastore so different Lua states stay in sync
     persistLoad(did, Doctor[did])
 
-    print("[SmartDoctor][DEBUG] getDoctorState SYNC did=" .. tostring(did) ..
-          " state=" .. tostring(Doctor[did].state) ..
-          " negPid=" .. tostring(Doctor[did].negotiating and Doctor[did].negotiating.playerId or 0) ..
-          " curPid=" .. tostring(Doctor[did].current and Doctor[did].current.playerId or 0) ..
-          " step=" .. tostring(Doctor[did].current and Doctor[did].current.stepIndex or 0))
+    --print("[SmartDoctor][DEBUG] getDoctorState SYNC did=" .. tostring(did) ..
+    --      " state=" .. tostring(Doctor[did].state) ..
+    --      " negPid=" .. tostring(Doctor[did].negotiating and Doctor[did].negotiating.playerId or 0) ..
+    --      " curPid=" .. tostring(Doctor[did].current and Doctor[did].current.playerId or 0) ..
+    --      " step=" .. tostring(Doctor[did].current and Doctor[did].current.stepIndex or 0))
 
     return Doctor[did]
 end
@@ -508,44 +539,21 @@ end
 
 -- ========= Credits =========
 local function tryChargePlayer(pDoctor, pPlayer, price)
-    logInfo("tryChargePlayer")
+    --logInfo("tryChargePlayer")
     if pPlayer == nil then return false, "invalid" end
     --local ghost = CreatureObject(pPlayer):getPlayerObject()
     --if ghost == nil then return false, "invalid" end
     if (CreatureObject(pPlayer):getCashCredits() < price) then
-        logInfo("tryChargePlayer insufficient")
+        --logInfo("tryChargePlayer insufficient")
         return false, "insufficient" 
     end
-    --local cash = ghost:getCashCredits() or 0
-    --local bank = ghost:getBankCredits() or 0
-    --local total = cash + bank
 
-    --if total < price then return false, "insufficient" end
-
-    --if cash >= price then
-        --ghost:subtractCashCredits(price)
-    --local messageString = ""
     CreatureObject(pPlayer):subtractCashCredits(price)
 
 	CreatureObject(pPlayer):sendSystemMessage("You successfully purchase a Buff for " .. price .. " credits.")
-    logInfo("tryChargePlayer ok")
+    --logInfo("tryChargePlayer ok")
     return true, "ok"
-    --end
-
-    --local remaining = price - cash
-    --if cash > 0 then ghost:subtractCashCredits(cash) end
-    --ghost:subtractBankCredits(remaining)
-    --return true, "ok"
 end
-
--- ========= Buff application =========
---local function applyBuffStep(pDoctor, pPlayer, stepKey)
---    if pDoctor == nil or pPlayer == nil then return false end
---    if stepKey == nil or stepKey == "" then return false end
---    LuaAiAgent(pDoctor):healEnhanceCreatureTarget(pPlayer, stepKey)
---    return true
---end
-
 
 local function hasMethod(obj, name)
     local ok, val = pcall(function() return obj[name] end)
@@ -558,7 +566,7 @@ local function callMethod(obj, name, ...)
     if fn == nil then return false end
     local ok, err = pcall(fn, obj, ...)
     if not ok then
-        print("[SmartDoctor][ERROR] callMethod " .. tostring(name) .. " failed: " .. tostring(err))
+        --print("[SmartDoctor][ERROR] callMethod " .. tostring(name) .. " failed: " .. tostring(err))
         return false
     end
     return true
@@ -569,11 +577,11 @@ local function applyBuffStep(pDoctor, pPlayer, stepKey)
     if stepKey == nil or stepKey == "" then return false end
 
     local agent = LuaAiAgent(pDoctor)
-    print(string.format("[SmartDoctor][DEBUG] applyBuffStep stepKey=%s agent=%s",
-        tostring(stepKey), tostring(agent)))
+    --print(string.format("[SmartDoctor][DEBUG] applyBuffStep stepKey=%s agent=%s",
+    --    tostring(stepKey), tostring(agent)))
 
     if agent == nil then
-        print("[SmartDoctor][ERROR] applyBuffStep: LuaAiAgent(pDoctor) returned nil")
+        --print("[SmartDoctor][ERROR] applyBuffStep: LuaAiAgent(pDoctor) returned nil")
         return false
     end
 
@@ -582,7 +590,7 @@ local function applyBuffStep(pDoctor, pPlayer, stepKey)
         return callMethod(agent, "healEnhanceCreatureTarget", pPlayer, stepKey)
     end
 
-    print("[SmartDoctor][ERROR] No enhance/buff method found on LuaAiAgent in this Core3 build.")
+    --print("[SmartDoctor][ERROR] No enhance/buff method found on LuaAiAgent in this Core3 build.")
     return false
 end
 
@@ -618,14 +626,6 @@ local function advanceToNextTarget(pDoctor, st)
     end
 end
 
-print("### [SmartDoctor][DEBUG] entering method-definition section ###")
-print("### [SmartDoctor][DEBUG] SmartDoctorBuffer type (at method section) = " .. tostring(type(SmartDoctorBuffer)))
-if SmartDoctorBuffer == nil then
-    print("### [SmartDoctor][DEBUG] SmartDoctorBuffer IS NIL right before method defs ###")
-else
-    print("### [SmartDoctor][DEBUG] SmartDoctorBuffer exists; methods should attach OK ###")
-end
-
 function SmartDoctorBuffer_onTick(pDoctor)
 end
 
@@ -642,11 +642,11 @@ function SmartDoctorBuffer:tick(pDoctor)
     if doctor == nil then return end
     if doctor:isDead() then return end
 
-    logInfo("In the Tick")
+    --logInfo("In the Tick")
 
     local st = getDoctorState(pDoctor)
     if st == nil then return end
-    logInfo("Tick: before the Buffing, pauses, idle")
+    --logInfo("Tick: before the Buffing, pauses, idle")
     if st.state ~= "BUFFING" and st.state ~= "PAUSED" then return end
     if st.current == nil then st.state = "IDLE"; return end
 
@@ -654,7 +654,7 @@ function SmartDoctorBuffer:tick(pDoctor)
     local pPlayer = getCreatureById(pid)
 
     if pPlayer == nil then
-        logInfo("tick: current target invalid, cancelling and moving on")
+        --logInfo("tick: current target invalid, cancelling and moving on")
         say(pDoctor, dialogueLine("cancel", pDoctor, nil, st))
         advanceToNextTarget(pDoctor, st)
         return
@@ -673,7 +673,7 @@ function SmartDoctorBuffer:tick(pDoctor)
     end
 
     if st.state ~= "PAUSED" then
-        logInfo("PAUSED")
+        --logInfo("PAUSED")
         st.state = "PAUSED"
         st.current.pauseStartSec = nowSec()
         persistSave(getId(pDoctor), st)
@@ -685,7 +685,7 @@ function SmartDoctorBuffer:tick(pDoctor)
     else
         local ps = st.current.pauseStartSec or nowSec()
         if (nowSec() - ps) * 1000 > SmartDoctorConfig.pause_grace_ms then
-            logInfo("pause grace exceeded; cancelling target " .. getPlayerName(pPlayer))
+            --logInfo("pause grace exceeded; cancelling target " .. getPlayerName(pPlayer))
             say(pDoctor, dialogueLine("cancel", pDoctor, pPlayer, st))
             advanceToNextTarget(pDoctor, st)
             return
@@ -696,7 +696,7 @@ function SmartDoctorBuffer:tick(pDoctor)
 end
 
 function SmartDoctorBuffer:applyNextStep(pDoctor, playerIdStr)
-    logInfo("applyNextStep")
+    --logInfo("applyNextStep")
     local st = getDoctorState(pDoctor)
     if st == nil then return end
     if st.state ~= "BUFFING" then return end
@@ -707,13 +707,13 @@ function SmartDoctorBuffer:applyNextStep(pDoctor, playerIdStr)
 
     local pPlayer = getCreatureById(pid)
     if pPlayer == nil then
-        logInfo("applyNextStep: player invalid, moving on")
+        --logInfo("applyNextStep: player invalid, moving on")
         advanceToNextTarget(pDoctor, st)
         return
     end
 
     local ok = isValidBuffTarget(pDoctor, pPlayer)
-    logInfo("isValidBuffTarget: " .. tostring(ok))
+    --logInfo("isValidBuffTarget: " .. tostring(ok))
     if not ok then
         st.state = "PAUSED"
         st.current.pauseStartSec = nowSec()
@@ -723,7 +723,7 @@ function SmartDoctorBuffer:applyNextStep(pDoctor, playerIdStr)
     end
 
     --faceTarget(pDoctor, pPlayer)
-    logInfo("Would normally face target")
+    --logInfo("Would normally face target")
 
     local idx = st.current.stepIndex or 1
     if idx < 1 then idx = 1 end
@@ -744,7 +744,7 @@ function SmartDoctorBuffer:applyNextStep(pDoctor, playerIdStr)
 
     local stepKey = SmartDoctorConfig.buff_steps[idx]
     if stepKey == nil then
-        logWarn("Missing buff step at index " .. tostring(idx))
+        --logWarn("Missing buff step at index " .. tostring(idx))
         st.current.stepIndex = idx + 1
         persistSave(getId(pDoctor), st)
         safeCreateEvent(250, "SmartDoctorBuffer", "applyNextStep", pDoctor, tostring(pid))
@@ -761,7 +761,7 @@ function SmartDoctorBuffer:applyNextStep(pDoctor, playerIdStr)
 
     local applied = applyBuffStep(pDoctor, pPlayer, stepKey)
     if not applied then
-        logWarn("applyBuffStep FAILED for stepKey=" .. tostring(stepKey) .. "   aborting buff session")
+        --logWarn("applyBuffStep FAILED for stepKey=" .. tostring(stepKey) .. "   aborting buff session")
         say(pDoctor, "Uh… my medical droid interface is busted. Hang on a sec.")
         st.state = "IDLE"
         st.current = nil
@@ -771,7 +771,7 @@ function SmartDoctorBuffer:applyNextStep(pDoctor, playerIdStr)
     end
 
     st.current.stepIndex = idx + 1
-    print("st.current.stepIndex = idx + 1")
+    --print("st.current.stepIndex = idx + 1")
     persistSave(getId(pDoctor), st)
     safeCreateEvent(SmartDoctorConfig.step_delay_ms, "SmartDoctorBuffer", "applyNextStep", pDoctor, tostring(pid))
     safeCreateEvent(1000, "SmartDoctorBuffer", "tick", pDoctor, "")
@@ -820,32 +820,32 @@ local function alreadyQueuedOrCurrent(st, playerId)
 end
 
 local function enqueuePlayer(st, playerId)
-    logInfo("enqueuePlayer")
+    --logInfo("enqueuePlayer")
     if #st.queue >= SmartDoctorConfig.max_queue_length then
-        logInfo("enqueuePlayer: full")
+        --logInfo("enqueuePlayer: full")
         return false, "full"
     end
     if st.queueSet[playerId] == true then
-        logInfo("enqueuePlayer: already")
+        --logInfo("enqueuePlayer: already")
         return true, "already"
     end
     table.insert(st.queue, playerId)
     st.queueSet[playerId] = true
-    logInfo("enqueuePlayer: ok")
+    --logInfo("enqueuePlayer: ok")
     return true, "ok"
 end
 
 local function startBuffingNow(pDoctor, st, pPlayer)
-    logInfo("startBuffingNow")
+    --logInfo("startBuffingNow")
     local pid = getId(pPlayer)
     if pid == 0 then return end
-    logInfo("startBuffingNow: pid <> 0")
+    --logInfo("startBuffingNow: pid <> 0")
     local okCharge = tryChargePlayer(pDoctor, pPlayer, SmartDoctorConfig.price)
-    logInfo("startBuffingNow: " .. tostring(okCharge))
+    --logInfo("startBuffingNow: " .. tostring(okCharge))
     if not okCharge then
-        logInfo("startBuffingNow: not okChange")
+        --logInfo("startBuffingNow: not okChange")
         say(pDoctor, dialogueLine("poor", pDoctor, pPlayer, st))
-        logInfo("Insufficient credits for " .. getPlayerName(pPlayer))
+        --logInfo("Insufficient credits for " .. getPlayerName(pPlayer))
         advanceToNextTarget(pDoctor, st)
         return
     end
@@ -863,16 +863,15 @@ local function startBuffingNow(pDoctor, st, pPlayer)
 
     local agent = LuaAiAgent(pDoctor)
     if agent == nil then
-        logInfo("[SmartDoctor][WIPE] ERROR: LuaAiAgent(pDoctor) returned nil; cannot wipe buffs.")
+        --logInfo("[SmartDoctor][WIPE] ERROR: LuaAiAgent(pDoctor) returned nil; cannot wipe buffs.")
     elseif agent.wipeMedicalEnhanceBuffs == nil then
         logInfo("[SmartDoctor][WIPE] ERROR: wipeMedicalEnhanceBuffs is nil on LuaAiAgent; binding not present.")
     else
-        logInfo("[SmartDoctor][WIPE] Wiping medical buffs on " .. getPlayerName(pPlayer))
-        agent:wipeMedicalEnhanceBuffs(pPlayer)
-        logInfo("[SmartDoctor][WIPE] Done wiping medical buffs on " .. getPlayerName(pPlayer))
+        --logInfo("[SmartDoctor][WIPE] Wiping medical buffs on " .. getPlayerName(pPlayer))
+        agent:wipeEnhanceBuffs(pPlayer, 1)
+        --logInfo("[SmartDoctor][WIPE] Done wiping medical buffs on " .. getPlayerName(pPlayer))
     end
-
-    logInfo("Starting buffs for " .. getPlayerName(pPlayer) .. " price=" .. tostring(SmartDoctorConfig.price))
+    --logInfo("Starting buffs for " .. getPlayerName(pPlayer) .. " price=" .. tostring(SmartDoctorConfig.price))
     safeCreateEvent(250, "SmartDoctorBuffer", "applyNextStep", pDoctor, tostring(pid))
     safeCreateEvent(1000, "SmartDoctorBuffer", "tick", pDoctor, "")
 end
@@ -887,11 +886,11 @@ function SmartDoctorBuffer:handleChat(pDoctor, pSpeaker, message)
 
     local did = getId(pDoctor)
     local sid = getId(pSpeaker)
-    print(string.format("[SmartDoctor][DEBUG] handleChat did=%s sid=%s msg='%s'", tostring(did), tostring(sid), tostring(message)))
+    --print(string.format("[SmartDoctor][DEBUG] handleChat did=%s sid=%s msg='%s'", tostring(did), tostring(sid), tostring(message)))
 
     local st = getDoctorState(pDoctor)
-    print(string.format("[SmartDoctor][DEBUG] st=%s st.state=%s st.negotiating=%s",
-        tostring(st), tostring(st and st.state), tostring(st and st.negotiating)))
+    --print(string.format("[SmartDoctor][DEBUG] st=%s st.state=%s st.negotiating=%s",
+    --    tostring(st), tostring(st and st.state), tostring(st and st.negotiating)))
     if pDoctor == nil or pSpeaker == nil then return false end
     if st == nil then return false end
 
@@ -912,11 +911,11 @@ function SmartDoctorBuffer:handleChat(pDoctor, pSpeaker, message)
         end
 
         if st.negotiating ~= nil and st.negotiating.playerId == speakerId then
-            logInfo("handleChat: st.negotiating: " .. getPlayerName(pSpeaker))
+            --logInfo("handleChat: st.negotiating: " .. getPlayerName(pSpeaker))
             say(pDoctor, dialogueLine("cancel", pDoctor, pSpeaker, st))
             st.negotiating = nil
             st.state = "IDLE"
-            logInfo("handleChat: Player cancelled negotiation: " .. getPlayerName(pSpeaker))
+            --logInfo("handleChat: Player cancelled negotiation: " .. getPlayerName(pSpeaker))
             advanceToNextTarget(pDoctor, st)
             return true
         end
@@ -924,7 +923,7 @@ function SmartDoctorBuffer:handleChat(pDoctor, pSpeaker, message)
         if st.queueSet[speakerId] == true then
             removeFromQueue(st, speakerId)
             say(pDoctor, "Alright you're off the list.")
-            logInfo("handleChat: Player removed from queue: " .. getPlayerName(pSpeaker))
+            --logInfo("handleChat: Player removed from queue: " .. getPlayerName(pSpeaker))
             return true
         end
 
@@ -937,14 +936,14 @@ function SmartDoctorBuffer:handleChat(pDoctor, pSpeaker, message)
             setMemoryTopic(speakerId, msg)
         end
     end
-    logInfo("before NEGOTIATING")
-    print("[SmartDoctor][DEBUG] STATE=" .. tostring(st and st.state))
-    print("[SmartDoctor][DEBUG] NEGOTIATING=" .. tostring(st and st.negotiating))
-    print("[SmartDoctor][DEBUG] NEGOTIATING.playerId=" .. tostring(st and st.negotiating and st.negotiating.playerId))
+    --logInfo("before NEGOTIATING")
+    --print("[SmartDoctor][DEBUG] STATE=" .. tostring(st and st.state))
+    --print("[SmartDoctor][DEBUG] NEGOTIATING=" .. tostring(st and st.negotiating))
+    --print("[SmartDoctor][DEBUG] NEGOTIATING.playerId=" .. tostring(st and st.negotiating and st.negotiating.playerId))
     if st.state == "NEGOTIATING" and st.negotiating ~= nil and st.negotiating.playerId == speakerId then
-        logInfo("after if st.state == NEGOTIATING and st.negotiating ~= nil and st.negotiating.playerId == speakerId then")
+        --logInfo("after if st.state == NEGOTIATING and st.negotiating ~= nil and st.negotiating.playerId == speakerId then")
         if isConfirm(msg) then
-            logInfo("after isConfirm")
+            --logInfo("after isConfirm")
             local ok, reason = isValidBuffTarget(pDoctor, pSpeaker)
             if not ok then
                 if reason == "out_of_range" then
@@ -960,7 +959,7 @@ function SmartDoctorBuffer:handleChat(pDoctor, pSpeaker, message)
             startBuffingNow(pDoctor, st, pSpeaker)
             return true
         end
-        logInfo("before isDecline")
+        --logInfo("before isDecline")
         if isDecline(msg) then
             say(pDoctor, dialogueLine("decline", pDoctor, pSpeaker, st))
             st.negotiating = nil
@@ -968,7 +967,7 @@ function SmartDoctorBuffer:handleChat(pDoctor, pSpeaker, message)
             advanceToNextTarget(pDoctor, st)
             return true
         end
-        logInfo("before if msg ~= and not isBuffRequest(msg) then")
+        --logInfo("before if msg ~= and not isBuffRequest(msg) then")
         if msg ~= "" and not isBuffRequest(msg) then
             setMemoryTopic(speakerId, msg)
             say(pDoctor, "Got it. So still want the buffs?")
@@ -979,15 +978,15 @@ function SmartDoctorBuffer:handleChat(pDoctor, pSpeaker, message)
     end
 
     if not isBuffRequest(msg) then return false end
-    logInfo("isBuffRequest true")
+    --logInfo("isBuffRequest true")
     if not throttleAllows(st, speakerId) then
-        logInfo("throttleAllows BLOCKED")
+        --logInfo("throttleAllows BLOCKED")
         return true
     end
-    logInfo("throttleAllows ALLOWED")
+    --logInfo("throttleAllows ALLOWED")
 
     if alreadyQueuedOrCurrent(st, speakerId) then
-        logInfo("alreadyQueuedOrCurrent true")
+        --logInfo("alreadyQueuedOrCurrent true")
         if st.current ~= nil and st.current.playerId == speakerId then
             if st.state == "PAUSED" then
                 say(pDoctor, "There you are hold still, picking back up.")
@@ -1011,17 +1010,16 @@ function SmartDoctorBuffer:handleChat(pDoctor, pSpeaker, message)
     end
 
     if st.state == "IDLE" then
-        logInfo("IDLE true")
+        --logInfo("IDLE true")
         st.state = "NEGOTIATING"
         st.negotiating = {
             playerId = speakerId,
             expiresAtSec = nowSec() + math.floor(SmartDoctorConfig.confirm_timeout_ms / 1000)
         }
         persistSave(did, st)
-        print(string.format("[SmartDoctor][DEBUG] AFTER NEGOTIATING persist did=%s state=%s negPid=%s",
-            tostring(did), tostring(st.state), tostring(st.negotiating and st.negotiating.playerId)
-        ))
-        logInfo("say stuff")
+        --print(string.format("[SmartDoctor][DEBUG] AFTER NEGOTIATING persist did=%s state=%s negPid=%s",
+        --    tostring(did), tostring(st.state), tostring(st.negotiating and st.negotiating.playerId)
+        --))
         say(pDoctor, dialogueLine("quote", pDoctor, pSpeaker, st, nil, getMemoryTopic(speakerId)))
         --faceTarget(pDoctor, pSpeaker)
 
@@ -1052,18 +1050,17 @@ function SmartDoctorBuffer:handleChat(pDoctor, pSpeaker, message)
 end
 
 -- ========= Registration =========
-print("### [SmartDoctor][DEBUG] About to registerScreenPlay('SmartDoctorBuffer', true). _G.SmartDoctorBuffer=" .. tostring(SmartDoctorBuffer) .. " type=" .. type(SmartDoctorBuffer) .. " ###")
+--print("### [SmartDoctor][DEBUG] About to registerScreenPlay('SmartDoctorBuffer', true). _G.SmartDoctorBuffer=" .. tostring(SmartDoctorBuffer) .. " type=" .. type(SmartDoctorBuffer) .. " ###")
 registerScreenPlay("SmartDoctorBuffer", true)
-print("### [SmartDoctor][DEBUG] registerScreenPlay done ###")
 
 -- ========= Spawn =========
 function SmartDoctorBuffer:start()
-    logInfo("SmartDoctorBuffer:start() entered. spawn_points type=" ..
-        type(SmartDoctorConfig.spawn_points) ..
-        " count=" .. tostring(SmartDoctorConfig.spawn_points and #SmartDoctorConfig.spawn_points or 0))
+    --logInfo("SmartDoctorBuffer:start() entered. spawn_points type=" ..
+    --    type(SmartDoctorConfig.spawn_points) ..
+    --    " count=" .. tostring(SmartDoctorConfig.spawn_points and #SmartDoctorConfig.spawn_points or 0))
 
     if SmartDoctorConfig.spawn_points == nil or #SmartDoctorConfig.spawn_points == 0 then
-        logInfo("No spawn_points configured; SmartDoctorBuffer loaded (chat-driven) without spawning.")
+        --logInfo("No spawn_points configured; SmartDoctorBuffer loaded (chat-driven) without spawning.")
         return
     end
 
@@ -1075,11 +1072,11 @@ function SmartDoctorBuffer:start()
         local heading = sp.heading or 0
         local cell    = sp.cell or 0
 
-        logInfo(string.format(
-            "SpawnPoint[%d]: planet=%s template=%s respawn=%s x=%.2f z=%.2f y=%.2f heading=%s cell=%s customName=%s",
-            i, tostring(planet), "smart_doctor_buffer", "0",
-            x, z, y, tostring(heading), tostring(cell), tostring(sp.customName)
-        ))
+        --logInfo(string.format(
+        --    "SpawnPoint[%d]: planet=%s template=%s respawn=%s x=%.2f z=%.2f y=%.2f heading=%s cell=%s customName=%s",
+        --    i, tostring(planet), "smart_doctor_buffer", "0",
+        --    x, z, y, tostring(heading), tostring(cell), tostring(sp.customName)
+        --))
 
         local zoneEnabledVal = false
         local okZone, errZone = pcall(function()
@@ -1094,6 +1091,22 @@ function SmartDoctorBuffer:start()
             goto continue
         end
 
+        -- Prevent duplicates if the screenplay reloads
+        if sp.key ~= nil and sp.key ~= "" then
+            local existingDid = getSpawnedDoctorId(sp)
+            if existingDid ~= 0 then
+                local existingObj = getSceneObject(existingDid)
+                if existingObj ~= nil then
+                    --logInfo("SpawnPoint[" .. i .. "] key=" .. tostring(sp.key) ..
+                    --    " already spawned did=" .. tostring(existingDid) .. " (skipping)")
+                    goto continue
+                else
+                    -- stale id (despawned/restart), clear and respawn
+                    setSpawnedDoctorId(sp, 0)
+                end
+            end
+        end
+
         local pMob = nil
         local okSpawn, errSpawn = pcall(function()
             pMob = spawnMobile(planet, "smart_doctor_buffer", 0, x, z, y, heading, cell)
@@ -1104,16 +1117,21 @@ function SmartDoctorBuffer:start()
             goto continue
         end
 
-        logInfo("SpawnPoint[" .. i .. "]: spawnMobile returned pMob=" .. tostring(pMob))
+        --logInfo("SpawnPoint[" .. i .. "]: spawnMobile returned pMob=" .. tostring(pMob))
 
         if pMob == nil then
             logWarn("SpawnPoint[" .. i .. "]: Failed to spawn smart_doctor_buffer (pMob nil)")
             goto continue
         end
 
+        -- record spawned id for reload-safety
+        if sp.key ~= nil and sp.key ~= "" then
+            setSpawnedDoctorId(sp, getId(pMob))
+        end
+
         -- Name ONCE, using the safe wrapper (NO boolean arg).
         local desiredName = sp.customName or SmartDoctorConfig.doctor_custom_name
-        logInfo("SpawnPoint[" .. i .. "]: setting custom name to '" .. tostring(desiredName) .. "' (safe)")
+        --logInfo("SpawnPoint[" .. i .. "]: setting custom name to '" .. tostring(desiredName) .. "' (safe)")
         safeSetCustomObjectName(pMob, desiredName)
 
         ::continue::

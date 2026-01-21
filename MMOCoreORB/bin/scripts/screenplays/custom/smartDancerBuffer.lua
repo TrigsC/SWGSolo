@@ -10,13 +10,44 @@ local ObjectManager = require("managers.object.object_manager")
 SmartDancerConfig = SmartDancerConfig or {}
 
 SmartDancerConfig.spawn_points = SmartDancerConfig.spawn_points or {
+    -- Coronet
     {
         planet = "corellia",
-        x = -153,
-        z = 28,
-        y = -4720,
+        x = 19.73,
+        z = -0.89,
+        y = 4.67,
         heading = 90,
-        cell = 0,
+        cell = 8105496,
+        customName = "Dancer Buffer"
+    },
+    -- Moenia
+    {
+        planet = "naboo",
+        x = 19.41,
+        z = -0.89,
+        y = -1.20,
+        heading = 90,
+        cell = 111,
+        customName = "Dancer Buffer"
+    },
+    -- Theed
+    {
+        planet = "naboo",
+        x = 19.88,
+        z = -0.89,
+        y = 4.21,
+        heading = 90,
+        cell = 91,
+        customName = "Dancer Buffer"
+    },
+    -- mos eisly
+    {
+        planet = "tatooine",
+        x = 18.36,
+        z = -0.89,
+        y = 2.53,
+        heading = 90,
+        cell = 1082877,
         customName = "Dancer Buffer"
     }
 }
@@ -112,7 +143,7 @@ function SmartDancerBuffer:notifyWatched(pNpc, pWatcher)
     end
     
     -- wipe only dance (and BF+wounds)
-    agent:wipeEnhanceBuffs(pPlayer, 2)
+    agent:wipeEnhanceBuffs(pWatcher, 2)
     agent:applyDanceMindBuff(pWatcher, SmartDancerConfig.buffAmount, SmartDancerConfig.buffDuration)
 
     -- optional flavor message

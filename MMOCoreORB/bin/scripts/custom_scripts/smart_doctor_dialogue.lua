@@ -26,9 +26,9 @@ local USE_LLM_FLAVOR = true
 local AiBrain = nil
 do
     local ok, brain = pcall(require, "custom_scripts.ai_brain")
-    print("Called custom_scripts.ai_brain")
+    -- print("Called custom_scripts.ai_brain")
     if ok and brain then
-        print("AiBrain = brain")
+        --print("AiBrain = brain")
         AiBrain = brain
     end
 end

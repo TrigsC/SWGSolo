@@ -11,13 +11,44 @@ local ObjectManager = require("managers.object.object_manager")
 SmartMusicianConfig = SmartMusicianConfig or {}
 
 SmartMusicianConfig.spawn_points = SmartMusicianConfig.spawn_points or {
+    -- coronet
     {
         planet = "corellia",
-        x = -153,
-        z = 28,
-        y = -4715,
+        x = 19.59,
+        z = -0.89,
+        y = -1.51,
         heading = 90,
-        cell = 0,
+        cell = 8105496,
+        customName = "Musician Buffer"
+    },
+    -- moenia
+    {
+        planet = "naboo",
+        x = 19.16,
+        z = -0.89,
+        y = 3.72,
+        heading = 90,
+        cell = 111,
+        customName = "Musician Buffer"
+    },
+    -- theed
+    {
+        planet = "naboo",
+        x = 20.04,
+        z = -0.89,
+        y = -0.36,
+        heading = 90,
+        cell = 91,
+        customName = "Musician Buffer"
+    },
+    -- mos eisly
+    {
+        planet = "tatooine",
+        x = 18.05,
+        z = -0.89,
+        y = -0.85,
+        heading = 90,
+        cell = 1082877,
         customName = "Musician Buffer"
     }
 }
@@ -50,21 +81,21 @@ local function inRange(pNpc, pPlayer)
 end
 
 local function giveAndEquipInstrument(pMob)
-    print("Musician: giveAndEquipInstrument " .. tostring(pMob))
+    --print("Musician: giveAndEquipInstrument " .. tostring(pMob))
     if pMob == nil then return end
 
     local pInv = SceneObject(pMob):getSlottedObject("inventory")
-    print("Musician: inventory " .. tostring(pInv))
+    --print("Musician: inventory " .. tostring(pInv))
     if pInv == nil then return end
 
     local pInst = giveItem(pInv, SmartMusicianConfig.instrumentIff, -1, true)
-    print("Musician: giveItem " .. tostring(pInst))
+    --print("Musician: giveItem " .. tostring(pInst))
     if pInst == nil then return end
 
     -- Try to slot it into hold_r via arrangementGroup 0 (containmentType = 4)
     -- LuaSceneObject::transferObject(obj, containmentType, notifyClient)
     local ok = SceneObject(pMob):transferObject(pInst, 4, true)
-    print("Musician: transferObject to mob (containment=4) ok=" .. tostring(ok))
+    --print("Musician: transferObject to mob (containment=4) ok=" .. tostring(ok))
 
     -- If 4 fails (rare), try a couple other arrangement groups (5,6)
     if not ok then
@@ -83,10 +114,9 @@ registerScreenPlay("SmartMusicianBuffer", true)
 function SmartMusicianBuffer:start()
     for _, sp in ipairs(SmartMusicianConfig.spawn_points) do
         if sp.planet ~= nil and isZoneEnabled(sp.planet) then
-            -- IMPORTANT: use a dedicated creature template name (see next section)
             local pMob = spawnMobile(
                 sp.planet,
-                "entertainer", -- <-- create this creature template (below)
+                "entertainer",
                 0,
                 sp.x or 0, sp.z or 0, sp.y or 0,
                 sp.heading or 0,
@@ -144,7 +174,7 @@ function SmartMusicianBuffer:notifyListened(pNpc, pListener)
     end
     
     -- wipe only music (and BF+wounds)
-    agent:wipeEnhanceBuffs(pPlayer, 4)
+    agent:wipeEnhanceBuffs(pListener, 4)
     agent:applyMusicBuffs(pListener, SmartMusicianConfig.buffAmount, SmartMusicianConfig.buffDuration)
     CreatureObject(pListener):sendSystemMessage("You feel inspired by the music.")
     return 0

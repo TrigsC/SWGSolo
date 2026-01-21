@@ -4237,9 +4237,11 @@ void AiAgentImplementation::healEnhanceCreatureTarget(CreatureObject* target, St
 }
 
 void AiAgentImplementation::wipeMedicalEnhanceBuffs(CreatureObject* target) {
-    if (target == nullptr)
+    if (target == nullptr){
         return;
+	}
 
+	info("wipeMedicalEnhanceBuffs: Wipeitup: ", true);
     target->removeBuff(BuffCRC::MEDICAL_ENHANCE_HEALTH);
     target->removeBuff(BuffCRC::MEDICAL_ENHANCE_STRENGTH);
     target->removeBuff(BuffCRC::MEDICAL_ENHANCE_CONSTITUTION);
@@ -4249,20 +4251,59 @@ void AiAgentImplementation::wipeMedicalEnhanceBuffs(CreatureObject* target) {
 }
 
 void AiAgentImplementation::wipeEnhanceBuffs(CreatureObject* target, uint32 flags) {
-    if (target == nullptr)
+    if (target == nullptr) {
+		info("wipeEnhanceBuffs: target nullptr: ", true);
         return;
-
+	}
+	info("wipeEnhanceBuffs: flags:: " + String::valueOf(flags), true);
     if (flags & EnhanceWipeFlags::MEDICAL) {
         wipeMedicalEnhanceBuffs(target); // reuse your existing stable behavior
+		info("wipeEnhanceBuffs: back from wipe: ", true);
+
+		Locker clocker(target);
+		TangibleObject* healer = nullptr;
+		float shock = target->getShockWounds();
+		if (shock > 0) {
+		    target->addShockWounds(-shock, true, false);
+		}
+		int healthW = target->getWounds(CreatureAttribute::HEALTH);
+		if (healthW > 0) {
+		    target->healWound(healer, CreatureAttribute::HEALTH, healthW, true, false);
+		}
+
+		int strengthW = target->getWounds(CreatureAttribute::STRENGTH);
+		if (strengthW > 0) {
+		    target->healWound(healer, CreatureAttribute::STRENGTH, strengthW, true, false);
+		}
+
+		int constitutionW = target->getWounds(CreatureAttribute::CONSTITUTION);
+		if (constitutionW > 0) {
+		    target->healWound(healer, CreatureAttribute::CONSTITUTION, constitutionW, true, false);
+		}
+
+		int actionW = target->getWounds(CreatureAttribute::ACTION);
+		if (actionW > 0) {
+		    target->healWound(healer, CreatureAttribute::ACTION, actionW, true, false);
+		}
+
+		int quicknessW = target->getWounds(CreatureAttribute::QUICKNESS);
+		if (quicknessW > 0) {
+		    target->healWound(healer, CreatureAttribute::QUICKNESS, quicknessW, true, false);
+		}
+
+		int staminaW = target->getWounds(CreatureAttribute::STAMINA);
+		if (staminaW > 0) {
+		    target->healWound(healer, CreatureAttribute::STAMINA, staminaW, true, false);
+		}
     }
 
     if (flags & EnhanceWipeFlags::DANCE) {
-        target->removeBuff(0x11C1772E); // performance_enhance_dance_mind
+        target->removeBuff(BuffCRC::PERFORMANCE_ENHANCE_DANCE_MIND); // performance_enhance_dance_mind
     }
 
     if (flags & EnhanceWipeFlags::MUSIC) {
-        target->removeBuff(0x2E77F586); // performance_enhance_music_focus
-        target->removeBuff(0x3EC6FCB6); // performance_enhance_music_willpower
+        target->removeBuff(BuffCRC::PERFORMANCE_ENHANCE_MUSIC_FOCUS); // performance_enhance_music_focus
+        target->removeBuff(BuffCRC::PERFORMANCE_ENHANCE_MUSIC_WILLPOWER); // performance_enhance_music_willpower
     }
 
     // Battle fatigue + mind/focus/willpower wounds are "performance side"
@@ -4271,9 +4312,6 @@ void AiAgentImplementation::wipeEnhanceBuffs(CreatureObject* target, uint32 flag
 		Locker clocker(target);
 
 		// Use the AI creature itself as the healer attribution.
-		// (AiAgentImplementation is the implementation of a CreatureObject)
-		//TangibleObject* healer = cast<TangibleObject*>(_this.get());
-		//TangibleObject* healer = cast<TangibleObject*>(realObject.get());
 		TangibleObject* healer = nullptr;
 
 		float shock = target->getShockWounds();
