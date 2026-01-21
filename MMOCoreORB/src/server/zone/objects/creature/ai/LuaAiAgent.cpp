@@ -32,7 +32,7 @@
 #include "server/zone/objects/creature/buffs/BuffType.h"
 #include "server/zone/objects/tangible/Instrument.h"
 
-#define DEBUG
+//#define DEBUG
 
 const char LuaAiAgent::className[] = "LuaAiAgent";
 
