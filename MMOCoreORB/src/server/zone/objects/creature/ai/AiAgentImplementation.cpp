@@ -4252,13 +4252,13 @@ void AiAgentImplementation::wipeMedicalEnhanceBuffs(CreatureObject* target) {
 
 void AiAgentImplementation::wipeEnhanceBuffs(CreatureObject* target, uint32 flags) {
     if (target == nullptr) {
-		info("wipeEnhanceBuffs: target nullptr: ", true);
+		// info("wipeEnhanceBuffs: target nullptr: ", true);
         return;
 	}
-	info("wipeEnhanceBuffs: flags:: " + String::valueOf(flags), true);
+	// info("wipeEnhanceBuffs: flags:: " + String::valueOf(flags), true);
     if (flags & EnhanceWipeFlags::MEDICAL) {
         wipeMedicalEnhanceBuffs(target); // reuse your existing stable behavior
-		info("wipeEnhanceBuffs: back from wipe: ", true);
+		// info("wipeEnhanceBuffs: back from wipe: ", true);
 
 		Locker clocker(target);
 		TangibleObject* healer = nullptr;
