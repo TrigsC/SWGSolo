@@ -554,66 +554,94 @@ void AiAgentImplementation::reloadTemplate() {
 }
 
 int AiAgentImplementation::getSkillMod(const String& skillMod) const {
-    // 1. Check standard game buffs first
+
+	// --- FORCE DEBUG: PROVE EXECUTION ---
+    if (skillMod.contains("speed")) {
+        StringBuffer msg;
+        msg << "DEBUG: AiAgent::getSkillMod IS RUNNING for " << skillMod;
+        Logger::console.info(msg.toString(), true);
+    }
+
+    // 1. Check standard game buffs first (Spices, Buffs, etc.)
     int baseMod = CreatureObjectImplementation::getSkillMod(skillMod);
 	//StringBuffer msg;
-    //msg << "DEBUG AI DEFENSE: " << getFirstName() << " checking baseMod " << baseMod;
-	//info(msg.toString(), true);
-    //if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "saber_block") {
-    //     StringBuffer msg;
-    //     msg << "DEBUG INCOMING ATTACK: Engine asking AI for " << skillMod << ". Base is " << baseMod;
-    //     info(msg.toString(), true);
-    //}
+    //msg << "DEBUG AI LINK: " << getFirstName() << " skillmod = " << skillMod << " basemod = " << baseMod;
+    //Logger::console.info(msg.toString(), true);
 
-    // 2. If base is 0, check our Lua "brain"
-    if (baseMod == 0 && npcTemplate != nullptr) {
-        
-        int templateMod = npcTemplate->getStatistic(skillMod); 
-        
-        // --- LOGGING & RETURN LUA VALUE ---
-        if (templateMod > 0) { 
-            //StringBuffer msg;
-            //msg << "DEBUG AI DEFENSE: " << getFirstName() << " checking " << skillMod 
-            //    << " -> Lua says: " << templateMod;
-            
-            // If it's a primary defense, remind us that Level is added automatically
-            //if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "melee_defense" || skillMod == "ranged_defense" || skillMod == "jedi_toughness" || skillMod == "lightsaber_toughness") {
-            //    msg << " (Total Defense will be " << getLevel() << " + " << templateMod << ")";
-            //}
-            
-            //info(msg.toString(), true); 
+    if (baseMod != 0)
+		//Logger::console.info("baseMod != 0", true);
+        return baseMod;
+
+    // 2. Check the Lua Template (The "Character Sheet")
+    if (npcTemplate != nullptr) {
+
+        int templateMod = npcTemplate->getStatistic(skillMod);
+		//StringBuffer msg;
+    	//msg << "DEBUG AI LINK: " << getFirstName() << " found template = " << templateMod;
+    	//Logger::console.info(msg.toString(), true);
+
+        // --- DEBUG: Verify the link works ---
+        // If you see this log, the connection is fixed.
+        //if (templateMod > 0 && skillMod.contains("speed")) {
+        //    StringBuffer msg;
+        //    msg << "DEBUG AI LINK: " << getFirstName() << " found template stat " << skillMod << " = " << templateMod;
+        //    Logger::console.info(msg.toString(), true);
+        //}
+
+        if (templateMod > 0) {
+			//StringBuffer msg;
+    		//msg << "DEBUG AI LINK: " << getFirstName() << " templatemod > 0 " << templateMod;
+    		//Logger::console.info(msg.toString(), true);
             return templateMod;
-        } 
-
-        // 3. Fallback Heuristic Logic (If Lua is empty)
-        ManagedReference<WeaponObject*> weapon = const_cast<AiAgentImplementation*>(this)->getWeapon();
-
-        // --- SECONDARY DEFENSE FALLBACK ---
-        // If Lua didn't specify Saber Block, give them a level-based chance
-        if (skillMod == "saber_block" && weapon != nullptr && weapon->isJediWeapon()) {
-             return getLevel(); // Level 88 = 88% chance to ricochet
-        }
-
-        // --- ACCURACY FALLBACK ---
-        if (skillMod.contains("accuracy")) {
-             return 100 + (getLevel() * 2); 
-        }
-        
-        // --- PRIMARY DEFENSE FALLBACK ---
-        if ((skillMod == "dodge_attack" || skillMod == "block") && getLevel() > 80) {
-            
-            // --- ADD LOGGING HERE ---
-            //StringBuffer msg;
-            //msg << "DEBUG AI DEFENSE: " << getFirstName() << " using FALLBACK for " << skillMod 
-            //    << " -> Returning 20 (Total Defense will be " << getLevel() << " + 20)";
-            //info(msg.toString(), true);
-            // ------------------------
-
-            return 20; // Adds 20 to their base Level defense
         }
     }
 
-    return baseMod;
+    // ==========================================================
+    // 3. THE SAFETY NET (Fallback Logic)
+    // ==========================================================
+    // This part is CRITICAL. If the template link fails (Result: 0),
+    // this code forces the NPC to have speed based on Level.
+    // IT PREVENTS "0" FROM EVER BEING RETURNED FOR SPEED.
+
+    if (skillMod.contains("_speed")) {
+        int speed = getLevel() + 25;
+        if (speed > 100) speed = 100;
+        
+        // --- DEBUG: Verify Fallback ---
+        //StringBuffer msg;
+        //msg << "DEBUG AI FALLBACK: " << getFirstName() << " (Level " << getLevel() << ") generating speed " << speed;
+        //Logger::console.info(msg.toString(), true);
+
+        return speed;
+    }
+
+    // Accuracy Fallback
+    if (skillMod.contains("accuracy")) {
+		StringBuffer msg;
+		msg << "DEBUG AI LINK: " << getFirstName() << " contains accuracy";
+		Logger::console.info(msg.toString(), true);
+        return 100 + (getLevel() * 2); 
+    }
+    
+    // Defense Fallback
+    if ((skillMod == "dodge_attack" || skillMod == "block") && getLevel() > 80) {
+		StringBuffer msg;
+		msg << "DEBUG AI LINK: " << getFirstName() << " Defense Fallback ";
+		Logger::console.info(msg.toString(), true);
+        return 20;
+    }
+
+    // Jedi Block Fallback
+    if (skillMod == "saber_block") {
+         ManagedReference<WeaponObject*> weapon = const_cast<AiAgentImplementation*>(this)->getWeapon();
+         if (weapon != nullptr && weapon->isJediWeapon()) {
+             return getLevel();
+         }
+    }
+	//StringBuffer msg;
+	//msg << "DEBUG AI LINK: " << getFirstName() << " Return 0 ";
+	//Logger::console.info(msg.toString(), true);
+    return 0;
 }
 
 void AiAgentImplementation::activateForcePowerRegen() {
@@ -1100,6 +1128,7 @@ void AiAgentImplementation::setupCombatStats() {
 	}
 
 	weaponSpeed = calculateAttackSpeed(level);
+	info(true) << "calculateAttackSpeed - WeaponSpeed = " << weaponSpeed;
 
 	float globalSpeedOverride = CreatureTemplateManager::instance()->getGlobalAttackSpeedOverride();
 	float customSpeed = npcTemplate->getAttackSpeed();
@@ -2731,32 +2760,32 @@ int AiAgentImplementation::notifyAttack(Observable* observable) {
 int AiAgentImplementation::handleObjectMenuSelect(CreatureObject* player, byte selectedID) {
 	// --- START SIMPLAYER HOOK ---
     // Check if the player is an Admin
-    if (player->isPlayerCreature()) {
-        PlayerObject* ghost = player->getPlayerObject();
-        if (ghost != nullptr && ghost->isAdmin()) {
-            
-            // We hijack the 'EXAMINE' menu option (usually ID 13 or similar constant)
-            // If you right-click -> Inspect, this code runs.
-            if (selectedID == RadialOptions::EXAMINE) {
-                player->sendSystemMessage("admin: Toggling SimPlayer AI...");
-    			SimPlayerManager::instance()->toggleBot(_this.get());
-
-    			// Prevent auto-despawn-by-no-players
-    			setDespawnOnNoPlayerInRange(false);
-
-    			// Cancel any already scheduled despawn mechanisms
-    			Reference<DespawnCreatureTask*> pending = getPendingTask("despawn").castTo<DespawnCreatureTask*>();
-    			if (pending != nullptr) pending->cancel();
-
-    			if (despawnEvent != nullptr && despawnEvent->isScheduled()) {
-    			    despawnEvent->cancel();
-    			    despawnEvent = nullptr;
-    			}
-
-    			return 0;
-            }
-        }
-    }
+    //if (player->isPlayerCreature()) {
+    //    PlayerObject* ghost = player->getPlayerObject();
+    //    if (ghost != nullptr && ghost->isAdmin()) {
+    //        
+    //        // We hijack the 'EXAMINE' menu option (usually ID 13 or similar constant)
+    //        // If you right-click -> Inspect, this code runs.
+    //        if (selectedID == RadialOptions::EXAMINE) {
+    //            player->sendSystemMessage("admin: Toggling SimPlayer AI...");
+    //			SimPlayerManager::instance()->toggleBot(_this.get());
+//
+    //			// Prevent auto-despawn-by-no-players
+    //			setDespawnOnNoPlayerInRange(false);
+//
+    //			// Cancel any already scheduled despawn mechanisms
+    //			Reference<DespawnCreatureTask*> pending = getPendingTask("despawn").castTo<DespawnCreatureTask*>();
+    //			if (pending != nullptr) pending->cancel();
+//
+    //			if (despawnEvent != nullptr && despawnEvent->isScheduled()) {
+    //			    despawnEvent->cancel();
+    //			    despawnEvent = nullptr;
+    //			}
+//
+    //			return 0;
+    //        }
+    //    }
+    //}
 	if (isDead() && !isPet()) {
 		switch (selectedID) {
 		case 35:

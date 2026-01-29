@@ -2,7 +2,7 @@
 --to modify this for hybrids you can create a name for your hybrid tree and insert it at the bottom of the list
 --in the Server Administrator NPC Skill section
 -- command usage inside npc templates is attacks = merge(skilltreename1,skilltreename2,ect,ect)
-
+print("[SKILLTAG] LOADING creatureskills.lua (mobile)")
 --creature level 1 to 10
 brawlernovice = { {"melee1hlunge1",""},{"melee2hlunge1",""},{"polearmlunge1",""},{"unarmedlunge1",""} }
 marksmannovice = { {"overchargeshot1",""},{"pointblanksingle1",""},{"pointblankarea1",""} }
@@ -56,3 +56,60 @@ forcepowermaster = { {"forcelightningsingle2",""},{"forcelightningcone2",""},{"m
 -- npc force wielders use standard profession mastery with the addition of this command
 forcewielder ={ {"forcelightningsingle1",""},{"mindblast1",""},{"forceweaken1",""},{"forceknockdown1",""},{"forcelightningcone1",""},{"forceintimidate1",""} }
 --Server Administrator NPC skill trees place below
+
+-- =========================================================
+-- Tag skill trees with profession+tier metadata (NO getfenv needed)
+-- =========================================================
+do
+    local function tag(tree, prof, tier)
+        if type(tree) ~= "table" then return end
+        tree.__tiers = tree.__tiers or {}
+        tree.__tiers[prof] = tier
+    end
+
+    -- novice
+    tag(brawlernovice,   "brawler",   "novice")
+    tag(marksmannovice,  "marksman",  "novice")
+    tag(riflemannovice,  "rifleman",  "novice")
+    tag(fencernovice,    "fencer",    "novice")
+    tag(swordsmannovice, "swordsman", "novice")
+    tag(pikemannovice,   "pikeman",   "novice")
+    tag(tkanovice,       "tka",       "novice")
+    tag(pistoleernovice, "pistoleer", "novice")
+    tag(carbineernovice, "carbineer", "novice")
+    tag(commandonovice,  "commando",  "novice")
+    tag(bountyhunternovice,"bountyhunter","novice")
+
+    -- mid
+    tag(brawlermid,   "brawler",   "mid")
+    tag(marksmanmid,  "marksman",  "mid")
+    tag(riflemanmid,  "rifleman",  "mid")
+    tag(fencermid,    "fencer",    "mid")
+    tag(swordsmanmid, "swordsman", "mid")
+    tag(pikemanmid,   "pikeman",   "mid")
+    tag(tkamid,       "tka",       "mid")
+    tag(pistoleermid, "pistoleer", "mid")
+    tag(carbineermid, "carbineer", "mid")
+    tag(commandomid,  "commando",  "mid")
+    tag(bountyhuntermid,"bountyhunter","mid")
+
+    -- master
+    tag(brawlermaster,   "brawler",   "master")
+    tag(marksmanmaster,  "marksman",  "master")
+    tag(riflemanmaster,  "rifleman",  "master")
+    tag(fencermaster,    "fencer",    "master")
+    tag(swordsmanmaster, "swordsman", "master")
+    tag(pikemanmaster,   "pikeman",   "master")
+    tag(tkamaster,       "tka",       "master")
+    tag(pistoleermaster, "pistoleer", "master")
+    tag(carbineermaster, "carbineer", "master")
+    tag(commandomaster,  "commando",  "master")
+    tag(bountyhuntermaster,"bountyhunter","master")
+
+    -- Jedi-ish
+    tag(lightsabermaster, "lightsaber", "master")
+    tag(forcepowermaster, "forcepower", "master")
+    tag(forcewielder,     "forcewielder","master")
+
+    print("[SKILLTAG] riflemanmaster __tiers = " .. (riflemanmaster.__tiers and "OK" or "nil"))
+end

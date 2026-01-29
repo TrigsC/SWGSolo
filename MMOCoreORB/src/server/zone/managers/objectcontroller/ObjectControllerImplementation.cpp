@@ -83,7 +83,16 @@ float ObjectControllerImplementation::activateCommand(CreatureObject* object, un
 	}
 
 	float commandTime = queueCommand->getCommandDuration(object, arguments);
-	const String& characterAbility = queueCommand->getCharacterAbility();
+
+    // --- DEBUG START ---
+    if (object->isAiAgent() && queueCommand->isCombatCommand()) {
+        object->info(true) << "NPC Attack Speed Debug: Command '" 
+                           << queueCommand->getQueueCommandName() 
+                           << "' returned duration: " << commandTime;
+    }
+    // --- DEBUG END ---
+
+    const String& characterAbility = queueCommand->getCharacterAbility();
 
 	if (characterAbility.length() > 1) {
 		object->debug() << "activating characterAbility " << characterAbility;
@@ -138,6 +147,13 @@ float ObjectControllerImplementation::activateCommand(CreatureObject* object, un
 	for (int i = 0; i < queueCommand->getSkillModSize(); ++i) {
 		String skillMod;
 		int value = queueCommand->getSkillMod(i, skillMod);
+		// --- DEBUG START ---
+    	if (object->isAiAgent()) {
+    	    object->info(true) << "NPC Skill Mod " 
+    	                       << skillMod
+    	                       << "' Value: " << value;
+    	}
+    	// --- DEBUG END ---
 		object->addSkillMod(SkillModManager::ABILITYBONUS, skillMod, value, false);
 	}
 
@@ -162,7 +178,14 @@ float ObjectControllerImplementation::activateCommand(CreatureObject* object, un
 
 		queueCommand->onComplete(actionCount, object, durationTime);
 	}
-
+    
+	// --- DEBUG START ---
+    if (object->isAiAgent() && queueCommand->isCombatCommand()) {
+        object->info(true) << "NPC Attack Speed Debug: Command '" 
+                           << queueCommand->getQueueCommandName() 
+                           << "' returned durationTime: " << durationTime;
+    }
+    // --- DEBUG END ---
 
 	return durationTime;
 }

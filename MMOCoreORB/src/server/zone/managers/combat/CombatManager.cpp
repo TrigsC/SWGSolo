@@ -26,6 +26,7 @@
 #include "server/zone/managers/player/PlayerManager.h"
 #include "server/zone/objects/installation/components/TurretDataComponent.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
+#include "server/zone/objects/creature/ai/CreatureTemplate.h"
 #include "server/zone/objects/installation/InstallationObject.h"
 #include "server/zone/packets/object/ShowFlyText.h"
 #include "server/zone/managers/frs/FrsManager.h"
@@ -33,6 +34,7 @@
 #include "server/zone/objects/installation/TurretObject.h"
 
 #define COMBAT_SPAM_RANGE 85 // Range at which players will see Combat Log Info
+#define TOHIT_DEBUG
 
 /*
 * Notes:
@@ -2354,27 +2356,63 @@ float CombatManager::hitChanceEquation(float attackerAccuracy, float targetDefen
 }
 
 int CombatManager::getSpeedModifier(CreatureObject* attacker, WeaponObject* weapon) const {
-	int speedMods = 0;
+    int speedMods = 0;
 
-	if (weapon != nullptr) {
-		const auto weaponSpeedMods = weapon->getSpeedModifiers();
+    if (weapon != nullptr) {
+        const auto weaponSpeedMods = weapon->getSpeedModifiers();
 
-		for (int i = 0; i < weaponSpeedMods->size(); ++i) {
-			speedMods += attacker->getSkillMod(weaponSpeedMods->get(i));
-		}
-	}
+        for (int i = 0; i < weaponSpeedMods->size(); ++i) {
+            String modName = weaponSpeedMods->get(i);
+            
+            // 1. Try standard lookup first
+            int val = attacker->getSkillMod(modName);
+			attacker->info(true) << "DEBUG SPEED LOOKUP: val: " << val;
 
-	speedMods += attacker->getSkillMod("private_speed_bonus");
+            // 2. FIX: If standard lookup returned 0 and this is an AI, 
+            // force a direct look at the Template (bypass broken overrides)
+            if (val == 0 && attacker->isAiAgent()) {
+                AiAgent* ai = attacker->asAiAgent();
+                if (ai != nullptr) {
+                    const CreatureTemplate* templ = ai->getCreatureTemplate();
+                    if (templ != nullptr) {
+                        // Direct access to the data we verified exists
+                        val = templ->getStatistic(modName);
+                        
+                        // Debug to confirm this fix is working
+                        if (val > 0) {
+                            ai->info("CombatManager: Direct Template Lookup found " + modName + " = " + String::valueOf(val), true);
+                        }
+                    }
 
-	if (weapon->getAttackType() == SharedWeaponObjectTemplate::MELEEATTACK) {
-		speedMods += attacker->getSkillMod("private_melee_speed_bonus");
-		speedMods += attacker->getSkillMod("melee_speed");
-	} else if (weapon->getAttackType() == SharedWeaponObjectTemplate::RANGEDATTACK) {
-		speedMods += attacker->getSkillMod("private_ranged_speed_bonus");
-		speedMods += attacker->getSkillMod("ranged_speed");
-	}
+                    // 3. Safety Net: If Template was also 0/missing, calculate based on Level
+                    if (val == 0) {
+                        val = attacker->getLevel() + 25;
+                        if (val > 100) val = 100;
+                    }
+                }
+            }
 
-	return speedMods;
+            speedMods += val;
+        }
+    }
+
+    speedMods += attacker->getSkillMod("private_speed_bonus");
+
+    if (weapon->getAttackType() == SharedWeaponObjectTemplate::MELEEATTACK) {
+        speedMods += attacker->getSkillMod("private_melee_speed_bonus");
+        speedMods += attacker->getSkillMod("melee_speed");
+    } else if (weapon->getAttackType() == SharedWeaponObjectTemplate::RANGEDATTACK) {
+        speedMods += attacker->getSkillMod("private_ranged_speed_bonus");
+        speedMods += attacker->getSkillMod("ranged_speed");
+    }
+
+    // --- DEBUG START ---
+    if (attacker->isAiAgent()) {
+        attacker->info(true) << "DEBUG SPEED LOOKUP: Final Speed Mod Total: " << speedMods;
+    }
+    // --- DEBUG END ---
+
+    return speedMods;
 }
 
 float CombatManager::getDefenderToughnessModifier(CreatureObject* defender, int attackType, int damType, float damage) const {
@@ -2982,19 +3020,31 @@ float CombatManager::doObjectDetonation(TangibleObject* attackerTanO, CreatureOb
 // Calculate Weapon Speed
 
 float CombatManager::calculateWeaponAttackSpeed(CreatureObject* attacker, WeaponObject* weapon, float skillSpeedRatio) const {
-	if (weapon == nullptr) {
-		return 4.0f;
-	}
+    if (weapon == nullptr) {
+        return 4.0f;
+    }
 
-	int speedMod = getSpeedModifier(attacker, weapon);
-	float jediSpeed = attacker->getSkillMod("combat_haste") / 100.0f;
+    int speedMod = getSpeedModifier(attacker, weapon);
+    float jediSpeed = attacker->getSkillMod("combat_haste") / 100.0f;
 
-	float attackSpeed = (1.0f - ((float)speedMod / 100.0f)) * skillSpeedRatio * weapon->getAttackSpeed();
+    // --- DEBUG START ---
+    if (attacker->isAiAgent()) {
+        StringBuffer msg;
+        msg << "DEBUG SPEED CALC: " << attacker->getDisplayedName()
+            << " | Base Weapon Speed: " << weapon->getAttackSpeed()
+            << " | Speed Mods Found: " << speedMod
+            << " | Command Multiplier: " << skillSpeedRatio
+            << " | Jedi Haste: " << jediSpeed;
+        attacker->info(msg.toString(), true);
+    }
+    // --- DEBUG END ---
 
-	if (jediSpeed > 0)
-		attackSpeed = attackSpeed - (attackSpeed * jediSpeed);
+    float attackSpeed = (1.0f - ((float)speedMod / 100.0f)) * skillSpeedRatio * weapon->getAttackSpeed();
 
-	return Math::max(attackSpeed, 1.0f);
+    if (jediSpeed > 0)
+        attackSpeed = attackSpeed - (attackSpeed * jediSpeed);
+
+    return Math::max(attackSpeed, 1.0f);
 }
 
 // Fly Text - Miss, Counterattack, Block, Hit Location
