@@ -556,11 +556,11 @@ void AiAgentImplementation::reloadTemplate() {
 int AiAgentImplementation::getSkillMod(const String& skillMod) const {
 
 	// --- FORCE DEBUG: PROVE EXECUTION ---
-    if (skillMod.contains("speed")) {
-        StringBuffer msg;
-        msg << "DEBUG: AiAgent::getSkillMod IS RUNNING for " << skillMod;
-        Logger::console.info(msg.toString(), true);
-    }
+    //if (skillMod.contains("speed")) {
+    //    StringBuffer msg;
+    //    msg << "DEBUG: AiAgent::getSkillMod IS RUNNING for " << skillMod;
+    //    Logger::console.info(msg.toString(), true);
+    //}
 
     // 1. Check standard game buffs first (Spices, Buffs, etc.)
     int baseMod = CreatureObjectImplementation::getSkillMod(skillMod);
@@ -1128,7 +1128,7 @@ void AiAgentImplementation::setupCombatStats() {
 	}
 
 	weaponSpeed = calculateAttackSpeed(level);
-	info(true) << "calculateAttackSpeed - WeaponSpeed = " << weaponSpeed;
+	//info(true) << "calculateAttackSpeed - WeaponSpeed = " << weaponSpeed;
 
 	float globalSpeedOverride = CreatureTemplateManager::instance()->getGlobalAttackSpeedOverride();
 	float customSpeed = npcTemplate->getAttackSpeed();

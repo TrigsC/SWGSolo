@@ -53,12 +53,6 @@ bool ObjectControllerImplementation::transferObject(SceneObject* objectToTransfe
 	uint32 oldContainmentType = objectToTransfer->getContainmentType();
 
 	if (!destinationObject->transferObject(objectToTransfer, containmentType, notifyClient, allowOverflow)) {
-		StringBuffer msg;
-		msg << "could not add " << objectToTransfer->getLoggingName() << " to this object in ObjectManager::transferObject ";
-		msg << "with containmentType: " << containmentType << " allowOverflow: " << allowOverflow << " destination container size:";
-		msg << destinationObject->getContainerObjectsSize() << " slotted container size:" << destinationObject->getSlottedObjectsSize();
-
-		destinationObject->error(msg.toString());
 
 		parent->transferObject(objectToTransfer, oldContainmentType);
 
@@ -147,13 +141,7 @@ float ObjectControllerImplementation::activateCommand(CreatureObject* object, un
 	for (int i = 0; i < queueCommand->getSkillModSize(); ++i) {
 		String skillMod;
 		int value = queueCommand->getSkillMod(i, skillMod);
-		// --- DEBUG START ---
-    	if (object->isAiAgent()) {
-    	    object->info(true) << "NPC Skill Mod " 
-    	                       << skillMod
-    	                       << "' Value: " << value;
-    	}
-    	// --- DEBUG END ---
+
 		object->addSkillMod(SkillModManager::ABILITYBONUS, skillMod, value, false);
 	}
 

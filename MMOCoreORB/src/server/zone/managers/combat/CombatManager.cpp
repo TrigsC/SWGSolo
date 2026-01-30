@@ -34,7 +34,7 @@
 #include "server/zone/objects/installation/TurretObject.h"
 
 #define COMBAT_SPAM_RANGE 85 // Range at which players will see Combat Log Info
-#define TOHIT_DEBUG
+//#define TOHIT_DEBUG
 
 /*
 * Notes:
@@ -2366,7 +2366,7 @@ int CombatManager::getSpeedModifier(CreatureObject* attacker, WeaponObject* weap
             
             // 1. Try standard lookup first
             int val = attacker->getSkillMod(modName);
-			attacker->info(true) << "DEBUG SPEED LOOKUP: val: " << val;
+			//attacker->info(true) << "DEBUG SPEED LOOKUP: val: " << val;
 
             // 2. FIX: If standard lookup returned 0 and this is an AI, 
             // force a direct look at the Template (bypass broken overrides)
@@ -2377,11 +2377,6 @@ int CombatManager::getSpeedModifier(CreatureObject* attacker, WeaponObject* weap
                     if (templ != nullptr) {
                         // Direct access to the data we verified exists
                         val = templ->getStatistic(modName);
-                        
-                        // Debug to confirm this fix is working
-                        if (val > 0) {
-                            ai->info("CombatManager: Direct Template Lookup found " + modName + " = " + String::valueOf(val), true);
-                        }
                     }
 
                     // 3. Safety Net: If Template was also 0/missing, calculate based on Level
@@ -2405,12 +2400,6 @@ int CombatManager::getSpeedModifier(CreatureObject* attacker, WeaponObject* weap
         speedMods += attacker->getSkillMod("private_ranged_speed_bonus");
         speedMods += attacker->getSkillMod("ranged_speed");
     }
-
-    // --- DEBUG START ---
-    if (attacker->isAiAgent()) {
-        attacker->info(true) << "DEBUG SPEED LOOKUP: Final Speed Mod Total: " << speedMods;
-    }
-    // --- DEBUG END ---
 
     return speedMods;
 }
@@ -3028,15 +3017,15 @@ float CombatManager::calculateWeaponAttackSpeed(CreatureObject* attacker, Weapon
     float jediSpeed = attacker->getSkillMod("combat_haste") / 100.0f;
 
     // --- DEBUG START ---
-    if (attacker->isAiAgent()) {
-        StringBuffer msg;
-        msg << "DEBUG SPEED CALC: " << attacker->getDisplayedName()
-            << " | Base Weapon Speed: " << weapon->getAttackSpeed()
-            << " | Speed Mods Found: " << speedMod
-            << " | Command Multiplier: " << skillSpeedRatio
-            << " | Jedi Haste: " << jediSpeed;
-        attacker->info(msg.toString(), true);
-    }
+    //if (attacker->isAiAgent()) {
+    //    StringBuffer msg;
+    //    msg << "DEBUG SPEED CALC: " << attacker->getDisplayedName()
+    //        << " | Base Weapon Speed: " << weapon->getAttackSpeed()
+    //        << " | Speed Mods Found: " << speedMod
+    //        << " | Command Multiplier: " << skillSpeedRatio
+    //        << " | Jedi Haste: " << jediSpeed;
+    //    attacker->info(msg.toString(), true);
+    //}
     // --- DEBUG END ---
 
     float attackSpeed = (1.0f - ((float)speedMod / 100.0f)) * skillSpeedRatio * weapon->getAttackSpeed();

@@ -234,7 +234,6 @@ int CommandQueue::handleRunningState() {
 		Logger::console.error() << "CommandQueue ERROR -- Creature: " << creature->getDisplayedName() << " ID: " << creature->getObjectID() << " Command Name: " << queueCommand->getName() << " Issue: " << e.getMessage();
 		e.printStackTrace();
 	}
-	info(true) << "Command Queue activateCommand called -- time = " << time << " ---- Removing Action";
 
 #ifdef DEBUG_QUEUE
 	info(true) << "Command Queue activateCommand called -- time = " << time << " ---- Removing Action";
@@ -263,9 +262,9 @@ int CommandQueue::handleRunningState() {
 //	}
 	if (time > 0) {
 		uint64 miliTime = time * 1000;
-//#ifdef DEBUG_QUEUE
+#ifdef DEBUG_QUEUE
 		info(true) << "Command Delay Time > 0 -- adding to next action time " << miliTime;
-//#endif
+#endif
 		nextActionTime->addMiliTime(miliTime);
 	}
 
