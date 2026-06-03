@@ -4,22 +4,22 @@ local AiRegistry = require("custom_scripts.ai_registry")
 
 padawanConvoHandler = conv_handler:new {}
 
-print("###################################################")
-print("CRITICAL DEBUG: padawanConvoHandler LOADED")
-print("###################################################")
+--print("###################################################")
+--print("CRITICAL DEBUG: padawanConvoHandler LOADED")
+--print("###################################################")
 registerScreenPlay("padawanConvoHandler", true)
 
 function padawanConvoHandler:start()
-    print("###################################################")
-    print("CRITICAL DEBUG: padawanConvoHandler START")
-    print("###################################################")
+    --print("###################################################")
+    --print("CRITICAL DEBUG: padawanConvoHandler START")
+    --print("###################################################")
 end
 
 function padawanConvoHandler:getInitialScreen(pPlayer, pNpc, pConvTemplate)
     local convoTemplate = LuaConversationTemplate(pConvTemplate)
-    print("###################################################")
-    print("CRITICAL DEBUG: padawanConvoHandler getInitialScreen")
-    print("###################################################")
+    --print("###################################################")
+    --print("CRITICAL DEBUG: padawanConvoHandler getInitialScreen")
+    --print("###################################################")
     return convoTemplate:getScreen("init")
 end
 

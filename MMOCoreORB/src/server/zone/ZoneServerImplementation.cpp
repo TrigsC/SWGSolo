@@ -41,6 +41,7 @@
 #include "server/zone/managers/frs/FrsManager.h"
 #include "server/chat/ChatManager.h"
 #include "server/zone/managers/ship/ShipManager.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
 
 #include "server/zone/ZoneProcessServer.h"
 #include "ZonePacketHandler.h"
@@ -367,6 +368,8 @@ void ZoneServerImplementation::startManagers() {
 
 	frsManager = new FrsManager(_this.getReferenceUnsafeStaticCast());
 	frsManager->initialize();
+
+	SimPlayerManager::instance()->initialize();
 
 	info(true) << "ZoneServerImplementation -- Managers Started.";
 }

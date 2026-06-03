@@ -68,6 +68,10 @@
 #include "templates/params/creature/ObjectFlag.h"
 #include "templates/params/creature/CreaturePosture.h"
 #include "templates/params/creature/CreatureState.h"
+#include "server/zone/objects/creature/buffs/Buff.h"
+#include "server/zone/objects/creature/BuffAttribute.h"
+#include "server/zone/objects/creature/buffs/BuffType.h"
+#include "server/zone/objects/creature/buffs/BuffCRC.h"
 #include "server/zone/objects/creature/damageovertime/DamageOverTimeList.h"
 #include "server/zone/objects/creature/ai/events/AiBehaviorEvent.h"
 #include "server/zone/objects/creature/ai/events/AiRecoveryEvent.h"
@@ -91,6 +95,8 @@
 #include "server/zone/managers/objectcontroller/command/CommandConfigManager.h"
 #include "server/zone/objects/creature/commands/ForcePowersQueueCommand.h"
 #include "server/zone/objects/creature/commands/JediQueueCommand.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
+#include "server/zone/managers/radial/RadialOptions.h"
 
 // #define DEBUG
 //#define DEBUG_AI_WEAPONS
@@ -101,6 +107,7 @@
 // #define SHOW_PATH
 // #define SHOW_NEXT_POSITION
 // #define DEBUG_FINDNEXTPOSITION
+// #define DEBUG_MOVE
 
 #ifdef DEBUG_AI_ATTACK
 static void debugLogSelectedAttack(AiAgentImplementation* agent,
@@ -174,6 +181,12 @@ static void debugLogAttackMap(AiAgentImplementation* agent,
 	}
 }
 #endif // DEBUG_AI_WEAPONS
+
+namespace EnhanceWipeFlags {
+    static const uint32 MEDICAL = 1 << 0;
+    static const uint32 DANCE   = 1 << 1; // mind performance buff
+    static const uint32 MUSIC   = 1 << 2; // focus+will performance buffs
+}
 
 namespace {
 
@@ -541,66 +554,88 @@ void AiAgentImplementation::reloadTemplate() {
 }
 
 int AiAgentImplementation::getSkillMod(const String& skillMod) const {
-    // 1. Check standard game buffs first
+
+	// --- FORCE DEBUG: PROVE EXECUTION ---
+    //if (skillMod.contains("speed")) {
+    //    StringBuffer msg;
+    //    msg << "DEBUG: AiAgent::getSkillMod IS RUNNING for " << skillMod;
+    //    Logger::console.info(msg.toString(), true);
+    //}
+
+    // 1. Check standard game buffs first (Spices, Buffs, etc.)
     int baseMod = CreatureObjectImplementation::getSkillMod(skillMod);
-	StringBuffer msg;
-    msg << "DEBUG AI DEFENSE: " << getFirstName() << " checking baseMod " << baseMod;
-	info(msg.toString(), true);
-    if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "saber_block") {
-         StringBuffer msg;
-         msg << "DEBUG INCOMING ATTACK: Engine asking AI for " << skillMod << ". Base is " << baseMod;
-         info(msg.toString(), true);
-    }
+	//StringBuffer msg;
+    //msg << "DEBUG AI LINK: " << getFirstName() << " skillmod = " << skillMod << " basemod = " << baseMod;
+    //Logger::console.info(msg.toString(), true);
 
-    // 2. If base is 0, check our Lua "brain"
-    if (baseMod == 0 && npcTemplate != nullptr) {
-        
-        int templateMod = npcTemplate->getStatistic(skillMod); 
-        
-        // --- LOGGING & RETURN LUA VALUE ---
-        if (templateMod > 0) { 
-            StringBuffer msg;
-            msg << "DEBUG AI DEFENSE: " << getFirstName() << " checking " << skillMod 
-                << " -> Lua says: " << templateMod;
-            
-            // If it's a primary defense, remind us that Level is added automatically
-            if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "melee_defense" || skillMod == "ranged_defense" || skillMod == "jedi_toughness" || skillMod == "lightsaber_toughness") {
-                msg << " (Total Defense will be " << getLevel() << " + " << templateMod << ")";
-            }
-            
-            info(msg.toString(), true); 
+    if (baseMod != 0)
+		//Logger::console.info("baseMod != 0", true);
+        return baseMod;
+
+    // 2. Check the Lua Template (The "Character Sheet")
+    if (npcTemplate != nullptr) {
+
+        int templateMod = npcTemplate->getStatistic(skillMod);
+		//StringBuffer msg;
+    	//msg << "DEBUG AI LINK: " << getFirstName() << " found template = " << templateMod;
+    	//Logger::console.info(msg.toString(), true);
+
+        // --- DEBUG: Verify the link works ---
+        // If you see this log, the connection is fixed.
+        //if (templateMod > 0 && skillMod.contains("speed")) {
+        //    StringBuffer msg;
+        //    msg << "DEBUG AI LINK: " << getFirstName() << " found template stat " << skillMod << " = " << templateMod;
+        //    Logger::console.info(msg.toString(), true);
+        //}
+
+        if (templateMod > 0) {
+			//StringBuffer msg;
+    		//msg << "DEBUG AI LINK: " << getFirstName() << " templatemod > 0 " << templateMod;
+    		//Logger::console.info(msg.toString(), true);
             return templateMod;
-        } 
-
-        // 3. Fallback Heuristic Logic (If Lua is empty)
-        ManagedReference<WeaponObject*> weapon = const_cast<AiAgentImplementation*>(this)->getWeapon();
-
-        // --- SECONDARY DEFENSE FALLBACK ---
-        // If Lua didn't specify Saber Block, give them a level-based chance
-        if (skillMod == "saber_block" && weapon != nullptr && weapon->isJediWeapon()) {
-             return getLevel(); // Level 88 = 88% chance to ricochet
-        }
-
-        // --- ACCURACY FALLBACK ---
-        if (skillMod.contains("accuracy")) {
-             return 100 + (getLevel() * 2); 
-        }
-        
-        // --- PRIMARY DEFENSE FALLBACK ---
-        if ((skillMod == "dodge_attack" || skillMod == "block") && getLevel() > 80) {
-            
-            // --- ADD LOGGING HERE ---
-            StringBuffer msg;
-            msg << "DEBUG AI DEFENSE: " << getFirstName() << " using FALLBACK for " << skillMod 
-                << " -> Returning 20 (Total Defense will be " << getLevel() << " + 20)";
-            info(msg.toString(), true);
-            // ------------------------
-
-            return 20; // Adds 20 to their base Level defense
         }
     }
 
-    return baseMod;
+    // ==========================================================
+    // 3. THE SAFETY NET (Fallback Logic)
+    // ==========================================================
+    // This part is CRITICAL. If the template link fails (Result: 0),
+    // this code forces the NPC to have speed based on Level.
+    // IT PREVENTS "0" FROM EVER BEING RETURNED FOR SPEED.
+
+    if (skillMod.contains("_speed")) {
+        int speed = getLevel() + 25;
+        if (speed > 100) speed = 100;
+        
+        // --- DEBUG: Verify Fallback ---
+        //StringBuffer msg;
+        //msg << "DEBUG AI FALLBACK: " << getFirstName() << " (Level " << getLevel() << ") generating speed " << speed;
+        //Logger::console.info(msg.toString(), true);
+
+        return speed;
+    }
+
+    // Accuracy Fallback
+    if (skillMod.contains("accuracy")) {
+        return 100 + (getLevel() * 2); 
+    }
+    
+    // Defense Fallback
+    if ((skillMod == "dodge_attack" || skillMod == "block") && getLevel() > 80) {
+        return 20;
+    }
+
+    // Jedi Block Fallback
+    if (skillMod == "saber_block") {
+         ManagedReference<WeaponObject*> weapon = const_cast<AiAgentImplementation*>(this)->getWeapon();
+         if (weapon != nullptr && weapon->isJediWeapon()) {
+             return getLevel();
+         }
+    }
+	//StringBuffer msg;
+	//msg << "DEBUG AI LINK: " << getFirstName() << " Return 0 ";
+	//Logger::console.info(msg.toString(), true);
+    return 0;
 }
 
 void AiAgentImplementation::activateForcePowerRegen() {
@@ -656,9 +691,9 @@ void AiAgentImplementation::doForceRegen() {
     setCurrentForce(newForce);
 
     // --- LOGGING (Remove this later if it spams too much) ---
-    StringBuffer msg;
-    msg << "AI Force Regen: +" << regenAmount << " (" << newForce << "/" << maxForcePoints << ")";
-    info(msg.toString(), true);
+    //StringBuffer msg;
+    //msg << "AI Force Regen: +" << regenAmount << " (" << newForce << "/" << maxForcePoints << ")";
+    //info(msg.toString(), true);
 
     // --- RESCHEDULE ---
     // Run again in 2 seconds
@@ -1087,6 +1122,7 @@ void AiAgentImplementation::setupCombatStats() {
 	}
 
 	weaponSpeed = calculateAttackSpeed(level);
+	//info(true) << "calculateAttackSpeed - WeaponSpeed = " << weaponSpeed;
 
 	float globalSpeedOverride = CreatureTemplateManager::instance()->getGlobalAttackSpeedOverride();
 	float customSpeed = npcTemplate->getAttackSpeed();
@@ -2716,6 +2752,34 @@ int AiAgentImplementation::notifyAttack(Observable* observable) {
 }
 
 int AiAgentImplementation::handleObjectMenuSelect(CreatureObject* player, byte selectedID) {
+	// --- START SIMPLAYER HOOK ---
+    // Check if the player is an Admin
+    //if (player->isPlayerCreature()) {
+    //    PlayerObject* ghost = player->getPlayerObject();
+    //    if (ghost != nullptr && ghost->isAdmin()) {
+    //        
+    //        // We hijack the 'EXAMINE' menu option (usually ID 13 or similar constant)
+    //        // If you right-click -> Inspect, this code runs.
+    //        if (selectedID == RadialOptions::EXAMINE) {
+    //            player->sendSystemMessage("admin: Toggling SimPlayer AI...");
+    //			SimPlayerManager::instance()->toggleBot(_this.get());
+//
+    //			// Prevent auto-despawn-by-no-players
+    //			setDespawnOnNoPlayerInRange(false);
+//
+    //			// Cancel any already scheduled despawn mechanisms
+    //			Reference<DespawnCreatureTask*> pending = getPendingTask("despawn").castTo<DespawnCreatureTask*>();
+    //			if (pending != nullptr) pending->cancel();
+//
+    //			if (despawnEvent != nullptr && despawnEvent->isScheduled()) {
+    //			    despawnEvent->cancel();
+    //			    despawnEvent = nullptr;
+    //			}
+//
+    //			return 0;
+    //        }
+    //    }
+    //}
 	if (isDead() && !isPet()) {
 		switch (selectedID) {
 		case 35:
@@ -2795,6 +2859,10 @@ bool AiAgentImplementation::validateStateAttack(CreatureObject* target, unsigned
 }
 
 void AiAgentImplementation::setDespawnOnNoPlayerInRange(bool val) {
+	if (getSimAlwaysActive()) {
+        despawnOnNoPlayerInRange = false;
+        return;
+    }
 	if (despawnOnNoPlayerInRange == val)
 		return;
 
@@ -2808,6 +2876,22 @@ void AiAgentImplementation::setDespawnOnNoPlayerInRange(bool val) {
 		if (!despawnEvent->isScheduled())
 			despawnEvent->schedule(30000);
 	}
+}
+
+bool AiAgentImplementation::getSimPlayerBot() {
+    return simPlayerBot;
+}
+
+void AiAgentImplementation::setSimPlayerBot(bool v) {
+    simPlayerBot = v;
+}
+
+bool AiAgentImplementation::getSimAlwaysActive() {
+    return simAlwaysActive;
+}
+
+void AiAgentImplementation::setSimAlwaysActive(bool v) {
+    simAlwaysActive = v;
 }
 
 void AiAgentImplementation::runAway(CreatureObject* target, float range, bool random, bool setTarget) {
@@ -3027,11 +3111,11 @@ void AiAgentImplementation::healCreatureTarget(CreatureObject* healTarget) {
 
 if (healerType == STRING_HASHCODE("force")) {
         // --- LOGGING START ---
-        StringBuffer logMsg;
-        logMsg << "AI Force Heal Triggered. Current Force: " << getCurrentForce() 
-               << " / " << getMaxForce() 
-               << " - Cost: " << forceCost;
-        info(logMsg.toString(), true); // 'true' forces this to print to the console
+        //StringBuffer logMsg;
+        //logMsg << "AI Force Heal Triggered. Current Force: " << getCurrentForce() 
+        //       << " / " << getMaxForce() 
+        //       << " - Cost: " << forceCost;
+        //info(logMsg.toString(), true); // 'true' forces this to print to the console
         // --- LOGGING END ---
 
         // Deduct the Force
@@ -3039,7 +3123,7 @@ if (healerType == STRING_HASHCODE("force")) {
         setCurrentForce(newForce < 0 ? 0 : newForce); 
 
         // Optional: Confirm new total
-        info("AI Force remaining: " + String::valueOf(newForce), true);
+        //info("AI Force remaining: " + String::valueOf(newForce), true);
     } else {
         // Deduct Mind for medics
         int mindCost = 100;
@@ -3327,8 +3411,11 @@ void AiAgentImplementation::notifyDespawn(Zone* zone) {
 	//info(true) << "ID: " << getObjectID() << " Reference Count: " << getReferenceCount();
 }
 
+
 void AiAgentImplementation::scheduleDespawn(int timeToDespawn, bool force) {
 	Reference<DespawnCreatureTask*> despawn = getPendingTask("despawn").castTo<DespawnCreatureTask*>();
+	if (!force && getSimAlwaysActive())
+        return;
 
 	if (!force && despawn != nullptr)
 		return;
@@ -3392,10 +3479,12 @@ void AiAgentImplementation::notifyDissapear(TreeEntry* entry) {
 			}
 
 			if (newValue == 0) {
-				if (despawnOnNoPlayerInRange && (despawnEvent == nullptr) && !isPet()) {
-					despawnEvent = new DespawnCreatureOnPlayerDissappear(asAiAgent());
-					despawnEvent->schedule(30000);
-				}
+				bool isSim = getSimAlwaysActive() || getSimPlayerBot();
+    
+    			if (!isSim && despawnOnNoPlayerInRange && (despawnEvent == nullptr) && !isPet()) {
+    			    despawnEvent = new DespawnCreatureOnPlayerDissappear(asAiAgent());
+    			    despawnEvent->schedule(30000);
+    			}
 
 				if (isCreature()) {
 					Creature* creature = cast<Creature*>(asAiAgent());
@@ -3578,363 +3667,254 @@ void AiAgentImplementation::checkNewAngle() {
  * range or they have reached their maxDistance to the point.
 */
 bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
-	/*
-	 * SETUP: Check speed and posture before attempting to find a path
-	 */
+    #ifdef DEBUG_AI
+        if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
+            info("findNextPosition(" + String::valueOf(maxDistance) + ", " + String::valueOf(walk) + ")", true);
+    #endif 
 
-#ifdef DEBUG_AI
-	if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
-		info("findNextPosition(" + String::valueOf(maxDistance) + ", " + String::valueOf(walk) + ")", true);
-#endif // DEBUG_AI
+    bool isSimPlayer = getSimPlayerBot();
+    const CreatureTemplate* tmpl = getCreatureTemplate();
+    if (tmpl != nullptr && tmpl->getTemplateName() == "light_jedi_sentinel") {
+        isSimPlayer = true;
+    }
 
-	Locker locker(&targetMutex);
+    Locker locker(&targetMutex);
 
-	if (isDead() || getPatrolPointSize() <= 0)
-		return false;
+    if (isSimPlayer && (isDead() || getPatrolPointSize() <= 0)) {
+		#ifdef DEBUG_MOVE
+        if (isSimPlayer) info("DEBUG_MOVE: Queue Empty or Dead. Stopping.", true);
+		#endif 
+        return false;
+    }
+    if (!isSimPlayer && (isDead() || getPatrolPointSize() <= 0)) return false;
 
-	int posture = getPosture();
-	int movementState = getMovementState();
+    int posture = getPosture();
+    int movementState = getMovementState();
 
-	if (posture == CreaturePosture::CROUCHED)
-		return false;
+    if (posture == CreaturePosture::CROUCHED) return false;
 
-	float newSpeed = runSpeed;
+    float newSpeed = runSpeed;
+    if (movementState == AiAgent::FLEEING && isInCombat()) newSpeed *= 0.7f;
+    if ((walk && movementState != AiAgent::FLEEING) || posture == CreaturePosture::PRONE) newSpeed = walkSpeed;
+    if (hasState(CreatureState::IMMOBILIZED)) newSpeed = newSpeed / 2.f;
+    if (hasState(CreatureState::FROZEN)) newSpeed = 0.01f;
 
-	if (movementState == AiAgent::FLEEING && isInCombat())
-		newSpeed *= 0.7f;
+    float updateTicks = float(BEHAVIORINTERVAL) / 1000.f;
+    float maxSpeed = newSpeed * updateTicks; 
 
-	if ((walk && movementState != AiAgent::FLEEING) || posture == CreaturePosture::PRONE)
-		newSpeed = walkSpeed;
+    Vector3 currentPosition = getPosition();
+    Vector3 currentWorldPos = getWorldPosition();
+    PatrolPoint endMovementPosition = getNextPosition();
 
-	if (hasState(CreatureState::IMMOBILIZED))
-		newSpeed = newSpeed / 2.f;
+    // ------------------------------------------------------------------
+    // DISTANCE & COORDINATE CALCULATION
+    // Vector3 Config: X=East, Y=North, Z=Height
+    // ------------------------------------------------------------------
+    Vector3 endDistDiff(currentWorldPos - endMovementPosition.getWorldPosition());
+    
+    // Horizontal Distance (X and Y are the map plane)
+    float endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
+    
+    // Vertical Distance (Z is Height)
+    float endDistZ = fabs(endDistDiff.getZ());
+    
+    float maxSquared = Math::max(0.1f, maxDistance * maxDistance);
+#ifdef DEBUG_MOVE
+    if (isSimPlayer) {
+        StringBuffer msg;
+        msg << "DEBUG_MOVE: Dist2D=" << sqrt(endDistanceSq) 
+            << "m Speed=" << currentSpeed 
+            << " HeightDiff=" << endDistZ
+            << " Pts=" << patrolPoints.size();
+        if (currentSpeed < 0.1f) msg << " [STALLED]";
+        info(msg.toString(), true);
+    }
+#endif 
+    // --- ARRIVAL LOGIC ---
+    if (endDistanceSq <= maxSquared && endDistZ < (maxDistance + 2.5f)) {
+        currentFoundPath = nullptr;
+        if (patrolPoints.size() > 0) patrolPoints.remove(0);
 
-	if (hasState(CreatureState::FROZEN))
-		newSpeed = 0.01f;
+        if (patrolPoints.size() > 0) {
+#ifdef DEBUG_MOVE
+            if (isSimPlayer) info("DEBUG_MOVE: Cornering...", true);
+#endif 
+            endMovementPosition = getNextPosition();
+            
+            // Recalculate Logic for new target
+            currentPosition = getPosition();
+            currentWorldPos = getWorldPosition();
+            endDistDiff = Vector3(currentWorldPos - endMovementPosition.getWorldPosition());
+            endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
+            maxSquared = Math::max(0.1f, maxDistance * maxDistance);
+        } else {
+#ifdef DEBUG_MOVE
+            if (isSimPlayer) info("DEBUG_MOVE: Arrived.", true);
+#endif 
+            if (movementState != AiAgent::FOLLOWING) notifyObservers(ObserverEventType::DESTINATIONREACHED);
+            setCurrentSpeed(0.f);
+            updateLocomotion();
+            return false;
+        }
+    }
 
-	float updateTicks = float(BEHAVIORINTERVAL) / 1000.f;
-	float maxSpeed = newSpeed * updateTicks; // maxSpeed is the distance able to travel in time updateTicks
+    // --- DIGITAL PHYSICS (NO BRAKING) ---
+    if (isSimPlayer) {
+        if (patrolPoints.size() > 0) newSpeed = runSpeed; 
+        else if (endDistanceSq < 9.0f && newSpeed > 0.4f) newSpeed = Math::max(0.2f, (currentSpeed - 0.8f));
+        else newSpeed = runSpeed;
+        setCurrentSpeed(newSpeed);
+    } else {
+        if ((((currentSpeed * currentSpeed) * maxSquared) > endDistanceSq) && newSpeed > 0.4f) newSpeed = Math::max(0.2f, (currentSpeed - 0.4f));
+        else if (currentSpeed < newSpeed) {
+            float speedDiff = newSpeed - currentSpeed;
+            if (speedDiff > 0.4f) newSpeed = currentSpeed + 0.4f;
+        }
+        setCurrentSpeed(newSpeed);
+    }
+    updateLocomotion();
 
-	Vector3 currentPosition = getPosition();
-	Vector3 currentWorldPos = getWorldPosition();
-	PatrolPoint endMovementPosition = getNextPosition();
+    // --- PATHFINDER ---
+    PathFinderManager* pathFinder = PathFinderManager::instance();
+    if (pathFinder == nullptr) return false;
 
-	Vector3 endDistDiff(currentWorldPos - endMovementPosition.getWorldPosition());
-	float endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
-	float maxSquared = Math::max(0.1f, maxDistance * maxDistance);
+    Reference<Vector<WorldCoordinates>* > path = nullptr;
+    ManagedReference<SceneObject*> currentParent = getParent().get();
+    PatrolPoint currentPoint(currentPosition);
+    const WorldCoordinates endMovementCoords = endMovementPosition.getCoordinates();
+    CellObject* endMovementCell = endMovementPosition.getCell();
 
-	float endDistZSq = endDistDiff.getZ() * endDistDiff.getZ();
-	endDistZSq = Math::getPrecision(endDistZSq, 2);
+    if (currentFoundPath == nullptr) {
+        if (currentParent != nullptr && currentParent->isCellObject()) currentPoint.setCell(currentParent.castTo<CellObject*>());
+        path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementCoords, getZoneUnsafe()));
+    } else {
+        if (currentParent != nullptr && !currentParent->isCellObject()) currentParent = nullptr;
+        if ((movementState == AiAgent::FOLLOWING || movementState == AiAgent::PATHING_HOME || movementState == AiAgent::NOTIFY_ALLY || movementState == AiAgent::MOVING_TO_HEAL || movementState == AiAgent::WATCHING || movementState == AiAgent::CRACKDOWN_SCANNING || movementState == AiAgent::LAIR_HEALING)
+            && endMovementCell == nullptr && currentParent == nullptr && currentFoundPath->get(currentFoundPath->size() - 1).getWorldPosition().squaredDistanceTo(endMovementCoords.getWorldPosition()) > 4 * 4) {
+            path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementPosition.getCoordinates(), getZoneUnsafe()));
+        } else {
+            currentFoundPath->set(0, WorldCoordinates(currentPosition, currentParent.castTo<CellObject*>()));
+            path = currentFoundPath;
+        }
+    }
 
+    if (path == nullptr || path->size() < 2) {
+        currentFoundPath = nullptr;
+        return false;
+    }
+
+    if (currentParent != nullptr && endMovementCell != nullptr) pathFinder->filterPastPoints(path, asAiAgent());
+
+    // --- MULTI-NODE CONSUMPTION LOOP (CORRECTED COORDS) ---
+    WorldCoordinates nextMovementPosition;
+    float remainingDist = maxSpeed; 
+    bool finalPosSet = false;
+    int pathIndex = 1; 
+
+    while (pathIndex < path->size()) {
+        nextMovementPosition = path->get(pathIndex);
+        
+        CellObject* nextMovementCell = nextMovementPosition.getCell();
+        uint64 nextParentID = nextMovementCell != nullptr ? nextMovementCell->getObjectID() : 0;
+        uint64 currentParentID = currentParent != nullptr ? currentParent->getObjectID() : 0;
+        
+        Vector3 checkPos = currentPosition;
+        if (currentParentID != nextParentID && nextParentID > 0) {
+            checkPos = PathFinderManager::transformToModelSpace(currentPosition, nextMovementCell->getParent().get());
+        }
+
+        Vector3 movementDiff(checkPos - nextMovementPosition.getWorldPosition());
+        
+        // 2D Distance using X and Y (Map Plane)
+        float distToNode = Math::sqrt(movementDiff.getX() * movementDiff.getX() + movementDiff.getY() * movementDiff.getY());
+
+        // Skip duplicates
+        if (distToNode < 0.01f) {
+            path->remove(1); 
+            continue;
+        }
+
+        if (distToNode <= remainingDist) {
+            remainingDist -= distToNode;
+            currentPosition = nextMovementPosition.getPoint();
+            currentParent = nextMovementCell; 
+            path->remove(1); 
+            
+            if (path->size() < 2) {
+                finalPosSet = true;
+                break;
+            }
+        } else {
+            // INTERPOLATE
+            float ratio = remainingDist / distToNode;
+            
+            float dx = nextMovementPosition.getX() - checkPos.getX();
+            float dy = nextMovementPosition.getY() - checkPos.getY(); // Y is North
+            float dz = nextMovementPosition.getZ() - checkPos.getZ(); // Z is Height
+            
+            Vector3 interpPos;
+            interpPos.setX(checkPos.getX() + (dx * ratio));
+            interpPos.setY(checkPos.getY() + (dy * ratio)); // Y = North
+            interpPos.setZ(checkPos.getZ() + (dz * ratio)); // Z = Height (Linear Interp)
+            
+            if (!isInNavMesh() && currentParent == nullptr) {
+                // If snapping to floor, update Z (Height)
+                interpPos.setZ(getWorldZ(interpPos)); 
+            }
+
+            nextMovementPosition.setX(interpPos.getX());
+            nextMovementPosition.setY(interpPos.getY());
+            nextMovementPosition.setZ(interpPos.getZ());
+            
+            finalPosSet = true;
+            break;
+        }
+    }
+
+    if (!finalPosSet) {
+        if (path->size() >= 2) {
+            nextMovementPosition = path->get(1);
+        } else {
+            // FIX: Manual set (X, Y=North, Z=Height)
+            nextMovementPosition.setX(currentPosition.getX());
+            nextMovementPosition.setY(currentPosition.getY());
+            nextMovementPosition.setZ(currentPosition.getZ());
+        }
+    }
+
+    // --- FINAL UPDATE ---
+    // [FIXED] Pass coordinates without swapping. 
+    // Vector3 is (X, Y=North, Z=Height). 
+    // nextStepPosition likely matches Vector3 structure internally.
+    nextStepPosition.setPosition(nextMovementPosition.getX(), nextMovementPosition.getZ(), nextMovementPosition.getY());
+    nextStepPosition.setCell(nextMovementPosition.getCell());
+
+    // DIRECTION CALCULATION (FIXED DRIFT)
+    // Use Y for North/South (dy in atan2)
+    float dx = nextMovementPosition.getX() - getPositionX();
+    float dy = nextMovementPosition.getY() - getPositionY(); // Corrected: Y is North
+    
+    float directionAngle = atan2(dy, dx);
+    directionAngle = M_PI / 2 - directionAngle;
+    if (directionAngle < 0) directionAngle = M_PI + directionAngle;
+
+    float error = fabs(directionAngle - direction.getRadians());
+    if (error >= 0.05) setDirection(directionAngle);
+
+    float distTraveled = currentPosition.distanceTo(nextMovementPosition.getPoint()); 
+    if (distTraveled == 0) distTraveled = maxSpeed;
+
+    auto interval = BEHAVIORINTERVAL;
+    nextBehaviorInterval = Math::max((int)50, Math::min((int)((distTraveled / newSpeed) * 1000 + 0.5), interval));
+    
+    currentSpeed = newSpeed;
+    updateCurrentPosition(&nextStepPosition);
+
+    if (isPet()) updatePetSwimmingState();
 #ifdef DEBUG_FINDNEXTPOSITION
-	info(true) << "findNextPosition -- ID: " <<  getObjectID() << " endDistSquared = " << endDistanceSq << "  maxSquared = " << maxSquared << " endDistDiff Z = " << endDistZSq << " Max Distance = " << maxDistance;
+    if (isSimPlayer) info("findNextPosition - complete returning true", true);
 #endif
-
-	if (endDistanceSq <= maxSquared && fabs(endDistZSq) < (maxDistance + 1.f)) {
-		currentFoundPath = nullptr;
-
-		if (patrolPoints.size() > 0)
-			patrolPoints.remove(0);
-
-		if (movementState != AiAgent::FOLLOWING)
-			notifyObservers(ObserverEventType::DESTINATIONREACHED);
-
-		setCurrentSpeed(0.f);
-		updateLocomotion();
-
-		return false;
-	}
-
-	// Handle speed up and slow down
-	if ((((currentSpeed * currentSpeed) * maxSquared) > endDistanceSq) && newSpeed > 0.4f) {
-		newSpeed = Math::max(0.2f, (currentSpeed - 0.4f));
-	} else if (currentSpeed < newSpeed) {
-		float speedDiff = newSpeed - currentSpeed;
-
-		if (speedDiff > 0.4f)
-			newSpeed = currentSpeed + 0.4f;
-	}
-
-	setCurrentSpeed(newSpeed);
-	updateLocomotion();
-
-#ifdef DEBUG_FINDNEXTPOSITION
-	StringBuffer msg1;
-
-	msg1 << "\n--- !!!!    findNextPosition -- Start -- !!!! ----- " << endl
-	<< "Patrol Points Size = " << patrolPoints.size() << endl
-	<< "Current World Position X = " << currentWorldPos.getX() << " Z = " << currentWorldPos.getZ() << " Y = " << currentWorldPos.getY() << endl
-	<< "End Movement Position X = " << endMovementPosition.getWorldPosition().getX() << " Z = " << endMovementPosition.getWorldPosition().getZ() << " Y = " << endMovementPosition.getWorldPosition().getY() << endl
-
-	<< "endDistanceSq = " << endDistanceSq << endl
-	<< "maxSquared = " << maxSquared << endl
-	<< "max distance = " << maxDistance << endl;
-
-	info(true) << msg1.toString();
-#endif
-
-	PathFinderManager* pathFinder = PathFinderManager::instance();
-
-	if (pathFinder == nullptr) {
-		return false;
-	}
-
-	/*
-	*	STEP 1: If we do not already have a path referenced, find a new path
-	*/
-
-	Reference<Vector<WorldCoordinates>* > path = nullptr;
-	ManagedReference<SceneObject*> currentParent = getParent().get();
-
-	PatrolPoint currentPoint(currentPosition);
-	const WorldCoordinates endMovementCoords = endMovementPosition.getCoordinates();
-	CellObject* endMovementCell = endMovementPosition.getCell();
-
-	if (currentFoundPath == nullptr) {
-		// No prior path or path is null, find new path
-		if (currentParent != nullptr && currentParent->isCellObject()) {
-			currentPoint.setCell(currentParent.castTo<CellObject*>());
-		}
-
-		path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementCoords, getZoneUnsafe()));
-	} else {
-		if (currentParent != nullptr && !currentParent->isCellObject()) {
-			currentParent = nullptr;
-		}
-
-		if ((movementState == AiAgent::FOLLOWING || movementState == AiAgent::PATHING_HOME || movementState == AiAgent::NOTIFY_ALLY || movementState == AiAgent::MOVING_TO_HEAL || movementState == AiAgent::WATCHING || movementState == AiAgent::CRACKDOWN_SCANNING || movementState == AiAgent::LAIR_HEALING)
-			&& endMovementCell == nullptr && currentParent == nullptr && currentFoundPath->get(currentFoundPath->size() - 1).getWorldPosition().squaredDistanceTo(endMovementCoords.getWorldPosition()) > 4 * 4) {
-
-			path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementPosition.getCoordinates(), getZoneUnsafe()));
-		} else {
-			currentFoundPath->set(0, WorldCoordinates(currentPosition, currentParent.castTo<CellObject*>()));
-			path = currentFoundPath;
-		}
-	}
-
-	if (path == nullptr) {
-		currentFoundPath = nullptr;
-
-		return false;
-	} else if (path->size() < 2) {
-		currentFoundPath = nullptr;
-		path == nullptr;
-
-		return false;
-	}
-
-#ifdef SHOW_PATH
-	CreateClientPathMessage* pathMessage = new CreateClientPathMessage();
-	if (getParent() == nullptr && pathMessage != nullptr) {
-		pathMessage->addCoordinate(currentPosition.getX(), currentPosition.getZ(), currentPosition.getY());
-	}
-#endif
-
-	// Filter out duplicate path points
-	if (currentParent != nullptr && endMovementCell != nullptr) {
-		pathFinder->filterPastPoints(path, asAiAgent());
-	}
-
-	// the farthest we will move is one point in the path, and the movement update time will change to reflect that
-	WorldCoordinates nextMovementPosition;
-
-	nextMovementPosition = path->get(1);
-
-	if (nextMovementPosition.getX() == currentPosition.getX() && nextMovementPosition.getY() == currentPosition.getY()) {
-		path->remove(1);
-
-		if (path->size() >= 2) {
-			nextMovementPosition = path->get(1);
-		} else {
-			path = nullptr;
-			currentFoundPath = nullptr;
-
-			return false;
-		}
-	}
-
-	CellObject* nextMovementCell = nextMovementPosition.getCell();
-	uint64 currentParentID = currentParent != nullptr ? currentParent->getObjectID() : 0;
-	uint64 nextParentID = nextMovementCell != nullptr ? nextMovementCell->getObjectID() : 0;
-
-	if (currentParentID != nextParentID && nextParentID > 0) {
-		currentPosition = PathFinderManager::transformToModelSpace(currentPosition, nextMovementCell->getParent().get());
-	}
-
-	Vector3 movementDiff(currentWorldPos - nextMovementPosition.getWorldPosition());
-
-	// Determine the distance to the next point excluding the Z coordnate
-	float nextMovementDistance = Math::sqrt(movementDiff.getX() * movementDiff.getX() + movementDiff.getY() * movementDiff.getY());
-	float maxDist = maxSpeed;
-
-	if (endDistanceSq > maxSquared) {
-		// this is the actual "distance we can travel" calculation. We only want to
-		// go to the edge of the maxDistance radius and stop, so select the minimum
-		// of either our max travel distance (maxSpeed) or the distance from the
-		// maxDistance radius
-		maxDist = Math::min(maxSpeed, endDistanceSq - maxSquared + 0.1f);
-	}
-
-#ifdef DEBUG_AI
-	if (nextMovementDistance <= 0) {
-		/*info(true) << "findNextPosition -- ID: " <<  getObjectID() << " endDistSquared = " << endDistanceSq << "  maxSquared = " << maxSquared << "   For:  " << getObjectID();
-		info(true) << " ----- >>>>>>>> nextMovementDistance = " << nextMovementDistance << "   For: " << getObjectID() << " Movement State = " << movementState << " Path size: " << path->size() << "  Patrol points total = " << getPatrolPointSize() << "  Location: " << currentPosition.toString() << "    Next Position = " << nextMovementPosition.getWorldPosition().toString();*/
-	}
-#endif
-
-#ifdef DEBUG_PATHING
-	printf("findNextPosition - Path Size = %i ---  \n", path->size());
-
-	printf("max speed = %f \n", maxSpeed);
-	printf("max distance = %f \n", maxDist);
-	printf("Current Position x = %f , ", currentPosition.getX());
-	printf(" z = %f \n", currentPosition.getZ());
-	printf(" y = %f \n", currentPosition.getY());
-
-	printf("Next Movement Position X = %f , ", nextMovementPosition.getX());
-	printf(" Z = %f \n", nextMovementPosition.getZ());
-	printf(" Y = %f \n", nextMovementPosition.getY());
-	printf("nextMovementDistance = %f \n", nextMovementDistance);
-
-	/*printf(" - Current Path Points - \n");
-
-	for (int i = 0; i < path->size(); ++i) {
-		WorldCoordinates pos = path->get(i);
-
-		printf("Point # %i ", i);
-		printf(" X = %f , ", pos.getX());
-		printf(" Z = %f ", pos.getZ());
-		printf(" Y = %f \n", pos.getY());
-
-		if (pos.getCell() == nullptr)
-			printf(" Cell is null \n");
-	}*/
-#endif
-	Vector3 newPosition;
-
-	if (nextMovementDistance > maxDist && currentParentID == nextParentID) {
-		// nextMovementPosition is further then the maxDist and both points are in the same parent or in the zone
-		// Calculate the distance we can go and set the new nextMovementPosition
-		float dx = nextMovementPosition.getX() - currentPosition.getX();
-		float dy = nextMovementPosition.getY() - currentPosition.getY();
-
-		newPosition.setX(currentPosition.getX() + (maxDist * (dx / nextMovementDistance)));
-		newPosition.setY(currentPosition.getY() + (maxDist * (dy / nextMovementDistance)));
-	} else {
-		newPosition.setX(nextMovementPosition.getX());
-		newPosition.setY(nextMovementPosition.getY());
-
-		path->remove(1);
-	}
-
-	// Handle next Z coordinate
-	if (!isInNavMesh() && currentParent == nullptr) {
-		newPosition.setZ(getWorldZ(newPosition));
-	} else {
-		newPosition.setZ(nextMovementPosition.getZ());
-	}
-
-	nextMovementPosition.setX(newPosition.getX());
-	nextMovementPosition.setY(newPosition.getY());
-	nextMovementPosition.setZ(newPosition.getZ());
-
-#ifdef SHOW_PATH
-		for (int i = 1; i < path->size(); ++i) { // i = 0 is our position
-			const WorldCoordinates& nextPositionDebug = path->get(i);
-
-			Vector3 nextWorldPos = nextPositionDebug.getWorldPosition();
-
-			if (nextPositionDebug.getCell() == nullptr)
-				pathMessage->addCoordinate(nextWorldPos.getX(), currentPosition.getZ(), nextWorldPos.getY());
-		}
-
-		broadcastMessage(pathMessage, false);
-#endif
-
-#ifdef SHOW_NEXT_POSITION
-		for (int i = 0; i < movementMarkers.size(); ++i) {
-			ManagedReference<SceneObject*> marker = movementMarkers.get(i);
-
-			Core::getTaskManager()->scheduleTask([marker] {
-				Locker clocker(marker);
-				marker->destroyObjectFromWorld(false);
-			}, "DestroyMarker", 2000);
-		}
-
-		movementMarkers.removeAll();
-
-		for (int i = 1; i < path->size(); ++i) { // i = 0 is our position
-			const WorldCoordinates& nextPositionDebug = path->get(i);
-
-			Vector3 nextWorldPos = nextPositionDebug.getWorldPosition();
-
-			Reference<SceneObject*> movementMarker = getZoneServer()->createObject(STRING_HASHCODE("object/path_waypoint/path_waypoint.iff"), 0);
-
-			Locker clocker(movementMarker, asAiAgent());
-
-			movementMarker->initializePosition(nextPositionDebug.getX(), nextPositionDebug.getZ(), nextPositionDebug.getY());
-			StringBuffer msg;
-			msg << "Next Position: path distance: " << nextPositionDebug.getWorldPosition().distanceTo(getWorldPosition()) << " maxDist:" << maxDist;
-			movementMarker->setCustomObjectName(msg.toString(), false);
-
-			CellObject* cellObject = nextPositionDebug.getCell();
-
-			if (cellObject != nullptr) {
-				cellObject->transferObject(movementMarker, -1, true);
-			} else {
-				getZone()->transferObject(movementMarker, -1, true);
-			}
-
-			movementMarkers.add(movementMarker);
-		}
-#endif
-
-	/*
-	* STEP 3: Send the movement updates
-	*/
-
-	// Set the next place we will be if we are to move
-	nextStepPosition.setPosition(nextMovementPosition.getX(), nextMovementPosition.getZ(), nextMovementPosition.getY());
-	nextStepPosition.setCell(nextMovementCell);
-
-	float dx = nextMovementPosition.getX() - getPositionX();
-	float dy = nextMovementPosition.getY() - getPositionY();
-
-	float directionAngle = atan2(dy, dx);
-
-	directionAngle = M_PI / 2 - directionAngle;
-
-	if (directionAngle < 0) {
-		float a = M_PI + directionAngle;
-		directionAngle = M_PI + a;
-	}
-
-	float error = fabs(directionAngle - direction.getRadians());
-
-	if (error >= 0.05) {
-		setDirection(directionAngle);
-	}
-
-	auto interval = BEHAVIORINTERVAL;
-	nextBehaviorInterval = Math::min((int)((Math::min(nextMovementDistance, maxDist) / newSpeed) * 1000 + 0.5), interval);
-	currentSpeed = newSpeed;
-
-	updateCurrentPosition(&nextStepPosition);
-
-	if (isPet()) {
-		updatePetSwimmingState();
-	}
-
-#ifdef DEBUG_AI
-	if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
-		info("findNextPosition - complete returning true", true);
-#endif // DEBUG_AI
-
-#ifdef DEBUG_FINDNEXTPOSITION
-	printf("----   !!!!   findNextPosition -- End --   !!!! -----\n");
-#endif
-
-	return true;
+    return true;
 }
 
 bool AiAgentImplementation::checkLineOfSight(SceneObject* obj) {
@@ -4227,13 +4207,156 @@ bool AiAgentImplementation::generatePatrol(int num, float dist) {
 		}
 	}
 
-	// info(true) << "ID: " << getObjectID() << " Finished - generatePatrol with a state of " << getMovementState() << " and point size of = " << getPatrolPointSize();
+	//info(true) << "ID: " << getObjectID() << " Finished - generatePatrol with a state of " << getMovementState() << " and point size of = " << getPatrolPointSize();
 
 	if (getPatrolPointSize() > 0)
 		return true;
 
 	setMovementState(savedState);
 	return false;
+}
+
+void AiAgentImplementation::healEnhanceCreatureTarget(CreatureObject* target, String& statKey) {
+    if (target == nullptr)
+        return;
+
+    if (isDead() || target->isDead())
+        return;
+
+    if (target->isInCombat() || isInCombat())
+        return;
+
+    String key = statKey.toLowerCase();
+
+    int attributeIdx = -1;
+    if (key == "health") attributeIdx = 0;
+    else if (key == "strength") attributeIdx = 1;
+    else if (key == "constitution") attributeIdx = 2;
+    else if (key == "action") attributeIdx = 3;
+    else if (key == "quickness") attributeIdx = 4;
+    else if (key == "stamina") attributeIdx = 5;
+    else return;
+
+    const uint32 crc = BuffCRC::getMedicalBuff(attributeIdx);
+
+    // tune these however you want for your server:
+    const int amount = 1200;          // buff strength
+    const float duration = 3600.0f;        // seconds
+    const int buffType = BuffType::MEDICAL;
+
+    Locker locker(target);
+
+    if (target->hasBuff(crc))
+        return;
+
+    ManagedReference<Buff*> buff = new Buff(target, crc, duration, buffType);
+
+    Locker buffLock(buff);
+    buff->setAttributeModifier((uint8)attributeIdx, amount);
+
+    target->addBuff(buff);
+	target->playEffect("clienteffect/healing_healenhance.cef", "");
+	
+}
+
+void AiAgentImplementation::wipeMedicalEnhanceBuffs(CreatureObject* target) {
+    if (target == nullptr){
+        return;
+	}
+
+	info("wipeMedicalEnhanceBuffs: Wipeitup: ", true);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_HEALTH);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_STRENGTH);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_CONSTITUTION);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_ACTION);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_QUICKNESS);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_STAMINA);
+}
+
+void AiAgentImplementation::wipeEnhanceBuffs(CreatureObject* target, uint32 flags) {
+    if (target == nullptr) {
+		// info("wipeEnhanceBuffs: target nullptr: ", true);
+        return;
+	}
+	// info("wipeEnhanceBuffs: flags:: " + String::valueOf(flags), true);
+    if (flags & EnhanceWipeFlags::MEDICAL) {
+        wipeMedicalEnhanceBuffs(target); // reuse your existing stable behavior
+		// info("wipeEnhanceBuffs: back from wipe: ", true);
+
+		Locker clocker(target);
+		TangibleObject* healer = nullptr;
+		float shock = target->getShockWounds();
+		if (shock > 0) {
+		    target->addShockWounds(-shock, true, false);
+		}
+		int healthW = target->getWounds(CreatureAttribute::HEALTH);
+		if (healthW > 0) {
+		    target->healWound(healer, CreatureAttribute::HEALTH, healthW, true, false);
+		}
+
+		int strengthW = target->getWounds(CreatureAttribute::STRENGTH);
+		if (strengthW > 0) {
+		    target->healWound(healer, CreatureAttribute::STRENGTH, strengthW, true, false);
+		}
+
+		int constitutionW = target->getWounds(CreatureAttribute::CONSTITUTION);
+		if (constitutionW > 0) {
+		    target->healWound(healer, CreatureAttribute::CONSTITUTION, constitutionW, true, false);
+		}
+
+		int actionW = target->getWounds(CreatureAttribute::ACTION);
+		if (actionW > 0) {
+		    target->healWound(healer, CreatureAttribute::ACTION, actionW, true, false);
+		}
+
+		int quicknessW = target->getWounds(CreatureAttribute::QUICKNESS);
+		if (quicknessW > 0) {
+		    target->healWound(healer, CreatureAttribute::QUICKNESS, quicknessW, true, false);
+		}
+
+		int staminaW = target->getWounds(CreatureAttribute::STAMINA);
+		if (staminaW > 0) {
+		    target->healWound(healer, CreatureAttribute::STAMINA, staminaW, true, false);
+		}
+    }
+
+    if (flags & EnhanceWipeFlags::DANCE) {
+        target->removeBuff(BuffCRC::PERFORMANCE_ENHANCE_DANCE_MIND); // performance_enhance_dance_mind
+    }
+
+    if (flags & EnhanceWipeFlags::MUSIC) {
+        target->removeBuff(BuffCRC::PERFORMANCE_ENHANCE_MUSIC_FOCUS); // performance_enhance_music_focus
+        target->removeBuff(BuffCRC::PERFORMANCE_ENHANCE_MUSIC_WILLPOWER); // performance_enhance_music_willpower
+    }
+
+    // Battle fatigue + mind/focus/willpower wounds are "performance side"
+    if (flags & (EnhanceWipeFlags::DANCE | EnhanceWipeFlags::MUSIC)) {
+        // Lock just the target; AiAgentImplementation isn't Lockable.
+		Locker clocker(target);
+
+		// Use the AI creature itself as the healer attribution.
+		TangibleObject* healer = nullptr;
+
+		float shock = target->getShockWounds();
+		if (shock > 0) {
+		    target->addShockWounds(-shock, true, false);
+		}
+
+		int mindW = target->getWounds(CreatureAttribute::MIND);
+		if (mindW > 0) {
+		    target->healWound(healer, CreatureAttribute::MIND, mindW, true, false);
+		}
+
+		int focusW = target->getWounds(CreatureAttribute::FOCUS);
+		if (focusW > 0) {
+		    target->healWound(healer, CreatureAttribute::FOCUS, focusW, true, false);
+		}
+
+		int willW = target->getWounds(CreatureAttribute::WILLPOWER);
+		if (willW > 0) {
+		    target->healWound(healer, CreatureAttribute::WILLPOWER, willW, true, false);
+		}
+	}
 }
 
 float AiAgentImplementation::getMaxDistance() {
@@ -4338,12 +4461,11 @@ int AiAgentImplementation::setDestination() {
 	ManagedReference<SceneObject*> followCopy = getFollowObject().get();
 	unsigned int stateCopy = getMovementState();
 
-	// info(true) << getDisplayedName() << " - ID: " << getObjectID() << "  setDestination - stateCopy: " << stateCopy << "  Patrol Point Size:" << getPatrolPointSize();
-	// info("homeLocation: " + homeLocation.toString(), true);
+	//info(true) << getDisplayedName() << " - ID: " << getObjectID() << "  setDestination - stateCopy: " << stateCopy << "  Patrol Point Size:" << getPatrolPointSize();
+	//info("homeLocation: " + homeLocation.toString(), true);
 
 	if (patrolPoints.size() > 20) {
-		info() << getObjectID() << " Patrol points have overflowed - Total points: " << patrolPoints.size() << " Movement State: " << stateCopy << " Saved Patrol point size: " << savedPatrolPoints.size();
-
+		//info() << getObjectID() << " Patrol points have overflowed - Total points: " << patrolPoints.size() << " Movement State: " << stateCopy << " Saved Patrol point size: " << savedPatrolPoints.size();
 		clearPatrolPoints();
 	}
 
@@ -4741,38 +4863,57 @@ bool AiAgentImplementation::isCamouflaged(CreatureObject* creature) {
 }
 
 void AiAgentImplementation::activateAiBehavior(bool reschedule) {
-	if (getZoneUnsafe() == nullptr || !(getOptionsBitmask() & OptionBitmask::AIENABLED))
-		return;
+    if (getZoneUnsafe() == nullptr || !(getOptionsBitmask() & OptionBitmask::AIENABLED))
+        return;
 
 #ifdef DEBUG_AI
-	bool alwaysActive = ConfigManager::instance()->getAiAgentLoadTesting();
-#else // DEBUG_AI
-	bool alwaysActive = false;
-#endif // DEBUG_AI
+    bool alwaysActive = ConfigManager::instance()->getAiAgentLoadTesting();
+#else
+    bool alwaysActive = false;
+#endif
 
-	ZoneServer* zoneServer = getZoneServer();
+    // ✅ Single source of truth: use your IDL flags (reliable)
+    // If this is a sim bot or forced always active, keep AI ticking even with 0 players nearby.
+    if (getSimAlwaysActive() || getSimPlayerBot() || !getDespawnOnNoPlayerInRange()) {
+        alwaysActive = true;
+    }
 
-	if ((!alwaysActive && numberOfPlayersInRange.get() <= 0 && getFollowObject().get() == nullptr && !isRetreating()) || zoneServer == nullptr || zoneServer->isServerLoading() || zoneServer->isServerShuttingDown()) {
-		cancelBehaviorEvent();
-		return;
-	}
+    ZoneServer* zoneServer = getZoneServer();
 
-	Locker locker(&behaviorEventMutex);
+    // Original "no players nearby -> stop AI" gate, but now bypassed for sim bots / always-active.
+    if ((!alwaysActive && numberOfPlayersInRange.get() <= 0 && getFollowObject().get() == nullptr && !isRetreating())
+        || zoneServer == nullptr
+        || zoneServer->isServerLoading()
+        || zoneServer->isServerShuttingDown()) {
 
-	if (behaviorEvent == nullptr) {
-		behaviorEvent = new AiBehaviorEvent(asAiAgent());
-		behaviorEvent->schedule(Math::max(10, nextBehaviorInterval));
-	} else {
-		if (reschedule) {
-			try {
-				if (!behaviorEvent->isScheduled())
-					behaviorEvent->schedule(Math::max(10, nextBehaviorInterval));
-			} catch (IllegalArgumentException& e) {
-			}
-		}
-	}
+#ifdef DEBUG_AI
+        info() << "activateAiBehavior CANCEL oid=" << getObjectID()
+               << " playersInRange=" << numberOfPlayersInRange.get()
+               << " follow=" << (getFollowObject().get() != nullptr)
+               << " retreat=" << isRetreating()
+               << " simAlwaysActive=" << getSimAlwaysActive()
+               << " simPlayerBot=" << getSimPlayerBot()
+               << " despawnOnNoPlayerInRange=" << getDespawnOnNoPlayerInRange()
+               << " alwaysActiveVar=" << alwaysActive;
+#endif
+        cancelBehaviorEvent();
+        return;
+    }
 
-	nextBehaviorInterval = BEHAVIORINTERVAL;
+    Locker locker(&behaviorEventMutex);
+
+    if (behaviorEvent == nullptr) {
+        behaviorEvent = new AiBehaviorEvent(asAiAgent());
+        behaviorEvent->schedule(Math::max(10, nextBehaviorInterval));
+    } else if (reschedule) {
+        try {
+            if (!behaviorEvent->isScheduled())
+                behaviorEvent->schedule(Math::max(10, nextBehaviorInterval));
+        } catch (IllegalArgumentException& e) {
+        }
+    }
+
+    nextBehaviorInterval = BEHAVIORINTERVAL;
 }
 
 void AiAgentImplementation::cancelBehaviorEvent() {

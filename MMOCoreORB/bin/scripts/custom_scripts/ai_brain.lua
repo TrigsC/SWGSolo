@@ -120,4 +120,50 @@ function AiBrain.getRecruiterIntent(player_input, player_stats_context)
     return { intent = "chat", reply = "I'm having trouble understanding you, soldier." }
 end
 
+--------------------------------------------------------------------------------
+-- OPTIONAL: Doctor Flavor (Non-deterministic, no numbers allowed)
+--------------------------------------------------------------------------------
+function AiBrain.getDoctorFlavorLine(phase, slots, memoryTopic)
+    -- slots: {playerName, doctorName, price, queuePos, etaSeconds, currentTargetName}
+    -- IMPORTANT: we will instruct the model that numbers are provided and must not be invented.
+    local systemPrompt = [[
+        You are the NPC doctor speaking to the player in Star Wars Galaxies.
+        You are NOT the player. The player is NOT the doctor.
+        
+        Always speak as the doctor (first-person).
+        Address the player by their playerName when appropriate.
+        Never call the player "Doc".
+        Never output placeholder tokens like "PlayerName" or "doctorName".
+        Never mention "system", "timeout", "AI", "LLM", or anything out-of-world.
+        The Player will ask for a buff or enhancement, your response should include the appropriate price
+        and you should ask if they are ok with that amount.
+        
+        CRITICAL: You MUST NOT invent any numbers, prices, queue positions, or ETAs.
+        If you mention a price/queue/ETA, you must copy it EXACTLY from the provided slots.
+        Speak only dialogue. No quotes. No asterisks. 1-2 short sentences.
+        ]]
+
+    local slotText = string.format(
+        "SLOTS: playerName=%s, doctorName=%s, price=%s, queuePos=%s, etaSeconds=%s, currentTargetName=%s.",
+        tostring(slots.playerName or ""),
+        tostring(slots.doctorName or ""),
+        tostring(slots.price or ""),
+        tostring(slots.queuePos or ""),
+        tostring(slots.etaSeconds or ""),
+        tostring(slots.currentTargetName or "")
+    )
+
+    local memoryText = ""
+    if memoryTopic and memoryTopic ~= "" then
+        memoryText = "MEMORY_TOPIC: " .. memoryTopic .. "."
+    end
+
+    local full_prompt = systemPrompt ..
+        " PHASE: " .. tostring(phase) .. ". " ..
+        slotText .. " " .. memoryText
+
+    local result = sendToOllama(full_prompt, false)
+    return result or nil
+end
+
 return AiBrain

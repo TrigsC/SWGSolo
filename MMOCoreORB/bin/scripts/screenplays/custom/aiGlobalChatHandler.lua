@@ -1,7 +1,17 @@
+-- MMOCoreORB/bin/scripts/screenplays/custom/aiGlobalChatHandler.lua
+--
+-- Adds SmartDoctorBuffer routing while preserving your existing recruiter + normal LLM paths.
+-- Key behavior:
+--   - If profile.role == "smart_doctor": route to SmartDoctorBuffer:handleChat(...) (deterministic).
+--   - Otherwise keep your existing recruiter logic and standard AiBrain chat logic intact.
+
 local ObjectManager = require("managers.object.object_manager")
 local AiBrain = require("custom_scripts.ai_brain")
 local AiRegistry = require("custom_scripts.ai_registry")
 local recruiterScreenplay = require("screenplays.gcw.recruiters.recruiterScreenplay")
+
+-- Smart Doctor Buffer deterministic handler
+--local SmartDoctorBuffer = require("screenplays.custom.smartDoctorBuffer")
 
 local FactionRanks = {
     [0] = "Recruit",
@@ -37,11 +47,11 @@ end
 
 -- 2. LOGIN HANDLER
 function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
-    
+
     -- Safety Check 1: Did we get a valid object?
-    if (pPlayer == nil) then 
+    if (pPlayer == nil) then
         print("[AI Global] ERROR: onPlayerLoggedIn received nil player!")
-        return 0 
+        return 0
     end
 
     -- Safety Check 2: Is it actually a scene object?
@@ -49,11 +59,11 @@ function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
     if (pSceneObject == nil) then
         return 0
     end
-    
+
     -- Call the internal function using COLON because we are inside Lua now
     AiGlobalChatHandler:registerObservers(pPlayer)
     print("[AI Global] Chat Observer attached to " .. pSceneObject:getCustomObjectName())
-    
+
     return 0
 end
 
@@ -67,34 +77,34 @@ end
 
 function AiGlobalChatHandler:getWorldDistance(pObj1, pObj2)
     if (pObj1 == nil or pObj2 == nil) then return math.huge end
-    
+
     -- Force cast to SceneObject safely
     local scno1 = LuaSceneObject(pObj1)
     local scno2 = LuaSceneObject(pObj2)
-    
+
     if (scno1 == nil or scno2 == nil) then return math.huge end
 
     local x1 = scno1:getWorldPositionX()
     local y1 = scno1:getWorldPositionY()
     local z1 = scno1:getWorldPositionZ()
-    
+
     local x2 = scno2:getWorldPositionX()
     local y2 = scno2:getWorldPositionY()
     local z2 = scno2:getWorldPositionZ()
-    
+
     local dx = x1 - x2
     local dy = y1 - y2
     local dz = z1 - z2
-    
+
     return math.sqrt(dx*dx + dy*dy + dz*dz)
 end
 
 function AiGlobalChatHandler:getPlayerContext(pPlayer)
     if (pPlayer == nil) then return "" end
-    
+
     local pCreature = CreatureObject(pPlayer)
     local name = pCreature:getFirstName()
-    
+
     -- 1. FACTION
     local faction = "Civilian"
     if (pCreature:isRebel()) then faction = "Rebel" end
@@ -113,7 +123,7 @@ function AiGlobalChatHandler:getPlayerContext(pPlayer)
 
     -- 3. CONSTRUCT SENTENCE
     local context = "The player's name is " .. name .. "."
-    
+
     if (faction ~= "Civilian") then
         context = context .. " They are a " .. faction .. " " .. rankTitle .. "."
     else
@@ -124,13 +134,13 @@ function AiGlobalChatHandler:getPlayerContext(pPlayer)
     if (pCreature:hasSkill("force_title_jedi_novice")) then
         context = context .. " They appear to be force sensitive."
     end
-    
+
     return context
 end
 
 function AiGlobalChatHandler:getNpcContext(pTarget)
     if (pTarget == nil) then return "" end
-    
+
     local name = SceneObject(pTarget):getDisplayedName()
     local context = "Your name is " .. name .. "."
 
@@ -144,7 +154,7 @@ end
 -- 2. Nearby LOGIC
 ----------------------------------------------------------------------
 function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTargetID)
-    
+
     local pScenePlayer = SceneObject(pPlayer)
     if (pScenePlayer == nil) then return nil end
 
@@ -155,22 +165,21 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
     local closestDistance = math.huge
     local messageLower = string.lower(message)
 
-    -- print("[AI Debug] Scanning " .. #nearbyObjects .. " nearby objects for keywords...")
-
     for i = 1, #nearbyObjects, 1 do
         local pObj = nearbyObjects[i]
         local objID = SceneObject(pObj):getObjectID()
-        
+
         -- Check if it's a creature and not the player
         if (pObj ~= nil and SceneObject(pObj):getObjectID() ~= SceneObject(pPlayer):getObjectID() and SceneObject(pObj):isCreatureObject()) then
             local dist = self:getWorldDistance(pPlayer, pObj)
 
             if (dist <= AI_RANGE) then
                 local profile = AiRegistry.getProfile(pObj)
-                
+
                 if (profile ~= nil) then
+                    print("[SmartDoctor] Profile: " .. tostring(profile))
                     local isMatch = false
-                    
+
                     local name = string.lower(SceneObject(pObj):getDisplayedName())
                     if (string.find(messageLower, name)) then isMatch = true end
 
@@ -186,15 +195,13 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
                     if (isMatch) then
                         -- PRIORITY 1: Ownership
                         local owner = CreatureObject(pObj):getOwner()
-                        if (owner == pPlayer) then return pObj end 
-                        
+                        if (owner == pPlayer) then return pObj end
+
                         -- PRIORITY 2: Preferred Target
                         if (preferredTargetID ~= 0 and SceneObject(pObj):getObjectID() == preferredTargetID) then
                             return pObj
                         end
-                        
-                        -- print("[AI Debug] Candidate: " .. name .. " WorldDist: " .. dist)
-                
+
                         if (dist < closestDistance) then
                             closestDistance = dist
                             bestMatch = pObj
@@ -204,15 +211,15 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
             end
         end
     end
-    
+
     return bestMatch
 end
 
 ----------------------------------------------------------------------
--- 3. CHAT LOGIC (Includes Recruiter & Normal Handling)
+-- 3. CHAT LOGIC (Includes Recruiter & Normal Handling + Smart Doctor)
 ----------------------------------------------------------------------
 function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothing)
-    
+
     if (pPlayer == nil or pChatMessage == nil) then return 0 end
 
     local spatialMsg = getChatMessage(pChatMessage)
@@ -232,7 +239,7 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
         -- D. FALLBACK: TARGET
         if (targetID ~= 0) then
             local pPossibleTarget = getSceneObject(targetID)
-            
+
             if (pPossibleTarget ~= nil and SceneObject(pPossibleTarget):isCreatureObject()) then
                 -- Only use if they have a valid profile
                 if (AiRegistry.getProfile(pPossibleTarget) ~= nil) then
@@ -250,7 +257,7 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
 
     -- E. CHECK DISTANCE
     local finalDist = self:getWorldDistance(pPlayer, pTarget)
-    
+
     if (finalDist > AI_RANGE) then
         print("[AI Debug] Ignored: Target found, but out of range (" .. finalDist .. "m > " .. AI_RANGE .. "m).")
         return 0
@@ -258,17 +265,46 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
 
     -- F. GET PROFILE
     local profile = AiRegistry.getProfile(pTarget)
-    if (profile == nil) then 
+    if (profile == nil) then
         print("[AI Debug] Ignored: Registry returned nil profile.")
-        return 0 
+        return 0
     end
 
     ----------------------------------------------------------------------
-    -- G. DECISION TREE: RECRUITER vs NORMAL
+    -- G. DECISION TREE: SMART DOCTOR vs RECRUITER vs NORMAL
     ----------------------------------------------------------------------
-    if (profile.role == "recruiter") then
+    if (profile.role == "smart_doctor") then
+        --if (SmartDoctorBuffer ~= nil and SmartDoctorBuffer.handleChat ~= nil) then
+            print("[AI GLOBAL] smart_doctor")
+            local handled = false
+            local ok, err = pcall(function()
+                handled = SmartDoctorBuffer:handleChat(pTarget, pPlayer, spatialMsg)
+            end)
+    
+            if (not ok) then
+                print("[SmartDoctor][ERROR] handleChat exception: " .. tostring(err))
+                return 0
+            end
+    
+            -- If the doctor handled the message, stop here.
+            -- If it returned false, fall through to normal AI response (optional).
+            if (handled) then
+                print("[SmartDoctor] handled")
+                return 0
+            end
+        --else
+        --    print("[SmartDoctor][ERROR] SmartDoctorBuffer not loaded. Did you includeFile(\"custom/smartDoctorBuffer.lua\")?")
+        --    return 0
+        --end
+
+        -- If not handled (message unrelated), allow fall-through to normal NPC response if desired:
+        -- (But in practice, SmartDoctorBuffer returns false for non-buff lines and this might cause LLM chatter.
+        --  If you want the doctor to ONLY respond to buff lines, leave this fall-through as-is or return 0 here.)
+        -- return 0
+
+    elseif (profile.role == "recruiter") then
         -- === PATH 1: RECRUITER AI (JSON LOGIC) ===
-        
+
         -- A. STUCK CHECK: If the server restarted while the timer was running, the data might be gone.
         -- This logic (borrowed from Core3) fixes the player so they aren't stuck forever.
         if (CreatureObject(pPlayer):isChangingFactionStatus() and readData(CreatureObject(pPlayer):getObjectID() .. ":changingFactionStatus") ~= 1) then
@@ -280,10 +316,10 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
             spatialChat(pTarget, "Greetings. I see that your status is currently being processed. I won't be able to help you until that is complete. It should not take much longer.")
             return 0
         end
-        
+
         -- 1. Get Game Context specifically for Recruiters (Rank, Points)
         local recruiterContext = recruiterScreenplay:getPlayerStatusContext(pPlayer, pTarget)
-        
+
         -- 2. Ask Brain for INTENT (Returns a Lua table from JSON)
         local aiData = AiBrain.getRecruiterIntent(spatialMsg, recruiterContext)
 
@@ -297,13 +333,13 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
             -- Trigger Game Mechanics
             if aiData.intent == "promote" then
                 recruiterScreenplay:attemptPromotion(pPlayer, pTarget)
-                
+
             elseif aiData.intent == "buy_armor" then
                 recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_weapons_armor", getGCWDiscount(pPlayer))
-                
+
             elseif aiData.intent == "buy_furniture" then
                 recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_furniture", getGCWDiscount(pPlayer))
-                
+
             elseif aiData.intent == "buy_structures" then
                 recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_installations", getGCWDiscount(pPlayer))
 
@@ -336,7 +372,7 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
         -- === PATH 2: STANDARD NPC AI (FLAVOR TEXT) ===
         local playerContext = self:getPlayerContext(pPlayer)
         local npcContext = self:getNpcContext(pTarget)
-        
+
         -- Use the standard Chat Response function
         local aiResponse = AiBrain.getChatResponse(spatialMsg, profile, playerContext, npcContext)
         spatialChat(pTarget, aiResponse)

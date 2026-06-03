@@ -66,7 +66,7 @@ CreatureTemplate::CreatureTemplate() {
 
 	primaryWeapon = "";
 	secondaryWeapon = "";
-	thrownWeapon = "",
+	thrownWeapon = "";
 
 	templates.removeAll();
 
@@ -155,16 +155,46 @@ void CreatureTemplate::readObject(LuaObject* templateData) {
 	LuaObject statsTable = templateData->getObjectField("statistics");
     if (statsTable.isValidTable()) {
         lua_State* L = statsTable.getLuaState();
-        
+
         // Iterate over the Lua table
         for (lua_pushnil(L); lua_next(L, -2); lua_pop(L, 1)) {
-            // Key is at -2, Value is at -1
-            if (lua_type(L, -2) == LUA_TSTRING && lua_type(L, -1) == LUA_TNUMBER) {
-                String key = lua_tostring(L, -2);
-                int value = (int)lua_tonumber(L, -1);
-                
+            String key = "";
+            int value = 0;
+            bool valid = false;
+
+            // 1. Check Key (Must be String)
+            if (lua_type(L, -2) == LUA_TSTRING) {
+                key = lua_tostring(L, -2);
+
+                // 2. Check Value (Accept Number OR String)
+                if (lua_type(L, -1) == LUA_TNUMBER) {
+                    value = (int)lua_tonumber(L, -1);
+                    valid = true;
+                } else if (lua_type(L, -1) == LUA_TSTRING) {
+                    String valStr = lua_tostring(L, -1);
+                    value = Integer::valueOf(valStr);
+                    valid = true;
+                }
+            }
+
+            if (valid) {
                 statistics.put(key, value);
-                System::out << "TEMPLATE LOAD: light_jedi_sentinel loaded stat [" << key << "] = " << value << endl;
+
+                // --- DEBUG: PROVE THAT C++ SEES THE STATS ---
+                // We use Logger::console because 'attacker' does not exist here.
+                if (key.contains("speed")) {
+                    StringBuffer msg;
+                    msg << "[CreatureTemplate] STAT-LOAD: Injected " << key << " = " << value;
+                    Logger::console.info(msg.toString(), true);
+                }
+            } else {
+                 // Warn if we are skipping data
+                 if (lua_type(L, -2) == LUA_TSTRING) {
+                     String skey = lua_tostring(L, -2); // Renamed to avoid shadow warning
+                     StringBuffer msg;
+                     msg << "[CreatureTemplate] STAT-SKIP: Skipped " << skey << " (Invalid Type)";
+                     Logger::console.info(msg.toString(), true);
+                 }
             }
         }
     }
