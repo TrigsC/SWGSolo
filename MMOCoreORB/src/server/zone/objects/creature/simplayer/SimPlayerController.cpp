@@ -19,7 +19,7 @@
 
 using namespace server::zone::objects::creature::ai::bt;
 
-//#define DEBUG_SIMPLAYER
+//#define DEBUG_SIMPVP
 
 // --------------------------------------------------------
 // TASKS
@@ -129,15 +129,15 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
     destination = targetPos;
     
     float dist = agent->getWorldPosition().distanceTo(targetPos);
+#ifdef DEBUG_SIMPVP
     Logger::console.info("SimPlayer: Requesting move to " + targetPos.toString() + " (Dist: " + String::valueOf(dist) + "m)", true);
+#endif
 
     WorldCoordinates startCoord(agent);
     WorldCoordinates endCoord(targetPos, nullptr);
 
     Reference<SimPathFindTask*> task = new SimPathFindTask(this, startCoord, endCoord, zone);
     
-    // FIX: Use schedule(100) instead of execute() to yield to main thread 
-    // and prevent lockups during heavy startup load.
     task->schedule(100); 
 }
 
@@ -208,8 +208,7 @@ void SimPlayerController::onPathFailed() {
     Logger::console.info("SimPlayer: Pathfinding failed/unreachable. Retrying in 5s...", true);
 #endif
     state = IDLE;
-    
-    // FIX: Don't recurse immediately. Schedule a retry.
+
     Reference<SimRetryTask*> task = new SimRetryTask(this);
     task->schedule(5000); // 5 seconds
 }
@@ -248,9 +247,9 @@ void SimPlayerController::queueMorePathNodes() {
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->getZone() == nullptr) return;
 
-    Locker locker(agent);
-
     onTick(); 
+    
+    Locker locker(agent);
 
     if (agent->isDead() || agent->isIncapacitated()) {
         // tell manager to cleanup corpse after a delay
@@ -300,7 +299,9 @@ void SimPlayerController::checkArrival() {
     if (agent->getPatrolPointSize() == 0 && simPathIndex >= simPath.size()) arrived = true;
 
     if (arrived) {
+#ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer: Arrived at destination.", true);
+#endif
         agent->clearPatrolPoints(); 
         onArrived(); 
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
@@ -363,8 +364,10 @@ SimMinerController::~SimMinerController() {
 void SimMinerController::startSimLoop() {
     state = DECIDING;
     String res = pickRandomResource();
-    targetResource = res; 
+    targetResource = res;
+#ifdef DEBUG_SIMPVP
     Logger::console.info("SimMiner: Loop -> I want [" + res + "]", true);
+#endif
     performSurvey();
 }
 
@@ -419,7 +422,9 @@ void SimMinerController::onArrived() {
 
 void SimMinerController::performSample() {
     state = PERFORMING_ACTION;
+#ifdef DEBUG_SIMPVP
     Logger::console.info("SimMiner: State -> SAMPLING (15s)", true);
+#endif
 
     agent->clearPatrolPoints(); 
     agent->setMovementState(AiAgent::OBLIVIOUS);
@@ -431,7 +436,9 @@ void SimMinerController::performSample() {
 }
 
 void SimMinerController::finishSample() {
+#ifdef DEBUG_SIMPVP
     Logger::console.info("SimMiner: Done sampling.", true);
+#endif
     agent->setPosture(CreaturePosture::UPRIGHT, true);
     agent->doAnimation("stop_sample"); 
     startSimLoop();

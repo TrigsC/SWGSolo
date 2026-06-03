@@ -759,6 +759,21 @@ class AiAgent extends CreatureObject {
 	@preLocked
 	public native void setDespawnOnNoPlayerInRange(boolean val);
 
+	@mock
+	@preLocked
+	@local
+	public abstract native void healEnhanceCreatureTarget(CreatureObject target, String statKey);
+
+	@mock
+	@preLocked
+	@local
+	public abstract native void wipeMedicalEnhanceBuffs(CreatureObject target);
+
+	@mock
+	@preLocked
+	@local
+	public abstract native void wipeEnhanceBuffs(CreatureObject target, unsigned int flags); 
+
 	/**
 	 * Gets called when the creature was despawned
 	 */

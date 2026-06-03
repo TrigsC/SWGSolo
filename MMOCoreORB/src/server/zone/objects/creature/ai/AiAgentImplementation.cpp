@@ -68,6 +68,10 @@
 #include "templates/params/creature/ObjectFlag.h"
 #include "templates/params/creature/CreaturePosture.h"
 #include "templates/params/creature/CreatureState.h"
+#include "server/zone/objects/creature/buffs/Buff.h"
+#include "server/zone/objects/creature/BuffAttribute.h"
+#include "server/zone/objects/creature/buffs/BuffType.h"
+#include "server/zone/objects/creature/buffs/BuffCRC.h"
 #include "server/zone/objects/creature/damageovertime/DamageOverTimeList.h"
 #include "server/zone/objects/creature/ai/events/AiBehaviorEvent.h"
 #include "server/zone/objects/creature/ai/events/AiRecoveryEvent.h"
@@ -177,6 +181,12 @@ static void debugLogAttackMap(AiAgentImplementation* agent,
 	}
 }
 #endif // DEBUG_AI_WEAPONS
+
+namespace EnhanceWipeFlags {
+    static const uint32 MEDICAL = 1 << 0;
+    static const uint32 DANCE   = 1 << 1; // mind performance buff
+    static const uint32 MUSIC   = 1 << 2; // focus+will performance buffs
+}
 
 namespace {
 
@@ -544,66 +554,88 @@ void AiAgentImplementation::reloadTemplate() {
 }
 
 int AiAgentImplementation::getSkillMod(const String& skillMod) const {
-    // 1. Check standard game buffs first
-    int baseMod = CreatureObjectImplementation::getSkillMod(skillMod);
-	//StringBuffer msg;
-    //msg << "DEBUG AI DEFENSE: " << getFirstName() << " checking baseMod " << baseMod;
-	//info(msg.toString(), true);
-    //if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "saber_block") {
-    //     StringBuffer msg;
-    //     msg << "DEBUG INCOMING ATTACK: Engine asking AI for " << skillMod << ". Base is " << baseMod;
-    //     info(msg.toString(), true);
+
+	// --- FORCE DEBUG: PROVE EXECUTION ---
+    //if (skillMod.contains("speed")) {
+    //    StringBuffer msg;
+    //    msg << "DEBUG: AiAgent::getSkillMod IS RUNNING for " << skillMod;
+    //    Logger::console.info(msg.toString(), true);
     //}
 
-    // 2. If base is 0, check our Lua "brain"
-    if (baseMod == 0 && npcTemplate != nullptr) {
-        
-        int templateMod = npcTemplate->getStatistic(skillMod); 
-        
-        // --- LOGGING & RETURN LUA VALUE ---
-        if (templateMod > 0) { 
-            //StringBuffer msg;
-            //msg << "DEBUG AI DEFENSE: " << getFirstName() << " checking " << skillMod 
-            //    << " -> Lua says: " << templateMod;
-            
-            // If it's a primary defense, remind us that Level is added automatically
-            //if (skillMod == "dodge_attack" || skillMod == "block" || skillMod == "melee_defense" || skillMod == "ranged_defense" || skillMod == "jedi_toughness" || skillMod == "lightsaber_toughness") {
-            //    msg << " (Total Defense will be " << getLevel() << " + " << templateMod << ")";
-            //}
-            
-            //info(msg.toString(), true); 
+    // 1. Check standard game buffs first (Spices, Buffs, etc.)
+    int baseMod = CreatureObjectImplementation::getSkillMod(skillMod);
+	//StringBuffer msg;
+    //msg << "DEBUG AI LINK: " << getFirstName() << " skillmod = " << skillMod << " basemod = " << baseMod;
+    //Logger::console.info(msg.toString(), true);
+
+    if (baseMod != 0)
+		//Logger::console.info("baseMod != 0", true);
+        return baseMod;
+
+    // 2. Check the Lua Template (The "Character Sheet")
+    if (npcTemplate != nullptr) {
+
+        int templateMod = npcTemplate->getStatistic(skillMod);
+		//StringBuffer msg;
+    	//msg << "DEBUG AI LINK: " << getFirstName() << " found template = " << templateMod;
+    	//Logger::console.info(msg.toString(), true);
+
+        // --- DEBUG: Verify the link works ---
+        // If you see this log, the connection is fixed.
+        //if (templateMod > 0 && skillMod.contains("speed")) {
+        //    StringBuffer msg;
+        //    msg << "DEBUG AI LINK: " << getFirstName() << " found template stat " << skillMod << " = " << templateMod;
+        //    Logger::console.info(msg.toString(), true);
+        //}
+
+        if (templateMod > 0) {
+			//StringBuffer msg;
+    		//msg << "DEBUG AI LINK: " << getFirstName() << " templatemod > 0 " << templateMod;
+    		//Logger::console.info(msg.toString(), true);
             return templateMod;
-        } 
-
-        // 3. Fallback Heuristic Logic (If Lua is empty)
-        ManagedReference<WeaponObject*> weapon = const_cast<AiAgentImplementation*>(this)->getWeapon();
-
-        // --- SECONDARY DEFENSE FALLBACK ---
-        // If Lua didn't specify Saber Block, give them a level-based chance
-        if (skillMod == "saber_block" && weapon != nullptr && weapon->isJediWeapon()) {
-             return getLevel(); // Level 88 = 88% chance to ricochet
-        }
-
-        // --- ACCURACY FALLBACK ---
-        if (skillMod.contains("accuracy")) {
-             return 100 + (getLevel() * 2); 
-        }
-        
-        // --- PRIMARY DEFENSE FALLBACK ---
-        if ((skillMod == "dodge_attack" || skillMod == "block") && getLevel() > 80) {
-            
-            // --- ADD LOGGING HERE ---
-            //StringBuffer msg;
-            //msg << "DEBUG AI DEFENSE: " << getFirstName() << " using FALLBACK for " << skillMod 
-            //    << " -> Returning 20 (Total Defense will be " << getLevel() << " + 20)";
-            //info(msg.toString(), true);
-            // ------------------------
-
-            return 20; // Adds 20 to their base Level defense
         }
     }
 
-    return baseMod;
+    // ==========================================================
+    // 3. THE SAFETY NET (Fallback Logic)
+    // ==========================================================
+    // This part is CRITICAL. If the template link fails (Result: 0),
+    // this code forces the NPC to have speed based on Level.
+    // IT PREVENTS "0" FROM EVER BEING RETURNED FOR SPEED.
+
+    if (skillMod.contains("_speed")) {
+        int speed = getLevel() + 25;
+        if (speed > 100) speed = 100;
+        
+        // --- DEBUG: Verify Fallback ---
+        //StringBuffer msg;
+        //msg << "DEBUG AI FALLBACK: " << getFirstName() << " (Level " << getLevel() << ") generating speed " << speed;
+        //Logger::console.info(msg.toString(), true);
+
+        return speed;
+    }
+
+    // Accuracy Fallback
+    if (skillMod.contains("accuracy")) {
+        return 100 + (getLevel() * 2); 
+    }
+    
+    // Defense Fallback
+    if ((skillMod == "dodge_attack" || skillMod == "block") && getLevel() > 80) {
+        return 20;
+    }
+
+    // Jedi Block Fallback
+    if (skillMod == "saber_block") {
+         ManagedReference<WeaponObject*> weapon = const_cast<AiAgentImplementation*>(this)->getWeapon();
+         if (weapon != nullptr && weapon->isJediWeapon()) {
+             return getLevel();
+         }
+    }
+	//StringBuffer msg;
+	//msg << "DEBUG AI LINK: " << getFirstName() << " Return 0 ";
+	//Logger::console.info(msg.toString(), true);
+    return 0;
 }
 
 void AiAgentImplementation::activateForcePowerRegen() {
@@ -1090,6 +1122,7 @@ void AiAgentImplementation::setupCombatStats() {
 	}
 
 	weaponSpeed = calculateAttackSpeed(level);
+	//info(true) << "calculateAttackSpeed - WeaponSpeed = " << weaponSpeed;
 
 	float globalSpeedOverride = CreatureTemplateManager::instance()->getGlobalAttackSpeedOverride();
 	float customSpeed = npcTemplate->getAttackSpeed();
@@ -2721,32 +2754,32 @@ int AiAgentImplementation::notifyAttack(Observable* observable) {
 int AiAgentImplementation::handleObjectMenuSelect(CreatureObject* player, byte selectedID) {
 	// --- START SIMPLAYER HOOK ---
     // Check if the player is an Admin
-    if (player->isPlayerCreature()) {
-        PlayerObject* ghost = player->getPlayerObject();
-        if (ghost != nullptr && ghost->isAdmin()) {
-            
-            // We hijack the 'EXAMINE' menu option (usually ID 13 or similar constant)
-            // If you right-click -> Inspect, this code runs.
-            if (selectedID == RadialOptions::EXAMINE) {
-                player->sendSystemMessage("admin: Toggling SimPlayer AI...");
-    			SimPlayerManager::instance()->toggleBot(_this.get());
-
-    			// Prevent auto-despawn-by-no-players
-    			setDespawnOnNoPlayerInRange(false);
-
-    			// Cancel any already scheduled despawn mechanisms
-    			Reference<DespawnCreatureTask*> pending = getPendingTask("despawn").castTo<DespawnCreatureTask*>();
-    			if (pending != nullptr) pending->cancel();
-
-    			if (despawnEvent != nullptr && despawnEvent->isScheduled()) {
-    			    despawnEvent->cancel();
-    			    despawnEvent = nullptr;
-    			}
-
-    			return 0;
-            }
-        }
-    }
+    //if (player->isPlayerCreature()) {
+    //    PlayerObject* ghost = player->getPlayerObject();
+    //    if (ghost != nullptr && ghost->isAdmin()) {
+    //        
+    //        // We hijack the 'EXAMINE' menu option (usually ID 13 or similar constant)
+    //        // If you right-click -> Inspect, this code runs.
+    //        if (selectedID == RadialOptions::EXAMINE) {
+    //            player->sendSystemMessage("admin: Toggling SimPlayer AI...");
+    //			SimPlayerManager::instance()->toggleBot(_this.get());
+//
+    //			// Prevent auto-despawn-by-no-players
+    //			setDespawnOnNoPlayerInRange(false);
+//
+    //			// Cancel any already scheduled despawn mechanisms
+    //			Reference<DespawnCreatureTask*> pending = getPendingTask("despawn").castTo<DespawnCreatureTask*>();
+    //			if (pending != nullptr) pending->cancel();
+//
+    //			if (despawnEvent != nullptr && despawnEvent->isScheduled()) {
+    //			    despawnEvent->cancel();
+    //			    despawnEvent = nullptr;
+    //			}
+//
+    //			return 0;
+    //        }
+    //    }
+    //}
 	if (isDead() && !isPet()) {
 		switch (selectedID) {
 		case 35:
@@ -4181,6 +4214,149 @@ bool AiAgentImplementation::generatePatrol(int num, float dist) {
 
 	setMovementState(savedState);
 	return false;
+}
+
+void AiAgentImplementation::healEnhanceCreatureTarget(CreatureObject* target, String& statKey) {
+    if (target == nullptr)
+        return;
+
+    if (isDead() || target->isDead())
+        return;
+
+    if (target->isInCombat() || isInCombat())
+        return;
+
+    String key = statKey.toLowerCase();
+
+    int attributeIdx = -1;
+    if (key == "health") attributeIdx = 0;
+    else if (key == "strength") attributeIdx = 1;
+    else if (key == "constitution") attributeIdx = 2;
+    else if (key == "action") attributeIdx = 3;
+    else if (key == "quickness") attributeIdx = 4;
+    else if (key == "stamina") attributeIdx = 5;
+    else return;
+
+    const uint32 crc = BuffCRC::getMedicalBuff(attributeIdx);
+
+    // tune these however you want for your server:
+    const int amount = 1200;          // buff strength
+    const float duration = 3600.0f;        // seconds
+    const int buffType = BuffType::MEDICAL;
+
+    Locker locker(target);
+
+    if (target->hasBuff(crc))
+        return;
+
+    ManagedReference<Buff*> buff = new Buff(target, crc, duration, buffType);
+
+    Locker buffLock(buff);
+    buff->setAttributeModifier((uint8)attributeIdx, amount);
+
+    target->addBuff(buff);
+	target->playEffect("clienteffect/healing_healenhance.cef", "");
+	
+}
+
+void AiAgentImplementation::wipeMedicalEnhanceBuffs(CreatureObject* target) {
+    if (target == nullptr){
+        return;
+	}
+
+	info("wipeMedicalEnhanceBuffs: Wipeitup: ", true);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_HEALTH);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_STRENGTH);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_CONSTITUTION);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_ACTION);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_QUICKNESS);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_STAMINA);
+}
+
+void AiAgentImplementation::wipeEnhanceBuffs(CreatureObject* target, uint32 flags) {
+    if (target == nullptr) {
+		// info("wipeEnhanceBuffs: target nullptr: ", true);
+        return;
+	}
+	// info("wipeEnhanceBuffs: flags:: " + String::valueOf(flags), true);
+    if (flags & EnhanceWipeFlags::MEDICAL) {
+        wipeMedicalEnhanceBuffs(target); // reuse your existing stable behavior
+		// info("wipeEnhanceBuffs: back from wipe: ", true);
+
+		Locker clocker(target);
+		TangibleObject* healer = nullptr;
+		float shock = target->getShockWounds();
+		if (shock > 0) {
+		    target->addShockWounds(-shock, true, false);
+		}
+		int healthW = target->getWounds(CreatureAttribute::HEALTH);
+		if (healthW > 0) {
+		    target->healWound(healer, CreatureAttribute::HEALTH, healthW, true, false);
+		}
+
+		int strengthW = target->getWounds(CreatureAttribute::STRENGTH);
+		if (strengthW > 0) {
+		    target->healWound(healer, CreatureAttribute::STRENGTH, strengthW, true, false);
+		}
+
+		int constitutionW = target->getWounds(CreatureAttribute::CONSTITUTION);
+		if (constitutionW > 0) {
+		    target->healWound(healer, CreatureAttribute::CONSTITUTION, constitutionW, true, false);
+		}
+
+		int actionW = target->getWounds(CreatureAttribute::ACTION);
+		if (actionW > 0) {
+		    target->healWound(healer, CreatureAttribute::ACTION, actionW, true, false);
+		}
+
+		int quicknessW = target->getWounds(CreatureAttribute::QUICKNESS);
+		if (quicknessW > 0) {
+		    target->healWound(healer, CreatureAttribute::QUICKNESS, quicknessW, true, false);
+		}
+
+		int staminaW = target->getWounds(CreatureAttribute::STAMINA);
+		if (staminaW > 0) {
+		    target->healWound(healer, CreatureAttribute::STAMINA, staminaW, true, false);
+		}
+    }
+
+    if (flags & EnhanceWipeFlags::DANCE) {
+        target->removeBuff(BuffCRC::PERFORMANCE_ENHANCE_DANCE_MIND); // performance_enhance_dance_mind
+    }
+
+    if (flags & EnhanceWipeFlags::MUSIC) {
+        target->removeBuff(BuffCRC::PERFORMANCE_ENHANCE_MUSIC_FOCUS); // performance_enhance_music_focus
+        target->removeBuff(BuffCRC::PERFORMANCE_ENHANCE_MUSIC_WILLPOWER); // performance_enhance_music_willpower
+    }
+
+    // Battle fatigue + mind/focus/willpower wounds are "performance side"
+    if (flags & (EnhanceWipeFlags::DANCE | EnhanceWipeFlags::MUSIC)) {
+        // Lock just the target; AiAgentImplementation isn't Lockable.
+		Locker clocker(target);
+
+		// Use the AI creature itself as the healer attribution.
+		TangibleObject* healer = nullptr;
+
+		float shock = target->getShockWounds();
+		if (shock > 0) {
+		    target->addShockWounds(-shock, true, false);
+		}
+
+		int mindW = target->getWounds(CreatureAttribute::MIND);
+		if (mindW > 0) {
+		    target->healWound(healer, CreatureAttribute::MIND, mindW, true, false);
+		}
+
+		int focusW = target->getWounds(CreatureAttribute::FOCUS);
+		if (focusW > 0) {
+		    target->healWound(healer, CreatureAttribute::FOCUS, focusW, true, false);
+		}
+
+		int willW = target->getWounds(CreatureAttribute::WILLPOWER);
+		if (willW > 0) {
+		    target->healWound(healer, CreatureAttribute::WILLPOWER, willW, true, false);
+		}
+	}
 }
 
 float AiAgentImplementation::getMaxDistance() {

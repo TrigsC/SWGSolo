@@ -1591,9 +1591,15 @@ void CreatureObjectImplementation::removeAllSkillModsOfType(const int modType, b
 }
 
 int CreatureObjectImplementation::getSkillMod(const String& skillmod) const {
-	ReadLocker locker(&skillModMutex);
+    // ONLY log if we are looking for speed (filters out 99% of the spam)
+    //if (skillmod.contains("speed")) {
+    //    StringBuffer msg;
+    //    msg << "CreatureObject (BASE) called for: " << skillmod;
+    //    Logger::console.info(msg.toString(), true);
+    //}
 
-	return skillModList.getSkillMod(skillmod);
+    ReadLocker locker(&skillModMutex);
+    return skillModList.getSkillMod(skillmod);
 }
 
 int CreatureObjectImplementation::getSkillModOfType(const String& skillmod, const unsigned int modType) {

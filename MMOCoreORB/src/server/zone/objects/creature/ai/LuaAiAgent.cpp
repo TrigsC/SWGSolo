@@ -15,6 +15,7 @@
 #include "server/zone/ZoneServer.h"
 #include "server/chat/StringIdChatParameter.h"
 #include "server/ServerCore.h"
+#include <system/lang/StringBuffer.h>
 
 #include "server/zone/managers/collision/CollisionManager.h"
 #include "server/zone/managers/reaction/ReactionManager.h"
@@ -24,6 +25,14 @@
 #include "server/zone/objects/intangible/tasks/PetControlDeviceStoreTask.h"
 #include "server/zone/objects/area/ActiveArea.h"
 #include "server/zone/managers/creature/PetManager.h"
+#include "server/zone/objects/player/sessions/EntertainingSession.h"
+#include "server/zone/managers/skill/SkillManager.h"
+#include "server/zone/managers/skill/PerformanceManager.h"
+#include "server/zone/objects/creature/buffs/Buff.h"
+#include "server/zone/objects/creature/buffs/BuffType.h"
+#include "server/zone/objects/tangible/Instrument.h"
+
+//#define DEBUG
 
 const char LuaAiAgent::className[] = "LuaAiAgent";
 
@@ -136,6 +145,13 @@ Luna<LuaAiAgent>::RegType LuaAiAgent::Register[] = {
 		{ "setEventArea", &LuaAiAgent::setEventArea },
 		{ "setHamRegenDisabled", &LuaAiAgent::setHamRegenDisabled },
 		{ "healCreatureTarget", &LuaAiAgent::healCreatureTarget },
+		{"healEnhanceCreatureTarget", &LuaAiAgent::healEnhanceCreatureTarget},
+		{"wipeMedicalEnhanceBuffs", &LuaAiAgent::wipeMedicalEnhanceBuffs},
+		{ "startDancingByName", &LuaAiAgent::startDancingByName },
+		{ "applyDanceMindBuff", &LuaAiAgent::applyDanceMindBuff },
+		{ "startPlayingMusicByName", &LuaAiAgent::startPlayingMusicByName },
+		{ "applyMusicBuffs", &LuaAiAgent::applyMusicBuffs },
+		{ "wipeEnhanceBuffs", &LuaAiAgent::wipeEnhanceBuffs },
 		{ 0, 0 }
 };
 
@@ -1109,6 +1125,278 @@ int LuaAiAgent::healCreatureTarget(lua_State* L) {
 
     // 4. Call your specific logic in AiAgentImplementation.cpp
     realObject->healCreatureTarget(target->asCreatureObject());
+
+    return 0;
+}
+
+int LuaAiAgent::healEnhanceCreatureTarget(lua_State* L) {
+    // Expected Lua call: ai:healEnhanceCreatureTarget(pTarget, "health")
+    // Stack (top): [self][target][key]
+#ifdef DEBUG
+Logger::console.info(true) << "healEnhanceCreatureTarget -- ";
+#endif //DEBUG
+    const int numberOfArguments = lua_gettop(L);
+    if (numberOfArguments < 3) {
+#ifdef DEBUG
+Logger::console.info(true) << "healEnhanceCreatureTarget -- < 3";
+#endif //DEBUG
+		return 0;
+	}
+
+	SceneObject* target = (SceneObject*) lua_touserdata(L, -2);
+
+	const char* keyC = lua_tostring(L, -1);
+	if (realObject == nullptr || target == nullptr || keyC == nullptr) {
+#ifdef DEBUG
+	    Logger::console.info(true) << "healEnhanceCreatureTarget -- Something null";
+#endif
+	    return 0;
+	}
+
+	String key(keyC);
+	if (key.isEmpty()) {
+#ifdef DEBUG
+	    Logger::console.info(true) << "healEnhanceCreatureTarget -- key empty";
+#endif
+	    return 0;
+	}
+        
+    if (!target->isCreatureObject()) {
+#ifdef DEBUG
+Logger::console.info(true) << "healEnhanceCreatureTarget -- not isCreatureObject";
+#endif //DEBUG
+		return 0;
+	}
+
+    // Delegate to AiAgentImplementation for the actual buff application logic.
+    // NOTE: Auto-generated Core3 signatures typically use String*.
+    //String keyStr(key);
+    realObject->healEnhanceCreatureTarget(target->asCreatureObject(), key);
+#ifdef DEBUG
+Logger::console.info(true) << "healEnhanceCreatureTarget -- made it!";
+#endif //DEBUG
+    return 0;
+}
+
+int LuaAiAgent::wipeMedicalEnhanceBuffs(lua_State* L) {
+    // Expected Lua call: ai:wipeMedicalEnhanceBuffs(pTarget)
+    // Stack (top): [self][target]
+#ifdef DEBUG
+    Logger::console.info(true) << "wipeMedicalEnhanceBuffs -- ";
+#endif // DEBUG
+
+    const int numberOfArguments = lua_gettop(L);
+    if (numberOfArguments < 2) {
+#ifdef DEBUG
+        Logger::console.info(true) << "wipeMedicalEnhanceBuffs -- < 2";
+#endif // DEBUG
+        return 0;
+    }
+
+    SceneObject* target = (SceneObject*) lua_touserdata(L, -1);
+
+    if (realObject == nullptr || target == nullptr) {
+#ifdef DEBUG
+        Logger::console.info(true) << "wipeMedicalEnhanceBuffs -- Something null";
+#endif // DEBUG
+        return 0;
+    }
+
+    if (!target->isCreatureObject()) {
+#ifdef DEBUG
+        Logger::console.info(true) << "wipeMedicalEnhanceBuffs -- not isCreatureObject";
+#endif // DEBUG
+        return 0;
+    }
+
+    realObject->wipeMedicalEnhanceBuffs(target->asCreatureObject());
+
+#ifdef DEBUG
+    Logger::console.info(true) << "wipeMedicalEnhanceBuffs -- made it!";
+#endif // DEBUG
+
+    return 0;
+}
+
+int LuaAiAgent::wipeEnhanceBuffs(lua_State* L) {
+    // Lua: ai:wipeEnhanceBuffs(pTarget, flags)
+    // flags = bitmask (MEDICAL=1, DANCE=2, MUSIC=4)
+
+    if (realObject == nullptr)
+        return 0;
+
+    if (lua_gettop(L) < 3)
+        return 0;
+
+    SceneObject* target = (SceneObject*) lua_touserdata(L, -2);
+    uint32 flags = (uint32) lua_tonumber(L, -1);
+
+    if (target == nullptr || !target->isCreatureObject())
+        return 0;
+
+    realObject->wipeEnhanceBuffs(target->asCreatureObject(), flags);
+    return 0;
+}
+
+int LuaAiAgent::startDancingByName(lua_State* L) {
+	// Lua call: ai:startDancingByName("basic")
+	if (realObject == nullptr)
+		return 0;
+
+	const char* danceNameC = lua_tostring(L, -1);
+	if (danceNameC == nullptr)
+		danceNameC = "basic";
+
+	String danceName(danceNameC);
+	if (danceName.isEmpty())
+		danceName = "basic";
+
+	PerformanceManager* performanceManager = SkillManager::instance()->getPerformanceManager();
+	if (performanceManager == nullptr)
+		return 0;
+
+	// Resolve the dance index from name
+	int performanceIndex = performanceManager->getPerformanceIndex(PerformanceType::DANCE, danceName, 0);
+	if (performanceIndex == 0)
+		return 0;
+
+	// Ensure entertaining session exists, then start dancing
+	ManagedReference<Facade*> facade = realObject->getActiveSession(SessionFacadeType::ENTERTAINING);
+	ManagedReference<EntertainingSession*> session = dynamic_cast<EntertainingSession*>(facade.get());
+
+	if (session == nullptr) {
+		session = new EntertainingSession(realObject);
+		realObject->addActiveSession(SessionFacadeType::ENTERTAINING, session);
+	}
+
+	session->startDancing(performanceIndex);
+	return 0;
+}
+
+int LuaAiAgent::applyDanceMindBuff(lua_State* L) {
+	// Lua call: ai:applyDanceMindBuff(pPlayer, amount, durationSeconds)
+	// Stack: [self][target][amount][duration]
+	if (realObject == nullptr)
+		return 0;
+
+	const int argc = lua_gettop(L);
+	if (argc < 2)
+		return 0;
+
+	SceneObject* targetObj = (SceneObject*) lua_touserdata(L, 2);
+	if (targetObj == nullptr || !targetObj->isCreatureObject())
+		return 0;
+
+	CreatureObject* target = targetObj->asCreatureObject();
+	if (target == nullptr)
+		return 0;
+
+	int amount = 1000;
+	int duration = 3600; // seconds
+
+	if (argc >= 3 && lua_isnumber(L, 3))
+		amount = (int) lua_tointeger(L, 3);
+
+	if (argc >= 4 && lua_isnumber(L, 4))
+		duration = (int) lua_tointeger(L, 4);
+
+	// performance_enhance_dance_mind
+	const uint32 crc = 0x11C1772E;
+	const uint8 attribute = 6; // Mind
+	const int buffType = BuffType::PERFORMANCE;
+
+	if (target->hasBuff(crc))
+		return 0;
+
+	ManagedReference<Buff*> buff = new Buff(target, crc, duration, buffType);
+	Locker locker(buff);
+
+	buff->setAttributeModifier(attribute, amount);
+	target->addBuff(buff);
+
+	return 0;
+}
+
+int LuaAiAgent::startPlayingMusicByName(lua_State* L) {
+	if (realObject == nullptr)
+		return 0;
+
+	const char* songC = lua_tostring(L, -1);
+	if (songC == nullptr)
+		songC = "ballad";
+
+	String song(songC);
+	if (song.isEmpty())
+		song = "ballad";
+
+	PerformanceManager* performanceManager = SkillManager::instance()->getPerformanceManager();
+	if (performanceManager == nullptr)
+		return 0;
+
+	ManagedReference<Facade*> facade = realObject->getActiveSession(SessionFacadeType::ENTERTAINING);
+	ManagedReference<EntertainingSession*> session = dynamic_cast<EntertainingSession*>(facade.get());
+
+	if (session == nullptr) {
+		session = new EntertainingSession(realObject);
+		realObject->addActiveSession(SessionFacadeType::ENTERTAINING, session);
+	}
+
+	ManagedReference<Instrument*> instrument = realObject->getPlayableInstrument();
+
+	if (instrument == nullptr) {
+		realObject->info("[LUAAIAGENT] startPlayingMusicByName: NO instrument in hold_r and no valid target instrument.");
+		return 0;
+	}
+
+	int instrumentType = instrument->getInstrumentType();
+
+	int performanceIndex = performanceManager->getPerformanceIndex(PerformanceType::MUSIC, song, instrumentType);
+	if (performanceIndex == 0) {
+		StringBuffer sb;
+		sb << "[LUAAIAGENT] startPlayingMusicByName: invalid song for instrumentType=" << instrumentType << " song=" << song;
+		realObject->info(sb.toString());
+		return 0;
+	}
+
+	session->startPlayingMusic(performanceIndex, instrument);
+	return 0;
+}
+
+int LuaAiAgent::applyMusicBuffs(lua_State* L) {
+    // Lua call: ai:applyMusicBuffs(pPlayer, amount, durationSeconds)
+    if (realObject == nullptr)
+        return 0;
+
+    SceneObject* targetObj = (SceneObject*) lua_touserdata(L, 2);
+    if (targetObj == nullptr || !targetObj->isCreatureObject())
+        return 0;
+
+    CreatureObject* target = targetObj->asCreatureObject();
+    if (target == nullptr)
+        return 0;
+
+    int amount = lua_isnumber(L, 3) ? (int) lua_tointeger(L, 3) : 1000;
+    int duration = lua_isnumber(L, 4) ? (int) lua_tointeger(L, 4) : 3600;
+
+    const int buffType = BuffType::PERFORMANCE;
+
+    // Focus
+    const uint32 crcFocus = 0x2E77F586;
+    if (!target->hasBuff(crcFocus)) {
+        ManagedReference<Buff*> b = new Buff(target, crcFocus, duration, buffType);
+        Locker l(b);
+        b->setAttributeModifier(7, amount);
+        target->addBuff(b);
+    }
+
+    // Willpower
+    const uint32 crcWill = 0x3EC6FCB6;
+    if (!target->hasBuff(crcWill)) {
+        ManagedReference<Buff*> b = new Buff(target, crcWill, duration, buffType);
+        Locker l(b);
+        b->setAttributeModifier(8, amount);
+        target->addBuff(b);
+    }
 
     return 0;
 }
