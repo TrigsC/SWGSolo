@@ -4216,8 +4216,8 @@ bool AiAgentImplementation::generatePatrol(int num, float dist) {
 	return false;
 }
 
-void AiAgentImplementation::healEnhanceCreatureTarget(CreatureObject* target, String* statKey) {
-    if (target == nullptr || statKey == nullptr)
+void AiAgentImplementation::healEnhanceCreatureTarget(CreatureObject* target, String& statKey) {
+    if (target == nullptr)
         return;
 
     if (isDead() || target->isDead())
@@ -4226,7 +4226,7 @@ void AiAgentImplementation::healEnhanceCreatureTarget(CreatureObject* target, St
     if (target->isInCombat() || isInCombat())
         return;
 
-    String key = statKey->toLowerCase();
+    String key = statKey.toLowerCase();
 
     int attributeIdx = -1;
     if (key == "health") attributeIdx = 0;
