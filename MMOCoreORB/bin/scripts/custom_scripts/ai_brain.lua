@@ -19,6 +19,21 @@ do
     end
 end
 
+local AiLogger = nil
+do
+    local ok, logger = pcall(require, "custom_scripts.ai_logger")
+    if ok and logger ~= nil then
+        AiLogger = logger
+    else
+        AiLogger = {
+            warn = function() end,
+            info = function() end,
+            debug = function() end,
+            trace = function() end
+        }
+    end
+end
+
 local http = nil
 local ltn12 = nil
 local json = nil
@@ -33,6 +48,19 @@ do
     local okJson, jsonModule = pcall(require, "cjson")
     if okJson then json = jsonModule end
 end
+
+if http == nil then
+    AiLogger.warn("llm", "socket.http unavailable; LLM responses will use fallback text.")
+end
+if ltn12 == nil then
+    AiLogger.warn("llm", "ltn12 unavailable; LLM responses will use fallback text.")
+end
+if json == nil then
+    AiLogger.warn("llm", "cjson unavailable; LLM responses will use fallback text.")
+end
+
+local loggedLlmDisabled = false
+local loggedMissingDependencies = false
 
 local function getLlmConfig()
     local llm = (Config and Config.llm) or {}
@@ -58,10 +86,28 @@ local function dependenciesAvailable()
     return http ~= nil and ltn12 ~= nil and json ~= nil
 end
 
+local function logLlmDisabledOnce()
+    if loggedLlmDisabled then return end
+    loggedLlmDisabled = true
+    AiLogger.debug("llm", "LLM disabled or missing URL/model; using deterministic fallback.")
+end
+
+local function logMissingDependenciesOnce()
+    if loggedMissingDependencies then return end
+    loggedMissingDependencies = true
+    AiLogger.warn("llm", "LLM dependencies unavailable; using deterministic fallback.")
+end
+
 -- PRIVATE HELPER: Handles the raw HTTP request
 local function sendToOllama(final_prompt, json_mode)
     local llmConfig = getLlmConfig()
-    if not llmConfig.enabled or not dependenciesAvailable() then
+    if not llmConfig.enabled then
+        logLlmDisabledOnce()
+        return nil
+    end
+
+    if not dependenciesAvailable() then
+        logMissingDependenciesOnce()
         return nil
     end
 
@@ -78,7 +124,7 @@ local function sendToOllama(final_prompt, json_mode)
 
     local okEncode, request_body = pcall(json.encode, payload)
     if not okEncode or request_body == nil then
-        print("[AiBrain] Error: failed to encode request payload")
+        AiLogger.warn("llm", "Failed to encode Ollama request payload.")
         return nil
     end
 
@@ -100,12 +146,12 @@ local function sendToOllama(final_prompt, json_mode)
     })
 
     if not okRequest then
-        print("[AiBrain] Error: HTTP request failed")
+        AiLogger.warn("llm", "Ollama HTTP request failed: " .. tostring(res))
         return nil
     end
 
     if code ~= 200 then
-        print("[AiBrain] Error: HTTP " .. tostring(code))
+        AiLogger.warn("llm", "Ollama HTTP response code " .. tostring(code) .. ".")
         return nil
     end
 
@@ -115,7 +161,7 @@ local function sendToOllama(final_prompt, json_mode)
     local status, response_data = pcall(json.decode, response_string)
     
     if not status or not response_data or not response_data.response then
-        print("[AiBrain] JSON Decode Error: " .. tostring(response_string))
+        AiLogger.warn("llm", "Failed to parse Ollama response JSON: " .. tostring(response_string):sub(1, 200))
         return nil
     end
 
@@ -184,6 +230,8 @@ function AiBrain.getRecruiterIntent(player_input, player_stats_context)
         if status then
             return result_table
         end
+
+        AiLogger.warn("llm", "Failed to parse recruiter intent JSON: " .. tostring(result_raw):sub(1, 200))
     end
 
     -- Fallback if AI fails

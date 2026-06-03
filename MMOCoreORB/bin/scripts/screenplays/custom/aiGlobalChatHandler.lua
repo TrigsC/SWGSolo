@@ -9,13 +9,29 @@ local ObjectManager = require("managers.object.object_manager")
 local AiRegistry = require("custom_scripts.ai_registry")
 local recruiterScreenplay = require("screenplays.gcw.recruiters.recruiterScreenplay")
 
+local AiLogger = nil
+do
+    local ok, logger = pcall(require, "custom_scripts.ai_logger")
+    if ok and logger ~= nil then
+        AiLogger = logger
+    else
+        AiLogger = {
+            error = function() end,
+            warn = function() end,
+            info = function() end,
+            debug = function() end,
+            trace = function() end
+        }
+    end
+end
+
 local AiBrain = nil
 do
     local ok, brain = pcall(require, "custom_scripts.ai_brain")
     if ok and brain ~= nil then
         AiBrain = brain
     else
-        print("[AI Global] WARN: custom_scripts.ai_brain unavailable; using deterministic AI fallbacks.")
+        AiLogger.warn("chat", "custom_scripts.ai_brain unavailable; using deterministic AI fallbacks.")
         AiBrain = {
             getChatResponse = function()
                 return "..."
@@ -62,7 +78,7 @@ registerScreenPlay("AiGlobalChatHandler", true)
 -- 1. STARTUP & LOGIN LOGIC
 ----------------------------------------------------------------------
 function AiGlobalChatHandler:start()
-    print("[AI Global] Handler Started.")
+    AiLogger.info("chat", "Global chat handler started.")
 end
 
 -- 2. LOGIN HANDLER
@@ -70,7 +86,7 @@ function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
 
     -- Safety Check 1: Did we get a valid object?
     if (pPlayer == nil) then
-        print("[AI Global] ERROR: onPlayerLoggedIn received nil player!")
+        AiLogger.error("chat", "onPlayerLoggedIn received nil player.")
         return 0
     end
 
@@ -82,7 +98,7 @@ function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
 
     -- Call the internal function using COLON because we are inside Lua now
     AiGlobalChatHandler:registerObservers(pPlayer)
-    print("[AI Global] Chat Observer attached to " .. pSceneObject:getCustomObjectName())
+    AiLogger.debug("chat", "Chat observer attached to " .. tostring(pSceneObject:getCustomObjectName()))
 
     return 0
 end
@@ -197,7 +213,7 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
                 local profile = AiRegistry.getProfile(pObj)
 
                 if (profile ~= nil) then
-                    print("[SmartDoctor] Profile: " .. tostring(profile))
+                    AiLogger.trace("chat", "AI profile found while scanning nearby responder.")
                     local isMatch = false
 
                     local name = string.lower(SceneObject(pObj):getDisplayedName())
@@ -254,7 +270,7 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
     pTarget = self:findNearbyResponder(pPlayer, spatialMsg, targetID)
 
     if (pTarget ~= nil) then
-        print("[AI Global] Auto-detected responder via keyword.")
+        AiLogger.debug("chat", "Auto-detected responder via keyword.")
     else
         -- D. FALLBACK: TARGET
         if (targetID ~= 0) then
@@ -264,7 +280,7 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
                 -- Only use if they have a valid profile
                 if (AiRegistry.getProfile(pPossibleTarget) ~= nil) then
                     pTarget = pPossibleTarget
-                    print("[AI Global] Using Hard Target (No keyword detected).")
+                    AiLogger.debug("chat", "Using hard target responder.")
                 end
             end
         end
@@ -279,14 +295,14 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
     local finalDist = self:getWorldDistance(pPlayer, pTarget)
 
     if (finalDist > AI_RANGE) then
-        print("[AI Debug] Ignored: Target found, but out of range (" .. finalDist .. "m > " .. AI_RANGE .. "m).")
+        AiLogger.debug("chat", "Ignored target out of range (" .. tostring(finalDist) .. "m > " .. tostring(AI_RANGE) .. "m).")
         return 0
     end
 
     -- F. GET PROFILE
     local profile = AiRegistry.getProfile(pTarget)
     if (profile == nil) then
-        print("[AI Debug] Ignored: Registry returned nil profile.")
+        AiLogger.trace("chat", "Ignored target because registry returned nil profile.")
         return 0
     end
 
@@ -295,21 +311,21 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
     ----------------------------------------------------------------------
     if (profile.role == "smart_doctor") then
         --if (SmartDoctorBuffer ~= nil and SmartDoctorBuffer.handleChat ~= nil) then
-            print("[AI GLOBAL] smart_doctor")
+            AiLogger.debug("doctor", "Routing chat to SmartDoctorBuffer.")
             local handled = false
             local ok, err = pcall(function()
                 handled = SmartDoctorBuffer:handleChat(pTarget, pPlayer, spatialMsg)
             end)
     
             if (not ok) then
-                print("[SmartDoctor][ERROR] handleChat exception: " .. tostring(err))
+                AiLogger.error("doctor", "handleChat exception: " .. tostring(err))
                 return 0
             end
     
             -- If the doctor handled the message, stop here.
             -- If it returned false, fall through to normal AI response (optional).
             if (handled) then
-                print("[SmartDoctor] handled")
+                AiLogger.debug("doctor", "SmartDoctorBuffer handled chat.")
                 return 0
             end
         --else

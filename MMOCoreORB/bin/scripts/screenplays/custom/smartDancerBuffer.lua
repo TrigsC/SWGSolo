@@ -7,6 +7,19 @@
 
 local ObjectManager = require("managers.object.object_manager")
 local AiAgentBridge = require("custom_scripts.ai_agent_bridge")
+local SmartEntertainerHelper = require("custom_scripts.smart_entertainer_helper")
+local AiLogger = nil
+do
+    local ok, logger = pcall(require, "custom_scripts.ai_logger")
+    if ok and logger ~= nil then
+        AiLogger = logger
+    else
+        AiLogger = {
+            warn = function() end,
+            debug = function() end
+        }
+    end
+end
 
 SmartDancerConfig = SmartDancerConfig or {}
 
@@ -63,21 +76,6 @@ SmartDancerConfig.buffDuration = SmartDancerConfig.buffDuration or 3600 -- secon
 SmartDancerConfig.maxRange = SmartDancerConfig.maxRange or 10
 SmartDancerConfig.keepDancingHeartbeatMs = SmartDancerConfig.keepDancingHeartbeatMs or 15000
 
-local function safeSetCustomObjectName(pObj, name)
-    if pObj == nil or name == nil or name == "" then return end
-    -- IMPORTANT: no boolean arg (your doctor buffer notes this can crash some builds)
-    SceneObject(pObj):setCustomObjectName(name)
-end
-
-local function inRange(pNpc, pPlayer)
-    if pNpc == nil or pPlayer == nil then return false end
-    if SceneObject(pNpc).isInRangeWithObject ~= nil then
-        return SceneObject(pNpc):isInRangeWithObject(pPlayer, SmartDancerConfig.maxRange)
-    end
-    local dist = SceneObject(pNpc):getDistanceTo(pPlayer)
-    return dist ~= nil and dist <= SmartDancerConfig.maxRange
-end
-
 SmartDancerBuffer = SmartDancerBuffer or ScreenPlay:new { numberOfActs = 1 }
 registerScreenPlay("SmartDancerBuffer", true)
 
@@ -94,16 +92,18 @@ function SmartDancerBuffer:start()
             )
 
             if pMob ~= nil then
-                safeSetCustomObjectName(pMob, sp.customName or "Dancer Buffer")
+                SmartEntertainerHelper.safeSetCustomName(pMob, sp.customName or "Dancer Buffer")
 
                 -- Start dancing
-                AiAgentBridge.startDance(pMob, SmartDancerConfig.danceName)
+                if not AiAgentBridge.startDance(pMob, SmartDancerConfig.danceName) then
+                    AiLogger.warn("entertainer", "Failed to start Smart Dancer performance.")
+                end
 
                 -- Watch observer: when players watch this NPC, buff them
                 createObserver(WASWATCHED, "SmartDancerBuffer", "notifyWatched", pMob, 1)
 
                 -- Keep dancing in case something interrupts it
-                createEvent(SmartDancerConfig.keepDancingHeartbeatMs, "SmartDancerBuffer", "keepDancing", pMob, "")
+                SmartEntertainerHelper.scheduleHeartbeat("SmartDancerBuffer", "keepDancing", pMob, SmartDancerConfig.keepDancingHeartbeatMs)
             end
         end
     end
@@ -117,18 +117,16 @@ function SmartDancerBuffer:keepDancing(pMob)
     if c == nil then return end
 
     if not c:isDancing() then
-        AiAgentBridge.startDance(pMob, SmartDancerConfig.danceName)
+        if not AiAgentBridge.startDance(pMob, SmartDancerConfig.danceName) then
+            AiLogger.debug("entertainer", "Failed to restart Smart Dancer performance.")
+        end
     end
 
-    createEvent(SmartDancerConfig.keepDancingHeartbeatMs, "SmartDancerBuffer", "keepDancing", pMob, "")
+    SmartEntertainerHelper.scheduleHeartbeat("SmartDancerBuffer", "keepDancing", pMob, SmartDancerConfig.keepDancingHeartbeatMs)
 end
 
 function SmartDancerBuffer:notifyWatched(pNpc, pWatcher)
-    if pNpc == nil or pWatcher == nil then return 0 end
-    if not SceneObject(pWatcher):isPlayerCreature() then return 0 end
-
-    -- optional: only buff if they’re nearby
-    if not inRange(pNpc, pWatcher) then
+    if not SmartEntertainerHelper.isValidAudienceMember(pWatcher, pNpc, SmartDancerConfig.maxRange) then
         return 0
     end
 

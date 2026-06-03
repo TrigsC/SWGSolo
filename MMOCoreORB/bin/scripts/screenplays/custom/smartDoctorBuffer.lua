@@ -11,9 +11,29 @@
 
 local ObjectManager = require("managers.object.object_manager")
 local AiAgentBridge = require("custom_scripts.ai_agent_bridge")
+local AiLogger = nil
+do
+    local ok, logger = pcall(require, "custom_scripts.ai_logger")
+    if ok and logger ~= nil then
+        AiLogger = logger
+    else
+        AiLogger = {
+            warn = function() end,
+            info = function() end,
+            debug = function() end
+        }
+    end
+end
 
 SmartDoctorConfig = SmartDoctorConfig or {}
-SmartDoctorConfig.pause_grace_ms = SmartDoctorConfig.pause_grace_ms or 8000
+do
+    local ok, cfg = pcall(require, "custom_scripts.smart_doctor_config")
+    if ok and cfg ~= nil then
+        SmartDoctorConfig = cfg
+    elseif not ok then
+        AiLogger.warn("doctor", "Failed to load smart_doctor_config.lua; using embedded fallback defaults.")
+    end
+end
 
 -- ===== Script identity / reload detection =====
 _G.__smartDocLoadCount = (_G.__smartDocLoadCount or 0) + 1
@@ -36,7 +56,7 @@ SmartDoctorConfig.buff_steps = SmartDoctorConfig.buff_steps or {
 SmartDoctorConfig.total_steps = SmartDoctorConfig.total_steps or #SmartDoctorConfig.buff_steps
 SmartDoctorConfig.step_delay_ms = SmartDoctorConfig.step_delay_ms or 4500
 SmartDoctorConfig.confirm_timeout_ms = SmartDoctorConfig.confirm_timeout_ms or 15000
-SmartDoctorConfig.pause_grace_ms = SmartDoctorConfig.pause_grace_ms or 6000
+SmartDoctorConfig.pause_grace_ms = SmartDoctorConfig.pause_grace_ms or 8000
 SmartDoctorConfig.max_range = SmartDoctorConfig.max_range or 10
 SmartDoctorConfig.face_target = (SmartDoctorConfig.face_target ~= false)
 SmartDoctorConfig.min_seconds_between_requests = SmartDoctorConfig.min_seconds_between_requests or 2
@@ -47,6 +67,7 @@ SmartDoctorConfig.doctor_custom_name = SmartDoctorConfig.doctor_custom_name or "
 SmartDoctorConfig.spawn_points = SmartDoctorConfig.spawn_points or {
     -- coronet
     {
+        key = "coronet_medcenter",
         planet = "corellia",
         x = -18.54,
         z = 0.26,
@@ -57,6 +78,7 @@ SmartDoctorConfig.spawn_points = SmartDoctorConfig.spawn_points or {
     },
     -- moenia
     {
+        key = "moenia_medcenter",
         planet = "naboo",
         x = -18.57,
         z = 0.26,
@@ -67,6 +89,7 @@ SmartDoctorConfig.spawn_points = SmartDoctorConfig.spawn_points or {
     },
     -- theed
     {
+        key = "theed_medcenter",
         planet = "naboo",
         x = -18.46,
         z = 0.26,
@@ -77,6 +100,7 @@ SmartDoctorConfig.spawn_points = SmartDoctorConfig.spawn_points or {
     },
     -- mos eisly
     {
+        key = "mos_eisley_medcenter",
         planet = "tatooine",
         x = 7.45,
         z = 0.18,
@@ -97,8 +121,9 @@ do
 end
 
 -- ========= Helpers =========
-local function logInfo(msg) print("[SmartDoctor] " .. tostring(msg)) end
-local function logWarn(msg) print("[SmartDoctor][WARN] " .. tostring(msg)) end
+local function logInfo(msg) AiLogger.info("doctor", msg) end
+local function logWarn(msg) AiLogger.warn("doctor", msg) end
+local function logDebug(msg) AiLogger.debug("doctor", msg) end
 local function nowSec() return os.time() end
 
 local function spawnRegistryKey(sp)
@@ -294,7 +319,7 @@ local function normalizeMsg(msg)
     if msg == nil then return "" end
     msg = string.lower(msg)
     msg = msg:gsub("^%s+", ""):gsub("%s+$", "")
-    print("normalizeMsg Player says: " .. tostring(msg))
+    logDebug("normalizeMsg player says: " .. tostring(msg))
     return msg
 end
 
@@ -832,7 +857,7 @@ local function startBuffingNow(pDoctor, st, pPlayer)
     persistSave(getId(pDoctor), st)
 
     if not AiAgentBridge.wipeMedicalBuffs(pDoctor, pPlayer) then
-        logInfo("[SmartDoctor][WIPE] ERROR: wipeEnhanceBuffs failed or binding not present.")
+        logWarn("wipeEnhanceBuffs failed or binding not present.")
     end
     --logInfo("Starting buffs for " .. getPlayerName(pPlayer) .. " price=" .. tostring(SmartDoctorConfig.price))
     safeCreateEvent(250, "SmartDoctorBuffer", "applyNextStep", pDoctor, tostring(pid))
@@ -842,10 +867,10 @@ end
 -- Core entry called by aiGlobalChatHandler
 function SmartDoctorBuffer:handleChat(pDoctor, pSpeaker, message)
     logInfo("handleChat")
-    print(string.format("[SmartDoctor][DEBUG] LUACTX _G=%s SmartDoctorGlobalState=%s",
-    tostring(_G),
-    tostring(_G.SmartDoctorGlobalState)
-))
+    logDebug(string.format("LUACTX _G=%s SmartDoctorGlobalState=%s",
+        tostring(_G),
+        tostring(_G.SmartDoctorGlobalState)
+    ))
 
     local did = getId(pDoctor)
     local sid = getId(pSpeaker)

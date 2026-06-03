@@ -81,13 +81,14 @@ The AI chat system lets NPCs respond to player spatial chat. It supports three m
 
 - `MMOCoreORB/bin/scripts/custom_scripts/ai_brain.lua`
 - `MMOCoreORB/bin/scripts/custom_scripts/ai_config.lua`
+- `MMOCoreORB/bin/scripts/custom_scripts/ai_logger.lua`
 - `MMOCoreORB/bin/scripts/custom_scripts/ai_registry.lua`
 - `MMOCoreORB/bin/scripts/screenplays/custom/aiGlobalChatHandler.lua`
 - `MMOCoreORB/src/server/zone/objects/player/PlayerObjectImplementation.cpp`
 
 ### Runtime responsibilities
 
-`ai_config.lua` centralizes the custom AI service configuration. It currently controls whether general/recruiter LLM behavior is enabled, which Ollama URL/model to use, the LuaSocket timeout value, and whether Smart Doctor LLM flavor is allowed.
+`ai_config.lua` centralizes the custom AI service configuration. It currently controls whether general/recruiter LLM behavior is enabled, which Ollama URL/model to use, the LuaSocket timeout value, whether Smart Doctor LLM flavor is allowed, and AI logging defaults.
 
 `ai_brain.lua` is the current Lua AI service client. It uses LuaSocket and cjson when they are available:
 
@@ -112,6 +113,21 @@ Public functions currently include:
 - `AiBrain.getChatResponse(player_input, npc_profile, player_context, npc_context)`
 - `AiBrain.getRecruiterIntent(player_input, player_stats_context)`
 - `AiBrain.getDoctorFlavorLine(phase, slots, memoryTopic)`
+
+`ai_logger.lua` is the central logging helper for custom AI Lua systems. It reads `AiConfig.logging`, formats messages as:
+
+```text
+[AI][doctor][WARN] message
+```
+
+The default logging level is `warn`, so error/warn diagnostics are visible while normal chat routing, heartbeat, and debug traces remain quiet. Current logging categories are:
+
+- `doctor`
+- `entertainer`
+- `chat`
+- `llm`
+- `simplayer`
+- `bridge`
 
 `ai_registry.lua` maps NPCs to profiles. It currently supports lookup by internal creature template name and fallback lookup by template path. Important profile concepts include:
 
@@ -191,16 +207,18 @@ health -> strength -> constitution -> action -> quickness -> stamina
 Each buff step calls:
 
 ```lua
-LuaAiAgent(pDoctor):healEnhanceCreatureTarget(pPlayer, stepKey)
+AiAgentBridge.applyMedicalBuffStep(pDoctor, pPlayer, stepKey)
 ```
 
 Before buffing, the doctor attempts to wipe medical enhancement state by calling:
 
 ```lua
-LuaAiAgent(pDoctor):wipeEnhanceBuffs(pPlayer, 1)
+AiAgentBridge.wipeMedicalBuffs(pDoctor, pPlayer)
 ```
 
-The `1` flag corresponds to the medical wipe path in `AiAgentImplementation.cpp`.
+The bridge delegates to `LuaAiAgent(pDoctor):healEnhanceCreatureTarget(...)` and `LuaAiAgent(pDoctor):wipeEnhanceBuffs(..., 1)`. The `1` flag corresponds to the medical wipe path in `AiAgentImplementation.cpp`.
+
+`smart_doctor_config.lua` is now loaded by `smartDoctorBuffer.lua` and owns gameplay/service tuning defaults such as price, buff sequence, timing, range, queue limits, and spawn points. If the config module fails to load, `smartDoctorBuffer.lua` keeps equivalent embedded fallback defaults so the behavior can still start. `AiConfig.smartDoctor.llmFlavorEnabled` remains authoritative for the optional Smart Doctor LLM flavor toggle; `SmartDoctorConfig` is for deterministic gameplay/service tuning.
 
 ### Queue flow
 
@@ -262,7 +280,7 @@ Current behavior:
 - Calls `CreatureObject(pPlayer):subtractCashCredits(price)`.
 - Sends a system message confirming purchase.
 
-The current default price inside `smartDoctorBuffer.lua` is `5000` credits unless `SmartDoctorConfig.price` is already defined before the file loads.
+The current default price is `5000` credits from `SmartDoctorConfig.price`, with an equivalent fallback in `smartDoctorBuffer.lua` if the config module cannot be loaded.
 
 ### Buff application sequence
 
@@ -307,12 +325,9 @@ Current effective behavior is deterministic dialogue.
 
 ### Current limitations
 
-- `smart_doctor_config.lua` exists but is not required by `smartDoctorBuffer.lua` or any other discovered loader.
-- Spawn duplicate protection uses `sp.key`, but the default spawn points in `smartDoctorBuffer.lua` do not define keys.
 - Queue state is not fully persisted.
-- Some debug logging remains in hot paths.
 - `pcall` protects Lua errors but cannot reliably protect against all C++ binding failures.
-- The doctor behavior knows about bridge method names directly.
+- The doctor behavior still owns the full state machine and calls bridge methods directly.
 
 ## Smart Entertainers
 
@@ -324,6 +339,7 @@ Smart Entertainers provide simple NPC service behaviors for performance buffs. T
 
 - `MMOCoreORB/bin/scripts/screenplays/custom/smartDancerBuffer.lua`
 - `MMOCoreORB/bin/scripts/screenplays/custom/smartMusicianBuffer.lua`
+- `MMOCoreORB/bin/scripts/custom_scripts/smart_entertainer_helper.lua`
 
 ### Spawn behavior
 
@@ -340,7 +356,7 @@ Current behavior:
 
 Smart Dancer:
 
-- Starts dancing with `LuaAiAgent:startDancingByName`.
+- Starts dancing through `AiAgentBridge.startDance`.
 - Periodically checks whether the NPC is still dancing.
 - Restarts dancing if interrupted.
 
@@ -348,7 +364,7 @@ Smart Musician:
 
 - Gives the NPC a configured instrument, defaulting to `object/tangible/instrument/slitherhorn.iff`.
 - Tries to equip the instrument through containment transfer.
-- Starts music with `LuaAiAgent:startPlayingMusicByName`.
+- Starts music through `AiAgentBridge.startMusic`.
 - Periodically checks whether the NPC is still playing.
 - Re-equips/restarts music if interrupted.
 
@@ -358,28 +374,30 @@ Smart Dancer:
 
 - Registers `WASWATCHED`.
 - On watch, checks player status and range.
-- Calls `wipeEnhanceBuffs(pWatcher, 2)`.
-- Calls `applyDanceMindBuff`.
+- Calls `AiAgentBridge.wipeDanceBuffs`.
+- Calls `AiAgentBridge.applyDanceMindBuff`.
 
 Smart Musician:
 
 - Registers `WASLISTENEDTO`.
 - On listen, checks player status and range.
-- Calls `wipeEnhanceBuffs(pListener, 4)`.
-- Calls `applyMusicBuffs`.
+- Calls `AiAgentBridge.wipeMusicBuffs`.
+- Calls `AiAgentBridge.applyMusicBuffs`.
 
-The `2` and `4` flags correspond to dance and music enhancement wipe paths in C++.
+The bridge delegates to the raw `LuaAiAgent` bindings. The `2` and `4` flags correspond to dance and music enhancement wipe paths in C++.
 
 ### Shared concepts
 
-The two scripts share several concepts but do not currently share a helper module:
+The two scripts remain separate behaviors but share `smart_entertainer_helper.lua` for generic safe operations:
 
 - Spawn-point driven service NPCs.
 - Safe custom naming.
 - Range checks.
 - Heartbeat events to maintain performance.
-- Bridge calls through `LuaAiAgent`.
+- Bridge calls through `AiAgentBridge`.
 - Immediate buff application after watch/listen observer events.
+
+Behavior-specific details such as spawn locations, observer names, dance/song choices, buff values, and Musician instrument handling remain in the individual screenplay files.
 
 ## SimPlayer System
 
@@ -544,12 +562,10 @@ Recruiter flow is different from general chat because the LLM is used for intent
 
 The following risks and limitations exist in the current codebase:
 
-- `smart_doctor_config.lua` exists but is not currently required by the inspected runtime path.
 - LLM HTTP calls are synchronous and can block the Lua path that handles spatial chat.
 - LLM URL/model/default timeout are centralized in `ai_config.lua`, but broader gameplay configuration remains scattered.
 - Missing LuaSocket or cjson now falls back safely, but the system still depends on those libraries for actual LLM responses.
 - Smart Doctor full queue state is not persisted.
-- Smart Doctor duplicate spawn protection depends on `sp.key`, but default spawn points do not define keys.
 - Some older AI paths still directly know raw `LuaAiAgent` method names.
 - Lua-side `pcall` cannot guarantee safety from every C++ binding failure.
 - Buff amounts, durations, spawn points, cells, prices, and route data are scattered or hardcoded.
@@ -594,6 +610,7 @@ The AI service layer should own AI routing and model interaction:
 - NPC profile lookup.
 - Role-based chat routing.
 - LLM client configuration.
+- AI logging configuration.
 - Prompt construction.
 - JSON parsing and fallback behavior.
 - LLM timeout/failure behavior.
@@ -612,6 +629,8 @@ The behavior layer should own individual NPC workflows:
 
 Behavior scripts may call bridge/service layers but should avoid duplicating low-level binding checks or C++ method names.
 
+Smart Dancer and Smart Musician now share `MMOCoreORB/bin/scripts/custom_scripts/smart_entertainer_helper.lua` for generic safe custom naming, audience validation, and heartbeat scheduling while keeping behavior-specific logic in their own screenplays.
+
 ## Configuration Layer
 
 The configuration layer should own tunable values:
@@ -623,8 +642,9 @@ The configuration layer should own tunable values:
 - Ollama URL/model.
 - SimPlayer group counts and routes.
 - LLM enable/disable switches.
+- AI logging enablement, level, and category switches.
 
-Current LLM configuration is centralized in `ai_config.lua`; gameplay configuration is still split across Lua defaults, hardcoded strings, and one unused Smart Doctor config module.
+Current LLM configuration and AI logging configuration are centralized in `ai_config.lua`. Smart Doctor gameplay/service tuning is active in `smart_doctor_config.lua`, while other gameplay configuration is still split across Lua defaults and hardcoded strings.
 
 # Future Refactoring Roadmap
 
