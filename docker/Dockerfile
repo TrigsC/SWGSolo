@@ -118,9 +118,9 @@ RUN set -xe; \
     git clone ${IDLC_GO_REPO} /opt/idlc-go; \
     cd /opt/idlc-go; \
     git checkout ${IDLC_GO_REF}; \
-    make build; \
+    go build -o idlc-go ./cmd/idlc; \
     install -m 0755 ./idlc-go /usr/local/bin/idlc-go; \
-    idlc-go --help || true
+    idlc-go --help
 
 ENV RUN_USER=swgemu \
     HOME_DIR=/home/swgemu \
