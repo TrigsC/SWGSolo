@@ -31,7 +31,7 @@ if(BUILD_IDL)
 		string(CONCAT idl_b "src/" ${idl_f})
 
 		add_custom_command(OUTPUT "${autogen_cpp}" #"${autogen_h}"
-			COMMAND ${Java_JAVA_EXECUTABLE} ${IDLC_JAVA_ARGS} ${IDL_DIRECTIVES} -silence -rbcpp -sd src ${idl_f}
+			COMMAND ${IDLC_JAVA_ARGS} ${IDL_DIRECTIVES} -silence -rbcpp -sd src ${idl_f}
 			WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 			DEPENDS ${idl}
 			COMMENT "Building IDL object ${idl_b}"
@@ -187,13 +187,13 @@ if(COMPILE_TESTS)
 endif(COMPILE_TESTS)
 
 add_custom_target(idl
-	COMMAND ${Java_JAVA_EXECUTABLE} ${IDLC_JAVA_ARGS} ${IDL_DIRECTIVES} -sd src anyadEclipse
+	COMMAND ${IDLC_JAVA_ARGS} ${IDL_DIRECTIVES} -sd src anyadEclipse
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         COMMENT "Building idl sources"
         VERBATIM)
 
 add_custom_target(rebuild-idl
-	COMMAND ${Java_JAVA_EXECUTABLE} ${IDLC_JAVA_ARGS} ${IDL_DIRECTIVES} -rb -sd src anyadEclipse
+	COMMAND ${IDLC_JAVA_ARGS} ${IDL_DIRECTIVES} -rb -sd src anyadEclipse
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 	COMMENT "Rebuilding idl sources"
         VERBATIM)
