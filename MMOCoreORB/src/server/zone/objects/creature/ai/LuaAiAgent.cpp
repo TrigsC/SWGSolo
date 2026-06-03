@@ -1171,7 +1171,7 @@ Logger::console.info(true) << "healEnhanceCreatureTarget -- not isCreatureObject
     // Delegate to AiAgentImplementation for the actual buff application logic.
     // NOTE: Auto-generated Core3 signatures typically use String*.
     //String keyStr(key);
-    realObject->healEnhanceCreatureTarget(target->asCreatureObject(), &key);
+    realObject->healEnhanceCreatureTarget(target->asCreatureObject(), key);
 #ifdef DEBUG
 Logger::console.info(true) << "healEnhanceCreatureTarget -- made it!";
 #endif //DEBUG
