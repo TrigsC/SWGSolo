@@ -1,17 +1,72 @@
-local http = require("socket.http")
-local ltn12 = require("ltn12") 
-local json = require("cjson")
-
 local AiBrain = {}
 
--- CONFIG
-local brain_url = "http://ollama_brain:11434/api/generate"
-local model_name = "llama3.2"
+local DEFAULT_LLM_CONFIG = {
+    enabled = false,
+    url = nil,
+    model = nil,
+    timeoutSeconds = 3,
+}
+
+local Config = nil
+do
+    local ok, cfg = pcall(require, "custom_scripts.ai_config")
+    if ok and cfg ~= nil then
+        Config = cfg
+    elseif AiConfig ~= nil then
+        Config = AiConfig
+    else
+        Config = { llm = DEFAULT_LLM_CONFIG }
+    end
+end
+
+local http = nil
+local ltn12 = nil
+local json = nil
+
+do
+    local okHttp, httpModule = pcall(require, "socket.http")
+    if okHttp then http = httpModule end
+
+    local okLtn12, ltn12Module = pcall(require, "ltn12")
+    if okLtn12 then ltn12 = ltn12Module end
+
+    local okJson, jsonModule = pcall(require, "cjson")
+    if okJson then json = jsonModule end
+end
+
+local function getLlmConfig()
+    local llm = (Config and Config.llm) or {}
+    local url = llm.url or DEFAULT_LLM_CONFIG.url
+    local model = llm.model or DEFAULT_LLM_CONFIG.model
+    return {
+        enabled = (llm.enabled ~= false and url ~= nil and model ~= nil),
+        url = url,
+        model = model,
+        timeoutSeconds = tonumber(llm.timeoutSeconds) or DEFAULT_LLM_CONFIG.timeoutSeconds,
+    }
+end
+
+local function fallbackChatResponse()
+    return "..."
+end
+
+local function fallbackRecruiterIntent()
+    return { intent = "chat", reply = "I'm having trouble understanding you, soldier." }
+end
+
+local function dependenciesAvailable()
+    return http ~= nil and ltn12 ~= nil and json ~= nil
+end
 
 -- PRIVATE HELPER: Handles the raw HTTP request
 local function sendToOllama(final_prompt, json_mode)
+    local llmConfig = getLlmConfig()
+    if not llmConfig.enabled or not dependenciesAvailable() then
+        return nil
+    end
+
     local payload = {
-        model = model_name,
+        model = llmConfig.model,
         prompt = final_prompt,
         stream = false
     }
@@ -21,11 +76,20 @@ local function sendToOllama(final_prompt, json_mode)
         payload.format = "json"
     end
 
-    local request_body = json.encode(payload)
+    local okEncode, request_body = pcall(json.encode, payload)
+    if not okEncode or request_body == nil then
+        print("[AiBrain] Error: failed to encode request payload")
+        return nil
+    end
+
     local response_body = {}
 
-    local res, code, response_headers = http.request{
-        url = brain_url,
+    if llmConfig.timeoutSeconds ~= nil and llmConfig.timeoutSeconds > 0 then
+        pcall(function() http.TIMEOUT = llmConfig.timeoutSeconds end)
+    end
+
+    local okRequest, res, code, response_headers = pcall(http.request, {
+        url = llmConfig.url,
         method = "POST",
         headers = {
             ["Content-Type"] = "application/json",
@@ -33,7 +97,12 @@ local function sendToOllama(final_prompt, json_mode)
         },
         source = ltn12.source.string(request_body),
         sink = ltn12.sink.table(response_body)
-    }
+    })
+
+    if not okRequest then
+        print("[AiBrain] Error: HTTP request failed")
+        return nil
+    end
 
     if code ~= 200 then
         print("[AiBrain] Error: HTTP " .. tostring(code))
@@ -57,6 +126,7 @@ end
 -- PUBLIC FUNCTION 1: Standard Chat (Flavor Text)
 --------------------------------------------------------------------------------
 function AiBrain.getChatResponse(player_input, npc_profile, player_context, npc_context)
+    npc_profile = npc_profile or {}
     local system_instruction = npc_profile.system_prompt or "You are a Star Wars character."
     
     -- Global formatting rules for CHAT ONLY
@@ -69,7 +139,7 @@ function AiBrain.getChatResponse(player_input, npc_profile, player_context, npc_
                         " The player says: '" .. player_input .. "'."
 
     local result = sendToOllama(full_prompt, false)
-    return result or "..."
+    return result or fallbackChatResponse()
 end
 
 --------------------------------------------------------------------------------
@@ -108,7 +178,7 @@ function AiBrain.getRecruiterIntent(player_input, player_stats_context)
     -- Send with json_mode = true
     local result_raw = sendToOllama(full_prompt, true)
 
-    if result_raw then
+    if result_raw and json ~= nil then
         -- Decode the inner JSON content returned by the AI
         local status, result_table = pcall(json.decode, result_raw)
         if status then
@@ -117,7 +187,7 @@ function AiBrain.getRecruiterIntent(player_input, player_stats_context)
     end
 
     -- Fallback if AI fails
-    return { intent = "chat", reply = "I'm having trouble understanding you, soldier." }
+    return fallbackRecruiterIntent()
 end
 
 --------------------------------------------------------------------------------

@@ -10,6 +10,7 @@
 --  3) This drop-in version wraps ALL createEvent calls to ensure delay_ms >= 1 and args are strings.
 
 local ObjectManager = require("managers.object.object_manager")
+local AiAgentBridge = require("custom_scripts.ai_agent_bridge")
 
 SmartDoctorConfig = SmartDoctorConfig or {}
 SmartDoctorConfig.pause_grace_ms = SmartDoctorConfig.pause_grace_ms or 8000
@@ -48,7 +49,7 @@ SmartDoctorConfig.spawn_points = SmartDoctorConfig.spawn_points or {
     {
         planet = "corellia",
         x = -18.54,
-        z = 26,
+        z = 0.26,
         y = 3.33,
         heading = 90,
         cell = 1855535,
@@ -555,43 +556,12 @@ local function tryChargePlayer(pDoctor, pPlayer, price)
     return true, "ok"
 end
 
-local function hasMethod(obj, name)
-    local ok, val = pcall(function() return obj[name] end)
-    if not ok then return false end
-    return val ~= nil
-end
-
-local function callMethod(obj, name, ...)
-    local fn = obj[name]
-    if fn == nil then return false end
-    local ok, err = pcall(fn, obj, ...)
-    if not ok then
-        --print("[SmartDoctor][ERROR] callMethod " .. tostring(name) .. " failed: " .. tostring(err))
-        return false
-    end
-    return true
-end
-
 local function applyBuffStep(pDoctor, pPlayer, stepKey)
     if pDoctor == nil or pPlayer == nil then return false end
     if stepKey == nil or stepKey == "" then return false end
 
-    local agent = LuaAiAgent(pDoctor)
-    --print(string.format("[SmartDoctor][DEBUG] applyBuffStep stepKey=%s agent=%s",
-    --    tostring(stepKey), tostring(agent)))
-
-    if agent == nil then
-        --print("[SmartDoctor][ERROR] applyBuffStep: LuaAiAgent(pDoctor) returned nil")
-        return false
-    end
-
     CreatureObject(pDoctor):doAnimation("heal_other")
-    if hasMethod(agent, "healEnhanceCreatureTarget") then
-        return callMethod(agent, "healEnhanceCreatureTarget", pPlayer, stepKey)
-    end
-
-    --print("[SmartDoctor][ERROR] No enhance/buff method found on LuaAiAgent in this Core3 build.")
-    return false
+    return AiAgentBridge.applyMedicalBuffStep(pDoctor, pPlayer, stepKey)
 end
 
 local function advanceToNextTarget(pDoctor, st)
@@ -861,15 +831,8 @@ local function startBuffingNow(pDoctor, st, pPlayer)
     }
     persistSave(getId(pDoctor), st)
 
-    local agent = LuaAiAgent(pDoctor)
-    if agent == nil then
-        --logInfo("[SmartDoctor][WIPE] ERROR: LuaAiAgent(pDoctor) returned nil; cannot wipe buffs.")
-    elseif agent.wipeMedicalEnhanceBuffs == nil then
-        logInfo("[SmartDoctor][WIPE] ERROR: wipeMedicalEnhanceBuffs is nil on LuaAiAgent; binding not present.")
-    else
-        --logInfo("[SmartDoctor][WIPE] Wiping medical buffs on " .. getPlayerName(pPlayer))
-        agent:wipeEnhanceBuffs(pPlayer, 1)
-        --logInfo("[SmartDoctor][WIPE] Done wiping medical buffs on " .. getPlayerName(pPlayer))
+    if not AiAgentBridge.wipeMedicalBuffs(pDoctor, pPlayer) then
+        logInfo("[SmartDoctor][WIPE] ERROR: wipeEnhanceBuffs failed or binding not present.")
     end
     --logInfo("Starting buffs for " .. getPlayerName(pPlayer) .. " price=" .. tostring(SmartDoctorConfig.price))
     safeCreateEvent(250, "SmartDoctorBuffer", "applyNextStep", pDoctor, tostring(pid))

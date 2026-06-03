@@ -6,9 +6,29 @@
 --   - Otherwise keep your existing recruiter logic and standard AiBrain chat logic intact.
 
 local ObjectManager = require("managers.object.object_manager")
-local AiBrain = require("custom_scripts.ai_brain")
 local AiRegistry = require("custom_scripts.ai_registry")
 local recruiterScreenplay = require("screenplays.gcw.recruiters.recruiterScreenplay")
+
+local AiBrain = nil
+do
+    local ok, brain = pcall(require, "custom_scripts.ai_brain")
+    if ok and brain ~= nil then
+        AiBrain = brain
+    else
+        print("[AI Global] WARN: custom_scripts.ai_brain unavailable; using deterministic AI fallbacks.")
+        AiBrain = {
+            getChatResponse = function()
+                return "..."
+            end,
+            getRecruiterIntent = function()
+                return { intent = "chat", reply = "I'm having trouble understanding you, soldier." }
+            end,
+            getDoctorFlavorLine = function()
+                return nil
+            end
+        }
+    end
+end
 
 -- Smart Doctor Buffer deterministic handler
 --local SmartDoctorBuffer = require("screenplays.custom.smartDoctorBuffer")
