@@ -617,17 +617,11 @@ int AiAgentImplementation::getSkillMod(const String& skillMod) const {
 
     // Accuracy Fallback
     if (skillMod.contains("accuracy")) {
-		StringBuffer msg;
-		msg << "DEBUG AI LINK: " << getFirstName() << " contains accuracy";
-		Logger::console.info(msg.toString(), true);
         return 100 + (getLevel() * 2); 
     }
     
     // Defense Fallback
     if ((skillMod == "dodge_attack" || skillMod == "block") && getLevel() > 80) {
-		StringBuffer msg;
-		msg << "DEBUG AI LINK: " << getFirstName() << " Defense Fallback ";
-		Logger::console.info(msg.toString(), true);
         return 20;
     }
 
