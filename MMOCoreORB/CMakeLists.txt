@@ -272,7 +272,7 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU
     endforeach(flag_comp)
 
     if (ENABLE_ERROR_ON_WARNINGS)
-	   set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+	   set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -Wno-deprecated-literal-operator -Wno-nontrivial-memcall")
     endif(ENABLE_ERROR_ON_WARNINGS)
 
     if (ENABLE_ASAN)

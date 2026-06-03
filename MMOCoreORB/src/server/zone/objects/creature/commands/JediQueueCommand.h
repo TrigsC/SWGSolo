@@ -16,6 +16,7 @@
 #include "server/zone/objects/creature/buffs/SingleUseBuff.h"
 #include "server/zone/objects/player/PlayerObject.h"
 #include "server/zone/managers/frs/FrsManager.h"
+#include "server/zone/objects/creature/ai/AiAgent.h"
 
 class JediQueueCommand : public QueueCommand {
 
@@ -44,6 +45,11 @@ protected:
 
 public:
 	enum { BASE_BUFF, SINGLE_USE_BUFF };
+
+	// For AI to understand Force Cost
+	int getForceCost() const {
+        return forceCost;
+    }
 
 	JediQueueCommand(const String& name, ZoneProcessServer* server) : QueueCommand(name, server) {
 		forceCost = 0;
@@ -113,16 +119,31 @@ public:
 	}
 
 	int doJediForceCostCheck(CreatureObject* creature) const {
-		//Check for Force Cost..
-		ManagedReference<PlayerObject*> playerObject = creature->getPlayerObject();
+        // 1. PLAYER LOGIC
+        if (creature->isPlayerCreature()) {
+            ManagedReference<PlayerObject*> playerObject = creature->getPlayerObject();
 
-		if (playerObject && playerObject->getForcePower() < getFrsModifiedForceCost(creature)) {
-			creature->sendSystemMessage("@jedi_spam:no_force_power"); //"You do not have enough Force Power to peform that action.
-			return GENERALERROR;
-		}
+            if (playerObject && playerObject->getForcePower() < getFrsModifiedForceCost(creature)) {
+                creature->sendSystemMessage("@jedi_spam:no_force_power"); 
+                return GENERALERROR;
+            }
+        }
+        // 2. AI LOGIC
+        else if (creature->isAiAgent()) {
+            AiAgent* ai = creature->asAiAgent();
+            if (ai != nullptr) {
+                // Safety: Ensure a minimum cost so they can't spam free spells
+                int cost = forceCost;
+                if (cost <= 0) cost = 50; 
 
-		return SUCCESS;
-	}
+                if (ai->getCurrentForce() < cost) {
+                    return GENERALERROR; // Out of Force
+                }
+            }
+        }
+
+        return SUCCESS;
+    }
 
 	int doCommonJediSelfChecks(CreatureObject* creature) const {
 		int res = doCommonMedicalCommandChecks(creature);
@@ -226,6 +247,11 @@ public:
 
 
 	int getFrsModifiedForceCost(CreatureObject* creature) const {
+		// AI has no FRS stats, just return the base cost.
+        if (creature->isAiAgent()) {
+            return forceCost;
+        }
+
 		ManagedReference<PlayerObject*> ghost = creature->getPlayerObject();
 
 		if (ghost == nullptr)
@@ -286,11 +312,31 @@ public:
 	}
 
 	void doForceCost(CreatureObject* creature) const {
-		// Force Cost.
-		ManagedReference<PlayerObject*> playerObject = creature->getPlayerObject();
-		playerObject->setForcePower(playerObject->getForcePower() - getFrsModifiedForceCost(creature));
-		VisibilityManager::instance()->increaseVisibility(creature, visMod);
-	}
+        // 1. PLAYER LOGIC
+        if (creature->isPlayerCreature()) {
+            ManagedReference<PlayerObject*> playerObject = creature->getPlayerObject();
+            if (playerObject != nullptr) {
+                playerObject->setForcePower(playerObject->getForcePower() - getFrsModifiedForceCost(creature));
+                VisibilityManager::instance()->increaseVisibility(creature, visMod);
+            }
+        }
+        // 2. AI LOGIC 
+        else if (creature->isAiAgent()) {
+            AiAgent* ai = creature->asAiAgent();
+            if (ai != nullptr) {
+                 int cost = forceCost;
+                 if (cost <= 0) cost = 50; // Default fallback
+
+                 int newForce = ai->getCurrentForce() - cost;
+                 ai->setCurrentForce(newForce < 0 ? 0 : newForce);
+                 
+                 // Debug Logging (Optional)
+                 StringBuffer msg;
+                 msg << "AI Force Spell used. Cost: " << cost << " Remaining: " << newForce;
+                 ai->info(msg.toString(), true);
+            }
+        }
+    }
 
 	void setForceCost(int fc) {
 		forceCost = fc;

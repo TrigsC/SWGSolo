@@ -94,6 +94,8 @@ protected:
 
 	LootGroupCollection lootgroups;
 
+	VectorMap<String, int> statistics;
+
 	String primaryWeapon;
 	String secondaryWeapon;
 	String thrownWeapon;
@@ -202,7 +204,7 @@ public:
 	}
 
 	inline bool isHealer() const {
-		return creatureBitmask & ObjectFlag::HEALER;
+		return creatureBitmask & ObjectFlag::HEALER || !healerType.isEmpty();
 	}
 
 	inline bool isPack() const {
@@ -316,6 +318,12 @@ public:
 	inline int getLevel() const {
 		return level;
 	}
+
+	inline int getStatistic(const String& statName) const {
+        if (statistics.contains(statName))
+            return statistics.get(statName);
+        return 0;
+    }
 
 	inline float getChanceHit() const {
 		return chanceHit;

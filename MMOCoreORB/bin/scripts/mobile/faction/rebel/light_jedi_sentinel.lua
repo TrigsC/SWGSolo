@@ -5,15 +5,30 @@ light_jedi_sentinel = Creature:new {
 	mobType = MOB_NPC,
 	socialGroup = "self",
 	faction = "",
-	level = 1,
-	chanceHit = 30,
-	damageMin = 2645,
-	damageMax = 5000,
+	level = 88,
+	--chanceHit = 30,
+	statistics = {
+        attack_accuracy = 100,
+        melee_accuracy = 60,
+		melee_defense = 20,
+        --dodge_attack = 40,
+        --block = 40,
+        --counter_attack = 40, 
+        lightsaber_toughness = 55,
+		--jedi_toughness = 45,
+        saber_block = 85,
+		--posture_change_defense = 60,
+        --intimidate_defense = 60,
+        --stun_defense = 60,
+        --blind_defense = 60,
+    },
+	damageMin = 500,
+	damageMax = 600,
 	baseXp = 45,
-	baseHAM = 1106000,
-	baseHAMmax = 1352000,
-	armor = 3,
-	resists = {95,95,95,95,95,95,95,95,-1},
+	baseHAM = 4000,
+	baseHAMmax = 5000,
+	armor = 1,
+	resists = {0,0,0,0,0,0,0,0,-1},
 	meatType = "",
 	meatAmount = 0,
 	hideType = "",
@@ -27,6 +42,7 @@ light_jedi_sentinel = Creature:new {
 	creatureBitmask = KILLER + PACK + HERD,
 	optionsBitmask = AIENABLED,
 	diet = HERBIVORE,
+	healerType = "force",
 	customAiMap = "enclaveSentinel",
 
 	templates = { "light_jedi" },
@@ -40,7 +56,7 @@ light_jedi_sentinel = Creature:new {
 
 	-- primaryAttacks and secondaryAttacks should be separate skill groups specific to the weapon type listed in primaryWeapon and secondaryWeapon
 	-- Use merge() to merge groups in creatureskills.lua together. If a weapon is set to "none", set the attacks variable to empty brackets
-	primaryAttacks = merge(lightsabermaster,forcepowermaster),
+	primaryAttacks = lightsabermaster,
 	secondaryAttacks = forcepowermaster
 }
 

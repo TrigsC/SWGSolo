@@ -68,6 +68,10 @@
 #include "templates/params/creature/ObjectFlag.h"
 #include "templates/params/creature/CreaturePosture.h"
 #include "templates/params/creature/CreatureState.h"
+#include "server/zone/objects/creature/buffs/Buff.h"
+#include "server/zone/objects/creature/BuffAttribute.h"
+#include "server/zone/objects/creature/buffs/BuffType.h"
+#include "server/zone/objects/creature/buffs/BuffCRC.h"
 #include "server/zone/objects/creature/damageovertime/DamageOverTimeList.h"
 #include "server/zone/objects/creature/ai/events/AiBehaviorEvent.h"
 #include "server/zone/objects/creature/ai/events/AiRecoveryEvent.h"
@@ -87,18 +91,146 @@
 #include "server/zone/objects/transaction/TransactionLog.h"
 #include "server/chat/ChatManager.h"
 #include "server/zone/objects/intangible/tasks/PetControlDeviceStoreTask.h"
+#include "server/zone/objects/creature/ai/events/AiForceRegenerationEvent.h"
+#include "server/zone/managers/objectcontroller/command/CommandConfigManager.h"
+#include "server/zone/objects/creature/commands/ForcePowersQueueCommand.h"
+#include "server/zone/objects/creature/commands/JediQueueCommand.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
+#include "server/zone/managers/radial/RadialOptions.h"
 
 // #define DEBUG
-// #define DEBUG_AI_WEAPONS
-// #define DEBUG_AI_HEAL
+//#define DEBUG_AI_WEAPONS
+//#define DEBUG_AI_HEAL
+//#define DEBUG_AI_ATTACK
 
 // #define DEBUG_PATHING
 // #define SHOW_PATH
 // #define SHOW_NEXT_POSITION
 // #define DEBUG_FINDNEXTPOSITION
+// #define DEBUG_MOVE
+
+#ifdef DEBUG_AI_ATTACK
+static void debugLogSelectedAttack(AiAgentImplementation* agent,
+        const String& context,
+        const CreatureAttackMap* attackMap,
+        int attackNum) {
+
+    if (agent == nullptr)
+        return;
+
+    if (attackMap == nullptr) {
+        agent->info(true) << "AI_ATTACK: " << context << " - attackMap == nullptr for "
+                          << agent->getDisplayedName() << " (" << agent->getObjectID() << ")";
+        return;
+    }
+
+    if (attackNum < 0 || attackNum >= attackMap->size()) {
+        agent->info(true) << "AI_ATTACK: " << context << " - invalid attackNum=" << attackNum
+                          << " size=" << attackMap->size() << " for "
+                          << agent->getDisplayedName() << " (" << agent->getObjectID() << ")";
+        return;
+    }
+
+    String cmdKey = attackMap->getCommand(attackNum);
+
+    agent->info(true) << "AI_ATTACK: " << context << " chose index=" << attackNum
+                      << " key=" << cmdKey << " for "
+                      << agent->getDisplayedName() << " (" << agent->getObjectID() << ")";
+}
+#endif // DEBUG_AI_ATTACK
+
+#ifdef DEBUG_AI_WEAPONS
+// Simple debug helper to dump the contents of a CreatureAttackMap
+static void debugLogAttackMap(AiAgentImplementation* agent,
+		const String& label,
+		const CreatureAttackMap* map,
+		ObjectController* objectController) {
+
+	if (agent == nullptr) return;
+
+	if (map == nullptr) {
+		agent->info(true) << "AI_WEAPONS: " << label << " is nullptr for "
+		                  << agent->getDisplayedName() << " (" << agent->getObjectID() << ")";
+		return;
+	}
+
+	agent->info(true) << "AI_WEAPONS: " << label << " for "
+	                  << agent->getDisplayedName() << " ("
+	                  << agent->getObjectID() << ") size=" << map->size();
+
+	if (objectController == nullptr || map->isEmpty())
+		return;
+
+	for (int i = 0; i < map->size(); ++i) {
+		// In your code, getCommand(i) is already what getQueueCommand expects,
+		// and it's a String, not a uint32.
+		String cmdKey = map->getCommand(i);
+
+		const CombatQueueCommand* cmd =
+			cast<const CombatQueueCommand*>(objectController->getQueueCommand(cmdKey));
+
+		if (cmd == nullptr) {
+			agent->info(true) << "  [" << i << "] key=" << cmdKey
+			                  << " (NO COMMAND FOUND)";
+			continue;
+		}
+
+		// We don't rely on CombatQueueCommand having getCommandName().
+		// Just log the key from the map, since that's the configured command name.
+		agent->info(true) << "  [" << i << "] key=" << cmdKey;
+	}
+}
+#endif // DEBUG_AI_WEAPONS
+
+namespace EnhanceWipeFlags {
+    static const uint32 MEDICAL = 1 << 0;
+    static const uint32 DANCE   = 1 << 1; // mind performance buff
+    static const uint32 MUSIC   = 1 << 2; // focus+will performance buffs
+}
+
+namespace {
+
+bool originatesFromDestroyMissionLair(AiAgent* agent) {
+        if (agent == nullptr)
+                return false;
+
+        ManagedReference<SceneObject*> home = agent->getHomeObject().get();
+
+        if (home == nullptr)
+                return false;
+
+        auto hasDestroyMissionObserver = [&](int eventType) -> bool {
+                SortedVector<ManagedReference<Observer*> > observers = home->getObservers(eventType);
+
+                for (int i = 0; i < observers.size(); ++i) {
+                        ManagedReference<SpawnObserver*> spawnObserver = observers.get(i).castTo<SpawnObserver*>();
+
+                        if (spawnObserver != nullptr && spawnObserver->isDestroyMissionLairObserver())
+                                return true;
+                }
+
+                return false;
+        };
+
+        if (hasDestroyMissionObserver(ObserverEventType::CREATUREDESPAWNED))
+                return true;
+
+        if (hasDestroyMissionObserver(ObserverEventType::OBJECTDESTRUCTION))
+                return true;
+
+        return false;
+}
+
+}
 
 void AiAgentImplementation::initializeTransientMembers() {
 	CreatureObjectImplementation::initializeTransientMembers();
+
+	// -------------------------------------------------------
+    // NEW: Initialize Force/Mana for the AI
+    // -------------------------------------------------------
+    currentForcePoints = 6850; 
+    maxForcePoints = 6850;
 
 	auto aiLogLevel = ConfigManager::instance()->getInt("Core3.AiAgent.LogLevel", LogLevel::WARNING);
 
@@ -125,6 +257,7 @@ void AiAgentImplementation::initializeTransientMembers() {
 
 	setAITemplate();
 	setupAttackMaps();
+	activateForcePowerRegen();
 }
 
 void AiAgentImplementation::notifyLoadFromDatabase() {
@@ -418,6 +551,153 @@ void AiAgentImplementation::reloadTemplate() {
 	if (isMount()) {
 		setOptionBit(OptionBitmask::VEHICLE);
 	}
+}
+
+int AiAgentImplementation::getSkillMod(const String& skillMod) const {
+
+	// --- FORCE DEBUG: PROVE EXECUTION ---
+    //if (skillMod.contains("speed")) {
+    //    StringBuffer msg;
+    //    msg << "DEBUG: AiAgent::getSkillMod IS RUNNING for " << skillMod;
+    //    Logger::console.info(msg.toString(), true);
+    //}
+
+    // 1. Check standard game buffs first (Spices, Buffs, etc.)
+    int baseMod = CreatureObjectImplementation::getSkillMod(skillMod);
+	//StringBuffer msg;
+    //msg << "DEBUG AI LINK: " << getFirstName() << " skillmod = " << skillMod << " basemod = " << baseMod;
+    //Logger::console.info(msg.toString(), true);
+
+    if (baseMod != 0)
+		//Logger::console.info("baseMod != 0", true);
+        return baseMod;
+
+    // 2. Check the Lua Template (The "Character Sheet")
+    if (npcTemplate != nullptr) {
+
+        int templateMod = npcTemplate->getStatistic(skillMod);
+		//StringBuffer msg;
+    	//msg << "DEBUG AI LINK: " << getFirstName() << " found template = " << templateMod;
+    	//Logger::console.info(msg.toString(), true);
+
+        // --- DEBUG: Verify the link works ---
+        // If you see this log, the connection is fixed.
+        //if (templateMod > 0 && skillMod.contains("speed")) {
+        //    StringBuffer msg;
+        //    msg << "DEBUG AI LINK: " << getFirstName() << " found template stat " << skillMod << " = " << templateMod;
+        //    Logger::console.info(msg.toString(), true);
+        //}
+
+        if (templateMod > 0) {
+			//StringBuffer msg;
+    		//msg << "DEBUG AI LINK: " << getFirstName() << " templatemod > 0 " << templateMod;
+    		//Logger::console.info(msg.toString(), true);
+            return templateMod;
+        }
+    }
+
+    // ==========================================================
+    // 3. THE SAFETY NET (Fallback Logic)
+    // ==========================================================
+    // This part is CRITICAL. If the template link fails (Result: 0),
+    // this code forces the NPC to have speed based on Level.
+    // IT PREVENTS "0" FROM EVER BEING RETURNED FOR SPEED.
+
+    if (skillMod.contains("_speed")) {
+        int speed = getLevel() + 25;
+        if (speed > 100) speed = 100;
+        
+        // --- DEBUG: Verify Fallback ---
+        //StringBuffer msg;
+        //msg << "DEBUG AI FALLBACK: " << getFirstName() << " (Level " << getLevel() << ") generating speed " << speed;
+        //Logger::console.info(msg.toString(), true);
+
+        return speed;
+    }
+
+    // Accuracy Fallback
+    if (skillMod.contains("accuracy")) {
+        return 100 + (getLevel() * 2); 
+    }
+    
+    // Defense Fallback
+    if ((skillMod == "dodge_attack" || skillMod == "block") && getLevel() > 80) {
+        return 20;
+    }
+
+    // Jedi Block Fallback
+    if (skillMod == "saber_block") {
+         ManagedReference<WeaponObject*> weapon = const_cast<AiAgentImplementation*>(this)->getWeapon();
+         if (weapon != nullptr && weapon->isJediWeapon()) {
+             return getLevel();
+         }
+    }
+	//StringBuffer msg;
+	//msg << "DEBUG AI LINK: " << getFirstName() << " Return 0 ";
+	//Logger::console.info(msg.toString(), true);
+    return 0;
+}
+
+void AiAgentImplementation::activateForcePowerRegen() {
+    // 1. Basic check: Do we even use Force?
+    if (getMaxForce() <= 0) return;
+    
+    // 2. If the event doesn't exist, create it.
+    if (forceRegenerationEvent == nullptr) {
+        forceRegenerationEvent = new AiForceRegenerationEvent(asAiAgent());
+    }
+
+    // 3. If it's not currently running, schedule it.
+    if (!forceRegenerationEvent->isScheduled()) {
+        // Schedule it to run in 2 seconds (2000ms)
+        forceRegenerationEvent->schedule(2000); 
+    }
+}
+
+void AiAgentImplementation::doForceRegen() {
+    if (isDead() || currentForcePoints >= maxForcePoints) {
+        // If full or dead, stop the loop.
+        // But we might want to check again later if we spend force?
+        // For now, let's keep it running but do nothing if full.
+        if (!isDead()) {
+             forceRegenerationEvent->schedule(10000); // Check again in 10s if full
+        }
+        return;
+    }
+
+    // 1. Default very low (Wait for it to build up)
+    int regenAmount = 10; // 10 Force every 2 seconds.
+                          // This makes spending the force expensive!
+
+    // 2. Check for "jedi_force_power_regen" skill mod (if you add it to their LUA)
+    // This allows you to make "Boss" Jedi regen faster than "Minion" Jedi.
+    int skillRegen = (int)getSkillMod("jedi_force_power_regen");
+    
+    if (skillRegen > 0) {
+        // If they have the skill, let's use that per tick
+        regenAmount = skillRegen;
+    }
+    
+    // Multipliers (optional, if you want to give them "force_control")
+    // int controlMod = getSkillMod("force_control_light");
+    // regenAmount += (controlMod / 10);
+
+    int newForce = currentForcePoints + regenAmount;
+    
+    if (newForce > maxForcePoints) {
+        newForce = maxForcePoints;
+    }
+
+    setCurrentForce(newForce);
+
+    // --- LOGGING (Remove this later if it spams too much) ---
+    //StringBuffer msg;
+    //msg << "AI Force Regen: +" << regenAmount << " (" << newForce << "/" << maxForcePoints << ")";
+    //info(msg.toString(), true);
+
+    // --- RESCHEDULE ---
+    // Run again in 2 seconds
+    forceRegenerationEvent->schedule(2000);
 }
 
 void AiAgentImplementation::fillAttributeList(AttributeListMessage* alm, CreatureObject* player) {
@@ -842,6 +1122,7 @@ void AiAgentImplementation::setupCombatStats() {
 	}
 
 	weaponSpeed = calculateAttackSpeed(level);
+	//info(true) << "calculateAttackSpeed - WeaponSpeed = " << weaponSpeed;
 
 	float globalSpeedOverride = CreatureTemplateManager::instance()->getGlobalAttackSpeedOverride();
 	float customSpeed = npcTemplate->getAttackSpeed();
@@ -850,6 +1131,9 @@ void AiAgentImplementation::setupCombatStats() {
 		weaponSpeed = globalSpeedOverride;
 	else if (customSpeed > 0.0f)
 		weaponSpeed = customSpeed;
+#ifdef DEBUG_AI_WEAPONS
+	info(true) << "setupCombatStats - WeaponSpeed = " << weaponSpeed;
+#endif
 }
 
 void AiAgentImplementation::createDefaultWeapon() {
@@ -1016,87 +1300,159 @@ void AiAgentImplementation::setWeaponStats() {
 }
 
 void AiAgentImplementation::setupAttackMaps() {
-	if (npcTemplate == nullptr)
-		return;
+    if (npcTemplate == nullptr)
+        return;
 
 #ifdef DEBUG_AI_WEAPONS
-	//info(true) << "setupAttackMaps - " << getDisplayedName() << " " << getObjectID();
+    info(true) << "AI_WEAPONS: setupAttackMaps for "
+               << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
 
-	primaryAttackMap = nullptr;
-	secondaryAttackMap = nullptr;
-	defaultAttackMap = nullptr;
+    primaryAttackMap = nullptr;
+    secondaryAttackMap = nullptr;
+    defaultAttackMap = nullptr;
 
-	ZoneServer* zoneServer = getZoneServer();
+    ZoneServer* zoneServer = getZoneServer();
 
-	if (zoneServer == nullptr)
-		return;
+    if (zoneServer == nullptr)
+        return;
 
-	ObjectController* objectController = zoneServer->getObjectController();
+    ObjectController* objectController = zoneServer->getObjectController();
 
-	if (objectController == nullptr)
-		return;
+    if (objectController == nullptr)
+        return;
 
-	const CreatureAttackMap* attackMap;
+    const CreatureAttackMap* attackMap;
 
-	if (petDeed != nullptr)
-		attackMap = petDeed->getAttacks();
-	else
-		attackMap = npcTemplate->getPrimaryAttacks();
+    // ----- PRIMARY ATTACKS -----
+    if (petDeed != nullptr)
+        attackMap = petDeed->getAttacks();
+    else
+        attackMap = npcTemplate->getPrimaryAttacks();
 
-	Reference<WeaponObject*> defaultWeap = getDefaultWeapon();
-	Reference<WeaponObject*> primaryWeap = getPrimaryWeapon();
-	Reference<WeaponObject*> secondaryWeap = getSecondaryWeapon();
+#ifdef DEBUG_AI_WEAPONS
+    debugLogAttackMap(this, "Template primaryAttacks (raw)", attackMap, objectController);
+#endif
 
-	defaultAttackMap = new CreatureAttackMap();
-	primaryAttackMap = new CreatureAttackMap();
-	secondaryAttackMap = new CreatureAttackMap();
+    Reference<WeaponObject*> defaultWeap = getDefaultWeapon();
+    Reference<WeaponObject*> primaryWeap = getPrimaryWeapon();
+    Reference<WeaponObject*> secondaryWeap = getSecondaryWeapon();
 
-	for (int i = 0; i < attackMap->size(); i++) {
-		const CombatQueueCommand* attack = cast<const CombatQueueCommand*>(objectController->getQueueCommand(attackMap->getCommand(i)));
+    defaultAttackMap = new CreatureAttackMap();
+    primaryAttackMap = new CreatureAttackMap();
+    secondaryAttackMap = new CreatureAttackMap();
 
-		if (attack == nullptr)
-			continue;
+    for (int i = 0; i < attackMap->size(); i++) {
+        String cmdKey = attackMap->getCommand(i);
 
-		if (primaryWeap != nullptr && (attack->getWeaponType() & primaryWeap->getWeaponBitmask())) {
-			primaryAttackMap->add(attackMap->get(i));
-		}
+        const CombatQueueCommand* attack =
+            cast<const CombatQueueCommand*>(objectController->getQueueCommand(cmdKey));
 
-		if (defaultWeap != nullptr && (attack->getWeaponType() & defaultWeap->getWeaponBitmask())) {
-			defaultAttackMap->add(attackMap->get(i));
-		}
-	}
+        if (attack == nullptr)
+            continue;
 
-	if (petDeed == nullptr) {
-		attackMap = npcTemplate->getSecondaryAttacks();
+#ifdef DEBUG_AI_WEAPONS
+        info(true) << "AI_WEAPONS: checking primary raw cmd ["
+                   << i << "] key=" << cmdKey;
+#endif
 
-		for (int i = 0; i < attackMap->size(); i++) {
-			const CombatQueueCommand* attack = cast<const CombatQueueCommand*>(objectController->getQueueCommand(attackMap->getCommand(i)));
+        if (primaryWeap != nullptr && (attack->getWeaponType() & primaryWeap->getWeaponBitmask())) {
+            primaryAttackMap->add(attackMap->get(i));
+#ifdef DEBUG_AI_WEAPONS
+            info(true) << "  -> added to primaryAttackMap";
+#endif
+        }
 
-			if (attack == nullptr)
-				continue;
+        if (defaultWeap != nullptr && (attack->getWeaponType() & defaultWeap->getWeaponBitmask())) {
+            // FIX: Check for duplicates before adding to defaultAttackMap
+            bool alreadyExists = false;
+            for (int k = 0; k < defaultAttackMap->size(); ++k) {
+                if (defaultAttackMap->getCommand(k) == cmdKey) {
+                    alreadyExists = true;
+                    break;
+                }
+            }
 
-			if (secondaryWeap != nullptr && (attack->getWeaponType() & secondaryWeap->getWeaponBitmask())) {
-				secondaryAttackMap->add(attackMap->get(i));
-			}
+            if (!alreadyExists) {
+                defaultAttackMap->add(attackMap->get(i));
+#ifdef DEBUG_AI_WEAPONS
+                info(true) << "  -> added to defaultAttackMap";
+#endif
+            }
+        }
+    }
 
-			if (defaultWeap != nullptr && (attack->getWeaponType() & defaultWeap->getWeaponBitmask())) {
-				defaultAttackMap->add(attackMap->get(i));
-			}
-		}
-	}
+    // ----- SECONDARY ATTACKS -----
+    if (petDeed == nullptr) {
+        attackMap = npcTemplate->getSecondaryAttacks();
 
-	// if we didn't get any attacks or the weapon is nullptr, drop the reference to the attack maps
-	if (defaultAttackMap != nullptr && defaultAttackMap->isEmpty())
-		defaultAttackMap = nullptr;
+#ifdef DEBUG_AI_WEAPONS
+        debugLogAttackMap(this, "Template secondaryAttacks (raw)", attackMap, objectController);
+#endif
 
-	if (primaryAttackMap != nullptr && primaryAttackMap->isEmpty())
-		primaryAttackMap = nullptr;
+        for (int i = 0; i < attackMap->size(); i++) {
+            String cmdKey = attackMap->getCommand(i);
 
-	if (secondaryAttackMap != nullptr && secondaryAttackMap->isEmpty())
-		secondaryAttackMap = nullptr;
+            const CombatQueueCommand* attack =
+                cast<const CombatQueueCommand*>(objectController->getQueueCommand(cmdKey));
 
-	attackMap = nullptr;
+            if (attack == nullptr)
+                continue;
+
+#ifdef DEBUG_AI_WEAPONS
+            info(true) << "AI_WEAPONS: checking secondary raw cmd ["
+                       << i << "] key=" << cmdKey;
+#endif
+
+            if (secondaryWeap != nullptr && (attack->getWeaponType() & secondaryWeap->getWeaponBitmask())) {
+                secondaryAttackMap->add(attackMap->get(i));
+#ifdef DEBUG_AI_WEAPONS
+                info(true) << "  -> added to secondaryAttackMap";
+#endif
+            }
+
+            if (defaultWeap != nullptr && (attack->getWeaponType() & defaultWeap->getWeaponBitmask())) {
+                // FIX: Check for duplicates before adding to defaultAttackMap
+                // This is the critical one, as Force powers from Primary are likely already here
+                bool alreadyExists = false;
+                for (int k = 0; k < defaultAttackMap->size(); ++k) {
+                    if (defaultAttackMap->getCommand(k) == cmdKey) {
+                        alreadyExists = true;
+                        break;
+                    }
+                }
+
+                if (!alreadyExists) {
+                    defaultAttackMap->add(attackMap->get(i));
+#ifdef DEBUG_AI_WEAPONS
+                    info(true) << "  -> added to defaultAttackMap (from secondary)";
+#endif
+                } else {
+#ifdef DEBUG_AI_WEAPONS
+                    info(true) << "  -> SKIPPED duplicate in defaultAttackMap";
+#endif
+                }
+            }
+        }
+    }
+
+    // if we didn't get any attacks or the weapon is nullptr, drop the reference to the attack maps
+    if (defaultAttackMap != nullptr && defaultAttackMap->isEmpty())
+        defaultAttackMap = nullptr;
+
+    if (primaryAttackMap != nullptr && primaryAttackMap->isEmpty())
+        primaryAttackMap = nullptr;
+
+    if (secondaryAttackMap != nullptr && secondaryAttackMap->isEmpty())
+        secondaryAttackMap = nullptr;
+
+#ifdef DEBUG_AI_WEAPONS
+    debugLogAttackMap(this, "primaryAttackMap (filtered)", primaryAttackMap, objectController);
+    debugLogAttackMap(this, "secondaryAttackMap (filtered)", secondaryAttackMap, objectController);
+    debugLogAttackMap(this, "defaultAttackMap (filtered)", defaultAttackMap, objectController);
+#endif
+
+    attackMap = nullptr;
 }
 
 void AiAgentImplementation::equipPrimaryWeapon() {
@@ -1364,9 +1720,6 @@ void AiAgentImplementation::setLevel(int lvl, bool randomHam) {
 
 void AiAgentImplementation::notifyPositionUpdate(TreeEntry* entry) {
 	CreatureObjectImplementation::notifyPositionUpdate(entry);
-
-	//SceneObject* object = static_cast<SceneObject*>(entry);
-	//CreatureObject* creo = object->asCreatureObject();
 }
 
 void AiAgentImplementation::doRecovery(int latency) {
@@ -1398,111 +1751,760 @@ void AiAgentImplementation::doRecovery(int latency) {
 	Attack Handling
 */
 
+String AiAgentImplementation::getWeaponCategory(WeaponObject* weapon) const {
+    if (weapon == nullptr)
+        return "unarmed";
+
+    String wt = weapon->getWeaponType().toLowerCase();
+
+    // Ranged buckets
+    if (wt.contains("pistol") || wt.contains("rifle") || wt.contains("carbine") || wt.contains("heavyweapon"))
+        return "ranged";
+
+    // Melee buckets
+    if (wt.contains("onehandmelee") || wt.contains("twohandmelee") || wt.contains("unarmed"))
+        return "melee";
+
+    // FIX: Move Lightsaber check ABOVE Polearm check
+    // "saberpolearm" contains both strings, so order matters!
+    if (wt.contains("lightsaber"))
+        return "saber";
+
+    // Polearm melee (pike, staff, etc.)
+    if (wt.contains("polearm"))
+        return "polearm";
+
+    // Thrown weapon can be treated as ranged
+    if (wt.contains("thrownweapon"))
+        return "ranged";
+
+    // Fallback
+    return "melee";
+}
+
+String AiAgentImplementation::getCommandCategory(String& lower) const {
+    // Force powers are allowed with basically anything
+    if (lower.contains("force") ||
+        lower.contains("forcelightning") ||
+        lower.contains("mindblast"))
+        return "force";
+
+    // Explicit ranged lines: pistol/carbine/rifle/xxxshot
+    if (lower.beginsWith("pistol") ||
+        lower.beginsWith("carbine") ||
+        lower.beginsWith("rifle"))
+        return "ranged";
+
+    // Generic ranged "shot" commands (strafeshot, scattershot, fanshot, etc.)
+    if (lower.contains("shot") || 
+		lower.contains("burst") || 
+		lower.contains("spray") ||
+		lower.contains("pointblank") ||
+		lower.contains("suppression"))
+        return "ranged";
+
+    // Saber commands
+    if (lower.beginsWith("saber1h") ||
+        lower.beginsWith("saber2h") ||
+        lower.beginsWith("saberpolearm") ||
+        lower.contains("saberslash"))
+        return "saber";
+
+    // Polearm commands
+    if (lower.beginsWith("polearm"))
+        return "polearm";
+
+    // Generic melee commands
+    if (lower.beginsWith("melee1h") ||
+        lower.beginsWith("melee2h") ||
+        lower.beginsWith("unarmed") ||
+        lower.contains("lunge") ||
+        lower.contains("slash") ||
+        lower.contains("spinattack") ||
+		lower.contains("hit"))
+        return "melee";
+
+    // Default to "any" if we can't classify – better to allow than over-restrict
+    return "any";
+}
+
+// 3. isFitsWeaponType
+// FIX: Added 'const' to the end of the function.
+bool AiAgentImplementation::isFitsWeaponType(String& cmd, WeaponObject* weapon) const {
+    String lower = cmd.toLowerCase();
+    
+    // Because all 3 functions are now 'const', they can call each other safely.
+    String weapCat   = getWeaponCategory(weapon);
+    String cmdCat    = getCommandCategory(lower);
+
+    // If command is "any", don't restrict it
+    if (cmdCat == "any")
+        return true;
+
+    // Sabers: saber weapon preferred, but also allow generic melee if you want
+    if (cmdCat == "saber") {
+        return (weapCat == "saber");
+    }
+
+    // Polearm commands should not be used with 1H sword or pistol
+    if (cmdCat == "polearm") {
+        return (weapCat == "polearm" || weapCat == "saber"); 
+    }
+
+    // Melee commands – disallow if weapon is clearly ranged
+    if (cmdCat == "melee") {
+        return (weapCat == "melee" || weapCat == "saber" || weapCat == "polearm");
+    }
+
+    // Ranged commands – disallow if weapon is clearly melee-only
+    if (cmdCat == "ranged") {
+        return (weapCat == "ranged");
+    }
+
+	// Force powers can be used with anything (for now)
+    if (cmdCat == "force")
+        return true;
+
+    // Fallback: if we don't understand, allow it
+    return true;
+}
+
 bool AiAgentImplementation::selectSpecialAttack() {
-	// Handle Thrown Weapons
-	if (System::random(100) > 95) {
-		ManagedReference<WeaponObject*> thrownWeapRef = thrownWeapon.get();
+    // --- Thrown weapons handling (unchanged) ---
+    if (System::random(100) > 95) {
+        ManagedReference<WeaponObject*> thrownWeapRef = thrownWeapon.get();
 
-		if (thrownWeapRef != nullptr) {
-			Reference<SceneObject*> followCopy = getFollowObject().get();
+        if (thrownWeapRef != nullptr) {
+            Reference<SceneObject*> followCopy = getFollowObject().get();
 
-			if (followCopy != nullptr) {
-				auto targetID = followCopy->getObjectID();
-				Reference<AiAgent*> strongAgent = asAiAgent();
+            if (followCopy != nullptr) {
+                auto targetID = followCopy->getObjectID();
+                Reference<AiAgent*> strongAgent = asAiAgent();
 
-				Core::getTaskManager()->executeTask([strongAgent, targetID, thrownWeapRef] () {
-					if (strongAgent == nullptr || thrownWeapRef == nullptr)
-						return;
+                Core::getTaskManager()->executeTask([strongAgent, targetID, thrownWeapRef] () {
+                    if (strongAgent == nullptr || thrownWeapRef == nullptr)
+                        return;
 
-					Locker lock(strongAgent);
+                    Locker lock(strongAgent);
 
-					strongAgent->enqueueCommand(STRING_HASHCODE("throwgrenade"), 0, targetID, String::valueOf(thrownWeapRef->getObjectID()), QueueCommand::NORMAL);
+                    strongAgent->enqueueCommand(
+                        STRING_HASHCODE("throwgrenade"), 0, targetID,
+                        String::valueOf(thrownWeapRef->getObjectID()), QueueCommand::NORMAL
+                    );
 
-					if (thrownWeapRef->getUseCount() <= 0) {
-						Locker locker(thrownWeapRef, strongAgent);
+                    if (thrownWeapRef->getUseCount() <= 0) {
+                        Locker locker(thrownWeapRef, strongAgent);
 
-						thrownWeapRef->destroyObjectFromWorld(true);
-						strongAgent->clearThrownWeapon();
-					}
-				}, "AiAgentThrowGrenadeLambda");
-			}
-		}
-	}
+                        thrownWeapRef->destroyObjectFromWorld(true);
+                        strongAgent->clearThrownWeapon();
+                    }
+                }, "AiAgentThrowGrenadeLambda");
+            }
+        }
+    }
 
-	const CreatureAttackMap* attackMap = getAttackMap();
+    WeaponObject* weapon = getWeapon();
+    String weapCat = getWeaponCategory(weapon);
+    const CreatureAttackMap* attackMap = nullptr;
 
-	if (attackMap == nullptr) {
-		selectDefaultAttack();
-		return true;
-	}
+    // Logic: Pick the map that matches the weapon
+    if (weapCat == "ranged") {
+        attackMap = primaryAttackMap.get();
+    } else if (weapCat == "melee" || weapCat == "saber" || weapCat == "polearm") {
+        attackMap = secondaryAttackMap.get();
+    } else {
+        // Unarmed or unknown
+        attackMap = defaultAttackMap.get();
+    }
 
-	return selectSpecialAttack(attackMap->getRandomAttackNumber());
+    // Fallback: If the selected map is empty, try the Primary one as a hail mary
+    if (attackMap == nullptr || attackMap->size() == 0) {
+        attackMap = getAttackMap(); 
+    }
+
+    if (attackMap == nullptr || attackMap->isEmpty()) {
+#ifdef DEBUG_AI_ATTACK
+        info(true) << "AI_ATTACK: selectSpecialAttack() - attackMap null/empty, "
+                   << "falling back to selectDefaultAttack() for "
+                   << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
+        // Always have *something* ready
+        return selectDefaultAttack();
+    }
+
+    // --- Situational context snapshot ---
+    ManagedReference<SceneObject*> followCopy = getFollowObject().get();
+    CreatureObject* targetCreo = nullptr;
+
+    if (followCopy != nullptr && followCopy->isCreatureObject())
+        targetCreo = followCopy->asCreatureObject();
+
+    bool hasTarget = (followCopy != nullptr && targetCreo != nullptr && !targetCreo->isDead());
+
+    // Simple range bands
+    bool meleeRange = false;
+    bool midRange   = false;
+    bool longRange  = false;
+
+    if (followCopy != nullptr) {
+        meleeRange = isInRange(followCopy, 7.5f);
+        midRange   = isInRange(followCopy, 25.0f);
+        longRange  = isInRange(followCopy, 40.0f);
+    }
+
+    // Target HAM awareness
+    int targetHealthPct = 100;
+    int targetActionPct = 100;
+    int targetMindPct   = 100;
+
+    if (targetCreo != nullptr) {
+        int curHP  = targetCreo->getHAM(CreatureAttribute::HEALTH);
+        int maxHP  = targetCreo->getMaxHAM(CreatureAttribute::HEALTH);
+        int curAct = targetCreo->getHAM(CreatureAttribute::ACTION);
+        int maxAct = targetCreo->getMaxHAM(CreatureAttribute::ACTION);
+        int curMind = targetCreo->getHAM(CreatureAttribute::MIND);
+        int maxMind = targetCreo->getMaxHAM(CreatureAttribute::MIND);
+
+        if (maxHP > 0)
+            targetHealthPct = (curHP * 100) / maxHP;
+        if (maxAct > 0)
+            targetActionPct = (curAct * 100) / maxAct;
+        if (maxMind > 0)
+            targetMindPct = (curMind * 100) / maxMind;
+    }
+
+    // My own ACTION only lightly used (no heavy “cost” logic for now)
+    int myActionPct = 100;
+    {
+        int myAct    = getHAM(CreatureAttribute::ACTION);
+        int myActMax = getMaxHAM(CreatureAttribute::ACTION);
+
+        if (myActMax > 0)
+            myActionPct = (myAct * 100) / myActMax;
+    }
+
+    // Target control-state awareness
+    bool targetIntimidated = false;
+    bool targetBlinded     = false;
+    bool targetDizzy       = false;
+    bool targetStunned     = false;
+    bool targetKD          = false;
+
+    if (targetCreo != nullptr) {
+        targetIntimidated = targetCreo->hasState(CreatureState::INTIMIDATED);
+        targetBlinded     = targetCreo->hasState(CreatureState::BLINDED);
+        targetDizzy       = targetCreo->hasState(CreatureState::DIZZY);
+        targetStunned     = targetCreo->hasState(CreatureState::STUNNED);
+        targetKD          = (targetCreo->getPosture() == CreaturePosture::KNOCKEDDOWN);
+    }
+
+    // --- Score each available special and pick the best like a "human" would ---
+
+    int bestIdx   = -1;
+    int bestScore = -9999;
+    
+    // Prepare for Force Checks
+    ZoneServer* zoneServer = getZoneServer();
+
+    for (int i = 0; i < attackMap->size(); ++i) {
+        String key = attackMap->getCommand(i);
+        if (key.isEmpty())
+            continue;
+
+        // =================================================================
+        // [AI FORCE CHECK] - Can I afford this?
+        // =================================================================
+        if (zoneServer != nullptr) {
+            ObjectController* objectController = zoneServer->getObjectController();
+            
+            if (objectController != nullptr) {
+                // Look up the command using ObjectController
+                const QueueCommand* qCmd = objectController->getQueueCommand(key.hashCode());
+                
+                if (qCmd != nullptr) {
+                    int predictedCost = 0;
+
+                    // 1. Check if it's a Force Power (Lightning, etc.)
+                    const ForcePowersQueueCommand* fpCmd = dynamic_cast<const ForcePowersQueueCommand*>(qCmd);
+                    if (fpCmd != nullptr) {
+                        predictedCost = fpCmd->getForceCost();
+                    }
+                    else {
+                        // 2. Check if it's a Buff/Spell
+                        const JediQueueCommand* jCmd = dynamic_cast<const JediQueueCommand*>(qCmd);
+                        if (jCmd != nullptr) {
+                             predictedCost = jCmd->getForceCost();
+                        }
+                    }
+
+                    // 3. Fallback for Sabers/Powers with 0 cost in template
+                    if (predictedCost <= 0 && (key.contains("force") || key.contains("saber"))) {
+                        predictedCost = 50; 
+                    }
+
+                    // 4. THE WALLET CHECK
+                    // If I have less Force than this costs, I cannot use it.
+                    if (predictedCost > 0 && getCurrentForce() < predictedCost) {
+                        continue; // Skip to next ability in the loop
+                    }
+                }
+            }
+        }
+        // =================================================================
+
+        String lower = key.toLowerCase();
+        int score    = 0;
+
+        // 1) Big “identity” / signature moves
+        if (lower.contains("saberpolearmdervish2") ||
+            lower.contains("saber2hfrenzy") ||
+            lower.contains("saber1hflurry2") ||
+            lower.contains("saber2hsweep3") ||
+            lower.contains("saber2hbodyhit3") ||
+            lower.contains("saber1hhit3")) {
+            score += 20;
+            if (meleeRange) score += 6;
+        }
+
+        if (lower.contains("melee1hhit3") ||
+            lower.contains("melee2hhit3") ||
+            lower.contains("unarmedhit3") ||
+            lower.contains("polearmhit3")) {
+            score += 20;
+            if (meleeRange) score += 6;
+        }
+
+        // Ranged identity moves
+        if (lower.contains("scattershot2") ||
+            lower.contains("fanshot") ||
+            lower.contains("strafeshot2") ||
+            lower.contains("fullautosingle2") ||
+            lower.contains("flurryshot2")) {
+            score += 20;
+            if (!meleeRange && midRange) score += 6;
+        }
+
+        // 2) Control / setup abilities
+        bool isIntimidate = lower.contains("intimidate");
+
+        bool isKD         = lower.contains("knockdown") ||
+                            lower.contains("sweep") ||
+                            lower.contains("lowblow") ||
+                            lower.contains("meleedefense") ||
+                            lower.contains("charge") ||
+                            lower.contains("throw") ||
+                            lower.contains("lunge");
+
+        bool isBlind      = lower.contains("blind") ||
+                            lower.contains("eye") ||
+                            lower.contains("flurry") ||
+                            lower.contains("phantom") ||
+                            lower.contains("dervish") ||
+                            lower.contains("fullauto");
+
+        bool isDizzy      = lower.contains("dizzy") ||
+                            lower.contains("flurry") ||
+                            lower.contains("spray") ||
+                            lower.contains("dervish") ||
+                            lower.contains("confusion");
+
+        bool isStun       = lower.contains("stun") ||
+                            lower.contains("confusion") ||
+                            lower.contains("lastditch") ||
+                            lower.contains("forcethrow") ||
+                            lower.contains("flurry") ||
+                            lower.contains("wildshot") ||
+                            lower.contains("flushing") ||
+                            lower.contains("fullauto");
+
+        if (isIntimidate) {
+            if (!targetIntimidated) {
+                score += 24;
+                if (targetHealthPct > 20) score += 6;  // good early pressure
+                if (!meleeRange)         score -= 6;  // needs to land
+            } else {
+                score -= 15;
+            }
+        }
+
+        if (isKD) {
+            if (targetCreo == nullptr) {
+                score -= 999;
+            }
+            else {
+                if (targetKD) {
+                    score -= 50;
+                }
+                else if (!targetCreo->checkKnockdownRecovery()){
+                     score -= 50;
+                }
+                else {
+                    score += 24;
+                    if (meleeRange) score += 6;
+                    if (targetHealthPct < 25) score -= 6;
+                }
+            }
+        }
+
+        bool isControlState = isBlind || isDizzy || isStun;
+
+        if (isBlind) {
+            if (!targetBlinded) {
+                score += 24;
+                if (meleeRange) score += 6;
+            } else {
+                score -= 10;
+            }
+        }
+
+        if (isDizzy) {
+            if (!targetDizzy) {
+                score += 24;
+                if (meleeRange) score += 6;
+            } else {
+                score -= 10;
+            }
+        }
+
+        if (isStun) {
+            if (!targetStunned) {
+                score += 24;
+                if (meleeRange) score += 6;
+            } else {
+                score -= 10;
+            }
+        }
+
+        if (!hasTarget && (isIntimidate || isKD || isControlState))
+            score -= 25;
+
+        // 3) HAM-pool–aware focus
+        bool hitsHealth = lower.contains("health") || lower.contains("body") || lower.contains("torso");
+        bool hitsAction = lower.contains("action") || lower.contains("leg") || lower.contains("crippling");
+        bool hitsMind   = lower.contains("mind") || lower.contains("head") || lower.contains("startleshot");
+
+        bool healthLow = (targetHealthPct < 50);
+        bool actionLow = (targetActionPct < 50);
+        bool mindLow   = (targetMindPct   < 50);
+
+        if (hasTarget) {
+            if (hitsHealth && healthLow) score += 12;
+            if (hitsAction && actionLow) score += 12;
+            if (hitsMind && mindLow)     score += 12;
+        }
+
+        // 4) Single-target vs AoE
+        bool isCone = lower.contains("cone");
+        bool isArea = lower.contains("area") || lower.contains("spray");
+
+        if (isCone || isArea) {
+            score += 4;
+            if (!meleeRange && !midRange) score -= 6;
+            if (targetHealthPct < 20)     score -= 6;
+        }
+
+        // 5) Exhaustion logic (Placeholder)
+        bool isHeavyBurst =
+            lower.contains("spinattack") ||
+            lower.contains("flurry") ||
+            lower.contains("frenzy") ||
+            lower.contains("fullauto") ||
+            isCone || isArea;
+
+        if (myActionPct < 20 && isHeavyBurst) {
+            score -= 5;
+        }
+
+        // 6) Generic hits
+        bool looksMeleeHit = lower.contains("hit");
+        bool looksRangedHit = lower.contains("shot") || lower.contains("burst");
+
+        if (score == 0) {
+            if (meleeRange && looksMeleeHit) score += 10;
+            else if (!meleeRange && looksRangedHit) score += 10;
+            else score += 2;
+        }
+
+        // 7) Random jitter
+        score += System::random(7) - 3; // [-3, +3]
+
+#ifdef DEBUG_AI_ATTACK
+        info(true) << "AI_ATTACK: selectSpecialAttack scoring idx=" << i
+                   << " key=" << key << " score=" << score
+                   << " hp=" << targetHealthPct
+                   << " act=" << targetActionPct
+                   << " mind=" << targetMindPct
+                   << " for " << getDisplayedName()
+                   << " (" << getObjectID() << ")";
+#endif
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestIdx   = i;
+        }
+    }
+
+    // Fallback
+    if (bestIdx == -1) {
+#ifdef DEBUG_AI_ATTACK
+        info(true) << "AI_ATTACK: selectSpecialAttack - no bestIdx, falling back to random for "
+                   << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
+        int randomIdx = attackMap->getRandomAttackNumber();
+        return selectSpecialAttack(randomIdx);
+    }
+
+#ifdef DEBUG_AI_ATTACK
+    info(true) << "AI_ATTACK: selectSpecialAttack(situational) chose idx=" << bestIdx
+               << " key=" << attackMap->getCommand(bestIdx)
+               << " score=" << bestScore << " for "
+               << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
+
+    return selectSpecialAttack(bestIdx);
 }
 
 bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
-	const CreatureAttackMap* attackMap = getAttackMap();
+    // =================================================================
+    // FIX: We cannot use generic getAttackMap() here.
+    // We must select the SAME map that the scoring function used,
+    // otherwise "Index 5" might point to a completely different ability.
+    // =================================================================
+    
+    WeaponObject* weapon = getWeapon();
+    String weapCat = getWeaponCategory(weapon);
+    const CreatureAttackMap* attackMap = nullptr;
 
-	if (attackMap == nullptr) {
-#ifdef DEBUG_AI
-		if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
-			info("attackMap == nullptr", true);
-#endif // DEBUG_AI
-		return false;
-	}
+    // 1. Select the correct map based on the weapon category
+    // (This matches the logic in your main selectSpecialAttack function)
+    if (weapCat == "saber") {
+        // Jedi Logic: Saber attacks are in Primary
+        if (primaryAttackMap != nullptr && primaryAttackMap->size() > 0) {
+            attackMap = primaryAttackMap.get();
+        } else {
+            attackMap = secondaryAttackMap.get();
+        }
+    }
+    else if (weapCat == "melee" || weapCat == "polearm") {
+        // Melee Mobs (Nightsisters/Tuskens): Special moves usually in Secondary
+        if (secondaryAttackMap != nullptr && secondaryAttackMap->size() > 0) {
+            attackMap = secondaryAttackMap.get();
+        } else {
+            attackMap = defaultAttackMap.get();
+        }
+    } 
+    else if (weapCat == "ranged") {
+        // Ranged Mobs: Primary
+        if (primaryAttackMap != nullptr && primaryAttackMap->size() > 0) {
+            attackMap = primaryAttackMap.get();
+        }
+    }
 
-	if (attackNum < 0) {
-		return selectSpecialAttack();
-	}
+    // Fallback
+    if (attackMap == nullptr || attackMap->size() == 0) {
+        attackMap = getAttackMap(); 
+    }
 
-	if (attackNum >= attackMap->size()) {
-#ifdef DEBUG_AI
-		if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
-			info("attackNum >= attackMap->size()", true);
-#endif // DEBUG_AI
-		return false;
-	}
+    if (attackMap == nullptr) {
+#ifdef DEBUG_AI_ATTACK
+        info(true) << "AI_ATTACK: selectSpecialAttack(" << attackNum
+                   << ") - attackMap == nullptr";
+#endif
+        return false;
+    }
+    // =================================================================
 
-	String cmd = attackMap->getCommand(attackNum);
+    if (attackNum < 0) {
+        return selectSpecialAttack();
+    }
 
-	if (cmd.isEmpty()) {
-#ifdef DEBUG_AI
-		if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
-			info("cmd.isEmpty()", true);
-#endif // DEBUG_AI
-		return false;
-	}
+    if (attackNum >= attackMap->size()) {
+#ifdef DEBUG_AI_ATTACK
+        info(true) << "AI_ATTACK: selectSpecialAttack(" << attackNum
+                   << ") - attackNum >= size (" << attackMap->size()
+                   << ")";
+#endif
+        return false;
+    }
 
-	nextActionCRC = cmd.hashCode();
-	nextActionArgs = attackMap->getArguments(attackNum);
+    String cmd = attackMap->getCommand(attackNum);
 
-	ZoneServer* zoneServer = getZoneServer();
+    if (cmd.isEmpty()) {
+        return false;
+    }
 
-	if (zoneServer == nullptr)
-		return false;
+#ifdef DEBUG_AI_ATTACK
+    // Updated log to show which command is actually being executed
+    info(true) << "AI_ATTACK: selectSpecialAttack(explicit) EXECUTING index=" 
+               << attackNum << " key=" << cmd;
+#endif
 
-	ObjectController* objectController = zoneServer->getObjectController();
+    nextActionCRC = cmd.hashCode();
+    nextActionArgs = attackMap->getArguments(attackNum);
 
-	if (objectController == nullptr)
-		return false;
+    ZoneServer* zoneServer = getZoneServer();
+    if (zoneServer == nullptr) return false;
+    ObjectController* objectController = zoneServer->getObjectController();
+    if (objectController == nullptr) return false;
+    const QueueCommand* queueCommand = objectController->getQueueCommand(nextActionCRC);
+    ManagedReference<SceneObject*> followCopy = getFollowObject().get();
 
-	const QueueCommand* queueCommand = objectController->getQueueCommand(nextActionCRC);
-	ManagedReference<SceneObject*> followCopy = getFollowObject().get();
+    if (queueCommand == nullptr || followCopy == nullptr)
+        return false;
 
-	if (queueCommand == nullptr || followCopy == nullptr)
-		return false;
-
-	return true;
+    return true;
 }
 
 bool AiAgentImplementation::selectDefaultAttack() {
-	if (npcTemplate == nullptr)
-		nextActionCRC = STRING_HASHCODE("defaultattack");
-	else
-		nextActionCRC = npcTemplate->getDefaultAttack().hashCode();
+    String cmd;
 
-	nextActionArgs = "";
+    // 1) Template default (may be "defaultattack" as engine fallback)
+    if (npcTemplate != nullptr) {
+        cmd = npcTemplate->getDefaultAttack();
+    }
 
-	return true;
+    bool treatAsUnset = cmd.isEmpty()
+        || cmd.hashCode() == STRING_HASHCODE("defaultattack");
+
+    if (treatAsUnset) {
+        cmd = "";
+        
+        WeaponObject* weapon = getWeapon(); 
+        
+        // We create a list of maps to iterate over.
+        // We don't care if it's Primary or Secondary, we check them ALL.
+        Vector<const CreatureAttackMap*> mapsToCheck;
+        
+        if (primaryAttackMap != nullptr) mapsToCheck.add(primaryAttackMap.get());
+        if (secondaryAttackMap != nullptr) mapsToCheck.add(secondaryAttackMap.get());
+        if (defaultAttackMap != nullptr) mapsToCheck.add(defaultAttackMap.get());
+
+        // Containers for our candidates
+        Vector<String> priorityCommands; // High-tier "Identity" moves
+        String bestHeuristicCmd = "";
+        int bestHeuristicScore = -9999;
+
+        // =================================================================
+        // DYNAMIC ITERATION: Check ALL maps, filter by WEAPON COMPATIBILITY
+        // =================================================================
+        for (int m = 0; m < mapsToCheck.size(); ++m) {
+            const CreatureAttackMap* currentMap = mapsToCheck.get(m);
+            if (currentMap == nullptr || currentMap->isEmpty()) continue;
+
+            for (int i = 0; i < currentMap->size(); ++i) {
+                String key   = currentMap->getCommand(i);
+                String lower = key.toLowerCase();
+
+                // THE ONLY FILTER THAT MATTERS: Does it fit the weapon?
+                if (!isFitsWeaponType(lower, weapon)) {
+                    continue;
+                }
+
+                // --- 1. Check for "Top Tier" Priority Attacks ---
+                bool isPriority = false;
+
+                // Lightsaber / Polearm / Melee Master Hits
+                if (lower.contains("dervish") || 
+                    lower.contains("flurry") || 
+                    lower.contains("phantom") ||
+                    lower.contains("hit3") ||      // Covers saber, polearm, melee, unarmed hit3
+                    lower.contains("bodyhit3") ||
+                    lower.contains("headhit3") ||
+                    lower.contains("saberslash2")) {
+                    isPriority = true;
+                }
+                // Force Master (Mix in force powers if they are valid)
+                else if (lower.contains("forcelightningcone2")) {
+                    isPriority = true;
+                }
+                // Ranged Master Hits
+                else if (lower.contains("strafeshot2") ||
+                         lower.contains("scattershot2") ||
+                         lower.contains("fanshot")) {
+                    isPriority = true;
+                }
+
+                if (isPriority) {
+                    priorityCommands.add(key);
+                    continue; // If added to priority, we don't need to score it heuristically
+                }
+
+                // --- 2. Heuristic Scoring for "Filler" Attacks ---
+                int score = 0;
+
+                // Penalize control moves for default attacks (save them for specials)
+                if (lower.contains("intimidate") || lower.contains("knockdown") ||
+                    lower.contains("blind") || lower.contains("dizzy") ||
+                    lower.contains("stun") || lower.contains("sweep") ||
+                    lower.contains("suppression") || lower.contains("warning") ||
+                    lower.contains("confusion") || lower.contains("meleedefense")) {
+                    score -= 10;
+                }
+
+                // Bonus for damage tiers
+                if (lower.contains("hit2") || lower.contains("shot2")) score += 5;
+                else if (lower.contains("hit1") || lower.contains("shot1")) score += 2;
+                
+                // Bonus for Force Nukes (if not top tier)
+                if (lower.contains("mindblast") || lower.contains("forcelightning")) score += 6;
+
+                // Select best heuristic
+                if (score > bestHeuristicScore) {
+                    bestHeuristicScore = score;
+                    bestHeuristicCmd = key;
+                }
+            }
+        }
+
+        // =================================================================
+        // FINAL SELECTION
+        // =================================================================
+        
+        // 1. If we found High-Priority moves, pick one randomly
+        if (!priorityCommands.isEmpty()) {
+             int idx = System::random(priorityCommands.size() - 1);
+             cmd = priorityCommands.get(idx);
+             
+             #ifdef DEBUG_AI_ATTACK
+             info(true) << "AI_ATTACK: Selected PRIORITY cmd: " << cmd;
+             #endif
+        }
+        // 2. Otherwise, use the best scored "filler" move
+        else if (!bestHeuristicCmd.isEmpty() && bestHeuristicScore > -5) {
+             cmd = bestHeuristicCmd;
+             
+             #ifdef DEBUG_AI_ATTACK
+             info(true) << "AI_ATTACK: Selected HEURISTIC cmd: " << cmd << " (Score: " << bestHeuristicScore << ")";
+             #endif
+        }
+    }
+
+    // 3) Final fallback
+    if (cmd.isEmpty()) {
+        cmd = "defaultattack";
+    }
+
+    nextActionCRC  = cmd.hashCode();
+    nextActionArgs = "";
+
+    // --- QUEUE STUFFER FIX (Kept from previous step) ---
+    ManagedReference<SceneObject*> target = getFollowObject().get();
+    if (target != nullptr) {
+        int currentQSize = getCommandQueueSize();
+        if (currentQSize < 2) {
+             #ifdef DEBUG_AI_ATTACK
+             info(true) << "AI_ATTACK: Queue low, stuffing: " << cmd;
+             #endif
+             enqueueCommand(nextActionCRC, 0, target->getObjectID(), "", QueueCommand::NORMAL);
+        }
+    }
+
+#ifdef DEBUG_AI_ATTACK
+    info(true) << "AI_ATTACK: selectDefaultAttack final cmd=" << cmd
+               << " for " << getDisplayedName() << " (" << getObjectID() << ")";
+#endif
+
+    return true;
 }
 
 const QueueCommand* AiAgentImplementation::getNextAction() {
@@ -1750,6 +2752,34 @@ int AiAgentImplementation::notifyAttack(Observable* observable) {
 }
 
 int AiAgentImplementation::handleObjectMenuSelect(CreatureObject* player, byte selectedID) {
+	// --- START SIMPLAYER HOOK ---
+    // Check if the player is an Admin
+    //if (player->isPlayerCreature()) {
+    //    PlayerObject* ghost = player->getPlayerObject();
+    //    if (ghost != nullptr && ghost->isAdmin()) {
+    //        
+    //        // We hijack the 'EXAMINE' menu option (usually ID 13 or similar constant)
+    //        // If you right-click -> Inspect, this code runs.
+    //        if (selectedID == RadialOptions::EXAMINE) {
+    //            player->sendSystemMessage("admin: Toggling SimPlayer AI...");
+    //			SimPlayerManager::instance()->toggleBot(_this.get());
+//
+    //			// Prevent auto-despawn-by-no-players
+    //			setDespawnOnNoPlayerInRange(false);
+//
+    //			// Cancel any already scheduled despawn mechanisms
+    //			Reference<DespawnCreatureTask*> pending = getPendingTask("despawn").castTo<DespawnCreatureTask*>();
+    //			if (pending != nullptr) pending->cancel();
+//
+    //			if (despawnEvent != nullptr && despawnEvent->isScheduled()) {
+    //			    despawnEvent->cancel();
+    //			    despawnEvent = nullptr;
+    //			}
+//
+    //			return 0;
+    //        }
+    //    }
+    //}
 	if (isDead() && !isPet()) {
 		switch (selectedID) {
 		case 35:
@@ -1829,6 +2859,10 @@ bool AiAgentImplementation::validateStateAttack(CreatureObject* target, unsigned
 }
 
 void AiAgentImplementation::setDespawnOnNoPlayerInRange(bool val) {
+	if (getSimAlwaysActive()) {
+        despawnOnNoPlayerInRange = false;
+        return;
+    }
 	if (despawnOnNoPlayerInRange == val)
 		return;
 
@@ -1842,6 +2876,22 @@ void AiAgentImplementation::setDespawnOnNoPlayerInRange(bool val) {
 		if (!despawnEvent->isScheduled())
 			despawnEvent->schedule(30000);
 	}
+}
+
+bool AiAgentImplementation::getSimPlayerBot() {
+    return simPlayerBot;
+}
+
+void AiAgentImplementation::setSimPlayerBot(bool v) {
+    simPlayerBot = v;
+}
+
+bool AiAgentImplementation::getSimAlwaysActive() {
+    return simAlwaysActive;
+}
+
+void AiAgentImplementation::setSimAlwaysActive(bool v) {
+    simAlwaysActive = v;
 }
 
 void AiAgentImplementation::runAway(CreatureObject* target, float range, bool random, bool setTarget) {
@@ -1997,91 +3047,118 @@ bool AiAgentImplementation::stalkProspect(SceneObject* prospect) {
 }
 
 void AiAgentImplementation::healCreatureTarget(CreatureObject* healTarget) {
-	if (healTarget == nullptr || healTarget->isDead()) {
-		return;
-	}
+    if (healTarget == nullptr || healTarget->isDead()) {
+        return;
+    }
 
 #ifdef DEBUG_AI_HEAL
-	ZoneServer* zoneServer = getZoneServer();
+    ZoneServer* zoneServer = getZoneServer();
 
-	ChatManager* chatManager = nullptr;
+    ChatManager* chatManager = nullptr;
 
-	if (zoneServer != nullptr)
-		chatManager = zoneServer->getChatManager();
+    if (zoneServer != nullptr)
+        chatManager = zoneServer->getChatManager();
 #endif
 
-	uint32 socialGroup = getSocialGroup().toLowerCase().hashCode();
+    uint32 socialGroup = getSocialGroup().toLowerCase().hashCode();
 
-	// Types are: force & normal
-	uint32 healerType = getHealerType().toLowerCase().hashCode();
-	uint32 typeForce = STRING_HASHCODE("force");
+    // Types are: force & normal
+    uint32 healerType = getHealerType().toLowerCase().hashCode();
+    uint32 typeForce = STRING_HASHCODE("force");
 
-	if (healerType == typeForce || socialGroup == STRING_HASHCODE("nightsister") || socialGroup == STRING_HASHCODE("mtn_clan") || socialGroup == STRING_HASHCODE("force") || socialGroup == STRING_HASHCODE("spider_nightsister")) {
-		if (healTarget->getObjectID() == getObjectID()) {
-			healTarget->playEffect("clienteffect/pl_force_heal_self.cef");
+    // 1. Handle Animations and Visuals
+    if (healerType == typeForce || socialGroup == STRING_HASHCODE("nightsister") || socialGroup == STRING_HASHCODE("mtn_clan") || socialGroup == STRING_HASHCODE("force") || socialGroup == STRING_HASHCODE("spider_nightsister")) {
+        if (healTarget->getObjectID() == getObjectID()) {
+            healTarget->playEffect("clienteffect/pl_force_heal_self.cef");
 
 #ifdef DEBUG_AI_HEAL
-			if (chatManager != nullptr) {
-				chatManager->broadcastChatMessage(asAiAgent(), "Force Healing myself!", 0, 0, asAiAgent()->getMoodID());
-			}
+            if (chatManager != nullptr) {
+                chatManager->broadcastChatMessage(asAiAgent(), "Force Healing myself!", 0, 0, asAiAgent()->getMoodID());
+            }
 #endif
 
-		} else {
-			doCombatAnimation(healTarget, STRING_HASHCODE("force_healing_1"), 0, 0xFF);
+        } else {
+            doCombatAnimation(healTarget, STRING_HASHCODE("force_healing_1"), 0, 0xFF);
 
 #ifdef DEBUG_AI_HEAL
-			if (chatManager != nullptr)
-				chatManager->broadcastChatMessage(asAiAgent(), "Force Healing target!", 0, 0, asAiAgent()->getMoodID());
+            if (chatManager != nullptr)
+                chatManager->broadcastChatMessage(asAiAgent(), "Force Healing target!", 0, 0, asAiAgent()->getMoodID());
 #endif
-		}
-	} else {
-		if (healTarget->getObjectID() == getObjectID()) {
-			doAnimation("heal_self");
+        }
+    } else {
+        if (healTarget->getObjectID() == getObjectID()) {
+            doAnimation("heal_self");
 
 #ifdef DEBUG_AI_HEAL
-			if (chatManager != nullptr)
-				chatManager->broadcastChatMessage(asAiAgent(), "Healing myself!", 0, 0, asAiAgent()->getMoodID());
+            if (chatManager != nullptr)
+                chatManager->broadcastChatMessage(asAiAgent(), "Healing myself!", 0, 0, asAiAgent()->getMoodID());
 #endif
 
-		} else {
-			doAnimation("heal_other");
+        } else {
+            doAnimation("heal_other");
 
 #ifdef DEBUG_AI_HEAL
-			if (chatManager != nullptr)
-				chatManager->broadcastChatMessage(asAiAgent(), "Healing target!", 0, 0, asAiAgent()->getMoodID());
+            if (chatManager != nullptr)
+                chatManager->broadcastChatMessage(asAiAgent(), "Healing target!", 0, 0, asAiAgent()->getMoodID());
 #endif
-		}
+        }
 
-		healTarget->playEffect("clienteffect/healing_healdamage.cef");
-	}
+        healTarget->playEffect("clienteffect/healing_healdamage.cef");
+    }
+    
+    // 2. Handle Resource Costs
+    int forceCost = 200; 
 
-	int healthMax = healTarget->getMaxHAM(CreatureAttribute::HEALTH) - healTarget->getWounds(CreatureAttribute::HEALTH);
-	int actionMax = healTarget->getMaxHAM(CreatureAttribute::ACTION) - healTarget->getWounds(CreatureAttribute::ACTION);
-	int mindMax = healTarget->getMaxHAM(CreatureAttribute::MIND) - healTarget->getWounds(CreatureAttribute::MIND);
+if (healerType == STRING_HASHCODE("force")) {
+        // --- LOGGING START ---
+        //StringBuffer logMsg;
+        //logMsg << "AI Force Heal Triggered. Current Force: " << getCurrentForce() 
+        //       << " / " << getMaxForce() 
+        //       << " - Cost: " << forceCost;
+        //info(logMsg.toString(), true); // 'true' forces this to print to the console
+        // --- LOGGING END ---
 
-	int healthDam = healthMax - healTarget->getHAM(CreatureAttribute::HEALTH);
-	int actionDam = actionMax - healTarget->getHAM(CreatureAttribute::ACTION);
-	int mindDam = mindMax - healTarget->getHAM(CreatureAttribute::MIND);
+        // Deduct the Force
+        int newForce = getCurrentForce() - forceCost;
+        setCurrentForce(newForce < 0 ? 0 : newForce); 
 
-	int healAmount = getLevel() * 20;
+        // Optional: Confirm new total
+        //info("AI Force remaining: " + String::valueOf(newForce), true);
+    } else {
+        // Deduct Mind for medics
+        int mindCost = 100;
+        // FIX: Use asTangibleObject() instead of 'this'
+        inflictDamage(asTangibleObject(), CreatureAttribute::MIND, mindCost, false);
+    }
 
-	if (healAmount > healthDam) {
-		healTarget->healDamage(asAiAgent(), CreatureAttribute::HEALTH, healthMax, true, false);
-	} else {
-		healTarget->healDamage(asAiAgent(), CreatureAttribute::HEALTH, healAmount, true, false);
-	}
+    // 3. Apply Healing Logic
+    int healthMax = healTarget->getMaxHAM(CreatureAttribute::HEALTH) - healTarget->getWounds(CreatureAttribute::HEALTH);
+    int actionMax = healTarget->getMaxHAM(CreatureAttribute::ACTION) - healTarget->getWounds(CreatureAttribute::ACTION);
+    int mindMax = healTarget->getMaxHAM(CreatureAttribute::MIND) - healTarget->getWounds(CreatureAttribute::MIND);
 
-	if (healAmount > actionDam) {
-		healTarget->healDamage(asAiAgent(), CreatureAttribute::ACTION, actionMax, true, false);
-	} else {
-		healTarget->healDamage(asAiAgent(), CreatureAttribute::ACTION, healAmount, true, false);
-	}
+    int healthDam = healthMax - healTarget->getHAM(CreatureAttribute::HEALTH);
+    int actionDam = actionMax - healTarget->getHAM(CreatureAttribute::ACTION);
+    int mindDam = mindMax - healTarget->getHAM(CreatureAttribute::MIND);
 
-	if (healAmount > mindDam) {
-		healTarget->healDamage(asAiAgent(), CreatureAttribute::MIND, mindMax, true, false);
-	} else {
-		healTarget->healDamage(asAiAgent(), CreatureAttribute::MIND, healAmount, true, false);
-	}
+    int healAmount = getLevel() * 20;
+
+    if (healAmount > healthDam) {
+        healTarget->healDamage(asAiAgent(), CreatureAttribute::HEALTH, healthMax, true, false);
+    } else {
+        healTarget->healDamage(asAiAgent(), CreatureAttribute::HEALTH, healAmount, true, false);
+    }
+
+    if (healAmount > actionDam) {
+        healTarget->healDamage(asAiAgent(), CreatureAttribute::ACTION, actionMax, true, false);
+    } else {
+        healTarget->healDamage(asAiAgent(), CreatureAttribute::ACTION, healAmount, true, false);
+    }
+
+    if (healAmount > mindDam) {
+        healTarget->healDamage(asAiAgent(), CreatureAttribute::MIND, mindMax, true, false);
+    } else {
+        healTarget->healDamage(asAiAgent(), CreatureAttribute::MIND, healAmount, true, false);
+    }
 }
 
 void AiAgentImplementation::healTangibleTarget(TangibleObject* healTarget) {
@@ -2334,8 +3411,11 @@ void AiAgentImplementation::notifyDespawn(Zone* zone) {
 	//info(true) << "ID: " << getObjectID() << " Reference Count: " << getReferenceCount();
 }
 
+
 void AiAgentImplementation::scheduleDespawn(int timeToDespawn, bool force) {
 	Reference<DespawnCreatureTask*> despawn = getPendingTask("despawn").castTo<DespawnCreatureTask*>();
+	if (!force && getSimAlwaysActive())
+        return;
 
 	if (!force && despawn != nullptr)
 		return;
@@ -2399,10 +3479,12 @@ void AiAgentImplementation::notifyDissapear(TreeEntry* entry) {
 			}
 
 			if (newValue == 0) {
-				if (despawnOnNoPlayerInRange && (despawnEvent == nullptr) && !isPet()) {
-					despawnEvent = new DespawnCreatureOnPlayerDissappear(asAiAgent());
-					despawnEvent->schedule(30000);
-				}
+				bool isSim = getSimAlwaysActive() || getSimPlayerBot();
+    
+    			if (!isSim && despawnOnNoPlayerInRange && (despawnEvent == nullptr) && !isPet()) {
+    			    despawnEvent = new DespawnCreatureOnPlayerDissappear(asAiAgent());
+    			    despawnEvent->schedule(30000);
+    			}
 
 				if (isCreature()) {
 					Creature* creature = cast<Creature*>(asAiAgent());
@@ -2585,363 +3667,254 @@ void AiAgentImplementation::checkNewAngle() {
  * range or they have reached their maxDistance to the point.
 */
 bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
-	/*
-	 * SETUP: Check speed and posture before attempting to find a path
-	 */
+    #ifdef DEBUG_AI
+        if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
+            info("findNextPosition(" + String::valueOf(maxDistance) + ", " + String::valueOf(walk) + ")", true);
+    #endif 
 
-#ifdef DEBUG_AI
-	if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
-		info("findNextPosition(" + String::valueOf(maxDistance) + ", " + String::valueOf(walk) + ")", true);
-#endif // DEBUG_AI
+    bool isSimPlayer = getSimPlayerBot();
+    const CreatureTemplate* tmpl = getCreatureTemplate();
+    if (tmpl != nullptr && tmpl->getTemplateName() == "light_jedi_sentinel") {
+        isSimPlayer = true;
+    }
 
-	Locker locker(&targetMutex);
+    Locker locker(&targetMutex);
 
-	if (isDead() || getPatrolPointSize() <= 0)
-		return false;
+    if (isSimPlayer && (isDead() || getPatrolPointSize() <= 0)) {
+		#ifdef DEBUG_MOVE
+        if (isSimPlayer) info("DEBUG_MOVE: Queue Empty or Dead. Stopping.", true);
+		#endif 
+        return false;
+    }
+    if (!isSimPlayer && (isDead() || getPatrolPointSize() <= 0)) return false;
 
-	int posture = getPosture();
-	int movementState = getMovementState();
+    int posture = getPosture();
+    int movementState = getMovementState();
 
-	if (posture == CreaturePosture::CROUCHED)
-		return false;
+    if (posture == CreaturePosture::CROUCHED) return false;
 
-	float newSpeed = runSpeed;
+    float newSpeed = runSpeed;
+    if (movementState == AiAgent::FLEEING && isInCombat()) newSpeed *= 0.7f;
+    if ((walk && movementState != AiAgent::FLEEING) || posture == CreaturePosture::PRONE) newSpeed = walkSpeed;
+    if (hasState(CreatureState::IMMOBILIZED)) newSpeed = newSpeed / 2.f;
+    if (hasState(CreatureState::FROZEN)) newSpeed = 0.01f;
 
-	if (movementState == AiAgent::FLEEING && isInCombat())
-		newSpeed *= 0.7f;
+    float updateTicks = float(BEHAVIORINTERVAL) / 1000.f;
+    float maxSpeed = newSpeed * updateTicks; 
 
-	if ((walk && movementState != AiAgent::FLEEING) || posture == CreaturePosture::PRONE)
-		newSpeed = walkSpeed;
+    Vector3 currentPosition = getPosition();
+    Vector3 currentWorldPos = getWorldPosition();
+    PatrolPoint endMovementPosition = getNextPosition();
 
-	if (hasState(CreatureState::IMMOBILIZED))
-		newSpeed = newSpeed / 2.f;
+    // ------------------------------------------------------------------
+    // DISTANCE & COORDINATE CALCULATION
+    // Vector3 Config: X=East, Y=North, Z=Height
+    // ------------------------------------------------------------------
+    Vector3 endDistDiff(currentWorldPos - endMovementPosition.getWorldPosition());
+    
+    // Horizontal Distance (X and Y are the map plane)
+    float endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
+    
+    // Vertical Distance (Z is Height)
+    float endDistZ = fabs(endDistDiff.getZ());
+    
+    float maxSquared = Math::max(0.1f, maxDistance * maxDistance);
+#ifdef DEBUG_MOVE
+    if (isSimPlayer) {
+        StringBuffer msg;
+        msg << "DEBUG_MOVE: Dist2D=" << sqrt(endDistanceSq) 
+            << "m Speed=" << currentSpeed 
+            << " HeightDiff=" << endDistZ
+            << " Pts=" << patrolPoints.size();
+        if (currentSpeed < 0.1f) msg << " [STALLED]";
+        info(msg.toString(), true);
+    }
+#endif 
+    // --- ARRIVAL LOGIC ---
+    if (endDistanceSq <= maxSquared && endDistZ < (maxDistance + 2.5f)) {
+        currentFoundPath = nullptr;
+        if (patrolPoints.size() > 0) patrolPoints.remove(0);
 
-	if (hasState(CreatureState::FROZEN))
-		newSpeed = 0.01f;
+        if (patrolPoints.size() > 0) {
+#ifdef DEBUG_MOVE
+            if (isSimPlayer) info("DEBUG_MOVE: Cornering...", true);
+#endif 
+            endMovementPosition = getNextPosition();
+            
+            // Recalculate Logic for new target
+            currentPosition = getPosition();
+            currentWorldPos = getWorldPosition();
+            endDistDiff = Vector3(currentWorldPos - endMovementPosition.getWorldPosition());
+            endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
+            maxSquared = Math::max(0.1f, maxDistance * maxDistance);
+        } else {
+#ifdef DEBUG_MOVE
+            if (isSimPlayer) info("DEBUG_MOVE: Arrived.", true);
+#endif 
+            if (movementState != AiAgent::FOLLOWING) notifyObservers(ObserverEventType::DESTINATIONREACHED);
+            setCurrentSpeed(0.f);
+            updateLocomotion();
+            return false;
+        }
+    }
 
-	float updateTicks = float(BEHAVIORINTERVAL) / 1000.f;
-	float maxSpeed = newSpeed * updateTicks; // maxSpeed is the distance able to travel in time updateTicks
+    // --- DIGITAL PHYSICS (NO BRAKING) ---
+    if (isSimPlayer) {
+        if (patrolPoints.size() > 0) newSpeed = runSpeed; 
+        else if (endDistanceSq < 9.0f && newSpeed > 0.4f) newSpeed = Math::max(0.2f, (currentSpeed - 0.8f));
+        else newSpeed = runSpeed;
+        setCurrentSpeed(newSpeed);
+    } else {
+        if ((((currentSpeed * currentSpeed) * maxSquared) > endDistanceSq) && newSpeed > 0.4f) newSpeed = Math::max(0.2f, (currentSpeed - 0.4f));
+        else if (currentSpeed < newSpeed) {
+            float speedDiff = newSpeed - currentSpeed;
+            if (speedDiff > 0.4f) newSpeed = currentSpeed + 0.4f;
+        }
+        setCurrentSpeed(newSpeed);
+    }
+    updateLocomotion();
 
-	Vector3 currentPosition = getPosition();
-	Vector3 currentWorldPos = getWorldPosition();
-	PatrolPoint endMovementPosition = getNextPosition();
+    // --- PATHFINDER ---
+    PathFinderManager* pathFinder = PathFinderManager::instance();
+    if (pathFinder == nullptr) return false;
 
-	Vector3 endDistDiff(currentWorldPos - endMovementPosition.getWorldPosition());
-	float endDistanceSq = (endDistDiff.getX() * endDistDiff.getX() + endDistDiff.getY() * endDistDiff.getY());
-	float maxSquared = Math::max(0.1f, maxDistance * maxDistance);
+    Reference<Vector<WorldCoordinates>* > path = nullptr;
+    ManagedReference<SceneObject*> currentParent = getParent().get();
+    PatrolPoint currentPoint(currentPosition);
+    const WorldCoordinates endMovementCoords = endMovementPosition.getCoordinates();
+    CellObject* endMovementCell = endMovementPosition.getCell();
 
-	float endDistZSq = endDistDiff.getZ() * endDistDiff.getZ();
-	endDistZSq = Math::getPrecision(endDistZSq, 2);
+    if (currentFoundPath == nullptr) {
+        if (currentParent != nullptr && currentParent->isCellObject()) currentPoint.setCell(currentParent.castTo<CellObject*>());
+        path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementCoords, getZoneUnsafe()));
+    } else {
+        if (currentParent != nullptr && !currentParent->isCellObject()) currentParent = nullptr;
+        if ((movementState == AiAgent::FOLLOWING || movementState == AiAgent::PATHING_HOME || movementState == AiAgent::NOTIFY_ALLY || movementState == AiAgent::MOVING_TO_HEAL || movementState == AiAgent::WATCHING || movementState == AiAgent::CRACKDOWN_SCANNING || movementState == AiAgent::LAIR_HEALING)
+            && endMovementCell == nullptr && currentParent == nullptr && currentFoundPath->get(currentFoundPath->size() - 1).getWorldPosition().squaredDistanceTo(endMovementCoords.getWorldPosition()) > 4 * 4) {
+            path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementPosition.getCoordinates(), getZoneUnsafe()));
+        } else {
+            currentFoundPath->set(0, WorldCoordinates(currentPosition, currentParent.castTo<CellObject*>()));
+            path = currentFoundPath;
+        }
+    }
 
+    if (path == nullptr || path->size() < 2) {
+        currentFoundPath = nullptr;
+        return false;
+    }
+
+    if (currentParent != nullptr && endMovementCell != nullptr) pathFinder->filterPastPoints(path, asAiAgent());
+
+    // --- MULTI-NODE CONSUMPTION LOOP (CORRECTED COORDS) ---
+    WorldCoordinates nextMovementPosition;
+    float remainingDist = maxSpeed; 
+    bool finalPosSet = false;
+    int pathIndex = 1; 
+
+    while (pathIndex < path->size()) {
+        nextMovementPosition = path->get(pathIndex);
+        
+        CellObject* nextMovementCell = nextMovementPosition.getCell();
+        uint64 nextParentID = nextMovementCell != nullptr ? nextMovementCell->getObjectID() : 0;
+        uint64 currentParentID = currentParent != nullptr ? currentParent->getObjectID() : 0;
+        
+        Vector3 checkPos = currentPosition;
+        if (currentParentID != nextParentID && nextParentID > 0) {
+            checkPos = PathFinderManager::transformToModelSpace(currentPosition, nextMovementCell->getParent().get());
+        }
+
+        Vector3 movementDiff(checkPos - nextMovementPosition.getWorldPosition());
+        
+        // 2D Distance using X and Y (Map Plane)
+        float distToNode = Math::sqrt(movementDiff.getX() * movementDiff.getX() + movementDiff.getY() * movementDiff.getY());
+
+        // Skip duplicates
+        if (distToNode < 0.01f) {
+            path->remove(1); 
+            continue;
+        }
+
+        if (distToNode <= remainingDist) {
+            remainingDist -= distToNode;
+            currentPosition = nextMovementPosition.getPoint();
+            currentParent = nextMovementCell; 
+            path->remove(1); 
+            
+            if (path->size() < 2) {
+                finalPosSet = true;
+                break;
+            }
+        } else {
+            // INTERPOLATE
+            float ratio = remainingDist / distToNode;
+            
+            float dx = nextMovementPosition.getX() - checkPos.getX();
+            float dy = nextMovementPosition.getY() - checkPos.getY(); // Y is North
+            float dz = nextMovementPosition.getZ() - checkPos.getZ(); // Z is Height
+            
+            Vector3 interpPos;
+            interpPos.setX(checkPos.getX() + (dx * ratio));
+            interpPos.setY(checkPos.getY() + (dy * ratio)); // Y = North
+            interpPos.setZ(checkPos.getZ() + (dz * ratio)); // Z = Height (Linear Interp)
+            
+            if (!isInNavMesh() && currentParent == nullptr) {
+                // If snapping to floor, update Z (Height)
+                interpPos.setZ(getWorldZ(interpPos)); 
+            }
+
+            nextMovementPosition.setX(interpPos.getX());
+            nextMovementPosition.setY(interpPos.getY());
+            nextMovementPosition.setZ(interpPos.getZ());
+            
+            finalPosSet = true;
+            break;
+        }
+    }
+
+    if (!finalPosSet) {
+        if (path->size() >= 2) {
+            nextMovementPosition = path->get(1);
+        } else {
+            // FIX: Manual set (X, Y=North, Z=Height)
+            nextMovementPosition.setX(currentPosition.getX());
+            nextMovementPosition.setY(currentPosition.getY());
+            nextMovementPosition.setZ(currentPosition.getZ());
+        }
+    }
+
+    // --- FINAL UPDATE ---
+    // [FIXED] Pass coordinates without swapping. 
+    // Vector3 is (X, Y=North, Z=Height). 
+    // nextStepPosition likely matches Vector3 structure internally.
+    nextStepPosition.setPosition(nextMovementPosition.getX(), nextMovementPosition.getZ(), nextMovementPosition.getY());
+    nextStepPosition.setCell(nextMovementPosition.getCell());
+
+    // DIRECTION CALCULATION (FIXED DRIFT)
+    // Use Y for North/South (dy in atan2)
+    float dx = nextMovementPosition.getX() - getPositionX();
+    float dy = nextMovementPosition.getY() - getPositionY(); // Corrected: Y is North
+    
+    float directionAngle = atan2(dy, dx);
+    directionAngle = M_PI / 2 - directionAngle;
+    if (directionAngle < 0) directionAngle = M_PI + directionAngle;
+
+    float error = fabs(directionAngle - direction.getRadians());
+    if (error >= 0.05) setDirection(directionAngle);
+
+    float distTraveled = currentPosition.distanceTo(nextMovementPosition.getPoint()); 
+    if (distTraveled == 0) distTraveled = maxSpeed;
+
+    auto interval = BEHAVIORINTERVAL;
+    nextBehaviorInterval = Math::max((int)50, Math::min((int)((distTraveled / newSpeed) * 1000 + 0.5), interval));
+    
+    currentSpeed = newSpeed;
+    updateCurrentPosition(&nextStepPosition);
+
+    if (isPet()) updatePetSwimmingState();
 #ifdef DEBUG_FINDNEXTPOSITION
-	info(true) << "findNextPosition -- ID: " <<  getObjectID() << " endDistSquared = " << endDistanceSq << "  maxSquared = " << maxSquared << " endDistDiff Z = " << endDistZSq << " Max Distance = " << maxDistance;
+    if (isSimPlayer) info("findNextPosition - complete returning true", true);
 #endif
-
-	if (endDistanceSq <= maxSquared && fabs(endDistZSq) < (maxDistance + 1.f)) {
-		currentFoundPath = nullptr;
-
-		if (patrolPoints.size() > 0)
-			patrolPoints.remove(0);
-
-		if (movementState != AiAgent::FOLLOWING)
-			notifyObservers(ObserverEventType::DESTINATIONREACHED);
-
-		setCurrentSpeed(0.f);
-		updateLocomotion();
-
-		return false;
-	}
-
-	// Handle speed up and slow down
-	if ((((currentSpeed * currentSpeed) * maxSquared) > endDistanceSq) && newSpeed > 0.4f) {
-		newSpeed = Math::max(0.2f, (currentSpeed - 0.4f));
-	} else if (currentSpeed < newSpeed) {
-		float speedDiff = newSpeed - currentSpeed;
-
-		if (speedDiff > 0.4f)
-			newSpeed = currentSpeed + 0.4f;
-	}
-
-	setCurrentSpeed(newSpeed);
-	updateLocomotion();
-
-#ifdef DEBUG_FINDNEXTPOSITION
-	StringBuffer msg1;
-
-	msg1 << "\n--- !!!!    findNextPosition -- Start -- !!!! ----- " << endl
-	<< "Patrol Points Size = " << patrolPoints.size() << endl
-	<< "Current World Position X = " << currentWorldPos.getX() << " Z = " << currentWorldPos.getZ() << " Y = " << currentWorldPos.getY() << endl
-	<< "End Movement Position X = " << endMovementPosition.getWorldPosition().getX() << " Z = " << endMovementPosition.getWorldPosition().getZ() << " Y = " << endMovementPosition.getWorldPosition().getY() << endl
-
-	<< "endDistanceSq = " << endDistanceSq << endl
-	<< "maxSquared = " << maxSquared << endl
-	<< "max distance = " << maxDistance << endl;
-
-	info(true) << msg1.toString();
-#endif
-
-	PathFinderManager* pathFinder = PathFinderManager::instance();
-
-	if (pathFinder == nullptr) {
-		return false;
-	}
-
-	/*
-	*	STEP 1: If we do not already have a path referenced, find a new path
-	*/
-
-	Reference<Vector<WorldCoordinates>* > path = nullptr;
-	ManagedReference<SceneObject*> currentParent = getParent().get();
-
-	PatrolPoint currentPoint(currentPosition);
-	const WorldCoordinates endMovementCoords = endMovementPosition.getCoordinates();
-	CellObject* endMovementCell = endMovementPosition.getCell();
-
-	if (currentFoundPath == nullptr) {
-		// No prior path or path is null, find new path
-		if (currentParent != nullptr && currentParent->isCellObject()) {
-			currentPoint.setCell(currentParent.castTo<CellObject*>());
-		}
-
-		path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementCoords, getZoneUnsafe()));
-	} else {
-		if (currentParent != nullptr && !currentParent->isCellObject()) {
-			currentParent = nullptr;
-		}
-
-		if ((movementState == AiAgent::FOLLOWING || movementState == AiAgent::PATHING_HOME || movementState == AiAgent::NOTIFY_ALLY || movementState == AiAgent::MOVING_TO_HEAL || movementState == AiAgent::WATCHING || movementState == AiAgent::CRACKDOWN_SCANNING || movementState == AiAgent::LAIR_HEALING)
-			&& endMovementCell == nullptr && currentParent == nullptr && currentFoundPath->get(currentFoundPath->size() - 1).getWorldPosition().squaredDistanceTo(endMovementCoords.getWorldPosition()) > 4 * 4) {
-
-			path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementPosition.getCoordinates(), getZoneUnsafe()));
-		} else {
-			currentFoundPath->set(0, WorldCoordinates(currentPosition, currentParent.castTo<CellObject*>()));
-			path = currentFoundPath;
-		}
-	}
-
-	if (path == nullptr) {
-		currentFoundPath = nullptr;
-
-		return false;
-	} else if (path->size() < 2) {
-		currentFoundPath = nullptr;
-		path == nullptr;
-
-		return false;
-	}
-
-#ifdef SHOW_PATH
-	CreateClientPathMessage* pathMessage = new CreateClientPathMessage();
-	if (getParent() == nullptr && pathMessage != nullptr) {
-		pathMessage->addCoordinate(currentPosition.getX(), currentPosition.getZ(), currentPosition.getY());
-	}
-#endif
-
-	// Filter out duplicate path points
-	if (currentParent != nullptr && endMovementCell != nullptr) {
-		pathFinder->filterPastPoints(path, asAiAgent());
-	}
-
-	// the farthest we will move is one point in the path, and the movement update time will change to reflect that
-	WorldCoordinates nextMovementPosition;
-
-	nextMovementPosition = path->get(1);
-
-	if (nextMovementPosition.getX() == currentPosition.getX() && nextMovementPosition.getY() == currentPosition.getY()) {
-		path->remove(1);
-
-		if (path->size() >= 2) {
-			nextMovementPosition = path->get(1);
-		} else {
-			path = nullptr;
-			currentFoundPath = nullptr;
-
-			return false;
-		}
-	}
-
-	CellObject* nextMovementCell = nextMovementPosition.getCell();
-	uint64 currentParentID = currentParent != nullptr ? currentParent->getObjectID() : 0;
-	uint64 nextParentID = nextMovementCell != nullptr ? nextMovementCell->getObjectID() : 0;
-
-	if (currentParentID != nextParentID && nextParentID > 0) {
-		currentPosition = PathFinderManager::transformToModelSpace(currentPosition, nextMovementCell->getParent().get());
-	}
-
-	Vector3 movementDiff(currentWorldPos - nextMovementPosition.getWorldPosition());
-
-	// Determine the distance to the next point excluding the Z coordnate
-	float nextMovementDistance = Math::sqrt(movementDiff.getX() * movementDiff.getX() + movementDiff.getY() * movementDiff.getY());
-	float maxDist = maxSpeed;
-
-	if (endDistanceSq > maxSquared) {
-		// this is the actual "distance we can travel" calculation. We only want to
-		// go to the edge of the maxDistance radius and stop, so select the minimum
-		// of either our max travel distance (maxSpeed) or the distance from the
-		// maxDistance radius
-		maxDist = Math::min(maxSpeed, endDistanceSq - maxSquared + 0.1f);
-	}
-
-#ifdef DEBUG_AI
-	if (nextMovementDistance <= 0) {
-		/*info(true) << "findNextPosition -- ID: " <<  getObjectID() << " endDistSquared = " << endDistanceSq << "  maxSquared = " << maxSquared << "   For:  " << getObjectID();
-		info(true) << " ----- >>>>>>>> nextMovementDistance = " << nextMovementDistance << "   For: " << getObjectID() << " Movement State = " << movementState << " Path size: " << path->size() << "  Patrol points total = " << getPatrolPointSize() << "  Location: " << currentPosition.toString() << "    Next Position = " << nextMovementPosition.getWorldPosition().toString();*/
-	}
-#endif
-
-#ifdef DEBUG_PATHING
-	printf("findNextPosition - Path Size = %i ---  \n", path->size());
-
-	printf("max speed = %f \n", maxSpeed);
-	printf("max distance = %f \n", maxDist);
-	printf("Current Position x = %f , ", currentPosition.getX());
-	printf(" z = %f \n", currentPosition.getZ());
-	printf(" y = %f \n", currentPosition.getY());
-
-	printf("Next Movement Position X = %f , ", nextMovementPosition.getX());
-	printf(" Z = %f \n", nextMovementPosition.getZ());
-	printf(" Y = %f \n", nextMovementPosition.getY());
-	printf("nextMovementDistance = %f \n", nextMovementDistance);
-
-	/*printf(" - Current Path Points - \n");
-
-	for (int i = 0; i < path->size(); ++i) {
-		WorldCoordinates pos = path->get(i);
-
-		printf("Point # %i ", i);
-		printf(" X = %f , ", pos.getX());
-		printf(" Z = %f ", pos.getZ());
-		printf(" Y = %f \n", pos.getY());
-
-		if (pos.getCell() == nullptr)
-			printf(" Cell is null \n");
-	}*/
-#endif
-	Vector3 newPosition;
-
-	if (nextMovementDistance > maxDist && currentParentID == nextParentID) {
-		// nextMovementPosition is further then the maxDist and both points are in the same parent or in the zone
-		// Calculate the distance we can go and set the new nextMovementPosition
-		float dx = nextMovementPosition.getX() - currentPosition.getX();
-		float dy = nextMovementPosition.getY() - currentPosition.getY();
-
-		newPosition.setX(currentPosition.getX() + (maxDist * (dx / nextMovementDistance)));
-		newPosition.setY(currentPosition.getY() + (maxDist * (dy / nextMovementDistance)));
-	} else {
-		newPosition.setX(nextMovementPosition.getX());
-		newPosition.setY(nextMovementPosition.getY());
-
-		path->remove(1);
-	}
-
-	// Handle next Z coordinate
-	if (!isInNavMesh() && currentParent == nullptr) {
-		newPosition.setZ(getWorldZ(newPosition));
-	} else {
-		newPosition.setZ(nextMovementPosition.getZ());
-	}
-
-	nextMovementPosition.setX(newPosition.getX());
-	nextMovementPosition.setY(newPosition.getY());
-	nextMovementPosition.setZ(newPosition.getZ());
-
-#ifdef SHOW_PATH
-		for (int i = 1; i < path->size(); ++i) { // i = 0 is our position
-			const WorldCoordinates& nextPositionDebug = path->get(i);
-
-			Vector3 nextWorldPos = nextPositionDebug.getWorldPosition();
-
-			if (nextPositionDebug.getCell() == nullptr)
-				pathMessage->addCoordinate(nextWorldPos.getX(), currentPosition.getZ(), nextWorldPos.getY());
-		}
-
-		broadcastMessage(pathMessage, false);
-#endif
-
-#ifdef SHOW_NEXT_POSITION
-		for (int i = 0; i < movementMarkers.size(); ++i) {
-			ManagedReference<SceneObject*> marker = movementMarkers.get(i);
-
-			Core::getTaskManager()->scheduleTask([marker] {
-				Locker clocker(marker);
-				marker->destroyObjectFromWorld(false);
-			}, "DestroyMarker", 2000);
-		}
-
-		movementMarkers.removeAll();
-
-		for (int i = 1; i < path->size(); ++i) { // i = 0 is our position
-			const WorldCoordinates& nextPositionDebug = path->get(i);
-
-			Vector3 nextWorldPos = nextPositionDebug.getWorldPosition();
-
-			Reference<SceneObject*> movementMarker = getZoneServer()->createObject(STRING_HASHCODE("object/path_waypoint/path_waypoint.iff"), 0);
-
-			Locker clocker(movementMarker, asAiAgent());
-
-			movementMarker->initializePosition(nextPositionDebug.getX(), nextPositionDebug.getZ(), nextPositionDebug.getY());
-			StringBuffer msg;
-			msg << "Next Position: path distance: " << nextPositionDebug.getWorldPosition().distanceTo(getWorldPosition()) << " maxDist:" << maxDist;
-			movementMarker->setCustomObjectName(msg.toString(), false);
-
-			CellObject* cellObject = nextPositionDebug.getCell();
-
-			if (cellObject != nullptr) {
-				cellObject->transferObject(movementMarker, -1, true);
-			} else {
-				getZone()->transferObject(movementMarker, -1, true);
-			}
-
-			movementMarkers.add(movementMarker);
-		}
-#endif
-
-	/*
-	* STEP 3: Send the movement updates
-	*/
-
-	// Set the next place we will be if we are to move
-	nextStepPosition.setPosition(nextMovementPosition.getX(), nextMovementPosition.getZ(), nextMovementPosition.getY());
-	nextStepPosition.setCell(nextMovementCell);
-
-	float dx = nextMovementPosition.getX() - getPositionX();
-	float dy = nextMovementPosition.getY() - getPositionY();
-
-	float directionAngle = atan2(dy, dx);
-
-	directionAngle = M_PI / 2 - directionAngle;
-
-	if (directionAngle < 0) {
-		float a = M_PI + directionAngle;
-		directionAngle = M_PI + a;
-	}
-
-	float error = fabs(directionAngle - direction.getRadians());
-
-	if (error >= 0.05) {
-		setDirection(directionAngle);
-	}
-
-	auto interval = BEHAVIORINTERVAL;
-	nextBehaviorInterval = Math::min((int)((Math::min(nextMovementDistance, maxDist) / newSpeed) * 1000 + 0.5), interval);
-	currentSpeed = newSpeed;
-
-	updateCurrentPosition(&nextStepPosition);
-
-	if (isPet()) {
-		updatePetSwimmingState();
-	}
-
-#ifdef DEBUG_AI
-	if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
-		info("findNextPosition - complete returning true", true);
-#endif // DEBUG_AI
-
-#ifdef DEBUG_FINDNEXTPOSITION
-	printf("----   !!!!   findNextPosition -- End --   !!!! -----\n");
-#endif
-
-	return true;
+    return true;
 }
 
 bool AiAgentImplementation::checkLineOfSight(SceneObject* obj) {
@@ -3234,13 +4207,156 @@ bool AiAgentImplementation::generatePatrol(int num, float dist) {
 		}
 	}
 
-	// info(true) << "ID: " << getObjectID() << " Finished - generatePatrol with a state of " << getMovementState() << " and point size of = " << getPatrolPointSize();
+	//info(true) << "ID: " << getObjectID() << " Finished - generatePatrol with a state of " << getMovementState() << " and point size of = " << getPatrolPointSize();
 
 	if (getPatrolPointSize() > 0)
 		return true;
 
 	setMovementState(savedState);
 	return false;
+}
+
+void AiAgentImplementation::healEnhanceCreatureTarget(CreatureObject* target, String& statKey) {
+    if (target == nullptr)
+        return;
+
+    if (isDead() || target->isDead())
+        return;
+
+    if (target->isInCombat() || isInCombat())
+        return;
+
+    String key = statKey.toLowerCase();
+
+    int attributeIdx = -1;
+    if (key == "health") attributeIdx = 0;
+    else if (key == "strength") attributeIdx = 1;
+    else if (key == "constitution") attributeIdx = 2;
+    else if (key == "action") attributeIdx = 3;
+    else if (key == "quickness") attributeIdx = 4;
+    else if (key == "stamina") attributeIdx = 5;
+    else return;
+
+    const uint32 crc = BuffCRC::getMedicalBuff(attributeIdx);
+
+    // tune these however you want for your server:
+    const int amount = 1200;          // buff strength
+    const float duration = 3600.0f;        // seconds
+    const int buffType = BuffType::MEDICAL;
+
+    Locker locker(target);
+
+    if (target->hasBuff(crc))
+        return;
+
+    ManagedReference<Buff*> buff = new Buff(target, crc, duration, buffType);
+
+    Locker buffLock(buff);
+    buff->setAttributeModifier((uint8)attributeIdx, amount);
+
+    target->addBuff(buff);
+	target->playEffect("clienteffect/healing_healenhance.cef", "");
+	
+}
+
+void AiAgentImplementation::wipeMedicalEnhanceBuffs(CreatureObject* target) {
+    if (target == nullptr){
+        return;
+	}
+
+	info("wipeMedicalEnhanceBuffs: Wipeitup: ", true);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_HEALTH);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_STRENGTH);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_CONSTITUTION);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_ACTION);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_QUICKNESS);
+    target->removeBuff(BuffCRC::MEDICAL_ENHANCE_STAMINA);
+}
+
+void AiAgentImplementation::wipeEnhanceBuffs(CreatureObject* target, uint32 flags) {
+    if (target == nullptr) {
+		// info("wipeEnhanceBuffs: target nullptr: ", true);
+        return;
+	}
+	// info("wipeEnhanceBuffs: flags:: " + String::valueOf(flags), true);
+    if (flags & EnhanceWipeFlags::MEDICAL) {
+        wipeMedicalEnhanceBuffs(target); // reuse your existing stable behavior
+		// info("wipeEnhanceBuffs: back from wipe: ", true);
+
+		Locker clocker(target);
+		TangibleObject* healer = nullptr;
+		float shock = target->getShockWounds();
+		if (shock > 0) {
+		    target->addShockWounds(-shock, true, false);
+		}
+		int healthW = target->getWounds(CreatureAttribute::HEALTH);
+		if (healthW > 0) {
+		    target->healWound(healer, CreatureAttribute::HEALTH, healthW, true, false);
+		}
+
+		int strengthW = target->getWounds(CreatureAttribute::STRENGTH);
+		if (strengthW > 0) {
+		    target->healWound(healer, CreatureAttribute::STRENGTH, strengthW, true, false);
+		}
+
+		int constitutionW = target->getWounds(CreatureAttribute::CONSTITUTION);
+		if (constitutionW > 0) {
+		    target->healWound(healer, CreatureAttribute::CONSTITUTION, constitutionW, true, false);
+		}
+
+		int actionW = target->getWounds(CreatureAttribute::ACTION);
+		if (actionW > 0) {
+		    target->healWound(healer, CreatureAttribute::ACTION, actionW, true, false);
+		}
+
+		int quicknessW = target->getWounds(CreatureAttribute::QUICKNESS);
+		if (quicknessW > 0) {
+		    target->healWound(healer, CreatureAttribute::QUICKNESS, quicknessW, true, false);
+		}
+
+		int staminaW = target->getWounds(CreatureAttribute::STAMINA);
+		if (staminaW > 0) {
+		    target->healWound(healer, CreatureAttribute::STAMINA, staminaW, true, false);
+		}
+    }
+
+    if (flags & EnhanceWipeFlags::DANCE) {
+        target->removeBuff(BuffCRC::PERFORMANCE_ENHANCE_DANCE_MIND); // performance_enhance_dance_mind
+    }
+
+    if (flags & EnhanceWipeFlags::MUSIC) {
+        target->removeBuff(BuffCRC::PERFORMANCE_ENHANCE_MUSIC_FOCUS); // performance_enhance_music_focus
+        target->removeBuff(BuffCRC::PERFORMANCE_ENHANCE_MUSIC_WILLPOWER); // performance_enhance_music_willpower
+    }
+
+    // Battle fatigue + mind/focus/willpower wounds are "performance side"
+    if (flags & (EnhanceWipeFlags::DANCE | EnhanceWipeFlags::MUSIC)) {
+        // Lock just the target; AiAgentImplementation isn't Lockable.
+		Locker clocker(target);
+
+		// Use the AI creature itself as the healer attribution.
+		TangibleObject* healer = nullptr;
+
+		float shock = target->getShockWounds();
+		if (shock > 0) {
+		    target->addShockWounds(-shock, true, false);
+		}
+
+		int mindW = target->getWounds(CreatureAttribute::MIND);
+		if (mindW > 0) {
+		    target->healWound(healer, CreatureAttribute::MIND, mindW, true, false);
+		}
+
+		int focusW = target->getWounds(CreatureAttribute::FOCUS);
+		if (focusW > 0) {
+		    target->healWound(healer, CreatureAttribute::FOCUS, focusW, true, false);
+		}
+
+		int willW = target->getWounds(CreatureAttribute::WILLPOWER);
+		if (willW > 0) {
+		    target->healWound(healer, CreatureAttribute::WILLPOWER, willW, true, false);
+		}
+	}
 }
 
 float AiAgentImplementation::getMaxDistance() {
@@ -3345,12 +4461,11 @@ int AiAgentImplementation::setDestination() {
 	ManagedReference<SceneObject*> followCopy = getFollowObject().get();
 	unsigned int stateCopy = getMovementState();
 
-	// info(true) << getDisplayedName() << " - ID: " << getObjectID() << "  setDestination - stateCopy: " << stateCopy << "  Patrol Point Size:" << getPatrolPointSize();
-	// info("homeLocation: " + homeLocation.toString(), true);
+	//info(true) << getDisplayedName() << " - ID: " << getObjectID() << "  setDestination - stateCopy: " << stateCopy << "  Patrol Point Size:" << getPatrolPointSize();
+	//info("homeLocation: " + homeLocation.toString(), true);
 
 	if (patrolPoints.size() > 20) {
-		info() << getObjectID() << " Patrol points have overflowed - Total points: " << patrolPoints.size() << " Movement State: " << stateCopy << " Saved Patrol point size: " << savedPatrolPoints.size();
-
+		//info() << getObjectID() << " Patrol points have overflowed - Total points: " << patrolPoints.size() << " Movement State: " << stateCopy << " Saved Patrol point size: " << savedPatrolPoints.size();
 		clearPatrolPoints();
 	}
 
@@ -3748,38 +4863,57 @@ bool AiAgentImplementation::isCamouflaged(CreatureObject* creature) {
 }
 
 void AiAgentImplementation::activateAiBehavior(bool reschedule) {
-	if (getZoneUnsafe() == nullptr || !(getOptionsBitmask() & OptionBitmask::AIENABLED))
-		return;
+    if (getZoneUnsafe() == nullptr || !(getOptionsBitmask() & OptionBitmask::AIENABLED))
+        return;
 
 #ifdef DEBUG_AI
-	bool alwaysActive = ConfigManager::instance()->getAiAgentLoadTesting();
-#else // DEBUG_AI
-	bool alwaysActive = false;
-#endif // DEBUG_AI
+    bool alwaysActive = ConfigManager::instance()->getAiAgentLoadTesting();
+#else
+    bool alwaysActive = false;
+#endif
 
-	ZoneServer* zoneServer = getZoneServer();
+    // ✅ Single source of truth: use your IDL flags (reliable)
+    // If this is a sim bot or forced always active, keep AI ticking even with 0 players nearby.
+    if (getSimAlwaysActive() || getSimPlayerBot() || !getDespawnOnNoPlayerInRange()) {
+        alwaysActive = true;
+    }
 
-	if ((!alwaysActive && numberOfPlayersInRange.get() <= 0 && getFollowObject().get() == nullptr && !isRetreating()) || zoneServer == nullptr || zoneServer->isServerLoading() || zoneServer->isServerShuttingDown()) {
-		cancelBehaviorEvent();
-		return;
-	}
+    ZoneServer* zoneServer = getZoneServer();
 
-	Locker locker(&behaviorEventMutex);
+    // Original "no players nearby -> stop AI" gate, but now bypassed for sim bots / always-active.
+    if ((!alwaysActive && numberOfPlayersInRange.get() <= 0 && getFollowObject().get() == nullptr && !isRetreating())
+        || zoneServer == nullptr
+        || zoneServer->isServerLoading()
+        || zoneServer->isServerShuttingDown()) {
 
-	if (behaviorEvent == nullptr) {
-		behaviorEvent = new AiBehaviorEvent(asAiAgent());
-		behaviorEvent->schedule(Math::max(10, nextBehaviorInterval));
-	} else {
-		if (reschedule) {
-			try {
-				if (!behaviorEvent->isScheduled())
-					behaviorEvent->schedule(Math::max(10, nextBehaviorInterval));
-			} catch (IllegalArgumentException& e) {
-			}
-		}
-	}
+#ifdef DEBUG_AI
+        info() << "activateAiBehavior CANCEL oid=" << getObjectID()
+               << " playersInRange=" << numberOfPlayersInRange.get()
+               << " follow=" << (getFollowObject().get() != nullptr)
+               << " retreat=" << isRetreating()
+               << " simAlwaysActive=" << getSimAlwaysActive()
+               << " simPlayerBot=" << getSimPlayerBot()
+               << " despawnOnNoPlayerInRange=" << getDespawnOnNoPlayerInRange()
+               << " alwaysActiveVar=" << alwaysActive;
+#endif
+        cancelBehaviorEvent();
+        return;
+    }
 
-	nextBehaviorInterval = BEHAVIORINTERVAL;
+    Locker locker(&behaviorEventMutex);
+
+    if (behaviorEvent == nullptr) {
+        behaviorEvent = new AiBehaviorEvent(asAiAgent());
+        behaviorEvent->schedule(Math::max(10, nextBehaviorInterval));
+    } else if (reschedule) {
+        try {
+            if (!behaviorEvent->isScheduled())
+                behaviorEvent->schedule(Math::max(10, nextBehaviorInterval));
+        } catch (IllegalArgumentException& e) {
+        }
+    }
+
+    nextBehaviorInterval = BEHAVIORINTERVAL;
 }
 
 void AiAgentImplementation::cancelBehaviorEvent() {
@@ -3878,11 +5012,21 @@ int AiAgentImplementation::inflictDamage(TangibleObject* attacker, int damageTyp
 
 	activateRecovery();
 
-	if (damage > 0) {
-		// This damage is DOT or other types of non direct combat damage, it should not count towards loot and thus not be added to the threat map damage.
-		// Adding aggro should still be done.
-		getThreatMap()->addAggro(attacker, 1);
-	}
+	if (attacker != nullptr && attacker->isTangibleObject() && attacker->isAttackableBy(asAiAgent())) {
+        addDefender(attacker);
+    }
+
+    if (damage > 0) {
+        // This damage is DOT or other types of non direct combat damage, it should not count towards loot and thus not be added to the threat map damage.
+        // Adding aggro should still be done.
+        getThreatMap()->addAggro(attacker, 1);
+    }
+
+	//if (damage > 0) {
+	//	// This damage is DOT or other types of non direct combat damage, it should not count towards loot and thus not be added to the threat map damage.
+	//	// Adding aggro should still be done.
+	//	getThreatMap()->addAggro(attacker, 1);
+	//}
 
 	notifyObservers(ObserverEventType::DAMAGERECEIVED, attacker);
 	return CreatureObjectImplementation::inflictDamage(attacker, damageType, damage, destroy, notifyClient, isCombatAction);
@@ -3893,9 +5037,17 @@ int AiAgentImplementation::inflictDamage(TangibleObject* attacker, int damageTyp
 
 	activateRecovery();
 
-	if (damage > 0) {
-		getThreatMap()->addDamage(attacker, damage, xp);
-	}
+	if (attacker != nullptr && attacker->isTangibleObject() && attacker->isAttackableBy(asAiAgent())) {
+        addDefender(attacker);
+    }
+
+    if (damage > 0) {
+        getThreatMap()->addDamage(attacker, damage, xp);
+    }
+
+	//if (damage > 0) {
+	//	getThreatMap()->addDamage(attacker, damage, xp);
+	//}
 
 	notifyObservers(ObserverEventType::DAMAGERECEIVED, attacker);
 
@@ -3957,21 +5109,165 @@ void AiAgentImplementation::notifyPackMobs(SceneObject* attacker) {
 		Reference<SceneObject*> attackerRef = attacker;
 
 		Core::getTaskManager()->executeTask([agentRef, attackerRef] () {
-			Locker locker(agentRef);
-			Locker clocker(attackerRef, agentRef);
+            Locker locker(agentRef);
+            Locker clocker(attackerRef, agentRef);
 
-			Time* lastNotify = agentRef->getLastPackNotify();
+            Time* lastNotify = agentRef->getLastPackNotify();
 
-			if (lastNotify != nullptr) {
-				lastNotify->updateToCurrentTime();
-				lastNotify->addMiliTime(30000);
-			}
+            if (lastNotify != nullptr) {
+                lastNotify->updateToCurrentTime();
+                lastNotify->addMiliTime(30000);
+            }
 
-			agentRef->showFlyText("npc_reaction/flytext", "threaten", 0xFF, 0, 0);
-			agentRef->setDefender(attackerRef);
+            agentRef->showFlyText("npc_reaction/flytext", "threaten", 0xFF, 0, 0);
+            agentRef->setDefender(attackerRef);
 
 		}, "PackAttackLambda");
 	}
+	// START OF AI FRIEND ASSIST
+	AiAgent* selfAgent = asAiAgent();
+
+        if (selfAgent == nullptr)
+                return;
+
+        if (originatesFromDestroyMissionLair(selfAgent))
+                return;
+
+        // Allow same-faction allies to assist nearby players only when this isn't a destroy-mission lair.
+        // Destroy-mission lairs spawn spin groups where mass assistance would overwhelm players.
+        if (attacker == nullptr || !attacker->isCreatureObject())
+                return;
+
+        CreatureObject* attackerCreo = attacker->asCreatureObject();
+
+        if (attackerCreo == nullptr || !attackerCreo->isPlayerCreature())
+                return;
+
+        uint32 selfFaction = getFaction();
+
+        if (selfFaction == 0)
+                return;
+
+        const int MAX_ALLY_ENGAGERS = 3;
+        int engagedFriendlies = 0;
+
+        {
+            Locker attackerLocker(attackerCreo, selfAgent);
+            const DeltaVector<ManagedReference<SceneObject*> >* defenderList = attackerCreo->getDefenderList();
+            if (defenderList != nullptr) {
+                for (int i = 0; i < defenderList->size(); ++i) {
+                    ManagedReference<SceneObject*> defender = defenderList->get(i);
+                    if (defender == nullptr || !defender->isAiAgent())
+                        continue;
+                    AiAgent* defenderAgent = defender->asAiAgent();
+					if (defenderAgent == nullptr)
+						continue;
+					if (defenderAgent->isDead() || defenderAgent->isIncapacitated())
+						continue;
+                    if (defenderAgent->getFaction() != selfFaction)
+						continue;
+					++engagedFriendlies;
+                }
+            }
+        }
+
+        if (engagedFriendlies >= MAX_ALLY_ENGAGERS)
+                return;
+
+        const float ASSIST_RANGE = 30.0f;
+        const float ASSIST_RANGE_SQUARED = ASSIST_RANGE * ASSIST_RANGE;
+
+        Vector< Reference<AiAgent*> > assistCandidates;
+
+        for (int i = 0; i < closeObjects.size(); ++i) {
+                SceneObject* object = static_cast<SceneObject*>(closeObjects.get(i));
+
+                if (!object->isCreatureObject())
+                        continue;
+
+                CreatureObject* creature = object->asCreatureObject();
+
+                if (creature == nullptr || creature->getObjectID() == getObjectID())
+                        continue;
+
+                AiAgent* candidateAgent = creature->asAiAgent();
+
+                if (candidateAgent == nullptr || candidateAgent == selfAgent)
+                        continue;
+
+                if (candidateAgent->isDead() || candidateAgent->isIncapacitated())
+                        continue;
+
+                if (candidateAgent->getFaction() != selfFaction)
+                        continue;
+
+                if (originatesFromDestroyMissionLair(candidateAgent))
+                        continue;
+
+                if (candidateAgent->hasDefender(attacker))
+                        continue;
+
+                if (!candidateAgent->isAggressiveTo(attackerCreo))
+                        continue;
+
+                Vector3 candidatePosition = candidateAgent->getWorldPosition();
+                Vector3 attackerPosition = attackerCreo->getWorldPosition();
+
+                if (candidatePosition.squaredDistanceTo(attackerPosition) > ASSIST_RANGE_SQUARED)
+                        continue;
+
+                if (!CollisionManager::checkLineOfSight(candidateAgent, attackerCreo))
+                        continue;
+
+                assistCandidates.add(candidateAgent);
+        }
+
+        if (assistCandidates.isEmpty())
+                return;
+
+        Reference<SceneObject*> attackerRef = attacker;
+
+        for (int i = 0; i < assistCandidates.size() && engagedFriendlies < MAX_ALLY_ENGAGERS; ++i) {
+                Reference<AiAgent*> candidateRef = assistCandidates.get(i);
+
+                if (candidateRef == nullptr)
+                        continue;
+
+                ++engagedFriendlies;
+
+                Core::getTaskManager()->executeTask([candidateRef, attackerRef] () {
+                        Locker locker(candidateRef);
+                        Locker clocker(attackerRef, candidateRef);
+
+                        AiAgent* candidate = candidateRef.get();
+                        SceneObject* enemy = attackerRef.get();
+
+                        if (candidate == nullptr || enemy == nullptr || !enemy->isCreatureObject())
+                                return;
+
+                        CreatureObject* enemyCreo = enemy->asCreatureObject();
+
+                        if (enemyCreo == nullptr || enemyCreo->isDead() || enemyCreo->isIncapacitated())
+                                return;
+
+                        if (candidate->isDead() || candidate->isIncapacitated())
+                                return;
+
+                        if (!candidate->isAggressiveTo(enemyCreo))
+                                return;
+
+                        if (!candidate->isInRange(enemyCreo, 30.0f))
+                                return;
+
+                        if (!candidate->checkLineOfSight(enemyCreo))
+                                return;
+
+                        if (!candidate->hasDefender(enemy))
+                                candidate->addDefender(enemy);
+
+                }, "FactionAssistLambda");
+        }
+	// END OF AI FRIEND ASSIST
 }
 
 

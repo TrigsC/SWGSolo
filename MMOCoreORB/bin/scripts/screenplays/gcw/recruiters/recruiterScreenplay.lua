@@ -835,3 +835,121 @@ function recruiterScreenplay:handleResign(pPlayer)
 
 	PlayerObject(pGhost):decreaseFactionStanding(oldFactionName, 0)
 end
+
+-- INTENT: ATTEMPT PROMOTION
+function recruiterScreenplay:attemptPromotion(pPlayer, pNpc)
+    local pGhost = CreatureObject(pPlayer):getPlayerObject()
+    local currentRank = CreatureObject(pPlayer):getFactionRank()
+    
+    -- Logic extracted from Handler
+    if isHighestRank(currentRank) then
+        CreatureObject(pPlayer):sendSystemMessage("You are already at the highest rank, soldier.")
+        return
+    end
+
+    local nextRank = currentRank + 1
+    local requiredPoints = getRankCost(nextRank)
+    local faction = self:getRecruiterFaction(pNpc)
+    local currentStanding = PlayerObject(pGhost):getFactionStanding(faction)
+
+	if (currentStanding < (requiredPoints + self.minimumFactionStanding)) then
+        -- FAILURE MESSAGE (Handled by Lua, not AI)
+        local missing = (requiredPoints + self.minimumFactionStanding) - currentStanding
+        spatialChat(pNpc, "I can't promote you yet. You need " .. missing .. " more faction points.")
+    else
+        -- SUCCESS MESSAGE (Handled by Lua, not AI)
+        PlayerObject(pGhost):decreaseFactionStanding(faction, requiredPoints)
+        CreatureObject(pPlayer):setFactionRank(nextRank)
+        CreatureObject(pPlayer):sendSystemMessage("You have been promoted to " .. getRankName(nextRank) .. "!")
+        
+        -- This is the text you see in the chat bubble
+        spatialChat(pNpc, "Congratulations on your promotion, " .. getRankName(nextRank) .. "!")
+        
+        CreatureObject(pPlayer):playEffect("clienteffect/level_up.cef", "")
+    end
+end
+
+-- INTENT: CHECK ELIGIBILITY (Just data, no action)
+function recruiterScreenplay:getPlayerStatusContext(pPlayer, pNpc)
+    local pGhost = CreatureObject(pPlayer):getPlayerObject()
+    local faction = self:getRecruiterFaction(pNpc)
+    local rank = CreatureObject(pPlayer):getFactionRank()
+    local points = PlayerObject(pGhost):getFactionStanding(faction)
+    
+    return string.format("Rank: %s, Faction Points: %d, Faction: %s", getRankName(rank), points, faction)
+end
+
+-- INTENT: TOGGLE COVERT/OVERT
+-- Logic to toggle On Leave (0), Covert (1), or Overt (2)
+function recruiterScreenplay:attemptToggleStatus(pPlayer, pNpc, targetStatus) 
+    local currentStatus = CreatureObject(pPlayer):getFactionStatus()
+    
+    -- FIX: Use isChangingFactionStatus() because getFutureFactionStatus() is not exposed to Lua
+    if (CreatureObject(pPlayer):isChangingFactionStatus()) then
+        spatialChat(pNpc, "Your status change is already being processed. Please wait.")
+        return
+    end
+    
+    if (currentStatus == targetStatus) then
+        spatialChat(pNpc, "You are already in that status, soldier.")
+        return
+    end
+
+    -- Check for Jedi (Jedi cannot hide)
+    if (targetStatus ~= 2 and (CreatureObject(pPlayer):hasSkill("force_rank_light_novice") or CreatureObject(pPlayer):hasSkill("force_rank_dark_novice"))) then
+        spatialChat(pNpc, "I cannot hide your presence, Force User. You must remain Special Forces.")
+        return
+    end
+
+    -- Status 2: OVERT (Special Forces) - Fast Transition (30s)
+    if targetStatus == 2 then 
+         CreatureObject(pPlayer):setFutureFactionStatus(2)
+         writeData(CreatureObject(pPlayer):getObjectID() .. ":changingFactionStatus", 1)
+         createEvent(30000, "recruiterScreenplay", "handleGoOvert", pPlayer, "")
+         
+         spatialChat(pNpc, "I've updated your files. You will be declared Special Forces in 30 seconds.")
+
+    -- Status 1: COVERT (Combatant) - Slow Transition
+    elseif targetStatus == 1 then
+        CreatureObject(pPlayer):setFutureFactionStatus(1)
+        writeData(CreatureObject(pPlayer):getObjectID() .. ":changingFactionStatus", 1)
+        
+        local timer = self.covertOvertResignTime * 60 * 1000 
+        createEvent(timer, "recruiterScreenplay", "handleGoCovert", pPlayer, "")
+        
+        spatialChat(pNpc, "Understood. You will be stepped down to Combatant status in " .. self.covertOvertResignTime .. " minutes.")
+
+    -- Status 0: ON LEAVE (Civilian) - Slow Transition
+    elseif targetStatus == 0 then
+        CreatureObject(pPlayer):setFutureFactionStatus(0)
+        writeData(CreatureObject(pPlayer):getObjectID() .. ":changingFactionStatus", 1)
+        
+        local timer = self.covertOvertResignTime * 60 * 1000 
+        createEvent(timer, "recruiterScreenplay", "handleGoOnLeave", pPlayer, "")
+        
+        spatialChat(pNpc, "I'll process your leave request. You will be off duty in " .. self.covertOvertResignTime .. " minutes.")
+    end
+end
+
+-- Logic to announce the GCW Score for the planet
+function recruiterScreenplay:announceGCWScore(pNpc)
+    if (pNpc == nil) then return end
+    
+    local zoneName = SceneObject(pNpc):getZoneName()
+    local rebelScore = getRebelScore(zoneName)
+    local imperialScore = getImperialScore(zoneName)
+    
+    local message = "Current Status for " .. zoneName .. ": Rebel: " .. rebelScore .. " / Imperial: " .. imperialScore .. "."
+    
+    if (rebelScore > imperialScore) then
+        message = message .. " We are winning, soldier!"
+    elseif (imperialScore > rebelScore) then
+        message = message .. " The Empire is pushing us back!"
+    else
+        message = message .. " It is a stalemate."
+    end
+    
+    spatialChat(pNpc, message)
+end
+
+return recruiterScreenplay

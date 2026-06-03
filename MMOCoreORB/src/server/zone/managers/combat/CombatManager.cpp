@@ -26,6 +26,7 @@
 #include "server/zone/managers/player/PlayerManager.h"
 #include "server/zone/objects/installation/components/TurretDataComponent.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
+#include "server/zone/objects/creature/ai/CreatureTemplate.h"
 #include "server/zone/objects/installation/InstallationObject.h"
 #include "server/zone/packets/object/ShowFlyText.h"
 #include "server/zone/managers/frs/FrsManager.h"
@@ -33,6 +34,7 @@
 #include "server/zone/objects/installation/TurretObject.h"
 
 #define COMBAT_SPAM_RANGE 85 // Range at which players will see Combat Log Info
+//#define TOHIT_DEBUG
 
 /*
 * Notes:
@@ -1137,12 +1139,12 @@ float CombatManager::calculateDamage(CreatureObject* attacker, WeaponObject* wea
 
 	damage += defender->getSkillMod("private_damage_susceptibility");
 
-	if (attacker->isPlayerCreature()) {
-		if (data.isForceAttack() && !defender->isPlayerCreature())
-			damage *= 2 + System::random(1);
-		else if (!data.isForceAttack())
-			damage *= 1.5;
-	}
+	//if (attacker->isPlayerCreature()) {
+	if (data.isForceAttack() && !defender->isPlayerCreature())
+		damage *= 2 + System::random(1);
+	else if (!data.isForceAttack())
+		damage *= 1.5;
+	//}
 
 	if (!data.isForceAttack() && weapon->getAttackType() == SharedWeaponObjectTemplate::MELEEATTACK)
 		damage *= 1.25;
@@ -1171,7 +1173,8 @@ float CombatManager::calculateDamage(CreatureObject* attacker, WeaponObject* wea
 	}
 
 	// PvP Damage Reduction.
-	if (attacker->isPlayerCreature() && defender->isPlayerCreature() && !data.isForceAttack())
+	//if (attacker->isPlayerCreature() && defender->isPlayerCreature() && !data.isForceAttack())
+	if (!data.isForceAttack())
 		damage *= 0.25;
 
 	if (damage < 1)
@@ -1214,7 +1217,7 @@ float CombatManager::calculateDamage(CreatureObject* attacker, WeaponObject* wea
 
 	damage = applyDamageModifiers(attacker, weapon, damage, data);
 
-	if (attacker->isPlayerCreature())
+	if (attacker->isPlayerCreature() || attacker->isAiAgent())
 		damage *= 1.5;
 
 	if (!data.isForceAttack() && weapon->getAttackType() == SharedWeaponObjectTemplate::MELEEATTACK)
@@ -1948,7 +1951,31 @@ int CombatManager::calculateTargetPostureModifier(WeaponObject* weapon, Creature
 
 int CombatManager::getAttackerAccuracyModifier(TangibleObject* attacker, CreatureObject* defender, WeaponObject* weapon) const {
 	if (attacker->isAiAgent()) {
-		return cast<AiAgent*>(attacker)->getChanceHit() * 100;
+		AiAgent* agent = cast<AiAgent*>(attacker);
+        
+        // If the AI has a custom accuracy defined in Lua/getSkillMod, use it!
+        int aiAccuracy = agent->getSkillMod("attack_accuracy");
+        
+        if (aiAccuracy > 0) {
+            // If weapon is melee, add melee_accuracy, etc.
+            if (weapon->isMeleeWeapon())
+                aiAccuracy += agent->getSkillMod("melee_accuracy");
+            else
+                aiAccuracy += agent->getSkillMod("ranged_accuracy");
+
+			// --- LOGGING START ---
+            //StringBuffer msg;
+            //msg << "DEBUG COMBAT: Attacker " << attacker->getDisplayedName() 
+            //    << " Total Accuracy: " << aiAccuracy 
+            //    << " (Should be Base + WeaponSkill)";
+            //agent->info(msg.toString(), true);
+            // --- LOGGING END ---
+                
+            return aiAccuracy;
+        }
+
+        // FALLBACK: Old logic if no stats defined
+        return agent->getChanceHit() * 100;
 	} else if (attacker->isInstallationObject()) {
 		return cast<InstallationObject*>(attacker)->getHitChance() * 100;
 	}
@@ -2014,11 +2041,33 @@ int CombatManager::getDefenderDefenseModifier(CreatureObject* defender, WeaponOb
 
 	const auto defenseAccMods = weapon->getDefenderDefenseModifiers();
 
+	//if (defender->isAiAgent()) {
+    //    //StringBuffer msg;
+    //    //msg << "DEBUG WEAPON CHECK: Attacker's weapon has " << defenseAccMods->size() << " modifiers.";
+    //    if (defenseAccMods->size() > 0) {
+    //        //msg << " It will ask for: ";
+    //        for (int i = 0; i < defenseAccMods->size(); ++i) {
+    //            msg << defenseAccMods->get(i) << " ";
+    //        }
+    //    } else {
+    //        msg << " (The AI will receive NO bonus defense because the list is empty)";
+    //    }
+    //    //info(msg.toString(), true);
+    //}
+
 	for (int i = 0; i < defenseAccMods->size(); ++i) {
-		const String& mod = defenseAccMods->get(i);
-		targetDefense += defender->getSkillMod(mod);
-		targetDefense += defender->getSkillMod("private_" + mod);
-	}
+        const String& mod = defenseAccMods->get(i);
+        // We cast to AiAgent* to force the compiler to use your new code 
+        if (defender->isAiAgent()) {
+            AiAgent* aiDef = cast<AiAgent*>(defender);
+            targetDefense += aiDef->getSkillMod(mod);
+            targetDefense += aiDef->getSkillMod("private_" + mod);
+        } else {
+            // Standard player logic
+            targetDefense += defender->getSkillMod(mod);
+            targetDefense += defender->getSkillMod("private_" + mod);
+        }
+    }
 
 	debug() << "Base target defense is " << targetDefense;
 
@@ -2035,34 +2084,72 @@ int CombatManager::getDefenderDefenseModifier(CreatureObject* defender, WeaponOb
 		targetDefense += defender->getSkillMod("private_group_" + mod);
 	}
 
-	// food bonus goes on top as well
-	targetDefense += defender->getSkillMod("dodge_attack");
-	targetDefense += defender->getSkillMod("private_dodge_attack");
+
+	// Prevent double-dipping stats for AI Agents. 
+    // This section is intended for food/state bonuses which are usually Player only.
+    if (defender->isPlayerCreature()) {
+        targetDefense += defender->getSkillMod("dodge_attack");
+        targetDefense += defender->getSkillMod("private_dodge_attack");
+    }
 
 	debug() << "Target defense after state affects and cap is " << targetDefense;
+	//StringBuffer msg;
+	//msg << "DEBUG AI DEFENSE: " << defender->getFirstName() << " checking targetDefense " << targetDefense;
+	//info(msg.toString(), true);
 
 	return targetDefense;
 }
 
 int CombatManager::getDefenderSecondaryDefenseModifier(CreatureObject* defender) const {
-	if (defender->isIntimidated() || defender->isBerserked() || defender->isVehicleObject())
-		return 0;
+    if (defender->isIntimidated() || defender->isBerserked() || defender->isVehicleObject())
+        return 0;
 
-	int targetDefense = defender->getLevel();
-	ManagedReference<WeaponObject*> weapon = defender->getWeapon();
+    int targetDefense = defender->getLevel();
+    ManagedReference<WeaponObject*> weapon = defender->getWeapon();
 
-	const auto defenseAccMods = weapon->getDefenderSecondaryDefenseModifiers();
+    const auto defenseAccMods = weapon->getDefenderSecondaryDefenseModifiers();
 
-	for (int i = 0; i < defenseAccMods->size(); ++i) {
-		const String& mod = defenseAccMods->get(i);
-		targetDefense += defender->getSkillMod(mod);
-		targetDefense += defender->getSkillMod("private_" + mod);
-	}
+    // Loop through weapon mods (Standard Logic)
+    for (int i = 0; i < defenseAccMods->size(); ++i) {
+        const String& mod = defenseAccMods->get(i);
 
-	if (targetDefense > 125)
-		targetDefense = 125;
+        if (defender->isAiAgent()) {
+            AiAgent* aiDef = cast<AiAgent*>(defender);
+            targetDefense += aiDef->getSkillMod(mod);
+            targetDefense += aiDef->getSkillMod("private_" + mod);
+        } else {
+            targetDefense += defender->getSkillMod(mod);
+            targetDefense += defender->getSkillMod("private_" + mod);
+        }
+    }
 
-	return targetDefense;
+    // --- AI FORCE BLOCK/DODGE ---
+    if (defender->isAiAgent()) {
+        // CRITICAL FIX: Cast to AiAgent* so we call the Child function (Lua stats), not the Parent function (0)
+        AiAgent* aiDef = cast<AiAgent*>(defender); 
+        
+        // If holding a Melee weapon (or Lightsaber), check BLOCK
+        if (weapon->isMeleeWeapon() || weapon->isJediWeapon()) {
+            targetDefense += aiDef->getSkillMod("block");
+        }
+        // If holding a Ranged weapon, check DODGE
+        else {
+             targetDefense += aiDef->getSkillMod("dodge");
+        }
+        
+        // Always check Counter Attack (some masters have this)
+        targetDefense += aiDef->getSkillMod("counter_attack");
+    }
+    // ----------------------------
+
+    //StringBuffer msg;
+    //msg << "DEBUG AI SECONDARY DEFENSE: " << defender->getFirstName() << " checking defenderDefense " << targetDefense;
+    //info(msg.toString(), true);
+
+    if (targetDefense > 125)
+        targetDefense = 125;
+
+    return targetDefense;
 }
 
 /*
@@ -2158,6 +2245,15 @@ int CombatManager::getHitChance(TangibleObject* attacker, CreatureObject* creoDe
 
 			if ((!attacker->isTurret() && attackMask != WeaponType::GRENADEWEAPON) && (attackType == SharedWeaponObjectTemplate::RANGEDATTACK || attackMask == WeaponType::HEAVYWEAPON)) {
 				evadeTotal = evadeSkill = creoDefender->getSkillMod("saber_block");
+
+				// --- LOGGING START ---
+                if (creoDefender->isAiAgent()) {
+                     StringBuffer msg;
+                     msg << "DEBUG DEFENSE: " << creoDefender->getDisplayedName() 
+                         << " Saber Block Chance: " << evadeTotal;
+                     creoDefender->info(msg.toString(), true);
+                }
+                // --- LOGGING END ---
 
 				if (evadeTotal > 0 && System::random(100) <= evadeTotal) {
 					hitResult = HitStatus::RICOCHET;
@@ -2260,50 +2356,136 @@ float CombatManager::hitChanceEquation(float attackerAccuracy, float targetDefen
 }
 
 int CombatManager::getSpeedModifier(CreatureObject* attacker, WeaponObject* weapon) const {
-	int speedMods = 0;
+    int speedMods = 0;
 
-	if (weapon != nullptr) {
-		const auto weaponSpeedMods = weapon->getSpeedModifiers();
+    if (weapon != nullptr) {
+        const auto weaponSpeedMods = weapon->getSpeedModifiers();
 
-		for (int i = 0; i < weaponSpeedMods->size(); ++i) {
-			speedMods += attacker->getSkillMod(weaponSpeedMods->get(i));
-		}
-	}
+        for (int i = 0; i < weaponSpeedMods->size(); ++i) {
+            String modName = weaponSpeedMods->get(i);
+            
+            // 1. Try standard lookup first
+            int val = attacker->getSkillMod(modName);
+			//attacker->info(true) << "DEBUG SPEED LOOKUP: val: " << val;
 
-	speedMods += attacker->getSkillMod("private_speed_bonus");
+            // 2. FIX: If standard lookup returned 0 and this is an AI, 
+            // force a direct look at the Template (bypass broken overrides)
+            if (val == 0 && attacker->isAiAgent()) {
+                AiAgent* ai = attacker->asAiAgent();
+                if (ai != nullptr) {
+                    const CreatureTemplate* templ = ai->getCreatureTemplate();
+                    if (templ != nullptr) {
+                        // Direct access to the data we verified exists
+                        val = templ->getStatistic(modName);
+                    }
 
-	if (weapon->getAttackType() == SharedWeaponObjectTemplate::MELEEATTACK) {
-		speedMods += attacker->getSkillMod("private_melee_speed_bonus");
-		speedMods += attacker->getSkillMod("melee_speed");
-	} else if (weapon->getAttackType() == SharedWeaponObjectTemplate::RANGEDATTACK) {
-		speedMods += attacker->getSkillMod("private_ranged_speed_bonus");
-		speedMods += attacker->getSkillMod("ranged_speed");
-	}
+                    // 3. Safety Net: If Template was also 0/missing, calculate based on Level
+                    if (val == 0) {
+                        val = attacker->getLevel() + 25;
+                        if (val > 100) val = 100;
+                    }
+                }
+            }
 
-	return speedMods;
+            speedMods += val;
+        }
+    }
+
+    speedMods += attacker->getSkillMod("private_speed_bonus");
+
+    if (weapon->getAttackType() == SharedWeaponObjectTemplate::MELEEATTACK) {
+        speedMods += attacker->getSkillMod("private_melee_speed_bonus");
+        speedMods += attacker->getSkillMod("melee_speed");
+    } else if (weapon->getAttackType() == SharedWeaponObjectTemplate::RANGEDATTACK) {
+        speedMods += attacker->getSkillMod("private_ranged_speed_bonus");
+        speedMods += attacker->getSkillMod("ranged_speed");
+    }
+
+    return speedMods;
+}
+
+float CombatManager::getDefenderToughnessModifier(CreatureObject* defender, int attackType, int damType, float damage) const {
+    ManagedReference<WeaponObject*> weapon = defender->getWeapon();
+    const auto defenseToughMods = weapon->getDefenderToughnessModifiers();
+
+    // 1. Check Weapon-specific toughness (Standard Logic)
+    if (attackType == weapon->getAttackType()) {
+        for (int i = 0; i < defenseToughMods->size(); ++i) {
+            String mod = defenseToughMods->get(i);
+            int toughMod = 0;
+
+            // FIX: Force AI Cast to read Lua
+            if (defender->isAiAgent()) {
+                toughMod = cast<AiAgent*>(defender)->getSkillMod(mod);
+            } else {
+                toughMod = defender->getSkillMod(mod);
+            }
+
+            if (toughMod > 0)
+                damage *= 1.f - (toughMod / 100.f);
+        }
+    }
+
+    // 2. Check Jedi Toughness
+    int jediToughness = 0;
+    
+    // FIX: Force AI Cast to read Lua for jedi_toughness
+    if (defender->isAiAgent()) {
+        jediToughness = cast<AiAgent*>(defender)->getSkillMod("jedi_toughness");
+    } else {
+        jediToughness = defender->getSkillMod("jedi_toughness");
+    }
+
+    if (damType != SharedWeaponObjectTemplate::LIGHTSABER && jediToughness > 0)
+        damage *= 1.f - (jediToughness / 100.f);
+
+    // 3. Code for Lightsaber Toughness
+    //if (damType == SharedWeaponObjectTemplate::LIGHTSABER) {
+    //    int lsToughness = 0;
+//
+    //    // FIX: Force AI Cast to read Lua for lightsaber_toughness
+    //    if (defender->isAiAgent()) {
+    //        lsToughness = cast<AiAgent*>(defender)->getSkillMod("lightsaber_toughness");
+    //        
+    //        // Debug Log to prove it works
+    //        if (lsToughness > 0 && (defender->getFirstName().contains("Jedi") || defender->getLastName().contains("Jedi"))) {
+    //             // Uncomment if you want to see it in console:
+    //             // StringBuffer msg;
+    //             // msg << "DEBUG TOUGHNESS: AI " << defender->getFirstName() << " reducing saber damage by " << lsToughness << "%";
+    //             // cast<AiAgent*>(defender)->info(msg.toString(), true);
+    //        }
+    //    } else {
+    //        lsToughness = defender->getSkillMod("lightsaber_toughness");
+    //    }
+//
+    //    if (lsToughness > 0)
+    //         damage *= 1.f - (lsToughness / 100.f);
+    //}
+
+    return damage < 0 ? 0 : damage;
 }
 
 // Toughness Mitigation
 
-float CombatManager::getDefenderToughnessModifier(CreatureObject* defender, int attackType, int damType, float damage) const {
-	ManagedReference<WeaponObject*> weapon = defender->getWeapon();
-
-	const auto defenseToughMods = weapon->getDefenderToughnessModifiers();
-
-	if (attackType == weapon->getAttackType()) {
-		for (int i = 0; i < defenseToughMods->size(); ++i) {
-			int toughMod = defender->getSkillMod(defenseToughMods->get(i));
-			if (toughMod > 0)
-				damage *= 1.f - (toughMod / 100.f);
-		}
-	}
-
-	int jediToughness = defender->getSkillMod("jedi_toughness");
-	if (damType != SharedWeaponObjectTemplate::LIGHTSABER && jediToughness > 0)
-		damage *= 1.f - (jediToughness / 100.f);
-
-	return damage < 0 ? 0 : damage;
-}
+//float CombatManager::getDefenderToughnessModifier(CreatureObject* defender, int attackType, int damType, float damage) const {
+//	ManagedReference<WeaponObject*> weapon = defender->getWeapon();
+//
+//	const auto defenseToughMods = weapon->getDefenderToughnessModifiers();
+//
+//	if (attackType == weapon->getAttackType()) {
+//		for (int i = 0; i < defenseToughMods->size(); ++i) {
+//			int toughMod = defender->getSkillMod(defenseToughMods->get(i));
+//			if (toughMod > 0)
+//				damage *= 1.f - (toughMod / 100.f);
+//		}
+//	}
+//
+//	int jediToughness = defender->getSkillMod("jedi_toughness");
+//	if (damType != SharedWeaponObjectTemplate::LIGHTSABER && jediToughness > 0)
+//		damage *= 1.f - (jediToughness / 100.f);
+//
+//	return damage < 0 ? 0 : damage;
+//}
 
 /*
 
@@ -2827,19 +3009,31 @@ float CombatManager::doObjectDetonation(TangibleObject* attackerTanO, CreatureOb
 // Calculate Weapon Speed
 
 float CombatManager::calculateWeaponAttackSpeed(CreatureObject* attacker, WeaponObject* weapon, float skillSpeedRatio) const {
-	if (weapon == nullptr) {
-		return 4.0f;
-	}
+    if (weapon == nullptr) {
+        return 4.0f;
+    }
 
-	int speedMod = getSpeedModifier(attacker, weapon);
-	float jediSpeed = attacker->getSkillMod("combat_haste") / 100.0f;
+    int speedMod = getSpeedModifier(attacker, weapon);
+    float jediSpeed = attacker->getSkillMod("combat_haste") / 100.0f;
 
-	float attackSpeed = (1.0f - ((float)speedMod / 100.0f)) * skillSpeedRatio * weapon->getAttackSpeed();
+    // --- DEBUG START ---
+    //if (attacker->isAiAgent()) {
+    //    StringBuffer msg;
+    //    msg << "DEBUG SPEED CALC: " << attacker->getDisplayedName()
+    //        << " | Base Weapon Speed: " << weapon->getAttackSpeed()
+    //        << " | Speed Mods Found: " << speedMod
+    //        << " | Command Multiplier: " << skillSpeedRatio
+    //        << " | Jedi Haste: " << jediSpeed;
+    //    attacker->info(msg.toString(), true);
+    //}
+    // --- DEBUG END ---
 
-	if (jediSpeed > 0)
-		attackSpeed = attackSpeed - (attackSpeed * jediSpeed);
+    float attackSpeed = (1.0f - ((float)speedMod / 100.0f)) * skillSpeedRatio * weapon->getAttackSpeed();
 
-	return Math::max(attackSpeed, 1.0f);
+    if (jediSpeed > 0)
+        attackSpeed = attackSpeed - (attackSpeed * jediSpeed);
+
+    return Math::max(attackSpeed, 1.0f);
 }
 
 // Fly Text - Miss, Counterattack, Block, Hit Location
@@ -2994,7 +3188,10 @@ void CombatManager::applyStates(CreatureObject* creature, CreatureObject* target
 				playerLevel = pManager->calculatePlayerLevel(targetCreature) - 5;
 			}
 		}
-	}
+	} else if (targetCreature->isAiAgent()) {
+        // AI Agents get their full level as a defense bonus against states
+        playerLevel = targetCreature->getLevel() - 5;
+    }
 
 #ifdef DEBUG_STATES
 	StringBuffer stateDebug;
@@ -3046,9 +3243,16 @@ void CombatManager::applyStates(CreatureObject* creature, CreatureObject* target
 			const Vector<String>& defenseMods = effect.getDefenderStateDefenseModifiers();
 			// add up all defenses against the state the target has
 			for (int j = 0; j < defenseMods.size(); j++) {
-				targetDefense += targetCreature->getSkillMod(defenseMods.get(j));
-			}
-
+                const String& mod = defenseMods.get(j);
+                
+                if (targetCreature->isAiAgent()) {
+                    AiAgent* aiDef = cast<AiAgent*>(targetCreature);
+                    targetDefense += aiDef->getSkillMod(mod);
+                } else {
+                    targetDefense += targetCreature->getSkillMod(mod);
+                }
+            }
+		
 #ifdef DEBUG_STATES
 			stateDebug << " - Target Defense Base = " << targetDefense << "\n";
 #endif
@@ -3088,24 +3292,49 @@ void CombatManager::applyStates(CreatureObject* creature, CreatureObject* target
 			}
 
 			// no reason to apply jedi defenses if primary defense was successful
-			// and only perform extra rolls if the character is a Jedi
-			if (!failed && targetCreature->isPlayerCreature() && targetCreature->getPlayerObject()->isJedi()) {
-				const Vector<String>& jediMods = effect.getDefenderJediStateDefenseModifiers();
-				// second chance for jedi, roll against their special defenses jedi_state_defense & resistance_states
-				for (int j = 0; j < jediMods.size(); j++) {
-					targetDefense = targetCreature->getSkillMod(jediMods.get(j));
+            // and only perform extra rolls if the character is a Jedi OR a high-level AI setup as a Jedi
+            bool isJediPlayer = targetCreature->isPlayerCreature() && targetCreature->getPlayerObject()->isJedi();
+            bool isJediAI = false;
+            
+            // For AI, we check if they have the specific "Jedi" state defense stat in their Lua
+            if (targetCreature->isAiAgent()) {
+                 // Check using the override we built
+                 if (cast<AiAgent*>(targetCreature)->getSkillMod("jedi_state_defense") > 0) {
+                     isJediAI = true;
+                 }
+            }
 
-					targetDefense /= 1.5;
-					targetDefense += playerLevel;
+            if (!failed && (isJediPlayer || isJediAI)) {
+                const Vector<String>& jediMods = effect.getDefenderJediStateDefenseModifiers();
+                
+                // second chance for jedi, roll against their special defenses jedi_state_defense & resistance_states
+                for (int j = 0; j < jediMods.size(); j++) {
+                    String mod = jediMods.get(j);
+                    
+                    // --- FORCE AI CAST ---
+                    if (targetCreature->isAiAgent()) {
+                        targetDefense = cast<AiAgent*>(targetCreature)->getSkillMod(mod);
+                    } else {
+                        targetDefense = targetCreature->getSkillMod(mod);
+                    }
+                    // ---------------------
 
-					calc = (int)(accuracyMod - targetDefense);
+                    targetDefense /= 1.5;
 
-					if (roll > calc) {
-						failed = true;
-						break;
-					}
-				}
-			}
+                    calc = (int)(accuracyMod - targetDefense);
+
+                    if (roll > calc) {
+                        failed = true;
+                        
+                        // Debugging to see the "Second Chance" save the AI
+                        if (isJediAI && (cast<AiAgent*>(targetCreature)->getFirstName().contains("Jedi") || cast<AiAgent*>(targetCreature)->getLastName().contains("Jedi"))) {
+                             cast<AiAgent*>(targetCreature)->info("DEBUG STATE: Jedi State Defense Triggered! Resisted state via Second Chance.", true);
+                        }
+                        
+                        break;
+                    }
+                }
+            }
 		}
 
 		if (!failed) {
@@ -3161,7 +3390,12 @@ void CombatManager::applyStates(CreatureObject* creature, CreatureObject* target
 
 		// now check combat equilibrium
 		if (!failed && (effectType == CommandEffect::KNOCKDOWN || effectType == CommandEffect::POSTUREDOWN || effectType == CommandEffect::POSTUREUP)) {
-			int combatEquil = targetCreature->getSkillMod("combat_equillibrium");
+			int combatEquil = 0;
+            if (targetCreature->isAiAgent()) {
+                 combatEquil = cast<AiAgent*>(targetCreature)->getSkillMod("combat_equillibrium");
+            } else {
+                 combatEquil = targetCreature->getSkillMod("combat_equillibrium");
+            }
 
 			if (combatEquil > 100) {
 				combatEquil = 100;

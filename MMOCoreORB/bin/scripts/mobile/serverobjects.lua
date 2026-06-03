@@ -46,5 +46,8 @@ includeFile("lair/serverobjects.lua")
 -- Outfits
 includeFile("outfits/serverobjects.lua")
 
+-- Force load the AI script
+includeFile("light_jedi_padawan.lua")
+
 -- Custom content - Loads last to allow for overrides
 includeFile("../custom_scripts/mobile/serverobjects.lua")

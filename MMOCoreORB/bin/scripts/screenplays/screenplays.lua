@@ -275,6 +275,7 @@ includeFile("jedi/padawan/convos/padawan_spice_mom_02_conv_handler.lua")
 includeFile("jedi/padawan/convos/padawan_surveyor_01_conv_handler.lua")
 includeFile("jedi/padawan/convos/padawan_the_ring_01_conv_handler.lua")
 includeFile("jedi/padawan/convos/padawan_the_ring_02_conv_handler.lua")
+includeFile("jedi/padawan/convos/padawanConvoHandler.lua")
 
 -- Jedi Objects
 includeFile("jedi/components/ForceShrineMenuComponent.lua")
@@ -732,4 +733,8 @@ includeFile("events/ServerEventAutomation.lua")
 
 -- Custom content - Loads last to allow for overrides
 includeFile("custom/market_seeder.lua")
+includeFile("custom/aiGlobalChatHandler.lua")
+includeFile("custom/smartDoctorBuffer.lua")
+includeFile("custom/smartDancerBuffer.lua")
+includeFile("custom/smartMusicianBuffer.lua")
 includeFile("../custom_scripts/screenplays/screenplays.lua")

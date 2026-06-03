@@ -862,6 +862,10 @@ void EntertainingSessionImplementation::activateEntertainerBuff(CreatureObject* 
 		if (creature->isIncapacitated() || creature->isDead()) {
 			return;
 		}
+		
+		PlayerObject* ghost = creature->getPlayerObject(); // creature here is the entertainer that owns the session
+		if (ghost == nullptr)
+		    return;
 
 		if (!canGiveEntertainBuff())
 			return;

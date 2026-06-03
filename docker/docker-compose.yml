@@ -1,0 +1,53 @@
+services:
+  swgemu:
+    build: .
+    container_name: swgemu_server # We are giving it a fixed name
+    hostname: swgemu
+    restart: unless-stopped
+    stdin_open: true # mimics -i
+    tty: true        # mimics -t
+    cap_add:
+      - SYS_PTRACE
+    # Load your existing environment variables
+    env_file:
+      - ./env-base
+      - ./env-run
+    ports:
+      - "44455:44455/tcp"
+      - "44453:44453/udp"
+      - "44462:44462/udp"
+      - "44463:44463/udp"
+      - "44443:44443/tcp"
+      - "44480:44480/tcp"
+      - "2222:2222/tcp"
+    volumes:
+      # CRITICAL: This connects to your existing data
+      - swgemu-core3:/home/swgemu
+      # Maps your tre files (read-only as per your script)
+      - shared-tre:/tre:ro
+    networks:
+      - swg_net
+
+  # The AI Brain (Ollama)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama_brain
+    restart: always
+    volumes:
+      - ollama_storage:/root/.ollama
+    networks:
+      - swg_net
+
+# Create the bridge network so they can talk
+networks:
+  swg_net:
+    driver: bridge
+
+# define the volumes
+volumes:
+  ollama_storage:
+  # We tell Docker these volumes already exist so it doesn't try to wipe them
+  swgemu-core3:
+    external: true
+  shared-tre:
+    external: true

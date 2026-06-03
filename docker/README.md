@@ -15,3 +15,12 @@ The container publishes the LAN ports required by SWGEmu clients:
 | Web (HTTP) | TCP | 44480 |
 
 If you customise `env-run`, keep these mappings intact so other devices on your network can connect.
+
+docker volume create swgemu-core3
+docker compose up -d --build
+- Immediately attach to catch the passwords
+docker attach swgemu_server
+
+- Join console
+docker attach swgemu_server
+docker exec -it -u swgemu swgemu_server bash
