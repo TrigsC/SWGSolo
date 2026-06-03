@@ -21,7 +21,16 @@ local SmartDoctorDialogue = {}
 
 -- Toggle LLM flavor usage.
 -- If false or AiBrain isn't available, we use deterministic lines.
-local USE_LLM_FLAVOR = true
+local USE_LLM_FLAVOR = false
+
+do
+    local ok, cfg = pcall(require, "custom_scripts.ai_config")
+    if ok and cfg ~= nil and cfg.smartDoctor ~= nil then
+        USE_LLM_FLAVOR = (cfg.smartDoctor.llmFlavorEnabled == true)
+    elseif AiConfig ~= nil and AiConfig.smartDoctor ~= nil then
+        USE_LLM_FLAVOR = (AiConfig.smartDoctor.llmFlavorEnabled == true)
+    end
+end
 
 local AiBrain = nil
 do
@@ -161,11 +170,10 @@ end
 -- Public API
 function SmartDoctorDialogue.getLine(key, slots, memoryTopic)
     -- Try LLM flavor first (if available and safe), then fall back deterministic.
-    -- TODO: UNCOMMENT THIS LINE FOR LLM USE
-    --local line = llmFlavor(key, slots, memoryTopic)
-    --if line ~= nil and line ~= "" then
-    --    return line
-    --end
+    local line = llmFlavor(key, slots, memoryTopic)
+    if line ~= nil and line ~= "" then
+        return line
+    end
     return deterministic(key, slots, memoryTopic)
 end
 

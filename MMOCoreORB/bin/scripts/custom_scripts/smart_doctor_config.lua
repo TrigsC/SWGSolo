@@ -29,9 +29,9 @@ SmartDoctorConfig.doctor_custom_name = "Doc Buffer"
 SmartDoctorConfig.spawn_points = {
   {
     planet = "corellia",
-    x = -153,
+    x = -71,
     z = 28,
-    y = -4723,
+    y = -4443,
     heading = 90,
     cell = 0,
     customName = "Doc Buffer"

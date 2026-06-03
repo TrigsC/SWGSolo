@@ -6,6 +6,7 @@
 --  - When a player "watches" it, apply performance mind buff instantly
 
 local ObjectManager = require("managers.object.object_manager")
+local AiAgentBridge = require("custom_scripts.ai_agent_bridge")
 
 SmartDancerConfig = SmartDancerConfig or {}
 
@@ -96,10 +97,7 @@ function SmartDancerBuffer:start()
                 safeSetCustomObjectName(pMob, sp.customName or "Dancer Buffer")
 
                 -- Start dancing
-                local agent = LuaAiAgent(pMob)
-                if agent ~= nil and agent.startDancingByName ~= nil then
-                    agent:startDancingByName(SmartDancerConfig.danceName)
-                end
+                AiAgentBridge.startDance(pMob, SmartDancerConfig.danceName)
 
                 -- Watch observer: when players watch this NPC, buff them
                 createObserver(WASWATCHED, "SmartDancerBuffer", "notifyWatched", pMob, 1)
@@ -119,10 +117,7 @@ function SmartDancerBuffer:keepDancing(pMob)
     if c == nil then return end
 
     if not c:isDancing() then
-        local agent = LuaAiAgent(pMob)
-        if agent ~= nil and agent.startDancingByName ~= nil then
-            agent:startDancingByName(SmartDancerConfig.danceName)
-        end
+        AiAgentBridge.startDance(pMob, SmartDancerConfig.danceName)
     end
 
     createEvent(SmartDancerConfig.keepDancingHeartbeatMs, "SmartDancerBuffer", "keepDancing", pMob, "")
@@ -137,14 +132,15 @@ function SmartDancerBuffer:notifyWatched(pNpc, pWatcher)
         return 0
     end
 
-    local agent = LuaAiAgent(pNpc)
-    if agent == nil or agent.applyDanceMindBuff == nil then
+    if not AiAgentBridge.hasMethod(pNpc, "applyDanceMindBuff") then
         return 0
     end
     
     -- wipe only dance (and BF+wounds)
-    agent:wipeEnhanceBuffs(pWatcher, 2)
-    agent:applyDanceMindBuff(pWatcher, SmartDancerConfig.buffAmount, SmartDancerConfig.buffDuration)
+    AiAgentBridge.wipeDanceBuffs(pNpc, pWatcher)
+    if not AiAgentBridge.applyDanceMindBuff(pNpc, pWatcher, SmartDancerConfig.buffAmount, SmartDancerConfig.buffDuration) then
+        return 0
+    end
 
     -- optional flavor message
     CreatureObject(pWatcher):sendSystemMessage("You feel your mind sharpen as you watch the dancer.")

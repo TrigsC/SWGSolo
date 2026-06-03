@@ -7,6 +7,7 @@
 --  - When a player "listens" to it, apply buffs instantly
 
 local ObjectManager = require("managers.object.object_manager")
+local AiAgentBridge = require("custom_scripts.ai_agent_bridge")
 
 SmartMusicianConfig = SmartMusicianConfig or {}
 
@@ -128,10 +129,7 @@ function SmartMusicianBuffer:start()
 
                 giveAndEquipInstrument(pMob)
 
-                local agent = LuaAiAgent(pMob)
-                if agent ~= nil and agent.startPlayingMusicByName ~= nil then
-                    agent:startPlayingMusicByName(SmartMusicianConfig.songName)
-                end
+                AiAgentBridge.startMusic(pMob, SmartMusicianConfig.songName)
 
                 createObserver(WASLISTENEDTO, "SmartMusicianBuffer", "notifyListened", pMob, 1)
                 createEvent(SmartMusicianConfig.keepPlayingHeartbeatMs, "SmartMusicianBuffer", "keepPlaying", pMob, "")
@@ -151,10 +149,7 @@ function SmartMusicianBuffer:keepPlaying(pMob)
         giveAndEquipInstrument(pMob)
         print("[MUSICIAN]: keepPlaying - c:is not playing")
 
-        local agent = LuaAiAgent(pMob)
-        if agent ~= nil and agent.startPlayingMusicByName ~= nil then
-            agent:startPlayingMusicByName(SmartMusicianConfig.songName)
-        end
+        AiAgentBridge.startMusic(pMob, SmartMusicianConfig.songName)
     end
 
     createEvent(SmartMusicianConfig.keepPlayingHeartbeatMs, "SmartMusicianBuffer", "keepPlaying", pMob, "")
@@ -168,14 +163,15 @@ function SmartMusicianBuffer:notifyListened(pNpc, pListener)
         return 0
     end
 
-    local agent = LuaAiAgent(pNpc)
-    if agent == nil or agent.applyMusicBuffs == nil then
+    if not AiAgentBridge.hasMethod(pNpc, "applyMusicBuffs") then
         return 0
     end
     
     -- wipe only music (and BF+wounds)
-    agent:wipeEnhanceBuffs(pListener, 4)
-    agent:applyMusicBuffs(pListener, SmartMusicianConfig.buffAmount, SmartMusicianConfig.buffDuration)
+    AiAgentBridge.wipeMusicBuffs(pNpc, pListener)
+    if not AiAgentBridge.applyMusicBuffs(pNpc, pListener, SmartMusicianConfig.buffAmount, SmartMusicianConfig.buffDuration) then
+        return 0
+    end
     CreatureObject(pListener):sendSystemMessage("You feel inspired by the music.")
     return 0
 end
