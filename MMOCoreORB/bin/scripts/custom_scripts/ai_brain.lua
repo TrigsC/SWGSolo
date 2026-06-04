@@ -1,7 +1,7 @@
 local AiBrain = {}
 
 local DEFAULT_LLM_CONFIG = {
-    enabled = false,
+    enabled = true,
     url = nil,
     model = nil,
     timeoutSeconds = 3,
