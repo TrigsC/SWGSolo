@@ -8,11 +8,26 @@ AiAgentBridge.WIPE_MEDICAL = 1
 AiAgentBridge.WIPE_DANCE = 2
 AiAgentBridge.WIPE_MUSIC = 4
 
+local AiLogger = nil
+do
+    local ok, logger = pcall(require, "custom_scripts.ai_logger")
+    if ok and logger ~= nil then
+        AiLogger = logger
+    else
+        AiLogger = {
+            warn = function() end,
+            debug = function() end,
+            trace = function() end
+        }
+    end
+end
+
 local function getAgent(pNpc)
     if pNpc == nil then return nil end
 
     local ok, agent = pcall(LuaAiAgent, pNpc)
     if not ok or agent == nil then
+        AiLogger.warn("bridge", "LuaAiAgent construction failed: " .. tostring(agent))
         return nil
     end
 
@@ -30,6 +45,9 @@ function AiAgentBridge.hasMethod(pNpc, methodName)
     end
 
     local ok, fn = pcall(function() return agent[methodName] end)
+    if not ok then
+        AiLogger.debug("bridge", "Failed to inspect LuaAiAgent method " .. tostring(methodName) .. ".")
+    end
     return ok and fn ~= nil
 end
 
@@ -45,10 +63,14 @@ local function callAgentMethod(pNpc, methodName, ...)
 
     local okGet, fn = pcall(function() return agent[methodName] end)
     if not okGet or fn == nil then
+        AiLogger.debug("bridge", "LuaAiAgent method unavailable: " .. tostring(methodName))
         return false
     end
 
-    local okCall = pcall(fn, agent, ...)
+    local okCall, err = pcall(fn, agent, ...)
+    if not okCall then
+        AiLogger.warn("bridge", "LuaAiAgent method failed: " .. tostring(methodName) .. " error=" .. tostring(err))
+    end
     return okCall == true
 end
 

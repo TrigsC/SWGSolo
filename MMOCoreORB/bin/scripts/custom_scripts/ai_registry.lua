@@ -98,31 +98,51 @@ function AiRegistry.getProfile(pCreature)
     if (pCreature == nil) then return nil end
 
     -- 1. SAFETY CHECK: Is this a Player?
-    if (SceneObject(pCreature):isPlayerCreature()) then
+    local okIsPlayer, isPlayer = pcall(function()
+        return SceneObject(pCreature):isPlayerCreature()
+    end)
+    if (not okIsPlayer or isPlayer) then
         return nil
     end
 
     -- 2. SAFETY CHECK: Is this an AI?
-    if (not SceneObject(pCreature):isAiAgent()) then
+    local okIsAi, isAi = pcall(function()
+        return SceneObject(pCreature):isAiAgent()
+    end)
+    if (not okIsAi or not isAi) then
         return nil
     end
 
     -- 3. Try to find by Internal Mob Name
-    local agent = LuaAiAgent(pCreature)
-    local mobName = agent:getCreatureTemplateName()
+    local okAgent, agent = pcall(LuaAiAgent, pCreature)
+    if (not okAgent or agent == nil) then
+        return nil
+    end
+
+    local okMobName, mobName = pcall(function()
+        return agent:getCreatureTemplateName()
+    end)
 
     -- CHECK IF NAME IS VALID
-    if (mobName ~= nil and AiRegistry.mobMap[mobName]) then
+    if (okMobName and mobName ~= nil and AiRegistry.mobMap[mobName]) then
         return AiRegistry.profiles[AiRegistry.mobMap[mobName]]
     end
 
     -- 4. Fallback: Try to find by IFF File Path
-    local templatePath = SceneObject(pCreature):getTemplateObjectPath()
-    if (templatePath ~= nil and AiRegistry.templateMap[templatePath]) then
+    local okTemplatePath, templatePath = pcall(function()
+        return SceneObject(pCreature):getTemplateObjectPath()
+    end)
+    if (okTemplatePath and templatePath ~= nil and AiRegistry.templateMap[templatePath]) then
         return AiRegistry.profiles[AiRegistry.templateMap[templatePath]]
     end
 
     return nil
+end
+
+function AiRegistry.getProfileByTemplate(profileKey)
+    if (profileKey == nil) then return nil end
+
+    return AiRegistry.profiles[tostring(profileKey)]
 end
 
 return AiRegistry

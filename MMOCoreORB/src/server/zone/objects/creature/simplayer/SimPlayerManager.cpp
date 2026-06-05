@@ -613,6 +613,8 @@ void SimPlayerManager::cyclePvPBotWhenShuttleReady(uint64 oldOid,
         return;
     }
 
+    bool cleanupOldAgent = false;
+
     {
         Locker locker(oldAgent);
         // If the bot died while waiting, stop the loop and clean up.
@@ -621,6 +623,39 @@ void SimPlayerManager::cyclePvPBotWhenShuttleReady(uint64 oldOid,
             info("cyclePvPBotWhenShuttleReady: old bot is dead/incap; cleaning up oldOid=" +
                  String::valueOf(oldOid), true);
 #endif
+            cleanupOldAgent = true;
+        }
+    }
+
+    if (cleanupOldAgent) {
+        controllers.drop(oldOid);
+
+        // If you want NO corpses/loot for simplayers:
+        oldAgent->destroyObjectFromWorld(true);
+        oldAgent->destroyObjectFromDatabase(true);
+
+        return;
+    }
+
+    // Do not hold the bot lock while checking PlanetManager/shuttle state.
+    if (!isNearestShuttleBoardable(oldAgent)) {
+        {
+            Locker locker(oldAgent);
+
+            if (oldAgent->isDead() || oldAgent->isIncapacitated()) {
+#ifdef DEBUG_SIMPLAYER
+                info("cyclePvPBotWhenShuttleReady: old bot died while waiting for shuttle oldOid=" +
+                     String::valueOf(oldOid), true);
+#endif
+                cleanupOldAgent = true;
+            } else {
+                // Optional: make it look like it’s waiting
+                oldAgent->setMovementState(AiAgent::OBLIVIOUS);
+                oldAgent->activateAiBehavior(true);
+            }
+        }
+
+        if (cleanupOldAgent) {
             controllers.drop(oldOid);
 
             // If you want NO corpses/loot for simplayers:
@@ -630,21 +665,15 @@ void SimPlayerManager::cyclePvPBotWhenShuttleReady(uint64 oldOid,
             return;
         }
 
-        if (!isNearestShuttleBoardable(oldAgent)) {
-            // Optional: make it look like it’s waiting
-            oldAgent->setMovementState(AiAgent::OBLIVIOUS);
-            oldAgent->activateAiBehavior(true);
+        Core::getTaskManager()->scheduleTask(
+            [this, oldOid, groupType, templateName, imperial, fromPlanet, fromLocation, attempts]() {
+                this->cyclePvPBotWhenShuttleReady(oldOid, groupType, templateName, imperial, fromPlanet, fromLocation, attempts + 1);
+            },
+            "SimPvPWaitForShuttle",
+            5000
+        );
 
-            Core::getTaskManager()->scheduleTask(
-                [this, oldOid, groupType, templateName, imperial, fromPlanet, fromLocation, attempts]() {
-                    this->cyclePvPBotWhenShuttleReady(oldOid, groupType, templateName, imperial, fromPlanet, fromLocation, attempts + 1);
-                },
-                "SimPvPWaitForShuttle",
-                5000
-            );
-
-            return;
-        }
+        return;
     }
 
     // Shuttle is boardable now — do the real cycle
@@ -808,12 +837,17 @@ void SimPlayerManager::cyclePvPBot(uint64 oldOid,
         if (oldAgent == nullptr)
             return;
 
-        Locker locker(oldAgent);
-        if (oldAgent->isDead() || oldAgent->isIncapacitated()) {
+        bool oldAgentDeadOrIncap = false;
+
+        {
+            Locker locker(oldAgent);
+            oldAgentDeadOrIncap = oldAgent->isDead() || oldAgent->isIncapacitated();
+        }
+
+        if (oldAgentDeadOrIncap) {
 #ifdef DEBUG_SIMPLAYER
             info("cyclePvPBot: old bot already dead/incap; destroying oldOid=" + String::valueOf(oldOid), true);
 #endif
-            controllers.drop(oldOid);
             oldAgent->destroyObjectFromWorld(true);
             oldAgent->destroyObjectFromDatabase(true);
             return;

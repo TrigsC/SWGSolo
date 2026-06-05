@@ -6,8 +6,34 @@
 --   - Otherwise keep your existing recruiter logic and standard AiBrain chat logic intact.
 
 local ObjectManager = require("managers.object.object_manager")
-local AiRegistry = require("custom_scripts.ai_registry")
-local recruiterScreenplay = require("screenplays.gcw.recruiters.recruiterScreenplay")
+local okRegistry, AiRegistry = pcall(require, "custom_scripts.ai_registry")
+if not okRegistry or AiRegistry == nil then
+    AiRegistry = {
+        getProfile = function() return nil end,
+        getProfileByTemplate = function() return nil end
+    }
+end
+
+local okRecruiter, recruiterScreenplay = pcall(require, "screenplays.gcw.recruiters.recruiterScreenplay")
+if not okRecruiter then
+    recruiterScreenplay = nil
+end
+
+local AiLogger = nil
+do
+    local ok, logger = pcall(require, "custom_scripts.ai_logger")
+    if ok and logger ~= nil then
+        AiLogger = logger
+    else
+        AiLogger = {
+            error = function() end,
+            warn = function() end,
+            info = function() end,
+            debug = function() end,
+            trace = function() end
+        }
+    end
+end
 
 local AiBrain = nil
 do
@@ -15,7 +41,7 @@ do
     if ok and brain ~= nil then
         AiBrain = brain
     else
-        print("[AI Global] WARN: custom_scripts.ai_brain unavailable; using deterministic AI fallbacks.")
+        AiLogger.warn("chat", "custom_scripts.ai_brain unavailable; using deterministic AI fallbacks.")
         AiBrain = {
             getChatResponse = function()
                 return "..."
@@ -54,6 +80,16 @@ local FactionRanks = {
 
 local AI_RANGE = 20
 
+local function safeCall(defaultValue, fn)
+    local ok, result = pcall(fn)
+    if ok then
+        return result
+    end
+
+    AiLogger.debug("chat", "Safe call failed: " .. tostring(result))
+    return defaultValue
+end
+
 AiGlobalChatHandler = ScreenPlay:new {}
 
 registerScreenPlay("AiGlobalChatHandler", true)
@@ -62,7 +98,7 @@ registerScreenPlay("AiGlobalChatHandler", true)
 -- 1. STARTUP & LOGIN LOGIC
 ----------------------------------------------------------------------
 function AiGlobalChatHandler:start()
-    print("[AI Global] Handler Started.")
+    AiLogger.info("chat", "Global chat handler started.")
 end
 
 -- 2. LOGIN HANDLER
@@ -70,19 +106,20 @@ function AiGlobalChatHandler:onPlayerLoggedIn(pPlayer)
 
     -- Safety Check 1: Did we get a valid object?
     if (pPlayer == nil) then
-        print("[AI Global] ERROR: onPlayerLoggedIn received nil player!")
+        AiLogger.error("chat", "onPlayerLoggedIn received nil player.")
         return 0
     end
 
     -- Safety Check 2: Is it actually a scene object?
-    local pSceneObject = LuaSceneObject(pPlayer)
+    local pSceneObject = safeCall(nil, function() return LuaSceneObject(pPlayer) end)
     if (pSceneObject == nil) then
         return 0
     end
 
     -- Call the internal function using COLON because we are inside Lua now
-    AiGlobalChatHandler:registerObservers(pPlayer)
-    print("[AI Global] Chat Observer attached to " .. pSceneObject:getCustomObjectName())
+    safeCall(nil, function() AiGlobalChatHandler:registerObservers(pPlayer) end)
+    local playerName = safeCall("unknown", function() return pSceneObject:getCustomObjectName() end)
+    AiLogger.debug("chat", "Chat observer attached to " .. tostring(playerName))
 
     return 0
 end
@@ -91,26 +128,30 @@ function AiGlobalChatHandler:registerObservers(pPlayer)
     if (pPlayer == nil) then return end
 
     -- Drop then Create to avoid duplicates or crashes
-    dropObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
-    createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer)
+    safeCall(nil, function() dropObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer) end)
+    safeCall(nil, function() createObserver(SPATIALCHATSENT, "AiGlobalChatHandler", "notifySpatialChatSent", pPlayer) end)
 end
 
 function AiGlobalChatHandler:getWorldDistance(pObj1, pObj2)
     if (pObj1 == nil or pObj2 == nil) then return math.huge end
 
     -- Force cast to SceneObject safely
-    local scno1 = LuaSceneObject(pObj1)
-    local scno2 = LuaSceneObject(pObj2)
+    local scno1 = safeCall(nil, function() return LuaSceneObject(pObj1) end)
+    local scno2 = safeCall(nil, function() return LuaSceneObject(pObj2) end)
 
     if (scno1 == nil or scno2 == nil) then return math.huge end
 
-    local x1 = scno1:getWorldPositionX()
-    local y1 = scno1:getWorldPositionY()
-    local z1 = scno1:getWorldPositionZ()
+    local x1 = safeCall(nil, function() return scno1:getWorldPositionX() end)
+    local y1 = safeCall(nil, function() return scno1:getWorldPositionY() end)
+    local z1 = safeCall(nil, function() return scno1:getWorldPositionZ() end)
 
-    local x2 = scno2:getWorldPositionX()
-    local y2 = scno2:getWorldPositionY()
-    local z2 = scno2:getWorldPositionZ()
+    local x2 = safeCall(nil, function() return scno2:getWorldPositionX() end)
+    local y2 = safeCall(nil, function() return scno2:getWorldPositionY() end)
+    local z2 = safeCall(nil, function() return scno2:getWorldPositionZ() end)
+
+    if (x1 == nil or y1 == nil or z1 == nil or x2 == nil or y2 == nil or z2 == nil) then
+        return math.huge
+    end
 
     local dx = x1 - x2
     local dy = y1 - y2
@@ -122,22 +163,25 @@ end
 function AiGlobalChatHandler:getPlayerContext(pPlayer)
     if (pPlayer == nil) then return "" end
 
-    local pCreature = CreatureObject(pPlayer)
-    local name = pCreature:getFirstName()
+    local pCreature = safeCall(nil, function() return CreatureObject(pPlayer) end)
+    if (pCreature == nil) then return "" end
+
+    local name = safeCall("unknown", function() return pCreature:getFirstName() end)
+    if (name == nil or name == "") then name = "unknown" end
 
     -- 1. FACTION
     local faction = "Civilian"
-    if (pCreature:isRebel()) then faction = "Rebel" end
-    if (pCreature:isImperial()) then faction = "Imperial" end
+    if (safeCall(false, function() return pCreature:isRebel() end)) then faction = "Rebel" end
+    if (safeCall(false, function() return pCreature:isImperial() end)) then faction = "Imperial" end
 
     -- 2. RANK
     local rankTitle = ""
     if (faction ~= "Civilian") then
-        local rankID = pCreature:getFactionRank()
+        local rankID = safeCall(0, function() return pCreature:getFactionRank() end)
         if (FactionRanks[rankID]) then
             rankTitle = FactionRanks[rankID]
         else
-            rankTitle = "Rank " .. rankID
+            rankTitle = "Rank " .. tostring(rankID)
         end
     end
 
@@ -151,7 +195,7 @@ function AiGlobalChatHandler:getPlayerContext(pPlayer)
     end
 
     -- 4. JEDI CHECK
-    if (pCreature:hasSkill("force_title_jedi_novice")) then
+    if (safeCall(false, function() return pCreature:hasSkill("force_title_jedi_novice") end)) then
         context = context .. " They appear to be force sensitive."
     end
 
@@ -161,10 +205,12 @@ end
 function AiGlobalChatHandler:getNpcContext(pTarget)
     if (pTarget == nil) then return "" end
 
-    local name = SceneObject(pTarget):getDisplayedName()
+    local name = safeCall("unknown", function() return SceneObject(pTarget):getDisplayedName() end)
+    if (name == nil or name == "") then name = "unknown" end
     local context = "Your name is " .. name .. "."
 
-    local zoneName = SceneObject(pTarget):getZoneName()
+    local zoneName = safeCall("unknown", function() return SceneObject(pTarget):getZoneName() end)
+    if (zoneName == nil or zoneName == "") then zoneName = "unknown" end
     context = context .. " You are currently on the planet " .. zoneName .. "."
 
     return context
@@ -175,37 +221,41 @@ end
 ----------------------------------------------------------------------
 function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTargetID)
 
-    local pScenePlayer = SceneObject(pPlayer)
+    local pScenePlayer = safeCall(nil, function() return SceneObject(pPlayer) end)
     if (pScenePlayer == nil) then return nil end
 
-    local nearbyObjects = pScenePlayer:getInRangeObjects()
+    local nearbyObjects = safeCall(nil, function() return pScenePlayer:getInRangeObjects() end)
     if (nearbyObjects == nil) then return nil end
 
     local bestMatch = nil
     local closestDistance = math.huge
-    local messageLower = string.lower(message)
+    local messageLower = string.lower(tostring(message or ""))
+    local playerID = safeCall(0, function() return SceneObject(pPlayer):getObjectID() end)
 
     for i = 1, #nearbyObjects, 1 do
         local pObj = nearbyObjects[i]
-        local objID = SceneObject(pObj):getObjectID()
 
         -- Check if it's a creature and not the player
-        if (pObj ~= nil and SceneObject(pObj):getObjectID() ~= SceneObject(pPlayer):getObjectID() and SceneObject(pObj):isCreatureObject()) then
+        local objID = safeCall(0, function() return SceneObject(pObj):getObjectID() end)
+        local isCreature = safeCall(false, function() return SceneObject(pObj):isCreatureObject() end)
+        if (pObj ~= nil and objID ~= 0 and objID ~= playerID and isCreature) then
             local dist = self:getWorldDistance(pPlayer, pObj)
 
             if (dist <= AI_RANGE) then
                 local profile = AiRegistry.getProfile(pObj)
 
                 if (profile ~= nil) then
-                    print("[SmartDoctor] Profile: " .. tostring(profile))
+                    AiLogger.trace("chat", "AI profile found while scanning nearby responder.")
                     local isMatch = false
 
-                    local name = string.lower(SceneObject(pObj):getDisplayedName())
-                    if (string.find(messageLower, name)) then isMatch = true end
+                    local name = safeCall("", function() return SceneObject(pObj):getDisplayedName() end)
+                    name = string.lower(tostring(name or ""))
+                    if (name ~= "" and string.find(messageLower, name, 1, true)) then isMatch = true end
 
-                    if (not isMatch and profile.call_signs) then
+                    if (not isMatch and type(profile.call_signs) == "table") then
                         for k, sign in pairs(profile.call_signs) do
-                            if (string.find(messageLower, sign)) then
+                            sign = tostring(sign or "")
+                            if (sign ~= "" and string.find(messageLower, sign, 1, true)) then
                                 isMatch = true
                                 break
                             end
@@ -214,11 +264,11 @@ function AiGlobalChatHandler:findNearbyResponder(pPlayer, message, preferredTarg
 
                     if (isMatch) then
                         -- PRIORITY 1: Ownership
-                        local owner = CreatureObject(pObj):getOwner()
+                        local owner = safeCall(nil, function() return CreatureObject(pObj):getOwner() end)
                         if (owner == pPlayer) then return pObj end
 
                         -- PRIORITY 2: Preferred Target
-                        if (preferredTargetID ~= 0 and SceneObject(pObj):getObjectID() == preferredTargetID) then
+                        if (preferredTargetID ~= 0 and objID == preferredTargetID) then
                             return pObj
                         end
 
@@ -242,29 +292,31 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
 
     if (pPlayer == nil or pChatMessage == nil) then return 0 end
 
-    local spatialMsg = getChatMessage(pChatMessage)
+    local spatialMsg = safeCall(nil, function() return getChatMessage(pChatMessage) end)
     if (spatialMsg == nil or spatialMsg == "") then return 0 end
 
     -- B. GET TARGET ID
-    local pCreature = CreatureObject(pPlayer)
-    local targetID = pCreature:getTargetID()
+    local pCreature = safeCall(nil, function() return CreatureObject(pPlayer) end)
+    if (pCreature == nil) then return 0 end
+
+    local targetID = safeCall(0, function() return pCreature:getTargetID() end)
     local pTarget = nil
 
     -- C. STRATEGY: KEYWORDS FIRST
     pTarget = self:findNearbyResponder(pPlayer, spatialMsg, targetID)
 
     if (pTarget ~= nil) then
-        print("[AI Global] Auto-detected responder via keyword.")
+        AiLogger.debug("chat", "Auto-detected responder via keyword.")
     else
         -- D. FALLBACK: TARGET
         if (targetID ~= 0) then
             local pPossibleTarget = getSceneObject(targetID)
 
-            if (pPossibleTarget ~= nil and SceneObject(pPossibleTarget):isCreatureObject()) then
+            if (pPossibleTarget ~= nil and safeCall(false, function() return SceneObject(pPossibleTarget):isCreatureObject() end)) then
                 -- Only use if they have a valid profile
                 if (AiRegistry.getProfile(pPossibleTarget) ~= nil) then
                     pTarget = pPossibleTarget
-                    print("[AI Global] Using Hard Target (No keyword detected).")
+                    AiLogger.debug("chat", "Using hard target responder.")
                 end
             end
         end
@@ -279,14 +331,14 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
     local finalDist = self:getWorldDistance(pPlayer, pTarget)
 
     if (finalDist > AI_RANGE) then
-        print("[AI Debug] Ignored: Target found, but out of range (" .. finalDist .. "m > " .. AI_RANGE .. "m).")
+        AiLogger.debug("chat", "Ignored target out of range (" .. tostring(finalDist) .. "m > " .. tostring(AI_RANGE) .. "m).")
         return 0
     end
 
     -- F. GET PROFILE
     local profile = AiRegistry.getProfile(pTarget)
-    if (profile == nil) then
-        print("[AI Debug] Ignored: Registry returned nil profile.")
+    if (type(profile) ~= "table") then
+        AiLogger.trace("chat", "Ignored target because registry returned nil profile.")
         return 0
     end
 
@@ -294,28 +346,28 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
     -- G. DECISION TREE: SMART DOCTOR vs RECRUITER vs NORMAL
     ----------------------------------------------------------------------
     if (profile.role == "smart_doctor") then
-        --if (SmartDoctorBuffer ~= nil and SmartDoctorBuffer.handleChat ~= nil) then
-            print("[AI GLOBAL] smart_doctor")
+        if (SmartDoctorBuffer ~= nil and SmartDoctorBuffer.handleChat ~= nil) then
+            AiLogger.debug("doctor", "Routing chat to SmartDoctorBuffer.")
             local handled = false
             local ok, err = pcall(function()
                 handled = SmartDoctorBuffer:handleChat(pTarget, pPlayer, spatialMsg)
             end)
     
             if (not ok) then
-                print("[SmartDoctor][ERROR] handleChat exception: " .. tostring(err))
+                AiLogger.error("doctor", "handleChat exception: " .. tostring(err))
                 return 0
             end
     
             -- If the doctor handled the message, stop here.
             -- If it returned false, fall through to normal AI response (optional).
             if (handled) then
-                print("[SmartDoctor] handled")
+                AiLogger.debug("doctor", "SmartDoctorBuffer handled chat.")
                 return 0
             end
-        --else
-        --    print("[SmartDoctor][ERROR] SmartDoctorBuffer not loaded. Did you includeFile(\"custom/smartDoctorBuffer.lua\")?")
-        --    return 0
-        --end
+        else
+            AiLogger.warn("doctor", "SmartDoctorBuffer not loaded; smart doctor chat ignored.")
+            return 0
+        end
 
         -- If not handled (message unrelated), allow fall-through to normal NPC response if desired:
         -- (But in practice, SmartDoctorBuffer returns false for non-buff lines and this might cause LLM chatter.
@@ -324,68 +376,87 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
 
     elseif (profile.role == "recruiter") then
         -- === PATH 1: RECRUITER AI (JSON LOGIC) ===
+        if (recruiterScreenplay == nil) then
+            AiLogger.warn("chat", "Recruiter screenplay unavailable; recruiter AI route skipped.")
+            return 0
+        end
+
+        local function gcwDiscount()
+            if type(getGCWDiscount) ~= "function" then
+                return 0
+            end
+
+            return safeCall(0, function() return getGCWDiscount(pPlayer) end)
+        end
 
         -- A. STUCK CHECK: If the server restarted while the timer was running, the data might be gone.
         -- This logic (borrowed from Core3) fixes the player so they aren't stuck forever.
-        if (CreatureObject(pPlayer):isChangingFactionStatus() and readData(CreatureObject(pPlayer):getObjectID() .. ":changingFactionStatus") ~= 1) then
-            recruiterScreenplay:handleGoCovert(pPlayer)
+        local playerObjectID = safeCall(0, function() return CreatureObject(pPlayer):getObjectID() end)
+        if (safeCall(false, function() return CreatureObject(pPlayer):isChangingFactionStatus() end) and readData(playerObjectID .. ":changingFactionStatus") ~= 1) then
+            safeCall(nil, function() recruiterScreenplay:handleGoCovert(pPlayer) end)
         end
 
         -- B. LOCKDOWN CHECK: If they are actively waiting for status change, BLOCK interaction.
-        if (CreatureObject(pPlayer):isChangingFactionStatus()) then
-            spatialChat(pTarget, "Greetings. I see that your status is currently being processed. I won't be able to help you until that is complete. It should not take much longer.")
+        if (safeCall(false, function() return CreatureObject(pPlayer):isChangingFactionStatus() end)) then
+            safeCall(nil, function() spatialChat(pTarget, "Greetings. I see that your status is currently being processed. I won't be able to help you until that is complete. It should not take much longer.") end)
             return 0
         end
 
         -- 1. Get Game Context specifically for Recruiters (Rank, Points)
-        local recruiterContext = recruiterScreenplay:getPlayerStatusContext(pPlayer, pTarget)
+        local recruiterContext = safeCall("", function() return recruiterScreenplay:getPlayerStatusContext(pPlayer, pTarget) end)
 
         -- 2. Ask Brain for INTENT (Returns a Lua table from JSON)
-        local aiData = AiBrain.getRecruiterIntent(spatialMsg, recruiterContext)
+        local aiData = safeCall(nil, function() return AiBrain.getRecruiterIntent(spatialMsg, recruiterContext) end)
 
         -- 3. Act on the Result
-        if aiData then
+        if type(aiData) == "table" then
             -- Speak the flavor text
             if aiData.reply then
-                spatialChat(pTarget, aiData.reply)
+                safeCall(nil, function() spatialChat(pTarget, tostring(aiData.reply)) end)
             end
 
             -- Trigger Game Mechanics
             if aiData.intent == "promote" then
-                recruiterScreenplay:attemptPromotion(pPlayer, pTarget)
+                safeCall(nil, function() recruiterScreenplay:attemptPromotion(pPlayer, pTarget) end)
 
             elseif aiData.intent == "buy_armor" then
-                recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_weapons_armor", getGCWDiscount(pPlayer))
+                local discount = gcwDiscount()
+                safeCall(nil, function() recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_weapons_armor", discount) end)
 
             elseif aiData.intent == "buy_furniture" then
-                recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_furniture", getGCWDiscount(pPlayer))
+                local discount = gcwDiscount()
+                safeCall(nil, function() recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_furniture", discount) end)
 
             elseif aiData.intent == "buy_structures" then
-                recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_installations", getGCWDiscount(pPlayer))
+                local discount = gcwDiscount()
+                safeCall(nil, function() recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_installations", discount) end)
 
             elseif aiData.intent == "buy_hirelings" then
-                recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_hirelings", getGCWDiscount(pPlayer))
+                local discount = gcwDiscount()
+                safeCall(nil, function() recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_hirelings", discount) end)
 
             elseif aiData.intent == "buy_schematics" then
-                recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_schematics", getGCWDiscount(pPlayer))
+                local discount = gcwDiscount()
+                safeCall(nil, function() recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_schematics", discount) end)
 
             elseif aiData.intent == "buy_uniforms" then
-                recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_uniforms", getGCWDiscount(pPlayer))
+                local discount = gcwDiscount()
+                safeCall(nil, function() recruiterScreenplay:sendPurchaseSui(pTarget, pPlayer, "fp_uniforms", discount) end)
 
             elseif aiData.intent == "check_war_status" then
-                recruiterScreenplay:announceGCWScore(pTarget)
+                safeCall(nil, function() recruiterScreenplay:announceGCWScore(pTarget) end)
 
             elseif aiData.intent == "go_overt" then
-                recruiterScreenplay:attemptToggleStatus(pPlayer, pTarget, 2)
+                safeCall(nil, function() recruiterScreenplay:attemptToggleStatus(pPlayer, pTarget, 2) end)
 
             elseif aiData.intent == "go_covert" then
-                recruiterScreenplay:attemptToggleStatus(pPlayer, pTarget, 1)
+                safeCall(nil, function() recruiterScreenplay:attemptToggleStatus(pPlayer, pTarget, 1) end)
 
             elseif aiData.intent == "go_on_leave" then
-                recruiterScreenplay:attemptToggleStatus(pPlayer, pTarget, 0)
+                safeCall(nil, function() recruiterScreenplay:attemptToggleStatus(pPlayer, pTarget, 0) end)
             end
         else
-            spatialChat(pTarget, "I... I'm not sure what you mean, soldier. Please ask in a different way!")
+            safeCall(nil, function() spatialChat(pTarget, "I... I'm not sure what you mean, soldier. Please ask in a different way!") end)
         end
 
     else
@@ -394,21 +465,25 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
         local npcContext = self:getNpcContext(pTarget)
 
         -- Use the standard Chat Response function
-        local aiResponse = AiBrain.getChatResponse(spatialMsg, profile, playerContext, npcContext)
-        spatialChat(pTarget, aiResponse)
+        local aiResponse = safeCall("...", function() return AiBrain.getChatResponse(spatialMsg, profile, playerContext, npcContext) end)
+        if aiResponse == nil or aiResponse == "" then
+            aiResponse = "..."
+        end
+        safeCall(nil, function() spatialChat(pTarget, tostring(aiResponse)) end)
     end
 
     ----------------------------------------------------------------------
     -- H. LEGACY SKILL HANDLER (Optional extras defined in Registry)
     ----------------------------------------------------------------------
-    if profile.skills then
+    if type(profile.skills) == "table" then
         for keyword, skillData in pairs(profile.skills) do
-            if string.find(string.lower(spatialMsg), keyword) then
-                if skillData.animation then
-                    CreatureObject(pTarget):doAnimation(skillData.animation)
+            local keywordText = tostring(keyword or "")
+            if keywordText ~= "" and string.find(string.lower(tostring(spatialMsg or "")), keywordText, 1, true) then
+                if type(skillData) == "table" and skillData.animation then
+                    safeCall(nil, function() CreatureObject(pTarget):doAnimation(skillData.animation) end)
                 end
-                if skillData.cpp_function == "healCreatureTarget" then
-                    LuaAiAgent(pTarget):healCreatureTarget(pPlayer)
+                if type(skillData) == "table" and skillData.cpp_function == "healCreatureTarget" then
+                    safeCall(nil, function() LuaAiAgent(pTarget):healCreatureTarget(pPlayer) end)
                 end
             end
         end

@@ -23,6 +23,19 @@ local SmartDoctorDialogue = {}
 -- If false or AiBrain isn't available, we use deterministic lines.
 local USE_LLM_FLAVOR = false
 
+local AiLogger = nil
+do
+    local ok, logger = pcall(require, "custom_scripts.ai_logger")
+    if ok and logger ~= nil then
+        AiLogger = logger
+    else
+        AiLogger = {
+            debug = function() end,
+            trace = function() end
+        }
+    end
+end
+
 do
     local ok, cfg = pcall(require, "custom_scripts.ai_config")
     if ok and cfg ~= nil and cfg.smartDoctor ~= nil then
@@ -35,10 +48,10 @@ end
 local AiBrain = nil
 do
     local ok, brain = pcall(require, "custom_scripts.ai_brain")
-    -- print("Called custom_scripts.ai_brain")
     if ok and brain then
-        --print("AiBrain = brain")
         AiBrain = brain
+    else
+        AiLogger.debug("doctor", "custom_scripts.ai_brain unavailable for optional Smart Doctor flavor.")
     end
 end
 
@@ -92,11 +105,10 @@ end
 
 -- LLM flavor (optional). Must not invent numbers.
 local function llmFlavor(key, slots, memoryTopic)
-    print("llmflavor: key: "..tostring(key) .. " price: " ..tostring(slots.price))
+    AiLogger.debug("doctor", "Smart Doctor LLM flavor requested key=" .. tostring(key) .. " price=" .. tostring(slots.price))
     if not USE_LLM_FLAVOR then return nil end
     if AiBrain == nil then return nil end
     if AiBrain.getDoctorFlavorLine == nil then return nil end
-    print("llmflavor: past brain")
 
     -- Provide a "phase" label so the model knows the moment.
     local phase = key
@@ -110,9 +122,9 @@ local function llmFlavor(key, slots, memoryTopic)
     if line == nil then return nil end
 
     line = tostring(line)
-    print("llFlavor: Line " .. line)
+    AiLogger.trace("doctor", "Smart Doctor raw LLM flavor line: " .. line)
     line = line:gsub("^%s+", ""):gsub("%s+$", "")
-    print("llFlavor: Line " .. line)
+    AiLogger.trace("doctor", "Smart Doctor trimmed LLM flavor line: " .. line)
 
     if line == "" then return nil end
 

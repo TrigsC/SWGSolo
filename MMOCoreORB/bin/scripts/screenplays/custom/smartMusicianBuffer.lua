@@ -8,6 +8,19 @@
 
 local ObjectManager = require("managers.object.object_manager")
 local AiAgentBridge = require("custom_scripts.ai_agent_bridge")
+local SmartEntertainerHelper = require("custom_scripts.smart_entertainer_helper")
+local AiLogger = nil
+do
+    local ok, logger = pcall(require, "custom_scripts.ai_logger")
+    if ok and logger ~= nil then
+        AiLogger = logger
+    else
+        AiLogger = {
+            warn = function() end,
+            debug = function() end
+        }
+    end
+end
 
 SmartMusicianConfig = SmartMusicianConfig or {}
 
@@ -67,20 +80,6 @@ SmartMusicianConfig.buffDuration = SmartMusicianConfig.buffDuration or 3600 -- s
 SmartMusicianConfig.maxRange = SmartMusicianConfig.maxRange or 10
 SmartMusicianConfig.keepPlayingHeartbeatMs = SmartMusicianConfig.keepPlayingHeartbeatMs or 15000
 
-local function safeSetCustomObjectName(pObj, name)
-    if pObj == nil or name == nil or name == "" then return end
-    SceneObject(pObj):setCustomObjectName(name)
-end
-
-local function inRange(pNpc, pPlayer)
-    if pNpc == nil or pPlayer == nil then return false end
-    if SceneObject(pNpc).isInRangeWithObject ~= nil then
-        return SceneObject(pNpc):isInRangeWithObject(pPlayer, SmartMusicianConfig.maxRange)
-    end
-    local dist = SceneObject(pNpc):getDistanceTo(pPlayer)
-    return dist ~= nil and dist <= SmartMusicianConfig.maxRange
-end
-
 local function giveAndEquipInstrument(pMob)
     --print("Musician: giveAndEquipInstrument " .. tostring(pMob))
     if pMob == nil then return end
@@ -101,11 +100,11 @@ local function giveAndEquipInstrument(pMob)
     -- If 4 fails (rare), try a couple other arrangement groups (5,6)
     if not ok then
         ok = SceneObject(pMob):transferObject(pInst, 5, true)
-        print("Musician: transferObject containment=5 ok=" .. tostring(ok))
+        AiLogger.debug("entertainer", "Musician transferObject containment=5 ok=" .. tostring(ok))
     end
     if not ok then
         ok = SceneObject(pMob):transferObject(pInst, 6, true)
-        print("Musician: transferObject containment=6 ok=" .. tostring(ok))
+        AiLogger.debug("entertainer", "Musician transferObject containment=6 ok=" .. tostring(ok))
     end
 end
 
@@ -125,14 +124,16 @@ function SmartMusicianBuffer:start()
             )
 
             if pMob ~= nil then
-                safeSetCustomObjectName(pMob, sp.customName or "Musician Buffer")
+                SmartEntertainerHelper.safeSetCustomName(pMob, sp.customName or "Musician Buffer")
 
                 giveAndEquipInstrument(pMob)
 
-                AiAgentBridge.startMusic(pMob, SmartMusicianConfig.songName)
+                if not AiAgentBridge.startMusic(pMob, SmartMusicianConfig.songName) then
+                    AiLogger.warn("entertainer", "Failed to start Smart Musician performance.")
+                end
 
                 createObserver(WASLISTENEDTO, "SmartMusicianBuffer", "notifyListened", pMob, 1)
-                createEvent(SmartMusicianConfig.keepPlayingHeartbeatMs, "SmartMusicianBuffer", "keepPlaying", pMob, "")
+                SmartEntertainerHelper.scheduleHeartbeat("SmartMusicianBuffer", "keepPlaying", pMob, SmartMusicianConfig.keepPlayingHeartbeatMs)
             end
         end
     end
@@ -147,31 +148,36 @@ function SmartMusicianBuffer:keepPlaying(pMob)
 
     if not c:isPlayingMusic() then
         giveAndEquipInstrument(pMob)
-        print("[MUSICIAN]: keepPlaying - c:is not playing")
+        AiLogger.debug("entertainer", "Smart Musician heartbeat detected stopped performance.")
 
-        AiAgentBridge.startMusic(pMob, SmartMusicianConfig.songName)
+        if not AiAgentBridge.startMusic(pMob, SmartMusicianConfig.songName) then
+            AiLogger.debug("entertainer", "Failed to restart Smart Musician performance.")
+        end
     end
 
-    createEvent(SmartMusicianConfig.keepPlayingHeartbeatMs, "SmartMusicianBuffer", "keepPlaying", pMob, "")
+    SmartEntertainerHelper.scheduleHeartbeat("SmartMusicianBuffer", "keepPlaying", pMob, SmartMusicianConfig.keepPlayingHeartbeatMs)
 end
 
 function SmartMusicianBuffer:notifyListened(pNpc, pListener)
-    if pNpc == nil or pListener == nil then return 0 end
-    if not SceneObject(pListener):isPlayerCreature() then return 0 end
+    SmartEntertainerHelper.scheduleAudienceEvent("SmartMusicianBuffer", "applyListenerBuff", pNpc, pListener, 100)
+    return 0
+end
 
-    if not inRange(pNpc, pListener) then
-        return 0
+function SmartMusicianBuffer:applyListenerBuff(pNpc, listenerID)
+    local pListener = getSceneObject(tonumber(listenerID) or 0)
+
+    if not SmartEntertainerHelper.isValidAudienceMember(pListener, pNpc, SmartMusicianConfig.maxRange) then
+        return
     end
 
     if not AiAgentBridge.hasMethod(pNpc, "applyMusicBuffs") then
-        return 0
+        return
     end
-    
+
     -- wipe only music (and BF+wounds)
     AiAgentBridge.wipeMusicBuffs(pNpc, pListener)
     if not AiAgentBridge.applyMusicBuffs(pNpc, pListener, SmartMusicianConfig.buffAmount, SmartMusicianConfig.buffDuration) then
-        return 0
+        return
     end
     CreatureObject(pListener):sendSystemMessage("You feel inspired by the music.")
-    return 0
 end

@@ -15,4 +15,29 @@ if AiConfig.smartDoctor.llmFlavorEnabled == nil then
     AiConfig.smartDoctor.llmFlavorEnabled = false
 end
 
+AiConfig.logging = AiConfig.logging or {}
+if AiConfig.logging.enabled == nil then
+    AiConfig.logging.enabled = true
+end
+AiConfig.logging.level = AiConfig.logging.level or "warn"
+AiConfig.logging.categories = AiConfig.logging.categories or {}
+if AiConfig.logging.categories.doctor == nil then
+    AiConfig.logging.categories.doctor = true
+end
+if AiConfig.logging.categories.entertainer == nil then
+    AiConfig.logging.categories.entertainer = true
+end
+if AiConfig.logging.categories.chat == nil then
+    AiConfig.logging.categories.chat = true
+end
+if AiConfig.logging.categories.llm == nil then
+    AiConfig.logging.categories.llm = true
+end
+if AiConfig.logging.categories.simplayer == nil then
+    AiConfig.logging.categories.simplayer = true
+end
+if AiConfig.logging.categories.bridge == nil then
+    AiConfig.logging.categories.bridge = true
+end
+
 return AiConfig

@@ -1,7 +1,7 @@
 local AiBrain = {}
 
 local DEFAULT_LLM_CONFIG = {
-    enabled = false,
+    enabled = true,
     url = nil,
     model = nil,
     timeoutSeconds = 3,
@@ -19,6 +19,21 @@ do
     end
 end
 
+local AiLogger = nil
+do
+    local ok, logger = pcall(require, "custom_scripts.ai_logger")
+    if ok and logger ~= nil then
+        AiLogger = logger
+    else
+        AiLogger = {
+            warn = function() end,
+            info = function() end,
+            debug = function() end,
+            trace = function() end
+        }
+    end
+end
+
 local http = nil
 local ltn12 = nil
 local json = nil
@@ -33,6 +48,19 @@ do
     local okJson, jsonModule = pcall(require, "cjson")
     if okJson then json = jsonModule end
 end
+
+if http == nil then
+    AiLogger.warn("llm", "socket.http unavailable; LLM responses will use fallback text.")
+end
+if ltn12 == nil then
+    AiLogger.warn("llm", "ltn12 unavailable; LLM responses will use fallback text.")
+end
+if json == nil then
+    AiLogger.warn("llm", "cjson unavailable; LLM responses will use fallback text.")
+end
+
+local loggedLlmDisabled = false
+local loggedMissingDependencies = false
 
 local function getLlmConfig()
     local llm = (Config and Config.llm) or {}
@@ -58,10 +86,36 @@ local function dependenciesAvailable()
     return http ~= nil and ltn12 ~= nil and json ~= nil
 end
 
+local function safeString(value)
+    if value == nil then
+        return ""
+    end
+
+    return tostring(value)
+end
+
+local function logLlmDisabledOnce()
+    if loggedLlmDisabled then return end
+    loggedLlmDisabled = true
+    AiLogger.debug("llm", "LLM disabled or missing URL/model; using deterministic fallback.")
+end
+
+local function logMissingDependenciesOnce()
+    if loggedMissingDependencies then return end
+    loggedMissingDependencies = true
+    AiLogger.warn("llm", "LLM dependencies unavailable; using deterministic fallback.")
+end
+
 -- PRIVATE HELPER: Handles the raw HTTP request
 local function sendToOllama(final_prompt, json_mode)
     local llmConfig = getLlmConfig()
-    if not llmConfig.enabled or not dependenciesAvailable() then
+    if not llmConfig.enabled then
+        logLlmDisabledOnce()
+        return nil
+    end
+
+    if not dependenciesAvailable() then
+        logMissingDependenciesOnce()
         return nil
     end
 
@@ -78,7 +132,7 @@ local function sendToOllama(final_prompt, json_mode)
 
     local okEncode, request_body = pcall(json.encode, payload)
     if not okEncode or request_body == nil then
-        print("[AiBrain] Error: failed to encode request payload")
+        AiLogger.warn("llm", "Failed to encode Ollama request payload.")
         return nil
     end
 
@@ -100,12 +154,12 @@ local function sendToOllama(final_prompt, json_mode)
     })
 
     if not okRequest then
-        print("[AiBrain] Error: HTTP request failed")
+        AiLogger.warn("llm", "Ollama HTTP request failed: " .. tostring(res))
         return nil
     end
 
     if code ~= 200 then
-        print("[AiBrain] Error: HTTP " .. tostring(code))
+        AiLogger.warn("llm", "Ollama HTTP response code " .. tostring(code) .. ".")
         return nil
     end
 
@@ -115,7 +169,7 @@ local function sendToOllama(final_prompt, json_mode)
     local status, response_data = pcall(json.decode, response_string)
     
     if not status or not response_data or not response_data.response then
-        print("[AiBrain] JSON Decode Error: " .. tostring(response_string))
+        AiLogger.warn("llm", "Failed to parse Ollama response JSON: " .. tostring(response_string):sub(1, 200))
         return nil
     end
 
@@ -126,20 +180,30 @@ end
 -- PUBLIC FUNCTION 1: Standard Chat (Flavor Text)
 --------------------------------------------------------------------------------
 function AiBrain.getChatResponse(player_input, npc_profile, player_context, npc_context)
-    npc_profile = npc_profile or {}
-    local system_instruction = npc_profile.system_prompt or "You are a Star Wars character."
+    if type(npc_profile) ~= "table" then
+        npc_profile = {}
+    end
+
+    local system_instruction = safeString(npc_profile.system_prompt)
+    if system_instruction == "" then
+        system_instruction = "You are a Star Wars character."
+    end
     
     -- Global formatting rules for CHAT ONLY
     local formatting_rules = " Do not describe actions or use asterisks (*). Speak only the dialogue. Keep the response brief (under 2 sentences)."
 
     local full_prompt = system_instruction .. 
-                        (npc_context and (" " .. npc_context) or "") .. 
-                        (player_context and (" " .. player_context) or "") .. 
+                        (npc_context and (" " .. safeString(npc_context)) or "") ..
+                        (player_context and (" " .. safeString(player_context)) or "") ..
                         formatting_rules .. 
-                        " The player says: '" .. player_input .. "'."
+                        " The player says: '" .. safeString(player_input) .. "'."
 
     local result = sendToOllama(full_prompt, false)
-    return result or fallbackChatResponse()
+    if result == nil or result == "" then
+        return fallbackChatResponse()
+    end
+
+    return tostring(result)
 end
 
 --------------------------------------------------------------------------------
@@ -148,7 +212,7 @@ end
 function AiBrain.getRecruiterIntent(player_input, player_stats_context)
     local systemPrompt = [[
     You are a Star Wars Rebel Recruiter.
-    Current Player Stats: ]] .. player_stats_context .. [[
+    Current Player Stats: ]] .. safeString(player_stats_context) .. [[
     
     Analyze the player's message and determine their intent.
     Valid intents: 
@@ -173,7 +237,7 @@ function AiBrain.getRecruiterIntent(player_input, player_stats_context)
     { "intent": "intent_name", "reply": "Your in-character response" }
     ]]
 
-    local full_prompt = systemPrompt .. " Player Input: " .. player_input
+    local full_prompt = systemPrompt .. " Player Input: " .. safeString(player_input)
     
     -- Send with json_mode = true
     local result_raw = sendToOllama(full_prompt, true)
@@ -181,9 +245,14 @@ function AiBrain.getRecruiterIntent(player_input, player_stats_context)
     if result_raw and json ~= nil then
         -- Decode the inner JSON content returned by the AI
         local status, result_table = pcall(json.decode, result_raw)
-        if status then
+        if status and type(result_table) == "table" and type(result_table.intent) == "string" then
+            if result_table.reply ~= nil then
+                result_table.reply = tostring(result_table.reply)
+            end
             return result_table
         end
+
+        AiLogger.warn("llm", "Failed to parse recruiter intent JSON: " .. tostring(result_raw):sub(1, 200))
     end
 
     -- Fallback if AI fails
@@ -194,6 +263,10 @@ end
 -- OPTIONAL: Doctor Flavor (Non-deterministic, no numbers allowed)
 --------------------------------------------------------------------------------
 function AiBrain.getDoctorFlavorLine(phase, slots, memoryTopic)
+    if type(slots) ~= "table" then
+        slots = {}
+    end
+
     -- slots: {playerName, doctorName, price, queuePos, etaSeconds, currentTargetName}
     -- IMPORTANT: we will instruct the model that numbers are provided and must not be invented.
     local systemPrompt = [[
@@ -234,6 +307,10 @@ function AiBrain.getDoctorFlavorLine(phase, slots, memoryTopic)
 
     local result = sendToOllama(full_prompt, false)
     return result or nil
+end
+
+function AiBrain.askBrain(player_input, npc_profile, player_context, npc_context)
+    return AiBrain.getChatResponse(player_input, npc_profile, player_context, npc_context)
 end
 
 return AiBrain
