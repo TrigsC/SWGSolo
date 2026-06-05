@@ -485,7 +485,7 @@ Current enabled status:
 | Miner spawn group `totalCount` | `0` | No miners spawn from default startup config. |
 | Miner spawn group `templates` | `light_jedi_sentinel`, `artisan` | Would be used if `totalCount` were raised above zero. |
 | Miner spawn group `behavior` | `gather_resources` | Loaded into `SpawnGroup.behavior`, but not used by controller selection. Non-`pvp` groups become miners. |
-| Miner spawn group `minerConfig` | Present with current defaults | Configures conceptual resource names, survey/sample timings, movement search radii, fallback radius, and optional state-transition logging. |
+| Miner spawn group `minerConfig` | Present with current defaults | Configures conceptual resource names, survey/sample timings, movement search radii, fallback radius, optional state-transition logging, and memory-only conceptual yield accounting. |
 
 Startup and spawn flow:
 
@@ -522,7 +522,7 @@ Current miner loop:
 8. `checkArrival` runs repeatedly while moving. It queues more path nodes, calls `findNextPosition(2.0f, false)`, detects arrival within roughly 4 meters, and uses a stuck watchdog to reapply the next step and reactivate AI behavior.
 9. `onArrived` calls `performSample`.
 10. `performSample` sets state to `SAMPLING`, clears patrol points, sets movement state to `OBLIVIOUS`, crouches the agent, plays `sample`, and schedules a `SimBehaviorTask` using `minerConfig.sampleDurationMs`, currently 15000 ms by default.
-11. `finishSample` returns the agent upright, plays `stop_sample`, and calls `startSimLoop` again.
+11. `finishSample` records an optional memory-only conceptual yield for the selected resource, returns the agent upright, plays `stop_sample`, and calls `startSimLoop` again.
 
 Movement and destination behavior:
 
@@ -534,16 +534,24 @@ Movement and destination behavior:
 
 Resource and economy behavior:
 
-The current miner does not create real resources. It simulates activity visually and procedurally only.
+The current miner does not create real resources. It simulates activity visually and records optional conceptual amounts in memory only.
 
 Static inspection found:
 
 - No calls from `SimMinerController` into `ResourceManager`.
 - No calls into `ResourceSpawn`.
 - No creation of `ResourceContainer` objects.
-- No inventory transfer or abstract inventory bookkeeping.
+- No inventory transfer.
 - No credits, vendor, bazaar, auction, harvester, crafting, or database persistence integration.
 - `ResourceManager.h` and `ResourceSpawn.h` are included in `SimPlayerController.cpp`, but the inspected miner methods do not use those APIs.
+
+Conceptual accounting:
+
+- `SimMinerController::finishSample` calls `recordConceptualYield` when `minerConfig.yieldConfig.enabled` is true.
+- `recordConceptualYield` chooses a random amount between `yieldConfig.minAmount` and `yieldConfig.maxAmount`.
+- `SimPlayerManager::recordConceptualMinerYield` stores aggregate totals in `SimPlayerManager::conceptualMinerTotals`, keyed by conceptual resource string.
+- Totals are C++ memory only. They are not persisted, exposed to players, turned into game objects, or connected to resource pools.
+- Optional yield logs are controlled by `minerConfig.yieldConfig.logYield`, which defaults to `false`.
 
 Config values and actual consumption:
 
@@ -563,6 +571,10 @@ Config values and actual consumption:
 | `spawnGroups[].minerConfig.maxSearchRadius` | Yes | Maximum navmesh search radius. Default is 200 meters. If lower than min, it is raised to min. |
 | `spawnGroups[].minerConfig.fallbackRadius` | Yes | Random fallback movement radius when navmesh destination selection fails. Default is 100 meters. |
 | `spawnGroups[].minerConfig.logStateTransitions` | Yes | Optional miner state-transition logs. Default is `false`, so normal gameplay remains quiet. |
+| `spawnGroups[].minerConfig.yieldConfig.enabled` | Yes | Enables memory-only conceptual accounting after sample completion. Default is `true`, but no miners spawn while `totalCount = 0`. |
+| `spawnGroups[].minerConfig.yieldConfig.minAmount` | Yes | Minimum conceptual yield per completed sample. Default is 5 and values are clamped. |
+| `spawnGroups[].minerConfig.yieldConfig.maxAmount` | Yes | Maximum conceptual yield per completed sample. Default is 25, values are clamped, and values lower than min are raised to min. |
+| `spawnGroups[].minerConfig.yieldConfig.logYield` | Yes | Optional per-sample conceptual yield log. Default is `false`, so normal gameplay remains quiet. |
 
 Logs and debug output:
 
@@ -570,12 +582,14 @@ Logs and debug output:
 - `DEBUG_SIMPVP` in `SimPlayerController.cpp` gates shared movement logs and the miner logs.
 - Miner-specific state logs can also be enabled per miner spawn group with `minerConfig.logStateTransitions = true`.
 - Miner-specific debug strings include loop start, selected conceptual resource, survey start/finish, destination selection, path failure/retry, arrival, sample start, and sample completion.
+- Conceptual yield logs can be enabled per miner spawn group with `minerConfig.yieldConfig.logYield = true`; logs include resource label, generated amount, source bot object id, and aggregate total.
 - `SimPathFindTask` always logs `SimPlayer: [Thread] EXCEPTION in findPath!` if pathfinding throws, even when debug macros are disabled.
 - The Lua config has commented-out `print` debug checks.
 
 Stability considerations:
 
 - `SimPathFindTask`, `ArrivalCheckTask`, `SimBehaviorTask`, and `SimRetryTask` all hold weak references to the controller and bounce work back through `Core::getTaskManager()->executeTask`.
+- `SimBehaviorTask` re-resolves the miner controller inside the task-manager lambda from a captured strong base-controller reference. It should not capture raw delayed `SimMinerController*` pointers because survey/sample callbacks can run after a controller is stopped or recycled.
 - `checkArrival` locks the AiAgent while examining combat/death/movement state and while updating patrol movement.
 - The current miner can schedule repeated arrival checks every 500 ms while moving and every 1000 ms while waiting, incapped, or in combat.
 - Pathfinding failure schedules a retry after 5000 ms by calling `startSimLoop` again.
@@ -586,17 +600,20 @@ Known limitations:
 - Miners are disabled by default via `totalCount = 0`.
 - Resource names are configurable conceptual labels, but they are not tied to the live SWG resource pool.
 - The selected resource string does not influence destination selection.
-- Surveying and sampling are animations only; no real extraction occurs.
+- Surveying and sampling are visual/conceptual only; no real extraction occurs.
 - Miner tuning values are exposed through Lua config, but only for the current conceptual loop.
 - The loaded `behavior = "gather_resources"` value is descriptive only in current controller selection.
-- There is no miner memory, inventory, accounting, persistence, market output, or crafting input.
+- Conceptual totals reset on server restart.
+- Conceptual totals are not visible to players.
+- Conceptual totals are not connected to vendors, crafting, resource pools, harvesters, credits, containers, inventory, or persistence.
+- There is no miner market output or crafting input.
 
 Suggested future phases:
 
 | Phase | Goal | Notes |
 |---|---|---|
 | Phase A | Make current miner behavior observable and configurable. | Implemented for conceptual resources, survey/sample durations, movement radii, and optional state-transition logging. Miner count remains disabled by default. |
-| Phase B | Record conceptual gathered resource amounts in memory/log only. | Keep the economy side-effect free while proving loop timing and accounting. |
+| Phase B | Record conceptual gathered resource amounts in memory/log only. | Implemented with manager-owned in-memory aggregate totals and optional yield logging. No real economy systems are touched. |
 | Phase C | Persist abstract resource inventory safely. | Store simple per-miner or per-system resource counters without creating SWG resource containers yet. |
 | Phase D | Sell resource lots through a controlled vendor/market abstraction. | Introduce a constrained output path with caps, pricing rules, and audit logs. |
 | Phase E | Connect to crafting/economy loops. | Only after resource accounting, persistence, and market limits are stable. |

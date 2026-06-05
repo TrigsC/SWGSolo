@@ -182,11 +182,11 @@ void CreatureTemplate::readObject(LuaObject* templateData) {
 
                 // --- DEBUG: PROVE THAT C++ SEES THE STATS ---
                 // We use Logger::console because 'attacker' does not exist here.
-                if (key.contains("speed")) {
-                    StringBuffer msg;
-                    msg << "[CreatureTemplate] STAT-LOAD: Injected " << key << " = " << value;
-                    Logger::console.info(msg.toString(), true);
-                }
+                // if (key.contains("speed")) {
+                //     StringBuffer msg;
+                //     msg << "[CreatureTemplate] STAT-LOAD: Injected " << key << " = " << value;
+                //     Logger::console.info(msg.toString(), true);
+                // }
             } else {
                  // Warn if we are skipping data
                  if (lua_type(L, -2) == LUA_TSTRING) {

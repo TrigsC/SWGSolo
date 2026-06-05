@@ -9,6 +9,8 @@
 #include "engine/util/Singleton.h"
 #include "system/util/SynchronizedVectorMap.h"
 #include "system/util/Vector.h"
+#include "system/util/VectorMap.h"
+#include "system/thread/Mutex.h"
 #include "engine/util/u3d/Vector3.h"
 #include "engine/lua/Lua.h"
 
@@ -20,6 +22,8 @@ class SimPlayerManager : public Singleton<SimPlayerManager>, public Object, publ
 private:
 	// Map of Creature ObjectID -> Controller
 	SynchronizedVectorMap<uint64, Reference<SimPlayerController*> > controllers;
+	VectorMap<String, uint64> conceptualMinerTotals;
+	Mutex conceptualMinerTotalsMutex;
 
     Lua* lua;
 
@@ -86,6 +90,8 @@ public:
 
 	// Toggle logic
 	void toggleBot(AiAgent* agent);
+
+	uint64 recordConceptualMinerYield(const String& resourceName, int amount, uint64 sourceObjectID, bool logYield);
 
 	// Cycle logic (called by SimPvPController)
 	void cyclePvPBot(uint64 oldOid,

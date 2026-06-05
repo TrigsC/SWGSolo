@@ -4,6 +4,7 @@
  */
 
 #include "SimPlayerController.h"
+#include "SimPlayerManager.h"
 #include "engine/core/Core.h"
 #include "engine/core/TaskManager.h"
 #include "server/zone/managers/collision/PathFinderManager.h"
@@ -67,12 +68,12 @@ void ArrivalCheckTask::run() {
 void SimBehaviorTask::run() {
     Reference<SimPlayerController*> baseCtrl = controller.get();
     if (baseCtrl == nullptr) return;
-    
-    SimMinerController* miner = dynamic_cast<SimMinerController*>(baseCtrl.get());
-    if (miner == nullptr) return;
 
     int capturedType = type;
-    Core::getTaskManager()->executeTask([miner, capturedType] () {
+    Core::getTaskManager()->executeTask([baseCtrl, capturedType] () {
+        SimMinerController* miner = dynamic_cast<SimMinerController*>(baseCtrl.get());
+        if (miner == nullptr) return;
+
         if (capturedType == SimBehaviorTask::FINISH_SURVEY) miner->finishSurvey();
         else if (capturedType == SimBehaviorTask::FINISH_SAMPLE) miner->finishSample();
     }, "SimPlayerBehaviorLambda");
@@ -488,10 +489,35 @@ void SimMinerController::performSample() {
 }
 
 void SimMinerController::finishSample() {
+    if (agent == nullptr)
+        return;
+
     logStateTransition("SimMiner: Sample finished for [" + targetResource + "]");
+    recordConceptualYield();
     agent->setPosture(CreaturePosture::UPRIGHT, true);
     agent->doAnimation("stop_sample"); 
     startSimLoop();
+}
+
+void SimMinerController::recordConceptualYield() {
+    if (!config.yieldEnabled || targetResource.isEmpty())
+        return;
+
+    int minAmount = config.minYieldAmount;
+    int maxAmount = config.maxYieldAmount;
+
+    if (minAmount <= 0 || maxAmount <= 0)
+        return;
+
+    if (maxAmount < minAmount)
+        maxAmount = minAmount;
+
+    int amount = minAmount;
+    if (maxAmount > minAmount)
+        amount += System::random(maxAmount - minAmount);
+
+    uint64 sourceObjectID = agent != nullptr ? agent->getObjectID() : 0;
+    SimPlayerManager::instance()->recordConceptualMinerYield(targetResource, amount, sourceObjectID, config.logYield);
 }
 
 void SimMinerController::logStateTransition(const String& message) const {

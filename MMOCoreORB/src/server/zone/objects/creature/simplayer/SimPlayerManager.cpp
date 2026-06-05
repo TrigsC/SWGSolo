@@ -17,7 +17,7 @@
 #include "server/zone/managers/planet/PlanetManager.h"
 #include "server/zone/managers/planet/PlanetTravelPoint.h"
 
-//#define DEBUG_SIMPLAYER
+#define DEBUG_SIMPLAYER
 
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
@@ -80,7 +80,19 @@ static void loadMinerConfig(LuaObject& group, SimMinerConfig& minerConfig) {
     minerConfig.minSearchRadius = clampMinerInt(config.getIntField("minSearchRadius"), minerConfig.minSearchRadius, 1, 1000);
     minerConfig.maxSearchRadius = clampMinerInt(config.getIntField("maxSearchRadius"), minerConfig.maxSearchRadius, 1, 1000);
     minerConfig.fallbackRadius = clampMinerInt(config.getIntField("fallbackRadius"), minerConfig.fallbackRadius, 1, 1000);
-    minerConfig.logStateTransitions = config.getBooleanField("logStateTransitions");
+    minerConfig.logStateTransitions = config.getBooleanField("logStateTransitions", minerConfig.logStateTransitions);
+
+    LuaObject yieldConfig = config.getObjectField("yieldConfig");
+    if (yieldConfig.isValidTable()) {
+        minerConfig.yieldEnabled = yieldConfig.getBooleanField("enabled", minerConfig.yieldEnabled);
+        minerConfig.minYieldAmount = clampMinerInt(yieldConfig.getIntField("minAmount"), minerConfig.minYieldAmount, 1, 1000000);
+        minerConfig.maxYieldAmount = clampMinerInt(yieldConfig.getIntField("maxAmount"), minerConfig.maxYieldAmount, 1, 1000000);
+        minerConfig.logYield = yieldConfig.getBooleanField("logYield", minerConfig.logYield);
+
+        if (minerConfig.maxYieldAmount < minerConfig.minYieldAmount)
+            minerConfig.maxYieldAmount = minerConfig.minYieldAmount;
+    }
+    yieldConfig.pop();
 
     if (minerConfig.maxSearchRadius < minerConfig.minSearchRadius)
         minerConfig.maxSearchRadius = minerConfig.minSearchRadius;
@@ -382,6 +394,31 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         agent->activateAiBehavior(true);
         ctrl->startSimLoop();
     }
+}
+
+uint64 SimPlayerManager::recordConceptualMinerYield(const String& resourceName, int amount, uint64 sourceObjectID, bool logYield) {
+    if (resourceName.isEmpty() || amount <= 0)
+        return 0;
+
+    uint64 total = 0;
+
+    {
+        Locker locker(&conceptualMinerTotalsMutex);
+
+        if (conceptualMinerTotals.contains(resourceName))
+            total = conceptualMinerTotals.get(resourceName);
+
+        total += amount;
+        conceptualMinerTotals.put(resourceName, total);
+    }
+
+    if (logYield) {
+        info("SimMiner: recorded " + String::valueOf(amount) + " conceptual " + resourceName +
+             " from bot " + String::valueOf(sourceObjectID) + "; total " + resourceName + "=" +
+             String::valueOf(total), true);
+    }
+
+    return total;
 }
 
 void SimPlayerManager::startControllerForAgent(AiAgent* agent, Reference<SimPlayerController*> ctrl) {

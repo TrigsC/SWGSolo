@@ -24,7 +24,7 @@ SimPlayerManagerConfig = {
         -- MINERS: Spread randomly across ALL defined shuttleports
         {
             type = "miner",
-            totalCount = 0, 
+            totalCount = 4,
             templates = { "light_jedi_sentinel", "artisan" }, -- Randomly picks appearance
             behavior = "gather_resources",
             minerConfig = {
@@ -34,12 +34,18 @@ SimPlayerManagerConfig = {
                 minSearchRadius = 100,
                 maxSearchRadius = 200,
                 fallbackRadius = 100,
-                logStateTransitions = false,
+                logStateTransitions = true,
+                yieldConfig = {
+                    enabled = true,
+                    minAmount = 5,
+                    maxAmount = 25,
+                    logYield = true,
+                },
             }
         },
         {
             type = "pvp_solo",
-            totalCount = 3,
+            totalCount = 0,
             templates = { "rebel_trooper", "stormtrooper" },
             minStaySeconds = 60,
             maxStaySeconds = 180

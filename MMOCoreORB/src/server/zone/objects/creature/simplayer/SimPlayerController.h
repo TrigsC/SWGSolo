@@ -26,6 +26,10 @@ struct SimMinerConfig {
     int maxSearchRadius;
     int fallbackRadius;
     bool logStateTransitions;
+    bool yieldEnabled;
+    int minYieldAmount;
+    int maxYieldAmount;
+    bool logYield;
 
     SimMinerConfig() {
         resources.add("iron");
@@ -39,6 +43,10 @@ struct SimMinerConfig {
         maxSearchRadius = 200;
         fallbackRadius = 100;
         logStateTransitions = false;
+        yieldEnabled = true;
+        minYieldAmount = 5;
+        maxYieldAmount = 25;
+        logYield = false;
     }
 };
 
@@ -152,6 +160,7 @@ public:
 
 private:
     void logStateTransition(const String& message) const;
+    void recordConceptualYield();
 };
 
 #endif
