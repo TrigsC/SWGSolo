@@ -113,6 +113,9 @@ Public functions currently include:
 - `AiBrain.getChatResponse(player_input, npc_profile, player_context, npc_context)`
 - `AiBrain.getRecruiterIntent(player_input, player_stats_context)`
 - `AiBrain.getDoctorFlavorLine(phase, slots, memoryTopic)`
+- `AiBrain.askBrain(player_input, npc_profile, player_context, npc_context)`, a compatibility wrapper for older Padawan/legacy callers.
+
+These public functions normalize nil or non-string inputs where practical and return deterministic fallback values when the LLM client, JSON parsing, or dependency loading fails.
 
 `ai_logger.lua` is the central logging helper for custom AI Lua systems. It reads `AiConfig.logging`, formats messages as:
 
@@ -129,7 +132,7 @@ The default logging level is `warn`, so error/warn diagnostics are visible while
 - `simplayer`
 - `bridge`
 
-`ai_registry.lua` maps NPCs to profiles. It currently supports lookup by internal creature template name and fallback lookup by template path. Important profile concepts include:
+`ai_registry.lua` maps NPCs to profiles. It currently supports lookup by internal creature template name, direct profile-key lookup for older callers, and fallback lookup by template path. Lookup is guarded so invalid scene objects or failed `LuaAiAgent` construction return nil instead of unwinding chat routing. Important profile concepts include:
 
 - `role = "smart_doctor"`
 - `role = "recruiter"`
@@ -373,18 +376,19 @@ Smart Musician:
 Smart Dancer:
 
 - Registers `WASWATCHED`.
-- On watch, checks player status and range.
+- On watch, schedules a short deferred buff event, then rechecks player status and range.
 - Calls `AiAgentBridge.wipeDanceBuffs`.
 - Calls `AiAgentBridge.applyDanceMindBuff`.
 
 Smart Musician:
 
 - Registers `WASLISTENEDTO`.
-- On listen, checks player status and range.
+- On listen, schedules a short deferred buff event, then rechecks player status and range.
 - Calls `AiAgentBridge.wipeMusicBuffs`.
 - Calls `AiAgentBridge.applyMusicBuffs`.
 
 The bridge delegates to the raw `LuaAiAgent` bindings. The `2` and `4` flags correspond to dance and music enhancement wipe paths in C++.
+The deferred event keeps buff mutation out of the immediate `/watch` and `/listen` observer callback, where `PlayerManager` may still be holding entertainer/player locks.
 
 ### Shared concepts
 
@@ -467,6 +471,8 @@ The system does not appear to use normal player travel commands. Instead, it sim
 
 This creates the appearance of roaming between locations.
 
+Operational stability rule: SimPlayer recycle code should keep AiAgent object-lock scopes small. Shuttle readiness checks touch `PlanetManager`, and old-bot cleanup calls `destroyObjectFromWorld` / `destroyObjectFromDatabase`; these should run outside the old bot's own `Locker` scope to avoid silent lock inversions during timed roam/recycle tasks.
+
 ### Resource gathering concepts
 
 `SimMinerController` exists and models a resource gathering loop:
@@ -502,6 +508,7 @@ The controller:
 - PvP solo spawn group with count `3`.
 - PvP loiter, movement, combat scan, shuttle cycling, and death recycling.
 - Always-active AiAgent behavior for SimPlayers.
+- SimPlayer recycle cleanup is guarded so dead/incap checks happen under the old bot lock, but world/database destruction happens after that lock is released.
 
 ### Current disabled or inactive features
 
@@ -544,12 +551,12 @@ Current player-to-LLM flow:
    - Displayed name match.
    - Profile call signs.
    - Hard-target fallback.
-8. `AiRegistry.getProfile` checks that the target is an AiAgent.
+8. `AiRegistry.getProfile` checks that the target is an AiAgent and returns nil on invalid object/binding failures.
 9. `AiRegistry.getProfile` reads the creature template name through `LuaAiAgent:getCreatureTemplateName`.
 10. If a profile is found, routing continues by role.
 11. For `role = "smart_doctor"`, the handler calls `SmartDoctorBuffer:handleChat`.
-12. For `role = "recruiter"`, the handler calls `AiBrain.getRecruiterIntent`.
-13. For normal profiles, the handler calls `AiBrain.getChatResponse`.
+12. For `role = "recruiter"`, the handler calls `AiBrain.getRecruiterIntent` and falls back safely if intent parsing or recruiter screenplay calls fail.
+13. For normal profiles, the handler calls `AiBrain.getChatResponse` and falls back to deterministic text if the model path fails.
 14. `ai_brain.lua` reads `AiConfig.llm` for enablement, URL, model, and timeout settings.
 15. `ai_brain.lua` builds a prompt and sends a synchronous HTTP POST to Ollama.
 16. Ollama returns JSON containing a response field.
@@ -558,6 +565,8 @@ Current player-to-LLM flow:
 
 Recruiter flow is different from general chat because the LLM is used for intent classification. The gameplay action is still performed by existing recruiter screenplay functions after the intent is parsed.
 
+SimPlayer configuration and controllers do not currently call `AiBrain`, `AiRegistry`, `AiGlobalChatHandler`, or `AiAgentBridge`. SimPlayers use their own Lua config load path plus C++ controllers.
+
 # Current Technical Debt
 
 The following risks and limitations exist in the current codebase:
@@ -565,6 +574,7 @@ The following risks and limitations exist in the current codebase:
 - LLM HTTP calls are synchronous and can block the Lua path that handles spatial chat.
 - LLM URL/model/default timeout are centralized in `ai_config.lua`, but broader gameplay configuration remains scattered.
 - Missing LuaSocket or cjson now falls back safely, but the system still depends on those libraries for actual LLM responses.
+- Lua guards prevent common nil/type failures, but they cannot prevent C++-side deadlocks or blocking inside native bindings.
 - Smart Doctor full queue state is not persisted.
 - Some older AI paths still directly know raw `LuaAiAgent` method names.
 - Lua-side `pcall` cannot guarantee safety from every C++ binding failure.
@@ -573,6 +583,7 @@ The following risks and limitations exist in the current codebase:
 - SimPlayer behavior modifies broad AiAgent lifecycle behavior through `simAlwaysActive` and `simPlayerBot`.
 - SimPlayer configuration is loaded through a separate Lua instance, not through the same screenplay include path.
 - SimPlayer controller selection relies partly on template-name inference.
+- `sim_player_manager.lua` declares PvP `minStaySeconds` / `maxStaySeconds`, but the inspected `SimPvPController` loiter logic currently uses its own C++ range.
 - Large AI training artifacts and archives are currently untracked at the repository root.
 
 # Architectural Boundaries

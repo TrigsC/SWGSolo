@@ -50,3 +50,6 @@ build.out.prev
 bin/screenlog*
 compile_commands.json
 .env*
+/bin/databses-backup/*
+/cmake/Modules/FindEngine3.cmake.bak
+/src/CMakeLists.txt.bak-idlc-go

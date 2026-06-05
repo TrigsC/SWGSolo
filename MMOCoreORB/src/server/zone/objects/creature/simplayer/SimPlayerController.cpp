@@ -115,7 +115,10 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
 
     if (agent->isInCombat()) {
         destination = targetPos;
-        state = IDLE; 
+        state = IDLE;
+#ifdef DEBUG_SIMPVP
+    Logger::console.info("SimPlayer moveTo: isInCombat", true);
+#endif
         return;
     }
 
@@ -130,7 +133,7 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
     
     float dist = agent->getWorldPosition().distanceTo(targetPos);
 #ifdef DEBUG_SIMPVP
-    Logger::console.info("SimPlayer: Requesting move to " + targetPos.toString() + " (Dist: " + String::valueOf(dist) + "m)", true);
+    Logger::console.info("SimPlayer moveTo: Requesting move to " + targetPos.toString() + " (Dist: " + String::valueOf(dist) + "m)", true);
 #endif
 
     WorldCoordinates startCoord(agent);
@@ -146,7 +149,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     
     if (agent->isInCombat()) {
 #ifdef DEBUG_SIMPVP
-        Logger::console.info("SimPlayer: Path found but Agent is in Combat. Holding.", true);
+        Logger::console.info("SimPlayer onPathFound: Path found but Agent is in Combat. Holding.", true);
 #endif
         if (path) delete path;
         state = IDLE;
@@ -156,7 +159,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     if (path == nullptr || path->size() < 2) { 
         if (path) delete path;
 #ifdef DEBUG_SIMPVP
-        Logger::console.info("SimPlayer: Path too short. Retrying in 5s.", true);
+        Logger::console.info("SimPlayer onPathFound: Path too short. Retrying in 5s.", true);
 #endif
         onPathFailed(); 
         return; 
@@ -172,7 +175,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
     destination = simPath.get(simPath.size() - 1).getPoint();
 #ifdef DEBUG_SIMPVP
-    Logger::console.info("SimPlayer: Path Found (" + String::valueOf(path->size()) + " nodes). Moving...", true);
+    Logger::console.info("SimPlayer onPathFound: Path Found (" + String::valueOf(path->size()) + " nodes). Moving...", true);
 #endif
     agent->setHomeLocation(destination.getX(), destination.getZ(), destination.getY(), nullptr);
 
@@ -205,7 +208,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 
 void SimPlayerController::onPathFailed() {
 #ifdef DEBUG_SIMPVP
-    Logger::console.info("SimPlayer: Pathfinding failed/unreachable. Retrying in 5s...", true);
+    Logger::console.info("SimPlayer onPathFailed: Pathfinding failed/unreachable. Retrying in 5s...", true);
 #endif
     state = IDLE;
 
@@ -251,23 +254,40 @@ void SimPlayerController::checkArrival() {
     
     Locker locker(agent);
 
-    if (agent->isDead() || agent->isIncapacitated()) {
-        // tell manager to cleanup corpse after a delay
-        agent->destroyObjectFromWorld(true);
-        agent->destroyObjectFromDatabase(true);
+    if (agent->isDead()) {
+        // SimPvPController::onTick schedules recycle for dead bots. Do not
+        // destroy the object while holding its own lock; that can deadlock
+        // against world/database cleanup paths.
+        state = WAITING;
+#ifdef DEBUG_SIMPVP
+        Logger::console.info("SimPlayer checkArrival: isDead", true);
+#endif
+        return;
+    }
+
+    if (agent->isIncapacitated()) {
+        state = WAITING;
+        Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
+#ifdef DEBUG_SIMPVP
+        Logger::console.info("SimPlayer checkArrival: isIncapacitated", true);
+#endif
+        task->schedule(1000);
         return;
     }
 
     if (agent->isInCombat()) {
         state = IDLE; 
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
+#ifdef DEBUG_SIMPVP
+        Logger::console.info("SimPlayer checkArrival: isInCombat", true);
+#endif
         task->schedule(1000); 
         return;
     }
 
     if (state == IDLE && destination.getX() != 0) {
 #ifdef DEBUG_SIMPVP
-        Logger::console.info("SimPlayer: Resuming path to " + destination.toString(), true);
+        Logger::console.info("SimPlayer checkArrival: Resuming path to " + destination.toString(), true);
 #endif
         moveTo(destination);
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
@@ -300,7 +320,7 @@ void SimPlayerController::checkArrival() {
 
     if (arrived) {
 #ifdef DEBUG_SIMPVP
-        Logger::console.info("SimPlayer: Arrived at destination.", true);
+        Logger::console.info("SimPlayer checkArrival: Arrived at destination.", true);
 #endif
         agent->clearPatrolPoints(); 
         onArrived(); 
@@ -318,6 +338,9 @@ void SimPlayerController::checkArrival() {
     if (movedDistSq < 0.05f) {
         stuckWatchdogCount++;
         if (stuckWatchdogCount > 5) { 
+#ifdef DEBUG_SIMPVP
+        Logger::console.info("SimPlayer checkArrival: stuckWatchdogCount > 5.", true);
+#endif
              if (agent->getPatrolPointSize() > 0) {
                  PatrolPoint next = agent->getNextPosition();
                  agent->setNextStepPosition(next.getPositionX(), next.getPositionZ(), next.getPositionY(), next.getCell());

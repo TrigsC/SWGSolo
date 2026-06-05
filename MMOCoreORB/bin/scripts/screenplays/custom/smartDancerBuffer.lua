@@ -126,21 +126,27 @@ function SmartDancerBuffer:keepDancing(pMob)
 end
 
 function SmartDancerBuffer:notifyWatched(pNpc, pWatcher)
+    SmartEntertainerHelper.scheduleAudienceEvent("SmartDancerBuffer", "applyWatcherBuff", pNpc, pWatcher, 100)
+    return 0
+end
+
+function SmartDancerBuffer:applyWatcherBuff(pNpc, watcherID)
+    local pWatcher = getSceneObject(tonumber(watcherID) or 0)
+
     if not SmartEntertainerHelper.isValidAudienceMember(pWatcher, pNpc, SmartDancerConfig.maxRange) then
-        return 0
+        return
     end
 
     if not AiAgentBridge.hasMethod(pNpc, "applyDanceMindBuff") then
-        return 0
+        return
     end
-    
+
     -- wipe only dance (and BF+wounds)
     AiAgentBridge.wipeDanceBuffs(pNpc, pWatcher)
     if not AiAgentBridge.applyDanceMindBuff(pNpc, pWatcher, SmartDancerConfig.buffAmount, SmartDancerConfig.buffDuration) then
-        return 0
+        return
     end
 
     -- optional flavor message
     CreatureObject(pWatcher):sendSystemMessage("You feel your mind sharpen as you watch the dancer.")
-    return 0
 end

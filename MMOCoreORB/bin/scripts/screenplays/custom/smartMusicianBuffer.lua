@@ -159,19 +159,25 @@ function SmartMusicianBuffer:keepPlaying(pMob)
 end
 
 function SmartMusicianBuffer:notifyListened(pNpc, pListener)
+    SmartEntertainerHelper.scheduleAudienceEvent("SmartMusicianBuffer", "applyListenerBuff", pNpc, pListener, 100)
+    return 0
+end
+
+function SmartMusicianBuffer:applyListenerBuff(pNpc, listenerID)
+    local pListener = getSceneObject(tonumber(listenerID) or 0)
+
     if not SmartEntertainerHelper.isValidAudienceMember(pListener, pNpc, SmartMusicianConfig.maxRange) then
-        return 0
+        return
     end
 
     if not AiAgentBridge.hasMethod(pNpc, "applyMusicBuffs") then
-        return 0
+        return
     end
-    
+
     -- wipe only music (and BF+wounds)
     AiAgentBridge.wipeMusicBuffs(pNpc, pListener)
     if not AiAgentBridge.applyMusicBuffs(pNpc, pListener, SmartMusicianConfig.buffAmount, SmartMusicianConfig.buffDuration) then
-        return 0
+        return
     end
     CreatureObject(pListener):sendSystemMessage("You feel inspired by the music.")
-    return 0
 end

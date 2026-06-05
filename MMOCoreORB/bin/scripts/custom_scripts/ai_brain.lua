@@ -86,6 +86,14 @@ local function dependenciesAvailable()
     return http ~= nil and ltn12 ~= nil and json ~= nil
 end
 
+local function safeString(value)
+    if value == nil then
+        return ""
+    end
+
+    return tostring(value)
+end
+
 local function logLlmDisabledOnce()
     if loggedLlmDisabled then return end
     loggedLlmDisabled = true
@@ -172,20 +180,30 @@ end
 -- PUBLIC FUNCTION 1: Standard Chat (Flavor Text)
 --------------------------------------------------------------------------------
 function AiBrain.getChatResponse(player_input, npc_profile, player_context, npc_context)
-    npc_profile = npc_profile or {}
-    local system_instruction = npc_profile.system_prompt or "You are a Star Wars character."
+    if type(npc_profile) ~= "table" then
+        npc_profile = {}
+    end
+
+    local system_instruction = safeString(npc_profile.system_prompt)
+    if system_instruction == "" then
+        system_instruction = "You are a Star Wars character."
+    end
     
     -- Global formatting rules for CHAT ONLY
     local formatting_rules = " Do not describe actions or use asterisks (*). Speak only the dialogue. Keep the response brief (under 2 sentences)."
 
     local full_prompt = system_instruction .. 
-                        (npc_context and (" " .. npc_context) or "") .. 
-                        (player_context and (" " .. player_context) or "") .. 
+                        (npc_context and (" " .. safeString(npc_context)) or "") ..
+                        (player_context and (" " .. safeString(player_context)) or "") ..
                         formatting_rules .. 
-                        " The player says: '" .. player_input .. "'."
+                        " The player says: '" .. safeString(player_input) .. "'."
 
     local result = sendToOllama(full_prompt, false)
-    return result or fallbackChatResponse()
+    if result == nil or result == "" then
+        return fallbackChatResponse()
+    end
+
+    return tostring(result)
 end
 
 --------------------------------------------------------------------------------
@@ -194,7 +212,7 @@ end
 function AiBrain.getRecruiterIntent(player_input, player_stats_context)
     local systemPrompt = [[
     You are a Star Wars Rebel Recruiter.
-    Current Player Stats: ]] .. player_stats_context .. [[
+    Current Player Stats: ]] .. safeString(player_stats_context) .. [[
     
     Analyze the player's message and determine their intent.
     Valid intents: 
@@ -219,7 +237,7 @@ function AiBrain.getRecruiterIntent(player_input, player_stats_context)
     { "intent": "intent_name", "reply": "Your in-character response" }
     ]]
 
-    local full_prompt = systemPrompt .. " Player Input: " .. player_input
+    local full_prompt = systemPrompt .. " Player Input: " .. safeString(player_input)
     
     -- Send with json_mode = true
     local result_raw = sendToOllama(full_prompt, true)
@@ -227,7 +245,10 @@ function AiBrain.getRecruiterIntent(player_input, player_stats_context)
     if result_raw and json ~= nil then
         -- Decode the inner JSON content returned by the AI
         local status, result_table = pcall(json.decode, result_raw)
-        if status then
+        if status and type(result_table) == "table" and type(result_table.intent) == "string" then
+            if result_table.reply ~= nil then
+                result_table.reply = tostring(result_table.reply)
+            end
             return result_table
         end
 
@@ -242,6 +263,10 @@ end
 -- OPTIONAL: Doctor Flavor (Non-deterministic, no numbers allowed)
 --------------------------------------------------------------------------------
 function AiBrain.getDoctorFlavorLine(phase, slots, memoryTopic)
+    if type(slots) ~= "table" then
+        slots = {}
+    end
+
     -- slots: {playerName, doctorName, price, queuePos, etaSeconds, currentTargetName}
     -- IMPORTANT: we will instruct the model that numbers are provided and must not be invented.
     local systemPrompt = [[
@@ -282,6 +307,10 @@ function AiBrain.getDoctorFlavorLine(phase, slots, memoryTopic)
 
     local result = sendToOllama(full_prompt, false)
     return result or nil
+end
+
+function AiBrain.askBrain(player_input, npc_profile, player_context, npc_context)
+    return AiBrain.getChatResponse(player_input, npc_profile, player_context, npc_context)
 end
 
 return AiBrain
