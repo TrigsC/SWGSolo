@@ -188,6 +188,10 @@ void GroundZoneImplementation::inRange(TreeEntry* entry, float range) {
 }
 
 void GroundZoneImplementation::updateActiveAreas(TangibleObject* tano) {
+	if (tano == nullptr) {
+		return;
+	}
+
 	//Locker locker(_this.getReferenceUnsafeStaticCast());
 
 	Locker _alocker(tano->getContainerLock());
@@ -249,19 +253,12 @@ void GroundZoneImplementation::updateActiveAreas(TangibleObject* tano) {
 			auto worldArea = creatureManager->getWorldSpawnArea();
 
 			if (worldArea != nullptr) {
-				Reference<TangibleObject*> tanoStrong = tano;
-				Reference<ActiveArea*> areaStrong = worldArea;
-
-				Core::getTaskManager()->executeTask([areaStrong, tanoStrong] () {
-					Locker lockerO(tanoStrong);
-
-					if (!tanoStrong->hasActiveArea(areaStrong)) {
-						tanoStrong->addActiveArea(areaStrong);
-						areaStrong->notifyEnter(tanoStrong);
-					} else {
-						areaStrong->notifyPositionUpdate(tanoStrong);
-					}
-				}, "UpdateWorldActiveArea", zoneName);
+				if (!tano->hasActiveArea(worldArea)) {
+					tano->addActiveArea(worldArea);
+					worldArea->enqueueEnterEvent(tano);
+				} else {
+					worldArea->notifyPositionUpdate(tano);
+				}
 			}
 		}
 	} catch (...) {

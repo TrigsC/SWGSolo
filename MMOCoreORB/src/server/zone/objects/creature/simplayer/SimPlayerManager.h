@@ -18,8 +18,14 @@
 
 using namespace server::zone;
 
+class SimMinerSummaryTask;
+class ResourceIntelligenceTask;
+
 class SimPlayerManager : public Singleton<SimPlayerManager>, public Object, public Logger {
 private:
+	friend class SimMinerSummaryTask;
+	friend class ResourceIntelligenceTask;
+
 	// Map of Creature ObjectID -> Controller
 	SynchronizedVectorMap<uint64, Reference<SimPlayerController*> > controllers;
 	VectorMap<String, uint64> conceptualMinerTotals;
@@ -62,6 +68,14 @@ public:
 
 private:
 	bool enabled = true;
+	bool minerSummaryLoggingEnabled = false;
+	bool minerSummaryTaskScheduled = false;
+	int minerSummaryIntervalSeconds = 300;
+	bool resourceIntelligenceEnabled = false;
+	bool resourceIntelligenceLogTopResources = false;
+	bool resourceIntelligenceTaskScheduled = false;
+	int resourceIntelligenceIntervalSeconds = 600;
+	int resourceIntelligenceTopN = 10;
 	Vector<ShuttleportLocation> allShuttleports;
 	Vector<SpawnGroup> spawnGroups;
 
@@ -72,6 +86,14 @@ private:
 
 	bool pickRandomShuttleport(ShuttleportLocation& out) const;
 	bool isNearestShuttleBoardable(CreatureObject* c);
+	void scheduleMinerSummaryTask();
+	void runMinerSummaryTask();
+	int countActiveMiners();
+	void collectConceptualMinerTotals(Vector<String>& resourceNames, Vector<uint64>& amounts);
+	void logConceptualMinerSummary();
+	void scheduleResourceIntelligenceTask();
+	void runResourceIntelligenceTask();
+	void logResourceIntelligenceSummary();
 	
 	String pickRandomTemplate(const SpawnGroup& g) const;
 	bool isImperialForSpawn(const SpawnGroup& g, const String& templateName) const;

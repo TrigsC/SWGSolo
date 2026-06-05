@@ -552,6 +552,7 @@ Conceptual accounting:
 - `SimPlayerManager::recordConceptualMinerYield` stores aggregate totals in `SimPlayerManager::conceptualMinerTotals`, keyed by conceptual resource string.
 - Totals are C++ memory only. They are not persisted, exposed to players, turned into game objects, or connected to resource pools.
 - Optional yield logs are controlled by `minerConfig.yieldConfig.logYield`, which defaults to `false`.
+- Optional periodic summary logs are controlled by `minerConfig.summaryConfig`, which defaults to disabled.
 
 Config values and actual consumption:
 
@@ -575,6 +576,8 @@ Config values and actual consumption:
 | `spawnGroups[].minerConfig.yieldConfig.minAmount` | Yes | Minimum conceptual yield per completed sample. Default is 5 and values are clamped. |
 | `spawnGroups[].minerConfig.yieldConfig.maxAmount` | Yes | Maximum conceptual yield per completed sample. Default is 25, values are clamped, and values lower than min are raised to min. |
 | `spawnGroups[].minerConfig.yieldConfig.logYield` | Yes | Optional per-sample conceptual yield log. Default is `false`, so normal gameplay remains quiet. |
+| `spawnGroups[].minerConfig.summaryConfig.enabled` | Yes | Enables periodic read-only summary logging for conceptual miner totals and active miner count. Default is `false`. |
+| `spawnGroups[].minerConfig.summaryConfig.intervalSeconds` | Yes | Summary logging interval. Default is 300 seconds, clamped between 30 and 3600 seconds. |
 
 Logs and debug output:
 
@@ -583,6 +586,8 @@ Logs and debug output:
 - Miner-specific state logs can also be enabled per miner spawn group with `minerConfig.logStateTransitions = true`.
 - Miner-specific debug strings include loop start, selected conceptual resource, survey start/finish, destination selection, path failure/retry, arrival, sample start, and sample completion.
 - Conceptual yield logs can be enabled per miner spawn group with `minerConfig.yieldConfig.logYield = true`; logs include resource label, generated amount, source bot object id, and aggregate total.
+- Periodic summary logs can be enabled per miner spawn group with `minerConfig.summaryConfig.enabled = true`. The manager logs a compact line with active miner count and current conceptual totals at `summaryConfig.intervalSeconds`.
+- Summary logging is read-only and skips completely empty summaries when there are no active miners and no conceptual totals.
 - `SimPathFindTask` always logs `SimPlayer: [Thread] EXCEPTION in findPath!` if pathfinding throws, even when debug macros are disabled.
 - The Lua config has commented-out `print` debug checks.
 
@@ -590,6 +595,7 @@ Stability considerations:
 
 - `SimPathFindTask`, `ArrivalCheckTask`, `SimBehaviorTask`, and `SimRetryTask` all hold weak references to the controller and bounce work back through `Core::getTaskManager()->executeTask`.
 - `SimBehaviorTask` re-resolves the miner controller inside the task-manager lambda from a captured strong base-controller reference. It should not capture raw delayed `SimMinerController*` pointers because survey/sample callbacks can run after a controller is stopped or recycled.
+- The periodic miner summary task is manager-owned and calls back through `SimPlayerManager::instance()`; it does not capture controller or AiAgent pointers.
 - `checkArrival` locks the AiAgent while examining combat/death/movement state and while updating patrol movement.
 - The current miner can schedule repeated arrival checks every 500 ms while moving and every 1000 ms while waiting, incapped, or in combat.
 - Pathfinding failure schedules a retry after 5000 ms by calling `startSimLoop` again.
@@ -606,6 +612,7 @@ Known limitations:
 - Conceptual totals reset on server restart.
 - Conceptual totals are not visible to players.
 - Conceptual totals are not connected to vendors, crafting, resource pools, harvesters, credits, containers, inventory, or persistence.
+- Active miner count in summary logs means currently tracked `SimMinerController` entries in `SimPlayerManager::controllers`, not a persisted population metric.
 - There is no miner market output or crafting input.
 
 Suggested future phases:
@@ -614,9 +621,928 @@ Suggested future phases:
 |---|---|---|
 | Phase A | Make current miner behavior observable and configurable. | Implemented for conceptual resources, survey/sample durations, movement radii, and optional state-transition logging. Miner count remains disabled by default. |
 | Phase B | Record conceptual gathered resource amounts in memory/log only. | Implemented with manager-owned in-memory aggregate totals and optional yield logging. No real economy systems are touched. |
+| Phase B.2 | Add periodic read-only miner summary logging. | Implemented with disabled-by-default `summaryConfig`; empty zero-miner summaries are skipped to avoid log noise. |
 | Phase C | Persist abstract resource inventory safely. | Store simple per-miner or per-system resource counters without creating SWG resource containers yet. |
 | Phase D | Sell resource lots through a controlled vendor/market abstraction. | Introduce a constrained output path with caps, pricing rules, and audit logs. |
 | Phase E | Connect to crafting/economy loops. | Only after resource accounting, persistence, and market limits are stable. |
+
+### Phase C - Persistence Architecture Research
+
+This section documents persistence research for future AI economy state. It is architecture guidance only; no persistence is implemented by the current SimMiner work.
+
+Current state:
+
+- SimMiner conceptual totals live in `SimPlayerManager::conceptualMinerTotals`.
+- Totals are memory-only and reset on server restart.
+- SimMiner output does not create `ResourceContainer` objects, credits, vendor stock, auction entries, crafting inputs, harvesters, player inventory, or database records.
+- Summary logging and per-yield logging are observability tools only.
+
+Existing Core3 persistence patterns inspected:
+
+| Pattern | Examples | How it works | Fit for AI economy |
+|---|---|---|---|
+| Persistent game objects through `ObjectManager` and Berkeley/ObjectDatabase | `sceneobjects`, `playerstructures`, `buffs`, `guilds`, `cityregions`, `resourcespawns`, `frsmanager`, `frsdata` loaded in `ObjectManager.cpp` | Objects are created or loaded through `ObjectManager`, serialized through `ManagedObject`/IDL/generated serialization, marked persistent, and flushed by Core3's object database update/commit threads. | Best fit for authoritative AI economy state if represented as a small manager-owned data object. |
+| Manager-owned persisted data object | `FrsManagerImplementation::loadFrsData` loads `frsmanager`; `FrsManagerData.idl` stores manager state; missing data is created and persisted. | Runtime manager stays transient, but durable state lives in a separate `ManagedObject` persisted in a dedicated object database. | Strongest precedent for AI economy state. Keeps behavior code separate from durable state and uses existing recovery flow. |
+| Persisted gameplay objects and data components | Droid module data components, vendor data components, structure permission lists, buffs, missions | State is stored on actual game objects or components using `toBinaryStream`/`parseFromBinaryStream` or `addSerializableVariable`, then saved with the owning object. | Good for future real objects, but poor for conceptual economy state because it would couple AI economy data to player/game object lifecycles. |
+| Server MySQL via `ServerDatabase` | Account/session/schema metadata, character lists, login/account data | MySQL schema migrations are managed in `ServerDatabase::updateDatabaseSchema`; queries are explicit SQL. | Useful for operational/account data, but higher risk and heavier than needed for abstract in-game economy counters. Requires schema changes and careful migration policy. |
+| Lua/config files | `sim_player_manager.lua`, AI config files | Defines startup configuration and tunables. | Good for defaults and tuning only. Runtime economy state should not be written back to Lua config. |
+| Manager-only memory | Current `SimPlayerManager::conceptualMinerTotals` | Fast, simple, and safe while experimenting. | Good for Phase B observability, but insufficient once server restart should preserve economy state. |
+
+Recommended persistence approach:
+
+Use a dedicated manager-owned persisted data object backed by Core3's existing object database system. The future shape should be similar to FRS:
+
+1. Add an AI economy data object, for example `AiEconomyData`, generated through IDL and persisted as a `ManagedObject`.
+2. Store it in a dedicated object database, for example `aieconomy`, loaded by `ObjectManager` during database initialization.
+3. Let a future `AiEconomyManager` or `SimPlayerManager` load that object on startup by iterating the database, similar to `FrsManagerImplementation::loadFrsData`.
+4. If the object is missing, create one default data object and persist it.
+5. Keep runtime controllers and SimPlayers transient; they should update the manager-owned economy data through narrow methods.
+6. Save by updating the persistent data object through the normal object database dirty/update flow, not by writing ad hoc files.
+
+Why this is preferred:
+
+- It follows an existing Core3 manager-state pattern instead of inventing a parallel save system.
+- It avoids real SWG resource containers and player-facing economic objects until the conceptual model is stable.
+- It can use generated serialization for maps, counters, timestamps, and version fields.
+- It has a clear recovery model: load one authoritative economy state object at manager startup or create defaults if absent.
+- It keeps future schema migration inside Core3's object/IDL evolution rather than hand-maintained custom files.
+
+Persistence options comparison:
+
+| Option | Advantages | Disadvantages | Recovery behavior | Operational risk | Suitability |
+|---|---|---|---|---|---|
+| Dedicated persisted `ManagedObject` in a new object database | Matches FRS manager-state precedent; works with Core3 serialization, object IDs, update threads, and database tooling; avoids SQL schema churn. | Requires IDL and object database registration in a future PR; needs versioning discipline. | Manager loads existing object; if missing, creates default object; if corrupt, can fail closed and keep economy disabled. | Medium, because it touches object persistence, but bounded and idiomatic. | Recommended for Phase C. |
+| Reuse an existing persisted manager database such as `frsmanager` or unrelated tables | No new database registration. | Pollutes unrelated systems and makes support/debugging confusing. | Ambiguous ownership and cleanup. | High. | Not recommended. |
+| MySQL tables through `ServerDatabase` | Easy to query externally; explicit schema; good for analytics. | Requires schema migrations, SQL escaping, operational DB coupling, and more policy around transactions. | Depends on table existence and migration success. | Medium to high. | Possible later for analytics/reporting, not first durable game-state storage. |
+| Manager-owned JSON/save file | Easy to inspect and hand edit; no IDL. | Bypasses Core3 object database conventions, needs atomic write/backup logic, path configuration, corruption handling, and permissions handling. | Must invent load/repair/fallback behavior. | Medium. | Not recommended unless object DB proves impractical. |
+| Store conceptual state on SimPlayer NPC objects | Uses existing object persistence if SimPlayers become persistent. | SimPlayers are currently spawned/transient service actors; controller lifecycle and despawn/recycle would threaten economy state. | Lost if NPC object is destroyed or recreated incorrectly. | High. | Not recommended. |
+| Store conceptual state as real `ResourceContainer`/inventory/vendor objects | Integrates with economy eventually. | Violates current conceptual boundary; risks players receiving fake resources before rules are ready. | Complex and player-visible. | High. | Future Phase E or later only, after abstraction is proven. |
+| Keep memory-only forever | Very low implementation complexity. | Restart erases economy history and prevents long-running supply/demand simulation. | No recovery. | Low runtime risk, high product limitation. | Good only through Phase B/B.2. |
+
+Recommended persisted categories:
+
+| Category | Persist? | Reason |
+|---|---|---|
+| Conceptual resource totals by label | Yes | This is the first durable inventory layer for AI economy loops. |
+| Conceptual inventory by AI role/group | Yes, once roles exist | Future SimCrafters, vendors, and consumers need stable inventories independent of individual spawned NPC lifetimes. |
+| Supply metrics | Yes | Supply/demand balancing needs restart-stable trend inputs. |
+| Demand metrics | Yes | Demand should evolve over real server uptime and survive restarts. |
+| Production statistics | Yes, aggregated | Useful for tuning and audit logs; keep raw event history bounded. |
+| Consumption statistics | Yes, aggregated | Needed for demand modeling and future vendor/crafter loops. |
+| Vendor inventory state | Yes, when conceptual vendors exist | Should survive restart, but should remain conceptual until a controlled market abstraction exists. |
+| Economic trend snapshots | Yes, bounded rolling window | Store coarse time buckets, not unbounded event logs. |
+| Active SimMiner count | No | Runtime observation only; derives from current controllers. |
+| Current SimMiner destinations/resources in progress | Usually no | Losing in-progress work on restart is acceptable; completed output should be the durable boundary. |
+| Debug/summary log state | No | Logs are operational output, not economy state. |
+| LLM conversation state | No for economy Phase C | Keep separate from economy persistence unless a future memory system is explicitly designed. |
+
+Recommended save cadence:
+
+- Record conceptual changes in memory immediately through manager APIs.
+- Mark the persisted economy data dirty after meaningful state changes.
+- Flush on a coarse interval, such as every 5 to 15 minutes, to avoid writing after every sample.
+- Force a save during orderly shutdown if the manager lifecycle provides a safe hook.
+- Keep per-event logging independent from persistence; logging should not be required for recovery.
+
+Restart recovery behavior:
+
+1. Load the dedicated AI economy object database during object database initialization.
+2. At AI economy manager startup, load the single economy state object.
+3. Validate version, resource labels, non-negative counters, and timestamp sanity.
+4. If missing, create a default empty economy state.
+5. If corrupt or incompatible, fail closed: disable AI economy production, keep SimMiner visual behavior safe, and log a clear error.
+6. Never synthesize real resources or player-visible goods during recovery.
+
+Failure scenarios to design for:
+
+- Server crash after memory totals change but before flush: accept bounded loss up to the save interval.
+- Corrupt persisted object: keep a backup/export path or recovery command in a later PR; do not let corrupt economy state block normal server startup.
+- Version mismatch after IDL changes: include a version field and migration path.
+- Counter overflow or bad values: clamp or reject negative/absurd totals on load.
+- Partial future feature rollout: economy persistence should tolerate missing roles such as crafters/vendors/consumers.
+- Accidental player-facing integration: keep conceptual inventory APIs separate from real resource/container APIs until a deliberate economy phase connects them.
+
+Future implementation phases:
+
+| Phase | Goal | Notes |
+|---|---|---|
+| Phase C.1 | Define persisted economy data shape. | Create an IDL design for `AiEconomyData` with version, resource totals, role inventories, coarse stats, and timestamps. |
+| Phase C.2 | Add database registration and load-only bootstrap. | Register a dedicated object database and load/create the data object without changing miner output yet. |
+| Phase C.3 | Save conceptual miner totals. | Periodically copy `SimPlayerManager` totals into the persisted data object; keep restart loss bounded by interval. |
+| Phase C.4 | Add admin/debug inspection. | Add read-only logs or tools to inspect persisted totals without player-facing economy effects. |
+| Phase C.5 | Add migrations and repair tooling. | Add version migration, backup/export, and safe reset options before expanding the economy. |
+
+Open questions:
+
+- Should AI economy ownership remain in `SimPlayerManager`, or should a new `AiEconomyManager` own durable state while SimPlayers report production events?
+- Should conceptual totals be galaxy-wide, planet-specific, resource-type-specific, or role-specific from the first persisted version?
+- What is the acceptable crash-loss window for a low-population solo server: 5 minutes, 15 minutes, or one server tick batch?
+- How much history is useful for supply/demand without creating unbounded database growth?
+- Should persistence be disabled by default until migration and admin reset tooling exists?
+
+### SWG Resource System Research
+
+This section captures how the real Core3 resource system works so future AI economy persistence does not hard-code around the current SimMiner placeholder labels.
+
+Main files inspected:
+
+- `MMOCoreORB/src/server/zone/managers/resource/ResourceManager.idl`
+- `MMOCoreORB/src/server/zone/managers/resource/ResourceManagerImplementation.cpp`
+- `MMOCoreORB/src/server/zone/managers/resource/ResourceShiftTask.h`
+- `MMOCoreORB/src/server/zone/managers/resource/resourcespawner/ResourceSpawner.h`
+- `MMOCoreORB/src/server/zone/managers/resource/resourcespawner/ResourceSpawner.cpp`
+- `MMOCoreORB/src/server/zone/managers/resource/resourcespawner/resourcetree/ResourceTree.h`
+- `MMOCoreORB/src/server/zone/managers/resource/resourcespawner/resourcetree/ResourceTree.cpp`
+- `MMOCoreORB/src/server/zone/managers/resource/resourcespawner/resourcetree/ResourceTreeEntry.h`
+- `MMOCoreORB/src/server/zone/managers/resource/resourcespawner/resourcetree/ResourceAttribute.h`
+- `MMOCoreORB/src/server/zone/objects/resource/ResourceSpawn.idl`
+- `MMOCoreORB/src/server/zone/objects/resource/ResourceSpawnImplementation.cpp`
+- `MMOCoreORB/src/server/zone/objects/resource/ResourceContainer.idl`
+- `MMOCoreORB/src/server/zone/objects/resource/ResourceContainerImplementation.cpp`
+- `MMOCoreORB/src/server/zone/objects/resource/SpawnDensityMap.h`
+- `MMOCoreORB/bin/scripts/managers/resource_manager.lua`
+- `MMOCoreORB/bin/scripts/managers/resource_manager_spawns.lua`
+- Crafting examples under `MMOCoreORB/bin/scripts/object/draft_schematic`, `MMOCoreORB/bin/scripts/object/weapon`, and `MMOCoreORB/bin/scripts/object/tangible/food`
+
+#### Resource hierarchy
+
+Core3 does not treat resources as flat labels such as `iron` or `water`. It builds a resource tree from the client data table `datatables/resource/resource_tree.iff` in `ResourceTree::buildTreeFromClient`. Each `ResourceTreeEntry` contains:
+
+- `type`: the final internal resource type, such as `copper_borocarbitic`.
+- Plain-English class chain, such as `Inorganic`, `Mineral`, `Metal`, `Non-Ferrous Metal`, `Copper`, `Conductive Borcarbitic Copper`.
+- STF/internal class chain, such as `inorganic`, `mineral`, `metal`, `metal_nonferrous`, `copper`, `copper_borocarbitic`.
+- Per-type attribute ranges.
+- Pool limits (`mintype`, `maxtype`, `minpool`, `maxpool`).
+- Zone restriction, if the type is planet-specific.
+- Survey tool type.
+- Resource container template CRC.
+- Random-name class for generated spawn names.
+
+The active in-game resource is a `ResourceSpawn`, not the tree entry itself. A `ResourceSpawn` stores a generated `spawnName`, final `spawnType`, class chains, generated stat values, active planet spawn maps, spawned/despawned timestamps, survey tool type, container CRC, and extraction counters.
+
+Example from `resource_manager_spawns.lua`:
+
+| Layer | Example value |
+|---|---|
+| Category/root | `Inorganic` |
+| Resource category | `Mineral` |
+| Resource class | `Metal` |
+| Resource subclass | `Non-Ferrous Metal` |
+| Family/type group | `Copper` |
+| Specific resource type | `Conductive Borcarbitic Copper` / `copper_borocarbitic` |
+| Spawn name | `Ababuglu` |
+
+Other examples:
+
+- `iron_kammris`: `Inorganic -> Mineral -> Metal -> Ferrous Metal -> Iron -> Kammris Iron`.
+- `water_vapor_lok`: `Water -> Lokian Water Vapor`, with `zoneRestriction = "lok"`.
+- `rice_wild_rori`: `Organic -> Flora Resources -> Flora Food -> Cereal -> Rice -> Wild Rice -> Rori Wild Rice`.
+- `bone_horn_rori`: `Organic -> Creature Resources -> Creature Structural -> Horn -> Rori Horn`.
+- `gas_reactive_organometallic`: `Inorganic -> Gas -> Reactive Gas -> Known Reactive Gas -> Unstable Organometallic Reactive Gas`.
+
+Internal identification:
+
+- Resource type is the stable class/type identifier used by schematics and pools, for example `iron`, `copper`, `chemical`, `metal`, or `copper_borocarbitic`.
+- Resource spawn name is the generated active resource name used for specific harvested stacks, for example `Ababuglu`.
+- `ResourceSpawn` has an object ID because it is a persisted game object in the `resourcespawns` object database.
+- `ResourceContainer` stores a reference to the `ResourceSpawn`, so a stack knows its spawn name, spawn type, and spawn object ID through that reference.
+
+#### Resource statistics
+
+Resource stats are stored on `ResourceSpawn::spawnAttributes` as a `VectorMap<string, int>`. `ResourceAttribute` maps stat strings to `CraftingManager` stat constants. `ResourceSpawnImplementation::getValueOf` maps those constants back to stored attribute names.
+
+| Abbreviation | Stored attribute | Meaning in Core3 naming | Notes |
+|---|---|---|---|
+| `CR` | `res_cold_resist` | Cold Resistance | Used by resource weighting when schematics request `CR`. |
+| `CD` | `res_conductivity` | Conductivity | Common in weapon and electronics-style weights. |
+| `DR` | `res_decay_resist` | Decay Resistance | Common in food/spice and structural durability-style weights. |
+| `HR` | `res_heat_resist` | Heat Resistance | Available as a resource stat and crafting weight. |
+| `FL` | `res_flavor` | Flavor | Common on food/organic resources and chef outputs. |
+| `MA` | `res_malleability` | Malleability | Common on metals/structural resources. |
+| `PE` | `res_potential_energy` | Potential Energy | Common on food/energy-related outputs. |
+| `OQ` | `res_quality` | Overall Quality | Broadly used across crafting categories. |
+| `SR` | `res_shock_resistance` | Shock Resistance | Used by several weapon/explosive/structural outputs. |
+| `UT` | `res_toughness` | Unit Toughness | Used by durability, armor, and some weapon outputs. |
+
+Generation and ranges:
+
+- `ResourceTree::buildTreeFromClient` reads each resource type's stat names and min/max gates from the resource tree data table.
+- `ResourceSpawner::createResourceSpawn` calls `randomizeValue(min, max)` for each resource attribute.
+- `randomizeValue` uses the per-type min/max range and applies `lowerGateOverride` and `spawnThrottling` from `resource_manager.lua`.
+- Admin-created specific resources clamp manually supplied stat values to `1..1000`.
+- The normal resource tree has per-type gates; future AI code should not assume every stat exists on every resource or that every stat uses the full `1..1000` range.
+
+#### Resource spawn lifecycle
+
+Startup flow:
+
+1. `ResourceManagerImplementation::initialize` loads resource config from `scripts/managers/resource_manager.lua`.
+2. It initializes `ResourceSpawner` pools and the resource tree.
+3. `ResourceSpawner::start` calls `loadResourceSpawns` and then `shiftResources`.
+4. `loadResourceSpawns` loads persisted `ResourceSpawn` objects from the `resourcespawns` object database.
+5. If the database is empty and `buildInitialResourcesFromScript = 1`, it loads initial resources from `scripts/managers/resource_manager_spawns.lua`.
+
+Shift flow:
+
+- `ResourceManagerImplementation::startResourceSpawner` schedules `ResourceShiftTask` using `averageShiftTime`.
+- The default config uses `averageShiftTime = 7200000` ms, or 2 hours.
+- `ResourceManagerImplementation::shiftResources` calls `ResourceSpawner::shiftResources` and schedules the next shift.
+- `ResourceSpawner::shiftResources` updates the random, fixed, native, minimum, and manual pools.
+- Expired or invalid resources are despawned by removing their spawn maps and setting their pool to `NOPOOL`.
+- Replacement resources are created by the pool update code when pool rules require them.
+
+Duration rules from `resource_manager.lua` and `ResourceSpawner::getRandomExpirationTime`:
+
+- Organic resources last between `6 * aveduration` and `22 * aveduration`.
+- Inorganic resources last between `6 * aveduration` and `11 * aveduration`.
+- JTL resources last between `13 * aveduration` and `22 * aveduration`.
+- Default `aveduration` is `86400` seconds.
+
+Planet and galaxy scope:
+
+- `ResourceSpawn` can be planet-specific through `zoneRestriction`.
+- Zone-specific resource types are detected when the type name contains an active zone suffix, such as `_rori`, `_lok`, or `_dantooine`.
+- Native pool resources are configured to spawn one planet-restricted resource per listed type on each planet.
+- Non-restricted resources can have spawn maps on multiple active zones.
+- `ResourceSpawn::spawnMaps` is keyed by zone name and stores a `SpawnDensityMap` for each planet where that spawn is active.
+
+Spawn density and concentration:
+
+- `ResourceSpawn::createSpawnMaps` builds per-zone density maps.
+- `SpawnDensityMap` uses simplex noise with a random seed, a map modifier, and max density.
+- Ore uses a broader map modifier than non-ore resources.
+- High density maps produce roughly `0.90..0.99` max density, medium `0.75..0.95`, and low `0.50..0.75`.
+- `ResourceSpawn::getDensityAt(zone, x, y)` returns `0` when the resource is not in shift or has no map for that zone.
+
+Pools:
+
+- `minimumPool` keeps configured resource families always present in at least the configured count.
+- `randomPool` chooses weighted entries from broad types such as `metal`, `ore`, `gas`, and `water`.
+- `fixedPool` keeps configured entries such as `iron` and JTL resource types present.
+- `nativePool` creates planet-restricted organic/native resources.
+- `manualPool` owns admin-created resources.
+
+#### Harvesting and sampling
+
+Manual survey flow:
+
+1. The player uses a survey tool and resource name.
+2. `ResourceManagerImplementation::sendSurvey` forwards to `ResourceSpawner::sendSurvey`.
+3. `sendSurvey` validates the active `SurveySession`, survey tool, resource name, and player zone.
+4. It samples a grid around the player using `resourceMap->getDensityAt`.
+5. It sends `SurveyMessage` results and may create/update a survey waypoint at the highest-density point.
+
+Manual sampling flow:
+
+1. `ResourceManagerImplementation::sendSample` forwards to `ResourceSpawner::sendSample`.
+2. `sendSample` validates the survey session/tool/resource/zone, applies action cost, plays the sample animation, reads density at the player's current location, and schedules sample result processing.
+3. `ResourceSpawner::sendSampleResults` validates density and skill thresholds.
+4. Units are calculated from density, surveying skill, random chance, city sample-size modifiers, optional gamble, and rich sample location bonuses.
+5. If enough units are extracted, it calls `resourceSpawn->extractResource(zoneName, unitsExtracted)`.
+6. It creates or stacks a `ResourceContainer` in player inventory through `addResourceToPlayerInventory`.
+7. It awards resource harvesting XP and notifies sample observers.
+
+Harvester and other extraction flows:
+
+- Harvester/installation code stores resource output as `ResourceContainer` objects in hoppers.
+- Foraging, fishing, creature/droid harvesting, director tooling, and admin commands all route through `ResourceManager`/`ResourceSpawner` helpers that resolve a current `ResourceSpawn`, call extraction, and create/add `ResourceContainer` stacks.
+- The common real-output object is still `ResourceContainer` referencing `ResourceSpawn`.
+
+Resource availability effects:
+
+- Density at the current planet coordinate directly affects manual sampling success and units.
+- Skill thresholds can prevent sampling low-density spots.
+- `ResourceSpawn::inShift` gates density lookup; expired resources effectively disappear from survey/sampling.
+- The inspected `SpawnDensityMap` stores `totalUnits` and `unitsHarvested`, but the current `ResourceSpawn::extractResource` implementation only increments `unitsInCirculation`; no code path inspected here consumes `SpawnDensityMap::unitsHarvested`.
+
+What real miners use:
+
+- Player survey/sampling systems use active resource name, planet, position, survey tool type, density map, survey skill, action/mind costs, and resource spawn metadata.
+- Harvesters use active resource spawn/container state through installation hopper logic.
+- Current SimMiner uses none of these real resource APIs.
+
+#### Crafting resource usage
+
+Crafting uses resource type requirements and resource stat weights rather than flat resource labels.
+
+Schematic ingredient requirements:
+
+- Draft schematics list `resourceTypes`, `resourceQuantities`, and contribution values.
+- Examples:
+  - `pistol_blaster_dl44.lua` requires generic `metal` plus specific weapon components.
+  - `clothing_armor_ris_bracer_l.lua` requires specific resource types such as `armophous_vendusii`, `fuel_petrochem_solid_known`, `fiberplast_talus`, `aluminum_chromium`, `copper_platinite`, and `hide_wooly_rori`, plus crafted components.
+  - `droid_r2_advanced.lua` requires `chemical` plus droid components.
+
+Experimental weighting:
+
+- Crafted object templates provide `numberExperimentalProperties`, `experimentalProperties`, `experimentalWeights`, groups, subgroups, min/max values, precision, and combine types.
+- `SharedTangibleObjectTemplate` converts those Lua arrays into `ResourceWeight` groups.
+- `ResourceWeight` maps strings such as `CD`, `OQ`, `SR`, and `UT` to numeric crafting stat identifiers.
+- `ResourceLabratory::setInitialCraftingValues` computes a weighted sum from the resources slotted into the manufacture schematic and uses it to set experimental percentages.
+- Experimentation later modifies those percentages, but the maximum possible value is bounded by the initial resource-weight result.
+
+Concrete examples:
+
+- Weapons such as `pistol_dl44.lua` use many `CD` and `OQ` weights for damage, speed/efficiency, range, and action/mind/health costs.
+- Grenades use `OQ` and `SR` heavily.
+- Food/drink examples under `tangible/food/crafted` commonly use `OQ`, `PE`, `FL`, and `DR`; some use `SR`.
+- Spice and creature bio effect food examples use `DR`, `OQ`, and `UT`.
+- Some droid/electronics and ship component examples use `CD`, `OQ`, `UT`, `SR`, and `PE`.
+
+Implication:
+
+- There is no single universal "best resource" value in the inspected Core3 path.
+- A resource can be excellent for one item category and poor for another depending on required resource type and weighted stats.
+- A future AI economy must model both eligibility (`resourceTypes`) and quality (`experimentalProperties`/`experimentalWeights`) if it wants to approximate player demand.
+
+#### Market behavior implications
+
+Conceptual labels like `iron`, `copper`, `gas`, and `water` are insufficient because:
+
+- They may describe broad families, not active spawn names.
+- They do not encode specific subtype, such as `iron_kammris` versus `iron_doonium`.
+- They do not encode generated stat values.
+- They do not encode planet availability or density maps.
+- They do not encode whether a resource is currently in shift.
+- They do not identify a `ResourceSpawn` object.
+- They do not distinguish real inventory (`ResourceContainer`) from abstract AI accounting.
+- They cannot answer whether a resource satisfies a schematic's exact `resourceTypes` requirement.
+- They cannot answer whether a resource is valuable for a profession's stat weighting.
+
+Attributes that can influence player demand:
+
+- Resource type/family eligibility for popular schematics.
+- Current active spawn name and object ID.
+- Stat vector and weighted quality for important crafting outputs.
+- Planet availability and density, because gatherability affects supply.
+- Time remaining before despawn.
+- Quantity in circulation or player/vendor supply.
+- Whether the resource is organic, inorganic, energy, JTL, native, recycled, or planet-restricted.
+- Container type and stackability when it becomes real inventory.
+
+#### SimMiner gap analysis
+
+What SimMiner currently models:
+
+- Conceptual resource label selection from configurable strings.
+- Visual survey animation.
+- Movement to a random navmesh/fallback destination.
+- Visual sample animation.
+- Memory-only conceptual yield totals keyed by selected label.
+- Optional per-yield and periodic summary logs.
+
+What real Core3 resources contain:
+
+- Resource tree type and class hierarchy.
+- Generated active spawn name.
+- `ResourceSpawn` object ID.
+- Per-stat generated values.
+- Spawn/despawn timestamps.
+- Planet/zone restrictions.
+- Per-planet density maps.
+- Survey tool type.
+- Resource container template CRC.
+- Pool ownership.
+- Real extraction and inventory object paths through `ResourceContainer`.
+
+Missing from SimMiner:
+
+- No `ResourceManager` lookup.
+- No `ResourceSpawn` identity.
+- No real resource type validation.
+- No resource stats.
+- No planet density/concentration check.
+- No survey tool concept.
+- No in-shift/despawn awareness.
+- No real unit extraction.
+- No `ResourceContainer`.
+- No interaction with harvesters, hoppers, vendors, bazaar, crafting, credits, player inventory, or persistence.
+- No demand model based on schematics or experimentation weights.
+
+#### Future persistence considerations
+
+Research-only recommendations:
+
+- Persisting only `iron=123` is too lossy for any economy that may later touch crafting or markets.
+- The first persistent AI economy format may still keep conceptual counters, but it should be versioned and explicitly named as abstract/conceptual.
+- If future AI miners gather real or semi-real resources, persisted entries should likely include:
+  - Conceptual quantity.
+  - Resource type, such as `copper_borocarbitic`.
+  - Resource spawn name, if tied to an active spawn.
+  - Resource spawn object ID, if the spawn is expected to still exist.
+  - Class chain or final class snapshot.
+  - Stat map snapshot.
+  - Planet/zone source.
+  - Gather timestamp.
+  - Whether the source spawn was active at gather time.
+  - AI role/group owner.
+- If the economy remains abstract, persisted entries should still include enough metadata to migrate from broad labels to typed resources later.
+- Aggregated supply/demand trends should persist as coarse time buckets, not unbounded per-sample event history.
+- Runtime-only state should remain transient: active miner count, current destination, current animation phase, in-progress sample, current path, and debug counters.
+- Real `ResourceContainer` objects should not be created merely to persist abstract AI inventory.
+- Player inventory, hopper contents, vendor stock, and bazaar listings should not be used as persistence backends for conceptual state.
+- If future AI economy state references a real `ResourceSpawn`, recovery must handle despawned or missing spawns by preserving historical metadata without pretending that the spawn is still active.
+- Before a real economy bridge is implemented, define a strict boundary between abstract AI inventory and Core3's real resource/container APIs.
+
+### Galaxy Resource Intelligence Network
+
+This section describes a future shared AI knowledge layer for resource discovery and economic reasoning. It is architecture research only. It does not define persistence schemas, database objects, new classes, or runtime behavior.
+
+The core question is: what should the AI economy understand before deciding how to save it?
+
+#### Purpose
+
+The Galaxy Resource Intelligence Network would be a shared intelligence layer that all AI economic roles can consult and update. It should not be a per-miner backpack or a replacement for Core3's real `ResourceManager`. Instead, it should be a common knowledge model that turns live resource system facts into AI-usable economic signals.
+
+Future goals:
+
+- Track discovered active resources.
+- Evaluate resource quality by profession/use case.
+- Track which resources are still active and when they are likely to expire.
+- Estimate available supply, scarcity, and gatherability.
+- Estimate demand from crafters, vendors, consumers, factions, and guilds.
+- Let multiple AI roles make decisions from the same resource knowledge instead of each role inventing its own view.
+
+The network should remain clearly separate from real player inventory, `ResourceContainer` stacks, vendors, bazaar listings, credits, and crafting output until a later explicit economy-integration phase.
+
+#### Shared knowledge model
+
+A future intelligence entry should represent a known resource opportunity, not just a raw counter. Useful fields to understand conceptually include:
+
+| Knowledge area | Examples | Why it matters |
+|---|---|---|
+| Resource identity | Resource type, active spawn name, `ResourceSpawn` object ID if live, class chain | Lets AI distinguish `iron_kammris` from `iron_doonium` and broad `iron` requests from specific active spawns. |
+| Spawn state | Planet/zone, active/inactive, spawned/despawned timestamps, time remaining | Prevents AI decisions based on expired resources. |
+| Resource stats | OQ, CD, DR, HR, FL, MA, PE, SR, UT, CR when present | Enables profession-specific quality evaluation. |
+| Gatherability | Planet availability, density estimate, known rich areas, survey confidence | Helps miners choose where to operate and helps vendors understand supply risk. |
+| Supply signal | Known conceptual stock, recent production rate, scarcity estimate | Helps crafters/vendors decide whether to consume or conserve a resource. |
+| Demand signal | Professions/items that want this resource, current requested quantities, priority | Helps miners gather what the economy needs instead of random labels. |
+| Evaluation scores | Weaponsmith score, armorsmith score, chef score, architect score, generic value score | Lets different AI roles share one resource catalog while making role-specific decisions. |
+| Confidence and freshness | Who discovered it, last observed time, observation count, stale flag | Prevents old scout data from being treated as authoritative forever. |
+
+This model should be read as information requirements, not a storage design.
+
+#### Resource Scout concept
+
+A future SimMiner can evolve into a resource scout before it becomes a real economic harvester. This is a safer intermediate role because scouting can inspect and classify resources without creating real resources or moving goods through the economy.
+
+Future scout responsibilities:
+
+- Inspect active `ResourceSpawn` data through a controlled engine/service API.
+- Identify the resource type hierarchy and generated spawn name.
+- Read available stats and planet restrictions.
+- Determine whether the spawn is active and estimate time remaining.
+- Estimate gatherability from known density information or survey-like observations.
+- Classify usefulness by profession or demand category.
+- Publish a finding into the shared intelligence layer.
+- Update stale findings when a resource despawns or a better observation is made.
+
+Possible scout outputs:
+
+- "High-OQ/CD metal active on Corellia; useful for weaponsmith demand."
+- "Flavor-heavy organic food resource active on Rori; useful for chef demand."
+- "Planet-restricted water is available but low priority because supply is already high."
+- "Previously useful spawn expired; mark as stale and remove from active gathering plans."
+
+Important boundary:
+
+- A scout should not create `ResourceContainer` objects.
+- A scout should not modify player inventory, vendors, bazaar, harvesters, credits, or crafting.
+- A scout should publish knowledge, not goods.
+
+#### Shared knowledge versus per-miner knowledge
+
+| Model | Advantages | Disadvantages | Recommendation |
+|---|---|---|---|
+| Per-miner inventory | Simple mental model; supports individual worker identity; useful for future role flavor. | Duplicates global state, can strand important knowledge on despawned/recycled NPCs, makes economy-wide demand harder to balance. | Use only for local carried/assigned output once real production exists. Do not make it the primary resource intelligence source. |
+| Per-miner memory | Good for short-term behavior, local patrol decisions, and avoiding repeated failed actions. | Volatile, fragmented, and hard to aggregate across the galaxy. | Keep transient and behavior-focused: current target, recent failed locations, short cooldowns. |
+| Shared galaxy intelligence | Gives miners, crafters, vendors, consumers, factions, and guilds one common source of resource truth; supports supply/demand coordination; safer for persistence planning. | Requires careful authority, freshness, and conflict rules; can become too broad if it stores every event forever. | Recommended as the primary future economy knowledge layer. Keep it bounded, versioned, and separated from real inventory. |
+
+Recommended split:
+
+- Per-miner memory should answer: "What am I doing right now, and what did I just try?"
+- Per-miner inventory should answer: "What output has this worker personally produced or been assigned?"
+- Shared galaxy intelligence should answer: "What does the AI economy know about resources, supply, demand, and value?"
+
+#### AI role interaction model
+
+All future AI economic roles should be able to reference the same intelligence layer while keeping role-specific decisions separate.
+
+| Role | How it could use shared intelligence |
+|---|---|
+| SimMiners | Choose scouting/gathering targets based on active resources, demand scores, scarcity, planet access, and expiration risk. |
+| SimCrafters | Select resources that satisfy schematic requirements and maximize profession-specific stat scores. |
+| SimVendors | Adjust conceptual inventory, pricing, and restock requests based on supply scarcity and demand signals. |
+| SimConsumers | Generate demand for goods, indirectly increasing demand for the resources used to craft those goods. |
+| PvP factions | Prioritize patrols, raids, or defense around valuable resource regions without needing their own duplicate resource catalog. |
+| Future AI guilds | Coordinate large goals, such as "stockpile chef organics" or "support weaponsmith production for faction conflict." |
+
+Interaction principle:
+
+- The intelligence network should provide facts and scores.
+- Behavior systems should make decisions.
+- Engine systems should perform gameplay effects.
+
+This keeps generated intelligence from directly causing unsafe gameplay side effects.
+
+#### Resource scoring architecture
+
+Future scoring should be role-aware and use Core3 crafting facts rather than a single global quality number. Scores should be explainable enough for logs and debugging.
+
+Potential score families:
+
+| Score | Inputs | Example interpretation |
+|---|---|---|
+| Generic value score | OQ, rarity, active time remaining, demand count, scarcity | "Generally useful and scarce." |
+| Weaponsmith demand score | Eligibility for weapon schematics, CD/OQ/SR/UT weights, current weapon demand | "Useful for high-demand weapon production." |
+| Armorsmith demand score | Armor schematic eligibility, OQ/UT/SR/DR/MA-style durability and resistance relevance, component demand | "Useful for armor segments or required RIS-style resources." |
+| Chef demand score | Food resource eligibility, FL/PE/OQ/DR/SR relevance, consumer demand | "Useful for food/drink crafting or buffs." |
+| Architect demand score | Structural resource eligibility, OQ/DR/UT/MA-style durability relevance, building/component demand | "Useful for structures and installation components." |
+| Droid/electronics score | Chemical/metal/electronics eligibility, CD/OQ/PE/SR relevance | "Useful for droid and electronic components." |
+| Faction logistics score | Scarcity, combat production demand, location, faction strategy | "Worth guarding, disrupting, or prioritizing." |
+
+Scoring concepts:
+
+- Eligibility comes first: a resource must satisfy the requested type or class requirement before high stats matter.
+- Scores should account for missing stats. A resource without `FL` should not receive chef flavor credit.
+- Scores should be role-specific because the same resource can be valuable to one profession and unimportant to another.
+- Scores should preserve explainability, such as "high because OQ/CD are strong and weaponsmith demand is active."
+- Scores should degrade or become stale when the resource is near despawn or no longer active.
+- Scores should not create gameplay effects by themselves.
+
+Future scoring could be layered:
+
+1. Raw stat normalization by resource type.
+2. Schematic eligibility matching.
+3. Profession-specific weighted score.
+4. Supply/demand adjustment.
+5. Freshness/expiration adjustment.
+6. Final priority score for behavior systems.
+
+#### Supply and demand awareness
+
+The intelligence layer should distinguish resource knowledge from economic pressure.
+
+Supply signals might include:
+
+- Known conceptual totals.
+- Recent production rate.
+- Number of active scouts/miners assigned.
+- Known density/gatherability.
+- Known or estimated time until despawn.
+- Whether equivalent resource types are currently available.
+
+Demand signals might include:
+
+- Crafting goals waiting for inputs.
+- Vendor restock requests.
+- Consumer demand by product category.
+- Faction or guild strategic goals.
+- Scarcity of substitutes.
+- Manual admin-configured priorities for a solo/low-population server.
+
+Supply and demand should be separate inputs so the AI can explain decisions:
+
+- "Gather because demand is high and supply is low."
+- "Ignore because resource is excellent but expires soon and no current role needs it."
+- "Scout because stats are unknown and the type could satisfy a high-priority schematic."
+
+#### Expiration awareness
+
+Real resources are temporary. The intelligence network should treat active status and freshness as first-class concepts.
+
+Future behavior should account for:
+
+- Active versus expired resource spawns.
+- Time remaining until despawn.
+- Confidence that a scout observation is still valid.
+- Whether a planned gather route can complete before expiration.
+- Whether an expired resource should remain as historical market knowledge but not an active target.
+
+This is one reason persistence should not simply save active `ResourceSpawn` IDs without metadata. On restart or later load, a referenced spawn may be gone, but its historical stats and demand impact may still be useful for trend analysis.
+
+#### Recommended evolution path
+
+This roadmap defines knowledge and behavior evolution only. It intentionally does not design persistence yet.
+
+| Phase | Goal | Expected benefit | Risk to manage |
+|---|---|---|---|
+| Phase D - Resource intelligence | Build a read-only/shared knowledge concept around active resources, quality, supply, demand, and expiration. | AI roles can reason from the same resource facts before any real economy writes occur. | Avoid turning intelligence updates into gameplay effects. |
+| Phase E - Supply and demand modeling | Add abstract pressure signals from crafters, vendors, consumers, factions, and admin priorities. | Miners gather for reasons instead of random labels. | Keep models bounded and explainable; avoid runaway demand loops. |
+| Phase F - AI crafting | Let SimCrafters consume conceptual inputs and produce conceptual outputs using schematic-aware resource evaluation. | Connect resource intelligence to production planning without immediately touching real player markets. | Maintain strict separation from real crafting outputs until deliberately bridged. |
+| Phase G - AI market participation | Introduce controlled vendor/market behavior based on conceptual stock and demand. | The galaxy economy becomes visible and interactive in limited, auditable ways. | Prevent inflation, fake resource leakage, and uncontrolled player-facing goods. |
+| Phase H - Persistent living economy | Decide persistence after the intelligence model is stable and the economy knows what state matters. | Restart can preserve meaningful economic state rather than arbitrary early counters. | Persistence must preserve abstractions without locking in bad resource identifiers. |
+
+Recommended ordering:
+
+1. Define the intelligence vocabulary.
+2. Define scout observations.
+3. Define scoring inputs and explanations.
+4. Define supply/demand signals.
+5. Validate the model with logs and read-only summaries.
+6. Research schematic-aware scoring before letting miners target real active resources.
+6. Only then design persistence.
+
+Open questions:
+
+- Should intelligence be galaxy-wide first, or planet-specific from the beginning?
+- Should AI scouts inspect all active resources globally or only resources discoverable from their current planet?
+- How much density information should be known globally versus learned through scout movement?
+- Should demand be driven first by configured goals, simulated consumers, or actual player market observations?
+- Should future PvP factions react to valuable resource zones before market participation exists?
+- What resource score explanations are needed in logs so economy decisions are debuggable?
+
+### Resource Intelligence MVP
+
+This is the first read-only implementation step toward the Galaxy Resource Intelligence Network. It is observability only.
+
+Current implementation:
+
+- Configured in `MMOCoreORB/bin/scripts/managers/sim_player_manager.lua` with `resourceIntelligenceConfig`.
+- Implemented in `SimPlayerManager` as a periodic read-only snapshot task.
+- Disabled by default with `enabled = false`.
+- Top-resource logging is separately disabled by default with `logTopResources = false`.
+- Does not change SimMiner targeting, movement, survey timing, sampling timing, conceptual yield accounting, or spawn counts.
+- Does not create resources, `ResourceContainer` objects, inventory items, vendor stock, bazaar listings, harvester output, credits, or crafting output.
+
+Default config:
+
+```lua
+resourceIntelligenceConfig = {
+    enabled = false,
+    logTopResources = false,
+    summaryIntervalSeconds = 600,
+    topN = 10,
+}
+```
+
+Read-only access path:
+
+1. `SimPlayerManager` schedules a `ResourceIntelligenceTask` only when `resourceIntelligenceConfig.enabled` is true.
+2. The task calls `SimPlayerManager::logResourceIntelligenceSummary`.
+3. The manager obtains `ZoneServer` through `ServerCore::getZoneServer`.
+4. It obtains `ResourceManager` through `ZoneServer::getResourceManager`.
+5. It locks `ResourceManager` while reading `ResourceSpawner::getResourceMap`.
+6. It iterates current `ResourceMap` entries and skips null or inactive/non-shift resources.
+7. It copies primitive metadata into local snapshot rows before logging.
+
+Metadata currently read:
+
+| Field | Source | Notes |
+|---|---|---|
+| Resource spawn object ID | `ResourceSpawn::getObjectID` | Useful for identifying live spawns in logs. |
+| Spawn name | `ResourceSpawn::getName` | The generated active resource name. |
+| Spawn type | `ResourceSpawn::getType` | The internal resource type, such as `copper_borocarbitic`. |
+| Class/type chain | `ResourceSpawn::getStfClass` | Logged/copied as the STF class chain when present. |
+| Active status | `ResourceSpawn::inShift` | Only in-shift resources are included in the MVP snapshot. |
+| Zone availability | `ResourceSpawn::getSpawnMapZone` | Captures the zones where the spawn has maps. |
+| Despawn timestamp | `ResourceSpawn::getDespawned` | Spawn timestamp is not currently exposed through a public getter, so it is not read to avoid IDL changes. |
+| Survey tool type | `ResourceSpawn::getSurveyToolType` | Captured for future scout/tool reasoning. |
+| Stats | `ResourceSpawn::getValueOf(attributeName)` | Reads OQ/CD/DR/HR/FL/MA/PE/SR/UT/CR when present. |
+
+Initial heuristic score families:
+
+| Score | Current heuristic | Notes |
+|---|---|---|
+| `genericScore` | Weighted average of OQ plus available resource stats. | OQ has extra weight; missing stats are ignored, not treated as perfect. |
+| `weaponsmithScore` | CD, OQ, SR, UT. | Inspired by common weapon stat weights, but not schematic-exact. |
+| `armorsmithScore` | OQ, UT, SR, DR, MA. | Approximate armor/structural quality signal. |
+| `chefScore` | OQ, PE, FL, DR. | Approximate food/drink usefulness signal. |
+| `architectScore` | OQ, DR, UT, MA. | Approximate structure/component usefulness signal. |
+
+Logging behavior:
+
+- If `enabled = false`, no resource intelligence task is scheduled.
+- If `enabled = true`, the task logs a compact read-only snapshot summary at `summaryIntervalSeconds`.
+- If `logTopResources = true`, the task logs up to `topN` resources per score family.
+- Logs are intentionally heuristic and diagnostic. They do not feed gameplay decisions.
+
+Limitations:
+
+- Scoring is approximate and intentionally early.
+- Scoring is not tied to exact draft schematics yet.
+- No density sampling or best-location discovery is performed.
+- No persistence exists.
+- No miner targeting uses these scores.
+- No shared resource memory exists yet beyond the periodic snapshot/log output.
+- No `ResourceContainer` objects are created.
+- No real economy systems are touched.
+- Spawned timestamp is not read because `ResourceSpawn` currently exposes `getDespawned` but not `getSpawned`; the MVP avoids IDL changes.
+
+Recommended next step:
+
+Do not jump to persistence yet. The next safest step should be either:
+
+- Schematic-aware scoring research, mapping common draft schematic `resourceTypes` and `experimentalProperties` into better profession scores.
+- Miner target-selection simulation in logs only, where the system reports what a scout would choose without changing actual SimMiner behavior.
+
+### Schematic-Aware Resource Scoring Research
+
+This section documents how to evolve the current Resource Intelligence MVP from broad heuristic scores into schematic-aware scores. It is research only. No miner targeting, persistence, resource creation, player inventory, vendor, bazaar, crafting, harvester, credit, or player-facing economy behavior is implemented by this section.
+
+#### Research scope
+
+Files and systems inspected:
+
+- Draft schematic Lua under `MMOCoreORB/bin/scripts/object/draft_schematic`, including weapon, armor, food, structure, and droid examples.
+- Crafted output and component templates under `MMOCoreORB/bin/scripts/object/weapon`, `MMOCoreORB/bin/scripts/object/tangible/component`, and `MMOCoreORB/bin/scripts/object/tangible/food`.
+- `MMOCoreORB/src/templates/intangible/DraftSchematicObjectTemplate.cpp`
+- `MMOCoreORB/src/templates/SharedTangibleObjectTemplate.cpp`
+- `MMOCoreORB/src/templates/crafting/resourceweight/ResourceWeight.h`
+- `MMOCoreORB/src/server/zone/objects/manufactureschematic/ManufactureSchematicImplementation.cpp`
+- `MMOCoreORB/src/server/zone/objects/manufactureschematic/ingredientslots/IngredientSlot.h`
+- `MMOCoreORB/src/server/zone/objects/manufactureschematic/ingredientslots/ResourceSlot.h`
+- `MMOCoreORB/src/server/zone/managers/crafting/labratories/ResourceLabratory.cpp`
+- `MMOCoreORB/src/server/zone/managers/crafting/labratories/SharedLabratory.cpp`
+- `MMOCoreORB/src/server/zone/objects/resource/ResourceSpawn.idl`
+- `MMOCoreORB/src/server/zone/objects/resource/ResourceSpawnImplementation.cpp`
+
+#### Draft schematic structure
+
+Draft schematic Lua files define what ingredients are eligible for a craft and how much is needed. The parser in `DraftSchematicObjectTemplate::parseVariableData` reads these fields into vectors, and `DraftSchematicObjectTemplate::readObject` turns each row into a `DraftSlot`.
+
+Important fields:
+
+| Field | Meaning | Runtime destination |
+|---|---|---|
+| `craftingToolTab` | Crafting category/tab used by the client and crafting systems. | `DraftSchematicObjectTemplate::craftingToolTab` |
+| `assemblySkill` | Skill used for assembly rolls. | `DraftSchematicObjectTemplate::assemblySkill` |
+| `experimentingSkill` | Skill used for experimentation rolls. | `DraftSchematicObjectTemplate::experimentingSkill` |
+| `ingredientTemplateNames` | String table references for slot names. | `DraftSlot::setStringId` |
+| `ingredientTitleNames` | Slot title keys. | `DraftSlot::setStringId` |
+| `ingredientSlotType` | Slot behavior: resource slot, identical component slot, mixed component slot, optional variants. | `DraftSlot::setSlotType`; later mapped to `ResourceSlot` or `ComponentSlot` |
+| `resourceTypes` | Eligibility string for each slot. For resource slots this is a resource class/type; for component slots this can be an object template path. | `DraftSlot::setResourceType` and then `IngredientSlot::setContentType` |
+| `resourceQuantities` | Required amount for each slot. | `DraftSlot::setQuantity`; later used by `SharedLabratory::getWeightedValue` |
+| `contribution` | Per-slot contribution value carried on the `DraftSlot`. | `DraftSlot::setContribution` |
+| `targetTemplate` | Crafted output/component template path. | Stored as CRC; used to load `SharedTangibleObjectTemplate` for resource weights |
+| `additionalTemplates` | Alternative visual/output templates. | Stored on draft schematic template |
+
+Representative examples:
+
+| Category | Draft schematic | Resource and component shape |
+|---|---|---|
+| Weapon component | `draft_schematic/weapon/component/blaster_pistol_barrel.lua` | Five raw resource slots: `metal`, `metal`, `metal`, `gemstone`, `metal`; quantities 10, 8, 6, 1, 3. |
+| Armor component | `draft_schematic/armor/armor_segment_composite.lua` | Raw `metal` and `steel` slots plus component slots for armor layers and segment enhancement templates. |
+| Food | `draft_schematic/food/dish_ahrisa.lua` | Raw `vegetable_greens` and `fruit_flowers` plus component/object-template slots for `dish_soypro` and additive. |
+| Structure component | `draft_schematic/structure/component/structure_light_ore_mining_unit.lua` | Raw `steel`, `metal`, and `gas_inert` slots in large quantities. |
+| Droid/electronics | `draft_schematic/droid/component/crafting_module_weapon.lua` | Raw `aluminum`, `gas_inert`, and `metal` slots. |
+
+This means future scoring cannot look only at final item categories. Many high-value schematics depend on intermediate components. A first scorer can evaluate direct raw resource slots, but a complete scorer will eventually need to walk component chains or maintain curated component demand profiles.
+
+#### Experimental weighting structure
+
+Crafted target templates define the resource-stat weights that become experimental attributes. `DraftSchematicObjectTemplate::getResourceWeights` loads the target template through `TemplateManager` and returns the target template's `resourceWeights`. Those weights are built by `SharedTangibleObjectTemplate` from:
+
+- `numberExperimentalProperties`
+- `experimentalProperties`
+- `experimentalWeights`
+- `experimentalGroupTitles`
+- `experimentalSubGroupTitles`
+- `experimentalMin`
+- `experimentalMax`
+- `experimentalPrecision`
+- `experimentalCombineType`
+
+`SharedTangibleObjectTemplate` groups the flat `experimentalProperties` and `experimentalWeights` arrays into `ResourceWeight` rows. `ResourceWeight::convertStringValue` maps resource stat strings to crafting stat codes:
+
+| Template string | Resource stat |
+|---|---|
+| `CR` | Cold Resistance |
+| `CD` | Conductivity |
+| `DR` | Decay Resistance |
+| `HR` | Heat Resistance |
+| `FL` | Flavor |
+| `MA` | Malleability |
+| `PE` | Potential Energy |
+| `OQ` | Overall Quality |
+| `SR` | Shock Resistance |
+| `UT` | Unit Toughness |
+| `BK` | Bulk |
+| `XX` / unknown | Filler/no resource stat |
+
+Representative target-template examples:
+
+| Target template | Experimental signal |
+|---|---|
+| `object/tangible/component/weapon/blaster_pistol_barrel.iff` | Damage/range/durability rows use `CD` and `SR`, often with `CD` weighted higher than `SR`. |
+| `object/weapon/ranged/pistol/pistol_dl44.iff` | Weapon final item rows commonly use repeated `CD` and `OQ` pairs across damage, efficiency, durability, and range attributes. |
+| `object/tangible/component/armor/armor_segment_composite.iff` | Armor effectiveness and encumbrance rows use combinations of `OQ`, `SR`, `UT`, and `MA`. |
+| `object/tangible/food/crafted/dish_ahrisa.iff` | Food rows use `OQ`, `PE`, `FL`, and `DR`; quantity has strong `PE`/`DR` weighting in this example. |
+| `object/tangible/component/structure/light_ore_mining_unit.iff` | Extraction efficiency uses `HR`, `SR`, and `UT`, with `UT` weighted more heavily. |
+| `object/tangible/component/droid/crafting_module_weapon.iff` | Droid module effectiveness/durability uses `CD` and `OQ`. |
+
+`ResourceLabratory::setInitialCraftingValues` then evaluates each `ResourceWeight` by:
+
+1. Adding an experimental attribute for the target row.
+2. Iterating the row's stat weights.
+3. Calling `SharedLabratory::getWeightedValue` for each stat.
+4. Combining those stat values by the `ResourceWeight` percentages.
+5. Converting the weighted sum into max/current experimentation percentages.
+
+`SharedLabratory::getWeightedValue` computes a quantity-weighted average across filled ingredient slots. For raw resource slots it reads `ResourceSlot::getCurrentSpawn` and then `ResourceSpawn::getValueOf(type)`. For custom ingredient component slots it can read `CustomIngredient::getValueOf(type)` when the slotted component carries resource-derived values.
+
+Implication: a schematic-aware AI score should model expected contribution to a chosen schematic or profile, including ingredient quantity, eligibility, and target-template resource weights. A flat family score is useful for scouting, but it cannot explain whether a resource is good for a specific item.
+
+#### Eligibility matching
+
+Resource eligibility is enforced by `ResourceSlot::add`: the incoming object must be a `ResourceContainer`, its spawn must match any existing `currentSpawn` for that slot, and `incomingResource->getSpawnObject()->isType(contentType)` must be true.
+
+`ResourceSpawn::isType` checks both `stfSpawnClasses` and `spawnClasses`. A future read-only scorer should use the same rule conceptually:
+
+1. Read the schematic slot's `resourceType`.
+2. Skip component/object-template slots unless the scorer has component-chain support.
+3. For raw resource slots, treat a `ResourceSpawn` as eligible when `spawn->isType(slotResourceType)` would be true.
+4. Score only eligible spawns for that slot.
+5. Weight slot influence by `resourceQuantities` and, later, demand for the item/component.
+
+Examples:
+
+- A generic `metal` slot should accept any active spawn whose class chain includes `metal`.
+- A `copper` slot should accept copper subtypes because their class chain should include `copper`.
+- A specific subtype such as `copper_borocarbitic` should require that exact class/type match.
+- Food resources such as `vegetable_greens`, `fruit_flowers`, `meat`, or `water` should be matched through the resource class chain, not a broad conceptual label.
+- Chemical, gas, mineral, ore, and energy resources should use the same class-chain eligibility rule.
+- Planet-specific resources are still resources with type/class metadata, but availability and density should remain separate intelligence facts.
+
+Object-template strings such as `object/tangible/component/armor/shared_armor_layer.iff` are not raw resource types. They represent component requirements. A resource scorer should not mark a live `ResourceSpawn` eligible for those slots unless it is recursively scoring the component schematic that produces the required component.
+
+#### Profession/category scoring
+
+The current Resource Intelligence MVP has broad score families: `weaponsmithScore`, `armorsmithScore`, `chefScore`, and `architectScore`. These are useful for discovery logs, but they are intentionally too broad.
+
+Future scoring should move from "profession likes these stats" to "resource is eligible for these high-priority schematic slots and improves these experimental rows."
+
+| Category | Representative examples | Important resource types | Important stat weights | Current heuristic fit |
+|---|---|---|---|---|
+| Weaponsmith | `blaster_pistol_barrel`, `pistol_dl44` | Metal, gemstone, subtype metals, weapon components | Component barrel example emphasizes `CD`/`SR`; final weapon templates commonly emphasize `CD`/`OQ`. | Current `CD/OQ/SR/UT` is directionally useful but overvalues `UT` for examples where exact templates care mostly about `CD`, `OQ`, or `SR`. |
+| Armorsmith | `armor_segment_composite` | Metal, steel, armor layers, armor segment enhancements | `OQ`, `SR`, `UT`, and `MA` appear in armor effectiveness/encumbrance/resistance rows. | Current `OQ/UT/SR/DR/MA` is broad; `DR` may be useful for some armor-adjacent profiles but was not central in the inspected composite segment target. |
+| Chef | `dish_ahrisa` | Vegetables, fruits, meats, water, additives, prepared food components | `OQ`, `PE`, `FL`, and `DR`, with row-specific weights. | Current `OQ/PE/FL/DR` matches the inspected food example well, but it lacks eligibility and cannot distinguish greens from flowers from additives. |
+| Architect/structures | `structure_light_ore_mining_unit`, house/city/factory deeds | Steel, metal, gas, structure components | Structure component example uses `HR`, `SR`, `UT`, with `UT` weighted heavily; many deeds/components use `DR`, `UT`, `MA`, or `OQ` depending on target. | Current `OQ/DR/UT/MA` misses `HR`/`SR` for mining-unit efficiency and is too broad across all structure outputs. |
+| Droid/electronics | `crafting_module_weapon`, droid component schematics | Aluminum, copper, steel, metal, gas, ore, chemical, electronics components | Droid module example uses `CD`/`OQ`; other droid components vary by electronics/mechanical role. | No dedicated current score exists; droid/electronics should start as curated profiles rather than borrowing generic weaponsmith/architect scores. |
+| Generic/high-value | Active resources eligible for many common slots or rare high-demand slots | Broad class-chain coverage plus high-stat outliers | OQ plus category-specific rare stat combinations | Current `genericScore` is useful for scouting but should not drive production decisions alone. |
+
+#### Explainability requirements
+
+Future logs should explain both eligibility and score composition. A good explanation should include:
+
+- Resource spawn name and type.
+- Matched schematic/profile.
+- Matched ingredient slot and required resource type.
+- Quantity required by that slot.
+- Stats used and their values.
+- Target-template weight profile.
+- Whether component-chain demand is direct or inferred.
+- Whether the score is advisory, log-only, simulated, or behavior-driving.
+
+Example future log shape:
+
+```text
+[ResourceIntelligence] Ababuglu copper_borocarbitic weaponsmithScore=842 eligibleFor=blaster_pistol_barrel:emitter_nozzle slotType=metal qty=10 stats=CD:880 SR:650 weightProfile=expDamage CD:2 SR:1 mode=log-only
+```
+
+For higher-level category logs:
+
+```text
+[ResourceIntelligence] top chef: Kima vegetable_greens score=791 eligibleFor=dish_ahrisa:greens qty=20 stats=OQ:910 PE:760 FL:620 DR:480 rows=nutrition/flavor/quantity/filling mode=log-only
+```
+
+#### Implementation recommendation
+
+Do not jump directly to full dynamic schematic parsing for behavior decisions. The safest path is a hybrid, staged approach:
+
+| Option | Advantages | Disadvantages | Recommendation |
+|---|---|---|---|
+| Curated scoring profiles | Small, reviewable, easy to explain, can target known high-value examples, avoids parsing every schematic edge case at once. | Incomplete; requires manual maintenance; can reflect designer bias. | Best first implementation step after this research. |
+| Fully dynamic schematic parsing | Most complete; can eventually use loaded template data and exact `ResourceWeight` rows; reduces manual duplication. | Higher complexity; must handle component recursion, optional slots, magic schematics, category labeling, and performance. | Good long-term goal after curated profiles prove the model. |
+| Admin-configured demand profiles | Gives server owners control over economy goals; can steer low-population economy intentionally. | Needs validation, documentation, and guardrails to avoid runaway demand or confusing scores. | Useful as an overlay after curated profiles exist. |
+
+Recommended first technical shape for a future PR:
+
+1. Add read-only curated scoring profile configuration for a small set of representative schematics.
+2. Resolve profile entries against loaded `DraftSchematicObjectTemplate` and target-template `ResourceWeight` data where safe.
+3. Log top eligible active resources per curated profile.
+4. Keep all output advisory/log-only.
+5. Do not alter SimMiner targeting until target recommendations have been validated in logs.
+
+This gives the AI economy a stronger scoring vocabulary without committing to persistence, live mining decisions, or real crafting output.
+
+#### Future phases after this research
+
+| Phase | Goal | Behavior impact |
+|---|---|---|
+| Phase D.1 - Schematic-aware scoring design/research | Document exact draft schematic, target-template, resource weight, and eligibility paths. | Documentation only. |
+| Phase D.2 - Curated scoring profile config, read-only | Add disabled-by-default profile definitions for a handful of high-value schematics. | Log-only; no miner targeting. |
+| Phase D.3 - Log-only miner target recommendations | Show which resource a miner or scout would choose for a profile. | No movement or gathering changes. |
+| Phase D.4 - Miner target selection simulation | Simulate route/resource choices in memory/logs while miners continue current conceptual loops. | No behavior change unless explicitly enabled in a later phase. |
+| Phase D.5 - Optional miner targeting switch | Add a disabled-by-default switch for miners to use resource-intelligence targets. | First possible behavior change; requires careful testing and rollback. |
+
+Open questions:
+
+- Which schematics should seed the first curated profiles: common player staples, AI economy staples, or admin-selected goals?
+- Should component-chain scoring recurse one level first, or should it use manual component demand multipliers?
+- Should resource density affect schematic score, or remain a separate "can gather enough here" score?
+- Should expired resources remain in intelligence as historical market/trend data?
+- How should future demand distinguish "best possible resource" from "good enough for bulk production"?
 
 ### Pathfinding interaction
 

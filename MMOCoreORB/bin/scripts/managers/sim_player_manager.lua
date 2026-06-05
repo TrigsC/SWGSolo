@@ -5,6 +5,14 @@ SimPlayerManagerConfig = {
     -- MASTER SWITCH
     enabled = true,
 
+    -- Read-only resource intelligence observability. Disabled by default.
+    resourceIntelligenceConfig = {
+        enabled = false,
+        logTopResources = false,
+        summaryIntervalSeconds = 600,
+        topN = 10,
+    },
+
     -- 1. LOCATIONS
     shuttleports = {
         naboo = {
@@ -40,6 +48,10 @@ SimPlayerManagerConfig = {
                     minAmount = 5,
                     maxAmount = 25,
                     logYield = true,
+                },
+                summaryConfig = {
+                    enabled = false,
+                    intervalSeconds = 300,
                 },
             }
         },

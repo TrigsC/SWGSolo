@@ -16,8 +16,55 @@
 #include "templates/params/creature/ObjectFlag.h"
 #include "server/zone/managers/planet/PlanetManager.h"
 #include "server/zone/managers/planet/PlanetTravelPoint.h"
+#include "server/zone/managers/resource/ResourceManager.h"
+#include "server/zone/managers/resource/resourcespawner/ResourceSpawner.h"
+#include "server/zone/managers/resource/resourcespawner/resourcemap/ResourceMap.h"
+#include "server/zone/objects/resource/ResourceSpawn.h"
 
 #define DEBUG_SIMPLAYER
+
+class SimMinerSummaryTask : public Task {
+public:
+    void run() override {
+        SimPlayerManager::instance()->runMinerSummaryTask();
+    }
+};
+
+class ResourceIntelligenceTask : public Task {
+public:
+    void run() override {
+        SimPlayerManager::instance()->runResourceIntelligenceTask();
+    }
+};
+
+struct ResourceIntelligenceEntry {
+    uint64 objectID = 0;
+    String name;
+    String type;
+    String classChain;
+    String zones;
+    bool inShift = false;
+    unsigned long despawned = 0;
+    int surveyToolType = 0;
+    int oq = 0;
+    int cd = 0;
+    int dr = 0;
+    int hr = 0;
+    int fl = 0;
+    int ma = 0;
+    int pe = 0;
+    int sr = 0;
+    int ut = 0;
+    int cr = 0;
+    int genericScore = 0;
+    int weaponsmithScore = 0;
+    int armorsmithScore = 0;
+    int chefScore = 0;
+    int architectScore = 0;
+
+    bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+    bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
 
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
@@ -43,6 +90,139 @@ static int clampMinerInt(int value, int currentValue, int minValue, int maxValue
         return maxValue;
 
     return value;
+}
+
+static void addScorePart(int value, int weight, int& weightedTotal, int& totalWeight) {
+    if (value <= 0 || weight <= 0)
+        return;
+
+    weightedTotal += value * weight;
+    totalWeight += weight;
+}
+
+static int finishScore(int weightedTotal, int totalWeight) {
+    if (totalWeight <= 0)
+        return 0;
+
+    return weightedTotal / totalWeight;
+}
+
+static int getResourceAttribute(ResourceSpawn* spawn, const String& attributeName) {
+    if (spawn == nullptr)
+        return 0;
+
+    return spawn->getValueOf(attributeName);
+}
+
+static int calculateGenericScore(const ResourceIntelligenceEntry& entry) {
+    int weightedTotal = 0;
+    int totalWeight = 0;
+
+    addScorePart(entry.oq, 2, weightedTotal, totalWeight);
+    addScorePart(entry.cd, 1, weightedTotal, totalWeight);
+    addScorePart(entry.dr, 1, weightedTotal, totalWeight);
+    addScorePart(entry.hr, 1, weightedTotal, totalWeight);
+    addScorePart(entry.fl, 1, weightedTotal, totalWeight);
+    addScorePart(entry.ma, 1, weightedTotal, totalWeight);
+    addScorePart(entry.pe, 1, weightedTotal, totalWeight);
+    addScorePart(entry.sr, 1, weightedTotal, totalWeight);
+    addScorePart(entry.ut, 1, weightedTotal, totalWeight);
+    addScorePart(entry.cr, 1, weightedTotal, totalWeight);
+
+    return finishScore(weightedTotal, totalWeight);
+}
+
+static int calculateWeaponsmithScore(const ResourceIntelligenceEntry& entry) {
+    int weightedTotal = 0;
+    int totalWeight = 0;
+
+    addScorePart(entry.cd, 3, weightedTotal, totalWeight);
+    addScorePart(entry.oq, 3, weightedTotal, totalWeight);
+    addScorePart(entry.sr, 2, weightedTotal, totalWeight);
+    addScorePart(entry.ut, 2, weightedTotal, totalWeight);
+
+    return finishScore(weightedTotal, totalWeight);
+}
+
+static int calculateArmorsmithScore(const ResourceIntelligenceEntry& entry) {
+    int weightedTotal = 0;
+    int totalWeight = 0;
+
+    addScorePart(entry.oq, 3, weightedTotal, totalWeight);
+    addScorePart(entry.ut, 2, weightedTotal, totalWeight);
+    addScorePart(entry.sr, 2, weightedTotal, totalWeight);
+    addScorePart(entry.dr, 2, weightedTotal, totalWeight);
+    addScorePart(entry.ma, 1, weightedTotal, totalWeight);
+
+    return finishScore(weightedTotal, totalWeight);
+}
+
+static int calculateChefScore(const ResourceIntelligenceEntry& entry) {
+    int weightedTotal = 0;
+    int totalWeight = 0;
+
+    addScorePart(entry.oq, 3, weightedTotal, totalWeight);
+    addScorePart(entry.pe, 2, weightedTotal, totalWeight);
+    addScorePart(entry.fl, 2, weightedTotal, totalWeight);
+    addScorePart(entry.dr, 1, weightedTotal, totalWeight);
+
+    return finishScore(weightedTotal, totalWeight);
+}
+
+static int calculateArchitectScore(const ResourceIntelligenceEntry& entry) {
+    int weightedTotal = 0;
+    int totalWeight = 0;
+
+    addScorePart(entry.oq, 3, weightedTotal, totalWeight);
+    addScorePart(entry.dr, 2, weightedTotal, totalWeight);
+    addScorePart(entry.ut, 2, weightedTotal, totalWeight);
+    addScorePart(entry.ma, 2, weightedTotal, totalWeight);
+
+    return finishScore(weightedTotal, totalWeight);
+}
+
+static int getResourceIntelligenceScore(const ResourceIntelligenceEntry& entry, int scoreFamily) {
+    switch (scoreFamily) {
+    case 0:
+        return entry.genericScore;
+    case 1:
+        return entry.weaponsmithScore;
+    case 2:
+        return entry.armorsmithScore;
+    case 3:
+        return entry.chefScore;
+    case 4:
+        return entry.architectScore;
+    default:
+        return 0;
+    }
+}
+
+static bool resourceIntelligenceIndexUsed(const Vector<int>& usedIndexes, int index) {
+    for (int i = 0; i < usedIndexes.size(); ++i) {
+        if (usedIndexes.get(i) == index)
+            return true;
+    }
+
+    return false;
+}
+
+static String formatResourceIntelligenceLine(const String& label, const ResourceIntelligenceEntry& entry, int score, int rank) {
+    String line = "ResourceIntelligence top " + label + " #" + String::valueOf(rank) +
+        ": " + entry.name + " type=" + entry.type +
+        " score=" + String::valueOf(score) +
+        " OQ=" + String::valueOf(entry.oq) +
+        " CD=" + String::valueOf(entry.cd) +
+        " DR=" + String::valueOf(entry.dr) +
+        " FL=" + String::valueOf(entry.fl) +
+        " PE=" + String::valueOf(entry.pe) +
+        " SR=" + String::valueOf(entry.sr) +
+        " UT=" + String::valueOf(entry.ut) +
+        " MA=" + String::valueOf(entry.ma) +
+        " zones=" + (entry.zones.isEmpty() ? String("unknown") : entry.zones) +
+        " despawns=" + String::valueOf(entry.despawned);
+
+    return line;
 }
 
 static void loadMinerConfig(LuaObject& group, SimMinerConfig& minerConfig) {
@@ -94,6 +274,13 @@ static void loadMinerConfig(LuaObject& group, SimMinerConfig& minerConfig) {
     }
     yieldConfig.pop();
 
+    LuaObject summaryConfig = config.getObjectField("summaryConfig");
+    if (summaryConfig.isValidTable()) {
+        minerConfig.summaryEnabled = summaryConfig.getBooleanField("enabled", minerConfig.summaryEnabled);
+        minerConfig.summaryIntervalSeconds = clampMinerInt(summaryConfig.getIntField("intervalSeconds"), minerConfig.summaryIntervalSeconds, 30, 3600);
+    }
+    summaryConfig.pop();
+
     if (minerConfig.maxSearchRadius < minerConfig.minSearchRadius)
         minerConfig.maxSearchRadius = minerConfig.minSearchRadius;
 
@@ -115,6 +302,8 @@ void SimPlayerManager::initialize() {
 
     loadLuaConfig();
     spawnConfiguredGroups();
+    scheduleMinerSummaryTask();
+    scheduleResourceIntelligenceTask();
 }
 
 void SimPlayerManager::loadLuaConfig() {
@@ -153,6 +342,23 @@ void SimPlayerManager::loadLuaConfig() {
 
     allShuttleports.removeAll();
     spawnGroups.removeAll();
+    minerSummaryLoggingEnabled = false;
+    minerSummaryTaskScheduled = false;
+    minerSummaryIntervalSeconds = 300;
+    resourceIntelligenceEnabled = false;
+    resourceIntelligenceLogTopResources = false;
+    resourceIntelligenceTaskScheduled = false;
+    resourceIntelligenceIntervalSeconds = 600;
+    resourceIntelligenceTopN = 10;
+
+    LuaObject resourceIntelligenceConfig = config.getObjectField("resourceIntelligenceConfig");
+    if (resourceIntelligenceConfig.isValidTable()) {
+        resourceIntelligenceEnabled = resourceIntelligenceConfig.getBooleanField("enabled", resourceIntelligenceEnabled);
+        resourceIntelligenceLogTopResources = resourceIntelligenceConfig.getBooleanField("logTopResources", resourceIntelligenceLogTopResources);
+        resourceIntelligenceIntervalSeconds = clampMinerInt(resourceIntelligenceConfig.getIntField("summaryIntervalSeconds"), resourceIntelligenceIntervalSeconds, 30, 3600);
+        resourceIntelligenceTopN = clampMinerInt(resourceIntelligenceConfig.getIntField("topN"), resourceIntelligenceTopN, 1, 50);
+    }
+    resourceIntelligenceConfig.pop();
 
     // --- LOAD SHUTTLEPORTS ---
     LuaObject shuttles = config.getObjectField("shuttleports");
@@ -266,6 +472,12 @@ void SimPlayerManager::loadLuaConfig() {
             templates.pop();
 
             loadMinerConfig(group, g.minerConfig);
+            if (!g.type.beginsWith("pvp") && g.minerConfig.summaryEnabled) {
+                if (!minerSummaryLoggingEnabled || g.minerConfig.summaryIntervalSeconds < minerSummaryIntervalSeconds)
+                    minerSummaryIntervalSeconds = g.minerConfig.summaryIntervalSeconds;
+
+                minerSummaryLoggingEnabled = true;
+            }
 #ifdef DEBUG_SIMPLAYER
             info("DEBUG: Loaded Group " + String::valueOf(i) + " (" + g.type + ") totalCount=" + String::valueOf(g.totalCount), true);
 #endif
@@ -419,6 +631,227 @@ uint64 SimPlayerManager::recordConceptualMinerYield(const String& resourceName, 
     }
 
     return total;
+}
+
+void SimPlayerManager::scheduleMinerSummaryTask() {
+    if (!minerSummaryLoggingEnabled || minerSummaryTaskScheduled)
+        return;
+
+    minerSummaryTaskScheduled = true;
+
+    Reference<SimMinerSummaryTask*> task = new SimMinerSummaryTask();
+    task->schedule(minerSummaryIntervalSeconds * 1000);
+}
+
+void SimPlayerManager::runMinerSummaryTask() {
+    minerSummaryTaskScheduled = false;
+
+    if (!minerSummaryLoggingEnabled)
+        return;
+
+    logConceptualMinerSummary();
+    scheduleMinerSummaryTask();
+}
+
+int SimPlayerManager::countActiveMiners() {
+    int activeMiners = 0;
+    int controllerCount = controllers.size();
+
+    for (int i = 0; i < controllerCount; ++i) {
+        uint64 key = controllers.getKey(i);
+        Reference<SimPlayerController*> ctrl = controllers.get(key);
+
+        if (ctrl != nullptr && dynamic_cast<SimMinerController*>(ctrl.get()) != nullptr)
+            ++activeMiners;
+    }
+
+    return activeMiners;
+}
+
+void SimPlayerManager::collectConceptualMinerTotals(Vector<String>& resourceNames, Vector<uint64>& amounts) {
+    Locker locker(&conceptualMinerTotalsMutex);
+
+    for (int i = 0; i < conceptualMinerTotals.size(); ++i) {
+        resourceNames.add(conceptualMinerTotals.elementAt(i).getKey());
+        amounts.add(conceptualMinerTotals.get(i));
+    }
+}
+
+void SimPlayerManager::logConceptualMinerSummary() {
+    Vector<String> resourceNames;
+    Vector<uint64> amounts;
+    collectConceptualMinerTotals(resourceNames, amounts);
+
+    int activeMiners = countActiveMiners();
+
+    if (activeMiners == 0 && resourceNames.size() == 0)
+        return;
+
+    String message = "SimMiner totals: activeMiners=" + String::valueOf(activeMiners);
+
+    if (resourceNames.size() == 0) {
+        message += " totals=empty";
+    } else {
+        for (int i = 0; i < resourceNames.size(); ++i) {
+            message += " " + resourceNames.get(i) + "=" + String::valueOf(amounts.get(i));
+        }
+    }
+
+    info(message, true);
+}
+
+void SimPlayerManager::scheduleResourceIntelligenceTask() {
+    if (!resourceIntelligenceEnabled || resourceIntelligenceTaskScheduled)
+        return;
+
+    resourceIntelligenceTaskScheduled = true;
+
+    Reference<ResourceIntelligenceTask*> task = new ResourceIntelligenceTask();
+    task->schedule(resourceIntelligenceIntervalSeconds * 1000);
+}
+
+void SimPlayerManager::runResourceIntelligenceTask() {
+    resourceIntelligenceTaskScheduled = false;
+
+    if (!resourceIntelligenceEnabled)
+        return;
+
+    logResourceIntelligenceSummary();
+    scheduleResourceIntelligenceTask();
+}
+
+void SimPlayerManager::logResourceIntelligenceSummary() {
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+
+    if (zoneServer == nullptr) {
+        info("ResourceIntelligence: ZoneServer unavailable; skipping read-only snapshot", true);
+        return;
+    }
+
+    ManagedReference<ResourceManager*> resourceManager = zoneServer->getResourceManager();
+
+    if (resourceManager == nullptr) {
+        info("ResourceIntelligence: ResourceManager unavailable; skipping read-only snapshot", true);
+        return;
+    }
+
+    Vector<ResourceIntelligenceEntry> entries;
+
+    {
+        Locker managerLocker(resourceManager);
+
+        ResourceSpawner* spawner = resourceManager->getResourceSpawner();
+
+        if (spawner == nullptr || spawner->getResourceMap() == nullptr) {
+            info("ResourceIntelligence: ResourceSpawner/resource map unavailable; skipping read-only snapshot", true);
+            return;
+        }
+
+        ResourceMap* resourceMap = spawner->getResourceMap();
+        int resourceCount = resourceMap->size();
+
+        for (int i = 0; i < resourceCount; ++i) {
+            ManagedReference<ResourceSpawn*> spawn = resourceMap->get(i);
+
+            if (spawn == nullptr || !spawn->inShift())
+                continue;
+
+            ResourceIntelligenceEntry entry;
+            entry.objectID = spawn->getObjectID();
+            entry.name = spawn->getName();
+            entry.type = spawn->getType();
+            entry.inShift = true;
+            entry.despawned = spawn->getDespawned();
+            entry.surveyToolType = spawn->getSurveyToolType();
+
+            for (int classIndex = 0; classIndex < 12; ++classIndex) {
+                String stfClass = spawn->getStfClass(classIndex);
+
+                if (stfClass.isEmpty())
+                    break;
+
+                if (!entry.classChain.isEmpty())
+                    entry.classChain += ">";
+
+                entry.classChain += stfClass;
+            }
+
+            for (int zoneIndex = 0; zoneIndex < spawn->getSpawnMapSize(); ++zoneIndex) {
+                String zoneName = spawn->getSpawnMapZone(zoneIndex);
+
+                if (zoneName.isEmpty())
+                    continue;
+
+                if (!entry.zones.isEmpty())
+                    entry.zones += ",";
+
+                entry.zones += zoneName;
+            }
+
+            entry.oq = getResourceAttribute(spawn, "res_quality");
+            entry.cd = getResourceAttribute(spawn, "res_conductivity");
+            entry.dr = getResourceAttribute(spawn, "res_decay_resist");
+            entry.hr = getResourceAttribute(spawn, "res_heat_resist");
+            entry.fl = getResourceAttribute(spawn, "res_flavor");
+            entry.ma = getResourceAttribute(spawn, "res_malleability");
+            entry.pe = getResourceAttribute(spawn, "res_potential_energy");
+            entry.sr = getResourceAttribute(spawn, "res_shock_resistance");
+            entry.ut = getResourceAttribute(spawn, "res_toughness");
+            entry.cr = getResourceAttribute(spawn, "res_cold_resist");
+
+            entries.add(entry);
+        }
+    }
+
+    for (int i = 0; i < entries.size(); ++i) {
+        ResourceIntelligenceEntry entry = entries.get(i);
+
+        entry.genericScore = calculateGenericScore(entry);
+        entry.weaponsmithScore = calculateWeaponsmithScore(entry);
+        entry.armorsmithScore = calculateArmorsmithScore(entry);
+        entry.chefScore = calculateChefScore(entry);
+        entry.architectScore = calculateArchitectScore(entry);
+
+        entries.set(i, entry);
+    }
+
+    info("ResourceIntelligence: read-only snapshot activeResources=" + String::valueOf(entries.size()) +
+         " heuristicScores=true topLogging=" + String(resourceIntelligenceLogTopResources ? "true" : "false"), true);
+
+    if (!resourceIntelligenceLogTopResources || entries.size() == 0)
+        return;
+
+    const char* labels[] = {"generic", "weaponsmith", "armorsmith", "chef", "architect"};
+
+    for (int scoreFamily = 0; scoreFamily < 5; ++scoreFamily) {
+        Vector<int> usedIndexes;
+        int logged = 0;
+
+        while (logged < resourceIntelligenceTopN) {
+            int bestIndex = -1;
+            int bestScore = 0;
+
+            for (int i = 0; i < entries.size(); ++i) {
+                if (resourceIntelligenceIndexUsed(usedIndexes, i))
+                    continue;
+
+                int score = getResourceIntelligenceScore(entries.get(i), scoreFamily);
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestIndex = i;
+                }
+            }
+
+            if (bestIndex < 0 || bestScore <= 0)
+                break;
+
+            usedIndexes.add(bestIndex);
+            ++logged;
+
+            info(formatResourceIntelligenceLine(String(labels[scoreFamily]), entries.get(bestIndex), bestScore, logged), true);
+        }
+    }
 }
 
 void SimPlayerManager::startControllerForAgent(AiAgent* agent, Reference<SimPlayerController*> ctrl) {

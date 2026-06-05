@@ -30,6 +30,8 @@ struct SimMinerConfig {
     int minYieldAmount;
     int maxYieldAmount;
     bool logYield;
+    bool summaryEnabled;
+    int summaryIntervalSeconds;
 
     SimMinerConfig() {
         resources.add("iron");
@@ -47,6 +49,8 @@ struct SimMinerConfig {
         minYieldAmount = 5;
         maxYieldAmount = 25;
         logYield = false;
+        summaryEnabled = false;
+        summaryIntervalSeconds = 300;
     }
 };
 
