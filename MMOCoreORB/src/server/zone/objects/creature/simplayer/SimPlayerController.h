@@ -18,6 +18,30 @@
 
 class SimPlayerController;
 
+struct SimMinerConfig {
+    Vector<String> resources;
+    int surveyDurationMs;
+    int sampleDurationMs;
+    int minSearchRadius;
+    int maxSearchRadius;
+    int fallbackRadius;
+    bool logStateTransitions;
+
+    SimMinerConfig() {
+        resources.add("iron");
+        resources.add("gas");
+        resources.add("water");
+        resources.add("copper");
+
+        surveyDurationMs = 4000;
+        sampleDurationMs = 15000;
+        minSearchRadius = 100;
+        maxSearchRadius = 200;
+        fallbackRadius = 100;
+        logStateTransitions = false;
+    }
+};
+
 // Generic Pathfinding Task
 class SimPathFindTask : public Task {
     WeakReference<SimPlayerController*> controller;
@@ -93,11 +117,11 @@ public:
     void checkArrival();
     
     void onPathFound(Vector<WorldCoordinates>* path);
-    void onPathFailed();
+    virtual void onPathFailed();
 
 protected:
     void queueMorePathNodes();
-    bool pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out);
+    bool pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out, int minSearchRadius = 100, int maxSearchRadius = 200);
 };
 
 // -------------------------------------------------------
@@ -106,13 +130,16 @@ protected:
 class SimMinerController : public SimPlayerController {
     String targetResource;
     int retryCount;
+    SimMinerConfig config;
 
 public:
     SimMinerController(AiAgent* aiAgent);
+    SimMinerController(AiAgent* aiAgent, const SimMinerConfig& minerConfig);
     virtual ~SimMinerController();
 
     void startSimLoop() override;
     void onArrived() override;
+    void onPathFailed() override;
 
     // Specific logic
     void performSurvey();
@@ -122,6 +149,9 @@ public:
     void finishSample();
 
     String pickRandomResource();
+
+private:
+    void logStateTransition(const String& message) const;
 };
 
 #endif

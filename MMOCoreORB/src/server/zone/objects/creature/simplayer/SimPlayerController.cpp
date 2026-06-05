@@ -357,11 +357,20 @@ void SimPlayerController::checkArrival() {
     task->schedule(500);
 }
 
-bool SimPlayerController::pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out) {
+bool SimPlayerController::pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out, int minSearchRadius, int maxSearchRadius) {
     if (zone == nullptr || agent == nullptr) return false;
     if (!agent->isInNavMesh()) return false;
 
-    int distance = 100 + System::random(100);
+    if (minSearchRadius < 1)
+        minSearchRadius = 1;
+
+    if (maxSearchRadius < minSearchRadius)
+        maxSearchRadius = minSearchRadius;
+
+    int distance = minSearchRadius;
+    if (maxSearchRadius > minSearchRadius)
+        distance += System::random(maxSearchRadius - minSearchRadius);
+
     Sphere area(currentPos, (float)distance);
 
     Vector3 result;
@@ -376,8 +385,12 @@ bool SimPlayerController::pickDestinationInNavMesh(Zone* zone, const Vector3& cu
 // SIM MINER CONTROLLER
 // ========================================================
 
-SimMinerController::SimMinerController(AiAgent* aiAgent) : SimPlayerController(aiAgent) {
+SimMinerController::SimMinerController(AiAgent* aiAgent) : SimMinerController(aiAgent, SimMinerConfig()) {
+}
+
+SimMinerController::SimMinerController(AiAgent* aiAgent, const SimMinerConfig& minerConfig) : SimPlayerController(aiAgent) {
     retryCount = 0;
+    config = minerConfig;
     setLoggingName("SimMinerController");
 }
 
@@ -388,23 +401,30 @@ void SimMinerController::startSimLoop() {
     state = DECIDING;
     String res = pickRandomResource();
     targetResource = res;
-#ifdef DEBUG_SIMPVP
-    Logger::console.info("SimMiner: Loop -> I want [" + res + "]", true);
-#endif
+    logStateTransition("SimMiner: Loop started; selected conceptual resource [" + res + "]");
     performSurvey();
 }
 
 String SimMinerController::pickRandomResource() {
-    int roll = System::random(4);
-    if (roll == 0) return "iron";
-    if (roll == 1) return "gas";
-    if (roll == 2) return "water";
-    return "copper";
+    if (config.resources.size() == 0) {
+        int roll = System::random(4);
+        if (roll == 0) return "iron";
+        if (roll == 1) return "gas";
+        if (roll == 2) return "water";
+        return "copper";
+    }
+
+    if (config.resources.size() == 1)
+        return config.resources.get(0);
+
+    int index = System::random(config.resources.size() - 1);
+    return config.resources.get(index);
 }
 
 void SimMinerController::performSurvey() {
     if (agent == nullptr) return;
-    state = PERFORMING_ACTION;
+    state = SURVEYING;
+    logStateTransition("SimMiner: Survey started for [" + targetResource + "]");
 
     agent->setMovementState(AiAgent::OBLIVIOUS);
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
@@ -413,10 +433,11 @@ void SimMinerController::performSurvey() {
     agent->doAnimation("manipulate_high"); 
 
     Reference<SimBehaviorTask*> task = new SimBehaviorTask(this, SimBehaviorTask::FINISH_SURVEY);
-    task->schedule(4000); 
+    task->schedule(config.surveyDurationMs);
 }
 
 void SimMinerController::finishSurvey() {
+    logStateTransition("SimMiner: Survey finished for [" + targetResource + "]");
     goToResource(targetResource);
 }
 
@@ -427,27 +448,35 @@ void SimMinerController::goToResource(const String& resourceName) {
 
     Vector3 currentPos = agent->getWorldPosition();
     Vector3 targetPos;
+    bool usedFallback = false;
 
-    if (!pickDestinationInNavMesh(zone, currentPos, targetPos)) {
+    if (!pickDestinationInNavMesh(zone, currentPos, targetPos, config.minSearchRadius, config.maxSearchRadius)) {
         float angle = System::random(360) * (M_PI / 180.0f);
-        float dist = 100.0f;
+        float dist = (float)config.fallbackRadius;
         targetPos.setX(currentPos.getX() + (dist * cos(angle)));
         targetPos.setY(currentPos.getY() + (dist * sin(angle))); 
         targetPos.setZ(zone->getHeight(targetPos.getX(), targetPos.getY())); 
+        usedFallback = true;
     }
 
+    String destinationSource = usedFallback ? "fallback" : "navmesh";
+    logStateTransition("SimMiner: Destination selected for [" + resourceName + "] using " + destinationSource + " target=" + targetPos.toString());
     moveTo(targetPos);
 }
 
 void SimMinerController::onArrived() {
+    logStateTransition("SimMiner: Arrived at conceptual resource destination for [" + targetResource + "]");
     performSample();
 }
 
+void SimMinerController::onPathFailed() {
+    logStateTransition("SimMiner: Path failed; retrying loop for [" + targetResource + "]");
+    SimPlayerController::onPathFailed();
+}
+
 void SimMinerController::performSample() {
-    state = PERFORMING_ACTION;
-#ifdef DEBUG_SIMPVP
-    Logger::console.info("SimMiner: State -> SAMPLING (15s)", true);
-#endif
+    state = SAMPLING;
+    logStateTransition("SimMiner: Sample started for [" + targetResource + "]");
 
     agent->clearPatrolPoints(); 
     agent->setMovementState(AiAgent::OBLIVIOUS);
@@ -455,14 +484,21 @@ void SimMinerController::performSample() {
     agent->doAnimation("sample"); 
     
     Reference<SimBehaviorTask*> task = new SimBehaviorTask(this, SimBehaviorTask::FINISH_SAMPLE);
-    task->schedule(15000);
+    task->schedule(config.sampleDurationMs);
 }
 
 void SimMinerController::finishSample() {
-#ifdef DEBUG_SIMPVP
-    Logger::console.info("SimMiner: Done sampling.", true);
-#endif
+    logStateTransition("SimMiner: Sample finished for [" + targetResource + "]");
     agent->setPosture(CreaturePosture::UPRIGHT, true);
     agent->doAnimation("stop_sample"); 
     startSimLoop();
+}
+
+void SimMinerController::logStateTransition(const String& message) const {
+#ifdef DEBUG_SIMPVP
+    Logger::console.info(message, true);
+#else
+    if (config.logStateTransitions)
+        Logger::console.info(message, true);
+#endif
 }

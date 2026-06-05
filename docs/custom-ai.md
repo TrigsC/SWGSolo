@@ -473,18 +473,133 @@ This creates the appearance of roaming between locations.
 
 Operational stability rule: SimPlayer recycle code should keep AiAgent object-lock scopes small. Shuttle readiness checks touch `PlanetManager`, and old-bot cleanup calls `destroyObjectFromWorld` / `destroyObjectFromDatabase`; these should run outside the old bot's own `Locker` scope to avoid silent lock inversions during timed roam/recycle tasks.
 
-### Resource gathering concepts
+### SimMiner / Resource Gatherer Behavior
 
-`SimMinerController` exists and models a resource gathering loop:
+`SimMinerController` is the current simulated resource gatherer controller. It is implemented in `SimPlayerController.h` and `SimPlayerController.cpp`; there is no separate `SimMinerController.cpp` in the inspected tree.
 
-1. Pick a resource type.
-2. Perform a survey animation.
-3. Pick a destination in navmesh or random nearby location.
-4. Move there.
-5. Perform sample animation.
-6. Repeat.
+Current enabled status:
 
-Current resource selection is conceptual and simple. It chooses strings such as `iron`, `gas`, `water`, and `copper`. The current config has miner `totalCount = 0`, so this behavior is not currently active through the default SimPlayer config.
+| Source | Current value | Runtime effect |
+|---|---:|---|
+| `SimPlayerManagerConfig.enabled` | `true` | Allows `SimPlayerManager` to load config and spawn configured groups. |
+| Miner spawn group `totalCount` | `0` | No miners spawn from default startup config. |
+| Miner spawn group `templates` | `light_jedi_sentinel`, `artisan` | Would be used if `totalCount` were raised above zero. |
+| Miner spawn group `behavior` | `gather_resources` | Loaded into `SpawnGroup.behavior`, but not used by controller selection. Non-`pvp` groups become miners. |
+| Miner spawn group `minerConfig` | Present with current defaults | Configures conceptual resource names, survey/sample timings, movement search radii, fallback radius, and optional state-transition logging. |
+
+Startup and spawn flow:
+
+1. `ZoneServerImplementation.cpp` calls `SimPlayerManager::instance()->initialize()`.
+2. `SimPlayerManager::initialize` calls `loadLuaConfig` and then `spawnConfiguredGroups`.
+3. `loadLuaConfig` runs `scripts/managers/sim_player_manager.lua` through a dedicated C++ `Lua` instance.
+4. The manager loads `enabled`, `shuttleports`, and each spawn group's `type`, `totalCount`, `behavior`, `faction`, `templates`, and optional `minerConfig`.
+5. `spawnConfiguredGroups` loops each group `totalCount` times. Because the miner count is currently `0`, the miner group is skipped.
+6. If enabled in the future, `spawnFromConfig` would pick a random shuttleport and random template, spawn an AiAgent creature, set SimPlayer flags, and choose the controller.
+7. Controller selection is based on `g.type.beginsWith("pvp")`. Non-PvP groups, including the current `type = "miner"`, get `SimMinerController`.
+
+Controller state machine:
+
+| State | Used by miner today | Meaning in current miner flow |
+|---|---|---|
+| `IDLE` | Yes | Initial state and retry/holding state. |
+| `DECIDING` | Yes | Set when miner starts a new loop and chooses a resource string. |
+| `SURVEYING` | Yes | Set while the miner performs the survey animation and waits for the survey timer. |
+| `CALCULATING_PATH` | Yes | Set by shared `moveTo` while pathfinding is requested. |
+| `PERFORMING_ACTION` | No direct miner assignment found | Declared and available to shared/older behavior, but current miner survey/sample phases use `SURVEYING` and `SAMPLING`. |
+| `MOVING` | Yes | Set after a valid path is returned. |
+| `SAMPLING` | Yes | Set while the miner crouches, plays the sample animation, and waits for the sample timer. |
+| `WAITING` | Shared | Used by shared dead/incap handling; not part of normal miner gather loop. |
+
+Current miner loop:
+
+1. `startSimLoop` sets state to `DECIDING`.
+2. `pickRandomResource` picks one conceptual resource string from `minerConfig.resources`, falling back to `iron`, `gas`, `water`, and `copper` if the configured list is missing or empty.
+3. `performSurvey` sets state to `SURVEYING`, sets movement state to `OBLIVIOUS`, ensures upright posture, plays `manipulate_high`, and schedules a `SimBehaviorTask` using `minerConfig.surveyDurationMs`, currently 4000 ms by default.
+4. `finishSurvey` calls `goToResource(targetResource)`.
+5. `goToResource` chooses a movement destination. The selected resource name is not used to query real resource pools.
+6. `moveTo` schedules `SimPathFindTask`, which calls `PathFinderManager::instance()->findPath`.
+7. `onPathFound` copies the returned path, clears follow/watch/target/combat state, clears patrol points, writes blackboard `moveMode = RUN`, queues patrol nodes, switches the AiAgent to `PATROLLING`, activates AI behavior, and schedules `ArrivalCheckTask`.
+8. `checkArrival` runs repeatedly while moving. It queues more path nodes, calls `findNextPosition(2.0f, false)`, detects arrival within roughly 4 meters, and uses a stuck watchdog to reapply the next step and reactivate AI behavior.
+9. `onArrived` calls `performSample`.
+10. `performSample` sets state to `SAMPLING`, clears patrol points, sets movement state to `OBLIVIOUS`, crouches the agent, plays `sample`, and schedules a `SimBehaviorTask` using `minerConfig.sampleDurationMs`, currently 15000 ms by default.
+11. `finishSample` returns the agent upright, plays `stop_sample`, and calls `startSimLoop` again.
+
+Movement and destination behavior:
+
+- `pickDestinationInNavMesh` first requires `agent->isInNavMesh()`.
+- It chooses a radius from `minerConfig.minSearchRadius` to `minerConfig.maxSearchRadius`, currently equivalent to the old approximately 100 to 200 meter search range.
+- It calls `PathFinderManager::instance()->getSpawnPointInArea(area, zone, result, true)`.
+- If no navmesh destination is found, `goToResource` falls back to a random point using `minerConfig.fallbackRadius`, currently 100 meters, and uses `zone->getHeight` for Z.
+- The shared pathing code requests a path after 100 ms and retries failed/short paths after 5000 ms.
+
+Resource and economy behavior:
+
+The current miner does not create real resources. It simulates activity visually and procedurally only.
+
+Static inspection found:
+
+- No calls from `SimMinerController` into `ResourceManager`.
+- No calls into `ResourceSpawn`.
+- No creation of `ResourceContainer` objects.
+- No inventory transfer or abstract inventory bookkeeping.
+- No credits, vendor, bazaar, auction, harvester, crafting, or database persistence integration.
+- `ResourceManager.h` and `ResourceSpawn.h` are included in `SimPlayerController.cpp`, but the inspected miner methods do not use those APIs.
+
+Config values and actual consumption:
+
+| Config field | Consumed by C++ | Current miner effect |
+|---|---|---|
+| `enabled` | Yes | If false, no SimPlayer groups spawn. |
+| `shuttleports` | Yes | Provides possible spawn locations for all groups, including miners if enabled. |
+| `spawnGroups[].type` | Yes | Non-`pvp` type selects `SimMinerController`. |
+| `spawnGroups[].totalCount` | Yes | Controls how many miners would spawn; current value is `0`. |
+| `spawnGroups[].templates` | Yes | Provides random miner creature templates; fallback is `artisan` if empty. |
+| `spawnGroups[].behavior` | Loaded only | Stored but not used for miner behavior selection. |
+| `spawnGroups[].faction` | Loaded, mostly PvP-oriented | Not meaningful for current miner loop. |
+| `spawnGroups[].minerConfig.resources` | Yes | Provides conceptual resource labels. Missing or empty lists fall back to `iron`, `gas`, `water`, `copper`. |
+| `spawnGroups[].minerConfig.surveyDurationMs` | Yes | Survey animation delay. Default is 4000 ms. Values are clamped to a safe range. |
+| `spawnGroups[].minerConfig.sampleDurationMs` | Yes | Sampling animation delay. Default is 15000 ms. Values are clamped to a safe range. |
+| `spawnGroups[].minerConfig.minSearchRadius` | Yes | Minimum navmesh search radius. Default is 100 meters. Values are clamped. |
+| `spawnGroups[].minerConfig.maxSearchRadius` | Yes | Maximum navmesh search radius. Default is 200 meters. If lower than min, it is raised to min. |
+| `spawnGroups[].minerConfig.fallbackRadius` | Yes | Random fallback movement radius when navmesh destination selection fails. Default is 100 meters. |
+| `spawnGroups[].minerConfig.logStateTransitions` | Yes | Optional miner state-transition logs. Default is `false`, so normal gameplay remains quiet. |
+
+Logs and debug output:
+
+- `DEBUG_SIMPLAYER` in `SimPlayerManager.cpp` gates most manager startup/spawn/cycle logs.
+- `DEBUG_SIMPVP` in `SimPlayerController.cpp` gates shared movement logs and the miner logs.
+- Miner-specific state logs can also be enabled per miner spawn group with `minerConfig.logStateTransitions = true`.
+- Miner-specific debug strings include loop start, selected conceptual resource, survey start/finish, destination selection, path failure/retry, arrival, sample start, and sample completion.
+- `SimPathFindTask` always logs `SimPlayer: [Thread] EXCEPTION in findPath!` if pathfinding throws, even when debug macros are disabled.
+- The Lua config has commented-out `print` debug checks.
+
+Stability considerations:
+
+- `SimPathFindTask`, `ArrivalCheckTask`, `SimBehaviorTask`, and `SimRetryTask` all hold weak references to the controller and bounce work back through `Core::getTaskManager()->executeTask`.
+- `checkArrival` locks the AiAgent while examining combat/death/movement state and while updating patrol movement.
+- The current miner can schedule repeated arrival checks every 500 ms while moving and every 1000 ms while waiting, incapped, or in combat.
+- Pathfinding failure schedules a retry after 5000 ms by calling `startSimLoop` again.
+- If miners are enabled, they will be always-active SimPlayers with `simAlwaysActive`, `simPlayerBot`, and `despawnOnNoPlayerInRange(false)` set by the manager.
+
+Known limitations:
+
+- Miners are disabled by default via `totalCount = 0`.
+- Resource names are configurable conceptual labels, but they are not tied to the live SWG resource pool.
+- The selected resource string does not influence destination selection.
+- Surveying and sampling are animations only; no real extraction occurs.
+- Miner tuning values are exposed through Lua config, but only for the current conceptual loop.
+- The loaded `behavior = "gather_resources"` value is descriptive only in current controller selection.
+- There is no miner memory, inventory, accounting, persistence, market output, or crafting input.
+
+Suggested future phases:
+
+| Phase | Goal | Notes |
+|---|---|---|
+| Phase A | Make current miner behavior observable and configurable. | Implemented for conceptual resources, survey/sample durations, movement radii, and optional state-transition logging. Miner count remains disabled by default. |
+| Phase B | Record conceptual gathered resource amounts in memory/log only. | Keep the economy side-effect free while proving loop timing and accounting. |
+| Phase C | Persist abstract resource inventory safely. | Store simple per-miner or per-system resource counters without creating SWG resource containers yet. |
+| Phase D | Sell resource lots through a controlled vendor/market abstraction. | Introduce a constrained output path with caps, pricing rules, and audit logs. |
+| Phase E | Connect to crafting/economy loops. | Only after resource accounting, persistence, and market limits are stable. |
 
 ### Pathfinding interaction
 

@@ -26,7 +26,16 @@ SimPlayerManagerConfig = {
             type = "miner",
             totalCount = 0, 
             templates = { "light_jedi_sentinel", "artisan" }, -- Randomly picks appearance
-            behavior = "gather_resources"
+            behavior = "gather_resources",
+            minerConfig = {
+                resources = { "iron", "gas", "water", "copper" },
+                surveyDurationMs = 4000,
+                sampleDurationMs = 15000,
+                minSearchRadius = 100,
+                maxSearchRadius = 200,
+                fallbackRadius = 100,
+                logStateTransitions = false,
+            }
         },
         {
             type = "pvp_solo",

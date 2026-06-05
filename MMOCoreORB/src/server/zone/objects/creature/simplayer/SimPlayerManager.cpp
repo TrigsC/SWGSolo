@@ -32,6 +32,69 @@ SimPlayerManager::~SimPlayerManager() {
     }
 }
 
+static int clampMinerInt(int value, int currentValue, int minValue, int maxValue) {
+    if (value == 0)
+        return currentValue;
+
+    if (value < minValue)
+        return minValue;
+
+    if (value > maxValue)
+        return maxValue;
+
+    return value;
+}
+
+static void loadMinerConfig(LuaObject& group, SimMinerConfig& minerConfig) {
+    LuaObject config = group.getObjectField("minerConfig");
+
+    if (!config.isValidTable()) {
+        config.pop();
+        return;
+    }
+
+    LuaObject resources = config.getObjectField("resources");
+    if (resources.isValidTable()) {
+        Vector<String> parsedResources;
+        int resourceCount = resources.getTableSize();
+
+        for (int i = 1; i <= resourceCount; ++i) {
+            String resourceName = resources.getStringAt(i);
+
+            if (!resourceName.isEmpty())
+                parsedResources.add(resourceName);
+        }
+
+        if (parsedResources.size() > 0) {
+            minerConfig.resources.removeAll();
+
+            for (int i = 0; i < parsedResources.size(); ++i) {
+                minerConfig.resources.add(parsedResources.get(i));
+            }
+        }
+    }
+    resources.pop();
+
+    minerConfig.surveyDurationMs = clampMinerInt(config.getIntField("surveyDurationMs"), minerConfig.surveyDurationMs, 250, 300000);
+    minerConfig.sampleDurationMs = clampMinerInt(config.getIntField("sampleDurationMs"), minerConfig.sampleDurationMs, 250, 300000);
+    minerConfig.minSearchRadius = clampMinerInt(config.getIntField("minSearchRadius"), minerConfig.minSearchRadius, 1, 1000);
+    minerConfig.maxSearchRadius = clampMinerInt(config.getIntField("maxSearchRadius"), minerConfig.maxSearchRadius, 1, 1000);
+    minerConfig.fallbackRadius = clampMinerInt(config.getIntField("fallbackRadius"), minerConfig.fallbackRadius, 1, 1000);
+    minerConfig.logStateTransitions = config.getBooleanField("logStateTransitions");
+
+    if (minerConfig.maxSearchRadius < minerConfig.minSearchRadius)
+        minerConfig.maxSearchRadius = minerConfig.minSearchRadius;
+
+    if (minerConfig.resources.size() == 0) {
+        minerConfig.resources.add("iron");
+        minerConfig.resources.add("gas");
+        minerConfig.resources.add("water");
+        minerConfig.resources.add("copper");
+    }
+
+    config.pop();
+}
+
 void SimPlayerManager::initialize() {
 #ifdef DEBUG_SIMPLAYER
     info("Initializing SimPlayer Manager...", true);
@@ -189,6 +252,8 @@ void SimPlayerManager::loadLuaConfig() {
                 }
             }
             templates.pop();
+
+            loadMinerConfig(group, g.minerConfig);
 #ifdef DEBUG_SIMPLAYER
             info("DEBUG: Loaded Group " + String::valueOf(i) + " (" + g.type + ") totalCount=" + String::valueOf(g.totalCount), true);
 #endif
@@ -578,7 +643,7 @@ void SimPlayerManager::spawnFromConfig(const SpawnGroup& g, const ShuttleportLoc
         ctrl = pvp;
     } else {
         agent->setPvpStatusBitmask(0);
-        ctrl = new SimMinerController(agent);
+        ctrl = new SimMinerController(agent, g.minerConfig);
     }
         controllers.put(oid, ctrl);
         agent->activateAiBehavior(true);

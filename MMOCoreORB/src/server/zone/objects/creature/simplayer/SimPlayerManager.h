@@ -41,6 +41,7 @@ public:
 		String behavior;
 		String faction;
 		Vector<String> templates;
+		SimMinerConfig minerConfig;
 
 		// Satisfy Vector/TypeInfo template instantiation
 		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
