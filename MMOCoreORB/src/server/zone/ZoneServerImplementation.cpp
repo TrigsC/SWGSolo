@@ -41,6 +41,7 @@
 #include "server/zone/managers/frs/FrsManager.h"
 #include "server/chat/ChatManager.h"
 #include "server/zone/managers/ship/ShipManager.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
 
 #include "server/zone/ZoneProcessServer.h"
 #include "ZonePacketHandler.h"
@@ -348,6 +349,8 @@ void ZoneServerImplementation::startManagers() {
 	//Loads the FactionManager LUA Config.
 	FactionManager::instance()->loadData();
 
+	auctionManager->initialize();
+
 	//Start global screen plays
 	DirectorManager::instance()->loadPersistentEvents();
 	DirectorManager::instance()->loadPersistentStatus();
@@ -363,10 +366,10 @@ void ZoneServerImplementation::startManagers() {
 		}
 	}
 
-	auctionManager->initialize();
-
 	frsManager = new FrsManager(_this.getReferenceUnsafeStaticCast());
 	frsManager->initialize();
+
+	SimPlayerManager::instance()->initialize();
 
 	info(true) << "ZoneServerImplementation -- Managers Started.";
 }

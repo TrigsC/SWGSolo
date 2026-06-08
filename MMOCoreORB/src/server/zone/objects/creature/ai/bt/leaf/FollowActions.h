@@ -886,12 +886,11 @@ public:
 			return FAILURE;
 		}
 
-		if (healTarget->getObjectID() == agent->getObjectID()) {
-			// agent->info(true) << "ID: " << agent->getObjectID() << " Agent setting self as heal target";
-
-			agent->writeBlackboard("healTarget", healTarget);
-			return SUCCESS;
-		}
+		//if (healTarget->getObjectID() == agent->getObjectID()) {
+		//	// agent->info(true) << "ID: " << agent->getObjectID() << " Agent setting self as heal target";
+		//	agent->writeBlackboard("healTarget", healTarget);
+		//	return SUCCESS;
+		//}
 
 		auto healCreo = healTarget->asCreatureObject();
 
@@ -915,14 +914,81 @@ public:
 		}
 
 		agent->setMovementState(AiAgent::MOVING_TO_HEAL);
+				// Inside GetHealTarget execute() method...
 
-		// This must set the Tangible Object as the target to heal
-		agent->writeBlackboard("healTarget", healTarget);
+		ManagedReference<TangibleObject*> bestTarget = nullptr;
+        int highestDamage = 0; 
+		float healThreshold = 0.70f;
 
-		// agent->info(true) << "ID: " << agent->getObjectID() << "    Set up a healTarget ---- " << healCreo->getDisplayedName();
+        // Loop through enemies' defender list (our allies)
+        for (int i = 0; i < defenderList->size(); ++i) {
+            ManagedReference<SceneObject*> defenderSceneO = defenderList->get(i);
+            
+            if (defenderSceneO == nullptr || !defenderSceneO->isCreatureObject()) continue;
 
-		return SUCCESS;
-	}
+            CreatureObject* candidate = defenderSceneO->asCreatureObject();
+
+            // Skip dead people
+            if (candidate->isDead()) continue;
+            
+            // Range check (Use the range variable parsed from Lua)
+            if (!agent->isInRange3d(candidate, range)) continue;
+            
+            // Faction/Aggro checks (Prevent healing enemies)
+            if (candidate->isAggressiveTo(agent) || agent->isAggressiveTo(candidate)) continue;
+
+			bool needsHeal = false;
+            int totalDamage = 0;
+
+			// Check Health
+            float maxH = (float)candidate->getMaxHAM(CreatureAttribute::HEALTH);
+            float curH = (float)candidate->getHAM(CreatureAttribute::HEALTH);
+            if ((curH / maxH) < healThreshold) needsHeal = true;
+            totalDamage += (int)(maxH - curH);
+
+            // Check Action
+            float maxA = (float)candidate->getMaxHAM(CreatureAttribute::ACTION);
+            float curA = (float)candidate->getHAM(CreatureAttribute::ACTION);
+            if ((curA / maxA) < healThreshold) needsHeal = true;
+            totalDamage += (int)(maxA - curA);
+
+            // Check Mind (Important for non-Force medics)
+            float maxM = (float)candidate->getMaxHAM(CreatureAttribute::MIND);
+            float curM = (float)candidate->getHAM(CreatureAttribute::MIND);
+            if ((curM / maxM) < healThreshold) needsHeal = true;
+            totalDamage += (int)(maxM - curM);
+
+            // Calculate Damage
+            int damage = candidate->getMaxHAM(CreatureAttribute::HEALTH) - candidate->getHAM(CreatureAttribute::HEALTH);
+
+            // If they aren't hurt badly enough, ignore them
+            if (!needsHeal) continue;
+
+            // Pick the person with the HIGHEST total missing points
+            if (totalDamage > highestDamage) {
+                highestDamage = totalDamage;
+                bestTarget = candidate->asTangibleObject();
+            }
+        }
+
+        // SELF PRESERVATION OVERRIDE
+        // I care more about myself. If *I* am below 50%, I take priority over everyone.
+        float myMaxH = (float)agent->getMaxHAM(CreatureAttribute::HEALTH);
+        float myCurH = (float)agent->getHAM(CreatureAttribute::HEALTH);
+        
+        if ((myCurH / myMaxH) < 0.50f) {
+             bestTarget = agent->asTangibleObject();
+        }
+
+        if (bestTarget == nullptr) {
+            return FAILURE; 
+        }
+
+        agent->setMovementState(AiAgent::MOVING_TO_HEAL);
+        agent->writeBlackboard("healTarget", bestTarget);
+
+        return SUCCESS;
+    }
 
 	void parseArgs(const LuaObject& args) {
 		range = (float) (getArg<float>()(args, "range"));

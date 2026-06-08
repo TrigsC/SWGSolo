@@ -5,13 +5,13 @@ FROM debian:bookworm
 USER root
 
 # Prep and update system
-# Note to avoid java install failure we make the  /share/man pages: see https://github.com/kubernetes/kubernetes/issues/1806
 RUN set -xe; \
     for i in 1 2 3 4 5 6 7 8; do mkdir -p /usr/share/man/man$i; done; \
     export UCF_FORCE_CONFFOLD=YES; \
     unset UCF_FORCE_CONFFNEW; \
     export DEBIAN_FRONTEND=noninteractive; \
     echo 'APT::Install-Recommends "0";\nAPT::Install-Suggests "0";' > /etc/apt/apt.conf.d/01norecommends; \
+    echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/bookworm-backports.list; \
     apt-get update; \
     apt-get upgrade -y;
 
@@ -21,17 +21,11 @@ RUN set -xe; \
     wget -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh; \
     chmod +x /tmp/llvm.sh; \
     /tmp/llvm.sh all || /tmp/llvm.sh all; \
-    (set +x;cd /usr/bin;for i in ../lib/llvm-*/bin/*; do ln -sfv $i .; done); \
+    (set +x; cd /usr/bin; for i in ../lib/llvm-*/bin/*; do ln -sfv $i .; done); \
     clang --version; \
     ld.lld --version; \
     apt-get update; \
     apt-get install -y --fix-missing \
-	binutils \
-	db5.3-util \
-	gdb \
-	less \
-	strace \
-	time \
         autoconf \
         automake \
         autotools-dev \
@@ -87,7 +81,7 @@ RUN set -xe; \
         mariadb-client \
         mariadb-server \
         net-tools \
-        netcat\* \
+        netcat-openbsd \
         ninja-build \
         openssh-server \
         pv \
@@ -108,10 +102,25 @@ RUN set -xe; \
         vim-nox \
         wget \
     ; \
-    apt-get install lua5.3 liblua5.3-0 liblua5.3-dev; \
-    apt-get install lua-inspect lua-socket lua-sec lua-filesystem lua-cjson; \
+    apt-get install -y lua5.3 liblua5.3-0 liblua5.3-dev; \
+    apt-get install -y lua-inspect lua-socket lua-sec lua-filesystem lua-cjson; \
+    apt-get install -y default-jre-headless; \
+    apt-get install -y -t bookworm-backports golang-go; \
+    go version; \
     apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/* /var/log/dpkg.log* /var/log/apt/*;
+
+# Build idlc-go into the image
+ARG IDLC_GO_REPO=https://github.com/bholten/idlc-go.git
+ARG IDLC_GO_REF=master
+
+RUN set -xe; \
+    git clone ${IDLC_GO_REPO} /opt/idlc-go; \
+    cd /opt/idlc-go; \
+    git checkout ${IDLC_GO_REF}; \
+    go build -o idlc-go ./cmd/idlc; \
+    install -m 0755 ./idlc-go /usr/local/bin/idlc-go; \
+    idlc-go --help
 
 ENV RUN_USER=swgemu \
     HOME_DIR=/home/swgemu \
@@ -124,17 +133,19 @@ ENV STATUSPORT=${PORT_GROUP}455 \
     LOGINPORT=${PORT_GROUP}453 \
     PINGPORT=${PORT_GROUP}462 \
     ZONESERVERPORT=${PORT_GROUP}463 \
+    RESTPORT=${PORT_GROUP}443 \
+    WEBPORT=${PORT_GROUP}480 \
     WITH_GDB=true \
     SSHPORT=2222 \
     DBUSER=swgemu \
     ADMIN_USER=admin \
     REPOS='Core3' \
-    REPO_PUBLIC_URL=https://github.com/swgemu \
+    REPO_PUBLIC_URL=https://github.com/TrigsC/SWGSolo.git \
     REPO_PUBLIC_BRANCH='unstable'
 
 ENV PATH=${HOME_DIR}/bin:/usr/local/bin:${PATH}
 
-EXPOSE ${STATUSPORT}/tcp ${LOGINPORT}/udp ${PINGPORT}/udp ${ZONESERVERPORT}/udp
+EXPOSE ${STATUSPORT}/tcp ${LOGINPORT}/udp ${PINGPORT}/udp ${ZONESERVERPORT}/udp ${RESTPORT}/tcp ${WEBPORT}/tcp
 
 COPY files /
 

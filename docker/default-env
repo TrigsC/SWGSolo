@@ -1,2 +1,2 @@
-GALAXY_NAME=swgemu-core3
+GALAXY_NAME=swgsolo
 IMAGE=swgemu/core3-dev:latest

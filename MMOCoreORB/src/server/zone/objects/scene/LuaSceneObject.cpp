@@ -12,6 +12,7 @@
 #include "server/zone/managers/director/DirectorManager.h"
 #include "server/zone/Zone.h"
 #include "server/zone/SpaceZone.h"
+#include "server/zone/CloseObjectsVector.h"
 #include "server/zone/managers/director/ScreenPlayTask.h"
 #include "engine/lua/LuaPanicException.h"
 #include "server/zone/objects/tangible/Container.h"
@@ -104,6 +105,7 @@ Luna<LuaSceneObject>::RegType LuaSceneObject::Register[] = {
 		{ "getPlayersInRange", &LuaSceneObject::getPlayersInRange },
 		{ "isInNavMesh", &LuaSceneObject::isInNavMesh },
 		{ "checkInConversationRange", &LuaSceneObject::checkInConversationRange },
+		{ "getInRangeObjects", &LuaSceneObject::getInRangeObjects },
 
 		// JTL
 		{ "isShipObject", &LuaSceneObject::isShipObject },
@@ -1107,4 +1109,45 @@ int LuaSceneObject::isShipComponentRepairKit(lua_State* L) {
 	lua_pushboolean(L, val);
 
 	return 1;
+}
+
+int LuaSceneObject::getInRangeObjects(lua_State* L) {
+    // 1. Check if the underlying object exists
+    if (realObject == nullptr) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    // 2. Get the CloseObjectsVector
+    CloseObjectsVector* closeObjects = (CloseObjectsVector*) realObject->getCloseObjects();
+
+    if (closeObjects == nullptr) {
+        lua_newtable(L); 
+        return 1;
+    }
+
+    // 3. Create a local copy safely
+    // We use safeCopyTo() which locks the private mutex internally
+    Vector<TreeEntry*> objects;
+    closeObjects->safeCopyTo(objects);
+
+    lua_newtable(L);
+
+    // 4. Iterate over our local copy
+    int index = 1;
+    for (int i = 0; i < objects.size(); ++i) {
+        TreeEntry* entry = objects.get(i);
+        
+        // Cast the TreeEntry to a SceneObject
+        SceneObject* obj = dynamic_cast<SceneObject*>(entry);
+
+        if (obj != nullptr) {
+            // Push the object to Lua
+            lua_pushlightuserdata(L, obj);
+            // Add to table at index
+            lua_rawseti(L, -2, index++);
+        }
+    }
+
+    return 1;
 }

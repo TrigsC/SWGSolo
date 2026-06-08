@@ -19,6 +19,8 @@
 #include "server/zone/ZoneProcessServer.h"
 #include "server/zone/managers/name/NameManager.h"
 #include "templates/manager/TemplateManager.h"
+//#include "server/zone/managers/creature/CreatureTemplateManager.h"
+#include "server/zone/objects/creature/ai/CreatureTemplate.h"
 #include "server/zone/managers/object/ObjectManager.h"
 #include "server/zone/managers/faction/FactionManager.h"
 #include "server/zone/managers/frs/FrsManager.h"
@@ -3365,10 +3367,10 @@ void PlayerManagerImplementation::stopListen(CreatureObject* creature, uint64 en
 		return;
 	}
 
-	if (!object->isPlayerCreature()) {
-		creature->sendSystemMessage("@performance:music_listen_npc"); // "You cannot /listen to NPCs."
-		return;
-	}
+	//if (!object->isPlayerCreature()) {
+	//	creature->sendSystemMessage("@performance:music_listen_npc"); // "You cannot /listen to NPCs."
+	//	return;
+	//}
 
 	CreatureObject* entertainer = cast<CreatureObject*>( object.get());
 
@@ -3389,10 +3391,20 @@ void PlayerManagerImplementation::stopListen(CreatureObject* creature, uint64 en
 			esession = dynamic_cast<EntertainingSession*>(session.get());
 
 			if (esession != nullptr) {
-				esession->activateEntertainerBuff(creature, PerformanceType::MUSIC);
+    			// activateEntertainerBuff assumes the ENTERTAINER has a PlayerObject.
+    			// For NPC entertainers, this can crash (null PlayerObject).
+    			if (object->isPlayerCreature()) {
+    			    esession->activateEntertainerBuff(creature, PerformanceType::MUSIC);
+    			}
 
-				esession->removePatron(creature);
+			    esession->removePatron(creature);
 			}
+
+			//if (esession != nullptr) {
+			//	esession->activateEntertainerBuff(creature, PerformanceType::MUSIC);
+//
+			//	esession->removePatron(creature);
+			//}
 		}
 
 		clocker.release();
@@ -3448,19 +3460,45 @@ void PlayerManagerImplementation::stopWatch(CreatureObject* creature, uint64 ent
 	}
 
 	ManagedReference<SceneObject*> object = server->getObject(entertainerID);
+	
 
 	if (object == nullptr)
 		return;
 
-	if (!object->isPlayerCreature()) {
-		creature->sendSystemMessage("@performance:dance_watch_npc"); // "You cannot /watch NPCs."
+	CreatureObject* entertainer = cast<CreatureObject*>(object.get());
+	AiAgent* agent = cast<AiAgent*>(entertainer);
+
+	if (agent == nullptr)
 		return;
+
+	if (entertainer == nullptr || creature == entertainer)
+	    return;
+
+	// Only allow watching NPCs if they're specifically our entertainer template.
+	// This prevents /watch from working on random NPCs.
+	if (!object->isPlayerCreature()) {
+	    const CreatureTemplate* templ = agent->getCreatureTemplate();
+
+	    String templateName;
+	    if (templ != nullptr)
+	        templateName = templ->getTemplateName();
+
+	    // Allow ONLY the "entertainer" creature template (your dancer buffer uses this).
+	    if (templateName != "entertainer") {
+	        creature->sendSystemMessage("@performance:dance_watch_npc"); // You can not /watch NPCs.
+	        return;
+	    }
 	}
 
-	CreatureObject* entertainer = cast<CreatureObject*>( object.get());
+	//if (!object->isPlayerCreature()) {
+	//	creature->sendSystemMessage("@performance:dance_watch_npc"); // "You cannot /watch NPCs."
+	//	return;
+	//}
 
-	if (entertainer == creature)
-		return;
+	//CreatureObject* entertainer = cast<CreatureObject*>( object.get());
+
+	//if (entertainer == creature)
+	//	return;
 
 	ManagedReference<EntertainingSession*> esession = nullptr;
 
@@ -3475,10 +3513,19 @@ void PlayerManagerImplementation::stopWatch(CreatureObject* creature, uint64 ent
 		if (session != nullptr) {
 			esession = dynamic_cast<EntertainingSession*>(session.get());
 
+			//if (esession != nullptr) {
+			//	esession->activateEntertainerBuff(creature, PerformanceType::DANCE);
+//
+			//	esession->removePatron(creature);
+			//}
 			if (esession != nullptr) {
-				esession->activateEntertainerBuff(creature, PerformanceType::DANCE);
+			    // NPC entertainers don't have PlayerObject/entertainer buff bookkeeping,
+			    // and activateEntertainerBuff assumes a player entertainer.
+			    if (object->isPlayerCreature()) {
+			        esession->activateEntertainerBuff(creature, PerformanceType::DANCE);
+			    }
 
-				esession->removePatron(creature);
+			    esession->removePatron(creature);
 			}
 		}
 
@@ -3539,9 +3586,33 @@ void PlayerManagerImplementation::startWatch(CreatureObject* creature, uint64 en
 	if (object == nullptr)
 		return;
 
-	if (!object->isPlayerCreature()) {
-		creature->sendSystemMessage("@performance:dance_watch_npc"); // "You can not /watch NPCs."
+	//if (!object->isPlayerCreature()) {
+	//	creature->sendSystemMessage("@performance:dance_watch_npc"); // "You can not /watch NPCs."
+	//	return;
+	//}
+	CreatureObject* entertainer = cast<CreatureObject*>(object.get());
+	AiAgent* agent = cast<AiAgent*>(entertainer);
+
+	if (agent == nullptr)
 		return;
+
+	if (entertainer == nullptr || creature == entertainer)
+	    return;
+
+	// Only allow watching NPCs if they're specifically our entertainer template.
+	// This prevents /watch from working on random NPCs.
+	if (!object->isPlayerCreature()) {
+	    const CreatureTemplate* templ = agent->getCreatureTemplate();
+
+	    String templateName;
+	    if (templ != nullptr)
+	        templateName = templ->getTemplateName();
+
+	    // Allow ONLY the "entertainer" creature template (your dancer buffer uses this).
+	    if (templateName != "entertainer") {
+	        creature->sendSystemMessage("@performance:dance_watch_npc"); // You can not /watch NPCs.
+	        return;
+	    }
 	}
 
 	if (!CollisionManager::checkLineOfSight(object, creature)) {
@@ -3549,10 +3620,9 @@ void PlayerManagerImplementation::startWatch(CreatureObject* creature, uint64 en
 		return;
 	}
 
-	CreatureObject* entertainer = cast<CreatureObject*>(object.get());
-
-	if (entertainer == nullptr || creature == entertainer)
-		return;
+	//CreatureObject* entertainer = cast<CreatureObject*>(object.get());
+	//if (entertainer == nullptr || creature == entertainer)
+	//	return;
 
 	Locker clocker(entertainer, creature);
 
@@ -3667,12 +3737,31 @@ void PlayerManagerImplementation::startListen(CreatureObject* creature, uint64 e
 		return;
 	}
 
-	if (!object->isPlayerCreature()) {
-		creature->sendSystemMessage("@performance:music_listen_npc"); // "You cannot /listen to NPCs."
-		return;
-	}
-
 	CreatureObject* entertainer = cast<CreatureObject*>( object.get());
+
+	if (!object->isPlayerCreature()) {
+		AiAgent* agent = cast<AiAgent*>(entertainer);
+
+		if (agent == nullptr)
+			return;
+
+	    if (entertainer == nullptr) {
+	        creature->sendSystemMessage("@performance:music_listen_npc"); // You cannot /listen to NPCs.
+	        return;
+	    }
+
+	    // Allow listening ONLY to our entertainer buff NPC(s)
+	    // (your musician buffer currently uses the "entertainer" creature template)
+	    const CreatureTemplate* templ = agent->getCreatureTemplate();
+		String templateName;
+		if (templ != nullptr)
+          templateName = templ->getTemplateName();
+
+	    if (templateName != "entertainer") {
+	        creature->sendSystemMessage("@performance:music_listen_npc"); // You cannot /listen to NPCs.
+	        return;
+	    }
+	}
 
 	if (creature == entertainer)
 		return;

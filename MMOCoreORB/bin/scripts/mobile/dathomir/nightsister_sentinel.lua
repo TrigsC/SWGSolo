@@ -27,6 +27,7 @@ nightsister_sentinel = Creature:new {
 	creatureBitmask = PACK + KILLER,
 	optionsBitmask = AIENABLED,
 	diet = HERBIVORE,
+	healerType = "force",
 
 	templates = {"object/mobile/dressed_dathomir_nightsister_sentinal.iff"},
 	lootGroups = {

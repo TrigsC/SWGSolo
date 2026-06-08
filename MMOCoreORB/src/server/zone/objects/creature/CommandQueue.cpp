@@ -244,19 +244,27 @@ int CommandQueue::handleRunningState() {
 	if (priority == QueueCommand::NORMAL)
 		nextActionTime->updateToCurrentTime();
 
-	 if (creature->isAiAgent()) {
-		if (priority == QueueCommand::NORMAL) {
-			time = 2;
-			nextActionTime->addMiliTime(2000);
-		} else {
-			return DEFAULTTIME;
-		}
-	} else if (time > 0) {
+//	 if (creature->isAiAgent()) {
+//		if (priority == QueueCommand::NORMAL) {
+//			uint64 miliTime = time * 1000;
+//			//time = 2;
+//			nextActionTime->addMiliTime(miliTime);
+//		} else {
+//			return DEFAULTTIME;
+//		}
+//	} else if (time > 0) {
+//		uint64 miliTime = time * 1000;
+//#ifdef DEBUG_QUEUE
+//		info(true) << "Command Delay Time > 0 -- adding to next action time " << miliTime;
+//#endif
+//
+//		nextActionTime->addMiliTime(miliTime);
+//	}
+	if (time > 0) {
 		uint64 miliTime = time * 1000;
 #ifdef DEBUG_QUEUE
 		info(true) << "Command Delay Time > 0 -- adding to next action time " << miliTime;
 #endif
-
 		nextActionTime->addMiliTime(miliTime);
 	}
 
@@ -309,10 +317,10 @@ void CommandQueue::run() {
 			if (delay <= 0)
 				delay = DEFAULTTIME;
 
-			if (creature->isAiAgent())
-				queueTask->reschedule(delay);
-			else
-				queueTask->reschedule(DEFAULTTIME);
+			//if (creature->isAiAgent())
+			//	queueTask->reschedule(delay);
+			//else
+			queueTask->reschedule(DEFAULTTIME);
 
 			break;
 		}

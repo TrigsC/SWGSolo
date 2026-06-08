@@ -48,9 +48,9 @@ IDL_CLASSPATH = ../MMOEngine/include
 #IDL_DIRECTIVES = -noprelocks -outdir autogen -cp $(IDL_CLASSPATH)
 IDL_DIRECTIVES = -outdir autogen -cp $(IDL_CLASSPATH)
 
-UNITTEST_DIRECTIVES =
+UNITTEST_DIRECTIVES = -Wno-deprecated-literal-operator
 
-CMAKE_ARGS =
+CMAKE_ARGS = -DCMAKE_CXX_FLAGS="-Wno-error=deprecated-literal-operator -Wno-error=nontrivial-memcall"
 
 BUILD_PATH = build/unix
 DEFAULT_BUILD_TYPE = RelWithDebInfo

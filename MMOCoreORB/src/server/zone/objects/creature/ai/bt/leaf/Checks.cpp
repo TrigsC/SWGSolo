@@ -584,18 +584,50 @@ template<> bool CheckIsHealer::check(AiAgent* agent) const {
 }
 
 template<> bool CheckHealChance::check(AiAgent* agent) const {
-	Time* healDelay = agent->getHealDelay();
+    Time* healDelay = agent->getHealDelay();
 
-	if (healDelay == nullptr || !healDelay->isPast()) {
-		return false;
-	}
+    // 1. Check Cooldown (Keep this, it prevents spam)
+    if (healDelay == nullptr || !healDelay->isPast()) {
+        return false;
+    }
 
-	if (System::random(100) < 98) {
-		return false;
-	}
+    // 2. Resource Check (The Human Element)
+    uint32 healerType = agent->getHealerType().toLowerCase().hashCode();
+    
+    if (healerType == STRING_HASHCODE("force")) {
+        // If I have less than 200 force (cost of a heal), I cannot heal.
+        // Instead, I should save force for an attack or wait to regen.
+        if (agent->getCurrentForce() < 200) { 
+            return false; 
+        }
+    } else {
+        // Non-Force users (Medics)
+        // Simulate "Mind" cost or supply count here.
+        // Example: If Mind is exhausted, return false.
+        if (agent->getHAM(CreatureAttribute::MIND) < 100) {
+            return false;
+        }
+    }
 
-	return true;
+    // 3. Remove the 98% failure rate. 
+    // If we have the cooldown and the mana, we *can* heal.
+    // We let the next step (GetHealTarget) decide if we *should* heal.
+    return true;
 }
+
+//template<> bool CheckHealChance::check(AiAgent* agent) const {
+//	Time* healDelay = agent->getHealDelay();
+//
+//	if (healDelay == nullptr || !healDelay->isPast()) {
+//		return false;
+//	}
+//
+//	if (System::random(100) < 68) {
+//		return false;
+//	}
+//
+//	return true;
+//}
 
 template<> bool CheckIsHome::check(AiAgent* agent) const {
 	PatrolPoint* homeLocation = agent->getHomeLocation();

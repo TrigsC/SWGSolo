@@ -44,10 +44,10 @@
 object_tangible_food_crafted_dish_thakitillo = object_tangible_food_crafted_shared_dish_thakitillo:new {
 	templateType = CONSUMABLE,
 
-	useCount = 5,
-	duration = 600,
-	filling = 49,
-	nutrition = 80,
+	duration = 796,
+	filling = 43,
+	nutrition = 107,
+	useCount = 99,
 
 	effectType = 4,
 

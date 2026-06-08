@@ -226,70 +226,90 @@ private:
 
 class SelectAttack : public Behavior {
 public:
-	SelectAttack(const String& className, const uint32 id, const LuaObject& args)
-			: Behavior(className, id, args), attackNum(-1) {
-		parseArgs(args);
-	}
+    SelectAttack(const String& className, const uint32 id, const LuaObject& args)
+        : Behavior(className, id, args), attackNum(-1) {
+        parseArgs(args);
+    }
 
-	SelectAttack(const SelectAttack& a)
-			: Behavior(a), attackNum(a.attackNum) {
-	}
+    SelectAttack(const SelectAttack& a)
+        : Behavior(a), attackNum(a.attackNum) {
+    }
 
-	SelectAttack& operator=(const SelectAttack& a) {
-		if (this == &a)
-			return *this;
-		Behavior::operator=(a);
-		attackNum = a.attackNum;
-		return *this;
-	}
+    SelectAttack& operator=(const SelectAttack& a) {
+        if (this == &a)
+            return *this;
+        Behavior::operator=(a);
+        attackNum = a.attackNum;
+        return *this;
+    }
 
-	void parseArgs(const LuaObject& args) {
-		attackNum = getArg<int>()(args, "attackNum", -1);
-	}
+    void parseArgs(const LuaObject& args) {
+        attackNum = getArg<int>()(args, "attackNum", -1);
+    }
 
-	Behavior::Status execute(AiAgent* agent, unsigned int startIdx = 0) const {
-		//agent->info("SelectAttack::execute", true);
+    Behavior::Status execute(AiAgent* agent, unsigned int startIdx = 0) const {
+        //agent->info("SelectAttack::execute", true);
 
-		if (agent->isDead()) {
-			return FAILURE;
-		}
+        if (agent->isDead()) {
+            return FAILURE;
+        }
 
-		WeaponObject* weapon = agent->getCurrentWeapon();
+        bool ok = false;
 
-		if (weapon != nullptr && weapon->getAttackType() ==  SharedWeaponObjectTemplate::FORCEATTACK) {
-			return agent->selectSpecialAttack(-1) ? SUCCESS : FAILURE;
-		}
+        WeaponObject* weapon = agent->getCurrentWeapon();
 
-		if (agent->peekBlackboard("attackType")) {
-			//agent->info("SelectAttack::execute has attackType", true);
+        // Force attackers tend to lean on specials, but still fall back if nothing chosen
+        if (weapon != nullptr && weapon->getAttackType() == SharedWeaponObjectTemplate::FORCEATTACK) {
+            ok = agent->selectSpecialAttack(-1);
+            if (!ok) {
+                ok = agent->selectDefaultAttack();
+            }
+            return ok ? SUCCESS : FAILURE;
+        }
 
-			if (agent->readBlackboard("attackType").get<uint32>() == static_cast<uint32>(DataVal::DEFAULT)) {
-				//agent->info("SelectAttack::execute has attackType DEFAULT", true);
+        // If the behavior tree has written an attackType, respect it
+        if (agent->peekBlackboard("attackType")) {
+            uint32 atkType = agent->readBlackboard("attackType").get<uint32>();
 
-				return agent->selectDefaultAttack() ? SUCCESS : FAILURE;
-			}
+            if (atkType == static_cast<uint32>(DataVal::DEFAULT)) {
+                ok = agent->selectDefaultAttack();
+                return ok ? SUCCESS : FAILURE;
+            }
 
-			if (agent->readBlackboard("attackType").get<uint32>() == static_cast<uint32>(DataVal::RANDOM)) {
-				//agent->info("SelectAttack::execute has attackType RANDOM", true);
+            if (atkType == static_cast<uint32>(DataVal::RANDOM)) {
+                // 70% of the time: use default/main attack
+                if (System::random(100) < 60) {
+                    ok = agent->selectDefaultAttack();
+                    return ok ? SUCCESS : FAILURE;
+                }
 
-				return agent->selectSpecialAttack(-1) ? SUCCESS : FAILURE;
-			}
-		}
+                // 30%: use a situational special
+                ok = agent->selectSpecialAttack(-1);
+                if (!ok) {
+                    // Don't waste the tick – fallback to default
+                    ok = agent->selectDefaultAttack();
+                }
+                return ok ? SUCCESS : FAILURE;
+            }
+        }
 
-		//agent->info("SelectAttack::execute has attackType attackNum", true);
+        // If no attackType was set, defer to the configured attackNum
+        ok = agent->selectSpecialAttack(attackNum);
+        if (!ok) {
+            ok = agent->selectDefaultAttack();
+        }
 
-		return agent->selectSpecialAttack(attackNum) ? SUCCESS : FAILURE;
-	}
+        return ok ? SUCCESS : FAILURE;
+    }
 
-	String print() const {
-		StringBuffer msg;
-		msg << className << "-" << attackNum;
-
-		return msg.toString();
-	}
+    String print() const {
+        StringBuffer msg;
+        msg << className << "-" << attackNum;
+        return msg.toString();
+    }
 
 private:
-	int attackNum;
+    int attackNum;
 };
 
 class EnqueueAttack : public Behavior {
@@ -310,16 +330,21 @@ public:
 		return *this;
 	}
 
-	Behavior::Status execute(AiAgent* agent, unsigned int startIdx = 0) const {
-		// Using Normal (2) Priority
-		int res = agent->enqueueAttack(2);
-		Behavior::Status returnRes = FAILURE;
+Behavior::Status execute(AiAgent* agent, unsigned int startIdx = 0) const {
+    int res = agent->enqueueAttack(2);
 
-		if (!res)
-			returnRes = SUCCESS;
+#ifdef DEBUG_AI_ATTACK
+    agent->info(true) << "AI_ATTACK: EnqueueAttack called, enqueueAttack(2) returned "
+                      << res << " for " << agent->getDisplayedName()
+                      << " (" << agent->getObjectID() << ")";
+#endif
 
-		return returnRes;
-	}
+    Behavior::Status returnRes = FAILURE;
+    if (!res)
+        returnRes = SUCCESS;
+
+    return returnRes;
+}
 
 	String print() const {
 		StringBuffer msg;
@@ -694,14 +719,20 @@ public:
 		}
 
 		if (healExecuted == true) {
-			Time* healDelay = agent->getHealDelay();
+        	Time* healDelay = agent->getHealDelay();
 
-			if (healDelay != nullptr) {
-				healDelay->updateToCurrentTime();
-				healDelay->addMiliTime(20 * 1000);
-			}
+        	if (healDelay != nullptr) {
+        	    healDelay->updateToCurrentTime();
+				// Minimum wait: 8 seconds
+            	// Maximum wait: 20 seconds
+            	// Logic: 8000ms base + random(0 to 12000ms)
+				int delay = 8000 + System::random(12000);
 
-			agent->eraseBlackboard("healTarget");
+        	    // This allows ai to "spam" heal if they have the Force.
+        	    healDelay->addMiliTime(delay); 
+        	}
+
+        	agent->eraseBlackboard("healTarget");
 		}
 
 		return SUCCESS;
