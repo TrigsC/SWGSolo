@@ -268,20 +268,22 @@ void SimPlayerController::checkArrival() {
 
     if (agent->isIncapacitated()) {
         state = WAITING;
-        Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer checkArrival: isIncapacitated", true);
 #endif
+        locker.release();
+        Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(1000);
         return;
     }
 
     if (agent->isInCombat()) {
         state = IDLE; 
-        Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer checkArrival: isInCombat", true);
 #endif
+        locker.release();
+        Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(1000); 
         return;
     }
@@ -290,13 +292,16 @@ void SimPlayerController::checkArrival() {
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer checkArrival: Resuming path to " + destination.toString(), true);
 #endif
-        moveTo(destination);
+        Vector3 resumeDestination = destination;
+        locker.release();
+        moveTo(resumeDestination);
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(1000);
         return;
     }
 
     if (state != MOVING) {
+        locker.release();
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(1000);
         return;
@@ -323,8 +328,10 @@ void SimPlayerController::checkArrival() {
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer checkArrival: Arrived at destination.", true);
 #endif
-        agent->clearPatrolPoints(); 
-        onArrived(); 
+        agent->clearPatrolPoints();
+        state = WAITING;
+        locker.release();
+        onArrived();
         Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
         task->schedule(1000);
         return;
@@ -354,6 +361,7 @@ void SimPlayerController::checkArrival() {
 
     lastWatchdogPos = currentPos;
 
+    locker.release();
     Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
     task->schedule(500);
 }
@@ -489,35 +497,47 @@ void SimMinerController::performSample() {
 }
 
 void SimMinerController::finishSample() {
-    if (agent == nullptr)
+    ManagedReference<AiAgent*> strongAgent = agent;
+    if (strongAgent == nullptr)
         return;
 
-    logStateTransition("SimMiner: Sample finished for [" + targetResource + "]");
-    recordConceptualYield();
-    agent->setPosture(CreaturePosture::UPRIGHT, true);
-    agent->doAnimation("stop_sample"); 
+    String completedResource = targetResource;
+    int yieldAmount = 0;
+    bool logYield = false;
+    bool recordYield = prepareConceptualYield(completedResource, yieldAmount, logYield);
+    uint64 sourceObjectID = strongAgent->getObjectID();
+
+    logStateTransition("SimMiner: Sample finished for [" + completedResource + "]");
+    strongAgent->setPosture(CreaturePosture::UPRIGHT, true);
+    strongAgent->doAnimation("stop_sample");
     startSimLoop();
+
+    // Keep conceptual accounting outside the completed sample's agent work.
+    if (recordYield) {
+        SimPlayerManager::instance()->recordConceptualMinerYield(
+            completedResource, yieldAmount, sourceObjectID, logYield);
+    }
 }
 
-void SimMinerController::recordConceptualYield() {
-    if (!config.yieldEnabled || targetResource.isEmpty())
-        return;
+bool SimMinerController::prepareConceptualYield(const String& completedResource, int& amount, bool& logYield) const {
+    if (!config.yieldEnabled || completedResource.isEmpty())
+        return false;
 
     int minAmount = config.minYieldAmount;
     int maxAmount = config.maxYieldAmount;
 
     if (minAmount <= 0 || maxAmount <= 0)
-        return;
+        return false;
 
     if (maxAmount < minAmount)
         maxAmount = minAmount;
 
-    int amount = minAmount;
+    amount = minAmount;
     if (maxAmount > minAmount)
         amount += System::random(maxAmount - minAmount);
 
-    uint64 sourceObjectID = agent != nullptr ? agent->getObjectID() : 0;
-    SimPlayerManager::instance()->recordConceptualMinerYield(targetResource, amount, sourceObjectID, config.logYield);
+    logYield = config.logYield;
+    return true;
 }
 
 void SimMinerController::logStateTransition(const String& message) const {

@@ -21,11 +21,12 @@ catch signal SIGUSR1
 commands
 set trace-commands on
 shell date '+START %c %s%nSIGUSR1 Caught' >> gdb.log
-shell sleep 10;tail -10 ~/../bin/screenlog.0 | tr -d '\r' >> gdb.log
 set logging file gdb.log
 set logging on
-thread apply all bt
+info threads
+thread apply all bt 30
 set logging off
+shell tail -10 screenlog.0 | tr -d '\r' >> gdb.log
 shell date '+END %c %s' >> gdb.log
 set trace-commands off
 continue

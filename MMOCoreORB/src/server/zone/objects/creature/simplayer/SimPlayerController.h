@@ -127,6 +127,7 @@ public:
     // --- Common Movement Logic ---
     void moveTo(Vector3 targetPos);
     void checkArrival();
+    ManagedReference<AiAgent*> getAgent() const { return agent; }
     
     void onPathFound(Vector<WorldCoordinates>* path);
     virtual void onPathFailed();
@@ -164,7 +165,7 @@ public:
 
 private:
     void logStateTransition(const String& message) const;
-    void recordConceptualYield();
+    bool prepareConceptualYield(const String& completedResource, int& amount, bool& logYield) const;
 };
 
 #endif

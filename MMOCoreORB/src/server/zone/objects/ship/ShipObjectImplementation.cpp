@@ -646,7 +646,20 @@ void ShipObjectImplementation::sendDestroyTo(SceneObject* player) {
 
 void ShipObjectImplementation::notifyInsertToZone(Zone* zone) {
 	StringBuffer newName;
-	newName << getDisplayedName() << " -- ID: " << getObjectID() << " - " << zone->getZoneName();
+
+	// Avoid resolving the localized display name here. Space spawners call this
+	// while holding the ship lock, and StringIdManager resolution opens a local
+	// database transaction. A startup burst of ship spawns can otherwise exhaust
+	// the task pool in concurrent Berkeley DB transactions.
+	if (!customName.isEmpty()) {
+		newName << customName.toString();
+	} else if (!objectName.getStringID().isEmpty()) {
+		newName << objectName.getStringID();
+	} else {
+		newName << "ShipObject";
+	}
+
+	newName << " -- ID: " << getObjectID() << " - " << zone->getZoneName();
 
 	setLoggingName(newName.toString());
 
