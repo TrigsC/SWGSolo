@@ -62,6 +62,8 @@ ObjectManager::ObjectManager(bool initializeTemplates) : DOBObjectManager() {
 	databaseManager->loadObjectDatabase("navareas", true, 0xFFFF, false);
 	databaseManager->loadObjectDatabase("frsdata", true);
 	databaseManager->loadObjectDatabase("frsmanager", true);
+	databaseManager->loadObjectDatabase("aieconomy", true);
+	databaseManager->loadObjectDatabase("aieconomylots", true);
 	databaseManager->loadObjectDatabase("resourcespawns", true);
 	databaseManager->loadObjectDatabase("playerbounties", true);
 	databaseManager->loadObjectDatabase("mail", true);

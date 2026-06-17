@@ -40,7 +40,7 @@ class ShipObjectTimerTask : public Task, public Logger {
 
 		Vector<ManagedReference<ShipObject*>> shipVector;
 		Vector<ManagedReference<ShipAiAgent*>> agentVector;
-		Vector<ManagedWeakReference<ShipObject*>> queueVector;
+		Vector<WeakReference<ShipObject*>> queueVector;
 
 		Vector<uint64> timers;
 		Vector<uint32> deltas;

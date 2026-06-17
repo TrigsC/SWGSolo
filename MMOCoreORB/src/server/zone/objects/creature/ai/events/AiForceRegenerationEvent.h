@@ -10,7 +10,7 @@
 
 // The cycle is broken, so we can safely include AiAgent.h now
 #include "server/zone/objects/creature/ai/AiAgent.h"
-#include "system/thread/Locker.h" 
+#include "system/thread/Locker.h"
 
 namespace server {
 namespace zone {
@@ -27,22 +27,28 @@ public:
         weakAgent = agent;
     }
 
-    void run() {
-        ManagedReference<AiAgent*> agent = weakAgent.get();
+	void run() {
+		ManagedReference<AiAgent*> agent = weakAgent.get();
 
-        if (agent == nullptr) {
-            return;
-        }
-        
-        // This locker will work now because AiAgent is fully defined
-        Locker lock(agent); 
+		if (agent == nullptr)
+			return;
 
-        if (agent->isDead() || agent->getZone() == nullptr) {
-            return; 
-        }
+		ZoneServer* zoneServer = agent->getZoneServer();
 
-        agent->doForceRegen();
-    }
+		if (zoneServer == nullptr || zoneServer->isServerShuttingDown())
+			return;
+
+		Locker lock(agent);
+
+		if (agent->isDead() || agent->getZone() == nullptr)
+			return;
+
+		agent->doForceRegen();
+	}
+
+	void clearAgentObject() {
+		weakAgent = nullptr;
+	}
 };
 
 } // namespace events

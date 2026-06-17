@@ -1,0 +1,306 @@
+/*
+				Copyright <SWGEmu>
+		See file COPYING for copying conditions. */
+
+package server.zone.managers.aieconomy;
+
+import engine.core.ManagedObject;
+include system.lang.Time;
+
+@json
+class AiEconomyStockpileLot extends ManagedObject {
+	protected unsigned long entryId;
+	protected unsigned long resourceSpawnObjectId;
+
+	protected string conceptualLabel;
+	protected string resourceSpawnName;
+	protected string resourceType;
+	protected string resourceClassChain;
+	protected string sourcePlanet;
+	protected string sourceZone;
+	protected string acquisitionSource;
+	protected string resourceLifecycleState;
+	protected string ownerScope;
+	protected string identityConfidence;
+	protected string matchedDemandProfiles;
+	protected string qualityTier;
+
+	protected unsigned long quantity;
+	protected unsigned long reservedQuantity;
+
+	@dereferenced
+	protected Time acquiredTimestamp;
+
+	@dereferenced
+	protected Time lastUpdatedTimestamp;
+
+	protected boolean activeAtAcquisition;
+
+	protected int oq;
+	protected int cd;
+	protected int dr;
+	protected int hr;
+	protected int fl;
+	protected int ma;
+	protected int pe;
+	protected int sr;
+	protected int ut;
+	protected int cr;
+
+	public AiEconomyStockpileLot() {
+		entryId = 0;
+		resourceSpawnObjectId = 0;
+		conceptualLabel = "";
+		resourceSpawnName = "";
+		resourceType = "";
+		resourceClassChain = "";
+		sourcePlanet = "";
+		sourceZone = "";
+		acquisitionSource = "unknown";
+		resourceLifecycleState = "unknown";
+		ownerScope = "galaxy";
+		identityConfidence = "unknown";
+		matchedDemandProfiles = "";
+		qualityTier = "";
+		quantity = 0;
+		reservedQuantity = 0;
+		activeAtAcquisition = false;
+		oq = -1;
+		cd = -1;
+		dr = -1;
+		hr = -1;
+		fl = -1;
+		ma = -1;
+		pe = -1;
+		sr = -1;
+		ut = -1;
+		cr = -1;
+		acquiredTimestamp.updateToCurrentTime();
+		lastUpdatedTimestamp.updateToCurrentTime();
+	}
+
+	public AiEconomyStockpileLot(
+			unsigned long newEntryId, final string label,
+			unsigned long newQuantity) {
+		entryId = newEntryId;
+		resourceSpawnObjectId = 0;
+		conceptualLabel = label;
+		resourceSpawnName = "";
+		resourceType = "";
+		resourceClassChain = "";
+		sourcePlanet = "";
+		sourceZone = "";
+		acquisitionSource = "conceptual_miner";
+		resourceLifecycleState = "conceptual";
+		ownerScope = "galaxy";
+		identityConfidence = "conceptual_label";
+		matchedDemandProfiles = "";
+		qualityTier = "";
+		quantity = newQuantity;
+		reservedQuantity = 0;
+		activeAtAcquisition = false;
+		oq = -1;
+		cd = -1;
+		dr = -1;
+		hr = -1;
+		fl = -1;
+		ma = -1;
+		pe = -1;
+		sr = -1;
+		ut = -1;
+		cr = -1;
+		acquiredTimestamp.updateToCurrentTime();
+		lastUpdatedTimestamp.updateToCurrentTime();
+	}
+
+	@read
+	@preLocked
+	public unsigned long getEntryId() {
+		return entryId;
+	}
+
+	@read
+	@preLocked
+	public unsigned long getResourceSpawnObjectId() {
+		return resourceSpawnObjectId;
+	}
+
+	@read
+	@preLocked
+	public final string getConceptualLabel() {
+		return conceptualLabel;
+	}
+
+	@read
+	@preLocked
+	public final string getResourceSpawnName() {
+		return resourceSpawnName;
+	}
+
+	@read
+	@preLocked
+	public final string getResourceType() {
+		return resourceType;
+	}
+
+	@read
+	@preLocked
+	public final string getResourceClassChain() {
+		return resourceClassChain;
+	}
+
+	@read
+	@preLocked
+	public final string getSourcePlanet() {
+		return sourcePlanet;
+	}
+
+	@read
+	@preLocked
+	public final string getSourceZone() {
+		return sourceZone;
+	}
+
+	@read
+	@preLocked
+	public final string getAcquisitionSource() {
+		return acquisitionSource;
+	}
+
+	@read
+	@preLocked
+	public final string getResourceLifecycleState() {
+		return resourceLifecycleState;
+	}
+
+	@read
+	@preLocked
+	public final string getOwnerScope() {
+		return ownerScope;
+	}
+
+	@read
+	@preLocked
+	public final string getIdentityConfidence() {
+		return identityConfidence;
+	}
+
+	@read
+	@preLocked
+	public final string getMatchedDemandProfiles() {
+		return matchedDemandProfiles;
+	}
+
+	@read
+	@preLocked
+	public final string getQualityTier() {
+		return qualityTier;
+	}
+
+	@read
+	@preLocked
+	public unsigned long getQuantity() {
+		return quantity;
+	}
+
+	@read
+	@preLocked
+	public unsigned long getReservedQuantity() {
+		return reservedQuantity;
+	}
+
+	@read
+	@preLocked
+	public unsigned long getAvailableQuantity() {
+		if (reservedQuantity >= quantity)
+			return 0;
+
+		return quantity - reservedQuantity;
+	}
+
+	@read
+	@preLocked
+	public unsigned long getAcquiredTimestamp() {
+		return acquiredTimestamp.getMiliTime();
+	}
+
+	@read
+	@preLocked
+	public unsigned long getLastUpdatedTimestamp() {
+		return lastUpdatedTimestamp.getMiliTime();
+	}
+
+	@read
+	@preLocked
+	public boolean wasActiveAtAcquisition() {
+		return activeAtAcquisition;
+	}
+
+	@read
+	@preLocked
+	public int getOq() {
+		return oq;
+	}
+
+	@read
+	@preLocked
+	public int getCd() {
+		return cd;
+	}
+
+	@read
+	@preLocked
+	public int getDr() {
+		return dr;
+	}
+
+	@read
+	@preLocked
+	public int getHr() {
+		return hr;
+	}
+
+	@read
+	@preLocked
+	public int getFl() {
+		return fl;
+	}
+
+	@read
+	@preLocked
+	public int getMa() {
+		return ma;
+	}
+
+	@read
+	@preLocked
+	public int getPe() {
+		return pe;
+	}
+
+	@read
+	@preLocked
+	public int getSr() {
+		return sr;
+	}
+
+	@read
+	@preLocked
+	public int getUt() {
+		return ut;
+	}
+
+	@read
+	@preLocked
+	public int getCr() {
+		return cr;
+	}
+
+	@dirty
+	@preLocked
+	public void updateConceptualMinerAggregate(unsigned long newQuantity) {
+		quantity = newQuantity;
+		reservedQuantity = 0;
+		lastUpdatedTimestamp.updateToCurrentTime();
+	}
+}

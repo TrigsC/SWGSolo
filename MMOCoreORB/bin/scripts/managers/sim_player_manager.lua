@@ -197,6 +197,20 @@ SimPlayerManagerConfig = {
         includeMarketObservation = true,
     },
 
+    -- Persist aggregate conceptual miner totals only. Disabled by default.
+    aiEconomyPersistenceConfig = {
+        persistConceptualMinerTotals = false,
+        intervalSeconds = 300,
+        logSummary = true,
+    },
+
+    -- Read-only D.6.2 consumer for validated durable conceptual stockpile baseline.
+    persistentStockpileDemandConfig = {
+        enabled = true,
+        includeConceptualMinerLots = true,
+        logSummary = true,
+    },
+
     -- Log-only D.6 demand-pressure plans. Never assigns targets or changes miner behavior.
     demandWeightedMinerPlanSimulationConfig = {
         enabled = true,

@@ -247,6 +247,8 @@ class AiAgent extends CreatureObject {
 
 	@dereferenced
 	protected transient Reference<Task> forceRegenerationEvent;
+	@dereferenced
+	private transient Mutex forceRegenerationEventMutex;
 
 	public AiAgent() {
 		movementState = OBLIVIOUS;
@@ -679,6 +681,8 @@ class AiAgent extends CreatureObject {
 
 	@preLocked
 	public void destroyObjectFromWorld(boolean sendSelfDestroy) {
+		cancelForceRegenerationEvent();
+
 		super.destroyObjectFromWorld(sendSelfDestroy);
 
 		numberOfPlayersInRange.set(0);
@@ -690,6 +694,8 @@ class AiAgent extends CreatureObject {
 
 	@preLocked
 	public void destroyObjectFromDatabase(boolean destroyContainedObjects = false) {
+		cancelForceRegenerationEvent();
+
 		if (petDeed) {
 			petDeed.destroyObjectFromDatabase(true);
 		}
@@ -1011,27 +1017,32 @@ class AiAgent extends CreatureObject {
 	}
 
 	// NEW AI HEALING METHODS
+	@dirty
     public void setMaxForce(int value) {
         maxForcePoints = value;
     }
-    
-    @dirty
+
     public int getMaxForce() {
         return maxForcePoints;
     }
 
+	@dirty
     public void setCurrentForce(int value) {
         currentForcePoints = value;
     }
 
-    @dirty
     public int getCurrentForce() {
         return currentForcePoints;
     }
 
+	@preLocked
 	public native void activateForcePowerRegen();
 
+	@preLocked
     public native void doForceRegen();
+
+	@preLocked
+	public native void cancelForceRegenerationEvent();
 
 	public boolean isResting() {
 		return getMovementState() == RESTING;

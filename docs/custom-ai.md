@@ -56,6 +56,8 @@ The custom AiAgent engine extensions expose additional gameplay actions to Lua a
 - Modifying despawn and behavior activation rules so SimPlayers can remain active even with no real players nearby.
 - Adjusting `findNextPosition` behavior for SimPlayers.
 
+Force regeneration uses the same lifetime rule as the standard AI behavior and recovery events: the event reference is mutex-protected, canceled during despawn/world removal, and its weak `AiAgent` target is cleared before the agent can be recycled. Force setters mark the managed object dirty; force getters remain side-effect-free while preserving their established non-const generated ABI.
+
 `LuaAiAgent.cpp` and `LuaAiAgent.h` expose selected C++ behavior to Lua. These bindings are used by the Smart Doctor, Smart Dancer, Smart Musician, and older AI chat skill flows.
 
 `BuffCRC.h` defines CRC constants for the custom medical and performance buffs. These constants are used by the custom buff bridge methods.
@@ -598,6 +600,7 @@ Stability considerations:
 - `SimBehaviorTask` re-resolves the miner controller inside the task-manager lambda from a captured strong base-controller reference. It should not capture raw delayed `SimMinerController*` pointers because survey/sample callbacks can run after a controller is stopped or recycled.
 - The periodic miner summary task is manager-owned and calls back through `SimPlayerManager::instance()`; it does not capture controller or AiAgent pointers.
 - Conceptual yield accounting uses a dedicated `conceptualMinerTotalsMutex`, copies completed-sample primitive/string values before the miner starts its next loop, and copies the resource key again at the manager boundary so the map never depends on caller-owned mutable string storage. It performs no `AiAgent`, object-manager, resource-manager, scheduling, persistence, or economy calls while holding that mutex. Logging occurs only before lock acquisition or after lock release.
+- Miner movement validates navmesh and fallback destinations against the ground-zone boundary before terrain-height or pathfinding calls. A random fallback that crosses the terrain edge is biased toward the planet center; if it is still invalid, the loop retries without querying out-of-bounds terrain. This prevents the long-running conceptual random walk from producing repeated `TerrainManager` stack traces.
 - `checkArrival` locks the AiAgent while examining combat/death/movement state and updating patrol movement, but releases that lock before scheduling another task, restarting path selection, or invoking the behavior-specific `onArrived` callback.
 - Resource Intelligence copies strong `ResourceSpawn` references while holding a short `ResourceManager` read lock, then releases the manager lock before locking and inspecting individual spawns. Density simulation follows the same manager-then-release/spawn-lock separation. This avoids holding the global resource-manager lock across per-spawn metadata or density work.
 - The current miner can schedule repeated arrival checks every 500 ms while moving and every 1000 ms while waiting, incapped, or in combat.
@@ -625,13 +628,13 @@ Suggested future phases:
 | Phase A | Make current miner behavior observable and configurable. | Implemented for conceptual resources, survey/sample durations, movement radii, and optional state-transition logging. Miner count remains disabled by default. |
 | Phase B | Record conceptual gathered resource amounts in memory/log only. | Implemented with manager-owned in-memory aggregate totals and optional yield logging. No real economy systems are touched. |
 | Phase B.2 | Add periodic read-only miner summary logging. | Implemented with disabled-by-default `summaryConfig`; empty zero-miner summaries are skipped to avoid log noise. |
-| Phase C | Persist abstract resource inventory safely. | Store simple per-miner or per-system resource counters without creating SWG resource containers yet. |
+| Phase C | Persist abstract resource inventory safely. | C.1/C.2 provide the object/database bootstrap; C.3.1 can checkpoint aggregate conceptual totals behind a disabled-by-default switch. Demand state still does not consume them. |
 | Phase D | Sell resource lots through a controlled vendor/market abstraction. | Introduce a constrained output path with caps, pricing rules, and audit logs. |
 | Phase E | Connect to crafting/economy loops. | Only after resource accounting, persistence, and market limits are stable. |
 
 ### Phase C - Persistence Architecture Research
 
-This section documents persistence research for future AI economy state. It is architecture guidance only; no persistence is implemented by the current SimMiner work.
+This section documents the research that informed C.1/C.2 and the later C.3.1 aggregate checkpoint. Live SimMiner accounting remains memory-only; C.3.1 periodically copies completed session totals into separate durable conceptual lots only when explicitly enabled.
 
 Current state:
 
@@ -729,19 +732,335 @@ Future implementation phases:
 
 | Phase | Goal | Notes |
 |---|---|---|
-| Phase C.1 | Define persisted economy data shape. | Create an IDL design for `AiEconomyData` with version, resource totals, role inventories, coarse stats, and timestamps. |
-| Phase C.2 | Add database registration and load-only bootstrap. | Register a dedicated object database and load/create the data object without changing miner output yet. |
-| Phase C.3 | Save conceptual miner totals. | Periodically copy `SimPlayerManager` totals into the persisted data object; keep restart loss bounded by interval. |
+| Phase C.1 | Define persisted economy data shape. | Implemented with `AiEconomyData` and `AiEconomyStockpileLot` IDL objects. |
+| Phase C.2 | Add database registration and load-only bootstrap. | Implemented with the dedicated `aieconomy` object database and `AiEconomyManager` startup load/create validation. |
+| Phase C.3.1 | Persist aggregate conceptual miner totals. | Implemented behind a disabled-by-default switch; one durable lot is upserted per non-zero conceptual label. |
+| Phase C.3.2 | Prove restart survival and diagnostics. | Exercise repeated intervals/restarts, verify quantities and lot identity, and add repair-oriented diagnostics if needed. |
+| Phase C.3.3/C.3.4 | Expose durable supply to demand state. | Add a separate disabled gate before D.6.2 may consume `persistentStockpileSupply`; keep demand integration independent from persistence writes. |
 | Phase C.4 | Add admin/debug inspection. | Add read-only logs or tools to inspect persisted totals without player-facing economy effects. |
 | Phase C.5 | Add migrations and repair tooling. | Add version migration, backup/export, and safe reset options before expanding the economy. |
 
 Open questions:
 
-- Should AI economy ownership remain in `SimPlayerManager`, or should a new `AiEconomyManager` own durable state while SimPlayers report production events?
+- How should future durable stockpile ownership be divided below the galaxy-wide `AiEconomyManager` boundary: profession, faction, vendor, crafter, or another explicit scope?
 - Should conceptual totals be galaxy-wide, planet-specific, resource-type-specific, or role-specific from the first persisted version?
 - What is the acceptable crash-loss window for a low-population solo server: 5 minutes, 15 minutes, or one server tick batch?
 - How much history is useful for supply/demand without creating unbounded database growth?
 - Should persistence be disabled by default until migration and admin reset tooling exists?
+
+### Phase C.1/C.2 - AI Economy Persistence Bootstrap
+
+Phase C.1/C.2 implements the first durable AI economy foundation without connecting it to production, demand, market, or gameplay state. It follows the existing FRS manager-state pattern:
+
+- A transient manager owns the runtime reference.
+- One generated `ManagedObject` contains durable state.
+- A dedicated Core3 object database stores that object.
+- Startup loads the existing object or creates an empty default when the database is genuinely empty.
+
+#### Added objects and ownership
+
+The new files are:
+
+- `server/zone/managers/aieconomy/AiEconomyData.idl`: the schema-versioned root data object.
+- `server/zone/managers/aieconomy/AiEconomyStockpileLot.idl`: the future resource-lot shape.
+- `server/zone/managers/aieconomy/AiEconomyManager.h/.cpp`: the transient persistence owner, bootstrap, validator, and narrow C.3.1 aggregate upsert boundary.
+
+`AiEconomyManager` is intentionally separate from `SimPlayerManager`. Durable economy ownership must survive individual SimPlayer controllers, spawned NPCs, and future role implementations. This also keeps object persistence outside SimPlayer, `AiAgent`, conceptual-total, market-observation, and resource-manager lock scopes.
+
+The root object currently stores:
+
+- `schemaVersion`, currently `1`.
+- `createdTimestamp`.
+- `updatedTimestamp`.
+- `nextStockpileEntryId`.
+- A vector of `AiEconomyStockpileLot` references.
+
+The future lot shape includes:
+
+- Stable economy `entryId`.
+- Conceptual label.
+- Quantity and reserved quantity; available quantity is derived as `quantity - reservedQuantity`.
+- Acquisition source.
+- Resource lifecycle state.
+- Owner scope.
+- Identity confidence.
+- Acquisition and update timestamps.
+- Optional resource spawn object ID, generated name, exact type, class-chain snapshot, source planet/zone, active-at-acquisition state, demand-profile explanation, and quality tier.
+- Optional OQ/CD/DR/HR/FL/MA/PE/SR/UT/CR stat snapshots. Missing stats default to `-1`.
+
+There is no separate persisted boolean on each lot. Membership in the persisted `AiEconomyData` object is the durable/persisted semantic. D.6.5.1 simulation rows remain explicitly `persisted=false` because they are not members of this object.
+
+#### Database and startup flow
+
+`ObjectManager` registers and loads a dedicated root object database named `aieconomy`. C.3.1 additionally uses `aieconomylots` for referenced stockpile-lot objects, following the FRS split between `frsmanager` and `frsdata`. Neither database reuses `sceneobjects`, `resourcespawns`, MySQL, Lua configuration, or a player-facing object database.
+
+`ZoneServerImplementation::startManagers` initializes `AiEconomyManager` immediately before `SimPlayerManager`. Startup then:
+
+1. Opens the `aieconomy` object database.
+2. Iterates its object keys through the normal object database iterator.
+3. Resolves the single object through the Core3 object broker as `AiEconomyData`.
+4. Creates and persists a default empty `AiEconomyData` through `ObjectManager::persistObject` only when the database has no object.
+5. Validates the complete snapshot before publishing it as persistence-ready.
+6. Emits one bounded startup diagnostic.
+
+Example first-run log:
+
+```text
+AiEconomyPersistence loaded=true created=true version=1 stockpileLots=0 persistenceReady=true mode=load-only totalsImported=false persistentStockpileSupplyChanged=false
+```
+
+Example subsequent-start log:
+
+```text
+AiEconomyPersistence loaded=true created=false version=1 stockpileLots=0 persistenceReady=true mode=load-only totalsImported=false persistentStockpileSupplyChanged=false
+```
+
+No periodic persistence task is added in this phase.
+
+#### Validation and fail-closed behavior
+
+The loader accepts exactly one compatible `AiEconomyData` object. It fails closed for AI economy persistence when it encounters:
+
+- An unavailable database.
+- An object of the wrong generated type.
+- More than one root economy object.
+- An unsupported schema version.
+- Missing, reversed, or implausibly future timestamps.
+- A zero or non-monotonic next-entry ID.
+- Too many stockpile lots.
+- Null lots, duplicate/zero entry IDs, absurd quantities, or reservations greater than quantity.
+- Missing identity fields or oversized metadata.
+- Unknown acquisition-source, lifecycle, or identity-confidence values.
+- Invalid resource-stat snapshots.
+
+Validation copies lot references while holding only the root data lock, releases it, and then validates each lot under its own short lock. Object database loading and creation occur without holding SimPlayer/controller/`AiAgent`, conceptual-total, market-observation, `ResourceManager`, `AuctionManager`, or resource-object locks.
+
+Invalid or incompatible state is not replaced with an empty object. The manager logs one clear error and leaves persistence unavailable. SimPlayer startup continues afterward, so visual miner behavior and all existing simulation-only tasks remain operational. No recovery path creates resources or mutates player-facing economy state.
+
+#### Deliberate load-only boundary
+
+This phase does **not**:
+
+- Copy `SimPlayerManager::conceptualMinerTotals` into `AiEconomyData`.
+- Add stockpile lots after startup.
+- Populate D.6.2 `persistentStockpileSupply`.
+- Change reserve ratios, pressure scores, D.4/D.6.6 plans, density/path simulations, or miner behavior.
+- Import D.6.4 market observations. Public listings remain `owned=false` and `imported=false`.
+- Persist active miners, destinations, patrol/path data, resource choices, animation/sample state, pending yield, diagnostics, or raw event history.
+- Create `ResourceContainer`, inventory, vendor, bazaar/auction, harvester, crafting, credit, or other player-facing objects or transactions.
+- Add a save cadence, migration, repair, admin mutation, reservation, consumption, or stockpile mutation API.
+
+The live `SimPlayerManager` conceptual counters still reset on restart. D.6.5.1 stockpile-shaped logs remain memory-only simulations and continue reporting `persisted=false`. When C.3.1 is disabled, the root remains only a load/create proof; when C.3.1 is enabled, separate durable conceptual lots preserve completed aggregate output without changing the live counters or demand state.
+
+The implemented follow-up is C.3.1 below. C.1/C.2 itself remains the load/create and validation boundary.
+
+### Phase C.3.1 - Conceptual Miner Total Persistence
+
+C.3.1 connects completed memory-only SimMiner totals to the persisted AI economy object while preserving every gameplay and demand-state boundary. It stores aggregate stockpile state rather than per-sample event history.
+
+Configuration lives under `SimPlayerManagerConfig.aiEconomyPersistenceConfig`:
+
+```lua
+aiEconomyPersistenceConfig = {
+    persistConceptualMinerTotals = false,
+    intervalSeconds = 300,
+    logSummary = true,
+}
+```
+
+| Field | Behavior |
+|---|---|
+| `persistConceptualMinerTotals` | Disabled by default. No persistence task is scheduled unless this and the SimPlayerManager master switch are enabled and `AiEconomyManager` is persistence-ready. |
+| `intervalSeconds` | Coarse checkpoint interval, clamped to 60-3600 seconds. |
+| `logSummary` | Emits one compact successful-update line per interval that contains non-zero totals. |
+
+The manager-owned task reloads this config at each interval while running. Disabling the block stops rescheduling. A missing or unreadable config also stops persistence rather than retaining a previously enabled write switch. Enabling it from a fully stopped state still requires the normal manager/server reload.
+
+#### Aggregate snapshot and lock boundary
+
+The task copies `SimPlayerManager::conceptualMinerTotals` while holding only `conceptualMinerTotalsMutex`. It then releases that mutex before validation, object locking, persistence, or logging. Empty labels, zero quantities, labels longer than 128 characters, and quantities above the persisted validation bound are rejected.
+
+No controller, `AiAgent`, `ResourceSpawn`, `AuctionItem`, `ResourceContainer`, market object, or other mutable gameplay pointer is captured by the delayed task. The task calls the manager singletons when it executes.
+
+Each accepted label is represented by one persisted aggregate lot:
+
+- `conceptualLabel=<label>`
+- `quantity=<durable startup baseline + current-session aggregate>`
+- `reservedQuantity=0`
+- `availableQuantity=quantity`
+- `acquisitionSource=conceptual_miner`
+- `resourceLifecycleState=conceptual`
+- `ownerScope=galaxy`
+- `identityConfidence=conceptual_label`
+- Resource spawn object ID `0`
+- Empty spawn name, exact resource type, class chain, planet, and zone
+- Missing stat snapshots remain `-1`
+
+The root remains in `aieconomy`; referenced `AiEconomyStockpileLot` objects are persisted in `aieconomylots`. New lots are persisted before their references are attached to the root, and object-database calls occur outside root and lot locks.
+
+New lots are fully initialized by their generated constructor before `persistObject` is called. No `@dirty` mutator is invoked on an unregistered object. Once persisted, later quantity and root-reference changes use the generated `@dirty` methods rather than manually placing objects into the modified-object queue. This follows the FRS creation pattern and avoids exposing Core3's periodic backup pass to an unregistered lot pointer.
+
+#### Idempotency and restart behavior
+
+`AiEconomyManager` captures loaded conceptual-miner quantities as a startup baseline. Each checkpoint calculates a target quantity as:
+
+```text
+target persisted quantity = loaded startup quantity + current-session conceptual total
+```
+
+The manager then **sets** the lot to that target. It never adds the current lot quantity again. Therefore:
+
+- Repeating a checkpoint with the same session total does not increase the lot.
+- A label is matched by conceptual label plus its `conceptual_miner`/`conceptual`/`galaxy`/`conceptual_label` classification.
+- Existing matching lots are updated in place.
+- New non-zero labels create one lot with the next stable entry ID.
+- Duplicate matching lots fail closed instead of being merged silently.
+- Restart loads the existing lot and uses its quantity as the new session baseline.
+
+Example first checkpoint:
+
+```text
+AiEconomyPersistenceConceptualTotals updated=true labels=4 createdLots=4 updatedLots=0 totalQuantity=3472 mode=persisted-conceptual totalsImported=true persistentStockpileSupplyChanged=false
+```
+
+Example later checkpoint:
+
+```text
+AiEconomyPersistenceConceptualTotals updated=true labels=4 createdLots=0 updatedLots=4 totalQuantity=3600 mode=persisted-conceptual totalsImported=true persistentStockpileSupplyChanged=false
+```
+
+After restart, loaded conceptual lots produce one bounded read-only summary:
+
+```text
+AiEconomyPersistenceStockpile loadedLots=4 conceptualMinerLots=4 totalQuantity=3600 mode=read-only persistentStockpileSupplyChanged=false
+```
+
+#### Fail-closed and demand-state boundary
+
+The mutation path is serialized by a dedicated `AiEconomyManager` mutex. Root and lot locks are short and never overlap the conceptual-total lock. Invalid persisted state, duplicate conceptual lots, exhausted IDs, persistence exceptions, or failed post-update validation mark persistence unavailable and stop this task without stopping visual SimMiner behavior.
+
+C.3.1 deliberately does not:
+
+- Populate D.6.2 `persistentStockpileSupply`.
+- Change `aiConceptualSupply`, reserve ratios, shortage/surplus state, pressure scores, or D.6.6 plans.
+- Import D.6.4 public market quantities into AI ownership.
+- Persist active miners, destinations, paths, animations, in-progress samples, pending yield, diagnostics, or raw event history.
+- Create or mutate real resources, `ResourceContainer`, inventory, vendor, bazaar/auction, stockroom, harvester, crafting, credit, or player-facing objects.
+- Change SimMiner targeting, movement, survey/sample timing, conceptual resource selection, or yield amounts.
+
+Demand-state logs therefore continue to report `persistentStockpileSupply=0` unless the later C.3.3/C.3.4 read-only demand integration gate is explicitly enabled. Durable lots remain available through AI economy persistence diagnostics even when D.6.2 does not consume them.
+
+Known limitation: these lots still have only `conceptual_label` identity confidence. They do not identify an exact `ResourceSpawn`, resource type, planet, density map, or stat snapshot.
+
+#### Next phases
+
+- **C.3.2 - Restart Survival and Diagnostics:** test repeated checkpoints and restarts, verify that lot counts remain stable, and add bounded audit/repair diagnostics only where evidence shows they are needed.
+- **C.3.3/C.3.4 - Gated Persistent Supply Integration:** implemented below as a read-only, disabled-by-default D.6.2 consumer for validated durable conceptual baseline quantities. Persistence writes remain independent from demand calculations.
+
+### Phase C.3.3/C.3.4 - Gated Persistent Supply Integration
+
+C.3.3/C.3.4 is the first read-only demand-state consumer of validated durable conceptual stockpile lots. It allows D.6.2 to optionally include recovered AI-owned conceptual baseline supply in `persistentStockpileSupply` while preserving all existing write, miner, market, and gameplay boundaries.
+
+Configuration lives under `SimPlayerManagerConfig.persistentStockpileDemandConfig`:
+
+```lua
+persistentStockpileDemandConfig = {
+    enabled = false,
+    includeConceptualMinerLots = true,
+    logSummary = true,
+}
+```
+
+| Field | Behavior |
+|---|---|
+| `enabled` | Disabled by default. When false, D.6.2 behavior remains unchanged and `persistentStockpileSupply=0`. |
+| `includeConceptualMinerLots` | Allows validated conceptual-miner lots to contribute only their recovered durable baseline portion. |
+| `logSummary` | Emits one compact read-only snapshot line per D.6.2 interval while the gate is enabled. |
+
+The config is deliberately separate from `aiEconomyPersistenceConfig`, which controls write/checkpoint behavior. Enabling D.6.2 persistent supply reads does not enable checkpointing. Enabling checkpointing does not make D.6.2 consume persisted lots.
+
+#### Double-counting boundary
+
+C.3.1 persists conceptual lots with this target quantity:
+
+```text
+target persisted quantity = loaded startup quantity + current-session conceptual total
+```
+
+D.6.2 already counts the current-session total as `aiConceptualSupply`. Therefore C.3.3/C.3.4 must not feed the full current persisted lot quantity into demand state, or the current session would be counted twice.
+
+The implemented method is `startup_baseline_only`. `AiEconomyManager` captures loaded conceptual-miner lot quantities into its startup baseline during initialization. D.6.2 calls a narrow read-only snapshot method that returns copied label/quantity pairs from that baseline only. It does not read mutable lot objects, lock stockpile lots during scoring, mark objects dirty, checkpoint data, or inspect current persisted aggregate quantities.
+
+The resulting D.6.2 equation is:
+
+```text
+totalKnownSupply =
+    current-session aiConceptualSupply
+    + observed marketObservedSupply
+    + recovered startup-baseline persistentStockpileSupply
+```
+
+#### Mapping and confidence
+
+Persistent conceptual lots use exactly the same narrow profile mapping as D.6.2 conceptual live totals:
+
+| Demand profile | Persistent conceptual labels |
+|---|---|
+| `composite_armor_supply` | `copper`, `iron` |
+| `master_weaponsmith_staples` | `copper`, `iron` |
+| `high_damage_weapon_components` | `copper`, `iron` |
+| `chef_buff_foods` | `water` |
+| `chef_high_value_consumables` | `water` |
+| `production_infrastructure` | `copper`, `iron`, `gas` |
+
+No exact `ResourceSpawn`, resource type, planet, density, stat, or quality is inferred from these labels. Matching persistent conceptual lots report `persistentStockpileConfidence=conceptual_label`. Overall `supplyConfidence` still prefers `exact_type`, then `coarse_family`, then `conceptual_label`, then `none`.
+
+#### Diagnostics
+
+When enabled, the task logs one bounded read-only summary:
+
+```text
+PersistentStockpileDemandSnapshot enabled=true conceptualMinerLots=4 baselineQuantity=3347 labels=copper=900,iron=800,gas=700,water=947 status=ready mode=read-only
+```
+
+D.6.2 lines keep the existing fields and add persistent diagnostics:
+
+```text
+DemandStateSimulation profile=production_infrastructure state=target desiredReserve=10000 aiConceptualSupply=159 marketObservedSupply=0 persistentStockpileSupply=2400 persistentStockpileLotsMatched=3 persistentStockpileQuantityMatched=2400 persistentStockpileConfidence=conceptual_label persistentStockpileLabels=copper=900,iron=800,gas=700 persistentStockpileMode=startup_baseline_only persistentStockpileStatus=ready totalKnownSupply=2559 supplyConfidence=conceptual_label mode=log-only
+```
+
+If the gate is disabled, no `PersistentStockpileDemandSnapshot` line is emitted and D.6.2 remains effectively unchanged with `persistentStockpileSupply=0`. If persistence is unavailable or invalid, D.6.2 continues with live conceptual and market supply only, logs `persistentStockpileStatus=unavailable` or `invalid` while enabled, and contributes zero persistent supply.
+
+#### Safety boundaries
+
+C.3.3/C.3.4 does not:
+
+- Mutate `AiEconomyData` or `AiEconomyStockpileLot`.
+- Mark any object dirty or call `persistObject`.
+- Checkpoint from the demand-state task.
+- Import market observations into AI-owned stockpile.
+- Populate reservations or consumption.
+- Create `ResourceContainer`, resource, inventory, vendor, bazaar/auction, stockroom, harvester, crafting, credit, or player-facing economy objects.
+- Change SimMiner movement, target selection, patrol/path data, survey/sample timing, conceptual resource choice, yield amount, density simulation, path validation, or D.6.6 plan activation.
+
+Locking remains one-way and copy-first: D.6.2 copies live conceptual totals under `conceptualMinerTotalsMutex`, copies market observation under `marketSupplyObservationMutex`, and copies persistent startup-baseline labels through `AiEconomyManager` without holding either of those locks. Scoring and logging occur after these snapshots are copied.
+
+#### Test procedure
+
+1. With `persistentStockpileDemandConfig.enabled=false`, verify D.6.2 still reports `persistentStockpileSupply=0` and emits no `PersistentStockpileDemandSnapshot`.
+2. Enable C.3.1 checkpointing, let miners persist conceptual lots, then restart.
+3. Enable `persistentStockpileDemandConfig.enabled=true` while D.6.2 is enabled.
+4. Confirm D.6.2 shows `persistentStockpileStatus=ready`, `persistentStockpileConfidence=conceptual_label`, and non-zero `persistentStockpileSupply` only for mapped labels.
+5. Confirm no double count: current-session totals remain under `aiConceptualSupply`, and persistent contribution equals the recovered startup baseline rather than the full current persisted aggregate.
+6. If D.6.4 is also enabled, confirm `totalKnownSupply = aiConceptualSupply + marketObservedSupply + persistentStockpileSupply`.
+
+#### Remaining limitations
+
+- Persistent supply is still conceptual-label only and can overlap across demand profiles.
+- It has no exact resource identity, quality, planet, density, expiration, allocation, reservation, consumption, or cost.
+- It affects D.6.2 diagnostic reserve/pressure logs only. It does not directly feed D.3/D.4/D.5/D.6.6 miner behavior, target assignment, or gameplay.
+
+The next persistence phase should stay diagnostic: prove restart behavior over several checkpoint/restart cycles and add bounded audit tooling before any reservation, consumption, or demand-weighted behavior switch consumes stockpile state operationally.
 
 ### SWG Resource System Research
 
@@ -2698,7 +3017,8 @@ The current totals are labels such as `copper`, `iron`, `gas`, and `water`, not 
 
 This mapping does not claim that conceptual iron is Kiirium steel, that copper is Polysteel, or that water represents all Chef inputs. It is only a broad family hint:
 
-- `supplyConfidence=coarse_family` when one or more mapped conceptual totals exist.
+- `supplyConfidence=coarse_family` when one or more mapped live conceptual totals exist.
+- `supplyConfidence=conceptual_label` when the only known supply is gated persistent conceptual baseline supply.
 - `supplyConfidence=none` when no meaningful conceptual label exists for the profile.
 - `exact_type` is reserved for a future inventory model and is not emitted in D.6.2.
 
@@ -2706,11 +3026,11 @@ Each line exposes:
 
 - `aiConceptualSupply`
 - `marketObservedSupply=0`
-- `persistentStockpileSupply=0`
+- `persistentStockpileSupply=0` unless the separate C.3.3/C.3.4 gate is enabled and ready
 - `totalKnownSupply`
 - `supplyLabels`
 
-The zero-valued market and persistent fields make the missing supply sources explicit. SimMiner totals are one signal, not the whole economy, and still reset on server restart.
+The zero-valued market and persistent fields make missing supply sources explicit. SimMiner totals are one signal, not the whole economy. Live SimMiner totals still reset on server restart; C.3.3/C.3.4 can separately report validated durable baseline conceptual lots when explicitly enabled.
 
 #### Reserve state and pressure
 
@@ -2768,7 +3088,7 @@ Known limitations:
 
 - Multiple profiles can count the same coarse conceptual label because no exact inventory allocation exists yet.
 - Conceptual supply has no quality, spawn identity, location, expiration, consumption, reservation, or ownership.
-- `persistentStockpileSupply` remains a placeholder fixed at zero. `marketObservedSupply` remains zero unless the separate D.6.4 observer is enabled and has produced a snapshot.
+- `persistentStockpileSupply` remains zero unless C.3.3/C.3.4 is enabled and `AiEconomyManager` has validated startup-baseline conceptual lots. `marketObservedSupply` remains zero unless the separate D.6.4 observer is enabled and has produced a snapshot.
 - Active opportunity represents the best currently active eligible resource, not density, pathability, acquisition cost, or obtainable quantity.
 - Reserve targets are administrator policy and do not yet respond to real production or consumption.
 
@@ -2898,8 +3218,8 @@ Known limitations:
 - Unavailable listed scene objects are skipped rather than loaded through a new persistence path.
 - Price statistics do not model completed sales, listing age, taxes, auction bids, price manipulation, or quantity-weighted median.
 - Profile overlap can count one listing in several profile views.
-- No stockroom, private inventory, historical-sale, scarcity, velocity, or persistent AI stockpile signal exists yet.
-- `persistentStockpileSupply` remains zero.
+- No stockroom, private inventory, historical-sale, scarcity, or velocity signal exists yet.
+- `persistentStockpileSupply` remains zero unless the separate C.3.3/C.3.4 persistent stockpile demand gate is enabled and ready. Public market observation never becomes AI-owned stockpile.
 
 D.6.5 subsequently documented persistent stockpile boundaries, D.6.5.1 added a memory-only stockpile-shaped snapshot, and D.6.6 added separate demand-weighted plan logs. All remain diagnostic; actual miner behavior changes remain deferred.
 
@@ -2915,7 +3235,7 @@ The design goal is restart-stable economic continuity:
 - Recovery must never manufacture player-visible resources or mutate the live economy.
 - The data model should support future miners, crafters, vendors, consumers, services, factions, and guild-like AI organizations without coupling durable state to one transient NPC.
 
-This section is research and architecture guidance only. No persistence, schema, object database, manager, IDL, or runtime behavior is added by D.6.5.
+This section records the D.6.5 research and architecture guidance. The later C.1/C.2 bootstrap now provides an empty schema object, dedicated database, and load-only manager, but D.6.5 itself still adds no stockpile contents or economy behavior.
 
 #### AI-owned stockpile boundary
 
@@ -3043,7 +3363,7 @@ Reservation semantics must prevent false abundance:
 - Independent D.6.2 profile views may continue to show overlapping eligibility for diagnosis, but a future allocation phase must resolve competition before any consumption or production decision.
 - Demand-state logs should eventually expose `persistentOwnedSupply`, `persistentReservedSupply`, `persistentAvailableSupply`, stockpile confidence, and matched lot count rather than hiding reservation pressure in one number.
 
-`persistentStockpileSupply` should remain zero until a future implementation can load a validated stockpile snapshot. Invalid or unavailable durable state must not be replaced with invented supply.
+`persistentStockpileSupply` should remain zero until a gated implementation can load a validated stockpile snapshot. C.3.3/C.3.4 provides the first conceptual-baseline-only version of that gate; future exact stockpile models still need richer identity, reservation, and confidence handling. Invalid or unavailable durable state must not be replaced with invented supply.
 
 #### Restart and recovery behavior
 
@@ -3160,7 +3480,7 @@ The phase remains memory-only and adds no persistence. It:
 - Validate that exact-type, coarse-family, and conceptual entries produce understandable demand-state explanations.
 - Test restart expectations only as documented scenarios; all simulated rows would still disappear on restart.
 
-Only after D.6.5.1 logs and semantics are stable should a later proposal define an IDL schema, object database registration, migration/version policy, and load-only recovery proof. Demand-weighted miner planning and any real economy materialization remain separate later phases.
+The later C.1/C.2 bootstrap defines the IDL shape, object database registration, and load-only recovery proof. C.3.1 now checkpoints the same underlying conceptual totals into authoritative aggregate lots, but it does not import D.6.5.1 market-reference rows or alter demand-weighted planning.
 
 ### D.6.5.1 - Log-Only Stockpile Snapshot Simulation
 
@@ -3212,7 +3532,7 @@ StockpileSnapshotSimulation enabled=true simulatedOwnedLots=4 totalOwnedQuantity
 StockpileSnapshotSimulation lot=1 owned=true conceptualLabel=copper quantity=500 reservedQuantity=0 availableQuantity=500 acquisitionSource=conceptual_miner resourceLifecycleState=conceptual ownerScope=galaxy identityConfidence=conceptual_label persisted=false mode=simulation-only
 ```
 
-These rows are projections of the existing totals, not additional accounting records. They disappear on restart along with the underlying conceptual totals.
+These rows are projections of the live session totals, not additional accounting records. The rows and live counters disappear on restart. If C.3.1 is separately enabled, authoritative persisted conceptual lots survive independently and are reported by `AiEconomyManager`; D.6.5.1 still does not read those lots.
 
 #### Optional market references
 
@@ -3230,7 +3550,7 @@ If D.6.4 is disabled or has no snapshot, no market-reference rows are produced. 
 
 D.6.5.1 does not modify D.6.2:
 
-- `persistentStockpileSupply` remains zero.
+- `persistentStockpileSupply` remains zero because this simulation task does not feed reserve calculations. C.3.3/C.3.4 may separately populate it from validated persisted baseline lots when explicitly enabled.
 - `aiConceptualSupply` remains the existing coarse memory-only signal.
 - `marketObservedSupply` remains owned and populated only by D.6.4.
 - No simulated lot is fed into reserve ratios, pressure scores, miner plans, or gameplay.
@@ -3239,7 +3559,7 @@ The summary explicitly logs `persistentStockpileSupplyChanged=false` to make tha
 
 #### Safety and limitations
 
-- No IDL, object database, save/load, migration, or recovery path exists.
+- D.6.5.1 itself adds no save/load or recovery path. C.1/C.2 load the persisted root and C.3.1 may update durable conceptual lots, but this simulation task does not read from or write to either database.
 - No real resource or `ResourceContainer` is created, mutated, transferred, or destroyed.
 - No player inventory, bank, private container, vendor stockroom, bazaar/auction listing, factory, harvester hopper, crafting output, or credit balance is read or changed by this task.
 - SimMiner targeting, movement, destinations, conceptual resource selection, survey/sample timing, density simulation, path validation, yield amount, and yield accounting are unchanged.
@@ -3309,7 +3629,7 @@ pressureScore =
     shortagePressure + opportunityPressure       otherwise
 ```
 
-`persistentStockpileSupply` remains zero. D.6.5.1 simulated rows are not imported into pressure or plans.
+The D.6.6 planner still does not import D.6.5.1 simulated rows or C.3.3/C.3.4 persistent baseline supply. Any future demand-weighted planner consumption of persistent stockpile pressure needs a separate gate and review.
 
 #### Selection algorithm
 

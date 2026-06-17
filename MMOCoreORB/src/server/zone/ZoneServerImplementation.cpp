@@ -39,6 +39,7 @@
 #include "server/zone/managers/city/CityManager.h"
 #include "server/zone/managers/structure/StructureManager.h"
 #include "server/zone/managers/frs/FrsManager.h"
+#include "server/zone/managers/aieconomy/AiEconomyManager.h"
 #include "server/chat/ChatManager.h"
 #include "server/zone/managers/ship/ShipManager.h"
 #include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
@@ -368,6 +369,8 @@ void ZoneServerImplementation::startManagers() {
 
 	frsManager = new FrsManager(_this.getReferenceUnsafeStaticCast());
 	frsManager->initialize();
+
+	AiEconomyManager::instance()->initialize();
 
 	SimPlayerManager::instance()->initialize();
 

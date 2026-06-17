@@ -114,6 +114,14 @@ SimPlayerController::~SimPlayerController() {
 void SimPlayerController::moveTo(Vector3 targetPos) {
     if (agent == nullptr) return;
 
+    Zone* zone = agent->getZone();
+    if (zone == nullptr) return;
+
+    if (!zone->isWithinBoundaries(targetPos)) {
+        onPathFailed();
+        return;
+    }
+
     if (agent->isInCombat()) {
         destination = targetPos;
         state = IDLE;
@@ -126,9 +134,6 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
     stuckWatchdogCount = 0;
     lastWatchdogPos = agent->getWorldPosition();
     state = CALCULATING_PATH; 
-
-    Zone* zone = agent->getZone();
-    if (zone == nullptr) return;
 
     destination = targetPos;
     
@@ -383,7 +388,8 @@ bool SimPlayerController::pickDestinationInNavMesh(Zone* zone, const Vector3& cu
     Sphere area(currentPos, (float)distance);
 
     Vector3 result;
-    if (PathFinderManager::instance()->getSpawnPointInArea(area, zone, result, true)) {
+    if (PathFinderManager::instance()->getSpawnPointInArea(area, zone, result, true) &&
+            zone->isWithinBoundaries(result)) {
         out = result;
         return true;
     }
@@ -463,8 +469,31 @@ void SimMinerController::goToResource(const String& resourceName) {
         float angle = System::random(360) * (M_PI / 180.0f);
         float dist = (float)config.fallbackRadius;
         targetPos.setX(currentPos.getX() + (dist * cos(angle)));
-        targetPos.setY(currentPos.getY() + (dist * sin(angle))); 
-        targetPos.setZ(zone->getHeight(targetPos.getX(), targetPos.getY())); 
+        targetPos.setY(currentPos.getY() + (dist * sin(angle)));
+
+        if (!zone->isWithinBoundaries(targetPos)) {
+            // Near an edge, bias the fallback toward the planet center instead
+            // of allowing the conceptual loop to wander beyond terrain bounds.
+            float currentDistance = Math::sqrt(
+                currentPos.getX() * currentPos.getX() +
+                currentPos.getY() * currentPos.getY());
+
+            if (currentDistance > 0.f) {
+                targetPos.setX(currentPos.getX() -
+                    currentPos.getX() / currentDistance * dist);
+                targetPos.setY(currentPos.getY() -
+                    currentPos.getY() / currentDistance * dist);
+            }
+        }
+
+        if (!zone->isWithinBoundaries(targetPos)) {
+            logStateTransition("SimMiner: No in-bounds fallback destination for [" +
+                resourceName + "]; retrying loop");
+            onPathFailed();
+            return;
+        }
+
+        targetPos.setZ(zone->getHeight(targetPos.getX(), targetPos.getY()));
         usedFallback = true;
     }
 

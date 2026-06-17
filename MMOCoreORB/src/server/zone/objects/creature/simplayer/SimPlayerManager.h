@@ -30,6 +30,7 @@ class DemandStateSimulationTask;
 class MarketSupplyObservationTask;
 class StockpileSnapshotSimulationTask;
 class DemandWeightedMinerPlanSimulationTask;
+class AiEconomyConceptualTotalsPersistenceTask;
 
 class SimPlayerManager : public Singleton<SimPlayerManager>, public Object, public Logger {
 private:
@@ -45,6 +46,7 @@ private:
 	friend class MarketSupplyObservationTask;
 	friend class StockpileSnapshotSimulationTask;
 	friend class DemandWeightedMinerPlanSimulationTask;
+	friend class AiEconomyConceptualTotalsPersistenceTask;
 
 	// Map of Creature ObjectID -> Controller
 	SynchronizedVectorMap<uint64, Reference<SimPlayerController*> > controllers;
@@ -176,6 +178,14 @@ private:
 	int stockpileSnapshotSimulationLogTopN = 10;
 	bool stockpileSnapshotSimulationIncludeConceptualMinerTotals = true;
 	bool stockpileSnapshotSimulationIncludeMarketObservation = false;
+	bool aiEconomyPersistConceptualMinerTotals = false;
+	bool aiEconomyPersistenceTaskScheduled = false;
+	bool aiEconomyPersistenceLogSummary = true;
+	bool aiEconomyPersistenceFailureLogged = false;
+	int aiEconomyPersistenceIntervalSeconds = 300;
+	bool persistentStockpileDemandEnabled = false;
+	bool persistentStockpileDemandIncludeConceptualMinerLots = true;
+	bool persistentStockpileDemandLogSummary = true;
 	bool demandWeightedMinerPlanSimulationEnabled = false;
 	bool demandWeightedMinerPlanSimulationTaskScheduled = false;
 	int demandWeightedMinerPlanSimulationIntervalSeconds = 300;
@@ -244,13 +254,18 @@ private:
 	void refreshStockpileSnapshotSimulationConfig();
 	void applyStockpileSnapshotSimulationConfig(LuaObject& stockpileSnapshotConfig);
 	void logStockpileSnapshotSimulation();
+	void scheduleAiEconomyPersistenceTask();
+	void runAiEconomyPersistenceTask();
+	void refreshAiEconomyPersistenceConfig();
+	void applyAiEconomyPersistenceConfig(LuaObject& persistenceConfig);
+	void applyPersistentStockpileDemandConfig(LuaObject& stockpileDemandConfig);
 	void scheduleDemandWeightedMinerPlanSimulationTask();
 	void runDemandWeightedMinerPlanSimulationTask();
 	void refreshDemandWeightedMinerPlanSimulationConfig();
 	void applyDemandWeightedMinerPlanSimulationConfig(LuaObject& demandWeightedConfig);
 	void applyDemandWeightedMinerPlanDependencyConfig(LuaObject& managerConfig);
 	void logDemandWeightedMinerPlanSimulations();
-	
+
 	String pickRandomTemplate(const SpawnGroup& g) const;
 	bool isImperialForSpawn(const SpawnGroup& g, const String& templateName) const;
 

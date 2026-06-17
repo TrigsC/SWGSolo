@@ -19,6 +19,7 @@
 #include "server/zone/managers/resource/ResourceManager.h"
 #include "server/zone/managers/resource/resourcespawner/ResourceSpawner.h"
 #include "server/zone/managers/resource/resourcespawner/resourcemap/ResourceMap.h"
+#include "server/zone/managers/aieconomy/AiEconomyManager.h"
 #include "server/zone/managers/auction/AuctionManager.h"
 #include "server/zone/managers/auction/AuctionsMap.h"
 #include "server/zone/managers/auction/TerminalListVector.h"
@@ -105,6 +106,13 @@ class DemandWeightedMinerPlanSimulationTask : public Task {
 public:
     void run() override {
         SimPlayerManager::instance()->runDemandWeightedMinerPlanSimulationTask();
+    }
+};
+
+class AiEconomyConceptualTotalsPersistenceTask : public Task {
+public:
+    void run() override {
+        SimPlayerManager::instance()->runAiEconomyPersistenceTask();
     }
 };
 
@@ -236,10 +244,12 @@ struct DemandStateSimulationResult {
     uint64 aiConceptualSupply = 0;
     uint64 marketObservedSupply = 0;
     uint64 persistentStockpileSupply = 0;
+    uint64 persistentStockpileQuantityMatched = 0;
     uint64 totalKnownSupply = 0;
     uint64 shortageUnits = 0;
     uint64 surplusUnits = 0;
     int marketListingsMatched = 0;
+    int persistentStockpileLotsMatched = 0;
     float marketCheapestPricePerUnit = -1.f;
     float marketMedianPricePerUnit = -1.f;
     float reserveRatio = 0.f;
@@ -249,6 +259,10 @@ struct DemandStateSimulationResult {
     bool hasActiveOpportunity = false;
     bool activeProfileAvailableForPhase = true;
     String marketSupplyConfidence = "none";
+    String persistentStockpileConfidence = "none";
+    String persistentStockpileLabels = "none";
+    String persistentStockpileMode = "disabled";
+    String persistentStockpileStatus = "disabled";
     String marketTopResource;
     String marketTopType;
     ResourceIntelligenceEntry activeResource;
@@ -1118,6 +1132,45 @@ static uint64 estimateConceptualDemandStateSupply(
     return total;
 }
 
+static uint64 estimatePersistentConceptualDemandStateSupply(
+        const String& profileKey,
+        const VectorMap<String, uint64>& labelQuantities,
+        int& lotsMatched,
+        String& supplyConfidence,
+        String& supplyLabels) {
+    uint64 total = 0;
+    lotsMatched = 0;
+
+    for (int i = 0; i < labelQuantities.size(); ++i) {
+        String resourceLabel = labelQuantities.elementAt(i).getKey().toLowerCase();
+
+        if (!demandStateProfileUsesConceptualLabel(profileKey, resourceLabel))
+            continue;
+
+        uint64 amount = labelQuantities.get(i);
+
+        if (amount == 0)
+            continue;
+
+        total += amount;
+        lotsMatched++;
+
+        if (!supplyLabels.isEmpty())
+            supplyLabels += ",";
+
+        supplyLabels += resourceLabel + "=" + String::valueOf(amount);
+    }
+
+    if (supplyLabels.isEmpty()) {
+        supplyConfidence = "none";
+        supplyLabels = "none";
+    } else {
+        supplyConfidence = "conceptual_label";
+    }
+
+    return total;
+}
+
 static String formatDemandStateOpportunityReason(
         const DemandProfileMatch& match,
         const ResourceIntelligenceEntry& entry,
@@ -1278,6 +1331,9 @@ static String combineSupplyConfidence(
 
     if (marketConfidence == "coarse_family" || conceptualConfidence == "coarse_family")
         return "coarse_family";
+
+    if (marketConfidence == "conceptual_label" || conceptualConfidence == "conceptual_label")
+        return "conceptual_label";
 
     return "none";
 }
@@ -2166,6 +2222,7 @@ void SimPlayerManager::initialize() {
     scheduleDemandProfileSimulationTask();
     scheduleMarketSupplyObservationTask();
     scheduleStockpileSnapshotSimulationTask();
+    scheduleAiEconomyPersistenceTask();
     scheduleDemandStateSimulationTask();
     scheduleDemandWeightedMinerPlanSimulationTask();
 }
@@ -2287,6 +2344,14 @@ void SimPlayerManager::loadLuaConfig() {
     stockpileSnapshotSimulationLogTopN = 10;
     stockpileSnapshotSimulationIncludeConceptualMinerTotals = true;
     stockpileSnapshotSimulationIncludeMarketObservation = false;
+    aiEconomyPersistConceptualMinerTotals = false;
+    aiEconomyPersistenceTaskScheduled = false;
+    aiEconomyPersistenceLogSummary = true;
+    aiEconomyPersistenceFailureLogged = false;
+    aiEconomyPersistenceIntervalSeconds = 300;
+    persistentStockpileDemandEnabled = false;
+    persistentStockpileDemandIncludeConceptualMinerLots = true;
+    persistentStockpileDemandLogSummary = true;
     demandWeightedMinerPlanSimulationEnabled = false;
     demandWeightedMinerPlanSimulationTaskScheduled = false;
     demandWeightedMinerPlanSimulationIntervalSeconds = 300;
@@ -2567,6 +2632,19 @@ void SimPlayerManager::loadLuaConfig() {
     if (stockpileSnapshotSimulationConfig.isValidTable())
         applyStockpileSnapshotSimulationConfig(stockpileSnapshotSimulationConfig);
     stockpileSnapshotSimulationConfig.pop();
+
+    LuaObject aiEconomyPersistenceConfig =
+        config.getObjectField("aiEconomyPersistenceConfig");
+    if (aiEconomyPersistenceConfig.isValidTable())
+        applyAiEconomyPersistenceConfig(aiEconomyPersistenceConfig);
+    aiEconomyPersistenceConfig.pop();
+
+    LuaObject persistentStockpileDemandConfig =
+        config.getObjectField("persistentStockpileDemandConfig");
+    if (persistentStockpileDemandConfig.isValidTable())
+        applyPersistentStockpileDemandConfig(
+            persistentStockpileDemandConfig);
+    persistentStockpileDemandConfig.pop();
 
     LuaObject demandWeightedMinerPlanSimulationConfig =
         config.getObjectField("demandWeightedMinerPlanSimulationConfig");
@@ -3888,6 +3966,183 @@ void SimPlayerManager::logStockpileSnapshotSimulation() {
     }
 }
 
+void SimPlayerManager::applyAiEconomyPersistenceConfig(
+        LuaObject& persistenceConfig) {
+    aiEconomyPersistConceptualMinerTotals =
+        persistenceConfig.getBooleanField(
+            "persistConceptualMinerTotals",
+            aiEconomyPersistConceptualMinerTotals);
+    aiEconomyPersistenceIntervalSeconds = clampMinerInt(
+        persistenceConfig.getIntField("intervalSeconds"),
+        aiEconomyPersistenceIntervalSeconds, 60, 3600);
+    aiEconomyPersistenceLogSummary = persistenceConfig.getBooleanField(
+        "logSummary", aiEconomyPersistenceLogSummary);
+}
+
+void SimPlayerManager::applyPersistentStockpileDemandConfig(
+        LuaObject& stockpileDemandConfig) {
+    persistentStockpileDemandEnabled =
+        stockpileDemandConfig.getBooleanField(
+            "enabled", persistentStockpileDemandEnabled);
+    persistentStockpileDemandIncludeConceptualMinerLots =
+        stockpileDemandConfig.getBooleanField(
+            "includeConceptualMinerLots",
+            persistentStockpileDemandIncludeConceptualMinerLots);
+    persistentStockpileDemandLogSummary =
+        stockpileDemandConfig.getBooleanField(
+            "logSummary", persistentStockpileDemandLogSummary);
+}
+
+void SimPlayerManager::scheduleAiEconomyPersistenceTask() {
+    if (!enabled || !aiEconomyPersistConceptualMinerTotals ||
+            aiEconomyPersistenceTaskScheduled)
+        return;
+
+    if (!AiEconomyManager::instance()->isPersistenceReady()) {
+        if (!aiEconomyPersistenceFailureLogged) {
+            warning("AiEconomyPersistenceConceptualTotals skipped=true reason=persistenceUnavailable mode=persisted-conceptual persistentStockpileSupplyChanged=false");
+            aiEconomyPersistenceFailureLogged = true;
+        }
+
+        return;
+    }
+
+    aiEconomyPersistenceFailureLogged = false;
+    aiEconomyPersistenceTaskScheduled = true;
+
+    Reference<AiEconomyConceptualTotalsPersistenceTask*> task =
+        new AiEconomyConceptualTotalsPersistenceTask();
+    task->schedule(aiEconomyPersistenceIntervalSeconds * 1000);
+}
+
+void SimPlayerManager::runAiEconomyPersistenceTask() {
+    aiEconomyPersistenceTaskScheduled = false;
+
+    if (!enabled)
+        return;
+
+    refreshAiEconomyPersistenceConfig();
+
+    if (!aiEconomyPersistConceptualMinerTotals)
+        return;
+
+    if (!AiEconomyManager::instance()->isPersistenceReady()) {
+        if (!aiEconomyPersistenceFailureLogged) {
+            warning("AiEconomyPersistenceConceptualTotals skipped=true reason=persistenceUnavailable mode=persisted-conceptual persistentStockpileSupplyChanged=false");
+            aiEconomyPersistenceFailureLogged = true;
+        }
+
+        return;
+    }
+
+    Vector<String> resourceNames;
+    Vector<uint64> amounts;
+    collectConceptualMinerTotals(resourceNames, amounts);
+
+    VectorMap<String, uint64> totalsSnapshot;
+    int rejectedLabels = 0;
+
+    for (int i = 0; i < resourceNames.size(); ++i) {
+        String label = resourceNames.get(i);
+        uint64 quantity = amounts.get(i);
+
+        if (label.isEmpty() || label.length() > 128 || quantity == 0 ||
+                quantity > 1000000000000ULL) {
+            rejectedLabels++;
+            continue;
+        }
+
+        totalsSnapshot.put(label, quantity);
+    }
+
+    if (rejectedLabels > 0) {
+        warning(String("AiEconomyPersistenceConceptualTotals rejectedLabels=") +
+            String::valueOf(rejectedLabels) +
+            " reason=invalidLabelOrQuantity mode=persisted-conceptual persistentStockpileSupplyChanged=false");
+    }
+
+    if (totalsSnapshot.size() == 0) {
+        scheduleAiEconomyPersistenceTask();
+        return;
+    }
+
+    int createdLots = 0;
+    int updatedLots = 0;
+    uint64 totalQuantity = 0;
+    String failureReason;
+    bool updated = AiEconomyManager::instance()->updateConceptualMinerTotals(
+        totalsSnapshot, createdLots, updatedLots, totalQuantity,
+        failureReason);
+
+    if (!updated) {
+        warning(String("AiEconomyPersistenceConceptualTotals updated=false reason=\"") +
+            failureReason +
+            "\" mode=persisted-conceptual totalsImported=false persistentStockpileSupplyChanged=false");
+        aiEconomyPersistenceFailureLogged = true;
+        return;
+    }
+
+    aiEconomyPersistenceFailureLogged = false;
+
+    if (aiEconomyPersistenceLogSummary) {
+        info(String("AiEconomyPersistenceConceptualTotals updated=true labels=") +
+            String::valueOf(totalsSnapshot.size()) +
+            " createdLots=" + String::valueOf(createdLots) +
+            " updatedLots=" + String::valueOf(updatedLots) +
+            " totalQuantity=" + String::valueOf(totalQuantity) +
+            " mode=persisted-conceptual totalsImported=true persistentStockpileSupplyChanged=false", true);
+    }
+
+    scheduleAiEconomyPersistenceTask();
+}
+
+void SimPlayerManager::refreshAiEconomyPersistenceConfig() {
+    Lua configLua;
+    configLua.init();
+
+    try {
+        configLua.runFile("scripts/managers/sim_player_manager.lua");
+    } catch (Exception& e) {
+        aiEconomyPersistConceptualMinerTotals = false;
+        warning(String("AiEconomyPersistenceConceptualTotals configReloadFailed=true reason=\"") +
+            e.getMessage() +
+            "\" persistenceStopped=true mode=persisted-conceptual");
+        return;
+    }
+
+    LuaObject managerConfig =
+        configLua.getGlobalObject("SimPlayerManagerConfig");
+
+    if (!managerConfig.isValidTable()) {
+        aiEconomyPersistConceptualMinerTotals = false;
+        warning("AiEconomyPersistenceConceptualTotals configReloadFailed=true reason=missingManagerConfig persistenceStopped=true mode=persisted-conceptual");
+        managerConfig.pop();
+        return;
+    }
+
+    if (!managerConfig.getBooleanField("enabled", false)) {
+        aiEconomyPersistConceptualMinerTotals = false;
+        managerConfig.pop();
+        return;
+    }
+
+    LuaObject persistenceConfig =
+        managerConfig.getObjectField("aiEconomyPersistenceConfig");
+
+    if (!persistenceConfig.isValidTable()) {
+        aiEconomyPersistConceptualMinerTotals = false;
+        warning("AiEconomyPersistenceConceptualTotals configReloadFailed=true reason=missingPersistenceConfig persistenceStopped=true mode=persisted-conceptual");
+        persistenceConfig.pop();
+        managerConfig.pop();
+        return;
+    }
+
+    applyAiEconomyPersistenceConfig(persistenceConfig);
+
+    persistenceConfig.pop();
+    managerConfig.pop();
+}
+
 void SimPlayerManager::applyDemandWeightedMinerPlanSimulationConfig(
         LuaObject& demandWeightedConfig) {
     demandWeightedMinerPlanSimulationEnabled =
@@ -4873,6 +5128,18 @@ void SimPlayerManager::refreshDemandStateSimulationConfig() {
     applyDemandStateSimulationConfig(demandStateConfig);
 
     demandStateConfig.pop();
+
+    LuaObject persistentStockpileDemandConfig =
+        managerConfig.getObjectField("persistentStockpileDemandConfig");
+
+    if (persistentStockpileDemandConfig.isValidTable()) {
+        applyPersistentStockpileDemandConfig(
+            persistentStockpileDemandConfig);
+    } else {
+        persistentStockpileDemandEnabled = false;
+    }
+
+    persistentStockpileDemandConfig.pop();
     managerConfig.pop();
 }
 
@@ -4931,6 +5198,70 @@ void SimPlayerManager::logDemandStateSimulations() {
         }
     }
 
+    VectorMap<String, uint64> persistentConceptualTotals;
+    int persistentConceptualLots = 0;
+    uint64 persistentConceptualQuantity = 0;
+    String persistentStockpileStatus = "disabled";
+    String persistentStockpileMode = "disabled";
+
+    if (persistentStockpileDemandEnabled) {
+        persistentStockpileMode = persistentStockpileDemandIncludeConceptualMinerLots ?
+            String("startup_baseline_only") : String("disabled");
+
+        if (persistentStockpileDemandIncludeConceptualMinerLots) {
+            bool snapshotReady =
+                AiEconomyManager::instance()->
+                    snapshotPersistentConceptualMinerSupplyForDemand(
+                        persistentConceptualTotals,
+                        persistentConceptualLots,
+                        persistentConceptualQuantity,
+                        persistentStockpileStatus);
+
+            if (!snapshotReady)
+                persistentConceptualTotals.removeAll();
+        }
+
+        if (persistentStockpileDemandLogSummary) {
+            String persistentLabels = "none";
+            int loggedLabels = 0;
+
+            for (int labelIndex = 0;
+                    labelIndex < persistentConceptualTotals.size();
+                    ++labelIndex) {
+                if (loggedLabels >= 12)
+                    break;
+
+                if (persistentLabels == "none")
+                    persistentLabels = "";
+                else
+                    persistentLabels += ",";
+
+                persistentLabels +=
+                    persistentConceptualTotals.elementAt(labelIndex).getKey() +
+                    "=" +
+                    String::valueOf(persistentConceptualTotals.get(labelIndex));
+                loggedLabels++;
+            }
+
+            if (persistentConceptualTotals.size() > loggedLabels) {
+                if (persistentLabels == "none")
+                    persistentLabels = "";
+                else
+                    persistentLabels += ",";
+
+                persistentLabels += "truncated=true";
+            }
+
+            info(String("PersistentStockpileDemandSnapshot enabled=true conceptualMinerLots=") +
+                String::valueOf(persistentConceptualLots) +
+                " baselineQuantity=" +
+                    String::valueOf(persistentConceptualQuantity) +
+                " labels=" + persistentLabels +
+                " status=" + persistentStockpileStatus +
+                " mode=read-only", true);
+        }
+    }
+
     Vector<DemandStateSimulationResult> results;
 
     for (int profileIndex = 0; profileIndex < profiles.size(); ++profileIndex) {
@@ -4980,6 +5311,38 @@ void SimPlayerManager::logDemandStateSimulations() {
                 result.supplyLabels = marketLabel;
             else
                 result.supplyLabels += ";" + marketLabel;
+        }
+
+        if (persistentStockpileDemandEnabled) {
+            result.persistentStockpileMode = persistentStockpileMode;
+            result.persistentStockpileStatus = persistentStockpileStatus;
+
+            if (persistentStockpileDemandIncludeConceptualMinerLots &&
+                    persistentStockpileStatus == "ready") {
+                result.persistentStockpileSupply =
+                    estimatePersistentConceptualDemandStateSupply(
+                        profile.key,
+                        persistentConceptualTotals,
+                        result.persistentStockpileLotsMatched,
+                        result.persistentStockpileConfidence,
+                        result.persistentStockpileLabels);
+                result.persistentStockpileQuantityMatched =
+                    result.persistentStockpileSupply;
+                result.supplyConfidence = combineSupplyConfidence(
+                    result.supplyConfidence,
+                    result.persistentStockpileConfidence);
+
+                if (result.persistentStockpileSupply > 0) {
+                    String persistentLabel =
+                        String("persistent=") +
+                        result.persistentStockpileLabels;
+
+                    if (result.supplyLabels == "none")
+                        result.supplyLabels = persistentLabel;
+                    else
+                        result.supplyLabels += ";" + persistentLabel;
+                }
+            }
         }
 
         float lowThreshold =
@@ -5047,9 +5410,19 @@ void SimPlayerManager::logDemandStateSimulations() {
         String reason = result.state + " reserve";
 
         if (result.state == "surplus") {
-            reason = result.marketObservedSupply > 0 ?
-                String("reserve met by known supply including observed market supply; active opportunity dampened") :
-                String("reserve met; active opportunity dampened");
+            if (result.marketObservedSupply > 0 &&
+                    result.persistentStockpileSupply > 0) {
+                reason =
+                    "reserve met by known supply including observed market and persistent AI stockpile supply; active opportunity dampened";
+            } else if (result.marketObservedSupply > 0) {
+                reason =
+                    "reserve met by known supply including observed market supply; active opportunity dampened";
+            } else if (result.persistentStockpileSupply > 0) {
+                reason =
+                    "reserve met by known supply including persistent AI stockpile supply; active opportunity dampened";
+            } else {
+                reason = "reserve met; active opportunity dampened";
+            }
         }
         else if (result.state == "disabledReserve")
             reason = "desired reserve disabled";
@@ -5095,6 +5468,22 @@ void SimPlayerManager::logDemandStateSimulations() {
                 String::valueOf(result.activeMatch.demandScore) +
             " pressureScore=" +
                 String::valueOf(Math::getPrecision(result.pressureScore, 1));
+
+        if (persistentStockpileDemandEnabled) {
+            line += " persistentStockpileLotsMatched=" +
+                String::valueOf(result.persistentStockpileLotsMatched) +
+                " persistentStockpileQuantityMatched=" +
+                    String::valueOf(
+                        result.persistentStockpileQuantityMatched) +
+                " persistentStockpileConfidence=" +
+                    result.persistentStockpileConfidence +
+                " persistentStockpileLabels=" +
+                    result.persistentStockpileLabels +
+                " persistentStockpileMode=" +
+                    result.persistentStockpileMode +
+                " persistentStockpileStatus=" +
+                    result.persistentStockpileStatus;
+        }
 
         if (result.marketCheapestPricePerUnit >= 0.f) {
             line += " marketCheapestPricePerUnit=" +

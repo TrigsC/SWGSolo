@@ -10,7 +10,7 @@ private:
 	const static int INDEXMIN = 1;
 
 protected:
-	VectorMap<uint16, ManagedWeakReference<ShipObject*>> shipIdMap;
+	VectorMap<uint16, WeakReference<ShipObject*>> shipIdMap;
 	mutable ReadWriteLock mutex;
 	int index;
 
@@ -20,9 +20,10 @@ public:
 
 		shipIdMap.removeAll(INDEXMAX,INDEXMAX);
 		shipIdMap.setNoDuplicateInsertPlan();
-		shipIdMap.setNullValue(nullptr);
+		WeakReference<ShipObject*> nullShip(static_cast<ShipObject*>(nullptr));
+		shipIdMap.setNullValue(nullShip);
 
-		shipIdMap.put(0, nullptr);
+		shipIdMap.put(0, nullShip);
 		index = INDEXMIN;
 	}
 
@@ -32,7 +33,7 @@ public:
 		for (uint16 shipID = index; shipID < INDEXMAX; ++shipID) {
 			auto entry = shipIdMap.get(shipID);
 
-			if (entry == nullptr) {
+			if (entry.get() == nullptr) {
 				index = shipID + 1;
 				return shipID;
 			}
@@ -41,7 +42,7 @@ public:
 		for (uint16 shipID = INDEXMIN; shipID < INDEXMAX; ++shipID) {
 			auto entry = shipIdMap.get(shipID);
 
-			if (entry == nullptr) {
+			if (entry.get() == nullptr) {
 				index = shipID + 1;
 				return shipID;
 			}
@@ -74,12 +75,12 @@ public:
 		Locker mLock(&mutex);
 		uint16 shipID = ship->getUniqueID();
 
-		if (shipID != 0 && shipIdMap.get(shipID) == ship) {
+		if (shipID != 0 && shipIdMap.get(shipID).get() == ship) {
 			shipIdMap.drop(shipID);
 		}
 	}
 
-	void safeCopyTo(Vector<ManagedWeakReference<ShipObject*>>& vector) const {
+	void safeCopyTo(Vector<WeakReference<ShipObject*>>& vector) const {
 		Locker mLock(&mutex);
 		int size = shipIdMap.size();
 
@@ -88,7 +89,7 @@ public:
 		for (int i = 1; i < size; ++i) {
 			auto ship = shipIdMap.elementAt(i).getValue();
 
-			if (ship == nullptr) {
+			if (ship.get() == nullptr) {
 				continue;
 			}
 

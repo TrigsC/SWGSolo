@@ -1,0 +1,89 @@
+/*
+				Copyright <SWGEmu>
+		See file COPYING for copying conditions. */
+
+package server.zone.managers.aieconomy;
+
+import engine.core.ManagedObject;
+import system.util.Vector;
+include server.zone.managers.aieconomy.AiEconomyStockpileLot;
+include system.lang.Time;
+
+@json
+class AiEconomyData extends ManagedObject {
+	public static final int CURRENT_SCHEMA_VERSION = 1;
+
+	protected int schemaVersion;
+	protected unsigned long nextStockpileEntryId;
+
+	@dereferenced
+	protected Time createdTimestamp;
+
+	@dereferenced
+	protected Time updatedTimestamp;
+
+	@dereferenced
+	protected Vector<AiEconomyStockpileLot> stockpileLots;
+
+	public AiEconomyData() {
+		schemaVersion = CURRENT_SCHEMA_VERSION;
+		nextStockpileEntryId = 1;
+		createdTimestamp.updateToCurrentTime();
+		updatedTimestamp.updateToCurrentTime();
+	}
+
+	@read
+	@preLocked
+	public int getSchemaVersion() {
+		return schemaVersion;
+	}
+
+	@read
+	@preLocked
+	public unsigned long getNextStockpileEntryId() {
+		return nextStockpileEntryId;
+	}
+
+	@read
+	@preLocked
+	public unsigned long getCreatedTimestamp() {
+		return createdTimestamp.getMiliTime();
+	}
+
+	@read
+	@preLocked
+	public unsigned long getUpdatedTimestamp() {
+		return updatedTimestamp.getMiliTime();
+	}
+
+	@read
+	@preLocked
+	public int getStockpileLotCount() {
+		return stockpileLots.size();
+	}
+
+	@local
+	@preLocked
+	public Vector<AiEconomyStockpileLot> getStockpileLots() {
+		return stockpileLots;
+	}
+
+	@dirty
+	@preLocked
+	public void addStockpileLot(AiEconomyStockpileLot lot) {
+		stockpileLots.add(lot);
+	}
+
+	@dirty
+	@preLocked
+	public void setNextStockpileEntryId(unsigned long nextEntryId) {
+		nextStockpileEntryId = nextEntryId;
+		updatedTimestamp.updateToCurrentTime();
+	}
+
+	@dirty
+	@preLocked
+	public void updateTimestamp() {
+		updatedTimestamp.updateToCurrentTime();
+	}
+}

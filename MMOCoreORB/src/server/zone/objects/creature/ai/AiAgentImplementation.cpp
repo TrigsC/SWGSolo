@@ -639,65 +639,77 @@ int AiAgentImplementation::getSkillMod(const String& skillMod) const {
 }
 
 void AiAgentImplementation::activateForcePowerRegen() {
-    // 1. Basic check: Do we even use Force?
-    if (getMaxForce() <= 0) return;
-    
-    // 2. If the event doesn't exist, create it.
+    if (getMaxForce() <= 0)
+        return;
+
+    ZoneServer* zoneServer = getZoneServer();
+
+    if (zoneServer != nullptr && zoneServer->isServerShuttingDown()) {
+        cancelForceRegenerationEvent();
+        return;
+    }
+
+    Locker eventLocker(&forceRegenerationEventMutex);
+
     if (forceRegenerationEvent == nullptr) {
         forceRegenerationEvent = new AiForceRegenerationEvent(asAiAgent());
     }
 
-    // 3. If it's not currently running, schedule it.
     if (!forceRegenerationEvent->isScheduled()) {
-        // Schedule it to run in 2 seconds (2000ms)
-        forceRegenerationEvent->schedule(2000); 
+        forceRegenerationEvent->schedule(2000);
     }
 }
 
 void AiAgentImplementation::doForceRegen() {
     if (isDead() || currentForcePoints >= maxForcePoints) {
-        // If full or dead, stop the loop.
-        // But we might want to check again later if we spend force?
-        // For now, let's keep it running but do nothing if full.
         if (!isDead()) {
-             forceRegenerationEvent->schedule(10000); // Check again in 10s if full
+            Locker eventLocker(&forceRegenerationEventMutex);
+
+            if (forceRegenerationEvent != nullptr)
+                forceRegenerationEvent->schedule(10000);
         }
+
         return;
     }
 
-    // 1. Default very low (Wait for it to build up)
-    int regenAmount = 10; // 10 Force every 2 seconds.
-                          // This makes spending the force expensive!
+    int regenAmount = 10;
 
-    // 2. Check for "jedi_force_power_regen" skill mod (if you add it to their LUA)
-    // This allows you to make "Boss" Jedi regen faster than "Minion" Jedi.
     int skillRegen = (int)getSkillMod("jedi_force_power_regen");
-    
+
     if (skillRegen > 0) {
-        // If they have the skill, let's use that per tick
         regenAmount = skillRegen;
     }
-    
-    // Multipliers (optional, if you want to give them "force_control")
-    // int controlMod = getSkillMod("force_control_light");
-    // regenAmount += (controlMod / 10);
 
     int newForce = currentForcePoints + regenAmount;
-    
+
     if (newForce > maxForcePoints) {
         newForce = maxForcePoints;
     }
 
     setCurrentForce(newForce);
 
-    // --- LOGGING (Remove this later if it spams too much) ---
-    //StringBuffer msg;
-    //msg << "AI Force Regen: +" << regenAmount << " (" << newForce << "/" << maxForcePoints << ")";
-    //info(msg.toString(), true);
+    Locker eventLocker(&forceRegenerationEventMutex);
 
-    // --- RESCHEDULE ---
-    // Run again in 2 seconds
-    forceRegenerationEvent->schedule(2000);
+    if (forceRegenerationEvent != nullptr)
+        forceRegenerationEvent->schedule(2000);
+}
+
+void AiAgentImplementation::cancelForceRegenerationEvent() {
+    Locker eventLocker(&forceRegenerationEventMutex);
+
+    if (forceRegenerationEvent == nullptr)
+        return;
+
+    if (forceRegenerationEvent->isScheduled())
+        forceRegenerationEvent->cancel();
+
+    AiForceRegenerationEvent* regenerationEvent =
+        dynamic_cast<AiForceRegenerationEvent*>(forceRegenerationEvent.get());
+
+    if (regenerationEvent != nullptr)
+        regenerationEvent->clearAgentObject();
+
+    forceRegenerationEvent = nullptr;
 }
 
 void AiAgentImplementation::fillAttributeList(AttributeListMessage* alm, CreatureObject* player) {
@@ -3295,6 +3307,7 @@ void AiAgentImplementation::notifyDespawn(Zone* zone) {
 	// Clearing Agent Events
 	cancelBehaviorEvent();
 	cancelRecoveryEvent();
+	cancelForceRegenerationEvent();
 	wipeBlackboard();
 
 	clearQueueActions(false);
