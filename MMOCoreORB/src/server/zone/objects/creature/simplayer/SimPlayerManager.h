@@ -12,6 +12,7 @@
 #include "system/util/VectorMap.h"
 #include "system/thread/Mutex.h"
 #include "engine/util/u3d/Vector3.h"
+#include "engine/util/JSONSerializationType.h"
 #include "engine/lua/Lua.h"
 
 #include "SimPlayerController.h"
@@ -31,6 +32,66 @@ class MarketSupplyObservationTask;
 class StockpileSnapshotSimulationTask;
 class DemandWeightedMinerPlanSimulationTask;
 class AiEconomyConceptualTotalsPersistenceTask;
+class MinerIntelligentTargetingTask;
+
+struct MinerPathValidationSnapshot {
+	String zoneName;
+	String profileKey;
+	String resourceName;
+	String resourceType;
+	bool acceptedDensityTarget = false;
+	bool pathFound = false;
+	String targetSource;
+	String rejectReason;
+	String pathTrustStatus;
+	int pathNodes = 0;
+	float pathDistance = 0.f;
+	float density = 0.f;
+	float directDistance = 0.f;
+	float targetX = 0.f;
+	float targetY = 0.f;
+	float targetZ = 0.f;
+	uint64 recordedAtMs = 0;
+};
+
+struct MinerIntelligentTargetAssignment {
+	uint64 minerID = 0;
+	uint64 createdAtMs = 0;
+	uint64 updatedAtMs = 0;
+	uint64 validatedAtMs = 0;
+	uint64 queuedAtMs = 0;
+	uint64 activatedAtMs = 0;
+	uint64 sampleStartedAtMs = 0;
+	uint64 sampleFinishedAtMs = 0;
+	uint64 expiresAtMs = 0;
+	String targetSource;
+	String selectedProfileKey;
+	String assignmentReason;
+	String demandState;
+	float pressureScore = 0.f;
+	String targetResourceName;
+	String targetResourceType;
+	String targetZoneName;
+	float targetX = 0.f;
+	float targetY = 0.f;
+	float targetZ = 0.f;
+	float targetDensity = 0.f;
+	String densityTargetStatus;
+	String pathValidationStatus;
+	String pathValidationTrustStatus;
+	bool pathValidationMatched = false;
+	String status;
+	String clearReason;
+	String lastActivationResult;
+	String lastFailureReason;
+
+	bool isValid() const {
+		return minerID != 0 && targetSource == "demand_weighted_plan" &&
+			!selectedProfileKey.isEmpty() && !targetResourceName.isEmpty() &&
+			!targetResourceType.isEmpty() && !targetZoneName.isEmpty() &&
+			densityTargetStatus == "accepted" && expiresAtMs > 0;
+	}
+};
 
 class SimPlayerManager : public Singleton<SimPlayerManager>, public Object, public Logger {
 private:
@@ -47,6 +108,7 @@ private:
 	friend class StockpileSnapshotSimulationTask;
 	friend class DemandWeightedMinerPlanSimulationTask;
 	friend class AiEconomyConceptualTotalsPersistenceTask;
+	friend class MinerIntelligentTargetingTask;
 
 	// Map of Creature ObjectID -> Controller
 	SynchronizedVectorMap<uint64, Reference<SimPlayerController*> > controllers;
@@ -130,6 +192,8 @@ private:
 	bool minerPathValidationOnlyAcceptedDensityTargets = true;
 	int minerPathValidationMaxPathDistance = 2500;
 	int minerPathValidationMaxPathNodes = 256;
+	Mutex minerPathValidationSnapshotMutex;
+	VectorMap<uint64, MinerPathValidationSnapshot> minerPathValidationSnapshots;
 	bool demandProfileSimulationEnabled = false;
 	bool demandProfileSimulationTaskScheduled = false;
 	int demandProfileSimulationIntervalSeconds = 300;
@@ -204,6 +268,54 @@ private:
 	VectorMap<String, int> demandWeightedMinerPlanSimulationDesiredReserve;
 	VectorMap<String, float> demandWeightedMinerPlanSimulationLowStockThreshold;
 	VectorMap<String, float> demandWeightedMinerPlanSimulationCriticalStockThreshold;
+	bool minerIntelligentTargetingEnabled = false;
+	bool minerIntelligentTargetingTaskScheduled = false;
+	String minerIntelligentTargetingMode = "off";
+	int minerIntelligentTargetingIntervalSeconds = 300;
+	int minerIntelligentTargetingMaxActiveMiners = 1;
+	bool minerIntelligentTargetingRequireDemandWeightedPlan = true;
+	bool minerIntelligentTargetingRequireAcceptedDensityTarget = true;
+	bool minerIntelligentTargetingRequireValidPath = true;
+	bool minerIntelligentTargetingFallbackToConceptualLoop = true;
+	int minerIntelligentTargetingRollbackOnFailureCount = 3;
+	bool minerIntelligentTargetingLogDecisionSummary = true;
+	bool minerIntelligentTargetingLogVerboseSwitchDecisions = false;
+	bool minerIntelligentTargetingAssignmentEnabled = true;
+	int minerIntelligentTargetingAssignmentTtlSeconds = 30;
+	bool minerIntelligentTargetingAssignmentReplaceOnlyWhenExpiredOrInvalid = true;
+	bool minerIntelligentTargetingAssignmentClearOnSampleComplete = true;
+	bool minerIntelligentTargetingAssignmentClearOnCombat = true;
+	bool minerIntelligentTargetingAssignmentClearOnIncapOrDeath = true;
+	bool minerIntelligentTargetingAssignmentClearOnZoneChange = true;
+	bool minerIntelligentTargetingAssignmentLogLifecycle = true;
+	bool minerIntelligentTargetingAssignmentLogRetained = false;
+	bool minerIntelligentTargetingLimitedActivationEnabled = false;
+	int minerIntelligentTargetingLimitedMaxActivationsPerInterval = 1;
+	int minerIntelligentTargetingLimitedMaxActiveIntelligentMiners = 1;
+	int minerIntelligentTargetingLimitedCooldownSecondsPerMiner = 0;
+	bool minerIntelligentTargetingLimitedRequireSamePlanet = true;
+	bool minerIntelligentTargetingLimitedDisableOnFirstFailure = true;
+	bool minerIntelligentTargetingLimitedDisableOnActivationFailure = false;
+	bool minerIntelligentTargetingLimitedLogActivationLifecycle = true;
+	bool minerIntelligentTargetingLimitedLogHealthSummary = true;
+	bool minerIntelligentTargetingLimitedEmergencyDisabled = false;
+	Vector<String> minerIntelligentTargetingLimitedAllowedZones;
+	Mutex minerIntelligentTargetingFailureMutex;
+	VectorMap<uint64, int> minerIntelligentTargetingFailureCounts;
+	Mutex minerIntelligentTargetingCooldownMutex;
+	VectorMap<uint64, uint64> minerIntelligentTargetingLastActivationMs;
+	Mutex minerIntelligentTargetingHealthMutex;
+	int minerIntelligentActivationHealthAttempts = 0;
+	int minerIntelligentActivationHealthStarted = 0;
+	int minerIntelligentActivationHealthArrivals = 0;
+	int minerIntelligentActivationHealthSamplesCompleted = 0;
+	int minerIntelligentActivationHealthPathFailures = 0;
+	int minerIntelligentActivationHealthExpired = 0;
+	int minerIntelligentActivationHealthCooldownSkips = 0;
+	int minerIntelligentActivationHealthActiveCapSkips = 0;
+	int minerIntelligentActivationHealthZoneSkips = 0;
+	Mutex minerIntelligentTargetingAssignmentMutex;
+	VectorMap<uint64, MinerIntelligentTargetAssignment> minerIntelligentTargetAssignments;
 	Vector<ShuttleportLocation> allShuttleports;
 	Vector<SpawnGroup> spawnGroups;
 
@@ -234,6 +346,8 @@ private:
 	void scheduleMinerPathValidationSimulationTask();
 	void runMinerPathValidationSimulationTask();
 	void logMinerPathValidationSimulations();
+	void recordMinerPathValidationSnapshot(uint64 minerID, const MinerPathValidationSnapshot& snapshot);
+	bool getMinerPathValidationSnapshot(uint64 minerID, MinerPathValidationSnapshot& snapshot);
 	void scheduleDemandProfileSimulationTask();
 	void runDemandProfileSimulationTask();
 	void logDemandProfileSimulations();
@@ -265,6 +379,22 @@ private:
 	void applyDemandWeightedMinerPlanSimulationConfig(LuaObject& demandWeightedConfig);
 	void applyDemandWeightedMinerPlanDependencyConfig(LuaObject& managerConfig);
 	void logDemandWeightedMinerPlanSimulations();
+	void scheduleMinerIntelligentTargetingTask();
+	void runMinerIntelligentTargetingTask();
+	void refreshMinerIntelligentTargetingConfig();
+	void applyMinerIntelligentTargetingConfig(LuaObject& targetingConfig);
+	void logMinerIntelligentTargetingDecisions();
+	bool getMinerIntelligentTargetAssignment(uint64 minerID, MinerIntelligentTargetAssignment& assignment);
+	void putMinerIntelligentTargetAssignment(const MinerIntelligentTargetAssignment& assignment);
+	void clearMinerIntelligentTargetAssignment(uint64 minerID, const String& reason, const String& mode);
+	void recordMinerIntelligentTargetAssignmentLifecycle(uint64 minerID, const String& eventName, const String& detail);
+	bool isMinerIntelligentTargetZoneAllowed(const String& zoneName);
+	bool isMinerIntelligentAssignmentActive(const MinerIntelligentTargetAssignment& assignment);
+	int countActiveMinerIntelligentAssignments();
+	bool isMinerIntelligentActivationOnCooldown(uint64 minerID, uint64 nowMs);
+	void rememberMinerIntelligentActivation(uint64 minerID, uint64 nowMs);
+	void recordMinerIntelligentActivationHealthEvent(const String& eventName);
+	void snapshotAndResetMinerIntelligentActivationHealth(int& attempts, int& started, int& arrivals, int& samplesCompleted, int& pathFailures, int& expired, int& cooldownSkips, int& activeCapSkips, int& zoneSkips);
 
 	String pickRandomTemplate(const SpawnGroup& g) const;
 	bool isImperialForSpawn(const SpawnGroup& g, const String& templateName) const;
@@ -285,6 +415,10 @@ public:
 	void toggleBot(AiAgent* agent);
 
 	uint64 recordConceptualMinerYield(const String& resourceName, int amount, uint64 sourceObjectID, bool logYield);
+	void clearMinerIntelligentTargetAssignmentFromController(uint64 minerID, const String& reason);
+	void clearMinerIntelligentTargetAssignmentOnSampleComplete(uint64 minerID);
+	void recordMinerIntelligentTargetAssignmentLifecycleFromController(uint64 minerID, const String& eventName, const String& detail = "");
+	JSONSerializationType getAiEconomyDashboardSnapshot();
 
 	// Cycle logic (called by SimPvPController)
 	void cyclePvPBot(uint64 oldOid,

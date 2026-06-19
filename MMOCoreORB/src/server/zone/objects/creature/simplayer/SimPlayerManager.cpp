@@ -116,12 +116,20 @@ public:
     }
 };
 
+class MinerIntelligentTargetingTask : public Task {
+public:
+    void run() override {
+        SimPlayerManager::instance()->runMinerIntelligentTargetingTask();
+    }
+};
+
 class MinerPathValidationTask : public Task {
     uint64 minerID;
     String zoneName;
     String profileKey;
     String resourceName;
     String resourceType;
+    String targetSource;
     Vector3 startPosition;
     Vector3 targetPosition;
     float density;
@@ -138,6 +146,7 @@ public:
             const String& profileKey,
             const String& resourceName,
             const String& resourceType,
+            const String& targetSource,
             const Vector3& startPosition,
             const Vector3& targetPosition,
             float density,
@@ -151,6 +160,7 @@ public:
           profileKey(profileKey),
           resourceName(resourceName),
           resourceType(resourceType),
+          targetSource(targetSource),
           startPosition(startPosition),
           targetPosition(targetPosition),
           density(density),
@@ -365,6 +375,24 @@ struct DemandWeightedMinerCandidate {
 
     bool isValid() const {
         return resultIndex >= 0 && target.isValid();
+    }
+
+    bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+    bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct MinerIntelligentTargetingMinerSnapshot {
+    uint64 objectID = 0;
+    String zoneName;
+    Vector3 position;
+    bool inNavmesh = false;
+    bool dead = false;
+    bool incapacitated = false;
+    bool inCombat = false;
+    ManagedReference<Zone*> zone;
+
+    bool isValid() const {
+        return objectID != 0 && zone != nullptr;
     }
 
     bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
@@ -1140,6 +1168,7 @@ static uint64 estimatePersistentConceptualDemandStateSupply(
         String& supplyLabels) {
     uint64 total = 0;
     lotsMatched = 0;
+    supplyLabels = "";
 
     for (int i = 0; i < labelQuantities.size(); ++i) {
         String resourceLabel = labelQuantities.elementAt(i).getKey().toLowerCase();
@@ -1644,6 +1673,245 @@ static DemandWeightedMinerTarget selectDemandWeightedMinerTarget(
     return target;
 }
 
+struct DemandWeightedPlanSelection {
+    bool valid = false;
+    DemandWeightedMinerCandidate selected;
+    DemandStateSimulationResult selectedResult;
+    DemandProfileDefinition selectedProfile;
+    ResourceIntelligenceEntry selectedResource;
+    String assignmentReason = "none";
+    bool strongPressureOverflow = false;
+
+    bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+    bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+static void buildDemandWeightedPressureResultsForMiners(
+        const Vector<ResourceIntelligenceEntry>& entries,
+        const Vector<DemandProfileDefinition>& profiles,
+        const Vector<String>& conceptualResourceNames,
+        const Vector<uint64>& conceptualAmounts,
+        VectorMap<String, uint64>& marketQuantities,
+        VectorMap<String, int>& profileEnabled,
+        VectorMap<String, int>& desiredReserve,
+        VectorMap<String, float>& lowStockThreshold,
+        VectorMap<String, float>& criticalStockThreshold,
+        const String& serverPhase,
+        float shortageWeight,
+        float activeOpportunityWeight,
+        float surplusDampening,
+        float minimumPressureThreshold,
+        Vector<DemandStateSimulationResult>& pressureResults,
+        int& profilesDisabled,
+        int& profilesInactivePhase,
+        int& profilesBelowPressure,
+        int& profilesNoEligibleResource) {
+    pressureResults.removeAll();
+    profilesDisabled = 0;
+    profilesInactivePhase = 0;
+    profilesBelowPressure = 0;
+    profilesNoEligibleResource = 0;
+
+    for (int profileIndex = 0; profileIndex < profiles.size(); ++profileIndex) {
+        DemandProfileDefinition profile = profiles.get(profileIndex);
+        bool enabled = !profileEnabled.contains(profile.key) ||
+            profileEnabled.get(profile.key) != 0;
+
+        if (!enabled) {
+            profilesDisabled++;
+            continue;
+        }
+
+        if (!demandProfileActiveForPhase(profile, serverPhase)) {
+            profilesInactivePhase++;
+            continue;
+        }
+
+        DemandStateSimulationResult result;
+        result.profileKey = profile.key;
+        result.desiredReserve = desiredReserve.contains(profile.key) ?
+            static_cast<uint64>(desiredReserve.get(profile.key)) : 0;
+        result.aiConceptualSupply = estimateConceptualDemandStateSupply(
+            profile.key,
+            conceptualResourceNames,
+            conceptualAmounts,
+            result.supplyConfidence,
+            result.supplyLabels);
+        result.marketObservedSupply = marketQuantities.contains(profile.key) ?
+            marketQuantities.get(profile.key) : 0;
+        float lowThreshold = lowStockThreshold.contains(profile.key) ?
+            lowStockThreshold.get(profile.key) : 0.35f;
+        float criticalThreshold = criticalStockThreshold.contains(profile.key) ?
+            criticalStockThreshold.get(profile.key) : 0.10f;
+
+        for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
+            ResourceIntelligenceEntry entry = entries.get(entryIndex);
+            DemandProfileMatch match =
+                evaluateDemandProfileResource(entry, profile, 1.f, 100);
+
+            if (!match.eligible ||
+                    (result.hasActiveOpportunity &&
+                     match.demandScore <= result.activeMatch.demandScore)) {
+                continue;
+            }
+
+            result.hasActiveOpportunity = true;
+            result.activeResource = entry;
+            result.activeMatch = match;
+        }
+
+        calculateDemandStatePressure(
+            result,
+            lowThreshold,
+            criticalThreshold,
+            shortageWeight,
+            activeOpportunityWeight,
+            surplusDampening);
+
+        if (!result.hasActiveOpportunity) {
+            profilesNoEligibleResource++;
+            continue;
+        }
+
+        if (result.pressureScore < minimumPressureThreshold) {
+            profilesBelowPressure++;
+            continue;
+        }
+
+        pressureResults.add(result);
+    }
+}
+
+static DemandWeightedPlanSelection selectDemandWeightedMinerPlanForValidation(
+        const Vector<ResourceIntelligenceEntry>& entries,
+        const Vector<DemandProfileDefinition>& profiles,
+        const Vector<DemandStateSimulationResult>& pressureResults,
+        VectorMap<String, int>& assignmentsByProfile,
+        const String& zoneName,
+        int samePlanetBonus,
+        int travelPenalty,
+        int maxMinersPerProfile,
+        float strongPressureRatio) {
+    DemandWeightedPlanSelection selection;
+    DemandWeightedMinerCandidate bestWithinCap;
+    DemandWeightedMinerCandidate strongestCapped;
+    DemandWeightedMinerCandidate secondStrongestCapped;
+
+    for (int resultIndex = 0; resultIndex < pressureResults.size(); ++resultIndex) {
+        DemandStateSimulationResult result = pressureResults.get(resultIndex);
+        DemandProfileDefinition profile;
+
+        if (!findDemandProfileDefinition(profiles, result.profileKey, profile))
+            continue;
+
+        DemandWeightedMinerTarget target =
+            selectDemandWeightedMinerTarget(
+                entries, profile, zoneName, samePlanetBonus, travelPenalty);
+
+        if (!target.isValid())
+            continue;
+
+        int assignmentCount = assignmentsByProfile.contains(result.profileKey) ?
+            assignmentsByProfile.get(result.profileKey) : 0;
+        DemandWeightedMinerCandidate candidate;
+        candidate.resultIndex = resultIndex;
+        candidate.target = target;
+        candidate.existingAssignments = assignmentCount;
+        candidate.exceedsProfileCap = assignmentCount >= maxMinersPerProfile;
+        candidate.locationAdjustedPressure = result.pressureScore +
+            (target.samePlanet ?
+                static_cast<float>(samePlanetBonus) :
+                -static_cast<float>(travelPenalty));
+        candidate.balancedScore =
+            candidate.locationAdjustedPressure /
+            static_cast<float>(assignmentCount + 1);
+
+        if (!candidate.exceedsProfileCap &&
+                (!bestWithinCap.isValid() ||
+                 candidate.balancedScore > bestWithinCap.balancedScore)) {
+            bestWithinCap = candidate;
+        }
+
+        if (candidate.exceedsProfileCap &&
+                (!strongestCapped.isValid() ||
+                 candidate.locationAdjustedPressure >
+                    strongestCapped.locationAdjustedPressure)) {
+            secondStrongestCapped = strongestCapped;
+            strongestCapped = candidate;
+        } else if (candidate.exceedsProfileCap &&
+                (!secondStrongestCapped.isValid() ||
+                 candidate.locationAdjustedPressure >
+                    secondStrongestCapped.locationAdjustedPressure)) {
+            secondStrongestCapped = candidate;
+        }
+    }
+
+    DemandWeightedMinerCandidate selected;
+    bool strongPressureOverflow = false;
+
+    if (bestWithinCap.isValid()) {
+        selected = bestWithinCap;
+
+        if (strongestCapped.isValid()) {
+            DemandStateSimulationResult overflowResult =
+                pressureResults.get(strongestCapped.resultIndex);
+            DemandStateSimulationResult boundedResult =
+                pressureResults.get(bestWithinCap.resultIndex);
+
+            if (overflowResult.pressureScore >=
+                    boundedResult.pressureScore * strongPressureRatio) {
+                selected = strongestCapped;
+                strongPressureOverflow = true;
+            }
+        }
+    } else if (strongestCapped.isValid()) {
+        DemandStateSimulationResult strongestResult =
+            pressureResults.get(strongestCapped.resultIndex);
+        bool overflowJustified = !secondStrongestCapped.isValid();
+
+        if (secondStrongestCapped.isValid()) {
+            DemandStateSimulationResult secondResult =
+                pressureResults.get(secondStrongestCapped.resultIndex);
+            overflowJustified = strongestResult.pressureScore >=
+                secondResult.pressureScore * strongPressureRatio;
+        }
+
+        if (overflowJustified) {
+            selected = strongestCapped;
+            strongPressureOverflow = true;
+        }
+    }
+
+    if (!selected.isValid())
+        return selection;
+
+    selection.valid = true;
+    selection.selected = selected;
+    selection.selectedResult = pressureResults.get(selected.resultIndex);
+    findDemandProfileDefinition(
+        profiles, selection.selectedResult.profileKey, selection.selectedProfile);
+    selection.selectedResource = entries.get(selected.target.resourceIndex);
+    selection.strongPressureOverflow = strongPressureOverflow;
+
+    int newAssignmentCount = selected.existingAssignments + 1;
+    assignmentsByProfile.put(selection.selectedResult.profileKey, newAssignmentCount);
+
+    if (strongPressureOverflow) {
+        selection.assignmentReason =
+            "strong pressure justified profile cap overflow";
+    } else if (selected.existingAssignments > 0) {
+        selection.assignmentReason = "load-balanced demand pressure";
+    } else {
+        selection.assignmentReason = "highest demand pressure";
+    }
+
+    selection.assignmentReason += selected.target.samePlanet ?
+        String("; same-planet opportunity") :
+        String("; travel-required opportunity");
+
+    return selection;
+}
+
 struct MinerDensityTargetCandidate {
     float x = 0.f;
     float y = 0.f;
@@ -1977,11 +2245,15 @@ void MinerPathValidationTask::run() {
         rejectReason = "pathTooLong";
     }
 
+    String pathTrustStatus = pathFound ? String("verifiedPath") :
+        (rejectReason.isEmpty() ? String("untrusted") : rejectReason);
+
     String line = String("MinerPathValidationSimulation miner=") + String::valueOf(minerID) +
         " zone=" + zoneName +
         " profile=" + profileKey +
         " resource=" + resourceName +
         " type=" + resourceType +
+        " targetSource=" + targetSource +
         " target=(x:" + String::valueOf(Math::getPrecision(targetPosition.getX(), 1)) +
         ",y:" + String::valueOf(Math::getPrecision(targetPosition.getY(), 1)) +
         ",z:" + String::valueOf(Math::getPrecision(targetPosition.getZ(), 1)) + ")" +
@@ -1991,13 +2263,84 @@ void MinerPathValidationTask::run() {
         " pathFound=" + (pathFound ? String("true") : String("false")) +
         " pathNodes=" + String::valueOf(pathNodes) +
         " pathDistance=" + String::valueOf(Math::getPrecision(pathDistance, 1)) +
-        " directFallback=" + (directFallback ? String("true") : String("false"));
+        " directFallback=" + (directFallback ? String("true") : String("false")) +
+        " pathTrustStatus=" + pathTrustStatus;
 
     if (!rejectReason.isEmpty())
         line += " rejectReason=" + rejectReason;
 
     line += " mode=simulation-only";
+    MinerPathValidationSnapshot snapshot;
+    snapshot.zoneName = zoneName;
+    snapshot.profileKey = profileKey;
+    snapshot.resourceName = resourceName;
+    snapshot.resourceType = resourceType;
+    snapshot.targetSource = targetSource;
+    snapshot.acceptedDensityTarget = acceptedDensityTarget;
+    snapshot.pathFound = pathFound;
+    snapshot.rejectReason = rejectReason.isEmpty() ? String("none") : rejectReason;
+    snapshot.pathTrustStatus = pathTrustStatus;
+    snapshot.pathNodes = pathNodes;
+    snapshot.pathDistance = pathDistance;
+    snapshot.density = density;
+    snapshot.directDistance = directDistance;
+    snapshot.targetX = targetPosition.getX();
+    snapshot.targetY = targetPosition.getY();
+    snapshot.targetZ = targetPosition.getZ();
+    snapshot.recordedAtMs = System::getMiliTime();
+    manager->recordMinerPathValidationSnapshot(minerID, snapshot);
+
+    MinerIntelligentTargetAssignment assignment;
+    bool assignmentMatches = false;
+
+    if (manager->getMinerIntelligentTargetAssignment(minerID, assignment)) {
+        float dx = assignment.targetX - targetPosition.getX();
+        float dy = assignment.targetY - targetPosition.getY();
+        float dz = assignment.targetZ - targetPosition.getZ();
+        assignmentMatches =
+            assignment.targetSource == targetSource &&
+            assignment.selectedProfileKey == profileKey &&
+            assignment.targetResourceName == resourceName &&
+            assignment.targetResourceType == resourceType &&
+            assignment.targetZoneName == zoneName &&
+            (dx * dx + dy * dy + dz * dz) <= 4.f;
+
+        if (assignmentMatches) {
+            assignment.updatedAtMs = snapshot.recordedAtMs;
+            assignment.pathValidationStatus = pathFound ? "valid" : "failed";
+            assignment.pathValidationTrustStatus = pathTrustStatus;
+            assignment.pathValidationMatched = pathFound;
+            assignment.status = pathFound ? "validated" : "candidate";
+            if (pathFound && assignment.validatedAtMs == 0)
+                assignment.validatedAtMs = snapshot.recordedAtMs;
+            manager->putMinerIntelligentTargetAssignment(assignment);
+        }
+    }
+
     manager->info(line, true);
+
+    if (targetSource == "demand_weighted_plan") {
+        String validationLine = String("DemandWeightedMinerTargetValidation miner=") +
+            String::valueOf(minerID) +
+            " zone=" + zoneName +
+            " selectedProfile=" + profileKey +
+            " targetResource=" + resourceName +
+            " targetType=" + resourceType +
+            " targetSource=demand_weighted_plan" +
+            " densityTargetStatus=" +
+                (acceptedDensityTarget ? String("accepted") : String("rejected")) +
+            " pathValidationStatus=" +
+                (pathFound ? String("valid") : String("failed")) +
+            " pathTrustStatus=" + pathTrustStatus +
+            " matchesSwitchDecision=" +
+                (assignmentMatches ? String("true") : String("false"));
+
+        if (!rejectReason.isEmpty())
+            validationLine += " fallbackReason=" + rejectReason;
+
+        validationLine += " mode=diagnostic-only";
+        manager->info(validationLine, true);
+    }
 
     if (path != nullptr)
         delete path;
@@ -2225,6 +2568,7 @@ void SimPlayerManager::initialize() {
     scheduleAiEconomyPersistenceTask();
     scheduleDemandStateSimulationTask();
     scheduleDemandWeightedMinerPlanSimulationTask();
+    scheduleMinerIntelligentTargetingTask();
 }
 
 void SimPlayerManager::loadLuaConfig() {
@@ -2370,6 +2714,45 @@ void SimPlayerManager::loadLuaConfig() {
     demandWeightedMinerPlanSimulationDesiredReserve.removeAll();
     demandWeightedMinerPlanSimulationLowStockThreshold.removeAll();
     demandWeightedMinerPlanSimulationCriticalStockThreshold.removeAll();
+    minerIntelligentTargetingEnabled = false;
+    minerIntelligentTargetingTaskScheduled = false;
+    minerIntelligentTargetingMode = "off";
+    minerIntelligentTargetingIntervalSeconds = 300;
+    minerIntelligentTargetingMaxActiveMiners = 1;
+    minerIntelligentTargetingRequireDemandWeightedPlan = true;
+    minerIntelligentTargetingRequireAcceptedDensityTarget = true;
+    minerIntelligentTargetingRequireValidPath = true;
+    minerIntelligentTargetingFallbackToConceptualLoop = true;
+    minerIntelligentTargetingRollbackOnFailureCount = 3;
+    minerIntelligentTargetingLogDecisionSummary = true;
+    minerIntelligentTargetingAssignmentEnabled = true;
+    minerIntelligentTargetingAssignmentTtlSeconds = 30;
+    minerIntelligentTargetingAssignmentReplaceOnlyWhenExpiredOrInvalid = true;
+    minerIntelligentTargetingAssignmentClearOnSampleComplete = true;
+    minerIntelligentTargetingAssignmentClearOnCombat = true;
+    minerIntelligentTargetingAssignmentClearOnIncapOrDeath = true;
+    minerIntelligentTargetingAssignmentClearOnZoneChange = true;
+    minerIntelligentTargetingAssignmentLogLifecycle = true;
+    minerIntelligentTargetingLimitedActivationEnabled = false;
+    minerIntelligentTargetingLimitedMaxActivationsPerInterval = 1;
+    minerIntelligentTargetingLimitedRequireSamePlanet = true;
+    minerIntelligentTargetingLimitedDisableOnFirstFailure = true;
+    minerIntelligentTargetingLimitedLogActivationLifecycle = true;
+
+    {
+        Locker failureLocker(&minerIntelligentTargetingFailureMutex);
+        minerIntelligentTargetingFailureCounts.removeAll();
+    }
+
+    {
+        Locker assignmentLocker(&minerIntelligentTargetingAssignmentMutex);
+        minerIntelligentTargetAssignments.removeAll();
+    }
+
+    {
+        Locker pathSnapshotLocker(&minerPathValidationSnapshotMutex);
+        minerPathValidationSnapshots.removeAll();
+    }
 
     const char* demandProfileKeys[] = {
         "composite_armor_supply",
@@ -2653,6 +3036,12 @@ void SimPlayerManager::loadLuaConfig() {
             demandWeightedMinerPlanSimulationConfig);
     demandWeightedMinerPlanSimulationConfig.pop();
     applyDemandWeightedMinerPlanDependencyConfig(config);
+
+    LuaObject minerIntelligentTargetingConfig =
+        config.getObjectField("minerIntelligentTargetingConfig");
+    if (minerIntelligentTargetingConfig.isValidTable())
+        applyMinerIntelligentTargetingConfig(minerIntelligentTargetingConfig);
+    minerIntelligentTargetingConfig.pop();
 
     // --- LOAD SHUTTLEPORTS ---
     LuaObject shuttles = config.getObjectField("shuttleports");
@@ -2951,6 +3340,29 @@ uint64 SimPlayerManager::recordConceptualMinerYield(const String& resourceName, 
     return total;
 }
 
+void SimPlayerManager::clearMinerIntelligentTargetAssignmentFromController(
+        uint64 minerID, const String& reason) {
+    if (!enabled)
+        return;
+
+    clearMinerIntelligentTargetAssignment(minerID, reason, minerIntelligentTargetingMode);
+}
+
+void SimPlayerManager::clearMinerIntelligentTargetAssignmentOnSampleComplete(uint64 minerID) {
+    if (!enabled || !minerIntelligentTargetingAssignmentClearOnSampleComplete)
+        return;
+
+    clearMinerIntelligentTargetAssignmentFromController(minerID, "sampleComplete");
+}
+
+void SimPlayerManager::recordMinerIntelligentTargetAssignmentLifecycleFromController(
+        uint64 minerID, const String& eventName, const String& detail) {
+    if (!enabled)
+        return;
+
+    recordMinerIntelligentTargetAssignmentLifecycle(minerID, eventName, detail);
+}
+
 void SimPlayerManager::scheduleMinerSummaryTask() {
     if (!enabled || !minerSummaryLoggingEnabled || minerSummaryTaskScheduled)
         return;
@@ -2993,6 +3405,507 @@ void SimPlayerManager::collectConceptualMinerTotals(Vector<String>& resourceName
         resourceNames.add(conceptualMinerTotals.elementAt(i).getKey());
         amounts.add(conceptualMinerTotals.get(i));
     }
+}
+
+JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
+    uint64 nowMs = System::getMiliTime();
+    Time now;
+
+    JSONSerializationType result = JSONSerializationType::object();
+    JSONSerializationType metadata = JSONSerializationType::object();
+    metadata["asOfTime"] = now.getFormattedTimeFull();
+    metadata["epochMs"] = nowMs;
+    metadata["enabled"] = enabled;
+    result["metadata"] = metadata;
+
+    int activeMiners = 0;
+    int activePvpBots = 0;
+    int controllerCount = controllers.size();
+    JSONSerializationType controllerRows = JSONSerializationType::array();
+
+    for (int i = 0; i < controllerCount; ++i) {
+        uint64 controllerKey = controllers.getKey(i);
+        Reference<SimPlayerController*> ctrl = controllers.get(controllerKey);
+
+        if (ctrl == nullptr)
+            continue;
+
+        String role = "unknown";
+
+        if (dynamic_cast<SimMinerController*>(ctrl.get()) != nullptr) {
+            role = "miner";
+            activeMiners++;
+        } else if (dynamic_cast<SimPvPController*>(ctrl.get()) != nullptr) {
+            role = "pvp_bot";
+            activePvpBots++;
+        }
+
+        ManagedReference<AiAgent*> agent = ctrl->getAgent();
+        String zoneName = "unknown";
+        uint64 objectID = controllerKey;
+
+        if (agent != nullptr) {
+            Locker agentLocker(agent);
+            objectID = agent->getObjectID();
+
+            Zone* zone = agent->getZone();
+            if (zone != nullptr)
+                zoneName = zone->getZoneName();
+        }
+
+        JSONSerializationType row = JSONSerializationType::object();
+        row["objectId"] = objectID;
+        row["role"] = role;
+        row["zone"] = zoneName;
+        controllerRows.push_back(row);
+    }
+
+    JSONSerializationType population = JSONSerializationType::object();
+    population["totalControllers"] = controllerCount;
+    population["activeMiners"] = activeMiners;
+    population["activePvpBots"] = activePvpBots;
+    population["pvpStatus"] = "experimental";
+    population["controllers"] = controllerRows;
+
+    JSONSerializationType futureRoles = JSONSerializationType::array();
+    JSONSerializationType crafterRole = JSONSerializationType::object();
+    crafterRole["role"] = "crafters";
+    crafterRole["status"] = "not_implemented";
+    crafterRole["active"] = 0;
+    futureRoles.push_back(crafterRole);
+
+    JSONSerializationType pveRole = JSONSerializationType::object();
+    pveRole["role"] = "pve_roles";
+    pveRole["status"] = "not_implemented";
+    pveRole["active"] = 0;
+    futureRoles.push_back(pveRole);
+    population["futureRoles"] = futureRoles;
+    result["population"] = population;
+
+    int assignmentActive = 0;
+    int assignmentQueued = 0;
+    int assignmentMoving = 0;
+    int assignmentSampling = 0;
+    int assignmentCandidate = 0;
+    int assignmentValidated = 0;
+    int assignmentFailed = 0;
+    int assignmentExpired = 0;
+    JSONSerializationType assignments = JSONSerializationType::array();
+
+    {
+        Locker assignmentLocker(&minerIntelligentTargetingAssignmentMutex);
+
+        for (int i = 0; i < minerIntelligentTargetAssignments.size(); ++i) {
+            MinerIntelligentTargetAssignment assignment =
+                minerIntelligentTargetAssignments.elementAt(i).getValue();
+            bool expired = assignment.expiresAtMs > 0 && nowMs > assignment.expiresAtMs;
+            String status = expired ? String("expired") : assignment.status;
+
+            if (expired) {
+                assignmentExpired++;
+            } else if (status == "queued") {
+                assignmentQueued++;
+            } else if (status == "activation_started") {
+                assignmentMoving++;
+            } else if (status == "sample_started") {
+                assignmentSampling++;
+            } else if (status == "candidate") {
+                assignmentCandidate++;
+            } else if (status == "validated") {
+                assignmentValidated++;
+            } else if (status == "failed") {
+                assignmentFailed++;
+            }
+
+            if (!expired && isMinerIntelligentAssignmentActive(assignment))
+                assignmentActive++;
+
+            JSONSerializationType assignmentJSON = JSONSerializationType::object();
+            assignmentJSON["minerId"] = assignment.minerID;
+            assignmentJSON["status"] = status;
+            assignmentJSON["profile"] = assignment.selectedProfileKey;
+            assignmentJSON["demandState"] = assignment.demandState;
+            assignmentJSON["targetResource"] = assignment.targetResourceName;
+            assignmentJSON["targetType"] = assignment.targetResourceType;
+            assignmentJSON["targetZone"] = assignment.targetZoneName;
+            assignmentJSON["density"] = Math::getPrecision(assignment.targetDensity, 3);
+            assignmentJSON["pathValidationStatus"] = assignment.pathValidationStatus;
+            assignmentJSON["pathTrustStatus"] = assignment.pathValidationTrustStatus;
+            assignmentJSON["lastActivationResult"] = assignment.lastActivationResult;
+            assignmentJSON["lastFailureReason"] = assignment.lastFailureReason;
+            assignmentJSON["ageSeconds"] =
+                assignment.createdAtMs > 0 && nowMs > assignment.createdAtMs ?
+                (nowMs - assignment.createdAtMs) / 1000 : 0;
+            assignmentJSON["remainingSeconds"] =
+                assignment.expiresAtMs > nowMs ?
+                (assignment.expiresAtMs - nowMs) / 1000 : 0;
+            assignments.push_back(assignmentJSON);
+        }
+    }
+
+    int healthAttempts = 0;
+    int healthStarted = 0;
+    int healthArrivals = 0;
+    int healthSamplesCompleted = 0;
+    int healthPathFailures = 0;
+    int healthExpired = 0;
+    int healthCooldownSkips = 0;
+    int healthActiveCapSkips = 0;
+    int healthZoneSkips = 0;
+
+    {
+        Locker healthLocker(&minerIntelligentTargetingHealthMutex);
+        healthAttempts = minerIntelligentActivationHealthAttempts;
+        healthStarted = minerIntelligentActivationHealthStarted;
+        healthArrivals = minerIntelligentActivationHealthArrivals;
+        healthSamplesCompleted = minerIntelligentActivationHealthSamplesCompleted;
+        healthPathFailures = minerIntelligentActivationHealthPathFailures;
+        healthExpired = minerIntelligentActivationHealthExpired;
+        healthCooldownSkips = minerIntelligentActivationHealthCooldownSkips;
+        healthActiveCapSkips = minerIntelligentActivationHealthActiveCapSkips;
+        healthZoneSkips = minerIntelligentActivationHealthZoneSkips;
+    }
+
+    int activationFailures = healthAttempts > healthStarted ?
+        healthAttempts - healthStarted : 0;
+
+    JSONSerializationType minerActivity = JSONSerializationType::object();
+    minerActivity["intelligentTargetingEnabled"] = minerIntelligentTargetingEnabled;
+    minerActivity["mode"] = minerIntelligentTargetingMode;
+    minerActivity["currentIntelligentActiveCount"] = assignmentActive;
+    minerActivity["queued"] = assignmentQueued;
+    minerActivity["moving"] = assignmentMoving;
+    minerActivity["sampling"] = assignmentSampling;
+    minerActivity["candidate"] = assignmentCandidate;
+    minerActivity["validated"] = assignmentValidated;
+    minerActivity["failed"] = assignmentFailed;
+    minerActivity["expired"] = assignmentExpired;
+    minerActivity["activationFailures"] = activationFailures;
+    minerActivity["pathFailures"] = healthPathFailures;
+    minerActivity["emergencyDisabled"] =
+        minerIntelligentTargetingLimitedEmergencyDisabled;
+    minerActivity["maxActiveIntelligentMiners"] =
+        minerIntelligentTargetingLimitedMaxActiveIntelligentMiners;
+    minerActivity["maxActivationsPerInterval"] =
+        minerIntelligentTargetingLimitedMaxActivationsPerInterval;
+    minerActivity["cooldownSeconds"] =
+        minerIntelligentTargetingLimitedCooldownSecondsPerMiner;
+    minerActivity["assignments"] = assignments;
+
+    JSONSerializationType health = JSONSerializationType::object();
+    health["attempts"] = healthAttempts;
+    health["started"] = healthStarted;
+    health["arrivals"] = healthArrivals;
+    health["samplesCompleted"] = healthSamplesCompleted;
+    health["expired"] = healthExpired;
+    health["cooldownSkips"] = healthCooldownSkips;
+    health["activeCapSkips"] = healthActiveCapSkips;
+    health["zoneSkips"] = healthZoneSkips;
+    minerActivity["healthWindow"] = health;
+    result["minerActivity"] = minerActivity;
+
+    Vector<String> conceptualResourceNames;
+    Vector<uint64> conceptualAmounts;
+    collectConceptualMinerTotals(conceptualResourceNames, conceptualAmounts);
+
+    JSONSerializationType sessionTotals = JSONSerializationType::array();
+    uint64 sessionTotalQuantity = 0;
+
+    for (int i = 0; i < conceptualResourceNames.size() && i < conceptualAmounts.size(); ++i) {
+        uint64 amount = conceptualAmounts.get(i);
+        sessionTotalQuantity += amount;
+
+        JSONSerializationType row = JSONSerializationType::object();
+        row["label"] = conceptualResourceNames.get(i);
+        row["quantity"] = amount;
+        sessionTotals.push_back(row);
+    }
+
+    VectorMap<String, uint64> persistentConceptualTotals;
+    int persistentConceptualLots = 0;
+    uint64 persistentConceptualQuantity = 0;
+    String persistentStockpileStatus = "disabled";
+    bool persistentSnapshotReady =
+        AiEconomyManager::instance()->snapshotPersistentConceptualMinerSupplyForDemand(
+            persistentConceptualTotals,
+            persistentConceptualLots,
+            persistentConceptualQuantity,
+            persistentStockpileStatus);
+
+    JSONSerializationType persistentTotals = JSONSerializationType::array();
+
+    if (persistentSnapshotReady) {
+        for (int i = 0; i < persistentConceptualTotals.size(); ++i) {
+            JSONSerializationType row = JSONSerializationType::object();
+            row["label"] = persistentConceptualTotals.elementAt(i).getKey();
+            row["quantity"] = persistentConceptualTotals.get(i);
+            persistentTotals.push_back(row);
+        }
+    }
+
+    VectorMap<String, uint64> knownConceptualTotals;
+    uint64 knownConceptualQuantity = 0;
+
+    for (int i = 0; i < persistentConceptualTotals.size(); ++i) {
+        String label = persistentConceptualTotals.elementAt(i).getKey();
+        uint64 quantity = persistentConceptualTotals.get(i);
+        knownConceptualTotals.put(label, quantity);
+        knownConceptualQuantity += quantity;
+    }
+
+    for (int i = 0; i < conceptualResourceNames.size() && i < conceptualAmounts.size(); ++i) {
+        String label = conceptualResourceNames.get(i);
+        uint64 quantity = conceptualAmounts.get(i);
+        uint64 aggregate = knownConceptualTotals.contains(label) ?
+            knownConceptualTotals.get(label) : 0;
+        aggregate += quantity;
+        knownConceptualTotals.put(label, aggregate);
+        knownConceptualQuantity += quantity;
+    }
+
+    JSONSerializationType knownTotals = JSONSerializationType::array();
+
+    for (int i = 0; i < knownConceptualTotals.size(); ++i) {
+        JSONSerializationType row = JSONSerializationType::object();
+        row["label"] = knownConceptualTotals.elementAt(i).getKey();
+        row["quantity"] = knownConceptualTotals.get(i);
+        knownTotals.push_back(row);
+    }
+
+    JSONSerializationType supply = JSONSerializationType::object();
+    supply["currentSessionConceptualTotals"] = sessionTotals;
+    supply["currentSessionConceptualTotalQuantity"] = sessionTotalQuantity;
+    supply["persistentBaselineStockpile"] = persistentTotals;
+    supply["persistentBaselineStockpileLots"] = persistentConceptualLots;
+    supply["persistentBaselineStockpileQuantity"] = persistentConceptualQuantity;
+    supply["persistentBaselineStatus"] = persistentStockpileStatus;
+    supply["persistentBaselineReady"] = persistentSnapshotReady;
+    supply["totalKnownConceptualSupply"] = knownTotals;
+    supply["totalKnownConceptualQuantity"] = knownConceptualQuantity;
+    result["supply"] = supply;
+
+    Vector<ResourceIntelligenceEntry> entries;
+    String snapshotError;
+    bool activeSnapshotAvailable = collectResourceIntelligenceSnapshot(entries, snapshotError);
+    Vector<DemandProfileDefinition> profiles = createDemandProfileDefinitions();
+    VectorMap<String, uint64> marketQuantities;
+    VectorMap<String, int> marketListings;
+    VectorMap<String, float> marketCheapestPrices;
+    VectorMap<String, float> marketMedianPrices;
+    VectorMap<String, String> marketConfidences;
+    VectorMap<String, String> marketTopResources;
+    VectorMap<String, String> marketTopTypes;
+
+    if (marketSupplyObservationEnabled) {
+        Locker marketSnapshotLocker(&marketSupplyObservationMutex);
+
+        for (int profileIndex = 0; profileIndex < profiles.size(); ++profileIndex) {
+            String profileKey = profiles.get(profileIndex).key;
+
+            if (marketSupplyProfileQuantities.contains(profileKey))
+                marketQuantities.put(profileKey, marketSupplyProfileQuantities.get(profileKey));
+            if (marketSupplyProfileListings.contains(profileKey))
+                marketListings.put(profileKey, marketSupplyProfileListings.get(profileKey));
+            if (marketSupplyProfileCheapestPricePerUnit.contains(profileKey))
+                marketCheapestPrices.put(profileKey, marketSupplyProfileCheapestPricePerUnit.get(profileKey));
+            if (marketSupplyProfileMedianPricePerUnit.contains(profileKey))
+                marketMedianPrices.put(profileKey, marketSupplyProfileMedianPricePerUnit.get(profileKey));
+            if (marketSupplyProfileConfidence.contains(profileKey))
+                marketConfidences.put(profileKey, marketSupplyProfileConfidence.get(profileKey));
+            if (marketSupplyProfileTopResource.contains(profileKey))
+                marketTopResources.put(profileKey, marketSupplyProfileTopResource.get(profileKey));
+            if (marketSupplyProfileTopType.contains(profileKey))
+                marketTopTypes.put(profileKey, marketSupplyProfileTopType.get(profileKey));
+        }
+    }
+
+    Vector<DemandStateSimulationResult> demandResults;
+
+    for (int profileIndex = 0; profileIndex < profiles.size(); ++profileIndex) {
+        DemandProfileDefinition profile = profiles.get(profileIndex);
+        bool profileEnabled = !demandStateSimulationProfileEnabled.contains(profile.key) ||
+            demandStateSimulationProfileEnabled.get(profile.key) != 0;
+
+        if (!profileEnabled)
+            continue;
+
+        DemandStateSimulationResult demandResult;
+        demandResult.profileKey = profile.key;
+        demandResult.desiredReserve = demandStateSimulationDesiredReserve.contains(profile.key) ?
+            static_cast<uint64>(demandStateSimulationDesiredReserve.get(profile.key)) : 0;
+        demandResult.aiConceptualSupply = estimateConceptualDemandStateSupply(
+            profile.key,
+            conceptualResourceNames,
+            conceptualAmounts,
+            demandResult.supplyConfidence,
+            demandResult.supplyLabels);
+        demandResult.marketObservedSupply = marketQuantities.contains(profile.key) ?
+            marketQuantities.get(profile.key) : 0;
+        demandResult.marketListingsMatched = marketListings.contains(profile.key) ?
+            marketListings.get(profile.key) : 0;
+        demandResult.marketCheapestPricePerUnit =
+            marketCheapestPrices.contains(profile.key) ?
+            marketCheapestPrices.get(profile.key) : -1.f;
+        demandResult.marketMedianPricePerUnit =
+            marketMedianPrices.contains(profile.key) ?
+            marketMedianPrices.get(profile.key) : -1.f;
+        demandResult.marketSupplyConfidence = marketConfidences.contains(profile.key) ?
+            marketConfidences.get(profile.key) : "none";
+        demandResult.marketTopResource = marketTopResources.contains(profile.key) ?
+            marketTopResources.get(profile.key) : "";
+        demandResult.marketTopType = marketTopTypes.contains(profile.key) ?
+            marketTopTypes.get(profile.key) : "";
+        demandResult.supplyConfidence = combineSupplyConfidence(
+            demandResult.supplyConfidence,
+            demandResult.marketSupplyConfidence);
+
+        if (persistentStockpileDemandEnabled) {
+            demandResult.persistentStockpileMode =
+                persistentStockpileDemandIncludeConceptualMinerLots ?
+                String("startup_baseline_only") : String("disabled");
+            demandResult.persistentStockpileStatus = persistentStockpileStatus;
+
+            if (persistentStockpileDemandIncludeConceptualMinerLots &&
+                    persistentStockpileStatus == "ready") {
+                demandResult.persistentStockpileSupply =
+                    estimatePersistentConceptualDemandStateSupply(
+                        profile.key,
+                        persistentConceptualTotals,
+                        demandResult.persistentStockpileLotsMatched,
+                        demandResult.persistentStockpileConfidence,
+                        demandResult.persistentStockpileLabels);
+                demandResult.persistentStockpileQuantityMatched =
+                    demandResult.persistentStockpileSupply;
+                demandResult.supplyConfidence = combineSupplyConfidence(
+                    demandResult.supplyConfidence,
+                    demandResult.persistentStockpileConfidence);
+            }
+        }
+
+        float lowThreshold = demandStateSimulationLowStockThreshold.contains(profile.key) ?
+            demandStateSimulationLowStockThreshold.get(profile.key) : 0.35f;
+        float criticalThreshold = demandStateSimulationCriticalStockThreshold.contains(profile.key) ?
+            demandStateSimulationCriticalStockThreshold.get(profile.key) : 0.10f;
+
+        demandResult.activeProfileAvailableForPhase =
+            demandProfileActiveForPhase(profile, demandProfileSimulationServerPhase);
+
+        if (activeSnapshotAvailable && demandResult.activeProfileAvailableForPhase) {
+            for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
+                ResourceIntelligenceEntry entry = entries.get(entryIndex);
+                DemandProfileMatch match =
+                    evaluateDemandProfileResource(entry, profile, 1.f, 100);
+
+                if (!match.eligible ||
+                        (demandResult.hasActiveOpportunity &&
+                         match.demandScore <= demandResult.activeMatch.demandScore)) {
+                    continue;
+                }
+
+                demandResult.hasActiveOpportunity = true;
+                demandResult.activeResource = entry;
+                demandResult.activeMatch = match;
+            }
+        }
+
+        calculateDemandStatePressure(
+            demandResult,
+            lowThreshold,
+            criticalThreshold,
+            demandStateSimulationShortageWeight,
+            demandStateSimulationActiveOpportunityWeight,
+            demandStateSimulationSurplusDampening);
+
+        demandResults.add(demandResult);
+    }
+
+    for (int i = 0; i < demandResults.size(); ++i) {
+        for (int j = i + 1; j < demandResults.size(); ++j) {
+            if (demandResults.get(j).pressureScore <= demandResults.get(i).pressureScore)
+                continue;
+
+            DemandStateSimulationResult swap = demandResults.get(i);
+            demandResults.set(i, demandResults.get(j));
+            demandResults.set(j, swap);
+        }
+    }
+
+    JSONSerializationType demandRows = JSONSerializationType::array();
+
+    for (int i = 0; i < demandResults.size(); ++i) {
+        DemandStateSimulationResult demandResult = demandResults.get(i);
+        String stateGroup = demandResult.state;
+
+        if (demandResult.state == "critical" || demandResult.state == "low")
+            stateGroup = "shortage";
+        else if (demandResult.state == "disabledReserve")
+            stateGroup = "disabled";
+
+        JSONSerializationType row = JSONSerializationType::object();
+        row["profile"] = demandResult.profileKey;
+        row["state"] = demandResult.state;
+        row["stateGroup"] = stateGroup;
+        row["desiredReserve"] = demandResult.desiredReserve;
+        row["knownSupply"] = demandResult.totalKnownSupply;
+        row["aiConceptualSupply"] = demandResult.aiConceptualSupply;
+        row["persistentStockpileSupply"] = demandResult.persistentStockpileSupply;
+        row["marketObservedSupply"] = demandResult.marketObservedSupply;
+        row["shortageUnits"] = demandResult.shortageUnits;
+        row["surplusUnits"] = demandResult.surplusUnits;
+        row["reserveRatio"] = Math::getPrecision(demandResult.reserveRatio, 3);
+        row["pressureScore"] = Math::getPrecision(demandResult.pressureScore, 1);
+        row["supplyConfidence"] = demandResult.supplyConfidence;
+        row["supplyLabels"] = demandResult.supplyLabels;
+        row["activeProfileAvailableForPhase"] =
+            demandResult.activeProfileAvailableForPhase;
+
+        JSONSerializationType opportunity = JSONSerializationType::object();
+        opportunity["available"] = demandResult.hasActiveOpportunity;
+
+        if (demandResult.hasActiveOpportunity) {
+            opportunity["resourceName"] = demandResult.activeResource.name;
+            opportunity["resourceType"] = demandResult.activeResource.type;
+            opportunity["zones"] = demandResult.activeResource.zones;
+            opportunity["demandScore"] = demandResult.activeMatch.demandScore;
+            opportunity["matchedType"] = demandResult.activeMatch.matchedType;
+            opportunity["oq"] = demandResult.activeResource.oq;
+            opportunity["cd"] = demandResult.activeResource.cd;
+            opportunity["dr"] = demandResult.activeResource.dr;
+            opportunity["ma"] = demandResult.activeResource.ma;
+            opportunity["pe"] = demandResult.activeResource.pe;
+        } else if (!activeSnapshotAvailable) {
+            opportunity["reason"] = snapshotError;
+        } else if (!demandResult.activeProfileAvailableForPhase) {
+            opportunity["reason"] = "profile_inactive_for_phase";
+        } else {
+            opportunity["reason"] = "no_eligible_active_resource";
+        }
+
+        row["activeOpportunityResource"] = opportunity;
+        demandRows.push_back(row);
+    }
+
+    JSONSerializationType demand = JSONSerializationType::object();
+    demand["enabled"] = demandStateSimulationEnabled;
+    demand["supplyMode"] = demandStateSimulationSupplyMode;
+    demand["serverPhase"] = demandProfileSimulationServerPhase;
+    demand["activeResourceSnapshotAvailable"] = activeSnapshotAvailable;
+    demand["activeResourceSnapshotError"] = snapshotError;
+    demand["profiles"] = demandRows;
+    result["demand"] = demand;
+
+    JSONSerializationType safety = JSONSerializationType::object();
+    safety["realResourceCreation"] = "no";
+    safety["realResourceCreationEnabled"] = false;
+    safety["resourceContainerCreation"] = "no";
+    safety["resourceContainerCreationEnabled"] = false;
+    safety["marketMutation"] = "no";
+    safety["marketMutationEnabled"] = false;
+    safety["inventoryMutation"] = "no";
+    safety["inventoryMutationEnabled"] = false;
+    result["safetyBoundaries"] = safety;
+
+    return result;
 }
 
 void SimPlayerManager::logConceptualMinerSummary() {
@@ -4304,6 +5217,173 @@ void SimPlayerManager::applyDemandWeightedMinerPlanDependencyConfig(
     marketSupplyConfig.pop();
 }
 
+void SimPlayerManager::applyMinerIntelligentTargetingConfig(
+        LuaObject& targetingConfig) {
+    minerIntelligentTargetingEnabled =
+        targetingConfig.getBooleanField(
+            "enabled", minerIntelligentTargetingEnabled);
+    minerIntelligentTargetingIntervalSeconds = clampMinerInt(
+        targetingConfig.getIntField("intervalSeconds"),
+        minerIntelligentTargetingIntervalSeconds, 30, 3600);
+    minerIntelligentTargetingMaxActiveMiners = clampMinerInt(
+        targetingConfig.getIntField("maxActiveMiners"),
+        minerIntelligentTargetingMaxActiveMiners, 1, 100);
+    minerIntelligentTargetingRequireDemandWeightedPlan =
+        targetingConfig.getBooleanField(
+            "requireDemandWeightedPlan",
+            minerIntelligentTargetingRequireDemandWeightedPlan);
+    minerIntelligentTargetingRequireAcceptedDensityTarget =
+        targetingConfig.getBooleanField(
+            "requireAcceptedDensityTarget",
+            minerIntelligentTargetingRequireAcceptedDensityTarget);
+    minerIntelligentTargetingRequireValidPath =
+        targetingConfig.getBooleanField(
+            "requireValidPath",
+            minerIntelligentTargetingRequireValidPath);
+    minerIntelligentTargetingFallbackToConceptualLoop =
+        targetingConfig.getBooleanField(
+            "fallbackToConceptualLoop",
+            minerIntelligentTargetingFallbackToConceptualLoop);
+    minerIntelligentTargetingRollbackOnFailureCount = clampMinerInt(
+        targetingConfig.getIntField("rollbackOnFailureCount"),
+        minerIntelligentTargetingRollbackOnFailureCount, 1, 100);
+	minerIntelligentTargetingLogDecisionSummary =
+		targetingConfig.getBooleanField(
+			"logDecisionSummary",
+			minerIntelligentTargetingLogDecisionSummary);
+	minerIntelligentTargetingLogVerboseSwitchDecisions =
+		targetingConfig.getBooleanField(
+			"logVerboseSwitchDecisions",
+			minerIntelligentTargetingLogVerboseSwitchDecisions);
+
+    LuaObject assignmentConfig = targetingConfig.getObjectField("assignmentConfig");
+
+    if (assignmentConfig.isValidTable()) {
+        minerIntelligentTargetingAssignmentEnabled =
+            assignmentConfig.getBooleanField(
+                "enabled",
+                minerIntelligentTargetingAssignmentEnabled);
+        minerIntelligentTargetingAssignmentTtlSeconds = clampMinerInt(
+            assignmentConfig.getIntField("ttlSeconds"),
+            minerIntelligentTargetingAssignmentTtlSeconds, 5, 600);
+        minerIntelligentTargetingAssignmentReplaceOnlyWhenExpiredOrInvalid =
+            assignmentConfig.getBooleanField(
+                "replaceOnlyWhenExpiredOrInvalid",
+                minerIntelligentTargetingAssignmentReplaceOnlyWhenExpiredOrInvalid);
+        minerIntelligentTargetingAssignmentClearOnSampleComplete =
+            assignmentConfig.getBooleanField(
+                "clearOnSampleComplete",
+                minerIntelligentTargetingAssignmentClearOnSampleComplete);
+        minerIntelligentTargetingAssignmentClearOnCombat =
+            assignmentConfig.getBooleanField(
+                "clearOnCombat",
+                minerIntelligentTargetingAssignmentClearOnCombat);
+        minerIntelligentTargetingAssignmentClearOnIncapOrDeath =
+            assignmentConfig.getBooleanField(
+                "clearOnIncapOrDeath",
+                minerIntelligentTargetingAssignmentClearOnIncapOrDeath);
+        minerIntelligentTargetingAssignmentClearOnZoneChange =
+            assignmentConfig.getBooleanField(
+                "clearOnZoneChange",
+                minerIntelligentTargetingAssignmentClearOnZoneChange);
+		minerIntelligentTargetingAssignmentLogLifecycle =
+			assignmentConfig.getBooleanField(
+				"logAssignmentLifecycle",
+				minerIntelligentTargetingAssignmentLogLifecycle);
+		minerIntelligentTargetingAssignmentLogRetained =
+			assignmentConfig.getBooleanField(
+				"logRetainedAssignments",
+				minerIntelligentTargetingAssignmentLogRetained);
+	}
+
+    assignmentConfig.pop();
+
+    LuaObject limitedActivationConfig =
+        targetingConfig.getObjectField("limitedActivationConfig");
+
+    if (limitedActivationConfig.isValidTable()) {
+        minerIntelligentTargetingLimitedActivationEnabled =
+            limitedActivationConfig.getBooleanField(
+                "enabled",
+                minerIntelligentTargetingLimitedActivationEnabled);
+        minerIntelligentTargetingLimitedMaxActivationsPerInterval = clampMinerInt(
+            limitedActivationConfig.getIntField("maxActivationsPerInterval"),
+            minerIntelligentTargetingLimitedMaxActivationsPerInterval, 1, 10);
+        minerIntelligentTargetingLimitedMaxActiveIntelligentMiners = clampMinerInt(
+            limitedActivationConfig.getIntField("maxActiveIntelligentMiners"),
+            minerIntelligentTargetingLimitedMaxActiveIntelligentMiners, 1, 100);
+        minerIntelligentTargetingLimitedCooldownSecondsPerMiner = clampMinerInt(
+            limitedActivationConfig.getIntField("cooldownSecondsPerMiner"),
+            minerIntelligentTargetingLimitedCooldownSecondsPerMiner, 0, 3600);
+        minerIntelligentTargetingLimitedRequireSamePlanet =
+            limitedActivationConfig.getBooleanField(
+                "requireSamePlanet",
+                minerIntelligentTargetingLimitedRequireSamePlanet);
+        minerIntelligentTargetingLimitedDisableOnFirstFailure =
+            limitedActivationConfig.getBooleanField(
+                "disableOnFirstActivationFailure",
+                minerIntelligentTargetingLimitedDisableOnFirstFailure);
+        minerIntelligentTargetingLimitedDisableOnActivationFailure =
+            limitedActivationConfig.getBooleanField(
+                "disableOnActivationFailure",
+                minerIntelligentTargetingLimitedDisableOnActivationFailure);
+        minerIntelligentTargetingLimitedLogActivationLifecycle =
+            limitedActivationConfig.getBooleanField(
+                "logActivationLifecycle",
+                minerIntelligentTargetingLimitedLogActivationLifecycle);
+        minerIntelligentTargetingLimitedLogHealthSummary =
+            limitedActivationConfig.getBooleanField(
+                "logHealthSummary",
+                minerIntelligentTargetingLimitedLogHealthSummary);
+
+        LuaObject allowedZones = limitedActivationConfig.getObjectField("allowedZones");
+
+        if (allowedZones.isValidTable()) {
+            minerIntelligentTargetingLimitedAllowedZones.removeAll();
+            int allowedZoneCount = allowedZones.getTableSize();
+
+            for (int zoneIndex = 1; zoneIndex <= allowedZoneCount; ++zoneIndex) {
+                String zoneName = allowedZones.getStringAt(zoneIndex);
+
+                if (!zoneName.isEmpty())
+                    minerIntelligentTargetingLimitedAllowedZones.add(zoneName);
+            }
+        }
+
+        allowedZones.pop();
+    }
+
+    limitedActivationConfig.pop();
+
+    String mode = targetingConfig.getStringField("mode");
+
+	if (mode == "shadow" || mode == "limited") {
+		minerIntelligentTargetingMode = mode;
+	} else if (mode == "soak") {
+		// Soak is an operator recipe for limited mode with conservative caps,
+		// health summaries, cooldowns, and emergency-stop controls enabled.
+		minerIntelligentTargetingMode = "limited";
+	} else {
+		minerIntelligentTargetingMode = "off";
+		minerIntelligentTargetingEnabled = false;
+	}
+
+    if (minerIntelligentTargetingMode != "limited" ||
+            !minerIntelligentTargetingLimitedActivationEnabled ||
+            !minerIntelligentTargetingLimitedDisableOnActivationFailure) {
+        minerIntelligentTargetingLimitedEmergencyDisabled = false;
+    }
+
+    if (minerIntelligentTargetingRequireValidPath) {
+        int minimumUsefulTtl =
+            minerIntelligentTargetingIntervalSeconds +
+            minerPathValidationSimulationIntervalSeconds + 5;
+
+        if (minerIntelligentTargetingAssignmentTtlSeconds < minimumUsefulTtl)
+            minerIntelligentTargetingAssignmentTtlSeconds = minimumUsefulTtl;
+    }
+}
+
 void SimPlayerManager::scheduleDemandWeightedMinerPlanSimulationTask() {
     if (!enabled || !demandWeightedMinerPlanSimulationEnabled ||
             demandWeightedMinerPlanSimulationTaskScheduled)
@@ -4986,6 +6066,1344 @@ void SimPlayerManager::logDemandWeightedMinerPlanSimulations() {
             String(" rejectedProfiles=\"") +
                 profileRejectionSummary + "\"") +
          " mode=simulation-only", true);
+}
+
+void SimPlayerManager::scheduleMinerIntelligentTargetingTask() {
+    if (!enabled || !minerIntelligentTargetingEnabled ||
+            (minerIntelligentTargetingMode != "shadow" &&
+             minerIntelligentTargetingMode != "limited") ||
+            minerIntelligentTargetingTaskScheduled)
+        return;
+
+    minerIntelligentTargetingTaskScheduled = true;
+
+    Reference<MinerIntelligentTargetingTask*> task =
+        new MinerIntelligentTargetingTask();
+    task->schedule(minerIntelligentTargetingIntervalSeconds * 1000);
+}
+
+void SimPlayerManager::runMinerIntelligentTargetingTask() {
+    minerIntelligentTargetingTaskScheduled = false;
+
+    if (!enabled)
+        return;
+
+    refreshMinerIntelligentTargetingConfig();
+
+    if (!minerIntelligentTargetingEnabled ||
+            (minerIntelligentTargetingMode != "shadow" &&
+             minerIntelligentTargetingMode != "limited"))
+        return;
+
+    logMinerIntelligentTargetingDecisions();
+    scheduleMinerIntelligentTargetingTask();
+}
+
+void SimPlayerManager::refreshMinerIntelligentTargetingConfig() {
+    Lua configLua;
+    configLua.init();
+
+    try {
+        configLua.runFile("scripts/managers/sim_player_manager.lua");
+    } catch (Exception& e) {
+        minerIntelligentTargetingEnabled = false;
+        minerIntelligentTargetingMode = "off";
+        warning(String("MinerTargetingSwitchDecision configReloadFailed=true reason=\"") +
+            e.getMessage() + "\" mode=off diagnosticOnly=true");
+        return;
+    }
+
+    LuaObject managerConfig =
+        configLua.getGlobalObject("SimPlayerManagerConfig");
+
+    if (!managerConfig.isValidTable() ||
+            !managerConfig.getBooleanField("enabled", false)) {
+        minerIntelligentTargetingEnabled = false;
+        minerIntelligentTargetingMode = "off";
+        managerConfig.pop();
+        return;
+    }
+
+    LuaObject demandWeightedConfig =
+        managerConfig.getObjectField("demandWeightedMinerPlanSimulationConfig");
+
+    if (demandWeightedConfig.isValidTable())
+        applyDemandWeightedMinerPlanSimulationConfig(demandWeightedConfig);
+
+    demandWeightedConfig.pop();
+    applyDemandWeightedMinerPlanDependencyConfig(managerConfig);
+
+    LuaObject targetingConfig =
+        managerConfig.getObjectField("minerIntelligentTargetingConfig");
+
+    if (!targetingConfig.isValidTable()) {
+        minerIntelligentTargetingEnabled = false;
+        minerIntelligentTargetingMode = "off";
+        targetingConfig.pop();
+        managerConfig.pop();
+        return;
+    }
+
+    applyMinerIntelligentTargetingConfig(targetingConfig);
+
+    targetingConfig.pop();
+    managerConfig.pop();
+}
+
+bool SimPlayerManager::getMinerIntelligentTargetAssignment(
+        uint64 minerID, MinerIntelligentTargetAssignment& assignment) {
+    if (minerID == 0)
+        return false;
+
+    Locker locker(&minerIntelligentTargetingAssignmentMutex);
+
+    if (!minerIntelligentTargetAssignments.contains(minerID))
+        return false;
+
+    assignment = minerIntelligentTargetAssignments.get(minerID);
+    return assignment.isValid();
+}
+
+void SimPlayerManager::putMinerIntelligentTargetAssignment(
+        const MinerIntelligentTargetAssignment& assignment) {
+    if (!assignment.isValid())
+        return;
+
+    Locker locker(&minerIntelligentTargetingAssignmentMutex);
+    minerIntelligentTargetAssignments.put(assignment.minerID, assignment);
+}
+
+bool SimPlayerManager::isMinerIntelligentTargetZoneAllowed(const String& zoneName) {
+    if (minerIntelligentTargetingLimitedAllowedZones.size() == 0)
+        return true;
+
+    for (int i = 0; i < minerIntelligentTargetingLimitedAllowedZones.size(); ++i) {
+        if (minerIntelligentTargetingLimitedAllowedZones.get(i) == zoneName)
+            return true;
+    }
+
+    return false;
+}
+
+bool SimPlayerManager::isMinerIntelligentAssignmentActive(
+        const MinerIntelligentTargetAssignment& assignment) {
+    return assignment.status == "queued" ||
+        assignment.status == "activation_started" ||
+        assignment.status == "sample_started";
+}
+
+int SimPlayerManager::countActiveMinerIntelligentAssignments() {
+    int activeCount = 0;
+    uint64 now = System::getMiliTime();
+
+    Locker locker(&minerIntelligentTargetingAssignmentMutex);
+
+    for (int i = 0; i < minerIntelligentTargetAssignments.size(); ++i) {
+        MinerIntelligentTargetAssignment assignment =
+            minerIntelligentTargetAssignments.elementAt(i).getValue();
+
+        if (assignment.expiresAtMs > 0 && now > assignment.expiresAtMs)
+            continue;
+
+        if (isMinerIntelligentAssignmentActive(assignment))
+            activeCount++;
+    }
+
+    return activeCount;
+}
+
+bool SimPlayerManager::isMinerIntelligentActivationOnCooldown(
+        uint64 minerID, uint64 nowMs) {
+    if (minerID == 0 || minerIntelligentTargetingLimitedCooldownSecondsPerMiner <= 0)
+        return false;
+
+    Locker locker(&minerIntelligentTargetingCooldownMutex);
+
+    if (!minerIntelligentTargetingLastActivationMs.contains(minerID))
+        return false;
+
+    uint64 lastActivationMs = minerIntelligentTargetingLastActivationMs.get(minerID);
+    uint64 cooldownMs =
+        static_cast<uint64>(minerIntelligentTargetingLimitedCooldownSecondsPerMiner) * 1000;
+
+    return lastActivationMs > 0 && nowMs < lastActivationMs + cooldownMs;
+}
+
+void SimPlayerManager::rememberMinerIntelligentActivation(uint64 minerID, uint64 nowMs) {
+    if (minerID == 0)
+        return;
+
+    Locker locker(&minerIntelligentTargetingCooldownMutex);
+    minerIntelligentTargetingLastActivationMs.put(minerID, nowMs);
+}
+
+void SimPlayerManager::recordMinerIntelligentActivationHealthEvent(
+        const String& eventName) {
+    Locker locker(&minerIntelligentTargetingHealthMutex);
+
+    if (eventName == "attempted") {
+        minerIntelligentActivationHealthAttempts++;
+    } else if (eventName == "started") {
+        minerIntelligentActivationHealthStarted++;
+    } else if (eventName == "arrival") {
+        minerIntelligentActivationHealthArrivals++;
+    } else if (eventName == "sampleFinished") {
+        minerIntelligentActivationHealthSamplesCompleted++;
+    } else if (eventName == "pathFailed") {
+        minerIntelligentActivationHealthPathFailures++;
+    } else if (eventName == "expired") {
+        minerIntelligentActivationHealthExpired++;
+    } else if (eventName == "cooldownSkip") {
+        minerIntelligentActivationHealthCooldownSkips++;
+    } else if (eventName == "activeCapSkip") {
+        minerIntelligentActivationHealthActiveCapSkips++;
+    } else if (eventName == "zoneSkip") {
+        minerIntelligentActivationHealthZoneSkips++;
+    }
+}
+
+void SimPlayerManager::snapshotAndResetMinerIntelligentActivationHealth(
+        int& attempts, int& started, int& arrivals, int& samplesCompleted,
+        int& pathFailures, int& expired, int& cooldownSkips,
+        int& activeCapSkips, int& zoneSkips) {
+    Locker locker(&minerIntelligentTargetingHealthMutex);
+
+    attempts = minerIntelligentActivationHealthAttempts;
+    started = minerIntelligentActivationHealthStarted;
+    arrivals = minerIntelligentActivationHealthArrivals;
+    samplesCompleted = minerIntelligentActivationHealthSamplesCompleted;
+    pathFailures = minerIntelligentActivationHealthPathFailures;
+    expired = minerIntelligentActivationHealthExpired;
+    cooldownSkips = minerIntelligentActivationHealthCooldownSkips;
+    activeCapSkips = minerIntelligentActivationHealthActiveCapSkips;
+    zoneSkips = minerIntelligentActivationHealthZoneSkips;
+
+    minerIntelligentActivationHealthAttempts = 0;
+    minerIntelligentActivationHealthStarted = 0;
+    minerIntelligentActivationHealthArrivals = 0;
+    minerIntelligentActivationHealthSamplesCompleted = 0;
+    minerIntelligentActivationHealthPathFailures = 0;
+    minerIntelligentActivationHealthExpired = 0;
+    minerIntelligentActivationHealthCooldownSkips = 0;
+    minerIntelligentActivationHealthActiveCapSkips = 0;
+    minerIntelligentActivationHealthZoneSkips = 0;
+}
+
+void SimPlayerManager::recordMinerIntelligentTargetAssignmentLifecycle(
+        uint64 minerID, const String& eventName, const String& detail) {
+    if (minerID == 0 || !minerIntelligentTargetingAssignmentEnabled)
+        return;
+
+    uint64 now = System::getMiliTime();
+
+    Locker locker(&minerIntelligentTargetingAssignmentMutex);
+
+    if (!minerIntelligentTargetAssignments.contains(minerID))
+        return;
+
+    MinerIntelligentTargetAssignment assignment =
+        minerIntelligentTargetAssignments.get(minerID);
+    assignment.updatedAtMs = now;
+
+    if (eventName == "queued") {
+        if (assignment.queuedAtMs == 0)
+            assignment.queuedAtMs = now;
+
+        assignment.status = "queued";
+        assignment.lastActivationResult =
+            detail.isEmpty() ? String("queued") : detail;
+    } else if (eventName == "activationStarted") {
+        if (assignment.activatedAtMs == 0)
+            assignment.activatedAtMs = now;
+
+        assignment.status = "activation_started";
+        assignment.lastActivationResult =
+            detail.isEmpty() ? String("started") : detail;
+        recordMinerIntelligentActivationHealthEvent("started");
+    } else if (eventName == "sampleStarted") {
+        if (assignment.sampleStartedAtMs == 0)
+            assignment.sampleStartedAtMs = now;
+
+        assignment.status = "sample_started";
+        recordMinerIntelligentActivationHealthEvent("arrival");
+    } else if (eventName == "sampleFinished") {
+        if (assignment.sampleFinishedAtMs == 0)
+            assignment.sampleFinishedAtMs = now;
+
+        assignment.status = "sample_finished";
+        recordMinerIntelligentActivationHealthEvent("sampleFinished");
+    } else if (eventName == "failed") {
+        assignment.status = "failed";
+        assignment.lastFailureReason =
+            detail.isEmpty() ? String("unknown") : detail;
+
+        if (detail == "pathFailed")
+            recordMinerIntelligentActivationHealthEvent("pathFailed");
+    }
+
+    minerIntelligentTargetAssignments.put(minerID, assignment);
+}
+
+void SimPlayerManager::clearMinerIntelligentTargetAssignment(
+        uint64 minerID, const String& reason, const String& mode) {
+    if (minerID == 0)
+        return;
+
+    MinerIntelligentTargetAssignment previous;
+    bool hadAssignment = false;
+
+    {
+        Locker locker(&minerIntelligentTargetingAssignmentMutex);
+
+        if (minerIntelligentTargetAssignments.contains(minerID)) {
+            previous = minerIntelligentTargetAssignments.get(minerID);
+            minerIntelligentTargetAssignments.drop(minerID);
+            hadAssignment = true;
+        }
+    }
+
+    if (hadAssignment && (reason == "expired" || reason == "assignmentExpired"))
+        recordMinerIntelligentActivationHealthEvent("expired");
+
+    if (hadAssignment && minerIntelligentTargetingAssignmentLogLifecycle) {
+        uint64 now = System::getMiliTime();
+        uint64 ageSeconds = previous.createdAtMs > 0 && now > previous.createdAtMs ?
+            (now - previous.createdAtMs) / 1000 : 0;
+        String validatedAge = "not_set";
+        String queuedAge = "not_set";
+        String activatedAge = "not_set";
+        String sampleStartedAge = "not_set";
+        String sampleFinishedAge = "not_set";
+
+        if (previous.createdAtMs > 0) {
+            if (previous.validatedAtMs > previous.createdAtMs)
+                validatedAge =
+                    String::valueOf((previous.validatedAtMs - previous.createdAtMs) / 1000);
+
+            if (previous.queuedAtMs > previous.createdAtMs)
+                queuedAge =
+                    String::valueOf((previous.queuedAtMs - previous.createdAtMs) / 1000);
+
+            if (previous.activatedAtMs > previous.createdAtMs)
+                activatedAge =
+                    String::valueOf((previous.activatedAtMs - previous.createdAtMs) / 1000);
+
+            if (previous.sampleStartedAtMs > previous.createdAtMs)
+                sampleStartedAge =
+                    String::valueOf((previous.sampleStartedAtMs - previous.createdAtMs) / 1000);
+
+            if (previous.sampleFinishedAtMs > previous.createdAtMs)
+                sampleFinishedAge =
+                    String::valueOf((previous.sampleFinishedAtMs - previous.createdAtMs) / 1000);
+        }
+
+        info(String("MinerIntelligentTargetAssignment miner=") +
+             String::valueOf(minerID) +
+             " action=cleared" +
+             " clearReason=" + reason +
+             " selectedProfile=" +
+                (previous.selectedProfileKey.isEmpty() ?
+                    String("none") : previous.selectedProfileKey) +
+             " targetResource=" +
+                (previous.targetResourceName.isEmpty() ?
+                    String("none") : previous.targetResourceName) +
+             " ageSeconds=" + String::valueOf(ageSeconds) +
+             " validatedAgeSeconds=" + validatedAge +
+             " queuedAgeSeconds=" + queuedAge +
+             " activatedAgeSeconds=" + activatedAge +
+             " sampleStartedAgeSeconds=" + sampleStartedAge +
+             " sampleFinishedAgeSeconds=" + sampleFinishedAge +
+             " pathValidationStatus=" +
+                (previous.pathValidationStatus.isEmpty() ?
+                    String("none") : previous.pathValidationStatus) +
+             " pathTrustStatus=" +
+                (previous.pathValidationTrustStatus.isEmpty() ?
+                    String("none") : previous.pathValidationTrustStatus) +
+             " lastActivationResult=" +
+                (previous.lastActivationResult.isEmpty() ?
+                    String("none") : previous.lastActivationResult) +
+             " lastFailureReason=" +
+                (previous.lastFailureReason.isEmpty() ?
+                    String("none") : previous.lastFailureReason) +
+             " mode=" + mode, true);
+    }
+}
+
+void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
+    Vector<MinerIntelligentTargetingMinerSnapshot> miners;
+    int controllerCount = controllers.size();
+
+    for (int controllerIndex = 0; controllerIndex < controllerCount; ++controllerIndex) {
+        uint64 controllerKey = controllers.getKey(controllerIndex);
+        Reference<SimPlayerController*> ctrl = controllers.get(controllerKey);
+
+        if (ctrl == nullptr || dynamic_cast<SimMinerController*>(ctrl.get()) == nullptr)
+            continue;
+
+        ManagedReference<AiAgent*> agent = ctrl->getAgent();
+
+        if (agent == nullptr)
+            continue;
+
+        MinerIntelligentTargetingMinerSnapshot miner;
+
+        {
+            Locker agentLocker(agent);
+            miner.zone = agent->getZone();
+
+            if (miner.zone != nullptr) {
+                miner.objectID = agent->getObjectID();
+                miner.zoneName = miner.zone->getZoneName();
+                miner.position = agent->getWorldPosition();
+                miner.inNavmesh = agent->isInNavMesh();
+                miner.dead = agent->isDead();
+                miner.incapacitated = agent->isIncapacitated();
+                miner.inCombat = agent->isInCombat();
+            }
+        }
+
+        if (miner.isValid())
+            miners.add(miner);
+    }
+
+    if (miners.size() == 0)
+        return;
+
+    for (int i = 0; i < miners.size(); ++i) {
+        for (int j = i + 1; j < miners.size(); ++j) {
+            if (miners.get(j).objectID >= miners.get(i).objectID)
+                continue;
+
+            MinerIntelligentTargetingMinerSnapshot swap = miners.get(i);
+            miners.set(i, miners.get(j));
+            miners.set(j, swap);
+        }
+    }
+
+    int evaluatedLimit = miners.size();
+
+    if (evaluatedLimit > minerIntelligentTargetingMaxActiveMiners)
+        evaluatedLimit = minerIntelligentTargetingMaxActiveMiners;
+
+    Vector<String> conceptualResourceNames;
+    Vector<uint64> conceptualAmounts;
+    collectConceptualMinerTotals(conceptualResourceNames, conceptualAmounts);
+
+    Vector<ResourceIntelligenceEntry> entries;
+    String snapshotError;
+    bool resourceSnapshotAvailable =
+        collectResourceIntelligenceSnapshot(entries, snapshotError);
+    Vector<DemandProfileDefinition> profiles = createDemandProfileDefinitions();
+    VectorMap<String, uint64> marketQuantities;
+
+    if (demandWeightedMinerPlanSimulationIncludeMarketSupply) {
+        Locker marketSnapshotLocker(&marketSupplyObservationMutex);
+
+        for (int profileIndex = 0; profileIndex < profiles.size(); ++profileIndex) {
+            String profileKey = profiles.get(profileIndex).key;
+
+            if (marketSupplyProfileQuantities.contains(profileKey))
+                marketQuantities.put(
+                    profileKey, marketSupplyProfileQuantities.get(profileKey));
+        }
+    }
+
+    Vector<DemandStateSimulationResult> pressureResults;
+    int profilesDisabled = 0;
+    int profilesInactivePhase = 0;
+    int profilesBelowPressure = 0;
+    int profilesNoEligibleResource = 0;
+
+    if (resourceSnapshotAvailable && entries.size() > 0 &&
+            demandWeightedMinerPlanSimulationEnabled) {
+        buildDemandWeightedPressureResultsForMiners(
+            entries,
+            profiles,
+            conceptualResourceNames,
+            conceptualAmounts,
+            marketQuantities,
+            demandWeightedMinerPlanSimulationProfileEnabled,
+            demandWeightedMinerPlanSimulationDesiredReserve,
+            demandWeightedMinerPlanSimulationLowStockThreshold,
+            demandWeightedMinerPlanSimulationCriticalStockThreshold,
+            demandWeightedMinerPlanSimulationServerPhase,
+            demandWeightedMinerPlanSimulationShortageWeight,
+            demandWeightedMinerPlanSimulationActiveOpportunityWeight,
+            demandWeightedMinerPlanSimulationSurplusDampening,
+            demandWeightedMinerPlanSimulationMinimumPressureThreshold,
+            pressureResults,
+            profilesDisabled,
+            profilesInactivePhase,
+            profilesBelowPressure,
+            profilesNoEligibleResource);
+    }
+
+    VectorMap<String, int> assignmentsByProfile;
+    int wouldActivateCount = 0;
+    int fallbackCount = 0;
+    int noPlanCount = 0;
+    int noDensityTargetCount = 0;
+    int pathRejectedCount = 0;
+    int rollbackHeldCount = 0;
+	int actualActivationCount = 0;
+	int activationFallbackCount = 0;
+	int cappedCount = miners.size() - evaluatedLimit;
+	int activationControlledSkipCount = 0;
+	int assignmentMismatchCount = 0;
+	int pathTrustRejectedCount = 0;
+	int activeIntelligentMinerCount = countActiveMinerIntelligentAssignments();
+	bool activationDisabledForInterval = false;
+
+    for (int minerIndex = 0; minerIndex < evaluatedLimit; ++minerIndex) {
+        MinerIntelligentTargetingMinerSnapshot miner = miners.get(minerIndex);
+        DemandWeightedMinerCandidate selected;
+        ResourceIntelligenceEntry selectedResource;
+        DemandStateSimulationResult selectedResult;
+        String selectedProfileKey = "none";
+        String demandState = "none";
+        String targetResourceName = "none";
+        String targetResourceType = "none";
+        String targetSource = "none";
+        String fallbackReason = "none";
+        String densityTargetStatus = "not_checked";
+        String pathValidationStatus = "not_checked";
+        String pathRejectReason = "none";
+        String pathTrustStatus = "not_checked";
+        String assignmentReason = "none";
+        String assignmentStatus = "none";
+        String assignmentClearReason = "none";
+        uint64 assignmentAgeSeconds = 0;
+        bool assignmentMatchesValidation = false;
+        bool selectedSamePlanet = false;
+        bool acceptedDensityTarget = false;
+        bool pathValidationValid = false;
+        bool wouldActivate = false;
+		bool actualActivation = false;
+		bool hasSelectedPlan = false;
+		bool usedCachedAssignment = false;
+		bool activationControlledSkip = false;
+		bool activationFailedOrFallback = false;
+		String activationResult = "not_attempted";
+        MinerDensityTargetCandidate selectedDensityTarget;
+        MinerIntelligentTargetAssignment cachedAssignment;
+        uint64 nowMs = System::getMiliTime();
+
+        if (minerIntelligentTargetingAssignmentEnabled &&
+                getMinerIntelligentTargetAssignment(
+                    miner.objectID, cachedAssignment)) {
+            if (cachedAssignment.expiresAtMs > 0 &&
+                    nowMs > cachedAssignment.expiresAtMs) {
+                assignmentClearReason = "expired";
+                clearMinerIntelligentTargetAssignment(
+                    miner.objectID,
+                    assignmentClearReason,
+                    minerIntelligentTargetingMode);
+            } else if (minerIntelligentTargetingAssignmentClearOnZoneChange &&
+                    cachedAssignment.targetZoneName != miner.zoneName) {
+                assignmentClearReason = "zoneChanged";
+                clearMinerIntelligentTargetAssignment(
+                    miner.objectID,
+                    assignmentClearReason,
+                    minerIntelligentTargetingMode);
+            } else if (minerIntelligentTargetingAssignmentClearOnIncapOrDeath &&
+                    (miner.dead || miner.incapacitated)) {
+                assignmentClearReason = miner.dead ? "dead" : "incapacitated";
+                clearMinerIntelligentTargetAssignment(
+                    miner.objectID,
+                    assignmentClearReason,
+                    minerIntelligentTargetingMode);
+            } else if (minerIntelligentTargetingAssignmentClearOnCombat &&
+                    miner.inCombat) {
+                assignmentClearReason = "combat";
+                clearMinerIntelligentTargetAssignment(
+                    miner.objectID,
+                    assignmentClearReason,
+                    minerIntelligentTargetingMode);
+            } else {
+                usedCachedAssignment =
+                    minerIntelligentTargetingAssignmentReplaceOnlyWhenExpiredOrInvalid;
+            }
+        }
+
+        if (usedCachedAssignment) {
+			hasSelectedPlan = true;
+			selectedProfileKey = cachedAssignment.selectedProfileKey;
+			assignmentReason = cachedAssignment.assignmentReason.isEmpty() ?
+				String("retainedAssignment") :
+				cachedAssignment.assignmentReason;
+            demandState = cachedAssignment.demandState;
+            targetResourceName = cachedAssignment.targetResourceName;
+            targetResourceType = cachedAssignment.targetResourceType;
+            targetSource = cachedAssignment.targetSource;
+            selectedSamePlanet = cachedAssignment.targetZoneName == miner.zoneName;
+            acceptedDensityTarget =
+                cachedAssignment.densityTargetStatus == "accepted";
+            densityTargetStatus = cachedAssignment.densityTargetStatus;
+            pathTrustStatus = cachedAssignment.pathValidationTrustStatus.isEmpty() ?
+                String("not_checked") : cachedAssignment.pathValidationTrustStatus;
+            assignmentStatus = cachedAssignment.status.isEmpty() ?
+                String("candidate") : cachedAssignment.status;
+            assignmentAgeSeconds =
+                cachedAssignment.createdAtMs > 0 && nowMs > cachedAssignment.createdAtMs ?
+                (nowMs - cachedAssignment.createdAtMs) / 1000 : 0;
+            selectedResult.profileKey = cachedAssignment.selectedProfileKey;
+            selectedResult.state = cachedAssignment.demandState;
+            selectedResult.pressureScore = cachedAssignment.pressureScore;
+            selectedDensityTarget.x = cachedAssignment.targetX;
+            selectedDensityTarget.y = cachedAssignment.targetY;
+            selectedDensityTarget.z = cachedAssignment.targetZ;
+            selectedDensityTarget.density = cachedAssignment.targetDensity;
+            selectedDensityTarget.searchRadius = 1;
+        } else if (!demandWeightedMinerPlanSimulationEnabled) {
+            fallbackReason = "noDemandWeightedPlan";
+        } else if (!resourceSnapshotAvailable) {
+            fallbackReason = "resourceSnapshotUnavailable";
+        } else if (entries.size() == 0) {
+            fallbackReason = "noActiveResourceSnapshot";
+        } else if (pressureResults.size() == 0) {
+            if (profilesBelowPressure > 0) {
+                fallbackReason = "belowMinimumPressure";
+            } else if (profilesNoEligibleResource > 0) {
+                fallbackReason = "noEligibleActiveResource";
+            } else if (profilesInactivePhase > 0) {
+                fallbackReason = "inactiveServerPhase";
+            } else if (profilesDisabled > 0) {
+                fallbackReason = "disabledProfile";
+            } else {
+                fallbackReason = "noDemandWeightedPlan";
+            }
+        } else {
+            DemandWeightedPlanSelection demandSelection =
+                selectDemandWeightedMinerPlanForValidation(
+                    entries,
+                    profiles,
+                    pressureResults,
+                    assignmentsByProfile,
+                    miner.zoneName,
+                    demandWeightedMinerPlanSimulationSamePlanetBonus,
+                    demandWeightedMinerPlanSimulationTravelPenalty,
+                    demandWeightedMinerPlanSimulationMaxMinersPerProfile,
+                    demandWeightedMinerPlanSimulationStrongPressureRatio);
+
+            if (!demandSelection.valid) {
+                fallbackReason = "allCandidatesCappedWithoutStrongPressure";
+            } else {
+                selected = demandSelection.selected;
+                selectedResult = demandSelection.selectedResult;
+                selectedResource = demandSelection.selectedResource;
+                hasSelectedPlan = true;
+                selectedProfileKey = selectedResult.profileKey;
+                demandState = selectedResult.state;
+                targetResourceName = selectedResource.name;
+                targetResourceType = selectedResource.type;
+                selectedSamePlanet = selected.target.samePlanet;
+                targetSource = "demand_weighted_plan";
+                assignmentReason = demandSelection.assignmentReason;
+            }
+        }
+
+        if (hasSelectedPlan) {
+            if (!selectedSamePlanet) {
+                densityTargetStatus = "wrongPlanet";
+            } else if (!usedCachedAssignment) {
+                MinerDensityTargetCandidate densityTarget;
+                MinerDensityTargetDiagnostics densityDiagnostics;
+                acceptedDensityTarget = findMinerDensityTarget(
+                    miner.objectID,
+                    selectedResource,
+                    miner.zone,
+                    miner.position,
+                    minerDensityTargetSimulationSearchRadii,
+                    minerDensityTargetSimulationSamplesPerRadius,
+                    minerDensityTargetSimulationMinAcceptableDensity,
+                    minerDensityTargetSimulationRequireNavmesh,
+                    miner.inNavmesh,
+                    minerDensityTargetSimulationMaxPathCheckAttempts,
+                    minerDensityTargetSimulationDistancePenaltyPerMeter,
+                    densityTarget,
+                    densityDiagnostics);
+
+                densityTargetStatus = acceptedDensityTarget ?
+                    String("accepted") : densityDiagnostics.rejectReason;
+
+                if (acceptedDensityTarget)
+                    selectedDensityTarget = densityTarget;
+            }
+
+            if (!usedCachedAssignment && acceptedDensityTarget &&
+                    minerIntelligentTargetingAssignmentEnabled &&
+                    targetSource == "demand_weighted_plan") {
+                MinerIntelligentTargetAssignment assignment;
+                assignment.minerID = miner.objectID;
+                assignment.createdAtMs = nowMs;
+                assignment.updatedAtMs = nowMs;
+                assignment.expiresAtMs = nowMs +
+                    static_cast<uint64>(
+                        minerIntelligentTargetingAssignmentTtlSeconds) * 1000;
+                assignment.targetSource = targetSource;
+                assignment.selectedProfileKey = selectedProfileKey;
+                assignment.assignmentReason = assignmentReason;
+                assignment.demandState = demandState;
+                assignment.pressureScore = selectedResult.pressureScore;
+                assignment.targetResourceName = targetResourceName;
+                assignment.targetResourceType = targetResourceType;
+                assignment.targetZoneName = miner.zoneName;
+                assignment.targetX = selectedDensityTarget.x;
+                assignment.targetY = selectedDensityTarget.y;
+                assignment.targetZ = selectedDensityTarget.z;
+                assignment.targetDensity = selectedDensityTarget.density;
+                assignment.densityTargetStatus = densityTargetStatus;
+                assignment.pathValidationStatus = "not_checked";
+                assignment.pathValidationTrustStatus = "not_checked";
+                assignment.pathValidationMatched = false;
+                assignment.status = "candidate";
+                putMinerIntelligentTargetAssignment(assignment);
+
+                cachedAssignment = assignment;
+                usedCachedAssignment = true;
+                assignmentStatus = "candidate";
+                assignmentAgeSeconds = 0;
+
+                if (minerIntelligentTargetingAssignmentLogLifecycle) {
+                    info(String("MinerIntelligentTargetAssignment miner=") +
+                         String::valueOf(miner.objectID) +
+                         " action=created" +
+                         " targetSource=" + targetSource +
+                         " selectedProfile=" + selectedProfileKey +
+                         " targetResource=" + targetResourceName +
+                         " targetType=" + targetResourceType +
+                         " targetZone=" + miner.zoneName +
+                         " x=" +
+                            String::valueOf(Math::getPrecision(
+                                selectedDensityTarget.x, 1)) +
+                         " y=" +
+                            String::valueOf(Math::getPrecision(
+                                selectedDensityTarget.y, 1)) +
+                         " z=" +
+                            String::valueOf(Math::getPrecision(
+                                selectedDensityTarget.z, 1)) +
+                         " densityTargetStatus=" + densityTargetStatus +
+                         " pathValidationStatus=not_checked" +
+                         " pathTrustStatus=not_checked" +
+                         " ttlSeconds=" +
+                            String::valueOf(
+                                minerIntelligentTargetingAssignmentTtlSeconds) +
+                         " mode=" + minerIntelligentTargetingMode, true);
+                }
+			} else if (usedCachedAssignment &&
+					minerIntelligentTargetingAssignmentLogLifecycle) {
+				uint64 remainingSeconds =
+					cachedAssignment.expiresAtMs > nowMs ?
+					(cachedAssignment.expiresAtMs - nowMs) / 1000 : 0;
+				uint64 retainedNearExpirySeconds =
+					static_cast<uint64>(
+						minerIntelligentTargetingIntervalSeconds > 0 ?
+						minerIntelligentTargetingIntervalSeconds : 60);
+				bool retainedNearExpiry =
+					remainingSeconds <= retainedNearExpirySeconds;
+
+				if (minerIntelligentTargetingAssignmentLogRetained ||
+						retainedNearExpiry) {
+					info(String("MinerIntelligentTargetAssignment miner=") +
+						 String::valueOf(miner.objectID) +
+						 " action=retained" +
+						 " selectedProfile=" + selectedProfileKey +
+						 " targetResource=" + targetResourceName +
+						 " ageSeconds=" + String::valueOf(assignmentAgeSeconds) +
+						 " remainingSeconds=" +
+							String::valueOf(remainingSeconds) +
+						 " nearExpiry=" +
+							(retainedNearExpiry ? String("true") : String("false")) +
+						 " pathValidationStatus=" +
+							(cachedAssignment.pathValidationStatus.isEmpty() ?
+								String("not_checked") :
+								cachedAssignment.pathValidationStatus) +
+						 " pathTrustStatus=" +
+							(cachedAssignment.pathValidationTrustStatus.isEmpty() ?
+								String("not_checked") :
+								cachedAssignment.pathValidationTrustStatus) +
+						 " mode=" + minerIntelligentTargetingMode, true);
+				}
+			}
+
+            MinerPathValidationSnapshot pathSnapshot;
+
+            if (!minerIntelligentTargetingRequireValidPath) {
+                pathValidationStatus = "not_required";
+                pathTrustStatus = "not_required";
+                pathValidationValid = true;
+            } else if (getMinerPathValidationSnapshot(
+                    miner.objectID, pathSnapshot)) {
+                pathTrustStatus = pathSnapshot.pathTrustStatus.isEmpty() ?
+                    (pathSnapshot.pathFound ? String("verifiedPath") :
+                        (pathSnapshot.rejectReason.isEmpty() ?
+                            String("untrusted") : pathSnapshot.rejectReason)) :
+                    pathSnapshot.pathTrustStatus;
+                bool snapshotMatches =
+                    pathSnapshot.targetSource == "demand_weighted_plan" &&
+                    pathSnapshot.zoneName == miner.zoneName &&
+                    pathSnapshot.profileKey == selectedProfileKey &&
+                    pathSnapshot.resourceName == targetResourceName &&
+                    pathSnapshot.resourceType == targetResourceType;
+                bool snapshotCoordinateMatches = false;
+
+                if (snapshotMatches && selectedDensityTarget.isValid()) {
+                    float dx = pathSnapshot.targetX - selectedDensityTarget.x;
+                    float dy = pathSnapshot.targetY - selectedDensityTarget.y;
+                    float dz = pathSnapshot.targetZ - selectedDensityTarget.z;
+                    snapshotCoordinateMatches = (dx * dx + dy * dy + dz * dz) <= 4.f;
+                }
+
+                uint64 now = System::getMiliTime();
+                uint64 maxAgeMs =
+                    static_cast<uint64>(
+                        minerPathValidationSimulationIntervalSeconds > 0 ?
+                        minerPathValidationSimulationIntervalSeconds : 300) *
+                    3000;
+
+                if (!snapshotMatches) {
+                    pathValidationStatus = "target_mismatch";
+                    pathRejectReason = pathSnapshot.targetSource != "demand_weighted_plan" ?
+                        String("targetSourceMismatch") :
+                        (pathSnapshot.zoneName != miner.zoneName ?
+                            String("zoneMismatch") :
+                            String("profileResourceMismatch"));
+                    pathTrustStatus = pathRejectReason;
+                } else if (!snapshotCoordinateMatches) {
+                    pathValidationStatus = "target_mismatch";
+                    pathRejectReason = "densityTargetCoordinateMismatch";
+                    pathTrustStatus = pathRejectReason;
+                } else if (pathSnapshot.recordedAtMs > 0 &&
+                        now > pathSnapshot.recordedAtMs + maxAgeMs) {
+                    pathValidationStatus = "stale";
+                    pathRejectReason = "stalePathValidation";
+                    pathTrustStatus = pathRejectReason;
+                } else if (pathSnapshot.pathFound) {
+                    pathValidationStatus = "valid";
+                    pathValidationValid = true;
+                } else {
+                    pathValidationStatus = "failed";
+                    pathRejectReason = pathSnapshot.rejectReason;
+                    pathTrustStatus = pathSnapshot.pathTrustStatus.isEmpty() ?
+                        pathRejectReason : pathSnapshot.pathTrustStatus;
+                }
+            } else {
+                pathValidationStatus = "not_available";
+                pathTrustStatus = "not_available";
+                pathRejectReason = minerPathValidationSimulationEnabled ?
+                    String("noMatchingPathValidationSnapshot") :
+                    String("pathValidationSimulationDisabled");
+            }
+
+            assignmentMatchesValidation =
+                pathValidationStatus == "valid" && pathValidationValid &&
+                pathTrustStatus == "verifiedPath";
+
+			if (usedCachedAssignment &&
+					minerIntelligentTargetingAssignmentEnabled &&
+					cachedAssignment.isValid()) {
+				String previousAssignmentStatus =
+					cachedAssignment.status.isEmpty() ?
+					String("candidate") : cachedAssignment.status;
+				String previousPathValidationStatus =
+					cachedAssignment.pathValidationStatus.isEmpty() ?
+					String("not_checked") :
+					cachedAssignment.pathValidationStatus;
+				String previousPathTrustStatus =
+					cachedAssignment.pathValidationTrustStatus.isEmpty() ?
+					String("not_checked") :
+					cachedAssignment.pathValidationTrustStatus;
+				bool previousPathValidationMatched =
+					cachedAssignment.pathValidationMatched;
+				cachedAssignment.updatedAtMs = nowMs;
+				cachedAssignment.pathValidationStatus = pathValidationStatus;
+				cachedAssignment.pathValidationTrustStatus = pathTrustStatus;
+				cachedAssignment.pathValidationMatched = assignmentMatchesValidation;
+				cachedAssignment.status = assignmentMatchesValidation ?
+					String("validated") : String("candidate");
+				if (assignmentMatchesValidation && cachedAssignment.validatedAtMs == 0)
+					cachedAssignment.validatedAtMs = nowMs;
+				putMinerIntelligentTargetAssignment(cachedAssignment);
+				assignmentStatus = cachedAssignment.status;
+
+				bool assignmentStatusChanged =
+					previousAssignmentStatus != cachedAssignment.status;
+				bool pathValidationStatusChanged =
+					previousPathValidationStatus != cachedAssignment.pathValidationStatus;
+				bool pathTrustStatusChanged =
+					previousPathTrustStatus != cachedAssignment.pathValidationTrustStatus;
+				bool pathValidationMatchChanged =
+					previousPathValidationMatched !=
+					cachedAssignment.pathValidationMatched;
+
+				if (minerIntelligentTargetingAssignmentLogLifecycle &&
+						(assignmentStatusChanged ||
+						 pathValidationStatusChanged ||
+						 pathTrustStatusChanged ||
+						 pathValidationMatchChanged)) {
+					info(String("MinerIntelligentTargetAssignment miner=") +
+						 String::valueOf(miner.objectID) +
+						 " action=updated" +
+						 " selectedProfile=" + selectedProfileKey +
+						 " targetResource=" + targetResourceName +
+						 " previousStatus=" + previousAssignmentStatus +
+						 " status=" + cachedAssignment.status +
+						 " previousPathValidationStatus=" +
+							previousPathValidationStatus +
+						 " pathValidationStatus=" +
+							cachedAssignment.pathValidationStatus +
+						 " previousPathTrustStatus=" +
+							previousPathTrustStatus +
+						 " pathTrustStatus=" +
+							cachedAssignment.pathValidationTrustStatus +
+						 " assignmentMatchesValidation=" +
+							(cachedAssignment.pathValidationMatched ?
+								String("true") : String("false")) +
+						 " mode=" + minerIntelligentTargetingMode, true);
+				}
+			}
+
+            wouldActivate = true;
+
+            if (minerIntelligentTargetingRequireDemandWeightedPlan &&
+                    !hasSelectedPlan) {
+                wouldActivate = false;
+                fallbackReason = "noDemandWeightedPlan";
+            }
+
+            if (minerIntelligentTargetingRequireAcceptedDensityTarget &&
+                    !acceptedDensityTarget) {
+                wouldActivate = false;
+
+                if (densityTargetStatus == "wrongPlanet") {
+                    fallbackReason = "wrongPlanet";
+                } else {
+                    fallbackReason = "noAcceptedDensityTarget";
+                }
+            }
+
+            if (minerIntelligentTargetingRequireValidPath &&
+                    !pathValidationValid) {
+                wouldActivate = false;
+
+                if (pathValidationStatus == "failed") {
+                    fallbackReason = "pathValidationFailed";
+                } else if (pathValidationStatus == "not_available") {
+                    fallbackReason = "pathValidationUnavailable";
+                } else if (pathValidationStatus == "target_mismatch") {
+                    fallbackReason = "pathValidationTargetMismatch";
+                } else if (pathValidationStatus == "stale") {
+                    fallbackReason = "pathValidationStale";
+                } else {
+                    fallbackReason = "pathValidationRejected";
+                }
+            } else if (minerIntelligentTargetingRequireValidPath &&
+                    pathTrustStatus != "verifiedPath") {
+                wouldActivate = false;
+                fallbackReason = "pathValidationNotTrusted";
+            }
+        }
+
+        if (!hasSelectedPlan) {
+            noPlanCount++;
+            wouldActivate = false;
+        }
+
+        int failureCount = 0;
+        bool rollbackHeld = false;
+
+        {
+            Locker failureLocker(&minerIntelligentTargetingFailureMutex);
+
+            if (wouldActivate) {
+                minerIntelligentTargetingFailureCounts.put(miner.objectID, 0);
+            } else {
+                failureCount =
+                    minerIntelligentTargetingFailureCounts.contains(miner.objectID) ?
+                    minerIntelligentTargetingFailureCounts.get(miner.objectID) : 0;
+                failureCount++;
+                minerIntelligentTargetingFailureCounts.put(
+                    miner.objectID, failureCount);
+            }
+        }
+
+        if (!wouldActivate &&
+                failureCount >= minerIntelligentTargetingRollbackOnFailureCount) {
+            rollbackHeld = true;
+            rollbackHeldCount++;
+        }
+
+        if (wouldActivate && rollbackHeld) {
+            wouldActivate = false;
+            fallbackReason = "rollbackHeld";
+        }
+
+		if (wouldActivate &&
+				minerIntelligentTargetingMode == "limited" &&
+				minerIntelligentTargetingLimitedActivationEnabled) {
+			bool activationAllowed = true;
+			bool activationAttempted = false;
+            bool assignmentAlreadyActive =
+                usedCachedAssignment && isMinerIntelligentAssignmentActive(cachedAssignment);
+
+            if (minerIntelligentTargetingLimitedEmergencyDisabled) {
+                activationAllowed = false;
+                activationControlledSkip = true;
+                activationResult = "activationEmergencyDisabled";
+            } else if (!isMinerIntelligentTargetZoneAllowed(miner.zoneName)) {
+                activationAllowed = false;
+                activationControlledSkip = true;
+                activationResult = "zoneNotAllowed";
+                recordMinerIntelligentActivationHealthEvent("zoneSkip");
+            } else if (activationDisabledForInterval) {
+                activationAllowed = false;
+                activationControlledSkip = true;
+                activationResult = "activationDisabledForInterval";
+            } else if (actualActivationCount >=
+                    minerIntelligentTargetingLimitedMaxActivationsPerInterval) {
+                activationAllowed = false;
+                activationControlledSkip = true;
+                activationResult = "activationCapReached";
+            } else if (!assignmentAlreadyActive &&
+                    activeIntelligentMinerCount >=
+                    minerIntelligentTargetingLimitedMaxActiveIntelligentMiners) {
+                activationAllowed = false;
+                activationControlledSkip = true;
+                activationResult = "activeIntelligentMinerCapReached";
+                recordMinerIntelligentActivationHealthEvent("activeCapSkip");
+            } else if (!assignmentAlreadyActive &&
+                    isMinerIntelligentActivationOnCooldown(miner.objectID, nowMs)) {
+                activationAllowed = false;
+                activationControlledSkip = true;
+                activationResult = "activationCooldown";
+                recordMinerIntelligentActivationHealthEvent("cooldownSkip");
+            } else if (!usedCachedAssignment || !cachedAssignment.isValid()) {
+                activationAllowed = false;
+                activationResult = "missingValidatedAssignment";
+            } else if ((assignmentStatus != "validated" &&
+                    assignmentStatus != "queued" &&
+                    assignmentStatus != "activation_started" &&
+                    assignmentStatus != "sample_started") ||
+                    !assignmentMatchesValidation) {
+                activationAllowed = false;
+                activationResult = "assignmentNotValidated";
+            } else if (cachedAssignment.pathValidationStatus != "valid" ||
+                    !cachedAssignment.pathValidationMatched) {
+                activationAllowed = false;
+                activationResult = "pathValidationNotMatched";
+            } else if (cachedAssignment.pathValidationTrustStatus != "verifiedPath") {
+                activationAllowed = false;
+                activationResult = "pathValidationNotTrusted";
+            } else if (minerIntelligentTargetingLimitedRequireSamePlanet &&
+                    cachedAssignment.targetZoneName != miner.zoneName) {
+                activationAllowed = false;
+                activationResult = "wrongPlanet";
+            } else if (miner.dead || miner.incapacitated || miner.inCombat) {
+                activationAllowed = false;
+                activationResult = "controllerStateNotSafe";
+            }
+
+            if (activationAllowed) {
+                Reference<SimPlayerController*> ctrl;
+
+                if (controllers.contains(miner.objectID))
+                    ctrl = controllers.get(miner.objectID);
+
+                SimMinerController* minerController =
+                    ctrl == nullptr ? nullptr :
+                    dynamic_cast<SimMinerController*>(ctrl.get());
+
+                if (minerController == nullptr) {
+                    activationAllowed = false;
+                    activationResult = "controllerUnavailable";
+                } else {
+                    String controllerResult;
+                    Vector3 activationTarget(
+                        cachedAssignment.targetX,
+                            cachedAssignment.targetY,
+                            cachedAssignment.targetZ);
+
+                    activationAttempted = true;
+                    recordMinerIntelligentActivationHealthEvent("attempted");
+                    actualActivation =
+                        minerController->requestIntelligentTargetAssignment(
+                            cachedAssignment.selectedProfileKey,
+                            cachedAssignment.targetResourceName,
+                            cachedAssignment.targetResourceType,
+                            cachedAssignment.targetZoneName,
+                            activationTarget,
+                            cachedAssignment.targetDensity,
+                            cachedAssignment.expiresAtMs,
+                            minerIntelligentTargetingLimitedLogActivationLifecycle,
+                            controllerResult);
+                    activationResult = controllerResult;
+
+                    if (!actualActivation && controllerResult == "alreadyActive")
+                        actualActivation = true;
+
+                    if (actualActivation) {
+                        if (controllerResult != "alreadyActive") {
+                            actualActivationCount++;
+                            activeIntelligentMinerCount++;
+                            rememberMinerIntelligentActivation(miner.objectID, nowMs);
+                            cachedAssignment.status = "queued";
+                            if (cachedAssignment.queuedAtMs == 0)
+                                cachedAssignment.queuedAtMs = nowMs;
+                        }
+
+                        cachedAssignment.updatedAtMs = nowMs;
+                        cachedAssignment.lastActivationResult = activationResult;
+                        putMinerIntelligentTargetAssignment(cachedAssignment);
+                        assignmentStatus = cachedAssignment.status;
+                    }
+                }
+            }
+
+			if (!actualActivation) {
+				if (activationControlledSkip) {
+					activationControlledSkipCount++;
+				} else {
+					activationFallbackCount++;
+					activationFailedOrFallback = true;
+				}
+                fallbackReason = activationResult;
+
+                if (!activationControlledSkip &&
+                        minerIntelligentTargetingLimitedDisableOnActivationFailure)
+                    minerIntelligentTargetingLimitedEmergencyDisabled = true;
+
+                if (!activationControlledSkip &&
+                        minerIntelligentTargetingLimitedDisableOnFirstFailure)
+                    activationDisabledForInterval = true;
+
+                if (minerIntelligentTargetingLimitedLogActivationLifecycle) {
+                    info(String("MinerIntelligentTargetActivation miner=") +
+                         String::valueOf(miner.objectID) +
+                         " action=" +
+                            (activationControlledSkip ?
+                                String("skipped") : String("fallback")) +
+                         " fallbackReason=" + activationResult +
+                         " selectedProfile=" + selectedProfileKey +
+                         " targetResource=" + targetResourceName +
+                         " targetType=" + targetResourceType +
+                         " targetZone=" +
+                            (usedCachedAssignment ?
+                                cachedAssignment.targetZoneName :
+                                miner.zoneName) +
+                         " attempted=" +
+                            (activationAttempted ?
+                                String("true") : String("false")) +
+                         " controlledSkip=" +
+                            (activationControlledSkip ?
+                                String("true") : String("false")) +
+                         " mode=limited", true);
+                }
+            }
+        }
+
+        if (wouldActivate) {
+            wouldActivateCount++;
+        } else {
+            fallbackCount++;
+        }
+
+        if (hasSelectedPlan &&
+                minerIntelligentTargetingRequireAcceptedDensityTarget &&
+                !acceptedDensityTarget) {
+            noDensityTargetCount++;
+        }
+
+		if (hasSelectedPlan &&
+				minerIntelligentTargetingRequireValidPath &&
+				!pathValidationValid) {
+			pathRejectedCount++;
+		}
+
+		bool assignmentMismatch =
+			hasSelectedPlan &&
+			minerIntelligentTargetingRequireValidPath &&
+			pathValidationStatus == "target_mismatch";
+
+		if (assignmentMismatch)
+			assignmentMismatchCount++;
+
+		bool pathTrustRejected =
+			hasSelectedPlan &&
+			minerIntelligentTargetingRequireValidPath &&
+			pathValidationStatus == "valid" &&
+			pathTrustStatus != "verifiedPath";
+
+		if (pathTrustRejected)
+			pathTrustRejectedCount++;
+
+		bool shouldLogSwitchDecision =
+			minerIntelligentTargetingLogVerboseSwitchDecisions ||
+			wouldActivate ||
+			actualActivation ||
+			activationFailedOrFallback ||
+			assignmentMismatch ||
+			pathTrustRejected ||
+			(hasSelectedPlan && minerIntelligentTargetingRequireValidPath &&
+			 pathValidationStatus == "failed") ||
+			rollbackHeld ||
+			(minerIntelligentTargetingMode == "shadow" &&
+			 !minerIntelligentTargetingLogDecisionSummary);
+
+		if (shouldLogSwitchDecision) {
+			info(String("MinerTargetingSwitchDecision miner=") +
+				 String::valueOf(miner.objectID) +
+				 " zone=" + miner.zoneName +
+				 " mode=" + minerIntelligentTargetingMode +
+				 " selectedProfile=" + selectedProfileKey +
+				 " demandState=" + demandState +
+				 " pressureScore=" +
+					(hasSelectedPlan ?
+						String::valueOf(Math::getPrecision(
+							selectedResult.pressureScore, 1)) :
+						String("0")) +
+				 " targetResource=" + targetResourceName +
+				 " targetType=" + targetResourceType +
+				 " targetSource=" + targetSource +
+				 " samePlanet=" +
+					(selectedSamePlanet ? String("true") : String("false")) +
+				 " travelRequired=" +
+					(selectedSamePlanet ? String("false") : String("true")) +
+				 " densityTargetStatus=" + densityTargetStatus +
+				 " pathValidationStatus=" + pathValidationStatus +
+				 " pathTrustStatus=" + pathTrustStatus +
+				 " pathRejectReason=" + pathRejectReason +
+				 " assignmentStatus=" + assignmentStatus +
+				 " assignmentAgeSeconds=" + String::valueOf(assignmentAgeSeconds) +
+				 " assignmentMatchesValidation=" +
+					(assignmentMatchesValidation ?
+						String("true") : String("false")) +
+				 " assignmentTargetResource=" +
+					(usedCachedAssignment ?
+						cachedAssignment.targetResourceName : String("none")) +
+				 " assignmentTargetType=" +
+					(usedCachedAssignment ?
+						cachedAssignment.targetResourceType : String("none")) +
+				 " assignmentTargetZone=" +
+					(usedCachedAssignment ?
+						cachedAssignment.targetZoneName : String("none")) +
+				 " assignmentPathTrustStatus=" +
+					(usedCachedAssignment ?
+						(cachedAssignment.pathValidationTrustStatus.isEmpty() ?
+							String("none") :
+							cachedAssignment.pathValidationTrustStatus) :
+						String("none")) +
+				 " assignmentClearReason=" +
+					(assignmentClearReason.isEmpty() ?
+						String("none") : assignmentClearReason) +
+				 " wouldActivate=" +
+					(wouldActivate ? String("true") : String("false")) +
+				 " actualActivation=" +
+					(actualActivation ? String("true") : String("false")) +
+				 " activationResult=" + activationResult +
+				 " fallbackReason=" +
+					(wouldActivate ?
+						(actualActivation ?
+							String("none") :
+							(minerIntelligentTargetingMode == "limited" ?
+								(minerIntelligentTargetingLimitedActivationEnabled ?
+									fallbackReason :
+									String("limitedActivationDisabled")) :
+								String("shadowMode"))) :
+						fallbackReason) +
+				 " fallbackToConceptualLoop=" +
+					(minerIntelligentTargetingFallbackToConceptualLoop ?
+						String("true") : String("false")) +
+				 " rollbackHeld=" +
+					(rollbackHeld ? String("true") : String("false")) +
+				 " failureCount=" + String::valueOf(failureCount) +
+				 " limitedActivationEnabled=" +
+					(minerIntelligentTargetingLimitedActivationEnabled ?
+						String("true") : String("false")) +
+				 " assignmentReason=\"" + assignmentReason + "\"" +
+				 " decisionBasis=demandWeightedMinerPlanSimulation" +
+				 " diagnosticOnly=" +
+					(actualActivation ? String("false") : String("true")) +
+				 " mode=" +
+					(actualActivation ? String("limited") : String("diagnostic-only")),
+				 true);
+		}
+	}
+
+    if (minerIntelligentTargetingLogDecisionSummary) {
+        info(String("MinerTargetingSwitchDecisionSummary activeMiners=") +
+             String::valueOf(miners.size()) +
+             " evaluated=" + String::valueOf(evaluatedLimit) +
+             " wouldActivate=" + String::valueOf(wouldActivateCount) +
+             " fallback=" + String::valueOf(fallbackCount) +
+             " capped=" + String::valueOf(cappedCount) +
+             " noPlan=" + String::valueOf(noPlanCount) +
+			 " noDensityTarget=" + String::valueOf(noDensityTargetCount) +
+			 " pathRejected=" + String::valueOf(pathRejectedCount) +
+			 " assignmentMismatches=" + String::valueOf(assignmentMismatchCount) +
+			 " pathTrustRejected=" + String::valueOf(pathTrustRejectedCount) +
+			 " rollbackHeld=" + String::valueOf(rollbackHeldCount) +
+			 " actualActivations=" + String::valueOf(actualActivationCount) +
+			 " controlledSkips=" + String::valueOf(activationControlledSkipCount) +
+			 " activationFallbacks=" + String::valueOf(activationFallbackCount) +
+			 " mode=" + minerIntelligentTargetingMode +
+             " diagnosticOnly=" +
+                (actualActivationCount > 0 ? String("false") : String("true")),
+             true);
+    }
+
+    if (minerIntelligentTargetingLimitedLogHealthSummary &&
+            minerIntelligentTargetingMode == "limited") {
+        int healthAttempts = 0;
+        int healthStarted = 0;
+        int healthArrivals = 0;
+        int healthSamplesCompleted = 0;
+        int healthPathFailures = 0;
+        int healthExpired = 0;
+        int healthCooldownSkips = 0;
+        int healthActiveCapSkips = 0;
+        int healthZoneSkips = 0;
+
+        snapshotAndResetMinerIntelligentActivationHealth(
+            healthAttempts,
+            healthStarted,
+            healthArrivals,
+            healthSamplesCompleted,
+            healthPathFailures,
+            healthExpired,
+            healthCooldownSkips,
+            healthActiveCapSkips,
+            healthZoneSkips);
+
+        info(String("MinerIntelligentActivationHealth active=") +
+             String::valueOf(countActiveMinerIntelligentAssignments()) +
+             " attempted=" + String::valueOf(healthAttempts) +
+             " started=" + String::valueOf(healthStarted) +
+             " arrivals=" + String::valueOf(healthArrivals) +
+             " sampleFinished=" + String::valueOf(healthSamplesCompleted) +
+             " pathFailed=" + String::valueOf(healthPathFailures) +
+             " expired=" + String::valueOf(healthExpired) +
+			 " rollbackHeld=" + String::valueOf(rollbackHeldCount) +
+			 " controlledSkips=" + String::valueOf(activationControlledSkipCount) +
+			 " assignmentMismatches=" + String::valueOf(assignmentMismatchCount) +
+			 " pathTrustRejected=" + String::valueOf(pathTrustRejectedCount) +
+			 " cooldownSkips=" + String::valueOf(healthCooldownSkips) +
+             " activeCapSkips=" + String::valueOf(healthActiveCapSkips) +
+             " zoneSkips=" + String::valueOf(healthZoneSkips) +
+             " activationFallbacks=" + String::valueOf(activationFallbackCount) +
+             " maxActive=" +
+                String::valueOf(
+                    minerIntelligentTargetingLimitedMaxActiveIntelligentMiners) +
+             " maxActivationsPerInterval=" +
+                String::valueOf(
+                    minerIntelligentTargetingLimitedMaxActivationsPerInterval) +
+             " cooldownSeconds=" +
+                String::valueOf(
+                    minerIntelligentTargetingLimitedCooldownSecondsPerMiner) +
+             " emergencyDisabled=" +
+                (minerIntelligentTargetingLimitedEmergencyDisabled ?
+                    String("true") : String("false")) +
+             " mode=" + minerIntelligentTargetingMode, true);
+    }
 }
 
 void SimPlayerManager::applyDemandStateSimulationConfig(LuaObject& demandStateConfig) {
@@ -5838,23 +8256,70 @@ void SimPlayerManager::logMinerDensityTargetSimulations() {
     if (entries.size() == 0)
         return;
 
-    Vector<ResourceScoringProfile> profiles = createCuratedResourceScoringProfiles();
+    Vector<ResourceScoringProfile> roundRobinProfiles = createCuratedResourceScoringProfiles();
     Vector<int> enabledProfileIndexes;
 
-    for (int profileIndex = 0; profileIndex < profiles.size(); ++profileIndex) {
-        ResourceScoringProfile profile = profiles.get(profileIndex);
+    for (int profileIndex = 0; profileIndex < roundRobinProfiles.size(); ++profileIndex) {
+        ResourceScoringProfile profile = roundRobinProfiles.get(profileIndex);
         float profileWeight = getMinerTargetSimulationProfileWeight(minerTargetSimulationProfileWeights, profile.key);
 
         if (profileWeight > 0.f)
             enabledProfileIndexes.add(profileIndex);
     }
 
-    if (enabledProfileIndexes.size() == 0) {
+    Vector<String> conceptualResourceNames;
+    Vector<uint64> conceptualAmounts;
+    collectConceptualMinerTotals(conceptualResourceNames, conceptualAmounts);
+
+    Vector<DemandProfileDefinition> demandProfiles = createDemandProfileDefinitions();
+    VectorMap<String, uint64> marketQuantities;
+
+    if (demandWeightedMinerPlanSimulationIncludeMarketSupply) {
+        Locker marketSnapshotLocker(&marketSupplyObservationMutex);
+
+        for (int profileIndex = 0; profileIndex < demandProfiles.size(); ++profileIndex) {
+            String profileKey = demandProfiles.get(profileIndex).key;
+
+            if (marketSupplyProfileQuantities.contains(profileKey))
+                marketQuantities.put(profileKey, marketSupplyProfileQuantities.get(profileKey));
+        }
+    }
+
+    Vector<DemandStateSimulationResult> pressureResults;
+    int profilesDisabled = 0;
+    int profilesInactivePhase = 0;
+    int profilesBelowPressure = 0;
+    int profilesNoEligibleResource = 0;
+
+    if (demandWeightedMinerPlanSimulationEnabled) {
+        buildDemandWeightedPressureResultsForMiners(
+            entries,
+            demandProfiles,
+            conceptualResourceNames,
+            conceptualAmounts,
+            marketQuantities,
+            demandWeightedMinerPlanSimulationProfileEnabled,
+            demandWeightedMinerPlanSimulationDesiredReserve,
+            demandWeightedMinerPlanSimulationLowStockThreshold,
+            demandWeightedMinerPlanSimulationCriticalStockThreshold,
+            demandWeightedMinerPlanSimulationServerPhase,
+            demandWeightedMinerPlanSimulationShortageWeight,
+            demandWeightedMinerPlanSimulationActiveOpportunityWeight,
+            demandWeightedMinerPlanSimulationSurplusDampening,
+            demandWeightedMinerPlanSimulationMinimumPressureThreshold,
+            pressureResults,
+            profilesDisabled,
+            profilesInactivePhase,
+            profilesBelowPressure,
+            profilesNoEligibleResource);
+    }
+
+    if (pressureResults.size() == 0 && enabledProfileIndexes.size() == 0) {
         info("MinerDensityTargetSimulation skipped=true reason=noEnabledProfiles mode=simulation-only", true);
         return;
     }
 
-    int minerOrdinal = 0;
+    Vector<MinerIntelligentTargetingMinerSnapshot> miners;
     int controllerCount = controllers.size();
 
     for (int controllerIndex = 0; controllerIndex < controllerCount; ++controllerIndex) {
@@ -5869,35 +8334,145 @@ void SimPlayerManager::logMinerDensityTargetSimulations() {
         if (agent == nullptr)
             continue;
 
-        Zone* zone = agent->getZone();
+        MinerIntelligentTargetingMinerSnapshot miner;
 
-        if (zone == nullptr)
-            continue;
+        {
+            Locker agentLocker(agent);
+            miner.zone = agent->getZone();
 
-        uint64 minerID = agent->getObjectID();
-        String zoneName = zone->getZoneName();
-        Vector3 minerPosition = agent->getWorldPosition();
+            if (miner.zone != nullptr) {
+                miner.objectID = agent->getObjectID();
+                miner.zoneName = miner.zone->getZoneName();
+                miner.position = agent->getWorldPosition();
+                miner.inNavmesh = agent->isInNavMesh();
+                miner.dead = agent->isDead();
+                miner.incapacitated = agent->isIncapacitated();
+                miner.inCombat = agent->isInCombat();
+            }
+        }
+
+        if (miner.isValid())
+            miners.add(miner);
+    }
+
+    for (int i = 0; i < miners.size(); ++i) {
+        for (int j = i + 1; j < miners.size(); ++j) {
+            if (miners.get(j).objectID >= miners.get(i).objectID)
+                continue;
+
+            MinerIntelligentTargetingMinerSnapshot swap = miners.get(i);
+            miners.set(i, miners.get(j));
+            miners.set(j, swap);
+        }
+    }
+
+    int minerOrdinal = 0;
+    VectorMap<String, int> demandAssignmentsByProfile;
+
+    for (int minerIndex = 0; minerIndex < miners.size(); ++minerIndex) {
+        MinerIntelligentTargetingMinerSnapshot miner = miners.get(minerIndex);
+        String targetSource = "none";
+        String selectedProfileKey = "none";
+        ResourceIntelligenceEntry selectedResource;
+        bool samePlanet = false;
+        bool hasTarget = false;
+        bool usingAssignment = false;
+        MinerDensityTargetCandidate densityTarget;
+        MinerIntelligentTargetAssignment assignment;
+        uint64 nowMs = System::getMiliTime();
+
+        if (minerIntelligentTargetingEnabled &&
+                (minerIntelligentTargetingMode == "shadow" ||
+                 minerIntelligentTargetingMode == "limited") &&
+                minerIntelligentTargetingAssignmentEnabled &&
+                getMinerIntelligentTargetAssignment(
+                    miner.objectID, assignment)) {
+            if (assignment.expiresAtMs > 0 && nowMs > assignment.expiresAtMs) {
+                clearMinerIntelligentTargetAssignment(
+                    miner.objectID, "expired", minerIntelligentTargetingMode);
+            } else if (assignment.targetZoneName != miner.zoneName) {
+                clearMinerIntelligentTargetAssignment(
+                    miner.objectID, "zoneChanged", minerIntelligentTargetingMode);
+            } else if (minerIntelligentTargetingAssignmentClearOnIncapOrDeath &&
+                    (miner.dead || miner.incapacitated)) {
+                clearMinerIntelligentTargetAssignment(
+                    miner.objectID,
+                    miner.dead ? String("dead") : String("incapacitated"),
+                    minerIntelligentTargetingMode);
+            } else if (minerIntelligentTargetingAssignmentClearOnCombat &&
+                    miner.inCombat) {
+                clearMinerIntelligentTargetAssignment(
+                    miner.objectID, "combat", minerIntelligentTargetingMode);
+            } else if (assignment.densityTargetStatus == "accepted") {
+                targetSource = assignment.targetSource;
+                selectedProfileKey = assignment.selectedProfileKey;
+                selectedResource.name = assignment.targetResourceName;
+                selectedResource.type = assignment.targetResourceType;
+                samePlanet = true;
+                hasTarget = true;
+                usingAssignment = true;
+                densityTarget.x = assignment.targetX;
+                densityTarget.y = assignment.targetY;
+                densityTarget.z = assignment.targetZ;
+                densityTarget.density = assignment.targetDensity;
+                densityTarget.distance =
+                    miner.position.distanceTo(
+                        Vector3(assignment.targetX, assignment.targetY, assignment.targetZ));
+                densityTarget.searchRadius = 1;
+            }
+        }
+
+        if (!hasTarget && pressureResults.size() > 0) {
+            DemandWeightedPlanSelection demandSelection =
+                selectDemandWeightedMinerPlanForValidation(
+                    entries,
+                    demandProfiles,
+                    pressureResults,
+                    demandAssignmentsByProfile,
+                    miner.zoneName,
+                    demandWeightedMinerPlanSimulationSamePlanetBonus,
+                    demandWeightedMinerPlanSimulationTravelPenalty,
+                    demandWeightedMinerPlanSimulationMaxMinersPerProfile,
+                    demandWeightedMinerPlanSimulationStrongPressureRatio);
+
+            if (demandSelection.valid) {
+                targetSource = "demand_weighted_plan";
+                selectedProfileKey = demandSelection.selectedResult.profileKey;
+                selectedResource = demandSelection.selectedResource;
+                samePlanet = demandSelection.selected.target.samePlanet;
+                hasTarget = true;
+            }
+        }
+
         int assignedProfileIndex = -1;
-        MinerTargetSimulationPlan plan = selectAssignedMinerTargetSimulationPlan(
-            entries,
-            profiles,
-            enabledProfileIndexes,
-            minerTargetSimulationProfileWeights,
-            minerOrdinal,
-            zoneName,
-            minerTargetSimulationPreferSamePlanet,
-            minerTargetSimulationSamePlanetBonus,
-            minerTargetSimulationTravelPenalty,
-            assignedProfileIndex);
 
-        if (!plan.isValid()) {
-            String assignedProfile = assignedProfileIndex >= 0 ?
-                profiles.get(assignedProfileIndex).key : String("none");
+        if (!hasTarget) {
+            MinerTargetSimulationPlan plan = selectAssignedMinerTargetSimulationPlan(
+                entries,
+                roundRobinProfiles,
+                enabledProfileIndexes,
+                minerTargetSimulationProfileWeights,
+                minerOrdinal,
+                miner.zoneName,
+                minerTargetSimulationPreferSamePlanet,
+                minerTargetSimulationSamePlanetBonus,
+                minerTargetSimulationTravelPenalty,
+                assignedProfileIndex);
 
-            info(String("MinerDensityTargetSimulation miner=") + String::valueOf(minerID) +
-                " zone=" + zoneName +
-                " assignedProfile=" + assignedProfile +
-                " noEligibleTarget=true noDensityTarget=true" +
+            if (plan.isValid()) {
+                ResourceScoringProfile selectedProfile = roundRobinProfiles.get(plan.profileIndex);
+                targetSource = "round_robin_plan";
+                selectedProfileKey = selectedProfile.key;
+                selectedResource = entries.get(plan.resourceIndex);
+                samePlanet = plan.samePlanet;
+                hasTarget = true;
+            }
+        }
+
+        if (!hasTarget) {
+            info(String("MinerDensityTargetSimulation miner=") + String::valueOf(miner.objectID) +
+                " zone=" + miner.zoneName +
+                " targetSource=none noEligibleTarget=true noDensityTarget=true" +
                 " minAcceptableDensity=" +
                 String::valueOf(Math::getPrecision(minerDensityTargetSimulationMinAcceptableDensity, 3)) +
                 " candidateCount=0 rejectReason=noValidCandidate mode=simulation-only", true);
@@ -5905,15 +8480,13 @@ void SimPlayerManager::logMinerDensityTargetSimulations() {
             continue;
         }
 
-        ResourceScoringProfile selectedProfile = profiles.get(plan.profileIndex);
-        ResourceIntelligenceEntry selectedResource = entries.get(plan.resourceIndex);
-
-        if (!plan.samePlanet) {
-            info(String("MinerDensityTargetSimulation miner=") + String::valueOf(minerID) +
-                " zone=" + zoneName +
-                " profile=" + selectedProfile.key +
+        if (!samePlanet) {
+            info(String("MinerDensityTargetSimulation miner=") + String::valueOf(miner.objectID) +
+                " zone=" + miner.zoneName +
+                " profile=" + selectedProfileKey +
                 " resource=" + selectedResource.name +
                 " type=" + selectedResource.type +
+                " targetSource=" + targetSource +
                 " zones=" + (selectedResource.zones.isEmpty() ? String("unknown") : selectedResource.zones) +
                 " travelRequired=true noSamePlanetDensityTarget=true noDensityTarget=true" +
                 " minAcceptableDensity=" +
@@ -5923,33 +8496,43 @@ void SimPlayerManager::logMinerDensityTargetSimulations() {
             continue;
         }
 
-        MinerDensityTargetCandidate densityTarget;
         MinerDensityTargetDiagnostics densityDiagnostics;
-        bool minerInNavmesh = agent->isInNavMesh();
-        bool foundTarget = findMinerDensityTarget(
-            minerID,
-            selectedResource,
-            zone,
-            minerPosition,
-            minerDensityTargetSimulationSearchRadii,
-            minerDensityTargetSimulationSamplesPerRadius,
-            minerDensityTargetSimulationMinAcceptableDensity,
-            minerDensityTargetSimulationRequireNavmesh,
-            minerInNavmesh,
-            minerDensityTargetSimulationMaxPathCheckAttempts,
-            minerDensityTargetSimulationDistancePenaltyPerMeter,
-            densityTarget,
-            densityDiagnostics);
+        bool foundTarget = usingAssignment;
+
+        if (!usingAssignment) {
+            foundTarget = findMinerDensityTarget(
+                miner.objectID,
+                selectedResource,
+                miner.zone,
+                miner.position,
+                minerDensityTargetSimulationSearchRadii,
+                minerDensityTargetSimulationSamplesPerRadius,
+                minerDensityTargetSimulationMinAcceptableDensity,
+                minerDensityTargetSimulationRequireNavmesh,
+                miner.inNavmesh,
+                minerDensityTargetSimulationMaxPathCheckAttempts,
+                minerDensityTargetSimulationDistancePenaltyPerMeter,
+                densityTarget,
+                densityDiagnostics);
+        }
 
         if (foundTarget) {
-            String reason = densityTarget.density >= minerDensityTargetSimulationPreferredDensity ?
-                String("nearest preferred pocket") : String("nearest acceptable pocket");
+            String reason = usingAssignment ? String("retained assignment target") :
+                (densityTarget.density >= minerDensityTargetSimulationPreferredDensity ?
+                    String("nearest preferred pocket") :
+                    String("nearest acceptable pocket"));
 
-            info(String("MinerDensityTargetSimulation miner=") + String::valueOf(minerID) +
-                " zone=" + zoneName +
-                " profile=" + selectedProfile.key +
+            info(String("MinerDensityTargetSimulation miner=") + String::valueOf(miner.objectID) +
+                " zone=" + miner.zoneName +
+                " profile=" + selectedProfileKey +
                 " resource=" + selectedResource.name +
                 " type=" + selectedResource.type +
+                " targetSource=" + targetSource +
+                " assignmentStatus=" +
+                    (usingAssignment ?
+                        (assignment.status.isEmpty() ?
+                            String("candidate") : assignment.status) :
+                        String("none")) +
                 " target=(x:" + String::valueOf(Math::getPrecision(densityTarget.x, 1)) +
                 ",y:" + String::valueOf(Math::getPrecision(densityTarget.y, 1)) +
                 ",z:" + String::valueOf(Math::getPrecision(densityTarget.z, 1)) + ")" +
@@ -5964,11 +8547,12 @@ void SimPlayerManager::logMinerDensityTargetSimulations() {
                 " navmeshChecked=" + (densityTarget.navmeshChecked ? String("true") : String("false")) +
                 " mode=simulation-only reason=" + reason, true);
         } else {
-            String rejectionLine = String("MinerDensityTargetSimulation miner=") + String::valueOf(minerID) +
-                " zone=" + zoneName +
-                " profile=" + selectedProfile.key +
+            String rejectionLine = String("MinerDensityTargetSimulation miner=") + String::valueOf(miner.objectID) +
+                " zone=" + miner.zoneName +
+                " profile=" + selectedProfileKey +
                 " resource=" + selectedResource.name +
                 " type=" + selectedResource.type +
+                " targetSource=" + targetSource +
                 " noDensityTarget=true bestDensity=" +
                 String::valueOf(Math::getPrecision(densityDiagnostics.bestObservedCandidate.density, 3)) +
                 " minAcceptableDensity=" +
@@ -6029,23 +8613,70 @@ void SimPlayerManager::logMinerPathValidationSimulations() {
     if (entries.size() == 0)
         return;
 
-    Vector<ResourceScoringProfile> profiles = createCuratedResourceScoringProfiles();
+    Vector<ResourceScoringProfile> roundRobinProfiles = createCuratedResourceScoringProfiles();
     Vector<int> enabledProfileIndexes;
 
-    for (int profileIndex = 0; profileIndex < profiles.size(); ++profileIndex) {
-        ResourceScoringProfile profile = profiles.get(profileIndex);
+    for (int profileIndex = 0; profileIndex < roundRobinProfiles.size(); ++profileIndex) {
+        ResourceScoringProfile profile = roundRobinProfiles.get(profileIndex);
         float profileWeight = getMinerTargetSimulationProfileWeight(minerTargetSimulationProfileWeights, profile.key);
 
         if (profileWeight > 0.f)
             enabledProfileIndexes.add(profileIndex);
     }
 
-    if (enabledProfileIndexes.size() == 0) {
+    Vector<String> conceptualResourceNames;
+    Vector<uint64> conceptualAmounts;
+    collectConceptualMinerTotals(conceptualResourceNames, conceptualAmounts);
+
+    Vector<DemandProfileDefinition> demandProfiles = createDemandProfileDefinitions();
+    VectorMap<String, uint64> marketQuantities;
+
+    if (demandWeightedMinerPlanSimulationIncludeMarketSupply) {
+        Locker marketSnapshotLocker(&marketSupplyObservationMutex);
+
+        for (int profileIndex = 0; profileIndex < demandProfiles.size(); ++profileIndex) {
+            String profileKey = demandProfiles.get(profileIndex).key;
+
+            if (marketSupplyProfileQuantities.contains(profileKey))
+                marketQuantities.put(profileKey, marketSupplyProfileQuantities.get(profileKey));
+        }
+    }
+
+    Vector<DemandStateSimulationResult> pressureResults;
+    int profilesDisabled = 0;
+    int profilesInactivePhase = 0;
+    int profilesBelowPressure = 0;
+    int profilesNoEligibleResource = 0;
+
+    if (demandWeightedMinerPlanSimulationEnabled) {
+        buildDemandWeightedPressureResultsForMiners(
+            entries,
+            demandProfiles,
+            conceptualResourceNames,
+            conceptualAmounts,
+            marketQuantities,
+            demandWeightedMinerPlanSimulationProfileEnabled,
+            demandWeightedMinerPlanSimulationDesiredReserve,
+            demandWeightedMinerPlanSimulationLowStockThreshold,
+            demandWeightedMinerPlanSimulationCriticalStockThreshold,
+            demandWeightedMinerPlanSimulationServerPhase,
+            demandWeightedMinerPlanSimulationShortageWeight,
+            demandWeightedMinerPlanSimulationActiveOpportunityWeight,
+            demandWeightedMinerPlanSimulationSurplusDampening,
+            demandWeightedMinerPlanSimulationMinimumPressureThreshold,
+            pressureResults,
+            profilesDisabled,
+            profilesInactivePhase,
+            profilesBelowPressure,
+            profilesNoEligibleResource);
+    }
+
+    if (pressureResults.size() == 0 && enabledProfileIndexes.size() == 0) {
         info("MinerPathValidationSimulation skipped=true reason=noEnabledProfiles mode=simulation-only", true);
         return;
     }
 
-    int minerOrdinal = 0;
+    Vector<MinerIntelligentTargetingMinerSnapshot> miners;
     int controllerCount = controllers.size();
 
     for (int controllerIndex = 0; controllerIndex < controllerCount; ++controllerIndex) {
@@ -6060,89 +8691,200 @@ void SimPlayerManager::logMinerPathValidationSimulations() {
         if (agent == nullptr)
             continue;
 
-        ManagedReference<Zone*> zone;
-        uint64 minerID = 0;
-        String zoneName;
-        Vector3 minerPosition;
-        bool minerInNavmesh = false;
+        MinerIntelligentTargetingMinerSnapshot miner;
 
         {
             Locker agentLocker(agent);
-            zone = agent->getZone();
+            miner.zone = agent->getZone();
 
-            if (zone != nullptr) {
-                minerID = agent->getObjectID();
-                zoneName = zone->getZoneName();
-                minerPosition = agent->getWorldPosition();
-                minerInNavmesh = agent->isInNavMesh();
+            if (miner.zone != nullptr) {
+                miner.objectID = agent->getObjectID();
+                miner.zoneName = miner.zone->getZoneName();
+                miner.position = agent->getWorldPosition();
+                miner.inNavmesh = agent->isInNavMesh();
+                miner.dead = agent->isDead();
+                miner.incapacitated = agent->isIncapacitated();
+                miner.inCombat = agent->isInCombat();
             }
         }
 
-        if (zone == nullptr)
-            continue;
+        if (miner.isValid())
+            miners.add(miner);
+    }
+
+    for (int i = 0; i < miners.size(); ++i) {
+        for (int j = i + 1; j < miners.size(); ++j) {
+            if (miners.get(j).objectID >= miners.get(i).objectID)
+                continue;
+
+            MinerIntelligentTargetingMinerSnapshot swap = miners.get(i);
+            miners.set(i, miners.get(j));
+            miners.set(j, swap);
+        }
+    }
+
+    int minerOrdinal = 0;
+    VectorMap<String, int> demandAssignmentsByProfile;
+
+    for (int minerIndex = 0; minerIndex < miners.size(); ++minerIndex) {
+        MinerIntelligentTargetingMinerSnapshot miner = miners.get(minerIndex);
+        String targetSource = "none";
+        String selectedProfileKey = "none";
+        ResourceIntelligenceEntry selectedResource;
+        bool samePlanet = false;
+        bool hasTarget = false;
+        bool usingAssignment = false;
+        MinerDensityTargetCandidate densityTarget;
+        MinerIntelligentTargetAssignment assignment;
+        uint64 nowMs = System::getMiliTime();
+
+        if (minerIntelligentTargetingEnabled &&
+                (minerIntelligentTargetingMode == "shadow" ||
+                 minerIntelligentTargetingMode == "limited") &&
+                minerIntelligentTargetingAssignmentEnabled &&
+                getMinerIntelligentTargetAssignment(
+                    miner.objectID, assignment)) {
+            if (assignment.expiresAtMs > 0 && nowMs > assignment.expiresAtMs) {
+                clearMinerIntelligentTargetAssignment(
+                    miner.objectID, "expired", minerIntelligentTargetingMode);
+            } else if (assignment.targetZoneName != miner.zoneName) {
+                clearMinerIntelligentTargetAssignment(
+                    miner.objectID, "zoneChanged", minerIntelligentTargetingMode);
+            } else if (minerIntelligentTargetingAssignmentClearOnIncapOrDeath &&
+                    (miner.dead || miner.incapacitated)) {
+                clearMinerIntelligentTargetAssignment(
+                    miner.objectID,
+                    miner.dead ? String("dead") : String("incapacitated"),
+                    minerIntelligentTargetingMode);
+            } else if (minerIntelligentTargetingAssignmentClearOnCombat &&
+                    miner.inCombat) {
+                clearMinerIntelligentTargetAssignment(
+                    miner.objectID, "combat", minerIntelligentTargetingMode);
+            } else if (assignment.densityTargetStatus == "accepted") {
+                targetSource = assignment.targetSource;
+                selectedProfileKey = assignment.selectedProfileKey;
+                selectedResource.name = assignment.targetResourceName;
+                selectedResource.type = assignment.targetResourceType;
+                samePlanet = true;
+                hasTarget = true;
+                usingAssignment = true;
+                densityTarget.x = assignment.targetX;
+                densityTarget.y = assignment.targetY;
+                densityTarget.z = assignment.targetZ;
+                densityTarget.density = assignment.targetDensity;
+                densityTarget.distance =
+                    miner.position.distanceTo(
+                        Vector3(assignment.targetX, assignment.targetY, assignment.targetZ));
+                densityTarget.searchRadius = 1;
+            }
+        }
+
+        if (!hasTarget && pressureResults.size() > 0) {
+            DemandWeightedPlanSelection demandSelection =
+                selectDemandWeightedMinerPlanForValidation(
+                    entries,
+                    demandProfiles,
+                    pressureResults,
+                    demandAssignmentsByProfile,
+                    miner.zoneName,
+                    demandWeightedMinerPlanSimulationSamePlanetBonus,
+                    demandWeightedMinerPlanSimulationTravelPenalty,
+                    demandWeightedMinerPlanSimulationMaxMinersPerProfile,
+                    demandWeightedMinerPlanSimulationStrongPressureRatio);
+
+            if (demandSelection.valid) {
+                targetSource = "demand_weighted_plan";
+                selectedProfileKey = demandSelection.selectedResult.profileKey;
+                selectedResource = demandSelection.selectedResource;
+                samePlanet = demandSelection.selected.target.samePlanet;
+                hasTarget = true;
+            }
+        }
 
         int assignedProfileIndex = -1;
-        MinerTargetSimulationPlan plan = selectAssignedMinerTargetSimulationPlan(
-            entries,
-            profiles,
-            enabledProfileIndexes,
-            minerTargetSimulationProfileWeights,
-            minerOrdinal,
-            zoneName,
-            minerTargetSimulationPreferSamePlanet,
-            minerTargetSimulationSamePlanetBonus,
-            minerTargetSimulationTravelPenalty,
-            assignedProfileIndex);
 
-        if (!plan.isValid()) {
-            info(String("MinerPathValidationSimulation miner=") + String::valueOf(minerID) +
-                " zone=" + zoneName +
-                " skipped=true reason=noAcceptedDensityTarget mode=simulation-only", true);
+        if (!hasTarget) {
+            MinerTargetSimulationPlan plan = selectAssignedMinerTargetSimulationPlan(
+                entries,
+                roundRobinProfiles,
+                enabledProfileIndexes,
+                minerTargetSimulationProfileWeights,
+                minerOrdinal,
+                miner.zoneName,
+                minerTargetSimulationPreferSamePlanet,
+                minerTargetSimulationSamePlanetBonus,
+                minerTargetSimulationTravelPenalty,
+                assignedProfileIndex);
+
+            if (plan.isValid()) {
+                ResourceScoringProfile selectedProfile =
+                    roundRobinProfiles.get(plan.profileIndex);
+                targetSource = "round_robin_plan";
+                selectedProfileKey = selectedProfile.key;
+                selectedResource = entries.get(plan.resourceIndex);
+                samePlanet = plan.samePlanet;
+                hasTarget = true;
+            }
+        }
+
+        if (!hasTarget) {
+            info(String("MinerPathValidationSimulation miner=") + String::valueOf(miner.objectID) +
+                " zone=" + miner.zoneName +
+                " targetSource=none skipped=true reason=noTargetPlan mode=simulation-only", true);
             ++minerOrdinal;
             continue;
         }
 
-        ResourceScoringProfile selectedProfile = profiles.get(plan.profileIndex);
-        ResourceIntelligenceEntry selectedResource = entries.get(plan.resourceIndex);
-
-        if (!plan.samePlanet) {
-            info(String("MinerPathValidationSimulation miner=") + String::valueOf(minerID) +
-                " zone=" + zoneName +
-                " profile=" + selectedProfile.key +
+        if (!samePlanet) {
+            info(String("MinerPathValidationSimulation miner=") + String::valueOf(miner.objectID) +
+                " zone=" + miner.zoneName +
+                " profile=" + selectedProfileKey +
                 " resource=" + selectedResource.name +
+                " type=" + selectedResource.type +
+                " targetSource=" + targetSource +
                 " skipped=true reason=wrongPlanet mode=simulation-only", true);
             ++minerOrdinal;
             continue;
         }
 
-        MinerDensityTargetCandidate densityTarget;
         MinerDensityTargetDiagnostics densityDiagnostics;
-        bool acceptedDensityTarget = findMinerDensityTarget(
-            minerID,
-            selectedResource,
-            zone,
-            minerPosition,
-            minerDensityTargetSimulationSearchRadii,
-            minerDensityTargetSimulationSamplesPerRadius,
-            minerDensityTargetSimulationMinAcceptableDensity,
-            minerDensityTargetSimulationRequireNavmesh,
-            minerInNavmesh,
-            minerDensityTargetSimulationMaxPathCheckAttempts,
-            minerDensityTargetSimulationDistancePenaltyPerMeter,
-            densityTarget,
-            densityDiagnostics);
+        bool acceptedDensityTarget = usingAssignment;
+
+        if (!usingAssignment) {
+            acceptedDensityTarget = findMinerDensityTarget(
+                miner.objectID,
+                selectedResource,
+                miner.zone,
+                miner.position,
+                minerDensityTargetSimulationSearchRadii,
+                minerDensityTargetSimulationSamplesPerRadius,
+                minerDensityTargetSimulationMinAcceptableDensity,
+                minerDensityTargetSimulationRequireNavmesh,
+                miner.inNavmesh,
+                minerDensityTargetSimulationMaxPathCheckAttempts,
+                minerDensityTargetSimulationDistancePenaltyPerMeter,
+                densityTarget,
+                densityDiagnostics);
+        }
 
         if (!acceptedDensityTarget && !minerPathValidationOnlyAcceptedDensityTargets &&
                 densityDiagnostics.hasBestRejectedCandidate()) {
             densityTarget = densityDiagnostics.bestRejectedCandidate;
-            densityTarget.z = zone->getHeight(densityTarget.x, densityTarget.y);
+            densityTarget.z = miner.zone->getHeight(densityTarget.x, densityTarget.y);
         }
 
         if (!densityTarget.isValid()) {
-            info(String("MinerPathValidationSimulation miner=") + String::valueOf(minerID) +
-                " zone=" + zoneName +
-                " profile=" + selectedProfile.key +
+            info(String("MinerPathValidationSimulation miner=") + String::valueOf(miner.objectID) +
+                " zone=" + miner.zoneName +
+                " profile=" + selectedProfileKey +
                 " resource=" + selectedResource.name +
+                " type=" + selectedResource.type +
+                " targetSource=" + targetSource +
+                " assignmentStatus=" +
+                    (usingAssignment ?
+                        (assignment.status.isEmpty() ?
+                            String("candidate") : assignment.status) :
+                        String("none")) +
                 " skipped=true reason=noAcceptedDensityTarget" +
                 " densityRejectReason=" + densityDiagnostics.rejectReason +
                 " mode=simulation-only", true);
@@ -6151,14 +8893,20 @@ void SimPlayerManager::logMinerPathValidationSimulations() {
         }
 
         Vector3 targetPosition(densityTarget.x, densityTarget.y, densityTarget.z);
-        float directDistance = minerPosition.distanceTo(targetPosition);
+        float directDistance = miner.position.distanceTo(targetPosition);
 
         if (directDistance > static_cast<float>(minerPathValidationMaxPathDistance)) {
-            info(String("MinerPathValidationSimulation miner=") + String::valueOf(minerID) +
-                " zone=" + zoneName +
-                " profile=" + selectedProfile.key +
+            info(String("MinerPathValidationSimulation miner=") + String::valueOf(miner.objectID) +
+                " zone=" + miner.zoneName +
+                " profile=" + selectedProfileKey +
                 " resource=" + selectedResource.name +
                 " type=" + selectedResource.type +
+                " targetSource=" + targetSource +
+                " assignmentStatus=" +
+                    (usingAssignment ?
+                        (assignment.status.isEmpty() ?
+                            String("candidate") : assignment.status) :
+                        String("none")) +
                 " target=(x:" + String::valueOf(Math::getPrecision(targetPosition.getX(), 1)) +
                 ",y:" + String::valueOf(Math::getPrecision(targetPosition.getY(), 1)) +
                 ",z:" + String::valueOf(Math::getPrecision(targetPosition.getZ(), 1)) + ")" +
@@ -6170,23 +8918,47 @@ void SimPlayerManager::logMinerPathValidationSimulations() {
         }
 
         Reference<MinerPathValidationTask*> pathTask = new MinerPathValidationTask(
-            minerID,
-            zoneName,
-            selectedProfile.key,
+            miner.objectID,
+            miner.zoneName,
+            selectedProfileKey,
             selectedResource.name,
             selectedResource.type,
-            minerPosition,
+            targetSource,
+            miner.position,
             targetPosition,
             densityTarget.density,
             directDistance,
             minerPathValidationMaxPathDistance,
             minerPathValidationMaxPathNodes,
             acceptedDensityTarget,
-            zone);
+            miner.zone);
         pathTask->schedule(0);
 
         ++minerOrdinal;
     }
+}
+
+void SimPlayerManager::recordMinerPathValidationSnapshot(
+        uint64 minerID, const MinerPathValidationSnapshot& snapshot) {
+    if (minerID == 0)
+        return;
+
+    Locker locker(&minerPathValidationSnapshotMutex);
+    minerPathValidationSnapshots.put(minerID, snapshot);
+}
+
+bool SimPlayerManager::getMinerPathValidationSnapshot(
+        uint64 minerID, MinerPathValidationSnapshot& snapshot) {
+    if (minerID == 0)
+        return false;
+
+    Locker locker(&minerPathValidationSnapshotMutex);
+
+    if (!minerPathValidationSnapshots.contains(minerID))
+        return false;
+
+    snapshot = minerPathValidationSnapshots.get(minerID);
+    return true;
 }
 
 void SimPlayerManager::startControllerForAgent(AiAgent* agent, Reference<SimPlayerController*> ctrl) {

@@ -33,6 +33,7 @@ namespace server {
  class APIProxyGuildManager;
  class APIProxyConfigManager;
  class APIProxyStatisticsManager;
+ class APIProxyAiEconomyManager;
  class RESTEndpoint;
 
  using namespace web;
@@ -52,11 +53,14 @@ namespace server {
 	APIProxyGuildManager* mGuildManagerProxy = nullptr;
 	APIProxyConfigManager* mConfigManagerProxy = nullptr;
 	APIProxyStatisticsManager* mStatisticsManager = nullptr;
+	APIProxyAiEconomyManager* mAiEconomyManager = nullptr;
 
 	void createProxies();
 	void destroyProxies();
 	void registerEndpoints();
 	bool checkAuth(http_request& request);
+	bool serveDashboardRequest(http_request& request);
+	String getDashboardContentType(const String& fileName) const;
 	void routeRequest(http_request& request);
 
  public:

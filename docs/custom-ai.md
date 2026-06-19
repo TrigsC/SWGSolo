@@ -1857,10 +1857,14 @@ This gives the AI economy a stronger scoring vocabulary without committing to pe
 | Phase D.2.1 - Broad top-list eligibility cleanup | Add coarse resource-family filters to broad profession top-list logs. | Implemented as log-only filtering; curated profiles remain unchanged. |
 | Phase D.3 - Log-only miner target recommendations | Show which resource a miner or scout would choose for a profile. | Implemented as disabled-by-default recommendation logs; no movement or gathering changes. |
 | Phase D.4 - Miner target selection simulation | Simulate one profile/resource plan per active miner while miners continue current conceptual loops. | Implemented as disabled-by-default simulation logs; no target assignment or behavior change. |
-| D.5-prep - Density target simulation | Find a nearby acceptable density pocket for each D.4 simulated plan. | Implemented as disabled-by-default coordinate logs; no movement, extraction, or target assignment. |
+| D.5-prep - Density target simulation | Find a nearby acceptable density pocket for each simulated plan. | Implemented as disabled-by-default coordinate logs; now prefers the D.6.6 demand-weighted plan when available and falls back to D.4 only diagnostically. |
 | Phase D.5.1 - Density simulation explainability | Explain successful and rejected density candidates with thresholds, counts, ranks, and rejection reasons. | Implemented as diagnostics-only logging; selection behavior is unchanged. |
 | Phase D.5.2 - Path validation simulation | Run the existing pathfinder against accepted simulated density targets without assigning paths to miners. | Implemented as disabled-by-default asynchronous validation logs; no movement or controller callback occurs. |
-| Phase D.5.3 - Behavior-switch design and rollback | Define opt-in activation, failure fallback, operational safeguards, and rollback before any miner movement changes. | Future design phase; should follow observation of D.5.2 results across planets and resource shifts. |
+| Phase D.5.3 - Behavior-switch design and rollback | Decide whether a miner would be allowed to use intelligence-selected targets, with shadow diagnostics and rollback counters. | Implemented as disabled-by-default shadow logs only; actual miner behavior remains unchanged. |
+| Phase D.5.4/D.5.5 - Target validation alignment and assignment cache | Align density/path validation with the D.6.6 demand-weighted target and retain a stable assignment long enough for validation. | Implemented as diagnostics and controller-safe cache; no movement activation by default. |
+| Phase D.5.6 - Limited intelligent miner target activation | Allow one miner to queue and follow one validated retained assignment behind explicit limited-mode gates. | Implemented as opt-in behavior; default config still prevents real activation. |
+| Phase D.5.7 - Limited activation stability and path validation tightening | Make limited activation require an explicitly trusted path result and add lifecycle diagnostics for queued, started, arrived/sample-started, sample-finished, and cleared assignments. | Implemented as diagnostics and fail-closed gating; activation breadth and economy behavior are unchanged. |
+| Phase D.5.8 - Limited activation soak controls and gradual scale-up | Add controlled scale-up knobs, per-miner cooldown, zone allowlist, emergency stop, and compact activation health summaries. | Implemented as manager-only soak controls around the existing limited activation path; defaults keep one-miner behavior. |
 | Phase D.5 - Optional miner targeting switch | Add a disabled-by-default switch for miners to use resource-intelligence targets. | First possible behavior change; requires careful testing and rollback. |
 | Phase D.6 - Hot-item demand profile research | Replace toy schematic assumptions with player-goal, component-chain, server-phase, resource-rush, and stockpile concepts. | Documentation only; no scoring or miner behavior changes. |
 | Phase D.6.1 - Dynamic demand simulator | Apply configurable hot-item demand weights to active-resource recommendation logs. | Implemented as disabled-by-default log-only scoring; disconnected from miner targeting. |
@@ -2326,7 +2330,7 @@ minerPathValidationSimulationConfig = {
 Execution and lifetime safety:
 
 1. A manager-owned periodic task copies the same active `ResourceSpawn` metadata used by Resource Intelligence.
-2. It reproduces the D.4 round-robin profile/resource plan and the D.5-prep deterministic density search without storing either result.
+2. It prefers the D.6.6 demand-weighted profile/resource plan, using the older D.4 round-robin plan only as a diagnostic fallback when no demand-weighted plan is available.
 3. Wrong-planet and missing-density-target cases are logged as skipped.
 4. For a usable coordinate, the manager copies primitive identifiers, names, positions, density, and limits into a standalone `MinerPathValidationTask`.
 5. The task keeps only a managed `Zone` reference. It captures no raw or delayed `SimMinerController*` or `AiAgent*`.
@@ -2335,13 +2339,19 @@ Execution and lifetime safety:
 Example validated route:
 
 ```text
-MinerPathValidationSimulation miner=281475014318303 zone=tatooine profile=architect_mining_unit resource=Goree type=steel_quadranium target=(x:3380.5,y:-4756.6,z:5.0) density=0.663 distance=248.6 densityTarget=accepted pathFound=true pathNodes=37 pathDistance=312.4 directFallback=false mode=simulation-only
+MinerPathValidationSimulation miner=281475014318303 zone=tatooine profile=architect_mining_unit resource=Goree type=steel_quadranium targetSource=demand_weighted_plan target=(x:3380.5,y:-4756.6,z:5.0) density=0.663 distance=248.6 densityTarget=accepted pathFound=true pathNodes=37 pathDistance=312.4 directFallback=false mode=simulation-only
 ```
 
 Example failed route:
 
 ```text
-MinerPathValidationSimulation miner=281475014318295 zone=tatooine profile=weaponsmith_dl44 resource=Gowane type=copper_polysteel target=(x:5220.5,y:-4252.0,z:175.8) density=0.687 distance=411.2 densityTarget=accepted pathFound=false pathNodes=0 pathDistance=0.0 directFallback=false rejectReason=noPath mode=simulation-only
+MinerPathValidationSimulation miner=281475014318295 zone=tatooine profile=weaponsmith_dl44 resource=Gowane type=copper_polysteel targetSource=demand_weighted_plan target=(x:5220.5,y:-4252.0,z:175.8) density=0.687 distance=411.2 densityTarget=accepted pathFound=false pathNodes=0 pathDistance=0.0 directFallback=false rejectReason=noPath mode=simulation-only
+```
+
+When the path task validates a D.6.6 target, it also emits a compact provenance line:
+
+```text
+DemandWeightedMinerTargetValidation miner=281475014318303 zone=tatooine selectedProfile=architect_mining_unit targetResource=Goree targetType=steel_quadranium targetSource=demand_weighted_plan densityTargetStatus=accepted pathValidationStatus=valid matchesSwitchDecision=true mode=diagnostic-only
 ```
 
 Important pathfinder limitation:
@@ -2361,7 +2371,459 @@ Safety boundaries and limitations:
 - Validation observes the route returned at one moment. It does not guarantee that dynamic world conditions will remain unchanged.
 - D.5.2 does not test cross-planet travel; remote resources are logged as `wrongPlanet`.
 
-The next phase should be D.5.3, a behavior-switch design and rollback plan. Optional real targeting should not begin until D.5.2 logs are sane across multiple planets, terrain types, miner lifetimes, and resource shifts.
+#### Phase D.5.3 - Miner Intelligent Targeting Switch Design and Rollback
+
+D.5.3 adds a disabled-by-default switch-decision layer for future intelligent SimMiner targeting. It answers whether a miner would be allowed to leave the current random conceptual loop and use an intelligence-selected target, but it does not activate that behavior. The only implemented mode is shadow diagnostics.
+
+Configuration:
+
+```lua
+minerIntelligentTargetingConfig = {
+    enabled = false,
+    mode = "off",
+    intervalSeconds = 300,
+    maxActiveMiners = 1,
+    requireDemandWeightedPlan = true,
+    requireAcceptedDensityTarget = true,
+    requireValidPath = true,
+    fallbackToConceptualLoop = true,
+    rollbackOnFailureCount = 3,
+    logDecisionSummary = true,
+}
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Enables the D.5.3 diagnostic task. |
+| `mode` | `"off"` | `off` emits no switch-decision logs. `shadow` emits diagnostics only. Invalid modes fail closed to `off`. |
+| `intervalSeconds` | `300` | Diagnostic interval, clamped to `30..3600`. |
+| `maxActiveMiners` | `1` | Maximum miners evaluated per interval. Additional miners are counted as capped in the summary. |
+| `requireDemandWeightedPlan` | `true` | Requires a D.6.6-style demand-weighted plan before a miner would be eligible. |
+| `requireAcceptedDensityTarget` | `true` | Requires an accepted same-planet density target for the selected resource. |
+| `requireValidPath` | `true` | Requires a matching cached D.5.2 path-validation result with `pathFound=true`. |
+| `fallbackToConceptualLoop` | `true` | Documents that the current conceptual loop remains the fallback. |
+| `rollbackOnFailureCount` | `3` | Number of consecutive failed decisions before diagnostics mark `rollbackHeld=true`. |
+| `logDecisionSummary` | `true` | Emits one compact per-interval summary. |
+
+Decision flow:
+
+1. The manager copies active miner identity, zone, position, and navmesh status under short `AiAgent` locks.
+2. It recomputes a D.6.6-style demand-weighted plan from copied Resource Intelligence, conceptual supply, optional market-observation snapshots, and D.6.6 config values.
+3. It probes a density target for the selected simulated resource using the existing D.5-prep bounded search.
+4. It reads the latest copied D.5.2 path-validation snapshot for the same miner/profile/resource/type, `targetSource=demand_weighted_plan`, and matching density coordinate.
+5. It applies the configured gates and logs `wouldActivate=true|false`.
+6. It always logs `actualActivation=false`; no behavior-changing activation exists in this phase.
+
+Example successful shadow decision:
+
+```text
+MinerTargetingSwitchDecision miner=281475017397855 zone=corellia mode=shadow selectedProfile=chef_high_value_consumables demandState=surplus pressureScore=482.5 targetResource=Ptohi targetType=fruit_fruits_naboo targetSource=demand_weighted_plan samePlanet=true travelRequired=false densityTargetStatus=accepted pathValidationStatus=valid wouldActivate=true actualActivation=false fallbackReason=shadowMode fallbackToConceptualLoop=true rollbackHeld=false failureCount=0 assignmentReason="highest demand pressure; same-planet opportunity" decisionBasis=demandWeightedMinerPlanSimulation diagnosticOnly=true mode=diagnostic-only
+```
+
+Example fail-closed decision:
+
+```text
+MinerTargetingSwitchDecision miner=281475017397855 zone=naboo mode=shadow selectedProfile=production_infrastructure demandState=surplus pressureScore=443.5 targetResource=Toahiiam targetType=iron_doonium targetSource=demand_weighted_plan samePlanet=true travelRequired=false densityTargetStatus=accepted pathValidationStatus=failed pathRejectReason=noPath wouldActivate=false actualActivation=false fallbackReason=pathValidationFailed fallbackToConceptualLoop=true rollbackHeld=false failureCount=2 assignmentReason="highest demand pressure; same-planet opportunity" decisionBasis=demandWeightedMinerPlanSimulation diagnosticOnly=true mode=diagnostic-only
+```
+
+Summary example:
+
+```text
+MinerTargetingSwitchDecisionSummary activeMiners=4 evaluated=1 wouldActivate=0 fallback=1 capped=3 noPlan=0 noDensityTarget=0 pathRejected=1 rollbackHeld=0 mode=shadow diagnosticOnly=true
+```
+
+Safety boundaries:
+
+- D.5.3 does not call `moveTo`, queue patrol points, assign `targetResource`, change miner blackboard state, alter survey/sample timing, change conceptual resource selection, or change yield accounting.
+- It does not write `AiEconomyData`, checkpoint conceptual totals, mark persistence objects dirty, or consume/produce stockpile.
+- It does not create `ResourceContainer` objects, resources, inventory items, vendor listings, bazaar entries, crafting output, harvester output, or credits.
+- It copies primitive/string snapshots and releases locks before scoring and logging. A temporary managed `Zone` reference may be used during the immediate density probe, but D.5.3 does not retain it or capture it in delayed work. It does not capture delayed raw `SimMinerController*`, `AiAgent*`, `ResourceSpawn*`, `AuctionItem*`, or `ResourceContainer*` pointers.
+
+Known limitations:
+
+- D.5.3 accepts a cached path result only if it was produced from `targetSource=demand_weighted_plan` and matches the current D.6.6 profile, resource name, resource type, and density coordinate. If the latest path validation is for a different simulated plan or stale coordinate, D.5.3 logs `pathValidationStatus=target_mismatch`, `fallbackReason=pathValidationTargetMismatch`, and fails closed when `requireValidPath=true`.
+- D.6.6 remains intentionally separate from C.3.3/C.3.4 persistent stockpile pressure unless a later explicitly gated phase connects those signals.
+- Enabling D.5.3 from a fully stopped state follows the existing SimPlayer config pattern and normally requires manager/server reload. While running, it reloads its own config each interval.
+
+#### Phase D.5.4/D.5.5 - Demand-Weighted Target Validation Alignment and Assignment Cache
+
+D.5.4 aligns the validation chain around the same simulated target that D.5.3 would use for a future behavior switch:
+
+```text
+D.6.6 demand-weighted miner plan
+-> D.5 density target for that profile/resource
+-> D.5.2 path validation for that density target
+-> D.5.3 switch decision
+```
+
+D.5.4 testing showed that the target source alignment worked, but strict shadow decisions still failed later with `pathValidationTargetMismatch`. That was expected because miners continued their old conceptual loop and could move between D.6.6 selection, density probing, path validation, and the next D.5.3 decision. D.5.5 adds a manager-owned per-miner intelligent target assignment cache so those diagnostics can refer to one stable target long enough for validation to catch up.
+
+The density and path validation logs include `targetSource`. The preferred source is `demand_weighted_plan`; `round_robin_plan` remains only as a diagnostic fallback if D.6.6 cannot produce a plan. The path-validation task records copied primitive/string snapshots containing profile, resource name, resource type, target source, target coordinate, density, path result, and timestamp. D.5.3 only treats a cached path as valid when all of these match the current D.6.6 switch target or the retained assignment target.
+`DemandWeightedMinerTargetValidation.matchesSwitchDecision=false` can appear before an assignment exists or when the validation is for a stale target; it should become `true` only when the path result matches the retained assignment.
+
+Assignment config:
+
+```lua
+minerIntelligentTargetingConfig = {
+    enabled = true,
+    mode = "shadow",
+    maxActiveMiners = 1,
+    requireDemandWeightedPlan = true,
+    requireAcceptedDensityTarget = true,
+    requireValidPath = true,
+    fallbackToConceptualLoop = true,
+    rollbackOnFailureCount = 3,
+    logDecisionSummary = true,
+    assignmentConfig = {
+        enabled = true,
+        ttlSeconds = 180,
+        replaceOnlyWhenExpiredOrInvalid = true,
+        clearOnSampleComplete = true,
+        clearOnCombat = true,
+        clearOnIncapOrDeath = true,
+        clearOnZoneChange = true,
+        logAssignmentLifecycle = true,
+    },
+    limitedActivationConfig = {
+        enabled = false,
+        maxActivationsPerInterval = 1,
+        requireSamePlanet = true,
+        disableOnFirstActivationFailure = true,
+        logActivationLifecycle = true,
+    },
+}
+```
+
+If valid-path gating is enabled, the effective assignment TTL is clamped high enough to span the targeting interval plus the path-validation interval. This prevents an assignment from expiring before D.5.2 has a chance to validate it.
+
+Assignment contents are copied primitive/string fields only:
+
+- Miner object id.
+- Created, updated, and expiration timestamps.
+- `targetSource=demand_weighted_plan`.
+- Selected demand profile, demand state, and pressure score.
+- Target resource name/type and target zone.
+- Density coordinate and density value.
+- Density/path status and whether path validation matched.
+- Assignment status such as `candidate` or `validated`.
+
+Assignment lifecycle examples:
+
+```text
+MinerIntelligentTargetAssignment miner=281475017397855 action=created targetSource=demand_weighted_plan selectedProfile=chef_high_value_consumables targetResource=Ptohi targetType=fruit_fruits_naboo targetZone=naboo x=1234.0 y=-5678.0 z=12.3 densityTargetStatus=accepted pathValidationStatus=not_checked ttlSeconds=180 mode=shadow
+MinerIntelligentTargetAssignment miner=281475017397855 action=retained selectedProfile=chef_high_value_consumables targetResource=Ptohi ageSeconds=61 remainingSeconds=119 pathValidationStatus=valid mode=shadow
+MinerIntelligentTargetAssignment miner=281475017397855 action=cleared clearReason=expired selectedProfile=chef_high_value_consumables targetResource=Ptohi ageSeconds=181 mode=shadow
+```
+
+Expected diagnostic outcomes:
+
+- `wouldActivate=true` means a D.6.6 demand-weighted plan or retained assignment exists, an accepted same-planet density target exists, and a matching D.6.6-sourced path-validation snapshot has `pathFound=true`.
+- `actualActivation=false` still means no behavior change occurs.
+- `fallbackReason=pathValidationTargetMismatch` means a path snapshot exists but was for a different target source, profile/resource, or density coordinate.
+- `fallbackReason=pathValidationUnavailable` usually means the D.5.2 task has not produced a matching snapshot yet, or path validation simulation is disabled.
+- `assignmentStatus=validated` means the assignment target has a matching successful path-validation snapshot.
+- `assignmentStatus=candidate` means the assignment exists but has not yet received a valid matching path result.
+
+Switch-decision example:
+
+```text
+MinerTargetingSwitchDecision miner=281475017397855 zone=naboo mode=shadow selectedProfile=chef_high_value_consumables demandState=critical pressureScore=1848.6 targetResource=Ptohi targetType=fruit_fruits_naboo targetSource=demand_weighted_plan samePlanet=true travelRequired=false densityTargetStatus=accepted pathValidationStatus=valid pathRejectReason=none assignmentStatus=validated assignmentAgeSeconds=65 assignmentMatchesValidation=true assignmentTargetResource=Ptohi assignmentTargetType=fruit_fruits_naboo assignmentTargetZone=naboo assignmentClearReason=none wouldActivate=true actualActivation=false fallbackReason=shadowMode diagnosticOnly=true mode=diagnostic-only
+```
+
+D.5.5 intentionally did not call `moveTo`, queue patrol points, or change miner movement. It proved the assignment and validation chain before adding any behavior switch.
+
+Safety boundaries:
+
+- No D.5.5 path mutates `AiEconomyData`, `AiEconomyStockpileLot`, market listings, inventory, vendors, bazaar, crafting, harvesters, credits, or player-facing economy.
+- No `ResourceContainer` objects or real resources are created.
+- No miner destination, patrol point, movement state, survey timing, sample timing, conceptual resource selection, or yield amount is changed.
+- The assignment cache stores no `AiAgent`, controller, `ResourceSpawn`, path node, `ManagedObject`, `Zone`, `AuctionItem`, or resource-container references.
+- Locks are limited to cache map updates and copied snapshots; formatting/logging happens outside those locks.
+- `clearOnSampleComplete` applies only to assignment-aware intelligent sample completion. The current unrelated conceptual sample loop does not clear assignments, because doing so would recreate the validation drift D.5.5 is designed to diagnose.
+
+Test procedure:
+
+1. Run with `mode="shadow"`, assignment caching enabled, and `requireValidPath=true`.
+2. Confirm `MinerIntelligentTargetAssignment action=created` appears for the evaluated miner.
+3. Confirm later density/path logs show the same assignment target or `reason=retained assignment target`.
+4. Confirm `MinerTargetingSwitchDecision` reports assignment fields.
+5. Confirm `actualActivation=false` always remains true for this phase.
+
+#### Phase D.5.6 - Limited Intelligent Miner Target Activation
+
+D.5.6 adds the first opt-in behavior change for SimMiners. It allows one evaluated miner to accept one retained, validated D.5.5 assignment and queue assignment-aware movement toward that density coordinate. The default repo config still runs in shadow mode with `limitedActivationConfig.enabled=false`, so no movement change occurs until both gates are explicitly enabled.
+
+Limited activation config:
+
+```lua
+minerIntelligentTargetingConfig = {
+    enabled = true,
+    mode = "limited",
+    maxActiveMiners = 1,
+    requireDemandWeightedPlan = true,
+    requireAcceptedDensityTarget = true,
+    requireValidPath = true,
+    fallbackToConceptualLoop = true,
+    rollbackOnFailureCount = 3,
+    logDecisionSummary = true,
+    assignmentConfig = {
+        enabled = true,
+        ttlSeconds = 180,
+        replaceOnlyWhenExpiredOrInvalid = true,
+        clearOnSampleComplete = true,
+        clearOnCombat = true,
+        clearOnIncapOrDeath = true,
+        clearOnZoneChange = true,
+        logAssignmentLifecycle = true,
+    },
+    limitedActivationConfig = {
+        enabled = true,
+        maxActivationsPerInterval = 1,
+        requireSamePlanet = true,
+        disableOnFirstActivationFailure = true,
+        logActivationLifecycle = true,
+    },
+}
+```
+
+Activation gates:
+
+- `minerIntelligentTargetingConfig.enabled=true`.
+- `mode="limited"`.
+- `limitedActivationConfig.enabled=true`.
+- A retained assignment exists, is not expired, and has `targetSource=demand_weighted_plan`.
+- The assignment has accepted density and matching valid path validation.
+- The assignment matches the same miner, profile, resource name, resource type, zone, and density coordinate.
+- The miner has a valid controller and zone, is alive, is not incapacitated, and is not in combat.
+- Same-planet targeting is required when `requireSamePlanet=true`.
+- The miner is not rollback-held.
+- The interval activation cap has not been reached.
+
+Assignment-aware controller behavior:
+
+1. The manager does not interrupt the miner mid-survey, movement, or sample. It queues a copied primitive assignment on the `SimMinerController`.
+2. The controller starts the intelligent assignment at the next safe `startSimLoop()` boundary.
+3. The controller moves to the retained density coordinate using the existing pathing machinery.
+4. `SimMinerController::onArrived()` now has an assignment-aware branch. Intelligent arrivals log `MinerIntelligentTargetArrival` and start the visual sample animation without falling through the old conceptual arrival path.
+5. The intelligent sample still records only conceptual yield. It chooses the conceptual yield label with the existing `pickRandomResource()` path, not from the exact `ResourceSpawn` target.
+6. On sample completion, the local assignment state is cleared and the manager cache is cleared when `clearOnSampleComplete=true`.
+7. On path failure, expired assignment, combat, incap/death, missing zone, zone mismatch, or invalid target, the controller logs fallback and returns to the old conceptual loop.
+
+Example logs:
+
+```text
+MinerTargetingSwitchDecision miner=281475017397855 zone=naboo mode=limited selectedProfile=chef_high_value_consumables targetResource=Ptohi targetType=fruit_fruits_naboo assignmentStatus=validated assignmentMatchesValidation=true wouldActivate=true actualActivation=true activationResult=queued fallbackReason=none limitedActivationEnabled=true diagnosticOnly=false mode=limited
+MinerIntelligentTargetActivation miner=281475017397855 action=queued selectedProfile=chef_high_value_consumables targetResource=Ptohi targetType=fruit_fruits_naboo targetZone=naboo x=1234.0 y=-5678.0 z=12.3 density=0.764 pathValidationStatus=valid mode=limited
+MinerIntelligentTargetActivation miner=281475017397855 action=started selectedProfile=chef_high_value_consumables targetResource=Ptohi targetType=fruit_fruits_naboo targetZone=naboo x=1234.0 y=-5678.0 z=12.3 density=0.764 pathValidationStatus=valid mode=limited
+MinerIntelligentTargetArrival miner=281475017397855 selectedProfile=chef_high_value_consumables targetResource=Ptohi targetType=fruit_fruits_naboo arrivalResult=sample_started yieldMode=conceptual conceptualResource=water mode=limited
+MinerIntelligentTargetAssignment miner=281475017397855 action=cleared clearReason=sampleComplete selectedProfile=chef_high_value_consumables targetResource=Ptohi ageSeconds=42 mode=limited
+```
+
+Failure example:
+
+```text
+MinerIntelligentTargetActivation miner=281475017397855 action=fallback fallbackReason=controllerStateNotSafe selectedProfile=chef_high_value_consumables targetResource=Ptohi targetType=fruit_fruits_naboo targetZone=naboo mode=limited
+```
+
+Safety boundaries:
+
+- No limited activation occurs unless `mode="limited"` and `limitedActivationConfig.enabled=true`.
+- At most one activation is accepted per interval by default.
+- No real resource extraction occurs.
+- No `ResourceContainer`, inventory item, vendor listing, bazaar entry, harvester output, crafting output, credit transfer, market purchase, reservation, consumption, or persistence write is created.
+- No `AiEconomyData` or `AiEconomyStockpileLot` object is modified from D.5.6.
+- The exact ResourceSpawn target is not converted into a conceptual yield label. Conceptual yield remains conceptual and uses the existing random conceptual label path.
+- No delayed task captures raw controller, `AiAgent`, `ResourceSpawn`, path-node, market, or resource-container pointers.
+
+Test procedure:
+
+1. Start with the current shadow config and confirm `actualActivation=false`.
+2. Set `mode="limited"`, `limitedActivationConfig.enabled=true`, and `assignmentConfig.clearOnSampleComplete=true`.
+3. Keep `maxActiveMiners=1` and `maxActivationsPerInterval=1`.
+4. Confirm exactly one switch decision can show `actualActivation=true activationResult=queued` per interval.
+5. Confirm the controller later logs `MinerIntelligentTargetActivation action=started`.
+6. Confirm arrival logs are assignment-aware and include `yieldMode=conceptual`.
+7. Confirm the assignment clears with `clearReason=sampleComplete`.
+8. Confirm conceptual yield logs continue and no player-facing economy/resource/container logs appear.
+
+Known limitations:
+
+- Activation is queued at the next safe miner loop boundary rather than interrupting the current sample or path.
+- The miner still records conceptual output, not real resource output.
+- Activation uses one validated density coordinate; it does not yet support dynamic retargeting while en route.
+- If the assignment expires before the controller reaches the safe boundary, activation fails closed and the old conceptual loop continues.
+
+The next possible phase should observe limited activation over longer runs, then decide whether to support more than one active miner or add richer fallback/retargeting controls.
+
+#### Phase D.5.7 - Limited Activation Stability and Path Validation Tightening
+
+D.5.7 keeps D.5.6's limited activation behavior narrow while making the logs easier to trust during longer tests. It does not add new miner capacity, new targeting behavior, resource extraction, persistence, or economy output.
+
+Path validation trust tightening:
+
+- `MinerPathValidationSimulation` now emits `pathTrustStatus`.
+- A normal multi-node path that passes distance/node limits is marked `pathTrustStatus=verifiedPath`.
+- `directFallbackUnverified`, `noPath`, `pathTooLong`, `tooManyPathNodes`, path exceptions, stale validation, target mismatch, and coordinate mismatch remain fail-closed.
+- `MinerTargetingSwitchDecision` now reports both `pathValidationStatus` and `pathTrustStatus`.
+- Limited activation requires `pathValidationStatus=valid`, `assignmentMatchesValidation=true`, and `pathTrustStatus=verifiedPath`.
+- A direct start/end fallback from the pathfinder is still treated as unverified and cannot activate a miner.
+
+Assignment lifecycle diagnostics:
+
+```text
+MinerIntelligentTargetActivation miner=281475017397855 action=queued ... pathTrustStatus=verifiedPath queuedState=sampling queuedDuringSample=true previousSampleYieldMayFollow=true mode=limited
+MinerIntelligentTargetActivation miner=281475017397855 action=started ... queuedAgeSeconds=18 mode=limited
+MinerIntelligentTargetArrival miner=281475017397855 ... arrivalResult=sample_started yieldMode=conceptual conceptualResource=water mode=limited
+MinerIntelligentTargetAssignment miner=281475017397855 action=cleared clearReason=sampleComplete ... validatedAgeSeconds=60 queuedAgeSeconds=60 activatedAgeSeconds=79 sampleStartedAgeSeconds=80 sampleFinishedAgeSeconds=95 pathValidationStatus=valid pathTrustStatus=verifiedPath lastActivationResult=started lastFailureReason=none mode=limited
+```
+
+The `queuedDuringSample` and `previousSampleYieldMayFollow` fields explain the normal ordering where a miner can accept a limited activation at the next loop boundary while the previous conceptual sample's yield log appears nearby. The activation still starts only through the assignment-aware path and keeps yield conceptual.
+
+Safety boundaries:
+
+- No activation occurs unless the existing D.5.6 limited-mode gates are explicitly enabled.
+- D.5.7 does not increase `maxActiveMiners` or `maxActivationsPerInterval`.
+- No miner activates from `directFallbackUnverified` or any other untrusted path result.
+- No `ResourceContainer`, real resource, inventory item, vendor/bazaar/auction listing, harvester output, crafting output, credit transfer, AI stockpile mutation, or persistence write is created.
+- No demand profile, density selection, yield amount, conceptual resource selection, or market observation behavior is changed.
+
+Test procedure:
+
+1. Keep `maxActiveMiners=1`, `maxActivationsPerInterval=1`, `requireValidPath=true`, and `limitedActivationConfig.enabled=true`.
+2. Confirm every activation-capable `MinerTargetingSwitchDecision` has `pathTrustStatus=verifiedPath`.
+3. Confirm `directFallbackUnverified` appears only as a failed/untrusted path validation and never as `actualActivation=true`.
+4. Confirm assignment clear logs include lifecycle ages for validation, queued, activation start, sample start, and sample finish when those stages occurred.
+5. Confirm conceptual yield logs still use the existing SimMiner conceptual labels and no player-facing economy objects are created.
+
+Known limitations:
+
+- The lifecycle timestamps are diagnostic only and are not persisted.
+- `sampleStartedAgeSeconds` represents the assignment-aware arrival/sample-start boundary; it is not a real resource extraction event.
+- The feature still supports only the explicitly capped limited activation path. Broader activation should wait until long-run logs show stable trusted-path behavior.
+
+#### Phase D.5.8 - Limited Activation Soak Controls and Gradual Scale-Up
+
+D.5.8 adds soak-test controls around the D.5.6/D.5.7 limited activation path. It is meant to let operators test one miner for longer runs, then gradually raise caps when logs stay healthy. It does not change demand scoring, density targeting, path validation math, conceptual yield, persistence, or economy output.
+
+Additional limited activation config:
+
+```lua
+minerIntelligentTargetingConfig = {
+    mode = "limited",
+    maxActiveMiners = 1,
+    limitedActivationConfig = {
+        enabled = true,
+        maxActiveIntelligentMiners = 1,
+        maxActivationsPerInterval = 1,
+        cooldownSecondsPerMiner = 0,
+        allowedZones = {},
+        requireSamePlanet = true,
+        disableOnFirstActivationFailure = true,
+        disableOnActivationFailure = false,
+        logActivationLifecycle = true,
+        logHealthSummary = true,
+    },
+}
+```
+
+Field behavior:
+
+- `maxActiveIntelligentMiners` limits assignments currently queued, moving, or sampling through the intelligent path. The default remains `1`.
+- `maxActivationsPerInterval` still limits new activation requests accepted in one manager interval.
+- `cooldownSecondsPerMiner` prevents the same miner from accepting another new intelligent activation until the cooldown expires. The default `0` preserves previous behavior.
+- `allowedZones` is an optional allowlist. Empty means all zones are allowed. A non-empty list skips activation for miners outside those zones without marking that as a failure.
+- `disableOnActivationFailure` is an emergency latch for real activation failures. It is off by default and resets when limited activation is disabled or the option is turned off.
+- Controlled skips from caps, cooldown, disallowed zones, or interval disablement do not trip the failure latch.
+
+Health summary:
+
+```text
+MinerIntelligentActivationHealth active=1 attempted=1 started=1 arrivals=1 sampleFinished=1 pathFailed=0 expired=0 rollbackHeld=0 controlledSkips=0 cooldownSkips=0 activeCapSkips=0 zoneSkips=0 activationFallbacks=0 maxActive=1 maxActivationsPerInterval=1 cooldownSeconds=0 emergencyDisabled=false mode=limited
+```
+
+The counters are interval summaries:
+
+- `attempted` counts controller activation requests.
+- `started` counts assignment-aware movement starts.
+- `arrivals` counts assignment-aware arrival/sample-start events.
+- `sampleFinished` counts assignment-aware conceptual sample completion.
+- `pathFailed` counts assignment-aware path failures.
+- `expired` counts assignment clears caused by expiration.
+- `controlledSkips` counts cap/cooldown/zone/emergency skips that are expected during soak tests.
+- `activationFallbacks` counts actual activation failures that should be investigated.
+
+Safety boundaries:
+
+- The default scale remains one active intelligent miner and one new activation per interval.
+- Raising caps is operator-controlled; no automatic scale-up occurs.
+- No real resources, `ResourceContainer` objects, inventory, vendors, bazaar/auction listings, harvesters, crafting output, credits, market purchases, reservations, stockpile mutations, or persistence writes are created.
+- The old conceptual fallback loop remains the fallback for all skipped or failed limited activations.
+- All health state is manager memory only and resets on server restart.
+
+Recommended soak procedure:
+
+1. Run with `maxActiveIntelligentMiners=1`, `maxActivationsPerInterval=1`, and `cooldownSecondsPerMiner=0`.
+2. Confirm `activationFallbacks=0`, `pathFailed=0`, and `emergencyDisabled=false` across several intervals.
+3. Add a small cooldown such as `cooldownSecondsPerMiner=120` if the same miner repeats too often.
+4. Optionally set `allowedZones = { "tatooine" }` or another test planet to isolate runs.
+5. Only after long clean runs, raise `maxActiveIntelligentMiners` and `maxActivationsPerInterval` one step at a time.
+
+Known limitations:
+
+- The health counters are operational diagnostics, not persisted metrics.
+- The active count is based on retained manager assignments with queued/started/sample-started statuses.
+- D.5.8 still does not make exact-resource yield or real extraction decisions. It only makes limited activation safer to observe at small scale.
+
+#### Phase D.5.8.1 - Config and Log Consolidation
+
+D.5.8.1 is a cleanup-only pass. It does not change miner targeting behavior, activation gates, demand scoring, conceptual yield, AI economy persistence, market observation, or any player-facing economy path.
+
+Planner and diagnostic intent:
+
+- D.6.6 demand-weighted planning is now the canonical planner for intelligent SimMiner targeting.
+- D.3 miner target recommendations remain useful for resource-intelligence debugging, but they are not required for normal limited-activation soak.
+- D.4 round-robin target simulation remains a legacy diagnostic/fallback comparison, not the preferred targeting signal.
+- D.5 density and D.5.2 path validation remain required because they validate the exact D.6.6/assignment target before limited activation can proceed.
+- D.5.3 switch decisions remain useful, but per-miner lines are now summary-first: stable no-change intervals rely on summaries, while activation-capable decisions, activation failures, path failures, trust failures, target mismatches, and rollback-held cases still emit detailed lines.
+- `MinerIntelligentActivationHealth` is the primary D.5 limited-activation soak signal.
+
+Operator mode comments were added to `sim_player_manager.lua`:
+
+| Mode | Meaning |
+|---|---|
+| `observe` | Resource, demand, market, stockpile, and planner logs only; no intelligent targeting or activation. |
+| `shadow` | Assignment and would-activate diagnostics; `actualActivation=false`. |
+| `limited` | Explicitly gated miners may move to verified retained assignments; yield remains conceptual. |
+| `soak` | Alias for limited mode plus health summaries, cooldowns, caps, and emergency latch for longer runs. Internally this normalizes to the existing `limited` activation path. |
+
+The three activation caps are intentionally separate:
+
+| Field | Meaning |
+|---|---|
+| `maxActiveMiners` | Number of miners evaluated by D.5.3/D.5.5 switch-decision and assignment logic per interval. It is not the active mover cap. |
+| `maxActiveIntelligentMiners` | Number of miners currently queued, moving, or sampling through the intelligent assignment path. |
+| `maxActivationsPerInterval` | Number of new intelligent activations accepted in one manager interval. |
+
+Log-noise reductions:
+
+- `assignmentConfig.logRetainedAssignments=false` suppresses repeated `MinerIntelligentTargetAssignment action=retained` lines during stable soak intervals.
+- Creation, validation/update, failure, clear, activation, and near-expiry assignment lifecycle lines remain available through `logAssignmentLifecycle=true`.
+- `logVerboseSwitchDecisions=false` keeps full `MinerTargetingSwitchDecision` lines focused on activation-capable decisions, activation outcomes, path/trust failures, assignment mismatches, and rollback-held cases.
+- `MinerTargetingSwitchDecisionSummary` and `MinerIntelligentActivationHealth` include compact aggregate counts such as assignment mismatches, path trust rejections, controlled skips, cooldown skips, active-cap skips, zone skips, and activation fallbacks.
+- Routine base SimPlayer movement/path trace logs remain gated behind `DEBUG_SIMPVP`; exception/failure and assignment-aware activation lifecycle logs remain visible.
+
+Safety gates intentionally remain mandatory:
+
+- `SimPlayerManagerConfig.enabled`.
+- `minerIntelligentTargetingConfig.mode`.
+- `limitedActivationConfig.enabled`.
+- `requireDemandWeightedPlan`, `requireAcceptedDensityTarget`, and `requireValidPath`.
+- `pathTrustStatus=verifiedPath`.
+- The retained assignment cache and TTL/clear-on-combat/incap/death/zone-change rules.
+- `maxActiveIntelligentMiners` and `maxActivationsPerInterval`.
+- AI economy persistence write/read gates.
+- Market observation read-only separation.
+- No real resources, no `ResourceContainer` objects, no player inventory/vendor/bazaar/crafting/harvester/credit mutations, and no persistence writes from activation.
 
 ### D.6 - Hot-Item Demand Profile Research
 

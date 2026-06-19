@@ -144,6 +144,20 @@ class SimMinerController : public SimPlayerController {
     String targetResource;
     int retryCount;
     SimMinerConfig config;
+    bool intelligentAssignmentPending;
+    bool intelligentAssignmentActive;
+    bool intelligentSampleActive;
+    bool intelligentLogActivationLifecycle;
+    bool intelligentQueuedDuringSample;
+    uint64 intelligentQueuedAtMs;
+    String intelligentQueuedState;
+    String intelligentProfileKey;
+    String intelligentResourceName;
+    String intelligentResourceType;
+    String intelligentTargetZone;
+    Vector3 intelligentTargetPosition;
+    float intelligentTargetDensity;
+    uint64 intelligentAssignmentExpiresAtMs;
 
 public:
     SimMinerController(AiAgent* aiAgent);
@@ -160,12 +174,29 @@ public:
     void goToResource(const String& resourceName);
     void performSample();
     void finishSample();
+    bool requestIntelligentTargetAssignment(
+        const String& profileKey,
+        const String& resourceName,
+        const String& resourceType,
+        const String& targetZone,
+        const Vector3& targetPosition,
+        float density,
+        uint64 expiresAtMs,
+        bool logActivationLifecycle,
+        String& activationResult);
 
     String pickRandomResource();
 
 private:
     void logStateTransition(const String& message) const;
     bool prepareConceptualYield(const String& completedResource, int& amount, bool& logYield) const;
+    bool beginIntelligentTargetAssignment(String& activationResult);
+    void performIntelligentSample();
+    void finishIntelligentSample();
+    void clearLocalIntelligentTargetAssignment();
+    String getSimStateName(SimState simState) const;
+    void logIntelligentTargetActivation(const String& action, const String& reason = "") const;
+    void logIntelligentTargetArrival(const String& arrivalResult) const;
 };
 
 #endif

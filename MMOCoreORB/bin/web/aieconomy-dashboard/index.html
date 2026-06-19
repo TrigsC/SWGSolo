@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Economy Datapad</title>
+  <link rel="stylesheet" href="/dashboard/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <div>
+          <h1>AI Economy Datapad</h1>
+          <p id="server-state">Awaiting local API token</p>
+        </div>
+      </div>
+      <form id="token-form" class="token-form">
+        <input id="token-input" type="password" autocomplete="current-password" placeholder="REST API token" aria-label="REST API token">
+        <button type="submit">Connect</button>
+      </form>
+    </header>
+
+    <main class="dashboard-grid">
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>AI Population</h2>
+          <span id="as-of">No snapshot</span>
+        </div>
+        <div class="metric-strip">
+          <article class="metric">
+            <span>Active Miners</span>
+            <strong id="active-miners">0</strong>
+          </article>
+          <article class="metric">
+            <span>PvP Bots</span>
+            <strong id="active-pvp">0</strong>
+            <small id="pvp-status">experimental</small>
+          </article>
+          <article class="metric muted">
+            <span>Crafters</span>
+            <strong>0</strong>
+            <small>not implemented</small>
+          </article>
+          <article class="metric muted">
+            <span>PvE Roles</span>
+            <strong>0</strong>
+            <small>not implemented</small>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel span-5">
+        <div class="panel-title">
+          <h2>Miner Activity</h2>
+          <span id="miner-mode">mode off</span>
+        </div>
+        <div class="activity-readout">
+          <div>
+            <span>Intelligent Active</span>
+            <strong id="intelligent-active">0</strong>
+          </div>
+          <div class="emergency" id="emergency-state">Emergency clear</div>
+        </div>
+        <div class="bars" id="miner-bars"></div>
+        <div class="minor-grid">
+          <div><span>Activation Failures</span><strong id="activation-failures">0</strong></div>
+          <div><span>Path Failures</span><strong id="path-failures">0</strong></div>
+          <div><span>Max Active</span><strong id="max-active">0</strong></div>
+          <div><span>Cooldown</span><strong id="cooldown">0s</strong></div>
+        </div>
+      </section>
+
+      <section class="panel span-7">
+        <div class="panel-title">
+          <h2>Supply</h2>
+          <span id="supply-status">baseline unavailable</span>
+        </div>
+        <div class="supply-totals">
+          <div>
+            <span>Current Session</span>
+            <strong id="session-total">0</strong>
+          </div>
+          <div>
+            <span>Persistent Baseline</span>
+            <strong id="persistent-total">0</strong>
+          </div>
+          <div>
+            <span>Total Known</span>
+            <strong id="known-total">0</strong>
+          </div>
+        </div>
+        <div class="list-columns">
+          <div>
+            <h3>Session</h3>
+            <div id="session-list" class="supply-list"></div>
+          </div>
+          <div>
+            <h3>Known</h3>
+            <div id="known-list" class="supply-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel span-8">
+        <div class="panel-title">
+          <h2>Demand</h2>
+          <span id="demand-state">snapshot pending</span>
+        </div>
+        <div class="demand-table-wrap">
+          <table class="demand-table">
+            <thead>
+              <tr>
+                <th>Profile</th>
+                <th>State</th>
+                <th>Reserve</th>
+                <th>Known</th>
+                <th>Pressure</th>
+                <th>Active Opportunity</th>
+              </tr>
+            </thead>
+            <tbody id="demand-table"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel span-4">
+        <div class="panel-title">
+          <h2>Safety Boundaries</h2>
+          <span>read only</span>
+        </div>
+        <div id="safety-list" class="safety-list"></div>
+        <div class="assignment-panel">
+          <h3>Live Assignments</h3>
+          <div id="assignment-list" class="assignment-list"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/dashboard/app.js"></script>
+</body>
+</html>

@@ -53,6 +53,27 @@ curl -s -k -H "Authorization: Bearer {tokenhere}" "https://127.0.0.1:44443/v1/ve
 
 The output should be a JSON object with the status of the request and some simple version info (first line of rev.txt etc.)
 
+## AI Economy Dashboard
+
+When the REST API is enabled, a local browser dashboard is available at:
+
+```
+https://{server-host}:{Core3.RESTServerPort}/dashboard/
+```
+
+The dashboard shell is served without an authorization header so Safari can load it directly, but all live data requests still use the configured bearer token. The page stores the token in browser local storage and polls:
+
+```
+GET /v1/aieconomy/dashboard/
+Authorization: Bearer {tokenhere}
+```
+
+Dashboard assets are read from `web/aieconomy-dashboard` relative to the Core3 working directory. You can override this with:
+
+```
+Core3.RESTServer.DashboardRoot = "web/aieconomy-dashboard"
+```
+
 ## API Endpoints
 
 There are numerous endpoints, this documentation will most likely be out of date, use the source Luke. Each endpoint is described by a RESTEndpoint object (more on the objects below) created in RESTServer::registerEndpoints().

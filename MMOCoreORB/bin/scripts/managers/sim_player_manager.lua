@@ -5,11 +5,21 @@ SimPlayerManagerConfig = {
     -- MASTER SWITCH
     enabled = true,
 
+    -- Recommended testing modes:
+    -- observe: resource/demand/market logs only; no targeting or activation.
+    -- shadow: assignment and would-activate diagnostics; actualActivation=false.
+    -- limited: capped miners may move to verified assignments; yield remains conceptual.
+    -- soak: limited mode plus health summaries, cooldowns, caps, and emergency latch.
+    --
+    -- D.6.6 demand-weighted planning is the canonical planner for intelligent
+    -- SimMiner targeting. D.3 recommendations and D.4 round-robin simulation
+    -- are retained as legacy/resource-intelligence diagnostics.
+
     -- Read-only resource intelligence observability. Disabled by default.
     resourceIntelligenceConfig = {
-        enabled = false,
+        enabled = true,
         logTopResources = false,
-        summaryIntervalSeconds = 60,
+        summaryIntervalSeconds = 300,
         topN = 10,
     },
 
@@ -35,7 +45,8 @@ SimPlayerManagerConfig = {
         },
     },
 
-    -- Log-only miner target recommendations. Disabled by default and does not change miner behavior.
+    -- D.3 legacy diagnostic: per-profile recommendations for resource-intelligence debugging.
+    -- Disabled by default and does not change miner behavior.
     minerTargetRecommendationConfig = {
         enabled = false,
         intervalSeconds = 30,
@@ -48,7 +59,9 @@ SimPlayerManagerConfig = {
         includeAllActiveMiners = false,
     },
 
-    -- Simulation-only single target plans. Disabled by default and never changes miner state.
+    -- D.4 legacy diagnostic: round-robin single target plans.
+    -- D.6.6 is the canonical planner for intelligent targeting.
+    -- Disabled by default and never changes miner state.
     minerTargetSimulationConfig = {
         enabled = false,
         intervalSeconds = 30,
@@ -63,10 +76,11 @@ SimPlayerManagerConfig = {
         assignmentMode = "round_robin",
     },
 
-    -- Simulation-only density pocket search for the current D.4 plan.
+    -- Simulation-only density pocket search. Uses the D.6.6 demand-weighted
+    -- plan when available, with the older D.4 plan only as a diagnostic fallback.
     minerDensityTargetSimulationConfig = {
-        enabled = false,
-        intervalSeconds = 30,
+        enabled = true,
+        intervalSeconds = 60,
         searchRadii = { 250, 500, 1000, 2000 },
         samplesPerRadius = 48,
         minAcceptableDensity = 0.65,
@@ -76,13 +90,73 @@ SimPlayerManagerConfig = {
         distancePenaltyPerMeter = 0.02,
     },
 
-    -- Simulation-only route validation for D.5-prep density coordinates.
+    -- Simulation-only route validation for D.6.6-aligned density coordinates.
     minerPathValidationSimulationConfig = {
-        enabled = false,
-        intervalSeconds = 30,
-        validateOnlyAcceptedDensityTargets = false,
+        enabled = true,
+        intervalSeconds = 60,
+        validateOnlyAcceptedDensityTargets = true,
         maxPathDistance = 2500,
         maxPathNodes = 256,
+    },
+
+    -- Intelligent targeting switch. "off" does nothing, "shadow" logs decisions,
+    -- "limited" may move capped miners only when limitedActivationConfig.enabled=true,
+    -- and "soak" is a C++ alias for limited mode with these conservative soak controls.
+    -- requireValidPath requires pathTrustStatus=verifiedPath before activation.
+    minerIntelligentTargetingConfig = {
+        enabled = true,
+        mode = "soak",
+        intervalSeconds = 60,
+        -- Number of miners evaluated by D.5.3/D.5.5 switch-decision and
+        -- assignment logic per interval. This is not the active mover cap.
+        maxActiveMiners = 2,
+        requireDemandWeightedPlan = true,
+        requireAcceptedDensityTarget = true,
+        requireValidPath = true,
+        fallbackToConceptualLoop = true,
+        rollbackOnFailureCount = 3,
+        logDecisionSummary = true,
+        -- Full per-miner switch lines are otherwise emitted only for useful
+        -- transitions/failures/activation-capable decisions.
+        logVerboseSwitchDecisions = false,
+        assignmentConfig = {
+            enabled = true,
+            -- Retained target lifetime. With requireValidPath=true, C++ clamps
+            -- this high enough for density/path validation to catch up.
+            ttlSeconds = 180,
+            replaceOnlyWhenExpiredOrInvalid = true,
+            -- Only assignment-aware intelligent samples clear retained assignments;
+            -- the normal conceptual sample loop does not touch this cache.
+            clearOnSampleComplete = true,
+            clearOnCombat = true,
+            clearOnIncapOrDeath = true,
+            clearOnZoneChange = true,
+            -- Lifecycle logs keep creation/update/failure/clear events visible.
+            logAssignmentLifecycle = true,
+            -- Retained logs are noisy during soak; leave false unless tracing TTL drift.
+            logRetainedAssignments = false,
+        },
+        limitedActivationConfig = {
+            enabled = true,
+            -- Number of miners currently queued, moving, or sampling through
+            -- the intelligent assignment path.
+            maxActiveIntelligentMiners = 2,
+            -- Number of new intelligent activations accepted in one manager interval.
+            maxActivationsPerInterval = 1,
+            -- Per-miner cooldown after accepted activation. Zero preserves current behavior.
+            cooldownSecondsPerMiner = 0,
+            -- Empty means all zones are allowed. Non-empty entries are zone names.
+            allowedZones = {},
+            requireSamePlanet = true,
+            -- Stops additional activation attempts for the current interval after
+            -- a real activation failure. Controlled skips do not trip this.
+            disableOnFirstActivationFailure = true,
+            -- Emergency latch for activation failures; reset by disabling/changing config.
+            disableOnActivationFailure = false,
+            logActivationLifecycle = true,
+            -- Primary D.5 limited-activation soak summary.
+            logHealthSummary = true,
+        },
     },
 
     -- Log-only hot-item demand pressure. This does not feed miner target selection.

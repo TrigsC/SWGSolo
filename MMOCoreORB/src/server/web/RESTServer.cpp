@@ -22,6 +22,7 @@
 #include "APIProxyGuildManager.h"
 #include "APIProxyConfigManager.h"
 #include "APIProxyStatisticsManager.h"
+#include "APIProxyAiEconomyManager.h"
 
 // Workaround for googletest conflict
 // See https://github.com/Microsoft/cpprestsdk/blob/master/Release/include/cpprest/details/basic_types.h#L95
@@ -55,6 +56,8 @@ RESTServer::~RESTServer() {
 #include <memory>
 #include <chrono>
 #include <regex>
+#include <fstream>
+#include <sstream>
 
 using namespace web;
 using namespace web::http;
@@ -109,6 +112,10 @@ void RESTServer::registerEndpoints() {
 		mStatisticsManager->handle(apiRequest);
 	}));
 
+	addEndpoint(RESTEndpoint("GET:/v1/aieconomy/dashboard/", {}, [this] (APIRequest& apiRequest) -> void {
+		mAiEconomyManager->handle(apiRequest);
+	}));
+
 	addEndpoint(RESTEndpoint("POST:/v1/admin/console/(\\w+)/", {"command"}, [this] (APIRequest& apiRequest) -> void {
 		StringBuffer buf;
 
@@ -154,6 +161,69 @@ void RESTServer::registerEndpoints() {
 	info() << "Registered " << mAPIEndpoints.size() << " endpoint(s)";
 }
 
+String RESTServer::getDashboardContentType(const String& fileName) const {
+	if (fileName.endsWith(".css"))
+		return "text/css; charset=utf-8";
+
+	if (fileName.endsWith(".js"))
+		return "application/javascript; charset=utf-8";
+
+	return "text/html; charset=utf-8";
+}
+
+bool RESTServer::serveDashboardRequest(http_request& request) {
+	if (request.method() != methods::GET)
+		return false;
+
+	const auto& uri = request.relative_uri();
+	String requestPath = uri::decode(uri.path());
+
+	if (requestPath != "/dashboard" && requestPath != "/dashboard/" &&
+			!requestPath.beginsWith("/dashboard/")) {
+		return false;
+	}
+
+	String fileName = "index.html";
+
+	if (requestPath.beginsWith("/dashboard/") && requestPath.length() > 11)
+		fileName = requestPath.subString(11);
+
+	if (fileName.isEmpty() || fileName == "/")
+		fileName = "index.html";
+
+	if (fileName != "index.html" && fileName != "styles.css" &&
+			fileName != "app.js") {
+		request.reply(status_codes::NotFound, U("Invalid dashboard asset"));
+		return true;
+	}
+
+	String dashboardRoot = ConfigManager::instance()->getString(
+		"Core3.RESTServer.DashboardRoot",
+		"web/aieconomy-dashboard");
+
+	if (!dashboardRoot.endsWith("/"))
+		dashboardRoot += "/";
+
+	String fullPath = dashboardRoot + fileName;
+	std::ifstream file(fullPath.toCharArray(), std::ios::in | std::ios::binary);
+
+	if (!file.good()) {
+		warning() << "Dashboard asset not found: " << fullPath;
+		request.reply(status_codes::NotFound, U("Dashboard asset not found"));
+		return true;
+	}
+
+	std::ostringstream buffer;
+	buffer << file.rdbuf();
+
+	http_response response(status_codes::OK);
+	response.headers().add(U("Content-Type"), getDashboardContentType(fileName).toCharArray());
+	response.headers().add(U("Cache-Control"), U("no-store"));
+	response.set_body(buffer.str());
+	request.reply(response);
+	return true;
+}
+
 void RESTServer::routeRequest(http_request& request) {
 	const auto& uri = request.relative_uri();
 
@@ -162,6 +232,9 @@ void RESTServer::routeRequest(http_request& request) {
 	if (!endpointKey.endsWith("/")) {
 		endpointKey += "/";
 	}
+
+	if (serveDashboardRequest(request))
+		return;
 
 	if (!checkAuth(request)) {
 		warning() << "AUTHFAIL " << endpointKey;
@@ -292,6 +365,12 @@ void RESTServer::createProxies() {
 	if (mStatisticsManager == nullptr) {
 		throw OutOfMemoryError();
 	}
+
+	mAiEconomyManager = new APIProxyAiEconomyManager();
+
+	if (mAiEconomyManager == nullptr) {
+		throw OutOfMemoryError();
+	}
 }
 
 void RESTServer::destroyProxies() {
@@ -323,6 +402,11 @@ void RESTServer::destroyProxies() {
 	if (mStatisticsManager != nullptr) {
 		delete mStatisticsManager;
 		mStatisticsManager = nullptr;
+	}
+
+	if (mAiEconomyManager != nullptr) {
+		delete mAiEconomyManager;
+		mAiEconomyManager = nullptr;
 	}
 }
 

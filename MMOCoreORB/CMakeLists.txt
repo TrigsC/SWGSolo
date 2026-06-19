@@ -61,7 +61,7 @@ option(ENABLE_UBSAN "Enables undefined behavior sanitizer compiling" OFF)
 option(ENABLE_NATIVE "Enables -march=native compiler option" ON)
 option(ENABLE_OMIT_FRAMEPOINTER "Enables -fno-omit-frame-pointer compiler option" ON)
 option(ENABLE_ERROR_ON_WARNINGS "Enables -Werror compiler option" ON)
-option(ENABLE_REST_SERVER "Enables REST API Server" OFF)
+option(ENABLE_REST_SERVER "Enables REST API Server" ON)
 option(ENABLE_SWGREALMS "Enables SWGRealms API support" OFF)
 option(ENABLE_ODB "Enables odb3 compiling" OFF)
 option(ENABLE_ODB_REFERENCES "Sets ODB_REFERENCES define" ON) #needs to match engine3
