@@ -375,6 +375,141 @@ bool AiEconomyManager::snapshotPersistentConceptualMinerSupplyForDemand(
 	return true;
 }
 
+bool AiEconomyManager::snapshotStockpileInspection(
+		AiEconomyStockpileInspectionSnapshot& snapshot,
+		int maxLotRows,
+		String& status) {
+	snapshot.persistenceReady = false;
+	snapshot.status = "unavailable";
+	snapshot.loadedLots = 0;
+	snapshot.conceptualMinerLots = 0;
+	snapshot.totalQuantity = 0;
+	snapshot.conceptualMinerQuantity = 0;
+	snapshot.startupBaselineQuantity = 0;
+	snapshot.reservedQuantity = 0;
+	snapshot.availableQuantity = 0;
+	snapshot.dataCreatedTimestampMs = 0;
+	snapshot.dataUpdatedTimestampMs = 0;
+	snapshot.conceptualMinerQuantities.removeAll();
+	snapshot.startupBaselineQuantities.removeAll();
+	snapshot.lots.removeAll();
+	status = "unavailable";
+
+	Locker mutationLocker(&persistenceMutationMutex);
+
+	ManagedReference<AiEconomyData*> data = economyData;
+
+	if (!persistenceReady.get() || data == nullptr)
+		return false;
+
+	snapshot.persistenceReady = true;
+
+	for (int i = 0; i < conceptualMinerStartupTotals.size(); ++i) {
+		String label = conceptualMinerStartupTotals.elementAt(i).getKey();
+		uint64 quantity = conceptualMinerStartupTotals.get(i);
+
+		if (label.isEmpty() || label.length() > MAX_LABEL_LENGTH ||
+				quantity > MAX_STOCKPILE_QUANTITY) {
+			status = "invalid";
+			snapshot.status = status;
+			snapshot.persistenceReady = false;
+			return false;
+		}
+
+		if (quantity == 0)
+			continue;
+
+		snapshot.startupBaselineQuantities.put(label, quantity);
+		snapshot.startupBaselineQuantity += quantity;
+	}
+
+	Vector<ManagedReference<AiEconomyStockpileLot*> > lots;
+
+	{
+		Locker dataLocker(data);
+		snapshot.dataCreatedTimestampMs = data->getCreatedTimestamp();
+		snapshot.dataUpdatedTimestampMs = data->getUpdatedTimestamp();
+
+		Vector<ManagedReference<AiEconomyStockpileLot*> >* storedLots =
+			data->getStockpileLots();
+
+		if (storedLots == nullptr) {
+			status = "invalid";
+			snapshot.status = status;
+			snapshot.persistenceReady = false;
+			return false;
+		}
+
+		snapshot.loadedLots = storedLots->size();
+
+		for (int i = 0; i < storedLots->size(); ++i)
+			lots.add(storedLots->get(i));
+	}
+
+	for (int i = 0; i < lots.size(); ++i) {
+		ManagedReference<AiEconomyStockpileLot*> lot = lots.get(i);
+
+		if (lot == nullptr) {
+			status = "invalid";
+			snapshot.status = status;
+			snapshot.persistenceReady = false;
+			return false;
+		}
+
+		AiEconomyStockpileInspectionLot row;
+
+		{
+			Locker lotLocker(lot);
+			row.entryID = lot->getEntryId();
+			row.resourceSpawnObjectID = lot->getResourceSpawnObjectId();
+			row.conceptualLabel = lot->getConceptualLabel();
+			row.resourceSpawnName = lot->getResourceSpawnName();
+			row.resourceType = lot->getResourceType();
+			row.resourceClassChain = lot->getResourceClassChain();
+			row.sourcePlanet = lot->getSourcePlanet();
+			row.sourceZone = lot->getSourceZone();
+			row.acquisitionSource = lot->getAcquisitionSource();
+			row.resourceLifecycleState = lot->getResourceLifecycleState();
+			row.ownerScope = lot->getOwnerScope();
+			row.identityConfidence = lot->getIdentityConfidence();
+			row.matchedDemandProfiles = lot->getMatchedDemandProfiles();
+			row.qualityTier = lot->getQualityTier();
+			row.quantity = lot->getQuantity();
+			row.reservedQuantity = lot->getReservedQuantity();
+			row.availableQuantity = lot->getAvailableQuantity();
+			row.acquiredTimestampMs = lot->getAcquiredTimestamp();
+			row.lastUpdatedTimestampMs = lot->getLastUpdatedTimestamp();
+			row.activeAtAcquisition = lot->wasActiveAtAcquisition();
+		}
+
+		row.conceptualMinerLot =
+			row.acquisitionSource == "conceptual_miner" &&
+			row.resourceLifecycleState == "conceptual" &&
+			row.ownerScope == "galaxy" &&
+			row.identityConfidence == "conceptual_label";
+
+		snapshot.totalQuantity += row.quantity;
+		snapshot.reservedQuantity += row.reservedQuantity;
+		snapshot.availableQuantity += row.availableQuantity;
+
+		if (row.conceptualMinerLot) {
+			snapshot.conceptualMinerLots++;
+			snapshot.conceptualMinerQuantity += row.quantity;
+
+			if (!row.conceptualLabel.isEmpty())
+				snapshot.conceptualMinerQuantities.put(
+					row.conceptualLabel, row.quantity);
+		}
+
+		if (maxLotRows <= 0 || snapshot.lots.size() < maxLotRows)
+			snapshot.lots.add(row);
+	}
+
+	status = "ready";
+	snapshot.status = status;
+	return true;
+}
+
 bool AiEconomyManager::loadOrCreateEconomyData(
 		bool& created, String& failureReason, int& stockpileLotCount) {
 	created = false;

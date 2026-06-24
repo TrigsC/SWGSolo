@@ -182,7 +182,16 @@ h1 {
 
 .metric,
 .minor-grid > div,
-.supply-totals > div {
+.supply-totals > div,
+.scout-summary > div,
+.stockpile-summary > div,
+.resource-aware-summary > div,
+.audit-summary > div,
+.travel-summary > div,
+.path-summary > div,
+.navarea-summary > div,
+.coverage-summary > div,
+.coverage-focus {
   border: 1px solid rgba(53, 208, 186, 0.18);
   border-radius: 7px;
   background: rgba(5, 8, 8, 0.46);
@@ -216,6 +225,38 @@ h1 {
   border: 1px solid var(--line-cool);
   border-radius: 7px;
   background: rgba(53, 208, 186, 0.08);
+}
+
+.readiness-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  margin-top: 12px;
+  border: 1px solid rgba(53, 208, 186, 0.18);
+  border-radius: 7px;
+  background: rgba(5, 8, 8, 0.46);
+  padding: 10px;
+}
+
+.readiness-card > div {
+  min-width: 0;
+}
+
+.readiness-card span,
+.readiness-card small {
+  color: var(--muted);
+}
+
+.readiness-card strong {
+  display: block;
+  color: var(--teal);
+  font-size: 1.15rem;
+}
+
+.readiness-card small {
+  grid-column: 1 / -1;
+  overflow-wrap: anywhere;
 }
 
 .activity-readout span {
@@ -279,7 +320,9 @@ h1 {
 }
 
 .minor-grid strong,
-.supply-totals strong {
+.supply-totals strong,
+.scout-summary strong,
+.coverage-summary strong {
   display: block;
   margin-top: 5px;
   font-size: 1.2rem;
@@ -294,6 +337,209 @@ h1 {
 
 .supply-totals strong {
   color: var(--amber);
+}
+
+.scout-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.stockpile-summary {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.resource-aware-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.scout-summary span,
+.stockpile-summary span,
+.resource-aware-summary span {
+  color: var(--muted);
+}
+
+.scout-summary strong,
+.stockpile-summary strong,
+.resource-aware-summary strong,
+.coverage-summary strong {
+  color: var(--teal);
+}
+
+.stockpile-safety {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.audit-headline {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: center;
+  margin-bottom: 14px;
+  border: 1px solid var(--line-cool);
+  border-radius: 7px;
+  background: rgba(53, 208, 186, 0.07);
+  padding: 12px;
+}
+
+.audit-headline strong {
+  display: block;
+  color: var(--amber);
+  font-size: 1rem;
+}
+
+.audit-headline p {
+  color: var(--muted);
+  font-size: 0.86rem;
+  margin-top: 4px;
+}
+
+.audit-summary {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.travel-summary {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.travel-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.path-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.audit-summary span {
+  color: var(--muted);
+}
+
+.audit-summary strong {
+  color: var(--teal);
+}
+
+.travel-summary span {
+  color: var(--muted);
+}
+
+.travel-summary strong {
+  color: var(--teal);
+}
+
+.path-summary {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.path-summary span,
+.navarea-summary span {
+  color: var(--muted);
+}
+
+.path-summary strong,
+.navarea-summary strong {
+  color: var(--teal);
+}
+
+.navarea-summary {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.coverage-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.alignment-summary {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.coverage-summary span {
+  color: var(--muted);
+}
+
+.alignment-summary span {
+  color: var(--muted);
+}
+
+.alignment-summary strong {
+  color: var(--teal);
+}
+
+.scout-layout,
+.coverage-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(280px, 0.8fr);
+  gap: 16px;
+}
+
+.alignment-layout {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.stockpile-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  gap: 16px;
+}
+
+.audit-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(260px, 0.65fr);
+  gap: 16px;
+}
+
+.travel-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(260px, 0.65fr);
+  gap: 16px;
+}
+
+.navarea-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(260px, 0.65fr);
+  gap: 16px;
+}
+
+.travel-plans {
+  margin-top: 16px;
 }
 
 .list-columns {
@@ -349,26 +595,39 @@ h3 {
   max-height: 420px;
 }
 
-.demand-table {
+.demand-table,
+.scout-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.86rem;
 }
 
 .demand-table th,
-.demand-table td {
+.demand-table td,
+.scout-table th,
+.scout-table td {
   padding: 10px 8px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   text-align: left;
   vertical-align: top;
 }
 
-.demand-table th {
+.demand-table th,
+.scout-table th {
   position: sticky;
   top: 0;
   background: var(--panel-strong);
   color: var(--muted);
   font-weight: 680;
+}
+
+.scout-table-wrap {
+  overflow: auto;
+  max-height: 360px;
+}
+
+.scout-table-wrap.compact {
+  max-height: 300px;
 }
 
 .chip {
@@ -382,8 +641,50 @@ h3 {
 }
 
 .chip.shortage { color: var(--red); border-color: rgba(217, 95, 69, 0.45); }
+.chip.critical,
+.chip.low { color: var(--red); border-color: rgba(217, 95, 69, 0.45); }
 .chip.target { color: var(--amber); border-color: rgba(215, 194, 123, 0.45); }
 .chip.surplus { color: var(--green); border-color: rgba(136, 197, 111, 0.45); }
+.chip.healthy { color: var(--green); border-color: rgba(136, 197, 111, 0.45); }
+.chip.watch { color: var(--amber); border-color: rgba(215, 194, 123, 0.45); }
+.chip.blocked,
+.chip.unsafe { color: var(--red); border-color: rgba(217, 95, 69, 0.45); }
+.chip.no_data { color: var(--muted); }
+.chip.covered { color: var(--green); border-color: rgba(136, 197, 111, 0.45); }
+.chip.uncovered { color: var(--amber); border-color: rgba(215, 194, 123, 0.45); }
+.chip.validated,
+.chip.candidate,
+.chip.resource_rush,
+.chip.hub_return { color: var(--amber); border-color: rgba(215, 194, 123, 0.45); }
+.chip.blocked_by_path,
+.chip.blocked_by_density,
+.chip.wrong_planet,
+.chip.cooldown,
+.chip.capped,
+.chip.untrusted,
+.chip.stale,
+.chip.direct_fallback_unverified,
+.chip.path_too_long,
+.chip.exceeds_max_path_distance,
+.chip.too_many_path_nodes,
+.chip.no_path,
+.chip.path_exception,
+.chip.target_mismatch,
+.chip.density_target_coordinate_mismatch,
+.chip.miner_not_in_navmesh,
+.chip.target_outside_navmesh,
+.chip.bad_terrain_or_height,
+.chip.unknown_path_failure,
+.chip.path_validation_unavailable,
+.chip.density_target_not_accepted,
+.chip.profile_mismatch,
+.chip.resource_mismatch,
+.chip.zone_mismatch,
+.chip.key_mismatch,
+.chip.unreachable_no_configured_miner_spawn_zone,
+.chip.travel_required_unsupported { color: var(--red); border-color: rgba(217, 95, 69, 0.45); }
+.chip.verified_path { color: var(--green); border-color: rgba(136, 197, 111, 0.45); }
+.chip.not_top_opportunity { color: var(--muted); }
 .chip.disabled { color: var(--muted); }
 
 .opportunity {
@@ -394,6 +695,71 @@ h3 {
   display: block;
   color: var(--muted);
   margin-top: 3px;
+}
+
+.stat-line,
+.resource-meta {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.stat-line strong {
+  color: var(--amber);
+  font-weight: 700;
+}
+
+.profession-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.profession-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.035);
+  padding: 9px 10px;
+  font-size: 0.84rem;
+}
+
+.profession-row span,
+.profession-row small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profession-row small {
+  color: var(--muted);
+  margin-top: 3px;
+}
+
+.profession-row strong {
+  color: var(--teal);
+  white-space: nowrap;
+}
+
+.coverage-focus {
+  min-height: 142px;
+}
+
+.coverage-focus strong {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--amber);
+  font-size: 1rem;
+}
+
+.coverage-focus span {
+  display: block;
+  color: var(--muted);
+  font-size: 0.84rem;
+  margin-top: 6px;
 }
 
 .safety-list {
@@ -412,6 +778,12 @@ h3 {
 .assignment-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.assignment-row small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .empty {
@@ -441,8 +813,32 @@ h3 {
   }
 
   .metric-strip,
-  .supply-totals {
+  .supply-totals,
+  .scout-summary,
+  .stockpile-summary,
+  .resource-aware-summary,
+  .audit-summary,
+  .travel-summary,
+  .path-summary,
+  .navarea-summary,
+  .alignment-summary,
+  .coverage-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .scout-layout,
+  .stockpile-layout,
+  .audit-layout,
+  .travel-layout,
+  .navarea-layout,
+  .alignment-layout,
+  .coverage-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .audit-headline {
+    grid-template-columns: 1fr;
+    align-items: stretch;
   }
 }
 
@@ -453,9 +849,18 @@ h3 {
   }
 
   .metric-strip,
-  .minor-grid,
-  .supply-totals,
-  .list-columns {
+    .minor-grid,
+    .supply-totals,
+    .scout-summary,
+    .stockpile-summary,
+    .resource-aware-summary,
+    .audit-summary,
+    .travel-summary,
+    .path-summary,
+    .navarea-summary,
+    .alignment-summary,
+    .coverage-summary,
+    .list-columns {
     grid-template-columns: 1fr;
   }
 

@@ -90,6 +90,37 @@ SimPlayerManagerConfig = {
         distancePenaltyPerMeter = 0.02,
     },
 
+    -- P.2/D.8.2 shadow-mode NavArea-backed pathable density staging.
+    -- This never changes miner targets while enableNavAreaDensityShadowMode=true.
+    navAreaDensitySelectionConfig = {
+        enableNavAreaDensitySelection = false,
+        enableNavAreaDensityShadowMode = true,
+        navAreaSampleCacheTtlSeconds = 900,
+        navAreaMaxSamplesPerArea = 8,
+        navAreaMaxSampleAttemptsPerCycle = 16,
+        navAreaMaxPathValidationsPerCycle = 0,
+        navAreaAvoidGenericInteriors = true,
+        navAreaPreferCityAndPoiRegions = true,
+    },
+
+    -- P.2.6 runtime-only reachability memory. Memory collection is enabled so
+    -- the dashboard can learn which buckets validate; candidate preference is
+    -- shadow-only until explicitly enabled.
+    reachabilityMemoryConfig = {
+        enableReachabilityMemory = true,
+        enableReachabilityCandidatePreference = true,
+        reachabilityMemoryTtlSeconds = 1800,
+        reachabilityBucketSizeMeters = 128,
+        minAttemptsBeforePenalty = 3,
+        verifiedPathScoreBonus = 0.15,
+        sampleCompleteScoreBonus = 0.25,
+        repeatedFailurePenalty = 0.25,
+        longDistancePenalty512Plus = 0.15,
+        planetPenaltyEnabled = true,
+        resourcePenaltyEnabled = true,
+        maxReachabilityMemoryRows = 5000,
+    },
+
     -- Simulation-only route validation for D.6.6-aligned density coordinates.
     minerPathValidationSimulationConfig = {
         enabled = true,
@@ -109,7 +140,7 @@ SimPlayerManagerConfig = {
         intervalSeconds = 60,
         -- Number of miners evaluated by D.5.3/D.5.5 switch-decision and
         -- assignment logic per interval. This is not the active mover cap.
-        maxActiveMiners = 2,
+        maxActiveMiners = 10,
         requireDemandWeightedPlan = true,
         requireAcceptedDensityTarget = true,
         requireValidPath = true,
@@ -121,10 +152,22 @@ SimPlayerManagerConfig = {
         logVerboseSwitchDecisions = false,
         assignmentConfig = {
             enabled = true,
-            -- Retained target lifetime. With requireValidPath=true, C++ clamps
-            -- this high enough for density/path validation to catch up.
-            ttlSeconds = 180,
-            replaceOnlyWhenExpiredOrInvalid = true,
+	            -- Retained target lifetime. Keep this comfortably above the
+	            -- 60s planning/validation cadence so verified assignments do
+	            -- not expire while waiting for the limited activation lane.
+	            ttlSeconds = 600,
+	            candidateAssignmentTtlSeconds = 600,
+	            validatedAssignmentTtlSeconds = 600,
+	            queuedActivationTtlSeconds = 240,
+	            movementArrivalTimeoutSeconds = 600,
+	            movementArrivalTimeoutMinSeconds = 240,
+	            movementArrivalTimeoutMaxSeconds = 1200,
+	            movementArrivalSecondsPerMeter = 0.75,
+	            sampleStartedTimeoutSeconds = 180,
+	            -- Active movement uses lifecycle-specific timeouts instead of
+	            -- being cleared by stale candidate/validated assignment TTL.
+	            preventNormalTtlForActiveMovement = true,
+	            replaceOnlyWhenExpiredOrInvalid = true,
             -- Only assignment-aware intelligent samples clear retained assignments;
             -- the normal conceptual sample loop does not touch this cache.
             clearOnSampleComplete = true,
@@ -135,14 +178,16 @@ SimPlayerManagerConfig = {
             logAssignmentLifecycle = true,
             -- Retained logs are noisy during soak; leave false unless tracing TTL drift.
             logRetainedAssignments = false,
+            -- P.2.2/P.2.3 read-only readiness check for future forced movement.
+            movementReadinessDiagnosticsEnabled = true,
         },
         limitedActivationConfig = {
             enabled = true,
             -- Number of miners currently queued, moving, or sampling through
             -- the intelligent assignment path.
-            maxActiveIntelligentMiners = 2,
+            maxActiveIntelligentMiners = 10,
             -- Number of new intelligent activations accepted in one manager interval.
-            maxActivationsPerInterval = 1,
+            maxActivationsPerInterval = 2,
             -- Per-miner cooldown after accepted activation. Zero preserves current behavior.
             cooldownSecondsPerMiner = 0,
             -- Empty means all zones are allowed. Non-empty entries are zone names.
@@ -297,6 +342,42 @@ SimPlayerManagerConfig = {
         strongPressureRatio = 1.5,
     },
 
+    -- Dashboard-only future travel planning. This never moves, despawns,
+    -- respawns, sells, or changes miner behavior.
+    aiTravelSimulationConfig = {
+        enabled = true,
+        maxPlans = 20,
+        includeResourceRushPlans = true,
+        includeHubReturnPlans = true,
+        homeHub = {
+            enabled = true,
+            key = "coronet_resource_hub",
+            zone = "corellia",
+            city = "coronet",
+            -- Same approximate staging point as shuttleports.corellia.coronet.hangout.
+            x = -155.0,
+            y = -4722.0,
+            purpose = "sell_resources",
+        },
+    },
+
+    -- P.3.1/P.3.2 coverage-oriented miner lifecycle.
+    -- Disabled by default: when enabled, a successful intelligent conceptual
+    -- sample can retain its assignment as stationed coverage. Repeated samples
+    -- remain separately gated and conceptual-only.
+    stationedMinerConfig = {
+        enableStationedLifecycle = true,
+        enableStationedRepeatedSampling = true,
+        stationedSampleIntervalSeconds = 300,
+        stationedSampleJitterSeconds = 60,
+        stationedMaxSamplesPerAssignment = 12,
+        stationedMaxDurationSeconds = 3600,
+        stationedRequireDemandStillValid = true,
+        stationedRequireResourceStillActive = true,
+        stationedRequireSamePlanet = true,
+        stationedClearWhenReserveSatisfied = true,
+    },
+
     -- 1. LOCATIONS
     shuttleports = {
         naboo = {
@@ -316,8 +397,8 @@ SimPlayerManagerConfig = {
         -- MINERS: Spread randomly across ALL defined shuttleports
         {
             type = "miner",
-            totalCount = 4,
-            templates = { "light_jedi_sentinel", "artisan" }, -- Randomly picks appearance
+            totalCount = 10,
+            templates = { "artisan" }, -- Randomly picks appearance
             behavior = "gather_resources",
             minerConfig = {
                 resources = { "iron", "gas", "water", "copper" },

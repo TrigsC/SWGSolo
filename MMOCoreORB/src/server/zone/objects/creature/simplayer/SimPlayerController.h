@@ -83,6 +83,7 @@ class SimBehaviorTask : public Task {
 public:
     static const int FINISH_SURVEY = 1;
     static const int FINISH_SAMPLE = 2;
+    static const int START_STATIONED_SAMPLE = 3;
 
     SimBehaviorTask(SimPlayerController* ctrl, int t) : controller(ctrl), type(t) {}
     void run() override;
@@ -147,10 +148,16 @@ class SimMinerController : public SimPlayerController {
     bool intelligentAssignmentPending;
     bool intelligentAssignmentActive;
     bool intelligentSampleActive;
+    bool intelligentAssignmentStationed;
     bool intelligentLogActivationLifecycle;
     bool intelligentQueuedDuringSample;
     uint64 intelligentQueuedAtMs;
+    uint64 intelligentAssignmentGenerationId;
+    uint64 intelligentActivationSnapshotId;
     String intelligentQueuedState;
+    String intelligentTargetHash;
+    String intelligentActivationPathValidationStatus;
+    String intelligentActivationPathTrustStatus;
     String intelligentProfileKey;
     String intelligentResourceName;
     String intelligentResourceType;
@@ -174,6 +181,7 @@ public:
     void goToResource(const String& resourceName);
     void performSample();
     void finishSample();
+    void startStationedSample();
     bool requestIntelligentTargetAssignment(
         const String& profileKey,
         const String& resourceName,
@@ -182,6 +190,11 @@ public:
         const Vector3& targetPosition,
         float density,
         uint64 expiresAtMs,
+        uint64 assignmentGenerationId,
+        const String& targetHash,
+        uint64 activationSnapshotId,
+        const String& activationPathValidationStatus,
+        const String& activationPathTrustStatus,
         bool logActivationLifecycle,
         String& activationResult);
 

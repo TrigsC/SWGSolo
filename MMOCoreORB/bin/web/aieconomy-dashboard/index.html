@@ -51,6 +51,148 @@
         </div>
       </section>
 
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>AI Population & Travel Simulation</h2>
+          <span id="travel-panel-state">simulation pending</span>
+        </div>
+        <div class="travel-badges">
+          <span id="travel-simulation-badge" class="chip watch">TRAVEL SIMULATION ONLY</span>
+          <span id="travel-implemented-badge" class="chip blocked">TRAVEL IMPLEMENTED: FALSE</span>
+          <span id="travel-hub-badge" class="chip no_data">hub pending</span>
+        </div>
+        <div class="travel-summary">
+          <div>
+            <span>Total AI</span>
+            <strong id="ai-pop-total">0</strong>
+          </div>
+          <div>
+            <span>Miners</span>
+            <strong id="ai-pop-miners">0</strong>
+          </div>
+          <div>
+            <span>Assigned</span>
+            <strong id="ai-pop-assigned">0</strong>
+          </div>
+          <div>
+            <span>Idle</span>
+            <strong id="ai-pop-idle">0</strong>
+          </div>
+          <div>
+            <span>Travel Plans</span>
+            <strong id="travel-plan-count">0</strong>
+          </div>
+          <div>
+            <span>Remote Priority</span>
+            <strong id="travel-remote-count">0</strong>
+          </div>
+        </div>
+        <div class="travel-layout">
+          <div>
+            <h3>Miner Zones</h3>
+            <div class="scout-table-wrap compact">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Zone</th>
+                    <th>Miners</th>
+                    <th>Assigned</th>
+                    <th>State</th>
+                    <th>Plans</th>
+                  </tr>
+                </thead>
+                <tbody id="ai-zone-table"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Resource Rush</h3>
+            <div id="resource-rush-summary" class="coverage-focus"></div>
+          </div>
+        </div>
+        <div class="travel-plans">
+          <h3>Simulated Travel Plans</h3>
+          <div class="scout-table-wrap compact">
+            <table class="scout-table">
+              <thead>
+                <tr>
+                  <th>Plan</th>
+                  <th>Miner</th>
+                  <th>Route</th>
+                  <th>Target</th>
+                  <th>Recommendation</th>
+                </tr>
+              </thead>
+              <tbody id="travel-plan-table"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>Economy Health</h2>
+          <span id="economy-audit-state">audit pending</span>
+        </div>
+        <div class="audit-headline">
+          <span id="economy-audit-status" class="chip no_data">NO DATA</span>
+          <div>
+            <strong id="economy-audit-recommendation">do not change behavior yet</strong>
+            <p id="economy-audit-summary">Waiting for dashboard snapshot.</p>
+          </div>
+          <span id="economy-audit-safety" class="chip covered">READ ONLY / CONCEPTUAL ONLY</span>
+        </div>
+        <div class="audit-summary">
+          <div>
+            <span>Top Opportunities</span>
+            <strong id="audit-top-opportunities">0</strong>
+          </div>
+          <div>
+            <span>Uncovered</span>
+            <strong id="audit-uncovered">0</strong>
+          </div>
+          <div>
+            <span>Recent Yields</span>
+            <strong id="audit-recent-yields">0</strong>
+          </div>
+          <div>
+            <span>Aware Quantity</span>
+            <strong id="audit-aware-quantity">0</strong>
+          </div>
+          <div>
+            <span>Path Failed</span>
+            <strong id="audit-path-failed">0</strong>
+          </div>
+          <div>
+            <span>Stockpile</span>
+            <strong id="audit-stockpile">UNKNOWN</strong>
+          </div>
+        </div>
+        <div class="audit-layout">
+          <div>
+            <h3>Profile Audit</h3>
+            <div class="scout-table-wrap">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Profile</th>
+                    <th>Demand</th>
+                    <th>Coverage</th>
+                    <th>Yield</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="audit-profile-table"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Blockers</h3>
+            <div id="audit-blocker-list" class="safety-list"></div>
+          </div>
+        </div>
+      </section>
+
       <section class="panel span-5">
         <div class="panel-title">
           <h2>Miner Activity</h2>
@@ -65,10 +207,24 @@
         </div>
         <div class="bars" id="miner-bars"></div>
         <div class="minor-grid">
-          <div><span>Activation Failures</span><strong id="activation-failures">0</strong></div>
-          <div><span>Path Failures</span><strong id="path-failures">0</strong></div>
-          <div><span>Max Active</span><strong id="max-active">0</strong></div>
-          <div><span>Cooldown</span><strong id="cooldown">0s</strong></div>
+	          <div><span>Activation Failures</span><strong id="activation-failures">0</strong></div>
+	          <div><span>Path Failures</span><strong id="path-failures">0</strong></div>
+	          <div><span>Move Timeouts</span><strong id="movement-timeouts">0</strong></div>
+	          <div><span>TTL Protected</span><strong id="ttl-protected">0</strong></div>
+	          <div><span>Max Active</span><strong id="max-active">0</strong></div>
+	          <div><span>Cooldown</span><strong id="cooldown">0s</strong></div>
+	        </div>
+        <div class="readiness-card">
+          <span id="movement-readiness-badge" class="chip no_data">READINESS PENDING</span>
+          <div>
+            <span>Passed</span>
+            <strong id="movement-readiness-passed">0</strong>
+          </div>
+          <div>
+            <span>Blocked</span>
+            <strong id="movement-readiness-blocked">0</strong>
+          </div>
+          <small id="movement-readiness-reason">waiting for assignment identity</small>
         </div>
       </section>
 
@@ -103,6 +259,122 @@
         </div>
       </section>
 
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>AI Stockpile</h2>
+          <span id="stockpile-state">snapshot pending</span>
+        </div>
+        <div class="stockpile-summary">
+          <div>
+            <span>Persistence</span>
+            <strong id="stockpile-persistence-ready">UNKNOWN</strong>
+          </div>
+          <div>
+            <span>Checkpoint</span>
+            <strong id="stockpile-checkpoint">OFF</strong>
+          </div>
+          <div>
+            <span>Demand Baseline</span>
+            <strong id="stockpile-demand">OFF</strong>
+          </div>
+          <div>
+            <span>Current Session</span>
+            <strong id="stockpile-current">0</strong>
+          </div>
+          <div>
+            <span>Persisted Lots</span>
+            <strong id="stockpile-persisted">0</strong>
+          </div>
+          <div>
+            <span>Startup Baseline</span>
+            <strong id="stockpile-baseline">0</strong>
+          </div>
+        </div>
+        <div class="stockpile-safety">
+          <span class="chip covered" id="stockpile-safety">CONCEPTUAL ONLY</span>
+          <span id="stockpile-available">0 available</span>
+        </div>
+        <div class="stockpile-layout">
+          <div>
+            <h3>Per Label</h3>
+            <div class="scout-table-wrap">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Label</th>
+                    <th>Session</th>
+                    <th>Persisted</th>
+                    <th>Baseline</th>
+                    <th>Known</th>
+                    <th>Demand Profiles</th>
+                  </tr>
+                </thead>
+                <tbody id="stockpile-label-table"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Persisted Lot Rows</h3>
+            <div class="scout-table-wrap">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Entry</th>
+                    <th>Label</th>
+                    <th>Quantity</th>
+                    <th>Class</th>
+                    <th>Source</th>
+                  </tr>
+                </thead>
+                <tbody id="stockpile-lot-table"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>Resource-Aware Stockpile</h2>
+          <span id="resource-aware-state">runtime pending</span>
+        </div>
+        <div class="resource-aware-summary">
+          <div>
+            <span>Total Quantity</span>
+            <strong id="resource-aware-total">0</strong>
+          </div>
+          <div>
+            <span>Rows</span>
+            <strong id="resource-aware-rows">0</strong>
+          </div>
+          <div>
+            <span>Events</span>
+            <strong id="resource-aware-events">0</strong>
+          </div>
+          <div>
+            <span>Mode</span>
+            <strong id="resource-aware-mode">RUNTIME</strong>
+          </div>
+        </div>
+        <div class="scout-table-wrap">
+          <table class="scout-table">
+            <thead>
+              <tr>
+                <th>Conceptual Label</th>
+                <th>Quantity</th>
+                <th>Source Resource</th>
+                <th>Planet</th>
+                <th>Demand</th>
+                <th>Confidence</th>
+                <th>Last Seen</th>
+                <th>Safety</th>
+              </tr>
+            </thead>
+            <tbody id="resource-aware-table"></tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="panel span-8">
         <div class="panel-title">
           <h2>Demand</h2>
@@ -125,6 +397,599 @@
         </div>
       </section>
 
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>Resource Scout</h2>
+          <span id="resource-scout-state">snapshot pending</span>
+        </div>
+        <div class="scout-summary">
+          <div>
+            <span>Active Resources</span>
+            <strong id="scout-active-count">0</strong>
+          </div>
+          <div>
+            <span>Demand Opportunities</span>
+            <strong id="scout-demand-count">0</strong>
+          </div>
+          <div>
+            <span>No Density Targets</span>
+            <strong id="scout-risk-density">0</strong>
+          </div>
+          <div>
+            <span>Unassigned High Value</span>
+            <strong id="scout-risk-unassigned">0</strong>
+          </div>
+        </div>
+        <div class="scout-layout">
+          <div>
+            <h3>Top Demand Opportunities</h3>
+            <div class="scout-table-wrap">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Resource</th>
+                    <th>Use</th>
+                    <th>State</th>
+                    <th>Score</th>
+                    <th>Stats</th>
+                    <th>Gatherability</th>
+                  </tr>
+                </thead>
+                <tbody id="resource-opportunity-list"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Profession Leaders</h3>
+            <div id="resource-profession-list" class="profession-list"></div>
+            <h3>Scout Boundary</h3>
+            <div id="scout-boundary-list" class="safety-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>Resource Coverage</h2>
+          <span id="resource-coverage-state">snapshot pending</span>
+        </div>
+        <div class="coverage-summary">
+          <div>
+            <span>Covered</span>
+            <strong id="coverage-covered">0</strong>
+          </div>
+          <div>
+            <span>Uncovered</span>
+            <strong id="coverage-uncovered">0</strong>
+          </div>
+          <div>
+            <span>Assigned Miners</span>
+            <strong id="coverage-assigned">0</strong>
+          </div>
+          <div>
+            <span>Active Assignments</span>
+            <strong id="coverage-active">0</strong>
+          </div>
+        </div>
+        <div class="coverage-layout">
+          <div>
+            <h3>Top Opportunity Coverage</h3>
+            <div class="scout-table-wrap">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Resource</th>
+                    <th>Use</th>
+                    <th>Coverage</th>
+                    <th>Miners</th>
+                    <th>Pressure</th>
+                    <th>Reason</th>
+                  </tr>
+                </thead>
+                <tbody id="coverage-table"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Highest Uncovered</h3>
+            <div id="highest-uncovered" class="coverage-focus"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>Coverage Planner</h2>
+          <span id="coverage-planner-state">planner pending</span>
+        </div>
+        <div class="coverage-summary">
+          <div>
+            <span>Desired Slots</span>
+            <strong id="coverage-desired-slots">0</strong>
+          </div>
+          <div>
+            <span>Covered Slots</span>
+            <strong id="coverage-actual-slots">0</strong>
+          </div>
+          <div>
+            <span>Total Gap</span>
+            <strong id="coverage-total-gap">0</strong>
+          </div>
+          <div>
+            <span>Stationed</span>
+            <strong id="coverage-stationed-miners">0</strong>
+          </div>
+          <div>
+            <span>Moving</span>
+            <strong id="coverage-moving-miners">0</strong>
+          </div>
+          <div>
+            <span>Sampling</span>
+            <strong id="coverage-sampling-miners">0</strong>
+          </div>
+          <div>
+            <span>Unassigned</span>
+            <strong id="coverage-unassigned-miners">0</strong>
+          </div>
+        </div>
+        <div class="coverage-layout">
+          <div>
+            <h3>Coverage By Profile</h3>
+            <div class="scout-table-wrap">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Profile</th>
+                    <th>Desired</th>
+                    <th>Assigned</th>
+                    <th>Coverage</th>
+                    <th>Gap</th>
+                  </tr>
+                </thead>
+                <tbody id="coverage-profile-table"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Station Summary</h3>
+            <div id="coverage-station-summary" class="coverage-focus"></div>
+          </div>
+        </div>
+        <div class="travel-plans">
+          <h3>Coverage Slots</h3>
+          <div class="scout-table-wrap compact">
+            <table class="scout-table">
+              <thead>
+                <tr>
+                  <th>Need</th>
+                  <th>Resource</th>
+                  <th>Zone</th>
+                  <th>Coverage</th>
+                  <th>Reserve</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody id="coverage-slot-table"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>Coverage Alignment</h2>
+          <span id="coverage-alignment-state">snapshot pending</span>
+        </div>
+        <div class="alignment-summary">
+          <div>
+            <span>Exact Matches</span>
+            <strong id="alignment-exact">0</strong>
+          </div>
+          <div>
+            <span>Validated</span>
+            <strong id="alignment-validated">0</strong>
+          </div>
+          <div>
+            <span>Candidate</span>
+            <strong id="alignment-candidate">0</strong>
+          </div>
+          <div>
+            <span>Untrusted</span>
+            <strong id="alignment-untrusted">0</strong>
+          </div>
+          <div>
+            <span>Unreachable</span>
+            <strong id="alignment-unreachable">0</strong>
+          </div>
+          <div>
+            <span>Not Top</span>
+            <strong id="alignment-not-top">0</strong>
+          </div>
+        </div>
+        <div class="alignment-layout">
+          <div>
+            <h3>Opportunity Reasons</h3>
+            <div class="scout-table-wrap">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Opportunity</th>
+                    <th>Demand</th>
+                    <th>Diagnosis</th>
+                    <th>Matches</th>
+                    <th>Closest Assignment</th>
+                  </tr>
+                </thead>
+                <tbody id="alignment-opportunity-table"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Assignment Mapping</h3>
+            <div class="scout-table-wrap">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Miner</th>
+                    <th>Assignment</th>
+                    <th>Matched Top</th>
+                    <th>Status</th>
+                    <th>Path</th>
+                  </tr>
+                </thead>
+                <tbody id="alignment-assignment-table"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>Path Validation</h2>
+          <span id="path-validation-state">diagnostics pending</span>
+        </div>
+        <div class="path-badges">
+          <span class="chip candidate">READ ONLY DIAGNOSTICS</span>
+          <span id="path-trust-badge" class="chip blocked">TRUST REQUIRED: VERIFIED PATH</span>
+        </div>
+        <div class="path-summary">
+          <div>
+            <span>Candidates</span>
+            <strong id="path-candidates">0</strong>
+          </div>
+          <div>
+            <span>Failed</span>
+            <strong id="path-failed">0</strong>
+          </div>
+          <div>
+            <span>Direct Fallback</span>
+            <strong id="path-direct-fallback">0</strong>
+          </div>
+          <div>
+            <span>Stale</span>
+            <strong id="path-stale">0</strong>
+          </div>
+          <div>
+            <span>Target Drift</span>
+            <strong id="path-mismatch">0</strong>
+          </div>
+          <div>
+            <span>Navmesh/Terrain</span>
+            <strong id="path-navmesh">0</strong>
+          </div>
+          <div>
+            <span>Ready</span>
+            <strong id="path-ready">0</strong>
+          </div>
+          <div>
+            <span>Blocked</span>
+            <strong id="path-readiness-blocked">0</strong>
+          </div>
+        </div>
+        <div class="scout-table-wrap">
+          <table class="scout-table">
+            <thead>
+              <tr>
+                <th>Miner</th>
+                <th>Target</th>
+                <th>Path</th>
+                <th>Distance</th>
+                <th>Navmesh</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
+            <tbody id="path-validation-table"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>Reachability Calibration</h2>
+          <span id="reachability-state">calibration pending</span>
+        </div>
+        <div class="path-badges">
+          <span id="reachability-safety-badge" class="chip candidate">DIAGNOSTICS ONLY</span>
+          <span class="chip blocked">VALIDATION RULES UNCHANGED</span>
+        </div>
+        <div class="path-summary">
+          <div>
+            <span>Candidates</span>
+            <strong id="reachability-candidates">0</strong>
+          </div>
+          <div>
+            <span>Validated</span>
+            <strong id="reachability-validated">0</strong>
+          </div>
+          <div>
+            <span>Rejected</span>
+            <strong id="reachability-rejected">0</strong>
+          </div>
+          <div>
+            <span>Validation Rate</span>
+            <strong id="reachability-validation-rate">0%</strong>
+          </div>
+          <div>
+            <span>Sample Complete</span>
+            <strong id="reachability-sample-complete">0</strong>
+          </div>
+          <div>
+            <span>Chosen → Complete</span>
+            <strong id="reachability-density-ratio">0%</strong>
+          </div>
+        </div>
+        <div class="alignment-layout">
+          <div>
+            <h3>Validation Outcomes</h3>
+            <div class="scout-table-wrap compact">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Outcome</th>
+                    <th>Count</th>
+                    <th>Share</th>
+                    <th>Avg Distance</th>
+                  </tr>
+                </thead>
+                <tbody id="reachability-outcome-table"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Top Failure Reasons</h3>
+            <div id="reachability-failure-list" class="safety-list"></div>
+          </div>
+        </div>
+        <div class="alignment-layout">
+          <div>
+            <h3>Planet Reachability</h3>
+            <div class="scout-table-wrap compact">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Planet</th>
+                    <th>Candidates</th>
+                    <th>Valid / Reject</th>
+                    <th>Activated</th>
+                    <th>Complete</th>
+                    <th>Valid %</th>
+                  </tr>
+                </thead>
+                <tbody id="reachability-planet-table"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Distance Bands</h3>
+            <div class="scout-table-wrap compact">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Band</th>
+                    <th>Candidates</th>
+                    <th>Valid</th>
+                    <th>Reject</th>
+                    <th>Complete</th>
+                    <th>Complete %</th>
+                  </tr>
+                </thead>
+                <tbody id="reachability-distance-table"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>Reachability Memory</h2>
+          <span id="reachability-memory-state">memory pending</span>
+        </div>
+        <div class="path-badges">
+          <span id="reachability-memory-mode-badge" class="chip candidate">SHADOW READ ONLY</span>
+          <span class="chip candidate">RUNTIME ONLY</span>
+          <span class="chip blocked">VALIDATION REQUIRED</span>
+        </div>
+        <div class="path-summary">
+          <div>
+            <span>Rows</span>
+            <strong id="reachability-memory-rows">0</strong>
+          </div>
+          <div>
+            <span>Attempts</span>
+            <strong id="reachability-memory-attempts">0</strong>
+          </div>
+          <div>
+            <span>Verified</span>
+            <strong id="reachability-memory-verified">0</strong>
+          </div>
+          <div>
+            <span>Fallback</span>
+            <strong id="reachability-memory-rejected">0</strong>
+          </div>
+          <div>
+            <span>Sample Complete</span>
+            <strong id="reachability-memory-sample">0</strong>
+          </div>
+          <div>
+            <span>Shadow Diff</span>
+            <strong id="reachability-memory-shadow-different">0</strong>
+          </div>
+        </div>
+        <div class="alignment-layout">
+          <div>
+            <h3>Successful Buckets</h3>
+            <div class="scout-table-wrap compact">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Resource</th>
+                    <th>Bucket</th>
+                    <th>Evidence</th>
+                    <th>Confidence</th>
+                  </tr>
+                </thead>
+                <tbody id="reachability-memory-success-table"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Rejected Buckets</h3>
+            <div class="scout-table-wrap compact">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Resource</th>
+                    <th>Bucket</th>
+                    <th>Fallbacks</th>
+                    <th>Age</th>
+                  </tr>
+                </thead>
+                <tbody id="reachability-memory-rejected-table"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div class="alignment-layout">
+          <div>
+            <h3>Planet Memory</h3>
+            <div class="scout-table-wrap compact">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Planet</th>
+                    <th>Attempts</th>
+                    <th>Verified</th>
+                    <th>Fallback</th>
+                    <th>Complete</th>
+                  </tr>
+                </thead>
+                <tbody id="reachability-memory-planet-table"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Resource Type Memory</h3>
+            <div class="scout-table-wrap compact">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Type</th>
+                    <th>Attempts</th>
+                    <th>Verified</th>
+                    <th>Fallback</th>
+                    <th>Complete</th>
+                  </tr>
+                </thead>
+                <tbody id="reachability-memory-resource-table"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>NavArea Density</h2>
+          <span id="navarea-density-state">shadow pending</span>
+        </div>
+        <div class="path-badges">
+          <span id="navarea-mode-badge" class="chip candidate">SHADOW MODE</span>
+          <span class="chip candidate">RUNTIME CACHE ONLY</span>
+        </div>
+        <div class="navarea-summary">
+          <div>
+            <span>Areas</span>
+            <strong id="navarea-candidates">0</strong>
+          </div>
+          <div>
+            <span>Generated</span>
+            <strong id="navarea-generated">0</strong>
+          </div>
+          <div>
+            <span>Cache Hits</span>
+            <strong id="navarea-cache-hits">0</strong>
+          </div>
+          <div>
+            <span>Validated</span>
+            <strong id="navarea-validated">0</strong>
+          </div>
+          <div>
+            <span>Rejected</span>
+            <strong id="navarea-rejected">0</strong>
+          </div>
+          <div>
+            <span>Legacy Fallback</span>
+            <strong id="navarea-fallback">0</strong>
+          </div>
+        </div>
+        <div class="navarea-layout">
+          <div>
+            <h3>Sample Cache</h3>
+            <div class="scout-table-wrap compact">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>NavArea</th>
+                    <th>Position</th>
+                    <th>Validation</th>
+                    <th>Use</th>
+                  </tr>
+                </thead>
+                <tbody id="navarea-sample-table"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Rejections</h3>
+            <div id="navarea-rejection-list" class="safety-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>Recent Intelligent Yields</h2>
+          <span id="recent-yield-state">no rows</span>
+        </div>
+        <div class="scout-table-wrap">
+          <table class="scout-table">
+            <thead>
+              <tr>
+                <th>Miner</th>
+                <th>Conceptual Yield</th>
+                <th>Source Resource</th>
+                <th>Demand</th>
+                <th>Safety</th>
+                <th>Age</th>
+              </tr>
+            </thead>
+            <tbody id="recent-yield-table"></tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="panel span-4">
         <div class="panel-title">
           <h2>Safety Boundaries</h2>
@@ -134,6 +999,10 @@
         <div class="assignment-panel">
           <h3>Live Assignments</h3>
           <div id="assignment-list" class="assignment-list"></div>
+        </div>
+        <div class="assignment-panel">
+          <h3>Recent Assignment History</h3>
+          <div id="assignment-history-list" class="assignment-list"></div>
         </div>
       </section>
     </main>

@@ -76,6 +76,7 @@ void SimBehaviorTask::run() {
 
         if (capturedType == SimBehaviorTask::FINISH_SURVEY) miner->finishSurvey();
         else if (capturedType == SimBehaviorTask::FINISH_SAMPLE) miner->finishSample();
+        else if (capturedType == SimBehaviorTask::START_STATIONED_SAMPLE) miner->startStationedSample();
     }, "SimPlayerBehaviorLambda");
 }
 
@@ -409,9 +410,12 @@ SimMinerController::SimMinerController(AiAgent* aiAgent, const SimMinerConfig& m
     intelligentAssignmentPending = false;
     intelligentAssignmentActive = false;
     intelligentSampleActive = false;
+    intelligentAssignmentStationed = false;
     intelligentLogActivationLifecycle = true;
     intelligentQueuedDuringSample = false;
     intelligentQueuedAtMs = 0;
+    intelligentAssignmentGenerationId = 0;
+    intelligentActivationSnapshotId = 0;
     intelligentTargetDensity = 0.f;
     intelligentAssignmentExpiresAtMs = 0;
     setLoggingName("SimMinerController");
@@ -619,6 +623,11 @@ bool SimMinerController::requestIntelligentTargetAssignment(
         const Vector3& targetPosition,
         float density,
         uint64 expiresAtMs,
+        uint64 assignmentGenerationId,
+        const String& targetHash,
+        uint64 activationSnapshotId,
+        const String& activationPathValidationStatus,
+        const String& activationPathTrustStatus,
         bool logActivationLifecycle,
         String& activationResult) {
     activationResult = "fallback";
@@ -683,9 +692,35 @@ bool SimMinerController::requestIntelligentTargetAssignment(
     }
 
     if (intelligentAssignmentPending || intelligentAssignmentActive ||
-            intelligentSampleActive) {
+            intelligentSampleActive || intelligentAssignmentStationed) {
+        bool sameAssignment =
+            intelligentAssignmentGenerationId == assignmentGenerationId &&
+            !targetHash.isEmpty() &&
+            intelligentTargetHash == targetHash;
+
+        if (!sameAssignment) {
+            activationResult = "controllerBusy";
+            return false;
+        }
+
+        intelligentLogActivationLifecycle = logActivationLifecycle;
         activationResult = "alreadyActive";
-        return false;
+
+        if (intelligentSampleActive) {
+            SimPlayerManager::instance()->recordMinerIntelligentTargetAssignmentLifecycleFromController(
+                strongAgent->getObjectID(), "sampleStarted", activationResult);
+        } else if (intelligentAssignmentStationed) {
+            SimPlayerManager::instance()->recordMinerIntelligentTargetAssignmentLifecycleFromController(
+                strongAgent->getObjectID(), "stationed", activationResult);
+        } else if (intelligentAssignmentActive) {
+            SimPlayerManager::instance()->recordMinerIntelligentTargetAssignmentLifecycleFromController(
+                strongAgent->getObjectID(), "activationStarted", activationResult);
+        } else {
+            SimPlayerManager::instance()->recordMinerIntelligentTargetAssignmentLifecycleFromController(
+                strongAgent->getObjectID(), "queued", activationResult);
+        }
+
+        return true;
     }
 
     intelligentProfileKey = profileKey;
@@ -695,6 +730,11 @@ bool SimMinerController::requestIntelligentTargetAssignment(
     intelligentTargetPosition = targetPosition;
     intelligentTargetDensity = density;
     intelligentAssignmentExpiresAtMs = expiresAtMs;
+    intelligentAssignmentGenerationId = assignmentGenerationId;
+    intelligentTargetHash = targetHash;
+    intelligentActivationSnapshotId = activationSnapshotId;
+    intelligentActivationPathValidationStatus = activationPathValidationStatus;
+    intelligentActivationPathTrustStatus = activationPathTrustStatus;
     intelligentLogActivationLifecycle = logActivationLifecycle;
     intelligentQueuedState = getSimStateName(state);
     intelligentQueuedDuringSample =
@@ -768,6 +808,7 @@ bool SimMinerController::beginIntelligentTargetAssignment(String& activationResu
     intelligentAssignmentPending = false;
     intelligentAssignmentActive = true;
     intelligentSampleActive = false;
+    intelligentAssignmentStationed = false;
 
     // Keep yield conceptual and independent from the exact ResourceSpawn target.
     targetResource = pickRandomResource();
@@ -799,6 +840,28 @@ void SimMinerController::performIntelligentSample() {
     task->schedule(config.sampleDurationMs);
 }
 
+void SimMinerController::startStationedSample() {
+    if (!intelligentAssignmentStationed)
+        return;
+
+    ManagedReference<AiAgent*> strongAgent = agent;
+
+    if (strongAgent == nullptr) {
+        clearLocalIntelligentTargetAssignment();
+        return;
+    }
+
+    intelligentAssignmentStationed = false;
+    intelligentAssignmentActive = true;
+    intelligentSampleActive = false;
+
+    uint64 sourceObjectID = strongAgent->getObjectID();
+    SimPlayerManager::instance()->recordMinerIntelligentTargetAssignmentLifecycleFromController(
+        sourceObjectID, "sampleStarted", "stationedRepeat");
+    logIntelligentTargetArrival("stationed_sample_started");
+    performIntelligentSample();
+}
+
 void SimMinerController::finishIntelligentSample() {
     ManagedReference<AiAgent*> strongAgent = agent;
 
@@ -819,24 +882,59 @@ void SimMinerController::finishIntelligentSample() {
     strongAgent->setPosture(CreaturePosture::UPRIGHT, true);
     strongAgent->doAnimation("stop_sample");
 
-    clearLocalIntelligentTargetAssignment();
-    SimPlayerManager::instance()->clearMinerIntelligentTargetAssignmentOnSampleComplete(sourceObjectID);
-    startSimLoop();
-
     if (recordYield) {
-        SimPlayerManager::instance()->recordConceptualMinerYield(
+        SimPlayerManager::instance()->recordIntelligentConceptualMinerYield(
             completedResource, yieldAmount, sourceObjectID, logYield);
     }
+
+    bool scheduleRepeatedSample = false;
+    int repeatedSampleDelayMs = 0;
+    String stationedReason;
+    bool retainedStationed =
+        SimPlayerManager::instance()->transitionMinerIntelligentAssignmentToStationed(
+            sourceObjectID,
+            recordYield ? yieldAmount : 0,
+            scheduleRepeatedSample,
+            repeatedSampleDelayMs,
+            stationedReason);
+
+    if (retainedStationed) {
+        intelligentAssignmentPending = false;
+        intelligentAssignmentActive = false;
+        intelligentSampleActive = false;
+        intelligentAssignmentStationed = true;
+        state = WAITING;
+
+        if (scheduleRepeatedSample && repeatedSampleDelayMs > 0) {
+            Reference<SimBehaviorTask*> task =
+                new SimBehaviorTask(this, SimBehaviorTask::START_STATIONED_SAMPLE);
+            task->schedule(repeatedSampleDelayMs);
+        }
+
+        return;
+    }
+
+    clearLocalIntelligentTargetAssignment();
+    SimPlayerManager::instance()->clearMinerIntelligentTargetAssignmentFromController(
+        sourceObjectID,
+        stationedReason.isEmpty() ? String("sampleComplete") : stationedReason);
+    startSimLoop();
 }
 
 void SimMinerController::clearLocalIntelligentTargetAssignment() {
     intelligentAssignmentPending = false;
     intelligentAssignmentActive = false;
     intelligentSampleActive = false;
+    intelligentAssignmentStationed = false;
     intelligentProfileKey = "";
     intelligentQueuedDuringSample = false;
     intelligentQueuedAtMs = 0;
+    intelligentAssignmentGenerationId = 0;
+    intelligentActivationSnapshotId = 0;
     intelligentQueuedState = "";
+    intelligentTargetHash = "";
+    intelligentActivationPathValidationStatus = "";
+    intelligentActivationPathTrustStatus = "";
     intelligentResourceName = "";
     intelligentResourceType = "";
     intelligentTargetZone = "";
@@ -855,6 +953,13 @@ void SimMinerController::logIntelligentTargetActivation(
     String line = String("MinerIntelligentTargetActivation miner=") +
         String::valueOf(objectID) +
         " action=" + action +
+        " assignmentGenerationId=" +
+            String::valueOf(intelligentAssignmentGenerationId) +
+        " targetHash=" +
+            (intelligentTargetHash.isEmpty() ?
+                String("none") : intelligentTargetHash) +
+        " activationSnapshotId=" +
+            String::valueOf(intelligentActivationSnapshotId) +
         " selectedProfile=" +
             (intelligentProfileKey.isEmpty() ?
                 String("none") : intelligentProfileKey) +
@@ -878,8 +983,12 @@ void SimMinerController::logIntelligentTargetActivation(
                 intelligentTargetPosition.getZ(), 1)) +
         " density=" +
             String::valueOf(Math::getPrecision(intelligentTargetDensity, 3)) +
-        " pathValidationStatus=valid" +
-        " pathTrustStatus=verifiedPath" +
+        " pathValidationStatus=" +
+            (intelligentActivationPathValidationStatus.isEmpty() ?
+                String("valid") : intelligentActivationPathValidationStatus) +
+        " pathTrustStatus=" +
+            (intelligentActivationPathTrustStatus.isEmpty() ?
+                String("verifiedPath") : intelligentActivationPathTrustStatus) +
         " queuedState=" +
             (intelligentQueuedState.isEmpty() ?
                 String("none") : intelligentQueuedState) +
@@ -914,6 +1023,13 @@ void SimMinerController::logIntelligentTargetArrival(
     Logger::console.info(
         String("MinerIntelligentTargetArrival miner=") +
         String::valueOf(objectID) +
+        " assignmentGenerationId=" +
+            String::valueOf(intelligentAssignmentGenerationId) +
+        " targetHash=" +
+            (intelligentTargetHash.isEmpty() ?
+                String("none") : intelligentTargetHash) +
+        " activationSnapshotId=" +
+            String::valueOf(intelligentActivationSnapshotId) +
         " selectedProfile=" +
             (intelligentProfileKey.isEmpty() ?
                 String("none") : intelligentProfileKey) +

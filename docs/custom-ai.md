@@ -1062,6 +1062,263 @@ Locking remains one-way and copy-first: D.6.2 copies live conceptual totals unde
 
 The next persistence phase should stay diagnostic: prove restart behavior over several checkpoint/restart cycles and add bounded audit tooling before any reservation, consumption, or demand-weighted behavior switch consumes stockpile state operationally.
 
+### C.4 / RI.4 - Read-Only Stockpile Inspection
+
+C.4/RI.4 adds dashboard/API inspection for AI-owned conceptual stockpile state. It is observability only: the dashboard reads copied primitive/string snapshots from `SimPlayerManager` and `AiEconomyManager`, then renders them beside Resource Scout, Resource Coverage, and RI.3 recent intelligent yield provenance.
+
+The inspection view separates three quantities that should not be confused:
+
+- Current-session conceptual totals from `SimPlayerManager::conceptualMinerTotals`.
+- Persisted conceptual-miner lot quantities from `AiEconomyData` / `AiEconomyStockpileLot`.
+- Startup-baseline quantities captured by `AiEconomyManager` at load time and optionally consumed by D.6.2 when `persistentStockpileDemandConfig.enabled=true`.
+
+The dashboard section reports persistence readiness, checkpoint configuration, persistent-demand configuration, loaded lot counts, conceptual-miner lot counts, persisted quantity, current-session quantity, available/reserved quantities, and per-label summaries. Per-label rows include the demand profiles that currently consume that conceptual label by reusing the same D.6.2 conceptual-label mapping. Bounded persisted-lot rows include entry id, conceptual label, quantity, available/reserved quantity, acquisition source, lifecycle, owner scope, identity confidence, optional source resource fields, and update age.
+
+The view is deliberately clear that this is conceptual AI economy state rather than real SWG inventory. Rows use `identityConfidence=conceptual_label`, `yieldMode=conceptual`, and explicit safety fields such as `realResourceCreated=false`, `resourceContainerCreated=false`, `inventoryMutated=false`, and `economyMutated=false`.
+
+C.4/RI.4 does not add persistence writes, alter C.3.1 checkpoint behavior, alter D.6.2 reserve/pressure math, add stockpile reservations or consumption, or change SimMiner targeting, activation, movement, sampling, conceptual labels, or yield amounts. It does not call real extraction APIs, create `ResourceContainer` objects, or mutate inventory, vendors, bazaar/auction, harvesters, crafting, credits, market state, or player-facing economy objects.
+
+This bridges RI.3 provenance to future exact-resource-aware stockpiles: operators can now see recent exact-resource-aware conceptual yield explanations next to the persistent conceptual lots and startup baseline that demand state may read later, while the system still avoids claiming that real resource units exist.
+
+### C.5 / RI.5 - Runtime Exact-Resource-Aware Conceptual Stockpile Aggregation
+
+C.5/RI.5 adds a runtime-only aggregation layer for intelligent SimMiner conceptual yields that have RI.3 provenance. It does not persist exact-resource-aware rows yet. The goal is to prove the shape of exact-resource-aware conceptual stockpile data in the dashboard before adding any durable write path.
+
+The source signal is `SimPlayerManager::recordIntelligentConceptualMinerYield`. After the existing broad conceptual total is credited, the manager copies the same RI.3 provenance snapshot into a bounded in-memory aggregate when the assignment identity is available as `identityConfidence=observed_resource_spawn`.
+
+Rows are grouped by copied primitive/string provenance:
+
+- Conceptual label.
+- Source resource name.
+- Source resource type.
+- Source zone/planet.
+- Selected demand profile.
+- Identity confidence.
+- Acquisition source, currently `intelligent_miner`.
+
+Each row tracks conceptual quantity, event/sample count, first observed time, last observed time, latest density coordinate, latest density value, demand state, and pressure score. The dashboard exposes these rows as `resourceAwareStockpile` with `mode=runtime-read-only`, `runtimeOnly=true`, and `persisted=false`.
+
+This differs from broad conceptual totals. The existing broad counters still answer "how much water/copper/iron/gas did conceptual miners produce this session?" The C.5/RI.5 rows answer "which exact observed resource opportunity did an intelligent assignment conceptually produce against?" Broad conceptual totals remain the accounting source for C.3.1 checkpointing and D.6.2 current-session supply. Resource-aware rows are explanatory, restart-volatile runtime aggregates and are not added back into demand math.
+
+Double-counting is avoided by treating the new rows as provenance aggregates only. `recordIntelligentConceptualMinerYield` still calls the existing `recordConceptualMinerYield` once, exactly as before, then records the runtime provenance aggregate separately. The dashboard can show both views, but D.6.2 and C.3.1 continue to consume the broad conceptual totals unless a future explicitly gated phase changes that.
+
+Safety boundaries:
+
+- No real `ResourceSpawn` extraction or sampling API is called.
+- No `ResourceContainer` is created.
+- No player inventory, vendor, bazaar/auction, harvester, crafting, credit, market, reservation, consumption, or stockpile allocation path is touched.
+- No `AiEconomyData` or `AiEconomyStockpileLot` write is added in this phase.
+- No SimMiner targeting, activation caps, assignment selection, movement, sampling duration, yield amount, or conceptual label selection changes.
+- Rows store only copied primitive/string metadata and are bounded in memory.
+
+This prepares for future exact-resource-aware stockpile persistence and later AI crafting by proving a safe provenance key and dashboard shape without crossing into real economy behavior.
+
+### D.7 / RI.6 - Economy Decision Audit and Dashboard Health Summary
+
+D.7/RI.6 adds a read-only audit layer to the AI economy dashboard. It summarizes whether the current intelligence loop looks aligned without changing any planner, miner, stockpile, demand, or economy behavior.
+
+The audit is computed inside the existing `/v1/aieconomy/dashboard/` snapshot path from data that has already been copied for other dashboard sections:
+
+- `resourceScout` active demand opportunities.
+- `resourceCoverage` covered, uncovered, and blocker status for top opportunities.
+- RI.3 `recentIntelligentYields`.
+- C.5/RI.5 `resourceAwareStockpile` runtime provenance aggregates.
+- C.4/RI.4 `stockpileInspection`.
+- D.5.8 limited activation health counters.
+- D.6.2 demand profile summaries.
+
+The top-level status values are intentionally conservative:
+
+| Status | Meaning |
+|---|---|
+| `healthy` | Coverage, recent intelligent yield, resource-aware stockpile rows, stockpile readability, and safety flags are aligned. |
+| `watch` | Data is present, but there are uncovered opportunities, no recent matching yield yet, no resource-aware rows yet, stockpile readability concerns, or concentration in one profile while other opportunities remain uncovered. |
+| `blocked` | Activation health or coverage blockers indicate investigation is needed, such as path failures, activation failures, emergency disablement, or most uncovered opportunities blocked by path/density/planet constraints. |
+| `no_data` | The dashboard snapshot has no useful demand, coverage, yield, or resource-aware stockpile data yet. |
+| `unsafe` | Reserved for unexpected safety flags that would indicate real resources, containers, inventory, market, or economy mutation. |
+
+The audit also emits a recommendation such as `keep_current`, `watch_uncovered_priority`, `investigate_blockers`, or `do_not_change_behavior_yet`, plus compact counts and a bounded profile audit. Profile rows compare demand state, coverage, recent intelligent yield quantity, and resource-aware stockpile quantity so operators can see whether shortage profiles are receiving attention or whether output is drifting toward surplus profiles.
+
+D.7/RI.6 is deliberately read-only and should run before any future phase lets resource-aware stockpile data influence demand math or miner planning. It gives operators a single health view for the current loop while preserving the experimental boundary.
+
+Safety boundaries:
+
+- No miner targeting, D.6.6 planning, D.6.2 demand math, activation caps, movement, sampling, yield amount, or conceptual label selection changes.
+- No C.3.1 checkpoint behavior changes and no new persistence writes.
+- No stockpile reservations, consumption, allocation, crafting inputs, vendor output, or market output.
+- No real resource extraction, no `ResourceSpawn::extractResource`, and no `ResourceContainer` creation.
+- No player inventory, vendor, bazaar/auction, harvester, crafting, credit, market, or player-facing economy mutation.
+- The audit stores no raw controller, agent, resource, zone, path, market, vendor, container, or inventory pointers.
+
+### D.7.1 / RI.7 - Coverage Alignment Diagnostics
+
+D.7.1/RI.7 adds a read-only explanation layer for the specific case where `resourceCoverage` reports top opportunities as uncovered while intelligent assignments exist. It does not change coverage rules or miner behavior; it explains why the existing matcher did or did not count an assignment as coverage.
+
+The dashboard API now emits `coverageAlignmentDiagnostics` with:
+
+- `opportunities`: bounded top-opportunity rows showing resource, profile, demand state, current coverage status, diagnosis, match counts, and the closest current assignment.
+- `assignments`: bounded intelligent assignment rows showing target resource/type/zone, selected profile, matched top opportunity, coverage-alignment status, match reason, path validation status, path trust, density target status, age, and remaining TTL.
+- `counts`: compact totals for exact matches, active matches, validated-but-not-active matches, candidate matches, untrusted path matches, stale matches, profile/resource/zone mismatches, normalized-key mismatches, config/travel reachability blockers, and assignments that are not tied to a top opportunity.
+- `activeMinerZones`, `configuredMinerSpawnZones`, `samePlanetRequired`, and `travelSupported`: copied deployment context used to explain whether a valuable opportunity is actually reachable by the current limited miner path.
+
+RI.7 also makes the diagnostics config-aware. If a top resource opportunity is on a planet that has no configured miner spawn zone, such as a Dathomir resource while miners only spawn from the configured Naboo/Corellia/Tatooine shuttleports, the opportunity is diagnosed as `unreachable_no_configured_miner_spawn_zone`. If a planet is configured but no active miner is currently local and travel is not implemented, it is diagnosed as `travel_required_unsupported`. These are dashboard explanations only; they do not change planner scoring, miner spawning, or movement.
+
+This phase answers questions such as:
+
+- Is a top opportunity uncovered because no assignment exists?
+- Does an assignment target the same resource but a different demand profile?
+- Does the resource/profile match but the miner zone does not match the opportunity zones?
+- Is the assignment only a candidate, validated but not active, stale, or using an untrusted fallback path?
+- Did resource keys normalize to the same value even though exact string matching differs?
+- Is the resource on a planet outside the configured miner deployment zones?
+- Would the miner need travel that the current limited activation path does not support?
+- Is the assignment simply not mapped to any current top opportunity?
+
+The dashboard adds a compact Coverage Alignment panel with opportunity-level reasons and assignment-level mapping. This should run before any planner or matcher tuning, because it distinguishes data interpretation problems from actual miner behavior problems.
+
+Safety boundaries:
+
+- Read-only dashboard/API only.
+- No miner targeting, assignment selection, activation, movement, sampling, yield, demand math, or coverage-rule behavior changes.
+- No persistence writes, stockpile reservations, crafting inputs, vendor output, market output, or economy mutations.
+- No real resource extraction, no `ResourceSpawn::extractResource`, no `ResourceContainer` creation, and no player inventory mutation.
+- Rows store only copied primitive/string metadata from existing dashboard snapshot inputs and current intelligent assignment state.
+
+### T.1 / D.8 - Travel Plan Simulation and AI Population Dashboard
+
+T.1/D.8 adds a read-only travel planning layer for the dashboard. The goal is to explain what future travel-aware AI would probably want to do, without moving, recycling, despawning, respawning, selling, staging, or changing any miner behavior.
+
+The dashboard API now emits:
+
+- `travelPlanSimulation`: simulation-only travel plan rows, bounded by config, with `travelImplemented=false`, `travelSupported=false`, `behaviorChanged=false`, and explicit safety flags.
+- `aiPopulation`: active AI/miner population counts by role, assignment state, idle/blocked state, current zone, configured miner spawn zones, simulated plan counts, and travel support flags.
+- `resourceRush`: a compact summary of local versus remote high-priority resource opportunities and the top remote opportunity, if present.
+
+Remote resource rush planning compares active demand/resource opportunities against current active miner zones and configured miner spawn zones. If a valuable opportunity is remote, the simulation can produce `resource_rush` rows showing which active miner would hypothetically travel, from which zone, to which resource zone, and why. These rows use copied primitive/string metadata only and recommend `travel_when_supported`.
+
+Hub-return planning is also simulation-only. `SimPlayerManagerConfig.aiTravelSimulationConfig.homeHub` defines a future Coronet/Corellia resource hub, using the same approximate Coronet hangout coordinates already configured for the Corellia shuttleport. The dashboard can emit `hub_return` rows for miners away from Corellia with recommendation `return_to_hub_when_selling_supported`. This does not add selling, staging, vendor, bazaar, inventory, or market behavior.
+
+Configuration lives under `SimPlayerManagerConfig.aiTravelSimulationConfig`:
+
+```lua
+aiTravelSimulationConfig = {
+    enabled = true,
+    maxPlans = 20,
+    includeResourceRushPlans = true,
+    includeHubReturnPlans = true,
+    homeHub = {
+        enabled = true,
+        key = "coronet_resource_hub",
+        zone = "corellia",
+        city = "coronet",
+        x = -155.0,
+        y = -4722.0,
+        purpose = "sell_resources",
+    },
+}
+```
+
+The economy audit can now distinguish remote high-priority opportunities pending travel support from local assignment or path blockers. A remote opportunity with simulation rows should remain `watch`, with recommendation `enable_travel_or_add_local_miners_later`, instead of being treated as an immediate behavior failure.
+
+This phase prepares for future travel behavior by making the intended decisions visible first. It also gives operators a scalable population view for monitoring many AI without parsing logs. Existing PvP simulated travel/recycle behavior remains a separate precedent; T.1/D.8 does not change or reuse that behavior for miners.
+
+Safety boundaries:
+
+- No actual travel, shuttle use, recycle, despawn, respawn, miner relocation, or PvP travel behavior changes.
+- No miner targeting, assignment selection, activation, movement, sampling, yield amount, conceptual label selection, D.6.2 demand math, D.6.6 planning, or activation cap changes.
+- No persistence writes, stockpile reservations, consumption, selling, vendor output, bazaar output, crafting input/output, credit, market, or player-facing economy behavior.
+- No real resource extraction, no `ResourceSpawn::extractResource`, no `ResourceContainer` creation, and no player inventory mutation.
+- Dashboard rows store only copied primitive/string metadata from existing dashboard snapshot inputs, active controllers, and current intelligent assignment state.
+
+### P.1 / D.8.1 - Path Validation Explanation and Dashboard Diagnostics
+
+P.1/D.8.1 adds a read-only path validation explanation layer for intelligent SimMiner assignments. It exists because coverage alignment can show that an assignment should cover a local opportunity while the limited activation path still refuses to activate it due to `pathValidationStatus=failed` or `pathTrustStatus=directFallbackUnverified`.
+
+The dashboard API now emits `pathValidationDiagnostics` with compact counts and bounded rows. Each row is copied from current assignment state plus the latest path validation snapshot for that miner, when available. The row can include miner id, assignment status, demand profile, target resource/type/zone, density target status, path validation status, path trust status, reject reason, miner and target coordinates, validation target coordinates, straight-line distance, path distance, path node count, direct fallback flag, validation age, assignment age, coordinate drift distance, and a human-readable reason.
+
+The diagnostics distinguish path and target states such as:
+
+- `direct_fallback_unverified`: pathfinder returned only the unverified start/end fallback, so activation remains blocked.
+- `path_too_long`, `exceeds_max_path_distance`, and `too_many_path_nodes`: a path or target exceeded configured validation limits.
+- `no_path` and `path_exception`: no usable path was produced or path validation failed with an exception.
+- `target_mismatch` and `density_target_coordinate_mismatch`: the assignment target drifted from the coordinate used by the latest validation snapshot.
+- `stale`: the latest validation snapshot is older than the configured freshness window.
+- `miner_not_in_navmesh`, `target_outside_navmesh`, and `bad_terrain_or_height`: copied navmesh/terrain checks indicate the miner or target is suspect.
+- `path_validation_unavailable` and `unknown_path_failure`: the dashboard does not have enough copied data to explain more precisely yet.
+
+Known versus unknown navmesh detail is explicit. The validator can report whether the miner was in navmesh when the validation was scheduled, whether the target coordinate was checked against nearby navmesh areas, whether that target was inside one of those areas, and the target terrain height delta. If a field is not safely known, the API and UI mark it unavailable/unknown instead of inferring terrain or navmesh certainty from logs.
+
+The dashboard adds a Path Validation panel near Coverage Alignment. It shows candidate counts, failed validations, direct fallback count, stale count, target drift count, navmesh/terrain warning count, and a table with miner, target, path state, distance, navmesh, and human reason. The Economy Health audit also includes these path diagnostic counts in its blocker summary so a generic watch state can point at the specific local path validation issue.
+
+`directFallbackUnverified` still remains blocked. P.1/D.8.1 does not relax `pathTrustStatus=verifiedPath`, does not allow fallback paths to activate, and does not change path validation thresholds. It only explains why a candidate cannot become an active assignment.
+
+Safety boundaries:
+
+- Read-only dashboard/API only.
+- No path trust gate relaxation and no direct fallback activation.
+- No miner targeting, assignment selection, movement, patrol queue, sampling, yield amount, conceptual label selection, travel behavior, D.6.2 demand math, D.6.6 planning, or activation cap changes.
+- No persistence writes, stockpile reservations, consumption, crafting, vendors, bazaar/auction, credits, market, or player-facing economy behavior.
+- No real resource extraction, no `ResourceSpawn::extractResource`, no `ResourceContainer` creation, and no player inventory mutation.
+- Rows store only copied primitive/string/number/boolean values and do not retain raw agent, controller, resource, zone, path-node, market, vendor, container, or inventory pointers.
+
+### P.2 / D.8.2 - NavArea-Backed Pathable Density Target Selection
+
+P.2/D.8.2 adds a shadow-mode NavArea-backed density candidate layer for SimMiner/economy targeting. The goal is to start moving density target selection away from raw random terrain samples and toward cached pathable staging candidates, without changing miner behavior by default.
+
+NavAreas are used as the scalable decision layer because they are already persisted per planet, loaded into the active-area tree, and backed by Recast/Detour navmesh when available. The first implementation keeps a memory-only sample cache keyed by `planet:NavAreaName`, where the NavArea name comes from `NavArea::getMeshName()` with safe fallbacks. Cached rows store only copied data: sample position, planet, source NavArea, coarse source role such as `city`, `poi_region`, or `region`, validation result, validation timestamp, use count, rejection count, confidence, and generated time.
+
+`NavArea::containsPoint` is not treated as proof of true pathability. It is only a coarse active-area coverage check. Samples are considered pathable candidates only when they come from `PathFinderManager::getSpawnPointInArea` while a loaded NavArea overlaps the sampled area. The existing P.1 path validation layer remains the final trust gate for assignment activation, and `pathTrustStatus=verifiedPath` is still required.
+
+Full path validation is deliberately budgeted and not newly invoked by this phase. P.2 records `navAreaMaxPathValidationsPerCycle` and exposes path validation budget counters, but the first safe implementation uses Detour-backed spawn sampling plus the existing P.1 validation pass rather than adding new per-candidate `findPath` calls. This avoids pathfinding spikes while still exposing cache hit/miss, sample generation, candidate scoring, and fallback reasons.
+
+Generic interiors are initially avoided with `navAreaAvoidGenericInteriors=true`. Building interiors are not generally represented by useful region NavAreas, and the economy AI should stay on outdoor/city/POI staging until explicit validated interior anchors exist.
+
+Configuration lives under `SimPlayerManagerConfig.navAreaDensitySelectionConfig`:
+
+```lua
+navAreaDensitySelectionConfig = {
+    enableNavAreaDensitySelection = false,
+    enableNavAreaDensityShadowMode = true,
+    navAreaSampleCacheTtlSeconds = 900,
+    navAreaMaxSamplesPerArea = 8,
+    navAreaMaxSampleAttemptsPerCycle = 16,
+    navAreaMaxPathValidationsPerCycle = 0,
+    navAreaAvoidGenericInteriors = true,
+    navAreaPreferCityAndPoiRegions = true,
+}
+```
+
+Dashboard/API diagnostics are exposed as `navAreaDensitySelection` and include:
+
+- `navAreaCandidatesConsidered`
+- `navAreaSamplesGenerated`
+- `navAreaSampleCacheHits`
+- `navAreaSampleCacheMisses`
+- `navAreaSamplesValidated`
+- `navAreaSamplesRejected`
+- `navAreaRejectionReasons`
+- `densityCandidatesConsidered`
+- `densitySelectedCandidateScore`
+- `densitySelectionMode`
+- `pathValidationBudgetUsed`
+- `pathValidationSkippedBudget`
+- `fallbackToLegacySamplingCount`
+- `directFallbackPathCount`
+- `confirmedPathCount`
+- `indoorCandidateRejectedCount`
+
+The dashboard adds a NavArea Density panel next to Path Validation. It shows the shadow/active mode, runtime cache size, candidate/sample/cache counts, fallback count, recent cached samples, and rejection reasons. Shadow logs use `NavAreaDensitySelection` and include whether the NavArea candidate would have selected a different target.
+
+Default behavior is unchanged. With `enableNavAreaDensitySelection=false` and `enableNavAreaDensityShadowMode=true`, the feature only records diagnostics and logs would-select decisions. Active replacement is reserved for a later test by setting `enableNavAreaDensitySelection=true` and `enableNavAreaDensityShadowMode=false`; even then, existing density/path fallback behavior remains available when the cache is empty, confidence is low, or budgets are exhausted.
+
+Safety boundaries:
+
+- Runtime/dashboard-only cache; no persistence writes.
+- No new real resource extraction, no `ResourceSpawn::extractResource`, no `ResourceContainer` creation, and no inventory/economy mutation.
+- No travel, selling, vendor, bazaar, crafting, credit, market, or player-facing economy behavior.
+- No default miner behavior change; shadow mode leaves legacy density targets and assignments untouched.
+- No raw `NavArea`, `ResourceSpawn`, controller, agent, path-node, market, vendor, container, or inventory pointers are retained.
+
 ### SWG Resource System Research
 
 This section captures how the real Core3 resource system works so future AI economy persistence does not hard-code around the current SimMiner placeholder labels.
@@ -2825,6 +3082,23 @@ Safety gates intentionally remain mandatory:
 - Market observation read-only separation.
 - No real resources, no `ResourceContainer` objects, no player inventory/vendor/bazaar/crafting/harvester/credit mutations, and no persistence writes from activation.
 
+### RI.3 - Exact-Resource-Aware Conceptual Yield Provenance
+
+RI.3 connects the Resource Scout and Resource Coverage views to completed intelligent SimMiner samples without changing what the miner actually produces. When an assignment-aware miner completes its conceptual sample, the manager records a small bounded in-memory provenance row before clearing the retained assignment.
+
+The row is dashboard/API metadata only. It copies primitive/string facts that were already present in the intelligent assignment:
+
+- Miner object ID.
+- Conceptual label and amount credited by the existing conceptual yield path.
+- Source resource name, source resource type, source zone, density coordinate, and density when available.
+- Selected demand profile, demand state, and pressure score when available.
+- Assignment creation time and assignment age.
+- Explicit safety fields: `yieldMode=conceptual`, `identityConfidence=observed_resource_spawn`, `realResourceCreated=false`, `resourceContainerCreated=false`, `inventoryMutated=false`, and `economyMutated=false`.
+
+RI.3 does not call real sampling or extraction APIs, does not call `ResourceSpawn::extractResource`, does not create `ResourceContainer` objects, and does not mutate player inventory, vendors, bazaar/auction listings, harvesters, crafting output, credits, market state, or AI economy persistence. The credited conceptual totals remain the existing memory-only conceptual accounting, and the exact `ResourceSpawn` target is not converted into the credited conceptual label.
+
+This phase is a bridge from read-only resource intelligence to future exact-resource-aware stockpile lots. The dashboard can now explain that a miner conceptually produced a broad label because it completed an intelligent assignment against a named active resource opportunity, while still making clear that no real resource units exist.
+
 ### D.6 - Hot-Item Demand Profile Research
 
 D.2's curated profiles proved that active `ResourceSpawn` objects can be filtered and scored, but names such as `weaponsmith_dl44` are test fixtures rather than economic truth. A schematic being craftable does not mean players create it often, that its resources deserve equal priority, or that it should influence future miner behavior.
@@ -4458,3 +4732,95 @@ Build richer reusable AI behavior modules on top of the stabilized bridge and se
 - LLM behavior must remain bounded by deterministic gameplay rules.
 - Emergent behavior can be hard to test.
 - More AI features increase the need for centralized configuration, observability, and fallback paths.
+
+## P.2.2 / P.2.3 - Miner Assignment Lifecycle Hardening
+
+P.2.2/P.2.3 hardens the intelligent miner assignment lifecycle before any stronger forced movement behavior is enabled. The assignment lifecycle status is now treated as authoritative and monotonic: path validation refreshes can update current/latest validation fields, but they must not move an active assignment backward from `queued`, `activation_started`, `sample_started`, or `sample_complete` to `candidate` or `validated`.
+
+Assignments now carry an `assignmentGenerationId` and stable `targetHash` built from target source, demand profile, resource name/type, zone, and bucketed target coordinates. Path validation snapshots carry a monotonically increasing `validationSnapshotId`, the assignment generation when available, and the same target hash. This prevents diagnostics from relying only on miner object id when deciding whether a validation snapshot belongs to a live assignment.
+
+Validation state is split into three meanings:
+
+- lifecycle status: current assignment lifecycle such as `candidate`, `validated`, `queued`, `activation_started`, `sample_started`, or `sample_complete`.
+- activation validation: the verified decision-time validation copied when activation is accepted.
+- latest validation: the newest diagnostic snapshot for the miner, which may be newer than the activation decision and may describe a mismatch, stale check, or failed path.
+
+Dashboard/API rows now expose `assignmentGenerationId`, `targetHash`, `validationSnapshotId`, `activationSnapshotId`, activation validation status/trust, latest validation status/trust, target hash mismatch state, and whether a lifecycle downgrade was prevented. If `densityTargetCoordinateMismatch`, `profileResourceMismatch`, `assignmentGenerationMismatch`, or `targetHashMismatch` appears, it should be interpreted first as snapshot-to-assignment drift unless the activation validation also failed.
+
+Cleared assignments are copied into a bounded runtime-only `recentAssignmentHistory` list. This preserves generation id, target hash, lifecycle timestamps, clear reason, latest validation, activation validation, and yield-related context after the live assignment is removed. This is memory-only and is not persisted.
+
+The dashboard also emits `movementReadiness`. This is a read-only diagnostic for a future forced-movement phase. Readiness requires a valid lifecycle state, verified activation/decision validation, matching generation/target hash identity, no lifecycle downgrade, no mismatch, and available activation cap. It does not force movement, change targeting, relax path trust, change scoring, alter yields, create resources, create `ResourceContainer` objects, mutate inventory, or write persistence.
+
+## P.2.4 - Movement / Arrival Timeout Hardening
+
+P.2.4 separates assignment freshness from active movement lifetime. The broad assignment TTL now applies to stale `candidate` and never-activated `validated` assignments only. Once an intelligent miner assignment reaches `queued`, `activation_started`, or `sample_started`, normal candidate TTL no longer clears it when `preventNormalTtlForActiveMovement` is enabled.
+
+Active lifecycle states use separate timeouts:
+
+- `queuedActivationTimeout` clears a queued assignment that never starts.
+- `movementArrivalTimeout` clears an `activation_started` assignment that does not arrive within a conservative movement timeout.
+- `sampleTimeout` clears a `sample_started` assignment that does not finish sampling.
+
+Movement arrival timeout is distance-aware when validation path distance is available. The timeout is computed from `movementArrivalTimeoutMinSeconds + pathDistance * movementArrivalSecondsPerMeter`, then clamped between `movementArrivalTimeoutMinSeconds` and `movementArrivalTimeoutMaxSeconds`. If no path distance is known, `movementArrivalTimeoutSeconds` is used.
+
+Dashboard/API rows now expose lifecycle timeout reason, lifecycle timeout age, lifecycle timeout seconds, movement timeout remaining seconds, sample timeout remaining seconds, activation path distance, latest path distance, and whether normal TTL was skipped for active movement. The `minerActivity`, `movementReadiness`, and health-window sections expose counts for candidate expiry, validated expiry, queued activation timeout, movement arrival timeout, sample timeout, expired-while-active prevention, and normal TTL skips.
+
+Cleared assignment history records lifecycle status at clear, clear reason, movement/sample ages, timeout used, activation snapshot id, activation path trust, latest path trust, and the normal-TTL protection flag. A row with `clearReason=movementArrivalTimeout` means the miner had activation-time validation and movement was allowed, but arrival did not happen before the movement-specific timeout. A row with `clearReason=expired` now means a stale candidate or validated assignment expired before active movement.
+
+This does not change demand scoring, density selection, path validation, NavArea selection, activation caps, movement speed, yield amount, persistence, inventory, resources, containers, market, vendor, crafting, or credit behavior. It is a movement lifecycle hardening step before any stronger movement forcing is considered.
+
+## P.2.5 - Reachability Calibration & Explainability
+
+P.2.5 adds runtime-only reachability calibration metrics for intelligent miner candidate selection. The goal is to explain where density-selected opportunities are lost before activation, without relaxing validation or changing movement behavior.
+
+The dashboard/API section is `reachabilityCalibration`. It is `runtime-rolling-read-only`, meaning counters accumulate in memory for the current server process and are not persisted. The section reports:
+
+- `validationFunnel`: assignment-level candidate counts for generated, first validated, and first rejected candidates.
+- `densityConversion`: density target conversion from chosen to validated, activated, and sample complete.
+- `validationOutcomes`: path validation attempt outcomes, including `verifiedPath`, `directFallbackVerified`, `directFallbackUnverified`, `pathRejected`, and `pathGenerationFailed`, with count, share, and average distance.
+- `byPlanet`: candidate, validation, rejection, activation, and completion counts per planet.
+- `byResourceClass`: the same funnel grouped by broad resource type prefix, such as `water`, `gas`, `iron`, or `copper`.
+- `byDensitySource`: the same funnel grouped by source, currently usually `demand_weighted_plan`.
+- `byDistanceBand`: the same funnel grouped into `0-128m`, `128-256m`, `256-512m`, and `512m+`.
+- `topFailureReasons`: normalized blockers such as `trustInsufficient`, `pathGenerationFailed`, `validationDistanceExceeded`, and `candidateExpiredBeforeValidation`.
+
+Interpretation guidance:
+
+- If `directFallbackUnverified` dominates validation outcomes, the pathfinder is returning start/end fallback paths that remain intentionally untrusted.
+- If failures cluster in `512m+`, the selected density targets may be too far away for reliable local pathing.
+- If one planet has a much lower validation success percentage than others, inspect that planet's navmesh, terrain, configured miner spawn points, and density target coordinates.
+- If chosen-to-validated is low but validated-to-activated is high, candidate/pathability selection is the bottleneck.
+- If validated-to-activated is low, activation caps, cooldowns, lifecycle state, or readiness blockers are more likely than density pathability.
+- If activated-to-sample-complete is low, use P.2.4 movement/arrival timeout diagnostics and controller lifecycle logs.
+
+Assignment funnel counts and validation outcome counts intentionally answer different questions. The assignment funnel tracks candidate lifecycle conversion. Validation outcomes track path validation attempts, so repeated validation retries can increase outcome counts without creating new assignments.
+
+This phase does not change demand scoring, density scoring, density weighting, path validation acceptance, NavArea behavior, movement, activation caps, sampling, yield amounts, persistence, resources, containers, inventory, vendors, bazaar, market, crafting, credits, or economy state. It only exposes calibration data needed before considering stronger movement forcing or reachability tuning.
+
+## P.2.6 - Verified Reachability Memory + Candidate Preference
+
+P.2.6 adds runtime-only reachability memory for intelligent miner density targets. The memory is keyed by copied primitive/string provenance: planet, resource name, resource type, selected demand profile, target source, and a rounded coordinate bucket. It records validation attempts, verified path counts, direct fallback failures, activations, sample completions, average path distance, average density, and a simple confidence score.
+
+Memory collection is enabled by default through `reachabilityMemoryConfig.enableReachabilityMemory=true`. Candidate preference is explicitly disabled by default through `enableReachabilityCandidatePreference=false`, so the system records what it would prefer in shadow mode but does not change selected targets unless the operator intentionally enables the gate.
+
+The dashboard/API section is `reachabilityMemory`. It reports:
+
+- `topSuccessfulBuckets`: buckets with verified paths or sample completions.
+- `topRejectedBuckets`: buckets with direct fallback/unverified path history.
+- `byPlanet`, `byResourceType`, and distance-band aggregates.
+- Shadow counters such as `shadowWouldSelectDifferentCount` and `shadowPreferredVerifiedHistoryCount`.
+- Active preference counters such as `activePreferenceUsedCount` and `activePreferenceFallbackCount`, which should remain zero while preference is disabled.
+
+When candidate preference is disabled, reachability memory does not change density scoring, demand scoring, path validation, assignment selection, activation, movement, sampling, yield amounts, persistence, inventory, resources, containers, market, vendor, crafting, credits, or economy state. When preference is enabled later, it only nudges density candidate ranking toward buckets with verified/sample-complete history and away from repeatedly unverified buckets; normal path validation and `verifiedPath` activation gates still remain mandatory.
+
+This is restart-volatile by design. It prepares the AI economy to prefer known-pathable density pockets in a later active phase without persisting location memory or crossing into real resource/economy mutation.
+
+## P.3.1 / P.3.2 - Coverage Slots + Stationed Miner Lifecycle
+
+P.3.1/P.3.2 moves intelligent SimMiner diagnostics toward stable resource coverage instead of movement frequency. The dashboard/API now exposes `coveragePlanner`, a memory-only, read-only section derived from live demand/resource/assignment state. It includes desired coverage slots, covered slots, coverage gap, stationed/moving/sampling/unassigned miners, profile/resource coverage rows, uncovered needs, rebalance candidates, and station duration/sample summaries.
+
+The retained assignment lifecycle adds `stationed`. With `stationedMinerConfig.enableStationedLifecycle=false` by default, behavior is unchanged. When enabled, a successful intelligent conceptual sample may retain its assignment as stationed coverage instead of clearing on `sampleComplete`, preserving assignment generation, target hash, activation snapshot, target resource identity, demand profile, and zone.
+
+Repeated stationed sampling is separately gated by `enableStationedRepeatedSampling=false`. If explicitly enabled, it reuses only the existing conceptual yield path and remains bounded by sample interval, jitter, max sample count, max station duration, demand/resource/planet checks, and reserve-satisfied clearing.
+
+Safety boundaries remain unchanged: no demand scoring change, no resource scoring change, no path trust relaxation, no movement speed change, no NavArea behavior change, no real extraction, no `ResourceContainer` creation, no inventory/vendor/market/crafting/credit mutation, and no persistence writes.
