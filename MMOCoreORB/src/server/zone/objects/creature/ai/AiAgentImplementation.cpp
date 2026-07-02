@@ -4979,8 +4979,32 @@ void AiAgentImplementation::broadcastNextPositionUpdate(PatrolPoint* point) {
 	BasePacket* msg = nullptr;
 	++movementCounter;
 
+	// AI riding a vehicle/mount (SimMiner mounted travel): clients track the
+	// MOUNT's transform, not the contained rider's. Mirror the player path
+	// (DataTransform.h updateTransform): bump the mount's movement counter and
+	// broadcast UpdateTransformMessage for the mount, whose position/direction
+	// updateVehiclePosition() already synced during updateZone(). Only an AI
+	// actually contained in a vehicle/mount reaches this branch.
+	ManagedReference<SceneObject*> strongParent = getParent().get();
+
+	if (strongParent != nullptr && (strongParent->isVehicleObject() || strongParent->isMount())) {
+		CreatureObject* mount = strongParent->asCreatureObject();
+
+		if (mount != nullptr) {
+			mount->incrementMovementCounter();
+
+			if (point != nullptr)
+				msg = new UpdateTransformMessage(mount, point->getPositionX(), point->getPositionZ(), point->getPositionY());
+			else
+				msg = new UpdateTransformMessage(mount);
+
+			mount->broadcastMessage(msg, false);
+			return;
+		}
+	}
+
 	if (point == nullptr) {
-		if (parent.get() != nullptr)
+		if (strongParent != nullptr)
 			msg = new UpdateTransformWithParentMessage(asAiAgent());
 		else
 			msg = new UpdateTransformMessage(asAiAgent());

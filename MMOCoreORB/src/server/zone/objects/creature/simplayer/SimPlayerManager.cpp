@@ -13,8 +13,12 @@
 #include "server/zone/objects/creature/ai/CreatureTemplate.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h"
+#include "server/zone/objects/creature/VehicleObject.h"
+#include "server/zone/objects/intangible/VehicleControlDevice.h"
+#include "templates/params/creature/PlayerArrangement.h"
 #include "templates/params/creature/ObjectFlag.h"
 #include "server/zone/managers/planet/PlanetManager.h"
+#include "terrain/manager/TerrainManager.h"
 #include "server/zone/managers/planet/PlanetTravelPoint.h"
 #include "server/zone/managers/resource/ResourceManager.h"
 #include "server/zone/managers/resource/resourcespawner/ResourceSpawner.h"
@@ -116,10 +120,79 @@ public:
     }
 };
 
+// P.5.2: periodic non-destructive hive reservation self-test (reserve+release).
+class HiveReservationSelfTestTask : public Task {
+public:
+    void run() override {
+        SimPlayerManager::instance()->runHiveReservationSelfTestTask();
+    }
+};
+
+// P.5.3: first crafter consumer — demand-driven reserve+consume that actually
+// draws hive stock down (fork of the self-test, but destructive).
+class HiveCrafterConsumerTask : public Task {
+public:
+    void run() override {
+        SimPlayerManager::instance()->runHiveCrafterConsumerTask();
+    }
+};
+
 class MinerIntelligentTargetingTask : public Task {
 public:
     void run() override {
         SimPlayerManager::instance()->runMinerIntelligentTargetingTask();
+    }
+};
+
+class MinerRecoveryTask : public Task {
+public:
+    void run() override {
+        SimPlayerManager::instance()->runMinerRecoveryTask();
+    }
+};
+
+// P.4.5b: periodic cross-planet dispatch (proportional rebalance). Picks one idle
+// donor per interval and starts a player-mimetic shuttle trip to an under-covered
+// high-value planet.
+class MinerPlanetDispatchTask : public Task {
+public:
+    void run() override {
+        SimPlayerManager::instance()->runMinerPlanetDispatchTask();
+    }
+};
+
+// P.4.4a: periodic vehicle-mechanics self-test driver.
+class VehicleSelfTestTask : public Task {
+public:
+    void run() override {
+        SimPlayerManager::instance()->runVehicleSelfTestTask();
+    }
+};
+
+// P.4.4a: delayed dismount+store for the self-test "hold" window.
+class VehicleStoreTask : public Task {
+    uint64 minerID;
+
+public:
+    VehicleStoreTask(uint64 miner) : minerID(miner) {
+    }
+
+    void run() override {
+        String result;
+        SimPlayerManager::instance()->dismountAndStoreMinerVehicle(minerID, result);
+    }
+};
+
+class SimPlayerConfiguredSpawnTask : public Task {
+    int groupIndex;
+    int spawnIndex;
+
+public:
+    SimPlayerConfiguredSpawnTask(int group, int spawn) : groupIndex(group), spawnIndex(spawn) {
+    }
+
+    void run() override {
+        SimPlayerManager::instance()->runConfiguredSpawnTask(groupIndex, spawnIndex);
     }
 };
 
@@ -488,10 +561,33 @@ struct MinerIntelligentTargetingMinerSnapshot {
     bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
 
+struct SimulatedAcquisitionRuntimeState {
+    Mutex mutex;
+    Vector<SimulatedAcquisitionEvent> events;
+    int attempts = 0;
+    int successful = 0;
+    int blocked = 0;
+    uint64 totalQuantity = 0;
+    VectorMap<String, int> blockedReasons;
+    VectorMap<String, uint64> quantityByPlanet;
+    VectorMap<String, uint64> quantityByResourceType;
+    VectorMap<String, uint64> quantityByExactResource;
+};
+
+namespace {
+    const int AI_STATIONED_SAMPLE_RESULT_DELAY_MS = 3000;
+    const int AI_STATIONED_SAMPLE_INTERVAL_MS = 25000;
+    const int AI_MASTER_ARTISAN_SURVEY_SKILL = 100;
+    const char* AI_STATIONED_SAMPLE_INTERVAL_SOURCE =
+        "player_sampling_code";
+}
+
 SimPlayerManager::SimPlayerManager() {
     setLoggingName("SimPlayerManager");
     lua = new Lua();
     lua->init();
+    marketSupplyObservationStartedAtMs = System::getMiliTime();
+    simulatedAcquisitionRuntime = new SimulatedAcquisitionRuntimeState();
 }
 
 SimPlayerManager::~SimPlayerManager() {
@@ -499,6 +595,152 @@ SimPlayerManager::~SimPlayerManager() {
         delete lua;
         lua = nullptr;
     }
+
+    if (simulatedAcquisitionRuntime != nullptr) {
+        delete simulatedAcquisitionRuntime;
+        simulatedAcquisitionRuntime = nullptr;
+    }
+}
+
+int SimPlayerManager::getGameDerivedStationedSampleResultDelayMs() {
+    return AI_STATIONED_SAMPLE_RESULT_DELAY_MS;
+}
+
+int SimPlayerManager::getGameDerivedStationedSampleIntervalMs() {
+    return AI_STATIONED_SAMPLE_INTERVAL_MS;
+}
+
+int SimPlayerManager::getGameDerivedStationedSampleIntervalSeconds() {
+    return AI_STATIONED_SAMPLE_INTERVAL_MS / 1000;
+}
+
+int SimPlayerManager::getGameDerivedMasterArtisanSurveySkill() {
+    return AI_MASTER_ARTISAN_SURVEY_SKILL;
+}
+
+const char* SimPlayerManager::getGameDerivedStationedSampleIntervalSource() {
+    return AI_STATIONED_SAMPLE_INTERVAL_SOURCE;
+}
+
+int SimPlayerManager::getGameDerivedStationedSampleYield(float density) {
+    float effectiveDensity = density;
+
+    if (effectiveDensity < 0.f)
+        effectiveDensity = 0.f;
+    else if (effectiveDensity > 1.f)
+        effectiveDensity = 1.f;
+
+    int maxUnitsExtracted =
+        static_cast<int>(effectiveDensity * (25 + System::random(3)));
+    int unitsExtracted =
+        static_cast<int>(maxUnitsExtracted *
+            (static_cast<float>(AI_MASTER_ARTISAN_SURVEY_SKILL) / 100.0f));
+
+    return unitsExtracted >= 2 ? unitsExtracted : 0;
+}
+
+bool SimPlayerManager::isIntelligentMinerWorkLoopOwnerEnabled() const {
+    return minerIntelligentTargetingEnabled && stationedMinerLifecycleEnabled;
+}
+
+bool SimPlayerManager::isLegacyConceptualMinerLoopAllowed() const {
+    if (!isIntelligentMinerWorkLoopOwnerEnabled())
+        return true;
+
+    return legacyMinerConceptualLoopEnabled ||
+        minerIntelligentTargetingFallbackToConceptualLoop ||
+        legacyMinerAllowFallbackWhenNoIntelligentAssignment ||
+        legacyMinerAllowFallbackAfterIntelligentFailure;
+}
+
+bool SimPlayerManager::shouldLogLegacyMinerLoopSuppression() const {
+    return legacyMinerLogSuppression;
+}
+
+void SimPlayerManager::recordLegacyMinerLoopSuppressed(
+        uint64 minerID, const String& controllerState,
+        bool assignmentPending, bool assignmentActive,
+        bool assignmentStationed, uint64 assignmentGenerationId,
+        const String& targetHash, const String& reason) {
+    {
+        Locker locker(&minerWorkLoopDiagnosticsMutex);
+        legacyMinerLoopSuppressedCount++;
+        lastLegacyMinerSuppressionReason = reason;
+    }
+
+    if (legacyMinerLogSuppression) {
+        info(String("SimMinerLegacyLoopSuppressed miner=") +
+            String::valueOf(minerID) +
+            " controllerState=" + controllerState +
+            " intelligentAssignmentPending=" +
+                (assignmentPending ? String("true") : String("false")) +
+            " intelligentAssignmentActive=" +
+                (assignmentActive ? String("true") : String("false")) +
+            " intelligentAssignmentStationed=" +
+                (assignmentStationed ? String("true") : String("false")) +
+            " assignmentGenerationId=" +
+                String::valueOf(assignmentGenerationId) +
+            " targetHash=" +
+                (targetHash.isEmpty() ? String("none") : targetHash) +
+            " reason=" + reason,
+            true);
+    }
+}
+
+void SimPlayerManager::recordLegacyMinerLoopStarted(
+        uint64 minerID, const String& reason) {
+    {
+        Locker locker(&minerWorkLoopDiagnosticsMutex);
+        legacyMinerLoopStartedCount++;
+    }
+
+    info(String("SimMinerLegacyLoopStarted miner=") +
+        String::valueOf(minerID) +
+        " reason=" + reason,
+        true);
+}
+
+void SimPlayerManager::recordIntelligentMinerLoopStarted(
+        uint64 minerID, const String& reason) {
+    {
+        Locker locker(&minerWorkLoopDiagnosticsMutex);
+        intelligentMinerLoopStartedCount++;
+    }
+
+    info(String("SimMinerIntelligentLoopStarted miner=") +
+        String::valueOf(minerID) +
+        " reason=" + reason,
+        true);
+}
+
+void SimPlayerManager::recordStaleMinerTaskIgnored(
+        uint64 minerID, const String& taskType,
+        uint64 capturedGeneration, uint64 currentGeneration,
+        const String& lifecycleState, uint64 assignmentGenerationId,
+        const String& targetHash) {
+    String reason = taskType +
+        String(":captured=") + String::valueOf(capturedGeneration) +
+        String(":current=") + String::valueOf(currentGeneration);
+
+    {
+        Locker locker(&minerWorkLoopDiagnosticsMutex);
+        staleMinerTaskIgnoredCount++;
+        lastStaleMinerTaskReason = reason;
+    }
+
+    info(String("SimMinerStaleTaskIgnored miner=") +
+        String::valueOf(minerID) +
+        " taskType=" + taskType +
+        " capturedGeneration=" +
+            String::valueOf(capturedGeneration) +
+        " currentGeneration=" +
+            String::valueOf(currentGeneration) +
+        " lifecycleState=" + lifecycleState +
+        " assignmentGenerationId=" +
+            String::valueOf(assignmentGenerationId) +
+        " targetHash=" +
+            (targetHash.isEmpty() ? String("none") : targetHash),
+        true);
 }
 
 static int clampMinerInt(int value, int currentValue, int minValue, int maxValue) {
@@ -726,21 +968,20 @@ static bool resourceTypeMatches(const ResourceIntelligenceEntry& entry, const St
     if (requiredType.isEmpty())
         return false;
 
-    if (entry.type == requiredType || entry.type.beginsWith(requiredType + "_"))
+    if (entry.type == requiredType || entry.type.beginsWith(requiredType))
         return true;
 
     if (entry.classChain.isEmpty())
         return false;
 
-    String chain = String(">") + entry.classChain + ">";
-    String needle = String(">") + requiredType + ">";
-
-    return chain.indexOf(needle) >= 0;
+    return entry.classChain.indexOf(requiredType) >= 0;
 }
 
 static bool resourceMatchesAnyFamily(const ResourceIntelligenceEntry& entry, const char* const* families, int familyCount) {
     for (int i = 0; i < familyCount; ++i) {
-        if (resourceTypeMatches(entry, String(families[i])))
+        String family = families[i];
+
+        if (resourceTypeMatches(entry, family))
             return true;
     }
 
@@ -2793,6 +3034,75 @@ static bool isPointInAnyNavmesh(Zone* zone, float x, float y) {
     return false;
 }
 
+// P.4.1 overland reachability guards. Read-only terrain/zone queries (water
+// height, terrain height, boundary), called from MinerPathValidationTask::run()
+// exactly like the existing zone->getHeight / getInRangeNavMeshes calls in that
+// task. No Locker is taken: this matches every other caller of
+// getWaterHeight/getWorldFloorCollision (NpcSpawnPoint, DirectorManager,
+// BuildingObject eject), and the task's captured ManagedReference<Zone*> keeps
+// the zone alive for the call. These guards never move or mutate anything.
+static bool isOverlandPointInWater(Zone* zone, float x, float y, float margin) {
+    if (zone == nullptr)
+        return false;
+
+    PlanetManager* planetManager = zone->getPlanetManager();
+    if (planetManager == nullptr)
+        return false;
+
+    TerrainManager* terrainManager = planetManager->getTerrainManager();
+    if (terrainManager == nullptr)
+        return false;
+
+    float waterHeight = 0.f;
+    if (!terrainManager->getWaterHeight(x, y, waterHeight))
+        return false;
+
+    float terrainHeight = terrainManager->getHeight(x, y);
+    return waterHeight > terrainHeight + margin;
+}
+
+// Evaluates whether an off-navmesh target is reachable by overland travel.
+// In SWG, NPCs and vehicles climb near-vertical cliffs and cross water freely,
+// so terrain slope and mid-route water never block travel. The only overland
+// blockers are (a) the target being outside the zone boundary, or (b) the
+// resource pocket itself sitting over open water, in which case the miner would
+// sample the outskirts or the planner should pick another pocket. Read-only
+// terrain/zone queries, lock-free, same pattern as the rest of this task.
+static bool evaluateOverlandReachability(
+        Zone* zone,
+        const Vector3& target,
+        float waterMargin,
+        bool rejectWaterTargets,
+        bool& waterAtTargetOut,
+        String& rejectReasonOut) {
+    waterAtTargetOut = false;
+    rejectReasonOut = "none";
+
+    if (zone == nullptr) {
+        rejectReasonOut = "noZone";
+        return false;
+    }
+
+    Vector3 probe;
+    probe.setX(target.getX());
+    probe.setY(target.getY());
+
+    if (!zone->isWithinBoundaries(probe)) {
+        rejectReasonOut = "outOfBounds";
+        return false;
+    }
+
+    waterAtTargetOut = isOverlandPointInWater(
+        zone, target.getX(), target.getY(), waterMargin);
+
+    if (rejectWaterTargets && waterAtTargetOut) {
+        rejectReasonOut = "targetInWater";
+        return false;
+    }
+
+    return true;
+}
+
 static bool isDensityCandidateInRequiredNavmesh(
         Zone* zone,
         float x,
@@ -3546,6 +3856,18 @@ static bool findMinerDensityTarget(
             if (!zone->isWithinBoundaries(Vector3(x, y, 0.f)))
                 continue;
 
+            // P.4.2: skip resource pockets sitting over open water. A miner
+            // cannot station on a water pocket (it would sample the outskirts),
+            // so the planner should pick a drier candidate instead of repeatedly
+            // assigning an unreachable target.
+            SimPlayerManager* travelManager = SimPlayerManager::instance();
+            if (travelManager != nullptr &&
+                    travelManager->isTravelRejectWaterTargets() &&
+                    isOverlandPointInWater(
+                        zone, x, y,
+                        travelManager->getTravelWaterMarginMeters()))
+                continue;
+
             MinerDensityTargetCandidate candidate;
             candidate.x = x;
             candidate.y = y;
@@ -3866,6 +4188,27 @@ void MinerPathValidationTask::run() {
         zone->getHeight(targetPosition.getX(), targetPosition.getY()) : 0.f;
     float targetZDelta = targetTerrainHeightKnown ?
         targetPosition.getZ() - targetTerrainHeight : 0.f;
+
+    // P.4.1 overland reachability diagnostics. Purely additive: evaluates
+    // whether an off-navmesh target could be reached by a guarded straight-line
+    // overland leg. Does NOT change pathTrustStatus, rejectReason, or the
+    // activation gate (still requires verifiedPath), so behavior is unchanged.
+    bool overlandEvaluated = false;
+    bool overlandReachable = false;
+    String overlandRejectReason = "none";
+    bool overlandWaterAtTarget = false;
+
+    if ((manager->travelOverlandDiagnosticsEnabled ||
+            manager->travelEnableOverlandActivation) && zone != nullptr &&
+            !targetInNavmesh) {
+        overlandEvaluated = true;
+        overlandReachable = evaluateOverlandReachability(
+            zone, targetPosition,
+            manager->travelWaterMarginMeters,
+            manager->travelRejectWaterTargets,
+            overlandWaterAtTarget, overlandRejectReason);
+    }
+
     String rejectReason;
 
     if (pathException) {
@@ -3875,8 +4218,16 @@ void MinerPathValidationTask::run() {
         rejectReason = "noPath";
     } else if (directFallback) {
         // Core3 returns start/end when a world path could not be evaluated.
-        pathFound = false;
-        rejectReason = "directFallbackUnverified";
+        // P.4.2: if overland activation is enabled and the P.4.1 guards say the
+        // target is overland-reachable, treat this as a usable path under the
+        // directOverland trust tier so it flows through the normal
+        // validated->activate pipeline; otherwise it stays unverified/blocked.
+        if (manager->travelEnableOverlandActivation && overlandReachable) {
+            pathFound = true;
+        } else {
+            pathFound = false;
+            rejectReason = "directFallbackUnverified";
+        }
     } else if (pathNodes > maxPathNodes) {
         pathFound = false;
         rejectReason = "tooManyPathNodes";
@@ -3885,7 +4236,11 @@ void MinerPathValidationTask::run() {
         rejectReason = "pathTooLong";
     }
 
-    String pathTrustStatus = pathFound ? String("verifiedPath") :
+    // verifiedPath = real navmesh route; directOverland = guard-passed overland
+    // straight line (off-navmesh but reachable). Distinct tiers so downstream
+    // gates/diagnostics can tell them apart.
+    String pathTrustStatus = pathFound ?
+        (directFallback ? String("directOverland") : String("verifiedPath")) :
         (rejectReason.isEmpty() ? String("untrusted") : rejectReason);
 
     String line = String("MinerPathValidationSimulation miner=") + String::valueOf(minerID) +
@@ -3917,7 +4272,10 @@ void MinerPathValidationTask::run() {
         " pathNodes=" + String::valueOf(pathNodes) +
         " pathDistance=" + String::valueOf(Math::getPrecision(pathDistance, 1)) +
         " directFallback=" + (directFallback ? String("true") : String("false")) +
-        " pathTrustStatus=" + pathTrustStatus;
+        " pathTrustStatus=" + pathTrustStatus +
+        " overlandEvaluated=" + (overlandEvaluated ? String("true") : String("false")) +
+        " overlandReachable=" + (overlandReachable ? String("true") : String("false")) +
+        " overlandReject=" + overlandRejectReason;
 
     if (!rejectReason.isEmpty())
         line += " rejectReason=" + rejectReason;
@@ -3963,6 +4321,10 @@ void MinerPathValidationTask::run() {
     snapshot.targetTerrainHeightKnown = targetTerrainHeightKnown;
     snapshot.targetTerrainHeight = targetTerrainHeight;
     snapshot.targetZDelta = targetZDelta;
+    snapshot.overlandEvaluated = overlandEvaluated;
+    snapshot.overlandReachable = overlandReachable;
+    snapshot.overlandRejectReason = overlandRejectReason;
+    snapshot.overlandWaterAtTarget = overlandWaterAtTarget;
     snapshot.maxPathDistance = maxPathDistance;
     snapshot.maxPathNodes = maxPathNodes;
     snapshot.recordedAtMs = System::getMiliTime();
@@ -4482,6 +4844,11 @@ static String getPathValidationDiagnosticKey(
             snapshot.pathFound)
         return "verified_path";
 
+    if (assignment.pathValidationStatus == "valid" &&
+            assignment.pathValidationTrustStatus == "directOverland" &&
+            snapshot.pathFound)
+        return "direct_overland";
+
     if (assignment.pathValidationStatus == "failed")
         return "unknown_path_failure";
 
@@ -4519,6 +4886,8 @@ static String getPathValidationHumanReason(const String& key) {
         return "No matching path validation snapshot is available for this assignment yet.";
     if (key == "verified_path")
         return "Assignment has a verified path snapshot.";
+    if (key == "direct_overland")
+        return "Off-navmesh target is overland-reachable (guard-passed); activated via the directOverland tier.";
 
     return "Path validation has not produced a more specific diagnostic yet.";
 }
@@ -4546,7 +4915,7 @@ static String getPathValidationRecommendedAction(const String& key) {
         return "wait_for_fresh_path_validation";
     if (key == "density_target_not_accepted")
         return "inspect_density_target";
-    if (key == "verified_path")
+    if (key == "verified_path" || key == "direct_overland")
         return "path_clear";
 
     return "inspect_path_validation";
@@ -4663,7 +5032,7 @@ void SimPlayerManager::initialize() {
         return;
     }
 
-    spawnConfiguredGroups();
+    scheduleConfiguredSpawnTask(0, 0, configuredSpawnStartupDelaySeconds * 1000);
     scheduleMinerSummaryTask();
     scheduleResourceIntelligenceTask();
     scheduleMinerTargetRecommendationTask();
@@ -4674,9 +5043,14 @@ void SimPlayerManager::initialize() {
     scheduleMarketSupplyObservationTask();
     scheduleStockpileSnapshotSimulationTask();
     scheduleAiEconomyPersistenceTask();
+    scheduleHiveReservationSelfTestTask();
+    scheduleHiveCrafterConsumerTask();
     scheduleDemandStateSimulationTask();
     scheduleDemandWeightedMinerPlanSimulationTask();
     scheduleMinerIntelligentTargetingTask();
+    scheduleMinerRecoveryTask();
+    scheduleMinerPlanetDispatchTask();
+    scheduleVehicleSelfTestTask();
 }
 
 void SimPlayerManager::loadLuaConfig() {
@@ -4726,6 +5100,10 @@ void SimPlayerManager::loadLuaConfig() {
     resourceIntelligenceTaskScheduled = false;
     resourceIntelligenceIntervalSeconds = 600;
     resourceIntelligenceTopN = 10;
+    configuredSpawnTaskScheduled = false;
+    configuredSpawnStartupDelaySeconds = 0;
+    configuredSpawnBatchSize = 5;
+    configuredSpawnBatchDelayMs = 1000;
     resourceScoringProfilesEnabled = false;
     resourceScoringProfileKeys.removeAll();
     minerTargetRecommendationsEnabled = false;
@@ -4807,8 +5185,11 @@ void SimPlayerManager::loadLuaConfig() {
     marketSupplyObservationIncludeVendorStockrooms = false;
     marketSupplyObservationIncludePlayerInventory = false;
     marketSupplyObservationIncludePrivateContainers = false;
+    marketSupplyObservationResolveResourceContainers = false;
+    marketSupplyObservationStartupDelaySeconds = 900;
     marketSupplyObservationMinQuantity = 1;
     marketSupplyObservationLogTopN = 5;
+    marketSupplyObservationStartedAtMs = System::getMiliTime();
     clearMarketSupplyObservationSnapshot();
     stockpileSnapshotSimulationEnabled = false;
     stockpileSnapshotSimulationTaskScheduled = false;
@@ -4817,6 +5198,7 @@ void SimPlayerManager::loadLuaConfig() {
     stockpileSnapshotSimulationIncludeConceptualMinerTotals = true;
     stockpileSnapshotSimulationIncludeMarketObservation = false;
     aiEconomyPersistConceptualMinerTotals = false;
+    aiEconomyPersistSpawnIdentifiedLots = false;
     aiEconomyPersistenceTaskScheduled = false;
     aiEconomyPersistenceLogSummary = true;
     aiEconomyPersistenceFailureLogged = false;
@@ -4883,6 +5265,33 @@ void SimPlayerManager::loadLuaConfig() {
     minerIntelligentTargetingAssignmentLogLifecycle = true;
     minerIntelligentTargetingAssignmentLogRetained = false;
     minerMovementReadinessDiagnosticsEnabled = true;
+    minerRecoveryEnabled = true;
+    minerRecoveryDryRun = true;
+    minerRecoveryAllowClearAssignment = true;
+    minerRecoveryAllowNudgeToSafeNearbyPoint = false;
+    minerRecoveryAllowTeleportToStationTarget = false;
+    minerRecoveryAllowRespawnReplacement = false;
+    minerRecoveryAdminActionsEnabled = false;
+    minerRecoveryTaskScheduled = false;
+    minerRecoveryStuckCheckIntervalSeconds = 60;
+    minerRecoveryMovingStuckSeconds = 180;
+    minerRecoveryStationedSamplingGraceSeconds = 90;
+    minerRecoveryFarFromStationDistanceMeters = 32.f;
+    minerRecoveryMaxAutomaticRecoveriesPerInterval = 2;
+    minerRecoveryMaxRecoveriesPerMinerPerHour = 3;
+    minerRecoveryLogRecoveryDecisions = true;
+    {
+        Locker recoveryLocker(&minerRecoveryMutex);
+        minerRecoveryActionsTaken = 0;
+        minerRecoveryActionsSkipped = 0;
+        minerRecoveryIntervalBucketStartMs = 0;
+        minerRecoveryHourBucketStartMs = 0;
+        minerRecoveryAutomaticRecoveriesThisInterval = 0;
+        minerRecoveryCountPerMinerThisHour.removeAll();
+        minerRecoveryLastActionByMiner.removeAll();
+        minerRecoveryLastActionAtMsByMiner.removeAll();
+        minerRecoveryReasonCounts.removeAll();
+    }
     minerIntelligentTargetingLimitedActivationEnabled = false;
     minerIntelligentTargetingLimitedMaxActivationsPerInterval = 1;
     minerIntelligentTargetingLimitedRequireSamePlanet = true;
@@ -4937,6 +5346,20 @@ void SimPlayerManager::loadLuaConfig() {
         demandWeightedMinerPlanSimulationLowStockThreshold.put(profileKey, 0.35f);
         demandWeightedMinerPlanSimulationCriticalStockThreshold.put(profileKey, 0.10f);
     }
+
+    LuaObject spawnStartupConfig = config.getObjectField("spawnStartupConfig");
+    if (spawnStartupConfig.isValidTable()) {
+        configuredSpawnStartupDelaySeconds = clampMinerInt(
+            spawnStartupConfig.getIntField("startupDelaySeconds"),
+            configuredSpawnStartupDelaySeconds, 0, 3600);
+        configuredSpawnBatchSize = clampMinerInt(
+            spawnStartupConfig.getIntField("batchSize"),
+            configuredSpawnBatchSize, 1, 100);
+        configuredSpawnBatchDelayMs = clampMinerInt(
+            spawnStartupConfig.getIntField("batchDelayMs"),
+            configuredSpawnBatchDelayMs, 250, 60000);
+    }
+    spawnStartupConfig.pop();
 
     LuaObject resourceIntelligenceConfig = config.getObjectField("resourceIntelligenceConfig");
     if (resourceIntelligenceConfig.isValidTable()) {
@@ -5299,6 +5722,18 @@ void SimPlayerManager::loadLuaConfig() {
         applyAiEconomyPersistenceConfig(aiEconomyPersistenceConfig);
     aiEconomyPersistenceConfig.pop();
 
+    LuaObject hiveReservationSelfTestConfig =
+        config.getObjectField("hiveReservationSelfTestConfig");
+    if (hiveReservationSelfTestConfig.isValidTable())
+        applyHiveReservationSelfTestConfig(hiveReservationSelfTestConfig);
+    hiveReservationSelfTestConfig.pop();
+
+    LuaObject hiveCrafterConsumerConfig =
+        config.getObjectField("hiveCrafterConsumerConfig");
+    if (hiveCrafterConsumerConfig.isValidTable())
+        applyHiveCrafterConsumerConfig(hiveCrafterConsumerConfig);
+    hiveCrafterConsumerConfig.pop();
+
     LuaObject persistentStockpileDemandConfig =
         config.getObjectField("persistentStockpileDemandConfig");
     if (persistentStockpileDemandConfig.isValidTable())
@@ -5326,11 +5761,48 @@ void SimPlayerManager::loadLuaConfig() {
         applyStationedMinerConfig(stationedMinerConfig);
     stationedMinerConfig.pop();
 
+    LuaObject realResourceAcquisitionConfig =
+        config.getObjectField("realResourceAcquisitionConfig");
+    if (realResourceAcquisitionConfig.isValidTable())
+        applyRealResourceAcquisitionConfig(realResourceAcquisitionConfig);
+    realResourceAcquisitionConfig.pop();
+
+    LuaObject minerRecoveryConfig =
+        config.getObjectField("minerRecoveryConfig");
+    if (minerRecoveryConfig.isValidTable())
+        applyMinerRecoveryConfig(minerRecoveryConfig);
+    minerRecoveryConfig.pop();
+
+    LuaObject legacyMinerLoopConfig =
+        config.getObjectField("legacyMinerLoopConfig");
+    if (legacyMinerLoopConfig.isValidTable())
+        applyLegacyMinerLoopConfig(legacyMinerLoopConfig);
+    legacyMinerLoopConfig.pop();
+
     LuaObject minerIntelligentTargetingConfig =
         config.getObjectField("minerIntelligentTargetingConfig");
     if (minerIntelligentTargetingConfig.isValidTable())
         applyMinerIntelligentTargetingConfig(minerIntelligentTargetingConfig);
     minerIntelligentTargetingConfig.pop();
+
+    LuaObject travelConfig =
+        config.getObjectField("travelConfig");
+    if (travelConfig.isValidTable())
+        applyTravelConfig(travelConfig);
+    travelConfig.pop();
+
+    LuaObject vehicleConfig =
+        config.getObjectField("vehicleConfig");
+    if (vehicleConfig.isValidTable())
+        applyVehicleConfig(vehicleConfig);
+    vehicleConfig.pop();
+
+    LuaObject presentationConfig =
+        config.getObjectField("presentationConfig");
+    if (presentationConfig.isValidTable())
+        simNpcPlayerDotEnabled = presentationConfig.getBooleanField(
+            "showSimNpcsAsPlayerDots", simNpcPlayerDotEnabled);
+    presentationConfig.pop();
 
     // --- LOAD SHUTTLEPORTS ---
     LuaObject shuttles = config.getObjectField("shuttleports");
@@ -5515,6 +5987,16 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         info("Stopping SimPlayer for agent " + String::valueOf(oid), true);
 #endif
         agent->eraseBlackboard("simAlwaysActive");
+
+        // P.4.4b: extract + store any travel swoop BEFORE dropping the
+        // controller (the dismount resolves the agent through the controllers
+        // map) and before destroying the agent, so the rider is never destroyed
+        // inside (or orphaned with) the vehicle.
+        {
+            String dismountResult;
+            dismountAndStoreMinerVehicle(oid, dismountResult);
+        }
+
         controllers.drop(oid);
 
         agent->clearPatrolPoints();
@@ -5555,7 +6037,7 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         bool looksImperial = lower.beginsWith("imperial") || lower.contains("stormtrooper") || lower.contains("dark");
 
         if (looksImperial) {
-            agent->setPvpStatusBitmask(ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
+            applySimNpcPresentation(agent, ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
 
             SimPvPController* pvp = new SimPvPController(agent, true);
 
@@ -5566,7 +6048,7 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
             ctrl = pvp;
 
         } else if (looksRebel) {
-            agent->setPvpStatusBitmask(ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
+            applySimNpcPresentation(agent, ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
 
             SimPvPController* pvp = new SimPvPController(agent, false);
 
@@ -5575,7 +6057,12 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
 
             ctrl = pvp;
         } else {
-             agent->setPvpStatusBitmask(0);
+             applySimNpcPresentation(agent, 0);
+             // Miners are driven entirely by SimMinerController; give them the
+             // no-op simMiner tree so the default idle/wander tree does not
+             // compete with the controller's movement (see scripts/ai/simMiner.lua).
+             agent->setCustomAiMap(String("simMiner").hashCode());
+             agent->setAITemplate();
              ctrl = new SimMinerController(agent);
         }
 
@@ -5719,6 +6206,235 @@ void SimPlayerManager::recordResourceAwareConceptualStockpileYield(
     resourceAwareStockpileRows.add(row);
 }
 
+void SimPlayerManager::recordSimulatedAcquisitionBlocked(
+        const String& reason) {
+    if (simulatedAcquisitionRuntime == nullptr)
+        return;
+
+    Locker locker(&simulatedAcquisitionRuntime->mutex);
+
+    simulatedAcquisitionRuntime->blocked++;
+    addIntCounter(
+        simulatedAcquisitionRuntime->blockedReasons,
+        reason.isEmpty() ? String("blocked") : reason);
+}
+
+bool SimPlayerManager::isSimulatedAcquisitionReadyForSample(
+        const MinerIntelligentTargetAssignment& assignment,
+        String& blockedReason) {
+    blockedReason = "ready";
+
+    if (!simulatedAcquisitionTransactionsEnabled) {
+        blockedReason = "simulationDisabled";
+        return false;
+    }
+
+    if (realResourceAcquisitionEnabled) {
+        blockedReason = "realAcquisitionEnabled";
+        return false;
+    }
+
+    if (!acquisitionReadinessDiagnosticsEnabled) {
+        blockedReason = "diagnosticsDisabled";
+        return false;
+    }
+
+    if (!assignment.isValid()) {
+        blockedReason = "assignmentInvalid";
+        return false;
+    }
+
+    if (acquisitionRequireStationedLifecycle &&
+            assignment.status != "stationed") {
+        blockedReason = "notStationed";
+        return false;
+    }
+
+    if (acquisitionRequireKnownResourceSpawnIdentity &&
+            (assignment.targetResourceName.isEmpty() ||
+             assignment.targetResourceType.isEmpty() ||
+             assignment.targetHash.isEmpty())) {
+        blockedReason = "resourceIdentityUnknown";
+        return false;
+    }
+
+    if (assignment.targetZoneName.isEmpty()) {
+        blockedReason = "zoneMismatch";
+        return false;
+    }
+
+    if (acquisitionRequireDemandStillValid) {
+        bool demandStillValid = !assignment.selectedProfileKey.isEmpty() &&
+            demandWeightedMinerPlanSimulationProfileEnabled.contains(
+                assignment.selectedProfileKey) &&
+            demandWeightedMinerPlanSimulationProfileEnabled.get(
+                assignment.selectedProfileKey) > 0;
+
+        if (!demandStillValid) {
+            blockedReason = "demandNoLongerValid";
+            return false;
+        }
+    }
+
+    if (acquisitionRequireReserveBelowTarget &&
+            !assignment.selectedProfileKey.isEmpty()) {
+        uint64 desiredReserve =
+            demandWeightedMinerPlanSimulationDesiredReserve.contains(
+                assignment.selectedProfileKey) ?
+            static_cast<uint64>(
+                demandWeightedMinerPlanSimulationDesiredReserve.get(
+                    assignment.selectedProfileKey)) : 0;
+
+        if (desiredReserve > 0) {
+            Vector<String> resourceNames;
+            Vector<uint64> amounts;
+            collectConceptualMinerTotals(resourceNames, amounts);
+
+            for (int i = 0; i < resourceNames.size() && i < amounts.size(); ++i) {
+                String label = resourceNames.get(i);
+
+                if ((label == assignment.targetResourceType ||
+                        label == assignment.targetResourceName) &&
+                        amounts.get(i) >= desiredReserve) {
+                    blockedReason = "reserveSatisfied";
+                    return false;
+                }
+            }
+        }
+    }
+
+    if (acquisitionRequireVerifiedActivationPath &&
+            !isActivationTrustAcceptable(assignment.activationPathTrustStatus)) {
+        blockedReason = "activationPathNotVerified";
+        return false;
+    }
+
+    return true;
+}
+
+void SimPlayerManager::recordSimulatedAcquisitionTransactionFromController(
+        uint64 minerID, int amount) {
+    if (simulatedAcquisitionRuntime == nullptr)
+        return;
+
+    {
+        Locker locker(&simulatedAcquisitionRuntime->mutex);
+        simulatedAcquisitionRuntime->attempts++;
+    }
+
+    if (!enabled || minerID == 0) {
+        recordSimulatedAcquisitionBlocked("minerInvalid");
+        return;
+    }
+
+    if (amount <= 0) {
+        recordSimulatedAcquisitionBlocked("zeroQuantity");
+        return;
+    }
+
+    uint64 nowMs = System::getMiliTime();
+    MinerIntelligentTargetAssignment assignment;
+    bool assignmentFound = false;
+
+    {
+        Locker locker(&minerIntelligentTargetingAssignmentMutex);
+
+        if (minerIntelligentTargetAssignments.contains(minerID)) {
+            assignment = minerIntelligentTargetAssignments.get(minerID);
+            assignmentFound = true;
+        }
+    }
+
+    if (!assignmentFound) {
+        recordSimulatedAcquisitionBlocked("minerInvalid");
+        return;
+    }
+
+    String blockedReason;
+    if (!isSimulatedAcquisitionReadyForSample(assignment, blockedReason)) {
+        recordSimulatedAcquisitionBlocked(blockedReason);
+        return;
+    }
+
+    SimulatedAcquisitionEvent event;
+    event.timestampMs = nowMs;
+    event.minerID = minerID;
+    event.assignmentGenerationId = assignment.assignmentGenerationId;
+    event.activationSnapshotId = assignment.activationSnapshotId;
+    event.stationedAtMs = assignment.stationedAtMs;
+    event.stationDurationSeconds =
+        assignment.stationedAtMs > 0 && nowMs > assignment.stationedAtMs ?
+        (nowMs - assignment.stationedAtMs) / 1000 :
+        assignment.stationDurationSeconds;
+    event.resourceName = assignment.targetResourceName;
+    event.resourceType = assignment.targetResourceType;
+    event.resourceClass = assignment.targetResourceType;
+    event.planet = assignment.targetZoneName;
+    event.spawnIdentity = assignment.targetHash;
+    event.demandProfile = assignment.selectedProfileKey;
+    event.activationPathTrustStatus = assignment.activationPathTrustStatus;
+    event.conceptualLabel = assignment.targetResourceType;
+    event.quantity = static_cast<uint32>(amount);
+    event.density = assignment.targetDensity;
+    event.concentration = assignment.targetDensity;
+    event.wouldCreateResourceContainer = true;
+    event.realResourceCreated = false;
+    event.resourceContainerCreated = false;
+    event.inventoryMutated = false;
+    event.economyMutated = false;
+    event.persistenceMutated = false;
+
+    {
+        Locker locker(&simulatedAcquisitionRuntime->mutex);
+
+        simulatedAcquisitionRuntime->events.add(event);
+        simulatedAcquisitionRuntime->successful++;
+        simulatedAcquisitionRuntime->totalQuantity +=
+            static_cast<uint64>(event.quantity);
+        addUint64Counter(
+            simulatedAcquisitionRuntime->quantityByPlanet,
+            event.planet,
+            static_cast<uint64>(event.quantity));
+        addUint64Counter(
+            simulatedAcquisitionRuntime->quantityByResourceType,
+            event.resourceType,
+            static_cast<uint64>(event.quantity));
+        addUint64Counter(
+            simulatedAcquisitionRuntime->quantityByExactResource,
+            event.resourceName + "|" + event.resourceType + "|" +
+                event.planet,
+            static_cast<uint64>(event.quantity));
+
+        while (simulatedAcquisitionRuntime->events.size() >
+                simulatedAcquisitionMaxLedgerEvents)
+            simulatedAcquisitionRuntime->events.remove(0);
+    }
+
+    if (simulatedAcquisitionLogTransactions) {
+        info(String("SimMiner simulated acquisition transaction miner=") +
+             String::valueOf(minerID) +
+             " assignmentGenerationId=" +
+                String::valueOf(event.assignmentGenerationId) +
+             " resourceName=" + event.resourceName +
+             " resourceType=" + event.resourceType +
+             " planet=" + event.planet +
+             " quantity=" + String::valueOf(static_cast<int>(event.quantity)) +
+             " density=" + String::valueOf(event.density) +
+             " demandProfile=" +
+                (event.demandProfile.isEmpty() ?
+                    String("none") : event.demandProfile) +
+             " activationSnapshotId=" +
+                String::valueOf(event.activationSnapshotId) +
+             " activationPathTrustStatus=" +
+                (event.activationPathTrustStatus.isEmpty() ?
+                    String("none") : event.activationPathTrustStatus) +
+             " wouldCreateResourceContainer=true" +
+             " realResourceCreated=false resourceContainerCreated=false" +
+             " inventoryMutated=false economyMutated=false" +
+             " persistenceMutated=false", true);
+    }
+}
+
 uint64 SimPlayerManager::recordIntelligentConceptualMinerYield(
         const String& conceptualLabel, int amount, uint64 minerID, bool logYield) {
     uint64 total = recordConceptualMinerYield(
@@ -5775,6 +6491,11 @@ uint64 SimPlayerManager::recordIntelligentConceptualMinerYield(
         snapshot.selectedDemandProfile = assignment.selectedProfileKey;
         snapshot.demandState = assignment.demandState;
         snapshot.pressureScore = assignment.pressureScore;
+
+        // P.5.1: accumulate an exact resource-spawn hive deposit alongside the
+        // coarse conceptual total. No-op when the assignment carries no spawn
+        // identity (degrades gracefully to conceptual-only).
+        recordSpawnIdentifiedMinerYield(assignment, amount);
     }
 
     {
@@ -5938,19 +6659,6 @@ bool SimPlayerManager::transitionMinerIntelligentAssignmentToStationed(
         now > assignment.stationedAtMs ?
         (now - assignment.stationedAtMs) / 1000 : 0;
 
-    if (stationedMinerMaxDurationSeconds > 0 &&
-            assignment.stationedAtMs > 0 &&
-            durationSeconds >= static_cast<uint64>(stationedMinerMaxDurationSeconds)) {
-        reason = "maxStationDurationReached";
-        return false;
-    }
-
-    if (stationedMinerMaxSamplesPerAssignment > 0 &&
-            assignment.stationSampleCount >= stationedMinerMaxSamplesPerAssignment) {
-        reason = "maxStationSamplesReached";
-        return false;
-    }
-
     {
         Locker locker(&minerIntelligentTargetingAssignmentMutex);
 
@@ -5985,14 +6693,8 @@ bool SimPlayerManager::transitionMinerIntelligentAssignmentToStationed(
 
     reason = "stationed";
 
-    if (stationedMinerRepeatedSamplingEnabled &&
-            assignment.stationSampleCount < stationedMinerMaxSamplesPerAssignment &&
-            (stationedMinerMaxDurationSeconds <= 0 ||
-                assignment.stationDurationSeconds <
-                    static_cast<uint64>(stationedMinerMaxDurationSeconds))) {
-        int jitter = stationedMinerSampleJitterSeconds > 0 ?
-            System::random(stationedMinerSampleJitterSeconds) : 0;
-        delayMs = (stationedMinerSampleIntervalSeconds + jitter) * 1000;
+    if (stationedMinerRepeatedSamplingEnabled) {
+        delayMs = getGameDerivedStationedSampleIntervalMs();
         scheduleRepeatedSample = delayMs > 0;
     }
 
@@ -6068,6 +6770,75 @@ void SimPlayerManager::collectConceptualMinerTotals(Vector<String>& resourceName
     for (int i = 0; i < conceptualMinerTotals.size(); ++i) {
         resourceNames.add(conceptualMinerTotals.elementAt(i).getKey());
         amounts.add(conceptualMinerTotals.get(i));
+    }
+}
+
+void SimPlayerManager::recordSpawnIdentifiedMinerYield(
+        const MinerIntelligentTargetAssignment& assignment, int amount) {
+    if (!enabled || amount <= 0)
+        return;
+
+    // Degrade gracefully: without an exact spawn id we cannot key a hive lot,
+    // so the conceptual total already recorded is the only ledger for it.
+    if (assignment.targetResourceSpawnObjectId == 0 ||
+            assignment.targetResourceType.isEmpty())
+        return;
+
+    uint64 spawnID = assignment.targetResourceSpawnObjectId;
+
+    Locker locker(&spawnYieldAccumulatorMutex);
+
+    MinerSpawnYieldAccumulator accumulator;
+
+    if (spawnYieldAccumulators.contains(spawnID))
+        accumulator = spawnYieldAccumulators.get(spawnID);
+
+    accumulator.resourceSpawnObjectId = spawnID;
+    accumulator.resourceSpawnName = assignment.targetResourceName;
+    accumulator.resourceType = assignment.targetResourceType;
+    accumulator.resourceClassChain = assignment.targetResourceClassChain;
+    accumulator.sourcePlanet = assignment.targetZoneName;
+    accumulator.sourceZone = assignment.targetZoneName;
+    accumulator.matchedDemandProfiles = assignment.selectedProfileKey;
+    accumulator.active = assignment.targetResourceActive;
+    accumulator.oq = assignment.targetResourceOq;
+    accumulator.cd = assignment.targetResourceCd;
+    accumulator.dr = assignment.targetResourceDr;
+    accumulator.hr = assignment.targetResourceHr;
+    accumulator.fl = assignment.targetResourceFl;
+    accumulator.ma = assignment.targetResourceMa;
+    accumulator.pe = assignment.targetResourcePe;
+    accumulator.sr = assignment.targetResourceSr;
+    accumulator.ut = assignment.targetResourceUt;
+    accumulator.cr = assignment.targetResourceCr;
+    accumulator.sessionQuantity += static_cast<uint64>(amount);
+
+    spawnYieldAccumulators.put(spawnID, accumulator);
+}
+
+void SimPlayerManager::collectSpawnYieldAccumulators(
+        Vector<MinerSpawnYieldAccumulator>& accumulators) {
+    Locker locker(&spawnYieldAccumulatorMutex);
+
+    for (int i = 0; i < spawnYieldAccumulators.size(); ++i)
+        accumulators.add(spawnYieldAccumulators.get(i));
+}
+
+void SimPlayerManager::markSpawnYieldFlushed(
+        uint64 resourceSpawnObjectId, uint64 flushedQuantity) {
+    Locker locker(&spawnYieldAccumulatorMutex);
+
+    if (!spawnYieldAccumulators.contains(resourceSpawnObjectId))
+        return;
+
+    MinerSpawnYieldAccumulator accumulator =
+        spawnYieldAccumulators.get(resourceSpawnObjectId);
+
+    // Only advance; never regress (sessionQuantity is monotonic and more yield
+    // may have arrived since the flush snapshot was taken).
+    if (flushedQuantity > accumulator.lastFlushedQuantity) {
+        accumulator.lastFlushedQuantity = flushedQuantity;
+        spawnYieldAccumulators.put(resourceSpawnObjectId, accumulator);
     }
 }
 
@@ -6200,8 +6971,13 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     JSONSerializationType futureRoles = JSONSerializationType::array();
     JSONSerializationType crafterRole = JSONSerializationType::object();
     crafterRole["role"] = "crafters";
-    crafterRole["status"] = "not_implemented";
-    crafterRole["active"] = 0;
+    crafterRole["status"] = hiveCrafterConsumerEnabled ?
+        String("simulation") : String("not_implemented");
+    {
+        Locker crafterLocker(&hiveCrafterConsumerMutex);
+        crafterRole["active"] = hiveCrafterConsumerEnabled ? 1 : 0;
+        crafterRole["batchesCompleted"] = hiveCrafterBatchesCompleted;
+    }
     futureRoles.push_back(crafterRole);
 
     JSONSerializationType pveRole = JSONSerializationType::object();
@@ -6427,12 +7203,14 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         bool validationStatusReady =
             (assignment.activationSnapshotId > 0 &&
                 assignment.activationPathValidationStatus == "valid" &&
-                assignment.activationPathTrustStatus == "verifiedPath" &&
+                isActivationTrustAcceptable(
+                    assignment.activationPathTrustStatus) &&
                 assignment.activationTargetHash == assignment.targetHash) ||
             (assignment.activationSnapshotId == 0 &&
                 assignment.validatedSnapshotId > 0 &&
                 assignment.validatedPathValidationStatus == "valid" &&
-                assignment.validatedPathTrustStatus == "verifiedPath" &&
+                isActivationTrustAcceptable(
+                    assignment.validatedPathTrustStatus) &&
                 assignment.validatedTargetHash == assignment.targetHash);
         bool lifecycleReady = !expired &&
             (status == "candidate" || status == "validated" ||
@@ -6549,9 +7327,35 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     int activationFailures = healthAttempts > healthStarted ?
         healthAttempts - healthStarted : 0;
 
+    int legacyLoopSuppressedSnapshot = 0;
+    int legacyLoopStartedSnapshot = 0;
+    int intelligentLoopStartedSnapshot = 0;
+    String lastLegacyLoopSuppressionReasonSnapshot;
+
+    {
+        Locker locker(&minerWorkLoopDiagnosticsMutex);
+        legacyLoopSuppressedSnapshot = legacyMinerLoopSuppressedCount;
+        legacyLoopStartedSnapshot = legacyMinerLoopStartedCount;
+        intelligentLoopStartedSnapshot = intelligentMinerLoopStartedCount;
+        lastLegacyLoopSuppressionReasonSnapshot =
+            lastLegacyMinerSuppressionReason;
+    }
+
     JSONSerializationType minerActivity = JSONSerializationType::object();
     minerActivity["intelligentTargetingEnabled"] = minerIntelligentTargetingEnabled;
     minerActivity["mode"] = minerIntelligentTargetingMode;
+    minerActivity["intelligentWorkLoopOwnerEnabled"] =
+        isIntelligentMinerWorkLoopOwnerEnabled();
+    minerActivity["legacyConceptualLoopAllowed"] =
+        isLegacyConceptualMinerLoopAllowed();
+    minerActivity["legacyLoopSuppressedCount"] =
+        legacyLoopSuppressedSnapshot;
+    minerActivity["legacyLoopStartedCount"] =
+        legacyLoopStartedSnapshot;
+    minerActivity["intelligentLoopStartedCount"] =
+        intelligentLoopStartedSnapshot;
+    minerActivity["lastSuppressedLegacyReason"] =
+        lastLegacyLoopSuppressionReasonSnapshot;
     minerActivity["currentIntelligentActiveCount"] = assignmentActive;
     minerActivity["coverageActiveCount"] = assignmentActive;
     minerActivity["queued"] = assignmentQueued;
@@ -6926,6 +7730,31 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         knownTotals.push_back(row);
     }
 
+    Vector<DemandProfileDefinition> profiles = createDemandProfileDefinitions();
+    VectorMap<String, uint64> exactResourceKnownQuantities;
+    VectorMap<String, uint64> resourceTypeKnownQuantities;
+
+    {
+        Locker stockpileLocker(&resourceAwareStockpileMutex);
+
+        for (int i = 0; i < resourceAwareStockpileRows.size(); ++i) {
+            SimResourceAwareStockpileRow row =
+                resourceAwareStockpileRows.get(i);
+
+            if (!row.sourceResourceName.isEmpty())
+                addUint64Counter(
+                    exactResourceKnownQuantities,
+                    row.sourceResourceName,
+                    row.quantity);
+
+            if (!row.sourceResourceType.isEmpty())
+                addUint64Counter(
+                    resourceTypeKnownQuantities,
+                    row.sourceResourceType,
+                    row.quantity);
+        }
+    }
+
     JSONSerializationType coverageSlots = JSONSerializationType::array();
     JSONSerializationType coverageByResource = JSONSerializationType::array();
     JSONSerializationType coverageByProfile = JSONSerializationType::array();
@@ -6936,6 +7765,7 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     VectorMap<String, int> profileStationed;
     VectorMap<String, int> profileMoving;
     VectorMap<String, int> profileSampling;
+    VectorMap<String, int> profileActiveCoverage;
     VectorMap<String, float> profilePressure;
     VectorMap<String, int> resourceAssigned;
     VectorMap<String, int> resourceStationed;
@@ -6946,6 +7776,12 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     VectorMap<String, String> resourceZoneByKey;
     int desiredCoverageSlots = 0;
     int actualCoveredSlots = 0;
+    int fullyCoveredSlots = 0;
+    int partiallyCoveredSlots = 0;
+    int uncoveredSlots = 0;
+    int totalCoverageGap = 0;
+    int assignedCoverageMiners = 0;
+    int activeCoverageMiners = 0;
     int stationedCoverageMiners = 0;
     int movingCoverageMiners = 0;
     int samplingCoverageMiners = 0;
@@ -6954,6 +7790,8 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     int stationDurationSamples = 0;
     int stationSampleTotal = 0;
     uint64 stationYieldTotal = 0;
+    uint64 lastStationedSampleAgeSeconds = 0;
+    bool hasStationedSampleAge = false;
 
     for (int i = 0; i < dashboardAssignmentSnapshots.size(); ++i) {
         MinerIntelligentTargetAssignment assignment =
@@ -6977,6 +7815,7 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
             assignment.targetZoneName;
         addIntCounter(profileAssigned, profileKey);
         addIntCounter(resourceAssigned, resourceKey);
+        assignedCoverageMiners++;
         resourceNameByKey.put(resourceKey, assignment.targetResourceName);
         resourceTypeByKey.put(resourceKey, assignment.targetResourceType);
         resourceZoneByKey.put(resourceKey, assignment.targetZoneName);
@@ -6987,7 +7826,9 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
 
         if (status == "stationed") {
             addIntCounter(profileStationed, profileKey);
+            addIntCounter(profileActiveCoverage, profileKey);
             addIntCounter(resourceStationed, resourceKey);
+            activeCoverageMiners++;
             stationedCoverageMiners++;
             uint64 durationSeconds = assignment.stationedAtMs > 0 &&
                 nowMs > assignment.stationedAtMs ?
@@ -6997,13 +7838,29 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
             stationDurationSamples++;
             if (durationSeconds > stationDurationMaxSeconds)
                 stationDurationMaxSeconds = durationSeconds;
+
+            if (assignment.lastStationSampleAtMs > 0 &&
+                    nowMs > assignment.lastStationSampleAtMs) {
+                uint64 sampleAgeSeconds =
+                    (nowMs - assignment.lastStationSampleAtMs) / 1000;
+
+                if (!hasStationedSampleAge ||
+                        sampleAgeSeconds < lastStationedSampleAgeSeconds) {
+                    lastStationedSampleAgeSeconds = sampleAgeSeconds;
+                    hasStationedSampleAge = true;
+                }
+            }
         } else if (status == "sample_started") {
             addIntCounter(profileSampling, profileKey);
+            addIntCounter(profileActiveCoverage, profileKey);
             addIntCounter(resourceSampling, resourceKey);
+            activeCoverageMiners++;
             samplingCoverageMiners++;
         } else if (status == "activation_started" || status == "queued") {
             addIntCounter(profileMoving, profileKey);
+            addIntCounter(profileActiveCoverage, profileKey);
             addIntCounter(resourceMoving, resourceKey);
+            activeCoverageMiners++;
             movingCoverageMiners++;
         }
 
@@ -7015,22 +7872,63 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         int slotMoving =
             (status == "activation_started" || status == "queued") ? 1 : 0;
         int slotSampling = status == "sample_started" ? 1 : 0;
+        int slotActiveCoverage = slotStationed + slotMoving + slotSampling;
         int desiredMiners = 1;
-        int gap = desiredMiners > slotAssigned ?
-            desiredMiners - slotAssigned : 0;
+        int gap = desiredMiners > slotActiveCoverage ?
+            desiredMiners - slotActiveCoverage : 0;
         String conceptualLabel = assignment.targetResourceType;
-        uint64 knownQuantity =
+        uint64 exactResourceKnownQuantity =
+            exactResourceKnownQuantities.contains(assignment.targetResourceName) ?
+            exactResourceKnownQuantities.get(assignment.targetResourceName) : 0;
+        uint64 resourceTypeKnownQuantity =
+            resourceTypeKnownQuantities.contains(assignment.targetResourceType) ?
+            resourceTypeKnownQuantities.get(assignment.targetResourceType) : 0;
+        uint64 conceptualLabelKnownQuantity =
             knownConceptualTotals.contains(conceptualLabel) ?
             knownConceptualTotals.get(conceptualLabel) : 0;
+        uint64 demandMatchedKnownQuantity =
+            resourceAwareQuantityByProfile.contains(profileKey) ?
+            resourceAwareQuantityByProfile.get(profileKey) : 0;
+
+        if (demandMatchedKnownQuantity == 0) {
+            for (int labelIndex = 0;
+                    labelIndex < knownConceptualTotals.size(); ++labelIndex) {
+                String label = knownConceptualTotals.elementAt(labelIndex).getKey();
+                String matchedProfiles =
+                    getDemandProfilesForConceptualLabel(profiles, label);
+
+                if (matchedProfiles.contains(profileKey))
+                    demandMatchedKnownQuantity +=
+                        knownConceptualTotals.get(label);
+            }
+        }
+
         uint64 desiredReserve =
             demandWeightedMinerPlanSimulationDesiredReserve.contains(profileKey) ?
             static_cast<uint64>(
                 demandWeightedMinerPlanSimulationDesiredReserve.get(profileKey)) : 0;
+        uint64 reserveQuantity = exactResourceKnownQuantity > 0 ?
+            exactResourceKnownQuantity :
+            (resourceTypeKnownQuantity > 0 ?
+                resourceTypeKnownQuantity :
+                (conceptualLabelKnownQuantity > 0 ?
+                    conceptualLabelKnownQuantity :
+                    demandMatchedKnownQuantity));
         float reserveRatio = desiredReserve > 0 ?
             Math::getPrecision(
-                static_cast<float>(knownQuantity) /
+                static_cast<float>(reserveQuantity) /
                     static_cast<float>(desiredReserve),
                 3) : 0.f;
+        String stockpileConfidence =
+            exactResourceKnownQuantity > 0 ? String("exact_resource") :
+            (resourceTypeKnownQuantity > 0 ? String("resource_type") :
+            (conceptualLabelKnownQuantity > 0 ? String("conceptual_label") :
+            (demandMatchedKnownQuantity > 0 ? String("demand_profile") :
+                String("none"))));
+        String coverageState = slotActiveCoverage >= desiredMiners ?
+            String("fully_covered") :
+            (slotActiveCoverage > 0 ?
+                String("partially_covered") : String("uncovered"));
 
         JSONSerializationType slot = JSONSerializationType::object();
         slot["coverageSlotId"] = assignment.targetHash.isEmpty() ?
@@ -7048,11 +7946,18 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         slot["stationedMinerCount"] = slotStationed;
         slot["movingMinerCount"] = slotMoving;
         slot["samplingMinerCount"] = slotSampling;
+        slot["activeCoverageMinerCount"] = slotActiveCoverage;
         slot["coverageGap"] = gap;
+        slot["coverageState"] = coverageState;
         slot["pressureScore"] = Math::getPrecision(assignment.pressureScore, 1);
-        slot["stockpileKnownQuantity"] = knownQuantity;
+        slot["stockpileKnownQuantity"] = reserveQuantity;
+        slot["exactResourceKnownQuantity"] = exactResourceKnownQuantity;
+        slot["resourceTypeKnownQuantity"] = resourceTypeKnownQuantity;
+        slot["conceptualLabelKnownQuantity"] = conceptualLabelKnownQuantity;
+        slot["demandMatchedKnownQuantity"] = demandMatchedKnownQuantity;
         slot["desiredReserve"] = desiredReserve;
         slot["reserveRatio"] = reserveRatio;
+        slot["stockpileConfidence"] = stockpileConfidence;
         slot["rebalanceReason"] = assignment.rebalanceReason.isEmpty() ?
             String("none") : assignment.rebalanceReason;
         slot["lastUpdatedMs"] = assignment.updatedAtMs;
@@ -7063,12 +7968,10 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         slot["economyMutated"] = false;
         coverageSlots.push_back(slot);
 
-        if (gap == 0)
+        if (slotActiveCoverage > 0)
             actualCoveredSlots++;
 
-        if (!assignment.rebalanceReason.isEmpty() ||
-                status == "failed" || status == "maxStationDurationReached" ||
-                status == "maxStationSamplesReached") {
+        if (!assignment.rebalanceReason.isEmpty() || status == "failed") {
             JSONSerializationType candidate = JSONSerializationType::object();
             candidate["minerId"] = assignment.minerID;
             candidate["demandProfile"] = profileKey;
@@ -7100,12 +8003,39 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
             profileMoving.get(profileKey) : 0;
         int samplingCount = profileSampling.contains(profileKey) ?
             profileSampling.get(profileKey) : 0;
-        int gap = desiredMiners > assignedCount ?
-            desiredMiners - assignedCount : 0;
+        int activeCount = profileActiveCoverage.contains(profileKey) ?
+            profileActiveCoverage.get(profileKey) : 0;
+        int gap = desiredMiners > activeCount ?
+            desiredMiners - activeCount : 0;
+        totalCoverageGap += gap;
+
+        if (activeCount >= desiredMiners)
+            fullyCoveredSlots++;
+        else if (activeCount > 0)
+            partiallyCoveredSlots++;
+        else
+            uncoveredSlots++;
+
         uint64 desiredReserve =
             demandWeightedMinerPlanSimulationDesiredReserve.contains(profileKey) ?
             static_cast<uint64>(
                 demandWeightedMinerPlanSimulationDesiredReserve.get(profileKey)) : 0;
+        uint64 demandMatchedKnownQuantity =
+            resourceAwareQuantityByProfile.contains(profileKey) ?
+            resourceAwareQuantityByProfile.get(profileKey) : 0;
+
+        if (demandMatchedKnownQuantity == 0) {
+            for (int labelIndex = 0;
+                    labelIndex < knownConceptualTotals.size(); ++labelIndex) {
+                String label = knownConceptualTotals.elementAt(labelIndex).getKey();
+                String matchedProfiles =
+                    getDemandProfilesForConceptualLabel(profiles, label);
+
+                if (matchedProfiles.contains(profileKey))
+                    demandMatchedKnownQuantity +=
+                        knownConceptualTotals.get(label);
+            }
+        }
 
         JSONSerializationType row = JSONSerializationType::object();
         row["demandProfile"] = profileKey;
@@ -7114,11 +8044,19 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         row["stationedMinerCount"] = stationedCount;
         row["movingMinerCount"] = movingCount;
         row["samplingMinerCount"] = samplingCount;
+        row["activeCoverageMinerCount"] = activeCount;
+        row["assignedButNotStationedCount"] =
+            assignedCount > stationedCount ? assignedCount - stationedCount : 0;
         row["coverageGap"] = gap;
+        row["coverageState"] = activeCount >= desiredMiners ?
+            String("fully_covered") :
+            (activeCount > 0 ? String("partially_covered") :
+                String("uncovered"));
         float rowPressureScore = profilePressure.contains(profileKey) ?
             Math::getPrecision(profilePressure.get(profileKey), 1) : 0.f;
         row["pressureScore"] = rowPressureScore;
         row["desiredReserve"] = desiredReserve;
+        row["demandMatchedKnownQuantity"] = demandMatchedKnownQuantity;
         coverageByProfile.push_back(row);
 
         if (gap > 0) {
@@ -7143,13 +8081,21 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
             resourceTypeByKey.get(resourceKey) : String("unknown");
         row["zone"] = resourceZoneByKey.contains(resourceKey) ?
             resourceZoneByKey.get(resourceKey) : String("unknown");
-        row["assignedMinerCount"] = resourceAssigned.get(resourceKey);
-        row["stationedMinerCount"] = resourceStationed.contains(resourceKey) ?
+        int resourceStationedCount =
+            resourceStationed.contains(resourceKey) ?
             resourceStationed.get(resourceKey) : 0;
-        row["movingMinerCount"] = resourceMoving.contains(resourceKey) ?
+        int resourceMovingCount =
+            resourceMoving.contains(resourceKey) ?
             resourceMoving.get(resourceKey) : 0;
-        row["samplingMinerCount"] = resourceSampling.contains(resourceKey) ?
+        int resourceSamplingCount =
+            resourceSampling.contains(resourceKey) ?
             resourceSampling.get(resourceKey) : 0;
+        row["assignedMinerCount"] = resourceAssigned.get(resourceKey);
+        row["stationedMinerCount"] = resourceStationedCount;
+        row["movingMinerCount"] = resourceMovingCount;
+        row["samplingMinerCount"] = resourceSamplingCount;
+        row["activeCoverageMinerCount"] =
+            resourceStationedCount + resourceMovingCount + resourceSamplingCount;
         coverageByResource.push_back(row);
     }
 
@@ -7166,13 +8112,39 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     JSONSerializationType stationSampleSummary =
         JSONSerializationType::object();
     stationSampleSummary["stationSampleCount"] = stationSampleTotal;
+    stationSampleSummary["stationedSampleTicks"] = stationSampleTotal;
     stationSampleSummary["stationYieldQuantity"] = stationYieldTotal;
+    stationSampleSummary["lastStationedSampleAgeSeconds"] =
+        hasStationedSampleAge ? lastStationedSampleAgeSeconds : 0;
     stationSampleSummary["averageSamplesPerStationedMiner"] =
         stationedCoverageMiners > 0 ?
         Math::getPrecision(
             static_cast<float>(stationSampleTotal) /
                 static_cast<float>(stationedCoverageMiners),
             2) : 0.f;
+
+    actualCoveredSlots = fullyCoveredSlots + partiallyCoveredSlots;
+
+    JSONSerializationType coverageDefinitions =
+        JSONSerializationType::object();
+    coverageDefinitions["desiredCoverage"] =
+        "sum of desired miner coverage slots across enabled demand profiles";
+    coverageDefinitions["assignedCoverage"] =
+        "non-expired live assignments for a profile/resource/zone target";
+    coverageDefinitions["stationedCoverage"] =
+        "assignments whose lifecycle is stationed after arrival/sample";
+    coverageDefinitions["activeCoverage"] =
+        "stationed plus sampling plus queued/moving-to-target assignments";
+    coverageDefinitions["fullyCoveredSlot"] =
+        "profile slot whose activeCoverage >= desiredCoverage";
+    coverageDefinitions["partiallyCoveredSlot"] =
+        "profile slot whose activeCoverage > 0 and activeCoverage < desiredCoverage";
+    coverageDefinitions["uncoveredSlot"] =
+        "profile slot whose activeCoverage == 0";
+    coverageDefinitions["coverageGap"] =
+        "max(0, desiredCoverage - activeCoverage)";
+    coverageDefinitions["assignedButNotStationed"] =
+        "live assignments that have not reached long-lived stationed coverage";
 
     JSONSerializationType coveragePlanner = JSONSerializationType::object();
     coveragePlanner["enabled"] = true;
@@ -7183,12 +8155,30 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         stationedMinerLifecycleEnabled;
     coveragePlanner["stationedRepeatedSamplingEnabled"] =
         stationedMinerRepeatedSamplingEnabled;
+    coveragePlanner["stationedSamplingEnabled"] =
+        stationedMinerRepeatedSamplingEnabled;
+    coveragePlanner["sampleIntervalSource"] =
+        String(getGameDerivedStationedSampleIntervalSource());
+    coveragePlanner["sampleIntervalSeconds"] =
+        getGameDerivedStationedSampleIntervalSeconds();
+    coveragePlanner["sampleResultDelaySeconds"] =
+        getGameDerivedStationedSampleResultDelayMs() / 1000;
+    coveragePlanner["stationedSampleTicks"] = stationSampleTotal;
+    coveragePlanner["lastStationedSampleAgeSeconds"] =
+        hasStationedSampleAge ? lastStationedSampleAgeSeconds : 0;
+    coveragePlanner["coverageDefinitions"] = coverageDefinitions;
     coveragePlanner["desiredCoverageSlots"] = desiredCoverageSlots;
     coveragePlanner["actualCoveredSlots"] = actualCoveredSlots;
-    coveragePlanner["totalCoverageGap"] =
-        desiredCoverageSlots > actualCoveredSlots ?
-        desiredCoverageSlots - actualCoveredSlots : 0;
+    coveragePlanner["fullyCoveredSlots"] = fullyCoveredSlots;
+    coveragePlanner["partiallyCoveredSlots"] = partiallyCoveredSlots;
+    coveragePlanner["uncoveredSlots"] = uncoveredSlots;
+    coveragePlanner["totalCoverageGap"] = totalCoverageGap;
+    coveragePlanner["assignedCoverageMiners"] = assignedCoverageMiners;
+    coveragePlanner["activeCoverageMiners"] = activeCoverageMiners;
     coveragePlanner["stationedMiners"] = stationedCoverageMiners;
+    coveragePlanner["assignedButNotStationed"] =
+        assignedCoverageMiners > stationedCoverageMiners ?
+        assignedCoverageMiners - stationedCoverageMiners : 0;
     coveragePlanner["movingMiners"] = movingCoverageMiners;
     coveragePlanner["samplingMiners"] = samplingCoverageMiners;
     coveragePlanner["unassignedMiners"] =
@@ -7208,7 +8198,636 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     coveragePlanner["economyMutated"] = false;
     result["coveragePlanner"] = coveragePlanner;
 
-    Vector<DemandProfileDefinition> profiles = createDemandProfileDefinitions();
+    JSONSerializationType acquisitionRows = JSONSerializationType::array();
+    JSONSerializationType acquisitionReadyRows = JSONSerializationType::array();
+    VectorMap<String, int> acquisitionBlockedReasons;
+    VectorMap<String, int> acquisitionReadyByProfile;
+    VectorMap<String, int> acquisitionReadyByResource;
+    VectorMap<String, int> acquisitionReadyByPlanet;
+    int acquisitionStationedMiners = 0;
+    int acquisitionReadyMiners = 0;
+    int acquisitionBlockedMiners = 0;
+
+    for (int i = 0; i < dashboardAssignmentSnapshots.size(); ++i) {
+        MinerIntelligentTargetAssignment assignment =
+            dashboardAssignmentSnapshots.get(i);
+        uint64 timeoutAgeSeconds = 0;
+        uint64 timeoutSeconds = 0;
+        String timeoutReason =
+            getMinerIntelligentAssignmentTimeoutReason(
+                assignment, nowMs, timeoutAgeSeconds, timeoutSeconds, false);
+
+        if (!timeoutReason.isEmpty() || assignment.status != "stationed")
+            continue;
+
+        acquisitionStationedMiners++;
+
+        String profileKey = assignment.selectedProfileKey.isEmpty() ?
+            String("unknown") : assignment.selectedProfileKey;
+        String conceptualLabel = assignment.targetResourceType;
+        uint64 exactResourceKnownQuantity =
+            exactResourceKnownQuantities.contains(assignment.targetResourceName) ?
+            exactResourceKnownQuantities.get(assignment.targetResourceName) : 0;
+        uint64 resourceTypeKnownQuantity =
+            resourceTypeKnownQuantities.contains(assignment.targetResourceType) ?
+            resourceTypeKnownQuantities.get(assignment.targetResourceType) : 0;
+        uint64 conceptualLabelKnownQuantity =
+            knownConceptualTotals.contains(conceptualLabel) ?
+            knownConceptualTotals.get(conceptualLabel) : 0;
+        uint64 demandMatchedKnownQuantity =
+            resourceAwareQuantityByProfile.contains(profileKey) ?
+            resourceAwareQuantityByProfile.get(profileKey) : 0;
+
+        if (demandMatchedKnownQuantity == 0) {
+            for (int labelIndex = 0;
+                    labelIndex < knownConceptualTotals.size(); ++labelIndex) {
+                String label = knownConceptualTotals.elementAt(labelIndex).getKey();
+                String matchedProfiles =
+                    getDemandProfilesForConceptualLabel(profiles, label);
+
+                if (matchedProfiles.contains(profileKey))
+                    demandMatchedKnownQuantity +=
+                        knownConceptualTotals.get(label);
+            }
+        }
+
+        uint64 desiredReserve =
+            demandWeightedMinerPlanSimulationDesiredReserve.contains(profileKey) ?
+            static_cast<uint64>(
+                demandWeightedMinerPlanSimulationDesiredReserve.get(profileKey)) : 0;
+        uint64 reserveQuantity = exactResourceKnownQuantity > 0 ?
+            exactResourceKnownQuantity :
+            (resourceTypeKnownQuantity > 0 ?
+                resourceTypeKnownQuantity :
+                (conceptualLabelKnownQuantity > 0 ?
+                    conceptualLabelKnownQuantity :
+                    demandMatchedKnownQuantity));
+        float reserveRatio = desiredReserve > 0 ?
+            Math::getPrecision(
+                static_cast<float>(reserveQuantity) /
+                    static_cast<float>(desiredReserve),
+                3) : 0.f;
+        String stockpileConfidence =
+            exactResourceKnownQuantity > 0 ? String("exact_resource") :
+            (resourceTypeKnownQuantity > 0 ? String("resource_type") :
+            (conceptualLabelKnownQuantity > 0 ? String("conceptual_label") :
+            (demandMatchedKnownQuantity > 0 ? String("demand_profile") :
+                String("none"))));
+        bool resourceIdentityKnown =
+            !assignment.targetResourceName.isEmpty() &&
+            !assignment.targetResourceType.isEmpty() &&
+            !assignment.targetHash.isEmpty();
+        bool samePlanet = activeMinerZoneById.contains(assignment.minerID) ?
+            activeMinerZoneById.get(assignment.minerID) ==
+                assignment.targetZoneName :
+            !assignment.targetZoneName.isEmpty();
+        bool demandStillValid =
+            demandWeightedMinerPlanSimulationProfileEnabled.contains(profileKey) &&
+            demandWeightedMinerPlanSimulationProfileEnabled.get(profileKey) > 0;
+        bool reserveBelowTarget =
+            desiredReserve == 0 || reserveQuantity < desiredReserve;
+        bool verifiedActivationPath =
+            isActivationTrustAcceptable(assignment.activationPathTrustStatus);
+        bool safetyClean = true;
+        bool ready = acquisitionReadinessDiagnosticsEnabled;
+        String readinessReason = "ready";
+
+        if (!acquisitionReadinessDiagnosticsEnabled) {
+            ready = false;
+            readinessReason = "diagnosticsDisabled";
+        } else if (realResourceAcquisitionEnabled) {
+            ready = false;
+            readinessReason = "realAcquisitionEnabled";
+        } else if (acquisitionRequireStationedLifecycle &&
+                assignment.status != "stationed") {
+            ready = false;
+            readinessReason = "notStationed";
+        } else if (acquisitionRequireKnownResourceSpawnIdentity &&
+                !resourceIdentityKnown) {
+            ready = false;
+            readinessReason = "resourceIdentityUnknown";
+        } else if (!samePlanet) {
+            ready = false;
+            readinessReason = "zoneMismatch";
+        } else if (acquisitionRequireDemandStillValid &&
+                !demandStillValid) {
+            ready = false;
+            readinessReason = "demandNoLongerValid";
+        } else if (acquisitionRequireReserveBelowTarget &&
+                !reserveBelowTarget) {
+            ready = false;
+            readinessReason = "reserveSatisfied";
+        } else if (acquisitionRequireVerifiedActivationPath &&
+                !verifiedActivationPath) {
+            ready = false;
+            readinessReason = "activationPathNotVerified";
+        } else if (!safetyClean) {
+            ready = false;
+            readinessReason = "safetyFlagsNotClean";
+        }
+
+        JSONSerializationType row = JSONSerializationType::object();
+        row["minerId"] = assignment.minerID;
+        row["assignmentGenerationId"] = assignment.assignmentGenerationId;
+        row["targetHash"] = assignment.targetHash;
+        row["resourceName"] = assignment.targetResourceName;
+        row["resourceType"] = assignment.targetResourceType;
+        row["conceptualLabel"] = conceptualLabel;
+        row["planet"] = assignment.targetZoneName;
+        row["demandProfile"] = profileKey;
+        row["stationDurationSeconds"] =
+            assignment.stationedAtMs > 0 && nowMs > assignment.stationedAtMs ?
+            (nowMs - assignment.stationedAtMs) / 1000 :
+            assignment.stationDurationSeconds;
+        row["stationSampleCount"] = assignment.stationSampleCount;
+        row["stationYieldQuantity"] = assignment.stationYieldQuantity;
+        row["activationPathTrustStatus"] =
+            assignment.activationPathTrustStatus;
+        row["stockpileConfidence"] = stockpileConfidence;
+        row["reserveRatio"] = reserveRatio;
+        row["exactResourceKnownQuantity"] = exactResourceKnownQuantity;
+        row["resourceTypeKnownQuantity"] = resourceTypeKnownQuantity;
+        row["conceptualLabelKnownQuantity"] = conceptualLabelKnownQuantity;
+        row["demandMatchedKnownQuantity"] = demandMatchedKnownQuantity;
+        row["desiredReserve"] = desiredReserve;
+        row["sourceResourceIdentityStatus"] =
+            resourceIdentityKnown ? String("identity_known") :
+                String("identity_unknown");
+        row["acquisitionReadinessStatus"] =
+            ready ? String("ready") : String("blocked");
+        row["acquisitionReadinessReason"] = readinessReason;
+        row["futureAcquisitionOnly"] = true;
+        row["realResourceAcquisitionEnabled"] = realResourceAcquisitionEnabled;
+        row["realResourceCreated"] = false;
+        row["resourceContainerCreated"] = false;
+        row["inventoryMutated"] = false;
+        row["economyMutated"] = false;
+        acquisitionRows.push_back(row);
+
+        if (ready) {
+            acquisitionReadyMiners++;
+            acquisitionReadyRows.push_back(row);
+            addIntCounter(acquisitionReadyByProfile, profileKey);
+            addIntCounter(
+                acquisitionReadyByResource,
+                assignment.targetResourceName + "|" +
+                    assignment.targetResourceType);
+            addIntCounter(acquisitionReadyByPlanet, assignment.targetZoneName);
+        } else {
+            acquisitionBlockedMiners++;
+            addIntCounter(acquisitionBlockedReasons, readinessReason);
+        }
+    }
+
+    JSONSerializationType acquisitionBlockedReasonRows =
+        JSONSerializationType::array();
+    for (int i = 0; i < acquisitionBlockedReasons.size(); ++i) {
+        JSONSerializationType row = JSONSerializationType::object();
+        row["reason"] = acquisitionBlockedReasons.elementAt(i).getKey();
+        row["count"] = acquisitionBlockedReasons.get(i);
+        acquisitionBlockedReasonRows.push_back(row);
+    }
+
+    JSONSerializationType acquisitionReadyByProfileRows =
+        JSONSerializationType::array();
+    for (int i = 0; i < acquisitionReadyByProfile.size(); ++i) {
+        JSONSerializationType row = JSONSerializationType::object();
+        row["demandProfile"] = acquisitionReadyByProfile.elementAt(i).getKey();
+        row["readyCount"] = acquisitionReadyByProfile.get(i);
+        acquisitionReadyByProfileRows.push_back(row);
+    }
+
+    JSONSerializationType acquisitionReadyByResourceRows =
+        JSONSerializationType::array();
+    for (int i = 0; i < acquisitionReadyByResource.size(); ++i) {
+        JSONSerializationType row = JSONSerializationType::object();
+        row["resource"] = acquisitionReadyByResource.elementAt(i).getKey();
+        row["readyCount"] = acquisitionReadyByResource.get(i);
+        acquisitionReadyByResourceRows.push_back(row);
+    }
+
+    JSONSerializationType acquisitionReadyByPlanetRows =
+        JSONSerializationType::array();
+    for (int i = 0; i < acquisitionReadyByPlanet.size(); ++i) {
+        JSONSerializationType row = JSONSerializationType::object();
+        row["planet"] = acquisitionReadyByPlanet.elementAt(i).getKey();
+        row["readyCount"] = acquisitionReadyByPlanet.get(i);
+        acquisitionReadyByPlanetRows.push_back(row);
+    }
+
+    JSONSerializationType acquisitionReadiness = JSONSerializationType::object();
+    acquisitionReadiness["enabled"] = acquisitionReadinessDiagnosticsEnabled;
+    acquisitionReadiness["mode"] = "diagnostics-only";
+    acquisitionReadiness["futureAcquisitionOnly"] = true;
+    acquisitionReadiness["realResourceAcquisitionEnabled"] =
+        realResourceAcquisitionEnabled;
+    acquisitionReadiness["maxAcquisitionsPerInterval"] =
+        acquisitionMaxAcquisitionsPerInterval;
+    acquisitionReadiness["stationedMiners"] = acquisitionStationedMiners;
+    acquisitionReadiness["acquisitionReadyMiners"] =
+        acquisitionReadyMiners;
+    acquisitionReadiness["acquisitionBlockedMiners"] =
+        acquisitionBlockedMiners;
+    acquisitionReadiness["acquisitionBlockedReasons"] =
+        acquisitionBlockedReasonRows;
+    acquisitionReadiness["readyByProfile"] = acquisitionReadyByProfileRows;
+    acquisitionReadiness["readyByResource"] = acquisitionReadyByResourceRows;
+    acquisitionReadiness["readyByPlanet"] = acquisitionReadyByPlanetRows;
+    acquisitionReadiness["readyRows"] = acquisitionReadyRows;
+    acquisitionReadiness["rows"] = acquisitionRows;
+    acquisitionReadiness["requiresStationedLifecycle"] =
+        acquisitionRequireStationedLifecycle;
+    acquisitionReadiness["requiresVerifiedActivationPath"] =
+        acquisitionRequireVerifiedActivationPath;
+    acquisitionReadiness["requiresKnownResourceSpawnIdentity"] =
+        acquisitionRequireKnownResourceSpawnIdentity;
+    acquisitionReadiness["requiresDemandStillValid"] =
+        acquisitionRequireDemandStillValid;
+    acquisitionReadiness["requiresReserveBelowTarget"] =
+        acquisitionRequireReserveBelowTarget;
+    acquisitionReadiness["realResourceCreated"] = false;
+    acquisitionReadiness["resourceContainerCreated"] = false;
+    acquisitionReadiness["inventoryMutated"] = false;
+    acquisitionReadiness["economyMutated"] = false;
+    result["acquisitionReadiness"] = acquisitionReadiness;
+
+    JSONSerializationType simulatedAcquisitionRows =
+        JSONSerializationType::array();
+    JSONSerializationType simulatedBlockedReasonRows =
+        JSONSerializationType::array();
+    JSONSerializationType simulatedQuantityByPlanetRows =
+        JSONSerializationType::array();
+    JSONSerializationType simulatedQuantityByResourceTypeRows =
+        JSONSerializationType::array();
+    JSONSerializationType simulatedQuantityByExactResourceRows =
+        JSONSerializationType::array();
+    uint64 simulatedResourcesAcquired = 0;
+    int simulatedUniqueResources = 0;
+    int simulatedRetainedRows = 0;
+    int simulatedMaxRows = 0;
+    int simulatedAttempts = 0;
+    int simulatedSuccessful = 0;
+    int simulatedBlocked = 0;
+
+    if (simulatedAcquisitionRuntime != nullptr) {
+        Locker locker(&simulatedAcquisitionRuntime->mutex);
+
+        simulatedRetainedRows = simulatedAcquisitionRuntime->events.size();
+        simulatedMaxRows = simulatedAcquisitionMaxLedgerEvents;
+        simulatedAttempts = simulatedAcquisitionRuntime->attempts;
+        simulatedSuccessful = simulatedAcquisitionRuntime->successful;
+        simulatedBlocked = simulatedAcquisitionRuntime->blocked;
+        simulatedResourcesAcquired =
+            simulatedAcquisitionRuntime->totalQuantity;
+        simulatedUniqueResources =
+            simulatedAcquisitionRuntime->quantityByExactResource.size();
+
+        for (int i = 0;
+                i < simulatedAcquisitionRuntime->blockedReasons.size(); ++i) {
+            JSONSerializationType row = JSONSerializationType::object();
+            row["reason"] =
+                simulatedAcquisitionRuntime->blockedReasons.elementAt(i).getKey();
+            row["count"] =
+                simulatedAcquisitionRuntime->blockedReasons.get(i);
+            simulatedBlockedReasonRows.push_back(row);
+        }
+
+        int emitted = 0;
+        for (int i = simulatedAcquisitionRuntime->events.size() - 1;
+                i >= 0 && emitted < 50; --i, ++emitted) {
+            SimulatedAcquisitionEvent event =
+                simulatedAcquisitionRuntime->events.get(i);
+
+            JSONSerializationType row = JSONSerializationType::object();
+            row["timestampMs"] = event.timestampMs;
+            row["ageSeconds"] =
+                event.timestampMs > 0 && nowMs > event.timestampMs ?
+                (nowMs - event.timestampMs) / 1000 : 0;
+            row["minerId"] = event.minerID;
+            row["resourceName"] = event.resourceName;
+            row["resourceType"] = event.resourceType;
+            row["resourceClass"] = event.resourceClass;
+            row["planet"] = event.planet;
+            row["spawnIdentity"] = event.spawnIdentity;
+            row["quantity"] = event.quantity;
+            row["density"] = event.density;
+            row["concentration"] = event.concentration;
+            row["demandProfile"] = event.demandProfile;
+            row["assignmentGenerationId"] =
+                event.assignmentGenerationId;
+            row["activationSnapshotId"] =
+                event.activationSnapshotId;
+            row["activationPathTrustStatus"] =
+                event.activationPathTrustStatus;
+            row["stationedAtMs"] = event.stationedAtMs;
+            row["stationDurationSeconds"] =
+                event.stationDurationSeconds;
+            row["conceptualLabel"] = event.conceptualLabel;
+            row["wouldCreateResourceContainer"] =
+                event.wouldCreateResourceContainer;
+            row["realResourceCreated"] = event.realResourceCreated;
+            row["resourceContainerCreated"] =
+                event.resourceContainerCreated;
+            row["inventoryMutated"] = event.inventoryMutated;
+            row["economyMutated"] = event.economyMutated;
+            row["persistenceMutated"] = event.persistenceMutated;
+            simulatedAcquisitionRows.push_back(row);
+        }
+
+        for (int i = 0;
+                i < simulatedAcquisitionRuntime->quantityByPlanet.size(); ++i) {
+            JSONSerializationType row = JSONSerializationType::object();
+            row["planet"] =
+                simulatedAcquisitionRuntime->quantityByPlanet.elementAt(i).getKey();
+            row["quantity"] =
+                simulatedAcquisitionRuntime->quantityByPlanet.get(i);
+            simulatedQuantityByPlanetRows.push_back(row);
+        }
+
+        for (int i = 0;
+                i < simulatedAcquisitionRuntime->quantityByResourceType.size(); ++i) {
+            JSONSerializationType row = JSONSerializationType::object();
+            row["resourceType"] =
+                simulatedAcquisitionRuntime->quantityByResourceType.elementAt(i).getKey();
+            row["quantity"] =
+                simulatedAcquisitionRuntime->quantityByResourceType.get(i);
+            simulatedQuantityByResourceTypeRows.push_back(row);
+        }
+
+        for (int i = 0;
+                i < simulatedAcquisitionRuntime->quantityByExactResource.size(); ++i) {
+            JSONSerializationType row = JSONSerializationType::object();
+            row["exactResource"] =
+                simulatedAcquisitionRuntime->quantityByExactResource.elementAt(i).getKey();
+            row["quantity"] =
+                simulatedAcquisitionRuntime->quantityByExactResource.get(i);
+            simulatedQuantityByExactResourceRows.push_back(row);
+        }
+    }
+
+    JSONSerializationType simulatedAcquisition = JSONSerializationType::object();
+    simulatedAcquisition["enabled"] =
+        simulatedAcquisitionTransactionsEnabled;
+    simulatedAcquisition["mode"] = "runtime-ledger";
+    simulatedAcquisition["simulationOnly"] = true;
+    simulatedAcquisition["readyMiners"] = acquisitionReadyMiners;
+    simulatedAcquisition["acquisitions"] = simulatedSuccessful;
+    simulatedAcquisition["resourcesAcquired"] =
+        simulatedResourcesAcquired;
+    simulatedAcquisition["uniqueResources"] =
+        simulatedUniqueResources;
+    simulatedAcquisition["averageQuantity"] =
+        simulatedSuccessful > 0 ?
+        Math::getPrecision(
+            static_cast<float>(simulatedResourcesAcquired) /
+                static_cast<float>(simulatedSuccessful),
+            2) : 0.f;
+    simulatedAcquisition["stationedSamplingEnabled"] =
+        stationedMinerRepeatedSamplingEnabled;
+    simulatedAcquisition["sampleIntervalSource"] =
+        String(getGameDerivedStationedSampleIntervalSource());
+    simulatedAcquisition["sampleIntervalSeconds"] =
+        getGameDerivedStationedSampleIntervalSeconds();
+    simulatedAcquisition["sampleResultDelaySeconds"] =
+        getGameDerivedStationedSampleResultDelayMs() / 1000;
+    simulatedAcquisition["stationedSampleTicks"] = stationSampleTotal;
+    simulatedAcquisition["simulatedAcquisitionTransactions"] =
+        simulatedSuccessful;
+    simulatedAcquisition["exactResourceTotals"] =
+        simulatedQuantityByExactResourceRows;
+    simulatedAcquisition["lastStationedSampleAgeSeconds"] =
+        hasStationedSampleAge ? lastStationedSampleAgeSeconds : 0;
+    simulatedAcquisition["ledgerRetainedRows"] = simulatedRetainedRows;
+    simulatedAcquisition["ledgerMaxRows"] = simulatedMaxRows;
+    simulatedAcquisition["acquisitionAttempts"] = simulatedAttempts;
+    simulatedAcquisition["successfulAcquisitions"] = simulatedSuccessful;
+    simulatedAcquisition["blockedAcquisitions"] = simulatedBlocked;
+    simulatedAcquisition["blockedReasons"] = simulatedBlockedReasonRows;
+    simulatedAcquisition["quantityByPlanet"] =
+        simulatedQuantityByPlanetRows;
+    simulatedAcquisition["quantityByResourceType"] =
+        simulatedQuantityByResourceTypeRows;
+    simulatedAcquisition["quantityByExactResource"] =
+        simulatedQuantityByExactResourceRows;
+    simulatedAcquisition["events"] = simulatedAcquisitionRows;
+    simulatedAcquisition["wouldCreateResourceContainer"] = true;
+    simulatedAcquisition["realResourceAcquisitionEnabled"] =
+        realResourceAcquisitionEnabled;
+    simulatedAcquisition["realResourceCreated"] = false;
+    simulatedAcquisition["resourceContainerCreated"] = false;
+    simulatedAcquisition["inventoryMutated"] = false;
+    simulatedAcquisition["economyMutated"] = false;
+    simulatedAcquisition["persistenceMutated"] = false;
+    result["simulatedAcquisition"] = simulatedAcquisition;
+
+    JSONSerializationType minerRecoveryRows = JSONSerializationType::array();
+    JSONSerializationType minerRecoveryStatusRows =
+        JSONSerializationType::array();
+    JSONSerializationType minerRecoveryRuntimeReasonRows =
+        JSONSerializationType::array();
+    VectorMap<String, int> minerRecoveryStatusCounts;
+    int minerRecoveryTracked = 0;
+    int minerRecoveryHealthy = 0;
+    int minerRecoveryNeedsAttention = 0;
+    int minerRecoveryActionsTakenSnapshot = 0;
+    int minerRecoveryActionsSkippedSnapshot = 0;
+
+    for (int i = 0; i < dashboardAssignmentSnapshots.size(); ++i) {
+        MinerRecoveryDiagnosticRow recoveryRow =
+            buildMinerRecoveryDiagnostic(
+                dashboardAssignmentSnapshots.get(i), nowMs);
+        minerRecoveryTracked++;
+
+        if (recoveryRow.healthy)
+            minerRecoveryHealthy++;
+
+        if (recoveryRow.needsAttention)
+            minerRecoveryNeedsAttention++;
+
+        addIntCounter(
+            minerRecoveryStatusCounts, recoveryRow.recoveryStatus);
+        minerRecoveryRows.push_back(
+            serializeMinerRecoveryDiagnostic(recoveryRow));
+    }
+
+    for (int i = 0; i < minerRecoveryStatusCounts.size(); ++i) {
+        JSONSerializationType row = JSONSerializationType::object();
+        row["status"] =
+            minerRecoveryStatusCounts.elementAt(i).getKey();
+        row["count"] = minerRecoveryStatusCounts.get(i);
+        minerRecoveryStatusRows.push_back(row);
+    }
+
+    {
+        Locker recoveryLocker(&minerRecoveryMutex);
+        minerRecoveryActionsTakenSnapshot = minerRecoveryActionsTaken;
+        minerRecoveryActionsSkippedSnapshot = minerRecoveryActionsSkipped;
+
+        for (int i = 0; i < minerRecoveryReasonCounts.size(); ++i) {
+            JSONSerializationType row = JSONSerializationType::object();
+            row["reason"] =
+                minerRecoveryReasonCounts.elementAt(i).getKey();
+            row["count"] = minerRecoveryReasonCounts.get(i);
+            minerRecoveryRuntimeReasonRows.push_back(row);
+        }
+    }
+
+    JSONSerializationType minerRecovery = JSONSerializationType::object();
+    minerRecovery["enabled"] = minerRecoveryEnabled;
+    minerRecovery["dryRun"] = minerRecoveryDryRun;
+    minerRecovery["trackedMiners"] = minerRecoveryTracked;
+    minerRecovery["healthy"] = minerRecoveryHealthy;
+    minerRecovery["needsAttention"] = minerRecoveryNeedsAttention;
+    minerRecovery["actionsTaken"] =
+        minerRecoveryActionsTakenSnapshot;
+    minerRecovery["actionsSkipped"] =
+        minerRecoveryActionsSkippedSnapshot;
+    minerRecovery["stuckCheckIntervalSeconds"] =
+        minerRecoveryStuckCheckIntervalSeconds;
+    minerRecovery["movingStuckSeconds"] =
+        minerRecoveryMovingStuckSeconds;
+    minerRecovery["stationedSamplingGraceSeconds"] =
+        minerRecoveryStationedSamplingGraceSeconds;
+    minerRecovery["farFromStationDistanceMeters"] =
+        minerRecoveryFarFromStationDistanceMeters;
+    minerRecovery["maxAutomaticRecoveriesPerInterval"] =
+        minerRecoveryMaxAutomaticRecoveriesPerInterval;
+    minerRecovery["maxRecoveriesPerMinerPerHour"] =
+        minerRecoveryMaxRecoveriesPerMinerPerHour;
+    minerRecovery["allowClearAssignment"] =
+        minerRecoveryAllowClearAssignment;
+    minerRecovery["allowNudgeToSafeNearbyPoint"] =
+        minerRecoveryAllowNudgeToSafeNearbyPoint;
+    minerRecovery["allowTeleportToStationTarget"] =
+        minerRecoveryAllowTeleportToStationTarget;
+    minerRecovery["allowRespawnReplacement"] =
+        minerRecoveryAllowRespawnReplacement;
+    minerRecovery["adminActionsEnabled"] =
+        minerRecoveryAdminActionsEnabled;
+    minerRecovery["implementedActionScope"] = "assignment_clear_only";
+    minerRecovery["statuses"] = minerRecoveryStatusRows;
+    minerRecovery["topReasons"] = minerRecoveryRuntimeReasonRows;
+    minerRecovery["rows"] = minerRecoveryRows;
+    minerRecovery["nudgeMutationEnabled"] = false;
+    minerRecovery["teleportMutationEnabled"] = false;
+    minerRecovery["respawnMutationEnabled"] = false;
+    minerRecovery["realResourceCreated"] = false;
+    minerRecovery["resourceContainerCreated"] = false;
+    minerRecovery["inventoryMutated"] = false;
+    minerRecovery["economyMutated"] = false;
+    minerRecovery["persistenceMutated"] = false;
+    result["minerRecovery"] = minerRecovery;
+
+    // P.4.4a real vehicle mechanics (spawn/mount/dismount/store) diagnostics.
+    JSONSerializationType vehicleMechanics = JSONSerializationType::object();
+    vehicleMechanics["enabled"] = vehicleMechanicsEnabled;
+    vehicleMechanics["selfTestEnabled"] = vehicleSelfTestEnabled;
+    vehicleMechanics["vehicleObjectTemplate"] = vehicleObjectTemplate;
+    vehicleMechanics["controlDeviceTemplate"] = vehicleControlDeviceTemplate;
+    vehicleMechanics["selfTestIntervalSeconds"] = vehicleSelfTestIntervalSeconds;
+    vehicleMechanics["selfTestHoldSeconds"] = vehicleSelfTestHoldSeconds;
+    vehicleMechanics["deploys"] = vehicleDeployCount;
+    vehicleMechanics["mounts"] = vehicleMountCount;
+    vehicleMechanics["dismounts"] = vehicleDismountCount;
+    vehicleMechanics["stores"] = vehicleStoreCount;
+    vehicleMechanics["failures"] = vehicleMechanicsFailureCount;
+    vehicleMechanics["mountedTravelEnabled"] = mountedTravelEnabled;
+    vehicleMechanics["mountedTravelMinLegMeters"] = mountedTravelMinLegMeters;
+    vehicleMechanics["mountedTravelLegs"] = mountedTravelLegCount;
+    {
+        Locker tracker(&vehicleMechanicsMutex);
+        vehicleMechanics["activeVehicles"] = activeMinerVehicleDevices.size();
+    }
+    vehicleMechanics["realObjectsSimulationOnly"] = true;
+    vehicleMechanics["inventoryMutated"] = false;
+    vehicleMechanics["economyMutated"] = false;
+    vehicleMechanics["persistenceMutated"] = false;
+    result["vehicleMechanics"] = vehicleMechanics;
+
+    // Client presentation: sim NPCs flagged with ObjectFlag::PLAYER so clients
+    // render them as player radar dots. Cosmetic only; flag applied at spawn.
+    JSONSerializationType simNpcPresentation = JSONSerializationType::object();
+    simNpcPresentation["showSimNpcsAsPlayerDots"] = simNpcPlayerDotEnabled;
+    simNpcPresentation["npcsFlaggedTotal"] = simNpcPlayerDotFlaggedCount;
+    result["simNpcPresentation"] = simNpcPresentation;
+
+    // P.4.5a station/shuttle travel diagnostics.
+    JSONSerializationType stationTravel = JSONSerializationType::object();
+    stationTravel["enabled"] = travelEnableStationTravel;
+    stationTravel["minSavingMeters"] = travelStationMinSavingMeters;
+    stationTravel["travels"] = stationTravelCount;
+    stationTravel["totalOverlandMetersSaved"] = stationTravelMetersSaved;
+    stationTravel["avgOverlandMetersSaved"] =
+        stationTravelCount > 0 ? stationTravelMetersSaved / stationTravelCount : 0;
+    stationTravel["samePlanetOnly"] = true;
+    stationTravel["mechanism"] = "switchZone_to_outdoor_arrival";
+    result["stationTravel"] = stationTravel;
+
+    // P.4.5b cross-planet dispatch (player-mimetic: run to starport -> board ->
+    // ride). byPlanet / last-* reflect the plan the dispatch task last computed.
+    JSONSerializationType planetDispatch = JSONSerializationType::object();
+    planetDispatch["enabled"] = travelEnablePlanetDispatch;
+    planetDispatch["dryRun"] = travelPlanetDispatchDryRun;
+    planetDispatch["mechanism"] =
+        "run_to_ticket_collector_then_switchZone_to_outdoor_arrival";
+    planetDispatch["dispatches"] = planetDispatchCount;
+    planetDispatch["boarded"] = travelBoardedCount;
+    planetDispatch["minDemandScore"] = travelPlanetDispatchMinDemandScore;
+    planetDispatch["minMinersPerHomePlanet"] =
+        travelPlanetDispatchMinMinersPerHomePlanet;
+    planetDispatch["maxMinersPerRemotePlanet"] =
+        travelPlanetDispatchMaxMinersPerRemotePlanet;
+
+    int travelsInProgress = 0;
+    for (int i = 0; i < controllers.size(); ++i) {
+        Reference<SimPlayerController*> ctrl = controllers.get(controllers.getKey(i));
+        SimMinerController* miner =
+            ctrl == nullptr ? nullptr :
+            dynamic_cast<SimMinerController*>(ctrl.get());
+        if (miner != nullptr && miner->isInterplanetaryTravelActive())
+            travelsInProgress++;
+    }
+    planetDispatch["inProgress"] = travelsInProgress;
+
+    {
+        Locker planLock(&planetDispatchMutex);
+        planetDispatch["totalMiners"] = planetDispatchTotalMiners;
+        planetDispatch["lastTargetZone"] =
+            planetDispatchLastTargetZone.isEmpty() ?
+                String("none") : planetDispatchLastTargetZone;
+        planetDispatch["lastDonorId"] =
+            String::valueOf(planetDispatchLastDonorId);
+        planetDispatch["lastDonorFromZone"] =
+            planetDispatchLastDonorFromZone.isEmpty() ?
+                String("none") : planetDispatchLastDonorFromZone;
+        planetDispatch["lastSkipReason"] =
+            planetDispatchLastSkipReason.isEmpty() ?
+                String("none") : planetDispatchLastSkipReason;
+        planetDispatch["lastBoardedFromZone"] =
+            planetDispatchLastBoardedFromZone.isEmpty() ?
+                String("none") : planetDispatchLastBoardedFromZone;
+        planetDispatch["lastBoardedToZone"] =
+            planetDispatchLastBoardedToZone.isEmpty() ?
+                String("none") : planetDispatchLastBoardedToZone;
+        planetDispatch["lastBoardedReason"] =
+            planetDispatchLastBoardedReason.isEmpty() ?
+                String("none") : planetDispatchLastBoardedReason;
+
+        JSONSerializationType byPlanet = JSONSerializationType::array();
+        for (int i = 0; i < planetDispatchPlanRows.size(); ++i) {
+            const PlanetDispatchPlanetRow& row = planetDispatchPlanRows.get(i);
+            JSONSerializationType planetJson = JSONSerializationType::object();
+            planetJson["zone"] = row.planet;
+            planetJson["current"] = row.current;
+            planetJson["desired"] = row.desired;
+            planetJson["demandWeight"] = row.demandWeight;
+            planetJson["home"] = row.home;
+            byPlanet.push_back(planetJson);
+        }
+        planetDispatch["byPlanet"] = byPlanet;
+    }
+    result["planetDispatch"] = planetDispatch;
+
     AiEconomyStockpileInspectionSnapshot stockpileSnapshot;
     String stockpileInspectionStatus;
     bool stockpileInspectionReady =
@@ -7360,7 +8979,68 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     stockpileInspection["lots"] = lotRows;
     stockpileInspection["lotRowsTruncated"] =
         stockpileSnapshot.loadedLots > stockpileSnapshot.lots.size();
+    stockpileInspection["spawnIdentifiedPersistEnabled"] =
+        aiEconomyPersistSpawnIdentifiedLots;
     result["stockpileInspection"] = stockpileInspection;
+
+    // P.5.2: hive reservation ledger (reserve/consume/release) + self-test.
+    int activeReservations = 0;
+    uint64 reservationReservedQuantity = 0;
+    uint64 reservationsGranted = 0;
+    uint64 reservationsConsumed = 0;
+    uint64 reservationsReleased = 0;
+    AiEconomyManager::instance()->getReservationStats(
+        activeReservations, reservationReservedQuantity,
+        reservationsGranted, reservationsConsumed, reservationsReleased);
+
+    JSONSerializationType hiveReservations = JSONSerializationType::object();
+    hiveReservations["apiReady"] = stockpileInspectionReady;
+    hiveReservations["activeReservations"] = activeReservations;
+    hiveReservations["reservedQuantity"] = reservationReservedQuantity;
+    hiveReservations["granted"] = reservationsGranted;
+    hiveReservations["consumed"] = reservationsConsumed;
+    hiveReservations["released"] = reservationsReleased;
+    hiveReservations["selfTestEnabled"] = hiveReservationSelfTestEnabled;
+    hiveReservations["selfTestIntervalSeconds"] =
+        hiveReservationSelfTestIntervalSeconds;
+    hiveReservations["selfTestReserveQuantity"] =
+        hiveReservationSelfTestReserveQuantity;
+    hiveReservations["mode"] = "simulation-only";
+    hiveReservations["economyMutated"] = false;
+    result["hiveReservations"] = hiveReservations;
+
+    // P.5.3: first crafter consumer telemetry. `consumed` on hiveReservations
+    // (above) climbs as this drives real draws; here we surface the consumer's
+    // own counters and per-profile simulated crafted output.
+    JSONSerializationType hiveCrafters = JSONSerializationType::object();
+    hiveCrafters["enabled"] = hiveCrafterConsumerEnabled;
+    hiveCrafters["intervalSeconds"] = hiveCrafterConsumerIntervalSeconds;
+    hiveCrafters["craftBatchQuantity"] = hiveCrafterConsumerBatchQuantity;
+    hiveCrafters["minOq"] = hiveCrafterConsumerMinOq;
+    hiveCrafters["mode"] = "simulation-only";
+    hiveCrafters["economyMutated"] = false;
+    {
+        Locker crafterLocker(&hiveCrafterConsumerMutex);
+        hiveCrafters["batchesCompleted"] = hiveCrafterBatchesCompleted;
+        hiveCrafters["unitsConsumed"] = hiveCrafterUnitsConsumed;
+        hiveCrafters["lastProfile"] = hiveCrafterLastProfile.isEmpty() ?
+            String("none") : hiveCrafterLastProfile;
+        hiveCrafters["lastReserveReason"] =
+            hiveCrafterLastReserveReason.isEmpty() ?
+                String("none") : hiveCrafterLastReserveReason;
+        hiveCrafters["fallbackUsed"] = hiveCrafterLastFallbackUsed;
+
+        JSONSerializationType producedByProfile = JSONSerializationType::array();
+        for (int i = 0; i < hiveCrafterProducedByProfile.size(); ++i) {
+            JSONSerializationType producedRow = JSONSerializationType::object();
+            producedRow["profile"] =
+                hiveCrafterProducedByProfile.elementAt(i).getKey();
+            producedRow["craftedUnits"] = hiveCrafterProducedByProfile.get(i);
+            producedByProfile.push_back(producedRow);
+        }
+        hiveCrafters["producedByProfile"] = producedByProfile;
+    }
+    result["hiveCrafters"] = hiveCrafters;
 
     JSONSerializationType supply = JSONSerializationType::object();
     supply["currentSessionConceptualTotals"] = sessionTotals;
@@ -7485,7 +9165,7 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
 
         if (activeSnapshotAvailable && demandResult.activeProfileAvailableForPhase) {
             for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
-                ResourceIntelligenceEntry entry = entries.get(entryIndex);
+                const ResourceIntelligenceEntry& entry = entries.get(entryIndex);
                 DemandProfileMatch match =
                     evaluateDemandProfileResource(entry, profile, 1.f, 100);
 
@@ -7608,7 +9288,7 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
             int bestScore = 0;
 
             for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
-                ResourceIntelligenceEntry entry = entries.get(entryIndex);
+                const ResourceIntelligenceEntry& entry = entries.get(entryIndex);
 
                 if (!broadScoreFamilyAllowsResource(entry, scoreFamily))
                     continue;
@@ -8412,6 +10092,9 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     int pathDiagnosticBadTerrainOrHeight = 0;
     int pathDiagnosticUnknownPathFailures = 0;
     int pathDiagnosticVerifiedPaths = 0;
+    int pathDiagnosticOverlandReachable = 0;
+    int pathDiagnosticOverlandUnsafeWater = 0;
+    int pathDiagnosticOverlandUnsafeBounds = 0;
     const int maxPathDiagnosticRows = 32;
     uint64 pathValidationFreshnessWindowMs =
         static_cast<uint64>(
@@ -8472,8 +10155,11 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
             coordinateMismatchDistance,
             validationStale);
 
+        // A directFallback that P.4.2 accepted as directOverland is no longer an
+        // "unverified" blocker, so exclude that tier from this count.
         bool directFallbackUnverified =
-            (snapshotAvailable && snapshot.directFallback) ||
+            (snapshotAvailable && snapshot.directFallback &&
+                snapshot.pathTrustStatus != "directOverland") ||
             (snapshotAvailable &&
                 (snapshot.rejectReason == "directFallbackUnverified" ||
                  snapshot.pathTrustStatus == "directFallbackUnverified")) ||
@@ -8519,6 +10205,15 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
             pathDiagnosticUnknownPathFailures++;
         if (explanationKey == "verified_path")
             pathDiagnosticVerifiedPaths++;
+
+        if (snapshotAvailable && snapshot.overlandEvaluated) {
+            if (snapshot.overlandReachable)
+                pathDiagnosticOverlandReachable++;
+            else if (snapshot.overlandRejectReason == "targetInWater")
+                pathDiagnosticOverlandUnsafeWater++;
+            else if (snapshot.overlandRejectReason == "outOfBounds")
+                pathDiagnosticOverlandUnsafeBounds++;
+        }
 
         pathDiagnosticRowsTotal++;
 
@@ -8654,6 +10349,14 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
             Math::getPrecision(snapshot.targetTerrainHeight, 1) : 0;
         row["zDelta"] =
             snapshotAvailable ? Math::getPrecision(snapshot.targetZDelta, 1) : 0;
+        row["overlandEvaluated"] =
+            snapshotAvailable && snapshot.overlandEvaluated;
+        row["overlandReachable"] =
+            snapshotAvailable && snapshot.overlandReachable;
+        row["overlandRejectReason"] =
+            snapshotAvailable ? snapshot.overlandRejectReason : String("none");
+        row["overlandWaterAtTarget"] =
+            snapshotAvailable && snapshot.overlandWaterAtTarget;
         row["coordinateMismatchDistance"] =
             Math::getPrecision(coordinateMismatchDistance, 2);
         row["validationAgeSeconds"] = validationAgeSeconds;
@@ -8718,6 +10421,14 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     pathValidationDiagnostics["unknownPathFailures"] =
         pathDiagnosticUnknownPathFailures;
     pathValidationDiagnostics["verifiedPaths"] = pathDiagnosticVerifiedPaths;
+    // P.4.1 overland reachability diagnostics (off-navmesh targets that a guarded
+    // straight-line leg could/couldn't reach). Diagnostics-only; gate unchanged.
+    pathValidationDiagnostics["overlandReachable"] =
+        pathDiagnosticOverlandReachable;
+    pathValidationDiagnostics["overlandUnsafeWater"] =
+        pathDiagnosticOverlandUnsafeWater;
+    pathValidationDiagnostics["overlandUnsafeBounds"] =
+        pathDiagnosticOverlandUnsafeBounds;
     pathValidationDiagnostics["rowCount"] = pathDiagnosticRowsTotal;
     pathValidationDiagnostics["maxRows"] = maxPathDiagnosticRows;
     pathValidationDiagnostics["rowsTruncated"] = pathDiagnosticRowsTruncated;
@@ -8892,7 +10603,7 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
                 topRemoteOpportunity["configuredSpawnZone"] =
                     hasConfiguredSpawnZone;
                 topRemoteOpportunity["travelRequired"] = true;
-                topRemoteOpportunity["travelSupported"] = false;
+                topRemoteOpportunity["travelSupported"] = travelEnablePlanetDispatch;
                 hasTopRemoteOpportunity = true;
             }
 
@@ -8925,12 +10636,14 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
                 plan["demandScore"] = demandResult.activeMatch.demandScore;
                 plan["configuredSpawnZone"] = hasConfiguredSpawnZone;
                 plan["travelRequired"] = true;
-                plan["travelSupported"] = false;
-                plan["travelImplemented"] = false;
-                plan["recommendedAction"] = "travel_when_supported";
-                plan["reason"] = hasConfiguredSpawnZone ?
-                    String("remote high-priority opportunity; no local miner coverage; travel not implemented") :
-                    String("remote high-priority opportunity outside configured miner spawn zones; travel not implemented");
+                plan["travelSupported"] = travelEnablePlanetDispatch;
+                plan["travelImplemented"] = true;
+                plan["recommendedAction"] = travelEnablePlanetDispatch ?
+                    String("dispatch_when_spare_miner") :
+                    String("enable_planet_dispatch");
+                plan["reason"] = travelEnablePlanetDispatch ?
+                    String("remote high-priority opportunity; P.4.5b planet dispatch active (run to starport -> board -> ride)") :
+                    String("remote high-priority opportunity; P.4.5b planet dispatch implemented but disabled (enablePlanetDispatch=false)");
                 plan["mode"] = "simulation-only";
                 plan["behaviorChanged"] = false;
                 travelPlanRows.push_back(plan);
@@ -8993,8 +10706,8 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     resourceRush["topRemoteOpportunityAvailable"] =
         hasTopRemoteOpportunity;
     resourceRush["topRemoteOpportunity"] = topRemoteOpportunity;
-    resourceRush["travelImplemented"] = false;
-    resourceRush["travelSupported"] = false;
+    resourceRush["travelImplemented"] = true;
+    resourceRush["travelSupported"] = travelEnablePlanetDispatch;
     result["resourceRush"] = resourceRush;
 
     JSONSerializationType travelSimulation = JSONSerializationType::object();
@@ -9003,8 +10716,8 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     travelSimulation["mode"] = "simulation-only";
     travelSimulation["status"] =
         aiTravelSimulationEnabled ? String("ready") : String("disabled");
-    travelSimulation["travelImplemented"] = false;
-    travelSimulation["travelSupported"] = false;
+    travelSimulation["travelImplemented"] = true;
+    travelSimulation["travelSupported"] = travelEnablePlanetDispatch;
     travelSimulation["behaviorChanged"] = false;
     travelSimulation["persistenceChanged"] = false;
     travelSimulation["realResourceCreated"] = false;
@@ -9518,7 +11231,7 @@ void SimPlayerManager::logResourceIntelligenceSummary() {
             String bestMatchedType;
 
             for (int i = 0; i < entries.size(); ++i) {
-                ResourceIntelligenceEntry entry = entries.get(i);
+                const ResourceIntelligenceEntry& entry = entries.get(i);
                 String matchedType = getBestMatchedResourceType(entry, profile);
 
                 if (matchedType.isEmpty())
@@ -9562,7 +11275,7 @@ void SimPlayerManager::logResourceIntelligenceSummary() {
                 if (resourceIntelligenceIndexUsed(usedIndexes, i))
                     continue;
 
-                ResourceIntelligenceEntry entry = entries.get(i);
+                const ResourceIntelligenceEntry& entry = entries.get(i);
 
                 if (!broadScoreFamilyAllowsResource(entry, scoreFamily))
                     continue;
@@ -9807,6 +11520,11 @@ void SimPlayerManager::applyMarketSupplyObservationConfig(LuaObject& marketSuppl
         "includePlayerInventory", marketSupplyObservationIncludePlayerInventory);
     marketSupplyObservationIncludePrivateContainers = marketSupplyConfig.getBooleanField(
         "includePrivateContainers", marketSupplyObservationIncludePrivateContainers);
+    marketSupplyObservationResolveResourceContainers = marketSupplyConfig.getBooleanField(
+        "resolveResourceContainers", marketSupplyObservationResolveResourceContainers);
+    marketSupplyObservationStartupDelaySeconds = clampMinerInt(
+        marketSupplyConfig.getIntField("startupDelaySeconds"),
+        marketSupplyObservationStartupDelaySeconds, 1, 3600);
     marketSupplyObservationMinQuantity = clampMinerInt(
         marketSupplyConfig.getIntField("minQuantity"),
         marketSupplyObservationMinQuantity, 1, 100000000);
@@ -9939,6 +11657,62 @@ void SimPlayerManager::observeMarketSupply() {
         collectMarketListingSnapshots(
             vendorLists, false, marketSupplyObservationMaxListingsScanned,
             listingsExamined, listingSnapshots);
+    }
+
+    if (!marketSupplyObservationResolveResourceContainers) {
+        {
+            Locker snapshotLocker(&marketSupplyObservationMutex);
+
+            marketSupplyObservationListingsScanned = listingsExamined;
+            marketSupplyObservationResourceListings = 0;
+            marketSupplyObservationTotalQuantity = 0;
+            marketSupplyProfileQuantities.removeAll();
+            marketSupplyProfileListings.removeAll();
+            marketSupplyProfileCheapestPricePerUnit.removeAll();
+            marketSupplyProfileMedianPricePerUnit.removeAll();
+            marketSupplyProfileConfidence.removeAll();
+            marketSupplyProfileTopResource.removeAll();
+            marketSupplyProfileTopType.removeAll();
+        }
+
+        info(String("MarketSupplyObservation enabled=true listingsScanned=") +
+             String::valueOf(listingsExamined) +
+             " resourceContainerResolution=false resourceContainersObserved=0" +
+             " matchedResourceListings=0 totalQuantity=0 mode=read-only", true);
+        return;
+    }
+
+    uint64 nowMs = System::getMiliTime();
+    uint64 elapsedSeconds = marketSupplyObservationStartedAtMs > 0 &&
+            nowMs >= marketSupplyObservationStartedAtMs ?
+        (nowMs - marketSupplyObservationStartedAtMs) / 1000 : 0;
+
+    if (marketSupplyObservationStartupDelaySeconds > 0 &&
+            elapsedSeconds < static_cast<uint64>(marketSupplyObservationStartupDelaySeconds)) {
+        {
+            Locker snapshotLocker(&marketSupplyObservationMutex);
+
+            marketSupplyObservationListingsScanned = listingsExamined;
+            marketSupplyObservationResourceListings = 0;
+            marketSupplyObservationTotalQuantity = 0;
+            marketSupplyProfileQuantities.removeAll();
+            marketSupplyProfileListings.removeAll();
+            marketSupplyProfileCheapestPricePerUnit.removeAll();
+            marketSupplyProfileMedianPricePerUnit.removeAll();
+            marketSupplyProfileConfidence.removeAll();
+            marketSupplyProfileTopResource.removeAll();
+            marketSupplyProfileTopType.removeAll();
+        }
+
+        info(String("MarketSupplyObservation enabled=true listingsScanned=") +
+             String::valueOf(listingsExamined) +
+             " resourceContainerResolution=delayed elapsedSeconds=" +
+             String::valueOf(elapsedSeconds) +
+             " startupDelaySeconds=" +
+             String::valueOf(marketSupplyObservationStartupDelaySeconds) +
+             " resourceContainersObserved=0 matchedResourceListings=0" +
+             " totalQuantity=0 mode=read-only", true);
+        return;
     }
 
     Vector<MarketSupplyRow> rows;
@@ -10423,6 +12197,10 @@ void SimPlayerManager::applyAiEconomyPersistenceConfig(
         persistenceConfig.getBooleanField(
             "persistConceptualMinerTotals",
             aiEconomyPersistConceptualMinerTotals);
+    aiEconomyPersistSpawnIdentifiedLots =
+        persistenceConfig.getBooleanField(
+            "persistSpawnIdentifiedLots",
+            aiEconomyPersistSpawnIdentifiedLots);
     aiEconomyPersistenceIntervalSeconds = clampMinerInt(
         persistenceConfig.getIntField("intervalSeconds"),
         aiEconomyPersistenceIntervalSeconds, 60, 3600);
@@ -10445,7 +12223,9 @@ void SimPlayerManager::applyPersistentStockpileDemandConfig(
 }
 
 void SimPlayerManager::scheduleAiEconomyPersistenceTask() {
-    if (!enabled || !aiEconomyPersistConceptualMinerTotals ||
+    if (!enabled ||
+            (!aiEconomyPersistConceptualMinerTotals &&
+                !aiEconomyPersistSpawnIdentifiedLots) ||
             aiEconomyPersistenceTaskScheduled)
         return;
 
@@ -10466,6 +12246,329 @@ void SimPlayerManager::scheduleAiEconomyPersistenceTask() {
     task->schedule(aiEconomyPersistenceIntervalSeconds * 1000);
 }
 
+void SimPlayerManager::flushSpawnIdentifiedLotsToHive() {
+    Vector<MinerSpawnYieldAccumulator> spawnAccumulators;
+    collectSpawnYieldAccumulators(spawnAccumulators);
+
+    Vector<AiEconomySpawnLotDeposit> deposits;
+    // Remember the sessionQuantity flushed per spawn so we can advance each
+    // accumulator's lastFlushedQuantity only after a successful hive write.
+    Vector<uint64> flushedSpawnIds;
+    Vector<uint64> flushedQuantities;
+
+    for (int i = 0; i < spawnAccumulators.size(); ++i) {
+        const MinerSpawnYieldAccumulator& acc = spawnAccumulators.get(i);
+
+        if (acc.resourceSpawnObjectId == 0 || acc.resourceType.isEmpty())
+            continue;
+
+        if (acc.sessionQuantity <= acc.lastFlushedQuantity)
+            continue;
+
+        uint64 delta = acc.sessionQuantity - acc.lastFlushedQuantity;
+
+        AiEconomySpawnLotDeposit deposit;
+        deposit.resourceSpawnObjectID = acc.resourceSpawnObjectId;
+        deposit.quantityDelta = delta;
+        deposit.resourceSpawnName = acc.resourceSpawnName;
+        deposit.resourceType = acc.resourceType;
+        deposit.resourceClassChain = acc.resourceClassChain;
+        deposit.sourcePlanet = acc.sourcePlanet;
+        deposit.sourceZone = acc.sourceZone;
+        deposit.matchedDemandProfiles = acc.matchedDemandProfiles;
+        deposit.acquisitionSource = "conceptual_miner";
+        deposit.resourceLifecycleState =
+            acc.active ? String("active") : String("inactive");
+        deposit.identityConfidence = "exact_type";
+        deposit.activeAtAcquisition = acc.active;
+        deposit.oq = acc.oq;
+        deposit.cd = acc.cd;
+        deposit.dr = acc.dr;
+        deposit.hr = acc.hr;
+        deposit.fl = acc.fl;
+        deposit.ma = acc.ma;
+        deposit.pe = acc.pe;
+        deposit.sr = acc.sr;
+        deposit.ut = acc.ut;
+        deposit.cr = acc.cr;
+        deposits.add(deposit);
+        flushedSpawnIds.add(acc.resourceSpawnObjectId);
+        flushedQuantities.add(acc.sessionQuantity);
+    }
+
+    if (deposits.size() == 0)
+        return;
+
+    int createdLots = 0;
+    int updatedLots = 0;
+    uint64 totalQuantity = 0;
+    String failureReason;
+    bool updated = AiEconomyManager::instance()->updateStockpileSpawnLots(
+        deposits, createdLots, updatedLots, totalQuantity, failureReason);
+
+    if (!updated) {
+        warning(String("AiEconomyPersistenceSpawnLots updated=false reason=\"") +
+            failureReason +
+            "\" mode=persisted-exact totalsImported=false persistentStockpileSupplyChanged=false");
+        aiEconomyPersistenceFailureLogged = true;
+        return;
+    }
+
+    aiEconomyPersistenceFailureLogged = false;
+
+    // Advance each accumulator's flushed watermark so the next flush only sends
+    // newly gathered units.
+    for (int i = 0; i < flushedSpawnIds.size(); ++i)
+        markSpawnYieldFlushed(flushedSpawnIds.get(i), flushedQuantities.get(i));
+
+    if (aiEconomyPersistenceLogSummary) {
+        info(String("AiEconomyPersistenceSpawnLots updated=true spawns=") +
+            String::valueOf(deposits.size()) +
+            " createdLots=" + String::valueOf(createdLots) +
+            " updatedLots=" + String::valueOf(updatedLots) +
+            " addedQuantity=" + String::valueOf(totalQuantity) +
+            " mode=persisted-exact totalsImported=true persistentStockpileSupplyChanged=false", true);
+    }
+}
+
+void SimPlayerManager::scheduleHiveReservationSelfTestTask() {
+    if (!enabled || !hiveReservationSelfTestEnabled ||
+            hiveReservationSelfTestTaskScheduled)
+        return;
+
+    hiveReservationSelfTestTaskScheduled = true;
+
+    Reference<HiveReservationSelfTestTask*> task =
+        new HiveReservationSelfTestTask();
+    task->schedule(hiveReservationSelfTestIntervalSeconds * 1000);
+}
+
+void SimPlayerManager::applyHiveReservationSelfTestConfig(
+        LuaObject& selfTestConfig) {
+    hiveReservationSelfTestEnabled = selfTestConfig.getBooleanField(
+        "enabled", hiveReservationSelfTestEnabled);
+    hiveReservationSelfTestIntervalSeconds = clampMinerInt(
+        selfTestConfig.getIntField("intervalSeconds"),
+        hiveReservationSelfTestIntervalSeconds, 30, 3600);
+    hiveReservationSelfTestReserveQuantity = clampMinerInt(
+        selfTestConfig.getIntField("reserveQuantity"),
+        hiveReservationSelfTestReserveQuantity, 1, 1000);
+}
+
+void SimPlayerManager::runHiveReservationSelfTestTask() {
+    hiveReservationSelfTestTaskScheduled = false;
+
+    if (!enabled || !hiveReservationSelfTestEnabled)
+        return;
+
+    // Non-destructive proof of the reservation ledger: reserve a small amount
+    // from any eligible exact lot, then release it (no consume, so gathered
+    // stock is untouched).
+    uint64 token = 0;
+    uint64 entryID = 0;
+    String failureReason;
+    bool reserved = AiEconomyManager::instance()->reserveFromStockpile(
+        String(""), 0,
+        static_cast<uint64>(hiveReservationSelfTestReserveQuantity),
+        token, entryID, failureReason);
+
+    if (!reserved) {
+        info(String("HiveReservationSelfTest reserved=false reason=") +
+            failureReason + " mode=non-destructive", true);
+        scheduleHiveReservationSelfTestTask();
+        return;
+    }
+
+    String releaseFailure;
+    bool released = AiEconomyManager::instance()->releaseReservation(
+        token, releaseFailure);
+
+    info(String("HiveReservationSelfTest reserved=true entryId=") +
+        String::valueOf(entryID) +
+        " quantity=" + String::valueOf(hiveReservationSelfTestReserveQuantity) +
+        " released=" + (released ? String("true") : String("false")) +
+        (released ? String("") : String(" releaseReason=") + releaseFailure) +
+        " mode=non-destructive", true);
+
+    scheduleHiveReservationSelfTestTask();
+}
+
+void SimPlayerManager::scheduleHiveCrafterConsumerTask() {
+    if (!enabled || !hiveCrafterConsumerEnabled ||
+            hiveCrafterConsumerTaskScheduled)
+        return;
+
+    hiveCrafterConsumerTaskScheduled = true;
+
+    Reference<HiveCrafterConsumerTask*> task = new HiveCrafterConsumerTask();
+    task->schedule(hiveCrafterConsumerIntervalSeconds * 1000);
+}
+
+void SimPlayerManager::applyHiveCrafterConsumerConfig(
+        LuaObject& crafterConfig) {
+    hiveCrafterConsumerEnabled = crafterConfig.getBooleanField(
+        "enabled", hiveCrafterConsumerEnabled);
+    hiveCrafterConsumerIntervalSeconds = clampMinerInt(
+        crafterConfig.getIntField("intervalSeconds"),
+        hiveCrafterConsumerIntervalSeconds, 30, 3600);
+    hiveCrafterConsumerBatchQuantity = clampMinerInt(
+        crafterConfig.getIntField("craftBatchQuantity"),
+        hiveCrafterConsumerBatchQuantity, 1, 100000);
+    hiveCrafterConsumerMinOq = clampMinerInt(
+        crafterConfig.getIntField("minOq"),
+        hiveCrafterConsumerMinOq, 0, 1000);
+    hiveCrafterConsumerPreferShortage = crafterConfig.getBooleanField(
+        "preferShortageProfiles", hiveCrafterConsumerPreferShortage);
+    hiveCrafterConsumerAllowAnyLotFallback = crafterConfig.getBooleanField(
+        "allowAnyLotFallback", hiveCrafterConsumerAllowAnyLotFallback);
+}
+
+void SimPlayerManager::runHiveCrafterConsumerTask() {
+    hiveCrafterConsumerTaskScheduled = false;
+
+    if (!enabled || !hiveCrafterConsumerEnabled)
+        return;
+
+    // P.5.3: the first REAL hive consumer. Pick the highest-pressure demand
+    // profile that has an active resource opportunity, then reserve+consume a
+    // batch of that resource type from the hive. Simulation-only: consume
+    // decrements the private hive ledger only (no ResourceContainer, market,
+    // or credit state is touched).
+    Vector<DemandStateSimulationResult> results;
+    bool activeSnapshotAvailable = false;
+    String snapshotError;
+    computeDemandStateResults(results, activeSnapshotAvailable, snapshotError);
+
+    if (results.size() == 0) {
+        info("HiveCrafterConsumer skipped=true reason=noDemandResults "
+            "mode=simulation-only", true);
+        scheduleHiveCrafterConsumerTask();
+        return;
+    }
+
+    // Highest pressureScore wins. When preferShortage is set, critical/low
+    // profiles are the first-pass candidates; if none qualify, fall back to any
+    // profile that has an opportunity so the consumer still makes progress.
+    int selectedIndex = -1;
+
+    for (int pass = 0; pass < 2 && selectedIndex < 0; ++pass) {
+        bool shortageOnly = hiveCrafterConsumerPreferShortage && pass == 0;
+
+        for (int i = 0; i < results.size(); ++i) {
+            const DemandStateSimulationResult& r = results.get(i);
+
+            if (!r.hasActiveOpportunity)
+                continue;
+
+            if (shortageOnly && r.state != "critical" && r.state != "low")
+                continue;
+
+            if (selectedIndex < 0 ||
+                    r.pressureScore > results.get(selectedIndex).pressureScore)
+                selectedIndex = i;
+        }
+
+        if (!hiveCrafterConsumerPreferShortage)
+            break;
+    }
+
+    if (selectedIndex < 0) {
+        info("HiveCrafterConsumer skipped=true reason=noProfileWithOpportunity "
+            "mode=simulation-only", true);
+        scheduleHiveCrafterConsumerTask();
+        return;
+    }
+
+    DemandStateSimulationResult selected = results.get(selectedIndex);
+    String profileKey = selected.profileKey;
+    String resourceType = selected.activeResource.type;
+    int minOq = hiveCrafterConsumerMinOq;
+    uint64 batch = static_cast<uint64>(hiveCrafterConsumerBatchQuantity);
+
+    uint64 token = 0;
+    uint64 entryID = 0;
+    String reserveReason;
+    bool fallbackUsed = false;
+
+    bool reserved = AiEconomyManager::instance()->reserveFromStockpile(
+        resourceType, minOq, batch, token, entryID, reserveReason);
+
+    if (!reserved && hiveCrafterConsumerAllowAnyLotFallback) {
+        // Demand's ideal type isn't stocked yet — draw from any eligible exact
+        // lot so the consume path is still exercised against real stock.
+        fallbackUsed = true;
+        reserved = AiEconomyManager::instance()->reserveFromStockpile(
+            String(""), 0, batch, token, entryID, reserveReason);
+    }
+
+    if (!reserved) {
+        {
+            Locker crafterLocker(&hiveCrafterConsumerMutex);
+            hiveCrafterLastProfile = profileKey;
+            hiveCrafterLastReserveReason = reserveReason;
+            hiveCrafterLastFallbackUsed = fallbackUsed;
+        }
+
+        info(String("HiveCrafterConsumer profile=") + profileKey +
+            " resourceType=" +
+                (resourceType.isEmpty() ? String("any") : resourceType) +
+            " reserved=false reason=" + reserveReason +
+            " fallback=" + (fallbackUsed ? String("true") : String("false")) +
+            " mode=simulation-only", true);
+        scheduleHiveCrafterConsumerTask();
+        return;
+    }
+
+    String consumeReason;
+    bool consumed = AiEconomyManager::instance()->consumeReservation(
+        token, consumeReason);
+
+    if (!consumed) {
+        // Never leak a reservation: roll it back if the consume failed.
+        String releaseReason;
+        AiEconomyManager::instance()->releaseReservation(token, releaseReason);
+
+        {
+            Locker crafterLocker(&hiveCrafterConsumerMutex);
+            hiveCrafterLastProfile = profileKey;
+            hiveCrafterLastReserveReason = consumeReason;
+            hiveCrafterLastFallbackUsed = fallbackUsed;
+        }
+
+        info(String("HiveCrafterConsumer profile=") + profileKey +
+            " reserved=true entryId=" + String::valueOf(entryID) +
+            " consumed=false reason=" + consumeReason +
+            " releasedReservation=true mode=simulation-only", true);
+        scheduleHiveCrafterConsumerTask();
+        return;
+    }
+
+    {
+        Locker crafterLocker(&hiveCrafterConsumerMutex);
+        hiveCrafterBatchesCompleted += 1;
+        hiveCrafterUnitsConsumed += batch;
+        hiveCrafterLastProfile = profileKey;
+        hiveCrafterLastReserveReason = "granted";
+        hiveCrafterLastFallbackUsed = fallbackUsed;
+
+        // First-cut recipe ratio: 1 crafted unit per unit consumed.
+        uint64 produced = batch;
+        if (hiveCrafterProducedByProfile.contains(profileKey))
+            produced += hiveCrafterProducedByProfile.get(profileKey);
+        hiveCrafterProducedByProfile.put(profileKey, produced);
+    }
+
+    info(String("HiveCrafterConsumer profile=") + profileKey +
+        " resourceType=" +
+            (resourceType.isEmpty() ? String("any") : resourceType) +
+        " reserved=true entryId=" + String::valueOf(entryID) +
+        " consumed=true units=" + String::valueOf(batch) +
+        " fallback=" + (fallbackUsed ? String("true") : String("false")) +
+        " mode=simulation-only", true);
+
+    scheduleHiveCrafterConsumerTask();
+}
+
 void SimPlayerManager::runAiEconomyPersistenceTask() {
     aiEconomyPersistenceTaskScheduled = false;
 
@@ -10474,7 +12577,8 @@ void SimPlayerManager::runAiEconomyPersistenceTask() {
 
     refreshAiEconomyPersistenceConfig();
 
-    if (!aiEconomyPersistConceptualMinerTotals)
+    if (!aiEconomyPersistConceptualMinerTotals &&
+            !aiEconomyPersistSpawnIdentifiedLots)
         return;
 
     if (!AiEconomyManager::instance()->isPersistenceReady()) {
@@ -10483,6 +12587,16 @@ void SimPlayerManager::runAiEconomyPersistenceTask() {
             aiEconomyPersistenceFailureLogged = true;
         }
 
+        return;
+    }
+
+    // P.5.1: flush exact resource-spawn-identity hive lots (crafting-grade),
+    // independent of the coarse conceptual rollup below.
+    if (aiEconomyPersistSpawnIdentifiedLots)
+        flushSpawnIdentifiedLotsToHive();
+
+    if (!aiEconomyPersistConceptualMinerTotals) {
+        scheduleAiEconomyPersistenceTask();
         return;
     }
 
@@ -10555,6 +12669,7 @@ void SimPlayerManager::refreshAiEconomyPersistenceConfig() {
         configLua.runFile("scripts/managers/sim_player_manager.lua");
     } catch (Exception& e) {
         aiEconomyPersistConceptualMinerTotals = false;
+        aiEconomyPersistSpawnIdentifiedLots = false;
         warning(String("AiEconomyPersistenceConceptualTotals configReloadFailed=true reason=\"") +
             e.getMessage() +
             "\" persistenceStopped=true mode=persisted-conceptual");
@@ -10566,6 +12681,7 @@ void SimPlayerManager::refreshAiEconomyPersistenceConfig() {
 
     if (!managerConfig.isValidTable()) {
         aiEconomyPersistConceptualMinerTotals = false;
+        aiEconomyPersistSpawnIdentifiedLots = false;
         warning("AiEconomyPersistenceConceptualTotals configReloadFailed=true reason=missingManagerConfig persistenceStopped=true mode=persisted-conceptual");
         managerConfig.pop();
         return;
@@ -10573,6 +12689,7 @@ void SimPlayerManager::refreshAiEconomyPersistenceConfig() {
 
     if (!managerConfig.getBooleanField("enabled", false)) {
         aiEconomyPersistConceptualMinerTotals = false;
+        aiEconomyPersistSpawnIdentifiedLots = false;
         managerConfig.pop();
         return;
     }
@@ -10582,6 +12699,7 @@ void SimPlayerManager::refreshAiEconomyPersistenceConfig() {
 
     if (!persistenceConfig.isValidTable()) {
         aiEconomyPersistConceptualMinerTotals = false;
+        aiEconomyPersistSpawnIdentifiedLots = false;
         warning("AiEconomyPersistenceConceptualTotals configReloadFailed=true reason=missingPersistenceConfig persistenceStopped=true mode=persisted-conceptual");
         persistenceConfig.pop();
         managerConfig.pop();
@@ -10812,18 +12930,6 @@ void SimPlayerManager::applyStationedMinerConfig(
         stationedConfig.getBooleanField(
             "enableStationedRepeatedSampling",
             stationedMinerRepeatedSamplingEnabled);
-    stationedMinerSampleIntervalSeconds = clampMinerInt(
-        stationedConfig.getIntField("stationedSampleIntervalSeconds"),
-        stationedMinerSampleIntervalSeconds, 30, 7200);
-    stationedMinerSampleJitterSeconds = clampMinerInt(
-        stationedConfig.getIntField("stationedSampleJitterSeconds"),
-        stationedMinerSampleJitterSeconds, 0, 3600);
-    stationedMinerMaxSamplesPerAssignment = clampMinerInt(
-        stationedConfig.getIntField("stationedMaxSamplesPerAssignment"),
-        stationedMinerMaxSamplesPerAssignment, 1, 1000);
-    stationedMinerMaxDurationSeconds = clampMinerInt(
-        stationedConfig.getIntField("stationedMaxDurationSeconds"),
-        stationedMinerMaxDurationSeconds, 60, 86400);
     stationedMinerRequireDemandStillValid =
         stationedConfig.getBooleanField(
             "stationedRequireDemandStillValid",
@@ -10840,6 +12946,1041 @@ void SimPlayerManager::applyStationedMinerConfig(
         stationedConfig.getBooleanField(
             "stationedClearWhenReserveSatisfied",
             stationedMinerClearWhenReserveSatisfied);
+}
+
+void SimPlayerManager::applyTravelConfig(
+        LuaObject& travelConfig) {
+    travelOverlandDiagnosticsEnabled =
+        travelConfig.getBooleanField(
+            "enableOverlandDiagnostics",
+            travelOverlandDiagnosticsEnabled);
+    travelWaterMarginMeters =
+        travelConfig.getFloatField(
+            "waterMarginMeters", travelWaterMarginMeters);
+    travelRejectWaterTargets =
+        travelConfig.getBooleanField(
+            "rejectWaterTargets", travelRejectWaterTargets);
+    travelEnableOverlandActivation =
+        travelConfig.getBooleanField(
+            "enableOverlandActivation", travelEnableOverlandActivation);
+    travelEnableStationTravel =
+        travelConfig.getBooleanField(
+            "enableStationTravel", travelEnableStationTravel);
+    travelStationMinSavingMeters = clampMinerInt(
+        travelConfig.getIntField("stationMinSavingMeters"),
+        travelStationMinSavingMeters, 0, 16000);
+
+    // P.4.5b cross-planet dispatch (default off + dryRun on -> ships inert).
+    travelEnablePlanetDispatch =
+        travelConfig.getBooleanField(
+            "enablePlanetDispatch", travelEnablePlanetDispatch);
+    travelPlanetDispatchDryRun =
+        travelConfig.getBooleanField(
+            "planetDispatchDryRun", travelPlanetDispatchDryRun);
+    travelPlanetDispatchIntervalSeconds = clampMinerInt(
+        travelConfig.getIntField("planetDispatchIntervalSeconds"),
+        travelPlanetDispatchIntervalSeconds, 10, 3600);
+    travelPlanetDispatchMinDemandScore = clampMinerInt(
+        travelConfig.getIntField("planetDispatchMinDemandScore"),
+        travelPlanetDispatchMinDemandScore, 0, 100000);
+    travelPlanetDispatchMinMinersPerHomePlanet = clampMinerInt(
+        travelConfig.getIntField("planetDispatchMinMinersPerHomePlanet"),
+        travelPlanetDispatchMinMinersPerHomePlanet, 0, 1000);
+    travelPlanetDispatchMaxMinersPerRemotePlanet = clampMinerInt(
+        travelConfig.getIntField("planetDispatchMaxMinersPerRemotePlanet"),
+        travelPlanetDispatchMaxMinersPerRemotePlanet, 1, 1000);
+    travelPlanetDispatchPerMinerCooldownSeconds = clampMinerInt(
+        travelConfig.getIntField("planetDispatchPerMinerCooldownSeconds"),
+        travelPlanetDispatchPerMinerCooldownSeconds, 0, 86400);
+    travelPlanetDispatchPerPlanetCooldownSeconds = clampMinerInt(
+        travelConfig.getIntField("planetDispatchPerPlanetCooldownSeconds"),
+        travelPlanetDispatchPerPlanetCooldownSeconds, 0, 86400);
+    travelPlanetDispatchBoardRadiusMeters =
+        travelConfig.getFloatField(
+            "planetDispatchBoardRadiusMeters",
+            travelPlanetDispatchBoardRadiusMeters);
+}
+
+bool SimPlayerManager::isActivationTrustAcceptable(
+        const String& trustStatus) const {
+    if (trustStatus == "verifiedPath")
+        return true;
+
+    // P.4.2: an overland-reachable off-navmesh target (directOverland) is an
+    // acceptable activation path only while overland activation is enabled.
+    if (travelEnableOverlandActivation && trustStatus == "directOverland")
+        return true;
+
+    return false;
+}
+
+// P.4.5a: model a shuttle/starport ride. If a travel point is meaningfully
+// closer to the target than the miner currently is (same planet), teleport the
+// miner to the station's OUTDOOR arrival point (no cell -> never traverses the
+// un-navmeshed starport interior). switchZone is a plain reposition (the same
+// call clone/eject/board-shuttle use); it cannot orphan the miner like the
+// RIDER container transfer did. Returns true if it teleported.
+bool SimPlayerManager::tryStationTravelForActivation(
+        uint64 minerID, const String& targetZone,
+        float targetX, float targetY, float targetZ) {
+    if (!enabled || !travelEnableStationTravel)
+        return false;
+
+    Reference<SimPlayerController*> ctrl;
+    if (controllers.contains(minerID))
+        ctrl = controllers.get(minerID);
+    ManagedReference<AiAgent*> agent = ctrl == nullptr ? nullptr : ctrl->getAgent();
+    if (agent == nullptr)
+        return false;
+
+    Vector3 minerPos;
+    ManagedReference<Zone*> zone;
+    {
+        Locker agentLocker(agent);
+        if (agent->isDead() || agent->isIncapacitated() || agent->isInCombat())
+            return false;
+        if (agent->isRidingMount() || agent->getParent().get() != nullptr)
+            return false;
+        zone = agent->getZone();
+        if (zone == nullptr)
+            return false;
+        minerPos = agent->getWorldPosition();
+    }
+
+    // Same-planet only for P.4.5a.
+    if (zone->getZoneName() != targetZone)
+        return false;
+
+    PlanetManager* planetManager = zone->getPlanetManager();
+    if (planetManager == nullptr)
+        return false;
+
+    Vector3 targetPos;
+    targetPos.setX(targetX);
+    targetPos.setY(targetY);
+    targetPos.setZ(targetZ);
+
+    Reference<PlanetTravelPoint*> station =
+        planetManager->getNearestPlanetTravelPoint(
+            targetPos, travelStationMaxRangeMeters, false);
+    if (station == nullptr)
+        return false;
+
+    float arrivalX = station->getArrivalPositionX();
+    float arrivalY = station->getArrivalPositionY();
+    float arrivalZ = station->getArrivalPositionZ();
+
+    Vector3 arrivalPos;
+    arrivalPos.setX(arrivalX);
+    arrivalPos.setY(arrivalY);
+    arrivalPos.setZ(arrivalZ);
+
+    float currentDist = minerPos.distanceTo(targetPos);
+    float arrivalDist = arrivalPos.distanceTo(targetPos);
+    float saving = currentDist - arrivalDist;
+
+    if (saving < static_cast<float>(travelStationMinSavingMeters))
+        return false;
+
+    // "Take the shuttle": teleport to the station's outdoor arrival point.
+    // switchZone params are (terrain, X, Z=height, Y=north, parentID=0).
+    {
+        Locker agentLocker(agent);
+        agent->switchZone(targetZone, arrivalX, arrivalZ, arrivalY, 0);
+    }
+
+    stationTravelCount++;
+    stationTravelMetersSaved += static_cast<int>(saving);
+
+    info(String("StationTravel miner=") + String::valueOf(minerID) +
+         " station=" + station->getPointName() +
+         " zone=" + targetZone +
+         " savedMeters=" + String::valueOf(static_cast<int>(saving)) +
+         " arrivalDistToTarget=" + String::valueOf(static_cast<int>(arrivalDist)),
+         true);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// P.4.5b: cross-planet miner dispatch (proportional rebalance, player-mimetic).
+// ---------------------------------------------------------------------------
+
+static bool planetVectorContains(const Vector<String>& v, const String& s) {
+    for (int i = 0; i < v.size(); ++i)
+        if (v.get(i) == s)
+            return true;
+    return false;
+}
+
+void SimPlayerManager::scheduleMinerPlanetDispatchTask() {
+    if (!enabled || minerPlanetDispatchTaskScheduled)
+        return;
+
+    minerPlanetDispatchTaskScheduled = true;
+
+    Reference<MinerPlanetDispatchTask*> task = new MinerPlanetDispatchTask();
+    task->schedule(travelPlanetDispatchIntervalSeconds * 1000);
+}
+
+void SimPlayerManager::runMinerPlanetDispatchTask() {
+    minerPlanetDispatchTaskScheduled = false;
+
+    if (!enabled)
+        return;
+
+    refreshMinerPlanetDispatchConfig();
+
+    // Always reschedule so a runtime toggle of enablePlanetDispatch takes effect
+    // without a restart; the decision routine no-ops while disabled.
+    if (travelEnablePlanetDispatch)
+        logMinerPlanetDispatchDecisions();
+
+    scheduleMinerPlanetDispatchTask();
+}
+
+void SimPlayerManager::refreshMinerPlanetDispatchConfig() {
+    Lua configLua;
+    configLua.init();
+
+    try {
+        configLua.runFile("scripts/managers/sim_player_manager.lua");
+    } catch (Exception& e) {
+        info(String("MinerPlanetDispatch configReloadFailed=true reason=\"") +
+             e.getMessage() + "\" retainingPreviousConfig=true mode=simulation-only", true);
+        return;
+    }
+
+    LuaObject managerConfig = configLua.getGlobalObject("SimPlayerManagerConfig");
+
+    if (!managerConfig.isValidTable()) {
+        managerConfig.pop();
+        return;
+    }
+
+    LuaObject travelConfig = managerConfig.getObjectField("travelConfig");
+    if (travelConfig.isValidTable())
+        applyTravelConfig(travelConfig);
+    travelConfig.pop();
+    managerConfig.pop();
+}
+
+void SimPlayerManager::logMinerPlanetDispatchDecisions() {
+    uint64 nowMs = System::getMiliTime();
+
+    // 1. Enumerate miners: per-planet counts + idle donor candidates.
+    VectorMap<String, int> planetMinerCount;
+    Vector<uint64> donorIds;
+    Vector<String> donorZones;
+    int totalMiners = 0;
+
+    int controllerCount = controllers.size();
+    for (int i = 0; i < controllerCount; ++i) {
+        uint64 key = controllers.getKey(i);
+        Reference<SimPlayerController*> ctrl = controllers.get(key);
+        SimMinerController* miner =
+            ctrl == nullptr ? nullptr :
+            dynamic_cast<SimMinerController*>(ctrl.get());
+
+        if (miner == nullptr)
+            continue;
+
+        ManagedReference<AiAgent*> agent = ctrl->getAgent();
+        if (agent == nullptr)
+            continue;
+
+        Zone* zone = agent->getZone();
+        if (zone == nullptr)
+            continue;
+
+        String zoneName = zone->getZoneName();
+        addIntCounter(planetMinerCount, zoneName);
+        totalMiners++;
+
+        if (miner->isAvailableForDispatch()) {
+            donorIds.add(key);
+            donorZones.add(zoneName);
+        }
+    }
+
+    // 2. Home (configured spawn) planets.
+    Vector<String> homePlanets;
+    for (int i = 0; i < allShuttleports.size(); ++i)
+        addUniqueLabel(homePlanets, allShuttleports.get(i).planet);
+
+    // 3. Per-planet demand weight of high-value resources (best demandScore per
+    //    resource, summed by planet). Single-planet resources only ("multi" is an
+    //    ambiguous dispatch destination).
+    VectorMap<String, int> planetDemandWeight;
+    {
+        Vector<ResourceIntelligenceEntry> entries;
+        String err;
+
+        if (collectResourceIntelligenceSnapshot(entries, err) && entries.size() > 0) {
+            Vector<DemandProfileDefinition> profiles = createDemandProfileDefinitions();
+            VectorMap<String, int> resourceBestScore;
+            VectorMap<String, String> resourcePlanet;
+
+            for (int p = 0; p < profiles.size(); ++p) {
+                DemandProfileDefinition profile = profiles.get(p);
+
+                if (!demandProfileActiveForPhase(
+                        profile, demandProfileSimulationServerPhase))
+                    continue;
+
+                for (int e = 0; e < entries.size(); ++e) {
+                    const ResourceIntelligenceEntry& entry = entries.get(e);
+                    DemandProfileMatch match =
+                        evaluateDemandProfileResource(entry, profile, 1.f, 100);
+
+                    if (!match.eligible ||
+                            match.demandScore < travelPlanetDispatchMinDemandScore)
+                        continue;
+
+                    int prev = resourceBestScore.contains(entry.name) ?
+                        resourceBestScore.get(entry.name) : -1;
+
+                    if (match.demandScore > prev) {
+                        resourceBestScore.put(entry.name, match.demandScore);
+                        resourcePlanet.put(entry.name, getResourceScoutPlanet(entry));
+                    }
+                }
+            }
+
+            for (int r = 0; r < resourceBestScore.size(); ++r) {
+                String resourceName = resourceBestScore.elementAt(r).getKey();
+                String planet = resourcePlanet.get(resourceName);
+
+                if (planet.isEmpty() || planet == "multi" || planet == "unknown")
+                    continue;
+
+                int add = resourceBestScore.elementAt(r).getValue();
+                int cur = planetDemandWeight.contains(planet) ?
+                    planetDemandWeight.get(planet) : 0;
+                planetDemandWeight.put(planet, cur + add);
+            }
+        }
+    }
+
+    // 4. Consideration set = home planets + demand planets + planets with miners.
+    Vector<String> considered;
+    for (int i = 0; i < homePlanets.size(); ++i)
+        addUniqueLabel(considered, homePlanets.get(i));
+    for (int i = 0; i < planetDemandWeight.size(); ++i)
+        addUniqueLabel(considered, planetDemandWeight.elementAt(i).getKey());
+    for (int i = 0; i < planetMinerCount.size(); ++i)
+        addUniqueLabel(considered, planetMinerCount.elementAt(i).getKey());
+
+    // 5. Proportional desired allocation: reserve a floor for each home planet,
+    //    then distribute the remaining pool across planets by demand weight
+    //    (remote planets clamped to the per-remote cap).
+    VectorMap<String, int> desired;
+    int reserved = 0;
+    for (int i = 0; i < homePlanets.size(); ++i) {
+        desired.put(homePlanets.get(i), travelPlanetDispatchMinMinersPerHomePlanet);
+        reserved += travelPlanetDispatchMinMinersPerHomePlanet;
+    }
+
+    int freePool = totalMiners - reserved;
+    if (freePool < 0)
+        freePool = 0;
+
+    double totalWeight = 0.0;
+    for (int i = 0; i < considered.size(); ++i) {
+        String planet = considered.get(i);
+        if (planetDemandWeight.contains(planet))
+            totalWeight += planetDemandWeight.get(planet);
+    }
+
+    if (totalWeight > 0.0 && freePool > 0) {
+        for (int i = 0; i < considered.size(); ++i) {
+            String planet = considered.get(i);
+            int weight = planetDemandWeight.contains(planet) ?
+                planetDemandWeight.get(planet) : 0;
+
+            if (weight <= 0)
+                continue;
+
+            int extra = (int) (((double) freePool * (double) weight / totalWeight) + 0.5);
+            int base = desired.contains(planet) ? desired.get(planet) : 0;
+            int value = base + extra;
+            bool home = planetVectorContains(homePlanets, planet);
+
+            if (!home && value > travelPlanetDispatchMaxMinersPerRemotePlanet)
+                value = travelPlanetDispatchMaxMinersPerRemotePlanet;
+
+            desired.put(planet, value);
+        }
+    }
+
+    // 6. Pick a destination: a REMOTE high-value planet that is under-served,
+    //    preferring zero-coverage / larger deficit / higher weight.
+    String targetZone;
+    long bestTargetScore = -1;
+    for (int i = 0; i < considered.size(); ++i) {
+        String planet = considered.get(i);
+
+        if (planetVectorContains(homePlanets, planet))
+            continue;
+
+        int weight = planetDemandWeight.contains(planet) ?
+            planetDemandWeight.get(planet) : 0;
+        if (weight <= 0)
+            continue;
+
+        int cur = planetMinerCount.contains(planet) ?
+            planetMinerCount.get(planet) : 0;
+        int des = desired.contains(planet) ? desired.get(planet) : 0;
+        if (cur >= des)
+            continue;
+
+        if (planetDispatchPlanetCooldownMs.contains(planet) &&
+                nowMs < planetDispatchPlanetCooldownMs.get(planet))
+            continue;
+
+        int deficit = des - cur;
+        long score = (long) deficit * 1000000L +
+            (cur == 0 ? 500000L : 0L) + (long) weight;
+
+        if (score > bestTargetScore) {
+            bestTargetScore = score;
+            targetZone = planet;
+        }
+    }
+
+    // 7. Pick a donor: an idle miner on an over-served planet that stays >= its
+    //    floor after leaving.
+    uint64 donorId = 0;
+    String donorFromZone;
+    int bestDonorSurplus = 0;
+    for (int i = 0; i < donorIds.size(); ++i) {
+        uint64 mid = donorIds.get(i);
+        String zoneName = donorZones.get(i);
+
+        if (targetZone.isEmpty() || zoneName == targetZone)
+            continue;
+
+        int cur = planetMinerCount.contains(zoneName) ?
+            planetMinerCount.get(zoneName) : 0;
+        int des = desired.contains(zoneName) ? desired.get(zoneName) : 0;
+        int surplus = cur - des;
+        if (surplus <= 0)
+            continue;
+
+        bool home = planetVectorContains(homePlanets, zoneName);
+        int floorZone = home ? travelPlanetDispatchMinMinersPerHomePlanet : 0;
+        if (cur - 1 < floorZone)
+            continue;
+
+        if (planetDispatchMinerCooldownMs.contains(mid) &&
+                nowMs < planetDispatchMinerCooldownMs.get(mid))
+            continue;
+
+        if (surplus > bestDonorSurplus) {
+            bestDonorSurplus = surplus;
+            donorId = mid;
+            donorFromZone = zoneName;
+        }
+    }
+
+    // 8. Execute (unless dryRun): run the player-mimetic trip.
+    String skipReason;
+
+    if (targetZone.isEmpty())
+        skipReason = "noUnderservedHighValuePlanet";
+    else if (donorId == 0)
+        skipReason = "noEligibleDonor";
+    else {
+        Reference<SimPlayerController*> donorCtrl =
+            controllers.contains(donorId) ? controllers.get(donorId) : nullptr;
+        SimMinerController* donorMiner =
+            donorCtrl == nullptr ? nullptr :
+            dynamic_cast<SimMinerController*>(donorCtrl.get());
+        ManagedReference<AiAgent*> donorAgent =
+            donorCtrl == nullptr ? nullptr : donorCtrl->getAgent();
+
+        if (donorMiner == nullptr || donorAgent == nullptr) {
+            skipReason = "donorUnavailable";
+        } else {
+            Vector3 donorPos;
+            ManagedReference<Zone*> donorZoneObj;
+            {
+                Locker donorLocker(donorAgent);
+                donorZoneObj = donorAgent->getZone();
+                if (donorZoneObj != nullptr)
+                    donorPos = donorAgent->getWorldPosition();
+            }
+
+            ZoneServer* zoneServer = ServerCore::getZoneServer();
+            PlanetManager* donorPM = donorZoneObj != nullptr ?
+                donorZoneObj->getPlanetManager() : nullptr;
+            Zone* destZoneObj = zoneServer != nullptr ?
+                zoneServer->getZone(targetZone) : nullptr;
+            PlanetManager* destPM = destZoneObj != nullptr ?
+                destZoneObj->getPlanetManager() : nullptr;
+
+            Reference<PlanetTravelPoint*> departure = donorPM != nullptr ?
+                donorPM->getNearestPlanetTravelPoint(donorPos, 16000.f, true) : nullptr;
+            Reference<PlanetTravelPoint*> arrival = destPM != nullptr ?
+                destPM->getNearestPlanetTravelPoint(Vector3(0, 0, 0), 16000.f, true) : nullptr;
+
+            if (departure == nullptr)
+                skipReason = "noDepartureStarport";
+            else if (arrival == nullptr)
+                skipReason = "noArrivalStarport";
+            else {
+                Vector3 departurePos(
+                    departure->getDeparturePositionX(),
+                    departure->getDeparturePositionY(),
+                    departure->getDeparturePositionZ());
+                Vector3 arrivalPos(
+                    arrival->getArrivalPositionX(),
+                    arrival->getArrivalPositionY(),
+                    arrival->getArrivalPositionZ());
+
+                if (travelPlanetDispatchDryRun) {
+                    skipReason = "dryRun";
+                    info(String("MinerPlanetDispatch dryRun=true would-dispatch miner=") +
+                         String::valueOf(donorId) +
+                         " fromZone=" + donorFromZone +
+                         " toZone=" + targetZone +
+                         " departureStarport=" + departure->getPointName() +
+                         " arrivalStarport=" + arrival->getPointName(), true);
+                } else {
+                    String travelResult;
+                    bool ok = donorMiner->beginInterplanetaryTravel(
+                        targetZone, departurePos, arrivalPos,
+                        arrival->getPointName(),
+                        travelPlanetDispatchBoardRadiusMeters, travelResult);
+
+                    if (ok) {
+                        planetDispatchCount++;
+                        planetDispatchMinerCooldownMs.put(donorId,
+                            nowMs + (uint64) travelPlanetDispatchPerMinerCooldownSeconds * 1000);
+                        planetDispatchPlanetCooldownMs.put(targetZone,
+                            nowMs + (uint64) travelPlanetDispatchPerPlanetCooldownSeconds * 1000);
+                        info(String("MinerPlanetDispatch dispatched miner=") +
+                             String::valueOf(donorId) +
+                             " fromZone=" + donorFromZone +
+                             " toZone=" + targetZone +
+                             " departureStarport=" + departure->getPointName() +
+                             " arrivalStarport=" + arrival->getPointName(), true);
+                    } else {
+                        skipReason = String("dispatchRejected:") + travelResult;
+                    }
+                }
+            }
+        }
+    }
+
+    // 9. Store the plan for the dashboard.
+    {
+        Locker planLock(&planetDispatchMutex);
+        planetDispatchPlanRows.removeAll();
+        for (int i = 0; i < considered.size(); ++i) {
+            PlanetDispatchPlanetRow row;
+            row.planet = considered.get(i);
+            row.current = planetMinerCount.contains(row.planet) ?
+                planetMinerCount.get(row.planet) : 0;
+            row.desired = desired.contains(row.planet) ?
+                desired.get(row.planet) : 0;
+            row.demandWeight = planetDemandWeight.contains(row.planet) ?
+                planetDemandWeight.get(row.planet) : 0;
+            row.home = planetVectorContains(homePlanets, row.planet);
+            planetDispatchPlanRows.add(row);
+        }
+        planetDispatchTotalMiners = totalMiners;
+        planetDispatchLastTargetZone = targetZone;
+        planetDispatchLastDonorId = donorId;
+        planetDispatchLastDonorFromZone = donorFromZone;
+        planetDispatchLastSkipReason = skipReason;
+    }
+}
+
+void SimPlayerManager::recordInterplanetaryTravelBoarded(
+        uint64 minerID, const String& fromZone, const String& toZone,
+        const String& starport, const String& reason) {
+    travelBoardedCount++;
+
+    Locker planLock(&planetDispatchMutex);
+    planetDispatchLastBoardedFromZone = fromZone;
+    planetDispatchLastBoardedToZone = toZone;
+    planetDispatchLastBoardedReason = reason;
+}
+
+void SimPlayerManager::applyVehicleConfig(LuaObject& vehicleConfig) {
+    vehicleMechanicsEnabled =
+        vehicleConfig.getBooleanField("enableVehicleMechanics", vehicleMechanicsEnabled);
+
+    String vehicleTemplate = vehicleConfig.getStringField("vehicleObjectTemplate");
+    if (!vehicleTemplate.isEmpty())
+        vehicleObjectTemplate = vehicleTemplate;
+
+    String controlTemplate = vehicleConfig.getStringField("controlDeviceTemplate");
+    if (!controlTemplate.isEmpty())
+        vehicleControlDeviceTemplate = controlTemplate;
+
+    vehicleSelfTestEnabled =
+        vehicleConfig.getBooleanField("selfTestEnabled", vehicleSelfTestEnabled);
+    vehicleSelfTestIntervalSeconds = clampMinerInt(
+        vehicleConfig.getIntField("selfTestIntervalSeconds"),
+        vehicleSelfTestIntervalSeconds, 30, 3600);
+    vehicleSelfTestHoldSeconds = clampMinerInt(
+        vehicleConfig.getIntField("selfTestHoldSeconds"),
+        vehicleSelfTestHoldSeconds, 2, 120);
+
+    mountedTravelEnabled =
+        vehicleConfig.getBooleanField("enableMountedTravel", mountedTravelEnabled);
+    mountedTravelMinLegMeters = clampMinerInt(
+        vehicleConfig.getIntField("mountedTravelMinLegMeters"),
+        mountedTravelMinLegMeters, 25, 5000);
+}
+
+// Client presentation only. ObjectFlag::PLAYER makes clients render the NPC
+// with player radar dots / player con-color rules; every server-side read of
+// the bit is isPlayerCreature()-gated, so AiAgent gameplay is unaffected. Set
+// at spawn: clients receive it via sendBaselinesTo -> sendPvpStatusTo on
+// discovery, so the null-closeobjects broadcast no-op on miners is harmless.
+void SimPlayerManager::applySimNpcPresentation(AiAgent* agent, uint32 baseBits) {
+    if (agent == nullptr)
+        return;
+
+    if (simNpcPlayerDotEnabled) {
+        baseBits |= ObjectFlag::PLAYER;
+        simNpcPlayerDotFlaggedCount++;
+    }
+
+    agent->setPvpStatusBitmask(baseBits);
+}
+
+// P.4.4a: create a real (transient) speeder + control device, deploy it at the
+// miner, and mount the miner exactly as the deed/spawnObject/MountCommand path
+// does for a player. Simulation-only object lifecycle; no economy mutation.
+// Locking mirrors the proven sequence: device, then (vehicle, agent) cross-locks.
+bool SimPlayerManager::deployAndMountMinerVehicle(uint64 minerID, String& resultOut) {
+    resultOut = "fail";
+
+    if (!enabled || !vehicleMechanicsEnabled) {
+        resultOut = "disabled";
+        return false;
+    }
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    if (zoneServer == nullptr) {
+        resultOut = "noZoneServer";
+        return false;
+    }
+
+    Reference<SimPlayerController*> ctrl;
+    if (controllers.contains(minerID))
+        ctrl = controllers.get(minerID);
+    ManagedReference<AiAgent*> agent = ctrl == nullptr ? nullptr : ctrl->getAgent();
+    if (agent == nullptr) {
+        resultOut = "noAgent";
+        return false;
+    }
+
+    {
+        Locker tracker(&vehicleMechanicsMutex);
+        if (activeMinerVehicleDevices.contains(minerID)) {
+            resultOut = "alreadyDeployed";
+            return false;
+        }
+    }
+
+    Vector3 minerWorld;
+    ManagedReference<Zone*> zone;
+    {
+        Locker agentLocker(agent);
+        if (agent->isDead() || agent->isIncapacitated() || agent->isInCombat()) {
+            resultOut = "agentStateUnsafe";
+            return false;
+        }
+        if (agent->isRidingMount() || agent->getParent().get() != nullptr) {
+            resultOut = "agentBusy";
+            return false;
+        }
+        zone = agent->getZone();
+        if (zone == nullptr || !zone->isGroundZone()) {
+            resultOut = "notGroundZone";
+            return false;
+        }
+        minerWorld = agent->getWorldPosition();
+    }
+
+    ManagedReference<SceneObject*> deviceScene =
+        zoneServer->createObject(vehicleControlDeviceTemplate.hashCode(), 0);
+    ManagedReference<VehicleControlDevice*> device =
+        deviceScene.castTo<VehicleControlDevice*>();
+    if (device == nullptr) {
+        if (deviceScene != nullptr) {
+            Locker dl(deviceScene);
+            deviceScene->destroyObjectFromWorld(true);
+        }
+        vehicleMechanicsFailureCount++;
+        resultOut = "deviceCreateFail";
+        return false;
+    }
+
+    ManagedReference<SceneObject*> vehicleScene =
+        zoneServer->createObject(vehicleObjectTemplate.hashCode(), 0);
+    ManagedReference<VehicleObject*> vehicle = vehicleScene.castTo<VehicleObject*>();
+    if (vehicle == nullptr) {
+        {
+            Locker dl(device);
+            device->destroyObjectFromWorld(true);
+        }
+        if (vehicleScene != nullptr) {
+            Locker vl(vehicleScene);
+            vehicleScene->destroyObjectFromWorld(true);
+        }
+        vehicleMechanicsFailureCount++;
+        resultOut = "vehicleCreateFail";
+        return false;
+    }
+
+    {
+        Locker deviceLocker(device);
+        Locker vehicleLocker(vehicle, device);
+        vehicle->createChildObjects();
+        device->setControlledObject(vehicle);
+    }
+
+    // Deploy into the world at the miner (spawnObject core).
+    // LOCKING CONTRACT: Locker(vehicle, agent) crosslocks require the agent to
+    // already be write-locked by this thread (MountCommand gets that from the
+    // command framework; here we must take it explicitly). Violating it makes
+    // the crosslock retry loop unlock an agent rwlock this thread does not
+    // hold — undefined behavior that wedged the whole server on 2026-07-02.
+    {
+        Locker agentLocker(agent);
+        Locker crossLocker(vehicle, agent);
+        vehicle->initializePosition(minerWorld.getX(), minerWorld.getZ(), minerWorld.getY());
+        vehicle->setCreatureLink(agent);
+        vehicle->setControlDevice(device);
+        // Client presentation: while ridden, the map/radar dot players see is
+        // the VEHICLE's, and a bare vehicle broadcasts pvpStatusBitmask=0 →
+        // white object dot. Mirror the rider's faction + status (including
+        // ObjectFlag::PLAYER when showSimNpcsAsPlayerDots is on) so the swoop
+        // reads as a traveling player dot (blue/purple/red), matching how a
+        // player-ridden speeder appears. Set before zone insert so discovery
+        // (sendBaselinesTo -> sendPvpStatusTo) carries it; the vehicle is
+        // transient and destroyed at dismount, so nothing needs restoring.
+        vehicle->setFaction(agent->getFaction());
+        vehicle->setPvpStatusBitmask(agent->getPvpStatusBitmask(), false);
+        zone->transferObject(vehicle, -1, true);
+    }
+    vehicleDeployCount++;
+
+    // Mount the miner (MountCommand core).
+    bool mounted = false;
+    {
+        Locker agentLocker(agent);
+        Locker crossLocker(vehicle, agent);
+        if (!agent->isInCombat() && agent->getParent().get() == nullptr &&
+                !agent->isRidingMount()) {
+            vehicle->setState(CreatureState::MOUNTEDCREATURE);
+            bool transferred =
+                vehicle->transferObject(agent, PlayerArrangement::RIDER, true);
+            if (transferred && agent->getParent().get() == vehicle) {
+                agent->synchronizeCloseObjects();
+                agent->setState(CreatureState::RIDINGMOUNT);
+                mounted = true;
+            } else {
+                // Mount failed. CRITICAL: ensure the miner is never left inside
+                // the vehicle (it would be destroyed with it) or orphaned out of
+                // the world by a partial transfer. Pull it back to the world.
+                if (agent->isRidingMount())
+                    agent->clearState(CreatureState::RIDINGMOUNT);
+                if (agent->getParent().get() == vehicle)
+                    zone->transferObject(agent, -1, false, false, false);
+                if (agent->getParent().get() == nullptr &&
+                        agent->getZone() == nullptr) {
+                    agent->initializePosition(
+                        minerWorld.getX(), minerWorld.getZ(), minerWorld.getY());
+                    zone->transferObject(agent, -1, true);
+                }
+                vehicle->clearState(CreatureState::MOUNTEDCREATURE);
+            }
+        }
+    }
+
+    if (!mounted) {
+        // The miner is guaranteed back in the world above; the vehicle has no
+        // rider, so destroying it (and only its own child objects) is safe.
+        Locker vl(vehicle);
+        if (vehicle->getZone() != nullptr)
+            vehicle->destroyObjectFromWorld(true);
+        vehicle->setCreatureLink(nullptr);
+        vehicleMechanicsFailureCount++;
+        resultOut = "mountFail";
+        return false;
+    }
+
+    vehicleMountCount++;
+
+    {
+        Locker tracker(&vehicleMechanicsMutex);
+        activeMinerVehicleDevices.put(minerID, device.castTo<SceneObject*>());
+    }
+
+    info("VehicleMechanics miner=" + String::valueOf(minerID) +
+         " action=deployedAndMounted vehicle=" + vehicleObjectTemplate, true);
+    resultOut = "mounted";
+    return true;
+}
+
+// P.4.4a: reverse of deploy+mount — dismount the miner (DismountCommand core)
+// and destroy the transient vehicle/device. Safe to call even if the miner
+// despawned (still cleans up the vehicle).
+bool SimPlayerManager::dismountAndStoreMinerVehicle(uint64 minerID, String& resultOut) {
+    resultOut = "fail";
+
+    ManagedReference<SceneObject*> deviceScene;
+    {
+        Locker tracker(&vehicleMechanicsMutex);
+        if (activeMinerVehicleDevices.contains(minerID))
+            deviceScene = activeMinerVehicleDevices.get(minerID);
+        activeMinerVehicleDevices.drop(minerID);
+    }
+
+    if (minerID == vehicleSelfTestActiveMinerID)
+        vehicleSelfTestActiveMinerID = 0;
+
+    if (deviceScene == nullptr) {
+        resultOut = "noVehicle";
+        return false;
+    }
+
+    ManagedReference<VehicleControlDevice*> device =
+        deviceScene.castTo<VehicleControlDevice*>();
+    ManagedReference<SceneObject*> vehicleScene =
+        device == nullptr ? nullptr : device->getControlledObject();
+    ManagedReference<VehicleObject*> vehicle =
+        vehicleScene == nullptr ? nullptr : vehicleScene.castTo<VehicleObject*>();
+
+    Reference<SimPlayerController*> ctrl;
+    if (controllers.contains(minerID))
+        ctrl = controllers.get(minerID);
+    ManagedReference<AiAgent*> agent = ctrl == nullptr ? nullptr : ctrl->getAgent();
+
+    if (agent != nullptr && vehicle != nullptr) {
+        // Same crosslock contract as deploy/mount: agent must be locked first.
+        Locker agentLocker(agent);
+        Locker crossLocker(vehicle, agent);
+        // Extract the rider whenever it is inside the vehicle (not only when the
+        // RIDINGMOUNT flag is set) so it can never be destroyed with the vehicle.
+        if (agent->getParent().get() == vehicle) {
+            if (agent->isRidingMount())
+                agent->clearState(CreatureState::RIDINGMOUNT);
+            ManagedReference<Zone*> zone = vehicle->getZone();
+            if (zone != nullptr)
+                zone->transferObject(agent, -1, false, false, false);
+            agent->synchronizeCloseObjects();
+            vehicleDismountCount++;
+        }
+        if (vehicle->hasState(CreatureState::MOUNTEDCREATURE))
+            vehicle->clearState(CreatureState::MOUNTEDCREATURE);
+    }
+
+    if (vehicle != nullptr) {
+        Locker vl(vehicle);
+        // Rider already extracted above; safe to destroy the vehicle + its own
+        // child objects only.
+        if (vehicle->getZone() != nullptr)
+            vehicle->destroyObjectFromWorld(true);
+        vehicle->setCreatureLink(nullptr);
+    }
+    vehicleStoreCount++;
+
+    info("VehicleMechanics miner=" + String::valueOf(minerID) +
+         " action=dismountedAndStored", true);
+    resultOut = "stored";
+    return true;
+}
+
+void SimPlayerManager::scheduleVehicleSelfTestTask() {
+    if (!enabled || !vehicleMechanicsEnabled || !vehicleSelfTestEnabled ||
+            vehicleSelfTestTaskScheduled)
+        return;
+
+    vehicleSelfTestTaskScheduled = true;
+
+    Reference<VehicleSelfTestTask*> task = new VehicleSelfTestTask();
+    task->schedule(vehicleSelfTestIntervalSeconds * 1000);
+}
+
+void SimPlayerManager::runVehicleSelfTestTask() {
+    vehicleSelfTestTaskScheduled = false;
+
+    if (!enabled || !vehicleMechanicsEnabled || !vehicleSelfTestEnabled) {
+        return;
+    }
+
+    // One self-test at a time. Pick a stationed, idle, outdoor miner with no
+    // vehicle, run deploy+mount, then schedule the dismount+store after the hold.
+    if (vehicleSelfTestActiveMinerID == 0) {
+        uint64 chosen = 0;
+        int controllerCount = controllers.size();
+
+        for (int i = 0; i < controllerCount && chosen == 0; ++i) {
+            uint64 key = controllers.getKey(i);
+
+            {
+                Locker tracker(&vehicleMechanicsMutex);
+                if (activeMinerVehicleDevices.contains(key))
+                    continue;
+            }
+
+            Reference<SimPlayerController*> ctrl = controllers.get(key);
+            ManagedReference<AiAgent*> agent = ctrl == nullptr ? nullptr : ctrl->getAgent();
+            if (agent == nullptr)
+                continue;
+
+            bool eligible = false;
+            {
+                Locker al(agent);
+                ManagedReference<Zone*> z = agent->getZone();
+                eligible = !agent->isDead() && !agent->isIncapacitated() &&
+                    !agent->isInCombat() && !agent->isRidingMount() &&
+                    agent->getParent().get() == nullptr &&
+                    z != nullptr && z->isGroundZone();
+            }
+
+            if (eligible)
+                chosen = key;
+        }
+
+        if (chosen != 0) {
+            String deployResult;
+            if (deployAndMountMinerVehicle(chosen, deployResult)) {
+                vehicleSelfTestActiveMinerID = chosen;
+                Reference<VehicleStoreTask*> storeTask = new VehicleStoreTask(chosen);
+                storeTask->schedule(vehicleSelfTestHoldSeconds * 1000);
+            }
+        }
+    }
+
+    scheduleVehicleSelfTestTask();
+}
+
+void SimPlayerManager::applyRealResourceAcquisitionConfig(
+        LuaObject& acquisitionConfig) {
+    realResourceAcquisitionEnabled =
+        acquisitionConfig.getBooleanField(
+            "enableRealResourceAcquisition",
+            realResourceAcquisitionEnabled);
+    acquisitionReadinessDiagnosticsEnabled =
+        acquisitionConfig.getBooleanField(
+            "acquisitionReadinessDiagnosticsEnabled",
+            acquisitionReadinessDiagnosticsEnabled);
+    acquisitionRequireStationedLifecycle =
+        acquisitionConfig.getBooleanField(
+            "requireStationedLifecycle",
+            acquisitionRequireStationedLifecycle);
+    acquisitionRequireVerifiedActivationPath =
+        acquisitionConfig.getBooleanField(
+            "requireVerifiedActivationPath",
+            acquisitionRequireVerifiedActivationPath);
+    acquisitionRequireKnownResourceSpawnIdentity =
+        acquisitionConfig.getBooleanField(
+            "requireKnownResourceSpawnIdentity",
+            acquisitionRequireKnownResourceSpawnIdentity);
+    acquisitionRequireDemandStillValid =
+        acquisitionConfig.getBooleanField(
+            "requireDemandStillValid",
+            acquisitionRequireDemandStillValid);
+    acquisitionRequireReserveBelowTarget =
+        acquisitionConfig.getBooleanField(
+            "requireReserveBelowTarget",
+            acquisitionRequireReserveBelowTarget);
+    acquisitionMaxAcquisitionsPerInterval = clampMinerInt(
+        acquisitionConfig.getIntField("maxAcquisitionsPerInterval"),
+        acquisitionMaxAcquisitionsPerInterval, 0, 100);
+    simulatedAcquisitionTransactionsEnabled =
+        acquisitionConfig.getBooleanField(
+            "enableSimulatedAcquisitionTransactions",
+            simulatedAcquisitionTransactionsEnabled);
+    simulatedAcquisitionLogTransactions =
+        acquisitionConfig.getBooleanField(
+            "simulatedAcquisitionLogTransactions",
+            simulatedAcquisitionLogTransactions);
+    simulatedAcquisitionMaxLedgerEvents = clampMinerInt(
+        acquisitionConfig.getIntField("simulatedAcquisitionMaxLedgerEvents"),
+        simulatedAcquisitionMaxLedgerEvents, 1, 1000);
+
+    if (!realResourceAcquisitionEnabled)
+        acquisitionMaxAcquisitionsPerInterval = 0;
+}
+
+void SimPlayerManager::applyMinerRecoveryConfig(
+        LuaObject& recoveryConfig) {
+    minerRecoveryEnabled =
+        recoveryConfig.getBooleanField("enabled", minerRecoveryEnabled);
+    minerRecoveryDryRun =
+        recoveryConfig.getBooleanField("dryRun", minerRecoveryDryRun);
+    minerRecoveryAllowClearAssignment =
+        recoveryConfig.getBooleanField(
+            "allowClearAssignment", minerRecoveryAllowClearAssignment);
+    minerRecoveryAllowNudgeToSafeNearbyPoint =
+        recoveryConfig.getBooleanField(
+            "allowNudgeToSafeNearbyPoint",
+            minerRecoveryAllowNudgeToSafeNearbyPoint);
+    minerRecoveryAllowTeleportToStationTarget =
+        recoveryConfig.getBooleanField(
+            "allowTeleportToStationTarget",
+            minerRecoveryAllowTeleportToStationTarget);
+    minerRecoveryAllowRespawnReplacement =
+        recoveryConfig.getBooleanField(
+            "allowRespawnReplacement",
+            minerRecoveryAllowRespawnReplacement);
+    minerRecoveryAdminActionsEnabled =
+        recoveryConfig.getBooleanField(
+            "adminActionsEnabled",
+            minerRecoveryAdminActionsEnabled);
+    minerRecoveryStuckCheckIntervalSeconds = clampMinerInt(
+        recoveryConfig.getIntField("stuckCheckIntervalSeconds"),
+        minerRecoveryStuckCheckIntervalSeconds, 15, 3600);
+    minerRecoveryMovingStuckSeconds = clampMinerInt(
+        recoveryConfig.getIntField("movingStuckSeconds"),
+        minerRecoveryMovingStuckSeconds, 30, 7200);
+    minerRecoveryStationedSamplingGraceSeconds = clampMinerInt(
+        recoveryConfig.getIntField("stationedSamplingGraceSeconds"),
+        minerRecoveryStationedSamplingGraceSeconds, 0, 3600);
+    minerRecoveryFarFromStationDistanceMeters = clampFloatRange(
+        recoveryConfig.getFloatField(
+            "farFromStationDistanceMeters",
+            minerRecoveryFarFromStationDistanceMeters),
+        1.f, 1000.f);
+    minerRecoveryMaxAutomaticRecoveriesPerInterval = clampMinerInt(
+        recoveryConfig.getIntField("maxAutomaticRecoveriesPerInterval"),
+        minerRecoveryMaxAutomaticRecoveriesPerInterval, 0, 100);
+    minerRecoveryMaxRecoveriesPerMinerPerHour = clampMinerInt(
+        recoveryConfig.getIntField("maxRecoveriesPerMinerPerHour"),
+        minerRecoveryMaxRecoveriesPerMinerPerHour, 0, 100);
+    minerRecoveryLogRecoveryDecisions =
+        recoveryConfig.getBooleanField(
+            "logRecoveryDecisions",
+            minerRecoveryLogRecoveryDecisions);
+}
+
+void SimPlayerManager::applyLegacyMinerLoopConfig(
+        LuaObject& legacyLoopConfig) {
+    legacyMinerConceptualLoopEnabled =
+        legacyLoopConfig.getBooleanField(
+            "enableLegacyConceptualLoop",
+            legacyMinerConceptualLoopEnabled);
+    legacyMinerAllowFallbackWhenNoIntelligentAssignment =
+        legacyLoopConfig.getBooleanField(
+            "allowLegacyFallbackWhenNoIntelligentAssignment",
+            legacyMinerAllowFallbackWhenNoIntelligentAssignment);
+    legacyMinerAllowFallbackAfterIntelligentFailure =
+        legacyLoopConfig.getBooleanField(
+            "allowLegacyFallbackAfterIntelligentFailure",
+            legacyMinerAllowFallbackAfterIntelligentFailure);
+    legacyMinerLogSuppression =
+        legacyLoopConfig.getBooleanField(
+            "logLegacySuppression",
+            legacyMinerLogSuppression);
 }
 
 void SimPlayerManager::applyMinerIntelligentTargetingConfig(
@@ -10865,6 +14006,14 @@ void SimPlayerManager::applyMinerIntelligentTargetingConfig(
         targetingConfig.getBooleanField(
             "requireValidPath",
             minerIntelligentTargetingRequireValidPath);
+    // P.4.5c final approach: how close (m) a miner must get to the true target
+    // before it stations. Long off-navmesh walks can terminate short; the miner
+    // re-paths to close the gap to within this radius. The pocket is a planet-
+    // wide spawn so stopping ~10-15 m short is fine; keep this < the recovery
+    // farFromStation threshold (32 m) so a completed approach is never flagged.
+    minerIntelligentArrivalRadiusMeters =
+        targetingConfig.getFloatField(
+            "arrivalRadiusMeters", minerIntelligentArrivalRadiusMeters);
     minerIntelligentTargetingFallbackToConceptualLoop =
         targetingConfig.getBooleanField(
             "fallbackToConceptualLoop",
@@ -11737,6 +14886,546 @@ void SimPlayerManager::logDemandWeightedMinerPlanSimulations() {
          " mode=simulation-only", true);
 }
 
+uint64 SimPlayerManager::getLastSimulatedAcquisitionAtMsForMiner(
+        uint64 minerID) {
+    if (simulatedAcquisitionRuntime == nullptr || minerID == 0)
+        return 0;
+
+    Locker locker(&simulatedAcquisitionRuntime->mutex);
+
+    for (int i = simulatedAcquisitionRuntime->events.size() - 1; i >= 0; --i) {
+        SimulatedAcquisitionEvent event =
+            simulatedAcquisitionRuntime->events.get(i);
+
+        if (event.minerID == minerID)
+            return event.timestampMs;
+    }
+
+    return 0;
+}
+
+MinerRecoveryDiagnosticRow SimPlayerManager::buildMinerRecoveryDiagnostic(
+        const MinerIntelligentTargetAssignment& assignment, uint64 nowMs) {
+    MinerRecoveryDiagnosticRow row;
+    row.minerID = assignment.minerID;
+    row.assignmentGenerationId = assignment.assignmentGenerationId;
+    row.activationSnapshotId = assignment.activationSnapshotId;
+    row.targetHash = assignment.targetHash;
+    row.resourceName = assignment.targetResourceName;
+    row.resourceType = assignment.targetResourceType;
+    row.demandProfile = assignment.selectedProfileKey;
+    row.lifecycleStatus = assignment.status.isEmpty() ?
+        String("unknown") : assignment.status;
+    row.targetZone = assignment.targetZoneName;
+    row.targetX = assignment.targetX;
+    row.targetY = assignment.targetY;
+    row.targetZ = assignment.targetZ;
+    row.stationSampleCount = assignment.stationSampleCount;
+    row.stationYieldQuantity = assignment.stationYieldQuantity;
+    row.adminActionsEnabled = minerRecoveryAdminActionsEnabled;
+    row.dryRun = minerRecoveryDryRun;
+    row.copyableTargetCoordinates =
+        assignment.targetZoneName + " " +
+        String::valueOf(Math::getPrecision(assignment.targetX, 1)) + " " +
+        String::valueOf(Math::getPrecision(assignment.targetY, 1)) + " " +
+        String::valueOf(Math::getPrecision(assignment.targetZ, 1));
+
+    if (assignment.createdAtMs > 0 && nowMs > assignment.createdAtMs)
+        row.assignmentAgeSeconds = (nowMs - assignment.createdAtMs) / 1000;
+
+    if (assignment.activatedAtMs > 0 && nowMs > assignment.activatedAtMs)
+        row.movementAgeSeconds = (nowMs - assignment.activatedAtMs) / 1000;
+    else if (assignment.queuedAtMs > 0 && nowMs > assignment.queuedAtMs)
+        row.movementAgeSeconds = (nowMs - assignment.queuedAtMs) / 1000;
+
+    uint64 lastSampleAtMs = assignment.lastStationSampleAtMs > 0 ?
+        assignment.lastStationSampleAtMs : assignment.sampleFinishedAtMs;
+
+    if (lastSampleAtMs > 0 && nowMs > lastSampleAtMs)
+        row.sampleAgeSeconds = (nowMs - lastSampleAtMs) / 1000;
+
+    if (assignment.stationedAtMs > 0 && nowMs > assignment.stationedAtMs)
+        row.stationDurationSeconds = (nowMs - assignment.stationedAtMs) / 1000;
+    else
+        row.stationDurationSeconds = assignment.stationDurationSeconds;
+
+    uint64 expectedBaseMs = assignment.lastStationSampleAtMs > 0 ?
+        assignment.lastStationSampleAtMs :
+        (assignment.stationedAtMs > 0 ?
+            assignment.stationedAtMs : assignment.sampleFinishedAtMs);
+    if (expectedBaseMs > 0) {
+        row.expectedNextSampleAtMs =
+            expectedBaseMs + getGameDerivedStationedSampleIntervalMs();
+        if (nowMs > row.expectedNextSampleAtMs)
+            row.expectedNextSampleAgeSeconds =
+                (nowMs - row.expectedNextSampleAtMs) / 1000;
+    }
+
+    uint64 lastAcquisitionAtMs =
+        getLastSimulatedAcquisitionAtMsForMiner(assignment.minerID);
+    if (lastAcquisitionAtMs > 0 && nowMs > lastAcquisitionAtMs)
+        row.acquisitionAgeSeconds = (nowMs - lastAcquisitionAtMs) / 1000;
+
+    String lastAction;
+    {
+        Locker recoveryLocker(&minerRecoveryMutex);
+        if (minerRecoveryLastActionByMiner.contains(assignment.minerID))
+            lastAction = minerRecoveryLastActionByMiner.get(assignment.minerID);
+    }
+    row.lastRecoveryAction = lastAction.isEmpty() ? String("none") : lastAction;
+
+    Reference<SimPlayerController*> ctrl = nullptr;
+    if (controllers.contains(assignment.minerID))
+        ctrl = controllers.get(assignment.minerID);
+
+    row.controllerFound = ctrl != nullptr;
+
+    if (ctrl != nullptr && dynamic_cast<SimMinerController*>(ctrl.get()) != nullptr) {
+        ManagedReference<AiAgent*> agent = ctrl->getAgent();
+        row.minerFound = agent != nullptr;
+
+        if (agent != nullptr) {
+            Locker agentLocker(agent);
+            Zone* zone = agent->getZone();
+            row.currentZone = zone != nullptr ?
+                zone->getZoneName() : String("unknown");
+            Vector3 position = agent->getWorldPosition();
+            row.currentX = position.getX();
+            row.currentY = position.getY();
+            row.currentZ = position.getZ();
+            row.positionKnown = zone != nullptr;
+            row.dead = agent->isDead();
+            row.incapacitated = agent->isIncapacitated();
+            row.inCombat = agent->isInCombat();
+        }
+    }
+
+    if (row.currentZone.isEmpty())
+        row.currentZone = "unknown";
+
+    row.copyableCurrentCoordinates =
+        row.currentZone + " " +
+        String::valueOf(Math::getPrecision(row.currentX, 1)) + " " +
+        String::valueOf(Math::getPrecision(row.currentY, 1)) + " " +
+        String::valueOf(Math::getPrecision(row.currentZ, 1));
+
+    if (row.positionKnown) {
+        float dx = row.currentX - row.targetX;
+        float dy = row.currentY - row.targetY;
+        float dz = row.currentZ - row.targetZ;
+        row.distanceToTarget = Math::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    uint64 timeoutAgeSeconds = 0;
+    uint64 timeoutSeconds = 0;
+    MinerIntelligentTargetAssignment timeoutAssignment = assignment;
+    String timeoutReason = getMinerIntelligentAssignmentTimeoutReason(
+        timeoutAssignment, nowMs, timeoutAgeSeconds, timeoutSeconds, false);
+
+    bool resourceIdentityInvalid =
+        assignment.targetResourceName.isEmpty() ||
+        assignment.targetResourceType.isEmpty() ||
+        assignment.targetZoneName.isEmpty() ||
+        assignment.targetHash.isEmpty();
+    bool zoneMismatch = row.positionKnown && !assignment.targetZoneName.isEmpty() &&
+        row.currentZone != assignment.targetZoneName;
+    bool stationed = assignment.status == "stationed";
+    bool moving = assignment.status == "queued" ||
+        assignment.status == "activation_started";
+    bool sampling = assignment.status == "sample_started";
+    bool awaitingValidation = assignment.status == "candidate" ||
+        assignment.status == "validated";
+    bool blockedPath =
+        assignment.pathValidationStatus == "failed" ||
+        assignment.currentPathValidationStatus == "failed" ||
+        assignment.activationPathValidationStatus == "failed";
+    bool stationedFar = stationed && row.positionKnown &&
+        row.distanceToTarget > minerRecoveryFarFromStationDistanceMeters;
+    bool samplingOverdue = stationed &&
+        stationedMinerRepeatedSamplingEnabled &&
+        row.expectedNextSampleAtMs > 0 &&
+        nowMs > row.expectedNextSampleAtMs +
+            static_cast<uint64>(minerRecoveryStationedSamplingGraceSeconds) * 1000;
+    bool movingStalled = moving &&
+        (row.movementAgeSeconds >=
+            static_cast<uint64>(minerRecoveryMovingStuckSeconds) ||
+         timeoutReason == "queuedActivationTimeout" ||
+         timeoutReason == "movementArrivalTimeout");
+
+    if (!row.controllerFound) {
+        row.recoveryStatus = "controllerMissing";
+        row.stuckReason = "controllerMissing";
+        row.recoveryRecommendation = "clearAssignment";
+    } else if (!row.minerFound) {
+        row.recoveryStatus = "minerMissing";
+        row.stuckReason = "minerMissing";
+        row.recoveryRecommendation = "clearAssignment";
+    } else if (row.dead || row.incapacitated) {
+        row.recoveryStatus = "deadOrIncapacitated";
+        row.stuckReason = "deadOrIncapacitated";
+        row.recoveryRecommendation = "clearAssignment";
+    } else if (row.inCombat) {
+        row.recoveryStatus = "inCombat";
+        row.stuckReason = "inCombat";
+        row.recoveryRecommendation = "clearAssignment";
+    } else if (resourceIdentityInvalid) {
+        row.recoveryStatus = "resourceInvalid";
+        row.stuckReason = "resourceInvalid";
+        row.recoveryRecommendation = "clearAssignment";
+    } else if (blockedPath && awaitingValidation) {
+        row.recoveryStatus = "blockedPath";
+        row.stuckReason = "pathValidationFailed";
+        row.recoveryRecommendation = "observe";
+    } else if (blockedPath) {
+        row.recoveryStatus = "blockedPath";
+        row.stuckReason = "pathValidationFailed";
+        row.recoveryRecommendation = "clearAssignment";
+    } else if (zoneMismatch) {
+        row.recoveryStatus = "zoneMismatch";
+        row.stuckReason = "zoneMismatch";
+        row.recoveryRecommendation = "clearAssignment";
+    } else if (stationedFar) {
+        row.recoveryStatus = "farFromStationTarget";
+        row.stuckReason = "stationedFarFromTarget";
+        row.recoveryRecommendation = "clearAssignment";
+    } else if (samplingOverdue) {
+        row.recoveryStatus = "stalledStationedSampling";
+        row.stuckReason = "stationedSamplingOverdue";
+        row.recoveryRecommendation = "clearAssignmentToReschedule";
+    } else if (movingStalled) {
+        row.recoveryStatus = "stalledMoving";
+        row.stuckReason =
+            timeoutReason.isEmpty() ? String("noMovementProgress") : timeoutReason;
+        row.recoveryRecommendation = "clearAssignment";
+    } else if (!timeoutReason.isEmpty()) {
+        row.recoveryStatus = "needsReassignment";
+        row.stuckReason = timeoutReason;
+        row.recoveryRecommendation = "clearAssignment";
+    } else if (awaitingValidation) {
+        row.recoveryStatus = "awaitingValidation";
+        row.stuckReason = "none";
+        row.recoveryRecommendation = "observe";
+    } else if (stationed) {
+        row.recoveryStatus = "healthyStationed";
+        row.stuckReason = "none";
+        row.recoveryRecommendation = "none";
+    } else if (moving || sampling) {
+        row.recoveryStatus = "healthyMoving";
+        row.stuckReason = "none";
+        row.recoveryRecommendation = "none";
+    } else if (assignment.status == "failed" ||
+            assignment.status == "sample_complete") {
+        row.recoveryStatus = "needsReassignment";
+        row.stuckReason = assignment.status;
+        row.recoveryRecommendation = "clearAssignment";
+    } else {
+        row.recoveryStatus = "unknown";
+        row.stuckReason = "unknown";
+        row.recoveryRecommendation = "observe";
+    }
+
+    row.healthy = row.recoveryStatus == "healthyStationed" ||
+        row.recoveryStatus == "healthyMoving" ||
+        row.recoveryStatus == "awaitingValidation";
+    row.needsAttention = !row.healthy &&
+        row.recoveryRecommendation != "observe" &&
+        row.recoveryRecommendation != "none";
+
+    return row;
+}
+
+JSONSerializationType SimPlayerManager::serializeMinerRecoveryDiagnostic(
+        const MinerRecoveryDiagnosticRow& row) {
+    JSONSerializationType result = JSONSerializationType::object();
+    result["minerId"] = row.minerID;
+    result["assignmentGenerationId"] = row.assignmentGenerationId;
+    result["activationSnapshotId"] = row.activationSnapshotId;
+    result["targetHash"] = row.targetHash;
+    result["resourceName"] = row.resourceName;
+    result["resourceType"] = row.resourceType;
+    result["demandProfile"] = row.demandProfile;
+    result["lifecycleStatus"] = row.lifecycleStatus;
+    result["status"] = row.recoveryStatus;
+    result["stuckReason"] = row.stuckReason;
+    result["recoveryRecommendation"] = row.recoveryRecommendation;
+    result["lastRecoveryAction"] = row.lastRecoveryAction;
+    result["currentZone"] = row.currentZone;
+    result["targetZone"] = row.targetZone;
+    result["currentX"] = Math::getPrecision(row.currentX, 1);
+    result["currentY"] = Math::getPrecision(row.currentY, 1);
+    result["currentZ"] = Math::getPrecision(row.currentZ, 1);
+    result["targetX"] = Math::getPrecision(row.targetX, 1);
+    result["targetY"] = Math::getPrecision(row.targetY, 1);
+    result["targetZ"] = Math::getPrecision(row.targetZ, 1);
+    result["distanceToTarget"] =
+        Math::getPrecision(row.distanceToTarget, 1);
+    result["assignmentAgeSeconds"] = row.assignmentAgeSeconds;
+    result["movementAgeSeconds"] = row.movementAgeSeconds;
+    result["sampleAgeSeconds"] = row.sampleAgeSeconds;
+    result["acquisitionAgeSeconds"] = row.acquisitionAgeSeconds;
+    result["expectedNextSampleAtMs"] = row.expectedNextSampleAtMs;
+    result["expectedNextSampleAgeSeconds"] =
+        row.expectedNextSampleAgeSeconds;
+    result["stationDurationSeconds"] = row.stationDurationSeconds;
+    result["stationSampleCount"] = row.stationSampleCount;
+    result["stationYieldQuantity"] = row.stationYieldQuantity;
+    result["controllerFound"] = row.controllerFound;
+    result["minerFound"] = row.minerFound;
+    result["positionKnown"] = row.positionKnown;
+    result["dead"] = row.dead;
+    result["incapacitated"] = row.incapacitated;
+    result["inCombat"] = row.inCombat;
+    result["healthy"] = row.healthy;
+    result["needsAttention"] = row.needsAttention;
+    result["adminActionsEnabled"] = row.adminActionsEnabled;
+    result["dryRun"] = row.dryRun;
+    result["copyableCurrentCoordinates"] =
+        row.copyableCurrentCoordinates;
+    result["copyableTargetCoordinates"] =
+        row.copyableTargetCoordinates;
+    return result;
+}
+
+void SimPlayerManager::applyMinerRecoveryDecision(
+        const MinerRecoveryDiagnosticRow& row, bool adminTriggered) {
+    if (!minerRecoveryEnabled || !row.needsAttention)
+        return;
+
+    String action = row.recoveryRecommendation;
+    String result = "skipped";
+    String skipReason;
+    bool shouldClearAssignment =
+        action == "clearAssignment" ||
+        action == "clearAssignmentToReschedule";
+
+    {
+        Locker locker(&minerRecoveryMutex);
+
+        if (!minerRecoveryReasonCounts.contains(row.recoveryStatus))
+            minerRecoveryReasonCounts.put(row.recoveryStatus, 0);
+        minerRecoveryReasonCounts.put(
+            row.recoveryStatus,
+            minerRecoveryReasonCounts.get(row.recoveryStatus) + 1);
+    }
+
+    if (minerRecoveryDryRun) {
+        skipReason = "dryRun";
+    } else if (!shouldClearAssignment) {
+        skipReason = "actionNotImplemented";
+    } else if (!minerRecoveryAllowClearAssignment) {
+        skipReason = "clearAssignmentDisabled";
+    } else if (minerRecoveryMaxAutomaticRecoveriesPerInterval == 0 &&
+            !adminTriggered) {
+        skipReason = "automaticRecoveryDisabled";
+    } else {
+        bool rateLimitOk = true;
+
+        {
+            Locker locker(&minerRecoveryMutex);
+            uint64 nowMs = System::getMiliTime();
+
+            if (minerRecoveryIntervalBucketStartMs == 0 ||
+                    nowMs > minerRecoveryIntervalBucketStartMs +
+                        static_cast<uint64>(minerRecoveryStuckCheckIntervalSeconds) * 1000) {
+                minerRecoveryIntervalBucketStartMs = nowMs;
+                minerRecoveryAutomaticRecoveriesThisInterval = 0;
+            }
+
+            if (minerRecoveryHourBucketStartMs == 0 ||
+                    nowMs > minerRecoveryHourBucketStartMs + 3600000) {
+                minerRecoveryHourBucketStartMs = nowMs;
+                minerRecoveryCountPerMinerThisHour.removeAll();
+            }
+
+            int minerRecoveriesThisHour =
+                minerRecoveryCountPerMinerThisHour.contains(row.minerID) ?
+                minerRecoveryCountPerMinerThisHour.get(row.minerID) : 0;
+
+            if (!adminTriggered &&
+                    minerRecoveryAutomaticRecoveriesThisInterval >=
+                        minerRecoveryMaxAutomaticRecoveriesPerInterval) {
+                rateLimitOk = false;
+                skipReason = "intervalLimitReached";
+            } else if (minerRecoveryMaxRecoveriesPerMinerPerHour > 0 &&
+                    minerRecoveriesThisHour >=
+                        minerRecoveryMaxRecoveriesPerMinerPerHour) {
+                rateLimitOk = false;
+                skipReason = "minerHourlyLimitReached";
+            } else {
+                if (!adminTriggered)
+                    minerRecoveryAutomaticRecoveriesThisInterval++;
+
+                minerRecoveryCountPerMinerThisHour.put(
+                    row.minerID, minerRecoveriesThisHour + 1);
+            }
+        }
+
+        if (rateLimitOk) {
+            clearMinerIntelligentTargetAssignment(
+                row.minerID,
+                "recovery:" + row.recoveryStatus,
+                adminTriggered ? String("minerRecoveryAdmin") :
+                    String("minerRecovery"));
+
+            // Clearing the manager assignment alone leaves a stationed
+            // controller stuck (it would reject new assignments as
+            // controllerBusy), so reset the controller out of stationed/active
+            // state. It then re-enters the work loop and the planner reassigns a
+            // fresh, reachable target.
+            Reference<SimPlayerController*> ctrl;
+
+            if (controllers.contains(row.minerID))
+                ctrl = controllers.get(row.minerID);
+
+            SimMinerController* minerController =
+                ctrl == nullptr ? nullptr :
+                dynamic_cast<SimMinerController*>(ctrl.get());
+
+            if (minerController != nullptr)
+                minerController->resetIntelligentAssignmentForRecovery();
+
+            result = "taken";
+        }
+    }
+
+    {
+        Locker locker(&minerRecoveryMutex);
+        String lastAction =
+            (result == "taken" ? String("clearedAssignment") :
+                String("skipped:") + skipReason) +
+            ":" + row.recoveryStatus;
+        minerRecoveryLastActionByMiner.put(row.minerID, lastAction);
+        minerRecoveryLastActionAtMsByMiner.put(
+            row.minerID, System::getMiliTime());
+
+        if (result == "taken")
+            minerRecoveryActionsTaken++;
+        else
+            minerRecoveryActionsSkipped++;
+    }
+
+    if (minerRecoveryLogRecoveryDecisions) {
+        String logPrefix = adminTriggered ?
+            String("MinerAdminRecoveryAction") :
+            String("MinerRecoveryDecision");
+        info(logPrefix +
+             " miner=" + String::valueOf(row.minerID) +
+             " status=" + row.recoveryStatus +
+             " stuckReason=" + row.stuckReason +
+             " recommendation=" + action +
+             " result=" + result +
+             (skipReason.isEmpty() ?
+                String("") : String(" skipReason=") + skipReason) +
+             " dryRun=" + String::valueOf(minerRecoveryDryRun) +
+             " current=\"" + row.copyableCurrentCoordinates + "\"" +
+             " target=\"" + row.copyableTargetCoordinates + "\"", true);
+    }
+
+    if (row.recoveryStatus == "farFromStationTarget") {
+        info("MinerSafeTeleportCandidate miner=" +
+             String::valueOf(row.minerID) +
+             " dryRun=" + String::valueOf(minerRecoveryDryRun) +
+             " teleportAllowed=" +
+                String::valueOf(minerRecoveryAllowTeleportToStationTarget) +
+             " current=\"" + row.copyableCurrentCoordinates + "\"" +
+             " target=\"" + row.copyableTargetCoordinates + "\"" +
+             " action=copy-coordinates-only", true);
+    }
+
+    if (result == "taken") {
+        info("MinerRecoveryActionTaken miner=" +
+             String::valueOf(row.minerID) +
+             " action=clearAssignment" +
+             " status=" + row.recoveryStatus +
+             " reason=" + row.stuckReason +
+             " mode=assignment-clear-only", true);
+        info("MinerAssignmentClearedByRecovery miner=" +
+             String::valueOf(row.minerID) +
+             " status=" + row.recoveryStatus +
+             " reason=" + row.stuckReason +
+             " mode=assignment-clear-only", true);
+    } else {
+        info("MinerRecoveryActionSkipped miner=" +
+             String::valueOf(row.minerID) +
+             " action=" + action +
+             " status=" + row.recoveryStatus +
+             " reason=" + row.stuckReason +
+             " dryRun=" + String::valueOf(minerRecoveryDryRun) +
+             " mode=diagnostics-only", true);
+    }
+}
+
+void SimPlayerManager::scheduleMinerRecoveryTask() {
+    if (!enabled || !minerRecoveryEnabled || minerRecoveryTaskScheduled)
+        return;
+
+    minerRecoveryTaskScheduled = true;
+
+    Reference<MinerRecoveryTask*> task = new MinerRecoveryTask();
+    task->schedule(minerRecoveryStuckCheckIntervalSeconds * 1000);
+}
+
+void SimPlayerManager::runMinerRecoveryTask() {
+    minerRecoveryTaskScheduled = false;
+
+    if (!enabled)
+        return;
+
+    if (!minerRecoveryEnabled)
+        return;
+
+    Vector<MinerIntelligentTargetAssignment> assignments;
+    {
+        Locker assignmentLocker(&minerIntelligentTargetingAssignmentMutex);
+        for (int i = 0; i < minerIntelligentTargetAssignments.size(); ++i)
+            assignments.add(minerIntelligentTargetAssignments.elementAt(i).getValue());
+    }
+
+    uint64 nowMs = System::getMiliTime();
+    int tracked = 0;
+    int needsAttention = 0;
+
+    for (int i = 0; i < assignments.size(); ++i) {
+        MinerRecoveryDiagnosticRow row =
+            buildMinerRecoveryDiagnostic(assignments.get(i), nowMs);
+        tracked++;
+
+        if (row.needsAttention) {
+            needsAttention++;
+
+            if (minerRecoveryLogRecoveryDecisions) {
+                info("MinerRecoveryStatus miner=" +
+                     String::valueOf(row.minerID) +
+                     " status=" + row.recoveryStatus +
+                     " stuckReason=" + row.stuckReason +
+                     " lifecycle=" + row.lifecycleStatus +
+                     " distance=" +
+                        String::valueOf(Math::getPrecision(
+                            row.distanceToTarget, 1)) +
+                     " recommendation=" + row.recoveryRecommendation +
+                     " dryRun=" + String::valueOf(minerRecoveryDryRun), true);
+            }
+
+            applyMinerRecoveryDecision(row, false);
+        }
+    }
+
+    if (minerRecoveryLogRecoveryDecisions && needsAttention > 0) {
+        info("MinerRecoverySummary trackedMiners=" +
+             String::valueOf(tracked) +
+             " needsAttention=" + String::valueOf(needsAttention) +
+             " dryRun=" + String::valueOf(minerRecoveryDryRun) +
+             " clearAssignmentAllowed=" +
+                String::valueOf(minerRecoveryAllowClearAssignment) +
+             " nudgeAllowed=" +
+                String::valueOf(minerRecoveryAllowNudgeToSafeNearbyPoint) +
+             " teleportAllowed=" +
+                String::valueOf(minerRecoveryAllowTeleportToStationTarget), true);
+    }
+
+    scheduleMinerRecoveryTask();
+}
+
 void SimPlayerManager::scheduleMinerIntelligentTargetingTask() {
     if (!enabled || !minerIntelligentTargetingEnabled ||
             (minerIntelligentTargetingMode != "shadow" &&
@@ -11809,6 +15498,30 @@ void SimPlayerManager::refreshMinerIntelligentTargetingConfig() {
         applyStationedMinerConfig(stationedConfig);
 
     stationedConfig.pop();
+
+    LuaObject acquisitionConfig =
+        managerConfig.getObjectField("realResourceAcquisitionConfig");
+
+    if (acquisitionConfig.isValidTable())
+        applyRealResourceAcquisitionConfig(acquisitionConfig);
+
+    acquisitionConfig.pop();
+
+    LuaObject recoveryConfig =
+        managerConfig.getObjectField("minerRecoveryConfig");
+
+    if (recoveryConfig.isValidTable())
+        applyMinerRecoveryConfig(recoveryConfig);
+
+    recoveryConfig.pop();
+
+    LuaObject legacyLoopConfig =
+        managerConfig.getObjectField("legacyMinerLoopConfig");
+
+    if (legacyLoopConfig.isValidTable())
+        applyLegacyMinerLoopConfig(legacyLoopConfig);
+
+    legacyLoopConfig.pop();
 
     LuaObject targetingConfig =
         managerConfig.getObjectField("minerIntelligentTargetingConfig");
@@ -12014,19 +15727,6 @@ String SimPlayerManager::getMinerIntelligentAssignmentTimeoutReason(
         ageSeconds = nowMs > baseMs ? (nowMs - baseMs) / 1000 : 0;
 
         return ageSeconds > timeoutSeconds ? String("sampleTimeout") : String("");
-    }
-
-    if (assignment.status == "stationed" &&
-            stationedMinerLifecycleEnabled &&
-            stationedMinerMaxDurationSeconds > 0) {
-        uint64 baseMs = assignment.stationedAtMs > 0 ?
-            assignment.stationedAtMs : assignment.createdAtMs;
-        timeoutSeconds =
-            static_cast<uint64>(stationedMinerMaxDurationSeconds);
-        ageSeconds = nowMs > baseMs ? (nowMs - baseMs) / 1000 : 0;
-
-        return ageSeconds > timeoutSeconds ?
-            String("maxStationDurationReached") : String("");
     }
 
     return "";
@@ -13454,6 +17154,23 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
                 assignment.targetY = selectedDensityTarget.y;
                 assignment.targetZ = selectedDensityTarget.z;
                 assignment.targetDensity = selectedDensityTarget.density;
+                // P.5.1: capture exact resource-spawn identity + stats so hive
+                // deposits record crafting-grade lots.
+                assignment.targetResourceSpawnObjectId = selectedResource.objectID;
+                assignment.targetResourceClassChain = selectedResource.classChain;
+                // inShift = the spawn is currently active in the resource map;
+                // despawned is a future timestamp, not a boolean.
+                assignment.targetResourceActive = selectedResource.inShift;
+                assignment.targetResourceOq = selectedResource.oq;
+                assignment.targetResourceCd = selectedResource.cd;
+                assignment.targetResourceDr = selectedResource.dr;
+                assignment.targetResourceHr = selectedResource.hr;
+                assignment.targetResourceFl = selectedResource.fl;
+                assignment.targetResourceMa = selectedResource.ma;
+                assignment.targetResourcePe = selectedResource.pe;
+                assignment.targetResourceSr = selectedResource.sr;
+                assignment.targetResourceUt = selectedResource.ut;
+                assignment.targetResourceCr = selectedResource.cr;
                 assignment.targetDirectDistance =
                     miner.position.distanceTo(
                         Vector3(
@@ -13651,7 +17368,7 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
 
             assignmentMatchesValidation =
                 pathValidationStatus == "valid" && pathValidationValid &&
-                pathTrustStatus == "verifiedPath";
+                isActivationTrustAcceptable(pathTrustStatus);
 
 			if (usedCachedAssignment &&
 					minerIntelligentTargetingAssignmentEnabled &&
@@ -13811,7 +17528,7 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
                     fallbackReason = "pathValidationRejected";
                 }
             } else if (minerIntelligentTargetingRequireValidPath &&
-                    pathTrustStatus != "verifiedPath") {
+                    !isActivationTrustAcceptable(pathTrustStatus)) {
                 wouldActivate = false;
                 fallbackReason = "pathValidationNotTrusted";
             }
@@ -13890,6 +17607,18 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
                 activationControlledSkip = true;
                 activationResult = "activationCooldown";
                 recordMinerIntelligentActivationHealthEvent("cooldownSkip");
+            } else if (assignmentAlreadyActive) {
+                // Already in the active pipeline (queued/moving/sampling/
+                // stationed). There is nothing to (re)activate, so treat it as a
+                // CONTROLLED skip. Without this, a stationed miner (status not in
+                // the validated/queued/... list) falls through to
+                // "assignmentNotValidated" below, which is a real fallback that
+                // trips disableOnFirstActivationFailure and starves every other
+                // validated miner for the whole interval.
+                activationAllowed = false;
+                activationControlledSkip = true;
+                activationResult = "alreadyActive";
+                recordMinerIntelligentActivationHealthEvent("alreadyActiveSkip");
             } else if (!usedCachedAssignment || !cachedAssignment.isValid()) {
                 activationAllowed = false;
                 activationResult = "missingValidatedAssignment";
@@ -13897,7 +17626,8 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
                     cachedAssignment.validatedTargetHash !=
                         cachedAssignment.targetHash ||
                     cachedAssignment.validatedPathValidationStatus != "valid" ||
-                    cachedAssignment.validatedPathTrustStatus != "verifiedPath") {
+                    !isActivationTrustAcceptable(
+                        cachedAssignment.validatedPathTrustStatus)) {
                 activationAllowed = false;
                 activationResult = "activationValidationUnavailable";
             } else if ((assignmentStatus != "validated" &&
@@ -13911,7 +17641,8 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
                     !cachedAssignment.pathValidationMatched) {
                 activationAllowed = false;
                 activationResult = "pathValidationNotMatched";
-            } else if (cachedAssignment.pathValidationTrustStatus != "verifiedPath") {
+            } else if (!isActivationTrustAcceptable(
+                    cachedAssignment.pathValidationTrustStatus)) {
                 activationAllowed = false;
                 activationResult = "pathValidationNotTrusted";
             } else if (minerIntelligentTargetingLimitedRequireSamePlanet &&
@@ -13957,6 +17688,18 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
 	                        cachedAssignment.validatedPathDistance > 0.f ?
 	                            cachedAssignment.validatedPathDistance :
 	                            cachedAssignment.latestPathDistance;
+
+	                    // P.4.5a: model a shuttle ride to a station near the
+	                    // target before activating, so the controller then only
+	                    // walks the short last leg. Safe reposition; no-op unless
+	                    // enabled and a station meaningfully shortens the trip.
+	                    tryStationTravelForActivation(
+	                        miner.objectID,
+	                        cachedAssignment.targetZoneName,
+	                        cachedAssignment.targetX,
+	                        cachedAssignment.targetY,
+	                        cachedAssignment.targetZ);
+
 	                    actualActivation =
 	                        minerController->requestIntelligentTargetAssignment(
                             cachedAssignment.selectedProfileKey,
@@ -13974,6 +17717,13 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
                             minerIntelligentTargetingLimitedLogActivationLifecycle,
                             controllerResult);
                     activationResult = controllerResult;
+
+                    // A controller momentarily busy with its own work is a
+                    // transient, benign condition (not a real activation failure),
+                    // so don't let it trip disableOnFirstActivationFailure and
+                    // starve the rest of the interval.
+                    if (!actualActivation && controllerResult == "controllerBusy")
+                        activationControlledSkip = true;
 
                     if (actualActivation) {
                         if (controllerResult != "alreadyActive") {
@@ -13999,6 +17749,8 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
                         cachedAssignment.updatedAtMs = nowMs;
                         cachedAssignment.lastActivationResult = activationResult;
                         putMinerIntelligentTargetAssignment(cachedAssignment);
+                        if (controllerResult == "queued")
+                            minerController->startSimLoop();
                         assignmentStatus = cachedAssignment.status;
                     }
                 }
@@ -14097,7 +17849,7 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
 			hasSelectedPlan &&
 			minerIntelligentTargetingRequireValidPath &&
 			pathValidationStatus == "valid" &&
-			pathTrustStatus != "verifiedPath";
+			!isActivationTrustAcceptable(pathTrustStatus);
 
 		if (pathTrustRejected)
 			pathTrustRejectedCount++;
@@ -14462,14 +18214,19 @@ void SimPlayerManager::refreshDemandStateSimulationConfig() {
     managerConfig.pop();
 }
 
-void SimPlayerManager::logDemandStateSimulations() {
+void SimPlayerManager::computeDemandStateResults(
+        Vector<DemandStateSimulationResult>& results,
+        bool& activeSnapshotAvailable, String& snapshotError) {
+    results.removeAll();
+    activeSnapshotAvailable = false;
+    snapshotError = "";
+
     Vector<String> conceptualResourceNames;
     Vector<uint64> conceptualAmounts;
     collectConceptualMinerTotals(conceptualResourceNames, conceptualAmounts);
 
     Vector<ResourceIntelligenceEntry> entries;
-    String snapshotError;
-    bool activeSnapshotAvailable = collectResourceIntelligenceSnapshot(entries, snapshotError);
+    activeSnapshotAvailable = collectResourceIntelligenceSnapshot(entries, snapshotError);
 
     if (!activeSnapshotAvailable) {
         info(String("DemandStateSimulation activeSnapshotAvailable=false reason=\"") +
@@ -14580,8 +18337,6 @@ void SimPlayerManager::logDemandStateSimulations() {
                 " mode=read-only", true);
         }
     }
-
-    Vector<DemandStateSimulationResult> results;
 
     for (int profileIndex = 0; profileIndex < profiles.size(); ++profileIndex) {
         DemandProfileDefinition profile = profiles.get(profileIndex);
@@ -14702,6 +18457,15 @@ void SimPlayerManager::logDemandStateSimulations() {
 
         results.add(result);
     }
+}
+
+void SimPlayerManager::logDemandStateSimulations() {
+    Vector<DemandStateSimulationResult> results;
+    bool activeSnapshotAvailable = false;
+    String snapshotError;
+    computeDemandStateResults(results, activeSnapshotAvailable, snapshotError);
+
+    Vector<DemandProfileDefinition> profiles = createDemandProfileDefinitions();
 
     if (results.size() == 0) {
         info("DemandStateSimulation skipped=true reason=noEnabledProfiles mode=log-only", true);
@@ -16241,13 +20005,13 @@ void SimPlayerManager::spawnSimPlayerWithRoute(const String& planet,
     if (groupType.beginsWith("pvp")) {
         bool imperial = inferImperialFromTemplateName(templateName);
 
-        agent->setPvpStatusBitmask(ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
+        applySimNpcPresentation(agent, ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
 
         SimPvPController* pvp = new SimPvPController(agent, imperial, spawnPos, hangoutPos);
         pvp->setCycleContext(this, templateName, groupType, planet, locationName);
         ctrl = pvp;
     } else {
-        agent->setPvpStatusBitmask(0);
+        applySimNpcPresentation(agent, 0);
         ctrl = new SimMinerController(agent);
     }
 #ifdef DEBUG_SIMPLAYER
@@ -16296,6 +20060,67 @@ void SimPlayerManager::spawnConfiguredGroups() {
             spawnFromConfig(g, loc, tmpl);
         }
     }
+}
+
+void SimPlayerManager::scheduleConfiguredSpawnTask(int groupIndex, int spawnIndex, int delayMs) {
+    if (!enabled || configuredSpawnTaskScheduled)
+        return;
+
+    if (spawnGroups.size() == 0 || allShuttleports.size() == 0)
+        return;
+
+    configuredSpawnTaskScheduled = true;
+
+    Reference<SimPlayerConfiguredSpawnTask*> task =
+        new SimPlayerConfiguredSpawnTask(groupIndex, spawnIndex);
+    task->schedule(delayMs);
+}
+
+void SimPlayerManager::runConfiguredSpawnTask(int groupIndex, int spawnIndex) {
+    configuredSpawnTaskScheduled = false;
+
+    if (!enabled)
+        return;
+
+    if (spawnGroups.size() == 0 || allShuttleports.size() == 0) {
+#ifdef DEBUG_SIMPLAYER
+        info("SimPlayerManager has no config to spawn from (spawnGroups/shuttleports empty).");
+#endif
+        return;
+    }
+
+    int gi = groupIndex;
+    int ci = spawnIndex;
+    int spawned = 0;
+
+    while (gi < spawnGroups.size() && spawned < configuredSpawnBatchSize) {
+        const SpawnGroup& g = spawnGroups.get(gi);
+
+        if (ci >= g.totalCount) {
+            gi++;
+            ci = 0;
+            continue;
+        }
+
+        ShuttleportLocation loc;
+        if (!pickRandomShuttleport(loc))
+            return;
+
+        String tmpl = pickRandomTemplate(g);
+        spawnFromConfig(g, loc, tmpl);
+
+        ci++;
+        spawned++;
+    }
+
+    if (gi < spawnGroups.size()) {
+        scheduleConfiguredSpawnTask(gi, ci, configuredSpawnBatchDelayMs);
+        return;
+    }
+
+#ifdef DEBUG_SIMPLAYER
+    info("SimPlayerManager configured spawns complete.");
+#endif
 }
 
 bool SimPlayerManager::pickRandomShuttleport(ShuttleportLocation& out) const {
@@ -16401,7 +20226,7 @@ void SimPlayerManager::spawnFromConfig(const SpawnGroup& g, const ShuttleportLoc
 
     if (g.type.beginsWith("pvp")) {
         bool imperial = isImperialForSpawn(g, templateName);
-        agent->setPvpStatusBitmask(ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
+        applySimNpcPresentation(agent, ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
 #ifdef DEBUG_SIMPLAYER
         info("spawnFromConfig: creating PvP controller with route spawn=("
             + String::valueOf(spawnPos.getX()) + "," + String::valueOf(spawnPos.getY()) + "," + String::valueOf(spawnPos.getZ())
@@ -16423,7 +20248,12 @@ void SimPlayerManager::spawnFromConfig(const SpawnGroup& g, const ShuttleportLoc
 #endif
         ctrl = pvp;
     } else {
-        agent->setPvpStatusBitmask(0);
+        applySimNpcPresentation(agent, 0);
+        // Miners are driven entirely by SimMinerController; give them the no-op
+        // simMiner tree so the default idle/wander tree does not compete with
+        // the controller's movement (see scripts/ai/simMiner.lua).
+        agent->setCustomAiMap(String("simMiner").hashCode());
+        agent->setAITemplate();
         ctrl = new SimMinerController(agent, g.minerConfig);
     }
         controllers.put(oid, ctrl);

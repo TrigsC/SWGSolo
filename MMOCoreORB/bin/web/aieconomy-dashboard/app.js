@@ -1,7 +1,11 @@
 const state = {
   token: localStorage.getItem("core3_api_token") || "",
   refreshMs: 5000,
-  timer: null
+  requestTimeoutMs: 4000,
+  timeoutBackoffMs: 30000,
+  timer: null,
+  loading: false,
+  backoffUntilMs: 0
 };
 
 const $ = (id) => document.getElementById(id);
@@ -25,7 +29,8 @@ function renderBars(activity) {
     ["Sampling", activity.sampling],
     ["Stationed", activity.stationed],
     ["Validated", activity.validated],
-    ["Failed", activity.failed]
+    ["Failed", activity.failed],
+    ["Legacy Suppressed", activity.legacyLoopSuppressedCount]
   ];
   const max = Math.max(1, ...rows.map(([, value]) => Number(value || 0)));
 
@@ -564,26 +569,29 @@ function renderCoveragePlanner(planner = {}) {
   $("coverage-planner-state").textContent =
     `${planner.mode || "memory-only"} · ${planner.stationedLifecycleEnabled ? "stationed enabled" : "stationed disabled"}`;
   $("coverage-desired-slots").textContent = number(planner.desiredCoverageSlots);
-  $("coverage-actual-slots").textContent = number(planner.actualCoveredSlots);
+  $("coverage-fully-covered-slots").textContent = number(planner.fullyCoveredSlots);
+  $("coverage-partially-covered-slots").textContent = number(planner.partiallyCoveredSlots);
+  $("coverage-uncovered-slots").textContent = number(planner.uncoveredSlots);
   $("coverage-total-gap").textContent = number(planner.totalCoverageGap);
+  $("coverage-active-miners").textContent = number(planner.activeCoverageMiners);
   $("coverage-stationed-miners").textContent = number(planner.stationedMiners);
-  $("coverage-moving-miners").textContent = number(planner.movingMiners);
-  $("coverage-sampling-miners").textContent = number(planner.samplingMiners);
+  $("coverage-assigned-not-stationed").textContent = number(planner.assignedButNotStationed);
   $("coverage-unassigned-miners").textContent = number(planner.unassignedMiners);
 
   $("coverage-profile-table").innerHTML = profiles.map((row) => {
     const movement = [
       Number(row.stationedMinerCount || 0) ? `${number(row.stationedMinerCount)} stationed` : "",
       Number(row.movingMinerCount || 0) ? `${number(row.movingMinerCount)} moving` : "",
-      Number(row.samplingMinerCount || 0) ? `${number(row.samplingMinerCount)} sampling` : ""
+      Number(row.samplingMinerCount || 0) ? `${number(row.samplingMinerCount)} sampling` : "",
+      Number(row.assignedButNotStationedCount || 0) ? `${number(row.assignedButNotStationedCount)} assigned not stationed` : ""
     ].filter(Boolean).join(" · ") || "none";
 
     return `
       <tr>
-        <td><div class="opportunity">${labelize(row.demandProfile)}<small>pressure ${number(row.pressureScore)}</small></div></td>
+        <td><div class="opportunity">${labelize(row.demandProfile)}<small>${labelize(row.coverageState)} · pressure ${number(row.pressureScore)}</small></div></td>
         <td>${number(row.desiredMiners)}</td>
         <td>${number(row.assignedMinerCount)}</td>
-        <td><span class="resource-meta">${movement}</span></td>
+        <td>${number(row.activeCoverageMinerCount)}<br><span class="resource-meta">${movement}</span></td>
         <td><span class="chip ${Number(row.coverageGap || 0) ? "watch" : "covered"}">${number(row.coverageGap)}</span></td>
       </tr>
     `;
@@ -603,8 +611,8 @@ function renderCoveragePlanner(planner = {}) {
         <td><div class="opportunity">${row.resourceName || "unknown"}<small>${row.resourceType || row.conceptualLabel || "unknown type"}</small></div></td>
         <td>${labelize(row.zone)}</td>
         <td><span class="resource-meta">${coverage}</span></td>
-        <td>${number(row.stockpileKnownQuantity)} / ${number(row.desiredReserve)}<br><span class="resource-meta">ratio ${number(row.reserveRatio)}</span></td>
-        <td><span class="resource-meta">${labelize(row.rebalanceReason || "none")}</span></td>
+        <td>${number(row.stockpileKnownQuantity)} / ${number(row.desiredReserve)}<br><span class="resource-meta">${labelize(row.stockpileConfidence)} · ratio ${number(row.reserveRatio)}</span></td>
+        <td><span class="resource-meta">${labelize(row.coverageState || row.rebalanceReason || "none")}</span></td>
       </tr>
     `;
   }).join("") || `<tr><td colspan="6"><div class="empty">No coverage slots yet</div></td></tr>`;
@@ -613,9 +621,200 @@ function renderCoveragePlanner(planner = {}) {
     <strong>${number(duration.stationedCount)} stationed miners</strong>
     <span>${number(duration.averageStationDurationSeconds)}s average station duration</span>
     <span>${number(duration.maxStationDurationSeconds)}s max station duration</span>
-    <span>${number(samples.stationSampleCount)} station samples · ${number(samples.stationYieldQuantity)} conceptual yield</span>
-    <span>Repeated sampling ${planner.stationedRepeatedSamplingEnabled ? "enabled" : "disabled"}</span>
+    <span>${number(planner.stationedSampleTicks || samples.stationedSampleTicks || samples.stationSampleCount)} station samples · ${number(samples.stationYieldQuantity)} simulated yield</span>
+    <span>Repeated sampling ${planner.stationedSamplingEnabled ? "enabled" : "disabled"} · ${number(planner.sampleIntervalSeconds)}s · ${planner.sampleIntervalSource || "unknown_source"}</span>
+    <span>Last stationed sample ${number(planner.lastStationedSampleAgeSeconds)}s ago</span>
   `;
+}
+
+function renderSimulatedAcquisition(acquisition = {}) {
+  const rows = [...(acquisition.events || [])];
+  const blocked = [...(acquisition.blockedReasons || [])];
+  const exactTotals = [...(acquisition.exactResourceTotals || acquisition.quantityByExactResource || [])]
+    .slice(0, 4)
+    .map((row) => `${row.exactResource || "unknown"}: ${number(row.quantity)}`)
+    .join(", ") || "none";
+  const simulationOnly = Boolean(acquisition.simulationOnly) &&
+    !acquisition.realResourceCreated &&
+    !acquisition.resourceContainerCreated &&
+    !acquisition.inventoryMutated &&
+    !acquisition.economyMutated &&
+    !acquisition.persistenceMutated;
+
+  $("sim-acquisition-state").textContent =
+    `${acquisition.mode || "runtime-ledger"} · ${acquisition.enabled ? "enabled" : "disabled"}`;
+  $("sim-acquisition-ready").textContent = number(acquisition.readyMiners);
+  $("sim-acquisition-count").textContent = number(acquisition.acquisitions);
+  $("sim-acquisition-quantity").textContent = number(acquisition.resourcesAcquired);
+  $("sim-acquisition-unique").textContent = number(acquisition.uniqueResources);
+  $("sim-acquisition-retained").textContent =
+    `${number(acquisition.ledgerRetainedRows)} / ${number(acquisition.ledgerMaxRows)}`;
+  $("sim-acquisition-average").textContent = number(acquisition.averageQuantity);
+  $("sim-acquisition-mode").textContent = simulationOnly ? "SIM ONLY" : "REVIEW";
+
+  $("sim-acquisition-table").innerHTML = rows.slice(0, 50).map((row) => `
+    <tr>
+      <td>#${row.minerId || "none"}<br><span class="resource-meta">${row.assignmentGenerationId || 0}</span></td>
+      <td><div class="opportunity">${row.resourceName || "unknown"}<small>${row.spawnIdentity || "unknown spawn"}</small></div></td>
+      <td>${row.resourceType || "unknown"}</td>
+      <td>${labelize(row.planet)}</td>
+      <td>${number(row.quantity)}</td>
+      <td>${number(row.density)}</td>
+      <td>${labelize(row.demandProfile)}</td>
+      <td>${number(row.stationDurationSeconds)}s</td>
+      <td><span class="chip ${row.activationPathTrustStatus || "unknown"}">${labelize(row.activationPathTrustStatus)}</span></td>
+      <td>${number(row.ageSeconds)}s</td>
+    </tr>
+  `).join("") || `<tr><td colspan="10"><div class="empty">No simulated acquisition transactions yet</div></td></tr>`;
+
+  const diagnostics = [
+    ["Attempts", acquisition.acquisitionAttempts],
+    ["Successful", acquisition.successfulAcquisitions],
+    ["Blocked", acquisition.blockedAcquisitions],
+    ["Stationed Sampling", acquisition.stationedSamplingEnabled ? "ON" : "OFF"],
+    ["Sample Interval", `${number(acquisition.sampleIntervalSeconds)}s · ${acquisition.sampleIntervalSource || "unknown_source"}`],
+    ["Stationed Sample Ticks", acquisition.stationedSampleTicks],
+    ["Sim Transactions", acquisition.simulatedAcquisitionTransactions],
+    ["Exact Resource Totals", exactTotals],
+    ["Last Stationed Sample", `${number(acquisition.lastStationedSampleAgeSeconds)}s ago`],
+    ["Retained Rows", `${number(acquisition.ledgerRetainedRows)} / ${number(acquisition.ledgerMaxRows)}`],
+    ["Simulation Only", simulationOnly ? "YES" : "REVIEW"],
+  ];
+
+  $("sim-acquisition-diagnostics").innerHTML = diagnostics.map(([label, value]) => `
+    <div class="safety-row">
+      <span>${label}</span>
+      <strong>${typeof value === "number" ? number(value) : value}</strong>
+    </div>
+  `).join("") + (blocked.length ? blocked.map((row) => `
+    <div class="safety-row">
+      <span>${labelize(row.reason)}</span>
+      <strong>${number(row.count)}</strong>
+    </div>
+  `).join("") : "");
+}
+
+function renderMinerRecovery(recovery = {}) {
+  const rows = [...(recovery.rows || [])];
+  const statuses = [...(recovery.statuses || [])];
+  const reasons = [...(recovery.topReasons || [])];
+  const implementedScope = recovery.implementedActionScope || "assignment_clear_only";
+  const activeMode = recovery.dryRun
+    ? "dry-run"
+    : implementedScope === "assignment_clear_only"
+      ? "clear-only"
+      : "active";
+
+  $("miner-recovery-state").textContent =
+    `${recovery.enabled ? "enabled" : "disabled"} · ${activeMode} · admin ${recovery.adminActionsEnabled ? "enabled" : "disabled"}`;
+  $("miner-recovery-tracked").textContent = number(recovery.trackedMiners);
+  $("miner-recovery-healthy").textContent = number(recovery.healthy);
+  $("miner-recovery-attention").textContent = number(recovery.needsAttention);
+  $("miner-recovery-taken").textContent = number(recovery.actionsTaken);
+  $("miner-recovery-skipped").textContent = number(recovery.actionsSkipped);
+  $("miner-recovery-mode").textContent = activeMode.toUpperCase();
+
+  const sortedRows = rows.sort((a, b) => {
+    const attentionDelta = Number(Boolean(b.needsAttention)) - Number(Boolean(a.needsAttention));
+    if (attentionDelta) return attentionDelta;
+    return Number(b.distanceToTarget || 0) - Number(a.distanceToTarget || 0);
+  });
+
+  $("miner-recovery-table").innerHTML = sortedRows.slice(0, 50).map((row) => {
+    const statusClass = row.needsAttention ? "blocked" : (row.healthy ? "covered" : "watch");
+    const ages = [
+      `${number(row.assignmentAgeSeconds)}s assigned`,
+      `${number(row.movementAgeSeconds)}s move`,
+      `${number(row.sampleAgeSeconds)}s sample`,
+      `${number(row.acquisitionAgeSeconds)}s acquisition`
+    ].join(" · ");
+    const flags = [
+      row.dead ? "dead" : "",
+      row.incapacitated ? "incap" : "",
+      row.inCombat ? "combat" : "",
+      !row.controllerFound ? "no controller" : "",
+      !row.minerFound ? "no miner" : ""
+    ].filter(Boolean).join(" · ");
+
+    return `
+      <tr>
+        <td>#${row.minerId || "none"}<br><span class="resource-meta">${row.assignmentGenerationId || 0}</span></td>
+        <td><span class="chip ${statusClass}">${labelize(row.status)}</span><br><span class="resource-meta">${labelize(row.lifecycleStatus)}${flags ? ` · ${flags}` : ""}</span></td>
+        <td><div class="opportunity">${row.resourceName || "unknown"}<small>${row.resourceType || "unknown type"} · ${labelize(row.demandProfile)}</small></div></td>
+        <td><div class="opportunity">${labelize(row.currentZone)}<small>${row.copyableCurrentCoordinates || "unknown"}</small></div></td>
+        <td><div class="opportunity">${labelize(row.targetZone)}<small>${row.copyableTargetCoordinates || "unknown"}</small></div></td>
+        <td>${number(row.distanceToTarget)}m</td>
+        <td><span class="resource-meta">${ages}</span></td>
+        <td><div class="opportunity">${labelize(row.recoveryRecommendation)}<small>${labelize(row.stuckReason)} · ${row.lastRecoveryAction || "none"}</small></div></td>
+      </tr>
+    `;
+  }).join("") || `<tr><td colspan="8"><div class="empty">No miner recovery rows yet</div></td></tr>`;
+
+  const diagnostics = [
+    ["Dry Run", recovery.dryRun ? "YES" : "NO"],
+    ["Implemented Scope", labelize(implementedScope)],
+    ["Admin Actions", recovery.adminActionsEnabled ? "ENABLED" : "DISABLED"],
+    ["Clear Assignment", recovery.allowClearAssignment ? "ALLOWED" : "DISABLED"],
+    ["Nudge Config", recovery.allowNudgeToSafeNearbyPoint ? "ALLOWED" : "DISABLED"],
+    ["Teleport Config", recovery.allowTeleportToStationTarget ? "ALLOWED" : "DISABLED"],
+    ["Respawn Config", recovery.allowRespawnReplacement ? "ALLOWED" : "DISABLED"],
+    ["Check Interval", `${number(recovery.stuckCheckIntervalSeconds)}s`],
+    ["Moving Stuck", `${number(recovery.movingStuckSeconds)}s`],
+    ["Station Grace", `${number(recovery.stationedSamplingGraceSeconds)}s`],
+    ["Far Distance", `${number(recovery.farFromStationDistanceMeters)}m`],
+    ["Interval Limit", recovery.maxAutomaticRecoveriesPerInterval],
+    ["Miner Hour Limit", recovery.maxRecoveriesPerMinerPerHour],
+    ["Nudge Implemented", recovery.nudgeMutationEnabled ? "ON" : "OFF"],
+    ["Teleport Implemented", recovery.teleportMutationEnabled ? "ON" : "OFF"],
+    ["Respawn Implemented", recovery.respawnMutationEnabled ? "ON" : "OFF"],
+  ];
+
+  $("miner-recovery-diagnostics").innerHTML = diagnostics.map(([label, value]) => `
+    <div class="safety-row">
+      <span>${label}</span>
+      <strong>${typeof value === "number" ? number(value) : value}</strong>
+    </div>
+  `).join("") + statuses.map((row) => `
+    <div class="safety-row">
+      <span>${labelize(row.status)}</span>
+      <strong>${number(row.count)}</strong>
+    </div>
+  `).join("") + reasons.map((row) => `
+    <div class="safety-row">
+      <span>${labelize(row.reason)}</span>
+      <strong>${number(row.count)}</strong>
+    </div>
+  `).join("");
+}
+
+function renderAcquisitionReadiness(readiness = {}) {
+  const rows = [...(readiness.readyRows || [])];
+  const blocked = [...(readiness.acquisitionBlockedReasons || [])];
+
+  $("acquisition-readiness-state").textContent =
+    `${readiness.mode || "diagnostics-only"} · ${readiness.enabled ? "enabled" : "disabled"}`;
+  $("acquisition-stationed").textContent = number(readiness.stationedMiners);
+  $("acquisition-ready").textContent = number(readiness.acquisitionReadyMiners);
+  $("acquisition-blocked").textContent = number(readiness.acquisitionBlockedMiners);
+  $("acquisition-real-enabled").textContent = readiness.realResourceAcquisitionEnabled ? "ON" : "OFF";
+
+  $("acquisition-ready-table").innerHTML = rows.slice(0, 24).map((row) => `
+    <tr>
+      <td>#${row.minerId || "none"}<br><span class="resource-meta">${row.assignmentGenerationId || 0}</span></td>
+      <td><div class="opportunity">${row.resourceName || "unknown"}<small>${row.resourceType || row.conceptualLabel || "unknown type"} · ${labelize(row.planet)}</small></div></td>
+      <td>${labelize(row.demandProfile)}</td>
+      <td>${number(row.stationDurationSeconds)}s<br><span class="resource-meta">${number(row.stationSampleCount)} samples · ${number(row.stationYieldQuantity)} yield</span></td>
+      <td>${number(row.reserveRatio)}<br><span class="resource-meta">${labelize(row.stockpileConfidence)}</span></td>
+      <td><span class="chip ${row.acquisitionReadinessStatus || "no_data"}">${labelize(row.acquisitionReadinessReason)}</span></td>
+    </tr>
+  `).join("") || `<tr><td colspan="6"><div class="empty">No acquisition-ready miners</div></td></tr>`;
+
+  $("acquisition-blocked-list").innerHTML = blocked.map((row) => `
+    <div class="safety-row">
+      <span>${labelize(row.reason)}</span>
+      <strong>${number(row.count)}</strong>
+    </div>
+  `).join("") || `<div class="empty">No blocked stationed miners</div>`;
 }
 
 function renderCoverageAlignment(diagnostics = {}) {
@@ -1053,6 +1252,9 @@ function renderSnapshot(snapshot) {
   renderResourceScout(snapshot.resourceScout || {});
   renderResourceCoverage(snapshot.resourceCoverage || {});
   renderCoveragePlanner(snapshot.coveragePlanner || {});
+  renderSimulatedAcquisition(snapshot.simulatedAcquisition || {});
+  renderMinerRecovery(snapshot.minerRecovery || {});
+  renderAcquisitionReadiness(snapshot.acquisitionReadiness || {});
   renderCoverageAlignment(snapshot.coverageAlignmentDiagnostics || {});
   renderPathValidationDiagnostics(snapshot.pathValidationDiagnostics || {});
   renderReachabilityCalibration(snapshot.reachabilityCalibration || {});
@@ -1070,12 +1272,23 @@ async function loadSnapshot() {
     return;
   }
 
+  const now = Date.now();
+  if (state.loading || now < state.backoffUntilMs)
+    return;
+
+  state.loading = true;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => {
+    controller.abort();
+  }, state.requestTimeoutMs);
+
   try {
     const response = await fetch("/v1/aieconomy/dashboard/", {
       headers: {
         Authorization: `Bearer ${state.token}`
       },
-      cache: "no-store"
+      cache: "no-store",
+      signal: controller.signal
     });
 
     if (!response.ok) {
@@ -1084,9 +1297,18 @@ async function loadSnapshot() {
 
     const payload = await response.json();
     renderSnapshot(payload.result || payload);
+    state.backoffUntilMs = 0;
     setServerState("Connected to Core3 REST API", "ok");
   } catch (error) {
-    setServerState(`Connection failed: ${error.message}`, "error");
+    if (error.name === "AbortError") {
+      state.backoffUntilMs = Date.now() + state.timeoutBackoffMs;
+      setServerState("Dashboard request timed out; backing off", "error");
+    } else {
+      setServerState(`Connection failed: ${error.message}`, "error");
+    }
+  } finally {
+    window.clearTimeout(timeout);
+    state.loading = false;
   }
 }
 

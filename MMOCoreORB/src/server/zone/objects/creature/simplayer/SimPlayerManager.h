@@ -33,6 +33,13 @@ class StockpileSnapshotSimulationTask;
 class DemandWeightedMinerPlanSimulationTask;
 class AiEconomyConceptualTotalsPersistenceTask;
 class MinerIntelligentTargetingTask;
+class MinerRecoveryTask;
+class SimPlayerConfiguredSpawnTask;
+class HiveCrafterConsumerTask;
+
+// P.5.3: defined in the .cpp (file scope); forward-declared here so the crafter
+// consumer can share the demand-state compute helper by reference.
+struct DemandStateSimulationResult;
 
 struct MinerPathValidationSnapshot {
 	uint64 validationSnapshotId = 0;
@@ -68,6 +75,12 @@ struct MinerPathValidationSnapshot {
 	int maxPathDistance = 0;
 	int maxPathNodes = 0;
 	uint64 recordedAtMs = 0;
+	// P.4.1 overland reachability diagnostics (additive only; does not affect
+	// pathTrustStatus, rejectReason, or the activation gate).
+	bool overlandEvaluated = false;
+	bool overlandReachable = false;
+	String overlandRejectReason = "none";
+	bool overlandWaterAtTarget = false;
 };
 
 struct MinerIntelligentTargetAssignment {
@@ -97,6 +110,22 @@ struct MinerIntelligentTargetAssignment {
 	float targetZ = 0.f;
 	float targetDensity = 0.f;
 	float targetDirectDistance = 0.f;
+	// P.5.1: exact resource-spawn identity captured at selection so hive
+	// deposits can record crafting-grade lots (spawn id + stats), not just a
+	// coarse conceptual label. 0 spawn id => degrade to conceptual-only.
+	uint64 targetResourceSpawnObjectId = 0;
+	String targetResourceClassChain;
+	bool targetResourceActive = true;
+	int targetResourceOq = -1;
+	int targetResourceCd = -1;
+	int targetResourceDr = -1;
+	int targetResourceHr = -1;
+	int targetResourceFl = -1;
+	int targetResourceMa = -1;
+	int targetResourcePe = -1;
+	int targetResourceSr = -1;
+	int targetResourceUt = -1;
+	int targetResourceCr = -1;
 	String densityTargetStatus;
 	String pathValidationStatus;
 	String pathValidationTrustStatus;
@@ -177,6 +206,117 @@ struct SimIntelligentYieldSnapshot {
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
+
+struct SimulatedAcquisitionEvent {
+	uint64 timestampMs = 0;
+	uint64 minerID = 0;
+	uint64 assignmentGenerationId = 0;
+	uint64 activationSnapshotId = 0;
+	uint64 stationedAtMs = 0;
+	uint64 stationDurationSeconds = 0;
+	String resourceName;
+	String resourceType;
+	String resourceClass;
+	String planet;
+	String spawnIdentity;
+	String demandProfile;
+	String activationPathTrustStatus;
+	String conceptualLabel;
+	uint32 quantity = 0;
+	float density = 0.f;
+	float concentration = 0.f;
+	bool wouldCreateResourceContainer = true;
+	bool realResourceCreated = false;
+	bool resourceContainerCreated = false;
+	bool inventoryMutated = false;
+	bool economyMutated = false;
+	bool persistenceMutated = false;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// P.5.1: per-resource-spawn running yield accumulated this session, flushed to
+// the persistent galaxy hive stockpile as an exact-identity lot (spawn id +
+// stats). Keyed hive-wide by resource-spawn object id, not by miner.
+struct MinerSpawnYieldAccumulator {
+	uint64 resourceSpawnObjectId = 0;
+	uint64 sessionQuantity = 0;
+	// P.5.2: how much of sessionQuantity has already been written to the hive
+	// lot, so each flush adds only the new delta (deposits and consumer draws
+	// then compose instead of overwriting each other).
+	uint64 lastFlushedQuantity = 0;
+	String resourceSpawnName;
+	String resourceType;
+	String resourceClassChain;
+	String sourcePlanet;
+	String sourceZone;
+	String matchedDemandProfiles;
+	bool active = true;
+	int oq = -1;
+	int cd = -1;
+	int dr = -1;
+	int hr = -1;
+	int fl = -1;
+	int ma = -1;
+	int pe = -1;
+	int sr = -1;
+	int ut = -1;
+	int cr = -1;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct MinerRecoveryDiagnosticRow {
+	uint64 minerID = 0;
+	uint64 assignmentGenerationId = 0;
+	uint64 activationSnapshotId = 0;
+	String targetHash;
+	String resourceName;
+	String resourceType;
+	String demandProfile;
+	String lifecycleStatus;
+	String recoveryStatus;
+	String stuckReason;
+	String recoveryRecommendation;
+	String lastRecoveryAction;
+	String currentZone;
+	String targetZone;
+	float currentX = 0.f;
+	float currentY = 0.f;
+	float currentZ = 0.f;
+	float targetX = 0.f;
+	float targetY = 0.f;
+	float targetZ = 0.f;
+	float distanceToTarget = 0.f;
+	uint64 assignmentAgeSeconds = 0;
+	uint64 movementAgeSeconds = 0;
+	uint64 sampleAgeSeconds = 0;
+	uint64 acquisitionAgeSeconds = 0;
+	uint64 expectedNextSampleAtMs = 0;
+	uint64 expectedNextSampleAgeSeconds = 0;
+	uint64 stationDurationSeconds = 0;
+	int stationSampleCount = 0;
+	uint64 stationYieldQuantity = 0;
+	bool controllerFound = false;
+	bool minerFound = false;
+	bool positionKnown = false;
+	bool dead = false;
+	bool incapacitated = false;
+	bool inCombat = false;
+	bool healthy = false;
+	bool needsAttention = false;
+	bool adminActionsEnabled = false;
+	bool dryRun = true;
+	String copyableCurrentCoordinates;
+	String copyableTargetCoordinates;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct SimulatedAcquisitionRuntimeState;
 
 struct SimResourceAwareStockpileRow {
 	String aggregationKey;
@@ -301,11 +441,15 @@ private:
 	friend class DemandWeightedMinerPlanSimulationTask;
 	friend class AiEconomyConceptualTotalsPersistenceTask;
 	friend class MinerIntelligentTargetingTask;
+	friend class SimPlayerConfiguredSpawnTask;
 
 	// Map of Creature ObjectID -> Controller
 	SynchronizedVectorMap<uint64, Reference<SimPlayerController*> > controllers;
 	VectorMap<String, uint64> conceptualMinerTotals;
 	Mutex conceptualMinerTotalsMutex;
+	// P.5.1: exact-identity per-spawn hive deposits (galaxy-scoped).
+	VectorMap<uint64, MinerSpawnYieldAccumulator> spawnYieldAccumulators;
+	Mutex spawnYieldAccumulatorMutex;
 	Vector<SimIntelligentYieldSnapshot> recentIntelligentYields;
 	Mutex recentIntelligentYieldsMutex;
 	Vector<SimResourceAwareStockpileRow> resourceAwareStockpileRows;
@@ -366,6 +510,10 @@ private:
 	bool resourceIntelligenceTaskScheduled = false;
 	int resourceIntelligenceIntervalSeconds = 600;
 	int resourceIntelligenceTopN = 10;
+	bool configuredSpawnTaskScheduled = false;
+	int configuredSpawnStartupDelaySeconds = 0;
+	int configuredSpawnBatchSize = 5;
+	int configuredSpawnBatchDelayMs = 1000;
 	bool resourceScoringProfilesEnabled = false;
 	Vector<String> resourceScoringProfileKeys;
 	bool minerTargetRecommendationsEnabled = false;
@@ -420,6 +568,92 @@ private:
 	int minerPathValidationMaxPathNodes = 256;
 	Mutex minerPathValidationSnapshotMutex;
 	VectorMap<uint64, MinerPathValidationSnapshot> minerPathValidationSnapshots;
+	// P.4.1 overland travel reachability guards. Read by MinerPathValidationTask
+	// via friend access. P.4.2 adds travelEnableOverlandActivation: when true, an
+	// overland-reachable off-navmesh target validates under the directOverland
+	// trust tier and is allowed to activate (still no vehicles/economy mutation).
+	bool travelOverlandDiagnosticsEnabled = true;
+	float travelWaterMarginMeters = 1.0f;
+	bool travelRejectWaterTargets = true;
+	bool travelEnableOverlandActivation = false;
+	// P.4.5a station/shuttle travel: at activation, if a travel point is much
+	// closer to the target than the miner, teleport (switchZone) the miner to the
+	// station's outdoor arrival point so it only walks the short last leg. Same-
+	// planet only, gated, safe reposition (no object containment).
+	bool travelEnableStationTravel = false;
+	int travelStationMinSavingMeters = 400;
+	float travelStationMaxRangeMeters = 16000.f;
+	int stationTravelCount = 0;
+	int stationTravelMetersSaved = 0;
+	// P.4.5b cross-planet dispatch (proportional rebalance, player-mimetic: run to
+	// the origin starport's ticket collector, board = switchZone to the
+	// destination starport's outdoor arrival, ride, then gather). Default off +
+	// dryRun on so the build ships inert. NPC repositioning only — no economy/
+	// inventory/persistence mutation (same class as station travel + recovery).
+	struct PlanetDispatchPlanetRow {
+		String planet;
+		int current = 0;
+		int desired = 0;
+		int demandWeight = 0;
+		bool home = false;
+
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+	bool travelEnablePlanetDispatch = false;
+	bool travelPlanetDispatchDryRun = true;
+	int travelPlanetDispatchIntervalSeconds = 60;
+	int travelPlanetDispatchMinDemandScore = 750;
+	int travelPlanetDispatchMinMinersPerHomePlanet = 2;
+	int travelPlanetDispatchMaxMinersPerRemotePlanet = 3;
+	int travelPlanetDispatchPerMinerCooldownSeconds = 900;
+	int travelPlanetDispatchPerPlanetCooldownSeconds = 300;
+	float travelPlanetDispatchBoardRadiusMeters = 20.f;
+	bool minerPlanetDispatchTaskScheduled = false;
+	int planetDispatchCount = 0;
+	int travelBoardedCount = 0;
+	VectorMap<uint64, uint64> planetDispatchMinerCooldownMs;
+	VectorMap<String, uint64> planetDispatchPlanetCooldownMs;
+	Mutex planetDispatchMutex;
+	Vector<PlanetDispatchPlanetRow> planetDispatchPlanRows;
+	int planetDispatchTotalMiners = 0;
+	String planetDispatchLastTargetZone;
+	uint64 planetDispatchLastDonorId = 0;
+	String planetDispatchLastDonorFromZone;
+	String planetDispatchLastSkipReason;
+	String planetDispatchLastBoardedFromZone;
+	String planetDispatchLastBoardedToZone;
+	String planetDispatchLastBoardedReason;
+	// P.4.4a real vehicle mechanics (spawn/mount/dismount/store). Heavily gated
+	// (master flag default off). Simulation-only object lifecycle — no economy/
+	// inventory/persistence mutation. Devices stored as SceneObject* to keep the
+	// header light; cast to VehicleControlDevice* in the .cpp.
+	bool vehicleMechanicsEnabled = false;
+	String vehicleObjectTemplate = "object/mobile/vehicle/speederbike_swoop.iff";
+	String vehicleControlDeviceTemplate = "object/intangible/vehicle/speederbike_swoop_pcd.iff";
+	bool vehicleSelfTestEnabled = false;
+	int vehicleSelfTestIntervalSeconds = 180;
+	int vehicleSelfTestHoldSeconds = 10;
+	// P.4.4b mounted travel: miners deploy+mount a swoop for long overland legs
+	// (SimMinerController::maybeMountForTravel) and dismount at every leg exit.
+	bool mountedTravelEnabled = false;
+	int mountedTravelMinLegMeters = 150;
+	int mountedTravelLegCount = 0;
+	bool vehicleSelfTestTaskScheduled = false;
+	uint64 vehicleSelfTestActiveMinerID = 0;
+	Mutex vehicleMechanicsMutex;
+	VectorMap<uint64, ManagedReference<SceneObject*> > activeMinerVehicleDevices;
+	int vehicleDeployCount = 0;
+	int vehicleMountCount = 0;
+	int vehicleDismountCount = 0;
+	int vehicleStoreCount = 0;
+	int vehicleMechanicsFailureCount = 0;
+	// Client presentation only: when enabled, spawned sim NPCs get
+	// ObjectFlag::PLAYER (0x10) in their pvpStatusBitmask so clients render
+	// them with player radar dots / player con-color rules. No server gameplay
+	// logic reads this bit on AiAgents (all reads are isPlayerCreature-gated).
+	bool simNpcPlayerDotEnabled = false;
+	int simNpcPlayerDotFlaggedCount = 0;
 	uint64 nextMinerPathValidationSnapshotId = 1;
 	bool demandProfileSimulationEnabled = false;
 	bool demandProfileSimulationTaskScheduled = false;
@@ -450,8 +684,11 @@ private:
 	bool marketSupplyObservationIncludeVendorStockrooms = false;
 	bool marketSupplyObservationIncludePlayerInventory = false;
 	bool marketSupplyObservationIncludePrivateContainers = false;
+	bool marketSupplyObservationResolveResourceContainers = false;
+	int marketSupplyObservationStartupDelaySeconds = 900;
 	int marketSupplyObservationMinQuantity = 1;
 	int marketSupplyObservationLogTopN = 5;
+	uint64 marketSupplyObservationStartedAtMs = 0;
 	Mutex marketSupplyObservationMutex;
 	int marketSupplyObservationListingsScanned = 0;
 	int marketSupplyObservationResourceListings = 0;
@@ -470,10 +707,36 @@ private:
 	bool stockpileSnapshotSimulationIncludeConceptualMinerTotals = true;
 	bool stockpileSnapshotSimulationIncludeMarketObservation = false;
 	bool aiEconomyPersistConceptualMinerTotals = false;
+	// P.5.1: persist exact resource-spawn-identity hive lots (crafting-grade).
+	bool aiEconomyPersistSpawnIdentifiedLots = false;
 	bool aiEconomyPersistenceTaskScheduled = false;
 	bool aiEconomyPersistenceLogSummary = true;
 	bool aiEconomyPersistenceFailureLogged = false;
 	int aiEconomyPersistenceIntervalSeconds = 300;
+	// P.5.2: non-destructive hive reservation self-test (reserve then release),
+	// so the reservation ledger can be verified before a real crafter consumer.
+	bool hiveReservationSelfTestEnabled = false;
+	bool hiveReservationSelfTestTaskScheduled = false;
+	int hiveReservationSelfTestIntervalSeconds = 120;
+	int hiveReservationSelfTestReserveQuantity = 5;
+	// P.5.3: first crafter consumer — demand-driven reserve+CONSUME that draws
+	// hive stock down (the first real consumer). Simulation-only: consume
+	// decrements the private hive ledger, no game state. C++ default off.
+	bool hiveCrafterConsumerEnabled = false;
+	bool hiveCrafterConsumerTaskScheduled = false;
+	int hiveCrafterConsumerIntervalSeconds = 90;
+	int hiveCrafterConsumerBatchQuantity = 25;
+	int hiveCrafterConsumerMinOq = 0;
+	bool hiveCrafterConsumerPreferShortage = true;
+	bool hiveCrafterConsumerAllowAnyLotFallback = true;
+	// Guarded runtime counters (task writes, dashboard reads).
+	Mutex hiveCrafterConsumerMutex;
+	uint64 hiveCrafterBatchesCompleted = 0;
+	uint64 hiveCrafterUnitsConsumed = 0;
+	String hiveCrafterLastProfile;
+	String hiveCrafterLastReserveReason;
+	bool hiveCrafterLastFallbackUsed = false;
+	VectorMap<String, uint64> hiveCrafterProducedByProfile;
 	bool persistentStockpileDemandEnabled = false;
 	bool persistentStockpileDemandIncludeConceptualMinerLots = true;
 	bool persistentStockpileDemandLogSummary = true;
@@ -514,10 +777,25 @@ private:
 	bool minerIntelligentTargetingRequireDemandWeightedPlan = true;
 	bool minerIntelligentTargetingRequireAcceptedDensityTarget = true;
 	bool minerIntelligentTargetingRequireValidPath = true;
-	bool minerIntelligentTargetingFallbackToConceptualLoop = true;
+	// P.4.5c: final-approach arrival radius (m). A miner keeps re-pathing toward
+	// its true target until within this distance before stationing, so long
+	// off-navmesh walks don't station hundreds of meters short (-> recovery churn).
+	float minerIntelligentArrivalRadiusMeters = 15.f;
+	bool minerIntelligentTargetingFallbackToConceptualLoop = false;
 	int minerIntelligentTargetingRollbackOnFailureCount = 3;
 	bool minerIntelligentTargetingLogDecisionSummary = true;
 	bool minerIntelligentTargetingLogVerboseSwitchDecisions = false;
+	bool legacyMinerConceptualLoopEnabled = false;
+	bool legacyMinerAllowFallbackWhenNoIntelligentAssignment = false;
+	bool legacyMinerAllowFallbackAfterIntelligentFailure = false;
+	bool legacyMinerLogSuppression = true;
+	Mutex minerWorkLoopDiagnosticsMutex;
+	int legacyMinerLoopSuppressedCount = 0;
+	int legacyMinerLoopStartedCount = 0;
+	int intelligentMinerLoopStartedCount = 0;
+	int staleMinerTaskIgnoredCount = 0;
+	String lastLegacyMinerSuppressionReason;
+	String lastStaleMinerTaskReason;
 	bool minerIntelligentTargetingAssignmentEnabled = true;
 	int minerIntelligentTargetingAssignmentTtlSeconds = 30;
 	int minerIntelligentTargetingCandidateAssignmentTtlSeconds = 180;
@@ -539,14 +817,47 @@ private:
 	bool minerMovementReadinessDiagnosticsEnabled = true;
 	bool stationedMinerLifecycleEnabled = false;
 	bool stationedMinerRepeatedSamplingEnabled = false;
-	int stationedMinerSampleIntervalSeconds = 300;
-	int stationedMinerSampleJitterSeconds = 60;
-	int stationedMinerMaxSamplesPerAssignment = 12;
-	int stationedMinerMaxDurationSeconds = 3600;
 	bool stationedMinerRequireDemandStillValid = true;
 	bool stationedMinerRequireResourceStillActive = true;
 	bool stationedMinerRequireSamePlanet = true;
 	bool stationedMinerClearWhenReserveSatisfied = true;
+	bool realResourceAcquisitionEnabled = false;
+	bool acquisitionReadinessDiagnosticsEnabled = true;
+	bool acquisitionRequireStationedLifecycle = true;
+	bool acquisitionRequireVerifiedActivationPath = true;
+	bool acquisitionRequireKnownResourceSpawnIdentity = true;
+	bool acquisitionRequireDemandStillValid = true;
+	bool acquisitionRequireReserveBelowTarget = true;
+	int acquisitionMaxAcquisitionsPerInterval = 0;
+	bool simulatedAcquisitionTransactionsEnabled = true;
+	bool simulatedAcquisitionLogTransactions = true;
+	int simulatedAcquisitionMaxLedgerEvents = 200;
+	SimulatedAcquisitionRuntimeState* simulatedAcquisitionRuntime = nullptr;
+	bool minerRecoveryEnabled = true;
+	bool minerRecoveryDryRun = true;
+	bool minerRecoveryAllowClearAssignment = true;
+	bool minerRecoveryAllowNudgeToSafeNearbyPoint = false;
+	bool minerRecoveryAllowTeleportToStationTarget = false;
+	bool minerRecoveryAllowRespawnReplacement = false;
+	bool minerRecoveryAdminActionsEnabled = false;
+	bool minerRecoveryTaskScheduled = false;
+	int minerRecoveryStuckCheckIntervalSeconds = 60;
+	int minerRecoveryMovingStuckSeconds = 180;
+	int minerRecoveryStationedSamplingGraceSeconds = 90;
+	float minerRecoveryFarFromStationDistanceMeters = 32.f;
+	int minerRecoveryMaxAutomaticRecoveriesPerInterval = 2;
+	int minerRecoveryMaxRecoveriesPerMinerPerHour = 3;
+	bool minerRecoveryLogRecoveryDecisions = true;
+	Mutex minerRecoveryMutex;
+	int minerRecoveryActionsTaken = 0;
+	int minerRecoveryActionsSkipped = 0;
+	uint64 minerRecoveryIntervalBucketStartMs = 0;
+	uint64 minerRecoveryHourBucketStartMs = 0;
+	int minerRecoveryAutomaticRecoveriesThisInterval = 0;
+	VectorMap<uint64, int> minerRecoveryCountPerMinerThisHour;
+	VectorMap<uint64, String> minerRecoveryLastActionByMiner;
+	VectorMap<uint64, uint64> minerRecoveryLastActionAtMsByMiner;
+	VectorMap<String, int> minerRecoveryReasonCounts;
 	bool minerIntelligentTargetingLimitedActivationEnabled = false;
 	int minerIntelligentTargetingLimitedMaxActivationsPerInterval = 1;
 	int minerIntelligentTargetingLimitedMaxActiveIntelligentMiners = 1;
@@ -588,6 +899,8 @@ private:
 	// Lua config loading / spawning
 	void loadLuaConfig();
 	void spawnConfiguredGroups();
+	void scheduleConfiguredSpawnTask(int groupIndex, int spawnIndex, int delayMs);
+	void runConfiguredSpawnTask(int groupIndex, int spawnIndex);
 	void startControllerForAgent(AiAgent* agent, Reference<SimPlayerController*> ctrl);
 
 	bool pickRandomShuttleport(ShuttleportLocation& out) const;
@@ -596,6 +909,11 @@ private:
 	void runMinerSummaryTask();
 	int countActiveMiners();
 	void collectConceptualMinerTotals(Vector<String>& resourceNames, Vector<uint64>& amounts);
+	// P.5.1: accumulate an exact-identity per-spawn deposit; drained by the
+	// persistence task and flushed to the galaxy hive stockpile.
+	void recordSpawnIdentifiedMinerYield(const MinerIntelligentTargetAssignment& assignment, int amount);
+	void collectSpawnYieldAccumulators(Vector<MinerSpawnYieldAccumulator>& accumulators);
+	void markSpawnYieldFlushed(uint64 resourceSpawnObjectId, uint64 flushedQuantity);
 	void recordResourceAwareConceptualStockpileYield(const SimIntelligentYieldSnapshot& snapshot);
 	void logConceptualMinerSummary();
 	void scheduleResourceIntelligenceTask();
@@ -622,6 +940,10 @@ private:
 	void scheduleDemandStateSimulationTask();
 	void runDemandStateSimulationTask();
 	void logDemandStateSimulations();
+	// P.5.3: shared demand-state compute (extracted from logDemandStateSimulations)
+	// so the crafter consumer selects targets from the same source of truth.
+	void computeDemandStateResults(Vector<DemandStateSimulationResult>& results,
+		bool& activeSnapshotAvailable, String& snapshotError);
 	void refreshDemandStateSimulationConfig();
 	void applyDemandStateSimulationConfig(LuaObject& demandStateConfig);
 	void scheduleMarketSupplyObservationTask();
@@ -637,8 +959,13 @@ private:
 	void logStockpileSnapshotSimulation();
 	void scheduleAiEconomyPersistenceTask();
 	void runAiEconomyPersistenceTask();
+	void flushSpawnIdentifiedLotsToHive();
 	void refreshAiEconomyPersistenceConfig();
 	void applyAiEconomyPersistenceConfig(LuaObject& persistenceConfig);
+	void scheduleHiveReservationSelfTestTask();
+	void applyHiveReservationSelfTestConfig(LuaObject& selfTestConfig);
+	void scheduleHiveCrafterConsumerTask();
+	void applyHiveCrafterConsumerConfig(LuaObject& crafterConfig);
 	void applyPersistentStockpileDemandConfig(LuaObject& stockpileDemandConfig);
 	void scheduleDemandWeightedMinerPlanSimulationTask();
 	void runDemandWeightedMinerPlanSimulationTask();
@@ -647,11 +974,33 @@ private:
 	void applyDemandWeightedMinerPlanDependencyConfig(LuaObject& managerConfig);
 	void logDemandWeightedMinerPlanSimulations();
 	void applyAiTravelSimulationConfig(LuaObject& travelSimulationConfig);
+	void applyRealResourceAcquisitionConfig(LuaObject& acquisitionConfig);
+	void applyMinerRecoveryConfig(LuaObject& recoveryConfig);
+	void applyLegacyMinerLoopConfig(LuaObject& legacyLoopConfig);
 	void scheduleMinerIntelligentTargetingTask();
 	void runMinerIntelligentTargetingTask();
+	void scheduleMinerRecoveryTask();
 	void refreshMinerIntelligentTargetingConfig();
 	void applyStationedMinerConfig(LuaObject& stationedConfig);
 	void applyMinerIntelligentTargetingConfig(LuaObject& targetingConfig);
+	void applyTravelConfig(LuaObject& travelConfig);
+	void applyVehicleConfig(LuaObject& vehicleConfig);
+	// Sets the agent's pvpStatusBitmask to baseBits, adding ObjectFlag::PLAYER
+	// when simNpcPlayerDotEnabled. Call from spawn paths with the agent locked.
+	void applySimNpcPresentation(AiAgent* agent, uint32 baseBits);
+	// P.4.2: a path trust tier acceptable for activation. verifiedPath always;
+	// directOverland only when travelEnableOverlandActivation is set.
+	bool isActivationTrustAcceptable(const String& trustStatus) const;
+	// P.4.5a: teleport the miner to the shuttle/starport nearest its target if it
+	// meaningfully shortens the overland leg. Returns true if it teleported.
+	bool tryStationTravelForActivation(uint64 minerID, const String& targetZone,
+		float targetX, float targetY, float targetZ);
+	// P.4.5b: cross-planet dispatch (proportional rebalance, player-mimetic).
+	// runMinerPlanetDispatchTask() + recordInterplanetaryTravelBoarded() are
+	// called externally (task / controller) and live in the public section.
+	void scheduleMinerPlanetDispatchTask();
+	void refreshMinerPlanetDispatchConfig();
+	void logMinerPlanetDispatchDecisions();
 	void logMinerIntelligentTargetingDecisions();
 	bool getMinerIntelligentTargetAssignment(uint64 minerID, MinerIntelligentTargetAssignment& assignment);
 	void putMinerIntelligentTargetAssignment(const MinerIntelligentTargetAssignment& assignment);
@@ -678,6 +1027,15 @@ private:
 	void recordReachabilityStationedCoverage(const MinerIntelligentTargetAssignment& assignment);
 	void recordReachabilityValidationSnapshot(const MinerPathValidationSnapshot& snapshot);
 	void snapshotAndResetMinerIntelligentActivationHealth(int& attempts, int& started, int& arrivals, int& samplesCompleted, int& pathFailures, int& expired, int& cooldownSkips, int& activeCapSkips, int& zoneSkips);
+	bool isSimulatedAcquisitionReadyForSample(const MinerIntelligentTargetAssignment& assignment, String& blockedReason);
+	void recordSimulatedAcquisitionBlocked(const String& reason);
+	uint64 getLastSimulatedAcquisitionAtMsForMiner(uint64 minerID);
+	MinerRecoveryDiagnosticRow buildMinerRecoveryDiagnostic(
+		const MinerIntelligentTargetAssignment& assignment, uint64 nowMs);
+	JSONSerializationType serializeMinerRecoveryDiagnostic(
+		const MinerRecoveryDiagnosticRow& row);
+	void applyMinerRecoveryDecision(
+		const MinerRecoveryDiagnosticRow& row, bool adminTriggered);
 
 	String pickRandomTemplate(const SpawnGroup& g) const;
 	bool isImperialForSpawn(const SpawnGroup& g, const String& templateName) const;
@@ -686,10 +1044,30 @@ private:
 
 public:
 	SimPlayerManager();
+
+	// P.4.2: read-only travel config accessors used by the static density-target
+	// search to skip resource pockets sitting over open water.
+	bool isTravelRejectWaterTargets() const { return travelRejectWaterTargets; }
+	float getTravelWaterMarginMeters() const { return travelWaterMarginMeters; }
+
+	// P.4.4a vehicle mechanics (deploy/dismount called by scheduled tasks).
+	bool deployAndMountMinerVehicle(uint64 minerID, String& resultOut);
+	bool dismountAndStoreMinerVehicle(uint64 minerID, String& resultOut);
+	void scheduleVehicleSelfTestTask();
+	void runVehicleSelfTestTask();
+
+	// P.4.4b mounted travel accessors (used by SimMinerController).
+	bool isMountedTravelEnabled() const {
+		return enabled && vehicleMechanicsEnabled && mountedTravelEnabled;
+	}
+	int getMountedTravelMinLegMeters() const { return mountedTravelMinLegMeters; }
+	void recordMountedTravelLegStarted() { mountedTravelLegCount++; }
+
 	~SimPlayerManager();
 
 	// Called by ZoneServer on startup
 	void initialize();
+	void runMinerRecoveryTask();
 
 	// The main logic to spawn a specific bot
 	void spawnSimPlayer(const String& planet, float x, float y, const String& templateName);
@@ -697,12 +1075,46 @@ public:
 	// Toggle logic
 	void toggleBot(AiAgent* agent);
 
+	static int getGameDerivedStationedSampleResultDelayMs();
+	static int getGameDerivedStationedSampleIntervalMs();
+	static int getGameDerivedStationedSampleIntervalSeconds();
+	static int getGameDerivedMasterArtisanSurveySkill();
+	static const char* getGameDerivedStationedSampleIntervalSource();
+	static int getGameDerivedStationedSampleYield(float density);
+	bool isIntelligentMinerWorkLoopOwnerEnabled() const;
+	bool isLegacyConceptualMinerLoopAllowed() const;
+	bool shouldLogLegacyMinerLoopSuppression() const;
+	void recordLegacyMinerLoopSuppressed(uint64 minerID, const String& controllerState,
+		bool assignmentPending, bool assignmentActive, bool assignmentStationed,
+		uint64 assignmentGenerationId, const String& targetHash,
+		const String& reason);
+	void recordLegacyMinerLoopStarted(uint64 minerID, const String& reason);
+	void recordIntelligentMinerLoopStarted(uint64 minerID, const String& reason);
+	void recordStaleMinerTaskIgnored(uint64 minerID, const String& taskType,
+		uint64 capturedGeneration, uint64 currentGeneration,
+		const String& lifecycleState, uint64 assignmentGenerationId,
+		const String& targetHash);
+
 	uint64 recordConceptualMinerYield(const String& resourceName, int amount, uint64 sourceObjectID, bool logYield);
+	void recordSimulatedAcquisitionTransactionFromController(uint64 minerID, int amount);
 	uint64 recordIntelligentConceptualMinerYield(const String& conceptualLabel, int amount, uint64 minerID, bool logYield);
 	bool transitionMinerIntelligentAssignmentToStationed(uint64 minerID, int yieldAmount, bool& scheduleRepeatedSample, int& delayMs, String& reason);
 	void clearMinerIntelligentTargetAssignmentFromController(uint64 minerID, const String& reason);
 	void clearMinerIntelligentTargetAssignmentOnSampleComplete(uint64 minerID);
 	void recordMinerIntelligentTargetAssignmentLifecycleFromController(uint64 minerID, const String& eventName, const String& detail = "");
+	// P.5.2: called by HiveReservationSelfTestTask (not a friend).
+	void runHiveReservationSelfTestTask();
+	// P.5.3: called by HiveCrafterConsumerTask (not a friend).
+	void runHiveCrafterConsumerTask();
+	// P.4.5b: called by MinerPlanetDispatchTask (not a friend) and by
+	// SimMinerController when a dispatched miner boards its shuttle.
+	void runMinerPlanetDispatchTask();
+	void recordInterplanetaryTravelBoarded(uint64 minerID, const String& fromZone,
+		const String& toZone, const String& starport, const String& reason);
+	// P.4.5c: final-approach arrival radius, read by SimMinerController.
+	float getMinerIntelligentArrivalRadiusMeters() const {
+		return minerIntelligentArrivalRadiusMeters;
+	}
 	JSONSerializationType getAiEconomyDashboardSnapshot();
 
 	// Cycle logic (called by SimPvPController)

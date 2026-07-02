@@ -8,6 +8,7 @@ includeFile("eventControl.lua")
 includeFile("pet.lua")
 includeFile("static.lua")
 includeFile("villageRaider.lua")
+includeFile("simMiner.lua")
 
 customMap = {
 	{ "crackdown", {
@@ -32,6 +33,14 @@ customMap = {
 	{ "cityPatrol", {
 		{ROOT, "rootCitypatrol"},
 		{IDLE, "idleCitypatrol"}
+	}},
+
+	-- No-op tree for SimPlayer miner bots (controller drives movement). NONE is
+	-- the root slot that runBehaviorTree() fetches; ROOT in other entries is an
+	-- undefined global that also evaluates to NONE (0).
+	{ "simMiner", {
+		{NONE, "rootSimMiner"},
+		{IDLE, "idleSimMiner"}
 	}},
 }
 

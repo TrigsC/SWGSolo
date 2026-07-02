@@ -130,6 +130,92 @@ SimPlayerManagerConfig = {
         maxPathNodes = 256,
     },
 
+    -- P.4 overland travel. In SWG, NPCs/vehicles climb near-vertical cliffs and
+    -- cross water freely, so terrain slope and mid-route water never block
+    -- travel. The only overland blockers are the target being out of bounds, or
+    -- the resource pocket itself sitting over open water (the miner would sample
+    -- the outskirts or the planner picks another pocket).
+    --
+    -- P.4.2: enableOverlandActivation lets an overland-reachable off-navmesh
+    -- target validate under the directOverland trust tier and ACTIVATE, so
+    -- miners actually walk to wilderness resources (walk speed; vehicles are a
+    -- later phase). rejectWaterTargets also makes the density-target search skip
+    -- water pockets so the planner stops assigning them. Still no economy/
+    -- inventory/persistence mutation. See docs/ai-miner-navigation-design.md.
+    travelConfig = {
+        enableOverlandDiagnostics = true,
+        enableOverlandActivation = true,  -- P.4.2: allow activation to overland-reachable targets
+        rejectWaterTargets = true,  -- flag + skip targets sitting over open water
+        waterMarginMeters = 1.0,    -- water depth over terrain to count as "in water"
+        -- P.4.5a station/shuttle travel: at activation, if a shuttle/starport is
+        -- much closer to the target than the miner, "take the shuttle" -- teleport
+        -- (switchZone) to the station's OUTDOOR arrival point, then the miner only
+        -- walks the short last leg overland (never traverses the un-navmeshed
+        -- starport interior). Same-planet only, safe reposition. Set false to hold.
+        enableStationTravel = true,
+        stationMinSavingMeters = 400,  -- only ride if it cuts at least this much overland distance
+        -- P.4.5b cross-planet dispatch (proportional rebalance, player-mimetic).
+        -- When a super-valuable resource is only reachable on an under-covered
+        -- planet (e.g. Looveaveyl on Dathomir), pick one idle miner per interval,
+        -- have it RUN to its nearest starport's ticket collector, then board =
+        -- teleport (switchZone) to the destination starport's OUTDOOR arrival, and
+        -- gather there. Proportional to per-planet demand, with a home-planet floor
+        -- so Naboo/Tatooine/Corellia are never stripped. Ships INERT: master flag
+        -- off + dryRun on. Rollout: set enablePlanetDispatch=true first and watch
+        -- planetDispatch.byPlanet on the dashboard; then set dryRun=false to travel.
+        enablePlanetDispatch = true,          -- master gate (default off)
+        planetDispatchDryRun = false,           -- true = compute+expose only, no travel
+        planetDispatchIntervalSeconds = 60,    -- decision cadence
+        planetDispatchMinDemandScore = 750,    -- only dispatch for high-value demand
+        planetDispatchMinMinersPerHomePlanet = 2,   -- floor kept on each spawn planet
+        planetDispatchMaxMinersPerRemotePlanet = 3,  -- cap per remote planet
+        planetDispatchPerMinerCooldownSeconds = 900, -- don't re-dispatch a miner too often
+        planetDispatchPerPlanetCooldownSeconds = 300,-- don't thrash a destination planet
+        planetDispatchBoardRadiusMeters = 20,  -- "reached the ticket collector" radius
+    },
+
+    -- P.4.4a real vehicle mechanics. NPCs spawn a real speeder + control device,
+    -- mount it, (drive later), dismount, and store/destroy it -- the same object
+    -- lifecycle a player uses, no fake speed. This phase only proves the
+    -- spawn/mount/dismount/store plumbing via a gated self-test on a stationed
+    -- miner. Simulation-only object lifecycle: no inventory/economy/persistence
+    -- mutation, transient (persistence 0) vehicles. Driving is P.4.4b.
+    -- HISTORY: disabled after P.4.4a first run -- transferObject into the RIDER
+    -- slot failed because NPC mobile templates had no arrangement descriptors
+    -- (players get "rider" from abstract/slot/arrangement/player.iff). Fixed by
+    -- adding arrangementDescriptorFilename to the six artisan dressed_* object
+    -- templates (see docs/npc-mount-and-player-dot-plan.md). The hardened
+    -- teardown (miner always pulled back to world before vehicle destruction)
+    -- remains in place, so a failed mount can no longer orphan a miner.
+    vehicleConfig = {
+        enableVehicleMechanics = true,   -- master switch
+        vehicleObjectTemplate = "object/mobile/vehicle/speederbike_swoop.iff",
+        controlDeviceTemplate = "object/intangible/vehicle/speederbike_swoop_pcd.iff",
+        -- P.4.4a self-test proved deploy/mount/dismount/store (3/3 cycles clean
+        -- on 2026-07-02); OFF now that mounted travel exercises the same
+        -- plumbing on every long leg.
+        selfTestEnabled = false,
+        selfTestIntervalSeconds = 120,
+        selfTestHoldSeconds = 10,
+        -- P.4.4b mounted travel: miners deploy+mount the swoop for any movement
+        -- leg longer than mountedTravelMinLegMeters, ride it at the vehicle's
+        -- real run speed (client sees the swoop move via its own transform
+        -- updates, rider seated), and dismount+store at arrival/station, path
+        -- failure, recovery, shuttle boarding, or sampling.
+        enableMountedTravel = true,
+        mountedTravelMinLegMeters = 150,
+    },
+
+    -- Client presentation only. When true, every sim NPC spawned by this manager
+    -- (miners and PvP bots) gets ObjectFlag::PLAYER (0x10) added to its
+    -- pvpStatusBitmask so game clients render it like a player: player-style
+    -- radar/map dot (blue neutral, purple ally, red attackable) and player
+    -- con-color rules. Cosmetic -- no server gameplay logic reads this bit on
+    -- AiAgents. Applied at spawn; changing it needs a restart (NPCs respawn).
+    presentationConfig = {
+        showSimNpcsAsPlayerDots = true,
+    },
+
     -- Intelligent targeting switch. "off" does nothing, "shadow" logs decisions,
     -- "limited" may move capped miners only when limitedActivationConfig.enabled=true,
     -- and "soak" is a C++ alias for limited mode with these conservative soak controls.
@@ -140,11 +226,17 @@ SimPlayerManagerConfig = {
         intervalSeconds = 60,
         -- Number of miners evaluated by D.5.3/D.5.5 switch-decision and
         -- assignment logic per interval. This is not the active mover cap.
-        maxActiveMiners = 10,
+        maxActiveMiners = 11,
         requireDemandWeightedPlan = true,
         requireAcceptedDensityTarget = true,
         requireValidPath = true,
-        fallbackToConceptualLoop = true,
+        -- P.4.5c final approach: how close (m) a miner must get to the true target
+        -- before it stations. Long off-navmesh walks can terminate short; the miner
+        -- re-paths (bounded) to close the gap. The pocket is a planet-wide spawn so
+        -- ~10-15 m short is fine; keep this below the recovery farFromStation
+        -- threshold (32) so a completed approach is never flagged as stuck.
+        arrivalRadiusMeters = 15,
+        fallbackToConceptualLoop = false,
         rollbackOnFailureCount = 3,
         logDecisionSummary = true,
         -- Full per-miner switch lines are otherwise emitted only for useful
@@ -204,6 +296,13 @@ SimPlayerManagerConfig = {
         },
     },
 
+    legacyMinerLoopConfig = {
+        enableLegacyConceptualLoop = false,
+        allowLegacyFallbackWhenNoIntelligentAssignment = false,
+        allowLegacyFallbackAfterIntelligentFailure = false,
+        logLegacySuppression = false,
+    },
+
     -- Log-only hot-item demand pressure. This does not feed miner target selection.
     demandProfileSimulationConfig = {
         enabled = true,
@@ -256,37 +355,37 @@ SimPlayerManagerConfig = {
         profiles = {
             composite_armor_supply = {
                 enabled = true,
-                desiredReserve = 5000,
+                desiredReserve = 100000,
                 lowStockThreshold = 0.35,
                 criticalStockThreshold = 0.10,
             },
             master_weaponsmith_staples = {
                 enabled = true,
-                desiredReserve = 3000,
+                desiredReserve = 100000,
                 lowStockThreshold = 0.35,
                 criticalStockThreshold = 0.10,
             },
             high_damage_weapon_components = {
                 enabled = true,
-                desiredReserve = 3000,
+                desiredReserve = 100000,
                 lowStockThreshold = 0.35,
                 criticalStockThreshold = 0.10,
             },
             chef_buff_foods = {
                 enabled = true,
-                desiredReserve = 5000,
+                desiredReserve = 100000,
                 lowStockThreshold = 0.35,
                 criticalStockThreshold = 0.10,
             },
             chef_high_value_consumables = {
                 enabled = true,
-                desiredReserve = 3000,
+                desiredReserve = 75000,
                 lowStockThreshold = 0.35,
                 criticalStockThreshold = 0.10,
             },
             production_infrastructure = {
                 enabled = true,
-                desiredReserve = 10000,
+                desiredReserve = 200000,
                 lowStockThreshold = 0.35,
                 criticalStockThreshold = 0.10,
             },
@@ -295,14 +394,16 @@ SimPlayerManagerConfig = {
 
     -- Read-only observation of public resource listings on bazaars and player vendors.
     marketSupplyObservationConfig = {
-        enabled = true,
+        enabled = false,
         intervalSeconds = 300,
         maxListingsScanned = 5000,
         includeBazaar = true,
         includePlayerVendors = true,
-        includeVendorStockrooms = true,
+        includeVendorStockrooms = false,
         includePlayerInventory = false,
         includePrivateContainers = false,
+        resolveResourceContainers = false,
+        startupDelaySeconds = 900,
         minQuantity = 1,
         logTopN = 5,
     },
@@ -313,14 +414,49 @@ SimPlayerManagerConfig = {
         intervalSeconds = 300,
         logTopN = 10,
         includeConceptualMinerTotals = true,
-        includeMarketObservation = true,
+        includeMarketObservation = false,
     },
 
-    -- Persist aggregate conceptual miner totals only. Disabled by default.
+    -- Hive stockpile persistence (galaxy-scoped, ownerScope="galaxy").
+    -- persistConceptualMinerTotals: coarse one-lot-per-resource-type rollup.
+    -- persistSpawnIdentifiedLots (P.5.1): crafting-grade exact lots keyed by
+    --   resource-spawn object id, carrying the 10 resource stats. Writes only to
+    --   the isolated aieconomy/aieconomylots databases (no game-state mutation).
     aiEconomyPersistenceConfig = {
         persistConceptualMinerTotals = false,
+        persistSpawnIdentifiedLots = true,
         intervalSeconds = 300,
         logSummary = true,
+    },
+
+    -- P.5.2 hive reservation ledger self-test. Non-destructive: reserves a small
+    -- quantity from any eligible exact lot then releases it (never consumes), so
+    -- the reserve/release accounting can be verified before a real crafter
+    -- consumer (P.5.3) exists. Simulation-only; mutates no game state. Retired
+    -- now that the P.5.3 crafter consumer drives real reservations.
+    hiveReservationSelfTestConfig = {
+        enabled = false,
+        intervalSeconds = 120,
+        reserveQuantity = 5,
+    },
+
+    -- P.5.3 first crafter consumer. Each tick it picks the highest-pressure
+    -- demand profile with an active resource opportunity and reserves+CONSUMES a
+    -- batch of that resource type from the hive (the first real draw-down).
+    -- Simulation-only: consume decrements the private aieconomy/aieconomylots
+    -- ledger only -- no ResourceContainer, market, or credit state is touched.
+    --   craftBatchQuantity     : units reserved+consumed per tick.
+    --   minOq                  : minimum resource overall-quality (0 = any).
+    --   preferShortageProfiles : prioritise critical/low profiles on first pass.
+    --   allowAnyLotFallback    : if the ideal type isn't stocked, draw from any
+    --                            eligible exact lot so the loop still progresses.
+    hiveCrafterConsumerConfig = {
+        enabled = true,
+        intervalSeconds = 90,
+        craftBatchQuantity = 25,
+        minOq = 0,
+        preferShortageProfiles = true,
+        allowAnyLotFallback = true,
     },
 
     -- Read-only D.6.2 consumer for validated durable conceptual stockpile baseline.
@@ -361,21 +497,69 @@ SimPlayerManagerConfig = {
         },
     },
 
-    -- P.3.1/P.3.2 coverage-oriented miner lifecycle.
-    -- Disabled by default: when enabled, a successful intelligent conceptual
-    -- sample can retain its assignment as stationed coverage. Repeated samples
-    -- remain separately gated and conceptual-only.
+    -- P.3.1-P.3.4.2 coverage-oriented miner lifecycle.
+    -- Stationed miners retain useful exact-resource assignments. Repeated
+    -- samples remain separately gated, simulation-only, and use Core3 player
+    -- sampling timing internally instead of Lua tuning knobs.
     stationedMinerConfig = {
         enableStationedLifecycle = true,
         enableStationedRepeatedSampling = true,
-        stationedSampleIntervalSeconds = 300,
-        stationedSampleJitterSeconds = 60,
-        stationedMaxSamplesPerAssignment = 12,
-        stationedMaxDurationSeconds = 3600,
         stationedRequireDemandStillValid = true,
         stationedRequireResourceStillActive = true,
         stationedRequireSamePlanet = true,
         stationedClearWhenReserveSatisfied = true,
+    },
+
+    -- P.3.3 acquisition readiness diagnostics only. Real acquisition remains
+    -- disabled and has no resource/container/inventory/economy mutation path.
+    -- P.3.4 simulated acquisition records exact spawned resources into a
+    -- runtime-only ledger; it still never creates ResourceContainers or
+    -- mutates inventory, vendors, market, crafting, credits, or persistence.
+    realResourceAcquisitionConfig = {
+        enableRealResourceAcquisition = false,
+        acquisitionReadinessDiagnosticsEnabled = true,
+        enableSimulatedAcquisitionTransactions = true,
+        simulatedAcquisitionLogTransactions = true,
+        simulatedAcquisitionMaxLedgerEvents = 200,
+        requireStationedLifecycle = true,
+        requireVerifiedActivationPath = true,
+        requireKnownResourceSpawnIdentity = true,
+        requireDemandStillValid = true,
+        requireReserveBelowTarget = true,
+        maxAcquisitionsPerInterval = 0,
+    },
+
+    -- P.3.4.4 / P.4.3 miner self-healing. Scoped live recovery: when dryRun is
+    -- false, the only action taken is clearAssignment (nudge/teleport/respawn
+    -- stay off), which also resets the miner's controller so it un-stations and
+    -- re-acquires a fresh reachable target. Rate-limited per interval and per
+    -- miner/hour. No inventory/economy/persistence mutation. The main case it
+    -- fixes is a "stationed far from target" miner that was reassigned to a far
+    -- target while stationed and could not be pulled back into the move loop.
+    minerRecoveryConfig = {
+        enabled = true,
+        dryRun = false,
+        allowClearAssignment = true,
+        allowNudgeToSafeNearbyPoint = false,
+        allowTeleportToStationTarget = false,
+        allowRespawnReplacement = false,
+        adminActionsEnabled = false,
+        stuckCheckIntervalSeconds = 60,
+        movingStuckSeconds = 180,
+        stationedSamplingGraceSeconds = 90,
+        farFromStationDistanceMeters = 32,
+        maxAutomaticRecoveriesPerInterval = 2,
+        maxRecoveriesPerMinerPerHour = 3,
+        logRecoveryDecisions = true,
+    },
+
+    -- Configured SimPlayers spawn immediately, but in small batches. This keeps
+    -- miners available for planner/acquisition soak while avoiding one large
+    -- AiAgent creation burst.
+    spawnStartupConfig = {
+        startupDelaySeconds = 0,
+        batchSize = 5,
+        batchDelayMs = 1000,
     },
 
     -- 1. LOCATIONS

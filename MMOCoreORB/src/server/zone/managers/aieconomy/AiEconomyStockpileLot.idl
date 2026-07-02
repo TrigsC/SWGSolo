@@ -303,4 +303,95 @@ class AiEconomyStockpileLot extends ManagedObject {
 		reservedQuantity = 0;
 		lastUpdatedTimestamp.updateToCurrentTime();
 	}
+
+	@dirty
+	@preLocked
+	public void initializeSpawnLot(
+			unsigned long newEntryId, unsigned long spawnObjectId,
+			final string spawnName, final string type,
+			final string classChain, final string planet,
+			final string zone, final string acquisition,
+			final string lifecycleState, final string confidence,
+			final string demandProfiles, final string tier,
+			boolean spawnActive, unsigned long newQuantity) {
+		entryId = newEntryId;
+		resourceSpawnObjectId = spawnObjectId;
+		conceptualLabel = type;
+		resourceSpawnName = spawnName;
+		resourceType = type;
+		resourceClassChain = classChain;
+		sourcePlanet = planet;
+		sourceZone = zone;
+		acquisitionSource = acquisition;
+		resourceLifecycleState = lifecycleState;
+		ownerScope = "galaxy";
+		identityConfidence = confidence;
+		matchedDemandProfiles = demandProfiles;
+		qualityTier = tier;
+		quantity = newQuantity;
+		reservedQuantity = 0;
+		activeAtAcquisition = spawnActive;
+		acquiredTimestamp.updateToCurrentTime();
+		lastUpdatedTimestamp.updateToCurrentTime();
+	}
+
+	@dirty
+	@preLocked
+	public void setResourceStats(int newOq, int newCd, int newDr,
+			int newHr, int newFl, int newMa, int newPe, int newSr,
+			int newUt, int newCr) {
+		oq = newOq;
+		cd = newCd;
+		dr = newDr;
+		hr = newHr;
+		fl = newFl;
+		ma = newMa;
+		pe = newPe;
+		sr = newSr;
+		ut = newUt;
+		cr = newCr;
+	}
+
+	// P.5.2: increment-by-delta deposit so producer yield and consumer draws
+	// compose. Persisted quantity is authoritative on-hand stock.
+	@dirty
+	@preLocked
+	public void addSpawnLotQuantity(unsigned long amount,
+			final string lifecycleState, boolean spawnActive) {
+		quantity += amount;
+		resourceLifecycleState = lifecycleState;
+		activeAtAcquisition = spawnActive;
+		lastUpdatedTimestamp.updateToCurrentTime();
+	}
+
+	// P.5.2 reservation primitives. The manager validates availability under the
+	// lot lock before calling these, so they are unconditional mutators.
+	@dirty
+	@preLocked
+	public void addReservedQuantity(unsigned long amount) {
+		reservedQuantity += amount;
+		lastUpdatedTimestamp.updateToCurrentTime();
+	}
+
+	@dirty
+	@preLocked
+	public void consumeReservedQuantity(unsigned long amount) {
+		reservedQuantity -= amount;
+		quantity -= amount;
+		lastUpdatedTimestamp.updateToCurrentTime();
+	}
+
+	@dirty
+	@preLocked
+	public void releaseReservedQuantity(unsigned long amount) {
+		reservedQuantity -= amount;
+		lastUpdatedTimestamp.updateToCurrentTime();
+	}
+
+	@dirty
+	@preLocked
+	public void clearReservedQuantity() {
+		reservedQuantity = 0;
+		lastUpdatedTimestamp.updateToCurrentTime();
+	}
 }

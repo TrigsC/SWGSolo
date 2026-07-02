@@ -508,24 +508,32 @@
             <strong id="coverage-desired-slots">0</strong>
           </div>
           <div>
-            <span>Covered Slots</span>
-            <strong id="coverage-actual-slots">0</strong>
+            <span>Fully Covered</span>
+            <strong id="coverage-fully-covered-slots">0</strong>
+          </div>
+          <div>
+            <span>Partially Covered</span>
+            <strong id="coverage-partially-covered-slots">0</strong>
+          </div>
+          <div>
+            <span>Uncovered Slots</span>
+            <strong id="coverage-uncovered-slots">0</strong>
           </div>
           <div>
             <span>Total Gap</span>
             <strong id="coverage-total-gap">0</strong>
           </div>
           <div>
+            <span>Active Coverage</span>
+            <strong id="coverage-active-miners">0</strong>
+          </div>
+          <div>
             <span>Stationed</span>
             <strong id="coverage-stationed-miners">0</strong>
           </div>
           <div>
-            <span>Moving</span>
-            <strong id="coverage-moving-miners">0</strong>
-          </div>
-          <div>
-            <span>Sampling</span>
-            <strong id="coverage-sampling-miners">0</strong>
+            <span>Assigned Not Stationed</span>
+            <strong id="coverage-assigned-not-stationed">0</strong>
           </div>
           <div>
             <span>Unassigned</span>
@@ -537,14 +545,14 @@
             <h3>Coverage By Profile</h3>
             <div class="scout-table-wrap">
               <table class="scout-table">
-                <thead>
-                  <tr>
-                    <th>Profile</th>
-                    <th>Desired</th>
-                    <th>Assigned</th>
-                    <th>Coverage</th>
-                    <th>Gap</th>
-                  </tr>
+              <thead>
+                <tr>
+                  <th>Profile</th>
+                  <th>Desired</th>
+                  <th>Assigned</th>
+                  <th>Active Coverage</th>
+                  <th>Gap</th>
+                </tr>
                 </thead>
                 <tbody id="coverage-profile-table"></tbody>
               </table>
@@ -571,6 +579,179 @@
               </thead>
               <tbody id="coverage-slot-table"></tbody>
             </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>Simulated Acquisition</h2>
+          <span id="sim-acquisition-state">ledger pending</span>
+        </div>
+        <div class="coverage-summary">
+          <div>
+            <span>Ready Miners</span>
+            <strong id="sim-acquisition-ready">0</strong>
+          </div>
+          <div>
+            <span>Acquisitions</span>
+            <strong id="sim-acquisition-count">0</strong>
+          </div>
+          <div>
+            <span>Resources Acquired</span>
+            <strong id="sim-acquisition-quantity">0</strong>
+          </div>
+          <div>
+            <span>Unique Resources</span>
+            <strong id="sim-acquisition-unique">0</strong>
+          </div>
+          <div>
+            <span>Ledger Rows</span>
+            <strong id="sim-acquisition-retained">0 / 0</strong>
+          </div>
+          <div>
+            <span>Average Qty</span>
+            <strong id="sim-acquisition-average">0</strong>
+          </div>
+          <div>
+            <span>Mode</span>
+            <strong id="sim-acquisition-mode">SIM</strong>
+          </div>
+        </div>
+        <div class="coverage-layout">
+          <div>
+            <h3>Transactions</h3>
+            <div class="scout-table-wrap">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Miner</th>
+                    <th>Actual Resource</th>
+                    <th>Type</th>
+                    <th>Planet</th>
+                    <th>Qty</th>
+                    <th>Density</th>
+                    <th>Profile</th>
+                    <th>Station</th>
+                    <th>Path</th>
+                    <th>Age</th>
+                  </tr>
+                </thead>
+                <tbody id="sim-acquisition-table"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Diagnostics</h3>
+            <div id="sim-acquisition-diagnostics" class="safety-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>Miner Recovery</h2>
+          <span id="miner-recovery-state">recovery pending</span>
+        </div>
+        <div class="coverage-summary">
+          <div>
+            <span>Tracked</span>
+            <strong id="miner-recovery-tracked">0</strong>
+          </div>
+          <div>
+            <span>Healthy</span>
+            <strong id="miner-recovery-healthy">0</strong>
+          </div>
+          <div>
+            <span>Needs Attention</span>
+            <strong id="miner-recovery-attention">0</strong>
+          </div>
+          <div>
+            <span>Actions Taken</span>
+            <strong id="miner-recovery-taken">0</strong>
+          </div>
+          <div>
+            <span>Actions Skipped</span>
+            <strong id="miner-recovery-skipped">0</strong>
+          </div>
+          <div>
+            <span>Mode</span>
+            <strong id="miner-recovery-mode">DRY RUN</strong>
+          </div>
+        </div>
+        <div class="coverage-layout">
+          <div>
+            <h3>Tracked Miners</h3>
+            <div class="scout-table-wrap">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Miner</th>
+                    <th>Status</th>
+                    <th>Resource</th>
+                    <th>Current</th>
+                    <th>Target</th>
+                    <th>Distance</th>
+                    <th>Ages</th>
+                    <th>Recommendation</th>
+                  </tr>
+                </thead>
+                <tbody id="miner-recovery-table"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Diagnostics</h3>
+            <div id="miner-recovery-diagnostics" class="safety-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel span-12">
+        <div class="panel-title">
+          <h2>Acquisition Readiness</h2>
+          <span id="acquisition-readiness-state">diagnostics pending</span>
+        </div>
+        <div class="coverage-summary">
+          <div>
+            <span>Stationed</span>
+            <strong id="acquisition-stationed">0</strong>
+          </div>
+          <div>
+            <span>Ready</span>
+            <strong id="acquisition-ready">0</strong>
+          </div>
+          <div>
+            <span>Blocked</span>
+            <strong id="acquisition-blocked">0</strong>
+          </div>
+          <div>
+            <span>Real Acquisition</span>
+            <strong id="acquisition-real-enabled">OFF</strong>
+          </div>
+        </div>
+        <div class="coverage-layout">
+          <div>
+            <h3>Ready Miners</h3>
+            <div class="scout-table-wrap">
+              <table class="scout-table">
+                <thead>
+                  <tr>
+                    <th>Miner</th>
+                    <th>Resource</th>
+                    <th>Profile</th>
+                    <th>Station</th>
+                    <th>Reserve</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="acquisition-ready-table"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Blocked Reasons</h3>
+            <div id="acquisition-blocked-list" class="safety-list"></div>
           </div>
         </div>
       </section>

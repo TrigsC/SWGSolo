@@ -42,6 +42,11 @@
 
 
 object_mobile_dressed_commoner_artisan_trandoshan_male_01 = object_mobile_shared_dressed_commoner_artisan_trandoshan_male_01:new {
+	-- Grants the player rider arrangement (arrangement 0 = "rider") so this
+	-- mobile can be slotted into a vehicle RIDER container (sim miner swoop
+	-- mount, P.4.4). Loaded from the client's abstract/slot/arrangement/
+	-- player.iff at startup; see docs/npc-mount-and-player-dot-plan.md.
+	arrangementDescriptorFilename = "abstract/slot/arrangement/player.iff",
 
 }
 

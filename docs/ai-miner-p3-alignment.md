@@ -260,20 +260,16 @@ P.3.1/P.3.2 adds the first conservative implementation of coverage-oriented mine
 
 The long-lived assignment status is `stationed`. When `stationedMinerConfig.enableStationedLifecycle=true`, a successful intelligent conceptual sample can retain its existing assignment instead of clearing it as `sampleComplete`. The retained assignment keeps its generation id, target hash, activation snapshot id, target resource identity, demand profile, zone, station timestamp, last station sample timestamp, station sample count, conceptual station yield quantity, and station duration.
 
-Repeated stationed sampling is separately gated by `stationedMinerConfig.enableStationedRepeatedSampling=false` by default. When explicitly enabled, it schedules another conceptual sample after `stationedSampleIntervalSeconds` plus jitter and still uses only the existing conceptual yield path. It does not create real resources, create `ResourceContainer` objects, mutate inventory, mutate vendors/market/crafting/credits, or write persistence.
+Repeated stationed sampling is separately gated by `stationedMinerConfig.enableStationedRepeatedSampling`. When enabled, it uses Core3 player sampling timing internally: sample results are modeled after the 3 second `sampleresults` task and the next stationed sample is scheduled after the 25 second player `sample` task interval. It does not create real resources, create `ResourceContainer` objects, mutate inventory, mutate vendors/market/crafting/credits, or write persistence.
 
-Stationed assignments clear or become eligible for reassignment only through explicit reasons such as `resourceDespawned`, `demandNoLongerValid`, `reserveSatisfied`, `maxStationDurationReached`, `maxStationSamplesReached`, `minerInvalid`, `zoneMismatch`, `manualReset`, or `emergencyDisabled`. `sampleFinished` remains an event; it is no longer treated as assignment completion when stationed lifecycle is enabled and the assignment remains valid.
+Stationed assignments clear or become eligible for reassignment only through explicit reasons such as `resourceDespawned`, `demandNoLongerValid`, `reserveSatisfied`, `strongerOpportunity`, `minerInvalid`, `zoneMismatch`, `manualReset`, or `emergencyDisabled`. `sampleFinished` remains an event; it is no longer treated as assignment completion when stationed lifecycle is enabled and the assignment remains valid.
 
 Configuration defaults:
 
 ```lua
 stationedMinerConfig = {
-    enableStationedLifecycle = false,
-    enableStationedRepeatedSampling = false,
-    stationedSampleIntervalSeconds = 300,
-    stationedSampleJitterSeconds = 60,
-    stationedMaxSamplesPerAssignment = 12,
-    stationedMaxDurationSeconds = 3600,
+    enableStationedLifecycle = true,
+    enableStationedRepeatedSampling = true,
     stationedRequireDemandStillValid = true,
     stationedRequireResourceStillActive = true,
     stationedRequireSamePlanet = true,
@@ -284,3 +280,219 @@ stationedMinerConfig = {
 Existing activity diagnostics now distinguish movement activity from coverage activity. `minerActivity.coverageActiveCount` includes moving, sampling, and stationed assignments, and stationed miners are not counted as idle. The dashboard shows Coverage Planner rows before Coverage Alignment so stable coverage is visible above lower-level path and activation diagnostics.
 
 Reachability memory is prepared for sustained coverage by recording `coverageRetainedCount`, `stationedSampleCount`, `stationedDurationSeconds`, and `sustainedCoverageConfidence` in runtime-only memory buckets. This strengthens positive evidence for locations that remain useful after arrival without changing candidate scoring, path validation trust, movement speed, NavArea behavior, extraction, inventory, market, vendor, crafting, credits, or persistence.
+
+## P.3.3 Implementation - Coverage Definition Audit + Acquisition Readiness
+
+P.3.3 tightens coverage terminology and adds acquisition-readiness diagnostics without implementing acquisition. The coverage planner now reports these definitions explicitly in `coveragePlanner.coverageDefinitions`:
+
+- `desiredCoverage`: sum of desired miner coverage slots across enabled demand profiles.
+- `assignedCoverage`: non-expired live assignments for a profile/resource/zone target.
+- `stationedCoverage`: assignments whose lifecycle is `stationed` after arrival/sample.
+- `activeCoverage`: stationed plus sampling plus queued/moving-to-target assignments.
+- `fullyCoveredSlot`: profile slot whose active coverage is at least desired coverage.
+- `partiallyCoveredSlot`: profile slot with some active coverage below desired coverage.
+- `uncoveredSlot`: profile slot with no active coverage.
+- `coverageGap`: `max(0, desiredCoverage - activeCoverage)`.
+- `assignedButNotStationed`: live assignments that have not reached long-lived stationed coverage.
+
+This means Desired, Covered, and Stationed can legitimately differ. Desired is the requested miner-slot total. Fully/partially/uncovered slot counts are profile-slot states. Stationed is only the productive retained state. Assigned miners can appear without active coverage when they are still candidate/validated, blocked, failed, or otherwise not yet queued/moving/sampling/stationed for that coverage slot.
+
+Reserve display is also explicit. Coverage slots now expose:
+
+- `exactResourceKnownQuantity`: runtime resource-aware conceptual yield tied to the exact source resource name.
+- `resourceTypeKnownQuantity`: runtime resource-aware conceptual yield tied to the source resource type.
+- `conceptualLabelKnownQuantity`: total known conceptual stockpile for the conceptual label.
+- `demandMatchedKnownQuantity`: stockpile quantity matched to the demand profile.
+- `stockpileKnownQuantity`: the display quantity chosen from the strongest available confidence tier.
+- `stockpileConfidence`: `exact_resource`, `resource_type`, `conceptual_label`, `demand_profile`, or `none`.
+
+`acquisitionReadiness` is a diagnostics-only API/dashboard section. A stationed miner is marked ready only when it is stationed, has known resource identity, is on the same planet, has a still-valid demand profile, is below reserve target when that gate is enabled, has verified activation-path provenance, and all safety flags are clean while real acquisition remains disabled.
+
+Example payload shape:
+
+```json
+{
+  "mode": "diagnostics-only",
+  "realResourceAcquisitionEnabled": false,
+  "stationedMiners": 6,
+  "acquisitionReadyMiners": 4,
+  "acquisitionBlockedMiners": 2,
+  "acquisitionBlockedReasons": [
+    { "reason": "reserveSatisfied", "count": 1 },
+    { "reason": "activationPathNotVerified", "count": 1 }
+  ],
+  "readyRows": [
+    {
+      "minerId": 12345,
+      "assignmentGenerationId": 77,
+      "resourceName": "example_resource",
+      "resourceType": "iron",
+      "conceptualLabel": "iron",
+      "planet": "naboo",
+      "demandProfile": "production_infrastructure",
+      "stationDurationSeconds": 900,
+      "stationSampleCount": 3,
+      "activationPathTrustStatus": "verifiedPath",
+      "stockpileConfidence": "resource_type",
+      "reserveRatio": 0.42,
+      "acquisitionReadinessStatus": "ready",
+      "acquisitionReadinessReason": "ready"
+    }
+  ]
+}
+```
+
+`realResourceAcquisitionConfig` contains placeholders only:
+
+```lua
+realResourceAcquisitionConfig = {
+    enableRealResourceAcquisition = false,
+    acquisitionReadinessDiagnosticsEnabled = true,
+    requireStationedLifecycle = true,
+    requireVerifiedActivationPath = true,
+    requireKnownResourceSpawnIdentity = true,
+    requireDemandStillValid = true,
+    requireReserveBelowTarget = true,
+    maxAcquisitionsPerInterval = 0,
+}
+```
+
+This phase still does not create resources, call extraction APIs, create `ResourceContainer` objects, mutate inventory, mutate vendors/market/crafting/credits, change demand/resource scoring, change path trust rules, change movement speed, change NavArea behavior, or write persistence.
+
+Market observation remains diagnostic and now defaults to listing-metadata-only resolution. `marketSupplyObservationConfig.resolveResourceContainers=false` prevents the observer from calling `ZoneServer::getObject` for auctioned items during normal dashboard/API operation, and `startupDelaySeconds` delays that heavier opt-in path after manager startup. This keeps acquisition-readiness and coverage diagnostics from forcing persistent object loads while the object broker is doing startup backup/update work.
+
+## P.3.4 - Simulated Acquisition Transactions
+
+P.3.4 adds `simulatedAcquisition`, a runtime-only ledger for exact resource acquisition events. A miner that completes an intelligent sample and passes the acquisition-readiness gates records the same exact assignment resource a future real miner would acquire:
+
+- `resourceName`: spawned SWG resource name, such as `Ptohi`, `Miki`, or `Nasi`.
+- `resourceType` / `resourceClass`: spawned SWG resource type, such as `fruit_fruits_naboo` or `steel_duralloy`.
+- `planet`, `spawnIdentity`, `density`, `concentration`, `demandProfile`, assignment generation, activation snapshot, path trust status, station duration, and quantity.
+
+The conceptual label is retained only as reporting provenance. It is not used as the acquired resource identity, and the dashboard transaction table displays actual resource name/type rather than labels like Iron, Copper, Gas, or Water.
+
+Example payload shape:
+
+```json
+{
+  "mode": "runtime-ledger",
+  "simulationOnly": true,
+  "readyMiners": 4,
+  "acquisitions": 12,
+  "resourcesAcquired": 286,
+  "uniqueResources": 5,
+  "averageQuantity": 23.83,
+  "acquisitionAttempts": 14,
+  "successfulAcquisitions": 12,
+  "blockedAcquisitions": 2,
+  "events": [
+    {
+      "minerId": 12345,
+      "resourceName": "Ptohi",
+      "resourceType": "fruit_fruits_naboo",
+      "planet": "naboo",
+      "quantity": 18,
+      "density": 61.5,
+      "demandProfile": "production_food",
+      "activationPathTrustStatus": "verifiedPath"
+    }
+  ]
+}
+```
+
+Config:
+
+```lua
+realResourceAcquisitionConfig = {
+    enableRealResourceAcquisition = false,
+    acquisitionReadinessDiagnosticsEnabled = true,
+    enableSimulatedAcquisitionTransactions = true,
+    simulatedAcquisitionLogTransactions = true,
+    simulatedAcquisitionMaxLedgerEvents = 200,
+    requireStationedLifecycle = true,
+    requireVerifiedActivationPath = true,
+    requireKnownResourceSpawnIdentity = true,
+    requireDemandStillValid = true,
+    requireReserveBelowTarget = true,
+    maxAcquisitionsPerInterval = 0,
+}
+```
+
+The transaction is recorded before the existing conceptual/resource-aware stockpile update, so a sample that satisfies the reserve still appears in the ledger. Reserve math remains otherwise unchanged. This phase still does not call extraction APIs, create `ResourceContainer` objects, mutate inventory, mutate vendors/market/crafting/credits, change demand/resource scoring, change coverage planning, change path validation, change movement/NavArea behavior, or write persistence.
+
+### P.3.4.1 - Counter vs Ledger Retention Audit
+
+`simulatedAcquisitionMaxLedgerEvents` is retention only. It caps the recent transaction rows kept in memory, not the lifetime/runtime counters. The dashboard separates:
+
+- `acquisitions`: total successful simulated acquisitions this server runtime.
+- `resourcesAcquired`: total simulated quantity this server runtime.
+- `ledgerRetainedRows`: recent rows currently retained for table display.
+- `ledgerMaxRows`: configured recent-row retention cap.
+
+`maxAcquisitionsPerInterval` remains a placeholder for future real acquisition and does not block simulated ledger transactions. If simulated acquisition stops ticking while miners remain ready, check whether additional sample-finished events are being scheduled. With `stationedMinerConfig.enableStationedRepeatedSampling=false`, a stationed miner records its initial successful sample/acquisition and then remains productive coverage without generating more transactions; the P.3.4.2 runtime config enables repeated stationed sampling.
+
+### P.3.4.3 - Single Owner Miner Work Loop
+
+The intended miner loop is now the exact-resource stationed lifecycle: coverage slot, exact resource assignment, verified path, move to resource, stationed, repeated exact-resource sampling, simulated acquisition transaction, then remain stationed until coverage or rebalance logic clears/reassigns the assignment.
+
+When `minerIntelligentTargetingConfig.enabled=true` and `stationedMinerConfig.enableStationedLifecycle=true`, the legacy conceptual miner loop is suppressed by default. `startSimLoop()` activates a pending intelligent assignment, leaves stationed miners under stationed-sample ownership, or waits for a planner assignment. It does not randomly choose broad labels such as Iron, Copper, Gas, or Water unless explicit legacy fallback config is enabled.
+
+The controller has a memory-only `workLoopGeneration` guard for delayed path, arrival, retry, survey-finish, sample-finish, and stationed-sample callbacks. If a delayed callback belongs to an older lifecycle generation, it exits without manager or logger side effects and without moving or sampling the miner. This prevents stale retries or legacy behavior tasks from pulling a stationed miner away from the exact resource target.
+
+Default config keeps legacy fallback off:
+
+```lua
+minerIntelligentTargetingConfig = {
+    fallbackToConceptualLoop = false,
+}
+
+legacyMinerLoopConfig = {
+    enableLegacyConceptualLoop = false,
+    allowLegacyFallbackWhenNoIntelligentAssignment = false,
+    allowLegacyFallbackAfterIntelligentFailure = false,
+    logLegacySuppression = true,
+}
+```
+
+Temporary legacy testing should use the explicit `legacyMinerLoopConfig` flags. Runtime proof fields are `minerActivity.legacyLoopSuppressedCount`, `legacyLoopStartedCount`, `intelligentLoopStartedCount`, and `lastSuppressedLegacyReason`. Safety boundaries remain unchanged: no real acquisition, no `ResourceContainer` creation, no inventory/vendor/market/crafting/credit mutation, no path-trust changes, no demand/resource scoring changes, no movement-speed changes, no NavArea changes, and no persistence writes.
+
+### P.3.4.2 - Stationed Sampling Loop With Game-Derived Timing
+
+Normal player sampling is implemented through `ResourceSpawner::sendSample`, `SurveySessionImplementation::rescheduleSampleResults`, and `SurveySessionImplementation::rescheduleSample`. The player path validates the active survey session/tool/resource/zone, computes density at the player position, schedules sample results after 3000 ms, and schedules the next sample task after 25000 ms. `ResourceSpawner::sendSampleResults` then uses surveying skill, density, private samplerate/samplesize modifiers, gamble/rich-node modifiers, and finally calls `extractResource` and inventory/container mutation only after the successful sample quantity is known.
+
+AI stationed sampling copies only the simulation-safe timing and quantity shape. It uses an internal Master Artisan surveying constant of 100, the density-based quantity formula shape `density * (25 + random(3))`, no gamble/rich-node/city multiplier, a 3 second sample result delay, and a 25 second stationed sample interval. The exact spawned resource remains the acquisition identity: `resourceName`, `resourceType`, `planet`, assignment generation, activation snapshot, target hash, density, and path trust provenance. Broad labels such as Iron, Copper, Gas, and Water are not acquisition identities.
+
+The Lua config no longer exposes interval, jitter, max-sample, or max-duration knobs for stationed sampling. The high-level switches are `enableStationedLifecycle` and `enableStationedRepeatedSampling`, plus the existing safety toggles for demand validity, active resource identity, same planet, and reserve satisfaction. Once repeated sampling is enabled, a stationed miner keeps sampling until coverage or safety logic clears/reassigns it.
+
+The API/dashboard fields `stationedSamplingEnabled`, `sampleIntervalSource`, `sampleIntervalSeconds`, `stationedSampleTicks`, `simulatedAcquisitionTransactions`, `exactResourceTotals`, and `lastStationedSampleAgeSeconds` make the loop observable. Runtime totals continue independently of recent ledger row retention.
+
+### P.3.4.4 - Miner Self-Healing, Safe Nudge, and Debug Teleport Tools
+
+P.3.4.4 introduces a recovery monitor for intelligent miner assignments. It is focused on liveness and assignment health, not increased movement. The monitor records current vs target position, current vs target zone, distance to station target, assignment age, movement age, last sample age, last simulated acquisition age, expected next stationed sample, lifecycle status, stuck reason, recovery recommendation, and copyable current/target coordinates.
+
+The API/dashboard section is `minerRecovery`. It exposes tracked/healthy/attention counts, action counters, dry-run state, recovery config flags, status/reason counts, and per-miner rows with controller/miner presence, combat/dead/incap flags, distance, ages, recommendation, and last action.
+
+Default config keeps diagnostics active and recovery non-mutating:
+
+```lua
+minerRecoveryConfig = {
+    enabled = true,
+    dryRun = true,
+    allowClearAssignment = true,
+    allowNudgeToSafeNearbyPoint = false,
+    allowTeleportToStationTarget = false,
+    allowRespawnReplacement = false,
+    adminActionsEnabled = false,
+    stuckCheckIntervalSeconds = 60,
+    movingStuckSeconds = 180,
+    stationedSamplingGraceSeconds = 90,
+    farFromStationDistanceMeters = 32,
+    maxAutomaticRecoveriesPerInterval = 2,
+    maxRecoveriesPerMinerPerHour = 3,
+    logRecoveryDecisions = true,
+}
+```
+
+When `dryRun=false`, automatic recovery remains deliberately narrow: it can clear a stuck assignment through the existing assignment-clear path when rate limits allow. Nudge, teleport, and respawn are represented as disabled debug capabilities in this phase; copyable coordinates are preferred until a safe explicit admin action path is implemented and enabled. No player or non-SimPlayer teleport is added.
+
+Safety boundaries remain unchanged: no real acquisition, no `ResourceContainer` creation, no inventory/vendor/market/crafting/credit mutation, no path trust relaxation, no movement speed change, no global NavArea behavior change, and no persistence writes.

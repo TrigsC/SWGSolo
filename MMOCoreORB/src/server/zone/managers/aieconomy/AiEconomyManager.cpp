@@ -37,6 +37,11 @@ void AiEconomyManager::initialize() {
 	economyData = nullptr;
 	persistenceReady.set(false);
 	conceptualMinerStartupTotals.removeAll();
+	activeReservations.removeAll();
+	nextReservationToken = 1;
+	reservationsGranted = 0;
+	reservationsConsumed = 0;
+	reservationsReleased = 0;
 
 	bool created = false;
 	String failureReason;
@@ -70,6 +75,9 @@ void AiEconomyManager::initialize() {
 		" persistentStockpileSupplyChanged=false", true);
 
 	logLoadedConceptualStockpileSummary();
+	// P.5.2: reservations do not survive a restart, so clear any reservedQuantity
+	// left on lots by a crash mid-reservation.
+	reconcileReservationsOnLoad();
 }
 
 bool AiEconomyManager::isPersistenceReady() const {
@@ -326,6 +334,514 @@ bool AiEconomyManager::updateConceptualMinerTotals(
 	}
 
 	return true;
+}
+
+bool AiEconomyManager::updateStockpileSpawnLots(
+		const Vector<AiEconomySpawnLotDeposit>& deposits,
+		int& createdLots, int& updatedLots, uint64& totalQuantity,
+		String& failureReason) {
+	createdLots = 0;
+	updatedLots = 0;
+	totalQuantity = 0;
+	failureReason = "";
+
+	Locker mutationLocker(&persistenceMutationMutex);
+
+	ManagedReference<AiEconomyData*> data = economyData;
+
+	if (!persistenceReady.get() || data == nullptr) {
+		failureReason = "persistenceUnavailable";
+		return false;
+	}
+
+	// spawnObjectID -> quantity delta to ADD this flush (P.5.2 increment model).
+	VectorMap<uint64, uint64> deltaSnapshot;
+
+	for (int i = 0; i < deposits.size(); ++i) {
+		const AiEconomySpawnLotDeposit& deposit = deposits.get(i);
+
+		if (deposit.resourceSpawnObjectID == 0) {
+			failureReason = "invalidSpawnDepositId";
+			return false;
+		}
+
+		if (deposit.quantityDelta == 0)
+			continue;
+
+		if (deposit.quantityDelta > MAX_STOCKPILE_QUANTITY) {
+			failureReason = "invalidSpawnDepositQuantity spawn=" +
+				String::valueOf(deposit.resourceSpawnObjectID);
+			return false;
+		}
+
+		if (deposit.resourceType.isEmpty() &&
+				deposit.resourceSpawnName.isEmpty()) {
+			failureReason = "missingSpawnDepositIdentity spawn=" +
+				String::valueOf(deposit.resourceSpawnObjectID);
+			return false;
+		}
+
+		if (!stringWithinLimit(deposit.resourceSpawnName, MAX_LABEL_LENGTH) ||
+				!stringWithinLimit(deposit.resourceType, MAX_LABEL_LENGTH) ||
+				!stringWithinLimit(deposit.sourcePlanet, MAX_LABEL_LENGTH) ||
+				!stringWithinLimit(deposit.sourceZone, MAX_LABEL_LENGTH) ||
+				!stringWithinLimit(deposit.qualityTier, MAX_LABEL_LENGTH) ||
+				!stringWithinLimit(
+					deposit.resourceClassChain, MAX_METADATA_LENGTH) ||
+				!stringWithinLimit(
+					deposit.matchedDemandProfiles, MAX_METADATA_LENGTH)) {
+			failureReason = "spawnDepositMetadataLimitExceeded spawn=" +
+				String::valueOf(deposit.resourceSpawnObjectID);
+			return false;
+		}
+
+		if (deltaSnapshot.contains(deposit.resourceSpawnObjectID)) {
+			failureReason = "duplicateSpawnDeposit spawn=" +
+				String::valueOf(deposit.resourceSpawnObjectID);
+			return false;
+		}
+
+		deltaSnapshot.put(
+			deposit.resourceSpawnObjectID, deposit.quantityDelta);
+	}
+
+	if (deltaSnapshot.size() == 0)
+		return true;
+
+	Vector<ManagedReference<AiEconomyStockpileLot*> > lots;
+	uint64 nextEntryID = 0;
+
+	{
+		Locker dataLocker(data);
+		nextEntryID = data->getNextStockpileEntryId();
+
+		Vector<ManagedReference<AiEconomyStockpileLot*> >* storedLots =
+			data->getStockpileLots();
+
+		if (storedLots == nullptr) {
+			persistenceReady.set(false);
+			failureReason = "nullStockpileLotVector";
+			return false;
+		}
+
+		for (int i = 0; i < storedLots->size(); ++i)
+			lots.add(storedLots->get(i));
+	}
+
+	VectorMap<uint64, ManagedReference<AiEconomyStockpileLot*> > spawnLots;
+
+	for (int i = 0; i < lots.size(); ++i) {
+		ManagedReference<AiEconomyStockpileLot*> lot = lots.get(i);
+
+		if (lot == nullptr) {
+			persistenceReady.set(false);
+			failureReason = "nullStockpileLot";
+			return false;
+		}
+
+		uint64 spawnObjectID = 0;
+		String identityConfidence;
+
+		{
+			Locker lotLocker(lot);
+			spawnObjectID = lot->getResourceSpawnObjectId();
+			identityConfidence = lot->getIdentityConfidence();
+		}
+
+		if (spawnObjectID == 0 || identityConfidence != "exact_type")
+			continue;
+
+		if (spawnLots.contains(spawnObjectID)) {
+			persistenceReady.set(false);
+			failureReason = "duplicateSpawnLot spawn=" +
+				String::valueOf(spawnObjectID);
+			return false;
+		}
+
+		spawnLots.put(spawnObjectID, lot);
+	}
+
+	int missingLotCount = 0;
+
+	for (int i = 0; i < deltaSnapshot.size(); ++i) {
+		uint64 spawnObjectID = deltaSnapshot.elementAt(i).getKey();
+
+		if (!spawnLots.contains(spawnObjectID))
+			missingLotCount++;
+	}
+
+	if (lots.size() + missingLotCount > MAX_STOCKPILE_LOTS) {
+		persistenceReady.set(false);
+		failureReason = "stockpileLotLimitExceeded";
+		return false;
+	}
+
+	Vector<ManagedReference<AiEconomyStockpileLot*> > newLots;
+
+	try {
+		for (int i = 0; i < deposits.size(); ++i) {
+			const AiEconomySpawnLotDeposit& deposit = deposits.get(i);
+
+			if (!deltaSnapshot.contains(deposit.resourceSpawnObjectID))
+				continue;
+
+			uint64 delta =
+				deltaSnapshot.get(deposit.resourceSpawnObjectID);
+
+			if (spawnLots.contains(deposit.resourceSpawnObjectID)) {
+				ManagedReference<AiEconomyStockpileLot*> lot =
+					spawnLots.get(deposit.resourceSpawnObjectID);
+
+				bool lotChanged = false;
+
+				{
+					Locker lotLocker(lot);
+					// Clamp so on-hand never exceeds the validation ceiling.
+					uint64 current = lot->getQuantity();
+					uint64 addable =
+						current >= MAX_STOCKPILE_QUANTITY ? 0 :
+						(delta < MAX_STOCKPILE_QUANTITY - current ? delta :
+							MAX_STOCKPILE_QUANTITY - current);
+
+					if (addable > 0) {
+						lot->addSpawnLotQuantity(
+							addable,
+							deposit.resourceLifecycleState,
+							deposit.activeAtAcquisition);
+						totalQuantity += addable;
+						lotChanged = true;
+					}
+				}
+
+				// Durability: addSpawnLotQuantity writes the field directly and
+				// does not dirty the managed object, so the periodic DB save
+				// would skip it and the deposit growth would be lost on restart.
+				// Flag it for persistence (matches the persistObject idiom below).
+				if (lotChanged)
+					ObjectManager::instance()->updatePersistentObject(lot);
+
+				updatedLots++;
+				continue;
+			}
+
+			if (nextEntryID == 0 || nextEntryID == static_cast<uint64>(-1)) {
+				persistenceReady.set(false);
+				failureReason = "stockpileEntryIdExhausted";
+				return false;
+			}
+
+			// Allocate via the existing constructor; initializeSpawnLot below
+			// overwrites every field with the exact-identity deposit values.
+			ManagedReference<AiEconomyStockpileLot*> newLot =
+				new AiEconomyStockpileLot(
+					nextEntryID, deposit.resourceType, delta);
+
+			{
+				Locker lotLocker(newLot);
+				newLot->initializeSpawnLot(
+					nextEntryID,
+					deposit.resourceSpawnObjectID,
+					deposit.resourceSpawnName,
+					deposit.resourceType,
+					deposit.resourceClassChain,
+					deposit.sourcePlanet,
+					deposit.sourceZone,
+					deposit.acquisitionSource,
+					deposit.resourceLifecycleState,
+					deposit.identityConfidence,
+					deposit.matchedDemandProfiles,
+					deposit.qualityTier,
+					deposit.activeAtAcquisition,
+					delta);
+				newLot->setResourceStats(
+					deposit.oq, deposit.cd, deposit.dr, deposit.hr,
+					deposit.fl, deposit.ma, deposit.pe, deposit.sr,
+					deposit.ut, deposit.cr);
+			}
+
+			totalQuantity += delta;
+
+			ObjectManager::instance()->persistObject(
+				newLot, 1, AI_ECONOMY_LOTS_DATABASE);
+
+			newLots.add(newLot);
+			spawnLots.put(deposit.resourceSpawnObjectID, newLot);
+			nextEntryID++;
+			createdLots++;
+		}
+
+		{
+			Locker dataLocker(data);
+
+			for (int i = 0; i < newLots.size(); ++i)
+				data->addStockpileLot(newLots.get(i));
+
+			if (newLots.size() > 0)
+				data->setNextStockpileEntryId(nextEntryID);
+			else
+				data->updateTimestamp();
+		}
+	} catch (Exception& e) {
+		persistenceReady.set(false);
+		failureReason = String("persistenceException: ") + e.getMessage();
+		return false;
+	}
+
+	int validatedLotCount = 0;
+
+	if (!validateEconomyData(data, failureReason, validatedLotCount)) {
+		persistenceReady.set(false);
+		return false;
+	}
+
+	return true;
+}
+
+void AiEconomyManager::reconcileReservationsOnLoad() {
+	Locker mutationLocker(&persistenceMutationMutex);
+
+	activeReservations.removeAll();
+
+	ManagedReference<AiEconomyData*> data = economyData;
+
+	if (!persistenceReady.get() || data == nullptr)
+		return;
+
+	Vector<ManagedReference<AiEconomyStockpileLot*> > lots;
+
+	{
+		Locker dataLocker(data);
+		Vector<ManagedReference<AiEconomyStockpileLot*> >* storedLots =
+			data->getStockpileLots();
+
+		if (storedLots == nullptr)
+			return;
+
+		for (int i = 0; i < storedLots->size(); ++i)
+			lots.add(storedLots->get(i));
+	}
+
+	int clearedLots = 0;
+
+	for (int i = 0; i < lots.size(); ++i) {
+		ManagedReference<AiEconomyStockpileLot*> lot = lots.get(i);
+
+		if (lot == nullptr)
+			continue;
+
+		Locker lotLocker(lot);
+
+		if (lot->getReservedQuantity() > 0) {
+			lot->clearReservedQuantity();
+			clearedLots++;
+		}
+	}
+
+	if (clearedLots > 0)
+		info(String("AiEconomyReservationReconcile clearedLots=") +
+			String::valueOf(clearedLots) + " mode=load-reset", true);
+}
+
+bool AiEconomyManager::reserveFromStockpile(
+		const String& resourceType, int minOq, uint64 quantity,
+		uint64& outToken, uint64& outEntryID, String& failureReason) {
+	outToken = 0;
+	outEntryID = 0;
+	failureReason = "";
+
+	if (quantity == 0) {
+		failureReason = "zeroQuantity";
+		return false;
+	}
+
+	Locker mutationLocker(&persistenceMutationMutex);
+
+	ManagedReference<AiEconomyData*> data = economyData;
+
+	if (!persistenceReady.get() || data == nullptr) {
+		failureReason = "persistenceUnavailable";
+		return false;
+	}
+
+	Vector<ManagedReference<AiEconomyStockpileLot*> > lots;
+
+	{
+		Locker dataLocker(data);
+		Vector<ManagedReference<AiEconomyStockpileLot*> >* storedLots =
+			data->getStockpileLots();
+
+		if (storedLots == nullptr) {
+			failureReason = "nullStockpileLotVector";
+			return false;
+		}
+
+		for (int i = 0; i < storedLots->size(); ++i)
+			lots.add(storedLots->get(i));
+	}
+
+	ManagedReference<AiEconomyStockpileLot*> bestLot;
+	uint64 bestEntryID = 0;
+	String bestResourceType;
+	int bestOq = -1;
+	uint64 bestAvailable = 0;
+
+	// Crafting-grade selection: prefer the highest-OQ eligible exact lot, then
+	// the deepest stack.
+	for (int i = 0; i < lots.size(); ++i) {
+		ManagedReference<AiEconomyStockpileLot*> lot = lots.get(i);
+
+		if (lot == nullptr)
+			continue;
+
+		Locker lotLocker(lot);
+
+		if (lot->getIdentityConfidence() != "exact_type" ||
+				lot->getResourceLifecycleState() == "despawned")
+			continue;
+
+		if (!resourceType.isEmpty() && lot->getResourceType() != resourceType)
+			continue;
+
+		int oq = lot->getOq();
+
+		if (oq < minOq)
+			continue;
+
+		uint64 available = lot->getAvailableQuantity();
+
+		if (available < quantity)
+			continue;
+
+		if (oq > bestOq || (oq == bestOq && available > bestAvailable)) {
+			bestOq = oq;
+			bestAvailable = available;
+			bestLot = lot;
+			bestEntryID = lot->getEntryId();
+			bestResourceType = lot->getResourceType();
+		}
+	}
+
+	if (bestLot == nullptr) {
+		failureReason = "noEligibleLot";
+		return false;
+	}
+
+	{
+		Locker lotLocker(bestLot);
+
+		if (bestLot->getAvailableQuantity() < quantity) {
+			failureReason = "insufficientAvailable";
+			return false;
+		}
+
+		bestLot->addReservedQuantity(quantity);
+	}
+
+	uint64 token = nextReservationToken++;
+
+	HiveReservation reservation;
+	reservation.token = token;
+	reservation.entryID = bestEntryID;
+	reservation.quantity = quantity;
+	reservation.resourceType = bestResourceType;
+	reservation.lot = bestLot;
+
+	activeReservations.put(token, reservation);
+	reservationsGranted++;
+
+	outToken = token;
+	outEntryID = bestEntryID;
+	return true;
+}
+
+bool AiEconomyManager::consumeReservation(uint64 token, String& failureReason) {
+	failureReason = "";
+
+	Locker mutationLocker(&persistenceMutationMutex);
+
+	if (!persistenceReady.get()) {
+		failureReason = "persistenceUnavailable";
+		return false;
+	}
+
+	if (!activeReservations.contains(token)) {
+		failureReason = "unknownReservation";
+		return false;
+	}
+
+	HiveReservation reservation = activeReservations.get(token);
+	ManagedReference<AiEconomyStockpileLot*> lot = reservation.lot;
+
+	if (lot == nullptr) {
+		activeReservations.drop(token);
+		failureReason = "lotMissing";
+		return false;
+	}
+
+	{
+		Locker lotLocker(lot);
+
+		if (lot->getReservedQuantity() < reservation.quantity ||
+				lot->getQuantity() < reservation.quantity) {
+			failureReason = "ledgerInconsistent";
+			return false;
+		}
+
+		lot->consumeReservedQuantity(reservation.quantity);
+	}
+
+	// Durability: consumeReservedQuantity writes quantity/reservedQuantity
+	// directly without dirtying the managed object, so the draw-down must be
+	// flagged for the periodic DB save or it would be lost on restart.
+	ObjectManager::instance()->updatePersistentObject(lot);
+
+	activeReservations.drop(token);
+	reservationsConsumed++;
+	return true;
+}
+
+bool AiEconomyManager::releaseReservation(uint64 token, String& failureReason) {
+	failureReason = "";
+
+	Locker mutationLocker(&persistenceMutationMutex);
+
+	if (!activeReservations.contains(token)) {
+		failureReason = "unknownReservation";
+		return false;
+	}
+
+	HiveReservation reservation = activeReservations.get(token);
+	ManagedReference<AiEconomyStockpileLot*> lot = reservation.lot;
+
+	if (lot != nullptr) {
+		Locker lotLocker(lot);
+
+		uint64 reserved = lot->getReservedQuantity();
+		uint64 release = reservation.quantity < reserved ?
+			reservation.quantity : reserved;
+
+		if (release > 0)
+			lot->releaseReservedQuantity(release);
+	}
+
+	activeReservations.drop(token);
+	reservationsReleased++;
+	return true;
+}
+
+void AiEconomyManager::getReservationStats(
+		int& activeReservationsOut, uint64& reservedQuantity,
+		uint64& granted, uint64& consumed, uint64& released) {
+	Locker mutationLocker(&persistenceMutationMutex);
+
+	activeReservationsOut = activeReservations.size();
+	granted = reservationsGranted;
+	consumed = reservationsConsumed;
+	released = reservationsReleased;
+	reservedQuantity = 0;
+
+	for (int i = 0; i < activeReservations.size(); ++i)
+		reservedQuantity += activeReservations.get(i).quantity;
 }
 
 bool AiEconomyManager::snapshotPersistentConceptualMinerSupplyForDemand(

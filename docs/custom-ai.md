@@ -484,19 +484,22 @@ Current enabled status:
 | Source | Current value | Runtime effect |
 |---|---:|---|
 | `SimPlayerManagerConfig.enabled` | `true` | Allows `SimPlayerManager` to load config and spawn configured groups. |
-| Miner spawn group `totalCount` | `0` | No miners spawn from default startup config. |
-| Miner spawn group `templates` | `light_jedi_sentinel`, `artisan` | Would be used if `totalCount` were raised above zero. |
+| `spawnStartupConfig.startupDelaySeconds` | `0` | Starts configured SimPlayer spawning immediately so miners are present for planner/acquisition soak. |
+| `spawnStartupConfig.batchSize` | `5` | Spawns configured SimPlayers in small batches instead of one startup burst. |
+| `spawnStartupConfig.batchDelayMs` | `1000` | Delay between configured spawn batches. |
+| Miner spawn group `totalCount` | `10` | Current configured miner population, spawned after the startup delay and batch throttle. |
+| Miner spawn group `templates` | `artisan` | Creature template used for configured miners. |
 | Miner spawn group `behavior` | `gather_resources` | Loaded into `SpawnGroup.behavior`, but not used by controller selection. Non-`pvp` groups become miners. |
 | Miner spawn group `minerConfig` | Present with current defaults | Configures conceptual resource names, survey/sample timings, movement search radii, fallback radius, optional state-transition logging, and memory-only conceptual yield accounting. |
 
 Startup and spawn flow:
 
 1. `ZoneServerImplementation.cpp` calls `SimPlayerManager::instance()->initialize()`.
-2. `SimPlayerManager::initialize` calls `loadLuaConfig` and then `spawnConfiguredGroups`.
+2. `SimPlayerManager::initialize` calls `loadLuaConfig` and schedules `SimPlayerConfiguredSpawnTask` using `spawnStartupConfig.startupDelaySeconds`.
 3. `loadLuaConfig` runs `scripts/managers/sim_player_manager.lua` through a dedicated C++ `Lua` instance.
-4. The manager loads `enabled`, `shuttleports`, and each spawn group's `type`, `totalCount`, `behavior`, `faction`, `templates`, and optional `minerConfig`.
-5. `spawnConfiguredGroups` loops each group `totalCount` times. Because the miner count is currently `0`, the miner group is skipped.
-6. If enabled in the future, `spawnFromConfig` would pick a random shuttleport and random template, spawn an AiAgent creature, set SimPlayer flags, and choose the controller.
+4. The manager loads `enabled`, `spawnStartupConfig`, `shuttleports`, and each spawn group's `type`, `totalCount`, `behavior`, `faction`, `templates`, and optional `minerConfig`.
+5. The configured spawn task emits at most `batchSize` SimPlayers per run and reschedules itself after `batchDelayMs` until all configured groups are spawned.
+6. `spawnFromConfig` picks a random shuttleport and random template, spawns a non-persistent AiAgent creature, sets SimPlayer flags, and chooses the controller.
 7. Controller selection is based on `g.type.beginsWith("pvp")`. Non-PvP groups, including the current `type = "miner"`, get `SimMinerController`.
 
 Controller state machine:
@@ -596,6 +599,7 @@ Logs and debug output:
 Stability considerations:
 
 - `SimPlayerManagerConfig.enabled` is a fail-closed master gate. The manager defaults to disabled in C++, disables itself before attempting Lua load, and returns from initialization before spawning or scheduling when the Lua switch is false or invalid. Every periodic task and late spawn/cycle/yield entry point rechecks the master gate, so an already queued task cannot perform Resource Intelligence, market, demand, path-validation, or miner work after disable.
+- Configured SimPlayer spawning is batched by `spawnStartupConfig`. The default keeps miners available immediately for planner/acquisition soak while avoiding one large synchronous `AiAgent` creation burst.
 - `SimPathFindTask`, `ArrivalCheckTask`, `SimBehaviorTask`, and `SimRetryTask` all hold weak references to the controller and bounce work back through `Core::getTaskManager()->executeTask`.
 - `SimBehaviorTask` re-resolves the miner controller inside the task-manager lambda from a captured strong base-controller reference. It should not capture raw delayed `SimMinerController*` pointers because survey/sample callbacks can run after a controller is stopped or recycled.
 - The periodic miner summary task is manager-owned and calls back through `SimPlayerManager::instance()`; it does not capture controller or AiAgent pointers.
@@ -603,7 +607,7 @@ Stability considerations:
 - Miner movement validates navmesh and fallback destinations against the ground-zone boundary before terrain-height or pathfinding calls. A random fallback that crosses the terrain edge is biased toward the planet center; if it is still invalid, the loop retries without querying out-of-bounds terrain. This prevents the long-running conceptual random walk from producing repeated `TerrainManager` stack traces.
 - `checkArrival` locks the AiAgent while examining combat/death/movement state and updating patrol movement, but releases that lock before scheduling another task, restarting path selection, or invoking the behavior-specific `onArrived` callback.
 - Resource Intelligence copies strong `ResourceSpawn` references while holding a short `ResourceManager` read lock, then releases the manager lock before locking and inspecting individual spawns. Density simulation follows the same manager-then-release/spawn-lock separation. This avoids holding the global resource-manager lock across per-spawn metadata or density work.
-- The current miner can schedule repeated arrival checks every 500 ms while moving and every 1000 ms while waiting, incapped, or in combat.
+- The current miner can schedule repeated arrival checks every 500 ms while moving and every 1000 ms while waiting, incapped, or in combat. Stationed intelligent miners stop rescheduling arrival checks because retained coverage is no longer movement work.
 - Pathfinding failure schedules a retry after 5000 ms by calling `startSimLoop` again.
 - If miners are enabled, they will be always-active SimPlayers with `simAlwaysActive`, `simPlayerBot`, and `despawnOnNoPlayerInRange(false)` set by the manager.
 
@@ -2643,7 +2647,7 @@ minerIntelligentTargetingConfig = {
     requireDemandWeightedPlan = true,
     requireAcceptedDensityTarget = true,
     requireValidPath = true,
-    fallbackToConceptualLoop = true,
+    fallbackToConceptualLoop = false,
     rollbackOnFailureCount = 3,
     logDecisionSummary = true,
 }
@@ -2658,7 +2662,7 @@ minerIntelligentTargetingConfig = {
 | `requireDemandWeightedPlan` | `true` | Requires a D.6.6-style demand-weighted plan before a miner would be eligible. |
 | `requireAcceptedDensityTarget` | `true` | Requires an accepted same-planet density target for the selected resource. |
 | `requireValidPath` | `true` | Requires a matching cached D.5.2 path-validation result with `pathFound=true`. |
-| `fallbackToConceptualLoop` | `true` | Documents that the current conceptual loop remains the fallback. |
+| `fallbackToConceptualLoop` | `false` | Keeps the legacy conceptual loop from owning intelligent/stationed miners; use `legacyMinerLoopConfig` only for temporary tests. |
 | `rollbackOnFailureCount` | `3` | Number of consecutive failed decisions before diagnostics mark `rollbackHeld=true`. |
 | `logDecisionSummary` | `true` | Emits one compact per-interval summary. |
 
@@ -2674,13 +2678,13 @@ Decision flow:
 Example successful shadow decision:
 
 ```text
-MinerTargetingSwitchDecision miner=281475017397855 zone=corellia mode=shadow selectedProfile=chef_high_value_consumables demandState=surplus pressureScore=482.5 targetResource=Ptohi targetType=fruit_fruits_naboo targetSource=demand_weighted_plan samePlanet=true travelRequired=false densityTargetStatus=accepted pathValidationStatus=valid wouldActivate=true actualActivation=false fallbackReason=shadowMode fallbackToConceptualLoop=true rollbackHeld=false failureCount=0 assignmentReason="highest demand pressure; same-planet opportunity" decisionBasis=demandWeightedMinerPlanSimulation diagnosticOnly=true mode=diagnostic-only
+MinerTargetingSwitchDecision miner=281475017397855 zone=corellia mode=shadow selectedProfile=chef_high_value_consumables demandState=surplus pressureScore=482.5 targetResource=Ptohi targetType=fruit_fruits_naboo targetSource=demand_weighted_plan samePlanet=true travelRequired=false densityTargetStatus=accepted pathValidationStatus=valid wouldActivate=true actualActivation=false fallbackReason=shadowMode fallbackToConceptualLoop=false rollbackHeld=false failureCount=0 assignmentReason="highest demand pressure; same-planet opportunity" decisionBasis=demandWeightedMinerPlanSimulation diagnosticOnly=true mode=diagnostic-only
 ```
 
 Example fail-closed decision:
 
 ```text
-MinerTargetingSwitchDecision miner=281475017397855 zone=naboo mode=shadow selectedProfile=production_infrastructure demandState=surplus pressureScore=443.5 targetResource=Toahiiam targetType=iron_doonium targetSource=demand_weighted_plan samePlanet=true travelRequired=false densityTargetStatus=accepted pathValidationStatus=failed pathRejectReason=noPath wouldActivate=false actualActivation=false fallbackReason=pathValidationFailed fallbackToConceptualLoop=true rollbackHeld=false failureCount=2 assignmentReason="highest demand pressure; same-planet opportunity" decisionBasis=demandWeightedMinerPlanSimulation diagnosticOnly=true mode=diagnostic-only
+MinerTargetingSwitchDecision miner=281475017397855 zone=naboo mode=shadow selectedProfile=production_infrastructure demandState=surplus pressureScore=443.5 targetResource=Toahiiam targetType=iron_doonium targetSource=demand_weighted_plan samePlanet=true travelRequired=false densityTargetStatus=accepted pathValidationStatus=failed pathRejectReason=noPath wouldActivate=false actualActivation=false fallbackReason=pathValidationFailed fallbackToConceptualLoop=false rollbackHeld=false failureCount=2 assignmentReason="highest demand pressure; same-planet opportunity" decisionBasis=demandWeightedMinerPlanSimulation diagnosticOnly=true mode=diagnostic-only
 ```
 
 Summary example:
@@ -2728,7 +2732,7 @@ minerIntelligentTargetingConfig = {
     requireDemandWeightedPlan = true,
     requireAcceptedDensityTarget = true,
     requireValidPath = true,
-    fallbackToConceptualLoop = true,
+    fallbackToConceptualLoop = false,
     rollbackOnFailureCount = 3,
     logDecisionSummary = true,
     assignmentConfig = {
@@ -2820,7 +2824,7 @@ minerIntelligentTargetingConfig = {
     requireDemandWeightedPlan = true,
     requireAcceptedDensityTarget = true,
     requireValidPath = true,
-    fallbackToConceptualLoop = true,
+    fallbackToConceptualLoop = false,
     rollbackOnFailureCount = 3,
     logDecisionSummary = true,
     assignmentConfig = {
@@ -3846,6 +3850,8 @@ marketSupplyObservationConfig = {
     includeVendorStockrooms = false,
     includePlayerInventory = false,
     includePrivateContainers = false,
+    resolveResourceContainers = false,
+    startupDelaySeconds = 900,
     minQuantity = 1,
     logTopN = 5,
 }
@@ -3861,6 +3867,8 @@ marketSupplyObservationConfig = {
 | `includeVendorStockrooms` | `false`; stockroom scanning is not implemented. Setting it true only reports it as deferred. |
 | `includePlayerInventory` | `false`; private player inventory is never scanned in this phase. |
 | `includePrivateContainers` | `false`; private containers are never scanned in this phase. |
+| `resolveResourceContainers` | `false`; when false, the task copies public listing metadata but does not call `ZoneServer::getObject` for auctioned items, avoiding diagnostic-driven persistent object loads. |
+| `startupDelaySeconds` | 900, clamped to 1-3600. Even when resource-container resolution is explicitly enabled, the observer delays that object-resolution path after manager startup. |
 | `minQuantity` | 1, clamped to 1-100,000,000. |
 | `logTopN` | 5, clamped to 1-20 profile summaries per observation interval. |
 
@@ -3873,11 +3881,12 @@ Core3 represents both bazaar sales and player-vendor sales through `AuctionManag
 1. Obtain the galaxy-level bazaar and/or player-vendor terminal lists under the existing `AuctionsMap` accessors.
 2. Copy managed `AuctionItem` references from each terminal list under its read lock.
 3. Copy only `FORSALE` listing primitives: item ID, vendor ID, owner ID, listed price, and bazaar/vendor source.
-4. Resolve the listed scene object through `ZoneServer::getObject`, which uses the existing object broker. Missing or unavailable objects are skipped; the observer does not load objects from a database itself.
-5. Accept only `ResourceContainer` objects meeting `minQuantity`.
-6. Copy quantity and a strong `ResourceSpawn` reference under the resource-container lock, release it, then copy resource name, exact type, class chain, stats, and shift metadata under a separate resource lock.
-7. Resolve the public terminal's planet when its vendor/bazaar object and zone are available.
-8. Release all game-object locks before profile matching, aggregation, sorting, median calculation, or logging.
+4. By default, stop after listing metadata and publish an empty resource-supply snapshot with the scanned listing count. This keeps dashboard/API shape available without object-broker lookups.
+5. Only when `resolveResourceContainers=true` and the startup delay has elapsed, resolve the listed scene object through `ZoneServer::getObject`, which uses the existing object broker and may load persistent objects. Missing or unavailable objects are skipped.
+6. Accept only `ResourceContainer` objects meeting `minQuantity`.
+7. Copy quantity and a strong `ResourceSpawn` reference under the resource-container lock, release it, then copy resource name, exact type, class chain, stats, and shift metadata under a separate resource lock.
+8. Resolve the public terminal's planet when its vendor/bazaar object and zone are available.
+9. Release all game-object locks before profile matching, aggregation, sorting, median calculation, or logging.
 
 The observation cache contains only per-profile primitive/string aggregates. It retains no `AuctionItem`, vendor, `ResourceContainer`, or `ResourceSpawn` pointer.
 
@@ -4821,6 +4830,154 @@ P.3.1/P.3.2 moves intelligent SimMiner diagnostics toward stable resource covera
 
 The retained assignment lifecycle adds `stationed`. With `stationedMinerConfig.enableStationedLifecycle=false` by default, behavior is unchanged. When enabled, a successful intelligent conceptual sample may retain its assignment as stationed coverage instead of clearing on `sampleComplete`, preserving assignment generation, target hash, activation snapshot, target resource identity, demand profile, and zone.
 
-Repeated stationed sampling is separately gated by `enableStationedRepeatedSampling=false`. If explicitly enabled, it reuses only the existing conceptual yield path and remains bounded by sample interval, jitter, max sample count, max station duration, demand/resource/planet checks, and reserve-satisfied clearing.
+Repeated stationed sampling is separately gated by `enableStationedRepeatedSampling`. When enabled, it uses the Core3 player sampling cadence internally: a 3 second simulated sample-result delay and a 25 second stationed sample interval. It is no longer bounded by exposed interval, jitter, max sample count, or max station duration knobs; it stops through demand/resource/planet checks, reserve-satisfied clearing, coverage rebalance, or safety invalidation.
 
 Safety boundaries remain unchanged: no demand scoring change, no resource scoring change, no path trust relaxation, no movement speed change, no NavArea behavior change, no real extraction, no `ResourceContainer` creation, no inventory/vendor/market/crafting/credit mutation, and no persistence writes.
+
+## P.3.3 - Coverage Definition Audit + Acquisition Readiness
+
+P.3.3 clarifies the coverage planner so the dashboard can explain stable coverage without implying real acquisition. `coveragePlanner.coverageDefinitions` now documents the exact meaning of desired, assigned, stationed, active, full, partial, uncovered, gap, and assigned-but-not-stationed coverage.
+
+The important distinction is that assignment is not the same thing as productive coverage. Candidate and validated assignments can count as assigned coverage, but only stationed, sampling, queued, or moving assignments count as active coverage. Stationed remains the main productive state because it means the miner reached the target and retained the assignment after a conceptual sample.
+
+Reserve diagnostics now expose multiple quantity sources instead of one ambiguous stockpile number:
+
+- `exactResourceKnownQuantity`
+- `resourceTypeKnownQuantity`
+- `conceptualLabelKnownQuantity`
+- `demandMatchedKnownQuantity`
+- `stockpileKnownQuantity`
+- `stockpileConfidence`
+
+`stockpileKnownQuantity` is the strongest available display quantity, preferring exact resource, then resource type, then conceptual label, then demand-profile match. This explains why a slot can show zero exact stockpile even while broader conceptual or demand-matched stockpile exists.
+
+The new `acquisitionReadiness` section is diagnostics-only. It reports stationed miners that would be eligible for a future real-acquisition phase if that phase were implemented and explicitly enabled. Readiness requires stationed lifecycle, known resource identity, same planet, valid demand profile, reserve below target when required, verified activation-path provenance, disabled real acquisition flag, and clean safety flags.
+
+`realResourceAcquisitionConfig` adds placeholders only:
+
+```lua
+realResourceAcquisitionConfig = {
+    enableRealResourceAcquisition = false,
+    acquisitionReadinessDiagnosticsEnabled = true,
+    requireStationedLifecycle = true,
+    requireVerifiedActivationPath = true,
+    requireKnownResourceSpawnIdentity = true,
+    requireDemandStillValid = true,
+    requireReserveBelowTarget = true,
+    maxAcquisitionsPerInterval = 0,
+}
+```
+
+P.3.3 does not create resources, call extraction APIs, create `ResourceContainer` objects, mutate inventory, mutate vendors/market/crafting/credits, alter demand/resource scoring, relax path trust, change movement/NavArea behavior, or write persistence.
+
+## P.3.4 - Simulated Acquisition Transactions
+
+P.3.4 turns acquisition readiness into a runtime-only simulated transaction ledger. When an intelligent miner finishes a sample and satisfies the acquisition gates, the manager records the exact spawned resource that the assignment targeted. The primary identity is the SWG resource spawn, not the conceptual planning label: `resourceName`, `resourceType`, `planet`, `targetHash`/spawn identity, density, demand profile, assignment generation, activation snapshot, and path trust provenance are copied into `simulatedAcquisition`.
+
+The conceptual label remains available only as derived reporting provenance. The dashboard table intentionally displays actual resource name and actual resource type first, so rows should show names like `Ptohi`, `Miki`, or `Nasi` when those are the selected spawns, not broad labels such as Iron, Copper, Gas, or Water.
+
+`realResourceAcquisitionConfig` now includes simulation controls:
+
+```lua
+realResourceAcquisitionConfig = {
+    enableRealResourceAcquisition = false,
+    acquisitionReadinessDiagnosticsEnabled = true,
+    enableSimulatedAcquisitionTransactions = true,
+    simulatedAcquisitionLogTransactions = true,
+    simulatedAcquisitionMaxLedgerEvents = 200,
+    requireStationedLifecycle = true,
+    requireVerifiedActivationPath = true,
+    requireKnownResourceSpawnIdentity = true,
+    requireDemandStillValid = true,
+    requireReserveBelowTarget = true,
+    maxAcquisitionsPerInterval = 0,
+}
+```
+
+The simulated ledger is memory-only and bounded. It records attempts, successful acquisitions, blocked acquisitions, average quantity, quantity by planet, quantity by resource type, quantity by exact resource, and recent event rows. The existing conceptual/resource-aware stockpile math is still updated after the ledger event so reserve diagnostics behave as before.
+
+`simulatedAcquisitionMaxLedgerEvents` only caps retained recent rows. Runtime totals continue through separate counters: `acquisitions`, `resourcesAcquired`, and aggregate quantities keep increasing after old rows roll off. The dashboard also exposes `ledgerRetainedRows` and `ledgerMaxRows` so operators can distinguish a recent-row cap from acquisition progress.
+
+`maxAcquisitionsPerInterval` is still reserved for future real acquisition and does not block simulated acquisition transactions. If the simulated totals stop while miners remain ready and unblocked, verify whether new sample-finished events are occurring. With stationed repeated sampling disabled, each stationed miner records its initial acquisition and then remains coverage without repeated transaction ticks.
+
+Safety boundaries remain unchanged: P.3.4 does not call extraction APIs, create `ResourceContainer` objects, mutate inventory, mutate vendors/market/crafting/credits, change demand/resource scoring, change coverage planning, change path validation, change movement, or write persistence. The only destination for the acquisition transaction is the runtime ledger.
+
+## P.3.4.2 - Stationed Sampling Loop With Game-Derived Timing
+
+Normal player resource sampling flows through `ResourceSpawner::sendSample`, `SurveySessionImplementation::rescheduleSampleResults`, and `SurveySessionImplementation::rescheduleSample`. `sendSample` requires an active survey session, active survey tool, known resource map entry, and player zone. It reads resource density at the player position, schedules `sampleresults` after 3000 ms, and schedules the next `sample` task after 25000 ms. `sendSampleResults` applies surveying skill and density thresholds, computes sample success, calculates quantity as density times `25 + random(3)` scaled by survey skill and optional modifiers, and only then calls `extractResource` plus inventory/container mutation.
+
+AI stationed sampling copies the safe parts of that behavior only. It uses internal constants derived from the player path: `sampleIntervalSource=player_sampling_code`, `sampleIntervalSeconds=25`, a 3 second result delay, and a Master Artisan-style surveying constant of 100 for simulated quantity. It does not reuse the player mutation tail and never calls `extractResource`, creates `ResourceContainer`, modifies inventory, mutates vendors/market/crafting/credits, or writes persistence.
+
+Stationed miners now keep sampling their assigned exact resource while the assignment remains valid. The simulated acquisition identity is the actual spawned resource name/type/planet/target hash, not a broad planning label. Labels like Iron, Copper, Gas, and Water remain reporting/stockpile categories only and should not appear as acquisition identities unless a live spawned resource is literally named that.
+
+The dashboard/API exposes `stationedSamplingEnabled`, `sampleIntervalSource`, `sampleIntervalSeconds`, `stationedSampleTicks`, `simulatedAcquisitionTransactions`, `exactResourceTotals`, and `lastStationedSampleAgeSeconds`. These are intended to distinguish a stopped sampling loop from a bounded recent-ledger table.
+
+## P.3.4.3 - Single Owner Miner Work Loop
+
+SimMiner work is single-owner when intelligent targeting and stationed lifecycle are enabled. The exact-resource lifecycle owns the miner: pending assignment activation, verified movement, stationed state, repeated stationed sampling, and simulated exact-resource acquisition. The old conceptual loop remains available only as an explicit test fallback.
+
+`SimMinerController::startSimLoop()` now suppresses the legacy broad resource path under intelligent ownership. It activates a pending exact-resource assignment if present, leaves stationed miners waiting for their stationed sample tick, or remains waiting for the planner. It does not select `iron`, `gas`, `water`, or `copper` for intelligent/stationed acquisition identity.
+
+Delayed tasks carry a controller `workLoopGeneration` token. `SimPathFindTask`, `ArrivalCheckTask`, `SimRetryTask`, survey finish, sample finish, and stationed sample start callbacks compare their captured generation with the current generation before running. Stale callbacks are ignored without manager or logger side effects, preventing old retry/arrival/sample tasks from moving or sampling a stationed miner.
+
+Operator logs:
+
+- `SimMinerLegacyLoopSuppressed`
+- `SimMinerLegacyLoopStarted`
+- `SimMinerLegacySurveyStarted`
+- `SimMinerLegacyMoveStarted`
+- `SimMinerLegacySampleStarted`
+- `SimMinerLegacySampleFinished`
+- `SimMinerIntelligentMoveStarted`
+- `SimMinerStationedSampleStarted`
+- `SimMinerStationedSampleFinished`
+
+Runtime dashboard/API fields: `minerActivity.legacyLoopSuppressedCount`, `legacyLoopStartedCount`, `intelligentLoopStartedCount`, and `lastSuppressedLegacyReason`.
+
+Default config:
+
+```lua
+minerIntelligentTargetingConfig = {
+    fallbackToConceptualLoop = false,
+}
+
+legacyMinerLoopConfig = {
+    enableLegacyConceptualLoop = false,
+    allowLegacyFallbackWhenNoIntelligentAssignment = false,
+    allowLegacyFallbackAfterIntelligentFailure = false,
+    logLegacySuppression = true,
+}
+```
+
+Enable those legacy flags only for temporary test miners. This phase does not implement real acquisition, create `ResourceContainer` objects, mutate inventory, mutate vendors/market/crafting/credits, change path validation, change demand/resource scoring, change movement/NavArea behavior, or write persistence.
+
+## P.3.4.4 - Miner Self-Healing and Safe Recovery Diagnostics
+
+P.3.4.4 adds a memory-only miner recovery monitor for the exact-resource lifecycle. The monitor classifies each intelligent assignment by comparing controller/miner presence, current position, assignment target position, zone, lifecycle timestamps, stationed sample timing, and simulated acquisition age.
+
+Recovery statuses include healthy states (`healthyStationed`, `healthyMoving`, `awaitingValidation`) and attention states such as `stalledMoving`, `stalledStationedSampling`, `farFromStationTarget`, `zoneMismatch`, `controllerMissing`, `minerMissing`, `deadOrIncapacitated`, `inCombat`, `resourceInvalid`, and `needsReassignment`.
+
+Default config is diagnostic-first:
+
+```lua
+minerRecoveryConfig = {
+    enabled = true,
+    dryRun = true,
+    allowClearAssignment = true,
+    allowNudgeToSafeNearbyPoint = false,
+    allowTeleportToStationTarget = false,
+    allowRespawnReplacement = false,
+    adminActionsEnabled = false,
+    stuckCheckIntervalSeconds = 60,
+    movingStuckSeconds = 180,
+    stationedSamplingGraceSeconds = 90,
+    farFromStationDistanceMeters = 32,
+    maxAutomaticRecoveriesPerInterval = 2,
+    maxRecoveriesPerMinerPerHour = 3,
+    logRecoveryDecisions = true,
+}
+```
+
+With `dryRun=true`, no assignments are changed. The dashboard exposes `minerRecovery` with tracked/healthy/attention counts, action counters, reason/status summaries, current and target coordinates, distance, ages, and copyable coordinates. Admin nudge/teleport/respawn tools remain disabled and non-mutating in this phase.
+
+If dry-run is explicitly turned off, automatic recovery is still conservative: it only clears stuck assignments through the existing assignment-clear path and respects interval/per-miner rate limits. It does not nudge, teleport, respawn, change movement speed, relax path validation, create resources, create `ResourceContainer` objects, mutate inventory, mutate vendors/market/crafting/credits, or write persistence.

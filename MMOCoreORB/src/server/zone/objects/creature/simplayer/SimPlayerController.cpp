@@ -28,6 +28,12 @@ using namespace server::zone::objects::creature::ai::bt;
 void SimPathFindTask::run() {
     Reference<SimPlayerController*> strongCtrl = controller.get();
     if (strongCtrl == nullptr) return;
+
+    uint64 capturedGeneration = generation;
+
+    if (!strongCtrl->isWorkLoopGenerationCurrent(capturedGeneration, "path_find"))
+        return;
+
 #ifdef DEBUG_SIMPVP
     // DEBUG: Trace start
     Logger::console.info("SimPlayer: [Thread] Pathfinding started...", true);
@@ -50,7 +56,13 @@ void SimPathFindTask::run() {
     }
 #endif
 
-    Core::getTaskManager()->executeTask([strongCtrl, path] () {
+    Core::getTaskManager()->executeTask([strongCtrl, path, capturedGeneration] () {
+        if (!strongCtrl->isWorkLoopGenerationCurrent(capturedGeneration, "path_find_result")) {
+            if (path != nullptr)
+                delete path;
+            return;
+        }
+
         if (path != nullptr) strongCtrl->onPathFound(path);
         else strongCtrl->onPathFailed();
     }, "SimPlayerResultLambda");
@@ -59,8 +71,16 @@ void SimPathFindTask::run() {
 void ArrivalCheckTask::run() {
     Reference<SimPlayerController*> strongCtrl = controller.get();
     if (strongCtrl == nullptr) return;
+
+    uint64 capturedGeneration = generation;
+
+    if (!strongCtrl->isWorkLoopGenerationCurrent(capturedGeneration, "arrival_check"))
+        return;
     
-    Core::getTaskManager()->executeTask([strongCtrl] () {
+    Core::getTaskManager()->executeTask([strongCtrl, capturedGeneration] () {
+        if (!strongCtrl->isWorkLoopGenerationCurrent(capturedGeneration, "arrival_check"))
+            return;
+
         strongCtrl->checkArrival();
     }, "SimPlayerArrivalLambda");
 }
@@ -70,7 +90,16 @@ void SimBehaviorTask::run() {
     if (baseCtrl == nullptr) return;
 
     int capturedType = type;
-    Core::getTaskManager()->executeTask([baseCtrl, capturedType] () {
+    uint64 capturedGeneration = generation;
+    String taskType = String("behavior_") + String::valueOf(capturedType);
+
+    if (!baseCtrl->isWorkLoopGenerationCurrent(capturedGeneration, taskType))
+        return;
+
+    Core::getTaskManager()->executeTask([baseCtrl, capturedType, capturedGeneration, taskType] () {
+        if (!baseCtrl->isWorkLoopGenerationCurrent(capturedGeneration, taskType))
+            return;
+
         SimMinerController* miner = dynamic_cast<SimMinerController*>(baseCtrl.get());
         if (miner == nullptr) return;
 
@@ -82,12 +111,21 @@ void SimBehaviorTask::run() {
 
 class SimRetryTask : public Task {
     WeakReference<SimPlayerController*> controller;
+    uint64 generation;
 public:
-    SimRetryTask(SimPlayerController* ctrl) : controller(ctrl) {}
+    SimRetryTask(SimPlayerController* ctrl, uint64 g) : controller(ctrl), generation(g) {}
     void run() override {
         Reference<SimPlayerController*> strong = controller.get();
         if (strong != nullptr) {
-            Core::getTaskManager()->executeTask([strong]() {
+            uint64 capturedGeneration = generation;
+
+            if (!strong->isWorkLoopGenerationCurrent(capturedGeneration, "retry"))
+                return;
+
+            Core::getTaskManager()->executeTask([strong, capturedGeneration]() {
+                if (!strong->isWorkLoopGenerationCurrent(capturedGeneration, "retry"))
+                    return;
+
                 strong->startSimLoop();
             }, "SimRetryLambda");
         }
@@ -103,7 +141,9 @@ SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     state = IDLE;
     simPathIndex = 0;
     stuckWatchdogCount = 0;
-    runSpeed = 3.0f; 
+    rePathAttempts = 0;
+    runSpeed = 3.0f;
+    workLoopGeneration = 1;
     setLoggingName("SimPlayerController");
     destination = Vector3(0, 0, 0);
 }
@@ -135,6 +175,7 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
     stuckWatchdogCount = 0;
     lastWatchdogPos = agent->getWorldPosition();
     state = CALCULATING_PATH; 
+    uint64 movementGeneration = advanceWorkLoopGeneration("moveTo");
 
     destination = targetPos;
     
@@ -146,7 +187,8 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
     WorldCoordinates startCoord(agent);
     WorldCoordinates endCoord(targetPos, nullptr);
 
-    Reference<SimPathFindTask*> task = new SimPathFindTask(this, startCoord, endCoord, zone);
+    Reference<SimPathFindTask*> task =
+        new SimPathFindTask(this, startCoord, endCoord, zone, movementGeneration);
     
     task->schedule(100); 
 }
@@ -209,7 +251,8 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     delete path;
 
     // Ensure loop is active
-    Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
+    Reference<ArrivalCheckTask*> task =
+        new ArrivalCheckTask(this, getWorkLoopGeneration());
     task->schedule(500); 
 }
 
@@ -219,8 +262,42 @@ void SimPlayerController::onPathFailed() {
 #endif
     state = IDLE;
 
-    Reference<SimRetryTask*> task = new SimRetryTask(this);
+    Reference<SimRetryTask*> task =
+        new SimRetryTask(this, getWorkLoopGeneration());
     task->schedule(5000); // 5 seconds
+}
+
+uint64 SimPlayerController::advanceWorkLoopGeneration(const String& reason) {
+    (void)reason;
+    workLoopGeneration++;
+
+    if (workLoopGeneration == 0)
+        workLoopGeneration = 1;
+
+    return workLoopGeneration;
+}
+
+bool SimPlayerController::isWorkLoopGenerationCurrent(
+        uint64 capturedGeneration, const String& taskType) {
+    (void)taskType;
+    uint64 currentGeneration = workLoopGeneration;
+
+    if (capturedGeneration == currentGeneration)
+        return true;
+
+    return false;
+}
+
+void SimPlayerController::onStaleWorkLoopTaskIgnored(
+        const String& taskType, uint64 capturedGeneration,
+        uint64 currentGeneration) {
+#ifdef DEBUG_SIMPVP
+    Logger::console.info(
+        String("SimPlayerStaleTaskIgnored taskType=") + taskType +
+        " capturedGeneration=" + String::valueOf(capturedGeneration) +
+        " currentGeneration=" + String::valueOf(currentGeneration),
+        true);
+#endif
 }
 
 void SimPlayerController::queueMorePathNodes() {
@@ -278,7 +355,8 @@ void SimPlayerController::checkArrival() {
         Logger::console.info("SimPlayer checkArrival: isIncapacitated", true);
 #endif
         locker.release();
-        Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
+        Reference<ArrivalCheckTask*> task =
+            new ArrivalCheckTask(this, getWorkLoopGeneration());
         task->schedule(1000);
         return;
     }
@@ -289,7 +367,8 @@ void SimPlayerController::checkArrival() {
         Logger::console.info("SimPlayer checkArrival: isInCombat", true);
 #endif
         locker.release();
-        Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
+        Reference<ArrivalCheckTask*> task =
+            new ArrivalCheckTask(this, getWorkLoopGeneration());
         task->schedule(1000); 
         return;
     }
@@ -301,14 +380,20 @@ void SimPlayerController::checkArrival() {
         Vector3 resumeDestination = destination;
         locker.release();
         moveTo(resumeDestination);
-        Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
+        Reference<ArrivalCheckTask*> task =
+            new ArrivalCheckTask(this, getWorkLoopGeneration());
         task->schedule(1000);
         return;
     }
 
     if (state != MOVING) {
         locker.release();
-        Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
+
+        if (!shouldContinueArrivalChecks())
+            return;
+
+        Reference<ArrivalCheckTask*> task =
+            new ArrivalCheckTask(this, getWorkLoopGeneration());
         task->schedule(1000);
         return;
     }
@@ -338,8 +423,13 @@ void SimPlayerController::checkArrival() {
         state = WAITING;
         locker.release();
         onArrived();
-        Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
-        task->schedule(1000);
+
+        if (shouldContinueArrivalChecks()) {
+            Reference<ArrivalCheckTask*> task =
+                new ArrivalCheckTask(this, getWorkLoopGeneration());
+            task->schedule(1000);
+        }
+
         return;
     } 
 
@@ -349,9 +439,41 @@ void SimPlayerController::checkArrival() {
     float moveDy = currentPos.getY() - lastWatchdogPos.getY();
     float movedDistSq = (moveDx*moveDx) + (moveDy*moveDy);
 
+    // --- STUCK WATCHDOG WITH BOUNDED ESCALATION ---
+    // No forward progress: first soft-nudge the next step, then re-path a
+    // bounded number of times, then give up via onPathFailed() so the planner
+    // can reassign instead of the miner spinning in MOVING forever. Any forward
+    // progress (else branch) refreshes both counters.
+    static const int kStuckSoftNudgeTicks = 5;
+    static const int kStuckRePathTicks = 12;
+    static const int kMaxRePathAttempts = 2;
+
     if (movedDistSq < 0.05f) {
         stuckWatchdogCount++;
-        if (stuckWatchdogCount > 5) { 
+
+        if (stuckWatchdogCount >= kStuckRePathTicks) {
+            Vector3 resumeDestination = destination;
+            locker.release();
+
+            if (rePathAttempts < kMaxRePathAttempts && shouldRepathWhenStuck()) {
+                rePathAttempts++;
+#ifdef DEBUG_SIMPVP
+                Logger::console.info("SimPlayer checkArrival: stuck; re-path attempt " + String::valueOf(rePathAttempts), true);
+#endif
+                // moveTo() advances the work-loop generation and schedules a
+                // fresh path-find + arrival loop, so do not reschedule here.
+                moveTo(resumeDestination);
+            } else {
+#ifdef DEBUG_SIMPVP
+                Logger::console.info("SimPlayer checkArrival: stuck; re-path budget exhausted, failing path.", true);
+#endif
+                onPathFailed();
+            }
+
+            return;
+        }
+
+        if (stuckWatchdogCount > kStuckSoftNudgeTicks) {
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer checkArrival: stuckWatchdogCount > 5.", true);
 #endif
@@ -362,13 +484,15 @@ void SimPlayerController::checkArrival() {
              agent->activateAiBehavior(true);
         }
     } else {
-        stuckWatchdogCount = 0; 
+        stuckWatchdogCount = 0;
+        rePathAttempts = 0;
     }
 
     lastWatchdogPos = currentPos;
 
     locker.release();
-    Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this);
+    Reference<ArrivalCheckTask*> task =
+        new ArrivalCheckTask(this, getWorkLoopGeneration());
     task->schedule(500);
 }
 
@@ -418,6 +542,15 @@ SimMinerController::SimMinerController(AiAgent* aiAgent, const SimMinerConfig& m
     intelligentActivationSnapshotId = 0;
     intelligentTargetDensity = 0.f;
     intelligentAssignmentExpiresAtMs = 0;
+    intelligentTravelActive = false;
+    travelDestinationZone = "";
+    travelDeparturePosition = Vector3(0, 0, 0);
+    travelDestinationArrival = Vector3(0, 0, 0);
+    travelDestinationStarport = "";
+    travelStartedAtMs = 0;
+    travelBoardRadius = 20.f;
+    intelligentFinalApproachAttempts = 0;
+    intelligentLastApproachDistance = 0.f;
     setLoggingName("SimMinerController");
 }
 
@@ -427,13 +560,47 @@ SimMinerController::~SimMinerController() {
 void SimMinerController::startSimLoop() {
     String activationResult;
 
-    if (intelligentAssignmentPending && beginIntelligentTargetAssignment(activationResult))
+    // P.4.5b: while traveling, the run to the ticket collector is driven by
+    // moveTo()/checkArrival(); the normal decision loop must not clobber it.
+    if (intelligentTravelActive) {
+        state = WAITING;
+        logLegacyLoopSuppressed("interplanetaryTravelActive");
         return;
+    }
 
+    if (intelligentAssignmentPending && beginIntelligentTargetAssignment(activationResult)) {
+        uint64 sourceObjectID = agent != nullptr ? agent->getObjectID() : 0;
+        SimPlayerManager::instance()->recordIntelligentMinerLoopStarted(
+            sourceObjectID, "pendingAssignment");
+        return;
+    }
+
+    if (intelligentAssignmentStationed) {
+        state = WAITING;
+        logLegacyLoopSuppressed("stationedLifecycleActive");
+        return;
+    }
+
+    if (intelligentAssignmentActive || intelligentSampleActive) {
+        logLegacyLoopSuppressed("intelligentAssignmentActive");
+        return;
+    }
+
+    if (SimPlayerManager::instance()->isIntelligentMinerWorkLoopOwnerEnabled() &&
+            !SimPlayerManager::instance()->isLegacyConceptualMinerLoopAllowed()) {
+        state = WAITING;
+        logLegacyLoopSuppressed("waitingForIntelligentAssignment");
+        return;
+    }
+
+    advanceWorkLoopGeneration("legacyLoopStarted");
     state = DECIDING;
     String res = pickRandomResource();
     targetResource = res;
-    logStateTransition("SimMiner: Loop started; selected conceptual resource [" + res + "]");
+    uint64 sourceObjectID = agent != nullptr ? agent->getObjectID() : 0;
+    SimPlayerManager::instance()->recordLegacyMinerLoopStarted(
+        sourceObjectID, "conceptualFallbackAllowed");
+    logStateTransition("SimMinerLegacyLoopStarted: selected conceptual resource [" + res + "]");
     performSurvey();
 }
 
@@ -478,8 +645,16 @@ String SimMinerController::getSimStateName(SimState simState) const {
 
 void SimMinerController::performSurvey() {
     if (agent == nullptr) return;
+
+    if (intelligentAssignmentPending || intelligentAssignmentActive ||
+            intelligentSampleActive || intelligentAssignmentStationed) {
+        logLegacyLoopSuppressed("legacySurveyBlockedByIntelligentLifecycle");
+        startSimLoop();
+        return;
+    }
+
     state = SURVEYING;
-    logStateTransition("SimMiner: Survey started for [" + targetResource + "]");
+    logStateTransition("SimMinerLegacySurveyStarted resource=" + targetResource);
 
     agent->setMovementState(AiAgent::OBLIVIOUS);
     if (agent->getPosture() != CreaturePosture::UPRIGHT) {
@@ -487,17 +662,123 @@ void SimMinerController::performSurvey() {
     }
     agent->doAnimation("manipulate_high"); 
 
-    Reference<SimBehaviorTask*> task = new SimBehaviorTask(this, SimBehaviorTask::FINISH_SURVEY);
+    Reference<SimBehaviorTask*> task =
+        new SimBehaviorTask(this, SimBehaviorTask::FINISH_SURVEY,
+            getWorkLoopGeneration());
     task->schedule(config.surveyDurationMs);
 }
 
 void SimMinerController::finishSurvey() {
-    logStateTransition("SimMiner: Survey finished for [" + targetResource + "]");
+    if (intelligentAssignmentPending || intelligentAssignmentActive ||
+            intelligentSampleActive || intelligentAssignmentStationed) {
+        logLegacyLoopSuppressed("legacySurveyFinishBlockedByIntelligentLifecycle");
+        startSimLoop();
+        return;
+    }
+
+    logStateTransition("SimMinerLegacySurveyFinished resource=" + targetResource);
     goToResource(targetResource);
+}
+
+// P.4.4b mounted travel. Deploy+mount a real swoop (proven P.4.4a manager
+// plumbing) when the upcoming leg is long enough, and ride it at the vehicle's
+// own run speed the same way a mounted player does (CreatureObject::getRunSpeed
+// returns the vehicle's speed for riders; AiAgent::findNextPosition reads the
+// raw member, so we copy the value explicitly and restore it on dismount).
+// LOCKING: never call the manager mount/dismount functions with the agent
+// locked — they take their own agent+vehicle crosslocks (see the 2026-07-02
+// deadlock postmortem in docs/npc-mount-and-player-dot-plan.md).
+void SimMinerController::maybeMountForTravel(const Vector3& target) {
+    if (mountedForTravel)
+        return;
+
+    ManagedReference<AiAgent*> strongAgent = agent;
+    if (strongAgent == nullptr)
+        return;
+
+    SimPlayerManager* manager = SimPlayerManager::instance();
+    if (!manager->isMountedTravelEnabled())
+        return;
+
+    Vector3 pos;
+    float baseRunSpeed = 0.f;
+    {
+        Locker lock(strongAgent);
+        if (strongAgent->isRidingMount() || strongAgent->getParent().get() != nullptr)
+            return;
+        pos = strongAgent->getWorldPosition();
+        baseRunSpeed = strongAgent->getRunSpeed();
+    }
+
+    float minLeg = (float)manager->getMountedTravelMinLegMeters();
+    float dx = pos.getX() - target.getX();
+    float dy = pos.getY() - target.getY();
+    if ((dx * dx + dy * dy) < minLeg * minLeg)
+        return;
+
+    String result;
+    if (!manager->deployAndMountMinerVehicle(strongAgent->getObjectID(), result)) {
+        logStateTransition("SimMinerMountedTravel mountFailed result=" + result +
+            "; continuing on foot");
+        return;
+    }
+
+    float vehicleSpeed = 0.f;
+    {
+        Locker lock(strongAgent);
+        ManagedReference<SceneObject*> parent = strongAgent->getParent().get();
+        if (parent != nullptr && parent->isVehicleObject()) {
+            CreatureObject* vehicle = parent->asCreatureObject();
+            if (vehicle != nullptr)
+                vehicleSpeed = vehicle->getRunSpeed();
+        }
+        if (vehicleSpeed > 0.f) {
+            preMountRunSpeed = baseRunSpeed;
+            strongAgent->setRunSpeed(vehicleSpeed);
+        }
+    }
+
+    mountedForTravel = true;
+    manager->recordMountedTravelLegStarted();
+    logStateTransition("SimMinerMountedTravel mounted speed=" +
+        String::valueOf(vehicleSpeed) + " legMeters=" +
+        String::valueOf(Math::sqrt(dx * dx + dy * dy)));
+}
+
+void SimMinerController::dismountIfMounted(const String& reason) {
+    if (!mountedForTravel)
+        return;
+
+    mountedForTravel = false;
+
+    ManagedReference<AiAgent*> strongAgent = agent;
+
+    if (strongAgent != nullptr && preMountRunSpeed > 0.f) {
+        Locker lock(strongAgent);
+        strongAgent->setRunSpeed(preMountRunSpeed);
+    }
+    preMountRunSpeed = 0.f;
+
+    if (strongAgent == nullptr)
+        return;
+
+    String result;
+    SimPlayerManager::instance()->dismountAndStoreMinerVehicle(
+        strongAgent->getObjectID(), result);
+    logStateTransition("SimMinerMountedTravel dismounted reason=" + reason +
+        " result=" + result);
 }
 
 void SimMinerController::goToResource(const String& resourceName) {
     if (agent == nullptr) return;
+
+    if (intelligentAssignmentPending || intelligentAssignmentActive ||
+            intelligentSampleActive || intelligentAssignmentStationed) {
+        logLegacyLoopSuppressed("legacyMoveBlockedByIntelligentLifecycle");
+        startSimLoop();
+        return;
+    }
+
     Zone* zone = agent->getZone();
     if (zone == nullptr) return;
 
@@ -527,7 +808,7 @@ void SimMinerController::goToResource(const String& resourceName) {
         }
 
         if (!zone->isWithinBoundaries(targetPos)) {
-            logStateTransition("SimMiner: No in-bounds fallback destination for [" +
+            logStateTransition("SimMinerLegacyMoveBlocked: no in-bounds fallback destination for [" +
                 resourceName + "]; retrying loop");
             onPathFailed();
             return;
@@ -538,12 +819,63 @@ void SimMinerController::goToResource(const String& resourceName) {
     }
 
     String destinationSource = usedFallback ? "fallback" : "navmesh";
-    logStateTransition("SimMiner: Destination selected for [" + resourceName + "] using " + destinationSource + " target=" + targetPos.toString());
+    logStateTransition("SimMinerLegacyMoveStarted resource=" + resourceName + " destinationSource=" + destinationSource + " target=" + targetPos.toString());
+    rePathAttempts = 0;
+    maybeMountForTravel(targetPos);
     moveTo(targetPos);
 }
 
 void SimMinerController::onArrived() {
+    // P.4.5b: the miner ran to the origin starport's ticket collector. Board the
+    // shuttle now = teleport to the destination starport's outdoor arrival.
+    if (intelligentTravelActive) {
+        boardInterplanetaryShuttle("arrived");
+        return;
+    }
+
     if (intelligentAssignmentActive) {
+        // P.4.5c final approach: a long off-navmesh walk can terminate short of
+        // the true target (path exhausted / patrol point popped early), which
+        // used to station the miner hundreds of meters away and churn it via
+        // recovery. Re-path directly toward the target to close the gap -- bounded
+        // by leg count and by requiring real progress each leg so a genuinely
+        // unreachable target can't loop. Stationing within arrivalRadius is fine
+        // (planet-wide resource; ~10-15 m short is acceptable).
+        if (agent != nullptr) {
+            static const int kMaxFinalApproachLegs = 8;
+            static const float kMinApproachProgressMeters = 5.f;
+
+            float arrivalRadius =
+                SimPlayerManager::instance()->getMinerIntelligentArrivalRadiusMeters();
+            Vector3 pos = agent->getWorldPosition();
+            float dx = pos.getX() - intelligentTargetPosition.getX();
+            float dy = pos.getY() - intelligentTargetPosition.getY();
+            float distToTarget = Math::sqrt(dx * dx + dy * dy);
+
+            bool madeProgress = intelligentFinalApproachAttempts == 0 ||
+                distToTarget <=
+                    intelligentLastApproachDistance - kMinApproachProgressMeters;
+
+            if (distToTarget > arrivalRadius &&
+                    intelligentFinalApproachAttempts < kMaxFinalApproachLegs &&
+                    madeProgress) {
+                intelligentFinalApproachAttempts++;
+                intelligentLastApproachDistance = distToTarget;
+                logIntelligentTargetArrival("final_approach");
+                Logger::console.info(
+                    String("SimMinerFinalApproach miner=") +
+                    String::valueOf(agent->getObjectID()) +
+                    " leg=" + String::valueOf(intelligentFinalApproachAttempts) +
+                    " distanceToTarget=" +
+                        String::valueOf(Math::getPrecision(distToTarget, 1)) +
+                    " arrivalRadius=" +
+                        String::valueOf(Math::getPrecision(arrivalRadius, 1)),
+                    true);
+                moveTo(intelligentTargetPosition);
+                return;
+            }
+        }
+
         uint64 sourceObjectID = agent != nullptr ? agent->getObjectID() : 0;
         if (sourceObjectID != 0)
             SimPlayerManager::instance()->recordMinerIntelligentTargetAssignmentLifecycleFromController(
@@ -553,11 +885,29 @@ void SimMinerController::onArrived() {
         return;
     }
 
-    logStateTransition("SimMiner: Arrived at conceptual resource destination for [" + targetResource + "]");
+    if (intelligentAssignmentPending || intelligentAssignmentStationed ||
+            intelligentSampleActive) {
+        logLegacyLoopSuppressed("legacyArrivalBlockedByIntelligentLifecycle");
+        startSimLoop();
+        return;
+    }
+
+    logStateTransition("SimMinerLegacyMoveArrived resource=" + targetResource);
     performSample();
 }
 
 void SimMinerController::onPathFailed() {
+    // P.4.5b: a traveling miner whose departure run wedged must never be left
+    // standing at/near the starport. Board from where it stands (the "ticket was
+    // already bought" fallback) rather than escalating to a normal path failure.
+    if (intelligentTravelActive) {
+        boardInterplanetaryShuttle("stuckFallback");
+        return;
+    }
+
+    // P.4.4b: park the swoop before any failure handling/reassignment.
+    dismountIfMounted("pathFailed");
+
     if (intelligentAssignmentActive || intelligentAssignmentPending) {
         logIntelligentTargetActivation("fallback", "pathFailed");
         uint64 sourceObjectID = agent != nullptr ? agent->getObjectID() : 0;
@@ -574,16 +924,211 @@ void SimMinerController::onPathFailed() {
     SimPlayerController::onPathFailed();
 }
 
+bool SimMinerController::shouldContinueArrivalChecks() const {
+    return !intelligentAssignmentStationed;
+}
+
+bool SimMinerController::shouldRepathWhenStuck() const {
+    // P.4.5b: while traveling to a starport the path is a straight off-navmesh
+    // line to the ticket collector; re-pathing reproduces it, so skip re-path and
+    // let the watchdog escalate to onPathFailed() -> board-anyway fallback.
+    if (intelligentTravelActive)
+        return false;
+
+    // For a directOverland assignment the path is a straight terrain-following
+    // line; re-pathing reproduces the same line, so skip re-path and let the
+    // watchdog give up immediately so the planner can reassign.
+    if (intelligentAssignmentActive &&
+            intelligentActivationPathTrustStatus == "directOverland")
+        return false;
+
+    return true;
+}
+
+void SimMinerController::resetIntelligentAssignmentForRecovery() {
+    // Manager-initiated recovery (e.g. a stationed miner whose assignment was
+    // reassigned far away and could not be reached). Drop all local intelligent
+    // state (including stationed), tidy posture/patrol, and re-enter the work
+    // loop so the planner can assign a fresh target the miner will actually
+    // travel to. clearLocalIntelligentTargetAssignment advances the work-loop
+    // generation, invalidating any in-flight stationed-sample/arrival tasks.
+    // P.4.4b: a recovered miner must never keep (or leak) a swoop.
+    dismountIfMounted("recoveryReset");
+    clearLocalIntelligentTargetAssignment();
+
+    ManagedReference<AiAgent*> strongAgent = agent;
+
+    if (strongAgent != nullptr) {
+        Locker locker(strongAgent);
+        strongAgent->clearPatrolPoints();
+        if (strongAgent->getPosture() != CreaturePosture::UPRIGHT)
+            strongAgent->setPosture(CreaturePosture::UPRIGHT, true);
+    }
+
+    startSimLoop();
+}
+
+bool SimMinerController::beginInterplanetaryTravel(
+        const String& destZone,
+        const Vector3& departurePos,
+        const Vector3& destArrivalPos,
+        const String& destStarportName,
+        float boardRadius,
+        String& travelResult) {
+    travelResult = "fallback";
+
+    ManagedReference<AiAgent*> strongAgent = agent;
+
+    if (strongAgent == nullptr) {
+        travelResult = "controllerUnavailable";
+        return false;
+    }
+
+    if (destZone.isEmpty()) {
+        travelResult = "invalidDestination";
+        return false;
+    }
+
+    // Only ever dispatch a fully idle miner; never disrupt active gathering.
+    if (!isAvailableForDispatch()) {
+        travelResult = "controllerBusy";
+        return false;
+    }
+
+    {
+        Locker agentLocker(strongAgent);
+        Zone* zone = strongAgent->getZone();
+
+        if (zone == nullptr) {
+            travelResult = "missingZone";
+            return false;
+        }
+
+        if (zone->getZoneName() == destZone) {
+            travelResult = "alreadyOnPlanet";
+            return false;
+        }
+
+        if (strongAgent->isDead() || strongAgent->isIncapacitated() ||
+                strongAgent->isInCombat()) {
+            travelResult = "controllerStateNotSafe";
+            return false;
+        }
+    }
+
+    intelligentTravelActive = true;
+    travelDestinationZone = destZone;
+    travelDeparturePosition = departurePos;
+    travelDestinationArrival = destArrivalPos;
+    travelDestinationStarport = destStarportName;
+    travelStartedAtMs = System::getMiliTime();
+    travelBoardRadius = boardRadius > 0.f ? boardRadius : 20.f;
+
+    travelResult = "traveling";
+
+    uint64 sourceObjectID = strongAgent->getObjectID();
+    Logger::console.info(
+        String("SimMinerInterplanetaryTravelStarted miner=") +
+        String::valueOf(sourceObjectID) +
+        " destZone=" + destZone +
+        " destStarport=" +
+            (destStarportName.isEmpty() ? String("none") : destStarportName) +
+        " departure=(" +
+            String::valueOf(Math::getPrecision(departurePos.getX(), 1)) + "," +
+            String::valueOf(Math::getPrecision(departurePos.getY(), 1)) + ")",
+        true);
+
+    // Run to the origin starport's ticket collector. On arrival (or if the
+    // stuck-watchdog gives up) onArrived()/onPathFailed() boards the shuttle.
+    maybeMountForTravel(departurePos);
+    moveTo(departurePos);
+    return true;
+}
+
+void SimMinerController::boardInterplanetaryShuttle(const String& reason) {
+    // P.4.4b: dismount + store the swoop at the starport before boarding —
+    // player-mimetic, and the transient vehicle must never be left behind or
+    // carried through switchZone.
+    dismountIfMounted("boardShuttle");
+
+    ManagedReference<AiAgent*> strongAgent = agent;
+
+    if (strongAgent == nullptr) {
+        // Nothing to board; just clear the flag so we don't wedge the state.
+        clearLocalIntelligentTargetAssignment();
+        return;
+    }
+
+    String destZone = travelDestinationZone;
+    Vector3 arrival = travelDestinationArrival;
+    String starport = travelDestinationStarport;
+    uint64 minerID = strongAgent->getObjectID();
+
+    if (destZone.isEmpty()) {
+        // No valid destination recorded; cancel travel and re-acquire locally.
+        resetIntelligentAssignmentForRecovery();
+        return;
+    }
+
+    String fromZone = "unknown";
+
+    {
+        Locker agentLocker(strongAgent);
+        Zone* zone = strongAgent->getZone();
+        if (zone != nullptr)
+            fromZone = zone->getZoneName();
+
+        // "Board the shuttle": switchZone params are (terrain, X, Z=height, Y=north,
+        // parentID=0 outdoor). Same safe reposition as P.4.5a station travel; the
+        // OUTDOOR arrival means we never enter the un-navmeshed starport interior.
+        strongAgent->switchZone(destZone, arrival.getX(), arrival.getZ(),
+            arrival.getY(), 0);
+        // Anchor the leash on the new planet so a stale home location on the old
+        // planet can't pull the miner. The next assignment's move resets it again.
+        strongAgent->setHomeLocation(arrival.getX(), arrival.getZ(),
+            arrival.getY(), nullptr);
+    }
+
+    Logger::console.info(
+        String("SimMinerInterplanetaryTravelBoarded miner=") +
+        String::valueOf(minerID) +
+        " fromZone=" + fromZone +
+        " toZone=" + destZone +
+        " starport=" + (starport.isEmpty() ? String("none") : starport) +
+        " reason=" + reason,
+        true);
+
+    SimPlayerManager::instance()->recordInterplanetaryTravelBoarded(
+        minerID, fromZone, destZone, starport, reason);
+
+    // clearLocalIntelligentTargetAssignment() (via reset) also clears travel state
+    // and advances the work-loop generation, then startSimLoop() re-enters the
+    // pipeline on the destination planet so it re-acquires a local target.
+    resetIntelligentAssignmentForRecovery();
+}
+
 void SimMinerController::performSample() {
+    if (intelligentAssignmentPending || intelligentAssignmentActive ||
+            intelligentSampleActive || intelligentAssignmentStationed) {
+        logLegacyLoopSuppressed("legacySampleBlockedByIntelligentLifecycle");
+        startSimLoop();
+        return;
+    }
+
+    // P.4.4b: park the swoop before kneeling to sample.
+    dismountIfMounted("legacySample");
+
     state = SAMPLING;
-    logStateTransition("SimMiner: Sample started for [" + targetResource + "]");
+    logStateTransition("SimMinerLegacySampleStarted resource=" + targetResource);
 
     agent->clearPatrolPoints(); 
     agent->setMovementState(AiAgent::OBLIVIOUS);
     agent->setPosture(CreaturePosture::CROUCHED, true);
     agent->doAnimation("sample"); 
     
-    Reference<SimBehaviorTask*> task = new SimBehaviorTask(this, SimBehaviorTask::FINISH_SAMPLE);
+    Reference<SimBehaviorTask*> task =
+        new SimBehaviorTask(this, SimBehaviorTask::FINISH_SAMPLE,
+            getWorkLoopGeneration());
     task->schedule(config.sampleDurationMs);
 }
 
@@ -597,13 +1142,22 @@ void SimMinerController::finishSample() {
     if (strongAgent == nullptr)
         return;
 
+    if (intelligentAssignmentPending || intelligentAssignmentActive ||
+            intelligentAssignmentStationed) {
+        logLegacyLoopSuppressed("legacySampleFinishBlockedByIntelligentLifecycle");
+        strongAgent->setPosture(CreaturePosture::UPRIGHT, true);
+        strongAgent->doAnimation("stop_sample");
+        startSimLoop();
+        return;
+    }
+
     String completedResource = targetResource;
     int yieldAmount = 0;
     bool logYield = false;
     bool recordYield = prepareConceptualYield(completedResource, yieldAmount, logYield);
     uint64 sourceObjectID = strongAgent->getObjectID();
 
-    logStateTransition("SimMiner: Sample finished for [" + completedResource + "]");
+    logStateTransition("SimMinerLegacySampleFinished resource=" + completedResource);
     strongAgent->setPosture(CreaturePosture::UPRIGHT, true);
     strongAgent->doAnimation("stop_sample");
     startSimLoop();
@@ -691,6 +1245,13 @@ bool SimMinerController::requestIntelligentTargetAssignment(
         }
     }
 
+    // P.4.5b: a traveling miner is busy (running to the shuttle); the manager must
+    // not hand it a normal same-planet target mid-trip.
+    if (intelligentTravelActive) {
+        activationResult = "controllerBusy";
+        return false;
+    }
+
     if (intelligentAssignmentPending || intelligentAssignmentActive ||
             intelligentSampleActive || intelligentAssignmentStationed) {
         bool sameAssignment =
@@ -741,11 +1302,13 @@ bool SimMinerController::requestIntelligentTargetAssignment(
         state == SAMPLING || state == PERFORMING_ACTION;
     intelligentQueuedAtMs = now;
     intelligentAssignmentPending = true;
+    advanceWorkLoopGeneration("intelligentAssignmentAccepted");
 
     activationResult = "queued";
     logIntelligentTargetActivation("queued");
     SimPlayerManager::instance()->recordMinerIntelligentTargetAssignmentLifecycleFromController(
         strongAgent->getObjectID(), "queued", activationResult);
+
     return true;
 }
 
@@ -810,13 +1373,38 @@ bool SimMinerController::beginIntelligentTargetAssignment(String& activationResu
     intelligentSampleActive = false;
     intelligentAssignmentStationed = false;
 
-    // Keep yield conceptual and independent from the exact ResourceSpawn target.
-    targetResource = pickRandomResource();
+    targetResource = !intelligentResourceType.isEmpty() ?
+        intelligentResourceType : intelligentResourceName;
 
     activationResult = "started";
     logIntelligentTargetActivation("started");
+    Logger::console.info(
+        String("SimMinerIntelligentMoveStarted miner=") +
+        String::valueOf(sourceObjectID) +
+        " assignmentGenerationId=" +
+            String::valueOf(intelligentAssignmentGenerationId) +
+        " targetHash=" +
+            (intelligentTargetHash.isEmpty() ?
+                String("none") : intelligentTargetHash) +
+        " targetResource=" +
+            (intelligentResourceName.isEmpty() ?
+                String("none") : intelligentResourceName) +
+        " targetType=" +
+            (intelligentResourceType.isEmpty() ?
+                String("none") : intelligentResourceType) +
+        " targetZone=" +
+            (intelligentTargetZone.isEmpty() ?
+                String("none") : intelligentTargetZone),
+        true);
     SimPlayerManager::instance()->recordMinerIntelligentTargetAssignmentLifecycleFromController(
         sourceObjectID, "activationStarted", activationResult);
+
+    strongAgent->setPosture(CreaturePosture::UPRIGHT, true);
+    strongAgent->doAnimation("stop_sample");
+    rePathAttempts = 0;
+    intelligentFinalApproachAttempts = 0;
+    intelligentLastApproachDistance = 0.f;
+    maybeMountForTravel(intelligentTargetPosition);
     moveTo(intelligentTargetPosition);
     return true;
 }
@@ -836,13 +1424,18 @@ void SimMinerController::performIntelligentSample() {
     agent->doAnimation("sample");
 
     Reference<SimBehaviorTask*> task =
-        new SimBehaviorTask(this, SimBehaviorTask::FINISH_SAMPLE);
-    task->schedule(config.sampleDurationMs);
+        new SimBehaviorTask(this, SimBehaviorTask::FINISH_SAMPLE,
+            getWorkLoopGeneration());
+    task->schedule(SimPlayerManager::getGameDerivedStationedSampleResultDelayMs());
 }
 
 void SimMinerController::startStationedSample() {
     if (!intelligentAssignmentStationed)
         return;
+
+    // P.4.4b: the ride ends where the work starts — park the swoop before the
+    // first stationed sample (idempotent; later sample ticks no-op).
+    dismountIfMounted("stationed");
 
     ManagedReference<AiAgent*> strongAgent = agent;
 
@@ -854,11 +1447,21 @@ void SimMinerController::startStationedSample() {
     intelligentAssignmentStationed = false;
     intelligentAssignmentActive = true;
     intelligentSampleActive = false;
+    advanceWorkLoopGeneration("stationedSampleStarted");
 
     uint64 sourceObjectID = strongAgent->getObjectID();
     SimPlayerManager::instance()->recordMinerIntelligentTargetAssignmentLifecycleFromController(
         sourceObjectID, "sampleStarted", "stationedRepeat");
     logIntelligentTargetArrival("stationed_sample_started");
+    Logger::console.info(
+        String("SimMinerStationedSampleStarted miner=") +
+        String::valueOf(sourceObjectID) +
+        " assignmentGenerationId=" +
+            String::valueOf(intelligentAssignmentGenerationId) +
+        " targetHash=" +
+            (intelligentTargetHash.isEmpty() ?
+                String("none") : intelligentTargetHash),
+        true);
     performIntelligentSample();
 }
 
@@ -877,15 +1480,19 @@ void SimMinerController::finishIntelligentSample() {
     uint64 sourceObjectID = strongAgent->getObjectID();
 
     logIntelligentTargetArrival("sample_finished");
+    Logger::console.info(
+        String("SimMinerStationedSampleFinished miner=") +
+        String::valueOf(sourceObjectID) +
+        " assignmentGenerationId=" +
+            String::valueOf(intelligentAssignmentGenerationId) +
+        " targetHash=" +
+            (intelligentTargetHash.isEmpty() ?
+                String("none") : intelligentTargetHash),
+        true);
     SimPlayerManager::instance()->recordMinerIntelligentTargetAssignmentLifecycleFromController(
         sourceObjectID, "sampleFinished");
     strongAgent->setPosture(CreaturePosture::UPRIGHT, true);
     strongAgent->doAnimation("stop_sample");
-
-    if (recordYield) {
-        SimPlayerManager::instance()->recordIntelligentConceptualMinerYield(
-            completedResource, yieldAmount, sourceObjectID, logYield);
-    }
 
     bool scheduleRepeatedSample = false;
     int repeatedSampleDelayMs = 0;
@@ -898,16 +1505,29 @@ void SimMinerController::finishIntelligentSample() {
             repeatedSampleDelayMs,
             stationedReason);
 
+    if (recordYield) {
+        if (retainedStationed) {
+            SimPlayerManager::instance()->recordSimulatedAcquisitionTransactionFromController(
+                sourceObjectID, yieldAmount);
+        }
+
+        SimPlayerManager::instance()->recordIntelligentConceptualMinerYield(
+            completedResource, yieldAmount, sourceObjectID, logYield);
+    }
+
     if (retainedStationed) {
         intelligentAssignmentPending = false;
         intelligentAssignmentActive = false;
         intelligentSampleActive = false;
         intelligentAssignmentStationed = true;
         state = WAITING;
+        advanceWorkLoopGeneration("stationed");
 
         if (scheduleRepeatedSample && repeatedSampleDelayMs > 0) {
             Reference<SimBehaviorTask*> task =
-                new SimBehaviorTask(this, SimBehaviorTask::START_STATIONED_SAMPLE);
+                new SimBehaviorTask(this,
+                    SimBehaviorTask::START_STATIONED_SAMPLE,
+                    getWorkLoopGeneration());
             task->schedule(repeatedSampleDelayMs);
         }
 
@@ -922,6 +1542,7 @@ void SimMinerController::finishIntelligentSample() {
 }
 
 void SimMinerController::clearLocalIntelligentTargetAssignment() {
+    advanceWorkLoopGeneration("clearIntelligentAssignment");
     intelligentAssignmentPending = false;
     intelligentAssignmentActive = false;
     intelligentSampleActive = false;
@@ -941,6 +1562,14 @@ void SimMinerController::clearLocalIntelligentTargetAssignment() {
     intelligentTargetPosition = Vector3(0, 0, 0);
     intelligentTargetDensity = 0.f;
     intelligentAssignmentExpiresAtMs = 0;
+    // P.4.5b: also drop any in-flight travel so recovery that resets a traveling
+    // miner cancels the trip cleanly (it re-acquires on its current planet).
+    intelligentTravelActive = false;
+    travelDestinationZone = "";
+    travelDeparturePosition = Vector3(0, 0, 0);
+    travelDestinationArrival = Vector3(0, 0, 0);
+    travelDestinationStarport = "";
+    travelStartedAtMs = 0;
 }
 
 void SimMinerController::logIntelligentTargetActivation(
@@ -1051,6 +1680,15 @@ bool SimMinerController::prepareConceptualYield(const String& completedResource,
     if (!config.yieldEnabled || completedResource.isEmpty())
         return false;
 
+    if (intelligentAssignmentActive || intelligentSampleActive ||
+            intelligentAssignmentStationed) {
+        amount =
+            SimPlayerManager::getGameDerivedStationedSampleYield(
+                intelligentTargetDensity);
+        logYield = config.logYield;
+        return amount > 0;
+    }
+
     int minAmount = config.minYieldAmount;
     int maxAmount = config.maxYieldAmount;
 
@@ -1066,6 +1704,28 @@ bool SimMinerController::prepareConceptualYield(const String& completedResource,
 
     logYield = config.logYield;
     return true;
+}
+
+void SimMinerController::logLegacyLoopSuppressed(const String& reason) const {
+    uint64 objectID = agent != nullptr ? agent->getObjectID() : 0;
+
+    SimPlayerManager::instance()->recordLegacyMinerLoopSuppressed(
+        objectID,
+        getSimStateName(state),
+        intelligentAssignmentPending,
+        intelligentAssignmentActive,
+        intelligentAssignmentStationed,
+        intelligentAssignmentGenerationId,
+        intelligentTargetHash,
+        reason);
+}
+
+void SimMinerController::onStaleWorkLoopTaskIgnored(
+        const String& taskType, uint64 capturedGeneration,
+        uint64 currentGeneration) {
+    (void)taskType;
+    (void)capturedGeneration;
+    (void)currentGeneration;
 }
 
 void SimMinerController::logStateTransition(const String& message) const {

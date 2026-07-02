@@ -6,18 +6,18 @@ MarketSeeder = {
     template = nil, -- If using 1 template
     -- Example configuration: list two template paths to seed and override their quantities below.
     templates = {
-        "object/tangible/wearables/armor/composite/armor_composite_helmet.iff",
-        "object/tangible/wearables/armor/composite/armor_composite_chest_plate.iff"
+        --"object/tangible/wearables/armor/composite/armor_composite_helmet.iff",
+        --"object/tangible/wearables/armor/composite/armor_composite_chest_plate.iff"
     },
     templateQuantities = {
-        ["object/tangible/wearables/armor/composite/armor_composite_helmet.iff"] = 3,
-        ["object/tangible/wearables/armor/composite/armor_composite_chest_plate.iff"] = 3
+        --["object/tangible/wearables/armor/composite/armor_composite_helmet.iff"] = 3,
+        --["object/tangible/wearables/armor/composite/armor_composite_chest_plate.iff"] = 3
     },
     templateSource = nil,
     defaultQuantity = 1,
     maxListingsPerSeed = 250,
     summaryLogLimit = 10,
-    runOnceOnBoot = true,
+    runOnceOnBoot = false,
     _hasSeeded = false
 }
 

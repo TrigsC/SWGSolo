@@ -42,6 +42,11 @@
 
 
 object_mobile_dressed_artisan_trainer_03 = object_mobile_shared_dressed_artisan_trainer_03:new {
+	-- Grants the player rider arrangement (arrangement 0 = "rider") so this
+	-- mobile can be slotted into a vehicle RIDER container (sim miner swoop
+	-- mount, P.4.4). Loaded from the client's abstract/slot/arrangement/
+	-- player.iff at startup; see docs/npc-mount-and-player-dot-plan.md.
+	arrangementDescriptorFilename = "abstract/slot/arrangement/player.iff",
 	objectMenuComponent = "TrainerMenuComponent"
 }
 
