@@ -72,6 +72,7 @@
 #include "server/zone/objects/creature/BuffAttribute.h"
 #include "server/zone/objects/creature/buffs/BuffType.h"
 #include "server/zone/objects/creature/buffs/BuffCRC.h"
+#include "server/zone/managers/skill/SkillModManager.h"
 #include "server/zone/objects/creature/damageovertime/DamageOverTimeList.h"
 #include "server/zone/objects/creature/ai/events/AiBehaviorEvent.h"
 #include "server/zone/objects/creature/ai/events/AiRecoveryEvent.h"
@@ -542,6 +543,7 @@ void AiAgentImplementation::loadTemplateData(CreatureTemplate* templateData) {
 	setLevel(level);
 	setWeaponStats();
 	setupAttackMaps();
+	initializeJediArchetype();
 }
 
 void AiAgentImplementation::reloadTemplate() {
@@ -710,6 +712,270 @@ void AiAgentImplementation::cancelForceRegenerationEvent() {
         regenerationEvent->clearAgentObject();
 
     forceRegenerationEvent = nullptr;
+}
+
+void AiAgentImplementation::initializeJediArchetype() {
+    // Roll once per spawn; reloadTemplate() keeps the existing roll so the
+    // stat package below is never applied twice.
+    if (jediArchetype != JEDI_ARCHETYPE_NONE || npcTemplate == nullptr)
+        return;
+
+    String archetype = npcTemplate->getJediArchetype();
+
+    if (archetype.isEmpty())
+        return;
+
+    if (archetype == "random")
+        archetype = System::random(1) == 0 ? "defender" : "enhancer";
+
+    // The AiAgent getSkillMod override returns the skillModList value whenever
+    // it is non-zero and never falls through to the template statistics, so
+    // each mod is baked as statistic + bonus (masking, not stacking).
+    auto applyArchetypeMod = [this](const String& mod, int bonus) {
+        addSkillMod(SkillModManager::TEMPLATE, mod, npcTemplate->getStatistic(mod) + bonus, false);
+    };
+
+    if (archetype == "defender") {
+        jediArchetype = JEDI_ARCHETYPE_DEFENDER;
+
+        applyArchetypeMod("saber_block", 15);
+        applyArchetypeMod("melee_defense", 15);
+        applyArchetypeMod("ranged_defense", 15);
+        applyArchetypeMod("force_defense", 20);
+    } else if (archetype == "enhancer") {
+        jediArchetype = JEDI_ARCHETYPE_ENHANCER;
+
+        // Enhancers refill force ~2.5x faster (doForceRegen reads this mod);
+        // their whole kit runs on force.
+        applyArchetypeMod("jedi_force_power_regen", 25);
+
+        // Owner decision: the Force Resist lines are assumed always active at
+        // no force cost - baked as permanent mods matching the player buff
+        // values (25) instead of being cast and re-cast in combat.
+        applyArchetypeMod("combat_bleeding_defense", 25);
+        applyArchetypeMod("absorption_bleeding", 25);
+        applyArchetypeMod("resistance_disease", 25);
+        applyArchetypeMod("absorption_disease", 25);
+        applyArchetypeMod("resistance_poison", 25);
+        applyArchetypeMod("absorption_poison", 25);
+        applyArchetypeMod("resistance_states", 25);
+    } else {
+        error() << "initializeJediArchetype: unknown jediArchetype '" << archetype
+                << "' on template " << npcTemplate->getTemplateName();
+        return;
+    }
+
+    debug() << "initializeJediArchetype: rolled " << archetype;
+}
+
+void AiAgentImplementation::runJediForceManagement() {
+    if (jediArchetype == JEDI_ARCHETYPE_NONE || isDead() || isIncapacitated())
+        return;
+
+    auto cooldownTimerMap = getCooldownTimerMap();
+
+    if (cooldownTimerMap == nullptr || !cooldownTimerMap->isPast("jedi_force_window"))
+        return;
+
+    // Always keep two force heals (2 x 200, see healCreatureTarget) in reserve
+    // so buffing never starves the heal pipeline, which runs first in the tree.
+    const static int FORCE_FLOOR = 400;
+
+    int curForce = getCurrentForce();
+
+    // Snapshot the current opponent for the anti-force-user tools.
+    bool targetIsForceUser = false;
+    bool targetHasForce = false;
+    uint64 targetID = 0;
+
+    ManagedReference<SceneObject*> followCopy = getFollowObject().get();
+
+    if (followCopy != nullptr && followCopy->isCreatureObject()) {
+        CreatureObject* targetCreo = followCopy->asCreatureObject();
+
+        if (targetCreo != nullptr && !targetCreo->isDead()) {
+            targetID = targetCreo->getObjectID();
+
+            if (targetCreo->isAiAgent()) {
+                AiAgent* targetAgent = targetCreo->asAiAgent();
+
+                if (targetAgent != nullptr && (targetAgent->getJediArchetype() != JEDI_ARCHETYPE_NONE
+                        || targetAgent->getHealerType().toLowerCase().hashCode() == STRING_HASHCODE("force"))) {
+                    targetIsForceUser = true;
+                    targetHasForce = targetAgent->getCurrentForce() > 0;
+                }
+            } else if (targetCreo->isPlayerCreature()) {
+                PlayerObject* targetGhost = targetCreo->getPlayerObject();
+
+                if (targetGhost != nullptr && targetGhost->getForcePowerMax() > 0) {
+                    targetIsForceUser = true;
+                    targetHasForce = targetGhost->getForcePower() > 0;
+                }
+            }
+        }
+    }
+
+    int healthPct = 100;
+    int maxHealth = getMaxHAM(CreatureAttribute::HEALTH);
+
+    if (maxHealth > 0)
+        healthPct = (getHAM(CreatureAttribute::HEALTH) * 100) / maxHealth;
+
+    // Priority ladder: pick AT MOST ONE power per jittered window (the
+    // anti-spam core), gated on !hasBuff because doJediSelfBuffCommand
+    // TOGGLES an active buff off.
+    uint32 castCRC = 0;
+    uint64 castTarget = 0;
+    bool combatCommand = false; // true = attack-type action, keep on the combat queue
+    String perPowerKey;
+    uint64 perPowerCooldownMs = 0;
+
+    if (jediArchetype == JEDI_ARCHETYPE_DEFENDER) {
+        if (healthPct < 35 && curForce >= 1000 && cooldownTimerMap->isPast("jedi_avoid_incap")) {
+            // Emergency: AvoidIncapacitation renews instead of toggling, so it
+            // needs its own cooldown rather than a hasBuff gate.
+            castCRC = STRING_HASHCODE("avoidincapacitation");
+            perPowerKey = "jedi_avoid_incap";
+            perPowerCooldownMs = 45000;
+        } else if (!hasBuff(BuffCRC::JEDI_FORCE_ARMOR_1) && !hasBuff(BuffCRC::JEDI_FORCE_ARMOR_2)
+                && curForce >= 75 + FORCE_FLOOR) {
+            castCRC = STRING_HASHCODE("forcearmor1");
+        }
+    } else if (jediArchetype == JEDI_ARCHETYPE_ENHANCER) {
+        bool hasArmor = hasBuff(BuffCRC::JEDI_FORCE_ARMOR_2);
+
+        if (healthPct < 35 && !hasArmor && curForce >= 150) {
+            // Emergency armor may dip into the heal reserve.
+            castCRC = STRING_HASHCODE("forcearmor2");
+        } else if (!hasArmor && curForce >= 150 + FORCE_FLOOR) {
+            castCRC = STRING_HASHCODE("forcearmor2");
+        } else if (targetIsForceUser && !hasBuff(BuffCRC::JEDI_FORCE_SHIELD_2)
+                && curForce >= 150 + FORCE_FLOOR) {
+            castCRC = STRING_HASHCODE("forceshield2");
+        } else if (targetIsForceUser && !hasBuff(BuffCRC::JEDI_FORCE_FEEDBACK_2)
+                && curForce >= 100 + FORCE_FLOOR) {
+            castCRC = STRING_HASHCODE("forcefeedback2");
+        } else if (targetIsForceUser && !hasBuff(BuffCRC::JEDI_FORCE_ABSORB_2)
+                && curForce >= 100 + FORCE_FLOOR) {
+            castCRC = STRING_HASHCODE("forceabsorb2");
+        } else if (targetHasForce && curForce >= 50 && curForce < (getMaxForce() * 2) / 5
+                && cooldownTimerMap->isPast("jedi_drain_force")) {
+            // Low on force against another force user: drain them.
+            castCRC = STRING_HASHCODE("drainforce");
+            castTarget = targetID;
+            combatCommand = true;
+            perPowerKey = "jedi_drain_force";
+            perPowerCooldownMs = 20000;
+        } else if (curForce > (getMaxForce() * 65) / 100
+                && cooldownTimerMap->isPast("jedi_transfer_force")) {
+            // Altruistic: if I can spare it, top off a friendly force-user who
+            // is running low. Allies = everyone fighting my current target, the
+            // same pool the AI heal pipeline draws from (GetHealTarget). Reads
+            // are lock-free like that scan loop; Transfer Force locks the chosen
+            // ally itself when it executes.
+            uint64 allyID = 0;
+
+            if (followCopy != nullptr) {
+                TangibleObject* enemyTano = followCopy->asTangibleObject();
+                auto allies = enemyTano != nullptr ? enemyTano->getDefenderList() : nullptr;
+
+                if (allies != nullptr) {
+                    for (int i = 0; i < allies->size(); ++i) {
+                        ManagedReference<SceneObject*> allySceneO = allies->get(i);
+
+                        if (allySceneO == nullptr || !allySceneO->isCreatureObject())
+                            continue;
+
+                        CreatureObject* ally = allySceneO->asCreatureObject();
+
+                        if (ally == nullptr || ally->getObjectID() == getObjectID()
+                                || ally->isDead() || ally->isIncapacitated())
+                            continue;
+
+                        if (!isInRange3d(ally, 30.f))
+                            continue;
+
+                        if (ally->isAggressiveTo(asAiAgent()) || isAggressiveTo(ally))
+                            continue;
+
+                        // Only force-users who are actually running low (< 25%).
+                        if (ally->isAiAgent()) {
+                            AiAgent* allyAgent = ally->asAiAgent();
+
+                            if (allyAgent == nullptr)
+                                continue;
+
+                            bool allyForceUser = allyAgent->getJediArchetype() != JEDI_ARCHETYPE_NONE
+                                    || allyAgent->getHealerType().toLowerCase().hashCode() == STRING_HASHCODE("force");
+                            int allyMax = allyAgent->getMaxForce();
+
+                            if (allyForceUser && allyMax > 0 && allyAgent->getCurrentForce() < allyMax / 4) {
+                                allyID = ally->getObjectID();
+                                break;
+                            }
+                        } else if (ally->isPlayerCreature()) {
+                            PlayerObject* allyGhost = ally->getPlayerObject();
+
+                            if (allyGhost != nullptr && allyGhost->getForcePowerMax() > 0
+                                    && allyGhost->getForcePower() < allyGhost->getForcePowerMax() / 4) {
+                                allyID = ally->getObjectID();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (allyID != 0) {
+                castCRC = STRING_HASHCODE("transferforce");
+                castTarget = allyID; // beneficial, not a combat command -> direct
+                perPowerKey = "jedi_transfer_force";
+                perPowerCooldownMs = 20000;
+            }
+        } else if (curForce < getMaxForce() / 5
+                && cooldownTimerMap->isPast("jedi_channel_force")
+                && getHAM(CreatureAttribute::HEALTH) > (getMaxHAM(CreatureAttribute::HEALTH) * 3) / 5
+                && getHAM(CreatureAttribute::ACTION) > (getMaxHAM(CreatureAttribute::ACTION) * 3) / 5
+                && getHAM(CreatureAttribute::MIND) > (getMaxHAM(CreatureAttribute::MIND) * 3) / 5) {
+            // Force-starved but with healthy HAM to spend: channel HAM into
+            // force (self, non-combat -> direct path). The big refill lifts us
+            // back above 20%, so this won't re-fire until we bottom out again.
+            castCRC = STRING_HASHCODE("channelforce");
+            perPowerKey = "jedi_channel_force";
+            perPowerCooldownMs = 30000;
+        }
+    }
+
+    if (castCRC == 0)
+        return;
+
+    // Non-combat powers (self-buffs and the beneficial Transfer Force) are
+    // applied DIRECTLY (synchronously), mirroring how the AI heal pipeline calls
+    // healCreatureTarget: routing a non-combat command through the shared command
+    // queue stalls the agent's own attack pacing, because attacks are enqueued
+    // into that same queue (enqueueAttack). Attack-type combat abilities (Drain
+    // Force) stay on the queue where they blend with the normal attack rhythm.
+    // The agent is already locked here (runBehaviorTree holds the lock, and this
+    // method is @preLocked); a targeted non-combat power (Transfer Force) does
+    // its own Locker(target, agent), the same blessed cross-lock the heal path
+    // uses (GetHealTarget/HealTarget).
+    if (combatCommand) {
+        enqueueCommand(castCRC, 0, castTarget, "");
+    } else {
+        ZoneServer* zoneServer = getZoneServer();
+        ObjectController* objectController = zoneServer != nullptr ? zoneServer->getObjectController() : nullptr;
+        const QueueCommand* queueCommand = objectController != nullptr ? objectController->getQueueCommand(castCRC) : nullptr;
+
+        if (queueCommand != nullptr)
+            queueCommand->doQueueCommand(asAiAgent(), castTarget, UnicodeString(""));
+    }
+
+    // Close the window even if the command later fails its own checks - a
+    // wasted window self-corrects next tick and can never machine-gun retry.
+    cooldownTimerMap->updateToCurrentAndAddMili("jedi_force_window", 6000 + System::random(4000));
+
+    if (!perPowerKey.isEmpty())
+        cooldownTimerMap->updateToCurrentAndAddMili(perPowerKey, perPowerCooldownMs);
 }
 
 void AiAgentImplementation::fillAttributeList(AttributeListMessage* alm, CreatureObject* player) {

@@ -64,6 +64,7 @@ protected:
 	String faction;
 	int mobType;
 	String healerType;
+	String jediArchetype;
 
 	bool tauntable;
 
@@ -484,6 +485,10 @@ public:
 
 	inline const String& getHealerType() const {
 		return healerType;
+	}
+
+	inline const String& getJediArchetype() const {
+		return jediArchetype;
 	}
 
 	inline bool isSpecialProtection(int resistType) const {

@@ -205,13 +205,22 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         return;
     }
 
-    if (path == nullptr || path->size() < 2) { 
+    if (path == nullptr || path->size() < 2) {
         if (path) delete path;
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer onPathFound: Path too short. Retrying in 5s.", true);
 #endif
-        onPathFailed(); 
-        return; 
+        onPathFailed();
+        return;
+    }
+
+    // P.6.1b: reject a path that does not end where the current destination
+    // points (stale result that slipped a generation race). The retry path
+    // recomputes against the correct target.
+    if (!acceptFoundPath(path->get(path->size() - 1).getPoint())) {
+        delete path;
+        onPathFailed();
+        return;
     }
 
     state = MOVING;
@@ -234,6 +243,13 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     agent->clearCombatState(true);
     agent->clearPatrolPoints();
     agent->clearSavedPatrolPoints();
+    // P.6.1d: invalidate the AGENT's cached A* route. findNextPosition
+    // (AiAgentImplementation) reuses currentFoundPath while PATROLLING WITHOUT
+    // re-checking it still matches the current patrol target, so a route left
+    // over from a previous leg (e.g. before a switchZone teleport) would be
+    // followed toward the OLD destination even though we just queued a fresh
+    // path here. Nulling it forces a re-pathfind to the new patrol[0].
+    agent->clearCurrentPath();
     agent->stopWaiting();
 
     agent->writeBlackboard("moveMode", BlackboardData((uint32)DataVal::RUN));

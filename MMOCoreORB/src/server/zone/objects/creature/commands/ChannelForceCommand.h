@@ -7,6 +7,7 @@
 
 #include "server/zone/objects/creature/buffs/ChannelForceBuff.h"
 #include "templates/params/creature/CreatureAttribute.h"
+#include "server/zone/objects/creature/ai/AiAgent.h"
 
 class ChannelForceCommand : public QueueCommand {
 public:
@@ -21,7 +22,9 @@ public:
 		if (!checkInvalidLocomotions(creature))
 			return INVALIDLOCOMOTION;
 
-		if (isWearingArmor(creature)) {
+		// AI LOGIC: NPC outfit pieces are cosmetic; the armor restriction is a
+		// player mechanic (see JediQueueCommand::doCommonJediSelfChecks).
+		if (!creature->isAiAgent() && isWearingArmor(creature)) {
 			return NOJEDIARMOR;
 		}
 
@@ -29,17 +32,36 @@ public:
 		int forceRandom = System::random(100);
 		int forceBonus = 250 + (forceRandom);
 
+		// Read the force pool from the player ghost or, for NPCs, the AiAgent.
 		ManagedReference<PlayerObject*> playerObject = creature->getPlayerObject();
-		if (playerObject == nullptr)
-			return GENERALERROR;
+		int currentForce = 0;
+		int maxForce = 0;
 
-		// Do not execute if the player's force bar is full.
-		if (playerObject->getForcePower() >= playerObject->getForcePowerMax())
+		if (creature->isPlayerCreature()) {
+			if (playerObject == nullptr)
+				return GENERALERROR;
+
+			currentForce = playerObject->getForcePower();
+			maxForce = playerObject->getForcePowerMax();
+		} else if (creature->isAiAgent()) {
+			AiAgent* agent = cast<AiAgent*>(creature);
+
+			if (agent == nullptr)
+				return GENERALERROR;
+
+			currentForce = agent->getCurrentForce();
+			maxForce = agent->getMaxForce();
+		} else {
+			return GENERALERROR;
+		}
+
+		// Do not execute if the force bar is full.
+		if (currentForce >= maxForce)
 			return GENERALERROR;
 
 		// To keep it from going over max...
-		if ((playerObject->getForcePowerMax() - playerObject->getForcePower()) < forceBonus)
-			forceBonus = ((playerObject->getForcePowerMax() - playerObject->getForcePower()) / 10) * 10;
+		if ((maxForce - currentForce) < forceBonus)
+			forceBonus = ((maxForce - currentForce) / 10) * 10;
 
 		int health = creature->getHAM(CreatureAttribute::HEALTH);
 		int action = creature->getHAM(CreatureAttribute::ACTION);
@@ -60,7 +82,11 @@ public:
 		}
 
 		// Give Force, and subtract HAM.
-		playerObject->setForcePower(playerObject->getForcePower() + forceBonus);
+		if (creature->isPlayerCreature()) {
+			playerObject->setForcePower(currentForce + forceBonus);
+		} else if (creature->isAiAgent()) {
+			cast<AiAgent*>(creature)->setCurrentForce(currentForce + forceBonus);
+		}
 
 		// Setup buffs.
 		uint32 buffCRC = STRING_HASHCODE("channelforcebuff");

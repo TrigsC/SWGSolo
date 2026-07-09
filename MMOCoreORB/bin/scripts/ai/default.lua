@@ -296,6 +296,19 @@ rootDefault = {
 	{id="3803724493",	name="If",	pid="2803689147"},
 	{id="1224859368",	name="CheckMovementState",	pid="3803724493",	args={condition=PATROLLING}},
 	{id="4224133747",	name="TreeSocket",	pid="3027533517",	args={slot=MOVE}},
+	-- P.7 Jedi force management: cheapest gate first (archetype byte), combat
+	-- only, wrapped in AlwaysFail so the selector always falls through to the
+	-- heal/attack sequence below.
+	{id="3811110001",	name="AlwaysFail",	pid="714360210"},
+	{id="3811110002",	name="Sequence",	pid="3811110001"},
+	{id="3811110003",	name="If",	pid="3811110002"},
+	{id="3811110004",	name="CheckJediForceChance",	pid="3811110003"},
+	{id="3811110005",	name="If",	pid="3811110002"},
+	{id="3811110006",	name="CheckIsInCombat",	pid="3811110005"},
+	{id="3811110007",	name="Not",	pid="3811110002"},
+	{id="3811110008",	name="If",	pid="3811110007"},
+	{id="3811110009",	name="CheckPosture",	pid="3811110008",	args={condition=KNOCKEDDOWN}},
+	{id="3811110010",	name="ManageJediForce",	pid="3811110002"},
 	{id="2623013711",	name="Sequence",	pid="714360210"},
 	{id="2922652730",	name="Selector",	pid="2623013711"},
 	{id="4260218892",	name="If",	pid="2922652730"},

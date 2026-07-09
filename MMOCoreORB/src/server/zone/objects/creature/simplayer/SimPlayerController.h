@@ -140,6 +140,28 @@ public:
     void moveTo(Vector3 targetPos);
     void checkArrival();
     ManagedReference<AiAgent*> getAgent() const { return agent; }
+    // P.6.1a: lets the manager detect a silently-lost path request (moveTo
+    // issued but neither onPathFound nor onPathFailed ever ran) and re-drive.
+    bool isAwaitingPathResult() const { return state == CALCULATING_PATH; }
+
+    // P.6.1b: invalidate ALL in-flight work-loop tasks and forget the current
+    // route before a teleport/interruption. Zeroing `destination` disarms the
+    // checkArrival IDLE-resume (which would otherwise re-issue moveTo() to a
+    // pre-teleport target from the chain thread and race the fresh moveTo()'s
+    // generation). Call before switchZone repositions.
+    void prepareForRelocation(const String& reason) {
+        advanceWorkLoopGeneration(reason);
+        state = WAITING;
+        destination = Vector3(0, 0, 0);
+        simPath.removeAll();
+        simPathIndex = 0;
+    }
+
+    // P.6.1b: last-line defense against a stale path winning a generation
+    // race — onPathFound() rejects (-> onPathFailed retry) any path whose end
+    // point this returns false for. Default accepts everything (miners rely
+    // on partial/exhausted paths); SimPvP leaders enforce end≈target.
+    virtual bool acceptFoundPath(const Vector3& pathEnd) { return true; }
     uint64 getWorkLoopGeneration() const { return workLoopGeneration; }
     uint64 advanceWorkLoopGeneration(const String& reason);
     bool isWorkLoopGenerationCurrent(uint64 capturedGeneration, const String& taskType);

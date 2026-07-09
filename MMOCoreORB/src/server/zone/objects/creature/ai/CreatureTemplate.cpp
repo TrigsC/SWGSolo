@@ -62,6 +62,7 @@ CreatureTemplate::CreatureTemplate() {
 	customAiMap = 0;
 	tauntable = true;
 	healerType = "";
+	jediArchetype = "";
 	lightsaberColor = 0;
 
 	primaryWeapon = "";
@@ -138,6 +139,7 @@ void CreatureTemplate::readObject(LuaObject* templateData) {
 	defaultWeapon = templateData->getStringField("defaultWeapon");
 	tauntable = templateData->getBooleanField("tauntable", true);
 	healerType = templateData->getStringField("healerType").trim();
+	jediArchetype = templateData->getStringField("jediArchetype").trim().toLowerCase();
 	lightsaberColor = templateData->getIntField("lightsaberColor");
 
 	if(!templateData->getStringField("defaultAttack").isEmpty())

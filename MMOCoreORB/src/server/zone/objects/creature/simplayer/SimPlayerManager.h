@@ -268,6 +268,23 @@ struct MinerSpawnYieldAccumulator {
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
 
+// P.5.4b: per-demand-profile crafting recipe (single-input first cut).
+// C++ defaults come from createHiveCrafterRecipeDefinitions(); lua
+// hiveCrafterConsumerConfig.recipes overrides per profile.
+struct HiveCrafterRecipe {
+	String profileKey;
+	String goodKey;
+	String goodName;
+	String goodClassChain;
+	int inputUnitsPerCraft = 25;
+	int outputUnitsPerCraft = 1;
+	// Parsed + surfaced now; enforced by the P.5.4d output governor.
+	int finishedGoodTargetUnits = 200;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
 struct MinerRecoveryDiagnosticRow {
 	uint64 minerID = 0;
 	uint64 assignmentGenerationId = 0;
@@ -473,6 +490,25 @@ public:
 		String name;
 		Vector3 spawn;
 		Vector3 hangout;
+		// P.6.5a: exact PlanetTravelPoint name of this city's starport (from
+		// scripts/managers/planet/planet_manager.lua) - resolves the routed
+		// travel pad. Empty = city excluded from routed travel.
+		String starportPoint;
+
+		// Satisfy Vector/TypeInfo template instantiation
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+
+	// P.6.5a routed travel: one leg of a planned multi-leg journey. Only the
+	// arrival side is stored - the departure is wherever the squad currently
+	// stands (it runs back to its pad, then "buys the ticket").
+	struct PvpTravelLeg {
+		String destPlanet;
+		String destCity;
+		Vector3 arrivalPos;        // starport pad (z re-derived at teleport)
+		bool interplanetary = false;
+		bool finalLeg = false;
 
 		// Satisfy Vector/TypeInfo template instantiation
 		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
@@ -492,13 +528,63 @@ public:
 		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 	};
 
-	void cyclePvPBotWhenShuttleReady(uint64 oldOid,
-                                const String& groupType,
-                                const String& templateName,
-                                bool imperial,
-                                const String& fromPlanet,
-                                const String& fromLocation,
-                                int attempts = 0);
+	// P.6.1 SimPvP squads: a persistent roster (leader + followers) that runs
+	// player-mimetic starport loops and travels between cities via the proven
+	// switchZone outdoor reposition. Gated by pvpConfig.enablePvpBots.
+	struct SimPvpSquad {
+		uint64 squadId = 0;
+		bool imperial = false;
+		int desiredSize = 1;
+		uint64 leaderOid = 0;
+		Vector<uint64> memberOids;      // live followers (leader excluded)
+		int pendingReplacements = 0;    // dead slots refilled at next city
+		String planet;
+		String city;
+		Vector3 shuttlePos;
+		Vector3 hangoutPos;
+		bool leaderDeadPendingPromotion = false;
+		bool travelTaskActive = false;
+		bool reforming = false;
+		uint64 reformAtMs = 0;
+		uint64 formedAtMs = 0;
+		uint64 lastTravelMs = 0;
+		int travels = 0;
+		int deaths = 0;
+		int engagements = 0;
+		// P.6.2 scouts + gank convergence: scout squads report contacts
+		// instead of engaging; a patrol squad gets a pending convergence
+		// destination which boardPvpSquad consumes instead of a random city.
+		bool scout = false;
+		uint64 lastConvergeMs = 0;      // per-squad converge cooldown anchor
+		String convergePlanet;          // pending convergence destination
+		String convergeCity;
+		uint64 convergeExpiresAtMs = 0;
+		uint64 lastAnnounceMs = 0;      // P.6.3a per-squad spatial announce cooldown
+		uint64 groupId = 0;             // P.6.3c GroupObject (0 = no players joined)
+		// P.6.5a routed travel: remaining legs of the planned journey (index 0
+		// = next to board); empty while idle at a destination city. An
+		// unexpired convergence stamp drops the rest of a route (replan).
+		Vector<PvpTravelLeg> pendingRoute;
+		String routeDestPlanet;
+		String routeDestCity;
+		int routeLegsTotal = 0;
+
+		// Satisfy Vector/TypeInfo template instantiation
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+
+	// P.6.2: latest reported enemy contact per faction (the reporter's faction
+	// is the one that converges). Guarded by pvpSquadMutex; expires by TTL.
+	struct SimPvpFactionContact {
+		bool valid = false;
+		String planet;
+		String city;
+		uint64 reportedAtMs = 0;
+		bool targetWasPlayer = false;
+		uint64 reporterSquadId = 0;
+		int reports = 0;
+	};
 
 private:
 	bool enabled = false;
@@ -588,7 +674,7 @@ private:
 	// P.4.5b cross-planet dispatch (proportional rebalance, player-mimetic: run to
 	// the origin starport's ticket collector, board = switchZone to the
 	// destination starport's outdoor arrival, ride, then gather). Default off +
-	// dryRun on so the build ships inert. NPC repositioning only — no economy/
+	// dryRun on so the build ships inert. NPC repositioning only - no economy/
 	// inventory/persistence mutation (same class as station travel + recovery).
 	struct PlanetDispatchPlanetRow {
 		String planet;
@@ -625,7 +711,7 @@ private:
 	String planetDispatchLastBoardedToZone;
 	String planetDispatchLastBoardedReason;
 	// P.4.4a real vehicle mechanics (spawn/mount/dismount/store). Heavily gated
-	// (master flag default off). Simulation-only object lifecycle — no economy/
+	// (master flag default off). Simulation-only object lifecycle - no economy/
 	// inventory/persistence mutation. Devices stored as SceneObject* to keep the
 	// header light; cast to VehicleControlDevice* in the .cpp.
 	bool vehicleMechanicsEnabled = false;
@@ -719,7 +805,7 @@ private:
 	bool hiveReservationSelfTestTaskScheduled = false;
 	int hiveReservationSelfTestIntervalSeconds = 120;
 	int hiveReservationSelfTestReserveQuantity = 5;
-	// P.5.3: first crafter consumer — demand-driven reserve+CONSUME that draws
+	// P.5.3: first crafter consumer - demand-driven reserve+CONSUME that draws
 	// hive stock down (the first real consumer). Simulation-only: consume
 	// decrements the private hive ledger, no game state. C++ default off.
 	bool hiveCrafterConsumerEnabled = false;
@@ -729,13 +815,26 @@ private:
 	int hiveCrafterConsumerMinOq = 0;
 	bool hiveCrafterConsumerPreferShortage = true;
 	bool hiveCrafterConsumerAllowAnyLotFallback = true;
+	// P.5.4a: reserve via the profile's exact-type/family candidate list
+	// (class-chain matching) instead of the single activeResource type.
+	bool hiveCrafterUseFamilyMatching = false;
+	// P.5.4b: consume raw -> deposit a finished_good hive lot per recipe.
+	bool hiveCrafterProduceFinishedGoods = false;
+	// Lua recipe overrides by profileKey (defaults live in
+	// createHiveCrafterRecipeDefinitions in the .cpp). Written once at config
+	// load, read by the crafter task.
+	VectorMap<String, HiveCrafterRecipe> hiveCrafterRecipeOverrides;
 	// Guarded runtime counters (task writes, dashboard reads).
 	Mutex hiveCrafterConsumerMutex;
 	uint64 hiveCrafterBatchesCompleted = 0;
 	uint64 hiveCrafterUnitsConsumed = 0;
+	uint64 hiveCrafterUnitsProduced = 0;
 	String hiveCrafterLastProfile;
 	String hiveCrafterLastReserveReason;
 	bool hiveCrafterLastFallbackUsed = false;
+	String hiveCrafterLastMatchedTier;
+	String hiveCrafterLastMatchedQuery;
+	String hiveCrafterLastGoodKey;
 	VectorMap<String, uint64> hiveCrafterProducedByProfile;
 	bool persistentStockpileDemandEnabled = false;
 	bool persistentStockpileDemandIncludeConceptualMinerLots = true;
@@ -901,7 +1000,6 @@ private:
 	void spawnConfiguredGroups();
 	void scheduleConfiguredSpawnTask(int groupIndex, int spawnIndex, int delayMs);
 	void runConfiguredSpawnTask(int groupIndex, int spawnIndex);
-	void startControllerForAgent(AiAgent* agent, Reference<SimPlayerController*> ctrl);
 
 	bool pickRandomShuttleport(ShuttleportLocation& out) const;
 	bool isNearestShuttleBoardable(CreatureObject* c);
@@ -966,6 +1064,7 @@ private:
 	void applyHiveReservationSelfTestConfig(LuaObject& selfTestConfig);
 	void scheduleHiveCrafterConsumerTask();
 	void applyHiveCrafterConsumerConfig(LuaObject& crafterConfig);
+	HiveCrafterRecipe getHiveCrafterRecipeForProfile(const String& profileKey);
 	void applyPersistentStockpileDemandConfig(LuaObject& stockpileDemandConfig);
 	void scheduleDemandWeightedMinerPlanSimulationTask();
 	void runDemandWeightedMinerPlanSimulationTask();
@@ -1042,6 +1141,202 @@ private:
 
 	void spawnFromConfig(const SpawnGroup& g, const ShuttleportLocation& loc, const String& templateName);
 
+	// --- P.6.1 SimPvP squads (config, roster, travel, upkeep) ---------------
+	// All C++ defaults ship OFF; lua pvpConfig enables and tunes at runtime
+	// (refreshed every maintenance interval, same pattern as travelConfig).
+	bool pvpEnabled = false;
+	int pvpSquadsPerFaction = 1;
+	int pvpSquadSize = 4;
+	float pvpScanRadiusMeters = 40.f;
+	// Disengage distance: a bot in combat whose target has fled beyond this
+	// (or died/left) drops combat instead of chasing across the map. Sits just
+	// above effective ranged weapon range (~64m) so real fights aren't cut off
+	// but 100m chases are. Also the phantom-combat stalemate guard's range.
+	float pvpCombatLeashMeters = 72.f;
+	int pvpLoiterMinSeconds = 60;
+	int pvpLoiterMaxSeconds = 180;
+	bool pvpAllowBotVsBotCombat = false;
+	bool pvpLogStateTransitions = false;
+	int pvpRespawnDelaySeconds = 120;
+	int pvpMaintenanceIntervalSeconds = 30;
+	int pvpShuttleWaitIntervalSeconds = 5;
+	int pvpShuttleWaitMaxAttempts = 24;
+	int pvpCorpseCleanupDelaySeconds = 60;
+	bool pvpRecoveryEnabled = true;
+	bool pvpRecoveryDryRun = true;
+	float pvpMemberFarMeters = 64.f;
+	int pvpStateTtlSeconds = 600;
+	int pvpMaxRecoveryActionsPerInterval = 2;
+	Vector<String> pvpImperialTemplates;
+	Vector<String> pvpRebelTemplates;
+	bool pvpMaintenanceTaskScheduled = false;
+	uint64 nextPvpSquadId = 1;
+	Vector<SimPvpSquad> pvpSquads;
+	Mutex pvpSquadMutex;
+	int pvpTravelsTotal = 0;
+	int pvpDeathsTotal = 0;
+	int pvpPlayerEngagementsTotal = 0;
+	int pvpBotEngagementsTotal = 0;
+	int pvpRecoveryActionsTotal = 0;
+	int pvpPromotionsTotal = 0;
+	int pvpSquadReformsTotal = 0;
+	int pvpBoardAnywayTotal = 0;
+	// P.6.2 scouts + gank convergence (all C++ defaults off/conservative).
+	bool pvpScoutsEnabled = false;
+	int pvpScoutSquadsPerFaction = 1;
+	int pvpScoutSquadSize = 1;
+	float pvpScoutScanRadiusMeters = 64.f;
+	bool pvpScoutReportOnly = true;
+	int pvpScoutReportIntervalSeconds = 30;
+	int pvpContactTtlSeconds = 300;
+	int pvpConvergeCooldownSeconds = 600;
+	SimPvpFactionContact pvpImperialContact;   // guarded by pvpSquadMutex
+	SimPvpFactionContact pvpRebelContact;      // guarded by pvpSquadMutex
+	VectorMap<String, uint64> pvpCityConvergeCooldowns; // key faction:planet:city
+	int pvpContactsReportedTotal = 0;
+	int pvpConvergencesTotal = 0;
+	// P.6.3a player-facing comms: squad leaders speak (spatial chat) on key
+	// events so nearby players hear the PvP happening. Gated + rate-limited.
+	bool pvpCommsSpatialEnabled = false;
+	int pvpCommsAnnounceCooldownSeconds = 45;  // per-squad min gap
+	int pvpCommsGlobalMinGapSeconds = 4;       // any-squad min gap (anti-spam)
+	uint64 pvpLastGlobalAnnounceMs = 0;        // guarded by pvpSquadMutex
+	int pvpAnnouncementsTotal = 0;
+	// P.6.3b faction chat rooms (GCW.Rebel / GCW.Imperial). Leaders post
+	// arrivals/contacts; entry is gated to the room's faction (optionally
+	// overt-only) via a flag-guarded hook in ChatManager::handleChatEnterRoomById.
+	bool pvpCommsFactionRoomsEnabled = false;
+	bool pvpCommsFactionRoomRequireOvert = false;
+	bool pvpFactionRoomsCreated = false;       // guarded by pvpSquadMutex
+	uint32 pvpRebelRoomID = 0;                 // set once at creation
+	uint32 pvpImperialRoomID = 0;
+    int pvpFactionRoomPostsTotal = 0;
+	int pvpFactionRoomJoinsBlockedTotal = 0;
+	void ensurePvpFactionRooms();
+	void postPvpFactionRoom(bool imperial, const String& sender, const String& text);
+	// P.6.3c player grouping: a player can join a squad's own GroupObject
+	// (NPC leader + players only). Leadership is only ever transferred to the
+	// squad's NEW NPC leader on promotion, or the group is disbanded on a full
+	// wipe - a player can never become the group leader.
+	bool pvpCommsPlayerGroupingEnabled = false;
+	int pvpCommsMaxPlayersPerSquad = 5;
+	float pvpCommsJoinRangeMeters = 48.f;
+	int pvpGroupsFormedTotal = 0;
+	int pvpPlayersJoinedTotal = 0;
+	int pvpPlayersLeftTotal = 0;
+	int pvpGroupsDisbandedTotal = 0;
+	// squadId lookup by group id, so a group-chat message resolves its squad
+	// without scanning (guarded by pvpSquadMutex).
+	int findPvpSquadIndexByGroup(uint64 groupId) const;
+	// Group ops (never called while holding pvpSquadMutex). Snapshot squad
+	// state under the mutex, then operate on the group/agents unlocked. Players
+	// LEAVE via the stock /leavegroup command (engine-correct locking); we only
+	// reconcile a now-empty group's stale id in maintenance.
+	bool addPlayerToSquadGroup(uint64 squadId, CreatureObject* player);
+	void disbandSquadGroup(uint64 groupId, const String& reason);
+	void transferSquadGroupLeadership(uint64 groupId, AiAgent* oldLeader,
+		AiAgent* newLeader);
+	void postSquadGroupChat(uint64 groupId, const String& sender,
+		const String& text);
+	void reconcilePvpSquadGroups();
+	// P.6.3c: keep the group's NPC roster == the squad's live members (owner
+	// wants the whole squad visible in a joined player's group). Idempotent;
+	// called at join and each maintenance tick for squads that have a group.
+	void syncSquadGroupMembers(uint64 squadId);
+
+	// P.6.5-0 travel diagnostics spike (read-only, one-shot per boot).
+	// Dumps the interplanetary fare matrix (the planet-connectivity truth the
+	// P.6.5 router will read), resolves each configured city's nearest
+	// starport, and computationally tests a street->ticket-collector path
+	// into each configured starport (PathFinderManager world->cell) without
+	// moving any agent. Results: SimPvpTravelSpike log lines + dashboard
+	// pvpActivity.travelDiagnostics. Outcome decides P.6.5b boarding realism
+	// (interior collector run vs outdoor entrance fallback).
+	struct PvpTravelSpikePoint {
+		String zoneName;
+		String pointName;
+
+		// Satisfy Vector/TypeInfo template instantiation
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+	struct PvpTravelSpikeInteriorResult {
+		String zoneName;
+		String pointName;
+		String status;            // ok|zoneMissing|pointMissing|noCollector|pathFailed|exception
+		String collectorTemplate;
+		bool collectorInCell = false;
+		bool pathable = false;
+		int pathNodes = 0;
+		float collectorX = 0.f;
+		float collectorY = 0.f;
+		float collectorZ = 0.f;
+
+		// Satisfy Vector/TypeInfo template instantiation
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+	bool pvpTravelDumpGraph = false;
+	bool pvpTravelTestInteriorPaths = false;
+	Vector<PvpTravelSpikePoint> pvpTravelInteriorPathPoints;
+	bool pvpTravelSpikeRan = false;                    // guarded by pvpSquadMutex
+	Vector<String> pvpTravelSpikeFareLines;            // guarded by pvpSquadMutex
+	Vector<String> pvpTravelSpikeStarportLines;        // guarded by pvpSquadMutex
+	Vector<PvpTravelSpikeInteriorResult> pvpTravelSpikeInteriorResults; // guarded by pvpSquadMutex
+	void runPvpTravelDiagnosticsIfNeeded();
+	void runPvpTravelDiagnostics();
+
+	// --- P.6.5a routed travel (owner-approved; ai-pvp-mimetic-travel-design.md)
+	// Squads travel like players: intra-planet hops are free-form, cross-planet
+	// legs require BOTH cities' starports AND a fare-matrix route (getTravelFare
+	// > 0 - the exact connectivity players see). Journeys are BFS-planned over
+	// the configured city pool; each leg reuses the proven switchZone boarding,
+	// with brief transit stops at connection ports. C++ default OFF.
+	bool pvpRoutedTravelEnabled = false;
+	Vector<String> pvpTravelMainPlanets;
+	int pvpTravelOffMainChancePct = 25;   // chance an off-main city is accepted
+	int pvpTravelMaxLegsPerRoute = 3;
+	int pvpTravelTransitDwellMinSeconds = 20;
+	int pvpTravelTransitDwellMaxSeconds = 45;
+	String pvpStagingRebelPlanet;         // squads form up at faction staging
+	String pvpStagingRebelCity;
+	String pvpStagingImperialPlanet;
+	String pvpStagingImperialCity;
+	int pvpRoutesPlannedTotal = 0;        // guarded by pvpSquadMutex
+	int pvpRouteLegsExecutedTotal = 0;    // guarded by pvpSquadMutex
+	int pvpRouteHopRoutesTotal = 0;       // routes with >1 leg
+	int pvpTransitStopsTotal = 0;         // non-final legs boarded
+	int pvpRouteFallbacksTotal = 0;       // routed on, plan failed → legacy pick
+	// Plans a route for the squad (consumes an unexpired convergence stamp as
+	// the destination) and stores it on the squad. Resolves travel points and
+	// connectivity OUTSIDE the squad mutex; picks/stores under it. Returns
+	// false → caller falls back to the legacy random pick.
+	bool planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
+		String& summaryOut, bool& convergenceOut);
+	// Pops the next planned leg. A fresh unexpired convergence stamp drops the
+	// remaining route instead (returns false → caller replans to the contact).
+	bool popNextPvpRouteLeg(uint64 squadId, PvpTravelLeg& legOut, int& remainingOut);
+	int findShuttleportIndex(const String& planet, const String& city) const;
+
+	void applyPvpConfig(LuaObject& pvpConfig);
+	void refreshPvpConfig();
+	void spawnPvpSquad(bool imperial, bool scout);
+	// P.6.2: consume unexpired faction contacts - pick an eligible patrol
+	// squad and send it to the contact's city (per-squad + per-city cooldowns).
+	void dispatchPvpConvergence(uint64 nowMs);
+	// Caller must hold pvpSquadMutex. Registers/refreshes the reporter
+	// faction's contact from the squad's current city.
+	void notePvpContactLocked(const SimPvpSquad& squad, bool targetWasPlayer);
+	AiAgent* spawnPvpBotAgent(Zone* zone, const Vector3& position,
+		const String& templateName, bool imperial, bool leader,
+		AiAgent* leaderAgent, float formationOffsetX, float formationOffsetY);
+	void boardPvpSquad(uint64 squadId);
+	void schedulePvpBotCleanup(uint64 oid, int delaySeconds);
+	void despawnPvpSquads(const String& reason);
+	String pickPvpTemplate(bool imperial) const;
+	// Caller must hold pvpSquadMutex. Returns -1 when the squad is gone.
+	int findPvpSquadIndex(uint64 squadId) const;
+
 public:
 	SimPlayerManager();
 
@@ -1117,20 +1412,70 @@ public:
 	}
 	JSONSerializationType getAiEconomyDashboardSnapshot();
 
-	// Cycle logic (called by SimPvPController)
-	void cyclePvPBot(uint64 oldOid,
-	                 const String& groupType,
-	                 const String& templateName,
-	                 bool imperial,
-	                 const String& fromPlanet,
-	                 const String& fromLocation);
+	// --- P.6.1 SimPvP squads: task- and controller-called entry points.
+	// (Scheduled tasks are not friends; these must stay public.)
+	void schedulePvpMaintenanceTask();
+	void runPvpMaintenanceTask();
+	void runPvpShuttleWaitTask(uint64 squadId, int attempts);
+	void runPvpBotCleanupTask(uint64 oid);
+	// Called by SimPvPController when the leader is posted at the shuttleport.
+	void onPvpSquadReadyToTravel(uint64 squadId);
+	// Called (once per life) by SimPvpBotController when a bot dies.
+	void onPvpBotDied(uint64 squadId, uint64 oid);
+	void recordPvpEngagement(uint64 squadId, bool targetWasPlayer);
+	// P.6.2: called (throttled) by a report-only scout's scan on contact.
+	void reportPvpContact(uint64 squadId, bool targetWasPlayer);
 
-	void spawnSimPlayerWithRoute(const String& planet,
-                    			const Vector3& spawn,
-                    			const Vector3& hangout,
-                    			const String& templateName,
-                    			const String& groupType,
-                    			const String& locationName);
+	// P.6.3a: squad-leader spatial announcements. The controller fires an event
+	// at a phase transition; the manager (config- and cooldown-gated) resolves
+	// the leader agent and broadcasts a faction-flavored line to nearby players.
+	enum PvpAnnounceEvent {
+		PVP_ANNOUNCE_ARRIVAL = 0,   // posted up at the starport
+		PVP_ANNOUNCE_DEPARTURE,     // area clear, moving on
+		PVP_ANNOUNCE_CONTACT,       // enemy spotted / engaging
+		PVP_ANNOUNCE_CONVERGE,      // breaking off to reinforce a fight
+		PVP_ANNOUNCE_MOVEOUT        // P.6.5a: boarding with a planned route
+	};
+	// detail: appended to the spatial line and used in the room/group post -
+	// P.6.5a passes the human-readable route ("Route: kor vella, then coronet
+	// (corellia)") so players know where the squad is heading. MOVEOUT bypasses
+	// the per-squad announce cooldown (route info must not be swallowed by the
+	// DEPARTURE callout seconds earlier); the global anti-spam gap still applies.
+	void announcePvpEvent(uint64 squadId, int eventType,
+		const String& detail = "");
+
+	// P.6.3b: called by the flag-gated hook in ChatManager::handleChatEnterRoom
+	// ById. isPvpFactionRoom returns false unless faction rooms + gating are
+	// enabled AND the id is one of ours, so the hook is inert when off.
+	bool isPvpFactionRoom(uint32 roomID) const;
+	bool isPvpFactionRoomJoinAllowed(CreatureObject* player, uint32 roomID) const;
+	void recordPvpFactionRoomJoinBlocked();
+
+	// P.6.3c: called by the flag-gated hooks in ChatManagerImplementation.
+	// onPlayerSpatialChat parses join keywords ("join pvp group", "join group
+	// with <name>"). onPvpGroupChat parses in-group commands (status/where/
+	// leave). isPvpSquadGroup lets the group-chat hook skip non-squad groups.
+	void onPlayerSpatialChat(CreatureObject* player, const UnicodeString& message);
+	void onPvpGroupChat(CreatureObject* player, uint64 groupId,
+		const UnicodeString& message);
+	bool isPvpSquadGroup(uint64 groupId) const;
+	// P.6.3c: gate for the joinGroup core patch - true only when grouping is
+	// enabled AND oid is a current squad leader NPC.
+	bool isPvpSquadLeaderNpc(uint64 oid) const;
+	// P.6.3c: called by the joinGroup core patch after a player ACCEPTS an
+	// invite from a squad-leader NPC (records the group + syncs the squad in).
+	void onPlayerJoinedSquadGroup(uint64 leaderOid, CreatureObject* player);
+
+	// Read-only pvpConfig accessors for the controllers (runtime-refreshed).
+	float getPvpScanRadiusMeters() const { return pvpScanRadiusMeters; }
+	float getPvpCombatLeashMeters() const { return pvpCombatLeashMeters; }
+	bool isPvpBotVsBotCombatEnabled() const { return pvpAllowBotVsBotCombat; }
+	int getPvpLoiterMinSeconds() const { return pvpLoiterMinSeconds; }
+	int getPvpLoiterMaxSeconds() const { return pvpLoiterMaxSeconds; }
+	bool isPvpLogStateTransitionsEnabled() const { return pvpLogStateTransitions; }
+	float getPvpScoutScanRadiusMeters() const { return pvpScoutScanRadiusMeters; }
+	bool isPvpScoutReportOnly() const { return pvpScoutReportOnly; }
+	int getPvpScoutReportIntervalSeconds() const { return pvpScoutReportIntervalSeconds; }
 };
 
 #endif /* SIMPLAYERMANAGER_H_ */

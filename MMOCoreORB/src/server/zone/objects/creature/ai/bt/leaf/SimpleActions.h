@@ -746,6 +746,36 @@ public:
 	}
 };
 
+class ManageJediForce : public Behavior {
+public:
+	ManageJediForce(const String& className, const uint32 id, const LuaObject& args) : Behavior(className, id, args) {
+	}
+
+	ManageJediForce(const ManageJediForce& b) : Behavior(b) {
+	}
+
+	ManageJediForce& operator=(const ManageJediForce& b) {
+		if (this == &b)
+			return *this;
+		Behavior::operator=(b);
+
+		return *this;
+	}
+
+	Behavior::Status execute(AiAgent* agent, unsigned int startIdx = 0) const {
+		agent->runJediForceManagement();
+
+		return SUCCESS;
+	}
+
+	String print() const {
+		StringBuffer msg;
+		msg << className;
+
+		return msg.toString();
+	}
+};
+
 class SendChatGreeting : public Behavior {
 public:
 	SendChatGreeting(const String& className, const uint32 id, const LuaObject& args) : Behavior(className, id, args) {

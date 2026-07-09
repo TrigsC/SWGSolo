@@ -9,6 +9,7 @@
 #include "server/zone/ZoneServer.h"
 #include "server/zone/Zone.h"
 #include "server/zone/SpaceZone.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
 
 #include "server/zone/managers/player/PlayerManager.h"
 #include "server/zone/managers/name/NameManager.h"
@@ -770,6 +771,20 @@ void ChatManagerImplementation::handleChatEnterRoomById(CreatureObject* player, 
 		return;
 	}
 
+	// P.6.3b: SimPvP faction command channels (GCW.Rebel / GCW.Imperial) are
+	// gated to the room's faction (optionally overt-only). isPvpFactionRoom is
+	// false unless the feature + gating are enabled AND this is one of those
+	// rooms, so this block is inert otherwise. Not gated by bypassSecurity -
+	// an admin bypass still shouldn't leak the enemy channel via faction.
+	if (SimPlayerManager::instance()->isPvpFactionRoom(roomID) &&
+			!SimPlayerManager::instance()->isPvpFactionRoomJoinAllowed(player, roomID)) {
+		SimPlayerManager::instance()->recordPvpFactionRoomJoinBlocked();
+		int error = ChatManager::NOTINVITED;
+		ChatOnEnteredRoom* coer = new ChatOnEnteredRoom(server->getGalaxyName(), player->getFirstName(), roomID, error, requestID);
+		player->sendMessage(coer);
+		return;
+	}
+
 	//Check if player is allowed to join.
 	int result = ChatManager::SUCCESS;
 
@@ -1093,6 +1108,13 @@ void ChatManagerImplementation::broadcastChatMessage(CreatureObject* sourceCreat
 			}
 		}
 	}
+
+	// P.6.3c: let SimPvP interpret a player's spatial "join" requests near a
+	// squad ("join pvp group", "join group with <name>"). onPlayerSpatialChat
+	// cheaply early-outs unless grouping is enabled and the text contains
+	// "join", so this adds negligible overhead to normal spatial chat.
+	if (sourceCreature->isPlayerCreature())
+		SimPlayerManager::instance()->onPlayerSpatialChat(sourceCreature, message);
 
 	StringIdChatParameter* param = nullptr;
 
@@ -1648,6 +1670,15 @@ void ChatManagerImplementation::handleGroupChat(CreatureObject* sender, const Un
 	}
 
 	sender->wlock();
+
+	// P.6.3c: after normal delivery, let a SimPvP squad group interpret the
+	// player's in-group commands (status / where). Flag-gated: isPvpSquadGroup
+	// is false unless grouping is enabled AND this group belongs to a squad.
+	if (sender->isPlayerCreature()) {
+		uint64 groupID = group->getObjectID();
+		if (SimPlayerManager::instance()->isPvpSquadGroup(groupID))
+			SimPlayerManager::instance()->onPvpGroupChat(sender, groupID, message);
+	}
 }
 
 void ChatManagerImplementation::handleGuildChat(CreatureObject* sender, const UnicodeString& message) {

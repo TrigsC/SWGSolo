@@ -629,6 +629,20 @@ template<> bool CheckHealChance::check(AiAgent* agent) const {
 //	return true;
 //}
 
+template<> bool CheckJediForceChance::check(AiAgent* agent) const {
+	// Fast gate: one int compare for the vast majority of NPCs.
+	if (agent->getJediArchetype() == AiAgent::JEDI_ARCHETYPE_NONE)
+		return false;
+
+	// Below this there is nothing in the ladder worth casting; save the tick.
+	if (agent->getCurrentForce() < 250)
+		return false;
+
+	auto cooldownTimerMap = agent->getCooldownTimerMap();
+
+	return cooldownTimerMap != nullptr && cooldownTimerMap->isPast("jedi_force_window");
+}
+
 template<> bool CheckIsHome::check(AiAgent* agent) const {
 	PatrolPoint* homeLocation = agent->getHomeLocation();
 

@@ -28,6 +28,24 @@ namespace {
 	bool validResourceStat(int value) {
 		return value >= -1 && value <= 1000;
 	}
+
+	// P.5.4a: mirrors the demand engine's resourceTypeMatches semantics
+	// (SimPlayerManager) on plain lot fields: exact type, type prefix, or
+	// class-chain containment.
+	bool lotFieldsMatchResourceQuery(
+			const String& resourceType, const String& classChain,
+			const String& query) {
+		if (query.isEmpty())
+			return false;
+
+		if (resourceType == query || resourceType.beginsWith(query))
+			return true;
+
+		if (classChain.isEmpty())
+			return false;
+
+		return classChain.indexOf(query) >= 0;
+	}
 }
 
 AiEconomyManager::AiEconomyManager() : Logger("AiEconomyManager") {
@@ -754,6 +772,358 @@ bool AiEconomyManager::reserveFromStockpile(
 	return true;
 }
 
+bool AiEconomyManager::reserveFromStockpileMatching(
+		const Vector<String>& orderedQueries, int minOq, uint64 quantity,
+		AiEconomyMatchedReservation& outReservation, String& failureReason) {
+	outReservation = AiEconomyMatchedReservation();
+	failureReason = "";
+
+	if (quantity == 0) {
+		failureReason = "zeroQuantity";
+		return false;
+	}
+
+	if (orderedQueries.size() == 0) {
+		failureReason = "noQueries";
+		return false;
+	}
+
+	Locker mutationLocker(&persistenceMutationMutex);
+
+	ManagedReference<AiEconomyData*> data = economyData;
+
+	if (!persistenceReady.get() || data == nullptr) {
+		failureReason = "persistenceUnavailable";
+		return false;
+	}
+
+	Vector<ManagedReference<AiEconomyStockpileLot*> > lots;
+
+	{
+		Locker dataLocker(data);
+		Vector<ManagedReference<AiEconomyStockpileLot*> >* storedLots =
+			data->getStockpileLots();
+
+		if (storedLots == nullptr) {
+			failureReason = "nullStockpileLotVector";
+			return false;
+		}
+
+		for (int i = 0; i < storedLots->size(); ++i)
+			lots.add(storedLots->get(i));
+	}
+
+	// Snapshot eligible raw lots once so each query tier matches in-memory
+	// (persistenceMutationMutex serializes all mutators, so this is stable).
+	Vector<int> candidateIndexes;
+	Vector<String> candidateTypes;
+	Vector<String> candidateChains;
+	Vector<int> candidateOqs;
+	Vector<uint64> candidateAvailable;
+
+	for (int i = 0; i < lots.size(); ++i) {
+		ManagedReference<AiEconomyStockpileLot*> lot = lots.get(i);
+
+		if (lot == nullptr)
+			continue;
+
+		Locker lotLocker(lot);
+
+		if (lot->getIdentityConfidence() != "exact_type" ||
+				lot->getResourceLifecycleState() == "despawned")
+			continue;
+
+		int oq = lot->getOq();
+
+		if (oq < minOq)
+			continue;
+
+		uint64 available = lot->getAvailableQuantity();
+
+		if (available < quantity)
+			continue;
+
+		candidateIndexes.add(i);
+		candidateTypes.add(lot->getResourceType());
+		candidateChains.add(lot->getResourceClassChain());
+		candidateOqs.add(oq);
+		candidateAvailable.add(available);
+	}
+
+	if (candidateIndexes.size() == 0) {
+		failureReason = "noEligibleLot";
+		return false;
+	}
+
+	// First query tier that matches any lot wins; within the tier keep the
+	// proven selection rule (highest OQ, tie-break deepest stack).
+	int bestCandidate = -1;
+	int matchedQueryIndex = -1;
+
+	for (int queryIndex = 0;
+			queryIndex < orderedQueries.size() && bestCandidate < 0;
+			++queryIndex) {
+		const String& query = orderedQueries.get(queryIndex);
+
+		for (int c = 0; c < candidateIndexes.size(); ++c) {
+			if (!lotFieldsMatchResourceQuery(
+					candidateTypes.get(c), candidateChains.get(c), query))
+				continue;
+
+			if (bestCandidate < 0 ||
+					candidateOqs.get(c) > candidateOqs.get(bestCandidate) ||
+					(candidateOqs.get(c) == candidateOqs.get(bestCandidate) &&
+						candidateAvailable.get(c) >
+							candidateAvailable.get(bestCandidate))) {
+				bestCandidate = c;
+				matchedQueryIndex = queryIndex;
+			}
+		}
+	}
+
+	if (bestCandidate < 0) {
+		failureReason = "noMatchingLot";
+		return false;
+	}
+
+	ManagedReference<AiEconomyStockpileLot*> bestLot =
+		lots.get(candidateIndexes.get(bestCandidate));
+
+	{
+		Locker lotLocker(bestLot);
+
+		if (bestLot->getAvailableQuantity() < quantity) {
+			failureReason = "insufficientAvailable";
+			return false;
+		}
+
+		bestLot->addReservedQuantity(quantity);
+
+		outReservation.entryID = bestLot->getEntryId();
+		outReservation.resourceType = bestLot->getResourceType();
+		outReservation.resourceSpawnName = bestLot->getResourceSpawnName();
+		outReservation.oq = bestLot->getOq();
+		outReservation.cd = bestLot->getCd();
+		outReservation.dr = bestLot->getDr();
+		outReservation.hr = bestLot->getHr();
+		outReservation.fl = bestLot->getFl();
+		outReservation.ma = bestLot->getMa();
+		outReservation.pe = bestLot->getPe();
+		outReservation.sr = bestLot->getSr();
+		outReservation.ut = bestLot->getUt();
+		outReservation.cr = bestLot->getCr();
+	}
+
+	uint64 token = nextReservationToken++;
+
+	HiveReservation reservation;
+	reservation.token = token;
+	reservation.entryID = outReservation.entryID;
+	reservation.quantity = quantity;
+	reservation.resourceType = outReservation.resourceType;
+	reservation.lot = bestLot;
+
+	activeReservations.put(token, reservation);
+	reservationsGranted++;
+
+	outReservation.token = token;
+	outReservation.matchedQuery = orderedQueries.get(matchedQueryIndex);
+	outReservation.matchedQueryIndex = matchedQueryIndex;
+	return true;
+}
+
+bool AiEconomyManager::depositFinishedGood(
+		const String& goodKey, const String& goodName,
+		const String& goodClassChain, const String& producingProfile,
+		const String& qualityTier, int qualityScore, uint64 outputUnits,
+		uint64& outEntryID, uint64& outNewQuantity, String& failureReason) {
+	outEntryID = 0;
+	outNewQuantity = 0;
+	failureReason = "";
+
+	if (goodKey.isEmpty() || outputUnits == 0 ||
+			outputUnits > MAX_STOCKPILE_QUANTITY) {
+		failureReason = "invalidFinishedGoodDeposit";
+		return false;
+	}
+
+	if (!stringWithinLimit(goodKey, MAX_LABEL_LENGTH) ||
+			!stringWithinLimit(goodName, MAX_LABEL_LENGTH) ||
+			!stringWithinLimit(qualityTier, MAX_LABEL_LENGTH) ||
+			!stringWithinLimit(goodClassChain, MAX_METADATA_LENGTH) ||
+			!stringWithinLimit(producingProfile, MAX_METADATA_LENGTH)) {
+		failureReason = "finishedGoodMetadataLimitExceeded";
+		return false;
+	}
+
+	if (qualityScore < -1)
+		qualityScore = -1;
+	else if (qualityScore > 1000)
+		qualityScore = 1000;
+
+	Locker mutationLocker(&persistenceMutationMutex);
+
+	ManagedReference<AiEconomyData*> data = economyData;
+
+	if (!persistenceReady.get() || data == nullptr) {
+		failureReason = "persistenceUnavailable";
+		return false;
+	}
+
+	Vector<ManagedReference<AiEconomyStockpileLot*> > lots;
+	uint64 nextEntryID = 0;
+
+	{
+		Locker dataLocker(data);
+		nextEntryID = data->getNextStockpileEntryId();
+
+		Vector<ManagedReference<AiEconomyStockpileLot*> >* storedLots =
+			data->getStockpileLots();
+
+		if (storedLots == nullptr) {
+			persistenceReady.set(false);
+			failureReason = "nullStockpileLotVector";
+			return false;
+		}
+
+		for (int i = 0; i < storedLots->size(); ++i)
+			lots.add(storedLots->get(i));
+	}
+
+	// Upsert: one finished_good lot per goodKey.
+	ManagedReference<AiEconomyStockpileLot*> goodLot;
+
+	for (int i = 0; i < lots.size(); ++i) {
+		ManagedReference<AiEconomyStockpileLot*> lot = lots.get(i);
+
+		if (lot == nullptr)
+			continue;
+
+		Locker lotLocker(lot);
+
+		if (lot->getIdentityConfidence() != "finished_good" ||
+				lot->getResourceType() != goodKey)
+			continue;
+
+		if (goodLot != nullptr) {
+			persistenceReady.set(false);
+			failureReason = "duplicateFinishedGoodLot goodKey=" + goodKey;
+			return false;
+		}
+
+		goodLot = lot;
+	}
+
+	try {
+		if (goodLot != nullptr) {
+			{
+				Locker lotLocker(goodLot);
+
+				uint64 current = goodLot->getQuantity();
+				uint64 addable =
+					current >= MAX_STOCKPILE_QUANTITY ? 0 :
+					(outputUnits < MAX_STOCKPILE_QUANTITY - current ?
+						outputUnits : MAX_STOCKPILE_QUANTITY - current);
+
+				if (addable == 0) {
+					failureReason = "finishedGoodQuantityCeiling";
+					return false;
+				}
+
+				// Quantity-weighted running-average quality, kept in oq.
+				int currentQuality = goodLot->getOq();
+				int newQuality = qualityScore;
+
+				if (currentQuality >= 0 && qualityScore >= 0) {
+					uint64 blended =
+						(static_cast<uint64>(currentQuality) * current +
+							static_cast<uint64>(qualityScore) * addable) /
+						(current + addable);
+					newQuality = static_cast<int>(blended);
+				} else if (currentQuality >= 0) {
+					newQuality = currentQuality;
+				}
+
+				goodLot->addFinishedGoodQuantity(
+					addable, newQuality, qualityTier);
+				outEntryID = goodLot->getEntryId();
+				outNewQuantity = goodLot->getQuantity();
+			}
+
+			// Durability: addFinishedGoodQuantity writes fields directly and
+			// does not dirty the managed object, so flag it for the periodic
+			// DB save (same idiom as the deposit/consume paths).
+			ObjectManager::instance()->updatePersistentObject(goodLot);
+
+			{
+				Locker dataLocker(data);
+				data->updateTimestamp();
+			}
+		} else {
+			if (nextEntryID == 0 || nextEntryID == static_cast<uint64>(-1)) {
+				persistenceReady.set(false);
+				failureReason = "stockpileEntryIdExhausted";
+				return false;
+			}
+
+			if (lots.size() + 1 > MAX_STOCKPILE_LOTS) {
+				persistenceReady.set(false);
+				failureReason = "stockpileLotLimitExceeded";
+				return false;
+			}
+
+			ManagedReference<AiEconomyStockpileLot*> newLot =
+				new AiEconomyStockpileLot(nextEntryID, goodKey, outputUnits);
+
+			{
+				Locker lotLocker(newLot);
+				newLot->initializeSpawnLot(
+					nextEntryID,
+					0,
+					goodName,
+					goodKey,
+					goodClassChain,
+					"",
+					"",
+					"hive_crafter",
+					"crafted",
+					"finished_good",
+					producingProfile,
+					qualityTier,
+					true,
+					outputUnits);
+				newLot->setResourceStats(
+					qualityScore, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+			}
+
+			ObjectManager::instance()->persistObject(
+				newLot, 1, AI_ECONOMY_LOTS_DATABASE);
+
+			{
+				Locker dataLocker(data);
+				data->addStockpileLot(newLot);
+				data->setNextStockpileEntryId(nextEntryID + 1);
+			}
+
+			outEntryID = nextEntryID;
+			outNewQuantity = outputUnits;
+		}
+	} catch (Exception& e) {
+		persistenceReady.set(false);
+		failureReason = String("persistenceException: ") + e.getMessage();
+		return false;
+	}
+
+	int validatedLotCount = 0;
+
+	if (!validateEconomyData(data, failureReason, validatedLotCount)) {
+		persistenceReady.set(false);
+		return false;
+	}
+
+	return true;
+}
+
 bool AiEconomyManager::consumeReservation(uint64 token, String& failureReason) {
 	failureReason = "";
 
@@ -996,6 +1366,16 @@ bool AiEconomyManager::snapshotStockpileInspection(
 			row.acquiredTimestampMs = lot->getAcquiredTimestamp();
 			row.lastUpdatedTimestampMs = lot->getLastUpdatedTimestamp();
 			row.activeAtAcquisition = lot->wasActiveAtAcquisition();
+			row.oq = lot->getOq();
+			row.cd = lot->getCd();
+			row.dr = lot->getDr();
+			row.hr = lot->getHr();
+			row.fl = lot->getFl();
+			row.ma = lot->getMa();
+			row.pe = lot->getPe();
+			row.sr = lot->getSr();
+			row.ut = lot->getUt();
+			row.cr = lot->getCr();
 		}
 
 		row.conceptualMinerLot =
@@ -1003,6 +1383,7 @@ bool AiEconomyManager::snapshotStockpileInspection(
 			row.resourceLifecycleState == "conceptual" &&
 			row.ownerScope == "galaxy" &&
 			row.identityConfidence == "conceptual_label";
+		row.finishedGoodLot = row.identityConfidence == "finished_good";
 
 		snapshot.totalQuantity += row.quantity;
 		snapshot.reservedQuantity += row.reservedQuantity;
@@ -1168,6 +1549,7 @@ bool AiEconomyManager::validateEconomyData(
 		"market_purchase",
 		"admin_seed",
 		"future_ai_crafter",
+		"hive_crafter",
 		"unknown"
 	};
 	const char* const lifecycleStates[] = {
@@ -1175,12 +1557,14 @@ bool AiEconomyManager::validateEconomyData(
 		"inactive",
 		"despawned",
 		"conceptual",
+		"crafted",
 		"unknown"
 	};
 	const char* const confidenceValues[] = {
 		"exact_type",
 		"coarse_family",
 		"conceptual_label",
+		"finished_good",
 		"unknown"
 	};
 
@@ -1284,10 +1668,10 @@ bool AiEconomyManager::validateEconomyData(
 
 		if (ownerScope.isEmpty() ||
 				!isAllowedValue(
-					acquisitionSource, acquisitionSources, 6) ||
-				!isAllowedValue(lifecycleState, lifecycleStates, 5) ||
+					acquisitionSource, acquisitionSources, 7) ||
+				!isAllowedValue(lifecycleState, lifecycleStates, 6) ||
 				!isAllowedValue(
-					identityConfidence, confidenceValues, 4)) {
+					identityConfidence, confidenceValues, 5)) {
 			failureReason = "invalidLotClassification entryId=" +
 				String::valueOf(entryID);
 			return false;

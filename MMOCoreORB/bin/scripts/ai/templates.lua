@@ -9,6 +9,7 @@ includeFile("pet.lua")
 includeFile("static.lua")
 includeFile("villageRaider.lua")
 includeFile("simMiner.lua")
+includeFile("simPvp.lua")
 
 customMap = {
 	{ "crackdown", {
@@ -41,6 +42,13 @@ customMap = {
 	{ "simMiner", {
 		{NONE, "rootSimMiner"},
 		{IDLE, "idleSimMiner"}
+	}},
+
+	-- SimPvP squad leaders (P.6.1): only IDLE is overridden (no-op wait) so
+	-- the controller is the sole out-of-combat mover; NONE/ATTACK/etc. fall
+	-- back to the defaults so the bot still fights (see simPvp.lua).
+	{ "simPvp", {
+		{IDLE, "idleSimPvp"}
 	}},
 }
 

@@ -43,6 +43,7 @@ light_jedi_sentinel = Creature:new {
 	optionsBitmask = AIENABLED,
 	diet = HERBIVORE,
 	healerType = "force",
+	jediArchetype = "random",
 	customAiMap = "enclaveSentinel",
 
 	templates = { "light_jedi" },

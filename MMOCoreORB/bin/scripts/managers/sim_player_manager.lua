@@ -440,23 +440,88 @@ SimPlayerManagerConfig = {
         reserveQuantity = 5,
     },
 
-    -- P.5.3 first crafter consumer. Each tick it picks the highest-pressure
-    -- demand profile with an active resource opportunity and reserves+CONSUMES a
-    -- batch of that resource type from the hive (the first real draw-down).
-    -- Simulation-only: consume decrements the private aieconomy/aieconomylots
+    -- P.5.3 first crafter consumer + P.5.4a/b type-correct crafting into the
+    -- finished-goods ledger. Each tick it picks the highest-pressure demand
+    -- profile with an active resource opportunity, reserves+CONSUMES a batch of
+    -- profession-correct raw stock, and deposits the recipe's finished-good
+    -- output as a finished_good hive lot.
+    -- Simulation-only: consume/produce touch the private aieconomy/aieconomylots
     -- ledger only -- no ResourceContainer, market, or credit state is touched.
-    --   craftBatchQuantity     : units reserved+consumed per tick.
+    --   craftBatchQuantity     : legacy flat batch (used when a recipe is absent
+    --                            or produceFinishedGoods is off).
     --   minOq                  : minimum resource overall-quality (0 = any).
     --   preferShortageProfiles : prioritise critical/low profiles on first pass.
-    --   allowAnyLotFallback    : if the ideal type isn't stocked, draw from any
-    --                            eligible exact lot so the loop still progresses.
+    --   allowAnyLotFallback    : RETIRED by P.5.4a (false): a profile without
+    --                            type-correct stock now skips instead of drawing
+    --                            wrong stock (e.g. chef consuming metal).
+    --   useFamilyMatching      : P.5.4a -- reserve via the profile's exact-type/
+    --                            family candidate list (class-chain matching).
+    --   produceFinishedGoods   : P.5.4b -- consume raw -> produce finished-good
+    --                            lots per the recipes below.
+    --   recipes                : per-profile single-input recipe. Fields:
+    --                            goodKey/goodName/goodClassChain,
+    --                            inputUnitsPerCraft, outputUnitsPerCraft,
+    --                            finishedGoodTargetUnits (enforced by the
+    --                            P.5.4d output governor; surfaced now).
     hiveCrafterConsumerConfig = {
         enabled = true,
         intervalSeconds = 90,
         craftBatchQuantity = 25,
         minOq = 0,
         preferShortageProfiles = true,
-        allowAnyLotFallback = true,
+        allowAnyLotFallback = false,
+        useFamilyMatching = true,
+        produceFinishedGoods = true,
+        recipes = {
+            composite_armor_supply = {
+                goodKey = "composite_armor_segment",
+                goodName = "Composite Armor Segment",
+                goodClassChain = "crafted.armor",
+                inputUnitsPerCraft = 25,
+                outputUnitsPerCraft = 1,
+                finishedGoodTargetUnits = 200,
+            },
+            master_weaponsmith_staples = {
+                goodKey = "weapon_staple_stock",
+                goodName = "Weapon Component Stock",
+                goodClassChain = "crafted.weapon",
+                inputUnitsPerCraft = 25,
+                outputUnitsPerCraft = 1,
+                finishedGoodTargetUnits = 200,
+            },
+            high_damage_weapon_components = {
+                goodKey = "high_damage_weapon",
+                goodName = "High-Damage Weapon",
+                goodClassChain = "crafted.weapon",
+                inputUnitsPerCraft = 25,
+                outputUnitsPerCraft = 1,
+                finishedGoodTargetUnits = 100,
+            },
+            chef_buff_foods = {
+                goodKey = "buff_food",
+                goodName = "Buff Food",
+                goodClassChain = "crafted.food",
+                inputUnitsPerCraft = 25,
+                outputUnitsPerCraft = 1,
+                finishedGoodTargetUnits = 200,
+            },
+            chef_high_value_consumables = {
+                goodKey = "high_value_consumable",
+                goodName = "High-Value Consumable",
+                goodClassChain = "crafted.food",
+                inputUnitsPerCraft = 25,
+                outputUnitsPerCraft = 1,
+                finishedGoodTargetUnits = 100,
+            },
+            production_infrastructure = {
+                goodKey = "factory_component",
+                goodName = "Factory Component",
+                goodClassChain = "crafted.structure",
+                inputUnitsPerCraft = 25,
+                outputUnitsPerCraft = 1,
+                finishedGoodTargetUnits = 300,
+            },
+        },
     },
 
     -- Read-only D.6.2 consumer for validated durable conceptual stockpile baseline.
@@ -562,18 +627,176 @@ SimPlayerManagerConfig = {
         batchDelayMs = 1000,
     },
 
+    -- P.6.1 SimPvP squads: persistent faction squads (leader + followers)
+    -- that shuttle into a city, run to the starport hangout, loiter looking
+    -- for attackable enemies, then shuttle to the next city (switchZone
+    -- travel - the legacy destroy+respawn pvp_solo loop is retired).
+    -- All C++ defaults are OFF; this table is refreshed every
+    -- maintenanceIntervalSeconds, so every knob (including enablePvpBots)
+    -- applies at runtime without a restart.
+    pvpConfig = {
+        enablePvpBots = true,           -- master gate
+        squadsPerFaction = 2,           -- owner-approved starting population
+        squadSize = 4,                  -- leader + 3 followers
+        scanRadiusMeters = 40,          -- how close before a bot ENGAGES
+        -- Disengage distance: a bot in combat whose target flees beyond this
+        -- (just above effective ranged weapon range) drops combat instead of
+        -- chasing/attacking across the map at 100m+. Also caps stalemates.
+        combatLeashMeters = 72,
+        loiterMinSeconds = 60,
+        loiterMaxSeconds = 180,
+        -- Owner-approved to enable AFTER the P.6.1 soak: opposing sim squads
+        -- fight each other (visible PvP with zero players online). Flip at
+        -- runtime; no restart needed.
+        allowBotVsBotCombat = true,
+        logStateTransitions = true,     -- verbose while we verify P.6.1
+        respawnDelaySeconds = 120,      -- full-wipe squad re-form delay
+        maintenanceIntervalSeconds = 30,
+        shuttleWaitIntervalSeconds = 5,
+        shuttleWaitMaxAttempts = 24,    -- ~2min, then board anyway
+        corpseCleanupDelaySeconds = 60,
+        recovery = {
+            enabled = true,
+            dryRun = true,              -- observe first; then allow teleports
+            memberFarMeters = 64,
+            stateTtlSeconds = 600,
+            maxActionsPerInterval = 2,
+        },
+        -- P.6.2 scouts + gank convergence: small scout squads run the same
+        -- city loop but REPORT enemy contacts instead of engaging; the
+        -- nearest eligible patrol squad of that faction breaks off, runs to
+        -- its shuttle, and travels to the contact's city. Any squad that
+        -- engages a real PLAYER also calls it in. Cooldowns per squad and
+        -- per city stop ping-pong; contacts expire on their own.
+        scouts = {
+            enabled = false,
+            squadsPerFaction = 1,
+            squadSize = 1,              -- lone scout (players use 1-2)
+            scanRadiusMeters = 64,      -- scouts watch a wider bubble
+            reportOnly = true,          -- scouts observe + call it in
+            reportIntervalSeconds = 30,
+            contactTtlSeconds = 300,
+            convergeCooldownSeconds = 600,
+        },
+        -- P.6.3a player-facing comms: squad LEADERS speak in spatial chat on
+        -- key events (post up at a starport, area clear, contact!, moving to
+        -- reinforce) so nearby players hear the PvP happening. Rate-limited
+        -- per squad + globally. No new client commands. Later sub-phases add
+        -- faction chat rooms (6.3b) and join-a-squad + group-chat keywords
+        -- (6.3c, the two gated core patches).
+        comms = {
+            spatialAnnouncements = true,
+            announceCooldownSeconds = 45,  -- per-squad min gap between shouts
+            globalMinGapSeconds = 4,       -- any-squad min gap (anti-spam)
+            -- P.6.3b faction chat rooms: creates "GCWRebel" / "GCWImperial"
+            -- channels (chat browser path SWG.<galaxy>.GCWRebel / .GCWImperial)
+            -- that leaders post arrivals/contacts/reinforcements to with city
+            -- context. Entry is gated to the room's faction so the enemy can't
+            -- read your channel (an alt of the SAME faction still can - that's
+            -- inherent). factionRoomRequireOvert additionally requires the
+            -- joiner be OVERT. Rooms are moderated (players read only; only the
+            -- squad command feed posts).
+            factionRooms = true,
+            factionRoomRequireOvert = false,
+            -- P.6.3c player grouping: a player can join a squad's own group.
+            -- Say "join pvp group" in spatial chat near a same-faction squad
+            -- (or "join group with <name>" naming one of its members), and the
+            -- squad leader invites you. The group is the NPC leader + players
+            -- only. If the leader dies the squad's new NPC leader takes over
+            -- the group (a player never becomes leader); if the whole squad
+            -- wipes the group disbands. Leave with the normal /leavegroup.
+            -- Once grouped, type "status" or "where" in group chat for a reply.
+            playerGrouping = true,
+            maxPlayersPerSquad = 5,
+            joinRangeMeters = 48,
+        },
+        templates = {
+            imperial = { "stormtrooper", "dark_jedi_sentinel" },
+            rebel = { "rebel_trooper", "light_jedi_sentinel" },
+        },
+        -- P.6.5 player-mimetic routed travel (design doc
+        -- ai-pvp-mimetic-travel-design.md). Only the P.6.5-0 diagnostics
+        -- spike is implemented so far: read-only, runs ONCE per boot on the
+        -- maintenance thread, moves no agents. It dumps the interplanetary
+        -- fare matrix (planet connectivity), resolves each configured city's
+        -- nearest starport, and computationally tests a street->ticket-
+        -- collector path into each starport below (world->cell pathfinding).
+        -- Results: dashboard pvpActivity.travelDiagnostics + SimPvpTravelSpike
+        -- log lines. The interior verdict decides P.6.5b boarding realism
+        -- (run to the collector inside vs an outdoor entrance point).
+        travel = {
+            -- P.6.5a routed travel (owner-approved): squads travel like
+            -- players. Intra-planet legs are open; cross-planet legs need
+            -- both cities' starports AND a fare-matrix route (naboo/tatooine/
+            -- corellia interconnect; restuss requires the naboo hop). Routes
+            -- are BFS-planned over the city pool below; connection stops wait
+            -- briefly at the pad for the next ship. Leaders announce the full
+            -- route on boarding (spatial + faction room + group chat) so
+            -- players can buy the same tickets and follow.
+            enableRoutedTravel = true,
+            mainPlanets = { "naboo", "corellia", "tatooine" },
+            offMainPlanetChancePct = 25,  -- restuss etc. accepted this often
+            maxLegsPerRoute = 3,
+            transitDwellSecondsMin = 20,
+            transitDwellSecondsMax = 45,
+            -- Squads form up (spawn + full-wipe reform) at faction staging.
+            staging = {
+                rebel = { planet = "naboo", city = "moenia" },
+                imperial = { planet = "tatooine", city = "bestine" },
+            },
+            diagnostics = {
+                dumpTravelGraph = true,
+                testStarportInteriorPaths = true,
+                -- Exact point names from scripts/managers/planet/planet_manager.lua
+                -- (note: "Theed Spaceport", and Moenia's starport is "Moenia").
+                interiorPathPoints = {
+                    { zone = "naboo", point = "Theed Spaceport" },
+                    { zone = "naboo", point = "Moenia" },
+                    { zone = "naboo", point = "Keren Starport" },
+                    { zone = "naboo", point = "Kaadara Starport" },
+                    { zone = "corellia", point = "Coronet Starport" },
+                    { zone = "corellia", point = "Kor Vella Starport" },
+                    { zone = "corellia", point = "Tyrena Starport" },
+                    { zone = "tatooine", point = "Mos Eisley Starport" },
+                    { zone = "tatooine", point = "Bestine Starport" },
+                    { zone = "tatooine", point = "Mos Entha Starport" },
+                    { zone = "rori", point = "Restuss Starport" },
+                },
+            },
+        },
+    },
+
     -- 1. LOCATIONS
+    -- P.6.5a: each city's `starport` is the EXACT PlanetTravelPoint name from
+    -- scripts/managers/planet/planet_manager.lua - it resolves the routed
+    -- travel pad at plan time (spawn/hangout coords stay hand-placed).
+    -- New city spawns = the starport pad; hangouts = near its ticket
+    -- collector (positions verified by the P.6.5-0 spike, all pathable).
+    -- NOTE: kaadara is EXCLUDED - its travel point z=-192 in the planet data
+    -- (under-the-world quirk); revisit if we ever want it in the pool.
+    -- NOTE: miners also spawn spread across this list, so miners now appear
+    -- in the new cities (incl. restuss on rori) - wider gather coverage.
     shuttleports = {
         naboo = {
-            { name = "moenia", spawn = {4963.0, -4892.0, 3.0}, hangout = {4807.0, -4700.0, 4.0} },
-            { name = "theed", spawn = {-5410, 4325.0, 6.0}, hangout = {-4880.0, 4140.0, 6.0} },
+            { name = "moenia", spawn = {4963.0, -4892.0, 3.0}, hangout = {4807.0, -4700.0, 4.0}, starport = "Moenia" },
+            { name = "theed", spawn = {-5410, 4325.0, 6.0}, hangout = {-4880.0, 4140.0, 6.0}, starport = "Theed Spaceport" },
+            { name = "keren", spawn = {1371.6, 2747.9, 13.0}, hangout = {1343.0, 2758.0, 13.0}, starport = "Keren Starport" },
         },
         corellia = {
-            { name = "coronet", spawn = {-328.0, -4600.0, 28.0}, hangout = {-155.0, -4722.0, 28.0} },
+            { name = "coronet", spawn = {-328.0, -4600.0, 28.0}, hangout = {-155.0, -4722.0, 28.0}, starport = "Coronet Starport" },
+            { name = "kor_vella", spawn = {-3157.3, 2876.2, 31.0}, hangout = {-3145.0, 2905.0, 31.0}, starport = "Kor Vella Starport" },
+            { name = "tyrena", spawn = {-5003.1, -2228.4, 21.0}, hangout = {-4975.0, -2216.0, 21.0}, starport = "Tyrena Starport" },
         },
         tatooine = {
-            { name = "mos_eisley", spawn = {3416.0, -4645.0, 5.0}, hangout = {3467.0, -4890.0, 5.0} },
-        }
+            { name = "mos_eisley", spawn = {3416.0, -4645.0, 5.0}, hangout = {3467.0, -4890.0, 5.0}, starport = "Mos Eisley Starport" },
+            { name = "bestine", spawn = {-1361.2, -3600.0, 12.0}, hangout = {-1388.0, -3584.0, 12.0}, starport = "Bestine Starport" },
+            { name = "mos_entha", spawn = {1266.1, 3065.1, 7.0}, hangout = {1241.0, 3048.0, 7.0}, starport = "Mos Entha Starport" },
+        },
+        rori = {
+            -- Off-main destination: reachable ONLY via a naboo hop (fare
+            -- matrix), so routes here exercise real multi-leg journeys.
+            { name = "restuss", spawn = {5340.0, 5734.0, 80.0}, hangout = {5354.0, 5762.0, 80.0}, starport = "Restuss Starport" },
+        },
     },
 
     -- 2. SPAWN RULES
@@ -603,14 +826,9 @@ SimPlayerManagerConfig = {
                     intervalSeconds = 30,
                 },
             }
-        },
-        {
-            type = "pvp_solo",
-            totalCount = 0,
-            templates = { "rebel_trooper", "stormtrooper" },
-            minStaySeconds = 60,
-            maxStaySeconds = 180
         }
+        -- (P.6.1) The legacy pvp_solo spawn group is retired; PvP squads are
+        -- configured in pvpConfig above.
     }
 }
 

@@ -114,7 +114,6 @@ end
 -- =========================================================
 PROF_TIER_STATS = {
     rifleman = {
-        -- Added rifle_accuracy
         novice = { melee_defense = 20, ranged_defense = 2 , block = 10, rifle_speed = 50, rifle_accuracy = 45, cover = 0, rifle_aim = 45 },
         mid    = { melee_defense = 40, ranged_defense = 12 , block = 25, rifle_speed = 70, rifle_accuracy = 80, cover = 20, rifle_aim = 60 },
         master = { melee_defense = 40, ranged_defense = 72 , block = 80, rifle_speed = 100, rifle_accuracy = 150, cover = 80, rifle_aim = 100, blind_defense = 10, stun_defense = 10, dizzy_defense = 10 },
@@ -125,13 +124,11 @@ PROF_TIER_STATS = {
         master = { melee_defense = 74, ranged_accuracy = 0, ranged_defense = 69 , block = 0, rifle_speed = 0, blind_defense = 40, stun_defense = 0, dizzy_defense = 40, knockdown_defense = 50, dodge = 105, posture_change_down_defense = 50, onehandmelee_speed=50, onehandmelee_accuracy=150, onehandmelee_toughness=32 },
     },
     swordsman = {
-        -- Fixed: Removed rifle_speed, Added twohandmelee_accuracy
         novice = { melee_defense = 5, ranged_defense = 0 , block = 0, blind_defense = 0, stun_defense = 0, dizzy_defense = 0, knockdown_defense = 0, dodge = 0, posture_change_down_defense = 0, twohandmelee_speed = 50, twohandmelee_accuracy = 100 },
         mid    = { melee_defense = 10, ranged_defense = 5 , block = 0, blind_defense = 0, stun_defense = 0, dizzy_defense = 0, knockdown_defense = 10, dodge = 0, posture_change_down_defense = 10, twohandmelee_speed = 70, twohandmelee_accuracy = 130 },
         master = { melee_defense = 20, ranged_defense = 15 , block = 0, blind_defense = 40, stun_defense = 50, dizzy_defense = 20, knockdown_defense = 25, dodge = 0, posture_change_down_defense = 10, twohandmelee_speed = 100, twohandmelee_accuracy = 150 },
     },
     pikeman = {
-        -- Fixed: Removed rifle_speed, Added polearm_accuracy
         novice = { melee_defense = 5, ranged_defense = 0 , block = 0, blind_defense = 0, stun_defense = 0, dizzy_defense = 0, knockdown_defense = 0, dodge = 0, posture_change_down_defense = 0, polearm_speed = 50, polearm_accuracy = 100 },
         mid    = { melee_defense = 10, ranged_defense = 5 , block = 0, blind_defense = 10, stun_defense = 10, dizzy_defense = 10, knockdown_defense = 10, dodge = 0, posture_change_down_defense = 10, polearm_speed = 70, polearm_accuracy = 130 },
         master = { melee_defense = 30, ranged_defense = 25 , block = 115, blind_defense = 40, stun_defense = 50, dizzy_defense = 20, knockdown_defense = 25, dodge = 0, posture_change_down_defense = 10, polearm_speed = 100, polearm_accuracy = 150 },

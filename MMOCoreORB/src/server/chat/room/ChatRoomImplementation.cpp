@@ -58,8 +58,14 @@ void ChatRoomImplementation::addPlayer(CreatureObject* player) {
 	locker.release();
 
 	Locker plocker(player);
+	// A non-player creature (e.g. a SimPvP squad-leader NPC being added to its
+	// group's chat room) has no PlayerObject ghost; guard the deref exactly as
+	// removePlayer() already does. It still lives in playerList (harmless -
+	// sends to a clientless creature no-op), but there's no client-side room to
+	// register. Without this, adding any NPC to a room SIGSEGVs.
 	PlayerObject* ghost = player->getPlayerObject();
-	ghost->addChatRoom(getRoomID());
+	if (ghost != nullptr)
+		ghost->addChatRoom(getRoomID());
 }
 
 void ChatRoomImplementation::removePlayer(CreatureObject* player, bool disconnecting) {

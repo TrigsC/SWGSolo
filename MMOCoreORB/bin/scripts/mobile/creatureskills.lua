@@ -49,8 +49,8 @@ pikemanmaster = { {"polearmactionhit2",""},{"polearmarea2",""},{"polearmhit3",""
 tkamaster = { {"unarmedhit3",""},{"unarmedleghit1",""},{"unarmedbodyhit1",""},{"unarmedheadhit1",""},{"unarmedspinattack2",""},{"unarmedcombo2",""},{"unarmedknockdown2",""},{"unarmeddizzy1",""} }
 
 --npc jedi skills
-lightsabermaster = { {"saber1hheadhit1",""},{"saber1hheadhit2",""},{"saber1hhit3",""},{"saber1hcombohit3",""},{"saber1hflurry",""},{"saber1hflurry2",""},{"saber2hbodyhit2",""},{"saber2hbodyhit3",""},{"saber2hfrenzy",""},{"saber2hhit3",""},{"saber2hphantom",""},{"saber2hsweep3",""},
-				{"saberpolearmdervish",""},{"saberpolearmdervish2",""},{"saberpolearmhit3",""},{"saberpolearmleghit3",""},{"saberpolearmspinattack3",""},{"saberslash1",""},{"saberslash2",""},{"saberthrow2",""} }
+lightsabermaster = { {"saber1hheadhit2",""},{"saber1hhit3",""},{"saber1hcombohit3",""},{"saber1hflurry2",""},{"saber2hbodyhit3",""},{"saber2hfrenzy",""},{"saber2hhit3",""},{"saber2hphantom",""},{"saber2hsweep3",""},
+				{"saberpolearmdervish2",""},{"saberpolearmhit3",""},{"saberpolearmleghit3",""},{"saberpolearmspinattack3",""},{"saberslash2",""},{"saberthrow2",""} }
 forcepowermaster = { {"forcelightningsingle2",""},{"forcelightningcone2",""},{"mindblast2",""},{"forceknockdown2",""},{"forceweaken2",""},{"forcethrow2",""},{"forcechoke",""},{"forceintimidate2",""} }
 
 -- npc force wielders use standard profession mastery with the addition of this command

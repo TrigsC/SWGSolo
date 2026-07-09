@@ -394,4 +394,19 @@ class AiEconomyStockpileLot extends ManagedObject {
 		reservedQuantity = 0;
 		lastUpdatedTimestamp.updateToCurrentTime();
 	}
+
+	// P.5.4b: add crafted output to a finished_good lot. Quality (stored in oq)
+	// is the caller-computed quantity-weighted running average; qualityTier
+	// records the most recent batch's input match tier.
+	@dirty
+	@preLocked
+	public void addFinishedGoodQuantity(unsigned long amount,
+			int qualityScore, final string tier) {
+		quantity += amount;
+		oq = qualityScore;
+		qualityTier = tier;
+		resourceLifecycleState = "crafted";
+		activeAtAcquisition = true;
+		lastUpdatedTimestamp.updateToCurrentTime();
+	}
 }

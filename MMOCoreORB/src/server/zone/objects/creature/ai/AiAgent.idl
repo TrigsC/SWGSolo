@@ -238,12 +238,18 @@ class AiAgent extends CreatureObject {
 	public static final int MAX_OOS_PERCENT = 40;
 	public static final float MAX_OOS_RANGE = 75.0f;
 
+	public static final int JEDI_ARCHETYPE_NONE = 0;
+	public static final int JEDI_ARCHETYPE_DEFENDER = 1;
+	public static final int JEDI_ARCHETYPE_ENHANCER = 2;
+
 	protected transient unsigned long customAiMap;
 
 	protected transient int outOfSightCounter;
 
 	protected int currentForcePoints;
     protected int maxForcePoints;
+
+	protected int jediArchetype;
 
 	@dereferenced
 	protected transient Reference<Task> forceRegenerationEvent;
@@ -290,6 +296,8 @@ class AiAgent extends CreatureObject {
 		coordinateMin = -8192;
 		coordinateMax = 8192;
 		outOfSightCounter = 0;
+
+		jediArchetype = JEDI_ARCHETYPE_NONE;
 	}
 
 	/**
@@ -1034,6 +1042,21 @@ class AiAgent extends CreatureObject {
     public int getCurrentForce() {
         return currentForcePoints;
     }
+
+	@dirty
+	public void setJediArchetype(int value) {
+		jediArchetype = value;
+	}
+
+	public int getJediArchetype() {
+		return jediArchetype;
+	}
+
+	@preLocked
+	public native void initializeJediArchetype();
+
+	@preLocked
+	public native void runJediForceManagement();
 
 	@preLocked
 	public native void activateForcePowerRegen();

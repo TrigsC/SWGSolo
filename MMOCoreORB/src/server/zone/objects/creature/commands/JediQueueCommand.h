@@ -151,7 +151,9 @@ public:
 		if (res != SUCCESS)
 			return res;
 
-		if (isWearingArmor(creature))
+		// AI LOGIC: NPC outfit pieces are cosmetic - the armor restriction is
+		// a player mechanic and would silently block all AI self-buffs.
+		if (!creature->isAiAgent() && isWearingArmor(creature))
 			return NOJEDIARMOR;
 
 		for (int i=0; i < blockingCRCs.size(); ++i) {

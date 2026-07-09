@@ -10,6 +10,12 @@
 #include "server/zone/managers/creature/CreatureManager.h"
 #include "server/zone/managers/creature/CreatureTemplateManager.h"
 #include "server/zone/managers/name/NameManager.h"
+#include "server/chat/ChatManager.h"
+#include "server/chat/room/ChatRoom.h"
+#include "server/zone/packets/chat/ChatRoomMessage.h"
+#include "server/zone/objects/player/FactionStatus.h"
+#include "server/zone/managers/group/GroupManager.h"
+#include "server/zone/objects/group/GroupObject.h"
 #include "server/zone/objects/creature/ai/CreatureTemplate.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h"
@@ -32,6 +38,10 @@
 #include "server/zone/objects/resource/ResourceSpawn.h"
 #include "server/zone/objects/pathfinding/NavArea.h"
 #include "server/zone/managers/collision/PathFinderManager.h"
+#include "server/zone/objects/building/BuildingObject.h"
+#include "server/zone/objects/cell/CellObject.h"
+#include "server/zone/objects/scene/SceneObjectType.h"
+#include "server/zone/TreeEntry.h"
 #include "system/thread/ReadLocker.h"
 
 #define DEBUG_SIMPLAYER
@@ -128,7 +138,7 @@ public:
     }
 };
 
-// P.5.3: first crafter consumer — demand-driven reserve+consume that actually
+// P.5.3: first crafter consumer - demand-driven reserve+consume that actually
 // draws hive stock down (fork of the self-test, but destructive).
 class HiveCrafterConsumerTask : public Task {
 public:
@@ -166,6 +176,44 @@ class VehicleSelfTestTask : public Task {
 public:
     void run() override {
         SimPlayerManager::instance()->runVehicleSelfTestTask();
+    }
+};
+
+// P.6.1: SimPvP squad upkeep - config refresh, population, promotion,
+// wipe/reform, member-far recovery, state-TTL escalation.
+class SimPvpMaintenanceTask : public Task {
+public:
+    void run() override {
+        SimPlayerManager::instance()->runPvpMaintenanceTask();
+    }
+};
+
+// P.6.1: waits (bounded) for the leader's shuttle to be boardable, then
+// travels the whole squad. Replaces the legacy destroy+respawn cycle.
+class SimPvpShuttleWaitTask : public Task {
+    uint64 squadId;
+    int attempts;
+
+public:
+    SimPvpShuttleWaitTask(uint64 squad, int attemptCount)
+        : squadId(squad), attempts(attemptCount) {
+    }
+
+    void run() override {
+        SimPlayerManager::instance()->runPvpShuttleWaitTask(squadId, attempts);
+    }
+};
+
+// P.6.1: delayed corpse cleanup for dead PvP bots (leaves loot window open).
+class SimPvpBotCleanupTask : public Task {
+    uint64 oid;
+
+public:
+    SimPvpBotCleanupTask(uint64 objectId) : oid(objectId) {
+    }
+
+    void run() override {
+        SimPlayerManager::instance()->runPvpBotCleanupTask(oid);
     }
 };
 
@@ -1266,6 +1314,45 @@ static Vector<DemandProfileDefinition> createDemandProfileDefinitions() {
     profiles.add(infrastructure);
 
     return profiles;
+}
+
+// P.5.4b: default single-input recipes, one per demand profile. Conceptual
+// goods (not real schematics) - the output is a finished_good hive lot, not a
+// game object. Lua hiveCrafterConsumerConfig.recipes overrides per profile.
+static HiveCrafterRecipe createHiveCrafterRecipe(
+        const String& profileKey, const String& goodKey,
+        const String& goodName, const String& goodClassChain,
+        int finishedGoodTargetUnits) {
+    HiveCrafterRecipe recipe;
+    recipe.profileKey = profileKey;
+    recipe.goodKey = goodKey;
+    recipe.goodName = goodName;
+    recipe.goodClassChain = goodClassChain;
+    recipe.finishedGoodTargetUnits = finishedGoodTargetUnits;
+    return recipe;
+}
+
+static Vector<HiveCrafterRecipe> createHiveCrafterRecipeDefinitions() {
+    Vector<HiveCrafterRecipe> recipes;
+    recipes.add(createHiveCrafterRecipe(
+        "composite_armor_supply", "composite_armor_segment",
+        "Composite Armor Segment", "crafted.armor", 200));
+    recipes.add(createHiveCrafterRecipe(
+        "master_weaponsmith_staples", "weapon_staple_stock",
+        "Weapon Component Stock", "crafted.weapon", 200));
+    recipes.add(createHiveCrafterRecipe(
+        "high_damage_weapon_components", "high_damage_weapon",
+        "High-Damage Weapon", "crafted.weapon", 100));
+    recipes.add(createHiveCrafterRecipe(
+        "chef_buff_foods", "buff_food",
+        "Buff Food", "crafted.food", 200));
+    recipes.add(createHiveCrafterRecipe(
+        "chef_high_value_consumables", "high_value_consumable",
+        "High-Value Consumable", "crafted.food", 100));
+    recipes.add(createHiveCrafterRecipe(
+        "production_infrastructure", "factory_component",
+        "Factory Component", "crafted.structure", 300));
+    return recipes;
 }
 
 static bool demandProfileActiveForPhase(const DemandProfileDefinition& profile, const String& serverPhase) {
@@ -5051,6 +5138,7 @@ void SimPlayerManager::initialize() {
     scheduleMinerRecoveryTask();
     scheduleMinerPlanetDispatchTask();
     scheduleVehicleSelfTestTask();
+    schedulePvpMaintenanceTask();
 }
 
 void SimPlayerManager::loadLuaConfig() {
@@ -5092,6 +5180,46 @@ void SimPlayerManager::loadLuaConfig() {
 
     allShuttleports.removeAll();
     spawnGroups.removeAll();
+    // P.6.1 SimPvP defaults (all off/conservative; lua pvpConfig overrides).
+    pvpEnabled = false;
+    pvpSquadsPerFaction = 1;
+    pvpSquadSize = 4;
+    pvpScanRadiusMeters = 40.f;
+    pvpCombatLeashMeters = 72.f;
+    pvpLoiterMinSeconds = 60;
+    pvpLoiterMaxSeconds = 180;
+    pvpAllowBotVsBotCombat = false;
+    pvpLogStateTransitions = false;
+    pvpRespawnDelaySeconds = 120;
+    pvpMaintenanceIntervalSeconds = 30;
+    pvpShuttleWaitIntervalSeconds = 5;
+    pvpShuttleWaitMaxAttempts = 24;
+    pvpCorpseCleanupDelaySeconds = 60;
+    pvpRecoveryEnabled = true;
+    pvpRecoveryDryRun = true;
+    pvpMemberFarMeters = 64.f;
+    pvpStateTtlSeconds = 600;
+    pvpMaxRecoveryActionsPerInterval = 2;
+    pvpImperialTemplates.removeAll();
+    pvpRebelTemplates.removeAll();
+    // P.6.2 scout/convergence defaults (lua pvpConfig.scouts overrides).
+    pvpScoutsEnabled = false;
+    pvpScoutSquadsPerFaction = 1;
+    pvpScoutSquadSize = 1;
+    pvpScoutScanRadiusMeters = 64.f;
+    pvpScoutReportOnly = true;
+    pvpScoutReportIntervalSeconds = 30;
+    pvpContactTtlSeconds = 300;
+    pvpConvergeCooldownSeconds = 600;
+    // P.6.3a comms defaults (lua pvpConfig.comms overrides).
+    pvpCommsSpatialEnabled = false;
+    pvpCommsAnnounceCooldownSeconds = 45;
+    pvpCommsGlobalMinGapSeconds = 4;
+    pvpCommsFactionRoomsEnabled = false;
+    pvpCommsFactionRoomRequireOvert = false;
+    pvpCommsPlayerGroupingEnabled = false;
+    pvpCommsMaxPlayersPerSquad = 5;
+    pvpCommsJoinRangeMeters = 48.f;
     minerSummaryLoggingEnabled = false;
     minerSummaryTaskScheduled = false;
     minerSummaryIntervalSeconds = 300;
@@ -5797,6 +5925,12 @@ void SimPlayerManager::loadLuaConfig() {
         applyVehicleConfig(vehicleConfig);
     vehicleConfig.pop();
 
+    // P.6.1 SimPvP squads.
+    LuaObject pvpConfig = config.getObjectField("pvpConfig");
+    if (pvpConfig.isValidTable())
+        applyPvpConfig(pvpConfig);
+    pvpConfig.pop();
+
     LuaObject presentationConfig =
         config.getObjectField("presentationConfig");
     if (presentationConfig.isValidTable())
@@ -5871,6 +6005,9 @@ void SimPlayerManager::loadLuaConfig() {
                             loc.name = entry.name;
                             loc.spawn = Vector3(entry.x, entry.y, entry.z);
                             loc.hangout = Vector3(entry.hx, entry.hy, entry.hz);
+                            // P.6.5a: exact PlanetTravelPoint name of the
+                            // city's starport (empty = not routed-travel able).
+                            loc.starportPoint = city.getStringField("starport");
                             allShuttleports.add(loc);
                         }
                     }
@@ -5916,6 +6053,11 @@ void SimPlayerManager::loadLuaConfig() {
             templates.pop();
 
             loadMinerConfig(group, g.minerConfig);
+            // P.6.1: pvp spawnGroups are retired; squads come from pvpConfig.
+            if (g.type.beginsWith("pvp") && g.totalCount > 0) {
+                info("loadLuaConfig: legacy pvp spawnGroup type=" + g.type +
+                     " ignored - configure pvpConfig.enablePvpBots instead.", true);
+            }
             if (!g.type.beginsWith("pvp") && g.minerConfig.summaryEnabled) {
                 if (!minerSummaryLoggingEnabled || g.minerConfig.summaryIntervalSeconds < minerSummaryIntervalSeconds)
                     minerSummaryIntervalSeconds = g.minerConfig.summaryIntervalSeconds;
@@ -6015,18 +6157,16 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
 #ifdef DEBUG_SIMPLAYER
         info("Starting SimPlayer for agent " + String::valueOf(oid), true);
 #endif
-        agent->setCustomAiMap(String("patrol").hashCode());
-        agent->setAITemplate();
-
+        // Each role branch below assigns its own custom AI map (simPvp /
+        // simMiner). The old "patrol" map matched nothing in customMap and
+        // silently fell back to the wandering default trees (dual-driver bug).
         agent->writeBlackboard("simAlwaysActive", true);
         agent->setSimAlwaysActive(true);
         agent->setSimPlayerBot(true);
         agent->setDespawnOnNoPlayerInRange(false);
 
         Reference<SimPlayerController*> ctrl = nullptr;
-#ifdef DEBUG_SIMPLAYER
-        info("toggleBot: creating PvP controller using DEFAULT route (no spawn/hangout)", true);
-#endif
+
         const CreatureTemplate* tmpl = agent->getCreatureTemplate();
         String tName = (tmpl != nullptr) ? tmpl->getTemplateName() : "";
 
@@ -6036,26 +6176,93 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
         bool looksRebel = lower.beginsWith("rebel") || lower.contains("specforce") || lower.contains("light");
         bool looksImperial = lower.beginsWith("imperial") || lower.contains("stormtrooper") || lower.contains("dark");
 
-        if (looksImperial) {
+        if (looksImperial || looksRebel) {
+            // P.6.1: an admin-toggled PvP bot becomes a solo squad running the
+            // nearest configured city loop on its zone.
+            bool imperial = looksImperial;
+
+            Zone* zone = agent->getZone();
+            String zoneName = (zone != nullptr) ? zone->getZoneName() : "";
+
+            int bestCity = -1;
+            float bestDistSq = 0.f;
+            Vector3 agentPos = agent->getWorldPosition();
+
+            for (int i = 0; i < allShuttleports.size(); ++i) {
+                const ShuttleportLocation& loc = allShuttleports.get(i);
+
+                if (loc.planet != zoneName)
+                    continue;
+
+                float dx = loc.spawn.getX() - agentPos.getX();
+                float dy = loc.spawn.getY() - agentPos.getY();
+                float distSq = dx * dx + dy * dy;
+
+                if (bestCity < 0 || distSq < bestDistSq) {
+                    bestCity = i;
+                    bestDistSq = distSq;
+                }
+            }
+
+            if (bestCity < 0) {
+                info("toggleBot: no configured shuttleport city on zone " +
+                     (zoneName.isEmpty() ? String("unknown") : zoneName) +
+                     "; not starting a PvP solo squad.", true);
+                return;
+            }
+
+            ShuttleportLocation loc = allShuttleports.get(bestCity);
+
+            static const uint32 imperialHash = String("imperial").hashCode();
+            static const uint32 rebelHash = String("rebel").hashCode();
+            agent->setFaction(imperial ? imperialHash : rebelHash);
+            // Permanently OVERT so opposing overt players con/dot RED without
+            // combat-state flicker (see spawnPvpBotAgent note).
+            agent->setFactionStatus(FactionStatus::OVERT);
             applySimNpcPresentation(agent, ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
 
-            SimPvPController* pvp = new SimPvPController(agent, true);
+            agent->setCreatureBitmask(0);
+            agent->setCustomAiMap(String("simPvp").hashCode());
+            agent->setAITemplate();
+            agent->clearPatrolPoints();
 
-            // Give it enough context to cycle
-            String zoneName = (agent->getZone() != nullptr) ? agent->getZone()->getZoneName() : "unknown";
-            pvp->setCycleContext(this, tName, "pvp_solo", zoneName, "toggleBot");
+            agent->writeBlackboard("simAlwaysActive", true);
+            agent->setSimAlwaysActive(true);
+            agent->setSimPlayerBot(true);
+            agent->setDespawnOnNoPlayerInRange(false);
 
+            uint64 squadId = 0;
+
+            {
+                Locker squadLock(&pvpSquadMutex);
+
+                SimPvpSquad squad;
+                squadId = nextPvpSquadId++;
+                squad.squadId = squadId;
+                squad.imperial = imperial;
+                squad.desiredSize = 1;
+                squad.leaderOid = oid;
+                squad.planet = loc.planet;
+                squad.city = loc.name;
+                squad.shuttlePos = loc.spawn;
+                squad.hangoutPos = loc.hangout;
+                squad.formedAtMs = System::getMiliTime();
+                pvpSquads.add(squad);
+            }
+
+            SimPvPController* pvp = new SimPvPController(agent, squadId, imperial);
             ctrl = pvp;
 
-        } else if (looksRebel) {
-            applySimNpcPresentation(agent, ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
+            controllers.put(oid, ctrl);
+            agent->activateAiBehavior(true);
+            pvp->beginCityLoop(loc.planet, loc.name, loc.spawn, loc.hangout);
 
-            SimPvPController* pvp = new SimPvPController(agent, false);
-
-            String zoneName = (agent->getZone() != nullptr) ? agent->getZone()->getZoneName() : "unknown";
-            pvp->setCycleContext(this, tName, "pvp_solo", zoneName, "toggleBot");
-
-            ctrl = pvp;
+            info("toggleBot: started PvP solo squad " + String::valueOf(squadId) +
+                 " at " + loc.planet + ":" + loc.name +
+                 (pvpEnabled ? String("") :
+                     String(" (pvpConfig.enablePvpBots is OFF - maintenance will despawn it)")),
+                 true);
+            return;
         } else {
              applySimNpcPresentation(agent, 0);
              // Miners are driven entirely by SimMinerController; give them the
@@ -6908,7 +7115,7 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         if (dynamic_cast<SimMinerController*>(ctrl.get()) != nullptr) {
             role = "miner";
             activeMiners++;
-        } else if (dynamic_cast<SimPvPController*>(ctrl.get()) != nullptr) {
+        } else if (dynamic_cast<SimPvpBotController*>(ctrl.get()) != nullptr) {
             role = "pvp_bot";
             activePvpBots++;
         }
@@ -6961,7 +7168,7 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     population["totalControllers"] = controllerCount;
     population["activeMiners"] = activeMiners;
     population["activePvpBots"] = activePvpBots;
-    population["pvpStatus"] = "experimental";
+    population["pvpStatus"] = pvpEnabled ? "squads" : "disabled";
     population["controllers"] = controllerRows;
     population["activeMinerZones"] = joinCoverageZones(activeMinerZones);
     population["configuredMinerSpawnZones"] =
@@ -8828,6 +9035,202 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     }
     result["planetDispatch"] = planetDispatch;
 
+    // P.6.1 SimPvP squads: persistent faction squads running starport loops.
+    JSONSerializationType pvpActivity = JSONSerializationType::object();
+    pvpActivity["enabled"] = pvpEnabled;
+    pvpActivity["squadsPerFaction"] = pvpSquadsPerFaction;
+    pvpActivity["squadSize"] = pvpSquadSize;
+    pvpActivity["allowBotVsBotCombat"] = pvpAllowBotVsBotCombat;
+    pvpActivity["scanRadiusMeters"] = pvpScanRadiusMeters;
+    pvpActivity["recoveryEnabled"] = pvpRecoveryEnabled;
+    pvpActivity["recoveryDryRun"] = pvpRecoveryDryRun;
+    pvpActivity["mechanism"] =
+        "persistent_squads_switchZone_between_cities";
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+
+        pvpActivity["travelsTotal"] = pvpTravelsTotal;
+        pvpActivity["deathsTotal"] = pvpDeathsTotal;
+        pvpActivity["playerEngagementsTotal"] = pvpPlayerEngagementsTotal;
+        pvpActivity["botEngagementsTotal"] = pvpBotEngagementsTotal;
+        pvpActivity["recoveryActionsTotal"] = pvpRecoveryActionsTotal;
+        pvpActivity["promotionsTotal"] = pvpPromotionsTotal;
+        pvpActivity["squadReformsTotal"] = pvpSquadReformsTotal;
+        pvpActivity["boardAnywayTotal"] = pvpBoardAnywayTotal;
+
+        // P.6.2 scouts + gank convergence.
+        JSONSerializationType scoutsJson = JSONSerializationType::object();
+        scoutsJson["enabled"] = pvpScoutsEnabled;
+        scoutsJson["squadsPerFaction"] = pvpScoutSquadsPerFaction;
+        scoutsJson["squadSize"] = pvpScoutSquadSize;
+        scoutsJson["scanRadiusMeters"] = pvpScoutScanRadiusMeters;
+        scoutsJson["reportOnly"] = pvpScoutReportOnly;
+        scoutsJson["contactTtlSeconds"] = pvpContactTtlSeconds;
+        scoutsJson["convergeCooldownSeconds"] = pvpConvergeCooldownSeconds;
+        scoutsJson["contactsReportedTotal"] = pvpContactsReportedTotal;
+        scoutsJson["convergencesTotal"] = pvpConvergencesTotal;
+
+        JSONSerializationType contactRows = JSONSerializationType::array();
+        for (int side = 0; side < 2; ++side) {
+            const SimPvpFactionContact& contact =
+                side == 0 ? pvpImperialContact : pvpRebelContact;
+
+            if (!contact.valid)
+                continue;
+
+            JSONSerializationType contactJson = JSONSerializationType::object();
+            contactJson["faction"] = side == 0 ? "imperial" : "rebel";
+            contactJson["planet"] = contact.planet;
+            contactJson["city"] = contact.city;
+            contactJson["ageSeconds"] = contact.reportedAtMs <= nowMs ?
+                (nowMs - contact.reportedAtMs) / 1000 : 0;
+            contactJson["targetWasPlayer"] = contact.targetWasPlayer;
+            contactJson["reporterSquadId"] = contact.reporterSquadId;
+            contactJson["reports"] = contact.reports;
+            contactRows.push_back(contactJson);
+        }
+        scoutsJson["activeContacts"] = contactRows;
+        pvpActivity["scouts"] = scoutsJson;
+
+        // P.6.3a player-facing comms.
+        JSONSerializationType commsJson = JSONSerializationType::object();
+        commsJson["spatialAnnouncements"] = pvpCommsSpatialEnabled;
+        commsJson["announceCooldownSeconds"] = pvpCommsAnnounceCooldownSeconds;
+        commsJson["announcementsTotal"] = pvpAnnouncementsTotal;
+        commsJson["factionRooms"] = pvpCommsFactionRoomsEnabled;
+        commsJson["factionRoomRequireOvert"] = pvpCommsFactionRoomRequireOvert;
+        commsJson["factionRoomsCreated"] = pvpFactionRoomsCreated;
+        commsJson["rebelRoomId"] = pvpRebelRoomID;
+        commsJson["imperialRoomId"] = pvpImperialRoomID;
+        commsJson["factionRoomPostsTotal"] = pvpFactionRoomPostsTotal;
+        commsJson["factionRoomJoinsBlockedTotal"] = pvpFactionRoomJoinsBlockedTotal;
+        commsJson["playerGrouping"] = pvpCommsPlayerGroupingEnabled;
+        commsJson["maxPlayersPerSquad"] = pvpCommsMaxPlayersPerSquad;
+        commsJson["groupsFormedTotal"] = pvpGroupsFormedTotal;
+        commsJson["playersJoinedTotal"] = pvpPlayersJoinedTotal;
+        commsJson["groupsDisbandedTotal"] = pvpGroupsDisbandedTotal;
+        int activeSquadGroups = 0;
+        for (int i = 0; i < pvpSquads.size(); ++i)
+            if (pvpSquads.get(i).groupId != 0)
+                activeSquadGroups++;
+        commsJson["activeSquadGroups"] = activeSquadGroups;
+        pvpActivity["comms"] = commsJson;
+
+        // P.6.5a routed travel.
+        JSONSerializationType routedJson = JSONSerializationType::object();
+        routedJson["enabled"] = pvpRoutedTravelEnabled;
+        routedJson["offMainPlanetChancePct"] = pvpTravelOffMainChancePct;
+        routedJson["maxLegsPerRoute"] = pvpTravelMaxLegsPerRoute;
+        routedJson["transitDwellSecondsMin"] = pvpTravelTransitDwellMinSeconds;
+        routedJson["transitDwellSecondsMax"] = pvpTravelTransitDwellMaxSeconds;
+        routedJson["stagingRebel"] =
+            pvpStagingRebelPlanet + ":" + pvpStagingRebelCity;
+        routedJson["stagingImperial"] =
+            pvpStagingImperialPlanet + ":" + pvpStagingImperialCity;
+        routedJson["routesPlannedTotal"] = pvpRoutesPlannedTotal;
+        routedJson["routeLegsExecutedTotal"] = pvpRouteLegsExecutedTotal;
+        routedJson["hopRoutesTotal"] = pvpRouteHopRoutesTotal;
+        routedJson["transitStopsTotal"] = pvpTransitStopsTotal;
+        routedJson["fallbacksTotal"] = pvpRouteFallbacksTotal;
+
+        JSONSerializationType mainPlanetRows = JSONSerializationType::array();
+        for (int i = 0; i < pvpTravelMainPlanets.size(); ++i)
+            mainPlanetRows.push_back(pvpTravelMainPlanets.get(i));
+        routedJson["mainPlanets"] = mainPlanetRows;
+        pvpActivity["routedTravel"] = routedJson;
+
+        // P.6.5-0 travel diagnostics spike results.
+        JSONSerializationType travelDiagJson = JSONSerializationType::object();
+        travelDiagJson["dumpTravelGraph"] = pvpTravelDumpGraph;
+        travelDiagJson["testStarportInteriorPaths"] = pvpTravelTestInteriorPaths;
+        travelDiagJson["ran"] = pvpTravelSpikeRan;
+
+        JSONSerializationType fareRows = JSONSerializationType::array();
+        for (int i = 0; i < pvpTravelSpikeFareLines.size(); ++i)
+            fareRows.push_back(pvpTravelSpikeFareLines.get(i));
+        travelDiagJson["fares"] = fareRows;
+
+        JSONSerializationType starportRows = JSONSerializationType::array();
+        for (int i = 0; i < pvpTravelSpikeStarportLines.size(); ++i)
+            starportRows.push_back(pvpTravelSpikeStarportLines.get(i));
+        travelDiagJson["nearestStarports"] = starportRows;
+
+        JSONSerializationType interiorRows = JSONSerializationType::array();
+        for (int i = 0; i < pvpTravelSpikeInteriorResults.size(); ++i) {
+            const PvpTravelSpikeInteriorResult& r =
+                pvpTravelSpikeInteriorResults.get(i);
+
+            JSONSerializationType row = JSONSerializationType::object();
+            row["zone"] = r.zoneName;
+            row["point"] = r.pointName;
+            row["status"] = r.status;
+            row["collectorTemplate"] = r.collectorTemplate;
+            row["collectorInCell"] = r.collectorInCell;
+            row["pathable"] = r.pathable;
+            row["pathNodes"] = r.pathNodes;
+            row["collectorX"] = r.collectorX;
+            row["collectorY"] = r.collectorY;
+            row["collectorZ"] = r.collectorZ;
+            interiorRows.push_back(row);
+        }
+        travelDiagJson["interiorPaths"] = interiorRows;
+        pvpActivity["travelDiagnostics"] = travelDiagJson;
+
+        JSONSerializationType squadRows = JSONSerializationType::array();
+
+        for (int i = 0; i < pvpSquads.size(); ++i) {
+            const SimPvpSquad& squad = pvpSquads.get(i);
+
+            JSONSerializationType row = JSONSerializationType::object();
+            row["squadId"] = squad.squadId;
+            row["faction"] = squad.imperial ? "imperial" : "rebel";
+            row["role"] = squad.scout ? "scout" : "patrol";
+            row["convergePending"] = !squad.convergePlanet.isEmpty();
+            row["planet"] = squad.planet;
+            row["city"] = squad.city;
+            row["leaderOid"] = String::valueOf(squad.leaderOid);
+            row["membersAlive"] = squad.memberOids.size();
+            row["desiredSize"] = squad.desiredSize;
+            row["pendingReplacements"] = squad.pendingReplacements;
+            row["deaths"] = squad.deaths;
+            row["travels"] = squad.travels;
+            row["engagements"] = squad.engagements;
+            row["reforming"] = squad.reforming;
+            row["travelTaskActive"] = squad.travelTaskActive;
+            // P.6.5a: mid-route visibility (empty/0 while idle at a city).
+            row["routeDest"] = squad.routeDestCity.isEmpty() ? String("") :
+                squad.routeDestPlanet + ":" + squad.routeDestCity;
+            row["routeLegsRemaining"] = squad.pendingRoute.size();
+            row["ageSeconds"] = squad.formedAtMs > 0 ?
+                (nowMs - squad.formedAtMs) / 1000 : 0;
+
+            // Leader phase (read-only member access; no agent locks in here).
+            String phaseName = "unknown";
+            uint64 phaseAgeSeconds = 0;
+
+            if (controllers.contains(squad.leaderOid)) {
+                Reference<SimPlayerController*> leaderRef =
+                    controllers.get(squad.leaderOid);
+                SimPvPController* leaderCtrl = leaderRef == nullptr ? nullptr :
+                    dynamic_cast<SimPvPController*>(leaderRef.get());
+
+                if (leaderCtrl != nullptr) {
+                    phaseName = leaderCtrl->getPvpPhaseName();
+                    phaseAgeSeconds =
+                        (nowMs - leaderCtrl->getPhaseSinceMs()) / 1000;
+                }
+            }
+
+            row["leaderPhase"] = phaseName;
+            row["leaderPhaseAgeSeconds"] = phaseAgeSeconds;
+            squadRows.push_back(row);
+        }
+
+        pvpActivity["squads"] = squadRows;
+    }
+    result["pvpActivity"] = pvpActivity;
+
     AiEconomyStockpileInspectionSnapshot stockpileSnapshot;
     String stockpileInspectionStatus;
     bool stockpileInspectionReady =
@@ -8917,6 +9320,17 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
             lot.lastUpdatedTimestampMs > 0 && nowMs > lot.lastUpdatedTimestampMs ?
             (nowMs - lot.lastUpdatedTimestampMs) / 1000 : 0;
         row["conceptualMinerLot"] = lot.conceptualMinerLot;
+        row["finishedGoodLot"] = lot.finishedGoodLot;
+        row["oq"] = lot.oq;
+        row["cd"] = lot.cd;
+        row["dr"] = lot.dr;
+        row["hr"] = lot.hr;
+        row["fl"] = lot.fl;
+        row["ma"] = lot.ma;
+        row["pe"] = lot.pe;
+        row["sr"] = lot.sr;
+        row["ut"] = lot.ut;
+        row["cr"] = lot.cr;
         row["yieldMode"] = "conceptual";
         row["realResourceCreated"] = false;
         row["resourceContainerCreated"] = false;
@@ -9017,18 +9431,30 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     hiveCrafters["intervalSeconds"] = hiveCrafterConsumerIntervalSeconds;
     hiveCrafters["craftBatchQuantity"] = hiveCrafterConsumerBatchQuantity;
     hiveCrafters["minOq"] = hiveCrafterConsumerMinOq;
+    hiveCrafters["familyMatching"] = hiveCrafterUseFamilyMatching;
+    hiveCrafters["produceFinishedGoods"] = hiveCrafterProduceFinishedGoods;
+    hiveCrafters["allowAnyLotFallback"] =
+        hiveCrafterConsumerAllowAnyLotFallback;
     hiveCrafters["mode"] = "simulation-only";
     hiveCrafters["economyMutated"] = false;
     {
         Locker crafterLocker(&hiveCrafterConsumerMutex);
         hiveCrafters["batchesCompleted"] = hiveCrafterBatchesCompleted;
         hiveCrafters["unitsConsumed"] = hiveCrafterUnitsConsumed;
+        hiveCrafters["unitsProduced"] = hiveCrafterUnitsProduced;
         hiveCrafters["lastProfile"] = hiveCrafterLastProfile.isEmpty() ?
             String("none") : hiveCrafterLastProfile;
         hiveCrafters["lastReserveReason"] =
             hiveCrafterLastReserveReason.isEmpty() ?
                 String("none") : hiveCrafterLastReserveReason;
         hiveCrafters["fallbackUsed"] = hiveCrafterLastFallbackUsed;
+        hiveCrafters["lastMatchedTier"] = hiveCrafterLastMatchedTier.isEmpty() ?
+            String("none") : hiveCrafterLastMatchedTier;
+        hiveCrafters["lastMatchedQuery"] =
+            hiveCrafterLastMatchedQuery.isEmpty() ?
+                String("none") : hiveCrafterLastMatchedQuery;
+        hiveCrafters["lastGoodKey"] = hiveCrafterLastGoodKey.isEmpty() ?
+            String("none") : hiveCrafterLastGoodKey;
 
         JSONSerializationType producedByProfile = JSONSerializationType::array();
         for (int i = 0; i < hiveCrafterProducedByProfile.size(); ++i) {
@@ -9041,6 +9467,70 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         hiveCrafters["producedByProfile"] = producedByProfile;
     }
     result["hiveCrafters"] = hiveCrafters;
+
+    // P.5.4b: finished-goods ledger view - the finished_good lot tier plus the
+    // effective recipe per profile (target enforcement lands with P.5.4d).
+    JSONSerializationType finishedGoodRows = JSONSerializationType::array();
+    uint64 finishedGoodTotalQuantity = 0;
+    int finishedGoodLots = 0;
+
+    for (int i = 0; i < stockpileSnapshot.lots.size(); ++i) {
+        AiEconomyStockpileInspectionLot lot = stockpileSnapshot.lots.get(i);
+
+        if (!lot.finishedGoodLot)
+            continue;
+
+        finishedGoodLots++;
+        finishedGoodTotalQuantity += lot.quantity;
+
+        JSONSerializationType row = JSONSerializationType::object();
+        row["entryId"] = lot.entryID;
+        row["goodKey"] = lot.resourceType;
+        row["goodName"] = lot.resourceSpawnName;
+        row["goodClassChain"] = lot.resourceClassChain;
+        row["producingProfile"] = lot.matchedDemandProfiles;
+        row["quantity"] = lot.quantity;
+        row["reservedQuantity"] = lot.reservedQuantity;
+        row["availableQuantity"] = lot.availableQuantity;
+        row["qualityScore"] = lot.oq;
+        row["qualityTier"] = lot.qualityTier;
+        row["lastCraftedAgeSeconds"] =
+            lot.lastUpdatedTimestampMs > 0 && nowMs > lot.lastUpdatedTimestampMs ?
+            (nowMs - lot.lastUpdatedTimestampMs) / 1000 : 0;
+        row["economyMutated"] = false;
+        finishedGoodRows.push_back(row);
+    }
+
+    JSONSerializationType recipeRows = JSONSerializationType::array();
+    {
+        Vector<HiveCrafterRecipe> recipeDefaults =
+            createHiveCrafterRecipeDefinitions();
+
+        for (int i = 0; i < recipeDefaults.size(); ++i) {
+            HiveCrafterRecipe recipe = getHiveCrafterRecipeForProfile(
+                recipeDefaults.get(i).profileKey);
+
+            JSONSerializationType row = JSONSerializationType::object();
+            row["profile"] = recipe.profileKey;
+            row["goodKey"] = recipe.goodKey;
+            row["goodName"] = recipe.goodName;
+            row["inputUnitsPerCraft"] = recipe.inputUnitsPerCraft;
+            row["outputUnitsPerCraft"] = recipe.outputUnitsPerCraft;
+            row["finishedGoodTargetUnits"] = recipe.finishedGoodTargetUnits;
+            recipeRows.push_back(row);
+        }
+    }
+
+    JSONSerializationType finishedGoods = JSONSerializationType::object();
+    finishedGoods["produceEnabled"] = hiveCrafterProduceFinishedGoods;
+    finishedGoods["familyMatching"] = hiveCrafterUseFamilyMatching;
+    finishedGoods["goodLots"] = finishedGoodLots;
+    finishedGoods["totalQuantity"] = finishedGoodTotalQuantity;
+    finishedGoods["lots"] = finishedGoodRows;
+    finishedGoods["recipes"] = recipeRows;
+    finishedGoods["mode"] = "simulation-only";
+    finishedGoods["economyMutated"] = false;
+    result["finishedGoods"] = finishedGoods;
 
     JSONSerializationType supply = JSONSerializationType::object();
     supply["currentSessionConceptualTotals"] = sessionTotals;
@@ -12393,6 +12883,55 @@ void SimPlayerManager::runHiveReservationSelfTestTask() {
     scheduleHiveReservationSelfTestTask();
 }
 
+// P.5.4a: dedup-append one reservation candidate query + its tier label.
+static void addHiveCrafterCandidateQuery(
+        Vector<String>& queries, Vector<String>& tiers,
+        const String& query, const String& tier) {
+    if (query.isEmpty())
+        return;
+
+    for (int i = 0; i < queries.size(); ++i) {
+        if (queries.get(i) == query)
+            return;
+    }
+
+    queries.add(query);
+    tiers.add(tier);
+}
+
+// P.5.4b: weighted quality of the consumed input lot under the producing
+// profile's stat weights (same scoring the demand engine uses), 0..1000.
+static int computeHiveCrafterInputQuality(
+        const AiEconomyMatchedReservation& reservation,
+        const DemandProfileDefinition& profile) {
+    ResourceIntelligenceEntry entry;
+    entry.oq = reservation.oq;
+    entry.cd = reservation.cd;
+    entry.dr = reservation.dr;
+    entry.hr = reservation.hr;
+    entry.fl = reservation.fl;
+    entry.ma = reservation.ma;
+    entry.pe = reservation.pe;
+    entry.sr = reservation.sr;
+    entry.ut = reservation.ut;
+    entry.cr = reservation.cr;
+
+    int weightedTotal = 0;
+    int totalWeight = 0;
+
+    for (int i = 0;
+            i < profile.preferredStats.size() && i < profile.statWeights.size();
+            ++i) {
+        addScorePart(
+            getProfileStatValue(entry, profile.preferredStats.get(i)),
+            profile.statWeights.get(i),
+            weightedTotal,
+            totalWeight);
+    }
+
+    return finishScore(weightedTotal, totalWeight);
+}
+
 void SimPlayerManager::scheduleHiveCrafterConsumerTask() {
     if (!enabled || !hiveCrafterConsumerEnabled ||
             hiveCrafterConsumerTaskScheduled)
@@ -12421,6 +12960,79 @@ void SimPlayerManager::applyHiveCrafterConsumerConfig(
         "preferShortageProfiles", hiveCrafterConsumerPreferShortage);
     hiveCrafterConsumerAllowAnyLotFallback = crafterConfig.getBooleanField(
         "allowAnyLotFallback", hiveCrafterConsumerAllowAnyLotFallback);
+    // P.5.4a/b gates (C++ defaults off; lua enables).
+    hiveCrafterUseFamilyMatching = crafterConfig.getBooleanField(
+        "useFamilyMatching", hiveCrafterUseFamilyMatching);
+    hiveCrafterProduceFinishedGoods = crafterConfig.getBooleanField(
+        "produceFinishedGoods", hiveCrafterProduceFinishedGoods);
+
+    LuaObject recipes = crafterConfig.getObjectField("recipes");
+
+    if (recipes.isValidTable()) {
+        Vector<HiveCrafterRecipe> defaults =
+            createHiveCrafterRecipeDefinitions();
+
+        for (int i = 0; i < defaults.size(); ++i) {
+            HiveCrafterRecipe recipe = defaults.get(i);
+
+            if (hiveCrafterRecipeOverrides.contains(recipe.profileKey))
+                recipe = hiveCrafterRecipeOverrides.get(recipe.profileKey);
+
+            LuaObject recipeConfig =
+                recipes.getObjectField(recipe.profileKey);
+
+            if (recipeConfig.isValidTable()) {
+                String goodKey = recipeConfig.getStringField("goodKey");
+                String goodName = recipeConfig.getStringField("goodName");
+                String goodClassChain =
+                    recipeConfig.getStringField("goodClassChain");
+
+                if (!goodKey.isEmpty())
+                    recipe.goodKey = goodKey;
+                if (!goodName.isEmpty())
+                    recipe.goodName = goodName;
+                if (!goodClassChain.isEmpty())
+                    recipe.goodClassChain = goodClassChain;
+
+                recipe.inputUnitsPerCraft = clampMinerInt(
+                    recipeConfig.getIntField("inputUnitsPerCraft"),
+                    recipe.inputUnitsPerCraft, 1, 100000);
+                recipe.outputUnitsPerCraft = clampMinerInt(
+                    recipeConfig.getIntField("outputUnitsPerCraft"),
+                    recipe.outputUnitsPerCraft, 1, 100000);
+                recipe.finishedGoodTargetUnits = clampMinerInt(
+                    recipeConfig.getIntField("finishedGoodTargetUnits"),
+                    recipe.finishedGoodTargetUnits, 0, 100000000);
+
+                hiveCrafterRecipeOverrides.put(recipe.profileKey, recipe);
+            }
+
+            recipeConfig.pop();
+        }
+    }
+
+    recipes.pop();
+}
+
+// P.5.4b: effective recipe = C++ default overlaid by any lua override.
+HiveCrafterRecipe SimPlayerManager::getHiveCrafterRecipeForProfile(
+        const String& profileKey) {
+    if (hiveCrafterRecipeOverrides.contains(profileKey))
+        return hiveCrafterRecipeOverrides.get(profileKey);
+
+    Vector<HiveCrafterRecipe> defaults = createHiveCrafterRecipeDefinitions();
+
+    for (int i = 0; i < defaults.size(); ++i) {
+        if (defaults.get(i).profileKey == profileKey)
+            return defaults.get(i);
+    }
+
+    // Unknown profile: fall back to the legacy flat batch, no finished good.
+    HiveCrafterRecipe recipe;
+    recipe.profileKey = profileKey;
+    recipe.inputUnitsPerCraft = hiveCrafterConsumerBatchQuantity;
+    recipe.outputUnitsPerCraft = 1;
+    return recipe;
 }
 
 void SimPlayerManager::runHiveCrafterConsumerTask() {
@@ -12483,20 +13095,92 @@ void SimPlayerManager::runHiveCrafterConsumerTask() {
     String profileKey = selected.profileKey;
     String resourceType = selected.activeResource.type;
     int minOq = hiveCrafterConsumerMinOq;
-    uint64 batch = static_cast<uint64>(hiveCrafterConsumerBatchQuantity);
+
+    // P.5.4b: recipe drives batch size and the finished-good output.
+    HiveCrafterRecipe recipe = getHiveCrafterRecipeForProfile(profileKey);
+    bool produceEnabled =
+        hiveCrafterProduceFinishedGoods && !recipe.goodKey.isEmpty();
+    uint64 batch = produceEnabled ?
+        static_cast<uint64>(recipe.inputUnitsPerCraft) :
+        static_cast<uint64>(hiveCrafterConsumerBatchQuantity);
+
+    Vector<DemandProfileDefinition> profileDefs =
+        createDemandProfileDefinitions();
+    int profileDefIndex = -1;
+
+    for (int i = 0; i < profileDefs.size(); ++i) {
+        if (profileDefs.get(i).key == profileKey) {
+            profileDefIndex = i;
+            break;
+        }
+    }
 
     uint64 token = 0;
     uint64 entryID = 0;
     String reserveReason;
     bool fallbackUsed = false;
+    String matchedTier = "exact";
+    String matchedQuery = resourceType;
+    AiEconomyMatchedReservation matchedReservation;
+    bool reserved = false;
 
-    bool reserved = AiEconomyManager::instance()->reserveFromStockpile(
-        resourceType, minOq, batch, token, entryID, reserveReason);
+    if (hiveCrafterUseFamilyMatching) {
+        // P.5.4a: type-correct targeting. Ordered candidates from the profile
+        // definition - demand's ideal active type first, then exact types,
+        // then premium/bulk families - so a chef only ever draws food.
+        Vector<String> queries;
+        Vector<String> tiers;
+
+        if (selected.hasActiveOpportunity && !resourceType.isEmpty()) {
+            String activeTier = selected.activeMatch.exact ? String("exact") :
+                (selected.activeMatch.premium ? String("premium") :
+                    String("bulk"));
+            addHiveCrafterCandidateQuery(
+                queries, tiers, resourceType, activeTier);
+        }
+
+        if (profileDefIndex >= 0) {
+            const DemandProfileDefinition& def =
+                profileDefs.get(profileDefIndex);
+
+            for (int i = 0; i < def.exactTypes.size(); ++i)
+                addHiveCrafterCandidateQuery(
+                    queries, tiers, def.exactTypes.get(i), "exact");
+
+            for (int i = 0; i < def.premiumFamilies.size(); ++i)
+                addHiveCrafterCandidateQuery(
+                    queries, tiers, def.premiumFamilies.get(i), "premium");
+
+            for (int i = 0; i < def.bulkFamilies.size(); ++i)
+                addHiveCrafterCandidateQuery(
+                    queries, tiers, def.bulkFamilies.get(i), "bulk");
+        }
+
+        reserved = AiEconomyManager::instance()->reserveFromStockpileMatching(
+            queries, minOq, batch, matchedReservation, reserveReason);
+
+        if (reserved) {
+            token = matchedReservation.token;
+            entryID = matchedReservation.entryID;
+            matchedQuery = matchedReservation.matchedQuery;
+            matchedTier = matchedReservation.matchedQueryIndex >= 0 &&
+                    matchedReservation.matchedQueryIndex < tiers.size() ?
+                tiers.get(matchedReservation.matchedQueryIndex) :
+                String("unknown");
+        }
+    } else {
+        reserved = AiEconomyManager::instance()->reserveFromStockpile(
+            resourceType, minOq, batch, token, entryID, reserveReason);
+    }
 
     if (!reserved && hiveCrafterConsumerAllowAnyLotFallback) {
-        // Demand's ideal type isn't stocked yet — draw from any eligible exact
+        // Demand's ideal type isn't stocked yet - draw from any eligible exact
         // lot so the consume path is still exercised against real stock.
+        // (Retired by P.5.4a: lua sets allowAnyLotFallback=false so a profile
+        // without type-correct stock skips instead of drawing wrong stock.)
         fallbackUsed = true;
+        matchedTier = "any";
+        matchedQuery = "";
         reserved = AiEconomyManager::instance()->reserveFromStockpile(
             String(""), 0, batch, token, entryID, reserveReason);
     }
@@ -12507,12 +13191,16 @@ void SimPlayerManager::runHiveCrafterConsumerTask() {
             hiveCrafterLastProfile = profileKey;
             hiveCrafterLastReserveReason = reserveReason;
             hiveCrafterLastFallbackUsed = fallbackUsed;
+            hiveCrafterLastMatchedTier = "none";
+            hiveCrafterLastMatchedQuery = "";
         }
 
         info(String("HiveCrafterConsumer profile=") + profileKey +
             " resourceType=" +
                 (resourceType.isEmpty() ? String("any") : resourceType) +
             " reserved=false reason=" + reserveReason +
+            " familyMatching=" +
+                (hiveCrafterUseFamilyMatching ? String("true") : String("false")) +
             " fallback=" + (fallbackUsed ? String("true") : String("false")) +
             " mode=simulation-only", true);
         scheduleHiveCrafterConsumerTask();
@@ -12543,6 +13231,36 @@ void SimPlayerManager::runHiveCrafterConsumerTask() {
         return;
     }
 
+    // P.5.4b: consumed raw becomes finished-good output in the hive ledger.
+    uint64 producedUnits = 0;
+    uint64 goodEntryID = 0;
+    uint64 goodNewQuantity = 0;
+    int qualityScore = -1;
+    bool producedOk = false;
+    String produceReason = "disabled";
+
+    if (produceEnabled) {
+        producedUnits = static_cast<uint64>(recipe.outputUnitsPerCraft);
+
+        // Quality is only meaningful when the input was type-correct matched
+        // (the matched reservation carries the consumed lot's 10 stats).
+        if (hiveCrafterUseFamilyMatching && !fallbackUsed &&
+                profileDefIndex >= 0)
+            qualityScore = computeHiveCrafterInputQuality(
+                matchedReservation, profileDefs.get(profileDefIndex));
+
+        producedOk = AiEconomyManager::instance()->depositFinishedGood(
+            recipe.goodKey, recipe.goodName, recipe.goodClassChain,
+            profileKey, matchedTier, qualityScore, producedUnits,
+            goodEntryID, goodNewQuantity, produceReason);
+
+        if (!producedOk)
+            warning(String("HiveCrafterConsumer profile=") + profileKey +
+                " consumed=true produced=false goodKey=" + recipe.goodKey +
+                " reason=" + produceReason +
+                " batchOutputLost=true mode=simulation-only");
+    }
+
     {
         Locker crafterLocker(&hiveCrafterConsumerMutex);
         hiveCrafterBatchesCompleted += 1;
@@ -12550,12 +13268,23 @@ void SimPlayerManager::runHiveCrafterConsumerTask() {
         hiveCrafterLastProfile = profileKey;
         hiveCrafterLastReserveReason = "granted";
         hiveCrafterLastFallbackUsed = fallbackUsed;
+        hiveCrafterLastMatchedTier = matchedTier;
+        hiveCrafterLastMatchedQuery = matchedQuery;
+        hiveCrafterLastGoodKey = produceEnabled ? recipe.goodKey : String("");
 
-        // First-cut recipe ratio: 1 crafted unit per unit consumed.
-        uint64 produced = batch;
-        if (hiveCrafterProducedByProfile.contains(profileKey))
-            produced += hiveCrafterProducedByProfile.get(profileKey);
-        hiveCrafterProducedByProfile.put(profileKey, produced);
+        // Produce mode counts real finished units; legacy mode keeps the
+        // P.5.3 1:1 consumed-units accounting.
+        uint64 produced = produceEnabled ?
+            (producedOk ? producedUnits : 0) : batch;
+
+        if (produceEnabled)
+            hiveCrafterUnitsProduced += produced;
+
+        if (produced > 0) {
+            if (hiveCrafterProducedByProfile.contains(profileKey))
+                produced += hiveCrafterProducedByProfile.get(profileKey);
+            hiveCrafterProducedByProfile.put(profileKey, produced);
+        }
     }
 
     info(String("HiveCrafterConsumer profile=") + profileKey +
@@ -12563,7 +13292,19 @@ void SimPlayerManager::runHiveCrafterConsumerTask() {
             (resourceType.isEmpty() ? String("any") : resourceType) +
         " reserved=true entryId=" + String::valueOf(entryID) +
         " consumed=true units=" + String::valueOf(batch) +
+        " matchedTier=" + matchedTier +
+        " matchedQuery=" +
+            (matchedQuery.isEmpty() ? String("any") : matchedQuery) +
         " fallback=" + (fallbackUsed ? String("true") : String("false")) +
+        (produceEnabled ?
+            String(" produced=") +
+                (producedOk ? String("true") : String("false")) +
+                " goodKey=" + recipe.goodKey +
+                " producedUnits=" + String::valueOf(
+                    producedOk ? producedUnits : 0) +
+                " goodQuantity=" + String::valueOf(goodNewQuantity) +
+                " quality=" + String::valueOf(qualityScore) :
+            String(" produced=disabled")) +
         " mode=simulation-only", true);
 
     scheduleHiveCrafterConsumerTask();
@@ -13650,7 +14391,7 @@ bool SimPlayerManager::deployAndMountMinerVehicle(uint64 minerID, String& result
     // already be write-locked by this thread (MountCommand gets that from the
     // command framework; here we must take it explicitly). Violating it makes
     // the crosslock retry loop unlock an agent rwlock this thread does not
-    // hold — undefined behavior that wedged the whole server on 2026-07-02.
+    // hold - undefined behavior that wedged the whole server on 2026-07-02.
     {
         Locker agentLocker(agent);
         Locker crossLocker(vehicle, agent);
@@ -13729,7 +14470,7 @@ bool SimPlayerManager::deployAndMountMinerVehicle(uint64 minerID, String& result
     return true;
 }
 
-// P.4.4a: reverse of deploy+mount — dismount the miner (DismountCommand core)
+// P.4.4a: reverse of deploy+mount - dismount the miner (DismountCommand core)
 // and destroy the transient vehicle/device. Safe to call even if the miner
 // despawned (still cleans up the vehicle).
 bool SimPlayerManager::dismountAndStoreMinerVehicle(uint64 minerID, String& resultOut) {
@@ -19923,107 +20664,6 @@ bool SimPlayerManager::getMinerPathValidationSnapshot(
     return true;
 }
 
-void SimPlayerManager::startControllerForAgent(AiAgent* agent, Reference<SimPlayerController*> ctrl) {
-    if (!enabled || agent == nullptr || ctrl == nullptr)
-        return;
-
-    uint64 oid = agent->getObjectID();
-
-    // Shared “Starting SimPlayer” flags (copied from your toggleBot start path)
-    agent->setCustomAiMap(String("patrol").hashCode());
-    agent->setAITemplate();
-
-    agent->writeBlackboard("simAlwaysActive", true);
-    agent->setSimAlwaysActive(true);
-    agent->setSimPlayerBot(true);
-    agent->setDespawnOnNoPlayerInRange(false);
-
-    controllers.put(oid, ctrl);
-
-    agent->activateAiBehavior(true);
-    ctrl->startSimLoop();
-}
-
-static bool inferImperialFromTemplateName(const String& templateNameOrTName) {
-    String lower = templateNameOrTName.toLowerCase();
-    bool looksRebel = lower.beginsWith("rebel");
-    bool looksImperial = lower.beginsWith("imperial") || lower.contains("stormtrooper");
-    if (looksRebel) return false;
-    if (looksImperial) return true;
-    // default if unknown
-    return true;
-}
-
-void SimPlayerManager::spawnSimPlayerWithRoute(const String& planet,
-                                              const Vector3& spawn,
-                                              const Vector3& hangout,
-                                              const String& templateName,
-                                              const String& groupType,
-                                              const String& locationName) {
-    if (!enabled)
-        return;
-
-    ZoneServer* zoneServer = ServerCore::getZoneServer();
-    if (zoneServer == nullptr) return;
-
-    Zone* zone = zoneServer->getZone(planet);
-    if (zone == nullptr) {
-        info("Could not find zone: " + planet, true);
-        return;
-    }
-
-    CreatureManager* creatureManager = zone->getCreatureManager();
-    if (creatureManager == nullptr) return;
-
-    // Compute good Z from navmesh/terrain
-    float spawnZ = zone->getHeight(spawn.getX(), spawn.getY());
-    if (spawnZ == 0.0f && spawn.getZ() != 0.0f) spawnZ = spawn.getZ();
-
-    float hangoutZ = zone->getHeight(hangout.getX(), hangout.getY());
-    if (hangoutZ == 0.0f && hangout.getZ() != 0.0f) hangoutZ = hangout.getZ();
-
-    Vector3 spawnPos(spawn.getX(), spawn.getY(), spawnZ);
-    Vector3 hangoutPos(hangout.getX(), hangout.getY(), hangoutZ);
-
-    CreatureObject* creature = creatureManager->spawnCreature(templateName.hashCode(), 0,
-                                                              spawnPos.getX(), spawnPos.getZ(), spawnPos.getY(), 0);
-    if (creature == nullptr) {
-        info("Failed to spawn SimPlayer template: " + templateName, true);
-        return;
-    }
-
-    AiAgent* agent = creature->asAiAgent();
-    if (agent == nullptr) return;
-
-    // Reset default flags to clean slate
-    agent->setCreatureBitmask(0);
-    agent->setDespawnOnNoPlayerInRange(false);
-
-    // Decide controller based on groupType first (authoritative)
-    Reference<SimPlayerController*> ctrl = nullptr;
-
-    if (groupType.beginsWith("pvp")) {
-        bool imperial = inferImperialFromTemplateName(templateName);
-
-        applySimNpcPresentation(agent, ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
-
-        SimPvPController* pvp = new SimPvPController(agent, imperial, spawnPos, hangoutPos);
-        pvp->setCycleContext(this, templateName, groupType, planet, locationName);
-        ctrl = pvp;
-    } else {
-        applySimNpcPresentation(agent, 0);
-        ctrl = new SimMinerController(agent);
-    }
-#ifdef DEBUG_SIMPLAYER
-    info("spawnSimPlayerWithRoute: spawned " + templateName +
-         " at " + planet + ":" + locationName +
-         " spawn=(" + String::valueOf(spawnPos.getX()) + "," + String::valueOf(spawnPos.getY()) + ")" +
-         " hangout=(" + String::valueOf(hangoutPos.getX()) + "," + String::valueOf(hangoutPos.getY()) + ")",
-         true);
-#endif
-    startControllerForAgent(agent, ctrl);
-}
-
 // -----------------------------------------------------------------------------
 // Lua config glue
 // -----------------------------------------------------------------------------
@@ -20169,6 +20809,11 @@ void SimPlayerManager::spawnFromConfig(const SpawnGroup& g, const ShuttleportLoc
     if (!enabled)
         return;
 
+    // P.6.1: pvp spawnGroups are retired - squads spawn from pvpConfig via
+    // the maintenance task (see spawnPvpSquad).
+    if (g.type.beginsWith("pvp"))
+        return;
+
     ZoneServer* zoneServer = ServerCore::getZoneServer();
     if (zoneServer == nullptr)
         return;
@@ -20188,12 +20833,7 @@ void SimPlayerManager::spawnFromConfig(const SpawnGroup& g, const ShuttleportLoc
     if (spawnZ == 0.0f && loc.spawn.getZ() != 0.0f)
         spawnZ = loc.spawn.getZ();
 
-    float hangoutZ = zone->getHeight(loc.hangout.getX(), loc.hangout.getY());
-    if (hangoutZ == 0.0f && loc.hangout.getZ() != 0.0f)
-        hangoutZ = loc.hangout.getZ();
-
     Vector3 spawnPos(loc.spawn.getX(), loc.spawn.getY(), spawnZ);
-    Vector3 hangoutPos(loc.hangout.getX(), loc.hangout.getY(), hangoutZ);
 #ifdef DEBUG_SIMPLAYER
     info("Spawning SimPlayer type=" + g.type + " template=" + templateName + " planet=" + loc.planet + " loc=" + loc.name, true);
 #endif
@@ -20214,149 +20854,23 @@ void SimPlayerManager::spawnFromConfig(const SpawnGroup& g, const ShuttleportLoc
     // Start (non-toggle) using the same flags as toggleBot's "Starting" path
     uint64 oid = agent->getObjectID();
 
-    agent->setCustomAiMap(String("patrol").hashCode());
-    agent->setAITemplate();
-
     agent->writeBlackboard("simAlwaysActive", true);
     agent->setSimAlwaysActive(true);
     agent->setSimPlayerBot(true);
     agent->setDespawnOnNoPlayerInRange(false);
 
-    Reference<SimPlayerController*> ctrl = nullptr;
+    applySimNpcPresentation(agent, 0);
+    // Miners are driven entirely by SimMinerController; give them the no-op
+    // simMiner tree so the default idle/wander tree does not compete with
+    // the controller's movement (see scripts/ai/simMiner.lua).
+    agent->setCustomAiMap(String("simMiner").hashCode());
+    agent->setAITemplate();
 
-    if (g.type.beginsWith("pvp")) {
-        bool imperial = isImperialForSpawn(g, templateName);
-        applySimNpcPresentation(agent, ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
-#ifdef DEBUG_SIMPLAYER
-        info("spawnFromConfig: creating PvP controller with route spawn=("
-            + String::valueOf(spawnPos.getX()) + "," + String::valueOf(spawnPos.getY()) + "," + String::valueOf(spawnPos.getZ())
-            + ") hangout=("
-            + String::valueOf(hangoutPos.getX()) + "," + String::valueOf(hangoutPos.getY()) + "," + String::valueOf(hangoutPos.getZ())
-            + ")", true);
-#endif
-        SimPvPController* pvp = new SimPvPController(agent, imperial, spawnPos, hangoutPos);
-        pvp->setCycleContext(this, templateName, g.type, loc.planet, loc.name);
-#ifdef DEBUG_SIMPLAYER
-        Logger::console.info(
-            "SimPlayerManager: spawnFromConfig wired cycle context oid=" + String::valueOf(agent->getObjectID()) +
-            " mgr=this groupType=" + g.type +
-            " template=" + templateName +
-            " planet=" + loc.planet +
-            " location=" + loc.name,
-            true
-        );
-#endif
-        ctrl = pvp;
-    } else {
-        applySimNpcPresentation(agent, 0);
-        // Miners are driven entirely by SimMinerController; give them the no-op
-        // simMiner tree so the default idle/wander tree does not compete with
-        // the controller's movement (see scripts/ai/simMiner.lua).
-        agent->setCustomAiMap(String("simMiner").hashCode());
-        agent->setAITemplate();
-        ctrl = new SimMinerController(agent, g.minerConfig);
-    }
-        controllers.put(oid, ctrl);
-        agent->activateAiBehavior(true);
-        ctrl->startSimLoop();
-    }
+    Reference<SimPlayerController*> ctrl = new SimMinerController(agent, g.minerConfig);
 
-void SimPlayerManager::cyclePvPBotWhenShuttleReady(uint64 oldOid,
-                                                   const String& groupType,
-                                                   const String& templateName,
-                                                   bool imperial,
-                                                   const String& fromPlanet,
-                                                   const String& fromLocation,
-                                                   int attempts) {
-    if (!enabled)
-        return;
-
-    // Safety: don’t wait forever
-    if (attempts >= 24) { // 24 * 5s = ~2 minutes
-#ifdef DEBUG_SIMPLAYER
-        info("cyclePvPBotWhenShuttleReady: timeout waiting for shuttle; cycling anyway oldOid=" +
-             String::valueOf(oldOid), true);
-#endif
-        cyclePvPBot(oldOid, groupType, templateName, imperial, fromPlanet, fromLocation);
-        return;
-    }
-
-    // Re-acquire the old agent by OID (don’t capture oldAgent across tasks)
-    ManagedReference<SceneObject*> obj = ServerCore::getZoneServer()->getObject(oldOid);
-    ManagedReference<AiAgent*> oldAgent = cast<AiAgent*>(obj.get());
-
-    if (oldAgent == nullptr) {
-#ifdef DEBUG_SIMPLAYER
-        info("cyclePvPBotWhenShuttleReady: oldAgent null, abort oldOid=" + String::valueOf(oldOid), true);
-#endif
-        return;
-    }
-
-    bool cleanupOldAgent = false;
-
-    {
-        Locker locker(oldAgent);
-        // If the bot died while waiting, stop the loop and clean up.
-        if (oldAgent->isDead() || oldAgent->isIncapacitated()) {
-#ifdef DEBUG_SIMPLAYER
-            info("cyclePvPBotWhenShuttleReady: old bot is dead/incap; cleaning up oldOid=" +
-                 String::valueOf(oldOid), true);
-#endif
-            cleanupOldAgent = true;
-        }
-    }
-
-    if (cleanupOldAgent) {
-        controllers.drop(oldOid);
-
-        // If you want NO corpses/loot for simplayers:
-        oldAgent->destroyObjectFromWorld(true);
-        oldAgent->destroyObjectFromDatabase(true);
-
-        return;
-    }
-
-    // Do not hold the bot lock while checking PlanetManager/shuttle state.
-    if (!isNearestShuttleBoardable(oldAgent)) {
-        {
-            Locker locker(oldAgent);
-
-            if (oldAgent->isDead() || oldAgent->isIncapacitated()) {
-#ifdef DEBUG_SIMPLAYER
-                info("cyclePvPBotWhenShuttleReady: old bot died while waiting for shuttle oldOid=" +
-                     String::valueOf(oldOid), true);
-#endif
-                cleanupOldAgent = true;
-            } else {
-                // Optional: make it look like it’s waiting
-                oldAgent->setMovementState(AiAgent::OBLIVIOUS);
-                oldAgent->activateAiBehavior(true);
-            }
-        }
-
-        if (cleanupOldAgent) {
-            controllers.drop(oldOid);
-
-            // If you want NO corpses/loot for simplayers:
-            oldAgent->destroyObjectFromWorld(true);
-            oldAgent->destroyObjectFromDatabase(true);
-
-            return;
-        }
-
-        Core::getTaskManager()->scheduleTask(
-            [this, oldOid, groupType, templateName, imperial, fromPlanet, fromLocation, attempts]() {
-                this->cyclePvPBotWhenShuttleReady(oldOid, groupType, templateName, imperial, fromPlanet, fromLocation, attempts + 1);
-            },
-            "SimPvPWaitForShuttle",
-            5000
-        );
-
-        return;
-    }
-
-    // Shuttle is boardable now — do the real cycle
-    cyclePvPBot(oldOid, groupType, templateName, imperial, fromPlanet, fromLocation);
+    controllers.put(oid, ctrl);
+    agent->activateAiBehavior(true);
+    ctrl->startSimLoop();
 }
 
 bool SimPlayerManager::isNearestShuttleBoardable(CreatureObject* creature) {
@@ -20387,163 +20901,3270 @@ bool SimPlayerManager::isNearestShuttleBoardable(CreatureObject* creature) {
     return true;
 }
 
-void SimPlayerManager::cyclePvPBot(uint64 oldOid,
-                                   const String& groupType,
-                                   const String& templateName,
-                                   bool imperial,
-                                   const String& fromPlanet,
-                                   const String& fromLocation) {
-    if (!enabled)
+
+// =============================================================================
+// P.6.1 SimPvP squads
+//
+// Persistent faction squads (leader + engine-FOLLOW members) that run
+// player-mimetic starport loops and travel between configured cities with the
+// proven switchZone outdoor reposition (P.4.5). Replaces the legacy solo
+// destroy+respawn cycle. Fully gated by pvpConfig.enablePvpBots (C++ default
+// off); config refreshes every maintenance interval so all knobs (including
+// the master gate) apply at runtime without a restart. NPC lifecycle only -
+// no economy/inventory/persistence mutation.
+// =============================================================================
+
+static float pvpSpawnJitter() {
+    // -2.0 .. +2.0m so squad bots never stack on one point.
+    return ((float)System::random(40) / 10.f) - 2.f;
+}
+
+// P.6.2c: follow-formation offset for member index j (1..squadSize-1; leader
+// is 0). The engine follow behavior stands each member at leaderPos + this
+// offset rotated by leader facing (AiAgentImplementation.cpp:4577). The old
+// column offsets were ~1-3m so members visually stacked; fan them out ~5-8m
+// behind the leader and spread ±7m laterally so they read as players loosely
+// grouped. Kept modest so followers stay on the open hangout ground; the
+// follow pathfinder already routes around buildings and a follower is never
+// permanently stuck (it re-follows the moment the leader moves on).
+static void pvpFormationOffset(int memberIndex, int squadSize,
+        float& xOffset, float& yOffset) {
+    int members = squadSize - 1;
+    if (members < 1)
+        members = 1;
+
+    float frac = members > 1 ?
+        (float)(memberIndex - 1) / (float)(members - 1) : 0.5f;
+
+    xOffset = (frac - 0.5f) * 14.f;                       // -7 .. +7m lateral
+    yOffset = -(5.f + (float)((memberIndex * 3) % 4));    // -5 .. -8m behind
+}
+
+void SimPlayerManager::applyPvpConfig(LuaObject& pvpConfig) {
+    pvpEnabled = pvpConfig.getBooleanField("enablePvpBots", pvpEnabled);
+    pvpSquadsPerFaction = clampMinerInt(
+        pvpConfig.getIntField("squadsPerFaction"), pvpSquadsPerFaction, 1, 8);
+    pvpSquadSize = clampMinerInt(
+        pvpConfig.getIntField("squadSize"), pvpSquadSize, 1, 20);
+
+    float scanRadius = pvpConfig.getFloatField("scanRadiusMeters");
+    if (scanRadius >= 5.f && scanRadius <= 128.f)
+        pvpScanRadiusMeters = scanRadius;
+
+    float leash = pvpConfig.getFloatField("combatLeashMeters");
+    if (leash >= 16.f && leash <= 256.f)
+        pvpCombatLeashMeters = leash;
+
+    pvpLoiterMinSeconds = clampMinerInt(
+        pvpConfig.getIntField("loiterMinSeconds"), pvpLoiterMinSeconds, 10, 3600);
+    pvpLoiterMaxSeconds = clampMinerInt(
+        pvpConfig.getIntField("loiterMaxSeconds"), pvpLoiterMaxSeconds,
+        pvpLoiterMinSeconds, 7200);
+    pvpAllowBotVsBotCombat = pvpConfig.getBooleanField(
+        "allowBotVsBotCombat", pvpAllowBotVsBotCombat);
+    pvpLogStateTransitions = pvpConfig.getBooleanField(
+        "logStateTransitions", pvpLogStateTransitions);
+    pvpRespawnDelaySeconds = clampMinerInt(
+        pvpConfig.getIntField("respawnDelaySeconds"), pvpRespawnDelaySeconds, 10, 3600);
+    pvpMaintenanceIntervalSeconds = clampMinerInt(
+        pvpConfig.getIntField("maintenanceIntervalSeconds"),
+        pvpMaintenanceIntervalSeconds, 10, 600);
+    pvpShuttleWaitIntervalSeconds = clampMinerInt(
+        pvpConfig.getIntField("shuttleWaitIntervalSeconds"),
+        pvpShuttleWaitIntervalSeconds, 2, 60);
+    pvpShuttleWaitMaxAttempts = clampMinerInt(
+        pvpConfig.getIntField("shuttleWaitMaxAttempts"),
+        pvpShuttleWaitMaxAttempts, 1, 240);
+    pvpCorpseCleanupDelaySeconds = clampMinerInt(
+        pvpConfig.getIntField("corpseCleanupDelaySeconds"),
+        pvpCorpseCleanupDelaySeconds, 10, 900);
+
+    LuaObject recovery = pvpConfig.getObjectField("recovery");
+    if (recovery.isValidTable()) {
+        pvpRecoveryEnabled = recovery.getBooleanField("enabled", pvpRecoveryEnabled);
+        pvpRecoveryDryRun = recovery.getBooleanField("dryRun", pvpRecoveryDryRun);
+
+        float farMeters = recovery.getFloatField("memberFarMeters");
+        if (farMeters >= 16.f && farMeters <= 512.f)
+            pvpMemberFarMeters = farMeters;
+
+        pvpStateTtlSeconds = clampMinerInt(
+            recovery.getIntField("stateTtlSeconds"), pvpStateTtlSeconds, 60, 7200);
+        pvpMaxRecoveryActionsPerInterval = clampMinerInt(
+            recovery.getIntField("maxActionsPerInterval"),
+            pvpMaxRecoveryActionsPerInterval, 1, 20);
+    }
+    recovery.pop();
+
+    // P.6.2 scouts + gank convergence.
+    LuaObject scouts = pvpConfig.getObjectField("scouts");
+    if (scouts.isValidTable()) {
+        pvpScoutsEnabled = scouts.getBooleanField("enabled", pvpScoutsEnabled);
+        pvpScoutSquadsPerFaction = clampMinerInt(
+            scouts.getIntField("squadsPerFaction"), pvpScoutSquadsPerFaction, 1, 4);
+        pvpScoutSquadSize = clampMinerInt(
+            scouts.getIntField("squadSize"), pvpScoutSquadSize, 1, 4);
+
+        float scoutScan = scouts.getFloatField("scanRadiusMeters");
+        if (scoutScan >= 5.f && scoutScan <= 192.f)
+            pvpScoutScanRadiusMeters = scoutScan;
+
+        pvpScoutReportOnly = scouts.getBooleanField("reportOnly", pvpScoutReportOnly);
+        pvpScoutReportIntervalSeconds = clampMinerInt(
+            scouts.getIntField("reportIntervalSeconds"),
+            pvpScoutReportIntervalSeconds, 5, 600);
+        pvpContactTtlSeconds = clampMinerInt(
+            scouts.getIntField("contactTtlSeconds"), pvpContactTtlSeconds, 30, 3600);
+        pvpConvergeCooldownSeconds = clampMinerInt(
+            scouts.getIntField("convergeCooldownSeconds"),
+            pvpConvergeCooldownSeconds, 30, 7200);
+    }
+    scouts.pop();
+
+    // P.6.3a player-facing comms.
+    LuaObject comms = pvpConfig.getObjectField("comms");
+    if (comms.isValidTable()) {
+        pvpCommsSpatialEnabled = comms.getBooleanField(
+            "spatialAnnouncements", pvpCommsSpatialEnabled);
+        pvpCommsAnnounceCooldownSeconds = clampMinerInt(
+            comms.getIntField("announceCooldownSeconds"),
+            pvpCommsAnnounceCooldownSeconds, 5, 3600);
+        pvpCommsGlobalMinGapSeconds = clampMinerInt(
+            comms.getIntField("globalMinGapSeconds"),
+            pvpCommsGlobalMinGapSeconds, 1, 120);
+        pvpCommsFactionRoomsEnabled = comms.getBooleanField(
+            "factionRooms", pvpCommsFactionRoomsEnabled);
+        pvpCommsFactionRoomRequireOvert = comms.getBooleanField(
+            "factionRoomRequireOvert", pvpCommsFactionRoomRequireOvert);
+        pvpCommsPlayerGroupingEnabled = comms.getBooleanField(
+            "playerGrouping", pvpCommsPlayerGroupingEnabled);
+        pvpCommsMaxPlayersPerSquad = clampMinerInt(
+            comms.getIntField("maxPlayersPerSquad"), pvpCommsMaxPlayersPerSquad, 1, 19);
+
+        float joinRange = comms.getFloatField("joinRangeMeters");
+        if (joinRange >= 5.f && joinRange <= 256.f)
+            pvpCommsJoinRangeMeters = joinRange;
+    }
+    comms.pop();
+
+    LuaObject templates = pvpConfig.getObjectField("templates");
+    if (templates.isValidTable()) {
+        LuaObject imperialList = templates.getObjectField("imperial");
+        if (imperialList.isValidTable() && imperialList.getTableSize() > 0) {
+            pvpImperialTemplates.removeAll();
+            for (int i = 1; i <= imperialList.getTableSize(); ++i)
+                pvpImperialTemplates.add(imperialList.getStringAt(i));
+        }
+        imperialList.pop();
+
+        LuaObject rebelList = templates.getObjectField("rebel");
+        if (rebelList.isValidTable() && rebelList.getTableSize() > 0) {
+            pvpRebelTemplates.removeAll();
+            for (int i = 1; i <= rebelList.getTableSize(); ++i)
+                pvpRebelTemplates.add(rebelList.getStringAt(i));
+        }
+        rebelList.pop();
+    }
+    templates.pop();
+
+    // P.6.5 travel: routed player-mimetic travel config + the P.6.5-0
+    // read-only diagnostics spike (runs once per boot when a flag is on).
+    LuaObject travel = pvpConfig.getObjectField("travel");
+    if (travel.isValidTable()) {
+        // P.6.5a routed travel.
+        pvpRoutedTravelEnabled = travel.getBooleanField(
+            "enableRoutedTravel", pvpRoutedTravelEnabled);
+        pvpTravelOffMainChancePct = clampMinerInt(
+            travel.getIntField("offMainPlanetChancePct"),
+            pvpTravelOffMainChancePct, 1, 100);
+        pvpTravelMaxLegsPerRoute = clampMinerInt(
+            travel.getIntField("maxLegsPerRoute"),
+            pvpTravelMaxLegsPerRoute, 1, 6);
+        pvpTravelTransitDwellMinSeconds = clampMinerInt(
+            travel.getIntField("transitDwellSecondsMin"),
+            pvpTravelTransitDwellMinSeconds, 5, 600);
+        pvpTravelTransitDwellMaxSeconds = clampMinerInt(
+            travel.getIntField("transitDwellSecondsMax"),
+            pvpTravelTransitDwellMaxSeconds, pvpTravelTransitDwellMinSeconds, 900);
+
+        LuaObject mains = travel.getObjectField("mainPlanets");
+        if (mains.isValidTable() && mains.getTableSize() > 0) {
+            pvpTravelMainPlanets.removeAll();
+            for (int i = 1; i <= mains.getTableSize(); ++i)
+                pvpTravelMainPlanets.add(mains.getStringAt(i));
+        }
+        mains.pop();
+
+        LuaObject staging = travel.getObjectField("staging");
+        if (staging.isValidTable()) {
+            LuaObject rebel = staging.getObjectField("rebel");
+            if (rebel.isValidTable()) {
+                pvpStagingRebelPlanet = rebel.getStringField("planet");
+                pvpStagingRebelCity = rebel.getStringField("city");
+            }
+            rebel.pop();
+
+            LuaObject imperial = staging.getObjectField("imperial");
+            if (imperial.isValidTable()) {
+                pvpStagingImperialPlanet = imperial.getStringField("planet");
+                pvpStagingImperialCity = imperial.getStringField("city");
+            }
+            imperial.pop();
+        }
+        staging.pop();
+
+        LuaObject diagnostics = travel.getObjectField("diagnostics");
+        if (diagnostics.isValidTable()) {
+            pvpTravelDumpGraph = diagnostics.getBooleanField(
+                "dumpTravelGraph", pvpTravelDumpGraph);
+            pvpTravelTestInteriorPaths = diagnostics.getBooleanField(
+                "testStarportInteriorPaths", pvpTravelTestInteriorPaths);
+
+            LuaObject points = diagnostics.getObjectField("interiorPathPoints");
+            if (points.isValidTable() && points.getTableSize() > 0) {
+                pvpTravelInteriorPathPoints.removeAll();
+
+                for (int i = 1; i <= points.getTableSize(); ++i) {
+                    LuaObject entry = points.getObjectAt(i);
+
+                    if (entry.isValidTable()) {
+                        PvpTravelSpikePoint point;
+                        point.zoneName = entry.getStringField("zone");
+                        point.pointName = entry.getStringField("point");
+
+                        if (!point.zoneName.isEmpty() && !point.pointName.isEmpty())
+                            pvpTravelInteriorPathPoints.add(point);
+                    }
+
+                    entry.pop();
+                }
+            }
+            points.pop();
+        }
+        diagnostics.pop();
+    }
+    travel.pop();
+}
+
+void SimPlayerManager::refreshPvpConfig() {
+    Lua configLua;
+    configLua.init();
+
+    try {
+        configLua.runFile("scripts/managers/sim_player_manager.lua");
+    } catch (Exception& e) {
+        info(String("SimPvp configReloadFailed=true reason=\"") + e.getMessage() +
+             "\" retainingPreviousConfig=true", true);
+        return;
+    }
+
+    LuaObject managerConfig = configLua.getGlobalObject("SimPlayerManagerConfig");
+
+    if (!managerConfig.isValidTable()) {
+        managerConfig.pop();
+        return;
+    }
+
+    LuaObject pvpConfig = managerConfig.getObjectField("pvpConfig");
+    if (pvpConfig.isValidTable())
+        applyPvpConfig(pvpConfig);
+    pvpConfig.pop();
+    managerConfig.pop();
+}
+
+// --- P.6.5-0 travel diagnostics spike (read-only) ---------------------------
+// Runs at most once per boot, on the PvP maintenance thread, when either
+// diagnostics flag is enabled. No agent is moved, no state besides the
+// diagnostic result cache is written; safe to leave enabled.
+
+void SimPlayerManager::runPvpTravelDiagnosticsIfNeeded() {
+    if (!pvpTravelDumpGraph && !pvpTravelTestInteriorPaths)
         return;
 
-#ifdef DEBUG_SIMPLAYER
-    info("cyclePvPBot ENTER this=" + String::valueOf((uint64)this) +
-         " oldOid=" + String::valueOf(oldOid) +
-         " controllersHas=" + String::valueOf(controllers.contains(oldOid)) +
-         " from " + fromPlanet + ":" + fromLocation +
-         " groupType=" + groupType + " template=" + templateName +
-         " shuttleports=" + String::valueOf(allShuttleports.size()) +
-         " spawnGroups=" + String::valueOf(spawnGroups.size()), true);
-#endif
-    // Run on task thread (you already do this style elsewhere)
-    Core::getTaskManager()->scheduleTask([this, oldOid, groupType, templateName, imperial, fromPlanet, fromLocation]() {
-#ifdef DEBUG_SIMPLAYER
-        info("cyclePvPBot TASK START this=" + String::valueOf((uint64)this) +
-             " oldOid=" + String::valueOf(oldOid) +
-             " enabled=" + String::valueOf(enabled) +
-             " shuttleports=" + String::valueOf(allShuttleports.size()) +
-             " spawnGroups=" + String::valueOf(spawnGroups.size()), true);
-#endif
-        if (!controllers.contains(oldOid)) {
-#ifdef DEBUG_SIMPLAYER
-            info("cyclePvPBot: oldOid no longer in controllers (already cleaned up?)", true);
-#endif
+    {
+        Locker squadLock(&pvpSquadMutex);
+
+        if (pvpTravelSpikeRan)
             return;
-        }
 
-        // If config wasn't loaded (or got wiped), try loading once.
-        // With the new loadLuaConfig() this won't destroy good config on failure.
-        if (!enabled || allShuttleports.size() == 0 || spawnGroups.size() == 0) {
-#ifdef DEBUG_SIMPLAYER
-            info("BEFORE loadLuaConfig: enabled=" + String::valueOf(enabled) +
-                 " shuttles=" + String::valueOf(allShuttleports.size()) +
-                 " groups=" + String::valueOf(spawnGroups.size()), true);
-#endif
-            loadLuaConfig();
-#ifdef DEBUG_SIMPLAYER
-            info("AFTER  loadLuaConfig: enabled=" + String::valueOf(enabled) +
-                 " shuttles=" + String::valueOf(allShuttleports.size()) +
-                 " groups=" + String::valueOf(spawnGroups.size()), true);
-#endif
-        }
+        pvpTravelSpikeRan = true;
+    }
 
-        if (!enabled || allShuttleports.size() == 0 || spawnGroups.size() == 0) {
-#ifdef DEBUG_SIMPLAYER
-            info("cyclePvPBot: cannot cycle because config still empty/disabled.", true);
-#endif
-            return;
-        }
+    runPvpTravelDiagnostics();
+}
 
-        // 1) Pick a new location (try not to repeat)
-        ShuttleportLocation newLoc;
-        bool pickedLoc = false;
+void SimPlayerManager::runPvpTravelDiagnostics() {
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
 
-        for (int tries = 0; tries < 10; ++tries) {
-            if (!pickRandomShuttleport(newLoc))
-                return;
+    if (zoneServer == nullptr)
+        return;
 
-            if (!(newLoc.planet == fromPlanet && newLoc.name == fromLocation)) {
-                pickedLoc = true;
-                break;
+    Vector<String> fareLines;
+    Vector<String> starportLines;
+    Vector<PvpTravelSpikeInteriorResult> interiorResults;
+
+    if (pvpTravelDumpGraph) {
+        // The fare matrix from datatables/travel/travel.iff is the
+        // planet-connectivity truth (fare > 0 = purchasable route). It is
+        // loaded symmetrically, so one direction per pair is the whole graph.
+        const String groundZones[] = {
+            "corellia", "dantooine", "dathomir", "endor", "lok",
+            "naboo", "rori", "talus", "tatooine", "yavin4"
+        };
+        const int zoneCount = sizeof(groundZones) / sizeof(groundZones[0]);
+
+        for (int i = 0; i < zoneCount; ++i) {
+            Zone* zone = zoneServer->getZone(groundZones[i]);
+            PlanetManager* planetManager =
+                zone == nullptr ? nullptr : zone->getPlanetManager();
+
+            if (planetManager == nullptr)
+                continue;
+
+            for (int j = i + 1; j < zoneCount; ++j) {
+                if (zoneServer->getZone(groundZones[j]) == nullptr)
+                    continue;
+
+                int fare = planetManager->getTravelFare(
+                    groundZones[i], groundZones[j]);
+
+                String line = groundZones[i] + "<->" + groundZones[j] +
+                    " fare=" + String::valueOf(fare) +
+                    " connected=" + (fare > 0 ? "true" : "false");
+                fareLines.add(line);
+                info("SimPvpTravelSpike fare " + line, true);
             }
         }
 
-        if (!pickedLoc) {
-            // Could not find a different one after N tries — allow same
-            if (!pickRandomShuttleport(newLoc))
-                return;
-        }
+        // Resolve each configured city's nearest interplanetary point - the
+        // departure starport the P.6.5 router would use from that city.
+        for (int i = 0; i < allShuttleports.size(); ++i) {
+            const ShuttleportLocation& loc = allShuttleports.get(i);
 
-        // 2) Find spawn group
-        SpawnGroup picked;
-        bool found = false;
+            Zone* zone = zoneServer->getZone(loc.planet);
+            PlanetManager* planetManager =
+                zone == nullptr ? nullptr : zone->getPlanetManager();
 
-        for (int i = 0; i < spawnGroups.size(); ++i) {
-            if (spawnGroups.get(i).type == groupType) {
-                picked = spawnGroups.get(i);
-                found = true;
-                break;
+            if (planetManager == nullptr)
+                continue;
+
+            Vector3 cityPos;
+            cityPos.setX(loc.spawn.getX());
+            cityPos.setY(loc.spawn.getY());
+            cityPos.setZ(loc.spawn.getZ());
+
+            Reference<PlanetTravelPoint*> starport =
+                planetManager->getNearestPlanetTravelPoint(cityPos, 16000.f, true);
+
+            String line = loc.planet + "/" + loc.name + " -> ";
+
+            if (starport == nullptr) {
+                line += "NONE";
+            } else {
+                Vector3 starportPos;
+                starportPos.setX(starport->getArrivalPositionX());
+                starportPos.setY(starport->getArrivalPositionY());
+                starportPos.setZ(starport->getArrivalPositionZ());
+
+                line += "\"" + starport->getPointName() + "\" dist=" +
+                    String::valueOf(static_cast<int>(cityPos.distanceTo(starportPos)));
             }
-        }
 
-        if (!found) {
-#ifdef DEBUG_SIMPLAYER
-            info("cyclePvPBot: could not find spawnGroup type=" + groupType + ", falling back to first pvp group", true);
-#endif
-            for (int i = 0; i < spawnGroups.size(); ++i) {
-                if (spawnGroups.get(i).type.beginsWith("pvp")) {
-                    picked = spawnGroups.get(i);
-                    found = true;
+            starportLines.add(line);
+            info("SimPvpTravelSpike nearestStarport " + line, true);
+        }
+    }
+
+    if (pvpTravelTestInteriorPaths) {
+        for (int i = 0; i < pvpTravelInteriorPathPoints.size(); ++i) {
+            const PvpTravelSpikePoint& testPoint = pvpTravelInteriorPathPoints.get(i);
+
+            PvpTravelSpikeInteriorResult result;
+            result.zoneName = testPoint.zoneName;
+            result.pointName = testPoint.pointName;
+
+            Zone* zone = zoneServer->getZone(testPoint.zoneName);
+            PlanetManager* planetManager =
+                zone == nullptr ? nullptr : zone->getPlanetManager();
+
+            if (planetManager == nullptr) {
+                result.status = "zoneMissing";
+                interiorResults.add(result);
+                continue;
+            }
+
+            Reference<PlanetTravelPoint*> travelPoint =
+                planetManager->getPlanetTravelPoint(testPoint.pointName);
+
+            if (travelPoint == nullptr) {
+                result.status = "pointMissing";
+                interiorResults.add(result);
+                continue;
+            }
+
+            float arrivalX = travelPoint->getArrivalPositionX();
+            float arrivalY = travelPoint->getArrivalPositionY();
+
+            Vector3 arrivalWorld;
+            arrivalWorld.setX(arrivalX);
+            arrivalWorld.setY(arrivalY);
+            arrivalWorld.setZ(zone->getHeight(arrivalX, arrivalY));
+
+            // Find the port's ticket collector. Collectors inside the
+            // building are cell children (not in the zone octree), so scan
+            // nearby buildings' cells as well as top-level objects. All of
+            // these are static world-snapshot objects - read-only scan.
+            SortedVector<TreeEntry*> closeObjects;
+            zone->getInRangeObjects(arrivalWorld.getX(), 0, arrivalWorld.getY(),
+                175.f, &closeObjects, true, true);
+
+            SceneObject* collector = nullptr;
+            float bestDistance = 0.f;
+
+            for (int k = 0; k < closeObjects.size(); ++k) {
+                SceneObject* candidate =
+                    static_cast<SceneObject*>(closeObjects.get(k));
+
+                if (candidate == nullptr)
+                    continue;
+
+                if (candidate->getGameObjectType() ==
+                        SceneObjectType::TICKETCOLLECTOR) {
+                    float distance =
+                        candidate->getWorldPosition().distanceTo(arrivalWorld);
+
+                    if (collector == nullptr || distance < bestDistance) {
+                        collector = candidate;
+                        bestDistance = distance;
+                    }
+                } else if (candidate->isBuildingObject()) {
+                    BuildingObject* building =
+                        cast<BuildingObject*>(candidate);
+
+                    if (building == nullptr)
+                        continue;
+
+                    // Cells are keyed 1..totalCellNumber (0 is invalid).
+                    for (int c = 1; c <= building->getTotalCellNumber(); ++c) {
+                        CellObject* cell = building->getCell(c);
+
+                        if (cell == nullptr)
+                            continue;
+
+                        for (int o = 0; o < cell->getContainerObjectsSize(); ++o) {
+                            SceneObject* child = cell->getContainerObject(o);
+
+                            if (child == nullptr || child->getGameObjectType() !=
+                                    SceneObjectType::TICKETCOLLECTOR)
+                                continue;
+
+                            float distance =
+                                child->getWorldPosition().distanceTo(arrivalWorld);
+
+                            if (collector == nullptr || distance < bestDistance) {
+                                collector = child;
+                                bestDistance = distance;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (collector == nullptr) {
+                result.status = "noCollector";
+            } else {
+                Vector3 collectorWorld = collector->getWorldPosition();
+                result.collectorX = collectorWorld.getX();
+                result.collectorY = collectorWorld.getY();
+                result.collectorZ = collectorWorld.getZ();
+                result.collectorTemplate = collector->getObjectTemplate() != nullptr ?
+                    collector->getObjectTemplate()->getFullTemplateString() : "";
+
+                ManagedReference<SceneObject*> collectorParent =
+                    collector->getParent().get();
+                result.collectorInCell = collectorParent != nullptr &&
+                    collectorParent->isCellObject();
+
+                Vector<WorldCoordinates>* path = nullptr;
+
+                try {
+                    WorldCoordinates start(arrivalWorld, nullptr);
+                    WorldCoordinates target(collector);
+                    path = PathFinderManager::instance()->findPath(
+                        start, target, zone);
+                } catch (...) {
+                    result.status = "exception";
+                }
+
+                if (result.status.isEmpty()) {
+                    result.pathNodes = path == nullptr ? 0 : path->size();
+                    result.pathable = path != nullptr && path->size() >= 2;
+                    result.status = result.pathable ? "ok" : "pathFailed";
+                }
+
+                if (path != nullptr)
+                    delete path;
+            }
+
+            interiorResults.add(result);
+
+            info("SimPvpTravelSpike interior zone=" + result.zoneName +
+                 " point=\"" + result.pointName + "\"" +
+                 " status=" + result.status +
+                 " collectorInCell=" + (result.collectorInCell ? "true" : "false") +
+                 " pathNodes=" + String::valueOf(result.pathNodes) +
+                 " collector=(" + String::valueOf(result.collectorX) + "," +
+                 String::valueOf(result.collectorY) + "," +
+                 String::valueOf(result.collectorZ) + ")", true);
+        }
+    }
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        pvpTravelSpikeFareLines = fareLines;
+        pvpTravelSpikeStarportLines = starportLines;
+        pvpTravelSpikeInteriorResults = interiorResults;
+    }
+
+    info("SimPvpTravelSpike complete fares=" + String::valueOf(fareLines.size()) +
+         " starports=" + String::valueOf(starportLines.size()) +
+         " interiorTests=" + String::valueOf(interiorResults.size()), true);
+}
+
+void SimPlayerManager::schedulePvpMaintenanceTask() {
+    if (!enabled || pvpMaintenanceTaskScheduled)
+        return;
+
+    pvpMaintenanceTaskScheduled = true;
+
+    Reference<SimPvpMaintenanceTask*> task = new SimPvpMaintenanceTask();
+    task->schedule(pvpMaintenanceIntervalSeconds * 1000);
+}
+
+String SimPlayerManager::pickPvpTemplate(bool imperial) const {
+    const Vector<String>& list = imperial ? pvpImperialTemplates : pvpRebelTemplates;
+
+    if (list.size() == 0)
+        return imperial ? "stormtrooper" : "rebel_trooper";
+
+    return list.get(System::random(list.size() - 1));
+}
+
+int SimPlayerManager::findPvpSquadIndex(uint64 squadId) const {
+    for (int i = 0; i < pvpSquads.size(); ++i) {
+        if (pvpSquads.get(i).squadId == squadId)
+            return i;
+    }
+
+    return -1;
+}
+
+AiAgent* SimPlayerManager::spawnPvpBotAgent(Zone* zone, const Vector3& position,
+        const String& templateName, bool imperial, bool leader,
+        AiAgent* leaderAgent, float formationOffsetX, float formationOffsetY) {
+    if (zone == nullptr)
+        return nullptr;
+
+    CreatureManager* creatureManager = zone->getCreatureManager();
+    if (creatureManager == nullptr)
+        return nullptr;
+
+    CreatureObject* creature = creatureManager->spawnCreature(
+        templateName.hashCode(), 0,
+        position.getX(), position.getZ(), position.getY(), 0);
+
+    if (creature == nullptr) {
+        info("spawnPvpBotAgent: failed to spawn template " + templateName, true);
+        return nullptr;
+    }
+
+    AiAgent* agent = creature->asAiAgent();
+    if (agent == nullptr)
+        return nullptr;
+
+    // Player-mimetic name (First Last), same as spawnSimPlayer.
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    NameManager* nm = zoneServer != nullptr ? zoneServer->getNameManager() : nullptr;
+    if (nm != nullptr) {
+        String name = nm->makeCreatureName(0, creature->getSpecies());
+        if (!name.isEmpty())
+            agent->setCustomObjectName(name, true);
+    }
+
+    static const uint32 imperialHash = String("imperial").hashCode();
+    static const uint32 rebelHash = String("rebel").hashCode();
+
+    Locker lock(agent);
+
+    agent->setDespawnOnNoPlayerInRange(false);
+    agent->setFaction(imperial ? imperialHash : rebelHash);
+    // Permanently OVERT so opposing overt players always con/dot RED. We flag
+    // bots as ObjectFlag::PLAYER (player-dot), so the client runs them through
+    // the player-vs-player attackability path, which needs OVERT-vs-OVERT
+    // (CreatureObjectImplementation isAttackableBy); setting only the OVERT
+    // bitmask bit but leaving factionStatus=ONLEAVE made them attackable only
+    // transiently (in combat/TEF), so the dot flickered red<->blue as combat
+    // state churned. Mirrors GCW base defenders (BuildingObject :1728).
+    agent->setFactionStatus(FactionStatus::OVERT);
+    applySimNpcPresentation(agent, ObjectFlag::ATTACKABLE | ObjectFlag::OVERT);
+
+    agent->writeBlackboard("simAlwaysActive", true);
+    agent->setSimAlwaysActive(true);
+    agent->setSimPlayerBot(true);
+
+    if (leader) {
+        // The leader is controller-driven: the simPvp custom map no-ops the
+        // IDLE tree (kills GeneratePatrol wander) while the default combat
+        // slots still apply (per-slot fallback in AiMap::getTemplate).
+        agent->setCreatureBitmask(0);
+        agent->setCustomAiMap(String("simPvp").hashCode());
+        agent->setAITemplate();
+        agent->clearPatrolPoints();
+    } else {
+        // Members use the engine-native GCW patrol follower pattern: FOLLOW
+        // bitmask trees own their movement (no dual-driver by construction).
+        agent->setCreatureBitmask(ObjectFlag::FOLLOW);
+        agent->setCustomAiMap(0);
+        agent->setAITemplate();
+        agent->clearPatrolPoints();
+
+        Vector3 formationOffset;
+        formationOffset.setX(formationOffsetX);
+        formationOffset.setY(formationOffsetY);
+        agent->writeBlackboard("formationOffset", formationOffset);
+
+        if (leaderAgent != nullptr) {
+            Locker crossLocker(leaderAgent, agent);
+            agent->setFollowObject(leaderAgent);
+            agent->setMovementState(AiAgent::FOLLOWING);
+        }
+    }
+
+    return agent;
+}
+
+void SimPlayerManager::spawnPvpSquad(bool imperial, bool scout) {
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    if (zoneServer == nullptr || allShuttleports.size() == 0)
+        return;
+
+    const int squadSize = scout ? pvpScoutSquadSize : pvpSquadSize;
+
+    // Prefer a city that has no squad of this faction yet.
+    ShuttleportLocation loc;
+    bool picked = false;
+
+    // P.6.5a: with routed travel on, squads form up at their faction's
+    // staging city (owner: rebels Moenia, imperials Bestine) - players learn
+    // where their faction's squads muster. Squads disperse on first travel.
+    if (pvpRoutedTravelEnabled) {
+        const String& stagePlanet =
+            imperial ? pvpStagingImperialPlanet : pvpStagingRebelPlanet;
+        const String& stageCity =
+            imperial ? pvpStagingImperialCity : pvpStagingRebelCity;
+        int stageIdx = findShuttleportIndex(stagePlanet, stageCity);
+
+        if (stageIdx >= 0) {
+            loc = allShuttleports.get(stageIdx);
+            picked = true;
+        }
+    }
+
+    for (int tries = 0; tries < 10 && !picked; ++tries) {
+        if (!pickRandomShuttleport(loc))
+            return;
+
+        bool occupied = false;
+
+        {
+            Locker squadLock(&pvpSquadMutex);
+            for (int i = 0; i < pvpSquads.size(); ++i) {
+                const SimPvpSquad& squad = pvpSquads.get(i);
+                if (squad.imperial == imperial && squad.planet == loc.planet &&
+                        squad.city == loc.name) {
+                    occupied = true;
                     break;
                 }
             }
-            if (!found)
-                return;
         }
 
-        // 3) Spawn replacement
-        String tmpl = templateName;
-        if (tmpl.isEmpty())
-            tmpl = pickRandomTemplate(picked);
-#ifdef DEBUG_SIMPLAYER
-        info("Cycling PvP bot " + String::valueOf(oldOid) +
-             " from " + fromPlanet + ":" + fromLocation +
-             " -> " + newLoc.planet + ":" + newLoc.name +
-             " template=" + tmpl, true);
-#endif
-        spawnFromConfig(picked, newLoc, tmpl);
+        picked = !occupied;
+    }
 
-        // 4) Drop controller first
-        controllers.drop(oldOid);
+    Zone* zone = zoneServer->getZone(loc.planet);
+    if (zone == nullptr)
+        return;
 
-        // 5) Destroy old object via ZoneServer lookup
-        ZoneServer* zoneServer = ServerCore::getZoneServer();
-        if (zoneServer == nullptr)
+    float spawnZ = zone->getHeight(loc.spawn.getX(), loc.spawn.getY());
+    if (spawnZ == 0.0f && loc.spawn.getZ() != 0.0f)
+        spawnZ = loc.spawn.getZ();
+
+    float hangoutZ = zone->getHeight(loc.hangout.getX(), loc.hangout.getY());
+    if (hangoutZ == 0.0f && loc.hangout.getZ() != 0.0f)
+        hangoutZ = loc.hangout.getZ();
+
+    Vector3 spawnPos(loc.spawn.getX(), loc.spawn.getY(), spawnZ);
+    Vector3 hangoutPos(loc.hangout.getX(), loc.hangout.getY(), hangoutZ);
+
+    uint64 squadId = 0;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        squadId = nextPvpSquadId++;
+    }
+
+    Vector3 leaderPos(spawnPos.getX() + pvpSpawnJitter(),
+        spawnPos.getY() + pvpSpawnJitter(), spawnPos.getZ());
+
+    AiAgent* leaderAgent = spawnPvpBotAgent(zone, leaderPos,
+        pickPvpTemplate(imperial), imperial, true, nullptr, 0.f, 0.f);
+
+    if (leaderAgent == nullptr)
+        return;
+
+    SimPvpSquad squad;
+    squad.squadId = squadId;
+    squad.imperial = imperial;
+    squad.desiredSize = squadSize;
+    squad.scout = scout;
+    squad.leaderOid = leaderAgent->getObjectID();
+    squad.planet = loc.planet;
+    squad.city = loc.name;
+    squad.shuttlePos = spawnPos;
+    squad.hangoutPos = hangoutPos;
+    squad.formedAtMs = System::getMiliTime();
+
+    Reference<SimPvPController*> leaderCtrl =
+        new SimPvPController(leaderAgent, squadId, imperial);
+    leaderCtrl->setScoutRole(scout);
+
+    Vector<Reference<SimPvPMemberController*> > memberCtrls;
+
+    for (int j = 1; j < squadSize; ++j) {
+        // P.6.2c: fanned-out formation so members don't stack (see helper).
+        float xOffset = 0.f;
+        float yOffset = 0.f;
+        pvpFormationOffset(j, squadSize, xOffset, yOffset);
+
+        float memberX = spawnPos.getX() + xOffset + pvpSpawnJitter();
+        float memberY = spawnPos.getY() + yOffset + pvpSpawnJitter();
+        float memberZ = zone->getHeight(memberX, memberY);
+        if (memberZ == 0.0f)
+            memberZ = spawnPos.getZ();
+        Vector3 memberPos(memberX, memberY, memberZ);
+
+        AiAgent* memberAgent = spawnPvpBotAgent(zone, memberPos,
+            pickPvpTemplate(imperial), imperial, false, leaderAgent,
+            xOffset, yOffset);
+
+        if (memberAgent == nullptr)
+            continue;
+
+        Reference<SimPvPMemberController*> memberCtrl =
+            new SimPvPMemberController(memberAgent, squadId, imperial, leaderAgent);
+        memberCtrl->setScoutRole(scout);
+
+        squad.memberOids.add(memberAgent->getObjectID());
+        memberCtrls.add(memberCtrl);
+    }
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        pvpSquads.add(squad);
+    }
+
+    controllers.put(squad.leaderOid, leaderCtrl.get());
+    leaderAgent->activateAiBehavior(true);
+    leaderCtrl->beginCityLoop(loc.planet, loc.name, spawnPos, hangoutPos);
+
+    for (int i = 0; i < memberCtrls.size(); ++i) {
+        Reference<SimPvPMemberController*> memberCtrl = memberCtrls.get(i);
+        ManagedReference<AiAgent*> memberAgent = memberCtrl->getAgent();
+
+        if (memberAgent == nullptr)
+            continue;
+
+        controllers.put(memberAgent->getObjectID(), memberCtrl.get());
+        memberAgent->activateAiBehavior(true);
+        memberCtrl->startSimLoop();
+    }
+
+    info("SimPvpSquadSpawned squad=" + String::valueOf(squadId) +
+         " faction=" + (imperial ? String("imperial") : String("rebel")) +
+         " role=" + (scout ? String("scout") : String("patrol")) +
+         " size=" + String::valueOf(1 + squad.memberOids.size()) +
+         " city=" + loc.planet + ":" + loc.name, true);
+}
+
+void SimPlayerManager::onPvpSquadReadyToTravel(uint64 squadId) {
+    if (!enabled || !pvpEnabled)
+        return;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndex(squadId);
+
+        if (idx < 0)
             return;
 
-        ManagedReference<SceneObject*> obj = zoneServer->getObject(oldOid);
-        if (obj == nullptr)
+        SimPvpSquad& squad = pvpSquads.get(idx);
+
+        if (squad.reforming || squad.travelTaskActive)
             return;
 
-        ManagedReference<AiAgent*> oldAgent = cast<AiAgent*>(obj.get());
-        if (oldAgent == nullptr)
-            return;
+        squad.travelTaskActive = true;
+    }
 
-        bool oldAgentDeadOrIncap = false;
+    Reference<SimPvpShuttleWaitTask*> task = new SimPvpShuttleWaitTask(squadId, 0);
+    task->schedule(1000);
+}
+
+void SimPlayerManager::runPvpShuttleWaitTask(uint64 squadId, int attempts) {
+    if (!enabled)
+        return;
+
+    uint64 leaderOid = 0;
+    bool squadGone = false;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndex(squadId);
+
+        if (idx < 0 || pvpSquads.get(idx).reforming)
+            squadGone = true;
+        else
+            leaderOid = pvpSquads.get(idx).leaderOid;
+    }
+
+    auto clearTravelFlag = [this, squadId]() {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndex(squadId);
+        if (idx >= 0)
+            pvpSquads.get(idx).travelTaskActive = false;
+    };
+
+    if (squadGone || !pvpEnabled) {
+        clearTravelFlag();
+        return;
+    }
+
+    Reference<SimPlayerController*> ctrl;
+    if (controllers.contains(leaderOid))
+        ctrl = controllers.get(leaderOid);
+
+    ManagedReference<AiAgent*> leaderAgent =
+        ctrl == nullptr ? nullptr : ctrl->getAgent();
+
+    if (leaderAgent == nullptr || leaderAgent->isDead()) {
+        // Promotion (maintenance) installs a new leader, which re-requests
+        // travel when it reaches the pad again.
+        clearTravelFlag();
+        return;
+    }
+
+    bool boardNow = false;
+
+    if (attempts >= pvpShuttleWaitMaxAttempts) {
+        // Same never-wedge-at-a-port contract as P.4.5b: board anyway.
+        boardNow = true;
 
         {
-            Locker locker(oldAgent);
-            oldAgentDeadOrIncap = oldAgent->isDead() || oldAgent->isIncapacitated();
+            Locker squadLock(&pvpSquadMutex);
+            pvpBoardAnywayTotal++;
+        }
+    } else if (!leaderAgent->isInCombat() && isNearestShuttleBoardable(leaderAgent)) {
+        boardNow = true;
+    }
+
+    if (boardNow) {
+        boardPvpSquad(squadId);
+        return;
+    }
+
+    Reference<SimPvpShuttleWaitTask*> task =
+        new SimPvpShuttleWaitTask(squadId, attempts + 1);
+    task->schedule(pvpShuttleWaitIntervalSeconds * 1000);
+}
+
+// --- P.6.5a routed travel ----------------------------------------------------
+
+int SimPlayerManager::findShuttleportIndex(const String& planet, const String& city) const {
+    for (int i = 0; i < allShuttleports.size(); ++i) {
+        const ShuttleportLocation& loc = allShuttleports.get(i);
+
+        if (loc.planet == planet && loc.name == city)
+            return i;
+    }
+
+    return -1;
+}
+
+// Lowercase config city names use underscores ("mos_eisley") - make them
+// speakable for the route callouts.
+static String prettyPvpCityName(const String& name) {
+    String pretty = name;
+    return pretty.replaceAll("_", " ");
+}
+
+bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
+        String& summaryOut, bool& convergenceOut) {
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+
+    if (zoneServer == nullptr || allShuttleports.size() < 2)
+        return false;
+
+    const int cityCount = allShuttleports.size();
+
+    // 1) Resolve every routed city's starport pad + planet connectivity
+    //    OUTSIDE the squad mutex (zone / planet-manager lookups only; no
+    //    agent locks anywhere in here).
+    Vector<Vector3> pads;          // per city: starport arrival position
+    Vector<bool> routable;         // has a resolvable starport point
+
+    for (int i = 0; i < cityCount; ++i) {
+        const ShuttleportLocation& loc = allShuttleports.get(i);
+
+        Vector3 pad = loc.spawn;
+        bool ok = !loc.starportPoint.isEmpty();
+
+        if (ok) {
+            Zone* zone = zoneServer->getZone(loc.planet);
+            PlanetManager* planetManager =
+                zone == nullptr ? nullptr : zone->getPlanetManager();
+            Reference<PlanetTravelPoint*> point = planetManager == nullptr ?
+                nullptr : planetManager->getPlanetTravelPoint(loc.starportPoint);
+
+            if (point != nullptr) {
+                pad.setX(point->getArrivalPositionX());
+                pad.setY(point->getArrivalPositionY());
+                pad.setZ(point->getArrivalPositionZ());
+            } else {
+                // Config typo / point missing: keep the city reachable at its
+                // configured pad rather than dropping it from the graph.
+                info("SimPvpRoute starportResolveFailed city=" + loc.planet +
+                     ":" + loc.name + " point=\"" + loc.starportPoint + "\"", true);
+            }
         }
 
-        if (oldAgentDeadOrIncap) {
-#ifdef DEBUG_SIMPLAYER
-            info("cyclePvPBot: old bot already dead/incap; destroying oldOid=" + String::valueOf(oldOid), true);
-#endif
-            oldAgent->destroyObjectFromWorld(true);
-            oldAgent->destroyObjectFromDatabase(true);
+        pads.add(pad);
+        routable.add(ok);
+    }
+
+    // City-to-city adjacency: same planet = intra-planet ticket (always
+    // permitted); cross-planet = both starports + a fare-matrix route (the
+    // same truth the player travel terminal shows).
+    Vector<Vector<bool> > adjacency;
+
+    for (int i = 0; i < cityCount; ++i) {
+        Vector<bool> row;
+
+        for (int j = 0; j < cityCount; ++j) {
+            bool connected = false;
+
+            if (i != j && routable.get(i) && routable.get(j)) {
+                const ShuttleportLocation& a = allShuttleports.get(i);
+                const ShuttleportLocation& b = allShuttleports.get(j);
+
+                if (a.planet == b.planet) {
+                    connected = true;
+                } else {
+                    Zone* zone = zoneServer->getZone(a.planet);
+                    PlanetManager* planetManager =
+                        zone == nullptr ? nullptr : zone->getPlanetManager();
+                    connected = planetManager != nullptr &&
+                        planetManager->getTravelFare(a.planet, b.planet) > 0;
+                }
+            }
+
+            row.add(connected);
+        }
+
+        adjacency.add(row);
+    }
+
+    int fromIdx = findShuttleportIndex(snapshot.planet, snapshot.city);
+
+    if (fromIdx < 0 || !routable.get(fromIdx))
+        return false;
+
+    // 2) Pick the destination + BFS + store, under the squad mutex (occupancy
+    //    and convergence live there).
+    Locker squadLock(&pvpSquadMutex);
+
+    int idx = findPvpSquadIndex(squadId);
+    if (idx < 0)
+        return false;
+
+    SimPvpSquad& squad = pvpSquads.get(idx);
+
+    int destIdx = -1;
+    convergenceOut = false;
+
+    // An unexpired convergence stamp beats the random pick - the squad
+    // travels to the reported contact's city. Consumed (cleared) either way.
+    if (!squad.convergePlanet.isEmpty()) {
+        if (System::getMiliTime() < squad.convergeExpiresAtMs) {
+            int convergeIdx = findShuttleportIndex(squad.convergePlanet,
+                squad.convergeCity);
+
+            if (convergeIdx >= 0 && convergeIdx != fromIdx &&
+                    routable.get(convergeIdx)) {
+                destIdx = convergeIdx;
+                convergenceOut = true;
+            }
+        }
+
+        squad.convergePlanet = "";
+        squad.convergeCity = "";
+        squad.convergeExpiresAtMs = 0;
+    }
+
+    // Spread-out random pick: different city, prefer no same-faction squad
+    // there, and bias toward the main PvP planets (off-main cities such as
+    // restuss are accepted offMainPlanetChancePct of the time).
+    for (int tries = 0; destIdx < 0 && tries < 20; ++tries) {
+        int candidate = System::random(cityCount - 1);
+
+        if (candidate == fromIdx || !routable.get(candidate))
+            continue;
+
+        const ShuttleportLocation& loc = allShuttleports.get(candidate);
+
+        bool mainPlanet = pvpTravelMainPlanets.size() == 0;
+        for (int i = 0; i < pvpTravelMainPlanets.size() && !mainPlanet; ++i)
+            mainPlanet = pvpTravelMainPlanets.get(i) == loc.planet;
+
+        if (!mainPlanet && System::random(99) >= pvpTravelOffMainChancePct)
+            continue;
+
+        bool occupied = false;
+
+        for (int i = 0; i < pvpSquads.size(); ++i) {
+            const SimPvpSquad& other = pvpSquads.get(i);
+
+            if (other.squadId != squadId && other.imperial == snapshot.imperial &&
+                    other.planet == loc.planet && other.city == loc.name) {
+                occupied = true;
+                break;
+            }
+        }
+
+        if (!occupied)
+            destIdx = candidate;
+    }
+
+    // Last resort: any routable city that isn't the current one.
+    for (int tries = 0; destIdx < 0 && tries < 20; ++tries) {
+        int candidate = System::random(cityCount - 1);
+
+        if (candidate != fromIdx && routable.get(candidate))
+            destIdx = candidate;
+    }
+
+    if (destIdx < 0)
+        return false;
+
+    // 3) BFS shortest-hop route over the adjacency (city counts are tiny).
+    Vector<int> previous;
+    Vector<bool> visited;
+
+    for (int i = 0; i < cityCount; ++i) {
+        previous.add(-1);
+        visited.add(false);
+    }
+
+    Vector<int> frontier;
+    frontier.add(fromIdx);
+    visited.setElementAt(fromIdx, true);
+
+    for (int head = 0; head < frontier.size() && !visited.get(destIdx); ++head) {
+        int current = frontier.get(head);
+
+        for (int next = 0; next < cityCount; ++next) {
+            if (visited.get(next) || !adjacency.get(current).get(next))
+                continue;
+
+            visited.setElementAt(next, true);
+            previous.setElementAt(next, current);
+            frontier.add(next);
+        }
+    }
+
+    if (!visited.get(destIdx))
+        return false;
+
+    Vector<int> path;   // destIdx back to fromIdx, then reversed
+    for (int walk = destIdx; walk != -1; walk = previous.get(walk))
+        path.add(walk);
+
+    int legCount = path.size() - 1;
+
+    if (legCount < 1 || legCount > pvpTravelMaxLegsPerRoute)
+        return false;
+
+    squad.pendingRoute.removeAll();
+
+    String summary = legCount > 1 ? "Route: " : "Next stop: ";
+
+    for (int legIndex = 0; legIndex < legCount; ++legIndex) {
+        int cityIdx = path.get(path.size() - 2 - legIndex);
+        int prevIdx = path.get(path.size() - 1 - legIndex);
+        const ShuttleportLocation& loc = allShuttleports.get(cityIdx);
+
+        PvpTravelLeg leg;
+        leg.destPlanet = loc.planet;
+        leg.destCity = loc.name;
+        leg.arrivalPos = pads.get(cityIdx);
+        leg.interplanetary =
+            allShuttleports.get(prevIdx).planet != loc.planet;
+        leg.finalLeg = legIndex == legCount - 1;
+        squad.pendingRoute.add(leg);
+
+        if (legIndex > 0)
+            summary = summary + ", then ";
+        summary = summary + prettyPvpCityName(loc.name) +
+            " (" + loc.planet + ")";
+    }
+
+    summary = summary + ".";
+
+    const ShuttleportLocation& destLoc = allShuttleports.get(destIdx);
+    squad.routeDestPlanet = destLoc.planet;
+    squad.routeDestCity = destLoc.name;
+    squad.routeLegsTotal = legCount;
+
+    pvpRoutesPlannedTotal++;
+    if (legCount > 1)
+        pvpRouteHopRoutesTotal++;
+
+    summaryOut = summary;
+
+    info("SimPvpRoutePlanned squad=" + String::valueOf(squadId) +
+         " from=" + snapshot.planet + ":" + snapshot.city +
+         " dest=" + destLoc.planet + ":" + destLoc.name +
+         " legs=" + String::valueOf(legCount) +
+         " convergence=" + String::valueOf(convergenceOut), true);
+
+    return true;
+}
+
+bool SimPlayerManager::popNextPvpRouteLeg(uint64 squadId, PvpTravelLeg& legOut,
+        int& remainingOut) {
+    Locker squadLock(&pvpSquadMutex);
+
+    int idx = findPvpSquadIndex(squadId);
+    if (idx < 0)
+        return false;
+
+    SimPvpSquad& squad = pvpSquads.get(idx);
+
+    // A fresh unexpired convergence stamp overrides the rest of a planned
+    // route - drop it so the caller replans straight to the contact.
+    if (!squad.convergePlanet.isEmpty() &&
+            System::getMiliTime() < squad.convergeExpiresAtMs &&
+            squad.pendingRoute.size() > 0) {
+        squad.pendingRoute.removeAll();
+        return false;
+    }
+
+    if (squad.pendingRoute.size() == 0)
+        return false;
+
+    legOut = squad.pendingRoute.get(0);
+    squad.pendingRoute.remove(0);
+    remainingOut = squad.pendingRoute.size();
+
+    pvpRouteLegsExecutedTotal++;
+    if (!legOut.finalLeg)
+        pvpTransitStopsTotal++;
+
+    if (legOut.finalLeg) {
+        squad.routeDestPlanet = "";
+        squad.routeDestCity = "";
+    }
+
+    return true;
+}
+
+void SimPlayerManager::boardPvpSquad(uint64 squadId) {
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+
+    SimPvpSquad snapshot;
+    bool found = false;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndex(squadId);
+
+        if (idx >= 0) {
+            snapshot = pvpSquads.get(idx);
+            found = true;
+        }
+    }
+
+    auto clearTravelFlag = [this, squadId]() {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndex(squadId);
+        if (idx >= 0)
+            pvpSquads.get(idx).travelTaskActive = false;
+    };
+
+    if (!found || snapshot.reforming || zoneServer == nullptr) {
+        clearTravelFlag();
+        return;
+    }
+
+    ShuttleportLocation dest;
+    bool picked = false;
+    bool convergence = false;
+
+    // P.6.5a routed travel: consume the next planned leg, planning a fresh
+    // route first when none is pending (an unexpired convergence stamp is
+    // consumed as the route destination inside planPvpRoute). Falls through
+    // to the legacy direct pick when disabled or planning fails.
+    bool routedLegActive = false;
+    bool routedTransit = false;
+    int routedLegsRemaining = 0;
+
+    if (pvpRoutedTravelEnabled) {
+        PvpTravelLeg leg;
+        bool haveLeg = popNextPvpRouteLeg(squadId, leg, routedLegsRemaining);
+
+        if (!haveLeg) {
+            String routeSummary;
+
+            if (planPvpRoute(squadId, snapshot, routeSummary, convergence)) {
+                // The route callout - players hear exactly where the squad is
+                // heading and can buy the same tickets to follow.
+                announcePvpEvent(squadId, PVP_ANNOUNCE_MOVEOUT, routeSummary);
+                haveLeg = popNextPvpRouteLeg(squadId, leg, routedLegsRemaining);
+            }
+        }
+
+        if (haveLeg) {
+            dest.planet = leg.destPlanet;
+            dest.name = leg.destCity;
+            dest.spawn = leg.arrivalPos;
+            dest.hangout = leg.arrivalPos;
+
+            // Final leg: loiter at the destination city's configured hangout;
+            // transit stop: wait at the pad for the connecting ship.
+            routedTransit = !leg.finalLeg;
+
+            if (!routedTransit) {
+                int cityIdx = findShuttleportIndex(dest.planet, dest.name);
+
+                if (cityIdx >= 0)
+                    dest.hangout = allShuttleports.get(cityIdx).hangout;
+            }
+
+            routedLegActive = true;
+            picked = true;
+        } else {
+            Locker squadLock(&pvpSquadMutex);
+            pvpRouteFallbacksTotal++;
+        }
+    }
+
+    // P.6.2: an unexpired pending convergence destination (set by
+    // dispatchPvpConvergence) beats the random pick - the squad travels to
+    // the reported contact's city. Consumed (cleared) either way so a stale
+    // entry can never redirect a later, unrelated travel. (With routed travel
+    // active this path only runs as the fallback - planPvpRoute already
+    // consumed any stamp.)
+    if (!picked) {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndex(squadId);
+
+        if (idx >= 0) {
+            SimPvpSquad& squad = pvpSquads.get(idx);
+
+            if (!squad.convergePlanet.isEmpty() &&
+                    System::getMiliTime() < squad.convergeExpiresAtMs) {
+                for (int i = 0; i < allShuttleports.size(); ++i) {
+                    const ShuttleportLocation& loc = allShuttleports.get(i);
+
+                    if (loc.planet == squad.convergePlanet &&
+                            loc.name == squad.convergeCity) {
+                        dest = loc;
+                        picked = true;
+                        convergence = true;
+                        break;
+                    }
+                }
+            }
+
+            squad.convergePlanet = "";
+            squad.convergeCity = "";
+            squad.convergeExpiresAtMs = 0;
+        }
+    }
+
+    // Otherwise pick a different city, preferring one with no same-faction
+    // squad so squads spread out (repeats allowed only as a last resort).
+    for (int tries = 0; !picked && tries < 10; ++tries) {
+        if (!pickRandomShuttleport(dest)) {
+            clearTravelFlag();
             return;
         }
-#ifdef DEBUG_SIMPLAYER
-        info("cyclePvPBot: destroying oldOid=" + String::valueOf(oldOid), true);
-#endif
-        oldAgent->destroyObjectFromWorld(true);
-#ifdef DEBUG_SIMPLAYER
-        info("cyclePvPBot: destroyObjectFromWorld done oldOid=" + String::valueOf(oldOid), true);
-#endif
-        oldAgent->destroyObjectFromDatabase(true);
-#ifdef DEBUG_SIMPLAYER
-        info("cyclePvPBot: destroyObjectFromDatabase done oldOid=" + String::valueOf(oldOid), true);
-#endif
-    }, "CyclePvPBot", 0);
+
+        if (dest.planet == snapshot.planet && dest.name == snapshot.city)
+            continue;
+
+        bool occupied = false;
+
+        {
+            Locker squadLock(&pvpSquadMutex);
+            for (int i = 0; i < pvpSquads.size(); ++i) {
+                const SimPvpSquad& other = pvpSquads.get(i);
+                if (other.squadId != squadId &&
+                        other.imperial == snapshot.imperial &&
+                        other.planet == dest.planet && other.city == dest.name) {
+                    occupied = true;
+                    break;
+                }
+            }
+        }
+
+        if (!occupied) {
+            picked = true;
+            break;
+        }
+    }
+
+    if (!picked) {
+        // Second pass: accept any city that isn't the current one.
+        for (int tries = 0; tries < 10 && !picked; ++tries) {
+            if (!pickRandomShuttleport(dest)) {
+                clearTravelFlag();
+                return;
+            }
+
+            picked = !(dest.planet == snapshot.planet && dest.name == snapshot.city);
+        }
+
+        if (!picked && !pickRandomShuttleport(dest)) {
+            clearTravelFlag();
+            return;
+        }
+    }
+
+    Zone* destZone = zoneServer->getZone(dest.planet);
+
+    if (destZone == nullptr) {
+        clearTravelFlag();
+        return;
+    }
+
+    float spawnZ = destZone->getHeight(dest.spawn.getX(), dest.spawn.getY());
+    if (spawnZ == 0.0f && dest.spawn.getZ() != 0.0f)
+        spawnZ = dest.spawn.getZ();
+
+    float hangoutZ = destZone->getHeight(dest.hangout.getX(), dest.hangout.getY());
+    if (hangoutZ == 0.0f && dest.hangout.getZ() != 0.0f)
+        hangoutZ = dest.hangout.getZ();
+
+    Vector3 spawnPos(dest.spawn.getX(), dest.spawn.getY(), spawnZ);
+    Vector3 hangoutPos(dest.hangout.getX(), dest.hangout.getY(), hangoutZ);
+
+    Reference<SimPlayerController*> ctrl;
+    if (controllers.contains(snapshot.leaderOid))
+        ctrl = controllers.get(snapshot.leaderOid);
+
+    SimPvPController* leaderCtrl =
+        ctrl == nullptr ? nullptr : dynamic_cast<SimPvPController*>(ctrl.get());
+    ManagedReference<AiAgent*> leaderAgent =
+        ctrl == nullptr ? nullptr : ctrl->getAgent();
+
+    if (leaderCtrl == nullptr || leaderAgent == nullptr) {
+        clearTravelFlag();
+        return;
+    }
+
+    // P.6.1b: invalidate every in-flight controller task and forget the old
+    // route BEFORE repositioning - a chain-thread resume or a late path
+    // result carrying the old city's coordinates must not survive boarding
+    // (observed live: stale path won a generation race and the leader
+    // sprinted toward the previous city's pad on the new planet).
+    leaderCtrl->prepareForRelocation("boarding");
+
+    {
+        Locker locker(leaderAgent);
+
+        if (leaderAgent->isDead()) {
+            clearTravelFlag();
+            return;
+        }
+
+        // P.6.1a/d: hard-stop any stale movement BEFORE repositioning. OBLIVIOUS
+        // first (clearPatrolPoints saves the queue while PATROLLING), then clear
+        // the queue, the saved queue, AND the agent's cached A* route
+        // (currentFoundPath). The last one is the real culprit: findNextPosition
+        // reuses currentFoundPath while PATROLLING without re-checking the
+        // target, so without clearing it a boarded bot walks the OLD city's
+        // cached route on the new planet (see SimPlayerController::onPathFound).
+        leaderAgent->setMovementState(AiAgent::OBLIVIOUS);
+        leaderAgent->clearPatrolPoints();
+        leaderAgent->clearSavedPatrolPoints();
+        leaderAgent->clearCurrentPath();
+
+        // "Board the shuttle": switchZone params are (terrain, X, Z=height,
+        // Y=north, parentID=0 outdoor) - the same safe reposition as P.4.5;
+        // the outdoor arrival never enters the un-navmeshed port interior.
+        leaderAgent->switchZone(dest.planet,
+            spawnPos.getX() + pvpSpawnJitter(), spawnPos.getZ(),
+            spawnPos.getY() + pvpSpawnJitter(), 0);
+        leaderAgent->setHomeLocation(spawnPos.getX(), spawnPos.getZ(),
+            spawnPos.getY(), nullptr);
+    }
+
+    // Board the (alive) members.
+    int boardedMembers = 0;
+    Vector<uint64> aliveMemberOids;
+
+    for (int i = 0; i < snapshot.memberOids.size(); ++i) {
+        uint64 memberOid = snapshot.memberOids.get(i);
+
+        Reference<SimPlayerController*> memberRef;
+        if (controllers.contains(memberOid))
+            memberRef = controllers.get(memberOid);
+
+        ManagedReference<AiAgent*> memberAgent =
+            memberRef == nullptr ? nullptr : memberRef->getAgent();
+
+        if (memberAgent == nullptr || memberAgent->isDead())
+            continue;
+
+        {
+            Locker locker(memberAgent);
+            // Same stale-movement stop as the leader; assertFollow() below
+            // puts the member back into FOLLOWING on the new planet.
+            memberAgent->setMovementState(AiAgent::OBLIVIOUS);
+            memberAgent->clearPatrolPoints();
+            memberAgent->clearSavedPatrolPoints();
+            memberAgent->clearCurrentPath();
+            memberAgent->switchZone(dest.planet,
+                spawnPos.getX() + pvpSpawnJitter(), spawnPos.getZ(),
+                spawnPos.getY() + pvpSpawnJitter(), 0);
+            memberAgent->setHomeLocation(spawnPos.getX(), spawnPos.getZ(),
+                spawnPos.getY(), nullptr);
+        }
+
+        aliveMemberOids.add(memberOid);
+        boardedMembers++;
+    }
+
+    // Refill dead slots at the destination pad ("a new player shuttles in").
+    int replacements = snapshot.desiredSize - 1 - boardedMembers;
+    if (replacements < 0)
+        replacements = 0;
+
+    Vector<uint64> newMemberOids;
+    Vector<Reference<SimPvPMemberController*> > newMemberCtrls;
+
+    for (int k = 0; k < replacements; ++k) {
+        int j = boardedMembers + k + 1;
+        // P.6.2c: fanned-out formation so members don't stack (see helper).
+        float xOffset = 0.f;
+        float yOffset = 0.f;
+        pvpFormationOffset(j, snapshot.desiredSize, xOffset, yOffset);
+
+        float memberX = spawnPos.getX() + xOffset + pvpSpawnJitter();
+        float memberY = spawnPos.getY() + yOffset + pvpSpawnJitter();
+        float memberZ = destZone->getHeight(memberX, memberY);
+        if (memberZ == 0.0f)
+            memberZ = spawnPos.getZ();
+        Vector3 memberPos(memberX, memberY, memberZ);
+
+        AiAgent* memberAgent = spawnPvpBotAgent(destZone, memberPos,
+            pickPvpTemplate(snapshot.imperial), snapshot.imperial, false,
+            leaderAgent, xOffset, yOffset);
+
+        if (memberAgent == nullptr)
+            continue;
+
+        Reference<SimPvPMemberController*> memberCtrl = new SimPvPMemberController(
+            memberAgent, squadId, snapshot.imperial, leaderAgent);
+        memberCtrl->setScoutRole(snapshot.scout);
+
+        newMemberOids.add(memberAgent->getObjectID());
+        newMemberCtrls.add(memberCtrl);
+    }
+
+    // Publish the new roster/city, then restart the loop on the new planet.
+    {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndex(squadId);
+
+        if (idx >= 0) {
+            SimPvpSquad& squad = pvpSquads.get(idx);
+            squad.planet = dest.planet;
+            squad.city = dest.name;
+            squad.shuttlePos = spawnPos;
+            squad.hangoutPos = hangoutPos;
+            squad.memberOids = aliveMemberOids;
+            for (int i = 0; i < newMemberOids.size(); ++i)
+                squad.memberOids.add(newMemberOids.get(i));
+            squad.pendingReplacements = 0;
+            squad.travelTaskActive = false;
+            squad.travels++;
+            squad.lastTravelMs = System::getMiliTime();
+            pvpTravelsTotal++;
+        }
+    }
+
+    for (int i = 0; i < newMemberCtrls.size(); ++i) {
+        Reference<SimPvPMemberController*> memberCtrl = newMemberCtrls.get(i);
+        ManagedReference<AiAgent*> memberAgent = memberCtrl->getAgent();
+
+        if (memberAgent == nullptr)
+            continue;
+
+        controllers.put(memberAgent->getObjectID(), memberCtrl.get());
+        memberAgent->activateAiBehavior(true);
+        memberCtrl->startSimLoop();
+    }
+
+    if (routedTransit) {
+        // P.6.5a transit stop: brief dwell at the connection pad, then the
+        // phase machine re-enters AWAITING_SHUTTLE and boards the next leg.
+        int dwellSeconds = pvpTravelTransitDwellMinSeconds;
+
+        if (pvpTravelTransitDwellMaxSeconds > dwellSeconds)
+            dwellSeconds += System::random(
+                pvpTravelTransitDwellMaxSeconds - dwellSeconds);
+
+        leaderCtrl->beginTransitStop(dest.planet, dest.name, spawnPos,
+            dwellSeconds);
+    } else {
+        leaderCtrl->beginCityLoop(dest.planet, dest.name, spawnPos, hangoutPos);
+    }
+
+    // Re-assert follows after the zone change.
+    for (int i = 0; i < aliveMemberOids.size(); ++i) {
+        uint64 memberOid = aliveMemberOids.get(i);
+
+        Reference<SimPlayerController*> memberRef;
+        if (controllers.contains(memberOid))
+            memberRef = controllers.get(memberOid);
+
+        SimPvPMemberController* memberCtrl = memberRef == nullptr ? nullptr :
+            dynamic_cast<SimPvPMemberController*>(memberRef.get());
+
+        if (memberCtrl != nullptr)
+            memberCtrl->assertFollow();
+    }
+
+    info("SimPvpSquadTraveled squad=" + String::valueOf(squadId) +
+         " faction=" + (snapshot.imperial ? String("imperial") : String("rebel")) +
+         " from=" + snapshot.planet + ":" + snapshot.city +
+         " to=" + dest.planet + ":" + dest.name +
+         " boardedMembers=" + String::valueOf(boardedMembers) +
+         " replacements=" + String::valueOf(newMemberOids.size()) +
+         " convergence=" + String::valueOf(convergence) +
+         " routed=" + String::valueOf(routedLegActive) +
+         " transit=" + String::valueOf(routedTransit) +
+         " legsRemaining=" + String::valueOf(routedLegsRemaining), true);
+}
+
+void SimPlayerManager::onPvpBotDied(uint64 squadId, uint64 oid) {
+    bool wasLeader = false;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndex(squadId);
+
+        if (idx >= 0) {
+            SimPvpSquad& squad = pvpSquads.get(idx);
+            squad.deaths++;
+            pvpDeathsTotal++;
+
+            if (squad.leaderOid == oid) {
+                squad.leaderDeadPendingPromotion = true;
+                wasLeader = true;
+            } else {
+                for (int i = 0; i < squad.memberOids.size(); ++i) {
+                    if (squad.memberOids.get(i) == oid) {
+                        squad.memberOids.remove(i);
+                        break;
+                    }
+                }
+                squad.pendingReplacements++;
+            }
+        }
+    }
+
+    schedulePvpBotCleanup(oid, pvpCorpseCleanupDelaySeconds);
+
+    info("SimPvpBotDied squad=" + String::valueOf(squadId) +
+         " oid=" + String::valueOf(oid) +
+         " role=" + (wasLeader ? String("leader") : String("member")), true);
+}
+
+void SimPlayerManager::schedulePvpBotCleanup(uint64 oid, int delaySeconds) {
+    Reference<SimPvpBotCleanupTask*> task = new SimPvpBotCleanupTask(oid);
+    task->schedule(delaySeconds * 1000);
+}
+
+void SimPlayerManager::runPvpBotCleanupTask(uint64 oid) {
+    controllers.drop(oid);
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    if (zoneServer == nullptr)
+        return;
+
+    ManagedReference<SceneObject*> obj = zoneServer->getObject(oid);
+    ManagedReference<AiAgent*> agent = cast<AiAgent*>(obj.get());
+
+    if (agent == nullptr)
+        return;
+
+    {
+        Locker locker(agent);
+
+        // Never destroy a live bot from a stale cleanup.
+        if (!agent->isDead() && !agent->isIncapacitated())
+            return;
+    }
+
+    agent->destroyObjectFromWorld(true);
+    agent->destroyObjectFromDatabase(true);
+}
+
+void SimPlayerManager::recordPvpEngagement(uint64 squadId, bool targetWasPlayer) {
+    Locker squadLock(&pvpSquadMutex);
+
+    int idx = findPvpSquadIndex(squadId);
+    if (idx >= 0)
+        pvpSquads.get(idx).engagements++;
+
+    if (targetWasPlayer) {
+        pvpPlayerEngagementsTotal++;
+
+        // P.6.2: PvP against a real PLAYER broke out - any squad calls that
+        // in for its faction so a patrol converges ("the gank"). Bot-vs-bot
+        // engagements deliberately do NOT auto-report (only scouts report
+        // those) to keep convergence churn down.
+        if (pvpScoutsEnabled && idx >= 0)
+            notePvpContactLocked(pvpSquads.get(idx), true);
+    } else {
+        pvpBotEngagementsTotal++;
+    }
+}
+
+// Caller holds pvpSquadMutex.
+void SimPlayerManager::notePvpContactLocked(const SimPvpSquad& squad,
+        bool targetWasPlayer) {
+    SimPvpFactionContact& contact =
+        squad.imperial ? pvpImperialContact : pvpRebelContact;
+
+    contact.valid = true;
+    contact.planet = squad.planet;
+    contact.city = squad.city;
+    contact.reportedAtMs = System::getMiliTime();
+    contact.targetWasPlayer = targetWasPlayer;
+    contact.reporterSquadId = squad.squadId;
+    contact.reports++;
+    pvpContactsReportedTotal++;
+
+    info("SimPvpContactReported squad=" + String::valueOf(squad.squadId) +
+         " faction=" + (squad.imperial ? String("imperial") : String("rebel")) +
+         " city=" + squad.planet + ":" + squad.city +
+         " targetWasPlayer=" + String::valueOf(targetWasPlayer), true);
+}
+
+void SimPlayerManager::reportPvpContact(uint64 squadId, bool targetWasPlayer) {
+    if (!enabled || !pvpEnabled || !pvpScoutsEnabled)
+        return;
+
+    Locker squadLock(&pvpSquadMutex);
+
+    int idx = findPvpSquadIndex(squadId);
+    if (idx < 0)
+        return;
+
+    notePvpContactLocked(pvpSquads.get(idx), targetWasPlayer);
+}
+
+// P.6.3a: faction-flavored line pools. Plain custom text (no client stf to
+// add), picked at random. Kept short and in-character so nearby players read
+// the PvP as live squad chatter.
+static String pickPvpAnnounceLine(bool imperial, int eventType) {
+    static const char* imperialArrival[] = {
+        "Imperial checkpoint established. Report any Rebel activity.",
+        "Holding the starport. Keep your eyes open.",
+        "Securing the sector. Stay sharp, troopers." };
+    static const char* rebelArrival[] = {
+        "Setting up at the starport. Watch for Imperials.",
+        "Rebels holding here. Keep your eyes peeled.",
+        "We've got the starport. Stay frosty." };
+    static const char* imperialDeparture[] = {
+        "Sector clear. Moving to the next post.",
+        "No Rebels here. Back to the shuttle.",
+        "Redeploying. Nothing to hold here." };
+    static const char* rebelDeparture[] = {
+        "All quiet. Let's move out.",
+        "Nothing doing here. On to the next stop.",
+        "Packing it up - heading for the shuttle." };
+    static const char* imperialContact[] = {
+        "Rebel scum spotted! Engage!",
+        "Contact! Rebels in the open!",
+        "We've got Rebels - take them down!" };
+    static const char* rebelContact[] = {
+        "Imperials! Open fire!",
+        "Contact - stormtroopers ahead!",
+        "Imps spotted! Light 'em up!" };
+    static const char* imperialConverge[] = {
+        "Reinforcing the line - moving to engage!",
+        "Imperials converging. Hold them until we arrive.",
+        "On our way to the fight!" };
+    static const char* rebelConverge[] = {
+        "Rallying to the fight - hang on!",
+        "Rebels inbound! We're coming!",
+        "Moving to reinforce - hold the line!" };
+    // P.6.5a: boarding with a planned route (the route detail is appended so
+    // players know exactly where the squad is heading and can follow).
+    static const char* imperialMoveout[] = {
+        "Transport's inbound - we're shipping out.",
+        "New orders. Pack it up, we're relocating.",
+        "Squad, to the pad. We move now." };
+    static const char* rebelMoveout[] = {
+        "Shuttle's here - time to move.",
+        "We're relocating. On me, to the pad.",
+        "New hunting ground. Let's ride." };
+
+    const char** pool = nullptr;
+    switch (eventType) {
+    case SimPlayerManager::PVP_ANNOUNCE_ARRIVAL:
+        pool = imperial ? imperialArrival : rebelArrival; break;
+    case SimPlayerManager::PVP_ANNOUNCE_DEPARTURE:
+        pool = imperial ? imperialDeparture : rebelDeparture; break;
+    case SimPlayerManager::PVP_ANNOUNCE_CONTACT:
+        pool = imperial ? imperialContact : rebelContact; break;
+    case SimPlayerManager::PVP_ANNOUNCE_CONVERGE:
+        pool = imperial ? imperialConverge : rebelConverge; break;
+    case SimPlayerManager::PVP_ANNOUNCE_MOVEOUT:
+        pool = imperial ? imperialMoveout : rebelMoveout; break;
+    default:
+        return "";
+    }
+
+    return pool[System::random(2)]; // 3 lines each (0..2)
+}
+
+void SimPlayerManager::announcePvpEvent(uint64 squadId, int eventType,
+        const String& detail) {
+    if (!enabled || !pvpEnabled || !pvpCommsSpatialEnabled)
+        return;
+
+    uint64 nowMs = System::getMiliTime();
+
+    bool imperial = false;
+    uint64 leaderOid = 0;
+    String city;
+    uint64 announceGroupId = 0;
+
+    // P.6.5a: the route callout must not be swallowed by the DEPARTURE shout
+    // fired seconds earlier at the hangout - it carries the destination info
+    // players need to follow. The global anti-spam gap still applies.
+    bool bypassSquadCooldown = eventType == PVP_ANNOUNCE_MOVEOUT;
+
+    // Cooldown gate under the mutex; stamp the timestamps so a burst of
+    // member engagements produces at most one leader shout.
+    {
+        Locker squadLock(&pvpSquadMutex);
+
+        int idx = findPvpSquadIndex(squadId);
+        if (idx < 0)
+            return;
+
+        SimPvpSquad& squad = pvpSquads.get(idx);
+
+        if (!bypassSquadCooldown &&
+                squad.lastAnnounceMs > 0 && squad.lastAnnounceMs <= nowMs &&
+                nowMs - squad.lastAnnounceMs <
+                    (uint64)pvpCommsAnnounceCooldownSeconds * 1000)
+            return;
+
+        if (pvpLastGlobalAnnounceMs > 0 && pvpLastGlobalAnnounceMs <= nowMs &&
+                nowMs - pvpLastGlobalAnnounceMs <
+                    (uint64)pvpCommsGlobalMinGapSeconds * 1000)
+            return;
+
+        squad.lastAnnounceMs = nowMs;
+        pvpLastGlobalAnnounceMs = nowMs;
+        imperial = squad.imperial;
+        leaderOid = squad.leaderOid;
+        city = squad.city;
+        announceGroupId = squad.groupId;
+        pvpAnnouncementsTotal++;
+    }
+
+    Reference<SimPlayerController*> ctrl;
+    if (controllers.contains(leaderOid))
+        ctrl = controllers.get(leaderOid);
+
+    ManagedReference<AiAgent*> leaderAgent =
+        ctrl == nullptr ? nullptr : ctrl->getAgent();
+
+    if (leaderAgent == nullptr || leaderAgent->isDead() ||
+            leaderAgent->getZone() == nullptr)
+        return;
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    if (zoneServer == nullptr)
+        return;
+
+    ChatManager* chatManager = zoneServer->getChatManager();
+    if (chatManager == nullptr)
+        return;
+
+    String line = pickPvpAnnounceLine(imperial, eventType);
+    if (line.isEmpty())
+        return;
+
+    // P.6.5a: append the route/context detail so players hear the actual
+    // destination ("... Route: kor vella, then coronet (corellia).").
+    if (!detail.isEmpty())
+        line = line + " " + detail;
+
+    // Spatial "say" from the leader; broadcasts to players in range only.
+    chatManager->broadcastChatMessage(leaderAgent, UnicodeString(line), 0, 0,
+        leaderAgent->getMoodID());
+
+    // P.6.3b/c: post the notable events (with city context) to this faction's
+    // chat room AND to the squad's own group chat, so subscribed / grouped
+    // players hear it galaxy-wide. Skip DEPARTURE (keeps the feeds signal-heavy).
+    if (eventType != PVP_ANNOUNCE_DEPARTURE &&
+            (pvpCommsFactionRoomsEnabled || announceGroupId != 0)) {
+        String where = city.isEmpty() ? String("the field") : city;
+        String roomLine;
+        switch (eventType) {
+        case PVP_ANNOUNCE_ARRIVAL:
+            roomLine = "Holding the starport at " + where + ".";
+            break;
+        case PVP_ANNOUNCE_CONTACT:
+            roomLine = "Contact at " + where + " - enemy engaged!";
+            break;
+        case PVP_ANNOUNCE_CONVERGE:
+            roomLine = "Reinforcing " + where + " - squad inbound!";
+            break;
+        case PVP_ANNOUNCE_MOVEOUT:
+            roomLine = "Departing " + where +
+                (detail.isEmpty() ? String(".") : String(" - ") + detail);
+            break;
+        default:
+            break;
+        }
+
+        if (!roomLine.isEmpty()) {
+            if (pvpCommsFactionRoomsEnabled)
+                postPvpFactionRoom(imperial, leaderAgent->getDisplayedName(),
+                    roomLine);
+            if (announceGroupId != 0)
+                postSquadGroupChat(announceGroupId,
+                    leaderAgent->getDisplayedName(), roomLine);
+        }
+    }
+}
+
+void SimPlayerManager::ensurePvpFactionRooms() {
+    if (!enabled || !pvpCommsFactionRoomsEnabled)
+        return;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        if (pvpFactionRoomsCreated)
+            return;
+    }
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    if (zoneServer == nullptr)
+        return;
+
+    ChatManager* chatManager = zoneServer->getChatManager();
+    if (chatManager == nullptr)
+        return;
+
+    // The galaxy room (SWG.<galaxy>) is the parent for galaxy-wide channels,
+    // exactly like the stock Auction / PvPBroadcasts rooms.
+    Reference<ChatRoom*> galaxyRoom = chatManager->getChatRoomByFullPath(
+        String("SWG.") + zoneServer->getGalaxyName());
+    if (galaxyRoom == nullptr)
+        return;
+
+    // moderated = only our system (direct broadcastMessage) posts; players in
+    // the room read the feed but cannot chat. CUSTOM + canEnter so the join
+    // goes through our faction gate in handleChatEnterRoomById.
+    Reference<ChatRoom*> rebelRoom = chatManager->createRoom("GCWRebel", galaxyRoom);
+    Reference<ChatRoom*> imperialRoom = chatManager->createRoom("GCWImperial", galaxyRoom);
+
+    if (rebelRoom == nullptr || imperialRoom == nullptr)
+        return;
+
+    rebelRoom->setCanEnter(true);
+    rebelRoom->setAllowSubrooms(false);
+    rebelRoom->setModerated(true);
+    rebelRoom->setTitle("Rebel GCW command channel (Rebels only).");
+    rebelRoom->setChatRoomType(ChatRoom::CUSTOM);
+
+    imperialRoom->setCanEnter(true);
+    imperialRoom->setAllowSubrooms(false);
+    imperialRoom->setModerated(true);
+    imperialRoom->setTitle("Imperial GCW command channel (Imperials only).");
+    imperialRoom->setChatRoomType(ChatRoom::CUSTOM);
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        pvpRebelRoomID = rebelRoom->getRoomID();
+        pvpImperialRoomID = imperialRoom->getRoomID();
+        pvpFactionRoomsCreated = true;
+    }
+
+    info("SimPvpFactionRoomsCreated rebelRoom=" +
+         String::valueOf(rebelRoom->getRoomID()) + " imperialRoom=" +
+         String::valueOf(imperialRoom->getRoomID()) +
+         " path=SWG." + zoneServer->getGalaxyName() +
+         ".GCW{Rebel,Imperial}", true);
+}
+
+void SimPlayerManager::postPvpFactionRoom(bool imperial, const String& sender,
+        const String& text) {
+    if (!enabled || !pvpCommsFactionRoomsEnabled)
+        return;
+
+    ensurePvpFactionRooms();
+
+    uint32 roomID = 0;
+    {
+        Locker squadLock(&pvpSquadMutex);
+        if (!pvpFactionRoomsCreated)
+            return;
+        roomID = imperial ? pvpImperialRoomID : pvpRebelRoomID;
+    }
+
+    if (roomID == 0)
+        return;
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    if (zoneServer == nullptr)
+        return;
+
+    ChatManager* chatManager = zoneServer->getChatManager();
+    if (chatManager == nullptr)
+        return;
+
+    Reference<ChatRoom*> room = chatManager->getChatRoom(roomID);
+    if (room == nullptr)
+        return;
+
+    // Forged room message: sender is a plain name string (no player object
+    // required), same shape ChatManager builds for a player's room chat.
+    String senderName = sender.isEmpty() ? String("GCW Command") : sender;
+    BaseMessage* msg = new ChatRoomMessage(senderName,
+        zoneServer->getGalaxyName(), UnicodeString(text), roomID);
+    room->broadcastMessage(msg);
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        pvpFactionRoomPostsTotal++;
+    }
+}
+
+bool SimPlayerManager::isPvpFactionRoom(uint32 roomID) const {
+    if (!pvpEnabled || !pvpCommsFactionRoomsEnabled || roomID == 0)
+        return false;
+
+    return roomID == pvpRebelRoomID || roomID == pvpImperialRoomID;
+}
+
+bool SimPlayerManager::isPvpFactionRoomJoinAllowed(CreatureObject* player,
+        uint32 roomID) const {
+    if (player == nullptr)
+        return false;
+
+    // Not one of our gated rooms → allow (the hook only calls us for ours).
+    bool rebelRoom = roomID == pvpRebelRoomID;
+    bool imperialRoom = roomID == pvpImperialRoomID;
+    if (!rebelRoom && !imperialRoom)
+        return true;
+
+    static const uint32 imperialHash = String("imperial").hashCode();
+    static const uint32 rebelHash = String("rebel").hashCode();
+    uint32 needFaction = imperialRoom ? imperialHash : rebelHash;
+
+    if (player->getFaction() != needFaction)
+        return false;
+
+    if (pvpCommsFactionRoomRequireOvert &&
+            player->getFactionStatus() != FactionStatus::OVERT)
+        return false;
+
+    return true;
+}
+
+void SimPlayerManager::recordPvpFactionRoomJoinBlocked() {
+    Locker squadLock(&pvpSquadMutex);
+    pvpFactionRoomJoinsBlockedTotal++;
+}
+
+// ===========================================================================
+// P.6.3c player grouping (each squad = its own GroupObject: NPC leader at
+// position 0 + joined players; NPC members are NOT in the group). Leadership
+// is only ever moved to the squad's NEW npc leader (promotion) or the group is
+// disbanded (full wipe) - a player can NEVER become the group leader.
+// ===========================================================================
+
+// Caller holds pvpSquadMutex.
+int SimPlayerManager::findPvpSquadIndexByGroup(uint64 groupId) const {
+    if (groupId == 0)
+        return -1;
+
+    for (int i = 0; i < pvpSquads.size(); ++i) {
+        if (pvpSquads.get(i).groupId == groupId)
+            return i;
+    }
+
+    return -1;
+}
+
+bool SimPlayerManager::isPvpSquadGroup(uint64 groupId) const {
+    if (!pvpEnabled || !pvpCommsPlayerGroupingEnabled || groupId == 0)
+        return false;
+
+    Locker squadLock(const_cast<Mutex*>(&pvpSquadMutex));
+    return findPvpSquadIndexByGroup(groupId) >= 0;
+}
+
+bool SimPlayerManager::isPvpSquadLeaderNpc(uint64 oid) const {
+    if (!pvpEnabled || !pvpCommsPlayerGroupingEnabled || oid == 0)
+        return false;
+
+    Locker squadLock(const_cast<Mutex*>(&pvpSquadMutex));
+    for (int i = 0; i < pvpSquads.size(); ++i) {
+        if (pvpSquads.get(i).leaderOid == oid)
+            return true;
+    }
+    return false;
+}
+
+void SimPlayerManager::postSquadGroupChat(uint64 groupId, const String& sender,
+        const String& text) {
+    if (groupId == 0)
+        return;
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    if (zoneServer == nullptr)
+        return;
+
+    ManagedReference<GroupObject*> group =
+        zoneServer->getObject(groupId).castTo<GroupObject*>();
+    if (group == nullptr)
+        return;
+
+    ManagedReference<ChatRoom*> room = group->getChatRoom();
+    if (room == nullptr)
+        return;
+
+    String senderName = sender.isEmpty() ? String("Squad Leader") : sender;
+    BaseMessage* msg = new ChatRoomMessage(senderName,
+        zoneServer->getGalaxyName(), UnicodeString(text), room->getRoomID());
+    room->broadcastMessage(msg);
+}
+
+bool SimPlayerManager::addPlayerToSquadGroup(uint64 squadId,
+        CreatureObject* player) {
+    if (!enabled || !pvpCommsPlayerGroupingEnabled || player == nullptr)
+        return false;
+
+    uint64 leaderOid = 0;
+    uint64 existingGroupId = 0;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndex(squadId);
+        if (idx < 0)
+            return false;
+
+        const SimPvpSquad& squad = pvpSquads.get(idx);
+        leaderOid = squad.leaderOid;
+        existingGroupId = squad.groupId;
+    }
+
+    Reference<SimPlayerController*> ctrl;
+    if (controllers.contains(leaderOid))
+        ctrl = controllers.get(leaderOid);
+
+    ManagedReference<AiAgent*> leaderAgent =
+        ctrl == nullptr ? nullptr : ctrl->getAgent();
+
+    if (leaderAgent == nullptr || leaderAgent->isDead()) {
+        player->sendSystemMessage("That squad's leader is unavailable.");
+        return false;
+    }
+
+    // Already grouped? (with this squad or anything else)
+    ManagedReference<GroupObject*> playerGroup = player->getGroup();
+    if (playerGroup != nullptr) {
+        if (existingGroupId != 0 && playerGroup->getObjectID() == existingGroupId)
+            player->sendSystemMessage("You're already in this squad.");
+        else
+            player->sendSystemMessage("Leave your current group before joining a squad.");
+        return false;
+    }
+
+    // Player-count cap on an existing squad group. Count only PLAYER members
+    // (the group also holds the NPC leader + squad members, which don't count).
+    if (existingGroupId != 0) {
+        ZoneServer* zoneServer = ServerCore::getZoneServer();
+        ManagedReference<GroupObject*> existing = zoneServer == nullptr ? nullptr :
+            zoneServer->getObject(existingGroupId).castTo<GroupObject*>();
+
+        if (existing != nullptr) {
+            int playerCount = 0;
+            Locker glock(existing);
+            for (int i = 0; i < existing->getGroupSize(); ++i) {
+                ManagedReference<CreatureObject*> gm = existing->getGroupMember(i);
+                if (gm != nullptr && gm->isPlayerCreature())
+                    playerCount++;
+            }
+            glock.release();
+
+            if (playerCount >= pvpCommsMaxPlayersPerSquad) {
+                player->sendSystemMessage("That squad's group is full.");
+                return false;
+            }
+        }
+    }
+
+    // Send only the INVITE (the client pop-up); the player decides. When they
+    // accept, the stock join runs GroupManager::joinGroup (patched to accept a
+    // sim-bot squad-leader inviter), which calls back onPlayerJoinedSquadGroup
+    // to record the group + pull in the squad. We do NOT auto-join here.
+    GroupManager* gm = GroupManager::instance();
+
+    {
+        Locker leaderLock(leaderAgent);
+        gm->inviteToGroup(leaderAgent, player);
+    }
+
+    info("SimPvpPlayerInvited squad=" + String::valueOf(squadId) +
+         " player=" + player->getFirstName() + " leader=" +
+         String::valueOf(leaderOid), true);
+    return true;
+}
+
+// Called from the joinGroup core patch when a player ACCEPTS an invite from a
+// SimPvP squad-leader NPC (createGroup or addMember already ran; the player is
+// now grouped). Records the squad's group id and defers the roster sync +
+// welcome to a task so no group/agent locks are taken inside joinGroup.
+void SimPlayerManager::onPlayerJoinedSquadGroup(uint64 leaderOid,
+        CreatureObject* player) {
+    if (!enabled || !pvpCommsPlayerGroupingEnabled || player == nullptr)
+        return;
+
+    ManagedReference<GroupObject*> group = player->getGroup();
+    if (group == nullptr)
+        return;
+
+    uint64 gid = group->getObjectID();
+    uint64 squadId = 0;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        for (int i = 0; i < pvpSquads.size(); ++i) {
+            SimPvpSquad& squad = pvpSquads.get(i);
+            if (squad.leaderOid != leaderOid)
+                continue;
+
+            if (squad.groupId != gid) {
+                if (squad.groupId == 0)
+                    pvpGroupsFormedTotal++;
+                squad.groupId = gid;
+            }
+            squadId = squad.squadId;
+            break;
+        }
+        pvpPlayersJoinedTotal++;
+    }
+
+    if (squadId == 0)
+        return;
+
+    info("SimPvpPlayerJoinedSquad squad=" + String::valueOf(squadId) +
+         " player=" + player->getFirstName() + " group=" +
+         String::valueOf(gid), true);
+
+    String pname = player->getFirstName();
+
+    // Off-lock: pull the whole squad into the group + welcome the player.
+    Core::getTaskManager()->scheduleTask([this, squadId, gid, pname]() {
+        syncSquadGroupMembers(squadId);
+
+        String leaderName = "Squad Leader";
+        uint64 leaderOidLocal = 0;
+        {
+            Locker squadLock(&pvpSquadMutex);
+            int idx = findPvpSquadIndex(squadId);
+            if (idx >= 0)
+                leaderOidLocal = pvpSquads.get(idx).leaderOid;
+        }
+        if (leaderOidLocal != 0 && controllers.contains(leaderOidLocal)) {
+            Reference<SimPlayerController*> ctrl =
+                controllers.get(leaderOidLocal);
+            ManagedReference<AiAgent*> la =
+                ctrl == nullptr ? nullptr : ctrl->getAgent();
+            if (la != nullptr)
+                leaderName = la->getDisplayedName();
+        }
+
+        postSquadGroupChat(gid, leaderName,
+            String("Welcome, ") + pname +
+            ". Form up and watch for hostiles.");
+    }, "SimPvpGroupJoinFollowup", 500);
+}
+
+void SimPlayerManager::disbandSquadGroup(uint64 groupId, const String& reason) {
+    if (groupId == 0)
+        return;
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    if (zoneServer != nullptr) {
+        ManagedReference<GroupObject*> group =
+            zoneServer->getObject(groupId).castTo<GroupObject*>();
+
+        if (group != nullptr) {
+            // Tell the players first (before the room is destroyed).
+            postSquadGroupChat(groupId, "Squad Command",
+                "Squad lost - group disbanding. Regroup at a starport.");
+
+            Locker glock(group);
+            group->disband();
+        }
+    }
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndexByGroup(groupId);
+        if (idx >= 0)
+            pvpSquads.get(idx).groupId = 0;
+        pvpGroupsDisbandedTotal++;
+    }
+
+    info("SimPvpSquadGroupDisbanded group=" + String::valueOf(groupId) +
+         " reason=" + reason, true);
+}
+
+void SimPlayerManager::transferSquadGroupLeadership(uint64 groupId,
+        AiAgent* oldLeader, AiAgent* newLeader) {
+    if (groupId == 0 || newLeader == nullptr)
+        return;
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    if (zoneServer == nullptr)
+        return;
+
+    ManagedReference<GroupObject*> group =
+        zoneServer->getObject(groupId).castTo<GroupObject*>();
+    if (group == nullptr)
+        return;
+
+    ManagedReference<AiAgent*> newLeaderRef = newLeader;
+
+    // Add the new NPC leader, promote it to slot 0, THEN drop the old (dead)
+    // leader - so the group leader is always an NPC and a player is never
+    // shifted into slot 0. All under the group lock.
+    {
+        Locker glock(group);
+        Locker nlock(newLeaderRef, group);
+
+        if (!group->hasMember(newLeaderRef))
+            group->addMember(newLeaderRef);
+    }
+
+    {
+        Locker glock(group);
+        group->makeLeader(newLeaderRef);
+    }
+
+    if (oldLeader != nullptr) {
+        ManagedReference<AiAgent*> oldRef = oldLeader;
+        Locker glock(group);
+        Locker olock(oldRef, group);
+        group->removeMember(oldRef);
+    }
+
+    info("SimPvpSquadGroupLeaderTransferred group=" + String::valueOf(groupId) +
+         " newLeader=" + String::valueOf(newLeaderRef->getObjectID()), true);
+}
+
+// Maintenance reconcile: clear a squad's groupId if the group is gone or the
+// NPC leader is no longer its leader (e.g. all players left via /leavegroup,
+// dropping the group below 2 → it disbanded). Cheap; runs each tick.
+void SimPlayerManager::reconcilePvpSquadGroups() {
+    if (!pvpCommsPlayerGroupingEnabled)
+        return;
+
+    Vector<uint64> groupIds;
+    Vector<uint64> leaderOids;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        for (int i = 0; i < pvpSquads.size(); ++i) {
+            const SimPvpSquad& squad = pvpSquads.get(i);
+            if (squad.groupId != 0) {
+                groupIds.add(squad.groupId);
+                leaderOids.add(squad.leaderOid);
+            }
+        }
+    }
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    if (zoneServer == nullptr)
+        return;
+
+    for (int i = 0; i < groupIds.size(); ++i) {
+        uint64 gid = groupIds.get(i);
+        ManagedReference<GroupObject*> group =
+            zoneServer->getObject(gid).castTo<GroupObject*>();
+
+        bool stale = false;
+        if (group == nullptr || group->getGroupSize() < 2) {
+            stale = true; // gone or only the NPC leader left
+        } else if (group->getLeaderID() != leaderOids.get(i)) {
+            // Leader drifted (shouldn't happen - we own transfers). Leave it;
+            // the transfer/disband paths manage leadership.
+        }
+
+        if (stale) {
+            Locker squadLock(&pvpSquadMutex);
+            int idx = findPvpSquadIndexByGroup(gid);
+            if (idx >= 0)
+                pvpSquads.get(idx).groupId = 0;
+            continue;
+        }
+
+        // Keep the group's NPC roster == the squad's live members (adds new
+        // spawns, drops dead/replaced members within a tick).
+        Locker squadLock(&pvpSquadMutex);
+        int sidx = findPvpSquadIndexByGroup(gid);
+        uint64 sid = sidx >= 0 ? pvpSquads.get(sidx).squadId : 0;
+        squadLock.release();
+        if (sid != 0)
+            syncSquadGroupMembers(sid);
+    }
+}
+
+void SimPlayerManager::syncSquadGroupMembers(uint64 squadId) {
+    if (!pvpCommsPlayerGroupingEnabled)
+        return;
+
+    uint64 groupId = 0;
+    uint64 leaderOid = 0;
+    Vector<uint64> desiredMembers;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndex(squadId);
+        if (idx < 0)
+            return;
+        const SimPvpSquad& squad = pvpSquads.get(idx);
+        groupId = squad.groupId;
+        leaderOid = squad.leaderOid;
+        desiredMembers = squad.memberOids;
+    }
+
+    if (groupId == 0)
+        return;
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    if (zoneServer == nullptr)
+        return;
+
+    ManagedReference<GroupObject*> group =
+        zoneServer->getObject(groupId).castTo<GroupObject*>();
+    if (group == nullptr)
+        return;
+
+    // 1) Remove group NPC members that are no longer live squad members
+    //    (dead / replaced). Never touch the leader or player members.
+    Vector<ManagedReference<AiAgent*> > toRemove;
+
+    {
+        Locker glock(group);
+        for (int i = 0; i < group->getGroupSize(); ++i) {
+            ManagedReference<CreatureObject*> gm = group->getGroupMember(i);
+            if (gm == nullptr || gm->isPlayerCreature())
+                continue;
+            if (gm->getObjectID() == leaderOid)
+                continue;
+
+            bool stillMember = false;
+            for (int d = 0; d < desiredMembers.size(); ++d) {
+                if (desiredMembers.get(d) == gm->getObjectID()) {
+                    stillMember = true;
+                    break;
+                }
+            }
+
+            AiAgent* npc = gm->asAiAgent();
+            if (!stillMember && npc != nullptr)
+                toRemove.add(npc);
+        }
+    }
+
+    for (int i = 0; i < toRemove.size(); ++i) {
+        ManagedReference<AiAgent*> npc = toRemove.get(i);
+        Locker glock(group);
+        Locker nlock(npc, group);
+        group->removeMember(npc);
+    }
+
+    // 2) Add live squad members not yet in the group.
+    for (int d = 0; d < desiredMembers.size(); ++d) {
+        Reference<SimPlayerController*> mc;
+        if (controllers.contains(desiredMembers.get(d)))
+            mc = controllers.get(desiredMembers.get(d));
+        ManagedReference<AiAgent*> npc =
+            mc == nullptr ? nullptr : mc->getAgent();
+        if (npc == nullptr || npc->isDead())
+            continue;
+
+        {
+            Locker glock(group);
+            if (group->hasMember(npc))
+                continue;
+            if (group->getGroupSize() >= 20)
+                break; // engine group cap
+        }
+
+        Locker glock(group);
+        Locker nlock(npc, group);
+        group->addMember(npc);
+    }
+}
+
+void SimPlayerManager::onPlayerSpatialChat(CreatureObject* player,
+        const UnicodeString& message) {
+    if (!enabled || !pvpEnabled || !pvpCommsPlayerGroupingEnabled ||
+            player == nullptr)
+        return;
+
+    String text = message.toString().toLowerCase();
+    if (text.indexOf("join") < 0)
+        return; // not a join request; cheap early-out
+
+    bool wantsJoin = text.indexOf("join pvp") >= 0 ||
+        text.indexOf("join squad") >= 0 || text.indexOf("join group") >= 0;
+    if (!wantsJoin)
+        return;
+
+    // Optional "join group with <name>" - target a squad by a member's name.
+    String targetName;
+    int withPos = text.indexOf("with ");
+    if (withPos >= 0)
+        targetName = text.subString(withPos + 5).trim();
+
+    Zone* zone = player->getZone();
+    if (zone == nullptr)
+        return;
+
+    String playerZone = zone->getZoneName();
+    uint32 playerFaction = player->getFaction();
+    Vector3 playerPos = player->getWorldPosition();
+
+    // Snapshot squads (id/faction/planet/leaderOid/members) under the mutex,
+    // then resolve agents unlocked (never lock agents holding pvpSquadMutex).
+    Vector<uint64> sqIds;
+    Vector<uint8> sqImperial;
+    Vector<String> sqPlanet;
+    Vector<uint64> sqLeaderOid;
+    Vector<Vector<uint64> > sqMembers;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        for (int i = 0; i < pvpSquads.size(); ++i) {
+            const SimPvpSquad& squad = pvpSquads.get(i);
+            sqIds.add(squad.squadId);
+            sqImperial.add(squad.imperial ? 1 : 0);
+            sqPlanet.add(squad.planet);
+            sqLeaderOid.add(squad.leaderOid);
+            sqMembers.add(squad.memberOids);
+        }
+    }
+
+    static const uint32 imperialHash = String("imperial").hashCode();
+    static const uint32 rebelHash = String("rebel").hashCode();
+
+    uint64 chosenSquad = 0;
+    float bestDistSq = 0.f;
+
+    for (int i = 0; i < sqIds.size(); ++i) {
+        bool squadImperial = sqImperial.get(i) != 0;
+        uint32 squadFaction = squadImperial ? imperialHash : rebelHash;
+
+        // Same-faction only (a neutral player may join either).
+        if (playerFaction != 0 && playerFaction != squadFaction)
+            continue;
+
+        Reference<SimPlayerController*> ctrl;
+        if (controllers.contains(sqLeaderOid.get(i)))
+            ctrl = controllers.get(sqLeaderOid.get(i));
+        ManagedReference<AiAgent*> leaderAgent =
+            ctrl == nullptr ? nullptr : ctrl->getAgent();
+        if (leaderAgent == nullptr || leaderAgent->isDead() ||
+                leaderAgent->getZone() == nullptr)
+            continue;
+
+        if (!targetName.isEmpty()) {
+            // Match a bot (leader or member) by displayed name.
+            bool nameMatch =
+                leaderAgent->getDisplayedName().toLowerCase().indexOf(targetName) >= 0;
+
+            if (!nameMatch) {
+                const Vector<uint64>& members = sqMembers.get(i);
+                for (int m = 0; m < members.size() && !nameMatch; ++m) {
+                    Reference<SimPlayerController*> mc;
+                    if (controllers.contains(members.get(m)))
+                        mc = controllers.get(members.get(m));
+                    ManagedReference<AiAgent*> ma =
+                        mc == nullptr ? nullptr : mc->getAgent();
+                    if (ma != nullptr && ma->getDisplayedName().toLowerCase()
+                            .indexOf(targetName) >= 0)
+                        nameMatch = true;
+                }
+            }
+
+            if (nameMatch) {
+                chosenSquad = sqIds.get(i);
+                break;
+            }
+            continue;
+        }
+
+        // "join pvp group": pick the squad whose NEAREST bot (leader OR any
+        // member) is closest to the player and within joinRange - so standing
+        // among a squad's members joins THAT squad, not a distant leader.
+        if (leaderAgent->getZone()->getZoneName() != playerZone)
+            continue;
+
+        auto distSqTo = [&playerPos](AiAgent* a) -> float {
+            Vector3 p = a->getWorldPosition();
+            float dx = p.getX() - playerPos.getX();
+            float dy = p.getY() - playerPos.getY();
+            return dx * dx + dy * dy;
+        };
+
+        float squadDistSq = distSqTo(leaderAgent.get());
+
+        const Vector<uint64>& members = sqMembers.get(i);
+        for (int m = 0; m < members.size(); ++m) {
+            Reference<SimPlayerController*> mc;
+            if (controllers.contains(members.get(m)))
+                mc = controllers.get(members.get(m));
+            ManagedReference<AiAgent*> ma =
+                mc == nullptr ? nullptr : mc->getAgent();
+            if (ma == nullptr || ma->isDead() || ma->getZone() == nullptr ||
+                    ma->getZone()->getZoneName() != playerZone)
+                continue;
+            float d = distSqTo(ma.get());
+            if (d < squadDistSq)
+                squadDistSq = d;
+        }
+
+        if (squadDistSq > pvpCommsJoinRangeMeters * pvpCommsJoinRangeMeters)
+            continue;
+
+        if (chosenSquad == 0 || squadDistSq < bestDistSq) {
+            chosenSquad = sqIds.get(i);
+            bestDistSq = squadDistSq;
+        }
+    }
+
+    if (chosenSquad == 0) {
+        if (!targetName.isEmpty())
+            player->sendSystemMessage("No squad found with a member by that name (or wrong faction).");
+        else
+            player->sendSystemMessage("No friendly squad is close enough to join. Get near one and try again.");
+        return;
+    }
+
+    addPlayerToSquadGroup(chosenSquad, player);
+}
+
+void SimPlayerManager::onPvpGroupChat(CreatureObject* player, uint64 groupId,
+        const UnicodeString& message) {
+    if (!enabled || !pvpEnabled || !pvpCommsPlayerGroupingEnabled ||
+            player == nullptr || groupId == 0)
+        return;
+
+    String text = message.toString().toLowerCase().trim();
+
+    // Read-only info commands only - no group mutation from the chat hook
+    // (players LEAVE via the stock /leavegroup command). The leader replies
+    // into the group chat room.
+    bool wantStatus = text == "status" || text.indexOf("sitrep") >= 0;
+    bool wantWhere = text == "where" || text.indexOf("location") >= 0;
+    if (!wantStatus && !wantWhere)
+        return;
+
+    String leaderName;
+    String planet;
+    String city;
+    String phase;
+    int membersAlive = 0;
+    bool found = false;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndexByGroup(groupId);
+        if (idx >= 0) {
+            const SimPvpSquad& squad = pvpSquads.get(idx);
+            planet = squad.planet;
+            city = squad.city;
+            membersAlive = squad.memberOids.size();
+
+            Reference<SimPlayerController*> ctrl;
+            if (controllers.contains(squad.leaderOid))
+                ctrl = controllers.get(squad.leaderOid);
+            SimPvPController* leaderCtrl = ctrl == nullptr ? nullptr :
+                dynamic_cast<SimPvPController*>(ctrl.get());
+            ManagedReference<AiAgent*> leaderAgent =
+                ctrl == nullptr ? nullptr : ctrl->getAgent();
+            if (leaderAgent != nullptr)
+                leaderName = leaderAgent->getDisplayedName();
+            if (leaderCtrl != nullptr)
+                phase = leaderCtrl->getPvpPhaseName();
+            found = true;
+        }
+    }
+
+    if (!found)
+        return;
+
+    String reply;
+    if (wantWhere) {
+        reply = "We're at " + (city.isEmpty() ? String("the field") : city) +
+            " on " + (planet.isEmpty() ? String("this planet") : planet) + ".";
+    } else {
+        reply = "Squad status: " + String::valueOf(membersAlive + 1) +
+            " strong, " + (phase.isEmpty() ? String("active") : phase) +
+            " at " + (city.isEmpty() ? String("the field") : city) + ".";
+    }
+
+    postSquadGroupChat(groupId, leaderName.isEmpty() ?
+        String("Squad Leader") : leaderName, reply);
+}
+
+void SimPlayerManager::dispatchPvpConvergence(uint64 nowMs) {
+    for (int side = 0; side < 2; ++side) {
+        bool imperial = side == 0;
+
+        // Copy + validate the faction contact under the mutex.
+        String contactPlanet;
+        String contactCity;
+        uint64 reporterSquadId = 0;
+        bool haveContact = false;
+
+        {
+            Locker squadLock(&pvpSquadMutex);
+            SimPvpFactionContact& contact =
+                imperial ? pvpImperialContact : pvpRebelContact;
+
+            if (!contact.valid)
+                continue;
+
+            if (nowMs - contact.reportedAtMs >
+                    (uint64)pvpContactTtlSeconds * 1000) {
+                contact.valid = false; // expired, forget it
+                continue;
+            }
+
+            // Per-(faction,city) cooldown: one gank per city per window.
+            String cityKey = (imperial ? String("imp:") : String("reb:")) +
+                contact.planet + ":" + contact.city;
+
+            if (pvpCityConvergeCooldowns.contains(cityKey)) {
+                uint64 lastMs = pvpCityConvergeCooldowns.get(cityKey);
+
+                if (lastMs <= nowMs && nowMs - lastMs <
+                        (uint64)pvpConvergeCooldownSeconds * 1000)
+                    continue; // keep the contact; it expires on its own
+            }
+
+            contactPlanet = contact.planet;
+            contactCity = contact.city;
+            reporterSquadId = contact.reporterSquadId;
+            haveContact = true;
+        }
+
+        if (!haveContact)
+            continue;
+
+        // Pick a responder: same faction, patrol (not scout), healthy, not
+        // already at the contact city, off its per-squad cooldown. Prefer a
+        // same-planet squad (shortest run to the fight).
+        uint64 responderSquadId = 0;
+        uint64 responderLeaderOid = 0;
+
+        {
+            Locker squadLock(&pvpSquadMutex);
+            int bestIdx = -1;
+            bool bestSamePlanet = false;
+
+            for (int i = 0; i < pvpSquads.size(); ++i) {
+                const SimPvpSquad& squad = pvpSquads.get(i);
+
+                if (squad.imperial != imperial || squad.scout ||
+                        squad.reforming || squad.leaderDeadPendingPromotion)
+                    continue;
+
+                if (squad.planet == contactPlanet && squad.city == contactCity)
+                    continue; // already there
+
+                if (squad.lastConvergeMs > 0 && squad.lastConvergeMs <= nowMs &&
+                        nowMs - squad.lastConvergeMs <
+                            (uint64)pvpConvergeCooldownSeconds * 1000)
+                    continue;
+
+                bool samePlanet = squad.planet == contactPlanet;
+
+                if (bestIdx < 0 || (samePlanet && !bestSamePlanet)) {
+                    bestIdx = i;
+                    bestSamePlanet = samePlanet;
+                }
+            }
+
+            if (bestIdx >= 0) {
+                SimPvpSquad& responder = pvpSquads.get(bestIdx);
+                responder.convergePlanet = contactPlanet;
+                responder.convergeCity = contactCity;
+                responder.convergeExpiresAtMs =
+                    nowMs + (uint64)pvpContactTtlSeconds * 1000 * 2;
+                responder.lastConvergeMs = nowMs;
+                responderSquadId = responder.squadId;
+                responderLeaderOid = responder.leaderOid;
+
+                String cityKey = (imperial ? String("imp:") : String("reb:")) +
+                    contactPlanet + ":" + contactCity;
+                pvpCityConvergeCooldowns.put(cityKey, nowMs);
+                pvpConvergencesTotal++;
+
+                // Consumed: the responder is on its way. Fresh reports from
+                // the scout re-arm it for the next window.
+                SimPvpFactionContact& contact =
+                    imperial ? pvpImperialContact : pvpRebelContact;
+                contact.valid = false;
+            }
+        }
+
+        if (responderSquadId == 0)
+            continue;
+
+        info("SimPvpConvergenceDispatched squad=" +
+             String::valueOf(responderSquadId) +
+             " faction=" + (imperial ? String("imperial") : String("rebel")) +
+             " toCity=" + contactPlanet + ":" + contactCity +
+             " reportedBy=" + String::valueOf(reporterSquadId), true);
+
+        // Nudge the responder toward its shuttle unless it is mid-fight (a
+        // squad in combat finishes its fight; the pending destination is
+        // consumed whenever it boards). AWAITING/TO_SHUTTLE need no nudge.
+        Reference<SimPlayerController*> ctrl;
+        if (controllers.contains(responderLeaderOid))
+            ctrl = controllers.get(responderLeaderOid);
+
+        SimPvPController* leaderCtrl =
+            ctrl == nullptr ? nullptr : dynamic_cast<SimPvPController*>(ctrl.get());
+        ManagedReference<AiAgent*> leaderAgent =
+            ctrl == nullptr ? nullptr : ctrl->getAgent();
+
+        if (leaderCtrl != nullptr && leaderAgent != nullptr &&
+                !leaderAgent->isDead() && !leaderAgent->isInCombat())
+            leaderCtrl->interruptForConvergence();
+    }
+}
+
+void SimPlayerManager::despawnPvpSquads(const String& reason) {
+    Vector<uint64> allOids;
+    int squadCount = 0;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        squadCount = pvpSquads.size();
+
+        for (int i = 0; i < pvpSquads.size(); ++i) {
+            const SimPvpSquad& squad = pvpSquads.get(i);
+            allOids.add(squad.leaderOid);
+            for (int j = 0; j < squad.memberOids.size(); ++j)
+                allOids.add(squad.memberOids.get(j));
+        }
+
+        pvpSquads.removeAll();
+    }
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+
+    for (int i = 0; i < allOids.size(); ++i) {
+        uint64 oid = allOids.get(i);
+        controllers.drop(oid);
+
+        if (zoneServer == nullptr)
+            continue;
+
+        ManagedReference<SceneObject*> obj = zoneServer->getObject(oid);
+        ManagedReference<AiAgent*> agent = cast<AiAgent*>(obj.get());
+
+        if (agent == nullptr)
+            continue;
+
+        agent->destroyObjectFromWorld(true);
+        agent->destroyObjectFromDatabase(true);
+    }
+
+    if (squadCount > 0) {
+        info("SimPvpSquadsDespawned squads=" + String::valueOf(squadCount) +
+             " bots=" + String::valueOf(allOids.size()) +
+             " reason=" + reason, true);
+    }
+}
+
+void SimPlayerManager::runPvpMaintenanceTask() {
+    pvpMaintenanceTaskScheduled = false;
+
+    if (!enabled)
+        return;
+
+    refreshPvpConfig();
+
+    // Always reschedule so runtime toggles of enablePvpBots apply without a
+    // restart; everything below no-ops while disabled.
+    schedulePvpMaintenanceTask();
+
+    if (!pvpEnabled) {
+        bool anySquads = false;
+
+        {
+            Locker squadLock(&pvpSquadMutex);
+            anySquads = pvpSquads.size() > 0;
+        }
+
+        if (anySquads)
+            despawnPvpSquads("pvpDisabled");
+
+        return;
+    }
+
+    if (allShuttleports.size() == 0)
+        return;
+
+    // P.6.3b: make sure the faction chat rooms exist so players see them in
+    // the chat browser (guarded; no-op once created / when disabled).
+    ensurePvpFactionRooms();
+
+    // P.6.3c: clear stale squad groupIds (players left via /leavegroup →
+    // group disbanded below 2). Guarded; no-op when grouping is disabled.
+    reconcilePvpSquadGroups();
+
+    // P.6.5-0: one-shot read-only travel diagnostics (fare-matrix dump +
+    // starport interior path test); results on the dashboard.
+    runPvpTravelDiagnosticsIfNeeded();
+
+    uint64 nowMs = System::getMiliTime();
+
+    // 1) Population: at most one new squad per faction per tick (gentle ramp).
+    //    Patrols fill first, then scouts (P.6.2).
+    int imperialPatrols = 0;
+    int rebelPatrols = 0;
+    int imperialScouts = 0;
+    int rebelScouts = 0;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        for (int i = 0; i < pvpSquads.size(); ++i) {
+            const SimPvpSquad& squad = pvpSquads.get(i);
+
+            if (squad.scout) {
+                if (squad.imperial)
+                    imperialScouts++;
+                else
+                    rebelScouts++;
+            } else {
+                if (squad.imperial)
+                    imperialPatrols++;
+                else
+                    rebelPatrols++;
+            }
+        }
+    }
+
+    if (imperialPatrols < pvpSquadsPerFaction)
+        spawnPvpSquad(true, false);
+    else if (pvpScoutsEnabled && imperialScouts < pvpScoutSquadsPerFaction)
+        spawnPvpSquad(true, true);
+
+    if (rebelPatrols < pvpSquadsPerFaction)
+        spawnPvpSquad(false, false);
+    else if (pvpScoutsEnabled && rebelScouts < pvpScoutSquadsPerFaction)
+        spawnPvpSquad(false, true);
+
+    // 2) Copy per-squad upkeep snapshots; act only after the mutex releases
+    //    (never hold pvpSquadMutex while locking agents).
+    Vector<SimPvpSquad> upkeep;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        for (int i = 0; i < pvpSquads.size(); ++i)
+            upkeep.add(pvpSquads.get(i));
+    }
+
+    int recoveryActionsUsed = 0;
+
+    for (int s = 0; s < upkeep.size(); ++s) {
+        const SimPvpSquad& squad = upkeep.get(s);
+
+        // 2a) Wipe re-form due: drop the old row and field a fresh squad.
+        if (squad.reforming) {
+            if (nowMs >= squad.reformAtMs) {
+                {
+                    Locker squadLock(&pvpSquadMutex);
+                    int idx = findPvpSquadIndex(squad.squadId);
+                    if (idx >= 0)
+                        pvpSquads.remove(idx);
+                    pvpSquadReformsTotal++;
+                }
+
+                info("SimPvpSquadReformed squad=" + String::valueOf(squad.squadId) +
+                     " faction=" + (squad.imperial ? String("imperial") : String("rebel")),
+                     true);
+
+                spawnPvpSquad(squad.imperial, squad.scout);
+            }
+
+            continue;
+        }
+
+        // 2b) Leader promotion (leader died): senior alive member takes over.
+        if (squad.leaderDeadPendingPromotion) {
+            uint64 newLeaderOid = 0;
+            ManagedReference<AiAgent*> newLeaderAgent;
+            Reference<SimPlayerController*> newLeaderOldCtrl;
+
+            for (int i = 0; i < squad.memberOids.size(); ++i) {
+                uint64 candidateOid = squad.memberOids.get(i);
+
+                Reference<SimPlayerController*> candidateRef;
+                if (controllers.contains(candidateOid))
+                    candidateRef = controllers.get(candidateOid);
+
+                ManagedReference<AiAgent*> candidateAgent =
+                    candidateRef == nullptr ? nullptr : candidateRef->getAgent();
+
+                if (candidateAgent == nullptr || candidateAgent->isDead())
+                    continue;
+
+                newLeaderOid = candidateOid;
+                newLeaderAgent = candidateAgent;
+                newLeaderOldCtrl = candidateRef;
+                break;
+            }
+
+            if (newLeaderOid == 0) {
+                // Full wipe: no NPC left. P.6.3c SAFETY - disband the group so
+                // any joined players are cleanly dropped (never left leaderless
+                // or promoted to leader), then schedule the re-form.
+                if (squad.groupId != 0)
+                    disbandSquadGroup(squad.groupId, "squadWiped");
+
+                Locker squadLock(&pvpSquadMutex);
+                int idx = findPvpSquadIndex(squad.squadId);
+
+                if (idx >= 0) {
+                    SimPvpSquad& live = pvpSquads.get(idx);
+                    live.leaderDeadPendingPromotion = false;
+                    live.groupId = 0;
+                    live.reforming = true;
+                    live.reformAtMs = nowMs + (uint64)pvpRespawnDelaySeconds * 1000;
+                }
+
+                info("SimPvpSquadWiped squad=" + String::valueOf(squad.squadId) +
+                     " respawnInSeconds=" + String::valueOf(pvpRespawnDelaySeconds),
+                     true);
+                continue;
+            }
+
+            // Re-profile the promoted member as a controller-driven leader.
+            {
+                Locker locker(newLeaderAgent);
+                newLeaderAgent->setFollowObject(nullptr);
+                newLeaderAgent->setCreatureBitmask(0);
+                newLeaderAgent->setCustomAiMap(String("simPvp").hashCode());
+                newLeaderAgent->setAITemplate();
+                newLeaderAgent->clearPatrolPoints();
+            }
+
+            Reference<SimPvPController*> newLeaderCtrl =
+                new SimPvPController(newLeaderAgent, squad.squadId, squad.imperial);
+            newLeaderCtrl->setScoutRole(squad.scout);
+
+            controllers.put(newLeaderOid, newLeaderCtrl.get());
+
+            Vector<uint64> remainingMembers;
+
+            {
+                Locker squadLock(&pvpSquadMutex);
+                int idx = findPvpSquadIndex(squad.squadId);
+
+                if (idx >= 0) {
+                    SimPvpSquad& live = pvpSquads.get(idx);
+                    live.leaderOid = newLeaderOid;
+
+                    for (int i = 0; i < live.memberOids.size(); ++i) {
+                        if (live.memberOids.get(i) == newLeaderOid) {
+                            live.memberOids.remove(i);
+                            break;
+                        }
+                    }
+
+                    // The promoted member vacates a follower slot; refill it
+                    // at the next city like any other death.
+                    live.pendingReplacements++;
+                    live.leaderDeadPendingPromotion = false;
+                    live.travelTaskActive = false;
+                    remainingMembers = live.memberOids;
+                    pvpPromotionsTotal++;
+                }
+            }
+
+            newLeaderCtrl->beginCityLoop(squad.planet, squad.city,
+                squad.shuttlePos, squad.hangoutPos);
+
+            for (int i = 0; i < remainingMembers.size(); ++i) {
+                uint64 memberOid = remainingMembers.get(i);
+
+                Reference<SimPlayerController*> memberRef;
+                if (controllers.contains(memberOid))
+                    memberRef = controllers.get(memberOid);
+
+                SimPvPMemberController* memberCtrl = memberRef == nullptr ? nullptr :
+                    dynamic_cast<SimPvPMemberController*>(memberRef.get());
+
+                if (memberCtrl != nullptr)
+                    memberCtrl->setLeader(newLeaderAgent);
+            }
+
+            info("SimPvpLeaderPromoted squad=" + String::valueOf(squad.squadId) +
+                 " newLeader=" + String::valueOf(newLeaderOid), true);
+
+            // P.6.3c SAFETY: if a player is grouped with this squad, move group
+            // leadership to the NEW npc leader (add it, promote it to slot 0,
+            // drop the dead old leader) so a player is never made group leader.
+            if (squad.groupId != 0) {
+                Reference<SimPlayerController*> oldRef;
+                if (controllers.contains(squad.leaderOid))
+                    oldRef = controllers.get(squad.leaderOid);
+                ManagedReference<AiAgent*> oldLeaderAgent =
+                    oldRef == nullptr ? nullptr : oldRef->getAgent();
+
+                transferSquadGroupLeadership(squad.groupId,
+                    oldLeaderAgent, newLeaderAgent);
+            }
+
+            continue;
+        }
+
+        // 2c) Leader liveness + state-TTL escalation.
+        Reference<SimPlayerController*> leaderRef;
+        if (controllers.contains(squad.leaderOid))
+            leaderRef = controllers.get(squad.leaderOid);
+
+        SimPvPController* leaderCtrl = leaderRef == nullptr ? nullptr :
+            dynamic_cast<SimPvPController*>(leaderRef.get());
+        ManagedReference<AiAgent*> leaderAgent =
+            leaderRef == nullptr ? nullptr : leaderRef->getAgent();
+
+        if (leaderCtrl == nullptr || leaderAgent == nullptr ||
+                leaderAgent->getZone() == nullptr) {
+            // Leader vanished without a death event (should not happen):
+            // treat as a wipe-level fault and re-form promptly. P.6.3c: disband
+            // any group first so players aren't stranded on a dead leader.
+            if (squad.groupId != 0)
+                disbandSquadGroup(squad.groupId, "leaderMissing");
+
+            Locker squadLock(&pvpSquadMutex);
+            int idx = findPvpSquadIndex(squad.squadId);
+
+            if (idx >= 0) {
+                SimPvpSquad& live = pvpSquads.get(idx);
+
+                if (!live.reforming) {
+                    live.reforming = true;
+                    live.groupId = 0;
+                    live.reformAtMs = nowMs + (uint64)pvpRespawnDelaySeconds * 1000;
+
+                    info("SimPvpLeaderMissing squad=" + String::valueOf(squad.squadId) +
+                         " scheduling reform", true);
+                }
+            }
+
+            continue;
+        }
+
+        // Phase age with underflow guard: phaseSinceMs can be NEWER than this
+        // task's nowMs when the squad was spawned/promoted earlier in this
+        // very tick - unsigned subtraction would wrap and instantly "expire"
+        // the phase (observed live: forceAdvance 37ms after squad spawn).
+        uint64 phaseSinceMs = leaderCtrl->getPhaseSinceMs();
+        uint64 phaseAgeMs = phaseSinceMs <= nowMs ? nowMs - phaseSinceMs : 0;
+
+        int leaderPhase = leaderCtrl->getPvpPhase();
+        bool movementPhase =
+            leaderPhase == SimPvPController::PVP_TO_HANGOUT ||
+            leaderPhase == SimPvPController::PVP_TO_SHUTTLE;
+
+        // P.6.1a rescue: a moveTo whose path request silently never resolved
+        // (neither onPathFound nor onPathFailed) leaves the controller parked
+        // in CALCULATING_PATH with no work-loop chain. Re-drive the phase.
+        if (movementPhase && leaderCtrl->isAwaitingPathResult() &&
+                phaseAgeMs > 90 * 1000 &&
+                !leaderAgent->isInCombat() && !leaderAgent->isDead()) {
+            info("SimPvpPathRequestLost squad=" + String::valueOf(squad.squadId) +
+                 " phase=" + leaderCtrl->getPvpPhaseName() +
+                 " ageSeconds=" + String::valueOf(phaseAgeMs / 1000) +
+                 " action=redrivePhase", true);
+            leaderCtrl->startSimLoop();
+        } else if (pvpStateTtlSeconds > 0 &&
+                phaseAgeMs > (uint64)pvpStateTtlSeconds * 1000 &&
+                !leaderAgent->isInCombat() && !leaderAgent->isDead()) {
+            if (leaderPhase == SimPvPController::PVP_AWAITING_SHUTTLE) {
+                // If the wait task silently died, clear the dedupe flag so the
+                // re-notify below can start a fresh one.
+                Locker squadLock(&pvpSquadMutex);
+                int idx = findPvpSquadIndex(squad.squadId);
+                if (idx >= 0)
+                    pvpSquads.get(idx).travelTaskActive = false;
+            }
+
+            leaderCtrl->forceAdvancePhase("stateTtl");
+        } else if (!leaderAgent->isDead() &&
+                (leaderPhase == SimPvPController::PVP_LOITERING || movementPhase) &&
+                phaseAgeMs > (uint64)pvpStateTtlSeconds * 1000) {
+            // P.6.2a hard backstop: any movement OR loiter phase stuck past the
+            // TTL while still isInCombat is a combat STALEMATE - two squads
+            // flagged in combat but not resolving (out of range / LOS blocked),
+            // which the phantom-combat guard leaves alone (the enemy is a live,
+            // near defender). Max legit loiter is ~180s, so >TTL means stuck.
+            // Break it: clear combat, then force the phase forward. (The
+            // earlier !isInCombat branch handles the non-combat cases.)
+            {
+                Locker locker(leaderAgent);
+                if (leaderAgent->isInCombat())
+                    leaderAgent->clearCombatState(true);
+            }
+
+            info("SimPvpHardStuck squad=" + String::valueOf(squad.squadId) +
+                 " phase=" + leaderCtrl->getPvpPhaseName() +
+                 " ageSeconds=" + String::valueOf(phaseAgeMs / 1000) +
+                 " action=clearCombat+forceAdvance", true);
+            leaderCtrl->forceAdvancePhase("hardStuck");
+        }
+
+        // 2d) Member-far recovery (re-follow always; teleport only when far
+        //     beyond the threshold AND dryRun is off; bounded per interval).
+        if (!pvpRecoveryEnabled ||
+                recoveryActionsUsed >= pvpMaxRecoveryActionsPerInterval)
+            continue;
+
+        Vector3 leaderPos;
+        String leaderZoneName;
+
+        {
+            Locker locker(leaderAgent);
+            leaderPos = leaderAgent->getWorldPosition();
+            Zone* leaderZone = leaderAgent->getZone();
+            if (leaderZone != nullptr)
+                leaderZoneName = leaderZone->getZoneName();
+        }
+
+        if (leaderZoneName.isEmpty())
+            continue;
+
+        for (int i = 0; i < squad.memberOids.size() &&
+                recoveryActionsUsed < pvpMaxRecoveryActionsPerInterval; ++i) {
+            uint64 memberOid = squad.memberOids.get(i);
+
+            Reference<SimPlayerController*> memberRef;
+            if (controllers.contains(memberOid))
+                memberRef = controllers.get(memberOid);
+
+            SimPvPMemberController* memberCtrl = memberRef == nullptr ? nullptr :
+                dynamic_cast<SimPvPMemberController*>(memberRef.get());
+            ManagedReference<AiAgent*> memberAgent =
+                memberRef == nullptr ? nullptr : memberRef->getAgent();
+
+            if (memberCtrl == nullptr || memberAgent == nullptr)
+                continue;
+
+            if (memberAgent->isDead() || memberAgent->isInCombat())
+                continue;
+
+            Vector3 memberPos;
+            String memberZoneName;
+
+            {
+                Locker locker(memberAgent);
+                memberPos = memberAgent->getWorldPosition();
+                Zone* memberZone = memberAgent->getZone();
+                if (memberZone != nullptr)
+                    memberZoneName = memberZone->getZoneName();
+            }
+
+            bool zoneMismatch = memberZoneName != leaderZoneName;
+
+            float dx = memberPos.getX() - leaderPos.getX();
+            float dy = memberPos.getY() - leaderPos.getY();
+            float distSq = dx * dx + dy * dy;
+            bool far = zoneMismatch ||
+                distSq > pvpMemberFarMeters * pvpMemberFarMeters;
+            bool veryFar = zoneMismatch ||
+                distSq > (2.f * pvpMemberFarMeters) * (2.f * pvpMemberFarMeters);
+
+            if (!far)
+                continue;
+
+            memberCtrl->assertFollow();
+
+            if (veryFar && !pvpRecoveryDryRun) {
+                {
+                    Locker locker(memberAgent);
+                    memberAgent->setMovementState(AiAgent::OBLIVIOUS);
+                    memberAgent->clearPatrolPoints();
+                    memberAgent->clearSavedPatrolPoints();
+                    memberAgent->clearCurrentPath();
+                    memberAgent->switchZone(leaderZoneName,
+                        leaderPos.getX() + pvpSpawnJitter(), leaderPos.getZ(),
+                        leaderPos.getY() + pvpSpawnJitter(), 0);
+                    memberAgent->setHomeLocation(leaderPos.getX(),
+                        leaderPos.getZ(), leaderPos.getY(), nullptr);
+                }
+
+                memberCtrl->assertFollow();
+                recoveryActionsUsed++;
+
+                {
+                    Locker squadLock(&pvpSquadMutex);
+                    pvpRecoveryActionsTotal++;
+                }
+
+                info("SimPvpMemberRecovered squad=" + String::valueOf(squad.squadId) +
+                     " member=" + String::valueOf(memberOid) +
+                     " action=teleportToLeader zoneMismatch=" +
+                     String::valueOf(zoneMismatch), true);
+            }
+        }
+    }
+
+    // 3) P.6.2: send a patrol squad after any live faction contact.
+    if (pvpScoutsEnabled)
+        dispatchPvpConvergence(nowMs);
 }

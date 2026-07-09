@@ -3,6 +3,10 @@
 Companion to `ai-miner-navigation-design.md`. Covers where the resources that AI
 miners gather are *held*, and how future crafter NPCs will *consume* them.
 
+**Next phase:** P.5.4 (crafted-goods output ledger, type-correct reservation,
+demand-loop closure, multi-profile crafting) is designed in
+`ai-crafter-output-ledger-design.md`.
+
 ## 0. Live status
 - **P.5.1 (implemented + verified live):** exact resource-spawn-identity hive
   deposits into the persistent galaxy stockpile. `persistSpawnIdentifiedLots =
@@ -229,10 +233,13 @@ depletion into demand supply is a later phase.
   demand-supply source (derive the coarse view from exact lots).
 - ~~P.5.3: wire the first crafter NPC to `reserveFromStockpile` →
   `consumeReservation`, and turn the self-test off.~~ **DONE (see §4b).**
-- Family/class-chain reservation matching (chef ↔ any fruit) via the demand
-  eligibility matcher, so crafter targeting isn't limited to exact `resourceType`.
-- Reconcile exact-lot depletion into demand supply so consumption relieves
-  pressure (augment/replace `supplyMode="conceptual_totals"`).
-- Recipe ratios (N inputs → 1 output) and multi-resource recipes.
-- Persistent crafted-goods ledger for downstream consumers (buffers, PvE).
-- Physical crafter-NPC embodiment at crafting stations (P.5.4).
+- ~~Family/class-chain reservation matching (chef ↔ any fruit).~~ → **P.5.4a**
+  in `ai-crafter-output-ledger-design.md`.
+- ~~Reconcile exact-lot depletion into demand supply so consumption relieves
+  pressure.~~ → **P.5.4c** (`supplyMode="exact_lots"`), same doc.
+- ~~Recipe ratios (N inputs → 1 output).~~ → **P.5.4b** (single-input recipes;
+  multi-resource recipes stay deferred), same doc.
+- ~~Persistent crafted-goods ledger for downstream consumers (buffers, PvE).~~
+  → **P.5.4b** (`finished_good` lot tier), same doc.
+- Physical crafter-NPC embodiment at crafting stations — **deferred past P.5.4**
+  (owner decision 2026-07-02: economy substance first, embodiment later).

@@ -433,6 +433,7 @@ private:
 		_REGISTERLEAF(CheckIsKiller);
 		_REGISTERLEAF(CheckIsHealer);
 		_REGISTERLEAF(CheckHealChance);
+		_REGISTERLEAF(CheckJediForceChance);
 		_REGISTERLEAF(CheckIsStalker);
 		_REGISTERLEAF(CheckFlee);
 		_REGISTERLEAF(CheckOwnerInRange);
@@ -490,6 +491,7 @@ private:
 		_REGISTERLEAF(FollowSquadLeader);
 		_REGISTERLEAF(GetHealTarget);
 		_REGISTERLEAF(HealTarget);
+		_REGISTERLEAF(ManageJediForce);
 		_REGISTERLEAF(RestorePetPatrols);
 		_REGISTERLEAF(SendChatGreeting);
 		_REGISTERLEAF(CallForHelp);

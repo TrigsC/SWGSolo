@@ -7,6 +7,7 @@
 #include "server/zone/ZoneServer.h"
 #include "server/zone/Zone.h"
 #include "server/zone/SpaceZone.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
 
 #include "server/chat/room/ChatRoom.h"
 
@@ -182,7 +183,17 @@ void GroupManager::joinGroup(CreatureObject* creature) {
 
 	ManagedReference<SceneObject*> object = zoneServer->getObject(inviterID);
 
-	if (object == nullptr || !object->isPlayerCreature() || object->getObjectID() == creature->getObjectID())
+	// P.6.3c: normally the inviter must be a player. Allow a SimPvP squad-leader
+	// NPC to be the inviter so a player can join a bot squad's group (flag-gated;
+	// SimPlayerManager::isPvpSquadLeaderNpc is false unless grouping is enabled
+	// AND this oid is a current squad leader). Everything downstream - createGroup
+	// / addMember / chat room - already accepts any CreatureObject leader.
+	bool inviterOk = object != nullptr && object->getObjectID() != creature->getObjectID();
+
+	if (inviterOk && !object->isPlayerCreature())
+		inviterOk = SimPlayerManager::instance()->isPvpSquadLeaderNpc(object->getObjectID());
+
+	if (!inviterOk)
 		return;
 
 	auto leader = object->asCreatureObject();
@@ -198,6 +209,13 @@ void GroupManager::joinGroup(CreatureObject* creature) {
 
 		// Leader does not have a group, so they create a new one
 		createGroup(leader, creature);
+
+		// P.6.3c: a player accepted a SimPvP squad-leader NPC's invite and a
+		// fresh group formed - let the manager record + sync the squad. Takes
+		// no leader/group locks (pvpSquadMutex + a deferred task only).
+		if (!leader->isPlayerCreature())
+			SimPlayerManager::instance()->onPlayerJoinedSquadGroup(leader->getObjectID(), creature);
+
 		return;
 	}
 
@@ -267,6 +285,11 @@ void GroupManager::joinGroup(CreatureObject* creature) {
 			joinGroupEntertainingSession(creature);
 		}
 	}
+
+	// P.6.3c: a player accepted a SimPvP squad-leader NPC's invite into its
+	// existing group - record + sync (no leader/group locks taken downstream).
+	if (!leader->isPlayerCreature())
+		SimPlayerManager::instance()->onPlayerJoinedSquadGroup(leader->getObjectID(), creature);
 
 	creature->updateGroupInviterID(0, false);
 }
