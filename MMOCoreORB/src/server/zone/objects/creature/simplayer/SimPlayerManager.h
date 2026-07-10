@@ -1167,8 +1167,41 @@ private:
 	float pvpMemberFarMeters = 64.f;
 	int pvpStateTtlSeconds = 600;
 	int pvpMaxRecoveryActionsPerInterval = 2;
-	Vector<String> pvpImperialTemplates;
-	Vector<String> pvpRebelTemplates;
+	struct PvpTemplateChoice {
+		String templateName;
+		int weight = 1;
+
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+	Vector<PvpTemplateChoice> pvpImperialTemplates;
+	Vector<PvpTemplateChoice> pvpRebelTemplates;
+	bool pvpRankedJediEnabled = false;
+	bool pvpFrsFromNpcJediEnabled = false;
+	// P.7.4c: stock getArmorReduction early-returns for AiAgent defenders
+	// BEFORE the jedi mitigation block — an NPC's Force Armor/Shield buffs
+	// never mitigated anything. Flag gates the AiAgent-branch mitigation.
+	bool pvpJediNpcMitigation = false;
+	float pvpNpcFrsXpFactor = 1.f;
+	int pvpNpcFrsXpDailyCap = 0;
+	float pvpNpcFrsMinContributionPct = 0.10f;
+	struct PvpNpcFrsAwardStats {
+		uint64 playerID = 0;
+		int dayKey = 0;
+		int awardsToday = 0;
+		int xpToday = 0;
+		int capHitsToday = 0;
+		int totalAwards = 0;
+		int totalXp = 0;
+		int capHitsTotal = 0;
+		uint64 lastAwardMs = 0;
+
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+	VectorMap<uint64, PvpNpcFrsAwardStats> pvpNpcFrsAwardStats;
+	uint64 pvpNpcFrsXpAwardedTotal = 0;
+	uint64 pvpNpcFrsXpCapHitsTotal = 0;
 	bool pvpMaintenanceTaskScheduled = false;
 	uint64 nextPvpSquadId = 1;
 	Vector<SimPvpSquad> pvpSquads;
@@ -1221,6 +1254,9 @@ private:
 	bool pvpCommsPlayerGroupingEnabled = false;
 	int pvpCommsMaxPlayersPerSquad = 5;
 	float pvpCommsJoinRangeMeters = 48.f;
+	// P.7.4c: deliver an NPC defender's jedi-mitigation combat spam to the
+	// attacking player (otherwise invisible — NPCs have no client).
+	bool pvpCommsShowNpcMitigation = false;
 	int pvpGroupsFormedTotal = 0;
 	int pvpPlayersJoinedTotal = 0;
 	int pvpPlayersLeftTotal = 0;
@@ -1307,6 +1343,12 @@ private:
 	int pvpRouteHopRoutesTotal = 0;       // routes with >1 leg
 	int pvpTransitStopsTotal = 0;         // non-final legs boarded
 	int pvpRouteFallbacksTotal = 0;       // routed on, plan failed → legacy pick
+	// Orphan-bot sweep (log-only diagnostics for the owner's "unlinked bots
+	// standing at a starport" report): live sim PvP bots that no squad roster
+	// claims. Runs each maintenance tick; SimPvpOrphanBot log lines.
+	int pvpOrphanBotsDetectedTotal = 0;   // guarded by pvpSquadMutex
+	int pvpOrphanBotsLastSweep = 0;       // guarded by pvpSquadMutex
+	void sweepPvpOrphanBots();
 	// Plans a route for the squad (consumes an unexpired convergence stamp as
 	// the destination) and stores it on the squad. Resolves travel points and
 	// connectivity OUTSIDE the squad mutex; picks/stores under it. Returns
@@ -1321,6 +1363,10 @@ private:
 	void applyPvpConfig(LuaObject& pvpConfig);
 	void refreshPvpConfig();
 	void spawnPvpSquad(bool imperial, bool scout);
+	// Destroys whatever bots remain of a squad row being dropped (reform of a
+	// leader-missing squad can hold LIVE members) — never leak orphans. Same
+	// destroy choreography as despawnPvpSquads.
+	void despawnPvpSquadRemnants(const SimPvpSquad& squad, const String& reason);
 	// P.6.2: consume unexpired faction contacts - pick an eligible patrol
 	// squad and send it to the contact's city (per-squad + per-city cooldowns).
 	void dispatchPvpConvergence(uint64 nowMs);
@@ -1334,6 +1380,8 @@ private:
 	void schedulePvpBotCleanup(uint64 oid, int delaySeconds);
 	void despawnPvpSquads(const String& reason);
 	String pickPvpTemplate(bool imperial) const;
+	void loadPvpTemplateChoices(LuaObject& templateList,
+		Vector<PvpTemplateChoice>& choices);
 	// Caller must hold pvpSquadMutex. Returns -1 when the squad is gone.
 	int findPvpSquadIndex(uint64 squadId) const;
 
@@ -1470,9 +1518,23 @@ public:
 	float getPvpScanRadiusMeters() const { return pvpScanRadiusMeters; }
 	float getPvpCombatLeashMeters() const { return pvpCombatLeashMeters; }
 	bool isPvpBotVsBotCombatEnabled() const { return pvpAllowBotVsBotCombat; }
+	bool isPvpRankedJediEnabled() const { return pvpRankedJediEnabled; }
+	bool isPvpNpcFrsXpEnabled() const { return pvpFrsFromNpcJediEnabled; }
+	float getPvpNpcFrsXpFactor() const { return pvpNpcFrsXpFactor; }
+	float getPvpNpcFrsMinContributionPct() const { return pvpNpcFrsMinContributionPct; }
+	int recordPvpNpcFrsXpAward(uint64 playerID, int requestedXp);
+	void recordPvpNpcFrsXpCapHit(uint64 playerID);
 	int getPvpLoiterMinSeconds() const { return pvpLoiterMinSeconds; }
 	int getPvpLoiterMaxSeconds() const { return pvpLoiterMaxSeconds; }
 	bool isPvpLogStateTransitionsEnabled() const { return pvpLogStateTransitions; }
+	// P.7.4c: an NPC defender has no client, so its Force Armor/Shield/Absorb
+	// mitigation spam was silently dropped — when enabled, the attacking
+	// PLAYER receives it instead (flag-gated hook in
+	// CombatManager::sendMitigationCombatSpam).
+	bool isPvpNpcMitigationSpamEnabled() const { return pvpCommsShowNpcMitigation; }
+	// P.7.4c: gates the AiAgent-defender jedi mitigation in
+	// CombatManager::getArmorReduction (stock code early-returned before it).
+	bool isPvpJediNpcMitigationEnabled() const { return pvpJediNpcMitigation; }
 	float getPvpScoutScanRadiusMeters() const { return pvpScoutScanRadiusMeters; }
 	bool isPvpScoutReportOnly() const { return pvpScoutReportOnly; }
 	int getPvpScoutReportIntervalSeconds() const { return pvpScoutReportIntervalSeconds; }

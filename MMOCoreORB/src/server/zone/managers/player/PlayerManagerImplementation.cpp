@@ -21,6 +21,7 @@
 #include "templates/manager/TemplateManager.h"
 //#include "server/zone/managers/creature/CreatureTemplateManager.h"
 #include "server/zone/objects/creature/ai/CreatureTemplate.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
 #include "server/zone/managers/object/ObjectManager.h"
 #include "server/zone/managers/faction/FactionManager.h"
 #include "server/zone/managers/frs/FrsManager.h"
@@ -48,6 +49,7 @@
 #include "server/zone/objects/building/BuildingObject.h"
 #include "templates/building/CloningBuildingObjectTemplate.h"
 #include "server/zone/objects/player/PlayerObject.h"
+#include "server/zone/objects/player/variables/FrsData.h"
 #include "server/zone/objects/tangible/wearables/ArmorObject.h"
 #include "server/zone/objects/tangible/weapon/WeaponObject.h"
 #include "server/zone/objects/tangible/wearables/WearableObject.h"
@@ -111,7 +113,6 @@
 #include "server/zone/objects/tangible/components/droid/DroidPlaybackModuleDataComponent.h"
 #include "server/zone/objects/player/badges/Badge.h"
 #include "server/zone/objects/building/TutorialBuildingObject.h"
-#include "server/zone/managers/frs/FrsManager.h"
 #include "server/zone/objects/player/events/OnlinePlayerLogTask.h"
 #include <sys/stat.h>
 #include "server/zone/objects/transaction/TransactionLog.h"
@@ -1931,6 +1932,138 @@ void PlayerManagerImplementation::disseminateExperience(TangibleObject* destruct
 		if (gcwMan != nullptr) {
 			gcwBonus += (gcwMan->getGCWXPBonus() / 100.0f);
 			winningFaction = gcwMan->getWinningFaction();
+		}
+	}
+
+	// P.7.4b: ranked NPC Jedi supplement FRS XP using the live rank win table.
+	AiAgent* rankedNpcJedi = destructedObject->isAiAgent() ?
+		destructedObject->asAiAgent() : nullptr;
+	SimPlayerManager* simManager = SimPlayerManager::instance();
+	FrsManager* frsManager = server != nullptr ? server->getFrsManager() : nullptr;
+
+	if (rankedNpcJedi != nullptr && simManager != nullptr && frsManager != nullptr &&
+			frsManager->isFrsEnabled() && simManager->isPvpNpcFrsXpEnabled()) {
+		int npcRank = rankedNpcJedi->getFrsRank();
+		int npcCouncil = rankedNpcJedi->getFrsCouncil();
+
+		if (npcRank >= 0 && npcRank <= 11 &&
+				(npcCouncil == FrsManager::COUNCIL_LIGHT ||
+				npcCouncil == FrsManager::COUNCIL_DARK)) {
+			float minContribution = simManager->getPvpNpcFrsMinContributionPct();
+			float xpFactor = simManager->getPvpNpcFrsXpFactor();
+
+			for (int i = 0; i < threatMap->size(); ++i) {
+				ThreatMapEntry* entry = &threatMap->elementAt(i).getValue();
+				TangibleObject* attacker = threatMap->elementAt(i).getKey();
+
+				if (entry == nullptr || attacker == nullptr ||
+						!attacker->isPlayerCreature())
+					continue;
+
+				if (zone != nullptr && attacker->getZone() != zone)
+					continue;
+
+				if (!destructedObject->isInRangeZoneless(attacker, 80))
+					continue;
+
+				CreatureObject* attackerCreo = attacker->asCreatureObject();
+
+				if (attackerCreo == nullptr ||
+						attackerCreo->getFactionStatus() != FactionStatus::OVERT)
+					continue;
+
+				uint32 damage = entry->getTotalDamage();
+				if (damage == 0)
+					continue;
+
+				float contribution = static_cast<float>(damage) /
+					static_cast<float>(totalDamage);
+				if (contribution < minContribution)
+					continue;
+
+				Locker crossLocker(attackerCreo, destructedObject);
+
+				PlayerObject* attackerGhost = attackerCreo->getPlayerObject();
+				if (attackerGhost == nullptr)
+					continue;
+
+				FrsData* attackerFrs = attackerGhost->getFrsData();
+				int playerCouncil = attackerFrs->getCouncilType();
+
+				if (playerCouncil == 0 || playerCouncil == npcCouncil)
+					continue;
+
+				int baseFrsXp =
+					frsManager->getNpcRankWinExperienceGain(attackerGhost, npcRank);
+				int requestedXp = static_cast<int>(
+					static_cast<float>(baseFrsXp) * contribution * xpFactor);
+
+				if (requestedXp <= 0)
+					continue;
+
+				ManagedReference<CreatureObject*> attackerRef = attackerCreo;
+				FrsManager* frsRef = frsManager;
+
+				Core::getTaskManager()->executeTask(
+					[attackerRef, frsRef, requestedXp] () {
+						if (attackerRef == nullptr || frsRef == nullptr)
+							return;
+
+						SimPlayerManager* awardManager = SimPlayerManager::instance();
+						if (awardManager == nullptr)
+							return;
+
+						bool forceXpCapped = false;
+
+						{
+							Locker locker(attackerRef);
+							PlayerObject* ghost = attackerRef->getPlayerObject();
+
+							if (ghost == nullptr)
+								return;
+
+							forceXpCapped =
+								ghost->hasCappedExperience("force_rank_xp");
+						}
+
+						if (forceXpCapped) {
+							awardManager->recordPvpNpcFrsXpCapHit(
+								attackerRef->getObjectID());
+							return;
+						}
+
+						int awardXp = awardManager->recordPvpNpcFrsXpAward(
+							attackerRef->getObjectID(), requestedXp);
+
+						if (awardXp <= 0)
+							return;
+
+						forceXpCapped = false;
+
+						{
+							Locker locker(attackerRef);
+							PlayerObject* ghost = attackerRef->getPlayerObject();
+
+							if (ghost == nullptr)
+								return;
+
+							if (ghost->hasCappedExperience("force_rank_xp")) {
+								forceXpCapped = true;
+							} else {
+								if (frsRef == nullptr)
+									return;
+
+								Locker clocker(frsRef, attackerRef);
+								frsRef->adjustFrsExperience(attackerRef, awardXp);
+							}
+						}
+
+						if (forceXpCapped) {
+							awardManager->recordPvpNpcFrsXpCapHit(
+								attackerRef->getObjectID());
+						}
+					}, "SimPvpNpcFrsXpAwardTask");
+			}
 		}
 	}
 

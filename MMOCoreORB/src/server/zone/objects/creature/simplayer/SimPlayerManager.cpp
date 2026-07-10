@@ -626,8 +626,13 @@ namespace {
     const int AI_STATIONED_SAMPLE_RESULT_DELAY_MS = 3000;
     const int AI_STATIONED_SAMPLE_INTERVAL_MS = 25000;
     const int AI_MASTER_ARTISAN_SURVEY_SKILL = 100;
+    const uint64 NPC_FRS_AWARD_DAY_MS = 24ULL * 60ULL * 60ULL * 1000ULL;
     const char* AI_STATIONED_SAMPLE_INTERVAL_SOURCE =
         "player_sampling_code";
+
+    int getNpcFrsAwardDayKey(uint64 nowMs) {
+        return static_cast<int>(nowMs / NPC_FRS_AWARD_DAY_MS);
+    }
 }
 
 SimPlayerManager::SimPlayerManager() {
@@ -636,6 +641,7 @@ SimPlayerManager::SimPlayerManager() {
     lua->init();
     marketSupplyObservationStartedAtMs = System::getMiliTime();
     simulatedAcquisitionRuntime = new SimulatedAcquisitionRuntimeState();
+    pvpNpcFrsAwardStats.setAllowOverwriteInsertPlan();
 }
 
 SimPlayerManager::~SimPlayerManager() {
@@ -668,6 +674,98 @@ int SimPlayerManager::getGameDerivedMasterArtisanSurveySkill() {
 
 const char* SimPlayerManager::getGameDerivedStationedSampleIntervalSource() {
     return AI_STATIONED_SAMPLE_INTERVAL_SOURCE;
+}
+
+int SimPlayerManager::recordPvpNpcFrsXpAward(uint64 playerID, int requestedXp) {
+    if (!pvpFrsFromNpcJediEnabled || playerID == 0 || requestedXp <= 0)
+        return 0;
+
+    uint64 nowMs = System::getMiliTime();
+    int dayKey = getNpcFrsAwardDayKey(nowMs);
+    int awardXp = requestedXp;
+    bool capHit = false;
+
+    Locker squadLock(&pvpSquadMutex);
+
+    PvpNpcFrsAwardStats stats;
+    if (pvpNpcFrsAwardStats.contains(playerID))
+        stats = pvpNpcFrsAwardStats.get(playerID);
+    else
+        stats.playerID = playerID;
+
+    if (stats.dayKey != dayKey) {
+        stats.dayKey = dayKey;
+        stats.awardsToday = 0;
+        stats.xpToday = 0;
+        stats.capHitsToday = 0;
+    }
+
+    if (pvpNpcFrsXpDailyCap > 0) {
+        int remaining = pvpNpcFrsXpDailyCap - stats.xpToday;
+
+        if (remaining <= 0) {
+            stats.capHitsToday++;
+            stats.capHitsTotal++;
+            pvpNpcFrsXpCapHitsTotal++;
+            pvpNpcFrsAwardStats.put(playerID, stats);
+            return 0;
+        }
+
+        if (awardXp > remaining) {
+            awardXp = remaining;
+            capHit = true;
+        }
+    }
+
+    if (awardXp <= 0) {
+        pvpNpcFrsAwardStats.put(playerID, stats);
+        return 0;
+    }
+
+    stats.awardsToday++;
+    stats.xpToday += awardXp;
+    stats.totalAwards++;
+    stats.totalXp += awardXp;
+    stats.lastAwardMs = nowMs;
+    pvpNpcFrsXpAwardedTotal += awardXp;
+
+    if (capHit) {
+        stats.capHitsToday++;
+        stats.capHitsTotal++;
+        pvpNpcFrsXpCapHitsTotal++;
+    }
+
+    pvpNpcFrsAwardStats.put(playerID, stats);
+
+    return awardXp;
+}
+
+void SimPlayerManager::recordPvpNpcFrsXpCapHit(uint64 playerID) {
+    if (!pvpFrsFromNpcJediEnabled || playerID == 0)
+        return;
+
+    uint64 nowMs = System::getMiliTime();
+    int dayKey = getNpcFrsAwardDayKey(nowMs);
+
+    Locker squadLock(&pvpSquadMutex);
+
+    PvpNpcFrsAwardStats stats;
+    if (pvpNpcFrsAwardStats.contains(playerID))
+        stats = pvpNpcFrsAwardStats.get(playerID);
+    else
+        stats.playerID = playerID;
+
+    if (stats.dayKey != dayKey) {
+        stats.dayKey = dayKey;
+        stats.awardsToday = 0;
+        stats.xpToday = 0;
+        stats.capHitsToday = 0;
+    }
+
+    stats.capHitsToday++;
+    stats.capHitsTotal++;
+    pvpNpcFrsXpCapHitsTotal++;
+    pvpNpcFrsAwardStats.put(playerID, stats);
 }
 
 int SimPlayerManager::getGameDerivedStationedSampleYield(float density) {
@@ -5202,6 +5300,11 @@ void SimPlayerManager::loadLuaConfig() {
     pvpMaxRecoveryActionsPerInterval = 2;
     pvpImperialTemplates.removeAll();
     pvpRebelTemplates.removeAll();
+    pvpRankedJediEnabled = false;
+    pvpFrsFromNpcJediEnabled = false;
+    pvpNpcFrsXpFactor = 1.f;
+    pvpNpcFrsXpDailyCap = 0;
+    pvpNpcFrsMinContributionPct = 0.10f;
     // P.6.2 scout/convergence defaults (lua pvpConfig.scouts overrides).
     pvpScoutsEnabled = false;
     pvpScoutSquadsPerFaction = 1;
@@ -9106,6 +9209,7 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         commsJson["factionRoomPostsTotal"] = pvpFactionRoomPostsTotal;
         commsJson["factionRoomJoinsBlockedTotal"] = pvpFactionRoomJoinsBlockedTotal;
         commsJson["playerGrouping"] = pvpCommsPlayerGroupingEnabled;
+        commsJson["showNpcMitigation"] = pvpCommsShowNpcMitigation;
         commsJson["maxPlayersPerSquad"] = pvpCommsMaxPlayersPerSquad;
         commsJson["groupsFormedTotal"] = pvpGroupsFormedTotal;
         commsJson["playersJoinedTotal"] = pvpPlayersJoinedTotal;
@@ -9116,6 +9220,126 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
                 activeSquadGroups++;
         commsJson["activeSquadGroups"] = activeSquadGroups;
         pvpActivity["comms"] = commsJson;
+
+        // P.7.4a ranked NPC Jedi: rank metadata + baked FRS skillmod visibility.
+        JSONSerializationType jediRanksJson = JSONSerializationType::object();
+        jediRanksJson["enableRankedJedi"] = pvpRankedJediEnabled;
+        jediRanksJson["npcMitigation"] = pvpJediNpcMitigation;
+        jediRanksJson["frsFromNpcJedi"] = pvpFrsFromNpcJediEnabled;
+        jediRanksJson["npcXpFactor"] = pvpNpcFrsXpFactor;
+        jediRanksJson["npcFrsXpDailyCap"] = pvpNpcFrsXpDailyCap;
+        jediRanksJson["minContributionPct"] = pvpNpcFrsMinContributionPct;
+        jediRanksJson["npcFrsXpAwardedTotal"] =
+            String::valueOf(pvpNpcFrsXpAwardedTotal);
+        jediRanksJson["npcFrsXpCapHitsTotal"] =
+            String::valueOf(pvpNpcFrsXpCapHitsTotal);
+
+        int awardDayKey = getNpcFrsAwardDayKey(nowMs);
+        JSONSerializationType awardRows = JSONSerializationType::array();
+        for (int i = 0; i < pvpNpcFrsAwardStats.size(); ++i) {
+            const PvpNpcFrsAwardStats& stats = pvpNpcFrsAwardStats.get(i);
+            bool today = stats.dayKey == awardDayKey;
+
+            JSONSerializationType row = JSONSerializationType::object();
+            row["playerId"] = String::valueOf(stats.playerID);
+            row["awardsToday"] = today ? stats.awardsToday : 0;
+            row["xpToday"] = today ? stats.xpToday : 0;
+            row["capHitsToday"] = today ? stats.capHitsToday : 0;
+            row["totalAwards"] = stats.totalAwards;
+            row["totalXp"] = stats.totalXp;
+            row["capHitsTotal"] = stats.capHitsTotal;
+            int lastAwardAgeSeconds = -1;
+            if (stats.lastAwardMs > 0 && stats.lastAwardMs <= nowMs)
+                lastAwardAgeSeconds =
+                    static_cast<int>((nowMs - stats.lastAwardMs) / 1000);
+
+            row["lastAwardAgeSeconds"] = lastAwardAgeSeconds;
+            awardRows.push_back(row);
+        }
+        jediRanksJson["awardsTodayByPlayer"] = awardRows;
+
+        int rankedJediTotal = 0;
+        int lightRankedJediTotal = 0;
+        int darkRankedJediTotal = 0;
+        int rankCounts[12];
+        for (int i = 0; i < 12; ++i)
+            rankCounts[i] = 0;
+
+        JSONSerializationType rankedRows = JSONSerializationType::array();
+
+        auto addRankedJediRow = [&](const SimPvpSquad& squad, uint64 oid,
+                const String& role) {
+            Reference<SimPlayerController*> ctrl;
+            if (controllers.contains(oid))
+                ctrl = controllers.get(oid);
+
+            ManagedReference<AiAgent*> agent =
+                ctrl == nullptr ? nullptr : ctrl->getAgent();
+            if (agent == nullptr)
+                return;
+
+            int rank = agent->getFrsRank();
+            int council = agent->getFrsCouncil();
+            if (rank < 0 || rank > 11)
+                return;
+
+            rankedJediTotal++;
+            rankCounts[rank]++;
+
+            String councilName = "unknown";
+            String side = "";
+            if (council == 1) {
+                councilName = "light";
+                side = "light";
+                lightRankedJediTotal++;
+            } else if (council == 2) {
+                councilName = "dark";
+                side = "dark";
+                darkRankedJediTotal++;
+            }
+
+            const CreatureTemplate* creatureTemplate = agent->getCreatureTemplate();
+
+            JSONSerializationType row = JSONSerializationType::object();
+            row["squadId"] = squad.squadId;
+            row["faction"] = squad.imperial ? "imperial" : "rebel";
+            row["role"] = role;
+            row["oid"] = String::valueOf(oid);
+            row["template"] = creatureTemplate == nullptr ? String("") :
+                creatureTemplate->getTemplateName();
+            row["council"] = councilName;
+            row["rank"] = rank;
+            row["forceControl"] = side.isEmpty() ? 0 :
+                agent->getSkillMod("force_control_" + side);
+            row["forceManipulation"] = side.isEmpty() ? 0 :
+                agent->getSkillMod("force_manipulation_" + side);
+            row["forcePowerMax"] = agent->getSkillMod("jedi_force_power_max");
+            row["forcePowerRegen"] = agent->getSkillMod("jedi_force_power_regen");
+            rankedRows.push_back(row);
+        };
+
+        for (int i = 0; i < pvpSquads.size(); ++i) {
+            const SimPvpSquad& squad = pvpSquads.get(i);
+            addRankedJediRow(squad, squad.leaderOid, "leader");
+
+            for (int m = 0; m < squad.memberOids.size(); ++m)
+                addRankedJediRow(squad, squad.memberOids.get(m), "member");
+        }
+
+        JSONSerializationType rankRows = JSONSerializationType::array();
+        for (int i = 0; i < 12; ++i) {
+            JSONSerializationType row = JSONSerializationType::object();
+            row["rank"] = i;
+            row["count"] = rankCounts[i];
+            rankRows.push_back(row);
+        }
+
+        jediRanksJson["rankedJediActive"] = rankedJediTotal;
+        jediRanksJson["lightRankedJediActive"] = lightRankedJediTotal;
+        jediRanksJson["darkRankedJediActive"] = darkRankedJediTotal;
+        jediRanksJson["byRank"] = rankRows;
+        jediRanksJson["rows"] = rankedRows;
+        pvpActivity["jediRanks"] = jediRanksJson;
 
         // P.6.5a routed travel.
         JSONSerializationType routedJson = JSONSerializationType::object();
@@ -9133,6 +9357,9 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         routedJson["hopRoutesTotal"] = pvpRouteHopRoutesTotal;
         routedJson["transitStopsTotal"] = pvpTransitStopsTotal;
         routedJson["fallbacksTotal"] = pvpRouteFallbacksTotal;
+        // Orphan-bot sweep diagnostics (log-only; SimPvpOrphanBot lines).
+        routedJson["orphanBotsLastSweep"] = pvpOrphanBotsLastSweep;
+        routedJson["orphanBotsDetectedTotal"] = pvpOrphanBotsDetectedTotal;
 
         JSONSerializationType mainPlanetRows = JSONSerializationType::array();
         for (int i = 0; i < pvpTravelMainPlanets.size(); ++i)
@@ -9197,6 +9424,7 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
             row["travels"] = squad.travels;
             row["engagements"] = squad.engagements;
             row["reforming"] = squad.reforming;
+            row["leaderDeadPendingPromotion"] = squad.leaderDeadPendingPromotion;
             row["travelTaskActive"] = squad.travelTaskActive;
             // P.6.5a: mid-route visibility (empty/0 while idle at a city).
             row["routeDest"] = squad.routeDestCity.isEmpty() ? String("") :
@@ -21038,6 +21266,8 @@ void SimPlayerManager::applyPvpConfig(LuaObject& pvpConfig) {
             "factionRoomRequireOvert", pvpCommsFactionRoomRequireOvert);
         pvpCommsPlayerGroupingEnabled = comms.getBooleanField(
             "playerGrouping", pvpCommsPlayerGroupingEnabled);
+        pvpCommsShowNpcMitigation = comms.getBooleanField(
+            "showNpcMitigation", pvpCommsShowNpcMitigation);
         pvpCommsMaxPlayersPerSquad = clampMinerInt(
             comms.getIntField("maxPlayersPerSquad"), pvpCommsMaxPlayersPerSquad, 1, 19);
 
@@ -21050,22 +21280,42 @@ void SimPlayerManager::applyPvpConfig(LuaObject& pvpConfig) {
     LuaObject templates = pvpConfig.getObjectField("templates");
     if (templates.isValidTable()) {
         LuaObject imperialList = templates.getObjectField("imperial");
-        if (imperialList.isValidTable() && imperialList.getTableSize() > 0) {
-            pvpImperialTemplates.removeAll();
-            for (int i = 1; i <= imperialList.getTableSize(); ++i)
-                pvpImperialTemplates.add(imperialList.getStringAt(i));
-        }
+        if (imperialList.isValidTable() && imperialList.getTableSize() > 0)
+            loadPvpTemplateChoices(imperialList, pvpImperialTemplates);
         imperialList.pop();
 
         LuaObject rebelList = templates.getObjectField("rebel");
-        if (rebelList.isValidTable() && rebelList.getTableSize() > 0) {
-            pvpRebelTemplates.removeAll();
-            for (int i = 1; i <= rebelList.getTableSize(); ++i)
-                pvpRebelTemplates.add(rebelList.getStringAt(i));
-        }
+        if (rebelList.isValidTable() && rebelList.getTableSize() > 0)
+            loadPvpTemplateChoices(rebelList, pvpRebelTemplates);
         rebelList.pop();
     }
     templates.pop();
+
+    // P.7.4 ranked NPC Jedi. C++ defaults remain off; lua can enable ranked
+    // NPC skillmods and the P.7.4b player FRS XP hook independently.
+    LuaObject jediRanks = pvpConfig.getObjectField("jediRanks");
+    if (jediRanks.isValidTable()) {
+        pvpRankedJediEnabled = jediRanks.getBooleanField(
+            "enableRankedJedi", pvpRankedJediEnabled);
+        pvpFrsFromNpcJediEnabled = jediRanks.getBooleanField(
+            "frsFromNpcJedi", pvpFrsFromNpcJediEnabled);
+        pvpJediNpcMitigation = jediRanks.getBooleanField(
+            "npcMitigation", pvpJediNpcMitigation);
+
+        float xpFactor = jediRanks.getFloatField("npcXpFactor", pvpNpcFrsXpFactor);
+        if (xpFactor >= 0.f && xpFactor <= 100.f)
+            pvpNpcFrsXpFactor = xpFactor;
+
+        pvpNpcFrsXpDailyCap = clampMinerInt(
+            jediRanks.getIntField("npcFrsXpDailyCap"),
+            pvpNpcFrsXpDailyCap, 0, 100000000);
+
+        float minContribution =
+            jediRanks.getFloatField("minContributionPct", pvpNpcFrsMinContributionPct);
+        if (minContribution >= 0.f && minContribution <= 1.f)
+            pvpNpcFrsMinContributionPct = minContribution;
+    }
+    jediRanks.pop();
 
     // P.6.5 travel: routed player-mimetic travel config + the P.6.5-0
     // read-only diagnostics spike (runs once per boot when a flag is on).
@@ -21441,13 +21691,57 @@ void SimPlayerManager::schedulePvpMaintenanceTask() {
     task->schedule(pvpMaintenanceIntervalSeconds * 1000);
 }
 
+void SimPlayerManager::loadPvpTemplateChoices(LuaObject& templateList,
+        Vector<PvpTemplateChoice>& choices) {
+    if (!templateList.isValidTable() || templateList.getTableSize() <= 0)
+        return;
+
+    choices.removeAll();
+
+    for (int i = 1; i <= templateList.getTableSize(); ++i) {
+        PvpTemplateChoice choice;
+
+        LuaObject entry = templateList.getObjectAt(i);
+        if (entry.isValidTable()) {
+            choice.templateName = entry.getStringField("template").trim();
+            if (choice.templateName.isEmpty())
+                choice.templateName = entry.getStringField("name").trim();
+            choice.weight = clampMinerInt(entry.getIntField("weight"), 1, 1, 100000);
+        } else {
+            choice.templateName = templateList.getStringAt(i).trim();
+            choice.weight = 1;
+        }
+        entry.pop();
+
+        if (!choice.templateName.isEmpty())
+            choices.add(choice);
+    }
+}
+
 String SimPlayerManager::pickPvpTemplate(bool imperial) const {
-    const Vector<String>& list = imperial ? pvpImperialTemplates : pvpRebelTemplates;
+    const Vector<PvpTemplateChoice>& list =
+        imperial ? pvpImperialTemplates : pvpRebelTemplates;
 
     if (list.size() == 0)
         return imperial ? "stormtrooper" : "rebel_trooper";
 
-    return list.get(System::random(list.size() - 1));
+    int totalWeight = 0;
+    for (int i = 0; i < list.size(); ++i)
+        totalWeight += list.get(i).weight;
+
+    if (totalWeight <= 0)
+        return list.get(System::random(list.size() - 1)).templateName;
+
+    int roll = System::random(totalWeight - 1);
+    for (int i = 0; i < list.size(); ++i) {
+        const PvpTemplateChoice& choice = list.get(i);
+        if (roll < choice.weight)
+            return choice.templateName;
+
+        roll -= choice.weight;
+    }
+
+    return list.get(list.size() - 1).templateName;
 }
 
 int SimPlayerManager::findPvpSquadIndex(uint64 squadId) const {
@@ -21700,6 +21994,8 @@ void SimPlayerManager::onPvpSquadReadyToTravel(uint64 squadId) {
     if (!enabled || !pvpEnabled)
         return;
 
+    SimPvpSquad snapshot;
+
     {
         Locker squadLock(&pvpSquadMutex);
         int idx = findPvpSquadIndex(squadId);
@@ -21713,6 +22009,23 @@ void SimPlayerManager::onPvpSquadReadyToTravel(uint64 squadId) {
             return;
 
         squad.travelTaskActive = true;
+        snapshot = squad;
+    }
+
+    // P.6.5a fix (owner report: "chats not sending before traveling"): plan
+    // the route and speak the MOVEOUT callout NOW, while the squad stands at
+    // the pad waiting for its ship — announcing inside boardPvpSquad fired at
+    // the teleport instant, so the spatial line raced the switchZone despawn
+    // and nearby players never saw it. Here the callout lands seconds-to-
+    // minutes before departure (players can literally board with them).
+    // boardPvpSquad keeps its plan-if-empty fallback (board-anyway paths,
+    // convergence replans).
+    if (pvpRoutedTravelEnabled && snapshot.pendingRoute.size() == 0) {
+        String routeSummary;
+        bool convergence = false;
+
+        if (planPvpRoute(squadId, snapshot, routeSummary, convergence))
+            announcePvpEvent(squadId, PVP_ANNOUNCE_MOVEOUT, routeSummary);
     }
 
     Reference<SimPvpShuttleWaitTask*> task = new SimPvpShuttleWaitTask(squadId, 0);
@@ -22084,6 +22397,88 @@ bool SimPlayerManager::popNextPvpRouteLeg(uint64 squadId, PvpTravelLeg& legOut,
     }
 
     return true;
+}
+
+void SimPlayerManager::sweepPvpOrphanBots() {
+    // Diagnostics (owner report: lone imperials at a starport that no
+    // dashboard squad claimed): find LIVE sim PvP bots whose squad no longer
+    // exists or whose squad roster no longer lists them. LOG-ONLY — names the
+    // orphan and where it stands so the report can be confirmed or retired;
+    // no despawn until the producing mechanism (if any) is understood.
+    Vector<uint64> botOids;
+    Vector<uint64> botSquadIds;
+
+    for (int i = 0; i < controllers.size(); ++i) {
+        uint64 key = controllers.getKey(i);
+        Reference<SimPlayerController*> ctrl = controllers.get(key);
+        SimPvpBotController* bot =
+            ctrl == nullptr ? nullptr :
+            dynamic_cast<SimPvpBotController*>(ctrl.get());
+
+        if (bot != nullptr) {
+            botOids.add(key);
+            botSquadIds.add(bot->getSquadId());
+        }
+    }
+
+    int orphans = 0;
+
+    for (int i = 0; i < botOids.size(); ++i) {
+        uint64 oid = botOids.get(i);
+        uint64 botSquadId = botSquadIds.get(i);
+        bool known = false;
+
+        {
+            Locker squadLock(&pvpSquadMutex);
+            int idx = findPvpSquadIndex(botSquadId);
+
+            if (idx >= 0) {
+                const SimPvpSquad& squad = pvpSquads.get(idx);
+
+                // Reform windows and pending promotions are legitimate
+                // roster gaps — never flag those.
+                if (squad.reforming || squad.leaderDeadPendingPromotion ||
+                        squad.leaderOid == oid) {
+                    known = true;
+                } else {
+                    for (int m = 0; m < squad.memberOids.size() && !known; ++m)
+                        known = squad.memberOids.get(m) == oid;
+                }
+            }
+        }
+
+        if (known)
+            continue;
+
+        // Dead bots awaiting the delayed corpse cleanup are expected; only a
+        // LIVE agent no squad claims is an orphan.
+        Reference<SimPlayerController*> ctrl;
+        if (controllers.contains(oid))
+            ctrl = controllers.get(oid);
+
+        ManagedReference<AiAgent*> agent =
+            ctrl == nullptr ? nullptr : ctrl->getAgent();
+
+        if (agent == nullptr || agent->isDead())
+            continue;
+
+        Zone* zone = agent->getZone();
+        Vector3 position = agent->getWorldPosition();
+        orphans++;
+
+        info("SimPvpOrphanBot oid=" + String::valueOf(oid) +
+             " squad=" + String::valueOf(botSquadId) +
+             " zone=" + (zone != nullptr ? zone->getZoneName() : String("none")) +
+             " pos=(" + String::valueOf((int)position.getX()) + "," +
+             String::valueOf((int)position.getY()) + ")", true);
+    }
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        pvpOrphanBotsLastSweep = orphans;
+        if (orphans > 0)
+            pvpOrphanBotsDetectedTotal += orphans;
+    }
 }
 
 void SimPlayerManager::boardPvpSquad(uint64 squadId) {
@@ -22469,6 +22864,7 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
 
 void SimPlayerManager::onPvpBotDied(uint64 squadId, uint64 oid) {
     bool wasLeader = false;
+    bool countedDeath = false;
 
     {
         Locker squadLock(&pvpSquadMutex);
@@ -22476,20 +22872,28 @@ void SimPlayerManager::onPvpBotDied(uint64 squadId, uint64 oid) {
 
         if (idx >= 0) {
             SimPvpSquad& squad = pvpSquads.get(idx);
-            squad.deaths++;
-            pvpDeathsTotal++;
 
             if (squad.leaderOid == oid) {
-                squad.leaderDeadPendingPromotion = true;
                 wasLeader = true;
+
+                if (!squad.leaderDeadPendingPromotion) {
+                    squad.leaderDeadPendingPromotion = true;
+                    countedDeath = true;
+                }
             } else {
                 for (int i = 0; i < squad.memberOids.size(); ++i) {
                     if (squad.memberOids.get(i) == oid) {
                         squad.memberOids.remove(i);
+                        squad.pendingReplacements++;
+                        countedDeath = true;
                         break;
                     }
                 }
-                squad.pendingReplacements++;
+            }
+
+            if (countedDeath) {
+                squad.deaths++;
+                pvpDeathsTotal++;
             }
         }
     }
@@ -22498,7 +22902,8 @@ void SimPlayerManager::onPvpBotDied(uint64 squadId, uint64 oid) {
 
     info("SimPvpBotDied squad=" + String::valueOf(squadId) +
          " oid=" + String::valueOf(oid) +
-         " role=" + (wasLeader ? String("leader") : String("member")), true);
+         " role=" + (wasLeader ? String("leader") : String("member")) +
+         " counted=" + String::valueOf(countedDeath), true);
 }
 
 void SimPlayerManager::schedulePvpBotCleanup(uint64 oid, int delaySeconds) {
@@ -22507,28 +22912,28 @@ void SimPlayerManager::schedulePvpBotCleanup(uint64 oid, int delaySeconds) {
 }
 
 void SimPlayerManager::runPvpBotCleanupTask(uint64 oid) {
-    controllers.drop(oid);
-
     ZoneServer* zoneServer = ServerCore::getZoneServer();
-    if (zoneServer == nullptr)
-        return;
 
-    ManagedReference<SceneObject*> obj = zoneServer->getObject(oid);
+    ManagedReference<SceneObject*> obj =
+        zoneServer == nullptr ? nullptr : zoneServer->getObject(oid);
     ManagedReference<AiAgent*> agent = cast<AiAgent*>(obj.get());
 
-    if (agent == nullptr)
-        return;
-
-    {
+    if (agent != nullptr) {
         Locker locker(agent);
 
-        // Never destroy a live bot from a stale cleanup.
+        // Never destroy a LIVE bot from a stale cleanup — and never strip its
+        // controller either (dropping before this guard would leave a live,
+        // squad-tracked bot without its controller: no ticks, no death report).
         if (!agent->isDead() && !agent->isIncapacitated())
             return;
     }
 
-    agent->destroyObjectFromWorld(true);
-    agent->destroyObjectFromDatabase(true);
+    controllers.drop(oid);
+
+    if (agent != nullptr) {
+        agent->destroyObjectFromWorld(true);
+        agent->destroyObjectFromDatabase(true);
+    }
 }
 
 void SimPlayerManager::recordPvpEngagement(uint64 squadId, bool targetWasPlayer) {
@@ -23729,6 +24134,49 @@ void SimPlayerManager::despawnPvpSquads(const String& reason) {
     }
 }
 
+void SimPlayerManager::despawnPvpSquadRemnants(const SimPvpSquad& squad,
+        const String& reason) {
+    // Destroys whatever bots remain of a squad row that is being dropped.
+    // A reform previously ASSUMED a full wipe (all bots dead) — a live
+    // leftover became an invisible orphan standing at its last pad, still
+    // scanning/fighting but claimed by no roster (owner-observed at Bestine;
+    // the orphan sweep confirmed squads 2/4/8 leaking members 2026-07-09
+    // after leader-missing reforms). Same destroy choreography as
+    // despawnPvpSquads.
+    Vector<uint64> oids;
+    oids.add(squad.leaderOid);
+    for (int i = 0; i < squad.memberOids.size(); ++i)
+        oids.add(squad.memberOids.get(i));
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    int destroyed = 0;
+
+    for (int i = 0; i < oids.size(); ++i) {
+        uint64 oid = oids.get(i);
+        controllers.drop(oid);
+
+        if (zoneServer == nullptr)
+            continue;
+
+        ManagedReference<SceneObject*> obj = zoneServer->getObject(oid);
+        ManagedReference<AiAgent*> agent = cast<AiAgent*>(obj.get());
+
+        if (agent == nullptr)
+            continue;
+
+        agent->destroyObjectFromWorld(true);
+        agent->destroyObjectFromDatabase(true);
+        destroyed++;
+    }
+
+    if (destroyed > 0) {
+        info("SimPvpSquadRemnantsDespawned squad=" +
+             String::valueOf(squad.squadId) +
+             " bots=" + String::valueOf(destroyed) +
+             " reason=" + reason, true);
+    }
+}
+
 void SimPlayerManager::runPvpMaintenanceTask() {
     pvpMaintenanceTaskScheduled = false;
 
@@ -23769,6 +24217,9 @@ void SimPlayerManager::runPvpMaintenanceTask() {
     // P.6.5-0: one-shot read-only travel diagnostics (fare-matrix dump +
     // starport interior path test); results on the dashboard.
     runPvpTravelDiagnosticsIfNeeded();
+
+    // Orphan-bot sweep (log-only diagnostics; see sweepPvpOrphanBots).
+    sweepPvpOrphanBots();
 
     uint64 nowMs = System::getMiliTime();
 
@@ -23826,13 +24277,24 @@ void SimPlayerManager::runPvpMaintenanceTask() {
         // 2a) Wipe re-form due: drop the old row and field a fresh squad.
         if (squad.reforming) {
             if (nowMs >= squad.reformAtMs) {
+                SimPvpSquad removedRow;
+                bool removed = false;
+
                 {
                     Locker squadLock(&pvpSquadMutex);
                     int idx = findPvpSquadIndex(squad.squadId);
-                    if (idx >= 0)
+                    if (idx >= 0) {
+                        removedRow = pvpSquads.get(idx);
                         pvpSquads.remove(idx);
+                        removed = true;
+                    }
                     pvpSquadReformsTotal++;
                 }
+
+                // Destroy any bots still standing (a leader-missing reform
+                // can drop a row with LIVE members) — never leak orphans.
+                if (removed)
+                    despawnPvpSquadRemnants(removedRow, "reform");
 
                 info("SimPvpSquadReformed squad=" + String::valueOf(squad.squadId) +
                      " faction=" + (squad.imperial ? String("imperial") : String("rebel")),
@@ -23985,11 +24447,32 @@ void SimPlayerManager::runPvpMaintenanceTask() {
 
         if (leaderCtrl == nullptr || leaderAgent == nullptr ||
                 leaderAgent->getZone() == nullptr) {
-            // Leader vanished without a death event (should not happen):
-            // treat as a wipe-level fault and re-form promptly. P.6.3c: disband
-            // any group first so players aren't stranded on a dead leader.
-            if (squad.groupId != 0)
-                disbandSquadGroup(squad.groupId, "leaderMissing");
+            // Leader vanished without a death event. Observed live 2026-07-09:
+            // a player kills AND LOOTS the leader — the looted corpse despawns
+            // within seconds, before the controller tick or this maintenance
+            // pass can see the death, so no promotion was ever marked. The old
+            // behavior reformed the whole squad here, which LEAKED the still-
+            // live members as roster-less orphans (the Bestine report). Now:
+            // if any member is alive, run the NORMAL promotion path; only a
+            // fully gone squad reforms.
+            String cause = leaderRef == nullptr ? "controllerGone"
+                : (leaderAgent == nullptr ? "agentGone"
+                : (leaderCtrl == nullptr ? "controllerWrongType" : "zoneNull"));
+
+            bool hasLiveMember = false;
+
+            for (int i = 0; i < squad.memberOids.size() && !hasLiveMember; ++i) {
+                Reference<SimPlayerController*> memberRef;
+                if (controllers.contains(squad.memberOids.get(i)))
+                    memberRef = controllers.get(squad.memberOids.get(i));
+
+                ManagedReference<AiAgent*> memberAgent =
+                    memberRef == nullptr ? nullptr : memberRef->getAgent();
+
+                hasLiveMember = memberAgent != nullptr &&
+                    !memberAgent->isDead() && !memberAgent->isIncapacitated() &&
+                    memberAgent->getZone() != nullptr;
+            }
 
             Locker squadLock(&pvpSquadMutex);
             int idx = findPvpSquadIndex(squad.squadId);
@@ -23997,14 +24480,71 @@ void SimPlayerManager::runPvpMaintenanceTask() {
             if (idx >= 0) {
                 SimPvpSquad& live = pvpSquads.get(idx);
 
-                if (!live.reforming) {
+                if (hasLiveMember) {
+                    if (!live.leaderDeadPendingPromotion && !live.reforming) {
+                        live.leaderDeadPendingPromotion = true;
+                        live.travelTaskActive = false;
+                        live.deaths++;
+                        pvpDeathsTotal++;
+
+                        info("SimPvpLeaderMissing squad=" +
+                             String::valueOf(squad.squadId) +
+                             " cause=" + cause + " action=promote", true);
+                    }
+                } else if (!live.reforming) {
                     live.reforming = true;
                     live.groupId = 0;
                     live.reformAtMs = nowMs + (uint64)pvpRespawnDelaySeconds * 1000;
 
-                    info("SimPvpLeaderMissing squad=" + String::valueOf(squad.squadId) +
-                         " scheduling reform", true);
+                    info("SimPvpLeaderMissing squad=" +
+                         String::valueOf(squad.squadId) +
+                         " cause=" + cause + " action=reform", true);
                 }
+            }
+
+            squadLock.release();
+
+            // P.6.3c: disband any group only on the reform path (a promotion
+            // transfers group leadership to the new NPC leader instead).
+            if (!hasLiveMember && squad.groupId != 0)
+                disbandSquadGroup(squad.groupId, "leaderMissing");
+
+            continue;
+        }
+
+        // If the controller tick chain is lost while a leader is killed/incapped
+        // (for example moveTo() was entered already in combat and scheduled no
+        // arrival checks), the manager must still drive the normal promotion/wipe
+        // path. Otherwise the dead leader row keeps counting against population
+        // forever with all follower replacements pending.
+        if (leaderAgent->isDead() || leaderAgent->isIncapacitated()) {
+            bool markedLeaderDown = false;
+
+            {
+                Locker squadLock(&pvpSquadMutex);
+                int idx = findPvpSquadIndex(squad.squadId);
+
+                if (idx >= 0) {
+                    SimPvpSquad& live = pvpSquads.get(idx);
+
+                    if (!live.leaderDeadPendingPromotion && !live.reforming) {
+                        live.leaderDeadPendingPromotion = true;
+                        live.travelTaskActive = false;
+                        live.deaths++;
+                        pvpDeathsTotal++;
+                        markedLeaderDown = true;
+                    }
+                }
+            }
+
+            if (markedLeaderDown) {
+                schedulePvpBotCleanup(squad.leaderOid, pvpCorpseCleanupDelaySeconds);
+
+                info("SimPvpLeaderDownDetected squad=" + String::valueOf(squad.squadId) +
+                     " state=" + (leaderAgent->isDead() ? String("dead") : String("incapacitated")) +
+                     " membersAlive=" + String::valueOf(squad.memberOids.size()) +
+                     " pendingReplacements=" + String::valueOf(squad.pendingReplacements) +
+                     " action=promoteOrReform", true);
             }
 
             continue;

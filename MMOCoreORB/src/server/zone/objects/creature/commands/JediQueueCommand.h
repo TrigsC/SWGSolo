@@ -133,7 +133,7 @@ public:
             AiAgent* ai = creature->asAiAgent();
             if (ai != nullptr) {
                 // Safety: Ensure a minimum cost so they can't spam free spells
-                int cost = forceCost;
+                int cost = getFrsModifiedForceCost(creature);
                 if (cost <= 0) cost = 50; 
 
                 if (ai->getCurrentForce() < cost) {
@@ -218,17 +218,27 @@ public:
 	}
 
 	int getFrsModifiedBuffValue(CreatureObject* player, int amount) const {
-		PlayerObject* ghost = player->getPlayerObject();
+		int councilType = 0;
 
-		if (ghost == nullptr)
-			return amount;
+		if (player->isAiAgent()) {
+			AiAgent* agent = player->asAiAgent();
+			if (agent == nullptr || agent->getFrsRank() < 0)
+				return amount;
 
-		Locker locker(player);
+			councilType = agent->getFrsCouncil();
+		} else {
+			PlayerObject* ghost = player->getPlayerObject();
 
-		FrsData* playerData = ghost->getFrsData();
-		short councilType = playerData->getCouncilType();
+			if (ghost == nullptr)
+				return amount;
 
-		locker.release();
+			Locker locker(player);
+
+			FrsData* playerData = ghost->getFrsData();
+			councilType = playerData->getCouncilType();
+
+			locker.release();
+		}
 
 		float buffModifier = 0;
 		int controlModifier = 0;
@@ -249,22 +259,27 @@ public:
 
 
 	int getFrsModifiedForceCost(CreatureObject* creature) const {
-		// AI has no FRS stats, just return the base cost.
-        if (creature->isAiAgent()) {
-            return forceCost;
-        }
+		int councilType = 0;
 
-		ManagedReference<PlayerObject*> ghost = creature->getPlayerObject();
+		if (creature->isAiAgent()) {
+			AiAgent* agent = creature->asAiAgent();
+			if (agent == nullptr || agent->getFrsRank() < 0)
+				return forceCost;
 
-		if (ghost == nullptr)
-			return forceCost;
+			councilType = agent->getFrsCouncil();
+		} else {
+			ManagedReference<PlayerObject*> ghost = creature->getPlayerObject();
 
-		Locker locker(creature);
+			if (ghost == nullptr)
+				return forceCost;
 
-		FrsData* playerData = ghost->getFrsData();
-		int councilType = playerData->getCouncilType();
+			Locker locker(creature);
 
-		locker.release();
+			FrsData* playerData = ghost->getFrsData();
+			councilType = playerData->getCouncilType();
+
+			locker.release();
+		}
 
 		int manipulationMod = 0;
 		float frsModifier = 0;
@@ -284,17 +299,27 @@ public:
 	}
 
 	float getFrsModifiedExtraForceCost(CreatureObject* creature, float val) const {
-		ManagedReference<PlayerObject*> ghost = creature->getPlayerObject();
+		int councilType = 0;
 
-		if (ghost == nullptr)
-			return val;
+		if (creature->isAiAgent()) {
+			AiAgent* agent = creature->asAiAgent();
+			if (agent == nullptr || agent->getFrsRank() < 0)
+				return val;
 
-		Locker locker(creature);
+			councilType = agent->getFrsCouncil();
+		} else {
+			ManagedReference<PlayerObject*> ghost = creature->getPlayerObject();
 
-		FrsData* playerData = ghost->getFrsData();
-		int councilType = playerData->getCouncilType();
+			if (ghost == nullptr)
+				return val;
 
-		locker.release();
+			Locker locker(creature);
+
+			FrsData* playerData = ghost->getFrsData();
+			councilType = playerData->getCouncilType();
+
+			locker.release();
+		}
 
 		int manipulationMod = 0;
 		float frsModifier = 0;
@@ -326,7 +351,7 @@ public:
         else if (creature->isAiAgent()) {
             AiAgent* ai = creature->asAiAgent();
             if (ai != nullptr) {
-                 int cost = forceCost;
+                 int cost = getFrsModifiedForceCost(creature);
                  if (cost <= 0) cost = 50; // Default fallback
 
                  int newForce = ai->getCurrentForce() - cost;

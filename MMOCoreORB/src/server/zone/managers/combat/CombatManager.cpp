@@ -30,6 +30,7 @@
 #include "server/zone/objects/installation/InstallationObject.h"
 #include "server/zone/packets/object/ShowFlyText.h"
 #include "server/zone/managers/frs/FrsManager.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
 #include "server/zone/objects/intangible/PetControlDevice.h"
 #include "server/zone/objects/installation/TurretObject.h"
 
@@ -787,10 +788,13 @@ void CombatManager::finalCombatSpam(TangibleObject* attacker, WeaponObject* weap
 					int psgDmgAbsorbed = hitList->getPsgMitigation();
 					int armorDmgAbsorbed = hitList->getArmorMitigation();
 
+					// P.7.4c: pass the attacker so an NPC defender's jedi
+					// mitigation is shown to the attacking player (flag-gated
+					// inside; NPCs have no client to receive their own spam).
 					if (jediMitigation > 0 && !data.isForceAttack()) {
-						sendMitigationCombatSpam(defenderCreo, nullptr, jediMitigation, FORCEARMOR);
+						sendMitigationCombatSpam(defenderCreo, nullptr, jediMitigation, FORCEARMOR, attacker);
 					} else if (jediMitigation > 0) {
-						sendMitigationCombatSpam(defenderCreo, nullptr, jediMitigation, FORCESHIELD);
+						sendMitigationCombatSpam(defenderCreo, nullptr, jediMitigation, FORCESHIELD, attacker);
 					}
 
 					if (feedbackDmg > 0) {
@@ -798,7 +802,7 @@ void CombatManager::finalCombatSpam(TangibleObject* attacker, WeaponObject* weap
 					}
 
 					if (forceAbsorb > 0) {
-						sendMitigationCombatSpam(defenderCreo, nullptr, forceAbsorb, FORCEABSORB);
+						sendMitigationCombatSpam(defenderCreo, nullptr, forceAbsorb, FORCEABSORB, attacker);
 					}
 
 					ManagedReference<ArmorObject*> psg = getPSGArmor(defenderCreo);
@@ -865,8 +869,28 @@ void CombatManager::broadcastCombatSpam(TangibleObject* attacker, TangibleObject
 	}
 }
 
-void CombatManager::sendMitigationCombatSpam(CreatureObject* defender, TangibleObject* item, uint32 damage, int type) const {
-	if (defender == nullptr || !defender->isPlayerCreature())
+void CombatManager::sendMitigationCombatSpam(CreatureObject* defender, TangibleObject* item, uint32 damage, int type, TangibleObject* attacker) const {
+	if (defender == nullptr)
+		return;
+
+	// The spam is normally the DEFENDER's ("your barrier protects you...").
+	// An NPC defender has no client, so its mitigation was invisible — when
+	// the sim flag is on, deliver it to the attacking PLAYER instead so
+	// fights against sim Jedi read honestly (P.7.4c; inert when off).
+	CreatureObject* receiver = nullptr;
+
+	if (defender->isPlayerCreature()) {
+		receiver = defender;
+	} else if (attacker != nullptr && defender->isAiAgent() &&
+			SimPlayerManager::instance()->isPvpNpcMitigationSpamEnabled() &&
+			attacker->isCreatureObject()) {
+		CreatureObject* attackerCreo = attacker->asCreatureObject();
+
+		if (attackerCreo != nullptr && attackerCreo->isPlayerCreature())
+			receiver = attackerCreo;
+	}
+
+	if (receiver == nullptr)
 		return;
 
 	int color = 0; // text color
@@ -918,8 +942,8 @@ void CombatManager::sendMitigationCombatSpam(CreatureObject* defender, TangibleO
 		break;
 	}
 
-	CombatSpam* spam = new CombatSpam(defender, nullptr, defender, item, damage, file, stringName, color);
-	defender->sendMessage(spam);
+	CombatSpam* spam = new CombatSpam(defender, nullptr, receiver, item, damage, file, stringName, color);
+	receiver->sendMessage(spam);
 }
 
 /*
@@ -2639,6 +2663,65 @@ int CombatManager::getArmorReduction(TangibleObject* attacker, WeaponObject* wea
 	}
 
 	if (defender->isAiAgent()) {
+		// P.7.4c (flag-gated): jedi buff mitigation for NPC defenders. Stock
+		// code returned right after template armor, so an NPC's Force Armor/
+		// Shield/Feedback buffs NEVER did anything — the P.7 ladder was
+		// casting dead buffs (owner-verified live: buffed master took full
+		// saber damage). Mirrors the player order below: jedi mitigation
+		// first, then armor. Force Absorb stays player-only (crediting force
+		// back needs a PlayerObject ghost).
+		if (SimPlayerManager::instance()->isPvpJediNpcMitigationEnabled()) {
+			float jediMit = hitList->getJediMitigation();
+
+			if (!data.isForceAttack()) {
+				float rawDamage = damage;
+				int forceArmor = defender->getSkillMod("force_armor");
+
+				if (forceArmor > 0) {
+					float dmgAbsorbed = rawDamage - (damage *= 1.f - (forceArmor / 100.f));
+					defender->notifyObservers(ObserverEventType::FORCEARMOR, attacker, dmgAbsorbed);
+
+					jediMit += dmgAbsorbed;
+					hitList->setJediMitigation(jediMit);
+				}
+			} else {
+				float rawDamage = damage;
+				int forceShield = defender->getSkillMod("force_shield");
+
+				if (forceShield > 0) {
+					float jediBuffDamage = rawDamage - (damage *= 1.f - (forceShield / 100.f));
+					defender->notifyObservers(ObserverEventType::FORCESHIELD, attacker, jediBuffDamage);
+
+					jediMit += jediBuffDamage;
+					hitList->setJediMitigation(jediMit);
+				}
+
+				// Force Feedback (enhancer kit): reflect part of a force
+				// attack back at the attacker — same math as the player
+				// block below.
+				int forceFeedback = defender->getSkillMod("force_feedback");
+
+				if (forceFeedback > 0 && (defender->hasBuff(BuffCRC::JEDI_FORCE_FEEDBACK_1) ||
+						defender->hasBuff(BuffCRC::JEDI_FORCE_FEEDBACK_2))) {
+					float feedbackDmg = rawDamage * (forceFeedback / 100.f);
+
+					int forceDefense = defender->getSkillMod("force_defense");
+
+					if (forceDefense > 0)
+						feedbackDmg *= 1.f / (1.f + ((float)forceDefense / 100.f));
+
+					float splitDmg = feedbackDmg / 3;
+
+					attacker->inflictDamage(defender, CreatureAttribute::HEALTH, splitDmg, true, true, true);
+					attacker->inflictDamage(defender, CreatureAttribute::ACTION, splitDmg, true, true, true);
+					attacker->inflictDamage(defender, CreatureAttribute::MIND, splitDmg, true, true, true);
+					defender->notifyObservers(ObserverEventType::FORCEFEEDBACK, attacker, feedbackDmg);
+					defender->playEffect("clienteffect/pl_force_feedback_block.cef", "");
+					hitList->setForceFeedback(feedbackDmg);
+				}
+			}
+		}
+
 		float armorReduction = getArmorNpcReduction(cast<AiAgent*>(defender), damageType);
 
 		if (armorReduction >= 0)

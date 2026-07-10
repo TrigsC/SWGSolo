@@ -11,6 +11,7 @@
 #include "server/zone/CloseObjectsVector.h"
 #include "server/zone/TreeEntry.h"
 #include "templates/params/creature/ObjectFlag.h"
+#include "templates/params/creature/CreaturePosture.h"
 
 #include "system/lang/System.h"
 
@@ -112,6 +113,15 @@ void SimPvpBotController::onTick() {
 	}
 
 	phantomCombatTicks = 0;
+
+	// P.7.5: combat is over but the bot is still on the floor (the jedi
+	// recovery reflex only ticks in combat, and nothing in the stock AI ever
+	// stands an NPC back up) — dust off and carry on.
+	if (strongAgent->getPosture() == CreaturePosture::KNOCKEDDOWN) {
+		Locker locker(strongAgent);
+		strongAgent->setPosture(CreaturePosture::UPRIGHT, true, true);
+	}
+
 	scanForTargets();
 }
 

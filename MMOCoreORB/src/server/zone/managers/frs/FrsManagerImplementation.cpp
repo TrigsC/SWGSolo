@@ -1191,6 +1191,31 @@ int FrsManagerImplementation::getBaseExperienceGain(PlayerObject* playerGhost, P
 	return returnValue;
 }
 
+int FrsManagerImplementation::getNpcRankWinExperienceGain(PlayerObject* playerGhost, int npcRank) {
+	if (!frsEnabled || playerGhost == nullptr || npcRank < 0 || npcRank > 11)
+		return 0;
+
+	FrsData* playerData = playerGhost->getFrsData();
+	int playerRank = playerData->getRank();
+	int playerCouncil = playerData->getCouncilType();
+
+	if (playerCouncil == 0 || playerRank < 0 || playerRank > 11)
+		return 0;
+
+	String key = "rank" + String::valueOf(npcRank) + "_win";
+	uint64 keyHash = key.hashCode();
+
+	if (!experienceValues.contains(keyHash))
+		return 0;
+
+	Vector<int> expValues = experienceValues.get(keyHash);
+
+	if (playerRank >= expValues.size())
+		return 0;
+
+	return expValues.get(playerRank);
+}
+
 void FrsManagerImplementation::sendVoteSUI(CreatureObject* player, SceneObject* terminal, short suiType, short enclaveType) {
 	PlayerObject* ghost = player->getPlayerObject();
 

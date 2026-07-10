@@ -13,7 +13,9 @@ foundation for player-mimetic PvP squads; then scouts/gank convergence, player-f
 communication (no new client commands), and staged GCW base attack/defense.
 
 Related docs: `ai-miner-navigation-design.md` (P.4 travel primitives this reuses),
-`ai-hive-inventory-design.md` / `ai-crafter-output-ledger-design.md` (P.5).
+`ai-hive-inventory-design.md` / `ai-crafter-output-ledger-design.md` (P.5),
+`ai-jedi-frs-rank-design.md` (P.7.4 ranked Jedi/FRS ladder; P.7.4a
+implemented 2026-07-08; P.7.4b code implemented, pending owner FRS test).
 
 ---
 
@@ -940,3 +942,34 @@ records the squad's `groupId` (under pvpSquadMutex) and defers the roster sync +
 welcome to a 0.5s task (so no group/agent locks are held inside joinGroup).
 Decline = joinGroup never runs = no group formed. **Verify:** ask to join → only
 the pop-up appears; Accept → joined, squad pulled in, welcome; Decline → nothing.
+
+## 28. P.6.3c/P.6.5a live incident - imperial depleted squads stopped reforming (2026-07-09)
+
+Owner reported both imperial patrols showing "stuck" for ~12h with `+3 inbound`.
+Live dashboard confirmed the exact shape: squads 1 and 3 were still counted as
+imperial patrol rows, `membersAlive=0`, `pendingReplacements=3`,
+`reforming=false`, and leader phase `movingToHangout` aged ~44k seconds. The
+rebel squads continued traveling normally, so the population balancer never
+spawned replacement imperial patrols because the stale imperial rows still
+satisfied `squadsPerFaction=2`.
+
+Log trail: squad 1 traveled to `tatooine:mos_eisley`, then all three followers
+died at 02:35 UTC and no later heartbeat/travel appeared. Squad 3 lost its
+leader plus two members, promoted the last follower, then also went silent with
+three replacements pending. Root cause: PvP death reporting happens from the
+controller tick. If `beginCityLoop -> moveTo()` enters while the leader is
+already in combat, `moveTo()` returns without scheduling a new arrival-check
+tick; if that leader later dies/incaps, the manager keeps a dead leader object
+and never sets `leaderDeadPendingPromotion`. The normal stateTtl/hardStuck
+branches skip dead leaders, so the stale row can block population forever.
+
+Fix implemented: `onPvpBotDied` is now idempotent (duplicate death reports no
+longer overcount deaths or `pendingReplacements`), dashboard squad rows expose
+`leaderDeadPendingPromotion`, and PvP maintenance detects a leader object that
+is dead/incapacitated even when no controller tick reported it. It marks the
+normal `leaderDeadPendingPromotion` path, clears `travelTaskActive`, counts the
+death once, schedules cleanup, and lets the existing promotion or full-wipe
+reform logic handle the next upkeep pass. Expected live recovery after restart:
+depleted imperial rows log `SimPvpLeaderDownDetected`, then either
+`SimPvpLeaderPromoted` or `SimPvpSquadWiped`/`SimPvpSquadReformed`; the dashboard
+should return to full imperial patrols instead of indefinite `+3 inbound`.

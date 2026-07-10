@@ -63,6 +63,9 @@ CreatureTemplate::CreatureTemplate() {
 	tauntable = true;
 	healerType = "";
 	jediArchetype = "";
+	frsRankMin = -1;
+	frsRankMax = -1;
+	frsCouncil = 0;
 	lightsaberColor = 0;
 
 	primaryWeapon = "";
@@ -140,6 +143,55 @@ void CreatureTemplate::readObject(LuaObject* templateData) {
 	tauntable = templateData->getBooleanField("tauntable", true);
 	healerType = templateData->getStringField("healerType").trim();
 	jediArchetype = templateData->getStringField("jediArchetype").trim().toLowerCase();
+	frsRankMin = templateData->getSignedIntField("frsRank", -1);
+	frsRankMax = frsRankMin;
+
+	int configuredFrsRankMin = templateData->getSignedIntField("frsRankMin", -1);
+	int configuredFrsRankMax = templateData->getSignedIntField("frsRankMax", -1);
+
+	if (configuredFrsRankMin >= 0 || configuredFrsRankMax >= 0) {
+		frsRankMin = configuredFrsRankMin >= 0 ? configuredFrsRankMin :
+			configuredFrsRankMax;
+		frsRankMax = configuredFrsRankMax >= 0 ? configuredFrsRankMax :
+			configuredFrsRankMin;
+	}
+
+	if (frsRankMin > frsRankMax) {
+		int swapRank = frsRankMin;
+		frsRankMin = frsRankMax;
+		frsRankMax = swapRank;
+	}
+
+	if (frsRankMin < -1)
+		frsRankMin = -1;
+	if (frsRankMax < -1)
+		frsRankMax = -1;
+	if (frsRankMin > 11)
+		frsRankMin = 11;
+	if (frsRankMax > 11)
+		frsRankMax = 11;
+
+	frsCouncil = templateData->getSignedIntField("frsCouncil", 0);
+	String frsCouncilName = templateData->getStringField("frsCouncil").trim().toLowerCase();
+
+	if (frsCouncilName == "light" || frsCouncilName == "rebel")
+		frsCouncil = 1;
+	else if (frsCouncilName == "dark" || frsCouncilName == "imperial")
+		frsCouncil = 2;
+
+	if (frsCouncil == 0 && frsRankMin >= 0) {
+		String lowerTemplateName = templateName.toLowerCase();
+		String lowerObjectName = objectName.toLowerCase();
+
+		if (lowerTemplateName.contains("light_jedi") ||
+				lowerObjectName.contains("light_jedi") ||
+				lowerObjectName.contains("light jedi"))
+			frsCouncil = 1;
+		else if (lowerTemplateName.contains("dark_jedi") ||
+				lowerObjectName.contains("dark_jedi") ||
+				lowerObjectName.contains("dark jedi"))
+			frsCouncil = 2;
+	}
 	lightsaberColor = templateData->getIntField("lightsaberColor");
 
 	if(!templateData->getStringField("defaultAttack").isEmpty())

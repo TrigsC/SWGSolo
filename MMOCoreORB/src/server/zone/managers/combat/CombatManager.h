@@ -203,7 +203,10 @@ public:
 
 	void finalCombatSpam(TangibleObject* attacker, WeaponObject* item, SortedVector<DefenderHitList*> targetDefenders, const CreatureAttackData & data) const;
 	void broadcastCombatSpam(TangibleObject* attacker, TangibleObject* defender, TangibleObject* item, int damage, const String& file, const String& stringName, byte color) const;
-	void sendMitigationCombatSpam(CreatureObject* defender, TangibleObject* item, uint32 damage, int type) const;
+	// attacker (optional): when the defender is an NPC (no client), the
+	// jedi-mitigation spam is delivered to the attacking player instead —
+	// flag-gated via SimPlayerManager (P.7.4c), inert when off/null.
+	void sendMitigationCombatSpam(CreatureObject* defender, TangibleObject* item, uint32 damage, int type, TangibleObject* attacker = nullptr) const;
 
 	float hitChanceEquation(float attackerAccuracy, float targetDefense) const;
 	float doObjectDetonation(TangibleObject* droid, CreatureObject* defender, float damage, WeaponObject* weapon = nullptr) const;

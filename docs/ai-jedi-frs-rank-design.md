@@ -1,7 +1,9 @@
 # P.7.4 — NPC Jedi FRS Ranks: Ranked Templates, Rank-Scaled Power, FRS XP on Kill
 
-Status: **APPROVED by owner 2026-07-07 — design updated with decisions, build
-next** (after the P.6.5-0 spike restart). Owner decisions (§7): tier order is
+Status: **IMPLEMENTED (Codex) + VERIFIED LIVE 2026-07-09 (28 ranked Jedi
+active; XP hook paid a real player 3,782 FRS XP / 5 kills). Two review bugs
+FIXED (dark control ladder, regen double-count — §6.5), compiled clean,
+PENDING RESTART.** Owner decisions (§7): tier order is
 **Knight → Sentinel → Master** = FRS titles (Knight is the FRS entry rank,
 Sentinel the next band, Master the top — matches the FRS title ladder Padawan/
 Knight/Sentinel I–IV/Consular I–III/Arbiter I–II/Council); **normal FRS XP per
@@ -240,6 +242,134 @@ pvpConfig.jediRanks = {
   same containment as P.7.1.
 - Reversible at runtime: both gates re-read on the 30s config refresh.
 
+## 6.5 P.7.4 AS-BUILT (implemented by Codex, reviewed + fixed 2026-07-09)
+
+Codex implemented the full design; verified live on the dashboard
+(`pvpActivity.jediRanks`): 28 ranked Jedi active across squads, and the XP
+hook already paid a real player 3,782 FRS XP over 5 NPC-Jedi kills. As-built
+notes (matches the design unless flagged):
+
+- Templates (all CL 88, clone-down as planned): light knight (rank 0 fixed) /
+  sentinel (1–4) / consular (5–7) / master (11 fixed); dark knight (0) /
+  enforcer (1–4) / templar (5–7) / master (11) — FRS tier titles per side.
+  `frsRank` or `frsRankMin/Max` + `frsCouncil` template fields
+  (CreatureTemplate.h). Squad picks are WEIGHTED
+  (`pvpConfig.templates` entries `{template=, weight=}`): trooper 35 /
+  knight 28 / band-2 19 / band-3 12 / master 6.
+- Rank bake in `initializeJediArchetype` (AiAgentImplementation.cpp ~:769):
+  control/manipulation/maxForce/regen skillmods per rank; AI-aware
+  `getFrsModified*` in JediQueueCommand.h exactly per design (§3.2).
+- XP hook in `disseminateExperience` (PlayerManagerImplementation ~:1944) →
+  `FrsManager` award path with contribution + factor; per-player daily-cap
+  bookkeeping on the sim manager (`recordPvpNpcFrsXpAward`, pvpSquadMutex).
+- Dashboard `pvpActivity.jediRanks`: per-agent rows (rank/council/mods),
+  byRank histogram, awardsTodayByPlayer, cap counters.
+
+**Two bugs found in review, FIXED 2026-07-09 (compiled clean, PENDING
+RESTART):**
+1. **Invented weaker dark control ladder** — Codex used
+   `darkControlByRank {4,6,8,10,12,15,20,25,35,45,60,75}`, but the owner's
+   light and dark tables carry IDENTICAL values (verified by diffing the raw
+   tables — only tier titles differ). A dark Master's Force Armor 2 was 71%
+   instead of 87%. Fix: one shared `controlByRank` = the verified light
+   ladder.
+2. **Regen double-count** — the bake passed
+   `getSkillMod("jedi_force_power_regen") + regenByRank[rank]` into
+   `addSkillMod`, which ACCUMULATES; an enhancer's baked +25 was counted
+   twice (observed live: enhancer knights at regen 51 instead of 26; defenders
+   correctly at 1). Fix: pass only `regenByRank[rank]`.
+   KEY LESSON: `addSkillMod(TEMPLATE, ...)` adds to the existing mod — never
+   read-modify-write it.
+
+## 6.6 NPC Force Armor: WAS COMPLETELY DEAD — root-caused + FIXED (P.7.4c,
+2026-07-09, compiled clean, PENDING RESTART)
+
+Owner report: "saw the NPC cast Force Armor but my (saber, Dervish2 — client
+STF renames it 'Wrath of Kun') hits don't seem mitigated." Owner then re-tested
+against a forced-enhancer master and STILL saw nothing. **The owner was right.**
+
+**CORRECTION OF THE RECORD (two prior claims were WRONG):** the P.7.1-era note
+"NPC Force Armor mitigates (skillmod-based)" and this doc's first-pass 07-09
+"verified working" analysis both missed the same thing. The buff mods DO land
+(live rank-6 templar carried BUFF-group `force_armor=61` + `force_shield=61` —
+45 + 45×0.35, the exact table row) and AiAgent::getSkillMod DOES read them —
+but **`CombatManager::getArmorReduction` early-returns inside its
+`defender->isAiAgent()` branch (template armor only), BEFORE the jedi
+mitigation block**. Force Armor/Shield/Feedback/Absorb were unreachable for
+NPC defenders: the whole P.7 ladder was casting dead defensive buffs.
+
+**P.7.4c fixes (both flag-gated, inert when off):**
+1. **Mitigation itself** (`pvpConfig.jediRanks.npcMitigation`, lua true / C++
+   off): inside the AiAgent branch, before template armor (mirroring the
+   player order), apply `force_armor` vs non-force damage and `force_shield`
+   vs force damage — identical math, observers notified, jediMitigation
+   recorded on the hitList. Force Absorb stays player-only (crediting force
+   back needs a ghost); NPC Force Feedback is a possible follow-up.
+2. **Visibility** (`pvpConfig.comms.showNpcMitigation`, lua true / C++ off):
+   `sendMitigationCombatSpam` gained an optional `attacker` param (default
+   nullptr, other call sites untouched); FORCEARMOR/FORCESHIELD/FORCEABSORB
+   call sites pass it; when the defender is an AiAgent, the spam is delivered
+   to the attacking PLAYER. (Fix 1 is what makes the hitList value nonzero so
+   this ever fires. Note: the cbt_spam STF may render second-person — "your
+   barrier..." — cosmetic, revisit if confusing.)
+
+Verify in-game after restart: saber a buffed sim Jedi → damage numbers DROP
+while Force Armor is up AND green absorption lines appear; a rank-11 master
+with FA2 (87%) should be dramatically tanky vs sabers/blasters. Force powers
+vs an ENHANCER (shield up) mitigate 61-87%; vs a DEFENDER archetype they
+still land raw (no shield in that ladder — by-design live behavior; owner may
+opt to add Shield to defenders).
+
+## 6.7 P.7.5 — Full NPC buff-effect AUDIT + knockdown/state recovery reflex
+(2026-07-09, compiled clean, PENDING RESTART)
+
+Owner (after confirming Force Armor now works in-game): "are we sure ALL
+buffs work for NPCs?" + spec for the missing healStatesSelf behavior. Audit
+of every P.7 ability's EFFECT path (call-path traced end to end — the §6.6
+lesson):
+
+| Ability / effect | NPC status |
+|---|---|
+| Force Armor 1/2 mitigation | ✅ fixed §6.6 (owner-verified in-game) |
+| Force Shield 1/2 mitigation | ✅ fixed §6.6 |
+| Force Feedback 1/2 reflect | ✅ **fixed NOW** — was still dead; added to the §6.6 gated block, same math as players (incl. attacker force_defense reduction), reflect spam already broadcast by the caller |
+| Force Absorb 1/2 | ❌ still inert for NPCs (stock `isPlayerCreature` gate; crediting force back needs ghost/AI plumbing — noted follow-up; enhancer ladder still casts it, harmless) |
+| Resists vs states | ✅ AI-aware path exists (jedi_state_defense AiAgent override in applyStates — owner's earlier creatureskills work) |
+| DoT resists (bleed/disease/poison) | ✅ generic getSkillMod reads, type-agnostic |
+| Avoid Incapacitation | ✅ generic (CreatureObjectImplementation:1096, setHAM path) |
+| Drain / Transfer / Channel Force | ✅ AI-aware (P.7.2/P.7.3) |
+| Force pool / regen mods | ✅ live-verified |
+| Per-hit Force Armor cost | ❌ by design so far (R3) |
+
+**P.7.5 knockdown/state recovery reflex** (owner-specified player combo:
+dizzy+KD → heal states → stand, "fluid, not dizzy-KD-heal-stand scripted"):
+- Discovery: the BT gated the ENTIRE jedi branch on NOT-KNOCKEDDOWN (and the
+  HEAL/NOTIFYHELP sockets still are) and **nothing in stock AI ever stands
+  an NPC back up** — a floored jedi was helpless. The NOT-KD gate (default.lua
+  ids 3811110007-9) is REMOVED; ManageJediForce now owns the floored window.
+- `runJediForceManagement` starts with the reflex, OUTSIDE the 6-10s buff
+  window (emergency, not rotation), self-paced 0.8-1.6s per action
+  ("jedi_state_recovery") so the combo reads human:
+  - KD + health <40% + force ≥300 → normal force heal FIRST while down
+    (healCreatureTarget self — jedi can heal while KD, exactly the owner's
+    "getting chunked" play);
+  - KD + dizzy → direct heal-states (mirrors HealStatesSelfCommand exactly:
+    state bits 12-15, removeStateBuff, 25 force/state, heal-self
+    clienteffect; own 3-4.2s cooldown = defaultTime 3 + jitter). Re-dizzied
+    before standing → waits out the cooldown like a player, with a 25%
+    desperate stand-anyway roll per pass;
+  - KD + not dizzy (or just cleared) → stand (setPosture UPRIGHT).
+- Upright + INTIMIDATED (owner: rare — intimidate is free for most
+  professions, clearing drains force for nothing): only when force >65% max,
+  20% roll, 45s own cooldown, consumes the normal buff window.
+- Sim-bot safety net (SimPvpBotController::onTick): combat over but still
+  KNOCKEDDOWN → stand (the jedi reflex only ticks in combat; covers troopers
+  too).
+
+Verify in-game: dizzy + knock down a squad jedi → heal-self effect (states
+cleared) then it stands within ~1-2s; chunk it while down → it heals first;
+no sim bot left lying around after a fight.
+
 ## 7. Owner decisions (ANSWERED 2026-07-07)
 
 1. Tier→rank map: **knight first, sentinel second, master final** — mapped to
@@ -258,6 +388,4 @@ Still open (small, can default sensibly at build):
   the FRS skillmods provide the rank power difference).
 - Master spawn weighting (default: masters rare — weighted template pick).
 - Creating light_jedi_knight/light_jedi_master lua templates (required for
-  light-side parity; assumed approved as part of the design). This is approved
-  but I want each faction to have 4 types Rebel: knight, sentinel, Consular, Master
-  Imperial: Knight, Enforcer, Templar, Master to follow the Core3/docs/frs-rank-values-dark.txt
+  light-side parity; assumed approved as part of the design).

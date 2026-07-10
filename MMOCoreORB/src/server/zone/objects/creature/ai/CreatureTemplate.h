@@ -65,6 +65,9 @@ protected:
 	int mobType;
 	String healerType;
 	String jediArchetype;
+	int frsRankMin;
+	int frsRankMax;
+	int frsCouncil;
 
 	bool tauntable;
 
@@ -489,6 +492,18 @@ public:
 
 	inline const String& getJediArchetype() const {
 		return jediArchetype;
+	}
+
+	inline int getFrsRankMin() const {
+		return frsRankMin;
+	}
+
+	inline int getFrsRankMax() const {
+		return frsRankMax;
+	}
+
+	inline int getFrsCouncil() const {
+		return frsCouncil;
 	}
 
 	inline bool isSpecialProtection(int resistType) const {

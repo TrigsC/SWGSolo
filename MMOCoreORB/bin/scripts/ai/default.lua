@@ -305,9 +305,10 @@ rootDefault = {
 	{id="3811110004",	name="CheckJediForceChance",	pid="3811110003"},
 	{id="3811110005",	name="If",	pid="3811110002"},
 	{id="3811110006",	name="CheckIsInCombat",	pid="3811110005"},
-	{id="3811110007",	name="Not",	pid="3811110002"},
-	{id="3811110008",	name="If",	pid="3811110007"},
-	{id="3811110009",	name="CheckPosture",	pid="3811110008",	args={condition=KNOCKEDDOWN}},
+	-- P.7.5: the NOT-KNOCKEDDOWN gate (old ids 3811110007-9) is REMOVED so
+	-- ManageJediForce ticks while floored — it owns the knockdown recovery
+	-- reflex (heal states -> stand, heal-first when chunked), exactly the
+	-- window where a real Jedi player is busiest.
 	{id="3811110010",	name="ManageJediForce",	pid="3811110002"},
 	{id="2623013711",	name="Sequence",	pid="714360210"},
 	{id="2922652730",	name="Selector",	pid="2623013711"},

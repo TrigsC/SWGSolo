@@ -97,6 +97,7 @@
 #include "server/zone/objects/creature/commands/ForcePowersQueueCommand.h"
 #include "server/zone/objects/creature/commands/JediQueueCommand.h"
 #include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
+#include "server/zone/managers/frs/FrsManager.h"
 #include "server/zone/managers/radial/RadialOptions.h"
 
 // #define DEBUG
@@ -765,7 +766,99 @@ void AiAgentImplementation::initializeJediArchetype() {
         return;
     }
 
+    if (SimPlayerManager::instance()->isPvpRankedJediEnabled() &&
+            npcTemplate->getFrsRankMin() >= 0 &&
+            npcTemplate->getFrsCouncil() > 0) {
+        // Per-rank FRS skillmods derived from the owner's authoritative
+        // ability tables (docs/frs-rank-values-{light,dark}.txt) inverted
+        // through the live formulas (getFrsModifiedBuffValue /
+        // getFrsModifiedExtraForceCost). The light and dark tables carry
+        // IDENTICAL values — only the tier titles differ — so both councils
+        // share one control ladder (verified: rank 11 FA2 = 45 + 120*0.35 =
+        // 87% at 30% - 80*0.003 = 6% per hit, exactly the table).
+        static const int controlByRank[12] =
+            { 5, 10, 15, 20, 25, 35, 45, 55, 70, 85, 100, 120 };
+        static const int manipulationByRank[12] =
+            { 5, 8, 12, 16, 20, 25, 30, 35, 45, 55, 65, 80 };
+        static const int maxForceByRank[12] =
+            { 90, 160, 230, 300, 370, 500, 650, 800, 1050, 1300, 1600, 1950 };
+        static const int regenByRank[12] =
+            { 1, 2, 3, 4, 5, 6, 8, 9, 12, 14, 17, 20 };
+
+        int rankMin = npcTemplate->getFrsRankMin();
+        int rankMax = npcTemplate->getFrsRankMax();
+
+        if (rankMin < 0)
+            rankMin = 0;
+        if (rankMin > 11)
+            rankMin = 11;
+        if (rankMax < rankMin)
+            rankMax = rankMin;
+        if (rankMax > 11)
+            rankMax = 11;
+
+        int rank = rankMin;
+        if (rankMax > rankMin)
+            rank += System::random(rankMax - rankMin);
+
+        const int council = npcTemplate->getFrsCouncil();
+        const bool lightCouncil = council == FrsManager::COUNCIL_LIGHT;
+        const bool darkCouncil = council == FrsManager::COUNCIL_DARK;
+
+        if (lightCouncil || darkCouncil) {
+            const String side = lightCouncil ? String("light") : String("dark");
+
+            frsRank = rank;
+            frsCouncil = council;
+
+            addSkillMod(SkillModManager::TEMPLATE,
+                "force_control_" + side, controlByRank[rank], false);
+            addSkillMod(SkillModManager::TEMPLATE,
+                "force_manipulation_" + side, manipulationByRank[rank], false);
+            addSkillMod(SkillModManager::TEMPLATE,
+                "jedi_force_power_max", maxForceByRank[rank], false);
+            // addSkillMod ACCUMULATES — pass only the rank bonus, or an
+            // enhancer's baked +25 regen gets double-counted (observed live:
+            // enhancer knights showed 51 = 25 + (25+1) instead of 26).
+            addSkillMod(SkillModManager::TEMPLATE,
+                "jedi_force_power_regen", regenByRank[rank], false);
+        }
+    }
+
     debug() << "initializeJediArchetype: rolled " << archetype;
+}
+
+// P.7.5: direct self heal-states, mirroring HealStatesSelfCommand exactly
+// (states are bits 12-15; removeStateBuff per state; 25 force per state
+// healed, healstatesself.lua) — applied DIRECTLY per the P.7.1a rule: an AI
+// ability effect never goes through its own attack command queue.
+static bool jediClearSelfStates(AiAgentImplementation* agent) {
+    static const uint64 statesToClear[] = {
+        CreatureState::STUNNED, CreatureState::BLINDED,
+        CreatureState::DIZZY, CreatureState::INTIMIDATED
+    };
+    const int perStateCost = 25; // healStateCost, healstatesself.lua
+
+    int curForce = agent->getCurrentForce();
+    int cost = 0;
+    int healed = 0;
+
+    for (int i = 0; i < 4; ++i) {
+        uint64 state = statesToClear[i];
+
+        if (agent->hasState(state) && curForce >= cost + perStateCost) {
+            agent->removeStateBuff(state);
+            cost += perStateCost;
+            healed++;
+        }
+    }
+
+    if (healed > 0) {
+        agent->setCurrentForce(curForce - cost);
+        agent->playEffect("clienteffect/pl_force_heal_self.cef", "");
+    }
+
+    return healed > 0;
 }
 
 void AiAgentImplementation::runJediForceManagement() {
@@ -774,7 +867,62 @@ void AiAgentImplementation::runJediForceManagement() {
 
     auto cooldownTimerMap = getCooldownTimerMap();
 
-    if (cooldownTimerMap == nullptr || !cooldownTimerMap->isPast("jedi_force_window"))
+    if (cooldownTimerMap == nullptr)
+        return;
+
+    // ----- P.7.5 knockdown/state recovery reflex (owner-specified player
+    // combo). While KNOCKEDDOWN you take extra damage; the player play is:
+    // heal states (clears dizzy — standing while dizzy puts you straight
+    // back on the floor), then stand; if you're getting chunked, run a normal
+    // force heal FIRST while down (jedi can). This reflex runs OUTSIDE the
+    // 6-10s buff window (it's an emergency, not a buff rotation) but paces
+    // itself ~0.8-1.6s per action so the combo reads human, not scripted.
+    // The BT gate that skipped ManageJediForce while KNOCKEDDOWN is removed
+    // (default.lua) so this actually ticks while floored.
+    if (getPosture() == CreaturePosture::KNOCKEDDOWN) {
+        if (!cooldownTimerMap->isPast("jedi_state_recovery"))
+            return;
+
+        int kdForce = getCurrentForce();
+        int maxHealth = getMaxHAM(CreatureAttribute::HEALTH);
+        int kdHealthPct = maxHealth > 0 ?
+            (getHAM(CreatureAttribute::HEALTH) * 100) / maxHealth : 100;
+
+        bool acted = false;
+
+        if (kdHealthPct < 40 && kdForce >= 300) {
+            // Getting chunked while down: normal heal first, states next pass.
+            healCreatureTarget(asCreatureObject());
+            acted = true;
+        } else if (hasState(CreatureState::DIZZY)) {
+            if (cooldownTimerMap->isPast("jedi_heal_states") && kdForce >= 25) {
+                if (jediClearSelfStates(this)) {
+                    // healstatesself defaultTime=3 (+jitter) — if another dizzy
+                    // lands before we stand, we wait this out like a player.
+                    cooldownTimerMap->updateToCurrentAndAddMili(
+                        "jedi_heal_states", 3000 + System::random(1200));
+                    acted = true;
+                }
+            } else if (System::random(99) < 25) {
+                // Heal-states unavailable: occasionally risk standing dizzy
+                // (players do when desperate); otherwise stay down and wait.
+                setPosture(CreaturePosture::UPRIGHT, true, true);
+                acted = true;
+            }
+        } else {
+            // Not dizzy (or just cleared it): get up.
+            setPosture(CreaturePosture::UPRIGHT, true, true);
+            acted = true;
+        }
+
+        if (acted)
+            cooldownTimerMap->updateToCurrentAndAddMili(
+                "jedi_state_recovery", 800 + System::random(800));
+
+        return; // recovery owns the tick; no buff ladder while floored
+    }
+
+    if (!cooldownTimerMap->isPast("jedi_force_window"))
         return;
 
     // Always keep two force heals (2 x 200, see healCreatureTarget) in reserve
@@ -782,6 +930,24 @@ void AiAgentImplementation::runJediForceManagement() {
     const static int FORCE_FLOOR = 400;
 
     int curForce = getCurrentForce();
+
+    // P.7.5 (rare, owner-specified): clear INTIMIDATED upright only when
+    // flush with force — intimidate is cheap for most professions to reapply,
+    // so players rarely burn force clearing it. Consumes the buff window.
+    if (hasState(CreatureState::INTIMIDATED) &&
+            curForce > (getMaxForce() * 65) / 100 &&
+            cooldownTimerMap->isPast("jedi_heal_states") &&
+            cooldownTimerMap->isPast("jedi_intim_clear") &&
+            System::random(99) < 20) {
+        if (jediClearSelfStates(this)) {
+            cooldownTimerMap->updateToCurrentAndAddMili("jedi_heal_states",
+                3000 + System::random(1200));
+            cooldownTimerMap->updateToCurrentAndAddMili("jedi_intim_clear", 45000);
+            cooldownTimerMap->updateToCurrentAndAddMili("jedi_force_window",
+                6000 + System::random(4000));
+            return;
+        }
+    }
 
     // Snapshot the current opponent for the anti-force-user tools.
     bool targetIsForceUser = false;

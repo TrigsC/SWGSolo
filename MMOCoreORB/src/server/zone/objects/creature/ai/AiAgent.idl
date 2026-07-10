@@ -250,6 +250,8 @@ class AiAgent extends CreatureObject {
     protected int maxForcePoints;
 
 	protected int jediArchetype;
+	protected int frsRank;
+	protected int frsCouncil;
 
 	@dereferenced
 	protected transient Reference<Task> forceRegenerationEvent;
@@ -298,6 +300,8 @@ class AiAgent extends CreatureObject {
 		outOfSightCounter = 0;
 
 		jediArchetype = JEDI_ARCHETYPE_NONE;
+		frsRank = -1;
+		frsCouncil = 0;
 	}
 
 	/**
@@ -1050,6 +1054,24 @@ class AiAgent extends CreatureObject {
 
 	public int getJediArchetype() {
 		return jediArchetype;
+	}
+
+	@dirty
+	public void setFrsRank(int value) {
+		frsRank = value;
+	}
+
+	public int getFrsRank() {
+		return frsRank;
+	}
+
+	@dirty
+	public void setFrsCouncil(int value) {
+		frsCouncil = value;
+	}
+
+	public int getFrsCouncil() {
+		return frsCouncil;
 	}
 
 	@preLocked

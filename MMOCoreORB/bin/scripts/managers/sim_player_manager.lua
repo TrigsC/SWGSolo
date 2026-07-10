@@ -636,9 +636,9 @@ SimPlayerManagerConfig = {
     -- applies at runtime without a restart.
     pvpConfig = {
         enablePvpBots = true,           -- master gate
-        squadsPerFaction = 2,           -- owner-approved starting population
+        squadsPerFaction = 3,           -- owner-approved starting population
         squadSize = 4,                  -- leader + 3 followers
-        scanRadiusMeters = 40,          -- how close before a bot ENGAGES
+        scanRadiusMeters = 64,          -- how close before a bot ENGAGES
         -- Disengage distance: a bot in combat whose target flees beyond this
         -- (just above effective ranged weapon range) drops combat instead of
         -- chasing/attacking across the map at 100m+. Also caps stalemates.
@@ -654,7 +654,7 @@ SimPlayerManagerConfig = {
         maintenanceIntervalSeconds = 30,
         shuttleWaitIntervalSeconds = 5,
         shuttleWaitMaxAttempts = 24,    -- ~2min, then board anyway
-        corpseCleanupDelaySeconds = 60,
+        corpseCleanupDelaySeconds = 20,
         recovery = {
             enabled = true,
             dryRun = true,              -- observe first; then allow teleports
@@ -709,10 +709,42 @@ SimPlayerManagerConfig = {
             playerGrouping = true,
             maxPlayersPerSquad = 5,
             joinRangeMeters = 48,
+            -- P.7.4c: NPCs have no client, so their Force Armor/Shield/Absorb
+            -- mitigation was invisible to players ("is it even working?").
+            -- When true, the attacking PLAYER receives the mitigation combat
+            -- spam instead — you SEE the bot's barrier absorbing your hits.
+            showNpcMitigation = false,
+        },
+        -- P.7.4 ranked NPC Jedi. Template entries accept either legacy strings
+        -- or weighted tables; P.7.4b enables player FRS XP from ranked NPC kills.
+        jediRanks = {
+            -- P.7.4c: stock combat code skipped ALL jedi buff mitigation for
+            -- NPC defenders (early return after template armor) — Force
+            -- Armor/Shield casts were dead buffs. This applies them to
+            -- AiAgent defenders exactly like players (armor vs non-force
+            -- damage, shield vs force damage), before template armor.
+            npcMitigation = true,
+            enableRankedJedi = true,
+            frsFromNpcJedi = true,
+            npcXpFactor = 1.0,
+            npcFrsXpDailyCap = 0,
+            minContributionPct = 0.10,
         },
         templates = {
-            imperial = { "stormtrooper", "dark_jedi_sentinel" },
-            rebel = { "rebel_trooper", "light_jedi_sentinel" },
+            imperial = {
+                { template = "stormtrooper", weight = 35 },
+                { template = "imperial_dark_jedi_knight", weight = 28 },
+                { template = "imperial_dark_jedi_enforcer", weight = 19 },
+                { template = "imperial_dark_jedi_templar", weight = 12 },
+                { template = "imperial_dark_jedi_master", weight = 6 },
+            },
+            rebel = {
+                { template = "rebel_trooper", weight = 35 },
+                { template = "light_jedi_knight", weight = 28 },
+                { template = "light_jedi_sentinel", weight = 19 },
+                { template = "light_jedi_consular", weight = 12 },
+                { template = "light_jedi_master", weight = 6 },
+            },
         },
         -- P.6.5 player-mimetic routed travel (design doc
         -- ai-pvp-mimetic-travel-design.md). Only the P.6.5-0 diagnostics
