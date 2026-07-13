@@ -40,9 +40,11 @@ light_jedi_consular = Creature:new {
 	frsCouncil = "light",
 	frsRankMin = 5,
 	frsRankMax = 7,
+	frsRankOutfits = lightJediFrsRankOutfits,
+	lightsaberColors = lightJediSaberColors,
 	customAiMap = "enclaveSentinel",
 
-	templates = { "light_jedi" },
+	templates = { "ranked_light_jedi" },
 	lootGroups = {},
 
 	primaryWeapon = "light_jedi_weapons",

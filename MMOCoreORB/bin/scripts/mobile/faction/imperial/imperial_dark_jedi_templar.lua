@@ -40,9 +40,10 @@ imperial_dark_jedi_templar = Creature:new {
 	frsCouncil = "dark",
 	frsRankMin = 5,
 	frsRankMax = 7,
+	frsRankOutfits = darkJediFrsRankOutfits,
 	customAiMap = "enclaveSentinel",
 
-	templates = { "dark_jedi" },
+	templates = { "ranked_dark_jedi" },
 	lootGroups = {},
 
 	primaryWeapon = "dark_jedi_weapons_gen4",

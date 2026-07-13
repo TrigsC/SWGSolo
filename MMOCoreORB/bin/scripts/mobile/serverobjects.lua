@@ -2,7 +2,10 @@
 includeFile("conversations.lua")
 
 -- Dress Groups - Must be loaded before mobiles
-includeFile("dressgroup/serverobjects.lua") 
+includeFile("dressgroup/serverobjects.lua")
+
+-- Ranked Jedi wearable mappings - Must be loaded before ranked mobiles
+includeFile("frs_rank_outfits.lua")
 
 -- Creatures
 includeFile("corellia/serverobjects.lua")

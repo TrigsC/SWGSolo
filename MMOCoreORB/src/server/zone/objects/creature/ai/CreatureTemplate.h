@@ -68,6 +68,7 @@ protected:
 	int frsRankMin;
 	int frsRankMax;
 	int frsCouncil;
+	Vector<String> frsRankOutfits;
 
 	bool tauntable;
 
@@ -91,6 +92,7 @@ protected:
 	unsigned int creatureBitmask;
 	unsigned int diet;
 	int lightsaberColor;
+	Vector<int> lightsaberColors;
 
 	Vector<int> hues;
 
@@ -406,6 +408,14 @@ public:
 		return lightsaberColor;
 	}
 
+	inline int getLightsaberColorsSize() const {
+		return lightsaberColors.size();
+	}
+
+	inline int getLightsaberColorAt(int index) const {
+		return lightsaberColors.get(index);
+	}
+
 	inline const Vector<String>& getTemplates() const {
 		return templates;
 	}
@@ -504,6 +514,14 @@ public:
 
 	inline int getFrsCouncil() const {
 		return frsCouncil;
+	}
+
+	inline int getFrsRankOutfitsSize() const {
+		return frsRankOutfits.size();
+	}
+
+	inline const String& getFrsRankOutfit(int rank) const {
+		return frsRankOutfits.get(rank);
 	}
 
 	inline bool isSpecialProtection(int resistType) const {

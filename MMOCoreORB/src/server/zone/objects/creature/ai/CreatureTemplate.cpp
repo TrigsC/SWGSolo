@@ -88,6 +88,8 @@ CreatureTemplate::CreatureTemplate() {
 
 CreatureTemplate::~CreatureTemplate() {
 	templates.removeAll();
+	frsRankOutfits.removeAll();
+	lightsaberColors.removeAll();
 
 	delete primaryAttacks;
 	primaryAttacks = nullptr;
@@ -192,7 +194,42 @@ void CreatureTemplate::readObject(LuaObject* templateData) {
 				lowerObjectName.contains("dark jedi"))
 			frsCouncil = 2;
 	}
+
+	frsRankOutfits.removeAll();
+	LuaObject rankOutfits = templateData->getObjectField("frsRankOutfits");
+	if (rankOutfits.isValidTable()) {
+		for (int i = 1; i <= rankOutfits.getTableSize(); ++i)
+			frsRankOutfits.add(rankOutfits.getStringAt(i).trim());
+	}
+	rankOutfits.pop();
+
+	if (!frsRankOutfits.isEmpty()) {
+		Logger::console.info(true)
+			<< "[RankedJediOutfit] event=template_mapping_loaded"
+			<< " template=" << templateName
+			<< " entries=" << frsRankOutfits.size()
+			<< " first=" << frsRankOutfits.get(0)
+			<< " last=" << frsRankOutfits.get(frsRankOutfits.size() - 1);
+	}
+
 	lightsaberColor = templateData->getIntField("lightsaberColor");
+
+	lightsaberColors.removeAll();
+	LuaObject saberColors = templateData->getObjectField("lightsaberColors");
+	if (saberColors.isValidTable()) {
+		for (int i = 1; i <= saberColors.getTableSize(); ++i)
+			lightsaberColors.add(saberColors.getIntAt(i));
+	}
+	saberColors.pop();
+
+	if (!lightsaberColors.isEmpty()) {
+		Logger::console.info(true)
+			<< "[RankedJediSaber] event=color_pool_loaded"
+			<< " template=" << templateName
+			<< " entries=" << lightsaberColors.size()
+			<< " first=" << lightsaberColors.get(0)
+			<< " last=" << lightsaberColors.get(lightsaberColors.size() - 1);
+	}
 
 	if(!templateData->getStringField("defaultAttack").isEmpty())
 		defaultAttack = templateData->getStringField("defaultAttack");

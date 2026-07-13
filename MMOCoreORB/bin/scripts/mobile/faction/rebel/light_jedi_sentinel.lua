@@ -47,9 +47,11 @@ light_jedi_sentinel = Creature:new {
 	frsCouncil = "light",
 	frsRankMin = 1,
 	frsRankMax = 4,
+	frsRankOutfits = lightJediFrsRankOutfits,
+	lightsaberColors = lightJediSaberColors,
 	customAiMap = "enclaveSentinel",
 
-	templates = { "light_jedi" },
+	templates = { "ranked_light_jedi" },
 	lootGroups = {},
 
 	-- Primary and secondary weapon should be different types (rifle/carbine, carbine/pistol, rifle/unarmed, etc)

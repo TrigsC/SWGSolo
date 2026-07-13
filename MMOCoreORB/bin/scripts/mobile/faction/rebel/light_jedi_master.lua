@@ -39,9 +39,11 @@ light_jedi_master = Creature:new {
 	jediArchetype = "random",
 	frsCouncil = "light",
 	frsRank = 11,
+	frsRankOutfits = lightJediFrsRankOutfits,
+	lightsaberColors = lightJediSaberColors,
 	customAiMap = "enclaveSentinel",
 
-	templates = { "light_jedi" },
+	templates = { "ranked_light_jedi" },
 	lootGroups = {},
 
 	primaryWeapon = "light_jedi_weapons",

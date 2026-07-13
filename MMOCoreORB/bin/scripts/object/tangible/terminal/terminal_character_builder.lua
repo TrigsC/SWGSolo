@@ -2177,7 +2177,7 @@ object_tangible_terminal_terminal_character_builder = object_tangible_terminal_s
 								"Arbiter II", "force_rank_light_rank_09"
 							},
 						},
-					},
+					
 				},	
 				--	"Light Saber",
 				--{

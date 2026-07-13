@@ -39,9 +39,10 @@ imperial_dark_jedi_knight = Creature:new {
 	jediArchetype = "random",
 	frsCouncil = "dark",
 	frsRank = 0,
+	frsRankOutfits = darkJediFrsRankOutfits,
 	customAiMap = "enclaveSentinel",
 
-	templates = { "dark_jedi" },
+	templates = { "ranked_dark_jedi" },
 	lootGroups = {},
 
 	primaryWeapon = "dark_jedi_weapons_gen4",

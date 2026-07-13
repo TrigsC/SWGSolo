@@ -57,7 +57,10 @@
 #include "server/zone/objects/creature/ai/CreatureTemplate.h"
 #include "templates/mobile/MobileOutfit.h"
 #include "templates/mobile/MobileOutfitGroup.h"
+#include "templates/creature/VendorCreatureTemplate.h"
+#include "templates/manager/TemplateManager.h"
 #include "templates/SharedObjectTemplate.h"
+#include "templates/SharedTangibleObjectTemplate.h"
 #include "server/zone/objects/player/FactionStatus.h"
 #include "templates/params/ObserverEventType.h"
 #include "server/zone/managers/gcw/observers/ImperialChatObserver.h"
@@ -715,6 +718,182 @@ void AiAgentImplementation::cancelForceRegenerationEvent() {
     forceRegenerationEvent = nullptr;
 }
 
+static String getRankedJediAppearanceProfile(const String& baseMobileTemplate) {
+	static const String bodyPrefix = "object/mobile/ranked_jedi_";
+
+	if (!baseMobileTemplate.beginsWith(bodyPrefix) ||
+			!baseMobileTemplate.endsWith(".iff"))
+		return "";
+
+	const String speciesGender = baseMobileTemplate.subString(
+		bodyPrefix.length(), baseMobileTemplate.length() - 4);
+
+	if (speciesGender.isEmpty())
+		return "";
+
+	return "object/mobile/vendor/" + speciesGender + ".iff";
+}
+
+static void randomizeRankedJediAppearance(AiAgentImplementation* agent,
+		const String& baseMobileTemplate, const String& creatureTemplate,
+		const String& council, int rank) {
+	if (agent == nullptr)
+		return;
+
+	const String profileTemplate = getRankedJediAppearanceProfile(baseMobileTemplate);
+
+	if (profileTemplate.isEmpty()) {
+		Logger::console.error()
+			<< "[RankedJediAppearance] event=profile_missing"
+			<< " agent=" << agent->getObjectID()
+			<< " template=" << creatureTemplate
+			<< " baseMobile=" << baseMobileTemplate
+			<< " council=" << council
+			<< " rank=" << rank
+			<< " reason=unsupported_body_template";
+		return;
+	}
+
+	SharedObjectTemplate* sharedProfile =
+		TemplateManager::instance()->getTemplate(profileTemplate.hashCode());
+	VendorCreatureTemplate* appearanceProfile =
+		dynamic_cast<VendorCreatureTemplate*>(sharedProfile);
+
+	if (appearanceProfile == nullptr) {
+		Logger::console.error()
+			<< "[RankedJediAppearance] event=profile_missing"
+			<< " agent=" << agent->getObjectID()
+			<< " template=" << creatureTemplate
+			<< " baseMobile=" << baseMobileTemplate
+			<< " council=" << council
+			<< " rank=" << rank
+			<< " profile=" << profileTemplate
+			<< " reason=vendor_profile_not_loaded";
+		return;
+	}
+
+	int customizationVariables = 0;
+
+	// Reuse the stock player-vendor feature profiles. These contain the valid
+	// per-species palette, texture, face, fat/skinny, and muscle values already
+	// used by Core3 rather than introducing a second set of appearance ranges.
+	for (int i = 0; i < appearanceProfile->getCustomizationStringNamesSize(); ++i) {
+		if (i >= appearanceProfile->getCustomizationValuesSize())
+			continue;
+
+		const String variableName = appearanceProfile->getCustomizationStringName(i);
+		const Vector<int> values = appearanceProfile->getCustomizationValues(i);
+
+		if (variableName.isEmpty() || values.isEmpty())
+			continue;
+
+		const int randomValue = values.get(System::random(values.size() - 1));
+		const int separator = variableName.indexOf(',');
+
+		// Some morphs are mutually-exclusive pairs (for example fat/skinny).
+		// Match VendorManager: choose one side and explicitly zero the other.
+		if (separator >= 0) {
+			const String firstVariable = variableName.subString(0, separator);
+			const String secondVariable = variableName.subString(separator + 1);
+
+			if (System::random(1) == 1) {
+				agent->setCustomizationVariable(firstVariable, randomValue, false);
+				agent->setCustomizationVariable(secondVariable, 0, false);
+			} else {
+				agent->setCustomizationVariable(firstVariable, 0, false);
+				agent->setCustomizationVariable(secondVariable, randomValue, false);
+			}
+		} else {
+			agent->setCustomizationVariable(variableName, randomValue, false);
+		}
+
+		++customizationVariables;
+	}
+
+	// Vendor profiles also carry the stock species/gender scale range.
+	const int minScale = static_cast<int>(appearanceProfile->getMinScale() * 100.f);
+	const int maxScale = static_cast<int>(appearanceProfile->getMaxScale() * 100.f);
+	int randomizedScale = minScale;
+
+	if (maxScale > minScale)
+		randomizedScale += System::random(maxScale - minScale);
+
+	const float height = randomizedScale / 100.f;
+	if (height > 0.f)
+		agent->setHeight(height, false);
+
+	String hairTemplate = "<none>";
+	bool hairTracked = false;
+
+	if (appearanceProfile->getHairSize() > 0 && agent->getZoneServer() != nullptr) {
+		hairTemplate = appearanceProfile->getHairFile(
+			System::random(appearanceProfile->getHairSize() - 1));
+
+		if (!hairTemplate.isEmpty()) {
+			ManagedReference<TangibleObject*> hair = agent->getZoneServer()->createObject(
+				hairTemplate.hashCode(), agent->getPersistenceLevel()).castTo<TangibleObject*>();
+
+			if (hair == nullptr) {
+				Logger::console.error()
+					<< "[RankedJediAppearance] event=hair_failed"
+					<< " agent=" << agent->getObjectID()
+					<< " template=" << creatureTemplate
+					<< " baseMobile=" << baseMobileTemplate
+					<< " hair=" << hairTemplate
+					<< " reason=create_failed";
+			} else {
+				Locker hairLocker(hair);
+				bool hasHairSlot = false;
+
+				for (int descriptor = 0;
+						descriptor < hair->getArrangementDescriptorSize(); ++descriptor) {
+					const Vector<String>* slots = hair->getArrangementDescriptor(descriptor);
+
+					if (slots != nullptr && slots->contains("hair")) {
+						hasHairSlot = true;
+						break;
+					}
+				}
+
+				if (!hasHairSlot || !agent->transferObject(hair, 4, false)) {
+					Logger::console.error()
+						<< "[RankedJediAppearance] event=hair_failed"
+						<< " agent=" << agent->getObjectID()
+						<< " template=" << creatureTemplate
+						<< " baseMobile=" << baseMobileTemplate
+						<< " hair=" << hairTemplate
+						<< " hasHairSlot=" << hasHairSlot
+						<< " reason=equip_failed";
+
+					hair->destroyObjectFromDatabase(true);
+				} else {
+					ManagedReference<SceneObject*> hairParent = hair->getParent().get();
+					const bool parentMatchesAgent = hairParent != nullptr &&
+						hairParent->getObjectID() == agent->getObjectID();
+
+					if (parentMatchesAgent)
+						agent->addWearableObject(hair, false);
+
+					hairTracked = agent->getWearablesDeltaVector()->contains(hair);
+				}
+			}
+		}
+	}
+
+	Logger::console.info(true)
+		<< "[RankedJediAppearance] event=randomized"
+		<< " agent=" << agent->getObjectID()
+		<< " template=" << creatureTemplate
+		<< " baseMobile=" << baseMobileTemplate
+		<< " council=" << council
+		<< " rank=" << rank
+		<< " profile=" << profileTemplate
+		<< " customizationVariables=" << customizationVariables
+		<< " height=" << height
+		<< " hair=" << hairTemplate
+		<< " hairTracked=" << hairTracked;
+}
+
 void AiAgentImplementation::initializeJediArchetype() {
     // Roll once per spawn; reloadTemplate() keeps the existing roll so the
     // stat package below is never applied twice.
@@ -766,9 +945,39 @@ void AiAgentImplementation::initializeJediArchetype() {
         return;
     }
 
-    if (SimPlayerManager::instance()->isPvpRankedJediEnabled() &&
-            npcTemplate->getFrsRankMin() >= 0 &&
-            npcTemplate->getFrsCouncil() > 0) {
+	const bool rankedJediEnabled = SimPlayerManager::instance()->isPvpRankedJediEnabled();
+	const bool rankedJediTemplate = npcTemplate->getFrsRankMin() >= 0 ||
+		npcTemplate->getFrsRankOutfitsSize() > 0;
+	const String baseMobileTemplate = getObjectTemplate() != nullptr ?
+		getObjectTemplate()->getFullTemplateString() : String("<missing>");
+
+	if (rankedJediTemplate) {
+		Logger::console.info(true)
+			<< "[RankedJediOutfit] event=spawn_config"
+			<< " agent=" << getObjectID()
+			<< " template=" << npcTemplate->getTemplateName()
+			<< " baseMobile=" << baseMobileTemplate
+			<< " enabled=" << rankedJediEnabled
+			<< " rankMin=" << npcTemplate->getFrsRankMin()
+			<< " rankMax=" << npcTemplate->getFrsRankMax()
+			<< " council=" << npcTemplate->getFrsCouncil()
+			<< " outfitEntries=" << npcTemplate->getFrsRankOutfitsSize()
+			<< " containerComponent=" << (getObjectTemplate() != nullptr ?
+				getObjectTemplate()->getContainerComponent() : String("<missing>"))
+			<< " containerOverride=" << npcTemplate->getContainerComponentTemplate();
+
+		if (!rankedJediEnabled) {
+			Logger::console.info(true)
+				<< "[RankedJediOutfit] event=skip"
+				<< " agent=" << getObjectID()
+				<< " template=" << npcTemplate->getTemplateName()
+				<< " reason=ranked_jedi_disabled";
+		}
+	}
+
+	if (rankedJediEnabled &&
+			npcTemplate->getFrsRankMin() >= 0 &&
+			npcTemplate->getFrsCouncil() > 0) {
         // Per-rank FRS skillmods derived from the owner's authoritative
         // ability tables (docs/frs-rank-values-{light,dark}.txt) inverted
         // through the live formulas (getFrsModifiedBuffValue /
@@ -805,11 +1014,19 @@ void AiAgentImplementation::initializeJediArchetype() {
         const bool lightCouncil = council == FrsManager::COUNCIL_LIGHT;
         const bool darkCouncil = council == FrsManager::COUNCIL_DARK;
 
-        if (lightCouncil || darkCouncil) {
-            const String side = lightCouncil ? String("light") : String("dark");
+		if (lightCouncil || darkCouncil) {
+			const String side = lightCouncil ? String("light") : String("dark");
 
-            frsRank = rank;
-            frsCouncil = council;
+			frsRank = rank;
+			frsCouncil = council;
+
+			Logger::console.info(true)
+				<< "[RankedJediOutfit] event=rank_selected"
+				<< " agent=" << getObjectID()
+				<< " template=" << npcTemplate->getTemplateName()
+				<< " baseMobile=" << baseMobileTemplate
+				<< " council=" << side
+				<< " rank=" << rank;
 
             addSkillMod(SkillModManager::TEMPLATE,
                 "force_control_" + side, controlByRank[rank], false);
@@ -822,8 +1039,176 @@ void AiAgentImplementation::initializeJediArchetype() {
             // enhancer knights showed 51 = 25 + (25+1) instead of 26).
             addSkillMod(SkillModManager::TEMPLATE,
                 "jedi_force_power_regen", regenByRank[rank], false);
-        }
-    }
+
+			randomizeRankedJediAppearance(this, baseMobileTemplate,
+				npcTemplate->getTemplateName(), side, rank);
+
+            // The base mobile's "dressed" appearance comes from its TRE CDF,
+            // but FRS robes are normal wearable objects and can be equipped by
+            // the server. Select after the rank roll so ranges spanning a robe
+            // boundary (currently dark ranks 8-10) always look correct.
+			if (rank < npcTemplate->getFrsRankOutfitsSize()) {
+				const String& rankOutfit = npcTemplate->getFrsRankOutfit(rank);
+
+				if (!rankOutfit.isEmpty()) {
+					Logger::console.info(true)
+						<< "[RankedJediOutfit] event=create_attempt"
+						<< " agent=" << getObjectID()
+						<< " template=" << npcTemplate->getTemplateName()
+						<< " baseMobile=" << baseMobileTemplate
+						<< " council=" << side
+						<< " rank=" << rank
+						<< " requestedIff=" << rankOutfit
+						<< " crc=" << rankOutfit.hashCode();
+
+					ManagedReference<TangibleObject*> wearable =
+						getZoneServer()->createObject(rankOutfit.hashCode(),
+							getPersistenceLevel()).castTo<TangibleObject*>();
+
+					if (wearable == nullptr) {
+						Logger::console.error()
+							<< "[RankedJediOutfit] event=create_failed"
+							<< " agent=" << getObjectID()
+							<< " template=" << npcTemplate->getTemplateName()
+							<< " baseMobile=" << baseMobileTemplate
+							<< " council=" << side
+							<< " rank=" << rank
+							<< " requestedIff=" << rankOutfit
+							<< " crc=" << rankOutfit.hashCode();
+					} else {
+						Locker wearableLocker(wearable);
+						const String resolvedTemplate = wearable->getObjectTemplate() != nullptr ?
+							wearable->getObjectTemplate()->getFullTemplateString() : String("<missing>");
+						bool raceListed = false;
+						SharedTangibleObjectTemplate* tangibleTemplate =
+							dynamic_cast<SharedTangibleObjectTemplate*>(wearable->getObjectTemplate());
+
+						if (tangibleTemplate != nullptr && getObjectTemplate() != nullptr) {
+							const Vector<uint32>* supportedRaces = tangibleTemplate->getPlayerRaces();
+
+							if (supportedRaces != nullptr)
+								raceListed = supportedRaces->contains(baseMobileTemplate.hashCode());
+						}
+
+						StringBuffer arrangementSlots;
+						bool hasArrangementSlots = false;
+						for (int descriptor = 0;
+								descriptor < wearable->getArrangementDescriptorSize(); ++descriptor) {
+							const Vector<String>* slots = wearable->getArrangementDescriptor(descriptor);
+
+							for (int slot = 0; slot < slots->size(); ++slot) {
+								if (hasArrangementSlots)
+									arrangementSlots << ",";
+
+								arrangementSlots << slots->get(slot);
+								hasArrangementSlots = true;
+							}
+						}
+
+						Logger::console.info(true)
+							<< "[RankedJediOutfit] event=create_success"
+							<< " agent=" << getObjectID()
+							<< " template=" << npcTemplate->getTemplateName()
+							<< " wearable=" << wearable->getObjectID()
+							<< " requestedIff=" << rankOutfit
+							<< " resolvedIff=" << resolvedTemplate
+							<< " isWearable=" << wearable->isWearableObject()
+							<< " isRobe=" << wearable->isRobeObject()
+							<< " raceListed=" << raceListed
+							<< " descriptorCount=" << wearable->getArrangementDescriptorSize()
+							<< " slots=" << (hasArrangementSlots ?
+								arrangementSlots.toString() : String("<none>"));
+
+						if (!transferObject(wearable, 4, false)) {
+							Logger::console.error()
+								<< "[RankedJediOutfit] event=equip_failed"
+								<< " agent=" << getObjectID()
+								<< " template=" << npcTemplate->getTemplateName()
+								<< " wearable=" << wearable->getObjectID()
+								<< " requestedIff=" << rankOutfit
+								<< " containmentType=4";
+
+							if (wearable->isPersistent())
+								wearable->destroyObjectFromDatabase(true);
+						} else {
+							ManagedReference<SceneObject*> wearableParent = wearable->getParent().get();
+							const uint64 parentID = wearableParent != nullptr ?
+								wearableParent->getObjectID() : 0;
+							const bool parentMatchesAgent = parentID == getObjectID();
+
+							// AiAgents use the generic ContainerComponent, unlike players.
+							// A successful slotted transfer therefore establishes
+							// containment but does not populate the CREO6 equipment list.
+							// Register this spawn-time wearable without a delta; observers
+							// receive it in the creature's initial baseline. This deliberately
+							// avoids PlayerContainerComponent, so player race/certification
+							// checks and robe skill-mod handling remain unchanged.
+							if (parentMatchesAgent)
+								addWearableObject(wearable, false);
+
+							const bool wearablesTracked =
+								getWearablesDeltaVector()->contains(wearable);
+
+							Logger::console.info(true)
+								<< "[RankedJediOutfit] event=equip_success"
+								<< " agent=" << getObjectID()
+								<< " template=" << npcTemplate->getTemplateName()
+								<< " baseMobile=" << baseMobileTemplate
+								<< " council=" << side
+								<< " rank=" << rank
+								<< " wearable=" << wearable->getObjectID()
+								<< " requestedIff=" << rankOutfit
+								<< " resolvedIff=" << resolvedTemplate
+								<< " parent=" << parentID
+								<< " parentMatchesAgent=" << parentMatchesAgent
+								<< " wearablesTracked=" << wearablesTracked
+								<< " wearablesCount=" << getWearablesDeltaVector()->size();
+
+							if (!wearablesTracked) {
+								Logger::console.error()
+									<< "[RankedJediOutfit] event=client_visibility_warning"
+									<< " agent=" << getObjectID()
+									<< " template=" << npcTemplate->getTemplateName()
+									<< " wearable=" << wearable->getObjectID()
+									<< " requestedIff=" << rankOutfit
+									<< " reason=not_in_wearables_vector";
+							}
+						}
+					}
+				} else {
+					Logger::console.error()
+						<< "[RankedJediOutfit] event=mapping_invalid"
+						<< " agent=" << getObjectID()
+						<< " template=" << npcTemplate->getTemplateName()
+						<< " rank=" << rank
+						<< " reason=empty_iff";
+				}
+			} else {
+				Logger::console.error()
+					<< "[RankedJediOutfit] event=mapping_invalid"
+					<< " agent=" << getObjectID()
+					<< " template=" << npcTemplate->getTemplateName()
+					<< " rank=" << rank
+					<< " outfitEntries=" << npcTemplate->getFrsRankOutfitsSize()
+					<< " reason=rank_out_of_range";
+			}
+		} else {
+			Logger::console.error()
+				<< "[RankedJediOutfit] event=rank_invalid"
+				<< " agent=" << getObjectID()
+				<< " template=" << npcTemplate->getTemplateName()
+				<< " rank=" << rank
+				<< " council=" << council;
+		}
+	} else if (rankedJediEnabled && rankedJediTemplate) {
+		Logger::console.error()
+			<< "[RankedJediOutfit] event=skip"
+			<< " agent=" << getObjectID()
+			<< " template=" << npcTemplate->getTemplateName()
+			<< " reason=invalid_rank_or_council"
+			<< " rankMin=" << npcTemplate->getFrsRankMin()
+			<< " council=" << npcTemplate->getFrsCouncil();
+	}
 
     debug() << "initializeJediArchetype: rolled " << archetype;
 }
@@ -1531,8 +1916,22 @@ WeaponObject* AiAgentImplementation::createWeapon(uint32 templateCRC, bool prima
 	}
 
 	int lightsaberColor = npcTemplate->getLightsaberColor();
+	const bool hasLightsaberColorPool = npcTemplate->getLightsaberColorsSize() > 0;
 
-	if (newWeapon->isJediWeapon() && lightsaberColor > 0) {
+	if (newWeapon->isJediWeapon() && hasLightsaberColorPool) {
+		lightsaberColor = npcTemplate->getLightsaberColorAt(
+			System::random(npcTemplate->getLightsaberColorsSize() - 1));
+
+		Logger::console.info(true)
+			<< "[RankedJediSaber] event=color_selected"
+			<< " agent=" << getObjectID()
+			<< " template=" << npcTemplate->getTemplateName()
+			<< " weapon=" << newWeapon->getObjectID()
+			<< " weaponIff=" << newWeapon->getObjectTemplate()->getFullTemplateString()
+			<< " color=" << lightsaberColor;
+	}
+
+	if (newWeapon->isJediWeapon() && (hasLightsaberColorPool || lightsaberColor > 0)) {
 		newWeapon->setBladeColor(lightsaberColor);
 		newWeapon->setCustomizationVariable("/private/index_color_blade", lightsaberColor, true);
 	}
