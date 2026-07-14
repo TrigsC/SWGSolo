@@ -774,6 +774,11 @@ SimPlayerManagerConfig = {
             -- Formalizes the existing real-ship wait. Set false as an escape
             -- hatch to board on the first wait tick without a ship present.
             boardOnActualShuttle = true,
+            -- 0.2.1: squads hold at the pad at least this long after the
+            -- MOVEOUT route callout before jumping, even if a ship is already
+            -- in - gives grouped players time to buy the same ticket. The
+            -- board-anyway cap still applies (never wedges a port).
+            minDepartureNoticeSeconds = 30,
             -- Random patrols arrive one city out when the destination is hot;
             -- convergence responses still take the direct route.
             avoidHotArrival = true,

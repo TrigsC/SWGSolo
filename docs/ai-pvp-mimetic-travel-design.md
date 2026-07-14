@@ -616,3 +616,25 @@ planet legs arrive at shuttle pads.
    regressions stay attributable).
 7. Miners unaffected: minerActivity/pathValidationDiagnostics at baseline
    (the SimPlayerController changes are outdoor no-ops).
+
+### 13.4 Hotfix 0.2.1 (2026-07-14, owner live report)
+
+Symptom: DEPARTURE line spoken, squad jumps, no route callout — first
+destination info was the ARRIVAL line in group chat. ROOT CAUSE: P.6.5b
+planned the route (and spoke MOVEOUT) inside the same call stack as the
+DEPARTURE shout at loiter-end; `announcePvpEvent`'s global
+4s anti-spam gap (which MOVEOUT deliberately does NOT bypass) dropped the
+route line on every normal departure. P.6.5a never hit this because MOVEOUT
+fired at the pad, a full run after DEPARTURE. FIX: planning at departure
+intent stays (the collector-run target needs it) but is silent —
+`planPvpRoute` stamps `squad.pendingRouteAnnounce`; `onPvpSquadReadyToTravel`
+speaks it at the pad (verified 2026-07-09 choreography restored); stamp
+cleared when spoken, on convergence route-drops, and on board-time fallback
+plans. PLUS `travel.minDepartureNoticeSeconds` (lua 30, C++ default 0):
+the shuttle wait won't board before the callout has had that long to land,
+even with a ship already in; board-anyway cap exempt (never-wedge wins).
+VERIFY: MOVEOUT lines audible at the pad again; ≥30s between callout and
+SquadTraveled; comms.announcementsTotal per-travel rate back up; no
+boardAnyway increase. KEY LESSON: any two announcePvpEvent calls in one
+call stack lose the second to the global gap — announce sites must be
+separated by real gameplay time, not code order.

@@ -5317,6 +5317,7 @@ void SimPlayerManager::loadLuaConfig() {
     pvpBoardOnActualShuttle = true;
     pvpCollectorScanRadiusMeters = 175.f;
     pvpCollectorZSanityMeters = 10.f;
+    pvpMinDepartureNoticeSeconds = 0;
     pvpBoardingPointCache.removeAll();
     // P.6.2 scout/convergence defaults (lua pvpConfig.scouts overrides).
     pvpScoutsEnabled = false;
@@ -9399,6 +9400,7 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         routedJson["useCollectorBoarding"] = pvpUseCollectorBoarding;
         routedJson["avoidHotArrival"] = pvpAvoidHotArrival;
         routedJson["boardOnActualShuttle"] = pvpBoardOnActualShuttle;
+        routedJson["minDepartureNoticeSeconds"] = pvpMinDepartureNoticeSeconds;
         routedJson["collectorScanRadiusMeters"] = pvpCollectorScanRadiusMeters;
         routedJson["collectorZSanityMeters"] = pvpCollectorZSanityMeters;
 
@@ -21424,6 +21426,9 @@ void SimPlayerManager::applyPvpConfig(LuaObject& pvpConfig) {
             "avoidHotArrival", pvpAvoidHotArrival);
         pvpBoardOnActualShuttle = travel.getBooleanField(
             "boardOnActualShuttle", pvpBoardOnActualShuttle);
+        pvpMinDepartureNoticeSeconds = clampMinerInt(
+            travel.getIntField("minDepartureNoticeSeconds"),
+            pvpMinDepartureNoticeSeconds, 0, 90);
 
         float previousScanRadius = pvpCollectorScanRadiusMeters;
         float previousZSanity = pvpCollectorZSanityMeters;
@@ -22236,13 +22241,16 @@ bool SimPlayerManager::onPvpSquadDepartureIntent(uint64 squadId,
 
 	// Plan before the controller enters TO_SHUTTLE. This is the first point
 	// where the route type can influence the movement target while the squad
-	// is still at its hangout.
+	// is still at its hangout. Planning is SILENT here (0.2.1 hotfix): the
+	// DEPARTURE shout fires in the same call stack, so an immediate MOVEOUT
+	// would be swallowed by the global announce gap. planPvpRoute stamps the
+	// route text on the squad; onPvpSquadReadyToTravel speaks it at the pad,
+	// during the shuttle wait, where players can still act on it.
 	if (pvpRoutedTravelEnabled && snapshot.pendingRoute.size() == 0) {
 		String routeSummary;
 		bool convergence = false;
 
-		if (planPvpRoute(squadId, snapshot, routeSummary, convergence))
-			announcePvpEvent(squadId, PVP_ANNOUNCE_MOVEOUT, routeSummary);
+		planPvpRoute(squadId, snapshot, routeSummary, convergence);
 	}
 
 	Locker squadLock(&pvpSquadMutex);
@@ -22295,16 +22303,32 @@ void SimPlayerManager::onPvpSquadReadyToTravel(uint64 squadId) {
         snapshot = squad;
     }
 
-    // P.6.5a/5b: departure intent normally planned the route and announced
-    // MOVEOUT before the squad began its run. Keep plan-if-empty here as the
-    // safety net for board-anyway paths and convergence replans.
+    // P.6.5a/5b: the route was normally planned (silently) at departure
+    // intent; plan-if-empty stays as the safety net for board-anyway paths
+    // and convergence replans. Either way the MOVEOUT callout is spoken HERE,
+    // at the pad during the shuttle wait (0.2.1 hotfix) - far enough from the
+    // hangout DEPARTURE shout to clear the global announce gap, and early
+    // enough for players to buy the same ticket.
     if (pvpRoutedTravelEnabled && snapshot.pendingRoute.size() == 0) {
         String routeSummary;
         bool convergence = false;
 
-        if (planPvpRoute(squadId, snapshot, routeSummary, convergence))
-            announcePvpEvent(squadId, PVP_ANNOUNCE_MOVEOUT, routeSummary);
+        planPvpRoute(squadId, snapshot, routeSummary, convergence);
     }
+
+    String pendingAnnounce;
+    {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndex(squadId);
+
+        if (idx >= 0) {
+            pendingAnnounce = pvpSquads.get(idx).pendingRouteAnnounce;
+            pvpSquads.get(idx).pendingRouteAnnounce = "";
+        }
+    }
+
+    if (!pendingAnnounce.isEmpty())
+        announcePvpEvent(squadId, PVP_ANNOUNCE_MOVEOUT, pendingAnnounce);
 
     Reference<SimPvpShuttleWaitTask*> task = new SimPvpShuttleWaitTask(squadId, 0);
     task->schedule(1000);
@@ -22355,11 +22379,14 @@ void SimPlayerManager::runPvpShuttleWaitTask(uint64 squadId, int attempts) {
 
     bool boardNow = false;
 
-    if (!pvpBoardOnActualShuttle) {
-        // Owner escape hatch: preserve the dwell/task choreography but do not
-        // require a live shuttle object at the departure port.
-        boardNow = true;
-    } else if (attempts >= pvpShuttleWaitMaxAttempts) {
+    // 0.2.1: guarantee players a window between the pad MOVEOUT callout and
+    // the jump. attempts * interval approximates time since the callout (the
+    // wait task starts right after ready-to-travel announces). The
+    // board-anyway cap is exempt - never-wedge beats notice.
+    bool noticeElapsed = attempts * pvpShuttleWaitIntervalSeconds >=
+        pvpMinDepartureNoticeSeconds;
+
+    if (attempts >= pvpShuttleWaitMaxAttempts) {
         // Same never-wedge-at-a-port contract as P.4.5b: board anyway.
         boardNow = true;
 
@@ -22367,6 +22394,12 @@ void SimPlayerManager::runPvpShuttleWaitTask(uint64 squadId, int attempts) {
             Locker squadLock(&pvpSquadMutex);
             pvpBoardAnywayTotal++;
         }
+    } else if (!noticeElapsed) {
+        boardNow = false;
+    } else if (!pvpBoardOnActualShuttle) {
+        // Owner escape hatch: preserve the dwell/task choreography but do not
+        // require a live shuttle object at the departure port.
+        boardNow = true;
     } else if (!leaderAgent->isInCombat() && isNearestShuttleBoardable(leaderAgent)) {
         boardNow = true;
     }
@@ -22758,6 +22791,9 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
     squad.routeDestPlanet = destLoc.planet;
     squad.routeDestCity = destLoc.name;
     squad.routeLegsTotal = legCount;
+    // 0.2.1: MOVEOUT is spoken at the pad (ready-to-travel), not at plan
+    // time - stash the route text so the announcer can pick it up there.
+    squad.pendingRouteAnnounce = summary;
 
     pvpRoutesPlannedTotal++;
     if (legCount > 1)
@@ -22788,11 +22824,13 @@ bool SimPlayerManager::popNextPvpRouteLeg(uint64 squadId, PvpTravelLeg& legOut,
     SimPvpSquad& squad = pvpSquads.get(idx);
 
     // A fresh unexpired convergence stamp overrides the rest of a planned
-    // route - drop it so the caller replans straight to the contact.
+    // route - drop it so the caller replans straight to the contact. The
+    // stashed route text goes with it (stale destinations must not speak).
     if (!squad.convergePlanet.isEmpty() &&
             System::getMiliTime() < squad.convergeExpiresAtMs &&
             squad.pendingRoute.size() > 0) {
         squad.pendingRoute.removeAll();
+        squad.pendingRouteAnnounce = "";
         return false;
     }
 
@@ -22945,9 +22983,19 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
             String routeSummary;
 
             if (planPvpRoute(squadId, snapshot, routeSummary, convergence)) {
-                // The route callout - players hear exactly where the squad is
-                // heading and can buy the same tickets to follow.
+                // Last-resort plan at the teleport itself (board-anyway /
+                // convergence replan): speak the callout immediately - a late
+                // announce beats none - and consume the stashed copy so the
+                // next pad wait cannot repeat a stale route.
                 announcePvpEvent(squadId, PVP_ANNOUNCE_MOVEOUT, routeSummary);
+
+                {
+                    Locker squadLock(&pvpSquadMutex);
+                    int idx = findPvpSquadIndex(squadId);
+                    if (idx >= 0)
+                        pvpSquads.get(idx).pendingRouteAnnounce = "";
+                }
+
                 haveLeg = popNextPvpRouteLeg(squadId, leg, routedLegsRemaining);
             }
         }

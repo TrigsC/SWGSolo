@@ -2,10 +2,16 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.2.1` | 1 | hotfix: MOVEOUT route callout swallowed by global announce gap; add min departure notice |
 | `0.2.0` | 1 | feat: P.6.5b starport boarding realism - collector runs, tactical arrival, cell-aware pathing |
 | `0.1.0` | 1 | chore: initialize TRIP workflow |
 
 # Changelog Summary
+
+- **v0.2.1 (Hotfix - Week 1, 14-07-2026)**:
+  - **Issue**: owner-reported live — squads spoke "packing it up" then jumped with no route callout; players had no time to follow (first destination info was the arrival line in group chat).
+  - **Fix**: route planning at departure intent is now silent (`pendingRouteAnnounce` stamped on the squad in `planPvpRoute`); the MOVEOUT callout is spoken at the pad in `onPvpSquadReadyToTravel` (restores the owner-verified 2026-07-09 timing); new `minDepartureNoticeSeconds` (lua 30, C++ default 0) holds boarding until the callout has had time to land even when a ship is already in (board-anyway cap unaffected). Stale stamps cleared on convergence replans and board-time fallback plans.
+  - **Root Cause**: P.6.5b moved planning+MOVEOUT to loiter-end, same call stack as the DEPARTURE shout — `announcePvpEvent`'s global 4s anti-spam gap (which MOVEOUT does not bypass) silently dropped the route line on every normal departure.
 
 - **v0.2.0 (P.6.5b Starport Boarding Realism - Week 1, 14-07-2026)**:
   - **Feature**: PvP squads depart from real starport ticket collectors (interior at Theed via new cell-aware pathing), tactical arrival one city out from hot destinations (convergence direct), formalized real-ship wait. All Lua-gated, simulation-only.

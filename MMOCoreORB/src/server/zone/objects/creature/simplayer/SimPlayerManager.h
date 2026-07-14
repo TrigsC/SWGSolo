@@ -598,6 +598,10 @@ public:
 		// = next to board); empty while idle at a destination city. An
 		// unexpired convergence stamp drops the rest of a route (replan).
 		Vector<PvpTravelLeg> pendingRoute;
+		// 0.2.1: route text stamped at plan time, spoken as MOVEOUT at the
+		// pad (ready-to-travel) so the hangout DEPARTURE shout can't swallow
+		// it via the global announce gap. Cleared when spoken or replanned.
+		String pendingRouteAnnounce;
 		String routeDestPlanet;
 		String routeDestCity;
 		int routeLegsTotal = 0;
@@ -1194,6 +1198,10 @@ private:
 	int pvpMaintenanceIntervalSeconds = 30;
 	int pvpShuttleWaitIntervalSeconds = 5;
 	int pvpShuttleWaitMaxAttempts = 24;
+	// 0.2.1: minimum seconds between the pad MOVEOUT callout and boarding, so
+	// a ship already sitting at the port can't yank the squad ~5s after the
+	// route is spoken. 0 = off (pre-hotfix behavior); board-anyway unaffected.
+	int pvpMinDepartureNoticeSeconds = 0;
 	int pvpCorpseCleanupDelaySeconds = 60;
 	bool pvpRecoveryEnabled = true;
 	bool pvpRecoveryDryRun = true;
