@@ -1,5 +1,7 @@
 # SWGEmu Core3: Recreating the Classic Star Wars Galaxies Experience
 
+**SWGSolo fork version: 0.2.0** (see `VERSION`, `docs/2-changelog/changelog_table.md`)
+
 ## What is SWGEmu?
 
 Star Wars Galaxies (SWG) was an immensely popular massively multiplayer online role-playing game (MMORPG) introduced by Sony Online Entertainment in 2003. Despite its eventual shutdown in 2011, SWG left a lasting legacy in the hearts of thousands of players.

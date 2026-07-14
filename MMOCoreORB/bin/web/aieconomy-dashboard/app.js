@@ -875,6 +875,7 @@
     const pvp = d.pvpActivity || {};
     const scouts = pvp.scouts || {};
     const comms = pvp.comms || {};
+    const routed = pvp.routedTravel || {};
     const squads = pvp.squads || [];
 
     const factionCard = (name, cls) => {
@@ -957,6 +958,28 @@
             ["Room posts", num(comms.factionRoomPostsTotal)],
             ["Joins blocked (covert)", num(comms.factionRoomJoinsBlockedTotal)],
             ["Announce cooldown", num(comms.announceCooldownSeconds) + "s"]
+          ])}</div>
+        </section>
+        <section class="panel span-12"><header><h3>ROUTED TRAVEL</h3>
+          <span class="panel-tag">${routed.enabled ? "routed" : "direct"} · collector boarding ${onoff(routed.useCollectorBoarding)} · ship-wait ${onoff(routed.boardOnActualShuttle)}</span></header>
+          <div class="panel-body"><div class="metric-row">
+            ${metric("Routes Planned", routed.routesPlannedTotal)}
+            ${metric("Legs Executed", routed.routeLegsExecutedTotal)}
+            ${metric("Hop Routes", routed.hopRoutesTotal)}
+            ${metric("Transit Stops", routed.transitStopsTotal)}
+            ${metric("Collector Boardings", routed.collectorBoardingsTotal, { tone: "accent" })}
+            ${metric("Tactical Arrivals", routed.tacticalArrivalsTotal, { tone: "accent" })}
+            ${metric("Plan Fallbacks", routed.fallbacksTotal, { tone: Number(routed.fallbacksTotal || 0) ? "warn" : "" })}
+            ${metric("Collector Fallbacks", routed.collectorFallbacksTotal, { tone: Number(routed.collectorFallbacksTotal || 0) ? "warn" : "" })}
+          </div>
+          <div class="section-gap"></div>
+          ${kvRows([
+            ["Collector cache", `${num(routed.collectorCacheResolvedCount)} resolved · ${num(routed.collectorCacheFallbackCount)} pad-fallback`],
+            ["Staging", `${esc(labelize(routed.stagingRebel || "?"))} (rebel) · ${esc(labelize(routed.stagingImperial || "?"))} (imperial)`],
+            ["Orphan sweep", `${num(routed.orphanBotsLastSweep)} last · ${num(routed.orphanBotsDetectedTotal)} total`],
+            ["En route", squads.filter((s) => s.routeDest).map((s) =>
+              `#${esc(s.squadId)} → ${esc(labelize(String(s.routeDest).split(":").pop() || ""))} (${num(s.routeLegsRemaining)} leg${Number(s.routeLegsRemaining) === 1 ? "" : "s"}${s.departureTargetKind === "collector" ? " · collector" : ""})`
+            ).join(" · ") || "none"]
           ])}</div>
         </section>
       </div>`;

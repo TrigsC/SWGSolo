@@ -5,6 +5,9 @@
 
 #include "SimPlayerManager.h"
 #include "SimPvPController.h"
+
+#include <cmath>
+
 #include "server/zone/ZoneServer.h"
 #include "server/ServerCore.h"
 #include "server/zone/managers/creature/CreatureManager.h"
@@ -5306,6 +5309,15 @@ void SimPlayerManager::loadLuaConfig() {
     pvpNpcFrsXpFactor = 1.f;
     pvpNpcFrsXpDailyCap = 0;
     pvpNpcFrsMinContributionPct = 0.10f;
+    // P.6.5b collector-boarding defaults are fail-closed in C++; Lua enables
+    // them for the rollout. boardOnActualShuttle preserves the existing
+    // real-ship wait when the key is absent.
+    pvpUseCollectorBoarding = false;
+    pvpAvoidHotArrival = false;
+    pvpBoardOnActualShuttle = true;
+    pvpCollectorScanRadiusMeters = 175.f;
+    pvpCollectorZSanityMeters = 10.f;
+    pvpBoardingPointCache.removeAll();
     // P.6.2 scout/convergence defaults (lua pvpConfig.scouts overrides).
     pvpScoutsEnabled = false;
     pvpScoutSquadsPerFaction = 1;
@@ -9381,6 +9393,39 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         routedJson["hopRoutesTotal"] = pvpRouteHopRoutesTotal;
         routedJson["transitStopsTotal"] = pvpTransitStopsTotal;
         routedJson["fallbacksTotal"] = pvpRouteFallbacksTotal;
+        routedJson["collectorBoardingsTotal"] = pvpCollectorBoardingsTotal;
+        routedJson["collectorFallbacksTotal"] = pvpCollectorFallbacksTotal;
+        routedJson["tacticalArrivalsTotal"] = pvpTacticalArrivalsTotal;
+        routedJson["useCollectorBoarding"] = pvpUseCollectorBoarding;
+        routedJson["avoidHotArrival"] = pvpAvoidHotArrival;
+        routedJson["boardOnActualShuttle"] = pvpBoardOnActualShuttle;
+        routedJson["collectorScanRadiusMeters"] = pvpCollectorScanRadiusMeters;
+        routedJson["collectorZSanityMeters"] = pvpCollectorZSanityMeters;
+
+        int collectorCacheResolved = 0;
+        int collectorCacheFallbacks = 0;
+        JSONSerializationType collectorCacheRows = JSONSerializationType::array();
+        for (int i = 0; i < pvpBoardingPointCache.size(); ++i) {
+            const PvpBoardingPoint& point = pvpBoardingPointCache.get(i);
+
+            if (point.resolved)
+                collectorCacheResolved++;
+            if (point.fellBackToPad)
+                collectorCacheFallbacks++;
+
+            JSONSerializationType row = JSONSerializationType::object();
+            row["point"] = pvpBoardingPointCache.elementAt(i).getKey();
+            row["resolved"] = point.resolved;
+            row["fellBackToPad"] = point.fellBackToPad;
+            row["cellOid"] = String::valueOf(point.cellOid);
+            row["worldX"] = point.worldPos.getX();
+            row["worldY"] = point.worldPos.getY();
+            row["worldZ"] = point.worldPos.getZ();
+            collectorCacheRows.push_back(row);
+        }
+        routedJson["collectorCacheResolvedCount"] = collectorCacheResolved;
+        routedJson["collectorCacheFallbackCount"] = collectorCacheFallbacks;
+        routedJson["collectorCache"] = collectorCacheRows;
         // Orphan-bot sweep diagnostics (log-only; SimPvpOrphanBot lines).
         routedJson["orphanBotsLastSweep"] = pvpOrphanBotsLastSweep;
         routedJson["orphanBotsDetectedTotal"] = pvpOrphanBotsDetectedTotal;
@@ -9454,6 +9499,11 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
             row["routeDest"] = squad.routeDestCity.isEmpty() ? String("") :
                 squad.routeDestPlanet + ":" + squad.routeDestCity;
             row["routeLegsRemaining"] = squad.pendingRoute.size();
+            String departureTargetKind = "";
+            if (squad.pendingRoute.size() > 0)
+                departureTargetKind =
+                    squad.pendingRoute.get(0).departureIsCollector ?
+                    String("collector") : String("pad");
             row["ageSeconds"] = squad.formedAtMs > 0 ?
                 (nowMs - squad.formedAtMs) / 1000 : 0;
 
@@ -9471,9 +9521,14 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
                     phaseName = leaderCtrl->getPvpPhaseName();
                     phaseAgeSeconds =
                         (nowMs - leaderCtrl->getPhaseSinceMs()) / 1000;
+                    // An active collector run (set at TO_SHUTTLE entry) wins
+                    // over the pending-leg guess above.
+                    if (leaderCtrl->isCurrentShuttleCollectorTarget())
+                        departureTargetKind = "collector";
                 }
             }
 
+            row["departureTargetKind"] = departureTargetKind;
             row["leaderPhase"] = phaseName;
             row["leaderPhaseAgeSeconds"] = phaseAgeSeconds;
             squadRows.push_back(row);
@@ -21361,6 +21416,37 @@ void SimPlayerManager::applyPvpConfig(LuaObject& pvpConfig) {
             travel.getIntField("transitDwellSecondsMax"),
             pvpTravelTransitDwellMaxSeconds, pvpTravelTransitDwellMinSeconds, 900);
 
+        // P.6.5b departure-port realism. C++ defaults remain conservative;
+        // runtime refresh applies these gates and resolver thresholds too.
+        pvpUseCollectorBoarding = travel.getBooleanField(
+            "useCollectorBoarding", pvpUseCollectorBoarding);
+        pvpAvoidHotArrival = travel.getBooleanField(
+            "avoidHotArrival", pvpAvoidHotArrival);
+        pvpBoardOnActualShuttle = travel.getBooleanField(
+            "boardOnActualShuttle", pvpBoardOnActualShuttle);
+
+        float previousScanRadius = pvpCollectorScanRadiusMeters;
+        float previousZSanity = pvpCollectorZSanityMeters;
+
+        float collectorScanRadius = travel.getFloatField(
+            "collectorScanRadiusMeters");
+        if (collectorScanRadius >= 32.f && collectorScanRadius <= 512.f)
+            pvpCollectorScanRadiusMeters = collectorScanRadius;
+
+        float collectorZSanity = travel.getFloatField(
+            "collectorZSanityMeters");
+        if (collectorZSanity >= 1.f && collectorZSanity <= 100.f)
+            pvpCollectorZSanityMeters = collectorZSanity;
+
+        // Resolver thresholds changed at runtime: drop the cached boarding
+        // points so the next departure re-scans with the new values (the
+        // cache would otherwise pin every port to the old thresholds).
+        if (previousScanRadius != pvpCollectorScanRadiusMeters ||
+                previousZSanity != pvpCollectorZSanityMeters) {
+            Locker squadLock(&pvpSquadMutex);
+            pvpBoardingPointCache.removeAll();
+        }
+
         LuaObject mains = travel.getObjectField("mainPlanets");
         if (mains.isValidTable() && mains.getTableSize() > 0) {
             pvpTravelMainPlanets.removeAll();
@@ -21465,6 +21551,149 @@ void SimPlayerManager::runPvpTravelDiagnosticsIfNeeded() {
     }
 
     runPvpTravelDiagnostics();
+}
+
+bool SimPlayerManager::resolvePvpBoardingPoint(
+		const ShuttleportLocation& location, PvpBoardingPoint& result) {
+	String cacheKey = location.starportPoint.isEmpty() ?
+		location.planet + ":" + location.name : location.starportPoint;
+
+	{
+		Locker squadLock(&pvpSquadMutex);
+		if (pvpBoardingPointCache.contains(cacheKey)) {
+			result = pvpBoardingPointCache.get(cacheKey);
+			return result.resolved;
+		}
+	}
+
+	PvpBoardingPoint resolved;
+	resolved.worldPos = location.spawn;
+	resolved.localPos = location.spawn;
+	resolved.fellBackToPad = true;
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	Zone* zone = zoneServer == nullptr ? nullptr :
+		zoneServer->getZone(location.planet);
+	PlanetManager* planetManager = zone == nullptr ? nullptr :
+		zone->getPlanetManager();
+
+	Vector3 padPosition = location.spawn;
+	Reference<PlanetTravelPoint*> travelPoint = planetManager == nullptr ?
+		nullptr : planetManager->getPlanetTravelPoint(location.starportPoint);
+
+	if (travelPoint != nullptr)
+		padPosition = travelPoint->getArrivalPosition();
+
+	resolved.worldPos = padPosition;
+	resolved.localPos = padPosition;
+
+	if (zone != nullptr && travelPoint != nullptr) {
+		SortedVector<TreeEntry*> closeObjects;
+		zone->getInRangeObjects(padPosition.getX(), 0, padPosition.getY(),
+			pvpCollectorScanRadiusMeters, &closeObjects, true, true);
+
+		SceneObject* collector = nullptr;
+		float bestDistance = 0.f;
+
+		for (int i = 0; i < closeObjects.size(); ++i) {
+			SceneObject* candidate =
+				static_cast<SceneObject*>(closeObjects.get(i));
+
+			if (candidate == nullptr)
+				continue;
+
+			if (candidate->getGameObjectType() ==
+					SceneObjectType::TICKETCOLLECTOR) {
+				float distance =
+					candidate->getWorldPosition().distanceTo(padPosition);
+
+				if (collector == nullptr || distance < bestDistance) {
+					collector = candidate;
+					bestDistance = distance;
+				}
+			} else if (candidate->isBuildingObject()) {
+				BuildingObject* building = cast<BuildingObject*>(candidate);
+
+				if (building == nullptr)
+					continue;
+
+				for (int cellNumber = 1;
+						cellNumber <= building->getTotalCellNumber(); ++cellNumber) {
+					CellObject* cell = building->getCell(cellNumber);
+
+					if (cell == nullptr)
+						continue;
+
+					for (int objectIndex = 0;
+							objectIndex < cell->getContainerObjectsSize();
+							++objectIndex) {
+						SceneObject* child =
+							cell->getContainerObject(objectIndex);
+
+						if (child == nullptr || child->getGameObjectType() !=
+								SceneObjectType::TICKETCOLLECTOR)
+							continue;
+
+						float distance =
+							child->getWorldPosition().distanceTo(padPosition);
+
+						if (collector == nullptr || distance < bestDistance) {
+							collector = child;
+							bestDistance = distance;
+						}
+					}
+				}
+			}
+		}
+
+		if (collector != nullptr) {
+			Vector3 collectorWorld = collector->getWorldPosition();
+			ManagedReference<SceneObject*> parent = collector->getParent().get();
+			CellObject* collectorCell = parent != nullptr && parent->isCellObject() ?
+				parent.castTo<CellObject*>() : nullptr;
+
+			bool zSane = true;
+			if (collectorCell == nullptr) {
+				float terrainHeight = zone->getHeight(
+					collectorWorld.getX(), collectorWorld.getY());
+				zSane = fabs(collectorWorld.getZ() - terrainHeight) <=
+					pvpCollectorZSanityMeters;
+			}
+
+			if (zSane) {
+				resolved.worldPos = collectorWorld;
+				resolved.localPos = collector->getPosition();
+				resolved.cellOid = collectorCell == nullptr ? 0 :
+					collectorCell->getObjectID();
+				resolved.resolved = true;
+				resolved.fellBackToPad = false;
+				resolved.collectorTemplate =
+					collector->getObjectTemplate() == nullptr ? String("") :
+					collector->getObjectTemplate()->getFullTemplateString();
+			}
+		}
+	}
+
+	{
+		Locker squadLock(&pvpSquadMutex);
+		// A concurrent diagnostic/route plan may have filled the cache while
+		// the world scan was running. Keep the first immutable snapshot.
+		if (pvpBoardingPointCache.contains(cacheKey)) {
+			result = pvpBoardingPointCache.get(cacheKey);
+			return result.resolved;
+		}
+
+		pvpBoardingPointCache.put(cacheKey, resolved);
+		if (resolved.fellBackToPad)
+			pvpCollectorFallbacksTotal++;
+	}
+
+	result = resolved;
+	info("SimPvpBoardingPoint point=\"" + cacheKey + "\" resolved=" +
+		String::valueOf(resolved.resolved) + " fallback=" +
+		String::valueOf(resolved.fellBackToPad) + " cell=" +
+		String::valueOf(resolved.cellOid), true);
+	return resolved.resolved;
 }
 
 void SimPlayerManager::runPvpTravelDiagnostics() {
@@ -21584,86 +21813,39 @@ void SimPlayerManager::runPvpTravelDiagnostics() {
             arrivalWorld.setY(arrivalY);
             arrivalWorld.setZ(zone->getHeight(arrivalX, arrivalY));
 
-            // Find the port's ticket collector. Collectors inside the
-            // building are cell children (not in the zone octree), so scan
-            // nearby buildings' cells as well as top-level objects. All of
-            // these are static world-snapshot objects - read-only scan.
-            SortedVector<TreeEntry*> closeObjects;
-            zone->getInRangeObjects(arrivalWorld.getX(), 0, arrivalWorld.getY(),
-                175.f, &closeObjects, true, true);
+            ShuttleportLocation location;
+            location.planet = testPoint.zoneName;
+            location.name = testPoint.pointName;
+            location.starportPoint = testPoint.pointName;
+            location.spawn = travelPoint->getArrivalPosition();
 
-            SceneObject* collector = nullptr;
-            float bestDistance = 0.f;
+            PvpBoardingPoint boardingPoint;
+            resolvePvpBoardingPoint(location, boardingPoint);
 
-            for (int k = 0; k < closeObjects.size(); ++k) {
-                SceneObject* candidate =
-                    static_cast<SceneObject*>(closeObjects.get(k));
+            result.collectorInCell = boardingPoint.cellOid != 0;
+            result.collectorTemplate = boardingPoint.collectorTemplate;
 
-                if (candidate == nullptr)
-                    continue;
-
-                if (candidate->getGameObjectType() ==
-                        SceneObjectType::TICKETCOLLECTOR) {
-                    float distance =
-                        candidate->getWorldPosition().distanceTo(arrivalWorld);
-
-                    if (collector == nullptr || distance < bestDistance) {
-                        collector = candidate;
-                        bestDistance = distance;
-                    }
-                } else if (candidate->isBuildingObject()) {
-                    BuildingObject* building =
-                        cast<BuildingObject*>(candidate);
-
-                    if (building == nullptr)
-                        continue;
-
-                    // Cells are keyed 1..totalCellNumber (0 is invalid).
-                    for (int c = 1; c <= building->getTotalCellNumber(); ++c) {
-                        CellObject* cell = building->getCell(c);
-
-                        if (cell == nullptr)
-                            continue;
-
-                        for (int o = 0; o < cell->getContainerObjectsSize(); ++o) {
-                            SceneObject* child = cell->getContainerObject(o);
-
-                            if (child == nullptr || child->getGameObjectType() !=
-                                    SceneObjectType::TICKETCOLLECTOR)
-                                continue;
-
-                            float distance =
-                                child->getWorldPosition().distanceTo(arrivalWorld);
-
-                            if (collector == nullptr || distance < bestDistance) {
-                                collector = child;
-                                bestDistance = distance;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (collector == nullptr) {
+            if (!boardingPoint.resolved) {
                 result.status = "noCollector";
             } else {
-                Vector3 collectorWorld = collector->getWorldPosition();
-                result.collectorX = collectorWorld.getX();
-                result.collectorY = collectorWorld.getY();
-                result.collectorZ = collectorWorld.getZ();
-                result.collectorTemplate = collector->getObjectTemplate() != nullptr ?
-                    collector->getObjectTemplate()->getFullTemplateString() : "";
+                result.collectorX = boardingPoint.worldPos.getX();
+                result.collectorY = boardingPoint.worldPos.getY();
+                result.collectorZ = boardingPoint.worldPos.getZ();
 
-                ManagedReference<SceneObject*> collectorParent =
-                    collector->getParent().get();
-                result.collectorInCell = collectorParent != nullptr &&
-                    collectorParent->isCellObject();
+                CellObject* collectorCell = nullptr;
+                if (boardingPoint.cellOid != 0) {
+                    ManagedReference<SceneObject*> cellObject =
+                        zoneServer->getObject(boardingPoint.cellOid);
+                    collectorCell = cellObject == nullptr ? nullptr :
+                        cellObject.castTo<CellObject*>();
+                }
 
                 Vector<WorldCoordinates>* path = nullptr;
 
                 try {
                     WorldCoordinates start(arrivalWorld, nullptr);
-                    WorldCoordinates target(collector);
+                    WorldCoordinates target(boardingPoint.localPos,
+                        collectorCell);
                     path = PathFinderManager::instance()->findPath(
                         start, target, zone);
                 } catch (...) {
@@ -21775,6 +21957,26 @@ int SimPlayerManager::findPvpSquadIndex(uint64 squadId) const {
     }
 
     return -1;
+}
+
+bool SimPlayerManager::isPvpCityHotLocked(const String& planet,
+		const String& city, bool imperial, uint64 squadId) const {
+	for (int i = 0; i < pvpSquads.size(); ++i) {
+		const SimPvpSquad& other = pvpSquads.get(i);
+
+		if (other.squadId != squadId && other.imperial != imperial &&
+				!other.reforming && !other.travelTaskActive &&
+				other.planet == planet && other.city == city)
+			return true;
+	}
+
+	const SimPvpFactionContact& contact = imperial ?
+		pvpImperialContact : pvpRebelContact;
+	uint64 nowMs = System::getMiliTime();
+
+	return contact.valid && contact.planet == planet &&
+		contact.city == city && contact.reportedAtMs <= nowMs &&
+		nowMs - contact.reportedAtMs <= (uint64)pvpContactTtlSeconds * 1000;
 }
 
 AiAgent* SimPlayerManager::spawnPvpBotAgent(Zone* zone, const Vector3& position,
@@ -22014,6 +22216,63 @@ void SimPlayerManager::spawnPvpSquad(bool imperial, bool scout) {
          " city=" + loc.planet + ":" + loc.name, true);
 }
 
+bool SimPlayerManager::onPvpSquadDepartureIntent(uint64 squadId,
+		PvpDepartureTarget& target) {
+	target = PvpDepartureTarget();
+
+	if (!enabled || !pvpEnabled)
+		return false;
+
+	SimPvpSquad snapshot;
+	{
+		Locker squadLock(&pvpSquadMutex);
+		int idx = findPvpSquadIndex(squadId);
+
+		if (idx < 0 || pvpSquads.get(idx).reforming)
+			return false;
+
+		snapshot = pvpSquads.get(idx);
+	}
+
+	// Plan before the controller enters TO_SHUTTLE. This is the first point
+	// where the route type can influence the movement target while the squad
+	// is still at its hangout.
+	if (pvpRoutedTravelEnabled && snapshot.pendingRoute.size() == 0) {
+		String routeSummary;
+		bool convergence = false;
+
+		if (planPvpRoute(squadId, snapshot, routeSummary, convergence))
+			announcePvpEvent(squadId, PVP_ANNOUNCE_MOVEOUT, routeSummary);
+	}
+
+	Locker squadLock(&pvpSquadMutex);
+	int idx = findPvpSquadIndex(squadId);
+
+	if (idx < 0)
+		return false;
+
+	const SimPvpSquad& squad = pvpSquads.get(idx);
+	// Default and gated-off behavior is the existing city shuttle pad.
+	target.worldPos = squad.shuttlePos;
+	target.localPos = squad.shuttlePos;
+
+	if (!pvpRoutedTravelEnabled || squad.pendingRoute.size() == 0)
+		return true;
+
+	const PvpTravelLeg& leg = squad.pendingRoute.get(0);
+	if (leg.interplanetary && pvpUseCollectorBoarding) {
+		// Collector when resolved, starport pad as the stored fallback -
+		// either way the squad departs from the actual port, never the city
+		// shuttle pad.
+		target.worldPos = leg.departurePos;
+		target.localPos = leg.departureLocalPos;
+		target.cellOid = leg.departureCellOid;
+		target.isCollector = leg.departureIsCollector;
+	}
+
+	return true;
+}
+
 void SimPlayerManager::onPvpSquadReadyToTravel(uint64 squadId) {
     if (!enabled || !pvpEnabled)
         return;
@@ -22036,14 +22295,9 @@ void SimPlayerManager::onPvpSquadReadyToTravel(uint64 squadId) {
         snapshot = squad;
     }
 
-    // P.6.5a fix (owner report: "chats not sending before traveling"): plan
-    // the route and speak the MOVEOUT callout NOW, while the squad stands at
-    // the pad waiting for its ship — announcing inside boardPvpSquad fired at
-    // the teleport instant, so the spatial line raced the switchZone despawn
-    // and nearby players never saw it. Here the callout lands seconds-to-
-    // minutes before departure (players can literally board with them).
-    // boardPvpSquad keeps its plan-if-empty fallback (board-anyway paths,
-    // convergence replans).
+    // P.6.5a/5b: departure intent normally planned the route and announced
+    // MOVEOUT before the squad began its run. Keep plan-if-empty here as the
+    // safety net for board-anyway paths and convergence replans.
     if (pvpRoutedTravelEnabled && snapshot.pendingRoute.size() == 0) {
         String routeSummary;
         bool convergence = false;
@@ -22101,7 +22355,11 @@ void SimPlayerManager::runPvpShuttleWaitTask(uint64 squadId, int attempts) {
 
     bool boardNow = false;
 
-    if (attempts >= pvpShuttleWaitMaxAttempts) {
+    if (!pvpBoardOnActualShuttle) {
+        // Owner escape hatch: preserve the dwell/task choreography but do not
+        // require a live shuttle object at the departure port.
+        boardNow = true;
+    } else if (attempts >= pvpShuttleWaitMaxAttempts) {
         // Same never-wedge-at-a-port contract as P.4.5b: board anyway.
         boardNow = true;
 
@@ -22185,6 +22443,20 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
 
         pads.add(pad);
         routable.add(ok);
+    }
+
+    // Resolve collectors outside pvpSquadMutex. The resolver caches immutable
+    // world/local coordinates, so subsequent route plans do no world scan.
+    if (pvpUseCollectorBoarding) {
+        for (int i = 0; i < cityCount; ++i) {
+            const ShuttleportLocation& loc = allShuttleports.get(i);
+
+            if (loc.starportPoint.isEmpty())
+                continue;
+
+            PvpBoardingPoint boardingPoint;
+            resolvePvpBoardingPoint(loc, boardingPoint);
+        }
     }
 
     // City-to-city adjacency: same planet = intra-planet ticket (always
@@ -22301,40 +22573,125 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
     if (destIdx < 0)
         return false;
 
-    // 3) BFS shortest-hop route over the adjacency (city counts are tiny).
-    Vector<int> previous;
-    Vector<bool> visited;
+    // Tactical arrival applies only to random destinations. Keep the picked
+    // city as the final destination; a tactical route inserts its alternate
+    // immediately before it in the backwards path below.
+    int finalDestIdx = destIdx;
+    bool tactical = false;
 
-    for (int i = 0; i < cityCount; ++i) {
-        previous.add(-1);
-        visited.add(false);
-    }
+    if (!convergenceOut && pvpAvoidHotArrival) {
+        const ShuttleportLocation& finalDestLoc =
+            allShuttleports.get(finalDestIdx);
 
-    Vector<int> frontier;
-    frontier.add(fromIdx);
-    visited.setElementAt(fromIdx, true);
+        if (isPvpCityHotLocked(finalDestLoc.planet, finalDestLoc.name,
+                    snapshot.imperial, squadId)) {
+            int bestAlternateIdx = -1;
+            int bestAlternateScore = -1;
 
-    for (int head = 0; head < frontier.size() && !visited.get(destIdx); ++head) {
-        int current = frontier.get(head);
+            for (int candidate = 0; candidate < cityCount; ++candidate) {
+                if (candidate == finalDestIdx || candidate == fromIdx ||
+                        !routable.get(candidate))
+                    continue;
 
-        for (int next = 0; next < cityCount; ++next) {
-            if (visited.get(next) || !adjacency.get(current).get(next))
-                continue;
+                const ShuttleportLocation& alternate =
+                    allShuttleports.get(candidate);
 
-            visited.setElementAt(next, true);
-            previous.setElementAt(next, current);
-            frontier.add(next);
+                if (alternate.planet != finalDestLoc.planet)
+                    continue;
+
+                bool sameFactionOccupied = false;
+                for (int i = 0; i < pvpSquads.size(); ++i) {
+                    const SimPvpSquad& other = pvpSquads.get(i);
+
+                    if (other.squadId != squadId &&
+                            other.imperial == snapshot.imperial &&
+                            !other.reforming && !other.travelTaskActive &&
+                            other.planet == alternate.planet &&
+                            other.city == alternate.name) {
+                        sameFactionOccupied = true;
+                        break;
+                    }
+                }
+
+                bool alternateHot = isPvpCityHotLocked(alternate.planet,
+                    alternate.name, snapshot.imperial, squadId);
+                int score = (alternateHot ? 0 : 2) +
+                    (sameFactionOccupied ? 0 : 1);
+
+                if (score > bestAlternateScore) {
+                    bestAlternateIdx = candidate;
+                    bestAlternateScore = score;
+                }
+            }
+
+            if (bestAlternateIdx >= 0) {
+                destIdx = bestAlternateIdx;
+                tactical = true;
+            }
         }
     }
 
-    if (!visited.get(destIdx))
+    // 3) BFS shortest-hop route over the adjacency (city counts are tiny).
+    auto buildPvpPath = [&](int target, Vector<int>& pathOut) {
+        Vector<int> previous;
+        Vector<bool> visited;
+
+        for (int i = 0; i < cityCount; ++i) {
+            previous.add(-1);
+            visited.add(false);
+        }
+
+        Vector<int> frontier;
+        frontier.add(fromIdx);
+        visited.setElementAt(fromIdx, true);
+
+        for (int head = 0; head < frontier.size() &&
+                !visited.get(target); ++head) {
+            int current = frontier.get(head);
+
+            for (int next = 0; next < cityCount; ++next) {
+                if (visited.get(next) || !adjacency.get(current).get(next))
+                    continue;
+
+                visited.setElementAt(next, true);
+                previous.setElementAt(next, current);
+                frontier.add(next);
+            }
+        }
+
+        if (!visited.get(target))
+            return false;
+
+        pathOut.removeAll();
+        for (int walk = target; walk != -1; walk = previous.get(walk))
+            pathOut.add(walk);
+
+        return true;
+    };
+
+    Vector<int> path;
+    bool pathFound = buildPvpPath(destIdx, path);
+
+    // Keep the direct route as a safe fallback if the alternate is
+    // disconnected or would exceed the configured maximum after the final
+    // shuttle leg is appended.
+    if (tactical && (!pathFound || path.size() <= 1 ||
+                path.size() > pvpTravelMaxLegsPerRoute)) {
+        tactical = false;
+        destIdx = finalDestIdx;
+        pathFound = buildPvpPath(destIdx, path);
+    }
+
+    if (!pathFound)
         return false;
 
-    Vector<int> path;   // destIdx back to fromIdx, then reversed
-    for (int walk = destIdx; walk != -1; walk = previous.get(walk))
-        path.add(walk);
+    Vector<int> routePath; // backwards: final destination through origin
+    if (tactical)
+        routePath.add(finalDestIdx);
+    for (int i = 0; i < path.size(); ++i)
+        routePath.add(path.get(i));
 
-    int legCount = path.size() - 1;
+    int legCount = routePath.size() - 1;
 
     if (legCount < 1 || legCount > pvpTravelMaxLegsPerRoute)
         return false;
@@ -22344,16 +22701,48 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
     String summary = legCount > 1 ? "Route: " : "Next stop: ";
 
     for (int legIndex = 0; legIndex < legCount; ++legIndex) {
-        int cityIdx = path.get(path.size() - 2 - legIndex);
-        int prevIdx = path.get(path.size() - 1 - legIndex);
+        int cityIdx = routePath.get(routePath.size() - 2 - legIndex);
+        int prevIdx = routePath.get(routePath.size() - 1 - legIndex);
         const ShuttleportLocation& loc = allShuttleports.get(cityIdx);
 
         PvpTravelLeg leg;
         leg.destPlanet = loc.planet;
         leg.destCity = loc.name;
-        leg.arrivalPos = pads.get(cityIdx);
         leg.interplanetary =
             allShuttleports.get(prevIdx).planet != loc.planet;
+        // Shuttles land at the destination city's shuttleport on same-planet
+        // legs. Cross-planet legs retain the starport arrival pad.
+        leg.arrivalPos = leg.interplanetary ? pads.get(cityIdx) : loc.spawn;
+
+        const ShuttleportLocation& departureLoc =
+            allShuttleports.get(prevIdx);
+        leg.departurePos = departureLoc.spawn;
+        leg.departureLocalPos = departureLoc.spawn;
+        if (prevIdx == fromIdx) {
+            leg.departurePos = snapshot.shuttlePos;
+            leg.departureLocalPos = snapshot.shuttlePos;
+        }
+
+        if (leg.interplanetary && pvpUseCollectorBoarding &&
+                !departureLoc.starportPoint.isEmpty()) {
+            String cacheKey = departureLoc.starportPoint;
+            if (pvpBoardingPointCache.contains(cacheKey)) {
+                const PvpBoardingPoint& boardingPoint =
+                    pvpBoardingPointCache.get(cacheKey);
+
+                // Always use the cached boarding point for a gated
+                // interplanetary departure - it holds the collector when one
+                // resolved and the STARPORT pad otherwise (the promised
+                // fallback; never the city shuttle pad). The collector flag
+                // only classifies the run for counters/labels.
+                leg.departurePos = boardingPoint.worldPos;
+                leg.departureLocalPos = boardingPoint.localPos;
+                leg.departureCellOid = boardingPoint.cellOid;
+                leg.departureIsCollector =
+                    boardingPoint.resolved && !boardingPoint.fellBackToPad;
+            }
+        }
+
         leg.finalLeg = legIndex == legCount - 1;
         squad.pendingRoute.add(leg);
 
@@ -22365,7 +22754,7 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
 
     summary = summary + ".";
 
-    const ShuttleportLocation& destLoc = allShuttleports.get(destIdx);
+    const ShuttleportLocation& destLoc = allShuttleports.get(finalDestIdx);
     squad.routeDestPlanet = destLoc.planet;
     squad.routeDestCity = destLoc.name;
     squad.routeLegsTotal = legCount;
@@ -22373,6 +22762,8 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
     pvpRoutesPlannedTotal++;
     if (legCount > 1)
         pvpRouteHopRoutesTotal++;
+    if (tactical)
+        pvpTacticalArrivalsTotal++;
 
     summaryOut = summary;
 
@@ -22380,7 +22771,8 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
          " from=" + snapshot.planet + ":" + snapshot.city +
          " dest=" + destLoc.planet + ":" + destLoc.name +
          " legs=" + String::valueOf(legCount) +
-         " convergence=" + String::valueOf(convergenceOut), true);
+         " convergence=" + String::valueOf(convergenceOut) +
+         " tactical=" + String::valueOf(tactical), true);
 
     return true;
 }
@@ -22561,6 +22953,11 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
         }
 
         if (haveLeg) {
+            if (leg.interplanetary && leg.departureIsCollector) {
+                Locker squadLock(&pvpSquadMutex);
+                pvpCollectorBoardingsTotal++;
+            }
+
             dest.planet = leg.destPlanet;
             dest.name = leg.destCity;
             dest.spawn = leg.arrivalPos;

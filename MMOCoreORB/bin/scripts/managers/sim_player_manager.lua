@@ -747,15 +747,12 @@ SimPlayerManagerConfig = {
             },
         },
         -- P.6.5 player-mimetic routed travel (design doc
-        -- ai-pvp-mimetic-travel-design.md). Only the P.6.5-0 diagnostics
-        -- spike is implemented so far: read-only, runs ONCE per boot on the
-        -- maintenance thread, moves no agents. It dumps the interplanetary
-        -- fare matrix (planet connectivity), resolves each configured city's
-        -- nearest starport, and computationally tests a street->ticket-
-        -- collector path into each starport below (world->cell pathfinding).
-        -- Results: dashboard pvpActivity.travelDiagnostics + SimPvpTravelSpike
-        -- log lines. The interior verdict decides P.6.5b boarding realism
-        -- (run to the collector inside vs an outdoor entrance point).
+        -- ai-pvp-mimetic-travel-design.md). Departures can run to the
+        -- configured starport's ticket collector, including Theed's
+        -- pathable in-cell collector. The resolver caches its world and
+        -- cell-local coordinates and falls back to the city pad when no
+        -- collector is usable. This remains simulation-only: no ticket,
+        -- credit, inventory, or player-state mutation occurs.
         travel = {
             -- P.6.5a routed travel (owner-approved): squads travel like
             -- players. Intra-planet legs are open; cross-planet legs need
@@ -771,6 +768,17 @@ SimPlayerManagerConfig = {
             maxLegsPerRoute = 3,
             transitDwellSecondsMin = 20,
             transitDwellSecondsMax = 45,
+            -- P.6.5b: interplanetary departures run to the actual ticket
+            -- collector. Set false to restore pad-only departures at runtime.
+            useCollectorBoarding = true,
+            -- Formalizes the existing real-ship wait. Set false as an escape
+            -- hatch to board on the first wait tick without a ship present.
+            boardOnActualShuttle = true,
+            -- Random patrols arrive one city out when the destination is hot;
+            -- convergence responses still take the direct route.
+            avoidHotArrival = true,
+            collectorScanRadiusMeters = 175,
+            collectorZSanityMeters = 10,
             -- Squads form up (spawn + full-wipe reform) at faction staging.
             staging = {
                 rebel = { planet = "naboo", city = "moenia" },

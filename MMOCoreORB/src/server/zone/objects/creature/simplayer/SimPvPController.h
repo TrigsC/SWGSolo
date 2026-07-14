@@ -117,6 +117,7 @@ public:
 	void startSimLoop() override;
 	void onArrived() override;
 	void onPathFailed() override;
+	void prepareForRelocation(const String& reason) override;
 	// P.6.1b: city legs must end at the requested target - rejects any stale
 	// path that slipped a work-loop generation race (observed live: a boarded
 	// leader accepted a pre-teleport path and sprinted toward the previous
@@ -132,6 +133,7 @@ public:
 	String getPvpPhaseName() const override;
 	int getPvpPhase() const { return phase; }
 	uint64 getPhaseSinceMs() const { return phaseSinceMs; }
+	bool isCurrentShuttleCollectorTarget() const { return shuttleTargetIsCollector; }
 
 	// Maintenance-task escalation: a phase that exceeded its TTL is forced
 	// forward (post up where we are / travel from where we are) so a squad can
@@ -150,6 +152,7 @@ private:
 	void setPhase(PvpPhase newPhase);
 	void startLoitering();
 	void finishLoitering();
+	void enterToShuttle(const String& reason);
 	void notifyReadyToTravel();
 	// P.6.1a: hard-stop the agent's engine-side movement (patrol queue, saved
 	// points, movement state). An interrupted leg (TTL force-advance, board)
@@ -165,6 +168,9 @@ private:
 	String planet;
 	String city;
 	Vector3 shuttleLocation;
+	Vector3 shuttleTargetLocalPosition;
+	uint64 shuttleTargetCellOid = 0;
+	bool shuttleTargetIsCollector = false;
 	Vector3 hangoutLocation;
 	// Consecutive path failures for the current movement phase; bounded, then
 	// the phase is forced forward instead of retrying forever.

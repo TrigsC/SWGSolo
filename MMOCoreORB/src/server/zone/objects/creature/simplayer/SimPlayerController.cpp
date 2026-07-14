@@ -146,6 +146,8 @@ SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     workLoopGeneration = 1;
     setLoggingName("SimPlayerController");
     destination = Vector3(0, 0, 0);
+    destinationLocal = Vector3(0, 0, 0);
+    destinationCell = nullptr;
 }
 
 SimPlayerController::~SimPlayerController() {
@@ -153,18 +155,26 @@ SimPlayerController::~SimPlayerController() {
 }
 
 void SimPlayerController::moveTo(Vector3 targetPos) {
+    moveTo(targetPos, targetPos, nullptr);
+}
+
+void SimPlayerController::moveTo(Vector3 worldPos, Vector3 localPos,
+        CellObject* targetCell) {
     if (agent == nullptr) return;
 
     Zone* zone = agent->getZone();
     if (zone == nullptr) return;
 
-    if (!zone->isWithinBoundaries(targetPos)) {
+    if (!zone->isWithinBoundaries(worldPos)) {
         onPathFailed();
         return;
     }
 
+    destination = worldPos;
+    destinationLocal = localPos;
+    destinationCell = targetCell;
+
     if (agent->isInCombat()) {
-        destination = targetPos;
         state = IDLE;
 #ifdef DEBUG_SIMPVP
     Logger::console.info("SimPlayer moveTo: isInCombat", true);
@@ -177,15 +187,13 @@ void SimPlayerController::moveTo(Vector3 targetPos) {
     state = CALCULATING_PATH; 
     uint64 movementGeneration = advanceWorkLoopGeneration("moveTo");
 
-    destination = targetPos;
-    
-    float dist = agent->getWorldPosition().distanceTo(targetPos);
+    float dist = agent->getWorldPosition().distanceTo(worldPos);
 #ifdef DEBUG_SIMPVP
-    Logger::console.info("SimPlayer moveTo: Requesting move to " + targetPos.toString() + " (Dist: " + String::valueOf(dist) + "m)", true);
+    Logger::console.info("SimPlayer moveTo: Requesting move to " + worldPos.toString() + " (Dist: " + String::valueOf(dist) + "m)", true);
 #endif
 
     WorldCoordinates startCoord(agent);
-    WorldCoordinates endCoord(targetPos, nullptr);
+    WorldCoordinates endCoord(localPos, targetCell);
 
     Reference<SimPathFindTask*> task =
         new SimPathFindTask(this, startCoord, endCoord, zone, movementGeneration);
@@ -217,7 +225,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     // P.6.1b: reject a path that does not end where the current destination
     // points (stale result that slipped a generation race). The retry path
     // recomputes against the correct target.
-    if (!acceptFoundPath(path->get(path->size() - 1).getPoint())) {
+    if (!acceptFoundPath(path->get(path->size() - 1).getWorldPosition())) {
         delete path;
         onPathFailed();
         return;
@@ -231,11 +239,15 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
         simPath.add(path->get(i));
     }
 
-    destination = simPath.get(simPath.size() - 1).getPoint();
+    WorldCoordinates finalPoint = simPath.get(simPath.size() - 1);
+    destination = finalPoint.getWorldPosition();
+    destinationLocal = finalPoint.getPoint();
+    destinationCell = finalPoint.getCell();
 #ifdef DEBUG_SIMPVP
     Logger::console.info("SimPlayer onPathFound: Path Found (" + String::valueOf(path->size()) + " nodes). Moving...", true);
 #endif
-    agent->setHomeLocation(destination.getX(), destination.getZ(), destination.getY(), nullptr);
+    agent->setHomeLocation(finalPoint.getX(), finalPoint.getZ(),
+        finalPoint.getY(), finalPoint.getCell());
 
     agent->setFollowObject(nullptr);
     agent->setWatchObject(nullptr);
@@ -327,7 +339,8 @@ void SimPlayerController::queueMorePathNodes() {
     int slots = 18 - currentQueued; 
 
     while (slots > 0 && simPathIndex < pathSize) {
-        Vector3 p = simPath.get(simPathIndex).getPoint();
+        WorldCoordinates node = simPath.get(simPathIndex);
+        Vector3 p = node.getWorldPosition();
 
         if (simPathIndex == 0) {
             Vector3 cur = agent->getWorldPosition();
@@ -339,7 +352,9 @@ void SimPlayerController::queueMorePathNodes() {
             }
         }
 
-        PatrolPoint pp(p.getX(), p.getZ(), p.getY(), nullptr); 
+        const Vector3& localPoint = node.getPoint();
+        PatrolPoint pp(localPoint.getX(), localPoint.getZ(),
+            localPoint.getY(), node.getCell());
         agent->addPatrolPoint(pp);
 
         simPathIndex++;
@@ -394,8 +409,10 @@ void SimPlayerController::checkArrival() {
         Logger::console.info("SimPlayer checkArrival: Resuming path to " + destination.toString(), true);
 #endif
         Vector3 resumeDestination = destination;
+        Vector3 resumeLocalDestination = destinationLocal;
+        ManagedReference<CellObject*> resumeCell = destinationCell;
         locker.release();
-        moveTo(resumeDestination);
+        moveTo(resumeDestination, resumeLocalDestination, resumeCell.get());
         Reference<ArrivalCheckTask*> task =
             new ArrivalCheckTask(this, getWorkLoopGeneration());
         task->schedule(1000);
@@ -469,6 +486,8 @@ void SimPlayerController::checkArrival() {
 
         if (stuckWatchdogCount >= kStuckRePathTicks) {
             Vector3 resumeDestination = destination;
+            Vector3 resumeLocalDestination = destinationLocal;
+            ManagedReference<CellObject*> resumeCell = destinationCell;
             locker.release();
 
             if (rePathAttempts < kMaxRePathAttempts && shouldRepathWhenStuck()) {
@@ -478,7 +497,8 @@ void SimPlayerController::checkArrival() {
 #endif
                 // moveTo() advances the work-loop generation and schedules a
                 // fresh path-find + arrival loop, so do not reschedule here.
-                moveTo(resumeDestination);
+                moveTo(resumeDestination, resumeLocalDestination,
+                    resumeCell.get());
             } else {
 #ifdef DEBUG_SIMPVP
                 Logger::console.info("SimPlayer checkArrival: stuck; re-path budget exhausted, failing path.", true);

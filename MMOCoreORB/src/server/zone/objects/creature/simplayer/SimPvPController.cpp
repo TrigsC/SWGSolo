@@ -7,6 +7,9 @@
 #include "SimPlayerManager.h"
 
 #include "engine/core/Core.h"
+#include "server/ServerCore.h"
+#include "server/zone/ZoneServer.h"
+#include "server/zone/objects/cell/CellObject.h"
 #include "server/zone/objects/creature/CreatureObject.h"
 #include "server/zone/CloseObjectsVector.h"
 #include "server/zone/TreeEntry.h"
@@ -238,6 +241,9 @@ SimPvPController::SimPvPController(AiAgent* aiAgent, uint64 squad, bool isImperi
 	phase = PVP_FORMING;
 	phaseSinceMs = System::getMiliTime();
 	pathFailStreak = 0;
+	shuttleTargetLocalPosition = Vector3(0, 0, 0);
+	shuttleTargetCellOid = 0;
+	shuttleTargetIsCollector = false;
 	setLoggingName("SimPvPController");
 }
 
@@ -249,6 +255,9 @@ void SimPvPController::beginCityLoop(const String& planetName, const String& cit
 	planet = planetName;
 	city = cityName;
 	shuttleLocation = shuttlePos;
+	shuttleTargetLocalPosition = shuttlePos;
+	shuttleTargetCellOid = 0;
+	shuttleTargetIsCollector = false;
 	hangoutLocation = hangoutPos;
 	transitLoiterSeconds = 0;
 	pathFailStreak = 0;
@@ -264,6 +273,9 @@ void SimPvPController::beginTransitStop(const String& planetName, const String& 
 	// short transit loiter stands in for waiting on the connecting ship, then
 	// TO_SHUTTLE/AWAITING re-enter the normal boarding path for the next leg.
 	shuttleLocation = padPos;
+	shuttleTargetLocalPosition = padPos;
+	shuttleTargetCellOid = 0;
+	shuttleTargetIsCollector = false;
 	hangoutLocation = padPos;
 	transitLoiterSeconds = dwellSeconds < 1 ? 1 : dwellSeconds;
 	pathFailStreak = 0;
@@ -300,7 +312,23 @@ void SimPvPController::drivePhase(const String& reason) {
 		break;
 	case PVP_TO_SHUTTLE:
 		logMoveTarget("shuttle", shuttleLocation);
-		moveTo(shuttleLocation);
+		{
+			CellObject* targetCell = nullptr;
+			if (shuttleTargetCellOid != 0) {
+				ZoneServer* zoneServer = ServerCore::getZoneServer();
+				if (zoneServer != nullptr) {
+					ManagedReference<SceneObject*> object =
+						zoneServer->getObject(shuttleTargetCellOid);
+					targetCell = object == nullptr ? nullptr :
+						object.castTo<CellObject*>();
+				}
+			}
+
+			if (targetCell == nullptr)
+				moveTo(shuttleLocation);
+			else
+				moveTo(shuttleLocation, shuttleTargetLocalPosition, targetCell);
+		}
 		break;
 	case PVP_AWAITING_SHUTTLE: {
 		// Kill any stale work-loop chain, then keep exactly one 1s tick chain
@@ -348,6 +376,13 @@ void SimPvPController::onPathFailed() {
 	// Base behavior: retry startSimLoop() in 5s, which re-drives the current
 	// phase (bounded by the streak counter above).
 	SimPlayerController::onPathFailed();
+}
+
+void SimPvPController::prepareForRelocation(const String& reason) {
+	SimPlayerController::prepareForRelocation(reason);
+	shuttleTargetLocalPosition = Vector3(0, 0, 0);
+	shuttleTargetCellOid = 0;
+	shuttleTargetIsCollector = false;
 }
 
 bool SimPvPController::acceptFoundPath(const Vector3& pathEnd) {
@@ -478,8 +513,7 @@ void SimPvPController::forceAdvancePhase(const String& reason) {
 		break;
 	}
 	case PVP_LOITERING:
-		setPhase(PVP_TO_SHUTTLE);
-		drivePhase("forceAdvance");
+		enterToShuttle("forceAdvance");
 		break;
 	case PVP_TO_SHUTTLE:
 	case PVP_AWAITING_SHUTTLE:
@@ -555,8 +589,29 @@ void SimPvPController::finishLoitering() {
 		SimPlayerManager::instance()->announcePvpEvent(squadId,
 			SimPlayerManager::PVP_ANNOUNCE_DEPARTURE);
 
+	enterToShuttle("loiterComplete");
+}
+
+void SimPvPController::enterToShuttle(const String& reason) {
+	SimPlayerManager::PvpDepartureTarget target;
+	SimPlayerManager* manager = SimPlayerManager::instance();
+
+	if (manager != nullptr && manager->onPvpSquadDepartureIntent(squadId,
+			target)) {
+		shuttleLocation = target.worldPos;
+		shuttleTargetLocalPosition = target.localPos;
+		shuttleTargetCellOid = target.cellOid;
+		shuttleTargetIsCollector = target.isCollector;
+	} else {
+		// Keep the current city pad as the safe fallback if the squad row has
+		// disappeared during a maintenance/reform race.
+		shuttleTargetLocalPosition = shuttleLocation;
+		shuttleTargetCellOid = 0;
+		shuttleTargetIsCollector = false;
+	}
+
 	setPhase(PVP_TO_SHUTTLE);
-	drivePhase("loiterComplete");
+	drivePhase(reason);
 }
 
 void SimPvPController::notifyReadyToTravel() {
@@ -580,8 +635,7 @@ void SimPvPController::interruptForConvergence() {
 
 	haltAgentMovement("convergence");
 	prepareForRelocation("convergence");
-	setPhase(PVP_TO_SHUTTLE);
-	drivePhase("convergence");
+	enterToShuttle("convergence");
 
 	// prepareForRelocation() killed the old tick chain. drivePhase's moveTo
 	// normally restarts one via onPathFound, but a combat-deferred moveTo

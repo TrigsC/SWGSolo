@@ -104,6 +104,8 @@ protected:
     int stuckWatchdogCount;
     int rePathAttempts;
     Vector3 destination;
+    Vector3 destinationLocal;
+    ManagedReference<CellObject*> destinationCell;
     uint64 workLoopGeneration;
     
     // Configurable speed/movement settings
@@ -137,7 +139,11 @@ public:
     virtual void onStaleWorkLoopTaskIgnored(const String& taskType, uint64 capturedGeneration, uint64 currentGeneration);
 
     // --- Common Movement Logic ---
+    // World-space target used by the existing callers.
     void moveTo(Vector3 targetPos);
+    // P.6.5b: worldPos remains the distance/arrival target while localPos is
+    // the path request coordinate when targetCell is an interior cell.
+    void moveTo(Vector3 worldPos, Vector3 localPos, CellObject* targetCell);
     void checkArrival();
     ManagedReference<AiAgent*> getAgent() const { return agent; }
     // P.6.1a: lets the manager detect a silently-lost path request (moveTo
@@ -149,10 +155,12 @@ public:
     // checkArrival IDLE-resume (which would otherwise re-issue moveTo() to a
     // pre-teleport target from the chain thread and race the fresh moveTo()'s
     // generation). Call before switchZone repositions.
-    void prepareForRelocation(const String& reason) {
+    virtual void prepareForRelocation(const String& reason) {
         advanceWorkLoopGeneration(reason);
         state = WAITING;
         destination = Vector3(0, 0, 0);
+        destinationLocal = Vector3(0, 0, 0);
+        destinationCell = nullptr;
         simPath.removeAll();
         simPathIndex = 0;
     }

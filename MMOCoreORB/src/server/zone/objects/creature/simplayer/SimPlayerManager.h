@@ -500,17 +500,50 @@ public:
 		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 	};
 
-	// P.6.5a routed travel: one leg of a planned multi-leg journey. Only the
-	// arrival side is stored - the departure is wherever the squad currently
-	// stands (it runs back to its pad, then "buys the ticket").
+	// P.6.5a/P.6.5b routed travel: one leg of a planned multi-leg journey.
+	// Departure coordinates are stored separately from arrival coordinates so
+	// P.6.5b can run a squad to the actual ticket collector without mixing the
+	// collector's world and cell-local coordinate forms.
 	struct PvpTravelLeg {
 		String destPlanet;
 		String destCity;
-		Vector3 arrivalPos;        // starport pad (z re-derived at teleport)
+		Vector3 arrivalPos;        // arrival pad (z re-derived at teleport)
+		Vector3 departurePos;      // world-space run target / distance math
+		Vector3 departureLocalPos; // cell-local path target; equals worldPos outdoors
+		uint64 departureCellOid = 0; // 0 = outdoor
+		bool departureIsCollector = false;
 		bool interplanetary = false;
 		bool finalLeg = false;
 
 		// Satisfy Vector/TypeInfo template instantiation
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+
+	// P.6.5b: cached ticket-collector coordinates for a configured starport.
+	// worldPos is used for all distance/arrival checks; localPos is passed to
+	// PathFinderManager when cellOid is non-zero.
+	struct PvpBoardingPoint {
+		Vector3 worldPos;
+		Vector3 localPos;
+		uint64 cellOid = 0;
+		bool resolved = false;
+		bool fellBackToPad = false;
+		String collectorTemplate;
+
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+
+	// P.6.5b: full departure target returned to SimPvPController. Both
+	// coordinate forms are intentional; a cell-aware path request cannot use
+	// the world-space position as its local destination.
+	struct PvpDepartureTarget {
+		Vector3 worldPos;
+		Vector3 localPos;
+		uint64 cellOid = 0;
+		bool isCollector = false;
+
 		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 	};
@@ -1321,6 +1354,8 @@ private:
 	Vector<PvpTravelSpikeInteriorResult> pvpTravelSpikeInteriorResults; // guarded by pvpSquadMutex
 	void runPvpTravelDiagnosticsIfNeeded();
 	void runPvpTravelDiagnostics();
+	bool resolvePvpBoardingPoint(const ShuttleportLocation& location,
+		PvpBoardingPoint& result);
 
 	// --- P.6.5a routed travel (owner-approved; ai-pvp-mimetic-travel-design.md)
 	// Squads travel like players: intra-planet hops are free-form, cross-planet
@@ -1343,6 +1378,17 @@ private:
 	int pvpRouteHopRoutesTotal = 0;       // routes with >1 leg
 	int pvpTransitStopsTotal = 0;         // non-final legs boarded
 	int pvpRouteFallbacksTotal = 0;       // routed on, plan failed → legacy pick
+	// P.6.5b departure-port realism. Collector boarding and hot-arrival are
+	// independently gated; the latter is populated by Phase 2.
+	bool pvpUseCollectorBoarding = false;
+	bool pvpAvoidHotArrival = false;
+	bool pvpBoardOnActualShuttle = true;
+	float pvpCollectorScanRadiusMeters = 175.f;
+	float pvpCollectorZSanityMeters = 10.f;
+	VectorMap<String, PvpBoardingPoint> pvpBoardingPointCache; // pvpSquadMutex
+	int pvpCollectorBoardingsTotal = 0; // guarded by pvpSquadMutex
+	int pvpCollectorFallbacksTotal = 0; // guarded by pvpSquadMutex
+	int pvpTacticalArrivalsTotal = 0; // Phase 2; guarded by pvpSquadMutex
 	// Orphan-bot sweep (log-only diagnostics for the owner's "unlinked bots
 	// standing at a starport" report): live sim PvP bots that no squad roster
 	// claims. Runs each maintenance tick; SimPvpOrphanBot log lines.
@@ -1384,6 +1430,10 @@ private:
 		Vector<PvpTemplateChoice>& choices);
 	// Caller must hold pvpSquadMutex. Returns -1 when the squad is gone.
 	int findPvpSquadIndex(uint64 squadId) const;
+	// Caller must hold pvpSquadMutex. A city is hot when an opposing squad is
+	// stationed there or this faction has an unexpired enemy contact there.
+	bool isPvpCityHotLocked(const String& planet, const String& city,
+		bool imperial, uint64 squadId) const;
 
 public:
 	SimPlayerManager();
@@ -1468,6 +1518,11 @@ public:
 	void runPvpBotCleanupTask(uint64 oid);
 	// Called by SimPvPController when the leader is posted at the shuttleport.
 	void onPvpSquadReadyToTravel(uint64 squadId);
+	// Called by SimPvPController before entering PVP_TO_SHUTTLE. Plans the
+	// route early enough for the controller to run to the correct departure
+	// point, and returns both coordinate forms for that run.
+	bool onPvpSquadDepartureIntent(uint64 squadId,
+		PvpDepartureTarget& target);
 	// Called (once per life) by SimPvpBotController when a bot dies.
 	void onPvpBotDied(uint64 squadId, uint64 oid);
 	void recordPvpEngagement(uint64 squadId, bool targetWasPlayer);

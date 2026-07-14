@@ -4767,13 +4767,29 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         CellObject* nextMovementCell = nextMovementPosition.getCell();
         uint64 nextParentID = nextMovementCell != nullptr ? nextMovementCell->getObjectID() : 0;
         uint64 currentParentID = currentParent != nullptr ? currentParent->getObjectID() : 0;
-        
+
+        // P.6.5b: express the current position in the NEXT NODE's coordinate
+        // space (cell-local when the node sits in a cell, world otherwise) so
+        // the distance/interpolation math never mixes spaces. currentPosition
+        // is always in currentParent's space, so same-parent nodes need no
+        // transform; every other combination routes through world space.
         Vector3 checkPos = currentPosition;
-        if (currentParentID != nextParentID && nextParentID > 0) {
-            checkPos = PathFinderManager::transformToModelSpace(currentPosition, nextMovementCell->getParent().get());
+        if (currentParentID != nextParentID) {
+            CellObject* currentMovementCell =
+                currentParent != nullptr && currentParent->isCellObject() ?
+                currentParent.castTo<CellObject*>() : nullptr;
+            WorldCoordinates currentCoords(currentPosition, currentMovementCell);
+
+            if (nextParentID > 0) {
+                checkPos = PathFinderManager::transformToModelSpace(
+                    currentCoords.getWorldPosition(),
+                    nextMovementCell->getParent().get());
+            } else {
+                checkPos = currentCoords.getWorldPosition();
+            }
         }
 
-        Vector3 movementDiff(checkPos - nextMovementPosition.getWorldPosition());
+        Vector3 movementDiff(checkPos - nextMovementPosition.getPoint());
         
         // 2D Distance using X and Y (Map Plane)
         float distToNode = Math::sqrt(movementDiff.getX() * movementDiff.getX() + movementDiff.getY() * movementDiff.getY());
@@ -4807,9 +4823,10 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
             interpPos.setY(checkPos.getY() + (dy * ratio)); // Y = North
             interpPos.setZ(checkPos.getZ() + (dz * ratio)); // Z = Height (Linear Interp)
             
-            if (!isInNavMesh() && currentParent == nullptr) {
-                // If snapping to floor, update Z (Height)
-                interpPos.setZ(getWorldZ(interpPos)); 
+            if (!isInNavMesh() && currentParent == nullptr && nextMovementCell == nullptr) {
+                // If snapping to floor, update Z (Height). World space only -
+                // a cell-local interpPos keeps its floor-mesh Z.
+                interpPos.setZ(getWorldZ(interpPos));
             }
 
             nextMovementPosition.setX(interpPos.getX());

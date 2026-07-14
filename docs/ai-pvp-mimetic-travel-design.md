@@ -1,10 +1,10 @@
 # P.6.5 — Player-Mimetic Routed Travel for PvP Squads
 
-Status: **P.6.5a VERIFIED LIVE 2026-07-09** (302 routes / 316 legs / 17 hops /
+Status: **P.6.5b BUILT 2026-07-14 (§13, PENDING BUILD GATE+RESTART)**. P.6.5a VERIFIED LIVE 2026-07-09 (302 routes / 316 legs / 17 hops /
 0 fallbacks in one session — §11) **+ owner-report fixes SHIPPED** (MOVEOUT
 announce moved to the shuttle wait; log-only orphan-bot sweep; compiled clean,
-PENDING RESTART — verify per §11). Next: P.6.5b boarding realism, P.6.5c group
-pacing.
+PENDING RESTART — verify per §11 BEFORE the P.6.5b restart). Next: P.6.5c
+group pacing.
 Owner decisions recorded in §8: P.6.5 runs AHEAD of P.6.4 GCW presence; staging
 = rebels Moenia / imperials Bestine; **NO waypoints written to players** (the
 groupWaypoints idea is DROPPED — squads communicate by chat only); pacing =
@@ -506,3 +506,113 @@ Owner reports investigated → three changes shipped 2026-07-09:
    routed too.
 7. Miners: confirm the new cities didn't break miner spawn placement (they now
    spread across 10 cities incl. restuss).
+
+## 13. P.6.5b Starport Boarding Realism — AS BUILT (2026-07-14, PENDING BUILD+RESTART)
+
+Plan: `docs/1-plans/F_0.2.0_p65b-boarding-realism.plan.md` (TRIP, Codex plan
+review APPROVED after 3 rounds). Owner decisions at discovery: full scope in
+one release; interior collector runs where pathable (Theed); **convergence
+goes DIRECT** — tactical arrival applies only to random patrol destinations.
+
+### 13.1 What shipped
+
+1. **Plan-at-departure-intent.** Route planning + the MOVEOUT announce moved
+   from `onPvpSquadReadyToTravel` (AWAITING_SHUTTLE entry) to a new
+   `SimPlayerManager::onPvpSquadDepartureIntent(squadId, PvpDepartureTarget&)`
+   called by `SimPvPController::enterToShuttle()` — a single centralized
+   entry into PVP_TO_SHUTTLE used by ALL THREE transitions (`finishLoitering`,
+   `interruptForConvergence`, `forceAdvancePhase`). The controller therefore
+   knows the first leg's type BEFORE the run and targets the correct
+   departure point: starport ticket collector for interplanetary legs, city
+   shuttle pad otherwise. `onPvpSquadReadyToTravel` keeps plan-if-empty as
+   the safety net. Accepted edge (documented): a fresh convergence stamp
+   arriving while already TO_SHUTTLE/AWAITING keeps today's behavior (replan
+   consumed at boarding; that one leg departs without collector realism).
+2. **Boarding-point cache.** `resolvePvpBoardingPoint()` extracts the P.6.5-0
+   spike's collector scan (octree + building-cell walk for TICKETCOLLECTOR)
+   into a cached resolver; the diagnostics task now calls it too. Cache holds
+   BOTH coordinate forms per starport: `worldPos` (all distance/arrival
+   math) and `localPos`+`cellOid` (cell-local path request; equals worldPos
+   outdoors). Outdoor collectors get the Kaadara z-sanity check
+   (|z − terrain| > collectorZSanityMeters → pad fallback,
+   `pvpCollectorFallbacksTotal++`). Scan runs OUTSIDE `pvpSquadMutex`,
+   store/double-check under it.
+2b. **Engine fix found by code review** (`AiAgentImplementation::
+   findNextPosition`, the fork's multi-node consumption loop): the
+   distance/interpolation math MIXED cell-local and world coordinates —
+   `transformToModelSpace` output (or a cell-local current position) was
+   subtracted from `getWorldPosition()`, and the terrain Z-snap could clobber
+   a cell-local interpolation. Harmless while every patrol point was outdoor
+   (pre-P.6.5b state, so miners/stock NPCs never hit it) but it would have
+   stalled every Theed interior run to the watchdog. Fixed: the current
+   position is expressed in the NEXT node's coordinate space for all math
+   (same-parent = no transform; cross-parent routes through world space);
+   Z-snap requires the node to be outdoor. Outdoor-only paths byte-identical.
+   KEY LESSON (with P.6.1d): the engine's own movement loop assumes one
+   coordinate space per comparison — any feature that first introduces
+   in-cell patrol points must audit every distance computed from them.
+3. **Cell-aware path support in the shared base** (`SimPlayerController`):
+   `moveTo(worldPos, localPos, targetCell)` overload; `simPath` nodes retain
+   their `WorldCoordinates` cell; `queuePatrolPointsFromSimPath` passes each
+   node's own cell into `PatrolPoint` (previously HARD-CODED nullptr — the
+   engine discarded every path node's cell); first-node skip / arrival /
+   stale-path (`acceptFoundPath`) comparisons all use `getWorldPosition()`.
+   Outdoor paths (all miners, 10/11 PvP ports) are exact no-ops.
+   `prepareForRelocation` (now virtual) clears destinationLocal/Cell; the
+   PvP override also clears the shuttle-target fields.
+4. **Leg departure fields.** `PvpTravelLeg` += `departurePos`,
+   `departureLocalPos`, `departureCellOid`, `departureIsCollector`,
+   populated at plan time (first leg departs from the squad's current city;
+   later legs from the previous leg's port). Intra-planet legs now arrive at
+   the destination's SHUTTLE pad (`loc.spawn`) instead of its starport pad —
+   deliberate unconditional correctness fix.
+5. **Tactical arrival (Phase 2).** In `planPvpRoute`, non-convergence picks
+   only: `isPvpCityHotLocked(planet, city, faction, selfSquadId)` = an
+   enemy-faction squad stationed there (not reforming/travelling) OR the
+   faction's own unexpired `SimPvpFactionContact` pointing at it (TTL
+   `pvpContactTtlSeconds` 300s). Hot destination → best same-planet
+   alternate (score: not-hot 2pts + not-same-faction-occupied 1pt), BFS to
+   the alternate, final intra-planet shuttle leg appended. Falls back to the
+   direct route when no alternate exists (single-city planets e.g. restuss)
+   or the tactical route exceeds `maxLegsPerRoute`. `routeDest` stays the
+   REAL destination; `SimPvpRoutePlanned ... tactical=true`;
+   `pvpTacticalArrivalsTotal++`.
+6. **boardOnActualShuttle knob.** `runPvpShuttleWaitTask` boards on the first
+   wait tick when false; true (default) = existing real-ship wait unchanged.
+7. **Counters/dashboard.** `routedTravel` += collectorBoardingsTotal
+   (incremented ONLY at the leg pop site in `boardPvpSquad`, once per
+   consumed interplanetary collector leg), collectorFallbacksTotal,
+   tacticalArrivalsTotal, config echo (useCollectorBoarding,
+   boardOnActualShuttle, avoidHotArrival, scan radius, z-sanity), collector
+   cache rows, per-squad `departureTargetKind` (pad|collector; live
+   controller state wins over the pending-leg guess). Dashboard SPA
+   `pageWarfront` gained a ROUTED TRAVEL panel (metrics + cache/staging/
+   orphan/en-route rows) — file-copy deploy.
+
+### 13.2 Config (lua `pvpConfig.travel`, C++ defaults conservative)
+
+`useCollectorBoarding=true` (C++ default false), `avoidHotArrival=true`
+(C++ default false), `boardOnActualShuttle=true` (C++ default true),
+`collectorScanRadiusMeters=175`, `collectorZSanityMeters=10`. All runtime-
+flippable via the 30s config refresh. Knobs-off restores P.6.5a behavior
+EXCEPT two unconditional correctness changes: (a) planning/MOVEOUT timing
+moved to loiter end (same non-race property, fires even earlier); (b) intra-
+planet legs arrive at shuttle pads.
+
+### 13.3 Verify after restart (owner's call)
+
+1. `routedTravel` echoes the new config; `collectorBoardingsTotal` climbs
+   with travels; `collectorFallbacksTotal` ≈ 0 (only z-quirk ports).
+2. Visual: a Theed-departing squad runs INTO Theed Spaceport to the
+   collector before vanishing; other ports gather at outdoor collectors.
+3. `SimPvpRoutePlanned ... tactical=true` over a session;
+   `tacticalArrivalsTotal` > 0; squad lands one city out and shuttles in.
+4. Convergence responses stay direct (`convergence=true` rows never gain an
+   appended leg).
+5. Intra-planet legs arrive at shuttle pads (spot-check a moenia→theed
+   arrival).
+6. No regression: `fallbacksTotal` ≈ 0, stuck/hardStuck at P.6.5a baseline,
+   orphan sweep still ~0 (verify §12 fixes FIRST, before this restart, so
+   regressions stay attributable).
+7. Miners unaffected: minerActivity/pathValidationDiagnostics at baseline
+   (the SimPlayerController changes are outdoor no-ops).
