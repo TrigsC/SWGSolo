@@ -20,6 +20,7 @@
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h"
 #include "server/zone/objects/creature/VehicleObject.h"
+#include "server/zone/objects/tangible/weapon/WeaponObject.h"
 #include "server/zone/objects/intangible/VehicleControlDevice.h"
 #include "templates/params/creature/PlayerArrangement.h"
 #include "templates/params/creature/ObjectFlag.h"
@@ -9311,10 +9312,33 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
             row["rank"] = rank;
             row["forceControl"] = side.isEmpty() ? 0 :
                 agent->getSkillMod("force_control_" + side);
+            row["forcePower"] = side.isEmpty() ? 0 :
+                agent->getSkillMod("force_power_" + side);
             row["forceManipulation"] = side.isEmpty() ? 0 :
                 agent->getSkillMod("force_manipulation_" + side);
+            row["forcePowerMaxBonus"] = agent->getSkillMod("jedi_force_power_max");
+            row["forcePowerRegenBonus"] = agent->getSkillMod("jedi_force_power_regen");
+            // Backward-compatible aliases retained for existing dashboard
+            // consumers; the Bonus names clarify what the values represent.
             row["forcePowerMax"] = agent->getSkillMod("jedi_force_power_max");
             row["forcePowerRegen"] = agent->getSkillMod("jedi_force_power_regen");
+            row["forceRegenPerTick"] = 10 + agent->getSkillMod("jedi_force_power_regen");
+            row["forcePoolCurrent"] = agent->getCurrentForce();
+            row["forcePoolMax"] = agent->getMaxForce();
+            ManagedReference<WeaponObject*> weapon = agent->getWeapon();
+            row["saberForceCost"] = weapon == nullptr ? 0.f : weapon->getForceCost();
+            // Retained for dashboard compatibility. P.7.10 removed the fixed
+            // reserve; attack selection now checks each command's exact cost.
+            row["conservingForce"] = false;
+            row["usesExactForceAffordability"] = true;
+            auto forceCooldowns = agent->getCooldownTimerMap();
+            row["recentForceThreat"] = forceCooldowns != nullptr &&
+                !forceCooldowns->isPast("jedi_force_threat");
+            row["forceArmor"] = agent->getSkillMod("force_armor");
+            row["forceShield"] = agent->getSkillMod("force_shield");
+            row["forceFeedback"] = agent->getSkillMod("force_feedback");
+            row["forceAbsorb"] = agent->getSkillMod("force_absorb");
+            row["resistanceStates"] = agent->getSkillMod("resistance_states");
             rankedRows.push_back(row);
         };
 

@@ -634,12 +634,16 @@ template<> bool CheckJediForceChance::check(AiAgent* agent) const {
 	if (agent->getJediArchetype() == AiAgent::JEDI_ARCHETYPE_NONE)
 		return false;
 
-	// Below this there is nothing in the ladder worth casting; save the tick.
-	if (agent->getCurrentForce() < 250)
-		return false;
+	// Knockdown recovery is an emergency reflex outside the normal 6-10 second
+	// buff window. Its own jedi_state_recovery cooldown provides pacing.
+	if (agent->getPosture() == CreaturePosture::KNOCKEDDOWN)
+		return true;
 
 	auto cooldownTimerMap = agent->getCooldownTimerMap();
 
+	// Do not gate on current Force here. Channel Force is specifically a
+	// low-pool recovery, and a knocked-down Jedi may need only 25 Force to clear
+	// dizzy before standing. runJediForceManagement owns the exact requirements.
 	return cooldownTimerMap != nullptr && cooldownTimerMap->isPast("jedi_force_window");
 }
 

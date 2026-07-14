@@ -28,16 +28,27 @@ public:
 			return;
 		}
 
-		ManagedReference<PlayerObject*> ghost = player->getPlayerObject();
-
-		if (ghost == nullptr) {
-			return;
-		}
-
 		// Client Effect upon hit (needed)
 		player->playEffect("clienteffect/pl_force_absorb_hit.cef", "");
 
-		ghost->setForcePower(ghost->getForcePower() + param);
+		ManagedReference<PlayerObject*> ghost = player->getPlayerObject();
+
+		if (ghost != nullptr) {
+			ghost->setForcePower(ghost->getForcePower() + param);
+		} else if (player->isAiAgent()) {
+			AiAgent* agent = player->asAiAgent();
+
+			if (agent != nullptr) {
+				int currentForce = agent->getCurrentForce();
+				int newForce = currentForce + (int)param;
+
+				if (newForce > agent->getMaxForce())
+					newForce = agent->getMaxForce();
+
+				JediNpcForceAccounting::apply(agent, "gain", name + "_credit",
+					(int)param, newForce);
+			}
+		}
 	}
 };
 

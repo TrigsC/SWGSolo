@@ -27,6 +27,9 @@
 #include "server/zone/objects/installation/components/TurretDataComponent.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/creature/ai/CreatureTemplate.h"
+#include "server/zone/objects/creature/ai/JediFrsNpcData.h"
+#include "server/zone/objects/creature/ai/JediNpcForceAccounting.h"
+#include "server/zone/objects/creature/variables/CooldownTimerMap.h"
 #include "server/zone/objects/installation/InstallationObject.h"
 #include "server/zone/packets/object/ShowFlyText.h"
 #include "server/zone/managers/frs/FrsManager.h"
@@ -1140,7 +1143,7 @@ float CombatManager::calculateDamage(CreatureObject* attacker, WeaponObject* wea
 		float minDmg = data.getMinDamage();
 		float maxDmg = data.getMaxDamage();
 
-		if (data.isForceAttack() && attacker->isPlayerCreature())
+		if (data.isForceAttack() && (attacker->isPlayerCreature() || attacker->isAiAgent()))
 			getFrsModifiedForceAttackDamage(attacker, minDmg, maxDmg, data);
 
 		float mod = attacker->isAiAgent() ? cast<AiAgent*>(attacker)->getSpecialDamageMult() : 1.f;
@@ -1218,7 +1221,7 @@ float CombatManager::calculateDamage(CreatureObject* attacker, WeaponObject* wea
 		float minDmg = data.getMinDamage();
 		float maxDmg = data.getMaxDamage();
 
-		if (data.isForceAttack() && attacker->isPlayerCreature())
+		if (data.isForceAttack() && (attacker->isPlayerCreature() || attacker->isAiAgent()))
 			getFrsModifiedForceAttackDamage(attacker, minDmg, maxDmg, data);
 
 		float mod = attacker->isAiAgent() ? cast<AiAgent*>(attacker)->getSpecialDamageMult() : 1.f;
@@ -1395,13 +1398,24 @@ float CombatManager::applyDamageModifiers(CreatureObject* attacker, WeaponObject
 }
 
 void CombatManager::getFrsModifiedForceAttackDamage(CreatureObject* attacker, float& minDmg, float& maxDmg, const CreatureAttackData& data) const {
-	ManagedReference<PlayerObject*> ghost = attacker->getPlayerObject();
+	int councilType = 0;
 
-	if (ghost == nullptr)
-		return;
+	if (attacker->isAiAgent()) {
+		AiAgent* agent = attacker->asAiAgent();
 
-	FrsData* playerData = ghost->getFrsData();
-	int councilType = playerData->getCouncilType();
+		if (agent == nullptr || agent->getFrsRank() < 0)
+			return;
+
+		councilType = agent->getFrsCouncil();
+	} else {
+		ManagedReference<PlayerObject*> ghost = attacker->getPlayerObject();
+
+		if (ghost == nullptr)
+			return;
+
+		FrsData* playerData = ghost->getFrsData();
+		councilType = playerData->getCouncilType();
+	}
 
 	float minMod = 0, maxMod = 0;
 	int powerModifier = 0;
@@ -2663,13 +2677,31 @@ int CombatManager::getArmorReduction(TangibleObject* attacker, WeaponObject* wea
 	}
 
 	if (defender->isAiAgent()) {
+		// Anti-Force buffs should react to an observed Force attack, not merely
+		// to an opponent who owns a Force pool. Refreshing this short memory on
+		// every real Force hit keeps the defenses available during an actual
+		// Force barrage without wasting them in ordinary saber combat.
+		if (data.isForceAttack()) {
+			AiAgent* defenderAgent = defender->asAiAgent();
+
+			if (defenderAgent != nullptr &&
+					defenderAgent->getJediArchetype() != AiAgent::JEDI_ARCHETYPE_NONE) {
+				auto cooldownTimerMap = defenderAgent->getCooldownTimerMap();
+
+				if (cooldownTimerMap != nullptr) {
+					cooldownTimerMap->updateToCurrentAndAddMili("jedi_force_threat",
+						JediFrsNpcData::FORCE_THREAT_MEMORY_MS);
+				}
+			}
+		}
+
 		// P.7.4c (flag-gated): jedi buff mitigation for NPC defenders. Stock
 		// code returned right after template armor, so an NPC's Force Armor/
 		// Shield/Feedback buffs NEVER did anything — the P.7 ladder was
 		// casting dead buffs (owner-verified live: buffed master took full
 		// saber damage). Mirrors the player order below: jedi mitigation
-		// first, then armor. Force Absorb stays player-only (crediting force
-		// back needs a PlayerObject ghost).
+		// first, then armor. The observer handlers below support both player and
+		// AiAgent force pools.
 		if (SimPlayerManager::instance()->isPvpJediNpcMitigationEnabled()) {
 			float jediMit = hitList->getJediMitigation();
 
@@ -2704,7 +2736,6 @@ int CombatManager::getArmorReduction(TangibleObject* attacker, WeaponObject* wea
 				if (forceFeedback > 0 && (defender->hasBuff(BuffCRC::JEDI_FORCE_FEEDBACK_1) ||
 						defender->hasBuff(BuffCRC::JEDI_FORCE_FEEDBACK_2))) {
 					float feedbackDmg = rawDamage * (forceFeedback / 100.f);
-
 					int forceDefense = defender->getSkillMod("force_defense");
 
 					if (forceDefense > 0)
@@ -2718,6 +2749,16 @@ int CombatManager::getArmorReduction(TangibleObject* attacker, WeaponObject* wea
 					defender->notifyObservers(ObserverEventType::FORCEFEEDBACK, attacker, feedbackDmg);
 					defender->playEffect("clienteffect/pl_force_feedback_block.cef", "");
 					hitList->setForceFeedback(feedbackDmg);
+				}
+
+				// SWGEmu intentionally defines Force Absorb as 40% of the
+				// post-Shield damage (Mantis #6810), not the obsolete command
+				// cost percentages still present in old FRS reference tables.
+				if (defender->getSkillMod("force_absorb") > 0) {
+					float absorbDam = damage * 0.4f;
+
+					defender->notifyObservers(ObserverEventType::FORCEABSORB, attacker, absorbDam);
+					hitList->setForceAbsorb(absorbDam);
 				}
 			}
 		}
@@ -3201,10 +3242,49 @@ void CombatManager::showHitLocationFlyText(CreatureObject* attacker, CreatureObj
 // Special Attack Cost
 
 bool CombatManager::applySpecialAttackCost(CreatureObject* attacker, WeaponObject* weapon, const CreatureAttackData& data) const {
-	if (attacker->isAiAgent() || data.isForceAttack())
+	// ForcePowersQueueCommand owns Force-attack checks and deductions, avoiding
+	// a double charge here.
+	if (data.isForceAttack())
 		return true;
 
 	float force = weapon->getForceCost() * data.getForceCostMultiplier();
+
+	if (attacker->isAiAgent()) {
+		AiAgent* agent = attacker->asAiAgent();
+
+		if (agent == nullptr)
+			return false;
+
+		if (force > 0) {
+			int currentForce = agent->getCurrentForce();
+
+			// Match the player rule below: saber specials cannot spend the
+			// final Force point.
+			if (currentForce <= force) {
+				int requestedCost = (int)force;
+				if (requestedCost < force)
+					requestedCost++;
+
+				JediNpcForceAccounting::record(agent, "blocked",
+					data.getCommandName(), -requestedCost,
+					currentForce, currentForce);
+				return false;
+			}
+
+			int newForce = (int)(currentForce - force);
+			JediNpcForceAccounting::apply(agent, "spend",
+				data.getCommandName(), newForce - currentForce, newForce);
+		} else if (weapon->isJediWeapon() &&
+				agent->getJediArchetype() != AiAgent::JEDI_ARCHETYPE_NONE) {
+			int currentForce = agent->getCurrentForce();
+			JediNpcForceAccounting::record(agent, "free",
+				data.getCommandName(), 0, currentForce, currentForce);
+		}
+
+		// Preserve stock NPC behavior for HAM costs; this change scopes only
+		// the previously skipped Jedi weapon Force cost.
+		return true;
+	}
 
 	if (force > 0) { // Need Force check first otherwise it can be spammed.
 		ManagedReference<PlayerObject*> playerObject = attacker->getPlayerObject();

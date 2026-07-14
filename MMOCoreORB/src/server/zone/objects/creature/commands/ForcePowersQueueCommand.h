@@ -16,6 +16,7 @@
 #include "CombatQueueCommand.h"
 #include "server/zone/managers/visibility/VisibilityManager.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
+#include "server/zone/objects/creature/ai/JediNpcForceAccounting.h"
 #include "server/zone/objects/creature/commands/ForcePowersQueueCommand.h"
 #include "server/zone/objects/creature/commands/JediQueueCommand.h"
 
@@ -65,11 +66,11 @@ public:
         } 
         else if (creature->isAiAgent()) {
             AiAgent* ai = creature->asAiAgent();
-            // Safety: If template has 0 cost, default to 50 so they can't spam forever
-            int cost = forceCost;
-            if (cost <= 0) cost = 50;
+            int cost = getFrsModifiedForceCost(creature);
 
             if (ai != nullptr && ai->getCurrentForce() < cost) {
+				JediNpcForceAccounting::record(ai, "blocked", name,
+					-cost, ai->getCurrentForce(), ai->getCurrentForce());
                 return GENERALERROR; // AI is out of force
             }
         }
@@ -96,17 +97,11 @@ public:
             else if (creature->isAiAgent()) {
                 AiAgent* ai = creature->asAiAgent();
                 if (ai != nullptr) {
-                    int cost = forceCost;
-                    if (cost <= 0) cost = 50;
+                    int cost = getFrsModifiedForceCost(creature);
 
-                    int newForce = ai->getCurrentForce() - cost;
-                    ai->setCurrentForce(newForce < 0 ? 0 : newForce);
-
-                    // --- DEBUG LOGGING ---
-                    // Uncomment this to verify it works in the console!
-                    StringBuffer msg;
-                    msg << "AI Force Power Used (" << name << "). Cost: " << cost << " Rem: " << newForce;
-                    ai->info(msg.toString(), true);
+					int newForce = ai->getCurrentForce() - cost;
+					JediNpcForceAccounting::apply(ai, "spend", name,
+						-cost, newForce);
                 }
             }
             // -------------------------------------------------------
@@ -125,22 +120,28 @@ public:
     }
 
 	int getFrsModifiedForceCost(CreatureObject* creature) const {
-		// AI Check
+		int councilType = 0;
+
 		if (creature->isAiAgent()) {
-             return forceCost;
-        }
+			AiAgent* agent = creature->asAiAgent();
 
-		ManagedReference<PlayerObject*> ghost = creature->getPlayerObject();
+			if (agent == nullptr || agent->getFrsRank() < 0)
+				return forceCost;
 
-		if (ghost == nullptr)
-			return forceCost;
+			councilType = agent->getFrsCouncil();
+		} else {
+			ManagedReference<PlayerObject*> ghost = creature->getPlayerObject();
 
-		Locker locker(creature);
+			if (ghost == nullptr)
+				return forceCost;
 
-		FrsData* playerData = ghost->getFrsData();
-		int councilType = playerData->getCouncilType();
+			Locker locker(creature);
 
-		locker.release();
+			FrsData* playerData = ghost->getFrsData();
+			councilType = playerData->getCouncilType();
+
+			locker.release();
+		}
 
 		int manipulationMod = 0;
 		float frsModifier = 0;

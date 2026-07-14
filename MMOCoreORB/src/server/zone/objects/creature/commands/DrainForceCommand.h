@@ -4,6 +4,7 @@
 #include "server/zone/objects/scene/SceneObject.h"
 #include "CombatQueueCommand.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
+#include "server/zone/objects/creature/ai/JediNpcForceAccounting.h"
 
 class DrainForceCommand : public CombatQueueCommand {
 public:
@@ -123,16 +124,20 @@ public:
             if (creature->isPlayerCreature()) {
                 playerGhost->setForcePower(attackerCurrentForce + netChange);
             } else if (creature->isAiAgent()) {
-                // AI LOGIC UPDATE
-                cast<AiAgent*>(creature)->setCurrentForce(attackerCurrentForce + netChange);
+				AiAgent* attackerAgent = cast<AiAgent*>(creature);
+				JediNpcForceAccounting::apply(attackerAgent, "exchange",
+					name + "_net", netChange,
+					attackerCurrentForce + netChange);
             }
 
             // Target Loses
             if (targetCreature->isPlayerCreature()) {
                 targetGhost->setForcePower(targetForce - forceDrain);
             } else if (targetCreature->isAiAgent()) {
-                // AI LOGIC UPDATE
-                cast<AiAgent*>(targetCreature)->setCurrentForce(targetForce - forceDrain);
+				AiAgent* targetAgent = cast<AiAgent*>(targetCreature);
+				JediNpcForceAccounting::apply(targetAgent, "spend",
+					name + "_drained", -forceDrain,
+					targetForce - forceDrain);
             }
 
             // 5. ANIMATION & SPAM

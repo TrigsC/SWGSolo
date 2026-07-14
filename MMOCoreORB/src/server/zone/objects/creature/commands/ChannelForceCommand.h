@@ -5,6 +5,8 @@
 #ifndef CHANNELFORCECOMMAND_H_
 #define CHANNELFORCECOMMAND_H_
 
+#include "server/zone/objects/creature/ai/JediNpcForceAccounting.h"
+
 #include "server/zone/objects/creature/buffs/ChannelForceBuff.h"
 #include "templates/params/creature/CreatureAttribute.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
@@ -85,7 +87,9 @@ public:
 		if (creature->isPlayerCreature()) {
 			playerObject->setForcePower(currentForce + forceBonus);
 		} else if (creature->isAiAgent()) {
-			cast<AiAgent*>(creature)->setCurrentForce(currentForce + forceBonus);
+			AiAgent* agent = cast<AiAgent*>(creature);
+			JediNpcForceAccounting::apply(agent, "gain", name,
+				forceBonus, currentForce + forceBonus);
 		}
 
 		// Setup buffs.

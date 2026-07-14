@@ -22,30 +22,9 @@ public:
 	}
 
 	void handleBuff(SceneObject* creature, ManagedObject* object, int64 param) const override {
-		ManagedReference<CreatureObject*> player = creature->asCreatureObject();
-
-		if (player == nullptr)
-			return;
-
-		ManagedReference<PlayerObject*> ghost = player->getPlayerObject();
-
-		if (ghost == nullptr)
-			return;
-
-		// Client Effect upon hit (needed)
-		player->playEffect("clienteffect/pl_force_shield_hit.cef", "");
-
-		int fCost = param * getFrsModifiedExtraForceCost(player, 0.3f);
-		if (ghost->getForcePower() <= fCost) { // Remove buff if not enough force.
-			Buff* buff = player->getBuff(BuffCRC::JEDI_FORCE_SHIELD_2);
-			if (buff != nullptr) {
-				Locker locker(buff);
-
-				player->removeBuff(buff);
-			}
-		} else {
-			ghost->setForcePower(ghost->getForcePower() - fCost);
-		}
+		handleMitigationForceCost(creature->asCreatureObject(),
+			BuffCRC::JEDI_FORCE_SHIELD_2, param, 0.3f,
+			"clienteffect/pl_force_shield_hit.cef");
 	}
 
 };

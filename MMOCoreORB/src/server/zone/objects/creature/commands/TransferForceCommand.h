@@ -1,6 +1,8 @@
 #ifndef TRANSFERFORCECOMMAND_H_
 #define TRANSFERFORCECOMMAND_H_
 
+#include "server/zone/objects/creature/ai/JediNpcForceAccounting.h"
+
 #include "server/zone/objects/scene/SceneObject.h"
 #include "server/zone/managers/frs/FrsManager.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
@@ -115,16 +117,19 @@ public:
         if (creature->isPlayerCreature()) {
             playerGhost->setForcePower(attackerForce - forceCost);
         } else if (creature->isAiAgent()) {
-            // AI LOGIC UPDATE
-            cast<AiAgent*>(creature)->setCurrentForce(attackerForce - forceCost);
+			AiAgent* attackerAgent = cast<AiAgent*>(creature);
+			JediNpcForceAccounting::apply(attackerAgent, "spend", name,
+				-forceCost, attackerForce - forceCost);
         }
 
         // Add Transfer to Target
         if (targetCreature->isPlayerCreature()) {
             targetGhost->setForcePower(targetCurrentForce + forceTransfer);
         } else if (targetCreature->isAiAgent()) {
-            // AI LOGIC UPDATE
-            cast<AiAgent*>(targetCreature)->setCurrentForce(targetCurrentForce + forceTransfer);
+			AiAgent* targetAgent = cast<AiAgent*>(targetCreature);
+			JediNpcForceAccounting::apply(targetAgent, "gain",
+				name + "_received", forceTransfer,
+				targetCurrentForce + forceTransfer);
         }
 
         uint32 animCRC = getAnimationString().hashCode();

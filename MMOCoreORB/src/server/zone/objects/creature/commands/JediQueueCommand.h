@@ -17,6 +17,7 @@
 #include "server/zone/objects/player/PlayerObject.h"
 #include "server/zone/managers/frs/FrsManager.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
+#include "server/zone/objects/creature/ai/JediNpcForceAccounting.h"
 
 class JediQueueCommand : public QueueCommand {
 
@@ -132,11 +133,11 @@ public:
         else if (creature->isAiAgent()) {
             AiAgent* ai = creature->asAiAgent();
             if (ai != nullptr) {
-                // Safety: Ensure a minimum cost so they can't spam free spells
                 int cost = getFrsModifiedForceCost(creature);
-                if (cost <= 0) cost = 50; 
 
                 if (ai->getCurrentForce() < cost) {
+					JediNpcForceAccounting::record(ai, "blocked", name,
+						-cost, ai->getCurrentForce(), ai->getCurrentForce());
                     return GENERALERROR; // Out of Force
                 }
             }
@@ -338,6 +339,55 @@ public:
 		return val + ((float)manipulationMod * frsModifier);
 	}
 
+	void handleMitigationForceCost(CreatureObject* creature, uint32 activeBuffCRC,
+			int64 damageAbsorbed, float baseCostRatio, const String& hitEffect) const {
+		if (creature == nullptr)
+			return;
+
+		ManagedReference<PlayerObject*> ghost = creature->getPlayerObject();
+		AiAgent* agent = creature->isAiAgent() ? creature->asAiAgent() : nullptr;
+
+		if (ghost == nullptr && agent == nullptr)
+			return;
+
+		if (!hitEffect.isEmpty())
+			creature->playEffect(hitEffect, "");
+
+		float costRatio = getFrsModifiedExtraForceCost(creature, baseCostRatio);
+
+		if (costRatio < 0)
+			costRatio = 0;
+
+		int forceCost = (int)(damageAbsorbed * costRatio);
+		int currentForce = ghost != nullptr ? ghost->getForcePower() : agent->getCurrentForce();
+
+		// Preserve the player rule: the hit is mitigated, then the buff drops
+		// without overdrawing the pool when the remaining force cannot pay it.
+		if (currentForce <= forceCost) {
+			if (agent != nullptr) {
+				JediNpcForceAccounting::record(agent, "depleted",
+					name + "_per_hit", -forceCost,
+					currentForce, currentForce);
+			}
+
+			Buff* buff = creature->getBuff(activeBuffCRC);
+
+			if (buff != nullptr) {
+				Locker locker(buff);
+
+				creature->removeBuff(buff);
+			}
+
+			return;
+		}
+
+		if (ghost != nullptr)
+			ghost->setForcePower(currentForce - forceCost);
+		else
+			JediNpcForceAccounting::apply(agent, "spend", name + "_per_hit",
+				-forceCost, currentForce - forceCost);
+	}
+
 	void doForceCost(CreatureObject* creature) const {
         // 1. PLAYER LOGIC
         if (creature->isPlayerCreature()) {
@@ -352,15 +402,10 @@ public:
             AiAgent* ai = creature->asAiAgent();
             if (ai != nullptr) {
                  int cost = getFrsModifiedForceCost(creature);
-                 if (cost <= 0) cost = 50; // Default fallback
 
-                 int newForce = ai->getCurrentForce() - cost;
-                 ai->setCurrentForce(newForce < 0 ? 0 : newForce);
-                 
-                 // Debug Logging (Optional)
-                 StringBuffer msg;
-                 msg << "AI Force Spell used. Cost: " << cost << " Remaining: " << newForce;
-                 ai->info(msg.toString(), true);
+				 int newForce = ai->getCurrentForce() - cost;
+				 JediNpcForceAccounting::apply(ai, "spend", name,
+					-cost, newForce);
             }
         }
     }

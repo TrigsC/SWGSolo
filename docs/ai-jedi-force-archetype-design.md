@@ -3,7 +3,12 @@
 **Status:** P.7.1 + P.7.1a + **P.7.2 (Transfer Force)** + **P.7.3 (Channel
 Force)** all SHIPPED 2026-07-06 (compiled clean `-Werror`, **PENDING RESTART +
 VERIFY** — checklist §7). The full ladder (rows 1–8) is now implemented. As-built
-deltas from the original proposal are marked **[AS-BUILT]** below.
+deltas from the original proposal are marked **[AS-BUILT]** below. **P.7.7
+Force-accounting audit implemented 2026-07-13**: all activation, ongoing,
+weapon-special, offensive-power, pool/regen, low-force recovery, and FRS rank
+paths have been corrected and source/static-verified. Full build/live verify is
+pending; the authoritative matrix and checklist are in
+`ai-jedi-frs-rank-design.md` §6.9.
 
 **P.7.1a (2026-07-06) — attack-stall regression fix.** First live look: NPCs
 cast the powers but then STOPPED attacking / couldn't be attacked while they
@@ -28,8 +33,10 @@ queue.
 
 **Owner change at approval:** Force Resists are NOT reactive casts — they are
 **assumed needed, always active, zero force cost**. Implemented as permanent
-spawn skillmods on the Enhancer (matching the player buff values, 25 each), so
-there is nothing to cast, recast, or spam. Ladder row 2 removed accordingly.
+spawn skillmods on the Enhancer (base player buff value 25 each), so there is
+nothing to cast, recast, or spam. Ranked NPCs add the side-correct
+`round(force_control × 0.35)` FRS value to each resist (§2.2/P.7.7). Ladder row
+2 remains removed and the activation cost remains zero.
 **Owner ask:** Jedi NPCs should roll an archetype on spawn — **Defender** (more
 defensive stats + Avoid Incapacitation) or **Enhancer** (the full self-buff /
 force-economy suite: Force Armor/Shield/Feedback/Absorb, resists, Drain Force,
@@ -47,15 +54,15 @@ The `healerType = "force"` work already built most of the substrate:
 |---|---|
 | AiAgent has a force pool: `currentForcePoints` / `maxForcePoints` (+ get/set) | `AiAgent.idl:245-246, 1021-1035` |
 | Pool is initialized 6850/6850 for **every** AiAgent | `AiAgentImplementation::initializeTransientMembers` (:233) |
-| Force regen task exists: `AiForceRegenerationEvent`, 10/2s (or `jedi_force_power_regen` skillmod), reschedules 10s when full | `AiAgentImplementation.cpp:641-696`, `events/AiForceRegenerationEvent.h` |
-| `JediQueueCommand` is **already AI-aware**: `doJediForceCostCheck` has an AiAgent branch (min cost 50), `doForceCost` deducts from `getCurrentForce()`, `getFrsModifiedForceCost` returns base cost for AI, `getForceCost()` accessor added "For AI" | `JediQueueCommand.h:49-52, 120-145, 320-339` |
+| Force regen task exists: `AiForceRegenerationEvent`; current audited value is base 10 + skillmods per tick, reschedules 10s when full | `AiAgentImplementation.cpp`, `events/AiForceRegenerationEvent.h` |
+| `JediQueueCommand` is AI-aware: checks/deductions use the exact FRS-modified command cost; legitimate zero-cost commands remain zero | `JediQueueCommand.h` |
 | **Drain Force is fully AI-aware both directions** (attacker or target may be player or AiAgent; uses agent pool; force_absorb observer fires) | `DrainForceCommand.h` (whole file) |
 | **Transfer Force is fully AI-aware both directions** | `TransferForceCommand.h:36-125` |
 | **Channel Force is NOT AI-aware** — hard-requires `PlayerObject` ghost → `GENERALERROR` for NPCs | `ChannelForceCommand.h` |
 | Self-buffs (Armor 1/2, Shield 1/2, Feedback 1/2, Absorb 1/2, Resist ×4, AvoidIncap) all route through `doJediSelfBuffCommand` → buff with skillmods via `createJediSelfBuff` | `JediQueueCommand.h:83-118, 166-218` |
 | ⚠ `doJediSelfBuffCommand` **TOGGLES**: if the buff is already on, it *removes* it and returns SUCCESS. AI must check `hasBuff(crc)` first or it will strip its own buffs | `JediQueueCommand.h:84-88` |
 | AvoidIncapacitation is the exception: it **renews** if present (never toggles off) | `AvoidIncapacitationCommand.h:20-40` |
-| Buff mitigation is skillmod-based (`force_armor`, `saber_block`, `avoid_incapacitation`…) so it works on any CreatureObject; but per-hit force drain in `handleBuff` early-returns for NPCs (no ghost) → NPC armor never pays per-hit force and never pops from depletion | `ForceArmor1Command.h:24-49` |
+| Buff mitigation is skillmod-based (`force_armor`, `saber_block`, `avoid_incapacitation`…). P.7.7 made Armor/Shield per-hit handlers pool-agnostic: NPCs pay the manipulation-adjusted cost and the buff drops at depletion | `JediQueueCommand.h`, `ForceArmor*Command.h`, `ForceShield*Command.h` |
 | Heal pipeline precedent (the pattern to extend): BT `healDefault` → `CheckIsHealer` → `CheckHealChance` (heal cooldown + force ≥ 200) → `GetHealTarget` → `HealTarget` leaf → `healCreatureTarget` (deducts 200 force, heals level×20, sets `healDelay`) | `default.lua:138-155`, `Checks.cpp:586-616`, `SimpleActions.h:634-735`, `AiAgentImplementation.cpp:3061-3178` |
 | HEAL tree socket ticks **in combat or LAIR_HEALING, not knocked down** | `default.lua rootDefault :298-307` |
 | AiAgents execute queue commands via `enqueueCommand` (precedents: prone/kneel `SimpleActions.h:564-566`, throwgrenade `AiAgentImplementation.cpp:1902`) | — |
@@ -64,9 +71,10 @@ The `healerType = "force"` work already built most of the substrate:
 | Command costs/durations (Lua): Armor2 150/1800s, Shield2 150/1800s, Feedback2 100/60s, Absorb2 100/60s, Resists 250/900s, AvoidIncap 750/30s (renewable), Drain 50, Transfer 200, heal 200 | `bin/scripts/commands/*.lua` |
 | Cooldown infra already on agents: `getCooldownTimerMap()` (used for `reaction_chat`) | `AiAgentImplementation.cpp:5921` |
 
-**Key implication:** phase 1 needs **zero changes to the command classes**. The
-work is: archetype roll at spawn, a stat package, one decision method, two BT
-leaves, one BT tree branch, and template fields.
+**Historical P.7.1 implication:** the initial archetype phase needed no command
+changes. Later live audits found player-only branches in ongoing mitigation,
+Absorb, Force-power scaling, and special-attack costs; P.7.7 corrected those
+shared command/combat paths for AiAgents.
 
 ---
 
@@ -93,7 +101,7 @@ buff objects, nothing to expire, visible to the existing combat math):
 | Archetype | Mods (v1 tuning — constants in C++, table kept here) |
 |---|---|
 | Defender | `saber_block +15`, `melee_defense +15`, `ranged_defense +15`, `force_defense +20` |
-| Enhancer | `jedi_force_power_regen 25` (vs default 10/2s — enhancers refill force ~2.5× faster; their whole kit runs on force) + **[AS-BUILT, owner decision]** all Force Resist lines always active at zero cost: `combat_bleeding_defense 25`, `absorption_bleeding 25`, `resistance_disease 25`, `absorption_disease 25`, `resistance_poison 25`, `absorption_poison 25`, `resistance_states 25` |
+| Enhancer | `jedi_force_power_regen +15` over the base 10 (unranked total 25/tick; ranked total also adds the FRS regen bonus) + **[AS-BUILT, owner decision]** all Force Resist lines always active at zero activation cost: base 25 plus the side/rank control-derived bonus for `combat_bleeding_defense`, `absorption_bleeding`, `resistance_disease`, `absorption_disease`, `resistance_poison`, `absorption_poison`, `resistance_states` |
 
 **[AS-BUILT] getSkillMod masking, not stacking:** the custom AiAgent
 `getSkillMod` override (`AiAgentImplementation.cpp:556`) returns the
@@ -115,6 +123,11 @@ decision window**, then closes the window. This is the anti-spam core:
   prevents multiple Jedi in one camp from sync-casting).
 - Per-power keys for the abilities that could otherwise chain (e.g.
   `jedi_avoid_incap` 45s, `jedi_drain_force` 20s).
+- `jedi_force_threat`: a 20s memory refreshed by each incoming Force attack;
+  Shield/Feedback/Absorb are reactive to this signal instead of merely seeing
+  that the opponent owns a Force pool.
+- `jedi_force_feedback`: 120s and `jedi_force_absorb`: 180s. Their buffs last
+  60s, so these cooldowns intentionally prevent continuous maintenance.
 
 **Force floor:** never cast (except the incap emergency) if it would leave
 `currentForce < 400` — always reserve two force heals (2×200). Heals stay
@@ -135,12 +148,38 @@ Armor/Shield!) is the natural rate limiter.
 | 2 | ~~reactive resists~~ **[AS-BUILT]** always active as spawn skillmods, zero cost (owner decision, §2.2) | — | Enhancer |
 | 3 | Armor2 missing | **Force Armor 2** (150/1800s) | Enhancer |
 | 3' | Armor1 AND Armor2 missing (Armor2 blocks Armor1) | **Force Armor 1** (75/1800s) | Defender |
-| 4 | opponent is a force user AND Shield2 missing | **Force Shield 2** (150/1800s) | Enhancer |
-| 5 | opponent is a force user AND Feedback2 missing, then Absorb2 missing | **Force Feedback 2 / Force Absorb 2** (100/60s) | Enhancer |
+| 4 | hit by a Force attack in the last 20s AND Shield2 missing | **Force Shield 2** (150/1800s) | Enhancer |
+| 5 | recent Force threat AND Feedback2 missing/cooldown past, then Absorb2 missing/cooldown past | **Force Feedback 2** (100/60s buff, 120s recast) / **Force Absorb 2** (100/60s buff, 180s recast) | Enhancer |
 | 6 | own force < 40% of max AND target is a force user with force > 0 AND `jedi_drain_force` cd past (20s) | **Drain Force** on target (already AI-aware) | Enhancer |
 | 7 | **[AS-BUILT, P.7.2 SHIPPED]** self force > 65% of max AND `jedi_transfer_force` cd past (20s) AND a friendly force-user ally ≤30m with force < 25% of their max exists | **Transfer Force** on that ally (AI-aware, applied DIRECTLY like a heal — beneficial, non-combat) | Enhancer |
 | 8 | **[AS-BUILT, P.7.3 SHIPPED]** force < 20% of max AND `jedi_channel_force` cd past (30s) AND all three HAM pools > 60% | **Channel Force** (HAM → force; self, non-combat, applied DIRECTLY) | Enhancer |
 | — | none matched | cast nothing this window | both |
+
+**[AS-BUILT] P.7.8 endurance tuning (2026-07-13, pending build/live
+verification).** Incoming Force attacks are recorded by `CombatManager` on the
+defending archetype Jedi's cooldown map. This makes the expensive anti-Force
+suite threat-driven: saber-only Jedi combat no longer causes speculative
+Shield/Feedback/Absorb casts. Generated archetype-Jedi sabers are normalized
+from the raw gen-4 template values (40–48) to a crafted-like base cost of 10,
+so command multipliers charge 10–30 rather than up to 144. At or below 20% of
+maximum Force, P.7.8 originally used zero-Force `defaultattack`; the first live
+P.7.9 ledger showed this reserve was unnecessary. P.7.10 now keeps selecting
+any exactly affordable skill and uses `defaultattack` only when none can be
+paid. Healing and Channel Force remain independent management decisions.
+The Imperial Dark Jedi Master template is now correctly fixed at FRS rank 11
+(8800 maximum Force, 45 regen per two-second tick) rather than rolling rank
+8–10. Full calculations and fight-log diagnosis are in
+`ai-jedi-frs-rank-design.md` §6.10.
+
+Build follow-up (2026-07-13): the P.7.8 threat guard in
+`CombatManager.cpp` now qualifies the generated AiAgent constant as
+`AiAgent::JEDI_ARCHETYPE_NONE`; the first external compile correctly rejected
+the unqualified identifier outside AiAgent implementation scope. The following
+build reached the final link but its external `SimPlayerManager.cpp.o`
+contained the complete `SimPvPController.cpp` implementation. Repository
+inspection confirms the two sources are distinct, each is compiled once, and
+there is no `.cpp` inclusion; this requires deployed-source verification and a
+targeted object/ccache rebuild rather than a Jedi or PvP code change.
 
 **[AS-BUILT] P.7.3 Channel Force (2026-07-06, compiled clean, PENDING
 RESTART+VERIFY).** Two parts: (1) `ChannelForceCommand` made AI-aware, mirroring
@@ -178,7 +217,7 @@ queue vs direct (only Drain Force sets it), replacing the earlier
 matches Drain Force's own target logic.
 
 **Emergent force management:** early fight = Armor (+Shield vs Jedi) ≈ 300
-force; mid fight = heals (200 each) + reactive resists; low force = Drain the
+force; mid fight = heals (200 each) with permanent resists protecting it; low force = Drain the
 opposing Jedi (net +120..+370) or, once P.7.3 lands, Channel HAM→force when
 safe. Defenders barely spend (Armor1 + rare AvoidIncap) — their kit is the
 passive stat package, exactly the profession contrast the owner described.
@@ -201,8 +240,10 @@ passive stat package, exactly the profession contrast the owner described.
 
 - Two new leaves, registered via `_REGISTERLEAF` in `AiMap.h`:
   - `CheckJediForceChance` (Checks.cpp): fast gate — `jediArchetype != 0 &&
-    cooldown "jedi_force_window" past && currentForce > 250`. One byte compare
-    for the other 99% of NPCs.
+    (knocked down || cooldown "jedi_force_window" past)`. Exact force
+    requirements belong to each selected action; there is no blanket minimum,
+    so Channel Force and low-cost state recovery remain reachable. One byte
+    compare for the other 99% of NPCs.
   - `ManageJediForce` (SimpleActions.h): calls
     `agent->runJediForceManagement()`, always returns SUCCESS.
 - One new branch in `rootDefault` (default.lua), inserted into the top
@@ -229,10 +270,12 @@ passive stat package, exactly the profession contrast the owner described.
   "AI already heals friendlies in the area, reuse that"). See ladder row 7
   AS-BUILT note.
 - **P.7.3 — SHIPPED 2026-07-06** (compiled clean, pending restart+verify).
-  Channel Force AI branch (§4 done — see ladder row 8 AS-BUILT note). Remaining
-  *optional* polish (not yet done): AWARE-slot pre-buffing, per-hit force drain
-  for NPC Force Armor (R3), tuning pass on ladder thresholds from live
-  observation.
+  Channel Force AI branch (§4 done — see ladder row 8 AS-BUILT note).
+- **P.7.7 — IMPLEMENTED 2026-07-13** (source/static-verified, full build/live
+  pending). The formerly optional Armor/Shield per-hit force drain is complete,
+  together with the broader accounting/rank audit documented in
+  `ai-jedi-frs-rank-design.md` §6.9. Remaining optional polish is AWARE-slot
+  pre-buffing and live tuning of ladder thresholds.
 
 ---
 
@@ -288,9 +331,9 @@ unchanged on NPCs. Ladder wiring: row 8 (§2.3).
 - **R2 — MITIGATED (shipped):** `doCommonJediSelfChecks` now skips
   `isWearingArmor()` for AiAgents (`JediQueueCommand.h`) — NPC outfit pieces
   are cosmetic and would have silently blocked every self-buff.
-- **R3** NPC Force Armor pays no per-hit force (handleBuff needs ghost →
-  early-returns). Mildly NPC-favoring; acceptable v1, optional AI branch in
-  P.7.3.
+- **R3 — RESOLVED P.7.7:** Force Armor and Force Shield per-hit handlers now
+  support PlayerObject and AiAgent pools, use the exact manipulation-adjusted
+  ratio, and remove the buff without overdrawing at depletion.
 - **R4 — RESOLVED at implementation:** worse than double-count — skillModList
   values MASK template statistics entirely in the custom getSkillMod. Handled
   by baking `statistic + bonus` (§2.2 AS-BUILT note).
@@ -313,8 +356,8 @@ unchanged on NPCs. Ladder wiring: row 8 (§2.3).
 3. Enhancer fight: `pl_force_armor_self.cef` fires ONCE, buff persists 30 min,
    force drops by cost, no recast while buffed (anti-toggle proven), casts
    ≥6s apart (window proven), Drain Force fires vs a Jedi opponent when low.
-   Console shows the existing "AI Force Spell used. Cost: X Remaining: Y" info
-   line from JediQueueCommand::doForceCost on every cast.
+   Console shows a `[JediForceAccounting]` line for every Force mutation; the
+   next line's `before` equals the prior line's `after` for that NPC.
 4. Defender fight: drop it below 35% HP → Avoid Incap effect
    (`pl_force_avoid_incap_self.cef`) + incap actually avoided; not renewed
    more than ~once/45s.
@@ -330,8 +373,33 @@ unchanged on NPCs. Ladder wiring: row 8 (§2.3).
    force jumps ~250–350, `channelforcebuff` applied, HAM restores over 180s);
    does not re-fire until force bottoms out again; ≤ once/30s. Confirm HAM
    restore actually happens on the NPC (buff tick has no ghost dependency).
+9. **P.7.7 accounting/ranks:** run the cross-council, mitigation-depletion,
+   Absorb, Force-power, saber-special, and low-force recovery checks in
+   `ai-jedi-frs-rank-design.md` §6.9. Confirm the dashboard's current/max pool,
+   control/power/manipulation, effective regen, and live buff values match the
+   tested rank table.
+10. **P.7.8 endurance:** an Imperial Dark Jedi Master reports rank 11, 8800
+    maximum Force, 45 regen/tick, and saber cost 10. In a saber-only fight it
+    does not use Shield/Feedback/Absorb. After a real Force hit it reacts with
+    those defenses and obeys the 120s/180s Feedback/Absorb recast cooldowns.
+11. **P.7.9 complete Force ledger:** filter one spawned NPC's log on its
+    `agent=<object id>` and `[JediForceAccounting]`. Begin at
+    `event=snapshot source=spawn_ready`, then confirm every `before` matches
+    the preceding `after` and final Force equals the snapshot plus all
+    `actualDelta` values.
+    The ledger covers activation
+    and Force-attack costs, saber specials, Armor/Shield per-hit costs, heals,
+    state recovery, regen, Absorb, Drain/Transfer/Channel, insufficient-cost
+    blocks, and explicit zero-cost `defaultattack` actions. A rank-0 NPC Knight
+    starts at 6940 Force and regenerates 11 (Defender) or 26 (Enhancer) every
+    two seconds.
+12. **P.7.10 last stand:** below 20% Force, confirm the NPC continues using
+    every affordable attack skill. Current Force must be strictly greater than
+    a saber special's calculated cost; Force attacks may equal their cost.
+    Only when every candidate is unaffordable should the ledger show
+    `source=defaultattack`.
 
-## 8. As-built file list (all compiled clean `-Werror`)
+## 8. P.7.1–P.7.3 as-built file list (historically compiled clean `-Werror`)
 
 | File | Change |
 |---|---|
@@ -339,7 +407,7 @@ unchanged on NPCs. Ladder wiring: row 8 (§2.3).
 | `ai/AiAgent.idl` | `JEDI_ARCHETYPE_NONE/DEFENDER/ENHANCER` consts; `int jediArchetype` member (+ctor init); get/set; native `initializeJediArchetype()` + `runJediForceManagement()` |
 | `ai/AiAgentImplementation.cpp` | +`SkillModManager.h` include; `initializeJediArchetype()` called at end of `loadTemplateData(CreatureTemplate*)`; both methods implemented after the force-regen block (~:715). Ladder rows 1–8 incl. Transfer Force ally scan (P.7.2) + Channel Force (P.7.3); `combatCommand` flag selects queue (Drain) vs direct (all else) execution (P.7.1a) |
 | `commands/ChannelForceCommand.h` | **(P.7.3)** AI-aware force read/write (AiAgent pool vs player ghost) + AI `isWearingArmor` bypass |
-| `ai/bt/leaf/Checks.h/.cpp` | `CHECK_JEDIFORCECHANCE` + `CheckJediForceChance` (archetype byte → force ≥ 250 → window past) |
+| `ai/bt/leaf/Checks.h/.cpp` | `CHECK_JEDIFORCECHANCE` + `CheckJediForceChance`; P.7.7 removed the blanket force ≥250 gate and lets KD recovery bypass the global window |
 | `ai/bt/leaf/SimpleActions.h` | `ManageJediForce` leaf → `runJediForceManagement()`, always SUCCESS |
 | `managers/creature/AiMap.h` | 2 × `_REGISTERLEAF` |
 | `bin/scripts/ai/default.lua` | `rootDefault`: AlwaysFail-wrapped branch, node ids 3811110001–3811110010, before the heal/combat sequence |

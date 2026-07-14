@@ -2,8 +2,12 @@
 
 Status: **IMPLEMENTED (Codex) + VERIFIED LIVE 2026-07-09 (28 ranked Jedi
 active; XP hook paid a real player 3,782 FRS XP / 5 kills). Two review bugs
-FIXED (dark control ladder, regen double-count — §6.5), compiled clean,
-PENDING RESTART. Rank-correct council robes are IMPLEMENTED and VERIFIED on
+FIXED in the original deployment (§6.5). A complete Force-accounting audit
+was implemented 2026-07-13 (§6.9): side-correct control/power ladders, actual
+ranked force pools and regen, offensive scaling/costs, lightsaber-special
+costs, defensive per-hit costs, Force Absorb, and low-force recovery gates.
+Source/static verification is complete; a full Core3 build and live restart
+remain pending. Rank-correct council robes are IMPLEMENTED and VERIFIED on
 clean Human and non-Human mobile bodies (§6.8); ranked-only clean-body groups
 and randomized species appearance are IMPLEMENTED and pending build/deployment
 verification.** Owner decisions (§7): tier order is
@@ -12,8 +16,10 @@ Sentinel the next band, Master the top — matches the FRS title ladder Padawan/
 Knight/Sentinel I–IV/Consular I–III/Arbiter I–II/Council); **normal FRS XP per
 kill by rank** (npcXpFactor = 1.0 — supersmall-population server); and the
 NPC's ability stats (Force Armor etc.) must be the **actual FRS per-rank
-values**, which the owner supplied (pastebin light/dark tables, §3.2 — light
-and dark values are identical, only tier titles differ).
+values**, which the owner supplied (pastebin light/dark tables, §3.2). The two
+councils share manipulation/max/regen but deliberately trade control and
+power: light ranks have the stronger defensive control ladder and dark ranks
+have the stronger offensive power ladder.
 Related docs: `ai-jedi-force-archetype-design.md` (P.7 archetypes this extends),
 `ai-pvp-squad-design.md` (P.6 squads that field the Jedi),
 `ai-pvp-mimetic-travel-design.md` (P.6.5, same session's first workstream).
@@ -95,30 +101,30 @@ Today only the low-tier Jedi NPCs are fielded; add higher-rank NPC Jedi
     early-out** (no ghost → base values; `getFrsModifiedForceCost` :251
     explicitly returns base for AI). AiAgents DO have a working skillModList
     (P.7.1 bakes packages into it and `getSkillMod` reads it).
-- **Derived per-rank skillmod ladder (verified against the owner's tables):**
-  inverting the pastebin values through the formulas above yields clean
-  integers that reproduce EVERY defensive table exactly (checked FA1, FA2,
-  shields, feedbacks, resists; e.g. rank 11 FA2 = 45 + 120×0.35 = 87% ✓ at
-  cost 0.30 − 80×0.003 = 6% ✓):
+- **Derived per-rank skillmod ladder (re-audited 2026-07-13 against both raw
+  owner tables):** control and power are side-specific mirror ladders;
+  manipulation is shared. `+maxForce = (control + power) × 10`, so max and
+  regen bonuses remain the same for both councils.
 
-  | FRS rank (light title) | force_control | force_manipulation | +maxForce | +regen |
-  |---|---|---|---|---|
-  | 0 (Knight) | 5 | 5 | 90 | 1 |
-  | 1 (Sentinel I) | 10 | 8 | 160 | 2 |
-  | 2 (Sentinel II) | 15 | 12 | 230 | 3 |
-  | 3 (Sentinel III) | 20 | 16 | 300 | 4 |
-  | 4 (Sentinel IV) | 25 | 20 | 370 | 5 |
-  | 5 (Consular I) | 35 | 25 | 500 | 6 |
-  | 6 (Consular II) | 45 | 30 | 650 | 8 |
-  | 7 (Consular III) | 55 | 35 | 800 | 9 |
-  | 8 (Arbiter I) | 70 | 45 | 1050 | 12 |
-  | 9 (Arbiter II) | 85 | 55 | 1300 | 14 |
-  | 10 (The Council) | 100 | 65 | 1600 | 17 |
-  | 11 (Council Leader / Master) | 120 | 80 | 1950 | 20 |
+  | Rank | light control | light power | dark control | dark power | manipulation | +maxForce | +regen |
+  |---|---:|---:|---:|---:|---:|---:|---:|
+  | 0 | 5 | 4 | 4 | 5 | 5 | 90 | 1 |
+  | 1 | 10 | 6 | 6 | 10 | 8 | 160 | 2 |
+  | 2 | 15 | 8 | 8 | 15 | 12 | 230 | 3 |
+  | 3 | 20 | 10 | 10 | 20 | 16 | 300 | 4 |
+  | 4 | 25 | 12 | 12 | 25 | 20 | 370 | 5 |
+  | 5 | 35 | 15 | 15 | 35 | 25 | 500 | 6 |
+  | 6 | 45 | 20 | 20 | 45 | 30 | 650 | 8 |
+  | 7 | 55 | 25 | 25 | 55 | 35 | 800 | 9 |
+  | 8 | 70 | 35 | 35 | 70 | 45 | 1050 | 12 |
+  | 9 | 85 | 45 | 45 | 85 | 55 | 1300 | 14 |
+  | 10 | 100 | 60 | 60 | 100 | 65 | 1600 | 17 |
+  | 11 | 120 | 75 | 75 | 120 | 80 | 1950 | 20 |
 
-  Dark titles differ (Dark Knight, Enforcer I–IV, Templar I–III, ...) but the
-  VALUES are identical. Raw tables archived from the owner's pastebins
-  (light 4vGV8evt, dark 8JjDtj0x).
+  Example: light rank 11 Force Armor 2 is `45 + 120×0.35 = 87%`, while dark
+  rank 11 rounds `45 + 75×0.35` to the table's 71%. Dark rank 11 instead
+  receives power 120 for its offensive Force attacks. Raw tables remain archived in
+  `frs-rank-values-light.txt` and `frs-rank-values-dark.txt`.
 
 ## 3. Design
 
@@ -149,28 +155,31 @@ already computes those from skillmods (§2 key find). So instead of an invented
 multiplier, P.7.4a does exactly what the FRS rank skill boxes do for players:
 
 1. **Bake the rank's skillmods at spawn** (extends `initializeJediArchetype`):
-   `force_control_light|dark` + `force_manipulation_light|dark` from the §2
-   ladder table (side picked by `frsCouncil`), plus the rank's
-   `jedi_force_power_regen` bonus. (Force pool: agents already carry 6850 —
-   far above player max+1950 — leave it; revisit only if R5 normalizes agent
-   pools.)
+   `force_control_light|dark`, `force_power_light|dark`, and
+   `force_manipulation_light|dark` from the §2 ladder table (side picked by
+   `frsCouncil`), plus the rank's max-force and regen bonuses. The actual AI
+   pool is `6850 + rank max bonus` and spawns full; regen is base 10 plus
+   modifiers, not a replacement value. Permanent Enhancer resist mods receive
+   their control-derived rank bonus explicitly because they are owner-defined
+   spawn stats rather than cast buffs.
 2. **Make the three `getFrsModified*` functions in `JediQueueCommand.h`
    AI-aware** (same file already has AI branches from P.7.1/1a): for an
    AiAgent, read council from the agent's `frsCouncil` and the control/
    manipulation mods via `agent->getSkillMod(...)` (works — P.7.1 bakes into
    skillModList). Then **every Jedi command an NPC casts gets the exact
-   player FRS math through the identical code path** — an NPC Master's Force
-   Armor 2 is 87% reduction because a player Master's is; no per-ability
-   tables, no drift when command lua is rebalanced.
+   player FRS math through the identical code path** — a light NPC Master's
+   Force Armor 2 is 87% reduction because a light player Master's is; no
+   per-ability tables, no drift when command lua is rebalanced. Force-power
+   damage and Force-power cast costs now use the same AI-aware rank path.
 3. Ladder tuning by rank stays as designed (cast window 6–10s shrinking to
    4–7s at high rank; masters keep Force Armor 2 up permanently — with 87%
    reduction that delivers "takes very little damage").
-4. "Uses very little force per hit": NPCs currently pay **no** per-hit Force
-   Armor drain (P.7 R3 — handleBuff early-returns without a ghost), so the
-   master-vs-knight efficiency contrast is trivially satisfied today. IF R3
-   is ever implemented, the AI-aware `getFrsModifiedExtraForceCost` from step
-   2 already yields the correct rank-scaled per-hit cost (Master 6% vs Knight
-   28.5% on FA2) — R3 becomes a one-line change that cannot regress this.
+4. **Per-hit mitigation cost is implemented.** Force Armor/Shield handlers
+   now debit either a PlayerObject pool or an AiAgent pool and remove the buff
+   when the remaining force cannot fund the hit. The cost is
+   `absorbedDamage × max(0, baseRatio + manipulation × extraCostModifier)`.
+   Because manipulation is shared, both councils pay the same rank cost; for
+   Force Armor 2 the ratio is 28.5% at rank 0 and 6% at rank 11.
 
 ### 3.3 FRS XP for players on NPC Jedi kills (P.7.4b — the one core hook)
 
@@ -254,13 +263,14 @@ notes (matches the design unless flagged):
 
 - Templates (all CL 88, clone-down as planned): light knight (rank 0 fixed) /
   sentinel (1–4) / consular (5–7) / master (11 fixed); dark knight (0) /
-  enforcer (1–4) / templar (5–7) / master (8–10) — FRS tier titles per side.
+  enforcer (1–4) / templar (5–7) / master (11 fixed) — FRS tier titles per
+  side. The dark Master's former 8–10 range was corrected in P.7.8 (§6.10).
   `frsRank` or `frsRankMin/Max` + `frsCouncil` template fields
   (CreatureTemplate.h). Squad picks are WEIGHTED
   (`pvpConfig.templates` entries `{template=, weight=}`): trooper 35 /
   knight 28 / band-2 19 / band-3 12 / master 6.
 - Rank bake in `initializeJediArchetype` (AiAgentImplementation.cpp ~:769):
-  control/manipulation/maxForce/regen skillmods per rank; AI-aware
+  control/power/manipulation/maxForce/regen skillmods per rank; AI-aware
   `getFrsModified*` in JediQueueCommand.h exactly per design (§3.2).
 - XP hook in `disseminateExperience` (PlayerManagerImplementation ~:1944) →
   `FrsManager` award path with contribution + factor; per-player daily-cap
@@ -268,19 +278,24 @@ notes (matches the design unless flagged):
 - Dashboard `pvpActivity.jediRanks`: per-agent rows (rank/council/mods),
   byRank histogram, awardsTodayByPlayer, cap counters.
 
-**Two bugs found in review, FIXED 2026-07-09 (compiled clean, PENDING
-RESTART):**
-1. **Invented weaker dark control ladder** — Codex used
-   `darkControlByRank {4,6,8,10,12,15,20,25,35,45,60,75}`, but the owner's
-   light and dark tables carry IDENTICAL values (verified by diffing the raw
-   tables — only tier titles differ). A dark Master's Force Armor 2 was 71%
-   instead of 87%. Fix: one shared `controlByRank` = the verified light
-   ladder.
-2. **Regen double-count** — the bake passed
+**Historical review findings from 2026-07-09:**
+1. **Dark-control conclusion superseded by the 2026-07-13 audit.** The
+   original implementation used
+   `darkControlByRank {4,6,8,10,12,15,20,25,35,45,60,75}`. The first review
+   incorrectly called this invented and replaced it with the light ladder.
+   Comparing the ability-value rows—not merely similarly shaped table
+   sections—shows that the original dark control ladder was correct and is
+   mirrored by light power. The shared-control change is now reverted and
+   both side-specific control/power ladders are centralized in
+   `JediFrsNpcData.h` with regression coverage.
+2. **Regen double-count was a real bug** — the bake passed
    `getSkillMod("jedi_force_power_regen") + regenByRank[rank]` into
    `addSkillMod`, which ACCUMULATES; an enhancer's baked +25 was counted
    twice (observed live: enhancer knights at regen 51 instead of 26; defenders
-   correctly at 1). Fix: pass only `regenByRank[rank]`.
+   correctly at 1). The later full audit also found that regen skillmods were
+   treated as replacing the base 10. Current behavior is base 10 + all mods;
+   Enhancer contributes +15 (preserving its intended unranked total of 25),
+   then the rank bonus is added once.
    KEY LESSON: `addSkillMod(TEMPLATE, ...)` adds to the existing mod — never
    read-modify-write it.
 
@@ -306,8 +321,8 @@ NPC defenders: the whole P.7 ladder was casting dead defensive buffs.
    off): inside the AiAgent branch, before template armor (mirroring the
    player order), apply `force_armor` vs non-force damage and `force_shield`
    vs force damage — identical math, observers notified, jediMitigation
-   recorded on the hitList. Force Absorb stays player-only (crediting force
-   back needs a ghost); NPC Force Feedback is a possible follow-up.
+   recorded on the hitList. Force Absorb and Force Feedback were completed in
+   later audits (§6.7, §6.9).
 2. **Visibility** (`pvpConfig.comms.showNpcMitigation`, lua true / C++ off):
    `sendMitigationCombatSpam` gained an optional `attacker` param (default
    nullptr, other call sites untouched); FORCEARMOR/FORCESHIELD/FORCEABSORB
@@ -336,13 +351,15 @@ lesson):
 | Force Armor 1/2 mitigation | ✅ fixed §6.6 (owner-verified in-game) |
 | Force Shield 1/2 mitigation | ✅ fixed §6.6 |
 | Force Feedback 1/2 reflect | ✅ **fixed NOW** — was still dead; added to the §6.6 gated block, same math as players (incl. attacker force_defense reduction), reflect spam already broadcast by the caller |
-| Force Absorb 1/2 | ❌ still inert for NPCs (stock `isPlayerCreature` gate; crediting force back needs ghost/AI plumbing — noted follow-up; enhancer ladder still casts it, harmless) |
-| Resists vs states | ✅ AI-aware path exists (jedi_state_defense AiAgent override in applyStates — owner's earlier creatureskills work) |
-| DoT resists (bleed/disease/poison) | ✅ generic getSkillMod reads, type-agnostic |
+| Force Absorb 1/2 | ✅ AI-aware as of §6.9; restores 40% of post-Shield Force damage, capped at actual max force |
+| Resists vs states | ✅ AI-aware path exists; permanent Enhancer values now receive the side-correct control rank bonus (§6.9) |
+| DoT resists (bleed/disease/poison) | ✅ generic getSkillMod reads, type-agnostic; permanent Enhancer values are rank-scaled (§6.9) |
 | Avoid Incapacitation | ✅ generic (CreatureObjectImplementation:1096, setHAM path) |
 | Drain / Transfer / Channel Force | ✅ AI-aware (P.7.2/P.7.3) |
-| Force pool / regen mods | ✅ live-verified |
-| Per-hit Force Armor cost | ❌ by design so far (R3) |
+| Force pool / regen mods | ✅ actual pool/max and additive base-10 regen corrected in §6.9 |
+| Per-hit Force Armor/Shield cost | ✅ AI pool debit, rank reduction, and depletion removal implemented in §6.9 |
+| Offensive Force powers | ✅ cast cost and force-power damage use side/rank skillmods (§6.9) |
+| Lightsaber specials | ✅ actual weapon Force cost × command multiplier is checked and deducted (§6.9) |
 
 **P.7.5 knockdown/state recovery reflex** (owner-specified player combo:
 dizzy+KD → heal states → stand, "fluid, not dizzy-KD-heal-stand scripted"):
@@ -420,18 +437,18 @@ Implementation details:
   opt in.
 - `CreatureTemplate` parses the optional list. After
   `initializeJediArchetype` rolls the actual rank, the AiAgent creates and
-  equips exactly that rank's tangible robe. This ordering is necessary because
-  the current imperial dark master rolls ranks 8–10, crossing the `s04` →
-  `s05` appearance boundary; a fixed `outfit` field would be wrong for one of
-  those results.
+  equips exactly that rank's tangible robe. This ordering supports every
+  ranged-rank template. The Imperial dark Master formerly crossed the
+  `s04`/`s05` boundary while rolling 8–10; P.7.8 fixed that named Master at
+  rank 11, so it now consistently uses `s05`.
 - The feature remains under the existing `enableRankedJedi` gate because rank
   initialization and robe equip share the same gated block. Templates without
   `frsRankOutfits` are unchanged.
 
 Restart verification: inspect one NPC from each available band and confirm its
-robe matches the dashboard `pvpActivity.jediRanks[].rank`. In particular,
-imperial dark-master rolls at rank 8/9 must wear `s04`, while rank 10 wears
-`s05`. Also check a non-human dress-group roll to confirm the client has an
+robe matches the dashboard `pvpActivity.jediRanks[].rank`. In particular, the
+Imperial dark Master must report rank 11 and wear `s05`. Also check a non-human
+dress-group roll to confirm the client has an
 appearance mapping for that species; the robe templates advertise all player
 races, but final rendering is client-side.
 
@@ -708,18 +725,286 @@ ID. Post-build verification should spawn several light Jedi and observe all
 four colors over a sufficient sample while dark Jedi remain red.
 
 
+## 6.9 P.7.7 — Full Jedi NPC Force-accounting audit (2026-07-13)
+
+Status: **IMPLEMENTED and source/static-verified; full Core3 build and live
+deployment verification pending.** The audit followed every archetype action
+from selection through command requirement checks, deduction, effect handling,
+ongoing costs, rank modifiers, pool bounds, and regeneration.
+
+### Authoritative rank data
+
+All NPC FRS arrays and derived values now live in the small pure header
+`JediFrsNpcData.h`. Spawn initialization, permanent-resist scaling, dashboard
+output, and regression tests consume or verify that one source. This prevents
+the previous drift in which documentation, the dark control ladder, and the
+offensive power ladder disagreed. The side-correct table is in §2.
+
+At ranked spawn the implementation now:
+
+- bakes side-specific `force_control_*` and `force_power_*`, plus shared
+  `force_manipulation_*`;
+- adds the rank's actual max-force bonus to both max and current force, so the
+  NPC spawns full at `6850 + bonus`;
+- regenerates base 10 + rank bonus + archetype bonus each tick; the Enhancer
+  bonus is +15, preserving the intended unranked total of 25;
+- adds `round(control × 0.35)` to every permanent Enhancer resist line. Those
+  owner-defined resists remain always active and activation-cost-free, while
+  their magnitude now matches the proper light/dark FRS rank row.
+
+### Cost and effect matrix
+
+| Path | Audited behavior |
+|---|---|
+| Force Armor 1/2 and Shield 1/2 activation | Exact command-Lua cast cost, including manipulation modifier; legitimate zero cost remains zero |
+| Armor/Shield mitigation hits | Current hit mitigates, then AI pays `absorbedDamage × rank-adjusted ratio`; buff is removed without overdrawing when remaining force is insufficient |
+| Force Feedback 1/2 | Exact activation cost; reflect remains the existing rank-control-scaled effect and has no invented per-hit Force charge |
+| Force Absorb 1/2 | Exact activation cost; AI restores 40% of post-Shield Force damage, capped at actual max force |
+| Offensive Force powers | Selector, command check, and deduction use the same manipulation-adjusted cost; damage uses side/rank `force_power_*` just like a ranked player |
+| Lightsaber specials | Selector predicts and combat execution deducts `weapon forceCost × command forceCostMultiplier`; the player rule requiring force to remain above zero is preserved |
+| Force heal | Requires and deducts 200 Force through the existing heal path |
+| Heal States Self | Deducts 25 per cleared state; dizzy/KD recovery can run below the former blanket 250-Force gate |
+| Drain Force | Costs 50 and transfers the existing calculated amount into the AI pool |
+| Transfer Force | Requires/deducts 200 and credits the ally through the existing AI-aware path |
+| Channel Force | Remains HAM-to-Force recovery; it is now reachable when the pool is actually low |
+| Avoid Incapacitation and permanent resists | Avoid Incap uses its command cost; permanent owner-defined resist stats correctly have no activation cost |
+
+The upstream Force Absorb behavior deserves an explicit note. Current SWGEmu
+changed Absorb to **40% of post-Shield damage** (Mantis #6810). The older raw
+FRS reference files still contain obsolete Absorb percentages/cost fields; the
+AI branch intentionally mirrors current engine behavior rather than reviving
+those historical values.
+
+The global `CheckJediForceChance` no longer rejects every action below 250
+Force. Exact requirements remain owned by the selected ability. Knockdown
+recovery also bypasses the normal 6–10 second Force window because its own
+`jedi_state_recovery` cooldown supplies pacing. This restores both intended
+low-pool Channel Force and the 25-Force dizzy-clear path.
+
+### Observability and verification
+
+`pvpActivity.jediRanks` now exposes each ranked NPC's control, power,
+manipulation, max bonus/total regen modifier, effective regen tick, current/max
+pool, saber Force cost, exact-affordability mode, recent Force-threat state, and
+live Armor/Shield/Feedback/Absorb/state-resist values. The legacy
+`conservingForce` field remains `false` for dashboard compatibility. Regression
+cases were added to `JediManagerTest.cpp` for every rank on both councils,
+checking the authoritative arrays plus representative defensive, resist,
+per-hit-cost, offensive, and endurance-tuning values.
+
+Local verification completed:
+
+- `git diff --check` passes;
+- the standalone C++14 syntax check for `JediFrsNpcData.h` passes;
+- both owner raw tables were compared row-by-row to the derived ladders.
+
+Build follow-up (2026-07-13): the first external Core3 compile correctly
+rejected two selector calls that passed the `AiAgentImplementation` delegate
+where the command API requires a `CreatureObject*`. Both FRS cost predictions
+now pass `asAiAgent()`, matching the generated Core3 interface pattern. A build
+rerun is pending.
+
+This checkout has no populated `engine3`/generated Core3 header tree and its
+Docker daemon is unavailable, so it cannot perform the normal full build.
+After deployment, build with the server's normal `-Werror` workflow and verify
+the following live:
+
+1. Compare a light and dark NPC at the same rank in the dashboard: light
+   control/dark power use the high ladder; light power/dark control use the
+   low ladder; current/max force includes the displayed max bonus.
+2. Damage an Armor/Shield-protected NPC repeatedly and confirm force falls by
+   rank-adjusted absorbed-damage cost and the buff drops at depletion.
+3. Hit an Absorb-protected Enhancer with Force damage and confirm a capped 40%
+   post-Shield credit.
+4. Exercise Lightning/other Force attacks and a lightsaber special; confirm
+   each selector stops when unaffordable and the actual pool falls by the
+   displayed/command-derived amount.
+5. Empty an Enhancer below 20% and confirm Channel Force remains reachable;
+   dizzy/knock down a low-force Jedi and confirm the 25-per-state recovery
+   still runs outside the normal cast window.
+
+## 6.10 P.7.8 — Live endurance correction (2026-07-13)
+
+Status: **IMPLEMENTED and source/static-verified; full Core3 build and live
+deployment verification pending.** Two 82–89 second fights showed an Imperial
+Dark Jedi Master falling from about 8,450 Force to about 1,500. The visible
+`AI Force Spell used` lines accounted only for self-buff activation costs; they
+did not report either saber-special deductions or Force Armor's per-hit cost.
+
+The observed initial value proved the named Master had rolled FRS rank 10:
+`6850 + 1600 = 8450`. The template incorrectly used ranks 8–10 even though the
+rank design assigns `*_jedi_master` to rank 11. It is now fixed at rank 11, so
+the dark Master spawns at `6850 + 1950 = 8800` and regenerates
+`10 base + 15 Enhancer + 20 rank = 45` Force every two seconds.
+
+The defensive math was correct but exposed why rank 10 depleted too quickly:
+
+- dark rank 10 Force Armor 2 is 66% mitigation and its manipulation-adjusted
+  cost is 10.5% of absorbed damage, or about 6.93% of the raw incoming hit;
+- dark rank 11 Force Armor 2 is 71% mitigation and costs 6% of absorbed
+  damage, or about 4.26% of the raw hit.
+
+The endurance changes are:
+
+1. Generated archetype-Jedi sabers use a 10-Force baseline. Raw gen-4 NPC
+   templates contain 40/47/48 Force, so the `lightsabermaster` command
+   multipliers previously cost 60–144 Force per special. They now cost 15–30,
+   while the normal `defaultattack` remains free. Player weapons are untouched.
+2. Force Shield, Feedback, and Absorb no longer activate merely because the
+   opponent owns a Force pool. A real incoming Force attack creates a 20-second
+   threat memory, refreshed by subsequent Force hits. The NPC then reacts with
+   its anti-Force tools.
+3. Feedback has a 120-second individual recast cooldown and Absorb 180 seconds.
+   Their buff duration remains 60 seconds, deliberately creating downtime
+   rather than continuous maintenance. Shield retains its normal 1800-second
+   duration and needs no additional cooldown.
+4. P.7.8 originally selected literal `defaultattack` at or below 20% maximum
+   Force. The first complete live ledger showed that this preserved much more
+   Force than the Knight needed, so P.7.10 supersedes the percentage reserve
+   with exact command affordability. Healing remains available down to its
+   exact 200-Force requirement and Channel Force remains independently
+   reachable.
+
+Spawn logging now reports `[JediForceAccounting] event=saber_cost_tuned` with
+the raw template and effective NPC weapon costs. Live verification should
+confirm an Imperial Dark Jedi Master dashboard row shows rank 11, pool 8800,
+regen 45, and `saberForceCost: 10`; a saber-only fight should not set
+`recentForceThreat` or cast Shield/Feedback/Absorb; and a real Force attack
+should set the flag and trigger the reactive ladder.
+
+Build follow-up (2026-07-13): the first external compile of P.7.8 found that
+`CombatManager.cpp` referenced the AiAgent-owned `JEDI_ARCHETYPE_NONE`
+constant without its class scope. The threat-marker guard now uses
+`AiAgent::JEDI_ARCHETYPE_NONE`, matching uses outside AiAgent implementation
+scope.
+
+The next external build compiled the changed sources and reached the final
+link, where it reported every `SimPvPController.cpp` symbol in both
+`SimPvPController.cpp.o` and `SimPlayerManager.cpp.o`. This is not a source
+ODR violation in the repository: the manager/controller sources are distinct
+(about 24.7k vs 687 lines), have different hashes, are each globbed once by
+CMake, and no file includes a `.cpp`. The external build therefore has either
+an overwritten deployed `SimPlayerManager.cpp` or a stale/corrupt object or
+ccache entry. Verify the deployed source first, then rebuild those two objects
+with ccache disabled. No PvP source should be removed from CMake.
+
+## 6.11 P.7.9 — Unified NPC Jedi Force ledger (2026-07-13)
+
+Status: **IMPLEMENTED, externally built, and LIVE-VERIFIED for the complete
+rank-0 Defender Knight path; additional ability-path coverage remains in the
+verification matrix.** The former `AI Force Spell used` message was emitted
+only by `JediQueueCommand::doForceCost()`. It could not show saber
+specials, Force-power commands, Armor/Shield per-hit consumption, direct AI
+heals/state recovery, regeneration, Absorb credits, or Force
+Drain/Transfer/Channel changes. A short combat log therefore could not prove
+that an NPC was using one finite Force pool.
+
+All runtime AiAgent Force mutations now pass through
+`JediNpcForceAccounting::apply()`. It clamps the result to `[0, maxForce]`,
+performs the write, and emits one structured line containing the NPC identity
+plus:
+
+```text
+[JediForceAccounting] agent=<object id> event=<type> source=<ability>
+requestedDelta=<signed> actualDelta=<signed> amount=<absolute actual>
+before=<pool> after=<pool> max=<pool> rank=<0-11> council=<id> archetype=<id>
+```
+
+The events and covered paths are:
+
+| Event | Sources / meaning |
+|---|---|
+| `snapshot` | `spawn_ready`: authoritative starting current/max pool after archetype and FRS rank initialization |
+| `initialize` | `frs_rank_bonus`: the spawn-time rank pool increase |
+| `spend` | Jedi self buffs, Force attacks, saber specials, `forcearmor*_per_hit`, `forceshield*_per_hit`, `force_heal`, `heal_states_self`, Transfer cost, and Force drained from an AI target |
+| `gain` | two-second `regeneration`, `forceabsorb*_credit`, Channel Force, and transferred Force received |
+| `exchange` | Drain Force caster's single net change (`amount drained - command cost`) |
+| `free` | a legitimate zero-Force Jedi-weapon action such as `defaultattack`; this proves visible saber damage did not hide a Force charge |
+| `blocked` | a cast or saber special refused because the pool cannot pay its exact cost; the pool is unchanged |
+| `depleted` | Armor/Shield mitigated the hit but dropped because the remaining pool could not pay its per-hit cost; the player-compatible rule leaves the pool unchanged |
+
+`requestedDelta` is the intended signed change. `actualDelta` is always
+`after - before` and can differ only when the maximum/minimum pool clamp (or a
+documented no-change decision) applies. For one spawned NPC, every ledger
+line's `before` must equal the prior line's `after`, and:
+
+```text
+final Force = spawn_ready Force + sum(all subsequent actualDelta values)
+```
+
+That is the live anti-cheat invariant: there is no unreported runtime
+`setCurrentForce()` call left under `MMOCoreORB/src/server/zone`; the only one
+is inside the accounting gateway itself. The base constructor assignment is
+represented by the later `spawn_ready` snapshot.
+
+For a rank-0 NPC Knight, the expected starting pool is `6850 + 90 = 6940`.
+Its two-second regen entry is 11 for a Defender (`10 base + 1 rank`) or 26 for
+an Enhancer (`10 base + 15 archetype + 1 rank`). Filter the server log for the
+specific `agent=<object id>` and `[JediForceAccounting]`, fight it through
+death, then verify continuity and the sum above. A source/static search
+currently finds only the generated setter definition and the gateway's one
+call to it.
+
+Build follow-up (2026-07-13): the first external compile of P.7.9 found that
+the lightweight accounting header forward-declared a second global `String`,
+which conflicted with Engine3's `sys::lang::String` when both names were
+visible. The header and implementation now forward-declare and use the fully
+qualified `sys::lang::String`; this removes the ambiguity without requiring a
+heavy Engine3 include in every command header.
+
+## 6.12 P.7.10 — Exact-affordability last stand and first live ledger audit
+(2026-07-13)
+
+Status: **IMPLEMENTED and source/static-verified; external Core3 build and live
+verification pending.** The first complete P.7.9 fight log covered a rank-0
+Imperial Dark Jedi Knight (`archetype=1`, Defender) from spawn through its last
+recorded combat action. The audit found:
+
+- 366 per-agent ledger entries, zero `before`/prior-`after` gaps, and zero
+  incorrect `actualDelta` calculations;
+- starting Force 6,940; gross spend 7,948; regeneration 1,089; calculated and
+  logged final Force both 81;
+- 2,420 Force across 113 saber specials, all at the tuned 18–30 costs;
+- 3,803 Force across 117 successful Armor 1 per-hit charges, plus the correct
+  final depletion event at 15 Force when the next hit required 35;
+- eight 200-Force heals (1,600 total), two 25-Force state clears, and the
+  one-time 75-Force Armor 1 activation;
+- no Shield, Feedback, or Absorb activity in this Defender/saber fight, and no
+  blocked or hidden Force changes.
+
+The only undesirable behavior was the deliberate P.7.8 20% attack reserve.
+For this 6,940-point pool the threshold was 1,388; queued specials finished as
+the pool crossed it, then the first free `defaultattack` appeared at 1,236
+despite every 18–30 Force saber special still being affordable.
+
+P.7.10 removes that fixed percentage reserve. Both `selectSpecialAttack()` and
+`selectDefaultAttack()` now use one command-aware affordability check before
+selecting template, priority, or heuristic attacks. The check predicts the
+same FRS-modified Force-command cost or weapon-cost multiplier used by
+execution. The Jedi keeps choosing paid skills while any candidate is legal,
+then falls back to `defaultattack` only when none is affordable. Player rules
+remain intact: a Force command may equal its cost, while current Force must be
+strictly greater than a saber special's calculated floating-point cost.
+Healing, Armor/Shield per-hit consumption, and Drain/Channel recovery continue
+through their independent management paths.
+
+`pvpActivity.jediRanks` retains `conservingForce: false` for compatibility and
+adds `usesExactForceAffordability: true`. The regression test covers free
+attacks, insufficient Force, a Force command spending exactly to zero, and a
+saber special requiring one point beyond its cost.
+
 ## 7. Owner decisions (ANSWERED 2026-07-07)
 
 1. Tier→rank map: **knight first, named council bands next, master final**.
    The as-built templates are authoritative: light 0 / 1–4 / 5–7 / 11 and
-   dark 0 / 1–4 / 5–7 / 8–10 (§6.5). These ranges match the side-specific FRS
+   dark 0 / 1–4 / 5–7 / 11 (§6.5). These ranges match the side-specific FRS
    title ladders in the owner-supplied tables.
 2. **Normal FRS XP per kill by rank** (npcXpFactor 1.0, no daily cap) —
    deliberately generous for a super-small-population server.
 3. **Ability stats must be the real FRS values** — implemented via the
-   force_control/force_manipulation skillmod ladder + AI-aware
-   getFrsModified* (§3.2); owner supplied the authoritative tables
-   (pastebin light 4vGV8evt / dark 8JjDtj0x, §2).
+   side-correct force_control/force_power ladders, shared force_manipulation
+   ladder, actual pool/regen bonuses, and AI-aware modifier paths (§3.2,
+   §6.9); owner supplied the authoritative light/dark tables (§2).
 
 Still open (small, can default sensibly at build):
 - CL/stat tuning for knight/master squad members — thug CL 265/291 blocks

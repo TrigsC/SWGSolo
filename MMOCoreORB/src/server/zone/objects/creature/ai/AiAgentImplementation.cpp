@@ -29,6 +29,8 @@
 #include "server/zone/managers/reaction/ReactionManager.h"
 #include "server/zone/objects/cell/CellObject.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
+#include "server/zone/objects/creature/ai/JediFrsNpcData.h"
+#include "server/zone/objects/creature/ai/JediNpcForceAccounting.h"
 #include "server/zone/objects/creature/ai/Creature.h"
 #include "server/zone/objects/creature/conversation/ConversationObserver.h"
 #include "server/zone/objects/creature/commands/CombatQueueCommand.h"
@@ -113,6 +115,54 @@
 // #define SHOW_NEXT_POSITION
 // #define DEBUG_FINDNEXTPOSITION
 // #define DEBUG_MOVE
+
+namespace JediNpcForceAccounting {
+
+void record(AiAgent* agent, const sys::lang::String& event,
+		const sys::lang::String& source, int requestedDelta, int beforeForce,
+		int afterForce) {
+	if (agent == nullptr)
+		return;
+
+	int actualDelta = afterForce - beforeForce;
+	int amount = actualDelta < 0 ? -actualDelta : actualDelta;
+
+	StringBuffer msg;
+	msg << "[JediForceAccounting]"
+		<< " agent=" << agent->getObjectID()
+		<< " event=" << event
+		<< " source=" << source
+		<< " requestedDelta=" << requestedDelta
+		<< " actualDelta=" << actualDelta
+		<< " amount=" << amount
+		<< " before=" << beforeForce
+		<< " after=" << afterForce
+		<< " max=" << agent->getMaxForce()
+		<< " rank=" << agent->getFrsRank()
+		<< " council=" << agent->getFrsCouncil()
+		<< " archetype=" << agent->getJediArchetype();
+
+	agent->info(msg.toString(), true);
+}
+
+void apply(AiAgent* agent, const sys::lang::String& event,
+		const sys::lang::String& source, int requestedDelta, int newForce) {
+	if (agent == nullptr)
+		return;
+
+	int beforeForce = agent->getCurrentForce();
+	int maxForce = agent->getMaxForce();
+
+	if (newForce < 0)
+		newForce = 0;
+	else if (maxForce > 0 && newForce > maxForce)
+		newForce = maxForce;
+
+	agent->setCurrentForce(newForce);
+	record(agent, event, source, requestedDelta, beforeForce, newForce);
+}
+
+} // namespace JediNpcForceAccounting
 
 #ifdef DEBUG_AI_ATTACK
 static void debugLogSelectedAttack(AiAgentImplementation* agent,
@@ -678,13 +728,11 @@ void AiAgentImplementation::doForceRegen() {
         return;
     }
 
-    int regenAmount = 10;
-
-    int skillRegen = (int)getSkillMod("jedi_force_power_regen");
-
-    if (skillRegen > 0) {
-        regenAmount = skillRegen;
-    }
+	// The NPC force pool has a base 10-point tick. FRS rank values are bonuses
+	// (the source tables explicitly use "+"), just as player robe/rank skillmods
+	// stack. Enhancers add another 15 so their unranked total remains the
+	// established 25 points per tick.
+	int regenAmount = 10 + (int)getSkillMod("jedi_force_power_regen");
 
     int newForce = currentForcePoints + regenAmount;
 
@@ -692,7 +740,8 @@ void AiAgentImplementation::doForceRegen() {
         newForce = maxForcePoints;
     }
 
-    setCurrentForce(newForce);
+	JediNpcForceAccounting::apply(asAiAgent(), "gain", "regeneration",
+		regenAmount, newForce);
 
     Locker eventLocker(&forceRegenerationEventMutex);
 
@@ -925,9 +974,10 @@ void AiAgentImplementation::initializeJediArchetype() {
     } else if (archetype == "enhancer") {
         jediArchetype = JEDI_ARCHETYPE_ENHANCER;
 
-        // Enhancers refill force ~2.5x faster (doForceRegen reads this mod);
-        // their whole kit runs on force.
-        applyArchetypeMod("jedi_force_power_regen", 25);
+		// NPCs regenerate a base 10 force per tick. This +15 archetype bonus
+		// preserves the established 25-point unranked enhancer total; ranked
+		// bonuses are added separately below.
+		applyArchetypeMod("jedi_force_power_regen", 15);
 
         // Owner decision: the Force Resist lines are assumed always active at
         // no force cost - baked as permanent mods matching the player buff
@@ -978,23 +1028,7 @@ void AiAgentImplementation::initializeJediArchetype() {
 	if (rankedJediEnabled &&
 			npcTemplate->getFrsRankMin() >= 0 &&
 			npcTemplate->getFrsCouncil() > 0) {
-        // Per-rank FRS skillmods derived from the owner's authoritative
-        // ability tables (docs/frs-rank-values-{light,dark}.txt) inverted
-        // through the live formulas (getFrsModifiedBuffValue /
-        // getFrsModifiedExtraForceCost). The light and dark tables carry
-        // IDENTICAL values — only the tier titles differ — so both councils
-        // share one control ladder (verified: rank 11 FA2 = 45 + 120*0.35 =
-        // 87% at 30% - 80*0.003 = 6% per hit, exactly the table).
-        static const int controlByRank[12] =
-            { 5, 10, 15, 20, 25, 35, 45, 55, 70, 85, 100, 120 };
-        static const int manipulationByRank[12] =
-            { 5, 8, 12, 16, 20, 25, 30, 35, 45, 55, 65, 80 };
-        static const int maxForceByRank[12] =
-            { 90, 160, 230, 300, 370, 500, 650, 800, 1050, 1300, 1600, 1950 };
-        static const int regenByRank[12] =
-            { 1, 2, 3, 4, 5, 6, 8, 9, 12, 14, 17, 20 };
-
-        int rankMin = npcTemplate->getFrsRankMin();
+		int rankMin = npcTemplate->getFrsRankMin();
         int rankMax = npcTemplate->getFrsRankMax();
 
         if (rankMin < 0)
@@ -1016,6 +1050,11 @@ void AiAgentImplementation::initializeJediArchetype() {
 
 		if (lightCouncil || darkCouncil) {
 			const String side = lightCouncil ? String("light") : String("dark");
+			const int control = JediFrsNpcData::getControl(lightCouncil, rank);
+			const int power = JediFrsNpcData::getPower(lightCouncil, rank);
+			const int manipulation = JediFrsNpcData::getManipulation(rank);
+			const int maxForceBonus = JediFrsNpcData::getMaxForceBonus(lightCouncil, rank);
+			const int regenBonus = JediFrsNpcData::getRegenBonus(rank);
 
 			frsRank = rank;
 			frsCouncil = council;
@@ -1028,17 +1067,44 @@ void AiAgentImplementation::initializeJediArchetype() {
 				<< " council=" << side
 				<< " rank=" << rank;
 
-            addSkillMod(SkillModManager::TEMPLATE,
-                "force_control_" + side, controlByRank[rank], false);
-            addSkillMod(SkillModManager::TEMPLATE,
-                "force_manipulation_" + side, manipulationByRank[rank], false);
-            addSkillMod(SkillModManager::TEMPLATE,
-                "jedi_force_power_max", maxForceByRank[rank], false);
-            // addSkillMod ACCUMULATES — pass only the rank bonus, or an
-            // enhancer's baked +25 regen gets double-counted (observed live:
-            // enhancer knights showed 51 = 25 + (25+1) instead of 26).
-            addSkillMod(SkillModManager::TEMPLATE,
-                "jedi_force_power_regen", regenByRank[rank], false);
+			addSkillMod(SkillModManager::TEMPLATE,
+				"force_control_" + side, control, false);
+			addSkillMod(SkillModManager::TEMPLATE,
+				"force_power_" + side, power, false);
+			addSkillMod(SkillModManager::TEMPLATE,
+				"force_manipulation_" + side, manipulation, false);
+			addSkillMod(SkillModManager::TEMPLATE,
+				"jedi_force_power_max", maxForceBonus, false);
+			// addSkillMod ACCUMULATES — pass only the rank bonus, or an
+			// enhancer's archetype bonus gets double-counted.
+			addSkillMod(SkillModManager::TEMPLATE,
+				"jedi_force_power_regen", regenBonus, false);
+
+			// The rank max-force value is a bonus, not dashboard-only metadata.
+			// Ranked NPCs spawn full, matching the base pool initialization.
+			const int rankedMaxForce = getMaxForce() + maxForceBonus;
+			int rankedCurrentForce = getCurrentForce() + maxForceBonus;
+
+			if (rankedCurrentForce > rankedMaxForce)
+				rankedCurrentForce = rankedMaxForce;
+
+			setMaxForce(rankedMaxForce);
+			JediNpcForceAccounting::apply(asAiAgent(), "initialize",
+				"frs_rank_bonus", maxForceBonus, rankedCurrentForce);
+
+			// Enhancer resists are permanent spawn mods rather than command
+			// buffs, so apply the same control-derived FRS bonus explicitly.
+			if (jediArchetype == JEDI_ARCHETYPE_ENHANCER) {
+				const int resistBonus = JediFrsNpcData::getRoundedControlBonus(control, 35);
+
+				addSkillMod(SkillModManager::TEMPLATE, "combat_bleeding_defense", resistBonus, false);
+				addSkillMod(SkillModManager::TEMPLATE, "absorption_bleeding", resistBonus, false);
+				addSkillMod(SkillModManager::TEMPLATE, "resistance_disease", resistBonus, false);
+				addSkillMod(SkillModManager::TEMPLATE, "absorption_disease", resistBonus, false);
+				addSkillMod(SkillModManager::TEMPLATE, "resistance_poison", resistBonus, false);
+				addSkillMod(SkillModManager::TEMPLATE, "absorption_poison", resistBonus, false);
+				addSkillMod(SkillModManager::TEMPLATE, "resistance_states", resistBonus, false);
+			}
 
 			randomizeRankedJediAppearance(this, baseMobileTemplate,
 				npcTemplate->getTemplateName(), side, rank);
@@ -1210,7 +1276,10 @@ void AiAgentImplementation::initializeJediArchetype() {
 			<< " council=" << npcTemplate->getFrsCouncil();
 	}
 
-    debug() << "initializeJediArchetype: rolled " << archetype;
+	JediNpcForceAccounting::record(asAiAgent(), "snapshot", "spawn_ready", 0,
+		getCurrentForce(), getCurrentForce());
+
+	debug() << "initializeJediArchetype: rolled " << archetype;
 }
 
 // P.7.5: direct self heal-states, mirroring HealStatesSelfCommand exactly
@@ -1239,7 +1308,8 @@ static bool jediClearSelfStates(AiAgentImplementation* agent) {
     }
 
     if (healed > 0) {
-        agent->setCurrentForce(curForce - cost);
+		JediNpcForceAccounting::apply(agent->asAiAgent(), "spend",
+			"heal_states_self", -cost, curForce - cost);
         agent->playEffect("clienteffect/pl_force_heal_self.cef", "");
     }
 
@@ -1335,7 +1405,6 @@ void AiAgentImplementation::runJediForceManagement() {
     }
 
     // Snapshot the current opponent for the anti-force-user tools.
-    bool targetIsForceUser = false;
     bool targetHasForce = false;
     uint64 targetID = 0;
 
@@ -1352,14 +1421,12 @@ void AiAgentImplementation::runJediForceManagement() {
 
                 if (targetAgent != nullptr && (targetAgent->getJediArchetype() != JEDI_ARCHETYPE_NONE
                         || targetAgent->getHealerType().toLowerCase().hashCode() == STRING_HASHCODE("force"))) {
-                    targetIsForceUser = true;
                     targetHasForce = targetAgent->getCurrentForce() > 0;
                 }
             } else if (targetCreo->isPlayerCreature()) {
                 PlayerObject* targetGhost = targetCreo->getPlayerObject();
 
                 if (targetGhost != nullptr && targetGhost->getForcePowerMax() > 0) {
-                    targetIsForceUser = true;
                     targetHasForce = targetGhost->getForcePower() > 0;
                 }
             }
@@ -1380,6 +1447,7 @@ void AiAgentImplementation::runJediForceManagement() {
     bool combatCommand = false; // true = attack-type action, keep on the combat queue
     String perPowerKey;
     uint64 perPowerCooldownMs = 0;
+    bool recentForceThreat = !cooldownTimerMap->isPast("jedi_force_threat");
 
     if (jediArchetype == JEDI_ARCHETYPE_DEFENDER) {
         if (healthPct < 35 && curForce >= 1000 && cooldownTimerMap->isPast("jedi_avoid_incap")) {
@@ -1400,15 +1468,21 @@ void AiAgentImplementation::runJediForceManagement() {
             castCRC = STRING_HASHCODE("forcearmor2");
         } else if (!hasArmor && curForce >= 150 + FORCE_FLOOR) {
             castCRC = STRING_HASHCODE("forcearmor2");
-        } else if (targetIsForceUser && !hasBuff(BuffCRC::JEDI_FORCE_SHIELD_2)
+        } else if (recentForceThreat && !hasBuff(BuffCRC::JEDI_FORCE_SHIELD_2)
                 && curForce >= 150 + FORCE_FLOOR) {
             castCRC = STRING_HASHCODE("forceshield2");
-        } else if (targetIsForceUser && !hasBuff(BuffCRC::JEDI_FORCE_FEEDBACK_2)
-                && curForce >= 100 + FORCE_FLOOR) {
+        } else if (recentForceThreat && !hasBuff(BuffCRC::JEDI_FORCE_FEEDBACK_2)
+                && curForce >= 100 + FORCE_FLOOR
+                && cooldownTimerMap->isPast("jedi_force_feedback")) {
             castCRC = STRING_HASHCODE("forcefeedback2");
-        } else if (targetIsForceUser && !hasBuff(BuffCRC::JEDI_FORCE_ABSORB_2)
-                && curForce >= 100 + FORCE_FLOOR) {
+            perPowerKey = "jedi_force_feedback";
+            perPowerCooldownMs = JediFrsNpcData::FORCE_FEEDBACK_RECAST_MS;
+        } else if (recentForceThreat && !hasBuff(BuffCRC::JEDI_FORCE_ABSORB_2)
+                && curForce >= 100 + FORCE_FLOOR
+                && cooldownTimerMap->isPast("jedi_force_absorb")) {
             castCRC = STRING_HASHCODE("forceabsorb2");
+            perPowerKey = "jedi_force_absorb";
+            perPowerCooldownMs = JediFrsNpcData::FORCE_ABSORB_RECAST_MS;
         } else if (targetHasForce && curForce >= 50 && curForce < (getMaxForce() * 2) / 5
                 && cooldownTimerMap->isPast("jedi_drain_force")) {
             // Low on force against another force user: drain them.
@@ -1913,6 +1987,20 @@ WeaponObject* AiAgentImplementation::createWeapon(uint32 templateCRC, bool prima
 		newWeapon->setAttackSpeed(weaponSpeed);
 	} else if (petDeed != nullptr) {
 		newWeapon->setAttackSpeed(petDeed->getAttackSpeed());
+	}
+
+	if (newWeapon->isJediWeapon() && npcTemplate != nullptr &&
+			!npcTemplate->getJediArchetype().isEmpty()) {
+		float templateForceCost = newWeapon->getForceCost();
+		newWeapon->setForceCost(JediFrsNpcData::getNpcSaberForceCost());
+
+		Logger::console.info(true)
+			<< "[JediForceAccounting] event=saber_cost_tuned"
+			<< " agent=" << getObjectID()
+			<< " template=" << npcTemplate->getTemplateName()
+			<< " weapon=" << newWeapon->getObjectID()
+			<< " templateForceCost=" << templateForceCost
+			<< " npcForceCost=" << newWeapon->getForceCost();
 	}
 
 	int lightsaberColor = npcTemplate->getLightsaberColor();
@@ -2712,6 +2800,57 @@ bool AiAgentImplementation::isFitsWeaponType(String& cmd, WeaponObject* weapon) 
     return true;
 }
 
+static bool canAffordAttackCommand(AiAgent* agent, const String& commandName) {
+	if (agent == nullptr || commandName.isEmpty())
+		return false;
+
+	ZoneServer* zoneServer = agent->getZoneServer();
+
+	if (zoneServer == nullptr)
+		return true;
+
+	ObjectController* objectController = zoneServer->getObjectController();
+
+	if (objectController == nullptr)
+		return true;
+
+	const QueueCommand* queueCommand =
+		objectController->getQueueCommand(commandName.hashCode());
+
+	if (queueCommand == nullptr)
+		return true;
+
+	float predictedCost = 0;
+	bool requiresForceAboveCost = false;
+
+	const ForcePowersQueueCommand* forcePower =
+		dynamic_cast<const ForcePowersQueueCommand*>(queueCommand);
+
+	if (forcePower != nullptr) {
+		predictedCost = forcePower->getFrsModifiedForceCost(agent);
+	} else {
+		const JediQueueCommand* jediCommand =
+			dynamic_cast<const JediQueueCommand*>(queueCommand);
+
+		if (jediCommand != nullptr) {
+			predictedCost = jediCommand->getFrsModifiedForceCost(agent);
+		} else {
+			const CombatQueueCommand* combatCommand =
+				dynamic_cast<const CombatQueueCommand*>(queueCommand);
+			ManagedReference<WeaponObject*> weapon = agent->getWeapon();
+
+			if (combatCommand != nullptr && weapon != nullptr) {
+				predictedCost = weapon->getForceCost() *
+					combatCommand->getForceCostMultiplier();
+				requiresForceAboveCost = predictedCost > 0;
+			}
+		}
+	}
+
+	return JediFrsNpcData::canAffordAttackCost(agent->getCurrentForce(),
+		predictedCost, requiresForceAboveCost);
+}
+
 bool AiAgentImplementation::selectSpecialAttack() {
     // --- Thrown weapons handling (unchanged) ---
     if (System::random(100) > 95) {
@@ -2846,54 +2985,13 @@ bool AiAgentImplementation::selectSpecialAttack() {
     int bestIdx   = -1;
     int bestScore = -9999;
     
-    // Prepare for Force Checks
-    ZoneServer* zoneServer = getZoneServer();
-
     for (int i = 0; i < attackMap->size(); ++i) {
         String key = attackMap->getCommand(i);
         if (key.isEmpty())
             continue;
 
-        // =================================================================
-        // [AI FORCE CHECK] - Can I afford this?
-        // =================================================================
-        if (zoneServer != nullptr) {
-            ObjectController* objectController = zoneServer->getObjectController();
-            
-            if (objectController != nullptr) {
-                // Look up the command using ObjectController
-                const QueueCommand* qCmd = objectController->getQueueCommand(key.hashCode());
-                
-                if (qCmd != nullptr) {
-                    int predictedCost = 0;
-
-                    // 1. Check if it's a Force Power (Lightning, etc.)
-                    const ForcePowersQueueCommand* fpCmd = dynamic_cast<const ForcePowersQueueCommand*>(qCmd);
-                    if (fpCmd != nullptr) {
-                        predictedCost = fpCmd->getForceCost();
-                    }
-                    else {
-                        // 2. Check if it's a Buff/Spell
-                        const JediQueueCommand* jCmd = dynamic_cast<const JediQueueCommand*>(qCmd);
-                        if (jCmd != nullptr) {
-                             predictedCost = jCmd->getForceCost();
-                        }
-                    }
-
-                    // 3. Fallback for Sabers/Powers with 0 cost in template
-                    if (predictedCost <= 0 && (key.contains("force") || key.contains("saber"))) {
-                        predictedCost = 50; 
-                    }
-
-                    // 4. THE WALLET CHECK
-                    // If I have less Force than this costs, I cannot use it.
-                    if (predictedCost > 0 && getCurrentForce() < predictedCost) {
-                        continue; // Skip to next ability in the loop
-                    }
-                }
-            }
-        }
-        // =================================================================
+        if (!canAffordAttackCommand(asAiAgent(), key))
+            continue;
 
         String lower = key.toLowerCase();
         int score    = 0;
@@ -3090,11 +3188,10 @@ bool AiAgentImplementation::selectSpecialAttack() {
     // Fallback
     if (bestIdx == -1) {
 #ifdef DEBUG_AI_ATTACK
-        info(true) << "AI_ATTACK: selectSpecialAttack - no bestIdx, falling back to random for "
+        info(true) << "AI_ATTACK: selectSpecialAttack - no affordable attack, falling back to default for "
                    << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
-        int randomIdx = attackMap->getRandomAttackNumber();
-        return selectSpecialAttack(randomIdx);
+        return selectDefaultAttack();
     }
 
 #ifdef DEBUG_AI_ATTACK
@@ -3206,8 +3303,12 @@ bool AiAgentImplementation::selectDefaultAttack() {
         cmd = npcTemplate->getDefaultAttack();
     }
 
+    if (!cmd.isEmpty() && !canAffordAttackCommand(asAiAgent(), cmd))
+        cmd = "";
+
     bool treatAsUnset = cmd.isEmpty()
         || cmd.hashCode() == STRING_HASHCODE("defaultattack");
+
 
     if (treatAsUnset) {
         cmd = "";
@@ -3237,6 +3338,9 @@ bool AiAgentImplementation::selectDefaultAttack() {
             for (int i = 0; i < currentMap->size(); ++i) {
                 String key   = currentMap->getCommand(i);
                 String lower = key.toLowerCase();
+
+				if (!canAffordAttackCommand(asAiAgent(), key))
+					continue;
 
                 // THE ONLY FILTER THAT MATTERS: Does it fit the weapon?
                 if (!isFitsWeaponType(lower, weapon)) {
@@ -3962,8 +4066,10 @@ if (healerType == STRING_HASHCODE("force")) {
         // --- LOGGING END ---
 
         // Deduct the Force
-        int newForce = getCurrentForce() - forceCost;
-        setCurrentForce(newForce < 0 ? 0 : newForce); 
+        int currentForce = getCurrentForce();
+        int newForce = currentForce - forceCost;
+        JediNpcForceAccounting::apply(asAiAgent(), "spend", "force_heal",
+            -forceCost, newForce);
 
         // Optional: Confirm new total
         //info("AI Force remaining: " + String::valueOf(newForce), true);
