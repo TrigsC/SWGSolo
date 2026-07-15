@@ -645,6 +645,28 @@ void SimPvPController::interruptForConvergence() {
 	task->schedule(1000);
 }
 
+void SimPvPController::interruptForBreakOff() {
+	if (agent == nullptr)
+		return;
+
+	// Already heading out - boarding will consume the pending destination.
+	if (phase == PVP_TO_SHUTTLE || phase == PVP_AWAITING_SHUTTLE)
+		return;
+
+	Logger::console.info("SimPvpLeader squad=" + String::valueOf(squadId) +
+		" interruptForBreakOff from=" + getPvpPhaseName(), true);
+
+	haltAgentMovement("breakOff");
+	prepareForRelocation("breakOff");
+	enterToShuttle("breakOff");
+
+	// prepareForRelocation() killed the old tick chain. Keep one alive when the
+	// interrupted move was deferred by combat and had no path callback to do it.
+	Reference<ArrivalCheckTask*> task =
+		new ArrivalCheckTask(this, getWorkLoopGeneration());
+	task->schedule(1000);
+}
+
 String SimPvPController::getPvpPhaseName() const {
 	switch (phase) {
 	case PVP_FORMING:

@@ -971,10 +971,15 @@
             ${metric("Tactical Arrivals", routed.tacticalArrivalsTotal, { tone: "accent" })}
             ${metric("Plan Fallbacks", routed.fallbacksTotal, { tone: Number(routed.fallbacksTotal || 0) ? "warn" : "" })}
             ${metric("Collector Fallbacks", routed.collectorFallbacksTotal, { tone: Number(routed.collectorFallbacksTotal || 0) ? "warn" : "" })}
+            ${metric("Break-offs", routed.breakOffsTotal, { tone: Number(routed.breakOffsTotal || 0) ? "warn" : "" })}
           </div>
           <div class="section-gap"></div>
           ${kvRows([
             ["Collector cache", `${num(routed.collectorCacheResolvedCount)} resolved · ${num(routed.collectorCacheFallbackCount)} pad-fallback`],
+            ["City hangouts", (routed.cityLocations || []).length
+              ? ["manual", "cantina", "fallback"].map((k) =>
+                  `${(routed.cityLocations || []).filter((c) => String(c.hangoutSource) === k).length} ${k}`).join(" · ")
+              : "not resolved yet"],
             ["Staging", `${esc(labelize(routed.stagingRebel || "?"))} (rebel) · ${esc(labelize(routed.stagingImperial || "?"))} (imperial)`],
             ["Orphan sweep", `${num(routed.orphanBotsLastSweep)} last · ${num(routed.orphanBotsDetectedTotal)} total`],
             ["En route", squads.filter((s) => s.routeDest).map((s) =>

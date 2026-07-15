@@ -5282,6 +5282,10 @@ void SimPlayerManager::loadLuaConfig() {
 
     allShuttleports.removeAll();
     spawnGroups.removeAll();
+    {
+        Locker squadLock(&pvpSquadMutex);
+        pvpCityLocationsCache.removeAll();
+    }
     // P.6.1 SimPvP defaults (all off/conservative; lua pvpConfig overrides).
     pvpEnabled = false;
     pvpSquadsPerFaction = 1;
@@ -5296,6 +5300,10 @@ void SimPlayerManager::loadLuaConfig() {
     pvpMaintenanceIntervalSeconds = 30;
     pvpShuttleWaitIntervalSeconds = 5;
     pvpShuttleWaitMaxAttempts = 24;
+    pvpBreakOffEnabled = false;
+    pvpBreakOffDeaths = 2;
+    pvpBreakOffWindowSeconds = 120;
+    pvpAvoidCitySeconds = 600;
     pvpCorpseCleanupDelaySeconds = 60;
     pvpRecoveryEnabled = true;
     pvpRecoveryDryRun = true;
@@ -6125,6 +6133,11 @@ void SimPlayerManager::loadLuaConfig() {
                             // P.6.5a: exact PlanetTravelPoint name of the
                             // city's starport (empty = not routed-travel able).
                             loc.starportPoint = city.getStringField("starport");
+                            // P.6.5d: exact intra-planet shuttleport and the
+                            // opt-in manual hangout override.
+                            loc.shuttlePoint = city.getStringField("shuttlePoint");
+                            loc.hangoutManual = city.getBooleanField(
+                                "hangoutManual", false);
                             allShuttleports.add(loc);
                         }
                     }
@@ -6329,6 +6342,8 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
             }
 
             ShuttleportLocation loc = allShuttleports.get(bestCity);
+            PvpCityLocations cityLocations;
+            resolvePvpCityLocations(loc, cityLocations);
 
             static const uint32 imperialHash = String("imperial").hashCode();
             static const uint32 rebelHash = String("rebel").hashCode();
@@ -6361,9 +6376,16 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
                 squad.leaderOid = oid;
                 squad.planet = loc.planet;
                 squad.city = loc.name;
-                squad.shuttlePos = loc.spawn;
-                squad.hangoutPos = loc.hangout;
+                squad.shuttlePos = cityLocations.shuttlePad;
+                squad.hangoutPos = cityLocations.hangout;
                 squad.formedAtMs = System::getMiliTime();
+                // P.6.5d: the solo toggle path is also a spawn site.
+                squad.recentDeathCount = 0;
+                squad.recentDeathWindowStartMs = squad.formedAtMs;
+                squad.breakOffPending = false;
+                squad.avoidPlanet = "";
+                squad.avoidCity = "";
+                squad.avoidExpiresAtMs = 0;
                 pvpSquads.add(squad);
             }
 
@@ -6372,7 +6394,8 @@ void SimPlayerManager::toggleBot(AiAgent* agent) {
 
             controllers.put(oid, ctrl);
             agent->activateAiBehavior(true);
-            pvp->beginCityLoop(loc.planet, loc.name, loc.spawn, loc.hangout);
+            pvp->beginCityLoop(loc.planet, loc.name,
+                cityLocations.shuttlePad, cityLocations.hangout);
 
             info("toggleBot: started PvP solo squad " + String::valueOf(squadId) +
                  " at " + loc.planet + ":" + loc.name +
@@ -9152,6 +9175,12 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     }
     result["planetDispatch"] = planetDispatch;
 
+    // P.6.5d: the dashboard is a PEEK-ONLY consumer of the city-location
+    // cache. Resolving here would let a poll that races the ~40-50s boot
+    // (zones/navmeshes not loaded yet) pin permanent fallback entries for
+    // the whole session; the maintenance task warms the cache once the
+    // server is online instead.
+
     // P.6.1 SimPvP squads: persistent faction squads running starport loops.
     JSONSerializationType pvpActivity = JSONSerializationType::object();
     pvpActivity["enabled"] = pvpEnabled;
@@ -9175,6 +9204,7 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         pvpActivity["promotionsTotal"] = pvpPromotionsTotal;
         pvpActivity["squadReformsTotal"] = pvpSquadReformsTotal;
         pvpActivity["boardAnywayTotal"] = pvpBoardAnywayTotal;
+        pvpActivity["breakOffsTotal"] = pvpBreakOffsTotal;
 
         // P.6.2 scouts + gank convergence.
         JSONSerializationType scoutsJson = JSONSerializationType::object();
@@ -9403,6 +9433,68 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         routedJson["minDepartureNoticeSeconds"] = pvpMinDepartureNoticeSeconds;
         routedJson["collectorScanRadiusMeters"] = pvpCollectorScanRadiusMeters;
         routedJson["collectorZSanityMeters"] = pvpCollectorZSanityMeters;
+        routedJson["useCantinaHangouts"] = pvpUseCantinaHangouts;
+        routedJson["cantinaScanRadiusMeters"] = pvpCantinaScanRadiusMeters;
+        routedJson["breakOffsTotal"] = pvpBreakOffsTotal;
+
+        JSONSerializationType cohesionJson = JSONSerializationType::object();
+        cohesionJson["breakOff"] = pvpBreakOffEnabled;
+        cohesionJson["breakOffDeaths"] = pvpBreakOffDeaths;
+        cohesionJson["breakOffWindowSeconds"] = pvpBreakOffWindowSeconds;
+        cohesionJson["avoidCitySeconds"] = pvpAvoidCitySeconds;
+        cohesionJson["breakOffsTotal"] = pvpBreakOffsTotal;
+        routedJson["cohesion"] = cohesionJson;
+
+        int cityShuttlePadsResolved = 0;
+        int cityHangoutsManual = 0;
+        int cityHangoutsCantina = 0;
+        int cityHangoutsFallback = 0;
+        JSONSerializationType cityLocationRows = JSONSerializationType::array();
+
+        for (int i = 0; i < allShuttleports.size(); ++i) {
+            const ShuttleportLocation& location = allShuttleports.get(i);
+            String cacheKey = location.planet + ":" + location.name;
+
+            if (!pvpCityLocationsCache.contains(cacheKey))
+                continue;
+
+            const PvpCityLocations& city = pvpCityLocationsCache.get(cacheKey);
+            if (city.shuttlePadResolved)
+                cityShuttlePadsResolved++;
+
+            String hangoutSource = "fallback";
+            if (city.hangoutSource == PvpCityLocations::HANGOUT_MANUAL) {
+                hangoutSource = "manual";
+                cityHangoutsManual++;
+            } else if (city.hangoutSource == PvpCityLocations::HANGOUT_CANTINA) {
+                hangoutSource = "cantina";
+                cityHangoutsCantina++;
+            } else {
+                cityHangoutsFallback++;
+            }
+
+            JSONSerializationType row = JSONSerializationType::object();
+            row["planet"] = location.planet;
+            row["city"] = location.name;
+            row["shuttlePoint"] = location.shuttlePoint;
+            row["shuttlePadResolved"] = city.shuttlePadResolved;
+            row["shuttlePadX"] = city.shuttlePad.getX();
+            row["shuttlePadY"] = city.shuttlePad.getY();
+            row["shuttlePadZ"] = city.shuttlePad.getZ();
+            row["hangoutManual"] = location.hangoutManual;
+            row["hangoutSource"] = hangoutSource;
+            row["hangoutPathNodes"] = city.hangoutPathNodes;
+            row["hangoutX"] = city.hangout.getX();
+            row["hangoutY"] = city.hangout.getY();
+            row["hangoutZ"] = city.hangout.getZ();
+            cityLocationRows.push_back(row);
+        }
+
+        routedJson["cityShuttlePadsResolved"] = cityShuttlePadsResolved;
+        routedJson["cityHangoutsManual"] = cityHangoutsManual;
+        routedJson["cityHangoutsCantina"] = cityHangoutsCantina;
+        routedJson["cityHangoutsFallback"] = cityHangoutsFallback;
+        routedJson["cityLocations"] = cityLocationRows;
 
         int collectorCacheResolved = 0;
         int collectorCacheFallbacks = 0;
@@ -9492,6 +9584,14 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
             row["desiredSize"] = squad.desiredSize;
             row["pendingReplacements"] = squad.pendingReplacements;
             row["deaths"] = squad.deaths;
+            row["recentDeathCount"] = squad.recentDeathCount;
+            row["recentDeathWindowStartMs"] = squad.recentDeathWindowStartMs;
+            row["breakOffPending"] = squad.breakOffPending;
+            row["avoidPlanet"] = squad.avoidPlanet;
+            row["avoidCity"] = squad.avoidCity;
+            row["avoidCityExpiresAtMs"] = squad.avoidExpiresAtMs;
+            row["avoidCityExpiresInSeconds"] = squad.avoidExpiresAtMs > nowMs ?
+                (squad.avoidExpiresAtMs - nowMs) / 1000 : 0;
             row["travels"] = squad.travels;
             row["engagements"] = squad.engagements;
             row["reforming"] = squad.reforming;
@@ -21305,6 +21405,21 @@ void SimPlayerManager::applyPvpConfig(LuaObject& pvpConfig) {
     }
     recovery.pop();
 
+    // P.6.5d break-off cohesion.
+    LuaObject cohesion = pvpConfig.getObjectField("cohesion");
+    if (cohesion.isValidTable()) {
+        pvpBreakOffEnabled = cohesion.getBooleanField(
+            "breakOff", pvpBreakOffEnabled);
+        pvpBreakOffDeaths = clampMinerInt(
+            cohesion.getIntField("breakOffDeaths"), pvpBreakOffDeaths, 1, 20);
+        pvpBreakOffWindowSeconds = clampMinerInt(
+            cohesion.getIntField("breakOffWindowSeconds"),
+            pvpBreakOffWindowSeconds, 1, 3600);
+        pvpAvoidCitySeconds = clampMinerInt(
+            cohesion.getIntField("avoidCitySeconds"), pvpAvoidCitySeconds, 0, 7200);
+    }
+    cohesion.pop();
+
     // P.6.2 scouts + gank convergence.
     LuaObject scouts = pvpConfig.getObjectField("scouts");
     if (scouts.isValidTable()) {
@@ -21426,6 +21541,14 @@ void SimPlayerManager::applyPvpConfig(LuaObject& pvpConfig) {
             "avoidHotArrival", pvpAvoidHotArrival);
         pvpBoardOnActualShuttle = travel.getBooleanField(
             "boardOnActualShuttle", pvpBoardOnActualShuttle);
+        bool previousUseCantinaHangouts = pvpUseCantinaHangouts;
+        float previousCantinaScanRadius = pvpCantinaScanRadiusMeters;
+        pvpUseCantinaHangouts = travel.getBooleanField(
+            "useCantinaHangouts", pvpUseCantinaHangouts);
+        float cantinaScanRadius = travel.getFloatField(
+            "cantinaScanRadiusMeters");
+        if (cantinaScanRadius >= 32.f && cantinaScanRadius <= 2048.f)
+            pvpCantinaScanRadiusMeters = cantinaScanRadius;
         pvpMinDepartureNoticeSeconds = clampMinerInt(
             travel.getIntField("minDepartureNoticeSeconds"),
             pvpMinDepartureNoticeSeconds, 0, 90);
@@ -21450,6 +21573,15 @@ void SimPlayerManager::applyPvpConfig(LuaObject& pvpConfig) {
                 previousZSanity != pvpCollectorZSanityMeters) {
             Locker squadLock(&pvpSquadMutex);
             pvpBoardingPointCache.removeAll();
+        }
+
+        if (previousUseCantinaHangouts != pvpUseCantinaHangouts ||
+                previousCantinaScanRadius != pvpCantinaScanRadiusMeters) {
+            Locker squadLock(&pvpSquadMutex);
+            pvpCityLocationsCache.removeAll();
+            // Re-arm the maintenance warmup so the cleared cache repopulates
+            // proactively instead of waiting for organic use.
+            pvpCityLocationsWarmedUp = false;
         }
 
         LuaObject mains = travel.getObjectField("mainPlanets");
@@ -21556,6 +21688,194 @@ void SimPlayerManager::runPvpTravelDiagnosticsIfNeeded() {
     }
 
     runPvpTravelDiagnostics();
+}
+
+bool SimPlayerManager::resolvePvpCityLocations(
+        const ShuttleportLocation& location, PvpCityLocations& result) {
+    String cacheKey = location.planet + ":" + location.name;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        if (pvpCityLocationsCache.contains(cacheKey)) {
+            result = pvpCityLocationsCache.get(cacheKey);
+            return result.shuttlePadResolved;
+        }
+    }
+
+    // The world scan deliberately happens outside pvpSquadMutex. This mirrors
+    // the boarding-point resolver: only the immutable result is published under
+    // the squad lock.
+    PvpCityLocations resolved;
+    resolved.shuttlePad = location.spawn;
+    resolved.hangout = location.hangout;
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    Zone* zone = zoneServer == nullptr ? nullptr :
+        zoneServer->getZone(location.planet);
+
+    // Readiness guard: while the server is loading (or the zone is absent),
+    // travel points / world objects / navmeshes may not exist yet. Return the
+    // configured fallback WITHOUT caching so a transient boot-time miss can
+    // never become the city's permanent resolution.
+    if (zoneServer == nullptr || zoneServer->isServerLoading() ||
+            zone == nullptr) {
+        result = resolved;
+        return false;
+    }
+
+    PlanetManager* planetManager = zone->getPlanetManager();
+
+    Reference<PlanetTravelPoint*> shuttlePoint =
+        planetManager == nullptr || location.shuttlePoint.isEmpty() ?
+        nullptr : planetManager->getPlanetTravelPoint(location.shuttlePoint);
+
+    if (shuttlePoint != nullptr) {
+        resolved.shuttlePad = shuttlePoint->getArrivalPosition();
+        resolved.shuttlePadResolved = true;
+    } else if (!location.shuttlePoint.isEmpty()) {
+        info("SimPvpCityLocation shuttlePadResolveFailed city=" +
+            location.planet + ":" + location.name + " point=\"" +
+            location.shuttlePoint + "\" fallback=true", true);
+    }
+
+    if (location.hangoutManual) {
+        resolved.hangoutSource = PvpCityLocations::HANGOUT_MANUAL;
+    } else if (pvpUseCantinaHangouts && zone != nullptr) {
+        // Navmesh readiness probe: mesh build jobs only START after server
+        // loading finishes (NavMeshManager.cpp:91), so !isServerLoading does
+        // NOT imply meshes exist yet. The city shuttle pad is a known
+        // on-mesh spot in every configured city — if IT reports no in-range
+        // navmesh, the city's meshes aren't up: return the fallback WITHOUT
+        // caching so the maintenance warmup retries until they are.
+        SortedVector<ManagedReference<NavArea*> > padAreas;
+        if (zone->getInRangeNavMeshes(resolved.shuttlePad.getX(),
+                resolved.shuttlePad.getY(), &padAreas, false) <= 0) {
+            result = resolved;
+            return false;
+        }
+
+        SortedVector<TreeEntry*> closeObjects;
+        zone->getInRangeObjects(resolved.shuttlePad.getX(), 0,
+            resolved.shuttlePad.getY(), pvpCantinaScanRadiusMeters,
+            &closeObjects, true, true);
+
+        BuildingObject* nearestCantina = nullptr;
+        float nearestDistance = 0.f;
+
+        for (int i = 0; i < closeObjects.size(); ++i) {
+            SceneObject* candidate =
+                static_cast<SceneObject*>(closeObjects.get(i));
+
+            if (candidate == nullptr || !candidate->isBuildingObject())
+                continue;
+
+            BuildingObject* building = candidate->asBuildingObject();
+            if (building == nullptr || building->getObjectTemplate() == nullptr)
+                continue;
+
+            String templatePath = building->getObjectTemplate()->
+                getFullTemplateString().toLowerCase();
+            if (!templatePath.contains("cantina"))
+                continue;
+
+            float distance = building->getWorldPosition().distanceTo2d(
+                resolved.shuttlePad);
+            if (nearestCantina == nullptr || distance < nearestDistance) {
+                nearestCantina = building;
+                nearestDistance = distance;
+            }
+        }
+
+        if (nearestCantina != nullptr) {
+            Vector3 cantinaPosition = nearestCantina->getWorldPosition();
+            float footprintRadius = nearestCantina->getBoundingRadius();
+            float candidateRadius = footprintRadius + 8.f;
+
+            Vector3 towardPad = resolved.shuttlePad - cantinaPosition;
+            towardPad.setZ(0.f);
+            if (towardPad.length2d() > 0.001f)
+                towardPad.normalize();
+            else
+                towardPad = Vector3::UNIT_X;
+
+            Vector<Vector3> candidates;
+            candidates.add(cantinaPosition + towardPad * candidateRadius);
+            candidates.add(cantinaPosition +
+                Vector3(candidateRadius, 0.f, 0.f));
+            candidates.add(cantinaPosition +
+                Vector3(-candidateRadius, 0.f, 0.f));
+            candidates.add(cantinaPosition +
+                Vector3(0.f, candidateRadius, 0.f));
+            candidates.add(cantinaPosition +
+                Vector3(0.f, -candidateRadius, 0.f));
+
+            for (int i = 0; i < candidates.size(); ++i) {
+                Vector3 candidate = candidates.get(i);
+                float terrainZ = zone->getHeight(candidate.getX(), candidate.getY());
+                if (terrainZ != 0.f || candidate.getZ() == 0.f)
+                    candidate.setZ(terrainZ);
+
+                // These are the two validation gates. A non-null findPath result
+                // is intentionally not used as a membership test.
+                SortedVector<ManagedReference<NavArea*> > areas;
+                if (zone->getInRangeNavMeshes(candidate.getX(), candidate.getY(),
+                        &areas, false) <= 0)
+                    continue;
+
+                if (candidate.distanceTo2d(cantinaPosition) < footprintRadius)
+                    continue;
+
+                Vector<WorldCoordinates>* path = nullptr;
+                try {
+                    WorldCoordinates start(resolved.shuttlePad, nullptr);
+                    WorldCoordinates end(candidate, nullptr);
+                    PathFinderManager* pathFinder = PathFinderManager::instance();
+                    if (pathFinder != nullptr)
+                        path = pathFinder->findPath(start, end, zone);
+                } catch (...) {
+                    path = nullptr;
+                }
+
+                if (path != nullptr && path->size() > 0) {
+                    resolved.hangout =
+                        path->get(path->size() - 1).getWorldPosition();
+                    resolved.hangoutSource = PvpCityLocations::HANGOUT_CANTINA;
+                    resolved.hangoutPathNodes = path->size();
+                    delete path;
+                    break;
+                }
+
+                if (path != nullptr)
+                    delete path;
+            }
+        }
+    }
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        // A concurrent resolver may have populated this city while the world
+        // scan was running. Keep the first immutable snapshot.
+        if (pvpCityLocationsCache.contains(cacheKey)) {
+            result = pvpCityLocationsCache.get(cacheKey);
+            return result.shuttlePadResolved;
+        }
+
+        pvpCityLocationsCache.put(cacheKey, resolved);
+    }
+
+    String source = resolved.hangoutSource == PvpCityLocations::HANGOUT_MANUAL ?
+        "manual" : resolved.hangoutSource == PvpCityLocations::HANGOUT_CANTINA ?
+        "cantina" : "fallback";
+    info("SimPvpCityLocation city=" + location.planet + ":" + location.name +
+        " shuttlePadResolved=" + String::valueOf(resolved.shuttlePadResolved) +
+        " hangoutSource=" + source + " hangoutPathNodes=" +
+        String::valueOf(resolved.hangoutPathNodes) + " hangout=(" +
+        String::valueOf(resolved.hangout.getX()) + "," +
+        String::valueOf(resolved.hangout.getY()) + "," +
+        String::valueOf(resolved.hangout.getZ()) + ")", true);
+
+    result = resolved;
+    return resolved.shuttlePadResolved;
 }
 
 bool SimPlayerManager::resolvePvpBoardingPoint(
@@ -22120,16 +22440,15 @@ void SimPlayerManager::spawnPvpSquad(bool imperial, bool scout) {
     if (zone == nullptr)
         return;
 
+    PvpCityLocations cityLocations;
+    resolvePvpCityLocations(loc, cityLocations);
+
     float spawnZ = zone->getHeight(loc.spawn.getX(), loc.spawn.getY());
     if (spawnZ == 0.0f && loc.spawn.getZ() != 0.0f)
         spawnZ = loc.spawn.getZ();
 
-    float hangoutZ = zone->getHeight(loc.hangout.getX(), loc.hangout.getY());
-    if (hangoutZ == 0.0f && loc.hangout.getZ() != 0.0f)
-        hangoutZ = loc.hangout.getZ();
-
     Vector3 spawnPos(loc.spawn.getX(), loc.spawn.getY(), spawnZ);
-    Vector3 hangoutPos(loc.hangout.getX(), loc.hangout.getY(), hangoutZ);
+    Vector3 hangoutPos = cityLocations.hangout;
 
     uint64 squadId = 0;
 
@@ -22155,9 +22474,16 @@ void SimPlayerManager::spawnPvpSquad(bool imperial, bool scout) {
     squad.leaderOid = leaderAgent->getObjectID();
     squad.planet = loc.planet;
     squad.city = loc.name;
-    squad.shuttlePos = spawnPos;
+    squad.shuttlePos = cityLocations.shuttlePad;
     squad.hangoutPos = hangoutPos;
     squad.formedAtMs = System::getMiliTime();
+    // P.6.5d: staging deaths start a fresh rolling cohesion window.
+    squad.recentDeathCount = 0;
+    squad.recentDeathWindowStartMs = squad.formedAtMs;
+    squad.breakOffPending = false;
+    squad.avoidPlanet = "";
+    squad.avoidCity = "";
+    squad.avoidExpiresAtMs = 0;
 
     Reference<SimPvPController*> leaderCtrl =
         new SimPvPController(leaderAgent, squadId, imperial);
@@ -22200,7 +22526,8 @@ void SimPlayerManager::spawnPvpSquad(bool imperial, bool scout) {
 
     controllers.put(squad.leaderOid, leaderCtrl.get());
     leaderAgent->activateAiBehavior(true);
-    leaderCtrl->beginCityLoop(loc.planet, loc.name, spawnPos, hangoutPos);
+    leaderCtrl->beginCityLoop(loc.planet, loc.name,
+        cityLocations.shuttlePad, hangoutPos);
 
     for (int i = 0; i < memberCtrls.size(); ++i) {
         Reference<SimPvPMemberController*> memberCtrl = memberCtrls.get(i);
@@ -22253,6 +22580,13 @@ bool SimPlayerManager::onPvpSquadDepartureIntent(uint64 squadId,
 		planPvpRoute(squadId, snapshot, routeSummary, convergence);
 	}
 
+	PvpCityLocations currentCityLocations;
+	currentCityLocations.shuttlePad = snapshot.shuttlePos;
+	int currentCityIdx = findShuttleportIndex(snapshot.planet, snapshot.city);
+	if (currentCityIdx >= 0)
+		resolvePvpCityLocations(allShuttleports.get(currentCityIdx),
+			currentCityLocations);
+
 	Locker squadLock(&pvpSquadMutex);
 	int idx = findPvpSquadIndex(squadId);
 
@@ -22260,23 +22594,22 @@ bool SimPlayerManager::onPvpSquadDepartureIntent(uint64 squadId,
 		return false;
 
 	const SimPvpSquad& squad = pvpSquads.get(idx);
-	// Default and gated-off behavior is the existing city shuttle pad.
-	target.worldPos = squad.shuttlePos;
-	target.localPos = squad.shuttlePos;
+	// Default and intra-planet behavior is the resolved city shuttle pad.
+	target.worldPos = currentCityLocations.shuttlePad;
+	target.localPos = currentCityLocations.shuttlePad;
 
 	if (!pvpRoutedTravelEnabled || squad.pendingRoute.size() == 0)
 		return true;
 
 	const PvpTravelLeg& leg = squad.pendingRoute.get(0);
-	if (leg.interplanetary && pvpUseCollectorBoarding) {
-		// Collector when resolved, starport pad as the stored fallback -
-		// either way the squad departs from the actual port, never the city
-		// shuttle pad.
-		target.worldPos = leg.departurePos;
-		target.localPos = leg.departureLocalPos;
-		target.cellOid = leg.departureCellOid;
-		target.isCollector = leg.departureIsCollector;
-	}
+	// planPvpRoute stores city-shuttle coordinates for intra-planet legs and
+	// starport/collector coordinates for interplanetary legs. Use the stored
+	// leg target directly so the first leg never falls back to the old
+	// snapshot.shuttlePos shortcut.
+	target.worldPos = leg.departurePos;
+	target.localPos = leg.departureLocalPos;
+	target.cellOid = leg.departureCellOid;
+	target.isCollector = leg.departureIsCollector;
 
 	return true;
 }
@@ -22447,6 +22780,7 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
     //    OUTSIDE the squad mutex (zone / planet-manager lookups only; no
     //    agent locks anywhere in here).
     Vector<Vector3> pads;          // per city: starport arrival position
+    Vector<PvpCityLocations> cityLocations; // per city: shuttle/hangout cache
     Vector<bool> routable;         // has a resolvable starport point
 
     for (int i = 0; i < cityCount; ++i) {
@@ -22475,6 +22809,10 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
         }
 
         pads.add(pad);
+
+        PvpCityLocations resolvedLocations;
+        resolvePvpCityLocations(loc, resolvedLocations);
+        cityLocations.add(resolvedLocations);
         routable.add(ok);
     }
 
@@ -22541,6 +22879,16 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
 
     int destIdx = -1;
     convergenceOut = false;
+    uint64 nowMs = System::getMiliTime();
+    bool avoidActive = squad.avoidExpiresAtMs > nowMs &&
+        !squad.avoidPlanet.isEmpty() && !squad.avoidCity.isEmpty();
+    auto isAvoidedCity = [&](int candidate) {
+        if (!avoidActive)
+            return false;
+
+        const ShuttleportLocation& loc = allShuttleports.get(candidate);
+        return loc.planet == squad.avoidPlanet && loc.name == squad.avoidCity;
+    };
 
     // An unexpired convergence stamp beats the random pick - the squad
     // travels to the reported contact's city. Consumed (cleared) either way.
@@ -22550,7 +22898,7 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
                 squad.convergeCity);
 
             if (convergeIdx >= 0 && convergeIdx != fromIdx &&
-                    routable.get(convergeIdx)) {
+                    routable.get(convergeIdx) && !isAvoidedCity(convergeIdx)) {
                 destIdx = convergeIdx;
                 convergenceOut = true;
             }
@@ -22567,7 +22915,8 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
     for (int tries = 0; destIdx < 0 && tries < 20; ++tries) {
         int candidate = System::random(cityCount - 1);
 
-        if (candidate == fromIdx || !routable.get(candidate))
+        if (candidate == fromIdx || !routable.get(candidate) ||
+                isAvoidedCity(candidate))
             continue;
 
         const ShuttleportLocation& loc = allShuttleports.get(candidate);
@@ -22623,7 +22972,7 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
 
             for (int candidate = 0; candidate < cityCount; ++candidate) {
                 if (candidate == finalDestIdx || candidate == fromIdx ||
-                        !routable.get(candidate))
+                        !routable.get(candidate) || isAvoidedCity(candidate))
                     continue;
 
                 const ShuttleportLocation& alternate =
@@ -22745,16 +23094,17 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
             allShuttleports.get(prevIdx).planet != loc.planet;
         // Shuttles land at the destination city's shuttleport on same-planet
         // legs. Cross-planet legs retain the starport arrival pad.
-        leg.arrivalPos = leg.interplanetary ? pads.get(cityIdx) : loc.spawn;
+        leg.arrivalPos = leg.interplanetary ? pads.get(cityIdx) :
+            cityLocations.get(cityIdx).shuttlePad;
 
         const ShuttleportLocation& departureLoc =
             allShuttleports.get(prevIdx);
-        leg.departurePos = departureLoc.spawn;
-        leg.departureLocalPos = departureLoc.spawn;
-        if (prevIdx == fromIdx) {
-            leg.departurePos = snapshot.shuttlePos;
-            leg.departureLocalPos = snapshot.shuttlePos;
-        }
+        // Intra-planet legs run from the departure city's live shuttle pad.
+        // Interplanetary legs run from the departure starport pad unless the
+        // collector resolver below supplies a more precise target.
+        leg.departurePos = leg.interplanetary ? pads.get(prevIdx) :
+            cityLocations.get(prevIdx).shuttlePad;
+        leg.departureLocalPos = leg.departurePos;
 
         if (leg.interplanetary && pvpUseCollectorBoarding &&
                 !departureLoc.starportPoint.isEmpty()) {
@@ -22966,6 +23316,13 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
     ShuttleportLocation dest;
     bool picked = false;
     bool convergence = false;
+    uint64 avoidNowMs = System::getMiliTime();
+    bool avoidActive = snapshot.avoidExpiresAtMs > avoidNowMs &&
+        !snapshot.avoidPlanet.isEmpty() && !snapshot.avoidCity.isEmpty();
+    auto isAvoidedCity = [&](const ShuttleportLocation& location) {
+        return avoidActive && location.planet == snapshot.avoidPlanet &&
+            location.name == snapshot.avoidCity;
+    };
 
     // P.6.5a routed travel: consume the next planned leg, planning a fresh
     // route first when none is pending (an unexpired convergence stamp is
@@ -23011,16 +23368,9 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
             dest.spawn = leg.arrivalPos;
             dest.hangout = leg.arrivalPos;
 
-            // Final leg: loiter at the destination city's configured hangout;
+            // Final leg: loiter at the destination city's resolved hangout;
             // transit stop: wait at the pad for the connecting ship.
             routedTransit = !leg.finalLeg;
-
-            if (!routedTransit) {
-                int cityIdx = findShuttleportIndex(dest.planet, dest.name);
-
-                if (cityIdx >= 0)
-                    dest.hangout = allShuttleports.get(cityIdx).hangout;
-            }
 
             routedLegActive = true;
             picked = true;
@@ -23049,7 +23399,8 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
                     const ShuttleportLocation& loc = allShuttleports.get(i);
 
                     if (loc.planet == squad.convergePlanet &&
-                            loc.name == squad.convergeCity) {
+                            loc.name == squad.convergeCity &&
+                            !isAvoidedCity(loc)) {
                         dest = loc;
                         picked = true;
                         convergence = true;
@@ -23073,6 +23424,9 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
         }
 
         if (dest.planet == snapshot.planet && dest.name == snapshot.city)
+            continue;
+
+        if (isAvoidedCity(dest))
             continue;
 
         bool occupied = false;
@@ -23110,6 +23464,17 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
         if (!picked && !pickRandomShuttleport(dest)) {
             clearTravelFlag();
             return;
+        }
+    }
+
+    if (!routedTransit) {
+        int cityIdx = findShuttleportIndex(dest.planet, dest.name);
+
+        if (cityIdx >= 0) {
+            PvpCityLocations cityLocations;
+            resolvePvpCityLocations(allShuttleports.get(cityIdx),
+                cityLocations);
+            dest.hangout = cityLocations.hangout;
         }
     }
 
@@ -23273,6 +23638,12 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
             squad.travelTaskActive = false;
             squad.travels++;
             squad.lastTravelMs = System::getMiliTime();
+            // P.6.5d: a city arrival starts a fresh rolling window and
+            // releases the one-shot break-off latch. Keep the avoid stamp so
+            // the next destination pick can steer away from the killzone.
+            squad.recentDeathCount = 0;
+            squad.recentDeathWindowStartMs = squad.lastTravelMs;
+            squad.breakOffPending = false;
             pvpTravelsTotal++;
         }
     }
@@ -23367,12 +23738,107 @@ void SimPlayerManager::onPvpBotDied(uint64 squadId, uint64 oid) {
         }
     }
 
+    checkPvpBreakOff(squadId, wasLeader, countedDeath);
     schedulePvpBotCleanup(oid, pvpCorpseCleanupDelaySeconds);
 
     info("SimPvpBotDied squad=" + String::valueOf(squadId) +
          " oid=" + String::valueOf(oid) +
          " role=" + (wasLeader ? String("leader") : String("member")) +
          " counted=" + String::valueOf(countedDeath), true);
+}
+
+void SimPlayerManager::checkPvpBreakOff(uint64 squadId, bool wasLeader,
+        bool countedDeath) {
+    if (!countedDeath)
+        return;
+
+    uint64 nowMs = System::getMiliTime();
+    bool trigger = false;
+    bool leaderAliveAtTrigger = false;
+    int recentDeathCount = 0;
+    String planet;
+    String city;
+    Reference<SimPlayerController*> leaderRef;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndex(squadId);
+
+        if (idx < 0)
+            return;
+
+        SimPvpSquad& squad = pvpSquads.get(idx);
+        uint64 windowMs = (uint64)pvpBreakOffWindowSeconds * 1000;
+
+        if (squad.recentDeathWindowStartMs == 0 ||
+                nowMs < squad.recentDeathWindowStartMs ||
+                nowMs - squad.recentDeathWindowStartMs > windowMs) {
+            squad.recentDeathCount = 1;
+            squad.recentDeathWindowStartMs = nowMs;
+        } else {
+            squad.recentDeathCount++;
+        }
+
+        recentDeathCount = squad.recentDeathCount;
+
+        if (!pvpBreakOffEnabled ||
+                recentDeathCount < pvpBreakOffDeaths ||
+                squad.breakOffPending)
+            return;
+
+        int leaderPhase = SimPvPController::PVP_FORMING;
+        if (controllers.contains(squad.leaderOid)) {
+            leaderRef = controllers.get(squad.leaderOid);
+            SimPvPController* leaderCtrl = leaderRef == nullptr ? nullptr :
+                dynamic_cast<SimPvPController*>(leaderRef.get());
+
+            if (leaderCtrl == nullptr)
+                return;
+
+            leaderPhase = leaderCtrl->getPvpPhase();
+            ManagedReference<AiAgent*> leaderAgent = leaderCtrl->getAgent();
+            leaderAliveAtTrigger = !wasLeader && leaderAgent != nullptr &&
+                !leaderAgent->isDead();
+        } else {
+            return;
+        }
+
+        if (leaderPhase != SimPvPController::PVP_TO_HANGOUT &&
+                leaderPhase != SimPvPController::PVP_LOITERING &&
+                leaderPhase != SimPvPController::PVP_TO_SHUTTLE)
+            return;
+
+        squad.breakOffPending = true;
+        squad.avoidPlanet = squad.planet;
+        squad.avoidCity = squad.city;
+        squad.avoidExpiresAtMs = nowMs +
+            (uint64)pvpAvoidCitySeconds * 1000;
+        pvpBreakOffsTotal++;
+
+        planet = squad.planet;
+        city = squad.city;
+        trigger = true;
+    }
+
+    if (!trigger)
+        return;
+
+    info("SimPvpSquadBrokeOff squad=" + String::valueOf(squadId) +
+         " city=" + planet + ":" + city +
+         " deaths=" + String::valueOf(recentDeathCount) +
+         " leaderAliveAtTrigger=" + String::valueOf(leaderAliveAtTrigger), true);
+
+    // A threshold death that killed the leader is intentionally silent. The
+    // promotion path announces through the freshly promoted live leader.
+    if (wasLeader || !leaderAliveAtTrigger)
+        return;
+
+    announcePvpEvent(squadId, PVP_ANNOUNCE_RETREAT);
+
+    SimPvPController* leaderCtrl = leaderRef == nullptr ? nullptr :
+        dynamic_cast<SimPvPController*>(leaderRef.get());
+    if (leaderCtrl != nullptr)
+        leaderCtrl->interruptForBreakOff();
 }
 
 void SimPlayerManager::schedulePvpBotCleanup(uint64 oid, int delaySeconds) {
@@ -23506,6 +23972,14 @@ static String pickPvpAnnounceLine(bool imperial, int eventType) {
         "Shuttle's here - time to move.",
         "We're relocating. On me, to the pad.",
         "New hunting ground. Let's ride." };
+    static const char* imperialRetreat[] = {
+        "Fall back to the shuttle! We're pulling out.",
+        "Too hot here - withdraw to the shuttle.",
+        "Break contact. Squad, fall back!" };
+    static const char* rebelRetreat[] = {
+        "Fall back to the shuttle! We're pulling out.",
+        "This spot's burned - withdraw now.",
+        "Break contact. Squad, back to the shuttle!" };
 
     const char** pool = nullptr;
     switch (eventType) {
@@ -23519,6 +23993,8 @@ static String pickPvpAnnounceLine(bool imperial, int eventType) {
         pool = imperial ? imperialConverge : rebelConverge; break;
     case SimPlayerManager::PVP_ANNOUNCE_MOVEOUT:
         pool = imperial ? imperialMoveout : rebelMoveout; break;
+    case SimPlayerManager::PVP_ANNOUNCE_RETREAT:
+        pool = imperial ? imperialRetreat : rebelRetreat; break;
     default:
         return "";
     }
@@ -23540,8 +24016,11 @@ void SimPlayerManager::announcePvpEvent(uint64 squadId, int eventType,
 
     // P.6.5a: the route callout must not be swallowed by the DEPARTURE shout
     // fired seconds earlier at the hangout - it carries the destination info
-    // players need to follow. The global anti-spam gap still applies.
-    bool bypassSquadCooldown = eventType == PVP_ANNOUNCE_MOVEOUT;
+    // players need to follow. RETREAT is an urgent, latched callout and
+    // bypasses both anti-spam gaps; MOVEOUT retains the older global gap.
+    bool bypassSquadCooldown = eventType == PVP_ANNOUNCE_MOVEOUT ||
+        eventType == PVP_ANNOUNCE_RETREAT;
+    bool bypassGlobalGap = eventType == PVP_ANNOUNCE_RETREAT;
 
     // Cooldown gate under the mutex; stamp the timestamps so a burst of
     // member engagements produces at most one leader shout.
@@ -23560,7 +24039,8 @@ void SimPlayerManager::announcePvpEvent(uint64 squadId, int eventType,
                     (uint64)pvpCommsAnnounceCooldownSeconds * 1000)
             return;
 
-        if (pvpLastGlobalAnnounceMs > 0 && pvpLastGlobalAnnounceMs <= nowMs &&
+        if (!bypassGlobalGap && pvpLastGlobalAnnounceMs > 0 &&
+                pvpLastGlobalAnnounceMs <= nowMs &&
                 nowMs - pvpLastGlobalAnnounceMs <
                     (uint64)pvpCommsGlobalMinGapSeconds * 1000)
             return;
@@ -23626,6 +24106,9 @@ void SimPlayerManager::announcePvpEvent(uint64 squadId, int eventType,
         case PVP_ANNOUNCE_MOVEOUT:
             roomLine = "Departing " + where +
                 (detail.isEmpty() ? String(".") : String(" - ") + detail);
+            break;
+        case PVP_ANNOUNCE_RETREAT:
+            roomLine = "Breaking off at " + where + " - fall back to the shuttle!";
             break;
         default:
             break;
@@ -24675,6 +25158,34 @@ void SimPlayerManager::runPvpMaintenanceTask() {
     if (allShuttleports.size() == 0)
         return;
 
+    // P.6.5d: single retryable warmup for the city-location cache (the
+    // dashboard is peek-only; this is the only proactive resolver). The
+    // resolver refuses to cache while the server is loading OR while the
+    // city's navmeshes aren't up yet, so this keeps retrying each tick
+    // until every configured city has a published entry. A config refresh
+    // that invalidates the cache re-arms it.
+    if (!pvpCityLocationsWarmedUp) {
+        ZoneServer* zoneServer = ServerCore::getZoneServer();
+
+        if (zoneServer != nullptr && !zoneServer->isServerLoading()) {
+            bool allCached = true;
+
+            for (int i = 0; i < allShuttleports.size(); ++i) {
+                const ShuttleportLocation& loc = allShuttleports.get(i);
+
+                PvpCityLocations cityLocations;
+                resolvePvpCityLocations(loc, cityLocations);
+
+                Locker squadLock(&pvpSquadMutex);
+                if (!pvpCityLocationsCache.contains(
+                        loc.planet + ":" + loc.name))
+                    allCached = false;
+            }
+
+            pvpCityLocationsWarmedUp = allCached;
+        }
+    }
+
     // P.6.3b: make sure the faction chat rooms exist so players see them in
     // the chat browser (guarded; no-op once created / when disabled).
     ensurePvpFactionRooms();
@@ -24841,6 +25352,7 @@ void SimPlayerManager::runPvpMaintenanceTask() {
             controllers.put(newLeaderOid, newLeaderCtrl.get());
 
             Vector<uint64> remainingMembers;
+            bool breakOffPending = false;
 
             {
                 Locker squadLock(&pvpSquadMutex);
@@ -24848,6 +25360,7 @@ void SimPlayerManager::runPvpMaintenanceTask() {
 
                 if (idx >= 0) {
                     SimPvpSquad& live = pvpSquads.get(idx);
+                    breakOffPending = live.breakOffPending;
                     live.leaderOid = newLeaderOid;
 
                     for (int i = 0; i < live.memberOids.size(); ++i) {
@@ -24867,8 +25380,17 @@ void SimPlayerManager::runPvpMaintenanceTask() {
                 }
             }
 
-            newLeaderCtrl->beginCityLoop(squad.planet, squad.city,
-                squad.shuttlePos, squad.hangoutPos);
+            if (breakOffPending) {
+                // The threshold death killed the former leader, so the death
+                // hook deliberately stayed silent. Announce through this
+                // freshly promoted alive leader and preserve the latched
+                // break-off route instead of re-entering the same hangout.
+                announcePvpEvent(squad.squadId, PVP_ANNOUNCE_RETREAT);
+                newLeaderCtrl->interruptForBreakOff();
+            } else {
+                newLeaderCtrl->beginCityLoop(squad.planet, squad.city,
+                    squad.shuttlePos, squad.hangoutPos);
+            }
 
             for (int i = 0; i < remainingMembers.size(); ++i) {
                 uint64 memberOid = remainingMembers.get(i);

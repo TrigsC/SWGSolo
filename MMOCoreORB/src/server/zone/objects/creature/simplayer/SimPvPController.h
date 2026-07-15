@@ -144,6 +144,9 @@ public:
 	// the squad can travel to a reported contact (boardPvpSquad consumes the
 	// squad's pending convergence destination). No-op if already outbound.
 	void interruptForConvergence();
+	// P.6.5d: break off the current city business after a cohesion threshold.
+	// Mirrors convergence without emitting a second CONVERGE callout.
+	void interruptForBreakOff();
 
 private:
 	friend class SimPvpLoiterTask;

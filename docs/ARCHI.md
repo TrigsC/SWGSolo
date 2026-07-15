@@ -301,9 +301,12 @@ A second major custom vertical, sharing the SimPlayer NPC infrastructure:
 - **PvP squads**: NPC-driven group combat (`SimPvPController`), with
   "player-mimetic" routed travel — BFS-planned multi-leg journeys over the
   real fare matrix, departures from actual starport ticket collectors
-  (interior where pathable), and tactical arrival one city out from
-  contested destinations — design in `docs/ai-pvp-mimetic-travel-design.md`
-  and `docs/ai-pvp-squad-design.md`.
+  (interior where pathable), intra-planet legs via real city shuttleports,
+  cantina-derived hangouts (all three per-city locations resolved from live
+  game data with boot/navmesh-readiness guards), tactical arrival one city
+  out from contested destinations, and break-off-after-deaths cohesion —
+  design in `docs/ai-pvp-mimetic-travel-design.md` and
+  `docs/ai-pvp-squad-design.md`.
 - **Jedi/Force archetype**: NPC Jedi with a Force-power ladder and FRS
   (Force Rank System) progression paid via the same XP hooks real players
   use — design in `docs/ai-jedi-force-archetype-design.md` and

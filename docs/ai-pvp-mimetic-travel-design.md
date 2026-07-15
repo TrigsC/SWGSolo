@@ -1,6 +1,6 @@
 # P.6.5 — Player-Mimetic Routed Travel for PvP Squads
 
-Status: **P.6.5b BUILT 2026-07-14 (§13, PENDING BUILD GATE+RESTART)**. P.6.5a VERIFIED LIVE 2026-07-09 (302 routes / 316 legs / 17 hops /
+Status: **P.6.5d BUILT 2026-07-14 (§14, PENDING BUILD GATE+RESTART)**; P.6.5b + 0.2.1 hotfix VERIFIED LIVE 2026-07-14 (MOVEOUT at pad confirmed; 176 collector boardings / 47 tactical arrivals / 0 fallbacks). P.6.5a VERIFIED LIVE 2026-07-09 (302 routes / 316 legs / 17 hops /
 0 fallbacks in one session — §11) **+ owner-report fixes SHIPPED** (MOVEOUT
 announce moved to the shuttle wait; log-only orphan-bot sweep; compiled clean,
 PENDING RESTART — verify per §11 BEFORE the P.6.5b restart). Next: P.6.5c
@@ -638,3 +638,71 @@ SquadTraveled; comms.announcementsTotal per-travel rate back up; no
 boardAnyway increase. KEY LESSON: any two announcePvpEvent calls in one
 call stack lose the second to the global gap — announce sites must be
 separated by real gameplay time, not code order.
+
+## 14. P.6.5d City-Loop Realism + Squad Cohesion — AS BUILT (2026-07-14, PENDING BUILD GATE+RESTART)
+
+Plan: `docs/1-plans/F_0.3.0_p65d-city-loop-realism.plan.md` (Codex plan review
+APPROVED, 4 rounds). Owner decisions: hangouts Mixed (cantina-derived +
+per-city manual override, theed manual); anti-gank = break off after N deaths.
+
+### 14.1 What shipped
+
+1. **Three per-city locations, all live-data.** `ShuttleportLocation` +=
+   `shuttlePoint` (exact intra-planet PlanetTravelPoint name; all 10 cities
+   configured from planet_manager.lua data) + `hangoutManual`.
+   `resolvePvpCityLocations()` caches per city: shuttle pad (via
+   `getPlanetTravelPoint`, fallback `loc.spawn` + log) and hangout. Cantina
+   hangout = nearest building template containing "cantina" within
+   `cantinaScanRadiusMeters` (400) of the shuttle pad; candidate points
+   (toward-pad + 4 cardinal ring at boundingRadius+8m) validated by
+   EXPLICIT navmesh membership (`zone->getInRangeNavMeshes(x,y,...) > 0`,
+   the SceneObject::isInNavMesh query) + footprint distance ≥ boundingRadius;
+   `findPath` supplies only the walk-in path end + `hangoutPathNodes`
+   (NEVER validates — P.4 synthetic-fallback rule). Sources:
+   manual|cantina|fallback, per-city rows on dashboard
+   (`routedTravel.cityLocations`).
+2. **Leg targets corrected.** Intra-planet legs depart AND arrive at
+   resolved city shuttle pads (the `snapshot.shuttlePos` first-leg shortcut
+   and the 0.2.0 `loc.spawn` arrival are gone); interplanetary legs keep
+   starport arrival + collector/starport-pad departure. `beginCityLoop`
+   receives the resolved hangout everywhere (spawn, travel, promotion,
+   toggle). NOTE (rollback honesty): with all knobs off, interplanetary
+   departures now run to the live starport pad (not the city pad as in
+   0.2.1) — strictly more correct, unconditional.
+3. **Break-off cohesion.** Rolling window (`recentDeathCount` +
+   `recentDeathWindowStartMs`; out-of-window death restarts count=1;
+   initialized at both spawn sites, reset on city arrival). Threshold
+   (`breakOffDeaths` 2 within `breakOffWindowSeconds` 120, phases
+   TO_HANGOUT/LOITERING/TO_SHUTTLE) → single-shot `breakOffPending` latch +
+   avoid stamp (`avoidCitySeconds` 600) + `pvpBreakOffsTotal++` +
+   `SimPvpSquadBrokeOff ... leaderAliveAtTrigger=` log. Leader alive →
+   RETREAT announce + `interruptForBreakOff()` (convergence choreography
+   minus the CONVERGE line). Threshold death killed the leader → silent at
+   death time; PROMOTION consumes the latch (RETREAT through the freshly
+   promoted alive leader, then break-off departure instead of
+   `beginCityLoop`). Latch clears ONLY on next-city arrival; avoid stamp
+   survives the arrival (600s TTL). Avoid stamp = preference in the
+   spread-out pick + convergence consumption + tactical alternate scoring;
+   the last-resort pass ignores it (never wedges). RETREAT bypasses BOTH
+   announce cooldowns (rare by construction). Config
+   `pvpConfig.cohesion { breakOff, breakOffDeaths, breakOffWindowSeconds,
+   avoidCitySeconds }`, C++ defaults off; lua ships on.
+4. **Dashboard**: `routedTravel.cityLocations` rows (shuttlePadResolved,
+   hangoutSource, hangoutPathNodes, positions), `breakOffsTotal`, cohesion
+   config echo, per-squad `recentDeathCount`/`breakOffPending`/avoid fields;
+   SPA Break-offs metric + city-hangouts source summary.
+
+### 14.2 Verify after restart (owner's call)
+
+1. `routedTravel.cityLocations`: 10/10 shuttlePadResolved; sources = 1
+   manual (theed) + cantina elsewhere; fallbacks = 0 expected — inspect any.
+2. Visual: mos_eisley→bestine — run across town to "Mos Eisley
+   Shuttleport", arrive "Bestine Shuttleport", run to Bestine's cantina.
+3. Cross-planet unchanged: collectorBoardingsTotal still climbing.
+4. Staged gank: 2 deaths en route → RETREAT line, SimPvpSquadBrokeOff log,
+   squad departs, avoided city absent from its next SimPvpRoutePlanned,
+   different squad converges. Kill the LEADER as the 2nd death →
+   promotion-driven break-off (leaderAliveAtTrigger=false).
+5. breakOffsTotal sane over a session (not firing constantly from bot-vs-bot
+   churn — if it is, raise breakOffDeaths or shorten the window).
+6. No stateTtl/hardStuck/boardAnyway regression vs 0.2.1 baseline.

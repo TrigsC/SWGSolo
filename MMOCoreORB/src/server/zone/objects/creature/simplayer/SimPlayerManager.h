@@ -494,6 +494,12 @@ public:
 		// scripts/managers/planet/planet_manager.lua) - resolves the routed
 		// travel pad. Empty = city excluded from routed travel.
 		String starportPoint;
+		// P.6.5d: exact intra-planet PlanetTravelPoint name of this city's
+		// shuttleport. Empty falls back to the configured spawn position.
+		String shuttlePoint;
+		// P.6.5d: the configured hangout is authoritative when true; otherwise
+		// the resolver may derive an exterior cantina hangout.
+		bool hangoutManual = false;
 
 		// Satisfy Vector/TypeInfo template instantiation
 		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
@@ -548,6 +554,26 @@ public:
 		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 	};
 
+	// P.6.5d: resolved city-loop locations. The cache stores live travel-point
+	// data and the validated exterior hangout selected from the city's cantina.
+	// Entries are guarded by pvpSquadMutex; world scans happen before publish.
+	struct PvpCityLocations {
+		enum HangoutSource {
+			HANGOUT_FALLBACK = 0,
+			HANGOUT_MANUAL = 1,
+			HANGOUT_CANTINA = 2
+		};
+
+		Vector3 shuttlePad;
+		bool shuttlePadResolved = false;
+		Vector3 hangout;
+		int hangoutSource = HANGOUT_FALLBACK;
+		int hangoutPathNodes = 0;
+
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+
 	struct SpawnGroup {
 		String type;
 		int totalCount = 0;
@@ -583,6 +609,13 @@ public:
 		uint64 lastTravelMs = 0;
 		int travels = 0;
 		int deaths = 0;
+		// P.6.5d: rolling cohesion window, independent of city-loop age.
+		int recentDeathCount = 0;
+		uint64 recentDeathWindowStartMs = 0;
+		bool breakOffPending = false;
+		String avoidPlanet;
+		String avoidCity;
+		uint64 avoidExpiresAtMs = 0;
 		int engagements = 0;
 		// P.6.2 scouts + gank convergence: scout squads report contacts
 		// instead of engaging; a patrol squad gets a pending convergence
@@ -1198,6 +1231,12 @@ private:
 	int pvpMaintenanceIntervalSeconds = 30;
 	int pvpShuttleWaitIntervalSeconds = 5;
 	int pvpShuttleWaitMaxAttempts = 24;
+	// P.6.5d break-off cohesion. C++ defaults remain disabled/conservative;
+	// pvpConfig.cohesion supplies the live rollout values.
+	bool pvpBreakOffEnabled = false;
+	int pvpBreakOffDeaths = 2;
+	int pvpBreakOffWindowSeconds = 120;
+	int pvpAvoidCitySeconds = 600;
 	// 0.2.1: minimum seconds between the pad MOVEOUT callout and boarding, so
 	// a ship already sitting at the port can't yank the squad ~5s after the
 	// route is spoken. 0 = off (pre-hotfix behavior); board-anyway unaffected.
@@ -1364,6 +1403,8 @@ private:
 	void runPvpTravelDiagnostics();
 	bool resolvePvpBoardingPoint(const ShuttleportLocation& location,
 		PvpBoardingPoint& result);
+	bool resolvePvpCityLocations(const ShuttleportLocation& location,
+		PvpCityLocations& result);
 
 	// --- P.6.5a routed travel (owner-approved; ai-pvp-mimetic-travel-design.md)
 	// Squads travel like players: intra-planet hops are free-form, cross-planet
@@ -1386,6 +1427,7 @@ private:
 	int pvpRouteHopRoutesTotal = 0;       // routes with >1 leg
 	int pvpTransitStopsTotal = 0;         // non-final legs boarded
 	int pvpRouteFallbacksTotal = 0;       // routed on, plan failed → legacy pick
+	int pvpBreakOffsTotal = 0;             // guarded by pvpSquadMutex
 	// P.6.5b departure-port realism. Collector boarding and hot-arrival are
 	// independently gated; the latter is populated by Phase 2.
 	bool pvpUseCollectorBoarding = false;
@@ -1394,6 +1436,14 @@ private:
 	float pvpCollectorScanRadiusMeters = 175.f;
 	float pvpCollectorZSanityMeters = 10.f;
 	VectorMap<String, PvpBoardingPoint> pvpBoardingPointCache; // pvpSquadMutex
+	// P.6.5d city-location cache; scans are performed outside the mutex and
+	// immutable snapshots are published under it.
+	bool pvpUseCantinaHangouts = false;
+	float pvpCantinaScanRadiusMeters = 400.f;
+	VectorMap<String, PvpCityLocations> pvpCityLocationsCache; // pvpSquadMutex
+	// One-shot post-boot warmup (maintenance thread) so dashboard rows are
+	// complete without the dashboard ever resolving; see resolver guard.
+	bool pvpCityLocationsWarmedUp = false;
 	int pvpCollectorBoardingsTotal = 0; // guarded by pvpSquadMutex
 	int pvpCollectorFallbacksTotal = 0; // guarded by pvpSquadMutex
 	int pvpTacticalArrivalsTotal = 0; // Phase 2; guarded by pvpSquadMutex
@@ -1431,6 +1481,7 @@ private:
 		const String& templateName, bool imperial, bool leader,
 		AiAgent* leaderAgent, float formationOffsetX, float formationOffsetY);
 	void boardPvpSquad(uint64 squadId);
+	void checkPvpBreakOff(uint64 squadId, bool wasLeader, bool countedDeath);
 	void schedulePvpBotCleanup(uint64 oid, int delaySeconds);
 	void despawnPvpSquads(const String& reason);
 	String pickPvpTemplate(bool imperial) const;
@@ -1545,13 +1596,14 @@ public:
 		PVP_ANNOUNCE_DEPARTURE,     // area clear, moving on
 		PVP_ANNOUNCE_CONTACT,       // enemy spotted / engaging
 		PVP_ANNOUNCE_CONVERGE,      // breaking off to reinforce a fight
-		PVP_ANNOUNCE_MOVEOUT        // P.6.5a: boarding with a planned route
+		PVP_ANNOUNCE_MOVEOUT,       // P.6.5a: boarding with a planned route
+		PVP_ANNOUNCE_RETREAT        // P.6.5d: breaking off after squad deaths
 	};
 	// detail: appended to the spatial line and used in the room/group post -
 	// P.6.5a passes the human-readable route ("Route: kor vella, then coronet
 	// (corellia)") so players know where the squad is heading. MOVEOUT bypasses
 	// the per-squad announce cooldown (route info must not be swallowed by the
-	// DEPARTURE callout seconds earlier); the global anti-spam gap still applies.
+	// DEPARTURE callout seconds earlier); RETREAT bypasses both gaps.
 	void announcePvpEvent(uint64 squadId, int eventType,
 		const String& detail = "");
 

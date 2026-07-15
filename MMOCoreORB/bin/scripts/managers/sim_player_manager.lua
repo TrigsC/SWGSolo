@@ -662,6 +662,15 @@ SimPlayerManagerConfig = {
             stateTtlSeconds = 600,
             maxActionsPerInterval = 2,
         },
+        -- P.6.5d break-off cohesion: two deaths in a rolling window send the
+        -- squad back to the shuttle and steer its next route away from the
+        -- killzone. C++ defaults remain off until this block enables it.
+        cohesion = {
+            breakOff = true,
+            breakOffDeaths = 2,
+            breakOffWindowSeconds = 120,
+            avoidCitySeconds = 600,
+        },
         -- P.6.2 scouts + gank convergence: small scout squads run the same
         -- city loop but REPORT enemy contacts instead of engaging; the
         -- nearest eligible patrol squad of that faction breaks off, runs to
@@ -784,6 +793,10 @@ SimPlayerManagerConfig = {
             avoidHotArrival = true,
             collectorScanRadiusMeters = 175,
             collectorZSanityMeters = 10,
+            -- P.6.5d: city-loop hangouts default to the nearest validated
+            -- cantina exterior; Theed keeps its verified hand-placed spot.
+            useCantinaHangouts = true,
+            cantinaScanRadiusMeters = 400,
             -- Squads form up (spawn + full-wipe reform) at faction staging.
             staging = {
                 rebel = { planet = "naboo", city = "moenia" },
@@ -812,35 +825,35 @@ SimPlayerManagerConfig = {
     },
 
     -- 1. LOCATIONS
-    -- P.6.5a: each city's `starport` is the EXACT PlanetTravelPoint name from
-    -- scripts/managers/planet/planet_manager.lua - it resolves the routed
-    -- travel pad at plan time (spawn/hangout coords stay hand-placed).
-    -- New city spawns = the starport pad; hangouts = near its ticket
-    -- collector (positions verified by the P.6.5-0 spike, all pathable).
+    -- P.6.5a/P.6.5d: `starport` and `shuttlePoint` are the EXACT
+    -- PlanetTravelPoint names from scripts/managers/planet/planet_manager.lua.
+    -- Starports serve cross-planet travel; shuttlePoints serve intra-planet
+    -- city departures/arrivals. The resolver supplies live positions and
+    -- derives exterior cantina hangouts unless hangoutManual is true.
     -- NOTE: kaadara is EXCLUDED - its travel point z=-192 in the planet data
     -- (under-the-world quirk); revisit if we ever want it in the pool.
     -- NOTE: miners also spawn spread across this list, so miners now appear
     -- in the new cities (incl. restuss on rori) - wider gather coverage.
     shuttleports = {
         naboo = {
-            { name = "moenia", spawn = {4963.0, -4892.0, 3.0}, hangout = {4807.0, -4700.0, 4.0}, starport = "Moenia" },
-            { name = "theed", spawn = {-5410, 4325.0, 6.0}, hangout = {-4880.0, 4140.0, 6.0}, starport = "Theed Spaceport" },
-            { name = "keren", spawn = {1371.6, 2747.9, 13.0}, hangout = {1343.0, 2758.0, 13.0}, starport = "Keren Starport" },
+            { name = "moenia", spawn = {4963.0, -4892.0, 3.0}, hangout = {4807.0, -4700.0, 4.0}, starport = "Moenia", shuttlePoint = "Moenia Shuttleport" },
+            { name = "theed", spawn = {-5410, 4325.0, 6.0}, hangout = {-4880.0, 4140.0, 6.0}, starport = "Theed Spaceport", shuttlePoint = "Theed Shuttle C", hangoutManual = true },
+            { name = "keren", spawn = {1371.6, 2747.9, 13.0}, hangout = {1343.0, 2758.0, 13.0}, starport = "Keren Starport", shuttlePoint = "Keren Shuttleport" },
         },
         corellia = {
-            { name = "coronet", spawn = {-328.0, -4600.0, 28.0}, hangout = {-155.0, -4722.0, 28.0}, starport = "Coronet Starport" },
-            { name = "kor_vella", spawn = {-3157.3, 2876.2, 31.0}, hangout = {-3145.0, 2905.0, 31.0}, starport = "Kor Vella Starport" },
-            { name = "tyrena", spawn = {-5003.1, -2228.4, 21.0}, hangout = {-4975.0, -2216.0, 21.0}, starport = "Tyrena Starport" },
+            { name = "coronet", spawn = {-328.0, -4600.0, 28.0}, hangout = {-155.0, -4722.0, 28.0}, starport = "Coronet Starport", shuttlePoint = "Coronet Shuttle B" },
+            { name = "kor_vella", spawn = {-3157.3, 2876.2, 31.0}, hangout = {-3145.0, 2905.0, 31.0}, starport = "Kor Vella Starport", shuttlePoint = "Kor Vella Shuttleport" },
+            { name = "tyrena", spawn = {-5003.1, -2228.4, 21.0}, hangout = {-4975.0, -2216.0, 21.0}, starport = "Tyrena Starport", shuttlePoint = "Tyrena Shuttle A" },
         },
         tatooine = {
-            { name = "mos_eisley", spawn = {3416.0, -4645.0, 5.0}, hangout = {3467.0, -4890.0, 5.0}, starport = "Mos Eisley Starport" },
-            { name = "bestine", spawn = {-1361.2, -3600.0, 12.0}, hangout = {-1388.0, -3584.0, 12.0}, starport = "Bestine Starport" },
-            { name = "mos_entha", spawn = {1266.1, 3065.1, 7.0}, hangout = {1241.0, 3048.0, 7.0}, starport = "Mos Entha Starport" },
+            { name = "mos_eisley", spawn = {3416.0, -4645.0, 5.0}, hangout = {3467.0, -4890.0, 5.0}, starport = "Mos Eisley Starport", shuttlePoint = "Mos Eisley Shuttleport" },
+            { name = "bestine", spawn = {-1361.2, -3600.0, 12.0}, hangout = {-1388.0, -3584.0, 12.0}, starport = "Bestine Starport", shuttlePoint = "Bestine Shuttleport" },
+            { name = "mos_entha", spawn = {1266.1, 3065.1, 7.0}, hangout = {1241.0, 3048.0, 7.0}, starport = "Mos Entha Starport", shuttlePoint = "Mos Entha Shuttle A" },
         },
         rori = {
             -- Off-main destination: reachable ONLY via a naboo hop (fare
             -- matrix), so routes here exercise real multi-leg journeys.
-            { name = "restuss", spawn = {5340.0, 5734.0, 80.0}, hangout = {5354.0, 5762.0, 80.0}, starport = "Restuss Starport" },
+            { name = "restuss", spawn = {5340.0, 5734.0, 80.0}, hangout = {5354.0, 5762.0, 80.0}, starport = "Restuss Starport", shuttlePoint = "Restuss Shuttleport" },
         },
     },
 

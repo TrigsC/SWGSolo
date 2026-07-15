@@ -2,11 +2,18 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.3.0` | 1 | feat: P.6.5d city-loop realism - real shuttleports, cantina hangouts, break-off cohesion |
 | `0.2.1` | 1 | hotfix: MOVEOUT route callout swallowed by global announce gap; add min departure notice |
 | `0.2.0` | 1 | feat: P.6.5b starport boarding realism - collector runs, tactical arrival, cell-aware pathing |
 | `0.1.0` | 1 | chore: initialize TRIP workflow |
 
 # Changelog Summary
+
+- **v0.3.0 (P.6.5d City-Loop Realism + Squad Cohesion - Week 1, 14-07-2026)**:
+  - **Feature**: three live-data locations per city (starport / shuttleport / cantina hangout) — intra-planet legs use real shuttleports both ways, squads hang out at validated cantina exteriors (Theed manual); break-off-after-deaths cohesion with promotion-safe latch, RETREAT callout, and 600s avoid-city stamp.
+  - **Hardening (review)**: resolver never caches during boot or pre-navmesh (shuttle-pad mesh probe); dashboard peek-only; retryable maintenance warmup.
+  - **Review**: Codex 3 rounds → APPROVED (`docs/3-code-review/CR_w1_v0.3.0.md`); live verification pending owner restart per design doc §14.2.
+  - **Files**: SimPlayerManager.{h,cpp}, SimPvPController.{h,cpp}, sim_player_manager.lua, dashboard app.js, design doc §14.
 
 - **v0.2.1 (Hotfix - Week 1, 14-07-2026)**:
   - **Issue**: owner-reported live — squads spoke "packing it up" then jumped with no route callout; players had no time to follow (first destination info was the arrival line in group chat).
