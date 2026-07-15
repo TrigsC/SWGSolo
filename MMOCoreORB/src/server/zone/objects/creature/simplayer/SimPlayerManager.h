@@ -14,6 +14,7 @@
 #include "engine/util/u3d/Vector3.h"
 #include "engine/util/JSONSerializationType.h"
 #include "engine/lua/Lua.h"
+#include "engine/util/Observer.h"
 
 #include "SimPlayerController.h"
 
@@ -36,6 +37,58 @@ class MinerIntelligentTargetingTask;
 class MinerRecoveryTask;
 class SimPlayerConfiguredSpawnTask;
 class HiveCrafterConsumerTask;
+
+struct SimBotIdentity {
+	uint64 id = 0;
+	String firstName;
+	String lastName;
+	String profession = "hunter";
+	String homePlanet;
+	String homeCity;
+	int skillTier = 1;
+	String createdAt;
+	String lastSeenAt;
+	int hunts = 0;
+	int kills = 0;
+	int deaths = 0;
+	uint64 harvestUnits = 0;
+	String assignmentSpecies;
+	String assignmentResource;
+	uint64 assignmentStamp = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PveSpikeState {
+	String phase = "SPAWNING";
+	uint64 startedAtMs = 0;
+	uint64 finishedAtMs = 0;
+	uint64 hunterOid = 0;
+	uint64 targetOid = 0;
+	int targetHealthAtEngage = 0;
+	int targetActionAtEngage = 0;
+	int targetMindAtEngage = 0;
+	int hunterHealthAtEngage = 0;
+	int hunterActionAtEngage = 0;
+	int hunterMindAtEngage = 0;
+	bool attackAccepted = false;
+	bool aggroBack = false;
+	bool damageDealtToTarget = false;
+	bool damageTakenBySpike = false;
+	bool targetDied = false;
+	bool spikeBotDied = false;
+	int destructionObserverFireCount = 0;
+	bool observerParticipantVerified = false;
+	bool observerRegistered = false;
+	bool observerHandoffPending = false;
+	bool cleanupComplete = false;
+	String verdict = "PENDING";
+	String failureFlag = "none";
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
 
 // P.5.3: defined in the .cpp (file scope); forward-declared here so the crafter
 // consumer can share the demand-state compute helper by reference.
@@ -1065,6 +1118,61 @@ private:
 	Vector<ShuttleportLocation> allShuttleports;
 	Vector<SpawnGroup> spawnGroups;
 
+	// P.8 Phase 1: persistent PvE identity roster. The body maps are transient
+	// and are always copied before any agent is locked. pveMutex is deliberately
+	// independent from pvpSquadMutex; neither mutex is acquired while holding
+	// the other, and neither is held while locking agents.
+	VectorMap<uint64, SimBotIdentity> pveIdentities;
+	VectorMap<uint64, uint64> pveIdentityBodyOids;
+	VectorMap<uint64, uint64> pveBodyIdentityIds;
+	VectorMap<uint64, uint64> pveRespawnDueAtMs;
+	VectorMap<uint64, bool> pveDirtyIdentityIds;
+	Mutex pveMutex;
+	PveSpikeState pveSpike;
+	Reference<Observer*> pveSpikeObserver;
+
+	bool pveEnabled = false;
+	bool pveHunterBotsEnabled = false; // Phase 2 remains config-locked.
+	bool pveSpikeEnabled = false;
+	int pveMaxHunters = 6;
+	int pveSkillTier = 1;
+	int pveMaintenanceIntervalSeconds = 30;
+	int pveRespawnDelaySeconds = 120;
+	int pveSpikeTimeoutSeconds = 180;
+	int pveSpikeScanRadiusMeters = 96;
+	String pveSpikeHunterTemplate = "artisan";
+	String pveSpikeTargetTemplateFilter;
+	String pveSpikePlanet;
+	Vector3 pveSpikePosition;
+	Vector<String> pveHunterTemplates;
+	bool pveRosterLoaded = false;
+	bool pveDatabaseAvailable = false;
+	bool pveBootReady = false;
+	// One-per-boot loud warning when hunters are enabled without a
+	// current-boot spike PASS (the verdict advises the owner; it is not a
+	// runtime interlock - see governPvePopulation).
+	bool pveHunterEnableWarned = false;
+	bool pveMaintenanceTaskScheduled = false;
+	uint64 pveLastRosterFlushMs = 0;
+	int pveRosterFlushIntervalSeconds = 60;
+	int pveNextHomeCityIndex = 0;
+
+	void applyPveConfig(LuaObject& pveConfig);
+	void loadPveIdentityRoster();
+	void mintPveIdentitiesIfNeeded();
+	void flushPveIdentityRoster(bool force);
+	void updatePveBodyLifecycles(uint64 nowMs);
+	void governPvePopulation(uint64 nowMs);
+	AiAgent* spawnPveIdentityBody(const SimBotIdentity& identity);
+	void runPveSpikeIfNeeded(uint64 nowMs);
+	void advancePveSpike(uint64 nowMs);
+	bool spawnPveSpikeActors();
+	bool engagePveSpike(uint64 nowMs);
+	void registerPveDestructionObserver(uint64 targetOid, uint64 participantOid);
+	void cleanupPveSpike();
+	JSONSerializationType getPveActivityDashboard();
+	JSONSerializationType getPveSpikeDashboard();
+
 	// Lua config loading / spawning
 	void loadLuaConfig();
 	void spawnConfiguredGroups();
@@ -1574,6 +1682,14 @@ public:
 		return minerIntelligentArrivalRadiusMeters;
 	}
 	JSONSerializationType getAiEconomyDashboardSnapshot();
+
+	// P.8 Phase 1: the foundation task owns every roster SQL operation. The
+	// destruction handoff is intentionally public because queued lambdas are not
+	// friends; it only updates in-memory spike state and never touches SQL.
+	void schedulePveFoundationMaintenanceTask();
+	void runPveFoundationMaintenanceTask();
+	void handlePveDestructionHandoff(uint64 targetOid, uint64 participantOid,
+		bool participantVerified);
 
 	// --- P.6.1 SimPvP squads: task- and controller-called entry points.
 	// (Scheduled tasks are not friends; these must stay public.)

@@ -627,6 +627,39 @@ SimPlayerManagerConfig = {
         batchDelayMs = 1000,
     },
 
+    -- P.8 Phase 1: persistent PvE identity roster plus the diagnostics-only
+    -- combat spike. Hunter bodies are deliberately locked off until the live
+    -- dashboard reports a PASS with destruction-observer participation proof.
+    pveConfig = {
+        enabled = true,
+        enableHunterBots = false, -- config-locked until the spike gate passes
+        maxHunters = 6,
+        skillTier = 1,
+        maintenanceIntervalSeconds = 30,
+        respawnDelaySeconds = 120,
+        bodyTemplates = { "artisan" },
+        identityRoster = {
+            maxHunters = 6,
+            skillTier = 1,
+            flushIntervalSeconds = 60,
+        },
+        spike = {
+            enabled = true,
+            timeoutSeconds = 180,
+            scanRadiusMeters = 96,
+            hunterTemplate = "artisan",
+            targetTemplateFilter = "womprat",
+            -- Kept away from the city center so the spike observes ordinary
+            -- wild-creature attackability without touching PvP populations.
+            lowThreatArea = {
+                planet = "tatooine",
+                x = 3600.0,
+                y = -5050.0,
+                z = 5.0,
+            },
+        },
+    },
+
     -- P.6.1 SimPvP squads: persistent faction squads (leader + followers)
     -- that shuttle into a city, run to the starport hangout, loiter looking
     -- for attackable enemies, then shuttle to the next city (switchZone

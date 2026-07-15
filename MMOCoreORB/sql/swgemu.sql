@@ -13552,6 +13552,28 @@ CREATE TABLE  `swgemu`.`account_ips` (
   PRIMARY KEY (`idaccount_ips`)
 ) ENGINE=MyISAM AUTO_INCREMENT=1099 DEFAULT CHARSET=latin1;
 
+DROP TABLE IF EXISTS `swgemu`.`simbot_identities`;
+CREATE TABLE `swgemu`.`simbot_identities` (
+  `id` bigint(20) NOT NULL AUTO_INCREMENT,
+  `first_name` varchar(64) NOT NULL,
+  `last_name` varchar(64) NOT NULL,
+  `profession` varchar(32) NOT NULL DEFAULT 'hunter',
+  `home_planet` varchar(32) NOT NULL,
+  `home_city` varchar(64) NOT NULL,
+  `skill_tier` int(11) NOT NULL DEFAULT '1',
+  `created_at` datetime NOT NULL,
+  `last_seen_at` datetime NOT NULL,
+  `hunts` int(11) NOT NULL DEFAULT '0',
+  `kills` int(11) NOT NULL DEFAULT '0',
+  `deaths` int(11) NOT NULL DEFAULT '0',
+  `harvest_units` bigint(20) NOT NULL DEFAULT '0',
+  `assignment_species` varchar(64) DEFAULT NULL,
+  `assignment_resource` varchar(128) DEFAULT NULL,
+  `assignment_stamp` bigint(20) NOT NULL DEFAULT '0',
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_simbot_identity_name` (`first_name`,`last_name`)
+) ENGINE=MyISAM DEFAULT CHARSET=latin1;
+
 ALTER TABLE `swgemu`.`deleted_characters` ADD COLUMN `db_deleted` BOOLEAN  NOT NULL DEFAULT 0 AFTER `creation_date`;
 
 -- Newer versions require these to have defaults

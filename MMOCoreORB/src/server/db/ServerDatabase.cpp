@@ -140,4 +140,27 @@ void ServerDatabase::updateDatabaseSchema() {
 	alterDatabase(1008,
 		"ALTER TABLE `account_log` MODIFY COLUMN `ip_address` VARCHAR(64);"
 	);
+
+	alterDatabase(1009,
+		"CREATE TABLE `simbot_identities` ("
+		"`id` BIGINT NOT NULL AUTO_INCREMENT,"
+		"`first_name` VARCHAR(64) NOT NULL,"
+		"`last_name` VARCHAR(64) NOT NULL,"
+		"`profession` VARCHAR(32) NOT NULL DEFAULT 'hunter',"
+		"`home_planet` VARCHAR(32) NOT NULL,"
+		"`home_city` VARCHAR(64) NOT NULL,"
+		"`skill_tier` INT NOT NULL DEFAULT 1,"
+		"`created_at` DATETIME NOT NULL,"
+		"`last_seen_at` DATETIME NOT NULL,"
+		"`hunts` INT NOT NULL DEFAULT 0,"
+		"`kills` INT NOT NULL DEFAULT 0,"
+		"`deaths` INT NOT NULL DEFAULT 0,"
+		"`harvest_units` BIGINT NOT NULL DEFAULT 0,"
+		"`assignment_species` VARCHAR(64) DEFAULT NULL,"
+		"`assignment_resource` VARCHAR(128) DEFAULT NULL,"
+		"`assignment_stamp` BIGINT NOT NULL DEFAULT 0,"
+		"PRIMARY KEY (`id`),"
+		"UNIQUE KEY `idx_simbot_identity_name` (`first_name`,`last_name`)"
+		") ENGINE=MyISAM DEFAULT CHARSET=latin1;"
+	);
 }
