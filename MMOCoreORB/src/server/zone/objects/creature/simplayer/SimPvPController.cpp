@@ -13,6 +13,7 @@
 #include "server/zone/objects/creature/CreatureObject.h"
 #include "server/zone/CloseObjectsVector.h"
 #include "server/zone/TreeEntry.h"
+#include "templates/params/creature/CreatureAttribute.h"
 #include "templates/params/creature/ObjectFlag.h"
 #include "templates/params/creature/CreaturePosture.h"
 
@@ -50,10 +51,28 @@ SimPvpBotController::SimPvpBotController(AiAgent* aiAgent, uint64 squad, bool is
 	scoutRole = false;
 	lastContactReportMs = 0;
 	phantomCombatTicks = 0;
+	stalemateDefenderOid = 0;
+	stalemateSelfHam = 0;
+	stalemateDefenderHam = 0;
+	lastCombatProgressMs = 0;
+	stalemateIgnoredOid = 0;
+	stalemateIgnoreUntilMs = 0;
 	setLoggingName("SimPvpBotController");
 }
 
 SimPvpBotController::~SimPvpBotController() {
+}
+
+void SimPvpBotController::resetStalemateProgress() {
+	stalemateDefenderOid = 0;
+	stalemateSelfHam = 0;
+	stalemateDefenderHam = 0;
+	lastCombatProgressMs = 0;
+}
+
+void SimPvpBotController::prepareForRelocation(const String& reason) {
+	SimPlayerController::prepareForRelocation(reason);
+	resetStalemateState();
 }
 
 void SimPvpBotController::onTick() {
@@ -62,7 +81,14 @@ void SimPvpBotController::onTick() {
 	if (strongAgent == nullptr)
 		return;
 
+	uint64 nowMs = System::getMiliTime();
+	if (stalemateIgnoredOid != 0 && nowMs >= stalemateIgnoreUntilMs) {
+		stalemateIgnoredOid = 0;
+		stalemateIgnoreUntilMs = 0;
+	}
+
 	if (strongAgent->isDead()) {
+		resetStalemateProgress();
 		// Report once; the manager owns the roster (delayed corpse cleanup,
 		// replacement at the squad's next city, leader promotion).
 		if (!deathReported) {
@@ -98,7 +124,59 @@ void SimPvpBotController::onTick() {
 
 		if (reachableEnemy) {
 			phantomCombatTicks = 0;
-		} else if (++phantomCombatTicks >= 6) {
+
+			uint64 defenderOid = defender->getObjectID();
+			int selfHam = strongAgent->getHAM(CreatureAttribute::HEALTH) +
+				strongAgent->getHAM(CreatureAttribute::ACTION) +
+				strongAgent->getHAM(CreatureAttribute::MIND);
+			int defenderHam = defender->getHAM(CreatureAttribute::HEALTH) +
+				defender->getHAM(CreatureAttribute::ACTION) +
+				defender->getHAM(CreatureAttribute::MIND);
+
+			if (stalemateDefenderOid != defenderOid) {
+				stalemateDefenderOid = defenderOid;
+				stalemateSelfHam = selfHam;
+				stalemateDefenderHam = defenderHam;
+				lastCombatProgressMs = nowMs;
+			} else {
+				if (selfHam < stalemateSelfHam ||
+						defenderHam < stalemateDefenderHam)
+					lastCombatProgressMs = nowMs;
+
+				stalemateSelfHam = selfHam;
+				stalemateDefenderHam = defenderHam;
+			}
+
+			int breakSeconds =
+				SimPlayerManager::instance()->getPvpStalemateBreakSeconds();
+			if (breakSeconds > 0 && lastCombatProgressMs != 0 &&
+					nowMs - lastCombatProgressMs >
+						(uint64)breakSeconds * 1000) {
+				uint64 brokenDefenderOid = defenderOid;
+				uint64 idleMs = nowMs - lastCombatProgressMs;
+				int graceSeconds = SimPlayerManager::instance()->
+					getPvpStalemateGraceSeconds();
+
+				{
+					Locker locker(strongAgent);
+					strongAgent->clearCombatState(true);
+				}
+
+				stalemateIgnoredOid = brokenDefenderOid;
+				stalemateIgnoreUntilMs = nowMs +
+					(uint64)graceSeconds * 1000;
+				resetStalemateProgress();
+				SimPlayerManager::instance()->recordPvpStalemateBreak(
+					squadId, strongAgent->getObjectID(), brokenDefenderOid,
+					idleMs);
+				return;
+			}
+		} else {
+			resetStalemateProgress();
+
+			if (++phantomCombatTicks < 6)
+				return;
+
 			phantomCombatTicks = 0;
 
 			Locker locker(strongAgent);
@@ -116,6 +194,7 @@ void SimPvpBotController::onTick() {
 	}
 
 	phantomCombatTicks = 0;
+	resetStalemateProgress();
 
 	// P.7.5: combat is over but the bot is still on the floor (the jedi
 	// recovery reflex only ticks in combat, and nothing in the stock AI ever
@@ -139,6 +218,7 @@ void SimPvpBotController::scanForTargets() {
 		return;
 
 	SimPlayerManager* manager = SimPlayerManager::instance();
+	uint64 nowMs = System::getMiliTime();
 	const float scanRadius = scoutRole ? manager->getPvpScoutScanRadiusMeters()
 									   : manager->getPvpScanRadiusMeters();
 	const bool allowBotVsBot = manager->isPvpBotVsBotCombatEnabled();
@@ -190,6 +270,11 @@ void SimPvpBotController::scanForTargets() {
 			continue;
 
 		if (strongAgent->getDistanceTo(target) >= scanRadius)
+			continue;
+
+		if (stalemateIgnoredOid != 0 &&
+				nowMs < stalemateIgnoreUntilMs &&
+				target->getObjectID() == stalemateIgnoredOid)
 			continue;
 
 		// P.6.2: a report-only scout calls the contact in (throttled) and
@@ -379,7 +464,7 @@ void SimPvPController::onPathFailed() {
 }
 
 void SimPvPController::prepareForRelocation(const String& reason) {
-	SimPlayerController::prepareForRelocation(reason);
+	SimPvpBotController::prepareForRelocation(reason);
 	shuttleTargetLocalPosition = Vector3(0, 0, 0);
 	shuttleTargetCellOid = 0;
 	shuttleTargetIsCollector = false;

@@ -972,6 +972,7 @@
             ${metric("Plan Fallbacks", routed.fallbacksTotal, { tone: Number(routed.fallbacksTotal || 0) ? "warn" : "" })}
             ${metric("Collector Fallbacks", routed.collectorFallbacksTotal, { tone: Number(routed.collectorFallbacksTotal || 0) ? "warn" : "" })}
             ${metric("Break-offs", routed.breakOffsTotal, { tone: Number(routed.breakOffsTotal || 0) ? "warn" : "" })}
+            ${metric("Stalemate Breaks", routed.stalemateBreaksTotal)}
           </div>
           <div class="section-gap"></div>
           ${kvRows([

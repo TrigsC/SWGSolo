@@ -5304,6 +5304,8 @@ void SimPlayerManager::loadLuaConfig() {
     pvpBreakOffDeaths = 2;
     pvpBreakOffWindowSeconds = 120;
     pvpAvoidCitySeconds = 600;
+    pvpStalemateBreakSeconds = 0;
+    pvpStalemateGraceSeconds = 20;
     pvpCorpseCleanupDelaySeconds = 60;
     pvpRecoveryEnabled = true;
     pvpRecoveryDryRun = true;
@@ -5325,6 +5327,7 @@ void SimPlayerManager::loadLuaConfig() {
     pvpBoardOnActualShuttle = true;
     pvpCollectorScanRadiusMeters = 175.f;
     pvpCollectorZSanityMeters = 10.f;
+    pvpCollectorJitterMeters = 0.f;
     pvpMinDepartureNoticeSeconds = 0;
     pvpBoardingPointCache.removeAll();
     // P.6.2 scout/convergence defaults (lua pvpConfig.scouts overrides).
@@ -9436,6 +9439,8 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         routedJson["useCantinaHangouts"] = pvpUseCantinaHangouts;
         routedJson["cantinaScanRadiusMeters"] = pvpCantinaScanRadiusMeters;
         routedJson["breakOffsTotal"] = pvpBreakOffsTotal;
+        routedJson["stalemateBreaksTotal"] = pvpStalemateBreaksTotal;
+        routedJson["collectorJitterMeters"] = pvpCollectorJitterMeters;
 
         JSONSerializationType cohesionJson = JSONSerializationType::object();
         cohesionJson["breakOff"] = pvpBreakOffEnabled;
@@ -9443,6 +9448,7 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         cohesionJson["breakOffWindowSeconds"] = pvpBreakOffWindowSeconds;
         cohesionJson["avoidCitySeconds"] = pvpAvoidCitySeconds;
         cohesionJson["breakOffsTotal"] = pvpBreakOffsTotal;
+        cohesionJson["stalemateBreakSeconds"] = pvpStalemateBreakSeconds;
         routedJson["cohesion"] = cohesionJson;
 
         int cityShuttlePadsResolved = 0;
@@ -21349,6 +21355,15 @@ static void pvpFormationOffset(int memberIndex, int squadSize,
     yOffset = -(5.f + (float)((memberIndex * 3) % 4));    // -5 .. -8m behind
 }
 
+static void pvpCollectorJitterOffset(uint64 squadId, float radius,
+        float& xOffset, float& yOffset) {
+    const double goldenAngle = 2.399963229728653;
+    const double angle = (double)squadId * goldenAngle;
+
+    xOffset = (float)(std::cos(angle) * radius);
+    yOffset = (float)(std::sin(angle) * radius);
+}
+
 void SimPlayerManager::applyPvpConfig(LuaObject& pvpConfig) {
     pvpEnabled = pvpConfig.getBooleanField("enablePvpBots", pvpEnabled);
     pvpSquadsPerFaction = clampMinerInt(
@@ -21417,6 +21432,13 @@ void SimPlayerManager::applyPvpConfig(LuaObject& pvpConfig) {
             pvpBreakOffWindowSeconds, 1, 3600);
         pvpAvoidCitySeconds = clampMinerInt(
             cohesion.getIntField("avoidCitySeconds"), pvpAvoidCitySeconds, 0, 7200);
+
+        int stalemateBreakSeconds =
+            cohesion.getIntField("stalemateBreakSeconds");
+        pvpStalemateBreakSeconds = stalemateBreakSeconds <= 0 ? 0 :
+            clampIntRange(stalemateBreakSeconds, 15, 300);
+        pvpStalemateGraceSeconds = clampIntRange(
+            cohesion.getIntField("stalemateGraceSeconds"), 5, 60);
     }
     cohesion.pop();
 
@@ -21565,6 +21587,11 @@ void SimPlayerManager::applyPvpConfig(LuaObject& pvpConfig) {
             "collectorZSanityMeters");
         if (collectorZSanity >= 1.f && collectorZSanity <= 100.f)
             pvpCollectorZSanityMeters = collectorZSanity;
+
+        float collectorJitter = travel.getFloatField(
+            "collectorJitterMeters");
+        pvpCollectorJitterMeters = collectorJitter <= 0.f ? 0.f :
+            clampFloatRange(collectorJitter, 1.f, 8.f);
 
         // Resolver thresholds changed at runtime: drop the cached boarding
         // points so the next departure re-scans with the new values (the
@@ -23123,6 +23150,31 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
                 leg.departureCellOid = boardingPoint.cellOid;
                 leg.departureIsCollector =
                     boardingPoint.resolved && !boardingPoint.fellBackToPad;
+
+                if (leg.departureIsCollector &&
+                        pvpCollectorJitterMeters > 0.f) {
+                    float xOffset = 0.f;
+                    float yOffset = 0.f;
+                    pvpCollectorJitterOffset(squadId,
+                        pvpCollectorJitterMeters, xOffset, yOffset);
+
+                    leg.departureLocalPos.setX(
+                        leg.departureLocalPos.getX() + xOffset);
+                    leg.departureLocalPos.setY(
+                        leg.departureLocalPos.getY() + yOffset);
+
+                    // Interior collectors keep the cached world point for
+                    // distance/arrival math; the jitter is cell-local only
+                    // because a world-space delta is wrong under rotation.
+                    if (leg.departureCellOid == 0) {
+                        // Outdoor collectors use one coordinate space for
+                        // both pathing and world-distance arrival checks.
+                        leg.departurePos.setX(
+                            leg.departurePos.getX() + xOffset);
+                        leg.departurePos.setY(
+                            leg.departurePos.getY() + yOffset);
+                    }
+                }
             }
         }
 
@@ -23564,6 +23616,15 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
         if (memberAgent == nullptr || memberAgent->isDead())
             continue;
 
+        // P.6.5e: a member's stalemate state (progress clock + ignore pair)
+        // must not survive the teleport. Scoped reset only - the full
+        // prepareForRelocation would bump the member's work-loop generation
+        // and orphan the tick chain that drives assertFollow.
+        SimPvpBotController* memberBotCtrl =
+            dynamic_cast<SimPvpBotController*>(memberRef.get());
+        if (memberBotCtrl != nullptr)
+            memberBotCtrl->resetStalemateState();
+
         {
             Locker locker(memberAgent);
             // Same stale-movement stop as the leader; assertFollow() below
@@ -23890,6 +23951,19 @@ void SimPlayerManager::recordPvpEngagement(uint64 squadId, bool targetWasPlayer)
     } else {
         pvpBotEngagementsTotal++;
     }
+}
+
+void SimPlayerManager::recordPvpStalemateBreak(uint64 squadId, uint64 oid,
+        uint64 defenderOid, uint64 idleMs) {
+    {
+        Locker squadLock(&pvpSquadMutex);
+        pvpStalemateBreaksTotal++;
+    }
+
+    info("SimPvpStalemateBreak oid=" + String::valueOf(oid) +
+         " squad=" + String::valueOf(squadId) +
+         " defender=" + String::valueOf(defenderOid) +
+         " idleMs=" + String::valueOf(idleMs), true);
 }
 
 // Caller holds pvpSquadMutex.

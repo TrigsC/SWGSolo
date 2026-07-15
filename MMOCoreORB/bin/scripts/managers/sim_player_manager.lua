@@ -670,6 +670,11 @@ SimPlayerManagerConfig = {
             breakOffDeaths = 2,
             breakOffWindowSeconds = 120,
             avoidCitySeconds = 600,
+            -- P.6.2b follow-up (P.6.5e): break the Theed doorway/collector
+            -- stalemate when live bots make no HAM progress. Set to 0 to
+            -- disable; any non-zero value is clamped to the 15s floor.
+            stalemateBreakSeconds = 45,
+            stalemateGraceSeconds = 20,
         },
         -- P.6.2 scouts + gank convergence: small scout squads run the same
         -- city loop but REPORT enemy contacts instead of engaging; the
@@ -678,10 +683,10 @@ SimPlayerManagerConfig = {
         -- engages a real PLAYER also calls it in. Cooldowns per squad and
         -- per city stop ping-pong; contacts expire on their own.
         scouts = {
-            enabled = false,
-            squadsPerFaction = 1,
+            enabled = true,
+            squadsPerFaction = 2,
             squadSize = 1,              -- lone scout (players use 1-2)
-            scanRadiusMeters = 64,      -- scouts watch a wider bubble
+            scanRadiusMeters = 128,      -- scouts watch a wider bubble
             reportOnly = true,          -- scouts observe + call it in
             reportIntervalSeconds = 30,
             contactTtlSeconds = 300,
@@ -793,6 +798,7 @@ SimPlayerManagerConfig = {
             avoidHotArrival = true,
             collectorScanRadiusMeters = 175,
             collectorZSanityMeters = 10,
+            collectorJitterMeters = 3,
             -- P.6.5d: city-loop hangouts default to the nearest validated
             -- cantina exterior; Theed keeps its verified hand-placed spot.
             useCantinaHangouts = true,

@@ -57,8 +57,32 @@ protected:
 	// freezes the controller AND blocks the maintenance TTL; after a few such
 	// ticks we clear the stale combat state so the loop resumes.
 	int phantomCombatTicks;
+	// P.6.5e: combat-progress tracking for live defenders that cannot land a
+	// hit. Only the three current HAM pools are observed; wounds and regen
+	// noise do not count as progress.
+	uint64 stalemateDefenderOid;
+	int stalemateSelfHam;
+	int stalemateDefenderHam;
+	uint64 lastCombatProgressMs;
+	// The defender cleared by a stalemate break is ignored only by this bot's
+	// own target scan for a short grace period. Engine-added defenders remain
+	// deliberately unfiltered.
+	uint64 stalemateIgnoredOid;
+	uint64 stalemateIgnoreUntilMs;
+
+	void resetStalemateProgress();
 
 public:
+	// P.6.5e: full stalemate reset (progress + ignore pair) for teleport
+	// sites that reposition a bot WITHOUT the full prepareForRelocation
+	// (members are engine-followers - bumping their work-loop generation
+	// would orphan the tick chain that drives assertFollow).
+	void resetStalemateState() {
+		resetStalemateProgress();
+		stalemateIgnoredOid = 0;
+		stalemateIgnoreUntilMs = 0;
+	}
+
 	SimPvpBotController(AiAgent* aiAgent, uint64 squad, bool isImperial);
 	virtual ~SimPvpBotController();
 
@@ -70,6 +94,7 @@ public:
 	// Called every arrival-check tick (~1s). Reports death once, stays quiet
 	// in combat, otherwise scans for attackable enemies.
 	void onTick() override;
+	void prepareForRelocation(const String& reason) override;
 
 	// Scan CloseObjects for an enemy to engage: overt enemy-faction players
 	// always; enemy sim bots only behind pvpConfig.allowBotVsBotCombat.

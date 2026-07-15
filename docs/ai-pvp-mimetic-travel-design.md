@@ -1,6 +1,6 @@
 # P.6.5 — Player-Mimetic Routed Travel for PvP Squads
 
-Status: **P.6.5d v0.3.0 VERIFIED LIVE 2026-07-14** (10/10 pads, 7 cantina + 1 manual + 2 fallback hangouts, warmup at 96s post-boot, 2 organic break-offs w/ correct avoid+reroute; staged leader-kill gank still pending — §14.2 item 4); P.6.5b + 0.2.1 hotfix VERIFIED LIVE 2026-07-14 (MOVEOUT at pad confirmed; 176 collector boardings / 47 tactical arrivals / 0 fallbacks). P.6.5a VERIFIED LIVE 2026-07-09 (302 routes / 316 legs / 17 hops /
+Status: **P.6.5e BUILT 2026-07-15 (§15, PENDING BUILD GATE+RESTART)**; P.6.5d v0.3.0 VERIFIED LIVE 2026-07-14 (10/10 pads, 7 cantina + 1 manual + 2 fallback hangouts, warmup at 96s post-boot, 2 organic break-offs w/ correct avoid+reroute; staged leader-kill gank still pending — §14.2 item 4); P.6.5b + 0.2.1 hotfix VERIFIED LIVE 2026-07-14 (MOVEOUT at pad confirmed; 176 collector boardings / 47 tactical arrivals / 0 fallbacks). P.6.5a VERIFIED LIVE 2026-07-09 (302 routes / 316 legs / 17 hops /
 0 fallbacks in one session — §11) **+ owner-report fixes SHIPPED** (MOVEOUT
 announce moved to the shuttle wait; log-only orphan-bot sweep; compiled clean,
 PENDING RESTART — verify per §11 BEFORE the P.6.5b restart). Next: P.6.5c
@@ -706,3 +706,50 @@ per-city manual override, theed manual); anti-gank = break off after N deaths.
 5. breakOffsTotal sane over a session (not firing constantly from bot-vs-bot
    churn — if it is, raise breakOffDeaths or shorten the window).
 6. No stateTtl/hardStuck/boardAnyway regression vs 0.2.1 baseline.
+
+## 15. P.6.5e Stalemate Break + Collector Jitter — AS BUILT (2026-07-15, PENDING BUILD GATE+RESTART)
+
+Plan: `docs/1-plans/F_0.3.1_p65e-stalemate-break.plan.md` (Codex plan review
+APPROVED, 3 rounds). Origin: owner-observed frozen statue pair inside Theed
+Spaceport's interior collector (combat deadlock: shared wait coordinate,
+cell-portal LOS block, phantom guard can't clear a live 0m defender) — the
+P.6.2b-flagged fast stalemate break, finally shipped.
+
+### 15.1 What shipped
+
+1. **Stalemate break** (`SimPvpBotController::onTick`, covers leaders AND
+   members via the base-onTick chain): tracks CURRENT HEALTH/ACTION/MIND
+   totals on self + tracked defender each combat tick; any DECREASE stamps
+   progress; defender swap re-baselines. In combat with zero progress for
+   `stalemateBreakSeconds` (lua 45, C++ 0=off; zero-preserving parse — raw
+   <=0 disables, else clamped 15..300) → `clearCombatState(true)` under the
+   agent lock (phantom-guard choreography), record
+   `stalemateIgnoredOid`+`stalemateIgnoreUntilMs` (grace lua 20s, clamp
+   5..60), counter + `SimPvpStalemateBreak oid= squad= defender= idleMs=`
+   log. The bot's OWN `scanForTargets` skips the ignored OID while
+   unexpired; the engine defender path is deliberately unfiltered (a landed
+   hit = real combat with fresh progress). Non-combat ticks reset only
+   progress baselines; the ignore pair survives until expiry or
+   `prepareForRelocation` (new base override; SimPvPController chains
+   through it).
+2. **Collector wait jitter**: deterministic golden-angle offset from
+   squadId, radius `collectorJitterMeters` (lua 3, C++ 0=off), applied at
+   leg build to `departureLocalPos` always and `departurePos` only when
+   outdoor (a world-space delta is wrong under building rotation; interior
+   arrival math keeps the cached world point, ±3m divergence within
+   arrival radius).
+3. Dashboard: `routedTravel.stalemateBreaksTotal` + `collectorJitterMeters`
+   echo + cohesion echo `stalemateBreakSeconds`; SPA Stalemate Breaks
+   metric.
+
+### 15.2 Verify after restart (owner's call)
+
+1. `stalemateBreaksTotal` climbs; `SimPvpStalemateBreak` idleMs ≈ 45-50s.
+2. `SimPvpHardStuck ... clearCombat+forceAdvance` rate drops sharply vs the
+   12.3h baseline (26/12h).
+3. No frozen statue pairs at Theed's collector across a session.
+4. Two squads waiting at one port stand ~3m+ apart (jitter visible).
+5. Bot fights still resolve with deaths (breaks fire only on progress-free
+   fights; deathsTotal rate roughly holds).
+6. Scout churn note (owner flipped scouts on 2026-07-15): solo scouts wipe
+   frequently in bot-vs-bot; tune scouts table if the reform spam bothers.

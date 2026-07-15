@@ -1237,6 +1237,10 @@ private:
 	int pvpBreakOffDeaths = 2;
 	int pvpBreakOffWindowSeconds = 120;
 	int pvpAvoidCitySeconds = 600;
+	// P.6.5e combat-progress stalemate break. C++ defaults keep the feature
+	// disabled until the runtime Lua cohesion block enables it.
+	int pvpStalemateBreakSeconds = 0;
+	int pvpStalemateGraceSeconds = 20;
 	// 0.2.1: minimum seconds between the pad MOVEOUT callout and boarding, so
 	// a ship already sitting at the port can't yank the squad ~5s after the
 	// route is spoken. 0 = off (pre-hotfix behavior); board-anyway unaffected.
@@ -1428,6 +1432,7 @@ private:
 	int pvpTransitStopsTotal = 0;         // non-final legs boarded
 	int pvpRouteFallbacksTotal = 0;       // routed on, plan failed → legacy pick
 	int pvpBreakOffsTotal = 0;             // guarded by pvpSquadMutex
+	int pvpStalemateBreaksTotal = 0;       // guarded by pvpSquadMutex
 	// P.6.5b departure-port realism. Collector boarding and hot-arrival are
 	// independently gated; the latter is populated by Phase 2.
 	bool pvpUseCollectorBoarding = false;
@@ -1435,6 +1440,7 @@ private:
 	bool pvpBoardOnActualShuttle = true;
 	float pvpCollectorScanRadiusMeters = 175.f;
 	float pvpCollectorZSanityMeters = 10.f;
+	float pvpCollectorJitterMeters = 0.f;
 	VectorMap<String, PvpBoardingPoint> pvpBoardingPointCache; // pvpSquadMutex
 	// P.6.5d city-location cache; scans are performed outside the mutex and
 	// immutable snapshots are published under it.
@@ -1585,6 +1591,8 @@ public:
 	// Called (once per life) by SimPvpBotController when a bot dies.
 	void onPvpBotDied(uint64 squadId, uint64 oid);
 	void recordPvpEngagement(uint64 squadId, bool targetWasPlayer);
+	void recordPvpStalemateBreak(uint64 squadId, uint64 oid,
+		uint64 defenderOid, uint64 idleMs);
 	// P.6.2: called (throttled) by a report-only scout's scan on contact.
 	void reportPvpContact(uint64 squadId, bool targetWasPlayer);
 
@@ -1632,6 +1640,8 @@ public:
 	// Read-only pvpConfig accessors for the controllers (runtime-refreshed).
 	float getPvpScanRadiusMeters() const { return pvpScanRadiusMeters; }
 	float getPvpCombatLeashMeters() const { return pvpCombatLeashMeters; }
+	int getPvpStalemateBreakSeconds() const { return pvpStalemateBreakSeconds; }
+	int getPvpStalemateGraceSeconds() const { return pvpStalemateGraceSeconds; }
 	bool isPvpBotVsBotCombatEnabled() const { return pvpAllowBotVsBotCombat; }
 	bool isPvpRankedJediEnabled() const { return pvpRankedJediEnabled; }
 	bool isPvpNpcFrsXpEnabled() const { return pvpFrsFromNpcJediEnabled; }
