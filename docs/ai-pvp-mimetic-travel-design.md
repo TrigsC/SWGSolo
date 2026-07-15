@@ -1,6 +1,6 @@
 # P.6.5 — Player-Mimetic Routed Travel for PvP Squads
 
-Status: **P.6.5d BUILT 2026-07-14 (§14, PENDING BUILD GATE+RESTART)**; P.6.5b + 0.2.1 hotfix VERIFIED LIVE 2026-07-14 (MOVEOUT at pad confirmed; 176 collector boardings / 47 tactical arrivals / 0 fallbacks). P.6.5a VERIFIED LIVE 2026-07-09 (302 routes / 316 legs / 17 hops /
+Status: **P.6.5d v0.3.0 VERIFIED LIVE 2026-07-14** (10/10 pads, 7 cantina + 1 manual + 2 fallback hangouts, warmup at 96s post-boot, 2 organic break-offs w/ correct avoid+reroute; staged leader-kill gank still pending — §14.2 item 4); P.6.5b + 0.2.1 hotfix VERIFIED LIVE 2026-07-14 (MOVEOUT at pad confirmed; 176 collector boardings / 47 tactical arrivals / 0 fallbacks). P.6.5a VERIFIED LIVE 2026-07-09 (302 routes / 316 legs / 17 hops /
 0 fallbacks in one session — §11) **+ owner-report fixes SHIPPED** (MOVEOUT
 announce moved to the shuttle wait; log-only orphan-bot sweep; compiled clean,
 PENDING RESTART — verify per §11 BEFORE the P.6.5b restart). Next: P.6.5c
