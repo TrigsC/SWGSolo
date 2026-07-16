@@ -6517,10 +6517,22 @@ void SimPlayerManager::schedulePveFoundationMaintenanceTask() {
 	if (!enabled || !pveEnabled || pveMaintenanceTaskScheduled)
 		return;
 
+	// A live spike samples a fast-moving world (a lair creature wanders/dies
+	// within seconds). The 30s roster cadence is far too coarse for it - tick
+	// every 2s while the spike is in an active phase, revert to 30s otherwise.
+	int intervalSeconds = pveMaintenanceIntervalSeconds;
+	{
+		Locker pveLock(&pveMutex);
+		bool spikeActive = pveSpikeEnabled && pveSpike.startedAtMs != 0 &&
+			pveSpike.phase != "DONE";
+		if (spikeActive && intervalSeconds > 2)
+			intervalSeconds = 2;
+	}
+
 	pveMaintenanceTaskScheduled = true;
 	Reference<SimPveFoundationMaintenanceTask*> task =
 		new SimPveFoundationMaintenanceTask();
-	task->schedule(pveMaintenanceIntervalSeconds * 1000);
+	task->schedule(intervalSeconds * 1000);
 }
 
 static String pveRosterResultString(ResultSet* result, int index) {
@@ -7388,8 +7400,18 @@ bool SimPlayerManager::engagePveSpike(uint64 nowMs) {
 	ManagedReference<SceneObject*> targetObject = zoneServer->getObject(targetOid);
 	AiAgent* hunter = hunterObject == nullptr ? nullptr : hunterObject->asAiAgent();
 	AiAgent* target = targetObject == nullptr ? nullptr : targetObject->asAiAgent();
-	if (hunter == nullptr || target == nullptr)
+	if (hunter == nullptr || target == nullptr) {
+		// The selected target vanished before engage. Reselect next tick
+		// instead of stalling ENGAGING until the combat timeout.
+		Locker pveLock(&pveMutex);
+		if (pveSpike.phase == "ENGAGING") {
+			info("SimPveSpike targetVanished target=" +
+				String::valueOf(targetOid) + " -> reselect", true);
+			pveSpike.targetOid = 0;
+			pveSpike.phase = "AWAITING_WORLD";
+		}
 		return false;
+	}
 
 	bool accepted = false;
 	int targetHealthAtEngage = 0;
@@ -7406,6 +7428,8 @@ bool SimPlayerManager::engagePveSpike(uint64 nowMs) {
 	}
 
 	if (!accepted) {
+		info("SimPveSpike phase=DONE verdict=FAIL failureFlag=attackAccepted "
+			"target=" + String::valueOf(targetOid), true);
 		Locker pveLock(&pveMutex);
 		pveSpike.attackAccepted = false;
 		pveSpike.failureFlag = "attackAccepted";
@@ -7549,8 +7573,13 @@ void SimPlayerManager::advancePveSpike(uint64 nowMs) {
 			pveSpike.spawnsTriggeredNearby = spawnDelta;
 		}
 
-		if (spawnDelta > 0 && selectPveSpikeTarget())
+		if (spawnDelta > 0 && selectPveSpikeTarget()) {
+			// Engage in the SAME tick - a gap lets the just-selected lair
+			// creature wander or die before the attack is ever commanded
+			// (observed live: select then FAIL one tick later).
+			engagePveSpike(nowMs);
 			return;
+		}
 
 		ZoneServer* zoneServer = ServerCore::getZoneServer();
 		ManagedReference<SceneObject*> hunterObject = zoneServer == nullptr ?
