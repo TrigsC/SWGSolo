@@ -648,9 +648,15 @@ SimPlayerManagerConfig = {
             enabled = true,
             worldWaitTimeoutSeconds = 300,
             combatTimeoutSeconds = 180,
-            scanRadiusMeters = 96,
+            -- 250 covers the lair spawn range (CLOSEOBJECTRANGE 192m) plus
+            -- the creatures' spread around their lair; 96 missed them.
+            scanRadiusMeters = 250,
             hunterTemplate = "artisan",
-            targetTemplateFilter = "womprat",
+            -- Empty = ANY attackable wild creature proves the kill path. The
+            -- old "womprat" filter never matched western_dune_sea_2's
+            -- hard_dune_sea spawn group. Phase 2's per-species hunts filter;
+            -- the spike only needs to prove attackability.
+            targetTemplateFilter = "",
             -- This is a real main-planet SPAWNAREA from
             -- managers/planet/tatooine_regions.lua. NOTE: use the large
             -- western_dune_sea_2 region with an EXPLICIT x/y - medium_womprats'
