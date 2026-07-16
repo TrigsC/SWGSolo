@@ -6,6 +6,9 @@
 #ifndef SIMPLAYERMANAGER_H_
 #define SIMPLAYERMANAGER_H_
 
+#include <atomic>
+#include <memory>
+
 #include "engine/util/Singleton.h"
 #include "system/util/SynchronizedVectorMap.h"
 #include "system/util/Vector.h"
@@ -63,9 +66,12 @@ struct SimBotIdentity {
 struct PveSpikeState {
 	String phase = "SPAWNING";
 	uint64 startedAtMs = 0;
+	uint64 phaseStartedAtMs = 0;
 	uint64 finishedAtMs = 0;
 	uint64 hunterOid = 0;
 	uint64 targetOid = 0;
+	uint64 spawnBaselineCount = 0;
+	uint64 spawnsTriggeredNearby = 0;
 	int targetHealthAtEngage = 0;
 	int targetActionAtEngage = 0;
 	int targetMindAtEngage = 0;
@@ -88,6 +94,14 @@ struct PveSpikeState {
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// P.8.0b: zone-thread readers use an atomically published immutable copy. The
+// value is zero for an active membership and a future timestamp for the
+// removal grace window. The manager owns all mutations under pveMutex.
+struct PvePresenceSnapshot {
+	bool enabled = false;
+	VectorMap<uint64, uint64> memberGraceUntilMs;
 };
 
 // P.5.3: defined in the .cpp (file scope); forward-declared here so the crafter
@@ -1127,21 +1141,28 @@ private:
 	VectorMap<uint64, uint64> pveBodyIdentityIds;
 	VectorMap<uint64, uint64> pveRespawnDueAtMs;
 	VectorMap<uint64, bool> pveDirtyIdentityIds;
+	VectorMap<uint64, uint64> pvePresenceOids;
+	VectorMap<uint64, uint64> pvePresenceSpawnCounts;
+	uint64 pvePresenceSpawnTotal = 0;
+	std::shared_ptr<const PvePresenceSnapshot> pvePresenceSnapshot;
 	Mutex pveMutex;
 	PveSpikeState pveSpike;
 	Reference<Observer*> pveSpikeObserver;
 
 	bool pveEnabled = false;
 	bool pveHunterBotsEnabled = false; // Phase 2 remains config-locked.
+	bool pveWorldPresenceEnabled = false;
 	bool pveSpikeEnabled = false;
 	int pveMaxHunters = 6;
 	int pveSkillTier = 1;
 	int pveMaintenanceIntervalSeconds = 30;
 	int pveRespawnDelaySeconds = 120;
-	int pveSpikeTimeoutSeconds = 180;
+	int pveSpikeWorldWaitTimeoutSeconds = 300;
+	int pveSpikeCombatTimeoutSeconds = 180;
 	int pveSpikeScanRadiusMeters = 96;
 	String pveSpikeHunterTemplate = "artisan";
 	String pveSpikeTargetTemplateFilter;
+	String pveSpikeSpawnArea;
 	String pveSpikePlanet;
 	Vector3 pveSpikePosition;
 	Vector<String> pveHunterTemplates;
@@ -1166,10 +1187,16 @@ private:
 	AiAgent* spawnPveIdentityBody(const SimBotIdentity& identity);
 	void runPveSpikeIfNeeded(uint64 nowMs);
 	void advancePveSpike(uint64 nowMs);
-	bool spawnPveSpikeActors();
+	bool spawnPveSpikeActors(uint64 nowMs);
 	bool engagePveSpike(uint64 nowMs);
+	bool selectPveSpikeTarget();
 	void registerPveDestructionObserver(uint64 targetOid, uint64 participantOid);
 	void cleanupPveSpike();
+	void publishPvePresenceSnapshotLocked(uint64 nowMs);
+	void expirePvePresenceMembers(uint64 nowMs);
+	bool publishSimPresenceMember(uint64 oid);
+	void removeSimPresenceMemberAfterWorldExit(uint64 oid, uint64 nowMs);
+	void drainSimPresenceBodies(uint64 nowMs);
 	JSONSerializationType getPveActivityDashboard();
 	JSONSerializationType getPveSpikeDashboard();
 
@@ -1682,6 +1709,12 @@ public:
 		return minerIntelligentArrivalRadiusMeters;
 	}
 	JSONSerializationType getAiEconomyDashboardSnapshot();
+	// P.8.0b: this predicate is used by hot zone/AI paths. It returns true for
+	// real players first, then consults only the published presence snapshot for
+	// opted-in PlayerBot bodies; it never acquires pveMutex.
+	bool isPlayerOrSimPresenceCreature(CreatureObject* creature) const;
+	bool isSimPresenceCreature(CreatureObject* creature) const;
+	void recordSimPresenceSpawn(uint64 oid);
 
 	// P.8 Phase 1: the foundation task owns every roster SQL operation. The
 	// destruction handoff is intentionally public because queued lambdas are not

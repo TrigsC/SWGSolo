@@ -633,6 +633,7 @@ SimPlayerManagerConfig = {
     pveConfig = {
         enabled = true,
         enableHunterBots = false, -- config-locked until the spike gate passes
+        enableWorldPresence = true, -- P.8.0b: spike/hunters act as players to world spawns
         maxHunters = 6,
         skillTier = 1,
         maintenanceIntervalSeconds = 30,
@@ -645,17 +646,18 @@ SimPlayerManagerConfig = {
         },
         spike = {
             enabled = true,
-            timeoutSeconds = 180,
+            worldWaitTimeoutSeconds = 300,
+            combatTimeoutSeconds = 180,
             scanRadiusMeters = 96,
             hunterTemplate = "artisan",
             targetTemplateFilter = "womprat",
-            -- Kept away from the city center so the spike observes ordinary
-            -- wild-creature attackability without touching PvP populations.
-            lowThreatArea = {
+            -- This is a real main-planet SPAWNAREA from
+            -- managers/planet/tatooine_regions.lua, backed by the ordinary
+            -- tatooine_medium_womprats spawn group. The C++ spike
+            -- resolves its center through CreatureManager::getSpawnArea().
+            spawnArea = {
                 planet = "tatooine",
-                x = 3600.0,
-                y = -5050.0,
-                z = 5.0,
+                name = "@tatooine_region_names:medium_womprats",
             },
         },
     },

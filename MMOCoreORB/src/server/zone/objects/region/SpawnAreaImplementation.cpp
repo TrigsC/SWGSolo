@@ -12,6 +12,7 @@
 #include "server/zone/managers/creature/CreatureTemplateManager.h"
 #include "server/zone/managers/creature/SpawnGroup.h"
 #include "server/zone/managers/planet/PlanetManager.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
 #include "server/zone/objects/region/SpawnAreaObserver.h"
 #include "server/zone/objects/area/areashapes/AreaShape.h"
 #include "server/ServerCore.h"
@@ -27,7 +28,8 @@ void SpawnAreaImplementation::notifyPositionUpdate(TreeEntry* entry) {
 
 	SceneObject* sceneObject = cast<SceneObject*>(entry);
 
-	if (sceneObject == nullptr || !sceneObject->isPlayerCreature()) {
+	if (sceneObject == nullptr || !SimPlayerManager::instance()->
+		isPlayerOrSimPresenceCreature(sceneObject->asCreatureObject())) {
 		return;
 	}
 
@@ -58,7 +60,8 @@ void SpawnAreaImplementation::notifyPositionUpdate(TreeEntry* entry) {
 }
 
 void SpawnAreaImplementation::notifyEnter(SceneObject* sceneO) {
-	if (sceneO == nullptr || !sceneO->isPlayerCreature())
+	if (sceneO == nullptr || !SimPlayerManager::instance()->
+		isPlayerOrSimPresenceCreature(sceneO->asCreatureObject()))
 		return;
 
 	if (sceneO->isDebuggingRegions())
@@ -72,7 +75,8 @@ void SpawnAreaImplementation::notifyEnter(SceneObject* sceneO) {
 }
 
 void SpawnAreaImplementation::notifyExit(SceneObject* sceneO) {
-	if (sceneO == nullptr || !sceneO->isPlayerCreature())
+	if (sceneO == nullptr || !SimPlayerManager::instance()->
+		isPlayerOrSimPresenceCreature(sceneO->asCreatureObject()))
 		return;
 
 	if (sceneO->isDebuggingRegions())
@@ -179,6 +183,9 @@ int SpawnAreaImplementation::notifyObserverEvent(unsigned int eventType, Observa
 }
 
 void SpawnAreaImplementation::tryToSpawn(CreatureObject* player) {
+	// ActiveAreaEvent can carry a stale/ghost player pointer. Keep this guard
+	// at the native entry point so every player dereference below is reached
+	// only after the same null audit used by the caller paths.
 	if (player == nullptr)
 		return;
 
@@ -393,6 +400,10 @@ void SpawnAreaImplementation::tryToSpawn(CreatureObject* player) {
 	totalSpawnCount++;
 
 	spawnCountByType.put(lairTemplate.hashCode(), currentSpawnCount + 1);
+
+	if (SimPlayerManager::instance()->isSimPresenceCreature(player))
+		SimPlayerManager::instance()->recordSimPresenceSpawn(
+			player->getObjectID());
 
 #ifdef DEBUG_SPAWNING
 		info(true) << "tryToSpawn Complete";

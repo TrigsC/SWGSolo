@@ -4226,7 +4226,8 @@ void AiAgentImplementation::notifyInsert(TreeEntry* entry) {
 
 	CreatureObject* creo = scno->asCreatureObject();
 
-	if (creo != nullptr && !creo->isInvisible() && creo->isPlayerCreature()) {
+	if (creo != nullptr && !creo->isInvisible() &&
+			SimPlayerManager::instance()->isPlayerOrSimPresenceCreature(creo)) {
 		int newValue = (int) numberOfPlayersInRange.increment();
 		activateAiBehavior();
 	}
@@ -4392,7 +4393,7 @@ void AiAgentImplementation::notifyDissapear(TreeEntry* entry) {
 
 	SceneObject* scno = static_cast<SceneObject*>( entry);
 
-	if (scno == asAiAgent())
+	if (scno == nullptr || scno == asAiAgent())
 		return;
 
 	if (scno == getFollowObject().get()) {
@@ -4409,9 +4410,9 @@ void AiAgentImplementation::notifyDissapear(TreeEntry* entry) {
 			}, "RestoreFollowObjectLambda");
 	}
 
-	if (scno->isPlayerCreature()) {
-		CreatureObject* creo = scno->asCreatureObject();
-
+	CreatureObject* creo = scno->asCreatureObject();
+	if (creo != nullptr &&
+			SimPlayerManager::instance()->isPlayerOrSimPresenceCreature(creo)) {
 		if (!creo->isInvisible()) {
 			int32 newValue = (int32) numberOfPlayersInRange.decrement();
 

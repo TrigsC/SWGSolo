@@ -25,6 +25,7 @@
 #include "server/zone/objects/creature/ai/CreatureTemplate.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h"
+#include "server/zone/objects/region/SpawnArea.h"
 #include "server/zone/objects/creature/VehicleObject.h"
 #include "server/zone/objects/tangible/weapon/WeaponObject.h"
 #include "server/zone/objects/intangible/VehicleControlDevice.h"
@@ -5306,20 +5307,27 @@ void SimPlayerManager::loadLuaConfig() {
 		pveBodyIdentityIds.removeAll();
 		pveRespawnDueAtMs.removeAll();
 		pveDirtyIdentityIds.removeAll();
+		pvePresenceOids.removeAll();
+		pvePresenceSpawnCounts.removeAll();
+		pvePresenceSpawnTotal = 0;
 		pveSpike = PveSpikeState();
 		pveSpikeObserver = nullptr;
+		publishPvePresenceSnapshotLocked(System::getMiliTime());
 	}
 	pveEnabled = false;
 	pveHunterBotsEnabled = false;
+	pveWorldPresenceEnabled = false;
 	pveSpikeEnabled = false;
 	pveMaxHunters = 6;
 	pveSkillTier = 1;
 	pveMaintenanceIntervalSeconds = 30;
 	pveRespawnDelaySeconds = 120;
-	pveSpikeTimeoutSeconds = 180;
+	pveSpikeWorldWaitTimeoutSeconds = 300;
+	pveSpikeCombatTimeoutSeconds = 180;
 	pveSpikeScanRadiusMeters = 96;
 	pveSpikeHunterTemplate = "artisan";
 	pveSpikeTargetTemplateFilter = "";
+	pveSpikeSpawnArea = "";
 	pveSpikePlanet = "";
 	pveSpikePosition = Vector3();
 	pveHunterTemplates.removeAll();
@@ -5328,6 +5336,10 @@ void SimPlayerManager::loadLuaConfig() {
 	pveBootReady = false;
 	pveMaintenanceTaskScheduled = false;
 	pveLastRosterFlushMs = 0;
+	{
+		Locker pveLock(&pveMutex);
+		publishPvePresenceSnapshotLocked(System::getMiliTime());
+	}
 	pveRosterFlushIntervalSeconds = 60;
 	pveNextHomeCityIndex = 0;
     // P.6.1 SimPvP defaults (all off/conservative; lua pvpConfig overrides).
@@ -6264,6 +6276,8 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	pveEnabled = pveConfig.getBooleanField("enabled", pveEnabled);
 	pveHunterBotsEnabled = pveConfig.getBooleanField(
 		"enableHunterBots", pveHunterBotsEnabled);
+	pveWorldPresenceEnabled = pveConfig.getBooleanField(
+		"enableWorldPresence", pveWorldPresenceEnabled);
 	pveMaxHunters = clampMinerInt(
 		pveConfig.getIntField("maxHunters"), pveMaxHunters, 0, 64);
 	pveSkillTier = clampMinerInt(
@@ -6308,9 +6322,12 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	if (spikeConfig.isValidTable()) {
 		pveSpikeEnabled = spikeConfig.getBooleanField(
 			"enabled", pveSpikeEnabled);
-		pveSpikeTimeoutSeconds = clampMinerInt(
-			spikeConfig.getIntField("timeoutSeconds"),
-			pveSpikeTimeoutSeconds, 30, 3600);
+		pveSpikeWorldWaitTimeoutSeconds = clampMinerInt(
+			spikeConfig.getIntField("worldWaitTimeoutSeconds"),
+			pveSpikeWorldWaitTimeoutSeconds, 30, 3600);
+		pveSpikeCombatTimeoutSeconds = clampMinerInt(
+			spikeConfig.getIntField("combatTimeoutSeconds"),
+			pveSpikeCombatTimeoutSeconds, 30, 3600);
 		pveSpikeScanRadiusMeters = clampMinerInt(
 			spikeConfig.getIntField("scanRadiusMeters"),
 			pveSpikeScanRadiusMeters, 16, 256);
@@ -6324,15 +6341,12 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		if (!targetFilter.isEmpty())
 			pveSpikeTargetTemplateFilter = targetFilter.toLowerCase();
 
-		LuaObject area = spikeConfig.getObjectField("lowThreatArea");
-		if (area.isValidTable()) {
-			pveSpikePlanet = area.getStringField("planet").trim();
-			float x = area.getFloatField("x");
-			float y = area.getFloatField("y");
-			float z = area.getFloatField("z");
-			pveSpikePosition = Vector3(x, y, z);
+		LuaObject spawnArea = spikeConfig.getObjectField("spawnArea");
+		if (spawnArea.isValidTable()) {
+			pveSpikePlanet = spawnArea.getStringField("planet").trim();
+			pveSpikeSpawnArea = spawnArea.getStringField("name").trim();
 		}
-		area.pop();
+		spawnArea.pop();
 	}
 	spikeConfig.pop();
 
@@ -6351,9 +6365,141 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 
 	info("SimPveConfig enabled=" + String::valueOf(pveEnabled) +
 		" enableHunterBots=" + String::valueOf(pveHunterBotsEnabled) +
+		" enableWorldPresence=" + String::valueOf(pveWorldPresenceEnabled) +
 		" spikeEnabled=" + String::valueOf(pveSpikeEnabled) +
 		" maxHunters=" + String::valueOf(pveMaxHunters) +
-		" timeoutSeconds=" + String::valueOf(pveSpikeTimeoutSeconds), true);
+		" worldWaitTimeoutSeconds=" +
+		String::valueOf(pveSpikeWorldWaitTimeoutSeconds) +
+		" combatTimeoutSeconds=" +
+		String::valueOf(pveSpikeCombatTimeoutSeconds), true);
+
+	{
+		Locker pveLock(&pveMutex);
+		publishPvePresenceSnapshotLocked(System::getMiliTime());
+	}
+}
+
+bool SimPlayerManager::isPlayerOrSimPresenceCreature(
+	CreatureObject* creature) const {
+	// Hot-path ordering is intentional: real players never touch the published
+	// snapshot, and ordinary wildlife fails before the ObjectFlag lookup.
+	if (creature == nullptr)
+		return false;
+
+	if (creature->isPlayerCreature())
+		return true;
+
+	if ((creature->getPvpStatusBitmask() & ObjectFlag::PLAYER) == 0)
+		return false;
+
+	std::shared_ptr<const PvePresenceSnapshot> snapshot =
+		std::atomic_load(&pvePresenceSnapshot);
+	if (snapshot == nullptr || !snapshot->enabled)
+		return false;
+
+	uint64 oid = creature->getObjectID();
+	if (!snapshot->memberGraceUntilMs.contains(oid))
+		return false;
+
+	uint64 graceUntilMs = snapshot->memberGraceUntilMs.get(oid);
+	return graceUntilMs == 0 || graceUntilMs >= System::getMiliTime();
+}
+
+bool SimPlayerManager::isSimPresenceCreature(CreatureObject* creature) const {
+	if (creature == nullptr || creature->isPlayerCreature())
+		return false;
+
+	if ((creature->getPvpStatusBitmask() & ObjectFlag::PLAYER) == 0)
+		return false;
+
+	std::shared_ptr<const PvePresenceSnapshot> snapshot =
+		std::atomic_load(&pvePresenceSnapshot);
+	if (snapshot == nullptr || !snapshot->enabled)
+		return false;
+
+	uint64 oid = creature->getObjectID();
+	if (!snapshot->memberGraceUntilMs.contains(oid))
+		return false;
+
+	uint64 graceUntilMs = snapshot->memberGraceUntilMs.get(oid);
+	return graceUntilMs == 0 || graceUntilMs >= System::getMiliTime();
+}
+
+void SimPlayerManager::publishPvePresenceSnapshotLocked(uint64 nowMs) {
+	std::shared_ptr<PvePresenceSnapshot> next(new PvePresenceSnapshot());
+	for (int i = 0; i < pvePresenceOids.size(); ++i) {
+		uint64 oid = pvePresenceOids.elementAt(i).getKey();
+		uint64 graceUntilMs = pvePresenceOids.elementAt(i).getValue();
+		if (graceUntilMs != 0 && graceUntilMs < nowMs)
+			continue;
+		next->memberGraceUntilMs.put(oid, graceUntilMs);
+	}
+
+	// Keep the published gate open while a drained member is still in its
+	// grace window. This is what makes queued exit/disappear notifications
+	// symmetric with the earlier enter/insert notification.
+	next->enabled = (pveEnabled && pveWorldPresenceEnabled) ||
+		pvePresenceOids.size() > 0;
+	std::shared_ptr<const PvePresenceSnapshot> published = next;
+	std::atomic_store(&pvePresenceSnapshot, published);
+}
+
+bool SimPlayerManager::publishSimPresenceMember(uint64 oid) {
+	if (oid == 0)
+		return false;
+
+	Locker pveLock(&pveMutex);
+	if (!pveEnabled || !pveWorldPresenceEnabled)
+		return false;
+
+	pvePresenceOids.put(oid, 0);
+	publishPvePresenceSnapshotLocked(System::getMiliTime());
+	return true;
+}
+
+void SimPlayerManager::removeSimPresenceMemberAfterWorldExit(
+	uint64 oid, uint64 nowMs) {
+	if (oid == 0)
+		return;
+
+	Locker pveLock(&pveMutex);
+	if (!pvePresenceOids.contains(oid))
+		return;
+
+	pvePresenceOids.put(oid, nowMs + 10000);
+	publishPvePresenceSnapshotLocked(nowMs);
+}
+
+void SimPlayerManager::expirePvePresenceMembers(uint64 nowMs) {
+	Locker pveLock(&pveMutex);
+	bool changed = false;
+	for (int i = pvePresenceOids.size() - 1; i >= 0; --i) {
+		uint64 graceUntilMs = pvePresenceOids.elementAt(i).getValue();
+		if (graceUntilMs != 0 && graceUntilMs < nowMs) {
+			pvePresenceOids.remove(i);
+			changed = true;
+		}
+	}
+
+	if (changed)
+		publishPvePresenceSnapshotLocked(nowMs);
+}
+
+void SimPlayerManager::recordSimPresenceSpawn(uint64 oid) {
+	if (oid == 0)
+		return;
+
+	Locker pveLock(&pveMutex);
+	uint64 count = pvePresenceSpawnCounts.contains(oid) ?
+		pvePresenceSpawnCounts.get(oid) : 0;
+	pvePresenceSpawnCounts.put(oid, count + 1);
+	pvePresenceSpawnTotal++;
+
+	if (pveSpike.phase == "AWAITING_WORLD" &&
+			pveSpike.hunterOid == oid && count + 1 >= pveSpike.spawnBaselineCount) {
+		pveSpike.spawnsTriggeredNearby =
+			(count + 1) - pveSpike.spawnBaselineCount;
+	}
 }
 
 void SimPlayerManager::schedulePveFoundationMaintenanceTask() {
@@ -6620,9 +6766,15 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity) 
 	if (spawnZ == 0.f)
 		spawnZ = home.spawn.getZ();
 
-	CreatureObject* creature = creatureManager->spawnCreature(
-		templateName.hashCode(), 0, home.spawn.getX(), spawnZ,
-		home.spawn.getY(), 0);
+	CreatureTemplate* creoTempl = CreatureTemplateManager::instance()->
+		getTemplate(templateName.hashCode());
+	if (creoTempl == nullptr)
+		return nullptr;
+
+	String objectTemplate = creatureManager->getTemplateToSpawn(
+		templateName.hashCode());
+	CreatureObject* creature = creatureManager->createCreature(
+		objectTemplate.hashCode(), false, templateName.hashCode());
 	if (creature == nullptr)
 		return nullptr;
 
@@ -6631,17 +6783,51 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity) 
 		return nullptr;
 
 	String fullName = identity.firstName + " " + identity.lastName;
-	agent->setCustomObjectName(fullName, true);
 	{
 		Locker agentLock(agent);
+		// createCreature() alone leaves the agent uninitialized -
+		// spawnCreature's path loads the mobile template (npcTemplate, HAM,
+		// level, bitmasks, combat stats, weapons) before any overrides
+		// (CreatureManagerImplementation.cpp:424). Same contract here.
+		agent->loadTemplateData(creoTempl);
+		agent->setCustomObjectName(fullName, true);
 		agent->setCreatureBitmask(0);
 		agent->setDespawnOnNoPlayerInRange(false);
 		agent->writeBlackboard("simAlwaysActive", true);
 		agent->setSimAlwaysActive(true);
 		agent->setSimPlayerBot(true);
-		applySimNpcPresentation(agent, 0);
-		// Phase 1 bodies are identity attachments only. simMiner keeps the
-		// body from acquiring a default wander/controller; Phase 2 owns the
+		// Presence-enabled bodies must carry PLAYER even when the optional
+		// client-dot presentation setting is disabled.
+		applySimNpcPresentation(agent, ObjectFlag::PLAYER);
+	}
+
+	uint64 bodyOid = agent->getObjectID();
+	// Unconditional: hunter bodies REQUIRE world presence by design, and
+	// publishSimPresenceMember is the authoritative flag check (under
+	// pveMutex). Gating on a stale local read of the flag would short-circuit
+	// past the refusal and place an unregistered body the drain cannot see.
+	if (!publishSimPresenceMember(bodyOid)) {
+		// A concurrent disable refused publication. Placing anyway would
+		// create a body the drain cannot see (it only walks presence
+		// members) - abort and destroy the never-placed creature; the
+		// population governor retries after the disable settles.
+		Locker agentLock(agent);
+		agent->destroyObjectFromWorld(true);
+		agent->destroyObjectFromDatabase(true);
+		return nullptr;
+	}
+
+	{
+		Locker agentLock(agent);
+		// Publish membership before this call: placeCreature inserts into the
+		// world and synchronously starts the area enter/insert choreography.
+		creatureManager->placeCreature(creature, home.spawn.getX(), spawnZ,
+			home.spawn.getY(), 0);
+	}
+
+	{
+		Locker agentLock(agent);
+		// Phase 1 bodies are identity attachments only. Phase 2 owns the
 		// SimHunterController binding and behavior loop.
 		agent->setCustomAiMap(String("simMiner").hashCode());
 		agent->setAITemplate();
@@ -6651,7 +6837,66 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity) 
 	return agent;
 }
 
+void SimPlayerManager::drainSimPresenceBodies(uint64 nowMs) {
+	Vector<uint64> presenceOids;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < pvePresenceOids.size(); ++i) {
+			// A non-zero value is already in the post-world-removal grace
+			// window; do not destroy it again or restart its ten-second clock.
+			if (pvePresenceOids.elementAt(i).getValue() == 0)
+				presenceOids.add(pvePresenceOids.elementAt(i).getKey());
+		}
+
+		// Detach identity rows before world destruction, but do not revoke the
+		// presence membership until the destroyObjectFromWorld call below has
+		// completed. This is the disable=drain ordering contract.
+		for (int i = 0; i < presenceOids.size(); ++i) {
+			uint64 oid = presenceOids.get(i);
+			for (int j = pveBodyIdentityIds.size() - 1; j >= 0; --j) {
+				if (pveBodyIdentityIds.elementAt(j).getKey() != oid)
+					continue;
+				uint64 identityId = pveBodyIdentityIds.elementAt(j).getValue();
+				pveBodyIdentityIds.remove(j);
+				pveIdentityBodyOids.drop(identityId);
+				pveRespawnDueAtMs.drop(identityId);
+			}
+		}
+	}
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	for (int i = 0; i < presenceOids.size(); ++i) {
+		uint64 oid = presenceOids.get(i);
+		controllers.drop(oid);
+
+		ManagedReference<SceneObject*> object = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(oid);
+		AiAgent* agent = object == nullptr ? nullptr : object->asAiAgent();
+		if (agent != nullptr) {
+			{
+				Locker agentLock(agent);
+				agent->destroyObjectFromWorld(true);
+				agent->destroyObjectFromDatabase(true);
+			}
+		}
+		// The grace clock starts only after this body's world removal. A missing
+		// object is already out of the world, while an existing object reaches
+		// this point only after destroyObjectFromWorld returned.
+		removeSimPresenceMemberAfterWorldExit(oid, nowMs);
+	}
+
+	expirePvePresenceMembers(nowMs);
+	if (presenceOids.size() > 0)
+		info("SimPvePresenceDrain bodies=" +
+			String::valueOf(presenceOids.size()), true);
+}
+
 void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
+	if (!pveWorldPresenceEnabled) {
+		drainSimPresenceBodies(nowMs);
+		return;
+	}
+
 	if (!pveHunterBotsEnabled) {
 		// Runtime disable (true -> false via the config refresh): existing
 		// bodies must not linger unmanaged. Collect + clear the attachment
@@ -6686,12 +6931,14 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 					agent->destroyObjectFromWorld(true);
 					agent->destroyObjectFromDatabase(true);
 				}
+				removeSimPresenceMemberAfterWorldExit(oid, nowMs);
 			}
 
 			info("SimPveHuntersDisabledDespawn bodies=" +
 				String::valueOf(orphanBodyOids.size()), true);
 		}
 
+		expirePvePresenceMembers(nowMs);
 		return;
 	}
 
@@ -6703,6 +6950,7 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
 	Vector<uint64> missingIdentities;
+	Vector<uint64> removedBodyOids;
 	Vector<ManagedReference<AiAgent*> > corpses;
 	for (int i = 0; i < bodySnapshot.size(); ++i) {
 		uint64 identityId = bodySnapshot.elementAt(i).getKey();
@@ -6738,6 +6986,7 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 		}
 		if (bodyIndex >= 0) {
 			uint64 bodyOid = pveIdentityBodyOids.elementAt(bodyIndex).getValue();
+			removedBodyOids.add(bodyOid);
 			pveIdentityBodyOids.remove(bodyIndex);
 			for (int j = pveBodyIdentityIds.size() - 1; j >= 0; --j) {
 				if (pveBodyIdentityIds.elementAt(j).getKey() == bodyOid)
@@ -6761,10 +7010,15 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 		corpse->destroyObjectFromWorld(true);
 		corpse->destroyObjectFromDatabase(true);
 	}
+
+	for (int i = 0; i < removedBodyOids.size(); ++i)
+		removeSimPresenceMemberAfterWorldExit(removedBodyOids.get(i), nowMs);
+
+	expirePvePresenceMembers(nowMs);
 }
 
 void SimPlayerManager::governPvePopulation(uint64 nowMs) {
-	if (!pveHunterBotsEnabled || pveMaxHunters <= 0)
+	if (!pveHunterBotsEnabled || !pveWorldPresenceEnabled || pveMaxHunters <= 0)
 		return;
 
 	// The spike verdict is the OWNER's decision input, not a runtime
@@ -6865,65 +7119,153 @@ void SimPlayerManager::runPveSpikeIfNeeded(uint64 nowMs) {
 	if (!pveSpikeEnabled)
 		return;
 
+	if (!pveWorldPresenceEnabled) {
+		bool cleanupRequired = false;
+		{
+			Locker pveLock(&pveMutex);
+			if (pveSpike.phase != "DONE" && pveSpike.hunterOid != 0) {
+				pveSpike.phase = "DONE";
+				pveSpike.finishedAtMs = nowMs;
+				pveSpike.verdict = "PARTIAL";
+				pveSpike.failureFlag = "enableWorldPresence";
+				cleanupRequired = true;
+			}
+		}
+
+		if (cleanupRequired)
+			cleanupPveSpike();
+
+		return;
+	}
+
 	{
 		Locker pveLock(&pveMutex);
 		if (pveSpike.phase == "DONE")
 			return;
-		if (pveSpike.startedAtMs == 0)
+		if (pveSpike.startedAtMs == 0) {
 			pveSpike.startedAtMs = nowMs;
+			pveSpike.phaseStartedAtMs = nowMs;
+		}
 	}
 
 	advancePveSpike(nowMs);
 }
 
-bool SimPlayerManager::spawnPveSpikeActors() {
+bool SimPlayerManager::spawnPveSpikeActors(uint64 nowMs) {
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
 	Zone* zone = zoneServer == nullptr ? nullptr :
 		zoneServer->getZone(pveSpikePlanet);
 	if (zone == nullptr)
 		return false;
 
+	CreatureManager* creatureManager = zone->getCreatureManager();
+	if (creatureManager == nullptr || pveSpikeSpawnArea.isEmpty())
+		return false;
+
+	SpawnArea* spawnArea = creatureManager->getSpawnArea(pveSpikeSpawnArea);
+	if (spawnArea == nullptr)
+		return false;
+
+	Vector3 spawnPosition = spawnArea->getAreaCenter();
+	spawnPosition.setZ(zone->getHeight(spawnPosition.getX(),
+		spawnPosition.getY()));
+	if (spawnPosition.getZ() == 0.f)
+		spawnPosition.setZ(pveSpikePosition.getZ());
+	pveSpikePosition = spawnPosition;
+
 	uint64 hunterOid = 0;
-	uint64 targetOid = 0;
 	{
 		Locker pveLock(&pveMutex);
 		hunterOid = pveSpike.hunterOid;
-		targetOid = pveSpike.targetOid;
 	}
 
 	if (hunterOid == 0) {
-		CreatureManager* creatureManager = zone->getCreatureManager();
-		if (creatureManager == nullptr)
+		CreatureTemplate* creoTempl = CreatureTemplateManager::instance()->
+			getTemplate(pveSpikeHunterTemplate.hashCode());
+		if (creoTempl == nullptr)
 			return false;
-		float spawnZ = zone->getHeight(pveSpikePosition.getX(),
-			pveSpikePosition.getY());
-		if (spawnZ == 0.f)
-			spawnZ = pveSpikePosition.getZ();
-		CreatureObject* creature = creatureManager->spawnCreature(
-			pveSpikeHunterTemplate.hashCode(), 0, pveSpikePosition.getX(),
-			spawnZ, pveSpikePosition.getY(), 0);
+
+		String objectTemplate = creatureManager->getTemplateToSpawn(
+			pveSpikeHunterTemplate.hashCode());
+		CreatureObject* creature = creatureManager->createCreature(
+			objectTemplate.hashCode(), false,
+			pveSpikeHunterTemplate.hashCode());
 		AiAgent* hunter = creature == nullptr ? nullptr : creature->asAiAgent();
 		if (hunter == nullptr)
 			return false;
 
-		hunter->setCustomObjectName("PVE Spike Hunter", true);
 		{
 			Locker hunterLock(hunter);
+			// Same contract as spawnCreature: template init before overrides
+			// (createCreature alone leaves HAM/level/weapons uninitialized).
+			hunter->loadTemplateData(creoTempl);
+			hunter->setCustomObjectName("PVE Spike Hunter", true);
 			hunter->setCreatureBitmask(0);
 			hunter->setDespawnOnNoPlayerInRange(false);
 			hunter->writeBlackboard("simAlwaysActive", true);
 			hunter->setSimAlwaysActive(true);
 			hunter->setSimPlayerBot(true);
-			applySimNpcPresentation(hunter, ObjectFlag::ATTACKABLE);
+			// The spike is the first world-presence body and must always carry
+			// the PLAYER bit, independent of optional client cosmetics.
+			applySimNpcPresentation(hunter,
+				ObjectFlag::ATTACKABLE | ObjectFlag::PLAYER);
+		}
+
+		hunterOid = hunter->getObjectID();
+		{
+			Locker pveLock(&pveMutex);
+			pveSpike.spawnBaselineCount = pvePresenceSpawnCounts.contains(hunterOid) ?
+				pvePresenceSpawnCounts.get(hunterOid) : 0;
+		}
+		if (!publishSimPresenceMember(hunterOid)) {
+			// Presence is a PASS prerequisite; a refusal (concurrent
+			// disable) is a terminal spike outcome, not a silent limp.
+			{
+				Locker hunterLock(hunter);
+				hunter->destroyObjectFromWorld(true);
+				hunter->destroyObjectFromDatabase(true);
+			}
+			Locker pveLock(&pveMutex);
+			pveSpike.phase = "DONE";
+			pveSpike.verdict = "FAIL";
+			pveSpike.failureFlag = "presenceRefused";
+			pveSpike.cleanupComplete = true;
+			return false;
+		}
+		{
+			Locker hunterLock(hunter);
+			// Publish before insertion so the first area enter/insert event sees
+			// exactly the same eligibility as every later movement event.
+			creatureManager->placeCreature(creature, pveSpikePosition.getX(),
+				pveSpikePosition.getZ(), pveSpikePosition.getY(), 0);
+		}
+		{
+			Locker hunterLock(hunter);
 			hunter->setCustomAiMap(String("simPvp").hashCode());
 			hunter->setAITemplate();
 			hunter->clearPatrolPoints();
 		}
-		hunterOid = hunter->getObjectID();
+
 		Locker pveLock(&pveMutex);
 		pveSpike.hunterOid = hunterOid;
-		info("SimPveSpike phase=SPAWNING hunter=" +
+		pveSpike.phase = "AWAITING_WORLD";
+		pveSpike.phaseStartedAtMs = nowMs;
+		info("SimPveSpike phase=AWAITING_WORLD hunter=" +
 			String::valueOf(hunterOid), true);
+	}
+
+	return hunterOid != 0;
+}
+
+bool SimPlayerManager::selectPveSpikeTarget() {
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (zoneServer == nullptr)
+		return false;
+
+	uint64 hunterOid = 0;
+	{
+		Locker pveLock(&pveMutex);
+		hunterOid = pveSpike.hunterOid;
 	}
 
 	ManagedReference<SceneObject*> hunterObject = zoneServer->getObject(hunterOid);
@@ -6931,46 +7273,66 @@ bool SimPlayerManager::spawnPveSpikeActors() {
 	if (hunter == nullptr)
 		return false;
 
-	if (targetOid == 0) {
-		SortedVector<TreeEntry*> closeObjects;
-		zone->getInRangeObjects(pveSpikePosition.getX(), 0,
-			pveSpikePosition.getY(), pveSpikeScanRadiusMeters, &closeObjects,
-			true, true);
+	Zone* zone = nullptr;
+	Vector3 hunterPosition;
+	{
+		Locker hunterLock(hunter);
+		if (hunter->isDead())
+			return false;
+		zone = hunter->getZone();
+		if (zone == nullptr)
+			return false;
+		hunterPosition = hunter->getWorldPosition();
+	}
+	SortedVector<TreeEntry*> closeObjects;
+	zone->getInRangeObjects(hunterPosition.getX(), hunterPosition.getZ(),
+		hunterPosition.getY(), pveSpikeScanRadiusMeters, &closeObjects, true, true);
 
-		for (int i = 0; i < closeObjects.size(); ++i) {
-			SceneObject* object = static_cast<SceneObject*>(closeObjects.get(i));
-			CreatureObject* target = object == nullptr ? nullptr :
-				object->asCreatureObject();
-			AiAgent* targetAgent = target == nullptr ? nullptr : target->asAiAgent();
-			if (targetAgent == nullptr || targetAgent == hunter ||
-					targetAgent->isDead() || targetAgent->isIncapacitated() ||
-					targetAgent->getSimPlayerBot() || targetAgent->getParent() != nullptr)
-				continue;
+	uint64 targetOid = 0;
+	for (int i = 0; i < closeObjects.size(); ++i) {
+		SceneObject* object = static_cast<SceneObject*>(closeObjects.get(i));
+		CreatureObject* target = object == nullptr ? nullptr :
+			object->asCreatureObject();
+		AiAgent* targetAgent = target == nullptr ? nullptr : target->asAiAgent();
+		if (targetAgent == nullptr || targetAgent == hunter)
+			continue;
 
+		bool candidate = false;
+		{
+			Locker hunterLock(hunter);
+			Locker targetLock(targetAgent, hunter);
 			const CreatureTemplate* targetTemplate =
 				targetAgent->getCreatureTemplate();
-			if (targetTemplate == nullptr)
-				continue;
-			if (!pveSpikeTargetTemplateFilter.isEmpty() &&
-					targetTemplate->getTemplateName().toLowerCase().indexOf(
-						pveSpikeTargetTemplateFilter) < 0)
-				continue;
-			if (!targetAgent->isAttackableBy(hunter))
-				continue;
-
-			targetOid = targetAgent->getObjectID();
-			break;
+			candidate = !targetAgent->isDead() &&
+				!targetAgent->isIncapacitated() &&
+				!targetAgent->getSimPlayerBot() &&
+				targetAgent->getParent() == nullptr &&
+				targetTemplate != nullptr &&
+				targetAgent->isAttackableBy(hunter);
+			if (candidate && !pveSpikeTargetTemplateFilter.isEmpty())
+				candidate = targetTemplate->getTemplateName().toLowerCase().indexOf(
+					pveSpikeTargetTemplateFilter) >= 0;
 		}
 
-		if (targetOid != 0) {
-			Locker pveLock(&pveMutex);
-			pveSpike.targetOid = targetOid;
-			info("SimPveSpike targetSelected target=" +
-				String::valueOf(targetOid), true);
-		}
+		if (!candidate)
+			continue;
+
+		targetOid = targetAgent->getObjectID();
+		break;
 	}
 
-	return hunterOid != 0 && targetOid != 0;
+	if (targetOid == 0)
+		return false;
+
+	Locker pveLock(&pveMutex);
+	if (pveSpike.targetOid == 0) {
+		pveSpike.targetOid = targetOid;
+		pveSpike.phase = "ENGAGING";
+		pveSpike.phaseStartedAtMs = System::getMiliTime();
+		info("SimPveSpike targetSelected target=" +
+			String::valueOf(targetOid), true);
+	}
+	return true;
 }
 
 bool SimPlayerManager::engagePveSpike(uint64 nowMs) {
@@ -7043,6 +7405,7 @@ bool SimPlayerManager::engagePveSpike(uint64 nowMs) {
 		pveSpike.hunterActionAtEngage = hunterActionAtEngage;
 		pveSpike.hunterMindAtEngage = hunterMindAtEngage;
 		pveSpike.phase = "OBSERVING";
+		pveSpike.phaseStartedAtMs = nowMs;
 	}
 	info("SimPveSpike phase=OBSERVING attackAccepted=true hunter=" +
 		String::valueOf(hunterOid) + " target=" + String::valueOf(targetOid), true);
@@ -7127,27 +7490,64 @@ void SimPlayerManager::advancePveSpike(uint64 nowMs) {
 	if (snapshot.startedAtMs == 0)
 		return;
 
-	if (nowMs - snapshot.startedAtMs >=
-			(uint64)pveSpikeTimeoutSeconds * 1000) {
-		String timeoutVerdict;
-		Locker pveLock(&pveMutex);
-		pveSpike.phase = "DONE";
-		pveSpike.finishedAtMs = nowMs;
-		pveSpike.verdict = pveSpike.attackAccepted ? "PARTIAL" : "FAIL";
-		pveSpike.failureFlag = "timeout";
-		timeoutVerdict = pveSpike.verdict;
-		pveLock.release();
-		info("SimPveSpike phase=DONE verdict=" + timeoutVerdict +
-			" failureFlag=timeout", true);
+	if (snapshot.phase == "DONE") {
 		cleanupPveSpike();
 		return;
 	}
 
 	if (snapshot.phase == "SPAWNING") {
-		spawnPveSpikeActors();
-		Locker pveLock(&pveMutex);
-		if (pveSpike.hunterOid != 0 && pveSpike.targetOid != 0)
-			pveSpike.phase = "ENGAGING";
+		spawnPveSpikeActors(nowMs);
+		return;
+	}
+
+	if (snapshot.phase == "AWAITING_WORLD") {
+		uint64 spawnDelta = 0;
+		{
+			Locker pveLock(&pveMutex);
+			uint64 currentCount = pvePresenceSpawnCounts.contains(
+				pveSpike.hunterOid) ? pvePresenceSpawnCounts.get(
+				pveSpike.hunterOid) : 0;
+			spawnDelta = currentCount >= pveSpike.spawnBaselineCount ?
+				currentCount - pveSpike.spawnBaselineCount : 0;
+			pveSpike.spawnsTriggeredNearby = spawnDelta;
+		}
+
+		if (spawnDelta > 0 && selectPveSpikeTarget())
+			return;
+
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> hunterObject = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(snapshot.hunterOid);
+		AiAgent* hunter = hunterObject == nullptr ? nullptr :
+			hunterObject->asAiAgent();
+		if (hunter != nullptr) {
+			Locker hunterLock(hunter);
+			if (!hunter->isDead() && !hunter->isInCombat() &&
+					hunter->getPatrolPointSize() == 0) {
+				// SpawnArea rolls are movement-driven. Keep the spike moving in
+				// the real region until a lair appears.
+				hunter->generatePatrol(2, 12.f);
+				hunter->setMovementState(AiAgent::PATROLLING);
+			}
+			hunter->activateAiBehavior(true);
+		}
+
+		if (nowMs - snapshot.phaseStartedAtMs >=
+				(uint64)pveSpikeWorldWaitTimeoutSeconds * 1000) {
+			String failureFlag;
+			{
+				Locker pveLock(&pveMutex);
+				pveSpike.phase = "DONE";
+				pveSpike.finishedAtMs = nowMs;
+				pveSpike.verdict = "FAIL";
+				failureFlag = pveSpike.spawnsTriggeredNearby > 0 ?
+					"targetOid" : "spawnsTriggeredNearby";
+				pveSpike.failureFlag = failureFlag;
+			}
+			info("SimPveSpike phase=DONE verdict=FAIL failureFlag=" +
+				failureFlag, true);
+			cleanupPveSpike();
+		}
 		return;
 	}
 
@@ -7158,6 +7558,14 @@ void SimPlayerManager::advancePveSpike(uint64 nowMs) {
 			{
 				Locker pveLock(&pveMutex);
 				done = pveSpike.phase == "DONE";
+				if (!done && nowMs - pveSpike.phaseStartedAtMs >=
+						(uint64)pveSpikeCombatTimeoutSeconds * 1000) {
+					pveSpike.phase = "DONE";
+					pveSpike.finishedAtMs = nowMs;
+					pveSpike.verdict = "FAIL";
+					pveSpike.failureFlag = "attackAccepted";
+					done = true;
+				}
 			}
 			if (done)
 				cleanupPveSpike();
@@ -7227,6 +7635,9 @@ void SimPlayerManager::advancePveSpike(uint64 nowMs) {
 			if (!pveSpike.attackAccepted) {
 				verdict = "FAIL";
 				failureFlag = "attackAccepted";
+			} else if (pveSpike.spawnsTriggeredNearby == 0) {
+				verdict = "PARTIAL";
+				failureFlag = "spawnsTriggeredNearby";
 			} else if (!pveSpike.damageDealtToTarget) {
 				verdict = "PARTIAL";
 				failureFlag = "damageDealtToTarget";
@@ -7248,6 +7659,42 @@ void SimPlayerManager::advancePveSpike(uint64 nowMs) {
 			pveSpike.verdict = verdict;
 			pveSpike.failureFlag = failureFlag;
 		}
+	}
+
+	if (!terminal && nowMs - snapshot.phaseStartedAtMs >=
+			(uint64)pveSpikeCombatTimeoutSeconds * 1000) {
+		Locker pveLock(&pveMutex);
+		pveSpike.phase = "DONE";
+		pveSpike.finishedAtMs = nowMs;
+		if (!pveSpike.attackAccepted) {
+			pveSpike.verdict = "FAIL";
+			pveSpike.failureFlag = "attackAccepted";
+		} else if (pveSpike.spawnsTriggeredNearby == 0) {
+			pveSpike.verdict = "PARTIAL";
+			pveSpike.failureFlag = "spawnsTriggeredNearby";
+		} else if (!pveSpike.damageDealtToTarget) {
+			pveSpike.verdict = "PARTIAL";
+			pveSpike.failureFlag = "damageDealtToTarget";
+		} else if (!pveSpike.targetDied) {
+			pveSpike.verdict = "PARTIAL";
+			pveSpike.failureFlag = "targetDied";
+		} else if (pveSpike.destructionObserverFireCount != 1) {
+			pveSpike.verdict = "PARTIAL";
+			pveSpike.failureFlag = "destructionObserverFireCount";
+		} else if (!pveSpike.observerParticipantVerified) {
+			pveSpike.verdict = "PARTIAL";
+			pveSpike.failureFlag = "observerParticipantVerified";
+		} else {
+			pveSpike.verdict = "PASS";
+			pveSpike.failureFlag = "none";
+		}
+		verdict = pveSpike.verdict;
+		failureFlag = pveSpike.failureFlag;
+		pveLock.release();
+		info("SimPveSpike phase=DONE verdict=" + verdict +
+			" failureFlag=" + failureFlag, true);
+		cleanupPveSpike();
+		return;
 	}
 
 	if (terminal) {
@@ -7290,6 +7737,10 @@ void SimPlayerManager::cleanupPveSpike() {
 		hunter->destroyObjectFromWorld(true);
 		hunter->destroyObjectFromDatabase(true);
 	}
+	// The body is now out of the world. Keep its membership published for the
+	// queued area exit/disappear choreography, then let the maintenance tick
+	// expire the ten-second grace entry.
+	removeSimPresenceMemberAfterWorldExit(hunterOid, System::getMiliTime());
 	info("SimPveSpike cleanupComplete=true hunter=" +
 		String::valueOf(hunterOid), true);
 }
@@ -7307,10 +7758,15 @@ JSONSerializationType SimPlayerManager::getPveSpikeDashboard() {
 	result["verdict"] = spike.verdict;
 	result["failureFlag"] = spike.failureFlag;
 	result["startedAtMs"] = spike.startedAtMs;
+	result["phaseStartedAtMs"] = spike.phaseStartedAtMs;
 	result["finishedAtMs"] = spike.finishedAtMs;
-	result["timeoutSeconds"] = pveSpikeTimeoutSeconds;
+	result["worldWaitTimeoutSeconds"] = pveSpikeWorldWaitTimeoutSeconds;
+	result["combatTimeoutSeconds"] = pveSpikeCombatTimeoutSeconds;
+	result["spawnArea"] = pveSpikeSpawnArea;
 	result["hunterOid"] = spike.hunterOid;
 	result["targetOid"] = spike.targetOid;
+	result["spawnBaselineCount"] = spike.spawnBaselineCount;
+	result["spawnsTriggeredNearby"] = spike.spawnsTriggeredNearby;
 	result["attackAccepted"] = spike.attackAccepted;
 	result["aggroBack"] = spike.aggroBack;
 	result["damageDealtToTarget"] = spike.damageDealtToTarget;
@@ -7327,22 +7783,31 @@ JSONSerializationType SimPlayerManager::getPveSpikeDashboard() {
 JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	Vector<SimBotIdentity> identities;
 	VectorMap<uint64, uint64> bodyOids;
+	VectorMap<uint64, uint64> presenceOids;
+	VectorMap<uint64, uint64> presenceSpawnCounts;
+	uint64 presenceSpawnTotal = 0;
 	{
 		Locker pveLock(&pveMutex);
 		for (int i = 0; i < pveIdentities.size(); ++i)
 			identities.add(pveIdentities.elementAt(i).getValue());
 		bodyOids = pveIdentityBodyOids;
+		presenceOids = pvePresenceOids;
+		presenceSpawnCounts = pvePresenceSpawnCounts;
+		presenceSpawnTotal = pvePresenceSpawnTotal;
 	}
 
 	JSONSerializationType result = JSONSerializationType::object();
 	result["enabled"] = pveEnabled;
 	result["enableHunterBots"] = pveHunterBotsEnabled;
+	result["enableWorldPresence"] = pveWorldPresenceEnabled;
 	result["maxHunters"] = pveMaxHunters;
 	result["rosterLoaded"] = pveRosterLoaded;
 	result["databaseAvailable"] = pveDatabaseAvailable;
 	result["bootReady"] = pveBootReady;
 	result["population"] = identities.size();
 	result["attachedBodies"] = bodyOids.size();
+	result["presenceMembers"] = presenceOids.size();
+	result["presenceSpawnTotal"] = presenceSpawnTotal;
 
 	JSONSerializationType rows = JSONSerializationType::array();
 	for (int i = 0; i < identities.size(); ++i) {
@@ -7359,6 +7824,12 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		row["bodyOid"] = bodyOids.contains(identity.id) ?
 			bodyOids.get(identity.id) : 0;
 		row["bodyAttached"] = bodyOids.contains(identity.id);
+		uint64 bodyOid = bodyOids.contains(identity.id) ?
+			bodyOids.get(identity.id) : 0;
+		row["presenceMember"] = bodyOid != 0 && presenceOids.contains(bodyOid);
+		row["presenceSpawns"] = bodyOid != 0 &&
+			presenceSpawnCounts.contains(bodyOid) ?
+			presenceSpawnCounts.get(bodyOid) : 0;
 		row["phase"] = "FOUNDATION_IDLE";
 		row["assignmentSpecies"] = identity.assignmentSpecies;
 		row["assignmentResource"] = identity.assignmentResource;
@@ -7369,6 +7840,17 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		rows.push_back(row);
 	}
 	result["roster"] = rows;
+
+	JSONSerializationType presenceRows = JSONSerializationType::array();
+	for (int i = 0; i < presenceSpawnCounts.size(); ++i) {
+		JSONSerializationType row = JSONSerializationType::object();
+		uint64 oid = presenceSpawnCounts.elementAt(i).getKey();
+		row["oid"] = oid;
+		row["spawnCount"] = presenceSpawnCounts.elementAt(i).getValue();
+		row["member"] = presenceOids.contains(oid);
+		presenceRows.push_back(row);
+	}
+	result["presenceSpawnRows"] = presenceRows;
 	return result;
 }
 
@@ -15858,8 +16340,8 @@ void SimPlayerManager::applyVehicleConfig(LuaObject& vehicleConfig) {
 }
 
 // Client presentation only. ObjectFlag::PLAYER makes clients render the NPC
-// with player radar dots / player con-color rules; every server-side read of
-// the bit is isPlayerCreature()-gated, so AiAgent gameplay is unaffected. Set
+// with player radar dots / player con-color rules; server-side world-presence
+// reads are manager-gated, so ordinary AiAgent gameplay is unaffected. Set
 // at spawn: clients receive it via sendBaselinesTo -> sendPvpStatusTo on
 // discovery, so the null-closeobjects broadcast no-op on miners is harmless.
 void SimPlayerManager::applySimNpcPresentation(AiAgent* agent, uint32 baseBits) {
