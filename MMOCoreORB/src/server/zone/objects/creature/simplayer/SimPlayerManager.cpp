@@ -5330,6 +5330,7 @@ void SimPlayerManager::loadLuaConfig() {
 	pveSpikeSpawnArea = "";
 	pveSpikePlanet = "";
 	pveSpikePosition = Vector3();
+	pveSpikeHasExplicitPos = false;
 	pveHunterTemplates.removeAll();
 	pveRosterLoaded = false;
 	pveDatabaseAvailable = false;
@@ -6345,6 +6346,16 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		if (spawnArea.isValidTable()) {
 			pveSpikePlanet = spawnArea.getStringField("planet").trim();
 			pveSpikeSpawnArea = spawnArea.getStringField("name").trim();
+			// Optional explicit x/y: overrides the area CENTER, which can sit
+			// inside a NOSPAWN sub-region (e.g. medium_womprats is swallowed by
+			// the Lars Homestead nospawn zone). 0/absent = use the center.
+			float sx = spawnArea.getFloatField("x");
+			float sy = spawnArea.getFloatField("y");
+			if (sx != 0.f || sy != 0.f) {
+				pveSpikePosition.setX(sx);
+				pveSpikePosition.setY(sy);
+				pveSpikeHasExplicitPos = true;
+			}
 		}
 		spawnArea.pop();
 	}
@@ -7170,7 +7181,9 @@ bool SimPlayerManager::spawnPveSpikeActors(uint64 nowMs) {
 	if (spawnArea == nullptr)
 		return false;
 
-	Vector3 spawnPosition = spawnArea->getAreaCenter();
+	Vector3 spawnPosition = pveSpikeHasExplicitPos ?
+		Vector3(pveSpikePosition.getX(), pveSpikePosition.getY(), 0) :
+		spawnArea->getAreaCenter();
 	spawnPosition.setZ(zone->getHeight(spawnPosition.getX(),
 		spawnPosition.getY()));
 	if (spawnPosition.getZ() == 0.f)

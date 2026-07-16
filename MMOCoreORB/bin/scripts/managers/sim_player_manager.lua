@@ -652,12 +652,17 @@ SimPlayerManagerConfig = {
             hunterTemplate = "artisan",
             targetTemplateFilter = "womprat",
             -- This is a real main-planet SPAWNAREA from
-            -- managers/planet/tatooine_regions.lua, backed by the ordinary
-            -- tatooine_medium_womprats spawn group. The C++ spike
-            -- resolves its center through CreatureManager::getSpawnArea().
+            -- managers/planet/tatooine_regions.lua. NOTE: use the large
+            -- western_dune_sea_2 region with an EXPLICIT x/y - medium_womprats'
+            -- center is entirely swallowed by the Lars Homestead NOSPAWN zone
+            -- (proven live: all rolls rejected sub=cityOrNoSpawn). The point
+            -- below is open desert, verified clear of every nospawn/city/
+            -- nobuild region and inside the dune-sea spawn circle.
             spawnArea = {
                 planet = "tatooine",
-                name = "@tatooine_region_names:medium_womprats",
+                name = "@tatooine_region_names:western_dune_sea_2",
+                x = -1500,
+                y = -6500,
             },
         },
     },

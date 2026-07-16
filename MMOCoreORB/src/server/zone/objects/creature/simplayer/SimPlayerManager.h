@@ -1165,6 +1165,7 @@ private:
 	String pveSpikeSpawnArea;
 	String pveSpikePlanet;
 	Vector3 pveSpikePosition;
+	bool pveSpikeHasExplicitPos = false;
 	Vector<String> pveHunterTemplates;
 	bool pveRosterLoaded = false;
 	bool pveDatabaseAvailable = false;
