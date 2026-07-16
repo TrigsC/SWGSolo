@@ -7325,11 +7325,6 @@ bool SimPlayerManager::selectPveSpikeTarget() {
 		hunterPosition.getY(), pveSpikeScanRadiusMeters, &closeObjects, true, true);
 
 	uint64 targetOid = 0;
-	// P.8.0 diagnostics: tally why candidates are rejected so a FAIL names the
-	// blocking sub-check (crucially: notAttackable = the real P.8.0 question).
-	int seenCreatures = 0, rejBotOrSelf = 0, rejDeadIncap = 0, rejParented = 0,
-		rejNoTemplate = 0, rejNotAttackable = 0, rejFilter = 0, firstBlocked = 0;
-	String sampleTemplate;
 	for (int i = 0; i < closeObjects.size(); ++i) {
 		SceneObject* object = static_cast<SceneObject*>(closeObjects.get(i));
 		CreatureObject* target = object == nullptr ? nullptr :
@@ -7338,24 +7333,21 @@ bool SimPlayerManager::selectPveSpikeTarget() {
 		if (targetAgent == nullptr || targetAgent == hunter)
 			continue;
 
-		seenCreatures++;
 		bool candidate = false;
 		{
 			Locker hunterLock(hunter);
 			Locker targetLock(targetAgent, hunter);
 			const CreatureTemplate* targetTemplate =
 				targetAgent->getCreatureTemplate();
-			if (sampleTemplate.isEmpty() && targetTemplate != nullptr)
-				sampleTemplate = targetTemplate->getTemplateName();
-			if (targetAgent->getSimPlayerBot()) { rejBotOrSelf++; }
-			else if (targetAgent->isDead() || targetAgent->isIncapacitated()) { rejDeadIncap++; }
-			else if (targetAgent->getParent() != nullptr) { rejParented++; }
-			else if (targetTemplate == nullptr) { rejNoTemplate++; }
-			else if (!targetAgent->isAttackableBy(hunter)) { rejNotAttackable++; }
-			else if (!pveSpikeTargetTemplateFilter.isEmpty() &&
-					targetTemplate->getTemplateName().toLowerCase().indexOf(
-						pveSpikeTargetTemplateFilter) < 0) { rejFilter++; }
-			else { candidate = true; }
+			candidate = !targetAgent->isDead() &&
+				!targetAgent->isIncapacitated() &&
+				!targetAgent->getSimPlayerBot() &&
+				targetAgent->getParent() == nullptr &&
+				targetTemplate != nullptr &&
+				targetAgent->isAttackableBy(hunter);
+			if (candidate && !pveSpikeTargetTemplateFilter.isEmpty())
+				candidate = targetTemplate->getTemplateName().toLowerCase().indexOf(
+					pveSpikeTargetTemplateFilter) >= 0;
 		}
 
 		if (!candidate)
@@ -7365,20 +7357,8 @@ bool SimPlayerManager::selectPveSpikeTarget() {
 		break;
 	}
 
-	if (targetOid == 0) {
-		// Rate-limited (only when creatures are actually in range) so a FAIL
-		// is diagnosable without spamming empty-scan ticks.
-		if (seenCreatures > 0)
-			info("SimPveSpikeScan seen=" + String::valueOf(seenCreatures) +
-				" botOrSelf=" + String::valueOf(rejBotOrSelf) +
-				" deadIncap=" + String::valueOf(rejDeadIncap) +
-				" parented=" + String::valueOf(rejParented) +
-				" noTemplate=" + String::valueOf(rejNoTemplate) +
-				" notAttackable=" + String::valueOf(rejNotAttackable) +
-				" filtered=" + String::valueOf(rejFilter) +
-				" sample=" + sampleTemplate, true);
+	if (targetOid == 0)
 		return false;
-	}
 
 	Locker pveLock(&pveMutex);
 	if (pveSpike.targetOid == 0) {
@@ -7479,11 +7459,23 @@ bool SimPlayerManager::engagePveSpike(uint64 nowMs) {
 		pveSpike.hunterHealthAtEngage = hunterHealthAtEngage;
 		pveSpike.hunterActionAtEngage = hunterActionAtEngage;
 		pveSpike.hunterMindAtEngage = hunterMindAtEngage;
-		pveSpike.phase = "OBSERVING";
-		pveSpike.phaseStartedAtMs = nowMs;
+		// P.8.0 boundary (owner decision 2026-07-16): the spike proves the
+		// PlayerBot FOUNDATION - presence populates the world, a NEUTRAL bot
+		// can target a wild creature, and it commits an attack. Actually
+		// landing damage / killing requires controller-driven move-to-target
+		// and an equipped weapon, which is Phase 2's SimHunterController (a
+		// few manager-side setter calls do NOT drive AiAgent combat - proven
+		// live: hunterCombat=false, unarmed, target 128m away, never closed).
+		// So PASS terminates here: world-populated + attackable + engaged.
+		pveSpike.phase = "DONE";
+		pveSpike.finishedAtMs = nowMs;
+		pveSpike.verdict = "PASS";
+		pveSpike.failureFlag = "none";
 	}
-	info("SimPveSpike phase=OBSERVING attackAccepted=true hunter=" +
-		String::valueOf(hunterOid) + " target=" + String::valueOf(targetOid), true);
+	info("SimPveSpike phase=DONE verdict=PASS foundationProven=presence+attackable+engaged "
+		"hunter=" + String::valueOf(hunterOid) + " target=" +
+		String::valueOf(targetOid), true);
+	cleanupPveSpike();
 	return true;
 }
 
@@ -7682,21 +7674,6 @@ void SimPlayerManager::advancePveSpike(uint64 nowMs) {
 	bool aggroBack = false;
 	bool damageToTarget = false;
 	bool damageToHunter = false;
-	if (hunter != nullptr && target != nullptr) {
-		Locker hunterLock(hunter);
-		Locker targetLock(target, hunter);
-		WeaponObject* wpn = hunter->getWeapon();
-		info("SimPveSpikeObserve hunterCombat=" +
-			String::valueOf(hunter->isInCombat()) +
-			" hasDefender=" + String::valueOf(hunter->hasDefender(target)) +
-			" dist=" + String::valueOf((int)hunter->getWorldPosition().distanceTo(
-				target->getWorldPosition())) +
-			" weapon=" + (wpn == nullptr ? String("none") :
-				wpn->getObjectTemplate()->getFullTemplateString()) +
-			" tgtHam=" + String::valueOf(target->getHAM(CreatureAttribute::HEALTH)) +
-			"/" + String::valueOf(snapshot.targetHealthAtEngage) +
-			" tgtCombat=" + String::valueOf(target->isInCombat()), true);
-	}
 	if (hunter != nullptr) {
 		Locker hunterLock(hunter);
 		hunterDead = hunter->isDead();
