@@ -651,7 +651,11 @@ SimPlayerManagerConfig = {
             -- 250 covers the lair spawn range (CLOSEOBJECTRANGE 192m) plus
             -- the creatures' spread around their lair; 96 missed them.
             scanRadiusMeters = 250,
-            hunterTemplate = "artisan",
+            -- Combat-capable template (level 25, armed) - the PvP bots kill
+            -- with it. "artisan" is a weaponless crafter and accepted combat
+            -- but never landed a hit (verdict PARTIAL damageDealtToTarget).
+            -- Phase 2 can pick a thematic hunter/mercenary template.
+            hunterTemplate = "stormtrooper",
             -- Empty = ANY attackable wild creature proves the kill path. The
             -- old "womprat" filter never matched western_dune_sea_2's
             -- hard_dune_sea spawn group. Phase 2's per-species hunts filter;
