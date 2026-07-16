@@ -7234,6 +7234,13 @@ bool SimPlayerManager::spawnPveSpikeActors(uint64 nowMs) {
 			hunter->writeBlackboard("simAlwaysActive", true);
 			hunter->setSimAlwaysActive(true);
 			hunter->setSimPlayerBot(true);
+			// NEUTRAL faction: a hunter attacks wild creatures like a PLAYER.
+			// AiAgentImplementation::isAttackableBy refuses a FACTIONED AI vs a
+			// faction-0 wild creature ("faction AI attacking non-faction AI"),
+			// so the stormtrooper template's default imperial faction made
+			// every womprat notAttackable. Clearing it fixes targeting while
+			// keeping the template's weapon/combat capability.
+			hunter->setFaction(0);
 			// The spike is the first world-presence body and must always carry
 			// the PLAYER bit, independent of optional client cosmetics.
 			applySimNpcPresentation(hunter,
