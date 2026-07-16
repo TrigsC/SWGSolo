@@ -1301,30 +1301,44 @@ bool PlanetManagerImplementation::isSpawningPermittedAt(float x, float y, float 
 			continue;
 
 		if (area->isCityRegion() || area->isNoSpawnArea()) {
+			// TEMP P.8.0b spike diagnostics - remove after verdict=PASS.
+			info(true) << "SimPveSpawnPermitReject sub=cityOrNoSpawn area="
+				<< area->getAreaName() << " at " << x << "," << y;
 			return false;
 		}
 
 		if (area->isRegion()) {
 			Region* region = cast<Region*>(area);
 
-			if (region != nullptr && region->isPlayerCity())
+			if (region != nullptr && region->isPlayerCity()) {
+				info(true) << "SimPveSpawnPermitReject sub=playerCity at "
+					<< x << "," << y;
 				return false;
+			}
 		}
 
-		if (worldSpawnArea && area->isNoWorldSpawnArea())
+		if (worldSpawnArea && area->isNoWorldSpawnArea()) {
+			info(true) << "SimPveSpawnPermitReject sub=noWorldSpawnArea area="
+				<< area->getAreaName() << " at " << x << "," << y;
 			return false;
+		}
 	}
 
 	if (isInObjectsNoBuildZone(x, y, margin)) {
+		info(true) << "SimPveSpawnPermitReject sub=noBuildZone at "
+			<< x << "," << y << " margin=" << margin;
 		return false;
 	}
 
 	if (isInWater(x, y)) {
+		info(true) << "SimPveSpawnPermitReject sub=water at " << x << "," << y;
 		return false;
 	}
 
-	if (terrainManager->getHighestHeightDifference(x - 10, y - 10, x + 10, y + 10) > 15.0)
+	if (terrainManager->getHighestHeightDifference(x - 10, y - 10, x + 10, y + 10) > 15.0) {
+		info(true) << "SimPveSpawnPermitReject sub=slope at " << x << "," << y;
 		return false;
+	}
 
 	return true;
 }
