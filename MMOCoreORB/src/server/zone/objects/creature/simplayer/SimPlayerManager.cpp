@@ -7520,8 +7520,21 @@ void SimPlayerManager::advancePveSpike(uint64 nowMs) {
 			nullptr : zoneServer->getObject(snapshot.hunterOid);
 		AiAgent* hunter = hunterObject == nullptr ? nullptr :
 			hunterObject->asAiAgent();
+
 		if (hunter != nullptr) {
 			Locker hunterLock(hunter);
+
+			// ROOT CAUSE of spike v2's spawnsTriggeredNearby=0 (log-proven):
+			// updateActiveAreas is only driven by the PLAYER movement path -
+			// NPC movement never notifies areas after insert, so SpawnArea's
+			// notifyPositionUpdate (the tryToSpawn driver) never fires for a
+			// walking bot. Presence bots pump it themselves at tick cadence
+			// (agent lock held, matching the movement path's invariant);
+			// ~1 call/s per presence bot, zero cost to everyone else.
+			Zone* hunterZone = hunter->getZone();
+			if (!hunter->isDead() && hunterZone != nullptr)
+				hunterZone->updateActiveAreas(hunter);
+
 			if (!hunter->isDead() && !hunter->isInCombat() &&
 					hunter->getPatrolPointSize() == 0) {
 				// SpawnArea rolls are movement-driven. Keep the spike moving in
