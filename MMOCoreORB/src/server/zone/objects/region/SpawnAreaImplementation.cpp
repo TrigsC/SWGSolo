@@ -221,6 +221,10 @@ void SpawnAreaImplementation::tryToSpawn(CreatureObject* player) {
 #ifdef DEBUG_SPAWNING
 		info(true) << "Total Spawn Count Reached for - " << getAreaName() << " Max Limit: " <<  maxSpawnLimit << " Total Spawn Count: " << totalSpawnCount;
 #endif // DEBUG_SPAWNING
+		if (!player->isPlayerCreature())
+			info(true) << "SimPveTrySpawnReject area=" << getAreaName()
+				<< " reason=maxSpawnLimit total=" << totalSpawnCount
+				<< " max=" << maxSpawnLimit;
 		return;
 	}
 
@@ -244,6 +248,9 @@ void SpawnAreaImplementation::tryToSpawn(CreatureObject* player) {
 #ifdef DEBUG_SPAWNING
 		info(true) << "tryToSpawn -- finalSpawnis nullptr";
 #endif // DEBUG_SPAWNING
+		if (!player->isPlayerCreature())
+			info(true) << "SimPveTrySpawnReject area=" << getAreaName()
+				<< " reason=noFinalSpawn weighting=" << totalWeighting;
 		return;
 	}
 
@@ -260,6 +267,9 @@ void SpawnAreaImplementation::tryToSpawn(CreatureObject* player) {
 #ifdef DEBUG_SPAWNING
 		info(true) << "tryToSpawn -- Spawn Limit Reached - spawnLimit: " << spawnLimit << " currentSpawnCount: " << currentSpawnCount;
 #endif // DEBUG_SPAWNING
+		if (!player->isPlayerCreature())
+			info(true) << "SimPveTrySpawnReject area=" << getAreaName()
+				<< " reason=typeSpawnLimit";
 		return;
 	}
 
@@ -278,7 +288,9 @@ void SpawnAreaImplementation::tryToSpawn(CreatureObject* player) {
 #ifdef DEBUG_SPAWNING
 		info(true) << "tryToSpawn -- Failed due to random position near 0, 0 -- Chosen position: " << randomPosition.toString();
 #endif // DEBUG_SPAWNING
-
+		if (!player->isPlayerCreature())
+			info(true) << "SimPveTrySpawnReject area=" << getAreaName()
+				<< " reason=zeroPosition";
 		return;
 	}
 
@@ -289,6 +301,9 @@ void SpawnAreaImplementation::tryToSpawn(CreatureObject* player) {
 #ifdef DEBUG_SPAWNING
 		info(true) << "tryToSpawn Spawning is not permitted at " << randomPosition.toString();
 #endif // DEBUG_SPAWNING
+		if (!player->isPlayerCreature())
+			info(true) << "SimPveTrySpawnReject area=" << getAreaName()
+				<< " reason=spawnNotPermitted pos=" << randomPosition.toString();
 		return;
 	}
 

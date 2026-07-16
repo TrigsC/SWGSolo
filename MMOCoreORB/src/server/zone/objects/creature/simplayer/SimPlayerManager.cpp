@@ -7109,6 +7109,10 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 	}
 
 	uint64 nowMs = System::getMiliTime();
+	// Unconditional: graced presence entries must prune even when every
+	// downstream step early-returns (e.g. spike cleanup with hunters
+	// disabled), or the snapshot stays non-empty forever.
+	expirePvePresenceMembers(nowMs);
 	runPveSpikeIfNeeded(nowMs);
 	updatePveBodyLifecycles(nowMs);
 	governPvePopulation(nowMs);
