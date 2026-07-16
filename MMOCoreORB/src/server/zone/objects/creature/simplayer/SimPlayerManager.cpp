@@ -7458,9 +7458,16 @@ bool SimPlayerManager::engagePveSpike(uint64 nowMs) {
 		hunterHealthAtEngage = hunter->getHAM(CreatureAttribute::HEALTH);
 		hunterActionAtEngage = hunter->getHAM(CreatureAttribute::ACTION);
 		hunterMindAtEngage = hunter->getHAM(CreatureAttribute::MIND);
+		// Leave the AWAITING_WORLD patrol and actively pursue the target so
+		// the combat behavior can close to weapon range and swing (a patrol-
+		// state agent walks its route instead of attacking).
+		hunter->clearPatrolPoints();
 		hunter->setTargetObject(target);
 		hunter->addDefender(target);
 		hunter->setCombatState();
+		hunter->setFollowObject(target);
+		hunter->setMovementState(AiAgent::FOLLOWING);
+		hunter->activateAiBehavior(true);
 	}
 
 	{
@@ -7675,6 +7682,21 @@ void SimPlayerManager::advancePveSpike(uint64 nowMs) {
 	bool aggroBack = false;
 	bool damageToTarget = false;
 	bool damageToHunter = false;
+	if (hunter != nullptr && target != nullptr) {
+		Locker hunterLock(hunter);
+		Locker targetLock(target, hunter);
+		WeaponObject* wpn = hunter->getWeapon();
+		info("SimPveSpikeObserve hunterCombat=" +
+			String::valueOf(hunter->isInCombat()) +
+			" hasDefender=" + String::valueOf(hunter->hasDefender(target)) +
+			" dist=" + String::valueOf((int)hunter->getWorldPosition().distanceTo(
+				target->getWorldPosition())) +
+			" weapon=" + (wpn == nullptr ? String("none") :
+				wpn->getObjectTemplate()->getFullTemplateString()) +
+			" tgtHam=" + String::valueOf(target->getHAM(CreatureAttribute::HEALTH)) +
+			"/" + String::valueOf(snapshot.targetHealthAtEngage) +
+			" tgtCombat=" + String::valueOf(target->isInCombat()), true);
+	}
 	if (hunter != nullptr) {
 		Locker hunterLock(hunter);
 		hunterDead = hunter->isDead();
