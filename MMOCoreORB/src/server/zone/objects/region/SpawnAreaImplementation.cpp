@@ -56,6 +56,12 @@ void SpawnAreaImplementation::notifyPositionUpdate(TreeEntry* entry) {
 	if (player == nullptr || player->isInvisible())
 		return;
 
+	// P.8.0b diagnostics: rate-limited by the lastSpawn interval gate above,
+	// so this fires at most once per minLairSpawnInterval per area.
+	if (!player->isPlayerCreature())
+		info(true) << "SimPvePresenceTrySpawn area=" << getAreaName()
+			<< " oid=" << player->getObjectID();
+
 	tryToSpawn(player);
 }
 
@@ -71,6 +77,12 @@ void SpawnAreaImplementation::notifyEnter(SceneObject* sceneO) {
 	info(true) << getAreaName() << " --SpawnAreaImplementation::notifyEnter for " << sceneO->getCustomObjectName();
 #endif // DEBUG_SPAWNING
 
+	// P.8.0b diagnostics: presence-bot area transitions are rare and load-
+	// bearing for the PvE spike verdict - always log them (players excluded).
+	if (!sceneO->isPlayerCreature())
+		info(true) << "SimPvePresenceEnter area=" << getAreaName()
+			<< " oid=" << sceneO->getObjectID();
+
 	numberOfPlayersInRange.increment();
 }
 
@@ -85,6 +97,10 @@ void SpawnAreaImplementation::notifyExit(SceneObject* sceneO) {
 #ifdef DEBUG_SPAWNING
 	info(true) << getAreaName() << " --SpawnAreaImplementation::notifyExit for " << sceneO->getCustomObjectName();
 #endif // DEBUG_SPAWNING
+
+	if (!sceneO->isPlayerCreature())
+		info(true) << "SimPvePresenceExit area=" << getAreaName()
+			<< " oid=" << sceneO->getObjectID();
 
 	numberOfPlayersInRange.decrement();
 
