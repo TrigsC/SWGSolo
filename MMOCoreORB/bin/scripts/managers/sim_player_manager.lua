@@ -627,18 +627,149 @@ SimPlayerManagerConfig = {
         batchDelayMs = 1000,
     },
 
-    -- P.8 Phase 1: persistent PvE identity roster plus the diagnostics-only
-    -- combat spike. Hunter bodies are deliberately locked off until the live
-    -- dashboard reports a PASS with destruction-observer participation proof.
+    -- P.8 Phase 2: persistent PvE identity roster, passed spike foundation,
+    -- and the player-mimetic solo hunt loop.
     pveConfig = {
         enabled = true,
-        enableHunterBots = false, -- config-locked until the spike gate passes
+        enableHunterBots = true, -- spike foundation passed; Phase 2 live
         enableWorldPresence = true, -- P.8.0b: spike/hunters act as players to world spawns
         maxHunters = 6,
         skillTier = 1,
         maintenanceIntervalSeconds = 30,
         respawnDelaySeconds = 120,
+        maxHuntDistanceMeters = 1500,
+        announceCooldownSeconds = 90,
+        announceSiteGapSeconds = 300,
         bodyTemplates = { "artisan" },
+        hunterLoadout = {
+            -- Explicitly created and equipped by the C++ hunter spawn path.
+            weaponTemplate = "object/weapon/ranged/rifle/rifle_cdef.iff",
+        },
+        buffs = {
+            {
+                name = "pve_hunter_ham",
+                crc = "medical_enhance_health",
+                durationSeconds = 7200,
+                type = 2, -- BuffType::MEDICAL
+                attribute = 0, -- CreatureAttribute::HEALTH
+                modifier = 100,
+            },
+            {
+                name = "pve_hunter_action",
+                crc = "medical_enhance_action",
+                durationSeconds = 7200,
+                type = 2, -- BuffType::MEDICAL
+                attribute = 3, -- CreatureAttribute::ACTION
+                modifier = 100,
+            },
+            {
+                name = "pve_hunter_mind",
+                crc = "performance_enhance_dance_mind",
+                durationSeconds = 7200,
+                type = 3, -- BuffType::PERFORMANCE
+                attribute = 6, -- CreatureAttribute::MIND
+                modifier = 100,
+            },
+        },
+        combat = {
+            retreatHamPct = 30,
+            resumeHamPct = 70,
+            maxRetreatCycles = 3,
+            retreatRangeMeters = 40,
+            cloneWoundAmount = 500,
+            huntActiveTickSeconds = 2,
+            huntQuota = 1,
+            huntTimeoutSeconds = 1800,
+            scanRadiusMeters = 96,
+            weaponRangeMeters = 48,
+        },
+        -- Each ground is a real SPAWNAREA from the planet region scripts;
+        -- C++ validates the object, terrain/boundary, and P.4.1 guards once
+        -- per config publication before a row becomes usable.
+        species = {
+            {
+                key = "tatooine_womprat_meat",
+                planet = "tatooine",
+                spawnArea = "@tatooine_region_names:mos_eisley_easy_newbie",
+                huntGround = { 4200, -4784, 0 },
+                templateFilter = "womp_rat",
+                requestedResourceType = "meat_wild",
+                harvestKind = "meat",
+                estimatedMeatUnits = 25,
+                soloable = true,
+                minSkillTier = 1,
+                eligibleHomeCities = { "mos_eisley" },
+            },
+            {
+                key = "tatooine_kreetle_meat",
+                planet = "tatooine",
+                spawnArea = "@tatooine_region_names:bestine_medium_newbie",
+                huntGround = { -1216, -3660, 0 },
+                templateFilter = "kreetle",
+                requestedResourceType = "meat_insect",
+                harvestKind = "meat",
+                estimatedMeatUnits = 20,
+                soloable = true,
+                minSkillTier = 1,
+                eligibleHomeCities = { "bestine" },
+            },
+            -- Group-tier rows are data for P.8.2. The v1 matchmaker ignores
+            -- them, but keeping the species/resource contract visible now
+            -- lets the next controller add group formation without changing
+            -- the config schema.
+            {
+                key = "tatooine_krayt_group",
+                planet = "tatooine",
+                spawnArea = "@tatooine_region_names:hard_krayt_ne",
+                huntGround = { 6515, 4215, 0 },
+                templateFilter = "krayt",
+                requestedResourceType = "meat_wild",
+                harvestKind = "meat",
+                estimatedMeatUnits = 120,
+                soloable = false,
+                minSkillTier = 3,
+                eligibleHomeCities = { "bestine" },
+            },
+            {
+                key = "yavin4_acklay_group",
+                planet = "yavin4",
+                spawnArea = "@yavin4_region_names:yavin4_geo_bunker_nobuild",
+                huntGround = { -6488, -417, 0 },
+                templateFilter = "acklay",
+                requestedResourceType = "meat_wild",
+                harvestKind = "meat",
+                estimatedMeatUnits = 150,
+                soloable = false,
+                minSkillTier = 5,
+                eligibleHomeCities = { "theed" },
+            },
+            {
+                key = "yavin4_geonosian_group",
+                planet = "yavin4",
+                spawnArea = "@yavin4_region_names:yavin4_geo_bunker_nobuild",
+                huntGround = { -6488, -417, 0 },
+                templateFilter = "geonosian",
+                requestedResourceType = "meat_insect",
+                harvestKind = "meat",
+                estimatedMeatUnits = 40,
+                soloable = false,
+                minSkillTier = 3,
+                eligibleHomeCities = { "theed" },
+            },
+            {
+                key = "dathomir_nightsister_group",
+                planet = "dathomir",
+                spawnArea = "@dathomir_region_names:nightsister_clan",
+                huntGround = { -4069, -184, 0 },
+                templateFilter = "nightsister",
+                requestedResourceType = "meat_wild",
+                harvestKind = "meat",
+                estimatedMeatUnits = 50,
+                soloable = false,
+                minSkillTier = 4,
+                eligibleHomeCities = { "moenia" },
+            },
+        },
         identityRoster = {
             maxHunters = 6,
             skillTier = 1,
@@ -653,8 +784,8 @@ SimPlayerManagerConfig = {
             scanRadiusMeters = 250,
             -- The spike only needs to target + engage a wild creature (its
             -- redefined PASS boundary); dealing damage is Phase 2. Any NEUTRAL
-            -- template works. Phase 2 will use a custom styled template with an
-            -- explicitly-equipped weapon (owner: buy-your-gear vision).
+            -- template works. Phase 2 hunter bodies use the same functional
+            -- artisan appearance with an explicitly-equipped rifle.
             hunterTemplate = "artisan",
             -- Empty = ANY attackable wild creature proves the kill path. The
             -- old "womprat" filter never matched western_dune_sea_2's

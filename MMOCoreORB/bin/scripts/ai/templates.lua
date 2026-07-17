@@ -10,6 +10,7 @@ includeFile("static.lua")
 includeFile("villageRaider.lua")
 includeFile("simMiner.lua")
 includeFile("simPvp.lua")
+includeFile("simHunter.lua")
 
 customMap = {
 	{ "crackdown", {
@@ -49,6 +50,12 @@ customMap = {
 	-- back to the defaults so the bot still fights (see simPvp.lua).
 	{ "simPvp", {
 		{IDLE, "idleSimPvp"}
+	}},
+
+	-- P.8.1 solo hunters: controller owns movement; default combat slots
+	-- remain inherited so the equipped rifle is actually used.
+	{ "simHunter", {
+		{IDLE, "idleSimHunter"}
 	}},
 }
 

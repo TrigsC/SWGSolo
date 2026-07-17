@@ -40,6 +40,7 @@ class MinerIntelligentTargetingTask;
 class MinerRecoveryTask;
 class SimPlayerConfiguredSpawnTask;
 class HiveCrafterConsumerTask;
+class SimHunterController;
 
 struct SimBotIdentity {
 	uint64 id = 0;
@@ -91,6 +92,64 @@ struct PveSpikeState {
 	bool cleanupComplete = false;
 	String verdict = "PENDING";
 	String failureFlag = "none";
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// P.8.1: configuration and runtime snapshots for the solo PvE hunter. These
+// are value types so controllers can copy a job without retaining pveMutex
+// across world/agent locks.
+struct PveHuntSpecies {
+	String key;
+	String planet;
+	String huntGroundName;
+	Vector3 huntGround;
+	String templateFilter;
+	String requestedResourceType;
+	String harvestKind;
+	int estimatedHideUnits = 0;
+	int estimatedBoneUnits = 0;
+	int estimatedMeatUnits = 0;
+	bool soloable = false;
+	int minSkillTier = 1;
+	Vector<String> eligibleHomeCities;
+	bool usable = false;
+	String unusableReason = "not_validated";
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PveHuntOrder {
+	uint64 identityId = 0;
+	uint64 bodyOid = 0;
+	uint64 issuedAtMs = 0;
+	uint64 targetOid = 0;
+	uint64 lastCreditedTargetOid = 0;
+	String homePlanet;
+	String homeCity;
+	String speciesKey;
+	String requestedResourceType;
+	String harvestKind;
+	String phase = "IDLE_HOME";
+	String status = "ASSIGNED";
+	int quota = 1;
+	int kills = 0;
+	int retreatCycles = 0;
+	uint64 spawnsTriggeredNearby = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PveBuffSpec {
+	String name;
+	uint32 crc = 0;
+	float durationSeconds = 7200.f;
+	int buffType = 0;
+	uint8 attribute = 0;
+	int modifier = 0;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -636,6 +695,10 @@ public:
 		Vector3 hangout;
 		int hangoutSource = HANGOUT_FALLBACK;
 		int hangoutPathNodes = 0;
+		// P.8.1: the same warmed city snapshot also carries a safe exterior
+		// med-center dwell point for clone wound clearing.
+		Vector3 medCenter;
+		bool medCenterResolved = false;
 
 		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -1143,14 +1206,27 @@ private:
 	VectorMap<uint64, bool> pveDirtyIdentityIds;
 	VectorMap<uint64, uint64> pvePresenceOids;
 	VectorMap<uint64, uint64> pvePresenceSpawnCounts;
+	Vector<PveHuntSpecies> pveHuntSpecies;
+	Vector<PveBuffSpec> pveHunterBuffs;
+	VectorMap<uint64, PveHuntOrder> pveHuntOrders;
+	VectorMap<uint64, bool> pveDeathsReportedBodyOids;
 	uint64 pvePresenceSpawnTotal = 0;
+	uint64 pveHunterKillsTotal = 0;
+	uint64 pveHunterDeathsTotal = 0;
+	uint64 pveHunterAbandonsTotal = 0;
+	uint64 pveHunterHarvestUnitsTotal = 0;
+	uint64 pveHunterHarvestMisses = 0;
+	uint64 pveHunterAnnouncementsTotal = 0;
+	uint64 pveHunterLastAnnounceMs = 0;
+	uint64 pveHunterLastSiteAnnounceMs = 0;
+	VectorMap<uint64, uint64> pveHunterLastAnnounceByIdentity;
 	std::shared_ptr<const PvePresenceSnapshot> pvePresenceSnapshot;
 	Mutex pveMutex;
 	PveSpikeState pveSpike;
 	Reference<Observer*> pveSpikeObserver;
 
 	bool pveEnabled = false;
-	bool pveHunterBotsEnabled = false; // Phase 2 remains config-locked.
+	bool pveHunterBotsEnabled = false;
 	bool pveWorldPresenceEnabled = false;
 	bool pveSpikeEnabled = false;
 	int pveMaxHunters = 6;
@@ -1160,6 +1236,21 @@ private:
 	int pveSpikeWorldWaitTimeoutSeconds = 300;
 	int pveSpikeCombatTimeoutSeconds = 180;
 	int pveSpikeScanRadiusMeters = 96;
+	String pveHunterWeaponTemplate = "object/weapon/ranged/rifle/rifle_cdef.iff";
+	int pveMaxHuntDistanceMeters = 6000;
+	float pveRetreatHamPct = 30.f;
+	float pveResumeHamPct = 70.f;
+	int pveMaxRetreatCycles = 3;
+	float pveRetreatRangeMeters = 40.f;
+	int pveCloneWoundAmount = 500;
+	int pveHunterActiveTickSeconds = 2;
+	int pveHuntQuota = 1;
+	int pveHuntTimeoutSeconds = 1800;
+	float pveHunterScanRadiusMeters = 96.f;
+	float pveHunterWeaponRangeMeters = 48.f;
+	int pveAnnounceCooldownSeconds = 90;
+	int pveAnnounceSiteGapSeconds = 300;
+	bool pveHuntGroundsValidated = false;
 	String pveSpikeHunterTemplate = "artisan";
 	String pveSpikeTargetTemplateFilter;
 	String pveSpikeSpawnArea;
@@ -1185,7 +1276,13 @@ private:
 	void flushPveIdentityRoster(bool force);
 	void updatePveBodyLifecycles(uint64 nowMs);
 	void governPvePopulation(uint64 nowMs);
+	void runPveHunterMatchmaker(uint64 nowMs);
+	void validatePveHuntGrounds();
+	void attachPveHunterController(const SimBotIdentity& identity, AiAgent* body);
 	AiAgent* spawnPveIdentityBody(const SimBotIdentity& identity);
+	void recordPveHunterHarvest(uint64 identityId, uint64 targetOid,
+		const String& harvestKind, const String& requestedResourceType);
+	void clearPveHunterOrderLocked(uint64 identityId, const String& status);
 	void runPveSpikeIfNeeded(uint64 nowMs);
 	void advancePveSpike(uint64 nowMs);
 	bool spawnPveSpikeActors(uint64 nowMs);
@@ -1724,6 +1821,33 @@ public:
 	void runPveFoundationMaintenanceTask();
 	void handlePveDestructionHandoff(uint64 targetOid, uint64 participantOid,
 		bool participantVerified);
+	void handlePveHunterDestructionHandoff(uint64 hunterOid, uint64 targetOid,
+		bool participantVerified);
+	void onPveHunterDied(uint64 identityId, uint64 bodyOid);
+	void recordPveHunterPhase(uint64 identityId, uint64 bodyOid,
+		const String& phase, uint64 targetOid = 0);
+	void recordPveHunterKill(uint64 identityId, uint64 bodyOid,
+		uint64 targetOid, const String& harvestKind,
+		const String& requestedResourceType, bool participantVerified);
+	void recordPveHunterAbandoned(uint64 identityId, uint64 bodyOid,
+		const String& reason);
+	void recordPveHunterCompleted(uint64 identityId, uint64 bodyOid);
+	bool getPveHunterSpecies(const String& key, PveHuntSpecies& species);
+	bool getPveHunterOrder(uint64 identityId, PveHuntOrder& order);
+	void getPveHunterBuffs(Vector<PveBuffSpec>& buffs);
+	float getPveHunterRetreatHamPct() const { return pveRetreatHamPct; }
+	float getPveHunterResumeHamPct() const { return pveResumeHamPct; }
+	int getPveHunterMaxRetreatCycles() const { return pveMaxRetreatCycles; }
+	float getPveHunterRetreatRangeMeters() const { return pveRetreatRangeMeters; }
+	int getPveHunterActiveTickSeconds() const { return pveHunterActiveTickSeconds; }
+	int getPveHunterTimeoutSeconds() const { return pveHuntTimeoutSeconds; }
+	float getPveHunterScanRadiusMeters() const { return pveHunterScanRadiusMeters; }
+	float getPveHunterWeaponRangeMeters() const { return pveHunterWeaponRangeMeters; }
+	int getPveHunterAnnounceCooldownSeconds() const { return pveAnnounceCooldownSeconds; }
+	bool getPveHomeLocations(const String& planet, const String& city,
+		Vector3& cantina, Vector3& medCenter, Vector3& home);
+	void announcePveHunterEvent(uint64 bodyOid, const String& site,
+		const String& detail = "");
 
 	// --- P.6.1 SimPvP squads: task- and controller-called entry points.
 	// (Scheduled tasks are not friends; these must stay public.)

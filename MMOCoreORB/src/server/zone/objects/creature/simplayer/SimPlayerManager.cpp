@@ -5,6 +5,7 @@
 
 #include "SimPlayerManager.h"
 #include "SimPvPController.h"
+#include "SimHunterController.h"
 
 #include <cmath>
 
@@ -46,6 +47,9 @@
 #include "server/zone/objects/auction/AuctionItem.h"
 #include "server/zone/objects/resource/ResourceContainer.h"
 #include "server/zone/objects/resource/ResourceSpawn.h"
+#include "server/zone/objects/creature/buffs/BuffType.h"
+#include "server/zone/objects/creature/ai/Creature.h"
+#include "server/zone/managers/object/ObjectManager.h"
 #include "server/zone/objects/pathfinding/NavArea.h"
 #include "server/zone/managers/collision/PathFinderManager.h"
 #include "server/zone/objects/building/BuildingObject.h"
@@ -5309,7 +5313,20 @@ void SimPlayerManager::loadLuaConfig() {
 		pveDirtyIdentityIds.removeAll();
 		pvePresenceOids.removeAll();
 		pvePresenceSpawnCounts.removeAll();
+		pveHuntSpecies.removeAll();
+		pveHunterBuffs.removeAll();
+		pveHuntOrders.removeAll();
+		pveDeathsReportedBodyOids.removeAll();
 		pvePresenceSpawnTotal = 0;
+		pveHunterKillsTotal = 0;
+		pveHunterDeathsTotal = 0;
+		pveHunterAbandonsTotal = 0;
+		pveHunterHarvestUnitsTotal = 0;
+		pveHunterHarvestMisses = 0;
+		pveHunterAnnouncementsTotal = 0;
+		pveHunterLastAnnounceMs = 0;
+		pveHunterLastSiteAnnounceMs = 0;
+		pveHunterLastAnnounceByIdentity.removeAll();
 		pveSpike = PveSpikeState();
 		pveSpikeObserver = nullptr;
 		publishPvePresenceSnapshotLocked(System::getMiliTime());
@@ -5325,6 +5342,21 @@ void SimPlayerManager::loadLuaConfig() {
 	pveSpikeWorldWaitTimeoutSeconds = 300;
 	pveSpikeCombatTimeoutSeconds = 180;
 	pveSpikeScanRadiusMeters = 96;
+	pveHunterWeaponTemplate = "object/weapon/ranged/rifle/rifle_cdef.iff";
+	pveMaxHuntDistanceMeters = 6000;
+	pveRetreatHamPct = 30.f;
+	pveResumeHamPct = 70.f;
+	pveMaxRetreatCycles = 3;
+	pveRetreatRangeMeters = 40.f;
+	pveCloneWoundAmount = 500;
+	pveHunterActiveTickSeconds = 2;
+	pveHuntQuota = 1;
+	pveHuntTimeoutSeconds = 1800;
+	pveHunterScanRadiusMeters = 96.f;
+	pveHunterWeaponRangeMeters = 48.f;
+	pveAnnounceCooldownSeconds = 90;
+	pveAnnounceSiteGapSeconds = 300;
+	pveHuntGroundsValidated = false;
 	pveSpikeHunterTemplate = "artisan";
 	pveSpikeTargetTemplateFilter = "";
 	pveSpikeSpawnArea = "";
@@ -6289,6 +6321,15 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	pveRespawnDelaySeconds = clampMinerInt(
 		pveConfig.getIntField("respawnDelaySeconds"), pveRespawnDelaySeconds,
 		1, 86400);
+	pveMaxHuntDistanceMeters = clampMinerInt(
+		pveConfig.getIntField("maxHuntDistanceMeters"),
+		pveMaxHuntDistanceMeters, 100, 100000);
+	pveAnnounceCooldownSeconds = clampMinerInt(
+		pveConfig.getIntField("announceCooldownSeconds"),
+		pveAnnounceCooldownSeconds, 10, 3600);
+	pveAnnounceSiteGapSeconds = clampMinerInt(
+		pveConfig.getIntField("announceSiteGapSeconds"),
+		pveAnnounceSiteGapSeconds, 30, 3600);
 
 	LuaObject rosterConfig = pveConfig.getObjectField("identityRoster");
 	if (rosterConfig.isValidTable()) {
@@ -6318,6 +6359,138 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		pveHunterTemplates = rebuilt;
 	}
 	bodyTemplates.pop();
+
+	LuaObject hunterLoadout = pveConfig.getObjectField("hunterLoadout");
+	if (hunterLoadout.isValidTable()) {
+		String weaponTemplate = hunterLoadout.getStringField(
+			"weaponTemplate").trim();
+		if (!weaponTemplate.isEmpty())
+			pveHunterWeaponTemplate = weaponTemplate;
+	}
+	hunterLoadout.pop();
+
+	LuaObject combatConfig = pveConfig.getObjectField("combat");
+	if (combatConfig.isValidTable()) {
+		pveRetreatHamPct = clampFloatRange(
+			combatConfig.getFloatField("retreatHamPct"), 5.f, 60.f);
+		pveResumeHamPct = clampFloatRange(
+			combatConfig.getFloatField("resumeHamPct"),
+			pveRetreatHamPct + 10.f, 95.f);
+		pveMaxRetreatCycles = clampMinerInt(
+			combatConfig.getIntField("maxRetreatCycles"),
+			pveMaxRetreatCycles, 0, 10);
+		pveRetreatRangeMeters = clampFloatRange(
+			combatConfig.getFloatField("retreatRangeMeters"), 10.f, 128.f);
+		pveCloneWoundAmount = clampMinerInt(
+			combatConfig.getIntField("cloneWoundAmount"),
+			pveCloneWoundAmount, 0, 5000);
+		pveHunterActiveTickSeconds = clampMinerInt(
+			combatConfig.getIntField("huntActiveTickSeconds"),
+			pveHunterActiveTickSeconds, 1, 10);
+		pveHuntQuota = clampMinerInt(
+			combatConfig.getIntField("huntQuota"), pveHuntQuota, 1, 20);
+		pveHuntTimeoutSeconds = clampMinerInt(
+			combatConfig.getIntField("huntTimeoutSeconds"),
+			pveHuntTimeoutSeconds, 60, 86400);
+		pveHunterScanRadiusMeters = clampFloatRange(
+			combatConfig.getFloatField("scanRadiusMeters"), 16.f, 256.f);
+		pveHunterWeaponRangeMeters = clampFloatRange(
+			combatConfig.getFloatField("weaponRangeMeters"), 8.f, 128.f);
+	}
+	combatConfig.pop();
+
+	Vector<PveBuffSpec> rebuiltBuffs;
+	LuaObject buffs = pveConfig.getObjectField("buffs");
+	if (buffs.isValidTable()) {
+		for (int i = 1; i <= buffs.getTableSize(); ++i) {
+			LuaObject entry = buffs.getObjectAt(i);
+			if (entry.isValidTable()) {
+				PveBuffSpec spec;
+				spec.name = entry.getStringField("name").trim();
+				String crcName = entry.getStringField("crc").trim();
+				if (!crcName.isEmpty())
+					spec.crc = crcName.hashCode();
+				else if (!spec.name.isEmpty())
+					spec.crc = spec.name.hashCode();
+				spec.durationSeconds = entry.getFloatField(
+					"durationSeconds", 7200.f);
+				spec.buffType = entry.getIntField(
+					"type", BuffType::MEDICAL);
+				spec.attribute = (uint8)clampMinerInt(
+					entry.getIntField("attribute"), CreatureAttribute::HEALTH,
+					CreatureAttribute::HEALTH, CreatureAttribute::WILLPOWER);
+				spec.modifier = entry.getIntField("modifier");
+				if (spec.crc != 0 && spec.durationSeconds > 0.f)
+					rebuiltBuffs.add(spec);
+			}
+			entry.pop();
+		}
+	}
+	buffs.pop();
+	if (rebuiltBuffs.size() == 0) {
+		PveBuffSpec fallback;
+		fallback.name = "medical_enhance_health";
+		fallback.crc = fallback.name.hashCode();
+		fallback.buffType = BuffType::MEDICAL;
+		fallback.attribute = CreatureAttribute::HEALTH;
+		fallback.modifier = 100;
+		rebuiltBuffs.add(fallback);
+	}
+
+	Vector<PveHuntSpecies> rebuiltSpecies;
+	LuaObject speciesConfig = pveConfig.getObjectField("species");
+	if (speciesConfig.isValidTable()) {
+		for (int i = 1; i <= speciesConfig.getTableSize(); ++i) {
+			LuaObject entry = speciesConfig.getObjectAt(i);
+			if (entry.isValidTable()) {
+				PveHuntSpecies row;
+				row.key = entry.getStringField("key").trim();
+				row.planet = entry.getStringField("planet").trim();
+				row.huntGroundName = entry.getStringField(
+					"spawnArea").trim();
+				row.templateFilter = entry.getStringField(
+					"templateFilter").trim().toLowerCase();
+				row.requestedResourceType = entry.getStringField(
+					"requestedResourceType").trim().toLowerCase();
+				row.harvestKind = entry.getStringField(
+					"harvestKind").trim().toLowerCase();
+				row.estimatedHideUnits = entry.getIntField("estimatedHideUnits");
+				row.estimatedBoneUnits = entry.getIntField("estimatedBoneUnits");
+				row.estimatedMeatUnits = entry.getIntField("estimatedMeatUnits");
+				row.soloable = entry.getBooleanField("soloable", false);
+				row.minSkillTier = clampMinerInt(entry.getIntField(
+					"minSkillTier"), 1, 1, 5);
+
+				LuaObject ground = entry.getObjectField("huntGround");
+				if (ground.isValidTable()) {
+					row.huntGround.setX(ground.getFloatAt(1));
+					row.huntGround.setY(ground.getFloatAt(2));
+					row.huntGround.setZ(ground.getFloatAt(3));
+				}
+				ground.pop();
+
+				LuaObject cities = entry.getObjectField("eligibleHomeCities");
+				if (cities.isValidTable()) {
+					for (int j = 1; j <= cities.getTableSize(); ++j)
+						row.eligibleHomeCities.add(
+							cities.getStringAt(j).trim().toLowerCase());
+				}
+				cities.pop();
+				if (!row.key.isEmpty() && !row.planet.isEmpty() &&
+						(!row.huntGroundName.isEmpty() || !row.soloable))
+					rebuiltSpecies.add(row);
+			}
+			entry.pop();
+		}
+	}
+	speciesConfig.pop();
+
+	{
+		Locker pveLock(&pveMutex);
+		pveHunterBuffs = rebuiltBuffs;
+		pveHuntSpecies = rebuiltSpecies;
+		pveHuntGroundsValidated = false;
+	}
 
 	LuaObject spikeConfig = pveConfig.getObjectField("spike");
 	if (spikeConfig.isValidTable()) {
@@ -6373,6 +6546,11 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		pveSpikePlanet = allShuttleports.get(0).planet;
 		pveSpikePosition = allShuttleports.get(0).spawn;
 	}
+
+	// Validate configured hunt grounds once per config publication. The
+	// validator is readiness-aware; a boot-time zone miss leaves the row
+	// unusable and the next runtime config refresh can re-evaluate it.
+	validatePveHuntGrounds();
 
 	info("SimPveConfig enabled=" + String::valueOf(pveEnabled) +
 		" enableHunterBots=" + String::valueOf(pveHunterBotsEnabled) +
@@ -6587,8 +6765,21 @@ void SimPlayerManager::loadPveIdentityRoster() {
 
 		{
 			Locker pveLock(&pveMutex);
-			for (int i = 0; i < loaded.size(); ++i)
-				pveIdentities.put(loaded.get(i).id, loaded.get(i));
+			for (int i = 0; i < loaded.size(); ++i) {
+				SimBotIdentity identity = loaded.get(i);
+				// Assignment state is intentionally not resumed across a process
+				// boundary. The controller/observer handles are transient, so a
+				// persisted in-flight contract is abandoned and rematched cleanly.
+				if (!identity.assignmentSpecies.isEmpty() ||
+						!identity.assignmentResource.isEmpty() ||
+						identity.assignmentStamp != 0) {
+					identity.assignmentSpecies = "";
+					identity.assignmentResource = "";
+					identity.assignmentStamp = 0;
+					pveDirtyIdentityIds.put(identity.id, true);
+				}
+				pveIdentities.put(identity.id, identity);
+			}
 		}
 
 		pveDatabaseAvailable = true;
@@ -6759,12 +6950,14 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity) 
 	// under pveMutex so a mid-refresh clear can never yield modulo-by-zero
 	// or an invalid read.
 	String templateName;
+	String weaponTemplate;
 	{
 		Locker pveLock(&pveMutex);
 		if (pveHunterTemplates.size() == 0)
 			return nullptr;
 		templateName = pveHunterTemplates.get(
 			identity.id % pveHunterTemplates.size());
+		weaponTemplate = pveHunterWeaponTemplate;
 	}
 
 	ShuttleportLocation home;
@@ -6805,14 +6998,52 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity) 
 	if (agent == nullptr)
 		return nullptr;
 
+	ManagedReference<SceneObject*> weaponObject =
+		ObjectManager::instance()->createObject(weaponTemplate.hashCode(), 0, "");
+	ManagedReference<WeaponObject*> weapon = weaponObject == nullptr ?
+		nullptr : weaponObject.castTo<WeaponObject*>();
+	if (weapon == nullptr) {
+		Locker agentLock(agent);
+		agent->destroyObjectFromWorld(true);
+		agent->destroyObjectFromDatabase(true);
+		return nullptr;
+	}
+
 	String fullName = identity.firstName + " " + identity.lastName;
+	bool equipped = false;
 	{
 		Locker agentLock(agent);
+		Locker weaponLock(weaponObject, agent);
 		// createCreature() alone leaves the agent uninitialized -
 		// spawnCreature's path loads the mobile template (npcTemplate, HAM,
 		// level, bitmasks, combat stats, weapons) before any overrides
 		// (CreatureManagerImplementation.cpp:424). Same contract here.
 		agent->loadTemplateData(creoTempl);
+		// A hunter is intentionally neutral: factioned AI agents refuse to
+		// attack faction-0 wildlife in isAttackableBy().
+		agent->setFaction(0);
+		// createCreature already filled the default_weapon slot (an unarmed
+		// creature weapon), so a raw transfer to slot 4 fails. Remove the
+		// stock weapon first, then equip our rifle and set BOTH pointers
+		// (combat leaf actions read currentWeapon; defaultWeapon alone is not
+		// enough - the equip failing is what made the spike bot unarmed).
+		ManagedReference<WeaponObject*> stockWeapon = agent->getDefaultWeapon();
+		if (stockWeapon != nullptr && stockWeapon != weapon) {
+			Locker stockLock(stockWeapon, agent);
+			stockWeapon->destroyObjectFromWorld(true);
+			stockWeapon->destroyObjectFromDatabase(true);
+		}
+		if (agent->transferObject(weaponObject, 4)) {
+			agent->setDefaultWeapon(weapon);
+			agent->setCurrentWeapon(weapon);
+			equipped = agent->getDefaultWeapon() == weapon &&
+				agent->getCurrentWeapon() == weapon;
+		}
+		if (identity.deaths > 0 && pveCloneWoundAmount > 0) {
+			for (uint8 pool = CreatureAttribute::HEALTH;
+					pool <= CreatureAttribute::WILLPOWER; ++pool)
+				agent->addWounds(pool, pveCloneWoundAmount, true, false);
+		}
 		agent->setCustomObjectName(fullName, true);
 		agent->setCreatureBitmask(0);
 		agent->setDespawnOnNoPlayerInRange(false);
@@ -6822,6 +7053,13 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity) 
 		// Presence-enabled bodies must carry PLAYER even when the optional
 		// client-dot presentation setting is disabled.
 		applySimNpcPresentation(agent, ObjectFlag::PLAYER);
+	}
+	if (!equipped) {
+		// Never publish or place a body that combat cannot arm.
+		Locker agentLock(agent);
+		agent->destroyObjectFromWorld(true);
+		agent->destroyObjectFromDatabase(true);
+		return nullptr;
 	}
 
 	uint64 bodyOid = agent->getObjectID();
@@ -6850,9 +7088,8 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity) 
 
 	{
 		Locker agentLock(agent);
-		// Phase 1 bodies are identity attachments only. Phase 2 owns the
-		// SimHunterController binding and behavior loop.
-		agent->setCustomAiMap(String("simMiner").hashCode());
+		// The hunter map only overrides IDLE; default combat slots remain live.
+		agent->setCustomAiMap(String("simHunter").hashCode());
 		agent->setAITemplate();
 		agent->clearPatrolPoints();
 	}
@@ -6933,6 +7170,13 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 			pveIdentityBodyOids.removeAll();
 			pveBodyIdentityIds.removeAll();
 			pveRespawnDueAtMs.removeAll();
+			Vector<uint64> assignedIdentityIds;
+			for (int i = 0; i < pveHuntOrders.size(); ++i)
+				assignedIdentityIds.add(pveHuntOrders.elementAt(i).getKey());
+			for (int i = 0; i < assignedIdentityIds.size(); ++i)
+				clearPveHunterOrderLocked(assignedIdentityIds.get(i),
+					"ABANDONED_DISABLED");
+			pveDeathsReportedBodyOids.removeAll();
 		}
 
 		if (orphanBodyOids.size() > 0) {
@@ -7009,21 +7253,33 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 		}
 		if (bodyIndex >= 0) {
 			uint64 bodyOid = pveIdentityBodyOids.elementAt(bodyIndex).getValue();
+			bool deathAlreadyReported =
+				pveDeathsReportedBodyOids.contains(bodyOid);
+			pveDeathsReportedBodyOids.drop(bodyOid);
 			removedBodyOids.add(bodyOid);
 			pveIdentityBodyOids.remove(bodyIndex);
 			for (int j = pveBodyIdentityIds.size() - 1; j >= 0; --j) {
 				if (pveBodyIdentityIds.elementAt(j).getKey() == bodyOid)
 					pveBodyIdentityIds.remove(j);
 			}
-			if (pveIdentities.contains(identityId)) {
+			if (!deathAlreadyReported && pveIdentities.contains(identityId)) {
 				SimBotIdentity& identity = pveIdentities.get(identityId);
 				identity.deaths++;
 				pveDirtyIdentityIds.put(identityId, true);
 			}
+			if (!deathAlreadyReported)
+				pveHunterDeathsTotal++;
+			clearPveHunterOrderLocked(identityId, "DEATH_REQUEUED");
 			pveRespawnDueAtMs.put(identityId,
 				nowMs + (uint64)pveRespawnDelaySeconds * 1000);
 		}
 	}
+
+	// Retire the controller before the corpse is destroyed. Its destructor
+	// drops the target observer and combat relationship, while the manager
+	// lock above is already released and the order has been requeued.
+	for (int i = 0; i < removedBodyOids.size(); ++i)
+		controllers.drop(removedBodyOids.get(i));
 
 	for (int i = 0; i < corpses.size(); ++i) {
 		AiAgent* corpse = corpses.get(i);
@@ -7082,20 +7338,667 @@ void SimPlayerManager::governPvePopulation(uint64 nowMs) {
 
 		uint64 identityId = candidates.get(i).id;
 		uint64 bodyOid = body->getObjectID();
-		Locker pveLock(&pveMutex);
-		if (!pveIdentityBodyOids.contains(identityId)) {
-			pveIdentityBodyOids.put(identityId, bodyOid);
-			pveBodyIdentityIds.put(bodyOid, identityId);
-			for (int j = pveRespawnDueAtMs.size() - 1; j >= 0; --j) {
-				if (pveRespawnDueAtMs.elementAt(j).getKey() == identityId)
-					pveRespawnDueAtMs.remove(j);
+		bool attached = false;
+		{
+			Locker pveLock(&pveMutex);
+			if (!pveIdentityBodyOids.contains(identityId)) {
+				pveIdentityBodyOids.put(identityId, bodyOid);
+				pveBodyIdentityIds.put(bodyOid, identityId);
+				for (int j = pveRespawnDueAtMs.size() - 1; j >= 0; --j) {
+					if (pveRespawnDueAtMs.elementAt(j).getKey() == identityId)
+						pveRespawnDueAtMs.remove(j);
+				}
+				attached = true;
 			}
+		}
+
+		if (attached) {
+			attachPveHunterController(candidates.get(i), body);
 			info("SimPveBodyAttached identity=" + String::valueOf(identityId) +
 				" body=" + String::valueOf(bodyOid) + " name=" +
 				candidates.get(i).firstName + " " + candidates.get(i).lastName,
 				true);
+		} else {
+			// A concurrent maintenance pass won the identity slot. Do not leave
+			// an unowned presence body behind.
+			controllers.drop(bodyOid);
+			Locker agentLock(body);
+			body->destroyObjectFromWorld(true);
+			body->destroyObjectFromDatabase(true);
+			removeSimPresenceMemberAfterWorldExit(bodyOid, nowMs);
 		}
 	}
+}
+
+void SimPlayerManager::validatePveHuntGrounds() {
+	Vector<PveHuntSpecies> speciesSnapshot;
+	{
+		Locker pveLock(&pveMutex);
+		speciesSnapshot = pveHuntSpecies;
+	}
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	bool worldReady = zoneServer != nullptr && !zoneServer->isServerLoading();
+	bool allRowsValidated = worldReady;
+	for (int i = 0; i < speciesSnapshot.size(); ++i) {
+		PveHuntSpecies row = speciesSnapshot.get(i);
+		row.usable = false;
+		row.unusableReason = "not_validated";
+
+		Zone* zone = zoneServer == nullptr ? nullptr :
+			zoneServer->getZone(row.planet);
+		CreatureManager* creatureManager = zone == nullptr ? nullptr :
+			zone->getCreatureManager();
+		SpawnArea* spawnArea = creatureManager == nullptr ? nullptr :
+			creatureManager->getSpawnArea(row.huntGroundName);
+		if (!worldReady || zone == nullptr) {
+			allRowsValidated = false;
+			row.unusableReason = !worldReady ? "world_not_ready" :
+				"zone_missing";
+		} else if (spawnArea == nullptr && !row.soloable) {
+			// Group-tier rows are configuration data for P.8.2. Some point at
+			// dungeon/named regions which do not expose a world SpawnArea yet;
+			// retain them for the dashboard without blocking usable solo rows.
+			row.unusableReason = "group_tier_data_only";
+		} else if (spawnArea == nullptr) {
+			allRowsValidated = false;
+			row.unusableReason = "spawn_area_missing";
+		} else {
+			bool groundInSpawnArea = spawnArea->containsPoint(
+				row.huntGround.getX(), row.huntGround.getY());
+			bool harvestKindValid = row.harvestKind == "hide" ||
+				row.harvestKind == "bone" || row.harvestKind == "meat";
+			String resourcePrefix = row.harvestKind + "_";
+			bool resourceKindMatches =
+				!row.requestedResourceType.isEmpty() &&
+				row.requestedResourceType.beginsWith(resourcePrefix);
+			bool resourceEstimateValid = row.harvestKind == "hide" ?
+				row.estimatedHideUnits > 0 : row.harvestKind == "bone" ?
+				row.estimatedBoneUnits > 0 : row.estimatedMeatUnits > 0;
+			float groundZ = zone->getHeight(row.huntGround.getX(),
+				row.huntGround.getY());
+			if (groundZ != 0.f)
+				row.huntGround.setZ(groundZ);
+			bool waterAtTarget = false;
+			String rejectReason;
+			bool overland = evaluateOverlandReachability(zone,
+				row.huntGround, travelWaterMarginMeters,
+				travelRejectWaterTargets, waterAtTarget, rejectReason);
+			if (!groundInSpawnArea) {
+				row.unusableReason = "ground_outside_spawn_area";
+			} else if (!harvestKindValid) {
+				row.unusableReason = "invalid_harvest_kind";
+			} else if (!resourceEstimateValid) {
+				row.unusableReason = "missing_kind_estimate";
+			} else if (!resourceKindMatches) {
+				row.unusableReason = "resource_kind_mismatch";
+			} else if (!overland) {
+				row.unusableReason = "overland_" + rejectReason;
+			} else if (!row.soloable) {
+				row.unusableReason = "not_soloable";
+			} else if (row.minSkillTier > pveSkillTier) {
+				row.unusableReason = "skill_tier";
+			} else if (row.eligibleHomeCities.size() == 0) {
+				row.unusableReason = "no_eligible_home_city";
+			} else {
+				row.usable = true;
+				row.unusableReason = "none";
+			}
+		}
+
+		Locker pveLock(&pveMutex);
+		for (int j = 0; j < pveHuntSpecies.size(); ++j) {
+			if (pveHuntSpecies.get(j).key == row.key) {
+				pveHuntSpecies.set(j, row);
+				break;
+			}
+		}
+	}
+
+	{
+		Locker pveLock(&pveMutex);
+		pveHuntGroundsValidated = allRowsValidated;
+	}
+}
+
+void SimPlayerManager::getPveHunterBuffs(Vector<PveBuffSpec>& buffs) {
+	Locker pveLock(&pveMutex);
+	buffs = pveHunterBuffs;
+}
+
+bool SimPlayerManager::getPveHunterSpecies(const String& key,
+		PveHuntSpecies& species) {
+	Locker pveLock(&pveMutex);
+	for (int i = 0; i < pveHuntSpecies.size(); ++i) {
+		if (pveHuntSpecies.get(i).key == key) {
+			species = pveHuntSpecies.get(i);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool SimPlayerManager::getPveHunterOrder(uint64 identityId,
+		PveHuntOrder& order) {
+	Locker pveLock(&pveMutex);
+	if (!pveHuntOrders.contains(identityId))
+		return false;
+	order = pveHuntOrders.get(identityId);
+	return true;
+}
+
+bool SimPlayerManager::getPveHomeLocations(const String& planet,
+		const String& city, Vector3& cantina, Vector3& medCenter,
+		Vector3& home) {
+	ShuttleportLocation location;
+	bool found = false;
+	for (int i = 0; i < allShuttleports.size(); ++i) {
+		if (allShuttleports.get(i).planet == planet &&
+				allShuttleports.get(i).name == city) {
+			location = allShuttleports.get(i);
+			found = true;
+			break;
+		}
+	}
+	if (!found)
+		return false;
+
+	PvpCityLocations resolved;
+	resolvePvpCityLocations(location, resolved);
+	home = resolved.shuttlePad;
+	cantina = resolved.hangout;
+	medCenter = resolved.medCenterResolved ? resolved.medCenter : home;
+	return true;
+}
+
+void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
+	if (!pveHunterBotsEnabled || !pveWorldPresenceEnabled ||
+			pveMaxHunters <= 0)
+		return;
+
+	bool groundsValidated = false;
+	{
+		Locker pveLock(&pveMutex);
+		groundsValidated = pveHuntGroundsValidated;
+	}
+	if (!groundsValidated) {
+		validatePveHuntGrounds();
+		{
+			Locker pveLock(&pveMutex);
+			groundsValidated = pveHuntGroundsValidated;
+		}
+		if (!groundsValidated)
+			return;
+	}
+
+	Vector<PveHuntSpecies> speciesSnapshot;
+	Vector<SimBotIdentity> identities;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveHuntSpecies.size() == 0)
+			return;
+		speciesSnapshot = pveHuntSpecies;
+		for (int i = 0; i < pveIdentities.size() &&
+				identities.size() < pveMaxHunters; ++i) {
+			uint64 identityId = pveIdentities.elementAt(i).getKey();
+			if (pveIdentityBodyOids.contains(identityId) &&
+					!pveHuntOrders.contains(identityId))
+				identities.add(pveIdentities.get(identityId));
+		}
+	}
+
+	Vector<DemandStateSimulationResult> demandResults;
+	bool activeSnapshotAvailable = false;
+	String snapshotError;
+	computeDemandStateResults(demandResults, activeSnapshotAvailable,
+		snapshotError);
+	(void)activeSnapshotAvailable;
+	(void)snapshotError;
+
+	// Pick the highest-pressure demand THAT A USABLE SOLOABLE SPECIES CAN
+	// SATISFY. Ranking across all demands first would let an ore/steel demand
+	// win and then reject every species, assigning nothing even when a
+	// lower-pressure creature resource is needed. No compatible demand ->
+	// return (no demandless wildcard contracts).
+	String demandedType;
+	float bestPressure = 0.f;
+	for (int i = 0; i < demandResults.size(); ++i) {
+		const DemandStateSimulationResult& demand = demandResults.get(i);
+		if (!demand.hasActiveOpportunity || demand.activeResource.type.isEmpty())
+			continue;
+		if (demand.shortagePressure <= bestPressure)
+			continue;
+		String candidate = demand.activeResource.type.toLowerCase();
+		bool speciesCanSatisfy = false;
+		for (int j = 0; j < speciesSnapshot.size() && !speciesCanSatisfy; ++j) {
+			const PveHuntSpecies& sp = speciesSnapshot.get(j);
+			if (!sp.usable || !sp.soloable)
+				continue;
+			if (sp.requestedResourceType == candidate ||
+					candidate.contains(sp.requestedResourceType))
+				speciesCanSatisfy = true;
+		}
+		if (speciesCanSatisfy) {
+			bestPressure = demand.shortagePressure;
+			demandedType = candidate;
+		}
+	}
+
+	if (demandedType.isEmpty())
+		return;  // no creature-resource demand a usable species can satisfy
+
+	for (int i = 0; i < identities.size(); ++i) {
+		const SimBotIdentity& identity = identities.get(i);
+		if (identity.skillTier < 1)
+			continue;
+
+		for (int j = 0; j < speciesSnapshot.size(); ++j) {
+			const PveHuntSpecies& species = speciesSnapshot.get(j);
+			if (!species.usable || !species.soloable ||
+					identity.skillTier < species.minSkillTier ||
+					species.planet != identity.homePlanet)
+				continue;
+
+			bool cityEligible = false;
+			for (int k = 0; k < species.eligibleHomeCities.size(); ++k) {
+				if (species.eligibleHomeCities.get(k) ==
+						identity.homeCity.toLowerCase()) {
+					cityEligible = true;
+					break;
+				}
+			}
+			if (!cityEligible)
+				continue;
+
+			if (!demandedType.isEmpty() &&
+					species.requestedResourceType != demandedType &&
+					!demandedType.contains(species.requestedResourceType))
+				continue;
+
+			Vector3 home;
+			bool homeFound = false;
+			for (int k = 0; k < allShuttleports.size(); ++k) {
+				if (allShuttleports.get(k).planet == identity.homePlanet &&
+						allShuttleports.get(k).name == identity.homeCity) {
+					home = allShuttleports.get(k).spawn;
+					homeFound = true;
+					break;
+				}
+			}
+			if (!homeFound || home.distanceTo2d(species.huntGround) >
+					(float)pveMaxHuntDistanceMeters)
+				continue;
+
+			uint64 bodyOid = 0;
+			{
+				Locker pveLock(&pveMutex);
+				if (pveHuntOrders.contains(identity.id) ||
+						!pveIdentityBodyOids.contains(identity.id))
+					break;
+				bodyOid = pveIdentityBodyOids.get(identity.id);
+				PveHuntOrder order;
+				order.identityId = identity.id;
+				order.bodyOid = bodyOid;
+				order.issuedAtMs = nowMs;
+				order.homePlanet = identity.homePlanet;
+				order.homeCity = identity.homeCity;
+				order.speciesKey = species.key;
+				order.requestedResourceType = species.requestedResourceType;
+				order.harvestKind = species.harvestKind;
+				order.quota = pveHuntQuota;
+				order.phase = "ANNOUNCE_JOB";
+				order.status = "ASSIGNED";
+				pveHuntOrders.put(identity.id, order);
+				SimBotIdentity& mutableIdentity = pveIdentities.get(identity.id);
+				mutableIdentity.assignmentSpecies = species.key;
+				mutableIdentity.assignmentResource = species.requestedResourceType;
+				mutableIdentity.assignmentStamp = nowMs;
+				pveDirtyIdentityIds.put(identity.id, true);
+			}
+
+			Reference<SimPlayerController*> ctrl = controllers.contains(bodyOid) ?
+				controllers.get(bodyOid) : nullptr;
+			SimHunterController* hunter = ctrl == nullptr ? nullptr :
+				dynamic_cast<SimHunterController*>(ctrl.get());
+			if (hunter != nullptr) {
+				PveHuntOrder assigned;
+				getPveHunterOrder(identity.id, assigned);
+				hunter->startOrder(assigned, species);
+			}
+			info("SimPveHuntAssigned identity=" +
+				String::valueOf(identity.id) + " body=" +
+				String::valueOf(bodyOid) + " species=" + species.key +
+				" resource=" + species.requestedResourceType, true);
+			break;
+		}
+	}
+}
+
+void SimPlayerManager::clearPveHunterOrderLocked(uint64 identityId,
+		const String& status) {
+	(void)status;
+	if (pveHuntOrders.contains(identityId)) {
+		pveHuntOrders.drop(identityId);
+	}
+
+	if (pveIdentities.contains(identityId)) {
+		SimBotIdentity& identity = pveIdentities.get(identityId);
+		identity.assignmentSpecies = "";
+		identity.assignmentResource = "";
+		identity.assignmentStamp = 0;
+		pveDirtyIdentityIds.put(identityId, true);
+	}
+}
+
+void SimPlayerManager::recordPveHunterPhase(uint64 identityId,
+		uint64 bodyOid, const String& phase, uint64 targetOid) {
+	Locker pveLock(&pveMutex);
+	if (!pveHuntOrders.contains(identityId))
+		return;
+	PveHuntOrder order = pveHuntOrders.get(identityId);
+	order.bodyOid = bodyOid == 0 ? order.bodyOid : bodyOid;
+	order.phase = phase;
+	order.targetOid = targetOid;
+	pveHuntOrders.put(identityId, order);
+}
+
+void SimPlayerManager::recordPveHunterHarvest(uint64 identityId,
+		uint64 targetOid, const String& harvestKind,
+		const String& requestedResourceType) {
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> targetObject = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(targetOid);
+	AiAgent* targetAgent = targetObject == nullptr ? nullptr :
+		targetObject->asAiAgent();
+	if (targetAgent == nullptr) {
+		Locker pveLock(&pveMutex);
+		pveHunterHarvestMisses++;
+		return;
+	}
+
+	Zone* zone = targetAgent->getZone();
+	const CreatureTemplate* targetTemplate = nullptr;
+	String resourceType;
+	int harvestAmount = 3;
+	bool missingTemplate = false;
+	{
+		Locker targetLock(targetAgent);
+		targetTemplate = targetAgent->getCreatureTemplate();
+		if (targetTemplate == nullptr)
+			missingTemplate = true;
+
+		if (!missingTemplate && harvestKind == "hide")
+			resourceType = targetTemplate->getHideType();
+		else if (!missingTemplate && harvestKind == "bone")
+			resourceType = targetTemplate->getBoneType();
+		else if (!missingTemplate)
+			resourceType = targetTemplate->getMeatType();
+
+		Creature* creature = cast<Creature*>(targetAgent);
+		if (!missingTemplate && creature != nullptr) {
+			if (harvestKind == "hide")
+				harvestAmount = Math::max(3, (int)creature->getHideMax());
+			else if (harvestKind == "bone")
+				harvestAmount = Math::max(3, (int)creature->getBoneMax());
+			else
+				harvestAmount = Math::max(3, (int)creature->getMeatMax());
+		}
+	}
+
+	(void)requestedResourceType;
+	if (missingTemplate || zone == nullptr || resourceType.isEmpty()) {
+		Locker pveLock(&pveMutex);
+		pveHunterHarvestMisses++;
+		return;
+	}
+
+	ManagedReference<ResourceManager*> resourceManager =
+		zone->getZoneServer()->getResourceManager();
+	ManagedReference<ResourceSpawn*> resourceSpawn = resourceManager == nullptr ?
+		nullptr : resourceManager->getCurrentSpawn(resourceType,
+		zone->getZoneName());
+	if (resourceSpawn == nullptr) {
+		Locker pveLock(&pveMutex);
+		pveHunterHarvestMisses++;
+		return;
+	}
+
+	uint64 spawnObjectId = resourceSpawn->getObjectID();
+	{
+		Locker spawnLock(&spawnYieldAccumulatorMutex);
+		// Preserve an existing (possibly miner-owned) accumulator: add the
+		// hunter's quantity to it and keep ITS resource stats + demand
+		// provenance. Only a fresh accumulator is populated from the spawn -
+		// with EVERY stat, not zeros (a lot with -1 stats corrupts the hive).
+		if (spawnYieldAccumulators.contains(spawnObjectId)) {
+			MinerSpawnYieldAccumulator existing =
+				spawnYieldAccumulators.get(spawnObjectId);
+			existing.sessionQuantity += harvestAmount;
+			existing.active = true;
+			spawnYieldAccumulators.put(spawnObjectId, existing);
+		} else {
+			MinerSpawnYieldAccumulator accumulator;
+			accumulator.resourceSpawnObjectId = spawnObjectId;
+			accumulator.resourceSpawnName = resourceSpawn->getName();
+			accumulator.resourceType = resourceSpawn->getType();
+			accumulator.resourceClassChain = resourceSpawn->getFinalClass();
+			accumulator.sourcePlanet = zone->getZoneName();
+			accumulator.sourceZone = zone->getZoneName();
+			accumulator.matchedDemandProfiles = requestedResourceType;
+			accumulator.active = true;
+			accumulator.sessionQuantity = harvestAmount;
+			accumulator.oq = getResourceAttribute(resourceSpawn, "res_quality");
+			accumulator.cd = getResourceAttribute(resourceSpawn, "res_conductivity");
+			accumulator.dr = getResourceAttribute(resourceSpawn, "res_decay_resist");
+			accumulator.hr = getResourceAttribute(resourceSpawn, "res_heat_resist");
+			accumulator.fl = getResourceAttribute(resourceSpawn, "res_flavor");
+			accumulator.ma = getResourceAttribute(resourceSpawn, "res_malleability");
+			accumulator.pe = getResourceAttribute(resourceSpawn, "res_potential_energy");
+			accumulator.sr = getResourceAttribute(resourceSpawn, "res_shock_resistance");
+			accumulator.ut = getResourceAttribute(resourceSpawn, "res_toughness");
+			accumulator.cr = getResourceAttribute(resourceSpawn, "res_cold_resist");
+			spawnYieldAccumulators.put(spawnObjectId, accumulator);
+		}
+	}
+
+	Locker pveLock(&pveMutex);
+	pveHunterHarvestUnitsTotal += harvestAmount;
+	if (pveIdentities.contains(identityId)) {
+		SimBotIdentity& identity = pveIdentities.get(identityId);
+		identity.harvestUnits += harvestAmount;
+		pveDirtyIdentityIds.put(identityId, true);
+	}
+}
+
+void SimPlayerManager::recordPveHunterKill(uint64 identityId,
+		uint64 bodyOid, uint64 targetOid, const String& harvestKind,
+		const String& requestedResourceType, bool participantVerified) {
+	if (!participantVerified || targetOid == 0)
+		return;
+
+	PveHuntOrder order;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveHuntOrders.contains(identityId))
+			return;
+		order = pveHuntOrders.get(identityId);
+		if (order.bodyOid != bodyOid || order.targetOid != targetOid ||
+				order.lastCreditedTargetOid == targetOid)
+			return;
+		order.lastCreditedTargetOid = targetOid;
+		order.targetOid = 0;
+		order.kills++;
+		pveHuntOrders.put(identityId, order);
+		pveHunterKillsTotal++;
+		if (pveIdentities.contains(identityId)) {
+			SimBotIdentity& identity = pveIdentities.get(identityId);
+			identity.kills++;
+			pveDirtyIdentityIds.put(identityId, true);
+		}
+	}
+
+	// The observer handoff is already outside the corpse/target lock. Resolve
+	// the corpse's actual hide/bone/meat type here, then deposit against that
+	// exact current ResourceSpawn identity; no conceptual label is substituted.
+	recordPveHunterHarvest(identityId, targetOid, harvestKind,
+		requestedResourceType);
+	info("SimPveHuntKill identity=" + String::valueOf(identityId) +
+		" body=" + String::valueOf(bodyOid) + " target=" +
+		String::valueOf(targetOid) + " harvest=" + harvestKind, true);
+}
+
+void SimPlayerManager::recordPveHunterAbandoned(uint64 identityId,
+		uint64 bodyOid, const String& reason) {
+	Locker pveLock(&pveMutex);
+	if (!pveHuntOrders.contains(identityId))
+		return;
+	PveHuntOrder order = pveHuntOrders.get(identityId);
+	if (bodyOid != 0 && order.bodyOid != bodyOid)
+		return;
+	pveHunterAbandonsTotal++;
+	clearPveHunterOrderLocked(identityId, "ABANDONED_" + reason);
+	info("SimPveHuntAbandoned identity=" + String::valueOf(identityId) +
+		" body=" + String::valueOf(bodyOid) + " reason=" + reason, true);
+}
+
+void SimPlayerManager::recordPveHunterCompleted(uint64 identityId,
+		uint64 bodyOid) {
+	Locker pveLock(&pveMutex);
+	if (!pveHuntOrders.contains(identityId))
+		return;
+	PveHuntOrder order = pveHuntOrders.get(identityId);
+	if (bodyOid != 0 && order.bodyOid != bodyOid)
+		return;
+	if (pveIdentities.contains(identityId)) {
+		SimBotIdentity& identity = pveIdentities.get(identityId);
+		identity.hunts++;
+		pveDirtyIdentityIds.put(identityId, true);
+	}
+	clearPveHunterOrderLocked(identityId, "DELIVERED");
+	info("SimPveHuntDelivered identity=" + String::valueOf(identityId) +
+		" body=" + String::valueOf(bodyOid), true);
+}
+
+void SimPlayerManager::handlePveHunterDestructionHandoff(uint64 hunterOid,
+		uint64 targetOid, bool participantVerified) {
+	Reference<SimPlayerController*> ctrl = controllers.contains(hunterOid) ?
+		controllers.get(hunterOid) : nullptr;
+	SimHunterController* hunter = ctrl == nullptr ? nullptr :
+		dynamic_cast<SimHunterController*>(ctrl.get());
+	if (hunter != nullptr)
+		hunter->onHuntDestruction(targetOid, participantVerified);
+}
+
+void SimPlayerManager::onPveHunterDied(uint64 identityId, uint64 bodyOid) {
+	Locker pveLock(&pveMutex);
+	if (pveDeathsReportedBodyOids.contains(bodyOid))
+		return;
+	pveDeathsReportedBodyOids.put(bodyOid, true);
+	pveHunterDeathsTotal++;
+	if (pveIdentities.contains(identityId)) {
+		SimBotIdentity& identity = pveIdentities.get(identityId);
+		identity.deaths++;
+		pveDirtyIdentityIds.put(identityId, true);
+	}
+	clearPveHunterOrderLocked(identityId, "DEATH_REQUEUED");
+	info("SimPveHunterDied identity=" + String::valueOf(identityId) +
+		" body=" + String::valueOf(bodyOid), true);
+}
+
+void SimPlayerManager::announcePveHunterEvent(uint64 bodyOid,
+		const String& site, const String& detail) {
+	if (!enabled || !pveHunterBotsEnabled || bodyOid == 0)
+		return;
+
+	uint64 nowMs = System::getMiliTime();
+	{
+		Locker pveLock(&pveMutex);
+		uint64 identityId = 0;
+		if (pveBodyIdentityIds.contains(bodyOid))
+			identityId = pveBodyIdentityIds.get(bodyOid);
+		if (identityId != 0 &&
+				pveHunterLastAnnounceByIdentity.contains(identityId) &&
+				nowMs - pveHunterLastAnnounceByIdentity.get(identityId) <
+					(uint64)pveAnnounceCooldownSeconds * 1000)
+			return;
+		if (pveHunterLastAnnounceMs != 0 &&
+				nowMs - pveHunterLastAnnounceMs <
+					(uint64)pveAnnounceCooldownSeconds * 1000)
+			return;
+		if (pveHunterLastSiteAnnounceMs != 0 &&
+				nowMs - pveHunterLastSiteAnnounceMs <
+					(uint64)pveAnnounceSiteGapSeconds * 1000)
+			return;
+		pveHunterLastAnnounceMs = nowMs;
+		pveHunterLastSiteAnnounceMs = nowMs;
+		if (identityId != 0)
+			pveHunterLastAnnounceByIdentity.put(identityId, nowMs);
+		pveHunterAnnouncementsTotal++;
+	}
+
+	Reference<SimPlayerController*> ctrl = controllers.contains(bodyOid) ?
+		controllers.get(bodyOid) : nullptr;
+	ManagedReference<AiAgent*> agent = ctrl == nullptr ? nullptr :
+		ctrl->getAgent();
+	if (agent == nullptr || agent->getZone() == nullptr)
+		return;
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ChatManager* chatManager = zoneServer == nullptr ? nullptr :
+		zoneServer->getChatManager();
+	if (chatManager == nullptr)
+		return;
+
+	String line;
+	switch (System::random(2)) {
+	case 0:
+		line = "A hunter is working the " + site + " grounds.";
+		break;
+	case 1:
+		line = "A hunting contract is active near the " + site + ".";
+		break;
+	default:
+		line = "A hunter has moved out to the " + site + " hunting grounds.";
+		break;
+	}
+	if (!detail.isEmpty())
+		line += " " + detail;
+	chatManager->broadcastChatMessage(agent, UnicodeString(line), 0, 0,
+		agent->getMoodID());
+}
+
+void SimPlayerManager::attachPveHunterController(
+		const SimBotIdentity& identity, AiAgent* body) {
+	if (body == nullptr || controllers.contains(body->getObjectID()))
+		return;
+
+	uint64 bodyOid = body->getObjectID();
+	Reference<SimHunterController*> hunter =
+		new SimHunterController(body, identity.id);
+	controllers.put(bodyOid, hunter.castTo<SimPlayerController*>());
+	body->activateAiBehavior(true);
+
+	PveHuntOrder order;
+	PveHuntSpecies species;
+	bool assigned = false;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveHuntOrders.contains(identity.id)) {
+			order = pveHuntOrders.get(identity.id);
+			for (int i = 0; i < pveHuntSpecies.size(); ++i) {
+				if (pveHuntSpecies.get(i).key == order.speciesKey) {
+					species = pveHuntSpecies.get(i);
+					assigned = true;
+					break;
+				}
+			}
+		}
+	}
+
+	if (assigned)
+		hunter->startOrder(order, species);
+	else
+		hunter->startSimLoop();
 }
 
 void SimPlayerManager::runPveFoundationMaintenanceTask() {
@@ -7139,6 +8042,7 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 	runPveSpikeIfNeeded(nowMs);
 	updatePveBodyLifecycles(nowMs);
 	governPvePopulation(nowMs);
+	runPveHunterMatchmaker(nowMs);
 	flushPveIdentityRoster(false);
 }
 
@@ -7870,7 +8774,16 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	VectorMap<uint64, uint64> bodyOids;
 	VectorMap<uint64, uint64> presenceOids;
 	VectorMap<uint64, uint64> presenceSpawnCounts;
+	Vector<PveHuntSpecies> huntSpecies;
+	Vector<PveBuffSpec> hunterBuffs;
+	Vector<PveHuntOrder> huntOrders;
 	uint64 presenceSpawnTotal = 0;
+	uint64 hunterKillsTotal = 0;
+	uint64 hunterDeathsTotal = 0;
+	uint64 hunterAbandonsTotal = 0;
+	uint64 hunterHarvestUnitsTotal = 0;
+	uint64 hunterHarvestMisses = 0;
+	uint64 hunterAnnouncementsTotal = 0;
 	{
 		Locker pveLock(&pveMutex);
 		for (int i = 0; i < pveIdentities.size(); ++i)
@@ -7879,6 +8792,16 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		presenceOids = pvePresenceOids;
 		presenceSpawnCounts = pvePresenceSpawnCounts;
 		presenceSpawnTotal = pvePresenceSpawnTotal;
+		huntSpecies = pveHuntSpecies;
+		hunterBuffs = pveHunterBuffs;
+		for (int i = 0; i < pveHuntOrders.size(); ++i)
+			huntOrders.add(pveHuntOrders.elementAt(i).getValue());
+		hunterKillsTotal = pveHunterKillsTotal;
+		hunterDeathsTotal = pveHunterDeathsTotal;
+		hunterAbandonsTotal = pveHunterAbandonsTotal;
+		hunterHarvestUnitsTotal = pveHunterHarvestUnitsTotal;
+		hunterHarvestMisses = pveHunterHarvestMisses;
+		hunterAnnouncementsTotal = pveHunterAnnouncementsTotal;
 	}
 
 	JSONSerializationType result = JSONSerializationType::object();
@@ -7893,6 +8816,41 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	result["attachedBodies"] = bodyOids.size();
 	result["presenceMembers"] = presenceOids.size();
 	result["presenceSpawnTotal"] = presenceSpawnTotal;
+	result["hunterKillsTotal"] = hunterKillsTotal;
+	result["hunterDeathsTotal"] = hunterDeathsTotal;
+	result["hunterAbandonsTotal"] = hunterAbandonsTotal;
+	result["hunterHarvestUnitsTotal"] = hunterHarvestUnitsTotal;
+	result["hunterHarvestMisses"] = hunterHarvestMisses;
+	result["hunterAnnouncementsTotal"] = hunterAnnouncementsTotal;
+	result["huntGroundsValidated"] = pveHuntGroundsValidated;
+	result["maxHuntDistanceMeters"] = pveMaxHuntDistanceMeters;
+	result["hunterWeaponTemplate"] = pveHunterWeaponTemplate;
+	result["announceCooldownSeconds"] = pveAnnounceCooldownSeconds;
+	result["announceSiteGapSeconds"] = pveAnnounceSiteGapSeconds;
+	JSONSerializationType combat = JSONSerializationType::object();
+	combat["retreatHamPct"] = pveRetreatHamPct;
+	combat["resumeHamPct"] = pveResumeHamPct;
+	combat["maxRetreatCycles"] = pveMaxRetreatCycles;
+	combat["huntActiveTickSeconds"] = pveHunterActiveTickSeconds;
+	combat["huntTimeoutSeconds"] = pveHuntTimeoutSeconds;
+	combat["retreatRangeMeters"] = pveRetreatRangeMeters;
+	combat["scanRadiusMeters"] = pveHunterScanRadiusMeters;
+	combat["weaponRangeMeters"] = pveHunterWeaponRangeMeters;
+	combat["cloneWoundAmount"] = pveCloneWoundAmount;
+	result["combat"] = combat;
+	JSONSerializationType buffRows = JSONSerializationType::array();
+	for (int i = 0; i < hunterBuffs.size(); ++i) {
+		const PveBuffSpec& buff = hunterBuffs.get(i);
+		JSONSerializationType row = JSONSerializationType::object();
+		row["name"] = buff.name;
+		row["crc"] = buff.crc;
+		row["durationSeconds"] = buff.durationSeconds;
+		row["type"] = buff.buffType;
+		row["attribute"] = buff.attribute;
+		row["modifier"] = buff.modifier;
+		buffRows.push_back(row);
+	}
+	result["buffs"] = buffRows;
 
 	JSONSerializationType rows = JSONSerializationType::array();
 	for (int i = 0; i < identities.size(); ++i) {
@@ -7915,7 +8873,22 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		row["presenceSpawns"] = bodyOid != 0 &&
 			presenceSpawnCounts.contains(bodyOid) ?
 			presenceSpawnCounts.get(bodyOid) : 0;
-		row["phase"] = "FOUNDATION_IDLE";
+		row["phase"] = "IDLE_HOME";
+		for (int j = 0; j < huntOrders.size(); ++j) {
+			if (huntOrders.get(j).identityId == identity.id) {
+				row["phase"] = huntOrders.get(j).phase;
+				row["orderStatus"] = huntOrders.get(j).status;
+				row["speciesKey"] = huntOrders.get(j).speciesKey;
+				row["requestedResourceType"] =
+					huntOrders.get(j).requestedResourceType;
+				row["harvestKind"] = huntOrders.get(j).harvestKind;
+				row["quota"] = huntOrders.get(j).quota;
+				row["orderKills"] = huntOrders.get(j).kills;
+				row["retreatCycles"] = huntOrders.get(j).retreatCycles;
+				row["targetOid"] = huntOrders.get(j).targetOid;
+				break;
+			}
+		}
 		row["assignmentSpecies"] = identity.assignmentSpecies;
 		row["assignmentResource"] = identity.assignmentResource;
 		row["hunts"] = identity.hunts;
@@ -7936,6 +8909,34 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		presenceRows.push_back(row);
 	}
 	result["presenceSpawnRows"] = presenceRows;
+
+	JSONSerializationType speciesRows = JSONSerializationType::array();
+	for (int i = 0; i < huntSpecies.size(); ++i) {
+		const PveHuntSpecies& species = huntSpecies.get(i);
+		JSONSerializationType row = JSONSerializationType::object();
+		row["key"] = species.key;
+		row["planet"] = species.planet;
+		row["spawnArea"] = species.huntGroundName;
+		row["templateFilter"] = species.templateFilter;
+		row["requestedResourceType"] = species.requestedResourceType;
+		row["harvestKind"] = species.harvestKind;
+		row["estimatedHideUnits"] = species.estimatedHideUnits;
+		row["estimatedBoneUnits"] = species.estimatedBoneUnits;
+		row["estimatedMeatUnits"] = species.estimatedMeatUnits;
+		row["huntGroundX"] = species.huntGround.getX();
+		row["huntGroundY"] = species.huntGround.getY();
+		row["huntGroundZ"] = species.huntGround.getZ();
+		row["soloable"] = species.soloable;
+		row["minSkillTier"] = species.minSkillTier;
+		row["usable"] = species.usable;
+		row["unusableReason"] = species.unusableReason;
+		JSONSerializationType cities = JSONSerializationType::array();
+		for (int j = 0; j < species.eligibleHomeCities.size(); ++j)
+			cities.push_back(species.eligibleHomeCities.get(j));
+		row["eligibleHomeCities"] = cities;
+		speciesRows.push_back(row);
+	}
+	result["species"] = speciesRows;
 	return result;
 }
 
@@ -23475,9 +24476,10 @@ bool SimPlayerManager::resolvePvpCityLocations(
     // The world scan deliberately happens outside pvpSquadMutex. This mirrors
     // the boarding-point resolver: only the immutable result is published under
     // the squad lock.
-    PvpCityLocations resolved;
-    resolved.shuttlePad = location.spawn;
-    resolved.hangout = location.hangout;
+	PvpCityLocations resolved;
+	resolved.shuttlePad = location.spawn;
+	resolved.hangout = location.hangout;
+	resolved.medCenter = resolved.shuttlePad;
 
     ZoneServer* zoneServer = ServerCore::getZoneServer();
     Zone* zone = zoneServer == nullptr ? nullptr :
@@ -23508,7 +24510,7 @@ bool SimPlayerManager::resolvePvpCityLocations(
             location.shuttlePoint + "\" fallback=true", true);
     }
 
-    if (location.hangoutManual) {
+	if (location.hangoutManual) {
         resolved.hangoutSource = PvpCityLocations::HANGOUT_MANUAL;
     } else if (pvpUseCantinaHangouts && zone != nullptr) {
         // Navmesh readiness probe: mesh build jobs only START after server
@@ -23618,6 +24620,55 @@ bool SimPlayerManager::resolvePvpCityLocations(
                 if (path != nullptr)
                     delete path;
             }
+        }
+    }
+
+    // P.8.1 med-center resolver: use the same immutable city scan as the
+    // cantina resolver, but publish an exterior point beside the hospital so
+    // the hunter can clear clone wounds without entering a cell.
+    if (zone != nullptr) {
+        SortedVector<TreeEntry*> medObjects;
+        zone->getInRangeObjects(resolved.shuttlePad.getX(), 0,
+            resolved.shuttlePad.getY(), pvpCantinaScanRadiusMeters,
+            &medObjects, true, true);
+        BuildingObject* nearestHospital = nullptr;
+        float nearestHospitalDistance = 0.f;
+        for (int i = 0; i < medObjects.size(); ++i) {
+            SceneObject* candidate =
+                static_cast<SceneObject*>(medObjects.get(i));
+            if (candidate == nullptr || !candidate->isBuildingObject())
+                continue;
+            BuildingObject* building = candidate->asBuildingObject();
+            if (building == nullptr || building->getObjectTemplate() == nullptr)
+                continue;
+            String templatePath = building->getObjectTemplate()->
+                getFullTemplateString().toLowerCase();
+            if (!templatePath.contains("hospital") &&
+                    !templatePath.contains("medicalcenter") &&
+                    !templatePath.contains("medcenter"))
+                continue;
+            float distance = building->getWorldPosition().distanceTo2d(
+                resolved.shuttlePad);
+            if (nearestHospital == nullptr || distance < nearestHospitalDistance) {
+                nearestHospital = building;
+                nearestHospitalDistance = distance;
+            }
+        }
+        if (nearestHospital != nullptr) {
+            Vector3 hospitalPosition = nearestHospital->getWorldPosition();
+            Vector3 towardPad = resolved.shuttlePad - hospitalPosition;
+            towardPad.setZ(0.f);
+            if (towardPad.length2d() < 0.01f)
+                towardPad = Vector3::UNIT_X;
+            else
+                towardPad.normalize();
+            resolved.medCenter = hospitalPosition + towardPad *
+                (nearestHospital->getBoundingRadius() + 8.f);
+            float medZ = zone->getHeight(resolved.medCenter.getX(),
+                resolved.medCenter.getY());
+            if (medZ != 0.f)
+                resolved.medCenter.setZ(medZ);
+            resolved.medCenterResolved = true;
         }
     }
 
