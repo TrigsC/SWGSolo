@@ -52,9 +52,13 @@
 #include "server/zone/managers/object/ObjectManager.h"
 #include "server/zone/objects/pathfinding/NavArea.h"
 #include "server/zone/managers/collision/PathFinderManager.h"
+#include "server/zone/managers/collision/CollisionManager.h"
 #include "server/zone/objects/building/BuildingObject.h"
 #include "server/zone/objects/cell/CellObject.h"
+#include "server/zone/objects/region/CityRegion.h"
 #include "server/zone/objects/scene/SceneObjectType.h"
+#include "server/zone/objects/tangible/LairObject.h"
+#include "server/zone/objects/tangible/terminal/mission/MissionTerminal.h"
 #include "server/zone/TreeEntry.h"
 #include "system/thread/ReadLocker.h"
 
@@ -476,6 +480,32 @@ struct DemandProfileMatch {
     bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
 
+struct DemandFamilySignal {
+	String family;
+	String channel;
+	uint64 effectiveCeiling = 0;
+	uint64 reserveTarget = 0;
+	uint64 familySupply = 0;
+	uint64 familyInbound = 0;
+	uint64 allocComponent = 0;
+	uint64 reserveComponent = 0;
+	uint64 signalUnits = 0;
+	float pressure = 0.f;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PveHunterFamilyCandidate {
+	int identityIndex = -1;
+	int speciesIndex = -1;
+	int demandResultIndex = -1;
+	int signalIndex = -1;
+	uint64 estimatedYieldUnits = 0;
+	uint64 expectedYieldUnits = 0;
+	float score = -1.f;
+};
+
 struct DemandStateSimulationResult {
     String profileKey;
     String state;
@@ -508,6 +538,8 @@ struct DemandStateSimulationResult {
     String marketTopType;
     ResourceIntelligenceEntry activeResource;
     DemandProfileMatch activeMatch;
+	Vector<DemandFamilySignal> familySignals;
+	uint64 reservedInboundSupply = 0;
 
     bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
     bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -651,6 +683,19 @@ namespace {
     const char* AI_STATIONED_SAMPLE_INTERVAL_SOURCE =
         "player_sampling_code";
 
+    String getPveMissionTerminalCityKey(const String& planet,
+            const String& city) {
+        String key = planet + ":" + city;
+        key.toLowerCase();
+        return key;
+    }
+
+    String getSpawnYieldAccumulatorKey(uint64 resourceSpawnObjectId,
+            const String& acquisitionOrigin) {
+        return String::valueOf(resourceSpawnObjectId) + "|" +
+            acquisitionOrigin;
+    }
+
     int getNpcFrsAwardDayKey(uint64 nowMs) {
         return static_cast<int>(nowMs / NPC_FRS_AWARD_DAY_MS);
     }
@@ -663,6 +708,9 @@ SimPlayerManager::SimPlayerManager() {
     marketSupplyObservationStartedAtMs = System::getMiliTime();
     simulatedAcquisitionRuntime = new SimulatedAcquisitionRuntimeState();
     pvpNpcFrsAwardStats.setAllowOverwriteInsertPlan();
+    missionTerminalCityState.setAllowOverwriteInsertPlan();
+    pveHuntLairs.setAllowOverwriteInsertPlan();
+    pveAcquisitionLedgerCreatureClassMarkers.add("creature_resources");
 }
 
 SimPlayerManager::~SimPlayerManager() {
@@ -1672,15 +1720,22 @@ static bool findDemandProfileDefinition(
     return false;
 }
 
-static bool demandStateProfileUsesConceptualLabel(const String& profileKey, const String& resourceLabel) {
+static bool demandStateProfileUsesConceptualLabel(
+		const String& profileKey, const String& resourceLabel,
+		bool includeCreatureFamilies = false) {
     if (profileKey == "composite_armor_supply" ||
             profileKey == "master_weaponsmith_staples" ||
             profileKey == "high_damage_weapon_components") {
         return resourceLabel == "copper" || resourceLabel == "iron";
     }
 
-    if (profileKey == "chef_buff_foods" || profileKey == "chef_high_value_consumables")
-        return resourceLabel == "water";
+	if (profileKey == "chef_buff_foods" || profileKey == "chef_high_value_consumables") {
+		if (resourceLabel == "water")
+			return true;
+
+		return includeCreatureFamilies &&
+			(resourceLabel == "meat" || resourceLabel.beginsWith("meat_"));
+	}
 
     if (profileKey == "production_infrastructure")
         return resourceLabel == "copper" || resourceLabel == "iron" || resourceLabel == "gas";
@@ -1738,13 +1793,15 @@ static uint64 estimateConceptualDemandStateSupply(
         const Vector<String>& resourceNames,
         const Vector<uint64>& amounts,
         String& supplyConfidence,
-        String& supplyLabels) {
+        String& supplyLabels,
+        bool includeCreatureFamilies = false) {
     uint64 total = 0;
 
     for (int i = 0; i < resourceNames.size() && i < amounts.size(); ++i) {
         String resourceLabel = resourceNames.get(i).toLowerCase();
 
-        if (!demandStateProfileUsesConceptualLabel(profileKey, resourceLabel))
+        if (!demandStateProfileUsesConceptualLabel(
+                profileKey, resourceLabel, includeCreatureFamilies))
             continue;
 
         uint64 amount = amounts.get(i);
@@ -1867,6 +1924,178 @@ static void calculateDemandStatePressure(
     else
         result.pressureScore =
             result.shortagePressure + result.opportunityPressure;
+}
+
+static uint64 addDemandFamilyUnits(uint64 left, uint64 right) {
+	return right > static_cast<uint64>(-1) - left ?
+		static_cast<uint64>(-1) : left + right;
+}
+
+static uint64 multiplyDemandFamilyUnits(uint64 units, int multiplier) {
+	if (units == 0 || multiplier <= 0)
+		return 0;
+
+	uint64 count = static_cast<uint64>(multiplier);
+	return units > static_cast<uint64>(-1) / count ?
+		static_cast<uint64>(-1) : units * count;
+}
+
+static uint64 getPveHunterSpeciesEstimatedYieldUnits(
+		const PveHuntSpecies& species) {
+	String harvestKind = species.harvestKind.toLowerCase().trim();
+
+	if (harvestKind == "hide")
+		return species.estimatedHideUnits > 0 ?
+			static_cast<uint64>(species.estimatedHideUnits) : 0;
+	if (harvestKind == "bone")
+		return species.estimatedBoneUnits > 0 ?
+			static_cast<uint64>(species.estimatedBoneUnits) : 0;
+	if (harvestKind == "meat")
+		return species.estimatedMeatUnits > 0 ?
+			static_cast<uint64>(species.estimatedMeatUnits) : 0;
+
+	return 0;
+}
+
+static String getDemandFamilySignalChannel(
+		const DemandProfileDefinition& profile, const String& family) {
+	for (int i = 0; i < profile.premiumFamilies.size(); ++i) {
+		if (profile.premiumFamilies.get(i).toLowerCase() == family)
+			return "premium";
+	}
+
+	for (int i = 0; i < profile.bulkFamilies.size(); ++i) {
+		if (profile.bulkFamilies.get(i).toLowerCase() == family)
+			return "bulk";
+	}
+
+	for (int i = 0; i < profile.exactTypes.size(); ++i) {
+		String exactType = profile.exactTypes.get(i).toLowerCase();
+		if (exactType == family || exactType.beginsWith(family))
+			return "exact";
+	}
+
+	return "eligible";
+}
+
+static void deriveDemandFamilySignals(
+		DemandStateSimulationResult& result,
+		const DemandProfileDefinition& profile,
+		const Vector<String>& creatureFamilies,
+		const VectorMap<String, uint64>& familySupplyByFamily,
+		const VectorMap<String, uint64>& reservedInboundByProfileFamily,
+		const VectorMap<String, uint64>& familyReserveTargets,
+		uint64 familyReserveCap,
+		const VectorMap<String, uint64>& familyAllocationCeilingUnits,
+		const VectorMap<String, float>& familyAllocationCeilingFractions,
+		float reservePressureFloor) {
+	result.familySignals.removeAll();
+	result.reservedInboundSupply = 0;
+
+	if (result.desiredReserve == 0)
+		return;
+
+	Vector<String> eligibleFamilies;
+	for (int i = 0; i < creatureFamilies.size(); ++i) {
+		String family = creatureFamilies.get(i).toLowerCase().trim();
+
+		if (family.isEmpty() || eligibleFamilies.contains(family) ||
+				!demandStateProfileUsesConceptualLabel(
+					profile.key, family, true))
+			continue;
+
+		eligibleFamilies.add(family);
+	}
+
+	if (eligibleFamilies.size() == 0)
+		return;
+
+	String profilePrefix = profile.key + "|";
+	uint64 reservedInboundTotal = 0;
+	for (int i = 0; i < eligibleFamilies.size(); ++i) {
+		String key = profilePrefix + eligibleFamilies.get(i);
+		if (reservedInboundByProfileFamily.contains(key))
+			reservedInboundTotal = addDemandFamilyUnits(
+				reservedInboundTotal, reservedInboundByProfileFamily.get(key));
+	}
+	result.reservedInboundSupply = reservedInboundTotal;
+
+	// Existing profiles are ANY-OF substitution pools. Inbound from any
+	// eligible creature family satisfies the shared gap, while the per-family
+	// inbound value remains scoped for each stable ceiling/reserve calculation.
+	uint64 sharedGap = result.shortageUnits > reservedInboundTotal ?
+		result.shortageUnits - reservedInboundTotal : 0;
+	uint64 familyCount = static_cast<uint64>(eligibleFamilies.size());
+	uint64 baseAllocation = sharedGap / familyCount;
+	uint64 largestRemainderCount = sharedGap % familyCount;
+
+	for (int i = 0; i < eligibleFamilies.size(); ++i) {
+		String family = eligibleFamilies.get(i);
+		String inboundKey = profilePrefix + family;
+		DemandFamilySignal signal;
+		signal.family = family;
+		signal.channel = getDemandFamilySignalChannel(profile, family);
+		signal.familySupply = familySupplyByFamily.contains(family) ?
+			familySupplyByFamily.get(family) : 0;
+		signal.familyInbound = reservedInboundByProfileFamily.contains(inboundKey) ?
+			reservedInboundByProfileFamily.get(inboundKey) : 0;
+		signal.reserveTarget = familyReserveTargets.contains(family) ?
+			familyReserveTargets.get(family) : 0;
+
+		bool hasAbsoluteCeiling =
+			familyAllocationCeilingUnits.contains(family) &&
+			familyAllocationCeilingUnits.get(family) > 0;
+		bool hasFractionCeiling =
+			familyAllocationCeilingFractions.contains(family) &&
+			familyAllocationCeilingFractions.get(family) > 0.f;
+
+		uint64 absoluteCeiling = hasAbsoluteCeiling ?
+			familyAllocationCeilingUnits.get(family) : 0;
+		uint64 fractionCeiling = 0;
+		if (hasFractionCeiling) {
+			float requested = static_cast<float>(result.desiredReserve) *
+				familyAllocationCeilingFractions.get(family);
+			fractionCeiling = requested > 0.f ?
+				static_cast<uint64>(std::floor(requested + 0.5f)) : 0;
+		}
+
+		if (hasAbsoluteCeiling && hasFractionCeiling)
+			signal.effectiveCeiling = Math::min(absoluteCeiling, fractionCeiling);
+		else if (hasAbsoluteCeiling)
+			signal.effectiveCeiling = absoluteCeiling;
+		else if (hasFractionCeiling)
+			signal.effectiveCeiling = fractionCeiling;
+		else
+			signal.effectiveCeiling = static_cast<uint64>(std::floor(
+				static_cast<float>(result.desiredReserve) * 0.25f + 0.5f));
+
+		uint64 currentFamilySupply = addDemandFamilyUnits(
+			signal.familySupply, signal.familyInbound);
+		uint64 maxPoolForFamily = addDemandFamilyUnits(
+			sharedGap, currentFamilySupply);
+		if (signal.effectiveCeiling > maxPoolForFamily)
+			signal.effectiveCeiling = maxPoolForFamily;
+
+		uint64 requestedAllocation = baseAllocation +
+			(static_cast<uint64>(i) < largestRemainderCount ? 1 : 0);
+		uint64 allocationHeadroom = signal.effectiveCeiling >
+			currentFamilySupply ? signal.effectiveCeiling - currentFamilySupply : 0;
+		signal.allocComponent = Math::min(requestedAllocation, allocationHeadroom);
+
+		uint64 reserveHeadroom = signal.reserveTarget > currentFamilySupply ?
+			signal.reserveTarget - currentFamilySupply : 0;
+		signal.reserveComponent = Math::min(familyReserveCap, reserveHeadroom);
+		signal.signalUnits = addDemandFamilyUnits(
+			signal.allocComponent, signal.reserveComponent);
+		signal.pressure = result.shortagePressure *
+			static_cast<float>(signal.allocComponent) /
+			static_cast<float>(Math::max(static_cast<uint64>(1),
+				result.shortageUnits));
+		if (signal.reserveComponent > 0)
+			signal.pressure += reservePressureFloor;
+
+		result.familySignals.add(signal);
+	}
 }
 
 static void collectMarketListingSnapshots(
@@ -2102,6 +2331,10 @@ static float getMinerTargetSimulationProfileWeight(VectorMap<String, float>& pro
     return profileWeights.get(profileKey);
 }
 
+static bool isCreatureResourceEntry(
+		const ResourceIntelligenceEntry& entry,
+		const Vector<String>& creatureClassMarkers);
+
 static MinerTargetSimulationPlan selectMinerTargetSimulationPlan(
         const Vector<ResourceIntelligenceEntry>& entries,
         const Vector<ResourceScoringProfile>& profiles,
@@ -2110,7 +2343,9 @@ static MinerTargetSimulationPlan selectMinerTargetSimulationPlan(
         float profileWeight,
         bool preferSamePlanet,
         int samePlanetBonus,
-        int travelPenalty) {
+        int travelPenalty,
+        bool excludeCreatureResources,
+        const Vector<String>& creatureClassMarkers) {
     MinerTargetSimulationPlan plan;
 
     if (profileIndex < 0 || profileIndex >= profiles.size() || profileWeight <= 0.f)
@@ -2121,6 +2356,10 @@ static MinerTargetSimulationPlan selectMinerTargetSimulationPlan(
 
     for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
         ResourceIntelligenceEntry entry = entries.get(entryIndex);
+		if (excludeCreatureResources &&
+				isCreatureResourceEntry(entry, creatureClassMarkers))
+			continue;
+
         String matchedType = getBestMatchedResourceType(entry, profile);
 
         if (matchedType.isEmpty())
@@ -2162,7 +2401,9 @@ static MinerTargetSimulationPlan selectAssignedMinerTargetSimulationPlan(
         bool preferSamePlanet,
         int samePlanetBonus,
         int travelPenalty,
-        int& assignedProfileIndex) {
+        int& assignedProfileIndex,
+        bool excludeCreatureResources,
+        const Vector<String>& creatureClassMarkers) {
     MinerTargetSimulationPlan selectedPlan;
     assignedProfileIndex = -1;
 
@@ -2182,7 +2423,9 @@ static MinerTargetSimulationPlan selectAssignedMinerTargetSimulationPlan(
         assignedWeight,
         preferSamePlanet,
         samePlanetBonus,
-        travelPenalty);
+        travelPenalty,
+        excludeCreatureResources,
+        creatureClassMarkers);
 
     if (selectedPlan.isValid())
         return selectedPlan;
@@ -2203,7 +2446,9 @@ static MinerTargetSimulationPlan selectAssignedMinerTargetSimulationPlan(
             fallbackWeight,
             preferSamePlanet,
             samePlanetBonus,
-            travelPenalty);
+            travelPenalty,
+            excludeCreatureResources,
+            creatureClassMarkers);
 
         if (!fallbackPlan.isValid())
             continue;
@@ -2246,16 +2491,52 @@ static String formatMinerTargetSimulationLine(
         " mode=simulation-only";
 }
 
+static bool isCreatureResourceEntry(
+		const ResourceIntelligenceEntry& entry,
+		const Vector<String>& creatureClassMarkers) {
+	String classChain = entry.classChain.toLowerCase();
+	for (int markerIndex = 0;
+			markerIndex < creatureClassMarkers.size(); ++markerIndex) {
+		String marker = creatureClassMarkers.get(markerIndex).toLowerCase().trim();
+		if (!marker.isEmpty() && classChain.indexOf(marker) >= 0)
+			return true;
+	}
+
+	// Some resource snapshots do not expose the full STF class chain. Keep a
+	// conservative family-root fallback for the creature resources that can be
+	// produced by PvE harvests.
+	if (classChain.beginsWith("creature_resources") ||
+			classChain.beginsWith("organic>creature_resources"))
+		return true;
+
+	String type = entry.type.toLowerCase().trim();
+	const char* const creatureRoots[] = {
+		"meat", "hide", "bone", "milk", "egg", "seafood"
+	};
+	for (int rootIndex = 0; rootIndex < 6; ++rootIndex) {
+		if (type.beginsWith(creatureRoots[rootIndex]))
+			return true;
+	}
+
+	return false;
+}
+
 static DemandWeightedMinerTarget selectDemandWeightedMinerTarget(
         const Vector<ResourceIntelligenceEntry>& entries,
         const DemandProfileDefinition& profile,
         const String& zoneName,
         int samePlanetBonus,
-        int travelPenalty) {
+        int travelPenalty,
+		bool excludeCreatureResources,
+		const Vector<String>& creatureClassMarkers) {
     DemandWeightedMinerTarget target;
 
     for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
         ResourceIntelligenceEntry entry = entries.get(entryIndex);
+		if (excludeCreatureResources &&
+				isCreatureResourceEntry(entry, creatureClassMarkers))
+			continue;
+
         DemandProfileMatch match =
             evaluateDemandProfileResource(entry, profile, 1.f, 100);
 
@@ -2397,7 +2678,9 @@ static DemandWeightedPlanSelection selectDemandWeightedMinerPlanForValidation(
         int samePlanetBonus,
         int travelPenalty,
         int maxMinersPerProfile,
-        float strongPressureRatio) {
+        float strongPressureRatio,
+		bool excludeCreatureResources,
+		const Vector<String>& creatureClassMarkers) {
     DemandWeightedPlanSelection selection;
     DemandWeightedMinerCandidate bestWithinCap;
     DemandWeightedMinerCandidate strongestCapped;
@@ -2412,7 +2695,8 @@ static DemandWeightedPlanSelection selectDemandWeightedMinerPlanForValidation(
 
         DemandWeightedMinerTarget target =
             selectDemandWeightedMinerTarget(
-                entries, profile, zoneName, samePlanetBonus, travelPenalty);
+                entries, profile, zoneName, samePlanetBonus, travelPenalty,
+				excludeCreatureResources, creatureClassMarkers);
 
         if (!target.isValid())
             continue;
@@ -5314,8 +5598,20 @@ void SimPlayerManager::loadLuaConfig() {
 		pvePresenceOids.removeAll();
 		pvePresenceSpawnCounts.removeAll();
 		pveHuntSpecies.removeAll();
+		allMissionTerminals.removeAll();
+		missionTerminalCityState.removeAll();
+		pveHuntLairs.removeAll();
 		pveHunterBuffs.removeAll();
 		pveHuntOrders.removeAll();
+		pveSessionHarvestByFamily.removeAll();
+		pveCreatureSupplyBootBaseline.removeAll();
+		pveBaselineState = "pending";
+		pveBaselineLastError = "";
+		pveBaselineRetryCount = 0;
+		pveBaselineNextRetryMs = 0;
+		pveTurfSplitEffective = false;
+		pveTurfSplitEffectiveLatched = false;
+		pveTurfSplitGateWarningIssued = false;
 		pveDeathsReportedBodyOids.removeAll();
 		pvePresenceSpawnTotal = 0;
 		pveHunterKillsTotal = 0;
@@ -5326,6 +5622,8 @@ void SimPlayerManager::loadLuaConfig() {
 		pveHunterAnnouncementsTotal = 0;
 		pveHunterLastAnnounceMs = 0;
 		pveHunterLastSiteAnnounceMs = 0;
+		pveMissionLairsSpawned = 0;
+		pveMissionLairsCleaned = 0;
 		pveHunterLastAnnounceByIdentity.removeAll();
 		pveSpike = PveSpikeState();
 		pveSpikeObserver = nullptr;
@@ -5333,8 +5631,30 @@ void SimPlayerManager::loadLuaConfig() {
 	}
 	pveEnabled = false;
 	pveHunterBotsEnabled = false;
+	pveMissionHuntEnabled = false;
+	pveMissionSpawnDistanceMeters = 200.f;
+	pveMissionTerminalScanRadiusMeters = 600.f;
+	pveMissionMaxSpawnPointTries = 32;
+	pveMissionMaxSimultaneousAdds = 1;
+	pveMissionAddsAbandonCycles = 3;
+	pveMissionTerminalDwellSeconds = 5;
+	pveMissionTerminalResolveWaitCycles = 10;
+	pveMissionLairTimeoutSeconds = 1800;
+	pveMissionMaxActiveLairs = 6;
 	pveWorldPresenceEnabled = false;
 	pveSpikeEnabled = false;
+	pveAcquisitionLedgerEnabled = false;
+	pveAcquisitionLedgerMinerCreatureExclusion = true;
+	pveAcquisitionLedgerCreatureFamilies.removeAll();
+	pveAcquisitionLedgerCreatureClassMarkers.removeAll();
+	pveAcquisitionLedgerCreatureClassMarkers.add("creature_resources");
+	pveAcquisitionLedgerFamilyReserveTargets.removeAll();
+	pveAcquisitionLedgerFamilyReserveCap = 5000;
+	pveAcquisitionLedgerFamilyAllocationCeilingUnits.removeAll();
+	pveAcquisitionLedgerFamilyAllocationCeilingFractions.removeAll();
+	pveAcquisitionLedgerReservePressureFloor = 25.f;
+	pveAcquisitionLedgerHuntTimeEstimateSeconds = 600;
+	pveAcquisitionLedgerBaselineRetryBackoffMs = 5000;
 	pveMaxHunters = 6;
 	pveSkillTier = 1;
 	pveMaintenanceIntervalSeconds = 30;
@@ -6309,6 +6629,40 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	pveEnabled = pveConfig.getBooleanField("enabled", pveEnabled);
 	pveHunterBotsEnabled = pveConfig.getBooleanField(
 		"enableHunterBots", pveHunterBotsEnabled);
+	pveMissionHuntEnabled = false;
+	LuaObject missionHuntConfig = pveConfig.getObjectField("missionHunt");
+	if (missionHuntConfig.isValidTable()) {
+		pveMissionHuntEnabled = missionHuntConfig.getBooleanField(
+			"enabled", false);
+		pveMissionSpawnDistanceMeters = clampFloatRange(
+			missionHuntConfig.getFloatField("missionSpawnDistanceMeters",
+				pveMissionSpawnDistanceMeters), 16.f, 2000.f);
+		pveMissionTerminalScanRadiusMeters = clampFloatRange(
+			missionHuntConfig.getFloatField("terminalScanRadiusMeters",
+				pveMissionTerminalScanRadiusMeters), 64.f, 2000.f);
+		pveMissionMaxSpawnPointTries = clampMinerInt(
+			missionHuntConfig.getIntField("maxSpawnPointTries"),
+			pveMissionMaxSpawnPointTries, 1, 256);
+		pveMissionMaxSimultaneousAdds = clampMinerInt(
+			missionHuntConfig.getIntField("maxSimultaneousAdds"),
+			pveMissionMaxSimultaneousAdds, 0, 64);
+		pveMissionAddsAbandonCycles = clampMinerInt(
+			missionHuntConfig.getIntField("addsAbandonCycles"),
+			pveMissionAddsAbandonCycles, 1, 100);
+		pveMissionTerminalDwellSeconds = clampMinerInt(
+			missionHuntConfig.getIntField("terminalDwellSeconds"),
+			pveMissionTerminalDwellSeconds, 1, 300);
+		pveMissionTerminalResolveWaitCycles = clampMinerInt(
+			missionHuntConfig.getIntField("terminalResolveWaitCycles"),
+			pveMissionTerminalResolveWaitCycles, 1, 1000);
+		pveMissionLairTimeoutSeconds = clampMinerInt(
+			missionHuntConfig.getIntField("lairTimeoutSeconds"),
+			pveMissionLairTimeoutSeconds, 60, 86400);
+		pveMissionMaxActiveLairs = clampMinerInt(
+			missionHuntConfig.getIntField("maxActiveLairs"),
+			pveMissionMaxActiveLairs, 0, 64);
+	}
+	missionHuntConfig.pop();
 	pveWorldPresenceEnabled = pveConfig.getBooleanField(
 		"enableWorldPresence", pveWorldPresenceEnabled);
 	pveMaxHunters = clampMinerInt(
@@ -6330,6 +6684,210 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	pveAnnounceSiteGapSeconds = clampMinerInt(
 		pveConfig.getIntField("announceSiteGapSeconds"),
 		pveAnnounceSiteGapSeconds, 30, 3600);
+
+	bool acquisitionLedgerEnabled;
+	bool acquisitionLedgerMinerCreatureExclusion;
+	Vector<String> acquisitionLedgerFamilies;
+	Vector<String> acquisitionLedgerCreatureClassMarkers;
+	VectorMap<String, uint64> acquisitionLedgerReserveTargets;
+	uint64 acquisitionLedgerReserveCap;
+	VectorMap<String, uint64> acquisitionLedgerCeilingUnits;
+	VectorMap<String, float> acquisitionLedgerCeilingFractions;
+	float acquisitionLedgerReservePressureFloor;
+	int acquisitionLedgerHuntTimeEstimateSeconds;
+	uint64 acquisitionLedgerBaselineRetryBackoffMs;
+	bool turfSplitGateWarning = false;
+	bool turfSplitEffective = false;
+
+	{
+		Locker pveLock(&pveMutex);
+		acquisitionLedgerEnabled = pveAcquisitionLedgerEnabled;
+		acquisitionLedgerMinerCreatureExclusion =
+			pveAcquisitionLedgerMinerCreatureExclusion;
+		acquisitionLedgerFamilies = pveAcquisitionLedgerCreatureFamilies;
+		acquisitionLedgerCreatureClassMarkers =
+			pveAcquisitionLedgerCreatureClassMarkers;
+		acquisitionLedgerReserveTargets =
+			pveAcquisitionLedgerFamilyReserveTargets;
+		acquisitionLedgerReserveCap = pveAcquisitionLedgerFamilyReserveCap;
+		acquisitionLedgerCeilingUnits =
+			pveAcquisitionLedgerFamilyAllocationCeilingUnits;
+		acquisitionLedgerCeilingFractions =
+			pveAcquisitionLedgerFamilyAllocationCeilingFractions;
+		acquisitionLedgerReservePressureFloor =
+			pveAcquisitionLedgerReservePressureFloor;
+		acquisitionLedgerHuntTimeEstimateSeconds =
+			pveAcquisitionLedgerHuntTimeEstimateSeconds;
+		acquisitionLedgerBaselineRetryBackoffMs =
+			pveAcquisitionLedgerBaselineRetryBackoffMs;
+	}
+
+	LuaObject acquisitionLedger = pveConfig.getObjectField(
+		"acquisitionLedger");
+	if (acquisitionLedger.isValidTable()) {
+		acquisitionLedgerEnabled = acquisitionLedger.getBooleanField(
+			"enabled", acquisitionLedgerEnabled);
+		acquisitionLedgerMinerCreatureExclusion =
+			acquisitionLedger.getBooleanField(
+				"minerCreatureResourceExclusion",
+				acquisitionLedgerMinerCreatureExclusion);
+
+		LuaObject configuredMarkers = acquisitionLedger.getObjectField(
+			"creatureResourceClassMarkers");
+		if (configuredMarkers.isValidTable()) {
+			acquisitionLedgerCreatureClassMarkers.removeAll();
+			for (int i = 1; i <= configuredMarkers.getTableSize(); ++i) {
+				String marker = configuredMarkers.getStringAt(i).toLowerCase().trim();
+				if (!marker.isEmpty() &&
+						!acquisitionLedgerCreatureClassMarkers.contains(marker))
+					acquisitionLedgerCreatureClassMarkers.add(marker);
+			}
+		}
+		configuredMarkers.pop();
+
+		LuaObject configuredFamilies = acquisitionLedger.getObjectField(
+			"creatureFamilies");
+		if (configuredFamilies.isValidTable()) {
+			acquisitionLedgerFamilies.removeAll();
+			for (int i = 1; i <= configuredFamilies.getTableSize(); ++i) {
+				String family = configuredFamilies.getStringAt(i).toLowerCase().trim();
+				if (!family.isEmpty() && !acquisitionLedgerFamilies.contains(family))
+					acquisitionLedgerFamilies.add(family);
+			}
+		}
+		configuredFamilies.pop();
+
+		LuaObject reserveTargets = acquisitionLedger.getObjectField(
+			"familyReserveTargets");
+		if (reserveTargets.isValidTable()) {
+			acquisitionLedgerReserveTargets.removeAll();
+			for (int i = 0; i < acquisitionLedgerFamilies.size(); ++i) {
+				String family = acquisitionLedgerFamilies.get(i);
+				int target = reserveTargets.getIntField(family);
+				if (target > 0)
+					acquisitionLedgerReserveTargets.put(
+						family, static_cast<uint64>(target));
+			}
+		}
+		reserveTargets.pop();
+
+		LuaObject ceilingUnits = acquisitionLedger.getObjectField(
+			"familyAllocationCeilingUnits");
+		if (ceilingUnits.isValidTable()) {
+			acquisitionLedgerCeilingUnits.removeAll();
+			for (int i = 0; i < acquisitionLedgerFamilies.size(); ++i) {
+				String family = acquisitionLedgerFamilies.get(i);
+				int ceiling = ceilingUnits.getIntField(family);
+				if (ceiling > 0)
+					acquisitionLedgerCeilingUnits.put(
+						family, static_cast<uint64>(ceiling));
+			}
+		}
+		ceilingUnits.pop();
+
+		LuaObject ceilingFractions = acquisitionLedger.getObjectField(
+			"familyAllocationCeilingFraction");
+		if (ceilingFractions.isValidTable()) {
+			acquisitionLedgerCeilingFractions.removeAll();
+			for (int i = 0; i < acquisitionLedgerFamilies.size(); ++i) {
+				String family = acquisitionLedgerFamilies.get(i);
+				float fraction = clampFloatRange(
+					ceilingFractions.getFloatField(family, 0.f), 0.f, 1.f);
+				if (fraction > 0.f)
+					acquisitionLedgerCeilingFractions.put(family, fraction);
+			}
+		}
+		ceilingFractions.pop();
+
+		acquisitionLedgerReserveCap = static_cast<uint64>(clampMinerInt(
+			acquisitionLedger.getIntField(
+				"familyReserveCap"),
+			static_cast<int>(acquisitionLedgerReserveCap), 0, 1000000000));
+		acquisitionLedgerReservePressureFloor = clampFloatRange(
+			acquisitionLedger.getFloatField(
+				"reservePressureFloor", acquisitionLedgerReservePressureFloor),
+			0.f, 1000000.f);
+		acquisitionLedgerHuntTimeEstimateSeconds = clampMinerInt(
+			acquisitionLedger.getIntField(
+				"huntTimeEstimateSeconds"),
+			acquisitionLedgerHuntTimeEstimateSeconds, 1, 86400);
+		acquisitionLedgerBaselineRetryBackoffMs = static_cast<uint64>(
+			clampMinerInt(
+				acquisitionLedger.getIntField(
+					"baselineRetryBackoffMs"),
+				static_cast<int>(acquisitionLedgerBaselineRetryBackoffMs),
+				100, 3600000));
+	}
+	acquisitionLedger.pop();
+
+	{
+		Locker pveLock(&pveMutex);
+		bool configuredTurfSplit = acquisitionLedgerEnabled &&
+			acquisitionLedgerMinerCreatureExclusion;
+		bool familyListChanged =
+			pveAcquisitionLedgerCreatureFamilies.size() !=
+				acquisitionLedgerFamilies.size();
+		if (!familyListChanged) {
+			for (int i = 0;
+					i < acquisitionLedgerFamilies.size(); ++i) {
+				if (pveAcquisitionLedgerCreatureFamilies.get(i) !=
+						acquisitionLedgerFamilies.get(i)) {
+					familyListChanged = true;
+					break;
+				}
+			}
+		}
+
+		pveAcquisitionLedgerEnabled = acquisitionLedgerEnabled;
+		pveAcquisitionLedgerMinerCreatureExclusion =
+			acquisitionLedgerMinerCreatureExclusion;
+		pveAcquisitionLedgerCreatureFamilies = acquisitionLedgerFamilies;
+		pveAcquisitionLedgerCreatureClassMarkers =
+			acquisitionLedgerCreatureClassMarkers;
+		pveAcquisitionLedgerFamilyReserveTargets =
+			acquisitionLedgerReserveTargets;
+		pveAcquisitionLedgerFamilyReserveCap = acquisitionLedgerReserveCap;
+		pveAcquisitionLedgerFamilyAllocationCeilingUnits =
+			acquisitionLedgerCeilingUnits;
+		pveAcquisitionLedgerFamilyAllocationCeilingFractions =
+			acquisitionLedgerCeilingFractions;
+		pveAcquisitionLedgerReservePressureFloor =
+			acquisitionLedgerReservePressureFloor;
+		pveAcquisitionLedgerHuntTimeEstimateSeconds =
+			acquisitionLedgerHuntTimeEstimateSeconds;
+		pveAcquisitionLedgerBaselineRetryBackoffMs =
+			acquisitionLedgerBaselineRetryBackoffMs;
+
+		if (!pveTurfSplitEffectiveLatched) {
+			pveTurfSplitEffective = configuredTurfSplit;
+			pveTurfSplitEffectiveLatched = true;
+			pveTurfSplitGateWarningIssued = false;
+		} else if (pveTurfSplitEffective != configuredTurfSplit) {
+			if (!pveTurfSplitGateWarningIssued) {
+				turfSplitGateWarning = true;
+				pveTurfSplitGateWarningIssued = true;
+			}
+		} else {
+			pveTurfSplitGateWarningIssued = false;
+		}
+		turfSplitEffective = pveTurfSplitEffective;
+
+		if (familyListChanged) {
+			pveCreatureSupplyBootBaseline.removeAll();
+			pveBaselineState = "pending";
+			pveBaselineLastError = "";
+			pveBaselineNextRetryMs = 0;
+		}
+	}
+
+	if (turfSplitGateWarning) {
+		warning(String("PveTurfSplitGateChangeRequiresRestart configured=") +
+			((acquisitionLedgerEnabled &&
+				acquisitionLedgerMinerCreatureExclusion) ?
+				String("true") : String("false")) +
+			" effective=" +
+			(turfSplitEffective ? String("true") : String("false")));
+	}
 
 	LuaObject rosterConfig = pveConfig.getObjectField("identityRoster");
 	if (rosterConfig.isValidTable()) {
@@ -6448,6 +7006,14 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 				row.planet = entry.getStringField("planet").trim();
 				row.huntGroundName = entry.getStringField(
 					"spawnArea").trim();
+				row.lairTemplate = entry.getStringField(
+					"lairTemplate").trim();
+				row.missionDifficulty = clampMinerInt(
+					entry.getIntField("missionDifficulty"), 1, 1, 10);
+				row.lairBuildingLevel = clampMinerInt(
+					entry.getIntField("lairBuildingLevel"), 1, 1, 5);
+				row.lairSize = clampFloatRange(
+					entry.getFloatField("lairSize", 20.f), 20.f, 128.f);
 				row.templateFilter = entry.getStringField(
 					"templateFilter").trim().toLowerCase();
 				row.requestedResourceType = entry.getStringField(
@@ -6489,6 +7055,7 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		Locker pveLock(&pveMutex);
 		pveHunterBuffs = rebuiltBuffs;
 		pveHuntSpecies = rebuiltSpecies;
+		configurePveMissionTerminalCitiesLocked(rebuiltSpecies);
 		pveHuntGroundsValidated = false;
 	}
 
@@ -7370,6 +7937,506 @@ void SimPlayerManager::governPvePopulation(uint64 nowMs) {
 	}
 }
 
+void SimPlayerManager::configurePveMissionTerminalCitiesLocked(
+		const Vector<PveHuntSpecies>& species) {
+	VectorMap<String, int> previousStates = missionTerminalCityState;
+	Vector<PveMissionTerminalLocation> previousTerminals =
+		allMissionTerminals;
+
+	missionTerminalCityState.removeAll();
+	allMissionTerminals.removeAll();
+
+	if (!pveMissionHuntEnabled)
+		return;
+
+	for (int i = 0; i < species.size(); ++i) {
+		const PveHuntSpecies& row = species.get(i);
+		for (int j = 0; j < row.eligibleHomeCities.size(); ++j) {
+			String city = row.eligibleHomeCities.get(j);
+			if (city.isEmpty())
+				continue;
+
+			String key = getPveMissionTerminalCityKey(row.planet, city);
+			if (missionTerminalCityState.contains(key))
+				continue;
+
+			int state = previousStates.contains(key) ? previousStates.get(key) :
+				PVE_MISSION_TERMINAL_PENDING;
+			missionTerminalCityState.put(key, state);
+		}
+	}
+
+	for (int i = 0; i < previousTerminals.size(); ++i) {
+		const PveMissionTerminalLocation& terminal = previousTerminals.get(i);
+		String key = getPveMissionTerminalCityKey(terminal.planet,
+			terminal.city);
+		if (missionTerminalCityState.contains(key) &&
+				missionTerminalCityState.get(key) == PVE_MISSION_TERMINAL_RESOLVED)
+			allMissionTerminals.add(terminal);
+	}
+}
+
+void SimPlayerManager::resolvePveMissionTerminals() {
+	if (!pveMissionHuntEnabled)
+		return;
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (zoneServer == nullptr || zoneServer->isServerLoading())
+		return;
+
+	Vector<String> cityKeys;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < missionTerminalCityState.size(); ++i)
+			cityKeys.add(missionTerminalCityState.elementAt(i).getKey());
+	}
+
+	for (int i = 0; i < cityKeys.size(); ++i) {
+		String key = cityKeys.get(i);
+		int state = PVE_MISSION_TERMINAL_PENDING;
+		{
+			Locker pveLock(&pveMutex);
+			if (!missionTerminalCityState.contains(key))
+				continue;
+			state = missionTerminalCityState.get(key);
+		}
+
+		if (state != PVE_MISSION_TERMINAL_PENDING)
+			continue;
+
+		int separator = key.indexOf(":");
+		if (separator <= 0 || separator >= key.length() - 1)
+			continue;
+
+		String planet = key.subString(0, separator);
+		String cityName = key.subString(separator + 1);
+		Zone* zone = zoneServer->getZone(planet);
+		if (zone == nullptr)
+			continue; // zone not up yet — stay pending
+
+		// Resolve the city centre from the proven shuttleport registry. If the
+		// city isn't resolvable yet, stay pending (do NOT mark absent).
+		Vector3 cantina, medCenter, cityHome;
+		if (!getPveHomeLocations(planet, cityName, cantina, medCenter, cityHome))
+			continue;
+
+		// NPC-city mission terminals are STATIC world tangibles, not the
+		// player-city installation registry. Scan world objects around the city
+		// centre for isMissionTerminal() (proven getInRangeObjects pattern).
+		SortedVector<TreeEntry*> cityObjects;
+		zone->getInRangeObjects(cityHome.getX(), 0, cityHome.getY(),
+			pveMissionTerminalScanRadiusMeters, &cityObjects, true, true);
+
+		// If the scan returns nothing at all, the city's static objects are not
+		// loaded yet — stay pending rather than falsely marking absent.
+		if (cityObjects.size() == 0)
+			continue;
+
+		Vector<PveMissionTerminalLocation> scanned;
+		for (int objIndex = 0; objIndex < cityObjects.size(); ++objIndex) {
+			SceneObject* terminal =
+				dynamic_cast<SceneObject*>(cityObjects.get(objIndex));
+			if (terminal == nullptr || !terminal->isMissionTerminal())
+				continue;
+
+			PveMissionTerminalLocation location;
+			location.planet = planet;
+			location.city = cityName;
+			location.terminal = terminal;
+			location.position = terminal->getWorldPosition();
+			scanned.add(location);
+		}
+
+		bool transitioned = false;
+		{
+			Locker pveLock(&pveMutex);
+			if (!missionTerminalCityState.contains(key) ||
+					missionTerminalCityState.get(key) !=
+					PVE_MISSION_TERMINAL_PENDING)
+				continue;
+
+			for (int terminalIndex = allMissionTerminals.size() - 1;
+					terminalIndex >= 0; --terminalIndex) {
+				const PveMissionTerminalLocation& existing =
+					allMissionTerminals.get(terminalIndex);
+				if (getPveMissionTerminalCityKey(existing.planet,
+						existing.city) == key)
+					allMissionTerminals.remove(terminalIndex);
+			}
+
+			for (int terminalIndex = 0; terminalIndex < scanned.size();
+					++terminalIndex)
+				allMissionTerminals.add(scanned.get(terminalIndex));
+
+			missionTerminalCityState.put(key, scanned.size() > 0 ?
+				PVE_MISSION_TERMINAL_RESOLVED : PVE_MISSION_TERMINAL_ABSENT);
+			transitioned = true;
+		}
+
+		if (transitioned) {
+			info("SimPveMissionTerminalScan city=" + key + " state=" +
+				(scanned.size() > 0 ? String("resolved terminals=") +
+					String::valueOf(scanned.size()) : String("absent")), true);
+		}
+	}
+}
+
+bool SimPlayerManager::getNearestMissionTerminal(const String& planet,
+		const String& city, const Vector3& fromPosition,
+		PveMissionTerminalLocation& result, int& cityState) {
+	result = PveMissionTerminalLocation();
+	cityState = PVE_MISSION_TERMINAL_PENDING;
+
+	if (!pveMissionHuntEnabled)
+		return false;
+
+	String key = getPveMissionTerminalCityKey(planet, city);
+	Locker pveLock(&pveMutex);
+	if (!missionTerminalCityState.contains(key))
+		return false;
+
+	cityState = missionTerminalCityState.get(key);
+	if (cityState != PVE_MISSION_TERMINAL_RESOLVED)
+		return false;
+
+	bool found = false;
+	float nearestDistance = 0.f;
+	for (int i = 0; i < allMissionTerminals.size(); ++i) {
+		const PveMissionTerminalLocation& candidate = allMissionTerminals.get(i);
+		if (getPveMissionTerminalCityKey(candidate.planet, candidate.city) !=
+				key || candidate.terminal == nullptr)
+			continue;
+
+		float distance = candidate.position.distanceTo2d(fromPosition);
+		if (!found || distance < nearestDistance) {
+			result = candidate;
+			nearestDistance = distance;
+			found = true;
+		}
+	}
+
+	return found;
+}
+
+bool SimPlayerManager::getPveHuntLair(uint64 bodyOid, PveHuntLair& result) {
+	result = PveHuntLair();
+	if (bodyOid == 0)
+		return false;
+
+	Locker pveLock(&pveMutex);
+	if (!pveHuntLairs.contains(bodyOid))
+		return false;
+
+	result = pveHuntLairs.get(bodyOid);
+	return true;
+}
+
+void SimPlayerManager::requestPveHuntLairCleanup(uint64 bodyOid,
+		const String& reason) {
+	if (bodyOid == 0)
+		return;
+
+	queuePveHuntLairCleanup(bodyOid, reason);
+}
+
+void SimPlayerManager::recordPveHunterMissionTerminal(uint64 identityId,
+		uint64 bodyOid, const String& planet, const String& city,
+		const Vector3& position) {
+	Locker pveLock(&pveMutex);
+	if (!pveHuntOrders.contains(identityId))
+		return;
+
+	PveHuntOrder order = pveHuntOrders.get(identityId);
+	if (bodyOid != 0 && order.bodyOid != bodyOid)
+		return;
+
+	order.missionTerminalPlanet = planet;
+	order.missionTerminalCity = city;
+	order.missionTerminalPosition = position;
+	pveHuntOrders.put(identityId, order);
+}
+
+void SimPlayerManager::recordPveHunterMissionAdds(uint64 identityId,
+		uint64 bodyOid, int adds) {
+	Locker pveLock(&pveMutex);
+	if (!pveHuntOrders.contains(identityId))
+		return;
+
+	PveHuntOrder order = pveHuntOrders.get(identityId);
+	if (bodyOid != 0 && order.bodyOid != bodyOid)
+		return;
+
+	order.missionAddsEngaged = Math::max(0, adds);
+	pveHuntOrders.put(identityId, order);
+}
+
+bool SimPlayerManager::choosePveHuntSpawnPoint(
+		const PveHuntSpecies& species, const Vector3& missionPos,
+		Vector3& spawnPos, Zone*& zoneOut) {
+	zoneOut = nullptr;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	Zone* zone = zoneServer == nullptr ? nullptr :
+		zoneServer->getZone(species.planet);
+	PlanetManager* planetManager = zone == nullptr ? nullptr :
+		zone->getPlanetManager();
+	if (zone == nullptr || planetManager == nullptr)
+		return false;
+
+	float clearance = Math::max(20.f, species.lairSize) + 25.f;
+	int maxTries = Math::max(1, pveMissionMaxSpawnPointTries);
+	for (int attempt = 0; attempt < maxTries; ++attempt) {
+		float angle = static_cast<float>(System::random(6283)) / 1000.f;
+		float distanceScale = 0.5f +
+			(static_cast<float>(System::random(1000)) / 1000.f);
+		// Expand the search radius with each attempt so a lair can always clear
+		// a large city-region exclusion (e.g. Bestine's ~336m) even when the
+		// hunt-ground anchor sits near the city centre — otherwise every
+		// candidate lands inside the city and is rejected (kreetle case).
+		float outwardGrowth = 1.f +
+			(static_cast<float>(attempt) / static_cast<float>(maxTries)) * 4.f;
+		float distance =
+			pveMissionSpawnDistanceMeters * distanceScale * outwardGrowth;
+		float x = missionPos.getX() + std::cos(angle) * distance;
+		float y = missionPos.getY() + std::sin(angle) * distance;
+
+		if (!zone->isWithinBoundaries(Vector3(x, y, 0.f)))
+			continue;
+		if (planetManager->getCityRegionAt(x, y) != nullptr)
+			continue;
+		if (!planetManager->isSpawningPermittedAt(x, y, clearance))
+			continue;
+		if (isOverlandPointInWater(zone, x, y, travelWaterMarginMeters))
+			continue;
+
+		float z = zone->getHeight(x, y);
+		// Vector3 is (x, y=north, z=height) in this engine; spawnLair later
+		// reads (getX(), getZ()=height, getY()=north).
+		Vector3 candidate(x, y, z);
+		if (CollisionManager::checkSphereCollision(candidate, clearance, zone))
+			continue;
+
+		spawnPos = candidate;
+		zoneOut = zone;
+		return true;
+	}
+
+	return false;
+}
+
+bool SimPlayerManager::spawnPveHuntLair(uint64 bodyOid,
+		const PveHuntSpecies& species, const Vector3& missionPos) {
+	if (!pveMissionHuntEnabled || bodyOid == 0 || species.planet.isEmpty() ||
+			species.lairTemplate.isEmpty() || pveMissionMaxActiveLairs <= 0)
+		return false;
+
+	PveHuntLair reservation;
+	reservation.bodyOid = bodyOid;
+	reservation.speciesKey = species.key;
+	reservation.planet = species.planet;
+	reservation.spawnedAtMs = System::getMiliTime();
+	reservation.spawnInProgress = true;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveHuntLairs.contains(bodyOid) ||
+				pveHuntLairs.size() >= pveMissionMaxActiveLairs)
+			return false;
+		if (pveBodyIdentityIds.contains(bodyOid))
+			reservation.identityId = pveBodyIdentityIds.get(bodyOid);
+		pveHuntLairs.put(bodyOid, reservation);
+	}
+
+	Vector3 spawnPos;
+	Zone* zone = nullptr;
+	if (!choosePveHuntSpawnPoint(species, missionPos, spawnPos, zone)) {
+		Locker pveLock(&pveMutex);
+		if (pveHuntLairs.contains(bodyOid) &&
+				pveHuntLairs.get(bodyOid).spawnInProgress)
+			pveHuntLairs.drop(bodyOid);
+		info("SimPveHuntLairSpawnSkipped body=" + String::valueOf(bodyOid) +
+			" species=" + species.key + " reason=no_spawnable_point", true);
+		return false;
+	}
+
+	CreatureManager* creatureManager = zone->getCreatureManager();
+	SceneObject* spawnedObject = creatureManager == nullptr ? nullptr :
+		creatureManager->spawnLair(species.lairTemplate.hashCode(),
+			clampMinerInt(species.missionDifficulty, 1, 1, 10),
+			clampMinerInt(species.lairBuildingLevel, 1, 1, 5),
+			spawnPos.getX(), spawnPos.getZ(), spawnPos.getY(),
+			clampFloatRange(species.lairSize, 20.f, 128.f));
+	LairObject* spawnedLair = spawnedObject == nullptr ? nullptr :
+		cast<LairObject*>(spawnedObject);
+
+	if (spawnedLair == nullptr) {
+		if (spawnedObject != nullptr) {
+			Locker objectLock(spawnedObject);
+			if (spawnedObject->getZone() != nullptr)
+				spawnedObject->destroyObjectFromWorld(true);
+		}
+		Locker pveLock(&pveMutex);
+		if (pveHuntLairs.contains(bodyOid) &&
+				pveHuntLairs.get(bodyOid).spawnInProgress)
+			pveHuntLairs.drop(bodyOid);
+		info("SimPveHuntLairSpawnFailed body=" + String::valueOf(bodyOid) +
+			" species=" + species.key + " reason=spawnLair", true);
+		return false;
+	}
+
+	uint64 lairOid = spawnedLair->getObjectID();
+	{
+		Locker lairLock(spawnedLair);
+		spawnedLair->setDespawnOnNoPlayersInRange(false);
+	}
+
+	bool registered = false;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveHuntLairs.contains(bodyOid) &&
+				pveHuntLairs.get(bodyOid).spawnInProgress) {
+			PveHuntLair& record = pveHuntLairs.get(bodyOid);
+			record.lairOid = lairOid;
+			record.x = spawnPos.getX();
+			record.y = spawnPos.getY();
+			record.z = spawnPos.getZ();
+			record.spawnedAtMs = System::getMiliTime();
+			record.alive = true;
+			record.spawnInProgress = false;
+			pveMissionLairsSpawned++;
+			registered = true;
+		}
+	}
+
+	if (!registered) {
+		Reference<LairObject*> lairReference = spawnedLair;
+		Core::getTaskManager()->executeTask([lairReference, lairOid]() {
+			Locker lairLock(lairReference);
+			if (lairReference->getZone() != nullptr)
+				lairReference->destroyObjectFromWorld(true);
+			(void)lairOid;
+		}, "SimPveHuntLairUnregisteredDespawn");
+		return false;
+	}
+
+	info("SimPveHuntLairSpawned body=" + String::valueOf(bodyOid) +
+		" identity=" + String::valueOf(reservation.identityId) +
+		" species=" + species.key + " lair=" + String::valueOf(lairOid) +
+		" position=" + spawnPos.toString(), true);
+	return true;
+}
+
+void SimPlayerManager::queuePveHuntLairCleanup(uint64 bodyOid,
+		const String& reason) {
+	uint64 lairOid = 0;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveHuntLairs.contains(bodyOid))
+			return;
+		PveHuntLair& record = pveHuntLairs.get(bodyOid);
+		if (record.cleanupQueued || record.lairOid == 0)
+			return;
+		record.cleanupQueued = true;
+		record.alive = false;
+		lairOid = record.lairOid;
+	}
+
+	Core::getTaskManager()->executeTask([bodyOid, lairOid, reason]() {
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> object = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(lairOid);
+		LairObject* lair = object == nullptr ? nullptr :
+			cast<LairObject*>(object.get());
+		if (lair != nullptr) {
+			Locker lairLock(lair);
+			if (lair->getZone() != nullptr)
+				lair->destroyObjectFromWorld(true);
+		}
+		SimPlayerManager::instance()->finishPveHuntLairCleanup(
+			bodyOid, lairOid, reason);
+	}, "SimPveHuntLairDespawn");
+}
+
+void SimPlayerManager::finishPveHuntLairCleanup(uint64 bodyOid,
+		uint64 lairOid, const String& reason) {
+	bool removed = false;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveHuntLairs.contains(bodyOid) &&
+				pveHuntLairs.get(bodyOid).lairOid == lairOid) {
+			pveHuntLairs.drop(bodyOid);
+			pveMissionLairsCleaned++;
+			removed = true;
+		}
+	}
+
+	if (removed)
+		info("SimPveHuntLairCleaned body=" + String::valueOf(bodyOid) +
+			" lair=" + String::valueOf(lairOid) + " reason=" + reason, true);
+}
+
+void SimPlayerManager::runPveHuntLairJanitor(uint64 nowMs) {
+	Vector<PveHuntLair> records;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < pveHuntLairs.size(); ++i)
+			records.add(pveHuntLairs.elementAt(i).getValue());
+	}
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	for (int i = 0; i < records.size(); ++i) {
+		const PveHuntLair& record = records.get(i);
+		if (record.spawnInProgress || record.cleanupQueued)
+			continue;
+
+		bool live = false;
+		if (zoneServer != nullptr) {
+			ManagedReference<SceneObject*> object = zoneServer->getObject(
+				record.lairOid);
+			LairObject* lair = object == nullptr ? nullptr :
+				cast<LairObject*>(object.get());
+			if (lair != nullptr) {
+				Locker lairLock(lair);
+				live = lair->getZone() != nullptr;
+			}
+		}
+
+		if (!live) {
+			bool removed = false;
+			{
+				Locker pveLock(&pveMutex);
+				if (pveHuntLairs.contains(record.bodyOid) &&
+						pveHuntLairs.get(record.bodyOid).lairOid ==
+						record.lairOid) {
+					pveHuntLairs.drop(record.bodyOid);
+					pveMissionLairsCleaned++;
+					removed = true;
+				}
+			}
+			if (removed)
+				info("SimPveHuntLairJanitorDropped body=" +
+					String::valueOf(record.bodyOid) + " lair=" +
+					String::valueOf(record.lairOid) +
+					" reason=missing_live_lair", true);
+			continue;
+		}
+
+		bool timedOut = pveMissionLairTimeoutSeconds > 0 &&
+			nowMs >= record.spawnedAtMs &&
+			nowMs - record.spawnedAtMs >=
+				static_cast<uint64>(pveMissionLairTimeoutSeconds) * 1000;
+		bool featureDisabled = !pveMissionHuntEnabled;
+		if (timedOut || featureDisabled) {
+			queuePveHuntLairCleanup(record.bodyOid,
+				featureDisabled ? String("feature_disabled") :
+				String("timeout"));
+		} else {
+			Locker pveLock(&pveMutex);
+			if (pveHuntLairs.contains(record.bodyOid) &&
+					pveHuntLairs.get(record.bodyOid).lairOid == record.lairOid)
+				pveHuntLairs.get(record.bodyOid).alive = true;
+		}
+	}
+}
+
 void SimPlayerManager::validatePveHuntGrounds() {
 	Vector<PveHuntSpecies> speciesSnapshot;
 	{
@@ -7533,11 +8600,13 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 
 	Vector<PveHuntSpecies> speciesSnapshot;
 	Vector<SimBotIdentity> identities;
+	int huntQuotaSnapshot = 1;
 	{
 		Locker pveLock(&pveMutex);
 		if (pveHuntSpecies.size() == 0)
 			return;
 		speciesSnapshot = pveHuntSpecies;
+		huntQuotaSnapshot = pveHuntQuota;
 		for (int i = 0; i < pveIdentities.size() &&
 				identities.size() < pveMaxHunters; ++i) {
 			uint64 identityId = pveIdentities.elementAt(i).getKey();
@@ -7554,6 +8623,193 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 		snapshotError);
 	(void)activeSnapshotAvailable;
 	(void)snapshotError;
+
+	bool acquisitionLedgerEnabled = false;
+	int acquisitionLedgerHuntTimeEstimateSeconds = 1;
+	{
+		Locker pveLock(&pveMutex);
+		acquisitionLedgerEnabled = pveAcquisitionLedgerEnabled;
+		acquisitionLedgerHuntTimeEstimateSeconds =
+			pveAcquisitionLedgerHuntTimeEstimateSeconds;
+	}
+
+	if (acquisitionLedgerEnabled) {
+		Vector<uint64> assignedIdentityIds;
+		uint64 huntTimeEstimate = acquisitionLedgerHuntTimeEstimateSeconds > 0 ?
+			static_cast<uint64>(acquisitionLedgerHuntTimeEstimateSeconds) : 1;
+
+		while (assignedIdentityIds.size() < identities.size()) {
+			PveHunterFamilyCandidate bestCandidate;
+
+			for (int identityIndex = 0;
+					identityIndex < identities.size(); ++identityIndex) {
+				const SimBotIdentity& identity = identities.get(identityIndex);
+				if (assignedIdentityIds.contains(identity.id) ||
+						identity.skillTier < 1)
+					continue;
+
+				for (int speciesIndex = 0;
+						speciesIndex < speciesSnapshot.size(); ++speciesIndex) {
+					const PveHuntSpecies& species =
+						speciesSnapshot.get(speciesIndex);
+					if (!species.usable || !species.soloable ||
+							identity.skillTier < species.minSkillTier ||
+							species.planet != identity.homePlanet)
+						continue;
+
+					bool cityEligible = false;
+					for (int cityIndex = 0;
+							cityIndex < species.eligibleHomeCities.size();
+							++cityIndex) {
+						if (species.eligibleHomeCities.get(cityIndex) ==
+								identity.homeCity.toLowerCase()) {
+							cityEligible = true;
+							break;
+						}
+					}
+					if (!cityEligible)
+						continue;
+
+					Vector3 home;
+					bool homeFound = false;
+					for (int shuttleportIndex = 0;
+							shuttleportIndex < allShuttleports.size();
+							++shuttleportIndex) {
+						if (allShuttleports.get(shuttleportIndex).planet ==
+								identity.homePlanet &&
+							allShuttleports.get(shuttleportIndex).name ==
+								identity.homeCity) {
+							home = allShuttleports.get(shuttleportIndex).spawn;
+							homeFound = true;
+							break;
+						}
+					}
+					if (!homeFound || home.distanceTo2d(species.huntGround) >
+							(float)pveMaxHuntDistanceMeters)
+						continue;
+
+					uint64 estimatedYieldUnits =
+						getPveHunterSpeciesEstimatedYieldUnits(species);
+					if (estimatedYieldUnits == 0)
+						continue;
+
+					String speciesFamily = species.harvestKind.
+						toLowerCase().trim();
+					for (int demandResultIndex = 0;
+							demandResultIndex < demandResults.size();
+							++demandResultIndex) {
+						const DemandStateSimulationResult& demand =
+							demandResults.get(demandResultIndex);
+						if (!demand.activeProfileAvailableForPhase)
+							continue;
+
+						for (int signalIndex = 0;
+								signalIndex < demand.familySignals.size();
+								++signalIndex) {
+							const DemandFamilySignal& signal =
+								demand.familySignals.get(signalIndex);
+							if (signal.signalUnits == 0 ||
+									signal.family != speciesFamily)
+								continue;
+
+							float score = signal.pressure *
+								static_cast<float>(estimatedYieldUnits) /
+								static_cast<float>(huntTimeEstimate);
+							if (score <= bestCandidate.score)
+								continue;
+
+							bestCandidate.identityIndex = identityIndex;
+							bestCandidate.speciesIndex = speciesIndex;
+							bestCandidate.demandResultIndex =
+								demandResultIndex;
+							bestCandidate.signalIndex = signalIndex;
+							bestCandidate.estimatedYieldUnits =
+								estimatedYieldUnits;
+							bestCandidate.expectedYieldUnits =
+								multiplyDemandFamilyUnits(
+									estimatedYieldUnits, huntQuotaSnapshot);
+							bestCandidate.score = score;
+						}
+					}
+				}
+			}
+
+			if (bestCandidate.identityIndex < 0)
+				return;
+
+			const SimBotIdentity& identity =
+				identities.get(bestCandidate.identityIndex);
+			const PveHuntSpecies& species =
+				speciesSnapshot.get(bestCandidate.speciesIndex);
+			uint64 bodyOid = 0;
+			bool assigned = false;
+			{
+				Locker pveLock(&pveMutex);
+				if (!pveHuntOrders.contains(identity.id) &&
+						pveIdentityBodyOids.contains(identity.id)) {
+					bodyOid = pveIdentityBodyOids.get(identity.id);
+					PveHuntOrder order;
+					order.identityId = identity.id;
+					order.bodyOid = bodyOid;
+					order.issuedAtMs = nowMs;
+					order.homePlanet = identity.homePlanet;
+					order.homeCity = identity.homeCity;
+					order.speciesKey = species.key;
+					order.requestedResourceType = species.requestedResourceType;
+					order.harvestKind = species.harvestKind;
+					order.demandProfileKey =
+						demandResults.get(bestCandidate.demandResultIndex).
+						profileKey;
+					order.quota = huntQuotaSnapshot;
+					order.expectedYieldUnits =
+						bestCandidate.expectedYieldUnits;
+					order.harvestedUnits = 0;
+					order.phase = "ANNOUNCE_JOB";
+					order.status = "ASSIGNED";
+					pveHuntOrders.put(identity.id, order);
+					SimBotIdentity& mutableIdentity = pveIdentities.get(identity.id);
+					mutableIdentity.assignmentSpecies = species.key;
+					mutableIdentity.assignmentResource =
+						species.requestedResourceType;
+					mutableIdentity.assignmentStamp = nowMs;
+					pveDirtyIdentityIds.put(identity.id, true);
+					assigned = true;
+				}
+			}
+
+			if (!assigned) {
+				assignedIdentityIds.add(identity.id);
+				continue;
+			}
+
+			DemandFamilySignal& selectedSignal =
+				demandResults.get(bestCandidate.demandResultIndex).
+				familySignals.get(bestCandidate.signalIndex);
+			selectedSignal.signalUnits = selectedSignal.signalUnits <=
+				bestCandidate.expectedYieldUnits ? 0 :
+				selectedSignal.signalUnits - bestCandidate.expectedYieldUnits;
+			assignedIdentityIds.add(identity.id);
+
+			Reference<SimPlayerController*> ctrl = controllers.contains(bodyOid) ?
+				controllers.get(bodyOid) : nullptr;
+			SimHunterController* hunter = ctrl == nullptr ? nullptr :
+				dynamic_cast<SimHunterController*>(ctrl.get());
+			if (hunter != nullptr) {
+				PveHuntOrder assignedOrder;
+				getPveHunterOrder(identity.id, assignedOrder);
+				hunter->startOrder(assignedOrder, species);
+			}
+			info("SimPveHuntAssigned identity=" +
+				String::valueOf(identity.id) + " body=" +
+				String::valueOf(bodyOid) + " species=" + species.key +
+				" resource=" + species.requestedResourceType +
+				" demandProfile=" +
+				demandResults.get(bestCandidate.demandResultIndex).profileKey +
+				" family=" + species.harvestKind, true);
+		}
+
+		return;
+	}
 
 	// Pick the highest-pressure demand THAT A USABLE SOLOABLE SPECIES CAN
 	// SATISFY. Ranking across all demands first would let an ore/steel demand
@@ -7702,6 +8958,155 @@ void SimPlayerManager::recordPveHunterPhase(uint64 identityId,
 	pveHuntOrders.put(identityId, order);
 }
 
+void SimPlayerManager::computeReservedInboundByProfileFamily(
+		VectorMap<String, uint64>& reservedInboundByProfileFamily,
+		VectorMap<String, uint64>& sessionHarvestByFamily) {
+	reservedInboundByProfileFamily.removeAll();
+	sessionHarvestByFamily.removeAll();
+
+	Locker pveLock(&pveMutex);
+
+	for (int i = 0; i < pveHuntOrders.size(); ++i) {
+		const PveHuntOrder& order = pveHuntOrders.elementAt(i).getValue();
+		String family = order.harvestKind.toLowerCase().trim();
+
+		if (order.demandProfileKey.isEmpty() || family.isEmpty() ||
+				order.expectedYieldUnits <= order.harvestedUnits)
+			continue;
+
+		uint64 remaining = order.expectedYieldUnits - order.harvestedUnits;
+		String key = order.demandProfileKey + "|" + family;
+		uint64 existing = reservedInboundByProfileFamily.contains(key) ?
+			reservedInboundByProfileFamily.get(key) : 0;
+		reservedInboundByProfileFamily.put(
+			key, addDemandFamilyUnits(existing, remaining));
+	}
+
+	for (int i = 0; i < pveSessionHarvestByFamily.size(); ++i)
+		sessionHarvestByFamily.put(
+			pveSessionHarvestByFamily.elementAt(i).getKey(),
+			pveSessionHarvestByFamily.get(i));
+}
+
+bool SimPlayerManager::preparePveCreatureFamilySupply(
+		const Vector<String>& creatureFamilies,
+		const VectorMap<String, uint64>& sessionHarvestByFamily,
+		VectorMap<String, uint64>& familySupplyByFamily) {
+	familySupplyByFamily.removeAll();
+
+	if (creatureFamilies.size() == 0)
+		return false;
+
+	uint64 nowMs = System::getMiliTime();
+	Vector<String> captureFamilies;
+	String captureRequiredAcquisitionSource;
+	bool captureWinner = false;
+
+	{
+		Locker pveLock(&pveMutex);
+
+		if (!pveAcquisitionLedgerEnabled)
+			return false;
+
+		if (pveBaselineState == "ready") {
+			for (int i = 0; i < creatureFamilies.size(); ++i) {
+				String family = creatureFamilies.get(i).toLowerCase().trim();
+				if (family.isEmpty() || familySupplyByFamily.contains(family))
+					continue;
+
+				uint64 baseline = pveCreatureSupplyBootBaseline.contains(family) ?
+					pveCreatureSupplyBootBaseline.get(family) : 0;
+				uint64 session = sessionHarvestByFamily.contains(family) ?
+					sessionHarvestByFamily.get(family) : 0;
+				familySupplyByFamily.put(
+					family, addDemandFamilyUnits(baseline, session));
+			}
+
+			return true;
+		}
+
+		if (pveBaselineState != "pending" ||
+				pveBaselineNextRetryMs > nowMs ||
+				AiEconomyManager::instance() == nullptr ||
+				!AiEconomyManager::instance()->isPersistenceReady())
+			return false;
+
+		// Compare-and-set under pveMutex. The slow durable scan is deliberately
+		// performed after releasing this lock so harvest/order readers remain
+		// independent of persistence latency.
+		pveBaselineState = "capturing";
+		captureFamilies = creatureFamilies;
+		captureRequiredAcquisitionSource = pveTurfSplitEffective ?
+			String("pve_hunter") : String("");
+		captureWinner = true;
+	}
+
+	if (!captureWinner)
+		return false;
+
+	VectorMap<String, uint64> capturedBaseline;
+	String captureStatus;
+	bool captureSucceeded = false;
+	try {
+		captureSucceeded = AiEconomyManager::instance()->
+			 snapshotStockpileTotalsByFamily(
+				captureFamilies, capturedBaseline, captureStatus,
+				captureRequiredAcquisitionSource);
+	} catch (Exception& e) {
+		captureStatus = String("exception=") + e.getMessage();
+		captureSucceeded = false;
+	}
+
+	String captureFailure;
+	int captureRetryCount = 0;
+	{
+		Locker pveLock(&pveMutex);
+
+		if (captureSucceeded) {
+			pveCreatureSupplyBootBaseline = capturedBaseline;
+			pveBaselineState = "ready";
+			pveBaselineLastError = "";
+			pveBaselineNextRetryMs = 0;
+		} else {
+			pveCreatureSupplyBootBaseline.removeAll();
+			pveBaselineState = "pending";
+			pveBaselineLastError = captureStatus.isEmpty() ?
+				String("snapshotFailed") : captureStatus;
+			if (pveBaselineRetryCount < 2147483647)
+				pveBaselineRetryCount++;
+			uint64 backoff = pveAcquisitionLedgerBaselineRetryBackoffMs;
+			pveBaselineNextRetryMs = backoff >
+				static_cast<uint64>(-1) - nowMs ?
+				static_cast<uint64>(-1) : nowMs + backoff;
+			captureFailure = pveBaselineLastError;
+			captureRetryCount = pveBaselineRetryCount;
+		}
+
+		if (captureSucceeded) {
+			for (int i = 0; i < creatureFamilies.size(); ++i) {
+				String family = creatureFamilies.get(i).toLowerCase().trim();
+				if (family.isEmpty() || familySupplyByFamily.contains(family))
+					continue;
+
+				uint64 baseline = pveCreatureSupplyBootBaseline.contains(family) ?
+					pveCreatureSupplyBootBaseline.get(family) : 0;
+				uint64 session = sessionHarvestByFamily.contains(family) ?
+					sessionHarvestByFamily.get(family) : 0;
+				familySupplyByFamily.put(
+					family, addDemandFamilyUnits(baseline, session));
+			}
+		}
+	}
+
+	if (!captureFailure.isEmpty()) {
+		error(String("PveAcquisitionLedger baselineCaptureFailed=true reason=\"") +
+			captureFailure + "\" retryCount=" +
+			String::valueOf(captureRetryCount));
+	}
+
+	return captureSucceeded;
+}
+
 void SimPlayerManager::recordPveHunterHarvest(uint64 identityId,
 		uint64 targetOid, const String& harvestKind,
 		const String& requestedResourceType) {
@@ -7764,21 +9169,25 @@ void SimPlayerManager::recordPveHunterHarvest(uint64 identityId,
 	}
 
 	uint64 spawnObjectId = resourceSpawn->getObjectID();
+	const String acquisitionOrigin = "pve_hunter";
+	String accumulatorKey = getSpawnYieldAccumulatorKey(
+		spawnObjectId, acquisitionOrigin);
 	{
 		Locker spawnLock(&spawnYieldAccumulatorMutex);
-		// Preserve an existing (possibly miner-owned) accumulator: add the
-		// hunter's quantity to it and keep ITS resource stats + demand
-		// provenance. Only a fresh accumulator is populated from the spawn -
+		// Keep hunter and miner provenance in separate accumulators, even when
+		// both origins use the same active resource spawn. Only a fresh
+		// accumulator is populated from the spawn -
 		// with EVERY stat, not zeros (a lot with -1 stats corrupts the hive).
-		if (spawnYieldAccumulators.contains(spawnObjectId)) {
+		if (spawnYieldAccumulators.contains(accumulatorKey)) {
 			MinerSpawnYieldAccumulator existing =
-				spawnYieldAccumulators.get(spawnObjectId);
+				spawnYieldAccumulators.get(accumulatorKey);
 			existing.sessionQuantity += harvestAmount;
 			existing.active = true;
-			spawnYieldAccumulators.put(spawnObjectId, existing);
+			spawnYieldAccumulators.put(accumulatorKey, existing);
 		} else {
 			MinerSpawnYieldAccumulator accumulator;
 			accumulator.resourceSpawnObjectId = spawnObjectId;
+			accumulator.acquisitionOrigin = acquisitionOrigin;
 			accumulator.resourceSpawnName = resourceSpawn->getName();
 			accumulator.resourceType = resourceSpawn->getType();
 			accumulator.resourceClassChain = resourceSpawn->getFinalClass();
@@ -7797,12 +9206,28 @@ void SimPlayerManager::recordPveHunterHarvest(uint64 identityId,
 			accumulator.sr = getResourceAttribute(resourceSpawn, "res_shock_resistance");
 			accumulator.ut = getResourceAttribute(resourceSpawn, "res_toughness");
 			accumulator.cr = getResourceAttribute(resourceSpawn, "res_cold_resist");
-			spawnYieldAccumulators.put(spawnObjectId, accumulator);
+			spawnYieldAccumulators.put(accumulatorKey, accumulator);
 		}
 	}
 
 	Locker pveLock(&pveMutex);
 	pveHunterHarvestUnitsTotal += harvestAmount;
+	String harvestedFamily = harvestKind.toLowerCase().trim();
+	if (!harvestedFamily.isEmpty()) {
+		uint64 existingFamilyHarvest =
+			pveSessionHarvestByFamily.contains(harvestedFamily) ?
+			pveSessionHarvestByFamily.get(harvestedFamily) : 0;
+		pveSessionHarvestByFamily.put(
+			harvestedFamily,
+			addDemandFamilyUnits(
+				existingFamilyHarvest, static_cast<uint64>(harvestAmount)));
+	}
+	if (pveHuntOrders.contains(identityId)) {
+		PveHuntOrder order = pveHuntOrders.get(identityId);
+		order.harvestedUnits = addDemandFamilyUnits(
+			order.harvestedUnits, static_cast<uint64>(harvestAmount));
+		pveHuntOrders.put(identityId, order);
+	}
 	if (pveIdentities.contains(identityId)) {
 		SimBotIdentity& identity = pveIdentities.get(identityId);
 		identity.harvestUnits += harvestAmount;
@@ -7849,32 +9274,42 @@ void SimPlayerManager::recordPveHunterKill(uint64 identityId,
 
 void SimPlayerManager::recordPveHunterAbandoned(uint64 identityId,
 		uint64 bodyOid, const String& reason) {
-	Locker pveLock(&pveMutex);
-	if (!pveHuntOrders.contains(identityId))
-		return;
-	PveHuntOrder order = pveHuntOrders.get(identityId);
-	if (bodyOid != 0 && order.bodyOid != bodyOid)
-		return;
-	pveHunterAbandonsTotal++;
-	clearPveHunterOrderLocked(identityId, "ABANDONED_" + reason);
+	uint64 cleanupBodyOid = bodyOid;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveHuntOrders.contains(identityId))
+			return;
+		PveHuntOrder order = pveHuntOrders.get(identityId);
+		if (bodyOid != 0 && order.bodyOid != bodyOid)
+			return;
+		cleanupBodyOid = order.bodyOid;
+		pveHunterAbandonsTotal++;
+		clearPveHunterOrderLocked(identityId, "ABANDONED_" + reason);
+	}
+	queuePveHuntLairCleanup(cleanupBodyOid, "abandoned_" + reason);
 	info("SimPveHuntAbandoned identity=" + String::valueOf(identityId) +
 		" body=" + String::valueOf(bodyOid) + " reason=" + reason, true);
 }
 
 void SimPlayerManager::recordPveHunterCompleted(uint64 identityId,
 		uint64 bodyOid) {
-	Locker pveLock(&pveMutex);
-	if (!pveHuntOrders.contains(identityId))
-		return;
-	PveHuntOrder order = pveHuntOrders.get(identityId);
-	if (bodyOid != 0 && order.bodyOid != bodyOid)
-		return;
-	if (pveIdentities.contains(identityId)) {
-		SimBotIdentity& identity = pveIdentities.get(identityId);
-		identity.hunts++;
-		pveDirtyIdentityIds.put(identityId, true);
+	uint64 cleanupBodyOid = bodyOid;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveHuntOrders.contains(identityId))
+			return;
+		PveHuntOrder order = pveHuntOrders.get(identityId);
+		if (bodyOid != 0 && order.bodyOid != bodyOid)
+			return;
+		cleanupBodyOid = order.bodyOid;
+		if (pveIdentities.contains(identityId)) {
+			SimBotIdentity& identity = pveIdentities.get(identityId);
+			identity.hunts++;
+			pveDirtyIdentityIds.put(identityId, true);
+		}
+		clearPveHunterOrderLocked(identityId, "DELIVERED");
 	}
-	clearPveHunterOrderLocked(identityId, "DELIVERED");
+	queuePveHuntLairCleanup(cleanupBodyOid, "completed");
 	info("SimPveHuntDelivered identity=" + String::valueOf(identityId) +
 		" body=" + String::valueOf(bodyOid), true);
 }
@@ -7890,17 +9325,20 @@ void SimPlayerManager::handlePveHunterDestructionHandoff(uint64 hunterOid,
 }
 
 void SimPlayerManager::onPveHunterDied(uint64 identityId, uint64 bodyOid) {
-	Locker pveLock(&pveMutex);
-	if (pveDeathsReportedBodyOids.contains(bodyOid))
-		return;
-	pveDeathsReportedBodyOids.put(bodyOid, true);
-	pveHunterDeathsTotal++;
-	if (pveIdentities.contains(identityId)) {
-		SimBotIdentity& identity = pveIdentities.get(identityId);
-		identity.deaths++;
-		pveDirtyIdentityIds.put(identityId, true);
+	{
+		Locker pveLock(&pveMutex);
+		if (pveDeathsReportedBodyOids.contains(bodyOid))
+			return;
+		pveDeathsReportedBodyOids.put(bodyOid, true);
+		pveHunterDeathsTotal++;
+		if (pveIdentities.contains(identityId)) {
+			SimBotIdentity& identity = pveIdentities.get(identityId);
+			identity.deaths++;
+			pveDirtyIdentityIds.put(identityId, true);
+		}
+		clearPveHunterOrderLocked(identityId, "DEATH_REQUEUED");
 	}
-	clearPveHunterOrderLocked(identityId, "DEATH_REQUEUED");
+	queuePveHuntLairCleanup(bodyOid, "hunter_died");
 	info("SimPveHunterDied identity=" + String::valueOf(identityId) +
 		" body=" + String::valueOf(bodyOid), true);
 }
@@ -8012,6 +9450,13 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
 	if (zoneServer == nullptr || zoneServer->isServerLoading())
 		return;
+
+	// Mission terminals are a post-load world scan. Each configured city is
+	// retried independently so one ready city cannot stop discovery for a
+	// slower city. This runs before roster readiness because terminal
+	// discovery is world-state plumbing, not a boot one-shot.
+	resolvePveMissionTerminals();
+	runPveHuntLairJanitor(System::getMiliTime());
 
 	if (!pveBootReady) {
 		String readinessPlanet = pveSpikePlanet;
@@ -8775,6 +10220,7 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	VectorMap<uint64, uint64> presenceOids;
 	VectorMap<uint64, uint64> presenceSpawnCounts;
 	Vector<PveHuntSpecies> huntSpecies;
+	VectorMap<uint64, PveHuntLair> huntLairs;
 	Vector<PveBuffSpec> hunterBuffs;
 	Vector<PveHuntOrder> huntOrders;
 	uint64 presenceSpawnTotal = 0;
@@ -8784,6 +10230,18 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	uint64 hunterHarvestUnitsTotal = 0;
 	uint64 hunterHarvestMisses = 0;
 	uint64 hunterAnnouncementsTotal = 0;
+	uint64 missionLairsSpawned = 0;
+	uint64 missionLairsCleaned = 0;
+	bool missionHuntEnabled = false;
+	bool acquisitionLedgerEnabled = false;
+	bool turfSplitEffective = false;
+	bool turfSplitPendingRestart = false;
+	bool minerCreatureExclusionActive = false;
+	String familySupplyOrigin;
+	uint64 bootBaselineHunterMeat = 0;
+	String baselineState = "pending";
+	String baselineLastError;
+	int baselineRetryCount = 0;
 	{
 		Locker pveLock(&pveMutex);
 		for (int i = 0; i < pveIdentities.size(); ++i)
@@ -8793,6 +10251,7 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		presenceSpawnCounts = pvePresenceSpawnCounts;
 		presenceSpawnTotal = pvePresenceSpawnTotal;
 		huntSpecies = pveHuntSpecies;
+		huntLairs = pveHuntLairs;
 		hunterBuffs = pveHunterBuffs;
 		for (int i = 0; i < pveHuntOrders.size(); ++i)
 			huntOrders.add(pveHuntOrders.elementAt(i).getValue());
@@ -8802,7 +10261,58 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		hunterHarvestUnitsTotal = pveHunterHarvestUnitsTotal;
 		hunterHarvestMisses = pveHunterHarvestMisses;
 		hunterAnnouncementsTotal = pveHunterAnnouncementsTotal;
+		missionLairsSpawned = pveMissionLairsSpawned;
+		missionLairsCleaned = pveMissionLairsCleaned;
+		missionHuntEnabled = pveMissionHuntEnabled;
+		acquisitionLedgerEnabled = pveAcquisitionLedgerEnabled;
+		turfSplitEffective = pveTurfSplitEffective;
+		turfSplitPendingRestart =
+			(pveAcquisitionLedgerEnabled &&
+				pveAcquisitionLedgerMinerCreatureExclusion) !=
+			pveTurfSplitEffective;
+		minerCreatureExclusionActive = pveTurfSplitEffective;
+		familySupplyOrigin = pveTurfSplitEffective ?
+			String("pve_hunter") : String("");
+		bootBaselineHunterMeat =
+			pveCreatureSupplyBootBaseline.contains("meat") ?
+			pveCreatureSupplyBootBaseline.get("meat") : 0;
+		baselineState = pveBaselineState;
+		baselineLastError = pveBaselineLastError;
+		baselineRetryCount = pveBaselineRetryCount;
 	}
+
+	Vector<DemandStateSimulationResult> demandResults;
+	if (acquisitionLedgerEnabled) {
+		bool activeSnapshotAvailable = false;
+		String snapshotError;
+		// Dashboard reads poll every ~5s; suppress the persistent-stockpile
+		// summary log here so the read does not spam ~17k log lines/day.
+		computeDemandStateResults(
+			demandResults, activeSnapshotAvailable, snapshotError, false);
+	}
+
+	// Refresh the state after the demand snapshot: the first dashboard read can
+	// be the caller that completes the one-time durable baseline capture.
+	{
+		Locker pveLock(&pveMutex);
+		acquisitionLedgerEnabled = pveAcquisitionLedgerEnabled;
+		turfSplitEffective = pveTurfSplitEffective;
+		turfSplitPendingRestart =
+			(pveAcquisitionLedgerEnabled &&
+				pveAcquisitionLedgerMinerCreatureExclusion) !=
+			pveTurfSplitEffective;
+		minerCreatureExclusionActive = pveTurfSplitEffective;
+		familySupplyOrigin = pveTurfSplitEffective ?
+			String("pve_hunter") : String("");
+		bootBaselineHunterMeat =
+			pveCreatureSupplyBootBaseline.contains("meat") ?
+			pveCreatureSupplyBootBaseline.get("meat") : 0;
+		baselineState = pveBaselineState;
+		baselineLastError = pveBaselineLastError;
+		baselineRetryCount = pveBaselineRetryCount;
+	}
+	if (!acquisitionLedgerEnabled)
+		demandResults.removeAll();
 
 	JSONSerializationType result = JSONSerializationType::object();
 	result["enabled"] = pveEnabled;
@@ -8822,6 +10332,18 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	result["hunterHarvestUnitsTotal"] = hunterHarvestUnitsTotal;
 	result["hunterHarvestMisses"] = hunterHarvestMisses;
 	result["hunterAnnouncementsTotal"] = hunterAnnouncementsTotal;
+	result["missionHuntEnabled"] = missionHuntEnabled;
+	result["missionLairsSpawned"] = missionLairsSpawned;
+	result["missionLairsCleaned"] = missionLairsCleaned;
+	result["acquisitionLedgerEnabled"] = acquisitionLedgerEnabled;
+	result["turfSplitEffective"] = turfSplitEffective;
+	result["turfSplitPendingRestart"] = turfSplitPendingRestart;
+	result["minerCreatureExclusionActive"] = minerCreatureExclusionActive;
+	result["familySupplyOrigin"] = familySupplyOrigin;
+	result["bootBaselineHunterMeat"] = bootBaselineHunterMeat;
+	result["baselineState"] = baselineState;
+	result["baselineLastError"] = baselineLastError;
+	result["baselineRetryCount"] = baselineRetryCount;
 	result["huntGroundsValidated"] = pveHuntGroundsValidated;
 	result["maxHuntDistanceMeters"] = pveMaxHuntDistanceMeters;
 	result["hunterWeaponTemplate"] = pveHunterWeaponTemplate;
@@ -8873,6 +10395,32 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		row["presenceSpawns"] = bodyOid != 0 &&
 			presenceSpawnCounts.contains(bodyOid) ?
 			presenceSpawnCounts.get(bodyOid) : 0;
+		row["terminalPlanet"] = String("");
+		row["terminalCity"] = String("");
+		row["terminalPosX"] = 0.f;
+		row["terminalPosY"] = 0.f;
+		row["terminalPosZ"] = 0.f;
+		row["lairOid"] = 0;
+		row["lairPlanet"] = String("");
+		row["lairPosX"] = 0.f;
+		row["lairPosY"] = 0.f;
+		row["lairPosZ"] = 0.f;
+		row["lairAlive"] = false;
+		row["addsEngaged"] = 0;
+		// Live body position so the owner can locate/observe each bot in-game.
+		ZoneServer* dashZoneServer = ServerCore::getZoneServer();
+		if (bodyOid != 0 && dashZoneServer != nullptr) {
+			ManagedReference<SceneObject*> body =
+				dashZoneServer->getObject(bodyOid);
+			if (body != nullptr) {
+				ManagedReference<Zone*> bodyZone = body->getZone();
+				row["posPlanet"] = bodyZone == nullptr ? String("") :
+					bodyZone->getZoneName();
+				row["posX"] = body->getWorldPositionX();
+				row["posY"] = body->getWorldPositionY();
+				row["posZ"] = body->getWorldPositionZ();
+			}
+		}
 		row["phase"] = "IDLE_HOME";
 		for (int j = 0; j < huntOrders.size(); ++j) {
 			if (huntOrders.get(j).identityId == identity.id) {
@@ -8886,8 +10434,28 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 				row["orderKills"] = huntOrders.get(j).kills;
 				row["retreatCycles"] = huntOrders.get(j).retreatCycles;
 				row["targetOid"] = huntOrders.get(j).targetOid;
+				row["terminalPlanet"] =
+					huntOrders.get(j).missionTerminalPlanet;
+				row["terminalCity"] = huntOrders.get(j).missionTerminalCity;
+				row["terminalPosX"] =
+					huntOrders.get(j).missionTerminalPosition.getX();
+				row["terminalPosY"] =
+					huntOrders.get(j).missionTerminalPosition.getY();
+				row["terminalPosZ"] =
+					huntOrders.get(j).missionTerminalPosition.getZ();
+				row["addsEngaged"] =
+					huntOrders.get(j).missionAddsEngaged;
 				break;
 			}
+		}
+		if (bodyOid != 0 && huntLairs.contains(bodyOid)) {
+			const PveHuntLair& lair = huntLairs.get(bodyOid);
+			row["lairOid"] = lair.lairOid;
+			row["lairPlanet"] = lair.planet;
+			row["lairPosX"] = lair.x;
+			row["lairPosY"] = lair.y;
+			row["lairPosZ"] = lair.z;
+			row["lairAlive"] = lair.alive;
 		}
 		row["assignmentSpecies"] = identity.assignmentSpecies;
 		row["assignmentResource"] = identity.assignmentResource;
@@ -8937,6 +10505,31 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		speciesRows.push_back(row);
 	}
 	result["species"] = speciesRows;
+
+	JSONSerializationType demandFamilyRows = JSONSerializationType::array();
+	for (int i = 0; i < demandResults.size(); ++i) {
+		const DemandStateSimulationResult& demand = demandResults.get(i);
+		for (int j = 0; j < demand.familySignals.size(); ++j) {
+			const DemandFamilySignal& signal = demand.familySignals.get(j);
+			JSONSerializationType row = JSONSerializationType::object();
+			row["profileKey"] = demand.profileKey;
+			row["activeProfileAvailableForPhase"] =
+				demand.activeProfileAvailableForPhase;
+			row["reservedInboundSupply"] = demand.reservedInboundSupply;
+			row["family"] = signal.family;
+			row["channel"] = signal.channel;
+			row["effectiveCeiling"] = signal.effectiveCeiling;
+			row["reserveTarget"] = signal.reserveTarget;
+			row["familySupply"] = signal.familySupply;
+			row["familyInbound"] = signal.familyInbound;
+			row["allocComponent"] = signal.allocComponent;
+			row["reserveComponent"] = signal.reserveComponent;
+			row["signalUnits"] = signal.signalUnits;
+			row["pressure"] = signal.pressure;
+			demandFamilyRows.push_back(row);
+		}
+	}
+	result["demandFamilies"] = demandFamilyRows;
 	return result;
 }
 
@@ -9867,15 +11460,19 @@ void SimPlayerManager::recordSpawnIdentifiedMinerYield(
         return;
 
     uint64 spawnID = assignment.targetResourceSpawnObjectId;
+    const String acquisitionOrigin = "conceptual_miner";
+    String accumulatorKey = getSpawnYieldAccumulatorKey(
+        spawnID, acquisitionOrigin);
 
     Locker locker(&spawnYieldAccumulatorMutex);
 
     MinerSpawnYieldAccumulator accumulator;
 
-    if (spawnYieldAccumulators.contains(spawnID))
-        accumulator = spawnYieldAccumulators.get(spawnID);
+    if (spawnYieldAccumulators.contains(accumulatorKey))
+        accumulator = spawnYieldAccumulators.get(accumulatorKey);
 
     accumulator.resourceSpawnObjectId = spawnID;
+    accumulator.acquisitionOrigin = acquisitionOrigin;
     accumulator.resourceSpawnName = assignment.targetResourceName;
     accumulator.resourceType = assignment.targetResourceType;
     accumulator.resourceClassChain = assignment.targetResourceClassChain;
@@ -9895,7 +11492,7 @@ void SimPlayerManager::recordSpawnIdentifiedMinerYield(
     accumulator.cr = assignment.targetResourceCr;
     accumulator.sessionQuantity += static_cast<uint64>(amount);
 
-    spawnYieldAccumulators.put(spawnID, accumulator);
+    spawnYieldAccumulators.put(accumulatorKey, accumulator);
 }
 
 void SimPlayerManager::collectSpawnYieldAccumulators(
@@ -9907,20 +11504,20 @@ void SimPlayerManager::collectSpawnYieldAccumulators(
 }
 
 void SimPlayerManager::markSpawnYieldFlushed(
-        uint64 resourceSpawnObjectId, uint64 flushedQuantity) {
+        const String& accumulatorKey, uint64 flushedQuantity) {
     Locker locker(&spawnYieldAccumulatorMutex);
 
-    if (!spawnYieldAccumulators.contains(resourceSpawnObjectId))
+    if (!spawnYieldAccumulators.contains(accumulatorKey))
         return;
 
     MinerSpawnYieldAccumulator accumulator =
-        spawnYieldAccumulators.get(resourceSpawnObjectId);
+        spawnYieldAccumulators.get(accumulatorKey);
 
     // Only advance; never regress (sessionQuantity is monotonic and more yield
     // may have arrived since the flush snapshot was taken).
     if (flushedQuantity > accumulator.lastFlushedQuantity) {
         accumulator.lastFlushedQuantity = flushedQuantity;
-        spawnYieldAccumulators.put(resourceSpawnObjectId, accumulator);
+        spawnYieldAccumulators.put(accumulatorKey, accumulator);
     }
 }
 
@@ -15890,9 +17487,10 @@ void SimPlayerManager::flushSpawnIdentifiedLotsToHive() {
     collectSpawnYieldAccumulators(spawnAccumulators);
 
     Vector<AiEconomySpawnLotDeposit> deposits;
-    // Remember the sessionQuantity flushed per spawn so we can advance each
-    // accumulator's lastFlushedQuantity only after a successful hive write.
-    Vector<uint64> flushedSpawnIds;
+    // Remember the sessionQuantity flushed per composite accumulator key so
+    // we can advance each origin's watermark only after a successful hive
+    // write.
+    Vector<String> flushedAccumulatorKeys;
     Vector<uint64> flushedQuantities;
 
     for (int i = 0; i < spawnAccumulators.size(); ++i) {
@@ -15915,7 +17513,7 @@ void SimPlayerManager::flushSpawnIdentifiedLotsToHive() {
         deposit.sourcePlanet = acc.sourcePlanet;
         deposit.sourceZone = acc.sourceZone;
         deposit.matchedDemandProfiles = acc.matchedDemandProfiles;
-        deposit.acquisitionSource = "conceptual_miner";
+        deposit.acquisitionSource = acc.acquisitionOrigin;
         deposit.resourceLifecycleState =
             acc.active ? String("active") : String("inactive");
         deposit.identityConfidence = "exact_type";
@@ -15931,7 +17529,8 @@ void SimPlayerManager::flushSpawnIdentifiedLotsToHive() {
         deposit.ut = acc.ut;
         deposit.cr = acc.cr;
         deposits.add(deposit);
-        flushedSpawnIds.add(acc.resourceSpawnObjectId);
+        flushedAccumulatorKeys.add(getSpawnYieldAccumulatorKey(
+            acc.resourceSpawnObjectId, acc.acquisitionOrigin));
         flushedQuantities.add(acc.sessionQuantity);
     }
 
@@ -15957,8 +17556,9 @@ void SimPlayerManager::flushSpawnIdentifiedLotsToHive() {
 
     // Advance each accumulator's flushed watermark so the next flush only sends
     // newly gathered units.
-    for (int i = 0; i < flushedSpawnIds.size(); ++i)
-        markSpawnYieldFlushed(flushedSpawnIds.get(i), flushedQuantities.get(i));
+    for (int i = 0; i < flushedAccumulatorKeys.size(); ++i)
+        markSpawnYieldFlushed(
+            flushedAccumulatorKeys.get(i), flushedQuantities.get(i));
 
     if (aiEconomyPersistenceLogSummary) {
         info(String("AiEconomyPersistenceSpawnLots updated=true spawns=") +
@@ -18218,8 +19818,16 @@ void SimPlayerManager::logDemandWeightedMinerPlanSimulations() {
         return;
     }
 
-    Vector<DemandProfileDefinition> profiles = createDemandProfileDefinitions();
-    VectorMap<String, uint64> marketQuantities;
+	Vector<DemandProfileDefinition> profiles = createDemandProfileDefinitions();
+	bool minerCreatureResourceExclusionActive = false;
+	Vector<String> creatureResourceClassMarkers;
+	{
+		Locker pveLock(&pveMutex);
+		minerCreatureResourceExclusionActive = pveTurfSplitEffective;
+		creatureResourceClassMarkers =
+			pveAcquisitionLedgerCreatureClassMarkers;
+	}
+	VectorMap<String, uint64> marketQuantities;
     Vector<ResourceScoringProfile> d4Profiles =
         createCuratedResourceScoringProfiles();
     Vector<int> d4EnabledProfileIndexes;
@@ -18374,7 +19982,9 @@ void SimPlayerManager::logDemandWeightedMinerPlanSimulations() {
                 minerTargetSimulationPreferSamePlanet,
                 minerTargetSimulationSamePlanetBonus,
                 minerTargetSimulationTravelPenalty,
-                d4AssignedProfileIndex);
+                d4AssignedProfileIndex,
+                minerCreatureResourceExclusionActive,
+                creatureResourceClassMarkers);
         DemandWeightedMinerCandidate bestWithinCap;
         DemandWeightedMinerCandidate strongestCapped;
         DemandWeightedMinerCandidate secondStrongestCapped;
@@ -18396,7 +20006,9 @@ void SimPlayerManager::logDemandWeightedMinerPlanSimulations() {
                     profile,
                     miner.zoneName,
                     demandWeightedMinerPlanSimulationSamePlanetBonus,
-                    demandWeightedMinerPlanSimulationTravelPenalty);
+                    demandWeightedMinerPlanSimulationTravelPenalty,
+					minerCreatureResourceExclusionActive,
+					creatureResourceClassMarkers);
 
             if (!target.isValid())
                 continue;
@@ -20654,6 +22266,14 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
     bool resourceSnapshotAvailable =
         collectResourceIntelligenceSnapshot(entries, snapshotError);
     Vector<DemandProfileDefinition> profiles = createDemandProfileDefinitions();
+    bool minerCreatureResourceExclusionActive = false;
+    Vector<String> creatureResourceClassMarkers;
+    {
+        Locker pveLock(&pveMutex);
+        minerCreatureResourceExclusionActive = pveTurfSplitEffective;
+        creatureResourceClassMarkers =
+            pveAcquisitionLedgerCreatureClassMarkers;
+    }
     VectorMap<String, uint64> marketQuantities;
 
     if (demandWeightedMinerPlanSimulationIncludeMarketSupply) {
@@ -20872,7 +22492,9 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
                     demandWeightedMinerPlanSimulationSamePlanetBonus,
                     demandWeightedMinerPlanSimulationTravelPenalty,
                     demandWeightedMinerPlanSimulationMaxMinersPerProfile,
-                    demandWeightedMinerPlanSimulationStrongPressureRatio);
+                    demandWeightedMinerPlanSimulationStrongPressureRatio,
+                    minerCreatureResourceExclusionActive,
+                    creatureResourceClassMarkers);
 
             if (!demandSelection.valid) {
                 fallbackReason = "allCandidatesCappedWithoutStrongPressure";
@@ -22106,7 +23728,8 @@ void SimPlayerManager::refreshDemandStateSimulationConfig() {
 
 void SimPlayerManager::computeDemandStateResults(
         Vector<DemandStateSimulationResult>& results,
-        bool& activeSnapshotAvailable, String& snapshotError) {
+        bool& activeSnapshotAvailable, String& snapshotError,
+        bool logPersistentSummary) {
     results.removeAll();
     activeSnapshotAvailable = false;
     snapshotError = "";
@@ -22124,6 +23747,41 @@ void SimPlayerManager::computeDemandStateResults(
     }
 
     Vector<DemandProfileDefinition> profiles = createDemandProfileDefinitions();
+    bool acquisitionLedgerEnabled = false;
+    Vector<String> acquisitionLedgerFamilies;
+    VectorMap<String, uint64> acquisitionLedgerReserveTargets;
+    uint64 acquisitionLedgerReserveCap = 0;
+    VectorMap<String, uint64> acquisitionLedgerCeilingUnits;
+    VectorMap<String, float> acquisitionLedgerCeilingFractions;
+    float acquisitionLedgerReservePressureFloor = 0.f;
+    VectorMap<String, uint64> reservedInboundByProfileFamily;
+    VectorMap<String, uint64> sessionHarvestByFamily;
+    VectorMap<String, uint64> familySupplyByFamily;
+    bool familySupplyReady = false;
+
+    {
+        Locker pveLock(&pveMutex);
+        acquisitionLedgerEnabled = pveAcquisitionLedgerEnabled;
+        acquisitionLedgerFamilies = pveAcquisitionLedgerCreatureFamilies;
+        acquisitionLedgerReserveTargets =
+            pveAcquisitionLedgerFamilyReserveTargets;
+        acquisitionLedgerReserveCap = pveAcquisitionLedgerFamilyReserveCap;
+        acquisitionLedgerCeilingUnits =
+            pveAcquisitionLedgerFamilyAllocationCeilingUnits;
+        acquisitionLedgerCeilingFractions =
+            pveAcquisitionLedgerFamilyAllocationCeilingFractions;
+        acquisitionLedgerReservePressureFloor =
+            pveAcquisitionLedgerReservePressureFloor;
+    }
+
+    if (acquisitionLedgerEnabled) {
+        computeReservedInboundByProfileFamily(
+            reservedInboundByProfileFamily, sessionHarvestByFamily);
+        familySupplyReady = preparePveCreatureFamilySupply(
+            acquisitionLedgerFamilies, sessionHarvestByFamily,
+            familySupplyByFamily);
+    }
+
     VectorMap<String, uint64> marketQuantities;
     VectorMap<String, int> marketListings;
     VectorMap<String, float> marketCheapestPrices;
@@ -22187,7 +23845,7 @@ void SimPlayerManager::computeDemandStateResults(
                 persistentConceptualTotals.removeAll();
         }
 
-        if (persistentStockpileDemandLogSummary) {
+        if (persistentStockpileDemandLogSummary && logPersistentSummary) {
             String persistentLabels = "none";
             int loggedLabels = 0;
 
@@ -22245,7 +23903,37 @@ void SimPlayerManager::computeDemandStateResults(
             conceptualResourceNames,
             conceptualAmounts,
             result.supplyConfidence,
-            result.supplyLabels);
+            result.supplyLabels,
+            acquisitionLedgerEnabled);
+
+        if (familySupplyReady) {
+            for (int familyIndex = 0;
+                    familyIndex < acquisitionLedgerFamilies.size();
+                    ++familyIndex) {
+                String family = acquisitionLedgerFamilies.get(familyIndex).
+                    toLowerCase().trim();
+                if (family.isEmpty() ||
+                        !demandStateProfileUsesConceptualLabel(
+                            profile.key, family, true) ||
+                        !familySupplyByFamily.contains(family))
+                    continue;
+
+                uint64 familySupply = familySupplyByFamily.get(family);
+                result.aiConceptualSupply = addDemandFamilyUnits(
+                    result.aiConceptualSupply, familySupply);
+                if (familySupply == 0)
+                    continue;
+
+                String familyLabel = String("family=") + family + "=" +
+                    String::valueOf(familySupply);
+                if (result.supplyLabels == "none")
+                    result.supplyLabels = familyLabel;
+                else
+                    result.supplyLabels += ";" + familyLabel;
+                result.supplyConfidence = combineSupplyConfidence(
+                    result.supplyConfidence, "coarse_family");
+            }
+        }
         result.marketObservedSupply = marketQuantities.contains(profile.key) ?
             marketQuantities.get(profile.key) : 0;
         result.marketListingsMatched = marketListings.contains(profile.key) ?
@@ -22344,6 +24032,16 @@ void SimPlayerManager::computeDemandStateResults(
             demandStateSimulationShortageWeight,
             demandStateSimulationActiveOpportunityWeight,
             demandStateSimulationSurplusDampening);
+
+		if (familySupplyReady) {
+			deriveDemandFamilySignals(
+				result, profile, acquisitionLedgerFamilies,
+				familySupplyByFamily, reservedInboundByProfileFamily,
+				acquisitionLedgerReserveTargets, acquisitionLedgerReserveCap,
+				acquisitionLedgerCeilingUnits,
+				acquisitionLedgerCeilingFractions,
+				acquisitionLedgerReservePressureFloor);
+		}
 
         results.add(result);
     }
@@ -22537,6 +24235,14 @@ void SimPlayerManager::logMinerTargetRecommendations() {
         return;
 
     Vector<ResourceScoringProfile> profiles = createCuratedResourceScoringProfiles();
+    bool minerCreatureResourceExclusionActive = false;
+    Vector<String> creatureResourceClassMarkers;
+    {
+        Locker pveLock(&pveMutex);
+        minerCreatureResourceExclusionActive = pveTurfSplitEffective;
+        creatureResourceClassMarkers =
+            pveAcquisitionLedgerCreatureClassMarkers;
+    }
     int loggedMinerCount = 0;
     int controllerCount = controllers.size();
 
@@ -22580,6 +24286,10 @@ void SimPlayerManager::logMinerTargetRecommendations() {
                         continue;
 
                     ResourceIntelligenceEntry entry = entries.get(entryIndex);
+					if (minerCreatureResourceExclusionActive &&
+							isCreatureResourceEntry(
+								entry, creatureResourceClassMarkers))
+						continue;
 
                     if (!resourceAvailableInZone(entry, zoneName))
                         continue;
@@ -22624,6 +24334,10 @@ void SimPlayerManager::logMinerTargetRecommendations() {
                         continue;
 
                     ResourceIntelligenceEntry entry = entries.get(entryIndex);
+					if (minerCreatureResourceExclusionActive &&
+							isCreatureResourceEntry(
+								entry, creatureResourceClassMarkers))
+						continue;
                     String matchedType = getBestMatchedResourceType(entry, profile);
 
                     if (matchedType.isEmpty())
@@ -22702,6 +24416,14 @@ void SimPlayerManager::logMinerTargetSimulations() {
         return;
 
     Vector<ResourceScoringProfile> profiles = createCuratedResourceScoringProfiles();
+    bool minerCreatureResourceExclusionActive = false;
+    Vector<String> creatureResourceClassMarkers;
+    {
+        Locker pveLock(&pveMutex);
+        minerCreatureResourceExclusionActive = pveTurfSplitEffective;
+        creatureResourceClassMarkers =
+            pveAcquisitionLedgerCreatureClassMarkers;
+    }
     Vector<int> enabledProfileIndexes;
 
     for (int profileIndex = 0; profileIndex < profiles.size(); ++profileIndex) {
@@ -22750,7 +24472,9 @@ void SimPlayerManager::logMinerTargetSimulations() {
             minerTargetSimulationPreferSamePlanet,
             minerTargetSimulationSamePlanetBonus,
             minerTargetSimulationTravelPenalty,
-            assignedProfileIndex);
+            assignedProfileIndex,
+            minerCreatureResourceExclusionActive,
+            creatureResourceClassMarkers);
         ResourceScoringProfile assignedProfile = profiles.get(assignedProfileIndex);
 
         if (selectedPlan.isValid()) {
@@ -22827,6 +24551,14 @@ void SimPlayerManager::logMinerDensityTargetSimulations() {
     collectConceptualMinerTotals(conceptualResourceNames, conceptualAmounts);
 
     Vector<DemandProfileDefinition> demandProfiles = createDemandProfileDefinitions();
+    bool minerCreatureResourceExclusionActive = false;
+    Vector<String> creatureResourceClassMarkers;
+    {
+        Locker pveLock(&pveMutex);
+        minerCreatureResourceExclusionActive = pveTurfSplitEffective;
+        creatureResourceClassMarkers =
+            pveAcquisitionLedgerCreatureClassMarkers;
+    }
     VectorMap<String, uint64> marketQuantities;
 
     if (demandWeightedMinerPlanSimulationIncludeMarketSupply) {
@@ -23004,7 +24736,9 @@ void SimPlayerManager::logMinerDensityTargetSimulations() {
                     demandWeightedMinerPlanSimulationSamePlanetBonus,
                     demandWeightedMinerPlanSimulationTravelPenalty,
                     demandWeightedMinerPlanSimulationMaxMinersPerProfile,
-                    demandWeightedMinerPlanSimulationStrongPressureRatio);
+                    demandWeightedMinerPlanSimulationStrongPressureRatio,
+                    minerCreatureResourceExclusionActive,
+                    creatureResourceClassMarkers);
 
             if (demandSelection.valid) {
                 targetSource = "demand_weighted_plan";
@@ -23028,7 +24762,9 @@ void SimPlayerManager::logMinerDensityTargetSimulations() {
                 minerTargetSimulationPreferSamePlanet,
                 minerTargetSimulationSamePlanetBonus,
                 minerTargetSimulationTravelPenalty,
-                assignedProfileIndex);
+                assignedProfileIndex,
+                minerCreatureResourceExclusionActive,
+                creatureResourceClassMarkers);
 
             if (plan.isValid()) {
                 ResourceScoringProfile selectedProfile = roundRobinProfiles.get(plan.profileIndex);
@@ -23288,6 +25024,14 @@ void SimPlayerManager::logMinerPathValidationSimulations() {
     collectConceptualMinerTotals(conceptualResourceNames, conceptualAmounts);
 
     Vector<DemandProfileDefinition> demandProfiles = createDemandProfileDefinitions();
+    bool minerCreatureResourceExclusionActive = false;
+    Vector<String> creatureResourceClassMarkers;
+    {
+        Locker pveLock(&pveMutex);
+        minerCreatureResourceExclusionActive = pveTurfSplitEffective;
+        creatureResourceClassMarkers =
+            pveAcquisitionLedgerCreatureClassMarkers;
+    }
     VectorMap<String, uint64> marketQuantities;
 
     if (demandWeightedMinerPlanSimulationIncludeMarketSupply) {
@@ -23465,7 +25209,9 @@ void SimPlayerManager::logMinerPathValidationSimulations() {
                     demandWeightedMinerPlanSimulationSamePlanetBonus,
                     demandWeightedMinerPlanSimulationTravelPenalty,
                     demandWeightedMinerPlanSimulationMaxMinersPerProfile,
-                    demandWeightedMinerPlanSimulationStrongPressureRatio);
+                    demandWeightedMinerPlanSimulationStrongPressureRatio,
+                    minerCreatureResourceExclusionActive,
+                    creatureResourceClassMarkers);
 
             if (demandSelection.valid) {
                 targetSource = "demand_weighted_plan";
@@ -23489,7 +25235,9 @@ void SimPlayerManager::logMinerPathValidationSimulations() {
                 minerTargetSimulationPreferSamePlanet,
                 minerTargetSimulationSamePlanetBonus,
                 minerTargetSimulationTravelPenalty,
-                assignedProfileIndex);
+                assignedProfileIndex,
+                minerCreatureResourceExclusionActive,
+                creatureResourceClassMarkers);
 
             if (plan.isValid()) {
                 ResourceScoringProfile selectedProfile =

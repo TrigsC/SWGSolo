@@ -640,6 +640,25 @@ SimPlayerManagerConfig = {
         maxHuntDistanceMeters = 1500,
         announceCooldownSeconds = 90,
         announceSiteGapSeconds = 300,
+        -- P.8.1c Phase 1: shared substitution-pool supply plumbing and
+        -- per-family demand signals. Default-off until the Phase 2 matcher
+        -- consumes these signals. This remains simulation-only.
+        acquisitionLedger = {
+            enabled = true,
+            -- Miner creature-resource exclusion and hunter-only baseline
+            -- provenance are latched on first applyPveConfig; changing this
+            -- gate requires a process restart.
+            minerCreatureResourceExclusion = true,
+            creatureResourceClassMarkers = { "creature_resources" },
+            creatureFamilies = { "meat" },
+            familyReserveTargets = { meat = 2500 },
+            familyReserveCap = 5000,
+            familyAllocationCeilingUnits = { meat = 0 },
+            familyAllocationCeilingFraction = { meat = 0.25 },
+            reservePressureFloor = 25,
+            huntTimeEstimateSeconds = 600,
+            baselineRetryBackoffMs = 5000,
+        },
         bodyTemplates = { "artisan" },
         hunterLoadout = {
             -- Explicitly created and equipped by the C++ hunter spawn path.
@@ -683,6 +702,21 @@ SimPlayerManagerConfig = {
             scanRadiusMeters = 96,
             weaponRangeMeters = 48,
         },
+        -- P.8.2 Phase 1 spawn + terminal plumbing. This is intentionally an
+        -- independent gate from enableHunterBots; terminal discovery and
+        -- transient lairs stay completely inert until explicitly enabled.
+        missionHunt = {
+            enabled = true,
+            missionSpawnDistanceMeters = 200,
+            terminalScanRadiusMeters = 600,
+            maxSpawnPointTries = 32,
+            maxSimultaneousAdds = 1,
+            addsAbandonCycles = 3,
+            terminalDwellSeconds = 5,
+            terminalResolveWaitCycles = 10,
+            lairTimeoutSeconds = 1800,
+            maxActiveLairs = 6,
+        },
         -- Each ground is a real SPAWNAREA from the planet region scripts;
         -- C++ validates the object, terrain/boundary, and P.4.1 guards once
         -- per config publication before a row becomes usable.
@@ -692,6 +726,10 @@ SimPlayerManagerConfig = {
                 planet = "tatooine",
                 spawnArea = "@tatooine_region_names:mos_eisley_easy_newbie",
                 huntGround = { 4200, -4784, 0 },
+                lairTemplate = "tatooine_womprat_lair_neutral_small",
+                missionDifficulty = 1,
+                lairBuildingLevel = 1,
+                lairSize = 20,
                 templateFilter = "womp_rat",
                 requestedResourceType = "meat_wild",
                 harvestKind = "meat",
@@ -705,6 +743,10 @@ SimPlayerManagerConfig = {
                 planet = "tatooine",
                 spawnArea = "@tatooine_region_names:bestine_medium_newbie",
                 huntGround = { -1216, -3660, 0 },
+                lairTemplate = "tatooine_kreetle_lair_neutral_small",
+                missionDifficulty = 1,
+                lairBuildingLevel = 1,
+                lairSize = 20,
                 templateFilter = "kreetle",
                 requestedResourceType = "meat_insect",
                 harvestKind = "meat",
@@ -722,6 +764,10 @@ SimPlayerManagerConfig = {
                 planet = "tatooine",
                 spawnArea = "@tatooine_region_names:hard_krayt_ne",
                 huntGround = { 6515, 4215, 0 },
+                lairTemplate = "tatooine_krayt_lair_neutral_small",
+                missionDifficulty = 3,
+                lairBuildingLevel = 2,
+                lairSize = 20,
                 templateFilter = "krayt",
                 requestedResourceType = "meat_wild",
                 harvestKind = "meat",
@@ -735,6 +781,10 @@ SimPlayerManagerConfig = {
                 planet = "yavin4",
                 spawnArea = "@yavin4_region_names:yavin4_geo_bunker_nobuild",
                 huntGround = { -6488, -417, 0 },
+                lairTemplate = "yavin4_acklay_lair_neutral_small",
+                missionDifficulty = 5,
+                lairBuildingLevel = 3,
+                lairSize = 20,
                 templateFilter = "acklay",
                 requestedResourceType = "meat_wild",
                 harvestKind = "meat",
@@ -748,6 +798,10 @@ SimPlayerManagerConfig = {
                 planet = "yavin4",
                 spawnArea = "@yavin4_region_names:yavin4_geo_bunker_nobuild",
                 huntGround = { -6488, -417, 0 },
+                lairTemplate = "yavin4_geonosian_lair_neutral_small",
+                missionDifficulty = 3,
+                lairBuildingLevel = 2,
+                lairSize = 20,
                 templateFilter = "geonosian",
                 requestedResourceType = "meat_insect",
                 harvestKind = "meat",
@@ -761,6 +815,10 @@ SimPlayerManagerConfig = {
                 planet = "dathomir",
                 spawnArea = "@dathomir_region_names:nightsister_clan",
                 huntGround = { -4069, -184, 0 },
+                lairTemplate = "dathomir_nightsister_lair_neutral_small",
+                missionDifficulty = 4,
+                lairBuildingLevel = 2,
+                lairSize = 20,
                 templateFilter = "nightsister",
                 requestedResourceType = "meat_wild",
                 harvestKind = "meat",

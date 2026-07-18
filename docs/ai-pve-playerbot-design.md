@@ -102,3 +102,122 @@ narrowed a specific cause (empty world → area-enter fires → trySpawn reached
 permit sub-reason → target scan reject → combat heartbeat) rather than
 guessing. Diagnostics in core files (SpawnArea, PlanetManager) were stripped
 after use (commit e7aea12814); the permanent presence predicate stays.
+
+## P.8.1c — Acquisition demand-ledger (substitution-pool family signals)
+
+Live verification 2026-07-17 found Phase 2 hunters correct but permanently
+`IDLE_HOME`: the matchmaker was strict demand-pull reading only each crafter
+profile's single collapsed `activeResource.type` (always a mined veggie/mineral),
+so the meat the species produce was invisible. Root gap: chef supply recognized
+only `water`; hunter harvest landed in a separate accumulator that never fed the
+demand supply. Plan: `docs/1-plans/F_0.4.1_p81c-acquisition-demand-ledger.plan.md`
+(Codex plan-review, 7 rounds, 14 findings → APPROVED).
+
+**Owner architecture:** `Crafter needs → shared demand ledger → acquisition
+opportunities {sample/harvester, solo hunt, group hunt, loot camp, mission}`.
+The ledger must expose shortages for **every eligible satisfier family** (a
+crafter's active opportunity governs what the *crafter* makes but must not erase
+demand for the other families the recipe can use); PvE bots pick by **expected
+economic value per unit time**; **no** dedicated meat-consumer profile
+(overproduction); speculative floor deferred.
+
+**Model (shared substitution-pool, stable per-family targets):** each ANY-OF
+profile is one pool; per creature family the signal has two independent
+components — an **allocation** share of the shared gap (largest-remainder,
+capped by a *stable* `effectiveCeiling = min(units, fraction·desiredReserve)`,
+default 25%) plus an **independent capped reserve** floor (diversity, own
+`reservePressureFloor`). `signalUnits = alloc + reserve`. Self-limiting:
+simulated harvest is fed back into chef `totalKnownSupply`, so producing meat
+shrinks the gap and the signal quiets at the ceiling even while veggies still
+fill the pool.
+
+**Consistent, restart-durable accounting:** `familySupply = immutable boot
+baseline + monotonic session tally`. Baseline captured once (guarded
+`pending→capturing→ready`, single-winner, slow durable scan
+`AiEconomyManager::snapshotStockpileTotalsByFamily` — includes `exact_type`
+lots, which `persistentConceptualTotals` omits — outside the lock, atomic
+publish; failure→`pending` + bounded backoff, never publish empty; no signals
+until `ready`). Session tally (`pveSessionHarvestByFamily`, `pveMutex`)
+increments in `recordPveHunterHarvest` atomically with the order's
+`harvestedUnits`; reservations + session tally snapshot under **one** `pveMutex`
+so a harvest can't read as both inbound and supply. No double-count with the
+miner/stockpile paths (hunters never write `conceptualMinerTotals`; exact_type
+excluded from `persistentConceptualTotals`).
+
+**Matchmaker (value/time + intra-pass reservation):** candidates = creature
+`familySignals` with `signalUnits>0` matched by `species.harvestKind ==
+signal.family`; score `= signal.pressure · estYieldUnits / huntTimeEstimate`;
+after each assignment the selected `(profileKey, family)` signal is
+saturating-decremented by the order's `expectedYieldUnits` and remaining
+identities re-scored, so N hunters in one pass spread across real need (one
+bounded overshoot then drop). Strict-pull preserved (no signal → no dispatch).
+Reservations scoped per `(profileKey, family)`; global harvested supply serves
+every meat-accepting profile.
+
+**Gating:** all of the above is behind `pveConfig.acquisitionLedger.enabled`
+(default **off**); off reproduces the prior `activeResource`-only matchmaker and
+skips harvest injection exactly. Simulation-only. v1 covers the `meat` family
+only (all configured species are `harvestKind=meat`; hide/bone and the
+loot/mission value terms are documented additive hooks for a later slice).
+
+**Live-verification contract:** with the flag on, `pveActivity.demandFamilies`
+shows a non-zero `meat` signal, `allocComponent` shrinks as `familySupply` rises
+and hits 0 at `effectiveCeiling` (leaving only `reserveComponent`),
+`reservedInboundSupply` nets in-flight hunts same-pass, `baselineState=ready`,
+and hunters leave `IDLE_HOME` → announce/travel/hunt → typed harvest climbs.
+
+## P.8.1d — Creature-resource turf split
+
+The PvE acquisition ledger makes the `organic>creature_resources` subtree
+hunter territory. When the ledger's turf split is active, SimMiners skip
+creature-resource entries during demand-weighted target selection, while
+hunters remain the producer for the configured creature families (`meat` in
+v1). This prevents mined `meat_*` resources from satisfying the hunter supply
+view; hide, bone, milk, egg, and seafood remain intentionally unfilled until a
+matching hunter harvest kind is implemented.
+
+Harvest provenance is retained end to end. Miner and hunter yields use
+composite in-memory accumulator keys `(resourceSpawnObjectID, origin)` and
+durable exact-type lot keys `(resourceSpawnObjectID, acquisitionSource)`.
+Miner deposits remain `conceptual_miner`; hunter deposits are `pve_hunter`, so
+the boot family baseline can count only hunter-origin creature lots without
+deleting or rewriting the existing miner stockpile.
+
+The turf split is a restart-latched gate: the first `applyPveConfig` captures
+`acquisitionLedger.enabled && minerCreatureResourceExclusion` as the effective
+value used by miner exclusion, baseline capture, and the dashboard. Runtime
+config refreshes update the configured value but never change effective
+behavior; a mismatch is surfaced as `turfSplitPendingRestart`. Dashboard
+verification fields include `turfSplitEffective`, `familySupplyOrigin`, and
+`bootBaselineHunterMeat` so the discounted miner bank can be distinguished from
+new hunter production.
+
+## P.8.2 — Mission-terminal hunting
+
+P.8.2 is independently gated by `pveConfig.missionHunt.enabled` (default
+`false`). When off, the existing P.8.1c/d hunter path remains
+`BUFF_UP → TRAVEL_OUT → AWAITING_WORLD → HUNTING` and no terminal or lair work
+is performed.
+
+When enabled, a hunter visits the nearest resolved mission terminal in its home
+city, dwells for the configured acceptance interval, and the manager creates a
+non-persistent real lair at a bounded, spawnability-checked wilderness point.
+The controller then travels to that lair and scans locally. A pending terminal
+city is retried per city for `terminalResolveWaitCycles`; only that hunt then
+falls back to a hunt-ground-adjacent spawn. A ready city with no terminal is
+`absent` and takes the same adjacent-spawn fallback. The shared terminal state
+is changed only by the post-load city scan.
+
+The mission phases are `TRAVEL_TO_TERMINAL`, `ACCEPT_MISSION`,
+`TRAVEL_TO_LAIR`, and `MISSION_CLEANUP`. Combat remains one-target-at-a-time.
+For social/herd targets, the hunter's defender count is compared with
+`maxSimultaneousAdds`; an over-cap pull uses the existing retreat/heal path and
+repeated over-cap cycles abandon the lair. Completion, abandonment, death, and
+timeout queue lair destruction off the hunter tick.
+
+`pveActivity.roster` exposes the current phase, terminal target, lair OID and
+position/alive state, and engaged adds. Root counters expose
+`missionLairsSpawned` and `missionLairsCleaned`, alongside the existing live
+body position and hunter kill/harvest counters. Temporary target-scan logging
+is not part of the controller; any future diagnostics should use the manager
+logger so they are visible in `core3.log`.

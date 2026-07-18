@@ -196,6 +196,14 @@ public:
 		VectorMap<String, uint64>& totalsSnapshot,
 		int& conceptualMinerLots, uint64& totalQuantity,
 		String& status);
+	// P.8.1c: totals-only durable family snapshot for the PvE acquisition
+	// ledger. Includes exact-type and other durable stockpile lots; callers
+	// freeze the returned totals as their boot baseline.
+	bool snapshotStockpileTotalsByFamily(
+		const Vector<String>& families,
+		VectorMap<String, uint64>& totalsByFamily,
+		String& status,
+		const String& requiredAcquisitionSource);
 	bool snapshotStockpileInspection(
 		AiEconomyStockpileInspectionSnapshot& snapshot,
 		int maxLotRows,

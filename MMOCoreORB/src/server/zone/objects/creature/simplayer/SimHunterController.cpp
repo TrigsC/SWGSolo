@@ -50,12 +50,16 @@ static String hunterPhaseName(SimHunterController::HuntPhase phase) {
 	case SimHunterController::ANNOUNCE_JOB: return "ANNOUNCE_JOB";
 	case SimHunterController::BUFF_UP: return "BUFF_UP";
 	case SimHunterController::TRAVEL_OUT: return "TRAVEL_OUT";
+	case SimHunterController::TRAVEL_TO_TERMINAL: return "TRAVEL_TO_TERMINAL";
+	case SimHunterController::ACCEPT_MISSION: return "ACCEPT_MISSION";
+	case SimHunterController::TRAVEL_TO_LAIR: return "TRAVEL_TO_LAIR";
 	case SimHunterController::AWAITING_WORLD: return "AWAITING_WORLD";
 	case SimHunterController::HUNTING: return "HUNTING";
 	case SimHunterController::RETREATING: return "RETREATING";
 	case SimHunterController::HEALING: return "HEALING";
 	case SimHunterController::TRAVEL_HOME: return "TRAVEL_HOME";
 	case SimHunterController::DELIVER: return "DELIVER";
+	case SimHunterController::MISSION_CLEANUP: return "MISSION_CLEANUP";
 	case SimHunterController::CLONE_HOME: return "CLONE_HOME";
 	case SimHunterController::DONE: return "DONE";
 	default: return "UNKNOWN";
@@ -88,6 +92,16 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 	stalemateSelfHam = 0;
 	stalemateDefenderHam = 0;
 	retreatCycles = 0;
+	missionHuntOrder = false;
+	missionTerminalFallback = false;
+	missionTerminalResolved = false;
+	missionCleanupRequested = false;
+	missionTerminalPosition = Vector3();
+	missionLairPosition = Vector3();
+	missionLairOid = 0;
+	terminalResolveWaitCycles = 0;
+	missionAddsOverCapCycles = 0;
+	missionAddsEngaged = 0;
 	setLoggingName("SimHunterController");
 }
 
@@ -150,6 +164,7 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	order = newOrder;
 	species = newSpecies;
 	orderActive = true;
+	missionHuntOrder = SimPlayerManager::instance()->isPveMissionHuntEnabled();
 	orderAbandoned = false;
 	deathReported = false;
 	phase = IDLE_HOME;
@@ -157,6 +172,15 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	huntStartedAtMs = 0;
 	targetOid = 0;
 	retreatCycles = 0;
+	missionTerminalFallback = false;
+	missionTerminalResolved = false;
+	missionCleanupRequested = false;
+	missionTerminalPosition = Vector3();
+	missionLairPosition = Vector3();
+	missionLairOid = 0;
+	terminalResolveWaitCycles = 0;
+	missionAddsOverCapCycles = 0;
+	missionAddsEngaged = 0;
 	cantinaDwellComplete = false;
 	medDwellComplete = false;
 	dwellUntilMs = 0;
@@ -231,6 +255,174 @@ void SimHunterController::applyHunterBuffs(bool clearWounds) {
 	}
 }
 
+void SimHunterController::beginMissionTerminalLeg() {
+	if (!orderActive || !missionHuntOrder || agent == nullptr)
+		return;
+
+	PveMissionTerminalLocation terminal;
+	int cityState = PVE_MISSION_TERMINAL_PENDING;
+	bool resolved = SimPlayerManager::instance()->getNearestMissionTerminal(
+		order.homePlanet, order.homeCity, agent->getWorldPosition(), terminal,
+		cityState);
+
+	if (resolved) {
+		missionTerminalPosition = terminal.position;
+		missionTerminalResolved = true;
+		missionTerminalFallback = false;
+		SimPlayerManager::instance()->recordPveHunterMissionTerminal(
+			identityId, agent->getObjectID(), terminal.planet, terminal.city,
+			terminal.position);
+		setPhase(TRAVEL_TO_TERMINAL);
+		if (state != MOVING && state != CALCULATING_PATH)
+			moveTo(missionTerminalPosition);
+		return;
+	}
+
+	if (cityState == PVE_MISSION_TERMINAL_ABSENT ||
+			terminalResolveWaitCycles >= SimPlayerManager::instance()->
+			getPveMissionTerminalResolveWaitCycles()) {
+		beginMissionFallback();
+		return;
+	}
+
+	missionTerminalResolved = false;
+	missionTerminalFallback = false;
+	++terminalResolveWaitCycles;
+	SimPlayerManager::instance()->recordPveHunterMissionTerminal(
+		identityId, agent->getObjectID(), order.homePlanet, order.homeCity,
+		Vector3());
+	setPhase(TRAVEL_TO_TERMINAL);
+	scheduleActiveTick(2000);
+}
+
+void SimHunterController::beginMissionFallback() {
+	missionTerminalFallback = true;
+	missionTerminalResolved = false;
+	SimPlayerManager::instance()->recordPveHunterMissionTerminal(
+		identityId, agent == nullptr ? 0 : agent->getObjectID(),
+		order.homePlanet, order.homeCity, Vector3());
+	spawnMissionLair();
+}
+
+void SimHunterController::beginMissionAccept() {
+	if (!orderActive || !missionHuntOrder)
+		return;
+
+	setPhase(ACCEPT_MISSION);
+	dwellUntilMs = System::getMiliTime() +
+		static_cast<uint64>(SimPlayerManager::instance()->
+			getPveMissionTerminalDwellSeconds()) * 1000;
+	scheduleActiveTick(1000);
+}
+
+void SimHunterController::spawnMissionLair() {
+	if (!orderActive || !missionHuntOrder || agent == nullptr)
+		return;
+
+	dwellUntilMs = 0;
+	Vector3 missionAnchor = missionTerminalFallback ? species.huntGround :
+		missionTerminalPosition;
+	if (!SimPlayerManager::instance()->spawnPveHuntLair(
+			agent->getObjectID(), species, missionAnchor)) {
+		beginMissionCleanup(true, "lair_spawn_failed");
+		return;
+	}
+
+	PveHuntLair lair;
+	if (!SimPlayerManager::instance()->getPveHuntLair(
+			agent->getObjectID(), lair) || lair.lairOid == 0) {
+		beginMissionCleanup(true, "lair_record_missing");
+		return;
+	}
+
+	missionLairOid = lair.lairOid;
+	missionLairPosition = Vector3(lair.x, lair.y, lair.z);
+	missionAddsOverCapCycles = 0;
+	updateMissionAdds(0);
+	setPhase(TRAVEL_TO_LAIR);
+	moveTo(missionLairPosition);
+}
+
+void SimHunterController::beginMissionCleanup(bool abandoned,
+		const String& reason) {
+	if (!orderActive || !missionHuntOrder)
+		return;
+
+	orderAbandoned = abandoned;
+	dropTargetObserver();
+	disengageTarget(false);
+	targetOid = 0;
+	missionAddsOverCapCycles = 0;
+	updateMissionAdds(0);
+	missionCleanupRequested = true;
+	setPhase(MISSION_CLEANUP);
+	SimPlayerManager::instance()->requestPveHuntLairCleanup(
+		agent == nullptr ? 0 : agent->getObjectID(), reason);
+	scheduleActiveTick(250);
+}
+
+void SimHunterController::continueAfterMissionCleanup() {
+	if (!orderActive || !missionHuntOrder)
+		return;
+
+	PveHuntLair lair;
+	if (SimPlayerManager::instance()->getPveHuntLair(
+			agent == nullptr ? 0 : agent->getObjectID(), lair)) {
+		scheduleActiveTick(500);
+		return;
+	}
+
+	missionLairOid = 0;
+	missionCleanupRequested = false;
+	beginTravelHome(orderAbandoned);
+}
+
+bool SimHunterController::checkMissionSocialAggro(AiAgent* hunter) {
+	if (!missionHuntOrder || hunter == nullptr || targetOid == 0)
+		return false;
+
+	CreatureObject* target = nullptr;
+	AiAgent* targetAgent = nullptr;
+	if (!targetIsLive(targetOid, target, targetAgent)) {
+		missionAddsOverCapCycles = 0;
+		return false;
+	}
+
+	const CreatureTemplate* targetTemplate = targetAgent->getCreatureTemplate();
+	bool socialTarget = !targetAgent->getSocialGroup().isEmpty() ||
+		(targetTemplate != nullptr && targetTemplate->isHerd());
+	const DeltaVector<ManagedReference<SceneObject*> >* defenders =
+		hunter->getDefenderList();
+	int adds = defenders == nullptr ? 0 : defenders->size();
+	updateMissionAdds(adds);
+
+	if (!socialTarget || adds <= SimPlayerManager::instance()->
+		getPveMissionMaxSimultaneousAdds()) {
+		missionAddsOverCapCycles = 0;
+		return false;
+	}
+
+	++missionAddsOverCapCycles;
+	if (missionAddsOverCapCycles >= SimPlayerManager::instance()->
+		getPveMissionAddsAbandonCycles()) {
+		beginMissionCleanup(true, "social_adds_above_cap");
+		return true;
+	}
+
+	beginRetreat();
+	return true;
+}
+
+void SimHunterController::updateMissionAdds(int adds) {
+	adds = Math::max(0, adds);
+	if (adds == missionAddsEngaged)
+		return;
+
+	missionAddsEngaged = adds;
+	SimPlayerManager::instance()->recordPveHunterMissionAdds(
+		identityId, agent == nullptr ? 0 : agent->getObjectID(), adds);
+}
+
 void SimHunterController::onArrived() {
 	if (agent == nullptr)
 		return;
@@ -261,10 +453,24 @@ void SimHunterController::onArrived() {
 		if (!medDwellComplete) {
 			medDwellComplete = true;
 			applyHunterBuffs(true);
-			setPhase(TRAVEL_OUT);
-			moveTo(species.huntGround);
+			if (missionHuntOrder)
+				beginMissionTerminalLeg();
+			else {
+				setPhase(TRAVEL_OUT);
+				moveTo(species.huntGround);
+			}
 			return;
 		}
+	}
+
+	if (phase == TRAVEL_TO_TERMINAL) {
+		beginMissionAccept();
+		return;
+	}
+
+	if (phase == TRAVEL_TO_LAIR) {
+		beginHunting();
+		return;
 	}
 
 	if (phase == TRAVEL_OUT) {
@@ -310,6 +516,11 @@ void SimHunterController::onArrived() {
 			completeOrder(false, "quota");
 		}
 	}
+
+	if (phase == MISSION_CLEANUP) {
+		continueAfterMissionCleanup();
+		return;
+	}
 }
 
 void SimHunterController::onPathFailed() {
@@ -319,6 +530,21 @@ void SimHunterController::onPathFailed() {
 
 	if (!orderActive)
 		return;
+
+	if (missionHuntOrder && phase == TRAVEL_TO_TERMINAL) {
+		beginMissionFallback();
+		return;
+	}
+
+	if (missionHuntOrder && phase == TRAVEL_TO_LAIR) {
+		beginMissionCleanup(true, "lair_path_failed");
+		return;
+	}
+
+	if (missionHuntOrder && phase == BUFF_UP) {
+		beginMissionCleanup(true, "buff_path_failed");
+		return;
+	}
 
 	if (phase == TRAVEL_OUT || phase == TRAVEL_HOME || phase == BUFF_UP) {
 		completeOrder(true, "path_failed_" + getPhaseName());
@@ -337,6 +563,10 @@ void SimHunterController::onPathFailed() {
 void SimHunterController::beginHunting() {
 	if (!orderActive)
 		return;
+	if (missionHuntOrder && missionLairOid == 0) {
+		beginMissionCleanup(true, "lair_missing_before_hunt");
+		return;
+	}
 
 	if (huntStartedAtMs == 0)
 		huntStartedAtMs = System::getMiliTime();
@@ -357,7 +587,10 @@ void SimHunterController::runActiveTick() {
 			deathReported = true;
 			dropTargetObserver();
 			disengageTarget(false);
-			setPhase(CLONE_HOME);
+			if (missionHuntOrder)
+				beginMissionCleanup(true, "hunter_died");
+			else
+				setPhase(CLONE_HOME);
 			SimPlayerManager::instance()->onPveHunterDied(identityId,
 				strongAgent->getObjectID());
 		}
@@ -378,16 +611,24 @@ void SimHunterController::runActiveTick() {
 	case ANNOUNCE_JOB: phaseTimeoutMs = 120000; break;
 	case BUFF_UP: phaseTimeoutMs = 600000; break;
 	case TRAVEL_OUT: phaseTimeoutMs = 900000; break;
+	case TRAVEL_TO_TERMINAL: phaseTimeoutMs = 900000; break;
+	case ACCEPT_MISSION: phaseTimeoutMs = 600000; break;
+	case TRAVEL_TO_LAIR: phaseTimeoutMs = 900000; break;
 	case AWAITING_WORLD: phaseTimeoutMs = 300000; break;
 	case RETREATING: phaseTimeoutMs = 180000; break;
 	case HEALING: phaseTimeoutMs = 900000; break;
 	case TRAVEL_HOME: phaseTimeoutMs = 900000; break;
+	case MISSION_CLEANUP: phaseTimeoutMs = 120000; break;
 	default: break;
 	}
 	if (phaseTimeoutMs != 0 && phaseStartedAtMs != 0 &&
 			nowMs - phaseStartedAtMs >= phaseTimeoutMs) {
 		if (phase == TRAVEL_HOME)
 			completeOrder(true, "phase_timeout_" + getPhaseName());
+		else if (missionHuntOrder && phase == MISSION_CLEANUP)
+			completeOrder(true, "cleanup_timeout");
+		else if (missionHuntOrder)
+			beginMissionCleanup(true, "phase_timeout_" + getPhaseName());
 		else
 			beginTravelHome(true);
 		return;
@@ -421,9 +662,47 @@ void SimHunterController::runActiveTick() {
 		return;
 	}
 
+	if (missionHuntOrder && phase == TRAVEL_TO_TERMINAL) {
+		if (missionTerminalResolved &&
+				(state == MOVING || state == CALCULATING_PATH))
+			scheduleActiveTick(2000);
+		else
+			beginMissionTerminalLeg();
+		return;
+	}
+
+	if (missionHuntOrder && phase == ACCEPT_MISSION) {
+		if (dwellUntilMs == 0 || nowMs >= dwellUntilMs)
+			spawnMissionLair();
+		else
+			scheduleActiveTick((int)Math::max(100,
+				(int)(dwellUntilMs - nowMs)));
+		return;
+	}
+
+	if (missionHuntOrder && phase == TRAVEL_TO_LAIR) {
+		scheduleActiveTick(2000);
+		return;
+	}
+
+	if (missionHuntOrder && phase == MISSION_CLEANUP) {
+		continueAfterMissionCleanup();
+		return;
+	}
+
 	if (phase == TRAVEL_HOME || phase == DELIVER || phase == DONE) {
 		scheduleActiveTick(1000);
 		return;
+	}
+
+	if (missionHuntOrder && missionLairOid != 0) {
+		PveHuntLair lair;
+		if (!SimPlayerManager::instance()->getPveHuntLair(
+				agent == nullptr ? 0 : agent->getObjectID(), lair) ||
+				!lair.alive || lair.cleanupQueued) {
+			beginMissionCleanup(true, "lair_unavailable");
+			return;
+		}
 	}
 
 	if (huntStartedAtMs != 0 && nowMs - huntStartedAtMs >=
@@ -470,6 +749,9 @@ void SimHunterController::runActiveTick() {
 		beginRetreat();
 		return;
 	}
+
+	if (missionHuntOrder && checkMissionSocialAggro(strongAgent))
+		return;
 
 	if (strongAgent->isInCombat()) {
 		ManagedReference<SceneObject*> defenderScene =
@@ -614,24 +896,40 @@ void SimHunterController::scanForTarget() {
 	if (strongAgent == nullptr || strongAgent->isInCombat())
 		return;
 
-	CloseObjectsVector* closeObjects =
-		(CloseObjectsVector*)strongAgent->getCloseObjects();
-	if (closeObjects == nullptr)
-		return;
+	// Query the zone's QuadTree directly (like the proven spike scan at
+	// SimPlayerManager :9662). getCloseObjects() is NOT maintained for these
+	// spawned/moved bots (same class of gap as NPC updateActiveAreas), so it
+	// returns an empty/stale set even when creatures are right next to the
+	// hunter (lair packs) — the cause of hunters never acquiring a target.
+	Zone* zone = nullptr;
+	Vector3 hunterPosition;
+	{
+		Locker agentLock(strongAgent);
+		zone = strongAgent->getZone();
+		if (zone == nullptr)
+			return;
+		hunterPosition = strongAgent->getWorldPosition();
+	}
 
-	Vector<TreeEntry*> objects;
-	closeObjects->safeCopyReceiversTo(objects, CloseObjectsVector::CREOTYPE);
-	for (int i = 0; i < objects.size(); ++i) {
-		SceneObject* object = static_cast<SceneObject*>(objects.get(i));
+	float scanRadius =
+		SimPlayerManager::instance()->getPveHunterScanRadiusMeters();
+	SortedVector<TreeEntry*> closeObjects;
+	zone->getInRangeObjects(hunterPosition.getX(), hunterPosition.getZ(),
+		hunterPosition.getY(), scanRadius, &closeObjects, true, true);
+
+	for (int i = 0; i < closeObjects.size(); ++i) {
+		SceneObject* object = static_cast<SceneObject*>(closeObjects.get(i));
 		CreatureObject* candidate = object == nullptr ? nullptr :
 			object->asCreatureObject();
 		AiAgent* candidateAgent = candidate == nullptr ? nullptr :
 			candidate->asAiAgent();
 		if (candidate == nullptr || candidateAgent == nullptr ||
-				candidate == strongAgent.get() || !targetMatchesSpecies(candidate) ||
+				candidate == strongAgent.get())
+			continue;
+		if (!targetMatchesSpecies(candidate) ||
 				!candidate->isAttackableBy(strongAgent.get()) ||
-				strongAgent->getDistanceTo(candidate) >
-				SimPlayerManager::instance()->getPveHunterScanRadiusMeters())
+				strongAgent->getWorldPosition().distanceTo(
+					candidate->getWorldPosition()) > scanRadius)
 			continue;
 
 		selectTarget(candidateAgent);
@@ -849,8 +1147,12 @@ void SimHunterController::onHuntDestruction(uint64 destroyedTargetOid,
 	order.kills++;
 	disengageTarget(false);
 	if (order.kills >= order.quota) {
-		beginTravelHome(false);
+		if (missionHuntOrder)
+			beginMissionCleanup(false, "quota");
+		else
+			beginTravelHome(false);
 	} else {
+		updateMissionAdds(0);
 		scheduleActiveTick(1000);
 	}
 }
@@ -859,6 +1161,7 @@ void SimHunterController::handleTargetUnavailable() {
 	dropTargetObserver();
 	targetOid = 0;
 	destructionHandled = false;
+	updateMissionAdds(0);
 	disengageTarget(false);
 	resetCombatGuard();
 	scheduleActiveTick(500);
@@ -866,10 +1169,13 @@ void SimHunterController::handleTargetUnavailable() {
 
 void SimHunterController::beginRetreat() {
 	if (retreatCycles >= SimPlayerManager::instance()->
-			getPveHunterMaxRetreatCycles()) {
+		getPveHunterMaxRetreatCycles()) {
 		dropTargetObserver();
 		disengageTarget(false);
-		beginTravelHome(true);
+		if (missionHuntOrder)
+			beginMissionCleanup(true, "max_retreat_cycles");
+		else
+			beginTravelHome(true);
 		return;
 	}
 
@@ -898,6 +1204,7 @@ void SimHunterController::beginRetreat() {
 	// Retain the observer only for an exact same-target resume. A later fresh
 	// target selection drops it before changing targetOid.
 	disengageTarget(false);
+	updateMissionAdds(0);
 	moveTo(away);
 }
 
@@ -921,7 +1228,8 @@ void SimHunterController::clearStaleCombat(const String& reason) {
 	targetOid = 0;
 	destructionHandled = false;
 	resetCombatGuard();
-	info("SimPveHunterCombatReset identity=" + String::valueOf(identityId) +
+	SimPlayerManager::instance()->info(
+		"SimPveHunterCombatReset identity=" + String::valueOf(identityId) +
 		" reason=" + reason, true);
 }
 
@@ -934,7 +1242,9 @@ void SimHunterController::moveToPatrolPoint(uint64 nowMs) {
 	float radius = 8.f + (float)System::random(20) / 2.f;
 	// Offset X and Y(north); Z is height, set from terrain below. (This
 	// engine's Vector3 is (x, y_north, z_height) — huntGround loads that way.)
-	Vector3 patrol = species.huntGround +
+	Vector3 patrolAnchor = missionHuntOrder && missionLairOid != 0 ?
+		missionLairPosition : species.huntGround;
+	Vector3 patrol = patrolAnchor +
 		Vector3((float)std::cos(angle) * radius,
 			(float)std::sin(angle) * radius, 0.f);
 	// X and Y(north) carry the offset; set Z(height) from terrain. Writing
@@ -950,6 +1260,10 @@ void SimHunterController::moveToPatrolPoint(uint64 nowMs) {
 void SimHunterController::beginTravelHome(bool abandoned) {
 	if (!orderActive)
 		return;
+	if (missionHuntOrder && !missionCleanupRequested && missionLairOid != 0) {
+		beginMissionCleanup(abandoned, "travel_home");
+		return;
+	}
 
 	orderAbandoned = abandoned;
 	// Leaving the hunt always ends the target's observer lifetime. The only
@@ -972,6 +1286,10 @@ void SimHunterController::beginTravelHome(bool abandoned) {
 void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 	if (!orderActive)
 		return;
+	if (missionHuntOrder && !missionCleanupRequested && missionLairOid != 0) {
+		beginMissionCleanup(abandoned, reason);
+		return;
+	}
 
 	dropTargetObserver();
 	disengageTarget(false);
@@ -984,6 +1302,16 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 
 	orderActive = false;
 	orderAbandoned = false;
+	missionHuntOrder = false;
+	missionTerminalFallback = false;
+	missionTerminalResolved = false;
+	missionCleanupRequested = false;
+	missionTerminalPosition = Vector3();
+	missionLairPosition = Vector3();
+	missionLairOid = 0;
+	terminalResolveWaitCycles = 0;
+	missionAddsOverCapCycles = 0;
+	missionAddsEngaged = 0;
 	targetOid = 0;
 	setPhase(DONE);
 	setPhase(IDLE_HOME);

@@ -46,6 +46,30 @@ namespace {
 
 		return classChain.indexOf(query) >= 0;
 	}
+
+	bool lotFieldsMatchFamily(
+			const String& resourceType, const String& classChain,
+			const String& family) {
+		String normalizedType = resourceType.toLowerCase();
+		String normalizedChain = classChain.toLowerCase();
+		String normalizedFamily = family.toLowerCase().trim();
+
+		if (normalizedFamily.isEmpty())
+			return false;
+
+		if (normalizedType == normalizedFamily ||
+				normalizedType.beginsWith(normalizedFamily))
+			return true;
+
+		return !normalizedChain.isEmpty() &&
+			normalizedChain.indexOf(normalizedFamily) >= 0;
+	}
+
+	String spawnLotKey(uint64 resourceSpawnObjectID,
+			const String& acquisitionSource) {
+		return String::valueOf(resourceSpawnObjectID) + "|" +
+			acquisitionSource;
+	}
 }
 
 AiEconomyManager::AiEconomyManager() : Logger("AiEconomyManager") {
@@ -372,8 +396,9 @@ bool AiEconomyManager::updateStockpileSpawnLots(
 		return false;
 	}
 
-	// spawnObjectID -> quantity delta to ADD this flush (P.5.2 increment model).
-	VectorMap<uint64, uint64> deltaSnapshot;
+	// (spawnObjectID, acquisitionSource) -> quantity delta to ADD this flush
+	// (P.5.2 increment model).
+	VectorMap<String, uint64> deltaSnapshot;
 
 	for (int i = 0; i < deposits.size(); ++i) {
 		const AiEconomySpawnLotDeposit& deposit = deposits.get(i);
@@ -413,14 +438,18 @@ bool AiEconomyManager::updateStockpileSpawnLots(
 			return false;
 		}
 
-		if (deltaSnapshot.contains(deposit.resourceSpawnObjectID)) {
+		String depositKey = spawnLotKey(
+			deposit.resourceSpawnObjectID, deposit.acquisitionSource);
+
+		if (deltaSnapshot.contains(depositKey)) {
 			failureReason = "duplicateSpawnDeposit spawn=" +
-				String::valueOf(deposit.resourceSpawnObjectID);
+				String::valueOf(deposit.resourceSpawnObjectID) +
+				" source=" + deposit.acquisitionSource;
 			return false;
 		}
 
 		deltaSnapshot.put(
-			deposit.resourceSpawnObjectID, deposit.quantityDelta);
+			depositKey, deposit.quantityDelta);
 	}
 
 	if (deltaSnapshot.size() == 0)
@@ -446,7 +475,7 @@ bool AiEconomyManager::updateStockpileSpawnLots(
 			lots.add(storedLots->get(i));
 	}
 
-	VectorMap<uint64, ManagedReference<AiEconomyStockpileLot*> > spawnLots;
+	VectorMap<String, ManagedReference<AiEconomyStockpileLot*> > spawnLots;
 
 	for (int i = 0; i < lots.size(); ++i) {
 		ManagedReference<AiEconomyStockpileLot*> lot = lots.get(i);
@@ -458,33 +487,37 @@ bool AiEconomyManager::updateStockpileSpawnLots(
 		}
 
 		uint64 spawnObjectID = 0;
+		String acquisitionSource;
 		String identityConfidence;
 
 		{
 			Locker lotLocker(lot);
 			spawnObjectID = lot->getResourceSpawnObjectId();
+			acquisitionSource = lot->getAcquisitionSource();
 			identityConfidence = lot->getIdentityConfidence();
 		}
 
 		if (spawnObjectID == 0 || identityConfidence != "exact_type")
 			continue;
 
-		if (spawnLots.contains(spawnObjectID)) {
+		String lotKey = spawnLotKey(spawnObjectID, acquisitionSource);
+
+		if (spawnLots.contains(lotKey)) {
 			persistenceReady.set(false);
 			failureReason = "duplicateSpawnLot spawn=" +
-				String::valueOf(spawnObjectID);
+				String::valueOf(spawnObjectID) + " source=" + acquisitionSource;
 			return false;
 		}
 
-		spawnLots.put(spawnObjectID, lot);
+		spawnLots.put(lotKey, lot);
 	}
 
 	int missingLotCount = 0;
 
 	for (int i = 0; i < deltaSnapshot.size(); ++i) {
-		uint64 spawnObjectID = deltaSnapshot.elementAt(i).getKey();
+		String depositKey = deltaSnapshot.elementAt(i).getKey();
 
-		if (!spawnLots.contains(spawnObjectID))
+		if (!spawnLots.contains(depositKey))
 			missingLotCount++;
 	}
 
@@ -500,15 +533,17 @@ bool AiEconomyManager::updateStockpileSpawnLots(
 		for (int i = 0; i < deposits.size(); ++i) {
 			const AiEconomySpawnLotDeposit& deposit = deposits.get(i);
 
-			if (!deltaSnapshot.contains(deposit.resourceSpawnObjectID))
+			String depositKey = spawnLotKey(
+				deposit.resourceSpawnObjectID, deposit.acquisitionSource);
+
+			if (!deltaSnapshot.contains(depositKey))
 				continue;
 
-			uint64 delta =
-				deltaSnapshot.get(deposit.resourceSpawnObjectID);
+			uint64 delta = deltaSnapshot.get(depositKey);
 
-			if (spawnLots.contains(deposit.resourceSpawnObjectID)) {
+			if (spawnLots.contains(depositKey)) {
 				ManagedReference<AiEconomyStockpileLot*> lot =
-					spawnLots.get(deposit.resourceSpawnObjectID);
+					spawnLots.get(depositKey);
 
 				bool lotChanged = false;
 
@@ -583,7 +618,7 @@ bool AiEconomyManager::updateStockpileSpawnLots(
 				newLot, 1, AI_ECONOMY_LOTS_DATABASE);
 
 			newLots.add(newLot);
-			spawnLots.put(deposit.resourceSpawnObjectID, newLot);
+			spawnLots.put(depositKey, newLot);
 			nextEntryID++;
 			createdLots++;
 		}
@@ -1261,6 +1296,113 @@ bool AiEconomyManager::snapshotPersistentConceptualMinerSupplyForDemand(
 	return true;
 }
 
+bool AiEconomyManager::snapshotStockpileTotalsByFamily(
+		const Vector<String>& families,
+		VectorMap<String, uint64>& totalsByFamily,
+		String& status,
+		const String& requiredAcquisitionSource) {
+	totalsByFamily.removeAll();
+	status = "unavailable";
+
+	Locker mutationLocker(&persistenceMutationMutex);
+
+	ManagedReference<AiEconomyData*> data = economyData;
+
+	if (!persistenceReady.get() || data == nullptr)
+		return false;
+
+	Vector<String> normalizedFamilies;
+	for (int familyIndex = 0; familyIndex < families.size(); ++familyIndex) {
+		String family = families.get(familyIndex).toLowerCase().trim();
+
+		if (family.isEmpty() || family.length() > MAX_LABEL_LENGTH) {
+			totalsByFamily.removeAll();
+			status = "invalidFamily";
+			return false;
+		}
+
+		if (normalizedFamilies.contains(family))
+			continue;
+
+		normalizedFamilies.add(family);
+		totalsByFamily.put(family, 0);
+	}
+
+	for (int lotIndex = 0; ; ++lotIndex) {
+		ManagedReference<AiEconomyStockpileLot*> lot;
+
+		// Do not copy the full lot vector or inspection rows. The persistence
+		// mutation mutex keeps the vector stable while each reference is copied;
+		// the data lock is released before taking the lot lock, matching the
+		// existing snapshot lock choreography.
+		{
+			Locker dataLocker(data);
+			Vector<ManagedReference<AiEconomyStockpileLot*> >* storedLots =
+				data->getStockpileLots();
+
+			if (storedLots == nullptr) {
+				totalsByFamily.removeAll();
+				status = "nullStockpileLotVector";
+				return false;
+			}
+
+			if (lotIndex >= storedLots->size())
+				break;
+
+			lot = storedLots->get(lotIndex);
+		}
+
+		if (lot == nullptr) {
+			totalsByFamily.removeAll();
+			status = "nullStockpileLot";
+			return false;
+		}
+
+		String resourceType;
+		String resourceClassChain;
+		String acquisitionSource;
+		String lifecycleState;
+		uint64 quantity = 0;
+
+		{
+			Locker lotLocker(lot);
+			resourceType = lot->getResourceType();
+			resourceClassChain = lot->getResourceClassChain();
+			acquisitionSource = lot->getAcquisitionSource();
+			lifecycleState = lot->getResourceLifecycleState();
+			quantity = lot->getQuantity();
+		}
+
+		if (lifecycleState == "despawned" || quantity == 0)
+			continue;
+
+		if (!requiredAcquisitionSource.isEmpty() &&
+				acquisitionSource != requiredAcquisitionSource)
+			continue;
+
+		for (int familyIndex = 0;
+				familyIndex < normalizedFamilies.size(); ++familyIndex) {
+			String family = normalizedFamilies.get(familyIndex);
+
+			if (!lotFieldsMatchFamily(
+					resourceType, resourceClassChain, family))
+				continue;
+
+			uint64 current = totalsByFamily.get(family);
+			if (quantity > static_cast<uint64>(-1) - current) {
+				totalsByFamily.removeAll();
+				status = "quantityOverflow";
+				return false;
+			}
+
+			totalsByFamily.put(family, current + quantity);
+		}
+	}
+
+	status = "ready";
+	return true;
+}
+
 bool AiEconomyManager::snapshotStockpileInspection(
 		AiEconomyStockpileInspectionSnapshot& snapshot,
 		int maxLotRows,
@@ -1545,6 +1687,7 @@ bool AiEconomyManager::validateEconomyData(
 	uint64 highestEntryID = 0;
 	const char* const acquisitionSources[] = {
 		"conceptual_miner",
+		"pve_hunter",
 		"future_ai_harvester",
 		"market_purchase",
 		"admin_seed",
@@ -1668,7 +1811,7 @@ bool AiEconomyManager::validateEconomyData(
 
 		if (ownerScope.isEmpty() ||
 				!isAllowedValue(
-					acquisitionSource, acquisitionSources, 7) ||
+					acquisitionSource, acquisitionSources, 8) ||
 				!isAllowedValue(lifecycleState, lifecycleStates, 6) ||
 				!isAllowedValue(
 					identityConfidence, confidenceValues, 5)) {

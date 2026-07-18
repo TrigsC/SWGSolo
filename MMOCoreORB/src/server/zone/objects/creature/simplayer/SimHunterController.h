@@ -17,12 +17,16 @@ public:
 		ANNOUNCE_JOB,
 		BUFF_UP,
 		TRAVEL_OUT,
+		TRAVEL_TO_TERMINAL,
+		ACCEPT_MISSION,
+		TRAVEL_TO_LAIR,
 		AWAITING_WORLD,
 		HUNTING,
 		RETREATING,
 		HEALING,
 		TRAVEL_HOME,
 		DELIVER,
+		MISSION_CLEANUP,
 		CLONE_HOME,
 		DONE
 	};
@@ -60,12 +64,30 @@ private:
 	int stalemateSelfHam;
 	int stalemateDefenderHam;
 	int retreatCycles;
+	bool missionHuntOrder;
+	bool missionTerminalFallback;
+	bool missionTerminalResolved;
+	bool missionCleanupRequested;
+	Vector3 missionTerminalPosition;
+	Vector3 missionLairPosition;
+	uint64 missionLairOid;
+	int terminalResolveWaitCycles;
+	int missionAddsOverCapCycles;
+	int missionAddsEngaged;
 
 	void scheduleActiveTick(int delayMs);
 	void runActiveTick();
 	void setPhase(HuntPhase next);
 	void beginBuffUp();
 	void applyHunterBuffs(bool clearWounds);
+	void beginMissionTerminalLeg();
+	void beginMissionFallback();
+	void beginMissionAccept();
+	void spawnMissionLair();
+	void beginMissionCleanup(bool abandoned, const String& reason);
+	void continueAfterMissionCleanup();
+	bool checkMissionSocialAggro(AiAgent* hunter);
+	void updateMissionAdds(int adds);
 	void beginTravelHome(bool abandoned);
 	void beginHunting();
 	void scanForTarget();

@@ -42,6 +42,12 @@ class SimPlayerConfiguredSpawnTask;
 class HiveCrafterConsumerTask;
 class SimHunterController;
 
+enum PveMissionTerminalCityState {
+	PVE_MISSION_TERMINAL_PENDING = 0,
+	PVE_MISSION_TERMINAL_RESOLVED = 1,
+	PVE_MISSION_TERMINAL_ABSENT = 2
+};
+
 struct SimBotIdentity {
 	uint64 id = 0;
 	String firstName;
@@ -105,6 +111,10 @@ struct PveHuntSpecies {
 	String planet;
 	String huntGroundName;
 	Vector3 huntGround;
+	String lairTemplate;
+	int missionDifficulty = 1;
+	int lairBuildingLevel = 1;
+	float lairSize = 20.f;
 	String templateFilter;
 	String requestedResourceType;
 	String harvestKind;
@@ -121,6 +131,35 @@ struct PveHuntSpecies {
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
 
+struct PveMissionTerminalLocation {
+	String planet;
+	String city;
+	Vector3 position;
+	Reference<SceneObject*> terminal;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PveHuntLair {
+	uint64 identityId = 0;
+	uint64 bodyOid = 0;
+	uint64 lairOid = 0;
+	String speciesKey;
+	String planet;
+	float x = 0.f;
+	float y = 0.f;
+	float z = 0.f;
+	uint64 spawnedAtMs = 0;
+	int kills = 0;
+	bool alive = false;
+	bool spawnInProgress = false;
+	bool cleanupQueued = false;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
 struct PveHuntOrder {
 	uint64 identityId = 0;
 	uint64 bodyOid = 0;
@@ -132,11 +171,18 @@ struct PveHuntOrder {
 	String speciesKey;
 	String requestedResourceType;
 	String harvestKind;
+	String demandProfileKey;
+	String missionTerminalPlanet;
+	String missionTerminalCity;
+	Vector3 missionTerminalPosition;
 	String phase = "IDLE_HOME";
 	String status = "ASSIGNED";
 	int quota = 1;
 	int kills = 0;
 	int retreatCycles = 0;
+	int missionAddsEngaged = 0;
+	uint64 expectedYieldUnits = 0;
+	uint64 harvestedUnits = 0;
 	uint64 spawnsTriggeredNearby = 0;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
@@ -364,7 +410,8 @@ struct SimulatedAcquisitionEvent {
 
 // P.5.1: per-resource-spawn running yield accumulated this session, flushed to
 // the persistent galaxy hive stockpile as an exact-identity lot (spawn id +
-// stats). Keyed hive-wide by resource-spawn object id, not by miner.
+// origin + stats). Keyed hive-wide by resource-spawn object id and acquisition
+// origin, not by miner.
 struct MinerSpawnYieldAccumulator {
 	uint64 resourceSpawnObjectId = 0;
 	uint64 sessionQuantity = 0;
@@ -372,6 +419,7 @@ struct MinerSpawnYieldAccumulator {
 	// lot, so each flush adds only the new delta (deposits and consumer draws
 	// then compose instead of overwriting each other).
 	uint64 lastFlushedQuantity = 0;
+	String acquisitionOrigin = "conceptual_miner";
 	String resourceSpawnName;
 	String resourceType;
 	String resourceClassChain;
@@ -591,7 +639,7 @@ private:
 	VectorMap<String, uint64> conceptualMinerTotals;
 	Mutex conceptualMinerTotalsMutex;
 	// P.5.1: exact-identity per-spawn hive deposits (galaxy-scoped).
-	VectorMap<uint64, MinerSpawnYieldAccumulator> spawnYieldAccumulators;
+	VectorMap<String, MinerSpawnYieldAccumulator> spawnYieldAccumulators;
 	Mutex spawnYieldAccumulatorMutex;
 	Vector<SimIntelligentYieldSnapshot> recentIntelligentYields;
 	Mutex recentIntelligentYieldsMutex;
@@ -1207,8 +1255,17 @@ private:
 	VectorMap<uint64, uint64> pvePresenceOids;
 	VectorMap<uint64, uint64> pvePresenceSpawnCounts;
 	Vector<PveHuntSpecies> pveHuntSpecies;
+	Vector<PveMissionTerminalLocation> allMissionTerminals;
+	VectorMap<String, int> missionTerminalCityState;
+	VectorMap<uint64, PveHuntLair> pveHuntLairs;
 	Vector<PveBuffSpec> pveHunterBuffs;
 	VectorMap<uint64, PveHuntOrder> pveHuntOrders;
+	VectorMap<String, uint64> pveSessionHarvestByFamily;
+	VectorMap<String, uint64> pveCreatureSupplyBootBaseline;
+	String pveBaselineState = "pending";
+	String pveBaselineLastError;
+	int pveBaselineRetryCount = 0;
+	uint64 pveBaselineNextRetryMs = 0;
 	VectorMap<uint64, bool> pveDeathsReportedBodyOids;
 	uint64 pvePresenceSpawnTotal = 0;
 	uint64 pveHunterKillsTotal = 0;
@@ -1219,6 +1276,8 @@ private:
 	uint64 pveHunterAnnouncementsTotal = 0;
 	uint64 pveHunterLastAnnounceMs = 0;
 	uint64 pveHunterLastSiteAnnounceMs = 0;
+	uint64 pveMissionLairsSpawned = 0;
+	uint64 pveMissionLairsCleaned = 0;
 	VectorMap<uint64, uint64> pveHunterLastAnnounceByIdentity;
 	std::shared_ptr<const PvePresenceSnapshot> pvePresenceSnapshot;
 	Mutex pveMutex;
@@ -1227,8 +1286,32 @@ private:
 
 	bool pveEnabled = false;
 	bool pveHunterBotsEnabled = false;
+	bool pveMissionHuntEnabled = false;
+	float pveMissionSpawnDistanceMeters = 200.f;
+	float pveMissionTerminalScanRadiusMeters = 600.f;
+	int pveMissionMaxSpawnPointTries = 32;
+	int pveMissionMaxSimultaneousAdds = 1;
+	int pveMissionAddsAbandonCycles = 3;
+	int pveMissionTerminalDwellSeconds = 5;
+	int pveMissionTerminalResolveWaitCycles = 10;
+	int pveMissionLairTimeoutSeconds = 1800;
+	int pveMissionMaxActiveLairs = 6;
 	bool pveWorldPresenceEnabled = false;
 	bool pveSpikeEnabled = false;
+	bool pveAcquisitionLedgerEnabled = false;
+	bool pveAcquisitionLedgerMinerCreatureExclusion = true;
+	Vector<String> pveAcquisitionLedgerCreatureFamilies;
+	Vector<String> pveAcquisitionLedgerCreatureClassMarkers;
+	VectorMap<String, uint64> pveAcquisitionLedgerFamilyReserveTargets;
+	uint64 pveAcquisitionLedgerFamilyReserveCap = 5000;
+	VectorMap<String, uint64> pveAcquisitionLedgerFamilyAllocationCeilingUnits;
+	VectorMap<String, float> pveAcquisitionLedgerFamilyAllocationCeilingFractions;
+	float pveAcquisitionLedgerReservePressureFloor = 25.f;
+	int pveAcquisitionLedgerHuntTimeEstimateSeconds = 600;
+	uint64 pveAcquisitionLedgerBaselineRetryBackoffMs = 5000;
+	bool pveTurfSplitEffective = false;
+	bool pveTurfSplitEffectiveLatched = false;
+	bool pveTurfSplitGateWarningIssued = false;
 	int pveMaxHunters = 6;
 	int pveSkillTier = 1;
 	int pveMaintenanceIntervalSeconds = 30;
@@ -1282,6 +1365,15 @@ private:
 	AiAgent* spawnPveIdentityBody(const SimBotIdentity& identity);
 	void recordPveHunterHarvest(uint64 identityId, uint64 targetOid,
 		const String& harvestKind, const String& requestedResourceType);
+	// Copies reservations and the monotonic session harvest tally under one
+	// pveMutex acquisition so demand math observes one consistent ledger point.
+	void computeReservedInboundByProfileFamily(
+		VectorMap<String, uint64>& reservedInboundByProfileFamily,
+		VectorMap<String, uint64>& sessionHarvestByFamily);
+	bool preparePveCreatureFamilySupply(
+		const Vector<String>& creatureFamilies,
+		const VectorMap<String, uint64>& sessionHarvestByFamily,
+		VectorMap<String, uint64>& familySupplyByFamily);
 	void clearPveHunterOrderLocked(uint64 identityId, const String& status);
 	void runPveSpikeIfNeeded(uint64 nowMs);
 	void advancePveSpike(uint64 nowMs);
@@ -1295,6 +1387,15 @@ private:
 	bool publishSimPresenceMember(uint64 oid);
 	void removeSimPresenceMemberAfterWorldExit(uint64 oid, uint64 nowMs);
 	void drainSimPresenceBodies(uint64 nowMs);
+	void resolvePveMissionTerminals();
+	void configurePveMissionTerminalCitiesLocked(
+		const Vector<PveHuntSpecies>& species);
+	bool choosePveHuntSpawnPoint(const PveHuntSpecies& species,
+		const Vector3& missionPos, Vector3& spawnPos, Zone*& zoneOut);
+	void runPveHuntLairJanitor(uint64 nowMs);
+	void queuePveHuntLairCleanup(uint64 bodyOid, const String& reason);
+	void finishPveHuntLairCleanup(uint64 bodyOid, uint64 lairOid,
+		const String& reason);
 	JSONSerializationType getPveActivityDashboard();
 	JSONSerializationType getPveSpikeDashboard();
 
@@ -1314,7 +1415,8 @@ private:
 	// persistence task and flushed to the galaxy hive stockpile.
 	void recordSpawnIdentifiedMinerYield(const MinerIntelligentTargetAssignment& assignment, int amount);
 	void collectSpawnYieldAccumulators(Vector<MinerSpawnYieldAccumulator>& accumulators);
-	void markSpawnYieldFlushed(uint64 resourceSpawnObjectId, uint64 flushedQuantity);
+	void markSpawnYieldFlushed(const String& accumulatorKey,
+		uint64 flushedQuantity);
 	void recordResourceAwareConceptualStockpileYield(const SimIntelligentYieldSnapshot& snapshot);
 	void logConceptualMinerSummary();
 	void scheduleResourceIntelligenceTask();
@@ -1344,7 +1446,8 @@ private:
 	// P.5.3: shared demand-state compute (extracted from logDemandStateSimulations)
 	// so the crafter consumer selects targets from the same source of truth.
 	void computeDemandStateResults(Vector<DemandStateSimulationResult>& results,
-		bool& activeSnapshotAvailable, String& snapshotError);
+		bool& activeSnapshotAvailable, String& snapshotError,
+		bool logPersistentSummary = true);
 	void refreshDemandStateSimulationConfig();
 	void applyDemandStateSimulationConfig(LuaObject& demandStateConfig);
 	void scheduleMarketSupplyObservationTask();
@@ -1832,6 +1935,18 @@ public:
 	void recordPveHunterAbandoned(uint64 identityId, uint64 bodyOid,
 		const String& reason);
 	void recordPveHunterCompleted(uint64 identityId, uint64 bodyOid);
+	bool getNearestMissionTerminal(const String& planet, const String& city,
+		const Vector3& fromPosition, PveMissionTerminalLocation& result,
+		int& cityState);
+	bool spawnPveHuntLair(uint64 bodyOid, const PveHuntSpecies& species,
+		const Vector3& missionPos);
+	bool getPveHuntLair(uint64 bodyOid, PveHuntLair& result);
+	void requestPveHuntLairCleanup(uint64 bodyOid, const String& reason);
+	void recordPveHunterMissionTerminal(uint64 identityId, uint64 bodyOid,
+		const String& planet, const String& city, const Vector3& position);
+	void recordPveHunterMissionAdds(uint64 identityId, uint64 bodyOid,
+		int adds);
+	bool isPveMissionHuntEnabled() const { return pveMissionHuntEnabled; }
 	bool getPveHunterSpecies(const String& key, PveHuntSpecies& species);
 	bool getPveHunterOrder(uint64 identityId, PveHuntOrder& order);
 	void getPveHunterBuffs(Vector<PveBuffSpec>& buffs);
@@ -1843,6 +1958,18 @@ public:
 	int getPveHunterTimeoutSeconds() const { return pveHuntTimeoutSeconds; }
 	float getPveHunterScanRadiusMeters() const { return pveHunterScanRadiusMeters; }
 	float getPveHunterWeaponRangeMeters() const { return pveHunterWeaponRangeMeters; }
+	int getPveMissionTerminalDwellSeconds() const {
+		return pveMissionTerminalDwellSeconds;
+	}
+	int getPveMissionTerminalResolveWaitCycles() const {
+		return pveMissionTerminalResolveWaitCycles;
+	}
+	int getPveMissionMaxSimultaneousAdds() const {
+		return pveMissionMaxSimultaneousAdds;
+	}
+	int getPveMissionAddsAbandonCycles() const {
+		return pveMissionAddsAbandonCycles;
+	}
 	int getPveHunterAnnounceCooldownSeconds() const { return pveAnnounceCooldownSeconds; }
 	bool getPveHomeLocations(const String& planet, const String& city,
 		Vector3& cantina, Vector3& medCenter, Vector3& home);
