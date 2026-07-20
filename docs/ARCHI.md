@@ -223,7 +223,11 @@ unfamiliar change:
 - **`bin/scripts/ai/`** — NPC behavior trees (e.g. `simMiner.lua`, a
   deliberately no-op tree that cedes movement entirely to this fork's C++
   `SimPlayerController`, avoiding a dual-driver conflict with the default
-  `GeneratePatrol` wander behavior).
+  `GeneratePatrol` wander behavior). `simHunter.lua`/`simPvp.lua` override **only**
+  the IDLE slot, so the root falls back to `rootDefault` and the combat
+  attack/target sockets stay live — the C++ controller drives movement while the
+  stock tree drives combat (the controller must call `activateAiBehavior(true)`
+  on engage to wake that tree promptly).
 - **`bin/scripts/screenplays/`** — quest/event/world-state scripts (themepark,
   villages, spawners, custom one-offs like `market_seeder.lua`).
 - **`bin/scripts/commands/`, `object/`, `mobile/`, `skills/`** — command
@@ -247,7 +251,9 @@ unfamiliar change:
   `SimPlayerManager.cpp`) assemble the actual JSON payload sections
   (`minerActivity`, `coveragePlanner`, `minerRecovery`,
   `pathValidationDiagnostics`, `simulatedAcquisition`, `vehicleMechanics`,
-  `stationTravel`, ...) consumed by the dashboard frontend.
+  `stationTravel`, `pveActivity`, ...) consumed by the dashboard frontend. The
+  SPA is hash-routed (`#/command`, `#/warfront`, `#/wilds` for live PvE hunter
+  positions, ...).
 - **Frontend**: `bin/web/aieconomy-dashboard/` — static `index.html` +
   `app.js` + `styles.css`, no build step, deployed by copying files
   in-place (instant, no server restart needed for frontend-only changes).
@@ -282,6 +288,19 @@ This is this fork's primary custom subsystem, layered on top of the stock
   design doc §13.1 lesson).
 - **`SimPvPController.{h,cpp}`** — the PvP/combat-oriented sibling
   controller for AI squads (see §13).
+- **`SimHunterController.{h,cpp}`** — the PvE hunter controller (P.8). Drives a
+  mission-terminal hunt loop (travel → accept destroy mission → real lair spawn →
+  pull → kill → simulated harvest) that closes the crafter→hunter demand loop via
+  the acquisition/demand ledger. Combat is **real** (`CombatManager::startCombat`
+  with an AI-aligned rifle; wild creatures retaliate) but loot stays simulated.
+  Hunter-opt-in navmesh/overland hybrid movement (`usesNavmeshHybridMovement()`,
+  base false so miners/PvP are unchanged): navmesh inside cities, overland in the
+  wild. Bodies spawn `PLAYER | ATTACKABLE` and force faction 0 so wildlife fights
+  them while `isAttackableBy` keeps real players from attacking the neutral bot;
+  they use a neutral combat mob template (`death_watch_wraith` + `rifle_t21`,
+  configured in `sim_player_manager.lua`). Combat firing is woken via
+  `activateAiBehavior(true)` on engage. Design doc:
+  `docs/ai-pve-playerbot-design.md`.
 - **Everything here is simulation-only by explicit owner policy**: no real
   inventory/credit/market/persistence mutation happens from this layer until
   an economy-mutation phase is explicitly approved. New work here defaults

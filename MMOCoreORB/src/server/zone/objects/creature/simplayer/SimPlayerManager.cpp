@@ -64,6 +64,8 @@
 
 #define DEBUG_SIMPLAYER
 
+static String prettyPveHunterSiteName(const String& name);
+
 class SimMinerSummaryTask : public Task {
 public:
     void run() override {
@@ -5641,6 +5643,8 @@ void SimPlayerManager::loadLuaConfig() {
 	pveMissionTerminalResolveWaitCycles = 10;
 	pveMissionLairTimeoutSeconds = 1800;
 	pveMissionMaxActiveLairs = 6;
+	pveNavmeshModeDebounceTicks = 2;
+	pveNavmeshRepathTries = 3;
 	pveWorldPresenceEnabled = false;
 	pveSpikeEnabled = false;
 	pveAcquisitionLedgerEnabled = false;
@@ -6661,6 +6665,12 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		pveMissionMaxActiveLairs = clampMinerInt(
 			missionHuntConfig.getIntField("maxActiveLairs"),
 			pveMissionMaxActiveLairs, 0, 64);
+		pveNavmeshModeDebounceTicks = clampMinerInt(
+			missionHuntConfig.getIntField("navmeshModeDebounceTicks"),
+			pveNavmeshModeDebounceTicks, 1, 20);
+		pveNavmeshRepathTries = clampMinerInt(
+			missionHuntConfig.getIntField("navmeshRepathTries"),
+			pveNavmeshRepathTries, 1, 20);
 	}
 	missionHuntConfig.pop();
 	pveWorldPresenceEnabled = pveConfig.getBooleanField(
@@ -7591,9 +7601,9 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity) 
 		agent->setFaction(0);
 		// createCreature already filled the default_weapon slot (an unarmed
 		// creature weapon), so a raw transfer to slot 4 fails. Remove the
-		// stock weapon first, then equip our rifle and set BOTH pointers
-		// (combat leaf actions read currentWeapon; defaultWeapon alone is not
-		// enough - the equip failing is what made the spike bot unarmed).
+		// stock weapon first, then equip our rifle and align every AI weapon
+		// slot. Combat leaf actions read currentWeapon, while ranged attack-map
+		// filtering reads primaryWeapon.
 		ManagedReference<WeaponObject*> stockWeapon = agent->getDefaultWeapon();
 		if (stockWeapon != nullptr && stockWeapon != weapon) {
 			Locker stockLock(stockWeapon, agent);
@@ -7601,10 +7611,24 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity) 
 			stockWeapon->destroyObjectFromDatabase(true);
 		}
 		if (agent->transferObject(weaponObject, 4)) {
+			agent->setPrimaryWeapon(weapon);
 			agent->setDefaultWeapon(weapon);
-			agent->setCurrentWeapon(weapon);
-			equipped = agent->getDefaultWeapon() == weapon &&
-				agent->getCurrentWeapon() == weapon;
+			// Clear the destroyed template weapon before asking the AI to
+			// equip its replacement; equipPrimaryWeapon() then performs the
+			// normal current-weapon transition against the new default slot.
+			agent->setCurrentWeapon(nullptr);
+			agent->setWeapon(weapon, false);
+			// Rebuild the derived combat data after replacing the template's
+			// unarmed primary. The defaultattack command is weapon-driven, and
+			// the recreated attack maps retain any ranged actions supplied by
+			// the mobile template.
+			agent->setWeaponStats();
+			agent->setupAttackMaps();
+			agent->equipPrimaryWeapon();
+			equipped = agent->getPrimaryWeapon() == weapon &&
+				agent->getDefaultWeapon() == weapon &&
+				agent->getCurrentWeapon() == weapon &&
+				agent->getWeapon() == weapon && weapon->isRangedWeapon();
 		}
 		if (identity.deaths > 0 && pveCloneWoundAmount > 0) {
 			for (uint8 pool = CreatureAttribute::HEALTH;
@@ -7618,8 +7642,15 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity) 
 		agent->setSimAlwaysActive(true);
 		agent->setSimPlayerBot(true);
 		// Presence-enabled bodies must carry PLAYER even when the optional
-		// client-dot presentation setting is disabled.
-		applySimNpcPresentation(agent, ObjectFlag::PLAYER);
+		// client-dot presentation setting is disabled. ATTACKABLE is REQUIRED
+		// for two-way combat: AiAgent::isAttackableBy rejects any target whose
+		// pvpStatusBitmask lacks ATTACKABLE (AiAgentImplementation.cpp:6578), so
+		// without it a wild creature's inflictDamage never addDefender()s the
+		// hunter and the fight stays one-sided (no retaliation). The neutral
+		// (faction 0) hunter then passes the faction-0 AI-vs-AI checks. OVERT is
+		// a GCW flag the neutral hunter does not need (cf. the factioned sim
+		// combatants which use ATTACKABLE|OVERT).
+		applySimNpcPresentation(agent, ObjectFlag::PLAYER | ObjectFlag::ATTACKABLE);
 	}
 	if (!equipped) {
 		// Never publish or place a body that combat cannot arm.
@@ -9387,20 +9418,13 @@ void SimPlayerManager::announcePveHunterEvent(uint64 bodyOid,
 	if (chatManager == nullptr)
 		return;
 
-	String line;
-	switch (System::random(2)) {
-	case 0:
-		line = "A hunter is working the " + site + " grounds.";
-		break;
-	case 1:
-		line = "A hunting contract is active near the " + site + ".";
-		break;
-	default:
-		line = "A hunter has moved out to the " + site + " hunting grounds.";
-		break;
+	String line = detail;
+	if (line.isEmpty()) {
+		String readableSite = prettyPveHunterSiteName(site);
+		line = readableSite.isEmpty() ?
+			"A hunter is working a hunting ground." :
+			"A hunter is working the " + readableSite + " grounds.";
 	}
-	if (!detail.isEmpty())
-		line += " " + detail;
 	chatManager->broadcastChatMessage(agent, UnicodeString(line), 0, 0,
 		agent->getMoodID());
 }
@@ -27332,8 +27356,22 @@ int SimPlayerManager::findShuttleportIndex(const String& planet, const String& c
 // Lowercase config city names use underscores ("mos_eisley") - make them
 // speakable for the route callouts.
 static String prettyPvpCityName(const String& name) {
-    String pretty = name;
-    return pretty.replaceAll("_", " ");
+	String pretty = name;
+	return pretty.replaceAll("_", " ");
+}
+
+// Hunter species/site keys are configuration identifiers, not player-facing
+// prose (for example, "tatooine_womprat_meat"). Keep the fallback
+// announcement readable without changing the identity of the configured site.
+static String prettyPveHunterSiteName(const String& name) {
+	String pretty = name;
+	int separator = pretty.lastIndexOf(':');
+	if (separator >= 0)
+		pretty = pretty.subString(separator + 1);
+	separator = pretty.lastIndexOf('/');
+	if (separator >= 0)
+		pretty = pretty.subString(separator + 1);
+	return pretty.replaceAll("_", " ");
 }
 
 bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,

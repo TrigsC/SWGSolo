@@ -101,6 +101,11 @@ private:
 	void finishRetreatMove();
 	void resetCombatGuard();
 	void clearStaleCombat(const String& reason);
+	// Fight back at an attacker that intercepts the hunter mid-travel (not the
+	// mission target). Returns true if it handled combat this tick (caller
+	// should return); false if there is nothing reachable to fight (combat is
+	// shed so the movement layer resumes the interrupted leg).
+	bool defendAgainstInterceptor(AiAgent* hunter);
 	bool isBelowRetreatThreshold(AiAgent* hunter) const;
 	bool isReadyToResume(AiAgent* hunter) const;
 	bool targetIsLive(uint64 oid, CreatureObject*& target,
@@ -119,6 +124,14 @@ public:
 	void onPathFailed() override;
 	void onTick() override;
 	bool shouldContinueArrivalChecks() const override;
+	bool usesNavmeshHybridMovement() const override { return true; }
+	// Only resume a hybrid travel leg while the order is genuinely active and
+	// not tearing down its lair. Once the order completes/abandons/times out
+	// (orderActive=false) or enters cleanup, the preserved finalDestination must
+	// not revive movement toward the finished target (code-review Major).
+	bool shouldResumeHybridTravel() const override {
+		return hasFinalDestination && orderActive && !missionCleanupRequested;
+	}
 
 	void startOrder(const PveHuntOrder& newOrder,
 		const PveHuntSpecies& newSpecies);

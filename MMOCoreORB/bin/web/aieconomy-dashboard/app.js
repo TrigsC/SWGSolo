@@ -991,6 +991,56 @@
       </div>`;
   }
 
+  /* ---------------- WILDS (pve hunter positions) ---------------- */
+
+  function pageWilds(d) {
+    const pve = d.pveActivity || {};
+    const roster = Array.isArray(pve.roster) ? pve.roster : [];
+    const attached = roster.filter((r) => r.bodyAttached).length;
+    const active = roster.filter((r) => String(r.phase || "IDLE_HOME") !== "IDLE_HOME").length;
+    const rows = roster.map((r) => {
+      const phase = String(r.phase || "IDLE_HOME");
+      const planet = String(r.posPlanet || "");
+      const coords = [r.posX, r.posY, r.posZ].map(Number);
+      const hasPosition = Boolean(planet) && coords.every((v) => Number.isFinite(v));
+      const name = r.name || [r.firstName, r.lastName].filter(Boolean).join(" ") || "Hunter #" + (r.identityId || "?");
+      const way = hasPosition
+        ? "/way " + coords.map((v) => v.toFixed(1)).join(" ")
+        : "";
+      const position = hasPosition
+        ? `<span class="t-main">${coords[0].toFixed(1)} / ${coords[1].toFixed(1)}</span><span class="t-sub">z ${coords[2].toFixed(1)}</span>`
+        : `<span class="muted">position unavailable</span>`;
+      return `<tr>
+        <td><span class="t-main">${esc(name)}</span><span class="t-sub">${r.bodyAttached ? "body attached" : "identity only"}</span></td>
+        <td>${chip(labelize(phase), /HUNT|TRAVEL|RETREAT|MISSION/i.test(phase) ? "teal" : "ghost")}</td>
+        <td>${hasPosition ? esc(labelize(planet)) : `<span class="muted">in transit</span>`}</td>
+        <td class="t-num">${position}</td>
+        <td>${hasPosition ? `<code class="way-code">${esc(way)}</code>` : `<span class="muted">n/a</span>`}</td>
+      </tr>`;
+    }).join("");
+
+    return `
+      <div class="page-title"><h2>WILDS</h2><span class="page-sub">live PvE hunter positions and movement phases</span></div>
+      <div class="grid">
+        <section class="panel span-12"><header><h3>HUNTER FIELD SUMMARY</h3>
+          <span class="panel-tag">${pve.enabled ? "active" : "stand-down"} · refreshes with telemetry</span></header>
+          <div class="panel-body"><div class="metric-row">
+            ${metric("Hunters", roster.length, { tone: "accent" })}
+            ${metric("Attached Bodies", attached)}
+            ${metric("Active Orders", active)}
+            ${metric("Kills", pve.hunterKillsTotal)}
+            ${metric("Harvest Units", pve.hunterHarvestUnitsTotal)}
+            ${metric("Deaths", pve.hunterDeathsTotal, { tone: Number(pve.hunterDeathsTotal || 0) ? "warn" : "" })}
+          </div></div>
+        </section>
+        ${panel("HUNTER POSITION FEED", `${roster.length} identities · ${active} active`,
+          table(["Hunter", "Phase", "Planet", "X / Y", "/way"], rows, { scrollKey: "wilds-roster", tall: true }))}
+        <section class="panel span-12"><div class="panel-body wilds-note">
+          <span class="muted small">Coordinates are read-only live positions. Select the visible <code class="way-code">/way</code> text and paste it in-game; unavailable positions indicate a body or zone transition.</span>
+        </div></section>
+      </div>`;
+  }
+
   /* ---------------- TELEMETRY (diagnostics) ---------------- */
 
   function pageTelemetry(d) {
@@ -1144,6 +1194,7 @@
     supply: `<svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor"><rect x="2.5" y="6" width="11" height="7"/><path d="M2.5 6L8 2.5 13.5 6M8 6v7"/></svg>`,
     transit: `<svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor"><path d="M2 11c3-6 9-6 12 0"/><circle cx="8" cy="5" r="1.4" fill="currentColor"/><path d="M4 13.5h8"/></svg>`,
     warfront: `<svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor"><path d="M8 2l5 2v4c0 3-2.2 5-5 6-2.8-1-5-3-5-6V4z"/><path d="M5.7 8l1.6 1.6L10.6 6"/></svg>`,
+    wilds: `<svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor"><path d="M2 12.5l3.2-4 2.1 2 2.6-5 4.1 7"/><path d="M2 14h12"/><circle cx="11.9" cy="3.2" r="1.2"/></svg>`,
     telemetry: `<svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor"><path d="M2 8h3l1.5-4 3 8L11 8h3"/></svg>`,
     mainframe: `<svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor"><rect x="3" y="2.5" width="10" height="11"/><path d="M6 5.5h4M6 8h4M6 10.5h2"/></svg>`
   };
@@ -1154,6 +1205,7 @@
     { id: "supply", label: "SUPPLY", render: pageSupply },
     { id: "transit", label: "TRANSIT", render: pageTransit },
     { id: "warfront", label: "WARFRONT", render: pageWarfront },
+    { id: "wilds", label: "WILDS", render: pageWilds },
     { id: "telemetry", label: "TELEMETRY", render: pageTelemetry },
     { id: "mainframe", label: "MAINFRAME", render: pageMainframe }
   ];

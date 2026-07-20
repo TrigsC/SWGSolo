@@ -659,10 +659,19 @@ SimPlayerManagerConfig = {
             huntTimeEstimateSeconds = 600,
             baselineRetryBackoffMs = 5000,
         },
-        bodyTemplates = { "artisan" },
+        -- Combat template (not artisan): artisan has NO combat skills/attacks, so
+        -- the AI limped along on defaultattack and did ~15 dmg. death_watch_wraith
+        -- is a high-level NEUTRAL Mandalorian mercenary -- socialGroup "death_watch",
+        -- NOT a GCW faction, so no rebel/imperial "faction character" walking around
+        -- -- with master rifleman/marksman attacks that match the equipped T-21
+        -- rifle (so setupAttackMaps populates real ranged specials) plus large
+        -- HAM/resists so it survives interceptors and kills reliably. The C++ spawn
+        -- still overrides faction to 0 so it attacks / is attacked by wildlife.
+        bodyTemplates = { "death_watch_wraith" },
         hunterLoadout = {
             -- Explicitly created and equipped by the C++ hunter spawn path.
-            weaponTemplate = "object/weapon/ranged/rifle/rifle_cdef.iff",
+            -- T-21 rifle: matches the wraith's rifleman/marksman attack maps.
+            weaponTemplate = "object/weapon/ranged/rifle/rifle_t21.iff",
         },
         buffs = {
             {
@@ -671,7 +680,7 @@ SimPlayerManagerConfig = {
                 durationSeconds = 7200,
                 type = 2, -- BuffType::MEDICAL
                 attribute = 0, -- CreatureAttribute::HEALTH
-                modifier = 100,
+                modifier = 2500, -- realistic doctor-tier enhance (was 100 = imperceptible)
             },
             {
                 name = "pve_hunter_action",
@@ -679,7 +688,7 @@ SimPlayerManagerConfig = {
                 durationSeconds = 7200,
                 type = 2, -- BuffType::MEDICAL
                 attribute = 3, -- CreatureAttribute::ACTION
-                modifier = 100,
+                modifier = 2500, -- realistic doctor-tier enhance (was 100 = imperceptible)
             },
             {
                 name = "pve_hunter_mind",
@@ -687,7 +696,7 @@ SimPlayerManagerConfig = {
                 durationSeconds = 7200,
                 type = 3, -- BuffType::PERFORMANCE
                 attribute = 6, -- CreatureAttribute::MIND
-                modifier = 100,
+                modifier = 2500, -- realistic entertainer-tier enhance (was 100 = imperceptible)
             },
         },
         combat = {
@@ -716,6 +725,8 @@ SimPlayerManagerConfig = {
             terminalResolveWaitCycles = 10,
             lairTimeoutSeconds = 1800,
             maxActiveLairs = 6,
+            navmeshModeDebounceTicks = 2,
+            navmeshRepathTries = 3,
         },
         -- Each ground is a real SPAWNAREA from the planet region scripts;
         -- C++ validates the object, terrain/boundary, and P.4.1 guards once

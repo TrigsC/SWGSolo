@@ -15,6 +15,7 @@
 #include "server/zone/objects/creature/ai/Creature.h"
 #include "server/zone/objects/creature/buffs/Buff.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
+#include "server/zone/managers/combat/CombatManager.h"
 #include "templates/params/ObserverEventType.h"
 #include "server/zone/objects/creature/buffs/BuffType.h"
 #include "templates/params/creature/CreatureAttribute.h"
@@ -161,6 +162,8 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 
 	dropTargetObserver();
 	disengageTarget(false);
+	advanceWorkLoopGeneration("hunterStartOrder");
+	resetHybridMovementState(true);
 	order = newOrder;
 	species = newSpecies;
 	orderActive = true;
@@ -193,9 +196,39 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 }
 
 void SimHunterController::onTick() {
-	// Active decisions are deliberately driven by the adaptive hunter task,
-	// not the base arrival cadence. This hook remains empty so the shared
-	// movement check cannot create a second combat driver.
+	// Self-defense hook, run on the arrival cadence (checkArrival calls onTick),
+	// which stays live through BOTH travel and the lair stand (orderActive keeps
+	// the arrival loop rescheduling). The mission-target engagement is driven by
+	// the active tick; this covers the gap that tick canNOT: fighting back at
+	// WHATEVER is actually attacking the hunter, not only its acquired mission
+	// target. Two owner-observed deaths both reduce to that gap:
+	//   * an interceptor on a pure movement leg — TRAVEL_TO_LAIR leaves the
+	//     active tick DORMANT (spawnMissionLair moves without rescheduling it); and
+	//   * a creature (e.g. a baby womp rat) that aggros at the lair BEFORE the
+	//     hunter acquires a target — scanForTarget early-returns while in combat,
+	//     so the hunter is stuck in combat, never scanning, and dies.
+	// It never moves the bot (no second movement driver).
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr)
+		return;
+
+	// RETREATING flees and HEALING recovers; both own their combat/movement.
+	if (phase == RETREATING || phase == HEALING)
+		return;
+
+	if (!strongAgent->isInCombat())
+		return;
+
+	// A live acquired mission target is driven by the active-tick HUNTING
+	// handler — don't fight over it. Otherwise defend against the real attacker.
+	if (targetOid != 0) {
+		CreatureObject* missionTarget = nullptr;
+		AiAgent* missionTargetAgent = nullptr;
+		if (targetIsLive(targetOid, missionTarget, missionTargetAgent))
+			return;
+	}
+
+	defendAgainstInterceptor(strongAgent);
 }
 
 bool SimHunterController::shouldContinueArrivalChecks() const {
@@ -245,12 +278,16 @@ void SimHunterController::applyHunterBuffs(bool clearWounds) {
 		if (spec.crc == 0)
 			continue;
 
+		// Refreshes replace the prior effect before applying the new modifier;
+		// this prevents repeated mission ticks from stacking the same buff.
+		strongAgent->removeBuff(spec.crc);
 		Reference<Buff*> buff = new Buff(strongAgent.get(), spec.crc,
 			spec.durationSeconds, spec.buffType);
 		// @preLocked Buff contract: construct under the agent lock, lock the
 		// Buff before touching modifiers, and retain that lock through addBuff.
 		Locker buffLock(buff);
 		buff->setAttributeModifier(spec.attribute, spec.modifier);
+		buff->setFillAttributesOnBuff(true);
 		strongAgent->addBuff(buff);
 	}
 }
@@ -309,6 +346,9 @@ void SimHunterController::beginMissionAccept() {
 		return;
 
 	setPhase(ACCEPT_MISSION);
+	SimPlayerManager::instance()->announcePveHunterEvent(
+		agent == nullptr ? 0 : agent->getObjectID(), species.key,
+		"Signed on for a " + species.harvestKind + " hunting contract.");
 	dwellUntilMs = System::getMiliTime() +
 		static_cast<uint64>(SimPlayerManager::instance()->
 			getPveMissionTerminalDwellSeconds()) * 1000;
@@ -340,6 +380,9 @@ void SimHunterController::spawnMissionLair() {
 	missionAddsOverCapCycles = 0;
 	updateMissionAdds(0);
 	setPhase(TRAVEL_TO_LAIR);
+	SimPlayerManager::instance()->announcePveHunterEvent(
+		agent->getObjectID(), species.key,
+		"Moving out to the " + species.harvestKind + " lair.");
 	moveTo(missionLairPosition);
 }
 
@@ -349,12 +392,15 @@ void SimHunterController::beginMissionCleanup(bool abandoned,
 		return;
 
 	orderAbandoned = abandoned;
+	// Close the resume gate BEFORE disengaging so an arrival tick that acquires
+	// the agent lock right after disengage cannot revive movement toward the
+	// lair being torn down (code-review round 2).
+	missionCleanupRequested = true;
 	dropTargetObserver();
 	disengageTarget(false);
 	targetOid = 0;
 	missionAddsOverCapCycles = 0;
 	updateMissionAdds(0);
-	missionCleanupRequested = true;
 	setPhase(MISSION_CLEANUP);
 	SimPlayerManager::instance()->requestPveHuntLairCleanup(
 		agent == nullptr ? 0 : agent->getObjectID(), reason);
@@ -526,6 +572,7 @@ void SimHunterController::onArrived() {
 void SimHunterController::onPathFailed() {
 	// The base leaves the agent in CALCULATING_PATH; reset it or a failed
 	// retreat/patrol path wedges the controller until the phase TTL fires.
+	clearHybridMovementOnCancellation();
 	state = IDLE;
 
 	if (!orderActive)
@@ -1000,7 +1047,7 @@ void SimHunterController::engageTarget() {
 
 	CreatureObject* target = nullptr;
 	AiAgent* targetAgent = nullptr;
-	if (!targetIsLive(targetOid, target, targetAgent) ||
+	if (!targetIsLive(targetOid, target, targetAgent) || targetAgent == nullptr ||
 			!target->isAttackableBy(agent.get()))
 		return;
 
@@ -1016,11 +1063,18 @@ void SimHunterController::engageTarget() {
 		return;
 
 	Locker agentLock(agent);
-	Locker targetLock(target, agent);
+	if (!CombatManager::instance()->startCombat(agent, target))
+		return;
+
+	// startCombat() sets the defender/follow target and both combat states;
+	// retain the explicit target assignment used by the hunter controller so
+	// its existing combat AI target remains stable across ticks.
 	agent->setTargetObject(target);
-	agent->addDefender(target);
-	targetAgent->addDefender(agent);
-	agent->setCombatState();
+	// Wake the AI behavior tree so its combat socket runs NOW and fires the
+	// weapon. Without this the tree stays on its long IDLE (Wait 3600) schedule
+	// and the hunter "aims" but does not shoot for seconds-to-minutes — the
+	// working SimPvPController does exactly this on engage (SimPvPController.cpp:842).
+	agent->activateAiBehavior(true);
 	state = SimPlayerController::IDLE;
 }
 
@@ -1064,6 +1118,12 @@ void SimHunterController::disengageTarget(bool dropObserverHandle) {
 	destinationCell = nullptr;
 	simPath.removeAll();
 	simPathIndex = 0;
+	// finalDestination is deliberately preserved so a mid-travel ambush kill can
+	// resume the active leg via the order-gated hybrid resume. Cancellation
+	// paths close that gate (orderActive / missionCleanupRequested) BEFORE they
+	// call disengage, so a finished route cannot revive. Do NOT bump the
+	// work-loop generation here: that would kill the live arrival-check loop the
+	// resume depends on and strand the active travel leg (code-review round 2).
 	state = SimPlayerController::IDLE;
 }
 
@@ -1146,6 +1206,11 @@ void SimHunterController::onHuntDestruction(uint64 destroyedTargetOid,
 	targetOid = 0;
 	order.kills++;
 	disengageTarget(false);
+	// The pursuit target is dead; clear the stale pursuit finalDestination so the
+	// arrival resume / in-flight path result cannot drift the hunter toward the
+	// corpse before the hunt loop reacquires (plan §Type Definitions: clear
+	// finalDestination on cancellation).
+	clearHybridMovementOnCancellation();
 	if (order.kills >= order.quota) {
 		if (missionHuntOrder)
 			beginMissionCleanup(false, "quota");
@@ -1163,6 +1228,9 @@ void SimHunterController::handleTargetUnavailable() {
 	destructionHandled = false;
 	updateMissionAdds(0);
 	disengageTarget(false);
+	// Target vanished mid-pursuit: drop the stale pursuit destination so movement
+	// cannot resume toward an unavailable target before reacquisition.
+	clearHybridMovementOnCancellation();
 	resetCombatGuard();
 	scheduleActiveTick(500);
 }
@@ -1233,6 +1301,47 @@ void SimHunterController::clearStaleCombat(const String& reason) {
 		" reason=" + reason, true);
 }
 
+bool SimHunterController::defendAgainstInterceptor(AiAgent* hunter) {
+	if (hunter == nullptr)
+		return false;
+
+	ManagedReference<SceneObject*> defenderScene = hunter->getMainDefender();
+	CreatureObject* attacker = defenderScene == nullptr ? nullptr :
+		defenderScene->asCreatureObject();
+
+	// Only fight a live, reachable, out-of-building attacker. If nothing
+	// qualifies, shed the (stale) combat state so the movement layer resumes the
+	// interrupted travel leg (disengageTarget preserves finalDestination).
+	if (attacker == nullptr || attacker->isDead() || attacker->isIncapacitated() ||
+			attacker->getParent() != nullptr ||
+			hunter->getDistanceTo(attacker) >
+				SimPlayerManager::instance()->getPveHunterScanRadiusMeters() + 24.f) {
+		clearStaleCombat("intercept_cleared");
+		return false;
+	}
+
+	// Already fighting this interceptor: the AI combat is driving attacks, leave
+	// it be (avoids re-issuing startCombat on every arrival tick).
+	ManagedReference<SceneObject*> current = hunter->getFollowObject();
+	if (current != nullptr && current->getObjectID() == attacker->getObjectID())
+		return true;
+
+	// Fight back, mirroring engageTarget's real-combat contract (attacker locked;
+	// startCombat cross-locks the defender). Setting the attacker as the target
+	// is what makes the AI combat actually fire — the creature's inflictDamage
+	// only addDefender()s the hunter, it never sets its followObject, so without
+	// this the bot just stands there and dies (owner-observed).
+	Locker agentLock(hunter);
+	if (CombatManager::instance()->startCombat(hunter, attacker)) {
+		hunter->setTargetObject(attacker);
+		// Wake the combat behavior tree so the hunter shoots back promptly
+		// instead of idling on its long behavior schedule (see engageTarget).
+		hunter->activateAiBehavior(true);
+	}
+
+	return true;
+}
+
 void SimHunterController::moveToPatrolPoint(uint64 nowMs) {
 	if (state == MOVING || state == CALCULATING_PATH || targetOid != 0 ||
 			nowMs - lastPatrolMoveMs < 6000 || species.key.isEmpty())
@@ -1291,6 +1400,11 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 		return;
 	}
 
+	// Close the resume gate BEFORE disengaging: an arrival tick that already
+	// passed its generation check and then blocks on the agent lock could
+	// otherwise acquire it right after disengage and, with orderActive still
+	// set, revive movement toward the finished route (code-review round 2).
+	orderActive = false;
 	dropTargetObserver();
 	disengageTarget(false);
 	if (abandoned)
@@ -1300,7 +1414,6 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 		SimPlayerManager::instance()->recordPveHunterCompleted(identityId,
 			agent == nullptr ? 0 : agent->getObjectID());
 
-	orderActive = false;
 	orderAbandoned = false;
 	missionHuntOrder = false;
 	missionTerminalFallback = false;
@@ -1320,6 +1433,8 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 
 void SimHunterController::teardown(const String& reason) {
 	activeTickGeneration++;
+	advanceWorkLoopGeneration("hunterTeardown");
+	clearHybridMovementOnCancellation();
 	dropTargetObserver();
 	disengageTarget(false);
 	if (orderActive)

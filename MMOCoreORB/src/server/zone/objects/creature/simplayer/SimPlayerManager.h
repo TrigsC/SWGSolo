@@ -1296,6 +1296,8 @@ private:
 	int pveMissionTerminalResolveWaitCycles = 10;
 	int pveMissionLairTimeoutSeconds = 1800;
 	int pveMissionMaxActiveLairs = 6;
+	int pveNavmeshModeDebounceTicks = 2;
+	int pveNavmeshRepathTries = 3;
 	bool pveWorldPresenceEnabled = false;
 	bool pveSpikeEnabled = false;
 	bool pveAcquisitionLedgerEnabled = false;
@@ -1969,6 +1971,12 @@ public:
 	}
 	int getPveMissionAddsAbandonCycles() const {
 		return pveMissionAddsAbandonCycles;
+	}
+	int getPveNavmeshModeDebounceTicks() const {
+		return pveNavmeshModeDebounceTicks;
+	}
+	int getPveNavmeshRepathTries() const {
+		return pveNavmeshRepathTries;
 	}
 	int getPveHunterAnnounceCooldownSeconds() const { return pveAnnounceCooldownSeconds; }
 	bool getPveHomeLocations(const String& planet, const String& city,

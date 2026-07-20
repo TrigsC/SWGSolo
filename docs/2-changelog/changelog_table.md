@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.4.4` | 2 | F_0.4.4 P.8.3: PvE hunter combat & movement realism (real combat, navmesh-aware travel, self-defense + combat template, #/wilds dashboard) |
 | `0.3.1` | 1 | fix: combat stalemate break + collector wait jitter (Theed doorway statue deadlock) |
 | `0.3.0` | 1 | feat: P.6.5d city-loop realism - real shuttleports, cantina hangouts, break-off cohesion |
 | `0.2.1` | 1 | hotfix: MOVEOUT route callout swallowed by global announce gap; add min departure notice |
@@ -9,6 +10,14 @@
 | `0.1.0` | 1 | chore: initialize TRIP workflow |
 
 # Changelog Summary
+
+- **v0.4.4 (P.8.3 PvE Hunter Combat & Movement Realism - Week 2, 20-07-2026)**:
+  - **Feature**: makes the live PvE hunter loop read like real player activity (simulation-only loot) — real mutual combat via `CombatManager::startCombat` with the AI-aligned rifle; hunter-opt-in navmesh/overland hybrid movement (navmesh in cities, overland in the wild, validated egress); de-garbled per-phase announcements; HAM-filling non-stacking buffs; new read-only `#/wilds` dashboard route with live hunter positions.
+  - **Live-verification hardening (owner-verified, not Codex-re-reviewed)**: `ATTACKABLE` flag for two-way combat + player-attack scoping (neutral bot is not player-attackable); `onTick` self-defense against non-target attackers (en-route interceptors + lair pre-acquisition aggro); `activateAiBehavior(true)` on engage to fix multi-minute fire-cadence stalls; buffs +100 → +2500; body template `artisan` → neutral `death_watch_wraith` + `rifle_t21` (wraith tuned down from DWB boss stats).
+  - **Also carries**: the previously-unreleased P.8.1c/d + P.8.2 branch checkpoint (`1df1850b83`: acquisition/demand ledger, creature-resource turf split, mission-terminal hunting).
+  - **Review**: Codex 4 rounds → APPROVED (`docs/3-code-review/CR_w2_v0.4.4.md`), with an owner-verified live-hardening addendum. Live-verified in-game across restarts.
+  - **Files**: SimHunterController.{h,cpp}, SimPlayerController.{h,cpp}, SimPlayerManager.{h,cpp}, AiAgentImplementation.cpp, sim_player_manager.lua, death_watch_wraith.lua, dashboard app.js/index.html/styles.css, design doc + COVERAGE-DEBT.
+  - **Note**: NOT merged to `miner-ai` (owner landing further bug fixes on the branch first).
 
 - **v0.3.1 (P.6.5e Stalemate Break + Collector Jitter - Week 1, 15-07-2026)**:
   - **Fix**: owner-observed frozen statue pairs at Theed's interior collector — 45s combat-progress stalemate break (HAM-tracked, leaders+members, 20s single-enemy re-engage grace) + deterministic ~3m collector wait jitter. Zero-preserving config parse; member-teleport scoped reset.

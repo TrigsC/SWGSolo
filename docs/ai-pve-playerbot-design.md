@@ -221,3 +221,75 @@ position/alive state, and engaged adds. Root counters expose
 body position and hunter kill/harvest counters. Temporary target-scan logging
 is not part of the controller; any future diagnostics should use the manager
 logger so they are visible in `core3.log`.
+
+## P.8.3 — Hunter combat and movement realism
+
+The P.8.3 realism pass keeps the hunter economy loop simulation-only while
+making the in-world activity read like player activity. Hunter combat uses the
+real mutual-combat entry point and the explicitly equipped rifle; creatures
+can retaliate, so the existing retreat, clone, and wound-recovery paths remain
+part of the live acceptance check.
+
+Hunter travel is an opt-in hybrid controller mode. `SimHunterController` opts
+in through `usesNavmeshHybridMovement()`; miners and PvP controllers retain
+the base false default. The mode is latched from the agent's current
+`isInNavMesh()` state with a small debounce. On-mesh legs use the boolean
+provenance returned by `getRecastPath` and preserve navmesh node heights. A
+city-to-wilderness leg resolves and ground-snaps its exit boundary, validates
+an actually off-mesh egress point, then switches to terrain-following
+overland movement. A navmesh failure retries within the bounded
+`missionHunt.navmeshRepathTries` budget and never falls back to in-city
+overland movement.
+
+Phase announcements now broadcast the controller's phase-specific detail
+string as-is. The configured site key is only humanized for an empty-detail
+fallback, so identifiers such as `tatooine_womprat_meat` never get concatenated
+onto a return message. Hunter buffs explicitly fill the current HAM pools to
+their modified maxima, and each refresh removes the prior CRC before adding
+the replacement effect.
+
+The read-only `#/wilds` dashboard route renders `pveActivity.roster[]` live
+positions, phase, planet, and copy-paste `/way x y z` coordinates. Missing
+coordinates are shown as unavailable during body or zone transitions; the
+route adds no server mutation or new data source.
+
+### P.8.3 live-verification hardening
+
+In-world testing surfaced several combat-realism gaps that were fixed on the
+branch (still simulation-only for loot):
+
+- **Two-way combat requires `ATTACKABLE`.** A creature only retaliates against a
+  target its `isAttackableBy` accepts, and that check rejects any
+  `pvpStatusBitmask` without `ObjectFlag::ATTACKABLE`. Hunter bodies are spawned
+  `PLAYER | ATTACKABLE` so wildlife fights back. To keep the neutral bot from
+  becoming player-attackable, `AiAgentImplementation::isAttackableBy` returns
+  false for a real player attacking a faction-0 `getSimPlayerBot()` — mirroring a
+  neutral player — while creature/NPC AI still falls through to the normal
+  faction-0 rules. It reads blue and is not hover-attackable, yet wildlife
+  engages it.
+
+- **Self-defense against non-target attackers.** The hunter previously fought
+  only its scan-acquired mission target, so anything else that attacked it (an
+  interceptor mid-travel, or a creature that aggros at the lair before a target
+  is acquired — `scanForTarget` early-returns while in combat) went unanswered
+  and it died passively. `SimHunterController::onTick` — the arrival-cadence hook
+  that stays live through both travel and the lair stand — now, whenever the bot
+  is in combat with no live acquired target, fights whatever is actually
+  attacking it (`defendAgainstInterceptor`). It never moves the bot and steps
+  aside once a real mission target is engaged, so the active-tick mission combat
+  is unchanged.
+
+- **Combat cadence.** Attack timing is driven by the AI behavior tree, which
+  otherwise sits on the long idle `Wait` schedule and only fires opportunistically
+  (a target could be "aimed at" but unshot for minutes). Both engage paths now
+  call `activateAiBehavior(true)` after establishing combat, matching the working
+  PvP controller, so the weapon fires promptly and sustained combat
+  self-reschedules.
+
+- **Buff magnitude and body template.** Hunter enhancement buffs were correct but
+  set to a token `+100`; they now apply a doctor/entertainer-tier `+2500` so the
+  HAM change is meaningful. The body template moved off `artisan` (no combat
+  skills or attacks) to a real combat template with matching ranged attack maps
+  and much higher HAM/resists; the equipped rifle is aligned to that template's
+  attack family, and the C++ spawn still overrides faction to 0 so the neutral
+  hunter attacks and is attacked by wildlife regardless of the template's origin.

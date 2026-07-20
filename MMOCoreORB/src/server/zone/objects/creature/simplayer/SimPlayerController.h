@@ -15,6 +15,7 @@
 #include "server/zone/objects/scene/WorldCoordinates.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/Zone.h"
+#include "server/zone/objects/pathfinding/NavArea.h"
 
 class SimPlayerController;
 
@@ -61,10 +62,41 @@ class SimPathFindTask : public Task {
     WorldCoordinates endCoord;
     ManagedReference<Zone*> zone;
     uint64 generation;
+    bool useRecastPath;
+    bool useDirectOverlandPath;
+    bool directTargetUsesTerrainHeight;
+    ManagedReference<NavArea*> navArea;
+    Vector3 recastStart;
+    Vector3 recastEnd;
+    bool allowPartial;
 
 public:
     SimPathFindTask(SimPlayerController* ctrl, WorldCoordinates start, WorldCoordinates end, Zone* z, uint64 g)
-        : controller(ctrl), startCoord(start), endCoord(end), zone(z), generation(g) {
+        : controller(ctrl), startCoord(start), endCoord(end), zone(z), generation(g),
+          useRecastPath(false), useDirectOverlandPath(false),
+          directTargetUsesTerrainHeight(false), navArea(nullptr), recastStart(),
+          recastEnd(),
+          allowPartial(true) {
+    }
+
+    SimPathFindTask(SimPlayerController* ctrl, WorldCoordinates start,
+            WorldCoordinates end, Zone* z, NavArea* area,
+            const Vector3& recastStartPosition,
+            const Vector3& recastEndPosition, bool partial, uint64 g)
+        : controller(ctrl), startCoord(start), endCoord(end), zone(z), generation(g),
+          useRecastPath(true), useDirectOverlandPath(false),
+          directTargetUsesTerrainHeight(false), navArea(area),
+          recastStart(recastStartPosition), recastEnd(recastEndPosition),
+          allowPartial(partial) {
+    }
+
+    SimPathFindTask(SimPlayerController* ctrl, WorldCoordinates start,
+            WorldCoordinates end, Zone* z, bool directOverland,
+            bool terrainHeight, uint64 g)
+        : controller(ctrl), startCoord(start), endCoord(end), zone(z), generation(g),
+          useRecastPath(false), useDirectOverlandPath(directOverland),
+          directTargetUsesTerrainHeight(terrainHeight), navArea(nullptr),
+          recastStart(), recastEnd(), allowPartial(true) {
     }
     void run() override; 
 };
@@ -106,6 +138,24 @@ protected:
     Vector3 destination;
     Vector3 destinationLocal;
     ManagedReference<CellObject*> destinationCell;
+    // Hybrid movement keeps the logical assignment target separate from the
+    // current navmesh boundary/egress sub-leg endpoint.
+    Vector3 finalDestination;
+    bool hasFinalDestination;
+    bool onMeshMode;
+    int navmeshModeDebounceCounter;
+    int navmeshRepathAttempts;
+
+    enum HybridLeg {
+        HYBRID_LEG_NONE,
+        HYBRID_LEG_NAVMESH_FINAL,
+        HYBRID_LEG_NAVMESH_EXIT,
+        HYBRID_LEG_EGRESS,
+        HYBRID_LEG_OVERLAND_FINAL
+    };
+
+    HybridLeg hybridLeg;
+    Vector3 hybridEgressPoint;
     uint64 workLoopGeneration;
     
     // Configurable speed/movement settings
@@ -132,6 +182,15 @@ public:
     virtual void onArrived() = 0;     // Called when destination reached
     virtual void onTick() {}          // Called every 500ms (Good for PvP scanning)
     virtual bool shouldContinueArrivalChecks() const { return true; }
+    // Hunter-only opt-in for navmesh/overland hybrid movement. The default
+    // keeps the existing miner and PvP path behavior byte-for-byte unchanged.
+    virtual bool usesNavmeshHybridMovement() const { return false; }
+    // Hybrid-only: whether an IDLE agent should auto-resume travel toward the
+    // preserved finalDestination on the next arrival tick. Base resumes whenever
+    // a final destination is pending; SimHunterController additionally requires
+    // an active, non-cleanup order so a completed/abandoned/timed-out/cleanup
+    // route cannot revive movement toward a stale target.
+    virtual bool shouldResumeHybridTravel() const { return hasFinalDestination; }
     // P.4.2: whether a stuck miner should re-path before giving up. Re-pathing a
     // straight-line overland leg just reproduces the same line, so overland
     // assignments override this to false and escalate straight to onPathFailed().
@@ -163,6 +222,8 @@ public:
         destinationCell = nullptr;
         simPath.removeAll();
         simPathIndex = 0;
+        if (usesNavmeshHybridMovement())
+            resetHybridMovementState(true);
     }
 
     // P.6.1b: last-line defense against a stale path winning a generation
@@ -174,12 +235,23 @@ public:
     uint64 advanceWorkLoopGeneration(const String& reason);
     bool isWorkLoopGenerationCurrent(uint64 capturedGeneration, const String& taskType);
     
-    void onPathFound(Vector<WorldCoordinates>* path);
+    void onPathFound(Vector<WorldCoordinates>* path,
+            bool pathUsesNavmesh = false, bool pathIsOverland = false);
+    void onPathTaskFailed(bool pathUsesNavmesh);
     virtual void onPathFailed();
 
 protected:
     void queueMorePathNodes();
     bool pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out, int minSearchRadius = 100, int maxSearchRadius = 200);
+    void requestHybridPath();
+    void scheduleHybridDirectPath(const Vector3& target, HybridLeg leg);
+    void resetHybridMovementState(bool clearFinalDestination);
+    void clearHybridMovementOnCancellation();
+    bool findNavAreaAt(Zone* zone, const Vector3& position,
+            ManagedReference<NavArea*>& area) const;
+    bool resolveHybridExit(Zone* zone, const Vector3& currentPosition,
+            Vector3& boundary, Vector3& egress,
+            ManagedReference<NavArea*>& area) const;
 };
 
 // -------------------------------------------------------

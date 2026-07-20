@@ -8,6 +8,7 @@
 #include "engine/core/Core.h"
 #include "engine/core/TaskManager.h"
 #include "server/zone/managers/collision/PathFinderManager.h"
+#include "server/zone/managers/collision/CollisionManager.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h"
 #include "server/zone/Zone.h"
 #include "server/zone/managers/resource/ResourceManager.h"
@@ -39,9 +40,39 @@ void SimPathFindTask::run() {
     Logger::console.info("SimPlayer: [Thread] Pathfinding started...", true);
 #endif
     Vector<WorldCoordinates>* path = nullptr;
+    bool pathUsesNavmesh = useRecastPath;
+    bool pathIsOverland = useDirectOverlandPath;
     
     try {
-        path = PathFinderManager::instance()->findPath(startCoord, endCoord, zone);
+        if (useRecastPath) {
+            Vector<WorldCoordinates>* recastPath =
+                new Vector<WorldCoordinates>();
+            float length = 0.f;
+
+            if (navArea != nullptr &&
+                    PathFinderManager::instance()->getRecastPath(
+                        recastStart, recastEnd, navArea, recastPath, length,
+                        allowPartial)) {
+                path = recastPath;
+            } else {
+                delete recastPath;
+            }
+        } else if (useDirectOverlandPath) {
+            // This is an explicit overland request, not a guess based on the
+            // resulting node count. The target height is terrain-derived only
+            // after the controller has confirmed the agent is off-mesh (or
+            // this is the sanctioned exit egress leg).
+            Vector3 start = startCoord.getWorldPosition();
+            Vector3 end = endCoord.getWorldPosition();
+            if (directTargetUsesTerrainHeight)
+                end.setZ(zone->getHeight(end.getX(), end.getY()));
+
+            path = new Vector<WorldCoordinates>();
+            path->add(WorldCoordinates(start, nullptr));
+            path->add(WorldCoordinates(end, nullptr));
+        } else {
+            path = PathFinderManager::instance()->findPath(startCoord, endCoord, zone);
+        }
     } catch (...) {
         Logger::console.info("SimPlayer: [Thread] EXCEPTION in findPath!", true);
         path = nullptr;
@@ -56,15 +87,17 @@ void SimPathFindTask::run() {
     }
 #endif
 
-    Core::getTaskManager()->executeTask([strongCtrl, path, capturedGeneration] () {
+    Core::getTaskManager()->executeTask([strongCtrl, path, capturedGeneration, pathUsesNavmesh, pathIsOverland] () {
         if (!strongCtrl->isWorkLoopGenerationCurrent(capturedGeneration, "path_find_result")) {
             if (path != nullptr)
                 delete path;
             return;
         }
 
-        if (path != nullptr) strongCtrl->onPathFound(path);
-        else strongCtrl->onPathFailed();
+        if (path != nullptr)
+            strongCtrl->onPathFound(path, pathUsesNavmesh, pathIsOverland);
+        else
+            strongCtrl->onPathTaskFailed(pathUsesNavmesh);
     }, "SimPlayerResultLambda");
 }
 
@@ -148,6 +181,13 @@ SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     destination = Vector3(0, 0, 0);
     destinationLocal = Vector3(0, 0, 0);
     destinationCell = nullptr;
+    finalDestination = Vector3(0, 0, 0);
+    hasFinalDestination = false;
+    onMeshMode = false;
+    navmeshModeDebounceCounter = 0;
+    navmeshRepathAttempts = 0;
+    hybridLeg = HYBRID_LEG_NONE;
+    hybridEgressPoint = Vector3(0, 0, 0);
 }
 
 SimPlayerController::~SimPlayerController() {
@@ -170,6 +210,16 @@ void SimPlayerController::moveTo(Vector3 worldPos, Vector3 localPos,
         return;
     }
 
+    if (usesNavmeshHybridMovement()) {
+        finalDestination = worldPos;
+        hasFinalDestination = true;
+        onMeshMode = agent->isInNavMesh();
+        navmeshModeDebounceCounter = 0;
+        navmeshRepathAttempts = 0;
+        hybridLeg = HYBRID_LEG_NONE;
+        hybridEgressPoint = Vector3(0, 0, 0);
+    }
+
     destination = worldPos;
     destinationLocal = localPos;
     destinationCell = targetCell;
@@ -179,6 +229,11 @@ void SimPlayerController::moveTo(Vector3 worldPos, Vector3 localPos,
 #ifdef DEBUG_SIMPVP
     Logger::console.info("SimPlayer moveTo: isInCombat", true);
 #endif
+        return;
+    }
+
+    if (usesNavmeshHybridMovement()) {
+        requestHybridPath();
         return;
     }
 
@@ -201,8 +256,41 @@ void SimPlayerController::moveTo(Vector3 worldPos, Vector3 localPos,
     task->schedule(100); 
 }
 
-void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
+void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path,
+        bool pathUsesNavmesh, bool pathIsOverland) {
     if (agent == nullptr) { if (path) delete path; return; }
+
+    if (usesNavmeshHybridMovement() && !shouldResumeHybridTravel()) {
+        // The order completed/abandoned or entered lair cleanup while this path
+        // was in flight. Drop the result instead of re-entering MOVING toward a
+        // finished target. (Cancellation closes the resume gate before disengage,
+        // so this is the deterministic last line against a stale in-flight task.)
+        if (path) delete path;
+        state = IDLE;
+        return;
+    }
+
+    if (usesNavmeshHybridMovement()) {
+        bool expectsNavmesh = hybridLeg == HYBRID_LEG_NAVMESH_FINAL ||
+            hybridLeg == HYBRID_LEG_NAVMESH_EXIT;
+        if (expectsNavmesh != pathUsesNavmesh) {
+            delete path;
+            onPathTaskFailed(expectsNavmesh);
+            return;
+        }
+    }
+
+    if (usesNavmeshHybridMovement() && pathIsOverland &&
+            hybridLeg == HYBRID_LEG_OVERLAND_FINAL &&
+            agent->isInNavMesh()) {
+        // A direct task can outlive the boundary tick that scheduled it. Do
+        // not accept an overland route after the agent has entered a mesh.
+        delete path;
+        onMeshMode = true;
+        navmeshModeDebounceCounter = 0;
+        requestHybridPath();
+        return;
+    }
     
     if (agent->isInCombat()) {
 #ifdef DEBUG_SIMPVP
@@ -218,7 +306,10 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer onPathFound: Path too short. Retrying in 5s.", true);
 #endif
-        onPathFailed();
+        if (usesNavmeshHybridMovement() && pathUsesNavmesh)
+            onPathTaskFailed(true);
+        else
+            onPathFailed();
         return;
     }
 
@@ -243,6 +334,12 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     destination = finalPoint.getWorldPosition();
     destinationLocal = finalPoint.getPoint();
     destinationCell = finalPoint.getCell();
+
+    if (usesNavmeshHybridMovement()) {
+        onMeshMode = agent->isInNavMesh();
+        navmeshModeDebounceCounter = 0;
+        navmeshRepathAttempts = 0;
+    }
 #ifdef DEBUG_SIMPVP
     Logger::console.info("SimPlayer onPathFound: Path Found (" + String::valueOf(path->size()) + " nodes). Moving...", true);
 #endif
@@ -284,6 +381,224 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path) {
     task->schedule(500); 
 }
 
+void SimPlayerController::onPathTaskFailed(bool pathUsesNavmesh) {
+    if (!usesNavmeshHybridMovement() || !pathUsesNavmesh) {
+        onPathFailed();
+        return;
+    }
+
+    int retryBudget = SimPlayerManager::instance()->getPveNavmeshRepathTries();
+    if (navmeshRepathAttempts < retryBudget) {
+        navmeshRepathAttempts++;
+        requestHybridPath();
+        return;
+    }
+
+    navmeshRepathAttempts = 0;
+    onPathFailed();
+}
+
+bool SimPlayerController::findNavAreaAt(Zone* zone, const Vector3& position,
+        ManagedReference<NavArea*>& area) const {
+    if (zone == nullptr)
+        return false;
+
+    SortedVector<ManagedReference<NavArea*> > areas;
+    zone->getInRangeNavMeshes(position.getX(), position.getY(), &areas, false);
+
+    for (int i = 0; i < areas.size(); ++i) {
+        ManagedReference<NavArea*> candidate = areas.get(i);
+        if (candidate != nullptr &&
+                candidate->containsPoint(position.getX(), position.getY())) {
+            area = candidate;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool SimPlayerController::resolveHybridExit(Zone* zone,
+        const Vector3& currentPosition, Vector3& boundary,
+        Vector3& egress, ManagedReference<NavArea*>& area) const {
+    if (zone == nullptr || !hasFinalDestination)
+        return false;
+
+    // getNavMeshCollisions discards rays whose origin is already inside the
+    // mesh (tca < 0). Cast from the wilderness destination back toward the
+    // hunter so the first collision is the reliable exit boundary.
+    SortedVector<ManagedReference<NavArea*> > areas;
+    zone->getInRangeNavMeshes(currentPosition.getX(), currentPosition.getY(),
+        &areas, true);
+    if (areas.size() == 0)
+        return false;
+
+    SortedVector<NavCollision*> collisions;
+    PathFinderManager::instance()->getNavMeshCollisions(&collisions, &areas,
+        finalDestination, currentPosition);
+
+    Vector3 collisionPosition;
+    NavArea* selectedArea = nullptr;
+    for (int i = 0; i < collisions.size(); ++i) {
+        NavCollision* collision = collisions.get(i);
+        if (collision == nullptr)
+            continue;
+
+        NavArea* collisionArea = collision->getNavArea();
+        if (selectedArea == nullptr || collisionArea == area.get()) {
+            selectedArea = collisionArea;
+            collisionPosition = collision->getPosition();
+            if (collisionArea == area.get())
+                break;
+        }
+    }
+
+    for (int i = 0; i < collisions.size(); ++i)
+        delete collisions.get(i);
+
+    if (selectedArea == nullptr)
+        return false;
+
+    area = selectedArea;
+    collisionPosition.setZ(CollisionManager::getWorldFloorCollision(
+        collisionPosition.getX(), collisionPosition.getY(), zone, true));
+    if (!zone->isWithinBoundaries(collisionPosition))
+        return false;
+
+    Vector3 outward = finalDestination - collisionPosition;
+    outward.setZ(0.f);
+    float outwardLength = outward.length2d();
+    if (outwardLength < 0.001f)
+        return false;
+    outward.normalize();
+
+    // NavCollision is deliberately just inside the mesh. Probe far enough to
+    // clear the complete active-area radius, but keep the search bounded so a
+    // malformed mesh cannot turn a movement request into an unbounded loop.
+    const float probeStep = 8.f;
+    const int maxProbeSteps = 128;
+    for (int step = 1; step <= maxProbeSteps; ++step) {
+        Vector3 candidate = collisionPosition + outward *
+            (probeStep * static_cast<float>(step));
+        candidate.setZ(CollisionManager::getWorldFloorCollision(
+            candidate.getX(), candidate.getY(), zone, true));
+
+        if (!zone->isWithinBoundaries(candidate))
+            continue;
+
+        SortedVector<ManagedReference<NavArea*> > candidateAreas;
+        zone->getInRangeNavMeshes(candidate.getX(), candidate.getY(),
+            &candidateAreas, false);
+
+        // The candidate is valid only after both the ground/water snap and
+        // the nav-region query agree that it is outside every NavArea.
+        if (candidateAreas.size() == 0) {
+            egress = candidate;
+            boundary = collisionPosition;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void SimPlayerController::scheduleHybridDirectPath(const Vector3& target,
+        HybridLeg leg) {
+    if (agent == nullptr || agent->getZone() == nullptr ||
+            !hasFinalDestination)
+        return;
+
+    Zone* zone = agent->getZone();
+    if (!zone->isWithinBoundaries(target)) {
+        onPathTaskFailed(false);
+        return;
+    }
+
+    destination = target;
+    destinationLocal = target;
+    destinationCell = nullptr;
+    hybridLeg = leg;
+    stuckWatchdogCount = 0;
+    lastWatchdogPos = agent->getWorldPosition();
+    state = CALCULATING_PATH;
+    uint64 movementGeneration = advanceWorkLoopGeneration(
+        "hybridDirectOverland");
+
+    WorldCoordinates startCoord(agent);
+    WorldCoordinates endCoord(target, nullptr);
+    Reference<SimPathFindTask*> task = new SimPathFindTask(this, startCoord,
+        endCoord, zone, true, leg != HYBRID_LEG_EGRESS,
+        movementGeneration);
+    task->schedule(100);
+}
+
+void SimPlayerController::requestHybridPath() {
+    if (agent == nullptr || agent->getZone() == nullptr ||
+            !hasFinalDestination) {
+        onPathFailed();
+        return;
+    }
+
+    Zone* zone = agent->getZone();
+    Vector3 currentPosition = agent->getWorldPosition();
+
+    if (!onMeshMode) {
+        scheduleHybridDirectPath(finalDestination,
+            HYBRID_LEG_OVERLAND_FINAL);
+        return;
+    }
+
+    ManagedReference<NavArea*> currentArea;
+    if (!findNavAreaAt(zone, currentPosition, currentArea)) {
+        onPathTaskFailed(true);
+        return;
+    }
+
+    ManagedReference<NavArea*> targetArea;
+    bool targetOnSameMesh = findNavAreaAt(zone, finalDestination, targetArea) &&
+        targetArea == currentArea;
+
+    Vector3 pathEnd = finalDestination;
+    HybridLeg leg = HYBRID_LEG_NAVMESH_FINAL;
+    if (!targetOnSameMesh) {
+        Vector3 boundary;
+        Vector3 egress;
+        ManagedReference<NavArea*> exitArea;
+        if (!resolveHybridExit(zone, currentPosition, boundary, egress,
+                exitArea)) {
+            onPathTaskFailed(true);
+            return;
+        }
+
+        // The resolved area is the one used for the recast leg. This also
+        // makes the area provenance explicit instead of inferring it from
+        // path node count.
+        currentArea = exitArea;
+        pathEnd = boundary;
+        hybridEgressPoint = egress;
+        leg = HYBRID_LEG_NAVMESH_EXIT;
+    } else {
+        hybridEgressPoint = Vector3(0, 0, 0);
+    }
+
+    destination = pathEnd;
+    destinationLocal = pathEnd;
+    destinationCell = nullptr;
+    hybridLeg = leg;
+    stuckWatchdogCount = 0;
+    lastWatchdogPos = currentPosition;
+    state = CALCULATING_PATH;
+    uint64 movementGeneration = advanceWorkLoopGeneration(
+        "hybridRecastPath");
+
+    WorldCoordinates startCoord(agent);
+    WorldCoordinates endCoord(pathEnd, nullptr);
+    Reference<SimPathFindTask*> task = new SimPathFindTask(this, startCoord,
+        endCoord, zone, currentArea, currentPosition, pathEnd, false,
+        movementGeneration);
+    task->schedule(100);
+}
+
 void SimPlayerController::onPathFailed() {
 #ifdef DEBUG_SIMPVP
     Logger::console.info("SimPlayer onPathFailed: Pathfinding failed/unreachable. Retrying in 5s...", true);
@@ -293,6 +608,26 @@ void SimPlayerController::onPathFailed() {
     Reference<SimRetryTask*> task =
         new SimRetryTask(this, getWorkLoopGeneration());
     task->schedule(5000); // 5 seconds
+}
+
+void SimPlayerController::resetHybridMovementState(bool clearFinalDestination) {
+    onMeshMode = false;
+    navmeshModeDebounceCounter = 0;
+    navmeshRepathAttempts = 0;
+    hybridLeg = HYBRID_LEG_NONE;
+    hybridEgressPoint = Vector3(0, 0, 0);
+
+    if (clearFinalDestination) {
+        finalDestination = Vector3(0, 0, 0);
+        hasFinalDestination = false;
+    }
+}
+
+void SimPlayerController::clearHybridMovementOnCancellation() {
+    if (!usesNavmeshHybridMovement())
+        return;
+
+    resetHybridMovementState(true);
 }
 
 uint64 SimPlayerController::advanceWorkLoopGeneration(const String& reason) {
@@ -404,7 +739,40 @@ void SimPlayerController::checkArrival() {
         return;
     }
 
-    if (state == IDLE && destination.getX() != 0) {
+    if (usesNavmeshHybridMovement() &&
+            (state == MOVING || (state == IDLE && shouldResumeHybridTravel()))) {
+        bool observedOnMesh = agent->isInNavMesh();
+        if (observedOnMesh != onMeshMode) {
+            navmeshModeDebounceCounter++;
+            int debounceTicks =
+                SimPlayerManager::instance()->getPveNavmeshModeDebounceTicks();
+            if (debounceTicks < 1)
+                debounceTicks = 1;
+
+            if (navmeshModeDebounceCounter >= debounceTicks) {
+                onMeshMode = observedOnMesh;
+                navmeshModeDebounceCounter = 0;
+                locker.release();
+                requestHybridPath();
+                return;
+            }
+        } else {
+            navmeshModeDebounceCounter = 0;
+        }
+    }
+
+    if (usesNavmeshHybridMovement() && state == IDLE &&
+            shouldResumeHybridTravel()) {
+#ifdef DEBUG_SIMPVP
+        Logger::console.info("SimPlayer checkArrival: Resuming hybrid path to " +
+            finalDestination.toString(), true);
+#endif
+        locker.release();
+        requestHybridPath();
+        return;
+    }
+
+    if (!usesNavmeshHybridMovement() && state == IDLE && destination.getX() != 0) {
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer checkArrival: Resuming path to " + destination.toString(), true);
 #endif
@@ -448,12 +816,66 @@ void SimPlayerController::checkArrival() {
     if (distSq < 16.0f) arrived = true;
     if (agent->getPatrolPointSize() == 0 && simPathIndex >= simPath.size()) arrived = true;
 
+    if (usesNavmeshHybridMovement() &&
+            (hybridLeg == HYBRID_LEG_NAVMESH_FINAL ||
+             hybridLeg == HYBRID_LEG_OVERLAND_FINAL)) {
+        float finalDx = currentPos.getX() - finalDestination.getX();
+        float finalDy = currentPos.getY() - finalDestination.getY();
+        if ((finalDx * finalDx) + (finalDy * finalDy) >= 16.0f)
+            arrived = false;
+    }
+
     if (arrived) {
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer checkArrival: Arrived at destination.", true);
 #endif
         agent->clearPatrolPoints();
         state = WAITING;
+
+        if (usesNavmeshHybridMovement()) {
+            if (hybridLeg == HYBRID_LEG_OVERLAND_FINAL &&
+                    agent->isInNavMesh()) {
+                // A short wilderness leg can reach a city before two
+                // arrival samples have elapsed. Never fire onArrived from a
+                // direct route that ended on a navmesh.
+                onMeshMode = true;
+                navmeshModeDebounceCounter = 0;
+                locker.release();
+                requestHybridPath();
+                return;
+            }
+
+            if (hybridLeg == HYBRID_LEG_NAVMESH_EXIT) {
+                // The recast leg reached the resolved boundary. The logical
+                // destination survives this sub-leg; first cross a bounded,
+                // validated off-mesh egress waypoint.
+                Vector3 egress = hybridEgressPoint;
+                locker.release();
+                scheduleHybridDirectPath(egress, HYBRID_LEG_EGRESS);
+                return;
+            }
+
+            if (hybridLeg == HYBRID_LEG_EGRESS) {
+                // This is the sanctioned transition: the egress probe was
+                // validated outside every NavArea before it was scheduled.
+                if (agent->isInNavMesh()) {
+                    locker.release();
+                    onPathFailed();
+                    return;
+                }
+                onMeshMode = false;
+                navmeshModeDebounceCounter = 0;
+                locker.release();
+                scheduleHybridDirectPath(finalDestination,
+                    HYBRID_LEG_OVERLAND_FINAL);
+                return;
+            }
+
+            // Only the logical target clears finalDestination. Boundary and
+            // egress acceptance above deliberately leave it intact.
+            resetHybridMovementState(true);
+        }
+
         locker.release();
         onArrived();
 
@@ -495,10 +917,13 @@ void SimPlayerController::checkArrival() {
 #ifdef DEBUG_SIMPVP
                 Logger::console.info("SimPlayer checkArrival: stuck; re-path attempt " + String::valueOf(rePathAttempts), true);
 #endif
-                // moveTo() advances the work-loop generation and schedules a
+                // Both paths advance the work-loop generation and schedule a
                 // fresh path-find + arrival loop, so do not reschedule here.
-                moveTo(resumeDestination, resumeLocalDestination,
-                    resumeCell.get());
+                if (usesNavmeshHybridMovement())
+                    requestHybridPath();
+                else
+                    moveTo(resumeDestination, resumeLocalDestination,
+                        resumeCell.get());
             } else {
 #ifdef DEBUG_SIMPVP
                 Logger::console.info("SimPlayer checkArrival: stuck; re-path budget exhausted, failing path.", true);

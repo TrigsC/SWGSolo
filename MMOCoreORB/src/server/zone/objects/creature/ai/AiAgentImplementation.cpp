@@ -6579,6 +6579,15 @@ bool AiAgentImplementation::isAttackableBy(CreatureObject* creature) {
 	if (pvpStatusBitmask == 0 || !(pvpStatusBitmask & ObjectFlag::ATTACKABLE))
 		return false;
 
+	// A neutral sim player bot mimics a neutral player: creatures/NPCs may
+	// attack it (PvE aggro/retaliation), but a real PLAYER may not target or
+	// attack it (no faction/duel). Without this, the ATTACKABLE flag it needs so
+	// wild creatures fight back would also let players hover-attack a blue
+	// (neutral) bot. Factioned sim bots fall through to the normal faction rules
+	// below, so opposing-faction players can still engage them.
+	if (getSimPlayerBot() && getFaction() == 0 && creature->isPlayerCreature())
+		return false;
+
 	if (creature->isPet()) {
 		ManagedReference<PetControlDevice*> controlDevice = creature->getControlDevice().get().castTo<PetControlDevice*>();
 
