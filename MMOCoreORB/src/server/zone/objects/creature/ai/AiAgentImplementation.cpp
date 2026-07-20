@@ -354,6 +354,17 @@ void AiAgentImplementation::loadTemplateData(SharedObjectTemplate* templateData)
 void AiAgentImplementation::loadTemplateData(CreatureTemplate* templateData) {
 	npcTemplate = templateData;
 
+	// simPlayerBot is a sticky flag with only a single reset site (SimPlayer
+	// manager's toggleBot stop path). AiAgent objects get recycled by the
+	// engine, and sim bots are destroyed on many paths that never clear it, so
+	// a recycled ex-bot object reused for an ordinary creature would inherit a
+	// stale simPlayerBot=true and read as a neutral bot (isAttackableBy refuses
+	// players -> white/unattackable wildlife). Clearing it here, at the
+	// template-load chokepoint (runs on initial spawn AND respawn/reload),
+	// guarantees a template-loaded creature is never a stale bot. Legit sim
+	// bots re-assert setSimPlayerBot(true) AFTER spawnCreature/loadTemplateData.
+	simPlayerBot = false;
+
 	setPvpStatusBitmask(npcTemplate->getPvpBitmask());
 
 	if (npcTemplate->getPvpBitmask() == 0)
