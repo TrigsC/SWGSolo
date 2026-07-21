@@ -293,3 +293,45 @@ branch (still simulation-only for loot):
   and much higher HAM/resists; the equipped rifle is aligned to that template's
   attack family, and the C++ spawn still overrides faction to 0 so the neutral
   hunter attacks and is attacked by wildlife regardless of the template's origin.
+
+### P.8.4 combat-targeting hardening
+
+Two owner-observed hunter combat bugs shared a target-state gap. A faction-0
+hunter could damage a nearby real player with an area attack because the player
+side of `CreatureObject::isAttackableBy` had no sim-bot exception; the existing
+reverse guard only stopped a real player from attacking the neutral bot. The
+player-side predicate now mirrors `AiAgentImplementation::isAttackableBy` and
+rejects a faction-0 `getSimPlayerBot()` attacker. This shared chokepoint covers
+direct attacks and area-of-effect splash victims while leaving factioned PvP
+sim bots and normal NPCs unchanged.
+
+The controller now selects the nearest qualifying creature from the hunter's
+defender list, excluding players, sim-presence bodies, other sim bots, dead or
+unreachable creatures, and anything the hunter cannot attack. The defender list
+and current follow target are snapshotted under the hunter lock (add/remove
+defender are `@preLocked`) before filtering, so a concurrent defender removal
+cannot cause an out-of-bounds read. A bounded follow-target hysteresis prevents
+thrash without allowing a fleeing first target to mask a materially nearer
+attacker.
+
+Combat-target ownership follows a single-writer rule so the two independently
+scheduled tick loops (the arrival-cadence `onTick` and the `SimHunterActiveTickTask`
+`runActiveTick`) cannot race `targetOid`/the mission observer. `targetOid` is
+HUNTING-scoped (only `selectTarget` sets it, and only during HUNTING). The HUNTING
+active tick is the sole writer: it runs the full dispatcher where a species-valid
+attacker is promoted through the mission-target/observer path (so its kill credits
+the quota) and an off-species interceptor is fought transiently without changing
+the mission target. `onTick` defers entirely to the active tick in HUNTING and, on
+the travel legs, only self-defends via the interceptor path — it never promotes a
+mission target, so it never writes `targetOid`/the observer. A consequence is that
+a species creature killed incidentally on a travel leg is fought as an interceptor
+and does not credit the mission quota; lair aggro (HUNTING) is still promoted and
+credited by the active tick. Before retargeting, the dispatcher also waits out a
+just-killed mission target whose asynchronous destruction handoff is still pending,
+so a legitimate kill is not lost to an early `targetOid` advance.
+
+If no valid attacker remains, bilateral defender cleanup removes stale
+relationships from both sides while preserving a live mission target and its
+observer, or fully clears stale combat when no mission target remains. This
+keeps combat real and player-safe without adding inventory, credit, market, or
+persistence mutation.

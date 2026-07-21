@@ -3551,6 +3551,12 @@ bool CreatureObjectImplementation::isAttackableBy(CreatureObject* creature, bool
 		if (creature->isAiAgent()) {
 			AiAgent* agentCreo = creature->asAiAgent();
 
+			// Mirror AiAgentImplementation.cpp:6599: a neutral sim bot may
+			// be attacked by wildlife, but it must never target a real player.
+			if (agentCreo != nullptr && agentCreo->getSimPlayerBot() &&
+					agentCreo->getFaction() == 0)
+				return false;
+
 			// Attack creature is pet, use owner to check
 			if (creature->isPet() && (agentCreo != nullptr && !agentCreo->isMindTricked())) {
 				ManagedReference<PetControlDevice*> pcd = creature->getControlDevice().get().castTo<PetControlDevice*>();

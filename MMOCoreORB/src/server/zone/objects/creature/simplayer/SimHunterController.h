@@ -94,18 +94,20 @@ private:
 	void selectTarget(AiAgent* target);
 	void engageTarget();
 	void disengageTarget(bool dropObserverHandle);
+	bool selectActiveCombatAttacker(AiAgent* hunter,
+		ManagedReference<CreatureObject*>& outAttacker,
+		ManagedReference<AiAgent*>& outAttackerAgent);
+	ManagedReference<CreatureObject*> engageActiveAttacker(AiAgent* hunter);
 	void dropTargetObserver();
 	void registerTargetObserver(uint64 target);
 	void handleTargetUnavailable();
 	void beginRetreat();
 	void finishRetreatMove();
 	void resetCombatGuard();
+	void shedAllDefendersBilaterally(AiAgent* hunter);
+	void resetInterceptorCombat();
 	void clearStaleCombat(const String& reason);
-	// Fight back at an attacker that intercepts the hunter mid-travel (not the
-	// mission target). Returns true if it handled combat this tick (caller
-	// should return); false if there is nothing reachable to fight (combat is
-	// shed so the movement layer resumes the interrupted leg).
-	bool defendAgainstInterceptor(AiAgent* hunter);
+	bool defendAgainstInterceptor(AiAgent* hunter, CreatureObject* attacker);
 	bool isBelowRetreatThreshold(AiAgent* hunter) const;
 	bool isReadyToResume(AiAgent* hunter) const;
 	bool targetIsLive(uint64 oid, CreatureObject*& target,

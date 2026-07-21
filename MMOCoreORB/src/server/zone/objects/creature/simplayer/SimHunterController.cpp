@@ -197,17 +197,14 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 
 void SimHunterController::onTick() {
 	// Self-defense hook, run on the arrival cadence (checkArrival calls onTick),
-	// which stays live through BOTH travel and the lair stand (orderActive keeps
-	// the arrival loop rescheduling). The mission-target engagement is driven by
-	// the active tick; this covers the gap that tick canNOT: fighting back at
-	// WHATEVER is actually attacking the hunter, not only its acquired mission
-	// target. Two owner-observed deaths both reduce to that gap:
-	//   * an interceptor on a pure movement leg — TRAVEL_TO_LAIR leaves the
-	//     active tick DORMANT (spawnMissionLair moves without rescheduling it); and
-	//   * a creature (e.g. a baby womp rat) that aggros at the lair BEFORE the
-	//     hunter acquires a target — scanForTarget early-returns while in combat,
-	//     so the hunter is stuck in combat, never scanning, and dies.
-	// It never moves the bot (no second movement driver).
+	// which stays live through the travel legs even when the active tick is idle.
+	// It fights back at WHATEVER is attacking the hunter on a pure movement leg
+	// (e.g. an interceptor between the city and the lair — TRAVEL_TO_LAIR can
+	// leave the active tick sparse). To keep the two independently-scheduled loops
+	// from racing the mission-target state, onTick does NOT own targetOid: in
+	// HUNTING it defers entirely to runActiveTick (which handles the lair stand,
+	// including a creature that aggros before a target is acquired), and elsewhere
+	// it only self-defends via the interceptor path. It never moves the bot.
 	ManagedReference<AiAgent*> strongAgent = agent;
 	if (strongAgent == nullptr)
 		return;
@@ -219,16 +216,29 @@ void SimHunterController::onTick() {
 	if (!strongAgent->isInCombat())
 		return;
 
-	// A live acquired mission target is driven by the active-tick HUNTING
-	// handler — don't fight over it. Otherwise defend against the real attacker.
-	if (targetOid != 0) {
-		CreatureObject* missionTarget = nullptr;
-		AiAgent* missionTargetAgent = nullptr;
-		if (targetIsLive(targetOid, missionTarget, missionTargetAgent))
-			return;
-	}
+	// Concurrency: onTick (ArrivalCheckTask) and runActiveTick
+	// (SimHunterActiveTickTask) are independently scheduled and can run on
+	// different task-pool threads. runActiveTick is the SOLE writer of targetOid
+	// and the mission observer (both are HUNTING-scoped: targetOid is set only by
+	// selectTarget during HUNTING and cleared before the phase is left). To avoid
+	// racing that state, onTick never promotes a mission target — it only
+	// self-defends, and only in the travel/movement legs where runActiveTick's
+	// combat handler does not run. In HUNTING, runActiveTick owns combat.
+	if (phase == HUNTING)
+		return;
 
-	defendAgainstInterceptor(strongAgent);
+	// Interceptor-only self-defense: fight whatever is actually attacking, via
+	// startCombat/setTargetObject/activateAiBehavior, without ever touching
+	// targetOid or the observer. In the phases this code runs (travel/movement
+	// legs — RETREATING/HEALING and HUNTING have already returned above, and
+	// only those plus HUNTING ever hold a non-zero targetOid), targetOid is 0,
+	// so resetInterceptorCombat preserves it and cannot abandon a mission target.
+	ManagedReference<CreatureObject*> attacker;
+	ManagedReference<AiAgent*> attackerAgent;
+	if (selectActiveCombatAttacker(strongAgent, attacker, attackerAgent))
+		defendAgainstInterceptor(strongAgent, attacker.get());
+	else
+		resetInterceptorCombat();
 }
 
 bool SimHunterController::shouldContinueArrivalChecks() const {
@@ -801,10 +811,19 @@ void SimHunterController::runActiveTick() {
 		return;
 
 	if (strongAgent->isInCombat()) {
-		ManagedReference<SceneObject*> defenderScene =
-			strongAgent->getMainDefender();
-		CreatureObject* defender = defenderScene == nullptr ? nullptr :
-			defenderScene->asCreatureObject();
+		// Select and engage the actual attacker before any reachability or
+		// stalemate bookkeeping. The defender list can contain a stale first
+		// entry while a nearer creature is the one still attacking. runActiveTick
+		// is the sole owner of targetOid / the mission observer among the tick
+		// loops; onTick only self-defends during travel legs (see onTick).
+		ManagedReference<CreatureObject*> selectedAttacker =
+			engageActiveAttacker(strongAgent);
+		if (selectedAttacker == nullptr) {
+			scheduleActiveTick(2000);
+			return;
+		}
+
+		CreatureObject* defender = selectedAttacker.get();
 		AiAgent* defenderAgent = defender == nullptr ? nullptr :
 			defender->asAiAgent();
 		bool reachable = defender != nullptr && defenderAgent != nullptr &&
@@ -814,9 +833,21 @@ void SimHunterController::runActiveTick() {
 				SimPlayerManager::instance()->getPveHunterScanRadiusMeters() + 24.f;
 
 		if (!reachable) {
-			resetCombatGuard();
-			if (++phantomCombatTicks >= 6)
-				clearStaleCombat("phantom_combat");
+			if (++phantomCombatTicks >= 6) {
+				if (defender != nullptr && targetOid != 0 &&
+						targetOid == defender->getObjectID() &&
+						targetMatchesSpecies(defender)) {
+					clearStaleCombat("phantom_combat");
+				} else {
+					CreatureObject* missionTarget = nullptr;
+					AiAgent* missionTargetAgent = nullptr;
+					if (targetOid != 0 && targetIsLive(targetOid, missionTarget,
+							missionTargetAgent))
+						resetInterceptorCombat();
+					else
+						clearStaleCombat("phantom_combat");
+				}
+			}
 			scheduleActiveTick(2000);
 			return;
 		}
@@ -839,12 +870,24 @@ void SimHunterController::runActiveTick() {
 			lastCombatProgressMs = nowMs;
 		} else if (lastCombatProgressMs != 0 &&
 				nowMs - lastCombatProgressMs > 45000) {
-			clearStaleCombat("combat_stalemate");
+			bool missionTargetEngaged = targetOid != 0 &&
+				targetOid == defender->getObjectID() &&
+				targetMatchesSpecies(defender);
+			if (missionTargetEngaged) {
+				clearStaleCombat("combat_stalemate");
+			} else {
+				CreatureObject* missionTarget = nullptr;
+				AiAgent* missionTargetAgent = nullptr;
+				if (targetOid != 0 && targetIsLive(targetOid, missionTarget,
+						missionTargetAgent))
+					resetInterceptorCombat();
+				else
+					clearStaleCombat("combat_stalemate");
+			}
+			scheduleActiveTick(SimPlayerManager::instance()->
+				getPveHunterActiveTickSeconds() * 1000);
+			return;
 		}
-
-		if (targetOid != 0 && strongAgent->getDistanceTo(defender) >
-				SimPlayerManager::instance()->getPveHunterWeaponRangeMeters())
-			moveToTarget();
 
 		scheduleActiveTick(SimPlayerManager::instance()->
 			getPveHunterActiveTickSeconds() * 1000);
@@ -984,8 +1027,173 @@ void SimHunterController::scanForTarget() {
 	}
 }
 
+bool SimHunterController::selectActiveCombatAttacker(AiAgent* hunter,
+		ManagedReference<CreatureObject*>& outAttacker,
+		ManagedReference<AiAgent*>& outAttackerAgent) {
+	outAttacker = nullptr;
+	outAttackerAgent = nullptr;
+
+	if (hunter == nullptr)
+		return false;
+
+	ManagedReference<CreatureObject*> nearestAttacker;
+	ManagedReference<AiAgent*> nearestAttackerAgent;
+	float nearestDistance = 0.f;
+
+	ManagedReference<CreatureObject*> followedAttacker;
+	ManagedReference<AiAgent*> followedAttackerAgent;
+	float followedDistance = 0.f;
+	bool hasFollowedAttacker = false;
+
+	// Snapshot the defender list and follow target under the hunter lock so a
+	// concurrent (@preLocked) removeDefender cannot shrink the vector between the
+	// size() read and the element access — getSafe locks its own DeltaVector
+	// mutex but does not bounds-check a stale index. Filtering and distance math
+	// then run on the retained strong references outside the lock.
+	Vector<ManagedReference<CreatureObject*> > candidates;
+	uint64 followedOid = 0;
+	{
+		Locker agentLock(hunter);
+		const DeltaVector<ManagedReference<SceneObject*> >* defenderList =
+			hunter->getDefenderList();
+		if (defenderList != nullptr) {
+			for (int i = 0; i < defenderList->size(); ++i) {
+				ManagedReference<SceneObject*> defender = defenderList->getSafe(i);
+				CreatureObject* candidate = defender == nullptr ? nullptr :
+					defender->asCreatureObject();
+				if (candidate != nullptr)
+					candidates.add(candidate);
+			}
+		}
+		ManagedReference<SceneObject*> followObject = hunter->getFollowObject();
+		followedOid = followObject == nullptr ? 0 : followObject->getObjectID();
+	}
+
+	if (candidates.size() == 0)
+		return false;
+
+	float reachabilityRadius = SimPlayerManager::instance()->
+		getPveHunterScanRadiusMeters() + 24.f;
+
+	for (int i = 0; i < candidates.size(); ++i) {
+		ManagedReference<CreatureObject*> candidateReference = candidates.get(i);
+		CreatureObject* candidate = candidateReference.get();
+		AiAgent* candidateAgent = candidate == nullptr ? nullptr :
+			candidate->asAiAgent();
+
+		if (candidate == nullptr || candidateAgent == nullptr ||
+				candidate == hunter || candidate->isPlayerCreature() ||
+				SimPlayerManager::instance()->isSimPresenceCreature(candidate) ||
+				candidateAgent->getSimPlayerBot() || candidate->isDead() ||
+				candidate->isIncapacitated() || candidate->getParent() != nullptr ||
+				!candidate->isAttackableBy(hunter))
+			continue;
+
+		float distance = hunter->getDistanceTo(candidate);
+		if (distance > reachabilityRadius)
+			continue;
+
+		ManagedReference<AiAgent*> candidateAgentReference = candidateAgent;
+		if (nearestAttacker == nullptr || distance < nearestDistance) {
+			nearestAttacker = candidateReference;
+			nearestAttackerAgent = candidateAgentReference;
+			nearestDistance = distance;
+		}
+
+		if (followedOid != 0 && candidate->getObjectID() == followedOid) {
+			followedAttacker = candidateReference;
+			followedAttackerAgent = candidateAgentReference;
+			followedDistance = distance;
+			hasFollowedAttacker = true;
+		}
+	}
+
+	if (nearestAttacker == nullptr)
+		return false;
+
+	float weaponRange = SimPlayerManager::instance()->
+		getPveHunterWeaponRangeMeters();
+	float hysteresis = weaponRange * 0.5f;
+	if (hasFollowedAttacker && followedDistance <= weaponRange &&
+			!(nearestDistance + hysteresis < followedDistance)) {
+		outAttacker = followedAttacker;
+		outAttackerAgent = followedAttackerAgent;
+	} else {
+		outAttacker = nearestAttacker;
+		outAttackerAgent = nearestAttackerAgent;
+	}
+
+	return outAttacker != nullptr && outAttackerAgent != nullptr;
+}
+
+ManagedReference<CreatureObject*> SimHunterController::engageActiveAttacker(
+		AiAgent* hunter) {
+	// If the current mission target just died, let its queued destruction handoff
+	// (onHuntDestruction) credit the kill before we retarget. That handoff is
+	// rejected once targetOid advances (targetOid != destroyedTargetOid), so
+	// proactively promoting a new target here would silently drop a legitimate
+	// kill. The handoff runs promptly for a real kill and clears targetOid /
+	// destructionHandled, after which retargeting resumes normally next tick.
+	//
+	// Only defer when an observer is actually installed on this target
+	// (observerTargetOid == targetOid && targetObserver != nullptr). targetOid is
+	// assigned while approaching but the observer is registered only once in
+	// weapon range (engageTarget); if the target dies externally before that, no
+	// handoff will ever come, so deferring would suppress combat forever. Without
+	// an observer we fall through and retarget/clean up the dead target normally.
+	if (targetOid != 0 && !destructionHandled &&
+			observerTargetOid == targetOid && targetObserver != nullptr) {
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> current = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(targetOid);
+		CreatureObject* currentCreature = current == nullptr ? nullptr :
+			current->asCreatureObject();
+		if (currentCreature != nullptr && currentCreature->isDead())
+			return nullptr;
+	}
+
+	ManagedReference<CreatureObject*> attacker;
+	ManagedReference<AiAgent*> attackerAgent;
+	if (!selectActiveCombatAttacker(hunter, attacker, attackerAgent)) {
+		CreatureObject* missionTarget = nullptr;
+		AiAgent* missionTargetAgent = nullptr;
+		if (targetOid != 0 && targetIsLive(targetOid, missionTarget,
+				missionTargetAgent)) {
+			resetInterceptorCombat();
+		} else {
+			if (++phantomCombatTicks >= 6)
+				clearStaleCombat("phantom_combat");
+		}
+		return nullptr;
+	}
+
+	ManagedReference<SceneObject*> currentFollow;
+	if (hunter != nullptr)
+		currentFollow = hunter->getFollowObject();
+	if (currentFollow != nullptr &&
+			currentFollow->getObjectID() == attacker->getObjectID()) {
+		if (targetOid != 0 && targetOid == attacker->getObjectID() &&
+				targetMatchesSpecies(attacker.get()) &&
+				hunter->getDistanceTo(attacker) >
+					SimPlayerManager::instance()->getPveHunterWeaponRangeMeters())
+			moveToTarget();
+		return attacker;
+	}
+
+	if (targetMatchesSpecies(attacker.get())) {
+		selectTarget(attackerAgent.get());
+		return attacker;
+	}
+
+	if (!defendAgainstInterceptor(hunter, attacker.get()))
+		return nullptr;
+
+	return attacker;
+}
+
 void SimHunterController::selectTarget(AiAgent* target) {
-	if (target == nullptr || target->getObjectID() == 0)
+	if (target == nullptr || target->getObjectID() == 0 ||
+		!targetMatchesSpecies(target))
 		return;
 
 	uint64 selectedOid = target->getObjectID();
@@ -1290,7 +1498,59 @@ void SimHunterController::resetCombatGuard() {
 	lastCombatProgressMs = 0;
 }
 
+void SimHunterController::shedAllDefendersBilaterally(AiAgent* hunter) {
+	if (hunter == nullptr)
+		return;
+
+	Locker agentLock(hunter);
+	const DeltaVector<ManagedReference<SceneObject*> >* defenderList =
+		hunter->getDefenderList();
+	Vector<ManagedReference<CreatureObject*> > defenders;
+
+	if (defenderList != nullptr) {
+		for (int i = 0; i < defenderList->size(); ++i) {
+			ManagedReference<SceneObject*> object = defenderList->getSafe(i);
+			CreatureObject* defender = object == nullptr ? nullptr :
+				object->asCreatureObject();
+			if (defender != nullptr)
+				defenders.add(defender);
+		}
+	}
+
+	for (int i = 0; i < defenders.size(); ++i) {
+		ManagedReference<CreatureObject*> defender = defenders.get(i);
+		if (defender == nullptr)
+			continue;
+
+		Locker defenderLock(defender, hunter);
+		hunter->removeDefender(defender);
+		defender->removeDefender(hunter);
+	}
+}
+
+void SimHunterController::resetInterceptorCombat() {
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr)
+		return;
+
+	// This helper owns and releases its locks before the pre-locked combat
+	// methods below are called, matching the existing disengage choreography.
+	shedAllDefendersBilaterally(strongAgent);
+
+	Locker agentLock(strongAgent);
+	strongAgent->clearCombatState(true);
+	strongAgent->setTargetObject(nullptr);
+	strongAgent->setFollowObject(nullptr);
+	strongAgent->setWatchObject(nullptr);
+	strongAgent->clearQueueActions(true);
+	state = SimPlayerController::IDLE;
+	resetCombatGuard();
+}
+
 void SimHunterController::clearStaleCombat(const String& reason) {
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent != nullptr)
+		shedAllDefendersBilaterally(strongAgent);
 	dropTargetObserver();
 	disengageTarget(false);
 	targetOid = 0;
@@ -1301,43 +1561,44 @@ void SimHunterController::clearStaleCombat(const String& reason) {
 		" reason=" + reason, true);
 }
 
-bool SimHunterController::defendAgainstInterceptor(AiAgent* hunter) {
-	if (hunter == nullptr)
-		return false;
-
-	ManagedReference<SceneObject*> defenderScene = hunter->getMainDefender();
-	CreatureObject* attacker = defenderScene == nullptr ? nullptr :
-		defenderScene->asCreatureObject();
-
-	// Only fight a live, reachable, out-of-building attacker. If nothing
-	// qualifies, shed the (stale) combat state so the movement layer resumes the
-	// interrupted travel leg (disengageTarget preserves finalDestination).
-	if (attacker == nullptr || attacker->isDead() || attacker->isIncapacitated() ||
-			attacker->getParent() != nullptr ||
+bool SimHunterController::defendAgainstInterceptor(AiAgent* hunter,
+		CreatureObject* attacker) {
+	if (hunter == nullptr || attacker == nullptr ||
+			attacker->isPlayerCreature() ||
+			SimPlayerManager::instance()->isSimPresenceCreature(attacker) ||
+			attacker->asAiAgent() == nullptr ||
+			attacker->asAiAgent()->getSimPlayerBot() || attacker->isDead() ||
+			attacker->isIncapacitated() || attacker->getParent() != nullptr ||
+			!attacker->isAttackableBy(hunter) ||
 			hunter->getDistanceTo(attacker) >
 				SimPlayerManager::instance()->getPveHunterScanRadiusMeters() + 24.f) {
-		clearStaleCombat("intercept_cleared");
+		CreatureObject* missionTarget = nullptr;
+		AiAgent* missionTargetAgent = nullptr;
+		if (targetOid != 0 && targetIsLive(targetOid, missionTarget,
+				missionTargetAgent))
+			resetInterceptorCombat();
+		else
+			clearStaleCombat("intercept_cleared");
 		return false;
 	}
 
-	// Already fighting this interceptor: the AI combat is driving attacks, leave
-	// it be (avoids re-issuing startCombat on every arrival tick).
+	// Already fighting this selected interceptor: the AI combat is driving
+	// attacks, so avoid re-issuing startCombat on every arrival tick.
 	ManagedReference<SceneObject*> current = hunter->getFollowObject();
 	if (current != nullptr && current->getObjectID() == attacker->getObjectID())
 		return true;
 
-	// Fight back, mirroring engageTarget's real-combat contract (attacker locked;
-	// startCombat cross-locks the defender). Setting the attacker as the target
-	// is what makes the AI combat actually fire — the creature's inflictDamage
-	// only addDefender()s the hunter, it never sets its followObject, so without
-	// this the bot just stands there and dies (owner-observed).
+	// Fight back, mirroring engageTarget's real-combat contract (attacker
+	// locked; startCombat cross-locks the defender). The selector already chose
+	// this attacker, so do not inspect or reselect from the defender list here.
 	Locker agentLock(hunter);
-	if (CombatManager::instance()->startCombat(hunter, attacker)) {
-		hunter->setTargetObject(attacker);
-		// Wake the combat behavior tree so the hunter shoots back promptly
-		// instead of idling on its long behavior schedule (see engageTarget).
-		hunter->activateAiBehavior(true);
-	}
+	if (!CombatManager::instance()->startCombat(hunter, attacker))
+		return false;
+
+	hunter->setTargetObject(attacker);
+	// Wake the combat behavior tree so the hunter shoots back promptly instead
+	// of idling on its long behavior schedule (see engageTarget).
+	hunter->activateAiBehavior(true);
 
 	return true;
 }

@@ -293,6 +293,16 @@ This is this fork's primary custom subsystem, layered on top of the stock
   pull → kill → simulated harvest) that closes the crafter→hunter demand loop via
   the acquisition/demand ledger. Combat is **real** (`CombatManager::startCombat`
   with an AI-aligned rifle; wild creatures retaliate) but loot stays simulated.
+  Neutral hunters use player-safe targeting and defender-driven re-engagement so
+  they reject real players and follow the actual creature attacking them (the
+  player-side guard mirrors `AiAgentImplementation::isAttackableBy` and is consulted
+  by both `CombatManager::startCombat` and `getAreaTargets`, so it also stops AoE
+  splash onto players). The controller's two tick loops — `onTick` (arrival cadence)
+  and `runActiveTick` (`SimHunterActiveTickTask`) — run on independent task-pool
+  threads, so combat-target state (`targetOid`/observer) follows a single-writer rule:
+  `runActiveTick` owns it (HUNTING-scoped), while `onTick` only self-defends via the
+  interceptor path on travel legs and never writes it. Defender-list reads snapshot
+  under the hunter lock (`add`/`removeDefender` are `@preLocked`).
   Hunter-opt-in navmesh/overland hybrid movement (`usesNavmeshHybridMovement()`,
   base false so miners/PvP are unchanged): navmesh inside cities, overland in the
   wild. Bodies spawn `PLAYER | ATTACKABLE` and force faction 0 so wildlife fights

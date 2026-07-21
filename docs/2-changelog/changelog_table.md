@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.4.5` | 2 | fix: P.8.4 PvE hunter combat targeting — player-safe attack guard + defender-driven re-engagement |
 | `0.4.4` | 2 | F_0.4.4 P.8.3: PvE hunter combat & movement realism (real combat, navmesh-aware travel, self-defense + combat template, #/wilds dashboard) |
 | `0.3.1` | 1 | fix: combat stalemate break + collector wait jitter (Theed doorway statue deadlock) |
 | `0.3.0` | 1 | feat: P.6.5d city-loop realism - real shuttleports, cantina hangouts, break-off cohesion |
@@ -10,6 +11,14 @@
 | `0.1.0` | 1 | chore: initialize TRIP workflow |
 
 # Changelog Summary
+
+- **v0.4.5 (P.8.4 PvE Hunter Combat-Targeting Fixes - Week 2, 21-07-2026)**:
+  - **Fix**: two owner-observed hunter combat bugs, both rooted in the controller driving combat off its own `targetOid` pin rather than `CombatManager`'s real defender state. (1) A faction-0 hunter's area attack could damage and then lock onto a real player — fixed by mirroring the sim-bot guard on the player side of `CreatureObject::isAttackableBy` (one chokepoint that also covers AoE splash via `getAreaTargets`). (2) The hunter would not re-fire on a closer creature that started attacking it — now selects the nearest live/attackable/non-player defender (bounded hysteresis) and re-engages via `startCombat` + `activateAiBehavior`.
+  - **Hardening (from code review)**: single-writer mission-target ownership (`runActiveTick` sole writer; `onTick` defers in HUNTING, interceptor-only on travel legs) to remove an `onTick`/`runActiveTick` cross-thread race; defender-list snapshot under the hunter lock (OOB guard); shared bilateral defender cleanup; observer-gated pending-destruction guard so a just-killed target still credits quota without stalling combat.
+  - **Scope**: gated to `getSimPlayerBot()` hunters (miners/PvP/NPCs unchanged); no IDL/schema/config changes; simulation-only.
+  - **Review**: Codex 4 rounds → APPROVED (`docs/3-code-review/CR_w2_v0.4.5.md`), with an owner-verified live addendum (in-game: no player AoE damage, correct re-engagement).
+  - **Files**: CreatureObjectImplementation.cpp, SimHunterController.{h,cpp}, ARCHI.md, ai-pve-playerbot-design.md, COVERAGE-DEBT.md, F_0.4.5 plan.
+  - **Note**: ff-merged into `feat/pve-acquisition-demand-ledger` only, NOT `miner-ai`. Pre-existing `death_watch_wraith.lua`/`rifle_t21.lua` and `engine3` working-tree changes excluded.
 
 - **v0.4.4 (P.8.3 PvE Hunter Combat & Movement Realism - Week 2, 20-07-2026)**:
   - **Feature**: makes the live PvE hunter loop read like real player activity (simulation-only loot) — real mutual combat via `CombatManager::startCombat` with the AI-aligned rifle; hunter-opt-in navmesh/overland hybrid movement (navmesh in cities, overland in the wild, validated egress); de-garbled per-phase announcements; HAM-filling non-stacking buffs; new read-only `#/wilds` dashboard route with live hunter positions.
