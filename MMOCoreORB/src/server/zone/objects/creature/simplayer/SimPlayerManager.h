@@ -20,6 +20,7 @@
 #include "engine/util/Observer.h"
 
 #include "SimPlayerController.h"
+#include "server/zone/objects/cell/CellObject.h"
 
 using namespace server::zone;
 
@@ -199,6 +200,25 @@ struct PveBuffSpec {
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// P.8.6 Phase 2: provider resolution snapshot consumed by the hunter
+// controller. The cell reference is intentionally strong until the approach
+// leg has submitted its cell-aware path.
+struct PveBuffProviders {
+	struct Provider {
+		bool found = false;
+		uint64 oid = 0;
+		ManagedReference<CellObject*> cell;
+		uint64 cellId = 0;
+		Vector3 worldPos;
+		Vector3 localPos;
+	};
+
+	Provider doctor;
+	Provider musician;
+	Provider dancer;
+	bool pending = false;
 };
 
 // P.8.0b: zone-thread readers use an atomically published immutable copy. The
@@ -1259,6 +1279,8 @@ private:
 	VectorMap<String, int> missionTerminalCityState;
 	VectorMap<uint64, PveHuntLair> pveHuntLairs;
 	Vector<PveBuffSpec> pveHunterBuffs;
+	Vector<PveBuffSpec> pveRealBuffFallbackSpecs;
+	VectorMap<String, String> pveBuffProviderResolveStates;
 	VectorMap<uint64, PveHuntOrder> pveHuntOrders;
 	VectorMap<String, uint64> pveSessionHarvestByFamily;
 	VectorMap<String, uint64> pveCreatureSupplyBootBaseline;
@@ -1278,6 +1300,12 @@ private:
 	uint64 pveHunterLastSiteAnnounceMs = 0;
 	uint64 pveMissionLairsSpawned = 0;
 	uint64 pveMissionLairsCleaned = 0;
+	uint64 pveDoctorInteractions = 0;
+	uint64 pveDancerWatches = 0;
+	uint64 pveMusicianListens = 0;
+	uint64 pveBuffDetoursSkipped = 0;
+	uint64 pveSyntheticFallbacks = 0;
+	VectorMap<uint64, String> pveBuffLastSourceByBody;
 	VectorMap<uint64, uint64> pveHunterLastAnnounceByIdentity;
 	std::shared_ptr<const PvePresenceSnapshot> pvePresenceSnapshot;
 	Mutex pveMutex;
@@ -1287,6 +1315,18 @@ private:
 	bool pveEnabled = false;
 	bool pveHunterBotsEnabled = false;
 	bool pveMissionHuntEnabled = false;
+	bool pveRealBuffsEnabled = false;
+	bool pveRealBuffsFallbackSynthetic = true;
+	int pveRealBuffReapplySeconds = 900;
+	float pveBuffProviderScanRadiusMeters = 400.f;
+	String pveDoctorProviderName = "Doctor Buffer";
+	String pveMusicianProviderName = "Musician Buffer";
+	String pveDancerProviderName = "Dancer Buffer";
+	String pveEntertainerTemplate = "entertainer";
+	String pveDoctorTemplate = "smart_doctor_buffer";
+	int pveDoctorInteractionTimeoutMs = 45000;
+	int pveEntertainerDwellMs = 4000;
+	float pveProviderApproachRangeMeters = 8.f;
 	float pveMissionSpawnDistanceMeters = 200.f;
 	float pveMissionTerminalScanRadiusMeters = 600.f;
 	int pveMissionMaxSpawnPointTries = 32;
@@ -1948,10 +1988,40 @@ public:
 		const String& planet, const String& city, const Vector3& position);
 	void recordPveHunterMissionAdds(uint64 identityId, uint64 bodyOid,
 		int adds);
+	void recordPveDoctorInteraction();
+	void recordPveDancerWatch();
+	void recordPveMusicianListen();
+	void recordPveBuffDetourSkipped();
+	void recordPveSyntheticFallback(uint64 bodyOid);
+	void recordPveBuffSource(uint64 bodyOid, const String& source);
 	bool isPveMissionHuntEnabled() const { return pveMissionHuntEnabled; }
+	bool isPveRealBuffsEnabled() const { return pveRealBuffsEnabled; }
+	bool isPveRealBuffsFallbackSyntheticEnabled() const {
+		return pveRealBuffsFallbackSynthetic;
+	}
 	bool getPveHunterSpecies(const String& key, PveHuntSpecies& species);
 	bool getPveHunterOrder(uint64 identityId, PveHuntOrder& order);
 	void getPveHunterBuffs(Vector<PveBuffSpec>& buffs);
+	void getPveRealBuffFallbackSpecs(Vector<PveBuffSpec>& buffs);
+	void getPveTrackedBuffCrcs(Vector<uint32>& crcs) const;
+	int getPveRealBuffReapplyThresholdSeconds() const {
+		return pveRealBuffReapplySeconds;
+	}
+	float getPveBuffProviderScanRadiusMeters() const {
+		return pveBuffProviderScanRadiusMeters;
+	}
+	String getPveDoctorProviderName() const { return pveDoctorProviderName; }
+	String getPveMusicianProviderName() const { return pveMusicianProviderName; }
+	String getPveDancerProviderName() const { return pveDancerProviderName; }
+	String getPveEntertainerTemplate() const { return pveEntertainerTemplate; }
+	String getPveDoctorTemplate() const { return pveDoctorTemplate; }
+	int getPveDoctorInteractionTimeoutMs() const {
+		return pveDoctorInteractionTimeoutMs;
+	}
+	int getPveEntertainerDwellMs() const { return pveEntertainerDwellMs; }
+	float getPveProviderApproachRangeMeters() const {
+		return pveProviderApproachRangeMeters;
+	}
 	float getPveHunterRetreatHamPct() const { return pveRetreatHamPct; }
 	float getPveHunterResumeHamPct() const { return pveResumeHamPct; }
 	int getPveHunterMaxRetreatCycles() const { return pveMaxRetreatCycles; }
@@ -1981,6 +2051,8 @@ public:
 	int getPveHunterAnnounceCooldownSeconds() const { return pveAnnounceCooldownSeconds; }
 	bool getPveHomeLocations(const String& planet, const String& city,
 		Vector3& cantina, Vector3& medCenter, Vector3& home);
+	bool resolvePveBuffProviders(const String& planet, const String& city,
+		PveBuffProviders& out);
 	void announcePveHunterEvent(uint64 bodyOid, const String& site,
 		const String& detail = "");
 

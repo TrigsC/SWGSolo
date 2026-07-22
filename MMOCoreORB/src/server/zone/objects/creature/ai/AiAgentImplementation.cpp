@@ -5225,8 +5225,7 @@ void AiAgentImplementation::healEnhanceCreatureTarget(CreatureObject* target, St
 
     Locker locker(target);
 
-    if (target->hasBuff(crc))
-        return;
+    target->removeBuff(crc);
 
     ManagedReference<Buff*> buff = new Buff(target, crc, duration, buffType);
 

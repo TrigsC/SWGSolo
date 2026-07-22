@@ -699,6 +699,101 @@ SimPlayerManagerConfig = {
                 modifier = 2500, -- realistic entertainer-tier enhance (was 100 = imperceptible)
             },
         },
+        -- P.8.6 Phase 1: real buff need detection and fallback configuration.
+        -- The feature remains disabled until the provider interaction phases
+        -- are live-verified. Keep this list separate from the legacy buffs
+        -- table above so the gated-off synthetic behavior does not change.
+        realBuffs = {
+            enabled = true,
+            fallbackToSynthetic = true,
+            reapplyThresholdSeconds = 900,
+            providerScanRadiusMeters = 400,
+            doctorProviderName = "Doctor Buffer",
+            musicianProviderName = "Musician Buffer",
+            dancerProviderName = "Dancer Buffer",
+            entertainerTemplate = "entertainer",
+            doctorTemplate = "smart_doctor_buffer",
+            doctorInteractionTimeoutMs = 45000,
+            entertainerDwellMs = 4000,
+            providerApproachRangeMeters = 8,
+            -- Keep these nine entries aligned with
+            -- SimPlayerManager::getPveTrackedBuffCrcs: six medical buffs,
+            -- dance mind, and music focus/willpower.
+            fallbackBuffs = {
+                {
+                    name = "medical_enhance_health",
+                    crc = "medical_enhance_health",
+                    durationSeconds = 7200,
+                    type = 2, -- BuffType::MEDICAL
+                    attribute = 0, -- CreatureAttribute::HEALTH
+                    modifier = 2500,
+                },
+                {
+                    name = "medical_enhance_strength",
+                    crc = "medical_enhance_strength",
+                    durationSeconds = 7200,
+                    type = 2, -- BuffType::MEDICAL
+                    attribute = 1, -- CreatureAttribute::STRENGTH
+                    modifier = 2500,
+                },
+                {
+                    name = "medical_enhance_constitution",
+                    crc = "medical_enhance_constitution",
+                    durationSeconds = 7200,
+                    type = 2, -- BuffType::MEDICAL
+                    attribute = 2, -- CreatureAttribute::CONSTITUTION
+                    modifier = 2500,
+                },
+                {
+                    name = "medical_enhance_action",
+                    crc = "medical_enhance_action",
+                    durationSeconds = 7200,
+                    type = 2, -- BuffType::MEDICAL
+                    attribute = 3, -- CreatureAttribute::ACTION
+                    modifier = 2500,
+                },
+                {
+                    name = "medical_enhance_quickness",
+                    crc = "medical_enhance_quickness",
+                    durationSeconds = 7200,
+                    type = 2, -- BuffType::MEDICAL
+                    attribute = 4, -- CreatureAttribute::QUICKNESS
+                    modifier = 2500,
+                },
+                {
+                    name = "medical_enhance_stamina",
+                    crc = "medical_enhance_stamina",
+                    durationSeconds = 7200,
+                    type = 2, -- BuffType::MEDICAL
+                    attribute = 5, -- CreatureAttribute::STAMINA
+                    modifier = 2500,
+                },
+                {
+                    name = "performance_enhance_dance_mind",
+                    crc = "performance_enhance_dance_mind",
+                    durationSeconds = 7200,
+                    type = 3, -- BuffType::PERFORMANCE
+                    attribute = 6, -- CreatureAttribute::MIND
+                    modifier = 2500,
+                },
+                {
+                    name = "performance_enhance_music_focus",
+                    crc = "performance_enhance_music_focus",
+                    durationSeconds = 7200,
+                    type = 3, -- BuffType::PERFORMANCE
+                    attribute = 7, -- CreatureAttribute::FOCUS
+                    modifier = 2500,
+                },
+                {
+                    name = "performance_enhance_music_willpower",
+                    crc = "performance_enhance_music_willpower",
+                    durationSeconds = 7200,
+                    type = 3, -- BuffType::PERFORMANCE
+                    attribute = 8, -- CreatureAttribute::WILLPOWER
+                    modifier = 2500,
+                },
+            },
+        },
         combat = {
             retreatHamPct = 30,
             resumeHamPct = 70,

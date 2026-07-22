@@ -136,6 +136,7 @@ Luna<LuaAiAgent>::RegType LuaAiAgent::Register[] = {
 		{ "setNoAiAggro", &LuaAiAgent::setNoAiAggro },
 		{ "doDespawn", &LuaAiAgent::doDespawn },
 		{ "getCreatureTemplateName", &LuaAiAgent::getCreatureTemplateName },
+		{ "isSimPlayerBot", &LuaAiAgent::isSimPlayerBot },
 		{ "isInRangeOfHome", &LuaAiAgent::isInRangeOfHome },
 		{ "getPatrolPointsSize", &LuaAiAgent::getPatrolPointsSize },
 		{ "addObjectFlag", &LuaAiAgent::addObjectFlag },
@@ -1020,6 +1021,11 @@ int LuaAiAgent::getCreatureTemplateName(lua_State* L) {
     lua_pushstring(L, name.toCharArray());
 
     return 1;
+}
+
+int LuaAiAgent::isSimPlayerBot(lua_State* L) {
+	lua_pushboolean(L, realObject != nullptr && realObject->getSimPlayerBot());
+	return 1;
 }
 
 int LuaAiAgent::isInRangeOfHome(lua_State* L) {

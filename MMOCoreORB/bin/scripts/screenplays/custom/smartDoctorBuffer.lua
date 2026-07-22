@@ -182,6 +182,15 @@ local function persistSave(did, st)
 
     local pauseStart = (st.current and st.current.pauseStartSec) or 0
     writeData(k(did, "pauseStart"), pauseStart)
+
+    -- The sim-bot request token (generation + expiry) must survive across the
+    -- per-thread Lua states that run the deferred buff steps, so persist it with
+    -- the current target. botTokens (in-memory) is only valid same-thread.
+    local curBotGen = (st.current and st.current.botGeneration) or 0
+    writeData(k(did, "curBotGen"), curBotGen)
+
+    local curBotExp = (st.current and st.current.botExpiresAtSec) or 0
+    writeData(k(did, "curBotExp"), curBotExp)
 end
 
 local function persistLoad(did, st)
@@ -201,12 +210,16 @@ local function persistLoad(did, st)
     local curPid = readData(k(did, "curPid")) or 0
     local step = readData(k(did, "step")) or 0
     local pauseStart = readData(k(did, "pauseStart")) or 0
+    local curBotGen = readData(k(did, "curBotGen")) or 0
+    local curBotExp = readData(k(did, "curBotExp")) or 0
     if curPid ~= 0 then
         st.current = {
             playerId = curPid,
             stepIndex = (step ~= 0 and step or 1),
             pauseStartSec = (pauseStart ~= 0 and pauseStart or nil),
             lastValidSec = nowSec(),
+            botGeneration = (curBotGen ~= 0 and curBotGen or nil),
+            botExpiresAtSec = (curBotExp ~= 0 and curBotExp or nil),
         }
     else
         st.current = nil
@@ -224,6 +237,16 @@ local function getCreatureById(objectID)
     if pObj == nil then return nil end
     if not SceneObject(pObj):isCreatureObject() then return nil end
     return pObj
+end
+
+local function isSimPlayerBot(pObj)
+    if pObj == nil then return false end
+
+    local ok, isSimBot = pcall(function()
+        return AiAgent(pObj):isSimPlayerBot()
+    end)
+
+    return ok and isSimBot == true
 end
 
 local function getPlayerName(pPlayer)
@@ -503,8 +526,11 @@ local function getDoctorState(pDoctor)
             current = nil,
             lastRequestAt = {},
             lastSpokeAt = 0,
+            botTokens = {},
         }
     end
+
+    Doctor[did].botTokens = Doctor[did].botTokens or {}
 
     -- IMPORTANT: Always refresh from datastore so different Lua states stay in sync
     persistLoad(did, Doctor[did])
@@ -520,7 +546,6 @@ end
 
 local function removeFromQueue(st, playerId)
     if st == nil or playerId == nil or playerId == 0 then return end
-    if st.queueSet[playerId] ~= true then return end
 
     local newQ = {}
     for _, pid in ipairs(st.queue) do
@@ -528,6 +553,33 @@ local function removeFromQueue(st, playerId)
     end
     st.queue = newQ
     st.queueSet[playerId] = nil
+end
+
+local function isValidBotRequest(st, pDoctor, pPlayer)
+    if not isSimPlayerBot(pPlayer) then return true end
+    if st == nil or pDoctor == nil or pPlayer == nil then return false end
+
+    local pid = getId(pPlayer)
+    -- Prefer the token persisted with the current target (survives the
+    -- per-thread Lua states that run deferred steps); fall back to the
+    -- in-memory botTokens for same-thread pre-current checks.
+    local generation = 0
+    local expiresAtSec = 0
+    if st.current ~= nil and st.current.playerId == pid and
+            st.current.botGeneration ~= nil then
+        generation = tonumber(st.current.botGeneration) or 0
+        expiresAtSec = tonumber(st.current.botExpiresAtSec) or 0
+    else
+        local token = st.botTokens and st.botTokens[pid] or nil
+        if token == nil then return false end
+        generation = tonumber(token.generation) or 0
+        expiresAtSec = tonumber(token.expiresAtSec) or 0
+    end
+
+    if generation == 0 or nowSec() > expiresAtSec then return false end
+
+    local validTarget = isValidBuffTarget(pDoctor, pPlayer)
+    return validTarget == true
 end
 
 local function popNextValidFromQueue(pDoctor, st)
@@ -567,6 +619,7 @@ end
 local function tryChargePlayer(pDoctor, pPlayer, price)
     --logInfo("tryChargePlayer")
     if pPlayer == nil then return false, "invalid" end
+    if isSimPlayerBot(pPlayer) then return true, "sim_bot" end
     --local ghost = CreatureObject(pPlayer):getPlayerObject()
     --if ghost == nil then return false, "invalid" end
     if (CreatureObject(pPlayer):getCashCredits() < price) then
@@ -588,6 +641,8 @@ local function applyBuffStep(pDoctor, pPlayer, stepKey)
     CreatureObject(pDoctor):doAnimation("heal_other")
     return AiAgentBridge.applyMedicalBuffStep(pDoctor, pPlayer, stepKey)
 end
+
+local startBuffingNow
 
 local function advanceToNextTarget(pDoctor, st)
     if pDoctor == nil or st == nil then return end
@@ -615,6 +670,11 @@ local function advanceToNextTarget(pDoctor, st)
 
     local pNext = getCreatureById(nextPid)
     if pNext ~= nil then
+        if isSimPlayerBot(pNext) then
+            startBuffingNow(pDoctor, st, pNext)
+            return
+        end
+
         local line = dialogueLine("quote", pDoctor, pNext, st, nil, getMemoryTopic(nextPid))
         say(pDoctor, line)
         safeCreateEvent(SmartDoctorConfig.confirm_timeout_ms, "SmartDoctorBuffer", "onConfirmTimeout", pDoctor, tostring(nextPid))
@@ -656,6 +716,11 @@ function SmartDoctorBuffer:tick(pDoctor)
     end
 
     local ok, reason = isValidBuffTarget(pDoctor, pPlayer)
+    if isSimPlayerBot(pPlayer) and (not ok or not isValidBotRequest(st, pDoctor, pPlayer)) then
+        advanceToNextTarget(pDoctor, st)
+        return
+    end
+
     if ok then
         st.current.lastValidSec = nowSec()
         if st.state == "PAUSED" then
@@ -707,8 +772,15 @@ function SmartDoctorBuffer:applyNextStep(pDoctor, playerIdStr)
         return
     end
 
-    local ok = isValidBuffTarget(pDoctor, pPlayer)
+    local ok, reason = isValidBuffTarget(pDoctor, pPlayer)
     --logInfo("isValidBuffTarget: " .. tostring(ok))
+    if isSimPlayerBot(pPlayer) then
+        if not ok or not isValidBotRequest(st, pDoctor, pPlayer) then
+            advanceToNextTarget(pDoctor, st)
+            return
+        end
+    end
+
     if not ok then
         st.state = "PAUSED"
         st.current.pauseStartSec = nowSec()
@@ -830,10 +902,17 @@ local function enqueuePlayer(st, playerId)
     return true, "ok"
 end
 
-local function startBuffingNow(pDoctor, st, pPlayer)
+startBuffingNow = function(pDoctor, st, pPlayer)
     --logInfo("startBuffingNow")
     local pid = getId(pPlayer)
     if pid == 0 then return end
+
+    local simBot = isSimPlayerBot(pPlayer)
+    if simBot and not isValidBotRequest(st, pDoctor, pPlayer) then
+        advanceToNextTarget(pDoctor, st)
+        return
+    end
+
     --logInfo("startBuffingNow: pid <> 0")
     local okCharge = tryChargePlayer(pDoctor, pPlayer, SmartDoctorConfig.price)
     --logInfo("startBuffingNow: " .. tostring(okCharge))
@@ -845,6 +924,11 @@ local function startBuffingNow(pDoctor, st, pPlayer)
         return
     end
 
+    -- Carry the request token onto the current target so it persists across the
+    -- per-thread Lua states that run the deferred buff steps (botTokens is only
+    -- valid on the thread that received the request).
+    local botToken = simBot and st.botTokens and st.botTokens[pid] or nil
+
     st.negotiating = nil
     st.state = "BUFFING"
     st.current = {
@@ -853,11 +937,16 @@ local function startBuffingNow(pDoctor, st, pPlayer)
         charged = true,
         pauseStartSec = nil,
         lastValidSec = nowSec(),
+        botGeneration = botToken and (tonumber(botToken.generation) or nil) or nil,
+        botExpiresAtSec = botToken and
+            (tonumber(botToken.expiresAtSec) or nil) or nil,
     }
     persistSave(getId(pDoctor), st)
 
-    if not AiAgentBridge.wipeMedicalBuffs(pDoctor, pPlayer) then
-        logWarn("wipeEnhanceBuffs failed or binding not present.")
+    if not simBot then
+        if not AiAgentBridge.wipeMedicalBuffs(pDoctor, pPlayer) then
+            logWarn("wipeEnhanceBuffs failed or binding not present.")
+        end
     end
     --logInfo("Starting buffs for " .. getPlayerName(pPlayer) .. " price=" .. tostring(SmartDoctorConfig.price))
     safeCreateEvent(250, "SmartDoctorBuffer", "applyNextStep", pDoctor, tostring(pid))
@@ -1008,6 +1097,11 @@ function SmartDoctorBuffer:handleChat(pDoctor, pSpeaker, message)
         --print(string.format("[SmartDoctor][DEBUG] AFTER NEGOTIATING persist did=%s state=%s negPid=%s",
         --    tostring(did), tostring(st.state), tostring(st.negotiating and st.negotiating.playerId)
         --))
+        if isSimPlayerBot(pSpeaker) then
+            startBuffingNow(pDoctor, st, pSpeaker)
+            return true
+        end
+
         say(pDoctor, dialogueLine("quote", pDoctor, pSpeaker, st, nil, getMemoryTopic(speakerId)))
         --faceTarget(pDoctor, pSpeaker)
 
@@ -1034,6 +1128,80 @@ function SmartDoctorBuffer:handleChat(pDoctor, pSpeaker, message)
     local eta = estimateEtaSeconds(st, queuePos)
     local extra = { queuePos = queuePos, etaSeconds = eta, currentTargetName = currentName }
     say(pDoctor, dialogueLine("busy", pDoctor, pSpeaker, st, extra, getMemoryTopic(speakerId)))
+    return true
+end
+
+function SmartDoctorBuffer:botBuffRequest(pDoctor, argsString)
+    if pDoctor == nil or argsString == nil then return false end
+
+    local botOidString, generationString, deadlineString = string.match(
+        tostring(argsString), "^([^:]+):([^:]+):([^:]+)$")
+    local botOid = tonumber(botOidString) or 0
+    local generation = tonumber(generationString) or 0
+    local deadlineSec = tonumber(deadlineString) or 0
+    if botOid == 0 or generation == 0 or deadlineSec == 0 then return false end
+    if nowSec() > deadlineSec then return false end
+
+    local pBot = getCreatureById(botOid)
+    if pBot == nil or not isSimPlayerBot(pBot) then return false end
+
+    local st = getDoctorState(pDoctor)
+    if st == nil then return false end
+
+    local stored = st.botTokens[botOid]
+    if stored ~= nil and generation < (tonumber(stored.generation) or 0) then
+        return false
+    end
+
+    st.botTokens[botOid] = {
+        generation = generation,
+        expiresAtSec = deadlineSec,
+    }
+
+    return SmartDoctorBuffer:handleChat(pDoctor, pBot, "need a buff") == true
+end
+
+function SmartDoctorBuffer:botCancel(pDoctor, argsString)
+    if pDoctor == nil or argsString == nil then return false end
+
+    local botOidString, generationString = string.match(
+        tostring(argsString), "^([^:]+):([^:]+)$")
+    local botOid = tonumber(botOidString) or 0
+    local generation = tonumber(generationString) or 0
+    if botOid == 0 or generation == 0 then return false end
+
+    local st = getDoctorState(pDoctor)
+    if st == nil then return false end
+
+    -- Resolve the authoritative stored generation. The current target's token is
+    -- persisted (survives thread-local Lua states); the in-memory botTokens is a
+    -- same-thread fast path. Prefer the persisted current token so a stale cancel
+    -- for generation N cannot abort a newer persisted request N+1 (code-review
+    -- round 1).
+    local storedGeneration = 0
+    if st.current ~= nil and st.current.playerId == botOid and
+            st.current.botGeneration ~= nil then
+        storedGeneration = tonumber(st.current.botGeneration) or 0
+    else
+        local stored = st.botTokens[botOid]
+        storedGeneration = stored and (tonumber(stored.generation) or 0) or 0
+    end
+    if generation < storedGeneration then return false end
+
+    st.botTokens[botOid] = {
+        generation = math.max(generation, storedGeneration) + 1,
+        expiresAtSec = 0,
+    }
+    removeFromQueue(st, botOid)
+
+    local wasActive = (st.current ~= nil and st.current.playerId == botOid) or
+        (st.negotiating ~= nil and st.negotiating.playerId == botOid)
+    if wasActive then
+        advanceToNextTarget(pDoctor, st)
+    else
+        persistSave(getId(pDoctor), st)
+    end
+
     return true
 end
 

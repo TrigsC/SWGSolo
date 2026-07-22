@@ -26,6 +26,7 @@
 #include "server/zone/objects/creature/ai/CreatureTemplate.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h"
+#include "server/zone/objects/creature/buffs/Buff.h"
 #include "server/zone/objects/region/SpawnArea.h"
 #include "server/zone/objects/creature/VehicleObject.h"
 #include "server/zone/objects/tangible/weapon/WeaponObject.h"
@@ -709,10 +710,11 @@ SimPlayerManager::SimPlayerManager() {
     lua->init();
     marketSupplyObservationStartedAtMs = System::getMiliTime();
     simulatedAcquisitionRuntime = new SimulatedAcquisitionRuntimeState();
-    pvpNpcFrsAwardStats.setAllowOverwriteInsertPlan();
-    missionTerminalCityState.setAllowOverwriteInsertPlan();
-    pveHuntLairs.setAllowOverwriteInsertPlan();
-    pveAcquisitionLedgerCreatureClassMarkers.add("creature_resources");
+	pvpNpcFrsAwardStats.setAllowOverwriteInsertPlan();
+	missionTerminalCityState.setAllowOverwriteInsertPlan();
+	pveHuntLairs.setAllowOverwriteInsertPlan();
+	pveBuffProviderResolveStates.setAllowOverwriteInsertPlan();
+	pveAcquisitionLedgerCreatureClassMarkers.add("creature_resources");
 }
 
 SimPlayerManager::~SimPlayerManager() {
@@ -5604,6 +5606,8 @@ void SimPlayerManager::loadLuaConfig() {
 		missionTerminalCityState.removeAll();
 		pveHuntLairs.removeAll();
 		pveHunterBuffs.removeAll();
+		pveRealBuffFallbackSpecs.removeAll();
+		pveBuffProviderResolveStates.removeAll();
 		pveHuntOrders.removeAll();
 		pveSessionHarvestByFamily.removeAll();
 		pveCreatureSupplyBootBaseline.removeAll();
@@ -5626,6 +5630,12 @@ void SimPlayerManager::loadLuaConfig() {
 		pveHunterLastSiteAnnounceMs = 0;
 		pveMissionLairsSpawned = 0;
 		pveMissionLairsCleaned = 0;
+		pveDoctorInteractions = 0;
+		pveDancerWatches = 0;
+		pveMusicianListens = 0;
+		pveBuffDetoursSkipped = 0;
+		pveSyntheticFallbacks = 0;
+		pveBuffLastSourceByBody.removeAll();
 		pveHunterLastAnnounceByIdentity.removeAll();
 		pveSpike = PveSpikeState();
 		pveSpikeObserver = nullptr;
@@ -5634,6 +5644,18 @@ void SimPlayerManager::loadLuaConfig() {
 	pveEnabled = false;
 	pveHunterBotsEnabled = false;
 	pveMissionHuntEnabled = false;
+	pveRealBuffsEnabled = false;
+	pveRealBuffsFallbackSynthetic = true;
+	pveRealBuffReapplySeconds = 900;
+	pveBuffProviderScanRadiusMeters = 400.f;
+	pveDoctorProviderName = "Doctor Buffer";
+	pveMusicianProviderName = "Musician Buffer";
+	pveDancerProviderName = "Dancer Buffer";
+	pveEntertainerTemplate = "entertainer";
+	pveDoctorTemplate = "smart_doctor_buffer";
+	pveDoctorInteractionTimeoutMs = 45000;
+	pveEntertainerDwellMs = 4000;
+	pveProviderApproachRangeMeters = 8.f;
 	pveMissionSpawnDistanceMeters = 200.f;
 	pveMissionTerminalScanRadiusMeters = 600.f;
 	pveMissionMaxSpawnPointTries = 32;
@@ -6629,11 +6651,47 @@ void SimPlayerManager::loadLuaConfig() {
     config.pop();
 }
 
+// Authoritative CRC for a tracked hunter buff, keyed by CreatureAttribute. This
+// is the single source of truth shared by getPveTrackedBuffCrcs, the realBuffs
+// fallback specs, and the real doctor/entertainer providers, so a synthetic
+// fallback stamps the EXACT CRC the need check and the real buffs use (a
+// name.hashCode() would not necessarily equal these BuffCRC constants).
+static uint32 pveTrackedBuffCrcForAttribute(uint8 attribute) {
+	// CreatureAttribute::* are static const (not constexpr), so use runtime
+	// comparisons rather than switch/case labels.
+	if (attribute == CreatureAttribute::HEALTH ||
+			attribute == CreatureAttribute::STRENGTH ||
+			attribute == CreatureAttribute::CONSTITUTION ||
+			attribute == CreatureAttribute::ACTION ||
+			attribute == CreatureAttribute::QUICKNESS ||
+			attribute == CreatureAttribute::STAMINA)
+		return BuffCRC::getMedicalBuff(attribute);
+	if (attribute == CreatureAttribute::MIND)
+		return BuffCRC::PERFORMANCE_ENHANCE_DANCE_MIND;
+	if (attribute == CreatureAttribute::FOCUS)
+		return BuffCRC::PERFORMANCE_ENHANCE_MUSIC_FOCUS;
+	if (attribute == CreatureAttribute::WILLPOWER)
+		return BuffCRC::PERFORMANCE_ENHANCE_MUSIC_WILLPOWER;
+	return 0;
+}
+
 void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	pveEnabled = pveConfig.getBooleanField("enabled", pveEnabled);
 	pveHunterBotsEnabled = pveConfig.getBooleanField(
 		"enableHunterBots", pveHunterBotsEnabled);
 	pveMissionHuntEnabled = false;
+	pveRealBuffsEnabled = false;
+	pveRealBuffsFallbackSynthetic = true;
+	pveRealBuffReapplySeconds = 900;
+	pveBuffProviderScanRadiusMeters = 400.f;
+	pveDoctorProviderName = "Doctor Buffer";
+	pveMusicianProviderName = "Musician Buffer";
+	pveDancerProviderName = "Dancer Buffer";
+	pveEntertainerTemplate = "entertainer";
+	pveDoctorTemplate = "smart_doctor_buffer";
+	pveDoctorInteractionTimeoutMs = 45000;
+	pveEntertainerDwellMs = 4000;
+	pveProviderApproachRangeMeters = 8.f;
 	LuaObject missionHuntConfig = pveConfig.getObjectField("missionHunt");
 	if (missionHuntConfig.isValidTable()) {
 		pveMissionHuntEnabled = missionHuntConfig.getBooleanField(
@@ -6673,6 +6731,120 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 			pveNavmeshRepathTries, 1, 20);
 	}
 	missionHuntConfig.pop();
+
+	Vector<PveBuffSpec> rebuiltRealBuffFallbackSpecs;
+	LuaObject realBuffsConfig = pveConfig.getObjectField("realBuffs");
+	if (realBuffsConfig.isValidTable()) {
+		pveRealBuffsEnabled = realBuffsConfig.getBooleanField(
+			"enabled", pveRealBuffsEnabled);
+		pveRealBuffsFallbackSynthetic = realBuffsConfig.getBooleanField(
+			"fallbackToSynthetic", pveRealBuffsFallbackSynthetic);
+		pveRealBuffReapplySeconds = clampMinerInt(
+			realBuffsConfig.getIntField("reapplyThresholdSeconds"),
+			pveRealBuffReapplySeconds, 0, 86400);
+		pveBuffProviderScanRadiusMeters = clampFloatRange(
+			realBuffsConfig.getFloatField("providerScanRadiusMeters"),
+			1.f, 512.f);
+
+		String doctorProviderName = realBuffsConfig.getStringField(
+			"doctorProviderName").trim();
+		if (!doctorProviderName.isEmpty())
+			pveDoctorProviderName = doctorProviderName;
+		String musicianProviderName = realBuffsConfig.getStringField(
+			"musicianProviderName").trim();
+		if (!musicianProviderName.isEmpty())
+			pveMusicianProviderName = musicianProviderName;
+		String dancerProviderName = realBuffsConfig.getStringField(
+			"dancerProviderName").trim();
+		if (!dancerProviderName.isEmpty())
+			pveDancerProviderName = dancerProviderName;
+		String entertainerTemplate = realBuffsConfig.getStringField(
+			"entertainerTemplate").trim();
+		if (!entertainerTemplate.isEmpty())
+			pveEntertainerTemplate = entertainerTemplate;
+		String doctorTemplate = realBuffsConfig.getStringField(
+			"doctorTemplate").trim();
+		if (!doctorTemplate.isEmpty())
+			pveDoctorTemplate = doctorTemplate;
+
+		pveDoctorInteractionTimeoutMs = clampMinerInt(
+			realBuffsConfig.getIntField("doctorInteractionTimeoutMs"),
+			pveDoctorInteractionTimeoutMs, 1000, 600000);
+		pveEntertainerDwellMs = clampMinerInt(
+			realBuffsConfig.getIntField("entertainerDwellMs"),
+			pveEntertainerDwellMs, 100, 60000);
+		pveProviderApproachRangeMeters = clampFloatRange(
+			realBuffsConfig.getFloatField("providerApproachRangeMeters"),
+			1.f, 64.f);
+
+		LuaObject fallbackBuffs = realBuffsConfig.getObjectField(
+			"fallbackBuffs");
+		if (fallbackBuffs.isValidTable()) {
+			for (int i = 1; i <= fallbackBuffs.getTableSize(); ++i) {
+				LuaObject entry = fallbackBuffs.getObjectAt(i);
+				if (entry.isValidTable()) {
+					PveBuffSpec spec;
+					spec.name = entry.getStringField("name").trim();
+					spec.attribute = (uint8)clampMinerInt(
+						entry.getIntField("attribute"), CreatureAttribute::HEALTH,
+						CreatureAttribute::HEALTH, CreatureAttribute::WILLPOWER);
+					// CRC is derived from the attribute, NOT the Lua 'crc'/'name'
+					// string, so the fallback stamps the exact CRC the need check
+					// (getPveTrackedBuffCrcs) and the real doctor/entertainer
+					// buffs use. The Lua 'crc'/'name' fields are documentation.
+					spec.crc = pveTrackedBuffCrcForAttribute(spec.attribute);
+					spec.durationSeconds = entry.getFloatField(
+						"durationSeconds", 7200.f);
+					spec.buffType = entry.getIntField(
+						"type", BuffType::MEDICAL);
+					spec.modifier = entry.getIntField("modifier");
+					if (spec.crc != 0 && spec.durationSeconds > 0.f)
+						rebuiltRealBuffFallbackSpecs.add(spec);
+				}
+				entry.pop();
+			}
+		}
+		fallbackBuffs.pop();
+	}
+	realBuffsConfig.pop();
+
+	// Keep a complete safe default in C++ as well as the owner-tunable Lua
+	// table. The order and CRCs are the same source used by
+	// getPveTrackedBuffCrcs below: six medical pools, dance mind, then music.
+	if (rebuiltRealBuffFallbackSpecs.size() == 0) {
+		const char* names[] = {
+			"medical_enhance_health",
+			"medical_enhance_strength",
+			"medical_enhance_constitution",
+			"medical_enhance_action",
+			"medical_enhance_quickness",
+			"medical_enhance_stamina",
+			"performance_enhance_dance_mind",
+			"performance_enhance_music_focus",
+			"performance_enhance_music_willpower"
+		};
+		const uint8 attributes[] = {
+			CreatureAttribute::HEALTH,
+			CreatureAttribute::STRENGTH,
+			CreatureAttribute::CONSTITUTION,
+			CreatureAttribute::ACTION,
+			CreatureAttribute::QUICKNESS,
+			CreatureAttribute::STAMINA,
+			CreatureAttribute::MIND,
+			CreatureAttribute::FOCUS,
+			CreatureAttribute::WILLPOWER
+		};
+		for (int i = 0; i < 9; ++i) {
+			PveBuffSpec spec;
+			spec.name = names[i];
+			spec.attribute = attributes[i];
+			spec.crc = pveTrackedBuffCrcForAttribute(attributes[i]);
+			spec.durationSeconds = 7200.f;
+			spec.buffType = i < 6 ? BuffType::MEDICAL : BuffType::PERFORMANCE;
+			spec.modifier = 2500;
+			rebuiltRealBuffFallbackSpecs.add(spec);
+		}
+	}
 	pveWorldPresenceEnabled = pveConfig.getBooleanField(
 		"enableWorldPresence", pveWorldPresenceEnabled);
 	pveMaxHunters = clampMinerInt(
@@ -7064,6 +7236,7 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	{
 		Locker pveLock(&pveMutex);
 		pveHunterBuffs = rebuiltBuffs;
+		pveRealBuffFallbackSpecs = rebuiltRealBuffFallbackSpecs;
 		pveHuntSpecies = rebuiltSpecies;
 		configurePveMissionTerminalCitiesLocked(rebuiltSpecies);
 		pveHuntGroundsValidated = false;
@@ -8201,6 +8374,42 @@ void SimPlayerManager::recordPveHunterMissionAdds(uint64 identityId,
 	pveHuntOrders.put(identityId, order);
 }
 
+void SimPlayerManager::recordPveDoctorInteraction() {
+	Locker pveLock(&pveMutex);
+	++pveDoctorInteractions;
+}
+
+void SimPlayerManager::recordPveDancerWatch() {
+	Locker pveLock(&pveMutex);
+	++pveDancerWatches;
+}
+
+void SimPlayerManager::recordPveMusicianListen() {
+	Locker pveLock(&pveMutex);
+	++pveMusicianListens;
+}
+
+void SimPlayerManager::recordPveBuffDetourSkipped() {
+	Locker pveLock(&pveMutex);
+	++pveBuffDetoursSkipped;
+}
+
+void SimPlayerManager::recordPveSyntheticFallback(uint64 bodyOid) {
+	Locker pveLock(&pveMutex);
+	++pveSyntheticFallbacks;
+	if (bodyOid != 0)
+		pveBuffLastSourceByBody.put(bodyOid, "synthetic-fallback");
+}
+
+void SimPlayerManager::recordPveBuffSource(uint64 bodyOid,
+		const String& source) {
+	if (bodyOid == 0 || source.isEmpty())
+		return;
+
+	Locker pveLock(&pveMutex);
+	pveBuffLastSourceByBody.put(bodyOid, source);
+}
+
 bool SimPlayerManager::choosePveHuntSpawnPoint(
 		const PveHuntSpecies& species, const Vector3& missionPos,
 		Vector3& spawnPos, Zone*& zoneOut) {
@@ -8564,6 +8773,31 @@ void SimPlayerManager::getPveHunterBuffs(Vector<PveBuffSpec>& buffs) {
 	buffs = pveHunterBuffs;
 }
 
+void SimPlayerManager::getPveRealBuffFallbackSpecs(
+		Vector<PveBuffSpec>& buffs) {
+	Locker pveLock(&pveMutex);
+	buffs = pveRealBuffFallbackSpecs;
+}
+
+void SimPlayerManager::getPveTrackedBuffCrcs(Vector<uint32>& crcs) const {
+	crcs.removeAll();
+
+	// Single source of truth (pveTrackedBuffCrcForAttribute): six medical CRCs
+	// (same values AiAgentImplementation::healEnhanceCreatureTarget applies),
+	// then dance mind and music focus/willpower (applied by LuaAiAgent's
+	// dance/music provider paths). This order matches realBuffs.fallbackBuffs
+	// and the medical-first split (i < 6) in SimHunterController::computeBuffNeeds.
+	const uint8 attributes[] = {
+		CreatureAttribute::HEALTH, CreatureAttribute::STRENGTH,
+		CreatureAttribute::CONSTITUTION, CreatureAttribute::ACTION,
+		CreatureAttribute::QUICKNESS, CreatureAttribute::STAMINA,
+		CreatureAttribute::MIND, CreatureAttribute::FOCUS,
+		CreatureAttribute::WILLPOWER
+	};
+	for (int i = 0; i < 9; ++i)
+		crcs.add(pveTrackedBuffCrcForAttribute(attributes[i]));
+}
+
 bool SimPlayerManager::getPveHunterSpecies(const String& key,
 		PveHuntSpecies& species) {
 	Locker pveLock(&pveMutex);
@@ -8606,6 +8840,209 @@ bool SimPlayerManager::getPveHomeLocations(const String& planet,
 	home = resolved.shuttlePad;
 	cantina = resolved.hangout;
 	medCenter = resolved.medCenterResolved ? resolved.medCenter : home;
+	return true;
+}
+
+bool SimPlayerManager::resolvePveBuffProviders(const String& planet,
+		const String& city, PveBuffProviders& out) {
+	out = PveBuffProviders();
+
+	// The controller only calls this while the real-buffs gate is enabled, but
+	// keep the resolver itself gated so a future dashboard/maintenance caller
+	// cannot introduce provider scans while the feature is off.
+	if (!pveRealBuffsEnabled)
+		return false;
+
+	String stateKey = getPveMissionTerminalCityKey(planet, city);
+	auto publishState = [&](const String& state) {
+		Locker pveLock(&pveMutex);
+		pveBuffProviderResolveStates.put(stateKey, state);
+	};
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (zoneServer == nullptr || zoneServer->isServerLoading()) {
+		out.pending = true;
+		publishState("pending");
+		return false;
+	}
+
+	Zone* zone = zoneServer->getZone(planet);
+	if (zone == nullptr) {
+		out.pending = true;
+		publishState("pending");
+		return false;
+	}
+
+	// Resolve anchors before taking any provider/agent references. No manager or
+	// agent lock is held across either world query, matching scanForTarget and
+	// the mission-terminal resolver's lock choreography.
+	Vector3 cantina;
+	Vector3 medCenter;
+	Vector3 cityHome;
+	if (!getPveHomeLocations(planet, city, cantina, medCenter, cityHome)) {
+		out.pending = true;
+		publishState("pending");
+		return false;
+	}
+
+	// GroundZone's includeBuildingObjects query walks the cells of nearby
+	// buildings, but deliberately skips delayed-load cell containers. Static
+	// city buildings can therefore be present in the query while their NPC
+	// contents are not. Load only matching provider buildings, release any
+	// query-owned references, and rescan so the provider snapshot sees the
+	// already-spawned screenplay NPCs. This keeps the world query outside all
+	// manager/agent locks and does not change the generic zone query semantics.
+	auto loadProviderBuildingCells = [&](const Vector3& anchor,
+			const String& buildingFilter,
+			SortedVector<TreeEntry*>& objects) {
+		bool loadedCell = false;
+		for (int i = 0; i < objects.size(); ++i) {
+			SceneObject* candidate =
+				static_cast<SceneObject*>(objects.getUnsafe(i));
+			if (candidate == nullptr)
+				continue;
+
+			BuildingObject* building = candidate->asBuildingObject();
+			if (building == nullptr || building->getObjectTemplate() == nullptr)
+				continue;
+
+			String templatePath = building->getObjectTemplate()->
+				getFullTemplateString().toLowerCase();
+			if (!templatePath.contains(buildingFilter))
+				continue;
+
+			for (int cellIndex = 1;
+					cellIndex <= building->getMapCellSize(); ++cellIndex) {
+				CellObject* cell = building->getCell(cellIndex);
+				if (cell != nullptr && !cell->isContainerLoaded()) {
+					cell->getContainerObjectsSize();
+					loadedCell = true;
+				}
+			}
+		}
+
+		if (loadedCell) {
+			objects.removeAll();
+			zone->getInRangeObjects(anchor.getX(), 0, anchor.getY(),
+				pveBuffProviderScanRadiusMeters, &objects, true, true);
+		}
+	};
+
+	SortedVector<TreeEntry*> medCenterObjects;
+	zone->getInRangeObjects(medCenter.getX(), 0, medCenter.getY(),
+		pveBuffProviderScanRadiusMeters, &medCenterObjects, true, true);
+	loadProviderBuildingCells(medCenter, "hospital", medCenterObjects);
+	if (medCenterObjects.size() == 0) {
+		out.pending = true;
+		publishState("pending");
+		return false;
+	}
+
+	SortedVector<TreeEntry*> cantinaObjects;
+	zone->getInRangeObjects(cantina.getX(), 0, cantina.getY(),
+		pveBuffProviderScanRadiusMeters, &cantinaObjects, true, true);
+	loadProviderBuildingCells(cantina, "cantina", cantinaObjects);
+	if (cantinaObjects.size() == 0) {
+		out.pending = true;
+		publishState("pending");
+		return false;
+	}
+
+	String doctorName = pveDoctorProviderName.toLowerCase();
+	String musicianName = pveMusicianProviderName.toLowerCase();
+	String dancerName = pveDancerProviderName.toLowerCase();
+	String doctorTemplate = pveDoctorTemplate.toLowerCase();
+	String entertainerTemplate = pveEntertainerTemplate.toLowerCase();
+
+	auto findProvider = [&](const SortedVector<TreeEntry*>& objects,
+			const Vector3& anchor, const String& providerName,
+			const String& templateFilter, bool dancing, bool playingMusic,
+			PveBuffProviders::Provider& result) {
+		float bestDistanceSquared = 0.f;
+		bool haveDistance = false;
+
+		for (int i = 0; i < objects.size(); ++i) {
+			SceneObject* candidate =
+				dynamic_cast<SceneObject*>(objects.get(i));
+			if (candidate == nullptr || !candidate->isCreatureObject())
+				continue;
+
+			CreatureObject* creature = candidate->asCreatureObject();
+			if (creature == nullptr)
+				continue;
+
+			ManagedReference<CellObject*> cell;
+			uint64 objectId = 0;
+			uint64 cellId = 0;
+			Vector3 worldPosition;
+			Vector3 localPosition;
+			bool valid = false;
+
+			// Snapshot all provider fields under the provider lock, then retain
+			// only the strong cell reference in the returned DTO.
+			{
+				Locker providerLock(creature);
+				String customName = creature->getCustomObjectName().toString();
+				if (customName.toLowerCase() != providerName)
+					continue;
+
+				AiAgent* providerAgent = cast<AiAgent*>(creature);
+				if (providerAgent == nullptr)
+					continue;
+
+				const CreatureTemplate* creatureTemplate =
+					providerAgent->getCreatureTemplate();
+				if (creatureTemplate == nullptr)
+					continue;
+
+				String templateName =
+					creatureTemplate->getTemplateName().toLowerCase();
+				if (templateName.indexOf(templateFilter) < 0)
+					continue;
+				if (dancing && !creature->isDancing())
+					continue;
+				if (playingMusic && !creature->isPlayingMusic())
+					continue;
+
+				objectId = creature->getObjectID();
+				worldPosition = creature->getWorldPosition();
+				cell = creature->getParent().get().castTo<CellObject*>();
+				cellId = cell == nullptr ? 0 : cell->getObjectID();
+				localPosition = cell == nullptr ? worldPosition :
+					creature->getPosition();
+				valid = true;
+			}
+
+			if (!valid)
+				continue;
+
+			float dx = worldPosition.getX() - anchor.getX();
+			float dy = worldPosition.getY() - anchor.getY();
+			float distanceSquared = dx * dx + dy * dy;
+			if (haveDistance && distanceSquared >= bestDistanceSquared)
+				continue;
+
+			result.found = true;
+			result.oid = objectId;
+			result.cell = cell;
+			result.cellId = cellId;
+			result.worldPos = worldPosition;
+			result.localPos = localPosition;
+			bestDistanceSquared = distanceSquared;
+			haveDistance = true;
+		};
+	};
+
+	findProvider(medCenterObjects, medCenter, doctorName, doctorTemplate,
+		false, false, out.doctor);
+	findProvider(cantinaObjects, cantina, musicianName, entertainerTemplate,
+		false, true, out.musician);
+	findProvider(cantinaObjects, cantina, dancerName, entertainerTemplate,
+		true, false, out.dancer);
+
+	bool anyFound = out.doctor.found || out.musician.found ||
+		out.dancer.found;
+	publishState(anyFound ? "resolved" : "absent");
 	return true;
 }
 
@@ -10246,6 +10683,8 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	Vector<PveHuntSpecies> huntSpecies;
 	VectorMap<uint64, PveHuntLair> huntLairs;
 	Vector<PveBuffSpec> hunterBuffs;
+	VectorMap<String, String> providerResolveStates;
+	VectorMap<uint64, String> buffSources;
 	Vector<PveHuntOrder> huntOrders;
 	uint64 presenceSpawnTotal = 0;
 	uint64 hunterKillsTotal = 0;
@@ -10256,7 +10695,14 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	uint64 hunterAnnouncementsTotal = 0;
 	uint64 missionLairsSpawned = 0;
 	uint64 missionLairsCleaned = 0;
+	uint64 doctorInteractions = 0;
+	uint64 dancerWatches = 0;
+	uint64 musicianListens = 0;
+	uint64 buffDetoursSkipped = 0;
+	uint64 syntheticFallbacks = 0;
 	bool missionHuntEnabled = false;
+	bool realBuffsEnabled = false;
+	int realBuffReapplySeconds = 900;
 	bool acquisitionLedgerEnabled = false;
 	bool turfSplitEffective = false;
 	bool turfSplitPendingRestart = false;
@@ -10277,6 +10723,8 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		huntSpecies = pveHuntSpecies;
 		huntLairs = pveHuntLairs;
 		hunterBuffs = pveHunterBuffs;
+		providerResolveStates = pveBuffProviderResolveStates;
+		buffSources = pveBuffLastSourceByBody;
 		for (int i = 0; i < pveHuntOrders.size(); ++i)
 			huntOrders.add(pveHuntOrders.elementAt(i).getValue());
 		hunterKillsTotal = pveHunterKillsTotal;
@@ -10287,7 +10735,14 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		hunterAnnouncementsTotal = pveHunterAnnouncementsTotal;
 		missionLairsSpawned = pveMissionLairsSpawned;
 		missionLairsCleaned = pveMissionLairsCleaned;
+		doctorInteractions = pveDoctorInteractions;
+		dancerWatches = pveDancerWatches;
+		musicianListens = pveMusicianListens;
+		buffDetoursSkipped = pveBuffDetoursSkipped;
+		syntheticFallbacks = pveSyntheticFallbacks;
 		missionHuntEnabled = pveMissionHuntEnabled;
+		realBuffsEnabled = pveRealBuffsEnabled;
+		realBuffReapplySeconds = pveRealBuffReapplySeconds;
 		acquisitionLedgerEnabled = pveAcquisitionLedgerEnabled;
 		turfSplitEffective = pveTurfSplitEffective;
 		turfSplitPendingRestart =
@@ -10304,6 +10759,10 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		baselineLastError = pveBaselineLastError;
 		baselineRetryCount = pveBaselineRetryCount;
 	}
+
+	Vector<uint32> trackedBuffCrcs;
+	if (realBuffsEnabled)
+		getPveTrackedBuffCrcs(trackedBuffCrcs);
 
 	Vector<DemandStateSimulationResult> demandResults;
 	if (acquisitionLedgerEnabled) {
@@ -10357,6 +10816,17 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	result["hunterHarvestMisses"] = hunterHarvestMisses;
 	result["hunterAnnouncementsTotal"] = hunterAnnouncementsTotal;
 	result["missionHuntEnabled"] = missionHuntEnabled;
+	result["realBuffsEnabled"] = realBuffsEnabled;
+	result["realBuffReapplyThresholdSeconds"] = realBuffReapplySeconds;
+	JSONSerializationType realBuffs = JSONSerializationType::object();
+	realBuffs["enabled"] = realBuffsEnabled;
+	realBuffs["reapplyThresholdSeconds"] = realBuffReapplySeconds;
+	realBuffs["doctorInteractions"] = doctorInteractions;
+	realBuffs["dancerWatches"] = dancerWatches;
+	realBuffs["musicianListens"] = musicianListens;
+	realBuffs["buffDetoursSkipped"] = buffDetoursSkipped;
+	realBuffs["syntheticFallbacks"] = syntheticFallbacks;
+	result["realBuffs"] = realBuffs;
 	result["missionLairsSpawned"] = missionLairsSpawned;
 	result["missionLairsCleaned"] = missionLairsCleaned;
 	result["acquisitionLedgerEnabled"] = acquisitionLedgerEnabled;
@@ -10397,6 +10867,16 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		buffRows.push_back(row);
 	}
 	result["buffs"] = buffRows;
+	JSONSerializationType providerStates = JSONSerializationType::object();
+	if (realBuffsEnabled) {
+		for (int i = 0; i < providerResolveStates.size(); ++i) {
+			providerStates[providerResolveStates.elementAt(i).getKey()] =
+				providerResolveStates.elementAt(i).getValue();
+		}
+	}
+	realBuffs["providerResolveState"] = providerStates;
+	result["realBuffs"] = realBuffs;
+	result["providerResolveState"] = providerStates;
 
 	JSONSerializationType rows = JSONSerializationType::array();
 	for (int i = 0; i < identities.size(); ++i) {
@@ -10419,6 +10899,20 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		row["presenceSpawns"] = bodyOid != 0 &&
 			presenceSpawnCounts.contains(bodyOid) ?
 			presenceSpawnCounts.get(bodyOid) : 0;
+		row["providerResolveState"] = realBuffsEnabled ?
+			String("pending") : String("none");
+		if (realBuffsEnabled) {
+			String providerKey = getPveMissionTerminalCityKey(
+				identity.homePlanet, identity.homeCity);
+			if (providerResolveStates.contains(providerKey))
+				row["providerResolveState"] =
+					providerResolveStates.get(providerKey);
+		}
+		row["medicalBuffed"] = false;
+		row["entertainerBuffed"] = false;
+		row["minBuffSecondsLeft"] = 0;
+		row["lastBuffSource"] = buffSources.contains(bodyOid) &&
+			realBuffsEnabled ? buffSources.get(bodyOid) : String("none");
 		row["terminalPlanet"] = String("");
 		row["terminalCity"] = String("");
 		row["terminalPosX"] = 0.f;
@@ -10443,6 +10937,48 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 				row["posX"] = body->getWorldPositionX();
 				row["posY"] = body->getWorldPositionY();
 				row["posZ"] = body->getWorldPositionZ();
+
+				if (realBuffsEnabled && trackedBuffCrcs.size() > 0) {
+					ManagedReference<AiAgent*> bodyAgent = body->asAiAgent();
+					if (bodyAgent != nullptr) {
+						Locker bodyLock(bodyAgent);
+						bool medicalBuffed = true;
+						bool entertainerBuffed = true;
+						bool allTrackedBuffsPresent = true;
+						bool haveBuffTime = false;
+						int minBuffSecondsLeft = 0;
+						for (int buffIndex = 0;
+								buffIndex < trackedBuffCrcs.size(); ++buffIndex) {
+							Buff* buff = bodyAgent->getBuff(
+								trackedBuffCrcs.get(buffIndex));
+							if (buff == nullptr) {
+								allTrackedBuffsPresent = false;
+								if (buffIndex < 6)
+									medicalBuffed = false;
+								else
+									entertainerBuffed = false;
+								continue;
+							}
+
+							int secondsLeft = buff->getTimeLeft();
+							if (!haveBuffTime ||
+									secondsLeft < minBuffSecondsLeft)
+								minBuffSecondsLeft = Math::max(0, secondsLeft);
+							haveBuffTime = true;
+							if (secondsLeft < realBuffReapplySeconds) {
+								if (buffIndex < 6)
+									medicalBuffed = false;
+								else
+									entertainerBuffed = false;
+							}
+						}
+						if (!allTrackedBuffsPresent)
+							minBuffSecondsLeft = 0;
+						row["medicalBuffed"] = medicalBuffed;
+						row["entertainerBuffed"] = entertainerBuffed;
+						row["minBuffSecondsLeft"] = minBuffSecondsLeft;
+					}
+				}
 			}
 		}
 		row["phase"] = "IDLE_HOME";

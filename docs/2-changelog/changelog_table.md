@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.4.6` | 2 | F_0.4.6 P.8.6: PvE hunter player-mimetic real buffs (need-gated doctor/entertainer providers, delayed-load cell resolution, synthetic fallback) |
 | `0.4.5` | 2 | fix: P.8.4 PvE hunter combat targeting — player-safe attack guard + defender-driven re-engagement |
 | `0.4.4` | 2 | F_0.4.4 P.8.3: PvE hunter combat & movement realism (real combat, navmesh-aware travel, self-defense + combat template, #/wilds dashboard) |
 | `0.3.1` | 1 | fix: combat stalemate break + collector wait jitter (Theed doorway statue deadlock) |
@@ -11,6 +12,15 @@
 | `0.1.0` | 1 | chore: initialize TRIP workflow |
 
 # Changelog Summary
+
+- **v0.4.6 (P.8.6 PvE Hunter Player-Mimetic Real Buffs - Week 2, 22-07-2026)**:
+  - **Feature**: replaces the placeholder hunter `BUFF_UP` (loiter + synthetic buffs every cycle) with **need-gated real buffs** from the owner's in-world Doctor/Musician/Dancer buffer NPCs. `computeBuffNeeds` re-buffs only when a tracked buff is absent or within the refresh threshold (default 15 min); real entertainer buffs fire via `PlayerManager::startWatch`/`startListen` observers, and the doctor's negotiation is driven through a `ScreenPlayTask` (a bot's chat cannot reach the player-only `SPATIALCHATSENT` observer). Sim bots auto-confirm, the 5k charge is bypassed, and a per-step refresh replaces the up-front medical wipe so an interrupted session never strips a pool.
+  - **Provider resolution**: the buffer NPCs live in building cells that are delayed-load containers; `resolvePveBuffProviders` force-loads the matching provider building's cells (`getContainerObjectsSize`) and rescans so they're found by role name. Scan radius 400 m; interior approach via a leg-scoped non-hybrid cell path (POB floor graphs — no static navmesh blocker). Unreachable providers fall back to a synthetic `realBuffs.fallbackBuffs` set; `finishPveBuffProviderFlow` clears clone wounds + shock.
+  - **Hardening (from code review)**: doctor request generation + absolute deadline persisted with the current target so cancellation survives thread-local screenplay Lua states (stale-cancel race closed); wound-heal restored on the no-strip path; `#/wilds` shows a `disabled` chip when the feature is off. Queue-position loss under rare contention accepted (graceful synthetic fallback).
+  - **Scope**: gated `realBuffs.enabled` (default off); simulation-only (buffs/wound-clears on sim bots only, credit bypass scoped to `getSimPlayerBot()`); miners/PvP unchanged; no IDL/schema changes.
+  - **Review**: Codex 2 rounds → APPROVED with observations (`docs/3-code-review/CR_w2_v0.4.6.md`) + owner-verified live addendum (hunter ran to providers and obtained real buffs; provider-resolution cell-load fix and 40→400 m radius verified live).
+  - **Files**: sim_player_manager.lua, smartDoctorBuffer.lua, smart_entertainer_helper.lua, LuaAiAgent.{h,cpp}, AiAgentImplementation.cpp, SimHunterController.{h,cpp}, SimPlayerController.{h,cpp}, SimPlayerManager.{h,cpp}, app.js, ARCHI.md, ai-pve-playerbot-design.md, COVERAGE-DEBT.md, F_0.4.6 plan.
+  - **Note**: ff-merged into `feat/pve-acquisition-demand-ledger` only, NOT `miner-ai`. Pre-existing `death_watch_wraith.lua`/`rifle_t21.lua` and `engine3` working-tree changes excluded.
 
 - **v0.4.5 (P.8.4 PvE Hunter Combat-Targeting Fixes - Week 2, 21-07-2026)**:
   - **Fix**: two owner-observed hunter combat bugs, both rooted in the controller driving combat off its own `targetOid` pin rather than `CombatManager`'s real defender state. (1) A faction-0 hunter's area attack could damage and then lock onto a real player — fixed by mirroring the sim-bot guard on the player side of `CreatureObject::isAttackableBy` (one chokepoint that also covers AoE splash via `getAreaTargets`). (2) The hunter would not re-fire on a closer creature that started attacking it — now selects the nearest live/attackable/non-player defender (bounded hysteresis) and re-engages via `startCombat` + `activateAiBehavior`.

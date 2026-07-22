@@ -335,3 +335,83 @@ relationships from both sides while preserving a live mission target and its
 observer, or fully clears stale combat when no mission target remains. This
 keeps combat real and player-safe without adding inventory, credit, market, or
 persistence mutation.
+
+## P.8.6 — Player-mimetic real buffs (F_0.4.6)
+
+The `BUFF_UP` placeholder (loiter at a cantina/med-center point, then stamp
+synthetic config `Buff`s every mission cycle) is replaced with real, need-gated
+buffs obtained from the owner's in-world buffer NPCs. All of it sits behind
+`pveConfig.realBuffs.enabled` (default **off**); with the gate off the legacy
+synthetic `applyHunterBuffs`/`pveConfig.buffs` path is byte-for-byte unchanged.
+
+**Need detection.** Before the detour, `computeBuffNeeds` snapshots the hunter's
+buffs under its lock and compares nine tracked CRCs (six medical HAM enhances +
+dance-mind + music focus/willpower) against `reapplyThresholdSeconds` (default
+900s / 15 min). A buff absent or below the threshold marks its family
+(`needDoctor` / `needEntertainer`) needed; if neither is needed the hunter skips
+straight to the mission leg (the recycle is gone). One authoritative CRC source
+(`pveTrackedBuffCrcForAttribute` → `BuffCRC`) is shared by the need check, the
+`realBuffs.fallbackBuffs` synthetic set, and the real providers, so a synthetic
+fallback stamps exactly the CRC the need check and the real buffs use.
+
+**Provider resolution.** `resolvePveBuffProviders` finds the Doctor/Musician/
+Dancer buffer NPCs near the hunter's home-city med center and cantina via
+`getInRangeObjects` (locks released, `scanForTarget` discipline), keying on the
+role-specific custom name (Musician and Dancer share the `entertainer` template,
+so the name is the discriminator; template/performance state are validation).
+It returns each provider's OID, a strong `CellObject` reference, cell id, world
+position, and cell-local position, with mission-terminal-style pending/absent
+guards. A home city with no buffer NPC (e.g. Bestine) resolves absent → synthetic
+family fallback.
+
+**Interior approach.** Providers stand inside building cells. Because hunters use
+the navmesh/overland hybrid mover — whose path pipeline discards cell targets — a
+leg-scoped `interiorApproachLeg` latch makes every `usesNavmeshHybridMovement()`
+site treat the buff-approach leg as non-hybrid (`isHybridMovementActive()`), so
+that one leg routes through the base cell-aware path (submission, result,
+arrival, and stuck re-path). Miners, PvP, and the hunter's wilderness legs are
+unchanged (the latch is false for them).
+
+**Real interactions.** Entertainers: the controller issues the real
+`PlayerManager::startListen`/`startWatch` (owner-patched to accept the
+`entertainer` NPC and any `CreatureObject` watcher; `isValidAudienceMember` also
+accepts a verified sim bot), firing the genuine `WASLISTENEDTO`/`WASWATCHED`
+observers → real performance buffs. Doctor: the hunter emits visible "I need a
+buff" spatial chat, and the controller drives the doctor's own negotiation via a
+`ScreenPlayTask` into `SmartDoctorBuffer:botBuffRequest` (a bot's chat cannot
+reach the player-only `SPATIALCHATSENT` observer, so the handler is invoked
+directly). Sim bots auto-confirm on entering NEGOTIATING (initial request and
+every queue promotion), the 5k charge is bypassed, and the up-front
+`wipeMedicalBuffs` is skipped in favour of a per-step refresh
+(`healEnhanceCreatureTarget` now removes just its own CRC then re-applies), so an
+interrupted session never leaves a pool stripped-and-unfilled.
+
+**Request token + cancellation.** The controller owns a monotonic per-hunter
+generation and an absolute deadline, passed as `<botOid>:<generation>:<deadline>`.
+The token is persisted with the doctor's current target so it survives the
+thread-local screenplay Lua states that run the deferred steps; `botCancel`
+compares against that persisted generation so a stale cancel cannot abort a newer
+request. On timeout the controller cancels and falls back. (Doctor *queue*
+membership remains in-memory, inherited from the owner screenplay; bot queue
+contention degrades safely to synthetic fallback rather than stranding a hunter.)
+
+**Wounds.** Because the no-strip doctor path skips the wipe that used to heal
+wounds, `finishPveBuffProviderFlow` clears all HAM wounds + shock after the
+heal-up stop (real or fallback) — clones always need the doctor, so their
+respawn wounds are cleared.
+
+**Fallback.** Any absent/timed-out provider falls back to
+`applyHunterBuffsForFamily` over `realBuffs.fallbackBuffs` (never the legacy
+list), so a hunter is never left unbuffed.
+
+**Simulation safety.** Buffs and wound clears apply only to sim-bot bodies; the
+credit bypass is scoped to `getSimPlayerBot()` (real players still pay and are
+never buffed for free). No inventory/market/persistence mutation.
+
+**Live verification (owner restart with `realBuffs.enabled=true`).** Dashboard
+`pveActivity.realBuffs` counters climb (`doctorInteractions`, `dancerWatches`,
+`musicianListens`, `buffDetoursSkipped`, `syntheticFallbacks`) and roster rows
+show `medicalBuffed`/`entertainerBuffed` with `lastBuffSource=real-doctor`/
+`real-entertainer`; a fresh-buffed hunter skips the detour; a Bestine hunter uses
+`syntheticFallbacks`; an interrupted doctor session leaves processed medical pools
+fresh and unprocessed pools untouched; `hunterKillsTotal` keeps climbing.

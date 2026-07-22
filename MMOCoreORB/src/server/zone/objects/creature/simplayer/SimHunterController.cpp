@@ -16,6 +16,9 @@
 #include "server/zone/objects/creature/buffs/Buff.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/managers/combat/CombatManager.h"
+#include "server/zone/managers/player/PlayerManager.h"
+#include "server/chat/ChatManager.h"
+#include "server/zone/managers/director/ScreenPlayTask.h"
 #include "templates/params/ObserverEventType.h"
 #include "server/zone/objects/creature/buffs/BuffType.h"
 #include "templates/params/creature/CreatureAttribute.h"
@@ -103,6 +106,17 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 	terminalResolveWaitCycles = 0;
 	missionAddsOverCapCycles = 0;
 	missionAddsEngaged = 0;
+	pveNeedDoctorBuff = false;
+	pveNeedEntertainerBuff = false;
+	pveDoctorFallbackNeeded = false;
+	pveEntertainerFallbackNeeded = false;
+	pveBuffProviderApproachActive = false;
+	pveBuffApproachStage = PVE_BUFF_APPROACH_NONE;
+	pveBuffInteractionDwellActive = false;
+	pveDoctorRequestGen = 0;
+	pveDoctorRequestActive = false;
+	pveDoctorDeadlineSec = 0;
+	pveDoctorProviderObject = nullptr;
 	setLoggingName("SimHunterController");
 }
 
@@ -162,7 +176,9 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 
 	dropTargetObserver();
 	disengageTarget(false);
+	cancelPveDoctorRequest();
 	advanceWorkLoopGeneration("hunterStartOrder");
+	clearInteriorApproachLeg();
 	resetHybridMovementState(true);
 	order = newOrder;
 	species = newSpecies;
@@ -184,6 +200,17 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	terminalResolveWaitCycles = 0;
 	missionAddsOverCapCycles = 0;
 	missionAddsEngaged = 0;
+	pveBuffProviders = PveBuffProviders();
+	pveNeedDoctorBuff = false;
+	pveNeedEntertainerBuff = false;
+	pveDoctorFallbackNeeded = false;
+	pveEntertainerFallbackNeeded = false;
+	pveBuffProviderApproachActive = false;
+	pveBuffApproachStage = PVE_BUFF_APPROACH_NONE;
+	pveBuffInteractionDwellActive = false;
+	pveDoctorRequestActive = false;
+	pveDoctorDeadlineSec = 0;
+	pveDoctorProviderObject = nullptr;
 	cantinaDwellComplete = false;
 	medDwellComplete = false;
 	dwellUntilMs = 0;
@@ -245,7 +272,473 @@ bool SimHunterController::shouldContinueArrivalChecks() const {
 	return orderActive || state == MOVING || state == CALCULATING_PATH;
 }
 
+void SimHunterController::computeBuffNeeds(bool& needDoctor,
+		bool& needEntertainer) const {
+	needDoctor = false;
+	needEntertainer = false;
+
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr) {
+		needDoctor = true;
+		needEntertainer = true;
+		return;
+	}
+
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	Vector<uint32> trackedBuffCrcs;
+	manager->getPveTrackedBuffCrcs(trackedBuffCrcs);
+	int thresholdSeconds = manager->getPveRealBuffReapplyThresholdSeconds();
+
+	// Snapshot all buff state while holding the agent lock. Do not query other
+	// manager state while this lock is held; the controller's provider work will
+	// use the same release-before-manager-query choreography.
+	Locker agentLock(strongAgent);
+	for (int i = 0; i < trackedBuffCrcs.size(); ++i) {
+		Buff* buff = strongAgent->getBuff(trackedBuffCrcs.get(i));
+		bool needsRefresh = buff == nullptr ||
+			buff->getTimeLeft() < thresholdSeconds;
+		if (!needsRefresh)
+			continue;
+
+		if (i < 6)
+			needDoctor = true;
+		else
+			needEntertainer = true;
+
+		if (needDoctor && needEntertainer)
+			break;
+	}
+}
+
+bool SimHunterController::moveToNextPveBuffProvider() {
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (zoneServer == nullptr)
+		return false;
+
+	// The resolver's OID/cell snapshot is deliberately revalidated immediately
+	// before each movement leg. The world query happens before the provider lock;
+	// no manager or agent lock is held across that query.
+	auto refreshProvider = [&](PveBuffProviders::Provider& provider,
+			bool requireDancing, bool requirePlayingMusic) {
+		if (!provider.found || provider.oid == 0)
+			return false;
+
+		ManagedReference<SceneObject*> object =
+			zoneServer->getObject(provider.oid);
+		if (object == nullptr || !object->isCreatureObject())
+			return false;
+
+		CreatureObject* creature = object->asCreatureObject();
+		if (creature == nullptr)
+			return false;
+
+		Locker providerLock(creature);
+		if (requireDancing && !creature->isDancing())
+			return false;
+		if (requirePlayingMusic && !creature->isPlayingMusic())
+			return false;
+
+		provider.worldPos = creature->getWorldPosition();
+		provider.cell = creature->getParent().get().castTo<CellObject*>();
+		provider.cellId = provider.cell == nullptr ? 0 :
+			provider.cell->getObjectID();
+		provider.localPos = provider.cell == nullptr ? provider.worldPos :
+			creature->getPosition();
+		return true;
+	};
+
+	auto approach = [&](PveBuffProviders::Provider& provider,
+			PveBuffApproachStage stage, bool requireDancing,
+			bool requirePlayingMusic) {
+		if (!refreshProvider(provider, requireDancing, requirePlayingMusic)) {
+			if (stage == PVE_BUFF_APPROACH_DOCTOR)
+				pveDoctorFallbackNeeded = true;
+			else if (stage == PVE_BUFF_APPROACH_MUSICIAN ||
+					stage == PVE_BUFF_APPROACH_DANCER)
+				pveEntertainerFallbackNeeded = true;
+			return false;
+		}
+
+		pveBuffApproachStage = stage;
+		pveBuffProviderApproachActive = true;
+		moveToInterior(provider.worldPos, provider.localPos,
+			provider.cell.get());
+		return true;
+	};
+
+	// Each provider is gated by its OWN stage so approaching it (which sets the
+	// stage to that provider) advances past it on the next call. Guarding by the
+	// next stage would re-select the same provider forever.
+	if (pveNeedEntertainerBuff &&
+			pveBuffApproachStage < PVE_BUFF_APPROACH_MUSICIAN &&
+			approach(pveBuffProviders.musician,
+				PVE_BUFF_APPROACH_MUSICIAN, false, true))
+		return true;
+
+	if (pveNeedEntertainerBuff &&
+			pveBuffApproachStage < PVE_BUFF_APPROACH_DANCER &&
+			approach(pveBuffProviders.dancer,
+				PVE_BUFF_APPROACH_DANCER, true, false))
+		return true;
+
+	if (pveNeedDoctorBuff &&
+			pveBuffApproachStage < PVE_BUFF_APPROACH_DOCTOR &&
+			approach(pveBuffProviders.doctor,
+				PVE_BUFF_APPROACH_DOCTOR, false, false))
+		return true;
+
+	pveBuffApproachStage = PVE_BUFF_APPROACH_COMPLETE;
+	pveBuffProviderApproachActive = false;
+	return false;
+}
+
+void SimHunterController::beginLegacySyntheticBuffDetour() {
+	Vector3 cantina;
+	Vector3 medCenter;
+	Vector3 home;
+	if (!SimPlayerManager::instance()->getPveHomeLocations(
+		order.homePlanet, order.homeCity, cantina, medCenter, home)) {
+		scheduleActiveTick(5000);
+		return;
+	}
+
+	cantinaArrived = false;
+	cantinaDwellComplete = false;
+	medCenterReached = false;
+	medDwellComplete = false;
+	this->cantina = cantina;
+	this->medCenter = medCenter;
+	dwellUntilMs = 0;
+	setPhase(BUFF_UP);
+	moveTo(cantina);
+}
+
+bool SimHunterController::schedulePveDoctorScreenplay(SceneObject* provider,
+		const String& method, const String& args) {
+	if (provider == nullptr || method.isEmpty())
+		return false;
+
+	Reference<ScreenPlayTask*> task = new ScreenPlayTask(provider, method,
+		"SmartDoctorBuffer", args);
+	task->schedule(1);
+	return true;
+}
+
+void SimHunterController::cancelPveDoctorRequest() {
+	if (!pveDoctorRequestActive)
+		return;
+
+	ManagedReference<AiAgent*> strongHunter = agent;
+	uint64 bodyOid = order.bodyOid;
+	if (strongHunter != nullptr) {
+		Locker agentLock(strongHunter);
+		bodyOid = strongHunter->getObjectID();
+	}
+
+	String cancelArgs = String::valueOf(bodyOid) + ":" +
+		String::valueOf(pveDoctorRequestGen);
+	if (pveDoctorProviderObject != nullptr)
+		schedulePveDoctorScreenplay(pveDoctorProviderObject.get(), "botCancel",
+			cancelArgs);
+
+	pveDoctorRequestActive = false;
+	pveDoctorDeadlineSec = 0;
+}
+
+void SimHunterController::applyHunterBuffsForFamily(PveBuffFamily family) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (!manager->isPveRealBuffsEnabled() ||
+			!manager->isPveRealBuffsFallbackSyntheticEnabled())
+		return;
+
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr)
+		return;
+
+	Vector<PveBuffSpec> specs;
+	manager->getPveRealBuffFallbackSpecs(specs);
+	int thresholdSeconds = manager->getPveRealBuffReapplyThresholdSeconds();
+	bool appliedAny = false;
+	uint64 bodyOid = 0;
+
+	{
+		Locker agentLock(strongAgent);
+		bodyOid = strongAgent->getObjectID();
+		for (int i = 0; i < specs.size(); ++i) {
+			const PveBuffSpec& spec = specs.get(i);
+			bool medical = spec.attribute <= CreatureAttribute::STAMINA;
+			if ((family == PVE_BUFF_FAMILY_DOCTOR) != medical || spec.crc == 0)
+				continue;
+
+			Buff* existing = strongAgent->getBuff(spec.crc);
+			if (existing != nullptr &&
+					existing->getTimeLeft() >= thresholdSeconds)
+				continue;
+
+			strongAgent->removeBuff(spec.crc);
+			Reference<Buff*> buff = new Buff(strongAgent.get(), spec.crc,
+				spec.durationSeconds, spec.buffType);
+			Locker buffLock(buff);
+			buff->setAttributeModifier(spec.attribute, spec.modifier);
+			buff->setFillAttributesOnBuff(true);
+			strongAgent->addBuff(buff);
+			appliedAny = true;
+		}
+	}
+
+	if (appliedAny) {
+		manager->recordPveSyntheticFallback(bodyOid);
+		manager->recordPveBuffSource(bodyOid,
+			"synthetic-fallback");
+	}
+}
+
+void SimHunterController::finishPveBuffProviderFlow() {
+	cancelPveDoctorRequest();
+	pveBuffProviderApproachActive = false;
+	pveBuffInteractionDwellActive = false;
+	pveDoctorProviderObject = nullptr;
+	pveBuffApproachStage = PVE_BUFF_APPROACH_COMPLETE;
+	dwellUntilMs = 0;
+
+	if (pveEntertainerFallbackNeeded)
+		applyHunterBuffsForFamily(PVE_BUFF_FAMILY_ENTERTAINER);
+	if (pveDoctorFallbackNeeded)
+		applyHunterBuffsForFamily(PVE_BUFF_FAMILY_DOCTOR);
+
+	// The heal-up stop is complete (real providers and/or synthetic fallback).
+	// Clear wounds + shock so clone/respawn wounds don't permanently reduce HAM.
+	// The legacy synthetic applyHunterBuffs(clearWounds=true) did this each cycle;
+	// the no-strip sim-bot doctor path skips the wipe that used to heal them, and
+	// the family fallback only replaces buffs (code-review round 1).
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent != nullptr) {
+		Locker agentLock(strongAgent);
+		for (uint8 pool = CreatureAttribute::HEALTH;
+				pool <= CreatureAttribute::WILLPOWER; ++pool)
+			strongAgent->setWounds(pool, 0);
+		float shock = strongAgent->getShockWounds();
+		if (shock > 0)
+			strongAgent->addShockWounds(-shock, true, false);
+	}
+
+	if (missionHuntOrder)
+		beginMissionTerminalLeg();
+	else {
+		setPhase(TRAVEL_OUT);
+		moveTo(species.huntGround);
+	}
+}
+
+void SimHunterController::interactWithPveBuffProvider(
+		PveBuffApproachStage stage) {
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<AiAgent*> strongHunter = agent;
+	if (zoneServer == nullptr || strongHunter == nullptr) {
+		if (stage == PVE_BUFF_APPROACH_DOCTOR)
+			pveDoctorFallbackNeeded = true;
+		else
+			pveEntertainerFallbackNeeded = true;
+		finishPveBuffProviderFlow();
+		return;
+	}
+
+	uint64 providerOid = 0;
+	if (stage == PVE_BUFF_APPROACH_MUSICIAN)
+		providerOid = pveBuffProviders.musician.oid;
+	else if (stage == PVE_BUFF_APPROACH_DANCER)
+		providerOid = pveBuffProviders.dancer.oid;
+	else if (stage == PVE_BUFF_APPROACH_DOCTOR)
+		providerOid = pveBuffProviders.doctor.oid;
+
+	ManagedReference<SceneObject*> providerObject =
+		zoneServer->getObject(providerOid);
+	if (providerObject == nullptr || !providerObject->isCreatureObject()) {
+		if (stage == PVE_BUFF_APPROACH_DOCTOR)
+			pveDoctorFallbackNeeded = true;
+		else
+			pveEntertainerFallbackNeeded = true;
+		if (moveToNextPveBuffProvider())
+			return;
+		finishPveBuffProviderFlow();
+		return;
+	}
+
+	float approachRange = SimPlayerManager::instance()->
+		getPveProviderApproachRangeMeters();
+	Vector3 providerPosition;
+	bool providerDancing = false;
+	bool providerPlayingMusic = false;
+	CreatureObject* providerCreature = providerObject->asCreatureObject();
+	if (providerCreature == nullptr) {
+		if (stage == PVE_BUFF_APPROACH_DOCTOR)
+			pveDoctorFallbackNeeded = true;
+		else
+			pveEntertainerFallbackNeeded = true;
+		if (moveToNextPveBuffProvider())
+			return;
+		finishPveBuffProviderFlow();
+		return;
+	}
+	{
+		Locker providerLock(providerCreature);
+		providerPosition = providerCreature->getWorldPosition();
+		providerDancing = providerCreature->isDancing();
+		providerPlayingMusic = providerCreature->isPlayingMusic();
+	}
+
+	Vector3 hunterPosition;
+	uint64 bodyOid = 0;
+	{
+		Locker hunterLock(strongHunter);
+		hunterPosition = strongHunter->getWorldPosition();
+		bodyOid = strongHunter->getObjectID();
+	}
+	float dx = hunterPosition.getX() - providerPosition.getX();
+	float dy = hunterPosition.getY() - providerPosition.getY();
+	float dz = hunterPosition.getZ() - providerPosition.getZ();
+	float distanceSquared = dx * dx + dy * dy + dz * dz;
+	if (distanceSquared > approachRange * approachRange ||
+			(stage == PVE_BUFF_APPROACH_MUSICIAN && !providerPlayingMusic) ||
+			(stage == PVE_BUFF_APPROACH_DANCER && !providerDancing)) {
+		if (stage == PVE_BUFF_APPROACH_DOCTOR)
+			pveDoctorFallbackNeeded = true;
+		else
+			pveEntertainerFallbackNeeded = true;
+		if (moveToNextPveBuffProvider())
+			return;
+		finishPveBuffProviderFlow();
+		return;
+	}
+
+	// onArrived holds no agent lock across this point. Keep strong references
+	// alive while PlayerManager takes its own creature/entertainer locks.
+	if (stage == PVE_BUFF_APPROACH_MUSICIAN) {
+		PlayerManager* playerManager = zoneServer->getPlayerManager();
+		if (playerManager == nullptr) {
+			pveEntertainerFallbackNeeded = true;
+		} else {
+			playerManager->startListen(strongHunter.get(), providerOid);
+			SimPlayerManager::instance()->recordPveMusicianListen();
+		}
+		pveBuffInteractionDwellActive = true;
+		dwellUntilMs = System::getMiliTime() +
+			static_cast<uint64>(SimPlayerManager::instance()->
+				getPveEntertainerDwellMs());
+		scheduleActiveTick(SimPlayerManager::instance()->
+			getPveEntertainerDwellMs());
+		return;
+	}
+
+	if (stage == PVE_BUFF_APPROACH_DANCER) {
+		PlayerManager* playerManager = zoneServer->getPlayerManager();
+		if (playerManager == nullptr) {
+			pveEntertainerFallbackNeeded = true;
+		} else {
+			playerManager->startWatch(strongHunter.get(), providerOid);
+			SimPlayerManager::instance()->recordPveDancerWatch();
+		}
+		pveBuffInteractionDwellActive = true;
+		dwellUntilMs = System::getMiliTime() +
+			static_cast<uint64>(SimPlayerManager::instance()->
+				getPveEntertainerDwellMs());
+		scheduleActiveTick(SimPlayerManager::instance()->
+			getPveEntertainerDwellMs());
+		return;
+	}
+
+	if (stage != PVE_BUFF_APPROACH_DOCTOR) {
+		finishPveBuffProviderFlow();
+		return;
+	}
+
+	pveDoctorProviderObject = providerObject;
+
+	ChatManager* chatManager = zoneServer->getChatManager();
+	if (chatManager != nullptr)
+		chatManager->broadcastChatMessage(strongHunter.get(),
+			UnicodeString("I need a buff."));
+
+	++pveDoctorRequestGen;
+	if (pveDoctorRequestGen == 0)
+		pveDoctorRequestGen = 1;
+
+	uint64 deadlineSec = System::getMiliTime() / 1000;
+	uint64 timeoutSec = Math::max(1,
+		SimPlayerManager::instance()->getPveDoctorInteractionTimeoutMs() / 1000);
+	deadlineSec += timeoutSec;
+	pveDoctorDeadlineSec = deadlineSec;
+	pveDoctorRequestActive = true;
+
+	String args = String::valueOf(bodyOid) + ":" +
+		String::valueOf(pveDoctorRequestGen) + ":" +
+		String::valueOf(deadlineSec);
+	if (!schedulePveDoctorScreenplay(providerObject.get(), "botBuffRequest",
+			args)) {
+		pveDoctorRequestActive = false;
+		pveDoctorFallbackNeeded = true;
+		if (moveToNextPveBuffProvider())
+			return;
+		finishPveBuffProviderFlow();
+		return;
+	}
+
+	SimPlayerManager::instance()->recordPveDoctorInteraction();
+	scheduleActiveTick(1000);
+}
+
 void SimHunterController::beginBuffUp() {
+	if (SimPlayerManager::instance()->isPveRealBuffsEnabled()) {
+		bool needDoctor = false;
+		bool needEntertainer = false;
+		computeBuffNeeds(needDoctor, needEntertainer);
+		if (!needDoctor && !needEntertainer) {
+			SimPlayerManager::instance()->recordPveBuffDetourSkipped();
+			if (missionHuntOrder)
+				beginMissionTerminalLeg();
+			else {
+				setPhase(TRAVEL_OUT);
+				moveTo(species.huntGround);
+			}
+			return;
+		}
+
+		pveNeedDoctorBuff = needDoctor;
+		pveNeedEntertainerBuff = needEntertainer;
+		pveDoctorFallbackNeeded = false;
+		pveEntertainerFallbackNeeded = false;
+		pveBuffProviders = PveBuffProviders();
+		pveBuffApproachStage = PVE_BUFF_APPROACH_NONE;
+		pveBuffProviderApproachActive = false;
+		pveBuffInteractionDwellActive = false;
+		pveDoctorRequestActive = false;
+		pveDoctorDeadlineSec = 0;
+
+		PveBuffProviders providers;
+		if (!SimPlayerManager::instance()->resolvePveBuffProviders(
+				order.homePlanet, order.homeCity, providers)) {
+			if (providers.pending) {
+				scheduleActiveTick(5000);
+				return;
+			}
+			pveDoctorFallbackNeeded = needDoctor;
+			pveEntertainerFallbackNeeded = needEntertainer;
+			finishPveBuffProviderFlow();
+			return;
+		}
+
+		pveBuffProviders = providers;
+		pveDoctorFallbackNeeded = needDoctor && !providers.doctor.found;
+		pveEntertainerFallbackNeeded = needEntertainer &&
+			(!providers.musician.found || !providers.dancer.found);
+		setPhase(BUFF_UP);
+		if (moveToNextPveBuffProvider())
+			return;
+
+		finishPveBuffProviderFlow();
+		return;
+	}
+
 	Vector3 cantina;
 	Vector3 medCenter;
 	Vector3 home;
@@ -306,10 +799,21 @@ void SimHunterController::beginMissionTerminalLeg() {
 	if (!orderActive || !missionHuntOrder || agent == nullptr)
 		return;
 
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr)
+		return;
+	Vector3 currentPosition;
+	uint64 bodyOid = 0;
+	{
+		Locker agentLock(strongAgent);
+		currentPosition = strongAgent->getWorldPosition();
+		bodyOid = strongAgent->getObjectID();
+	}
+
 	PveMissionTerminalLocation terminal;
 	int cityState = PVE_MISSION_TERMINAL_PENDING;
 	bool resolved = SimPlayerManager::instance()->getNearestMissionTerminal(
-		order.homePlanet, order.homeCity, agent->getWorldPosition(), terminal,
+		order.homePlanet, order.homeCity, currentPosition, terminal,
 		cityState);
 
 	if (resolved) {
@@ -317,7 +821,7 @@ void SimHunterController::beginMissionTerminalLeg() {
 		missionTerminalResolved = true;
 		missionTerminalFallback = false;
 		SimPlayerManager::instance()->recordPveHunterMissionTerminal(
-			identityId, agent->getObjectID(), terminal.planet, terminal.city,
+			identityId, bodyOid, terminal.planet, terminal.city,
 			terminal.position);
 		setPhase(TRAVEL_TO_TERMINAL);
 		if (state != MOVING && state != CALCULATING_PATH)
@@ -336,7 +840,7 @@ void SimHunterController::beginMissionTerminalLeg() {
 	missionTerminalFallback = false;
 	++terminalResolveWaitCycles;
 	SimPlayerManager::instance()->recordPveHunterMissionTerminal(
-		identityId, agent->getObjectID(), order.homePlanet, order.homeCity,
+		identityId, bodyOid, order.homePlanet, order.homeCity,
 		Vector3());
 	setPhase(TRAVEL_TO_TERMINAL);
 	scheduleActiveTick(2000);
@@ -485,6 +989,39 @@ void SimHunterController::onArrived() {
 
 	uint64 nowMs = System::getMiliTime();
 	if (phase == BUFF_UP) {
+		if (pveBuffInteractionDwellActive) {
+			pveBuffInteractionDwellActive = false;
+			bool needDoctor = false;
+			bool needEntertainer = false;
+			computeBuffNeeds(needDoctor, needEntertainer);
+			if (needEntertainer) {
+				pveEntertainerFallbackNeeded = true;
+			} else {
+				ManagedReference<AiAgent*> strongAgent = agent;
+				uint64 bodyOid = 0;
+				if (strongAgent != nullptr) {
+					Locker agentLock(strongAgent);
+					bodyOid = strongAgent->getObjectID();
+				}
+				SimPlayerManager::instance()->recordPveBuffSource(
+					bodyOid, "real-entertainer");
+			}
+			if (moveToNextPveBuffProvider())
+				return;
+			finishPveBuffProviderFlow();
+			return;
+		}
+
+		if (pveBuffProviderApproachActive) {
+			PveBuffApproachStage providerStage = pveBuffApproachStage;
+			pveBuffProviderApproachActive = false;
+			interactWithPveBuffProvider(providerStage);
+			return;
+		}
+
+		if (SimPlayerManager::instance()->isPveRealBuffsEnabled())
+			return;
+
 		if (!cantinaArrived) {
 			// Cantina dwell (entertainer theater; real doctor/entertainer BOT
 			// providers are P.8.3). Loiter, then head to the med center.
@@ -588,6 +1125,19 @@ void SimHunterController::onPathFailed() {
 	if (!orderActive)
 		return;
 
+	if (phase == BUFF_UP && pveBuffProviderApproachActive) {
+		PveBuffApproachStage providerStage = pveBuffApproachStage;
+		pveBuffProviderApproachActive = false;
+		if (providerStage == PVE_BUFF_APPROACH_DOCTOR)
+			pveDoctorFallbackNeeded = true;
+		else
+			pveEntertainerFallbackNeeded = true;
+		if (moveToNextPveBuffProvider())
+			return;
+		finishPveBuffProviderFlow();
+		return;
+	}
+
 	if (missionHuntOrder && phase == TRAVEL_TO_TERMINAL) {
 		beginMissionFallback();
 		return;
@@ -640,6 +1190,7 @@ void SimHunterController::runActiveTick() {
 
 	uint64 nowMs = System::getMiliTime();
 	if (strongAgent->isDead()) {
+		cancelPveDoctorRequest();
 		if (!deathReported) {
 			deathReported = true;
 			dropTargetObserver();
@@ -698,6 +1249,40 @@ void SimHunterController::runActiveTick() {
 	}
 
 	if (phase == BUFF_UP) {
+		if (pveDoctorRequestActive) {
+			bool needDoctor = false;
+			bool needEntertainer = false;
+			computeBuffNeeds(needDoctor, needEntertainer);
+			if (!needDoctor) {
+				uint64 bodyOid = 0;
+				{
+					Locker agentLock(strongAgent);
+					bodyOid = strongAgent->getObjectID();
+				}
+				pveDoctorRequestActive = false;
+				pveDoctorDeadlineSec = 0;
+				pveDoctorProviderObject = nullptr;
+				SimPlayerManager::instance()->recordPveBuffSource(
+					bodyOid, "real-doctor");
+				if (moveToNextPveBuffProvider())
+					return;
+				finishPveBuffProviderFlow();
+				return;
+			}
+
+			if (nowMs / 1000 >= pveDoctorDeadlineSec) {
+				cancelPveDoctorRequest();
+				pveDoctorFallbackNeeded = true;
+				if (moveToNextPveBuffProvider())
+					return;
+				finishPveBuffProviderFlow();
+				return;
+			}
+
+			scheduleActiveTick(1000);
+			return;
+		}
+
 		if (dwellUntilMs != 0 && nowMs >= dwellUntilMs) {
 			dwellUntilMs = 0;
 			onArrived();
@@ -1665,6 +2250,7 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 	// passed its generation check and then blocks on the agent lock could
 	// otherwise acquire it right after disengage and, with orderActive still
 	// set, revive movement toward the finished route (code-review round 2).
+	cancelPveDoctorRequest();
 	orderActive = false;
 	dropTargetObserver();
 	disengageTarget(false);
@@ -1695,6 +2281,7 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 void SimHunterController::teardown(const String& reason) {
 	activeTickGeneration++;
 	advanceWorkLoopGeneration("hunterTeardown");
+	cancelPveDoctorRequest();
 	clearHybridMovementOnCancellation();
 	dropTargetObserver();
 	disengageTarget(false);

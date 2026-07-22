@@ -75,11 +75,45 @@ private:
 	int missionAddsOverCapCycles;
 	int missionAddsEngaged;
 
+	enum PveBuffApproachStage {
+		PVE_BUFF_APPROACH_NONE,
+		PVE_BUFF_APPROACH_MUSICIAN,
+		PVE_BUFF_APPROACH_DANCER,
+		PVE_BUFF_APPROACH_DOCTOR,
+		PVE_BUFF_APPROACH_COMPLETE
+	};
+	PveBuffProviders pveBuffProviders;
+	bool pveNeedDoctorBuff;
+	bool pveNeedEntertainerBuff;
+	bool pveDoctorFallbackNeeded;
+	bool pveEntertainerFallbackNeeded;
+	bool pveBuffProviderApproachActive;
+	PveBuffApproachStage pveBuffApproachStage;
+	bool pveBuffInteractionDwellActive;
+	uint32 pveDoctorRequestGen;
+	bool pveDoctorRequestActive;
+	uint64 pveDoctorDeadlineSec;
+	ManagedReference<SceneObject*> pveDoctorProviderObject;
+
+	enum PveBuffFamily {
+		PVE_BUFF_FAMILY_DOCTOR,
+		PVE_BUFF_FAMILY_ENTERTAINER
+	};
+
 	void scheduleActiveTick(int delayMs);
 	void runActiveTick();
 	void setPhase(HuntPhase next);
 	void beginBuffUp();
+	void computeBuffNeeds(bool& needDoctor, bool& needEntertainer) const;
+	bool moveToNextPveBuffProvider();
+	void beginLegacySyntheticBuffDetour();
+	bool schedulePveDoctorScreenplay(SceneObject* provider,
+		const String& method, const String& args);
+	void cancelPveDoctorRequest();
+	void finishPveBuffProviderFlow();
+	void interactWithPveBuffProvider(PveBuffApproachStage stage);
 	void applyHunterBuffs(bool clearWounds);
+	void applyHunterBuffsForFamily(PveBuffFamily family);
 	void beginMissionTerminalLeg();
 	void beginMissionFallback();
 	void beginMissionAccept();

@@ -157,6 +157,9 @@ protected:
     HybridLeg hybridLeg;
     Vector3 hybridEgressPoint;
     uint64 workLoopGeneration;
+    // A cell-aware provider approach is a complete base-path leg even for
+    // hunters, whose normal wilderness legs use the hybrid mover.
+    bool interiorApproachLeg;
     
     // Configurable speed/movement settings
     float runSpeed;
@@ -222,6 +225,7 @@ public:
         destinationCell = nullptr;
         simPath.removeAll();
         simPathIndex = 0;
+        interiorApproachLeg = false;
         if (usesNavmeshHybridMovement())
             resetHybridMovementState(true);
     }
@@ -241,6 +245,13 @@ public:
     virtual void onPathFailed();
 
 protected:
+    void moveToInterior(Vector3 worldPos, Vector3 localPos,
+            CellObject* targetCell);
+    void clearInteriorApproachLeg() { interiorApproachLeg = false; }
+    bool isInteriorApproachLeg() const { return interiorApproachLeg; }
+    bool isHybridMovementActive() const {
+        return usesNavmeshHybridMovement() && !interiorApproachLeg;
+    }
     void queueMorePathNodes();
     bool pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out, int minSearchRadius = 100, int maxSearchRadius = 200);
     void requestHybridPath();

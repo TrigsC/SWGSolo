@@ -122,6 +122,7 @@ namespace ai {
 		int setNoAiAggro(lua_State* L);
 		int doDespawn(lua_State* L);
 		int getCreatureTemplateName(lua_State* L);
+		int isSimPlayerBot(lua_State* L);
 		int isInRangeOfHome(lua_State* L);
 		int getPatrolPointsSize(lua_State* L);
 		int addObjectFlag(lua_State* L);

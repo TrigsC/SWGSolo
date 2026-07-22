@@ -309,8 +309,15 @@ This is this fork's primary custom subsystem, layered on top of the stock
   them while `isAttackableBy` keeps real players from attacking the neutral bot;
   they use a neutral combat mob template (`death_watch_wraith` + `rifle_t21`,
   configured in `sim_player_manager.lua`). Combat firing is woken via
-  `activateAiBehavior(true)` on engage. Design doc:
-  `docs/ai-pve-playerbot-design.md`.
+  `activateAiBehavior(true)` on engage. P.8.6 adds need-gated **real buffs**
+  (gated `realBuffs.enabled`, default off): the hunter walks into its home-city
+  med center / cantina and obtains buffs from the owner's real Doctor/Musician/
+  Dancer buffer NPCs (`PlayerManager::startWatch`/`startListen` observers; the
+  doctor's chat negotiation driven via a `ScreenPlayTask` since a bot's chat
+  can't reach the player-only `SPATIALCHATSENT` observer), only when a tracked
+  buff is missing or within a refresh threshold. Interior cells are reached with
+  a leg-scoped non-hybrid latch; a synthetic `realBuffs.fallbackBuffs` set covers
+  unreachable providers. Design doc: `docs/ai-pve-playerbot-design.md`.
 - **Everything here is simulation-only by explicit owner policy**: no real
   inventory/credit/market/persistence mutation happens from this layer until
   an economy-mutation phase is explicitly approved. New work here defaults

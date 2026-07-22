@@ -1010,12 +1010,23 @@
       const position = hasPosition
         ? `<span class="t-main">${coords[0].toFixed(1)} / ${coords[1].toFixed(1)}</span><span class="t-sub">z ${coords[2].toFixed(1)}</span>`
         : `<span class="muted">position unavailable</span>`;
+      const realBuffsOn = pve.realBuffsEnabled === true;
+      const medicalBuffed = r.medicalBuffed === true;
+      const entertainerBuffed = r.entertainerBuffed === true;
+      const buffLabel = medicalBuffed && entertainerBuffed
+        ? "full"
+        : medicalBuffed ? "medical" : entertainerBuffed ? "entertainer" : "needed";
+      const buffTone = medicalBuffed && entertainerBuffed ? "ok" : "amber";
+      const buffStatus = realBuffsOn
+        ? `${chip(buffLabel, buffTone)}<span class="t-sub">${num(r.minBuffSecondsLeft)}s · ${esc(r.lastBuffSource || "none")}</span>`
+        : `${chip("disabled", "ghost")}`;
       return `<tr>
         <td><span class="t-main">${esc(name)}</span><span class="t-sub">${r.bodyAttached ? "body attached" : "identity only"}</span></td>
         <td>${chip(labelize(phase), /HUNT|TRAVEL|RETREAT|MISSION/i.test(phase) ? "teal" : "ghost")}</td>
         <td>${hasPosition ? esc(labelize(planet)) : `<span class="muted">in transit</span>`}</td>
         <td class="t-num">${position}</td>
         <td>${hasPosition ? `<code class="way-code">${esc(way)}</code>` : `<span class="muted">n/a</span>`}</td>
+        <td>${buffStatus}</td>
       </tr>`;
     }).join("");
 
@@ -1034,7 +1045,7 @@
           </div></div>
         </section>
         ${panel("HUNTER POSITION FEED", `${roster.length} identities · ${active} active`,
-          table(["Hunter", "Phase", "Planet", "X / Y", "/way"], rows, { scrollKey: "wilds-roster", tall: true }))}
+          table(["Hunter", "Phase", "Planet", "X / Y", "/way", "Buffs"], rows, { scrollKey: "wilds-roster", tall: true }))}
         <section class="panel span-12"><div class="panel-body wilds-note">
           <span class="muted small">Coordinates are read-only live positions. Select the visible <code class="way-code">/way</code> text and paste it in-game; unavailable positions indicate a body or zone transition.</span>
         </div></section>

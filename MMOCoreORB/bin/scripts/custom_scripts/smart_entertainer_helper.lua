@@ -27,7 +27,16 @@ function SmartEntertainerHelper.isValidAudienceMember(pPlayer, pEntertainer, ran
     local okPlayer, isPlayer = pcall(function()
         return SceneObject(pPlayer):isPlayerCreature()
     end)
-    if not okPlayer or not isPlayer then return false end
+
+    local isAcceptedAudienceMember = okPlayer and isPlayer == true
+    if not isAcceptedAudienceMember then
+        local okSimBot, isSimBot = pcall(function()
+            return AiAgent(pPlayer):isSimPlayerBot()
+        end)
+        isAcceptedAudienceMember = okSimBot and isSimBot == true
+    end
+
+    if not isAcceptedAudienceMember then return false end
 
     local maxRange = tonumber(range) or 0
     local okRange, inRange = pcall(function()
