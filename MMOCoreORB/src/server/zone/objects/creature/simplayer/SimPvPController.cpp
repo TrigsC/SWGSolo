@@ -5,6 +5,7 @@
 
 #include "SimPvPController.h"
 #include "SimPlayerManager.h"
+#include "CellNavDiagLog.h"
 
 #include "engine/core/Core.h"
 #include "server/ServerCore.h"
@@ -329,6 +330,19 @@ SimPvPController::SimPvPController(AiAgent* aiAgent, uint64 squad, bool isImperi
 	shuttleTargetLocalPosition = Vector3(0, 0, 0);
 	shuttleTargetCellOid = 0;
 	shuttleTargetIsCollector = false;
+	shuttleTargetInterplanetary = false;
+	collectorDepartureActive = false;
+	collectorDepartureEntry = false;
+	collectorWorld = Vector3(0, 0, 0);
+	collectorLocal = Vector3(0, 0, 0);
+	collectorCell = nullptr;
+	collectorOid = 0;
+	collectorApproachAttempts = 0;
+	collectorApproachStartedAtMs = 0;
+	arrivalExitActive = false;
+	arrivalOutdoor = Vector3(0, 0, 0);
+	arrivalExitAttempts = 0;
+	arrivalExitReenter = false;
 	setLoggingName("SimPvPController");
 }
 
@@ -343,9 +357,13 @@ void SimPvPController::beginCityLoop(const String& planetName, const String& cit
 	shuttleTargetLocalPosition = shuttlePos;
 	shuttleTargetCellOid = 0;
 	shuttleTargetIsCollector = false;
+	shuttleTargetInterplanetary = false;
 	hangoutLocation = hangoutPos;
 	transitLoiterSeconds = 0;
 	pathFailStreak = 0;
+	arrivalExitActive = false;
+	arrivalExitAttempts = 0;
+	arrivalExitReenter = false;
 	setPhase(PVP_TO_HANGOUT);
 	drivePhase("beginCityLoop");
 }
@@ -361,9 +379,13 @@ void SimPvPController::beginTransitStop(const String& planetName, const String& 
 	shuttleTargetLocalPosition = padPos;
 	shuttleTargetCellOid = 0;
 	shuttleTargetIsCollector = false;
+	shuttleTargetInterplanetary = false;
 	hangoutLocation = padPos;
 	transitLoiterSeconds = dwellSeconds < 1 ? 1 : dwellSeconds;
 	pathFailStreak = 0;
+	arrivalExitActive = false;
+	arrivalExitAttempts = 0;
+	arrivalExitReenter = false;
 	setPhase(PVP_TO_HANGOUT);
 	drivePhase("beginTransitStop");
 }
@@ -371,6 +393,11 @@ void SimPvPController::beginTransitStop(const String& planetName, const String& 
 void SimPvPController::startSimLoop() {
 	if (agent == nullptr)
 		return;
+
+	if (arrivalExitActive) {
+		beginArrivalExit(arrivalOutdoor);
+		return;
+	}
 
 	drivePhase("startSimLoop");
 }
@@ -396,6 +423,11 @@ void SimPvPController::drivePhase(const String& reason) {
 		startLoitering();
 		break;
 	case PVP_TO_SHUTTLE:
+		if (shuttleTargetIsCollector && shuttleTargetInterplanetary &&
+				SimPlayerManager::instance()->isTicketCollectorTravelEnabled()) {
+			beginCollectorDepartureApproach(reason);
+			break;
+		}
 		logMoveTarget("shuttle", shuttleLocation);
 		{
 			CellObject* targetCell = nullptr;
@@ -426,6 +458,12 @@ void SimPvPController::drivePhase(const String& reason) {
 		notifyReadyToTravel();
 		break;
 	}
+	case PVP_ARRIVAL_REENTER:
+	case PVP_ARRIVAL_EGRESS:
+		// Arrival exit is driven by beginArrivalExit()/onArrived()/onPathFailed()
+		// and the startSimLoop resume; drivePhase must not re-issue it here (that
+		// would burn the bounded approach attempts).
+		break;
 	}
 }
 
@@ -434,8 +472,314 @@ void SimPvPController::setPhase(PvpPhase newPhase) {
 	phaseSinceMs = System::getMiliTime();
 }
 
+void SimPvPController::beginCollectorDepartureApproach(const String& reason) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (manager == nullptr || strongAgent == nullptr)
+		return;
+
+	if (!collectorDepartureActive) {
+		collectorDepartureActive = true;
+		collectorDepartureEntry = false;
+		collectorApproachAttempts = 0;
+		collectorApproachStartedAtMs = System::getMiliTime();
+	}
+
+	if (collectorApproachAttempts >= manager->getTicketCollectorApproachAttempts() ||
+			System::getMiliTime() > collectorApproachStartedAtMs +
+				(uint64)manager->getTicketCollectorApproachTtlSeconds() * 1000) {
+		if (manager->isTicketCollectorFallbackToBoardFromNear()) {
+			collectorDepartureActive = false;
+			cellEgressSuppressed = false;
+			setPhase(PVP_AWAITING_SHUTTLE);
+			notifyReadyToTravel();
+		} else {
+			cancelCollectorDeparture("collectorApproachExhausted");
+		}
+		return;
+	}
+
+	collectorApproachAttempts++;
+	ManagedReference<Zone*> zone;
+	Vector3 currentWorld;
+	{
+		Locker agentLocker(strongAgent);
+		zone = strongAgent->getZone();
+		currentWorld = strongAgent->getWorldPosition();
+	}
+
+	if (zone == nullptr) {
+		SimPlayerController::onPathFailed();
+		return;
+	}
+
+	Vector3 resolvedWorld;
+	Vector3 resolvedLocal;
+	ManagedReference<CellObject*> resolvedCell;
+	uint64 resolvedOid = 0;
+	if (!manager->resolveNearestTicketCollector(zone, shuttleLocation,
+			resolvedWorld, resolvedLocal, resolvedCell, resolvedOid)) {
+		// The route target was classified as a collector at plan time, but the
+		// world query can legitimately miss during a reload. Use the same bounded
+		// fallback as a path failure rather than silently switching topology.
+		if (manager->isTicketCollectorFallbackToBoardFromNear()) {
+			collectorDepartureActive = false;
+			cellEgressSuppressed = false;
+			setPhase(PVP_AWAITING_SHUTTLE);
+			notifyReadyToTravel();
+		} else {
+			cancelCollectorDeparture("collectorNotFound");
+		}
+		return;
+	}
+
+	collectorWorld = resolvedWorld;
+	collectorLocal = resolvedLocal;
+	collectorCell = resolvedCell;
+	collectorOid = resolvedOid;
+
+	bool contained = false;
+	{
+		Locker agentLocker(strongAgent);
+		currentWorld = strongAgent->getWorldPosition();
+		ManagedReference<SceneObject*> parent = strongAgent->getParent().get();
+		contained = collectorCell != nullptr ?
+			(parent != nullptr && parent->isCellObject() &&
+				parent->getObjectID() == collectorCell->getObjectID()) :
+			(parent == nullptr || !parent->isCellObject());
+	}
+
+	if (currentWorld.distanceTo(collectorWorld) <=
+			manager->getTicketCollectorBoardRadiusMeters() && contained) {
+		collectorDepartureActive = false;
+		setPhase(PVP_AWAITING_SHUTTLE);
+		notifyReadyToTravel();
+		return;
+	}
+
+	Vector3 interiorWorld;
+	Vector3 interiorLocal;
+	ManagedReference<CellObject*> interiorCell;
+	SimPlayerManager::StarportInteriorWaypointResult result =
+		manager->resolveStarportInteriorWaypoint(zone, shuttleLocation,
+			currentWorld, interiorWorld, interiorLocal, interiorCell);
+
+	CellNavDiagLog::write("PVP_COLLECTOR_APPROACH squad=" +
+		String::valueOf(squadId) + " agent=" +
+		String::valueOf(strongAgent->getObjectID()) +
+		" attempt=" + String::valueOf(collectorApproachAttempts) + " result=" +
+		String::valueOf((int)result) + " collector=(" +
+		String::valueOf(collectorWorld.getX()) + "," +
+		String::valueOf(collectorWorld.getY()) + ") collectorCellOid=" +
+		String::valueOf(collectorCell == nullptr ? 0 : collectorCell->getObjectID()) +
+		" cur=(" + String::valueOf(currentWorld.getX()) + "," +
+		String::valueOf(currentWorld.getY()) + ") action=" +
+		String(result == SimPlayerManager::STARPORT_WAYPOINT_FOUND ?
+			"moveToInterior" : result == SimPlayerManager::STARPORT_RESOLVE_FAILED ?
+			"onPathFailed" : "plainMoveTo(collector)"));
+
+	if (result == SimPlayerManager::STARPORT_RESOLVE_FAILED) {
+		SimPlayerController::onPathFailed();
+		return;
+	}
+
+	if (result == SimPlayerManager::STARPORT_WAYPOINT_FOUND) {
+		collectorDepartureEntry = true;
+		setPhase(PVP_TO_SHUTTLE);
+		moveToInterior(interiorWorld, interiorLocal, interiorCell.get());
+		return;
+	}
+
+	collectorDepartureEntry = false;
+	cellEgressSuppressed = false;
+	setPhase(PVP_TO_SHUTTLE);
+	moveTo(collectorWorld, collectorWorld, collectorCell.get());
+
+	if (SimPlayerManager::instance()->isPvpLogStateTransitionsEnabled())
+		Logger::console.info("SimPvpLeader squad=" + String::valueOf(squadId) +
+			" collectorApproach reason=" + reason, true);
+}
+
+void SimPvPController::beginArrivalExit(const Vector3& outdoorArrival) {
+	if (agent == nullptr)
+		return;
+
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr)
+		return;
+
+	if (!arrivalExitActive) {
+		arrivalExitActive = true;
+		arrivalExitAttempts = 0;
+	}
+
+	arrivalOutdoor = outdoorArrival;
+
+	if (arrivalExitAttempts >= manager->getTicketCollectorApproachAttempts()) {
+		// Bounded exit attempts exhausted: terminate cleanly (reposition outside +
+		// drop from the barrier) instead of looping onPathFailed forever.
+		abandonArrivalExit("attemptsExhausted");
+		return;
+	}
+
+	arrivalExitAttempts++;
+	ManagedReference<AiAgent*> strongAgent = agent;
+	ManagedReference<Zone*> zone;
+	Vector3 currentWorld;
+	{
+		Locker agentLocker(strongAgent);
+		zone = strongAgent->getZone();
+		currentWorld = strongAgent->getWorldPosition();
+	}
+
+	Vector3 interiorWorld;
+	Vector3 interiorLocal;
+	ManagedReference<CellObject*> interiorCell;
+	SimPlayerManager::StarportInteriorWaypointResult result =
+		manager->resolveStarportInteriorWaypoint(zone, outdoorArrival,
+			currentWorld, interiorWorld, interiorLocal, interiorCell);
+
+	if (result == SimPlayerManager::STARPORT_RESOLVE_FAILED) {
+		// Transient miss: a bounded delayed retry (onPathFailed reschedules and the
+		// startSimLoop resume re-drives beginArrivalExit); the attempts cap above
+		// makes this terminate via abandonArrivalExit().
+		setPhase(PVP_ARRIVAL_REENTER);
+		SimPlayerController::onPathFailed();
+		return;
+	}
+
+	clearCellEgressState();
+	if (result == SimPlayerManager::STARPORT_WAYPOINT_FOUND) {
+		arrivalExitReenter = true;
+		setPhase(PVP_ARRIVAL_REENTER);
+		moveToInterior(interiorWorld, interiorLocal, interiorCell.get());
+		return;
+	}
+
+	arrivalExitReenter = false;
+	setPhase(PVP_ARRIVAL_EGRESS);
+	moveTo(outdoorArrival);
+}
+
+void SimPvPController::finishArrivalExit() {
+	arrivalExitActive = false;
+	arrivalExitAttempts = 0;
+	arrivalExitReenter = false;
+	clearCellEgressState();
+}
+
+void SimPvPController::abandonArrivalExit(const String& reason) {
+	ManagedReference<AiAgent*> strongAgent = agent;
+	uint64 oid = 0;
+	if (strongAgent != nullptr) {
+		oid = strongAgent->getObjectID();
+		if (arrivalOutdoor.getX() != 0.f || arrivalOutdoor.getY() != 0.f) {
+			// Invalidate in-flight work and tear down stale movement before the
+			// reposition (board-path choreography: stale paths win this race live).
+			prepareForRelocation(reason);
+			Locker agentLocker(strongAgent);
+			Zone* zone = strongAgent->getZone();
+			if (zone != nullptr) {
+				strongAgent->setMovementState(AiAgent::OBLIVIOUS);
+				strongAgent->clearPatrolPoints();
+				strongAgent->clearSavedPatrolPoints();
+				strongAgent->clearCurrentPath();
+				strongAgent->switchZone(zone->getZoneName(),
+					arrivalOutdoor.getX(), arrivalOutdoor.getZ(),
+					arrivalOutdoor.getY(), 0);
+				// Re-anchor home outdoors: an OBLIVIOUS agent away from a stale
+				// hollow home would otherwise PATHING_HOME back into the hollow.
+				strongAgent->setHomeLocation(arrivalOutdoor.getX(),
+					arrivalOutdoor.getZ(), arrivalOutdoor.getY(), nullptr);
+			}
+		}
+	}
+	finishArrivalExit();
+	state = SimPlayerController::WAITING;
+	// Drop out of the squad arrival barrier so it never wedges waiting on a bot
+	// that could not exit; the barrier finalizes when the pending set empties.
+	if (oid != 0)
+		SimPlayerManager::instance()->onPvpArrivalExitComplete(squadId, oid);
+	if (SimPlayerManager::instance()->isPvpLogStateTransitionsEnabled())
+		Logger::console.info("SimPvpLeader squad=" + String::valueOf(squadId) +
+			" abandonArrivalExit reason=" + reason, true);
+}
+
+void SimPvPController::cancelCollectorDeparture(const String& reason) {
+	collectorDepartureActive = false;
+	collectorDepartureEntry = false;
+	cellEgressSuppressed = false;
+	haltAgentMovement(reason);
+	prepareForRelocation(reason);
+	shuttleTargetIsCollector = false;
+	shuttleTargetInterplanetary = false;
+	// Terminal: drop the pending routed leg so the loiter->depart cycle does not
+	// reselect the same unreachable collector leg forever (falls back to the simple
+	// city shuttle).
+	SimPlayerManager::instance()->abandonPvpRoutedTravel(squadId);
+	setPhase(PVP_LOITERING);
+	startLoitering();
+}
+
 void SimPvPController::onArrived() {
 	pathFailStreak = 0;
+
+	if (arrivalExitActive) {
+		if (phase == PVP_ARRIVAL_REENTER) {
+			clearCellEgressState();
+			arrivalExitReenter = false;
+			setPhase(PVP_ARRIVAL_EGRESS);
+			moveTo(arrivalOutdoor);
+			return;
+		}
+
+		if (phase == PVP_ARRIVAL_EGRESS) {
+			bool outdoors = false;
+			{
+				Locker agentLocker(agent);
+				ManagedReference<SceneObject*> parent = agent->getParent().get();
+				outdoors = parent == nullptr || !parent->isCellObject();
+			}
+			if (outdoors) {
+				finishArrivalExit();
+				SimPlayerManager::instance()->onPvpArrivalExitComplete(
+					squadId, agent->getObjectID());
+			}
+			return;
+		}
+	}
+
+	if (collectorDepartureActive) {
+		if (collectorDepartureEntry) {
+			collectorDepartureEntry = false;
+			cellEgressSuppressed = true;
+			moveTo(collectorWorld, collectorWorld, collectorCell.get());
+			return;
+		}
+
+		Vector3 currentWorld;
+		bool contained = false;
+		{
+			Locker agentLocker(agent);
+			currentWorld = agent->getWorldPosition();
+			ManagedReference<SceneObject*> parent = agent->getParent().get();
+			contained = collectorCell != nullptr ?
+				(parent != nullptr && parent->isCellObject() &&
+					parent->getObjectID() == collectorCell->getObjectID()) :
+				(parent == nullptr || !parent->isCellObject());
+		}
+		if (currentWorld.distanceTo(collectorWorld) <=
+				SimPlayerManager::instance()->getTicketCollectorBoardRadiusMeters() &&
+				contained) {
+			collectorDepartureActive = false;
+			cellEgressSuppressed = false;
+			setPhase(PVP_AWAITING_SHUTTLE);
+			notifyReadyToTravel();
+		} else {
+			beginCollectorDepartureApproach("collectorArrivalOutsideGate");
+		}
+		return;
+	}
 
 	if (phase == PVP_TO_HANGOUT) {
 		startLoitering();
@@ -447,6 +791,32 @@ void SimPvPController::onArrived() {
 }
 
 void SimPvPController::onPathFailed() {
+	if (arrivalExitActive) {
+		SimPlayerController::onPathFailed();
+		return;
+	}
+
+	if (collectorDepartureActive) {
+		if (collectorApproachAttempts <
+				SimPlayerManager::instance()->getTicketCollectorApproachAttempts() &&
+				System::getMiliTime() <= collectorApproachStartedAtMs +
+					(uint64)SimPlayerManager::instance()->
+						getTicketCollectorApproachTtlSeconds() * 1000) {
+			beginCollectorDepartureApproach("pathFailed");
+			return;
+		}
+
+		if (SimPlayerManager::instance()->isTicketCollectorFallbackToBoardFromNear()) {
+			collectorDepartureActive = false;
+			cellEgressSuppressed = false;
+			setPhase(PVP_AWAITING_SHUTTLE);
+			notifyReadyToTravel();
+		} else {
+			cancelCollectorDeparture("collectorApproachExhausted");
+		}
+		return;
+	}
+
 	pathFailStreak++;
 
 	Logger::console.info("SimPvpLeader squad=" + String::valueOf(squadId) +
@@ -468,6 +838,12 @@ void SimPvPController::prepareForRelocation(const String& reason) {
 	shuttleTargetLocalPosition = Vector3(0, 0, 0);
 	shuttleTargetCellOid = 0;
 	shuttleTargetIsCollector = false;
+	shuttleTargetInterplanetary = false;
+	collectorDepartureActive = false;
+	collectorDepartureEntry = false;
+	arrivalExitActive = false;
+	arrivalExitAttempts = 0;
+	arrivalExitReenter = false;
 }
 
 bool SimPvPController::acceptFoundPath(const Vector3& pathEnd) {
@@ -611,6 +987,12 @@ void SimPvPController::forceAdvancePhase(const String& reason) {
 		setPhase(PVP_AWAITING_SHUTTLE);
 		drivePhase("forceAdvance");
 		break;
+	case PVP_ARRIVAL_REENTER:
+	case PVP_ARRIVAL_EGRESS:
+		// Arrival exit owns the topology; a TTL only re-drives its current
+		// resolver/path phase and never marks the squad outside.
+		SimPlayerController::onPathFailed();
+		break;
 	}
 }
 
@@ -684,15 +1066,17 @@ void SimPvPController::enterToShuttle(const String& reason) {
 	if (manager != nullptr && manager->onPvpSquadDepartureIntent(squadId,
 			target)) {
 		shuttleLocation = target.worldPos;
-		shuttleTargetLocalPosition = target.localPos;
-		shuttleTargetCellOid = target.cellOid;
-		shuttleTargetIsCollector = target.isCollector;
+			shuttleTargetLocalPosition = target.localPos;
+			shuttleTargetCellOid = target.cellOid;
+			shuttleTargetIsCollector = target.isCollector;
+			shuttleTargetInterplanetary = target.interplanetary;
 	} else {
 		// Keep the current city pad as the safe fallback if the squad row has
 		// disappeared during a maintenance/reform race.
 		shuttleTargetLocalPosition = shuttleLocation;
-		shuttleTargetCellOid = 0;
-		shuttleTargetIsCollector = false;
+			shuttleTargetCellOid = 0;
+			shuttleTargetIsCollector = false;
+			shuttleTargetInterplanetary = false;
 	}
 
 	setPhase(PVP_TO_SHUTTLE);
@@ -708,7 +1092,8 @@ void SimPvPController::interruptForConvergence() {
 		return;
 
 	// Already heading out - boarding will consume the pending destination.
-	if (phase == PVP_TO_SHUTTLE || phase == PVP_AWAITING_SHUTTLE)
+	if (phase == PVP_TO_SHUTTLE || phase == PVP_AWAITING_SHUTTLE ||
+			phase == PVP_ARRIVAL_REENTER || phase == PVP_ARRIVAL_EGRESS)
 		return;
 
 	Logger::console.info("SimPvpLeader squad=" + String::valueOf(squadId) +
@@ -735,7 +1120,8 @@ void SimPvPController::interruptForBreakOff() {
 		return;
 
 	// Already heading out - boarding will consume the pending destination.
-	if (phase == PVP_TO_SHUTTLE || phase == PVP_AWAITING_SHUTTLE)
+	if (phase == PVP_TO_SHUTTLE || phase == PVP_AWAITING_SHUTTLE ||
+			phase == PVP_ARRIVAL_REENTER || phase == PVP_ARRIVAL_EGRESS)
 		return;
 
 	Logger::console.info("SimPvpLeader squad=" + String::valueOf(squadId) +
@@ -764,6 +1150,10 @@ String SimPvPController::getPvpPhaseName() const {
 		return "movingToShuttle";
 	case PVP_AWAITING_SHUTTLE:
 		return "awaitingShuttle";
+	case PVP_ARRIVAL_REENTER:
+		return "arrivalReenter";
+	case PVP_ARRIVAL_EGRESS:
+		return "arrivalEgress";
 	}
 
 	return "unknown";
@@ -786,6 +1176,11 @@ void SimPvPMemberController::startSimLoop() {
 	if (agent == nullptr)
 		return;
 
+	if (arrivalExitActive) {
+		beginArrivalExit(arrivalOutdoor);
+		return;
+	}
+
 	assertFollow();
 
 	// Keep exactly one 1s tick chain alive for scanning/death detection. The
@@ -797,7 +1192,135 @@ void SimPvPMemberController::startSimLoop() {
 }
 
 void SimPvPMemberController::onArrived() {
-	// Members never issue moveTo(); nothing to do.
+	if (!arrivalExitActive)
+		return;
+
+	if (arrivalExitReenter) {
+		clearCellEgressState();
+		arrivalExitReenter = false;
+		moveTo(arrivalOutdoor);
+		return;
+	}
+
+	bool outdoors = false;
+	{
+		Locker agentLocker(agent);
+		ManagedReference<SceneObject*> parent = agent->getParent().get();
+		outdoors = parent == nullptr || !parent->isCellObject();
+	}
+	if (outdoors) {
+		arrivalExitActive = false;
+		arrivalExitAttempts = 0;
+		clearCellEgressState();
+		SimPlayerManager::instance()->onPvpArrivalExitComplete(
+			squadId, agent->getObjectID());
+	}
+}
+
+void SimPvPMemberController::beginArrivalExit(const Vector3& outdoorArrival) {
+	if (agent == nullptr)
+		return;
+
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr)
+		return;
+
+	arrivalExitActive = true;
+	arrivalOutdoor = outdoorArrival;
+
+	if (arrivalExitAttempts >= manager->getTicketCollectorApproachAttempts()) {
+		// Bounded: members enforce the same cap as the leader so a member that
+		// cannot exit never blocks the squad arrival barrier forever.
+		abandonArrivalExit("attemptsExhausted");
+		return;
+	}
+
+	arrivalExitAttempts++;
+
+	ManagedReference<AiAgent*> strongAgent = agent;
+	ManagedReference<Zone*> zone;
+	Vector3 currentWorld;
+	{
+		Locker agentLocker(strongAgent);
+		zone = strongAgent->getZone();
+		currentWorld = strongAgent->getWorldPosition();
+		strongAgent->setMovementState(AiAgent::OBLIVIOUS);
+		strongAgent->clearPatrolPoints();
+		strongAgent->clearSavedPatrolPoints();
+		strongAgent->clearCurrentPath();
+	}
+
+	Vector3 interiorWorld;
+	Vector3 interiorLocal;
+	ManagedReference<CellObject*> interiorCell;
+	SimPlayerManager::StarportInteriorWaypointResult result =
+		manager->resolveStarportInteriorWaypoint(zone, outdoorArrival,
+			currentWorld, interiorWorld, interiorLocal, interiorCell);
+
+	if (result == SimPlayerManager::STARPORT_RESOLVE_FAILED) {
+		SimPlayerController::onPathFailed();
+		return;
+	}
+
+	clearCellEgressState();
+	if (result == SimPlayerManager::STARPORT_WAYPOINT_FOUND) {
+		arrivalExitReenter = true;
+		moveToInterior(interiorWorld, interiorLocal, interiorCell.get());
+	} else {
+		arrivalExitReenter = false;
+		moveTo(outdoorArrival);
+	}
+}
+
+void SimPvPMemberController::abandonArrivalExit(const String& reason) {
+	ManagedReference<AiAgent*> strongAgent = agent;
+	uint64 oid = 0;
+	if (strongAgent != nullptr) {
+		oid = strongAgent->getObjectID();
+		if (arrivalOutdoor.getX() != 0.f || arrivalOutdoor.getY() != 0.f) {
+			prepareForRelocation(reason);
+			Locker agentLocker(strongAgent);
+			Zone* zone = strongAgent->getZone();
+			if (zone != nullptr) {
+				strongAgent->setMovementState(AiAgent::OBLIVIOUS);
+				strongAgent->clearPatrolPoints();
+				strongAgent->clearSavedPatrolPoints();
+				strongAgent->clearCurrentPath();
+				strongAgent->switchZone(zone->getZoneName(),
+					arrivalOutdoor.getX(), arrivalOutdoor.getZ(),
+					arrivalOutdoor.getY(), 0);
+				// Re-anchor home outdoors: an OBLIVIOUS agent away from a stale
+				// hollow home would otherwise PATHING_HOME back into the hollow.
+				strongAgent->setHomeLocation(arrivalOutdoor.getX(),
+					arrivalOutdoor.getZ(), arrivalOutdoor.getY(), nullptr);
+			}
+		}
+	}
+	arrivalExitActive = false;
+	arrivalExitAttempts = 0;
+	arrivalExitReenter = false;
+	clearCellEgressState();
+	state = SimPlayerController::WAITING;
+	if (oid != 0)
+		SimPlayerManager::instance()->onPvpArrivalExitComplete(squadId, oid);
+	// Re-establish the follow AND the tick chain: startSimLoop returned right after
+	// beginArrivalExit, and the barrier finalization only calls assertFollow, so
+	// without this the member's onTick (death report, combat scan, follow self-heal)
+	// would stop permanently.
+	assertFollow();
+	Reference<ArrivalCheckTask*> task =
+		new ArrivalCheckTask(this, getWorkLoopGeneration());
+	task->schedule(1000);
+	(void)reason;
+}
+
+void SimPvPMemberController::onPathFailed() {
+	if (arrivalExitActive) {
+		SimPlayerController::onPathFailed();
+		return;
+	}
+
+	SimPlayerController::onPathFailed();
 }
 
 void SimPvPMemberController::onTick() {
@@ -806,6 +1329,9 @@ void SimPvPMemberController::onTick() {
 	ManagedReference<AiAgent*> strongAgent = agent;
 	if (strongAgent == nullptr || strongAgent->isDead() ||
 			strongAgent->isInCombat())
+		return;
+
+	if (arrivalExitActive)
 		return;
 
 	// Follow self-heal: combat and zone changes can clear followObject or the
@@ -818,6 +1344,10 @@ void SimPvPMemberController::assertFollow() {
 	ManagedReference<AiAgent*> leader = leaderAgent;
 
 	if (strongAgent == nullptr || leader == nullptr)
+		return;
+
+	if (arrivalExitActive ||
+			!SimPlayerManager::instance()->isPvpArrivalExitComplete(squadId))
 		return;
 
 	if (strongAgent->isDead() || strongAgent->isInCombat())

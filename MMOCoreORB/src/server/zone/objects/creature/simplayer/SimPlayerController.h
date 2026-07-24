@@ -138,6 +138,15 @@ protected:
     Vector3 destination;
     Vector3 destinationLocal;
     ManagedReference<CellObject*> destinationCell;
+    bool cellEgressActive;
+    Vector3 cellEgressResumeWorld;
+    Vector3 cellEgressResumeLocal;
+    ManagedReference<CellObject*> cellEgressResumeCell;
+    int cellEgressAttempts;
+    // When set, a move to an outdoor target from inside a cell does NOT trigger the
+    // generic egress; instead it does a directed findPath (routes through the portal
+    // graph to an enclosed/interior-reachable point, e.g. a starport hollow collector).
+    bool cellEgressSuppressed;
     // Hybrid movement keeps the logical assignment target separate from the
     // current navmesh boundary/egress sub-leg endpoint.
     Vector3 finalDestination;
@@ -160,6 +169,8 @@ protected:
     // A cell-aware provider approach is a complete base-path leg even for
     // hunters, whose normal wilderness legs use the hybrid mover.
     bool interiorApproachLeg;
+    uint64 diagnosticLastParentCellOid;
+    bool diagnosticParentCellInitialized;
     
     // Configurable speed/movement settings
     float runSpeed;
@@ -218,6 +229,7 @@ public:
     // pre-teleport target from the chain thread and race the fresh moveTo()'s
     // generation). Call before switchZone repositions.
     virtual void prepareForRelocation(const String& reason) {
+        clearCellEgressState();
         advanceWorkLoopGeneration(reason);
         state = WAITING;
         destination = Vector3(0, 0, 0);
@@ -247,10 +259,15 @@ public:
 protected:
     void moveToInterior(Vector3 worldPos, Vector3 localPos,
             CellObject* targetCell);
+    bool beginCellEgressIfNeeded(Vector3 worldPos, Vector3 localPos,
+            CellObject* targetCell);
+    void clearCellEgressState();
+    void failCellEgress();
     void clearInteriorApproachLeg() { interiorApproachLeg = false; }
     bool isInteriorApproachLeg() const { return interiorApproachLeg; }
     bool isHybridMovementActive() const {
-        return usesNavmeshHybridMovement() && !interiorApproachLeg;
+        return usesNavmeshHybridMovement() && !interiorApproachLeg &&
+            !cellEgressActive;
     }
     void queueMorePathNodes();
     bool pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out, int minSearchRadius = 100, int maxSearchRadius = 200);
@@ -263,12 +280,51 @@ protected:
     bool resolveHybridExit(Zone* zone, const Vector3& currentPosition,
             Vector3& boundary, Vector3& egress,
             ManagedReference<NavArea*>& area) const;
+    String getDiagnosticStateName() const;
+};
+
+// -------------------------------------------------------
+// CELL-NAVIGATION DIAGNOSTIC CONTROLLER (One Shot)
+// -------------------------------------------------------
+class SimCellNavDiagController : public SimPlayerController {
+    Vector3 diagnosticWorldPos;
+    Vector3 diagnosticLocalPos;
+    ManagedReference<CellObject*> diagnosticCell;
+    bool diagnosticRouteReady;
+    bool diagnosticRouteIssued;
+    // Round-trip exit leg: after arriving INSIDE the cell, move back out to an
+    // outdoor point to capture the cell->outdoor exit path.
+    Vector3 diagnosticExitWorldPos;
+    bool diagnosticExitReady;
+    bool diagnosticExitIssued;
+    // Leg 3 (arrival/landing): after reaching the hollow collector, route back OUT
+    // through the starport interior to an outside-world point.
+    Vector3 diagnosticReturnWorldPos;
+    bool diagnosticReturnReady;
+    bool diagnosticReturnIssued;   // leg 3a: re-enter a cell from the hollow
+    bool diagnosticFinalIssued;    // leg 3b: egress out to the world
+
+public:
+    SimCellNavDiagController(AiAgent* aiAgent);
+    virtual ~SimCellNavDiagController();
+
+    void setDiagnosticRoute(const Vector3& worldPos, const Vector3& localPos,
+            CellObject* cell);
+    void setDiagnosticExit(const Vector3& exitWorldPos);
+    void setDiagnosticReturn(const Vector3& returnWorldPos);
+    void startSimLoop() override;
+    void onArrived() override;
+    void onPathFailed() override;
+    bool shouldContinueArrivalChecks() const override { return false; }
 };
 
 // -------------------------------------------------------
 // MINER CONTROLLER (Resource Gathering)
 // -------------------------------------------------------
+class TicketArrivalRetryTask;
+
 class SimMinerController : public SimPlayerController {
+    friend class TicketArrivalRetryTask;
     String targetResource;
     int retryCount;
     SimMinerConfig config;
@@ -306,6 +362,24 @@ class SimMinerController : public SimPlayerController {
     String travelDestinationStarport;
     uint64 travelStartedAtMs;
     float travelBoardRadius;
+
+    enum TicketTravelPhase {
+        TICKET_TRAVEL_NONE,
+        TICKET_DEPARTURE_RESOLVE,
+        TICKET_DEPARTURE_ENTRY,
+        TICKET_DEPARTURE_COLLECTOR,
+        TICKET_ARRIVAL_REENTER,
+        TICKET_ARRIVAL_EGRESS
+    };
+    TicketTravelPhase ticketTravelPhase;
+    Vector3 ticketCollectorWorld;
+    Vector3 ticketCollectorLocal;
+    ManagedReference<CellObject*> ticketCollectorCell;
+    uint64 ticketCollectorOid;
+    bool ticketCollectorFound;
+    bool ticketArrivalCollectorFound;
+    Vector3 ticketArrivalOutdoor;
+    int ticketApproachAttempts;
 
     // P.4.5c: bounded "final approach". Long off-navmesh walks can terminate short
     // of the true target; the miner re-paths to close the gap to within the
@@ -403,6 +477,13 @@ private:
     // switchZone to the destination starport's outdoor arrival, clear travel
     // state, notify the manager, and re-enter the work loop on the new planet.
     void boardInterplanetaryShuttle(const String& reason);
+    void beginTicketCollectorDepartureApproach(const String& reason);
+    void beginTicketCollectorArrivalExit(const String& reason);
+    bool isAtTicketCollector() const;
+    bool canRetryTicketApproach() const;
+    void retryTicketApproach(const String& reason);
+    void cancelTicketCollectorTravel(const String& reason);
+    void completeTicketCollectorTravel();
     String getSimStateName(SimState simState) const;
     void logIntelligentTargetActivation(const String& action, const String& reason = "") const;
     void logIntelligentTargetArrival(const String& arrivalResult) const;

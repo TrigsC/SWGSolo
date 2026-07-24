@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.4.11` | 2 | F_0.4.7–F_0.4.11 cell-nav + starport ticket-collector travel: POB entry/egress/nearest-portal fixes, gated interplanetary collector travel, starport containment-margin fix, NPC pivot-swivel fixes, diagnostics behind a flag |
 | `0.4.6` | 2 | F_0.4.6 P.8.6: PvE hunter player-mimetic real buffs (need-gated doctor/entertainer providers, delayed-load cell resolution, synthetic fallback) |
 | `0.4.5` | 2 | fix: P.8.4 PvE hunter combat targeting — player-safe attack guard + defender-driven re-engagement |
 | `0.4.4` | 2 | F_0.4.4 P.8.3: PvE hunter combat & movement realism (real combat, navmesh-aware travel, self-defense + combat template, #/wilds dashboard) |
@@ -12,6 +13,17 @@
 | `0.1.0` | 1 | chore: initialize TRIP workflow |
 
 # Changelog Summary
+
+- **v0.4.11 (Cell-Nav + Starport Ticket-Collector Travel, F_0.4.7–F_0.4.11 - Week 2, 24-07-2026)**:
+  - **Feature**: gated, simulation-only **interplanetary ticket-collector travel** for miners and PvP squads. A bot walks *through* the starport interior to the ticket collector in the enclosed hollow (enter hall → cell-egress-suppressed directed route → board ≤ 8 m) and walks out of the destination hollow after boarding (re-enter a cell → egress out the front). Built on three POB cell-navigation fixes: **F_0.4.8** cell entry (`findNextPosition` adopts the cell on the duplicate-skip branch — no more teleport-into-wall at portals), **F_0.4.9** cell egress (portal-following leg to a computed building exterior, then resume the original move), **F_0.4.10** nearest-exterior-portal selection (new native `BuildingObject::getNearestExteriorPortalPoint`, fixes multi-door starports).
+  - **Starport containment-margin fix (live-verified)**: enclosed-hollow starports bake the collector ~10 m outside the collision AABB, so strict containment returned `NO_INTERIOR` and PvP bots wall-hugged. Two-pass selector keeps strict containment primary + a bounded horizontal margin (`interiorContainmentMarginMeters`, default 15). **66/66 PvP collector approaches now enter the interior.**
+  - **NPC pivot-swivel fixes (live-verified "way better")**: `AiAgentImplementation::findNextPosition` direction calc — hold facing when the per-step vector is ~0 (was applying `atan2(0,0)`), and normalize a negative angle with `+2*PI` instead of `+PI` (was a 180° flip), matching the patrol-side calc. A third cell-crossing world-space attempt was reverted (regressed parent-relative in-cell facing); logged as future work with the in-cell waypoint-feed wiggle.
+  - **Diagnostics behind a flag (not stripped)**: all `CellNavDiagLog` output (`ENGINE_*`, `STARPORT_WP_*`, `PVP_COLLECTOR_APPROACH`, `ENGINE_DIRECTION`) gated by one master flag `cellNavDiag.logging` (default off); diagnostic test-bot spawn `cellNavDiag.enabled` default off. Flip either to re-capture, no rebuild.
+  - **Scope**: gated `ticketCollectorTravel.enabled` (default off); simulation-only (`switchZone` repositioning, no inventory/credit/market/persistence mutation); disabled path byte-for-byte legacy. IDL change confined to `BuildingObject` source declaration; no generated files hand-edited.
+  - **Review**: Codex multi-round loop → APPROVED (7 Major recovery/edge-lifecycle findings addressed) + owner-verified live addendum (`docs/3-code-review/CR_w2_v0.4.11.md`): PvP interior entry 66/66, swivel "way better".
+  - **Deferred (logged in `docs/ai-cell-navigation-design.md`)**: portal-aware combat pursuit + LoS-gated attacks (starport-hollow combat wall-clip); cell-crossing heading garbage; in-cell waypoint-feed wiggle; PvP still pending the convergence fix.
+  - **Files**: sim_player_manager.lua, BuildingObject.idl, BuildingObjectImplementation.cpp, AiAgentImplementation.cpp, CellNavDiagLog.h, SimPlayerController.{h,cpp}, SimPlayerManager.{h,cpp}, SimPvPController.{h,cpp}, ARCHI.md, ai-cell-navigation-design.md, F_0.4.7–F_0.4.11 plans, tuto_0.4.11.md.
+  - **Note**: committed + tagged on `feat/cellnav-entry-diagnostics`; **NOT** merged into `miner-ai` (owner policy). Pre-existing `death_watch_wraith.lua`/`rifle_t21.lua` and `engine3` working-tree changes excluded.
 
 - **v0.4.6 (P.8.6 PvE Hunter Player-Mimetic Real Buffs - Week 2, 22-07-2026)**:
   - **Feature**: replaces the placeholder hunter `BUFF_UP` (loiter + synthetic buffs every cycle) with **need-gated real buffs** from the owner's in-world Doctor/Musician/Dancer buffer NPCs. `computeBuffNeeds` re-buffs only when a tracked buff is absent or within the refresh threshold (default 15 min); real entertainer buffs fire via `PlayerManager::startWatch`/`startListen` observers, and the doctor's negotiation is driven through a `ScreenPlayTask` (a bot's chat cannot reach the player-only `SPATIALCHATSENT` observer). Sim bots auto-confirm, the 5k charge is bypassed, and a per-step refresh replaces the up-front medical wipe so an interrupted session never strips a pool.

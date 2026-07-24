@@ -160,8 +160,11 @@ no new warnings before handing work back** (owner-stated standard).
 - **`MMOCoreORB/bin/scripts/managers/*.lua`** — per-manager tunable config
   (e.g. `sim_player_manager.lua` holds all AI-economy knobs: demand
   thresholds, station-travel gates, vehicle-mechanics toggle, recovery dry-run
-  flag). This is the primary place new simulation features expose
-  owner-tunable, default-off gates.
+  flag, `ticketCollectorTravel` interplanetary-travel gate +
+  `interiorContainmentMarginMeters`, and the `cellNavDiag` toggles —
+  `enabled` for the diagnostic test-bot spawn and `logging` as the master gate
+  for all `bin/log/cellnav.log` output, both default off). This is the primary
+  place new simulation features expose owner-tunable, default-off gates.
 - **`MMOCoreORB/bin/conf/features.lua`** — global feature flags.
 - Compiled-in constants are the exception, not the default — prefer a Lua
   config entry so behavior is tunable without a rebuild.
@@ -285,7 +288,25 @@ This is this fork's primary custom subsystem, layered on top of the stock
   callers (all miners) are unaffected. Caution: the engine's
   `findNextPosition` math assumes one coordinate space per comparison; any
   new in-cell movement must keep world/cell-local forms separate (P.6.5b
-  design doc §13.1 lesson).
+  design doc §13.1 lesson; reinforced by the F_0.4.8–F_0.4.11 cell-nav work
+  and `tuto_0.4.11.md`). The cell-navigation stack (F_0.4.7–F_0.4.11,
+  `docs/ai-cell-navigation-design.md`) adds: POB **cell entry** (adopt the
+  cell on `findNextPosition`'s duplicate-skip branch — no teleport-into-wall
+  at a portal), a **cell-egress** leg (`SimPlayerController::beginCellEgressIfNeeded`
+  — portal-follow `findPath` to a computed building exterior, then resume the
+  original move), **nearest-exterior-portal** selection (native
+  `BuildingObject::getNearestExteriorPortalPoint`, for multi-door starports),
+  and gated **ticket-collector interplanetary travel** (`ticketCollectorTravel`,
+  default off): a bot walks through the starport interior to the collector in
+  the enclosed hollow and out of the destination hollow after boarding, with a
+  tri-state interior resolver (`resolveStarportInteriorWaypoint`, whose
+  containment test allows a bounded horizontal margin so an enclosed-hollow
+  collector baked outside the collision AABB still associates with its
+  starport), bounded retries, safe outdoor recovery, and an idempotent PvP
+  arrival OID barrier. Two `findNextPosition` direction-calc fixes (hold facing
+  on a ~zero step; wrap a negative angle by `+2*PI` not `+PI`) removed a
+  pivot-swivel. Cell-nav instrumentation (`CellNavDiagLog` → `bin/log/cellnav.log`)
+  is retained but gated by `cellNavDiag.logging` (default off).
 - **`SimPvPController.{h,cpp}`** — the PvP/combat-oriented sibling
   controller for AI squads (see §13).
 - **`SimHunterController.{h,cpp}`** — the PvE hunter controller (P.8). Drives a

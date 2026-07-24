@@ -171,7 +171,30 @@ SimPlayerManagerConfig = {
         planetDispatchMaxMinersPerRemotePlanet = 3,  -- cap per remote planet
         planetDispatchPerMinerCooldownSeconds = 900, -- don't re-dispatch a miner too often
         planetDispatchPerPlanetCooldownSeconds = 300,-- don't thrash a destination planet
-        planetDispatchBoardRadiusMeters = 20,  -- "reached the ticket collector" radius
+        planetDispatchBoardRadiusMeters = 10,  -- "reached the ticket collector" radius
+        -- F.0.4.11: when enabled, interplanetary trips walk through the
+        -- starport interior to the ticket collector and walk out of the
+        -- destination hollow after boarding. Disabled keeps the existing
+        -- dispatch and PvP travel choreography unchanged, including the
+        -- 10-meter planetDispatchBoardRadiusMeters behavior.
+        ticketCollectorTravel = {
+            enabled = true,
+            boardRadiusMeters = 8,
+            approachAttempts = 3,
+            approachTtlSeconds = 60,
+            fallbackToBoardFromNear = false,
+            -- Deterministic fixture: force the shared collector resolver to
+            -- return none on every starport to exercise fallback/cancel paths.
+            testForceNoCollector = false,
+            -- Enclosed-hollow starports bake the ticket collector ~10m outside
+            -- the starport's collision bounding box, so a strict point-in-AABB
+            -- test fails to associate the collector with its own starport and
+            -- the bot walks straight at the walled hollow. This horizontal slack
+            -- (meters) on the containment test rescues that case; the next
+            -- cell-bearing building is always 100m+ away so there is no risk of
+            -- selecting an adjacent structure. Clamped 0..40 in C++.
+            interiorContainmentMarginMeters = 15,
+        },
     },
 
     -- P.4.4a real vehicle mechanics. NPCs spawn a real speeder + control device,
@@ -625,6 +648,34 @@ SimPlayerManagerConfig = {
         startupDelaySeconds = 0,
         batchSize = 5,
         batchDelayMs = 1000,
+    },
+
+    -- Pass-1 POB cell-entry movement diagnostic. Disabled by default.
+    cellNavDiag = {
+        -- Spawns the one-shot diagnostic artisan test bot. OFF in production; flip
+        -- true only when actively diagnosing cell-nav movement.
+        enabled = false,
+        -- Master gate for ALL cell-nav diagnostic file output (bin/log/cellnav.log:
+        -- ENGINE_*, STARPORT_WP_*, TICKET_COLLECTOR_RESOLVED, PVP_COLLECTOR_APPROACH,
+        -- ENGINE_DIRECTION, ...). OFF in production -- the full instrumentation stays
+        -- compiled in, dormant and free. Flip true to re-capture (no rebuild needed).
+        logging = false,
+        planet = "tatooine",
+        -- Mos Eisley STARPORT test (building oid 1106368, template
+        -- starport_tatooine.iff; interior = cell 4; outdoor landing pad ~3619,-4790).
+        -- Spawn out front (outdoor), target the interior main hall (resolver finds
+        -- the cell), then exit back out to the world (wilderness) to see where
+        -- getEjectionPoint() sends the bot and whether the egress works here.
+        spawnX = 3527, spawnY = -4803, spawnZ = 5,
+        targetX = 3563, targetY = -4799,   -- starport interior main hall
+        targetZ = 0,
+        doorwayX = 3527, doorwayY = -4803,  -- reference (front)
+        -- Exit to a flat, nearby, GROUND-LEVEL city point (the cantina front) so the
+        -- round-trip completes cleanly. The old 5000,-5500 target is a distant mesa
+        -- (z~155) that made the non-hybrid diag bot ramp up a long overland climb --
+        -- an artifact of the target, not the egress (which now exits the front fine).
+        exitX = 3626, exitY = -4791,
+        logEverySimLoopTick = true,
     },
 
     -- P.8 Phase 2: persistent PvE identity roster, passed spike foundation,

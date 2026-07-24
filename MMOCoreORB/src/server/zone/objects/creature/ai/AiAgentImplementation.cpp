@@ -102,6 +102,7 @@
 #include "server/zone/objects/creature/commands/ForcePowersQueueCommand.h"
 #include "server/zone/objects/creature/commands/JediQueueCommand.h"
 #include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
+#include "server/zone/objects/creature/simplayer/CellNavDiagLog.h"
 #include "server/zone/managers/frs/FrsManager.h"
 #include "server/zone/managers/radial/RadialOptions.h"
 
@@ -4542,6 +4543,16 @@ void AiAgentImplementation::updateCurrentPosition(PatrolPoint* nextPosition) {
 	if (nextPosition == nullptr)
 		return;
 
+	bool cellNavDiagTrace = getSimPlayerBot() &&
+		SimPlayerManager::instance()->isCellNavDiagBot(getObjectID());
+	if (cellNavDiagTrace)
+		CellNavDiagLog::write("ENGINE_UPDATE_POSITION setPositionArgs=(" +
+			String::valueOf(nextPosition->getPositionX()) + "," +
+			String::valueOf(nextPosition->getPositionZ()) + "," +
+			String::valueOf(nextPosition->getPositionY()) + ") incomingCell=" +
+			String::valueOf(nextPosition->getCell() == nullptr ? 0ULL :
+				nextPosition->getCell()->getObjectID()));
+
 	setPosition(nextPosition->getPositionX(), nextPosition->getPositionZ(), nextPosition->getPositionY());
 
 	CellObject* cell = nextPosition->getCell();
@@ -4552,8 +4563,13 @@ void AiAgentImplementation::updateCurrentPosition(PatrolPoint* nextPosition) {
 
 	if (cell != nullptr && cell->getParent().get() != nullptr) {
 		updateZoneWithParent(cell, false, false);
+		if (cellNavDiagTrace)
+			CellNavDiagLog::write("ENGINE_UPDATE_POSITION branch=updateZoneWithParent cell=" +
+				String::valueOf(cell->getObjectID()));
 	} else {
 		updateZone(false, false);
+		if (cellNavDiagTrace)
+			CellNavDiagLog::write("ENGINE_UPDATE_POSITION branch=updateZone cell=0");
 	}
 
 	removeOutOfRangeObjects();
@@ -4634,21 +4650,26 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
             info("findNextPosition(" + String::valueOf(maxDistance) + ", " + String::valueOf(walk) + ")", true);
     #endif 
 
-    bool isSimPlayer = getSimPlayerBot();
-    const CreatureTemplate* tmpl = getCreatureTemplate();
+	bool isSimPlayer = getSimPlayerBot();
+	bool cellNavDiagTrace = isSimPlayer &&
+		SimPlayerManager::instance()->isCellNavDiagBot(getObjectID());
+	const CreatureTemplate* tmpl = getCreatureTemplate();
     if (tmpl != nullptr && tmpl->getTemplateName() == "light_jedi_sentinel") {
         isSimPlayer = true;
     }
 
     Locker locker(&targetMutex);
 
-    if (isSimPlayer && (isDead() || getPatrolPointSize() <= 0)) {
-		#ifdef DEBUG_MOVE
+	if (isSimPlayer && (isDead() || getPatrolPointSize() <= 0)) {
+		if (cellNavDiagTrace)
+			CellNavDiagLog::write("ENGINE_FIND_NEXT_STOP reason=" +
+				String(isDead() ? "dead" : "no_patrol_points"));
+			#ifdef DEBUG_MOVE
         if (isSimPlayer) info("DEBUG_MOVE: Queue Empty or Dead. Stopping.", true);
 		#endif 
         return false;
     }
-    if (!isSimPlayer && (isDead() || getPatrolPointSize() <= 0)) return false;
+	if (!isSimPlayer && (isDead() || getPatrolPointSize() <= 0)) return false;
 
     int posture = getPosture();
     int movementState = getMovementState();
@@ -4666,7 +4687,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 
     Vector3 currentPosition = getPosition();
     Vector3 currentWorldPos = getWorldPosition();
-    PatrolPoint endMovementPosition = getNextPosition();
+	PatrolPoint endMovementPosition = getNextPosition();
 
     // ------------------------------------------------------------------
     // DISTANCE & COORDINATE CALCULATION
@@ -4681,7 +4702,7 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     float endDistZ = fabs(endDistDiff.getZ());
     
     float maxSquared = Math::max(0.1f, maxDistance * maxDistance);
-#ifdef DEBUG_MOVE
+	#ifdef DEBUG_MOVE
     if (isSimPlayer) {
         StringBuffer msg;
         msg << "DEBUG_MOVE: Dist2D=" << sqrt(endDistanceSq) 
@@ -4691,8 +4712,20 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         if (currentSpeed < 0.1f) msg << " [STALLED]";
         info(msg.toString(), true);
     }
-#endif 
-    // --- ARRIVAL LOGIC ---
+	#endif
+	if (cellNavDiagTrace) {
+		ManagedReference<SceneObject*> traceParent = getParent().get();
+		CellObject* traceCell = traceParent != nullptr &&
+			traceParent->isCellObject() ? traceParent.castTo<CellObject*>() :
+			nullptr;
+		CellNavDiagLog::write("ENGINE_FIND_NEXT_ENTRY current=" +
+			CellNavDiagLog::fmtPos(WorldCoordinates(currentPosition, traceCell)) +
+			" target=" + CellNavDiagLog::fmtPos(
+				endMovementPosition.getCoordinates()) + " maxDistance=" +
+			String::valueOf(maxDistance) + " walk=" +
+			String::valueOf(walk));
+	}
+	// --- ARRIVAL LOGIC ---
     if (endDistanceSq <= maxSquared && endDistZ < (maxDistance + 2.5f)) {
         currentFoundPath = nullptr;
         if (patrolPoints.size() > 0) patrolPoints.remove(0);
@@ -4737,31 +4770,51 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     updateLocomotion();
 
     // --- PATHFINDER ---
-    PathFinderManager* pathFinder = PathFinderManager::instance();
-    if (pathFinder == nullptr) return false;
+	PathFinderManager* pathFinder = PathFinderManager::instance();
+	if (pathFinder == nullptr) {
+		if (cellNavDiagTrace)
+			CellNavDiagLog::write("ENGINE_FIND_PATH_FAILED reason=no_pathfinder");
+		return false;
+	}
 
     Reference<Vector<WorldCoordinates>* > path = nullptr;
     ManagedReference<SceneObject*> currentParent = getParent().get();
     PatrolPoint currentPoint(currentPosition);
-    const WorldCoordinates endMovementCoords = endMovementPosition.getCoordinates();
-    CellObject* endMovementCell = endMovementPosition.getCell();
+	const WorldCoordinates endMovementCoords = endMovementPosition.getCoordinates();
+	CellObject* endMovementCell = endMovementPosition.getCell();
+	String pathSource = "cached";
 
-    if (currentFoundPath == nullptr) {
-        if (currentParent != nullptr && currentParent->isCellObject()) currentPoint.setCell(currentParent.castTo<CellObject*>());
-        path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementCoords, getZoneUnsafe()));
-    } else {
+	if (currentFoundPath == nullptr) {
+		pathSource = "initial_findPath";
+		if (currentParent != nullptr && currentParent->isCellObject()) currentPoint.setCell(currentParent.castTo<CellObject*>());
+		path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementCoords, getZoneUnsafe()));
+	} else {
         if (currentParent != nullptr && !currentParent->isCellObject()) currentParent = nullptr;
-        if ((movementState == AiAgent::FOLLOWING || movementState == AiAgent::PATHING_HOME || movementState == AiAgent::NOTIFY_ALLY || movementState == AiAgent::MOVING_TO_HEAL || movementState == AiAgent::WATCHING || movementState == AiAgent::CRACKDOWN_SCANNING || movementState == AiAgent::LAIR_HEALING)
-            && endMovementCell == nullptr && currentParent == nullptr && currentFoundPath->get(currentFoundPath->size() - 1).getWorldPosition().squaredDistanceTo(endMovementCoords.getWorldPosition()) > 4 * 4) {
-            path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementPosition.getCoordinates(), getZoneUnsafe()));
+		if ((movementState == AiAgent::FOLLOWING || movementState == AiAgent::PATHING_HOME || movementState == AiAgent::NOTIFY_ALLY || movementState == AiAgent::MOVING_TO_HEAL || movementState == AiAgent::WATCHING || movementState == AiAgent::CRACKDOWN_SCANNING || movementState == AiAgent::LAIR_HEALING)
+			&& endMovementCell == nullptr && currentParent == nullptr && currentFoundPath->get(currentFoundPath->size() - 1).getWorldPosition().squaredDistanceTo(endMovementCoords.getWorldPosition()) > 4 * 4) {
+			pathSource = "repath_findPath";
+			path = currentFoundPath = static_cast<CurrentFoundPath*>(pathFinder->findPath(currentPoint.getCoordinates(), endMovementPosition.getCoordinates(), getZoneUnsafe()));
         } else {
             currentFoundPath->set(0, WorldCoordinates(currentPosition, currentParent.castTo<CellObject*>()));
             path = currentFoundPath;
-        }
-    }
+		}
+	}
 
-    if (path == nullptr || path->size() < 2) {
-        currentFoundPath = nullptr;
+	if (cellNavDiagTrace) {
+		CellNavDiagLog::write("ENGINE_FIND_PATH_RESULT source=" + pathSource +
+			" nodes=" + String::valueOf(path == nullptr ? 0 : path->size()));
+		if (path != nullptr) {
+			for (int i = 0; i < path->size(); ++i)
+				CellNavDiagLog::write("ENGINE_PATH_NODE index=" +
+					String::valueOf(i) + " " +
+					CellNavDiagLog::fmtPos(path->get(i)));
+		}
+	}
+
+	if (path == nullptr || path->size() < 2) {
+		if (cellNavDiagTrace)
+			CellNavDiagLog::write("ENGINE_FIND_PATH_FAILED reason=short_or_null");
+		currentFoundPath = nullptr;
         return false;
     }
 
@@ -4786,41 +4839,81 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
         // is always in currentParent's space, so same-parent nodes need no
         // transform; every other combination routes through world space.
         Vector3 checkPos = currentPosition;
-        if (currentParentID != nextParentID) {
+		if (currentParentID != nextParentID) {
             CellObject* currentMovementCell =
                 currentParent != nullptr && currentParent->isCellObject() ?
                 currentParent.castTo<CellObject*>() : nullptr;
             WorldCoordinates currentCoords(currentPosition, currentMovementCell);
 
-            if (nextParentID > 0) {
-                checkPos = PathFinderManager::transformToModelSpace(
-                    currentCoords.getWorldPosition(),
-                    nextMovementCell->getParent().get());
-            } else {
-                checkPos = currentCoords.getWorldPosition();
-            }
-        }
+			if (nextParentID > 0) {
+				checkPos = PathFinderManager::transformToModelSpace(
+					currentCoords.getWorldPosition(),
+					nextMovementCell->getParent().get());
+			} else {
+				checkPos = currentCoords.getWorldPosition();
+			}
 
-        Vector3 movementDiff(checkPos - nextMovementPosition.getPoint());
+			// checkPos is the CURRENT position re-expressed in the next node's
+			// coordinate space (model-local when nextParentID>0, else world);
+			// log it unpaired so it is not mistaken for the node's own tuple.
+			if (cellNavDiagTrace)
+				CellNavDiagLog::write("ENGINE_CELL_CROSSING currentParent=" +
+					String::valueOf(currentParentID) + " nextParent=" +
+					String::valueOf(nextParentID) + " pre=" +
+					CellNavDiagLog::fmtPos(currentCoords) +
+					" checkPosInNextSpace=(" + String::valueOf(checkPos.getX()) +
+					"," + String::valueOf(checkPos.getY()) + "," +
+					String::valueOf(checkPos.getZ()) + ") node=" +
+					CellNavDiagLog::fmtPos(nextMovementPosition));
+		}
+
+		Vector3 movementDiff(checkPos - nextMovementPosition.getPoint());
         
         // 2D Distance using X and Y (Map Plane)
-        float distToNode = Math::sqrt(movementDiff.getX() * movementDiff.getX() + movementDiff.getY() * movementDiff.getY());
+		float distToNode = Math::sqrt(movementDiff.getX() * movementDiff.getX() + movementDiff.getY() * movementDiff.getY());
+
+		if (cellNavDiagTrace)
+			CellNavDiagLog::write("ENGINE_NODE_CANDIDATE index=" +
+				String::valueOf(pathIndex) + " checkPosInNodeSpace=(" +
+				String::valueOf(checkPos.getX()) + "," +
+				String::valueOf(checkPos.getY()) + "," +
+				String::valueOf(checkPos.getZ()) + ") node=" +
+				CellNavDiagLog::fmtPos(nextMovementPosition) + " distance=" +
+				String::valueOf(distToNode) + " remaining=" +
+				String::valueOf(remainingDist));
 
         // Skip duplicates
-        if (distToNode < 0.01f) {
-            path->remove(1); 
+		if (distToNode < 0.01f) {
+			// A near-zero step that is ALSO a cell/parent transition must still
+			// adopt the new cell before the node is dropped; otherwise the
+			// reparent is lost and the finalPos fallback below applies the old
+			// (world) position under the new cell parent -> teleport.
+			if (currentParentID != nextParentID) {
+				currentPosition = nextMovementPosition.getPoint();
+				currentParent = nextMovementCell;
+			}
+			if (cellNavDiagTrace)
+				CellNavDiagLog::write("ENGINE_NODE_CONSUME action=skip_duplicate");
+			path->remove(1);
             continue;
         }
 
         if (distToNode <= remainingDist) {
             remainingDist -= distToNode;
-            currentPosition = nextMovementPosition.getPoint();
-            currentParent = nextMovementCell; 
-            path->remove(1); 
+			currentPosition = nextMovementPosition.getPoint();
+			currentParent = nextMovementCell;
+			path->remove(1);
+			if (cellNavDiagTrace)
+				CellNavDiagLog::write("ENGINE_NODE_CONSUME action=consumed newParent=" +
+					String::valueOf(nextParentID) + " position=" +
+					CellNavDiagLog::fmtPos(nextMovementPosition));
             
             if (path->size() < 2) {
-                finalPosSet = true;
-                break;
+			finalPosSet = true;
+			if (cellNavDiagTrace)
+				CellNavDiagLog::write("ENGINE_NODE_CONSUME action=consumed_final position=" +
+					CellNavDiagLog::fmtPos(nextMovementPosition));
+			break;
             }
         } else {
             // INTERPOLATE
@@ -4843,10 +4936,13 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 
             nextMovementPosition.setX(interpPos.getX());
             nextMovementPosition.setY(interpPos.getY());
-            nextMovementPosition.setZ(interpPos.getZ());
-            
-            finalPosSet = true;
-            break;
+			nextMovementPosition.setZ(interpPos.getZ());
+
+			finalPosSet = true;
+			if (cellNavDiagTrace)
+				CellNavDiagLog::write("ENGINE_NODE_CONSUME action=interpolated position=" +
+					CellNavDiagLog::fmtPos(nextMovementPosition));
+			break;
         }
     }
 
@@ -4858,6 +4954,13 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
             nextMovementPosition.setX(currentPosition.getX());
             nextMovementPosition.setY(currentPosition.getY());
             nextMovementPosition.setZ(currentPosition.getZ());
+            // currentPosition is in currentParent's space; keep the node's cell
+            // consistent with it so we never apply a world coord under a cell
+            // parent (or a cell-local coord with no parent). currentParent is
+            // commonly null outdoors, so guard the deref.
+            nextMovementPosition.setCell(currentParent != nullptr &&
+                currentParent->isCellObject() ?
+                currentParent.castTo<CellObject*>() : nullptr);
         }
     }
 
@@ -4870,15 +4973,54 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
 
     // DIRECTION CALCULATION (FIXED DRIFT)
     // Use Y for North/South (dy in atan2)
+    // NOTE (cause-3, DEFERRED): at a world<->cell crossing nextMovementPosition can
+    // be a CELL-LOCAL node while getPosition() is the agent's parent-space position,
+    // so this subtraction yields a garbage heading for that single frame. A prior
+    // attempt to derive the heading in WORLD space fixed the crossing frame but made
+    // in-cell facing WORSE (a cell-parented creature's facing is parent-relative, so
+    // a world yaw renders rotated) and did not address the real in-cell wiggle (a
+    // separate pathing issue: findPath re-runs every frame toward a `next` waypoint
+    // ~= the current position). Reverted to the verified-good cell-local calc; the
+    // crossing-frame garbage + in-cell wiggle are logged as future items.
     float dx = nextMovementPosition.getX() - getPositionX();
     float dy = nextMovementPosition.getY() - getPositionY(); // Corrected: Y is North
-    
+
     float directionAngle = atan2(dy, dx);
     directionAngle = M_PI / 2 - directionAngle;
-    if (directionAngle < 0) directionAngle = M_PI + directionAngle;
+    float directionAnglePreWrap = directionAngle;
+    bool directionWrapped = false;
+    // FIX 2 (pivot-swivel): normalize a negative angle by +2*PI, matching the
+    // proven patrol-side calc at ~:3894 (M_PI + (M_PI + directionAngle)). The old
+    // `M_PI + directionAngle` added only +PI, applying a facing 180 degrees off for
+    // westward headings -> the ~90/180 spin at path pivots.
+    if (directionAngle < 0) { directionAngle = 2 * M_PI + directionAngle; directionWrapped = true; }
+
+    // FIX 1 (pivot-swivel): when the per-step move vector is ~0 (the agent is not
+    // advancing this frame -- e.g. sitting on a node), atan2 yields a meaningless
+    // heading (atan2(0,0)=0 -> due east) that would snap the facing away and back.
+    // Keep the current facing when there is effectively no movement to derive one.
+    float moveMagSq = dx * dx + dy * dy;
+    bool advancing = moveMagSq > 1e-4f; // ~0.01m per step
 
     float error = fabs(directionAngle - direction.getRadians());
-    if (error >= 0.05) setDirection(directionAngle);
+    bool directionApplied = advancing && error >= 0.05;
+
+    if (getSimPlayerBot() &&
+            SimPlayerManager::instance()->isCellNavDiagBot(getObjectID()))
+        CellNavDiagLog::write(String("ENGINE_DIRECTION dx=") +
+            String::valueOf(dx) + " dy=" + String::valueOf(dy) + " nodeCell=" +
+            String::valueOf(nextMovementPosition.getCell() == nullptr ? 0 :
+                nextMovementPosition.getCell()->getObjectID()) +
+            " rawAngle=" +
+            String::valueOf(directionAnglePreWrap) + " wrapped=" +
+            String::valueOf(directionWrapped) + " advancing=" +
+            String::valueOf(advancing) + " appliedAngle=" +
+            String::valueOf(directionAngle) + " prevDir=" +
+            String::valueOf(direction.getRadians()) + " deltaDeg=" +
+            String::valueOf(fabs(directionAngle - direction.getRadians()) *
+                180.f / M_PI) + " applied=" + String::valueOf(directionApplied));
+
+    if (directionApplied) setDirection(directionAngle);
 
     float distTraveled = currentPosition.distanceTo(nextMovementPosition.getPoint()); 
     if (distTraveled == 0) distTraveled = maxSpeed;
@@ -4886,8 +5028,18 @@ bool AiAgentImplementation::findNextPosition(float maxDistance, bool walk) {
     auto interval = BEHAVIORINTERVAL;
     nextBehaviorInterval = Math::max((int)50, Math::min((int)((distTraveled / newSpeed) * 1000 + 0.5), interval));
     
-    currentSpeed = newSpeed;
-    updateCurrentPosition(&nextStepPosition);
+	currentSpeed = newSpeed;
+	updateCurrentPosition(&nextStepPosition);
+
+	if (cellNavDiagTrace) {
+		ManagedReference<SceneObject*> appliedParent = getParent().get();
+		uint64 appliedCellOid = appliedParent != nullptr &&
+			appliedParent->isCellObject() ? appliedParent->getObjectID() : 0;
+		CellNavDiagLog::write("ENGINE_STEP_APPLIED " +
+			CellNavDiagLog::fmtPos(asAiAgent()) + " local=" +
+			getPosition().toString() + " parentCell=" +
+			String::valueOf(appliedCellOid));
+	}
 
     if (isPet()) updatePetSwimmingState();
 #ifdef DEBUG_FINDNEXTPOSITION

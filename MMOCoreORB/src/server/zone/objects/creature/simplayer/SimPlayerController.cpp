@@ -5,11 +5,14 @@
 
 #include "SimPlayerController.h"
 #include "SimPlayerManager.h"
+#include "CellNavDiagLog.h"
 #include "engine/core/Core.h"
 #include "engine/core/TaskManager.h"
 #include "server/zone/managers/collision/PathFinderManager.h"
 #include "server/zone/managers/collision/CollisionManager.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h"
+#include "server/zone/objects/building/BuildingObject.h"
+#include "server/zone/objects/cell/CellObject.h"
 #include "server/zone/Zone.h"
 #include "server/zone/managers/resource/ResourceManager.h"
 #include "server/zone/objects/resource/ResourceSpawn.h"
@@ -22,6 +25,16 @@
 using namespace server::zone::objects::creature::ai::bt;
 
 //#define DEBUG_SIMPVP
+
+static bool isCellNavDiagAgent(AiAgent* agent) {
+    return agent != nullptr &&
+        SimPlayerManager::instance()->isCellNavDiagBot(agent->getObjectID());
+}
+
+static void logCellNavDiag(AiAgent* agent, const String& line) {
+    if (isCellNavDiagAgent(agent))
+        CellNavDiagLog::write(line);
+}
 
 // --------------------------------------------------------
 // TASKS
@@ -181,6 +194,12 @@ SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     destination = Vector3(0, 0, 0);
     destinationLocal = Vector3(0, 0, 0);
     destinationCell = nullptr;
+    cellEgressActive = false;
+    cellEgressResumeWorld = Vector3(0, 0, 0);
+    cellEgressResumeLocal = Vector3(0, 0, 0);
+    cellEgressResumeCell = nullptr;
+    cellEgressAttempts = 0;
+    cellEgressSuppressed = false;
     finalDestination = Vector3(0, 0, 0);
     hasFinalDestination = false;
     onMeshMode = false;
@@ -189,9 +208,12 @@ SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     hybridLeg = HYBRID_LEG_NONE;
     hybridEgressPoint = Vector3(0, 0, 0);
     interiorApproachLeg = false;
+    diagnosticLastParentCellOid = 0;
+    diagnosticParentCellInitialized = false;
 }
 
 SimPlayerController::~SimPlayerController() {
+    clearCellEgressState();
     agent = nullptr;
 }
 
@@ -209,10 +231,35 @@ void SimPlayerController::moveTo(Vector3 worldPos, Vector3 localPos,
         CellObject* targetCell) {
     if (agent == nullptr) return;
 
+    if (cellEgressActive) {
+        clearCellEgressState();
+        advanceWorkLoopGeneration("moveToCancelsCellEgress");
+    }
+
+    bool diagnostic = isCellNavDiagAgent(agent.get());
+    if (diagnostic) {
+        CellNavDiagLog::write(
+            "MOVE_REQUEST_ENTRY " + CellNavDiagLog::fmtPos(agent.get()) +
+            " requested=" + CellNavDiagLog::fmtPos(worldPos, localPos,
+                targetCell) +
+            " distance=" + String::valueOf(
+                agent->getWorldPosition().distanceTo(worldPos)) +
+            " interiorApproachLeg=" +
+                String::valueOf(interiorApproachLeg) +
+            " hybridActive=" + String::valueOf(isHybridMovementActive()) +
+            " hybridOnMesh=" + String::valueOf(onMeshMode));
+    }
+
     Zone* zone = agent->getZone();
-    if (zone == nullptr) return;
+    if (zone == nullptr) {
+        if (diagnostic)
+            CellNavDiagLog::write("MOVE_REQUEST_REJECT reason=no_zone");
+        return;
+    }
 
     if (!zone->isWithinBoundaries(worldPos)) {
+        if (diagnostic)
+            CellNavDiagLog::write("MOVE_REQUEST_REJECT reason=outside_boundaries");
         onPathFailed();
         return;
     }
@@ -236,13 +283,20 @@ void SimPlayerController::moveTo(Vector3 worldPos, Vector3 localPos,
 
     if (agent->isInCombat()) {
         state = IDLE;
+        if (diagnostic)
+            CellNavDiagLog::write("MOVE_REQUEST_HELD reason=in_combat");
 #ifdef DEBUG_SIMPVP
     Logger::console.info("SimPlayer moveTo: isInCombat", true);
 #endif
         return;
     }
 
+    if (beginCellEgressIfNeeded(worldPos, localPos, targetCell))
+        return;
+
     if (isHybridMovementActive()) {
+        if (diagnostic)
+            CellNavDiagLog::write("MOVE_REQUEST_PATH mode=hybrid");
         requestHybridPath();
         return;
     }
@@ -260,15 +314,117 @@ void SimPlayerController::moveTo(Vector3 worldPos, Vector3 localPos,
     WorldCoordinates startCoord(agent);
     WorldCoordinates endCoord(localPos, targetCell);
 
+    if (diagnostic)
+        CellNavDiagLog::write("MOVE_REQUEST_PATH mode=cell_aware start=" +
+            CellNavDiagLog::fmtPos(startCoord) + " end=" +
+            CellNavDiagLog::fmtPos(endCoord));
+
     Reference<SimPathFindTask*> task =
         new SimPathFindTask(this, startCoord, endCoord, zone, movementGeneration);
     
     task->schedule(100); 
 }
 
+bool SimPlayerController::beginCellEgressIfNeeded(Vector3 worldPos,
+        Vector3 localPos, CellObject* targetCell) {
+    if (agent == nullptr || cellEgressActive || cellEgressSuppressed ||
+            agent->isInCombat())
+        return false;
+
+    Zone* zone = agent->getZone();
+    if (zone == nullptr)
+        return false;
+
+    ManagedReference<SceneObject*> parent = agent->getParent().get();
+    if (parent == nullptr || !parent->isCellObject()) {
+        // Outdoors: this is not a cell exit, and the situation has changed since
+        // any prior stuck exit, so refresh the per-stuck-exit attempt budget.
+        cellEgressAttempts = 0;
+        return false;
+    }
+
+    // In a cell but the exit attempts are exhausted: fall through to the normal
+    // (pre-fix) path rather than looping egress forever.
+    if (cellEgressAttempts >= 2)
+        return false;
+
+    ManagedReference<CellObject*> cell = cast<CellObject*>(parent.get());
+    if (cell == nullptr)
+        return false;
+
+    if (targetCell != nullptr) {
+        if (targetCell->getObjectID() == cell->getObjectID())
+            return false;
+        return false;
+    }
+
+    ManagedReference<BuildingObject*> building =
+        cell->getParent().get().castTo<BuildingObject*>();
+    if (building == nullptr)
+        return false;
+
+    // Leave via the exterior portal NEAREST the bot (so a front-hall bot exits the
+    // front door), not the single template ejection point which can be on a far /
+    // dead-end side (e.g. a starport's landing pad). Fall back to getEjectionPoint()
+    // for buildings with no readable portal layout (cantina-style still works).
+    Vector3 agentWorld = agent->getWorldPosition();
+    Vector3 ejection;
+    {
+        Locker buildingLocker(building);
+        ejection = building->getNearestExteriorPortalPoint(agentWorld);
+        if (ejection.getX() == 0.f && ejection.getY() == 0.f)
+            ejection = building->getEjectionPoint();
+    }
+
+    if ((ejection.getX() == 0.f && ejection.getY() == 0.f) ||
+            !zone->isWithinBoundaries(ejection))
+        return false;
+
+    cellEgressResumeWorld = worldPos;
+    cellEgressResumeLocal = localPos;
+    cellEgressResumeCell = targetCell;
+    cellEgressActive = true;
+    cellEgressAttempts++;
+
+    destination = ejection;
+    destinationLocal = ejection;
+    destinationCell = nullptr;
+    stuckWatchdogCount = 0;
+    lastWatchdogPos = agent->getWorldPosition();
+    state = CALCULATING_PATH;
+    uint64 movementGeneration = advanceWorkLoopGeneration("cellEgress");
+
+    if (isCellNavDiagAgent(agent.get()))
+        CellNavDiagLog::write("CELL_EGRESS_BEGIN cell=" +
+            String::valueOf(cell->getObjectID()) + " ejection=" +
+            ejection.toString());
+
+    WorldCoordinates startCoord(agent);
+    WorldCoordinates endCoord(ejection, nullptr);
+    Reference<SimPathFindTask*> task = new SimPathFindTask(this, startCoord,
+        endCoord, zone, movementGeneration);
+    task->schedule(100);
+    return true;
+}
+
 void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path,
         bool pathUsesNavmesh, bool pathIsOverland) {
     if (agent == nullptr) { if (path) delete path; return; }
+
+    bool diagnostic = isCellNavDiagAgent(agent.get());
+    if (diagnostic) {
+        CellNavDiagLog::write("PATH_FOUND_ENTRY usesNavmesh=" +
+            String::valueOf(pathUsesNavmesh) + " overland=" +
+            String::valueOf(pathIsOverland) + " nodes=" +
+            String::valueOf(path == nullptr ? 0 : path->size()));
+
+        if (path != nullptr) {
+            for (int i = 0; i < path->size(); ++i) {
+                CellNavDiagLog::write("PATH_NODE index=" + String::valueOf(i) +
+                    " " + CellNavDiagLog::fmtPos(path->get(i)));
+            }
+        }
+    }
 
     if (isHybridMovementActive() && !shouldResumeHybridTravel()) {
         // The order completed/abandoned or entered lair cleanup while this path
@@ -277,6 +433,8 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path,
         // so this is the deterministic last line against a stale in-flight task.)
         if (path) delete path;
         state = IDLE;
+        if (diagnostic)
+            CellNavDiagLog::write("PATH_REJECT reason=hybrid_resume_cancelled");
         return;
     }
 
@@ -285,6 +443,8 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path,
             hybridLeg == HYBRID_LEG_NAVMESH_EXIT;
         if (expectsNavmesh != pathUsesNavmesh) {
             delete path;
+            if (diagnostic)
+                CellNavDiagLog::write("PATH_REJECT reason=hybrid_mode_mismatch");
             onPathTaskFailed(expectsNavmesh);
             return;
         }
@@ -298,6 +458,8 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path,
         delete path;
         onMeshMode = true;
         navmeshModeDebounceCounter = 0;
+        if (diagnostic)
+            CellNavDiagLog::write("PATH_REJECT reason=overland_result_on_mesh");
         requestHybridPath();
         return;
     }
@@ -308,6 +470,8 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path,
 #endif
         if (path) delete path;
         state = IDLE;
+        if (diagnostic)
+            CellNavDiagLog::write("PATH_REJECT reason=in_combat");
         return;
     }
 
@@ -318,8 +482,12 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path,
 #endif
         if (isHybridMovementActive() && pathUsesNavmesh)
             onPathTaskFailed(true);
+        else if (cellEgressActive)
+            failCellEgress();
         else
             onPathFailed();
+        if (diagnostic)
+            CellNavDiagLog::write("PATH_REJECT reason=short_path");
         return;
     }
 
@@ -328,7 +496,12 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path,
     // recomputes against the correct target.
     if (!acceptFoundPath(path->get(path->size() - 1).getWorldPosition())) {
         delete path;
-        onPathFailed();
+        if (diagnostic)
+            CellNavDiagLog::write("PATH_REJECT reason=stale_path_end");
+        if (cellEgressActive)
+            failCellEgress();
+        else
+            onPathFailed();
         return;
     }
 
@@ -353,6 +526,9 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path,
 #ifdef DEBUG_SIMPVP
     Logger::console.info("SimPlayer onPathFound: Path Found (" + String::valueOf(path->size()) + " nodes). Moving...", true);
 #endif
+    if (diagnostic)
+        CellNavDiagLog::write("PATH_ACCEPTED destination=" +
+            CellNavDiagLog::fmtPos(finalPoint));
     agent->setHomeLocation(finalPoint.getX(), finalPoint.getZ(),
         finalPoint.getY(), finalPoint.getCell());
 
@@ -392,6 +568,16 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path,
 }
 
 void SimPlayerController::onPathTaskFailed(bool pathUsesNavmesh) {
+    if (isCellNavDiagAgent(agent.get()))
+        CellNavDiagLog::write("PATH_TASK_FAILED usesNavmesh=" +
+            String::valueOf(pathUsesNavmesh) + " hybrid=" +
+            String::valueOf(isHybridMovementActive()));
+
+    if (cellEgressActive) {
+        failCellEgress();
+        return;
+    }
+
     if (!isHybridMovementActive() || !pathUsesNavmesh) {
         onPathFailed();
         return;
@@ -544,7 +730,25 @@ void SimPlayerController::scheduleHybridDirectPath(const Vector3& target,
 
 void SimPlayerController::requestHybridPath() {
     if (agent == nullptr || agent->getZone() == nullptr ||
-            !hasFinalDestination || !isHybridMovementActive()) {
+            !hasFinalDestination) {
+        onPathFailed();
+        return;
+    }
+
+    Vector3 requestWorld = finalDestination;
+    Vector3 requestLocal = finalDestination;
+    ManagedReference<CellObject*> requestCell;
+    if (destinationCell != nullptr) {
+        requestWorld = destination;
+        requestLocal = destinationLocal;
+        requestCell = destinationCell;
+    }
+
+    if (beginCellEgressIfNeeded(requestWorld, requestLocal,
+            requestCell.get()))
+        return;
+
+    if (!isHybridMovementActive()) {
         onPathFailed();
         return;
     }
@@ -610,6 +814,10 @@ void SimPlayerController::requestHybridPath() {
 }
 
 void SimPlayerController::onPathFailed() {
+    if (isCellNavDiagAgent(agent.get()))
+        CellNavDiagLog::write("PATH_FAILED reason=base_retry interiorApproachLeg=" +
+            String::valueOf(interiorApproachLeg));
+
 #ifdef DEBUG_SIMPVP
     Logger::console.info("SimPlayer onPathFailed: Pathfinding failed/unreachable. Retrying in 5s...", true);
 #endif
@@ -619,6 +827,30 @@ void SimPlayerController::onPathFailed() {
     Reference<SimRetryTask*> task =
         new SimRetryTask(this, getWorkLoopGeneration());
     task->schedule(5000); // 5 seconds
+}
+
+void SimPlayerController::clearCellEgressState() {
+    // Deliberately does NOT reset cellEgressAttempts: the attempt cap must
+    // accumulate across repeated in-cell egress failures so it cannot loop
+    // forever. The counter is reset only when a move is issued from OUTDOORS
+    // (see beginCellEgressIfNeeded) — i.e. once the situation has actually changed.
+    cellEgressActive = false;
+    cellEgressResumeWorld = Vector3(0, 0, 0);
+    cellEgressResumeLocal = Vector3(0, 0, 0);
+    cellEgressResumeCell = nullptr;
+    cellEgressSuppressed = false;
+}
+
+void SimPlayerController::failCellEgress() {
+    clearCellEgressState();
+    destination = Vector3(0, 0, 0);
+    destinationLocal = Vector3(0, 0, 0);
+    destinationCell = nullptr;
+    simPath.removeAll();
+    simPathIndex = 0;
+    interiorApproachLeg = false;
+    state = IDLE;
+    onPathFailed();
 }
 
 void SimPlayerController::resetHybridMovementState(bool clearFinalDestination) {
@@ -635,6 +867,7 @@ void SimPlayerController::resetHybridMovementState(bool clearFinalDestination) {
 }
 
 void SimPlayerController::clearHybridMovementOnCancellation() {
+    clearCellEgressState();
     bool hadHybridMovement = isHybridMovementActive() || interiorApproachLeg;
     interiorApproachLeg = false;
     if (!hadHybridMovement)
@@ -676,6 +909,29 @@ void SimPlayerController::onStaleWorkLoopTaskIgnored(
 #endif
 }
 
+String SimPlayerController::getDiagnosticStateName() const {
+    switch (state) {
+    case IDLE:
+        return "IDLE";
+    case DECIDING:
+        return "DECIDING";
+    case SURVEYING:
+        return "SURVEYING";
+    case CALCULATING_PATH:
+        return "CALCULATING_PATH";
+    case PERFORMING_ACTION:
+        return "PERFORMING_ACTION";
+    case MOVING:
+        return "MOVING";
+    case SAMPLING:
+        return "SAMPLING";
+    case WAITING:
+        return "WAITING";
+    default:
+        return "UNKNOWN";
+    }
+}
+
 void SimPlayerController::queueMorePathNodes() {
     if (agent == nullptr) return;
     if (simPathIndex < 0) simPathIndex = 0;
@@ -705,6 +961,11 @@ void SimPlayerController::queueMorePathNodes() {
             localPoint.getY(), node.getCell());
         agent->addPatrolPoint(pp);
 
+        if (isCellNavDiagAgent(agent.get()))
+            CellNavDiagLog::write("QUEUE_NODE index=" +
+                String::valueOf(simPathIndex) + " " +
+                CellNavDiagLog::fmtPos(pp.getCoordinates()));
+
         simPathIndex++;
         slots--;
     }
@@ -717,11 +978,55 @@ void SimPlayerController::checkArrival() {
     
     Locker locker(agent);
 
+    bool diagnostic = isCellNavDiagAgent(agent.get());
+    ManagedReference<SceneObject*> currentParent = agent->getParent().get();
+    uint64 currentParentCellOid = currentParent != nullptr &&
+        currentParent->isCellObject() ? currentParent->getObjectID() : 0;
+
+    if (diagnostic) {
+        bool parentChanged = diagnosticParentCellInitialized &&
+            diagnosticLastParentCellOid != currentParentCellOid;
+
+        if (parentChanged)
+            CellNavDiagLog::write("PARENT_CELL_CHANGED old=" +
+                String::valueOf(diagnosticLastParentCellOid) + " new=" +
+                String::valueOf(currentParentCellOid) + " " +
+                CellNavDiagLog::fmtPos(agent.get()));
+
+        diagnosticLastParentCellOid = currentParentCellOid;
+        diagnosticParentCellInitialized = true;
+
+        if (SimPlayerManager::instance()->getCellNavDiagLogEveryTick()) {
+            String nextPatrol = "none";
+            if (agent->getPatrolPointSize() > 0)
+                nextPatrol = CellNavDiagLog::fmtPos(
+                    agent->getNextPosition().getCoordinates());
+
+            Vector3 diagnosticCurrentWorld = agent->getWorldPosition();
+            float diagnosticDx = diagnosticCurrentWorld.getX() -
+                destination.getX();
+            float diagnosticDy = diagnosticCurrentWorld.getY() -
+                destination.getY();
+
+            CellNavDiagLog::write("ARRIVAL_TICK state=" +
+                getDiagnosticStateName() + " current=" +
+                CellNavDiagLog::fmtPos(agent.get()) + " destination=" +
+                    CellNavDiagLog::fmtPos(destination, destinationLocal,
+                    destinationCell.get()) + " distance2d=" +
+                String::valueOf(Math::sqrt(diagnosticDx * diagnosticDx +
+                    diagnosticDy * diagnosticDy)) + " patrolPoints=" +
+                String::valueOf(agent->getPatrolPointSize()) +
+                " next=" + nextPatrol);
+        }
+    }
+
     if (agent->isDead()) {
         // SimPvPController::onTick schedules recycle for dead bots. Do not
         // destroy the object while holding its own lock; that can deadlock
         // against world/database cleanup paths.
         state = WAITING;
+        if (diagnostic)
+            CellNavDiagLog::write("ARRIVAL_BRANCH=dead");
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer checkArrival: isDead", true);
 #endif
@@ -730,6 +1035,8 @@ void SimPlayerController::checkArrival() {
 
     if (agent->isIncapacitated()) {
         state = WAITING;
+        if (diagnostic)
+            CellNavDiagLog::write("ARRIVAL_BRANCH=incapacitated");
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer checkArrival: isIncapacitated", true);
 #endif
@@ -742,6 +1049,8 @@ void SimPlayerController::checkArrival() {
 
     if (agent->isInCombat()) {
         state = IDLE; 
+        if (diagnostic)
+            CellNavDiagLog::write("ARRIVAL_BRANCH=in_combat");
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer checkArrival: isInCombat", true);
 #endif
@@ -765,6 +1074,9 @@ void SimPlayerController::checkArrival() {
             if (navmeshModeDebounceCounter >= debounceTicks) {
                 onMeshMode = observedOnMesh;
                 navmeshModeDebounceCounter = 0;
+                if (diagnostic)
+                    CellNavDiagLog::write("ARRIVAL_BRANCH=hybrid_mode_changed onMesh=" +
+                        String::valueOf(onMeshMode));
                 locker.release();
                 requestHybridPath();
                 return;
@@ -776,6 +1088,8 @@ void SimPlayerController::checkArrival() {
 
     if (isHybridMovementActive() && state == IDLE &&
             shouldResumeHybridTravel()) {
+        if (diagnostic)
+            CellNavDiagLog::write("ARRIVAL_BRANCH=hybrid_resume");
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer checkArrival: Resuming hybrid path to " +
             finalDestination.toString(), true);
@@ -785,7 +1099,22 @@ void SimPlayerController::checkArrival() {
         return;
     }
 
+    // An egress leg that went IDLE was interrupted (e.g. a combat hold). The
+    // generic resume below would re-drive moveTo() to the ejection waypoint and
+    // discard the stashed real destination, so fail the egress here and let the
+    // controller's recovery re-issue the real move (re-attempting egress, bounded
+    // by the attempt cap).
+    if (cellEgressActive && state == IDLE) {
+        if (diagnostic)
+            CellNavDiagLog::write("ARRIVAL_BRANCH=cell_egress_interrupted");
+        locker.release();
+        failCellEgress();
+        return;
+    }
+
     if (!isHybridMovementActive() && state == IDLE && destination.getX() != 0) {
+        if (diagnostic)
+            CellNavDiagLog::write("ARRIVAL_BRANCH=resume_destination");
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer checkArrival: Resuming path to " + destination.toString(), true);
 #endif
@@ -802,6 +1131,10 @@ void SimPlayerController::checkArrival() {
 
     if (state != MOVING) {
         locker.release();
+
+        if (diagnostic)
+            CellNavDiagLog::write("ARRIVAL_BRANCH=state_not_moving state=" +
+                getDiagnosticStateName());
 
         if (!shouldContinueArrivalChecks())
             return;
@@ -827,7 +1160,9 @@ void SimPlayerController::checkArrival() {
     bool arrived = false;
 
     if (distSq < 16.0f) arrived = true;
-    if (agent->getPatrolPointSize() == 0 && simPathIndex >= simPath.size()) arrived = true;
+    bool queueExhausted = agent->getPatrolPointSize() == 0 &&
+        simPathIndex >= simPath.size();
+    if (queueExhausted) arrived = true;
 
     if (isHybridMovementActive() &&
             (hybridLeg == HYBRID_LEG_NAVMESH_FINAL ||
@@ -838,12 +1173,57 @@ void SimPlayerController::checkArrival() {
             arrived = false;
     }
 
+    // Cell-egress "arrival" means the agent is actually OUTDOORS, not merely
+    // within 4m of the ejection point. The egress path ends with outdoor (cell 0)
+    // nodes; without this, the coarse 4m proximity check can fire while the agent
+    // is still a few metres inside the last cell (short of the final portal),
+    // stranding it. Keep consuming nodes to cross the portal unless the path is
+    // genuinely exhausted (truly stuck -> handled as arrived-inside below).
+    if (arrived && cellEgressActive && !queueExhausted &&
+            currentParent != nullptr && currentParent->isCellObject())
+        arrived = false;
+
     if (arrived) {
+        if (diagnostic)
+            CellNavDiagLog::write("ARRIVAL_BRANCH=arrived final=" +
+                CellNavDiagLog::fmtPos(agent.get()) + " destination=" +
+                CellNavDiagLog::fmtPos(destination, destinationLocal,
+                    destinationCell.get()));
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer checkArrival: Arrived at destination.", true);
 #endif
         agent->clearPatrolPoints();
         state = WAITING;
+
+        if (cellEgressActive) {
+            bool outdoors = currentParent == nullptr ||
+                !currentParent->isCellObject();
+            if (outdoors) {
+                Vector3 resumeWorld = cellEgressResumeWorld;
+                Vector3 resumeLocal = cellEgressResumeLocal;
+                ManagedReference<CellObject*> resumeCell = cellEgressResumeCell;
+                clearCellEgressState();
+                clearInteriorApproachLeg();
+                if (diagnostic)
+                    CellNavDiagLog::write("CELL_EGRESS_RESUME from=" +
+                        CellNavDiagLog::fmtPos(agent.get()) + " to=" +
+                        CellNavDiagLog::fmtPos(resumeWorld, resumeLocal,
+                            resumeCell.get()));
+                locker.release();
+                moveTo(resumeWorld, resumeLocal, resumeCell.get());
+                return;
+            }
+
+            // The egress path was consumed but the agent is STILL inside a cell:
+            // the leg did not actually reach the exterior. Fail the egress rather
+            // than falling through to onArrived() (which would report the real
+            // destination as reached while wedged inside).
+            if (diagnostic)
+                CellNavDiagLog::write("CELL_EGRESS_ARRIVED_INSIDE");
+            locker.release();
+            failCellEgress();
+            return;
+        }
 
         if (isHybridMovementActive()) {
             if (hybridLeg == HYBRID_LEG_OVERLAND_FINAL &&
@@ -903,6 +1283,9 @@ void SimPlayerController::checkArrival() {
         return;
     } 
 
+    if (diagnostic)
+        CellNavDiagLog::write("ARRIVAL_BRANCH=move_step");
+
     agent->findNextPosition(2.0f, false);
     
     float moveDx = currentPos.getX() - lastWatchdogPos.getX();
@@ -927,8 +1310,22 @@ void SimPlayerController::checkArrival() {
             ManagedReference<CellObject*> resumeCell = destinationCell;
             locker.release();
 
+            // A stalled cell-egress leg must fail cleanly rather than re-path via
+            // moveTo(), which would cancel the egress and lose the stashed real
+            // destination. failCellEgress() clears egress state and hands off to
+            // onPathFailed recovery; the bounded attempt cap prevents looping.
+            if (cellEgressActive) {
+                if (diagnostic)
+                    CellNavDiagLog::write("ARRIVAL_BRANCH=cell_egress_stuck");
+                failCellEgress();
+                return;
+            }
+
             if (rePathAttempts < kMaxRePathAttempts && shouldRepathWhenStuck()) {
                 rePathAttempts++;
+                if (diagnostic)
+                    CellNavDiagLog::write("ARRIVAL_BRANCH=stuck_repath attempt=" +
+                        String::valueOf(rePathAttempts));
 #ifdef DEBUG_SIMPVP
                 Logger::console.info("SimPlayer checkArrival: stuck; re-path attempt " + String::valueOf(rePathAttempts), true);
 #endif
@@ -940,6 +1337,8 @@ void SimPlayerController::checkArrival() {
                     moveTo(resumeDestination, resumeLocalDestination,
                         resumeCell.get());
             } else {
+                if (diagnostic)
+                    CellNavDiagLog::write("ARRIVAL_BRANCH=stuck_watchdog_exhausted");
 #ifdef DEBUG_SIMPVP
                 Logger::console.info("SimPlayer checkArrival: stuck; re-path budget exhausted, failing path.", true);
 #endif
@@ -950,6 +1349,9 @@ void SimPlayerController::checkArrival() {
         }
 
         if (stuckWatchdogCount > kStuckSoftNudgeTicks) {
+        if (diagnostic)
+            CellNavDiagLog::write("ARRIVAL_BRANCH=stuck_soft_nudge count=" +
+                String::valueOf(stuckWatchdogCount));
 #ifdef DEBUG_SIMPVP
         Logger::console.info("SimPlayer checkArrival: stuckWatchdogCount > 5.", true);
 #endif
@@ -998,6 +1400,146 @@ bool SimPlayerController::pickDestinationInNavMesh(Zone* zone, const Vector3& cu
 }
 
 // ========================================================
+// CELL-NAVIGATION DIAGNOSTIC CONTROLLER
+// ========================================================
+
+SimCellNavDiagController::SimCellNavDiagController(AiAgent* aiAgent)
+        : SimPlayerController(aiAgent) {
+    diagnosticWorldPos = Vector3(0, 0, 0);
+    diagnosticLocalPos = Vector3(0, 0, 0);
+    diagnosticCell = nullptr;
+    diagnosticRouteReady = false;
+    diagnosticRouteIssued = false;
+    diagnosticExitWorldPos = Vector3(0, 0, 0);
+    diagnosticExitReady = false;
+    diagnosticExitIssued = false;
+    diagnosticReturnWorldPos = Vector3(0, 0, 0);
+    diagnosticReturnReady = false;
+    diagnosticReturnIssued = false;
+    diagnosticFinalIssued = false;
+    setLoggingName("SimCellNavDiagController");
+}
+
+SimCellNavDiagController::~SimCellNavDiagController() {
+}
+
+void SimCellNavDiagController::setDiagnosticRoute(const Vector3& worldPos,
+        const Vector3& localPos, CellObject* cell) {
+    diagnosticWorldPos = worldPos;
+    diagnosticLocalPos = localPos;
+    diagnosticCell = cell;
+    diagnosticRouteReady = cell != nullptr;
+}
+
+void SimCellNavDiagController::startSimLoop() {
+    if (diagnosticRouteIssued || !diagnosticRouteReady || agent == nullptr) {
+        state = WAITING;
+        return;
+    }
+
+    diagnosticRouteIssued = true;
+    state = WAITING;
+
+    logCellNavDiag(agent.get(), "DIAG_ROUTE_REQUEST " +
+        CellNavDiagLog::fmtPos(diagnosticWorldPos, diagnosticLocalPos,
+            diagnosticCell.get()));
+    moveToInterior(diagnosticWorldPos, diagnosticLocalPos,
+        diagnosticCell.get());
+}
+
+void SimCellNavDiagController::setDiagnosticExit(const Vector3& exitWorldPos) {
+    diagnosticExitWorldPos = exitWorldPos;
+    diagnosticExitReady = true;
+}
+
+void SimCellNavDiagController::setDiagnosticReturn(const Vector3& returnWorldPos) {
+    diagnosticReturnWorldPos = returnWorldPos;
+    diagnosticReturnReady = true;
+}
+
+void SimCellNavDiagController::onArrived() {
+    state = WAITING;
+    logCellNavDiag(agent.get(), "ARRIVED final=" +
+        CellNavDiagLog::fmtPos(agent.get()));
+
+    // Round-trip: the first arrival is INSIDE the cell. Issue the exit leg back
+    // to an outdoor point (cell=nullptr) so findPath(cell-origin -> outdoor) and
+    // the whole exit is traced. The subsequent moveTo -> onPathFound restarts the
+    // arrival loop even though shouldContinueArrivalChecks() is false.
+    if (diagnosticExitReady && !diagnosticExitIssued) {
+        diagnosticExitIssued = true;
+        // RESEARCH: reach the (enclosed hollow) collector by a DIRECTED route
+        // through the portal graph — suppress the generic egress that would
+        // otherwise send the bot out the nearest front door and around the
+        // perimeter (which can't reach the walled hollow).
+        cellEgressSuppressed = true;
+        logCellNavDiag(agent.get(), "DIAG_EXIT_REQUEST directRoute=1 from=" +
+            CellNavDiagLog::fmtPos(agent.get()) + " to=" +
+            CellNavDiagLog::fmtPos(diagnosticExitWorldPos,
+                diagnosticExitWorldPos, nullptr));
+        moveTo(diagnosticExitWorldPos, diagnosticExitWorldPos, nullptr);
+        return;
+    }
+
+    if (diagnosticExitIssued && !diagnosticReturnIssued) {
+        float dxc = agent->getWorldPosition().getX() -
+            diagnosticExitWorldPos.getX();
+        float dyc = agent->getWorldPosition().getY() -
+            diagnosticExitWorldPos.getY();
+        logCellNavDiag(agent.get(), "DIAG_ROUNDTRIP_COMPLETE final=" +
+            CellNavDiagLog::fmtPos(agent.get()) + " collectorTarget=(" +
+            String::valueOf(diagnosticExitWorldPos.getX()) + "," +
+            String::valueOf(diagnosticExitWorldPos.getY()) + ") distToCollector=" +
+            String::valueOf(Math::sqrt(dxc * dxc + dyc * dyc)));
+
+        // Leg 3a (arrival/landing): findPath(hollow cell0 -> outside cell0) will
+        // NOT route through the portal graph (both cell 0 -> direct into the wall).
+        // Re-ENTER a cell first (target IS a cell -> findPath routes through the
+        // hollow portal into the building); leg 3b then egresses out to the world.
+        if (diagnosticReturnReady) {
+            diagnosticReturnIssued = true;
+            cellEgressSuppressed = false;
+            logCellNavDiag(agent.get(), "DIAG_REENTER_REQUEST from=" +
+                CellNavDiagLog::fmtPos(agent.get()) + " toCell=" +
+                CellNavDiagLog::fmtPos(diagnosticWorldPos, diagnosticLocalPos,
+                    diagnosticCell.get()));
+            moveToInterior(diagnosticWorldPos, diagnosticLocalPos,
+                diagnosticCell.get());
+        }
+        return;
+    }
+
+    if (diagnosticReturnIssued && !diagnosticFinalIssued) {
+        // Leg 3b: back inside a cell -> egress (enabled) out to the world.
+        diagnosticFinalIssued = true;
+        logCellNavDiag(agent.get(), "DIAG_REENTER_COMPLETE " +
+            CellNavDiagLog::fmtPos(agent.get()) + " -> LANDING_EXIT_REQUEST to=" +
+            CellNavDiagLog::fmtPos(diagnosticReturnWorldPos,
+                diagnosticReturnWorldPos, nullptr));
+        moveTo(diagnosticReturnWorldPos, diagnosticReturnWorldPos, nullptr);
+        return;
+    }
+
+    if (diagnosticFinalIssued) {
+        float dxr = agent->getWorldPosition().getX() -
+            diagnosticReturnWorldPos.getX();
+        float dyr = agent->getWorldPosition().getY() -
+            diagnosticReturnWorldPos.getY();
+        logCellNavDiag(agent.get(), "DIAG_LANDING_EXIT_COMPLETE final=" +
+            CellNavDiagLog::fmtPos(agent.get()) + " outsideTarget=(" +
+            String::valueOf(diagnosticReturnWorldPos.getX()) + "," +
+            String::valueOf(diagnosticReturnWorldPos.getY()) + ") distToOutside=" +
+            String::valueOf(Math::sqrt(dxr * dxr + dyr * dyr)));
+    }
+}
+
+void SimCellNavDiagController::onPathFailed() {
+    state = WAITING;
+    logCellNavDiag(agent.get(), "PATH_FAILED diagnostic_abort current=" +
+        CellNavDiagLog::fmtPos(agent.get()));
+}
+
+// ========================================================
 // SIM MINER CONTROLLER
 // ========================================================
 
@@ -1025,6 +1567,15 @@ SimMinerController::SimMinerController(AiAgent* aiAgent, const SimMinerConfig& m
     travelDestinationStarport = "";
     travelStartedAtMs = 0;
     travelBoardRadius = 20.f;
+    ticketTravelPhase = TICKET_TRAVEL_NONE;
+    ticketCollectorWorld = Vector3(0, 0, 0);
+    ticketCollectorLocal = Vector3(0, 0, 0);
+    ticketCollectorCell = nullptr;
+    ticketCollectorOid = 0;
+    ticketCollectorFound = false;
+    ticketArrivalCollectorFound = false;
+    ticketArrivalOutdoor = Vector3(0, 0, 0);
+    ticketApproachAttempts = 0;
     intelligentFinalApproachAttempts = 0;
     intelligentLastApproachDistance = 0.f;
     setLoggingName("SimMinerController");
@@ -1301,10 +1852,294 @@ void SimMinerController::goToResource(const String& resourceName) {
     moveTo(targetPos);
 }
 
+bool SimMinerController::isAtTicketCollector() const {
+    ManagedReference<AiAgent*> strongAgent = agent;
+    if (strongAgent == nullptr || !ticketCollectorFound)
+        return false;
+
+    Locker agentLocker(strongAgent);
+    if (strongAgent->getWorldPosition().distanceTo(ticketCollectorWorld) >
+            travelBoardRadius)
+        return false;
+
+    ManagedReference<SceneObject*> parent = strongAgent->getParent().get();
+    if (ticketCollectorCell != nullptr)
+        return parent != nullptr && parent->isCellObject() &&
+            parent->getObjectID() == ticketCollectorCell->getObjectID();
+
+    // The proven starport collector is cell 0/rootParent 0. A cell-less bot
+    // at the collector is therefore in the hollow/outdoor containment; a bot
+    // still parented to an interior cell is not boardable.
+    return parent == nullptr || !parent->isCellObject();
+}
+
+bool SimMinerController::canRetryTicketApproach() const {
+    SimPlayerManager* manager = SimPlayerManager::instance();
+    if (manager == nullptr)
+        return false;
+
+    if (ticketApproachAttempts >= manager->getTicketCollectorApproachAttempts())
+        return false;
+
+    return travelStartedAtMs == 0 ||
+        System::getMiliTime() <= travelStartedAtMs +
+            (uint64)manager->getTicketCollectorApproachTtlSeconds() * 1000;
+}
+
+void SimMinerController::retryTicketApproach(const String& reason) {
+    if (canRetryTicketApproach()) {
+        beginTicketCollectorDepartureApproach(reason);
+        return;
+    }
+
+    SimPlayerManager* manager = SimPlayerManager::instance();
+    if (manager != nullptr && manager->isTicketCollectorFallbackToBoardFromNear())
+        boardInterplanetaryShuttle("collectorUnreachable");
+    else
+        cancelTicketCollectorTravel("collectorApproachExhausted");
+}
+
+void SimMinerController::beginTicketCollectorDepartureApproach(
+        const String& reason) {
+    if (!intelligentTravelActive || agent == nullptr)
+        return;
+
+    if (ticketApproachAttempts >=
+            SimPlayerManager::instance()->getTicketCollectorApproachAttempts() ||
+            (travelStartedAtMs != 0 && System::getMiliTime() >
+                travelStartedAtMs + (uint64)SimPlayerManager::instance()->
+                    getTicketCollectorApproachTtlSeconds() * 1000)) {
+        retryTicketApproach(reason + ":exhausted");
+        return;
+    }
+
+    ticketApproachAttempts++;
+
+    ManagedReference<AiAgent*> strongAgent = agent;
+    ManagedReference<Zone*> zone;
+    Vector3 currentWorld;
+    {
+        Locker agentLocker(strongAgent);
+        zone = strongAgent->getZone();
+        currentWorld = strongAgent->getWorldPosition();
+    }
+
+    if (zone == nullptr) {
+        retryTicketApproach("missingZone");
+        return;
+    }
+
+    if (!ticketCollectorFound) {
+        if (!SimPlayerManager::instance()->resolveNearestTicketCollector(
+                zone, travelDeparturePosition, ticketCollectorWorld,
+                ticketCollectorLocal, ticketCollectorCell, ticketCollectorOid)) {
+            retryTicketApproach("collectorNotFound");
+            return;
+        }
+        ticketCollectorFound = true;
+    }
+
+    if (isAtTicketCollector()) {
+        ticketTravelPhase = TICKET_DEPARTURE_COLLECTOR;
+        boardInterplanetaryShuttle("collectorReached");
+        return;
+    }
+
+    Vector3 interiorWorld;
+    Vector3 interiorLocal;
+    ManagedReference<CellObject*> interiorCell;
+    SimPlayerManager::StarportInteriorWaypointResult result =
+        SimPlayerManager::instance()->resolveStarportInteriorWaypoint(
+            zone, travelDeparturePosition, currentWorld, interiorWorld,
+            interiorLocal, interiorCell);
+
+    if (result == SimPlayerManager::STARPORT_RESOLVE_FAILED) {
+        retryTicketApproach("interiorResolveFailed");
+        return;
+    }
+
+    if (result == SimPlayerManager::STARPORT_WAYPOINT_FOUND) {
+        // P.4.4b's mount lifecycle must end before any cell entry. The
+        // directed collector leg is the only route allowed to retain the
+        // egress suppression latch.
+        dismountIfMounted("ticketCollectorBeforeInterior");
+        ticketTravelPhase = TICKET_DEPARTURE_ENTRY;
+        moveToInterior(interiorWorld, interiorLocal, interiorCell.get());
+        return;
+    }
+
+    ticketTravelPhase = TICKET_DEPARTURE_COLLECTOR;
+    cellEgressSuppressed = false;
+    moveTo(ticketCollectorWorld, ticketCollectorWorld,
+        ticketCollectorCell.get());
+}
+
+// Delayed re-drive of the ticket-collector arrival exit after a transient
+// STARPORT_RESOLVE_FAILED, so the resolver miss is retried with a real interval
+// (bounded by attempts/TTL) instead of recursing and burning all attempts at once.
+class TicketArrivalRetryTask : public Task {
+    WeakReference<SimMinerController*> controller;
+    String reason;
+public:
+    TicketArrivalRetryTask(SimMinerController* ctrl, const String& r)
+        : controller(ctrl), reason(r) {}
+    void run() override {
+        Reference<SimMinerController*> strong = controller.get();
+        if (strong != nullptr)
+            strong->beginTicketCollectorArrivalExit(reason);
+    }
+};
+
+void SimMinerController::beginTicketCollectorArrivalExit(const String& reason) {
+    if (!intelligentTravelActive || agent == nullptr)
+        return;
+
+    SimPlayerManager* manager = SimPlayerManager::instance();
+    if (manager == nullptr)
+        return;
+
+    if (ticketApproachAttempts >= manager->getTicketCollectorApproachAttempts() ||
+            (travelStartedAtMs != 0 && System::getMiliTime() >
+                travelStartedAtMs + (uint64)manager->getTicketCollectorApproachTtlSeconds() * 1000)) {
+        cancelTicketCollectorTravel("arrivalExitResolveExhausted");
+        return;
+    }
+    ticketApproachAttempts++;
+
+    ManagedReference<AiAgent*> strongAgent = agent;
+    ManagedReference<Zone*> zone;
+    Vector3 currentWorld;
+    {
+        Locker agentLocker(strongAgent);
+        zone = strongAgent->getZone();
+        currentWorld = strongAgent->getWorldPosition();
+    }
+
+    if (zone == nullptr) {
+        cancelTicketCollectorTravel("arrivalExitMissingZone");
+        return;
+    }
+
+    Vector3 interiorWorld;
+    Vector3 interiorLocal;
+    ManagedReference<CellObject*> interiorCell;
+    SimPlayerManager::StarportInteriorWaypointResult result =
+        manager->resolveStarportInteriorWaypoint(
+            zone, ticketArrivalOutdoor, currentWorld, interiorWorld,
+            interiorLocal, interiorCell);
+
+    if (result == SimPlayerManager::STARPORT_RESOLVE_FAILED) {
+        // Transient resolver miss: retry after a real interval (do NOT recurse
+        // synchronously, which would exhaust attempts instantly). Bounded by the
+        // attempts/TTL check at the top of this method.
+        Reference<TicketArrivalRetryTask*> task =
+            new TicketArrivalRetryTask(this, reason + ":retry");
+        task->schedule(2000);
+        return;
+    }
+
+    clearCellEgressState();
+    if (result == SimPlayerManager::STARPORT_WAYPOINT_FOUND) {
+        ticketTravelPhase = TICKET_ARRIVAL_REENTER;
+        moveToInterior(interiorWorld, interiorLocal, interiorCell.get());
+        return;
+    }
+
+    ticketTravelPhase = TICKET_ARRIVAL_EGRESS;
+    moveTo(ticketArrivalOutdoor);
+}
+
+void SimMinerController::cancelTicketCollectorTravel(const String& reason) {
+    Logger::console.info(String("SimMinerTicketCollectorTravelCancelled miner=") +
+        String::valueOf(agent == nullptr ? 0 : agent->getObjectID()) +
+        " reason=" + reason, true);
+
+    // If we are cancelling an ARRIVAL exit the miner is stranded at the destination
+    // hollow: reposition it to the OUTDOOR arrival (a safe switchZone, same as the
+    // board reposition) so normal recovery does not resume mining wedged inside the
+    // enclosed hollow. Departure-side cancels are already outdoors and skip this.
+    if ((ticketTravelPhase == TICKET_ARRIVAL_REENTER ||
+            ticketTravelPhase == TICKET_ARRIVAL_EGRESS) && agent != nullptr &&
+            (ticketArrivalOutdoor.getX() != 0.f ||
+             ticketArrivalOutdoor.getY() != 0.f)) {
+        // Invalidate any in-flight path/arrival tasks and tear down stale movement
+        // BEFORE the reposition, matching the board-path choreography (stale paths
+        // have won this race live).
+        prepareForRelocation("arrivalExitRecovery");
+        ManagedReference<AiAgent*> strongAgent = agent;
+        Locker agentLocker(strongAgent);
+        Zone* zone = strongAgent->getZone();
+        if (zone != nullptr) {
+            strongAgent->setMovementState(AiAgent::OBLIVIOUS);
+            strongAgent->clearPatrolPoints();
+            strongAgent->clearSavedPatrolPoints();
+            strongAgent->clearCurrentPath();
+            strongAgent->switchZone(zone->getZoneName(),
+                ticketArrivalOutdoor.getX(), ticketArrivalOutdoor.getZ(),
+                ticketArrivalOutdoor.getY(), 0);
+            strongAgent->setHomeLocation(ticketArrivalOutdoor.getX(),
+                ticketArrivalOutdoor.getZ(), ticketArrivalOutdoor.getY(), nullptr);
+        }
+    }
+
+    ticketTravelPhase = TICKET_TRAVEL_NONE;
+    clearCellEgressState();
+
+    uint64 minerID = agent == nullptr ? 0 : agent->getObjectID();
+    if (minerID != 0)
+        SimPlayerManager::instance()->clearMinerIntelligentTargetAssignmentFromController(
+            minerID, reason);
+
+    resetIntelligentAssignmentForRecovery();
+}
+
+void SimMinerController::completeTicketCollectorTravel() {
+    clearCellEgressState();
+    ticketTravelPhase = TICKET_TRAVEL_NONE;
+    resetIntelligentAssignmentForRecovery();
+}
+
 void SimMinerController::onArrived() {
-    // P.4.5b: the miner ran to the origin starport's ticket collector. Board the
-    // shuttle now = teleport to the destination starport's outdoor arrival.
     if (intelligentTravelActive) {
+        if (ticketTravelPhase == TICKET_DEPARTURE_ENTRY) {
+            cellEgressSuppressed = true;
+            ticketTravelPhase = TICKET_DEPARTURE_COLLECTOR;
+            moveTo(ticketCollectorWorld, ticketCollectorWorld,
+                ticketCollectorCell.get());
+            return;
+        }
+
+        if (ticketTravelPhase == TICKET_DEPARTURE_COLLECTOR) {
+            if (isAtTicketCollector())
+                boardInterplanetaryShuttle("collectorReached");
+            else
+                retryTicketApproach("collectorArrivalOutsideGate");
+            return;
+        }
+
+        if (ticketTravelPhase == TICKET_ARRIVAL_REENTER) {
+            clearCellEgressState();
+            ticketTravelPhase = TICKET_ARRIVAL_EGRESS;
+            moveTo(ticketArrivalOutdoor);
+            return;
+        }
+
+        if (ticketTravelPhase == TICKET_ARRIVAL_EGRESS) {
+			bool outdoors = false;
+			{
+				Locker agentLocker(agent);
+				ManagedReference<SceneObject*> parent = agent->getParent().get();
+				outdoors = parent == nullptr || !parent->isCellObject();
+			}
+			if (outdoors)
+                completeTicketCollectorTravel();
+            else
+                beginTicketCollectorArrivalExit("stillInside");
+            return;
+        }
+
+        // Legacy travel keeps its original immediate board behavior when the
+        // F.0.4.11 gate is disabled.
         boardInterplanetaryShuttle("arrived");
         return;
     }
@@ -1373,10 +2208,20 @@ void SimMinerController::onArrived() {
 }
 
 void SimMinerController::onPathFailed() {
-    // P.4.5b: a traveling miner whose departure run wedged must never be left
-    // standing at/near the starport. Board from where it stands (the "ticket was
-    // already bought" fallback) rather than escalating to a normal path failure.
     if (intelligentTravelActive) {
+        if (ticketTravelPhase == TICKET_ARRIVAL_REENTER ||
+                ticketTravelPhase == TICKET_ARRIVAL_EGRESS) {
+            beginTicketCollectorArrivalExit("arrivalPathFailed");
+            return;
+        }
+
+        if (SimPlayerManager::instance()->isTicketCollectorTravelEnabled()) {
+            retryTicketApproach("pathFailed");
+            return;
+        }
+
+        // Legacy P.4.5b behavior: a traveling miner whose departure run wedged
+        // boards from where it stands.
         boardInterplanetaryShuttle("stuckFallback");
         return;
     }
@@ -1430,6 +2275,7 @@ void SimMinerController::resetIntelligentAssignmentForRecovery() {
     // generation, invalidating any in-flight stationed-sample/arrival tasks.
     // P.4.4b: a recovered miner must never keep (or leak) a swoop.
     dismountIfMounted("recoveryReset");
+    clearCellEgressState();
     clearLocalIntelligentTargetAssignment();
 
     ManagedReference<AiAgent*> strongAgent = agent;
@@ -1498,7 +2344,22 @@ bool SimMinerController::beginInterplanetaryTravel(
     travelDestinationArrival = destArrivalPos;
     travelDestinationStarport = destStarportName;
     travelStartedAtMs = System::getMiliTime();
-    travelBoardRadius = boardRadius > 0.f ? boardRadius : 20.f;
+    SimPlayerManager* manager = SimPlayerManager::instance();
+    bool collectorTravel = manager != nullptr &&
+        manager->isTicketCollectorTravelEnabled();
+    travelBoardRadius = collectorTravel ?
+        manager->getTicketCollectorBoardRadiusMeters() :
+        (boardRadius > 0.f ? boardRadius : 20.f);
+    ticketTravelPhase = collectorTravel ? TICKET_DEPARTURE_RESOLVE :
+        TICKET_TRAVEL_NONE;
+    ticketCollectorFound = false;
+    ticketArrivalCollectorFound = false;
+    ticketCollectorWorld = Vector3(0, 0, 0);
+    ticketCollectorLocal = Vector3(0, 0, 0);
+    ticketCollectorCell = nullptr;
+    ticketCollectorOid = 0;
+    ticketArrivalOutdoor = destArrivalPos;
+    ticketApproachAttempts = 0;
 
     travelResult = "traveling";
 
@@ -1514,10 +2375,16 @@ bool SimMinerController::beginInterplanetaryTravel(
             String::valueOf(Math::getPrecision(departurePos.getY(), 1)) + ")",
         true);
 
-    // Run to the origin starport's ticket collector. On arrival (or if the
-    // stuck-watchdog gives up) onArrived()/onPathFailed() boards the shuttle.
-    maybeMountForTravel(departurePos);
-    moveTo(departurePos);
+    if (collectorTravel) {
+        // Dismount before the first cell-aware operation. The approach itself
+        // is deliberately on foot so a rider can never enter a POB cell.
+        dismountIfMounted("ticketCollectorDeparture");
+        beginTicketCollectorDepartureApproach("travelStarted");
+    } else {
+        // Existing P.4.5b behavior, byte-for-byte while the new gate is off.
+        maybeMountForTravel(departurePos);
+        moveTo(departurePos);
+    }
     return true;
 }
 
@@ -1547,6 +2414,22 @@ void SimMinerController::boardInterplanetaryShuttle(const String& reason) {
     }
 
     String fromZone = "unknown";
+    Vector3 landing = arrival;
+    ticketArrivalCollectorFound = false;
+
+    SimPlayerManager* manager = SimPlayerManager::instance();
+    if (manager != nullptr && manager->isTicketCollectorTravelEnabled()) {
+        ZoneServer* zoneServer = ServerCore::getZoneServer();
+        Zone* destinationZone = zoneServer == nullptr ? nullptr :
+            zoneServer->getZone(destZone);
+        Vector3 collectorLocal;
+        ManagedReference<CellObject*> collectorCell;
+        uint64 collectorOid = 0;
+        if (manager->resolveNearestTicketCollector(destinationZone, arrival,
+                landing, collectorLocal, collectorCell, collectorOid)) {
+            ticketArrivalCollectorFound = true;
+        }
+    }
 
     {
         Locker agentLocker(strongAgent);
@@ -1557,12 +2440,12 @@ void SimMinerController::boardInterplanetaryShuttle(const String& reason) {
         // "Board the shuttle": switchZone params are (terrain, X, Z=height, Y=north,
         // parentID=0 outdoor). Same safe reposition as P.4.5a station travel; the
         // OUTDOOR arrival means we never enter the un-navmeshed starport interior.
-        strongAgent->switchZone(destZone, arrival.getX(), arrival.getZ(),
-            arrival.getY(), 0);
+        strongAgent->switchZone(destZone, landing.getX(), landing.getZ(),
+            landing.getY(), 0);
         // Anchor the leash on the new planet so a stale home location on the old
         // planet can't pull the miner. The next assignment's move resets it again.
-        strongAgent->setHomeLocation(arrival.getX(), arrival.getZ(),
-            arrival.getY(), nullptr);
+        strongAgent->setHomeLocation(landing.getX(), landing.getZ(),
+            landing.getY(), nullptr);
     }
 
     Logger::console.info(
@@ -1577,10 +2460,17 @@ void SimMinerController::boardInterplanetaryShuttle(const String& reason) {
     SimPlayerManager::instance()->recordInterplanetaryTravelBoarded(
         minerID, fromZone, destZone, starport, reason);
 
-    // clearLocalIntelligentTargetAssignment() (via reset) also clears travel state
-    // and advances the work-loop generation, then startSimLoop() re-enters the
-    // pipeline on the destination planet so it re-acquires a local target.
-    resetIntelligentAssignmentForRecovery();
+    if (manager != nullptr && manager->isTicketCollectorTravelEnabled() &&
+            ticketArrivalCollectorFound) {
+        travelStartedAtMs = System::getMiliTime();
+        ticketApproachAttempts = 0;
+        ticketArrivalOutdoor = arrival;
+        beginTicketCollectorArrivalExit("boarded");
+    } else {
+        // Existing arrival behavior: clear travel state and re-acquire on the
+        // destination planet immediately.
+        resetIntelligentAssignmentForRecovery();
+    }
 }
 
 void SimMinerController::performSample() {
@@ -2046,6 +2936,16 @@ void SimMinerController::clearLocalIntelligentTargetAssignment() {
     travelDestinationArrival = Vector3(0, 0, 0);
     travelDestinationStarport = "";
     travelStartedAtMs = 0;
+    ticketTravelPhase = TICKET_TRAVEL_NONE;
+    ticketCollectorWorld = Vector3(0, 0, 0);
+    ticketCollectorLocal = Vector3(0, 0, 0);
+    ticketCollectorCell = nullptr;
+    ticketCollectorOid = 0;
+    ticketCollectorFound = false;
+    ticketArrivalCollectorFound = false;
+    ticketArrivalOutdoor = Vector3(0, 0, 0);
+    ticketApproachAttempts = 0;
+    clearCellEgressState();
 }
 
 void SimMinerController::logIntelligentTargetActivation(

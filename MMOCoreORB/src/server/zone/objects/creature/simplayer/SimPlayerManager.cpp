@@ -6,6 +6,7 @@
 #include "SimPlayerManager.h"
 #include "SimPvPController.h"
 #include "SimHunterController.h"
+#include "CellNavDiagLog.h"
 
 #include <cmath>
 
@@ -56,6 +57,12 @@
 #include "server/zone/managers/collision/CollisionManager.h"
 #include "server/zone/objects/building/BuildingObject.h"
 #include "server/zone/objects/cell/CellObject.h"
+#include "templates/SharedObjectTemplate.h"
+#include "templates/appearance/PortalLayout.h"
+#include "templates/appearance/FloorMesh.h"
+#include "templates/appearance/PathGraph.h"
+#include "templates/appearance/PathNode.h"
+#include "templates/collision/BaseBoundingVolume.h"
 #include "server/zone/objects/region/CityRegion.h"
 #include "server/zone/objects/scene/SceneObjectType.h"
 #include "server/zone/objects/tangible/LairObject.h"
@@ -270,6 +277,20 @@ public:
     void run() override {
         SimPlayerManager::instance()->runConfiguredSpawnTask(groupIndex, spawnIndex);
     }
+};
+
+class CellNavDiagRetryTask : public Task {
+public:
+	void run() override {
+		SimPlayerManager::instance()->runCellNavDiagnosticRetry();
+	}
+};
+
+class CellNavDiagSpawnTask : public Task {
+public:
+	void run() override {
+		SimPlayerManager::instance()->spawnCellNavDiagnosticBot();
+	}
 };
 
 class MinerPathValidationTask : public Task {
@@ -5523,7 +5544,17 @@ void SimPlayerManager::initialize() {
 #ifdef DEBUG_SIMPLAYER
         info("SimPlayerManager disabled; skipping spawns and periodic tasks.", true);
 #endif
-        return;
+	    return;
+    }
+
+    if (cellNavDiagConfig.enabled) {
+        // Defer to the task pool (like the configured spawns) rather than
+        // spawning synchronously inside initialize(): the zone/creature-manager
+        // and building geometry are not reliably ready this early in
+        // ZoneServer startup. Same startup-delay knob as the miner spawns.
+        Reference<CellNavDiagSpawnTask*> diagSpawnTask =
+            new CellNavDiagSpawnTask();
+        diagSpawnTask->schedule(configuredSpawnStartupDelaySeconds * 1000);
     }
 
     scheduleConfiguredSpawnTask(0, 0, configuredSpawnStartupDelaySeconds * 1000);
@@ -6051,6 +6082,43 @@ void SimPlayerManager::loadLuaConfig() {
             configuredSpawnBatchDelayMs, 250, 60000);
     }
     spawnStartupConfig.pop();
+
+    LuaObject cellNavDiagConfig = config.getObjectField("cellNavDiag");
+    if (cellNavDiagConfig.isValidTable()) {
+        this->cellNavDiagConfig.enabled = cellNavDiagConfig.getBooleanField(
+            "enabled", this->cellNavDiagConfig.enabled);
+        this->cellNavDiagConfig.planet = cellNavDiagConfig.getStringField(
+            "planet", "tatooine");
+        this->cellNavDiagConfig.spawnX = cellNavDiagConfig.getFloatField(
+            "spawnX", this->cellNavDiagConfig.spawnX);
+        this->cellNavDiagConfig.spawnY = cellNavDiagConfig.getFloatField(
+            "spawnY", this->cellNavDiagConfig.spawnY);
+        this->cellNavDiagConfig.spawnZ = cellNavDiagConfig.getFloatField(
+            "spawnZ", this->cellNavDiagConfig.spawnZ);
+        this->cellNavDiagConfig.targetX = cellNavDiagConfig.getFloatField(
+            "targetX", this->cellNavDiagConfig.targetX);
+        this->cellNavDiagConfig.targetY = cellNavDiagConfig.getFloatField(
+            "targetY", this->cellNavDiagConfig.targetY);
+        this->cellNavDiagConfig.targetZ = cellNavDiagConfig.getFloatField(
+            "targetZ", this->cellNavDiagConfig.targetZ);
+        this->cellNavDiagConfig.doorwayX = cellNavDiagConfig.getFloatField(
+            "doorwayX", this->cellNavDiagConfig.doorwayX);
+        this->cellNavDiagConfig.doorwayY = cellNavDiagConfig.getFloatField(
+            "doorwayY", this->cellNavDiagConfig.doorwayY);
+        this->cellNavDiagConfig.exitX = cellNavDiagConfig.getFloatField(
+            "exitX", this->cellNavDiagConfig.exitX);
+        this->cellNavDiagConfig.exitY = cellNavDiagConfig.getFloatField(
+            "exitY", this->cellNavDiagConfig.exitY);
+        this->cellNavDiagConfig.logEverySimLoopTick =
+            cellNavDiagConfig.getBooleanField("logEverySimLoopTick",
+                this->cellNavDiagConfig.logEverySimLoopTick);
+        // Master gate for ALL cell-nav diagnostic file output. Default OFF so the
+        // full instrumentation stays in the binary, dormant and free, and can be
+        // re-enabled by flipping cellNavDiag.logging = true (no rebuild needed).
+        CellNavDiagLog::setLoggingEnabled(cellNavDiagConfig.getBooleanField(
+            "logging", CellNavDiagLog::isLoggingEnabled()));
+    }
+    cellNavDiagConfig.pop();
 
     LuaObject resourceIntelligenceConfig = config.getObjectField("resourceIntelligenceConfig");
     if (resourceIntelligenceConfig.isValidTable()) {
@@ -19049,6 +19117,46 @@ void SimPlayerManager::applyTravelConfig(
         travelConfig.getFloatField(
             "planetDispatchBoardRadiusMeters",
             travelPlanetDispatchBoardRadiusMeters);
+
+    // F.0.4.11 ticket-collector travel. This nested gate deliberately has no
+    // effect on the legacy miner/PvP paths while disabled.
+    LuaObject ticketCollectorTravel =
+        travelConfig.getObjectField("ticketCollectorTravel");
+    if (ticketCollectorTravel.isValidTable()) {
+        ticketCollectorTravelEnabled = ticketCollectorTravel.getBooleanField(
+            "enabled", ticketCollectorTravelEnabled);
+        ticketCollectorBoardRadiusMeters = clampFloatRange(
+            ticketCollectorTravel.getFloatField(
+                "boardRadiusMeters", ticketCollectorBoardRadiusMeters),
+            1.f, 64.f);
+        ticketCollectorApproachAttempts = clampMinerInt(
+            ticketCollectorTravel.getIntField("approachAttempts"),
+            ticketCollectorApproachAttempts, 1, 10);
+        ticketCollectorApproachTtlSeconds = clampMinerInt(
+            ticketCollectorTravel.getIntField("approachTtlSeconds"),
+            ticketCollectorApproachTtlSeconds, 5, 3600);
+        ticketCollectorFallbackToBoardFromNear =
+            ticketCollectorTravel.getBooleanField(
+                "fallbackToBoardFromNear",
+                ticketCollectorFallbackToBoardFromNear);
+        ticketCollectorTestForceNoCollector =
+            ticketCollectorTravel.getBooleanField(
+                "testForceNoCollector", ticketCollectorTestForceNoCollector);
+        // Enclosed-hollow starports bake the ticket collector as a childObject
+        // that sits a fixed ~10m outside the starport's collision bounding box
+        // (the box does not cover the hollow). The strict AABB containment test
+        // then fails to associate the collector with its own starport and wrongly
+        // returns NO_INTERIOR -> the bot walks straight at the walled hollow.
+        // A bounded horizontal margin rescues that case; the next-nearest
+        // cell-bearing building is always 100m+ away, so there is no risk of
+        // selecting an adjacent structure.
+        ticketCollectorInteriorContainmentMarginMeters = clampFloatRange(
+            ticketCollectorTravel.getFloatField(
+                "interiorContainmentMarginMeters",
+                ticketCollectorInteriorContainmentMarginMeters),
+            0.f, 40.f);
+    }
+    ticketCollectorTravel.pop();
 }
 
 bool SimPlayerManager::isActivationTrustAcceptable(
@@ -26330,6 +26438,676 @@ void SimPlayerManager::spawnFromConfig(const SpawnGroup& g, const ShuttleportLoc
     ctrl->startSimLoop();
 }
 
+SimPlayerManager::StarportInteriorWaypointResult
+SimPlayerManager::resolveStarportInteriorWaypoint(Zone* zone,
+        const Vector3& starportNearWorld, const Vector3& pathStartWorld,
+        Vector3& outWorld, Vector3& outLocal,
+        ManagedReference<CellObject*>& outCell) {
+    outWorld = Vector3(0, 0, 0);
+    outLocal = Vector3(0, 0, 0);
+    outCell = nullptr;
+
+    if (zone == nullptr)
+        return STARPORT_RESOLVE_FAILED;
+
+    // The collector is cell-less on the proven Mos Eisley starport, so the
+    // travel point is the stable building-selection anchor. Do not infer the
+    // building from the collector parent (which is rootParent 0).
+    SortedVector<TreeEntry*> closeObjects;
+    zone->getInRangeObjects(starportNearWorld.getX(), 0,
+        starportNearWorld.getY(), 256, &closeObjects, true, true);
+
+    CellNavDiagLog::write("STARPORT_WP_BEGIN near=(" +
+        String::valueOf(starportNearWorld.getX()) + "," +
+        String::valueOf(starportNearWorld.getY()) + "," +
+        String::valueOf(starportNearWorld.getZ()) + ") start=(" +
+        String::valueOf(pathStartWorld.getX()) + "," +
+        String::valueOf(pathStartWorld.getY()) + "," +
+        String::valueOf(pathStartWorld.getZ()) + ") closeObjects=" +
+        String::valueOf(closeObjects.size()));
+
+    ManagedReference<BuildingObject*> selectedBuilding;
+    const PortalLayout* selectedLayout = nullptr;
+    float selectedScore = 0.f;
+    // Selection rank: 0 for a strictly-contained building, else the horizontal
+    // box miss. A strict hit always beats a margin-only hit.
+    float selectedRank = 0.f;
+
+    for (int i = 0; i < closeObjects.size(); ++i) {
+        SceneObject* candidate = static_cast<SceneObject*>(closeObjects.get(i));
+        if (candidate == nullptr || !candidate->isBuildingObject())
+            continue;
+
+        BuildingObject* building = candidate->asBuildingObject();
+        SharedObjectTemplate* objectTemplate = candidate->getObjectTemplate();
+        const PortalLayout* layout = objectTemplate == nullptr ? nullptr :
+            objectTemplate->getPortalLayout();
+
+        if (building == nullptr || layout == nullptr) {
+            CellNavDiagLog::write("STARPORT_WP_CAND oid=" +
+                String::valueOf(candidate->getObjectID()) +
+                " skip=noLayout hasLayout=" +
+                String::valueOf(layout != nullptr));
+            continue;
+        }
+
+        Vector3 modelPoint = PathFinderManager::transformToModelSpace(
+            starportNearWorld, building);
+        const BaseBoundingVolume* boundingVolume =
+            building->getBoundingVolume();
+        if (boundingVolume == nullptr) {
+            CellNavDiagLog::write("STARPORT_WP_CAND oid=" +
+                String::valueOf(building->getObjectID()) +
+                " skip=noBoundingVolume");
+            continue;
+        }
+
+        const AABB& bounds = boundingVolume->getBoundingBox();
+        bool contains = modelPoint.getX() >= bounds.getXMin() &&
+            modelPoint.getX() <= bounds.getXMax() &&
+            modelPoint.getY() >= bounds.getYMin() &&
+            modelPoint.getY() <= bounds.getYMax() &&
+            modelPoint.getZ() >= bounds.getZMin() &&
+            modelPoint.getZ() <= bounds.getZMax();
+
+        // Horizontal (east/north) distance from the point to this building's
+        // collision box; 0 when the point is horizontally inside. An enclosed-
+        // hollow collector is baked just outside the box (see below), so we
+        // allow a bounded margin as a fallback while keeping strict containment
+        // as the primary, no-regression selector.
+        float missEast = Math::max(0.f, Math::max(
+            bounds.getXMin() - modelPoint.getX(),
+            modelPoint.getX() - bounds.getXMax()));
+        float missNorth = Math::max(0.f, Math::max(
+            bounds.getYMin() - modelPoint.getY(),
+            modelPoint.getY() - bounds.getYMax()));
+        float horizMiss = Math::sqrt(missEast * missEast +
+            missNorth * missNorth);
+        bool withinHeight = modelPoint.getZ() >= bounds.getZMin() &&
+            modelPoint.getZ() <= bounds.getZMax();
+        bool withinMargin = !contains && withinHeight &&
+            horizMiss <= ticketCollectorInteriorContainmentMarginMeters;
+
+        CellNavDiagLog::write("STARPORT_WP_CAND oid=" +
+            String::valueOf(building->getObjectID()) + " cells=" +
+            String::valueOf(building->getTotalCellNumber()) +
+            " contains=" + String::valueOf(contains) + " withinMargin=" +
+            String::valueOf(withinMargin) + " horizMiss=" +
+            String::valueOf(horizMiss) + " model=(" +
+            String::valueOf(modelPoint.getX()) + "," +
+            String::valueOf(modelPoint.getY()) + "," +
+            String::valueOf(modelPoint.getZ()) + ") boundsX=[" +
+            String::valueOf(bounds.getXMin()) + "," +
+            String::valueOf(bounds.getXMax()) + "] boundsY=[" +
+            String::valueOf(bounds.getYMin()) + "," +
+            String::valueOf(bounds.getYMax()) + "] boundsZ=[" +
+            String::valueOf(bounds.getZMin()) + "," +
+            String::valueOf(bounds.getZMax()) + "]");
+
+        // The travel point must be inside this building's exterior bounds, OR
+        // (for an enclosed-hollow starport whose collector childObject is baked
+        // ~10m outside the collision box) within a bounded horizontal margin.
+        // A merely nearby structure is not a valid starport candidate: the next
+        // cell-bearing building is always 100m+ away, well beyond the margin.
+        if (!contains && !withinMargin)
+            continue;
+
+        // Strictly-contained buildings always outrank margin-only ones; among
+        // equals, prefer the smaller box miss, then the nearer center.
+        float score = building->getWorldPosition().distanceTo2d(
+            starportNearWorld);
+        float rank = (contains ? 0.f : horizMiss);
+        bool better = selectedBuilding == nullptr ||
+            rank < selectedRank ||
+            (rank == selectedRank && score < selectedScore) ||
+            (rank == selectedRank && score == selectedScore &&
+                building->getObjectID() < selectedBuilding->getObjectID());
+
+        if (better) {
+            selectedBuilding = building;
+            selectedLayout = layout;
+            selectedScore = score;
+            selectedRank = rank;
+        }
+    }
+
+    if (selectedBuilding == nullptr || selectedLayout == nullptr) {
+        // No cell-bearing building CONTAINS the travel point, so the point is
+        // outdoors -> an outdoor starport (NO_INTERIOR). Only an empty in-range
+        // query (zone not yet populated) is a transient RESOLVE_FAILED. A merely
+        // adjacent cell-building must NOT force RESOLVE_FAILED.
+        CellNavDiagLog::write("STARPORT_WP_RESULT result=" +
+            String(closeObjects.size() > 0 ? "NO_INTERIOR(noContainingBuilding)" :
+                "RESOLVE_FAILED(emptyQuery)"));
+        return closeObjects.size() > 0 ? STARPORT_NO_INTERIOR :
+            STARPORT_RESOLVE_FAILED;
+    }
+
+    int interiorCellCount = Math::min(
+        selectedBuilding->getTotalCellNumber(),
+        selectedLayout->getFloorMeshNumber() - 1);
+
+    CellNavDiagLog::write("STARPORT_WP_SELECTED building=" +
+        String::valueOf(selectedBuilding->getObjectID()) + " totalCells=" +
+        String::valueOf(selectedBuilding->getTotalCellNumber()) +
+        " floorMeshes=" + String::valueOf(selectedLayout->getFloorMeshNumber()) +
+        " interiorCellCount=" + String::valueOf(interiorCellCount));
+
+    if (interiorCellCount <= 0) {
+        CellNavDiagLog::write("STARPORT_WP_RESULT result=NO_INTERIOR(zeroCells)");
+        return STARPORT_NO_INTERIOR;
+    }
+
+    // Prefer a path-graph point, falling back to a floor triangle centroid.
+    // Each candidate is route-validated from the supplied starport-side
+    // position before it is published to a controller.
+    for (int cellNumber = 1; cellNumber <= interiorCellCount; ++cellNumber) {
+        CellObject* candidateCell = selectedBuilding->getCell(cellNumber);
+        if (candidateCell == nullptr)
+            continue;
+
+        const FloorMesh* floorMesh = selectedLayout->getFloorMesh(cellNumber);
+        if (floorMesh == nullptr)
+            continue;
+
+        Vector3 candidateLocal;
+        bool haveCandidate = false;
+        const PathGraph* pathGraph = floorMesh->getPathGraph();
+        if (pathGraph != nullptr && pathGraph->getPathNodes() != nullptr) {
+            const Vector<PathNode*>* pathNodes = pathGraph->getPathNodes();
+            for (int nodeIndex = 0; nodeIndex < pathNodes->size(); ++nodeIndex) {
+                const PathNode* node = pathNodes->get(nodeIndex);
+                if (node == nullptr)
+                    continue;
+
+                candidateLocal = node->getPosition();
+                haveCandidate = true;
+                break;
+            }
+        }
+
+        if (!haveCandidate && floorMesh->getTriangleCount() > 0) {
+            const FloorMeshTriangleNode* triangle = floorMesh->getTriangle(0);
+            if (triangle != nullptr) {
+                candidateLocal = triangle->getBarycenter();
+                haveCandidate = true;
+            }
+        }
+
+        if (!haveCandidate)
+            continue;
+
+        Reference<Vector<float>*> floorHits =
+            CollisionManager::getCellFloorCollision(candidateLocal.getX(),
+                candidateLocal.getY(), candidateCell);
+        if (floorHits != nullptr && floorHits->size() > 0) {
+            float selectedFloor = floorHits->get(0);
+            float selectedDistance = fabs(selectedFloor - candidateLocal.getZ());
+            for (int floorIndex = 1; floorIndex < floorHits->size();
+                    ++floorIndex) {
+                float distance = fabs(floorHits->get(floorIndex) -
+                    candidateLocal.getZ());
+                if (distance < selectedDistance) {
+                    selectedFloor = floorHits->get(floorIndex);
+                    selectedDistance = distance;
+                }
+            }
+            candidateLocal.setZ(selectedFloor);
+        }
+
+        Vector3 candidateWorld = WorldCoordinates(candidateLocal,
+            candidateCell).getWorldPosition();
+        bool routeValid = false;
+        int pathSize = 0;
+        uint64 endCellOid = 0;
+        float endDist = -1.f;
+        Vector<WorldCoordinates>* path = nullptr;
+        try {
+            path = PathFinderManager::instance()->findPath(
+                WorldCoordinates(pathStartWorld, nullptr),
+                WorldCoordinates(candidateLocal, candidateCell), zone);
+            if (path != nullptr && path->size() >= 2) {
+                pathSize = path->size();
+                WorldCoordinates end = path->get(path->size() - 1);
+                endCellOid = end.getCell() == nullptr ? 0 :
+                    end.getCell()->getObjectID();
+                endDist = end.getWorldPosition().distanceTo(candidateWorld);
+                routeValid = end.getCell() != nullptr &&
+                    end.getCell()->getObjectID() == candidateCell->getObjectID() &&
+                    endDist <= 8.f;
+            } else if (path != nullptr) {
+                pathSize = path->size();
+            }
+        } catch (...) {
+            routeValid = false;
+        }
+
+        if (path != nullptr)
+            delete path;
+
+        CellNavDiagLog::write("STARPORT_WP_CELL cell=" +
+            String::valueOf(cellNumber) + " cellOid=" +
+            String::valueOf(candidateCell->getObjectID()) + " routeValid=" +
+            String::valueOf(routeValid) + " pathSize=" +
+            String::valueOf(pathSize) + " endCellOid=" +
+            String::valueOf(endCellOid) + " endDist=" +
+            String::valueOf(endDist));
+
+        if (!routeValid)
+            continue;
+
+        outLocal = candidateLocal;
+        outWorld = candidateWorld;
+        outCell = candidateCell;
+        CellNavDiagLog::write("STARPORT_WP_RESULT result=WAYPOINT_FOUND building=" +
+            String::valueOf(selectedBuilding->getObjectID()) + " " +
+            CellNavDiagLog::fmtPos(outWorld, outLocal, candidateCell));
+        return STARPORT_WAYPOINT_FOUND;
+    }
+
+    CellNavDiagLog::write("STARPORT_WP_RESULT result=RESOLVE_FAILED(noValidCellRoute) "
+        "building=" + String::valueOf(selectedBuilding->getObjectID()));
+    return STARPORT_RESOLVE_FAILED;
+}
+
+bool SimPlayerManager::resolveCellNavDiagnosticRoute(Vector3& worldPos,
+        Vector3& localPos, ManagedReference<CellObject*>& cell) {
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    Zone* zone = zoneServer == nullptr ? nullptr :
+        zoneServer->getZone(cellNavDiagConfig.planet);
+
+    if (zone == nullptr) {
+        CellNavDiagLog::write("CELLNAV_RESOLVE_DEFER reason=no_zone planet=" +
+            cellNavDiagConfig.planet);
+        return false;
+    }
+
+    Vector3 targetWorld(cellNavDiagConfig.targetX, cellNavDiagConfig.targetY,
+        cellNavDiagConfig.targetZ);
+    // Accept a cell only if its cell-local point round-trips back to the
+    // requested world target within this tolerance (convention-proof selection).
+    const float kCellNavResolveToleranceMeters = 3.f;
+    SortedVector<TreeEntry*> closeObjects;
+    zone->getInRangeObjects(targetWorld.getX(), 0, targetWorld.getY(), 128,
+        &closeObjects, true, true);
+
+    bool found = false;
+    float selectedDistance = 0.f;
+    float selectedFloorZ = 0.f;
+    float selectedLocalX = 0.f;
+    float selectedLocalY = 0.f;
+    uint64 selectedBuildingOid = 0;
+    int selectedCellNumber = 0;
+    String selectedCellName;
+    ManagedReference<CellObject*> selectedCell;
+
+    for (int i = 0; i < closeObjects.size(); ++i) {
+        SceneObject* candidate =
+            static_cast<SceneObject*>(closeObjects.get(i));
+
+        if (candidate == nullptr)
+            continue;
+
+        bool isBuilding = candidate->isBuildingObject();
+        CellNavDiagLog::write("RESOLVE_CANDIDATE oid=" +
+            String::valueOf(candidate->getObjectID()) + " building=" +
+            String::valueOf(isBuilding) + " position=" +
+            candidate->getWorldPosition().toString());
+
+        if (!isBuilding)
+            continue;
+
+        BuildingObject* building = cast<BuildingObject*>(candidate);
+        if (building == nullptr)
+            continue;
+
+        Vector3 modelPoint = PathFinderManager::transformToModelSpace(
+            targetWorld, building);
+        // transformToModelSpace returns a Vector3 with (getX()=east, getY()=north,
+        // getZ()=height) — proven empirically by cellnav.log (building height 5,
+        // target height 0 -> modelPoint.getZ()=-5). getCellFloorCollision() takes
+        // the two HORIZONTAL coords (east, north) and returns HEIGHT values.
+        float localX = modelPoint.getX();          // model east (horizontal)
+        float localNorth = modelPoint.getY();      // model north (horizontal)
+        float expectedHeight = modelPoint.getZ();  // model height
+
+        CellNavDiagLog::write("RESOLVE_BUILDING oid=" +
+            String::valueOf(building->getObjectID()) + " cells=" +
+            String::valueOf(building->getTotalCellNumber()) +
+            " modelPoint=(" + String::valueOf(modelPoint.getX()) + "," +
+            String::valueOf(modelPoint.getY()) + "," +
+            String::valueOf(modelPoint.getZ()) + ") localEast=" +
+            String::valueOf(localX) + " localNorth=" +
+            String::valueOf(localNorth) + " expectedHeight=" +
+            String::valueOf(expectedHeight));
+
+        for (int cellNumber = 1;
+                cellNumber <= building->getTotalCellNumber(); ++cellNumber) {
+            CellObject* candidateCell = building->getCell(cellNumber);
+            if (candidateCell == nullptr) {
+                CellNavDiagLog::write("RESOLVE_CELL_TEST building=" +
+                    String::valueOf(building->getObjectID()) + " cell=" +
+                    String::valueOf(cellNumber) + " floor=missing");
+                continue;
+            }
+
+            Reference<Vector<float>*> floorHits =
+                CollisionManager::getCellFloorCollision(localX, localNorth,
+                    candidateCell);
+
+            bool cellHit = floorHits != nullptr && floorHits->size() > 0;
+            float cellFloorZ = 0.f;
+            float cellFloorDistance = 0.f;
+
+            if (cellHit) {
+                for (int floorIndex = 0; floorIndex < floorHits->size();
+                        ++floorIndex) {
+                    float floorZ = floorHits->get(floorIndex);
+                    float distance = fabs(floorZ - expectedHeight);
+
+                    if (floorIndex == 0 || distance < cellFloorDistance) {
+                        cellFloorZ = floorZ;
+                        cellFloorDistance = distance;
+                    }
+                }
+            }
+
+            // Round-trip guard: the chosen cell-local point must map back to the
+            // requested world target. This is convention-proof — only the correct
+            // (cell, local) pairing round-trips, so a wrong building/cell (e.g. a
+            // neighbor ~100m away) is rejected regardless of axis assumptions.
+            float roundTripError = 0.f;
+            if (cellHit) {
+                Vector3 candidateLocal(localX, localNorth, cellFloorZ);
+                Vector3 candidateWorld = WorldCoordinates(candidateLocal,
+                    candidateCell).getWorldPosition();
+                float dxr = candidateWorld.getX() - targetWorld.getX();
+                float dyr = candidateWorld.getY() - targetWorld.getY();
+                roundTripError = Math::sqrt(dxr * dxr + dyr * dyr);
+            }
+
+            CellNavDiagLog::write("RESOLVE_CELL_TEST building=" +
+                String::valueOf(building->getObjectID()) + " cell=" +
+                String::valueOf(candidateCell->getObjectID()) +
+                " number=" + String::valueOf(cellNumber) + " name=" +
+                building->getCellName(candidateCell->getCellNumber()) +
+                " floor=" + (cellHit ? String::valueOf(cellFloorZ) :
+                    String("none")) + " expectedHeight=" +
+                String::valueOf(expectedHeight) + " roundTripError=" +
+                (cellHit ? String::valueOf(roundTripError) : String("n/a")));
+
+            if (!cellHit || roundTripError > kCellNavResolveToleranceMeters ||
+                    (found && roundTripError >= selectedDistance))
+                continue;
+
+            found = true;
+            selectedDistance = roundTripError;
+            selectedFloorZ = cellFloorZ;
+            selectedLocalX = localX;
+            selectedLocalY = localNorth;
+            selectedBuildingOid = building->getObjectID();
+            selectedCellNumber = candidateCell->getCellNumber();
+            selectedCellName = building->getCellName(selectedCellNumber);
+            selectedCell = candidateCell;
+        }
+    }
+
+    if (!found || selectedCell == nullptr) {
+        CellNavDiagLog::write("CELLNAV_RESOLVE_UNRESOLVED target=" +
+            targetWorld.toString() + " targetZFallback=" +
+            String::valueOf(cellNavDiagConfig.targetZ));
+        return false;
+    }
+
+    // localPos is a point Vector3 with (getX()=east, getY()=north, getZ()=height).
+    localPos = Vector3(selectedLocalX, selectedLocalY, selectedFloorZ);
+    worldPos = WorldCoordinates(localPos, selectedCell.get()).getWorldPosition();
+    cell = selectedCell;
+
+    CellNavDiagLog::write("RESOLVE_CHOSEN building=" +
+        String::valueOf(selectedBuildingOid) + " cell=" +
+        String::valueOf(selectedCell->getObjectID()) + " number=" +
+        String::valueOf(selectedCellNumber) + " name=" + selectedCellName +
+        " floorZ=" + String::valueOf(selectedFloorZ) + " " +
+        CellNavDiagLog::fmtPos(worldPos, localPos, selectedCell.get()));
+
+    return true;
+}
+
+bool SimPlayerManager::resolveNearestTicketCollector(Zone* zone,
+        const Vector3& nearWorld, Vector3& outWorld, Vector3& outLocal,
+        ManagedReference<CellObject*>& outCell, uint64& outOid) {
+    if (zone == nullptr || ticketCollectorTestForceNoCollector)
+        return false;
+
+    SortedVector<TreeEntry*> closeObjects;
+    zone->getInRangeObjects(nearWorld.getX(), 0, nearWorld.getY(), 256,
+        &closeObjects, true, true);
+
+    ManagedReference<TangibleObject*> best;
+    float bestDistSq = 0.f;
+
+    for (int i = 0; i < closeObjects.size(); ++i) {
+        SceneObject* so = static_cast<SceneObject*>(closeObjects.get(i));
+        if (so == nullptr)
+            continue;
+
+        TangibleObject* tano = so->asTangibleObject();
+        if (tano == nullptr || !tano->isTicketCollector())
+            continue;
+
+        Vector3 wp = tano->getWorldPosition();
+        float dx = wp.getX() - nearWorld.getX();
+        float dy = wp.getY() - nearWorld.getY();
+        float distSq = (dx * dx) + (dy * dy);
+
+        if (best == nullptr || distSq < bestDistSq) {
+            best = tano;
+            bestDistSq = distSq;
+        }
+    }
+
+    if (best == nullptr)
+        return false;
+
+    Locker collectorLock(best);
+    outOid = best->getObjectID();
+    outWorld = best->getWorldPosition();
+    ManagedReference<SceneObject*> parent = best->getParent().get();
+    outCell = (parent != nullptr && parent->isCellObject()) ?
+        parent.castTo<CellObject*>() : nullptr;
+    outLocal = outCell != nullptr ? best->getPosition() : outWorld;
+
+    ManagedReference<SceneObject*> root = best->getRootParent();
+    CellNavDiagLog::write("TICKET_COLLECTOR_RESOLVED oid=" +
+        String::valueOf(outOid) + " rootParent=" +
+        String::valueOf(root == nullptr ? 0ULL : root->getObjectID()) + " " +
+        CellNavDiagLog::fmtPos(outWorld, outLocal, outCell.get()) +
+        " nearDist=" + String::valueOf(Math::sqrt(bestDistSq)));
+
+    return true;
+}
+
+void SimPlayerManager::scheduleCellNavDiagnosticRetry() {
+    if (cellNavDiagRetryScheduled || cellNavDiagResolveAttempts >= 10)
+        return;
+
+    cellNavDiagRetryScheduled = true;
+    Reference<CellNavDiagRetryTask*> task = new CellNavDiagRetryTask();
+    task->schedule(3000);
+}
+
+void SimPlayerManager::runCellNavDiagnosticRetry() {
+    cellNavDiagRetryScheduled = false;
+
+    uint64 diagBotOid = cellNavDiagBotOid.get();
+    if (!enabled || !cellNavDiagConfig.enabled || diagBotOid == 0)
+        return;
+
+    cellNavDiagResolveAttempts++;
+
+    Reference<SimPlayerController*> controller =
+        controllers.contains(diagBotOid) ?
+            controllers.get(diagBotOid) : nullptr;
+    SimCellNavDiagController* diagnosticController = controller == nullptr ?
+        nullptr : dynamic_cast<SimCellNavDiagController*>(controller.get());
+
+    if (diagnosticController == nullptr) {
+        CellNavDiagLog::write("CELLNAV_RESOLVE_FAILED attempt=" +
+            String::valueOf(cellNavDiagResolveAttempts) +
+            " reason=controller_missing");
+        return;
+    }
+
+    Vector3 worldPos;
+    Vector3 localPos;
+    ManagedReference<CellObject*> cell;
+    if (resolveCellNavDiagnosticRoute(worldPos, localPos, cell)) {
+        ZoneServer* zoneServer = ServerCore::getZoneServer();
+        Zone* zone = zoneServer == nullptr ? nullptr :
+            zoneServer->getZone(cellNavDiagConfig.planet);
+        if (zone == nullptr)
+            return;
+        diagnosticController->setDiagnosticRoute(worldPos, localPos,
+            cell.get());
+        float exitZ = zone->getHeight(cellNavDiagConfig.exitX,
+            cellNavDiagConfig.exitY);
+        diagnosticController->setDiagnosticExit(Vector3(
+            cellNavDiagConfig.exitX, cellNavDiagConfig.exitY, exitZ));
+        CellNavDiagLog::write("CELLNAV_RESOLVE_RETRY_SUCCESS attempt=" +
+            String::valueOf(cellNavDiagResolveAttempts) + " doorway=(" +
+            String::valueOf(cellNavDiagConfig.doorwayX) + "," +
+            String::valueOf(cellNavDiagConfig.doorwayY) + ")");
+        diagnosticController->startSimLoop();
+        return;
+    }
+
+    if (cellNavDiagResolveAttempts >= 10) {
+        CellNavDiagLog::write("CELLNAV_RESOLVE_FAILED attempt=" +
+            String::valueOf(cellNavDiagResolveAttempts) +
+            " reason=cell_unresolved");
+        return;
+    }
+
+    CellNavDiagLog::write("CELLNAV_RESOLVE_RETRY_DEFER attempt=" +
+        String::valueOf(cellNavDiagResolveAttempts) + " nextMs=3000");
+    scheduleCellNavDiagnosticRetry();
+}
+
+void SimPlayerManager::spawnCellNavDiagnosticBot() {
+    if (!enabled || !cellNavDiagConfig.enabled || cellNavDiagBotOid.get() != 0)
+        return;
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    Zone* zone = zoneServer == nullptr ? nullptr :
+        zoneServer->getZone(cellNavDiagConfig.planet);
+    if (zone == nullptr) {
+        CellNavDiagLog::write("CELLNAV_RESOLVE_FAILED reason=no_spawn_zone");
+        return;
+    }
+
+    CreatureManager* creatureManager = zone->getCreatureManager();
+    if (creatureManager == nullptr) {
+        CellNavDiagLog::write("CELLNAV_RESOLVE_FAILED reason=no_creature_manager");
+        return;
+    }
+
+    float spawnZ = zone->getHeight(cellNavDiagConfig.spawnX,
+        cellNavDiagConfig.spawnY);
+    if (spawnZ == 0.f && cellNavDiagConfig.spawnZ != 0.f)
+        spawnZ = cellNavDiagConfig.spawnZ;
+
+    CreatureObject* creature = creatureManager->spawnCreature(
+        String("artisan").hashCode(), 0, cellNavDiagConfig.spawnX, spawnZ,
+        cellNavDiagConfig.spawnY, 0);
+    if (creature == nullptr) {
+        CellNavDiagLog::write("CELLNAV_RESOLVE_FAILED reason=spawn_failed");
+        return;
+    }
+
+    AiAgent* agent = creature->asAiAgent();
+    if (agent == nullptr) {
+        CellNavDiagLog::write("CELLNAV_RESOLVE_FAILED reason=spawn_not_ai_agent");
+        return;
+    }
+
+    agent->setCreatureBitmask(0);
+    agent->setDespawnOnNoPlayerInRange(false);
+    agent->writeBlackboard("simAlwaysActive", true);
+    agent->setSimAlwaysActive(true);
+    agent->setSimPlayerBot(true);
+    agent->setDespawnOnNoPlayerInRange(false);
+
+    uint64 oid = agent->getObjectID();
+    cellNavDiagBotOid = oid;
+
+    applySimNpcPresentation(agent, 0);
+    agent->setCustomAiMap(String("simMiner").hashCode());
+    agent->setAITemplate();
+
+    Reference<SimPlayerController*> controller =
+        new SimCellNavDiagController(agent);
+    controllers.put(oid, controller);
+    agent->activateAiBehavior(true);
+
+    CellNavDiagLog::write("CELLNAV_BOT_SPAWNED oid=" + String::valueOf(oid) +
+        " planet=" + cellNavDiagConfig.planet + " spawn=(" +
+        String::valueOf(cellNavDiagConfig.spawnX) + "," +
+        String::valueOf(cellNavDiagConfig.spawnY) + "," +
+        String::valueOf(spawnZ) + ") target=(" +
+        String::valueOf(cellNavDiagConfig.targetX) + "," +
+        String::valueOf(cellNavDiagConfig.targetY) + "," +
+        String::valueOf(cellNavDiagConfig.targetZ) + ")");
+
+    SimCellNavDiagController* diagnosticController =
+        dynamic_cast<SimCellNavDiagController*>(controller.get());
+    if (diagnosticController == nullptr) {
+        CellNavDiagLog::write("CELLNAV_RESOLVE_FAILED reason=controller_cast");
+        return;
+    }
+
+    Vector3 worldPos;
+    Vector3 localPos;
+    ManagedReference<CellObject*> cell;
+    if (resolveCellNavDiagnosticRoute(worldPos, localPos, cell)) {
+        diagnosticController->setDiagnosticRoute(worldPos, localPos,
+            cell.get());
+        // RESEARCH: locate the starport's ticket collector near the interior
+        // target and, if found, make the exit leg target IT (the enclosed-hollow
+        // collector) so we observe whether the bot can reach it from inside.
+        Vector3 collectorWorld, collectorLocal;
+        ManagedReference<CellObject*> collectorCell;
+        uint64 collectorOid = 0;
+        Vector3 targetWorld(cellNavDiagConfig.targetX, cellNavDiagConfig.targetY,
+            cellNavDiagConfig.targetZ);
+        if (resolveNearestTicketCollector(zone, targetWorld, collectorWorld,
+                collectorLocal, collectorCell, collectorOid)) {
+            diagnosticController->setDiagnosticExit(collectorWorld);
+            // Leg 3: after reaching the hollow collector, route back OUT to the
+            // outside world (the spawn/front) — the arrival/landing transition.
+            float returnZ = zone->getHeight(cellNavDiagConfig.spawnX,
+                cellNavDiagConfig.spawnY);
+            diagnosticController->setDiagnosticReturn(Vector3(
+                cellNavDiagConfig.spawnX, cellNavDiagConfig.spawnY,
+                returnZ == 0.f ? cellNavDiagConfig.spawnZ : returnZ));
+        } else {
+            float exitZ = zone->getHeight(cellNavDiagConfig.exitX,
+                cellNavDiagConfig.exitY);
+            diagnosticController->setDiagnosticExit(Vector3(
+                cellNavDiagConfig.exitX, cellNavDiagConfig.exitY, exitZ));
+        }
+        CellNavDiagLog::write("CELLNAV_ROUTE_READY doorway=(" +
+            String::valueOf(cellNavDiagConfig.doorwayX) + "," +
+            String::valueOf(cellNavDiagConfig.doorwayY) + ")");
+        diagnosticController->startSimLoop();
+        return;
+    }
+
+    cellNavDiagResolveAttempts = 0;
+    CellNavDiagLog::write("CELLNAV_RESOLVE_RETRY_START attempts=10 intervalMs=3000");
+    scheduleCellNavDiagnosticRetry();
+}
+
 bool SimPlayerManager::isNearestShuttleBoardable(CreatureObject* creature) {
     if (creature == nullptr)
         return false;
@@ -27702,7 +28480,8 @@ bool SimPlayerManager::onPvpSquadDepartureIntent(uint64 squadId,
 	// would be swallowed by the global announce gap. planPvpRoute stamps the
 	// route text on the squad; onPvpSquadReadyToTravel speaks it at the pad,
 	// during the shuttle wait, where players can still act on it.
-	if (pvpRoutedTravelEnabled && snapshot.pendingRoute.size() == 0) {
+	if (pvpRoutedTravelEnabled && snapshot.pendingRoute.size() == 0 &&
+			System::getMiliTime() >= snapshot.routedTravelSuppressUntilMs) {
 		String routeSummary;
 		bool convergence = false;
 
@@ -27739,6 +28518,7 @@ bool SimPlayerManager::onPvpSquadDepartureIntent(uint64 squadId,
 	target.localPos = leg.departureLocalPos;
 	target.cellOid = leg.departureCellOid;
 	target.isCollector = leg.departureIsCollector;
+	target.interplanetary = leg.interplanetary;
 
 	return true;
 }
@@ -27961,7 +28741,7 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
 
     // Resolve collectors outside pvpSquadMutex. The resolver caches immutable
     // world/local coordinates, so subsequent route plans do no world scan.
-    if (pvpUseCollectorBoarding) {
+    if (pvpUseCollectorBoarding && !ticketCollectorTravelEnabled) {
         for (int i = 0; i < cityCount; ++i) {
             const ShuttleportLocation& loc = allShuttleports.get(i);
 
@@ -28249,7 +29029,27 @@ bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
             cityLocations.get(prevIdx).shuttlePad;
         leg.departureLocalPos = leg.departurePos;
 
-        if (leg.interplanetary && pvpUseCollectorBoarding &&
+        if (leg.interplanetary && ticketCollectorTravelEnabled) {
+            // Mark every gated cross-planet departure as a collector approach,
+            // including a resolver miss. The controller then owns the bounded
+            // no-collector fallback/cancel path instead of silently reverting
+            // to the legacy pad walk.
+            leg.departureIsCollector = true;
+            Zone* departureZone = zoneServer->getZone(departureLoc.planet);
+            Vector3 collectorWorld;
+            Vector3 collectorLocal;
+            ManagedReference<CellObject*> collectorCell;
+            uint64 collectorOid = 0;
+            if (resolveNearestTicketCollector(departureZone,
+                    pads.get(prevIdx), collectorWorld, collectorLocal,
+                    collectorCell, collectorOid)) {
+                leg.departurePos = collectorWorld;
+                leg.departureLocalPos = collectorLocal;
+                leg.departureCellOid = collectorCell == nullptr ? 0 :
+                    collectorCell->getObjectID();
+                leg.departureIsCollector = true;
+            }
+        } else if (leg.interplanetary && pvpUseCollectorBoarding &&
                 !departureLoc.starportPoint.isEmpty()) {
             String cacheKey = departureLoc.starportPoint;
             if (pvpBoardingPointCache.contains(cacheKey)) {
@@ -28499,6 +29299,7 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
     bool routedLegActive = false;
     bool routedTransit = false;
     int routedLegsRemaining = 0;
+    bool arrivalNeedsCollectorExit = false;
 
     if (pvpRoutedTravelEnabled) {
         PvpTravelLeg leg;
@@ -28539,6 +29340,8 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
             // Final leg: loiter at the destination city's resolved hangout;
             // transit stop: wait at the pad for the connecting ship.
             routedTransit = !leg.finalLeg;
+			arrivalNeedsCollectorExit = ticketCollectorTravelEnabled &&
+				leg.interplanetary;
 
             routedLegActive = true;
             picked = true;
@@ -28663,6 +29466,18 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
 
     Vector3 spawnPos(dest.spawn.getX(), dest.spawn.getY(), spawnZ);
     Vector3 hangoutPos(dest.hangout.getX(), dest.hangout.getY(), hangoutZ);
+    Vector3 landingPos = spawnPos;
+    bool destinationCollectorFound = false;
+
+    if (arrivalNeedsCollectorExit) {
+        Vector3 collectorLocal;
+        ManagedReference<CellObject*> collectorCell;
+        uint64 collectorOid = 0;
+        if (resolveNearestTicketCollector(destZone, spawnPos, landingPos,
+                collectorLocal, collectorCell, collectorOid)) {
+            destinationCollectorFound = true;
+        }
+    }
 
     Reference<SimPlayerController*> ctrl;
     if (controllers.contains(snapshot.leaderOid))
@@ -28708,11 +29523,11 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
         // "Board the shuttle": switchZone params are (terrain, X, Z=height,
         // Y=north, parentID=0 outdoor) - the same safe reposition as P.4.5;
         // the outdoor arrival never enters the un-navmeshed port interior.
-        leaderAgent->switchZone(dest.planet,
-            spawnPos.getX() + pvpSpawnJitter(), spawnPos.getZ(),
-            spawnPos.getY() + pvpSpawnJitter(), 0);
-        leaderAgent->setHomeLocation(spawnPos.getX(), spawnPos.getZ(),
-            spawnPos.getY(), nullptr);
+		leaderAgent->switchZone(dest.planet,
+			landingPos.getX() + pvpSpawnJitter(), landingPos.getZ(),
+			landingPos.getY() + pvpSpawnJitter(), 0);
+		leaderAgent->setHomeLocation(landingPos.getX(), landingPos.getZ(),
+			landingPos.getY(), nullptr);
     }
 
     // Board the (alive) members.
@@ -28749,11 +29564,11 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
             memberAgent->clearPatrolPoints();
             memberAgent->clearSavedPatrolPoints();
             memberAgent->clearCurrentPath();
-            memberAgent->switchZone(dest.planet,
-                spawnPos.getX() + pvpSpawnJitter(), spawnPos.getZ(),
-                spawnPos.getY() + pvpSpawnJitter(), 0);
-            memberAgent->setHomeLocation(spawnPos.getX(), spawnPos.getZ(),
-                spawnPos.getY(), nullptr);
+			memberAgent->switchZone(dest.planet,
+				landingPos.getX() + pvpSpawnJitter(), landingPos.getZ(),
+				landingPos.getY() + pvpSpawnJitter(), 0);
+			memberAgent->setHomeLocation(landingPos.getX(), landingPos.getZ(),
+				landingPos.getY(), nullptr);
         }
 
         aliveMemberOids.add(memberOid);
@@ -28767,6 +29582,13 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
 
     Vector<uint64> newMemberOids;
     Vector<Reference<SimPvPMemberController*> > newMemberCtrls;
+	int arrivalExitDwellSeconds = 0;
+	if (arrivalNeedsCollectorExit && routedTransit) {
+		arrivalExitDwellSeconds = pvpTravelTransitDwellMinSeconds;
+		if (pvpTravelTransitDwellMaxSeconds > arrivalExitDwellSeconds)
+			arrivalExitDwellSeconds += System::random(
+				pvpTravelTransitDwellMaxSeconds - arrivalExitDwellSeconds);
+	}
 
     for (int k = 0; k < replacements; ++k) {
         int j = boardedMembers + k + 1;
@@ -28821,6 +29643,16 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
             squad.recentDeathCount = 0;
             squad.recentDeathWindowStartMs = squad.lastTravelMs;
             squad.breakOffPending = false;
+            squad.arrivalExitActive = arrivalNeedsCollectorExit &&
+                destinationCollectorFound;
+            squad.arrivalExitPending.removeAll();
+            if (squad.arrivalExitActive) {
+                squad.arrivalExitPending.add(squad.leaderOid);
+                for (int m = 0; m < aliveMemberOids.size(); ++m)
+                    squad.arrivalExitPending.add(aliveMemberOids.get(m));
+            }
+            squad.arrivalExitTransit = routedTransit;
+            squad.arrivalExitDwellSeconds = arrivalExitDwellSeconds;
             pvpTravelsTotal++;
         }
     }
@@ -28837,17 +29669,33 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
         memberCtrl->startSimLoop();
     }
 
-    if (routedTransit) {
+	if (arrivalNeedsCollectorExit && destinationCollectorFound) {
+		// The board landed every existing bot at the destination collector
+		// hollow. Each controller now re-enters a cell and runs the normal
+		// egress leg; the manager starts the next city phase from the completion
+		// callback only after all existing members are outside.
+		leaderCtrl->beginArrivalExit(spawnPos);
+		for (int i = 0; i < aliveMemberOids.size(); ++i) {
+			Reference<SimPlayerController*> memberRef;
+			if (controllers.contains(aliveMemberOids.get(i)))
+				memberRef = controllers.get(aliveMemberOids.get(i));
+			SimPvPMemberController* memberCtrl = memberRef == nullptr ? nullptr :
+				dynamic_cast<SimPvPMemberController*>(memberRef.get());
+			if (memberCtrl != nullptr)
+				memberCtrl->beginArrivalExit(spawnPos);
+		}
+	} else if (routedTransit) {
         // P.6.5a transit stop: brief dwell at the connection pad, then the
         // phase machine re-enters AWAITING_SHUTTLE and boards the next leg.
-        int dwellSeconds = pvpTravelTransitDwellMinSeconds;
-
-        if (pvpTravelTransitDwellMaxSeconds > dwellSeconds)
-            dwellSeconds += System::random(
-                pvpTravelTransitDwellMaxSeconds - dwellSeconds);
-
-        leaderCtrl->beginTransitStop(dest.planet, dest.name, spawnPos,
-            dwellSeconds);
+		int dwellSeconds = arrivalExitDwellSeconds;
+		if (!arrivalNeedsCollectorExit) {
+			dwellSeconds = pvpTravelTransitDwellMinSeconds;
+			if (pvpTravelTransitDwellMaxSeconds > dwellSeconds)
+				dwellSeconds += System::random(
+					pvpTravelTransitDwellMaxSeconds - dwellSeconds);
+		}
+		leaderCtrl->beginTransitStop(dest.planet, dest.name, spawnPos,
+			dwellSeconds);
     } else {
         leaderCtrl->beginCityLoop(dest.planet, dest.name, spawnPos, hangoutPos);
     }
@@ -28867,7 +29715,7 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
             memberCtrl->assertFollow();
     }
 
-    info("SimPvpSquadTraveled squad=" + String::valueOf(squadId) +
+	info("SimPvpSquadTraveled squad=" + String::valueOf(squadId) +
          " faction=" + (snapshot.imperial ? String("imperial") : String("rebel")) +
          " from=" + snapshot.planet + ":" + snapshot.city +
          " to=" + dest.planet + ":" + dest.name +
@@ -28876,12 +29724,119 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
          " convergence=" + String::valueOf(convergence) +
          " routed=" + String::valueOf(routedLegActive) +
          " transit=" + String::valueOf(routedTransit) +
-         " legsRemaining=" + String::valueOf(routedLegsRemaining), true);
+	     " legsRemaining=" + String::valueOf(routedLegsRemaining), true);
+}
+
+void SimPlayerManager::abandonPvpRoutedTravel(uint64 squadId) {
+	// Terminal recovery for a departure that cannot reach the collector with
+	// fallback-from-near disabled: drop the squad's pending routed legs so the next
+	// departure intent falls back to the simple city shuttle instead of reselecting
+	// the same failed collector leg forever.
+	Locker squadLock(&pvpSquadMutex);
+	int idx = findPvpSquadIndex(squadId);
+	if (idx < 0)
+		return;
+
+	SimPvpSquad& squad = pvpSquads.get(idx);
+	squad.pendingRoute.removeAll();
+	squad.pendingRouteAnnounce = "";
+	squad.routeDestPlanet = "";
+	squad.routeDestCity = "";
+	// Suppress routed re-planning for a window so the immediate loiter->depart
+	// intent falls back to the simple city shuttle instead of replanning the same
+	// unreachable collector leg; the squad may attempt routed travel again later.
+	squad.routedTravelSuppressUntilMs = System::getMiliTime() + 300000;
+}
+
+void SimPlayerManager::onPvpArrivalExitComplete(uint64 squadId, uint64 oid) {
+	String destinationPlanet;
+	String destinationCity;
+	Vector3 destinationShuttle;
+	Vector3 destinationHangout;
+	bool transit = false;
+	int dwellSeconds = 0;
+	uint64 leaderOid = 0;
+	Vector<uint64> memberOids;
+	bool startNextPhase = false;
+
+	{
+		Locker squadLock(&pvpSquadMutex);
+		int idx = findPvpSquadIndex(squadId);
+		if (idx < 0)
+			return;
+
+		SimPvpSquad& squad = pvpSquads.get(idx);
+		if (!squad.arrivalExitActive)
+			return;
+
+		// Remove this participant exactly once (idempotent: a stale/duplicate
+		// call for an already-removed OID is a no-op).
+		for (int i = 0; i < squad.arrivalExitPending.size(); ++i) {
+			if (squad.arrivalExitPending.get(i) == oid) {
+				squad.arrivalExitPending.remove(i);
+				break;
+			}
+		}
+
+		if (!squad.arrivalExitPending.isEmpty())
+			return;
+
+		squad.arrivalExitActive = false;
+		destinationPlanet = squad.planet;
+		destinationCity = squad.city;
+		destinationShuttle = squad.shuttlePos;
+		destinationHangout = squad.hangoutPos;
+		transit = squad.arrivalExitTransit;
+		dwellSeconds = squad.arrivalExitDwellSeconds;
+		leaderOid = squad.leaderOid;
+		memberOids = squad.memberOids;
+		squad.arrivalExitTransit = false;
+		squad.arrivalExitDwellSeconds = 0;
+		startNextPhase = true;
+	}
+
+	if (!startNextPhase)
+		return;
+
+	Reference<SimPlayerController*> leaderRef;
+	if (controllers.contains(leaderOid))
+		leaderRef = controllers.get(leaderOid);
+	SimPvPController* leaderCtrl = leaderRef == nullptr ? nullptr :
+		dynamic_cast<SimPvPController*>(leaderRef.get());
+	if (leaderCtrl != nullptr) {
+		if (transit)
+			leaderCtrl->beginTransitStop(destinationPlanet, destinationCity,
+				destinationShuttle, dwellSeconds);
+		else
+			leaderCtrl->beginCityLoop(destinationPlanet, destinationCity,
+				destinationShuttle, destinationHangout);
+	}
+
+	for (int i = 0; i < memberOids.size(); ++i) {
+		Reference<SimPlayerController*> memberRef;
+		if (controllers.contains(memberOids.get(i)))
+			memberRef = controllers.get(memberOids.get(i));
+		SimPvPMemberController* memberCtrl = memberRef == nullptr ? nullptr :
+			dynamic_cast<SimPvPMemberController*>(memberRef.get());
+		if (memberCtrl != nullptr)
+			memberCtrl->assertFollow();
+	}
+
+	info("SimPvpArrivalExitComplete squad=" + String::valueOf(squadId) +
+		" completedBy=" + String::valueOf(oid) +
+		" transit=" + String::valueOf(transit), true);
+}
+
+bool SimPlayerManager::isPvpArrivalExitComplete(uint64 squadId) {
+	Locker squadLock(&pvpSquadMutex);
+	int idx = findPvpSquadIndex(squadId);
+	return idx < 0 || !pvpSquads.get(idx).arrivalExitActive;
 }
 
 void SimPlayerManager::onPvpBotDied(uint64 squadId, uint64 oid) {
     bool wasLeader = false;
     bool countedDeath = false;
+    bool arrivalExitActive = false;
 
     {
         Locker squadLock(&pvpSquadMutex);
@@ -28889,6 +29844,7 @@ void SimPlayerManager::onPvpBotDied(uint64 squadId, uint64 oid) {
 
         if (idx >= 0) {
             SimPvpSquad& squad = pvpSquads.get(idx);
+            arrivalExitActive = squad.arrivalExitActive;
 
             if (squad.leaderOid == oid) {
                 wasLeader = true;
@@ -28914,6 +29870,12 @@ void SimPlayerManager::onPvpBotDied(uint64 squadId, uint64 oid) {
             }
         }
     }
+
+    // Drop the dead bot from the arrival barrier exactly once (idempotent) and
+    // finalize if it was the last pending participant. onPvpArrivalExitComplete
+    // is a no-op when there is no active arrival exit or the OID is already gone.
+    if (arrivalExitActive)
+        onPvpArrivalExitComplete(squadId, oid);
 
     checkPvpBreakOff(squadId, wasLeader, countedDeath);
     schedulePvpBotCleanup(oid, pvpCorpseCleanupDelaySeconds);
@@ -30481,6 +31443,8 @@ void SimPlayerManager::runPvpMaintenanceTask() {
             uint64 newLeaderOid = 0;
             ManagedReference<AiAgent*> newLeaderAgent;
             Reference<SimPlayerController*> newLeaderOldCtrl;
+            bool arrivalExitActive = squad.arrivalExitActive;
+            Vector3 arrivalExitOutdoor = squad.shuttlePos;
 
             for (int i = 0; i < squad.memberOids.size(); ++i) {
                 uint64 candidateOid = squad.memberOids.get(i);
@@ -30570,7 +31534,13 @@ void SimPlayerManager::runPvpMaintenanceTask() {
                 }
             }
 
-            if (breakOffPending) {
+            if (arrivalExitActive) {
+                // The promoted member was already one of the bots counted in
+                // the destination-hollow exit barrier. Recreate the leader
+                // controller without releasing the squad into its city loop;
+                // the new leader must complete its own re-enter/egress leg.
+                newLeaderCtrl->beginArrivalExit(arrivalExitOutdoor);
+            } else if (breakOffPending) {
                 // The threshold death killed the former leader, so the death
                 // hook deliberately stayed silent. Announce through this
                 // freshly promoted alive leader and preserve the latched
@@ -30741,7 +31711,9 @@ void SimPlayerManager::runPvpMaintenanceTask() {
         int leaderPhase = leaderCtrl->getPvpPhase();
         bool movementPhase =
             leaderPhase == SimPvPController::PVP_TO_HANGOUT ||
-            leaderPhase == SimPvPController::PVP_TO_SHUTTLE;
+            leaderPhase == SimPvPController::PVP_TO_SHUTTLE ||
+            leaderPhase == SimPvPController::PVP_ARRIVAL_REENTER ||
+            leaderPhase == SimPvPController::PVP_ARRIVAL_EGRESS;
 
         // P.6.1a rescue: a moveTo whose path request silently never resolved
         // (neither onPathFound nor onPathFailed) leaves the controller parked

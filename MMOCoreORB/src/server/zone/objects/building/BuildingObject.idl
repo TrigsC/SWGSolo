@@ -188,6 +188,17 @@ class BuildingObject extends StructureObject {
 	public native Vector3 getEjectionPoint();
 
 	/**
+	 * Returns the exterior portal (doorway) world point nearest to fromWorld, so a
+	 * caller can leave the building via the closest door rather than a single
+	 * template ejection point. Returns the (0,0) sentinel if there is no readable
+	 * portal layout / exterior portal.
+	 */
+	@local
+	@dereferenced
+	@dirty
+	public native Vector3 getNearestExteriorPortalPoint(@dereferenced final Vector3 fromWorld);
+
+	/**
 	 * Ejects an object to this building's ejection point.
 	 * @param creature The creature to eject.
 	 */

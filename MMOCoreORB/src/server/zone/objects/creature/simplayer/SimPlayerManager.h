@@ -14,6 +14,7 @@
 #include "system/util/Vector.h"
 #include "system/util/VectorMap.h"
 #include "system/thread/Mutex.h"
+#include "system/thread/atomic/AtomicLong.h"
 #include "engine/util/u3d/Vector3.h"
 #include "engine/util/JSONSerializationType.h"
 #include "engine/lua/Lua.h"
@@ -40,6 +41,8 @@ class AiEconomyConceptualTotalsPersistenceTask;
 class MinerIntelligentTargetingTask;
 class MinerRecoveryTask;
 class SimPlayerConfiguredSpawnTask;
+class CellNavDiagRetryTask;
+class CellNavDiagSpawnTask;
 class HiveCrafterConsumerTask;
 class SimHunterController;
 
@@ -653,6 +656,8 @@ private:
 	friend class AiEconomyConceptualTotalsPersistenceTask;
 	friend class MinerIntelligentTargetingTask;
 	friend class SimPlayerConfiguredSpawnTask;
+	friend class CellNavDiagRetryTask;
+	friend class CellNavDiagSpawnTask;
 
 	// Map of Creature ObjectID -> Controller
 	SynchronizedVectorMap<uint64, Reference<SimPlayerController*> > controllers;
@@ -679,6 +684,28 @@ private:
     Lua* lua;
 
 public:
+	enum StarportInteriorWaypointResult {
+		STARPORT_WAYPOINT_FOUND = 0,
+		STARPORT_NO_INTERIOR = 1,
+		STARPORT_RESOLVE_FAILED = 2
+	};
+
+	struct CellNavDiagConfig {
+		bool enabled = false;
+		String planet = "tatooine";
+		float spawnX = 3395.f;
+		float spawnY = -4775.f;
+		float spawnZ = 5.f;
+		float targetX = 3385.f;
+		float targetY = -4811.f;
+		float targetZ = 0.f;
+		float doorwayX = 3383.f;
+		float doorwayY = -4800.f;
+		float exitX = 5000.f;
+		float exitY = -5500.f;
+		bool logEverySimLoopTick = true;
+	};
+
 	struct ShuttleportLocation {
 		String planet;
 		String name;
@@ -743,6 +770,7 @@ public:
 		Vector3 localPos;
 		uint64 cellOid = 0;
 		bool isCollector = false;
+		bool interplanetary = false;
 
 		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -823,6 +851,20 @@ public:
 		String convergePlanet;          // pending convergence destination
 		String convergeCity;
 		uint64 convergeExpiresAtMs = 0;
+		// F.0.4.11: each bot exits an interplanetary arrival hollow through its
+		// own cell route before the leader restarts the city loop.
+		bool arrivalExitActive = false;
+		// OIDs still expected to reach the outside. Each participant is removed
+		// exactly once (on exit-complete OR death); the barrier finalizes when the
+		// set empties. Idempotent + death-safe (a plain counter double-decrements
+		// and rejects completion at zero when the last participant dies).
+		Vector<uint64> arrivalExitPending;
+		// Recovery latch: after a terminal collector-departure abandonment, suppress
+		// routed re-planning until this time so the loiter->depart cycle falls back
+		// to the simple city shuttle instead of reselecting the same failed leg.
+		uint64 routedTravelSuppressUntilMs = 0;
+		bool arrivalExitTransit = false;
+		int arrivalExitDwellSeconds = 0;
 		uint64 lastAnnounceMs = 0;      // P.6.3a per-squad spatial announce cooldown
 		uint64 groupId = 0;             // P.6.3c GroupObject (0 = no players joined)
 		// P.6.5a routed travel: remaining legs of the planned journey (index 0
@@ -856,6 +898,12 @@ public:
 
 private:
 	bool enabled = false;
+	CellNavDiagConfig cellNavDiagConfig;
+	// Written once by the diagnostic spawn task, read on every SimPlayer's
+	// findNextPosition/controller tick via the logging gate — hence atomic.
+	AtomicLong cellNavDiagBotOid;
+	int cellNavDiagResolveAttempts = 0;
+	bool cellNavDiagRetryScheduled = false;
 	bool minerSummaryLoggingEnabled = false;
 	bool minerSummaryTaskScheduled = false;
 	int minerSummaryIntervalSeconds = 300;
@@ -963,6 +1011,18 @@ private:
 	int travelPlanetDispatchPerMinerCooldownSeconds = 900;
 	int travelPlanetDispatchPerPlanetCooldownSeconds = 300;
 	float travelPlanetDispatchBoardRadiusMeters = 20.f;
+	// F.0.4.11 ticket-collector travel. Default-off preserves the existing
+	// outdoor pad/arrival choreography byte-for-byte.
+	bool ticketCollectorTravelEnabled = false;
+	float ticketCollectorBoardRadiusMeters = 8.f;
+	int ticketCollectorApproachAttempts = 3;
+	int ticketCollectorApproachTtlSeconds = 60;
+	bool ticketCollectorFallbackToBoardFromNear = true;
+	bool ticketCollectorTestForceNoCollector = false;
+	// Horizontal slack on the starport-building AABB containment test so an
+	// enclosed-hollow collector baked ~10m outside the collision box still
+	// associates with its own starport (see resolveStarportInteriorWaypoint).
+	float ticketCollectorInteriorContainmentMarginMeters = 15.f;
 	bool minerPlanetDispatchTaskScheduled = false;
 	int planetDispatchCount = 0;
 	int travelBoardedCount = 0;
@@ -1588,6 +1648,11 @@ private:
 	bool isImperialForSpawn(const SpawnGroup& g, const String& templateName) const;
 
 	void spawnFromConfig(const SpawnGroup& g, const ShuttleportLocation& loc, const String& templateName);
+	void spawnCellNavDiagnosticBot();
+	bool resolveCellNavDiagnosticRoute(Vector3& worldPos, Vector3& localPos,
+		ManagedReference<CellObject*>& cell);
+	void scheduleCellNavDiagnosticRetry();
+	void runCellNavDiagnosticRetry();
 
 	// --- P.6.1 SimPvP squads (config, roster, travel, upkeep) ---------------
 	// All C++ defaults ship OFF; lua pvpConfig enables and tunes at runtime
@@ -1881,6 +1946,36 @@ private:
 public:
 	SimPlayerManager();
 
+	// F.0.4.11: shared travel resolvers. World scans happen without an agent
+	// lock; the resolver takes only short object snapshots and validates the
+	// cell target with the portal-aware path finder.
+	StarportInteriorWaypointResult resolveStarportInteriorWaypoint(
+		Zone* zone, const Vector3& starportNearWorld,
+		const Vector3& pathStartWorld, Vector3& outWorld,
+		Vector3& outLocal, ManagedReference<CellObject*>& outCell);
+	bool resolveNearestTicketCollector(Zone* zone, const Vector3& nearWorld,
+		Vector3& outWorld, Vector3& outLocal,
+		ManagedReference<CellObject*>& outCell, uint64& outOid);
+
+	bool isTicketCollectorTravelEnabled() const {
+		return enabled && ticketCollectorTravelEnabled;
+	}
+	float getTicketCollectorBoardRadiusMeters() const {
+		return ticketCollectorBoardRadiusMeters;
+	}
+	int getTicketCollectorApproachAttempts() const {
+		return ticketCollectorApproachAttempts;
+	}
+	int getTicketCollectorApproachTtlSeconds() const {
+		return ticketCollectorApproachTtlSeconds;
+	}
+	bool isTicketCollectorFallbackToBoardFromNear() const {
+		return ticketCollectorFallbackToBoardFromNear;
+	}
+	bool isTicketCollectorTestForceNoCollector() const {
+		return ticketCollectorTestForceNoCollector;
+	}
+
 	// P.4.2: read-only travel config accessors used by the static density-target
 	// search to skip resource pockets sitting over open water.
 	bool isTravelRejectWaterTargets() const { return travelRejectWaterTargets; }
@@ -1904,6 +1999,12 @@ public:
 	// Called by ZoneServer on startup
 	void initialize();
 	void runMinerRecoveryTask();
+	bool isCellNavDiagBot(uint64 oid) const {
+		return oid != 0 && oid == cellNavDiagBotOid.get();
+	}
+	bool getCellNavDiagLogEveryTick() const {
+		return cellNavDiagConfig.logEverySimLoopTick;
+	}
 
 	// The main logic to spawn a specific bot
 	void spawnSimPlayer(const String& planet, float x, float y, const String& templateName);
@@ -2064,6 +2165,10 @@ public:
 	void runPvpBotCleanupTask(uint64 oid);
 	// Called by SimPvPController when the leader is posted at the shuttleport.
 	void onPvpSquadReadyToTravel(uint64 squadId);
+	// Called by each leader/member after its own arrival hollow exit completes.
+	void onPvpArrivalExitComplete(uint64 squadId, uint64 oid);
+	void abandonPvpRoutedTravel(uint64 squadId);
+	bool isPvpArrivalExitComplete(uint64 squadId);
 	// Called by SimPvPController before entering PVP_TO_SHUTTLE. Plans the
 	// route early enough for the controller to run to the correct departure
 	// point, and returns both coordinate forms for that run.

@@ -118,7 +118,9 @@ public:
 		PVP_TO_HANGOUT,
 		PVP_LOITERING,
 		PVP_TO_SHUTTLE,
-		PVP_AWAITING_SHUTTLE
+		PVP_AWAITING_SHUTTLE,
+		PVP_ARRIVAL_REENTER,
+		PVP_ARRIVAL_EGRESS
 	};
 
 	SimPvPController(AiAgent* aiAgent, uint64 squad, bool isImperial);
@@ -136,6 +138,9 @@ public:
 	// with hangout == shuttle == the pad.
 	void beginTransitStop(const String& planetName, const String& cityName,
 		const Vector3& padPos, int dwellSeconds);
+	// F.0.4.11: exit the destination hollow before the manager restarts the
+	// city/transit loop. Every squad member performs the same operation.
+	void beginArrivalExit(const Vector3& outdoorArrival);
 
 	// SimPlayerController interface. startSimLoop() (re)drives the CURRENT
 	// phase, so the base path-fail retry task naturally resumes the loop.
@@ -182,6 +187,13 @@ private:
 	void finishLoitering();
 	void enterToShuttle(const String& reason);
 	void notifyReadyToTravel();
+	void beginCollectorDepartureApproach(const String& reason);
+	void finishArrivalExit();
+	// Terminal recovery when the arrival exit can't complete within bounded
+	// attempts: switchZone to the outdoor arrival (never stranded in the hollow)
+	// and drop from the squad arrival barrier so the squad can never wedge.
+	void abandonArrivalExit(const String& reason);
+	void cancelCollectorDeparture(const String& reason);
 	// P.6.1a: hard-stop the agent's engine-side movement (patrol queue, saved
 	// points, movement state). An interrupted leg (TTL force-advance, board)
 	// must never leave stale movement running - the engine's own movement
@@ -199,6 +211,19 @@ private:
 	Vector3 shuttleTargetLocalPosition;
 	uint64 shuttleTargetCellOid = 0;
 	bool shuttleTargetIsCollector = false;
+	bool shuttleTargetInterplanetary = false;
+	bool collectorDepartureActive = false;
+	bool collectorDepartureEntry = false;
+	Vector3 collectorWorld;
+	Vector3 collectorLocal;
+	ManagedReference<CellObject*> collectorCell;
+	uint64 collectorOid = 0;
+	int collectorApproachAttempts = 0;
+	uint64 collectorApproachStartedAtMs = 0;
+	bool arrivalExitActive = false;
+	Vector3 arrivalOutdoor;
+	int arrivalExitAttempts = 0;
+	bool arrivalExitReenter = false;
 	Vector3 hangoutLocation;
 	// Consecutive path failures for the current movement phase; bounded, then
 	// the phase is forced forward instead of retrying forever.
@@ -228,6 +253,9 @@ public:
 	// there is no dual-driver by construction.
 	void startSimLoop() override;
 	void onArrived() override;
+	void beginArrivalExit(const Vector3& outdoorArrival);
+	void abandonArrivalExit(const String& reason);
+	void onPathFailed() override;
 	void onTick() override;
 
 	// Point the member at (a possibly new) leader and put it back into
@@ -235,6 +263,12 @@ public:
 	// on leader promotion. Takes/releases its own locks.
 	void assertFollow();
 	void setLeader(AiAgent* leader);
+
+private:
+	bool arrivalExitActive = false;
+	Vector3 arrivalOutdoor;
+	int arrivalExitAttempts = 0;
+	bool arrivalExitReenter = false;
 
 	const char* getPvpRoleName() const override { return "pvp_member"; }
 	String getPvpPhaseName() const override { return "following"; }

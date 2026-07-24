@@ -293,6 +293,115 @@ Vector3 BuildingObjectImplementation::getEjectionPoint() {
 	return worldPosition;
 }
 
+// Computes the exterior world point just outside a single building portal, using
+// the same geometry->normal->floor+ejectDistance->transform->ground-snap math as
+// getEjectionPoint()'s fallback. Returns the (0,0) sentinel if the portal geometry
+// is unusable. `transform` is the caller-built building world transform.
+static Vector3 computeExteriorPortalWorldPoint(const PortalLayout* portalLayout,
+		const SharedBuildingObjectTemplate* templateData, const CellPortal* portal,
+		const Matrix4& transform, Zone* zone) {
+	if (portal == nullptr)
+		return Vector3(0, 0, 0);
+
+	const AABB& box = portalLayout->getPortalBounds(portal->getGeometryIndex());
+	const MeshData* geom = portalLayout->getPortalGeometry(portal->getGeometryIndex());
+
+	if (geom == nullptr)
+		return Vector3(0, 0, 0);
+
+	const Vector<MeshTriangle>& tris = *geom->getTriangles();
+	const Vector<Vector3>& verts = *geom->getVerts();
+	if (tris.size() == 0)
+		return Vector3(0, 0, 0);
+
+	const MeshTriangle& tri = tris.get(0);
+	const int* ind = tri.getVerts();
+	Vector3 normal;
+	Vector3 v[3] = { verts.get(ind[0]), verts.get(ind[1]), verts.get(ind[2]) };
+	if (!portal->isWindingCCW()) {
+		normal = (v[0] - v[1]).crossProduct(v[0] - v[2]);
+	} else {
+		normal = (v[0] - v[2]).crossProduct(v[0] - v[1]);
+	}
+	normal.normalize();
+
+	Vector3 floor = box.center() - Vector3(0, box.extents().getY(), 0);
+	floor += normal * templateData->getEjectDistance();
+
+	Vector3 flipped = transform * floor;
+
+	if (zone == nullptr)
+		return Vector3(flipped[0], flipped[2], flipped[1]);
+
+	return Vector3(flipped[0], flipped[2],
+		CollisionManager::getWorldFloorCollision(flipped[0], flipped[2], flipped[1],
+			zone, false));
+}
+
+Vector3 BuildingObjectImplementation::getNearestExteriorPortalPoint(
+		const Vector3& fromWorld) {
+	SharedObjectTemplate* shot = getObjectTemplate();
+
+	if (shot == nullptr || !shot->isSharedBuildingObjectTemplate())
+		return Vector3(0, 0, 0);
+
+	SharedBuildingObjectTemplate* templateData =
+		static_cast<SharedBuildingObjectTemplate*>(shot);
+	const PortalLayout* portalLayout = templateData->getPortalLayout();
+
+	if (portalLayout == nullptr)
+		return Vector3(0, 0, 0);
+
+	const Vector<Reference<CellProperty*> >& cells =
+		portalLayout->getCellProperties();
+	if (cells.size() == 0)
+		return Vector3(0, 0, 0);
+
+	const CellProperty* exterior = cells.get(0);
+
+	// Build the same world transform getEjectionPoint()'s fallback uses (including
+	// the deliberate partial transpose).
+	Matrix4 transform;
+	transform.setRotationMatrix(direction.toMatrix3());
+	transform.setTranslation(getPositionX(), getPositionZ(), getPositionY());
+
+	Matrix4 orig = transform;
+	transform[0][1] = orig[1][0];
+	transform[0][2] = orig[2][0];
+	transform[1][0] = orig[0][1];
+	transform[1][2] = orig[2][1];
+	transform[2][0] = orig[0][2];
+	transform[2][1] = orig[1][2];
+
+	Zone* zone = getZone();
+
+	bool found = false;
+	Vector3 best(0, 0, 0);
+	float bestDistSq = 0.f;
+
+	// Enumerate EVERY exterior portal (getPortal(i) — getEjectionPoint's fallback
+	// has a getPortal(0) bug) and pick the doorway nearest fromWorld.
+	for (int i = 0; i < exterior->getNumberOfPortals(); ++i) {
+		Vector3 point = computeExteriorPortalWorldPoint(portalLayout, templateData,
+			exterior->getPortal(i), transform, zone);
+
+		if (point.getX() == 0.f && point.getY() == 0.f)
+			continue;
+
+		float dx = point.getX() - fromWorld.getX();
+		float dy = point.getY() - fromWorld.getY();
+		float distSq = (dx * dx) + (dy * dy);
+
+		if (!found || distSq < bestDistSq) {
+			found = true;
+			bestDistSq = distSq;
+			best = point;
+		}
+	}
+
+	return found ? best : Vector3(0, 0, 0);
+}
+
 void BuildingObjectImplementation::notifyRemoveFromZone() {
 	for (int i = 0; i < cells.size(); ++i) {
 		auto& cell = cells.get(i);
