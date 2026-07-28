@@ -650,6 +650,36 @@ SimPlayerManagerConfig = {
         batchDelayMs = 1000,
     },
 
+    -- P.8.7 interplanetary/ticket-collector travel diagnostics -> bin/log/traveldiag.log.
+    -- Its OWN file so a wedged departure leg is greppable without zone spam.
+    -- Every line is key=value: t=<ms> ev=<EVENT> oid=<bodyOid> ...
+    -- Compiled in and dormant when false; no rebuild needed to flip.
+    travelDiag = {
+        -- Investigation complete (F_0.5.0 shipped); off in production. The
+        -- instrumentation stays compiled in and free when off; flip true to
+        -- re-capture a relocation stall (no rebuild needed).
+        logging = false,
+        -- Seconds between "still in this phase" heartbeats for a bot that is
+        -- travelling. This is the line that catches a STALL, since a stuck leg
+        -- emits no transitions at all.
+        heartbeatSeconds = 10,
+    },
+
+    -- P.8.7 destroy-mission BOARD diagnostics -> bin/log/missiondiag.log.
+    -- Offer generation rejects with bare `continue`/`return false` and the
+    -- abandon reason is then flattened to the generic "abandoned" that
+    -- completeOrder() writes from the TRAVEL_HOME epilogue, so a board that
+    -- produces zero offers looks identical to one that was never asked. These
+    -- lines name the exact gate that rejected.
+    -- Every line is key=value: t=<ms> ev=<EVENT> id=<identityId> ...
+    -- Compiled in and dormant when false; no rebuild needed to flip.
+    missionDiag = {
+        -- Investigation complete (F_0.5.0 shipped): the rejecting gate was the
+        -- empty-board all-or-nothing discard plus offer saturation, both fixed.
+        -- Off in production; compiled in and free, flip true to re-capture.
+        logging = false,
+    },
+
     -- Pass-1 POB cell-entry movement diagnostic. Disabled by default.
     cellNavDiag = {
         -- Spawns the one-shot diagnostic artisan test bot. OFF in production; flip
@@ -705,7 +735,14 @@ SimPlayerManagerConfig = {
             familyReserveTargets = { meat = 2500 },
             familyReserveCap = 5000,
             familyAllocationCeilingUnits = { meat = 0 },
-            familyAllocationCeilingFraction = { meat = 0.25 },
+            -- meat is the ONLY family hunters supply, so the anti-domination
+            -- 0.25 cap (meant for multi-family profiles) permanently starved the
+            -- dispatcher once accumulated meat crossed 25% of desiredReserve:
+            -- headroom hit 0 -> signalUnits 0 -> pressure 0 -> no hunt orders.
+            -- 1.0 lets meat fill its profile's true target (no re-saturation
+            -- until desiredReserve is actually met). Revisit if a second hunter
+            -- family or a meat consumer is added. (2026-07-28)
+            familyAllocationCeilingFraction = { meat = 1.0 },
             reservePressureFloor = 25,
             huntTimeEstimateSeconds = 600,
             baselineRetryBackoffMs = 5000,
@@ -767,6 +804,13 @@ SimPlayerManagerConfig = {
             doctorInteractionTimeoutMs = 45000,
             entertainerDwellMs = 4000,
             providerApproachRangeMeters = 8,
+            -- P.8.7 Phase 4: opt-in cross-planet real-buff hubs.
+            buffHubs = {
+                enabled = true,
+                hubs = { "corellia:coronet", "tatooine:mos_eisley", "naboo:theed" },
+                maxBuffTripsPerHunt = 1,
+                buffTripDeadlineSeconds = 1800,
+            },
             -- Keep these nine entries aligned with
             -- SimPlayerManager::getPveTrackedBuffCrcs: six medical buffs,
             -- dance mind, and music focus/willpower.
@@ -865,14 +909,65 @@ SimPlayerManagerConfig = {
             missionSpawnDistanceMeters = 200,
             terminalScanRadiusMeters = 600,
             maxSpawnPointTries = 32,
-            maxSimultaneousAdds = 1,
-            addsAbandonCycles = 3,
+            maxSimultaneousAdds = 3,
+            addsAbandonCycles = 8,
             terminalDwellSeconds = 5,
             terminalResolveWaitCycles = 10,
             lairTimeoutSeconds = 1800,
             maxActiveLairs = 6,
             navmeshModeDebounceTicks = 2,
             navmeshRepathTries = 3,
+        },
+        -- Phase 2 real destroy-mission board. This is deliberately opt-in;
+        -- the legacy terminal/lair contract remains the default path.
+        missionBoard = {
+            enabled = true,
+            acceptedTerminalTypes = {"general"},
+            maxHeldMissions = 2,
+            sameDirectionArcDegrees = 60,
+            baseDistanceMeters = 1000,
+            difficultyDistanceFactor = 0,
+            randomDistanceMeters = 1000,
+            difficultyRandomDistance = 0,
+            lairRevealRadiusMeters = 120,
+            lairEngageAfterFieldClear = true,
+            maxOfferAgeSeconds = 1800,
+            -- On reveal, if the advertised wilderness point is no longer
+            -- spawn-permitted (a no-build object appeared since the offer was
+            -- generated), relocate the lair to the nearest clear point around
+            -- the waypoint instead of abandoning the mission. false = legacy
+            -- strict behaviour (abandon + terminal round trip).
+            revealRelocateEnabled = true,
+            -- Terminal offer-generation retry. On a partial (1-of-2) or empty
+            -- board the hunter dwells offerRetrySeconds at the terminal and
+            -- re-generates, up to offerMaxAttempts times, before accepting a
+            -- single offer (or abandoning if still empty). Fixes the dominant
+            -- mission_offers_unavailable churn where a valid offer was discarded
+            -- by the old all-or-nothing 2-of-2 rule.
+            offerRetrySeconds = 25,
+            offerMaxAttempts = 3,
+        },
+        -- Phase 1 dispatch gate. The legacy home-planet/home-city rules stay
+        -- byte-for-byte active until this opt-in is enabled.
+        dispatch = {
+            locationBasedEligibility = true,
+            dispatchRadiusMeters = 2500,
+        },
+        -- P.8.7 Phase 3 market dispatch. Families are intentionally limited
+        -- to the three resource paths recordPveHunterHarvest understands.
+        marketDispatch = {
+            enabled = true,
+            families = { "meat", "hide", "bone" },
+            qualityWeights = {
+                meat = { OQ = 1.0 },
+                hide = { OQ = 0.6, SR = 0.4 },
+                bone = { OQ = 0.6, SR = 0.4 },
+            },
+            minQualityScore = 0,
+            maxConcurrentRelocations = 1,
+            minHuntersPerActivePlanet = 1,
+            relocationCooldownSeconds = 1800,
+            relocationMinDwellSeconds = 900,
         },
         -- Each ground is a real SPAWNAREA from the planet region scripts;
         -- C++ validates the object, terrain/boundary, and P.4.1 guards once
@@ -1256,6 +1351,21 @@ SimPlayerManagerConfig = {
             -- Off-main destination: reachable ONLY via a naboo hop (fare
             -- matrix), so routes here exercise real multi-leg journeys.
             { name = "restuss", spawn = {5340.0, 5734.0, 80.0}, hangout = {5354.0, 5762.0, 80.0}, starport = "Restuss Starport", shuttlePoint = "Restuss Shuttleport" },
+        },
+        dantooine = {
+            { name = "mining_outpost", spawn = {-637.0, 2504.4, 3.0}, hangout = {-637.0, 2504.4, 3.0}, starport = "Dantooine Mining Outpost", routingOnly = true },
+        },
+        lok = {
+            { name = "nym_stronghold", spawn = {478.9, 5512.0, 9.0}, hangout = {478.9, 5512.0, 9.0}, starport = "Nym's Stronghold", routingOnly = true },
+        },
+        dathomir = {
+            { name = "trade_outpost", spawn = {618.9, 3092.0, 6.0}, hangout = {618.9, 3092.0, 6.0}, starport = "Trade Outpost", routingOnly = true },
+        },
+        endor = {
+            { name = "smuggler_outpost", spawn = {-950.6, 1553.4, 73.0}, hangout = {-950.6, 1553.4, 73.0}, starport = "Smuggler Outpost", routingOnly = true },
+        },
+        talus = {
+            { name = "dearic", spawn = {263.6, -2952.1, 6.0}, hangout = {263.6, -2952.1, 6.0}, starport = "Dearic Starport", routingOnly = true },
         },
     },
 

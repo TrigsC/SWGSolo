@@ -15,6 +15,7 @@ untouched. This doc is the living plan; the P.8.1 implementation plan is
 - **P.8.3** — service professions (doctor/entertainer bots, real buffs).
 - **P.8.4** — player interaction depth (trade, chat).
 - **P.8.5** — miner identity migration + population scale.
+- **P.8.7** — market-driven mission boards, dispatch, and buff travel.
 
 ## Owner decisions
 
@@ -199,6 +200,11 @@ P.8.2 is independently gated by `pveConfig.missionHunt.enabled` (default
 `BUFF_UP → TRAVEL_OUT → AWAITING_WORLD → HUNTING` and no terminal or lair work
 is performed.
 
+The original P.8.2 quota-completion rule and hand-written species-targeting
+model are superseded when the P.8.7 mission-board gate is enabled. They remain
+the compatibility behavior of the legacy path only; a board hunt completes on
+lair destruction and selects wave mobs by lair ownership.
+
 When enabled, a hunter visits the nearest resolved mission terminal in its home
 city, dwells for the configured acceptance interval, and the manager creates a
 non-persistent real lair at a bounded, spawnability-checked wilderness point.
@@ -355,7 +361,7 @@ straight to the mission leg (the recycle is gone). One authoritative CRC source
 fallback stamps exactly the CRC the need check and the real buffs use.
 
 **Provider resolution.** `resolvePveBuffProviders` finds the Doctor/Musician/
-Dancer buffer NPCs near the hunter's home-city med center and cantina via
+Dancer buffer NPCs near the resolved provider city's med center and cantina via
 `getInRangeObjects` (locks released, `scanForTarget` discipline), keying on the
 role-specific custom name (Musician and Dancer share the `entertainer` template,
 so the name is the discriminator; template/performance state are validation).
@@ -415,3 +421,34 @@ show `medicalBuffed`/`entertainerBuffed` with `lastBuffSource=real-doctor`/
 `real-entertainer`; a fresh-buffed hunter skips the detour; a Bestine hunter uses
 `syntheticFallbacks`; an interrupted doctor session leaves processed medical pools
 fresh and unprocessed pools untouched; `hunterKillsTotal` keeps climbing.
+
+## P.8.7 — Market-driven mission hunting
+
+P.8.7 is simulation-only and is independently gated by the mission-board,
+market-dispatch, and real-buff-hub configuration switches. With those gates
+off, P.8.2 and P.8.6 retain their existing behavior.
+
+The mission board holds up to two ordered offers per hunter. Offers are
+generated from the real destroy-mission spawn groups and lair yields, filtered
+to a hunter's level window, and ranked by configured market family demand and
+yield quality. A hunter travels through the shared fare-matrix planner to the
+selected planet and resolves a general mission terminal there. Routing-only
+cities are graph nodes only: they can be crossed in transit but never become a
+mission destination.
+
+The board advertises a point and reveals one real lair at 120 m. The lair uses
+the engine mission observer and its three-wave behavior. Wave mobs are
+identified by their non-null home object matching the mission lair OID, not by
+template name. The hunter records simulation-only harvest and completes the
+mission on lair destruction; no credits, inventory mutation, or `MissionObject`
+is created. The dashboard exposes held offers, phase, lair state, and the
+market dispatch census.
+
+When `realBuffs.buffHubs.enabled` is enabled, a hunter first resolves providers
+at the nearest routable city on its current planet. If a needed family is
+absent, it chooses the first route-reachable configured hub with resolved
+providers, takes the existing real doctor/entertainer interactions, then
+returns to the hunt planet. Trips are bounded by the per-hunt limit and total
+deadline, never begin while a lair or live defender is present, and fall back
+to `realBuffs.fallbackBuffs`. `pveActivity.buffTrips` reports active routes and
+outcomes; all existing dashboard roots remain additive and stable.

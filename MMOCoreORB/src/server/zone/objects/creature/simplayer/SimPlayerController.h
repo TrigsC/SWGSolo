@@ -18,6 +18,7 @@
 #include "server/zone/objects/pathfinding/NavArea.h"
 
 class SimPlayerController;
+class TicketArrivalRetryTask;
 
 struct SimMinerConfig {
     Vector<String> resources;
@@ -129,6 +130,8 @@ public:
 // -------------------------------------------------------
 class SimPlayerController : public Object, public Logger {
 protected:
+    friend class TicketArrivalRetryTask;
+
     ManagedReference<AiAgent*> agent;
     Vector<WorldCoordinates> simPath;
     int simPathIndex;
@@ -175,6 +178,34 @@ protected:
     // Configurable speed/movement settings
     float runSpeed;
 
+    // P.8.7 Phase 0: shared player-mimetic ticket-collector travel. The state
+    // lives here so miners and hunters use the same proven choreography.
+    bool interplanetaryTravelActive;
+    String travelDestinationZone;
+    Vector3 travelDeparturePosition;
+    Vector3 travelDestinationArrival;
+    String travelDestinationStarport;
+    uint64 travelStartedAtMs;
+    float travelBoardRadius;
+
+    enum TicketTravelPhase {
+        TICKET_TRAVEL_NONE,
+        TICKET_DEPARTURE_RESOLVE,
+        TICKET_DEPARTURE_ENTRY,
+        TICKET_DEPARTURE_COLLECTOR,
+        TICKET_ARRIVAL_REENTER,
+        TICKET_ARRIVAL_EGRESS
+    };
+    TicketTravelPhase ticketTravelPhase;
+    Vector3 ticketCollectorWorld;
+    Vector3 ticketCollectorLocal;
+    ManagedReference<CellObject*> ticketCollectorCell;
+    uint64 ticketCollectorOid;
+    bool ticketCollectorFound;
+    bool ticketArrivalCollectorFound;
+    Vector3 ticketArrivalOutdoor;
+    int ticketApproachAttempts;
+
     enum SimState {
         IDLE,
         DECIDING,
@@ -209,6 +240,18 @@ public:
     // straight-line overland leg just reproduces the same line, so overland
     // assignments override this to false and escalate straight to onPathFailed().
     virtual bool shouldRepathWhenStuck() const { return true; }
+    virtual bool canBeginInterplanetaryTravel() const { return true; }
+    virtual void prepareForInterplanetaryTravelDeparture() {}
+    virtual void prepareForTicketCollectorEntry(const String&) {}
+    virtual void prepareForInterplanetaryTravelBoarding(const String&) {}
+    // Per-controller boarding telemetry. The base journey machine is shared, but
+    // the counters are not: the miner override reports into planetDispatch,
+    // the hunter override into its own PvE travel counters. Base does nothing.
+    virtual void onInterplanetaryTravelBoarded(const String& /*fromZone*/,
+        const String& /*destZone*/, const String& /*starport*/,
+        const String& /*reason*/) {}
+    virtual void onInterplanetaryTravelFinished(bool, const String&,
+        const String&) {}
     virtual void onStaleWorkLoopTaskIgnored(const String& taskType, uint64 capturedGeneration, uint64 currentGeneration);
 
     // --- Common Movement Logic ---
@@ -256,6 +299,16 @@ public:
     void onPathTaskFailed(bool pathUsesNavmesh);
     virtual void onPathFailed();
 
+    // Shared interplanetary travel entry point. Derived controllers supply only
+    // readiness and terminal policy; the journey state machine is protected.
+    bool beginInterplanetaryTravel(const String& destZone,
+        const Vector3& departurePos, const Vector3& destArrivalPos,
+        const String& destStarportName, float boardRadius,
+        String& travelResult);
+    bool isInterplanetaryTravelActive() const {
+        return interplanetaryTravelActive;
+    }
+
 protected:
     void moveToInterior(Vector3 worldPos, Vector3 localPos,
             CellObject* targetCell);
@@ -266,8 +319,14 @@ protected:
     void clearInteriorApproachLeg() { interiorApproachLeg = false; }
     bool isInteriorApproachLeg() const { return interiorApproachLeg; }
     bool isHybridMovementActive() const {
+        // Every ticket-collector phase is cell-aware: the collector stands in the
+        // starport's enclosed hollow, and the hybrid mover DISCARDS cell targets.
+        // A hybrid controller (hunters) therefore walks to the building and then
+        // stalls short of the collector forever — observed live as a relocation
+        // wedged 87m out for 870s. Miners were unaffected only because they never
+        // enable hybrid movement. Same reasoning as interiorApproachLeg (P.8.6).
         return usesNavmeshHybridMovement() && !interiorApproachLeg &&
-            !cellEgressActive;
+            !cellEgressActive && ticketTravelPhase == TICKET_TRAVEL_NONE;
     }
     void queueMorePathNodes();
     bool pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out, int minSearchRadius = 100, int maxSearchRadius = 200);
@@ -281,6 +340,18 @@ protected:
             Vector3& boundary, Vector3& egress,
             ManagedReference<NavArea*>& area) const;
     String getDiagnosticStateName() const;
+
+    bool handleInterplanetaryTravelArrival();
+    bool handleInterplanetaryTravelPathFailed();
+    void beginTicketCollectorDepartureApproach(const String& reason);
+    void beginTicketCollectorArrivalExit(const String& reason);
+    bool isAtTicketCollector() const;
+    bool canRetryTicketApproach() const;
+    void retryTicketApproach(const String& reason);
+    void cancelTicketCollectorTravel(const String& reason);
+    void completeTicketCollectorTravel();
+    void boardInterplanetaryShuttle(const String& reason);
+    void clearInterplanetaryTravelState();
 };
 
 // -------------------------------------------------------
@@ -321,10 +392,7 @@ public:
 // -------------------------------------------------------
 // MINER CONTROLLER (Resource Gathering)
 // -------------------------------------------------------
-class TicketArrivalRetryTask;
-
 class SimMinerController : public SimPlayerController {
-    friend class TicketArrivalRetryTask;
     String targetResource;
     int retryCount;
     SimMinerConfig config;
@@ -348,38 +416,6 @@ class SimMinerController : public SimPlayerController {
     Vector3 intelligentTargetPosition;
     float intelligentTargetDensity;
     uint64 intelligentAssignmentExpiresAtMs;
-
-    // P.4.5b: player-mimetic interplanetary travel. The miner runs to the origin
-    // starport's ticket collector (travelDeparturePosition) and, on arrival (or
-    // if it gets stuck), boards = switchZone to the destination starport's
-    // OUTDOOR arrival (travelDestinationArrival on travelDestinationZone), then
-    // re-acquires a target there. Orthogonal to the resource-assignment lifecycle
-    // above; only ever set on an idle donor by the manager's dispatch task.
-    bool intelligentTravelActive;
-    String travelDestinationZone;
-    Vector3 travelDeparturePosition;
-    Vector3 travelDestinationArrival;
-    String travelDestinationStarport;
-    uint64 travelStartedAtMs;
-    float travelBoardRadius;
-
-    enum TicketTravelPhase {
-        TICKET_TRAVEL_NONE,
-        TICKET_DEPARTURE_RESOLVE,
-        TICKET_DEPARTURE_ENTRY,
-        TICKET_DEPARTURE_COLLECTOR,
-        TICKET_ARRIVAL_REENTER,
-        TICKET_ARRIVAL_EGRESS
-    };
-    TicketTravelPhase ticketTravelPhase;
-    Vector3 ticketCollectorWorld;
-    Vector3 ticketCollectorLocal;
-    ManagedReference<CellObject*> ticketCollectorCell;
-    uint64 ticketCollectorOid;
-    bool ticketCollectorFound;
-    bool ticketArrivalCollectorFound;
-    Vector3 ticketArrivalOutdoor;
-    int ticketApproachAttempts;
 
     // P.4.5c: bounded "final approach". Long off-navmesh walks can terminate short
     // of the true target; the miner re-paths to close the gap to within the
@@ -439,19 +475,19 @@ public:
     // reassign a fresh target the miner will actually travel to.
     void resetIntelligentAssignmentForRecovery();
 
-    // P.4.5b: begin a player-mimetic shuttle trip to another planet. The miner
-    // runs to departurePos (the origin starport's ticket collector) and, on
-    // arrival (or if the stuck-watchdog gives up), boards -> teleports to
-    // destArrivalPos on destZone, then re-acquires a target there. Returns false
-    // (with a reason in travelResult) if the miner is not in a safe idle state.
-    bool beginInterplanetaryTravel(
-        const String& destZone,
-        const Vector3& departurePos,
-        const Vector3& destArrivalPos,
-        const String& destStarportName,
-        float boardRadius,
-        String& travelResult);
-    bool isInterplanetaryTravelActive() const { return intelligentTravelActive; }
+    // P.4.5b: the inherited base entry point uses this readiness override so a
+    // dispatch never disrupts active gathering.
+    bool canBeginInterplanetaryTravel() const override {
+        return isAvailableForDispatch();
+    }
+    void prepareForInterplanetaryTravelDeparture() override;
+    void prepareForTicketCollectorEntry(const String& reason) override;
+    void prepareForInterplanetaryTravelBoarding(const String&) override;
+    void onInterplanetaryTravelBoarded(const String& fromZone,
+        const String& destZone, const String& starport,
+        const String& reason) override;
+    void onInterplanetaryTravelFinished(bool success, const String&,
+        const String& reason) override;
 
     // P.4.5b: a miner is dispatchable only when fully idle (no pending/active/
     // sampling/stationed assignment and not already traveling), so a dispatch
@@ -459,7 +495,7 @@ public:
     bool isAvailableForDispatch() const {
         return !(intelligentAssignmentPending || intelligentAssignmentActive ||
                  intelligentSampleActive || intelligentAssignmentStationed ||
-                 intelligentTravelActive);
+                 interplanetaryTravelActive);
     }
 
     String pickRandomResource();
@@ -473,17 +509,6 @@ private:
     void performIntelligentSample();
     void finishIntelligentSample();
     void clearLocalIntelligentTargetAssignment();
-    // P.4.5b: perform the "board the shuttle" step of interplanetary travel:
-    // switchZone to the destination starport's outdoor arrival, clear travel
-    // state, notify the manager, and re-enter the work loop on the new planet.
-    void boardInterplanetaryShuttle(const String& reason);
-    void beginTicketCollectorDepartureApproach(const String& reason);
-    void beginTicketCollectorArrivalExit(const String& reason);
-    bool isAtTicketCollector() const;
-    bool canRetryTicketApproach() const;
-    void retryTicketApproach(const String& reason);
-    void cancelTicketCollectorTravel(const String& reason);
-    void completeTicketCollectorTravel();
     String getSimStateName(SimState simState) const;
     void logIntelligentTargetActivation(const String& action, const String& reason = "") const;
     void logIntelligentTargetArrival(const String& arrivalResult) const;

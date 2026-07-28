@@ -4,6 +4,7 @@
  */
 
 #include "SimPlayerController.h"
+#include "TravelDiagLog.h"
 #include "SimPlayerManager.h"
 #include "CellNavDiagLog.h"
 #include "engine/core/Core.h"
@@ -189,6 +190,22 @@ SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     stuckWatchdogCount = 0;
     rePathAttempts = 0;
     runSpeed = 3.0f;
+    interplanetaryTravelActive = false;
+    travelDestinationZone = "";
+    travelDeparturePosition = Vector3(0, 0, 0);
+    travelDestinationArrival = Vector3(0, 0, 0);
+    travelDestinationStarport = "";
+    travelStartedAtMs = 0;
+    travelBoardRadius = 20.f;
+    ticketTravelPhase = TICKET_TRAVEL_NONE;
+    ticketCollectorWorld = Vector3(0, 0, 0);
+    ticketCollectorLocal = Vector3(0, 0, 0);
+    ticketCollectorCell = nullptr;
+    ticketCollectorOid = 0;
+    ticketCollectorFound = false;
+    ticketArrivalCollectorFound = false;
+    ticketArrivalOutdoor = Vector3(0, 0, 0);
+    ticketApproachAttempts = 0;
     workLoopGeneration = 1;
     setLoggingName("SimPlayerController");
     destination = Vector3(0, 0, 0);
@@ -1560,22 +1577,6 @@ SimMinerController::SimMinerController(AiAgent* aiAgent, const SimMinerConfig& m
     intelligentActivationSnapshotId = 0;
     intelligentTargetDensity = 0.f;
     intelligentAssignmentExpiresAtMs = 0;
-    intelligentTravelActive = false;
-    travelDestinationZone = "";
-    travelDeparturePosition = Vector3(0, 0, 0);
-    travelDestinationArrival = Vector3(0, 0, 0);
-    travelDestinationStarport = "";
-    travelStartedAtMs = 0;
-    travelBoardRadius = 20.f;
-    ticketTravelPhase = TICKET_TRAVEL_NONE;
-    ticketCollectorWorld = Vector3(0, 0, 0);
-    ticketCollectorLocal = Vector3(0, 0, 0);
-    ticketCollectorCell = nullptr;
-    ticketCollectorOid = 0;
-    ticketCollectorFound = false;
-    ticketArrivalCollectorFound = false;
-    ticketArrivalOutdoor = Vector3(0, 0, 0);
-    ticketApproachAttempts = 0;
     intelligentFinalApproachAttempts = 0;
     intelligentLastApproachDistance = 0.f;
     setLoggingName("SimMinerController");
@@ -1584,12 +1585,69 @@ SimMinerController::SimMinerController(AiAgent* aiAgent, const SimMinerConfig& m
 SimMinerController::~SimMinerController() {
 }
 
+void SimMinerController::prepareForInterplanetaryTravelDeparture() {
+    SimPlayerManager* manager = SimPlayerManager::instance();
+    if (manager != nullptr && manager->isTicketCollectorTravelEnabled())
+        dismountIfMounted("ticketCollectorDeparture");
+    else
+        maybeMountForTravel(travelDeparturePosition);
+}
+
+void SimMinerController::prepareForTicketCollectorEntry(
+        const String& reason) {
+    dismountIfMounted(reason);
+}
+
+void SimMinerController::prepareForInterplanetaryTravelBoarding(
+        const String&) {
+    dismountIfMounted("boardShuttle");
+}
+
+void SimMinerController::onInterplanetaryTravelBoarded(const String& fromZone,
+        const String& destZone, const String& starport, const String& reason) {
+    // Miner-only telemetry: this writes planetDispatch's boarded counter and
+    // last-boarded fields. Hunters deliberately do not reach it.
+    SimPlayerManager* manager = SimPlayerManager::instance();
+    uint64 minerID = agent == nullptr ? 0 : agent->getObjectID();
+    if (manager != nullptr && minerID != 0)
+        manager->recordInterplanetaryTravelBoarded(
+            minerID, fromZone, destZone, starport, reason);
+}
+
+void SimMinerController::onInterplanetaryTravelFinished(bool success,
+        const String&, const String& reason) {
+    // Invalid/busy entry attempts never activated the travel state and must
+    // remain no-ops, exactly as before the state machine was lifted.
+    if (!interplanetaryTravelActive)
+        return;
+
+    // The old board path cleared only local state when the controller had
+    // already disappeared: no manager notification and no work-loop re-entry,
+    // but still a full local reset (which advances the work-loop generation and
+    // so invalidates any in-flight sample/arrival task). Retain that terminal
+    // behavior exactly while routing it through the shared hook.
+    if (!success && agent == nullptr && reason == "controllerUnavailable") {
+        clearLocalIntelligentTargetAssignment();
+        return;
+    }
+
+    if (!success && reason != "invalidDestination") {
+        uint64 minerID = agent == nullptr ? 0 : agent->getObjectID();
+        SimPlayerManager* manager = SimPlayerManager::instance();
+        if (manager != nullptr && minerID != 0)
+            manager->clearMinerIntelligentTargetAssignmentFromController(
+                minerID, reason);
+    }
+
+    resetIntelligentAssignmentForRecovery();
+}
+
 void SimMinerController::startSimLoop() {
     String activationResult;
 
     // P.4.5b: while traveling, the run to the ticket collector is driven by
     // moveTo()/checkArrival(); the normal decision loop must not clobber it.
-    if (intelligentTravelActive) {
+    if (interplanetaryTravelActive) {
         state = WAITING;
         logLegacyLoopSuppressed("interplanetaryTravelActive");
         return;
@@ -1852,7 +1910,7 @@ void SimMinerController::goToResource(const String& resourceName) {
     moveTo(targetPos);
 }
 
-bool SimMinerController::isAtTicketCollector() const {
+bool SimPlayerController::isAtTicketCollector() const {
     ManagedReference<AiAgent*> strongAgent = agent;
     if (strongAgent == nullptr || !ticketCollectorFound)
         return false;
@@ -1873,7 +1931,7 @@ bool SimMinerController::isAtTicketCollector() const {
     return parent == nullptr || !parent->isCellObject();
 }
 
-bool SimMinerController::canRetryTicketApproach() const {
+bool SimPlayerController::canRetryTicketApproach() const {
     SimPlayerManager* manager = SimPlayerManager::instance();
     if (manager == nullptr)
         return false;
@@ -1886,7 +1944,7 @@ bool SimMinerController::canRetryTicketApproach() const {
             (uint64)manager->getTicketCollectorApproachTtlSeconds() * 1000;
 }
 
-void SimMinerController::retryTicketApproach(const String& reason) {
+void SimPlayerController::retryTicketApproach(const String& reason) {
     if (canRetryTicketApproach()) {
         beginTicketCollectorDepartureApproach(reason);
         return;
@@ -1899,9 +1957,9 @@ void SimMinerController::retryTicketApproach(const String& reason) {
         cancelTicketCollectorTravel("collectorApproachExhausted");
 }
 
-void SimMinerController::beginTicketCollectorDepartureApproach(
+void SimPlayerController::beginTicketCollectorDepartureApproach(
         const String& reason) {
-    if (!intelligentTravelActive || agent == nullptr)
+    if (!interplanetaryTravelActive || agent == nullptr)
         return;
 
     if (ticketApproachAttempts >=
@@ -1959,10 +2017,17 @@ void SimMinerController::beginTicketCollectorDepartureApproach(
     }
 
     if (result == SimPlayerManager::STARPORT_WAYPOINT_FOUND) {
-        // P.4.4b's mount lifecycle must end before any cell entry. The
-        // directed collector leg is the only route allowed to retain the
-        // egress suppression latch.
-        dismountIfMounted("ticketCollectorBeforeInterior");
+        // The derived controller tears down any vehicle before entering a
+        // starport cell; the base owns the path choreography.
+        TravelDiagLog::event("DEPART_INTERIOR", agent == nullptr ? 0 :
+            agent->getObjectID(), "reason=" + reason +
+            " attempts=" + String::valueOf(ticketApproachAttempts) +
+            " hybridActive=" + String::valueOf(isHybridMovementActive()) +
+            " cell=" + String::valueOf(interiorCell == nullptr ? 0 :
+                interiorCell->getObjectID()) +
+            " " + TravelDiagLog::fmtVec("interiorWorld", interiorWorld) +
+            " " + TravelDiagLog::fmtVec("interiorLocal", interiorLocal));
+        prepareForTicketCollectorEntry("ticketCollectorBeforeInterior");
         ticketTravelPhase = TICKET_DEPARTURE_ENTRY;
         moveToInterior(interiorWorld, interiorLocal, interiorCell.get());
         return;
@@ -1978,25 +2043,27 @@ void SimMinerController::beginTicketCollectorDepartureApproach(
 // STARPORT_RESOLVE_FAILED, so the resolver miss is retried with a real interval
 // (bounded by attempts/TTL) instead of recursing and burning all attempts at once.
 class TicketArrivalRetryTask : public Task {
-    WeakReference<SimMinerController*> controller;
+    WeakReference<SimPlayerController*> controller;
     String reason;
 public:
-    TicketArrivalRetryTask(SimMinerController* ctrl, const String& r)
+    TicketArrivalRetryTask(SimPlayerController* ctrl, const String& r)
         : controller(ctrl), reason(r) {}
     void run() override {
-        Reference<SimMinerController*> strong = controller.get();
+        Reference<SimPlayerController*> strong = controller.get();
         if (strong != nullptr)
             strong->beginTicketCollectorArrivalExit(reason);
     }
 };
 
-void SimMinerController::beginTicketCollectorArrivalExit(const String& reason) {
-    if (!intelligentTravelActive || agent == nullptr)
+void SimPlayerController::beginTicketCollectorArrivalExit(const String& reason) {
+    if (!interplanetaryTravelActive || agent == nullptr)
         return;
 
     SimPlayerManager* manager = SimPlayerManager::instance();
-    if (manager == nullptr)
+    if (manager == nullptr) {
+        cancelTicketCollectorTravel("managerUnavailable");
         return;
+    }
 
     if (ticketApproachAttempts >= manager->getTicketCollectorApproachAttempts() ||
             (travelStartedAtMs != 0 && System::getMiliTime() >
@@ -2049,7 +2116,11 @@ void SimMinerController::beginTicketCollectorArrivalExit(const String& reason) {
     moveTo(ticketArrivalOutdoor);
 }
 
-void SimMinerController::cancelTicketCollectorTravel(const String& reason) {
+void SimPlayerController::cancelTicketCollectorTravel(const String& reason) {
+    TravelDiagLog::event("CANCEL", agent == nullptr ? 0 : agent->getObjectID(),
+        "reason=" + reason + " phase=" +
+        String::valueOf((int)ticketTravelPhase) + " attempts=" +
+        String::valueOf(ticketApproachAttempts));
     Logger::console.info(String("SimMinerTicketCollectorTravelCancelled miner=") +
         String::valueOf(agent == nullptr ? 0 : agent->getObjectID()) +
         " reason=" + reason, true);
@@ -2084,65 +2155,118 @@ void SimMinerController::cancelTicketCollectorTravel(const String& reason) {
 
     ticketTravelPhase = TICKET_TRAVEL_NONE;
     clearCellEgressState();
-
-    uint64 minerID = agent == nullptr ? 0 : agent->getObjectID();
-    if (minerID != 0)
-        SimPlayerManager::instance()->clearMinerIntelligentTargetAssignmentFromController(
-            minerID, reason);
-
-    resetIntelligentAssignmentForRecovery();
+    String destZone = travelDestinationZone;
+    onInterplanetaryTravelFinished(false, destZone, reason);
+    clearInterplanetaryTravelState();
 }
 
-void SimMinerController::completeTicketCollectorTravel() {
+void SimPlayerController::completeTicketCollectorTravel() {
+    TravelDiagLog::event("COMPLETE", agent == nullptr ? 0 :
+        agent->getObjectID(), "destZone=" + travelDestinationZone);
     clearCellEgressState();
     ticketTravelPhase = TICKET_TRAVEL_NONE;
-    resetIntelligentAssignmentForRecovery();
+    String destZone = travelDestinationZone;
+    onInterplanetaryTravelFinished(true, destZone, "arrived");
+    clearInterplanetaryTravelState();
+}
+
+void SimPlayerController::clearInterplanetaryTravelState() {
+    interplanetaryTravelActive = false;
+    travelDestinationZone = "";
+    travelDeparturePosition = Vector3(0, 0, 0);
+    travelDestinationArrival = Vector3(0, 0, 0);
+    travelDestinationStarport = "";
+    travelStartedAtMs = 0;
+    ticketTravelPhase = TICKET_TRAVEL_NONE;
+    ticketCollectorWorld = Vector3(0, 0, 0);
+    ticketCollectorLocal = Vector3(0, 0, 0);
+    ticketCollectorCell = nullptr;
+    ticketCollectorOid = 0;
+    ticketCollectorFound = false;
+    ticketArrivalCollectorFound = false;
+    ticketArrivalOutdoor = Vector3(0, 0, 0);
+    ticketApproachAttempts = 0;
+    clearCellEgressState();
+}
+
+bool SimPlayerController::handleInterplanetaryTravelArrival() {
+    if (!interplanetaryTravelActive)
+        return false;
+
+    TravelDiagLog::event("ARRIVED", agent == nullptr ? 0 :
+        agent->getObjectID(), "phase=" + String::valueOf((int)ticketTravelPhase) +
+        " atCollector=" + String::valueOf(isAtTicketCollector()) +
+        " collectorFound=" + String::valueOf(ticketCollectorFound));
+
+    if (ticketTravelPhase == TICKET_DEPARTURE_ENTRY) {
+        cellEgressSuppressed = true;
+        ticketTravelPhase = TICKET_DEPARTURE_COLLECTOR;
+        moveTo(ticketCollectorWorld, ticketCollectorWorld,
+            ticketCollectorCell.get());
+        return true;
+    }
+
+    if (ticketTravelPhase == TICKET_DEPARTURE_COLLECTOR) {
+        if (isAtTicketCollector())
+            boardInterplanetaryShuttle("collectorReached");
+        else
+            retryTicketApproach("collectorArrivalOutsideGate");
+        return true;
+    }
+
+    if (ticketTravelPhase == TICKET_ARRIVAL_REENTER) {
+        clearCellEgressState();
+        ticketTravelPhase = TICKET_ARRIVAL_EGRESS;
+        moveTo(ticketArrivalOutdoor);
+        return true;
+    }
+
+    if (ticketTravelPhase == TICKET_ARRIVAL_EGRESS) {
+        bool outdoors = false;
+        {
+            Locker agentLocker(agent);
+            ManagedReference<SceneObject*> parent = agent->getParent().get();
+            outdoors = parent == nullptr || !parent->isCellObject();
+        }
+
+        if (outdoors)
+            completeTicketCollectorTravel();
+        else
+            beginTicketCollectorArrivalExit("stillInside");
+        return true;
+    }
+
+    // Preserve the legacy immediate-board path when collector travel is off.
+    boardInterplanetaryShuttle("arrived");
+    return true;
+}
+
+bool SimPlayerController::handleInterplanetaryTravelPathFailed() {
+    if (!interplanetaryTravelActive)
+        return false;
+
+    TravelDiagLog::event("PATH_FAILED", agent == nullptr ? 0 :
+        agent->getObjectID(), "phase=" + String::valueOf((int)ticketTravelPhase) +
+        " attempts=" + String::valueOf(ticketApproachAttempts));
+
+    if (ticketTravelPhase == TICKET_ARRIVAL_REENTER ||
+            ticketTravelPhase == TICKET_ARRIVAL_EGRESS) {
+        beginTicketCollectorArrivalExit("arrivalPathFailed");
+        return true;
+    }
+
+    SimPlayerManager* manager = SimPlayerManager::instance();
+    if (manager != nullptr && manager->isTicketCollectorTravelEnabled())
+        retryTicketApproach("pathFailed");
+    else
+        boardInterplanetaryShuttle("stuckFallback");
+
+    return true;
 }
 
 void SimMinerController::onArrived() {
-    if (intelligentTravelActive) {
-        if (ticketTravelPhase == TICKET_DEPARTURE_ENTRY) {
-            cellEgressSuppressed = true;
-            ticketTravelPhase = TICKET_DEPARTURE_COLLECTOR;
-            moveTo(ticketCollectorWorld, ticketCollectorWorld,
-                ticketCollectorCell.get());
-            return;
-        }
-
-        if (ticketTravelPhase == TICKET_DEPARTURE_COLLECTOR) {
-            if (isAtTicketCollector())
-                boardInterplanetaryShuttle("collectorReached");
-            else
-                retryTicketApproach("collectorArrivalOutsideGate");
-            return;
-        }
-
-        if (ticketTravelPhase == TICKET_ARRIVAL_REENTER) {
-            clearCellEgressState();
-            ticketTravelPhase = TICKET_ARRIVAL_EGRESS;
-            moveTo(ticketArrivalOutdoor);
-            return;
-        }
-
-        if (ticketTravelPhase == TICKET_ARRIVAL_EGRESS) {
-			bool outdoors = false;
-			{
-				Locker agentLocker(agent);
-				ManagedReference<SceneObject*> parent = agent->getParent().get();
-				outdoors = parent == nullptr || !parent->isCellObject();
-			}
-			if (outdoors)
-                completeTicketCollectorTravel();
-            else
-                beginTicketCollectorArrivalExit("stillInside");
-            return;
-        }
-
-        // Legacy travel keeps its original immediate board behavior when the
-        // F.0.4.11 gate is disabled.
-        boardInterplanetaryShuttle("arrived");
+    if (handleInterplanetaryTravelArrival())
         return;
-    }
 
     if (intelligentAssignmentActive) {
         // P.4.5c final approach: a long off-navmesh walk can terminate short of
@@ -2208,23 +2332,8 @@ void SimMinerController::onArrived() {
 }
 
 void SimMinerController::onPathFailed() {
-    if (intelligentTravelActive) {
-        if (ticketTravelPhase == TICKET_ARRIVAL_REENTER ||
-                ticketTravelPhase == TICKET_ARRIVAL_EGRESS) {
-            beginTicketCollectorArrivalExit("arrivalPathFailed");
-            return;
-        }
-
-        if (SimPlayerManager::instance()->isTicketCollectorTravelEnabled()) {
-            retryTicketApproach("pathFailed");
-            return;
-        }
-
-        // Legacy P.4.5b behavior: a traveling miner whose departure run wedged
-        // boards from where it stands.
-        boardInterplanetaryShuttle("stuckFallback");
+    if (handleInterplanetaryTravelPathFailed())
         return;
-    }
 
     // P.4.4b: park the swoop before any failure handling/reassignment.
     dismountIfMounted("pathFailed");
@@ -2253,7 +2362,7 @@ bool SimMinerController::shouldRepathWhenStuck() const {
     // P.4.5b: while traveling to a starport the path is a straight off-navmesh
     // line to the ticket collector; re-pathing reproduces it, so skip re-path and
     // let the watchdog escalate to onPathFailed() -> board-anyway fallback.
-    if (intelligentTravelActive)
+    if (interplanetaryTravelActive)
         return false;
 
     // For a directOverland assignment the path is a straight terrain-following
@@ -2290,7 +2399,7 @@ void SimMinerController::resetIntelligentAssignmentForRecovery() {
     startSimLoop();
 }
 
-bool SimMinerController::beginInterplanetaryTravel(
+bool SimPlayerController::beginInterplanetaryTravel(
         const String& destZone,
         const Vector3& departurePos,
         const Vector3& destArrivalPos,
@@ -2298,47 +2407,67 @@ bool SimMinerController::beginInterplanetaryTravel(
         float boardRadius,
         String& travelResult) {
     travelResult = "fallback";
+    // A rejected new-trip request is a terminal path for the request, not for
+    // an already-running journey. Keep the active journey visible to neither
+    // the miner policy callback nor any future derived controller.
+    auto notifyStartFailure = [this, &destZone](const String& reason) {
+        bool wasActive = interplanetaryTravelActive;
+        interplanetaryTravelActive = false;
+        onInterplanetaryTravelFinished(false, destZone, reason);
+        interplanetaryTravelActive = wasActive;
+    };
 
     ManagedReference<AiAgent*> strongAgent = agent;
 
     if (strongAgent == nullptr) {
         travelResult = "controllerUnavailable";
+        TravelDiagLog::event("BEGIN_REJECT", 0, "reason=" + travelResult);
+        notifyStartFailure(travelResult);
         return false;
     }
 
     if (destZone.isEmpty()) {
         travelResult = "invalidDestination";
+        TravelDiagLog::event("BEGIN_REJECT", strongAgent->getObjectID(),
+            "reason=" + travelResult);
+        notifyStartFailure(travelResult);
         return false;
     }
 
-    // Only ever dispatch a fully idle miner; never disrupt active gathering.
-    if (!isAvailableForDispatch()) {
+    if (!canBeginInterplanetaryTravel()) {
         travelResult = "controllerBusy";
+        TravelDiagLog::event("BEGIN_REJECT", strongAgent->getObjectID(),
+            "reason=" + travelResult);
+        notifyStartFailure(travelResult);
         return false;
     }
 
+    String validationFailure;
     {
         Locker agentLocker(strongAgent);
         Zone* zone = strongAgent->getZone();
 
         if (zone == nullptr) {
             travelResult = "missingZone";
-            return false;
-        }
-
-        if (zone->getZoneName() == destZone) {
+            validationFailure = travelResult;
+        } else if (zone->getZoneName() == destZone) {
             travelResult = "alreadyOnPlanet";
-            return false;
-        }
-
-        if (strongAgent->isDead() || strongAgent->isIncapacitated() ||
+            validationFailure = travelResult;
+        } else if (strongAgent->isDead() || strongAgent->isIncapacitated() ||
                 strongAgent->isInCombat()) {
             travelResult = "controllerStateNotSafe";
-            return false;
+            validationFailure = travelResult;
         }
     }
 
-    intelligentTravelActive = true;
+    if (!validationFailure.isEmpty()) {
+        TravelDiagLog::event("BEGIN_REJECT", strongAgent->getObjectID(),
+            "reason=" + validationFailure);
+        notifyStartFailure(validationFailure);
+        return false;
+    }
+
+    interplanetaryTravelActive = true;
     travelDestinationZone = destZone;
     travelDeparturePosition = departurePos;
     travelDestinationArrival = destArrivalPos;
@@ -2375,30 +2504,38 @@ bool SimMinerController::beginInterplanetaryTravel(
             String::valueOf(Math::getPrecision(departurePos.getY(), 1)) + ")",
         true);
 
+    TravelDiagLog::event("BEGIN_OK", strongAgent->getObjectID(),
+        "destZone=" + destZone + " starport=" +
+        (destStarportName.isEmpty() ? String("none") : destStarportName) +
+        " collectorTravel=" + String::valueOf(collectorTravel) +
+        " hybrid=" + String::valueOf(usesNavmeshHybridMovement()) +
+        " " + TravelDiagLog::fmtVec("departure", departurePos) +
+        " " + TravelDiagLog::fmtVec("arrival", destArrivalPos));
+
     if (collectorTravel) {
         // Dismount before the first cell-aware operation. The approach itself
         // is deliberately on foot so a rider can never enter a POB cell.
-        dismountIfMounted("ticketCollectorDeparture");
+        prepareForInterplanetaryTravelDeparture();
         beginTicketCollectorDepartureApproach("travelStarted");
     } else {
         // Existing P.4.5b behavior, byte-for-byte while the new gate is off.
-        maybeMountForTravel(departurePos);
+        prepareForInterplanetaryTravelDeparture();
         moveTo(departurePos);
     }
     return true;
 }
 
-void SimMinerController::boardInterplanetaryShuttle(const String& reason) {
-    // P.4.4b: dismount + store the swoop at the starport before boarding —
-    // player-mimetic, and the transient vehicle must never be left behind or
-    // carried through switchZone.
-    dismountIfMounted("boardShuttle");
+void SimPlayerController::boardInterplanetaryShuttle(const String& reason) {
+    TravelDiagLog::event("BOARD", agent == nullptr ? 0 : agent->getObjectID(),
+        "reason=" + reason + " destZone=" + travelDestinationZone);
+    prepareForInterplanetaryTravelBoarding(reason);
 
     ManagedReference<AiAgent*> strongAgent = agent;
 
     if (strongAgent == nullptr) {
-        // Nothing to board; just clear the flag so we don't wedge the state.
-        clearLocalIntelligentTargetAssignment();
+        onInterplanetaryTravelFinished(false, travelDestinationZone,
+            "controllerUnavailable");
+        clearInterplanetaryTravelState();
         return;
     }
 
@@ -2408,8 +2545,8 @@ void SimMinerController::boardInterplanetaryShuttle(const String& reason) {
     uint64 minerID = strongAgent->getObjectID();
 
     if (destZone.isEmpty()) {
-        // No valid destination recorded; cancel travel and re-acquire locally.
-        resetIntelligentAssignmentForRecovery();
+        onInterplanetaryTravelFinished(false, destZone, "invalidDestination");
+        clearInterplanetaryTravelState();
         return;
     }
 
@@ -2457,8 +2594,12 @@ void SimMinerController::boardInterplanetaryShuttle(const String& reason) {
         " reason=" + reason,
         true);
 
-    SimPlayerManager::instance()->recordInterplanetaryTravelBoarded(
-        minerID, fromZone, destZone, starport, reason);
+    // Boarding telemetry is per-controller-kind policy, not shared mechanics:
+    // recordInterplanetaryTravelBoarded writes MINER planet-dispatch counters
+    // and last-boarded fields, so a hunter or buff trip running through this
+    // same base path would corrupt miner telemetry. Each controller reports
+    // its own.
+    onInterplanetaryTravelBoarded(fromZone, destZone, starport, reason);
 
     if (manager != nullptr && manager->isTicketCollectorTravelEnabled() &&
             ticketArrivalCollectorFound) {
@@ -2469,7 +2610,8 @@ void SimMinerController::boardInterplanetaryShuttle(const String& reason) {
     } else {
         // Existing arrival behavior: clear travel state and re-acquire on the
         // destination planet immediately.
-        resetIntelligentAssignmentForRecovery();
+        onInterplanetaryTravelFinished(true, destZone, "arrived");
+        clearInterplanetaryTravelState();
     }
 }
 
@@ -2613,7 +2755,7 @@ bool SimMinerController::requestIntelligentTargetAssignment(
 
     // P.4.5b: a traveling miner is busy (running to the shuttle); the manager must
     // not hand it a normal same-planet target mid-trip.
-    if (intelligentTravelActive) {
+    if (interplanetaryTravelActive) {
         activationResult = "controllerBusy";
         return false;
     }
@@ -2930,22 +3072,7 @@ void SimMinerController::clearLocalIntelligentTargetAssignment() {
     intelligentAssignmentExpiresAtMs = 0;
     // P.4.5b: also drop any in-flight travel so recovery that resets a traveling
     // miner cancels the trip cleanly (it re-acquires on its current planet).
-    intelligentTravelActive = false;
-    travelDestinationZone = "";
-    travelDeparturePosition = Vector3(0, 0, 0);
-    travelDestinationArrival = Vector3(0, 0, 0);
-    travelDestinationStarport = "";
-    travelStartedAtMs = 0;
-    ticketTravelPhase = TICKET_TRAVEL_NONE;
-    ticketCollectorWorld = Vector3(0, 0, 0);
-    ticketCollectorLocal = Vector3(0, 0, 0);
-    ticketCollectorCell = nullptr;
-    ticketCollectorOid = 0;
-    ticketCollectorFound = false;
-    ticketArrivalCollectorFound = false;
-    ticketArrivalOutdoor = Vector3(0, 0, 0);
-    ticketApproachAttempts = 0;
-    clearCellEgressState();
+    clearInterplanetaryTravelState();
 }
 
 void SimMinerController::logIntelligentTargetActivation(

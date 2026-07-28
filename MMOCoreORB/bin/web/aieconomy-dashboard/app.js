@@ -996,6 +996,15 @@
   function pageWilds(d) {
     const pve = d.pveActivity || {};
     const roster = Array.isArray(pve.roster) ? pve.roster : [];
+    const offers = Array.isArray((pve.missionBoard || {}).offers)
+      ? pve.missionBoard.offers : [];
+    const offerFor = (r) => {
+      const matches = offers.filter((o) =>
+        Number(o.identityId) === Number(r.identityId) &&
+        (!r.bodyOid || !o.bodyOid || Number(o.bodyOid) === Number(r.bodyOid)) &&
+        o.completed !== true);
+      return matches.length ? matches[0] : null;
+    };
     const attached = roster.filter((r) => r.bodyAttached).length;
     const active = roster.filter((r) => String(r.phase || "IDLE_HOME") !== "IDLE_HOME").length;
     const rows = roster.map((r) => {
@@ -1010,6 +1019,20 @@
       const position = hasPosition
         ? `<span class="t-main">${coords[0].toFixed(1)} / ${coords[1].toFixed(1)}</span><span class="t-sub">z ${coords[2].toFixed(1)}</span>`
         : `<span class="muted">position unavailable</span>`;
+      const offer = offerFor(r);
+      const offerBearing = offer && Number.isFinite(Number(offer.bearingDeg))
+        ? `${Number(offer.bearingDeg).toFixed(0)}°` : "—";
+      const offerPos = offer ? [offer.advertisedX, offer.advertisedY].map(Number) : [];
+      const offerDistance = offer && hasPosition && offer.planet === planet &&
+        offerPos.every((v) => Number.isFinite(v))
+        ? `${Math.hypot(coords[0] - offerPos[0], coords[1] - offerPos[1]).toFixed(0)}m`
+        : "—";
+      const offerLabel = offer
+        ? `<span class="t-main">${esc(offerBearing)}</span><span class="t-sub">${esc(offerDistance)}</span>`
+        : `<span class="muted">no held offer</span>`;
+      const lairAlive = offer ? offer.lairAlive === true : r.lairAlive === true;
+      const wavesSeen = offer && offer.wavesSeen != null ? offer.wavesSeen : r.wavesSeen;
+      const wavesLabel = wavesSeen == null ? "—" : String(wavesSeen);
       const realBuffsOn = pve.realBuffsEnabled === true;
       const medicalBuffed = r.medicalBuffed === true;
       const entertainerBuffed = r.entertainerBuffed === true;
@@ -1023,6 +1046,9 @@
       return `<tr>
         <td><span class="t-main">${esc(name)}</span><span class="t-sub">${r.bodyAttached ? "body attached" : "identity only"}</span></td>
         <td>${chip(labelize(phase), /HUNT|TRAVEL|RETREAT|MISSION/i.test(phase) ? "teal" : "ghost")}</td>
+        <td class="wilds-offer">${offerLabel}</td>
+        <td>${chip(lairAlive ? "alive" : "clear", lairAlive ? "amber" : "ghost")}</td>
+        <td class="t-num wilds-waves">${esc(wavesLabel)}</td>
         <td>${hasPosition ? esc(labelize(planet)) : `<span class="muted">in transit</span>`}</td>
         <td class="t-num">${position}</td>
         <td>${hasPosition ? `<code class="way-code">${esc(way)}</code>` : `<span class="muted">n/a</span>`}</td>
@@ -1039,13 +1065,14 @@
             ${metric("Hunters", roster.length, { tone: "accent" })}
             ${metric("Attached Bodies", attached)}
             ${metric("Active Orders", active)}
+            ${metric("Completed Missions", pve.missionsCompletedTotal, { tone: "accent" })}
             ${metric("Kills", pve.hunterKillsTotal)}
             ${metric("Harvest Units", pve.hunterHarvestUnitsTotal)}
             ${metric("Deaths", pve.hunterDeathsTotal, { tone: Number(pve.hunterDeathsTotal || 0) ? "warn" : "" })}
           </div></div>
         </section>
         ${panel("HUNTER POSITION FEED", `${roster.length} identities · ${active} active`,
-          table(["Hunter", "Phase", "Planet", "X / Y", "/way", "Buffs"], rows, { scrollKey: "wilds-roster", tall: true }))}
+          table(["Hunter", "Phase", "Offer bearing / distance", "Lair", "Waves", "Planet", "X / Y", "/way", "Buffs"], rows, { scrollKey: "wilds-roster", tall: true }))}
         <section class="panel span-12"><div class="panel-body wilds-note">
           <span class="muted small">Coordinates are read-only live positions. Select the visible <code class="way-code">/way</code> text and paste it in-game; unavailable positions indicate a body or zone transition.</span>
         </div></section>

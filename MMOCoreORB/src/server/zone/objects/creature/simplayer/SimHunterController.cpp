@@ -4,6 +4,8 @@
  */
 
 #include "SimHunterController.h"
+#include "TravelDiagLog.h"
+#include "MissionDiagLog.h"
 
 #include "engine/core/Core.h"
 #include "server/ServerCore.h"
@@ -37,11 +39,13 @@ public:
 	void run() override {
 		uint64 capturedGeneration = generation;
 		Reference<SimHunterController*> strong = controller.get();
-		if (strong == nullptr || strong->activeTickGeneration != capturedGeneration)
+		if (strong == nullptr || strong->activeTickGeneration.load(
+				std::memory_order_acquire) != capturedGeneration)
 			return;
 
 		Core::getTaskManager()->executeTask([strong, capturedGeneration]() {
-			if (strong->activeTickGeneration != capturedGeneration)
+			if (strong->activeTickGeneration.load(std::memory_order_acquire) !=
+					capturedGeneration)
 				return;
 			strong->runActiveTick();
 		}, "SimHunterActiveTickLambda");
@@ -53,10 +57,14 @@ static String hunterPhaseName(SimHunterController::HuntPhase phase) {
 	case SimHunterController::IDLE_HOME: return "IDLE_HOME";
 	case SimHunterController::ANNOUNCE_JOB: return "ANNOUNCE_JOB";
 	case SimHunterController::BUFF_UP: return "BUFF_UP";
+	case SimHunterController::RELOCATING: return "RELOCATING";
+	case SimHunterController::BUFF_TRIP: return "BUFF_TRIP";
 	case SimHunterController::TRAVEL_OUT: return "TRAVEL_OUT";
 	case SimHunterController::TRAVEL_TO_TERMINAL: return "TRAVEL_TO_TERMINAL";
 	case SimHunterController::ACCEPT_MISSION: return "ACCEPT_MISSION";
+	case SimHunterController::TRAVEL_TO_MISSION: return "TRAVEL_TO_MISSION";
 	case SimHunterController::TRAVEL_TO_LAIR: return "TRAVEL_TO_LAIR";
+	case SimHunterController::ENGAGING_LAIR: return "ENGAGING_LAIR";
 	case SimHunterController::AWAITING_WORLD: return "AWAITING_WORLD";
 	case SimHunterController::HUNTING: return "HUNTING";
 	case SimHunterController::RETREATING: return "RETREATING";
@@ -82,6 +90,7 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 	activeTickGeneration = 1;
 	targetOid = 0;
 	observerTargetOid = 0;
+	targetMissionWave = false;
 	destructionHandled = false;
 	pursuing = false;
 	cantinaArrived = false;
@@ -103,6 +112,12 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 	missionTerminalPosition = Vector3();
 	missionLairPosition = Vector3();
 	missionLairOid = 0;
+	engagedMissionLairOid = 0;
+	currentMissionOfferId = 0;
+	missionOffersGenerated = false;
+	missionOfferAttempts = 0;
+	missionOfferVisitEpoch = 0;
+	missionOfferIds.removeAll();
 	terminalResolveWaitCycles = 0;
 	missionAddsOverCapCycles = 0;
 	missionAddsEngaged = 0;
@@ -117,11 +132,114 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 	pveDoctorRequestActive = false;
 	pveDoctorDeadlineSec = 0;
 	pveDoctorProviderObject = nullptr;
+	pveBuffTripAtHub = false;
+	pveBuffTripReturning = false;
+	pveBuffTripsThisHunt = 0;
 	setLoggingName("SimHunterController");
 }
 
 SimHunterController::~SimHunterController() {
 	teardown("destructor");
+}
+
+bool SimHunterController::isReadyForMarketRelocation() const {
+	return canBeginInterplanetaryTravel();
+}
+
+bool SimHunterController::canBeginInterplanetaryTravel() const {
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr || strongAgent->isDead() ||
+			strongAgent->isIncapacitated() || strongAgent->isInCombat() ||
+			missionLairOid != 0 || engagedMissionLairOid != 0 ||
+			isInterplanetaryTravelActive())
+		return false;
+
+	Vector<ManagedReference<CreatureObject*> > defenders;
+	{
+		Locker agentLock(strongAgent);
+		const DeltaVector<ManagedReference<SceneObject*> >* defenderList =
+			strongAgent->getDefenderList();
+		if (defenderList != nullptr) {
+			for (int i = 0; i < defenderList->size(); ++i) {
+				ManagedReference<SceneObject*> object = defenderList->getSafe(i);
+				CreatureObject* defender = object == nullptr ? nullptr :
+					object->asCreatureObject();
+				if (defender != nullptr)
+					defenders.add(defender);
+			}
+		}
+	}
+	for (int i = 0; i < defenders.size(); ++i) {
+		CreatureObject* defender = defenders.get(i);
+		if (defender != nullptr && !defender->isDead() &&
+				!defender->isIncapacitated())
+			return false;
+	}
+	return true;
+}
+
+void SimHunterController::onInterplanetaryTravelFinished(bool success,
+		const String& destZone, const String& reason) {
+	(void)reason;
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (!orderActive)
+		return;
+
+	SimPlayerManager::PveBuffTrip buffTrip;
+	if (manager->getPveHunterBuffTrip(identityId, buffTrip)) {
+		if (!success) {
+			manager->finishPveHunterBuffTrip(identityId, false);
+			clearInterplanetaryTravelState();
+			if (buffTrip.returning) {
+				pveBuffTripReturning = false;
+				resumeAfterBuffTrip();
+			} else {
+				pveBuffTripAtHub = false;
+				pveBuffTripReturning = false;
+				pveDoctorFallbackNeeded = pveNeedDoctorBuff;
+				pveEntertainerFallbackNeeded = pveNeedEntertainerBuff;
+				finishPveBuffProviderFlow();
+			}
+			return;
+		}
+
+		manager->advancePveHunterBuffTrip(identityId);
+		setPhase(BUFF_TRIP);
+		scheduleActiveTick(500);
+		return;
+	}
+
+	if (!manager->isPveMarketDispatchEnabled())
+		return;
+
+	SimPlayerManager::PveRelocation relocation;
+	if (!manager->getPveHunterRelocation(identityId,
+			relocation))
+		return;
+
+	if (!success) {
+		manager->finishPveHunterRelocation(identityId, false, destZone);
+		if (!destZone.isEmpty())
+			order.marketTargetPlanet = destZone;
+		if (agent != nullptr && agent->getZone() != nullptr)
+			order.marketTargetPlanet = agent->getZone()->getZoneName();
+		setPhase(ANNOUNCE_JOB);
+		scheduleActiveTick(500);
+		return;
+	}
+
+	manager->advancePveHunterRelocation(identityId);
+	SimPlayerManager::PveRelocation advanced;
+	if (!manager->getPveHunterRelocation(identityId,
+			advanced) || advanced.legIndex >= advanced.legs.size()) {
+		manager->finishPveHunterRelocation(identityId, true, destZone);
+		if (!destZone.isEmpty())
+			order.marketTargetPlanet = destZone;
+		setPhase(ANNOUNCE_JOB);
+	} else {
+		setPhase(RELOCATING);
+	}
+	scheduleActiveTick(500);
 }
 
 String SimHunterController::getPhaseName() const {
@@ -132,12 +250,15 @@ void SimHunterController::scheduleActiveTick(int delayMs) {
 	if (delayMs < 100)
 		delayMs = 100;
 
-	activeTickGeneration++;
-	if (activeTickGeneration == 0)
-		activeTickGeneration = 1;
+	// C1: atomic RMW; capture the resulting value so a concurrent scheduler on
+	// another thread cannot make us tag the task with a generation that a third
+	// party already advanced past.
+	uint64 gen = activeTickGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+	if (gen == 0)
+		gen = activeTickGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
 
 	Reference<SimHunterActiveTickTask*> task =
-		new SimHunterActiveTickTask(this, activeTickGeneration);
+		new SimHunterActiveTickTask(this, gen);
 	task->schedule(delayMs);
 }
 
@@ -176,6 +297,7 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 
 	dropTargetObserver();
 	disengageTarget(false);
+	clearEngagedTelemetry();
 	cancelPveDoctorRequest();
 	advanceWorkLoopGeneration("hunterStartOrder");
 	clearInteriorApproachLeg();
@@ -190,6 +312,7 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	phaseStartedAtMs = 0;
 	huntStartedAtMs = 0;
 	targetOid = 0;
+	targetMissionWave = false;
 	retreatCycles = 0;
 	missionTerminalFallback = false;
 	missionTerminalResolved = false;
@@ -197,6 +320,12 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	missionTerminalPosition = Vector3();
 	missionLairPosition = Vector3();
 	missionLairOid = 0;
+	engagedMissionLairOid = 0;
+	currentMissionOfferId = 0;
+	missionOffersGenerated = false;
+	missionOfferAttempts = 0;
+	missionOfferVisitEpoch = 0;
+	missionOfferIds.removeAll();
 	terminalResolveWaitCycles = 0;
 	missionAddsOverCapCycles = 0;
 	missionAddsEngaged = 0;
@@ -211,6 +340,9 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	pveDoctorRequestActive = false;
 	pveDoctorDeadlineSec = 0;
 	pveDoctorProviderObject = nullptr;
+	pveBuffTripAtHub = false;
+	pveBuffTripReturning = false;
+	pveBuffTripsThisHunt = 0;
 	cantinaDwellComplete = false;
 	medDwellComplete = false;
 	dwellUntilMs = 0;
@@ -251,7 +383,7 @@ void SimHunterController::onTick() {
 	// racing that state, onTick never promotes a mission target — it only
 	// self-defends, and only in the travel/movement legs where runActiveTick's
 	// combat handler does not run. In HUNTING, runActiveTick owns combat.
-	if (phase == HUNTING)
+	if (phase == HUNTING || phase == ENGAGING_LAIR)
 		return;
 
 	// Interceptor-only self-defense: fight whatever is actually attacking, via
@@ -522,6 +654,25 @@ void SimHunterController::finishPveBuffProviderFlow() {
 			strongAgent->addShockWounds(-shock, true, false);
 	}
 
+	// A hub provider flow is complete only after the hunter has a route back to
+	// the hunt planet. Keep this handoff outside the provider/agent locks; the
+	// manager owns the route record and the controller owns the next travel leg.
+	if (SimPlayerManager::instance()->isPveBuffHubsEnabled() &&
+			pveBuffTripAtHub) {
+		if (SimPlayerManager::instance()->beginPveHunterBuffReturn(identityId)) {
+			pveBuffTripAtHub = false;
+			pveBuffTripReturning = true;
+			setPhase(BUFF_TRIP);
+			scheduleActiveTick(500);
+			return;
+		}
+
+		SimPlayerManager::instance()->finishPveHunterBuffTrip(identityId,
+			false);
+		pveBuffTripAtHub = false;
+		pveBuffTripReturning = false;
+	}
+
 	if (missionHuntOrder)
 		beginMissionTerminalLeg();
 	else {
@@ -687,7 +838,118 @@ void SimHunterController::interactWithPveBuffProvider(
 	scheduleActiveTick(1000);
 }
 
+bool SimHunterController::beginMarketRelocationLeg() {
+	if (!orderActive || order.marketTargetPlanet.isEmpty() || agent == nullptr)
+		return false;
+	Zone* zone = agent->getZone();
+	if (zone == nullptr || zone->getZoneName() == order.marketTargetPlanet)
+		return false;
+
+	SimPlayerManager::PveRelocation relocation;
+	if (!SimPlayerManager::instance()->getPveHunterRelocation(identityId,
+			relocation) || relocation.legIndex < 0 || relocation.legIndex >=
+			relocation.legs.size())
+		return false;
+	if (isInterplanetaryTravelActive())
+		return true;
+
+	const SimPlayerManager::SimTravelLeg& leg = relocation.legs.get(
+		relocation.legIndex);
+	String travelResult;
+	if (!beginInterplanetaryTravel(leg.destPlanet, leg.departurePos,
+			leg.arrivalPos, leg.destCity, 0.f, travelResult)) {
+		SimPlayerManager::instance()->finishPveHunterRelocation(identityId,
+			false, zone->getZoneName());
+		return false;
+	}
+	setPhase(RELOCATING);
+	return true;
+}
+
+bool SimHunterController::beginBuffTripLeg() {
+	if (!orderActive || agent == nullptr)
+		return false;
+
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	SimPlayerManager::PveBuffTrip trip;
+	if (!manager->getPveHunterBuffTrip(identityId, trip))
+		return false;
+
+	if (isInterplanetaryTravelActive())
+		return true;
+
+	if (trip.legIndex < 0 || trip.legIndex >= trip.legs.size()) {
+		if (!trip.returning) {
+			pveBuffTripAtHub = true;
+			pveBuffTripReturning = false;
+			setPhase(BUFF_UP);
+			beginBuffUp();
+			return true;
+		}
+
+		manager->finishPveHunterBuffTrip(identityId, true);
+		pveBuffTripAtHub = false;
+		pveBuffTripReturning = false;
+		resumeAfterBuffTrip();
+		return true;
+	}
+
+	if (!canBeginInterplanetaryTravel()) {
+		manager->finishPveHunterBuffTrip(identityId, false);
+		if (trip.returning) {
+			pveBuffTripReturning = false;
+			resumeAfterBuffTrip();
+		} else {
+			pveBuffTripAtHub = false;
+			pveBuffTripReturning = false;
+			pveDoctorFallbackNeeded = pveNeedDoctorBuff;
+			pveEntertainerFallbackNeeded = pveNeedEntertainerBuff;
+			finishPveBuffProviderFlow();
+		}
+		return false;
+	}
+
+	const SimPlayerManager::SimTravelLeg& leg = trip.legs.get(
+		trip.legIndex);
+	String travelResult;
+	if (!beginInterplanetaryTravel(leg.destPlanet, leg.departurePos,
+			leg.arrivalPos, leg.destCity, 0.f, travelResult)) {
+		manager->finishPveHunterBuffTrip(identityId, false);
+		if (trip.returning) {
+			pveBuffTripReturning = false;
+			resumeAfterBuffTrip();
+		} else {
+			pveBuffTripAtHub = false;
+			pveBuffTripReturning = false;
+			pveDoctorFallbackNeeded = pveNeedDoctorBuff;
+			pveEntertainerFallbackNeeded = pveNeedEntertainerBuff;
+			finishPveBuffProviderFlow();
+		}
+		return false;
+	}
+
+	setPhase(BUFF_TRIP);
+	return true;
+}
+
+void SimHunterController::resumeAfterBuffTrip() {
+	if (!orderActive)
+		return;
+
+	if (missionHuntOrder)
+		beginMissionTerminalLeg();
+	else {
+		setPhase(TRAVEL_OUT);
+		moveTo(species.huntGround);
+	}
+}
+
 void SimHunterController::beginBuffUp() {
+	if (SimPlayerManager::instance()->isPveMarketDispatchEnabled() &&
+			!order.marketTargetPlanet.isEmpty() &&
+			beginMarketRelocationLeg())
+		return;
+
 	if (SimPlayerManager::instance()->isPveRealBuffsEnabled()) {
 		bool needDoctor = false;
 		bool needEntertainer = false;
@@ -714,8 +976,65 @@ void SimHunterController::beginBuffUp() {
 		pveDoctorRequestActive = false;
 		pveDoctorDeadlineSec = 0;
 
+		SimPlayerManager* manager = SimPlayerManager::instance();
 		PveBuffProviders providers;
-		if (!SimPlayerManager::instance()->resolvePveBuffProviders(
+		if (manager->isPveBuffHubsEnabled()) {
+			String providerPlanet;
+			String providerCity;
+			bool providerLocationResolved = false;
+			if (pveBuffTripAtHub) {
+				SimPlayerManager::PveBuffTrip trip;
+				if (manager->getPveHunterBuffTrip(identityId, trip)) {
+					providerPlanet = trip.hubPlanet;
+					providerCity = trip.hubCity;
+					providerLocationResolved = true;
+				}
+			} else {
+				SimPlayerManager::ShuttleportLocation currentCity;
+				providerLocationResolved =
+					manager->getPveHunterCurrentRoutableCity(
+						agent == nullptr ? 0 : agent->getObjectID(),
+						providerPlanet, currentCity);
+				if (providerLocationResolved)
+					providerCity = currentCity.name;
+			}
+
+			if (!providerLocationResolved) {
+				pveDoctorFallbackNeeded = needDoctor;
+				pveEntertainerFallbackNeeded = needEntertainer;
+				finishPveBuffProviderFlow();
+				return;
+			}
+
+			if (!manager->resolvePveBuffProviders(providerPlanet, providerCity,
+					providers)) {
+				if (providers.pending) {
+					scheduleActiveTick(5000);
+					return;
+				}
+				pveDoctorFallbackNeeded = needDoctor;
+				pveEntertainerFallbackNeeded = needEntertainer;
+				finishPveBuffProviderFlow();
+				return;
+			}
+
+			bool hasDoctor = !needDoctor || providers.doctor.found;
+			bool hasEntertainer = !needEntertainer ||
+				(providers.musician.found && providers.dancer.found);
+			if (!pveBuffTripAtHub && (!hasDoctor || !hasEntertainer) &&
+					pveBuffTripsThisHunt < manager->getPveMaxBuffTripsPerHunt() &&
+					canBeginInterplanetaryTravel()) {
+				SimPlayerManager::PveBuffTrip trip;
+				if (manager->planPveHunterBuffTrip(identityId,
+						agent == nullptr ? 0 : agent->getObjectID(), needDoctor,
+						needEntertainer, trip)) {
+					++pveBuffTripsThisHunt;
+					setPhase(BUFF_TRIP);
+					scheduleActiveTick(100);
+					return;
+				}
+			}
+		} else if (!manager->resolvePveBuffProviders(
 				order.homePlanet, order.homeCity, providers)) {
 			if (providers.pending) {
 				scheduleActiveTick(5000);
@@ -812,19 +1131,57 @@ void SimHunterController::beginMissionTerminalLeg() {
 
 	PveMissionTerminalLocation terminal;
 	int cityState = PVE_MISSION_TERMINAL_PENDING;
-	bool resolved = SimPlayerManager::instance()->getNearestMissionTerminal(
-		order.homePlanet, order.homeCity, currentPosition, terminal,
-		cityState);
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	bool boardEnabled = manager->isPveMissionBoardEnabled();
+	String currentPlanet;
+	if (boardEnabled) {
+		Zone* currentZone = strongAgent->getZone();
+		currentPlanet = currentZone == nullptr ? String() :
+			currentZone->getZoneName();
+	}
+	bool resolved = boardEnabled ? manager->getNearestGeneralMissionTerminal(
+		currentPlanet, currentPosition, terminal, cityState) :
+		manager->getNearestMissionTerminal(order.homePlanet, order.homeCity,
+			currentPosition, terminal, cityState);
 
 	if (resolved) {
 		missionTerminalPosition = terminal.position;
 		missionTerminalResolved = true;
 		missionTerminalFallback = false;
-		SimPlayerManager::instance()->recordPveHunterMissionTerminal(
+		manager->recordPveHunterMissionTerminal(
 			identityId, bodyOid, terminal.planet, terminal.city,
-			terminal.position);
+			terminal.position, terminal.terminalType, terminal.terminalOid);
+		// Publish the resolved terminal onto the ORDER. beginMissionAccept()
+		// rebuilds its PveMissionTerminalLocation from these fields, and nothing
+		// else ever wrote them -- they sat at their defaults (oid 0, empty
+		// strings, zero position), so generatePveBotMissionOffers() rejected every
+		// single contract on its `terminal.terminalOid == 0` entry gate. The
+		// hunter resolved a terminal, walked to it and arrived, and the board was
+		// then asked about a terminal that did not exist. Position matters too:
+		// choosePveBotMissionPosition() takes the terminal->city-centre bearing
+		// from it, so a zero position would aim the spawn arc at the map origin.
+		order.missionTerminalPlanet = terminal.planet;
+		order.missionTerminalCity = terminal.city;
+		order.missionTerminalType = terminal.terminalType;
+		order.missionTerminalOid = terminal.terminalOid;
+		order.missionTerminalPosition = terminal.position;
+
 		setPhase(TRAVEL_TO_TERMINAL);
-		if (state != MOVING && state != CALCULATING_PATH)
+		// NOTE the guard: if the controller is still MOVING/CALCULATING_PATH from
+		// a previous leg (e.g. the ticket-collector arrival egress that just ran),
+		// the terminal move is SKIPPED and this phase then rides on whatever the
+		// stale movement does next. movedIssued distinguishes the two cases.
+		bool moveIssued = state != MOVING && state != CALCULATING_PATH;
+		MissionDiagLog::event("TERM_RESOLVED", identityId, "planet=" +
+			terminal.planet + " city=" + terminal.city +
+			" type=" + terminal.terminalType +
+			" terminalOid=" + String::valueOf(terminal.terminalOid) +
+			" dist=" + String::valueOf(
+				currentPosition.distanceTo2d(terminal.position)) +
+			" state=" + getDiagnosticStateName() +
+			" moveIssued=" + String::valueOf(moveIssued) +
+			" waitCycles=" + String::valueOf(terminalResolveWaitCycles));
+		if (moveIssued)
 			moveTo(missionTerminalPosition);
 		return;
 	}
@@ -832,32 +1189,127 @@ void SimHunterController::beginMissionTerminalLeg() {
 	if (cityState == PVE_MISSION_TERMINAL_ABSENT ||
 			terminalResolveWaitCycles >= SimPlayerManager::instance()->
 			getPveMissionTerminalResolveWaitCycles()) {
+		MissionDiagLog::event("TERM_GIVEUP", identityId, "planet=" +
+			(boardEnabled ? currentPlanet : order.homePlanet) +
+			" cityState=" + String::valueOf(cityState) +
+			" waitCycles=" + String::valueOf(terminalResolveWaitCycles) +
+			" maxWaitCycles=" + String::valueOf(SimPlayerManager::instance()->
+				getPveMissionTerminalResolveWaitCycles()));
 		beginMissionFallback();
 		return;
 	}
 
+	MissionDiagLog::event("TERM_PENDING", identityId, "planet=" +
+		(boardEnabled ? currentPlanet : order.homePlanet) +
+		" cityState=" + String::valueOf(cityState) +
+		" waitCycles=" + String::valueOf(terminalResolveWaitCycles));
+
 	missionTerminalResolved = false;
 	missionTerminalFallback = false;
 	++terminalResolveWaitCycles;
-	SimPlayerManager::instance()->recordPveHunterMissionTerminal(
-		identityId, bodyOid, order.homePlanet, order.homeCity,
-		Vector3());
+	manager->recordPveHunterMissionTerminal(identityId, bodyOid,
+			boardEnabled ? currentPlanet : order.homePlanet,
+			boardEnabled ? String() : order.homeCity, Vector3(), "", 0);
 	setPhase(TRAVEL_TO_TERMINAL);
 	scheduleActiveTick(2000);
 }
 
 void SimHunterController::beginMissionFallback() {
+	MissionDiagLog::event("TERM_FALLBACK", identityId, "phase=" +
+		getPhaseName() + " boardEnabled=" + String::valueOf(
+			SimPlayerManager::instance()->isPveMissionBoardEnabled()));
 	missionTerminalFallback = true;
 	missionTerminalResolved = false;
 	SimPlayerManager::instance()->recordPveHunterMissionTerminal(
 		identityId, agent == nullptr ? 0 : agent->getObjectID(),
 		order.homePlanet, order.homeCity, Vector3());
+	if (SimPlayerManager::instance()->isPveMissionBoardEnabled()) {
+		beginMissionCleanup(true, "mission_terminal_unavailable");
+		return;
+	}
 	spawnMissionLair();
 }
 
 void SimHunterController::beginMissionAccept() {
 	if (!orderActive || !missionHuntOrder)
 		return;
+
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager->isPveMissionBoardEnabled() && !missionOffersGenerated) {
+		ManagedReference<AiAgent*> strongAgent = agent;
+		if (strongAgent == nullptr)
+			return;
+		// C4: fresh terminal visit (attempt 0) opens a visit epoch under pveMutex,
+		// which also verifies an active order for this body and drops any stale
+		// board. Epoch 0 => no active order (concluded under us) -> abandon.
+		// Retries (attempts > 0) reuse the captured epoch, never re-reading it.
+		if (missionOfferAttempts == 0) {
+			missionOfferVisitEpoch = manager->openTerminalVisit(
+				identityId, strongAgent->getObjectID());
+			if (missionOfferVisitEpoch == 0) {
+				beginMissionCleanup(true, "mission_offers_unavailable");
+				return;
+			}
+		}
+		Vector<PveBotMissionOffer> offers;
+		PveMissionTerminalLocation terminal;
+		terminal.planet = order.missionTerminalPlanet;
+		terminal.city = order.missionTerminalCity;
+		terminal.terminalType = order.missionTerminalType;
+		terminal.terminalOid = order.missionTerminalOid;
+		terminal.position = order.missionTerminalPosition;
+		// generatePveBotMissionOffers is no longer all-or-nothing: it commits and
+		// returns however many offers it could place (0, 1, or the full 2), and
+		// on a zero result it preserves any partial already committed this visit.
+		// It commits ONLY if the visit epoch still matches (order still active).
+		manager->generatePveBotMissionOffers(identityId,
+			strongAgent->getObjectID(), terminal,
+			manager->getPveBotHunterLevel(strongAgent), offers,
+			missionOfferVisitEpoch);
+		int have = offers.size();
+		int want = manager->getPveMissionBoardMaxHeldMissions();
+		++missionOfferAttempts;
+		int maxAttempts = manager->getPveMissionBoardOfferMaxAttempts();
+
+		if (have < want && missionOfferAttempts < maxAttempts) {
+			// Partial or empty board with retries left: dwell at the terminal and
+			// re-generate, rather than abandoning the whole trip. The ACCEPT_MISSION
+			// tick re-enters beginMissionAccept() while missionOffersGenerated is
+			// still false. This is the fix for the dominant mission_offers_unavailable
+			// churn -- ~55% of empty boards already had one valid offer that the old
+			// all-or-nothing rule discarded.
+			MissionDiagLog::event("OFFERS_RETRY", identityId, "have=" +
+				String::valueOf(have) + " want=" + String::valueOf(want) +
+				" attempt=" + String::valueOf(missionOfferAttempts) +
+				" maxAttempts=" + String::valueOf(maxAttempts));
+			setPhase(ACCEPT_MISSION);
+			dwellUntilMs = System::getMiliTime() +
+				static_cast<uint64>(manager->
+					getPveMissionBoardOfferRetrySeconds()) * 1000;
+			scheduleActiveTick((int)Math::max(100,
+				(int)(dwellUntilMs - System::getMiliTime())));
+			return;
+		}
+
+		if (have == 0) {
+			// Retry budget exhausted and still nothing placeable here.
+			beginMissionCleanup(true, "mission_offers_unavailable");
+			return;
+		}
+
+		// Accept what we have -- a full board (2) or a single offer after the
+		// retries could not fill the second slot.
+		MissionDiagLog::event("OFFERS_ACCEPT", identityId, "have=" +
+			String::valueOf(have) + " want=" + String::valueOf(want) +
+			" attempts=" + String::valueOf(missionOfferAttempts));
+		missionOffersGenerated = true;
+		missionOfferIds.removeAll();
+		for (int i = 0; i < offers.size(); ++i) {
+			missionOfferIds.add(offers.get(i).offerId);
+			manager->announcePveHunterEvent(strongAgent->getObjectID(),
+				species.key, "Offer " + String::valueOf(i + 1) + " is ready.");
+		}
+	}
 
 	setPhase(ACCEPT_MISSION);
 	SimPlayerManager::instance()->announcePveHunterEvent(
@@ -867,6 +1319,38 @@ void SimHunterController::beginMissionAccept() {
 		static_cast<uint64>(SimPlayerManager::instance()->
 			getPveMissionTerminalDwellSeconds()) * 1000;
 	scheduleActiveTick(1000);
+}
+
+bool SimHunterController::beginNextMissionOffer() {
+	if (!orderActive || !missionHuntOrder || !missionOffersGenerated)
+		return false;
+
+	Vector<PveBotMissionOffer> pending;
+	for (int offerIndex = 0; offerIndex < missionOfferIds.size();
+			++offerIndex) {
+		uint64 offerId = missionOfferIds.get(offerIndex);
+		PveBotMissionOffer offer;
+		if (!SimPlayerManager::instance()->getPveBotMissionOffer(identityId,
+				offerId, offer))
+			continue;
+		if (!offer.completed && !offer.revealed) {
+			pending.add(offer);
+			if (pending.size() >= SimPlayerManager::instance()->
+					getPveMissionBoardMaxHeldMissions())
+				break;
+		}
+	}
+	if (pending.size() == 0)
+		return false;
+
+	currentMissionOfferId = pending.get(0).offerId;
+	missionLairPosition = pending.get(0).advertisedPos;
+	missionLairOid = 0;
+	missionAddsOverCapCycles = 0;
+	updateMissionAdds(0);
+	setPhase(TRAVEL_TO_MISSION);
+	moveTo(missionLairPosition);
+	return true;
 }
 
 void SimHunterController::spawnMissionLair() {
@@ -905,14 +1389,26 @@ void SimHunterController::beginMissionCleanup(bool abandoned,
 	if (!orderActive || !missionHuntOrder)
 		return;
 
+	// The REAL abandon cause. Downstream, completeOrder overwrites it with the
+	// generic "abandoned" (reached home) or "path_failed_TRAVEL_HOME" (didn't),
+	// so the dashboard abandonReasons never shows WHY the mission was dropped.
+	MissionDiagLog::event("MISSION_CLEANUP", identityId, "abandoned=" +
+		String::valueOf(abandoned) + " reason=" + reason +
+		" phase=" + getPhaseName() +
+		" lairAlive=" + String::valueOf(missionLairOid != 0) +
+		" planet=" + (agent == nullptr || agent->getZone() == nullptr ?
+			String("?") : agent->getZone()->getZoneName()));
+
 	orderAbandoned = abandoned;
 	// Close the resume gate BEFORE disengaging so an arrival tick that acquires
 	// the agent lock right after disengage cannot revive movement toward the
 	// lair being torn down (code-review round 2).
 	missionCleanupRequested = true;
 	dropTargetObserver();
+	disengageMissionLair();
 	disengageTarget(false);
 	targetOid = 0;
+	targetMissionWave = false;
 	missionAddsOverCapCycles = 0;
 	updateMissionAdds(0);
 	setPhase(MISSION_CLEANUP);
@@ -969,7 +1465,28 @@ bool SimHunterController::checkMissionSocialAggro(AiAgent* hunter) {
 		return true;
 	}
 
-	beginRetreat();
+	if (SimPlayerManager::instance()->isPveMissionBoardEnabled()) {
+		// A mission wave boundary is a break-off, not a retreat-cycle
+		// abandonment. Keep the same target/observer so the next HUNTING pass
+		// can resume this wave, but do not let the generic retreat cap fire
+		// before addsAbandonCycles has elapsed.
+		setPhase(RETREATING);
+		Vector3 current = hunter->getWorldPosition();
+		Vector3 away = current;
+		Vector3 direction = current - target->getWorldPosition();
+		direction.setZ(0.f);
+		if (direction.length2d() < 0.01f)
+			direction = Vector3::UNIT_X;
+		else
+			direction.normalize();
+		away = current + direction * SimPlayerManager::instance()->
+			getPveHunterRetreatRangeMeters();
+		disengageTarget(false);
+		updateMissionAdds(0);
+		moveTo(away);
+	} else {
+		beginRetreat();
+	}
 	return true;
 }
 
@@ -985,6 +1502,20 @@ void SimHunterController::updateMissionAdds(int adds) {
 
 void SimHunterController::onArrived() {
 	if (agent == nullptr)
+		return;
+
+	// Cross-planet legs (RELOCATING / BUFF_TRIP) run on the SHARED ticket-collector
+	// state machine, and this callback is its ONLY advance point: the 2->3
+	// (TICKET_DEPARTURE_ENTRY -> TICKET_DEPARTURE_COLLECTOR) transition and every
+	// later one live inside handleInterplanetaryTravelArrival(). Without this
+	// dispatch the hunter walked into the starport cell, went MOVING -> WAITING,
+	// and sat in TICKET_DEPARTURE_ENTRY until the 900s phase timeout while
+	// runActiveTick() spun on isInterplanetaryTravelActive() forever (observed
+	// live: no ev=ARRIVED in traveldiag.log across 250+ ticks). SimMinerController
+	// makes the identical call as its first statement; the handler is a no-op
+	// returning false whenever no travel is in flight, so the phase branches below
+	// are unaffected.
+	if (handleInterplanetaryTravelArrival())
 		return;
 
 	uint64 nowMs = System::getMiliTime();
@@ -1057,11 +1588,34 @@ void SimHunterController::onArrived() {
 	}
 
 	if (phase == TRAVEL_TO_TERMINAL) {
-		beginMissionAccept();
+		MissionDiagLog::event("TERM_ARRIVED", identityId, "resolved=" +
+			String::valueOf(missionTerminalResolved) +
+			" offersGenerated=" + String::valueOf(missionOffersGenerated));
+		// C3: do NOT generate here (onArrived runs on its own callback thread).
+		// Hand off to the single-flight runActiveTick lane, which owns all offer
+		// generation/retry (the ACCEPT_MISSION tick calls beginMissionAccept while
+		// missionOffersGenerated is still false). Leaving TRAVEL_TO_TERMINAL now
+		// also stops a concurrent tick from re-issuing terminal movement.
+		setPhase(ACCEPT_MISSION);
+		dwellUntilMs = 0;
+		scheduleActiveTick(100);
+		return;
+	}
+
+	if (phase == TRAVEL_TO_MISSION) {
+		scheduleActiveTick(0);
 		return;
 	}
 
 	if (phase == TRAVEL_TO_LAIR) {
+		// DIAGNOSTIC: proves the engine reported arrival at the (relocated,
+		// wilderness) lair -- i.e. the hunter physically reached it and is about
+		// to start the fight. Absence of this line for a revealed lair means the
+		// stall is upstream in movement, not in combat.
+		MissionDiagLog::event("LAIR_REACHED", identityId,
+			MissionDiagLog::fmtVec("lair", missionLairPosition) +
+			" dist=" + String::valueOf(agent == nullptr ? -1.f :
+				agent->getWorldPosition().distanceTo2d(missionLairPosition)));
 		beginHunting();
 		return;
 	}
@@ -1122,6 +1676,18 @@ void SimHunterController::onPathFailed() {
 	clearHybridMovementOnCancellation();
 	state = IDLE;
 
+	// Same reason as onArrived(): while a cross-planet leg is in flight the shared
+	// ticket-collector machine owns failure handling (bounded retryTicketApproach,
+	// then cancelTicketCollectorTravel -> onInterplanetaryTravelFinished(false),
+	// which the hunter already implements for both the relocation and buff-trip
+	// records). It must run BEFORE the phase branches below: RELOCATING has no
+	// branch at all (a failed leg just fell through to scheduleActiveTick and
+	// waited out the phase TTL), and BUFF_TRIP's branch killed the whole trip on
+	// the first failure instead of letting the approach retry. Deliberately ahead
+	// of the !orderActive guard so an abandoned order can still tear travel down.
+	if (handleInterplanetaryTravelPathFailed())
+		return;
+
 	if (!orderActive)
 		return;
 
@@ -1138,12 +1704,50 @@ void SimHunterController::onPathFailed() {
 		return;
 	}
 
+	if (phase == BUFF_TRIP) {
+		SimPlayerManager::PveBuffTrip trip;
+		bool haveTrip = SimPlayerManager::instance()->getPveHunterBuffTrip(
+			identityId, trip);
+		SimPlayerManager::instance()->finishPveHunterBuffTrip(identityId,
+			false);
+		clearInterplanetaryTravelState();
+		if (haveTrip && trip.returning) {
+			pveBuffTripReturning = false;
+			resumeAfterBuffTrip();
+		} else {
+			pveBuffTripAtHub = false;
+			pveBuffTripReturning = false;
+			pveDoctorFallbackNeeded = pveNeedDoctorBuff;
+			pveEntertainerFallbackNeeded = pveNeedEntertainerBuff;
+			finishPveBuffProviderFlow();
+		}
+		return;
+	}
+
 	if (missionHuntOrder && phase == TRAVEL_TO_TERMINAL) {
+		MissionDiagLog::event("TERM_PATH_FAILED", identityId, "resolved=" +
+			String::valueOf(missionTerminalResolved) +
+			" " + MissionDiagLog::fmtVec("terminal", missionTerminalPosition) +
+			" " + MissionDiagLog::fmtVec("pos", agent == nullptr ? Vector3() :
+				agent->getWorldPosition()));
 		beginMissionFallback();
 		return;
 	}
 
+	if (missionHuntOrder && phase == TRAVEL_TO_MISSION) {
+		beginMissionCleanup(true, "mission_offer_path_failed");
+		return;
+	}
+
 	if (missionHuntOrder && phase == TRAVEL_TO_LAIR) {
+		// DIAGNOSTIC: the stuck-watchdog gave up pathing to the lair. If this
+		// fires, the lair is genuinely unreachable overland (unlike miners); if
+		// neither LAIR_REACHED nor LAIR_PATHFAIL ever fires, the movement loop is
+		// wedged without resolving either way.
+		MissionDiagLog::event("LAIR_PATHFAIL", identityId,
+			MissionDiagLog::fmtVec("lair", missionLairPosition) +
+			" dist=" + String::valueOf(agent == nullptr ? -1.f :
+				agent->getWorldPosition().distanceTo2d(missionLairPosition)));
 		beginMissionCleanup(true, "lair_path_failed");
 		return;
 	}
@@ -1153,7 +1757,23 @@ void SimHunterController::onPathFailed() {
 		return;
 	}
 
-	if (phase == TRAVEL_OUT || phase == TRAVEL_HOME || phase == BUFF_UP) {
+	// TRAVEL_HOME is an EPILOGUE: the hunt's verdict was already decided and
+	// stored in orderAbandoned by beginTravelHome(). Failing the walk back must
+	// not overturn it — forcing abandoned=true here re-labelled successful hunts
+	// as abandonments and was the single dominant churn source observed live
+	// (34 of 34 abandons were path_failed_TRAVEL_HOME). Complete with the real
+	// outcome and let the idle loop re-acquire; the hunter does not need to be
+	// physically home to take its next contract.
+	if (phase == TRAVEL_HOME) {
+		completeOrder(orderAbandoned, orderAbandoned ?
+			String("path_failed_TRAVEL_HOME") :
+			String("travel_home_unreachable_after_success"));
+		return;
+	}
+
+	// TRAVEL_OUT and BUFF_UP are prologues — the hunt never happened, so a path
+	// failure there is a genuine abandonment.
+	if (phase == TRAVEL_OUT || phase == BUFF_UP) {
 		completeOrder(true, "path_failed_" + getPhaseName());
 		return;
 	}
@@ -1185,16 +1805,55 @@ void SimHunterController::beginHunting() {
 
 void SimHunterController::runActiveTick() {
 	ManagedReference<AiAgent*> strongAgent = agent;
-	if (strongAgent == nullptr)
+	if (strongAgent == nullptr) {
+		TravelDiagLog::event("TICK_ABORT", 0, "reason=noAgent");
 		return;
+	}
+
+	// C2: non-blocking single-flight guard. If another runActiveTick body is
+	// executing for this controller (they can be dispatched on different task
+	// threads), reschedule and bail rather than run concurrently. NEVER blocks,
+	// so it adds no lock-order/deadlock surface. RAII clears it on every exit.
+	bool expected = false;
+	if (!tickRunning.compare_exchange_strong(expected, true,
+			std::memory_order_acq_rel)) {
+		scheduleActiveTick(100);
+		return;
+	}
+	struct TickGuard {
+		std::atomic<bool>& flag;
+		~TickGuard() { flag.store(false, std::memory_order_release); }
+	} tickGuard{tickRunning};
 
 	uint64 nowMs = System::getMiliTime();
+	// Entry probe: distinguishes "the controller stopped ticking entirely" from
+	// "it ticks but never reaches the phase branch". Rate-limited by the same
+	// heartbeat interval and only while on a cross-planet leg, so it cannot spam.
+	if (phase == RELOCATING || phase == BUFF_TRIP)
+		TravelDiagLog::event("TICK_ENTRY", strongAgent->getObjectID(),
+			"phase=" + getPhaseName() +
+			" orderActive=" + String::valueOf(orderActive) +
+			" gen=" + String::valueOf(activeTickGeneration.load(
+				std::memory_order_relaxed)));
 	if (strongAgent->isDead()) {
 		cancelPveDoctorRequest();
 		if (!deathReported) {
 			deathReported = true;
+			SimPlayerManager::instance()->finishPveHunterBuffTrip(identityId,
+				false);
+			pveBuffTripAtHub = false;
+			pveBuffTripReturning = false;
+			if (SimPlayerManager::instance()->isPveMarketDispatchEnabled()) {
+				String actualPlanet;
+				if (strongAgent->getZone() != nullptr)
+					actualPlanet = strongAgent->getZone()->getZoneName();
+				SimPlayerManager::instance()->finishPveHunterRelocation(
+					identityId, false, actualPlanet);
+				clearInterplanetaryTravelState();
+			}
 			dropTargetObserver();
 			disengageTarget(false);
+			clearEngagedTelemetry();
 			if (missionHuntOrder)
 				beginMissionCleanup(true, "hunter_died");
 			else
@@ -1221,17 +1880,31 @@ void SimHunterController::runActiveTick() {
 	case TRAVEL_OUT: phaseTimeoutMs = 900000; break;
 	case TRAVEL_TO_TERMINAL: phaseTimeoutMs = 900000; break;
 	case ACCEPT_MISSION: phaseTimeoutMs = 600000; break;
+	case TRAVEL_TO_MISSION: phaseTimeoutMs = 900000; break;
 	case TRAVEL_TO_LAIR: phaseTimeoutMs = 900000; break;
+	case ENGAGING_LAIR: phaseTimeoutMs = 900000; break;
 	case AWAITING_WORLD: phaseTimeoutMs = 300000; break;
 	case RETREATING: phaseTimeoutMs = 180000; break;
 	case HEALING: phaseTimeoutMs = 900000; break;
 	case TRAVEL_HOME: phaseTimeoutMs = 900000; break;
 	case MISSION_CLEANUP: phaseTimeoutMs = 120000; break;
+	// Cross-planet legs had NO timeout, so a wedged ticket-collector approach
+	// pinned a hunter indefinitely (observed live: 870s stuck at leg 0 of 1 with
+	// nothing to recover it). Generous, because a real multi-leg journey is slow,
+	// but bounded so a stuck leg always resolves.
+	case RELOCATING: phaseTimeoutMs = 900000; break;
+	case BUFF_TRIP: phaseTimeoutMs = 900000; break;
 	default: break;
 	}
 	if (phaseTimeoutMs != 0 && phaseStartedAtMs != 0 &&
 			nowMs - phaseStartedAtMs >= phaseTimeoutMs) {
-		if (phase == TRAVEL_HOME)
+		if (phase == RELOCATING || phase == BUFF_TRIP) {
+			// Abandon the trip, not the hunter: cancel travel, drop the
+			// relocation/trip record, and let the matchmaker re-dispatch it on
+			// whatever planet it is actually standing on.
+			cancelTicketCollectorTravel("phase_timeout_" + getPhaseName());
+			completeOrder(true, "phase_timeout_" + getPhaseName());
+		} else if (phase == TRAVEL_HOME)
 			completeOrder(true, "phase_timeout_" + getPhaseName());
 		else if (missionHuntOrder && phase == MISSION_CLEANUP)
 			completeOrder(true, "cleanup_timeout");
@@ -1248,7 +1921,77 @@ void SimHunterController::runActiveTick() {
 		return;
 	}
 
+	if (phase == RELOCATING) {
+		// STALL HEARTBEAT. A wedged leg produces no transitions at all, so this
+		// is the only line that can catch it: it reports which travel phase the
+		// bot is parked in, whether it is actually moving (distance to the
+		// departure target, sampled over time), and the mover mode.
+		logTravelHeartbeat("RELOCATING", nowMs);
+		if (isInterplanetaryTravelActive()) {
+			scheduleActiveTick(2000);
+			return;
+		}
+		if (beginMarketRelocationLeg()) {
+			scheduleActiveTick(500);
+			return;
+		}
+		Zone* currentZone = strongAgent->getZone();
+		if (currentZone != nullptr)
+			order.marketTargetPlanet = currentZone->getZoneName();
+		setPhase(ANNOUNCE_JOB);
+		scheduleActiveTick(500);
+		return;
+	}
+
+	if (phase == BUFF_TRIP) {
+		logTravelHeartbeat("BUFF_TRIP", nowMs);
+		SimPlayerManager* manager = SimPlayerManager::instance();
+		SimPlayerManager::PveBuffTrip trip;
+		if (!manager->getPveHunterBuffTrip(identityId, trip)) {
+			pveBuffTripAtHub = false;
+			pveBuffTripReturning = false;
+			setPhase(ANNOUNCE_JOB);
+			scheduleActiveTick(500);
+			return;
+		}
+
+		if (trip.deadlineAtMs != 0 && nowMs >= trip.deadlineAtMs &&
+				!trip.returning) {
+			manager->finishPveHunterBuffTrip(identityId, false);
+			clearInterplanetaryTravelState();
+			pveBuffTripAtHub = false;
+			pveBuffTripReturning = false;
+			pveDoctorFallbackNeeded = pveNeedDoctorBuff;
+			pveEntertainerFallbackNeeded = pveNeedEntertainerBuff;
+			finishPveBuffProviderFlow();
+			return;
+		}
+
+		if (isInterplanetaryTravelActive()) {
+			scheduleActiveTick(2000);
+			return;
+		}
+		if (beginBuffTripLeg()) {
+			scheduleActiveTick(500);
+			return;
+		}
+		return;
+	}
+
 	if (phase == BUFF_UP) {
+		if (pveBuffTripAtHub) {
+			SimPlayerManager::PveBuffTrip trip;
+			if (SimPlayerManager::instance()->getPveHunterBuffTrip(identityId,
+					trip) && trip.deadlineAtMs != 0 &&
+					nowMs >= trip.deadlineAtMs) {
+				cancelPveDoctorRequest();
+				pveDoctorFallbackNeeded = pveNeedDoctorBuff;
+				pveEntertainerFallbackNeeded = pveNeedEntertainerBuff;
+				finishPveBuffProviderFlow();
+				return;
+			}
+		}
+
 		if (pveDoctorRequestActive) {
 			bool needDoctor = false;
 			bool needEntertainer = false;
@@ -1314,21 +2057,111 @@ void SimHunterController::runActiveTick() {
 	}
 
 	if (missionHuntOrder && phase == ACCEPT_MISSION) {
-		if (dwellUntilMs == 0 || nowMs >= dwellUntilMs)
-			spawnMissionLair();
+		if (dwellUntilMs == 0 || nowMs >= dwellUntilMs) {
+			dwellUntilMs = 0;
+			if (SimPlayerManager::instance()->isPveMissionBoardEnabled()) {
+				if (!missionOffersGenerated) {
+					// Still generating: the dwell was an offer-retry wait, not the
+					// board-reading dwell. Re-run generation for another pass.
+					beginMissionAccept();
+				} else if (!beginNextMissionOffer()) {
+					beginMissionCleanup(true, "mission_offers_expired");
+				}
+			} else {
+				spawnMissionLair();
+			}
+		}
 		else
 			scheduleActiveTick((int)Math::max(100,
 				(int)(dwellUntilMs - nowMs)));
 		return;
 	}
 
+	if (missionHuntOrder && phase == TRAVEL_TO_MISSION) {
+		PveBotMissionOffer offer;
+		if (!SimPlayerManager::instance()->getPveBotMissionOffer(identityId,
+				currentMissionOfferId, offer)) {
+			beginMissionCleanup(true, "mission_offer_unavailable");
+			return;
+		}
+		if (offer.revealed) {
+			missionLairOid = offer.lairOid;
+			missionLairPosition = offer.revealedPos;
+			setPhase(TRAVEL_TO_LAIR);
+			moveTo(missionLairPosition);
+			return;
+		}
+		if (strongAgent->getWorldPosition().distanceTo2d(offer.advertisedPos) <=
+				SimPlayerManager::instance()->
+				getPveMissionBoardLairRevealRadiusMeters()) {
+			SimPlayerManager::PveLairRevealResult revealResult =
+				SimPlayerManager::instance()->revealPveBotMissionLair(
+					strongAgent->getObjectID(), currentMissionOfferId);
+			if (revealResult == SimPlayerManager::PVE_LAIR_REVEAL_DEFER) {
+				// Global lair capacity is full (or the offer moved under us).
+				// The mission is still good - wait and retry rather than
+				// abandoning it and burning a terminal round trip.
+				scheduleActiveTick(2000);
+				return;
+			}
+			if (revealResult != SimPlayerManager::PVE_LAIR_REVEAL_OK) {
+				beginMissionCleanup(true, "mission_lair_reveal_failed");
+				return;
+			}
+			PveBotMissionOffer revealed;
+			if (!SimPlayerManager::instance()->getPveBotMissionOffer(identityId,
+					currentMissionOfferId, revealed) || !revealed.revealed) {
+				beginMissionCleanup(true, "mission_lair_record_missing");
+				return;
+			}
+			missionLairOid = revealed.lairOid;
+			missionLairPosition = revealed.revealedPos;
+			// An AiAgent has no client, so sendSystemMessage() would be a no-op.
+			// Broadcast through the same spatial channel every other hunter
+			// phase uses, so the reveal is actually observable in-world.
+			SimPlayerManager::instance()->announcePveHunterEvent(
+				strongAgent->getObjectID(), species.key,
+				"Transmission Received: Mission Target has been located.  Mission waypoint has been updated to exact location");
+			setPhase(TRAVEL_TO_LAIR);
+			moveTo(missionLairPosition);
+			return;
+		}
+		if (state != MOVING && state != CALCULATING_PATH)
+			moveTo(offer.advertisedPos);
+		scheduleActiveTick(1000);
+		return;
+	}
+
 	if (missionHuntOrder && phase == TRAVEL_TO_LAIR) {
+		// DIAGNOSTIC heartbeat: a decreasing dist across ticks = the hunter is
+		// walking overland to the lair (reach is fine, look downstream); a flat
+		// dist with state=MOVING/CALCULATING = wedged mover; state=IDLE with the
+		// engine reporting neither arrival nor failure = the 2-node off-navmesh
+		// fallback trap. state ints: 0 IDLE, 3 CALCULATING_PATH, 5 MOVING.
+		MissionDiagLog::event("LAIR_TRAVEL", identityId,
+			MissionDiagLog::fmtVec("lair", missionLairPosition) +
+			" dist=" + String::valueOf(strongAgent->getWorldPosition().
+				distanceTo2d(missionLairPosition)) +
+			" state=" + String::valueOf((int)state) +
+			" lairOid=" + String::valueOf(missionLairOid));
 		scheduleActiveTick(2000);
 		return;
 	}
 
 	if (missionHuntOrder && phase == MISSION_CLEANUP) {
 		continueAfterMissionCleanup();
+		return;
+	}
+
+	if (missionHuntOrder && phase == ENGAGING_LAIR &&
+			SimPlayerManager::instance()->isPveMissionBoardEnabled()) {
+		if (hasMissionWaveMobInRange()) {
+			disengageMissionLair();
+			setPhase(HUNTING);
+			scanForTarget();
+		} else {
+			engageMissionLair();
+		}
 		return;
 	}
 
@@ -1342,6 +2175,14 @@ void SimHunterController::runActiveTick() {
 		if (!SimPlayerManager::instance()->getPveHuntLair(
 				agent == nullptr ? 0 : agent->getObjectID(), lair) ||
 				!lair.alive || lair.cleanupQueued) {
+			if (SimPlayerManager::instance()->isPveMissionBoardEnabled()) {
+				PveBotMissionOffer offer;
+				if (SimPlayerManager::instance()->getPveBotMissionOffer(
+						identityId, currentMissionOfferId, offer) && offer.completed) {
+					scheduleActiveTick(100);
+					return;
+				}
+			}
 			beginMissionCleanup(true, "lair_unavailable");
 			return;
 		}
@@ -1491,7 +2332,28 @@ void SimHunterController::runActiveTick() {
 		else
 			moveToTarget();
 	} else {
-		scanForTarget();
+		bool foundTarget = scanForTarget();
+		if (missionHuntOrder && missionLairOid != 0)
+			// DIAGNOSTIC: fires each HUNTING scan on a mission. foundTarget=1
+			// repeatedly => the field never clears (wave mobs keep respawning /
+			// in range) so the hunter never turns to attack the lair structure;
+			// foundTarget=0 with the engage gate on => it transitions to
+			// ENGAGING_LAIR (see LAIR_ENGAGE next).
+			MissionDiagLog::event("LAIR_FIELD", identityId,
+				"foundTarget=" + String::valueOf(foundTarget) +
+				" engageGate=" + String::valueOf(SimPlayerManager::instance()->
+					getPveMissionBoardLairEngageAfterFieldClear()) +
+				" lairOid=" + String::valueOf(missionLairOid));
+		if (!foundTarget && missionHuntOrder &&
+				SimPlayerManager::instance()->isPveMissionBoardEnabled() &&
+				missionLairOid != 0 && SimPlayerManager::instance()->
+				getPveMissionBoardLairEngageAfterFieldClear()) {
+			MissionDiagLog::event("LAIR_ENGAGE", identityId,
+				MissionDiagLog::fmtVec("lair", missionLairPosition));
+			setPhase(ENGAGING_LAIR);
+			engageMissionLair();
+			return;
+		}
 		moveToPatrolPoint(nowMs);
 	}
 
@@ -1557,6 +2419,16 @@ bool SimHunterController::targetMatchesSpecies(CreatureObject* target) const {
 	if (targetAgent == nullptr || targetAgent->getSimPlayerBot())
 		return false;
 
+	if (missionHuntOrder && SimPlayerManager::instance()->
+			isPveMissionBoardEnabled()) {
+		if (missionLairOid == 0)
+			return false;
+		ManagedReference<SceneObject*> homeObject =
+			targetAgent->getHomeObject().get();
+		return homeObject != nullptr && homeObject->getObjectID() ==
+			missionLairOid;
+	}
+
 	const CreatureTemplate* targetTemplate = targetAgent->getCreatureTemplate();
 	if (targetTemplate == nullptr)
 		return false;
@@ -1566,10 +2438,10 @@ bool SimHunterController::targetMatchesSpecies(CreatureObject* target) const {
 		targetName.contains(species.templateFilter.toLowerCase());
 }
 
-void SimHunterController::scanForTarget() {
+bool SimHunterController::scanForTarget() {
 	ManagedReference<AiAgent*> strongAgent = agent;
 	if (strongAgent == nullptr || strongAgent->isInCombat())
-		return;
+		return false;
 
 	// Query the zone's QuadTree directly (like the proven spike scan at
 	// SimPlayerManager :9662). getCloseObjects() is NOT maintained for these
@@ -1582,7 +2454,7 @@ void SimHunterController::scanForTarget() {
 		Locker agentLock(strongAgent);
 		zone = strongAgent->getZone();
 		if (zone == nullptr)
-			return;
+			return false;
 		hunterPosition = strongAgent->getWorldPosition();
 	}
 
@@ -1608,8 +2480,44 @@ void SimHunterController::scanForTarget() {
 			continue;
 
 		selectTarget(candidateAgent);
-		return;
+		return true;
 	}
+	return false;
+}
+
+bool SimHunterController::isMissionWaveMob(CreatureObject* target) const {
+	return targetMatchesSpecies(target);
+}
+
+bool SimHunterController::hasMissionWaveMobInRange() const {
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr)
+		return false;
+	Zone* zone = nullptr;
+	Vector3 hunterPosition;
+	{
+		Locker agentLock(strongAgent);
+		zone = strongAgent->getZone();
+		if (zone == nullptr)
+			return false;
+		hunterPosition = strongAgent->getWorldPosition();
+	}
+	float scanRadius = SimPlayerManager::instance()->
+		getPveHunterScanRadiusMeters();
+	SortedVector<TreeEntry*> closeObjects;
+	zone->getInRangeObjects(hunterPosition.getX(), hunterPosition.getZ(),
+		hunterPosition.getY(), scanRadius, &closeObjects, true, true);
+	for (int i = 0; i < closeObjects.size(); ++i) {
+		SceneObject* object = static_cast<SceneObject*>(closeObjects.get(i));
+		CreatureObject* candidate = object == nullptr ? nullptr :
+			object->asCreatureObject();
+		if (candidate != nullptr && isMissionWaveMob(candidate) &&
+				candidate->isAttackableBy(strongAgent.get()) &&
+				hunterPosition.distanceTo(candidate->getWorldPosition()) <=
+				scanRadius)
+			return true;
+	}
+	return false;
 }
 
 bool SimHunterController::selectActiveCombatAttacker(AiAgent* hunter,
@@ -1785,6 +2693,8 @@ void SimHunterController::selectTarget(AiAgent* target) {
 	if (targetOid != selectedOid) {
 		dropTargetObserver();
 		targetOid = selectedOid;
+		targetMissionWave = missionHuntOrder && SimPlayerManager::instance()->
+			isPveMissionBoardEnabled() && isMissionWaveMob(target);
 		destructionHandled = false;
 		SimPlayerManager::instance()->recordPveHunterPhase(identityId,
 			agent == nullptr ? 0 : agent->getObjectID(), getPhaseName(), targetOid);
@@ -1834,6 +2744,123 @@ void SimHunterController::moveToTarget() {
 	moveTo(targetPos);
 }
 
+void SimHunterController::engageMissionLair() {
+	if (!orderActive || !missionHuntOrder || missionLairOid == 0 ||
+			agent == nullptr)
+		return;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(missionLairOid);
+	TangibleObject* lair = object == nullptr ? nullptr :
+		object->asTangibleObject();
+	if (lair == nullptr || lair->getZone() == nullptr) {
+		PveBotMissionOffer offer;
+		if (SimPlayerManager::instance()->getPveBotMissionOffer(identityId,
+				currentMissionOfferId, offer) && offer.completed) {
+			scheduleActiveTick(100);
+			return;
+		}
+		beginMissionCleanup(true, "mission_lair_unavailable");
+		return;
+	}
+
+	if (agent->getDistanceTo(lair) >
+			SimPlayerManager::instance()->getPveHunterWeaponRangeMeters()) {
+		// DIAGNOSTIC: hunter decided to attack the lair but is out of weapon
+		// range and is closing. A dist that never falls below range across ticks
+		// = it cannot close on the lair structure (final-approach stall).
+		MissionDiagLog::event("LAIR_ATTACK", identityId, "phase=approach"
+			" dist=" + String::valueOf(agent->getDistanceTo(lair)) +
+			" range=" + String::valueOf(SimPlayerManager::instance()->
+				getPveHunterWeaponRangeMeters()));
+		moveTo(lair->getWorldPosition());
+		return;
+	}
+
+	ManagedReference<SceneObject*> followed = agent->getFollowObject();
+	if (engagedMissionLairOid == missionLairOid && followed != nullptr &&
+			followed->getObjectID() == missionLairOid)
+		return;
+
+	disengageMissionLair();
+	// Snapshot the combat result + distance under the agent lock, then log AFTER
+	// releasing it -- never hold the actor lock across MissionDiagLog file I/O.
+	bool combatStarted = false;
+	float engageDist = 0.f;
+	{
+		Locker agentLock(agent);
+		engageDist = agent->getDistanceTo(lair);
+		combatStarted = CombatManager::instance()->startCombat(agent, lair);
+		if (combatStarted) {
+			// The lair is a TangibleObject combat defender. This deliberately does
+			// not touch targetOid or observerTargetOid; those fields remain owned
+			// by the HUNTING target tick.
+			agent->setTargetObject(lair);
+			agent->activateAiBehavior(true);
+		}
+	}
+	// DIAGNOSTIC: the decisive combat probe. started=1 means the hunter is in
+	// weapon range and CombatManager accepted the lair as a defender; if this
+	// fires repeatedly yet the lair never dies (no LAIR_DESTROYED_*), the gap is
+	// combat damage/behaviour, not movement or targeting.
+	MissionDiagLog::event("LAIR_ATTACK", identityId, "phase=engage"
+		" started=" + String::valueOf(combatStarted) +
+		" lairOid=" + String::valueOf(missionLairOid) +
+		" dist=" + String::valueOf(engageDist));
+	if (!combatStarted)
+		return;
+	engagedMissionLairOid = missionLairOid;
+}
+
+void SimHunterController::disengageMissionLair() {
+	if (engagedMissionLairOid == 0) {
+		return;
+	}
+	ManagedReference<AiAgent*> strongAgent = agent;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(engagedMissionLairOid);
+	TangibleObject* lair = object == nullptr ? nullptr :
+		object->asTangibleObject();
+	if (strongAgent != nullptr) {
+		Locker agentLock(strongAgent);
+		if (lair != nullptr) {
+			Locker lairLock(lair, strongAgent);
+			strongAgent->removeDefender(lair);
+			lair->removeDefender(strongAgent);
+		}
+		strongAgent->clearCombatState(true);
+		strongAgent->setTargetObject(nullptr);
+		strongAgent->setFollowObject(nullptr);
+		strongAgent->setWatchObject(nullptr);
+		strongAgent->clearQueueActions(true);
+		state = SimPlayerController::IDLE;
+	}
+	engagedMissionLairOid = 0;
+}
+
+void SimHunterController::onPveBotMissionLairDestroyed(uint64 lairOid) {
+	if (!orderActive || !missionHuntOrder || !SimPlayerManager::instance()->
+			isPveMissionBoardEnabled() || missionCleanupRequested ||
+			missionLairOid != lairOid)
+		return;
+
+	disengageMissionLair();
+	missionLairOid = 0;
+	currentMissionOfferId = 0;
+	missionAddsOverCapCycles = 0;
+	updateMissionAdds(0);
+	if (beginNextMissionOffer())
+		return;
+
+	missionOffersGenerated = false;
+	missionOfferAttempts = 0;
+	missionOfferVisitEpoch = 0;
+	missionOfferIds.removeAll();
+	terminalResolveWaitCycles = 0;
+	beginMissionTerminalLeg();
+}
+
 void SimHunterController::engageTarget() {
 	if (targetOid == 0 || agent == nullptr)
 		return;
@@ -1855,19 +2882,22 @@ void SimHunterController::engageTarget() {
 	if (observerTargetOid != targetOid || targetObserver == nullptr)
 		return;
 
-	Locker agentLock(agent);
-	if (!CombatManager::instance()->startCombat(agent, target))
-		return;
+	{
+		Locker agentLock(agent);
+		if (!CombatManager::instance()->startCombat(agent, target))
+			return;
 
-	// startCombat() sets the defender/follow target and both combat states;
-	// retain the explicit target assignment used by the hunter controller so
-	// its existing combat AI target remains stable across ticks.
-	agent->setTargetObject(target);
-	// Wake the AI behavior tree so its combat socket runs NOW and fires the
-	// weapon. Without this the tree stays on its long IDLE (Wait 3600) schedule
-	// and the hunter "aims" but does not shoot for seconds-to-minutes — the
-	// working SimPvPController does exactly this on engage (SimPvPController.cpp:842).
-	agent->activateAiBehavior(true);
+		// startCombat() sets the defender/follow target and both combat states;
+		// retain the explicit target assignment used by the hunter controller so
+		// its existing combat AI target remains stable across ticks.
+		agent->setTargetObject(target);
+		// Wake the AI behavior tree so its combat socket runs NOW and fires the
+		// weapon. Without this the tree stays on its long IDLE (Wait 3600) schedule
+		// and the hunter "aims" but does not shoot for seconds-to-minutes — the
+		// working SimPvPController does exactly this on engage (SimPvPController.cpp:842).
+		agent->activateAiBehavior(true);
+	}
+	registerEngagedTelemetry(target->getObjectID());
 	state = SimPlayerController::IDLE;
 }
 
@@ -1939,6 +2969,118 @@ void SimHunterController::dropTargetObserver() {
 	}
 }
 
+void SimHunterController::clearEngagedTelemetry() {
+	Vector<uint64> observedOids;
+	Vector<Reference<Observer*> > observers;
+	// Snapshot and clear under the telemetry lock, then drop the observers
+	// OUTSIDE it: dropObserver takes a creature lock, and registerEngagedTelemetry
+	// takes the creature lock before the telemetry lock, so holding both here in
+	// the opposite order would invert the lock hierarchy.
+	{
+		Locker telemetryLock(&engagedTelemetryMutex);
+		for (int i = 0; i < engagedTelemetry.size(); ++i) {
+			observedOids.add(engagedTelemetry.elementAt(i).getKey());
+			observers.add(engagedTelemetry.get(i));
+		}
+		engagedTelemetry.removeAll();
+	}
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	for (int i = 0; i < observedOids.size(); ++i) {
+		if (zoneServer == nullptr || observers.get(i) == nullptr)
+			continue;
+
+		ManagedReference<SceneObject*> object = zoneServer->getObject(
+			observedOids.get(i));
+		TangibleObject* target = object == nullptr ? nullptr :
+			object->asTangibleObject();
+		if (target != nullptr) {
+			Locker targetLock(target);
+			target->dropObserver(ObserverEventType::OBJECTDESTRUCTION,
+				observers.get(i));
+		}
+	}
+}
+
+void SimHunterController::registerEngagedTelemetry(uint64 creatureOid) {
+	if (creatureOid == 0 || agent == nullptr)
+		return;
+
+	// Reserve the slot before doing any work so two ticks racing on the same
+	// creature cannot both register an observer and double-count the kill.
+	{
+		Locker telemetryLock(&engagedTelemetryMutex);
+		if (engagedTelemetry.contains(creatureOid))
+			return;
+		engagedTelemetry.put(creatureOid, nullptr);
+	}
+
+	// Any early return from here on must release the reservation.
+	bool registered = false;
+	auto releaseReservationIfUnused = [this, creatureOid, &registered]() {
+		if (registered)
+			return;
+		Locker telemetryLock(&engagedTelemetryMutex);
+		int index = engagedTelemetry.find(creatureOid);
+		if (index != -1 && engagedTelemetry.get(index) == nullptr)
+			engagedTelemetry.drop(creatureOid);
+	};
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(creatureOid);
+	TangibleObject* creature = object == nullptr ? nullptr :
+		object->asTangibleObject();
+	if (creature == nullptr) {
+		releaseReservationIfUnused();
+		return;
+	}
+
+	uint64 identity = identityId;
+	uint64 bodyOid = agent->getObjectID();
+	Reference<Observer*> observer = new LambdaObserver(
+		new LambdaObserverFunction(
+			[identity, bodyOid, creatureOid](uint32, Observable*,
+				ManagedObject* arg1, uint64) -> int {
+				TangibleObject* participant = cast<TangibleObject*>(arg1);
+				bool participantVerified = participant != nullptr &&
+					participant->getObjectID() == bodyOid;
+				// Destruction callbacks must remain write-only and lock-free with
+				// respect to the hunter manager. The task handoff performs the
+				// pveMutex accounting after target choreography has completed.
+				Core::getTaskManager()->executeTask(
+					[identity, bodyOid, creatureOid, participantVerified]() {
+						SimPlayerManager::instance()->
+							handlePveHunterTelemetryDestructionHandoff(
+								identity, bodyOid, creatureOid,
+								participantVerified);
+					}, "SimPveHunterTelemetryDestructionHandoff");
+				return 1;
+			}, "SimPveHunterTelemetryDestructionObserver"));
+
+	{
+		Locker creatureLock(creature);
+		creature->registerObserver(ObserverEventType::OBJECTDESTRUCTION,
+			observer);
+	}
+
+	{
+		Locker telemetryLock(&engagedTelemetryMutex);
+		// Only fill our own reservation; a concurrent clear (order completed
+		// mid-registration) drops it, and we must not resurrect the entry.
+		int index = engagedTelemetry.find(creatureOid);
+		if (index != -1 && engagedTelemetry.get(index) == nullptr) {
+			engagedTelemetry.put(creatureOid, observer);
+			registered = true;
+		}
+	}
+
+	if (!registered) {
+		Locker creatureLock(creature);
+		creature->dropObserver(ObserverEventType::OBJECTDESTRUCTION, observer);
+	}
+}
+
 void SimHunterController::registerTargetObserver(uint64 target) {
 	if (target == 0 || agent == nullptr)
 		return;
@@ -1992,11 +3134,19 @@ void SimHunterController::onHuntDestruction(uint64 destroyedTargetOid,
 		handleTargetUnavailable();
 		return;
 	}
+	if (missionHuntOrder && SimPlayerManager::instance()->
+			isPveMissionBoardEnabled()) {
+		if (!targetMissionWave) {
+			handleTargetUnavailable();
+			return;
+		}
+	}
 
 	SimPlayerManager::instance()->recordPveHunterKill(identityId,
 		agent == nullptr ? 0 : agent->getObjectID(), destroyedTargetOid,
 		order.harvestKind, order.requestedResourceType, true);
 	targetOid = 0;
+	targetMissionWave = false;
 	order.kills++;
 	disengageTarget(false);
 	// The pursuit target is dead; clear the stale pursuit finalDestination so the
@@ -2004,6 +3154,12 @@ void SimHunterController::onHuntDestruction(uint64 destroyedTargetOid,
 	// corpse before the hunt loop reacquires (plan §Type Definitions: clear
 	// finalDestination on cancellation).
 	clearHybridMovementOnCancellation();
+	if (missionHuntOrder && SimPlayerManager::instance()->
+			isPveMissionBoardEnabled()) {
+		updateMissionAdds(0);
+		scheduleActiveTick(1000);
+		return;
+	}
 	if (order.kills >= order.quota) {
 		if (missionHuntOrder)
 			beginMissionCleanup(false, "quota");
@@ -2018,6 +3174,7 @@ void SimHunterController::onHuntDestruction(uint64 destroyedTargetOid,
 void SimHunterController::handleTargetUnavailable() {
 	dropTargetObserver();
 	targetOid = 0;
+	targetMissionWave = false;
 	destructionHandled = false;
 	updateMissionAdds(0);
 	disengageTarget(false);
@@ -2060,6 +3217,7 @@ void SimHunterController::beginRetreat() {
 	} else {
 		dropTargetObserver();
 		targetOid = 0;
+		targetMissionWave = false;
 	}
 
 	// Retain the observer only for an exact same-target resume. A later fresh
@@ -2137,8 +3295,10 @@ void SimHunterController::clearStaleCombat(const String& reason) {
 	if (strongAgent != nullptr)
 		shedAllDefendersBilaterally(strongAgent);
 	dropTargetObserver();
+	disengageMissionLair();
 	disengageTarget(false);
 	targetOid = 0;
+	targetMissionWave = false;
 	destructionHandled = false;
 	resetCombatGuard();
 	SimPlayerManager::instance()->info(
@@ -2176,14 +3336,17 @@ bool SimHunterController::defendAgainstInterceptor(AiAgent* hunter,
 	// Fight back, mirroring engageTarget's real-combat contract (attacker
 	// locked; startCombat cross-locks the defender). The selector already chose
 	// this attacker, so do not inspect or reselect from the defender list here.
-	Locker agentLock(hunter);
-	if (!CombatManager::instance()->startCombat(hunter, attacker))
-		return false;
+	{
+		Locker agentLock(hunter);
+		if (!CombatManager::instance()->startCombat(hunter, attacker))
+			return false;
 
-	hunter->setTargetObject(attacker);
-	// Wake the combat behavior tree so the hunter shoots back promptly instead
-	// of idling on its long behavior schedule (see engageTarget).
-	hunter->activateAiBehavior(true);
+		hunter->setTargetObject(attacker);
+		// Wake the combat behavior tree so the hunter shoots back promptly instead
+		// of idling on its long behavior schedule (see engageTarget).
+		hunter->activateAiBehavior(true);
+	}
+	registerEngagedTelemetry(attacker->getObjectID());
 
 	return true;
 }
@@ -2212,6 +3375,58 @@ void SimHunterController::moveToPatrolPoint(uint64 nowMs) {
 	moveTo(patrol);
 }
 
+void SimHunterController::logTravelHeartbeat(const String& phaseLabel,
+		uint64 nowMs) {
+	if (!TravelDiagLog::isLoggingEnabled())
+		return;
+
+	uint64 intervalMs = static_cast<uint64>(Math::max(1,
+		SimPlayerManager::instance()->getTravelDiagHeartbeatSeconds())) * 1000;
+	if (lastTravelHeartbeatMs != 0 && nowMs - lastTravelHeartbeatMs < intervalMs)
+		return;
+	lastTravelHeartbeatMs = nowMs;
+
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr)
+		return;
+
+	Vector3 position;
+	bool inCombat = false;
+	uint64 parentCell = 0;
+	{
+		Locker agentLock(strongAgent);
+		position = strongAgent->getWorldPosition();
+		inCombat = strongAgent->isInCombat();
+		ManagedReference<SceneObject*> parent = strongAgent->getParent().get();
+		if (parent != nullptr && parent->isCellObject())
+			parentCell = parent->getObjectID();
+	}
+
+	// Distance to the leg's run target, and the delta since the last heartbeat -
+	// a delta of ~0 across successive lines is the signature of a true stall as
+	// opposed to a slow walk.
+	float distance = position.distanceTo2d(travelDeparturePosition);
+	float delta = lastTravelHeartbeatDistance < 0.f ? 0.f :
+		(lastTravelHeartbeatDistance - distance);
+	lastTravelHeartbeatDistance = distance;
+
+	TravelDiagLog::event("HEARTBEAT", strongAgent->getObjectID(),
+		"phase=" + phaseLabel +
+		" ticketPhase=" + String::valueOf((int)ticketTravelPhase) +
+		" travelActive=" + String::valueOf(isInterplanetaryTravelActive()) +
+		" state=" + getDiagnosticStateName() +
+		" hybridActive=" + String::valueOf(isHybridMovementActive()) +
+		" collectorFound=" + String::valueOf(ticketCollectorFound) +
+		" attempts=" + String::valueOf(ticketApproachAttempts) +
+		" inCombat=" + String::valueOf(inCombat) +
+		" parentCell=" + String::valueOf(parentCell) +
+		" " + TravelDiagLog::fmtVec("pos", position) +
+		" " + TravelDiagLog::fmtVec("target", travelDeparturePosition) +
+		" " + TravelDiagLog::fmtDist("dist", distance) +
+		" " + TravelDiagLog::fmtDist("closedSinceLast", delta) +
+		" destZone=" + travelDestinationZone);
+}
+
 void SimHunterController::beginTravelHome(bool abandoned) {
 	if (!orderActive)
 		return;
@@ -2224,13 +3439,35 @@ void SimHunterController::beginTravelHome(bool abandoned) {
 	// Leaving the hunt always ends the target's observer lifetime. The only
 	// retained handle is the same-target retreat/resume path above.
 	dropTargetObserver();
+	disengageMissionLair();
 	disengageTarget(false);
 	targetOid = 0;
+	targetMissionWave = false;
+	// Walk back to a city on the planet the hunter is ACTUALLY on. Using the
+	// identity's home planet/city unconditionally produced a cross-planet
+	// coordinate the moment a hunter was relocated (market dispatch) or cloned
+	// elsewhere — moveTo() would then aim at a position that does not exist on
+	// this terrain and the leg could never succeed. homePlanet/homeCity remain
+	// the spawn/clone origin only (P.8.7 "wherever it is is the base").
+	String returnPlanet = order.homePlanet;
+	String returnCity = order.homeCity;
+	{
+		String currentPlanet;
+		SimPlayerManager::ShuttleportLocation nearest;
+		if (SimPlayerManager::instance()->getPveHunterCurrentRoutableCity(
+				agent == nullptr ? 0 : agent->getObjectID(), currentPlanet,
+				nearest) && !currentPlanet.isEmpty() &&
+				currentPlanet != returnPlanet) {
+			returnPlanet = nearest.planet;
+			returnCity = nearest.name;
+		}
+	}
+
 	Vector3 cantina;
 	Vector3 medCenter;
 	Vector3 home;
 	if (!SimPlayerManager::instance()->getPveHomeLocations(
-			order.homePlanet, order.homeCity, cantina, medCenter, home)) {
+			returnPlanet, returnCity, cantina, medCenter, home)) {
 		completeOrder(abandoned, "home_location_unavailable");
 		return;
 	}
@@ -2251,9 +3488,22 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 	// otherwise acquire it right after disengage and, with orderActive still
 	// set, revive movement toward the finished route (code-review round 2).
 	cancelPveDoctorRequest();
+	SimPlayerManager::instance()->finishPveHunterBuffTrip(identityId, false);
+	pveBuffTripAtHub = false;
+	pveBuffTripReturning = false;
+	if (SimPlayerManager::instance()->isPveMarketDispatchEnabled()) {
+		String actualPlanet;
+		if (agent != nullptr && agent->getZone() != nullptr)
+			actualPlanet = agent->getZone()->getZoneName();
+		SimPlayerManager::instance()->finishPveHunterRelocation(identityId,
+			false, actualPlanet);
+		clearInterplanetaryTravelState();
+	}
 	orderActive = false;
 	dropTargetObserver();
+	disengageMissionLair();
 	disengageTarget(false);
+	clearEngagedTelemetry();
 	if (abandoned)
 		SimPlayerManager::instance()->recordPveHunterAbandoned(identityId,
 			agent == nullptr ? 0 : agent->getObjectID(), reason);
@@ -2273,6 +3523,7 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 	missionAddsOverCapCycles = 0;
 	missionAddsEngaged = 0;
 	targetOid = 0;
+	targetMissionWave = false;
 	setPhase(DONE);
 	setPhase(IDLE_HOME);
 	scheduleActiveTick(30000);
@@ -2282,9 +3533,21 @@ void SimHunterController::teardown(const String& reason) {
 	activeTickGeneration++;
 	advanceWorkLoopGeneration("hunterTeardown");
 	cancelPveDoctorRequest();
+	SimPlayerManager::instance()->finishPveHunterBuffTrip(identityId, false);
+	pveBuffTripAtHub = false;
+	pveBuffTripReturning = false;
+	if (SimPlayerManager::instance()->isPveMarketDispatchEnabled()) {
+		String actualPlanet;
+		if (agent != nullptr && agent->getZone() != nullptr)
+			actualPlanet = agent->getZone()->getZoneName();
+		SimPlayerManager::instance()->finishPveHunterRelocation(identityId,
+			false, actualPlanet);
+		clearInterplanetaryTravelState();
+	}
 	clearHybridMovementOnCancellation();
 	dropTargetObserver();
 	disengageTarget(false);
+	clearEngagedTelemetry();
 	if (orderActive)
 		SimPlayerManager::instance()->recordPveHunterAbandoned(identityId,
 			agent == nullptr ? 0 : agent->getObjectID(), reason);

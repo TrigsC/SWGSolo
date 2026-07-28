@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.5.0` | 3 | F_0.5.0 P.8.7: market-driven mission hunting — real destroy missions, galactic travel, 3-wave lairs; terminal-visit epoch + atomic tick concurrency; bounded offer-retry; meat allocation-ceiling saturation fix |
 | `0.4.11` | 2 | F_0.4.7–F_0.4.11 cell-nav + starport ticket-collector travel: POB entry/egress/nearest-portal fixes, gated interplanetary collector travel, starport containment-margin fix, NPC pivot-swivel fixes, diagnostics behind a flag |
 | `0.4.6` | 2 | F_0.4.6 P.8.6: PvE hunter player-mimetic real buffs (need-gated doctor/entertainer providers, delayed-load cell resolution, synthetic fallback) |
 | `0.4.5` | 2 | fix: P.8.4 PvE hunter combat targeting — player-safe attack guard + defender-driven re-engagement |
@@ -13,6 +14,16 @@
 | `0.1.0` | 1 | chore: initialize TRIP workflow |
 
 # Changelog Summary
+
+- **v0.5.0 (Market-Driven Mission Hunting, F_0.5.0 / P.8.7 - Week 3, 28-07-2026)**:
+  - **Feature**: replaces scripted single-kill PvE hunts with **market-driven destroy missions**. A hunter is dispatched against the highest demand-pressure resource family a level-qualified lair can yield, travels (galactic, `switchZone`-based) to a real mission terminal, holds a generated offer, reveals a **real three-wave lair**, pulls and fights it with real combat, and books a simulated harvest that closes the crafter→hunter demand loop via the acquisition/demand ledger. Optional gated cross-planet **buff trips**. New dashboard telemetry: mission wave progress + a **Completed Missions** metric on the WILDS page.
+  - **Concurrency hardening (C1–C4)**: the two hunter tick threads (`onTick`, `runActiveTick`/`SimHunterActiveTickTask`) are made race-safe around the terminal mission board. A monotonic **terminal-visit epoch** (`SimPlayerManager::openTerminalVisit` / `pveTerminalVisitEpoch`) is captured on board-open and compared at commit, so `generatePveBotMissionOffers` discards any offer set that lands after the order concluded or the body drained (ABA-safe via a never-reset global sequence); `activeTickGeneration` becomes `std::atomic<uint64>` (latest-wins) and `tickRunning` a non-blocking single-flight guard. Verified live: offer churn 558→0, 0 `staleVisit`, 0 crashes/deadlocks.
+  - **Offer-retry**: an empty board no longer abandons the trip; the hunter dwells and re-generates for a bounded `offerMaxAttempts`×`offerRetrySeconds` budget (default 3×25s, span-clamped ≤480s).
+  - **Saturation fix (live-verified)**: hunters sat idle across restarts because the meat family's dispatch ceiling defaulted to 25% of `desiredReserve`; accumulated meat crossed it → `signalUnits=0` → `pressure=0` → no orders. Meat is the *only* hunter family, so `familyAllocationCeilingFraction.meat` 0.25→**1.0** (fills the true reserve target). On the fix, meat `effectiveCeiling` 25k→70.6k, `signalUnits` 0→41k, hunters left IDLE_HOME immediately (live config reload, no restart).
+  - **Scope**: simulation-only, all new behavior behind default-off Lua gates; diagnostics (`travelDiag`/`missionDiag`) compiled-in and flipped **off** for release. `death_watch_wraith.lua` and the `engine3` submodule excluded (pre-existing owner changes).
+  - **Review**: Codex multi-round loop → **APPROVED with observations** (8 findings: 6 addressed, 1 perf deferred, 1 owner-controlled live-activation handoff); C1–C4 separately Codex-reviewed; saturation fix trivial config (`docs/3-code-review/CR_w3_v0.5.0.md`).
+  - **Deferred**: full per-controller lifecycle-event strand (churn-not-crash, `DESIGN3` sketch); market matchmaker multiplicative scan (bounded, default-off); pure-helper unit-test seam (`docs/4-unit-tests/COVERAGE-DEBT.md`); the real meat **consumer** (next economy phase).
+  - **Note**: committed + tagged on `feat/p87-market-driven-mission-hunting`; **NOT** merged into `miner-ai` (owner policy, consistent with v0.4.6/v0.4.11).
 
 - **v0.4.11 (Cell-Nav + Starport Ticket-Collector Travel, F_0.4.7–F_0.4.11 - Week 2, 24-07-2026)**:
   - **Feature**: gated, simulation-only **interplanetary ticket-collector travel** for miners and PvP squads. A bot walks *through* the starport interior to the ticket collector in the enclosed hollow (enter hall → cell-egress-suppressed directed route → board ≤ 8 m) and walks out of the destination hollow after boarding (re-enter a cell → egress out the front). Built on three POB cell-navigation fixes: **F_0.4.8** cell entry (`findNextPosition` adopts the cell on the duplicate-skip branch — no more teleport-into-wall at portals), **F_0.4.9** cell egress (portal-following leg to a computed building exterior, then resume the original move), **F_0.4.10** nearest-exterior-portal selection (new native `BuildingObject::getNearestExteriorPortalPoint`, fixes multi-door starports).

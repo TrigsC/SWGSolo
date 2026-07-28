@@ -67,6 +67,14 @@
 #include "server/zone/objects/scene/SceneObjectType.h"
 #include "server/zone/objects/tangible/LairObject.h"
 #include "server/zone/objects/tangible/terminal/mission/MissionTerminal.h"
+#include "server/zone/managers/mission/DestroyMissionLairObserver.h"
+#include "TravelDiagLog.h"
+#include "MissionDiagLog.h"
+#include "server/zone/managers/creature/LairSpawn.h"
+#include "server/zone/managers/creature/SpawnGroup.h"
+#include "server/zone/objects/area/ActiveArea.h"
+#include "server/zone/objects/scene/SceneObject.h"
+#include "templates/mobile/LairTemplate.h"
 #include "server/zone/TreeEntry.h"
 #include "system/thread/ReadLocker.h"
 
@@ -462,6 +470,89 @@ struct ResourceIntelligenceEntry {
     bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
 
+static int getPveMarketResourceStat(const ResourceIntelligenceEntry& entry,
+		const String& stat) {
+	if (stat == "OQ") return entry.oq;
+	if (stat == "SR") return entry.sr;
+	if (stat == "CD") return entry.cd;
+	if (stat == "DR") return entry.dr;
+	if (stat == "HR") return entry.hr;
+	if (stat == "FL") return entry.fl;
+	if (stat == "MA") return entry.ma;
+	if (stat == "PE") return entry.pe;
+	if (stat == "UT") return entry.ut;
+	if (stat == "CR") return entry.cr;
+	return 0;
+}
+
+static bool pveMarketResourceCoversPlanet(
+		const ResourceIntelligenceEntry& entry, const String& planet) {
+	int start = 0;
+	while (start <= entry.zones.length()) {
+		int separator = entry.zones.indexOf(",", start);
+		String zone = separator < 0 ? entry.zones.subString(start) :
+			entry.zones.subString(start, separator - start);
+		if (zone.trim() == planet)
+			return true;
+		if (separator < 0)
+			break;
+		start = separator + 1;
+	}
+	return false;
+}
+
+static bool pveMarketResourceMatchesFamily(
+		const ResourceIntelligenceEntry& entry, const String& family) {
+	String type = entry.type.toLowerCase().trim();
+	return type == family || type.beginsWith(family + "_");
+}
+
+// A CreatureTemplate yields a resource CLASS ("meat_wild"), while a live
+// ResourceSpawn carries a CONCRETE type ("meat_wild_tatooine"). Equality between
+// the two never holds, so class-vs-concrete matching must be prefix-based - the
+// same relationship ResourceManager::getCurrentSpawn(class, zone) resolves.
+static bool pveMarketResourceMatchesClass(const String& resourceType,
+		const String& resourceClass) {
+	if (resourceClass.isEmpty() || resourceType.isEmpty())
+		return false;
+	return resourceType == resourceClass ||
+		resourceType.beginsWith(resourceClass + "_");
+}
+
+static bool pveMarketLairYieldsResource(const PveLairYieldEntry& lair,
+		const String& resourceType) {
+	for (int i = 0; i < lair.resourceTypes.size(); ++i) {
+		if (pveMarketResourceMatchesClass(resourceType,
+				lair.resourceTypes.get(i)))
+			return true;
+	}
+	return false;
+}
+
+static bool pveMarketQualityScore(const ResourceIntelligenceEntry& entry,
+		const String& family,
+		const VectorMap<String, Vector<PveMarketQualityWeight> >& weightsByFamily,
+		float& score) {
+	score = 0.f;
+	if (!weightsByFamily.contains(family))
+		return false;
+	const Vector<PveMarketQualityWeight>& weights =
+		weightsByFamily.get(family);
+	float numerator = 0.f;
+	float denominator = 0.f;
+	for (int i = 0; i < weights.size(); ++i) {
+		int value = getPveMarketResourceStat(entry, weights.get(i).stat);
+		if (value <= 0)
+			continue;
+		numerator += weights.get(i).weight * static_cast<float>(value);
+		denominator += weights.get(i).weight;
+	}
+	if (denominator <= 0.f)
+		return false;
+	score = numerator / denominator;
+	return true;
+}
+
 struct ResourceScoringProfile {
     String key;
     String category;
@@ -529,6 +620,37 @@ struct PveHunterFamilyCandidate {
 	uint64 expectedYieldUnits = 0;
 	float score = -1.f;
 };
+
+struct PveMarketCandidate {
+	int identityIndex = -1;
+	String family;
+	String resourceType;
+	uint64 resourceSpawnOid = 0;
+	float qualityScore = 0.f;
+	String planet;
+	String city;
+	uint64 terminalOid = 0;
+	PveMissionTerminalLocation terminal;
+	uint64 expectedYieldUnits = 0;
+	String lairTemplate;
+	float pressure = 0.f;
+	String demandProfileKey;
+	int demandResultIndex = -1;
+	int signalIndex = -1;
+};
+
+static bool pveMarketTieEarlier(const PveMarketCandidate& left,
+		const PveMarketCandidate& right) {
+	if (left.resourceSpawnOid != right.resourceSpawnOid)
+		return left.resourceSpawnOid < right.resourceSpawnOid;
+	int planetOrder = left.planet.compareTo(right.planet);
+	if (planetOrder != 0)
+		return planetOrder < 0;
+	int cityOrder = left.city.compareTo(right.city);
+	if (cityOrder != 0)
+		return cityOrder < 0;
+	return left.terminalOid < right.terminalOid;
+}
 
 struct DemandStateSimulationResult {
     String profileKey;
@@ -5636,6 +5758,16 @@ void SimPlayerManager::loadLuaConfig() {
 		allMissionTerminals.removeAll();
 		missionTerminalCityState.removeAll();
 		pveHuntLairs.removeAll();
+		pveBotMissions.removeAll();
+		// C4: clear per-identity visit epochs on reload. The seq counter is NOT
+		// reset (stays globally monotonic) so no in-flight visit can ABA-match.
+		pveTerminalVisitEpoch.removeAll();
+		pveLairYieldIndex.removeAll();
+		pveRelocations.removeAll();
+		pveBuffTrips.removeAll();
+		pveMarketLastRelocationMs.removeAll();
+		pveMarketDwellSinceMs.removeAll();
+		pveNextMissionOfferId = 1;
 		pveHunterBuffs.removeAll();
 		pveRealBuffFallbackSpecs.removeAll();
 		pveBuffProviderResolveStates.removeAll();
@@ -5661,11 +5793,23 @@ void SimPlayerManager::loadLuaConfig() {
 		pveHunterLastSiteAnnounceMs = 0;
 		pveMissionLairsSpawned = 0;
 		pveMissionLairsCleaned = 0;
+		pveCreatureKillsTotal = 0;
+		pveLairsDestroyedTotal = 0;
+		pveMissionsCompletedTotal = 0;
+		pveMissionsAbandonedTotal = 0;
+		pveAbandonReasons.removeAll();
+		pveMarketDemandedFamily = "";
+		pveMarketWinningResourceType = "";
+		pveMarketWinningPlanet = "";
+		pveMarketWinningQualityScore = 0.f;
 		pveDoctorInteractions = 0;
 		pveDancerWatches = 0;
 		pveMusicianListens = 0;
 		pveBuffDetoursSkipped = 0;
 		pveSyntheticFallbacks = 0;
+		pveBuffTripsStarted = 0;
+		pveBuffTripsCompleted = 0;
+		pveBuffTripsFallback = 0;
 		pveBuffLastSourceByBody.removeAll();
 		pveHunterLastAnnounceByIdentity.removeAll();
 		pveSpike = PveSpikeState();
@@ -5675,8 +5819,16 @@ void SimPlayerManager::loadLuaConfig() {
 	pveEnabled = false;
 	pveHunterBotsEnabled = false;
 	pveMissionHuntEnabled = false;
+	pveMissionBoardEnabled = false;
 	pveRealBuffsEnabled = false;
 	pveRealBuffsFallbackSynthetic = true;
+	pveRealBuffHubsEnabled = false;
+	pveRealBuffHubKeys.removeAll();
+	pveRealBuffHubKeys.add("corellia:coronet");
+	pveRealBuffHubKeys.add("tatooine:mos_eisley");
+	pveRealBuffHubKeys.add("naboo:theed");
+	pveMaxBuffTripsPerHunt = 1;
+	pveBuffTripDeadlineSeconds = 1800;
 	pveRealBuffReapplySeconds = 900;
 	pveBuffProviderScanRadiusMeters = 400.f;
 	pveDoctorProviderName = "Doctor Buffer";
@@ -5690,8 +5842,8 @@ void SimPlayerManager::loadLuaConfig() {
 	pveMissionSpawnDistanceMeters = 200.f;
 	pveMissionTerminalScanRadiusMeters = 600.f;
 	pveMissionMaxSpawnPointTries = 32;
-	pveMissionMaxSimultaneousAdds = 1;
-	pveMissionAddsAbandonCycles = 3;
+	pveMissionMaxSimultaneousAdds = 3;
+	pveMissionAddsAbandonCycles = 8;
 	pveMissionTerminalDwellSeconds = 5;
 	pveMissionTerminalResolveWaitCycles = 10;
 	pveMissionLairTimeoutSeconds = 1800;
@@ -5702,6 +5854,50 @@ void SimPlayerManager::loadLuaConfig() {
 	pveSpikeEnabled = false;
 	pveAcquisitionLedgerEnabled = false;
 	pveAcquisitionLedgerMinerCreatureExclusion = true;
+	pveLocationBasedEligibility = false;
+	pveDispatchRadiusMeters = 2500.f;
+	pveMissionBoardAcceptedTerminalTypes.removeAll();
+	pveMissionBoardAcceptedTerminalTypes.add("general");
+	pveMissionBoardMaxHeldMissions = 2;
+	pveMissionBoardSameDirectionArcDegrees = 60.f;
+	pveMissionBoardBaseDistanceMeters = 1000;
+	pveMissionBoardDifficultyDistanceFactor = 0;
+	pveMissionBoardRandomDistanceMeters = 1000;
+	pveMissionBoardDifficultyRandomDistance = 0;
+	pveMissionBoardLairRevealRadiusMeters = 120.f;
+	pveMissionBoardLairEngageAfterFieldClear = true;
+	pveMissionBoardMaxOfferAgeSeconds = 1800;
+	pveMissionBoardRevealRelocateEnabled = true;
+	pveMissionBoardOfferRetrySeconds = 25;
+	pveMissionBoardOfferMaxAttempts = 3;
+	pveMarketDispatchEnabled = false;
+	pveMarketDispatchFamilies.removeAll();
+	pveMarketDispatchFamilies.add("meat");
+	pveMarketDispatchFamilies.add("hide");
+	pveMarketDispatchFamilies.add("bone");
+	pveMarketQualityWeights.removeAll();
+	Vector<PveMarketQualityWeight> meatWeights;
+	PveMarketQualityWeight meatOq;
+	meatOq.stat = "OQ";
+	meatOq.weight = 1.f;
+	meatWeights.add(meatOq);
+	pveMarketQualityWeights.put("meat", meatWeights);
+	Vector<PveMarketQualityWeight> hideWeights;
+	PveMarketQualityWeight hideOq;
+	hideOq.stat = "OQ";
+	hideOq.weight = 0.6f;
+	hideWeights.add(hideOq);
+	PveMarketQualityWeight hideSr;
+	hideSr.stat = "SR";
+	hideSr.weight = 0.4f;
+	hideWeights.add(hideSr);
+	pveMarketQualityWeights.put("hide", hideWeights);
+	pveMarketQualityWeights.put("bone", hideWeights);
+	pveMarketMinQualityScore = 0.f;
+	pveMarketMaxConcurrentRelocations = 1;
+	pveMarketMinHuntersPerActivePlanet = 1;
+	pveMarketRelocationCooldownSeconds = 1800;
+	pveMarketRelocationMinDwellSeconds = 900;
 	pveAcquisitionLedgerCreatureFamilies.removeAll();
 	pveAcquisitionLedgerCreatureClassMarkers.removeAll();
 	pveAcquisitionLedgerCreatureClassMarkers.add("creature_resources");
@@ -6082,6 +6278,24 @@ void SimPlayerManager::loadLuaConfig() {
             configuredSpawnBatchDelayMs, 250, 60000);
     }
     spawnStartupConfig.pop();
+
+    LuaObject travelDiagConfig = config.getObjectField("travelDiag");
+    if (travelDiagConfig.isValidTable()) {
+        TravelDiagLog::setLoggingEnabled(
+            travelDiagConfig.getBooleanField("logging", false));
+        travelDiagHeartbeatSeconds = clampMinerInt(
+            travelDiagConfig.getIntField("heartbeatSeconds",
+                travelDiagHeartbeatSeconds),
+            travelDiagHeartbeatSeconds, 1, 600);
+    }
+    travelDiagConfig.pop();
+
+    LuaObject missionDiagConfig = config.getObjectField("missionDiag");
+    if (missionDiagConfig.isValidTable()) {
+        MissionDiagLog::setLoggingEnabled(
+            missionDiagConfig.getBooleanField("logging", false));
+    }
+    missionDiagConfig.pop();
 
     LuaObject cellNavDiagConfig = config.getObjectField("cellNavDiag");
     if (cellNavDiagConfig.isValidTable()) {
@@ -6652,6 +6866,11 @@ void SimPlayerManager::loadLuaConfig() {
                             loc.shuttlePoint = city.getStringField("shuttlePoint");
                             loc.hangoutManual = city.getBooleanField(
                                 "hangoutManual", false);
+                            // P.8.7: routing-graph-only node (see the struct
+                            // comment). Defaults false, so every pre-existing
+                            // city keeps its current placement behavior.
+                            loc.routingOnly = city.getBooleanField(
+                                "routingOnly", false);
                             allShuttleports.add(loc);
                         }
                     }
@@ -6662,6 +6881,15 @@ void SimPlayerManager::loadLuaConfig() {
         }
     }
     shuttles.pop();
+
+	// The board registry is keyed by routable shuttleport cities, but the
+	// PvE species table is parsed before shuttleports. Re-seed once the graph
+	// nodes are available; the legacy registry is unchanged.
+	if (pveMissionBoardEnabled) {
+		Locker pveLock(&pveMutex);
+		configurePveMissionTerminalCitiesLocked(pveHuntSpecies);
+	}
+	buildPveLairYieldIndex();
 
     if (allShuttleports.size() == 0) {
 #ifdef DEBUG_SIMPLAYER
@@ -6748,8 +6976,16 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	pveHunterBotsEnabled = pveConfig.getBooleanField(
 		"enableHunterBots", pveHunterBotsEnabled);
 	pveMissionHuntEnabled = false;
+	pveMissionBoardEnabled = false;
 	pveRealBuffsEnabled = false;
 	pveRealBuffsFallbackSynthetic = true;
+	pveRealBuffHubsEnabled = false;
+	pveRealBuffHubKeys.removeAll();
+	pveRealBuffHubKeys.add("corellia:coronet");
+	pveRealBuffHubKeys.add("tatooine:mos_eisley");
+	pveRealBuffHubKeys.add("naboo:theed");
+	pveMaxBuffTripsPerHunt = 1;
+	pveBuffTripDeadlineSeconds = 1800;
 	pveRealBuffReapplySeconds = 900;
 	pveBuffProviderScanRadiusMeters = 400.f;
 	pveDoctorProviderName = "Doctor Buffer";
@@ -6760,6 +6996,48 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	pveDoctorInteractionTimeoutMs = 45000;
 	pveEntertainerDwellMs = 4000;
 	pveProviderApproachRangeMeters = 8.f;
+	pveMissionBoardAcceptedTerminalTypes.removeAll();
+	pveMissionBoardAcceptedTerminalTypes.add("general");
+	pveMissionBoardMaxHeldMissions = 2;
+	pveMissionBoardSameDirectionArcDegrees = 60.f;
+	pveMissionBoardBaseDistanceMeters = 1000;
+	pveMissionBoardDifficultyDistanceFactor = 0;
+	pveMissionBoardRandomDistanceMeters = 1000;
+	pveMissionBoardDifficultyRandomDistance = 0;
+	pveMissionBoardLairRevealRadiusMeters = 120.f;
+	pveMissionBoardLairEngageAfterFieldClear = true;
+	pveMissionBoardMaxOfferAgeSeconds = 1800;
+	pveMissionBoardRevealRelocateEnabled = true;
+	pveMissionBoardOfferRetrySeconds = 25;
+	pveMissionBoardOfferMaxAttempts = 3;
+	pveMarketDispatchEnabled = false;
+	pveMarketDispatchFamilies.removeAll();
+	pveMarketDispatchFamilies.add("meat");
+	pveMarketDispatchFamilies.add("hide");
+	pveMarketDispatchFamilies.add("bone");
+	pveMarketQualityWeights.removeAll();
+	Vector<PveMarketQualityWeight> defaultMeatWeights;
+	PveMarketQualityWeight defaultMeatOq;
+	defaultMeatOq.stat = "OQ";
+	defaultMeatOq.weight = 1.f;
+	defaultMeatWeights.add(defaultMeatOq);
+	pveMarketQualityWeights.put("meat", defaultMeatWeights);
+	Vector<PveMarketQualityWeight> defaultHideWeights;
+	PveMarketQualityWeight defaultHideOq;
+	defaultHideOq.stat = "OQ";
+	defaultHideOq.weight = 0.6f;
+	defaultHideWeights.add(defaultHideOq);
+	PveMarketQualityWeight defaultHideSr;
+	defaultHideSr.stat = "SR";
+	defaultHideSr.weight = 0.4f;
+	defaultHideWeights.add(defaultHideSr);
+	pveMarketQualityWeights.put("hide", defaultHideWeights);
+	pveMarketQualityWeights.put("bone", defaultHideWeights);
+	pveMarketMinQualityScore = 0.f;
+	pveMarketMaxConcurrentRelocations = 1;
+	pveMarketMinHuntersPerActivePlanet = 1;
+	pveMarketRelocationCooldownSeconds = 1800;
+	pveMarketRelocationMinDwellSeconds = 900;
 	LuaObject missionHuntConfig = pveConfig.getObjectField("missionHunt");
 	if (missionHuntConfig.isValidTable()) {
 		pveMissionHuntEnabled = missionHuntConfig.getBooleanField(
@@ -6799,6 +7077,159 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 			pveNavmeshRepathTries, 1, 20);
 	}
 	missionHuntConfig.pop();
+
+	LuaObject missionBoardConfig = pveConfig.getObjectField("missionBoard");
+	if (missionBoardConfig.isValidTable()) {
+		pveMissionBoardEnabled = missionBoardConfig.getBooleanField(
+			"enabled", false);
+		pveMissionBoardMaxHeldMissions = clampMinerInt(
+			missionBoardConfig.getIntField("maxHeldMissions"),
+			pveMissionBoardMaxHeldMissions, 1, 2);
+		pveMissionBoardSameDirectionArcDegrees = clampFloatRange(
+			missionBoardConfig.getFloatField("sameDirectionArcDegrees",
+				pveMissionBoardSameDirectionArcDegrees), 0.f, 180.f);
+		pveMissionBoardBaseDistanceMeters = clampMinerInt(
+			missionBoardConfig.getIntField("baseDistanceMeters"),
+			pveMissionBoardBaseDistanceMeters, 1, 100000);
+		pveMissionBoardDifficultyDistanceFactor = clampMinerInt(
+			missionBoardConfig.getIntField("difficultyDistanceFactor"),
+			pveMissionBoardDifficultyDistanceFactor, 0, 100000);
+		pveMissionBoardRandomDistanceMeters = clampMinerInt(
+			missionBoardConfig.getIntField("randomDistanceMeters"),
+			pveMissionBoardRandomDistanceMeters, 0, 100000);
+		pveMissionBoardDifficultyRandomDistance = clampMinerInt(
+			missionBoardConfig.getIntField("difficultyRandomDistance"),
+			pveMissionBoardDifficultyRandomDistance, 0, 100000);
+		pveMissionBoardLairRevealRadiusMeters = clampFloatRange(
+			missionBoardConfig.getFloatField("lairRevealRadiusMeters",
+				pveMissionBoardLairRevealRadiusMeters), 16.f, 1000.f);
+		pveMissionBoardLairEngageAfterFieldClear =
+			missionBoardConfig.getBooleanField("lairEngageAfterFieldClear",
+				pveMissionBoardLairEngageAfterFieldClear);
+		pveMissionBoardMaxOfferAgeSeconds = clampMinerInt(
+			missionBoardConfig.getIntField("maxOfferAgeSeconds"),
+			pveMissionBoardMaxOfferAgeSeconds, 60, 86400);
+		pveMissionBoardRevealRelocateEnabled =
+			missionBoardConfig.getBooleanField("revealRelocateEnabled",
+				pveMissionBoardRevealRelocateEnabled);
+		pveMissionBoardOfferRetrySeconds = clampMinerInt(
+			missionBoardConfig.getIntField("offerRetrySeconds"),
+			pveMissionBoardOfferRetrySeconds, 5, 300);
+		pveMissionBoardOfferMaxAttempts = clampMinerInt(
+			missionBoardConfig.getIntField("offerMaxAttempts"),
+			pveMissionBoardOfferMaxAttempts, 1, 10);
+		// Keep the whole retry window inside SimHunterController's 600s
+		// ACCEPT_MISSION phase timeout so a valid partial board is never discarded
+		// by a phase timeout mid-retry. The wait span is (attempts-1)*retry; trim
+		// attempts (never below 1) until it fits a budget that leaves room for the
+		// terminal read dwell + margin.
+		static const int OFFER_RETRY_BUDGET_SECONDS = 480;
+		while (pveMissionBoardOfferMaxAttempts > 1 &&
+				(pveMissionBoardOfferMaxAttempts - 1) *
+					pveMissionBoardOfferRetrySeconds > OFFER_RETRY_BUDGET_SECONDS)
+			--pveMissionBoardOfferMaxAttempts;
+
+		LuaObject acceptedTypes = missionBoardConfig.getObjectField(
+			"acceptedTerminalTypes");
+		if (acceptedTypes.isValidTable()) {
+			pveMissionBoardAcceptedTerminalTypes.removeAll();
+			for (int i = 1; i <= acceptedTypes.getTableSize(); ++i) {
+				String type = acceptedTypes.getStringAt(i).toLowerCase().trim();
+				if (!type.isEmpty() &&
+						!pveMissionBoardAcceptedTerminalTypes.contains(type))
+					pveMissionBoardAcceptedTerminalTypes.add(type);
+			}
+		}
+		acceptedTypes.pop();
+	}
+	missionBoardConfig.pop();
+	if (pveMissionBoardAcceptedTerminalTypes.size() == 0)
+		pveMissionBoardAcceptedTerminalTypes.add("general");
+
+	pveLocationBasedEligibility = false;
+	pveDispatchRadiusMeters = 2500.f;
+	LuaObject dispatchConfig = pveConfig.getObjectField("dispatch");
+	if (dispatchConfig.isValidTable()) {
+		pveLocationBasedEligibility = dispatchConfig.getBooleanField(
+			"locationBasedEligibility", false);
+		pveDispatchRadiusMeters = clampFloatRange(
+			dispatchConfig.getFloatField("dispatchRadiusMeters",
+				pveDispatchRadiusMeters), 100.f, 100000.f);
+	}
+	dispatchConfig.pop();
+
+	LuaObject marketDispatchConfig = pveConfig.getObjectField(
+		"marketDispatch");
+	if (marketDispatchConfig.isValidTable()) {
+		pveMarketDispatchEnabled = marketDispatchConfig.getBooleanField(
+			"enabled", false);
+		LuaObject families = marketDispatchConfig.getObjectField("families");
+		if (families.isValidTable()) {
+			pveMarketDispatchFamilies.removeAll();
+			for (int i = 1; i <= families.getTableSize(); ++i) {
+				String family = families.getStringAt(i).toLowerCase().trim();
+				if ((family == "meat" || family == "hide" || family == "bone") &&
+						!pveMarketDispatchFamilies.contains(family))
+					pveMarketDispatchFamilies.add(family);
+			}
+		}
+		families.pop();
+		pveMarketMinQualityScore = clampFloatRange(
+			marketDispatchConfig.getFloatField("minQualityScore", 0.f),
+			0.f, 1000.f);
+		pveMarketMaxConcurrentRelocations = clampMinerInt(
+			marketDispatchConfig.getIntField("maxConcurrentRelocations",
+				pveMarketMaxConcurrentRelocations),
+			pveMarketMaxConcurrentRelocations, 0, 64);
+		pveMarketMinHuntersPerActivePlanet = clampMinerInt(
+			marketDispatchConfig.getIntField("minHuntersPerActivePlanet",
+				pveMarketMinHuntersPerActivePlanet),
+			pveMarketMinHuntersPerActivePlanet, 0, 64);
+		pveMarketRelocationCooldownSeconds = clampMinerInt(
+			marketDispatchConfig.getIntField("relocationCooldownSeconds",
+				pveMarketRelocationCooldownSeconds),
+			pveMarketRelocationCooldownSeconds, 0, 86400);
+		pveMarketRelocationMinDwellSeconds = clampMinerInt(
+			marketDispatchConfig.getIntField("relocationMinDwellSeconds",
+				pveMarketRelocationMinDwellSeconds),
+			pveMarketRelocationMinDwellSeconds, 0, 86400);
+
+		const char* defaultFamilies[] = {"meat", "hide", "bone"};
+		LuaObject qualityWeights = marketDispatchConfig.getObjectField(
+			"qualityWeights");
+		if (qualityWeights.isValidTable()) {
+			for (int i = 0; i < 3; ++i) {
+				String family = defaultFamilies[i];
+				LuaObject familyWeights = qualityWeights.getObjectField(family);
+				if (!familyWeights.isValidTable()) {
+					familyWeights.pop();
+					continue;
+				}
+				Vector<PveMarketQualityWeight> weights;
+				const char* stats[] = {"OQ", "SR", "CD", "DR", "HR", "FL",
+					"MA", "PE", "UT", "CR"};
+				for (int statIndex = 0; statIndex < 10; ++statIndex) {
+					float weight = familyWeights.getFloatField(stats[statIndex], 0.f);
+					if (weight > 0.f) {
+						PveMarketQualityWeight entry;
+						entry.stat = stats[statIndex];
+						entry.weight = weight;
+						weights.add(entry);
+					}
+				}
+				if (weights.size() > 0)
+					pveMarketQualityWeights.put(family, weights);
+				familyWeights.pop();
+			}
+		}
+		qualityWeights.pop();
+	}
+	marketDispatchConfig.pop();
+	if (pveMarketDispatchFamilies.size() == 0) {
+		pveMarketDispatchFamilies.add("meat");
+		pveMarketDispatchFamilies.add("hide");
+		pveMarketDispatchFamilies.add("bone");
+	}
 
 	Vector<PveBuffSpec> rebuiltRealBuffFallbackSpecs;
 	LuaObject realBuffsConfig = pveConfig.getObjectField("realBuffs");
@@ -6844,6 +7275,36 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		pveProviderApproachRangeMeters = clampFloatRange(
 			realBuffsConfig.getFloatField("providerApproachRangeMeters"),
 			1.f, 64.f);
+
+		LuaObject buffHubsConfig = realBuffsConfig.getObjectField("buffHubs");
+		if (buffHubsConfig.isValidTable()) {
+			pveRealBuffHubsEnabled = buffHubsConfig.getBooleanField(
+				"enabled", false);
+			pveMaxBuffTripsPerHunt = clampMinerInt(
+				buffHubsConfig.getIntField("maxBuffTripsPerHunt",
+					pveMaxBuffTripsPerHunt), pveMaxBuffTripsPerHunt, 0, 16);
+			pveBuffTripDeadlineSeconds = clampMinerInt(
+				buffHubsConfig.getIntField("buffTripDeadlineSeconds",
+					pveBuffTripDeadlineSeconds), pveBuffTripDeadlineSeconds,
+				60, 86400);
+
+			LuaObject hubs = buffHubsConfig.getObjectField("hubs");
+			if (hubs.isValidTable()) {
+				pveRealBuffHubKeys.removeAll();
+				for (int i = 1; i <= hubs.getTableSize(); ++i) {
+					String hub = hubs.getStringAt(i).trim().toLowerCase();
+					if (!hub.isEmpty())
+						pveRealBuffHubKeys.add(hub);
+				}
+			}
+			hubs.pop();
+		}
+		buffHubsConfig.pop();
+		if (pveRealBuffHubKeys.size() == 0) {
+			pveRealBuffHubKeys.add("corellia:coronet");
+			pveRealBuffHubKeys.add("tatooine:mos_eisley");
+			pveRealBuffHubKeys.add("naboo:theed");
+		}
 
 		LuaObject fallbackBuffs = realBuffsConfig.getObjectField(
 			"fallbackBuffs");
@@ -7069,6 +7530,18 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 				100, 3600000));
 	}
 	acquisitionLedger.pop();
+	if (pveMarketDispatchEnabled && acquisitionLedgerEnabled) {
+		for (int i = 0; i < pveMarketDispatchFamilies.size(); ++i) {
+			String family = pveMarketDispatchFamilies.get(i);
+			if (!acquisitionLedgerFamilies.contains(family)) {
+				acquisitionLedgerFamilies.add(family);
+				if (!acquisitionLedgerReserveTargets.contains(family))
+					acquisitionLedgerReserveTargets.put(family, 2500);
+				if (!acquisitionLedgerCeilingFractions.contains(family))
+					acquisitionLedgerCeilingFractions.put(family, 0.25f);
+			}
+		}
+	}
 
 	{
 		Locker pveLock(&pveMutex);
@@ -7643,9 +8116,18 @@ void SimPlayerManager::mintPveIdentitiesIfNeeded() {
 			identity.profession = "hunter";
 			identity.skillTier = pveSkillTier;
 
-			if (allShuttleports.size() > 0) {
+			// P.8.7: rotate home cities over placement-eligible cities only, so
+			// a routing-graph node never becomes a hunter's spawn/clone origin.
+			Vector<int> homeCandidates;
+			for (int i = 0; i < allShuttleports.size(); ++i) {
+				if (!allShuttleports.get(i).routingOnly)
+					homeCandidates.add(i);
+			}
+
+			if (homeCandidates.size() > 0) {
 				const ShuttleportLocation& home = allShuttleports.get(
-					pveNextHomeCityIndex % allShuttleports.size());
+					homeCandidates.get(
+						pveNextHomeCityIndex % homeCandidates.size()));
 				identity.homePlanet = home.planet;
 				identity.homeCity = home.name;
 				pveNextHomeCityIndex++;
@@ -7959,6 +8441,11 @@ void SimPlayerManager::drainSimPresenceBodies(uint64 nowMs) {
 				pveBodyIdentityIds.remove(j);
 				pveIdentityBodyOids.drop(identityId);
 				pveRespawnDueAtMs.drop(identityId);
+				// C4: invalidate the terminal-visit epoch synchronously here too.
+				// Drain destroys the body but relies on eventual teardown to clear
+				// the order; without this, an in-flight generation could still
+				// commit a board for a now-destroyed body before teardown runs.
+				pveTerminalVisitEpoch.drop(identityId);
 			}
 		}
 	}
@@ -8209,6 +8696,31 @@ void SimPlayerManager::governPvePopulation(uint64 nowMs) {
 	}
 }
 
+static String pveMissionTerminalType(MissionTerminal* terminal) {
+	if (terminal == nullptr)
+		return "";
+	if (terminal->isGeneralTerminal()) return "general";
+	if (terminal->isArtisanTerminal()) return "artisan";
+	if (terminal->isBountyTerminal()) return "bounty";
+	if (terminal->isEntertainerTerminal()) return "entertainer";
+	if (terminal->isImperialTerminal()) return "imperial";
+	if (terminal->isNewbieTerminal()) return "newbie";
+	if (terminal->isRebelTerminal()) return "rebel";
+	if (terminal->isScoutTerminal()) return "scout";
+	if (terminal->isStatueTerminal()) return "statue";
+	return "";
+}
+
+static bool pveMissionTerminalTypeAccepted(const String& type,
+		const Vector<String>& acceptedTypes) {
+	String normalized = type.toLowerCase().trim();
+	for (int i = 0; i < acceptedTypes.size(); ++i) {
+		if (acceptedTypes.get(i) == normalized)
+			return true;
+	}
+	return false;
+}
+
 void SimPlayerManager::configurePveMissionTerminalCitiesLocked(
 		const Vector<PveHuntSpecies>& species) {
 	VectorMap<String, int> previousStates = missionTerminalCityState;
@@ -8221,7 +8733,24 @@ void SimPlayerManager::configurePveMissionTerminalCitiesLocked(
 	if (!pveMissionHuntEnabled)
 		return;
 
-	for (int i = 0; i < species.size(); ++i) {
+	if (pveMissionBoardEnabled) {
+		for (int i = 0; i < allShuttleports.size(); ++i) {
+			const ShuttleportLocation& location = allShuttleports.get(i);
+			// Routing-only cities ARE valid PvE work destinations - discovering
+			// their terminals is precisely why those nodes were added. They are
+			// excluded only from random placement and PvP destination choice.
+			if (location.starportPoint.isEmpty() ||
+					location.planet.isEmpty() || location.name.isEmpty())
+				continue;
+			String key = getPveMissionTerminalCityKey(location.planet,
+				location.name);
+			if (!missionTerminalCityState.contains(key)) {
+				int state = previousStates.contains(key) ? previousStates.get(key) :
+					PVE_MISSION_TERMINAL_PENDING;
+				missionTerminalCityState.put(key, state);
+			}
+		}
+	} else for (int i = 0; i < species.size(); ++i) {
 		const PveHuntSpecies& row = species.get(i);
 		for (int j = 0; j < row.eligibleHomeCities.size(); ++j) {
 			String city = row.eligibleHomeCities.get(j);
@@ -8243,8 +8772,32 @@ void SimPlayerManager::configurePveMissionTerminalCitiesLocked(
 		String key = getPveMissionTerminalCityKey(terminal.planet,
 			terminal.city);
 		if (missionTerminalCityState.contains(key) &&
-				missionTerminalCityState.get(key) == PVE_MISSION_TERMINAL_RESOLVED)
+				missionTerminalCityState.get(key) == PVE_MISSION_TERMINAL_RESOLVED &&
+				(!pveMissionBoardEnabled || pveMissionTerminalTypeAccepted(
+					terminal.terminalType, pveMissionBoardAcceptedTerminalTypes)))
 			allMissionTerminals.add(terminal);
+	}
+	if (pveMissionBoardEnabled) {
+		for (int i = 0; i < missionTerminalCityState.size(); ++i) {
+			String key = missionTerminalCityState.elementAt(i).getKey();
+			if (missionTerminalCityState.get(key) !=
+					PVE_MISSION_TERMINAL_RESOLVED)
+				continue;
+			bool hasAcceptedTerminal = false;
+			for (int terminalIndex = 0; terminalIndex < allMissionTerminals.size();
+					++terminalIndex) {
+				const PveMissionTerminalLocation& terminal =
+					allMissionTerminals.get(terminalIndex);
+				if (getPveMissionTerminalCityKey(terminal.planet,
+						terminal.city) == key) {
+					hasAcceptedTerminal = true;
+					break;
+				}
+			}
+			if (!hasAcceptedTerminal)
+				missionTerminalCityState.put(key,
+					PVE_MISSION_TERMINAL_PENDING);
+		}
 	}
 }
 
@@ -8311,9 +8864,23 @@ void SimPlayerManager::resolvePveMissionTerminals() {
 			if (terminal == nullptr || !terminal->isMissionTerminal())
 				continue;
 
+			MissionTerminal* missionTerminal =
+				dynamic_cast<MissionTerminal*>(terminal);
+			String terminalType;
+			if (pveMissionBoardEnabled) {
+				if (missionTerminal == nullptr)
+					continue;
+				terminalType = pveMissionTerminalType(missionTerminal);
+				if (!pveMissionTerminalTypeAccepted(terminalType,
+						pveMissionBoardAcceptedTerminalTypes))
+					continue;
+			}
+
 			PveMissionTerminalLocation location;
 			location.planet = planet;
 			location.city = cityName;
+			location.terminalType = terminalType;
+			location.terminalOid = terminal->getObjectID();
 			location.terminal = terminal;
 			location.position = terminal->getWorldPosition();
 			scanned.add(location);
@@ -8390,6 +8957,51 @@ bool SimPlayerManager::getNearestMissionTerminal(const String& planet,
 	return found;
 }
 
+bool SimPlayerManager::getNearestGeneralMissionTerminal(const String& planet,
+		const Vector3& fromPosition, PveMissionTerminalLocation& result,
+		int& cityState) {
+	result = PveMissionTerminalLocation();
+	cityState = PVE_MISSION_TERMINAL_ABSENT;
+	if (!pveMissionHuntEnabled || planet.isEmpty())
+		return false;
+
+	Locker pveLock(&pveMutex);
+	bool pending = false;
+	bool found = false;
+	float nearestDistance = 0.f;
+	for (int i = 0; i < missionTerminalCityState.size(); ++i) {
+		const String& key = missionTerminalCityState.elementAt(i).getKey();
+		if (!key.beginsWith(planet + ":"))
+			continue;
+		int state = missionTerminalCityState.elementAt(i).getValue();
+		if (state == PVE_MISSION_TERMINAL_PENDING)
+			pending = true;
+	}
+
+	for (int i = 0; i < allMissionTerminals.size(); ++i) {
+		const PveMissionTerminalLocation& candidate = allMissionTerminals.get(i);
+		if (candidate.planet != planet || candidate.terminal == nullptr ||
+				!pveMissionTerminalTypeAccepted(candidate.terminalType,
+					pveMissionBoardAcceptedTerminalTypes))
+			continue;
+		float distance = candidate.position.distanceTo2d(fromPosition);
+		if (!found || distance < nearestDistance) {
+			result = candidate;
+			nearestDistance = distance;
+			found = true;
+		}
+	}
+
+	if (found) {
+		cityState = PVE_MISSION_TERMINAL_RESOLVED;
+		return true;
+	}
+
+	cityState = pending ? PVE_MISSION_TERMINAL_PENDING :
+		PVE_MISSION_TERMINAL_ABSENT;
+	return false;
+}
+
 bool SimPlayerManager::getPveHuntLair(uint64 bodyOid, PveHuntLair& result) {
 	result = PveHuntLair();
 	if (bodyOid == 0)
@@ -8413,7 +9025,8 @@ void SimPlayerManager::requestPveHuntLairCleanup(uint64 bodyOid,
 
 void SimPlayerManager::recordPveHunterMissionTerminal(uint64 identityId,
 		uint64 bodyOid, const String& planet, const String& city,
-		const Vector3& position) {
+		const Vector3& position, const String& terminalType,
+		uint64 terminalOid) {
 	Locker pveLock(&pveMutex);
 	if (!pveHuntOrders.contains(identityId))
 		return;
@@ -8424,6 +9037,8 @@ void SimPlayerManager::recordPveHunterMissionTerminal(uint64 identityId,
 
 	order.missionTerminalPlanet = planet;
 	order.missionTerminalCity = city;
+	order.missionTerminalType = terminalType;
+	order.missionTerminalOid = terminalOid;
 	order.missionTerminalPosition = position;
 	pveHuntOrders.put(identityId, order);
 }
@@ -8529,6 +9144,1377 @@ bool SimPlayerManager::choosePveHuntSpawnPoint(
 	}
 
 	return false;
+}
+
+int SimPlayerManager::getPveBotHunterLevelForBody(uint64 bodyOid) const {
+	if (bodyOid == 0)
+		return 1;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> body = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(bodyOid);
+	return getPveBotHunterLevel(body == nullptr ? nullptr : body->asAiAgent());
+}
+
+int SimPlayerManager::getPveBotHunterLevel(AiAgent* hunter) const {
+	if (hunter == nullptr)
+		return 1;
+	return Math::max(1, hunter->getLevel());
+}
+
+void SimPlayerManager::buildPveLairYieldIndex() {
+	Vector<PveLairYieldEntry> rebuilt;
+	if (!pveMarketDispatchEnabled)
+		return;
+
+	Vector<String> planets;
+	for (int i = 0; i < allShuttleports.size(); ++i) {
+		const ShuttleportLocation& city = allShuttleports.get(i);
+		if (city.planet.isEmpty() || city.starportPoint.isEmpty() ||
+				planets.contains(city.planet))
+			continue;
+		planets.add(city.planet);
+	}
+
+	for (int planetIndex = 0; planetIndex < planets.size(); ++planetIndex) {
+		const String& planet = planets.get(planetIndex);
+		String groupName = planet + "_destroy_missions";
+		server::zone::managers::creature::SpawnGroup* group =
+			CreatureTemplateManager::instance()->getDestroyMissionGroup(
+				groupName.hashCode());
+		if (group == nullptr)
+			continue;
+
+		const Vector<Reference<server::zone::managers::creature::LairSpawn*> >&
+			lairList = group->getSpawnList();
+		for (int lairIndex = 0; lairIndex < lairList.size(); ++lairIndex) {
+			server::zone::managers::creature::LairSpawn* lairSpawn =
+				lairList.get(lairIndex);
+			if (lairSpawn == nullptr)
+				continue;
+			String lairTemplateName = lairSpawn->getLairTemplateName();
+			LairTemplate* lairTemplate = CreatureTemplateManager::instance()->
+				getLairTemplate(lairTemplateName.hashCode());
+			if (lairTemplate == nullptr)
+				continue;
+
+			PveLairYieldEntry entry;
+			entry.planet = planet;
+			entry.lairTemplate = lairTemplateName;
+			entry.missionBuilding = lairTemplate->getMissionBuilding(0);
+			entry.minDifficulty = lairSpawn->getMinDifficulty();
+			entry.maxDifficulty = lairSpawn->getMaxDifficulty();
+			entry.minLevelCeiling = group->getMinLevelCeiling();
+			entry.size = lairSpawn->getSize();
+			const Vector<String>* mobiles = lairTemplate->getWeightedMobiles();
+			if (mobiles == nullptr)
+				continue;
+
+			for (int mobileIndex = 0; mobileIndex < mobiles->size();
+					++mobileIndex) {
+				CreatureTemplate* mobile = CreatureTemplateManager::instance()->
+					getTemplate(mobiles->get(mobileIndex).hashCode());
+				if (mobile == nullptr)
+					continue;
+				const String types[] = {mobile->getMeatType(),
+					mobile->getHideType(), mobile->getBoneType()};
+				const float amounts[] = {mobile->getMeatMax(),
+					mobile->getHideMax(), mobile->getBoneMax()};
+				const char* families[] = {"meat", "hide", "bone"};
+				for (int familyIndex = 0; familyIndex < 3; ++familyIndex) {
+					if (types[familyIndex].isEmpty())
+						continue;
+					if (!entry.resourceTypes.contains(types[familyIndex]))
+						entry.resourceTypes.add(types[familyIndex]);
+					uint64 amount = static_cast<uint64>(Math::max(0.f,
+						amounts[familyIndex]));
+					uint64 oldAmount = entry.amountsByFamily.contains(
+						families[familyIndex]) ? entry.amountsByFamily.get(
+						families[familyIndex]) : 0;
+					entry.amountsByFamily.put(families[familyIndex],
+						addDemandFamilyUnits(oldAmount, amount));
+				}
+			}
+			if (entry.resourceTypes.size() > 0)
+				rebuilt.add(entry);
+		}
+	}
+
+	Locker pveLock(&pveMutex);
+	pveLairYieldIndex = rebuilt;
+}
+
+bool SimPlayerManager::selectPveBotMissionLairSpawn(
+		const String& planet, int hunterLevel, PveBotMissionOffer& offer,
+		const String& desiredFamily, const String& desiredResourceType) {
+	String missionGroup = planet + "_destroy_missions";
+	// Fully qualified: this fork already has its own SimPlayerManager::SpawnGroup
+	// (the Lua spawn-config struct), which otherwise shadows the engine's
+	// destroy-mission spawn group inside a SimPlayerManager member function.
+	server::zone::managers::creature::SpawnGroup* group =
+		CreatureTemplateManager::instance()->
+			getDestroyMissionGroup(missionGroup.hashCode());
+	if (group == nullptr || group->getSpawnList().size() == 0) {
+		MissionDiagLog::event("LAIR_FAIL", offer.identityId, "reason=noSpawnGroup group=" +
+			missionGroup + " found=" + String::valueOf(group != nullptr));
+		return false;
+	}
+
+	const Vector<Reference<LairSpawn*> >& lairList = group->getSpawnList();
+	int minLevelCeiling = group->getMinLevelCeiling();
+	int minLevel = Math::min(hunterLevel - 5, minLevelCeiling);
+	LairSpawn* selected = nullptr;
+	// Best per-mobile yield this lair can produce for the requested family/type.
+	// Mirrors yieldsRequestedResource's traversal so the two always agree on
+	// which mobiles count.
+	auto lairYieldForFamily = [&](LairSpawn* candidate) -> float {
+		if (candidate == nullptr || desiredFamily.isEmpty())
+			return 0.f;
+		LairTemplate* templateData = CreatureTemplateManager::instance()->
+			getLairTemplate(candidate->getLairTemplateName().hashCode());
+		if (templateData == nullptr)
+			return 0.f;
+		const Vector<String>* mobiles = templateData->getWeightedMobiles();
+		if (mobiles == nullptr)
+			return 0.f;
+		float best = 0.f;
+		for (int i = 0; i < mobiles->size(); ++i) {
+			CreatureTemplate* mobile = CreatureTemplateManager::instance()->
+				getTemplate(mobiles->get(i).hashCode());
+			if (mobile == nullptr)
+				continue;
+			String type;
+			float amount = 0.f;
+			if (desiredFamily == "hide") {
+				type = mobile->getHideType();
+				amount = mobile->getHideMax();
+			} else if (desiredFamily == "bone") {
+				type = mobile->getBoneType();
+				amount = mobile->getBoneMax();
+			} else if (desiredFamily == "meat") {
+				type = mobile->getMeatType();
+				amount = mobile->getMeatMax();
+			}
+			if (type.isEmpty() || amount <= 0.f)
+				continue;
+			if (!desiredResourceType.isEmpty() &&
+					!pveMarketResourceMatchesClass(desiredResourceType, type))
+				continue;
+			// SUM, not max-of-one-mobile: buildPveLairYieldIndex sums
+			// weighted-mobile amounts per family and the stored offer sums exact
+			// -type yields, so ranking on a single mobile here would give the
+			// matchmaker's reservation and the generated offer different
+			// magnitudes for the same lair.
+			best += amount;
+		}
+		return best;
+	};
+	auto yieldsRequestedResource = [&](LairSpawn* candidate) {
+		if (candidate == nullptr || desiredFamily.isEmpty())
+			return true;
+		LairTemplate* templateData = CreatureTemplateManager::instance()->
+			getLairTemplate(candidate->getLairTemplateName().hashCode());
+		if (templateData == nullptr)
+			return false;
+		const Vector<String>* mobiles = templateData->getWeightedMobiles();
+		if (mobiles == nullptr)
+			return false;
+		for (int i = 0; i < mobiles->size(); ++i) {
+			CreatureTemplate* mobile = CreatureTemplateManager::instance()->
+				getTemplate(mobiles->get(i).hashCode());
+			if (mobile == nullptr)
+				continue;
+			String type;
+			float amount = 0.f;
+			if (desiredFamily == "hide") {
+				type = mobile->getHideType();
+				amount = mobile->getHideMax();
+			} else if (desiredFamily == "bone") {
+				type = mobile->getBoneType();
+				amount = mobile->getBoneMax();
+			} else if (desiredFamily == "meat") {
+				type = mobile->getMeatType();
+				amount = mobile->getMeatMax();
+			}
+			if (!type.isEmpty() && amount > 0.f &&
+					(desiredResourceType.isEmpty() ||
+					pveMarketResourceMatchesClass(desiredResourceType, type)))
+				return true;
+		}
+		return false;
+	};
+	auto candidateInWindow = [&](LairSpawn* candidate, int lowerBound) {
+		return candidate != nullptr && candidate->getMinDifficulty() <=
+			hunterLevel + 5 && candidate->getMaxDifficulty() >= lowerBound &&
+			yieldsRequestedResource(candidate);
+	};
+
+	// Level-window relaxation mirrors MissionManager::getRandomLairSpawn, but the
+	// pick within a tier is deliberately NOT random: the market matchmaker
+	// reserved this (planet, resourceType, family)'s MAXIMUM indexed yield as
+	// inbound supply, so taking a lower-yield lair would suppress demand as
+	// though the maximum were on its way. Selecting the highest-yield candidate
+	// keeps the reservation and the actual contract in agreement (and is what a
+	// player picking off a board would do anyway).
+	auto candidateYield = [&](LairSpawn* candidate) {
+		return candidate == nullptr ? 0.f :
+			lairYieldForFamily(candidate);
+	};
+	auto selectBest = [&](int lowerBound) {
+		LairSpawn* best = nullptr;
+		float bestYield = -1.f;
+		for (int i = 0; i < lairList.size(); ++i) {
+			LairSpawn* candidate = lairList.get(i);
+			if (!candidateInWindow(candidate, lowerBound))
+				continue;
+			float yield = candidateYield(candidate);
+			if (best == nullptr || yield > bestYield) {
+				best = candidate;
+				bestYield = yield;
+			}
+		}
+		return best;
+	};
+	selected = selectBest(minLevel);
+	bool relaxedTier = false;
+	if (selected == nullptr) {
+		selected = selectBest(0);
+		relaxedTier = selected != nullptr;
+	}
+	if (selected == nullptr) {
+		// Attribute the miss to a specific sub-filter. candidateInWindow ANDs
+		// three conditions, so a bare "no candidate" would not distinguish "the
+		// hunter is too low level for this planet" from "no lair on this planet
+		// yields the requested resource" -- and note selectBest(0) relaxes only
+		// the LOWER bound, so the upper bound applies in both tiers.
+		int passUpper = 0;
+		int passYield = 0;
+		int passLowerRelaxed = 0;
+		for (int i = 0; i < lairList.size(); ++i) {
+			LairSpawn* candidate = lairList.get(i);
+			if (candidate == nullptr)
+				continue;
+			bool upperOk = candidate->getMinDifficulty() <= hunterLevel + 5;
+			bool yieldOk = yieldsRequestedResource(candidate);
+			if (upperOk)
+				++passUpper;
+			if (yieldOk)
+				++passYield;
+			if (upperOk && yieldOk && candidate->getMaxDifficulty() >= 0)
+				++passLowerRelaxed;
+		}
+		MissionDiagLog::event("LAIR_FAIL", offer.identityId, "reason=noCandidate group=" +
+			missionGroup + " lairs=" + String::valueOf(lairList.size()) +
+			" hunterLevel=" + String::valueOf(hunterLevel) +
+			" upperBound=" + String::valueOf(hunterLevel + 5) +
+			" minLevel=" + String::valueOf(minLevel) +
+			" minLevelCeiling=" + String::valueOf(minLevelCeiling) +
+			" family=" + (desiredFamily.isEmpty() ? String("none") :
+				desiredFamily) +
+			" resourceType=" + (desiredResourceType.isEmpty() ? String("none") :
+				desiredResourceType) +
+			" passUpperBound=" + String::valueOf(passUpper) +
+			" passYield=" + String::valueOf(passYield) +
+			" passAllRelaxed=" + String::valueOf(passLowerRelaxed));
+		return false;
+	}
+
+	int minDifficulty = selected->getMinDifficulty();
+	int maxDifficulty = selected->getMaxDifficulty();
+	int difficultyLevel = minDifficulty;
+	if (maxDifficulty > minDifficulty)
+		difficultyLevel += System::random(maxDifficulty - minDifficulty);
+	int difficultyWindow = (maxDifficulty > minDifficulty + 5 ?
+		maxDifficulty - minDifficulty : 5) / 5;
+	int difficulty = (difficultyLevel - minDifficulty) /
+		Math::max(1, difficultyWindow);
+	if (difficulty == 5)
+		difficulty = 4;
+
+	String lairTemplateName = selected->getLairTemplateName();
+	LairTemplate* lairTemplate = CreatureTemplateManager::instance()->
+		getLairTemplate(lairTemplateName.hashCode());
+	if (lairTemplate == nullptr) {
+		MissionDiagLog::event("LAIR_FAIL", offer.identityId, "reason=noLairTemplate template=" +
+			lairTemplateName);
+		return false;
+	}
+
+	// buildPveLairYieldIndex only ever validates getMissionBuilding(0), while the
+	// selector randomises difficultyLevel into a 0-4 tier -- so a lair the market
+	// matchmaker happily reserved can still reject here on a tier it never checked.
+	String building = lairTemplate->getMissionBuilding(difficulty);
+	if (building.isEmpty()) {
+		MissionDiagLog::event("LAIR_FAIL", offer.identityId,
+			"reason=noMissionBuilding template=" + lairTemplateName +
+			" difficulty=" + String::valueOf(difficulty) +
+			" difficultyLevel=" + String::valueOf(difficultyLevel) +
+			" tier0Defined=" + String::valueOf(
+				!lairTemplate->getMissionBuilding(0).isEmpty()));
+		return false;
+	}
+
+	MissionDiagLog::event("LAIR_OK", offer.identityId, "template=" + lairTemplateName +
+		" relaxedTier=" + String::valueOf(relaxedTier) +
+		" difficulty=" + String::valueOf(difficulty) +
+		" difficultyLevel=" + String::valueOf(difficultyLevel) +
+		" window=" + String::valueOf(minDifficulty) + "-" +
+			String::valueOf(maxDifficulty));
+
+	offer.lairTemplate = lairTemplateName;
+	offer.missionBuilding = building;
+	offer.difficulty = difficulty;
+	offer.difficultyLevel = difficultyLevel;
+	offer.minDifficulty = minDifficulty;
+	offer.maxDifficulty = maxDifficulty;
+	offer.size = selected->getSize();
+	offer.yieldResourceTypes.removeAll();
+	offer.expectedYieldUnits = 0;
+	const Vector<String>* mobiles = lairTemplate->getWeightedMobiles();
+	if (mobiles != nullptr) {
+		for (int i = 0; i < mobiles->size(); ++i) {
+			CreatureTemplate* mobile = CreatureTemplateManager::instance()->
+				getTemplate(mobiles->get(i).hashCode());
+			if (mobile == nullptr)
+				continue;
+			const String resourceTypes[] = {mobile->getMeatType(),
+				mobile->getHideType(), mobile->getBoneType()};
+			const float resourceAmounts[] = {mobile->getMeatMax(),
+				mobile->getHideMax(), mobile->getBoneMax()};
+			const char* families[] = {"meat", "hide", "bone"};
+			for (int resourceIndex = 0; resourceIndex < 3; ++resourceIndex) {
+				if (resourceTypes[resourceIndex].isEmpty())
+					continue;
+				if (!desiredFamily.isEmpty() && desiredFamily !=
+						families[resourceIndex])
+					continue;
+				if (!desiredResourceType.isEmpty() && desiredResourceType !=
+						resourceTypes[resourceIndex])
+					continue;
+				if (!offer.yieldResourceTypes.contains(
+						resourceTypes[resourceIndex]))
+					offer.yieldResourceTypes.add(resourceTypes[resourceIndex]);
+				offer.expectedYieldUnits += static_cast<uint64>(Math::max(0.f,
+					resourceAmounts[resourceIndex]));
+			}
+		}
+	}
+	return true;
+}
+
+bool SimPlayerManager::choosePveBotMissionPosition(
+		const PveMissionTerminalLocation& terminal, int difficultyLevel,
+		const String& planet, Vector3& position, float& bearing,
+		uint64 diagIdentityId) {
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	Zone* zone = zoneServer == nullptr ? nullptr : zoneServer->getZone(planet);
+	PlanetManager* planetManager = zone == nullptr ? nullptr :
+		zone->getPlanetManager();
+	TerrainManager* terrain = planetManager == nullptr ? nullptr :
+		planetManager->getTerrainManager();
+	if (zone == nullptr || planetManager == nullptr || terrain == nullptr) {
+		MissionDiagLog::event("POS_FAIL", diagIdentityId,
+			"reason=noZone planet=" + planet);
+		return false;
+	}
+
+	Vector3 cantina;
+	Vector3 medCenter;
+	Vector3 cityCenter;
+	if (!getPveHomeLocations(terminal.planet, terminal.city, cantina,
+			medCenter, cityCenter)) {
+		MissionDiagLog::event("POS_FAIL", diagIdentityId,
+			"reason=noHomeLocations planet=" +
+			terminal.planet + " city=" + terminal.city);
+		return false;
+	}
+
+	// Per-gate reject counters. Emitted as ONE summary line per call rather than
+	// one line per attempt: maxSpawnPointTries defaults to 32 and this runs twice
+	// per board refresh, so per-attempt lines would bury the answer.
+	int rejArc = 0;
+	int rejBounds = 0;
+	int rejWater = 0;
+	int rejCity = 0;
+	int rejNoSpawn = 0;
+	int rejCollision = 0;
+
+	const float radiansPerDegree = 0.017453292519943295f;
+	float terminalBearing = std::atan2(terminal.position.getY() -
+		cityCenter.getY(), terminal.position.getX() - cityCenter.getX()) /
+		radiansPerDegree;
+	float arc = pveMissionBoardSameDirectionArcDegrees;
+	float clearance = 45.f;
+	int maxTries = Math::max(1, pveMissionMaxSpawnPointTries);
+	for (int attempt = 0; attempt < maxTries; ++attempt) {
+		int distance = pveMissionBoardBaseDistanceMeters +
+			pveMissionBoardDifficultyDistanceFactor * difficultyLevel;
+		distance += pveMissionBoardRandomDistanceMeters == 0 ? 0 :
+			System::random(pveMissionBoardRandomDistanceMeters);
+		int difficultyRandom = pveMissionBoardDifficultyRandomDistance *
+			difficultyLevel;
+		if (difficultyRandom > 0)
+			distance += System::random(difficultyRandom);
+		float candidateBearing = static_cast<float>(System::random(360));
+		float candidateDelta = std::fabs(candidateBearing - terminalBearing);
+		while (candidateDelta > 180.f)
+			candidateDelta = std::fabs(candidateDelta - 360.f);
+		if (candidateDelta > arc) {
+			++rejArc;
+			continue;
+		}
+
+		float angle = candidateBearing * radiansPerDegree;
+		float x = cityCenter.getX() + std::cos(angle) * distance;
+		float y = cityCenter.getY() + std::sin(angle) * distance;
+		Vector3 boundaryProbe(x, y, 0.f);
+		if (!zone->isWithinBoundaries(boundaryProbe)) {
+			++rejBounds;
+			continue;
+		}
+		float height = zone->getHeight(x, y);
+		float waterHeight = height;
+		bool waterDefined = terrain->getWaterHeight(x, y, waterHeight);
+		if (waterDefined && waterHeight > height) {
+			++rejWater;
+			continue;
+		}
+
+		SortedVector<ManagedReference<ActiveArea*> > activeAreas;
+		zone->getInRangeActiveAreas(x, 0, y, &activeAreas, true);
+		bool inCity = false;
+		for (int areaIndex = 0; areaIndex < activeAreas.size(); ++areaIndex) {
+			ActiveArea* area = activeAreas.get(areaIndex);
+			if (area != nullptr && area->isCityRegion()) {
+				inCity = true;
+				break;
+			}
+		}
+		// Split from the original combined condition purely so the two gates get
+		// separate counters; the control flow is unchanged.
+		if (inCity) {
+			++rejCity;
+			continue;
+		}
+		if (!planetManager->isSpawningPermittedAt(x, y, clearance)) {
+			++rejNoSpawn;
+			continue;
+		}
+		if (CollisionManager::checkSphereCollision(
+				Vector3(x, y, height), clearance, zone)) {
+			++rejCollision;
+			continue;
+		}
+		position = Vector3(x, y, height);
+		bearing = candidateBearing;
+		MissionDiagLog::event("POS_OK", diagIdentityId, "planet=" + terminal.planet +
+			" city=" + terminal.city + " attempt=" + String::valueOf(attempt) +
+			" dist=" + String::valueOf(distance) +
+			" bearing=" + String::valueOf(candidateBearing));
+		return true;
+	}
+
+	MissionDiagLog::event("POS_FAIL", diagIdentityId,
+		"reason=noPointFound planet=" +
+		terminal.planet + " city=" + terminal.city +
+		" tries=" + String::valueOf(maxTries) +
+		" difficultyLevel=" + String::valueOf(difficultyLevel) +
+		" termBearing=" + String::valueOf(terminalBearing) +
+		" arc=" + String::valueOf(arc) +
+		" rejArc=" + String::valueOf(rejArc) +
+		" rejBounds=" + String::valueOf(rejBounds) +
+		" rejWater=" + String::valueOf(rejWater) +
+		" rejCity=" + String::valueOf(rejCity) +
+		" rejNoSpawn=" + String::valueOf(rejNoSpawn) +
+		" rejCollision=" + String::valueOf(rejCollision));
+	return false;
+}
+
+void SimPlayerManager::registerPveBotMissionLairObserver(LairObject* lair,
+		uint64 bodyOid, uint64 lairOid) {
+	if (lair == nullptr || bodyOid == 0 || lairOid == 0)
+		return;
+	Reference<Observer*> completionObserver = new LambdaObserver(
+		new LambdaObserverFunction(
+			[bodyOid, lairOid](uint32, Observable*, ManagedObject*, uint64) -> int {
+				Core::getTaskManager()->executeTask([bodyOid, lairOid]() {
+					SimPlayerManager::instance()->onPveBotMissionLairDestroyed(
+						bodyOid, lairOid);
+				}, "SimPveBotMissionLairDestroyedHandoff");
+				return 1;
+			}, "SimPveBotMissionLairDestroyedObserver"));
+	lair->registerObserver(ObserverEventType::OBJECTDESTRUCTION,
+		completionObserver);
+}
+
+bool SimPlayerManager::generatePveBotMissionOffers(uint64 identityId,
+		uint64 bodyOid, const PveMissionTerminalLocation& terminal,
+		int hunterLevel, Vector<PveBotMissionOffer>& offers, uint64 visitEpoch) {
+	offers.removeAll();
+	if (!pveMissionHuntEnabled || !pveMissionBoardEnabled || identityId == 0 ||
+			bodyOid == 0 || terminal.terminalOid == 0) {
+		MissionDiagLog::event("OFFERS_FAIL", identityId, "reason=gate"
+			" missionHunt=" + String::valueOf(pveMissionHuntEnabled) +
+			" board=" + String::valueOf(pveMissionBoardEnabled) +
+			" bodyOid=" + String::valueOf(bodyOid) +
+			" terminalOid=" + String::valueOf(terminal.terminalOid));
+		return false;
+	}
+
+	int offerCount = Math::min(2, pveMissionBoardMaxHeldMissions);
+	uint64 issuedAt = System::getMiliTime();
+	String desiredFamily;
+	String desiredResourceType;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveHuntOrders.contains(identityId)) {
+			const PveHuntOrder& order = pveHuntOrders.get(identityId);
+			desiredFamily = order.marketFamily;
+			desiredResourceType = order.marketResourceType;
+		}
+	}
+	MissionDiagLog::event("OFFERS_BEGIN", identityId, "planet=" +
+		terminal.planet + " city=" + terminal.city +
+		" terminalOid=" + String::valueOf(terminal.terminalOid) +
+		" hunterLevel=" + String::valueOf(hunterLevel) +
+		" want=" + String::valueOf(offerCount) +
+		" family=" + (desiredFamily.isEmpty() ? String("none") : desiredFamily) +
+		" resourceType=" + (desiredResourceType.isEmpty() ? String("none") :
+			desiredResourceType));
+
+	int failedLair = 0;
+	int failedPosition = 0;
+	for (int i = 0; i < offerCount; ++i) {
+		PveBotMissionOffer offer;
+		offer.identityId = identityId;
+		offer.bodyOid = bodyOid;
+		offer.planet = terminal.planet;
+		offer.terminalOid = terminal.terminalOid;
+		offer.terminalType = terminal.terminalType;
+		offer.issuedAtMs = issuedAt;
+		// Split from the original short-circuit ONLY so the two failures are
+		// distinguishable; evaluation order and semantics are identical (the
+		// position search still runs only when lair selection succeeded).
+		if (!selectPveBotMissionLairSpawn(terminal.planet, hunterLevel, offer,
+				desiredFamily, desiredResourceType)) {
+			++failedLair;
+			continue;
+		}
+		if (!choosePveBotMissionPosition(terminal, offer.difficultyLevel,
+				terminal.planet, offer.advertisedPos, offer.bearingDeg,
+				identityId)) {
+			++failedPosition;
+			continue;
+		}
+		offers.add(offer);
+	}
+	// NO LONGER ALL-OR-NOTHING. Previously a single unfilled slot discarded the
+	// offer that DID succeed and the board showed nothing -- live logs proved this
+	// threw away one valid offer in ~55% of empty boards. Now we commit whatever
+	// we placed (1 or the full 2); the hunter's terminal retry loop
+	// (beginMissionAccept) decides whether to wait for a fuller board or accept a
+	// single offer. A zero-result pass preserves any partial already committed
+	// this visit rather than wiping it.
+	if (offers.size() == 0) {
+		// Preserve any partial already committed THIS visit, but drop offers that
+		// have aged out (same expiry rule revealPveBotMissionLair enforces) so we
+		// never announce/accept a board that getPveBotMissionOffer will instantly
+		// reject as expired. Never log under pveMutex -- snapshot then emit after.
+		int kept = 0;
+		bool staleVisit = false;
+		{
+			Locker pveLock(&pveMutex);
+			// C4: if the visit epoch no longer matches, the order concluded while
+			// we generated -- discard rather than preserve/commit a stale board.
+			if (!pveTerminalVisitEpoch.contains(identityId) ||
+					pveTerminalVisitEpoch.get(identityId) != visitEpoch) {
+				staleVisit = true;
+			} else if (pveBotMissions.contains(identityId)) {
+				uint64 nowMs = System::getMiliTime();
+				uint64 maxAgeMs = static_cast<uint64>(
+					pveMissionBoardMaxOfferAgeSeconds) * 1000;
+				const Vector<PveBotMissionOffer>& existing =
+					pveBotMissions.get(identityId);
+				Vector<PveBotMissionOffer> fresh;
+				for (int i = 0; i < existing.size(); ++i) {
+					const PveBotMissionOffer& o = existing.get(i);
+					if (o.issuedAtMs == 0 || nowMs < o.issuedAtMs + maxAgeMs)
+						fresh.add(o);
+				}
+				if (fresh.size() != existing.size())
+					pveBotMissions.put(identityId, fresh);
+				offers = fresh;
+			} else {
+				offers.removeAll();
+			}
+			kept = offers.size();
+		}
+		if (staleVisit) {
+			offers.removeAll();
+			MissionDiagLog::event("OFFERS_FAIL", identityId, "reason=staleVisit"
+				" epoch=" + String::valueOf(visitEpoch));
+			return false;
+		}
+		MissionDiagLog::event("OFFERS_FAIL", identityId, "reason=incomplete"
+			" got=0 kept=" + String::valueOf(kept) +
+			" want=" + String::valueOf(offerCount) +
+			" failedLairSelect=" + String::valueOf(failedLair) +
+			" failedPosition=" + String::valueOf(failedPosition));
+		return kept >= 1;
+	}
+
+	// The terminal offers are presented nearest first.
+	for (int i = 0; i < offers.size(); ++i) {
+		for (int j = i + 1; j < offers.size(); ++j) {
+			float left = offers.get(i).advertisedPos.distanceTo2d(terminal.position);
+			float right = offers.get(j).advertisedPos.distanceTo2d(terminal.position);
+			if (right < left) {
+				PveBotMissionOffer swap = offers.get(i);
+				offers.set(i, offers.get(j));
+				offers.set(j, swap);
+			}
+		}
+	}
+
+	bool committed = false;
+	{
+		Locker pveLock(&pveMutex);
+		// C4: commit only if the visit epoch still matches (order still active and
+		// not superseded by a newer visit); otherwise this generation is stale.
+		if (pveTerminalVisitEpoch.contains(identityId) &&
+				pveTerminalVisitEpoch.get(identityId) == visitEpoch) {
+			Vector<PveBotMissionOffer> stored;
+			for (int i = 0; i < offers.size(); ++i) {
+				PveBotMissionOffer offer = offers.get(i);
+				offer.offerId = pveNextMissionOfferId++;
+				if (pveNextMissionOfferId == 0)
+					pveNextMissionOfferId = 1;
+				stored.add(offer);
+			}
+			pveBotMissions.put(identityId, stored);
+			offers = stored;
+			committed = true;
+		}
+	}
+	if (!committed) {
+		offers.removeAll();
+		MissionDiagLog::event("OFFERS_FAIL", identityId, "reason=staleVisit"
+			" epoch=" + String::valueOf(visitEpoch));
+		return false;
+	}
+	MissionDiagLog::event("OFFERS_OK", identityId, "count=" +
+		String::valueOf(offers.size()) + " want=" + String::valueOf(offerCount) +
+		" planet=" + terminal.planet);
+	return true;
+}
+
+uint64 SimPlayerManager::openTerminalVisit(uint64 identityId, uint64 bodyOid) {
+	if (identityId == 0)
+		return 0;
+	Locker pveLock(&pveMutex);
+	// Only open a visit for an identity with an active order on THIS body.
+	if (!pveHuntOrders.contains(identityId) ||
+			pveHuntOrders.get(identityId).bodyOid != bodyOid)
+		return 0;
+	uint64 epoch = ++pveTerminalVisitEpochSeq;
+	if (epoch == 0)
+		epoch = ++pveTerminalVisitEpochSeq;   // never hand out 0
+	pveTerminalVisitEpoch.put(identityId, epoch);
+	pveBotMissions.drop(identityId);          // fresh visit: drop any stale board
+	return epoch;
+}
+
+bool SimPlayerManager::planPveHunterRelocation(uint64 identityId,
+		uint64 bodyOid, const String& targetPlanet, const String& targetCity,
+		const String& reason, PveRelocation& relocation) {
+	relocation = PveRelocation();
+	if (!pveMarketDispatchEnabled || identityId == 0 || bodyOid == 0 ||
+			targetPlanet.isEmpty() || targetCity.isEmpty())
+		return false;
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> body = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(bodyOid);
+	AiAgent* agent = body == nullptr ? nullptr : body->asAiAgent();
+	if (agent == nullptr)
+		return false;
+
+	String fromPlanet;
+	Vector3 position;
+	{
+		Locker agentLock(agent);
+		Zone* zone = agent->getZone();
+		if (zone == nullptr)
+			return false;
+		fromPlanet = zone->getZoneName();
+		position = agent->getWorldPosition();
+	}
+	if (fromPlanet == targetPlanet)
+		return true;
+
+	ShuttleportLocation fromCity;
+	if (!getNearestRoutableCity(fromPlanet, position, true, fromCity))
+		return false;
+
+	uint64 nowMs = System::getMiliTime();
+	Vector<uint64> activeBodyOids;
+	int departingFromPlanet = 0;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveRelocations.contains(identityId) ||
+				pveRelocations.size() >= pveMarketMaxConcurrentRelocations)
+			return false;
+		if (pveMarketLastRelocationMs.contains(identityId) &&
+				nowMs - pveMarketLastRelocationMs.get(identityId) <
+				static_cast<uint64>(pveMarketRelocationCooldownSeconds) * 1000)
+			return false;
+		if (pveMarketDwellSinceMs.contains(identityId) &&
+				nowMs - pveMarketDwellSinceMs.get(identityId) <
+				static_cast<uint64>(pveMarketRelocationMinDwellSeconds) * 1000)
+			return false;
+		for (int i = 0; i < pveIdentityBodyOids.size(); ++i)
+			activeBodyOids.add(pveIdentityBodyOids.elementAt(i).getValue());
+		for (int i = 0; i < pveRelocations.size(); ++i) {
+			if (pveRelocations.elementAt(i).getValue().fromPlanet == fromPlanet)
+				++departingFromPlanet;
+		}
+	}
+
+	int currentPlanetHunters = 0;
+	for (int i = 0; i < activeBodyOids.size(); ++i) {
+		ManagedReference<SceneObject*> other = zoneServer->getObject(
+			activeBodyOids.get(i));
+		AiAgent* otherAgent = other == nullptr ? nullptr : other->asAiAgent();
+		if (otherAgent == nullptr)
+			continue;
+		Zone* otherZone = otherAgent->getZone();
+		if (otherZone != nullptr && otherZone->getZoneName() == fromPlanet)
+			++currentPlanetHunters;
+	}
+	if (currentPlanetHunters - departingFromPlanet <=
+			pveMarketMinHuntersPerActivePlanet)
+		return false;
+
+	Vector<SimTravelLeg> legs;
+	String summary;
+	if (!planSimTravelRoute(fromPlanet, fromCity.name, targetPlanet,
+			targetCity, false, legs, summary) || legs.size() == 0)
+		return false;
+
+	relocation.identityId = identityId;
+	relocation.fromPlanet = fromPlanet;
+	relocation.toPlanet = targetPlanet;
+	relocation.legs = legs;
+	relocation.startedAtMs = nowMs;
+	relocation.legIndex = 0;
+	relocation.reason = reason;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveRelocations.contains(identityId) ||
+				pveRelocations.size() >= pveMarketMaxConcurrentRelocations)
+			return false;
+		pveRelocations.put(identityId, relocation);
+		pveMarketLastRelocationMs.put(identityId, nowMs);
+	}
+	return true;
+}
+
+bool SimPlayerManager::getPveHunterRelocation(uint64 identityId,
+		PveRelocation& relocation) {
+	Locker pveLock(&pveMutex);
+	if (!pveRelocations.contains(identityId))
+		return false;
+	relocation = pveRelocations.get(identityId);
+	return true;
+}
+
+void SimPlayerManager::advancePveHunterRelocation(uint64 identityId) {
+	Locker pveLock(&pveMutex);
+	if (!pveRelocations.contains(identityId))
+		return;
+	PveRelocation relocation = pveRelocations.get(identityId);
+	++relocation.legIndex;
+	pveRelocations.put(identityId, relocation);
+}
+
+void SimPlayerManager::finishPveHunterRelocation(uint64 identityId,
+		bool success, const String& actualPlanet) {
+	Locker pveLock(&pveMutex);
+	if (!pveRelocations.contains(identityId))
+		return;
+	pveRelocations.drop(identityId);
+	if (success || !actualPlanet.isEmpty())
+		pveMarketDwellSinceMs.put(identityId, System::getMiliTime());
+}
+
+bool SimPlayerManager::getPveHunterCurrentRoutableCity(uint64 bodyOid,
+		String& currentPlanet, ShuttleportLocation& city) {
+	currentPlanet = "";
+	city = ShuttleportLocation();
+	if (bodyOid == 0)
+		return false;
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> body = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(bodyOid);
+	AiAgent* hunter = body == nullptr ? nullptr : body->asAiAgent();
+	if (hunter == nullptr)
+		return false;
+
+	Vector3 position;
+	{
+		Locker hunterLock(hunter);
+		Zone* zone = hunter->getZone();
+		if (zone == nullptr)
+			return false;
+		currentPlanet = zone->getZoneName();
+		position = hunter->getWorldPosition();
+	}
+
+	return getNearestRoutableCity(currentPlanet, position, true, city);
+}
+
+bool SimPlayerManager::planPveHunterBuffTrip(uint64 identityId,
+		uint64 bodyOid, bool needDoctor, bool needEntertainer,
+		PveBuffTrip& trip) {
+	trip = PveBuffTrip();
+	if (!pveRealBuffHubsEnabled || !pveRealBuffsEnabled || identityId == 0 ||
+			bodyOid == 0 || (!needDoctor && !needEntertainer))
+		return false;
+
+	String currentPlanet;
+	ShuttleportLocation currentCity;
+	if (!getPveHunterCurrentRoutableCity(bodyOid, currentPlanet,
+			currentCity))
+		return false;
+
+	for (int hubIndex = 0; hubIndex < pveRealBuffHubKeys.size();
+			++hubIndex) {
+		String hubKey = pveRealBuffHubKeys.get(hubIndex);
+		int separator = hubKey.indexOf(":");
+		if (separator <= 0 || separator >= hubKey.length() - 1)
+			continue;
+
+		String hubPlanet = hubKey.subString(0, separator);
+		String hubCity = hubKey.subString(separator + 1);
+		int hubIndexInGraph = findShuttleportIndex(hubPlanet, hubCity);
+		if (hubIndexInGraph < 0)
+			continue;
+		const ShuttleportLocation& hubLocation =
+			allShuttleports.get(hubIndexInGraph);
+		if (hubLocation.routingOnly || hubLocation.starportPoint.isEmpty() ||
+				(hubPlanet == currentPlanet && hubCity == currentCity.name))
+			continue;
+
+		Vector<SimTravelLeg> legs;
+		String summary;
+		if (!planSimTravelRoute(currentPlanet, currentCity.name, hubPlanet,
+				hubCity, false, legs, summary) || legs.size() == 0)
+			continue;
+
+		PveBuffProviders providers;
+		if (!resolvePveBuffProviders(hubPlanet, hubCity, providers) ||
+				providers.pending)
+			continue;
+		bool hasDoctor = !needDoctor || providers.doctor.found;
+		bool hasEntertainer = !needEntertainer ||
+			(providers.musician.found && providers.dancer.found);
+		if (!hasDoctor || !hasEntertainer)
+			continue;
+
+		uint64 nowMs = System::getMiliTime();
+		PveBuffTrip planned;
+		planned.identityId = identityId;
+		planned.bodyOid = bodyOid;
+		planned.huntPlanet = currentPlanet;
+		planned.huntCity = currentCity.name;
+		planned.hubPlanet = hubPlanet;
+		planned.hubCity = hubCity;
+		planned.legs = legs;
+		planned.startedAtMs = nowMs;
+		planned.deadlineAtMs = nowMs +
+			static_cast<uint64>(pveBuffTripDeadlineSeconds) * 1000;
+		planned.legIndex = 0;
+		planned.returning = false;
+		planned.summary = summary;
+
+		{
+			Locker pveLock(&pveMutex);
+			if (pveBuffTrips.contains(identityId))
+				return false;
+			pveBuffTrips.put(identityId, planned);
+			++pveBuffTripsStarted;
+		}
+		trip = planned;
+		return true;
+	}
+
+	return false;
+}
+
+bool SimPlayerManager::getPveHunterBuffTrip(uint64 identityId,
+		PveBuffTrip& trip) {
+	Locker pveLock(&pveMutex);
+	if (!pveBuffTrips.contains(identityId))
+		return false;
+	trip = pveBuffTrips.get(identityId);
+	return true;
+}
+
+void SimPlayerManager::advancePveHunterBuffTrip(uint64 identityId) {
+	Locker pveLock(&pveMutex);
+	if (!pveBuffTrips.contains(identityId))
+		return;
+	PveBuffTrip trip = pveBuffTrips.get(identityId);
+	++trip.legIndex;
+	pveBuffTrips.put(identityId, trip);
+}
+
+bool SimPlayerManager::beginPveHunterBuffReturn(uint64 identityId) {
+	PveBuffTrip current;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveBuffTrips.contains(identityId))
+			return false;
+		current = pveBuffTrips.get(identityId);
+	}
+
+	if (current.returning)
+		return true;
+
+	Vector<SimTravelLeg> returnLegs;
+	String summary;
+	if (!planSimTravelRoute(current.hubPlanet, current.hubCity,
+			current.huntPlanet, current.huntCity, false, returnLegs, summary) ||
+			returnLegs.size() == 0)
+		return false;
+
+	current.legs = returnLegs;
+	current.legIndex = 0;
+	current.returning = true;
+	current.summary = summary;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveBuffTrips.contains(identityId))
+			return false;
+		pveBuffTrips.put(identityId, current);
+	}
+	return true;
+}
+
+void SimPlayerManager::finishPveHunterBuffTrip(uint64 identityId,
+		bool success) {
+	Locker pveLock(&pveMutex);
+	if (!pveBuffTrips.contains(identityId))
+		return;
+	pveBuffTrips.drop(identityId);
+	if (success)
+		++pveBuffTripsCompleted;
+	else
+		++pveBuffTripsFallback;
+}
+
+void SimPlayerManager::onPveBotMissionLairDestroyed(uint64 bodyOid,
+		uint64 lairOid) {
+	if (bodyOid == 0 || lairOid == 0)
+		return;
+
+	uint64 identityId = 0;
+	bool missionCompleted = false;
+	bool trackedMissionLair = false;
+	// DIAGNOSTIC (built under MissionDiagLog gate): the completion counter only
+	// fires when a stored offer matches BOTH bodyOid and lairOid, while the
+	// lair-cleaned counter fires on the pveHuntLairs key alone -- so 10 cleaned /
+	// 0 completed means the offer match is missing. Capture the offers for this
+	// identity under the lock, emit after releasing it (never do file I/O under
+	// pveMutex).
+	String diagOfferDump;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveHuntLairs.contains(bodyOid) &&
+				pveHuntLairs.get(bodyOid).lairOid == lairOid) {
+			if (pveHuntLairs.get(bodyOid).cleanupQueued)
+				return;
+			trackedMissionLair = true;
+			identityId = pveHuntLairs.get(bodyOid).identityId;
+			pveHuntLairs.drop(bodyOid);
+			pveMissionLairsCleaned++;
+			pveLairsDestroyedTotal++;
+		}
+
+		for (int i = 0; trackedMissionLair && i < pveBotMissions.size() &&
+				!missionCompleted; ++i) {
+			Vector<PveBotMissionOffer>& offers =
+				pveBotMissions.elementAt(i).getValue();
+			for (int j = 0; j < offers.size(); ++j) {
+				PveBotMissionOffer& offer = offers.get(j);
+				if (offer.bodyOid != bodyOid || offer.lairOid != lairOid ||
+						offer.completed)
+					continue;
+				identityId = pveBotMissions.elementAt(i).getKey();
+				offer.completed = true;
+				missionCompleted = true;
+				break;
+			}
+		}
+
+		if (missionCompleted) {
+			pveMissionsCompletedTotal++;
+			if (pveIdentities.contains(identityId)) {
+				SimBotIdentity& identity = pveIdentities.get(identityId);
+				identity.hunts++;
+				pveDirtyIdentityIds.put(identityId, true);
+			}
+		}
+
+		if (MissionDiagLog::isLoggingEnabled() && trackedMissionLair &&
+				!missionCompleted && pveBotMissions.contains(identityId)) {
+			const Vector<PveBotMissionOffer>& offers =
+				pveBotMissions.get(identityId);
+			StringBuffer buf;
+			for (int j = 0; j < offers.size(); ++j) {
+				const PveBotMissionOffer& offer = offers.get(j);
+				buf << "[offerId=" << offer.offerId << " bodyOid="
+					<< offer.bodyOid << " lairOid=" << offer.lairOid
+					<< " completed=" << (offer.completed ? "1" : "0") << "]";
+			}
+			diagOfferDump = buf.toString();
+		}
+	}
+
+	if (trackedMissionLair && !missionCompleted)
+		MissionDiagLog::event("LAIR_DESTROYED_NOCREDIT", identityId,
+			"bodyOid=" + String::valueOf(bodyOid) +
+			" lairOid=" + String::valueOf(lairOid) +
+			" offers=" + (diagOfferDump.isEmpty() ? String("none") :
+				diagOfferDump));
+	else if (trackedMissionLair)
+		MissionDiagLog::event("LAIR_DESTROYED_CREDIT", identityId,
+			"bodyOid=" + String::valueOf(bodyOid) +
+			" lairOid=" + String::valueOf(lairOid));
+
+	Reference<SimPlayerController*> ctrl = controllers.contains(bodyOid) ?
+		controllers.get(bodyOid) : nullptr;
+	SimHunterController* hunter = ctrl == nullptr ? nullptr :
+		dynamic_cast<SimHunterController*>(ctrl.get());
+	if (hunter != nullptr)
+		hunter->onPveBotMissionLairDestroyed(lairOid);
+
+	info("SimPveBotMissionLairDestroyed body=" + String::valueOf(bodyOid) +
+		" lair=" + String::valueOf(lairOid) + " completed=" +
+		String::valueOf(missionCompleted), true);
+}
+
+bool SimPlayerManager::getPveBotMissionOffer(uint64 identityId,
+		uint64 offerId, PveBotMissionOffer& offer) {
+	offer = PveBotMissionOffer();
+	Locker pveLock(&pveMutex);
+	if (!pveBotMissions.contains(identityId))
+		return false;
+	const Vector<PveBotMissionOffer>& offers = pveBotMissions.get(identityId);
+	for (int i = 0; i < offers.size(); ++i) {
+		if (offers.get(i).offerId == offerId) {
+			uint64 now = System::getMiliTime();
+			if (offers.get(i).issuedAtMs != 0 && now >=
+					offers.get(i).issuedAtMs + static_cast<uint64>(
+						pveMissionBoardMaxOfferAgeSeconds) * 1000)
+				return false;
+			offer = offers.get(i);
+			return true;
+		}
+	}
+	return false;
+}
+
+SimPlayerManager::PveLairRevealResult
+SimPlayerManager::revealPveBotMissionLair(uint64 bodyOid, uint64 offerId) {
+	if (!pveMissionHuntEnabled || !pveMissionBoardEnabled || bodyOid == 0 ||
+		offerId == 0)
+		return PVE_LAIR_REVEAL_FAILED;
+
+	PveBotMissionOffer offer;
+	uint64 identityId = 0;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < pveBotMissions.size(); ++i) {
+			const Vector<PveBotMissionOffer>& identityOffers =
+				pveBotMissions.elementAt(i).getValue();
+			for (int j = 0; j < identityOffers.size(); ++j) {
+				if (identityOffers.get(j).offerId == offerId &&
+						identityOffers.get(j).bodyOid == bodyOid) {
+					identityId = pveBotMissions.elementAt(i).getKey();
+					offer = identityOffers.get(j);
+					break;
+				}
+			}
+			if (identityId != 0)
+				break;
+		}
+	}
+	// DIAGNOSTIC: this function has ~11 identical FAILED exits and the controller
+	// collapses them all to "mission_lair_reveal_failed". Name the exact one so
+	// the off-navmesh-forest reveal failures on Endor are attributable. Emits
+	// only when the gate is on; no behaviour change.
+	auto revealFail = [&](const char* why) -> PveLairRevealResult {
+		MissionDiagLog::event("REVEAL_FAIL", identityId, String("reason=") + why +
+			" bodyOid=" + String::valueOf(bodyOid) +
+			" offerId=" + String::valueOf(offerId) +
+			" " + MissionDiagLog::fmtVec("advertised", offer.advertisedPos) +
+			" size=" + String::valueOf(offer.size));
+		return PVE_LAIR_REVEAL_FAILED;
+	};
+
+	uint64 nowMs = System::getMiliTime();
+	if (identityId == 0 || offer.completed || offer.revealed ||
+			(offer.issuedAtMs != 0 && nowMs >= offer.issuedAtMs +
+				static_cast<uint64>(pveMissionBoardMaxOfferAgeSeconds) * 1000))
+		return revealFail("offerInvalidOrExpired");
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	Zone* zone = zoneServer == nullptr ? nullptr : zoneServer->getZone(
+		offer.planet);
+	if (zone == nullptr || zone->getZoneServer() == nullptr)
+		return revealFail("noZone");
+	Vector3 hunterPosition;
+	Zone* hunterZone = nullptr;
+	ManagedReference<SceneObject*> body = zoneServer->getObject(bodyOid);
+	AiAgent* hunter = body == nullptr ? nullptr : body->asAiAgent();
+	if (hunter == nullptr)
+		return revealFail("noHunter");
+	{
+		Locker hunterLock(hunter);
+		hunterZone = hunter->getZone();
+		hunterPosition = hunter->getWorldPosition();
+	}
+	if (hunterZone == nullptr || hunterZone->getZoneName() != offer.planet)
+		return revealFail("hunterOffPlanet");
+	if (hunterPosition.distanceTo2d(offer.advertisedPos) >
+			pveMissionBoardLairRevealRadiusMeters)
+		return revealFail("outsideRevealRadius");
+
+	PlanetManager* planetManager = zone->getPlanetManager();
+	if (planetManager == nullptr)
+		return revealFail("noPlanetManager");
+
+	// Candidate is spawnable when it clears the two gates reveal has always
+	// trusted: the engine no-build/water/slope permit at the lair's own margin,
+	// and a sphere-collision sweep. Height is resolved per candidate.
+	auto pointClear = [&](float px, float py, Vector3& out) -> bool {
+		if (!planetManager->isSpawningPermittedAt(px, py, offer.size))
+			return false;
+		// Mirror choosePveBotMissionPosition's city-region rejection: isSpawning
+		// PermittedAt does not fully exclude city regions, so without this a
+		// relocated candidate offset toward a nearby city could drop an
+		// attackable lair inside it.
+		SortedVector<ManagedReference<ActiveArea*> > activeAreas;
+		zone->getInRangeActiveAreas(px, 0, py, &activeAreas, true);
+		for (int a = 0; a < activeAreas.size(); ++a) {
+			ActiveArea* area = activeAreas.get(a);
+			if (area != nullptr && area->isCityRegion())
+				return false;
+		}
+		Vector3 probe(px, py, zone->getHeight(px, py));
+		if (CollisionManager::checkSphereCollision(probe, offer.size, zone))
+			return false;
+		out = probe;
+		return true;
+	};
+
+	// ROOT CAUSE (proven by REVEAL_SPAWNCHECK, 29/29 p45=false): a point that
+	// choosePveBotMissionPosition validated at generation (isSpawningPermittedAt
+	// margin 45) is routinely no longer permitted minutes later when the hunter
+	// arrives. isSpawningPermittedAt's only time-variant input is
+	// isInObjectsNoBuildZone, so a structure / no-build object has appeared near
+	// the advertised waypoint (Endor's forest is dense with POIs + world-presence
+	// churn). Rather than abandon the mission and burn a terminal round trip,
+	// relocate the lair to the nearest currently-clear point around the waypoint.
+	// The hunter is already within the reveal radius, so a small offset keeps it
+	// close and honours the "waypoint updated to exact location" message; spawnPos
+	// drives revealedPos, the lair record, and the hunter's moveTo downstream.
+	Vector3 spawnPos;
+	bool haveSpawn = pointClear(offer.advertisedPos.getX(),
+		offer.advertisedPos.getY(), spawnPos);
+	if (!haveSpawn) {
+		if (MissionDiagLog::isLoggingEnabled()) {
+			float ax = offer.advertisedPos.getX();
+			float ay = offer.advertisedPos.getY();
+			MissionDiagLog::event("REVEAL_SPAWNCHECK", identityId,
+				MissionDiagLog::fmtVec("advertised", offer.advertisedPos) +
+				" size=" + String::valueOf(offer.size) +
+				" p45=" + String::valueOf(planetManager->isSpawningPermittedAt(
+					ax, ay, 45.f)) +
+				" p0=" + String::valueOf(planetManager->isSpawningPermittedAt(
+					ax, ay, 0.f)) +
+				" inBounds=" + String::valueOf(zone->isWithinBoundaries(
+					Vector3(ax, ay, 0.f))) +
+				" height=" + String::valueOf(zone->getHeight(ax, ay)));
+		}
+		if (pveMissionBoardRevealRelocateEnabled) {
+			const float radiansPerDegree = 0.017453292519943295f;
+			static const float ringRadii[] = { 16.f, 32.f, 48.f, 64.f };
+			int probes = 0;
+			for (int r = 0; r < 4 && !haveSpawn; ++r) {
+				for (int b = 0; b < 8 && !haveSpawn; ++b) {
+					float ang = static_cast<float>(b * 45) * radiansPerDegree;
+					float px = offer.advertisedPos.getX() +
+						std::cos(ang) * ringRadii[r];
+					float py = offer.advertisedPos.getY() +
+						std::sin(ang) * ringRadii[r];
+					++probes;
+					if (!zone->isWithinBoundaries(Vector3(px, py, 0.f)))
+						continue;
+					haveSpawn = pointClear(px, py, spawnPos);
+				}
+			}
+			MissionDiagLog::event(
+				haveSpawn ? "REVEAL_RELOCATE" : "REVEAL_RELOCATE_DEFER",
+				identityId,
+				MissionDiagLog::fmtVec("advertised", offer.advertisedPos) +
+				(haveSpawn ? " " + MissionDiagLog::fmtVec("relocated", spawnPos) :
+					String("")) +
+				" probes=" + String::valueOf(probes) +
+				" offset=" + String::valueOf(haveSpawn ?
+					spawnPos.distanceTo2d(offer.advertisedPos) : 0.f));
+		}
+	}
+	if (!haveSpawn) {
+		// Whole neighbourhood is blocked (or relocation is disabled). When
+		// disabled, preserve the legacy strict behaviour (abandon). When enabled,
+		// DEFER instead: the controller retries in 2s exactly like the capacity
+		// path, and transient no-build occupancy typically clears.
+		if (!pveMissionBoardRevealRelocateEnabled)
+			return revealFail("spawnNotPermitted");
+		return PVE_LAIR_REVEAL_DEFER;
+	}
+
+	LairTemplate* lairTemplate = CreatureTemplateManager::instance()->
+		getLairTemplate(offer.lairTemplate.hashCode());
+	if (lairTemplate == nullptr)
+		return revealFail("noLairTemplate");
+	// Reserve the active-lair slot BEFORE creating anything. Checking capacity
+	// only after construction leaked the LairObject: at that point it is not yet
+	// in a zone, so the conditional destroyObjectFromWorld() below was a no-op.
+	{
+		Locker pveLock(&pveMutex);
+		if (pveHuntLairs.contains(bodyOid) ||
+				pveHuntLairs.size() >= pveMissionMaxActiveLairs ||
+				!pveBotMissions.contains(identityId))
+			return PVE_LAIR_REVEAL_DEFER;
+
+		PveHuntLair reservation;
+		reservation.identityId = identityId;
+		reservation.bodyOid = bodyOid;
+		reservation.planet = offer.planet;
+		reservation.speciesKey = "mission_board:" + String::valueOf(offerId);
+		reservation.spawnedAtMs = System::getMiliTime();
+		reservation.spawnInProgress = true;
+		pveHuntLairs.put(bodyOid, reservation);
+	}
+
+	// From here every failure path must release the reservation AND dispose the
+	// object; a ManagedReference keeps it alive until we do so explicitly.
+	auto releaseReservation = [this, bodyOid]() {
+		Locker pveLock(&pveMutex);
+		if (pveHuntLairs.contains(bodyOid) &&
+				pveHuntLairs.get(bodyOid).spawnInProgress)
+			pveHuntLairs.drop(bodyOid);
+	};
+
+	ManagedReference<LairObject*> lair = zone->getZoneServer()->createObject(
+		offer.missionBuilding.hashCode(), 0).castTo<LairObject*>();
+	if (lair == nullptr) {
+		releaseReservation();
+		return PVE_LAIR_REVEAL_FAILED;
+	}
+
+	uint64 lairOid = lair->getObjectID();
+	ManagedReference<DestroyMissionLairObserver*> lairObserver =
+		new DestroyMissionLairObserver();
+	{
+		Locker lairLock(lair);
+		lair->setObjectName("@lair_n:" + lairTemplate->getName(), false);
+		lair->setFaction(lairTemplate->getFaction());
+		lair->setPvpStatusBitmask(ObjectFlag::ATTACKABLE);
+		lair->setOptionsBitmask(0, false);
+		lair->setMaxCondition(offer.difficultyLevel *
+			(900 + System::random(200)));
+		lair->setConditionDamage(0, false);
+		lair->initializePosition(spawnPos.getX(), spawnPos.getZ(),
+			spawnPos.getY());
+		lair->setDespawnOnNoPlayersInRange(false);
+		registerPveBotMissionLairObserver(lair, bodyOid, lairOid);
+		lairObserver->deploy();
+		lairObserver->setLairTemplate(lairTemplate);
+		lairObserver->setDifficulty(offer.difficulty);
+		lairObserver->setObserverType(ObserverType::LAIR);
+		lairObserver->setSize(offer.size);
+		lair->registerObserver(ObserverEventType::OBJECTDESTRUCTION,
+			lairObserver);
+		lair->registerObserver(ObserverEventType::DAMAGERECEIVED,
+			lairObserver);
+		lair->registerObserver(ObserverEventType::AIMESSAGE, lairObserver);
+		lair->registerObserver(ObserverEventType::OBJECTREMOVEDFROMZONE,
+			lairObserver);
+		lair->registerObserver(ObserverEventType::NOPLAYERSINRANGE,
+			lairObserver);
+		lair->registerObserver(ObserverEventType::CREATUREDESPAWNED,
+			lairObserver);
+	}
+
+	PveHuntLair record;
+	record.identityId = identityId;
+	record.bodyOid = bodyOid;
+	record.lairOid = lairOid;
+	record.speciesKey = "mission_board:" + String::valueOf(offerId);
+	record.planet = offer.planet;
+	record.x = spawnPos.getX();
+	record.y = spawnPos.getY();
+	record.z = spawnPos.getZ();
+	record.spawnedAtMs = System::getMiliTime();
+	record.alive = true;
+	bool registered = false;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveHuntLairs.contains(bodyOid) ||
+				!pveHuntLairs.get(bodyOid).spawnInProgress ||
+				!pveBotMissions.contains(identityId)) {
+			registered = false;
+		} else {
+			Vector<PveBotMissionOffer>& currentOffers = pveBotMissions.get(identityId);
+			for (int i = 0; i < currentOffers.size(); ++i) {
+				if (currentOffers.get(i).offerId == offerId &&
+						!currentOffers.get(i).completed &&
+						!currentOffers.get(i).revealed) {
+					currentOffers.get(i).revealed = true;
+					currentOffers.get(i).revealedPos = spawnPos;
+					currentOffers.get(i).lairOid = lairOid;
+					registered = true;
+					break;
+				}
+			}
+			if (registered) {
+				record.spawnInProgress = false;
+				record.waveObserver = lairObserver;
+				pveHuntLairs.put(bodyOid, record);
+				pveMissionLairsSpawned++;
+			}
+		}
+	}
+	if (!registered) {
+		// Not in a zone yet, so destroyObjectFromWorld alone would do nothing.
+		// Dispose explicitly and hand the slot back.
+		releaseReservation();
+		Locker lairLock(lair);
+		if (lair->getZone() != nullptr)
+			lair->destroyObjectFromWorld(true);
+		lair->destroyObjectFromDatabase(true);
+		return PVE_LAIR_REVEAL_DEFER;
+	}
+	zone->transferObject(lair, -1, true);
+	lairObserver->checkForNewSpawns(lair, nullptr, true);
+	info("SimPveBotMissionLairRevealed identity=" + String::valueOf(identityId) +
+		" offer=" + String::valueOf(offerId) + " lair=" +
+		String::valueOf(lairOid), true);
+	return PVE_LAIR_REVEAL_OK;
 }
 
 bool SimPlayerManager::spawnPveHuntLair(uint64 bodyOid,
@@ -8672,6 +10658,7 @@ void SimPlayerManager::finishPveHuntLairCleanup(uint64 bodyOid,
 				pveHuntLairs.get(bodyOid).lairOid == lairOid) {
 			pveHuntLairs.drop(bodyOid);
 			pveMissionLairsCleaned++;
+			pveLairsDestroyedTotal++;
 			removed = true;
 		}
 	}
@@ -8716,6 +10703,7 @@ void SimPlayerManager::runPveHuntLairJanitor(uint64 nowMs) {
 						record.lairOid) {
 					pveHuntLairs.drop(record.bodyOid);
 					pveMissionLairsCleaned++;
+					pveLairsDestroyedTotal++;
 					removed = true;
 				}
 			}
@@ -9120,11 +11108,13 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 		return;
 
 	bool groundsValidated = false;
+	bool marketConfigured = false;
 	{
 		Locker pveLock(&pveMutex);
 		groundsValidated = pveHuntGroundsValidated;
+		marketConfigured = pveMarketDispatchEnabled;
 	}
-	if (!groundsValidated) {
+	if (!groundsValidated && !marketConfigured) {
 		validatePveHuntGrounds();
 		{
 			Locker pveLock(&pveMutex);
@@ -9136,19 +11126,57 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 
 	Vector<PveHuntSpecies> speciesSnapshot;
 	Vector<SimBotIdentity> identities;
+	Vector<uint64> identityBodyOids;
 	int huntQuotaSnapshot = 1;
+	bool locationBasedEligibility = false;
+	float dispatchRadiusMeters = 2500.f;
+	bool marketDispatchEnabled = false;
+	bool missionBoardEnabledSnapshot = false;
+	Vector<String> marketFamilies;
+	VectorMap<String, Vector<PveMarketQualityWeight> > marketQualityWeights;
+	Vector<PveLairYieldEntry> lairYieldIndex;
+	Vector<PveMissionTerminalLocation> marketTerminals;
 	{
 		Locker pveLock(&pveMutex);
-		if (pveHuntSpecies.size() == 0)
+		if (pveHuntSpecies.size() == 0 && !pveMarketDispatchEnabled)
 			return;
 		speciesSnapshot = pveHuntSpecies;
 		huntQuotaSnapshot = pveHuntQuota;
+		locationBasedEligibility = pveLocationBasedEligibility;
+		dispatchRadiusMeters = pveDispatchRadiusMeters;
+		marketDispatchEnabled = pveMarketDispatchEnabled;
+		missionBoardEnabledSnapshot = pveMissionBoardEnabled;
+		marketFamilies = pveMarketDispatchFamilies;
+		marketQualityWeights = pveMarketQualityWeights;
+		lairYieldIndex = pveLairYieldIndex;
+		marketTerminals = allMissionTerminals;
 		for (int i = 0; i < pveIdentities.size() &&
 				identities.size() < pveMaxHunters; ++i) {
 			uint64 identityId = pveIdentities.elementAt(i).getKey();
 			if (pveIdentityBodyOids.contains(identityId) &&
-					!pveHuntOrders.contains(identityId))
+					!pveHuntOrders.contains(identityId)) {
 				identities.add(pveIdentities.get(identityId));
+				identityBodyOids.add(pveIdentityBodyOids.get(identityId));
+			}
+		}
+	}
+
+	Vector<bool> locationEligible;
+	Vector<String> currentPlanets;
+	Vector<int> identityLevels;
+	if (locationBasedEligibility || marketDispatchEnabled) {
+		for (int i = 0; i < identities.size(); ++i) {
+			String currentPlanet;
+			ShuttleportLocation city;
+			PveMissionTerminalLocation terminal;
+			bool eligible = resolvePveHunterDispatchLocation(
+				identityBodyOids.get(i), dispatchRadiusMeters, currentPlanet,
+				city, terminal);
+			if (locationBasedEligibility)
+				locationEligible.add(eligible);
+			currentPlanets.add(currentPlanet);
+			identityLevels.add(getPveBotHunterLevelForBody(
+				identityBodyOids.get(i)));
 		}
 	}
 
@@ -9167,6 +11195,285 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 		acquisitionLedgerEnabled = pveAcquisitionLedgerEnabled;
 		acquisitionLedgerHuntTimeEstimateSeconds =
 			pveAcquisitionLedgerHuntTimeEstimateSeconds;
+	}
+
+	if (marketDispatchEnabled && missionBoardEnabledSnapshot &&
+			acquisitionLedgerEnabled && lairYieldIndex.size() > 0) {
+		Vector<ResourceIntelligenceEntry> resourceEntries;
+		String resourceError;
+		// A resource-intelligence miss must not strand every hunter. Returning
+		// here skipped the legacy matchmaker below and idled the whole roster,
+		// which is strictly worse than dispatching on the pre-market rules.
+		// Market dispatch is an ENHANCEMENT over the legacy path, never a
+		// replacement that can fail closed.
+		bool marketSnapshotReady = collectResourceIntelligenceSnapshot(
+			resourceEntries, resourceError);
+		if (!marketSnapshotReady)
+			info("SimPveMarketDispatchSkipped reason=resourceSnapshot error=" +
+				resourceError, true);
+
+		Vector<bool> blockedIdentity;
+		for (int i = 0; i < identities.size(); ++i)
+			blockedIdentity.add(false);
+		Vector<uint64> assignedIdentityIds;
+		uint64 huntTimeEstimate = acquisitionLedgerHuntTimeEstimateSeconds > 0 ?
+			static_cast<uint64>(acquisitionLedgerHuntTimeEstimateSeconds) : 1;
+
+		while (marketSnapshotReady &&
+				assignedIdentityIds.size() < identities.size()) {
+			PveMarketCandidate bestCandidate;
+			float bestDispatchScore = -1.f;
+
+			for (int identityIndex = 0; identityIndex < identities.size();
+					++identityIndex) {
+				const SimBotIdentity& identity = identities.get(identityIndex);
+				if (blockedIdentity.get(identityIndex) ||
+						assignedIdentityIds.contains(identity.id) ||
+						identity.skillTier < 1 || currentPlanets.size() <= identityIndex)
+					continue;
+
+				for (int demandResultIndex = 0;
+						demandResultIndex < demandResults.size();
+						++demandResultIndex) {
+					const DemandStateSimulationResult& demand =
+						demandResults.get(demandResultIndex);
+					if (!demand.activeProfileAvailableForPhase)
+						continue;
+
+					for (int signalIndex = 0;
+							signalIndex < demand.familySignals.size();
+							++signalIndex) {
+						const DemandFamilySignal& signal =
+							demand.familySignals.get(signalIndex);
+						String family = signal.family.toLowerCase().trim();
+						if (signal.signalUnits == 0 ||
+								!marketFamilies.contains(family))
+							continue;
+
+					PveMarketCandidate signalBest;
+					bool haveSignalCandidate = false;
+					for (int resourceIndex = 0;
+							resourceIndex < resourceEntries.size(); ++resourceIndex) {
+						const ResourceIntelligenceEntry& resource =
+							resourceEntries.get(resourceIndex);
+						if (!resource.inShift ||
+								!pveMarketResourceMatchesFamily(resource, family))
+							continue;
+						float quality = 0.f;
+						if (!pveMarketQualityScore(resource, family,
+								marketQualityWeights, quality) ||
+								quality < pveMarketMinQualityScore)
+							continue;
+
+						for (int terminalIndex = 0;
+								terminalIndex < marketTerminals.size();
+								++terminalIndex) {
+							const PveMissionTerminalLocation& terminal =
+								marketTerminals.get(terminalIndex);
+							bool validCity = false;
+							for (int cityIndex = 0;
+									cityIndex < allShuttleports.size(); ++cityIndex) {
+								const ShuttleportLocation& city =
+									allShuttleports.get(cityIndex);
+								if (city.planet == terminal.planet &&
+										city.name == terminal.city &&
+										!city.starportPoint.isEmpty()) {
+									validCity = true;
+									break;
+								}
+							}
+							if (!validCity || !pveMarketResourceCoversPlanet(
+									resource, terminal.planet))
+								continue;
+
+							// Mirror selectPveBotMissionLairSpawn's TIER PREFERENCE,
+							// not just its bounds: it takes the best in-window
+							// candidate and only relaxes to the upper-bound-only
+							// tier when the window yields nothing. Reserving on a
+							// flat upper-bound scan could pick a relaxed-tier lair
+							// the selector would never reach, so evaluate the strict
+							// window first and fall back exactly as the selector does.
+							uint64 expectedYield = 0;
+							String lairTemplate;
+							int hunterLevel = identityIndex < identityLevels.size() ?
+								identityLevels.get(identityIndex) : 1;
+							for (int tier = 0; tier < 2 && expectedYield == 0;
+									++tier) {
+								bool strictWindow = tier == 0;
+								for (int lairIndex = 0;
+										lairIndex < lairYieldIndex.size();
+										++lairIndex) {
+									const PveLairYieldEntry& lair =
+										lairYieldIndex.get(lairIndex);
+									if (lair.planet != terminal.planet ||
+											!pveMarketLairYieldsResource(lair,
+												resource.type) ||
+											!lair.amountsByFamily.contains(family))
+										continue;
+									if (lair.minDifficulty > hunterLevel + 5)
+										continue;
+									if (strictWindow) {
+										int lowerBound = Math::min(hunterLevel - 5,
+											lair.minLevelCeiling);
+										if (lair.maxDifficulty < lowerBound)
+											continue;
+									}
+									uint64 amount =
+										lair.amountsByFamily.get(family);
+									if (amount > expectedYield ||
+											(amount == expectedYield &&
+											lair.lairTemplate.compareTo(
+												lairTemplate) < 0)) {
+										expectedYield = amount;
+										lairTemplate = lair.lairTemplate;
+									}
+								}
+							}
+							if (expectedYield == 0)
+								continue;
+
+							PveMarketCandidate candidate;
+							candidate.family = family;
+							candidate.resourceType = resource.type;
+							candidate.resourceSpawnOid = resource.objectID;
+							candidate.qualityScore = quality;
+							candidate.planet = terminal.planet;
+							candidate.city = terminal.city;
+							candidate.terminalOid = terminal.terminalOid;
+							candidate.terminal = terminal;
+							candidate.expectedYieldUnits = expectedYield;
+							candidate.lairTemplate = lairTemplate;
+							candidate.pressure = signal.pressure;
+							candidate.demandProfileKey = demand.profileKey;
+							candidate.demandResultIndex = demandResultIndex;
+							candidate.signalIndex = signalIndex;
+							if (!haveSignalCandidate || quality >
+									signalBest.qualityScore || (quality ==
+									signalBest.qualityScore && pveMarketTieEarlier(
+									candidate, signalBest))) {
+								signalBest = candidate;
+								haveSignalCandidate = true;
+							}
+						}
+					}
+					if (!haveSignalCandidate)
+						continue;
+					float dispatchScore = signal.pressure *
+						static_cast<float>(signalBest.expectedYieldUnits) /
+						static_cast<float>(huntTimeEstimate);
+					if (bestCandidate.identityIndex < 0 || dispatchScore >
+							bestDispatchScore || (dispatchScore == bestDispatchScore &&
+							(signalBest.qualityScore > bestCandidate.qualityScore ||
+							(signalBest.qualityScore == bestCandidate.qualityScore &&
+								pveMarketTieEarlier(signalBest, bestCandidate))))) {
+						signalBest.identityIndex = identityIndex;
+						bestCandidate = signalBest;
+						bestDispatchScore = dispatchScore;
+					}
+				}
+			}
+		}
+
+		if (bestCandidate.identityIndex < 0)
+			break;
+
+		const SimBotIdentity& identity = identities.get(
+			bestCandidate.identityIndex);
+		uint64 bodyOid = identityBodyOids.get(bestCandidate.identityIndex);
+		Reference<SimPlayerController*> ctrl = controllers.contains(bodyOid) ?
+			controllers.get(bodyOid) : nullptr;
+		SimHunterController* hunter = ctrl == nullptr ? nullptr :
+			dynamic_cast<SimHunterController*>(ctrl.get());
+		if (hunter == nullptr || !hunter->isReadyForMarketRelocation()) {
+			blockedIdentity.set(bestCandidate.identityIndex, true);
+			continue;
+		}
+
+		PveRelocation relocation;
+		if (!planPveHunterRelocation(identity.id, bodyOid,
+				bestCandidate.planet, bestCandidate.city, "market_dispatch",
+				relocation)) {
+			blockedIdentity.set(bestCandidate.identityIndex, true);
+			continue;
+		}
+
+		PveHuntSpecies marketSpecies;
+		marketSpecies.key = "market_" + bestCandidate.family + "_" +
+			bestCandidate.planet;
+		marketSpecies.planet = bestCandidate.planet;
+		marketSpecies.requestedResourceType = bestCandidate.resourceType;
+		marketSpecies.harvestKind = bestCandidate.family;
+		marketSpecies.lairTemplate = bestCandidate.lairTemplate;
+		marketSpecies.soloable = true;
+		marketSpecies.usable = true;
+		marketSpecies.minSkillTier = 1;
+
+		bool assigned = false;
+		{
+			Locker pveLock(&pveMutex);
+			if (!pveHuntOrders.contains(identity.id) &&
+					pveIdentityBodyOids.contains(identity.id)) {
+				PveHuntOrder order;
+				order.identityId = identity.id;
+				order.bodyOid = bodyOid;
+				order.issuedAtMs = nowMs;
+				order.homePlanet = identity.homePlanet;
+				order.homeCity = identity.homeCity;
+				order.speciesKey = marketSpecies.key;
+				order.requestedResourceType = bestCandidate.resourceType;
+				order.harvestKind = bestCandidate.family;
+				order.demandProfileKey = bestCandidate.demandProfileKey;
+				order.quota = huntQuotaSnapshot;
+				order.expectedYieldUnits = multiplyDemandFamilyUnits(
+					bestCandidate.expectedYieldUnits, huntQuotaSnapshot);
+				order.marketTargetPlanet = bestCandidate.planet;
+				order.marketTargetCity = bestCandidate.city;
+				order.marketResourceType = bestCandidate.resourceType;
+				order.marketFamily = bestCandidate.family;
+				order.marketResourceSpawnOid = bestCandidate.resourceSpawnOid;
+				order.marketQualityScore = bestCandidate.qualityScore;
+				order.phase = "ANNOUNCE_JOB";
+				order.status = "ASSIGNED";
+				pveHuntOrders.put(identity.id, order);
+				SimBotIdentity& mutableIdentity = pveIdentities.get(identity.id);
+				mutableIdentity.assignmentSpecies = marketSpecies.key;
+				mutableIdentity.assignmentResource = bestCandidate.resourceType;
+				mutableIdentity.assignmentStamp = nowMs;
+				pveDirtyIdentityIds.put(identity.id, true);
+				assigned = true;
+			}
+		}
+		if (!assigned) {
+			blockedIdentity.set(bestCandidate.identityIndex, true);
+			continue;
+		}
+
+		DemandFamilySignal& selectedSignal = demandResults.get(
+			bestCandidate.demandResultIndex).familySignals.get(
+			bestCandidate.signalIndex);
+		uint64 expectedYield = multiplyDemandFamilyUnits(
+			bestCandidate.expectedYieldUnits, huntQuotaSnapshot);
+		selectedSignal.signalUnits = selectedSignal.signalUnits <= expectedYield ?
+			0 : selectedSignal.signalUnits - expectedYield;
+		assignedIdentityIds.add(identity.id);
+		{
+			Locker pveLock(&pveMutex);
+			pveMarketDemandedFamily = bestCandidate.family;
+			pveMarketWinningResourceType = bestCandidate.resourceType;
+			pveMarketWinningPlanet = bestCandidate.planet;
+			pveMarketWinningQualityScore = bestCandidate.qualityScore;
+		}
+
+		PveHuntOrder assignedOrder;
+		getPveHunterOrder(identity.id, assignedOrder);
+		hunter->startOrder(assignedOrder, marketSpecies);
+		info("SimPveMarketHuntAssigned identity=" + String::valueOf(
+			identity.id) + " planet=" + bestCandidate.planet +
+			" city=" + bestCandidate.city + " resource=" +
+			bestCandidate.resourceType + " quality=" + String::valueOf(
+			bestCandidate.qualityScore), true);
+		}
+		return;
 	}
 
 	if (acquisitionLedgerEnabled) {
@@ -9188,41 +11495,49 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 						speciesIndex < speciesSnapshot.size(); ++speciesIndex) {
 					const PveHuntSpecies& species =
 						speciesSnapshot.get(speciesIndex);
-					if (!species.usable || !species.soloable ||
-							identity.skillTier < species.minSkillTier ||
-							species.planet != identity.homePlanet)
-						continue;
+					if (locationBasedEligibility) {
+						if (!species.usable || !species.soloable ||
+								identity.skillTier < species.minSkillTier ||
+								!locationEligible.get(identityIndex) ||
+								species.planet != currentPlanets.get(identityIndex))
+							continue;
+					} else {
+						if (!species.usable || !species.soloable ||
+								identity.skillTier < species.minSkillTier ||
+								species.planet != identity.homePlanet)
+							continue;
 
-					bool cityEligible = false;
-					for (int cityIndex = 0;
-							cityIndex < species.eligibleHomeCities.size();
-							++cityIndex) {
-						if (species.eligibleHomeCities.get(cityIndex) ==
-								identity.homeCity.toLowerCase()) {
-							cityEligible = true;
-							break;
+						bool cityEligible = false;
+						for (int cityIndex = 0;
+								cityIndex < species.eligibleHomeCities.size();
+								++cityIndex) {
+							if (species.eligibleHomeCities.get(cityIndex) ==
+									identity.homeCity.toLowerCase()) {
+								cityEligible = true;
+								break;
+							}
 						}
-					}
-					if (!cityEligible)
-						continue;
+						if (!cityEligible)
+							continue;
 
-					Vector3 home;
-					bool homeFound = false;
-					for (int shuttleportIndex = 0;
-							shuttleportIndex < allShuttleports.size();
-							++shuttleportIndex) {
-						if (allShuttleports.get(shuttleportIndex).planet ==
-								identity.homePlanet &&
-							allShuttleports.get(shuttleportIndex).name ==
-								identity.homeCity) {
-							home = allShuttleports.get(shuttleportIndex).spawn;
-							homeFound = true;
-							break;
+						Vector3 home;
+						bool homeFound = false;
+						for (int shuttleportIndex = 0;
+								shuttleportIndex < allShuttleports.size();
+								++shuttleportIndex) {
+							if (allShuttleports.get(shuttleportIndex).planet ==
+									identity.homePlanet &&
+								allShuttleports.get(shuttleportIndex).name ==
+									identity.homeCity) {
+								home = allShuttleports.get(shuttleportIndex).spawn;
+								homeFound = true;
+								break;
+							}
 						}
+						if (!homeFound || home.distanceTo2d(species.huntGround) >
+								(float)pveMaxHuntDistanceMeters)
+							continue;
 					}
-					if (!homeFound || home.distanceTo2d(species.huntGround) >
-							(float)pveMaxHuntDistanceMeters)
-						continue;
 
 					uint64 estimatedYieldUnits =
 						getPveHunterSpeciesEstimatedYieldUnits(species);
@@ -9366,9 +11681,26 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 			const PveHuntSpecies& sp = speciesSnapshot.get(j);
 			if (!sp.usable || !sp.soloable)
 				continue;
-			if (sp.requestedResourceType == candidate ||
-					candidate.contains(sp.requestedResourceType))
+			if (sp.requestedResourceType != candidate &&
+					!candidate.contains(sp.requestedResourceType))
+				continue;
+
+			if (!locationBasedEligibility) {
 				speciesCanSatisfy = true;
+				continue;
+			}
+
+			// Location-based eligibility: the species only counts as
+			// satisfiable if some eligible identity is actually standing on
+			// the species' planet right now.
+			for (int identityIndex = 0;
+					identityIndex < identities.size(); ++identityIndex) {
+				if (locationEligible.get(identityIndex) &&
+						sp.planet == currentPlanets.get(identityIndex)) {
+					speciesCanSatisfy = true;
+					break;
+				}
+			}
 		}
 		if (speciesCanSatisfy) {
 			bestPressure = demand.shortagePressure;
@@ -9386,40 +11718,50 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 
 		for (int j = 0; j < speciesSnapshot.size(); ++j) {
 			const PveHuntSpecies& species = speciesSnapshot.get(j);
-			if (!species.usable || !species.soloable ||
-					identity.skillTier < species.minSkillTier ||
-					species.planet != identity.homePlanet)
-				continue;
+			if (locationBasedEligibility) {
+				if (!species.usable || !species.soloable ||
+						identity.skillTier < species.minSkillTier ||
+						!locationEligible.get(i) ||
+						species.planet != currentPlanets.get(i))
+					continue;
+			} else {
+				if (!species.usable || !species.soloable ||
+						identity.skillTier < species.minSkillTier ||
+						species.planet != identity.homePlanet)
+					continue;
 
-			bool cityEligible = false;
-			for (int k = 0; k < species.eligibleHomeCities.size(); ++k) {
-				if (species.eligibleHomeCities.get(k) ==
-						identity.homeCity.toLowerCase()) {
-					cityEligible = true;
-					break;
+				bool cityEligible = false;
+				for (int k = 0; k < species.eligibleHomeCities.size(); ++k) {
+					if (species.eligibleHomeCities.get(k) ==
+							identity.homeCity.toLowerCase()) {
+						cityEligible = true;
+						break;
+					}
 				}
+				if (!cityEligible)
+					continue;
 			}
-			if (!cityEligible)
-				continue;
 
 			if (!demandedType.isEmpty() &&
 					species.requestedResourceType != demandedType &&
 					!demandedType.contains(species.requestedResourceType))
 				continue;
 
-			Vector3 home;
-			bool homeFound = false;
-			for (int k = 0; k < allShuttleports.size(); ++k) {
-				if (allShuttleports.get(k).planet == identity.homePlanet &&
-						allShuttleports.get(k).name == identity.homeCity) {
-					home = allShuttleports.get(k).spawn;
-					homeFound = true;
-					break;
+			if (!locationBasedEligibility) {
+				Vector3 home;
+				bool homeFound = false;
+				for (int k = 0; k < allShuttleports.size(); ++k) {
+					if (allShuttleports.get(k).planet == identity.homePlanet &&
+							allShuttleports.get(k).name == identity.homeCity) {
+						home = allShuttleports.get(k).spawn;
+						homeFound = true;
+						break;
+					}
 				}
+				if (!homeFound || home.distanceTo2d(species.huntGround) >
+						(float)pveMaxHuntDistanceMeters)
+					continue;
 			}
-			if (!homeFound || home.distanceTo2d(species.huntGround) >
-					(float)pveMaxHuntDistanceMeters)
-				continue;
 
 			uint64 bodyOid = 0;
 			{
@@ -9472,6 +11814,11 @@ void SimPlayerManager::clearPveHunterOrderLocked(uint64 identityId,
 	if (pveHuntOrders.contains(identityId)) {
 		pveHuntOrders.drop(identityId);
 	}
+	pveRelocations.drop(identityId);
+	pveBotMissions.drop(identityId);
+	// C4: invalidate the terminal-visit epoch so any offer generation still in
+	// flight for this concluded order fails its commit epoch check.
+	pveTerminalVisitEpoch.drop(identityId);
 
 	if (pveIdentities.contains(identityId)) {
 		SimBotIdentity& identity = pveIdentities.get(identityId);
@@ -9646,6 +11993,15 @@ bool SimPlayerManager::preparePveCreatureFamilySupply(
 void SimPlayerManager::recordPveHunterHarvest(uint64 identityId,
 		uint64 targetOid, const String& harvestKind,
 		const String& requestedResourceType) {
+	String normalizedHarvestKind = harvestKind.toLowerCase().trim();
+	if (normalizedHarvestKind != "hide" &&
+			normalizedHarvestKind != "bone" &&
+			normalizedHarvestKind != "meat") {
+		Locker pveLock(&pveMutex);
+		pveHunterHarvestMisses++;
+		return;
+	}
+
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
 	ManagedReference<SceneObject*> targetObject = zoneServer == nullptr ? nullptr :
 		zoneServer->getObject(targetOid);
@@ -9668,18 +12024,18 @@ void SimPlayerManager::recordPveHunterHarvest(uint64 identityId,
 		if (targetTemplate == nullptr)
 			missingTemplate = true;
 
-		if (!missingTemplate && harvestKind == "hide")
+		if (!missingTemplate && normalizedHarvestKind == "hide")
 			resourceType = targetTemplate->getHideType();
-		else if (!missingTemplate && harvestKind == "bone")
+		else if (!missingTemplate && normalizedHarvestKind == "bone")
 			resourceType = targetTemplate->getBoneType();
 		else if (!missingTemplate)
 			resourceType = targetTemplate->getMeatType();
 
 		Creature* creature = cast<Creature*>(targetAgent);
 		if (!missingTemplate && creature != nullptr) {
-			if (harvestKind == "hide")
+			if (normalizedHarvestKind == "hide")
 				harvestAmount = Math::max(3, (int)creature->getHideMax());
-			else if (harvestKind == "bone")
+			else if (normalizedHarvestKind == "bone")
 				harvestAmount = Math::max(3, (int)creature->getBoneMax());
 			else
 				harvestAmount = Math::max(3, (int)creature->getMeatMax());
@@ -9748,7 +12104,7 @@ void SimPlayerManager::recordPveHunterHarvest(uint64 identityId,
 
 	Locker pveLock(&pveMutex);
 	pveHunterHarvestUnitsTotal += harvestAmount;
-	String harvestedFamily = harvestKind.toLowerCase().trim();
+	String harvestedFamily = normalizedHarvestKind;
 	if (!harvestedFamily.isEmpty()) {
 		uint64 existingFamilyHarvest =
 			pveSessionHarvestByFamily.contains(harvestedFamily) ?
@@ -9808,6 +12164,24 @@ void SimPlayerManager::recordPveHunterKill(uint64 identityId,
 		String::valueOf(targetOid) + " harvest=" + harvestKind, true);
 }
 
+void SimPlayerManager::handlePveHunterTelemetryDestructionHandoff(
+		uint64 identityId, uint64 bodyOid, uint64 creatureOid,
+		bool participantVerified) {
+	if (!participantVerified || identityId == 0 || bodyOid == 0 ||
+			creatureOid == 0)
+		return;
+
+	Locker pveLock(&pveMutex);
+	if (!pveHuntOrders.contains(identityId))
+		return;
+
+	const PveHuntOrder& order = pveHuntOrders.get(identityId);
+	if (order.bodyOid != bodyOid)
+		return;
+
+	pveCreatureKillsTotal++;
+}
+
 void SimPlayerManager::recordPveHunterAbandoned(uint64 identityId,
 		uint64 bodyOid, const String& reason) {
 	uint64 cleanupBodyOid = bodyOid;
@@ -9820,6 +12194,11 @@ void SimPlayerManager::recordPveHunterAbandoned(uint64 identityId,
 			return;
 		cleanupBodyOid = order.bodyOid;
 		pveHunterAbandonsTotal++;
+		pveMissionsAbandonedTotal++;
+		String abandonReason = reason.isEmpty() ? String("unknown") : reason;
+		uint64 priorReasonCount = pveAbandonReasons.contains(abandonReason) ?
+			pveAbandonReasons.get(abandonReason) : 0;
+		pveAbandonReasons.put(abandonReason, priorReasonCount + 1);
 		clearPveHunterOrderLocked(identityId, "ABANDONED_" + reason);
 	}
 	queuePveHuntLairCleanup(cleanupBodyOid, "abandoned_" + reason);
@@ -9838,11 +12217,13 @@ void SimPlayerManager::recordPveHunterCompleted(uint64 identityId,
 		if (bodyOid != 0 && order.bodyOid != bodyOid)
 			return;
 		cleanupBodyOid = order.bodyOid;
-		if (pveIdentities.contains(identityId)) {
+		if (!pveMissionBoardEnabled && pveIdentities.contains(identityId)) {
 			SimBotIdentity& identity = pveIdentities.get(identityId);
 			identity.hunts++;
 			pveDirtyIdentityIds.put(identityId, true);
 		}
+		if (!pveMissionBoardEnabled)
+			pveMissionsCompletedTotal++;
 		clearPveHunterOrderLocked(identityId, "DELIVERED");
 	}
 	queuePveHuntLairCleanup(cleanupBodyOid, "completed");
@@ -10750,6 +13131,11 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	VectorMap<uint64, uint64> presenceSpawnCounts;
 	Vector<PveHuntSpecies> huntSpecies;
 	VectorMap<uint64, PveHuntLair> huntLairs;
+	Vector<PveMissionTerminalLocation> missionTerminals;
+	VectorMap<String, int> missionTerminalStates;
+	VectorMap<uint64, Vector<PveBotMissionOffer> > missionOffers;
+	VectorMap<uint64, PveRelocation> marketRelocations;
+	VectorMap<uint64, PveBuffTrip> buffTrips;
 	Vector<PveBuffSpec> hunterBuffs;
 	VectorMap<String, String> providerResolveStates;
 	VectorMap<uint64, String> buffSources;
@@ -10763,15 +13149,33 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	uint64 hunterAnnouncementsTotal = 0;
 	uint64 missionLairsSpawned = 0;
 	uint64 missionLairsCleaned = 0;
+	uint64 creatureKillsTotal = 0;
+	uint64 lairsDestroyedTotal = 0;
+	uint64 missionsCompletedTotal = 0;
+	uint64 missionsAbandonedTotal = 0;
+	VectorMap<String, uint64> abandonReasons;
 	uint64 doctorInteractions = 0;
 	uint64 dancerWatches = 0;
 	uint64 musicianListens = 0;
 	uint64 buffDetoursSkipped = 0;
 	uint64 syntheticFallbacks = 0;
+	uint64 buffTripsStarted = 0;
+	uint64 buffTripsCompleted = 0;
+	uint64 buffTripsFallback = 0;
 	bool missionHuntEnabled = false;
+	bool missionBoardEnabled = false;
 	bool realBuffsEnabled = false;
+	bool buffHubsEnabled = false;
+	Vector<String> buffHubKeys;
+	int maxBuffTripsPerHunt = 1;
+	int buffTripDeadlineSeconds = 1800;
 	int realBuffReapplySeconds = 900;
 	bool acquisitionLedgerEnabled = false;
+	bool marketDispatchEnabled = false;
+	String marketDemandedFamily;
+	String marketWinningResourceType;
+	String marketWinningPlanet;
+	float marketWinningQualityScore = 0.f;
 	bool turfSplitEffective = false;
 	bool turfSplitPendingRestart = false;
 	bool minerCreatureExclusionActive = false;
@@ -10789,7 +13193,17 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		presenceSpawnCounts = pvePresenceSpawnCounts;
 		presenceSpawnTotal = pvePresenceSpawnTotal;
 		huntSpecies = pveHuntSpecies;
-		huntLairs = pveHuntLairs;
+		 huntLairs = pveHuntLairs;
+		missionTerminals = allMissionTerminals;
+		missionTerminalStates = missionTerminalCityState;
+		missionOffers = pveBotMissions;
+		marketRelocations = pveRelocations;
+		buffTrips = pveBuffTrips;
+		marketDispatchEnabled = pveMarketDispatchEnabled;
+		marketDemandedFamily = pveMarketDemandedFamily;
+		marketWinningResourceType = pveMarketWinningResourceType;
+		marketWinningPlanet = pveMarketWinningPlanet;
+		marketWinningQualityScore = pveMarketWinningQualityScore;
 		hunterBuffs = pveHunterBuffs;
 		providerResolveStates = pveBuffProviderResolveStates;
 		buffSources = pveBuffLastSourceByBody;
@@ -10803,13 +13217,26 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		hunterAnnouncementsTotal = pveHunterAnnouncementsTotal;
 		missionLairsSpawned = pveMissionLairsSpawned;
 		missionLairsCleaned = pveMissionLairsCleaned;
+		creatureKillsTotal = pveCreatureKillsTotal;
+		lairsDestroyedTotal = pveLairsDestroyedTotal;
+		missionsCompletedTotal = pveMissionsCompletedTotal;
+		missionsAbandonedTotal = pveMissionsAbandonedTotal;
+		abandonReasons = pveAbandonReasons;
 		doctorInteractions = pveDoctorInteractions;
 		dancerWatches = pveDancerWatches;
 		musicianListens = pveMusicianListens;
 		buffDetoursSkipped = pveBuffDetoursSkipped;
 		syntheticFallbacks = pveSyntheticFallbacks;
+		buffTripsStarted = pveBuffTripsStarted;
+		buffTripsCompleted = pveBuffTripsCompleted;
+		buffTripsFallback = pveBuffTripsFallback;
 		missionHuntEnabled = pveMissionHuntEnabled;
+		missionBoardEnabled = pveMissionBoardEnabled;
 		realBuffsEnabled = pveRealBuffsEnabled;
+		buffHubsEnabled = pveRealBuffHubsEnabled;
+		buffHubKeys = pveRealBuffHubKeys;
+		maxBuffTripsPerHunt = pveMaxBuffTripsPerHunt;
+		buffTripDeadlineSeconds = pveBuffTripDeadlineSeconds;
 		realBuffReapplySeconds = pveRealBuffReapplySeconds;
 		acquisitionLedgerEnabled = pveAcquisitionLedgerEnabled;
 		turfSplitEffective = pveTurfSplitEffective;
@@ -10826,6 +13253,18 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		baselineState = pveBaselineState;
 		baselineLastError = pveBaselineLastError;
 		baselineRetryCount = pveBaselineRetryCount;
+	}
+
+	uint64 lifetimeHunts = 0;
+	uint64 lifetimeKills = 0;
+	uint64 lifetimeDeaths = 0;
+	uint64 lifetimeHarvestUnits = 0;
+	for (int i = 0; i < identities.size(); ++i) {
+		const SimBotIdentity& identity = identities.get(i);
+		lifetimeHunts += static_cast<uint64>(Math::max(0, identity.hunts));
+		lifetimeKills += static_cast<uint64>(Math::max(0, identity.kills));
+		lifetimeDeaths += static_cast<uint64>(Math::max(0, identity.deaths));
+		lifetimeHarvestUnits += identity.harvestUnits;
 	}
 
 	Vector<uint32> trackedBuffCrcs;
@@ -10878,12 +13317,15 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	result["presenceMembers"] = presenceOids.size();
 	result["presenceSpawnTotal"] = presenceSpawnTotal;
 	result["hunterKillsTotal"] = hunterKillsTotal;
+	result["missionCreditedKills"] = hunterKillsTotal;
+	result["creatureKillsTotal"] = creatureKillsTotal;
 	result["hunterDeathsTotal"] = hunterDeathsTotal;
 	result["hunterAbandonsTotal"] = hunterAbandonsTotal;
 	result["hunterHarvestUnitsTotal"] = hunterHarvestUnitsTotal;
 	result["hunterHarvestMisses"] = hunterHarvestMisses;
 	result["hunterAnnouncementsTotal"] = hunterAnnouncementsTotal;
 	result["missionHuntEnabled"] = missionHuntEnabled;
+	result["missionBoardEnabled"] = missionBoardEnabled;
 	result["realBuffsEnabled"] = realBuffsEnabled;
 	result["realBuffReapplyThresholdSeconds"] = realBuffReapplySeconds;
 	JSONSerializationType realBuffs = JSONSerializationType::object();
@@ -10897,6 +13339,22 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	result["realBuffs"] = realBuffs;
 	result["missionLairsSpawned"] = missionLairsSpawned;
 	result["missionLairsCleaned"] = missionLairsCleaned;
+	result["lairsDestroyedTotal"] = lairsDestroyedTotal;
+	result["missionsCompletedTotal"] = missionsCompletedTotal;
+	result["missionsAbandonedTotal"] = missionsAbandonedTotal;
+	JSONSerializationType abandonReasonObject =
+		JSONSerializationType::object();
+	for (int i = 0; i < abandonReasons.size(); ++i)
+		abandonReasonObject[abandonReasons.elementAt(i).getKey()] =
+			abandonReasons.elementAt(i).getValue();
+	result["abandonReasons"] = abandonReasonObject;
+	result["countersScope"] = "session";
+	JSONSerializationType lifetime = JSONSerializationType::object();
+	lifetime["hunts"] = lifetimeHunts;
+	lifetime["kills"] = lifetimeKills;
+	lifetime["deaths"] = lifetimeDeaths;
+	lifetime["harvestUnits"] = lifetimeHarvestUnits;
+	result["lifetime"] = lifetime;
 	result["acquisitionLedgerEnabled"] = acquisitionLedgerEnabled;
 	result["turfSplitEffective"] = turfSplitEffective;
 	result["turfSplitPendingRestart"] = turfSplitPendingRestart;
@@ -10946,6 +13404,177 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	result["realBuffs"] = realBuffs;
 	result["providerResolveState"] = providerStates;
 
+	JSONSerializationType buffTripDashboard = JSONSerializationType::object();
+	buffTripDashboard["enabled"] = buffHubsEnabled;
+	JSONSerializationType buffHubRows = JSONSerializationType::array();
+	for (int i = 0; i < buffHubKeys.size(); ++i)
+		buffHubRows.push_back(buffHubKeys.get(i));
+	buffTripDashboard["hubs"] = buffHubRows;
+	buffTripDashboard["maxBuffTripsPerHunt"] = maxBuffTripsPerHunt;
+	buffTripDashboard["buffTripDeadlineSeconds"] = buffTripDeadlineSeconds;
+	buffTripDashboard["started"] = buffTripsStarted;
+	buffTripDashboard["completed"] = buffTripsCompleted;
+	buffTripDashboard["fallback"] = buffTripsFallback;
+	JSONSerializationType buffTripRows = JSONSerializationType::array();
+	for (int i = 0; i < buffTrips.size(); ++i) {
+		const PveBuffTrip& trip = buffTrips.elementAt(i).getValue();
+		JSONSerializationType row = JSONSerializationType::object();
+		row["identityId"] = trip.identityId;
+		row["bodyOid"] = trip.bodyOid;
+		row["huntPlanet"] = trip.huntPlanet;
+		row["huntCity"] = trip.huntCity;
+		row["hubPlanet"] = trip.hubPlanet;
+		row["hubCity"] = trip.hubCity;
+		row["startedAtMs"] = trip.startedAtMs;
+		row["deadlineAtMs"] = trip.deadlineAtMs;
+		row["legIndex"] = trip.legIndex;
+		row["legCount"] = trip.legs.size();
+		row["returning"] = trip.returning;
+		row["state"] = trip.returning ? String("RETURNING") :
+			(trip.legIndex >= trip.legs.size() ? String("AT_HUB") :
+			String("OUTBOUND"));
+		row["route"] = trip.summary;
+		buffTripRows.push_back(row);
+	}
+	buffTripDashboard["inFlight"] = buffTripRows;
+	result["buffTrips"] = buffTripDashboard;
+
+	JSONSerializationType missionBoard = JSONSerializationType::object();
+	missionBoard["enabled"] = missionBoardEnabled;
+	missionBoard["maxHeldMissions"] = pveMissionBoardMaxHeldMissions;
+	missionBoard["sameDirectionArcDegrees"] =
+		pveMissionBoardSameDirectionArcDegrees;
+	missionBoard["lairRevealRadiusMeters"] =
+		pveMissionBoardLairRevealRadiusMeters;
+	JSONSerializationType acceptedTerminalTypes = JSONSerializationType::array();
+	for (int i = 0; i < pveMissionBoardAcceptedTerminalTypes.size(); ++i)
+		acceptedTerminalTypes.push_back(
+			pveMissionBoardAcceptedTerminalTypes.get(i));
+	missionBoard["acceptedTerminalTypes"] = acceptedTerminalTypes;
+	JSONSerializationType terminalRows = JSONSerializationType::array();
+	for (int i = 0; i < missionTerminals.size(); ++i) {
+		const PveMissionTerminalLocation& terminal = missionTerminals.get(i);
+		JSONSerializationType row = JSONSerializationType::object();
+		row["planet"] = terminal.planet;
+		row["city"] = terminal.city;
+		row["terminalType"] = terminal.terminalType;
+		row["terminalOid"] = terminal.terminalOid;
+		row["posX"] = terminal.position.getX();
+		row["posY"] = terminal.position.getY();
+		row["posZ"] = terminal.position.getZ();
+		String key = getPveMissionTerminalCityKey(terminal.planet,
+			terminal.city);
+		row["cityState"] = missionTerminalStates.contains(key) ?
+			missionTerminalStates.get(key) : PVE_MISSION_TERMINAL_PENDING;
+		terminalRows.push_back(row);
+	}
+	missionBoard["terminals"] = terminalRows;
+	JSONSerializationType offerRows = JSONSerializationType::array();
+	for (int i = 0; i < missionOffers.size(); ++i) {
+		const Vector<PveBotMissionOffer>& offers =
+			missionOffers.elementAt(i).getValue();
+		for (int j = 0; j < offers.size(); ++j) {
+			const PveBotMissionOffer& offer = offers.get(j);
+			JSONSerializationType row = JSONSerializationType::object();
+			row["identityId"] = offer.identityId;
+			row["bodyOid"] = offer.bodyOid;
+			row["offerId"] = offer.offerId;
+			row["planet"] = offer.planet;
+			row["terminalOid"] = offer.terminalOid;
+			row["terminalType"] = offer.terminalType;
+			row["lairTemplate"] = offer.lairTemplate;
+			row["difficulty"] = offer.difficulty;
+			row["difficultyLevel"] = offer.difficultyLevel;
+			row["minDifficulty"] = offer.minDifficulty;
+			row["maxDifficulty"] = offer.maxDifficulty;
+			row["advertisedX"] = offer.advertisedPos.getX();
+			row["advertisedY"] = offer.advertisedPos.getY();
+			row["advertisedZ"] = offer.advertisedPos.getZ();
+			row["bearingDeg"] = offer.bearingDeg;
+			row["revealed"] = offer.revealed;
+			row["revealedX"] = offer.revealedPos.getX();
+			row["revealedY"] = offer.revealedPos.getY();
+			row["revealedZ"] = offer.revealedPos.getZ();
+			row["lairOid"] = offer.lairOid;
+			bool lairAlive = false;
+			int wavesSeen = -1;
+			for (int lairIndex = 0; lairIndex < huntLairs.size();
+					++lairIndex) {
+				const PveHuntLair& lair =
+					huntLairs.elementAt(lairIndex).getValue();
+				if (lair.bodyOid == offer.bodyOid &&
+						lair.lairOid == offer.lairOid) {
+					lairAlive = lair.alive && !lair.cleanupQueued;
+					// Real wave progress from the stock mission observer:
+					// 1 = initial pack, 2 = first-damage wave, 3 = half-condition
+					// wave. The #/wilds column reads this; without it the UI
+					// showed a permanently empty field.
+					if (lair.waveObserver != nullptr)
+						wavesSeen = lair.waveObserver->getSpawnNumber();
+					break;
+				}
+			}
+			row["lairAlive"] = lairAlive;
+			if (wavesSeen >= 0)
+				row["wavesSeen"] = wavesSeen;
+			row["completed"] = offer.completed;
+			row["expectedYieldUnits"] = offer.expectedYieldUnits;
+			JSONSerializationType yields = JSONSerializationType::array();
+			for (int typeIndex = 0; typeIndex <
+					offer.yieldResourceTypes.size(); ++typeIndex)
+				yields.push_back(offer.yieldResourceTypes.get(typeIndex));
+			row["yieldResourceTypes"] = yields;
+			offerRows.push_back(row);
+		}
+	}
+	missionBoard["offers"] = offerRows;
+	result["missionBoard"] = missionBoard;
+
+	JSONSerializationType marketDispatch = JSONSerializationType::object();
+	marketDispatch["enabled"] = marketDispatchEnabled;
+	marketDispatch["demandedFamily"] = marketDemandedFamily;
+	marketDispatch["winningResourceType"] = marketWinningResourceType;
+	marketDispatch["winningPlanet"] = marketWinningPlanet;
+	marketDispatch["winningQualityScore"] = marketWinningQualityScore;
+	marketDispatch["maxConcurrentRelocations"] =
+		pveMarketMaxConcurrentRelocations;
+	marketDispatch["minHuntersPerActivePlanet"] =
+		pveMarketMinHuntersPerActivePlanet;
+	JSONSerializationType relocationRows = JSONSerializationType::array();
+	for (int i = 0; i < marketRelocations.size(); ++i) {
+		const PveRelocation& relocation =
+			marketRelocations.elementAt(i).getValue();
+		JSONSerializationType row = JSONSerializationType::object();
+		row["identityId"] = relocation.identityId;
+		row["fromPlanet"] = relocation.fromPlanet;
+		row["toPlanet"] = relocation.toPlanet;
+		row["startedAtMs"] = relocation.startedAtMs;
+		row["legIndex"] = relocation.legIndex;
+		row["legCount"] = relocation.legs.size();
+		row["reason"] = relocation.reason;
+		relocationRows.push_back(row);
+	}
+	marketDispatch["inFlightRelocations"] = relocationRows;
+	JSONSerializationType census = JSONSerializationType::object();
+	VectorMap<String, uint64> censusCounts;
+	ZoneServer* censusZoneServer = ServerCore::getZoneServer();
+	for (int i = 0; i < bodyOids.size(); ++i) {
+		if (censusZoneServer == nullptr)
+			break;
+		ManagedReference<SceneObject*> body = censusZoneServer->getObject(
+			bodyOids.elementAt(i).getValue());
+		if (body == nullptr || body->getZone() == nullptr)
+			continue;
+		String planet = body->getZone()->getZoneName();
+		uint64 count = censusCounts.contains(planet) ? censusCounts.get(planet) : 0;
+		censusCounts.put(planet, count + 1);
+	}
+	for (int i = 0; i < censusCounts.size(); ++i)
+		census[censusCounts.elementAt(i).getKey()] =
+			censusCounts.elementAt(i).getValue();
+	marketDispatch["hunterCensusByPlanet"] = census;
+	result["marketDispatch"] = marketDispatch;
+
 	JSONSerializationType rows = JSONSerializationType::array();
 	for (int i = 0; i < identities.size(); ++i) {
 		const SimBotIdentity& identity = identities.get(i);
@@ -10983,6 +13612,7 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 			realBuffsEnabled ? buffSources.get(bodyOid) : String("none");
 		row["terminalPlanet"] = String("");
 		row["terminalCity"] = String("");
+		row["terminalType"] = String("");
 		row["terminalPosX"] = 0.f;
 		row["terminalPosY"] = 0.f;
 		row["terminalPosZ"] = 0.f;
@@ -11065,6 +13695,7 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 				row["terminalPlanet"] =
 					huntOrders.get(j).missionTerminalPlanet;
 				row["terminalCity"] = huntOrders.get(j).missionTerminalCity;
+				row["terminalType"] = huntOrders.get(j).missionTerminalType;
 				row["terminalPosX"] =
 					huntOrders.get(j).missionTerminalPosition.getX();
 				row["terminalPosY"] =
@@ -12165,6 +14796,7 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     int controllerCount = controllers.size();
     Vector<String> activeMinerZones;
     Vector<String> configuredMinerSpawnZones;
+    Vector<String> routingOnlyZones;
     Vector<uint64> activeMinerIds;
     VectorMap<uint64, String> activeMinerZoneById;
     VectorMap<uint64, float> activeMinerXById;
@@ -12199,6 +14831,14 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     if (minerSpawnsConfigured) {
         for (int i = 0; i < allShuttleports.size(); ++i) {
             ShuttleportLocation location = allShuttleports.get(i);
+            // P.8.7: a routingOnly city is a fare-matrix graph node, never a
+            // spawn site, so listing it here would misreport where miners can
+            // actually spawn. Surfaced separately as routingOnlyZones.
+            if (location.routingOnly) {
+                addUniqueLabel(routingOnlyZones, location.planet);
+                continue;
+            }
+
             addUniqueLabel(configuredMinerSpawnZones, location.planet);
         }
     }
@@ -12273,6 +14913,9 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     population["activeMinerZones"] = joinCoverageZones(activeMinerZones);
     population["configuredMinerSpawnZones"] =
         joinCoverageZones(configuredMinerSpawnZones);
+    // P.8.7: planets reachable by the travel graph but deliberately excluded
+    // from every placement decision (spawn, home-city rotation, PvP dest).
+    population["routingOnlyZones"] = joinCoverageZones(routingOnlyZones);
     population["travelImplemented"] = false;
 
     JSONSerializationType futureRoles = JSONSerializationType::array();
@@ -26332,7 +28975,19 @@ bool SimPlayerManager::pickRandomShuttleport(ShuttleportLocation& out) const {
     if (allShuttleports.size() == 0)
         return false;
 
-    int idx = System::random(allShuttleports.size() - 1);
+    // P.8.7: routing-only cities are graph nodes, not spawn sites. Pick from
+    // the placement-eligible subset so adding a routing node never changes
+    // where bots spawn. If every city is routing-only (never true today), fall
+    // back to the original behavior rather than failing the spawn.
+    Vector<int> placeable;
+    for (int i = 0; i < allShuttleports.size(); ++i) {
+        if (!allShuttleports.get(i).routingOnly)
+            placeable.add(i);
+    }
+
+    int idx = placeable.size() > 0 ?
+        placeable.get(System::random(placeable.size() - 1)) :
+        System::random(allShuttleports.size() - 1);
     out = allShuttleports.get(idx);
     return true;
 }
@@ -28509,7 +31164,7 @@ bool SimPlayerManager::onPvpSquadDepartureIntent(uint64 squadId,
 	if (!pvpRoutedTravelEnabled || squad.pendingRoute.size() == 0)
 		return true;
 
-	const PvpTravelLeg& leg = squad.pendingRoute.get(0);
+	const SimTravelLeg& leg = squad.pendingRoute.get(0);
 	// planPvpRoute stores city-shuttle coordinates for intra-planet legs and
 	// starport/collector coordinates for interplanetary legs. Use the stored
 	// leg target directly so the first leg never falls back to the old
@@ -28666,7 +31321,103 @@ int SimPlayerManager::findShuttleportIndex(const String& planet, const String& c
             return i;
     }
 
-    return -1;
+	return -1;
+}
+
+bool SimPlayerManager::getNearestRoutableCity(const String& planet,
+		const Vector3& from, bool allowRoutingOnly,
+		ShuttleportLocation& out) const {
+	bool found = false;
+	float bestDistance = 0.f;
+
+	for (int i = 0; i < allShuttleports.size(); ++i) {
+		const ShuttleportLocation& location = allShuttleports.get(i);
+
+		if (location.planet != planet || location.starportPoint.isEmpty() ||
+				(location.routingOnly && !allowRoutingOnly))
+			continue;
+
+		float distance = location.spawn.distanceTo2d(from);
+		if (!found || distance < bestDistance) {
+			out = location;
+			bestDistance = distance;
+			found = true;
+		}
+	}
+
+	return found;
+}
+
+bool SimPlayerManager::resolvePveHunterDispatchLocation(uint64 bodyOid,
+		float dispatchRadiusMeters, String& currentPlanet,
+		ShuttleportLocation& city, PveMissionTerminalLocation& terminal) {
+	currentPlanet = "";
+	city = ShuttleportLocation();
+	terminal = PveMissionTerminalLocation();
+
+	if (bodyOid == 0 || dispatchRadiusMeters <= 0.f)
+		return false;
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> body = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(bodyOid);
+	AiAgent* agent = body == nullptr ? nullptr : body->asAiAgent();
+	if (agent == nullptr)
+		return false;
+
+	Zone* zone = nullptr;
+	Vector3 position;
+	{
+		Locker agentLock(agent);
+		zone = agent->getZone();
+		if (zone == nullptr)
+			return false;
+		currentPlanet = zone->getZoneName();
+		position = agent->getWorldPosition();
+	}
+
+	if (!getNearestRoutableCity(currentPlanet, position, true, city))
+		return false;
+
+	int cityState = PVE_MISSION_TERMINAL_PENDING;
+	if (!getNearestMissionTerminal(currentPlanet, city.name, position,
+			terminal, cityState))
+		return false;
+
+	PveMissionTerminalLocation nearestGeneralTerminal;
+	bool foundGeneralTerminal = false;
+	float nearestDistance = 0.f;
+	String cityKey = getPveMissionTerminalCityKey(currentPlanet, city.name);
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < allMissionTerminals.size(); ++i) {
+			const PveMissionTerminalLocation& candidate =
+				allMissionTerminals.get(i);
+			if (getPveMissionTerminalCityKey(candidate.planet,
+					candidate.city) != cityKey || candidate.terminal == nullptr)
+				continue;
+
+			MissionTerminal* missionTerminal =
+				dynamic_cast<MissionTerminal*>(candidate.terminal.get());
+			if (missionTerminal == nullptr ||
+					!missionTerminal->isGeneralTerminal())
+				continue;
+
+			float distance = candidate.position.distanceTo2d(position);
+			if (!foundGeneralTerminal || distance < nearestDistance) {
+				nearestGeneralTerminal = candidate;
+				nearestDistance = distance;
+				foundGeneralTerminal = true;
+			}
+		}
+	}
+
+	if (!foundGeneralTerminal ||
+			position.distanceTo2d(city.spawn) > dispatchRadiusMeters)
+		return false;
+
+	terminal = nearestGeneralTerminal;
+	return true;
 }
 
 // Lowercase config city names use underscores ("mos_eisley") - make them
@@ -28690,448 +31441,471 @@ static String prettyPveHunterSiteName(const String& name) {
 	return pretty.replaceAll("_", " ");
 }
 
-bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
-        String& summaryOut, bool& convergenceOut) {
-    ZoneServer* zoneServer = ServerCore::getZoneServer();
-
-    if (zoneServer == nullptr || allShuttleports.size() < 2)
-        return false;
-
-    const int cityCount = allShuttleports.size();
-
-    // 1) Resolve every routed city's starport pad + planet connectivity
-    //    OUTSIDE the squad mutex (zone / planet-manager lookups only; no
-    //    agent locks anywhere in here).
-    Vector<Vector3> pads;          // per city: starport arrival position
-    Vector<PvpCityLocations> cityLocations; // per city: shuttle/hangout cache
-    Vector<bool> routable;         // has a resolvable starport point
-
-    for (int i = 0; i < cityCount; ++i) {
-        const ShuttleportLocation& loc = allShuttleports.get(i);
-
-        Vector3 pad = loc.spawn;
-        bool ok = !loc.starportPoint.isEmpty();
-
-        if (ok) {
-            Zone* zone = zoneServer->getZone(loc.planet);
-            PlanetManager* planetManager =
-                zone == nullptr ? nullptr : zone->getPlanetManager();
-            Reference<PlanetTravelPoint*> point = planetManager == nullptr ?
-                nullptr : planetManager->getPlanetTravelPoint(loc.starportPoint);
-
-            if (point != nullptr) {
-                pad.setX(point->getArrivalPositionX());
-                pad.setY(point->getArrivalPositionY());
-                pad.setZ(point->getArrivalPositionZ());
-            } else {
-                // Config typo / point missing: keep the city reachable at its
-                // configured pad rather than dropping it from the graph.
-                info("SimPvpRoute starportResolveFailed city=" + loc.planet +
-                     ":" + loc.name + " point=\"" + loc.starportPoint + "\"", true);
-            }
-        }
-
-        pads.add(pad);
-
-        PvpCityLocations resolvedLocations;
-        resolvePvpCityLocations(loc, resolvedLocations);
-        cityLocations.add(resolvedLocations);
-        routable.add(ok);
-    }
-
-    // Resolve collectors outside pvpSquadMutex. The resolver caches immutable
-    // world/local coordinates, so subsequent route plans do no world scan.
-    if (pvpUseCollectorBoarding && !ticketCollectorTravelEnabled) {
-        for (int i = 0; i < cityCount; ++i) {
-            const ShuttleportLocation& loc = allShuttleports.get(i);
-
-            if (loc.starportPoint.isEmpty())
-                continue;
-
-            PvpBoardingPoint boardingPoint;
-            resolvePvpBoardingPoint(loc, boardingPoint);
-        }
-    }
-
-    // City-to-city adjacency: same planet = intra-planet ticket (always
-    // permitted); cross-planet = both starports + a fare-matrix route (the
-    // same truth the player travel terminal shows).
-    Vector<Vector<bool> > adjacency;
-
-    for (int i = 0; i < cityCount; ++i) {
-        Vector<bool> row;
-
-        for (int j = 0; j < cityCount; ++j) {
-            bool connected = false;
-
-            if (i != j && routable.get(i) && routable.get(j)) {
-                const ShuttleportLocation& a = allShuttleports.get(i);
-                const ShuttleportLocation& b = allShuttleports.get(j);
-
-                if (a.planet == b.planet) {
-                    connected = true;
-                } else {
-                    Zone* zone = zoneServer->getZone(a.planet);
-                    PlanetManager* planetManager =
-                        zone == nullptr ? nullptr : zone->getPlanetManager();
-                    connected = planetManager != nullptr &&
-                        planetManager->getTravelFare(a.planet, b.planet) > 0;
-                }
-            }
-
-            row.add(connected);
-        }
-
-        adjacency.add(row);
-    }
-
-    int fromIdx = findShuttleportIndex(snapshot.planet, snapshot.city);
-
-    if (fromIdx < 0 || !routable.get(fromIdx))
-        return false;
-
-    // 2) Pick the destination + BFS + store, under the squad mutex (occupancy
-    //    and convergence live there).
-    Locker squadLock(&pvpSquadMutex);
-
-    int idx = findPvpSquadIndex(squadId);
-    if (idx < 0)
-        return false;
-
-    SimPvpSquad& squad = pvpSquads.get(idx);
-
-    int destIdx = -1;
-    convergenceOut = false;
-    uint64 nowMs = System::getMiliTime();
-    bool avoidActive = squad.avoidExpiresAtMs > nowMs &&
-        !squad.avoidPlanet.isEmpty() && !squad.avoidCity.isEmpty();
-    auto isAvoidedCity = [&](int candidate) {
-        if (!avoidActive)
-            return false;
-
-        const ShuttleportLocation& loc = allShuttleports.get(candidate);
-        return loc.planet == squad.avoidPlanet && loc.name == squad.avoidCity;
-    };
-
-    // An unexpired convergence stamp beats the random pick - the squad
-    // travels to the reported contact's city. Consumed (cleared) either way.
-    if (!squad.convergePlanet.isEmpty()) {
-        if (System::getMiliTime() < squad.convergeExpiresAtMs) {
-            int convergeIdx = findShuttleportIndex(squad.convergePlanet,
-                squad.convergeCity);
-
-            if (convergeIdx >= 0 && convergeIdx != fromIdx &&
-                    routable.get(convergeIdx) && !isAvoidedCity(convergeIdx)) {
-                destIdx = convergeIdx;
-                convergenceOut = true;
-            }
-        }
-
-        squad.convergePlanet = "";
-        squad.convergeCity = "";
-        squad.convergeExpiresAtMs = 0;
-    }
-
-    // Spread-out random pick: different city, prefer no same-faction squad
-    // there, and bias toward the main PvP planets (off-main cities such as
-    // restuss are accepted offMainPlanetChancePct of the time).
-    for (int tries = 0; destIdx < 0 && tries < 20; ++tries) {
-        int candidate = System::random(cityCount - 1);
-
-        if (candidate == fromIdx || !routable.get(candidate) ||
-                isAvoidedCity(candidate))
-            continue;
-
-        const ShuttleportLocation& loc = allShuttleports.get(candidate);
-
-        bool mainPlanet = pvpTravelMainPlanets.size() == 0;
-        for (int i = 0; i < pvpTravelMainPlanets.size() && !mainPlanet; ++i)
-            mainPlanet = pvpTravelMainPlanets.get(i) == loc.planet;
-
-        if (!mainPlanet && System::random(99) >= pvpTravelOffMainChancePct)
-            continue;
-
-        bool occupied = false;
-
-        for (int i = 0; i < pvpSquads.size(); ++i) {
-            const SimPvpSquad& other = pvpSquads.get(i);
-
-            if (other.squadId != squadId && other.imperial == snapshot.imperial &&
-                    other.planet == loc.planet && other.city == loc.name) {
-                occupied = true;
-                break;
-            }
-        }
-
-        if (!occupied)
-            destIdx = candidate;
-    }
-
-    // Last resort: any routable city that isn't the current one.
-    for (int tries = 0; destIdx < 0 && tries < 20; ++tries) {
-        int candidate = System::random(cityCount - 1);
-
-        if (candidate != fromIdx && routable.get(candidate))
-            destIdx = candidate;
-    }
-
-    if (destIdx < 0)
-        return false;
-
-    // Tactical arrival applies only to random destinations. Keep the picked
-    // city as the final destination; a tactical route inserts its alternate
-    // immediately before it in the backwards path below.
-    int finalDestIdx = destIdx;
-    bool tactical = false;
-
-    if (!convergenceOut && pvpAvoidHotArrival) {
-        const ShuttleportLocation& finalDestLoc =
-            allShuttleports.get(finalDestIdx);
-
-        if (isPvpCityHotLocked(finalDestLoc.planet, finalDestLoc.name,
-                    snapshot.imperial, squadId)) {
-            int bestAlternateIdx = -1;
-            int bestAlternateScore = -1;
-
-            for (int candidate = 0; candidate < cityCount; ++candidate) {
-                if (candidate == finalDestIdx || candidate == fromIdx ||
-                        !routable.get(candidate) || isAvoidedCity(candidate))
-                    continue;
-
-                const ShuttleportLocation& alternate =
-                    allShuttleports.get(candidate);
-
-                if (alternate.planet != finalDestLoc.planet)
-                    continue;
-
-                bool sameFactionOccupied = false;
-                for (int i = 0; i < pvpSquads.size(); ++i) {
-                    const SimPvpSquad& other = pvpSquads.get(i);
-
-                    if (other.squadId != squadId &&
-                            other.imperial == snapshot.imperial &&
-                            !other.reforming && !other.travelTaskActive &&
-                            other.planet == alternate.planet &&
-                            other.city == alternate.name) {
-                        sameFactionOccupied = true;
-                        break;
-                    }
-                }
-
-                bool alternateHot = isPvpCityHotLocked(alternate.planet,
-                    alternate.name, snapshot.imperial, squadId);
-                int score = (alternateHot ? 0 : 2) +
-                    (sameFactionOccupied ? 0 : 1);
-
-                if (score > bestAlternateScore) {
-                    bestAlternateIdx = candidate;
-                    bestAlternateScore = score;
-                }
-            }
-
-            if (bestAlternateIdx >= 0) {
-                destIdx = bestAlternateIdx;
-                tactical = true;
-            }
-        }
-    }
-
-    // 3) BFS shortest-hop route over the adjacency (city counts are tiny).
-    auto buildPvpPath = [&](int target, Vector<int>& pathOut) {
-        Vector<int> previous;
-        Vector<bool> visited;
-
-        for (int i = 0; i < cityCount; ++i) {
-            previous.add(-1);
-            visited.add(false);
-        }
-
-        Vector<int> frontier;
-        frontier.add(fromIdx);
-        visited.setElementAt(fromIdx, true);
-
-        for (int head = 0; head < frontier.size() &&
-                !visited.get(target); ++head) {
-            int current = frontier.get(head);
-
-            for (int next = 0; next < cityCount; ++next) {
-                if (visited.get(next) || !adjacency.get(current).get(next))
-                    continue;
-
-                visited.setElementAt(next, true);
-                previous.setElementAt(next, current);
-                frontier.add(next);
-            }
-        }
-
-        if (!visited.get(target))
-            return false;
-
-        pathOut.removeAll();
-        for (int walk = target; walk != -1; walk = previous.get(walk))
-            pathOut.add(walk);
-
-        return true;
-    };
-
-    Vector<int> path;
-    bool pathFound = buildPvpPath(destIdx, path);
-
-    // Keep the direct route as a safe fallback if the alternate is
-    // disconnected or would exceed the configured maximum after the final
-    // shuttle leg is appended.
-    if (tactical && (!pathFound || path.size() <= 1 ||
-                path.size() > pvpTravelMaxLegsPerRoute)) {
-        tactical = false;
-        destIdx = finalDestIdx;
-        pathFound = buildPvpPath(destIdx, path);
-    }
-
-    if (!pathFound)
-        return false;
-
-    Vector<int> routePath; // backwards: final destination through origin
-    if (tactical)
-        routePath.add(finalDestIdx);
-    for (int i = 0; i < path.size(); ++i)
-        routePath.add(path.get(i));
-
-    int legCount = routePath.size() - 1;
-
-    if (legCount < 1 || legCount > pvpTravelMaxLegsPerRoute)
-        return false;
-
-    squad.pendingRoute.removeAll();
-
-    String summary = legCount > 1 ? "Route: " : "Next stop: ";
-
-    for (int legIndex = 0; legIndex < legCount; ++legIndex) {
-        int cityIdx = routePath.get(routePath.size() - 2 - legIndex);
-        int prevIdx = routePath.get(routePath.size() - 1 - legIndex);
-        const ShuttleportLocation& loc = allShuttleports.get(cityIdx);
-
-        PvpTravelLeg leg;
-        leg.destPlanet = loc.planet;
-        leg.destCity = loc.name;
-        leg.interplanetary =
-            allShuttleports.get(prevIdx).planet != loc.planet;
-        // Shuttles land at the destination city's shuttleport on same-planet
-        // legs. Cross-planet legs retain the starport arrival pad.
-        leg.arrivalPos = leg.interplanetary ? pads.get(cityIdx) :
-            cityLocations.get(cityIdx).shuttlePad;
-
-        const ShuttleportLocation& departureLoc =
-            allShuttleports.get(prevIdx);
-        // Intra-planet legs run from the departure city's live shuttle pad.
-        // Interplanetary legs run from the departure starport pad unless the
-        // collector resolver below supplies a more precise target.
-        leg.departurePos = leg.interplanetary ? pads.get(prevIdx) :
-            cityLocations.get(prevIdx).shuttlePad;
-        leg.departureLocalPos = leg.departurePos;
-
-        if (leg.interplanetary && ticketCollectorTravelEnabled) {
-            // Mark every gated cross-planet departure as a collector approach,
-            // including a resolver miss. The controller then owns the bounded
-            // no-collector fallback/cancel path instead of silently reverting
-            // to the legacy pad walk.
-            leg.departureIsCollector = true;
-            Zone* departureZone = zoneServer->getZone(departureLoc.planet);
-            Vector3 collectorWorld;
-            Vector3 collectorLocal;
-            ManagedReference<CellObject*> collectorCell;
-            uint64 collectorOid = 0;
-            if (resolveNearestTicketCollector(departureZone,
-                    pads.get(prevIdx), collectorWorld, collectorLocal,
-                    collectorCell, collectorOid)) {
-                leg.departurePos = collectorWorld;
-                leg.departureLocalPos = collectorLocal;
-                leg.departureCellOid = collectorCell == nullptr ? 0 :
-                    collectorCell->getObjectID();
-                leg.departureIsCollector = true;
-            }
-        } else if (leg.interplanetary && pvpUseCollectorBoarding &&
-                !departureLoc.starportPoint.isEmpty()) {
-            String cacheKey = departureLoc.starportPoint;
-            if (pvpBoardingPointCache.contains(cacheKey)) {
-                const PvpBoardingPoint& boardingPoint =
-                    pvpBoardingPointCache.get(cacheKey);
-
-                // Always use the cached boarding point for a gated
-                // interplanetary departure - it holds the collector when one
-                // resolved and the STARPORT pad otherwise (the promised
-                // fallback; never the city shuttle pad). The collector flag
-                // only classifies the run for counters/labels.
-                leg.departurePos = boardingPoint.worldPos;
-                leg.departureLocalPos = boardingPoint.localPos;
-                leg.departureCellOid = boardingPoint.cellOid;
-                leg.departureIsCollector =
-                    boardingPoint.resolved && !boardingPoint.fellBackToPad;
-
-                if (leg.departureIsCollector &&
-                        pvpCollectorJitterMeters > 0.f) {
-                    float xOffset = 0.f;
-                    float yOffset = 0.f;
-                    pvpCollectorJitterOffset(squadId,
-                        pvpCollectorJitterMeters, xOffset, yOffset);
-
-                    leg.departureLocalPos.setX(
-                        leg.departureLocalPos.getX() + xOffset);
-                    leg.departureLocalPos.setY(
-                        leg.departureLocalPos.getY() + yOffset);
-
-                    // Interior collectors keep the cached world point for
-                    // distance/arrival math; the jitter is cell-local only
-                    // because a world-space delta is wrong under rotation.
-                    if (leg.departureCellOid == 0) {
-                        // Outdoor collectors use one coordinate space for
-                        // both pathing and world-distance arrival checks.
-                        leg.departurePos.setX(
-                            leg.departurePos.getX() + xOffset);
-                        leg.departurePos.setY(
-                            leg.departurePos.getY() + yOffset);
-                    }
-                }
-            }
-        }
-
-        leg.finalLeg = legIndex == legCount - 1;
-        squad.pendingRoute.add(leg);
-
-        if (legIndex > 0)
-            summary = summary + ", then ";
-        summary = summary + prettyPvpCityName(loc.name) +
-            " (" + loc.planet + ")";
-    }
-
-    summary = summary + ".";
-
-    const ShuttleportLocation& destLoc = allShuttleports.get(finalDestIdx);
-    squad.routeDestPlanet = destLoc.planet;
-    squad.routeDestCity = destLoc.name;
-    squad.routeLegsTotal = legCount;
-    // 0.2.1: MOVEOUT is spoken at the pad (ready-to-travel), not at plan
-    // time - stash the route text so the announcer can pick it up there.
-    squad.pendingRouteAnnounce = summary;
-
-    pvpRoutesPlannedTotal++;
-    if (legCount > 1)
-        pvpRouteHopRoutesTotal++;
-    if (tactical)
-        pvpTacticalArrivalsTotal++;
-
-    summaryOut = summary;
-
-    info("SimPvpRoutePlanned squad=" + String::valueOf(squadId) +
-         " from=" + snapshot.planet + ":" + snapshot.city +
-         " dest=" + destLoc.planet + ":" + destLoc.name +
-         " legs=" + String::valueOf(legCount) +
-         " convergence=" + String::valueOf(convergenceOut) +
-         " tactical=" + String::valueOf(tactical), true);
-
-    return true;
+bool SimPlayerManager::planSimTravelRoute(const String& fromPlanet,
+		const String& fromCity, const String& toPlanet, const String& toCity,
+		bool allowIntraPlanetShuttle, Vector<SimTravelLeg>& legsOut,
+		String& summaryOut) {
+	legsOut.removeAll();
+	summaryOut = "";
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (zoneServer == nullptr || allShuttleports.size() < 2)
+		return false;
+
+	const int cityCount = allShuttleports.size();
+	Vector<Vector3> starportPads;
+	Vector<Vector3> shuttlePads;
+	Vector<bool> routable;
+
+	// This is deliberately a read-only graph snapshot. No controller, squad,
+	// or squad mutex is involved in any lookup below.
+	for (int i = 0; i < cityCount; ++i) {
+		const ShuttleportLocation& location = allShuttleports.get(i);
+		Vector3 starportPad = location.spawn;
+		bool hasStarport = !location.starportPoint.isEmpty();
+
+		if (hasStarport) {
+			Zone* zone = zoneServer->getZone(location.planet);
+			PlanetManager* planetManager = zone == nullptr ? nullptr :
+				zone->getPlanetManager();
+			Reference<PlanetTravelPoint*> point = planetManager == nullptr ?
+				nullptr : planetManager->getPlanetTravelPoint(
+					location.starportPoint);
+
+			if (point != nullptr) {
+				starportPad.setX(point->getArrivalPositionX());
+				starportPad.setY(point->getArrivalPositionY());
+				starportPad.setZ(point->getArrivalPositionZ());
+			} else {
+				info("SimPvpRoute starportResolveFailed city=" +
+					location.planet + ":" + location.name + " point=\"" +
+					location.starportPoint + "\"", true);
+			}
+		}
+
+		Vector3 shuttlePad = location.spawn;
+		Zone* zone = zoneServer->getZone(location.planet);
+		PlanetManager* planetManager = zone == nullptr ? nullptr :
+			zone->getPlanetManager();
+		Reference<PlanetTravelPoint*> shuttlePoint =
+			planetManager == nullptr || location.shuttlePoint.isEmpty() ?
+			nullptr : planetManager->getPlanetTravelPoint(
+				location.shuttlePoint);
+		if (shuttlePoint != nullptr)
+			shuttlePad = shuttlePoint->getArrivalPosition();
+
+		starportPads.add(starportPad);
+		shuttlePads.add(shuttlePad);
+		routable.add(hasStarport);
+	}
+
+	int fromIdx = findShuttleportIndex(fromPlanet, fromCity);
+	int toIdx = findShuttleportIndex(toPlanet, toCity);
+	if (fromIdx < 0 || toIdx < 0 || fromIdx == toIdx ||
+			!routable.get(fromIdx) || !routable.get(toIdx))
+		return false;
+
+	Vector<Vector<bool> > adjacency;
+	for (int i = 0; i < cityCount; ++i) {
+		Vector<bool> row;
+		for (int j = 0; j < cityCount; ++j) {
+			bool connected = false;
+			if (i != j && routable.get(i) && routable.get(j)) {
+				const ShuttleportLocation& from = allShuttleports.get(i);
+				const ShuttleportLocation& to = allShuttleports.get(j);
+				if (from.planet == to.planet) {
+					connected = allowIntraPlanetShuttle;
+				} else {
+					Zone* zone = zoneServer->getZone(from.planet);
+					PlanetManager* planetManager = zone == nullptr ? nullptr :
+						zone->getPlanetManager();
+					connected = planetManager != nullptr &&
+						planetManager->getTravelFare(from.planet, to.planet) > 0;
+				}
+			}
+			row.add(connected);
+		}
+		adjacency.add(row);
+	}
+
+	Vector<int> previous;
+	Vector<bool> visited;
+	for (int i = 0; i < cityCount; ++i) {
+		previous.add(-1);
+		visited.add(false);
+	}
+
+	Vector<int> frontier;
+	frontier.add(fromIdx);
+	visited.setElementAt(fromIdx, true);
+	for (int head = 0; head < frontier.size() &&
+			!visited.get(toIdx); ++head) {
+		int current = frontier.get(head);
+		for (int next = 0; next < cityCount; ++next) {
+			if (visited.get(next) || !adjacency.get(current).get(next))
+				continue;
+			visited.setElementAt(next, true);
+			previous.setElementAt(next, current);
+			frontier.add(next);
+		}
+	}
+
+	if (!visited.get(toIdx))
+		return false;
+
+	// Backwards path: destination through origin. This preserves the existing
+	// leg ordering and makes the extraction mechanically equivalent to PvP.
+	Vector<int> path;
+	for (int walk = toIdx; walk != -1; walk = previous.get(walk))
+		path.add(walk);
+
+	int legCount = path.size() - 1;
+	if (legCount < 1 || legCount > pvpTravelMaxLegsPerRoute)
+		return false;
+
+	summaryOut = legCount > 1 ? "Route: " : "Next stop: ";
+	for (int legIndex = 0; legIndex < legCount; ++legIndex) {
+		int cityIdx = path.get(path.size() - 2 - legIndex);
+		int previousIdx = path.get(path.size() - 1 - legIndex);
+		const ShuttleportLocation& destination = allShuttleports.get(cityIdx);
+		const ShuttleportLocation& departure = allShuttleports.get(previousIdx);
+
+		SimTravelLeg leg;
+		leg.destPlanet = destination.planet;
+		leg.destCity = destination.name;
+		leg.interplanetary = departure.planet != destination.planet;
+		leg.arrivalPos = leg.interplanetary ? starportPads.get(cityIdx) :
+			shuttlePads.get(cityIdx);
+		leg.departurePos = leg.interplanetary ? starportPads.get(previousIdx) :
+			shuttlePads.get(previousIdx);
+		leg.departureLocalPos = leg.departurePos;
+
+		if (leg.interplanetary && ticketCollectorTravelEnabled) {
+			leg.departureIsCollector = true;
+			Zone* departureZone = zoneServer->getZone(departure.planet);
+			Vector3 collectorWorld;
+			Vector3 collectorLocal;
+			ManagedReference<CellObject*> collectorCell;
+			uint64 collectorOid = 0;
+			if (resolveNearestTicketCollector(departureZone,
+					leg.departurePos, collectorWorld, collectorLocal,
+					collectorCell, collectorOid)) {
+				leg.departurePos = collectorWorld;
+				leg.departureLocalPos = collectorLocal;
+				leg.departureCellOid = collectorCell == nullptr ? 0 :
+					collectorCell->getObjectID();
+			}
+		}
+
+		leg.finalLeg = legIndex == legCount - 1;
+		legsOut.add(leg);
+		if (legIndex > 0)
+			summaryOut = summaryOut + ", then ";
+		summaryOut = summaryOut + prettyPvpCityName(destination.name) +
+			" (" + destination.planet + ")";
+	}
+
+	summaryOut = summaryOut + ".";
+	return true;
 }
 
-bool SimPlayerManager::popNextPvpRouteLeg(uint64 squadId, PvpTravelLeg& legOut,
+bool SimPlayerManager::planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
+		String& summaryOut, bool& convergenceOut) {
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (zoneServer == nullptr || allShuttleports.size() < 2)
+		return false;
+
+	const int cityCount = allShuttleports.size();
+
+	// Preserve the pre-extraction PvP warmup side effect: route planning also
+	// populated the city-location cache used by the city loops. The generic
+	// planner intentionally does not touch that PvP-owned cache.
+	for (int i = 0; i < cityCount; ++i) {
+		PvpCityLocations resolvedLocations;
+		resolvePvpCityLocations(allShuttleports.get(i), resolvedLocations);
+	}
+
+	int fromIdx = findShuttleportIndex(snapshot.planet, snapshot.city);
+	if (fromIdx < 0 || allShuttleports.get(fromIdx).starportPoint.isEmpty())
+		return false;
+
+	// Resolve the optional PvP collector cache before taking the squad lock.
+	// planSimTravelRoute itself remains squad-free and only handles the generic
+	// graph/route representation.
+	Vector<PvpBoardingPoint> boardingPoints;
+	if (pvpUseCollectorBoarding && !ticketCollectorTravelEnabled) {
+		for (int i = 0; i < cityCount; ++i) {
+			PvpBoardingPoint boardingPoint;
+			const ShuttleportLocation& location = allShuttleports.get(i);
+			if (!location.starportPoint.isEmpty())
+				resolvePvpBoardingPoint(location, boardingPoint);
+			boardingPoints.add(boardingPoint);
+		}
+	}
+
+	int destIdx = -1;
+	int finalDestIdx = -1;
+	bool tactical = false;
+	convergenceOut = false;
+
+	// Destination choice is PvP policy and remains under pvpSquadMutex. The
+	// generic graph/BFS is deliberately called only after this lock is released.
+	{
+		Locker squadLock(&pvpSquadMutex);
+		int idx = findPvpSquadIndex(squadId);
+		if (idx < 0)
+			return false;
+
+		SimPvpSquad& squad = pvpSquads.get(idx);
+		uint64 nowMs = System::getMiliTime();
+		bool avoidActive = squad.avoidExpiresAtMs > nowMs &&
+			!squad.avoidPlanet.isEmpty() && !squad.avoidCity.isEmpty();
+		auto isAvoidedCity = [&](int candidate) {
+			if (!avoidActive)
+				return false;
+			const ShuttleportLocation& location = allShuttleports.get(candidate);
+			return location.planet == squad.avoidPlanet &&
+				location.name == squad.avoidCity;
+		};
+		// Destination eligibility, not graph reachability: the BFS inside
+		// planSimTravelRoute still routes THROUGH a routing-only city, but a
+		// squad must never be sent TO one (P.8.7 adds such nodes purely so the
+		// fare matrix reaches the planets market dispatch needs in Phase 3).
+		auto isRoutable = [&](int candidate) {
+			return candidate >= 0 && candidate < cityCount &&
+				!allShuttleports.get(candidate).starportPoint.isEmpty() &&
+				!allShuttleports.get(candidate).routingOnly;
+		};
+
+		if (!squad.convergePlanet.isEmpty()) {
+			if (System::getMiliTime() < squad.convergeExpiresAtMs) {
+				int convergeIdx = findShuttleportIndex(squad.convergePlanet,
+					squad.convergeCity);
+				if (convergeIdx >= 0 && convergeIdx != fromIdx &&
+						isRoutable(convergeIdx) && !isAvoidedCity(convergeIdx)) {
+					destIdx = convergeIdx;
+					convergenceOut = true;
+				}
+			}
+
+			squad.convergePlanet = "";
+			squad.convergeCity = "";
+			squad.convergeExpiresAtMs = 0;
+		}
+
+		for (int tries = 0; destIdx < 0 && tries < 20; ++tries) {
+			int candidate = System::random(cityCount - 1);
+			if (candidate == fromIdx || !isRoutable(candidate) ||
+					isAvoidedCity(candidate))
+				continue;
+
+			const ShuttleportLocation& location = allShuttleports.get(candidate);
+			bool mainPlanet = pvpTravelMainPlanets.size() == 0;
+			for (int i = 0; i < pvpTravelMainPlanets.size() && !mainPlanet; ++i)
+				mainPlanet = pvpTravelMainPlanets.get(i) == location.planet;
+			if (!mainPlanet && System::random(99) >= pvpTravelOffMainChancePct)
+				continue;
+
+			bool occupied = false;
+			for (int i = 0; i < pvpSquads.size(); ++i) {
+				const SimPvpSquad& other = pvpSquads.get(i);
+				if (other.squadId != squadId &&
+						other.imperial == snapshot.imperial &&
+						other.planet == location.planet &&
+						other.city == location.name) {
+					occupied = true;
+					break;
+				}
+			}
+
+			if (!occupied)
+				destIdx = candidate;
+		}
+
+		for (int tries = 0; destIdx < 0 && tries < 20; ++tries) {
+			int candidate = System::random(cityCount - 1);
+			if (candidate != fromIdx && isRoutable(candidate))
+				destIdx = candidate;
+		}
+
+		if (destIdx < 0)
+			return false;
+
+		finalDestIdx = destIdx;
+		if (!convergenceOut && pvpAvoidHotArrival) {
+			const ShuttleportLocation& finalDestination =
+				allShuttleports.get(finalDestIdx);
+			if (isPvpCityHotLocked(finalDestination.planet,
+					finalDestination.name, snapshot.imperial, squadId)) {
+				int bestAlternateIdx = -1;
+				int bestAlternateScore = -1;
+
+				for (int candidate = 0; candidate < cityCount; ++candidate) {
+					if (candidate == finalDestIdx || candidate == fromIdx ||
+							!isRoutable(candidate) || isAvoidedCity(candidate))
+						continue;
+
+					const ShuttleportLocation& alternate =
+						allShuttleports.get(candidate);
+					if (alternate.planet != finalDestination.planet)
+						continue;
+
+					bool sameFactionOccupied = false;
+					for (int i = 0; i < pvpSquads.size(); ++i) {
+						const SimPvpSquad& other = pvpSquads.get(i);
+						if (other.squadId != squadId &&
+								other.imperial == snapshot.imperial &&
+								!other.reforming && !other.travelTaskActive &&
+								other.planet == alternate.planet &&
+								other.city == alternate.name) {
+							sameFactionOccupied = true;
+							break;
+						}
+					}
+
+					bool alternateHot = isPvpCityHotLocked(alternate.planet,
+						alternate.name, snapshot.imperial, squadId);
+					int score = (alternateHot ? 0 : 2) +
+						(sameFactionOccupied ? 0 : 1);
+					if (score > bestAlternateScore) {
+						bestAlternateIdx = candidate;
+						bestAlternateScore = score;
+					}
+				}
+
+				if (bestAlternateIdx >= 0) {
+					destIdx = bestAlternateIdx;
+					tactical = true;
+				}
+			}
+		}
+	}
+
+	Vector<SimTravelLeg> legs;
+	String routeSummary;
+	if (!planSimTravelRoute(snapshot.planet, snapshot.city,
+			allShuttleports.get(destIdx).planet,
+			allShuttleports.get(destIdx).name, true, legs, routeSummary)) {
+		if (!tactical)
+			return false;
+
+		tactical = false;
+		destIdx = finalDestIdx;
+		legs.removeAll();
+		if (!planSimTravelRoute(snapshot.planet, snapshot.city,
+				allShuttleports.get(destIdx).planet,
+				allShuttleports.get(destIdx).name, true, legs, routeSummary))
+			return false;
+	}
+
+	if (tactical) {
+		Vector<SimTravelLeg> finalLeg;
+		String ignoredSummary;
+		if (!planSimTravelRoute(allShuttleports.get(destIdx).planet,
+				allShuttleports.get(destIdx).name,
+				allShuttleports.get(finalDestIdx).planet,
+				allShuttleports.get(finalDestIdx).name, true, finalLeg,
+				ignoredSummary) || finalLeg.size() != 1 ||
+					legs.size() + finalLeg.size() > pvpTravelMaxLegsPerRoute) {
+			tactical = false;
+			destIdx = finalDestIdx;
+			legs.removeAll();
+			if (!planSimTravelRoute(snapshot.planet, snapshot.city,
+					allShuttleports.get(destIdx).planet,
+					allShuttleports.get(destIdx).name, true, legs, routeSummary))
+				return false;
+		} else {
+			legs.get(legs.size() - 1).finalLeg = false;
+			legs.add(finalLeg.get(0));
+		}
+	}
+
+	// Apply the PvP-only collector cache and deterministic jitter after the
+	// generic planner returns. This keeps the extracted planner free of squad
+	// state while preserving the existing PvP departure coordinates.
+	String previousPlanet = snapshot.planet;
+	String previousCity = snapshot.city;
+	for (int i = 0; i < legs.size(); ++i) {
+		SimTravelLeg& leg = legs.get(i);
+		int departureIdx = findShuttleportIndex(previousPlanet, previousCity);
+		if (leg.interplanetary && pvpUseCollectorBoarding &&
+				!ticketCollectorTravelEnabled && departureIdx >= 0 &&
+				departureIdx < boardingPoints.size() &&
+				!allShuttleports.get(departureIdx).starportPoint.isEmpty()) {
+			const PvpBoardingPoint& boardingPoint =
+				boardingPoints.get(departureIdx);
+			leg.departurePos = boardingPoint.worldPos;
+			leg.departureLocalPos = boardingPoint.localPos;
+			leg.departureCellOid = boardingPoint.cellOid;
+			leg.departureIsCollector = boardingPoint.resolved &&
+				!boardingPoint.fellBackToPad;
+
+			if (leg.departureIsCollector && pvpCollectorJitterMeters > 0.f) {
+				float xOffset = 0.f;
+				float yOffset = 0.f;
+				pvpCollectorJitterOffset(squadId, pvpCollectorJitterMeters,
+					xOffset, yOffset);
+				leg.departureLocalPos.setX(
+					leg.departureLocalPos.getX() + xOffset);
+				leg.departureLocalPos.setY(
+					leg.departureLocalPos.getY() + yOffset);
+				if (leg.departureCellOid == 0) {
+					leg.departurePos.setX(leg.departurePos.getX() + xOffset);
+					leg.departurePos.setY(leg.departurePos.getY() + yOffset);
+				}
+			}
+		}
+
+		previousPlanet = leg.destPlanet;
+		previousCity = leg.destCity;
+	}
+
+	int legCount = legs.size();
+	if (legCount < 1 || legCount > pvpTravelMaxLegsPerRoute)
+		return false;
+
+	String summary = legCount > 1 ? "Route: " : "Next stop: ";
+	for (int i = 0; i < legs.size(); ++i) {
+		if (i > 0)
+			summary = summary + ", then ";
+		summary = summary + prettyPvpCityName(legs.get(i).destCity) +
+			" (" + legs.get(i).destPlanet + ")";
+	}
+	summary = summary + ".";
+
+	const ShuttleportLocation& destination = allShuttleports.get(finalDestIdx);
+	{
+		Locker squadLock(&pvpSquadMutex);
+		int idx = findPvpSquadIndex(squadId);
+		if (idx < 0)
+			return false;
+
+		SimPvpSquad& squad = pvpSquads.get(idx);
+		squad.pendingRoute.removeAll();
+		for (int i = 0; i < legs.size(); ++i)
+			squad.pendingRoute.add(legs.get(i));
+		squad.routeDestPlanet = destination.planet;
+		squad.routeDestCity = destination.name;
+		squad.routeLegsTotal = legCount;
+		squad.pendingRouteAnnounce = summary;
+		pvpRoutesPlannedTotal++;
+		if (legCount > 1)
+			pvpRouteHopRoutesTotal++;
+		if (tactical)
+			pvpTacticalArrivalsTotal++;
+	}
+
+	summaryOut = summary;
+	info("SimPvpRoutePlanned squad=" + String::valueOf(squadId) +
+		" from=" + snapshot.planet + ":" + snapshot.city +
+		" dest=" + destination.planet + ":" + destination.name +
+		" legs=" + String::valueOf(legCount) +
+		" convergence=" + String::valueOf(convergenceOut) +
+		" tactical=" + String::valueOf(tactical), true);
+	return true;
+}
+
+bool SimPlayerManager::popNextPvpRouteLeg(uint64 squadId, SimTravelLeg& legOut,
         int& remainingOut) {
     Locker squadLock(&pvpSquadMutex);
 
@@ -29302,7 +32076,7 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
     bool arrivalNeedsCollectorExit = false;
 
     if (pvpRoutedTravelEnabled) {
-        PvpTravelLeg leg;
+        SimTravelLeg leg;
         bool haveLeg = popNextPvpRouteLeg(squadId, leg, routedLegsRemaining);
 
         if (!haveLeg) {

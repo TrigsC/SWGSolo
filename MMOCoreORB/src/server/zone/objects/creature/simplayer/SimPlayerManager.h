@@ -22,6 +22,12 @@
 
 #include "SimPlayerController.h"
 #include "server/zone/objects/cell/CellObject.h"
+// P.8.7: the mission board owns real LairObjects. Included (rather than
+// forward-declared) because the type lives in a namespace that this header
+// only sees via the engine's using-declarations - a global `class LairObject;`
+// would declare a DIFFERENT type and make every reference ambiguous.
+#include "server/zone/objects/tangible/LairObject.h"
+#include "server/zone/managers/creature/LairObserver.h"
 
 using namespace server::zone;
 
@@ -138,8 +144,65 @@ struct PveHuntSpecies {
 struct PveMissionTerminalLocation {
 	String planet;
 	String city;
+	String terminalType;
+	uint64 terminalOid = 0;
 	Vector3 position;
 	Reference<SceneObject*> terminal;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PveBotMissionOffer {
+	uint64 offerId = 0;
+	uint64 identityId = 0;
+	uint64 bodyOid = 0;
+	String planet;
+	uint64 terminalOid = 0;
+	String terminalType;
+	String lairTemplate;
+	String missionBuilding;
+	int difficulty = 1;
+	int difficultyLevel = 1;
+	int minDifficulty = 1;
+	int maxDifficulty = 1;
+	float size = 25.f;
+	Vector3 advertisedPos;
+	float bearingDeg = 0.f;
+	Vector3 revealedPos;
+	bool revealed = false;
+	uint64 lairOid = 0;
+	Vector<String> yieldResourceTypes;
+	uint64 expectedYieldUnits = 0;
+	uint64 issuedAtMs = 0;
+	bool completed = false;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PveMarketQualityWeight {
+	String stat;
+	float weight = 0.f;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PveLairYieldEntry {
+	String planet;
+	String lairTemplate;
+	String missionBuilding;
+	int minDifficulty = 1;
+	int maxDifficulty = 1;
+	// The owning destroy-mission spawn group's ceiling. Stored so the market
+	// matchmaker can evaluate the SAME strict level window that
+	// selectPveBotMissionLairSpawn's tiers 1-2 use, instead of only the upper
+	// bound (which is all tier 3 enforces).
+	int minLevelCeiling = 20;
+	float size = 25.f;
+	Vector<String> resourceTypes;
+	VectorMap<String, uint64> amountsByFamily;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -159,6 +222,10 @@ struct PveHuntLair {
 	bool alive = false;
 	bool spawnInProgress = false;
 	bool cleanupQueued = false;
+	// Retained so the dashboard can report real wave progress
+	// (LairObserver::getSpawnNumber): 1 = initial spawn, 2 = first-damage wave,
+	// 3 = past-half-condition wave. The #/wilds column reads this.
+	ManagedReference<LairObserver*> waveObserver;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -168,6 +235,7 @@ struct PveHuntOrder {
 	uint64 identityId = 0;
 	uint64 bodyOid = 0;
 	uint64 issuedAtMs = 0;
+	uint64 offerId = 0;
 	uint64 targetOid = 0;
 	uint64 lastCreditedTargetOid = 0;
 	String homePlanet;
@@ -178,6 +246,8 @@ struct PveHuntOrder {
 	String demandProfileKey;
 	String missionTerminalPlanet;
 	String missionTerminalCity;
+	String missionTerminalType;
+	uint64 missionTerminalOid = 0;
 	Vector3 missionTerminalPosition;
 	String phase = "IDLE_HOME";
 	String status = "ASSIGNED";
@@ -188,6 +258,12 @@ struct PveHuntOrder {
 	uint64 expectedYieldUnits = 0;
 	uint64 harvestedUnits = 0;
 	uint64 spawnsTriggeredNearby = 0;
+	String marketTargetPlanet;
+	String marketTargetCity;
+	String marketResourceType;
+	String marketFamily;
+	uint64 marketResourceSpawnOid = 0;
+	float marketQualityScore = 0.f;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -706,6 +782,64 @@ public:
 		bool logEverySimLoopTick = true;
 	};
 
+	// Shared routed travel: one leg of a planned multi-leg journey. Departure
+	// coordinates are stored separately from arrival coordinates so any
+	// SimPlayer can run to the actual ticket collector without mixing the
+	// collector's world and cell-local coordinate forms.
+	struct SimTravelLeg {
+		String destPlanet;
+		String destCity;
+		Vector3 arrivalPos;        // arrival pad (z re-derived at teleport)
+		Vector3 departurePos;      // world-space run target / distance math
+		Vector3 departureLocalPos; // cell-local path target; equals worldPos outdoors
+		uint64 departureCellOid = 0; // 0 = outdoor
+		bool departureIsCollector = false;
+		bool interplanetary = false;
+		bool finalLeg = false;
+
+		// Satisfy Vector/TypeInfo template instantiation
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+
+	struct PveRelocation {
+	uint64 identityId = 0;
+	String fromPlanet;
+	String toPlanet;
+	Vector<SimTravelLeg> legs;
+	uint64 startedAtMs = 0;
+	int legIndex = 0;
+	String reason;
+
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+
+	// P.8.7: one bounded real-buff hub round trip. The manager owns the route
+	// and its lifecycle; the hunter controller owns the motion and provider
+	// interaction choreography.
+	struct PveBuffTrip {
+	uint64 identityId = 0;
+	uint64 bodyOid = 0;
+	String huntPlanet;
+	String huntCity;
+	String hubPlanet;
+	String hubCity;
+	Vector<SimTravelLeg> legs;
+	uint64 startedAtMs = 0;
+	uint64 deadlineAtMs = 0;
+	int legIndex = 0;
+	bool returning = false;
+	String summary;
+
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+
+	// Compatibility name for existing PvP callers and serialized/dashboard
+	// surfaces. The route representation itself is shared by all SimPlayers.
+	typedef SimTravelLeg PvpTravelLeg;
+
 	struct ShuttleportLocation {
 		String planet;
 		String name;
@@ -721,26 +855,17 @@ public:
 		// P.6.5d: the configured hangout is authoritative when true; otherwise
 		// the resolver may derive an exterior cantina hangout.
 		bool hangoutManual = false;
-
-		// Satisfy Vector/TypeInfo template instantiation
-		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
-		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
-	};
-
-	// P.6.5a/P.6.5b routed travel: one leg of a planned multi-leg journey.
-	// Departure coordinates are stored separately from arrival coordinates so
-	// P.6.5b can run a squad to the actual ticket collector without mixing the
-	// collector's world and cell-local coordinate forms.
-	struct PvpTravelLeg {
-		String destPlanet;
-		String destCity;
-		Vector3 arrivalPos;        // arrival pad (z re-derived at teleport)
-		Vector3 departurePos;      // world-space run target / distance math
-		Vector3 departureLocalPos; // cell-local path target; equals worldPos outdoors
-		uint64 departureCellOid = 0; // 0 = outdoor
-		bool departureIsCollector = false;
-		bool interplanetary = false;
-		bool finalLeg = false;
+		// P.8.7: the city is not a general-population site. It is excluded from
+		// every RANDOM/AUTOMATIC placement decision — random spawn placement,
+		// PvE home-city rotation, PvP destination roulette — so adding a node
+		// here cannot scatter miners or squads onto a new planet.
+		//
+		// It is NOT excluded from DELIBERATE PvE work destinations: fare-matrix
+		// routing, mission-terminal discovery, market-dispatch destination
+		// tuples, and nearest-city resolution for a hunter already standing
+		// there all accept it. Sending a hunter to Dantooine for the resource
+		// the market needs is the entire reason these nodes exist.
+		bool routingOnly = false;
 
 		// Satisfy Vector/TypeInfo template instantiation
 		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
@@ -870,7 +995,7 @@ public:
 		// P.6.5a routed travel: remaining legs of the planned journey (index 0
 		// = next to board); empty while idle at a destination city. An
 		// unexpired convergence stamp drops the rest of a route (replan).
-		Vector<PvpTravelLeg> pendingRoute;
+		Vector<SimTravelLeg> pendingRoute;
 		// 0.2.1: route text stamped at plan time, spoken as MOVEOUT at the
 		// pad (ready-to-travel) so the hangout DEPARTURE shout can't swallow
 		// it via the global announce gap. Cleared when spoken or replanned.
@@ -1338,6 +1463,20 @@ private:
 	Vector<PveMissionTerminalLocation> allMissionTerminals;
 	VectorMap<String, int> missionTerminalCityState;
 	VectorMap<uint64, PveHuntLair> pveHuntLairs;
+	VectorMap<uint64, Vector<PveBotMissionOffer> > pveBotMissions;
+	// C4 (finding #2): a terminal-visit epoch closes the window where a slow
+	// offer generation commits a board for an identity whose order was concluded
+	// mid-generation. pveTerminalVisitEpochSeq is GLOBALLY monotonic (never reset)
+	// so a stale visit can never ABA-match a new one; the per-identity map holds
+	// the epoch of that identity's current visit. All access under pveMutex.
+	uint64 pveTerminalVisitEpochSeq = 0;
+	VectorMap<uint64, uint64> pveTerminalVisitEpoch;
+	Vector<PveLairYieldEntry> pveLairYieldIndex;
+	VectorMap<uint64, PveRelocation> pveRelocations;
+	VectorMap<uint64, PveBuffTrip> pveBuffTrips;
+	VectorMap<uint64, uint64> pveMarketLastRelocationMs;
+	VectorMap<uint64, uint64> pveMarketDwellSinceMs;
+	uint64 pveNextMissionOfferId = 1;
 	Vector<PveBuffSpec> pveHunterBuffs;
 	Vector<PveBuffSpec> pveRealBuffFallbackSpecs;
 	VectorMap<String, String> pveBuffProviderResolveStates;
@@ -1360,11 +1499,23 @@ private:
 	uint64 pveHunterLastSiteAnnounceMs = 0;
 	uint64 pveMissionLairsSpawned = 0;
 	uint64 pveMissionLairsCleaned = 0;
+	uint64 pveCreatureKillsTotal = 0;
+	uint64 pveLairsDestroyedTotal = 0;
+	uint64 pveMissionsCompletedTotal = 0;
+	uint64 pveMissionsAbandonedTotal = 0;
+	VectorMap<String, uint64> pveAbandonReasons;
+	String pveMarketDemandedFamily;
+	String pveMarketWinningResourceType;
+	String pveMarketWinningPlanet;
+	float pveMarketWinningQualityScore = 0.f;
 	uint64 pveDoctorInteractions = 0;
 	uint64 pveDancerWatches = 0;
 	uint64 pveMusicianListens = 0;
 	uint64 pveBuffDetoursSkipped = 0;
 	uint64 pveSyntheticFallbacks = 0;
+	uint64 pveBuffTripsStarted = 0;
+	uint64 pveBuffTripsCompleted = 0;
+	uint64 pveBuffTripsFallback = 0;
 	VectorMap<uint64, String> pveBuffLastSourceByBody;
 	VectorMap<uint64, uint64> pveHunterLastAnnounceByIdentity;
 	std::shared_ptr<const PvePresenceSnapshot> pvePresenceSnapshot;
@@ -1375,8 +1526,13 @@ private:
 	bool pveEnabled = false;
 	bool pveHunterBotsEnabled = false;
 	bool pveMissionHuntEnabled = false;
+	bool pveMissionBoardEnabled = false;
 	bool pveRealBuffsEnabled = false;
 	bool pveRealBuffsFallbackSynthetic = true;
+	bool pveRealBuffHubsEnabled = false;
+	Vector<String> pveRealBuffHubKeys;
+	int pveMaxBuffTripsPerHunt = 1;
+	int pveBuffTripDeadlineSeconds = 1800;
 	int pveRealBuffReapplySeconds = 900;
 	float pveBuffProviderScanRadiusMeters = 400.f;
 	String pveDoctorProviderName = "Doctor Buffer";
@@ -1390,8 +1546,8 @@ private:
 	float pveMissionSpawnDistanceMeters = 200.f;
 	float pveMissionTerminalScanRadiusMeters = 600.f;
 	int pveMissionMaxSpawnPointTries = 32;
-	int pveMissionMaxSimultaneousAdds = 1;
-	int pveMissionAddsAbandonCycles = 3;
+	int pveMissionMaxSimultaneousAdds = 3;
+	int pveMissionAddsAbandonCycles = 8;
 	int pveMissionTerminalDwellSeconds = 5;
 	int pveMissionTerminalResolveWaitCycles = 10;
 	int pveMissionLairTimeoutSeconds = 1800;
@@ -1402,6 +1558,37 @@ private:
 	bool pveSpikeEnabled = false;
 	bool pveAcquisitionLedgerEnabled = false;
 	bool pveAcquisitionLedgerMinerCreatureExclusion = true;
+	bool pveLocationBasedEligibility = false;
+	float pveDispatchRadiusMeters = 2500.f;
+	Vector<String> pveMissionBoardAcceptedTerminalTypes;
+	int pveMissionBoardMaxHeldMissions = 2;
+	float pveMissionBoardSameDirectionArcDegrees = 60.f;
+	int pveMissionBoardBaseDistanceMeters = 1000;
+	int pveMissionBoardDifficultyDistanceFactor = 0;
+	int pveMissionBoardRandomDistanceMeters = 1000;
+	int pveMissionBoardDifficultyRandomDistance = 0;
+	float pveMissionBoardLairRevealRadiusMeters = 120.f;
+	bool pveMissionBoardLairEngageAfterFieldClear = true;
+	int pveMissionBoardMaxOfferAgeSeconds = 1800;
+	// A wilderness point validated at generation frequently goes stale (a
+	// no-build object appears) before the hunter arrives; when true, reveal
+	// relocates the lair to the nearest clear point around the advertised
+	// waypoint instead of abandoning the mission. See revealPveBotMissionLair.
+	bool pveMissionBoardRevealRelocateEnabled = true;
+	// Terminal offer-generation retry: on a partial/empty board the hunter dwells
+	// this long and re-generates, up to this many attempts, before accepting a
+	// single offer or (if still empty) abandoning. See beginMissionAccept.
+	int pveMissionBoardOfferRetrySeconds = 25;
+	int pveMissionBoardOfferMaxAttempts = 3;
+	bool pveMarketDispatchEnabled = false;
+	Vector<String> pveMarketDispatchFamilies;
+	VectorMap<String, Vector<PveMarketQualityWeight> >
+		pveMarketQualityWeights;
+	float pveMarketMinQualityScore = 0.f;
+	int pveMarketMaxConcurrentRelocations = 1;
+	int pveMarketMinHuntersPerActivePlanet = 1;
+	int pveMarketRelocationCooldownSeconds = 1800;
+	int pveMarketRelocationMinDwellSeconds = 900;
 	Vector<String> pveAcquisitionLedgerCreatureFamilies;
 	Vector<String> pveAcquisitionLedgerCreatureClassMarkers;
 	VectorMap<String, uint64> pveAcquisitionLedgerFamilyReserveTargets;
@@ -1498,6 +1685,19 @@ private:
 	void queuePveHuntLairCleanup(uint64 bodyOid, const String& reason);
 	void finishPveHuntLairCleanup(uint64 bodyOid, uint64 lairOid,
 		const String& reason);
+	bool selectPveBotMissionLairSpawn(const String& planet, int hunterLevel,
+		PveBotMissionOffer& offer, const String& desiredFamily = "",
+		const String& desiredResourceType = "");
+	// diagIdentityId is DIAGNOSTIC ONLY: it correlates missiondiag.log lines with
+	// the OFFERS_BEGIN that bracket them, since offer generation can run for two
+	// hunters on different threads and the lines would otherwise interleave
+	// unattributably. It never affects placement.
+	bool choosePveBotMissionPosition(const PveMissionTerminalLocation& terminal,
+		int difficultyLevel, const String& planet, Vector3& position,
+		float& bearing, uint64 diagIdentityId = 0);
+	void registerPveBotMissionLairObserver(LairObject* lair, uint64 bodyOid,
+		uint64 lairOid);
+	void buildPveLairYieldIndex();
 	JSONSerializationType getPveActivityDashboard();
 	JSONSerializationType getPveSpikeDashboard();
 
@@ -1908,9 +2108,33 @@ private:
 	// false → caller falls back to the legacy random pick.
 	bool planPvpRoute(uint64 squadId, const SimPvpSquad& snapshot,
 		String& summaryOut, bool& convergenceOut);
+	// Squad-free fare-matrix route planner used by PvP, PvE, and future
+	// SimPlayer travel callers. World/planet lookups happen without the squad
+	// mutex.
+	bool planSimTravelRoute(const String& fromPlanet, const String& fromCity,
+		const String& toPlanet, const String& toCity,
+		bool allowIntraPlanetShuttle, Vector<SimTravelLeg>& legsOut,
+		String& summaryOut);
+	// Returns the nearest configured city on a planet that has a routable
+	// starport. Empty starport entries are intentionally excluded.
+	// allowRoutingOnly has NO default on purpose: every caller must state
+	// whether a routing-only city is an acceptable answer. PvE work
+	// destinations say true (that is the whole reason those nodes exist);
+	// anything doing random/automatic placement says false.
+	int travelDiagHeartbeatSeconds = 10;
+
+public:
+	int getTravelDiagHeartbeatSeconds() const {
+		return travelDiagHeartbeatSeconds;
+	}
+
+private:
+	bool getNearestRoutableCity(const String& planet, const Vector3& from,
+		bool allowRoutingOnly,
+		ShuttleportLocation& out) const;
 	// Pops the next planned leg. A fresh unexpired convergence stamp drops the
 	// remaining route instead (returns false → caller replans to the contact).
-	bool popNextPvpRouteLeg(uint64 squadId, PvpTravelLeg& legOut, int& remainingOut);
+	bool popNextPvpRouteLeg(uint64 squadId, SimTravelLeg& legOut, int& remainingOut);
 	int findShuttleportIndex(const String& planet, const String& city) const;
 
 	void applyPvpConfig(LuaObject& pvpConfig);
@@ -2075,18 +2299,70 @@ public:
 	void recordPveHunterKill(uint64 identityId, uint64 bodyOid,
 		uint64 targetOid, const String& harvestKind,
 		const String& requestedResourceType, bool participantVerified);
+	void handlePveHunterTelemetryDestructionHandoff(uint64 identityId,
+		uint64 bodyOid, uint64 creatureOid, bool participantVerified);
 	void recordPveHunterAbandoned(uint64 identityId, uint64 bodyOid,
 		const String& reason);
 	void recordPveHunterCompleted(uint64 identityId, uint64 bodyOid);
 	bool getNearestMissionTerminal(const String& planet, const String& city,
 		const Vector3& fromPosition, PveMissionTerminalLocation& result,
 		int& cityState);
+	bool getNearestGeneralMissionTerminal(const String& planet,
+		const Vector3& fromPosition, PveMissionTerminalLocation& result,
+		int& cityState);
+	bool resolvePveHunterDispatchLocation(uint64 bodyOid,
+		float dispatchRadiusMeters, String& currentPlanet,
+		ShuttleportLocation& city, PveMissionTerminalLocation& terminal);
 	bool spawnPveHuntLair(uint64 bodyOid, const PveHuntSpecies& species,
 		const Vector3& missionPos);
+	bool generatePveBotMissionOffers(uint64 identityId, uint64 bodyOid,
+		const PveMissionTerminalLocation& terminal, int hunterLevel,
+		Vector<PveBotMissionOffer>& offers, uint64 visitEpoch);
+	// Opens a fresh terminal visit: verifies an active order for identity/body,
+	// drops any stale board, assigns+returns a new globally-monotonic visit
+	// epoch (0 = no active order, caller must not proceed). The controller passes
+	// this epoch back into generatePveBotMissionOffers so a commit that finishes
+	// after the order concluded is discarded. All work under pveMutex.
+	uint64 openTerminalVisit(uint64 identityId, uint64 bodyOid);
+	bool getPveBotMissionOffer(uint64 identityId, uint64 offerId,
+		PveBotMissionOffer& offer);
+	// Tri-state so a transient capacity/consistency miss defers the reveal
+	// (retry next tick) instead of abandoning a perfectly good mission.
+	enum PveLairRevealResult {
+		PVE_LAIR_REVEAL_OK = 0,
+		PVE_LAIR_REVEAL_DEFER = 1,
+		PVE_LAIR_REVEAL_FAILED = 2
+	};
+	PveLairRevealResult revealPveBotMissionLair(uint64 bodyOid, uint64 offerId);
+	void onPveBotMissionLairDestroyed(uint64 bodyOid, uint64 lairOid);
+	bool planPveHunterRelocation(uint64 identityId, uint64 bodyOid,
+		const String& targetPlanet, const String& targetCity,
+		const String& reason, PveRelocation& relocation);
+	bool getPveHunterRelocation(uint64 identityId, PveRelocation& relocation);
+	void advancePveHunterRelocation(uint64 identityId);
+	void finishPveHunterRelocation(uint64 identityId, bool success,
+		const String& actualPlanet);
+	bool isPveMarketDispatchEnabled() const {
+		return pveMarketDispatchEnabled;
+	}
+	bool isPveBuffHubsEnabled() const { return pveRealBuffHubsEnabled; }
+	int getPveMaxBuffTripsPerHunt() const { return pveMaxBuffTripsPerHunt; }
+	int getPveBuffTripDeadlineSeconds() const {
+		return pveBuffTripDeadlineSeconds;
+	}
+	bool getPveHunterCurrentRoutableCity(uint64 bodyOid,
+		String& currentPlanet, ShuttleportLocation& city);
+	bool planPveHunterBuffTrip(uint64 identityId, uint64 bodyOid,
+		bool needDoctor, bool needEntertainer, PveBuffTrip& trip);
+	bool getPveHunterBuffTrip(uint64 identityId, PveBuffTrip& trip);
+	void advancePveHunterBuffTrip(uint64 identityId);
+	bool beginPveHunterBuffReturn(uint64 identityId);
+	void finishPveHunterBuffTrip(uint64 identityId, bool success);
 	bool getPveHuntLair(uint64 bodyOid, PveHuntLair& result);
 	void requestPveHuntLairCleanup(uint64 bodyOid, const String& reason);
 	void recordPveHunterMissionTerminal(uint64 identityId, uint64 bodyOid,
-		const String& planet, const String& city, const Vector3& position);
+		const String& planet, const String& city, const Vector3& position,
+		const String& terminalType = "", uint64 terminalOid = 0);
 	void recordPveHunterMissionAdds(uint64 identityId, uint64 bodyOid,
 		int adds);
 	void recordPveDoctorInteraction();
@@ -2096,6 +2372,27 @@ public:
 	void recordPveSyntheticFallback(uint64 bodyOid);
 	void recordPveBuffSource(uint64 bodyOid, const String& source);
 	bool isPveMissionHuntEnabled() const { return pveMissionHuntEnabled; }
+	int getPveBotHunterLevelForBody(uint64 bodyOid) const;
+	int getPveBotHunterLevel(AiAgent* hunter) const;
+	bool isPveMissionBoardEnabled() const { return pveMissionBoardEnabled; }
+	int getPveMissionBoardMaxHeldMissions() const {
+		return pveMissionBoardMaxHeldMissions;
+	}
+	int getPveMissionBoardOfferRetrySeconds() const {
+		return pveMissionBoardOfferRetrySeconds;
+	}
+	int getPveMissionBoardOfferMaxAttempts() const {
+		return pveMissionBoardOfferMaxAttempts;
+	}
+	float getPveMissionBoardLairRevealRadiusMeters() const {
+		return pveMissionBoardLairRevealRadiusMeters;
+	}
+	bool getPveMissionBoardLairEngageAfterFieldClear() const {
+		return pveMissionBoardLairEngageAfterFieldClear;
+	}
+	int getPveMissionBoardMaxOfferAgeSeconds() const {
+		return pveMissionBoardMaxOfferAgeSeconds;
+	}
 	bool isPveRealBuffsEnabled() const { return pveRealBuffsEnabled; }
 	bool isPveRealBuffsFallbackSyntheticEnabled() const {
 		return pveRealBuffsFallbackSynthetic;

@@ -485,6 +485,8 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 11.5px; }
   font-size: 10px;
   user-select: all;
 }
+.wilds-offer { min-width: 112px; }
+.wilds-waves { min-width: 42px; text-align: center; }
 
 /* ---------- key/value list ---------- */
 

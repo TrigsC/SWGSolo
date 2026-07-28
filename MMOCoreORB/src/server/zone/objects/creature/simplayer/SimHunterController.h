@@ -6,6 +6,8 @@
 #ifndef SIMHUNTERCONTROLLER_H_
 #define SIMHUNTERCONTROLLER_H_
 
+#include <atomic>
+
 #include "SimPlayerManager.h"
 
 class SimHunterActiveTickTask;
@@ -14,12 +16,16 @@ class SimHunterController : public SimPlayerController {
 public:
 	enum HuntPhase {
 		IDLE_HOME = 0,
-		ANNOUNCE_JOB,
-		BUFF_UP,
-		TRAVEL_OUT,
-		TRAVEL_TO_TERMINAL,
-		ACCEPT_MISSION,
-		TRAVEL_TO_LAIR,
+	ANNOUNCE_JOB,
+	BUFF_UP,
+	RELOCATING,
+	BUFF_TRIP,
+	TRAVEL_OUT,
+	TRAVEL_TO_TERMINAL,
+	ACCEPT_MISSION,
+	TRAVEL_TO_MISSION,
+	TRAVEL_TO_LAIR,
+	ENGAGING_LAIR,
 		AWAITING_WORLD,
 		HUNTING,
 		RETREATING,
@@ -42,10 +48,23 @@ private:
 	HuntPhase phase;
 	uint64 phaseStartedAtMs;
 	uint64 huntStartedAtMs;
-	uint64 activeTickGeneration;
+	// C1: atomic so the read-modify-write in scheduleActiveTick and the reads in
+	// SimHunterActiveTickTask/TICK_ENTRY are not a data race across task threads.
+	std::atomic<uint64> activeTickGeneration;
+	// C2: non-blocking single-flight guard so two runActiveTick bodies never run
+	// concurrently for one controller (a loser reschedules instead of blocking).
+	std::atomic<bool> tickRunning{false};
 	uint64 targetOid;
 	uint64 observerTargetOid;
 	Reference<Observer*> targetObserver;
+	// Kill-telemetry observer handles, keyed by creature OID. Written from BOTH
+	// tick loops (onTick's interceptor path and runActiveTick's engage path,
+	// which run on independent task-pool threads) and cleared on order
+	// completion/abandon/death/teardown, so it needs its own lock. Never held
+	// while taking a creature lock — see registerEngagedTelemetry.
+	VectorMap<uint64, Reference<Observer*> > engagedTelemetry;
+	mutable Mutex engagedTelemetryMutex;
+	bool targetMissionWave;
 	bool destructionHandled;
 	bool cantinaDwellComplete;
 	bool cantinaArrived;
@@ -71,6 +90,18 @@ private:
 	Vector3 missionTerminalPosition;
 	Vector3 missionLairPosition;
 	uint64 missionLairOid;
+	uint64 engagedMissionLairOid;
+	uint64 currentMissionOfferId;
+	bool missionOffersGenerated;
+	// Bounded offer-generation retries at the terminal: on a partial/empty board
+	// the hunter dwells and re-generates rather than abandoning the trip. Reset
+	// to 0 at the start of each terminal visit (alongside missionOffersGenerated).
+	int missionOfferAttempts;
+	// C4: epoch captured from openTerminalVisit at the start of a terminal visit
+	// (attempt 0) and reused across retries; passed into generatePveBotMissionOffers
+	// so a commit that finishes after the order concluded is discarded.
+	uint64 missionOfferVisitEpoch;
+	Vector<uint64> missionOfferIds;
 	int terminalResolveWaitCycles;
 	int missionAddsOverCapCycles;
 	int missionAddsEngaged;
@@ -94,6 +125,9 @@ private:
 	bool pveDoctorRequestActive;
 	uint64 pveDoctorDeadlineSec;
 	ManagedReference<SceneObject*> pveDoctorProviderObject;
+	bool pveBuffTripAtHub;
+	bool pveBuffTripReturning;
+	int pveBuffTripsThisHunt;
 
 	enum PveBuffFamily {
 		PVE_BUFF_FAMILY_DOCTOR,
@@ -111,6 +145,8 @@ private:
 		const String& method, const String& args);
 	void cancelPveDoctorRequest();
 	void finishPveBuffProviderFlow();
+	bool beginBuffTripLeg();
+	void resumeAfterBuffTrip();
 	void interactWithPveBuffProvider(PveBuffApproachStage stage);
 	void applyHunterBuffs(bool clearWounds);
 	void applyHunterBuffsForFamily(PveBuffFamily family);
@@ -118,13 +154,23 @@ private:
 	void beginMissionFallback();
 	void beginMissionAccept();
 	void spawnMissionLair();
+	bool beginNextMissionOffer();
+	bool beginMarketRelocationLeg();
+	void engageMissionLair();
+	void disengageMissionLair();
 	void beginMissionCleanup(bool abandoned, const String& reason);
 	void continueAfterMissionCleanup();
 	bool checkMissionSocialAggro(AiAgent* hunter);
 	void updateMissionAdds(int adds);
 	void beginTravelHome(bool abandoned);
+	// P.8.7 travel diagnostics: periodic stall detector for the cross-planet
+	// legs. Rate-limited by travelDiag.heartbeatSeconds; no-op when the gate is
+	// off (checked before any lock is taken).
+	void logTravelHeartbeat(const String& phaseLabel, uint64 nowMs);
+	uint64 lastTravelHeartbeatMs = 0;
+	float lastTravelHeartbeatDistance = -1.f;
 	void beginHunting();
-	void scanForTarget();
+	bool scanForTarget();
 	void selectTarget(AiAgent* target);
 	void engageTarget();
 	void disengageTarget(bool dropObserverHandle);
@@ -134,6 +180,8 @@ private:
 	ManagedReference<CreatureObject*> engageActiveAttacker(AiAgent* hunter);
 	void dropTargetObserver();
 	void registerTargetObserver(uint64 target);
+	void clearEngagedTelemetry();
+	void registerEngagedTelemetry(uint64 creatureOid);
 	void handleTargetUnavailable();
 	void beginRetreat();
 	void finishRetreatMove();
@@ -147,6 +195,8 @@ private:
 	bool targetIsLive(uint64 oid, CreatureObject*& target,
 		AiAgent*& targetAgent) const;
 	bool targetMatchesSpecies(CreatureObject* target) const;
+	bool isMissionWaveMob(CreatureObject* target) const;
+	bool hasMissionWaveMobInRange() const;
 	void moveToTarget();
 	void moveToPatrolPoint(uint64 nowMs);
 	void completeOrder(bool abandoned, const String& reason);
@@ -166,19 +216,25 @@ public:
 	// (orderActive=false) or enters cleanup, the preserved finalDestination must
 	// not revive movement toward the finished target (code-review Major).
 	bool shouldResumeHybridTravel() const override {
-		return hasFinalDestination && orderActive && !missionCleanupRequested;
+		return hasFinalDestination && orderActive && !missionCleanupRequested &&
+			phase != RELOCATING && phase != BUFF_TRIP;
 	}
 
 	void startOrder(const PveHuntOrder& newOrder,
 		const PveHuntSpecies& newSpecies);
 	void onHuntDestruction(uint64 destroyedTargetOid,
 		bool participantVerified);
+	void onPveBotMissionLairDestroyed(uint64 lairOid);
 	void teardown(const String& reason);
 
 	String getPhaseName() const;
 	uint64 getIdentityId() const { return identityId; }
 	uint64 getTargetOid() const { return targetOid; }
 	HuntPhase getPhase() const { return phase; }
+	bool isReadyForMarketRelocation() const;
+	bool canBeginInterplanetaryTravel() const override;
+	void onInterplanetaryTravelFinished(bool success, const String& destZone,
+		const String& reason) override;
 };
 
 #endif /* SIMHUNTERCONTROLLER_H_ */

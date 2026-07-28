@@ -310,9 +310,11 @@ This is this fork's primary custom subsystem, layered on top of the stock
 - **`SimPvPController.{h,cpp}`** — the PvP/combat-oriented sibling
   controller for AI squads (see §13).
 - **`SimHunterController.{h,cpp}`** — the PvE hunter controller (P.8). Drives a
-  mission-terminal hunt loop (travel → accept destroy mission → real lair spawn →
-  pull → kill → simulated harvest) that closes the crafter→hunter demand loop via
-  the acquisition/demand ledger. Combat is **real** (`CombatManager::startCombat`
+  market-driven mission-board hunt loop (shared travel → terminal → held offer →
+  real lair spawn → pull → kill → simulated harvest) that closes the
+  crafter→hunter demand loop via the acquisition/demand ledger. It also owns the
+  gated cross-planet buff-trip phase while `SimPlayerManager` owns offer,
+  dispatch, and route state. Combat is **real** (`CombatManager::startCombat`
   with an AI-aligned rifle; wild creatures retaliate) but loot stays simulated.
   Neutral hunters use player-safe targeting and defender-driven re-engagement so
   they reject real players and follow the actual creature attacking them (the
@@ -324,6 +326,24 @@ This is this fork's primary custom subsystem, layered on top of the stock
   `runActiveTick` owns it (HUNTING-scoped), while `onTick` only self-defends via the
   interceptor path on travel legs and never writes it. Defender-list reads snapshot
   under the hunter lock (`add`/`removeDefender` are `@preLocked`).
+  F_0.5.0 hardened the terminal mission-board handoff against those two threads: a
+  monotonic **terminal-visit epoch** (`SimPlayerManager::openTerminalVisit` /
+  `pveTerminalVisitEpoch`) is captured when a hunter opens a board and re-checked at
+  commit, so `generatePveBotMissionOffers` discards any offer set that finishes after
+  the order concluded or the body was drained; `activeTickGeneration` is an
+  `std::atomic<uint64>` (latest-wins) and `tickRunning` a non-blocking single-flight
+  guard so no two `runActiveTick` bodies run concurrently. An empty board no longer
+  abandons the trip — the hunter dwells and re-generates for a bounded
+  `offerMaxAttempts`×`offerRetrySeconds` budget.
+  Hunt dispatch is gated on **demand pressure per family**: the market matchmaker
+  only issues an order when a family's `signalUnits > 0`, i.e. accumulated supply is
+  below its `effectiveCeiling` (`familyAllocationCeiling{Units,Fraction}` in the
+  acquisition ledger). The fraction is an anti-domination cap for *multi-family*
+  profiles; since hunters supply a single family (`meat`), it is set to `1.0` so meat
+  can fill its profile's true `desiredReserve` — a lower cap silently strands the
+  whole roster once supply crosses it (F_0.5.0 saturation fix). With no meat
+  *consumer* yet, meat still re-saturates at the reserve target; a consumption side is
+  the documented next economy phase.
   Hunter-opt-in navmesh/overland hybrid movement (`usesNavmeshHybridMovement()`,
   base false so miners/PvP are unchanged): navmesh inside cities, overland in the
   wild. Bodies spawn `PLAYER | ATTACKABLE` and force faction 0 so wildlife fights
