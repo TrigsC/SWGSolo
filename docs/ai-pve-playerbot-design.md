@@ -16,6 +16,7 @@ untouched. This doc is the living plan; the P.8.1 implementation plan is
 - **P.8.4** — player interaction depth (trade, chat).
 - **P.8.5** — miner identity migration + population scale.
 - **P.8.7** — market-driven mission boards, dispatch, and buff travel.
+- **P.8.8** — multi-family hunter demand (hide/bone/meat spread; F_0.6.0).
 
 ## Owner decisions
 
@@ -452,3 +453,55 @@ returns to the hunt planet. Trips are bounded by the per-hunt limit and total
 deadline, never begin while a lair or live defender is present, and fall back
 to `realBuffs.fallbackBuffs`. `pveActivity.buffTrips` reports active routes and
 outcomes; all existing dashboard roots remain additive and stable.
+
+## P.8.8 — Multi-family hunter demand (F_0.6.0)
+
+Before F_0.6.0 a hunt credited a single conceptual family (`meat`), so meat was
+the only family that ever accumulated supply and generated pressure. Once meat
+crossed its reserve target the *entire* roster idled — no other family's demand
+could keep hunters working. F_0.6.0 spreads demand across the three creature
+families a real kill produces.
+
+**What each kill now does.** `recordPveHunterHarvest` takes one target-lock and
+reads all three creature yields — `hide` (family 0), `bone` (1), `meat` (2) —
+then deposits each family independently (gated at `harvestAmount >= 3` per
+family) into `pveSessionHarvestByFamily` and the owning order's per-family
+`harvested*Units`. A missing yield on a given creature is skipped per family and
+surfaced through the existing harvest-miss counter; families are independent, so
+one absent yield never blocks the others.
+
+**Demand recognition.** Hide/bone demand is sourced by **extending existing
+demand profiles** rather than inventing new ones:
+`demandStateProfileUsesConceptualLabel` now maps `composite_armor_supply` to
+`hide`/`hide_*` and `master_weaponsmith_staples` to `bone`/`bone_*` (creature-
+family-gated; `high_damage_weapon_components` was split out so it keeps its prior
+labels). Config carries all three in `creatureFamilies`, with per-family
+`familyReserveTargets` and `familyAllocationCeiling{Units,Fraction}` (fraction
+`1.0` per family — the anti-domination cap must not strand a family below its
+true `desiredReserve`, the F_0.5.0 lesson).
+
+**Reserve-all-three on accept.** At order creation each matchmaker path records
+the expected units of all three families (`expected*Units`, from the lair's
+`amountsByFamily` on the market path, from the species scalars on the legacy
+path). `computeReservedInboundByProfileFamily` was rebuilt to iterate enabled
+profiles × 3 families and reserve remaining per-family expected against every
+profile that recognizes that family. Both matchmaker paths call a shared
+`decrementPveHuntFamilySignals` helper that decrements *every* matching family
+signal intra-pass, so a single matchmaker pass can never over-dispatch a family.
+The dashboard adds a `harvestByFamily` object under `pveActivity`.
+
+**Scope boundary (deliberate).** This is a **demand-spread** slice only.
+`consumeReservation` still does **not** feed back into `familySupply` in-session:
+supply remains the immutable boot baseline (`snapshotStockpileTotalsByFamily`)
+plus the monotonic `pveSessionHarvestByFamily`. With no in-session *consumer* for
+any family, each family still re-saturates at its reserve target over a long
+soak — the same accepted debt meat already carried. Closing the drain loop with
+a real family consumer (crafter/chef bots eating stockpiled hide/bone/meat)
+remains the documented next economy phase. The win F_0.6.0 does deliver: meat
+saturation alone can no longer idle the whole hunter roster, because hide and
+bone carry independent pressure.
+
+**Reversibility.** Purely additive — new struct fields default 0, no IDL/persist
+changes. Revert = restore single-family `recordPveHunterHarvest`, drop the two
+`demandStateProfileUsesConceptualLabel` label cases, remove the lua hide/bone
+keys, restore the single-family signal decrement.

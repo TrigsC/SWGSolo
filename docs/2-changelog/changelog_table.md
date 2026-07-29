@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.6.0` | 3 | F_0.6.0 P.8.8: multi-family hunter demand — hunters credit hide/bone/meat per kill so demand spreads across families and meat saturation no longer idles the roster; reserve-all-three on accept + shared intra-pass multi-family signal decrement; harvestByFamily dashboard |
 | `0.5.0` | 3 | F_0.5.0 P.8.7: market-driven mission hunting — real destroy missions, galactic travel, 3-wave lairs; terminal-visit epoch + atomic tick concurrency; bounded offer-retry; meat allocation-ceiling saturation fix |
 | `0.4.11` | 2 | F_0.4.7–F_0.4.11 cell-nav + starport ticket-collector travel: POB entry/egress/nearest-portal fixes, gated interplanetary collector travel, starport containment-margin fix, NPC pivot-swivel fixes, diagnostics behind a flag |
 | `0.4.6` | 2 | F_0.4.6 P.8.6: PvE hunter player-mimetic real buffs (need-gated doctor/entertainer providers, delayed-load cell resolution, synthetic fallback) |
@@ -14,6 +15,14 @@
 | `0.1.0` | 1 | chore: initialize TRIP workflow |
 
 # Changelog Summary
+
+- **v0.6.0 (Multi-Family Hunter Demand, F_0.6.0 / P.8.8 - Week 3, 29-07-2026)**:
+  - **Feature**: hunters now credit **three creature families** (hide, bone, meat) per kill instead of meat alone, so demand pressure spreads across families and **meat saturation alone can no longer idle the whole roster** (the residual F_0.5.0 problem). Each kill deposits all three families under a single target-lock in `recordPveHunterHarvest` (per-family, gated at `harvestAmount >= 3`); hide/bone demand is recognized by **extending existing profiles** (`demandStateProfileUsesConceptualLabel`: `composite_armor_supply`→`hide*`, `master_weaponsmith_staples`→`bone*`); each hunt **reserves the expected units of all three families on accept** (`computeReservedInboundByProfileFamily` over enabled profiles × 3 families), and both matchmaker paths run a shared **intra-pass multi-family signal decrement** (`decrementPveHuntFamilySignals`) so a single pass never over-dispatches a family. New `harvestByFamily` object on the `pveActivity` dashboard JSON.
+  - **Live-verified (2026-07-29, ~9h uptime, 0 errors)**: `demandFamilies` recognizes hide (`composite_armor_supply` signal=37007, supply=2100) and bone (`master_weaponsmith_staples` signal=39127, supply=840); `harvestByFamily` climbing hide=2100/bone=840/meat=2100 (= `hunterHarvestUnitsTotal` 5040, `hunterHarvestMisses`=0); `reservedInboundSupply == familyInbound` per family (no over/under-dispatch); roster stayed busy though meat is saturated (supply=55268 ≫ reserveTarget 2500).
+  - **Scope**: simulation-only; **always-on** by explicit plan authorization (no new gate; reserve targets/ceilings remain Lua-tunable). Demand-**spread** slice only — `consumeReservation` still does not drain `familySupply` in-session, so each family re-saturates at its reserve target until a consumer exists. Purely additive (new `PveHuntOrder` fields default 0, in-memory only, no IDL/persist change). `death_watch_wraith.lua` and the `engine3` submodule excluded (pre-existing owner changes).
+  - **Review**: Codex loop, 2 rounds → **APPROVED** (Round 1 REQUEST_CHANGES was a docs finding, since addressed, plus two out-of-scope owner-owned files and the owner-controlled live gate) (`docs/3-code-review/CR_w3_v0.6.0.md`).
+  - **Deferred**: the real family **consumer** (chef/crafter bots eating stockpiled hide/bone/meat) — the next economy phase that drains `familySupply` in-session; pure-helper unit-test seam (`docs/4-unit-tests/COVERAGE-DEBT.md`).
+  - **Note**: committed + tagged on `feat/multi-family-hunter-demand`; **NOT** merged into `miner-ai` (owner policy, consistent with v0.4.6 / v0.4.11 / v0.5.0).
 
 - **v0.5.0 (Market-Driven Mission Hunting, F_0.5.0 / P.8.7 - Week 3, 28-07-2026)**:
   - **Feature**: replaces scripted single-kill PvE hunts with **market-driven destroy missions**. A hunter is dispatched against the highest demand-pressure resource family a level-qualified lair can yield, travels (galactic, `switchZone`-based) to a real mission terminal, holds a generated offer, reveals a **real three-wave lair**, pulls and fights it with real combat, and books a simulated harvest that closes the crafter→hunter demand loop via the acquisition/demand ledger. Optional gated cross-planet **buff trips**. New dashboard telemetry: mission wave progress + a **Completed Missions** metric on the WILDS page.

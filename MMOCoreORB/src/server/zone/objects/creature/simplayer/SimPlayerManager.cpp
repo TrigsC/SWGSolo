@@ -632,6 +632,9 @@ struct PveMarketCandidate {
 	uint64 terminalOid = 0;
 	PveMissionTerminalLocation terminal;
 	uint64 expectedYieldUnits = 0;
+	uint64 amountHideUnits = 0;
+	uint64 amountBoneUnits = 0;
+	uint64 amountMeatUnits = 0;
 	String lairTemplate;
 	float pressure = 0.f;
 	String demandProfileKey;
@@ -690,6 +693,68 @@ struct DemandStateSimulationResult {
     bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
     bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
+
+static String getPveCreatureFamily(int index) {
+	switch (index) {
+	case 0:
+		return "hide";
+	case 1:
+		return "bone";
+	case 2:
+		return "meat";
+	default:
+		return "";
+	}
+}
+
+static uint64 getPveHuntOrderExpectedFamilyUnits(
+		const PveHuntOrder& order, const String& family) {
+	if (family == "hide")
+		return order.expectedHideUnits;
+	if (family == "bone")
+		return order.expectedBoneUnits;
+	if (family == "meat")
+		return order.expectedMeatUnits;
+
+	return 0;
+}
+
+static uint64 getPveHuntOrderHarvestedFamilyUnits(
+		const PveHuntOrder& order, const String& family) {
+	if (family == "hide")
+		return order.harvestedHideUnits;
+	if (family == "bone")
+		return order.harvestedBoneUnits;
+	if (family == "meat")
+		return order.harvestedMeatUnits;
+
+	return 0;
+}
+
+static void decrementPveHuntFamilySignals(
+		Vector<DemandStateSimulationResult>& demandResults,
+		const PveHuntOrder& order) {
+	for (int familyIndex = 0; familyIndex < 3; ++familyIndex) {
+		String family = getPveCreatureFamily(familyIndex);
+		uint64 expectedUnits = getPveHuntOrderExpectedFamilyUnits(order, family);
+		if (expectedUnits == 0)
+			continue;
+
+		for (int demandIndex = 0; demandIndex < demandResults.size();
+				demandIndex++) {
+			DemandStateSimulationResult& demand = demandResults.get(demandIndex);
+			for (int signalIndex = 0;
+					signalIndex < demand.familySignals.size(); signalIndex++) {
+				DemandFamilySignal& signal = demand.familySignals.get(signalIndex);
+				if (signal.family != family)
+					continue;
+
+				signal.signalUnits = signal.signalUnits <= expectedUnits ?
+					0 : signal.signalUnits - expectedUnits;
+			}
+		}
+	}
+}
 
 struct MarketListingSnapshot {
     uint64 objectID = 0;
@@ -1870,11 +1935,20 @@ static bool findDemandProfileDefinition(
 static bool demandStateProfileUsesConceptualLabel(
 		const String& profileKey, const String& resourceLabel,
 		bool includeCreatureFamilies = false) {
-    if (profileKey == "composite_armor_supply" ||
-            profileKey == "master_weaponsmith_staples" ||
-            profileKey == "high_damage_weapon_components") {
-        return resourceLabel == "copper" || resourceLabel == "iron";
-    }
+	if (profileKey == "composite_armor_supply") {
+		return resourceLabel == "copper" || resourceLabel == "iron" ||
+			(includeCreatureFamilies &&
+				(resourceLabel == "hide" || resourceLabel.beginsWith("hide_")));
+	}
+
+	if (profileKey == "master_weaponsmith_staples") {
+		return resourceLabel == "copper" || resourceLabel == "iron" ||
+			(includeCreatureFamilies &&
+				(resourceLabel == "bone" || resourceLabel.beginsWith("bone_")));
+	}
+
+	if (profileKey == "high_damage_weapon_components")
+		return resourceLabel == "copper" || resourceLabel == "iron";
 
 	if (profileKey == "chef_buff_foods" || profileKey == "chef_high_value_consumables") {
 		if (resourceLabel == "water")
@@ -11294,6 +11368,9 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 							// the selector would never reach, so evaluate the strict
 							// window first and fall back exactly as the selector does.
 							uint64 expectedYield = 0;
+							uint64 amountHideUnits = 0;
+							uint64 amountBoneUnits = 0;
+							uint64 amountMeatUnits = 0;
 							String lairTemplate;
 							int hunterLevel = identityIndex < identityLevels.size() ?
 								identityLevels.get(identityIndex) : 1;
@@ -11325,6 +11402,12 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 											lair.lairTemplate.compareTo(
 												lairTemplate) < 0)) {
 										expectedYield = amount;
+										amountHideUnits = lair.amountsByFamily.contains("hide") ?
+											lair.amountsByFamily.get("hide") : 0;
+										amountBoneUnits = lair.amountsByFamily.contains("bone") ?
+											lair.amountsByFamily.get("bone") : 0;
+										amountMeatUnits = lair.amountsByFamily.contains("meat") ?
+											lair.amountsByFamily.get("meat") : 0;
 										lairTemplate = lair.lairTemplate;
 									}
 								}
@@ -11342,6 +11425,9 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 							candidate.terminalOid = terminal.terminalOid;
 							candidate.terminal = terminal;
 							candidate.expectedYieldUnits = expectedYield;
+							candidate.amountHideUnits = amountHideUnits;
+							candidate.amountBoneUnits = amountBoneUnits;
+							candidate.amountMeatUnits = amountMeatUnits;
 							candidate.lairTemplate = lairTemplate;
 							candidate.pressure = signal.pressure;
 							candidate.demandProfileKey = demand.profileKey;
@@ -11426,6 +11512,12 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 				order.quota = huntQuotaSnapshot;
 				order.expectedYieldUnits = multiplyDemandFamilyUnits(
 					bestCandidate.expectedYieldUnits, huntQuotaSnapshot);
+				order.expectedHideUnits = multiplyDemandFamilyUnits(
+					bestCandidate.amountHideUnits, huntQuotaSnapshot);
+				order.expectedBoneUnits = multiplyDemandFamilyUnits(
+					bestCandidate.amountBoneUnits, huntQuotaSnapshot);
+				order.expectedMeatUnits = multiplyDemandFamilyUnits(
+					bestCandidate.amountMeatUnits, huntQuotaSnapshot);
 				order.marketTargetPlanet = bestCandidate.planet;
 				order.marketTargetCity = bestCandidate.city;
 				order.marketResourceType = bestCandidate.resourceType;
@@ -11448,13 +11540,9 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 			continue;
 		}
 
-		DemandFamilySignal& selectedSignal = demandResults.get(
-			bestCandidate.demandResultIndex).familySignals.get(
-			bestCandidate.signalIndex);
-		uint64 expectedYield = multiplyDemandFamilyUnits(
-			bestCandidate.expectedYieldUnits, huntQuotaSnapshot);
-		selectedSignal.signalUnits = selectedSignal.signalUnits <= expectedYield ?
-			0 : selectedSignal.signalUnits - expectedYield;
+		PveHuntOrder assignedOrder;
+		getPveHunterOrder(identity.id, assignedOrder);
+		decrementPveHuntFamilySignals(demandResults, assignedOrder);
 		assignedIdentityIds.add(identity.id);
 		{
 			Locker pveLock(&pveMutex);
@@ -11464,8 +11552,6 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 			pveMarketWinningQualityScore = bestCandidate.qualityScore;
 		}
 
-		PveHuntOrder assignedOrder;
-		getPveHunterOrder(identity.id, assignedOrder);
 		hunter->startOrder(assignedOrder, marketSpecies);
 		info("SimPveMarketHuntAssigned identity=" + String::valueOf(
 			identity.id) + " planet=" + bestCandidate.planet +
@@ -11614,6 +11700,15 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 					order.quota = huntQuotaSnapshot;
 					order.expectedYieldUnits =
 						bestCandidate.expectedYieldUnits;
+					order.expectedHideUnits = multiplyDemandFamilyUnits(
+						static_cast<uint64>(Math::max(0,
+							species.estimatedHideUnits)), huntQuotaSnapshot);
+					order.expectedBoneUnits = multiplyDemandFamilyUnits(
+						static_cast<uint64>(Math::max(0,
+							species.estimatedBoneUnits)), huntQuotaSnapshot);
+					order.expectedMeatUnits = multiplyDemandFamilyUnits(
+						static_cast<uint64>(Math::max(0,
+							species.estimatedMeatUnits)), huntQuotaSnapshot);
 					order.harvestedUnits = 0;
 					order.phase = "ANNOUNCE_JOB";
 					order.status = "ASSIGNED";
@@ -11633,12 +11728,9 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 				continue;
 			}
 
-			DemandFamilySignal& selectedSignal =
-				demandResults.get(bestCandidate.demandResultIndex).
-				familySignals.get(bestCandidate.signalIndex);
-			selectedSignal.signalUnits = selectedSignal.signalUnits <=
-				bestCandidate.expectedYieldUnits ? 0 :
-				selectedSignal.signalUnits - bestCandidate.expectedYieldUnits;
+			PveHuntOrder assignedOrder;
+			getPveHunterOrder(identity.id, assignedOrder);
+			decrementPveHuntFamilySignals(demandResults, assignedOrder);
 			assignedIdentityIds.add(identity.id);
 
 			Reference<SimPlayerController*> ctrl = controllers.contains(bodyOid) ?
@@ -11646,8 +11738,6 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 			SimHunterController* hunter = ctrl == nullptr ? nullptr :
 				dynamic_cast<SimHunterController*>(ctrl.get());
 			if (hunter != nullptr) {
-				PveHuntOrder assignedOrder;
-				getPveHunterOrder(identity.id, assignedOrder);
 				hunter->startOrder(assignedOrder, species);
 			}
 			info("SimPveHuntAssigned identity=" +
@@ -11780,6 +11870,15 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 				order.requestedResourceType = species.requestedResourceType;
 				order.harvestKind = species.harvestKind;
 				order.quota = pveHuntQuota;
+				order.expectedHideUnits = multiplyDemandFamilyUnits(
+					static_cast<uint64>(Math::max(0, species.estimatedHideUnits)),
+					pveHuntQuota);
+				order.expectedBoneUnits = multiplyDemandFamilyUnits(
+					static_cast<uint64>(Math::max(0, species.estimatedBoneUnits)),
+					pveHuntQuota);
+				order.expectedMeatUnits = multiplyDemandFamilyUnits(
+					static_cast<uint64>(Math::max(0, species.estimatedMeatUnits)),
+					pveHuntQuota);
 				order.phase = "ANNOUNCE_JOB";
 				order.status = "ASSIGNED";
 				pveHuntOrders.put(identity.id, order);
@@ -11848,21 +11947,46 @@ void SimPlayerManager::computeReservedInboundByProfileFamily(
 	sessionHarvestByFamily.removeAll();
 
 	Locker pveLock(&pveMutex);
+	Vector<DemandProfileDefinition> enabledProfiles;
+	Vector<DemandProfileDefinition> profiles =
+		createDemandProfileDefinitions();
+	for (int profileIndex = 0; profileIndex < profiles.size();
+			profileIndex++) {
+		const DemandProfileDefinition& profile = profiles.get(profileIndex);
+		if (demandStateSimulationProfileEnabled.contains(profile.key) &&
+				demandStateSimulationProfileEnabled.get(profile.key) == 0)
+			continue;
+
+		enabledProfiles.add(profile);
+	}
 
 	for (int i = 0; i < pveHuntOrders.size(); ++i) {
 		const PveHuntOrder& order = pveHuntOrders.elementAt(i).getValue();
-		String family = order.harvestKind.toLowerCase().trim();
+		for (int familyIndex = 0; familyIndex < 3; familyIndex++) {
+			String family = getPveCreatureFamily(familyIndex);
+			uint64 expectedUnits = getPveHuntOrderExpectedFamilyUnits(
+				order, family);
+			uint64 harvestedUnits = getPveHuntOrderHarvestedFamilyUnits(
+				order, family);
+			if (expectedUnits == 0 || expectedUnits <= harvestedUnits)
+				continue;
 
-		if (order.demandProfileKey.isEmpty() || family.isEmpty() ||
-				order.expectedYieldUnits <= order.harvestedUnits)
-			continue;
+			uint64 remaining = expectedUnits - harvestedUnits;
+			for (int profileIndex = 0; profileIndex < enabledProfiles.size();
+					profileIndex++) {
+				const DemandProfileDefinition& profile =
+					enabledProfiles.get(profileIndex);
+				if (!demandStateProfileUsesConceptualLabel(
+						profile.key, family, true))
+					continue;
 
-		uint64 remaining = order.expectedYieldUnits - order.harvestedUnits;
-		String key = order.demandProfileKey + "|" + family;
-		uint64 existing = reservedInboundByProfileFamily.contains(key) ?
-			reservedInboundByProfileFamily.get(key) : 0;
-		reservedInboundByProfileFamily.put(
-			key, addDemandFamilyUnits(existing, remaining));
+				String key = profile.key + "|" + family;
+				uint64 existing = reservedInboundByProfileFamily.contains(key) ?
+					reservedInboundByProfileFamily.get(key) : 0;
+				reservedInboundByProfileFamily.put(
+					key, addDemandFamilyUnits(existing, remaining));
+			}
+		}
 	}
 
 	for (int i = 0; i < pveSessionHarvestByFamily.size(); ++i)
@@ -11993,14 +12117,18 @@ bool SimPlayerManager::preparePveCreatureFamilySupply(
 void SimPlayerManager::recordPveHunterHarvest(uint64 identityId,
 		uint64 targetOid, const String& harvestKind,
 		const String& requestedResourceType) {
-	String normalizedHarvestKind = harvestKind.toLowerCase().trim();
-	if (normalizedHarvestKind != "hide" &&
-			normalizedHarvestKind != "bone" &&
-			normalizedHarvestKind != "meat") {
-		Locker pveLock(&pveMutex);
-		pveHunterHarvestMisses++;
-		return;
-	}
+	(void)harvestKind;
+
+	struct PveHunterHarvestFamily {
+		String family;
+		String resourceType;
+		int harvestAmount = 0;
+		bool deposited = false;
+	};
+
+	PveHunterHarvestFamily harvests[3];
+	for (int familyIndex = 0; familyIndex < 3; ++familyIndex)
+		harvests[familyIndex].family = getPveCreatureFamily(familyIndex);
 
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
 	ManagedReference<SceneObject*> targetObject = zoneServer == nullptr ? nullptr :
@@ -12009,120 +12137,133 @@ void SimPlayerManager::recordPveHunterHarvest(uint64 identityId,
 		targetObject->asAiAgent();
 	if (targetAgent == nullptr) {
 		Locker pveLock(&pveMutex);
-		pveHunterHarvestMisses++;
+		pveHunterHarvestMisses += 3;
 		return;
 	}
 
 	Zone* zone = targetAgent->getZone();
-	const CreatureTemplate* targetTemplate = nullptr;
-	String resourceType;
-	int harvestAmount = 3;
-	bool missingTemplate = false;
 	{
 		Locker targetLock(targetAgent);
-		targetTemplate = targetAgent->getCreatureTemplate();
-		if (targetTemplate == nullptr)
-			missingTemplate = true;
-
-		if (!missingTemplate && normalizedHarvestKind == "hide")
-			resourceType = targetTemplate->getHideType();
-		else if (!missingTemplate && normalizedHarvestKind == "bone")
-			resourceType = targetTemplate->getBoneType();
-		else if (!missingTemplate)
-			resourceType = targetTemplate->getMeatType();
-
+		const CreatureTemplate* targetTemplate =
+			targetAgent->getCreatureTemplate();
 		Creature* creature = cast<Creature*>(targetAgent);
-		if (!missingTemplate && creature != nullptr) {
-			if (normalizedHarvestKind == "hide")
-				harvestAmount = Math::max(3, (int)creature->getHideMax());
-			else if (normalizedHarvestKind == "bone")
-				harvestAmount = Math::max(3, (int)creature->getBoneMax());
-			else
-				harvestAmount = Math::max(3, (int)creature->getMeatMax());
+		if (targetTemplate != nullptr && creature != nullptr) {
+			harvests[0].resourceType = targetTemplate->getHideType();
+			harvests[0].harvestAmount =
+				static_cast<int>(creature->getHideMax());
+			harvests[1].resourceType = targetTemplate->getBoneType();
+			harvests[1].harvestAmount =
+				static_cast<int>(creature->getBoneMax());
+			harvests[2].resourceType = targetTemplate->getMeatType();
+			harvests[2].harvestAmount =
+				static_cast<int>(creature->getMeatMax());
 		}
 	}
 
-	(void)requestedResourceType;
-	if (missingTemplate || zone == nullptr || resourceType.isEmpty()) {
-		Locker pveLock(&pveMutex);
-		pveHunterHarvestMisses++;
-		return;
-	}
-
-	ManagedReference<ResourceManager*> resourceManager =
+	ManagedReference<ResourceManager*> resourceManager = zone == nullptr ||
+		zone->getZoneServer() == nullptr ? nullptr :
 		zone->getZoneServer()->getResourceManager();
-	ManagedReference<ResourceSpawn*> resourceSpawn = resourceManager == nullptr ?
-		nullptr : resourceManager->getCurrentSpawn(resourceType,
-		zone->getZoneName());
-	if (resourceSpawn == nullptr) {
-		Locker pveLock(&pveMutex);
-		pveHunterHarvestMisses++;
-		return;
-	}
-
-	uint64 spawnObjectId = resourceSpawn->getObjectID();
+	int harvestMisses = 0;
 	const String acquisitionOrigin = "pve_hunter";
-	String accumulatorKey = getSpawnYieldAccumulatorKey(
-		spawnObjectId, acquisitionOrigin);
-	{
-		Locker spawnLock(&spawnYieldAccumulatorMutex);
-		// Keep hunter and miner provenance in separate accumulators, even when
-		// both origins use the same active resource spawn. Only a fresh
-		// accumulator is populated from the spawn -
-		// with EVERY stat, not zeros (a lot with -1 stats corrupts the hive).
-		if (spawnYieldAccumulators.contains(accumulatorKey)) {
-			MinerSpawnYieldAccumulator existing =
-				spawnYieldAccumulators.get(accumulatorKey);
-			existing.sessionQuantity += harvestAmount;
-			existing.active = true;
-			spawnYieldAccumulators.put(accumulatorKey, existing);
-		} else {
-			MinerSpawnYieldAccumulator accumulator;
-			accumulator.resourceSpawnObjectId = spawnObjectId;
-			accumulator.acquisitionOrigin = acquisitionOrigin;
-			accumulator.resourceSpawnName = resourceSpawn->getName();
-			accumulator.resourceType = resourceSpawn->getType();
-			accumulator.resourceClassChain = resourceSpawn->getFinalClass();
-			accumulator.sourcePlanet = zone->getZoneName();
-			accumulator.sourceZone = zone->getZoneName();
-			accumulator.matchedDemandProfiles = requestedResourceType;
-			accumulator.active = true;
-			accumulator.sessionQuantity = harvestAmount;
-			accumulator.oq = getResourceAttribute(resourceSpawn, "res_quality");
-			accumulator.cd = getResourceAttribute(resourceSpawn, "res_conductivity");
-			accumulator.dr = getResourceAttribute(resourceSpawn, "res_decay_resist");
-			accumulator.hr = getResourceAttribute(resourceSpawn, "res_heat_resist");
-			accumulator.fl = getResourceAttribute(resourceSpawn, "res_flavor");
-			accumulator.ma = getResourceAttribute(resourceSpawn, "res_malleability");
-			accumulator.pe = getResourceAttribute(resourceSpawn, "res_potential_energy");
-			accumulator.sr = getResourceAttribute(resourceSpawn, "res_shock_resistance");
-			accumulator.ut = getResourceAttribute(resourceSpawn, "res_toughness");
-			accumulator.cr = getResourceAttribute(resourceSpawn, "res_cold_resist");
-			spawnYieldAccumulators.put(accumulatorKey, accumulator);
+	for (int familyIndex = 0; familyIndex < 3; ++familyIndex) {
+		PveHunterHarvestFamily& harvest = harvests[familyIndex];
+		if (resourceManager == nullptr || zone == nullptr ||
+				harvest.resourceType.isEmpty() || harvest.harvestAmount < 3) {
+			harvestMisses++;
+			continue;
 		}
+
+		ManagedReference<ResourceSpawn*> resourceSpawn =
+			resourceManager->getCurrentSpawn(harvest.resourceType,
+				zone->getZoneName());
+		if (resourceSpawn == nullptr) {
+			harvestMisses++;
+			continue;
+		}
+
+		uint64 spawnObjectId = resourceSpawn->getObjectID();
+		String accumulatorKey = getSpawnYieldAccumulatorKey(
+			spawnObjectId, acquisitionOrigin);
+		{
+			Locker spawnLock(&spawnYieldAccumulatorMutex);
+			// Keep hunter and miner provenance in separate accumulators, even when
+			// both origins use the same active resource spawn. Only a fresh
+			// accumulator is populated from the spawn -
+			// with EVERY stat, not zeros (a lot with -1 stats corrupts the hive).
+			if (spawnYieldAccumulators.contains(accumulatorKey)) {
+				MinerSpawnYieldAccumulator existing =
+					spawnYieldAccumulators.get(accumulatorKey);
+				existing.sessionQuantity += harvest.harvestAmount;
+				existing.active = true;
+				spawnYieldAccumulators.put(accumulatorKey, existing);
+			} else {
+				MinerSpawnYieldAccumulator accumulator;
+				accumulator.resourceSpawnObjectId = spawnObjectId;
+				accumulator.acquisitionOrigin = acquisitionOrigin;
+				accumulator.resourceSpawnName = resourceSpawn->getName();
+				accumulator.resourceType = resourceSpawn->getType();
+				accumulator.resourceClassChain = resourceSpawn->getFinalClass();
+				accumulator.sourcePlanet = zone->getZoneName();
+				accumulator.sourceZone = zone->getZoneName();
+				accumulator.matchedDemandProfiles = requestedResourceType;
+				accumulator.active = true;
+				accumulator.sessionQuantity = harvest.harvestAmount;
+				accumulator.oq = getResourceAttribute(resourceSpawn, "res_quality");
+				accumulator.cd = getResourceAttribute(resourceSpawn, "res_conductivity");
+				accumulator.dr = getResourceAttribute(resourceSpawn, "res_decay_resist");
+				accumulator.hr = getResourceAttribute(resourceSpawn, "res_heat_resist");
+				accumulator.fl = getResourceAttribute(resourceSpawn, "res_flavor");
+				accumulator.ma = getResourceAttribute(resourceSpawn, "res_malleability");
+				accumulator.pe = getResourceAttribute(resourceSpawn, "res_potential_energy");
+				accumulator.sr = getResourceAttribute(resourceSpawn, "res_shock_resistance");
+				accumulator.ut = getResourceAttribute(resourceSpawn, "res_toughness");
+				accumulator.cr = getResourceAttribute(resourceSpawn, "res_cold_resist");
+				spawnYieldAccumulators.put(accumulatorKey, accumulator);
+			}
+		}
+		harvest.deposited = true;
 	}
 
 	Locker pveLock(&pveMutex);
-	pveHunterHarvestUnitsTotal += harvestAmount;
-	String harvestedFamily = normalizedHarvestKind;
-	if (!harvestedFamily.isEmpty()) {
+	pveHunterHarvestMisses += harvestMisses;
+	uint64 totalHarvest = 0;
+	for (int familyIndex = 0; familyIndex < 3; ++familyIndex) {
+		PveHunterHarvestFamily& harvest = harvests[familyIndex];
+		if (!harvest.deposited)
+			continue;
+
+		uint64 harvestUnits = static_cast<uint64>(harvest.harvestAmount);
+		totalHarvest = addDemandFamilyUnits(totalHarvest, harvestUnits);
 		uint64 existingFamilyHarvest =
-			pveSessionHarvestByFamily.contains(harvestedFamily) ?
-			pveSessionHarvestByFamily.get(harvestedFamily) : 0;
-		pveSessionHarvestByFamily.put(
-			harvestedFamily,
-			addDemandFamilyUnits(
-				existingFamilyHarvest, static_cast<uint64>(harvestAmount)));
-	}
-	if (pveHuntOrders.contains(identityId)) {
+			pveSessionHarvestByFamily.contains(harvest.family) ?
+			pveSessionHarvestByFamily.get(harvest.family) : 0;
+		pveSessionHarvestByFamily.put(harvest.family,
+			addDemandFamilyUnits(existingFamilyHarvest, harvestUnits));
+
+		if (!pveHuntOrders.contains(identityId))
+			continue;
+
 		PveHuntOrder order = pveHuntOrders.get(identityId);
 		order.harvestedUnits = addDemandFamilyUnits(
-			order.harvestedUnits, static_cast<uint64>(harvestAmount));
+			order.harvestedUnits, harvestUnits);
+		if (harvest.family == "hide")
+			order.harvestedHideUnits = addDemandFamilyUnits(
+				order.harvestedHideUnits, harvestUnits);
+		else if (harvest.family == "bone")
+			order.harvestedBoneUnits = addDemandFamilyUnits(
+				order.harvestedBoneUnits, harvestUnits);
+		else if (harvest.family == "meat")
+			order.harvestedMeatUnits = addDemandFamilyUnits(
+				order.harvestedMeatUnits, harvestUnits);
 		pveHuntOrders.put(identityId, order);
 	}
+
+	pveHunterHarvestUnitsTotal = addDemandFamilyUnits(
+		pveHunterHarvestUnitsTotal, totalHarvest);
 	if (pveIdentities.contains(identityId)) {
 		SimBotIdentity& identity = pveIdentities.get(identityId);
-		identity.harvestUnits += harvestAmount;
+		identity.harvestUnits = addDemandFamilyUnits(
+			identity.harvestUnits, totalHarvest);
 		pveDirtyIdentityIds.put(identityId, true);
 	}
 }
@@ -13184,6 +13325,7 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	String baselineState = "pending";
 	String baselineLastError;
 	int baselineRetryCount = 0;
+	VectorMap<String, uint64> harvestByFamily;
 	{
 		Locker pveLock(&pveMutex);
 		for (int i = 0; i < pveIdentities.size(); ++i)
@@ -13214,6 +13356,7 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		hunterAbandonsTotal = pveHunterAbandonsTotal;
 		hunterHarvestUnitsTotal = pveHunterHarvestUnitsTotal;
 		hunterHarvestMisses = pveHunterHarvestMisses;
+		harvestByFamily = pveSessionHarvestByFamily;
 		hunterAnnouncementsTotal = pveHunterAnnouncementsTotal;
 		missionLairsSpawned = pveMissionLairsSpawned;
 		missionLairsCleaned = pveMissionLairsCleaned;
@@ -13322,6 +13465,11 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	result["hunterDeathsTotal"] = hunterDeathsTotal;
 	result["hunterAbandonsTotal"] = hunterAbandonsTotal;
 	result["hunterHarvestUnitsTotal"] = hunterHarvestUnitsTotal;
+	JSONSerializationType harvestByFamilyJson = JSONSerializationType::object();
+	for (int i = 0; i < harvestByFamily.size(); ++i)
+		harvestByFamilyJson[harvestByFamily.elementAt(i).getKey()] =
+			harvestByFamily.get(i);
+	result["harvestByFamily"] = harvestByFamilyJson;
 	result["hunterHarvestMisses"] = hunterHarvestMisses;
 	result["hunterAnnouncementsTotal"] = hunterAnnouncementsTotal;
 	result["missionHuntEnabled"] = missionHuntEnabled;

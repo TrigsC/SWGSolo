@@ -257,6 +257,12 @@ struct PveHuntOrder {
 	int missionAddsEngaged = 0;
 	uint64 expectedYieldUnits = 0;
 	uint64 harvestedUnits = 0;
+	uint64 expectedHideUnits = 0;
+	uint64 expectedBoneUnits = 0;
+	uint64 expectedMeatUnits = 0;
+	uint64 harvestedHideUnits = 0;
+	uint64 harvestedBoneUnits = 0;
+	uint64 harvestedMeatUnits = 0;
 	uint64 spawnsTriggeredNearby = 0;
 	String marketTargetPlanet;
 	String marketTargetCity;

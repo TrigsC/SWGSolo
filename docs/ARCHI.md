@@ -339,11 +339,24 @@ This is this fork's primary custom subsystem, layered on top of the stock
   only issues an order when a family's `signalUnits > 0`, i.e. accumulated supply is
   below its `effectiveCeiling` (`familyAllocationCeiling{Units,Fraction}` in the
   acquisition ledger). The fraction is an anti-domination cap for *multi-family*
-  profiles; since hunters supply a single family (`meat`), it is set to `1.0` so meat
-  can fill its profile's true `desiredReserve` — a lower cap silently strands the
-  whole roster once supply crosses it (F_0.5.0 saturation fix). With no meat
-  *consumer* yet, meat still re-saturates at the reserve target; a consumption side is
-  the documented next economy phase.
+  profiles, set to `1.0` per family so each can fill its profile's true
+  `desiredReserve` — a lower cap silently strands the whole roster once supply
+  crosses it (F_0.5.0 saturation fix). As of **F_0.6.0** hunters supply **three
+  creature families** — `hide`, `bone`, and `meat` — not meat alone: each kill
+  credits all three via a single target-lock in `recordPveHunterHarvest`
+  (per-family deposit gated at `harvestAmount >= 3`), demand for hide/bone is
+  recognized by extending existing profiles in `demandStateProfileUsesConceptualLabel`
+  (`composite_armor_supply`→`hide*`, `master_weaponsmith_staples`→`bone*`), and a
+  hunt reserves the expected units of **all three** families on accept
+  (`computeReservedInboundByProfileFamily` iterates enabled profiles × 3 families;
+  both matchmaker paths run a shared intra-pass multi-family signal decrement so a
+  single pass never over-dispatches a family). Effect: meat saturation alone can no
+  longer idle the whole roster — pressure spreads across families. This is a
+  **demand-spread** slice only: `consumeReservation` still does **not** drain
+  `familySupply` in-session (supply = immutable boot baseline + monotonic
+  `pveSessionHarvestByFamily`), so with no family *consumer* yet each family still
+  re-saturates at its reserve target. An in-session consumer that closes the drain
+  loop remains the documented next economy phase (same accepted debt as meat).
   Hunter-opt-in navmesh/overland hybrid movement (`usesNavmeshHybridMovement()`,
   base false so miners/PvP are unchanged): navmesh inside cities, overland in the
   wild. Bodies spawn `PLAYER | ATTACKABLE` and force faction 0 so wildlife fights

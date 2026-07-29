@@ -731,18 +731,18 @@ SimPlayerManagerConfig = {
             -- gate requires a process restart.
             minerCreatureResourceExclusion = true,
             creatureResourceClassMarkers = { "creature_resources" },
-            creatureFamilies = { "meat" },
-            familyReserveTargets = { meat = 2500 },
+            creatureFamilies = { "meat", "hide", "bone" },
+            familyReserveTargets = { meat = 2500, hide = 2500, bone = 2500 },
             familyReserveCap = 5000,
-            familyAllocationCeilingUnits = { meat = 0 },
-            -- meat is the ONLY family hunters supply, so the anti-domination
-            -- 0.25 cap (meant for multi-family profiles) permanently starved the
-            -- dispatcher once accumulated meat crossed 25% of desiredReserve:
-            -- headroom hit 0 -> signalUnits 0 -> pressure 0 -> no hunt orders.
-            -- 1.0 lets meat fill its profile's true target (no re-saturation
-            -- until desiredReserve is actually met). Revisit if a second hunter
-            -- family or a meat consumer is added. (2026-07-28)
-            familyAllocationCeilingFraction = { meat = 1.0 },
+            familyAllocationCeilingUnits = { meat = 0, hide = 0, bone = 0 },
+            -- Each creature family has its own reserve-driven demand signal.
+            -- A full 1.0 fraction prevents the multi-family anti-domination
+            -- fallback from starving any one family before its reserve is met.
+            familyAllocationCeilingFraction = {
+                meat = 1.0,
+                hide = 1.0,
+                bone = 1.0,
+            },
             reservePressureFloor = 25,
             huntTimeEstimateSeconds = 600,
             baselineRetryBackoffMs = 5000,
