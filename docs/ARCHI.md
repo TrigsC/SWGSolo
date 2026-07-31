@@ -241,6 +241,20 @@ unfamiliar change:
 - Convention: Lua is the default location for anything tunable or
   frequently-iterated; C++ is for structural/performance-critical logic
   only.
+- **Safe Lua↔C++ object wrapping (crash class).** A Lua wrapper constructor
+  like `AiAgent(pObj)` / `LuaAiAgent(pObj)` `dynamic_cast`s the underlying
+  scene object; in a debug build (`DYNAMIC_CAST_LUAOBJECTS`) wrapping an object
+  that is not that concrete type fires `E3_ASSERT` in `*::_setObject` →
+  `abort()`, which **`pcall`/`safeCall` cannot catch** (it is a process signal,
+  not a Lua error); a release build produces a mis-typed pointer (UB). Never
+  wrap a possibly-wrong-type object — always gate first with a safe virtual
+  predicate that takes no cast: `SceneObject(pObj):isCreatureObject()` /
+  `:isAiAgent()`. Type-specific reads that live only on `LuaAiAgent` should be
+  mirrored onto `LuaCreatureObject` using the native safe cast
+  `CreatureObject::asAiAgent()` (returns `nullptr` for non-agents) so callers
+  never need the `AiAgent()` wrap — e.g. `LuaCreatureObject::isSimPlayerBot`
+  (F_0.7.2), which fixed a SIGABRT when a real player's spatial chat reached a
+  buffer NPC's `isSimPlayerBot` gate.
 
 ## 11. Web/REST Layer (AI-Economy Dashboard)
 

@@ -31,7 +31,10 @@ function SmartEntertainerHelper.isValidAudienceMember(pPlayer, pEntertainer, ran
     local isAcceptedAudienceMember = okPlayer and isPlayer == true
     if not isAcceptedAudienceMember then
         local okSimBot, isSimBot = pcall(function()
-            return AiAgent(pPlayer):isSimPlayerBot()
+            if not SceneObject(pPlayer):isCreatureObject() then
+                return false
+            end
+            return CreatureObject(pPlayer):isSimPlayerBot()
         end)
         isAcceptedAudienceMember = okSimBot and isSimBot == true
     end

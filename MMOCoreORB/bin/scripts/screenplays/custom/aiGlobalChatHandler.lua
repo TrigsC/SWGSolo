@@ -483,7 +483,11 @@ function AiGlobalChatHandler:notifySpatialChatSent(pPlayer, pChatMessage, nothin
                     safeCall(nil, function() CreatureObject(pTarget):doAnimation(skillData.animation) end)
                 end
                 if type(skillData) == "table" and skillData.cpp_function == "healCreatureTarget" then
-                    safeCall(nil, function() LuaAiAgent(pTarget):healCreatureTarget(pPlayer) end)
+                    safeCall(nil, function()
+                        if SceneObject(pTarget):isAiAgent() then
+                            LuaAiAgent(pTarget):healCreatureTarget(pPlayer)
+                        end
+                    end)
                 end
             end
         end

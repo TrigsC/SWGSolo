@@ -415,6 +415,16 @@ list), so a hunter is never left unbuffed.
 credit bypass is scoped to `getSimPlayerBot()` (real players still pay and are
 never buffed for free). No inventory/market/persistence mutation.
 
+**Buffer-chat crash hardening.** The P.8.6 buffer-chat integration briefly
+introduced a SIGABRT when a real player's spatial chat reached the doctor
+handler: `AiAgent(pObj):isSimPlayerBot()` asserts for non-agents in debug builds
+and is an invalid cast in release builds. Lua buffer helpers must first use the
+safe `SceneObject(...):isCreatureObject()` predicate, then call
+`CreatureObject(...):isSimPlayerBot()`. The C++ binding resolves the underlying
+agent through `asAiAgent()` and returns false for non-agents. Any operation that
+still requires a `LuaAiAgent(...)` wrapper must first pass a safe
+`SceneObject(...):isAiAgent()` check.
+
 **Live verification (owner restart with `realBuffs.enabled=true`).** Dashboard
 `pveActivity.realBuffs` counters climb (`doctorInteractions`, `dancerWatches`,
 `musicianListens`, `buffDetoursSkipped`, `syntheticFallbacks`) and roster rows

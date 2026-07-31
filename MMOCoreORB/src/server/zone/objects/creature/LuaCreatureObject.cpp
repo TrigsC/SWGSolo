@@ -7,6 +7,7 @@
 
 #include "LuaCreatureObject.h"
 #include "server/zone/objects/creature/CreatureObject.h"
+#include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/creature/ai/DroidObject.h"
 #include "server/zone/objects/cell/CellObject.h"
 #include "server/zone/objects/player/sessions/ConversationSession.h"
@@ -97,6 +98,7 @@ Luna<LuaCreatureObject>::RegType LuaCreatureObject::Register[] = {
 		{ "getLastName", &LuaCreatureObject::getLastName},
 		{ "setLastName", &LuaCreatureObject::setLastName},
 		{ "isAiAgent", &LuaCreatureObject::isAiAgent},
+		{ "isSimPlayerBot", &LuaCreatureObject::isSimPlayerBot},
 		{ "setFactionRank", &LuaCreatureObject::setFactionRank},
 		{ "getFactionRank", &LuaCreatureObject::getFactionRank},
 		{ "getCashCredits", &LuaCreatureObject::getCashCredits},
@@ -791,6 +793,14 @@ int LuaCreatureObject::isAiAgent(lua_State* L) {
 	bool val = realObject->isAiAgent();
 
 	lua_pushboolean(L, val);
+
+	return 1;
+}
+
+int LuaCreatureObject::isSimPlayerBot(lua_State* L) {
+	AiAgent* agent = realObject != nullptr ? realObject->asAiAgent() : nullptr;
+
+	lua_pushboolean(L, agent != nullptr && agent->getSimPlayerBot());
 
 	return 1;
 }

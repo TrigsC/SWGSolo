@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.7.2` | 3 | fix: F_0.7.2 doctor/entertainer buffer player-chat crash — safe CreatureObject:isSimPlayerBot binding + guarded Lua buffer helpers (real-player buff no longer SIGABRTs the zone) |
 | `0.7.0` | 3 | F_0.7.0 P.6.6 + F_0.7.1 P.6.6b: PvP controller-driven combat engagement (100m scan, cell-aware approach, LOS/weapon-range engage-and-hold, no-stacking, traversal-wins, world-NPC drag-in + passive-death fixes) + squad aggro-sharing (idle squadmates converge on a teammate's fight); all gates default-off |
 | `0.6.0` | 3 | F_0.6.0 P.8.8: multi-family hunter demand — hunters credit hide/bone/meat per kill so demand spreads across families and meat saturation no longer idles the roster; reserve-all-three on accept + shared intra-pass multi-family signal decrement; harvestByFamily dashboard |
 | `0.5.0` | 3 | F_0.5.0 P.8.7: market-driven mission hunting — real destroy missions, galactic travel, 3-wave lairs; terminal-visit epoch + atomic tick concurrency; bounded offer-retry; meat allocation-ceiling saturation fix |
@@ -17,6 +18,11 @@
 
 # Changelog Summary
 
+- **v0.7.2 (Doctor/Entertainer Buffer Player-Chat Crash Fix, F_0.7.2 - Week 3, 31-07-2026)**:
+  - **Fix**: speaking a buff request to the Smart Doctor Buffer as a **real player** hard-crashed the zone (SIGABRT). The P.8.6 buffer→bot buff work wrapped the *speaker* as `AiAgent(pObj)`; for a non-agent player this tripped the debug assertion in `LuaAiAgent::_setObject` → `abort()`, which `pcall` cannot catch.
+  - **C++ (defense-in-depth)**: `LuaCreatureObject` now exposes `isSimPlayerBot()` via the native safe cast `CreatureObject::asAiAgent()` (returns `nullptr`/`false` for non-agents — no `dynamic_cast`, no assertion), so Lua never needs to wrap `AiAgent()` to test the flag.
+  - **Lua**: `smartDoctorBuffer.lua` (crash site), `smart_entertainer_helper.lua` (latent), and `aiGlobalChatHandler.lua` (heal wrap guarded by `isAiAgent()`) adopt the `isCreatureObject()`-guarded `CreatureObject:isSimPlayerBot()`. Bot behavior identical; players/non-creatures resolve to `false` and negotiate normally.
+  - **Verification**: owner-attested live PASS (real-player doctor buff, no SIGABRT, no `gdb.log`, `core3` alive, dashboard live). A separate **pre-existing** bot→doctor buff-trip fallback anomaly was observed and deferred to its own diagnosis (not a regression of this change). `engine3` submodule excluded per standing policy.
 - **v0.7.0 (PvP Controller-Driven Combat + Squad Aggro-Sharing, F_0.7.0 P.6.6 / F_0.7.1 P.6.6b - Week 3, 31-07-2026)**:
   - **Feature (P.6.6)**: replaces emergent stock-tree PvP combat with a full **controller-driven engagement pipeline** on `SimPvpBotController` — ~100 m scan, cell-aware approach (portal graph, no clipping through starports), engage-and-hold at weapon range with LOS enforced by stock combat, no-stacking, and a dynamically-swapped `simPvpCombat` no-op-MOVE AI map so the stock tree never double-drives movement. **P.6.6a**: `isInteriorTraversalActive()` suppresses combat while a member is mid-starport-traversal (traversal wins). **Fix A**: a shared eligibility helper keeps ordinary NPCs on stock self-defense (no world-NPC drag-in). **Fix B**: an in-range bot engages-and-holds under LOS loss (LOS is telemetry-only) instead of clearing combat and dying passively.
   - **Feature (P.6.6b)**: default-off **squad aggro-sharing** — idle squadmates converge on a teammate's fight over the same cell-aware lane via a TTL-refreshed per-squad shared-enemy set (`pvpSquadMutex`, agent locks outside it), a convergence-specific radius (300 m) and timeout (60 s), and failed-target suppression; self-limiting on target death/departure.

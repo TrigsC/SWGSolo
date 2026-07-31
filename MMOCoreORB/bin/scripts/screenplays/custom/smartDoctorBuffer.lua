@@ -243,7 +243,10 @@ local function isSimPlayerBot(pObj)
     if pObj == nil then return false end
 
     local ok, isSimBot = pcall(function()
-        return AiAgent(pObj):isSimPlayerBot()
+        if not SceneObject(pObj):isCreatureObject() then
+            return false
+        end
+        return CreatureObject(pObj):isSimPlayerBot()
     end)
 
     return ok and isSimBot == true

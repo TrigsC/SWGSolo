@@ -78,6 +78,7 @@ namespace creature {
 		int getLastName(lua_State* L);
 		int setLastName(lua_State* L);
 		int isAiAgent(lua_State* L);
+		int isSimPlayerBot(lua_State* L);
 		int setFactionRank(lua_State* L);
 		int getFactionRank(lua_State* L);
 		int getCashCredits(lua_State* L);
