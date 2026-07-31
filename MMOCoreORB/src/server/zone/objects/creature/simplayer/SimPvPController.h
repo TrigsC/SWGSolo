@@ -69,8 +69,49 @@ protected:
 	// deliberately unfiltered.
 	uint64 stalemateIgnoredOid;
 	uint64 stalemateIgnoreUntilMs;
+	// P.6.6: controller-owned engagement state. The target is retained across
+	// combat-cleared approach ticks; the normal route is preserved so teardown
+	// can hand movement back to the city-loop controller.
+	ManagedReference<CreatureObject*> controllerCombatTarget;
+	Vector3 combatApproachTargetPosition;
+	Vector3 combatResumeDestination;
+	Vector3 combatResumeLocalDestination;
+	ManagedReference<CellObject*> combatResumeCell;
+	uint64 combatApproachStartedAtMs;
+	bool combatApproachActive;
+	bool combatHolding;
+	bool combatLosBlocked;
+	bool combatIsConvergenceTarget;
+	uint64 lastSquadAggroPublishMs;
+	uint64 failedSharedTargetOid;
+	uint64 failedSharedTargetIgnoreUntilMs;
+	bool combatHybridMovementActive;
+	bool combatAiMapInstalled;
+	uint32 combatBaseAiMapHash;
+	bool hasCombatResumeDestination;
+	uint64 combatLosBlockedAttacks;
 
 	void resetStalemateProgress();
+	virtual bool isControllerDrivenEngageParticipant() const { return false; }
+	virtual uint32 getControllerCombatBaseAiMapHash() const { return 0; }
+	// P.6.6: true while the derived controller is running a starport interior
+	// traversal leg (arrival-exit / collector-departure). The controller combat
+	// lane stands down during traversal so the two movement drivers never
+	// deadlock.
+	virtual bool isInteriorTraversalActive() const { return false; }
+	void acquireControllerCombatTarget(CreatureObject* target);
+	void swapCombatAiMap(bool engaged, uint32 baseAiMapHash);
+	void teardownControllerEngagement(const String& reason,
+		bool resumeRoute = true);
+	void approachTarget(CreatureObject* target);
+	void engageHeldTarget(CreatureObject* target);
+	bool hasCombatLineOfSight(CreatureObject* target) const;
+	// A valid PvP combat target: a player, or (when bot-vs-bot is enabled) another
+	// sim PvP bot. Ordinary world NPCs are excluded so squads are never dragged
+	// into world-NPC fights via scan OR defender adoption.
+	bool isEligiblePvpCombatTarget(CreatureObject* target) const;
+	float currentWeaponEngageRange() const;
+	void driveCombatMovement();
 
 public:
 	// P.6.5e: full stalemate reset (progress + ignore pair) for teleport
@@ -95,12 +136,31 @@ public:
 	// in combat, otherwise scans for attackable enemies.
 	void onTick() override;
 	void prepareForRelocation(const String& reason) override;
+	uint32 nextArrivalDelayMillis(uint32 defaultMs) override;
+	bool usesNavmeshHybridMovement() const override {
+		return combatHybridMovementActive;
+	}
+	bool hasControllerCombatTarget() const {
+		return controllerCombatTarget != nullptr;
+	}
+	bool isControllerCombatApproachActive() const {
+		return controllerCombatTarget != nullptr && combatApproachActive;
+	}
+	bool isControllerCombatEngagementInRange() const;
+	bool isControllerCombatInCellEngagement() const;
+	bool isControllerCombatLosBlocked() const {
+		return controllerCombatTarget != nullptr && combatLosBlocked;
+	}
+	uint64 getControllerCombatLosBlockedAttacks() const {
+		return combatLosBlockedAttacks;
+	}
+	String getControllerCombatSubState() const;
 
 	// Scan CloseObjects for an enemy to engage: overt enemy-faction players
 	// always; enemy sim bots only behind pvpConfig.allowBotVsBotCombat.
 	// Engagement mirrors the proven lock choreography (agent lock, cross-lock
 	// target, setTargetObject/addDefender/setCombatState).
-	void scanForTargets();
+	void scanForTargets(CreatureObject* sharedFallback = nullptr);
 
 	virtual const char* getPvpRoleName() const = 0;
 	virtual String getPvpPhaseName() const = 0;
@@ -158,6 +218,13 @@ public:
 	// vs its phase target so we can see (from the log alone) whether the tick
 	// chain is alive, which way it walks, and whether patrol points are fed.
 	void onTick() override;
+	bool isControllerDrivenEngageParticipant() const override { return true; }
+	uint32 getControllerCombatBaseAiMapHash() const override {
+		return String("simPvp").hashCode();
+	}
+	bool isInteriorTraversalActive() const override {
+		return arrivalExitActive || collectorDepartureActive;
+	}
 
 	const char* getPvpRoleName() const override { return "pvp_leader"; }
 	String getPvpPhaseName() const override;
@@ -224,6 +291,12 @@ private:
 	Vector3 arrivalOutdoor;
 	int arrivalExitAttempts = 0;
 	bool arrivalExitReenter = false;
+	bool arrivalExitInteriorPath = false;
+	// P.6.6 Major-5: only true once the bot is actually observed inside a
+	// starport cell during the exit, so the traversal diagnostic reports a real
+	// interior run rather than mere interior-path INTENT (a snap/clip that never
+	// adopted a cell is recorded as a fallback, not "interior").
+	bool arrivalExitEnteredCell = false;
 	Vector3 hangoutLocation;
 	// Consecutive path failures for the current movement phase; bounded, then
 	// the phase is forced forward instead of retrying forever.
@@ -249,14 +322,19 @@ public:
 	virtual ~SimPvPMemberController();
 
 	// Starts the 1s arrival-check/onTick chain and asserts the follow. The
-	// member never calls moveTo(); the FOLLOW behavior trees own movement, so
-	// there is no dual-driver by construction.
+	// member normally follows the leader; controller-driven combat temporarily
+	// owns movement through the shared combat lane.
 	void startSimLoop() override;
 	void onArrived() override;
 	void beginArrivalExit(const Vector3& outdoorArrival);
 	void abandonArrivalExit(const String& reason);
 	void onPathFailed() override;
 	void onTick() override;
+	bool isControllerDrivenEngageParticipant() const override { return true; }
+	uint32 getControllerCombatBaseAiMapHash() const override { return 0; }
+	bool isInteriorTraversalActive() const override {
+		return arrivalExitActive;
+	}
 
 	// Point the member at (a possibly new) leader and put it back into
 	// FOLLOWING. Idempotent; used at spawn, after boarding, after combat and
@@ -269,6 +347,12 @@ private:
 	Vector3 arrivalOutdoor;
 	int arrivalExitAttempts = 0;
 	bool arrivalExitReenter = false;
+	bool arrivalExitInteriorPath = false;
+	// P.6.6 Major-5: only true once the bot is actually observed inside a
+	// starport cell during the exit, so the traversal diagnostic reports a real
+	// interior run rather than mere interior-path INTENT (a snap/clip that never
+	// adopted a cell is recorded as a fallback, not "interior").
+	bool arrivalExitEnteredCell = false;
 
 	const char* getPvpRoleName() const override { return "pvp_member"; }
 	String getPvpPhaseName() const override { return "following"; }

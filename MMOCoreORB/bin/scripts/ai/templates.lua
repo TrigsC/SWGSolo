@@ -52,6 +52,13 @@ customMap = {
 		{IDLE, "idleSimPvp"}
 	}},
 
+	-- Installed only for the duration of controller-driven combat. The MOVE
+	-- socket is a no-op; every other socket falls back to rootDefault.
+	{ "simPvpCombat", {
+		{IDLE, "idleSimPvp"},
+		{MOVE, "moveNoopSimPvp"}
+	}},
+
 	-- P.8.1 solo hunters: controller owns movement; default combat slots
 	-- remain inherited so the equipped rifle is actually used.
 	{ "simHunter", {

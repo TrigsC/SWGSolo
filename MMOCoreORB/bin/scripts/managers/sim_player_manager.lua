@@ -1130,6 +1130,30 @@ SimPlayerManagerConfig = {
         squadsPerFaction = 3,           -- owner-approved starting population
         squadSize = 4,                  -- leader + 3 followers
         scanRadiusMeters = 64,          -- how close before a bot ENGAGES
+        -- P.6.6 controller-driven engagement is deliberately opt-in. The
+        -- controller owns only combat approach/engage movement while this
+        -- gate is true; all existing PvP behavior remains unchanged by
+        -- default.
+        combat = {
+            controllerDrivenEngage = false,
+            -- P.6.6b squad combat contagion is independently gated. Keep it
+            -- off until the owner enables the live convergence soak.
+            squadAggroSharing = false,
+            squadAggroConvergeRadiusMeters = 300,
+            squadAggroConvergeTimeoutMillis = 60000, -- ~300m at run speed; a
+                                                     -- far squadmate needs time
+            squadAggroTargetTtlSeconds = 8,
+            squadAggroFailedTargetIgnoreSeconds = 10,
+            approachRadiusMeters = 100,
+            reapproachHysteresisMeters = 8,
+            arrivalToleranceMeters = 4,
+            approachTimeoutMillis = 15000,
+            losGateDamage = true,
+            allowInCellEngage = true,
+            combatTickMillis = 500,
+            fallbackWeaponRangeMeters = 64,
+            logCombatMovement = false,
+        },
         -- Disengage distance: a bot in combat whose target flees beyond this
         -- (just above effective ranged weapon range) drops combat instead of
         -- chasing/attacking across the map at 100m+. Also caps stalemates.

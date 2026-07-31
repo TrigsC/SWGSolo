@@ -991,8 +991,29 @@ void SimPlayerController::queueMorePathNodes() {
 void SimPlayerController::checkArrival() {
     if (agent == nullptr || agent->getZone() == nullptr) return;
 
-    onTick(); 
-    
+    // P.6.6: onTick may itself re-drive the work loop (the PvP combat lane issues
+    // a fresh moveTo/engage/teardown), each of which advances the generation and
+    // arranges its own continuation (moveTo -> SimPathFindTask -> onPathFound, or
+    // engage/teardown set IDLE for the successor scheduled below). If that
+    // happened, running the rest of checkArrival against this now-stale snapshot
+    // would fork a SECOND arrival chain on the same generation (ArrivalCheckTask
+    // only rejects stale-generation tasks, not duplicates). Mirror the onArrived
+    // tail instead: schedule exactly one successor and stop. For every existing
+    // controller onTick is a no-op / pure scan and never advances the generation,
+    // so this path is byte-for-byte unchanged for them.
+    uint64 preTickGeneration = getWorkLoopGeneration();
+    onTick();
+    if (getWorkLoopGeneration() != preTickGeneration) {
+        // CALCULATING_PATH means a moveTo is in flight and onPathFound owns the
+        // next schedule; anything else (engage/teardown left IDLE) needs one here.
+        if (state != CALCULATING_PATH && shouldContinueArrivalChecks()) {
+            Reference<ArrivalCheckTask*> task =
+                new ArrivalCheckTask(this, getWorkLoopGeneration());
+            task->schedule(nextArrivalDelayMillis(1000));
+        }
+        return;
+    }
+
     Locker locker(agent);
 
     bool diagnostic = isCellNavDiagAgent(agent.get());
@@ -1060,7 +1081,7 @@ void SimPlayerController::checkArrival() {
         locker.release();
         Reference<ArrivalCheckTask*> task =
             new ArrivalCheckTask(this, getWorkLoopGeneration());
-        task->schedule(1000);
+        task->schedule(nextArrivalDelayMillis(1000));
         return;
     }
 
@@ -1074,7 +1095,7 @@ void SimPlayerController::checkArrival() {
         locker.release();
         Reference<ArrivalCheckTask*> task =
             new ArrivalCheckTask(this, getWorkLoopGeneration());
-        task->schedule(1000); 
+        task->schedule(nextArrivalDelayMillis(1000));
         return;
     }
 
@@ -1142,7 +1163,7 @@ void SimPlayerController::checkArrival() {
         moveTo(resumeDestination, resumeLocalDestination, resumeCell.get());
         Reference<ArrivalCheckTask*> task =
             new ArrivalCheckTask(this, getWorkLoopGeneration());
-        task->schedule(1000);
+        task->schedule(nextArrivalDelayMillis(1000));
         return;
     }
 
@@ -1158,7 +1179,7 @@ void SimPlayerController::checkArrival() {
 
         Reference<ArrivalCheckTask*> task =
             new ArrivalCheckTask(this, getWorkLoopGeneration());
-        task->schedule(1000);
+        task->schedule(nextArrivalDelayMillis(1000));
         return;
     }
 
@@ -1294,7 +1315,7 @@ void SimPlayerController::checkArrival() {
         if (shouldContinueArrivalChecks()) {
             Reference<ArrivalCheckTask*> task =
                 new ArrivalCheckTask(this, getWorkLoopGeneration());
-            task->schedule(1000);
+            task->schedule(nextArrivalDelayMillis(1000));
         }
 
         return;
@@ -1388,7 +1409,7 @@ void SimPlayerController::checkArrival() {
     locker.release();
     Reference<ArrivalCheckTask*> task =
         new ArrivalCheckTask(this, getWorkLoopGeneration());
-    task->schedule(500);
+    task->schedule(nextArrivalDelayMillis(500));
 }
 
 bool SimPlayerController::pickDestinationInNavMesh(Zone* zone, const Vector3& currentPos, Vector3& out, int minSearchRadius, int maxSearchRadius) {

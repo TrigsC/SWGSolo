@@ -944,6 +944,16 @@ public:
 		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 	};
 
+	// P.6.6b: an enemy OID and its last refresh time shared by squadmates. The
+	// row owns only in-memory combat contact state; it is not persisted.
+	struct SimPvpSharedCombatTarget {
+		uint64 enemyOid = 0;
+		uint64 lastRefreshMs = 0;
+
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+
 	// P.6.1 SimPvP squads: a persistent roster (leader + followers) that runs
 	// player-mimetic starport loops and travels between cities via the proven
 	// switchZone outdoor reposition. Gated by pvpConfig.enablePvpBots.
@@ -953,6 +963,7 @@ public:
 		int desiredSize = 1;
 		uint64 leaderOid = 0;
 		Vector<uint64> memberOids;      // live followers (leader excluded)
+		Vector<SimPvpSharedCombatTarget> sharedCombatTargets;
 		int pendingReplacements = 0;    // dead slots refilled at next city
 		String planet;
 		String city;
@@ -1009,6 +1020,19 @@ public:
 		String routeDestPlanet;
 		String routeDestCity;
 		int routeLegsTotal = 0;
+		// P.6.6 diagnostic-only collector traversal evidence. A run covers the
+		// leader plus the live members that were placed at the destination
+		// collector; replacements spawned at the outdoor pad are not included.
+		bool starportTraversalActive = false;
+		int starportTraversalExpected = 0;
+		int starportTraversalInterior = 0;
+		int starportTraversalFallback = 0;
+		int starportTraversalRuns = 0;
+		int starportTraversalFullRuns = 0;
+		uint64 starportTraversalLastRunMs = 0;
+		String starportTraversalLastStatus = "none";
+		Vector<uint64> starportTraversalParticipantOids;
+		Vector<uint64> starportTraversalRecordedOids;
 
 		// Satisfy Vector/TypeInfo template instantiation
 		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
@@ -1867,6 +1891,25 @@ private:
 	int pvpSquadsPerFaction = 1;
 	int pvpSquadSize = 4;
 	float pvpScanRadiusMeters = 40.f;
+	// P.6.6 controller-driven combat engagement. The rollout is fail-closed;
+	// Lua pvpConfig.combat supplies the live values when explicitly enabled.
+	bool pvpControllerDrivenEngage = false;
+	// P.6.6b squad aggro sharing is independently gated so the P.6.6 combat
+	// lane remains behaviorally unchanged when the feature is off.
+	bool pvpSquadAggroSharing = false;
+	float pvpSquadAggroConvergeRadiusMeters = 300.f;
+	int pvpSquadAggroConvergeTimeoutMillis = 60000;
+	int pvpSquadAggroTargetTtlSeconds = 8;
+	int pvpSquadAggroFailedTargetIgnoreSeconds = 10;
+	float pvpCombatApproachRadiusMeters = 100.f;
+	float pvpCombatReapproachHysteresisMeters = 8.f;
+	float pvpCombatArrivalToleranceMeters = 4.f;
+	int pvpCombatApproachTimeoutMillis = 15000;
+	bool pvpCombatLosGateDamage = false;
+	bool pvpCombatAllowInCellEngage = false;
+	uint32 pvpCombatTickMillis = 0;
+	float pvpCombatFallbackWeaponRangeMeters = 64.f;
+	bool pvpCombatLogMovement = false;
 	// Disengage distance: a bot in combat whose target has fled beyond this
 	// (or died/left) drops combat instead of chasing across the map. Sits just
 	// above effective ranged weapon range (~64m) so real fights aren't cut off
@@ -1943,6 +1986,7 @@ private:
 	int pvpDeathsTotal = 0;
 	int pvpPlayerEngagementsTotal = 0;
 	int pvpBotEngagementsTotal = 0;
+	int pvpCombatConvergencesTotal = 0;
 	int pvpRecoveryActionsTotal = 0;
 	int pvpPromotionsTotal = 0;
 	int pvpSquadReformsTotal = 0;
@@ -2479,7 +2523,18 @@ public:
 		PvpDepartureTarget& target);
 	// Called (once per life) by SimPvpBotController when a bot dies.
 	void onPvpBotDied(uint64 squadId, uint64 oid);
+	void beginPvpStarportTraversalDiagnostic(uint64 squadId,
+		const Vector<uint64>& participantOids);
+	void recordPvpStarportTraversalParticipant(uint64 squadId, uint64 oid,
+		const String& result);
 	void recordPvpEngagement(uint64 squadId, bool targetWasPlayer);
+	// P.6.6b: publish/query the squad's short-lived shared combat contacts.
+	// Query liveness is resolved after the squad mutex is released; callers
+	// must never hold pvpSquadMutex while locking an agent.
+	void recordPvpSquadCombatTarget(uint64 squadId, uint64 enemyOid);
+	void getPvpSquadSharedCombatTargets(uint64 squadId, uint64 excludeOid,
+		Vector<uint64>& outLiveOids);
+	void recordPvpSquadConvergence(uint64 squadId);
 	void recordPvpStalemateBreak(uint64 squadId, uint64 oid,
 		uint64 defenderOid, uint64 idleMs);
 	// P.6.2: called (throttled) by a report-only scout's scan on contact.
@@ -2528,6 +2583,33 @@ public:
 
 	// Read-only pvpConfig accessors for the controllers (runtime-refreshed).
 	float getPvpScanRadiusMeters() const { return pvpScanRadiusMeters; }
+	bool isPvpControllerDrivenEngageEnabled() const { return pvpControllerDrivenEngage; }
+	bool isPvpSquadAggroSharingEnabled() const { return pvpSquadAggroSharing; }
+	float getPvpSquadAggroConvergeRadiusMeters() const {
+		return pvpSquadAggroConvergeRadiusMeters;
+	}
+	int getPvpSquadAggroConvergeTimeoutMillis() const {
+		return pvpSquadAggroConvergeTimeoutMillis;
+	}
+	int getPvpSquadAggroTargetTtlSeconds() const {
+		return pvpSquadAggroTargetTtlSeconds;
+	}
+	int getPvpSquadAggroFailedTargetIgnoreSeconds() const {
+		return pvpSquadAggroFailedTargetIgnoreSeconds;
+	}
+	float getPvpCombatApproachRadiusMeters() const { return pvpCombatApproachRadiusMeters; }
+	float getPvpCombatReapproachHysteresisMeters() const { return pvpCombatReapproachHysteresisMeters; }
+	float getPvpCombatArrivalToleranceMeters() const { return pvpCombatArrivalToleranceMeters; }
+	int getPvpCombatApproachTimeoutMillis() const { return pvpCombatApproachTimeoutMillis; }
+	bool isPvpCombatLosGateDamageEnabled() const { return pvpCombatLosGateDamage; }
+	bool isPvpCombatAllowInCellEngageEnabled() const { return pvpCombatAllowInCellEngage; }
+	uint32 getPvpCombatTickMillis() const { return pvpCombatTickMillis; }
+	float getPvpCombatFallbackWeaponRangeMeters() const { return pvpCombatFallbackWeaponRangeMeters; }
+	bool isPvpCombatLogMovementEnabled() const { return pvpCombatLogMovement; }
+	bool isPvpCombatMovementDiagnosticsEnabled() const {
+		return pvpControllerDrivenEngage &&
+			(pvpCombatLogMovement || pvpLogStateTransitions);
+	}
 	float getPvpCombatLeashMeters() const { return pvpCombatLeashMeters; }
 	int getPvpStalemateBreakSeconds() const { return pvpStalemateBreakSeconds; }
 	int getPvpStalemateGraceSeconds() const { return pvpStalemateGraceSeconds; }

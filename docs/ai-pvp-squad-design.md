@@ -973,3 +973,184 @@ reform logic handle the next upkeep pass. Expected live recovery after restart:
 depleted imperial rows log `SimPvpLeaderDownDetected`, then either
 `SimPvpLeaderPromoted` or `SimPvpSquadWiped`/`SimPvpSquadReformed`; the dashboard
 should return to full imperial patrols instead of indefinite `+3 inbound`.
+
+## 29. P.6.6 - controller-driven combat engagement rework (SHIPPED, compiled clean `-Werror`, PENDING RESTART+VERIFY)
+
+Plan: `docs/1-plans/F_0.7.0_p66-pvp-combat-engagement-rework.plan.md` (Codex
+plan-review APPROVED after 4 rounds). **All gated behind
+`pvpConfig.combat.controllerDrivenEngage`, C++ default OFF** — feature-off path is
+byte-identical to P.6.5e.
+
+**Problem (owner-reported):** convergence looked erratic, bots got stuck/clipped
+through starports, and squads stacked (the "10 jedi in 2 m"). Root cause: all
+in-combat movement was ceded to the stock combat tree — on a scan hit the
+controller only set combat state + `state=IDLE`, and `rootDefault`'s
+`TreeSocket(slot=MOVE)` closed on the defender off-navmesh via straight-line
+fallback. There was no LOS gate, no per-weapon spacing, and in-cell enemies were
+never engaged (`getParent()!=nullptr` hard-skip).
+
+**As-built** (mirrors the proven `SimHunterController` engage/approach split):
+- **Controller owns combat movement.** New `SimPvpBotController` lane:
+  `scanForTargets` detects within `combat.approachRadiusMeters` (100 m, radius-only,
+  no LOS — floored to the weapon's own engage band); `driveCombatMovement`
+  decides per tick: target dead/gone/left-zone/unattackable → teardown; beyond
+  `approachRadiusMeters` (out of combat) → teardown; approach older than
+  `approachTimeoutMillis` → teardown; distance > weapon `getMaxRange()` →
+  `approachTarget` (cell-aware `moveTo`, ½-range anti-thrash throttle, hold via
+  `reapproachHysteresisMeters`); `losGateDamage` && no LOS in range → keep
+  approaching to re-establish LOS; else `engageHeldTarget`
+  (`CombatManager::startCombat` + `activateAiBehavior(true)`, hold at range). No
+  stop-short buffer — bots hold at `max(getMaxRange(), arrivalToleranceMeters)`,
+  so rifles stand off ~64 m and melee close in; sub-4 m weapons still engage on
+  the base mover's 4 m arrival.
+- **Dual-driver suppression via a dynamically-swapped `simPvpCombat` AI map**
+  (`{IDLE→idleSimPvp, MOVE→moveNoopSimPvp}`, registered in `templates.lua`).
+  Installed only while engaged via `setCustomAiMap`+`setAITemplate` (both required;
+  the setter alone does not rebuild trees), with member `formationOffset` captured
+  before and re-written after the `setAITemplate()` blackboard wipe. Restored to
+  the base map (leader `simPvp`, member `0`) on teardown. Keeps the stock
+  ATTACK/TARGET sockets live (weapon still fires) while the controller is the sole
+  mover. Churn bounded to combat enter/exit.
+- **Cadence** without a second task thread: virtual
+  `SimPlayerController::nextArrivalDelayMillis(defaultMs)` consumed by every
+  `checkArrival` reschedule (byte-identical for existing controllers); the PvP
+  combat lane returns `combatTickMillis` while a target is held.
+- **In-cell engagement** allowed under `combat.allowInCellEngage`; the approach
+  uses the cell-aware path (P.6.5b + F_0.4.x cell entry/egress), entering through
+  the portal, never clipping. The combat-scoped hybrid latch
+  (`usesNavmeshHybridMovement()` → `combatHybridMovementActive`) makes only the
+  approach leg navmesh-aware; travel legs are unchanged.
+- **Members** are now controller-driven participants too; `assertFollow`
+  early-outs on `hasControllerCombatTarget()` (spanning the combat-cleared approach
+  leg), so FOLLOW never overwrites a member's approach; FOLLOW resumes on teardown.
+- **Approach-lane bounding** is separate from the in-combat `combatLeashMeters`/
+  P.6.5e stalemate break (those still bound only the holding/firing phase, gated on
+  `isInCombat()`): the combat-cleared approach is bounded by
+  `approachRadiusMeters` + `approachTimeoutMillis`.
+- **Runtime disable** is clean: an enabled→disabled transition (checked each tick
+  and at config refresh) tears down the target, approach path, hybrid latch, and
+  restores the base AI map, handing movement back to the city loop / FOLLOW.
+- **Dashboard:** `pvpActivity.combatEngagement` (controllerDrivenEngage,
+  approachRadiusMeters, approachesActive, engagementsInRange, losBlockedAttacks,
+  inCellEngagements, per-squad combat sub-state) + `starportTraversal`
+  (interior/fallback/abandoned participant counts per squad, scout vs patrol) to
+  answer the open "do full squads run starports like scouts?" question with
+  evidence. Rendered under `#/warfront`.
+
+**Verify after restart (flip `controllerDrivenEngage=true` at runtime):** ranged
+squads hold ~weapon-max-range apart (no 2 m stacks); `losBlockedAttacks` only
+transient; `inCellEngagements` climbs when squads meet at an indoor collector with
+zero clip-through (spot-check `/v1/object/{oid}`); two converging squads produce a
+clean "paths meet → fight" without P.6.5e statues; `starportTraversal` shows full
+squads traversing interiors like scouts; death/reform churn ≤ the P.6.5e baseline.
+
+### §29.1 P.6.6a traversal-vs-combat suppression (live-soak fix, PENDING RESTART+VERIFY)
+
+First live soak (2026-07-29, ~18 min, `controllerDrivenEngage=true`,
+`logCombatMovement=true`) — mostly healthy: 0 crashes/orphans, balanced AI-map
+swaps (no leak), clean open-field fights (focus-fire engage → ~6-13s → kill →
+re-target), live "holding-at-range" spacing confirmed (no stacking), and the
+Major-5 traversal diagnostic confirmed **full squads DO run starport interiors**
+(`status=full_interior interior=4 fallback=0`, patrolFull 3/7, scoutFull 6/8).
+
+**Bug caught:** `approachTimeout` teardown churn clustered on starport-traversing
+squads (e.g. squad 11: 0 engages / 14 timeouts). Root-caused via live
+`/v1/object/{oid}`: an approaching leader sat `movementState=0` (OBLIVIOUS) for 8s+
+while in `phase=arrivalReenter` — the controller **combat lane was acquiring/driving
+a target during an active starport interior-traversal**, and the combat approach
+deadlocked against the arrival-exit state machine (`SimPvPController::onArrived`
+early-returned into `driveCombatMovement()` before handling the arrival-exit step,
+so the run never progressed and the enemy was never reached → 15s timeout → churn).
+This was NOT a wall/cell blocking traversal (the cell-traversal machinery works);
+it was two controller movement drivers fighting. `inCellEngagements` stayed 0
+because these near-starport fights were consumed by the conflict before a clean
+in-cell chase could happen.
+
+**Fix (P.6.6a):** the controller combat lane **stands down during interior
+traversal**. New virtual `isInteriorTraversalActive()` (base false; leader =
+`arrivalExitActive || collectorDepartureActive`; member = `arrivalExitActive`).
+`SimPvpBotController::onTick` returns early (no scan/acquire/drive) while it's true
+— and if a fight was somehow still live entering the traversal (rare; combat is
+torn down at relocation/boarding first) it clears combat state so the traversal
+`moveTo` is not held (`moveTo` holds while `isInCombat`), WITHOUT a full
+`teardownControllerEngagement` (which would advance the work-loop generation and
+kill the in-flight traversal chain). Leader `onArrived`/`onPathFailed` and member
+`onTick` also gate their combat drive on `!isInteriorTraversalActive()`, so the
+starport run always takes priority. Net: squads finish the run, THEN engage;
+open-field/loiter combat is untouched.
+
+**Re-verify after restart:** `approachTimeout` teardowns collapse (esp. on
+starport squads), `inCellEngagements` becomes observable (a squad chasing an enemy
+into/near a cell), no OBLIVIOUS stalls mid-traversal, `starportTraversal` interior
+rate holds. Then reconsider the secondary tuning: `approachTimeoutMillis` 15000→
+~25000 for genuine ~100 m open approaches (~18 s at run speed).
+
+### §29.2 P.6.6b prep — combat-gate fixes from live observation (2026-07-29)
+
+Owner in-game observation: a Rebel bot "pulled aggro" on an **Imperial non-pvpbot
+world NPC** at a starport entrance, the NPC fled inside, and the bot "wasn't really
+fighting back" and died; a healer squadmate attacked a few times then also stopped.
+Root-caused to two defects (confirmed live: `losBlockedAttacks` climbing,
+`approachTimeout` teardowns dominant at ~946, `inCellEngagements=0`):
+
+- **World-NPC drag-in.** `scanForTargets` correctly excludes non-sim-bot NPCs, but
+  the P.6.6 Major-1 **defender-adoption** adopted *any* attackable defender — so an
+  enemy-faction world NPC that aggros an OVERT bot got pulled into the controller
+  lane and stranded. **Fix A:** shared `isEligiblePvpCombatTarget()` helper (player,
+  or bot-vs-bot-enabled && `getSimPlayerBot`) used by **both** scan and adoption;
+  world NPCs fall back to stock self-defense.
+- **LOS-gate passive death.** In weapon range with no LOS, the code called
+  `approachTarget()`, which **clears combat** to chase — so a bot under fire behind
+  a wall / at a fled-into-cell target approached-and-never-fired until it died (and
+  produced the bulk of the `approachTimeout` churn). **Fix B:** within weapon range
+  the bot now **engages and holds regardless of LOS** and lets the **stock combat
+  system enforce LOS-to-damage** (it already does — no shooting through walls);
+  `losGateDamage` is now telemetry-only. True mutual-no-LOS standoffs stay bounded
+  by the existing stalemate break; out-of-range in-cell targets keep the cell-aware
+  approach (chase-into-cell preserved).
+
+Immediate OLD-binary mitigation available without a restart: `losGateDamage=false`
+at runtime disables the harmful approach loop on the currently-running build too.
+
+The squad aggro-sharing feature the owner requested (whole squad converges on a
+squadmate's fight; never idle-heal) is implemented below in §29.3, from
+`docs/1-plans/F_0.7.1_p66b-squad-aggro-sharing.plan.md` (P.6.6b).
+
+### §29.3 P.6.6b - squad aggro-sharing / combat contagion (IMPLEMENTED, DEFAULT-OFF)
+
+P.6.6b reuses the P.6.6 controller combat lane to make a squadmate's fight
+visible to the rest of that squad. It is independently gated by
+`pvpConfig.combat.squadAggroSharing` (C++ default `false`), so disabling the
+gate leaves P.6.6 target scanning, approach, and engagement behavior unchanged.
+
+- **Shared contact row:** `SimPvpSquad.sharedCombatTargets` stores a bounded set
+  of enemy OIDs and per-entry refresh timestamps. `recordPvpSquadCombatTarget`
+  publishes from the single `acquireControllerCombatTarget` funnel (covering
+  both scans and defender adoption); `driveCombatMovement` refreshes the held
+  live target at most every 2.5 seconds and no later than half the configured
+  TTL. `getPvpSquadSharedCombatTarget` lazily removes expired/dead entries,
+  resolves and locks agents only after releasing `pvpSquadMutex`, and accepts an
+  `excludeOid` for a failed convergence retry window.
+- **Idle convergence:** after the normal scan, an idle controller-driven leader
+  or member can adopt a same-zone, attackable shared target within
+  `squadAggroConvergeRadiusMeters`. A closer target from the bot's own scan wins;
+  the shared target is only the fallback. The existing cell-aware
+  `driveCombatMovement` path remains the movement authority, and
+  `isInteriorTraversalActive()` still returns before scan/acquire/drive.
+- **Bounded give-up:** `combatIsConvergenceTarget` widens the pre-engagement
+  outer teardown bound to the convergence radius while retaining the existing
+  approach timeout. If an approach-radius/timeout teardown never reached the
+  fight, the controller records `failedSharedTargetOid` and ignores that OID for
+  `squadAggroFailedTargetIgnoreSeconds`; a successful engage or a different
+  shared target clears the suppression.
+- **Configuration:** the default-off block exposes a 300 m convergence radius,
+  8 s target TTL, and 10 s failed-target ignore window. All numeric fields are
+  explicitly bounded on every runtime refresh.
+- **Dashboard:** `pvpActivity.combatEngagement` exposes the gate,
+  `convergencesTotal`, convergence radius, and each squad's active
+  `sharedTargets` count. The `#/warfront` controller panel renders the total and
+  per-squad shared-contact columns.
+
+Live convergence, no-clipping traversal, target release, idle-heal behavior,
+and post-P.6.6a churn remain owner-run acceptance checks after the Docker build
+and restart.

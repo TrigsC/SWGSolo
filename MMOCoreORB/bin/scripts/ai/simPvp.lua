@@ -19,3 +19,11 @@
 idleSimPvp = {
 	{id="1000000011",	name="Wait",	pid="none",	args={duration=3600.0}}}
 addAiTemplate("idleSimPvp", idleSimPvp)
+
+-- Combat movement is owned by SimPvpBotController while the controller-driven
+-- engagement feature is active. This MOVE slot prevents rootDefault from
+-- independently closing on the defender; inherited ATTACK/TARGET sockets
+-- continue to run the real combat behavior.
+moveNoopSimPvp = {
+	{id="1000000013", name="Wait", pid="none", args={duration=3600.0}}}
+addAiTemplate("moveNoopSimPvp", moveNoopSimPvp)

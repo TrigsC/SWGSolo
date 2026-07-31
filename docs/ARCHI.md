@@ -142,8 +142,10 @@ docker exec -u swgemu -e TERM=xterm swgemu_server bash -lc 'build'
 
 # Run / restart the live server (~40-50s startup)
 /home/swgemu/bin/run
-#   RESTARTING THE LIVE SERVER IS THE OWNER'S CALL, not the agent's — after
-#   a change, build and hand off; the owner decides when to restart.
+#   RESTARTING THE LIVE SERVER IS THE OWNER'S CALL, not the agent's. Explicit
+#   /TRIP-verify invocation authorizes disconnecting test players and a guarded
+#   automatic restart after a green build. It tries normal GDB shutdown first,
+#   then may force-kill only the exact core3 process; all other work hands off.
 ```
 
 Key CMake options (top-level `MMOCoreORB/CMakeLists.txt`): `BUILD_IDL` (runs
@@ -397,6 +399,30 @@ A second major custom vertical, sharing the SimPlayer NPC infrastructure:
   out from contested destinations, and break-off-after-deaths cohesion —
   design in `docs/ai-pvp-mimetic-travel-design.md` and
   `docs/ai-pvp-squad-design.md`.
+- **Controller-driven combat engagement (P.6.6, F_0.7.0)**: an opt-in combat
+  lane that replaces the emergent stock behavior-tree combat. `SimPvpBotController`
+  scans a ~100 m radius, drives a cell-aware approach to the target (portal graph,
+  no clipping through starports), and engages/holds at weapon range with LOS
+  enforced by stock combat (`CombatManager::startCombat`). While engaged the
+  controller swaps in a `simPvpCombat` no-op-MOVE AI map (`setCustomAiMap` +
+  `setAITemplate`, formationOffset preserved) so the stock tree never double-drives
+  movement; a per-tick `driveCombatMovement` owns approach→engage→hold, and
+  `isInteriorTraversalActive()` suppresses combat while a member is mid-starport
+  traversal (traversal wins). Two hardening fixes ship with it: a shared
+  target-eligibility helper (players or enabled sim-bots only) keeps ordinary NPC
+  combat on stock self-defense, and an in-range bot engages-and-holds under LOS
+  loss (LOS is telemetry-only) instead of clearing combat and dying passively.
+- **Squad aggro-sharing / combat contagion (P.6.6b, F_0.7.1)**: default-off,
+  squad-local shared-aggro so idle squadmates converge on a teammate's fight over
+  the same cell-aware lane. Each `SimPvpSquad` keeps a small TTL-refreshed
+  shared-enemy set (`recordPvpSquadCombatTarget` / `getPvpSquadSharedCombatTargets`,
+  guarded by `pvpSquadMutex`, agent locks taken **outside** it); an idle
+  controller acquires a live shared target within a convergence-specific radius
+  (300 m) and timeout (60 s), with failed-target suppression so it never thrashes
+  an unreachable contact. Verified live at the squad level; per-member contribution
+  telemetry is recorded debt. All P.6.6/6.6b gates (`pvpConfig.combat.*`
+  `controllerDrivenEngage`, `squadAggroSharing`, `logCombatMovement`) ship
+  **default-off**; dashboard surface is `pvpActivity.combatEngagement`.
 - **Jedi/Force archetype**: NPC Jedi with a Force-power ladder and FRS
   (Force Rank System) progression paid via the same XP hooks real players
   use — design in `docs/ai-jedi-force-archetype-design.md` and

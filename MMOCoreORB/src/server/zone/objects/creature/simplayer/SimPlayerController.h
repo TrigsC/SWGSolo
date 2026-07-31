@@ -226,6 +226,12 @@ public:
     virtual void startSimLoop() = 0;  // Start the bot's logic
     virtual void onArrived() = 0;     // Called when destination reached
     virtual void onTick() {}          // Called every 500ms (Good for PvP scanning)
+    // ArrivalCheckTask remains the single scheduler for every controller. A
+    // derived controller may shorten the next interval without creating a
+    // second task chain.
+    virtual uint32 nextArrivalDelayMillis(uint32 defaultMs) {
+        return defaultMs;
+    }
     virtual bool shouldContinueArrivalChecks() const { return true; }
     // Hunter-only opt-in for navmesh/overland hybrid movement. The default
     // keeps the existing miner and PvP path behavior byte-for-byte unchanged.

@@ -876,7 +876,35 @@
     const scouts = pvp.scouts || {};
     const comms = pvp.comms || {};
     const routed = pvp.routedTravel || {};
+    const combat = pvp.combatEngagement || {};
+    const traversal = combat.starportTraversal || {};
     const squads = pvp.squads || [];
+    const combatSquadRows = (combat.squads || []).map((s) => {
+      const stateName = String(s.combatSubState || s.state || "idle");
+      const tone = stateName === "no-LOS" ? "red" :
+        stateName === "approaching" ? "amber" :
+        stateName === "holding-at-range" ? "teal" : "ghost";
+      return `<tr>
+        <td class="t-num">#${esc(s.squadId)}</td>
+        <td>${chip(labelize(s.role), s.role === "scout" ? "ghost" : "blue")}</td>
+        <td>${chip(labelize(stateName), tone)}</td>
+        <td class="t-num">${num(s.activeTargets)}</td>
+        <td class="t-num">${num(s.sharedTargets)}</td>
+      </tr>`;
+    }).join("");
+    const traversalSquadRows = (traversal.squads || []).map((s) => {
+      const status = String(s.status || "none");
+      const tone = status === "full_interior" ? "teal" :
+        status === "in_progress" ? "amber" :
+        status === "fallback_or_partial" ? "red" : "ghost";
+      return `<tr>
+        <td class="t-num">#${esc(s.squadId)}</td>
+        <td>${chip(labelize(s.role), s.role === "scout" ? "ghost" : "blue")}</td>
+        <td>${chip(labelize(status), tone)}</td>
+        <td class="t-num">${num(s.interior)}/${num(s.expected)}</td>
+        <td class="t-num">${num(s.fallback)}</td>
+      </tr>`;
+    }).join("");
 
     const factionCard = (name, cls) => {
       const list = squads.filter((s) => String(s.faction || "").toLowerCase() === name);
@@ -937,6 +965,33 @@
           </div>
           <div class="section-gap"></div>
           ${sparkline(histSeries("eng", { delta: true }), { note: "ENGAGEMENT RATE", color: "var(--red)" })}
+          </div>
+        </section>
+        <section class="panel span-12"><header><h3>CONTROLLER ENGAGEMENT</h3>
+          <span class="panel-tag">${combat.controllerDrivenEngage ? "enabled" : "stand-down"} · approach ${num(combat.approachRadiusMeters)}m</span></header>
+          <div class="panel-body"><div class="metric-row">
+            ${metric("Approaches Active", combat.approachesActive, { tone: "accent" })}
+            ${metric("Engagements In Range", combat.engagementsInRange)}
+            ${metric("Squad Convergences", combat.convergencesTotal, { tone: "teal" })}
+            ${metric("LOS-Blocked Attacks", combat.losBlockedAttacks, { tone: Number(combat.losBlockedAttacks || 0) ? "warn" : "" })}
+            ${metric("In-Cell Engagements", combat.inCellEngagements, { tone: "teal" })}
+            ${metric("Interior Full Runs", traversal.fullInteriorRuns, { tone: "teal" })}
+            ${metric("Traversal Fallbacks", traversal.fallbackParticipants, { tone: Number(traversal.fallbackParticipants || 0) ? "warn" : "" })}
+          </div>
+          <div class="section-gap"></div>
+          ${kvRows([
+            ["Controller-driven engage", onoff(combat.controllerDrivenEngage)],
+            ["Squad aggro sharing", onoff(combat.squadAggroSharing)],
+            ["Convergence radius", num(combat.squadAggroConvergeRadiusMeters) + "m"],
+            ["Approach radius", num(combat.approachRadiusMeters) + "m"],
+            ["Starport diagnostic", traversal.enabled ? "log/count active" : "disabled"],
+            ["Scout interiors", num(traversal.scoutFullInteriorRuns) + " / " + num(traversal.scoutRuns) + " full"],
+            ["Patrol interiors", num(traversal.patrolFullInteriorRuns) + " / " + num(traversal.patrolRuns) + " full"]
+          ])}
+          <div class="section-gap"></div>
+          ${table(["Squad", "Role", "Combat State", "Active Targets", "Shared Targets"], combatSquadRows, { scrollKey: "war-combat-squads" })}
+          <div class="section-gap"></div>
+          ${table(["Squad", "Role", "Traversal", "Interior / Expected", "Fallback"], traversalSquadRows, { scrollKey: "war-traversal-squads" })}
           </div>
         </section>
         <div class="faction-row" style="grid-column: span 12">

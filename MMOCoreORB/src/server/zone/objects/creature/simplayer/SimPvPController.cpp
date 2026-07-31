@@ -11,14 +11,19 @@
 #include "server/ServerCore.h"
 #include "server/zone/ZoneServer.h"
 #include "server/zone/objects/cell/CellObject.h"
+#include "server/zone/managers/collision/CollisionManager.h"
 #include "server/zone/objects/creature/CreatureObject.h"
 #include "server/zone/CloseObjectsVector.h"
 #include "server/zone/TreeEntry.h"
+#include "server/zone/managers/combat/CombatManager.h"
 #include "templates/params/creature/CreatureAttribute.h"
 #include "templates/params/creature/ObjectFlag.h"
 #include "templates/params/creature/CreaturePosture.h"
+#include "server/zone/objects/creature/ai/bt/BlackboardData.h"
 
 #include "system/lang/System.h"
+
+using namespace server::zone::objects::creature::ai::bt;
 
 // ------------------------------------------------------
 // Loiter task
@@ -58,6 +63,24 @@ SimPvpBotController::SimPvpBotController(AiAgent* aiAgent, uint64 squad, bool is
 	lastCombatProgressMs = 0;
 	stalemateIgnoredOid = 0;
 	stalemateIgnoreUntilMs = 0;
+	controllerCombatTarget = nullptr;
+	combatApproachTargetPosition = Vector3(0, 0, 0);
+	combatResumeDestination = Vector3(0, 0, 0);
+	combatResumeLocalDestination = Vector3(0, 0, 0);
+	combatResumeCell = nullptr;
+	combatApproachStartedAtMs = 0;
+	combatApproachActive = false;
+	combatHolding = false;
+	combatLosBlocked = false;
+	combatIsConvergenceTarget = false;
+	lastSquadAggroPublishMs = 0;
+	failedSharedTargetOid = 0;
+	failedSharedTargetIgnoreUntilMs = 0;
+	combatHybridMovementActive = false;
+	combatAiMapInstalled = false;
+	combatBaseAiMapHash = 0;
+	hasCombatResumeDestination = false;
+	combatLosBlockedAttacks = 0;
 	setLoggingName("SimPvpBotController");
 }
 
@@ -71,7 +94,480 @@ void SimPvpBotController::resetStalemateProgress() {
 	lastCombatProgressMs = 0;
 }
 
+float SimPvpBotController::currentWeaponEngageRange() const {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	float fallback = manager->getPvpCombatFallbackWeaponRangeMeters();
+	float range = fallback;
+
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent != nullptr) {
+		ManagedReference<WeaponObject*> weapon = strongAgent->getWeapon();
+		if (weapon != nullptr)
+			range = (float)weapon->getMaxRange();
+	}
+
+	float arrivalTolerance = manager->getPvpCombatArrivalToleranceMeters();
+	if (range < arrivalTolerance)
+		range = arrivalTolerance;
+
+	return range;
+}
+
+bool SimPvpBotController::isControllerCombatEngagementInRange() const {
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (controllerCombatTarget == nullptr || strongAgent == nullptr)
+		return false;
+
+	return strongAgent->getDistanceTo(controllerCombatTarget) <=
+		currentWeaponEngageRange();
+}
+
+bool SimPvpBotController::isControllerCombatInCellEngagement() const {
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (controllerCombatTarget == nullptr || strongAgent == nullptr)
+		return false;
+
+	ManagedReference<SceneObject*> agentParent = strongAgent->getParent().get();
+	ManagedReference<SceneObject*> targetParent =
+		controllerCombatTarget->getParent().get();
+	return (agentParent != nullptr && agentParent->isCellObject()) ||
+		(targetParent != nullptr && targetParent->isCellObject());
+}
+
+String SimPvpBotController::getControllerCombatSubState() const {
+	if (controllerCombatTarget == nullptr)
+		return "idle";
+
+	if (combatLosBlocked)
+		return "no-LOS";
+
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (combatApproachActive &&
+		(strongAgent == nullptr || !strongAgent->isInCombat()))
+		return "approaching";
+
+	return "holding-at-range";
+}
+
+bool SimPvpBotController::hasCombatLineOfSight(CreatureObject* target) const {
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr || target == nullptr)
+		return false;
+
+	// CollisionManager::checkLineOfSight dispatches to the building/cell
+	// implementation when either endpoint is contained, and to the world ray
+	// implementation for outdoor endpoints.
+	return CollisionManager::checkLineOfSight(strongAgent.get(), target);
+}
+
+bool SimPvpBotController::isEligiblePvpCombatTarget(CreatureObject* target) const {
+	if (target == nullptr)
+		return false;
+	// Players are always valid PvP targets.
+	if (target->isPlayerCreature())
+		return true;
+	// Non-players: only other sim PvP bots, and only when bot-vs-bot is enabled.
+	// Ordinary world NPCs (including enemy-faction ones that aggro an OVERT bot)
+	// are deliberately excluded — they are handled by stock self-defense, not the
+	// controller lane, whose range/LOS logic would otherwise strand the bot.
+	if (!SimPlayerManager::instance()->isPvpBotVsBotCombatEnabled())
+		return false;
+	AiAgent* targetAgent = target->asAiAgent();
+	return targetAgent != nullptr && targetAgent->getSimPlayerBot();
+}
+
+void SimPvpBotController::swapCombatAiMap(bool engaged, uint32 baseAiMapHash) {
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr)
+		return;
+
+	if (engaged && combatAiMapInstalled)
+		return;
+	if (!engaged && !combatAiMapInstalled)
+		return;
+
+	uint32 combatMapHash = String("simPvpCombat").hashCode();
+	uint32 selectedMap = engaged ? combatMapHash : combatBaseAiMapHash;
+	if (engaged)
+		combatBaseAiMapHash = baseAiMapHash;
+
+	bool hasFormationOffset = false;
+	Vector3 formationOffset;
+	{
+		Locker locker(strongAgent);
+		if (strongAgent->peekBlackboard("formationOffset")) {
+			hasFormationOffset = true;
+			formationOffset = strongAgent->readBlackboard(
+				"formationOffset").get<Vector3>();
+		}
+
+		strongAgent->setCustomAiMap(selectedMap);
+		strongAgent->setAITemplate();
+
+		// setAITemplate() wipes the blackboard. Preserve the formation value for
+		// followers even though Phase 1 only enables this path for leaders; the
+		// same helper is intentionally ready for the member phase.
+		if (hasFormationOffset)
+			strongAgent->writeBlackboard("formationOffset", formationOffset);
+
+		if (!engaged) {
+			// Teardown must not leave either the old combat path or a stock MOVE
+			// behavior walking it after the controller gives movement back.
+			strongAgent->setMovementState(AiAgent::OBLIVIOUS);
+			strongAgent->clearPatrolPoints();
+			strongAgent->clearSavedPatrolPoints();
+			strongAgent->clearCurrentPath();
+		}
+	}
+
+	combatAiMapInstalled = engaged;
+
+	if (SimPlayerManager::instance()->isPvpCombatLogMovementEnabled()) {
+		Logger::console.info("SimPvp squad=" + String::valueOf(squadId) +
+			" aiMap=" + (engaged ? "simPvpCombat" : "simPvp"), true);
+	}
+}
+
+void SimPvpBotController::acquireControllerCombatTarget(CreatureObject* target) {
+	if (target == nullptr || controllerCombatTarget != nullptr)
+		return;
+
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	uint64 nowMs = System::getMiliTime();
+	if (failedSharedTargetOid != 0 &&
+			failedSharedTargetOid != target->getObjectID()) {
+		failedSharedTargetOid = 0;
+		failedSharedTargetIgnoreUntilMs = 0;
+	}
+
+	combatResumeDestination = destination;
+	combatResumeLocalDestination = destinationLocal;
+	combatResumeCell = destinationCell;
+	hasCombatResumeDestination = destination.getX() != 0.f ||
+		destination.getY() != 0.f || destinationCell != nullptr ||
+		state == MOVING || state == CALCULATING_PATH;
+
+	controllerCombatTarget = target;
+	combatApproachTargetPosition = target->getWorldPosition();
+	combatApproachStartedAtMs = System::getMiliTime();
+	combatApproachActive = true;
+	combatHolding = false;
+	combatLosBlocked = false;
+	combatHybridMovementActive = false;
+	if (manager->isPvpSquadAggroSharingEnabled()) {
+		// This is the single publication funnel for both scan hits and defender
+		// adoption. The keep-alive path below only refreshes this same entry.
+		manager->recordPvpSquadCombatTarget(squadId,
+			target->getObjectID());
+		lastSquadAggroPublishMs = nowMs;
+	} else {
+		lastSquadAggroPublishMs = 0;
+	}
+
+	// The helper preserves any formationOffset it finds so the member
+	// transition can reuse the same choreography with base map 0.
+	swapCombatAiMap(true, getControllerCombatBaseAiMapHash());
+}
+
+void SimPvpBotController::teardownControllerEngagement(const String& reason,
+		bool resumeRoute) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	uint64 nowMs = System::getMiliTime();
+	bool failedConvergence = combatIsConvergenceTarget &&
+		manager->isPvpSquadAggroSharingEnabled() &&
+		controllerCombatTarget != nullptr && !combatHolding &&
+		(reason == "approachRadius" || reason == "approachTimeout");
+	if (failedConvergence) {
+		failedSharedTargetOid = controllerCombatTarget->getObjectID();
+		failedSharedTargetIgnoreUntilMs = nowMs +
+			static_cast<uint64>(manager->getPvpSquadAggroFailedTargetIgnoreSeconds()) *
+				1000;
+	}
+
+	ManagedReference<AiAgent*> strongAgent = agent;
+	Vector3 resumeDestination = combatResumeDestination;
+	Vector3 resumeLocalDestination = combatResumeLocalDestination;
+	ManagedReference<CellObject*> resumeCell = combatResumeCell;
+	bool restoreRoute = resumeRoute && hasCombatResumeDestination;
+
+	combatHybridMovementActive = false;
+	advanceWorkLoopGeneration("combatTeardown");
+	resetHybridMovementState(true);
+	clearInteriorApproachLeg();
+
+	if (strongAgent != nullptr) {
+		{
+			Locker locker(strongAgent);
+			if (strongAgent->isInCombat())
+				strongAgent->clearCombatState(true);
+			strongAgent->setTargetObject(nullptr);
+		}
+
+		swapCombatAiMap(false, String("simPvp").hashCode());
+	}
+
+	controllerCombatTarget = nullptr;
+	combatApproachStartedAtMs = 0;
+	combatApproachActive = false;
+	combatHolding = false;
+	combatLosBlocked = false;
+	combatIsConvergenceTarget = false;
+	lastSquadAggroPublishMs = 0;
+	combatApproachTargetPosition = Vector3(0, 0, 0);
+	combatResumeDestination = Vector3(0, 0, 0);
+	combatResumeLocalDestination = Vector3(0, 0, 0);
+	combatResumeCell = nullptr;
+	hasCombatResumeDestination = false;
+
+	if (restoreRoute) {
+		destination = resumeDestination;
+		destinationLocal = resumeLocalDestination;
+		destinationCell = resumeCell;
+		state = IDLE;
+	} else {
+		destination = Vector3(0, 0, 0);
+		destinationLocal = Vector3(0, 0, 0);
+		destinationCell = nullptr;
+		state = WAITING;
+	}
+
+	if (SimPlayerManager::instance()->isPvpCombatLogMovementEnabled()) {
+		Logger::console.info("SimPvp squad=" + String::valueOf(squadId) +
+			" combatTeardown reason=" + reason, true);
+	}
+}
+
+void SimPvpBotController::approachTarget(CreatureObject* target) {
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr || target == nullptr)
+		return;
+
+	Vector3 targetWorld = target->getWorldPosition();
+	float moveThreshold = currentWeaponEngageRange() * 0.5f;
+	if (moveThreshold < 1.f)
+		moveThreshold = 1.f;
+
+	bool alreadyPursuing = combatApproachActive &&
+		(state == MOVING || state == CALCULATING_PATH);
+	if (alreadyPursuing &&
+		combatApproachTargetPosition.distanceTo(targetWorld) < moveThreshold)
+		return;
+
+	{
+		Locker locker(strongAgent);
+		if (strongAgent->isInCombat())
+			strongAgent->clearCombatState(true);
+		state = IDLE;
+	}
+
+	ManagedReference<SceneObject*> parent = target->getParent().get();
+	CellObject* targetCell = parent == nullptr ? nullptr :
+		parent.castTo<CellObject*>();
+	Vector3 targetLocal = targetCell == nullptr ? targetWorld :
+		target->getPosition();
+
+	combatApproachActive = true;
+	combatHolding = false;
+	combatHybridMovementActive = true;
+	combatApproachTargetPosition = targetWorld;
+	if (combatApproachStartedAtMs == 0)
+		combatApproachStartedAtMs = System::getMiliTime();
+
+	// Hybrid movement is useful for outdoor/off-navmesh pursuit. An in-cell
+	// target must retain the cell-aware path request so the portal graph, not a
+	// straight-line fallback, performs the final entry.
+	if (targetCell != nullptr)
+		interiorApproachLeg = true;
+	else
+		clearInteriorApproachLeg();
+
+	moveTo(targetWorld, targetLocal, targetCell);
+}
+
+void SimPvpBotController::engageHeldTarget(CreatureObject* target) {
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr || target == nullptr)
+		return;
+
+	if (!target->isAttackableBy(strongAgent.get())) {
+		teardownControllerEngagement("targetNotAttackable");
+		return;
+	}
+
+	{
+		Locker locker(strongAgent);
+		Locker crossLocker(target, strongAgent);
+		// Cancel any outstanding approach path before handing movement to the
+		// combat state. Advancing the generation also rejects a late path result.
+		strongAgent->setMovementState(AiAgent::OBLIVIOUS);
+		strongAgent->clearPatrolPoints();
+		strongAgent->clearSavedPatrolPoints();
+		strongAgent->clearCurrentPath();
+		advanceWorkLoopGeneration("combatEngage");
+		if (!CombatManager::instance()->startCombat(strongAgent.get(), target))
+			return;
+
+		strongAgent->setTargetObject(target);
+		strongAgent->activateAiBehavior(true);
+		state = IDLE;
+	}
+
+	combatApproachActive = false;
+	combatHolding = true;
+	// P.6.6 Major-3: restart the approach clock on a successful engage. Otherwise
+	// a long fight that later loses LOS re-enters approach carrying the stale
+	// start time and the timeout guard fires instantly instead of repositioning.
+	combatApproachStartedAtMs = 0;
+	combatHybridMovementActive = false;
+	combatIsConvergenceTarget = false;
+	failedSharedTargetOid = 0;
+	failedSharedTargetIgnoreUntilMs = 0;
+	resetHybridMovementState(true);
+	clearInteriorApproachLeg();
+
+	if (SimPlayerManager::instance()->isPvpCombatLogMovementEnabled()) {
+		Logger::console.info("SimPvp squad=" + String::valueOf(squadId) +
+			" combatEngage target=" +
+			String::valueOf(target->getObjectID()), true);
+	}
+}
+
+void SimPvpBotController::driveCombatMovement() {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (!isControllerDrivenEngageParticipant() ||
+		!manager->isPvpControllerDrivenEngageEnabled())
+		return;
+
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr || controllerCombatTarget == nullptr)
+		return;
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(controllerCombatTarget->getObjectID());
+	CreatureObject* target = object == nullptr ? nullptr :
+		object->asCreatureObject();
+
+	if (target == nullptr || target->isDead() || target->isIncapacitated() ||
+		target->getZone() == nullptr || target->getZone() != strongAgent->getZone() ||
+		!target->isAttackableBy(strongAgent.get())) {
+		teardownControllerEngagement("targetUnavailable");
+		return;
+	}
+
+	float distance = strongAgent->getDistanceTo(target);
+	float approachRadius = combatIsConvergenceTarget &&
+		manager->isPvpSquadAggroSharingEnabled() ?
+		manager->getPvpSquadAggroConvergeRadiusMeters() :
+		manager->getPvpCombatApproachRadiusMeters();
+	float engageRange = currentWeaponEngageRange();
+	if (approachRadius < engageRange)
+		approachRadius = engageRange;
+
+	uint64 nowMs = System::getMiliTime();
+	if (manager->isPvpSquadAggroSharingEnabled()) {
+		// Refresh at most every 2.5s and no later than half the configured TTL,
+		// so a squadmate's entry remains available during a long approach/fight.
+		uint64 refreshIntervalMs = static_cast<uint64>(
+			manager->getPvpSquadAggroTargetTtlSeconds()) * 1000 / 2;
+		if (refreshIntervalMs > 2500)
+			refreshIntervalMs = 2500;
+		if (refreshIntervalMs < 250)
+			refreshIntervalMs = 250;
+		if (lastSquadAggroPublishMs == 0 || nowMs < lastSquadAggroPublishMs ||
+				nowMs - lastSquadAggroPublishMs >= refreshIntervalMs) {
+			manager->recordPvpSquadCombatTarget(squadId,
+				controllerCombatTarget->getObjectID());
+			lastSquadAggroPublishMs = nowMs;
+		}
+	}
+	if (!strongAgent->isInCombat() && distance > approachRadius) {
+		teardownControllerEngagement("approachRadius");
+		return;
+	}
+
+	// A convergence leg can be far longer than a normal 100m engage approach
+	// (the converge radius is ~300m ≈ ~55s at run speed), so it uses its own
+	// longer timeout — otherwise a distant squadmate always times out before it
+	// can join the fight (Codex P.6.6b Major).
+	int timeoutMillis = combatIsConvergenceTarget ?
+		SimPlayerManager::instance()->getPvpSquadAggroConvergeTimeoutMillis() :
+		SimPlayerManager::instance()->getPvpCombatApproachTimeoutMillis();
+	if (!strongAgent->isInCombat() && combatApproachActive &&
+		timeoutMillis > 0 && combatApproachStartedAtMs != 0 &&
+		nowMs - combatApproachStartedAtMs >= (uint64)timeoutMillis) {
+		teardownControllerEngagement("approachTimeout");
+		return;
+	}
+
+	if (distance > engageRange) {
+		combatLosBlocked = false;
+		float hysteresis = SimPlayerManager::instance()->
+			getPvpCombatReapproachHysteresisMeters();
+		if (combatHolding && hysteresis > 0.f &&
+			distance <= engageRange + hysteresis) {
+			state = IDLE;
+			return;
+		}
+
+		if (combatApproachStartedAtMs == 0 || combatHolding) {
+			combatApproachStartedAtMs = nowMs;
+			combatApproachActive = true;
+		}
+		approachTarget(target);
+		return;
+	}
+
+	// Within weapon range. The stock combat system already enforces "no damage
+	// without line of sight" on the actual weapon fire, so we ENGAGE and HOLD
+	// here regardless of LOS rather than clearing combat to chase a walled target.
+	// The old clear-combat-and-approach loop made a bot under fire
+	// approach-and-never-shoot into a wall until it died passively (2026-07-29
+	// live observation; also the bulk of the approachTimeout churn). A true
+	// mutual-no-LOS standoff is bounded by the existing stalemate break, not here.
+	// losGateDamage now only drives LOS telemetry.
+	bool losBlocked = SimPlayerManager::instance()->
+			isPvpCombatLosGateDamageEnabled() &&
+		!hasCombatLineOfSight(target);
+	if (losBlocked && !combatLosBlocked)
+		combatLosBlockedAttacks++;   // count distinct block events, not per-tick
+	combatLosBlocked = losBlocked;
+
+	// A live combat state is already the desired hold state. Only fall through
+	// to a fresh startCombat call when combat was cleared by an approach leg.
+	if (strongAgent->isInCombat()) {
+		// P.6.6 Major-3 (adoption interaction): a bot adopted while already
+		// fighting entered here with an "active approach" and a live start time
+		// (acquireControllerCombatTarget). Normalize it into the same holding
+		// state engageHeldTarget() leaves — no active approach, cleared clock —
+		// so a later LOS/distance re-approach starts a fresh timeout instead of
+		// tripping the stale one.
+		combatApproachActive = false;
+		combatHolding = true;
+		combatApproachStartedAtMs = 0;
+		combatIsConvergenceTarget = false;
+		failedSharedTargetOid = 0;
+		failedSharedTargetIgnoreUntilMs = 0;
+		return;
+	}
+
+	engageHeldTarget(target);
+}
+
+uint32 SimPvpBotController::nextArrivalDelayMillis(uint32 defaultMs) {
+	if (isControllerDrivenEngageParticipant() && controllerCombatTarget != nullptr) {
+		uint32 combatTick = SimPlayerManager::instance()->
+			getPvpCombatTickMillis();
+		if (combatTick > 0)
+			return combatTick;
+	}
+
+	return defaultMs;
+}
+
 void SimPvpBotController::prepareForRelocation(const String& reason) {
+	if (controllerCombatTarget != nullptr || combatAiMapInstalled)
+		teardownControllerEngagement("relocation", false);
 	SimPlayerController::prepareForRelocation(reason);
 	resetStalemateState();
 }
@@ -82,13 +578,33 @@ void SimPvpBotController::onTick() {
 	if (strongAgent == nullptr)
 		return;
 
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	bool controllerDriven = isControllerDrivenEngageParticipant() &&
+		manager->isPvpControllerDrivenEngageEnabled();
+	if (isControllerDrivenEngageParticipant() && !controllerDriven &&
+		(controllerCombatTarget != nullptr || combatAiMapInstalled))
+		teardownControllerEngagement("featureDisabled", true);
 	uint64 nowMs = System::getMiliTime();
+	if (!manager->isPvpSquadAggroSharingEnabled()) {
+		combatIsConvergenceTarget = false;
+		lastSquadAggroPublishMs = 0;
+		failedSharedTargetOid = 0;
+		failedSharedTargetIgnoreUntilMs = 0;
+	}
 	if (stalemateIgnoredOid != 0 && nowMs >= stalemateIgnoreUntilMs) {
 		stalemateIgnoredOid = 0;
 		stalemateIgnoreUntilMs = 0;
 	}
+	if (failedSharedTargetOid != 0 && nowMs >=
+			failedSharedTargetIgnoreUntilMs) {
+		failedSharedTargetOid = 0;
+		failedSharedTargetIgnoreUntilMs = 0;
+	}
 
 	if (strongAgent->isDead()) {
+		if (controllerDriven && (controllerCombatTarget != nullptr ||
+				combatAiMapInstalled))
+			teardownControllerEngagement("death", false);
 		resetStalemateProgress();
 		// Report once; the manager owns the roster (delayed corpse cleanup,
 		// replacement at the squad's next city, leader promotion).
@@ -100,6 +616,29 @@ void SimPvpBotController::onTick() {
 		return;
 	}
 
+	// P.6.6 traversal-vs-combat suppression: never run the controller combat
+	// lane while this squad is traversing a starport interior (arrival-exit /
+	// collector-departure). The traversal state machine owns movement there; a
+	// concurrent combat approach deadlocks against it (observed live: a bot
+	// stalled OBLIVIOUS mid-reenter, neither closing on the enemy nor finishing
+	// the run, until the approach timed out). Skip scan/acquire/drive and let the
+	// traversal finish; combat resumes normally once the bot is outdoors again.
+	// (Combat is already torn down at relocation/boarding before a traversal
+	// begins, so a held target here is a rare edge; leaving it dormant is safe —
+	// the simPvpCombat no-op MOVE map does not affect the controller's own
+	// findNextPosition traversal movement.)
+	if (controllerDriven && isInteriorTraversalActive()) {
+		// Rare edge only: if a fight was still live entering the traversal, clear
+		// combat so the traversal moveTo is not held (moveTo() holds while
+		// isInCombat). No teardownControllerEngagement() here — that advances the
+		// work-loop generation and would kill the in-flight traversal chain.
+		if (strongAgent->isInCombat()) {
+			Locker locker(strongAgent);
+			strongAgent->clearCombatState(true);
+		}
+		return;
+	}
+
 	if (strongAgent->isInCombat()) {
 		// P.6.2a phantom-combat guard + P.6.3c combat leash: clear combat when
 		// there's no reachable live enemy - the defender died/left (stale combat
@@ -107,12 +646,43 @@ void SimPvpBotController::onTick() {
 		// disengage instead of chasing/attacking a target across the map at
 		// 100m+). Cleared after a few ticks so a brief LOS/range blip doesn't
 		// drop a genuine fight.
-		float leash = SimPlayerManager::instance()->getPvpCombatLeashMeters();
+		float leash = manager->getPvpCombatLeashMeters();
+		// P.6.6 Major-4: a controller-driven bot re-approaches out to the
+		// approach radius (which is >= its weapon band + hysteresis), so the
+		// legacy 72m leash must not classify a target inside that radius as
+		// unreachable and tear the fight down before driveCombatMovement can
+		// re-close. driveCombatMovement owns the true outer bound (approach
+		// radius + timeout).
+		if (controllerDriven) {
+			float approachRadius = combatIsConvergenceTarget &&
+				manager->isPvpSquadAggroSharingEnabled() ?
+				manager->getPvpSquadAggroConvergeRadiusMeters() :
+				manager->getPvpCombatApproachRadiusMeters();
+			if (approachRadius > leash)
+				leash = approachRadius;
+		}
 
 		ManagedReference<SceneObject*> defenderScene =
 			strongAgent->getMainDefender();
 		CreatureObject* defender = defenderScene != nullptr ?
 			defenderScene->asCreatureObject() : nullptr;
+
+		// P.6.6 Major-1: a bot pulled into combat by an enemy (defender-initiated)
+		// has no controller target yet, so nothing installs simPvpCombat and the
+		// stock MOVE tree still closes/stacks it. Adopt the live main defender so
+		// the controller lane takes over movement — but ONLY for a valid PvP
+		// combatant (player or sim bot). A world NPC that aggros an OVERT bot must
+		// NOT be dragged into the controller lane (it gets stranded by the range/
+		// LOS logic and dies passively — 2026-07-29 live observation); ordinary
+		// stock self-defense handles that case.
+		if (controllerDriven && controllerCombatTarget == nullptr &&
+				defender != nullptr && !defender->isDead() &&
+				!defender->isIncapacitated() &&
+				defender->getZone() == strongAgent->getZone() &&
+				isEligiblePvpCombatTarget(defender) &&
+				defender->isAttackableBy(strongAgent.get())) {
+			acquireControllerCombatTarget(defender);
+		}
 
 		bool reachableEnemy = false;
 		if (defender != nullptr && !defender->isDead() &&
@@ -167,11 +737,17 @@ void SimPvpBotController::onTick() {
 				stalemateIgnoreUntilMs = nowMs +
 					(uint64)graceSeconds * 1000;
 				resetStalemateProgress();
-				SimPlayerManager::instance()->recordPvpStalemateBreak(
+				manager->recordPvpStalemateBreak(
 					squadId, strongAgent->getObjectID(), brokenDefenderOid,
 					idleMs);
+				if (controllerDriven && (controllerCombatTarget != nullptr ||
+						combatAiMapInstalled))
+					teardownControllerEngagement("stalemate", true);
 				return;
 			}
+
+			if (controllerDriven && controllerCombatTarget != nullptr)
+				driveCombatMovement();
 		} else {
 			resetStalemateProgress();
 
@@ -180,10 +756,15 @@ void SimPvpBotController::onTick() {
 
 			phantomCombatTicks = 0;
 
-			Locker locker(strongAgent);
-			strongAgent->clearCombatState(true);
+			if (controllerDriven && (controllerCombatTarget != nullptr ||
+					combatAiMapInstalled)) {
+				teardownControllerEngagement("phantomCombat", true);
+			} else {
+				Locker locker(strongAgent);
+				strongAgent->clearCombatState(true);
+			}
 
-			if (SimPlayerManager::instance()->isPvpLogStateTransitionsEnabled()) {
+			if (manager->isPvpLogStateTransitionsEnabled()) {
 				Logger::console.info("SimPvpBot squad=" +
 					String::valueOf(squadId) + " oid=" +
 					String::valueOf(strongAgent->getObjectID()) +
@@ -205,10 +786,51 @@ void SimPvpBotController::onTick() {
 		strongAgent->setPosture(CreaturePosture::UPRIGHT, true, true);
 	}
 
-	scanForTargets();
+	if (controllerDriven && controllerCombatTarget != nullptr) {
+		driveCombatMovement();
+		return;
+	}
+
+	ManagedReference<CreatureObject*> sharedFallback;
+	if (controllerDriven && !scoutRole &&
+			manager->isPvpSquadAggroSharingEnabled()) {
+		uint64 excludeOid = failedSharedTargetOid != 0 &&
+			failedSharedTargetIgnoreUntilMs > nowMs ?
+			failedSharedTargetOid : 0;
+		Vector<uint64> sharedOids;
+		manager->getPvpSquadSharedCombatTargets(squadId, excludeOid, sharedOids);
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		static const uint32 imperialHash = String("imperial").hashCode();
+		static const uint32 rebelHash = String("rebel").hashCode();
+		const uint32 enemyFaction = imperial ? rebelHash : imperialHash;
+		// Take the first shared contact that passes this bot's own faction/zone/
+		// radius/attackability checks — one unsuitable entry no longer blocks the
+		// rest (Codex P.6.6b minor).
+		for (int i = 0; i < sharedOids.size() && sharedFallback == nullptr; ++i) {
+			ManagedReference<SceneObject*> sharedObject = zoneServer == nullptr ?
+				nullptr : zoneServer->getObject(sharedOids.get(i));
+			CreatureObject* sharedTarget = sharedObject == nullptr ? nullptr :
+				sharedObject->asCreatureObject();
+			if (sharedTarget != nullptr && !sharedTarget->isDead() &&
+					!sharedTarget->isIncapacitated() &&
+					sharedTarget->getZone() == strongAgent->getZone() &&
+					sharedTarget->getFaction() == enemyFaction &&
+					(sharedTarget->getParent() == nullptr ||
+						manager->isPvpCombatAllowInCellEngageEnabled()) &&
+					isEligiblePvpCombatTarget(sharedTarget) &&
+					sharedTarget->isAttackableBy(strongAgent.get()) &&
+					strongAgent->getDistanceTo(sharedTarget) <
+						manager->getPvpSquadAggroConvergeRadiusMeters())
+				sharedFallback = sharedTarget;
+		}
+	}
+
+	// Own scanning remains primary; scanForTargets selects a closer local target
+	// when one exists, otherwise the shared contact pulls this bot into the fight.
+	scanForTargets(sharedFallback.get());
 }
 
-void SimPvpBotController::scanForTargets() {
+void SimPvpBotController::scanForTargets(CreatureObject* sharedFallback) {
 	ManagedReference<AiAgent*> strongAgent = agent;
 
 	if (strongAgent == nullptr)
@@ -220,12 +842,22 @@ void SimPvpBotController::scanForTargets() {
 
 	SimPlayerManager* manager = SimPlayerManager::instance();
 	uint64 nowMs = System::getMiliTime();
-	const float scanRadius = scoutRole ? manager->getPvpScoutScanRadiusMeters()
-									   : manager->getPvpScanRadiusMeters();
-	const bool allowBotVsBot = manager->isPvpBotVsBotCombatEnabled();
+	const bool controllerDriven = isControllerDrivenEngageParticipant() &&
+		manager->isPvpControllerDrivenEngageEnabled();
+	float scanRadius = scoutRole ? manager->getPvpScoutScanRadiusMeters()
+									: manager->getPvpScanRadiusMeters();
+	// Report-only scouts keep their wider watch bubble; only engaging bots
+	// switch to the controller-driven approach radius (which is floored to the
+	// weapon's own engage band so a bot can always detect from beyond range).
+	if (controllerDriven && !scoutRole) {
+		scanRadius = manager->getPvpCombatApproachRadiusMeters();
+		float engageRange = currentWeaponEngageRange();
+		if (scanRadius < engageRange)
+			scanRadius = engageRange;
+	}
 
 	CloseObjectsVector* vec = (CloseObjectsVector*) strongAgent->getCloseObjects();
-	if (vec == nullptr)
+	if (vec == nullptr && sharedFallback == nullptr)
 		return;
 
 	static const uint32 imperialHash = String("imperial").hashCode();
@@ -233,7 +865,10 @@ void SimPvpBotController::scanForTargets() {
 	const uint32 enemyFaction = imperial ? rebelHash : imperialHash;
 
 	Vector<TreeEntry*> objects;
-	vec->safeCopyReceiversTo(objects, CloseObjectsVector::CREOTYPE);
+	if (vec != nullptr)
+		vec->safeCopyReceiversTo(objects, CloseObjectsVector::CREOTYPE);
+	CreatureObject* closestOwnTarget = nullptr;
+	float closestOwnDistance = 0.f;
 
 	for (int i = 0; i < objects.size(); ++i) {
 		SceneObject* obj = static_cast<SceneObject*>(objects.get(i));
@@ -247,8 +882,11 @@ void SimPvpBotController::scanForTargets() {
 		if (target->isIncapacitated() || target->isDead())
 			continue;
 
-		// Starport loops hunt outdoors; never chase into buildings/cells.
-		if (target->getParent() != nullptr)
+		// The legacy city-loop behavior hunts outdoors only. Controller-driven
+		// leaders may opt into cell-aware pursuit; the path itself still enters
+		// through the cell portal rather than clipping through a wall.
+		if (target->getParent() != nullptr && (!controllerDriven ||
+				!manager->isPvpCombatAllowInCellEngageEnabled()))
 			continue;
 
 		if (target->getFaction() != enemyFaction)
@@ -256,16 +894,10 @@ void SimPvpBotController::scanForTargets() {
 
 		bool targetIsPlayer = target->isPlayerCreature();
 
-		if (!targetIsPlayer) {
-			// Bot-vs-bot is gated: only other sim bots qualify, so squads can
-			// never aggro ordinary world NPCs of the enemy faction.
-			if (!allowBotVsBot)
-				continue;
-
-			AiAgent* targetAgent = target->asAiAgent();
-			if (targetAgent == nullptr || !targetAgent->getSimPlayerBot())
-				continue;
-		}
+		// Only players and (when bot-vs-bot is on) other sim PvP bots qualify;
+		// squads never aggro ordinary world NPCs of the enemy faction.
+		if (!isEligiblePvpCombatTarget(target))
+			continue;
 
 		if (!target->isAttackableBy(strongAgent.get()))
 			continue;
@@ -296,7 +928,19 @@ void SimPvpBotController::scanForTargets() {
 			return;
 		}
 
-		{
+		if (sharedFallback != nullptr) {
+			float distance = strongAgent->getDistanceTo(target);
+			if (closestOwnTarget == nullptr || distance < closestOwnDistance) {
+				closestOwnTarget = target;
+				closestOwnDistance = distance;
+			}
+			continue;
+		}
+
+		if (controllerDriven) {
+			acquireControllerCombatTarget(target);
+			driveCombatMovement();
+		} else {
 			Locker locker(strongAgent);
 			Locker crossLocker(target, strongAgent);
 
@@ -317,6 +961,42 @@ void SimPvpBotController::scanForTargets() {
 			SimPlayerManager::PVP_ANNOUNCE_CONTACT);
 		return;
 	}
+
+	if (sharedFallback == nullptr)
+		return;
+
+	// The shared contact is only a fallback. A closer enemy from this bot's own
+	// scan wins; if the scan saw the same OID, treat it as an ordinary local hit
+	// rather than counting it as convergence.
+	if (sharedFallback->isDead() || sharedFallback->isIncapacitated() ||
+			sharedFallback->getZone() != zone ||
+			sharedFallback->getFaction() != enemyFaction ||
+			(sharedFallback->getParent() != nullptr &&
+				!manager->isPvpCombatAllowInCellEngageEnabled()) ||
+			!isEligiblePvpCombatTarget(sharedFallback) ||
+			!sharedFallback->isAttackableBy(strongAgent.get()) ||
+			strongAgent->getDistanceTo(sharedFallback) >=
+				manager->getPvpSquadAggroConvergeRadiusMeters())
+		return;
+
+	CreatureObject* selectedTarget = sharedFallback;
+	bool isConvergence = true;
+	if (closestOwnTarget != nullptr &&
+			(closestOwnTarget->getObjectID() == sharedFallback->getObjectID() ||
+				closestOwnDistance < strongAgent->getDistanceTo(sharedFallback))) {
+		selectedTarget = closestOwnTarget;
+		isConvergence = false;
+	}
+
+	combatIsConvergenceTarget = isConvergence;
+	acquireControllerCombatTarget(selectedTarget);
+	driveCombatMovement();
+	if (isConvergence)
+		manager->recordPvpSquadConvergence(squadId);
+	manager->recordPvpEngagement(squadId,
+		selectedTarget->isPlayerCreature());
+	manager->announcePvpEvent(squadId,
+		SimPlayerManager::PVP_ANNOUNCE_CONTACT);
 }
 
 // ------------------------------------------------------
@@ -611,6 +1291,7 @@ void SimPvPController::beginArrivalExit(const Vector3& outdoorArrival) {
 	if (!arrivalExitActive) {
 		arrivalExitActive = true;
 		arrivalExitAttempts = 0;
+		arrivalExitEnteredCell = false;
 	}
 
 	arrivalOutdoor = outdoorArrival;
@@ -650,12 +1331,14 @@ void SimPvPController::beginArrivalExit(const Vector3& outdoorArrival) {
 
 	clearCellEgressState();
 	if (result == SimPlayerManager::STARPORT_WAYPOINT_FOUND) {
+		arrivalExitInteriorPath = true;
 		arrivalExitReenter = true;
 		setPhase(PVP_ARRIVAL_REENTER);
 		moveToInterior(interiorWorld, interiorLocal, interiorCell.get());
 		return;
 	}
 
+	arrivalExitInteriorPath = false;
 	arrivalExitReenter = false;
 	setPhase(PVP_ARRIVAL_EGRESS);
 	moveTo(outdoorArrival);
@@ -665,6 +1348,8 @@ void SimPvPController::finishArrivalExit() {
 	arrivalExitActive = false;
 	arrivalExitAttempts = 0;
 	arrivalExitReenter = false;
+	arrivalExitInteriorPath = false;
+	arrivalExitEnteredCell = false;
 	clearCellEgressState();
 }
 
@@ -694,6 +1379,9 @@ void SimPvPController::abandonArrivalExit(const String& reason) {
 			}
 		}
 	}
+	if (oid != 0)
+		SimPlayerManager::instance()->recordPvpStarportTraversalParticipant(
+			squadId, oid, "abandoned");
 	finishArrivalExit();
 	state = SimPlayerController::WAITING;
 	// Drop out of the squad arrival barrier so it never wedges waiting on a bot
@@ -724,8 +1412,26 @@ void SimPvPController::cancelCollectorDeparture(const String& reason) {
 void SimPvPController::onArrived() {
 	pathFailStreak = 0;
 
+	// P.6.6: a starport-traversal leg takes priority over combat on arrival, so
+	// the run completes instead of the combat drive preempting it (this early
+	// return was the direct cause of the mid-reenter stall).
+	if (hasControllerCombatTarget() && !isInteriorTraversalActive() &&
+		SimPlayerManager::instance()->isPvpControllerDrivenEngageEnabled()) {
+		driveCombatMovement();
+		return;
+	}
+
 	if (arrivalExitActive) {
 		if (phase == PVP_ARRIVAL_REENTER) {
+			// P.6.6 Major-5: cell-parented at the interior waypoint = a real
+			// interior traversal happened (vs a snap/clip that never adopted a
+			// cell).
+			{
+				Locker agentLocker(agent);
+				ManagedReference<SceneObject*> parent = agent->getParent().get();
+				if (parent != nullptr && parent->isCellObject())
+					arrivalExitEnteredCell = true;
+			}
 			clearCellEgressState();
 			arrivalExitReenter = false;
 			setPhase(PVP_ARRIVAL_EGRESS);
@@ -741,7 +1447,13 @@ void SimPvPController::onArrived() {
 				outdoors = parent == nullptr || !parent->isCellObject();
 			}
 			if (outdoors) {
+				// Interior only if intended AND a cell was actually adopted.
+				bool interiorRun = arrivalExitInteriorPath &&
+					arrivalExitEnteredCell;
 				finishArrivalExit();
+				SimPlayerManager::instance()->recordPvpStarportTraversalParticipant(
+					squadId, agent->getObjectID(),
+					interiorRun ? "interior" : "fallback");
 				SimPlayerManager::instance()->onPvpArrivalExitComplete(
 					squadId, agent->getObjectID());
 			}
@@ -791,6 +1503,18 @@ void SimPvPController::onArrived() {
 }
 
 void SimPvPController::onPathFailed() {
+	// P.6.6: during a starport-traversal leg, a path failure belongs to the
+	// traversal state machine (below), not the combat lane.
+	if (hasControllerCombatTarget() && !isInteriorTraversalActive() &&
+		SimPlayerManager::instance()->isPvpControllerDrivenEngageEnabled()) {
+		// The shared stuck watchdog already bounds repeated retries. Keep the
+		// controller target alive so the next tick can re-issue a cell-aware
+		// approach, while the radius/timeout guard bounds the whole leg.
+		state = IDLE;
+		driveCombatMovement();
+		return;
+	}
+
 	if (arrivalExitActive) {
 		SimPlayerController::onPathFailed();
 		return;
@@ -1183,8 +1907,9 @@ void SimPvPMemberController::startSimLoop() {
 
 	assertFollow();
 
-	// Keep exactly one 1s tick chain alive for scanning/death detection. The
-	// member never calls moveTo(); the FOLLOW trees own its movement.
+	// Keep exactly one 1s tick chain alive for scanning/death detection. FOLLOW
+	// owns ordinary movement; the controller combat lane temporarily owns an
+	// approach while its target latch is active.
 	state = SimPlayerController::WAITING;
 	uint64 generation = advanceWorkLoopGeneration("pvpMemberStart");
 	Reference<ArrivalCheckTask*> task = new ArrivalCheckTask(this, generation);
@@ -1196,6 +1921,15 @@ void SimPvPMemberController::onArrived() {
 		return;
 
 	if (arrivalExitReenter) {
+		// P.6.6 Major-5: arriving at the interior waypoint with the agent
+		// actually parented to a cell is the evidence that a real interior
+		// traversal happened (vs a snap/clip that never adopted a cell).
+		{
+			Locker agentLocker(agent);
+			ManagedReference<SceneObject*> parent = agent->getParent().get();
+			if (parent != nullptr && parent->isCellObject())
+				arrivalExitEnteredCell = true;
+		}
 		clearCellEgressState();
 		arrivalExitReenter = false;
 		moveTo(arrivalOutdoor);
@@ -1209,9 +1943,17 @@ void SimPvPMemberController::onArrived() {
 		outdoors = parent == nullptr || !parent->isCellObject();
 	}
 	if (outdoors) {
+		// Report "interior" only when an interior path was intended AND the bot
+		// was observed inside a cell; intended-but-never-entered is a fallback.
+		bool interiorRun = arrivalExitInteriorPath && arrivalExitEnteredCell;
 		arrivalExitActive = false;
 		arrivalExitAttempts = 0;
+		arrivalExitInteriorPath = false;
+		arrivalExitEnteredCell = false;
 		clearCellEgressState();
+		SimPlayerManager::instance()->recordPvpStarportTraversalParticipant(
+			squadId, agent->getObjectID(),
+			interiorRun ? "interior" : "fallback");
 		SimPlayerManager::instance()->onPvpArrivalExitComplete(
 			squadId, agent->getObjectID());
 	}
@@ -1226,6 +1968,7 @@ void SimPvPMemberController::beginArrivalExit(const Vector3& outdoorArrival) {
 		return;
 
 	arrivalExitActive = true;
+	arrivalExitEnteredCell = false;
 	arrivalOutdoor = outdoorArrival;
 
 	if (arrivalExitAttempts >= manager->getTicketCollectorApproachAttempts()) {
@@ -1264,9 +2007,11 @@ void SimPvPMemberController::beginArrivalExit(const Vector3& outdoorArrival) {
 
 	clearCellEgressState();
 	if (result == SimPlayerManager::STARPORT_WAYPOINT_FOUND) {
+		arrivalExitInteriorPath = true;
 		arrivalExitReenter = true;
 		moveToInterior(interiorWorld, interiorLocal, interiorCell.get());
 	} else {
+		arrivalExitInteriorPath = false;
 		arrivalExitReenter = false;
 		moveTo(outdoorArrival);
 	}
@@ -1296,9 +2041,13 @@ void SimPvPMemberController::abandonArrivalExit(const String& reason) {
 			}
 		}
 	}
+	if (oid != 0)
+		SimPlayerManager::instance()->recordPvpStarportTraversalParticipant(
+			squadId, oid, "abandoned");
 	arrivalExitActive = false;
 	arrivalExitAttempts = 0;
 	arrivalExitReenter = false;
+	arrivalExitInteriorPath = false;
 	clearCellEgressState();
 	state = SimPlayerController::WAITING;
 	if (oid != 0)
@@ -1327,8 +2076,21 @@ void SimPvPMemberController::onTick() {
 	SimPvpBotController::onTick();
 
 	ManagedReference<AiAgent*> strongAgent = agent;
-	if (strongAgent == nullptr || strongAgent->isDead() ||
-			strongAgent->isInCombat())
+	if (strongAgent == nullptr || strongAgent->isDead())
+		return;
+
+	// The shared base lane can acquire a member target while this controller's
+	// normal FOLLOW tree is still active. Drive the same target here as well so
+	// a member owns its approach after the base tick returns, including the
+	// combat-cleared portion of that approach. P.6.6: but never while traversing
+	// a starport interior — the arrival-exit owns movement there (see base onTick).
+	if (hasControllerCombatTarget() && !isInteriorTraversalActive()) {
+		driveCombatMovement();
+		if (hasControllerCombatTarget())
+			return;
+	}
+
+	if (strongAgent->isInCombat())
 		return;
 
 	if (arrivalExitActive)
@@ -1350,7 +2112,8 @@ void SimPvPMemberController::assertFollow() {
 			!SimPlayerManager::instance()->isPvpArrivalExitComplete(squadId))
 		return;
 
-	if (strongAgent->isDead() || strongAgent->isInCombat())
+	if (strongAgent->isDead() || strongAgent->isInCombat() ||
+			hasControllerCombatTarget())
 		return;
 
 	if (leader->isDead())

@@ -6027,6 +6027,21 @@ void SimPlayerManager::loadLuaConfig() {
     pvpSquadsPerFaction = 1;
     pvpSquadSize = 4;
     pvpScanRadiusMeters = 40.f;
+    pvpControllerDrivenEngage = false;
+    pvpSquadAggroSharing = false;
+    pvpSquadAggroConvergeRadiusMeters = 300.f;
+    pvpSquadAggroConvergeTimeoutMillis = 60000;
+    pvpSquadAggroTargetTtlSeconds = 8;
+    pvpSquadAggroFailedTargetIgnoreSeconds = 10;
+    pvpCombatApproachRadiusMeters = 100.f;
+    pvpCombatReapproachHysteresisMeters = 8.f;
+    pvpCombatArrivalToleranceMeters = 4.f;
+    pvpCombatApproachTimeoutMillis = 15000;
+    pvpCombatLosGateDamage = false;
+    pvpCombatAllowInCellEngage = false;
+    pvpCombatTickMillis = 0;
+    pvpCombatFallbackWeaponRangeMeters = 64.f;
+    pvpCombatLogMovement = false;
     pvpCombatLeashMeters = 72.f;
     pvpLoiterMinSeconds = 60;
     pvpLoiterMaxSeconds = 180;
@@ -16958,6 +16973,154 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
         pvpActivity["squadReformsTotal"] = pvpSquadReformsTotal;
         pvpActivity["boardAnywayTotal"] = pvpBoardAnywayTotal;
         pvpActivity["breakOffsTotal"] = pvpBreakOffsTotal;
+
+		// P.6.6 controller-owned combat verification. This is a read-only
+		// snapshot: no agent locks are taken while the dashboard observes the
+		// controller's single-writer combat lane.
+		JSONSerializationType combatJson = JSONSerializationType::object();
+		combatJson["controllerDrivenEngage"] =
+			pvpControllerDrivenEngage;
+		combatJson["squadAggroSharing"] = pvpSquadAggroSharing;
+		combatJson["squadAggroConvergeRadiusMeters"] =
+			pvpSquadAggroConvergeRadiusMeters;
+		combatJson["squadAggroTargetTtlSeconds"] =
+			pvpSquadAggroTargetTtlSeconds;
+		combatJson["convergencesTotal"] = pvpCombatConvergencesTotal;
+		combatJson["approachRadiusMeters"] =
+			pvpCombatApproachRadiusMeters;
+		int approachesActive = 0;
+		int engagementsInRange = 0;
+		uint64 losBlockedAttacks = 0;
+		int inCellEngagements = 0;
+		JSONSerializationType combatSquadRows = JSONSerializationType::array();
+
+		auto observeCombatController = [&](uint64 oid, String& squadState,
+			int& activeTargets) {
+			if (!controllers.contains(oid))
+				return;
+
+			Reference<SimPlayerController*> controller = controllers.get(oid);
+			SimPvpBotController* bot = controller == nullptr ? nullptr :
+				dynamic_cast<SimPvpBotController*>(controller.get());
+			if (bot == nullptr || !bot->hasControllerCombatTarget())
+				return;
+
+			activeTargets++;
+			if (bot->isControllerCombatApproachActive())
+				approachesActive++;
+			if (bot->isControllerCombatEngagementInRange())
+				engagementsInRange++;
+			if (bot->isControllerCombatInCellEngagement())
+				inCellEngagements++;
+			losBlockedAttacks += bot->getControllerCombatLosBlockedAttacks();
+
+			String state = bot->getControllerCombatSubState();
+			if (state == "no-LOS")
+				squadState = state;
+			else if (squadState != "no-LOS" && state == "approaching")
+				squadState = state;
+			else if (squadState == "idle")
+				squadState = state;
+		};
+
+		for (int i = 0; i < pvpSquads.size(); ++i) {
+			const SimPvpSquad& squad = pvpSquads.get(i);
+			String combatState = "idle";
+			int activeTargets = 0;
+			int sharedTargets = 0;
+			if (pvpSquadAggroSharing) {
+				uint64 nowMs = System::getMiliTime();
+				uint64 ttlMs = static_cast<uint64>(
+					pvpSquadAggroTargetTtlSeconds) * 1000;
+				for (int s = 0; s < squad.sharedCombatTargets.size(); ++s) {
+					const SimPvpSharedCombatTarget& target =
+						squad.sharedCombatTargets.get(s);
+					if (target.enemyOid != 0 && nowMs >= target.lastRefreshMs &&
+							nowMs - target.lastRefreshMs < ttlMs)
+						sharedTargets++;
+				}
+			}
+			if (pvpControllerDrivenEngage) {
+				observeCombatController(squad.leaderOid, combatState,
+					activeTargets);
+				for (int m = 0; m < squad.memberOids.size(); ++m)
+					observeCombatController(squad.memberOids.get(m), combatState,
+						activeTargets);
+			}
+
+			JSONSerializationType combatRow = JSONSerializationType::object();
+			combatRow["squadId"] = squad.squadId;
+			combatRow["faction"] = squad.imperial ? "imperial" : "rebel";
+			combatRow["role"] = squad.scout ? "scout" : "patrol";
+			combatRow["state"] = combatState;
+			combatRow["combatSubState"] = combatState;
+			combatRow["activeTargets"] = activeTargets;
+			combatRow["sharedTargets"] = sharedTargets;
+			combatSquadRows.push_back(combatRow);
+		}
+
+		combatJson["approachesActive"] = approachesActive;
+		combatJson["engagementsInRange"] = engagementsInRange;
+		combatJson["losBlockedAttacks"] = losBlockedAttacks;
+		combatJson["inCellEngagements"] = inCellEngagements;
+		combatJson["squads"] = combatSquadRows;
+
+		JSONSerializationType traversalJson = JSONSerializationType::object();
+		traversalJson["enabled"] =
+			isPvpCombatMovementDiagnosticsEnabled();
+		int traversalRuns = 0;
+		int traversalFullRuns = 0;
+		int traversalActive = 0;
+		int scoutRuns = 0;
+		int scoutFullRuns = 0;
+		int patrolRuns = 0;
+		int patrolFullRuns = 0;
+		int traversalFallbackParticipants = 0;
+		JSONSerializationType traversalRows = JSONSerializationType::array();
+		for (int i = 0; i < pvpSquads.size(); ++i) {
+			const SimPvpSquad& squad = pvpSquads.get(i);
+			if (isPvpCombatMovementDiagnosticsEnabled()) {
+				traversalRuns += squad.starportTraversalRuns;
+				traversalFullRuns += squad.starportTraversalFullRuns;
+				if (squad.starportTraversalActive)
+					traversalActive++;
+				if (squad.scout) {
+					scoutRuns += squad.starportTraversalRuns;
+					scoutFullRuns += squad.starportTraversalFullRuns;
+				} else {
+					patrolRuns += squad.starportTraversalRuns;
+					patrolFullRuns += squad.starportTraversalFullRuns;
+				}
+				traversalFallbackParticipants += squad.starportTraversalFallback;
+			}
+
+			JSONSerializationType traversalRow = JSONSerializationType::object();
+			traversalRow["squadId"] = squad.squadId;
+			traversalRow["role"] = squad.scout ? "scout" : "patrol";
+			traversalRow["active"] = squad.starportTraversalActive;
+			traversalRow["runs"] = isPvpCombatMovementDiagnosticsEnabled() ?
+				squad.starportTraversalRuns : 0;
+			traversalRow["fullInteriorRuns"] =
+				isPvpCombatMovementDiagnosticsEnabled() ?
+					squad.starportTraversalFullRuns : 0;
+			traversalRow["expected"] = squad.starportTraversalExpected;
+			traversalRow["interior"] = squad.starportTraversalInterior;
+			traversalRow["fallback"] = squad.starportTraversalFallback;
+			traversalRow["status"] = squad.starportTraversalLastStatus;
+			traversalRows.push_back(traversalRow);
+		}
+		traversalJson["runsTotal"] = traversalRuns;
+		traversalJson["fullInteriorRuns"] = traversalFullRuns;
+		traversalJson["activeRuns"] = traversalActive;
+		traversalJson["scoutRuns"] = scoutRuns;
+		traversalJson["scoutFullInteriorRuns"] = scoutFullRuns;
+		traversalJson["patrolRuns"] = patrolRuns;
+		traversalJson["patrolFullInteriorRuns"] = patrolFullRuns;
+		traversalJson["fallbackParticipants"] =
+			traversalFallbackParticipants;
+		traversalJson["squads"] = traversalRows;
+		combatJson["starportTraversal"] = traversalJson;
+		pvpActivity["combatEngagement"] = combatJson;
 
         // P.6.2 scouts + gank convergence.
         JSONSerializationType scoutsJson = JSONSerializationType::object();
@@ -29998,6 +30161,65 @@ void SimPlayerManager::applyPvpConfig(LuaObject& pvpConfig) {
     if (scanRadius >= 5.f && scanRadius <= 128.f)
         pvpScanRadiusMeters = scanRadius;
 
+    LuaObject combat = pvpConfig.getObjectField("combat");
+    if (combat.isValidTable()) {
+        pvpControllerDrivenEngage = combat.getBooleanField(
+            "controllerDrivenEngage", pvpControllerDrivenEngage);
+
+        // P.6.6b: every shared-aggro field has an explicit bounded parse. In
+        // particular, zero does not silently preserve a prior runtime value.
+        pvpSquadAggroSharing = combat.getBooleanField(
+            "squadAggroSharing", pvpSquadAggroSharing);
+        pvpSquadAggroConvergeRadiusMeters = clampFloatRange(
+            combat.getFloatField("squadAggroConvergeRadiusMeters",
+                pvpSquadAggroConvergeRadiusMeters), 16.f, 1024.f);
+        pvpSquadAggroConvergeTimeoutMillis = clampIntRange(
+            combat.getIntField("squadAggroConvergeTimeoutMillis",
+                pvpSquadAggroConvergeTimeoutMillis), 1000, 300000);
+        pvpSquadAggroTargetTtlSeconds = clampIntRange(
+            combat.getIntField("squadAggroTargetTtlSeconds",
+                pvpSquadAggroTargetTtlSeconds), 1, 300);
+        pvpSquadAggroFailedTargetIgnoreSeconds = clampIntRange(
+            combat.getIntField("squadAggroFailedTargetIgnoreSeconds",
+                pvpSquadAggroFailedTargetIgnoreSeconds), 1, 600);
+
+        float approachRadius = combat.getFloatField("approachRadiusMeters");
+        if (approachRadius >= 5.f && approachRadius <= 512.f)
+            pvpCombatApproachRadiusMeters = approachRadius;
+
+        float hysteresis = combat.getFloatField(
+            "reapproachHysteresisMeters");
+        if (hysteresis >= 0.f && hysteresis <= 128.f)
+            pvpCombatReapproachHysteresisMeters = hysteresis;
+
+        float arrivalTolerance = combat.getFloatField(
+            "arrivalToleranceMeters");
+        if (arrivalTolerance >= 1.f && arrivalTolerance <= 32.f)
+            pvpCombatArrivalToleranceMeters = arrivalTolerance;
+
+        int approachTimeout = combat.getIntField("approachTimeoutMillis");
+        pvpCombatApproachTimeoutMillis = approachTimeout <= 0 ? 0 :
+            clampIntRange(approachTimeout, 1000, 120000);
+
+        pvpCombatLosGateDamage = combat.getBooleanField(
+            "losGateDamage", pvpCombatLosGateDamage);
+        pvpCombatAllowInCellEngage = combat.getBooleanField(
+            "allowInCellEngage", pvpCombatAllowInCellEngage);
+
+        int combatTick = combat.getIntField("combatTickMillis");
+        pvpCombatTickMillis = combatTick <= 0 ? 0 :
+            (uint32)clampIntRange(combatTick, 100, 5000);
+
+        float fallbackRange = combat.getFloatField(
+            "fallbackWeaponRangeMeters");
+        if (fallbackRange >= 1.f && fallbackRange <= 256.f)
+            pvpCombatFallbackWeaponRangeMeters = fallbackRange;
+
+        pvpCombatLogMovement = combat.getBooleanField(
+            "logCombatMovement", pvpCombatLogMovement);
+    }
+    combat.pop();
+
     float leash = pvpConfig.getFloatField("combatLeashMeters");
     if (leash >= 16.f && leash <= 256.f)
         pvpCombatLeashMeters = leash;
@@ -32175,6 +32397,88 @@ void SimPlayerManager::sweepPvpOrphanBots() {
     }
 }
 
+void SimPlayerManager::beginPvpStarportTraversalDiagnostic(uint64 squadId,
+		const Vector<uint64>& participantOids) {
+	if (!isPvpCombatMovementDiagnosticsEnabled() || participantOids.isEmpty())
+		return;
+
+	uint64 nowMs = System::getMiliTime();
+	{
+		Locker squadLock(&pvpSquadMutex);
+		int idx = findPvpSquadIndex(squadId);
+		if (idx < 0)
+			return;
+
+		SimPvpSquad& squad = pvpSquads.get(idx);
+		squad.starportTraversalActive = true;
+		squad.starportTraversalExpected = participantOids.size();
+		squad.starportTraversalInterior = 0;
+		squad.starportTraversalFallback = 0;
+		squad.starportTraversalRuns++;
+		squad.starportTraversalLastRunMs = nowMs;
+		squad.starportTraversalLastStatus = "in_progress";
+		squad.starportTraversalParticipantOids = participantOids;
+		squad.starportTraversalRecordedOids.removeAll();
+	}
+
+	if (isPvpCombatLogMovementEnabled() || isPvpLogStateTransitionsEnabled())
+		info("SimPvpStarportTraversal squad=" + String::valueOf(squadId) +
+			" expected=" + String::valueOf(participantOids.size()) +
+			" status=in_progress", true);
+}
+
+void SimPlayerManager::recordPvpStarportTraversalParticipant(uint64 squadId,
+		uint64 oid, const String& result) {
+	if (!isPvpCombatMovementDiagnosticsEnabled())
+		return;
+
+	bool complete = false;
+	bool fullTraversal = false;
+	int interior = 0;
+	int fallback = 0;
+	String status;
+
+	{
+		Locker squadLock(&pvpSquadMutex);
+		int idx = findPvpSquadIndex(squadId);
+		if (idx < 0)
+			return;
+
+		SimPvpSquad& squad = pvpSquads.get(idx);
+		if (!squad.starportTraversalActive ||
+				!squad.starportTraversalParticipantOids.contains(oid) ||
+				squad.starportTraversalRecordedOids.contains(oid))
+			return;
+
+		squad.starportTraversalRecordedOids.add(oid);
+		if (result == "interior")
+			squad.starportTraversalInterior++;
+		else
+			squad.starportTraversalFallback++;
+
+		interior = squad.starportTraversalInterior;
+		fallback = squad.starportTraversalFallback;
+		complete = squad.starportTraversalRecordedOids.size() >=
+			squad.starportTraversalExpected;
+		if (complete) {
+			fullTraversal = fallback == 0 &&
+				interior == squad.starportTraversalExpected;
+			squad.starportTraversalActive = false;
+			if (fullTraversal)
+				squad.starportTraversalFullRuns++;
+			squad.starportTraversalLastStatus = fullTraversal ?
+				"full_interior" : "fallback_or_partial";
+		}
+		status = squad.starportTraversalLastStatus;
+	}
+
+	if (complete && (isPvpCombatLogMovementEnabled() ||
+			isPvpLogStateTransitionsEnabled()))
+		info("SimPvpStarportTraversal squad=" + String::valueOf(squadId) +
+			" status=" + status + " interior=" + String::valueOf(interior) +
+			" fallback=" + String::valueOf(fallback), true);
+}
+
 void SimPlayerManager::boardPvpSquad(uint64 squadId) {
     ZoneServer* zoneServer = ServerCore::getZoneServer();
 
@@ -32579,6 +32883,14 @@ void SimPlayerManager::boardPvpSquad(uint64 squadId) {
         }
     }
 
+	if (arrivalNeedsCollectorExit && destinationCollectorFound) {
+		Vector<uint64> diagnosticOids;
+		diagnosticOids.add(snapshot.leaderOid);
+		for (int i = 0; i < aliveMemberOids.size(); ++i)
+			diagnosticOids.add(aliveMemberOids.get(i));
+		beginPvpStarportTraversalDiagnostic(squadId, diagnosticOids);
+	}
+
     for (int i = 0; i < newMemberCtrls.size(); ++i) {
         Reference<SimPvPMemberController*> memberCtrl = newMemberCtrls.get(i);
         ManagedReference<AiAgent*> memberAgent = memberCtrl->getAgent();
@@ -32680,6 +32992,7 @@ void SimPlayerManager::onPvpArrivalExitComplete(uint64 squadId, uint64 oid) {
 	uint64 leaderOid = 0;
 	Vector<uint64> memberOids;
 	bool startNextPhase = false;
+	bool arrivalParticipantRemoved = false;
 
 	{
 		Locker squadLock(&pvpSquadMutex);
@@ -32696,26 +33009,29 @@ void SimPlayerManager::onPvpArrivalExitComplete(uint64 squadId, uint64 oid) {
 		for (int i = 0; i < squad.arrivalExitPending.size(); ++i) {
 			if (squad.arrivalExitPending.get(i) == oid) {
 				squad.arrivalExitPending.remove(i);
+				arrivalParticipantRemoved = true;
 				break;
 			}
 		}
 
-		if (!squad.arrivalExitPending.isEmpty())
-			return;
-
-		squad.arrivalExitActive = false;
-		destinationPlanet = squad.planet;
-		destinationCity = squad.city;
-		destinationShuttle = squad.shuttlePos;
-		destinationHangout = squad.hangoutPos;
-		transit = squad.arrivalExitTransit;
-		dwellSeconds = squad.arrivalExitDwellSeconds;
-		leaderOid = squad.leaderOid;
-		memberOids = squad.memberOids;
-		squad.arrivalExitTransit = false;
-		squad.arrivalExitDwellSeconds = 0;
-		startNextPhase = true;
+		if (squad.arrivalExitPending.isEmpty()) {
+			squad.arrivalExitActive = false;
+			destinationPlanet = squad.planet;
+			destinationCity = squad.city;
+			destinationShuttle = squad.shuttlePos;
+			destinationHangout = squad.hangoutPos;
+			transit = squad.arrivalExitTransit;
+			dwellSeconds = squad.arrivalExitDwellSeconds;
+			leaderOid = squad.leaderOid;
+			memberOids = squad.memberOids;
+			squad.arrivalExitTransit = false;
+			squad.arrivalExitDwellSeconds = 0;
+			startNextPhase = true;
+		}
 	}
+
+	if (arrivalParticipantRemoved)
+		recordPvpStarportTraversalParticipant(squadId, oid, "barrier_or_death");
 
 	if (!startNextPhase)
 		return;
@@ -32951,6 +33267,155 @@ void SimPlayerManager::recordPvpEngagement(uint64 squadId, bool targetWasPlayer)
     } else {
         pvpBotEngagementsTotal++;
     }
+}
+
+void SimPlayerManager::recordPvpSquadCombatTarget(uint64 squadId,
+        uint64 enemyOid) {
+    if (!enabled || !pvpEnabled || !pvpSquadAggroSharing || squadId == 0 ||
+            enemyOid == 0)
+        return;
+
+    const uint64 nowMs = System::getMiliTime();
+    const uint64 ttlMs = static_cast<uint64>(
+        pvpSquadAggroTargetTtlSeconds) * 1000;
+
+    Locker squadLock(&pvpSquadMutex);
+    int idx = findPvpSquadIndex(squadId);
+    if (idx < 0)
+        return;
+
+    SimPvpSquad& squad = pvpSquads.get(idx);
+
+    // Prune expired rows before inserting so a long-running fight cannot
+    // leave an unbounded set behind. This is mutex-only work; no agent is
+    // resolved or locked while pvpSquadMutex is held.
+    for (int i = squad.sharedCombatTargets.size() - 1; i >= 0; --i) {
+        const SimPvpSharedCombatTarget& entry =
+            squad.sharedCombatTargets.get(i);
+        if (entry.enemyOid == 0 ||
+                (nowMs >= entry.lastRefreshMs &&
+                    nowMs - entry.lastRefreshMs >= ttlMs))
+            squad.sharedCombatTargets.remove(i);
+    }
+
+    for (int i = 0; i < squad.sharedCombatTargets.size(); ++i) {
+        SimPvpSharedCombatTarget& entry = squad.sharedCombatTargets.get(i);
+        if (entry.enemyOid == enemyOid) {
+            entry.lastRefreshMs = nowMs;
+            return;
+        }
+    }
+
+    // A squad only needs the small set of enemies it is actively fighting.
+    // Keep the newest contacts if a pathological fight produces more rows.
+    static const int maxSharedTargets = 8;
+    if (squad.sharedCombatTargets.size() >= maxSharedTargets) {
+        int oldest = 0;
+        for (int i = 1; i < squad.sharedCombatTargets.size(); ++i) {
+            if (squad.sharedCombatTargets.get(i).lastRefreshMs <
+                    squad.sharedCombatTargets.get(oldest).lastRefreshMs)
+                oldest = i;
+        }
+        squad.sharedCombatTargets.remove(oldest);
+    }
+
+    SimPvpSharedCombatTarget entry;
+    entry.enemyOid = enemyOid;
+    entry.lastRefreshMs = nowMs;
+    squad.sharedCombatTargets.add(entry);
+}
+
+void SimPlayerManager::getPvpSquadSharedCombatTargets(uint64 squadId,
+        uint64 excludeOid, Vector<uint64>& outLiveOids) {
+    outLiveOids.removeAll();
+    if (!enabled || !pvpEnabled || !pvpSquadAggroSharing || squadId == 0)
+        return;
+
+    const uint64 nowMs = System::getMiliTime();
+    const uint64 ttlMs = static_cast<uint64>(
+        pvpSquadAggroTargetTtlSeconds) * 1000;
+    Vector<SimPvpSharedCombatTarget> candidates;
+
+    {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndex(squadId);
+        if (idx < 0)
+            return;
+
+        SimPvpSquad& squad = pvpSquads.get(idx);
+        for (int i = squad.sharedCombatTargets.size() - 1; i >= 0; --i) {
+            const SimPvpSharedCombatTarget& entry =
+                squad.sharedCombatTargets.get(i);
+            if (entry.enemyOid == 0 ||
+                    (nowMs >= entry.lastRefreshMs &&
+                        nowMs - entry.lastRefreshMs >= ttlMs))
+                squad.sharedCombatTargets.remove(i);
+        }
+        candidates = squad.sharedCombatTargets;
+    }
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    if (zoneServer == nullptr)
+        return;
+
+    Vector<SimPvpSharedCombatTarget> deadEntries;
+
+    // Resolve and lock agents only after releasing pvpSquadMutex. Return EVERY
+    // live contact (not just the first) so the caller can skip one that fails its
+    // own faction/zone/radius/attackability checks and still try the rest (Codex
+    // P.6.6b minor).
+    for (int i = 0; i < candidates.size(); ++i) {
+        const SimPvpSharedCombatTarget& entry = candidates.get(i);
+        if (entry.enemyOid == excludeOid)
+            continue;
+
+        ManagedReference<SceneObject*> object = zoneServer->getObject(
+            entry.enemyOid);
+        CreatureObject* target = object == nullptr ? nullptr :
+            object->asCreatureObject();
+        bool live = false;
+        if (target != nullptr) {
+            Locker targetLock(target);
+            live = !target->isDead() && !target->isIncapacitated() &&
+                target->getZone() != nullptr;
+        }
+
+        if (!live) {
+            deadEntries.add(entry);
+            continue;
+        }
+
+        outLiveOids.add(entry.enemyOid);
+    }
+
+    if (deadEntries.size() > 0) {
+        Locker squadLock(&pvpSquadMutex);
+        int idx = findPvpSquadIndex(squadId);
+        if (idx >= 0) {
+            SimPvpSquad& squad = pvpSquads.get(idx);
+            for (int i = squad.sharedCombatTargets.size() - 1; i >= 0; --i) {
+                const SimPvpSharedCombatTarget& current =
+                    squad.sharedCombatTargets.get(i);
+                for (int d = 0; d < deadEntries.size(); ++d) {
+                    const SimPvpSharedCombatTarget& dead = deadEntries.get(d);
+                    if (current.enemyOid == dead.enemyOid &&
+                            current.lastRefreshMs == dead.lastRefreshMs) {
+                        squad.sharedCombatTargets.remove(i);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void SimPlayerManager::recordPvpSquadConvergence(uint64 squadId) {
+    if (!enabled || !pvpEnabled || !pvpSquadAggroSharing)
+        return;
+
+    Locker squadLock(&pvpSquadMutex);
+    if (findPvpSquadIndex(squadId) >= 0)
+        pvpCombatConvergencesTotal++;
 }
 
 void SimPlayerManager::recordPvpStalemateBreak(uint64 squadId, uint64 oid,
