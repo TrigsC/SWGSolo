@@ -211,6 +211,10 @@ public:
 	void onTick() override;
 	bool shouldContinueArrivalChecks() const override;
 	bool usesNavmeshHybridMovement() const override { return true; }
+	bool isCombatDriverActive() const override {
+		return targetOid != 0 && (pursuing || phase == HUNTING ||
+			phase == ENGAGING_LAIR);
+	}
 	// Only resume a hybrid travel leg while the order is genuinely active and
 	// not tearing down its lair. Once the order completes/abandons/times out
 	// (orderActive=false) or enters cleanup, the preserved finalDestination must

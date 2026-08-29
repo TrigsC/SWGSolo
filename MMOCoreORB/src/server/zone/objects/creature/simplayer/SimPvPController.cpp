@@ -381,7 +381,10 @@ void SimPvpBotController::approachTarget(CreatureObject* target) {
 	else
 		clearInteriorApproachLeg();
 
-	moveTo(targetWorld, targetLocal, targetCell);
+	if (isStructureTraversalFeatureEnabled() && isTraversalActive())
+		moveToCombat(targetWorld, targetLocal, targetCell);
+	else
+		moveTo(targetWorld, targetLocal, targetCell);
 }
 
 void SimPvpBotController::engageHeldTarget(CreatureObject* target) {
@@ -602,6 +605,8 @@ void SimPvpBotController::onTick() {
 	}
 
 	if (strongAgent->isDead()) {
+		if (isStructureTraversalFeatureEnabled() && isTraversalActive())
+			clearStructureTraversalState("pvp_death");
 		if (controllerDriven && (controllerCombatTarget != nullptr ||
 				combatAiMapInstalled))
 			teardownControllerEngagement("death", false);
@@ -1503,6 +1508,11 @@ void SimPvPController::onArrived() {
 }
 
 void SimPvPController::onPathFailed() {
+	if (isStructureTraversalFeatureEnabled() && isTraversalActive()) {
+		SimPlayerController::onPathFailed();
+		return;
+	}
+
 	// P.6.6: during a starport-traversal leg, a path failure belongs to the
 	// traversal state machine (below), not the combat lane.
 	if (hasControllerCombatTarget() && !isInteriorTraversalActive() &&

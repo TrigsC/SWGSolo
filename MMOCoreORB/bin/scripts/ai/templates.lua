@@ -11,6 +11,7 @@ includeFile("villageRaider.lua")
 includeFile("simMiner.lua")
 includeFile("simPvp.lua")
 includeFile("simHunter.lua")
+includeFile("simTraversalTest.lua")
 
 customMap = {
 	{ "crackdown", {
@@ -63,6 +64,12 @@ customMap = {
 	-- remain inherited so the equipped rifle is actually used.
 	{ "simHunter", {
 		{IDLE, "idleSimHunter"}
+	}},
+
+	-- Phase 3 structure-traversal harness.  Only IDLE is overridden; the
+	-- inherited combat sockets stay live so scripted interrupts are real combat.
+	{ "simTraversalTest", {
+		{IDLE, "idleSimTraversalTest"}
 	}},
 }
 

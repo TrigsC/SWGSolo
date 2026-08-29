@@ -708,6 +708,422 @@ SimPlayerManagerConfig = {
         logEverySimLoopTick = true,
     },
 
+    -- P.9 structure traversal foundation. The production API and its
+    -- diagnostics are compiled in but dormant until this master gate is
+    -- explicitly enabled.
+    structureTraversal = {
+        enabled = false,
+        logging = false,
+        hollowEscalationEnabled = false,
+        hollowEscalationAttemptCap = 1,
+        hollowEscalationPreferTravelPoint = true,
+        -- Option C is known to clip (crossesGeometry=1, hitAt=0.069) and is
+        -- superseded by D7.
+        hollowEscalationDirectFallback = false,
+        resumeSettleMs = 2000,
+        resumeAttemptCap = 3,
+        egressAttemptCap = 2,
+        teleportAnomalyMeters = 25,
+        zSanityMeters = 5,
+        -- Horizontal slack for "still inside the owning building's enclosed
+        -- hollow" (starport landing pad is cell 0 but walled in).
+        hollowContainmentMarginMeters = 15,
+        zeroClip = {
+            -- Committed defaults are OFF. An observation run flips these as a
+            -- deployment-local override and restores them afterwards; the probe
+            -- measured p95 ~19ms per path request plus per-path file logging,
+            -- which is not something to ship enabled.
+            enabled = false,
+            logging = false,
+            enforce = false,
+            -- D7 Phase 2. Conclusively-obstructed paths refused before the
+            -- bot gives up and walks one anyway. Bounded so a pathfinder that
+            -- deterministically returns the same clipping route cannot freeze
+            -- a bot; `zeroClip.capExhausted` on the dashboard is the residual
+            -- clip rate once enforcement is on.
+            rejectionCap = 2,
+            -- The appearance ray tests the straight chord between two path
+            -- nodes, which dives through the solid mass under a staircase or
+            -- bridge deck -- geometry a bot is meant to walk ON. MEASURED
+            -- 2026-08-28: 53% of raw mesh hits were this false positive.
+            -- Confirm a flagged chord against the navmesh (the authority on
+            -- what an agent can stand on) before believing the ray.
+            -- `zeroClip.walkableReclassified` counts the overrules.
+            walkableConfirm = false,
+            walkableToleranceRatio = 1.25,
+            -- Objects taken to the narrow phase per PATH (the world query is
+            -- hoisted out of the segment loop, so this is no longer per-segment).
+            maxCandidates = 256,
+            maxSegmentMeters = 512,
+            -- Segments probed per path. The first observe run capped at 16 and
+            -- truncated 88 of 89 long routes (median 58 nodes), so the block
+            -- rate could only be measured over 59% of traffic.
+            maxProbedSegments = 128,
+            -- getInRangeObjects matches on object ORIGIN; pad the query so a
+            -- large structure centred off to one side is still considered.
+            broadPhasePadMeters = 192,
+            exitSetEnabled = false,
+            egressCandidateAttemptCap = 2,
+            egressTotalAttemptCeiling = 8,
+            -- A CellPortal exit set contains doors on EVERY level of the POB.
+            -- Measured 2026-08-23: candidate heights of -19.997, 0.003, 6.04,
+            -- 10.335 and 77.6163 in one run, and a 2D-ordered set put the 77m
+            -- door first -> 240 zSanityViolations. A door that far off the
+            -- bot's own floor is not an exit it can walk to, so it is not a
+            -- candidate. Roughly one to two storeys. 0 disables the filter.
+            -- DERIVED, not guessed (2026-08-25). Measured starport door
+            -- heights above a bot on the pad: +5.96, +10.25 (a real ground
+            -- door at the far end of the band) and +77.53 (roof). The previous
+            -- hand-picked 10 rejected the +10.25 door by 0.25m and silently
+            -- hid half the door set. 20 keeps both real doors and still
+            -- rejects the roof by a wide margin.
+            exitCandidateMaxVerticalMeters = 20,
+        },
+        -- D8 radial hollow scan. REFUTED as an exit-finder on 2026-08-24
+        -- (blocked=72/72 on starport_tatooine) and retained for diagnostics
+        -- only; see docs/1-plans/F_0.8.0-D8_hollow-radial-exit.proposal.md.
+        -- MEASURED HARMFUL for traversal bots, 2026-08-25: flipping this true
+        -- took the matrix 11 PASS -> 9 PASS and turned 11 exit_not_outdoors into
+        -- 13 controller_path_failed. Hybrid movement already carries three
+        -- hand-added exclusions (interiorApproachLeg, cellEgressActive,
+        -- ticketTravelPhase) and structure-traversal egress needs a fourth --
+        -- which is the symptom, not the fix. Leave false.
+        useNavmeshHybrid = false,
+        -- Diagnostic gate. Turns a silently-accepted partial path into an
+        -- explicit rejection + bounded retry. MEASURED 2026-08-25: works (15
+        -- rejections, med-centre ingress retried and still PASSED) but costs
+        -- cantina_to_corellia_hospital, whose route legitimately ends short.
+        -- Keep OFF as a default; it is a measuring instrument, not a fix.
+        requireCompletePath = false,
+        completePathToleranceMeters = 10,
+        -- D2b far-side egress. When a found path ends back inside the
+        -- owning building's hollow while the DESTINATION is outside it, the
+        -- route made no progress (it left by the nearest portal). Reject it and
+        -- retarget to the nearest reachable non-hollow exit CELL, which the
+        -- pathfinder routes through the interior correctly.
+        -- LIVE-VERIFIED 2026-08-27 (run 20260827-200923-d2b-farside): matrix
+        -- 11 PASS/15 FAIL -> 22 PASS/4 FAIL of 26, 11 improvements, zero
+        -- regressions, assertions non-vacuous. Default OFF pending release.
+        farSideEgress = false,
+        hollowScan = {
+            enabled = false,
+            rays = 72,
+            rayMarginMeters = 40,
+            minOpeningDeg = 5,
+        },
+        hollowDoorEgress = {
+            observe = false,
+            walk = false,
+            useCellPortals = false,
+        },
+    },
+
+    -- Phase 3 scenario harness.  This remains disabled by default.  Explicit
+    -- cell OIDs are used where repository/live traces provide them (Mos Eisley
+    -- cantina/starport and the medical-center cells); Theed Spaceport and the
+    -- Coronet cantina use concrete world points, with the latter also pinned
+    -- by its known building OID for the resolver diagnostics.
+    structureTraversalTest = {
+        enabled = false,
+        planet = "tatooine",
+        botCount = 1,
+        -- Must be a REGISTERED creature template name; spawnCreature() hashes
+        -- this string and returns null for an unknown one, which fails the
+        -- scenario with attacker_spawn_failed. Verified registered in
+        -- scripts/mobile/naboo/hermit_spider.lua (level 7, pvpBitmask
+        -- ATTACKABLE). Creature templates are global, not planet-scoped.
+        attackerTemplate = "hermit_spider",
+        dwellScaling = 1.0,
+        scenarios = {
+            -- A. Core ingress/egress
+            { name="cantina_enter_exit", planet="tatooine", bots=1,
+              spawn={{x=3467,y=-4890,z=5}},
+              budgets={enterMs=90000,exitMs=90000,totalMs=300000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1082874,cellOid=1082877},
+                {op="dwell",ms=10000},
+                {op="exit",dest={x=3500,y=-4700,z=5}} } },
+
+            { name="naboo_hospital_enter_exit", planet="naboo", bots=1,
+              spawn={{x=-5410,y=4325,z=6}},
+              budgets={enterMs=120000,exitMs=120000,totalMs=360000},
+              steps={
+                -- Theed medical-center cell/local point from
+                -- custom_scripts/smart_doctor_config.lua.
+                {op="enter",target={x=-18.46,y=3.39,z=0.26},cellOid=1697364},
+                {op="dwell",ms=10000},
+                {op="exit",dest={x=-5480,y=4380,z=6}} } },
+
+            { name="mos_eisley_starport_front", planet="tatooine", bots=1,
+              spawn={{x=3527,y=-4803,z=5}},
+              budgets={enterMs=120000,exitMs=120000,totalMs=360000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372},
+                {op="exit",dest={x=3527,y=-4803,z=5}} } },
+
+            { name="mos_eisley_starport_deep_foyer4", planet="tatooine", bots=1,
+              spawn={{x=3563,y=-4799,z=5}},
+              budgets={enterMs=120000,exitMs=120000,totalMs=360000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372},
+                {op="exit",dest={x=3527,y=-4803,z=5}} } },
+
+            { name="cantina_immediate_exit", planet="tatooine", bots=1,
+              spawn={{x=3467,y=-4890,z=5}},
+              budgets={enterMs=90000,exitMs=90000,totalMs=240000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1082874,cellOid=1082877},
+                {op="exit",dest={x=3500,y=-4700,z=5}} } },
+
+            { name="cantina_long_dwell", planet="tatooine", bots=1,
+              spawn={{x=3467,y=-4890,z=5}},
+              budgets={enterMs=90000,exitMs=120000,totalMs=900000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1082874,cellOid=1082877},
+                {op="dwell",ms=600000},
+                {op="exit",dest={x=3500,y=-4700,z=5}} } },
+
+            { name="theed_starport_hangar", planet="naboo", bots=1,
+              -- The only scenario that exercises the world-point resolver.
+              -- The target is the Theed Spaceport PlanetTravelPoint from
+              -- planet_manager.lua:287 -- an OUTDOOR anchor, not a
+              -- destination: resolveStarportInteriorWaypoint() uses it to
+              -- select the building and then returns an interior path-graph
+              -- node. The building/cell OIDs are resolved at runtime.
+              spawn={{x=-5005,y=4072,z=6}},
+              budgets={enterMs=90000,exitMs=90000,totalMs=300000},
+              steps={
+                {op="enter",target={x=-4858.834,y=4164.0679,z=5.9483199}},
+                {op="exit",dest={x=-5005,y=4072,z=6}} } },
+
+            { name="starport_upper_floor", planet="tatooine", bots=1,
+              spawn={{x=3527,y=-4803,z=5}},
+              budgets={enterMs=120000,exitMs=120000,totalMs=360000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106374},
+                {op="exit",dest={x=3527,y=-4803,z=5}} } },
+
+            -- B. Cross-building. Explicit hospital cell/local points exercise
+            -- the asymmetric graph; world-only entries use the C++ resolver's
+            -- <=3m cell/world round-trip guard.
+            { name="hospital_to_cantina", planet="tatooine", bots=1,
+              spawn={{x=3467,y=-4890,z=5}},
+              budgets={enterMs=120000,exitMs=120000,totalMs=420000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},cellOid=9655496},
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1082874,cellOid=1082877},
+                {op="exit",dest={x=3500,y=-4700,z=5}} } },
+
+            { name="cantina_to_corellia_hospital", planet="corellia", bots=1,
+              spawn={{x=-328,y=-4600,z=28}},
+              budgets={enterMs=120000,exitMs=120000,totalMs=420000},
+              steps={
+                -- Coronet cantina is pinned by building OID and resolves to the
+                -- building's first interior cell, so the target here is
+                -- CELL-LOCAL (like the Mos Eisley cantina steps), never the
+                -- world point it used to carry. The hospital cell/local point
+                -- below is from smart_doctor_config.lua.
+                {op="enter",target={x=0,y=0,z=0},buildingOid=8105493},
+                {op="enter",target={x=-18.54,y=3.33,z=0.26},cellOid=1855535},
+                {op="exit",dest={x=-400,y=-4520,z=28}} } },
+
+            { name="cell_to_enclosed_hollow", planet="tatooine", bots=1,
+              spawn={{x=3527,y=-4803,z=5}},
+              budgets={enterMs=120000,exitMs=120000,totalMs=480000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372},
+                {op="moveTo",dest={x=3628.79,y=-4790.9,z=5}},
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372},
+                {op="exit",dest={x=3527,y=-4803,z=5}} } },
+
+            -- Multi-hop TRANSIT shape (owner, 2026-08-27). Planets are not
+            -- all directly connected, so a bot routinely lands somewhere it is
+            -- only passing through: it arrives by shuttle INTO THE HOLLOW,
+            -- walks into the starport cell to the ticket TERMINAL (where a
+            -- player buys a ticket), then walks BACK OUT INTO THE HOLLOW to the
+            -- ticket COLLECTOR, which is what actually initiates travel.
+            --
+            -- The bot ENDS ON THE PAD, and that is CORRECT. This scenario
+            -- therefore finishes with moveTo, never exit: an exit step asserts
+            -- !inCell && !inHollow and would fail a correctly-transiting bot.
+            -- Its whole purpose is to catch "always leave the hollow" logic,
+            -- which every other scenario here would happily pass because they
+            -- all specify an outdoor destination away from the building.
+            --
+            -- Name must NOT contain "enclosed_hollow": that substring makes the
+            -- runner call setHarnessEgressSuppressed() on moveTo steps, which
+            -- would skip the very cell->hollow egress this is testing.
+            --
+            -- VERIFIED LIVE 2026-08-27 (run 20260827-090754-d8-transit): PASS,
+            -- 84.1s total -- enter 54.0s, dwell 5.0s, moveTo 24.5s. Log shows a
+            -- real 47-node route from mid-pad, entered_structure at +10s,
+            -- target_cell_arrived at +54s, then a genuine cell->hollow return.
+            { name="starport_transit_terminal_to_collector", planet="tatooine", bots=1,
+              spawn={{x=3575,y=-4813,z=5}},
+              budgets={enterMs=120000,exitMs=120000,totalMs=420000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106383},
+                {op="dwell",ms=5000},
+                {op="moveTo",dest={x=3575,y=-4813,z=5}} } },
+
+            -- C. Combat-wins. Interrupts are attached to movement steps, so
+            -- the runner fires them after the named phase is observed.
+            { name="combat_approach_door", planet="tatooine", bots=1,
+              spawn={{x=3527,y=-4803,z=5}},
+              budgets={enterMs=120000,exitMs=120000,totalMs=420000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372,
+                 interrupt={phase="ApproachDoor",afterMs=500,durationMs=8000}},
+                {op="exit",dest={x=3527,y=-4803,z=5}} } },
+
+            { name="combat_interior_route", planet="tatooine", bots=1,
+              spawn={{x=3527,y=-4803,z=5}},
+              budgets={enterMs=120000,exitMs=120000,totalMs=420000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372,
+                 interrupt={phase="InteriorRoute",afterMs=500,durationMs=8000}},
+                {op="exit",dest={x=3527,y=-4803,z=5}} } },
+
+            { name="combat_egress", planet="tatooine", bots=1,
+              spawn={{x=3527,y=-4803,z=5}},
+              budgets={enterMs=120000,exitMs=120000,totalMs=420000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372},
+                {op="exit",dest={x=3527,y=-4803,z=5},
+                 interrupt={phase="Egress",afterMs=500,durationMs=8000}} } },
+
+            { name="combat_drag_different_cell", planet="tatooine", bots=1,
+              spawn={{x=3527,y=-4803,z=5}},
+              budgets={enterMs=120000,exitMs=120000,totalMs=420000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372},
+                {op="exit",dest={x=3527,y=-4803,z=5},
+                 interrupt={phase="Egress",afterMs=500,durationMs=8000,
+                   displace={x=0,y=0,z=0,cellOid=1106374}}} } },
+
+            { name="combat_ends_outdoors", planet="tatooine", bots=1,
+              spawn={{x=3527,y=-4803,z=5}},
+              budgets={enterMs=120000,exitMs=120000,totalMs=420000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372},
+                {op="exit",dest={x=3527,y=-4803,z=5},
+                 interrupt={phase="Egress",afterMs=500,durationMs=8000,
+                   displace={x=3527,y=-4803,z=5}}} } },
+
+            { name="combat_reentry_cross_building", planet="tatooine", bots=1,
+              spawn={{x=3467,y=-4890,z=5}},
+              budgets={enterMs=120000,exitMs=120000,totalMs=600000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1082874,cellOid=1082877},
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372,
+                 interrupt={phase="Reentry",afterMs=500,durationMs=8000}},
+                {op="exit",dest={x=3527,y=-4803,z=5}} } },
+
+            { name="attacker_dies_instantly", planet="tatooine", bots=1,
+              spawn={{x=3527,y=-4803,z=5}},
+              budgets={enterMs=120000,exitMs=120000,totalMs=420000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372,
+                 interrupt={phase="ApproachDoor",afterMs=100,durationMs=1}},
+                {op="exit",dest={x=3527,y=-4803,z=5}} } },
+
+            -- D. Failure and hygiene.
+            -- Bounded failure. The target is an ORDINARY resolvable starport
+            -- cell and the traversal API is driven for real; the harness forces
+            -- the path RESULT to fail (setHarnessForcePathFailure), which is
+            -- how a genuinely unroutable target surfaces. Map data cannot be
+            -- used to produce this: an off-mesh cell point falls back to the
+            -- nearest floor triangle, an out-of-bounds world point is rejected
+            -- before the path task is scheduled, and a cross-planet cell is
+            -- zone-checked by neither the resolver nor the pathfinder (the bot
+            -- would just time out chasing it). Assertion: bounded onPathFailed,
+            -- traversal state cleared, bot recovers and completes the moveTo.
+            { name="unreachable_target_bounded_failure", planet="tatooine", bots=1,
+              spawn={{x=3527,y=-4803,z=5}},
+              budgets={enterMs=30000,exitMs=30000,totalMs=120000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372},
+                {op="moveTo",dest={x=3527,y=-4803,z=5}} } },
+
+            { name="external_preemption", planet="tatooine", bots=1,
+              spawn={{x=3527,y=-4803,z=5}},
+              budgets={enterMs=90000,exitMs=90000,totalMs=300000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372},
+                {op="moveTo",dest={x=3500,y=-4700,z=5}} } },
+
+            { name="prepare_for_relocation", planet="tatooine", bots=1,
+              spawn={{x=3527,y=-4803,z=5}},
+              budgets={enterMs=90000,exitMs=90000,totalMs=300000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372},
+                {op="moveTo",dest={x=3527,y=-4803,z=5}} } },
+
+            -- Death must land MID-TRAVERSAL: the enter step is still in flight
+            -- (the runner kills the body while the leg is active), which is the
+            -- state that must leave no dangling task and no wedge.
+            { name="death_or_incapacity_recovery", planet="tatooine", bots=1,
+              spawn={{x=3527,y=-4803,z=5}},
+              budgets={enterMs=90000,exitMs=90000,totalMs=300000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372},
+                {op="moveTo",dest={x=3527,y=-4803,z=5}} } },
+
+            -- E. Ten-cycle stress scenario.
+            { name="ten_sequential_cycles", planet="tatooine", bots=1,
+              spawn={{x=3467,y=-4890,z=5}},
+              budgets={enterMs=900000,exitMs=900000,totalMs=3600000},
+              steps={
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1082874,cellOid=1082877},
+                {op="exit",dest={x=3500,y=-4700,z=5}},
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1082874,cellOid=1082877},
+                {op="exit",dest={x=3500,y=-4700,z=5}},
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1082874,cellOid=1082877},
+                {op="exit",dest={x=3500,y=-4700,z=5}},
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1082874,cellOid=1082877},
+                {op="exit",dest={x=3500,y=-4700,z=5}},
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1082874,cellOid=1082877},
+                {op="exit",dest={x=3500,y=-4700,z=5}},
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1082874,cellOid=1082877},
+                {op="exit",dest={x=3500,y=-4700,z=5}},
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1082874,cellOid=1082877},
+                {op="exit",dest={x=3500,y=-4700,z=5}},
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1082874,cellOid=1082877},
+                {op="exit",dest={x=3500,y=-4700,z=5}},
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1082874,cellOid=1082877},
+                {op="exit",dest={x=3500,y=-4700,z=5}},
+                {op="enter",target={x=0,y=0,z=0},buildingOid=1082874,cellOid=1082877},
+                {op="exit",dest={x=3500,y=-4700,z=5}} } },
+
+            -- Both bots share ONE building (the multi-door starport) — that is
+            -- what makes it an interference test. They approach from opposite
+            -- sides and leave toward opposite outdoor destinations.
+            { name="two_bots_opposite_directions", planet="tatooine", bots=2,
+              spawn={{x=3527,y=-4803,z=5},{x=3563,y=-4799,z=5}},
+              budgets={enterMs=180000,exitMs=180000,totalMs=600000},
+              steps={
+                {
+                  {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372},
+                  {op="exit",dest={x=3563,y=-4799,z=5}} },
+                {
+                  {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106374},
+                  {op="exit",dest={x=3527,y=-4803,z=5}} } } },
+
+            -- Bot A dwells INSIDE the same building bot B enters and exits.
+            { name="bot_a_dwell_bot_b_traverse", planet="tatooine", bots=2,
+              spawn={{x=3527,y=-4803,z=5},{x=3563,y=-4799,z=5}},
+              budgets={enterMs=180000,exitMs=180000,totalMs=600000},
+              steps={
+                {
+                  {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106374},
+                  {op="dwell",ms=30000},
+                  {op="exit",dest={x=3527,y=-4803,z=5}} },
+                {
+                  {op="enter",target={x=0,y=0,z=0},buildingOid=1106368,cellOid=1106372},
+                  {op="exit",dest={x=3563,y=-4799,z=5}} } } },
+        },
+    },
+
     -- P.8 Phase 2: persistent PvE identity roster, passed spike foundation,
     -- and the player-mimetic solo hunt loop.
     pveConfig = {

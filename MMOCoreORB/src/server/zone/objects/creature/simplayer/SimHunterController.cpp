@@ -1671,6 +1671,11 @@ void SimHunterController::onArrived() {
 }
 
 void SimHunterController::onPathFailed() {
+	if (isStructureTraversalFeatureEnabled() && isTraversalActive()) {
+		SimPlayerController::onPathFailed();
+		return;
+	}
+
 	// The base leaves the agent in CALCULATING_PATH; reset it or a failed
 	// retreat/patrol path wedges the controller until the phase TTL fires.
 	clearHybridMovementOnCancellation();
@@ -1836,6 +1841,8 @@ void SimHunterController::runActiveTick() {
 			" gen=" + String::valueOf(activeTickGeneration.load(
 				std::memory_order_relaxed)));
 	if (strongAgent->isDead()) {
+		if (isStructureTraversalFeatureEnabled() && isTraversalActive())
+			clearStructureTraversalState("hunter_death");
 		cancelPveDoctorRequest();
 		if (!deathReported) {
 			deathReported = true;
@@ -3478,6 +3485,8 @@ void SimHunterController::beginTravelHome(bool abandoned) {
 void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 	if (!orderActive)
 		return;
+	if (isStructureTraversalFeatureEnabled() && isTraversalActive())
+		clearStructureTraversalState("hunter_order_complete");
 	if (missionHuntOrder && !missionCleanupRequested && missionLairOid != 0) {
 		beginMissionCleanup(abandoned, reason);
 		return;
@@ -3530,6 +3539,8 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 }
 
 void SimHunterController::teardown(const String& reason) {
+	if (isStructureTraversalFeatureEnabled() && isTraversalActive())
+		clearStructureTraversalState("hunter_teardown");
 	activeTickGeneration++;
 	advanceWorkLoopGeneration("hunterTeardown");
 	cancelPveDoctorRequest();

@@ -7,6 +7,8 @@
 #ifndef SIMPLAYERCONTROLLER_H_
 #define SIMPLAYERCONTROLLER_H_
 
+#include <atomic>
+
 #include "engine/core/Task.h"
 #include "engine/core/ManagedReference.h"
 #include "system/lang/Object.h"
@@ -19,6 +21,116 @@
 
 class SimPlayerController;
 class TicketArrivalRetryTask;
+
+enum class StructureTraversalPhase {
+    Idle,
+    ApproachDoor,
+    InteriorRoute,
+    Egress,
+    Reentry,
+    CombatPaused,
+    Resuming
+};
+
+struct StructureTraversalIntent {
+    Vector3 finalTargetWorld;
+    Vector3 finalTargetLocal;
+    ManagedReference<CellObject*> finalTargetCell;
+    ManagedReference<CellObject*> reentryCell;
+    uint64 owningBuildingOid;
+    // CELL-LOCAL coordinate inside reentryCell — never a world point.
+    Vector3 entryReentryWaypoint;
+    // WORLD coordinate of the last egress ejection point (diagnostics only).
+    Vector3 egressWaypointWorld;
+    int egressAttempts;
+    int resumeAttempts;
+    uint64 generation;
+    uint64 createdAtMs;
+    uint64 lastPhaseAtMs;
+    bool exitIntent;
+    bool active;
+
+    StructureTraversalIntent()
+        : finalTargetWorld(0, 0, 0), finalTargetLocal(0, 0, 0),
+          finalTargetCell(nullptr), reentryCell(nullptr),
+          owningBuildingOid(0),
+          entryReentryWaypoint(0, 0, 0), egressWaypointWorld(0, 0, 0),
+          egressAttempts(0),
+          resumeAttempts(0), generation(0), createdAtMs(0),
+          lastPhaseAtMs(0), exitIntent(false), active(false) {
+    }
+
+    void clear() {
+        finalTargetWorld = Vector3(0, 0, 0);
+        finalTargetLocal = Vector3(0, 0, 0);
+        finalTargetCell = nullptr;
+        reentryCell = nullptr;
+        owningBuildingOid = 0;
+        entryReentryWaypoint = Vector3(0, 0, 0);
+        egressWaypointWorld = Vector3(0, 0, 0);
+        egressAttempts = 0;
+        resumeAttempts = 0;
+        generation = 0;
+        createdAtMs = 0;
+        lastPhaseAtMs = 0;
+        exitIntent = false;
+        active = false;
+    }
+};
+
+// Lua-authored, manager-owned scenario description.  These value types keep
+// the harness DSL independent of live agent references; cells are resolved by
+// SimPlayerManager immediately before a step is issued.
+struct StructureTraversalTestPoint {
+    float x = 0.f;
+    float y = 0.f;
+    float z = 0.f;
+    uint64 cellOid = 0;
+
+    bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+    bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct StructureTraversalTestInterrupt {
+    String phase;
+    int afterMs = 0;
+    int durationMs = 0;
+    bool hasDisplacement = false;
+    StructureTraversalTestPoint displacement;
+
+    bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+    bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct StructureTraversalTestStep {
+    String op;
+    StructureTraversalTestPoint target;
+    StructureTraversalTestPoint destination;
+    int dwellMs = 0;
+    uint64 buildingOid = 0;
+    uint64 cellOid = 0;
+    String cellName;
+    StructureTraversalTestInterrupt interrupt;
+
+    bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+    bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// Phase 2 owns the monitor implementation. The generation is deliberately
+// separate from SimPlayerController's work-loop generation so combat movement
+// can invalidate path tasks without invalidating a traversal intent.
+class StructureTraversalResumeMonitorTask : public Task {
+    WeakReference<SimPlayerController*> controller;
+    uint64 traversalGeneration;
+
+public:
+    StructureTraversalResumeMonitorTask(SimPlayerController* ctrl,
+            uint64 generation)
+        : controller(ctrl), traversalGeneration(generation) {
+    }
+
+    void run() override;
+};
 
 struct SimMinerConfig {
     Vector<String> resources;
@@ -56,6 +168,58 @@ struct SimMinerConfig {
     }
 };
 
+// Phase 1 exists to decide whether enforcement is safe, so a probe that could
+// not finish must never be indistinguishable from one that found nothing. Any
+// outcome other than Clear/WouldBlock means "no evidence", not "safe".
+enum class ZeroClipOutcome {
+    Clear,       // fully probed, nothing intersected
+    WouldBlock,  // definite intersection with a collidable appearance mesh
+    Skipped,     // not probed (no zone, degenerate or over-long segment)
+    Truncated,   // candidate budget ran out with objects still unexamined
+    Error        // threw while probing
+};
+
+struct ZeroClipClearanceResult {
+    ZeroClipOutcome outcome;
+    float hitAt;
+    int hitSegment;
+    String blockingTemplate;
+    int candidates;
+    int segments;
+    // Mesh intersections the navmesh overruled as walkable (stairs, bridge
+    // decks). Kept on the result so a run can show how much of the raw block
+    // rate was false positive.
+    int walkableReclassified;
+    uint64 elapsedUs;
+
+    ZeroClipClearanceResult()
+        : outcome(ZeroClipOutcome::Skipped), hitAt(0.f), hitSegment(-1),
+          blockingTemplate("none"), candidates(0), segments(0),
+          walkableReclassified(0), elapsedUs(0) {
+    }
+
+    bool wouldBlock() const {
+        return outcome == ZeroClipOutcome::WouldBlock;
+    }
+
+    // Evidence quality: only these two outcomes say anything about the world.
+    bool isConclusive() const {
+        return outcome == ZeroClipOutcome::Clear ||
+            outcome == ZeroClipOutcome::WouldBlock;
+    }
+
+    static const char* outcomeName(ZeroClipOutcome value) {
+        switch (value) {
+        case ZeroClipOutcome::Clear:      return "clear";
+        case ZeroClipOutcome::WouldBlock: return "would_block";
+        case ZeroClipOutcome::Skipped:    return "skipped";
+        case ZeroClipOutcome::Truncated:  return "truncated";
+        case ZeroClipOutcome::Error:      return "error";
+        }
+        return "unknown";
+    }
+};
+
 // Generic Pathfinding Task
 class SimPathFindTask : public Task {
     WeakReference<SimPlayerController*> controller;
@@ -66,39 +230,41 @@ class SimPathFindTask : public Task {
     bool useRecastPath;
     bool useDirectOverlandPath;
     bool directTargetUsesTerrainHeight;
+    // Bound at CONSTRUCTION on the issuing thread, never read back off the
+    // controller at probe time: two tasks can be in flight at once, and a newer
+    // one's refresh would otherwise re-label this task's path.
+    float probeRayHeight;
+    // Identity only, never dereferenced: a Task outlives the call that
+    // created it, so a raw AiAgent* here could dangle. An OID is a value.
+    uint64 probeAgentOid;
+    // D7 Phase 1 probes EVERY emitted path, not just the explicit overland
+    // one, because PathFinderManager::findPathFromWorldToWorld independently
+    // emits an unchecked 2-node fallback when it cannot evaluate a route
+    // (PathFinderManager.cpp, "path could not be evaluated"). Miners are
+    // non-hybrid and reach that fallback through the generic branch, so
+    // instrumenting only useDirectOverlandPath would exclude the dominant
+    // population from the evidence Phase 2 is decided on.
     ManagedReference<NavArea*> navArea;
     Vector3 recastStart;
     Vector3 recastEnd;
     bool allowPartial;
 
 public:
-    SimPathFindTask(SimPlayerController* ctrl, WorldCoordinates start, WorldCoordinates end, Zone* z, uint64 g)
-        : controller(ctrl), startCoord(start), endCoord(end), zone(z), generation(g),
-          useRecastPath(false), useDirectOverlandPath(false),
-          directTargetUsesTerrainHeight(false), navArea(nullptr), recastStart(),
-          recastEnd(),
-          allowPartial(true) {
-    }
+    // Defined out-of-line: they read value snapshots off SimPlayerController,
+    // which is not a complete type at this point in the header.
+    SimPathFindTask(SimPlayerController* ctrl, WorldCoordinates start,
+            WorldCoordinates end, Zone* z, uint64 g);
 
     SimPathFindTask(SimPlayerController* ctrl, WorldCoordinates start,
             WorldCoordinates end, Zone* z, NavArea* area,
             const Vector3& recastStartPosition,
-            const Vector3& recastEndPosition, bool partial, uint64 g)
-        : controller(ctrl), startCoord(start), endCoord(end), zone(z), generation(g),
-          useRecastPath(true), useDirectOverlandPath(false),
-          directTargetUsesTerrainHeight(false), navArea(area),
-          recastStart(recastStartPosition), recastEnd(recastEndPosition),
-          allowPartial(partial) {
-    }
+            const Vector3& recastEndPosition, bool partial, uint64 g);
 
     SimPathFindTask(SimPlayerController* ctrl, WorldCoordinates start,
             WorldCoordinates end, Zone* z, bool directOverland,
-            bool terrainHeight, uint64 g)
-        : controller(ctrl), startCoord(start), endCoord(end), zone(z), generation(g),
-          useRecastPath(false), useDirectOverlandPath(directOverland),
-          directTargetUsesTerrainHeight(terrainHeight), navArea(nullptr),
-          recastStart(), recastEnd(), allowPartial(true) {
-    }
+            bool terrainHeight, float rayHeight, uint64 rayAgentOid,
+            uint64 g);
+
     void run() override; 
 };
 
@@ -130,9 +296,26 @@ public:
 // -------------------------------------------------------
 class SimPlayerController : public Object, public Logger {
 protected:
+	enum class HollowEscalationOutcome {
+		NotHandled,
+		Started,
+		ResumeFinalDestination,
+		Failed,
+		// An entry leg is already in flight. Distinct from NotHandled, whose
+		// arrival tail clears the interior-approach latch and calls
+		// onArrived() -- both of which would end the leg that is still
+		// walking.
+		InProgress
+	};
+
     friend class TicketArrivalRetryTask;
+    friend class StructureTraversalResumeMonitorTask;
 
     ManagedReference<AiAgent*> agent;
+    // D7: value snapshots of agent identity/geometry for off-thread probing.
+    uint64 probeAgentOid;
+    float probeRayHeight;
+    bool probePathAccepted;
     Vector<WorldCoordinates> simPath;
     int simPathIndex;
     Vector3 lastWatchdogPos;
@@ -145,7 +328,20 @@ protected:
     Vector3 cellEgressResumeWorld;
     Vector3 cellEgressResumeLocal;
     ManagedReference<CellObject*> cellEgressResumeCell;
-    int cellEgressAttempts;
+	int cellEgressAttempts;
+	Vector<Vector3> cellEgressCandidates;
+	Vector<Vector3> cellEgressCandidateLocals;
+	Vector<int> cellEgressCandidateCellIndexes;
+	Vector<int> cellEgressCandidateInHollow;
+	int cellEgressCandidateIndex;
+	int cellEgressCandidateAttempts;
+	int cellEgressTotalAttempts;
+	bool cellEgressExitSetBuilt;
+	bool cellEgressBudgetExhaustedRecorded;
+	int hollowEscalationAttempts;
+	int hollowDoorEgressSelectedCandidateIndex;
+	bool hollowEscalationActive;
+	Vector3 hollowEscalationTarget;
     // When set, a move to an outdoor target from inside a cell does NOT trigger the
     // generic egress; instead it does a directed findPath (routes through the portal
     // graph to an enclosed/interior-reachable point, e.g. a starport hollow collector).
@@ -157,6 +353,10 @@ protected:
     bool onMeshMode;
     int navmeshModeDebounceCounter;
     int navmeshRepathAttempts;
+    // D7 Phase 2. Conclusively-obstructed paths rejected since the last route
+    // this bot actually walked. Bounded by zeroClip.rejectionCap so a
+    // pathfinder that keeps returning the same clipping route cannot freeze it.
+    int zeroClipRejections;
 
     enum HybridLeg {
         HYBRID_LEG_NONE,
@@ -174,6 +374,17 @@ protected:
     bool interiorApproachLeg;
     uint64 diagnosticLastParentCellOid;
     bool diagnosticParentCellInitialized;
+
+    StructureTraversalPhase structureTraversalPhase;
+    StructureTraversalIntent structureTraversalIntent;
+    uint64 traversalGeneration;
+    Vector3 traversalLastAppliedWorldPosition;
+    bool traversalWatchdogPositionInitialized;
+    uint64 traversalPeaceSinceMs;
+    std::atomic<uint64> traversalResumeMonitorGeneration;
+    bool traversalResumeInProgress;
+    bool combatDriverMoveActive;
+    bool farSideRejectionPending;
     
     // Configurable speed/movement settings
     float runSpeed;
@@ -259,6 +470,9 @@ public:
     virtual void onInterplanetaryTravelFinished(bool, const String&,
         const String&) {}
     virtual void onStaleWorkLoopTaskIgnored(const String& taskType, uint64 capturedGeneration, uint64 currentGeneration);
+    // Combat-capable controllers override this lease predicate for the
+    // compound peace predicate used by the traversal resume monitor.
+    virtual bool isCombatDriverActive() const { return false; }
 
     // --- Common Movement Logic ---
     // World-space target used by the existing callers.
@@ -266,8 +480,30 @@ public:
     // P.6.5b: worldPos remains the distance/arrival target while localPos is
     // the path request coordinate when targetCell is an interior cell.
     void moveTo(Vector3 worldPos, Vector3 localPos, CellObject* targetCell);
+    // Dedicated non-preempting movement entry point for combat-driver movement
+    // while a formal traversal is paused.
+    void moveToCombat(Vector3 targetPos);
+    void moveToCombat(Vector3 worldPos, Vector3 localPos,
+            CellObject* targetCell);
+    // Formal structure traversal API. Gate-off callers are routed through the
+    // existing movement implementation unchanged.
+    void enterStructure(Vector3 worldPos, Vector3 localPos,
+            CellObject* targetCell);
+    void exitStructure(Vector3 outdoorDest);
     void checkArrival();
     ManagedReference<AiAgent*> getAgent() const { return agent; }
+    StructureTraversalPhase getTraversalPhase() const {
+        return structureTraversalPhase;
+    }
+    bool isTraversalActive() const {
+        return structureTraversalIntent.active;
+    }
+    uint64 getTraversalGeneration() const { return traversalGeneration; }
+    uint64 getTraversalOwningBuildingOid() const {
+        return structureTraversalIntent.owningBuildingOid;
+    }
+    uint64 getTraversalTargetCellOid() const;
+    String getTraversalPhaseName() const;
     // P.6.1a: lets the manager detect a silently-lost path request (moveTo
     // issued but neither onPathFound nor onPathFailed ever ran) and re-drive.
     bool isAwaitingPathResult() const { return state == CALCULATING_PATH; }
@@ -278,7 +514,18 @@ public:
     // pre-teleport target from the chain thread and race the fresh moveTo()'s
     // generation). Call before switchZone repositions.
     virtual void prepareForRelocation(const String& reason) {
+        if (isTraversalActive() ||
+                structureTraversalPhase != StructureTraversalPhase::Idle)
+            clearStructureTraversalState(reason);
         clearCellEgressState();
+        // A relocation is the "situation has actually changed" signal for the
+        // D1 escalation budget, mirroring how beginCellEgressIfNeeded refreshes
+        // cellEgressAttempts once the bot is outdoors. Without this the counter
+        // survives every later traversal, so one failed escalation at building A
+        // would permanently disable escalation at buildings B and C. Escalation
+        // still cannot re-arm ITSELF -- only this external lifecycle event, and
+        // a genuinely-outdoors completion, clear the budget.
+        hollowEscalationAttempts = 0;
         advanceWorkLoopGeneration(reason);
         state = WAITING;
         destination = Vector3(0, 0, 0);
@@ -295,15 +542,53 @@ public:
     // race — onPathFound() rejects (-> onPathFailed retry) any path whose end
     // point this returns false for. Default accepts everything (miners rely
     // on partial/exhausted paths); SimPvP leaders enforce end≈target.
-    virtual bool acceptFoundPath(const Vector3& pathEnd) { return true; }
+    virtual bool acceptFoundPath(const Vector3& pathEnd);
     uint64 getWorkLoopGeneration() const { return workLoopGeneration; }
     uint64 advanceWorkLoopGeneration(const String& reason);
     bool isWorkLoopGenerationCurrent(uint64 capturedGeneration, const String& taskType);
     
-    void onPathFound(Vector<WorldCoordinates>* path,
+    // Virtual for the same reason onPathFailed is: the traversal harness needs
+    // to substitute a path result. No production controller overrides it.
+    virtual void onPathFound(Vector<WorldCoordinates>* path,
             bool pathUsesNavmesh = false, bool pathIsOverland = false);
     void onPathTaskFailed(bool pathUsesNavmesh);
     virtual void onPathFailed();
+
+    // Segment-by-segment probe of a path that is about to be handed to the
+    // mover, aggregated worst-first (WouldBlock > Error > Truncated > Skipped).
+    ZeroClipClearanceResult probeEmittedPathClearance(Zone* zone,
+            Vector<WorldCoordinates>* path, float rayHeight,
+            uint64 ignoredAgentOid);
+
+    // Plain-value snapshots so a task worker never touches creature state:
+    // both are written on the issuing thread and read as values off-thread.
+    uint64 getProbeAgentOid() const {
+        return probeAgentOid;
+    }
+    float getProbeRayHeight() const {
+        return probeRayHeight;
+    }
+    void refreshProbeRayHeight();
+
+    // onPathFound can still reject an already-generation-accepted path (hybrid
+    // cancellation, combat, too-short path, stale endpoint). Only a path that
+    // reaches state = MOVING is one the bot will actually walk, so Phase 1
+    // evidence is committed against this, not against generation acceptance.
+    bool consumeProbePathAccepted() {
+        bool accepted = probePathAccepted;
+        probePathAccepted = false;
+        return accepted;
+    }
+
+    // D7 Phase 2 enforcement. Decides whether a probed path is refused, and
+    // performs the refusal. Both run on the path-delivery task thread, before
+    // the path reaches the mover, and take no lock of their own — matching the
+    // existing acceptFoundPath rejection they sit beside.
+    bool isSegmentWalkableByNavmesh(Zone* zone, const Vector3& rayStart,
+            const Vector3& rayEnd, float segmentLength);
+    bool shouldRejectClippingPath(const ZeroClipClearanceResult& result,
+            bool& capExhausted);
+    void rejectClippingPath(Vector<WorldCoordinates>* path);
 
     // Shared interplanetary travel entry point. Derived controllers supply only
     // readiness and terminal policy; the journey state machine is protected.
@@ -316,12 +601,66 @@ public:
     }
 
 protected:
+    enum class TraversalMoveOrigin {
+        External,
+        Internal,
+        CombatDriver
+    };
+
     void moveToInterior(Vector3 worldPos, Vector3 localPos,
             CellObject* targetCell);
+    void moveToWithOrigin(Vector3 worldPos, Vector3 localPos,
+            CellObject* targetCell, TraversalMoveOrigin origin);
     bool beginCellEgressIfNeeded(Vector3 worldPos, Vector3 localPos,
-            CellObject* targetCell);
-    void clearCellEgressState();
-    void failCellEgress();
+            CellObject* targetCell, bool preserveTraversal = false,
+            bool combatDriver = false);
+    bool buildCellEgressExitSet(bool hollowDoorEgressTelemetry = false);
+    bool startNextCellEgressCandidate();
+    bool tryStartFarSideInteriorLeg();
+    bool isStructureTraversalFeatureEnabled() const;
+    uint64 advanceTraversalGeneration(const String& reason);
+    void clearStructureTraversalState(const String& reason);
+    void setStructureTraversalPhase(StructureTraversalPhase phase,
+            const String& reason);
+	HollowEscalationOutcome completeStructureTraversalIfArrived(
+			const Vector3& arrivalWorld);
+	HollowEscalationOutcome beginHollowEscalation(
+			const Vector3& arrivalWorld);
+	// Enumerate EVERY world portal in the owning building and report where each
+	// doorway sits relative to the hollow. The pad doors are inside it
+	// (hollowMissDistance=0), which is why walking to one does not leave. If any
+	// world portal lies OUTSIDE, that is the real exit and the route is
+	// pad -> door -> interior -> that cell -> out. If none does, the building has
+	// no exit to the open world and the answer is elsewhere entirely.
+	void observeBuildingExits(Zone* zone, BuildingObject* building,
+			const Vector3& botWorld);
+
+	void observeHollowRadialScan(Zone* zone, BuildingObject* building,
+			const Vector3& originWorld);
+	bool resolveHollowEscalationTarget(Zone* zone, BuildingObject* building,
+			const Vector3& agentWorld, const Vector3& finalDestination,
+			Vector3& target, String& source, int& candidates,
+			int& nodesExamined, int& rejectedHollow, int& rejectedBounds,
+			int& rejectedWater);
+	float hollowEscalationSegmentGeometryHit(
+			const Vector3& arrivalWorld, const Vector3& destination,
+			BuildingObject* building) const;
+	void recordTraversalMovementStep(const Vector3& previousPosition,
+            const Vector3& currentPosition);
+    bool isTraversalGenerationCurrent(uint64 generation) const {
+        return generation == traversalGeneration;
+    }
+    void pauseStructureTraversal(const String& reason);
+    void scheduleStructureTraversalResumeMonitor();
+    void checkStructureTraversalResume(uint64 generation);
+    bool resumeStructureTraversalFromCurrentPosition();
+    bool isWithinOwningBuildingHollow() const;
+	void clearCellEgressState();
+	void failCellEgress();
+	bool isWithinOwningBuildingHollowAt(const Vector3& worldPosition,
+			BuildingObject* building) const;
+	float getOwningBuildingHollowMissDistance(const Vector3& worldPosition,
+			BuildingObject* building) const;
     void clearInteriorApproachLeg() { interiorApproachLeg = false; }
     bool isInteriorApproachLeg() const { return interiorApproachLeg; }
     bool isHybridMovementActive() const {
@@ -393,6 +732,75 @@ public:
     void onArrived() override;
     void onPathFailed() override;
     bool shouldContinueArrivalChecks() const override { return false; }
+};
+
+// -------------------------------------------------------
+// STRUCTURE-TRAVERSAL SCENARIO CONTROLLER (Harness only)
+// -------------------------------------------------------
+// The manager owns the scenario cursor and lifecycle.  This controller only
+// translates an already-resolved step into the formal API and reports terminal
+// movement callbacks back to the manager.
+class SimTraversalTestController : public SimPlayerController {
+public:
+    SimTraversalTestController(AiAgent* aiAgent);
+    virtual ~SimTraversalTestController();
+
+    void startSimLoop() override;
+    void onArrived() override;
+    void onPathFailed() override;
+    void onPathFound(Vector<WorldCoordinates>* path,
+            bool pathUsesNavmesh = false,
+            bool pathIsOverland = false) override;
+    void onTick() override;
+    bool shouldContinueArrivalChecks() const override { return true; }
+
+    // Gated, default-off. A starport pad is a curved walled corridor; a
+    // straight overland leg cannot follow it. Hunters already return true here
+    // and are the bots observed using starports correctly.
+    bool usesNavmeshHybridMovement() const override;
+
+    // Gated, default-off. The base returns true for any endpoint because miners
+    // rely on partial paths; a structure egress that stops short has FAILED.
+    bool acceptFoundPath(const Vector3& pathEnd) override;
+
+    // Scenario 19 (bounded failure) needs findPath to fail for a target the bot
+    // otherwise CAN resolve and route to. Map data cannot be relied on to
+    // produce that (an off-mesh cell point falls back to the nearest triangle,
+    // and an out-of-bounds world point is rejected synchronously before the
+    // path task is even scheduled), so the harness injects the failure at the
+    // exact seam a null findPath would deliver it.
+    void setHarnessForcePathFailure(bool force) {
+        harnessForcePathFailure = force;
+    }
+
+    void issueResolvedStep(const StructureTraversalTestStep& step,
+            Vector3 targetWorld, Vector3 targetLocal, CellObject* targetCell);
+    // Dedicated deterministic combat-drift path.  It intentionally preserves
+    // the traversal generation and resume monitor while invalidating only
+    // movement work, then re-baselines the traversal watchdog for the expected
+    // harness reposition.
+    void applyHarnessCombatDisplacement(const String& zoneName,
+            const StructureTraversalTestPoint& point);
+    void setHarnessEgressSuppressed(bool suppressed) {
+        cellEgressSuppressed = suppressed;
+    }
+    bool isHarnessOutdoorsClear() const;
+
+    // The exit assertion is a conjunction of two conditions; reporting only its
+    // boolean cannot distinguish "genuinely outdoors" from "standing at a door
+    // that happens to sit outside the hollow AABB". Report both raw facts.
+    String describeHarnessOutdoorsState() const;
+
+    // isWithinOwningBuildingHollow() returns FALSE when the traversal intent has
+    // been cleared (owningBuildingOid == 0), which makes the hollow half of the
+    // exit assertion vacuous exactly when a traversal reports success. These
+    // take the building from the SCENARIO CONFIG so the check cannot be
+    // satisfied by the runtime simply forgetting which building it was in.
+    bool isHarnessOutdoorsClearFor(uint64 buildingOid) const;
+    String describeHarnessOutdoorsStateFor(uint64 buildingOid) const;
+
+private:
+    bool harnessForcePathFailure = false;
 };
 
 // -------------------------------------------------------

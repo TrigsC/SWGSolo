@@ -140,6 +140,10 @@ public:
 	bool usesNavmeshHybridMovement() const override {
 		return combatHybridMovementActive;
 	}
+	bool isCombatDriverActive() const override {
+		return controllerCombatTarget != nullptr || combatApproachActive ||
+			combatHolding || combatHybridMovementActive || combatAiMapInstalled;
+	}
 	bool hasControllerCombatTarget() const {
 		return controllerCombatTarget != nullptr;
 	}

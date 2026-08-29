@@ -7,6 +7,7 @@
 #include "SimPvPController.h"
 #include "SimHunterController.h"
 #include "CellNavDiagLog.h"
+#include "StructureTraversalDiagLog.h"
 
 #include <cmath>
 
@@ -55,6 +56,7 @@
 #include "server/zone/objects/pathfinding/NavArea.h"
 #include "server/zone/managers/collision/PathFinderManager.h"
 #include "server/zone/managers/collision/CollisionManager.h"
+#include "server/zone/managers/combat/CombatManager.h"
 #include "server/zone/objects/building/BuildingObject.h"
 #include "server/zone/objects/cell/CellObject.h"
 #include "templates/SharedObjectTemplate.h"
@@ -300,6 +302,97 @@ public:
 		SimPlayerManager::instance()->spawnCellNavDiagnosticBot();
 	}
 };
+
+class StructureTraversalTestSpawnTask : public Task {
+public:
+    void run() override {
+        SimPlayerManager::instance()->spawnStructureTraversalTestBots();
+    }
+};
+
+class StructureTraversalTestRunnerTask : public Task {
+public:
+    void run() override {
+        SimPlayerManager::instance()->runStructureTraversalTestRunner();
+    }
+};
+
+class StructureTraversalTestAttackerDespawnTask : public Task {
+    int botIndex;
+
+public:
+    explicit StructureTraversalTestAttackerDespawnTask(int index)
+            : botIndex(index) {
+    }
+
+    void run() override {
+        SimPlayerManager::instance()->despawnStructureTraversalTestAttacker(
+            botIndex, "scripted_duration_elapsed");
+    }
+};
+
+static StructureTraversalTestPoint parseStructureTraversalTestPoint(
+        LuaObject& table, const String& fieldName) {
+    StructureTraversalTestPoint point;
+    LuaObject pointTable = fieldName.isEmpty() ? table :
+        table.getObjectField(fieldName);
+    if (pointTable.isValidTable()) {
+        point.x = pointTable.getFloatField("x", point.x);
+        point.y = pointTable.getFloatField("y", point.y);
+        point.z = pointTable.getFloatField("z", point.z);
+        point.cellOid = pointTable.getLongField("cellOid", 0);
+    }
+    if (!fieldName.isEmpty())
+        pointTable.pop();
+    return point;
+}
+
+static StructureTraversalTestStep parseStructureTraversalTestStep(
+        LuaObject& table) {
+    StructureTraversalTestStep step;
+    step.op = table.getStringField("op").trim();
+    step.target = parseStructureTraversalTestPoint(table, "target");
+    step.destination = parseStructureTraversalTestPoint(table, "dest");
+    if (step.destination.x == 0.f && step.destination.y == 0.f &&
+            step.destination.z == 0.f)
+        step.destination = parseStructureTraversalTestPoint(table, "destination");
+    step.dwellMs = table.getIntField("ms", 0);
+    step.buildingOid = table.getLongField("buildingOid", 0);
+    step.cellOid = table.getLongField("cellOid", 0);
+    step.cellName = table.getStringField("cellName").trim();
+
+    LuaObject interrupt = table.getObjectField("interrupt");
+    if (interrupt.isValidTable()) {
+        step.interrupt.phase = interrupt.getStringField("phase").trim();
+        step.interrupt.afterMs = interrupt.getIntField("afterMs", 0);
+        step.interrupt.durationMs = interrupt.getIntField("durationMs", 0);
+        LuaObject displacement = interrupt.getObjectField("displace");
+        if (displacement.isValidTable()) {
+            step.interrupt.hasDisplacement = true;
+            step.interrupt.displacement.x = displacement.getFloatField("x", 0.f);
+            step.interrupt.displacement.y = displacement.getFloatField("y", 0.f);
+            step.interrupt.displacement.z = displacement.getFloatField("z", 0.f);
+            step.interrupt.displacement.cellOid = displacement.getLongField(
+                "cellOid", 0);
+        }
+        displacement.pop();
+    }
+    interrupt.pop();
+    return step;
+}
+
+static void parseStructureTraversalTestStepList(LuaObject& list,
+        Vector<StructureTraversalTestStep>& output) {
+    if (!list.isValidTable())
+        return;
+
+    for (int i = 1; i <= list.getTableSize(); ++i) {
+        LuaObject stepTable = list.getObjectAt(i);
+        if (stepTable.isValidTable())
+            output.add(parseStructureTraversalTestStep(stepTable));
+        stepTable.pop();
+    }
+}
 
 class MinerPathValidationTask : public Task {
     uint64 minerID;
@@ -918,6 +1011,8 @@ SimPlayerManager::SimPlayerManager() {
     lua->init();
     marketSupplyObservationStartedAtMs = System::getMiliTime();
     simulatedAcquisitionRuntime = new SimulatedAcquisitionRuntimeState();
+    structureTraversalTestCombatAttackerOids[0].store(0);
+    structureTraversalTestCombatAttackerOids[1].store(0);
 	pvpNpcFrsAwardStats.setAllowOverwriteInsertPlan();
 	missionTerminalCityState.setAllowOverwriteInsertPlan();
 	pveHuntLairs.setAllowOverwriteInsertPlan();
@@ -5753,6 +5848,12 @@ void SimPlayerManager::initialize() {
         diagSpawnTask->schedule(configuredSpawnStartupDelaySeconds * 1000);
     }
 
+    if (structureTraversalConfig.enabled &&
+            structureTraversalTestConfig.enabled &&
+            structureTraversalTestConfig.scenarios.size() > 0)
+        scheduleStructureTraversalTestSpawn(
+            configuredSpawnStartupDelaySeconds * 1000);
+
     scheduleConfiguredSpawnTask(0, 0, configuredSpawnStartupDelaySeconds * 1000);
     scheduleMinerSummaryTask();
     scheduleResourceIntelligenceTask();
@@ -6422,6 +6523,284 @@ void SimPlayerManager::loadLuaConfig() {
             "logging", CellNavDiagLog::isLoggingEnabled()));
     }
     cellNavDiagConfig.pop();
+
+    LuaObject structureTraversalConfig = config.getObjectField(
+        "structureTraversal");
+    if (structureTraversalConfig.isValidTable()) {
+        this->structureTraversalConfig.enabled =
+            structureTraversalConfig.getBooleanField("enabled",
+                this->structureTraversalConfig.enabled);
+        this->structureTraversalConfig.logging =
+            structureTraversalConfig.getBooleanField("logging",
+                this->structureTraversalConfig.logging);
+        this->structureTraversalConfig.hollowEscalationEnabled =
+            structureTraversalConfig.getBooleanField("hollowEscalationEnabled",
+                this->structureTraversalConfig.hollowEscalationEnabled);
+        this->structureTraversalConfig.hollowEscalationAttemptCap =
+            clampMinerInt(structureTraversalConfig.getIntField(
+                "hollowEscalationAttemptCap",
+                this->structureTraversalConfig.hollowEscalationAttemptCap),
+                this->structureTraversalConfig.hollowEscalationAttemptCap,
+                1, 32);
+        this->structureTraversalConfig.hollowEscalationPreferTravelPoint =
+            structureTraversalConfig.getBooleanField(
+                "hollowEscalationPreferTravelPoint",
+                this->structureTraversalConfig.hollowEscalationPreferTravelPoint);
+        this->structureTraversalConfig.hollowEscalationDirectFallback =
+            structureTraversalConfig.getBooleanField(
+                "hollowEscalationDirectFallback",
+                this->structureTraversalConfig.hollowEscalationDirectFallback);
+        this->structureTraversalConfig.resumeSettleMs = clampMinerInt(
+            structureTraversalConfig.getIntField("resumeSettleMs",
+                this->structureTraversalConfig.resumeSettleMs),
+            this->structureTraversalConfig.resumeSettleMs, 250, 60000);
+        this->structureTraversalConfig.resumeAttemptCap = clampMinerInt(
+            structureTraversalConfig.getIntField("resumeAttemptCap",
+                this->structureTraversalConfig.resumeAttemptCap),
+            this->structureTraversalConfig.resumeAttemptCap, 1, 32);
+        this->structureTraversalConfig.egressAttemptCap = clampMinerInt(
+            structureTraversalConfig.getIntField("egressAttemptCap",
+                this->structureTraversalConfig.egressAttemptCap),
+            this->structureTraversalConfig.egressAttemptCap, 1, 32);
+        this->structureTraversalConfig.teleportAnomalyMeters =
+            clampFloatRange(structureTraversalConfig.getFloatField(
+                "teleportAnomalyMeters",
+                this->structureTraversalConfig.teleportAnomalyMeters),
+                1.f, 1000.f);
+        this->structureTraversalConfig.zSanityMeters = clampFloatRange(
+            structureTraversalConfig.getFloatField("zSanityMeters",
+                this->structureTraversalConfig.zSanityMeters), 0.5f, 100.f);
+        this->structureTraversalConfig.hollowContainmentMarginMeters =
+            clampFloatRange(structureTraversalConfig.getFloatField(
+                "hollowContainmentMarginMeters",
+                this->structureTraversalConfig.hollowContainmentMarginMeters),
+                0.f, 100.f);
+        LuaObject hollowScan = structureTraversalConfig.getObjectField(
+            "hollowScan");
+        if (hollowScan.isValidTable()) {
+            this->structureTraversalConfig.hollowScan.enabled =
+                hollowScan.getBooleanField("enabled",
+                    this->structureTraversalConfig.hollowScan.enabled);
+            this->structureTraversalConfig.hollowScan.rays = clampMinerInt(
+                hollowScan.getIntField("rays",
+                    this->structureTraversalConfig.hollowScan.rays),
+                this->structureTraversalConfig.hollowScan.rays, 8, 360);
+            this->structureTraversalConfig.hollowScan.rayMarginMeters =
+                clampFloatRange(hollowScan.getFloatField(
+                    "rayMarginMeters",
+                    this->structureTraversalConfig.hollowScan.rayMarginMeters),
+                    1.f, 1024.f);
+            this->structureTraversalConfig.hollowScan.minOpeningDeg =
+                clampFloatRange(hollowScan.getFloatField(
+                    "minOpeningDeg",
+                    this->structureTraversalConfig.hollowScan.minOpeningDeg),
+                    0.1f, 180.f);
+        }
+        hollowScan.pop();
+        LuaObject hollowDoorEgress = structureTraversalConfig.getObjectField(
+            "hollowDoorEgress");
+        if (hollowDoorEgress.isValidTable()) {
+            this->structureTraversalConfig.hollowDoorEgress.observe =
+                hollowDoorEgress.getBooleanField("observe",
+                    this->structureTraversalConfig.hollowDoorEgress.observe);
+            this->structureTraversalConfig.hollowDoorEgress.walk =
+                hollowDoorEgress.getBooleanField("walk",
+                    this->structureTraversalConfig.hollowDoorEgress.walk);
+            this->structureTraversalConfig.hollowDoorEgress.useCellPortals =
+                hollowDoorEgress.getBooleanField("useCellPortals",
+                    this->structureTraversalConfig.hollowDoorEgress.useCellPortals);
+        }
+        hollowDoorEgress.pop();
+        this->structureTraversalConfig.requireCompletePath =
+            structureTraversalConfig.getBooleanField("requireCompletePath",
+                this->structureTraversalConfig.requireCompletePath);
+        this->structureTraversalConfig.completePathToleranceMeters =
+            clampFloatRange(structureTraversalConfig.getFloatField(
+                "completePathToleranceMeters",
+                this->structureTraversalConfig.completePathToleranceMeters),
+                0.5f, 256.f);
+        this->structureTraversalConfig.farSideEgress =
+            structureTraversalConfig.getBooleanField("farSideEgress",
+                this->structureTraversalConfig.farSideEgress);
+        this->structureTraversalConfig.useNavmeshHybrid =
+            structureTraversalConfig.getBooleanField("useNavmeshHybrid",
+                this->structureTraversalConfig.useNavmeshHybrid);
+        LuaObject zeroClip = structureTraversalConfig.getObjectField("zeroClip");
+        if (zeroClip.isValidTable()) {
+            this->structureTraversalConfig.zeroClip.enabled =
+                zeroClip.getBooleanField("enabled",
+                    this->structureTraversalConfig.zeroClip.enabled);
+            this->structureTraversalConfig.zeroClip.logging =
+                zeroClip.getBooleanField("logging",
+                    this->structureTraversalConfig.zeroClip.logging);
+            this->structureTraversalConfig.zeroClip.enforce =
+                zeroClip.getBooleanField("enforce",
+                    this->structureTraversalConfig.zeroClip.enforce);
+            this->structureTraversalConfig.zeroClip.maxCandidates =
+                clampMinerInt(zeroClip.getIntField("maxCandidates",
+                    this->structureTraversalConfig.zeroClip.maxCandidates),
+                    this->structureTraversalConfig.zeroClip.maxCandidates,
+                    1, 1024);
+            this->structureTraversalConfig.zeroClip.maxSegmentMeters =
+                clampFloatRange(zeroClip.getFloatField("maxSegmentMeters",
+                    this->structureTraversalConfig.zeroClip.maxSegmentMeters),
+                    1.f, 4096.f);
+            this->structureTraversalConfig.zeroClip.maxProbedSegments =
+                clampMinerInt(zeroClip.getIntField("maxProbedSegments",
+                    this->structureTraversalConfig.zeroClip.maxProbedSegments),
+                    this->structureTraversalConfig.zeroClip.maxProbedSegments,
+                    1, 4096);
+            this->structureTraversalConfig.zeroClip.broadPhasePadMeters =
+                clampFloatRange(zeroClip.getFloatField("broadPhasePadMeters",
+                    this->structureTraversalConfig.zeroClip.broadPhasePadMeters),
+                    0.f, 1024.f);
+            this->structureTraversalConfig.zeroClip.exitCandidateMaxVerticalMeters =
+                clampFloatRange(zeroClip.getFloatField(
+                    "exitCandidateMaxVerticalMeters",
+                    this->structureTraversalConfig.zeroClip.
+                        exitCandidateMaxVerticalMeters), 0.f, 512.f);
+            this->structureTraversalConfig.zeroClip.rejectionCap =
+                clampMinerInt(zeroClip.getIntField("rejectionCap",
+                    this->structureTraversalConfig.zeroClip.rejectionCap),
+                    this->structureTraversalConfig.zeroClip.rejectionCap,
+                    1, 32);
+            this->structureTraversalConfig.zeroClip.walkableConfirm =
+                zeroClip.getBooleanField("walkableConfirm",
+                    this->structureTraversalConfig.zeroClip.walkableConfirm);
+            this->structureTraversalConfig.zeroClip.walkableToleranceRatio =
+                clampFloatRange(zeroClip.getFloatField(
+                    "walkableToleranceRatio",
+                    this->structureTraversalConfig.zeroClip.
+                        walkableToleranceRatio), 1.f, 8.f);
+            this->structureTraversalConfig.zeroClip.exitSetEnabled =
+                zeroClip.getBooleanField("exitSetEnabled",
+                    this->structureTraversalConfig.zeroClip.exitSetEnabled);
+            this->structureTraversalConfig.zeroClip.egressCandidateAttemptCap =
+                clampMinerInt(zeroClip.getIntField(
+                    "egressCandidateAttemptCap",
+                    this->structureTraversalConfig.zeroClip.
+                        egressCandidateAttemptCap),
+                    this->structureTraversalConfig.zeroClip.
+                        egressCandidateAttemptCap, 1, 32);
+            this->structureTraversalConfig.zeroClip.egressTotalAttemptCeiling =
+                clampMinerInt(zeroClip.getIntField(
+                    "egressTotalAttemptCeiling",
+                    this->structureTraversalConfig.zeroClip.
+                        egressTotalAttemptCeiling),
+                    this->structureTraversalConfig.zeroClip.
+                        egressTotalAttemptCeiling, 1, 128);
+        }
+        zeroClip.pop();
+        StructureTraversalDiagLog::setLoggingEnabled(
+            this->structureTraversalConfig.logging);
+        StructureTraversalDiagLog::setZeroClipLoggingEnabled(
+            this->structureTraversalConfig.zeroClip.logging);
+        // Bound to the scan gate itself, not to traversal logging.
+        StructureTraversalDiagLog::setHollowScanLoggingEnabled(
+            this->structureTraversalConfig.hollowScan.enabled);
+    }
+    structureTraversalConfig.pop();
+
+    LuaObject structureTraversalTestConfig = config.getObjectField(
+        "structureTraversalTest");
+    if (structureTraversalTestConfig.isValidTable()) {
+        this->structureTraversalTestConfig.enabled =
+            structureTraversalTestConfig.getBooleanField("enabled",
+                this->structureTraversalTestConfig.enabled);
+        this->structureTraversalTestConfig.planet =
+            structureTraversalTestConfig.getStringField("planet",
+                this->structureTraversalTestConfig.planet.toCharArray());
+        this->structureTraversalTestConfig.botCount = clampMinerInt(
+            structureTraversalTestConfig.getIntField("botCount",
+                this->structureTraversalTestConfig.botCount),
+            this->structureTraversalTestConfig.botCount, 1, 2);
+        this->structureTraversalTestConfig.attackerTemplate =
+            structureTraversalTestConfig.getStringField("attackerTemplate",
+                this->structureTraversalTestConfig.attackerTemplate.toCharArray());
+        this->structureTraversalTestConfig.dwellScaling = clampFloatRange(
+            structureTraversalTestConfig.getFloatField("dwellScaling",
+                this->structureTraversalTestConfig.dwellScaling), 0.1f, 10.f);
+
+        this->structureTraversalTestConfig.scenarios.removeAll();
+        LuaObject scenarios = structureTraversalTestConfig.getObjectField(
+            "scenarios");
+        if (scenarios.isValidTable()) {
+            for (int i = 1; i <= scenarios.getTableSize(); ++i) {
+                LuaObject scenarioTable = scenarios.getObjectAt(i);
+                if (!scenarioTable.isValidTable()) {
+                    scenarioTable.pop();
+                    continue;
+                }
+
+                StructureTraversalTestScenario scenario;
+                scenario.name = scenarioTable.getStringField("name").trim();
+                scenario.planet = scenarioTable.getStringField("planet",
+                    this->structureTraversalTestConfig.planet.toCharArray());
+                scenario.bots = clampMinerInt(scenarioTable.getIntField(
+                    "bots", 1), 1, 1, 2);
+
+                LuaObject spawns = scenarioTable.getObjectField("spawn");
+                if (spawns.isValidTable()) {
+                    for (int spawnIndex = 1;
+                            spawnIndex <= spawns.getTableSize(); ++spawnIndex) {
+                        LuaObject spawnTable = spawns.getObjectAt(spawnIndex);
+                        if (spawnTable.isValidTable())
+                            scenario.spawns.add(
+                                parseStructureTraversalTestPoint(spawnTable,
+                                    ""));
+                        spawnTable.pop();
+                    }
+                }
+                spawns.pop();
+
+                LuaObject budgets = scenarioTable.getObjectField("budgets");
+                if (budgets.isValidTable()) {
+                    scenario.enterBudgetMs = clampMinerInt(
+                        budgets.getIntField("enterMs", scenario.enterBudgetMs),
+                        scenario.enterBudgetMs, 1000, 3600000);
+                    scenario.exitBudgetMs = clampMinerInt(
+                        budgets.getIntField("exitMs", scenario.exitBudgetMs),
+                        scenario.exitBudgetMs, 1000, 3600000);
+                    scenario.totalBudgetMs = clampMinerInt(
+                        budgets.getIntField("totalMs", scenario.totalBudgetMs),
+                        scenario.totalBudgetMs, 1000, 7200000);
+                }
+                budgets.pop();
+
+                LuaObject steps = scenarioTable.getObjectField("steps");
+                if (steps.isValidTable()) {
+                    LuaObject first = steps.getObjectAt(1);
+                    bool firstIsStep = first.isValidTable() &&
+                        !first.getStringField("op").trim().isEmpty();
+                    first.pop();
+                    if (firstIsStep) {
+                        Vector<StructureTraversalTestStep> botSteps;
+                        parseStructureTraversalTestStepList(steps, botSteps);
+                        scenario.steps.add(botSteps);
+                    } else {
+                        for (int botIndex = 1; botIndex <= steps.getTableSize();
+                                ++botIndex) {
+                            LuaObject botStepList = steps.getObjectAt(botIndex);
+                            Vector<StructureTraversalTestStep> botSteps;
+                            parseStructureTraversalTestStepList(botStepList,
+                                botSteps);
+                            scenario.steps.add(botSteps);
+                            botStepList.pop();
+                        }
+                    }
+                }
+                steps.pop();
+
+                if (!scenario.name.isEmpty() && scenario.planet.length() > 0)
+                    this->structureTraversalTestConfig.scenarios.add(scenario);
+                scenarioTable.pop();
+            }
+        }
+        scenarios.pop();
+    }
+    structureTraversalTestConfig.pop();
+
+    initializeStructureTraversalTestResults();
 
     LuaObject resourceIntelligenceConfig = config.getObjectField("resourceIntelligenceConfig");
     if (resourceIntelligenceConfig.isValidTable()) {
@@ -16878,6 +17257,176 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     stationTravel["mechanism"] = "switchZone_to_outdoor_arrival";
     result["stationTravel"] = stationTravel;
 
+    // P.9 structure traversal surface: live controller phases, repair/watchdog
+    // counters, and the manager-owned Phase 3 scenario result store.
+    JSONSerializationType structureTraversal = JSONSerializationType::object();
+    structureTraversal["enabled"] = structureTraversalConfig.enabled;
+    structureTraversal["logging"] = structureTraversalConfig.logging;
+    structureTraversal["hollowEscalationEnabled"] =
+        structureTraversalConfig.hollowEscalationEnabled;
+    structureTraversal["hollowEscalationAttemptCap"] =
+        structureTraversalConfig.hollowEscalationAttemptCap;
+    structureTraversal["hollowEscalationPreferTravelPoint"] =
+        structureTraversalConfig.hollowEscalationPreferTravelPoint;
+    structureTraversal["hollowEscalationDirectFallback"] =
+        structureTraversalConfig.hollowEscalationDirectFallback;
+    structureTraversal["resumeSettleMs"] =
+        structureTraversalConfig.resumeSettleMs;
+    structureTraversal["resumeAttemptCap"] =
+        structureTraversalConfig.resumeAttemptCap;
+    structureTraversal["egressAttemptCap"] =
+        structureTraversalConfig.egressAttemptCap;
+    structureTraversal["teleportAnomalyMeters"] =
+        structureTraversalConfig.teleportAnomalyMeters;
+    structureTraversal["zSanityMeters"] = structureTraversalConfig.zSanityMeters;
+    structureTraversal["requireCompletePath"] =
+        structureTraversalConfig.requireCompletePath;
+    structureTraversal["completePathToleranceMeters"] =
+        structureTraversalConfig.completePathToleranceMeters;
+    structureTraversal["farSideEgress"] =
+        structureTraversalConfig.farSideEgress;
+    structureTraversal["useNavmeshHybrid"] =
+        structureTraversalConfig.useNavmeshHybrid;
+    structureTraversal["hollowContainmentMarginMeters"] =
+        structureTraversalConfig.hollowContainmentMarginMeters;
+
+    JSONSerializationType hollowScan = JSONSerializationType::object();
+    hollowScan["enabled"] = structureTraversalConfig.hollowScan.enabled;
+    hollowScan["rays"] = structureTraversalConfig.hollowScan.rays;
+    hollowScan["rayMarginMeters"] =
+        structureTraversalConfig.hollowScan.rayMarginMeters;
+    hollowScan["minOpeningDeg"] =
+        structureTraversalConfig.hollowScan.minOpeningDeg;
+    structureTraversal["hollowScan"] = hollowScan;
+
+    JSONSerializationType hollowDoorEgress = JSONSerializationType::object();
+    hollowDoorEgress["observe"] =
+        structureTraversalConfig.hollowDoorEgress.observe;
+    hollowDoorEgress["walk"] = structureTraversalConfig.hollowDoorEgress.walk;
+    hollowDoorEgress["useCellPortals"] =
+        structureTraversalConfig.hollowDoorEgress.useCellPortals;
+    structureTraversal["hollowDoorEgress"] = hollowDoorEgress;
+
+    JSONSerializationType zeroClip = JSONSerializationType::object();
+    zeroClip["enabled"] = structureTraversalConfig.zeroClip.enabled;
+    zeroClip["logging"] = structureTraversalConfig.zeroClip.logging;
+    zeroClip["enforce"] = structureTraversalConfig.zeroClip.enforce;
+    zeroClip["maxCandidates"] =
+        structureTraversalConfig.zeroClip.maxCandidates;
+    zeroClip["maxSegmentMeters"] =
+        structureTraversalConfig.zeroClip.maxSegmentMeters;
+    zeroClip["maxProbedSegments"] =
+        structureTraversalConfig.zeroClip.maxProbedSegments;
+    zeroClip["broadPhasePadMeters"] =
+        structureTraversalConfig.zeroClip.broadPhasePadMeters;
+    zeroClip["exitSetEnabled"] =
+        structureTraversalConfig.zeroClip.exitSetEnabled;
+    zeroClip["egressCandidateAttemptCap"] =
+        structureTraversalConfig.zeroClip.egressCandidateAttemptCap;
+    zeroClip["egressTotalAttemptCeiling"] =
+        structureTraversalConfig.zeroClip.egressTotalAttemptCeiling;
+    zeroClip["exitCandidateMaxVerticalMeters"] =
+        structureTraversalConfig.zeroClip.exitCandidateMaxVerticalMeters;
+    zeroClip["rejectionCap"] =
+        structureTraversalConfig.zeroClip.rejectionCap;
+    zeroClip["clearanceChecks"] = zeroClipClearanceChecks.get();
+    zeroClip["wouldBlock"] = zeroClipWouldBlock.get();
+    zeroClip["blocked"] = zeroClipBlocked.get();
+    zeroClip["capExhausted"] = zeroClipCapExhausted.get();
+    zeroClip["walkableConfirm"] =
+        structureTraversalConfig.zeroClip.walkableConfirm;
+    zeroClip["walkableToleranceRatio"] =
+        structureTraversalConfig.zeroClip.walkableToleranceRatio;
+    zeroClip["walkableReclassified"] = zeroClipWalkableReclassified.get();
+    zeroClip["exitSetsBuilt"] = zeroClipExitSetsBuilt.get();
+    zeroClip["exitCandidatesTried"] = zeroClipExitCandidatesTried.get();
+    zeroClip["egressCandidateBudgetExhausted"] =
+        zeroClipEgressCandidateBudgetExhausted.get();
+    zeroClip["skipped"] = zeroClipSkipped.get();
+    zeroClip["truncated"] = zeroClipTruncated.get();
+    zeroClip["errors"] = zeroClipErrors.get();
+    structureTraversal["zeroClip"] = zeroClip;
+
+    JSONSerializationType traversalBots = JSONSerializationType::array();
+    for (int i = 0; i < controllers.size(); ++i) {
+        uint64 controllerKey = controllers.getKey(i);
+        Reference<SimPlayerController*> ctrl = controllers.get(controllerKey);
+        if (ctrl == nullptr || !ctrl->isTraversalActive())
+            continue;
+
+        JSONSerializationType row = JSONSerializationType::object();
+        row["agentOid"] = controllerKey;
+        row["phase"] = ctrl->getTraversalPhaseName();
+        row["generation"] = ctrl->getTraversalGeneration();
+        row["buildingOid"] = ctrl->getTraversalOwningBuildingOid();
+        row["cellOid"] = ctrl->getTraversalTargetCellOid();
+
+        ManagedReference<AiAgent*> traversalAgent = ctrl->getAgent();
+        if (traversalAgent != nullptr) {
+            Locker agentLocker(traversalAgent);
+            row["planet"] = traversalAgent->getZone() == nullptr ?
+                String("unknown") : traversalAgent->getZone()->getZoneName();
+            row["worldX"] = traversalAgent->getWorldPosition().getX();
+            row["worldY"] = traversalAgent->getWorldPosition().getY();
+            row["worldZ"] = traversalAgent->getWorldPosition().getZ();
+        }
+
+        traversalBots.push_back(row);
+    }
+    structureTraversal["bots"] = traversalBots;
+    structureTraversal["testEnabled"] = structureTraversalTestConfig.enabled;
+    structureTraversal["testBotCount"] = structureTraversalTestConfig.botCount;
+    structureTraversal["scenarioCursor"] = structureTraversalTestScenarioIndex;
+    JSONSerializationType scenarios = JSONSerializationType::array();
+    {
+        Locker resultsLocker(&structureTraversalTestMutex);
+        for (int i = 0; i < structureTraversalTestResults.size(); ++i) {
+            const StructureTraversalTestScenarioResult& scenario =
+                structureTraversalTestResults.get(i);
+            JSONSerializationType row = JSONSerializationType::object();
+            row["name"] = scenario.name;
+            row["status"] = scenario.status;
+            row["failReason"] = scenario.failReason;
+            row["startedAtMs"] = scenario.startedAtMs;
+            row["finishedAtMs"] = scenario.finishedAtMs;
+            row["durationMs"] = scenario.durationMs;
+            JSONSerializationType steps = JSONSerializationType::array();
+            for (int stepIndex = 0; stepIndex < scenario.steps.size();
+                    ++stepIndex) {
+                const StructureTraversalTestStepResult& step =
+                    scenario.steps.get(stepIndex);
+                JSONSerializationType stepRow = JSONSerializationType::object();
+                stepRow["op"] = step.op;
+                stepRow["botIndex"] = step.botIndex;
+                stepRow["status"] = step.status;
+                stepRow["failReason"] = step.failReason;
+                stepRow["durationMs"] = step.durationMs;
+                steps.push_back(stepRow);
+            }
+            row["steps"] = steps;
+            scenarios.push_back(row);
+        }
+    }
+    structureTraversal["scenarios"] = scenarios;
+
+    JSONSerializationType traversalAnomalies = JSONSerializationType::object();
+    traversalAnomalies["teleportsDetected"] =
+        structureTraversalTeleportAnomalies.get();
+    traversalAnomalies["zSanityViolations"] =
+        structureTraversalZSanityViolations.get();
+    traversalAnomalies["egressPathFailures"] =
+        structureTraversalEgressPathFailures.get();
+    traversalAnomalies["resumeFailures"] =
+        structureTraversalResumeFailures.get();
+    traversalAnomalies["pathfinderFallbackActivations"] =
+        structureTraversalPathfinderFallbackActivations.get();
+    traversalAnomalies["hollowEscalationsTriggered"] =
+        structureTraversalHollowEscalationsTriggered.get();
+    traversalAnomalies["hollowEscalationsFailed"] =
+        structureTraversalHollowEscalationsFailed.get();
+    structureTraversal["anomalyCounters"] = traversalAnomalies;
+    result["structureTraversal"] = structureTraversal;
+
     // P.4.5b cross-planet dispatch (player-mimetic: run to starport -> board ->
     // ride). byPlanet / last-* reflect the plan the dispatch task last computed.
     JSONSerializationType planetDispatch = JSONSerializationType::object();
@@ -22124,6 +22673,12 @@ bool SimPlayerManager::isActivationTrustAcceptable(
         return true;
 
     return false;
+}
+
+bool SimPlayerManager::isStructureTraversalPointInWater(
+        Zone* zone, const Vector3& point) const {
+    return isOverlandPointInWater(zone, point.getX(), point.getY(),
+        travelWaterMarginMeters);
 }
 
 // P.4.5a: model a shuttle/starport ride. If a travel point is meaningfully
@@ -29958,6 +30513,1152 @@ void SimPlayerManager::runCellNavDiagnosticRetry() {
     CellNavDiagLog::write("CELLNAV_RESOLVE_RETRY_DEFER attempt=" +
         String::valueOf(cellNavDiagResolveAttempts) + " nextMs=3000");
     scheduleCellNavDiagnosticRetry();
+}
+
+void SimPlayerManager::initializeStructureTraversalTestResults() {
+    Locker locker(&structureTraversalTestMutex);
+    structureTraversalTestResults.removeAll();
+
+    for (int i = 0; i < structureTraversalTestConfig.scenarios.size(); ++i) {
+        const StructureTraversalTestScenario& scenario =
+            structureTraversalTestConfig.scenarios.get(i);
+        StructureTraversalTestScenarioResult result;
+        result.name = scenario.name;
+        structureTraversalTestResults.add(result);
+    }
+}
+
+void SimPlayerManager::scheduleStructureTraversalTestSpawn(int delayMs) {
+    {
+        // Same check-then-set hazard as the runner arming flag below.
+        Locker locker(&structureTraversalTestMutex);
+        if (structureTraversalTestSpawnTaskScheduled)
+            return;
+
+        structureTraversalTestSpawnTaskScheduled = true;
+    }
+
+    Reference<StructureTraversalTestSpawnTask*> task =
+        new StructureTraversalTestSpawnTask();
+    task->schedule(delayMs < 0 ? 0 : delayMs);
+}
+
+void SimPlayerManager::scheduleStructureTraversalTestRunner(int delayMs) {
+    {
+        // The controller notify hooks call this from their own task threads,
+        // so the check and the set have to happen together. Unlocked, two
+        // threads both read false and both armed a runner task, and the two
+        // runners then wrote the same scenario cursor.
+        Locker locker(&structureTraversalTestMutex);
+        if (structureTraversalTestRunnerScheduled)
+            return;
+
+        structureTraversalTestRunnerScheduled = true;
+    }
+
+    // Armed outside the lock: task scheduling must not sit underneath the
+    // harness mutex that the controller threads also take.
+    Reference<StructureTraversalTestRunnerTask*> task =
+        new StructureTraversalTestRunnerTask();
+    task->schedule(delayMs < 0 ? 0 : delayMs);
+}
+
+AiAgent* SimPlayerManager::spawnStructureTraversalTestBot(
+        const String& planet, const StructureTraversalTestPoint& point,
+        int botIndex) {
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    Zone* zone = zoneServer == nullptr ? nullptr : zoneServer->getZone(planet);
+    if (zone == nullptr || zone->getCreatureManager() == nullptr)
+        return nullptr;
+
+    float spawnZ = point.z;
+    if (spawnZ == 0.f)
+        spawnZ = zone->getHeight(point.x, point.y);
+
+    CreatureObject* creature = zone->getCreatureManager()->spawnCreature(
+        String("artisan").hashCode(), 0, point.x, spawnZ, point.y, 0);
+    AiAgent* agent = creature == nullptr ? nullptr : creature->asAiAgent();
+    if (agent == nullptr)
+        return nullptr;
+
+    agent->setCreatureBitmask(0);
+    agent->setDespawnOnNoPlayerInRange(false);
+    agent->writeBlackboard("simAlwaysActive", true);
+    agent->setSimAlwaysActive(true);
+    agent->setSimPlayerBot(true);
+    agent->setFaction(0);
+    // ATTACKABLE is REQUIRED for the scripted combat interrupts to be REAL:
+    // AiAgent::isAttackableBy rejects any target whose pvpStatusBitmask lacks
+    // it, so CombatManager::startCombat would refuse the harness attacker and
+    // the scenario would "pass" on a faked defender list. Same reasoning as the
+    // PvE hunter bodies; neutral faction 0, no OVERT (not a GCW combatant).
+    applySimNpcPresentation(agent,
+        ObjectFlag::PLAYER | ObjectFlag::ATTACKABLE);
+    agent->setCustomAiMap(String("simTraversalTest").hashCode());
+    agent->setAITemplate();
+
+    uint64 oid = agent->getObjectID();
+    Reference<SimTraversalTestController*> controller =
+        new SimTraversalTestController(agent);
+    controllers.put(oid, controller.castTo<SimPlayerController*>());
+    if (structureTraversalTestBotOids.size() <= botIndex)
+        structureTraversalTestBotOids.add(oid);
+    else
+        structureTraversalTestBotOids.set(botIndex, oid);
+    agent->activateAiBehavior(true);
+
+    info("StructureTraversalTest bot spawned oid=" + String::valueOf(oid) +
+        " botIndex=" + String::valueOf(botIndex) + " planet=" + planet,
+        true);
+    return agent;
+}
+
+void SimPlayerManager::destroyStructureTraversalTestBot(uint64 oid,
+        const String& reason) {
+    if (oid == 0)
+        return;
+
+    Reference<SimPlayerController*> controller = controllers.contains(oid) ?
+        controllers.get(oid) : nullptr;
+    ManagedReference<AiAgent*> agent = controller == nullptr ? nullptr :
+        controller->getAgent();
+    controllers.drop(oid);
+
+    if (agent != nullptr) {
+        Locker locker(agent);
+        agent->setMovementState(AiAgent::OBLIVIOUS);
+        agent->clearPatrolPoints();
+        agent->clearSavedPatrolPoints();
+        agent->clearCurrentPath();
+        agent->setSimPlayerBot(false);
+        agent->destroyObjectFromWorld(true);
+        agent->destroyObjectFromDatabase(true);
+    }
+
+    StructureTraversalDiagLog::write("SCENARIO_BOT_DESPAWN oid=" +
+        String::valueOf(oid) + " reason=" + reason);
+}
+
+void SimPlayerManager::resetStructureTraversalTestBots(
+        const StructureTraversalTestScenario& scenario) {
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    if (zoneServer == nullptr)
+        return;
+
+    // Retire any attacker still alive from the previous scenario before the
+    // bots are cleared and repositioned; otherwise it simply re-engages and
+    // the freshly-cleared combat state is immediately dirty again.
+    for (int botIndex = 0; botIndex < 2; ++botIndex)
+        despawnStructureTraversalTestAttacker(botIndex, "scenario_reset");
+
+    while (structureTraversalTestBotOids.size() > scenario.bots) {
+        int last = structureTraversalTestBotOids.size() - 1;
+        destroyStructureTraversalTestBot(
+            structureTraversalTestBotOids.get(last), "scenario_bot_count");
+        structureTraversalTestBotOids.remove(last);
+    }
+
+    for (int botIndex = 0; botIndex < scenario.bots; ++botIndex) {
+        StructureTraversalTestPoint spawn;
+        if (botIndex < scenario.spawns.size())
+            spawn = scenario.spawns.get(botIndex);
+
+        uint64 oid = structureTraversalTestBotOids.size() > botIndex ?
+            structureTraversalTestBotOids.get(botIndex) : 0;
+        Reference<SimPlayerController*> controller = oid != 0 &&
+            controllers.contains(oid) ? controllers.get(oid) : nullptr;
+        ManagedReference<AiAgent*> agent = controller == nullptr ? nullptr :
+            controller->getAgent();
+
+        bool needsFreshBot = agent == nullptr;
+        if (!needsFreshBot) {
+            Locker agentLocker(agent);
+            needsFreshBot = agent->isDead() || agent->isIncapacitated();
+        }
+        if (needsFreshBot) {
+            destroyStructureTraversalTestBot(oid, "dead_or_missing_reset");
+            agent = spawnStructureTraversalTestBot(scenario.planet, spawn,
+                botIndex);
+            if (agent == nullptr)
+                continue;
+        } else {
+            controller->prepareForRelocation("structureTraversalScenarioReset");
+            Locker agentLocker(agent);
+            // A reused bot must start the next scenario at peace. Without this
+            // a scripted combat interrupt leaks into every later scenario: the
+            // traversal pauses on the first movement request and never resumes,
+            // so scenarios with no attacker at all fail on their budget.
+            agent->clearCombatState(true);
+            agent->setMovementState(AiAgent::OBLIVIOUS);
+            agent->clearPatrolPoints();
+            agent->clearSavedPatrolPoints();
+            agent->clearCurrentPath();
+            agent->switchZone(scenario.planet, spawn.x, spawn.z, spawn.y, 0);
+            agent->setHomeLocation(spawn.x, spawn.z, spawn.y, 0);
+        }
+
+        bool readyForScenario = false;
+        if (agent != nullptr) {
+            Locker agentLocker(agent);
+            ManagedReference<SceneObject*> parent = agent->getParent().get();
+            // Still in combat after clearCombatState() means the peace
+            // predicate would never settle, so the bot is not reusable.
+            readyForScenario = !agent->isDead() &&
+                !agent->isIncapacitated() && !agent->isInCombat() &&
+                (parent == nullptr || !parent->isCellObject());
+        }
+
+        // A relocation can race world teardown. Replace a bot that did not
+        // land in a live, peaceful outdoor state before the next scenario.
+        if (!readyForScenario && agent != nullptr) {
+            uint64 oldOid = agent->getObjectID();
+            StructureTraversalDiagLog::write(
+                "SCENARIO_RESET_REPLACE oid=" + String::valueOf(oldOid) +
+                " botIndex=" + String::valueOf(botIndex) +
+                " reason=not_alive_peaceful_or_outdoors");
+            destroyStructureTraversalTestBot(oldOid,
+                "reset_not_alive_peaceful_or_outdoors");
+            agent = spawnStructureTraversalTestBot(scenario.planet, spawn,
+                botIndex);
+            if (agent != nullptr) {
+                Locker agentLocker(agent);
+                ManagedReference<SceneObject*> parent = agent->getParent().get();
+                readyForScenario = !agent->isDead() &&
+                    !agent->isIncapacitated() && !agent->isInCombat() &&
+                    (parent == nullptr || !parent->isCellObject());
+            }
+        }
+
+        if (!readyForScenario)
+            StructureTraversalDiagLog::write(
+                "SCENARIO_RESET_VERIFY_FAILED botIndex=" +
+                String::valueOf(botIndex));
+    }
+}
+
+void SimPlayerManager::spawnStructureTraversalTestBots() {
+    {
+        Locker locker(&structureTraversalTestMutex);
+        structureTraversalTestSpawnTaskScheduled = false;
+    }
+    if (!enabled || !structureTraversalConfig.enabled ||
+            !structureTraversalTestConfig.enabled ||
+            structureTraversalTestConfig.scenarios.size() == 0)
+        return;
+
+    if (structureTraversalTestRespawnBotIndex >= 0 &&
+            structureTraversalTestScenarioIndex <
+                structureTraversalTestConfig.scenarios.size()) {
+        const StructureTraversalTestScenario& scenario =
+            structureTraversalTestConfig.scenarios.get(
+                structureTraversalTestScenarioIndex);
+        int botIndex = structureTraversalTestRespawnBotIndex;
+        StructureTraversalTestPoint spawn = botIndex < scenario.spawns.size() ?
+            scenario.spawns.get(botIndex) : StructureTraversalTestPoint();
+        AiAgent* fresh = spawnStructureTraversalTestBot(scenario.planet,
+            spawn, botIndex);
+        structureTraversalTestRespawnBotIndex = -1;
+        if (fresh == nullptr) {
+            failStructureTraversalTest(botIndex, "respawn_failed");
+            return;
+        }
+        completeStructureTraversalTestStep(botIndex, "PASS", "fresh_respawn");
+        scheduleStructureTraversalTestRunner(0);
+        return;
+    }
+
+    scheduleStructureTraversalTestRunner(0);
+}
+
+bool SimPlayerManager::resolveStructureTraversalTestTarget(
+        const String& planet, const StructureTraversalTestStep& step,
+        const Vector3& pathStart, Vector3& world, Vector3& local,
+        ManagedReference<CellObject*>& cell) {
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    Zone* zone = zoneServer == nullptr ? nullptr : zoneServer->getZone(planet);
+    if (zone == nullptr)
+        return false;
+
+    if (step.cellOid != 0) {
+        ManagedReference<SceneObject*> targetObject =
+            zone->getZoneServer()->getObject(step.cellOid);
+        cell = targetObject == nullptr ? nullptr :
+            targetObject.castTo<CellObject*>();
+
+        // An explicit cell OID that does not resolve is a hard failure. Falling
+        // through to the world-point resolver would hand it CELL-LOCAL target
+        // coordinates as a world anchor -- the F.0.4.7 world-coord-as-cell-local
+        // confusion, in reverse.
+        if (cell == nullptr) {
+            StructureTraversalDiagLog::write(
+                "ST_RESOLVE result=failed stage=explicit_cell_oid cellOid=" +
+                String::valueOf(step.cellOid) + " planet=" + planet);
+            return false;
+        }
+    } else if (step.buildingOid != 0) {
+        ManagedReference<SceneObject*> buildingObject =
+            zone->getZoneServer()->getObject(step.buildingOid);
+        BuildingObject* building = buildingObject == nullptr ? nullptr :
+            buildingObject->asBuildingObject();
+        if (building != nullptr) {
+            // A building pinned without a cell name resolves to its first
+            // interior cell. Interior cell numbering is 1-based (cell 0 is the
+            // exterior), matching resolveStarportInteriorWaypoint's loop.
+            if (!step.cellName.isEmpty())
+                cell = building->getCell(step.cellName);
+            else if (building->getTotalCellNumber() >= 1)
+                // BuildingObject::getCell(idx) is an unchecked cells.get(idx)
+                // and errors loudly on idx 0, so the cell count is verified
+                // before asking for the first interior cell.
+                cell = building->getCell(1);
+        }
+
+        // Same reasoning as the explicit-cell-OID guard above: a pinned
+        // building whose cell cannot be resolved must not fall through to the
+        // world resolver carrying cell-local coordinates.
+        if (cell == nullptr) {
+            StructureTraversalDiagLog::write(
+                "ST_RESOLVE result=failed stage=building_oid buildingOid=" +
+                String::valueOf(step.buildingOid) + " cellName=\"" +
+                step.cellName + "\" buildingResolved=" +
+                String::valueOf(building != nullptr) + " planet=" + planet);
+            return false;
+        }
+    }
+
+    if (cell != nullptr) {
+        local = Vector3(step.target.x, step.target.y, step.target.z);
+        world = WorldCoordinates(local, cell).getWorldPosition();
+        return true;
+    }
+
+    // World-only DSL entries use the F.0.4.7 resolver. The supplied point is a
+    // starport-SIDE ANCHOR (a PlanetTravelPoint), not the destination: the
+    // resolver deliberately returns an interior path-graph node many metres
+    // away from it. A distance-to-anchor guard therefore rejects every
+    // successful resolution, so the F.0.4.8 protection is applied where it
+    // actually belongs -- to the cell-local/world round trip, which is what
+    // guards against publishing a world coordinate as a cell-local one.
+    Vector3 anchor(step.target.x, step.target.y, step.target.z);
+    String anchorText = "anchor=(" + String::valueOf(anchor.getX()) + "," +
+        String::valueOf(anchor.getY()) + "," +
+        String::valueOf(anchor.getZ()) + ")";
+    ManagedReference<CellObject*> resolvedCell;
+    StarportInteriorWaypointResult resolveResult =
+        resolveStarportInteriorWaypoint(zone, anchor, pathStart, world, local,
+            resolvedCell);
+
+    if (resolveResult != STARPORT_WAYPOINT_FOUND || resolvedCell == nullptr) {
+        StructureTraversalDiagLog::write(
+            "ST_RESOLVE result=failed stage=starport_waypoint status=" +
+            String::valueOf((int)resolveResult) + " cellResolved=" +
+            String::valueOf(resolvedCell != nullptr) + " " + anchorText +
+            " planet=" + planet);
+        return false;
+    }
+
+    float roundTripError = WorldCoordinates(local, resolvedCell)
+        .getWorldPosition().distanceTo(world);
+    if (roundTripError > 1.f) {
+        StructureTraversalDiagLog::write(
+            "ST_RESOLVE result=failed stage=round_trip errorMeters=" +
+            String::valueOf(roundTripError) + " " +
+            StructureTraversalDiagLog::fmtPos(world, local, resolvedCell));
+        return false;
+    }
+
+    StructureTraversalDiagLog::write(
+        "ST_RESOLVE result=resolved " +
+        StructureTraversalDiagLog::fmtPos(world, local, resolvedCell) + " " +
+        anchorText);
+
+    cell = resolvedCell;
+    return true;
+}
+
+void SimPlayerManager::spawnStructureTraversalTestAttacker(uint64 botOid,
+        int botIndex, int durationMs) {
+    if (botIndex < 0 || botIndex >= 2 || botOid == 0)
+        return;
+
+    despawnStructureTraversalTestAttacker(botIndex, "replace_trigger");
+    Reference<SimPlayerController*> controller = controllers.contains(botOid) ?
+        controllers.get(botOid) : nullptr;
+    ManagedReference<AiAgent*> bot = controller == nullptr ? nullptr :
+        controller->getAgent();
+    if (bot == nullptr || bot->getZone() == nullptr)
+        return;
+
+    Zone* zone = bot->getZone();
+    Vector3 position = bot->getWorldPosition();
+    position.setX(position.getX() + 3.f);
+    float terrainZ = zone->getHeight(position.getX(), position.getY());
+    if (terrainZ != 0.f)
+        position.setZ(terrainZ);
+
+    CreatureManager* creatureManager = zone->getCreatureManager();
+    CreatureObject* creature = creatureManager == nullptr ? nullptr :
+        creatureManager->spawnCreature(
+            structureTraversalTestConfig.attackerTemplate.hashCode(), 0,
+            position.getX(), position.getZ(), position.getY(), 0);
+    AiAgent* attacker = creature == nullptr ? nullptr : creature->asAiAgent();
+    if (attacker == nullptr) {
+        failStructureTraversalTest(botIndex, "attacker_spawn_failed");
+        return;
+    }
+
+    attacker->setFaction(0);
+    attacker->setDespawnOnNoPlayerInRange(false);
+    attacker->setCreatureBitmask(0);
+
+    // Real combat or nothing: a forced defender list would produce a pause
+    // without ever proving the combat-wins path, i.e. a scenario that passes
+    // while testing nothing.
+    if (!CombatManager::instance()->startCombat(attacker, bot.get())) {
+        StructureTraversalDiagLog::write(
+            "SCENARIO_ATTACKER_STARTCOMBAT_FAILED botIndex=" +
+            String::valueOf(botIndex) + " attacker=" +
+            String::valueOf(attacker->getObjectID()));
+        structureTraversalTestCombatAttackerOids[botIndex].store(
+            attacker->getObjectID());
+        despawnStructureTraversalTestAttacker(botIndex, "start_combat_failed");
+        failStructureTraversalTest(botIndex, "attacker_start_combat_failed");
+        return;
+    }
+
+    {
+        Locker botLocker(bot);
+        bot->activateAiBehavior(true);
+    }
+
+    structureTraversalTestCombatAttackerOids[botIndex].store(
+        attacker->getObjectID());
+    int lifetime = durationMs > 0 ? durationMs : 8000;
+    Reference<StructureTraversalTestAttackerDespawnTask*> task =
+        new StructureTraversalTestAttackerDespawnTask(botIndex);
+    task->schedule(lifetime);
+}
+
+void SimPlayerManager::despawnStructureTraversalTestAttacker(int botIndex,
+        const String& reason) {
+    if (botIndex < 0 || botIndex >= 2)
+        return;
+
+    uint64 oid = structureTraversalTestCombatAttackerOids[botIndex].exchange(0);
+    if (oid == 0)
+        return;
+
+    ZoneServer* zoneServer = ServerCore::getZoneServer();
+    ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+        zoneServer->getObject(oid);
+    CreatureObject* creature = object == nullptr ? nullptr :
+        object->asCreatureObject();
+    if (creature != nullptr) {
+        Locker locker(creature);
+        creature->clearCombatState(true);
+        creature->destroyObjectFromWorld(true);
+        creature->destroyObjectFromDatabase(true);
+    }
+
+    // The attacker is force-destroyed rather than dying normally, so the bot
+    // can be left holding a defender that no longer exists. The traversal's
+    // peace predicate is isInCombat(), so a stale defender pins the traversal
+    // in CombatPaused forever and it never resumes.
+    uint64 botOid = botIndex < structureTraversalTestBotOids.size() ?
+        structureTraversalTestBotOids.get(botIndex) : 0;
+    Reference<SimPlayerController*> botController = botOid != 0 &&
+        controllers.contains(botOid) ? controllers.get(botOid) : nullptr;
+    ManagedReference<AiAgent*> bot = botController == nullptr ? nullptr :
+        botController->getAgent();
+    bool botStillInCombat = false;
+    if (bot != nullptr) {
+        Locker botLocker(bot);
+        bot->clearCombatState(true);
+        botStillInCombat = bot->isInCombat();
+    }
+
+    StructureTraversalDiagLog::write("SCENARIO_ATTACKER_DESPAWN oid=" +
+        String::valueOf(oid) + " botIndex=" + String::valueOf(botIndex) +
+        " reason=" + reason + " botCombatCleared=" +
+        String::valueOf(bot != nullptr) + " botStillInCombat=" +
+        String::valueOf(botStillInCombat));
+}
+
+void SimPlayerManager::startStructureTraversalTestBot(uint64 oid) {
+    if (structureTraversalTestScenarioActive && oid != 0)
+        scheduleStructureTraversalTestRunner(0);
+}
+
+// The two notify entry points below are called from the harness controllers'
+// own task threads. They only enqueue the event under the harness mutex; the
+// runner task drains and applies it, so cursor/step state keeps a single
+// writer and no controller thread walks the bot/scenario vectors.
+void SimPlayerManager::notifyStructureTraversalTestArrived(uint64 oid) {
+    if (!structureTraversalTestScenarioActive || oid == 0)
+        return;
+
+    {
+        Locker locker(&structureTraversalTestMutex);
+        structureTraversalTestPendingArrivals.add(oid);
+    }
+    scheduleStructureTraversalTestRunner(0);
+}
+
+void SimPlayerManager::notifyStructureTraversalTestPathFailed(uint64 oid,
+        const String& reason) {
+    if (!structureTraversalTestScenarioActive || oid == 0)
+        return;
+
+    {
+        Locker locker(&structureTraversalTestMutex);
+        structureTraversalTestPendingFailureOids.add(oid);
+        structureTraversalTestPendingFailureReasons.add(reason);
+    }
+    scheduleStructureTraversalTestRunner(0);
+}
+
+// Runner-thread half of the callbacks above.
+void SimPlayerManager::drainStructureTraversalTestEvents() {
+    Vector<uint64> arrivals;
+    Vector<uint64> failureOids;
+    Vector<String> failureReasons;
+
+    {
+        Locker locker(&structureTraversalTestMutex);
+        arrivals = structureTraversalTestPendingArrivals;
+        failureOids = structureTraversalTestPendingFailureOids;
+        failureReasons = structureTraversalTestPendingFailureReasons;
+        structureTraversalTestPendingArrivals.removeAll();
+        structureTraversalTestPendingFailureOids.removeAll();
+        structureTraversalTestPendingFailureReasons.removeAll();
+    }
+
+    for (int i = 0; i < arrivals.size(); ++i) {
+        if (!structureTraversalTestScenarioActive)
+            return;
+        int botIndex = getStructureTraversalTestBotIndex(arrivals.get(i));
+        if (botIndex >= 0 && structureTraversalTestStepIssued[botIndex])
+            completeStructureTraversalTestStep(botIndex, "PASS", "arrived");
+    }
+
+    for (int i = 0; i < failureOids.size(); ++i) {
+        if (!structureTraversalTestScenarioActive)
+            return;
+        int botIndex = getStructureTraversalTestBotIndex(failureOids.get(i));
+        if (botIndex < 0)
+            continue;
+
+        const StructureTraversalTestScenario& scenario =
+            structureTraversalTestConfig.scenarios.get(
+                structureTraversalTestScenarioIndex);
+        if (scenario.name.contains("unreachable"))
+            completeStructureTraversalTestStep(botIndex, "PASS",
+                "bounded_failure_expected");
+        else
+            failStructureTraversalTest(botIndex, failureReasons.get(i));
+    }
+}
+
+int SimPlayerManager::getStructureTraversalTestBotIndex(uint64 oid) const {
+    for (int botIndex = 0; botIndex < structureTraversalTestBotOids.size();
+            ++botIndex) {
+        if (structureTraversalTestBotOids.get(botIndex) == oid)
+            return botIndex;
+    }
+    return -1;
+}
+
+void SimPlayerManager::notifyStructureTraversalTestTick(uint64 oid) {
+    (void)oid;
+}
+
+void SimPlayerManager::completeStructureTraversalTestStep(int botIndex,
+        const String& status, const String& reason) {
+    if (!structureTraversalTestScenarioActive || botIndex < 0 ||
+            botIndex >= 2)
+        return;
+
+    const StructureTraversalTestScenario& scenario =
+        structureTraversalTestConfig.scenarios.get(
+            structureTraversalTestScenarioIndex);
+    if (botIndex >= scenario.steps.size())
+        return;
+    const Vector<StructureTraversalTestStep>& steps =
+        scenario.steps.get(botIndex);
+    int cursor = structureTraversalTestStepCursor[botIndex];
+    if (cursor < 0 || cursor >= steps.size() ||
+            !structureTraversalTestStepIssued[botIndex])
+        return;
+
+    Reference<SimPlayerController*> baseController =
+        controllers.contains(structureTraversalTestBotOids.get(botIndex)) ?
+            controllers.get(structureTraversalTestBotOids.get(botIndex)) :
+            nullptr;
+    SimTraversalTestController* controller = baseController == nullptr ?
+        nullptr : dynamic_cast<SimTraversalTestController*>(baseController.get());
+    if (controller == nullptr)
+        return;
+
+    const StructureTraversalTestStep& step = steps.get(cursor);
+    ManagedReference<AiAgent*> agent = controller->getAgent();
+    bool assertionPassed = true;
+    String assertionReason;
+    if (status == "PASS") {
+        if (agent == nullptr) {
+            assertionPassed = false;
+            assertionReason = "agent_missing";
+        } else if (structureTraversalTeleportAnomalies.get() >
+                    structureTraversalTestStepTeleportBaseline[botIndex] ||
+                structureTraversalZSanityViolations.get() >
+                    structureTraversalTestStepZSanityBaseline[botIndex]) {
+            assertionPassed = false;
+            assertionReason = "movement_anomaly";
+        } else if (step.interrupt.phase != "" &&
+                !structureTraversalTestPauseObserved[botIndex]) {
+            assertionPassed = false;
+            assertionReason = "combat_pause_not_observed";
+        } else if (step.op == "exit") {
+            // An "exit" step carries no building of its own, and the runtime
+            // intent is already cleared by the time this fires. Use the
+            // building captured when the last "enter" step's target RESOLVED:
+            // it is the structure the bot is actually in, unlike a backscan
+            // over the scenario config, which reported the FIRST building of a
+            // two-building scenario and nothing at all for a cell-only step.
+            // Fail closed — an unresolved building is what made the hollow half
+            // of this assertion vacuous precisely when it mattered.
+            uint64 assertBuildingOid =
+                structureTraversalTestBotBuildingOid[botIndex];
+
+            if (assertBuildingOid == 0) {
+                assertionPassed = false;
+            } else {
+                assertionPassed =
+                    controller->isHarnessOutdoorsClearFor(assertBuildingOid);
+            }
+
+            // Log the RAW state at the moment of assertion, pass or fail. The
+            // predicate is `!inCell && !inHollow`, so a PASS alone cannot tell
+            // "genuinely outdoors" from "at a door that sits outside the hollow
+            // AABB" -- and this project has already had a pass that was really a
+            // bot walking through a wall.
+            StructureTraversalDiagLog::write(
+                "ST_HARNESS exitAssert scenario=" + scenario.name + " pass=" +
+                String::valueOf(assertionPassed ? 1 : 0) + " " +
+                controller->describeHarnessOutdoorsStateFor(assertBuildingOid) +
+                " | legacy: " + controller->describeHarnessOutdoorsState());
+
+            if (!assertionPassed)
+                assertionReason = assertBuildingOid == 0 ?
+                    "exit_building_unresolved" : "exit_not_outdoors";
+        } else {
+            Locker locker(agent);
+            if (reason == "bounded_failure_expected" ||
+                    reason == "relocation_state_cleared" ||
+                    reason == "preempted_cleanly" ||
+                    reason == "fresh_respawn") {
+                // These steps assert lifecycle/failure behavior rather than a
+                // movement endpoint.
+            } else if (step.op == "enter") {
+                ManagedReference<SceneObject*> parent = agent->getParent().get();
+                assertionPassed = parent != nullptr && parent->isCellObject();
+                if (assertionPassed && step.cellOid != 0)
+                    assertionPassed = parent->getObjectID() == step.cellOid;
+                if (!assertionPassed)
+                    assertionReason = "enter_target_not_reached";
+            } else if (step.op == "moveTo") {
+                Vector3 destination(step.destination.x, step.destination.y,
+                    step.destination.z);
+                assertionPassed = agent->getWorldPosition().distanceTo(destination) <=
+                    6.f;
+                if (!assertionPassed)
+                    assertionReason = "move_target_not_reached";
+            }
+        }
+    }
+
+    String finalStatus = assertionPassed ? status : "FAIL";
+    String finalReason = assertionPassed ? reason :
+        (assertionReason.isEmpty() ? String("step_assertion_failed") :
+            assertionReason);
+    uint64 duration = System::getMiliTime() -
+        structureTraversalTestStepStartedAtMs[botIndex];
+    {
+        Locker resultsLocker(&structureTraversalTestMutex);
+        StructureTraversalTestScenarioResult& result =
+            structureTraversalTestResults.get(structureTraversalTestScenarioIndex);
+        StructureTraversalTestStepResult row;
+        row.op = step.op;
+        row.botIndex = botIndex;
+        row.status = finalStatus;
+        row.failReason = finalStatus == "PASS" ? String() : finalReason;
+        row.durationMs = duration;
+        result.steps.add(row);
+    }
+
+    StructureTraversalDiagLog::write("SCENARIO_STEP " + scenario.name +
+        " bot=" + String::valueOf(botIndex) + " index=" +
+        String::valueOf(cursor) + " op=" + step.op + " status=" +
+        finalStatus + " durationMs=" + String::valueOf(duration) +
+        (finalReason.isEmpty() ? String() : " reason=" + finalReason));
+
+    structureTraversalTestStepCursor[botIndex]++;
+    structureTraversalTestStepIssued[botIndex] = false;
+    structureTraversalTestInterruptTriggered[botIndex] = false;
+    structureTraversalTestPauseObserved[botIndex] = false;
+    structureTraversalTestDisplacementApplied[botIndex] = false;
+    structureTraversalTestExpectPreemption[botIndex] = false;
+    structureTraversalTestStepStartedAtMs[botIndex] = System::getMiliTime();
+
+    if (finalStatus != "PASS") {
+        failStructureTraversalTest(botIndex, finalReason);
+        return;
+    }
+
+    bool allDone = true;
+    for (int index = 0; index < scenario.bots; ++index) {
+        if (index >= scenario.steps.size() ||
+                structureTraversalTestStepCursor[index] <
+                    scenario.steps.get(index).size()) {
+            allDone = false;
+            break;
+        }
+    }
+    if (allDone)
+        finishStructureTraversalTestScenario("PASS", "all_steps_passed");
+}
+
+void SimPlayerManager::failStructureTraversalTest(int botIndex,
+        const String& reason) {
+    (void)botIndex;
+    finishStructureTraversalTestScenario("FAIL", reason);
+}
+
+void SimPlayerManager::finishStructureTraversalTestScenario(
+        const String& status, const String& reason) {
+    if (!structureTraversalTestScenarioActive)
+        return;
+
+    String finalStatus = status;
+    String finalReason = reason;
+    if (status == "PASS") {
+        if (structureTraversalTeleportAnomalies.get() >
+                    structureTraversalTestScenarioTeleportBaseline ||
+                structureTraversalZSanityViolations.get() >
+                    structureTraversalTestScenarioZSanityBaseline) {
+            finalStatus = "FAIL";
+            finalReason = "movement_anomaly";
+        }
+
+        const StructureTraversalTestScenario& scenario =
+            structureTraversalTestConfig.scenarios.get(
+                structureTraversalTestScenarioIndex);
+        for (int botIndex = 0; botIndex < scenario.bots; ++botIndex) {
+            if (botIndex >= structureTraversalTestBotOids.size())
+                continue;
+            Reference<SimPlayerController*> controller =
+                controllers.contains(structureTraversalTestBotOids.get(botIndex)) ?
+                controllers.get(structureTraversalTestBotOids.get(botIndex)) :
+                nullptr;
+            if (controller != nullptr && (controller->isTraversalActive() ||
+                    controller->getTraversalPhase() !=
+                        StructureTraversalPhase::Idle)) {
+                finalStatus = "FAIL";
+                finalReason = "residual_traversal_state";
+                break;
+            }
+        }
+    }
+
+    for (int botIndex = 0; botIndex < 2; ++botIndex)
+        despawnStructureTraversalTestAttacker(botIndex, "scenario_finished");
+
+    uint64 nowMs = System::getMiliTime();
+    {
+        Locker resultsLocker(&structureTraversalTestMutex);
+        StructureTraversalTestScenarioResult& result =
+            structureTraversalTestResults.get(structureTraversalTestScenarioIndex);
+        result.status = finalStatus;
+        result.failReason = finalStatus == "PASS" ? String() : finalReason;
+        result.finishedAtMs = nowMs;
+        result.durationMs = result.startedAtMs == 0 ? 0 :
+            nowMs - result.startedAtMs;
+    }
+
+    const String& name = structureTraversalTestConfig.scenarios.get(
+        structureTraversalTestScenarioIndex).name;
+    StructureTraversalDiagLog::write("SCENARIO_RESULT name=" + name +
+        " status=" + finalStatus + (finalReason.isEmpty() ? String() :
+            " reason=" + finalReason));
+    structureTraversalTestScenarioActive = false;
+    structureTraversalTestScenarioIndex++;
+    scheduleStructureTraversalTestRunner(250);
+}
+
+void SimPlayerManager::issueStructureTraversalTestStep(int botIndex) {
+    if (!structureTraversalTestScenarioActive || botIndex < 0 ||
+            botIndex >= 2)
+        return;
+
+    const StructureTraversalTestScenario& scenario =
+        structureTraversalTestConfig.scenarios.get(
+            structureTraversalTestScenarioIndex);
+    if (botIndex >= scenario.steps.size())
+        return;
+    const Vector<StructureTraversalTestStep>& steps =
+        scenario.steps.get(botIndex);
+    int cursor = structureTraversalTestStepCursor[botIndex];
+    if (cursor >= steps.size())
+        return;
+
+    uint64 oid = structureTraversalTestBotOids.get(botIndex);
+    Reference<SimPlayerController*> baseController = controllers.contains(oid) ?
+        controllers.get(oid) : nullptr;
+    SimTraversalTestController* controller = baseController == nullptr ?
+        nullptr : dynamic_cast<SimTraversalTestController*>(baseController.get());
+    if (controller == nullptr)
+        return;
+
+    const StructureTraversalTestStep& step = steps.get(cursor);
+    structureTraversalTestStepStartedAtMs[botIndex] = System::getMiliTime();
+    structureTraversalTestStepTeleportBaseline[botIndex] =
+        structureTraversalTeleportAnomalies.get();
+    structureTraversalTestStepZSanityBaseline[botIndex] =
+        structureTraversalZSanityViolations.get();
+    structureTraversalTestStepIssued[botIndex] = true;
+
+    if (step.op == "dwell") {
+        return;
+    }
+    if (step.op == "combatInterrupt") {
+        spawnStructureTraversalTestAttacker(oid, botIndex,
+            (int)(step.dwellMs > 0 ? step.dwellMs *
+                structureTraversalTestConfig.dwellScaling : 8000));
+        return;
+    }
+
+    Vector3 targetWorld(step.destination.x, step.destination.y,
+        step.destination.z);
+    Vector3 targetLocal = targetWorld;
+    ManagedReference<CellObject*> targetCell;
+    // A step whose target cannot be resolved is always a harness failure — the
+    // bounded-failure scenario must reach onPathFailed by actually driving the
+    // traversal API, never by skipping it on an unresolvable target.
+    if (step.op == "enter" && !resolveStructureTraversalTestTarget(
+            scenario.planet, step, controller->getAgent()->getWorldPosition(),
+            targetWorld, targetLocal, targetCell)) {
+        failStructureTraversalTest(botIndex, "target_cell_unresolved");
+        return;
+    }
+
+    // Record the structure the bot is about to occupy, from the RESOLVED
+    // target rather than from the step config. A step may name only a cell
+    // (naboo hospital), and a scenario may enter one building and then a
+    // second (cantina -> corellia hospital) — a config backscan silently
+    // picked up the earlier building in that case, and nothing at all in the
+    // first, which is exactly what the exit assertion must not tolerate.
+    if (step.op == "enter") {
+        uint64 owningBuildingOid = step.buildingOid;
+
+        if (owningBuildingOid == 0 && targetCell != nullptr) {
+            ManagedReference<SceneObject*> cellParent =
+                targetCell->getParent().get();
+
+            if (cellParent != nullptr)
+                owningBuildingOid = cellParent->getObjectID();
+        }
+
+        structureTraversalTestBotBuildingOid[botIndex] = owningBuildingOid;
+    }
+
+    // Bounded-failure scenario: the target is ordinary and resolvable, and the
+    // traversal API is driven for real; only the path RESULT is forced to fail.
+    controller->setHarnessForcePathFailure(
+        scenario.name.contains("unreachable") && step.op == "enter");
+
+    controller->setHarnessEgressSuppressed(
+        scenario.name.contains("enclosed_hollow") && step.op == "moveTo");
+    controller->issueResolvedStep(step, targetWorld, targetLocal,
+        targetCell.get());
+}
+
+void SimPlayerManager::runStructureTraversalTestRunner() {
+    {
+        Locker locker(&structureTraversalTestMutex);
+        // Ownership of the scenario cursor is held for the WHOLE invocation.
+        // Clearing the arming flag up front and running unguarded let a
+        // callback-driven zero-delay tick start a second runner over the same
+        // per-bot step arrays, which could advance a step twice or record a
+        // result against the wrong scenario.
+        //
+        // A tick that loses this race latches instead of running, and the
+        // owner re-arms from the latch on its way out. Simply dropping it
+        // would stall the suite: the death/respawn branch hands off to the
+        // spawn task and returns without a tail reschedule, so the zero-delay
+        // wake-up that task produces is the only thing left to arm.
+        structureTraversalTestRunnerScheduled = false;
+
+        if (structureTraversalTestRunnerRunning) {
+            structureTraversalTestRunnerRerunPending = true;
+            return;
+        }
+
+        structureTraversalTestRunnerRunning = true;
+        structureTraversalTestRunnerRerunPending = false;
+    }
+
+    runStructureTraversalTestRunnerBody();
+
+    bool rerun = false;
+    {
+        Locker locker(&structureTraversalTestMutex);
+        structureTraversalTestRunnerRunning = false;
+        rerun = structureTraversalTestRunnerRerunPending;
+        structureTraversalTestRunnerRerunPending = false;
+    }
+
+    // Bounded: the latch is only set by a tick that genuinely fired during
+    // this invocation, so each contended wake-up costs exactly one extra tick.
+    if (rerun)
+        scheduleStructureTraversalTestRunner(0);
+}
+
+void SimPlayerManager::runStructureTraversalTestRunnerBody() {
+    if (!enabled || !structureTraversalConfig.enabled ||
+            !structureTraversalTestConfig.enabled)
+        return;
+
+    if (structureTraversalTestScenarioIndex >=
+            structureTraversalTestConfig.scenarios.size()) {
+        for (int botIndex = 0; botIndex < 2; ++botIndex)
+            despawnStructureTraversalTestAttacker(botIndex, "suite_finished");
+        while (structureTraversalTestBotOids.size() > 0) {
+            int last = structureTraversalTestBotOids.size() - 1;
+            destroyStructureTraversalTestBot(
+                structureTraversalTestBotOids.get(last), "suite_finished");
+            structureTraversalTestBotOids.remove(last);
+        }
+        return;
+    }
+
+    uint64 nowMs = System::getMiliTime();
+    const StructureTraversalTestScenario& scenario =
+        structureTraversalTestConfig.scenarios.get(
+            structureTraversalTestScenarioIndex);
+
+    if (!structureTraversalTestScenarioActive) {
+        resetStructureTraversalTestBots(scenario);
+        structureTraversalTestScenarioActive = true;
+        structureTraversalTestScenarioStartedAtMs = nowMs;
+        structureTraversalTestScenarioTeleportBaseline =
+            structureTraversalTeleportAnomalies.get();
+        structureTraversalTestScenarioZSanityBaseline =
+            structureTraversalZSanityViolations.get();
+        structureTraversalTestStepCursor[0] = 0;
+        structureTraversalTestStepCursor[1] = 0;
+        structureTraversalTestStepIssued[0] = false;
+        structureTraversalTestStepIssued[1] = false;
+        structureTraversalTestInterruptTriggered[0] = false;
+        structureTraversalTestInterruptTriggered[1] = false;
+        structureTraversalTestPauseObserved[0] = false;
+        structureTraversalTestPauseObserved[1] = false;
+        structureTraversalTestDisplacementApplied[0] = false;
+        structureTraversalTestDisplacementApplied[1] = false;
+        structureTraversalTestExpectPreemption[0] = false;
+        structureTraversalTestExpectPreemption[1] = false;
+        structureTraversalTestBotBuildingOid[0] = 0;
+        structureTraversalTestBotBuildingOid[1] = 0;
+        {
+            Locker resultsLocker(&structureTraversalTestMutex);
+            StructureTraversalTestScenarioResult& result =
+                structureTraversalTestResults.get(
+                    structureTraversalTestScenarioIndex);
+            result.status = "RUNNING";
+            result.startedAtMs = nowMs;
+            // Harness bots are reused across scenarios, so a late arrival from
+            // the previous scenario would otherwise complete a fresh step.
+            structureTraversalTestPendingArrivals.removeAll();
+            structureTraversalTestPendingFailureOids.removeAll();
+            structureTraversalTestPendingFailureReasons.removeAll();
+        }
+        for (int botIndex = 0; botIndex < scenario.bots; ++botIndex) {
+            if (botIndex < structureTraversalTestBotOids.size()) {
+                Reference<SimPlayerController*> ctrl = controllers.contains(
+                    structureTraversalTestBotOids.get(botIndex)) ?
+                    controllers.get(structureTraversalTestBotOids.get(botIndex)) :
+                    nullptr;
+                if (ctrl != nullptr)
+                    ctrl->startSimLoop();
+            }
+        }
+    }
+
+    // Apply any arrival/path-failure events the controllers queued since the
+    // last tick before evaluating budgets and issuing the next step.
+    drainStructureTraversalTestEvents();
+    if (!structureTraversalTestScenarioActive)
+        return;
+
+    if (nowMs - structureTraversalTestScenarioStartedAtMs >
+            (uint64)scenario.totalBudgetMs) {
+        failStructureTraversalTest(-1, "scenario_timeout");
+        return;
+    }
+
+    bool allDone = true;
+    for (int botIndex = 0; botIndex < scenario.bots; ++botIndex) {
+        if (botIndex >= scenario.steps.size()) {
+            failStructureTraversalTest(botIndex, "missing_bot_steps");
+            return;
+        }
+        const Vector<StructureTraversalTestStep>& steps =
+            scenario.steps.get(botIndex);
+        int cursor = structureTraversalTestStepCursor[botIndex];
+        if (cursor >= steps.size())
+            continue;
+        allDone = false;
+
+        if (!structureTraversalTestStepIssued[botIndex]) {
+            issueStructureTraversalTestStep(botIndex);
+            if (!structureTraversalTestScenarioActive)
+                return;
+            // issue* stamps stepStartedAtMs with a LATER timestamp than the
+            // nowMs sampled at the top of this tick. Evaluating budgets or
+            // interrupt triggers here would underflow the unsigned age and fire
+            // everything instantly, so let the freshly issued step age until
+            // the next tick.
+            continue;
+        }
+
+        Reference<SimPlayerController*> baseController =
+            controllers.contains(structureTraversalTestBotOids.get(botIndex)) ?
+            controllers.get(structureTraversalTestBotOids.get(botIndex)) :
+            nullptr;
+        SimTraversalTestController* controller = baseController == nullptr ?
+            nullptr : dynamic_cast<SimTraversalTestController*>(baseController.get());
+        if (controller == nullptr) {
+            failStructureTraversalTest(botIndex, "controller_missing");
+            return;
+        }
+
+        const StructureTraversalTestStep& step = steps.get(cursor);
+        // Clamped: a step re-stamped by the event drain can carry a timestamp
+        // newer than this tick's nowMs.
+        uint64 stepStartedAtMs = structureTraversalTestStepStartedAtMs[botIndex];
+        uint64 stepAgeMs = nowMs > stepStartedAtMs ? nowMs - stepStartedAtMs : 0;
+
+        if ((step.op == "enter" || step.op == "exit") &&
+                stepAgeMs >
+                (uint64)((step.op == "enter" ? scenario.enterBudgetMs :
+                    scenario.exitBudgetMs))) {
+            failStructureTraversalTest(botIndex, step.op + "_budget_exceeded");
+            return;
+        }
+
+        // Scenario 20 deliberately exercises an external public-API
+        // preemption.  The replacement move is issued by the runner, not by a
+        // traversal-owned leg, so the formal API must cancel the old intent.
+        if (scenario.name.contains("external_preemption") &&
+                step.op == "enter" && !structureTraversalTestInterruptTriggered[botIndex] &&
+                stepAgeMs >= 750) {
+            structureTraversalTestInterruptTriggered[botIndex] = true;
+            structureTraversalTestExpectPreemption[botIndex] = true;
+            controller->moveTo(Vector3(3500, -4700, 5));
+        }
+
+        // The preempted enter step is verified as a preemption: the external
+        // moveTo above must have cancelled the traversal outright. Asserting
+        // "reached the target cell" here would fail a correct preemption (and
+        // pass a bot that simply entered before the trigger fired).
+        if (structureTraversalTestExpectPreemption[botIndex]) {
+            if (controller->isTraversalActive() ||
+                    controller->getTraversalPhase() !=
+                        StructureTraversalPhase::Idle) {
+                if (stepAgeMs >= 15000)
+                    failStructureTraversalTest(botIndex,
+                        "preemption_did_not_clear_traversal");
+                continue;
+            }
+            structureTraversalTestExpectPreemption[botIndex] = false;
+            completeStructureTraversalTestStep(botIndex, "PASS",
+                "preempted_cleanly");
+            continue;
+        }
+
+        // Scenario 21 uses the exact relocation hygiene hook and then records
+        // the cleared intent before the next plain movement step.
+        if (scenario.name.contains("prepare_for_relocation") &&
+                step.op == "enter" && !structureTraversalTestInterruptTriggered[botIndex] &&
+                stepAgeMs >= 750) {
+            structureTraversalTestInterruptTriggered[botIndex] = true;
+            controller->prepareForRelocation("harness_prepare_for_relocation");
+            completeStructureTraversalTestStep(botIndex, "PASS",
+                "relocation_state_cleared");
+            continue;
+        }
+
+        // Scenario 22 intentionally kills the current harness body.  The next
+        // scenario reset will also exercise this path, but respawn here keeps
+        // the suite moving without waiting for an external maintenance loop.
+        if (scenario.name.contains("death_or_incapacity") &&
+                step.op == "enter" && !structureTraversalTestInterruptTriggered[botIndex] &&
+                controller->isTraversalActive() && stepAgeMs >= 750) {
+            structureTraversalTestInterruptTriggered[botIndex] = true;
+            uint64 oldOid = structureTraversalTestBotOids.get(botIndex);
+            destroyStructureTraversalTestBot(oldOid, "harness_scripted_death");
+            structureTraversalTestBotOids.set(botIndex, 0);
+            structureTraversalTestRespawnBotIndex = botIndex;
+            scheduleStructureTraversalTestSpawn(0);
+            return;
+        }
+
+        if (step.interrupt.phase != "" &&
+                !structureTraversalTestInterruptTriggered[botIndex] &&
+                controller->getTraversalPhaseName() == step.interrupt.phase &&
+                stepAgeMs >= (uint64)step.interrupt.afterMs) {
+            structureTraversalTestInterruptTriggered[botIndex] = true;
+            spawnStructureTraversalTestAttacker(
+                structureTraversalTestBotOids.get(botIndex), botIndex,
+                (int)(step.interrupt.durationMs > 0 ?
+                    step.interrupt.durationMs : 8000));
+        }
+
+        if (controller->getTraversalPhase() ==
+                StructureTraversalPhase::CombatPaused)
+            structureTraversalTestPauseObserved[botIndex] = true;
+
+        // Displacement must happen only once the bot is genuinely CombatPaused:
+        // displacing earlier advances the work-loop generation and can cancel
+        // the very arrival task that would have entered the pause.
+        if (step.interrupt.hasDisplacement &&
+                structureTraversalTestInterruptTriggered[botIndex] &&
+                !structureTraversalTestDisplacementApplied[botIndex] &&
+                controller->getTraversalPhase() ==
+                    StructureTraversalPhase::CombatPaused) {
+            structureTraversalTestDisplacementApplied[botIndex] = true;
+            controller->applyHarnessCombatDisplacement(scenario.planet,
+                step.interrupt.displacement);
+        }
+
+        if (step.op == "dwell" && nowMs -
+                structureTraversalTestStepStartedAtMs[botIndex] >=
+                (uint64)(step.dwellMs *
+                    structureTraversalTestConfig.dwellScaling))
+            completeStructureTraversalTestStep(botIndex, "PASS", "dwell_complete");
+        else if (step.op == "combatInterrupt" &&
+                structureTraversalTestPauseObserved[botIndex] &&
+                controller->getTraversalPhase() !=
+                    StructureTraversalPhase::CombatPaused &&
+                structureTraversalTestCombatAttackerOids[botIndex].load() == 0)
+            completeStructureTraversalTestStep(botIndex, "PASS",
+                "combat_pause_resume_complete");
+    }
+
+    if (allDone) {
+        finishStructureTraversalTestScenario("PASS", "all_steps_passed");
+        return;
+    }
+
+    scheduleStructureTraversalTestRunner(500);
 }
 
 void SimPlayerManager::spawnCellNavDiagnosticBot() {
