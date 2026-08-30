@@ -4190,6 +4190,7 @@ void SimPlayerController::recordTraversalMovementStep(
     float teleportThreshold = SimPlayerManager::instance()->
         getStructureTraversalTeleportAnomalyMeters();
     if (delta > teleportThreshold) {
+        traversalTeleportAnomalyCount++;
         SimPlayerManager::instance()->recordStructureTraversalTeleportAnomaly();
         StructureTraversalDiagLog::write(
             "ST_TELEPORT_ANOMALY agent=" + String::valueOf(
@@ -4201,8 +4202,29 @@ void SimPlayerController::recordTraversalMovementStep(
             StructureTraversalDiagLog::fmtPos(agent));
     }
 
+    // The z-sanity reference is CollisionManager::getWorldFloorCollision, which
+    // returns the WORLD/terrain floor; CollisionManager exposes no cell-aware
+    // overload (CollisionManager.h:66-67). Inside a building that reference is
+    // meaningless -- a bot on an interior ramp or an upper floor legitimately
+    // sits metres above terrain, so the check fires on correct movement.
+    //
+    // F_0.8.1 stage 2 measured it: a PvP bot walking a Theed starport ramp to a
+    // ticket collector logged 15 consecutive violations, every step an
+    // identical 2.40m with dz 0.184m (a constant ~4.4-degree slope) while floor
+    // stayed pinned at terrain height 6.0 and the bot climbed to 13.67. Smooth,
+    // monotonic, arriving exactly on target, with teleportsDetected at 0 -- a
+    // correct walk, not a clip.
+    //
+    // Outdoors the check keeps its full value, which is where terrain clipping
+    // matters and where it was validated. Indoor z-sanity is recorded as
+    // coverage debt rather than a silently wrong number; clipping on the path
+    // side is already covered by the zero-clip clearance probe.
+    ManagedReference<SceneObject*> zSanityParent = agent->getParent().get();
+    bool zSanityIndoors = zSanityParent != nullptr &&
+        zSanityParent->isCellObject();
+
     Zone* zone = agent->getZone();
-    if (zone != nullptr) {
+    if (zone != nullptr && !zSanityIndoors) {
         float floor = CollisionManager::getWorldFloorCollision(
             currentPosition.getX(), currentPosition.getY(),
             currentPosition.getZ(), zone, true);
@@ -4212,6 +4234,7 @@ void SimPlayerController::recordTraversalMovementStep(
 
         if (floor != 0.f && zDelta > SimPlayerManager::instance()->
                 getStructureTraversalZSanityMeters()) {
+            traversalZSanityViolationCount++;
             SimPlayerManager::instance()->recordStructureTraversalZSanityViolation();
             StructureTraversalDiagLog::write(
                 "ST_ZSANITY agent=" + String::valueOf(

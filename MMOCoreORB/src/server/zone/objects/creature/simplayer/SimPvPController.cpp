@@ -1249,6 +1249,15 @@ void SimPvPController::beginCollectorDepartureApproach(const String& reason) {
 		manager->resolveStarportInteriorWaypoint(zone, shuttleLocation,
 			currentWorld, interiorWorld, interiorLocal, interiorCell);
 
+	// F_0.8.1 stage 2. A collector baked inside a building CELL is a real
+	// building entry, so it belongs to the traversal state machine rather than a
+	// bare moveTo. Guarded on BOTH a non-null cell and the feature gate so the
+	// gate-off and outdoor-collector paths stay byte-identical to today: a
+	// starport hollow collector resolves to a null cell and is frequently the
+	// destination in its own right (owner constraint, 2026-08-27).
+	bool collectorTraversalEntry = collectorCell != nullptr &&
+		isStructureTraversalFeatureEnabled();
+
 	CellNavDiagLog::write("PVP_COLLECTOR_APPROACH squad=" +
 		String::valueOf(squadId) + " agent=" +
 		String::valueOf(strongAgent->getObjectID()) +
@@ -1261,7 +1270,8 @@ void SimPvPController::beginCollectorDepartureApproach(const String& reason) {
 		String::valueOf(currentWorld.getY()) + ") action=" +
 		String(result == SimPlayerManager::STARPORT_WAYPOINT_FOUND ?
 			"moveToInterior" : result == SimPlayerManager::STARPORT_RESOLVE_FAILED ?
-			"onPathFailed" : "plainMoveTo(collector)"));
+			"onPathFailed" : collectorTraversalEntry ?
+			"enterStructure(collector)" : "plainMoveTo(collector)"));
 
 	if (result == SimPlayerManager::STARPORT_RESOLVE_FAILED) {
 		SimPlayerController::onPathFailed();
@@ -1284,7 +1294,10 @@ void SimPvPController::beginCollectorDepartureApproach(const String& reason) {
 	// CELL-LOCAL position. Passing the world point there is the
 	// world-coord-as-cell-local bug class (F_0.4.7), invisible so far only
 	// because hollow collectors make the two identical.
-	moveTo(collectorWorld, collectorLocal, collectorCell.get());
+	if (collectorTraversalEntry)
+		enterStructure(collectorWorld, collectorLocal, collectorCell.get());
+	else
+		moveTo(collectorWorld, collectorLocal, collectorCell.get());
 
 	if (SimPlayerManager::instance()->isPvpLogStateTransitionsEnabled())
 		Logger::console.info("SimPvpLeader squad=" + String::valueOf(squadId) +
@@ -1475,10 +1488,25 @@ void SimPvPController::onArrived() {
 	if (collectorDepartureActive) {
 		if (collectorDepartureEntry) {
 			collectorDepartureEntry = false;
-			cellEgressSuppressed = true;
 			// Cell-local for the local argument — see the note at the other
 			// collector approach.
-			moveTo(collectorWorld, collectorLocal, collectorCell.get());
+			//
+			// F_0.8.1 stage 2, same guard as the other approach. enterStructure
+			// clears cellEgressSuppressed (via clearStructureTraversalState), and
+			// that is intended: the suppression existed to stop the legacy egress
+			// machinery firing on an interior walk, but beginCellEgressIfNeeded
+			// already returns false for a same-cell or same-building target. The
+			// only case it now lets through is a collector in a DIFFERENT
+			// building, where an egress leg is the correct answer. The gate-off
+			// branch keeps the suppression so its behaviour is unchanged.
+			if (collectorCell != nullptr &&
+					isStructureTraversalFeatureEnabled()) {
+				enterStructure(collectorWorld, collectorLocal,
+					collectorCell.get());
+			} else {
+				cellEgressSuppressed = true;
+				moveTo(collectorWorld, collectorLocal, collectorCell.get());
+			}
 			return;
 		}
 

@@ -31107,9 +31107,9 @@ void SimPlayerManager::completeStructureTraversalTestStep(int botIndex,
         if (agent == nullptr) {
             assertionPassed = false;
             assertionReason = "agent_missing";
-        } else if (structureTraversalTeleportAnomalies.get() >
+        } else if (controller->getTraversalTeleportAnomalyCount() >
                     structureTraversalTestStepTeleportBaseline[botIndex] ||
-                structureTraversalZSanityViolations.get() >
+                controller->getTraversalZSanityViolationCount() >
                     structureTraversalTestStepZSanityBaseline[botIndex]) {
             assertionPassed = false;
             assertionReason = "movement_anomaly";
@@ -31320,10 +31320,14 @@ void SimPlayerManager::issueStructureTraversalTestStep(int botIndex) {
 
     const StructureTraversalTestStep& step = steps.get(cursor);
     structureTraversalTestStepStartedAtMs[botIndex] = System::getMiliTime();
+    // Baseline this BOT's own tallies, not the global aggregates: a production
+    // bot tripping an anomaly mid-step would otherwise fail an unrelated
+    // scenario (F_0.8.1 stage 2). Paired with the compare in
+    // advanceStructureTraversalTestStep.
     structureTraversalTestStepTeleportBaseline[botIndex] =
-        structureTraversalTeleportAnomalies.get();
+        controller->getTraversalTeleportAnomalyCount();
     structureTraversalTestStepZSanityBaseline[botIndex] =
-        structureTraversalZSanityViolations.get();
+        controller->getTraversalZSanityViolationCount();
     structureTraversalTestStepIssued[botIndex] = true;
 
     if (step.op == "dwell") {

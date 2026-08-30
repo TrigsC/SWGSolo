@@ -380,6 +380,16 @@ protected:
     uint64 traversalGeneration;
     Vector3 traversalLastAppliedWorldPosition;
     bool traversalWatchdogPositionInitialized;
+    // Per-agent traversal anomaly tallies. The manager's counters are global
+    // aggregates for the dashboard; the traversal test harness must assert on
+    // THIS agent's contribution instead, or any production bot tripping an
+    // anomaly during a harness step fails that step. F_0.8.1 stage 2 hit
+    // exactly that: a migrated PvP bot's z-sanity burst failed the unrelated
+    // cantina_long_dwell scenario. Monotonic -- deliberately NOT reset by
+    // clearStructureTraversalState, so a baseline/compare pair spanning a step
+    // stays valid across traversal generations.
+    uint64 traversalTeleportAnomalyCount = 0;
+    uint64 traversalZSanityViolationCount = 0;
     uint64 traversalPeaceSinceMs;
     std::atomic<uint64> traversalResumeMonitorGeneration;
     bool traversalResumeInProgress;
@@ -492,6 +502,12 @@ public:
     void exitStructure(Vector3 outdoorDest);
     void checkArrival();
     ManagedReference<AiAgent*> getAgent() const { return agent; }
+    uint64 getTraversalTeleportAnomalyCount() const {
+        return traversalTeleportAnomalyCount;
+    }
+    uint64 getTraversalZSanityViolationCount() const {
+        return traversalZSanityViolationCount;
+    }
     StructureTraversalPhase getTraversalPhase() const {
         return structureTraversalPhase;
     }
