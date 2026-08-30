@@ -2081,6 +2081,13 @@ private:
 	void scheduleStructureTraversalTestRunner(int delayMs);
 	void runStructureTraversalTestRunner();
 	void runStructureTraversalTestRunnerBody();
+	// Sums the HARNESS bots' own traversal anomaly tallies. The manager's
+	// structureTraversal{Teleport,ZSanity} counters are dashboard aggregates
+	// that include production bots; asserting on them lets any bot in the world
+	// fail a harness scenario (F_0.8.1 stage 2 fixed the per-step assertion,
+	// stage 3 the per-scenario one this feeds).
+	void sumStructureTraversalTestBotAnomalies(uint64& outTeleports,
+			uint64& outZSanity);
 	void finishStructureTraversalTestScenario(const String& status,
 		const String& reason);
 	void resetStructureTraversalTestBots(const StructureTraversalTestScenario& scenario);

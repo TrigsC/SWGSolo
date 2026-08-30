@@ -31227,6 +31227,21 @@ void SimPlayerManager::completeStructureTraversalTestStep(int botIndex,
         finishStructureTraversalTestScenario("PASS", "all_steps_passed");
 }
 
+void SimPlayerManager::sumStructureTraversalTestBotAnomalies(
+        uint64& outTeleports, uint64& outZSanity) {
+    outTeleports = 0;
+    outZSanity = 0;
+    for (int i = 0; i < structureTraversalTestBotOids.size(); ++i) {
+        uint64 oid = structureTraversalTestBotOids.get(i);
+        Reference<SimPlayerController*> controller = controllers.contains(oid) ?
+            controllers.get(oid) : nullptr;
+        if (controller == nullptr)
+            continue;
+        outTeleports += controller->getTraversalTeleportAnomalyCount();
+        outZSanity += controller->getTraversalZSanityViolationCount();
+    }
+}
+
 void SimPlayerManager::failStructureTraversalTest(int botIndex,
         const String& reason) {
     (void)botIndex;
@@ -31241,10 +31256,17 @@ void SimPlayerManager::finishStructureTraversalTestScenario(
     String finalStatus = status;
     String finalReason = reason;
     if (status == "PASS") {
-        if (structureTraversalTeleportAnomalies.get() >
-                    structureTraversalTestScenarioTeleportBaseline ||
-                structureTraversalZSanityViolations.get() >
-                    structureTraversalTestScenarioZSanityBaseline) {
+        // Per-agent, not global: production bots emit real anomalies now that
+        // they run traversal, and a PvP bot clipping terrain on Yavin must not
+        // fail a Mos Eisley harness scenario. Stage 2 fixed the per-STEP
+        // assertion and missed this per-SCENARIO one, which then failed
+        // mos_eisley_starport_deep_foyer4 with both of its steps passing.
+        uint64 scenarioTeleports = 0;
+        uint64 scenarioZSanity = 0;
+        sumStructureTraversalTestBotAnomalies(scenarioTeleports,
+            scenarioZSanity);
+        if (scenarioTeleports > structureTraversalTestScenarioTeleportBaseline ||
+                scenarioZSanity > structureTraversalTestScenarioZSanityBaseline) {
             finalStatus = "FAIL";
             finalReason = "movement_anomaly";
         }
@@ -31453,10 +31475,9 @@ void SimPlayerManager::runStructureTraversalTestRunnerBody() {
         resetStructureTraversalTestBots(scenario);
         structureTraversalTestScenarioActive = true;
         structureTraversalTestScenarioStartedAtMs = nowMs;
-        structureTraversalTestScenarioTeleportBaseline =
-            structureTraversalTeleportAnomalies.get();
-        structureTraversalTestScenarioZSanityBaseline =
-            structureTraversalZSanityViolations.get();
+        sumStructureTraversalTestBotAnomalies(
+            structureTraversalTestScenarioTeleportBaseline,
+            structureTraversalTestScenarioZSanityBaseline);
         structureTraversalTestStepCursor[0] = 0;
         structureTraversalTestStepCursor[1] = 0;
         structureTraversalTestStepIssued[0] = false;
