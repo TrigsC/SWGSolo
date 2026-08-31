@@ -165,8 +165,13 @@ no new warnings before handing work back** (owner-stated standard).
   flag, `ticketCollectorTravel` interplanetary-travel gate +
   `interiorContainmentMarginMeters`, and the `cellNavDiag` toggles —
   `enabled` for the diagnostic test-bot spawn and `logging` as the master gate
-  for all `bin/log/cellnav.log` output, both default off). This is the primary
-  place new simulation features expose owner-tunable, default-off gates.
+  for all `bin/log/cellnav.log` output, both default off). F_0.8.0/F_0.8.1 add the
+  `structureTraversal` block — `enabled`/`logging`, `hollowEscalation*`,
+  `farSideEgress`, `hollowDoorEgress.*`, the `zeroClip.*` probe and enforcement
+  knobs (`enforce`, `rejectionCap`, `walkableConfirm`,
+  `walkableToleranceRatio`), and the `structureTraversalTest` scenario matrix —
+  all default off. This is the primary place new simulation features expose
+  owner-tunable, default-off gates.
 - **`MMOCoreORB/bin/conf/features.lua`** — global feature flags.
 - Compiled-in constants are the exception, not the default — prefer a Lua
   config entry so behavior is tunable without a rebuild.
@@ -323,6 +328,96 @@ This is this fork's primary custom subsystem, layered on top of the stock
   on a ~zero step; wrap a negative angle by `+2*PI` not `+PI`) removed a
   pivot-swivel. Cell-nav instrumentation (`CellNavDiagLog` → `bin/log/cellnav.log`)
   is retained but gated by `cellNavDiag.logging` (default off).
+- **Structure traversal (P.9 / F_0.8.0)** — POB enter/exit is no longer an
+  ad-hoc `moveTo` sequence but an explicit state machine on
+  `SimPlayerController`: `StructureTraversalPhase`
+  (`Idle→ApproachDoor→InteriorRoute→Egress→Reentry→CombatPaused→Resuming`)
+  plus a `traversalGeneration` **separate from** the movement work-loop
+  generation, so combat can cancel a path task without cancelling the
+  traversal intent. Bounded **hollow escalation** recovers a bot stranded in a
+  starport's enclosed hollow. **D2b far-side egress** fixes the dominant
+  failure: from inside a starport the pathfinder answers "reach the far
+  exterior door" with a valid route out the *nearest* portal, back into the
+  hollow — a path that **succeeds while making no progress**, which the repair
+  ladder never sees because that ladder only runs on path *failure*.
+  `acceptFoundPath` rejects such a route and retargets to the nearest reachable
+  non-hollow exit **cell**. Its predicate deliberately exempts a destination
+  that is itself in the hollow: multi-hop planet transit lands a bot on the pad
+  (ticket collector) and must not be marched out the far side — see
+  `docs/ai-cell-navigation-design.md` and the `F_0.8.0-D*` proposals.
+  A **26-scenario live matrix** (`structureTraversalTest` in
+  `sim_player_manager.lua`, AI template `bin/scripts/ai/simTraversalTest.lua`)
+  is this subsystem's verification vehicle in place of unit tests, which cannot
+  reach code that needs a live zone's navmesh/PortalLayout. Its runner is a
+  single-writer state machine: ownership of the scenario cursor is held under
+  `structureTraversalTestMutex` for a whole invocation while task scheduling
+  happens **outside** the lock, because the controller notify hooks take that
+  same mutex from threads that may already hold an agent lock (harnessMutex →
+  agentLock against agentLock → harnessMutex is an ABBA deadlock).
+  Instrumentation: `StructureTraversalDiagLog` → `bin/log/structuretraversal.log`,
+  gated by `structureTraversal.logging`.
+- **Traversal adoption by production controllers (F_0.8.1)** — F_0.8.0 built the
+  state machine but nothing used it: `enterStructure()` had **exactly one caller,
+  the test harness**. Adoption is therefore a distinct architectural step from
+  the machinery, and the rule for any future controller is that a cell-bearing
+  destination is a **building entry** and belongs to `enterStructure`, not a bare
+  `moveTo`. Migrated: `SimHunterController` (buff providers) and
+  `SimPvPController` (collector approaches, starport interior waypoints).
+  Migration sites are guarded on a non-null cell — a starport hollow resolves to
+  a null cell and must stay an outdoor approach, since the hollow is frequently
+  the destination. Where the legacy call was `moveTo` rather than
+  `moveToInterior` the guard must **also** test the feature gate, because
+  `enterStructure`'s null-cell fallthrough calls `moveToInterior`; without that,
+  gate-off behaviour changes. **Miners are deliberately not migrated** — station
+  travel teleports them to an *outdoor* arrival by design, so they have no reason
+  to enter a cell. `acceptFoundPath` is now a non-virtual **template method**
+  (invariants + `virtual acceptFoundPathHook`): a subclass that overrode it
+  wholesale silently opted out of every base invariant, and that is now a compile
+  error. **`exitStructure` is NOT yet adopted** — production bots enter through
+  the state machine and leave through the legacy cell-egress ladder; see
+  `docs/1-plans/F_0.8.2_traversal-egress-adoption.plan.md`.
+- **Test-oracle vs. production telemetry (F_0.8.1)** — an architectural boundary
+  the harness originally got wrong. `SimPlayerManager`'s
+  `structureTraversal{Teleport,ZSanity}` counters are **global dashboard
+  aggregates**; the matrix must assert on **per-agent** tallies held on
+  `SimPlayerController` (monotonic, deliberately not reset by
+  `clearStructureTraversalState`, `std::atomic` because the oracle reads them
+  off-thread). Asserting on the globals lets any bot in the world fail an
+  unrelated harness scenario — latent and invisible until a production bot first
+  ran traversal. Counters belonging to a body destroyed mid-scenario are folded
+  into a per-slot carry inside `destroyStructureTraversalTestBot`, the single
+  choke point every destroy path passes through, **under the agent lock** so the
+  snapshot is final against the writer.
+- **Post-lock lifecycle recheck (F_0.8.1)** — `SimPlayerController::checkArrival`
+  guards on `agent->getZone()` *before* acquiring `Locker locker(agent)`, so a
+  task can pass the guard, block on the lock, and resume after another thread has
+  torn the agent down under that same lock (harness destruction and recovery
+  despawn both call `destroyObjectFromWorld` there). It now rechecks the same
+  predicate immediately after acquisition and returns without rescheduling. The
+  general rule: any pre-lock lifecycle guard in this controller needs a matching
+  post-lock recheck, or the work runs on a world-destroyed agent.
+- **Zero-clip movement (D7)** — an anti-clipping invariant for bot paths,
+  shipping **observe + enforce, both default-off**. The probe
+  (`SimPlayerController::probeEmittedPathClearance`) runs on the **pathfinding
+  worker thread**, before path delivery, so it never adds tick latency; results
+  are explicit (`clear`/`would_block`/`skipped`/`truncated`/`error`) and
+  aggregated worst-evidence-first so an inconclusive probe can never read as
+  clear. Enforcement refuses a conclusively obstructed route and re-asks,
+  bounded by `zeroClip.rejectionCap`, walking the route on exhaustion rather
+  than stranding the bot. It fails **open** on inconclusive probes — the
+  deliberate opposite of the harness exit assertion, which fails closed: a test
+  oracle that cannot see must not pass the subject, but a mover that cannot see
+  must still move. Two architectural facts came out of this work: the world-query
+  snapshot must be `SortedVector<ManagedReference<TreeEntry*> >`, never the raw
+  `InRangeObjectsVector`, because the probe walks it off-thread after the zone
+  lock is released; and the appearance ray tests the straight **chord** between
+  two path nodes, which for a staircase or bridge deck passes through the solid
+  mass beneath the walkable surface — `zeroClip.walkableConfirm` confirms a
+  flagged chord against the navmesh (the authority on what an agent can stand
+  on) and overruled ~half of all raw hits. `PathFinderManager::getRecastPath`'s
+  `float& len` is **not** a path length (it sums `x²+z²` of absolute
+  coordinates and is only ever a relative comparator); measure real lengths from
+  the returned points.
 - **`SimPvPController.{h,cpp}`** — the PvP/combat-oriented sibling
   controller for AI squads (see §13).
 - **`SimHunterController.{h,cpp}`** — the PvE hunter controller (P.8). Drives a

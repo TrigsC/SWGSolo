@@ -14,6 +14,8 @@
 #include "templates/appearance/FloorMesh.h"
 #include "templates/appearance/PathGraph.h"
 #include "server/zone/Zone.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
+#include "server/zone/objects/creature/simplayer/StructureTraversalDiagLog.h"
 
 #include "CollisionManager.h"
 #include "engine/util/u3d/Funnel.h"
@@ -737,6 +739,22 @@ Vector3 PathFinderManager::transformToModelSpace(const Vector3& point, SceneObje
 	return transformedPosition;
 }
 
+// Diagnostics helper for the F_0.8.0 egress repair ladder. Only ever called
+// from inside the structure-traversal feature gate.
+static String describeStructureTraversalPathNode(const char* label,
+		const PathNode* node) {
+	if (node == nullptr)
+		return String(label) + "=null";
+
+	Vector3 position = node->getPosition();
+
+	return String(label) + "=" + String::valueOf(node->getID()) +
+		"(global=" + String::valueOf(node->getGlobalGraphNodeID()) +
+		" pos=(" + String::valueOf(position.getX()) + "," +
+		String::valueOf(position.getY()) + "," +
+		String::valueOf(position.getZ()) + "))";
+}
+
 Vector<WorldCoordinates>* PathFinderManager::findPathFromCellToWorld(const WorldCoordinates& pointA, const WorldCoordinates& pointB, Zone *zone) {
 	Vector<WorldCoordinates>* path = new Vector<WorldCoordinates>(5, 1);
 
@@ -823,10 +841,859 @@ Vector<WorldCoordinates>* PathFinderManager::findPathFromCellToWorld(const World
 	if (exitPath == nullptr) {
 		String zoneName = zone == nullptr ? "unknown" : zone->getZoneName();
 
-		error() << "getPath from " << exitNode << " to " << exteriorNode << " exitpath is nullptr for building " << templateObject->getFullTemplateString() << " from " << pointA << " to " << pointB << " in zone " << zoneName;
+		// The legacy selection and interior-rooted search above are deliberately
+		// untouched. The foundation repair is entered only after that attempt has
+		// failed, and only while the new feature gate is enabled.
+		if (SimPlayerManager::instance()->isStructureTraversalEnabled()) {
+			const PathNode* legacyExitNode = exitNode;
+			const PathNode* legacyExteriorNode = exteriorNode;
+			bool repaired = false;
 
-		delete path;
-		return nullptr;
+			SimPlayerManager::instance()->recordStructureTraversalPathfinderFallback();
+			StructureTraversalDiagLog::write(
+				"ST_PATH repair=legacy_failure building=" +
+				String::valueOf(building->getObjectID()) + " cell=" +
+				String::valueOf(ourCell->getObjectID()) + " from=" +
+				StructureTraversalDiagLog::fmtPos(pointA) + " to=" +
+				StructureTraversalDiagLog::fmtPos(pointB) + " zone=" + zoneName);
+
+			// Topology snapshot: without this, an "all_failed" tells us nothing
+			// about WHY the portal graph could not be crossed.
+			StructureTraversalDiagLog::write(
+				"ST_PATH repair=topology " +
+				describeStructureTraversalPathNode("legacyExitNode",
+					legacyExitNode) + " " +
+				describeStructureTraversalPathNode("legacyExteriorNode",
+					legacyExteriorNode) + " sourceGlobalNodes=" +
+				String::valueOf(sourcePathGraph == nullptr ? -1 :
+					sourcePathGraph->getGlobalNodes().size()) +
+				" building=" + String::valueOf(building->getObjectID()) +
+				" cell=" + String::valueOf(ourCell->getObjectID()));
+
+			// Retry 1: re-hint the interior exit from the agent's cell-local
+			// position, not the requested outdoor door position.
+			const PathNode* repairedExitNode =
+				CollisionManager::findNearestPathNode(nearestTargetNodeTriangle,
+					sourceFloorMesh, pointA.getPoint());
+			if (repairedExitNode != nullptr) {
+				exitPath = portalLayout->getPath(repairedExitNode,
+					legacyExteriorNode);
+				if (exitPath != nullptr) {
+					exitNode = repairedExitNode;
+					repaired = true;
+					StructureTraversalDiagLog::write(
+						"ST_PATH repair=interior_rehint result=success nodes=" +
+						String::valueOf(exitPath->size()) + " building=" +
+						String::valueOf(building->getObjectID()) + " cell=" +
+						String::valueOf(ourCell->getObjectID()));
+				}
+			}
+
+			if (!repaired)
+				StructureTraversalDiagLog::write(
+					"ST_PATH repair=interior_rehint result=failed reason=" +
+					String(repairedExitNode == nullptr ?
+						"no_nearest_path_node" : "no_portal_path") + " " +
+					describeStructureTraversalPathNode("rehintExitNode",
+						repairedExitNode) + " " +
+					describeStructureTraversalPathNode("exteriorNode",
+						legacyExteriorNode) + " building=" +
+					String::valueOf(building->getObjectID()) + " cell=" +
+					String::valueOf(ourCell->getObjectID()));
+
+			// Retry 2: choose the exterior node whose global graph ID is exposed
+			// by the source cell, nearest to the requested door. Kept in scope
+			// so Retry 3 can reverse the CORRECTED pair, not the legacy one.
+			const PathNode* linkedExteriorNode = nullptr;
+			if (!repaired) {
+				float linkedDistance = 160000000.f;
+				Vector<const PathNode*> sourceGlobalNodes =
+					sourcePathGraph->getGlobalNodes();
+
+				for (int i = 0; i < sourceGlobalNodes.size(); ++i) {
+					const PathNode* sourceGlobalNode = sourceGlobalNodes.get(i);
+					if (sourceGlobalNode == nullptr)
+						continue;
+
+					const PathNode* candidate = exteriorFloorMesh->getGlobalNode(
+						sourceGlobalNode->getGlobalGraphNodeID());
+					if (candidate == nullptr)
+						continue;
+
+					float candidateDistance = candidate->getPosition().squaredDistanceTo(
+						transformedPosition);
+					if (linkedExteriorNode == nullptr ||
+						candidateDistance < linkedDistance) {
+						linkedExteriorNode = candidate;
+						linkedDistance = candidateDistance;
+					}
+				}
+
+				if (linkedExteriorNode != nullptr) {
+					const PathNode* linkedExitNode = repairedExitNode == nullptr ?
+						legacyExitNode : repairedExitNode;
+					exitPath = portalLayout->getPath(linkedExitNode,
+						linkedExteriorNode);
+					if (exitPath != nullptr) {
+						exitNode = linkedExitNode;
+						exteriorNode = linkedExteriorNode;
+						repaired = true;
+						StructureTraversalDiagLog::write(
+							"ST_PATH repair=linked_exterior result=success nodes=" +
+							String::valueOf(exitPath->size()) + " globalNode=" +
+							String::valueOf(linkedExteriorNode->getGlobalGraphNodeID()) +
+							" building=" + String::valueOf(building->getObjectID()) +
+							" cell=" + String::valueOf(ourCell->getObjectID()));
+					}
+				}
+
+				if (!repaired)
+					StructureTraversalDiagLog::write(
+						"ST_PATH repair=linked_exterior result=failed reason=" +
+						String(linkedExteriorNode == nullptr ?
+							"no_linked_exterior_node" : "no_portal_path") +
+						" candidatesScanned=" +
+						String::valueOf(sourceGlobalNodes.size()) + " " +
+						describeStructureTraversalPathNode("linkedExteriorNode",
+							linkedExteriorNode) + " building=" +
+						String::valueOf(building->getObjectID()) + " cell=" +
+						String::valueOf(ourCell->getObjectID()));
+			}
+
+			// Retry 3: the entry direction is known to work for these layouts.
+			// Reverse it and feed it through the existing downstream processing.
+			// Try the CORRECTED node pair first — reversing the legacy pair is
+			// pointless when Retry 1/2 established that those nodes are the
+			// disconnected ones — then fall back to the legacy pair.
+			if (!repaired) {
+				const PathNode* reverseExitNode = repairedExitNode == nullptr ?
+					legacyExitNode : repairedExitNode;
+				const PathNode* reverseExteriorNode =
+					linkedExteriorNode == nullptr ? legacyExteriorNode :
+					linkedExteriorNode;
+
+				Vector<const PathNode*>* entryPath = portalLayout->getPath(
+					reverseExteriorNode, reverseExitNode);
+				if (entryPath == nullptr && (reverseExitNode != legacyExitNode ||
+						reverseExteriorNode != legacyExteriorNode)) {
+					reverseExitNode = legacyExitNode;
+					reverseExteriorNode = legacyExteriorNode;
+					entryPath = portalLayout->getPath(reverseExteriorNode,
+						reverseExitNode);
+				}
+
+				if (entryPath != nullptr) {
+					exitPath = new Vector<const PathNode*>(entryPath->size(), 1);
+					for (int i = entryPath->size() - 1; i >= 0; --i)
+						exitPath->add(entryPath->get(i));
+					delete entryPath;
+					exitNode = reverseExitNode;
+					exteriorNode = reverseExteriorNode;
+					repaired = true;
+					StructureTraversalDiagLog::write(
+						"ST_PATH repair=reversed_entry result=success nodes=" +
+						String::valueOf(exitPath->size()) + " building=" +
+						String::valueOf(building->getObjectID()) + " cell=" +
+						String::valueOf(ourCell->getObjectID()));
+				} else {
+					// Both directions are unreachable across the portal graph
+					// for every node pair the ladder can construct.
+					StructureTraversalDiagLog::write(
+						"ST_PATH repair=reversed_entry result=failed "
+						"reason=no_portal_path_either_direction "
+						"legacyPairAlsoTried=" +
+						String::valueOf(reverseExitNode == legacyExitNode &&
+							reverseExteriorNode == legacyExteriorNode) + " " +
+						describeStructureTraversalPathNode("reverseExitNode",
+							reverseExitNode) + " " +
+						describeStructureTraversalPathNode(
+							"reverseExteriorNode", reverseExteriorNode) +
+						" building=" + String::valueOf(building->getObjectID()) +
+						" cell=" + String::valueOf(ourCell->getObjectID()));
+				}
+			}
+
+			// Retry 4: start A* at the source cell's global nodes and allow the
+			// portal graph to traverse intermediate cell graphs before reaching
+			// the exterior. Retry 2 only tests a direct shared-global-ID pair;
+			// this intentionally does not require such a pair.
+			if (!repaired) {
+				Vector<const PathNode*> remainingGlobalNodes =
+					sourcePathGraph->getGlobalNodes();
+				int candidatesTotal = remainingGlobalNodes.size();
+				const int candidateCap = 16;
+				int candidatesTried = 0;
+				const PathNode* bestExteriorNode = linkedExteriorNode != nullptr ?
+					linkedExteriorNode : legacyExteriorNode;
+
+				while (remainingGlobalNodes.size() > 0 &&
+						candidatesTried < candidateCap) {
+					int nearestIndex = 0;
+					float nearestDistance = remainingGlobalNodes.get(0)->
+						getPosition().squaredDistanceTo(transformedPosition);
+
+					for (int i = 1; i < remainingGlobalNodes.size(); ++i) {
+						float candidateDistance = remainingGlobalNodes.get(i)->
+							getPosition().squaredDistanceTo(transformedPosition);
+						if (candidateDistance < nearestDistance) {
+							nearestIndex = i;
+							nearestDistance = candidateDistance;
+						}
+					}
+
+					const PathNode* sourceGlobalNode =
+						remainingGlobalNodes.get(nearestIndex);
+					remainingGlobalNodes.remove(nearestIndex);
+
+					// Skip outright rather than half-guarding: getPath() would
+					// dereference a null start node, and the nearest-scan above
+					// already dereferences to measure distance.
+					if (sourceGlobalNode == nullptr)
+						continue;
+
+					candidatesTried++;
+
+					// getNeighbors() mixes BOTH kinds of edge: ordinary
+					// same-floor ones from PathGraph::connectNodes, and the
+					// cross-floor links from connectFloorMeshGraphs. Only the
+					// latter constitute portal connectivity, so count them
+					// separately -- a node with three local edges and no portal
+					// link would otherwise read as connected and lead the next
+					// diagnosis to exactly the wrong conclusion.
+					const Vector<PathNode*>* neighbors =
+						sourceGlobalNode->getNeighbors();
+					int neighborCount = neighbors == nullptr ? 0 :
+						neighbors->size();
+					int crossGraphChildren = 0;
+
+					for (int n = 0; n < neighborCount; ++n) {
+						const PathNode* neighbor = neighbors->get(n);
+
+						if (neighbor != nullptr && neighbor->getPathGraph() !=
+								sourceGlobalNode->getPathGraph())
+							++crossGraphChildren;
+					}
+
+					// The bot must be able to WALK to this node inside its own
+					// cell. Downstream, a failed floor route is silently ignored
+					// and exitNode is appended anyway, which would emit a
+					// straight in-cell segment that can cross walls -- the exact
+					// clipping this project is trying to eliminate. The stock
+					// selector filters through the same triangle-floor route.
+					Vector<const Triangle*>* candidateFloorPath = nullptr;
+					int floorResult = getFloorPath(pointA.getPoint(),
+						sourceGlobalNode->getPosition(), sourceFloorMesh,
+						candidateFloorPath);
+					// getFloorPath's contract: -1 = SAME TRIANGLE (reachable by
+					// a direct segment, nodes left null), 0 = reachable via the
+					// returned triangle path, 1 = genuinely unreachable. Only 1
+					// rejects. The `res != -1` idiom used further down guards
+					// whether INTERMEDIATE edges are needed, which is a
+					// different question -- reusing it here would discard the
+					// most common close-range case as unreachable.
+					bool floorReachable = floorResult == -1 ||
+						(floorResult == 0 && candidateFloorPath != nullptr);
+
+					if (candidateFloorPath != nullptr)
+						delete candidateFloorPath;
+
+					Vector<const PathNode*>* candidatePath =
+						(!floorReachable || bestExteriorNode == nullptr) ?
+						nullptr : portalLayout->getPath(sourceGlobalNode,
+						bestExteriorNode);
+					String candidatePathNodes = candidatePath == nullptr ?
+						String("none") : String::valueOf(candidatePath->size());
+
+					StructureTraversalDiagLog::write(
+						"ST_PATH repair=global_multihop candidate globalId=" +
+							String::valueOf(
+								sourceGlobalNode->getGlobalGraphNodeID()) +
+						" crossGraphChildren=" +
+						String::valueOf(crossGraphChildren) + " neighborCount=" +
+						String::valueOf(neighborCount) + " floorReachable=" +
+						String::valueOf(floorReachable ? 1 : 0) +
+						" floorResult=" + String::valueOf(floorResult) +
+						" pathNodes=" +
+						candidatePathNodes);
+
+					if (candidatePath != nullptr) {
+						exitPath = candidatePath;
+						exitNode = sourceGlobalNode;
+						exteriorNode = bestExteriorNode;
+						repaired = true;
+						break;
+					}
+				}
+
+				StructureTraversalDiagLog::write(
+					"ST_PATH repair=global_multihop result=" +
+					String(repaired ? "success" : "failed") + " nodes=" +
+					String::valueOf(exitPath == nullptr ? 0 : exitPath->size()) +
+					" globalNode=" + String::valueOf(repaired && exitNode != nullptr ?
+						exitNode->getGlobalGraphNodeID() : -1) +
+					" candidatesTried=" + String::valueOf(candidatesTried) +
+					" candidatesTotal=" + String::valueOf(candidatesTotal) +
+					" building=" + String::valueOf(building->getObjectID()) +
+					" cell=" + String::valueOf(ourCell->getObjectID()));
+			}
+
+			// Retry 5: the source cell's portal geometry is authoritative when
+			// the path graph has no edge into the exterior graph. Walk to the
+			// nearest reachable outside portal on the source floor, then emit its
+			// model-space doorway and the same doorway transformed to world space.
+			if (!repaired) {
+				const CellProperty* sourceCellProperty =
+					portalLayout->getCellProperty(ourCellID);
+				int portalsExamined = 0;
+				int outsidePortals = 0;
+				int reachablePortals = 0;
+				const CellPortal* selectedPortal = nullptr;
+				Vector3 selectedDoorPoint;
+				float selectedDistance = 0.f;
+				int selectedFloorResult = 1;
+				Vector<const Triangle*>* selectedTrianglePath = nullptr;
+
+				if (sourceCellProperty != nullptr) {
+					for (int i = 0; i < sourceCellProperty->getNumberOfPortals();
+							++i) {
+						++portalsExamined;
+						const CellPortal* portal = sourceCellProperty->getPortal(i);
+						int targetCellIndex = portal == nullptr ? -1 :
+							portal->getTargetCellIndex();
+						int geometryIndex = portal == nullptr ? -1 :
+							portal->getGeometryIndex();
+						int floorResult = 1;
+						bool reachable = false;
+						bool doorResolved = false;
+						Vector3 modelDoorPoint;
+						Vector3 doorPoint;
+						float distanceFromBot = 0.f;
+						Vector<const Triangle*>* trianglePath = nullptr;
+
+						// Resolve geometry ONLY for portals that lead outside.
+						// getPortalBounds() indexes portalGeometry without a
+						// bounds check (it throws on a bad index), so there is no
+						// reason to touch it for portals we are about to discard.
+						if (portal != nullptr && targetCellIndex <= 1) {
+							++outsidePortals;
+
+							// Portal geometry is Y-UP MODEL space: .Y is height,
+							// .Z is north. Path-graph node positions and
+							// pointA.getPoint() are already cell-local
+							// (x, north, height). These are DIFFERENT frames --
+							// verified against stock
+							// BuildingObjectImplementation::computeExteriorPortalWorldPoint,
+							// which drops to the floor by subtracting the Y
+							// extent and then swaps components 1 and 2.
+							// center() is also the doorway's VERTICAL MIDDLE, so
+							// aiming at it would target roughly chest height
+							// rather than the floor the bot walks on.
+							const AABB& doorBounds =
+								portalLayout->getPortalBounds(geometryIndex);
+							modelDoorPoint = doorBounds.center() -
+								Vector3(0, doorBounds.extents().getY(), 0);
+							doorPoint = Vector3(modelDoorPoint.getX(),
+								modelDoorPoint.getZ(), modelDoorPoint.getY());
+							doorResolved = true;
+							distanceFromBot = pointA.getPoint().distanceTo(
+								doorPoint);
+							floorResult = getFloorPath(pointA.getPoint(), doorPoint,
+								sourceFloorMesh, trianglePath);
+							reachable = floorResult == -1 ||
+								(floorResult == 0 && trianglePath != nullptr);
+							if (reachable)
+								++reachablePortals;
+						}
+						StructureTraversalDiagLog::write(
+							"ST_PATH repair=portal_geometry portal index=" +
+							String::valueOf(i) + " targetCell=" +
+							String::valueOf(targetCellIndex) + " geometryIndex=" +
+							String::valueOf(geometryIndex) + " doorModel=" +
+							(doorResolved ? (String::valueOf(
+								modelDoorPoint.getX()) + "," +
+								String::valueOf(modelDoorPoint.getY()) + "," +
+								String::valueOf(modelDoorPoint.getZ())) :
+								String("not_outside")) + " doorCellLocal=" +
+							(doorResolved ? (String::valueOf(doorPoint.getX()) +
+								"," + String::valueOf(doorPoint.getY()) + "," +
+								String::valueOf(doorPoint.getZ())) :
+								String("not_outside")) + " floorResult=" +
+							String::valueOf(floorResult) + " reachable=" +
+							String::valueOf(reachable ? 1 : 0) +
+							" distFromBot=" + (doorResolved ?
+								String::valueOf(distanceFromBot) :
+								String("n/a")));
+
+						if (reachable && (selectedPortal == nullptr ||
+								distanceFromBot < selectedDistance)) {
+							if (selectedTrianglePath != nullptr)
+								delete selectedTrianglePath;
+
+							selectedPortal = portal;
+							selectedDoorPoint = doorPoint;
+							selectedDistance = distanceFromBot;
+							selectedFloorResult = floorResult;
+							selectedTrianglePath = trianglePath;
+							trianglePath = nullptr;
+						}
+
+						if (trianglePath != nullptr)
+							delete trianglePath;
+					}
+				}
+
+				if (selectedPortal != nullptr) {
+					if (selectedFloorResult != -1 &&
+							selectedTrianglePath != nullptr) {
+						addTriangleNodeEdges(pointA.getPoint(), selectedDoorPoint,
+							selectedTrianglePath, path, ourCell);
+					}
+
+					if (selectedTrianglePath != nullptr)
+						delete selectedTrianglePath;
+
+					path->add(WorldCoordinates(selectedDoorPoint, ourCell));
+					WorldCoordinates doorInCell(selectedDoorPoint, ourCell);
+					path->add(WorldCoordinates(doorInCell.getWorldPosition(),
+						nullptr));
+
+					StructureTraversalDiagLog::write(
+						"ST_PATH repair=portal_geometry result=success reason=ok "
+						"portalsExamined=" + String::valueOf(portalsExamined) +
+						" outsidePortals=" + String::valueOf(outsidePortals) +
+						" reachable=" + String::valueOf(reachablePortals) +
+						" nodes=" + String::valueOf(path->size()) + " building=" +
+						String::valueOf(building->getObjectID()) + " cell=" +
+						String::valueOf(ourCell->getObjectID()));
+
+					// findPathFromCellToWorld is general pathfinding, not just
+					// SimPlayer egress: returning at the doorway would hand every
+					// other caller a truncated route REPORTED AS SUCCESS. Append
+					// the outdoor leg to the actually-requested pointB, mirroring
+					// the normal tail below.
+					if (path->size()) {
+						Vector<WorldCoordinates>* outdoorLeg =
+							findPathFromWorldToWorld(
+								path->get(path->size() - 1), pointB, zone);
+
+						if (outdoorLeg != nullptr) {
+							path->addAll(*outdoorLeg);
+							delete outdoorLeg;
+						}
+					} else {
+						path->add(pointB);
+					}
+
+					// !repaired means Retries 1-4 returned no path, so exitPath is
+					// null here. Retry 5 owns only the existing path vector and
+					// returns it directly; the downstream exitPath cleanup is skipped.
+					return path;
+				}
+
+				String failureReason = outsidePortals == 0 ?
+					String("no_outside_portal") : String("none_reachable");
+				StructureTraversalDiagLog::write(
+					"ST_PATH repair=portal_geometry result=failed reason=" +
+					failureReason + " portalsExamined=" +
+					String::valueOf(portalsExamined) + " outsidePortals=" +
+					String::valueOf(outsidePortals) + " reachable=" +
+					String::valueOf(reachablePortals) + " nodes=0 building=" +
+					String::valueOf(building->getObjectID()) + " cell=" +
+					String::valueOf(ourCell->getObjectID()));
+			}
+
+			// Retry 6: the doorway graph can cross several interior cells even
+			// when the path graphs cannot reach the exterior graph. BFS the raw
+			// portal links so the exact geometry used for every cell handoff is
+			// retained, then route each segment on that cell's floor mesh.
+			if (!repaired) {
+				const int maxCellsVisited = 32;
+				const int maxCellHops = 8;
+				const int cellPropertyCount =
+					portalLayout->getCellProperties().size();
+				const int pathSizeOnEntry = path->size();
+				Vector<int> pendingCells;
+				SortedVector<int> visitedCells;
+				Vector<int> parentCells;
+				Vector<int> parentPortalGeometry;
+				Vector<int> cellDepth;
+
+				for (int i = 0; i < cellPropertyCount; ++i) {
+					parentCells.add(-1);
+					parentPortalGeometry.add(-1);
+					cellDepth.add(-1);
+				}
+
+				bool bfsFound = false;
+				int exitCellIndex = -1;
+				int exitPortalGeometry = -1;
+				int exitPortalTargetCell = -1;
+				// Streamed, not collected. A cell can expose SEVERAL world
+				// portals, so a list capped at the cell budget would silently
+				// drop eligible exits -- including, on this building, the one
+				// nearest the destination. Evaluating each candidate as it is
+				// found keeps memory O(1) and drops nothing.
+				int exitCandidateCount = 0;
+				int bestExitCell = -1;
+				int bestExitGeometry = -1;
+				int bestExitTargetCell = -1;
+				int bestExitDepth = 0;
+				float bestExitDistance = 0.f;
+
+				if (ourCellID >= 0 && ourCellID < cellPropertyCount) {
+					visitedCells.setNoDuplicateInsertPlan();
+					visitedCells.put(ourCellID);
+					pendingCells.add(ourCellID);
+					cellDepth.set(ourCellID, 0);
+				}
+
+				// Telemetry only. Hitting a limit must NOT stop the search:
+				// the exit portal may be later in this same cell's portal list,
+				// or in a cell already queued and still within budget. Only the
+				// over-budget NEIGHBOUR is skipped.
+				bool budgetHit = false;
+				for (int pendingIndex = 0;
+						pendingIndex < pendingCells.size();
+						++pendingIndex) {
+					int currentCellIndex = pendingCells.get(pendingIndex);
+					const CellProperty* currentProperty =
+						portalLayout->getCellProperty(currentCellIndex);
+					if (currentProperty == nullptr)
+						continue;
+
+					int currentDepth = cellDepth.get(currentCellIndex);
+					for (int portalIndex = 0;
+							portalIndex < currentProperty->getNumberOfPortals();
+							++portalIndex) {
+						const CellPortal* portal =
+							currentProperty->getPortal(portalIndex);
+						if (portal == nullptr)
+							continue;
+
+						int targetCellIndex = portal->getTargetCellIndex();
+						if (targetCellIndex <= 1) {
+							++exitCandidateCount;
+
+							int candidateGeometry = portal->getGeometryIndex();
+							const AABB& candidateBounds =
+								portalLayout->getPortalBounds(candidateGeometry);
+							Vector3 candidateDoorModel =
+								candidateBounds.center() -
+								Vector3(0,
+									candidateBounds.extents().getY(), 0);
+							float candidateDistance =
+								candidateDoorModel.distanceTo(
+									transformedPosition);
+
+							StructureTraversalDiagLog::write(
+								"ST_PATH repair=multicell exitCandidate cell=" +
+								String::valueOf(currentCellIndex) +
+								" geometryIndex=" +
+								String::valueOf(candidateGeometry) + " depth=" +
+								String::valueOf(currentDepth) + " door=" +
+								String::valueOf(candidateDoorModel.getX()) +
+								"," +
+								String::valueOf(candidateDoorModel.getY()) +
+								"," +
+								String::valueOf(candidateDoorModel.getZ()) +
+								" distToTarget=" +
+								String::valueOf(candidateDistance));
+
+							// Nearest the destination wins; shorter chain breaks
+							// ties.
+							if (bestExitCell < 0 ||
+									candidateDistance < bestExitDistance ||
+									(candidateDistance == bestExitDistance &&
+										currentDepth < bestExitDepth)) {
+								bestExitCell = currentCellIndex;
+								bestExitGeometry = candidateGeometry;
+								bestExitTargetCell = targetCellIndex;
+								bestExitDepth = currentDepth;
+								bestExitDistance = candidateDistance;
+							}
+
+							continue;
+						}
+
+						if (targetCellIndex < 0 ||
+								targetCellIndex >= cellPropertyCount ||
+								visitedCells.contains(targetCellIndex))
+							continue;
+
+						// The final outside portal is also a portal hop, so a
+						// child at this depth would exceed the total hop budget.
+						// Skip THIS neighbour and keep scanning -- aborting here
+						// would discard already-queued cells and the remaining
+						// portals of this cell, any of which may hold an exit
+						// that is still inside the budget.
+						if (visitedCells.size() >= maxCellsVisited ||
+								currentDepth >= maxCellHops - 1) {
+							budgetHit = true;
+							continue;
+						}
+
+						visitedCells.put(targetCellIndex);
+						pendingCells.add(targetCellIndex);
+						parentCells.set(targetCellIndex, currentCellIndex);
+						parentPortalGeometry.set(targetCellIndex,
+							portal->getGeometryIndex());
+						cellDepth.set(targetCellIndex, currentDepth + 1);
+					}
+				}
+
+				bfsFound = bestExitCell >= 0;
+
+				if (bfsFound) {
+					exitCellIndex = bestExitCell;
+					exitPortalGeometry = bestExitGeometry;
+					exitPortalTargetCell = bestExitTargetCell;
+
+					StructureTraversalDiagLog::write(
+						"ST_PATH repair=multicell exitChoice cell=" +
+						String::valueOf(exitCellIndex) + " geometryIndex=" +
+						String::valueOf(exitPortalGeometry) + " depth=" +
+						String::valueOf(bestExitDepth) + " distToTarget=" +
+						String::valueOf(bestExitDistance) + " candidates=" +
+						String::valueOf(exitCandidateCount) +
+						" rejectedFarther=" +
+						String::valueOf(exitCandidateCount - 1) + " building=" +
+						String::valueOf(building->getObjectID()) + " cell=" +
+						String::valueOf(ourCell->getObjectID()));
+				}
+
+				Vector<int> reversedChain;
+				Vector<int> chainCells;
+				if (bfsFound) {
+					int chainCellIndex = exitCellIndex;
+					while (chainCellIndex >= 0) {
+						reversedChain.add(chainCellIndex);
+						if (chainCellIndex == ourCellID)
+							break;
+						chainCellIndex = parentCells.get(chainCellIndex);
+					}
+
+					if (reversedChain.size() == 0 ||
+							reversedChain.get(reversedChain.size() - 1) != ourCellID) {
+						bfsFound = false;
+						exitCellIndex = -1;
+						exitPortalGeometry = -1;
+						exitPortalTargetCell = -1;
+					} else {
+						for (int i = reversedChain.size() - 1; i >= 0; --i)
+							chainCells.add(reversedChain.get(i));
+					}
+				}
+
+				StructureTraversalDiagLog::write(
+					"ST_PATH repair=multicell bfs result=" +
+					String(bfsFound ? "found" : "not_found") +
+					" cellsVisited=" + String::valueOf(visitedCells.size()) +
+					" budgetHit=" + String::valueOf(budgetHit ? 1 : 0) +
+					" chainLen=" + String::valueOf(chainCells.size()) +
+					" exitCell=" + String::valueOf(exitCellIndex) +
+					" exitPortalGeom=" +
+					String::valueOf(exitPortalGeometry) + " building=" +
+					String::valueOf(building->getObjectID()) + " cell=" +
+					String::valueOf(ourCell->getObjectID()));
+
+				int failedHop = -1;
+				int hopsCompleted = 0;
+				if (!bfsFound) {
+					while (path->size() > pathSizeOnEntry)
+						path->remove(path->size() - 1);
+
+					StructureTraversalDiagLog::write(
+						String("ST_PATH repair=multicell result=failed reason=") +
+						(budgetHit ? "no_exit_cell_within_budget" :
+							"no_exit_cell_in_building") + " hops=0 nodes=" +
+						String::valueOf(path->size()) + " building=" +
+						String::valueOf(building->getObjectID()) + " cell=" +
+						String::valueOf(ourCell->getObjectID()));
+				} else {
+					Vector3 currentPoint = pointA.getPoint();
+					int currentCellIndex = ourCellID;
+					CellObject* currentCell = ourCell;
+					const FloorMesh* currentFloorMesh = sourceFloorMesh;
+					bool routeReachable = true;
+
+					for (int chainIndex = 1;
+							chainIndex < chainCells.size(); ++chainIndex) {
+						int nextCellIndex = chainCells.get(chainIndex);
+						int geometryIndex =
+							parentPortalGeometry.get(nextCellIndex);
+						const AABB& doorBounds =
+							portalLayout->getPortalBounds(geometryIndex);
+						Vector3 doorModel = doorBounds.center() -
+							Vector3(0, doorBounds.extents().getY(), 0);
+						Vector3 doorCellLocal(doorModel.getX(), doorModel.getZ(),
+							doorModel.getY());
+						float segmentLength = currentPoint.distanceTo(doorCellLocal);
+						Vector<const Triangle*>* trianglePath = nullptr;
+						int floorResult = 1;
+						if (currentFloorMesh != nullptr)
+							floorResult = getFloorPath(currentPoint, doorCellLocal,
+								currentFloorMesh, trianglePath);
+						bool reachable = floorResult == -1 ||
+							(floorResult == 0 && trianglePath != nullptr);
+						CellObject* nextCell = building->getCell(nextCellIndex);
+						const FloorMesh* nextFloorMesh = nextCell == nullptr ?
+							nullptr : portalLayout->getFloorMesh(nextCellIndex);
+						if (nextCell == nullptr || nextFloorMesh == nullptr)
+							reachable = false;
+
+						StructureTraversalDiagLog::write(
+							"ST_PATH repair=multicell hop=" +
+							String::valueOf(hopsCompleted) + " fromCell=" +
+							String::valueOf(currentCellIndex) + " toCell=" +
+							String::valueOf(nextCellIndex) + " geometryIndex=" +
+							String::valueOf(geometryIndex) + " doorModel=" +
+							String::valueOf(doorModel.getX()) + "," +
+							String::valueOf(doorModel.getY()) + "," +
+							String::valueOf(doorModel.getZ()) + " doorCellLocal=" +
+							String::valueOf(doorCellLocal.getX()) + "," +
+							String::valueOf(doorCellLocal.getY()) + "," +
+							String::valueOf(doorCellLocal.getZ()) + " floorResult=" +
+							String::valueOf(floorResult) + " reachable=" +
+							String::valueOf(reachable ? 1 : 0) + " segLen=" +
+							String::valueOf(segmentLength));
+
+						if (!reachable) {
+							if (trianglePath != nullptr)
+								delete trianglePath;
+							routeReachable = false;
+							failedHop = hopsCompleted;
+							break;
+						}
+
+						if (floorResult == 0 && trianglePath != nullptr)
+							addTriangleNodeEdges(currentPoint, doorCellLocal,
+								trianglePath, path, currentCell);
+
+						if (trianglePath != nullptr)
+							delete trianglePath;
+
+						path->add(WorldCoordinates(doorCellLocal, currentCell));
+						path->add(WorldCoordinates(doorCellLocal, nextCell));
+						currentPoint = doorCellLocal;
+						currentCell = nextCell;
+						currentFloorMesh = nextFloorMesh;
+						currentCellIndex = nextCellIndex;
+						++hopsCompleted;
+					}
+
+					if (routeReachable) {
+						int finalHop = hopsCompleted;
+						const AABB& exitDoorBounds =
+							portalLayout->getPortalBounds(exitPortalGeometry);
+						Vector3 exitDoorModel = exitDoorBounds.center() -
+							Vector3(0, exitDoorBounds.extents().getY(), 0);
+						Vector3 exitDoorCellLocal(exitDoorModel.getX(),
+							exitDoorModel.getZ(), exitDoorModel.getY());
+						float segmentLength = currentPoint.distanceTo(
+							exitDoorCellLocal);
+						Vector<const Triangle*>* trianglePath = nullptr;
+						int floorResult = 1;
+						if (currentFloorMesh != nullptr)
+							floorResult = getFloorPath(currentPoint,
+								exitDoorCellLocal, currentFloorMesh, trianglePath);
+						bool reachable = floorResult == -1 ||
+							(floorResult == 0 && trianglePath != nullptr);
+
+						StructureTraversalDiagLog::write(
+							"ST_PATH repair=multicell hop=" +
+							String::valueOf(finalHop) + " fromCell=" +
+							String::valueOf(currentCellIndex) + " toCell=" +
+							String::valueOf(exitPortalTargetCell) +
+							" geometryIndex=" +
+							String::valueOf(exitPortalGeometry) + " doorModel=" +
+							String::valueOf(exitDoorModel.getX()) + "," +
+							String::valueOf(exitDoorModel.getY()) + "," +
+							String::valueOf(exitDoorModel.getZ()) +
+							" doorCellLocal=" +
+							String::valueOf(exitDoorCellLocal.getX()) + "," +
+							String::valueOf(exitDoorCellLocal.getY()) + "," +
+							String::valueOf(exitDoorCellLocal.getZ()) +
+							" floorResult=" + String::valueOf(floorResult) +
+							" reachable=" + String::valueOf(reachable ? 1 : 0) +
+							" segLen=" + String::valueOf(segmentLength));
+
+						if (!reachable) {
+							if (trianglePath != nullptr)
+								delete trianglePath;
+							routeReachable = false;
+							failedHop = finalHop;
+						} else {
+							if (floorResult == 0 && trianglePath != nullptr)
+								addTriangleNodeEdges(currentPoint,
+									exitDoorCellLocal, trianglePath, path, currentCell);
+
+							if (trianglePath != nullptr)
+								delete trianglePath;
+
+							path->add(WorldCoordinates(exitDoorCellLocal,
+								currentCell));
+							WorldCoordinates eIn(exitDoorCellLocal, currentCell);
+							path->add(WorldCoordinates(eIn.getWorldPosition(),
+								nullptr));
+							++hopsCompleted;
+						}
+					}
+
+					if (routeReachable) {
+						if (path->size()) {
+							Vector<WorldCoordinates>* outdoorLeg =
+								findPathFromWorldToWorld(
+									path->get(path->size() - 1), pointB, zone);
+
+							if (outdoorLeg != nullptr) {
+								path->addAll(*outdoorLeg);
+								delete outdoorLeg;
+							}
+						} else {
+							path->add(pointB);
+						}
+
+						StructureTraversalDiagLog::write(
+							"ST_PATH repair=multicell result=success reason=ok hops=" +
+							String::valueOf(hopsCompleted) + " nodes=" +
+							String::valueOf(path->size()) + " building=" +
+							String::valueOf(building->getObjectID()) + " cell=" +
+							String::valueOf(ourCell->getObjectID()));
+						return path;
+					}
+				}
+
+				if (bfsFound) {
+					while (path->size() > pathSizeOnEntry)
+						path->remove(path->size() - 1);
+
+					StructureTraversalDiagLog::write(
+						"ST_PATH repair=multicell result=failed reason="
+						"hop_unreachable hops=" + String::valueOf(
+							failedHop < 0 ? hopsCompleted : failedHop + 1) +
+						" nodes=" + String::valueOf(path->size()) + " building=" +
+						String::valueOf(building->getObjectID()) + " cell=" +
+						String::valueOf(ourCell->getObjectID()));
+				}
+			}
+
+			if (!repaired)
+				StructureTraversalDiagLog::write(
+					"ST_PATH repair=all_failed building=" +
+					String::valueOf(building->getObjectID()) + " cell=" +
+					String::valueOf(ourCell->getObjectID()) + " " +
+					describeStructureTraversalPathNode("finalExitNode",
+						exitNode) + " " +
+					describeStructureTraversalPathNode("finalExteriorNode",
+						exteriorNode) + " zone=" + zoneName);
+		}
+
+		if (exitPath == nullptr) {
+			error() << "getPath from " << exitNode << " to " << exteriorNode << " exitpath is nullptr for building " << templateObject->getFullTemplateString() << " from " << pointA << " to " << pointB << " in zone " << zoneName;
+
+			delete path;
+			return nullptr;
+		}
 	}
 
 	//find triangle path to exitNode

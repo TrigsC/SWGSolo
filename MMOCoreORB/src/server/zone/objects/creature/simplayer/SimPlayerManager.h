@@ -49,8 +49,49 @@ class MinerRecoveryTask;
 class SimPlayerConfiguredSpawnTask;
 class CellNavDiagRetryTask;
 class CellNavDiagSpawnTask;
+class StructureTraversalTestSpawnTask;
+class StructureTraversalTestRunnerTask;
+class StructureTraversalTestAttackerDespawnTask;
 class HiveCrafterConsumerTask;
 class SimHunterController;
+
+struct StructureTraversalTestScenario {
+    String name;
+    String planet;
+    int bots = 1;
+    Vector<StructureTraversalTestPoint> spawns;
+    int enterBudgetMs = 90000;
+    int exitBudgetMs = 90000;
+    int totalBudgetMs = 300000;
+    Vector<Vector<StructureTraversalTestStep> > steps;
+
+    bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+    bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct StructureTraversalTestStepResult {
+    String op;
+    int botIndex = 0;
+    String status = "PENDING";
+    String failReason;
+    uint64 durationMs = 0;
+
+    bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+    bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct StructureTraversalTestScenarioResult {
+    String name;
+    String status = "PENDING";
+    String failReason;
+    uint64 startedAtMs = 0;
+    uint64 finishedAtMs = 0;
+    uint64 durationMs = 0;
+    Vector<StructureTraversalTestStepResult> steps;
+
+    bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+    bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
 
 enum PveMissionTerminalCityState {
 	PVE_MISSION_TERMINAL_PENDING = 0,
@@ -740,6 +781,9 @@ private:
 	friend class SimPlayerConfiguredSpawnTask;
 	friend class CellNavDiagRetryTask;
 	friend class CellNavDiagSpawnTask;
+	friend class StructureTraversalTestSpawnTask;
+	friend class StructureTraversalTestRunnerTask;
+	friend class StructureTraversalTestAttackerDespawnTask;
 
 	// Map of Creature ObjectID -> Controller
 	SynchronizedVectorMap<uint64, Reference<SimPlayerController*> > controllers;
@@ -786,6 +830,84 @@ public:
 		float exitX = 5000.f;
 		float exitY = -5500.f;
 		bool logEverySimLoopTick = true;
+	};
+
+	struct StructureTraversalConfig {
+		struct HollowScanConfig {
+			bool enabled = false;
+			int rays = 72;
+			float rayMarginMeters = 40.f;
+			float minOpeningDeg = 5.f;
+		};
+
+		struct HollowDoorEgressConfig {
+			bool observe = false;
+			bool walk = false;
+			bool useCellPortals = false;
+		};
+
+		struct ZeroClipConfig {
+			bool enabled = false;
+			bool logging = false;
+			bool enforce = false;
+			// Rejections of a conclusively-obstructed path before the leg is
+			// walked anyway. A pathfinder that deterministically returns the
+			// same clipping route would otherwise freeze the bot forever, and a
+			// frozen bot is worse than a clipping one.
+			int rejectionCap = 2;
+			// The appearance ray flags the solid mass under a staircase or
+			// bridge deck as an obstruction. Confirm a flagged chord against
+			// the navmesh, which is baked from what an agent can stand on,
+			// before calling it a clip.
+			bool walkableConfirm = false;
+			// Recast path length allowed relative to the straight chord before
+			// the obstruction counts as real. A detour means something is
+			// genuinely in the way; straight-through means the bot walks over
+			// whatever the ray hit.
+			float walkableToleranceRatio = 1.25f;
+			int maxCandidates = 256;
+			float maxSegmentMeters = 512.f;
+			bool exitSetEnabled = false;
+			int egressCandidateAttemptCap = 2;
+			int egressTotalAttemptCeiling = 8;
+			float exitCandidateMaxVerticalMeters = 10.f;
+			int maxProbedSegments = 128;
+			float broadPhasePadMeters = 192.f;
+		};
+
+		bool enabled = false;
+		bool logging = false;
+		bool hollowEscalationEnabled = false;
+		int hollowEscalationAttemptCap = 1;
+		bool hollowEscalationPreferTravelPoint = true;
+		bool hollowEscalationDirectFallback = false;
+		bool useNavmeshHybrid = false;
+		bool requireCompletePath = false;
+		float completePathToleranceMeters = 10.f;
+		bool farSideEgress = false;
+		int resumeSettleMs = 2000;
+		int resumeAttemptCap = 3;
+		int egressAttemptCap = 2;
+		float teleportAnomalyMeters = 25.f;
+		float zSanityMeters = 5.f;
+		// Horizontal slack when deciding whether an outdoor (cell 0) position is
+		// still inside the owning building's enclosed hollow. Mirrors the
+		// F.0.4.11 ticketCollector containment margin, but stays a separate knob
+		// so traversal can be tuned without touching collector travel.
+		float hollowContainmentMarginMeters = 15.f;
+		HollowScanConfig hollowScan;
+		HollowDoorEgressConfig hollowDoorEgress;
+		ZeroClipConfig zeroClip;
+	};
+
+	// Config shape for the Phase 3 scenario runner.
+	struct StructureTraversalTestConfig {
+		bool enabled = false;
+		String planet = "tatooine";
+		int botCount = 1;
+		String attackerTemplate = "adult_hermit_spider";
+		float dwellScaling = 1.f;
+		Vector<StructureTraversalTestScenario> scenarios;
 	};
 
 	// Shared routed travel: one leg of a planned multi-leg journey. Departure
@@ -1054,6 +1176,87 @@ public:
 private:
 	bool enabled = false;
 	CellNavDiagConfig cellNavDiagConfig;
+	StructureTraversalConfig structureTraversalConfig;
+	StructureTraversalTestConfig structureTraversalTestConfig;
+	AtomicLong structureTraversalTeleportAnomalies;
+	AtomicLong structureTraversalZSanityViolations;
+	AtomicLong structureTraversalEgressPathFailures;
+	AtomicLong structureTraversalResumeFailures;
+	AtomicLong structureTraversalPathfinderFallbackActivations;
+	AtomicLong structureTraversalHollowEscalationsTriggered;
+	AtomicLong structureTraversalHollowEscalationsFailed;
+	AtomicLong zeroClipClearanceChecks;
+	AtomicLong zeroClipWouldBlock;
+	AtomicLong zeroClipBlocked;
+	// Enforcement gave up and walked a conclusively-obstructed path because the
+	// rejection budget was spent. This is the residual clip rate under
+	// enforcement, and it must never be silent.
+	AtomicLong zeroClipCapExhausted;
+	// Mesh hits the navmesh overruled as walkable. The share of the raw block
+	// rate that was never a clip at all.
+	AtomicLong zeroClipWalkableReclassified;
+	AtomicLong zeroClipExitSetsBuilt;
+	AtomicLong zeroClipExitCandidatesTried;
+	AtomicLong zeroClipEgressCandidateBudgetExhausted;
+	// Evidence quality: a Phase 1 run whose "clear" count is inflated by
+	// skipped/truncated/errored probes must be readable as such.
+	AtomicLong zeroClipSkipped;
+	AtomicLong zeroClipTruncated;
+	AtomicLong zeroClipErrors;
+	Mutex structureTraversalTestMutex;
+	Vector<StructureTraversalTestScenarioResult> structureTraversalTestResults;
+	// Controller callbacks (onArrived/onPathFailed) run on the controllers'
+	// own task threads. They only enqueue here under structureTraversalTestMutex;
+	// the runner task is the single writer of all cursor/step state below and
+	// drains these at the top of its tick.
+	Vector<uint64> structureTraversalTestPendingArrivals;
+	Vector<uint64> structureTraversalTestPendingFailureOids;
+	Vector<String> structureTraversalTestPendingFailureReasons;
+	Vector<uint64> structureTraversalTestBotOids;
+	int structureTraversalTestScenarioIndex = 0;
+	int structureTraversalTestStepCursor[2] = {0, 0};
+	uint64 structureTraversalTestScenarioStartedAtMs = 0;
+	uint64 structureTraversalTestScenarioTeleportBaseline = 0;
+	uint64 structureTraversalTestScenarioZSanityBaseline = 0;
+	uint64 structureTraversalTestStepStartedAtMs[2] = {0, 0};
+	// Anomalies accrued by harness bodies that have since been DESTROYED, per
+	// harness slot. Scenario 22 (death_or_incapacity) replaces a bot mid-
+	// scenario and the fresh controller's tallies start at zero, so comparing
+	// them against a baseline captured from the destroyed controller would
+	// silently drop a pre-death anomaly. Folded in at
+	// destroyStructureTraversalTestBot -- the single choke point every destroy
+	// path passes through -- and added to the live controller's counts by
+	// structureTraversalTestBotAnomalies().
+	uint64 structureTraversalTestBotAnomalyCarryTeleport[2] = {0, 0};
+	uint64 structureTraversalTestBotAnomalyCarryZSanity[2] = {0, 0};
+	uint64 structureTraversalTestStepTeleportBaseline[2] = {0, 0};
+	uint64 structureTraversalTestStepZSanityBaseline[2] = {0, 0};
+	// The building the bot is actually inside, captured when an "enter" step's
+	// target RESOLVES. An exit assertion cannot recover this from the scenario
+	// config: a step may pin only a cell OID, and a scenario may visit two
+	// different buildings in sequence.
+	uint64 structureTraversalTestBotBuildingOid[2] = {0, 0};
+	// Cleared by the despawn task on its own thread while the runner reads it.
+	std::atomic<uint64> structureTraversalTestCombatAttackerOids[2];
+	bool structureTraversalTestScenarioActive = false;
+	bool structureTraversalTestSpawnTaskScheduled = false;
+	int structureTraversalTestRespawnBotIndex = -1;
+	// Both guarded by structureTraversalTestMutex. `scheduled` is the arming
+	// flag; `running` is the runner's ownership of the scenario cursor, held
+	// for the whole invocation so a callback-driven zero-delay tick cannot
+	// start a second concurrent writer.
+	bool structureTraversalTestRunnerScheduled = false;
+	bool structureTraversalTestRunnerRunning = false;
+	// Set by a tick that fired while another runner owned the cursor; the
+	// owner re-arms from it so a contended zero-delay wake-up is never lost.
+	bool structureTraversalTestRunnerRerunPending = false;
+	bool structureTraversalTestStepIssued[2] = {false, false};
+	bool structureTraversalTestInterruptTriggered[2] = {false, false};
+	bool structureTraversalTestPauseObserved[2] = {false, false};
+	bool structureTraversalTestDisplacementApplied[2] = {false, false};
+	// Scenario 20: the step under test is expected to be cancelled by an
+	// external public-API call, so it is verified as a preemption, not arrival.
+	bool structureTraversalTestExpectPreemption[2] = {false, false};
 	// Written once by the diagnostic spawn task, read on every SimPlayer's
 	// findNextPosition/controller tick via the logging gate — hence atomic.
 	AtomicLong cellNavDiagBotOid;
@@ -1883,6 +2086,46 @@ private:
 		ManagedReference<CellObject*>& cell);
 	void scheduleCellNavDiagnosticRetry();
 	void runCellNavDiagnosticRetry();
+	void scheduleStructureTraversalTestSpawn(int delayMs);
+	void spawnStructureTraversalTestBots();
+	void scheduleStructureTraversalTestRunner(int delayMs);
+	void runStructureTraversalTestRunner();
+	void runStructureTraversalTestRunnerBody();
+	// Sums the HARNESS bots' own traversal anomaly tallies. The manager's
+	// structureTraversal{Teleport,ZSanity} counters are dashboard aggregates
+	// that include production bots; asserting on them lets any bot in the world
+	// fail a harness scenario (F_0.8.1 stage 2 fixed the per-step assertion,
+	// stage 3 the per-scenario one this feeds).
+	// Folds a dying body's anomaly tallies into its harness slot. Callers MUST
+	// hold the agent lock when an agent still exists, to match the writer.
+	void foldStructureTraversalTestBotAnomalies(uint64 oid,
+			SimPlayerController* controller);
+	// One harness slot's anomaly total: destroyed-body carry + live controller.
+	void structureTraversalTestBotAnomalies(int botIndex, uint64& outTeleports,
+			uint64& outZSanity);
+	void sumStructureTraversalTestBotAnomalies(uint64& outTeleports,
+			uint64& outZSanity);
+	void finishStructureTraversalTestScenario(const String& status,
+		const String& reason);
+	void resetStructureTraversalTestBots(const StructureTraversalTestScenario& scenario);
+	void destroyStructureTraversalTestBot(uint64 oid, const String& reason);
+	AiAgent* spawnStructureTraversalTestBot(const String& planet,
+		const StructureTraversalTestPoint& point, int botIndex);
+	bool resolveStructureTraversalTestTarget(const String& planet,
+		const StructureTraversalTestStep& step, const Vector3& pathStart,
+		Vector3& world, Vector3& local,
+		ManagedReference<CellObject*>& cell);
+	void spawnStructureTraversalTestAttacker(uint64 botOid, int botIndex,
+		int durationMs);
+	void despawnStructureTraversalTestAttacker(int botIndex,
+		const String& reason);
+	void issueStructureTraversalTestStep(int botIndex);
+	void completeStructureTraversalTestStep(int botIndex,
+		const String& status, const String& reason);
+	void failStructureTraversalTest(int botIndex, const String& reason);
+	void initializeStructureTraversalTestResults();
+	void drainStructureTraversalTestEvents();
+	int getStructureTraversalTestBotIndex(uint64 oid) const;
 
 	// --- P.6.1 SimPvP squads (config, roster, travel, upkeep) ---------------
 	// All C++ defaults ship OFF; lua pvpConfig enables and tunes at runtime
@@ -2276,8 +2519,224 @@ public:
 	bool isCellNavDiagBot(uint64 oid) const {
 		return oid != 0 && oid == cellNavDiagBotOid.get();
 	}
+	void startStructureTraversalTestBot(uint64 oid);
+	void notifyStructureTraversalTestArrived(uint64 oid);
+	void notifyStructureTraversalTestPathFailed(uint64 oid,
+		const String& reason);
+	void notifyStructureTraversalTestTick(uint64 oid);
 	bool getCellNavDiagLogEveryTick() const {
 		return cellNavDiagConfig.logEverySimLoopTick;
+	}
+	bool isStructureTraversalEnabled() const {
+		return enabled && structureTraversalConfig.enabled;
+	}
+	bool isStructureTraversalLoggingEnabled() const {
+		return structureTraversalConfig.logging;
+	}
+	bool isStructureTraversalZeroClipEnabled() const {
+		return enabled && structureTraversalConfig.enabled &&
+			structureTraversalConfig.zeroClip.enabled;
+	}
+	bool isStructureTraversalZeroClipLoggingEnabled() const {
+		return structureTraversalConfig.zeroClip.logging;
+	}
+	bool isStructureTraversalZeroClipEnforceEnabled() const {
+		return structureTraversalConfig.zeroClip.enforce;
+	}
+	int getStructureTraversalZeroClipRejectionCap() const {
+		return structureTraversalConfig.zeroClip.rejectionCap;
+	}
+	bool isStructureTraversalZeroClipWalkableConfirmEnabled() const {
+		return structureTraversalConfig.zeroClip.walkableConfirm;
+	}
+	float getStructureTraversalZeroClipWalkableToleranceRatio() const {
+		return structureTraversalConfig.zeroClip.walkableToleranceRatio;
+	}
+	int getStructureTraversalZeroClipMaxCandidates() const {
+		return structureTraversalConfig.zeroClip.maxCandidates;
+	}
+	int getStructureTraversalZeroClipMaxProbedSegments() const {
+		return structureTraversalConfig.zeroClip.maxProbedSegments;
+	}
+	float getStructureTraversalZeroClipBroadPhasePadMeters() const {
+		return structureTraversalConfig.zeroClip.broadPhasePadMeters;
+	}
+	float getStructureTraversalZeroClipMaxSegmentMeters() const {
+		return structureTraversalConfig.zeroClip.maxSegmentMeters;
+	}
+	bool isStructureTraversalZeroClipExitSetEnabled() const {
+		return enabled && structureTraversalConfig.enabled &&
+			structureTraversalConfig.zeroClip.exitSetEnabled;
+	}
+	int getStructureTraversalZeroClipEgressCandidateAttemptCap() const {
+		return structureTraversalConfig.zeroClip.egressCandidateAttemptCap;
+	}
+	int getStructureTraversalZeroClipEgressTotalAttemptCeiling() const {
+		return structureTraversalConfig.zeroClip.egressTotalAttemptCeiling;
+	}
+	float getStructureTraversalZeroClipExitCandidateMaxVerticalMeters() const {
+		return structureTraversalConfig.zeroClip.exitCandidateMaxVerticalMeters;
+	}
+	int getStructureTraversalEgressAttemptCap() const {
+		return structureTraversalConfig.egressAttemptCap;
+	}
+	int getStructureTraversalResumeSettleMs() const {
+		return structureTraversalConfig.resumeSettleMs;
+	}
+	int getStructureTraversalResumeAttemptCap() const {
+		return structureTraversalConfig.resumeAttemptCap;
+	}
+	float getStructureTraversalTeleportAnomalyMeters() const {
+		return structureTraversalConfig.teleportAnomalyMeters;
+	}
+	float getStructureTraversalZSanityMeters() const {
+		return structureTraversalConfig.zSanityMeters;
+	}
+	float getStructureTraversalHollowContainmentMarginMeters() const {
+		return structureTraversalConfig.hollowContainmentMarginMeters;
+	}
+	bool isStructureTraversalRequireCompletePath() const {
+		return structureTraversalConfig.enabled &&
+			structureTraversalConfig.requireCompletePath;
+	}
+	bool isStructureTraversalFarSideEgressEnabled() const {
+		return enabled && structureTraversalConfig.enabled &&
+			structureTraversalConfig.farSideEgress;
+	}
+	float getStructureTraversalCompletePathToleranceMeters() const {
+		return structureTraversalConfig.completePathToleranceMeters;
+	}
+	bool isStructureTraversalUseNavmeshHybrid() const {
+		return structureTraversalConfig.enabled &&
+			structureTraversalConfig.useNavmeshHybrid;
+	}
+	bool isStructureTraversalHollowScanEnabled() const {
+		return enabled && structureTraversalConfig.enabled &&
+			structureTraversalConfig.hollowScan.enabled;
+	}
+	int getStructureTraversalHollowScanRays() const {
+		return structureTraversalConfig.hollowScan.rays;
+	}
+	float getStructureTraversalHollowScanRayMarginMeters() const {
+		return structureTraversalConfig.hollowScan.rayMarginMeters;
+	}
+	float getStructureTraversalHollowScanMinOpeningDeg() const {
+		return structureTraversalConfig.hollowScan.minOpeningDeg;
+	}
+	bool isStructureTraversalHollowDoorEgressObserveEnabled() const {
+		return enabled && structureTraversalConfig.enabled &&
+			structureTraversalConfig.hollowDoorEgress.observe;
+	}
+	bool isStructureTraversalHollowDoorEgressWalkEnabled() const {
+		return enabled && structureTraversalConfig.enabled &&
+			structureTraversalConfig.hollowDoorEgress.walk;
+	}
+	bool isStructureTraversalHollowDoorEgressUseCellPortalsEnabled() const {
+		return enabled && structureTraversalConfig.enabled &&
+			structureTraversalConfig.hollowDoorEgress.useCellPortals;
+	}
+	bool isStructureTraversalHollowEscalationEnabled() const {
+		return enabled && structureTraversalConfig.enabled &&
+			structureTraversalConfig.hollowEscalationEnabled;
+	}
+	int getStructureTraversalHollowEscalationAttemptCap() const {
+		return structureTraversalConfig.hollowEscalationAttemptCap;
+	}
+	bool isStructureTraversalHollowEscalationPreferTravelPoint() const {
+		return structureTraversalConfig.hollowEscalationPreferTravelPoint;
+	}
+	bool isStructureTraversalHollowEscalationDirectFallback() const {
+		return structureTraversalConfig.hollowEscalationDirectFallback;
+	}
+	bool isStructureTraversalPointInWater(Zone* zone,
+			const Vector3& point) const;
+	void recordStructureTraversalTeleportAnomaly() {
+		structureTraversalTeleportAnomalies.increment();
+	}
+	void recordStructureTraversalZSanityViolation() {
+		structureTraversalZSanityViolations.increment();
+	}
+	uint64 getStructureTraversalTeleportAnomalyCount() const {
+		return structureTraversalTeleportAnomalies.get();
+	}
+	uint64 getStructureTraversalZSanityViolationCount() const {
+		return structureTraversalZSanityViolations.get();
+	}
+	void recordStructureTraversalEgressPathFailure() {
+		structureTraversalEgressPathFailures.increment();
+	}
+	void recordStructureTraversalResumeFailure() {
+		structureTraversalResumeFailures.increment();
+	}
+	void recordStructureTraversalPathfinderFallback() {
+		structureTraversalPathfinderFallbackActivations.increment();
+	}
+	void recordStructureTraversalHollowEscalationTriggered() {
+		structureTraversalHollowEscalationsTriggered.increment();
+	}
+	void recordStructureTraversalHollowEscalationFailed() {
+		structureTraversalHollowEscalationsFailed.increment();
+	}
+	void recordZeroClipClearanceCheck() {
+		zeroClipClearanceChecks.increment();
+	}
+	void recordZeroClipWouldBlock() {
+		zeroClipWouldBlock.increment();
+	}
+	void recordZeroClipBlocked() {
+		zeroClipBlocked.increment();
+	}
+	void recordZeroClipCapExhausted() {
+		zeroClipCapExhausted.increment();
+	}
+	void recordZeroClipWalkableReclassified(int count) {
+		for (int i = 0; i < count; ++i)
+			zeroClipWalkableReclassified.increment();
+	}
+	void recordZeroClipExitSetBuilt() {
+		zeroClipExitSetsBuilt.increment();
+	}
+	void recordZeroClipExitCandidateTried() {
+		zeroClipExitCandidatesTried.increment();
+	}
+	void recordZeroClipEgressCandidateBudgetExhausted() {
+		zeroClipEgressCandidateBudgetExhausted.increment();
+	}
+	void recordZeroClipSkipped() {
+		zeroClipSkipped.increment();
+	}
+	void recordZeroClipTruncated() {
+		zeroClipTruncated.increment();
+	}
+	void recordZeroClipError() {
+		zeroClipErrors.increment();
+	}
+	uint64 getZeroClipSkippedCount() const {
+		return zeroClipSkipped.get();
+	}
+	uint64 getZeroClipTruncatedCount() const {
+		return zeroClipTruncated.get();
+	}
+	uint64 getZeroClipErrorCount() const {
+		return zeroClipErrors.get();
+	}
+	uint64 getZeroClipClearanceCheckCount() const {
+		return zeroClipClearanceChecks.get();
+	}
+	uint64 getZeroClipWouldBlockCount() const {
+		return zeroClipWouldBlock.get();
+	}
+	uint64 getZeroClipBlockedCount() const {
+		return zeroClipBlocked.get();
+	}
+	uint64 getZeroClipExitSetBuiltCount() const {
+		return zeroClipExitSetsBuilt.get();
+	}
+	uint64 getZeroClipExitCandidatesTriedCount() const {
+		return zeroClipExitCandidatesTried.get();
+	}
+	uint64 getZeroClipEgressCandidateBudgetExhaustedCount() const {
+		return zeroClipEgressCandidateBudgetExhausted.get();
 	}
 
 	// The main logic to spawn a specific bot

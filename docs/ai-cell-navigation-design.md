@@ -11,6 +11,46 @@ approaches.
 This is cross-cutting behavior shared by miners, PvE hunters, and PvP bots. It
 does not belong in the miner-only navigation design document.
 
+## Owning design: formal structure traversal
+
+The owning production design is now the gated `StructureTraversalPhase` state
+machine in `SimPlayerController`, not a caller-specific egress workaround. Its
+phases are `Idle`, `ApproachDoor`, `InteriorRoute`, `Egress`, `Reentry`,
+`CombatPaused`, and `Resuming`. `enterStructure(world, local, cell)` preserves
+the cell-aware target across cross-building egress; `exitStructure(dest)` keeps
+the outdoor destination as the durable intent. Internal egress and re-entry
+legs are tagged separately from external public-API calls, so a state-machine
+leg cannot preempt its own intent.
+
+The state machine also owns the enclosed-outdoor-hollow rule. A cell-0 agent
+whose world position remains within the owning building's bounded horizontal
+AABB margin is not treated as genuinely outdoors. On resume it first re-enters
+the stashed cell, then performs the normal egress; an exit intent cannot
+complete while the agent is still in that hollow. This avoids the engine's
+cell-0-to-cell-0 direct-path limitation.
+
+### Combat-wins policy
+
+Combat always wins over traversal movement. A gated traversal pauses in
+`CombatPaused`, keeps its intent and traversal generation, and lets the stock
+combat tree or controller combat lease drive the bot. A single
+traversal-generation-tagged resume monitor owns the transition to `Resuming`
+only after both `!isInCombat()` and `!isCombatDriverActive()` have remained true
+for the configured settle window. External `moveTo`, `enterStructure`, or
+`exitStructure` calls still replace the intent during combat, but remain frozen
+until that compound peace predicate is satisfied.
+
+Resume is recompute-not-replay: it inspects the bot's current parent and world
+position and chooses an interior route, egress, re-entry, or plain world move.
+It never replays the stale phase where combat began. Work-loop generations
+invalidate combat movement tasks, while the separate traversal generation keeps
+the resume monitor and durable intent alive. Relocation, recovery, preemption,
+death, and teardown clear both the intent and monitor eligibility.
+
+The former F.0.4.9 single-purpose egress behavior is therefore subsumed by this
+state machine for the gated formal API. Legacy `moveTo`/`moveToInterior`
+callers remain on their existing path when the structure-traversal gate is off.
+
 ## Suspected chain
 
 An interior movement request carries a world-space target for distance checks

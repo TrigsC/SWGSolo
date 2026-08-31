@@ -493,8 +493,31 @@ bool SimHunterController::moveToNextPveBuffProvider() {
 
 		pveBuffApproachStage = stage;
 		pveBuffProviderApproachActive = true;
-		moveToInterior(provider.worldPos, provider.localPos,
-			provider.cell.get());
+
+		// F_0.8.1 stage 1, RE-APPLIED 2026-08-30. A provider inside a cell is a
+		// real BUILDING ENTRY, so drive it through the traversal state machine.
+		// moveToInterior only sets interiorApproachLeg and never creates a
+		// StructureTraversalIntent, so none of the F_0.8.0 machinery was
+		// reachable from here.
+		//
+		// The first attempt (run 20260829-194002) produced 747 ST_FAILs: a
+		// provider in a DIFFERENT building routes through the traversal Egress
+		// phase, and cross-building egress failed. That was D2 -- and D2 turned
+		// out to be GATED OFF rather than unsolved: the portal-derived exit-set
+		// ladder in failCellEgress() sits behind zeroClip.exitSetEnabled, which
+		// was false in every run to that point. With it true the matrix went
+		// 22 -> 23 PASS and cantina_to_corellia_hospital passed for the first
+		// time (run 20260829-215252).
+		//
+		// Guarded on a non-null cell: an outdoor provider stays an outdoor
+		// approach, and a starport hollow is frequently a destination in its own
+		// right (owner constraint, 2026-08-27).
+		if (provider.cell != nullptr)
+			enterStructure(provider.worldPos, provider.localPos,
+				provider.cell.get());
+		else
+			moveToInterior(provider.worldPos, provider.localPos, nullptr);
+
 		return true;
 	};
 
@@ -1671,6 +1694,11 @@ void SimHunterController::onArrived() {
 }
 
 void SimHunterController::onPathFailed() {
+	if (isStructureTraversalFeatureEnabled() && isTraversalActive()) {
+		SimPlayerController::onPathFailed();
+		return;
+	}
+
 	// The base leaves the agent in CALCULATING_PATH; reset it or a failed
 	// retreat/patrol path wedges the controller until the phase TTL fires.
 	clearHybridMovementOnCancellation();
@@ -1836,6 +1864,8 @@ void SimHunterController::runActiveTick() {
 			" gen=" + String::valueOf(activeTickGeneration.load(
 				std::memory_order_relaxed)));
 	if (strongAgent->isDead()) {
+		if (isStructureTraversalFeatureEnabled() && isTraversalActive())
+			clearStructureTraversalState("hunter_death");
 		cancelPveDoctorRequest();
 		if (!deathReported) {
 			deathReported = true;
@@ -3478,6 +3508,8 @@ void SimHunterController::beginTravelHome(bool abandoned) {
 void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 	if (!orderActive)
 		return;
+	if (isStructureTraversalFeatureEnabled() && isTraversalActive())
+		clearStructureTraversalState("hunter_order_complete");
 	if (missionHuntOrder && !missionCleanupRequested && missionLairOid != 0) {
 		beginMissionCleanup(abandoned, reason);
 		return;
@@ -3530,6 +3562,8 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 }
 
 void SimHunterController::teardown(const String& reason) {
+	if (isStructureTraversalFeatureEnabled() && isTraversalActive())
+		clearStructureTraversalState("hunter_teardown");
 	activeTickGeneration++;
 	advanceWorkLoopGeneration("hunterTeardown");
 	cancelPveDoctorRequest();
