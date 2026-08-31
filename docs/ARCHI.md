@@ -165,7 +165,7 @@ no new warnings before handing work back** (owner-stated standard).
   flag, `ticketCollectorTravel` interplanetary-travel gate +
   `interiorContainmentMarginMeters`, and the `cellNavDiag` toggles —
   `enabled` for the diagnostic test-bot spawn and `logging` as the master gate
-  for all `bin/log/cellnav.log` output, both default off). F_0.8.0 adds the
+  for all `bin/log/cellnav.log` output, both default off). F_0.8.0/F_0.8.1 add the
   `structureTraversal` block — `enabled`/`logging`, `hollowEscalation*`,
   `farSideEgress`, `hollowDoorEgress.*`, the `zeroClip.*` probe and enforcement
   knobs (`enforce`, `rejectionCap`, `walkableConfirm`,
@@ -356,6 +356,46 @@ This is this fork's primary custom subsystem, layered on top of the stock
   agentLock against agentLock → harnessMutex is an ABBA deadlock).
   Instrumentation: `StructureTraversalDiagLog` → `bin/log/structuretraversal.log`,
   gated by `structureTraversal.logging`.
+- **Traversal adoption by production controllers (F_0.8.1)** — F_0.8.0 built the
+  state machine but nothing used it: `enterStructure()` had **exactly one caller,
+  the test harness**. Adoption is therefore a distinct architectural step from
+  the machinery, and the rule for any future controller is that a cell-bearing
+  destination is a **building entry** and belongs to `enterStructure`, not a bare
+  `moveTo`. Migrated: `SimHunterController` (buff providers) and
+  `SimPvPController` (collector approaches, starport interior waypoints).
+  Migration sites are guarded on a non-null cell — a starport hollow resolves to
+  a null cell and must stay an outdoor approach, since the hollow is frequently
+  the destination. Where the legacy call was `moveTo` rather than
+  `moveToInterior` the guard must **also** test the feature gate, because
+  `enterStructure`'s null-cell fallthrough calls `moveToInterior`; without that,
+  gate-off behaviour changes. **Miners are deliberately not migrated** — station
+  travel teleports them to an *outdoor* arrival by design, so they have no reason
+  to enter a cell. `acceptFoundPath` is now a non-virtual **template method**
+  (invariants + `virtual acceptFoundPathHook`): a subclass that overrode it
+  wholesale silently opted out of every base invariant, and that is now a compile
+  error. **`exitStructure` is NOT yet adopted** — production bots enter through
+  the state machine and leave through the legacy cell-egress ladder; see
+  `docs/1-plans/F_0.8.2_traversal-egress-adoption.plan.md`.
+- **Test-oracle vs. production telemetry (F_0.8.1)** — an architectural boundary
+  the harness originally got wrong. `SimPlayerManager`'s
+  `structureTraversal{Teleport,ZSanity}` counters are **global dashboard
+  aggregates**; the matrix must assert on **per-agent** tallies held on
+  `SimPlayerController` (monotonic, deliberately not reset by
+  `clearStructureTraversalState`, `std::atomic` because the oracle reads them
+  off-thread). Asserting on the globals lets any bot in the world fail an
+  unrelated harness scenario — latent and invisible until a production bot first
+  ran traversal. Counters belonging to a body destroyed mid-scenario are folded
+  into a per-slot carry inside `destroyStructureTraversalTestBot`, the single
+  choke point every destroy path passes through, **under the agent lock** so the
+  snapshot is final against the writer.
+- **Post-lock lifecycle recheck (F_0.8.1)** — `SimPlayerController::checkArrival`
+  guards on `agent->getZone()` *before* acquiring `Locker locker(agent)`, so a
+  task can pass the guard, block on the lock, and resume after another thread has
+  torn the agent down under that same lock (harness destruction and recovery
+  despawn both call `destroyObjectFromWorld` there). It now rechecks the same
+  predicate immediately after acquisition and returns without rescheduling. The
+  general rule: any pre-lock lifecycle guard in this controller needs a matching
+  post-lock recheck, or the work runs on a world-destroyed agent.
 - **Zero-clip movement (D7)** — an anti-clipping invariant for bot paths,
   shipping **observe + enforce, both default-off**. The probe
   (`SimPlayerController::probeEmittedPathClearance`) runs on the **pathfinding
