@@ -1219,6 +1219,16 @@ private:
 	uint64 structureTraversalTestScenarioTeleportBaseline = 0;
 	uint64 structureTraversalTestScenarioZSanityBaseline = 0;
 	uint64 structureTraversalTestStepStartedAtMs[2] = {0, 0};
+	// Anomalies accrued by harness bodies that have since been DESTROYED, per
+	// harness slot. Scenario 22 (death_or_incapacity) replaces a bot mid-
+	// scenario and the fresh controller's tallies start at zero, so comparing
+	// them against a baseline captured from the destroyed controller would
+	// silently drop a pre-death anomaly. Folded in at
+	// destroyStructureTraversalTestBot -- the single choke point every destroy
+	// path passes through -- and added to the live controller's counts by
+	// structureTraversalTestBotAnomalies().
+	uint64 structureTraversalTestBotAnomalyCarryTeleport[2] = {0, 0};
+	uint64 structureTraversalTestBotAnomalyCarryZSanity[2] = {0, 0};
 	uint64 structureTraversalTestStepTeleportBaseline[2] = {0, 0};
 	uint64 structureTraversalTestStepZSanityBaseline[2] = {0, 0};
 	// The building the bot is actually inside, captured when an "enter" step's
@@ -2086,6 +2096,13 @@ private:
 	// that include production bots; asserting on them lets any bot in the world
 	// fail a harness scenario (F_0.8.1 stage 2 fixed the per-step assertion,
 	// stage 3 the per-scenario one this feeds).
+	// Folds a dying body's anomaly tallies into its harness slot. Callers MUST
+	// hold the agent lock when an agent still exists, to match the writer.
+	void foldStructureTraversalTestBotAnomalies(uint64 oid,
+			SimPlayerController* controller);
+	// One harness slot's anomaly total: destroyed-body carry + live controller.
+	void structureTraversalTestBotAnomalies(int botIndex, uint64& outTeleports,
+			uint64& outZSanity);
 	void sumStructureTraversalTestBotAnomalies(uint64& outTeleports,
 			uint64& outZSanity);
 	void finishStructureTraversalTestScenario(const String& status,

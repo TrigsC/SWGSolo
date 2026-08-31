@@ -30622,10 +30622,18 @@ void SimPlayerManager::destroyStructureTraversalTestBot(uint64 oid,
         controllers.get(oid) : nullptr;
     ManagedReference<AiAgent*> agent = controller == nullptr ? nullptr :
         controller->getAgent();
+    // The Reference above keeps the controller alive past the drop, so the
+    // anomaly fold below is safe after this point.
     controllers.drop(oid);
 
     if (agent != nullptr) {
         Locker locker(agent);
+        // Fold FIRST, and under this lock: recordTraversalMovementStep's
+        // caller (checkArrival) holds the agent lock across the increment, so
+        // taking it here makes the snapshot final -- no increment can be in
+        // flight or land afterwards. Doing it unlocked would race the writer
+        // and lose exactly the anomaly this carry exists to preserve.
+        foldStructureTraversalTestBotAnomalies(oid, controller);
         agent->setMovementState(AiAgent::OBLIVIOUS);
         agent->clearPatrolPoints();
         agent->clearSavedPatrolPoints();
@@ -30633,6 +30641,9 @@ void SimPlayerManager::destroyStructureTraversalTestBot(uint64 oid,
         agent->setSimPlayerBot(false);
         agent->destroyObjectFromWorld(true);
         agent->destroyObjectFromDatabase(true);
+    } else {
+        // No agent means no movement task, so no writer to race.
+        foldStructureTraversalTestBotAnomalies(oid, controller);
     }
 
     StructureTraversalDiagLog::write("SCENARIO_BOT_DESPAWN oid=" +
@@ -31103,13 +31114,18 @@ void SimPlayerManager::completeStructureTraversalTestStep(int botIndex,
     ManagedReference<AiAgent*> agent = controller->getAgent();
     bool assertionPassed = true;
     String assertionReason;
+    // Slot totals, not the live controller's: scenario 22 replaces the body
+    // mid-step, and a fresh controller starts at zero.
+    uint64 stepTeleports = 0;
+    uint64 stepZSanity = 0;
+    structureTraversalTestBotAnomalies(botIndex, stepTeleports, stepZSanity);
     if (status == "PASS") {
         if (agent == nullptr) {
             assertionPassed = false;
             assertionReason = "agent_missing";
-        } else if (controller->getTraversalTeleportAnomalyCount() >
+        } else if (stepTeleports >
                     structureTraversalTestStepTeleportBaseline[botIndex] ||
-                controller->getTraversalZSanityViolationCount() >
+                stepZSanity >
                     structureTraversalTestStepZSanityBaseline[botIndex]) {
             assertionPassed = false;
             assertionReason = "movement_anomaly";
@@ -31227,18 +31243,58 @@ void SimPlayerManager::completeStructureTraversalTestStep(int botIndex,
         finishStructureTraversalTestScenario("PASS", "all_steps_passed");
 }
 
+void SimPlayerManager::foldStructureTraversalTestBotAnomalies(uint64 oid,
+        SimPlayerController* controller) {
+    if (controller == nullptr)
+        return;
+
+    int slots = structureTraversalTestBotOids.size();
+    if (slots > 2)
+        slots = 2;
+    for (int i = 0; i < slots; ++i) {
+        if (structureTraversalTestBotOids.get(i) != oid)
+            continue;
+        structureTraversalTestBotAnomalyCarryTeleport[i] +=
+            controller->getTraversalTeleportAnomalyCount();
+        structureTraversalTestBotAnomalyCarryZSanity[i] +=
+            controller->getTraversalZSanityViolationCount();
+        break;
+    }
+}
+
+void SimPlayerManager::structureTraversalTestBotAnomalies(int botIndex,
+        uint64& outTeleports, uint64& outZSanity) {
+    outTeleports = 0;
+    outZSanity = 0;
+    if (botIndex < 0 || botIndex >= 2 ||
+            botIndex >= structureTraversalTestBotOids.size())
+        return;
+
+    outTeleports = structureTraversalTestBotAnomalyCarryTeleport[botIndex];
+    outZSanity = structureTraversalTestBotAnomalyCarryZSanity[botIndex];
+
+    uint64 oid = structureTraversalTestBotOids.get(botIndex);
+    Reference<SimPlayerController*> controller = controllers.contains(oid) ?
+        controllers.get(oid) : nullptr;
+    if (controller == nullptr)
+        return;
+    outTeleports += controller->getTraversalTeleportAnomalyCount();
+    outZSanity += controller->getTraversalZSanityViolationCount();
+}
+
 void SimPlayerManager::sumStructureTraversalTestBotAnomalies(
         uint64& outTeleports, uint64& outZSanity) {
     outTeleports = 0;
     outZSanity = 0;
-    for (int i = 0; i < structureTraversalTestBotOids.size(); ++i) {
-        uint64 oid = structureTraversalTestBotOids.get(i);
-        Reference<SimPlayerController*> controller = controllers.contains(oid) ?
-            controllers.get(oid) : nullptr;
-        if (controller == nullptr)
-            continue;
-        outTeleports += controller->getTraversalTeleportAnomalyCount();
-        outZSanity += controller->getTraversalZSanityViolationCount();
+    int slots = structureTraversalTestBotOids.size();
+    if (slots > 2)
+        slots = 2;
+    for (int i = 0; i < slots; ++i) {
+        uint64 teleports = 0;
+        uint64 zSanity = 0;
+        structureTraversalTestBotAnomalies(i, teleports, zSanity);
+        outTeleports += teleports;
+        outZSanity += zSanity;
     }
 }
 
@@ -31346,10 +31402,9 @@ void SimPlayerManager::issueStructureTraversalTestStep(int botIndex) {
     // bot tripping an anomaly mid-step would otherwise fail an unrelated
     // scenario (F_0.8.1 stage 2). Paired with the compare in
     // advanceStructureTraversalTestStep.
-    structureTraversalTestStepTeleportBaseline[botIndex] =
-        controller->getTraversalTeleportAnomalyCount();
-    structureTraversalTestStepZSanityBaseline[botIndex] =
-        controller->getTraversalZSanityViolationCount();
+    structureTraversalTestBotAnomalies(botIndex,
+        structureTraversalTestStepTeleportBaseline[botIndex],
+        structureTraversalTestStepZSanityBaseline[botIndex]);
     structureTraversalTestStepIssued[botIndex] = true;
 
     if (step.op == "dwell") {

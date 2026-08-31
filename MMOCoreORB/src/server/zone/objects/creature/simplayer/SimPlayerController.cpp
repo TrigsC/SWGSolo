@@ -4190,7 +4190,8 @@ void SimPlayerController::recordTraversalMovementStep(
     float teleportThreshold = SimPlayerManager::instance()->
         getStructureTraversalTeleportAnomalyMeters();
     if (delta > teleportThreshold) {
-        traversalTeleportAnomalyCount++;
+        traversalTeleportAnomalyCount.fetch_add(1,
+            std::memory_order_relaxed);
         SimPlayerManager::instance()->recordStructureTraversalTeleportAnomaly();
         StructureTraversalDiagLog::write(
             "ST_TELEPORT_ANOMALY agent=" + String::valueOf(
@@ -4234,7 +4235,8 @@ void SimPlayerController::recordTraversalMovementStep(
 
         if (floor != 0.f && zDelta > SimPlayerManager::instance()->
                 getStructureTraversalZSanityMeters()) {
-            traversalZSanityViolationCount++;
+            traversalZSanityViolationCount.fetch_add(1,
+                std::memory_order_relaxed);
             SimPlayerManager::instance()->recordStructureTraversalZSanityViolation();
             StructureTraversalDiagLog::write(
                 "ST_ZSANITY agent=" + String::valueOf(

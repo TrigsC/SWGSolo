@@ -388,8 +388,16 @@ protected:
     // cantina_long_dwell scenario. Monotonic -- deliberately NOT reset by
     // clearStructureTraversalState, so a baseline/compare pair spanning a step
     // stays valid across traversal generations.
-    uint64 traversalTeleportAnomalyCount = 0;
-    uint64 traversalZSanityViolationCount = 0;
+    // Atomic: written by recordTraversalMovementStep on the movement/arrival
+    // task (under the agent lock) and read by the harness oracle on the runner
+    // task WITHOUT that lock, so a plain uint64 would be a data race. Relaxed
+    // ordering is sufficient -- these are monotonic tallies and the oracle only
+    // needs a coherent value, not a happens-before edge. The FINAL snapshot at
+    // teardown additionally takes the agent lock (see
+    // SimPlayerManager::destroyStructureTraversalTestBot) so no increment can
+    // be in flight when the count is folded into the harness slot.
+    std::atomic<uint64> traversalTeleportAnomalyCount{0};
+    std::atomic<uint64> traversalZSanityViolationCount{0};
     uint64 traversalPeaceSinceMs;
     std::atomic<uint64> traversalResumeMonitorGeneration;
     bool traversalResumeInProgress;
@@ -503,10 +511,10 @@ public:
     void checkArrival();
     ManagedReference<AiAgent*> getAgent() const { return agent; }
     uint64 getTraversalTeleportAnomalyCount() const {
-        return traversalTeleportAnomalyCount;
+        return traversalTeleportAnomalyCount.load(std::memory_order_relaxed);
     }
     uint64 getTraversalZSanityViolationCount() const {
-        return traversalZSanityViolationCount;
+        return traversalZSanityViolationCount.load(std::memory_order_relaxed);
     }
     StructureTraversalPhase getTraversalPhase() const {
         return structureTraversalPhase;
