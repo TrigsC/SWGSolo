@@ -4446,6 +4446,19 @@ void SimPlayerController::checkArrival() {
 
     Locker locker(agent);
 
+    // The getZone() guard at the top of this function runs BEFORE the lock, so
+    // a teardown can complete while this task is blocked here: harness bot
+    // destruction and recovery despawn both call destroyObjectFromWorld under
+    // this same lock. Without a recheck the task resumes on a world-destroyed
+    // agent -- refilling patrol points, calling findNextPosition, and recording
+    // a movement step whose anomaly tallies have already been folded into the
+    // harness slot and are therefore discarded. Rechecking here makes every
+    // writer either finish before teardown's fold or exit after destruction.
+    // Early return without rescheduling matches the pre-lock guard exactly: a
+    // zoneless agent has no arrival chain to continue.
+    if (agent->getZone() == nullptr)
+        return;
+
     bool diagnostic = isCellNavDiagAgent(agent.get());
     ManagedReference<SceneObject*> currentParent = agent->getParent().get();
     uint64 currentParentCellOid = currentParent != nullptr &&
