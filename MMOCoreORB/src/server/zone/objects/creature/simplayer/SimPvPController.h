@@ -216,7 +216,7 @@ public:
 	// path that slipped a work-loop generation race (observed live: a boarded
 	// leader accepted a pre-teleport path and sprinted toward the previous
 	// city's pad on the new planet).
-	bool acceptFoundPath(const Vector3& pathEnd) override;
+	bool acceptFoundPathHook(const Vector3& pathEnd) override;
 
 	// P.6.1c diagnostics-only: heartbeat that logs the leader's live movement
 	// vs its phase target so we can see (from the log alone) whether the tick

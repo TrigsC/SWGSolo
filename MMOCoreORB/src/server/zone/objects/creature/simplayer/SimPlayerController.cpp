@@ -2710,7 +2710,16 @@ bool SimPlayerController::tryStartFarSideInteriorLeg() {
     return true;
 }
 
+// Template method: invariants first, then whatever the subclass adds. A
+// subclass cannot reach the invariants to skip them.
 bool SimPlayerController::acceptFoundPath(const Vector3& pathEnd) {
+    if (!acceptFoundPathInvariants(pathEnd))
+        return false;
+
+    return acceptFoundPathHook(pathEnd);
+}
+
+bool SimPlayerController::acceptFoundPathInvariants(const Vector3& pathEnd) {
     farSideRejectionPending = false;
 
     SimPlayerManager* manager = SimPlayerManager::instance();
@@ -5301,10 +5310,9 @@ void SimTraversalTestController::applyHarnessCombatDisplacement(
     traversalWatchdogPositionInitialized = true;
 }
 
-bool SimTraversalTestController::acceptFoundPath(const Vector3& pathEnd) {
-    if (!SimPlayerController::acceptFoundPath(pathEnd))
-        return false;
-
+bool SimTraversalTestController::acceptFoundPathHook(const Vector3& pathEnd) {
+    // The base invariants already ran; this adds only the harness's own
+    // complete-path measuring instrument.
     SimPlayerManager* manager = SimPlayerManager::instance();
 
     // Default-off: without the gate this is the base behaviour exactly.

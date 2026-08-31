@@ -1278,7 +1278,13 @@ void SimPvPController::beginCollectorDepartureApproach(const String& reason) {
 	collectorDepartureEntry = false;
 	cellEgressSuppressed = false;
 	setPhase(PVP_TO_SHUTTLE);
-	moveTo(collectorWorld, collectorWorld, collectorCell.get());
+	// collectorLocal, NOT collectorWorld, for the local argument.
+	// resolveNearestTicketCollector sets outLocal = outWorld only when the
+	// collector is OUTDOORS; for one baked inside a starport cell it is the
+	// CELL-LOCAL position. Passing the world point there is the
+	// world-coord-as-cell-local bug class (F_0.4.7), invisible so far only
+	// because hollow collectors make the two identical.
+	moveTo(collectorWorld, collectorLocal, collectorCell.get());
 
 	if (SimPlayerManager::instance()->isPvpLogStateTransitionsEnabled())
 		Logger::console.info("SimPvpLeader squad=" + String::valueOf(squadId) +
@@ -1470,7 +1476,9 @@ void SimPvPController::onArrived() {
 		if (collectorDepartureEntry) {
 			collectorDepartureEntry = false;
 			cellEgressSuppressed = true;
-			moveTo(collectorWorld, collectorWorld, collectorCell.get());
+			// Cell-local for the local argument — see the note at the other
+			// collector approach.
+			moveTo(collectorWorld, collectorLocal, collectorCell.get());
 			return;
 		}
 
@@ -1580,7 +1588,7 @@ void SimPvPController::prepareForRelocation(const String& reason) {
 	arrivalExitReenter = false;
 }
 
-bool SimPvPController::acceptFoundPath(const Vector3& pathEnd) {
+bool SimPvPController::acceptFoundPathHook(const Vector3& pathEnd) {
 	// `destination` still holds the moveTo() target here (onPathFound only
 	// overwrites it after acceptance). City legs are short navmesh or direct
 	// overland paths, so the end must land near the target.

@@ -538,15 +538,31 @@ public:
             resetHybridMovementState(true);
     }
 
-    // P.6.1b: last-line defense against a stale path winning a generation
-    // race — onPathFound() rejects (-> onPathFailed retry) any path whose end
-    // point this returns false for. Default accepts everything (miners rely
-    // on partial/exhausted paths); SimPvP leaders enforce end≈target.
-    virtual bool acceptFoundPath(const Vector3& pathEnd);
+    // Path acceptance is a TEMPLATE METHOD and deliberately NOT virtual.
+    //
+    // The rules the base applies are INVARIANTS every bot type must obey — the
+    // P.6.1b stale-path defense and D2b far-side egress. When this was a plain
+    // virtual, a subclass that overrode it silently opted out of all of them:
+    // `SimPvPController` did exactly that and skipped D2b entirely, so PvP
+    // leaders kept walking out of a starport's nearest portal back into the
+    // hollow long after the fix shipped (F_0.8.1). Nothing announced it.
+    //
+    // Subclasses add their own ADDITIONAL constraints via acceptFoundPathHook()
+    // below; they cannot remove these. A future controller that tries to
+    // override acceptFoundPath gets a compile error rather than a silent
+    // regression.
+    bool acceptFoundPath(const Vector3& pathEnd);
+    // The invariant half of the template method above.
+    bool acceptFoundPathInvariants(const Vector3& pathEnd);
     uint64 getWorkLoopGeneration() const { return workLoopGeneration; }
     uint64 advanceWorkLoopGeneration(const String& reason);
     bool isWorkLoopGenerationCurrent(uint64 capturedGeneration, const String& taskType);
     
+    // Additional, subclass-specific path-acceptance constraints. Runs ONLY
+    // after the base invariants have already accepted the path, so a subclass
+    // can tighten acceptance but never loosen it. Default: no extra rule.
+    virtual bool acceptFoundPathHook(const Vector3& pathEnd) { return true; }
+
     // Virtual for the same reason onPathFailed is: the traversal harness needs
     // to substitute a path result. No production controller overrides it.
     virtual void onPathFound(Vector<WorldCoordinates>* path,
@@ -761,7 +777,7 @@ public:
 
     // Gated, default-off. The base returns true for any endpoint because miners
     // rely on partial paths; a structure egress that stops short has FAILED.
-    bool acceptFoundPath(const Vector3& pathEnd) override;
+    bool acceptFoundPathHook(const Vector3& pathEnd) override;
 
     // Scenario 19 (bounded failure) needs findPath to fail for a target the bot
     // otherwise CAN resolve and route to. Map data cannot be relied on to
