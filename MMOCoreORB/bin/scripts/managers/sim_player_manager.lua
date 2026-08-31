@@ -378,13 +378,13 @@ SimPlayerManagerConfig = {
         profiles = {
             composite_armor_supply = {
                 enabled = true,
-                desiredReserve = 100000,
+                desiredReserve = 500000,
                 lowStockThreshold = 0.35,
                 criticalStockThreshold = 0.10,
             },
             master_weaponsmith_staples = {
                 enabled = true,
-                desiredReserve = 100000,
+                desiredReserve = 500000,
                 lowStockThreshold = 0.35,
                 criticalStockThreshold = 0.10,
             },
@@ -396,13 +396,13 @@ SimPlayerManagerConfig = {
             },
             chef_buff_foods = {
                 enabled = true,
-                desiredReserve = 100000,
+                desiredReserve = 500000,
                 lowStockThreshold = 0.35,
                 criticalStockThreshold = 0.10,
             },
             chef_high_value_consumables = {
                 enabled = true,
-                desiredReserve = 75000,
+                desiredReserve = 500000,
                 lowStockThreshold = 0.35,
                 criticalStockThreshold = 0.10,
             },
