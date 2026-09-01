@@ -5997,6 +5997,7 @@ void SimPlayerManager::loadLuaConfig() {
 	pveMissionBoardEnabled = false;
 	pveRealBuffsEnabled = false;
 	pveRealBuffsFallbackSynthetic = true;
+	pveBuffCrossBuildingStaging = false;
 	pveRealBuffHubsEnabled = false;
 	pveRealBuffHubKeys.removeAll();
 	pveRealBuffHubKeys.add("corellia:coronet");
@@ -7326,6 +7327,20 @@ void SimPlayerManager::loadLuaConfig() {
                             loc.name = entry.name;
                             loc.spawn = Vector3(entry.x, entry.y, entry.z);
                             loc.hangout = Vector3(entry.hx, entry.hy, entry.hz);
+                            // F_0.7.3: optional authoritative med-center anchor,
+                            // mirroring the proven hangout override. Absent =
+                            // fall back to the spawn point and let the resolver
+                            // derive the anchor from the hospital scan.
+                            LuaObject medCenter = city.getObjectField("medCenter");
+                            if (medCenter.isValidTable()) {
+                                loc.medCenter = Vector3(
+                                    medCenter.getFloatAt(1),
+                                    medCenter.getFloatAt(2),
+                                    medCenter.getFloatAt(3));
+                            } else {
+                                loc.medCenter = loc.spawn;
+                            }
+                            medCenter.pop();
                             // P.6.5a: exact PlanetTravelPoint name of the
                             // city's starport (empty = not routed-travel able).
                             loc.starportPoint = city.getStringField("starport");
@@ -7334,6 +7349,8 @@ void SimPlayerManager::loadLuaConfig() {
                             loc.shuttlePoint = city.getStringField("shuttlePoint");
                             loc.hangoutManual = city.getBooleanField(
                                 "hangoutManual", false);
+                            loc.medCenterManual = city.getBooleanField(
+                                "medCenterManual", false);
                             // P.8.7: routing-graph-only node (see the struct
                             // comment). Defaults false, so every pre-existing
                             // city keeps its current placement behavior.
@@ -7447,6 +7464,7 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	pveMissionBoardEnabled = false;
 	pveRealBuffsEnabled = false;
 	pveRealBuffsFallbackSynthetic = true;
+	pveBuffCrossBuildingStaging = false;
 	pveRealBuffHubsEnabled = false;
 	pveRealBuffHubKeys.removeAll();
 	pveRealBuffHubKeys.add("corellia:coronet");
@@ -7706,6 +7724,8 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 			"enabled", pveRealBuffsEnabled);
 		pveRealBuffsFallbackSynthetic = realBuffsConfig.getBooleanField(
 			"fallbackToSynthetic", pveRealBuffsFallbackSynthetic);
+		pveBuffCrossBuildingStaging = realBuffsConfig.getBooleanField(
+			"crossBuildingStaging", pveBuffCrossBuildingStaging);
 		pveRealBuffReapplySeconds = clampMinerInt(
 			realBuffsConfig.getIntField("reapplyThresholdSeconds"),
 			pveRealBuffReapplySeconds, 0, 86400);
@@ -17949,6 +17969,10 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
             row["shuttlePadX"] = city.shuttlePad.getX();
             row["shuttlePadY"] = city.shuttlePad.getY();
             row["shuttlePadZ"] = city.shuttlePad.getZ();
+            row["medCenterResolved"] = city.medCenterResolved;
+            row["medCenterX"] = city.medCenter.getX();
+            row["medCenterY"] = city.medCenter.getY();
+            row["medCenterManual"] = location.medCenterManual;
             row["hangoutManual"] = location.hangoutManual;
             row["hangoutSource"] = hangoutSource;
             row["hangoutPathNodes"] = city.hangoutPathNodes;
@@ -32191,12 +32215,17 @@ void SimPlayerManager::applyPvpConfig(LuaObject& pvpConfig) {
             "boardOnActualShuttle", pvpBoardOnActualShuttle);
         bool previousUseCantinaHangouts = pvpUseCantinaHangouts;
         float previousCantinaScanRadius = pvpCantinaScanRadiusMeters;
+        float previousMedCenterScanRadius = pveMedCenterScanRadiusMeters;
         pvpUseCantinaHangouts = travel.getBooleanField(
             "useCantinaHangouts", pvpUseCantinaHangouts);
         float cantinaScanRadius = travel.getFloatField(
             "cantinaScanRadiusMeters");
         if (cantinaScanRadius >= 32.f && cantinaScanRadius <= 2048.f)
             pvpCantinaScanRadiusMeters = cantinaScanRadius;
+        float medCenterScanRadius = travel.getFloatField(
+            "medCenterScanRadiusMeters");
+        if (medCenterScanRadius >= 32.f && medCenterScanRadius <= 2048.f)
+            pveMedCenterScanRadiusMeters = medCenterScanRadius;
         pvpMinDepartureNoticeSeconds = clampMinerInt(
             travel.getIntField("minDepartureNoticeSeconds"),
             pvpMinDepartureNoticeSeconds, 0, 90);
@@ -32229,7 +32258,8 @@ void SimPlayerManager::applyPvpConfig(LuaObject& pvpConfig) {
         }
 
         if (previousUseCantinaHangouts != pvpUseCantinaHangouts ||
-                previousCantinaScanRadius != pvpCantinaScanRadiusMeters) {
+                previousCantinaScanRadius != pvpCantinaScanRadiusMeters ||
+                previousMedCenterScanRadius != pveMedCenterScanRadiusMeters) {
             Locker squadLock(&pvpSquadMutex);
             pvpCityLocationsCache.removeAll();
             // Re-arm the maintenance warmup so the cleared cache repopulates
@@ -32515,46 +32545,95 @@ bool SimPlayerManager::resolvePvpCityLocations(
         }
     }
 
-    // P.8.1 med-center resolver: use the same immutable city scan as the
-    // cantina resolver, but publish an exterior point beside the hospital so
-    // the hunter can clear clone wounds without entering a cell.
-    if (zone != nullptr) {
-        SortedVector<TreeEntry*> medObjects;
-        zone->getInRangeObjects(resolved.shuttlePad.getX(), 0,
-            resolved.shuttlePad.getY(), pvpCantinaScanRadiusMeters,
-            &medObjects, true, true);
-        BuildingObject* nearestHospital = nullptr;
-        float nearestHospitalDistance = 0.f;
-        for (int i = 0; i < medObjects.size(); ++i) {
-            SceneObject* candidate =
-                static_cast<SceneObject*>(medObjects.get(i));
-            if (candidate == nullptr || !candidate->isBuildingObject())
-                continue;
-            BuildingObject* building = candidate->asBuildingObject();
-            if (building == nullptr || building->getObjectTemplate() == nullptr)
-                continue;
-            String templatePath = building->getObjectTemplate()->
-                getFullTemplateString().toLowerCase();
-            if (!templatePath.contains("hospital") &&
-                    !templatePath.contains("medicalcenter") &&
-                    !templatePath.contains("medcenter"))
-                continue;
-            float distance = building->getWorldPosition().distanceTo2d(
-                resolved.shuttlePad);
-            if (nearestHospital == nullptr || distance < nearestHospitalDistance) {
-                nearestHospital = building;
-                nearestHospitalDistance = distance;
+    // F_0.7.3 med-center resolver: an authoritative manual anchor wins;
+    // otherwise find the nearest hospital from BOTH the shuttle pad AND the
+    // resolved cantina/hangout. A pad-only scan does not span a large city:
+    // measured 2026-08-31, Theed's pad sits 561m from its cantina, so no
+    // hospital fell inside the 400m cantina radius, medCenterResolved stayed
+    // false, the anchor silently defaulted to the pad, and the doctor scan
+    // (another ring on the pad) missed the hospital too -- every Theed hunter
+    // took the synthetic doctor buff. Coronet's pad is 75m from its cantina,
+    // which is why it always worked. Publish an exterior point beside the
+    // hospital so the hunter can clear clone wounds without entering a cell.
+    if (zone != nullptr && location.medCenterManual) {
+        resolved.medCenter = location.medCenter;
+        float medZ = zone->getHeight(resolved.medCenter.getX(),
+            resolved.medCenter.getY());
+        if (medZ != 0.f)
+            resolved.medCenter.setZ(medZ);
+        resolved.medCenterResolved = true;
+    } else if (zone != nullptr) {
+        // Same lock choreography as the cantina scan above: the world query
+        // runs outside pvpSquadMutex and only the immutable result is
+        // published under it.
+        auto findNearestHospital = [&](const Vector3& anchor, float radius,
+                float& distanceOut) -> BuildingObject* {
+            SortedVector<TreeEntry*> medObjects;
+            zone->getInRangeObjects(anchor.getX(), 0, anchor.getY(), radius,
+                &medObjects, true, true);
+
+            BuildingObject* nearestHospital = nullptr;
+            distanceOut = 0.f;
+            for (int i = 0; i < medObjects.size(); ++i) {
+                SceneObject* candidate =
+                    static_cast<SceneObject*>(medObjects.get(i));
+                if (candidate == nullptr || !candidate->isBuildingObject())
+                    continue;
+
+                BuildingObject* building = candidate->asBuildingObject();
+                if (building == nullptr ||
+                        building->getObjectTemplate() == nullptr)
+                    continue;
+
+                String templatePath = building->getObjectTemplate()->
+                    getFullTemplateString().toLowerCase();
+                if (!templatePath.contains("hospital") &&
+                        !templatePath.contains("medicalcenter") &&
+                        !templatePath.contains("medcenter"))
+                    continue;
+
+                float distance = building->getWorldPosition().distanceTo2d(
+                    anchor);
+                if (nearestHospital == nullptr || distance < distanceOut) {
+                    nearestHospital = building;
+                    distanceOut = distance;
+                }
             }
+
+            return nearestHospital;
+        };
+
+        float shuttleHospitalDistance = 0.f;
+        BuildingObject* shuttleHospital = findNearestHospital(
+            resolved.shuttlePad, pveMedCenterScanRadiusMeters,
+            shuttleHospitalDistance);
+        float hangoutHospitalDistance = 0.f;
+        BuildingObject* hangoutHospital = findNearestHospital(
+            resolved.hangout, pveMedCenterScanRadiusMeters,
+            hangoutHospitalDistance);
+
+        // Prefer whichever anchor is genuinely closer to a hospital, so the
+        // exterior point is computed on the side the hunter approaches from.
+        BuildingObject* nearestHospital = shuttleHospital;
+        float nearestHospitalDistance = shuttleHospitalDistance;
+        Vector3 nearestHospitalAnchor = resolved.shuttlePad;
+        if (hangoutHospital != nullptr &&
+                (nearestHospital == nullptr ||
+                hangoutHospitalDistance < nearestHospitalDistance)) {
+            nearestHospital = hangoutHospital;
+            nearestHospitalDistance = hangoutHospitalDistance;
+            nearestHospitalAnchor = resolved.hangout;
         }
+
         if (nearestHospital != nullptr) {
             Vector3 hospitalPosition = nearestHospital->getWorldPosition();
-            Vector3 towardPad = resolved.shuttlePad - hospitalPosition;
-            towardPad.setZ(0.f);
-            if (towardPad.length2d() < 0.01f)
-                towardPad = Vector3::UNIT_X;
+            Vector3 towardAnchor = nearestHospitalAnchor - hospitalPosition;
+            towardAnchor.setZ(0.f);
+            if (towardAnchor.length2d() < 0.01f)
+                towardAnchor = Vector3::UNIT_X;
             else
-                towardPad.normalize();
-            resolved.medCenter = hospitalPosition + towardPad *
+                towardAnchor.normalize();
+            resolved.medCenter = hospitalPosition + towardAnchor *
                 (nearestHospital->getBoundingRadius() + 8.f);
             float medZ = zone->getHeight(resolved.medCenter.getX(),
                 resolved.medCenter.getY());

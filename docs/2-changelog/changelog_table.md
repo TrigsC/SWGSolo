@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.8.2` | 8 | F_0.7.3 + F_0.7.5: PvE hunters reach real doctors — dual-anchor med-centre resolution and cross-building approach staging; P.9 traversal gates ship enabled |
 | `0.8.1` | 7 | F_0.8.1 P.9: production controllers adopt structure traversal — hunter and PvP building entry migrated onto the state machine (0 → 61 production agents emitting ordered phases), per-agent harness anomaly oracle, and a post-lock agent lifecycle recheck; all gates default-off |
 | `0.8.0` | 7 | F_0.8.0 P.9: structure traversal foundation — cell-aware enter/exit state machine (phase/generation, hollow escalation, D2b far-side egress), 26-scenario live matrix harness, and observe+enforce zero-clip movement (block rate half false-positive, clip rate 11.3%→3.4%); all gates default-off |
 | `0.7.2` | 3 | fix: F_0.7.2 doctor/entertainer buffer player-chat crash — safe CreatureObject:isSimPlayerBot binding + guarded Lua buffer helpers (real-player buff no longer SIGABRTs the zone) |
@@ -19,6 +20,14 @@
 | `0.1.0` | 1 | chore: initialize TRIP workflow |
 
 # Changelog Summary
+
+- **v0.8.2 (Hunters Reach Real Doctors, F_0.7.3 + F_0.7.5 - Week 8, 01-09-2026)**:
+  - **Two independent defects, one symptom**: hunters silently took synthetic doctor buffs. First the doctor was never *found*; then, once found, the walk to him could not be *pathfound*. Fixing only the first made the failure louder, not rarer — the bot went from ignoring the doctor to trying and failing 22 of 23 times.
+  - **F_0.7.3, the anchor**: the hospital was searched only within 400m of the **shuttle pad**. Where that misses, `medCenterResolved` stayed false and the anchor silently fell back to *the pad itself*, so the doctor scan — another ring on the same wrong point — missed too. The tell was geometric: Theed's pad is **561m** from its own cantina versus **75m** at Coronet, which is exactly why Coronet always worked. Now scans from **both** pad and cantina at a wider 900m, with a manual override. Fixed theed (525m) and mos_entha (438m).
+  - **F_0.7.5, the walk**: a six-scenario harness isolation, varying only the spawn against one fixed target, separated three explanations that all looked alike. The target was fine (entry passed from the pad and from the anchor); the failure was **positional** (it reproduced from a *fresh spawn*, so not egress state); and it was **not a localized hole** (still failed 15m away). The decisive detail: the bot could *move* overland from that point — only cell-entry pathfinding had no route. So cross-building approaches now walk outdoors to the target building's exterior anchor and enter from the doorstep, the transition that always worked.
+  - **The lesson**: "distance" explained the anchor bug and explained nothing about the walk. Holding those two apart is what made the second diagnosis possible — a ~172m gap failing in ~100ms is a pathfinder returning nothing, not a bot giving up.
+  - **Measured**: one Theed bot went from **536 path failures and zero doctor visits** to zero failures and a completed loop; fleet `syntheticFallbacks` 0; `doctorInteractions` climbing across four cities. P.9 traversal gates now ship **enabled** (owner decision), with the ~19ms-p95 zero-clip probe, all logging and the harness shipped off.
+  - **Debt**: no bounded-retry budget — the pre-fix loop happened because the synthetic fallback only records when it actually applies a buff. Nothing loops now, but an unresolvable provider elsewhere still could.
 
 - **v0.8.1 (Traversal Adoption by Production Controllers, F_0.8.1 P.9 - Week 7, 30-08-2026)**:
   - **The finding**: F_0.8.0 shipped the traversal state machine, but `enterStructure()` had **exactly one caller in the codebase — the test harness**. No production bot type used it; hunters and PvP bots reached buildings via `moveTo`/`moveToInterior`, neither of which starts a traversal. The foundation was exercised only by its own harness. (Zero-clip was never in that gap — it lives in the base class and already covered every path.)

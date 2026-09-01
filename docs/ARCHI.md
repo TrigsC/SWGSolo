@@ -483,6 +483,43 @@ This is this fork's primary custom subsystem, layered on top of the stock
   buff is missing or within a refresh threshold. Interior cells are reached with
   a leg-scoped non-hybrid latch; a synthetic `realBuffs.fallbackBuffs` set covers
   unreachable providers. Design doc: `docs/ai-pve-playerbot-design.md`.
+- **Provider anchors are SEARCH anchors, not destinations (F_0.7.3, v0.8.2)**:
+  `resolvePvpCityLocations` publishes a city's `hangout` and `medCenter` as
+  exterior points; `resolvePveBuffProviders` centres its provider scan on them,
+  but the hunter's actual move target is the provider NPC's own cell-local
+  position. The med-centre search originally ran only within
+  `pvpCantinaScanRadiusMeters` (400 m) **of the shuttle pad**, and on a miss
+  `getPveHomeLocations` silently collapses `medCenter` to the pad — so the
+  doctor scan re-ran on the same wrong point and the provider was never found.
+  It now takes a `medCenterManual` override, else scans from **both** the pad
+  and the hangout at a separate `medCenterScanRadiusMeters` (900 m). The
+  diagnostic geometry: Theed's pad is 561 m from its own cantina vs 75 m at
+  Coronet. `medCenterResolved`/`medCenterX/Y` are on the `cityLocations`
+  dashboard rows. Note `realBuffs.providerResolveState` is `doctor || musician
+  || dancer` — "resolved" does NOT mean the doctor resolved.
+- **Cross-building cell entry is not pathfindable at range (F_0.7.5, v0.8.2)**:
+  a second, independent constraint in the same class as the P.4.1/P.4.2
+  overland findings. Asking `findPath` for a cell target in ANOTHER building
+  from an ordinary outdoor point fails deterministically — measured at Theed,
+  22 of 23 attempts, always from the identical post-egress position, returning
+  in ~100 ms (a pathfinder with no route, not a bot giving up). Harness
+  isolation established it is **positional, not stateful** (it reproduces from
+  a fresh spawn), **not a localized hole** (still fails 15 m away), and **not
+  the target** (the same cell enters fine from the pad and from the building's
+  own exterior anchor). Overland *movement* from that point works — only
+  cell-entry pathfinding has no route. So `SimHunterController`'s provider
+  approach now stages through the target building's exterior anchor and enters
+  from the doorstep, gated on BOTH `isStructureTraversalFeatureEnabled()` and
+  `realBuffs.crossBuildingStaging`. Same-building and outdoor approaches are
+  unchanged. One bot went 536 `ST_FAIL path_failed` with zero doctor visits →
+  zero failures and a completed loop.
+- **P.9 traversal gates ship ENABLED as of v0.8.2** (owner decision): the
+  master gate, `zeroClip.exitSetEnabled`, `farSideEgress`,
+  `hollowEscalationEnabled`, `hollowDoorEgress.*` and `crossBuildingStaging`.
+  Still shipped off: the zeroClip probe/enforcement (~19 ms p95 per path
+  request), all traversal/cell-nav logging, and the scenario harness — which
+  means `ST_PHASE` traces are NOT available in a default deployment, and
+  turning logging on is a deliberate diagnostic step.
 - **Everything here is simulation-only by explicit owner policy**: no real
   inventory/credit/market/persistence mutation happens from this layer until
   an economy-mutation phase is explicitly approved. New work here defaults

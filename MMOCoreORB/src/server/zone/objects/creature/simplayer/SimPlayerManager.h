@@ -983,6 +983,11 @@ public:
 		// P.6.5d: the configured hangout is authoritative when true; otherwise
 		// the resolver may derive an exterior cantina hangout.
 		bool hangoutManual = false;
+		// F_0.7.3: the configured med-center anchor is authoritative when true;
+		// otherwise the resolver derives an exterior hospital anchor from BOTH
+		// the shuttle pad and the hangout.
+		Vector3 medCenter;
+		bool medCenterManual = false;
 		// P.8.7: the city is not a general-population site. It is excluded from
 		// every RANDOM/AUTOMATIC placement decision — random spawn placement,
 		// PvE home-city rotation, PvP destination roulette — so adding a node
@@ -1762,6 +1767,7 @@ private:
 	bool pveMissionBoardEnabled = false;
 	bool pveRealBuffsEnabled = false;
 	bool pveRealBuffsFallbackSynthetic = true;
+	bool pveBuffCrossBuildingStaging = false;
 	bool pveRealBuffHubsEnabled = false;
 	Vector<String> pveRealBuffHubKeys;
 	int pveMaxBuffTripsPerHunt = 1;
@@ -2382,6 +2388,9 @@ private:
 	// immutable snapshots are published under it.
 	bool pvpUseCantinaHangouts = false;
 	float pvpCantinaScanRadiusMeters = 400.f;
+	// F_0.7.3: the hospital search is its own, wider radius. The cantina radius
+	// is measured from the shuttle pad and 400m does not span a large city.
+	float pveMedCenterScanRadiusMeters = 900.f;
 	VectorMap<String, PvpCityLocations> pvpCityLocationsCache; // pvpSquadMutex
 	// One-shot post-boot warmup (maintenance thread) so dashboard rows are
 	// complete without the dashboard ever resolving; see resolver guard.
@@ -2903,6 +2912,14 @@ public:
 		return pveMissionBoardMaxOfferAgeSeconds;
 	}
 	bool isPveRealBuffsEnabled() const { return pveRealBuffsEnabled; }
+	// F_0.7.5: stage cross-building provider approaches through an outdoor
+	// anchor beside the target building. Compiled default OFF like every other
+	// gate here; the deployment config turns it on. It only ever matters when
+	// structure traversal is enabled, where direct cross-building entry is
+	// measurably broken (Theed doctor: 22 of 23 attempts failed).
+	bool isPveBuffCrossBuildingStagingEnabled() const {
+		return pveBuffCrossBuildingStaging;
+	}
 	bool isPveRealBuffsFallbackSyntheticEnabled() const {
 		return pveRealBuffsFallbackSynthetic;
 	}

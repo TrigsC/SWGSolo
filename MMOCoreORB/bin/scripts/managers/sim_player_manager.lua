@@ -712,9 +712,24 @@ SimPlayerManagerConfig = {
     -- diagnostics are compiled in but dormant until this master gate is
     -- explicitly enabled.
     structureTraversal = {
-        enabled = false,
+        -- P.9 gates SHIPPED ON as of v0.8.2 (owner decision 2026-09-01).
+        -- Live-verified: the v0.8.1 run matched 23 PASS / 3 FAIL of the
+        -- 26-scenario matrix with 61 production agents on ordered phases, and
+        -- the F_0.7.5 run confirmed Theed hunters completing the full
+        -- cantina -> med-center buff loop against real providers.
+        --
+        -- Deliberately still FALSE below, each for a measured reason:
+        --   hollowEscalationDirectFallback - clips (crossesGeometry=1)
+        --   useNavmeshHybrid               - measured harmful, 11 -> 9 PASS
+        --   requireCompletePath            - instrument; costs the
+        --                                    cantina -> corellia hospital route
+        --   hollowScan                     - refuted as an exit finder, 72/72
+        --   zeroClip.*                     - the probe costs ~19ms p95 per path
+        --                                    request and writes per-path files
+        --   logging / structureTraversalTest - diagnostics only
+        enabled = true,
         logging = false,
-        hollowEscalationEnabled = false,
+        hollowEscalationEnabled = true,
         hollowEscalationAttemptCap = 1,
         hollowEscalationPreferTravelPoint = true,
         -- Option C is known to clip (crossesGeometry=1, hitAt=0.069) and is
@@ -762,7 +777,7 @@ SimPlayerManagerConfig = {
             -- getInRangeObjects matches on object ORIGIN; pad the query so a
             -- large structure centred off to one side is still considered.
             broadPhasePadMeters = 192,
-            exitSetEnabled = false,
+            exitSetEnabled = true,
             egressCandidateAttemptCap = 2,
             egressTotalAttemptCeiling = 8,
             -- A CellPortal exit set contains doors on EVERY level of the POB.
@@ -804,7 +819,7 @@ SimPlayerManagerConfig = {
         -- LIVE-VERIFIED 2026-08-27 (run 20260827-200923-d2b-farside): matrix
         -- 11 PASS/15 FAIL -> 22 PASS/4 FAIL of 26, 11 improvements, zero
         -- regressions, assertions non-vacuous. Default OFF pending release.
-        farSideEgress = false,
+        farSideEgress = true,
         hollowScan = {
             enabled = false,
             rays = 72,
@@ -812,9 +827,9 @@ SimPlayerManagerConfig = {
             minOpeningDeg = 5,
         },
         hollowDoorEgress = {
-            observe = false,
-            walk = false,
-            useCellPortals = false,
+            observe = true,
+            walk = true,
+            useCellPortals = true,
         },
     },
 
@@ -1210,6 +1225,21 @@ SimPlayerManagerConfig = {
         realBuffs = {
             enabled = true,
             fallbackToSynthetic = true,
+            -- F_0.7.5: approach a provider in a DIFFERENT building by walking
+            -- OUTDOORS to that building's exterior anchor first, then entering
+            -- from the doorstep. Direct cross-building cell entry is broken
+            -- where the two buildings are any real distance apart: measured
+            -- 2026-08-31, Theed's doctor failed 22 of 23 attempts, and the
+            -- harness reproduced it from a FRESH spawn at the same point
+            -- (theed_doc_A FAIL) while the staged route from that identical
+            -- point passed (theed_doc_D PASS). Those six isolation scenarios
+            -- were removed from the matrix after the diagnosis; see
+            -- docs/2-changelog for the run. Set false to restore the
+            -- pre-F_0.7.5 direct entry.
+            -- Compiled default is FALSE (SimPlayerManager.h); the deployment
+            -- config turns it on. Only engages when structure traversal is also
+            -- enabled -- see the gate on the approach path.
+            crossBuildingStaging = true,
             reapplyThresholdSeconds = 900,
             providerScanRadiusMeters = 400,
             doctorProviderName = "Doctor Buffer",
@@ -1734,6 +1764,14 @@ SimPlayerManagerConfig = {
             -- cantina exterior; Theed keeps its verified hand-placed spot.
             useCantinaHangouts = true,
             cantinaScanRadiusMeters = 400,
+            -- F_0.7.3: the hospital search gets its own, wider radius and is
+            -- run from BOTH the shuttle pad and the cantina/hangout. 400m is
+            -- measured from the pad and does not span a large city -- Theed's
+            -- pad is 561m from its own cantina, so no hospital was ever in
+            -- range and every Theed hunter fell back to synthetic doctor
+            -- buffs. Set a city's medCenter = {x, y, z} with
+            -- medCenterManual = true to pin the anchor outright.
+            medCenterScanRadiusMeters = 900,
             -- Squads form up (spawn + full-wipe reform) at faction staging.
             staging = {
                 rebel = { planet = "naboo", city = "moenia" },
@@ -1766,7 +1804,9 @@ SimPlayerManagerConfig = {
     -- PlanetTravelPoint names from scripts/managers/planet/planet_manager.lua.
     -- Starports serve cross-planet travel; shuttlePoints serve intra-planet
     -- city departures/arrivals. The resolver supplies live positions and
-    -- derives exterior cantina hangouts unless hangoutManual is true.
+    -- derives exterior cantina hangouts unless hangoutManual is true, and an
+    -- exterior med-center anchor unless medCenterManual is true (which makes
+    -- a city's medCenter = {x, y, z} authoritative).
     -- NOTE: kaadara is EXCLUDED - its travel point z=-192 in the planet data
     -- (under-the-world quirk); revisit if we ever want it in the pool.
     -- NOTE: miners also spawn spread across this list, so miners now appear

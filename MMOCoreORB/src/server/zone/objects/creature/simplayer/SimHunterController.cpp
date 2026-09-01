@@ -135,6 +135,8 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 	pveBuffTripAtHub = false;
 	pveBuffTripReturning = false;
 	pveBuffTripsThisHunt = 0;
+	pveBuffStagingActive = false;
+	pveBuffStagingStage = PVE_BUFF_APPROACH_NONE;
 	setLoggingName("SimHunterController");
 }
 
@@ -343,6 +345,8 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	pveBuffTripAtHub = false;
 	pveBuffTripReturning = false;
 	pveBuffTripsThisHunt = 0;
+	pveBuffStagingActive = false;
+	pveBuffStagingStage = PVE_BUFF_APPROACH_NONE;
 	cantinaDwellComplete = false;
 	medDwellComplete = false;
 	dwellUntilMs = 0;
@@ -442,6 +446,82 @@ void SimHunterController::computeBuffNeeds(bool& needDoctor,
 	}
 }
 
+bool SimHunterController::isAgentInsideBuildingOfCell(CellObject* cell) const {
+	if (cell == nullptr)
+		return false;
+
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr)
+		return false;
+
+	ManagedReference<SceneObject*> agentParent = strongAgent->getParent().get();
+	if (agentParent == nullptr || !agentParent->isCellObject())
+		return false;
+
+	ManagedReference<SceneObject*> agentBuilding = agentParent->getParent().get();
+	ManagedReference<SceneObject*> providerBuilding = cell->getParent().get();
+	if (agentBuilding == nullptr || providerBuilding == nullptr)
+		return false;
+
+	return agentBuilding->getObjectID() == providerBuilding->getObjectID();
+}
+
+PveBuffProviders::Provider* SimHunterController::providerForStage(
+		PveBuffApproachStage stage) {
+	if (stage == PVE_BUFF_APPROACH_MUSICIAN)
+		return &pveBuffProviders.musician;
+	if (stage == PVE_BUFF_APPROACH_DANCER)
+		return &pveBuffProviders.dancer;
+	if (stage == PVE_BUFF_APPROACH_DOCTOR)
+		return &pveBuffProviders.doctor;
+	return nullptr;
+}
+
+bool SimHunterController::resolvePveProviderStagingPoint(
+		PveBuffApproachStage stage, Vector3& stagingPoint) const {
+	if (pveBuffProviderPlanet.isEmpty() || pveBuffProviderCity.isEmpty())
+		return false;
+
+	Vector3 cantina;
+	Vector3 medCenter;
+	Vector3 home;
+	if (!SimPlayerManager::instance()->getPveHomeLocations(
+			pveBuffProviderPlanet, pveBuffProviderCity, cantina, medCenter,
+			home))
+		return false;
+
+	// The doctor lives in the med center and the entertainers in the cantina,
+	// so each stage stages beside its OWN building. Both anchors are the
+	// resolver's exterior points (building position pushed out past the
+	// bounding radius and height-snapped), which is exactly the point
+	// theed_doc_C/D entered from successfully.
+	stagingPoint = stage == PVE_BUFF_APPROACH_DOCTOR ? medCenter : cantina;
+
+	// KNOWN LIMITATION: getPveHomeLocations collapses an UNRESOLVED med centre
+	// to the shuttle pad, so this cannot distinguish "anchor beside the
+	// hospital" from "no hospital in this city". Staging on the pad instead is
+	// a benign degradation rather than a regression -- entry from the pad is
+	// the one approach already proven to work (harness theed_doc_B PASS) -- and
+	// after the F_0.7.3 dual-anchor fix every city that actually has a hospital
+	// resolves a real anchor. Surfacing medCenterResolved through this accessor
+	// would let the check be exact.
+	return !(stagingPoint.getX() == 0.f && stagingPoint.getY() == 0.f);
+}
+
+bool SimHunterController::enterPveBuffProviderCell(
+		PveBuffApproachStage stage) {
+	PveBuffProviders::Provider* provider = providerForStage(stage);
+	if (provider == nullptr || !provider->found || provider->cell == nullptr)
+		return false;
+
+	// The snapshot was refreshed moments ago in approach(); these providers are
+	// stationary screenplay NPCs, so re-querying the world here would add a
+	// lock round-trip for no benefit.
+	enterStructure(provider->worldPos, provider->localPos,
+		provider->cell.get());
+	return true;
+}
+
 bool SimHunterController::moveToNextPveBuffProvider() {
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
 	if (zoneServer == nullptr)
@@ -512,6 +592,30 @@ bool SimHunterController::moveToNextPveBuffProvider() {
 		// Guarded on a non-null cell: an outdoor provider stays an outdoor
 		// approach, and a starport hollow is frequently a destination in its own
 		// right (owner constraint, 2026-08-27).
+		// F_0.7.5: a provider in a DIFFERENT building than the one the bot is
+		// standing in is reached by walking OUTDOORS to that building's
+		// exterior anchor first, then entering from the doorstep. Measured
+		// 2026-08-31: direct cell entry across buildings fails
+		// deterministically at Theed (theed_doc_A/E FAIL) while the staged
+		// route from the identical start point passes (theed_doc_D PASS).
+		// Same-building moves and outdoor providers are untouched.
+		bool crossBuilding = provider.cell != nullptr &&
+			!isAgentInsideBuildingOfCell(provider.cell.get());
+		Vector3 stagingPoint;
+		// Gated on traversal too: with the traversal feature off, enterStructure
+		// degrades to legacy moveToInterior, and inserting a staging leg in
+		// front of THAT would change movement in a configuration this fix was
+		// never measured against.
+		if (crossBuilding && isStructureTraversalFeatureEnabled() &&
+				SimPlayerManager::instance()->
+					isPveBuffCrossBuildingStagingEnabled() &&
+				resolvePveProviderStagingPoint(stage, stagingPoint)) {
+			pveBuffStagingActive = true;
+			pveBuffStagingStage = stage;
+			moveTo(stagingPoint);
+			return true;
+		}
+
 		if (provider.cell != nullptr)
 			enterStructure(provider.worldPos, provider.localPos,
 				provider.cell.get());
@@ -652,6 +756,7 @@ void SimHunterController::finishPveBuffProviderFlow() {
 	cancelPveDoctorRequest();
 	pveBuffProviderApproachActive = false;
 	pveBuffInteractionDwellActive = false;
+	pveBuffStagingActive = false;
 	pveDoctorProviderObject = nullptr;
 	pveBuffApproachStage = PVE_BUFF_APPROACH_COMPLETE;
 	dwellUntilMs = 0;
@@ -994,6 +1099,12 @@ void SimHunterController::beginBuffUp() {
 		pveEntertainerFallbackNeeded = false;
 		pveBuffProviders = PveBuffProviders();
 		pveBuffApproachStage = PVE_BUFF_APPROACH_NONE;
+		pveBuffStagingActive = false;
+		pveBuffStagingStage = PVE_BUFF_APPROACH_NONE;
+		// Default to the home city; the buff-hub branch below overwrites this
+		// with the hub it actually resolved providers against.
+		pveBuffProviderPlanet = order.homePlanet;
+		pveBuffProviderCity = order.homeCity;
 		pveBuffProviderApproachActive = false;
 		pveBuffInteractionDwellActive = false;
 		pveDoctorRequestActive = false;
@@ -1029,6 +1140,8 @@ void SimHunterController::beginBuffUp() {
 				return;
 			}
 
+			pveBuffProviderPlanet = providerPlanet;
+			pveBuffProviderCity = providerCity;
 			if (!manager->resolvePveBuffProviders(providerPlanet, providerCity,
 					providers)) {
 				if (providers.pending) {
@@ -1543,6 +1656,26 @@ void SimHunterController::onArrived() {
 
 	uint64 nowMs = System::getMiliTime();
 	if (phase == BUFF_UP) {
+		// F_0.7.5: arrival at the outdoor staging anchor. The provider approach
+		// is still active, so entering here hands the normal arrival path the
+		// same state it would have had from a direct entry.
+		if (pveBuffStagingActive) {
+			pveBuffStagingActive = false;
+			if (enterPveBuffProviderCell(pveBuffStagingStage))
+				return;
+
+			// The provider vanished between staging and entry.
+			if (pveBuffStagingStage == PVE_BUFF_APPROACH_DOCTOR)
+				pveDoctorFallbackNeeded = true;
+			else
+				pveEntertainerFallbackNeeded = true;
+			pveBuffProviderApproachActive = false;
+			if (moveToNextPveBuffProvider())
+				return;
+			finishPveBuffProviderFlow();
+			return;
+		}
+
 		if (pveBuffInteractionDwellActive) {
 			pveBuffInteractionDwellActive = false;
 			bool needDoctor = false;
@@ -1722,6 +1855,7 @@ void SimHunterController::onPathFailed() {
 	if (phase == BUFF_UP && pveBuffProviderApproachActive) {
 		PveBuffApproachStage providerStage = pveBuffApproachStage;
 		pveBuffProviderApproachActive = false;
+		pveBuffStagingActive = false;
 		if (providerStage == PVE_BUFF_APPROACH_DOCTOR)
 			pveDoctorFallbackNeeded = true;
 		else

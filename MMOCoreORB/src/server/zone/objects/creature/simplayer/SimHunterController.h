@@ -129,6 +129,22 @@ private:
 	bool pveBuffTripReturning;
 	int pveBuffTripsThisHunt;
 
+	// F_0.7.5: cross-building provider staging. A provider in a DIFFERENT
+	// building is approached via an OUTDOOR point beside that building first,
+	// and only entered from there. MEASURED 2026-08-31 (harness scenarios
+	// theed_doc_A/D): entering Theed hospital cell 1697364 direct from the
+	// cantina exterior FAILS deterministically -- and still fails from a fresh
+	// spawn at that point, and from 15m away -- while walking to the
+	// med-center anchor first and entering from there PASSES. The bot can
+	// MOVE overland from that point fine (theed_doc_D's moveTo leg passed);
+	// it is cell-entry pathfinding from there that has no route.
+	bool pveBuffStagingActive;
+	PveBuffApproachStage pveBuffStagingStage;
+	// The planet/city the current provider snapshot was resolved against, so
+	// the staging anchors can be looked up without re-deriving the hub.
+	String pveBuffProviderPlanet;
+	String pveBuffProviderCity;
+
 	enum PveBuffFamily {
 		PVE_BUFF_FAMILY_DOCTOR,
 		PVE_BUFF_FAMILY_ENTERTAINER
@@ -140,6 +156,17 @@ private:
 	void beginBuffUp();
 	void computeBuffNeeds(bool& needDoctor, bool& needEntertainer) const;
 	bool moveToNextPveBuffProvider();
+	// Returns the OUTDOOR anchor beside the building housing this stage's
+	// provider: the med-center anchor for the doctor, the cantina/hangout
+	// anchor for the entertainers. False when the city has no resolved anchor,
+	// in which case the caller keeps the pre-F_0.7.5 direct entry.
+	bool resolvePveProviderStagingPoint(PveBuffApproachStage stage,
+		Vector3& stagingPoint) const;
+	PveBuffProviders::Provider* providerForStage(PveBuffApproachStage stage);
+	// True when the agent is already standing inside the building that owns
+	// this cell, i.e. the move is same-building and needs no outdoor staging.
+	bool isAgentInsideBuildingOfCell(CellObject* cell) const;
+	bool enterPveBuffProviderCell(PveBuffApproachStage stage);
 	void beginLegacySyntheticBuffDetour();
 	bool schedulePveDoctorScreenplay(SceneObject* provider,
 		const String& method, const String& args);
