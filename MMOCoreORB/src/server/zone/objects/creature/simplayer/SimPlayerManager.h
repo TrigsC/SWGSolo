@@ -52,8 +52,11 @@ class CellNavDiagSpawnTask;
 class StructureTraversalTestSpawnTask;
 class StructureTraversalTestRunnerTask;
 class StructureTraversalTestAttackerDespawnTask;
+class PlayerBotParityTestSpawnTask;
+class PlayerBotParityTestRunnerTask;
 class HiveCrafterConsumerTask;
 class SimHunterController;
+class SimPveFoundationMaintenanceTask;
 
 struct StructureTraversalTestScenario {
     String name;
@@ -116,6 +119,144 @@ struct SimBotIdentity {
 	String assignmentSpecies;
 	String assignmentResource;
 	uint64 assignmentStamp = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// P.10a: durable player-parity state belongs to the manager and is keyed by
+// roster identity. It must never be attached to an AiAgent or body OID.
+struct SimBotProgression {
+	uint64 identityId = 0;
+	int64 bankCredits = 0;
+	int64 cashCredits = 0;
+	int skillPointsSpent = 0;
+	uint64 awardsTotal = 0;
+	String lastAwardSource;
+	uint64 lastAwardMs = 0;
+	VectorMap<String, int> experience;
+	Vector<String> skills;
+	String createdAt;
+	String updatedAt;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// P.10a request lane. The parity harness is a later phase; keeping its
+// vocabulary here lets it enqueue work onto the same PvE maintenance task
+// without introducing a second SQL writer.
+struct PlayerBotProgressionRequest {
+	enum Kind {
+		MintHarnessIdentity,
+		ReloadStore,
+		ReadRow,
+		InjectOrphan,
+		DeleteIdentity,
+		DeleteProgressionRow,
+		RunReaper,
+		FlushNow,
+		InjectFault,
+		WriteRestartProbe
+	};
+
+	enum State {
+		Queued,
+		Running,
+		Completed,
+		Failed
+	};
+
+	uint64 requestId = 0;
+	Kind kind = FlushNow;
+	State state = Queued;
+	uint64 identityId = 0;
+	String xpType;
+	bool force = false;
+	int faultFlushDelayMs = 0;
+	bool faultFailNextFlush = false;
+	bool resultFound = false;
+	int64 resultValue = 0;
+	String error;
+	uint64 completedAtMs = 0;
+	uint64 queuedAtMs = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// P.10a parity harness configuration. Runtime request fields are kept on the
+// step so a queued SQL operation can be polled without a second runner state
+// object; the runner is the only writer of those fields.
+struct PlayerBotParityTestStep {
+	String op;
+	int identityIndex = -1;
+	uint64 identityId = 0;
+	String xpType;
+	int64 amount = 0;
+	String expect;
+	String source = "harness";
+	bool bank = false;
+	// Set on a step whose award the scenario deliberately expects the API to
+	// refuse (an overspend, or an award while the gate is off). Rejection is
+	// then the PASS condition and an unexpected success is the failure.
+	bool expectReject = false;
+	bool force = false;
+	int flushDelayMs = 0;
+	bool failNextFlush = false;
+	int budgetMs = 0;
+	bool async = false;
+	String requestRef;
+	// The request state waitForRequest blocks on (queued|started|completed).
+	String phase;
+	// Restart-protocol gate (A|B). Deliberately SEPARATE from `phase`: the two
+	// meanings collided and silently skipped every waitForRequest step.
+	String restartPhase;
+	String counter;
+	int expectedRecords = -1;
+	int expectedOrphanRecords = -1;
+	int expectedRosterWithoutRecord = -1;
+	int64 expectedDelta = 0;
+	bool hasExpectedRecords = false;
+	bool hasExpectedOrphanRecords = false;
+	bool hasExpectedRosterWithoutRecord = false;
+	int requestBudgetMs = 30000;
+	uint64 runtimeRequestId = 0;
+	uint64 runtimeStartedAtMs = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotParityTestScenario {
+	String name;
+	Vector<PlayerBotParityTestStep> steps;
+	int budgetMs = 300000;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotParityTestStepResult {
+	String op;
+	int identityIndex = -1;
+	String status = "PENDING";
+	String failReason;
+	uint64 durationMs = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotParityTestScenarioResult {
+	String name;
+	String status = "PENDING";
+	String failReason;
+	String restartPhase = "A";
+	uint64 startedAtMs = 0;
+	uint64 finishedAtMs = 0;
+	uint64 durationMs = 0;
+	Vector<PlayerBotParityTestStepResult> steps;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -784,6 +925,8 @@ private:
 	friend class StructureTraversalTestSpawnTask;
 	friend class StructureTraversalTestRunnerTask;
 	friend class StructureTraversalTestAttackerDespawnTask;
+	friend class PlayerBotParityTestSpawnTask;
+	friend class PlayerBotParityTestRunnerTask;
 
 	// Map of Creature ObjectID -> Controller
 	SynchronizedVectorMap<uint64, Reference<SimPlayerController*> > controllers;
@@ -1695,6 +1838,95 @@ private:
 	VectorMap<uint64, uint64> pveBodyIdentityIds;
 	VectorMap<uint64, uint64> pveRespawnDueAtMs;
 	VectorMap<uint64, bool> pveDirtyIdentityIds;
+
+	// P.10a: manager-owned progression store. The two maps are intentionally
+	// guarded independently from pveMutex; roster snapshots are copied before
+	// progressionMutex is acquired and no agent lock is taken while holding it.
+	Mutex progressionMutex;
+	VectorMap<uint64, SimBotProgression> progressionRecords;
+	VectorMap<uint64, bool> progressionDirtyIds;
+	Vector<uint64> progressionOrphanIds;
+	bool progressionEnabled = false;
+	bool progressionLoaded = false;
+	bool progressionDbAvailable = false;
+	uint64 progressionLastFlushMs = 0;
+	uint64 progressionNextDbProbeMs = 0;
+	uint64 progressionDbProbeBackoffMs = 5000;
+	int progressionFlushIntervalSeconds = 60;
+	bool progressionReaperEnabled = false;
+	int progressionReaperMinAgeSeconds = 3600;
+	AtomicLong progressionAwardsAccepted;
+	AtomicLong progressionAwardsRejectedNoRecord;
+	AtomicLong progressionAwardsRejectedNoIdentity;
+	AtomicLong progressionAwardsRejectedDisabled;
+	AtomicLong progressionAwardsRejectedInsufficient;
+	AtomicLong progressionAwardsRejectedInvalidAmount;
+	AtomicLong progressionCreateRefusedNotInRoster;
+	AtomicLong progressionOrphanRecords;
+	AtomicLong progressionRosterWithoutRecord;
+	AtomicLong progressionOrphansReaped;
+	AtomicLong progressionReaperRuns;
+	AtomicLong progressionFlushFailures;
+	Mutex progressionRequestMutex;
+	Vector<PlayerBotProgressionRequest> progressionRequests;
+	uint64 progressionNextRequestId = 1;
+	int progressionFaultFlushDelayMs = 0;
+	bool progressionFaultFailNextFlush = false;
+
+	// P.10a parity harness. The runner owns cursor/oracle mutation; the mutex
+	// also gives the dashboard a coherent copy while the runner is between
+	// operations. No SQL or agent lock is taken while this mutex is held.
+	Mutex playerBotParityTestMutex;
+	Vector<PlayerBotParityTestScenario> playerBotParityTestScenarios;
+	Vector<PlayerBotParityTestScenarioResult> playerBotParityTestResults;
+	Vector<int> playerBotParityTestScenarioOrder;
+	Vector<uint64> playerBotParityTestIdentityIds;
+	Vector<uint64> playerBotParityTestBodyOids;
+	VectorMap<uint64, SimBotProgression> playerBotParityTestOracle;
+	VectorMap<String, uint64> playerBotParityTestRequestRefs;
+	VectorMap<String, uint64> playerBotParityTestCounterBaselines;
+	int playerBotParityTestScenarioIndex = 0;
+	int playerBotParityTestStepCursor = 0;
+	int playerBotParityTestSetupCursor = 0;
+	int playerBotParityTestSpawnCursor = 0;
+	// Cleanup runs two sequential passes over the same identity vector: first
+	// destroying bodies, then deleting rows. They must not share one cursor, or
+	// the second pass starts at the end and every harness row leaks.
+	int playerBotParityTestCleanupCursor = 0;
+	bool playerBotParityTestCleanupBodiesDone = false;
+	uint64 playerBotParityTestScenarioStartedAtMs = 0;
+	uint64 playerBotParityTestStepStartedAtMs = 0;
+	uint64 playerBotParityTestCleanupRequestId = 0;
+	uint64 playerBotParityTestPendingRequestId = 0;
+	bool playerBotParityTestSetupRequestActive = false;
+	bool playerBotParityTestGateOverridePreviousActive = false;
+	bool playerBotParityTestGateOverridePrevious = true;
+	bool playerBotParityTestScenarioActive = false;
+	bool playerBotParityTestOracleInitialized = false;
+	bool playerBotParityTestRunnerScheduled = false;
+	bool playerBotParityTestRunnerRunning = false;
+	bool playerBotParityTestRunnerRerunPending = false;
+	bool playerBotParityTestCleanupActive = false;
+	bool playerBotParityTestCleanupPreserveProbe = false;
+	bool playerBotParityTestCleanupReaperQueued = false;
+	bool playerBotParityTestBootInitialized = false;
+	bool playerBotParityTestAwaitingRestart = false;
+	bool playerBotParityTestCompleted = false;
+	bool playerBotParityTestGateOverrideActive = false;
+	bool playerBotParityTestGateOverride = true;
+	bool playerBotParityTestEnabled = false;
+	bool playerBotParityTestStaleRowsScanned = false;
+	bool playerBotParityTestPhaseAFileWritten = false;
+	bool playerBotParityTestPhaseAFileInvalid = false;
+	String playerBotParityTestPlanet = "tatooine";
+	Vector3 playerBotParityTestSpawn;
+	int playerBotParityTestIdentityCount = 2;
+	int playerBotParityTestStartupDelaySeconds = 60;
+	String playerBotParityTestRunId;
+	String playerBotParityTestPhase = "A";
+	uint64 playerBotParityTestProbeIdentityId = 0;
+	uint64 playerBotParityTestScenarioBaselineRecords = 0;
+	uint64 playerBotParityTestHarnessRowsStale = 0;
 	VectorMap<uint64, uint64> pvePresenceOids;
 	VectorMap<uint64, uint64> pvePresenceSpawnCounts;
 	Vector<PveHuntSpecies> pveHuntSpecies;
@@ -1876,21 +2108,95 @@ private:
 	// current-boot spike PASS (the verdict advises the owner; it is not a
 	// runtime interlock - see governPvePopulation).
 	bool pveHunterEnableWarned = false;
-	bool pveMaintenanceTaskScheduled = false;
+	// PvE maintenance is a single-flight task. Kicks cancel only a still-queued
+	// task; a task that is already running latches rerunPending for its exit.
+	Mutex pveMaintenanceStateMutex;
+	bool pveMaintenanceScheduled = false;
+	bool pveMaintenanceRunning = false;
+	bool pveMaintenanceRerunPending = false;
+	Reference<SimPveFoundationMaintenanceTask*> pveMaintenanceArmedTask;
+	uint64 pveMaintenanceLastEntryMs = 0;
+	AtomicLong pveMaintenanceTicksTotal;
+	// Kick outcome telemetry. A queued request that waits a full interval is a
+	// symptom worth attributing at a glance rather than by log archaeology.
+	AtomicLong pveMaintenanceKicksRequested;
+	AtomicLong pveMaintenanceKicksImmediate;
+	AtomicLong pveMaintenanceKicksDeferred;
+	AtomicLong progressionRequestMaxWaitMs;
 	uint64 pveLastRosterFlushMs = 0;
 	int pveRosterFlushIntervalSeconds = 60;
 	int pveNextHomeCityIndex = 0;
 
 	void applyPveConfig(LuaObject& pveConfig);
+	void applyPlayerBotProgressionConfig(LuaObject& config);
+	void applyPlayerBotParityTestConfig(LuaObject& config);
 	void loadPveIdentityRoster();
 	void mintPveIdentitiesIfNeeded();
+	bool mintPveIdentity(const String& profession, SimBotIdentity& identityOut);
 	void flushPveIdentityRoster(bool force);
+	void loadPlayerBotProgressionStore();
+	bool ensurePlayerBotProgressionRecord(uint64 identityId);
+	// The fault knobs are passed in rather than read from shared state so a
+	// routine maintenance flush can never consume a fault the harness armed for
+	// its own FlushNow request.
+	void flushPlayerBotProgressionStore(bool force, int faultDelayMs = 0,
+		bool faultFailNext = false);
+	void reconcilePlayerBotProgression();
+	void runPlayerBotProgressionReaper(uint64 nowMs, bool force = false);
+	void drainPlayerBotProgressionRequests();
+	uint64 enqueuePlayerBotProgressionRequest(
+		const PlayerBotProgressionRequest& request);
+	bool copyPlayerBotProgressionRequest(uint64 requestId,
+		PlayerBotProgressionRequest& requestOut);
+	bool consumePlayerBotProgressionRequest(uint64 requestId,
+		PlayerBotProgressionRequest& requestOut);
+	void prunePlayerBotProgressionRequests(uint64 nowMs);
+	void kickPveMaintenanceNow();
+	void completePveFoundationMaintenanceTask(uint64 entryMs);
+	void schedulePlayerBotParityTestSpawn(int delayMs);
+	void schedulePlayerBotParityTestRunner(int delayMs);
+	void runPlayerBotParityTestRunner();
+	void runPlayerBotParityTestRunnerBody();
+	void initializePlayerBotParityTestResults();
+	void beginPlayerBotParityTestCleanup(bool preserveProbe);
+	void resolvePlayerBotParityExpectedRejection(
+		const PlayerBotParityTestStep& step, bool accepted,
+		PlayerBotParityTestStepResult& result, const String& rejectedReason,
+		const String& unexpectedAcceptReason);
+	void cleanupPlayerBotParityTest();
+	void restorePlayerBotParityScenarioGate();
+	bool executePlayerBotParityStep(PlayerBotParityTestStep& step,
+		PlayerBotParityTestStepResult& result, uint64 nowMs);
+	bool executePlayerBotParityRequestStep(PlayerBotParityTestStep& step,
+		PlayerBotParityTestStepResult& result, uint64 nowMs,
+		PlayerBotProgressionRequest::Kind kind,
+		PlayerBotProgressionRequest* completedOut = nullptr);
+	bool getPlayerBotParityIdentityId(const PlayerBotParityTestStep& step,
+		uint64& identityId);
+	void syncPlayerBotParityOracle();
+	bool assertPlayerBotParityStore(const PlayerBotParityTestStep& step,
+		String& failure);
+	bool assertPlayerBotParityCounter(const String& counter, int64 expected,
+		bool delta, String& failure);
+	int64 playerBotParityCounterValue(const String& counter);
+	bool parsePlayerBotParityExpected(const String& value, int64& result);
+	bool writePlayerBotParityPhaseAFile();
+	bool readPlayerBotParityPhaseAFile(uint64 probeIdentityId,
+		const String& runId, String& failure);
+	void deletePlayerBotParityPhaseAFile();
+	bool findPlayerBotParityRestartProbe(uint64& identityId);
+	AiAgent* spawnPlayerBotParityBody(int identityIndex);
+	void destroyPlayerBotParityBody(int identityIndex, const String& reason);
+	bool awardToNonRosterPlayerBotBody(uint64 identityId, const String& xpType,
+		int amount, const String& source);
+	bool playerBotProgressionAwardGateEnabled();
 	void updatePveBodyLifecycles(uint64 nowMs);
 	void governPvePopulation(uint64 nowMs);
 	void runPveHunterMatchmaker(uint64 nowMs);
 	void validatePveHuntGrounds();
 	void attachPveHunterController(const SimBotIdentity& identity, AiAgent* body);
-	AiAgent* spawnPveIdentityBody(const SimBotIdentity& identity);
+	AiAgent* spawnPveIdentityBody(const SimBotIdentity& identity,
+		const Vector3* spawnOverride = nullptr);
 	void recordPveHunterHarvest(uint64 identityId, uint64 targetOid,
 		const String& harvestKind, const String& requestedResourceType);
 	// Copies reservations and the monotonic session harvest tally under one
@@ -1939,6 +2245,7 @@ private:
 	void buildPveLairYieldIndex();
 	JSONSerializationType getPveActivityDashboard();
 	JSONSerializationType getPveSpikeDashboard();
+	JSONSerializationType getPlayerBotProgressionDashboard();
 
 	// Lua config loading / spawning
 	void loadLuaConfig();
@@ -2471,6 +2778,21 @@ private:
 
 public:
 	SimPlayerManager();
+
+	// P.10a award surface. Callers resolve a body to a roster identity first;
+	// these functions deliberately require an already-loaded record and never
+	// create one as a side effect.
+	bool grantPlayerBotExperience(uint64 identityId, const String& xpType,
+		int amount, const String& source, int* awarded = nullptr);
+	bool grantPlayerBotCredits(uint64 identityId, int64 amount, bool bank,
+		const String& source);
+	bool spendPlayerBotCredits(uint64 identityId, int64 amount, bool bank,
+		const String& source);
+	bool recordPlayerBotSkill(uint64 identityId, const String& skillName,
+		const String& source);
+	uint64 resolvePlayerBotIdentity(uint64 bodyOid);
+	bool snapshotPlayerBotProgression(uint64 identityId,
+		SimBotProgression& out);
 
 	// F.0.4.11: shared travel resolvers. World scans happen without an agent
 	// lock; the resolver takes only short object snapshots and validates the

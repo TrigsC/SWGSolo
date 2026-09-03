@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.9.0` | 8 | F_0.9.0 P.10a: PlayerBot progression store — identity-keyed MySQL XP/credits/skills with award-requires-record semantics, atomic-swap flush and orphan reaper, plus an 18-scenario two-boot live harness; award API has no production caller and all gates ship default-off |
 | `0.8.2` | 8 | F_0.7.3 + F_0.7.5: PvE hunters reach real doctors — dual-anchor med-centre resolution and cross-building approach staging; P.9 traversal gates ship enabled |
 | `0.8.1` | 7 | F_0.8.1 P.9: production controllers adopt structure traversal — hunter and PvP building entry migrated onto the state machine (0 → 61 production agents emitting ordered phases), per-agent harness anomaly oracle, and a post-lock agent lifecycle recheck; all gates default-off |
 | `0.8.0` | 7 | F_0.8.0 P.9: structure traversal foundation — cell-aware enter/exit state machine (phase/generation, hollow escalation, D2b far-side egress), 26-scenario live matrix harness, and observe+enforce zero-clip movement (block rate half false-positive, clip rate 11.3%→3.4%); all gates default-off |
@@ -20,6 +21,15 @@
 | `0.1.0` | 1 | chore: initialize TRIP workflow |
 
 # Changelog Summary
+
+- **v0.9.0 (PlayerBot Progression Store, F_0.9.0 P.10a - Week 8, 02-09-2026)**:
+  - **Opens the P.10 player-parity line** under the owner's explicit economy-phase approval. This chunk builds only the *place* progression lives — nothing awards anything yet, and a hunter's kill pays exactly what it paid in 0.8.2.
+  - **Why a store rather than a field**: a PlayerBot body has **no `PlayerObject` ghost** and is destroyed and rebuilt on every death, so `awardExperience` returns 0 and `disseminateExperience`/loot both gate on `isPlayerCreature()`. Nothing durable can live on the body — and anything reachable *from* an object would repeat the `simPlayerBot` sticky-flag leak that once put a stale bot flag on wild creatures.
+  - **Three invariants**: one creation function that refuses non-roster ids (called at mint and again as an idempotent repair, because MyISAM cannot make the two INSERTs atomic); **award-requires-record**, so a leaked flag resolves to identity 0 and is rejected *by construction*; and one SQL lane on the PvE maintenance task. The flush **atomically swaps** its dirty batch, so an award landing mid-SQL is never dropped — the roster's clear-after-write shape was deliberately not copied.
+  - **Four defects that only live verification found**, after a warning-clean build and an approving review: engine3's `getStringField(key, default)` **returns an empty string on a nil field** (it sets the pointer but leaves the length at 0); one struct field served as both the restart gate and the request state, silently skipping waits; a log path used `bin/log/...` when the server's cwd *is* `bin/`, so the two-boot protocol would have failed closed every run; and two assertions chased transients the recovery clears in ~5s.
+  - **The 32-second flush, root-caused**: it was **not** the scheduler. The fault knobs were global, so the routine end-of-tick flush could *steal* the fault armed for the harness's own request, failing an unrelated flush and leaving the real one to wait for a later tick. Also a latent flaky test. Faults now travel with the request that armed them: **32010ms → 1011ms** max wait, with kick/latency telemetry added.
+  - **Measured**: 18/18 scenarios and 26/26 assertions across four boots. The restart probe's 4242 XP and 777 credits survived a real process boundary; boot repair created records for all six pre-existing identities; cleanup left zero harness rows; gates-off is inert with production untouched and cadence at 28.3s against a 30s interval.
+  - **Debt**: no unit coverage — the store is SQL-bound and the harness *is* the test deliverable (escape plan recorded: lift the award-validation predicate into a header-only helper when F_0.9.1 adds the first caller). The bazaar chunks remain blocked on the owner's human-listing policy.
 
 - **v0.8.2 (Hunters Reach Real Doctors, F_0.7.3 + F_0.7.5 - Week 8, 01-09-2026)**:
   - **Two independent defects, one symptom**: hunters silently took synthetic doctor buffs. First the doctor was never *found*; then, once found, the walk to him could not be *pathfound*. Fixing only the first made the failure louder, not rarer — the bot went from ignoring the doctor to trying and failing 22 of 23 times.

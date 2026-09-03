@@ -12,6 +12,7 @@ includeFile("simMiner.lua")
 includeFile("simPvp.lua")
 includeFile("simHunter.lua")
 includeFile("simTraversalTest.lua")
+includeFile("simParityTest.lua")
 
 customMap = {
 	{ "crackdown", {
@@ -70,6 +71,12 @@ customMap = {
 	-- inherited combat sockets stay live so scripted interrupts are real combat.
 	{ "simTraversalTest", {
 		{IDLE, "idleSimTraversalTest"}
+	}},
+
+	-- P.10a progression parity identities are real roster bodies, but the
+	-- manager owns their operations and the controller keeps them idle.
+	{ "simParityTest", {
+		{IDLE, "idleSimParityTest"}
 	}},
 }
 

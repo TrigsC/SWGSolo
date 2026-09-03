@@ -142,7 +142,7 @@ void ServerDatabase::updateDatabaseSchema() {
 	);
 
 	alterDatabase(1009,
-		"CREATE TABLE `simbot_identities` ("
+		"CREATE TABLE IF NOT EXISTS `simbot_identities` ("
 		"`id` BIGINT NOT NULL AUTO_INCREMENT,"
 		"`first_name` VARCHAR(64) NOT NULL,"
 		"`last_name` VARCHAR(64) NOT NULL,"
@@ -161,6 +161,39 @@ void ServerDatabase::updateDatabaseSchema() {
 		"`assignment_stamp` BIGINT NOT NULL DEFAULT 0,"
 		"PRIMARY KEY (`id`),"
 		"UNIQUE KEY `idx_simbot_identity_name` (`first_name`,`last_name`)"
+		") ENGINE=MyISAM DEFAULT CHARSET=latin1;"
+	);
+
+	alterDatabase(1010,
+		"CREATE TABLE IF NOT EXISTS `simbot_progression` ("
+		"`identity_id` BIGINT NOT NULL,"
+		"`bank_credits` BIGINT NOT NULL DEFAULT 0,"
+		"`cash_credits` BIGINT NOT NULL DEFAULT 0,"
+		"`skill_points_spent` INT NOT NULL DEFAULT 0,"
+		"`awards_total` BIGINT NOT NULL DEFAULT 0,"
+		"`last_award_source` VARCHAR(32) DEFAULT NULL,"
+		"`created_at` DATETIME NOT NULL,"
+		"`updated_at` DATETIME NOT NULL,"
+		"PRIMARY KEY (`identity_id`)"
+		") ENGINE=MyISAM DEFAULT CHARSET=latin1;"
+	);
+
+	alterDatabase(1011,
+		"CREATE TABLE IF NOT EXISTS `simbot_experience` ("
+		"`identity_id` BIGINT NOT NULL,"
+		"`xp_type` VARCHAR(64) NOT NULL,"
+		"`amount` INT NOT NULL DEFAULT 0,"
+		"`updated_at` DATETIME NOT NULL,"
+		"PRIMARY KEY (`identity_id`,`xp_type`)"
+		") ENGINE=MyISAM DEFAULT CHARSET=latin1;"
+	);
+
+	alterDatabase(1012,
+		"CREATE TABLE IF NOT EXISTS `simbot_skills` ("
+		"`identity_id` BIGINT NOT NULL,"
+		"`skill_name` VARCHAR(64) NOT NULL,"
+		"`trained_at` DATETIME NOT NULL,"
+		"PRIMARY KEY (`identity_id`,`skill_name`)"
 		") ENGINE=MyISAM DEFAULT CHARSET=latin1;"
 	);
 }

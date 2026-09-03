@@ -1139,6 +1139,157 @@ SimPlayerManagerConfig = {
         },
     },
 
+    -- P.10a live progression parity harness. It is completely default-off;
+    -- enable only on a disposable verification profile. The retained probe
+    -- is written in phase A and adopted by the next process boot as phase B.
+    playerBotParityTest = {
+        enabled = false,
+        planet = "tatooine",
+        spawn = {x=3467, y=-4890, z=5},
+        identityCount = 2,
+        startupDelaySeconds = 60,
+        scenarios = {
+            {name="store_boot_invariant", budgetMs=300000, steps={
+                {op="assertStore", records=-1, orphanRecords=0, rosterWithoutRecord=0}}},
+            {name="harness_identity_minted_with_record", budgetMs=300000, steps={
+                {op="assertXp", identityIndex=0, xpType="harness_zero", expect="0"},
+                {op="assertXp", identityIndex=1, xpType="harness_zero", expect="0"},
+                {op="assertCredits", identityIndex=0, bank=true, expect="0"},
+                {op="assertCredits", identityIndex=1, bank=true, expect="0"}}},
+            {name="grant_xp_accepted", budgetMs=300000, steps={
+                {op="grantXp", identityIndex=0, xpType="combat_rangedspecialize_rifle", amount=250},
+                {op="assertXp", identityIndex=0, xpType="combat_rangedspecialize_rifle", expect="250"},
+                {op="assertCounterDelta", counter="awards.accepted", expect="1"},
+                {op="assertSource", identityIndex=0, expect="harness"}}},
+            {name="grant_xp_unknown_identity_rejected", budgetMs=300000, steps={
+                {op="awardUnknownIdentity", identityId=999999999, xpType="harness_unknown", amount=1},
+                {op="assertCounterDelta", counter="rejectedNoRecord", expect="1"},
+                {op="assertRecords", delta=0}}},
+            {name="award_to_non_roster_body_rejected", budgetMs=300000, steps={
+                {op="awardNonRosterBody", xpType="harness_leaked_flag", amount=1},
+                {op="assertCounterDelta", counter="rejectedNoIdentity", expect="1"},
+                {op="assertRecords", delta=0}}},
+            {name="credits_grant_and_spend", budgetMs=300000, steps={
+                {op="grantCredits", identityIndex=0, bank=true, amount=1000},
+                {op="spendCredits", identityIndex=0, bank=true, amount=400},
+                {op="assertCredits", identityIndex=0, bank=true, expect="600"},
+                {op="spendCredits", identityIndex=0, bank=true, amount=1000, expectReject=true},
+                {op="assertCounterDelta", counter="rejectedInsufficient", expect="1"},
+                {op="assertCredits", identityIndex=0, bank=true, expect="600"}}},
+            {name="record_skill", budgetMs=300000, steps={
+                {op="recordSkill", identityIndex=0, xpType="combat_marksman_novice"},
+                {op="recordSkill", identityIndex=0, xpType="combat_marksman_novice"},
+                {op="assertSkill", identityIndex=0, xpType="combat_marksman_novice"}}},
+            {name="body_destroy_respawn_keeps_scalars", budgetMs=300000, steps={
+                {op="destroyBody", identityIndex=0},
+                {op="respawnBody", identityIndex=0},
+                {op="assertXp", identityIndex=0, xpType="combat_rangedspecialize_rifle", expect="250"},
+                {op="assertCredits", identityIndex=0, bank=true, expect="600"}}},
+            {name="flush_and_reload_roundtrip", budgetMs=300000, steps={
+                {op="flushNow", force=true},
+                {op="reloadStore"},
+                {op="assertXp", identityIndex=0, xpType="combat_rangedspecialize_rifle", expect="250"},
+                {op="assertCredits", identityIndex=0, bank=true, expect="600"}}},
+            {name="natural_flush_cadence", budgetMs=300000, steps={
+                {op="grantXp", identityIndex=0, xpType="harness_cadence", amount=10},
+                {op="waitForFlush", budgetMs=180000},
+                {op="reloadStore"},
+                {op="assertXp", identityIndex=0, xpType="harness_cadence", expect="10"}}},
+            {name="retained_record_survives_restart", budgetMs=300000, steps={
+                {op="grantXp", identityIndex=1, xpType="harness_restart", amount=4242, restartPhase="A"},
+                {op="grantCredits", identityIndex=1, bank=true, amount=777, restartPhase="A"},
+                {op="writeRestartProbe", identityIndex=1, restartPhase="A"},
+                {op="flushNow", force=true, restartPhase="A"},
+                {op="assertXp", identityIndex=0, xpType="harness_restart", expect="4242", restartPhase="B"},
+                {op="assertCredits", identityIndex=0, bank=true, expect="777", restartPhase="B"},
+                {op="deleteIdentity", identityIndex=0, restartPhase="B"},
+                {op="runReaper", force=true, restartPhase="B"}}},
+            {name="orphan_counted_not_reaped_gate_off", budgetMs=300000, steps={
+                {op="injectOrphan"},
+                {op="assertCounterDelta", counter="orphanRecords", expect="1"},
+                {op="runReaper", force=false},
+                {op="assertCounterDelta", counter="orphanRecords", expect="1"}}},
+            -- The injected orphan is inherited from the previous scenario, so
+            -- "back to baseline" is an ABSOLUTE zero here, not a zero delta
+            -- (the delta across this scenario is -1).
+            {name="orphan_reaped_gate_on", budgetMs=300000, steps={
+                {op="runReaper", force=true},
+                {op="assertCounterDelta", counter="orphansReaped", expect="1"},
+                {op="assertCounterValue", counter="orphanRecords", expect="0"}}},
+            {name="gate_off_rejects_awards", budgetMs=300000, steps={
+                {op="setGate", expect="false"},
+                {op="grantXp", identityIndex=0, xpType="combat_rangedspecialize_rifle", amount=1, expectReject=true},
+                {op="assertCounterDelta", counter="rejectedDisabled", expect="1"},
+                {op="assertXp", identityIndex=0, xpType="combat_rangedspecialize_rifle", expect="250"}}},
+            {name="harness_cleanup_reaps", budgetMs=300000, steps={
+                {op="mintIdentity"},
+                {op="deleteIdentity", identityIndex=2},
+                {op="assertCounterDelta", counter="orphanRecords", expect="1"},
+                {op="runReaper", force=true},
+                {op="assertStore", records=-1, orphanRecords=0, rosterWithoutRecord=0}}},
+            {name="award_during_flush_persists", budgetMs=300000, steps={
+                {op="injectFault", flushDelayMs=3000},
+                {op="grantXp", identityIndex=0, xpType="harness_flush_rifle", amount=100},
+                {op="flushNow", force=true, async=true, requestRef="flush14"},
+                {op="waitForRequest", requestRef="flush14", phase="started", budgetMs=30000},
+                {op="grantXp", identityIndex=0, xpType="harness_flush_rifle", amount=50},
+                {op="waitForRequest", requestRef="flush14", phase="completed", budgetMs=30000},
+                {op="assertPersisted", identityIndex=0, xpType="harness_flush_rifle", expect="100"},
+                {op="assertDirty", identityIndex=0, expect="true"},
+                {op="flushNow", force=true},
+                {op="assertPersisted", identityIndex=0, xpType="harness_flush_rifle", expect="150"},
+                {op="reloadStore"},
+                {op="assertXp", identityIndex=0, xpType="harness_flush_rifle", expect="150"}}},
+            {name="flush_failure_merge_back_and_recover", budgetMs=300000, steps={
+                {op="injectFault", failNextFlush=true},
+                {op="grantXp", identityIndex=0, xpType="harness_flush_rifle", amount=60},
+                {op="flushNow", force=true},
+                {op="assertCounterDelta", counter="flushFailures", expect="1"},
+                -- Deliberately NOT asserting dbAvailable==false here. That flag is a
+                -- self-healing transient: the re-probe restores it within ~5s by
+                -- design, while the harness observes the flush request through a
+                -- poll that can lag a full maintenance interval, so the false state
+                -- is not reliably observable. Recovery is proven durably below by
+                -- flushFailures+1, the record staying dirty, dbAvailable returning
+                -- true, and the merged value actually reaching SQL.
+                -- assertDirty is omitted here for the same reason: the retained
+                -- dirty id is cleared by the very recovery this scenario waits for.
+                -- Merge-back is proven decisively below instead - if the failed
+                -- flush had DROPPED the +60 rather than re-dirtying it, the
+                -- recovered row would read 150, not 210.
+                {op="waitForFlush", budgetMs=60000},
+                {op="assertCounterValue", counter="dbAvailable", expect="true"},
+                {op="assertPersisted", identityIndex=0, xpType="harness_flush_rifle", expect="210"},
+                {op="reloadStore"},
+                {op="assertXp", identityIndex=0, xpType="harness_flush_rifle", expect="210"}}},
+            {name="partial_mint_repair", budgetMs=300000, steps={
+                {op="mintIdentity"},
+                {op="deleteProgressionRow", identityIndex=3},
+                {op="assertStore", orphanRecords=0, rosterWithoutRecord=1},
+                {op="flushNow", force=true},
+                {op="assertStore", records=-1, orphanRecords=0, rosterWithoutRecord=0},
+                {op="assertXp", identityIndex=3, xpType="harness_partial", expect="0"},
+                {op="reloadStore"},
+                {op="assertXp", identityIndex=3, xpType="harness_partial", expect="0"},
+                {op="assertCounterDelta", counter="createRefusedNotInRoster", expect="0"},
+                {op="deleteIdentity", identityIndex=3},
+                {op="runReaper", force=true}}},
+        },
+    },
+
+    -- P.10a: manager-owned progression ledger. Capability gates added by
+    -- later chunks belong in this block: awardKillXp, awardMissionCredits,
+    -- lootEnabled, groupLoot, trainingEnabled, bazaarSell, and bazaarBuy.
+    -- The foundation is intentionally inert until its live receipt is accepted.
+    playerBotProgression = {
+        enabled = false,
+        flushIntervalSeconds = 60,
+        reaper = {
+            enabled = false,
+            minAgeSeconds = 3600,
+        },
+    },
+
     -- P.8 Phase 2: persistent PvE identity roster, passed spike foundation,
     -- and the player-mimetic solo hunt loop.
     pveConfig = {

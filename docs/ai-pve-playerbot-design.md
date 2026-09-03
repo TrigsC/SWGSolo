@@ -515,3 +515,56 @@ bone carry independent pressure.
 changes. Revert = restore single-family `recordPveHunterHarvest`, drop the two
 `demandStateProfileUsesConceptualLabel` label cases, remove the lua hide/bone
 keys, restore the single-family signal decrement.
+
+## P.10 — PlayerBot player parity (F_0.9.0, the progression store)
+
+The P.10 line is tracked in its own roadmap,
+`docs/1-plans/ROADMAP_p10-playerbot-parity.md`, which holds the nine-chunk
+breakdown (F_0.9.0 store → F_0.9.1 kill XP → F_0.9.2 mission credits →
+F_0.9.3 loot + item vault → F_0.9.4 group dispersal → F_0.9.5 skill training →
+F_0.9.6/F_0.9.7 bazaar → F_0.9.8 allocation policy), the engine-gap analysis
+per capability, and the owner's decisions. This section records only what
+**F_0.9.0 actually built**, because that is the part the PvE line now depends
+on.
+
+**Why a store at all.** A PvE hunter body is an `AiAgent` with no
+`PlayerObject` ghost, and `CLONE_HOME` destroys the body and builds a new one.
+Every engine reward path either writes the ghost (`awardExperience` returns 0
+without one) or gates on `isPlayerCreature()` (`disseminateExperience`,
+loot creation). So player-parity state cannot live on the body at all, and
+anything reachable from an object risks repeating the `simPlayerBot`
+sticky-flag leak that put a stale bot flag on wild creatures.
+
+**What shipped (all gated off).**
+
+- Three MySQL tables keyed by roster identity id — `simbot_progression`
+  (bank/cash credits, skill points, award counters), `simbot_experience`
+  (identity × xp type) and `simbot_skills` (identity × skill), schema
+  1010-1012, all `CREATE TABLE IF NOT EXISTS`.
+- `ensurePlayerBotProgressionRecord` as the **only** creation path, refusing
+  ids absent from the loaded roster, called at roster mint and again from
+  reconciliation to repair a roster identity whose record is missing (the two
+  mint INSERTs are not atomic on MyISAM).
+- An award API — `grantPlayerBotExperience`, `grantPlayerBotCredits`,
+  `spendPlayerBotCredits`, `recordPlayerBotSkill` — with
+  award-requires-record semantics, plus `resolvePlayerBotIdentity(bodyOid)`
+  which consults only `pveBodyIdentityIds` and therefore returns 0 for a
+  leaked-flag creature. **No production caller ships in F_0.9.0**; the hunter
+  loop pays exactly what it paid before.
+- An atomic-swap flush (per-record retirement, merge-back on failure, bounded
+  `SELECT 1` re-probe), reconciliation with `orphanRecords` /
+  `rosterWithoutRecord` counters, and a default-off orphan reaper.
+- One SQL lane: everything runs on the PvE maintenance task, which gained a
+  `scheduled/running/rerunPending` state machine and `kickPveMaintenanceNow()`.
+- The `playerBotParityTest` harness — 18 scenarios, a `SimParityTestController`
+  body attached through the normal identity-body path, and a two-boot restart
+  probe — plus the `playerBotProgression` dashboard section.
+
+**What the PvE line should know going forward.** Hunters and miners are
+unaffected while the gates are off: `governPvePopulation`, the matchmaker and
+the `maxHunters` count now filter on `profession == "hunter"`, which is a no-op
+for the all-hunter roster and is what keeps harness identities out of the hunt
+loop. When F_0.9.1 lands, kill XP is credited from the corpse's `ThreatMap`
+(which already keys every attacker's damage by the weapon's XP type) at the
+`CreatureManager::notifyDestruction` chokepoint — the same place
+`disseminateExperience` runs for players.

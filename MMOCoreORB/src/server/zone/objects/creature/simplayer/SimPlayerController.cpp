@@ -5293,6 +5293,26 @@ void SimTraversalTestController::onTick() {
             agent->getObjectID());
 }
 
+// ========================================================
+// PLAYERBOT PARITY SCENARIO CONTROLLER
+// ========================================================
+
+SimParityTestController::SimParityTestController(AiAgent* aiAgent)
+        : SimPlayerController(aiAgent) {
+    setLoggingName("SimParityTestController");
+}
+
+SimParityTestController::~SimParityTestController() {
+}
+
+void SimParityTestController::startSimLoop() {
+    state = WAITING;
+}
+
+void SimParityTestController::onArrived() {
+    state = WAITING;
+}
+
 void SimTraversalTestController::issueResolvedStep(
         const StructureTraversalTestStep& step, Vector3 targetWorld,
         Vector3 targetLocal, CellObject* targetCell) {

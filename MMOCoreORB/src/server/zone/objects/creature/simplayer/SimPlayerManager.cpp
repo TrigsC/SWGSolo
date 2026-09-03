@@ -10,6 +10,9 @@
 #include "StructureTraversalDiagLog.h"
 
 #include <cmath>
+#include <cstdio>
+#include <fstream>
+#include <sstream>
 
 #include "server/db/ServerDatabase.h"
 #include "server/utils/LambdaObserverFunction.h"
@@ -79,6 +82,7 @@
 #include "templates/mobile/LairTemplate.h"
 #include "server/zone/TreeEntry.h"
 #include "system/thread/ReadLocker.h"
+#include "system/thread/Thread.h"
 
 #define DEBUG_SIMPLAYER
 
@@ -315,6 +319,20 @@ public:
     void run() override {
         SimPlayerManager::instance()->runStructureTraversalTestRunner();
     }
+};
+
+class PlayerBotParityTestSpawnTask : public Task {
+public:
+	void run() override {
+		SimPlayerManager::instance()->schedulePlayerBotParityTestRunner(0);
+	}
+};
+
+class PlayerBotParityTestRunnerTask : public Task {
+public:
+	void run() override {
+		SimPlayerManager::instance()->runPlayerBotParityTestRunner();
+	}
 };
 
 class StructureTraversalTestAttackerDespawnTask : public Task {
@@ -5854,6 +5872,11 @@ void SimPlayerManager::initialize() {
         scheduleStructureTraversalTestSpawn(
             configuredSpawnStartupDelaySeconds * 1000);
 
+    if (playerBotParityTestEnabled && progressionEnabled &&
+            playerBotParityTestScenarios.size() > 0)
+        schedulePlayerBotParityTestSpawn(
+            playerBotParityTestStartupDelaySeconds * 1000);
+
     scheduleConfiguredSpawnTask(0, 0, configuredSpawnStartupDelaySeconds * 1000);
     scheduleMinerSummaryTask();
     scheduleResourceIntelligenceTask();
@@ -6116,7 +6139,73 @@ void SimPlayerManager::loadLuaConfig() {
 	pveRosterLoaded = false;
 	pveDatabaseAvailable = false;
 	pveBootReady = false;
-	pveMaintenanceTaskScheduled = false;
+	progressionEnabled = false;
+	progressionLoaded = false;
+	progressionDbAvailable = false;
+	progressionLastFlushMs = 0;
+	progressionNextDbProbeMs = 0;
+	progressionDbProbeBackoffMs = 5000;
+	progressionFlushIntervalSeconds = 60;
+	progressionReaperEnabled = false;
+	progressionReaperMinAgeSeconds = 3600;
+	progressionFaultFlushDelayMs = 0;
+	progressionFaultFailNextFlush = false;
+	{
+		Locker progressionLock(&progressionMutex);
+		progressionRecords.removeAll();
+		progressionDirtyIds.removeAll();
+		progressionOrphanIds.removeAll();
+	}
+	{
+		Locker requestLock(&progressionRequestMutex);
+		progressionRequests.removeAll();
+		progressionNextRequestId = 1;
+	}
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityTestScenarios.removeAll();
+		playerBotParityTestResults.removeAll();
+		playerBotParityTestScenarioOrder.removeAll();
+		playerBotParityTestIdentityIds.removeAll();
+		playerBotParityTestBodyOids.removeAll();
+		playerBotParityTestOracle.removeAll();
+		playerBotParityTestRequestRefs.removeAll();
+		playerBotParityTestCounterBaselines.removeAll();
+		playerBotParityTestScenarioIndex = 0;
+		playerBotParityTestStepCursor = 0;
+		playerBotParityTestSetupCursor = 0;
+		playerBotParityTestSpawnCursor = 0;
+		playerBotParityTestCleanupCursor = 0;
+		playerBotParityTestScenarioActive = false;
+		playerBotParityTestOracleInitialized = false;
+		playerBotParityTestRunnerScheduled = false;
+		playerBotParityTestRunnerRunning = false;
+		playerBotParityTestRunnerRerunPending = false;
+		playerBotParityTestCleanupActive = false;
+		playerBotParityTestCleanupPreserveProbe = false;
+		playerBotParityTestPendingRequestId = 0;
+		playerBotParityTestSetupRequestActive = false;
+		playerBotParityTestCleanupReaperQueued = false;
+		playerBotParityTestBootInitialized = false;
+		playerBotParityTestAwaitingRestart = false;
+		playerBotParityTestCompleted = false;
+		playerBotParityTestEnabled = false;
+		playerBotParityTestStaleRowsScanned = false;
+		playerBotParityTestPhaseAFileWritten = false;
+		playerBotParityTestPhaseAFileInvalid = false;
+		playerBotParityTestProbeIdentityId = 0;
+		playerBotParityTestPhase = "A";
+		playerBotParityTestRunId = "";
+	}
+	{
+		Locker stateLock(&pveMaintenanceStateMutex);
+		pveMaintenanceScheduled = false;
+		pveMaintenanceRunning = false;
+		pveMaintenanceRerunPending = false;
+		pveMaintenanceArmedTask = nullptr;
+		pveMaintenanceLastEntryMs = 0;
+	}
+	pveMaintenanceTicksTotal = 0;
 	pveLastRosterFlushMs = 0;
 	{
 		Locker pveLock(&pveMutex);
@@ -7253,6 +7342,18 @@ void SimPlayerManager::loadLuaConfig() {
 		applyPveConfig(pveConfig);
 	pveConfig.pop();
 
+	LuaObject playerBotProgressionConfig = config.getObjectField(
+		"playerBotProgression");
+	if (playerBotProgressionConfig.isValidTable())
+		applyPlayerBotProgressionConfig(playerBotProgressionConfig);
+	playerBotProgressionConfig.pop();
+
+	LuaObject playerBotParityTestConfig = config.getObjectField(
+		"playerBotParityTest");
+	if (playerBotParityTestConfig.isValidTable())
+		applyPlayerBotParityTestConfig(playerBotParityTestConfig);
+	playerBotParityTestConfig.pop();
+
     LuaObject presentationConfig =
         config.getObjectField("presentationConfig");
     if (presentationConfig.isValidTable())
@@ -7454,6 +7555,206 @@ static uint32 pveTrackedBuffCrcForAttribute(uint8 attribute) {
 	if (attribute == CreatureAttribute::WILLPOWER)
 		return BuffCRC::PERFORMANCE_ENHANCE_MUSIC_WILLPOWER;
 	return 0;
+}
+
+void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
+	progressionEnabled = config.getBooleanField("enabled", progressionEnabled);
+	progressionFlushIntervalSeconds = clampMinerInt(
+		config.getIntField("flushIntervalSeconds",
+			progressionFlushIntervalSeconds), progressionFlushIntervalSeconds,
+		5, 3600);
+
+	LuaObject reaper = config.getObjectField("reaper");
+	if (reaper.isValidTable()) {
+		progressionReaperEnabled = reaper.getBooleanField(
+			"enabled", progressionReaperEnabled);
+		progressionReaperMinAgeSeconds = clampMinerInt(
+			reaper.getIntField("minAgeSeconds", progressionReaperMinAgeSeconds),
+			progressionReaperMinAgeSeconds, 1, 86400 * 30);
+	}
+	reaper.pop();
+}
+
+static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
+	PlayerBotParityTestStep step;
+	step.op = table.getStringField("op").trim();
+	step.identityIndex = table.getIntField("identityIndex", -1);
+	step.identityId = table.getLongField("identityId", 0);
+	step.xpType = table.getStringField("xpType").trim();
+	step.amount = table.getLongField("amount", 0);
+	step.expect = table.getStringField("expect").trim();
+	// LuaObject::getStringField's default-value argument cannot be relied on: on a
+	// nil field it sets the pointer to the default but leaves the length at 0, so
+	// String(result, size) yields "". Read it plainly and apply the fallback here.
+	step.source = table.getStringField("source").trim();
+	if (step.source.isEmpty())
+		step.source = "harness";
+	step.bank = table.getBooleanField("bank", false);
+	step.expectReject = table.getBooleanField("expectReject", false);
+	step.force = table.getBooleanField("force", false);
+	step.flushDelayMs = table.getIntField("flushDelayMs", 0);
+	step.failNextFlush = table.getBooleanField("failNextFlush", false);
+	step.budgetMs = table.getIntField("budgetMs", 0);
+	step.async = table.getBooleanField("async", false);
+	step.requestRef = table.getStringField("requestRef").trim();
+	step.phase = table.getStringField("phase").trim();
+	step.restartPhase = table.getStringField("restartPhase").trim();
+	step.counter = table.getStringField("counter").trim();
+	const int absentExpected = -2147483647;
+	step.expectedRecords = table.getIntField("records", absentExpected);
+	step.hasExpectedRecords = step.expectedRecords != absentExpected;
+	if (!step.hasExpectedRecords)
+		step.expectedRecords = -1;
+	step.expectedOrphanRecords = table.getIntField("orphanRecords",
+		absentExpected);
+	step.hasExpectedOrphanRecords = step.expectedOrphanRecords != absentExpected;
+	if (!step.hasExpectedOrphanRecords)
+		step.expectedOrphanRecords = -1;
+	step.expectedRosterWithoutRecord = table.getIntField("rosterWithoutRecord",
+		absentExpected);
+	step.hasExpectedRosterWithoutRecord =
+		step.expectedRosterWithoutRecord != absentExpected;
+	if (!step.hasExpectedRosterWithoutRecord)
+		step.expectedRosterWithoutRecord = -1;
+	step.expectedDelta = table.getLongField("delta", 0);
+	step.requestBudgetMs = table.getIntField("requestBudgetMs", 30000);
+	if (step.requestBudgetMs < 100)
+		step.requestBudgetMs = 100;
+	return step;
+}
+
+void SimPlayerManager::initializePlayerBotParityTestResults() {
+	Locker parityLock(&playerBotParityTestMutex);
+	playerBotParityTestResults.removeAll();
+	for (int i = 0; i < playerBotParityTestScenarios.size(); ++i) {
+		PlayerBotParityTestScenarioResult result;
+		result.name = playerBotParityTestScenarios.get(i).name;
+		for (int j = 0; j < playerBotParityTestScenarios.get(i).steps.size(); ++j) {
+			PlayerBotParityTestStepResult stepResult;
+			stepResult.op = playerBotParityTestScenarios.get(i).steps.get(j).op;
+			stepResult.identityIndex = playerBotParityTestScenarios.get(i).
+				steps.get(j).identityIndex;
+			result.steps.add(stepResult);
+		}
+		playerBotParityTestResults.add(result);
+	}
+	playerBotParityTestScenarioOrder.removeAll();
+	int retainedIndex = -1;
+	for (int i = 0; i < playerBotParityTestScenarios.size(); ++i) {
+		if (playerBotParityTestScenarios.get(i).name ==
+				"retained_record_survives_restart")
+			retainedIndex = i;
+		else
+			playerBotParityTestScenarioOrder.add(i);
+	}
+	if (retainedIndex >= 0)
+		playerBotParityTestScenarioOrder.add(retainedIndex);
+	playerBotParityTestScenarioIndex = 0;
+	playerBotParityTestStepCursor = 0;
+	playerBotParityTestSetupCursor = 0;
+	playerBotParityTestSpawnCursor = 0;
+	playerBotParityTestCleanupCursor = 0;
+	playerBotParityTestScenarioActive = false;
+	playerBotParityTestOracleInitialized = false;
+	playerBotParityTestCleanupActive = false;
+	playerBotParityTestCleanupPreserveProbe = false;
+	playerBotParityTestPendingRequestId = 0;
+	playerBotParityTestSetupRequestActive = false;
+	playerBotParityTestCompleted = false;
+	playerBotParityTestAwaitingRestart = false;
+	playerBotParityTestBootInitialized = false;
+	playerBotParityTestPhaseAFileWritten = false;
+	playerBotParityTestPhaseAFileInvalid = false;
+	playerBotParityTestPhase = "A";
+	playerBotParityTestProbeIdentityId = 0;
+	playerBotParityTestRunId = String::valueOf(System::getMiliTime());
+}
+
+void SimPlayerManager::applyPlayerBotParityTestConfig(LuaObject& config) {
+	bool hadConfiguredScenarios = false;
+	bool currentEnabled = false;
+	String currentPlanet;
+	Vector3 currentSpawn;
+	int currentIdentityCount = 2;
+	int currentStartupDelaySeconds = 60;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		hadConfiguredScenarios = playerBotParityTestScenarios.size() > 0;
+		currentEnabled = playerBotParityTestEnabled;
+		currentPlanet = playerBotParityTestPlanet;
+		currentSpawn = playerBotParityTestSpawn;
+		currentIdentityCount = playerBotParityTestIdentityCount;
+		currentStartupDelaySeconds = playerBotParityTestStartupDelaySeconds;
+	}
+
+	bool parsedEnabled = config.getBooleanField("enabled", currentEnabled);
+	// Same nil-default caveat as the step parser above.
+	String parsedPlanet = config.getStringField("planet").trim();
+	if (parsedPlanet.isEmpty())
+		parsedPlanet = currentPlanet;
+	int parsedIdentityCount = clampMinerInt(
+		config.getIntField("identityCount", currentIdentityCount),
+		currentIdentityCount, 1, 8);
+	int parsedStartupDelaySeconds = clampMinerInt(
+		config.getIntField("startupDelaySeconds", currentStartupDelaySeconds),
+		currentStartupDelaySeconds, 0, 3600);
+	Vector3 parsedSpawn = currentSpawn;
+
+	LuaObject spawn = config.getObjectField("spawn");
+	if (spawn.isValidTable()) {
+		parsedSpawn.setX(spawn.getFloatField("x", parsedSpawn.getX()));
+		parsedSpawn.setY(spawn.getFloatField("y", parsedSpawn.getY()));
+		parsedSpawn.setZ(spawn.getFloatField("z", parsedSpawn.getZ()));
+	}
+	spawn.pop();
+
+	Vector<PlayerBotParityTestScenario> parsedScenarios;
+	LuaObject scenarios = config.getObjectField("scenarios");
+	if (scenarios.isValidTable()) {
+		for (int i = 1; i <= scenarios.getTableSize(); ++i) {
+			LuaObject scenarioTable = scenarios.getObjectAt(i);
+			if (!scenarioTable.isValidTable()) {
+				scenarioTable.pop();
+				continue;
+			}
+			PlayerBotParityTestScenario scenario;
+			scenario.name = scenarioTable.getStringField("name").trim();
+			scenario.budgetMs = clampMinerInt(scenarioTable.getIntField(
+				"budgetMs", scenario.budgetMs), scenario.budgetMs, 1000,
+				7200000);
+			LuaObject steps = scenarioTable.getObjectField("steps");
+			if (steps.isValidTable()) {
+				for (int j = 1; j <= steps.getTableSize(); ++j) {
+					LuaObject stepTable = steps.getObjectAt(j);
+					if (stepTable.isValidTable())
+						scenario.steps.add(parsePlayerBotParityTestStep(stepTable));
+					stepTable.pop();
+				}
+			}
+			steps.pop();
+			if (!scenario.name.isEmpty() && scenario.steps.size() > 0)
+				parsedScenarios.add(scenario);
+			scenarioTable.pop();
+		}
+	}
+	scenarios.pop();
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityTestEnabled = parsedEnabled;
+		playerBotParityTestPlanet = parsedPlanet;
+		playerBotParityTestSpawn = parsedSpawn;
+		playerBotParityTestIdentityCount = parsedIdentityCount;
+		playerBotParityTestStartupDelaySeconds = parsedStartupDelaySeconds;
+		// Preserve a live matrix, including per-step request state, across
+		// periodic Lua refreshes. A new matrix is loaded on the next boot.
+		if (!hadConfiguredScenarios)
+			playerBotParityTestScenarios = parsedScenarios;
+	}
+	// PVP maintenance refreshes the shared Lua file periodically. Preserve a
+	// live harness cursor/results across that refresh; the initial load is the
+	// only parse that initializes the matrix state.
+	if (!hadConfiguredScenarios)
+		initializePlayerBotParityTestResults();
 }
 
 void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
@@ -8471,7 +8772,7 @@ void SimPlayerManager::recordSimPresenceSpawn(uint64 oid) {
 }
 
 void SimPlayerManager::schedulePveFoundationMaintenanceTask() {
-	if (!enabled || !pveEnabled || pveMaintenanceTaskScheduled)
+	if (!enabled || !pveEnabled)
 		return;
 
 	// A live spike samples a fast-moving world (a lair creature wanders/dies
@@ -8486,10 +8787,92 @@ void SimPlayerManager::schedulePveFoundationMaintenanceTask() {
 			intervalSeconds = 2;
 	}
 
-	pveMaintenanceTaskScheduled = true;
+	Locker stateLock(&pveMaintenanceStateMutex);
+	if (pveMaintenanceScheduled || pveMaintenanceRunning)
+		return;
+
 	Reference<SimPveFoundationMaintenanceTask*> task =
 		new SimPveFoundationMaintenanceTask();
+	pveMaintenanceArmedTask = task;
+	pveMaintenanceScheduled = true;
+	// Schedule while the state lock is held. This closes the small window in
+	// which a kick could observe an armed-but-not-yet-scheduled task.
 	task->schedule(intervalSeconds * 1000);
+}
+
+void SimPlayerManager::kickPveMaintenanceNow() {
+	if (!enabled || !pveEnabled)
+		return;
+
+	pveMaintenanceKicksRequested.increment();
+
+	Locker stateLock(&pveMaintenanceStateMutex);
+	if (pveMaintenanceRunning) {
+		// A body is mid-flight; it consumes rerunPending at exit.
+		pveMaintenanceRerunPending = true;
+		pveMaintenanceKicksDeferred.increment();
+		return;
+	}
+
+	if (pveMaintenanceScheduled) {
+		Reference<SimPveFoundationMaintenanceTask*> armedTask =
+			pveMaintenanceArmedTask;
+		if (armedTask != nullptr && armedTask->cancel()) {
+			pveMaintenanceScheduled = false;
+			pveMaintenanceArmedTask = nullptr;
+		} else {
+			// The task has already left the scheduler queue and its body is
+			// about to enter; that body consumes rerunPending at exit.
+			pveMaintenanceRerunPending = true;
+			pveMaintenanceKicksDeferred.increment();
+			return;
+		}
+	}
+
+	Reference<SimPveFoundationMaintenanceTask*> task =
+		new SimPveFoundationMaintenanceTask();
+	pveMaintenanceArmedTask = task;
+	pveMaintenanceScheduled = true;
+	pveMaintenanceKicksImmediate.increment();
+	task->schedule(0);
+}
+
+void SimPlayerManager::completePveFoundationMaintenanceTask(uint64 entryMs) {
+	uint64 nowMs = System::getMiliTime();
+	int intervalSeconds = pveMaintenanceIntervalSeconds;
+	{
+		Locker pveLock(&pveMutex);
+		bool spikeActive = pveSpikeEnabled && pveSpike.startedAtMs != 0 &&
+			pveSpike.phase != "DONE";
+		if (spikeActive && intervalSeconds > 2)
+			intervalSeconds = 2;
+	}
+
+	Reference<SimPveFoundationMaintenanceTask*> successor;
+	uint64 delayMs = 0;
+
+	{
+		Locker stateLock(&pveMaintenanceStateMutex);
+		pveMaintenanceRunning = false;
+
+		if (!enabled || !pveEnabled)
+			return;
+
+		bool rerun = pveMaintenanceRerunPending;
+		pveMaintenanceRerunPending = false;
+		if (rerun) {
+			delayMs = 0;
+		} else {
+			uint64 intervalMs = static_cast<uint64>(intervalSeconds) * 1000;
+			uint64 dueMs = entryMs + intervalMs;
+			delayMs = dueMs > nowMs ? dueMs - nowMs : 0;
+		}
+
+		successor = new SimPveFoundationMaintenanceTask();
+		pveMaintenanceArmedTask = successor;
+		pveMaintenanceScheduled = true;
+		successor->schedule(delayMs);
+	}
 }
 
 static String pveRosterResultString(ResultSet* result, int index) {
@@ -8503,6 +8886,2574 @@ static String pveSqlValue(const String& value) {
 
 	String escaped = value.escapeString();
 	return "'" + escaped + "'";
+}
+
+static String progressionAwardSource(const String& source) {
+	String bounded = source.trim();
+	if (bounded.length() > 32)
+		bounded = bounded.subString(0, 32);
+	return bounded;
+}
+
+static SimBotProgression progressionFromResult(ResultSet* result) {
+	SimBotProgression progression;
+	progression.identityId = result->getUnsignedLong(0);
+	progression.bankCredits = result->getLong(1);
+	progression.cashCredits = result->getLong(2);
+	progression.skillPointsSpent = result->getInt(3);
+	progression.awardsTotal = result->getUnsignedLong(4);
+	progression.lastAwardSource = pveRosterResultString(result, 5);
+	progression.createdAt = pveRosterResultString(result, 6);
+	progression.updatedAt = pveRosterResultString(result, 7);
+	return progression;
+}
+
+void SimPlayerManager::loadPlayerBotProgressionStore() {
+	if (!progressionEnabled || progressionLoaded || !pveRosterLoaded ||
+			!pveDatabaseAvailable)
+		return;
+
+	uint64 nowMs = System::getMiliTime();
+	if (progressionNextDbProbeMs != 0 && nowMs < progressionNextDbProbeMs)
+		return;
+
+	try {
+		UniqueReference<ResultSet*> parentResult(
+			ServerDatabase::instance()->executeQuery(
+				"SELECT `identity_id`,`bank_credits`,`cash_credits`,"
+				"`skill_points_spent`,`awards_total`,`last_award_source`,"
+				"`created_at`,`updated_at` FROM `simbot_progression` "
+				"ORDER BY `identity_id`;"));
+		if (parentResult == nullptr)
+			throw Exception("progression parent query returned no result");
+
+		VectorMap<uint64, SimBotProgression> loaded;
+		while (parentResult->next()) {
+			SimBotProgression progression =
+				progressionFromResult(parentResult);
+			loaded.put(progression.identityId, progression);
+		}
+
+		UniqueReference<ResultSet*> experienceResult(
+			ServerDatabase::instance()->executeQuery(
+				"SELECT `identity_id`,`xp_type`,`amount` FROM "
+				"`simbot_experience` ORDER BY `identity_id`,`xp_type`;"));
+		if (experienceResult == nullptr)
+			throw Exception("progression experience query returned no result");
+		while (experienceResult->next()) {
+			uint64 identityId = experienceResult->getUnsignedLong(0);
+			String xpType = pveRosterResultString(experienceResult, 1);
+			if (loaded.contains(identityId) && !xpType.isEmpty())
+				loaded.get(identityId).experience.put(xpType,
+					experienceResult->getInt(2));
+		}
+
+		UniqueReference<ResultSet*> skillResult(
+			ServerDatabase::instance()->executeQuery(
+				"SELECT `identity_id`,`skill_name` FROM `simbot_skills` "
+				"ORDER BY `identity_id`,`skill_name`;"));
+		if (skillResult == nullptr)
+			throw Exception("progression skill query returned no result");
+		while (skillResult->next()) {
+			uint64 identityId = skillResult->getUnsignedLong(0);
+			String skillName = pveRosterResultString(skillResult, 1);
+			if (loaded.contains(identityId) && !skillName.isEmpty() &&
+					!loaded.get(identityId).skills.contains(skillName))
+				loaded.get(identityId).skills.add(skillName);
+		}
+
+		{
+			Locker progressionLock(&progressionMutex);
+			progressionRecords = loaded;
+			progressionDirtyIds.removeAll();
+			progressionOrphanIds.removeAll();
+		}
+
+		progressionLoaded = true;
+		progressionDbAvailable = true;
+		progressionNextDbProbeMs = 0;
+		progressionDbProbeBackoffMs = 5000;
+		reconcilePlayerBotProgression();
+		info("SimPlayerProgressionStoreLoaded records=" +
+			String::valueOf(loaded.size()), true);
+	} catch (const Exception& e) {
+		progressionDbAvailable = false;
+		progressionNextDbProbeMs = nowMs + progressionDbProbeBackoffMs;
+		progressionDbProbeBackoffMs = Math::min<uint64>(
+			progressionDbProbeBackoffMs * 2, 300000);
+		error("SimPlayerProgressionStoreLoadFailed: " + e.getMessage());
+	}
+}
+
+bool SimPlayerManager::ensurePlayerBotProgressionRecord(uint64 identityId) {
+	if (!progressionEnabled || !progressionLoaded || !progressionDbAvailable ||
+			!pveRosterLoaded || identityId == 0)
+		return false;
+
+	bool inRoster = false;
+	{
+		Locker pveLock(&pveMutex);
+		inRoster = pveIdentities.contains(identityId);
+	}
+	if (!inRoster) {
+		progressionCreateRefusedNotInRoster.increment();
+		return false;
+	}
+
+	{
+		Locker progressionLock(&progressionMutex);
+		if (progressionRecords.contains(identityId))
+			return true;
+	}
+
+	try {
+		String insert = "INSERT IGNORE INTO `simbot_progression` "
+			"(`identity_id`,`created_at`,`updated_at`) VALUES (" +
+			String::valueOf(identityId) + ",NOW(),NOW());";
+		UniqueReference<ResultSet*> insertResult(
+			ServerDatabase::instance()->executeQuery(insert));
+		(void)insertResult;
+
+		SimBotProgression progression;
+		UniqueReference<ResultSet*> parentResult(
+			ServerDatabase::instance()->executeQuery(
+				"SELECT `identity_id`,`bank_credits`,`cash_credits`,"
+				"`skill_points_spent`,`awards_total`,`last_award_source`,"
+				"`created_at`,`updated_at` FROM `simbot_progression` WHERE "
+				"`identity_id`=" + String::valueOf(identityId) + " LIMIT 1;"));
+		if (parentResult == nullptr || !parentResult->next())
+			throw Exception("progression record was not visible after insert");
+		progression = progressionFromResult(parentResult);
+
+		UniqueReference<ResultSet*> experienceResult(
+			ServerDatabase::instance()->executeQuery(
+				"SELECT `xp_type`,`amount` FROM `simbot_experience` WHERE "
+				"`identity_id`=" + String::valueOf(identityId) + ";"));
+		if (experienceResult != nullptr) {
+			while (experienceResult->next()) {
+				String xpType = pveRosterResultString(experienceResult, 0);
+				if (!xpType.isEmpty())
+					progression.experience.put(xpType,
+						experienceResult->getInt(1));
+			}
+		}
+
+		UniqueReference<ResultSet*> skillResult(
+			ServerDatabase::instance()->executeQuery(
+				"SELECT `skill_name` FROM `simbot_skills` WHERE "
+				"`identity_id`=" + String::valueOf(identityId) + ";"));
+		if (skillResult != nullptr) {
+			while (skillResult->next()) {
+				String skillName = pveRosterResultString(skillResult, 0);
+				if (!skillName.isEmpty() &&
+						!progression.skills.contains(skillName))
+					progression.skills.add(skillName);
+			}
+		}
+
+		Locker progressionLock(&progressionMutex);
+		if (!progressionRecords.contains(identityId))
+			progressionRecords.put(identityId, progression);
+		return true;
+	} catch (const Exception& e) {
+		uint64 nowMs = System::getMiliTime();
+		progressionDbAvailable = false;
+		progressionNextDbProbeMs = nowMs + progressionDbProbeBackoffMs;
+		progressionDbProbeBackoffMs = Math::min<uint64>(
+			progressionDbProbeBackoffMs * 2, 300000);
+		error("SimPlayerProgressionRecordCreateFailed: " + e.getMessage());
+		return false;
+	}
+}
+
+bool SimPlayerManager::playerBotProgressionAwardGateEnabled() {
+	if (!progressionEnabled)
+		return false;
+	Locker parityLock(&playerBotParityTestMutex);
+	if (playerBotParityTestGateOverrideActive)
+		return playerBotParityTestGateOverride;
+	return true;
+}
+
+bool SimPlayerManager::grantPlayerBotExperience(uint64 identityId,
+		const String& xpType, int amount, const String& source, int* awarded) {
+	if (awarded != nullptr)
+		*awarded = 0;
+	if (!playerBotProgressionAwardGateEnabled()) {
+		progressionAwardsRejectedDisabled.increment();
+		return false;
+	}
+	if (identityId == 0) {
+		progressionAwardsRejectedNoIdentity.increment();
+		return false;
+	}
+
+	Locker progressionLock(&progressionMutex);
+	if (!progressionRecords.contains(identityId)) {
+		progressionAwardsRejectedNoRecord.increment();
+		return false;
+	}
+
+	String normalizedType = xpType.trim();
+	if (normalizedType.isEmpty() || amount <= 0) {
+		progressionAwardsRejectedInvalidAmount.increment();
+		return false;
+	}
+
+	SimBotProgression& progression = progressionRecords.get(identityId);
+	int current = progression.experience.contains(normalizedType) ?
+		progression.experience.get(normalizedType) : 0;
+	if (amount > 0 && current > 2147483647 - amount) {
+		progressionAwardsRejectedInvalidAmount.increment();
+		return false;
+	}
+	progression.experience.put(normalizedType, current + amount);
+	progression.lastAwardMs = System::getMiliTime();
+	progression.lastAwardSource = progressionAwardSource(source);
+	progression.awardsTotal++;
+	progressionDirtyIds.put(identityId, true);
+	progressionAwardsAccepted.increment();
+	if (awarded != nullptr)
+		*awarded = amount;
+	return true;
+}
+
+bool SimPlayerManager::grantPlayerBotCredits(uint64 identityId, int64 amount,
+		bool bank, const String& source) {
+	if (!playerBotProgressionAwardGateEnabled()) {
+		progressionAwardsRejectedDisabled.increment();
+		return false;
+	}
+	if (identityId == 0) {
+		progressionAwardsRejectedNoIdentity.increment();
+		return false;
+	}
+	Locker progressionLock(&progressionMutex);
+	if (!progressionRecords.contains(identityId)) {
+		progressionAwardsRejectedNoRecord.increment();
+		return false;
+	}
+	if (amount <= 0) {
+		progressionAwardsRejectedInvalidAmount.increment();
+		return false;
+	}
+
+	SimBotProgression& progression = progressionRecords.get(identityId);
+	if (bank)
+		progression.bankCredits += amount;
+	else
+		progression.cashCredits += amount;
+	progression.lastAwardMs = System::getMiliTime();
+	progression.lastAwardSource = progressionAwardSource(source);
+	progression.awardsTotal++;
+	progressionDirtyIds.put(identityId, true);
+	progressionAwardsAccepted.increment();
+	return true;
+}
+
+bool SimPlayerManager::spendPlayerBotCredits(uint64 identityId, int64 amount,
+		bool bank, const String& source) {
+	if (!playerBotProgressionAwardGateEnabled()) {
+		progressionAwardsRejectedDisabled.increment();
+		return false;
+	}
+	if (identityId == 0) {
+		progressionAwardsRejectedNoIdentity.increment();
+		return false;
+	}
+	Locker progressionLock(&progressionMutex);
+	if (!progressionRecords.contains(identityId)) {
+		progressionAwardsRejectedNoRecord.increment();
+		return false;
+	}
+	if (amount <= 0) {
+		progressionAwardsRejectedInvalidAmount.increment();
+		return false;
+	}
+
+	SimBotProgression& progression = progressionRecords.get(identityId);
+	int64& balance = bank ? progression.bankCredits : progression.cashCredits;
+	if (balance < amount) {
+		progressionAwardsRejectedInsufficient.increment();
+		return false;
+	}
+	balance -= amount;
+	progression.lastAwardMs = System::getMiliTime();
+	progression.lastAwardSource = progressionAwardSource(source);
+	progression.awardsTotal++;
+	progressionDirtyIds.put(identityId, true);
+	progressionAwardsAccepted.increment();
+	return true;
+}
+
+bool SimPlayerManager::recordPlayerBotSkill(uint64 identityId,
+		const String& skillName, const String& source) {
+	if (!playerBotProgressionAwardGateEnabled()) {
+		progressionAwardsRejectedDisabled.increment();
+		return false;
+	}
+	if (identityId == 0) {
+		progressionAwardsRejectedNoIdentity.increment();
+		return false;
+	}
+	Locker progressionLock(&progressionMutex);
+	if (!progressionRecords.contains(identityId)) {
+		progressionAwardsRejectedNoRecord.increment();
+		return false;
+	}
+
+	String normalizedSkill = skillName.trim();
+	if (normalizedSkill.isEmpty()) {
+		progressionAwardsRejectedInvalidAmount.increment();
+		return false;
+	}
+
+	SimBotProgression& progression = progressionRecords.get(identityId);
+	if (progression.skills.contains(normalizedSkill))
+		return true;
+	progression.skills.add(normalizedSkill);
+	progression.lastAwardMs = System::getMiliTime();
+	progression.lastAwardSource = progressionAwardSource(source);
+	progression.awardsTotal++;
+	progressionDirtyIds.put(identityId, true);
+	progressionAwardsAccepted.increment();
+	return true;
+}
+
+uint64 SimPlayerManager::resolvePlayerBotIdentity(uint64 bodyOid) {
+	if (bodyOid == 0)
+		return 0;
+	Locker pveLock(&pveMutex);
+	return pveBodyIdentityIds.contains(bodyOid) ?
+		pveBodyIdentityIds.get(bodyOid) : 0;
+}
+
+bool SimPlayerManager::snapshotPlayerBotProgression(uint64 identityId,
+		SimBotProgression& out) {
+	Locker progressionLock(&progressionMutex);
+	if (!progressionRecords.contains(identityId))
+		return false;
+	out = progressionRecords.get(identityId);
+	return true;
+}
+
+void SimPlayerManager::reconcilePlayerBotProgression() {
+	if (!progressionEnabled || !progressionLoaded)
+		return;
+
+	// Keyed rather than linear: this runs after every flush and the roster is
+	// meant to reach hundreds of identities, where a nested scan would be the
+	// O(n^2)-per-tick pattern ARCHI warns about for this manager.
+	VectorMap<uint64, bool> rosterIds;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < pveIdentities.size(); ++i)
+			rosterIds.put(pveIdentities.elementAt(i).getKey(), true);
+	}
+
+	Vector<uint64> missingIds;
+	Vector<uint64> orphanIds;
+	{
+		Locker progressionLock(&progressionMutex);
+		for (int i = 0; i < progressionRecords.size(); ++i) {
+			uint64 identityId = progressionRecords.elementAt(i).getKey();
+			if (!rosterIds.contains(identityId))
+				orphanIds.add(identityId);
+		}
+		for (int i = 0; i < rosterIds.size(); ++i) {
+			uint64 identityId = rosterIds.elementAt(i).getKey();
+			if (!progressionRecords.contains(identityId))
+				missingIds.add(identityId);
+		}
+		progressionOrphanIds = orphanIds;
+		progressionOrphanRecords = orphanIds.size();
+		progressionRosterWithoutRecord = missingIds.size();
+	}
+
+	for (int i = 0; i < missingIds.size(); ++i)
+		ensurePlayerBotProgressionRecord(missingIds.get(i));
+
+	// Repair is immediate from the dashboard's perspective when the INSERTs
+	// succeed, while a database outage leaves the transient deficit visible.
+	{
+		Locker progressionLock(&progressionMutex);
+		int remaining = 0;
+		for (int i = 0; i < rosterIds.size(); ++i) {
+			if (!progressionRecords.contains(rosterIds.elementAt(i).getKey()))
+				++remaining;
+		}
+		progressionRosterWithoutRecord = remaining;
+	}
+}
+
+void SimPlayerManager::runPlayerBotProgressionReaper(uint64 nowMs, bool force) {
+	if (!progressionEnabled || !progressionLoaded ||
+			(!force && !progressionReaperEnabled) || !progressionDbAvailable)
+		return;
+
+	progressionReaperRuns.increment();
+	Vector<uint64> orphanIds;
+	{
+		Locker progressionLock(&progressionMutex);
+		orphanIds = progressionOrphanIds;
+	}
+
+	for (int i = 0; i < orphanIds.size(); ++i) {
+		uint64 identityId = orphanIds.get(i);
+		bool stillInRoster = false;
+		{
+			Locker pveLock(&pveMutex);
+			stillInRoster = pveIdentities.contains(identityId);
+		}
+		if (stillInRoster)
+			continue;
+
+		try {
+		String eligibility = force ? String("") :
+			" AND `updated_at` < DATE_SUB(NOW(), INTERVAL " +
+			String::valueOf(progressionReaperMinAgeSeconds) + " SECOND)";
+			UniqueReference<ResultSet*> oldResult(
+				ServerDatabase::instance()->executeQuery(
+					"SELECT `identity_id` FROM `simbot_progression` WHERE "
+					"`identity_id`=" + String::valueOf(identityId) + eligibility +
+					" LIMIT 1;"));
+			if (oldResult == nullptr || !oldResult->next())
+				continue;
+
+			UniqueReference<ResultSet*> deleteResult(
+				ServerDatabase::instance()->executeQuery(
+					"DELETE FROM `simbot_experience` WHERE `identity_id`=" +
+					String::valueOf(identityId) + ";"));
+			(void)deleteResult;
+			deleteResult = ServerDatabase::instance()->executeQuery(
+				"DELETE FROM `simbot_skills` WHERE `identity_id`=" +
+				String::valueOf(identityId) + ";");
+			deleteResult = ServerDatabase::instance()->executeQuery(
+				"DELETE FROM `simbot_progression` WHERE `identity_id`=" +
+				String::valueOf(identityId) + ";");
+
+			Locker progressionLock(&progressionMutex);
+			progressionRecords.drop(identityId);
+			progressionDirtyIds.drop(identityId);
+			for (int j = progressionOrphanIds.size() - 1; j >= 0; --j) {
+				if (progressionOrphanIds.get(j) == identityId)
+					progressionOrphanIds.remove(j);
+			}
+			progressionOrphanRecords = progressionOrphanIds.size();
+			progressionOrphansReaped.increment();
+		} catch (const Exception& e) {
+			progressionDbAvailable = false;
+			progressionNextDbProbeMs = nowMs + progressionDbProbeBackoffMs;
+			progressionDbProbeBackoffMs = Math::min<uint64>(
+				progressionDbProbeBackoffMs * 2, 300000);
+			error("SimPlayerProgressionReaperFailed: " + e.getMessage());
+			return;
+		}
+	}
+}
+
+void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
+		int faultDelayMs, bool faultFailNext) {
+	if (!progressionEnabled || !progressionLoaded)
+		return;
+
+	uint64 nowMs = System::getMiliTime();
+	bool recovered = false;
+	if (!progressionDbAvailable) {
+		if (!force && progressionNextDbProbeMs != 0 &&
+				nowMs < progressionNextDbProbeMs)
+			return;
+
+		try {
+			UniqueReference<ResultSet*> probe(
+				ServerDatabase::instance()->executeQuery("SELECT 1;"));
+			if (probe == nullptr)
+				throw Exception("progression database probe returned no result");
+			progressionDbAvailable = true;
+			progressionNextDbProbeMs = 0;
+			progressionDbProbeBackoffMs = 5000;
+			recovered = true;
+		} catch (const Exception& e) {
+			progressionNextDbProbeMs = nowMs + progressionDbProbeBackoffMs;
+			progressionDbProbeBackoffMs = Math::min<uint64>(
+				progressionDbProbeBackoffMs * 2, 300000);
+			error("SimPlayerProgressionDbProbeFailed: " + e.getMessage());
+			return;
+		}
+	}
+
+	if (!force && !recovered && progressionLastFlushMs > 0 &&
+			nowMs - progressionLastFlushMs <
+			static_cast<uint64>(progressionFlushIntervalSeconds) * 1000)
+		return;
+
+	VectorMap<uint64, SimBotProgression> batch;
+	bool failNextFlush = false;
+	{
+		Locker progressionLock(&progressionMutex);
+		// Copying and clearing under one lock is the atomic swap boundary. An
+		// award that arrives during SQL sees no entry in the dirty map and
+		// therefore re-dirties the identity for the next flush.
+		for (int i = 0; i < progressionDirtyIds.size(); ++i) {
+			uint64 identityId = progressionDirtyIds.elementAt(i).getKey();
+			if (progressionRecords.contains(identityId))
+				batch.put(identityId, progressionRecords.get(identityId));
+		}
+		progressionDirtyIds.removeAll();
+	}
+	// Faults arrive as arguments from the FlushNow request that armed them; a
+	// routine maintenance flush passes none and can never steal one.
+	failNextFlush = faultFailNext;
+
+	for (int i = 0; i < batch.size(); ++i) {
+		const SimBotProgression& progression = batch.elementAt(i).getValue();
+		uint64 identityId = progression.identityId;
+		try {
+			String scalarUpdate = "UPDATE `simbot_progression` SET "
+				"`bank_credits`=" + String::valueOf(progression.bankCredits) +
+				",`cash_credits`=" + String::valueOf(progression.cashCredits) +
+				",`skill_points_spent`=" +
+				String::valueOf(progression.skillPointsSpent) +
+				",`awards_total`=" + String::valueOf(progression.awardsTotal) +
+				",`last_award_source`=" +
+				pveSqlValue(progression.lastAwardSource) +
+				",`updated_at`=NOW() WHERE `identity_id`=" +
+				String::valueOf(identityId) + ";";
+			UniqueReference<ResultSet*> scalarResult(
+				ServerDatabase::instance()->executeQuery(scalarUpdate));
+			(void)scalarResult;
+			if (i == 0 && faultDelayMs > 0)
+				Thread::sleep(static_cast<uint64>(faultDelayMs));
+			if (i == 0 && failNextFlush)
+				throw Exception("player bot parity injected flush failure");
+
+			for (int xpIndex = 0;
+					xpIndex < progression.experience.size(); ++xpIndex) {
+				String xpType = progression.experience.elementAt(xpIndex).getKey();
+				String escapedXpType = xpType.escapeString();
+				String xpUpdate = "INSERT INTO `simbot_experience` "
+					"(`identity_id`,`xp_type`,`amount`,`updated_at`) VALUES (" +
+					String::valueOf(identityId) + ",'" + escapedXpType + "'," +
+					String::valueOf(progression.experience.elementAt(xpIndex).getValue()) +
+					",NOW()) ON DUPLICATE KEY UPDATE `amount`=VALUES(`amount`),"
+					"`updated_at`=NOW();";
+				UniqueReference<ResultSet*> xpResult(
+					ServerDatabase::instance()->executeQuery(xpUpdate));
+				(void)xpResult;
+			}
+
+			for (int skillIndex = 0; skillIndex < progression.skills.size();
+					++skillIndex) {
+				String escapedSkill = progression.skills.get(skillIndex).escapeString();
+				String skillInsert = "INSERT IGNORE INTO `simbot_skills` "
+					"(`identity_id`,`skill_name`,`trained_at`) VALUES (" +
+					String::valueOf(identityId) + ",'" + escapedSkill + "',NOW());";
+				UniqueReference<ResultSet*> skillResult(
+					ServerDatabase::instance()->executeQuery(skillInsert));
+				(void)skillResult;
+			}
+		} catch (const Exception& e) {
+			// The current record and all records not yet retired remain dirty.
+			// Merge under the mutex so a concurrent award cannot be overwritten.
+			Locker progressionLock(&progressionMutex);
+			for (int pending = i; pending < batch.size(); ++pending)
+				progressionDirtyIds.put(
+					batch.elementAt(pending).getKey(), true);
+			progressionDbAvailable = false;
+			progressionNextDbProbeMs = nowMs + progressionDbProbeBackoffMs;
+			progressionDbProbeBackoffMs = Math::min<uint64>(
+				progressionDbProbeBackoffMs * 2, 300000);
+			progressionFlushFailures.increment();
+			error("SimPlayerProgressionFlushFailed: " + e.getMessage());
+			return;
+		}
+	}
+
+	progressionLastFlushMs = nowMs;
+	reconcilePlayerBotProgression();
+	runPlayerBotProgressionReaper(nowMs);
+}
+
+uint64 SimPlayerManager::enqueuePlayerBotProgressionRequest(
+		const PlayerBotProgressionRequest& requestTemplate) {
+	PlayerBotProgressionRequest request = requestTemplate;
+	Locker requestLock(&progressionRequestMutex);
+	request.requestId = progressionNextRequestId++;
+	request.state = PlayerBotProgressionRequest::Queued;
+	request.error = "";
+	request.completedAtMs = 0;
+	request.queuedAtMs = System::getMiliTime();
+	progressionRequests.add(request);
+	return request.requestId;
+}
+
+bool SimPlayerManager::copyPlayerBotProgressionRequest(uint64 requestId,
+		PlayerBotProgressionRequest& requestOut) {
+	Locker requestLock(&progressionRequestMutex);
+	for (int i = 0; i < progressionRequests.size(); ++i) {
+		if (progressionRequests.get(i).requestId == requestId) {
+			requestOut = progressionRequests.get(i);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool SimPlayerManager::consumePlayerBotProgressionRequest(uint64 requestId,
+		PlayerBotProgressionRequest& requestOut) {
+	// Copy-and-remove for a request with a single terminal observer. Async
+	// requests are deliberately NOT consumed here: a scenario may observe one
+	// twice (phase=started, then completion), so those are left for the prune.
+	Locker requestLock(&progressionRequestMutex);
+	for (int i = 0; i < progressionRequests.size(); ++i) {
+		if (progressionRequests.get(i).requestId != requestId)
+			continue;
+		requestOut = progressionRequests.get(i);
+		if (requestOut.state == PlayerBotProgressionRequest::Completed ||
+				requestOut.state == PlayerBotProgressionRequest::Failed)
+			progressionRequests.remove(i);
+		return true;
+	}
+	return false;
+}
+
+void SimPlayerManager::prunePlayerBotProgressionRequests(uint64 nowMs) {
+	Locker requestLock(&progressionRequestMutex);
+	for (int i = progressionRequests.size() - 1; i >= 0; --i) {
+		const PlayerBotProgressionRequest& request = progressionRequests.get(i);
+		if ((request.state == PlayerBotProgressionRequest::Completed ||
+				request.state == PlayerBotProgressionRequest::Failed) &&
+				request.completedAtMs != 0 && nowMs > request.completedAtMs &&
+				nowMs - request.completedAtMs > 300000)
+			progressionRequests.remove(i);
+	}
+}
+
+void SimPlayerManager::drainPlayerBotProgressionRequests() {
+	// Every SQL-bearing harness operation is claimed here, on the same
+	// maintenance task that owns the production roster SQL. Claiming and
+	// publishing state are short queue-lock sections; the actual operation is
+	// deliberately outside progressionRequestMutex so async faults can expose
+	// Running to the harness while another request is queued.
+	while (true) {
+		PlayerBotProgressionRequest request;
+		bool found = false;
+		{
+			Locker requestLock(&progressionRequestMutex);
+			for (int i = 0; i < progressionRequests.size(); ++i) {
+				if (progressionRequests.get(i).state ==
+						PlayerBotProgressionRequest::Queued) {
+					progressionRequests.get(i).state =
+						PlayerBotProgressionRequest::Running;
+					request = progressionRequests.get(i);
+					// How long the lane made this request wait. A value near the
+					// maintenance interval means a kick did not land.
+					uint64 claimedAtMs = System::getMiliTime();
+					if (request.queuedAtMs != 0 &&
+							claimedAtMs > request.queuedAtMs) {
+						uint64 waited = claimedAtMs - request.queuedAtMs;
+						if (waited > (uint64)progressionRequestMaxWaitMs.get())
+							progressionRequestMaxWaitMs = waited;
+					}
+					found = true;
+					break;
+				}
+			}
+		}
+		if (!found)
+			break;
+
+		bool success = true;
+		String errorMessage;
+		try {
+			switch (request.kind) {
+			case PlayerBotProgressionRequest::MintHarnessIdentity: {
+				SimBotIdentity identity;
+				if (!mintPveIdentity("harness", identity))
+					throw Exception("harness identity mint failed");
+				request.identityId = identity.id;
+				request.resultFound = true;
+				request.resultValue = static_cast<int64>(identity.id);
+				break;
+			}
+			case PlayerBotProgressionRequest::ReloadStore: {
+				{
+					Locker progressionLock(&progressionMutex);
+					progressionRecords.removeAll();
+					progressionDirtyIds.removeAll();
+					progressionOrphanIds.removeAll();
+				}
+				progressionLoaded = false;
+				progressionDbAvailable = pveDatabaseAvailable;
+				progressionNextDbProbeMs = 0;
+				loadPlayerBotProgressionStore();
+				if (!progressionLoaded)
+					throw Exception("progression store reload failed");
+				request.resultFound = true;
+				request.resultValue = progressionRecords.size();
+				break;
+			}
+			case PlayerBotProgressionRequest::ReadRow: {
+				String query;
+				String field = request.xpType.trim();
+				if (field == "bankCredits")
+					query = "SELECT `bank_credits` FROM `simbot_progression` WHERE `identity_id`=";
+				else if (field == "cashCredits")
+					query = "SELECT `cash_credits` FROM `simbot_progression` WHERE `identity_id`=";
+				else if (field == "skillPointsSpent")
+					query = "SELECT `skill_points_spent` FROM `simbot_progression` WHERE `identity_id`=";
+				else if (field == "awardsTotal")
+					query = "SELECT `awards_total` FROM `simbot_progression` WHERE `identity_id`=";
+				else if (field == "lastAwardSource")
+					query = "SELECT `last_award_source` FROM `simbot_progression` WHERE `identity_id`=";
+				else
+					query = "SELECT `amount` FROM `simbot_experience` WHERE `identity_id`=";
+
+			String suffix = String::valueOf(request.identityId);
+			if (field != "bankCredits" && field != "cashCredits" &&
+					field != "skillPointsSpent" && field != "awardsTotal" &&
+					field != "lastAwardSource")
+				suffix += " AND `xp_type`='" + field.escapeString() + "'";
+			suffix += " LIMIT 1;";
+			UniqueReference<ResultSet*> result(
+				ServerDatabase::instance()->executeQuery(query + suffix));
+			if (result != nullptr && result->next()) {
+				request.resultFound = true;
+				if (field == "lastAwardSource")
+					request.resultValue = result->getString(0) == nullptr ? 0 : 1;
+				else
+					request.resultValue = result->getLong(0);
+			}
+				break;
+			}
+			case PlayerBotProgressionRequest::InjectOrphan: {
+				uint64 orphanId = 0;
+				{
+					Locker pveLock(&pveMutex);
+					for (int i = 0; i < pveIdentities.size(); ++i) {
+						uint64 identityId = pveIdentities.elementAt(i).getKey();
+						if (identityId > orphanId)
+							orphanId = identityId;
+					}
+				}
+				orphanId += 1000;
+				UniqueReference<ResultSet*> insert(
+					ServerDatabase::instance()->executeQuery(
+						"INSERT IGNORE INTO `simbot_progression` "
+						"(`identity_id`,`created_at`,`updated_at`) VALUES (" +
+						String::valueOf(orphanId) + ",NOW(),NOW());"));
+				(void)insert;
+				SimBotProgression orphan;
+				orphan.identityId = orphanId;
+				{
+					Locker progressionLock(&progressionMutex);
+					progressionRecords.put(orphanId, orphan);
+					progressionDirtyIds.drop(orphanId);
+				}
+				request.identityId = orphanId;
+				request.resultFound = true;
+				request.resultValue = static_cast<int64>(orphanId);
+				reconcilePlayerBotProgression();
+				break;
+			}
+			case PlayerBotProgressionRequest::DeleteIdentity: {
+				int harnessIndex = -1;
+				{
+					Locker parityLock(&playerBotParityTestMutex);
+					for (int i = 0; i < playerBotParityTestIdentityIds.size(); ++i)
+						if (playerBotParityTestIdentityIds.get(i) == request.identityId)
+							harnessIndex = i;
+				}
+				if (harnessIndex >= 0)
+					destroyPlayerBotParityBody(harnessIndex, "delete_identity");
+				UniqueReference<ResultSet*> deleted(
+					ServerDatabase::instance()->executeQuery(
+						"DELETE FROM `simbot_identities` WHERE `id`=" +
+						String::valueOf(request.identityId) + ";"));
+				(void)deleted;
+				{
+					Locker pveLock(&pveMutex);
+					pveIdentities.drop(request.identityId);
+					pveIdentityBodyOids.drop(request.identityId);
+					pveDirtyIdentityIds.drop(request.identityId);
+				}
+				reconcilePlayerBotProgression();
+				request.resultFound = true;
+				break;
+			}
+			case PlayerBotProgressionRequest::DeleteProgressionRow: {
+				UniqueReference<ResultSet*> deleted(
+					ServerDatabase::instance()->executeQuery(
+						"DELETE FROM `simbot_progression` WHERE `identity_id`=" +
+						String::valueOf(request.identityId) + ";"));
+				(void)deleted;
+				{
+					Locker progressionLock(&progressionMutex);
+					progressionRecords.drop(request.identityId);
+					progressionDirtyIds.drop(request.identityId);
+				}
+				progressionRosterWithoutRecord.increment();
+				request.resultFound = true;
+				break;
+			}
+			case PlayerBotProgressionRequest::RunReaper:
+				runPlayerBotProgressionReaper(System::getMiliTime(), request.force);
+				request.resultFound = true;
+				break;
+			case PlayerBotProgressionRequest::FlushNow: {
+				// Only this request consumes an armed fault, so the routine
+				// end-of-tick flush can never steal it.
+				int pendingFaultDelayMs = 0;
+				bool pendingFaultFail = false;
+				{
+					Locker progressionLock(&progressionMutex);
+					pendingFaultDelayMs = progressionFaultFlushDelayMs;
+					pendingFaultFail = progressionFaultFailNextFlush;
+					progressionFaultFlushDelayMs = 0;
+					progressionFaultFailNextFlush = false;
+				}
+				flushPlayerBotProgressionStore(request.force, pendingFaultDelayMs,
+					pendingFaultFail);
+				request.resultFound = true;
+				break;
+			}
+			case PlayerBotProgressionRequest::InjectFault:
+				{
+					Locker parityLock(&playerBotParityTestMutex);
+					if (!playerBotParityTestEnabled)
+						throw Exception("fault injection requires enabled harness");
+				}
+				progressionFaultFlushDelayMs = request.faultFlushDelayMs;
+				progressionFaultFailNextFlush = request.faultFailNextFlush;
+				request.resultFound = true;
+				break;
+			case PlayerBotProgressionRequest::WriteRestartProbe: {
+				UniqueReference<ResultSet*> update(
+					ServerDatabase::instance()->executeQuery(
+						"UPDATE `simbot_progression` SET `last_award_source`=" +
+						pveSqlValue("harness_retain") +
+						",`updated_at`=NOW() WHERE `identity_id`=" +
+						String::valueOf(request.identityId) + ";"));
+				(void)update;
+				{
+					Locker progressionLock(&progressionMutex);
+					if (!progressionRecords.contains(request.identityId))
+						throw Exception("restart probe record is missing");
+					progressionRecords.get(request.identityId).lastAwardSource =
+						"harness_retain";
+					progressionDirtyIds.put(request.identityId, true);
+				}
+				request.resultFound = true;
+				break;
+			}
+			}
+		} catch (const Exception& e) {
+			success = false;
+			errorMessage = e.getMessage();
+		}
+
+		Locker requestLock(&progressionRequestMutex);
+		for (int i = 0; i < progressionRequests.size(); ++i) {
+			PlayerBotProgressionRequest& published = progressionRequests.get(i);
+			if (published.requestId == request.requestId) {
+				published = request;
+				published.state = success ?
+					PlayerBotProgressionRequest::Completed :
+					PlayerBotProgressionRequest::Failed;
+				published.error = errorMessage;
+				published.completedAtMs = System::getMiliTime();
+				break;
+			}
+		}
+	}
+}
+
+AiAgent* SimPlayerManager::spawnPlayerBotParityBody(int identityIndex) {
+	uint64 identityId = 0;
+	String planet;
+	Vector3 spawn;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (identityIndex < 0 || identityIndex >=
+				playerBotParityTestIdentityIds.size())
+			return nullptr;
+		identityId = playerBotParityTestIdentityIds.get(identityIndex);
+		planet = playerBotParityTestPlanet;
+		spawn = playerBotParityTestSpawn;
+	}
+	SimBotIdentity identity;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveIdentities.contains(identityId))
+			return nullptr;
+		identity = pveIdentities.get(identityId);
+		identity.homePlanet = planet;
+	}
+
+	// The identity body factory still owns template, presence and object
+	// initialization; the optional point only selects where this harness body
+	// enters the world.
+	AiAgent* agent = spawnPveIdentityBody(identity, &spawn);
+	if (agent == nullptr)
+		return nullptr;
+	uint64 bodyOid = agent->getObjectID();
+	{
+		Locker pveLock(&pveMutex);
+		pveIdentityBodyOids.put(identityId, bodyOid);
+		pveBodyIdentityIds.put(bodyOid, identityId);
+	}
+	attachPveHunterController(identity, agent);
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		while (playerBotParityTestBodyOids.size() <= identityIndex)
+			playerBotParityTestBodyOids.add(0);
+		playerBotParityTestBodyOids.set(identityIndex, bodyOid);
+	}
+	(void)spawn;
+	return agent;
+}
+
+void SimPlayerManager::destroyPlayerBotParityBody(int identityIndex,
+		const String& reason) {
+	uint64 identityId = 0;
+	uint64 bodyOid = 0;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (identityIndex < 0 || identityIndex >=
+				playerBotParityTestIdentityIds.size())
+			return;
+		identityId = playerBotParityTestIdentityIds.get(identityIndex);
+		if (identityIndex < playerBotParityTestBodyOids.size())
+			bodyOid = playerBotParityTestBodyOids.get(identityIndex);
+	}
+	if (bodyOid == 0)
+		return;
+
+	Reference<SimPlayerController*> controller = controllers.contains(bodyOid) ?
+		controllers.get(bodyOid) : nullptr;
+	ManagedReference<AiAgent*> agent = controller == nullptr ? nullptr :
+		controller->getAgent();
+	controllers.drop(bodyOid);
+	if (agent != nullptr) {
+		Locker agentLock(agent);
+		agent->setMovementState(AiAgent::OBLIVIOUS);
+		agent->clearPatrolPoints();
+		agent->clearSavedPatrolPoints();
+		agent->clearCurrentPath();
+		agent->setSimPlayerBot(false);
+		agent->destroyObjectFromWorld(true);
+		agent->destroyObjectFromDatabase(true);
+	}
+	{
+		Locker pveLock(&pveMutex);
+		pveIdentityBodyOids.drop(identityId);
+		pveBodyIdentityIds.drop(bodyOid);
+		pveRespawnDueAtMs.drop(identityId);
+	}
+	removeSimPresenceMemberAfterWorldExit(bodyOid, System::getMiliTime());
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (identityIndex < playerBotParityTestBodyOids.size())
+			playerBotParityTestBodyOids.set(identityIndex, 0);
+	}
+	info("PlayerBotParityBodyDestroyed identity=" + String::valueOf(identityId) +
+		" body=" + String::valueOf(bodyOid) + " reason=" + reason, true);
+}
+
+bool SimPlayerManager::awardToNonRosterPlayerBotBody(uint64 identityId,
+		const String& xpType, int amount, const String& source) {
+	(void)identityId;
+	String planet;
+	Vector3 spawn;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		planet = playerBotParityTestPlanet;
+		spawn = playerBotParityTestSpawn;
+	}
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	Zone* zone = zoneServer == nullptr ? nullptr :
+		zoneServer->getZone(planet);
+	if (zone == nullptr || zone->getCreatureManager() == nullptr)
+		return false;
+	CreatureObject* creature = zone->getCreatureManager()->spawnCreature(
+		String("artisan").hashCode(), 0, spawn.getX(), spawn.getZ(),
+		spawn.getY(), 0);
+	AiAgent* agent = creature == nullptr ? nullptr : creature->asAiAgent();
+	if (agent == nullptr)
+		return false;
+	{
+		Locker agentLock(agent);
+		agent->setSimPlayerBot(true);
+	}
+	uint64 resolved = resolvePlayerBotIdentity(agent->getObjectID());
+	bool awarded = grantPlayerBotExperience(resolved, xpType, amount, source);
+	{
+		Locker agentLock(agent);
+		agent->setSimPlayerBot(false);
+		agent->destroyObjectFromWorld(true);
+		agent->destroyObjectFromDatabase(true);
+	}
+	return !awarded && resolved == 0;
+}
+
+bool SimPlayerManager::getPlayerBotParityIdentityId(
+		const PlayerBotParityTestStep& step, uint64& identityId) {
+	identityId = step.identityId;
+	Locker parityLock(&playerBotParityTestMutex);
+	if (step.identityIndex >= 0 && step.identityIndex <
+			playerBotParityTestIdentityIds.size())
+		identityId = playerBotParityTestIdentityIds.get(step.identityIndex);
+	return identityId != 0;
+}
+
+int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
+	String key = counter.trim().toLowerCase();
+	if (key == "awards.accepted" || key == "accepted" ||
+			key == "awardsaccepted")
+		return progressionAwardsAccepted.get();
+	if (key == "awards.rejectednorecord" || key == "rejectednorecord")
+		return progressionAwardsRejectedNoRecord.get();
+	if (key == "awards.rejectednoidentity" || key == "rejectednoidentity")
+		return progressionAwardsRejectedNoIdentity.get();
+	if (key == "awards.rejecteddisabled" || key == "rejecteddisabled")
+		return progressionAwardsRejectedDisabled.get();
+	if (key == "awards.rejectedinsufficient" || key == "rejectedinsufficient")
+		return progressionAwardsRejectedInsufficient.get();
+	if (key == "awards.rejectedinvalidamount" || key == "rejectedinvalidamount")
+		return progressionAwardsRejectedInvalidAmount.get();
+	if (key == "orphanrecords")
+		return progressionOrphanRecords.get();
+	if (key == "rosterwithoutrecord")
+		return progressionRosterWithoutRecord.get();
+	if (key == "orphansreaped")
+		return progressionOrphansReaped.get();
+	if (key == "reaperruns")
+		return progressionReaperRuns.get();
+	if (key == "flushfailures")
+		return progressionFlushFailures.get();
+	if (key == "createrefusednotinroster")
+		return progressionCreateRefusedNotInRoster.get();
+	if (key == "harnessrowsstale") {
+		Locker parityLock(&playerBotParityTestMutex);
+		return playerBotParityTestHarnessRowsStale;
+	}
+	if (key == "dbavailable")
+		return progressionDbAvailable ? 1 : 0;
+	if (key == "storeloaded")
+		return progressionLoaded ? 1 : 0;
+	if (key == "records") {
+		Locker progressionLock(&progressionMutex);
+		return progressionRecords.size();
+	}
+	if (key == "dirtycount") {
+		Locker progressionLock(&progressionMutex);
+		return progressionDirtyIds.size();
+	}
+	if (key == "maintenanceticks" || key == "tickstotal")
+		return pveMaintenanceTicksTotal.get();
+	return 0;
+}
+
+bool SimPlayerManager::parsePlayerBotParityExpected(const String& value,
+		int64& result) {
+	String normalized = value.trim().toLowerCase();
+	if (normalized == "true") {
+		result = 1;
+		return true;
+	}
+	if (normalized == "false") {
+		result = 0;
+		return true;
+	}
+	if (normalized.isEmpty())
+		return false;
+	int start = normalized.charAt(0) == '-' ? 1 : 0;
+	if (start == normalized.length())
+		return false;
+	for (int i = start; i < normalized.length(); ++i) {
+		if (normalized.charAt(i) < '0' || normalized.charAt(i) > '9')
+			return false;
+	}
+	result = Long::valueOf(normalized);
+	return true;
+}
+
+void SimPlayerManager::syncPlayerBotParityOracle() {
+	Vector<uint64> identityIds;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		identityIds = playerBotParityTestIdentityIds;
+	}
+	VectorMap<uint64, SimBotProgression> snapshot;
+	for (int i = 0; i < identityIds.size(); ++i) {
+		SimBotProgression progression;
+		if (snapshotPlayerBotProgression(identityIds.get(i), progression))
+			snapshot.put(identityIds.get(i), progression);
+	}
+	Locker parityLock(&playerBotParityTestMutex);
+	playerBotParityTestOracle = snapshot;
+}
+
+bool SimPlayerManager::assertPlayerBotParityCounter(const String& counter,
+		int64 expected, bool delta, String& failure) {
+	int64 actual = playerBotParityCounterValue(counter);
+	if (delta) {
+		Locker parityLock(&playerBotParityTestMutex);
+		String key = counter.trim().toLowerCase();
+		int64 baseline = playerBotParityTestCounterBaselines.contains(key) ?
+			static_cast<int64>(playerBotParityTestCounterBaselines.get(key)) : 0;
+		actual -= baseline;
+	}
+	if (actual != expected) {
+		failure = "counter_" + counter + "_expected_" +
+			String::valueOf(expected) + "_got_" + String::valueOf(actual);
+		return false;
+	}
+	return true;
+}
+
+bool SimPlayerManager::assertPlayerBotParityStore(
+		const PlayerBotParityTestStep& step, String& failure) {
+	int records = 0;
+	{
+		Locker progressionLock(&progressionMutex);
+		records = progressionRecords.size();
+	}
+	int rosterSize = 0;
+	{
+		Locker pveLock(&pveMutex);
+		rosterSize = pveIdentities.size();
+	}
+	if (step.hasExpectedRecords &&
+			((step.expectedRecords >= 0 && records != step.expectedRecords) ||
+			(step.expectedRecords < 0 && records != rosterSize))) {
+		failure = "records_expected_" + String::valueOf(
+			step.expectedRecords < 0 ? rosterSize : step.expectedRecords) +
+			"_got_" + String::valueOf(records);
+		return false;
+	}
+	if (step.hasExpectedOrphanRecords && step.expectedOrphanRecords >= 0 &&
+			progressionOrphanRecords.get() != step.expectedOrphanRecords) {
+		failure = "orphanRecords_expected_" + String::valueOf(
+			step.expectedOrphanRecords) + "_got_" +
+			String::valueOf(progressionOrphanRecords.get());
+		return false;
+	}
+	if (step.hasExpectedRosterWithoutRecord &&
+			step.expectedRosterWithoutRecord >= 0 &&
+			progressionRosterWithoutRecord.get() !=
+				step.expectedRosterWithoutRecord) {
+		failure = "rosterWithoutRecord_expected_" + String::valueOf(
+			step.expectedRosterWithoutRecord) + "_got_" + String::valueOf(
+			progressionRosterWithoutRecord.get());
+		return false;
+	}
+	return true;
+}
+
+bool SimPlayerManager::writePlayerBotParityPhaseAFile() {
+	Vector<PlayerBotParityTestScenarioResult> results;
+	uint64 probeId = 0;
+	String runId;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		results = playerBotParityTestResults;
+		probeId = playerBotParityTestProbeIdentityId;
+		runId = playerBotParityTestRunId;
+	}
+	if (probeId == 0 || runId.isEmpty())
+		return false;
+	JSONSerializationType root = JSONSerializationType::object();
+	root["runId"] = runId;
+	root["probeIdentityId"] = probeId;
+	root["phase"] = "A";
+	JSONSerializationType rows = JSONSerializationType::array();
+	for (int i = 0; i < results.size(); ++i) {
+		if (results.get(i).name == "retained_record_survives_restart")
+			continue;
+		if (results.get(i).status != "PASS")
+			return false;
+		JSONSerializationType row = JSONSerializationType::object();
+		row["name"] = results.get(i).name;
+		row["status"] = results.get(i).status;
+		row["failReason"] = results.get(i).failReason;
+		row["durationMs"] = results.get(i).durationMs;
+		rows.push_back(row);
+	}
+	root["scenarios"] = rows;
+	String path = "log/playerbotparity-phaseA.json";
+	String tempPath = path + ".tmp." + runId;
+	std::ofstream file(tempPath.toCharArray(), std::ios::out | std::ios::trunc);
+	if (!file.is_open())
+		return false;
+	file << root.dump(2) << std::endl;
+	file.close();
+	if (!file.good() || std::rename(tempPath.toCharArray(), path.toCharArray()) != 0)
+		return false;
+	Locker parityLock(&playerBotParityTestMutex);
+	playerBotParityTestPhaseAFileWritten = true;
+	return true;
+}
+
+bool SimPlayerManager::readPlayerBotParityPhaseAFile(uint64 probeIdentityId,
+		const String& runId, String& failure) {
+	std::ifstream file("log/playerbotparity-phaseA.json", std::ios::in);
+	if (!file.is_open()) {
+		failure = "phase_a_record_invalid";
+		return false;
+	}
+	std::stringstream contents;
+	contents << file.rdbuf();
+	try {
+		JSONSerializationType root = JSONSerializationType::parse(contents.str());
+		if (!root.is_object() || !root.contains("runId") ||
+				!root.contains("probeIdentityId") || !root.contains("scenarios") ||
+				!root.contains("phase") || !root["phase"].is_string() ||
+				root["phase"].get<std::string>() != "A" ||
+				!root["runId"].is_string() ||
+				(!runId.isEmpty() &&
+				root["runId"].get<std::string>() != runId.toCharArray()) ||
+				root["probeIdentityId"].get<uint64>() != probeIdentityId ||
+				!root["scenarios"].is_array()) {
+			failure = "phase_a_record_invalid";
+			return false;
+		}
+		if (runId.isEmpty()) {
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestRunId = String(
+				root["runId"].get<std::string>().c_str());
+		}
+		Vector<String> seenNames;
+		for (auto& row : root["scenarios"]) {
+			if (!row.is_object() || !row.contains("name") ||
+					!row.contains("status") || !row["name"].is_string() ||
+					!row["status"].is_string() ||
+					row["status"].get<std::string>() != "PASS") {
+				failure = "phase_a_record_invalid";
+				return false;
+			}
+			String name(row["name"].get<std::string>().c_str());
+			if (seenNames.contains(name)) {
+				failure = "phase_a_record_invalid";
+				return false;
+			}
+			seenNames.add(name);
+			bool knownScenario = false;
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				for (int i = 0; i < playerBotParityTestResults.size(); ++i) {
+					if (playerBotParityTestResults.get(i).name == name) {
+						if (name == "retained_record_survives_restart") {
+							failure = "phase_a_record_invalid";
+							return false;
+						}
+						playerBotParityTestResults.get(i).status = "PASS";
+						playerBotParityTestResults.get(i).failReason = "";
+						knownScenario = true;
+					}
+				}
+			}
+			if (!knownScenario) {
+				failure = "phase_a_record_invalid";
+				return false;
+			}
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			for (int i = 0; i < playerBotParityTestResults.size(); ++i) {
+				if (playerBotParityTestResults.get(i).name !=
+						"retained_record_survives_restart" &&
+						playerBotParityTestResults.get(i).status != "PASS") {
+					failure = "phase_a_record_incomplete";
+					return false;
+				}
+			}
+		}
+		return true;
+	} catch (...) {
+		failure = "phase_a_record_invalid";
+		return false;
+	}
+}
+
+void SimPlayerManager::deletePlayerBotParityPhaseAFile() {
+	std::remove("log/playerbotparity-phaseA.json");
+	Locker parityLock(&playerBotParityTestMutex);
+	playerBotParityTestPhaseAFileWritten = false;
+}
+
+void SimPlayerManager::schedulePlayerBotParityTestSpawn(int delayMs) {
+	Reference<PlayerBotParityTestSpawnTask*> task =
+		new PlayerBotParityTestSpawnTask();
+	task->schedule(delayMs < 0 ? 0 : delayMs);
+}
+
+void SimPlayerManager::schedulePlayerBotParityTestRunner(int delayMs) {
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (((!playerBotParityTestEnabled || !progressionEnabled) &&
+				!playerBotParityTestCleanupActive) ||
+				playerBotParityTestRunnerScheduled)
+			return;
+		playerBotParityTestRunnerScheduled = true;
+	}
+	// The task is armed after the mutex is released. The runner owns the
+	// cursor, while task scheduling is deliberately not nested under it.
+	Reference<PlayerBotParityTestRunnerTask*> task =
+		new PlayerBotParityTestRunnerTask();
+	task->schedule(delayMs < 0 ? 0 : delayMs);
+}
+
+void SimPlayerManager::runPlayerBotParityTestRunner() {
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityTestRunnerScheduled = false;
+		if (playerBotParityTestRunnerRunning) {
+			playerBotParityTestRunnerRerunPending = true;
+			return;
+		}
+		playerBotParityTestRunnerRunning = true;
+	}
+	runPlayerBotParityTestRunnerBody();
+	bool rerun = false;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityTestRunnerRunning = false;
+		rerun = playerBotParityTestRunnerRerunPending;
+		playerBotParityTestRunnerRerunPending = false;
+	}
+	if (rerun)
+		schedulePlayerBotParityTestRunner(0);
+}
+
+void SimPlayerManager::beginPlayerBotParityTestCleanup(bool preserveProbe) {
+	Locker parityLock(&playerBotParityTestMutex);
+	playerBotParityTestCleanupActive = true;
+	playerBotParityTestCleanupPreserveProbe = preserveProbe;
+	playerBotParityTestCleanupCursor = 0;
+	playerBotParityTestCleanupBodiesDone = false;
+	playerBotParityTestCleanupRequestId = 0;
+	playerBotParityTestCleanupReaperQueued = false;
+}
+
+void SimPlayerManager::restorePlayerBotParityScenarioGate() {
+	Locker parityLock(&playerBotParityTestMutex);
+	if (playerBotParityTestGateOverrideActive) {
+		playerBotParityTestGateOverrideActive =
+			playerBotParityTestGateOverridePreviousActive;
+		playerBotParityTestGateOverride =
+			playerBotParityTestGateOverridePrevious;
+	}
+}
+
+void SimPlayerManager::resolvePlayerBotParityExpectedRejection(
+		const PlayerBotParityTestStep& step, bool accepted,
+		PlayerBotParityTestStepResult& result, const String& rejectedReason,
+		const String& unexpectedAcceptReason) {
+	if (!step.expectReject) {
+		// An ordinary award step: only acceptance passes.
+		result.status = accepted ? String("PASS") : String("FAIL");
+		if (!accepted)
+			result.failReason = rejectedReason;
+		return;
+	}
+	// The scenario asked for a refusal, so the verdict inverts. The oracle is
+	// deliberately left untouched either way: a refused award changed nothing,
+	// and an unexpected acceptance is already a failure.
+	result.status = accepted ? String("FAIL") : String("PASS");
+	if (accepted)
+		result.failReason = unexpectedAcceptReason;
+}
+
+void SimPlayerManager::cleanupPlayerBotParityTest() {
+	Vector<uint64> identityIds;
+	bool preserveProbe = false;
+	uint64 probeId = 0;
+	uint64 pendingRequestId = 0;
+	bool reaperQueued = false;
+	int cleanupCursor = 0;
+	bool bodiesDone = false;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (!playerBotParityTestCleanupActive)
+			return;
+		identityIds = playerBotParityTestIdentityIds;
+		preserveProbe = playerBotParityTestCleanupPreserveProbe;
+		probeId = playerBotParityTestProbeIdentityId;
+		pendingRequestId = playerBotParityTestCleanupRequestId;
+		reaperQueued = playerBotParityTestCleanupReaperQueued;
+		cleanupCursor = playerBotParityTestCleanupCursor;
+		bodiesDone = playerBotParityTestCleanupBodiesDone;
+	}
+
+	if (!bodiesDone) {
+		if (cleanupCursor < identityIds.size()) {
+			destroyPlayerBotParityBody(cleanupCursor, "harness_cleanup");
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				playerBotParityTestCleanupCursor++;
+			}
+			schedulePlayerBotParityTestRunner(0);
+			return;
+		}
+		// Bodies are gone; restart the cursor so the row-deletion pass below
+		// actually walks the identities instead of starting past the end.
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestCleanupBodiesDone = true;
+			playerBotParityTestCleanupCursor = 0;
+		}
+		schedulePlayerBotParityTestRunner(0);
+		return;
+	}
+
+	if (pendingRequestId != 0) {
+		PlayerBotProgressionRequest request;
+		if (!consumePlayerBotProgressionRequest(pendingRequestId, request)) {
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				playerBotParityTestCleanupRequestId = 0;
+			}
+			schedulePlayerBotParityTestRunner(0);
+			return;
+		}
+		if (request.state == PlayerBotProgressionRequest::Queued ||
+				request.state == PlayerBotProgressionRequest::Running) {
+			schedulePlayerBotParityTestRunner(250);
+			return;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestCleanupRequestId = 0;
+			if (!reaperQueued)
+				playerBotParityTestCleanupCursor++;
+			if (request.state == PlayerBotProgressionRequest::Failed)
+				playerBotParityTestPhaseAFileInvalid = true;
+		}
+		schedulePlayerBotParityTestRunner(0);
+		return;
+	}
+
+	for (int i = cleanupCursor; i < identityIds.size(); ++i) {
+		if (preserveProbe && identityIds.get(i) == probeId) {
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestCleanupCursor = i + 1;
+			cleanupCursor = i + 1;
+			break;
+		}
+		PlayerBotProgressionRequest request;
+		request.kind = PlayerBotProgressionRequest::DeleteIdentity;
+		request.identityId = identityIds.get(i);
+		uint64 requestId = enqueuePlayerBotProgressionRequest(request);
+		kickPveMaintenanceNow();
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestCleanupRequestId = requestId;
+			playerBotParityTestCleanupCursor = i;
+		}
+		schedulePlayerBotParityTestRunner(250);
+		return;
+	}
+	if (cleanupCursor < identityIds.size()) {
+		schedulePlayerBotParityTestRunner(0);
+		return;
+	}
+
+	if (!reaperQueued) {
+		PlayerBotProgressionRequest request;
+		request.kind = PlayerBotProgressionRequest::RunReaper;
+		request.force = true;
+		uint64 requestId = enqueuePlayerBotProgressionRequest(request);
+		kickPveMaintenanceNow();
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestCleanupReaperQueued = true;
+			playerBotParityTestCleanupRequestId = requestId;
+		}
+		schedulePlayerBotParityTestRunner(250);
+		return;
+	}
+
+	if (!preserveProbe)
+		deletePlayerBotParityPhaseAFile();
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityTestCleanupActive = false;
+		playerBotParityTestScenarioActive = false;
+		playerBotParityTestCleanupRequestId = 0;
+		playerBotParityTestCleanupReaperQueued = false;
+		playerBotParityTestCompleted = !preserveProbe;
+		playerBotParityTestAwaitingRestart = preserveProbe;
+		playerBotParityTestIdentityIds.removeAll();
+		playerBotParityTestBodyOids.removeAll();
+		playerBotParityTestOracle.removeAll();
+		playerBotParityTestRequestRefs.removeAll();
+		if (!preserveProbe)
+			playerBotParityTestProbeIdentityId = 0;
+	}
+}
+
+void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
+	prunePlayerBotProgressionRequests(System::getMiliTime());
+	bool enabledNow = false;
+	bool cleanupActive = false;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		enabledNow = playerBotParityTestEnabled && progressionEnabled;
+		cleanupActive = playerBotParityTestCleanupActive;
+	}
+	if (!enabledNow) {
+		if (cleanupActive)
+			cleanupPlayerBotParityTest();
+		return;
+	}
+	if (cleanupActive) {
+		cleanupPlayerBotParityTest();
+		return;
+	}
+	if (!pveBootReady || !progressionLoaded || !progressionDbAvailable) {
+		schedulePlayerBotParityTestRunner(1000);
+		return;
+	}
+
+	bool bootInitialized = false;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		bootInitialized = playerBotParityTestBootInitialized;
+	}
+	if (!bootInitialized) {
+		uint64 probeId = 0;
+		if (findPlayerBotParityRestartProbe(probeId)) {
+			String phaseFileFailure;
+			bool fileValid = readPlayerBotParityPhaseAFile(probeId, "",
+				phaseFileFailure);
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				playerBotParityTestPhase = "B";
+				playerBotParityTestProbeIdentityId = probeId;
+				playerBotParityTestBootInitialized = true;
+				playerBotParityTestIdentityIds.add(probeId);
+				playerBotParityTestBodyOids.add(0);
+				for (int i = 0; i < playerBotParityTestResults.size(); ++i) {
+					if (playerBotParityTestResults.get(i).name ==
+							"retained_record_survives_restart") {
+						if (!fileValid) {
+							playerBotParityTestResults.get(i).status = "FAIL";
+							playerBotParityTestResults.get(i).failReason =
+								phaseFileFailure;
+						}
+						for (int j = 0; j < playerBotParityTestScenarioOrder.size(); ++j) {
+							if (playerBotParityTestScenarioOrder.get(j) == i) {
+								playerBotParityTestScenarioIndex = j;
+								break;
+							}
+						}
+					}
+				}
+			}
+			if (!fileValid) {
+				beginPlayerBotParityTestCleanup(false);
+				schedulePlayerBotParityTestRunner(0);
+				return;
+			}
+			syncPlayerBotParityOracle();
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				playerBotParityTestOracleInitialized = true;
+			}
+		} else {
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestPhase = "A";
+			playerBotParityTestBootInitialized = true;
+			playerBotParityTestRunId = String::valueOf(System::getMiliTime());
+				playerBotParityTestSetupCursor = 0;
+				playerBotParityTestSpawnCursor = 0;
+				playerBotParityTestOracleInitialized = false;
+		}
+	}
+	bootInitialized = true;
+
+	String phase;
+	int setupCursor = 0;
+	int spawnCursor = 0;
+	int identityCount = 0;
+	uint64 pendingSetupRequest = 0;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		phase = playerBotParityTestPhase;
+		setupCursor = playerBotParityTestSetupCursor;
+		spawnCursor = playerBotParityTestSpawnCursor;
+		identityCount = playerBotParityTestIdentityCount;
+		pendingSetupRequest = playerBotParityTestPendingRequestId;
+	}
+	if (phase == "A" && setupCursor < identityCount) {
+		if (pendingSetupRequest != 0) {
+			PlayerBotProgressionRequest request;
+			if (!copyPlayerBotProgressionRequest(pendingSetupRequest, request)) {
+				schedulePlayerBotParityTestRunner(250);
+				return;
+			}
+			if (request.state == PlayerBotProgressionRequest::Queued ||
+					request.state == PlayerBotProgressionRequest::Running) {
+				schedulePlayerBotParityTestRunner(250);
+				return;
+			}
+			if (request.state == PlayerBotProgressionRequest::Failed) {
+				beginPlayerBotParityTestCleanup(false);
+				schedulePlayerBotParityTestRunner(0);
+				return;
+			}
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				playerBotParityTestIdentityIds.add(request.identityId);
+				playerBotParityTestBodyOids.add(0);
+				playerBotParityTestSetupCursor++;
+				playerBotParityTestPendingRequestId = 0;
+			}
+			schedulePlayerBotParityTestRunner(0);
+			return;
+		}
+		PlayerBotProgressionRequest request;
+		request.kind = PlayerBotProgressionRequest::MintHarnessIdentity;
+		uint64 requestId = enqueuePlayerBotProgressionRequest(request);
+		kickPveMaintenanceNow();
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestPendingRequestId = requestId;
+		}
+		schedulePlayerBotParityTestRunner(250);
+		return;
+	}
+	if (phase == "A" && spawnCursor < identityCount) {
+		if (spawnPlayerBotParityBody(spawnCursor) == nullptr) {
+			beginPlayerBotParityTestCleanup(false);
+			schedulePlayerBotParityTestRunner(0);
+			return;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestSpawnCursor++;
+		}
+		schedulePlayerBotParityTestRunner(0);
+		return;
+	}
+	if (!bootInitialized)
+		return;
+	bool oracleInitialized = false;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		oracleInitialized = playerBotParityTestOracleInitialized;
+	}
+	if (phase == "A" && spawnCursor == identityCount && !oracleInitialized) {
+		syncPlayerBotParityOracle();
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityTestOracleInitialized = true;
+	}
+
+	int orderPosition = 0;
+	bool active = false;
+	int stepCursor = 0;
+	uint64 scenarioStartedAtMs = 0;
+	int scenarioConfigIndex = -1;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		active = playerBotParityTestScenarioActive;
+		stepCursor = playerBotParityTestStepCursor;
+		orderPosition = playerBotParityTestScenarioIndex;
+		scenarioStartedAtMs = playerBotParityTestScenarioStartedAtMs;
+		if (orderPosition >= 0 && orderPosition <
+				playerBotParityTestScenarioOrder.size())
+			scenarioConfigIndex = playerBotParityTestScenarioOrder.get(orderPosition);
+	}
+	if (scenarioConfigIndex < 0) {
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityTestCompleted = true;
+		return;
+	}
+	PlayerBotParityTestScenario scenario;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (scenarioConfigIndex >= playerBotParityTestScenarios.size()) {
+			playerBotParityTestCompleted = true;
+			return;
+		}
+		scenario = playerBotParityTestScenarios.get(scenarioConfigIndex);
+	}
+	if (!active) {
+		uint64 nowMs = System::getMiliTime();
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestScenarioActive = true;
+			playerBotParityTestStepCursor = 0;
+			playerBotParityTestScenarioStartedAtMs = nowMs;
+			playerBotParityTestStepStartedAtMs = nowMs;
+			playerBotParityTestScenarioBaselineRecords =
+				static_cast<uint64>(playerBotParityCounterValue("records"));
+			playerBotParityTestCounterBaselines.removeAll();
+			const String counters[] = {"awards.accepted", "rejectedNoRecord",
+				"rejectedNoIdentity", "rejectedDisabled", "rejectedInsufficient",
+				"orphanRecords", "rosterWithoutRecord", "orphansReaped",
+				"reaperRuns", "flushFailures", "createRefusedNotInRoster"};
+			for (unsigned int i = 0; i < sizeof(counters) / sizeof(counters[0]); ++i)
+				playerBotParityTestCounterBaselines.put(counters[i].toLowerCase(),
+					static_cast<uint64>(playerBotParityCounterValue(counters[i])));
+			playerBotParityTestCounterBaselines.put("records",
+				static_cast<uint64>(playerBotParityCounterValue("records")));
+			playerBotParityTestCounterBaselines.put("lastflushms", progressionLastFlushMs);
+			playerBotParityTestResults.get(scenarioConfigIndex).status = "RUNNING";
+			playerBotParityTestResults.get(scenarioConfigIndex).failReason = "";
+			playerBotParityTestResults.get(scenarioConfigIndex).restartPhase = phase;
+			playerBotParityTestResults.get(scenarioConfigIndex).startedAtMs = nowMs;
+		}
+		(void)scenario;
+		schedulePlayerBotParityTestRunner(0);
+		return;
+	}
+
+	uint64 nowMs = System::getMiliTime();
+	if (scenarioStartedAtMs != 0 && nowMs > scenarioStartedAtMs && nowMs -
+			scenarioStartedAtMs > static_cast<uint64>(scenario.budgetMs)) {
+		restorePlayerBotParityScenarioGate();
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestResults.get(scenarioConfigIndex).status = "FAIL";
+			playerBotParityTestResults.get(scenarioConfigIndex).failReason =
+				"scenario_budget_exceeded";
+			playerBotParityTestScenarioActive = false;
+		}
+		beginPlayerBotParityTestCleanup(false);
+		schedulePlayerBotParityTestRunner(0);
+		return;
+	}
+	if (stepCursor >= scenario.steps.size()) {
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			if (playerBotParityTestGateOverrideActive) {
+				playerBotParityTestGateOverrideActive =
+					playerBotParityTestGateOverridePreviousActive;
+				playerBotParityTestGateOverride =
+					playerBotParityTestGateOverridePrevious;
+			}
+		}
+		bool retained = scenario.name == "retained_record_survives_restart";
+		if (phase == "A" && retained) {
+			if (!writePlayerBotParityPhaseAFile()) {
+				{
+					Locker parityLock(&playerBotParityTestMutex);
+					playerBotParityTestResults.get(scenarioConfigIndex).status = "FAIL";
+					playerBotParityTestResults.get(scenarioConfigIndex).failReason =
+						"phase_a_record_write_failed";
+					playerBotParityTestScenarioActive = false;
+				}
+				beginPlayerBotParityTestCleanup(false);
+				schedulePlayerBotParityTestRunner(0);
+				return;
+			}
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				playerBotParityTestResults.get(scenarioConfigIndex).status =
+					"AWAITING_RESTART";
+				playerBotParityTestResults.get(scenarioConfigIndex).finishedAtMs = nowMs;
+				playerBotParityTestResults.get(scenarioConfigIndex).durationMs =
+					nowMs - scenarioStartedAtMs;
+				playerBotParityTestScenarioActive = false;
+				playerBotParityTestAwaitingRestart = true;
+			}
+			beginPlayerBotParityTestCleanup(true);
+			schedulePlayerBotParityTestRunner(0);
+			return;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestResults.get(scenarioConfigIndex).status = "PASS";
+			playerBotParityTestResults.get(scenarioConfigIndex).finishedAtMs = nowMs;
+			playerBotParityTestResults.get(scenarioConfigIndex).durationMs =
+				nowMs - scenarioStartedAtMs;
+			playerBotParityTestScenarioActive = false;
+			playerBotParityTestScenarioIndex++;
+			playerBotParityTestStepCursor = 0;
+		}
+		if (phase == "B")
+			deletePlayerBotParityPhaseAFile();
+		schedulePlayerBotParityTestRunner(0);
+		return;
+	}
+
+	PlayerBotParityTestStep step = scenario.steps.get(stepCursor);
+	PlayerBotParityTestStepResult stepResult;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		stepResult = playerBotParityTestResults.get(scenarioConfigIndex).
+			steps.get(stepCursor);
+	}
+	if (!step.restartPhase.isEmpty() && step.restartPhase != phase) {
+		stepResult.status = "SKIPPED";
+		stepResult.durationMs = 0;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestResults.get(scenarioConfigIndex).steps.set(stepCursor,
+				stepResult);
+			playerBotParityTestStepCursor++;
+			playerBotParityTestStepStartedAtMs = nowMs;
+		}
+		schedulePlayerBotParityTestRunner(0);
+		return;
+	}
+	if (step.runtimeStartedAtMs == 0)
+		step.runtimeStartedAtMs = nowMs;
+	bool done = executePlayerBotParityStep(step, stepResult, nowMs);
+	if (!done) {
+		if (stepResult.status == "WAITING") {
+			int budget = step.budgetMs > 0 ? step.budgetMs : step.requestBudgetMs;
+			if (nowMs > step.runtimeStartedAtMs && budget > 0 && nowMs -
+					step.runtimeStartedAtMs > static_cast<uint64>(budget)) {
+				stepResult.status = "FAIL";
+				stepResult.failReason = "step_budget_exceeded";
+				done = true;
+			}
+		}
+		if (!done) {
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				playerBotParityTestScenarios.get(scenarioConfigIndex).steps.set(
+					stepCursor, step);
+				playerBotParityTestResults.get(scenarioConfigIndex).steps.set(
+					stepCursor, stepResult);
+			}
+			schedulePlayerBotParityTestRunner(250);
+			return;
+		}
+	}
+	stepResult.durationMs = nowMs > step.runtimeStartedAtMs ?
+		nowMs - step.runtimeStartedAtMs : 0;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityTestScenarios.get(scenarioConfigIndex).steps.set(
+			stepCursor, step);
+		playerBotParityTestResults.get(scenarioConfigIndex).steps.set(
+			stepCursor, stepResult);
+		if (stepResult.status == "PASS" || stepResult.status == "SKIPPED") {
+			playerBotParityTestStepCursor++;
+			playerBotParityTestStepStartedAtMs = nowMs;
+		}
+		if (stepResult.status == "FAIL") {
+			playerBotParityTestResults.get(scenarioConfigIndex).status = "FAIL";
+			playerBotParityTestResults.get(scenarioConfigIndex).failReason =
+				stepResult.failReason;
+			playerBotParityTestResults.get(scenarioConfigIndex).finishedAtMs = nowMs;
+			playerBotParityTestResults.get(scenarioConfigIndex).durationMs =
+				nowMs - scenarioStartedAtMs;
+			playerBotParityTestScenarioActive = false;
+		}
+	}
+	if (stepResult.status == "FAIL") {
+		restorePlayerBotParityScenarioGate();
+		beginPlayerBotParityTestCleanup(false);
+		schedulePlayerBotParityTestRunner(0);
+		return;
+	}
+	schedulePlayerBotParityTestRunner(0);
+}
+
+bool SimPlayerManager::findPlayerBotParityRestartProbe(uint64& identityId) {
+	VectorMap<uint64, SimBotIdentity> roster;
+	{
+		Locker pveLock(&pveMutex);
+		roster = pveIdentities;
+	}
+	Locker progressionLock(&progressionMutex);
+	for (int i = 0; i < roster.size(); ++i) {
+		uint64 id = roster.elementAt(i).getKey();
+		if (roster.elementAt(i).getValue().profession == "harness" &&
+				progressionRecords.contains(id) && progressionRecords.get(id).
+				lastAwardSource == "harness_retain") {
+			identityId = id;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool SimPlayerManager::executePlayerBotParityRequestStep(
+		PlayerBotParityTestStep& step, PlayerBotParityTestStepResult& result,
+		uint64 nowMs, PlayerBotProgressionRequest::Kind kind,
+		PlayerBotProgressionRequest* completedOut) {
+	if (step.runtimeRequestId == 0) {
+		PlayerBotProgressionRequest request;
+		request.kind = kind;
+		request.force = step.force;
+		request.xpType = step.xpType;
+		request.faultFlushDelayMs = step.flushDelayMs;
+		request.faultFailNextFlush = step.failNextFlush;
+		uint64 identityId = 0;
+		if (kind == PlayerBotProgressionRequest::ReadRow ||
+				kind == PlayerBotProgressionRequest::DeleteIdentity ||
+				kind == PlayerBotProgressionRequest::DeleteProgressionRow ||
+				kind == PlayerBotProgressionRequest::WriteRestartProbe) {
+			if (!getPlayerBotParityIdentityId(step, identityId)) {
+				result.status = "FAIL";
+				result.failReason = "identity_not_found";
+				return true;
+			}
+			request.identityId = identityId;
+			if (kind == PlayerBotProgressionRequest::WriteRestartProbe) {
+				Locker parityLock(&playerBotParityTestMutex);
+				playerBotParityTestProbeIdentityId = identityId;
+			}
+		}
+		step.runtimeRequestId = enqueuePlayerBotProgressionRequest(request);
+		step.runtimeStartedAtMs = nowMs;
+		if (!step.requestRef.isEmpty()) {
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestRequestRefs.put(step.requestRef,
+				step.runtimeRequestId);
+		}
+		kickPveMaintenanceNow();
+		if (step.async) {
+			result.status = "PASS";
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
+	}
+
+	PlayerBotProgressionRequest request;
+	// Sync (await) steps are the sole observer of their request, so a finished
+	// one is consumed here rather than left for the prune.
+	if (!consumePlayerBotProgressionRequest(step.runtimeRequestId, request)) {
+		result.status = "FAIL";
+		result.failReason = "request_not_found";
+		return true;
+	}
+	if (request.state == PlayerBotProgressionRequest::Failed) {
+		result.status = "FAIL";
+		result.failReason = request.error.isEmpty() ?
+			String("request_failed") : request.error;
+		return true;
+	}
+	if (request.state != PlayerBotProgressionRequest::Completed) {
+		if (step.requestBudgetMs > 0 && step.runtimeStartedAtMs != 0 &&
+				nowMs > step.runtimeStartedAtMs && nowMs -
+				step.runtimeStartedAtMs > static_cast<uint64>(step.requestBudgetMs)) {
+			result.status = "FAIL";
+			result.failReason = "request_budget_exceeded";
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
+	}
+
+	if (kind == PlayerBotProgressionRequest::MintHarnessIdentity) {
+		Locker parityLock(&playerBotParityTestMutex);
+		step.identityIndex = playerBotParityTestIdentityIds.size();
+		playerBotParityTestIdentityIds.add(request.identityId);
+		playerBotParityTestBodyOids.add(0);
+	}
+	if (kind == PlayerBotProgressionRequest::DeleteProgressionRow) {
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityTestOracle.drop(request.identityId);
+	}
+	if (kind == PlayerBotProgressionRequest::ReadRow && !step.expect.isEmpty()) {
+		int64 expected = 0;
+		if (!parsePlayerBotParityExpected(step.expect, expected) ||
+				!request.resultFound || request.resultValue != expected) {
+			result.status = "FAIL";
+			result.failReason = "persisted_row_mismatch";
+			return true;
+		}
+	}
+	// The finished request was consumed above, so hand its result back rather
+	// than leaving the caller to look up an entry that no longer exists.
+	if (completedOut != nullptr)
+		*completedOut = request;
+	result.status = "PASS";
+	return true;
+}
+
+bool SimPlayerManager::executePlayerBotParityStep(
+		PlayerBotParityTestStep& step, PlayerBotParityTestStepResult& result,
+		uint64 nowMs) {
+	String op = step.op.trim();
+	uint64 identityId = 0;
+	if (op == "grantXp" || op == "grantCredits" || op == "spendCredits" ||
+			op == "recordSkill" || op == "assertXp" || op == "assertCredits" ||
+			op == "assertSkill" || op == "assertDirty" || op == "assertSource" ||
+			op == "destroyBody" || op == "respawnBody" ||
+			op == "assertPersisted" || op == "deleteProgressionRow" ||
+			op == "deleteIdentity" || op == "writeRestartProbe") {
+		if (!getPlayerBotParityIdentityId(step, identityId)) {
+			result.status = "FAIL";
+			result.failReason = "identity_not_found";
+			return true;
+		}
+	}
+
+	if (op == "grantXp") {
+		bool granted = grantPlayerBotExperience(identityId, step.xpType,
+			static_cast<int>(step.amount), step.source, nullptr);
+		if (!granted || step.expectReject) {
+			// A rejection the scenario asked for is the PASS condition, and an
+			// award that lands anyway is the failure. Every award op shares this
+			// rule so a deliberate refusal never reads as a broken step.
+			resolvePlayerBotParityExpectedRejection(step, granted, result,
+				"grant_xp_rejected", "grant_xp_unexpectedly_accepted");
+			return true;
+		}
+		Locker parityLock(&playerBotParityTestMutex);
+		if (playerBotParityTestOracle.contains(identityId)) {
+			SimBotProgression& expected = playerBotParityTestOracle.get(identityId);
+			int current = expected.experience.contains(step.xpType) ?
+				expected.experience.get(step.xpType) : 0;
+			expected.experience.put(step.xpType, current + static_cast<int>(step.amount));
+			expected.awardsTotal++;
+			expected.lastAwardSource = progressionAwardSource(step.source);
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "grantCredits" || op == "spendCredits") {
+		bool success = op == "grantCredits" ?
+			grantPlayerBotCredits(identityId, step.amount, step.bank, step.source) :
+			spendPlayerBotCredits(identityId, step.amount, step.bank, step.source);
+		if (!success || step.expectReject) {
+			resolvePlayerBotParityExpectedRejection(step, success, result,
+				op == "grantCredits" ? "grant_credits_rejected" :
+					"spend_credits_rejected",
+				op == "grantCredits" ? "grant_credits_unexpectedly_accepted" :
+					"spend_credits_unexpectedly_accepted");
+			return true;
+		}
+		Locker parityLock(&playerBotParityTestMutex);
+		if (playerBotParityTestOracle.contains(identityId)) {
+			SimBotProgression& expected = playerBotParityTestOracle.get(identityId);
+			if (op == "grantCredits") {
+				if (step.bank) expected.bankCredits += step.amount;
+				else expected.cashCredits += step.amount;
+			} else {
+				if (step.bank) expected.bankCredits -= step.amount;
+				else expected.cashCredits -= step.amount;
+			}
+			expected.awardsTotal++;
+			expected.lastAwardSource = progressionAwardSource(step.source);
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "recordSkill") {
+		bool recorded = recordPlayerBotSkill(identityId, step.xpType, step.source);
+		if (!recorded || step.expectReject) {
+			resolvePlayerBotParityExpectedRejection(step, recorded, result,
+				"record_skill_rejected", "record_skill_unexpectedly_accepted");
+			return true;
+		}
+		Locker parityLock(&playerBotParityTestMutex);
+		if (playerBotParityTestOracle.contains(identityId)) {
+			SimBotProgression& expected = playerBotParityTestOracle.get(identityId);
+			if (!expected.skills.contains(step.xpType)) {
+				expected.skills.add(step.xpType);
+				expected.awardsTotal++;
+				expected.lastAwardSource = progressionAwardSource(step.source);
+			}
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertXp" || op == "assertCredits" || op == "assertSkill" ||
+			op == "assertSource") {
+		int64 expectedValue = 0;
+		if (op != "assertSource" && op != "assertSkill" &&
+				!parsePlayerBotParityExpected(step.expect, expectedValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_expected_value";
+			return true;
+		}
+		SimBotProgression actual;
+		if (!snapshotPlayerBotProgression(identityId, actual)) {
+			result.status = "FAIL";
+			result.failReason = "record_not_found";
+			return true;
+		}
+		SimBotProgression oracle;
+		bool oracleFound = false;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			if (playerBotParityTestOracle.contains(identityId)) {
+				oracle = playerBotParityTestOracle.get(identityId);
+				oracleFound = true;
+			}
+		}
+		if (op == "assertXp") {
+			int actualValue = actual.experience.contains(step.xpType) ?
+				actual.experience.get(step.xpType) : 0;
+			if (oracleFound && oracle.experience.contains(step.xpType) &&
+					actualValue != oracle.experience.get(step.xpType)) {
+				result.status = "FAIL";
+				result.failReason = "oracle_xp_mismatch";
+				return true;
+			}
+			if (actualValue != expectedValue) {
+				result.status = "FAIL";
+				result.failReason = "xp_mismatch";
+				return true;
+			}
+		} else if (op == "assertCredits") {
+			int64 actualValue = step.bank ? actual.bankCredits : actual.cashCredits;
+			if (oracleFound && actualValue != (step.bank ? oracle.bankCredits :
+					oracle.cashCredits)) {
+				result.status = "FAIL";
+				result.failReason = "oracle_credits_mismatch";
+				return true;
+			}
+			if (actualValue != expectedValue) {
+				result.status = "FAIL";
+				result.failReason = "credits_mismatch";
+				return true;
+			}
+		} else if (op == "assertSkill") {
+			if (!actual.skills.contains(step.xpType)) {
+				result.status = "FAIL";
+				result.failReason = "skill_missing";
+				return true;
+			}
+		} else if (actual.lastAwardSource != step.expect) {
+			result.status = "FAIL";
+			result.failReason = "award_source_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertCounterDelta" || op == "assertCounterValue") {
+		int64 expected = 0;
+		if (!parsePlayerBotParityExpected(step.expect, expected) ||
+				!assertPlayerBotParityCounter(step.counter, expected,
+					op == "assertCounterDelta", result.failReason)) {
+			result.status = "FAIL";
+			if (result.failReason.isEmpty()) result.failReason = "counter_assertion_failed";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertStore") {
+		if (!assertPlayerBotParityStore(step, result.failReason)) {
+			result.status = "FAIL";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertRecords") {
+		int64 baseline = 0;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			baseline = playerBotParityTestScenarioBaselineRecords;
+		}
+		int64 actual = playerBotParityCounterValue("records");
+		if (actual - baseline != step.expectedDelta) {
+			result.status = "FAIL";
+			result.failReason = "record_delta_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertDirty") {
+		int64 expected = 0;
+		if (!parsePlayerBotParityExpected(step.expect, expected)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_dirty_expectation";
+			return true;
+		}
+		bool dirty = false;
+		{
+			Locker progressionLock(&progressionMutex);
+			dirty = progressionDirtyIds.contains(identityId);
+		}
+		if ((dirty ? 1 : 0) != expected) {
+			result.status = "FAIL";
+			result.failReason = "dirty_state_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertPersisted") {
+		PlayerBotProgressionRequest request;
+		if (!executePlayerBotParityRequestStep(step, result, nowMs,
+				PlayerBotProgressionRequest::ReadRow, &request))
+			return false;
+		if (result.status == "FAIL")
+			return true;
+		if (!request.resultFound) {
+			result.status = "FAIL";
+			result.failReason = "persisted_row_missing";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "awardUnknownIdentity") {
+		uint64 unknown = step.identityId == 0 ? 999999999ULL : step.identityId;
+		if (grantPlayerBotExperience(unknown, step.xpType.isEmpty() ?
+				String("harness_unknown") : step.xpType,
+				step.amount <= 0 ? 1 : static_cast<int>(step.amount), step.source,
+				nullptr)) {
+			result.status = "FAIL";
+			result.failReason = "unknown_identity_accepted";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "awardNonRosterBody") {
+		if (!awardToNonRosterPlayerBotBody(0, step.xpType, static_cast<int>(step.amount),
+				step.source)) {
+			result.status = "FAIL";
+			result.failReason = "non_roster_body_probe_failed";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "destroyBody") {
+		destroyPlayerBotParityBody(step.identityIndex, "scenario_destroy");
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "respawnBody") {
+		if (spawnPlayerBotParityBody(step.identityIndex) == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "body_respawn_failed";
+			return true;
+		}
+		syncPlayerBotParityOracle();
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "waitForFlush") {
+		uint64 baseline = 0;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			baseline = playerBotParityTestCounterBaselines.contains("lastflushms") ?
+				playerBotParityTestCounterBaselines.get("lastflushms") : 0;
+		}
+		if (progressionLastFlushMs > baseline) {
+			result.status = "PASS";
+			return true;
+		}
+		int budget = step.budgetMs > 0 ? step.budgetMs : 30000;
+		if (step.runtimeStartedAtMs == 0)
+			step.runtimeStartedAtMs = nowMs;
+		if (nowMs > step.runtimeStartedAtMs && nowMs - step.runtimeStartedAtMs >
+				static_cast<uint64>(budget)) {
+			result.status = "FAIL";
+			result.failReason = "flush_budget_exceeded";
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
+	}
+	if (op == "waitForRequest") {
+		uint64 requestId = step.runtimeRequestId;
+		if (requestId == 0) {
+			Locker parityLock(&playerBotParityTestMutex);
+			requestId = playerBotParityTestRequestRefs.contains(step.requestRef) ?
+				playerBotParityTestRequestRefs.get(step.requestRef) : 0;
+		}
+		if (requestId == 0) {
+			result.status = "FAIL";
+			result.failReason = "request_ref_not_found";
+			return true;
+		}
+		step.runtimeRequestId = requestId;
+		PlayerBotProgressionRequest request;
+		if (!copyPlayerBotProgressionRequest(requestId, request)) {
+			result.status = "FAIL";
+			result.failReason = "request_not_found";
+			return true;
+		}
+		if (request.state == PlayerBotProgressionRequest::Failed) {
+			result.status = "FAIL";
+			result.failReason = request.error;
+			return true;
+		}
+		String phase = step.phase.trim().toLowerCase();
+		bool complete = request.state == PlayerBotProgressionRequest::Completed;
+		bool started = request.state == PlayerBotProgressionRequest::Running || complete;
+		if ((phase == "queued" && request.state == PlayerBotProgressionRequest::Queued) ||
+				(phase == "started" && started) || (phase.isEmpty() && complete) ||
+				(phase == "completed" && complete)) {
+			result.status = "PASS";
+			return true;
+		}
+		int budget = step.budgetMs > 0 ? step.budgetMs : 30000;
+		if (step.runtimeStartedAtMs == 0)
+			step.runtimeStartedAtMs = nowMs;
+		if (nowMs > step.runtimeStartedAtMs && nowMs - step.runtimeStartedAtMs >
+				static_cast<uint64>(budget)) {
+			result.status = "FAIL";
+			result.failReason = "request_budget_exceeded";
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
+	}
+	if (op == "setGate") {
+		int64 enabledValue = 0;
+		if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_gate_value";
+			return true;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			if (!playerBotParityTestGateOverrideActive) {
+				playerBotParityTestGateOverridePreviousActive = false;
+				playerBotParityTestGateOverridePrevious = true;
+			} else {
+				playerBotParityTestGateOverridePreviousActive = true;
+				playerBotParityTestGateOverridePrevious = playerBotParityTestGateOverride;
+			}
+			playerBotParityTestGateOverrideActive = true;
+			playerBotParityTestGateOverride = enabledValue != 0;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "writeRestartProbe") {
+		bool allPriorPassed = true;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			for (int i = 0; i < playerBotParityTestResults.size(); ++i) {
+				if (playerBotParityTestResults.get(i).name !=
+						"retained_record_survives_restart" &&
+						playerBotParityTestResults.get(i).status != "PASS") {
+					allPriorPassed = false;
+					break;
+				}
+			}
+		}
+		if (!allPriorPassed) {
+			result.status = "FAIL";
+			result.failReason = "phase_a_not_fully_passing";
+			return true;
+		}
+		return executePlayerBotParityRequestStep(step, result, nowMs,
+			PlayerBotProgressionRequest::WriteRestartProbe);
+	}
+
+	PlayerBotProgressionRequest::Kind requestKind;
+	bool isRequest = true;
+	if (op == "flushNow") requestKind = PlayerBotProgressionRequest::FlushNow;
+	else if (op == "reloadStore") requestKind = PlayerBotProgressionRequest::ReloadStore;
+	else if (op == "readRow") requestKind = PlayerBotProgressionRequest::ReadRow;
+	else if (op == "injectOrphan") requestKind = PlayerBotProgressionRequest::InjectOrphan;
+	else if (op == "mintIdentity") requestKind = PlayerBotProgressionRequest::MintHarnessIdentity;
+	else if (op == "deleteIdentity") requestKind = PlayerBotProgressionRequest::DeleteIdentity;
+	else if (op == "deleteProgressionRow") requestKind = PlayerBotProgressionRequest::DeleteProgressionRow;
+	else if (op == "runReaper") requestKind = PlayerBotProgressionRequest::RunReaper;
+	else if (op == "injectFault") requestKind = PlayerBotProgressionRequest::InjectFault;
+	else isRequest = false;
+	if (isRequest)
+		return executePlayerBotParityRequestStep(step, result, nowMs, requestKind);
+
+	result.status = "FAIL";
+	result.failReason = "unknown_op_" + op;
+	return true;
+}
+
+JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
+	// Keyed by identity id so the per-record row build below stays linear; the
+	// dashboard is polled every few seconds against a roster meant to grow.
+	VectorMap<uint64, SimBotIdentity> roster;
+	VectorMap<uint64, uint64> bodyOids;
+	{
+		Locker pveLock(&pveMutex);
+		roster = pveIdentities;
+		bodyOids = pveIdentityBodyOids;
+	}
+
+	VectorMap<uint64, SimBotProgression> records;
+	int dirtyCount = 0;
+	uint64 lastFlushMs = 0;
+	{
+		Locker progressionLock(&progressionMutex);
+		records = progressionRecords;
+		dirtyCount = progressionDirtyIds.size();
+		lastFlushMs = progressionLastFlushMs;
+	}
+
+	bool rerunPending = false;
+	uint64 lastEntryMs = 0;
+	{
+		Locker stateLock(&pveMaintenanceStateMutex);
+		rerunPending = pveMaintenanceRerunPending;
+		lastEntryMs = pveMaintenanceLastEntryMs;
+	}
+
+	uint64 nowMs = System::getMiliTime();
+	JSONSerializationType result = JSONSerializationType::object();
+	result["enabled"] = progressionEnabled;
+	result["storeLoaded"] = progressionLoaded;
+	result["dbAvailable"] = progressionDbAvailable;
+	result["records"] = records.size();
+	result["orphanRecords"] = progressionOrphanRecords.get();
+	result["rosterWithoutRecord"] = progressionRosterWithoutRecord.get();
+	result["dirtyCount"] = dirtyCount;
+	result["lastFlushAgeSeconds"] = lastFlushMs == 0 ? 0 :
+		static_cast<uint64>((nowMs > lastFlushMs ?
+			nowMs - lastFlushMs : 0) / 1000);
+	result["flushIntervalSeconds"] = progressionFlushIntervalSeconds;
+
+	JSONSerializationType reaper = JSONSerializationType::object();
+	reaper["enabled"] = progressionReaperEnabled;
+	reaper["minAgeSeconds"] = progressionReaperMinAgeSeconds;
+	reaper["runs"] = progressionReaperRuns.get();
+	reaper["reaped"] = progressionOrphansReaped.get();
+	result["reaper"] = reaper;
+
+	JSONSerializationType awards = JSONSerializationType::object();
+	awards["accepted"] = progressionAwardsAccepted.get();
+	awards["rejectedNoRecord"] = progressionAwardsRejectedNoRecord.get();
+	awards["rejectedNoIdentity"] = progressionAwardsRejectedNoIdentity.get();
+	awards["rejectedDisabled"] = progressionAwardsRejectedDisabled.get();
+	awards["rejectedInsufficient"] =
+		progressionAwardsRejectedInsufficient.get();
+	awards["rejectedInvalidAmount"] =
+		progressionAwardsRejectedInvalidAmount.get();
+	result["awards"] = awards;
+
+	JSONSerializationType gates = JSONSerializationType::object();
+	// Later P.10 chunks add their capability gates to this shared Lua block.
+	// Reporting absent gates as false keeps the dashboard fail-closed today.
+	gates["awardKillXp"] = false;
+	gates["awardMissionCredits"] = false;
+	gates["lootEnabled"] = false;
+	gates["groupLoot"] = false;
+	gates["trainingEnabled"] = false;
+	gates["bazaarSell"] = false;
+	gates["bazaarBuy"] = false;
+	result["gates"] = gates;
+
+	JSONSerializationType maintenance = JSONSerializationType::object();
+	maintenance["ticksTotal"] = pveMaintenanceTicksTotal.get();
+	maintenance["lastEntryAgeSeconds"] = lastEntryMs == 0 ? 0 :
+		static_cast<uint64>((nowMs > lastEntryMs ?
+			nowMs - lastEntryMs : 0) / 1000);
+	maintenance["intervalSeconds"] = pveMaintenanceIntervalSeconds;
+	maintenance["rerunPending"] = rerunPending;
+	{
+		// Only work the maintenance lane still owes counts here. Completed and
+		// failed entries linger until their consumer or the prune removes them,
+		// and counting those would make the post-harness cadence gate
+		// (requestsQueued == 0) impossible to satisfy.
+		Locker requestLock(&progressionRequestMutex);
+		int liveRequests = 0;
+		for (int i = 0; i < progressionRequests.size(); ++i) {
+			const PlayerBotProgressionRequest& queued = progressionRequests.get(i);
+			if (queued.state == PlayerBotProgressionRequest::Queued ||
+					queued.state == PlayerBotProgressionRequest::Running)
+				++liveRequests;
+		}
+		maintenance["requestsQueued"] = liveRequests;
+	}
+	maintenance["kicksRequested"] = pveMaintenanceKicksRequested.get();
+	maintenance["kicksImmediate"] = pveMaintenanceKicksImmediate.get();
+	maintenance["kicksDeferred"] = pveMaintenanceKicksDeferred.get();
+	maintenance["requestMaxWaitMs"] = progressionRequestMaxWaitMs.get();
+	result["maintenance"] = maintenance;
+
+	JSONSerializationType identityRows = JSONSerializationType::array();
+	for (int i = 0; i < records.size(); ++i) {
+		uint64 identityId = records.elementAt(i).getKey();
+		const SimBotProgression& progression = records.elementAt(i).getValue();
+		const SimBotIdentity* identity = roster.contains(identityId) ?
+			&roster.get(identityId) : nullptr;
+
+		JSONSerializationType row = JSONSerializationType::object();
+		row["identityId"] = identityId;
+		row["name"] = identity == nullptr ?
+			String("orphan #") + String::valueOf(identityId) :
+			identity->firstName + " " + identity->lastName;
+		row["profession"] = identity == nullptr ? String("orphan") :
+			identity->profession;
+		row["bankCredits"] = progression.bankCredits;
+		row["cashCredits"] = progression.cashCredits;
+		row["skillPointsSpent"] = progression.skillPointsSpent;
+		row["awardsTotal"] = progression.awardsTotal;
+		row["lastAwardAgeSeconds"] = progression.lastAwardMs == 0 ? 0 :
+			static_cast<uint64>((nowMs > progression.lastAwardMs ?
+				nowMs - progression.lastAwardMs : 0) / 1000);
+		row["lastAwardSource"] = progression.lastAwardSource;
+		row["bodyOid"] = bodyOids.contains(identityId) ?
+			bodyOids.get(identityId) : 0;
+
+		JSONSerializationType experience = JSONSerializationType::object();
+		for (int j = 0; j < progression.experience.size(); ++j)
+			experience[progression.experience.elementAt(j).getKey()] =
+				progression.experience.elementAt(j).getValue();
+		row["xp"] = experience;
+		JSONSerializationType skills = JSONSerializationType::array();
+		for (int j = 0; j < progression.skills.size(); ++j)
+			skills.push_back(progression.skills.get(j));
+		row["skills"] = skills;
+		identityRows.push_back(row);
+	}
+	result["identities"] = identityRows;
+
+	JSONSerializationType harness = JSONSerializationType::object();
+	Vector<PlayerBotParityTestScenarioResult> harnessResults;
+	bool harnessEnabled = false;
+	int harnessCursor = 0;
+	String harnessPhase;
+	String harnessRunId;
+	uint64 harnessProbeId = 0;
+	uint64 harnessRowsStale = 0;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		harnessEnabled = playerBotParityTestEnabled;
+		harnessCursor = playerBotParityTestScenarioIndex;
+		harnessPhase = playerBotParityTestPhase;
+		harnessRunId = playerBotParityTestRunId;
+		harnessProbeId = playerBotParityTestProbeIdentityId;
+		harnessRowsStale = playerBotParityTestHarnessRowsStale;
+		harnessResults = playerBotParityTestResults;
+	}
+	harness["enabled"] = harnessEnabled;
+	harness["cursor"] = harnessCursor;
+	harness["phase"] = harnessPhase;
+	harness["runId"] = harnessRunId;
+	harness["probeIdentityId"] = harnessProbeId;
+	harness["harnessRowsStale"] = harnessRowsStale;
+	JSONSerializationType scenarioRows = JSONSerializationType::array();
+	for (int i = 0; i < harnessResults.size(); ++i) {
+		const PlayerBotParityTestScenarioResult& scenario = harnessResults.get(i);
+		JSONSerializationType scenarioRow = JSONSerializationType::object();
+		scenarioRow["name"] = scenario.name;
+		scenarioRow["status"] = scenario.status;
+		scenarioRow["failReason"] = scenario.failReason;
+		scenarioRow["restartPhase"] = scenario.restartPhase;
+		scenarioRow["startedAtMs"] = scenario.startedAtMs;
+		scenarioRow["finishedAtMs"] = scenario.finishedAtMs;
+		scenarioRow["durationMs"] = scenario.durationMs;
+		JSONSerializationType stepRows = JSONSerializationType::array();
+		for (int j = 0; j < scenario.steps.size(); ++j) {
+			const PlayerBotParityTestStepResult& step = scenario.steps.get(j);
+			JSONSerializationType stepRow = JSONSerializationType::object();
+			stepRow["op"] = step.op;
+			stepRow["identityIndex"] = step.identityIndex;
+			stepRow["status"] = step.status;
+			stepRow["failReason"] = step.failReason;
+			stepRow["durationMs"] = step.durationMs;
+			stepRows.push_back(stepRow);
+		}
+		scenarioRow["steps"] = stepRows;
+		scenarioRows.push_back(scenarioRow);
+	}
+	harness["scenarios"] = scenarioRows;
+	result["harness"] = harness;
+	return result;
 }
 
 void SimPlayerManager::loadPveIdentityRoster() {
@@ -8571,105 +11522,125 @@ void SimPlayerManager::loadPveIdentityRoster() {
 	}
 }
 
-void SimPlayerManager::mintPveIdentitiesIfNeeded() {
-	if (!pveRosterLoaded || !pveDatabaseAvailable || pveMaxHunters <= 0)
-		return;
+bool SimPlayerManager::mintPveIdentity(const String& requestedProfession,
+		SimBotIdentity& identityOut) {
+	if (!pveRosterLoaded || !pveDatabaseAvailable)
+		return false;
 
 	NameManager* nameManager = nullptr;
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
 	if (zoneServer != nullptr)
 		nameManager = zoneServer->getNameManager();
-
 	if (nameManager == nullptr)
+		return false;
+
+	String profession = requestedProfession.trim();
+	if (profession.isEmpty())
+		return false;
+
+	for (int attempt = 0; attempt < 20; ++attempt) {
+		String fullName = nameManager->makeCreatureName(0, 0).trim();
+		int separator = fullName.indexOf(" ");
+		if (separator <= 0 || separator >= fullName.length() - 1)
+			continue;
+
+		SimBotIdentity identity;
+		identity.firstName = fullName.subString(0, separator);
+		identity.lastName = fullName.subString(separator + 1);
+		identity.profession = profession;
+		identity.skillTier = pveSkillTier;
+
+		// Rotate all identity kinds over placement-eligible cities. Routing-only
+		// nodes are graph destinations, never body spawn/clone origins.
+		Vector<int> homeCandidates;
+		for (int i = 0; i < allShuttleports.size(); ++i) {
+			if (!allShuttleports.get(i).routingOnly)
+				homeCandidates.add(i);
+		}
+		if (homeCandidates.size() > 0) {
+			const ShuttleportLocation& home = allShuttleports.get(
+				homeCandidates.get(pveNextHomeCityIndex % homeCandidates.size()));
+			identity.homePlanet = home.planet;
+			identity.homeCity = home.name;
+			pveNextHomeCityIndex++;
+		}
+
+		String firstName = identity.firstName;
+		String lastName = identity.lastName;
+		String escapedProfession = identity.profession;
+		String homePlanet = identity.homePlanet;
+		String homeCity = identity.homeCity;
+		Database::escapeString(firstName);
+		Database::escapeString(lastName);
+		Database::escapeString(escapedProfession);
+		Database::escapeString(homePlanet);
+		Database::escapeString(homeCity);
+
+		String insert = "INSERT IGNORE INTO `simbot_identities` "
+			"(`first_name`,`last_name`,`profession`,`home_planet`,"
+			"`home_city`,`skill_tier`,`created_at`,`last_seen_at`) VALUES ('" +
+			firstName + "','" + lastName + "','" + escapedProfession + "','" +
+			homePlanet + "','" + homeCity + "'," +
+			String::valueOf(identity.skillTier) + ",NOW(),NOW());";
+
+		try {
+			UniqueReference<ResultSet*> insertResult(
+				ServerDatabase::instance()->executeQuery(insert));
+			(void)insertResult;
+			String select = "SELECT `id`,`created_at`,`last_seen_at` FROM "
+				"`simbot_identities` WHERE `first_name`='" + firstName +
+				"' AND `last_name`='" + lastName + "' LIMIT 1;";
+			UniqueReference<ResultSet*> result(
+				ServerDatabase::instance()->executeQuery(select));
+			if (result == nullptr || !result->next())
+				continue;
+
+			identity.id = result->getUnsignedLong(0);
+			identity.createdAt = pveRosterResultString(result, 1);
+			identity.lastSeenAt = pveRosterResultString(result, 2);
+			bool inserted = false;
+			{
+				Locker pveLock(&pveMutex);
+				if (!pveIdentities.contains(identity.id)) {
+					pveIdentities.put(identity.id, identity);
+					inserted = true;
+				}
+			}
+			if (!inserted)
+				continue;
+
+			identityOut = identity;
+			if (progressionEnabled && progressionLoaded)
+				ensurePlayerBotProgressionRecord(identity.id);
+			return true;
+		} catch (const Exception& e) {
+			pveDatabaseAvailable = false;
+			error("SimPveRosterMintFailed: " + e.getMessage());
+			return false;
+		}
+	}
+
+	return false;
+}
+
+void SimPlayerManager::mintPveIdentitiesIfNeeded() {
+	if (!pveRosterLoaded || !pveDatabaseAvailable || pveMaxHunters <= 0)
 		return;
 
 	int rosterSize = 0;
 	{
 		Locker pveLock(&pveMutex);
-		rosterSize = pveIdentities.size();
+		for (int i = 0; i < pveIdentities.size(); ++i) {
+			if (pveIdentities.elementAt(i).getValue().profession == "hunter")
+				++rosterSize;
+		}
 	}
 
 	while (rosterSize < pveMaxHunters) {
-		bool inserted = false;
-
-		for (int attempt = 0; attempt < 20 && !inserted; ++attempt) {
-			String fullName = nameManager->makeCreatureName(0, 0).trim();
-			int separator = fullName.indexOf(" ");
-			if (separator <= 0 || separator >= fullName.length() - 1)
-				continue;
-
-			SimBotIdentity identity;
-			identity.firstName = fullName.subString(0, separator);
-			identity.lastName = fullName.subString(separator + 1);
-			identity.profession = "hunter";
-			identity.skillTier = pveSkillTier;
-
-			// P.8.7: rotate home cities over placement-eligible cities only, so
-			// a routing-graph node never becomes a hunter's spawn/clone origin.
-			Vector<int> homeCandidates;
-			for (int i = 0; i < allShuttleports.size(); ++i) {
-				if (!allShuttleports.get(i).routingOnly)
-					homeCandidates.add(i);
-			}
-
-			if (homeCandidates.size() > 0) {
-				const ShuttleportLocation& home = allShuttleports.get(
-					homeCandidates.get(
-						pveNextHomeCityIndex % homeCandidates.size()));
-				identity.homePlanet = home.planet;
-				identity.homeCity = home.name;
-				pveNextHomeCityIndex++;
-			}
-
-			String firstName = identity.firstName;
-			String lastName = identity.lastName;
-			String profession = identity.profession;
-			String homePlanet = identity.homePlanet;
-			String homeCity = identity.homeCity;
-			Database::escapeString(firstName);
-			Database::escapeString(lastName);
-			Database::escapeString(profession);
-			Database::escapeString(homePlanet);
-			Database::escapeString(homeCity);
-
-			String insert = "INSERT IGNORE INTO `simbot_identities` "
-				"(`first_name`,`last_name`,`profession`,`home_planet`,"
-				"`home_city`,`skill_tier`,`created_at`,`last_seen_at`) VALUES ('" +
-				firstName + "','" + lastName + "','" + profession + "','" +
-				homePlanet + "','" + homeCity + "'," +
-				String::valueOf(identity.skillTier) + ",NOW(),NOW());";
-
-			try {
-				UniqueReference<ResultSet*> insertResult(
-					ServerDatabase::instance()->executeQuery(insert));
-				(void)insertResult;
-				String select = "SELECT `id`,`created_at`,`last_seen_at` FROM "
-					"`simbot_identities` WHERE `first_name`='" + firstName +
-					"' AND `last_name`='" + lastName + "' LIMIT 1;";
-				UniqueReference<ResultSet*> result(
-					ServerDatabase::instance()->executeQuery(select));
-
-				if (result != nullptr && result->next()) {
-					identity.id = result->getUnsignedLong(0);
-					identity.createdAt = pveRosterResultString(result, 1);
-					identity.lastSeenAt = pveRosterResultString(result, 2);
-					Locker pveLock(&pveMutex);
-					if (!pveIdentities.contains(identity.id)) {
-						pveIdentities.put(identity.id, identity);
-						inserted = true;
-					}
-				}
-			} catch (const Exception& e) {
-				pveDatabaseAvailable = false;
-				error("SimPveRosterMintFailed: " + e.getMessage());
-				return;
-			}
-		}
-
-		if (!inserted)
+		SimBotIdentity identity;
+		if (!mintPveIdentity("hunter", identity))
 			break;
-
-		rosterSize++;
+		++rosterSize;
 		info("SimPveIdentityMinted rosterSize=" + String::valueOf(rosterSize), true);
 	}
 }
@@ -8726,7 +11697,8 @@ void SimPlayerManager::flushPveIdentityRoster(bool force) {
 		info("SimPveRosterFlushed identities=" + String::valueOf(dirty.size()), true);
 }
 
-AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity) {
+AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
+		const Vector3* spawnOverride) {
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
 	Zone* zone = zoneServer == nullptr ? nullptr :
 		zoneServer->getZone(identity.homePlanet);
@@ -8749,14 +11721,19 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity) 
 	}
 
 	ShuttleportLocation home;
-	bool homeFound = false;
-	for (int i = 0; i < allShuttleports.size(); ++i) {
-		const ShuttleportLocation& location = allShuttleports.get(i);
-		if (location.planet == identity.homePlanet &&
-				location.name == identity.homeCity) {
-			home = location;
-			homeFound = true;
-			break;
+	bool homeFound = spawnOverride != nullptr;
+	if (homeFound) {
+		home.planet = identity.homePlanet;
+		home.spawn = *spawnOverride;
+	} else {
+		for (int i = 0; i < allShuttleports.size(); ++i) {
+			const ShuttleportLocation& location = allShuttleports.get(i);
+			if (location.planet == identity.homePlanet &&
+					location.name == identity.homeCity) {
+				home = location;
+				homeFound = true;
+				break;
+			}
 		}
 	}
 	if (!homeFound)
@@ -8897,8 +11874,10 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity) 
 
 	{
 		Locker agentLock(agent);
-		// The hunter map only overrides IDLE; default combat slots remain live.
-		agent->setCustomAiMap(String("simHunter").hashCode());
+		// Both identity kinds use the same production body path. Harness bodies
+		// only override IDLE; hunter bodies retain their existing combat map.
+		agent->setCustomAiMap((identity.profession == "harness" ?
+			String("simParityTest") : String("simHunter")).hashCode());
 		agent->setAITemplate();
 		agent->clearPatrolPoints();
 	}
@@ -9135,6 +12114,8 @@ void SimPlayerManager::governPvePopulation(uint64 nowMs) {
 		Locker pveLock(&pveMutex);
 		for (int i = 0; i < pveIdentities.size() &&
 				candidates.size() < pveMaxHunters; ++i) {
+			if (pveIdentities.elementAt(i).getValue().profession != "hunter")
+				continue;
 			uint64 identityId = pveIdentities.elementAt(i).getKey();
 			if (pveIdentityBodyOids.contains(identityId))
 				continue;
@@ -11640,6 +14621,8 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 		marketTerminals = allMissionTerminals;
 		for (int i = 0; i < pveIdentities.size() &&
 				identities.size() < pveMaxHunters; ++i) {
+			if (pveIdentities.elementAt(i).getValue().profession != "hunter")
+				continue;
 			uint64 identityId = pveIdentities.elementAt(i).getKey();
 			if (pveIdentityBodyOids.contains(identityId) &&
 					!pveHuntOrders.contains(identityId)) {
@@ -12876,6 +15859,15 @@ void SimPlayerManager::attachPveHunterController(
 		return;
 
 	uint64 bodyOid = body->getObjectID();
+	if (identity.profession == "harness") {
+		Reference<SimParityTestController*> parity =
+			new SimParityTestController(body);
+		controllers.put(bodyOid, parity.castTo<SimPlayerController*>());
+		body->activateAiBehavior(true);
+		parity->startSimLoop();
+		return;
+	}
+
 	Reference<SimHunterController*> hunter =
 		new SimHunterController(body, identity.id);
 	controllers.put(bodyOid, hunter.castTo<SimPlayerController*>());
@@ -12907,14 +15899,38 @@ void SimPlayerManager::attachPveHunterController(
 void SimPlayerManager::runPveFoundationMaintenanceTask() {
 	// This is the sole call path for the Phase 1 roster SQL. Observer and
 	// dashboard paths only publish/read memory and never query MySQL.
-	pveMaintenanceTaskScheduled = false;
-	if (!enabled || !pveEnabled)
-		return;
+	uint64 entryMs = System::getMiliTime();
+	{
+		Locker stateLock(&pveMaintenanceStateMutex);
+		pveMaintenanceScheduled = false;
+		pveMaintenanceArmedTask = nullptr;
+		pveMaintenanceRunning = true;
+		pveMaintenanceLastEntryMs = entryMs;
+		pveMaintenanceTicksTotal.increment();
+	}
 
-	schedulePveFoundationMaintenanceTask();
-	ZoneServer* zoneServer = ServerCore::getZoneServer();
-	if (zoneServer == nullptr || zoneServer->isServerLoading())
+	if (!enabled || !pveEnabled) {
+		completePveFoundationMaintenanceTask(entryMs);
 		return;
+	}
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (zoneServer == nullptr || zoneServer->isServerLoading()) {
+		completePveFoundationMaintenanceTask(entryMs);
+		return;
+	}
+
+	// Phase 2 queues all harness SQL here. Keeping the drain ahead of the
+	// ordinary maintenance work preserves one writer for every progression and
+	// roster query.
+	drainPlayerBotProgressionRequests();
+
+	// Runtime config refreshes do not revisit the boot block. An enable is
+	// therefore loaded explicitly on this maintenance lane once the roster is
+	// already available.
+	if (progressionEnabled && !progressionLoaded && pveRosterLoaded &&
+			pveDatabaseAvailable)
+		loadPlayerBotProgressionStore();
 
 	// Mission terminals are a post-load world scan. Each configured city is
 	// retried independently so one ready city cannot stop discovery for a
@@ -12927,12 +15943,47 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 		String readinessPlanet = pveSpikePlanet;
 		if (readinessPlanet.isEmpty() && allShuttleports.size() > 0)
 			readinessPlanet = allShuttleports.get(0).planet;
-		if (readinessPlanet.isEmpty() || zoneServer->getZone(readinessPlanet) == nullptr)
+		if (readinessPlanet.isEmpty() || zoneServer->getZone(readinessPlanet) == nullptr) {
+			completePveFoundationMaintenanceTask(entryMs);
 			return;
+		}
 
 		loadPveIdentityRoster();
-		if (!pveRosterLoaded || !pveDatabaseAvailable)
+		if (!pveRosterLoaded || !pveDatabaseAvailable) {
+			completePveFoundationMaintenanceTask(entryMs);
 			return;
+		}
+
+		if (progressionEnabled && !progressionLoaded)
+			loadPlayerBotProgressionStore();
+
+		bool parityEnabled = false;
+		bool staleScanned = false;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			parityEnabled = playerBotParityTestEnabled;
+			staleScanned = playerBotParityTestStaleRowsScanned;
+		}
+		if (progressionLoaded && !parityEnabled && !staleScanned) {
+			VectorMap<uint64, SimBotIdentity> rosterSnapshot;
+			{
+				Locker pveLock(&pveMutex);
+				rosterSnapshot = pveIdentities;
+			}
+			int staleRows = 0;
+			{
+				Locker progressionLock(&progressionMutex);
+				for (int i = 0; i < rosterSnapshot.size(); ++i) {
+					uint64 id = rosterSnapshot.elementAt(i).getKey();
+					if (rosterSnapshot.elementAt(i).getValue().profession == "harness" &&
+							progressionRecords.contains(id))
+						++staleRows;
+				}
+			}
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestHarnessRowsStale = staleRows;
+			playerBotParityTestStaleRowsScanned = true;
+		}
 
 		mintPveIdentitiesIfNeeded();
 		pveBootReady = true;
@@ -12954,6 +16005,8 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 	governPvePopulation(nowMs);
 	runPveHunterMatchmaker(nowMs);
 	flushPveIdentityRoster(false);
+	flushPlayerBotProgressionStore(false);
+	completePveFoundationMaintenanceTask(entryMs);
 }
 
 void SimPlayerManager::runPveSpikeIfNeeded(uint64 nowMs) {
@@ -15501,6 +18554,7 @@ JSONSerializationType SimPlayerManager::getAiEconomyDashboardSnapshot() {
     result["population"] = population;
 	result["pveActivity"] = getPveActivityDashboard();
 	result["pveSpike"] = getPveSpikeDashboard();
+	result["playerBotProgression"] = getPlayerBotProgressionDashboard();
 
     int assignmentActive = 0;
     int assignmentQueued = 0;
@@ -32358,6 +35412,18 @@ void SimPlayerManager::refreshPvpConfig() {
     if (pveConfig.isValidTable())
         applyPveConfig(pveConfig);
     pveConfig.pop();
+
+    LuaObject playerBotProgressionConfig = managerConfig.getObjectField(
+        "playerBotProgression");
+    if (playerBotProgressionConfig.isValidTable())
+        applyPlayerBotProgressionConfig(playerBotProgressionConfig);
+    playerBotProgressionConfig.pop();
+
+    LuaObject playerBotParityTestConfig = managerConfig.getObjectField(
+        "playerBotParityTest");
+    if (playerBotParityTestConfig.isValidTable())
+        applyPlayerBotParityTestConfig(playerBotParityTestConfig);
+    playerBotParityTestConfig.pop();
 
     managerConfig.pop();
 }

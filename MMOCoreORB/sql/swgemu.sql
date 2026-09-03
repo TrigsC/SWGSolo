@@ -13574,6 +13574,33 @@ CREATE TABLE `swgemu`.`simbot_identities` (
   UNIQUE KEY `idx_simbot_identity_name` (`first_name`,`last_name`)
 ) ENGINE=MyISAM DEFAULT CHARSET=latin1;
 
+CREATE TABLE IF NOT EXISTS `swgemu`.`simbot_progression` (
+  `identity_id` bigint(20) NOT NULL,
+  `bank_credits` bigint(20) NOT NULL DEFAULT '0',
+  `cash_credits` bigint(20) NOT NULL DEFAULT '0',
+  `skill_points_spent` int(11) NOT NULL DEFAULT '0',
+  `awards_total` bigint(20) NOT NULL DEFAULT '0',
+  `last_award_source` varchar(32) DEFAULT NULL,
+  `created_at` datetime NOT NULL,
+  `updated_at` datetime NOT NULL,
+  PRIMARY KEY (`identity_id`)
+) ENGINE=MyISAM DEFAULT CHARSET=latin1;
+
+CREATE TABLE IF NOT EXISTS `swgemu`.`simbot_experience` (
+  `identity_id` bigint(20) NOT NULL,
+  `xp_type` varchar(64) NOT NULL,
+  `amount` int(11) NOT NULL DEFAULT '0',
+  `updated_at` datetime NOT NULL,
+  PRIMARY KEY (`identity_id`,`xp_type`)
+) ENGINE=MyISAM DEFAULT CHARSET=latin1;
+
+CREATE TABLE IF NOT EXISTS `swgemu`.`simbot_skills` (
+  `identity_id` bigint(20) NOT NULL,
+  `skill_name` varchar(64) NOT NULL,
+  `trained_at` datetime NOT NULL,
+  PRIMARY KEY (`identity_id`,`skill_name`)
+) ENGINE=MyISAM DEFAULT CHARSET=latin1;
+
 ALTER TABLE `swgemu`.`deleted_characters` ADD COLUMN `db_deleted` BOOLEAN  NOT NULL DEFAULT 0 AFTER `creation_date`;
 
 -- Newer versions require these to have defaults

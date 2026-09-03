@@ -844,6 +844,24 @@ private:
 };
 
 // -------------------------------------------------------
+// PLAYERBOT PARITY SCENARIO CONTROLLER (Harness only)
+// -------------------------------------------------------
+// The progression harness exercises identity/body mapping, not movement. The
+// manager owns every scenario operation; this controller deliberately leaves
+// the body idle while still using the normal SimPlayer controller attachment
+// path.
+class SimParityTestController : public SimPlayerController {
+public:
+    SimParityTestController(AiAgent* aiAgent);
+    virtual ~SimParityTestController();
+
+    void startSimLoop() override;
+    void onArrived() override;
+    void onTick() override {}
+    bool shouldContinueArrivalChecks() const override { return false; }
+};
+
+// -------------------------------------------------------
 // MINER CONTROLLER (Resource Gathering)
 // -------------------------------------------------------
 class SimMinerController : public SimPlayerController {

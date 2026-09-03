@@ -1050,7 +1050,31 @@
 
   function pageWilds(d) {
     const pve = d.pveActivity || {};
+    const progression = d.playerBotProgression || {};
     const roster = Array.isArray(pve.roster) ? pve.roster : [];
+    const progressionRows = (progression.identities || []).map((r) => {
+      const xp = Object.entries(r.xp || {}).map(([k, v]) => `${labelize(k)} ${compact(v)}`).join(" · ") || "none";
+      return `<tr>
+        <td><span class="t-main">${esc(r.name || "#" + r.identityId)}</span><span class="t-sub">${esc(r.identityId)}</span></td>
+        <td>${chip(labelize(r.profession || "unknown"), r.profession === "orphan" ? "red" : "ghost")}</td>
+        <td class="t-num">${compact(r.bankCredits)}</td>
+        <td class="t-num">${compact(r.cashCredits)}</td>
+        <td>${esc(xp)}</td>
+        <td class="t-num">${num((r.skills || []).length)}</td>
+        <td><span class="t-main">${esc(r.lastAwardSource || "none")}</span><span class="t-sub">${r.lastAwardAgeSeconds == null ? "—" : ago(r.lastAwardAgeSeconds)}</span></td>
+      </tr>`;
+    }).join("");
+    const progressionHarness = progression.harness || {};
+    const progressionHarnessRows = (progressionHarness.scenarios || []).map((s) => {
+      const status = String(s.status || "PENDING");
+      const tone = /PASS|COMPLETE/i.test(status) ? "ok" : /FAIL/i.test(status) ? "red" : "amber";
+      return `<tr>
+        <td>${esc(s.name || "scenario")}</td>
+        <td>${chip(status, tone)}</td>
+        <td>${esc(s.failReason || s.reason || "—")}</td>
+        <td class="t-num">${num(s.durationMs)}</td>
+      </tr>`;
+    }).join("");
     const offers = Array.isArray((pve.missionBoard || {}).offers)
       ? pve.missionBoard.offers : [];
     const offerFor = (r) => {
@@ -1126,6 +1150,30 @@
             ${metric("Deaths", pve.hunterDeathsTotal, { tone: Number(pve.hunterDeathsTotal || 0) ? "warn" : "" })}
           </div></div>
         </section>
+        <section class="panel span-12"><header><h3>PROGRESSION LEDGER</h3>
+          <span class="panel-tag">${chip(progression.enabled ? "enabled" : "disabled", progression.enabled ? "ok" : "ghost")} ${chip(progression.storeLoaded ? "loaded" : "not loaded", progression.storeLoaded ? "teal" : "ghost")} ${chip(progression.dbAvailable ? "db online" : "db unavailable", progression.dbAvailable ? "ok" : "red")}</span></header>
+          <div class="panel-body"><div class="metric-row">
+            ${metric("Records", progression.records)}
+            ${metric("Orphans", progression.orphanRecords, { tone: Number(progression.orphanRecords || 0) ? "warn" : "" })}
+            ${metric("Roster Missing", progression.rosterWithoutRecord, { tone: Number(progression.rosterWithoutRecord || 0) ? "warn" : "" })}
+            ${metric("Harness Stale", progressionHarness.harnessRowsStale, { tone: Number(progressionHarness.harnessRowsStale || 0) ? "warn" : "" })}
+            ${metric("Dirty", progression.dirtyCount)}
+            ${metric("Awards Accepted", (progression.awards || {}).accepted, { tone: "accent" })}
+            ${metric("Flush Age", ago(progression.lastFlushAgeSeconds), { raw: true })}
+          </div>
+          <div class="section-gap"></div>
+          ${table(["Identity", "Profession", "Bank", "Cash", "XP", "Skills", "Last Award"], progressionRows, { scrollKey: "progression-identities", tall: true })}
+          <div class="section-gap"></div>
+          ${kvRows([
+            ["Flush interval", num(progression.flushIntervalSeconds) + "s"],
+            ["Reaper", progression.reaper && progression.reaper.enabled ? "enabled" : "count-only"],
+            ["Reaper runs / reaped", num(progression.reaper && progression.reaper.runs) + " / " + num(progression.reaper && progression.reaper.reaped)],
+            ["Rejected: no record / disabled", num((progression.awards || {}).rejectedNoRecord) + " / " + num((progression.awards || {}).rejectedDisabled)],
+            ["Maintenance", num(progression.maintenance && progression.maintenance.ticksTotal) + " ticks · " + num(progression.maintenance && progression.maintenance.requestsQueued) + " queued"]
+          ])}</div>
+        </section>
+        ${panel("PLAYERBOT PARITY MATRIX", progressionHarness.enabled ? "harness" : "harness disabled",
+          table(["Scenario", "Status", "Reason", "Ms"], progressionHarnessRows, { scrollKey: "progression-harness" }))}
         ${panel("HUNTER POSITION FEED", `${roster.length} identities · ${active} active`,
           table(["Hunter", "Phase", "Offer bearing / distance", "Lair", "Waves", "Planet", "X / Y", "/way", "Buffs"], rows, { scrollKey: "wilds-roster", tall: true }))}
         <section class="panel span-12"><div class="panel-body wilds-note">

@@ -27,9 +27,11 @@ talking to a legacy SWG game client over a custom binary protocol. This fork
 engine as a **single-player-capable, AI-driven economy sandbox**: hundreds of
 autonomous NPCs ("SimPlayers") are meant to gather resources, craft, fight,
 and progress Force ranks with no human players online, so the world stays
-"alive" unattended. All of that new behavior is currently
-**simulation-only** — no real inventory/credit/market mutation — until the
-owner explicitly approves an economy-mutating phase.
+"alive" unattended. That new behavior is **simulation-only by default**, with
+one approved exception: the P.10 PlayerBot player-parity line (from v0.9.0)
+may persist real progression for **roster** PlayerBots, each capability behind
+its own default-off gate. Everything else stays simulation-only until the owner
+explicitly approves an economy-mutating phase — see §12.
 
 ## 3. Technology Stack
 
@@ -170,8 +172,12 @@ no new warnings before handing work back** (owner-stated standard).
   `farSideEgress`, `hollowDoorEgress.*`, the `zeroClip.*` probe and enforcement
   knobs (`enforce`, `rejectionCap`, `walkableConfirm`,
   `walkableToleranceRatio`), and the `structureTraversalTest` scenario matrix —
-  all default off. This is the primary place new simulation features expose
-  owner-tunable, default-off gates.
+  all default off. F_0.9.0 adds the P.10 pair: `playerBotProgression`
+  (`enabled`, `flushIntervalSeconds`, `reaper.enabled`/`reaper.minAgeSeconds`,
+  and the per-capability award gates later chunks append) and
+  `playerBotParityTest` (the 18-scenario progression matrix), both default off.
+  This is the primary place new simulation features expose owner-tunable,
+  default-off gates.
 - **`MMOCoreORB/bin/conf/features.lua`** — global feature flags.
 - Compiled-in constants are the exception, not the default — prefer a Lua
   config entry so behavior is tunable without a rebuild.
@@ -520,10 +526,60 @@ This is this fork's primary custom subsystem, layered on top of the stock
   request), all traversal/cell-nav logging, and the scenario harness — which
   means `ST_PHASE` traces are NOT available in a default deployment, and
   turning logging on is a deliberate diagnostic step.
-- **Everything here is simulation-only by explicit owner policy**: no real
-  inventory/credit/market/persistence mutation happens from this layer until
-  an economy-mutation phase is explicitly approved. New work here defaults
-  to a dry-run/simulated code path unless the plan says otherwise.
+- **PlayerBot progression store (P.10a / F_0.9.0)** — the durable home for
+  player-parity state, and the first piece of the P.10 line. XP by type,
+  bank/cash credits, skill points and trained skills live in three MySQL tables
+  (`simbot_progression`, `simbot_experience`, `simbot_skills`, schema 1010-1012)
+  keyed by **roster identity id**, never by object ID and never on `AiAgent` —
+  a PlayerBot body has no `PlayerObject` ghost and is destroyed and rebuilt on
+  death, so nothing durable can live on it, and a record reachable from an
+  object would repeat the `simPlayerBot` sticky-flag leak. Three invariants
+  carry the design: **one creation function**
+  (`ensurePlayerBotProgressionRecord`, which refuses any id absent from the
+  loaded roster) called at roster mint and again from reconciliation as an
+  idempotent repair, because MyISAM cannot make the identity and record INSERTs
+  atomic; **award-requires-record** (a missing record is counted and skipped,
+  never created — so a leaked flag on a wild creature resolves to identity 0 and
+  is rejected); and **one SQL lane** — every store query runs on the PvE
+  maintenance task, with the harness enqueueing `PlayerBotProgressionRequest`
+  entries rather than issuing SQL itself. The flush **atomically swaps** its
+  dirty batch before I/O and merges failures back, so an award landing during
+  SQL is never dropped (the roster's clear-after-write shape is deliberately not
+  copied), and `dbAvailable` recovers through a bounded `SELECT 1` re-probe.
+  `pveMaintenanceTaskScheduled` became a `scheduled/running/rerunPending` state
+  machine so `kickPveMaintenanceNow()` can pull the lane forward without ever
+  running two bodies; the successor is scheduled one interval from **body
+  entry**, preserving the previous cadence. A corollary the harness proved the
+  hard way: anything a test arms for *its own* lane operation must travel with
+  that request, not sit in shared state. The flush fault knobs were global and
+  the routine end-of-tick flush could consume one armed for the harness's
+  `FlushNow`, which both broke the scenario and made it flaky; faults are now
+  parameters of `flushPlayerBotProgressionStore`. The lane publishes
+  `maintenance.{ticksTotal,kicksRequested,kicksImmediate,kicksDeferred,requestMaxWaitMs}`
+  so a request that waits a full interval is attributable from one dashboard
+  read instead of log archaeology. Verification vehicle: the
+  18-scenario `playerBotParityTest` matrix (`sim_player_manager.lua`, AI
+  template `bin/scripts/ai/simParityTest.lua`, controller
+  `SimParityTestController`), including a durable **two-boot restart probe**
+  whose phase-A verdict file is written only after every other scenario passes
+  and is read fail-closed. Dashboard section: `playerBotProgression`, carrying
+  `orphanRecords` and `rosterWithoutRecord` so a leak is visible rather than
+  silent. The award API ships with **no production caller** — adoption is
+  F_0.9.1's job, per the F_0.8.1 rule that adoption is a separate step.
+- **Simulation-only by default, with one approved exception (P.10, 2026-09-02)**:
+  no real inventory/credit/market/persistence mutation happens from this layer
+  except through the P.10 PlayerBot player-parity line
+  (`docs/1-plans/ROADMAP_p10-playerbot-parity.md`), which is the owner's
+  explicit economy-phase approval for **roster** PlayerBots (identities in
+  `simbot_identities`) to earn real XP, credits, loot, skills and trade on the
+  bazaar — each capability behind its own `playerBotProgression.*` Lua gate,
+  default-off, enabled only after that chunk's live harness receipt.
+  Progression state is never stored on `AiAgent`; it lives in a
+  `SimPlayerManager`-owned MySQL store keyed by roster identity id (never
+  object ID), created only at roster mint, with award-requires-record
+  semantics. Miners and PvP bots have no roster identity and remain
+  simulation-only. New work outside P.10 still defaults to a dry-run/simulated
+  code path unless its plan says otherwise.
 - **Config**: `bin/scripts/managers/sim_player_manager.lua` — all tunables
   (demand thresholds, recovery dry-run flag, `enableStationTravel`,
   `enableVehicleMechanics`, coverage/dispatch gates). New behavior should be
