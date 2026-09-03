@@ -2093,6 +2093,53 @@ void PlayerManagerImplementation::disseminateExperience(TangibleObject* destruct
 			baseXp = ai->getBaseXp();
 	}
 
+	if (simManager != nullptr && simManager->isPlayerBotKillXpEnabled() &&
+			baseXp > 0 && totalDamage > 0) {
+		PlayerBotKillXpEvent event;
+		event.baseXp = baseXp;
+		event.totalDamage = totalDamage;
+		event.globalMultiplier = globalExpMultiplier;
+
+		for (int i = 0; i < threatMap->size(); ++i) {
+			ThreatMapEntry* entry = &threatMap->elementAt(i).getValue();
+			TangibleObject* attacker = threatMap->elementAt(i).getKey();
+
+			if (entry == nullptr || attacker == nullptr ||
+					attacker->isPlayerCreature() || attacker->isPet() ||
+					!attacker->isAiAgent() || attacker->getZone() != zone ||
+					!destructedObject->isInRangeZoneless(attacker, 80))
+				continue;
+
+			AiAgent* attackerAgent = attacker->asAiAgent();
+			if (attackerAgent == nullptr || !attackerAgent->getSimPlayerBot())
+				continue;
+
+			PlayerBotKillXpAttacker killAttacker;
+			killAttacker.bodyOid = attacker->getObjectID();
+			killAttacker.groupMultiplier = attackerAgent->getGroup() != nullptr ?
+				groupExpMultiplier : 1.0f;
+			killAttacker.gcwMultiplier =
+				winningFaction != Factions::FACTIONNEUTRAL &&
+				winningFaction == attacker->getFaction() ? gcwBonus : 1.0f;
+
+			for (int j = 0; j < entry->size(); ++j) {
+				killAttacker.damageByType.add(Pair<String, uint32>(
+					entry->elementAt(j).getKey(),
+					entry->elementAt(j).getValue()));
+			}
+
+			event.attackers.add(killAttacker);
+		}
+
+		if (event.attackers.size() > 0) {
+			Core::getTaskManager()->executeTask([event] () {
+				SimPlayerManager* awardManager = SimPlayerManager::instance();
+				if (awardManager != nullptr)
+					awardManager->awardPlayerBotKillExperience(event);
+			}, "SimPlayerBotKillXpTask");
+		}
+	}
+
 	Vector<uint64> playerList;
 
 	for (int i = 0; i < threatMap->size(); ++i) {

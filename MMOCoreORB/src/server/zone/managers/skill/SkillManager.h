@@ -132,6 +132,8 @@ public:
 		return performanceManager;
 	}
 
+	int getDefaultXpLimit(const String& xpType);
+
 	inline bool isApprenticeshipEnabled() const {
 		return apprenticeshipEnabled;
 	}

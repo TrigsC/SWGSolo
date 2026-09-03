@@ -175,7 +175,10 @@ no new warnings before handing work back** (owner-stated standard).
   all default off. F_0.9.0 adds the P.10 pair: `playerBotProgression`
   (`enabled`, `flushIntervalSeconds`, `reaper.enabled`/`reaper.minAgeSeconds`,
   and the per-capability award gates later chunks append) and
-  `playerBotParityTest` (the 18-scenario progression matrix), both default off.
+  `playerBotParityTest` (the progression matrix, 28 scenarios as of F_0.9.1,
+  plus `killTargetTemplate`), both default off. F_0.9.1 appends the line's first
+  capability gate, `playerBotProgression.awardKillXp`, and its `killXpRate`
+  earn-rate multiplier (shipped `1.0` = exact player parity).
   This is the primary place new simulation features expose owner-tunable,
   default-off gates.
 - **`MMOCoreORB/bin/conf/features.lua`** — global feature flags.
@@ -228,7 +231,13 @@ unfamiliar change:
    the locking sequence of the nearest existing caller rather than invent
    one.**
 4. **Never hand-edit files under `src/autogen/`** — edit the `.idl` or the
-   `*Implementation.cpp`/`.h` and rebuild.
+   `*Implementation.cpp`/`.h` and rebuild. `src/autogen/` is **gitignored and
+   untracked**, so an additive `.idl` method costs exactly one line in a commit
+   and its stubs/adapters regenerate at build time — the reason F_0.9.1 could
+   add `PlayerManager::getExperienceMultiplier()` rather than let a test oracle
+   derive its expected value from the implementation under test. The cost is
+   build fan-out, not diff size: that one line took the incremental build from
+   17 to 89 targets.
 
 ## 10. Lua Scripting Layer
 
@@ -566,6 +575,61 @@ This is this fork's primary custom subsystem, layered on top of the stock
   `orphanRecords` and `rosterWithoutRecord` so a leak is visible rather than
   silent. The award API ships with **no production caller** — adoption is
   F_0.9.1's job, per the F_0.8.1 rule that adoption is a separate step.
+- **Kill XP for roster PlayerBots (P.10b / F_0.9.1)** — the first production
+  caller of that award API, and the first real economy mutation in the line.
+  The hook lives **inside** `PlayerManagerImplementation::disseminateExperience`
+  (after `baseXp` is derived), not at the `CreatureManagerImplementation.cpp`
+  call site the roadmap originally sketched: `disseminateExperience` has two
+  callers - single-creature death and `DisseminateExperienceTask` for lairs - so
+  hooking inside covers both with one branch and reuses the already-computed
+  `baseXp`/`totalDamage`/`gcwBonus`, and the P.7.4b FRS block proves the
+  posture. No combat-side change was needed: `ThreatMap::addDamage` already
+  records **every** attacker, AiAgents included, keyed by that attacker's weapon
+  `getXpType()`, so bot hunters were always in the victim's threat map.
+  `disseminateExperience` runs with the corpse **already locked** (the FRS block
+  cross-locks), so the branch takes **no object lock and no mutex**: it copies a
+  plain POD (`PlayerBotKillXpEvent` - per-attacker OID, damage-by-type and
+  group/GCW multipliers, plus an event-level global multiplier) and hands it to
+  a deferred `SimPlayerBotKillXpTask`, which resolves identities under
+  `pveMutex` and writes under `progressionMutex`. Capturing a
+  `ManagedReference` to the corpse is deliberately avoided. The cheap
+  synchronous pre-filter uses `AiAgent::getSimPlayerBot()` **only as a cost
+  filter, never as authority** - that is the flag that leaked onto wild
+  creatures (fixed in `d38877020c`), and both failure modes are safe: a stale
+  true costs one task that resolves nothing, a stale false costs one kill's XP.
+  Authority remains `resolvePlayerBotIdentity`. The formula mirrors the player
+  path exactly, including its **rounding**: the direct path truncates twice
+  (once at `awardExperience`'s `int amount` boundary, once inside after
+  `globalExpMultiplier`) while `combat_general` truncates once because
+  `combatXp` is already a `uint32`; `combatXp` accumulates per iteration,
+  excludes `jedi_general`, and includes `dotDMG` (which earns no row of its
+  own). Bot level comes from the identity's `skillTier`, **never** the body
+  template's level - a wraith-templated body would otherwise cap at 178x300.
+  The lifetime ceiling moved **inside** `grantPlayerBotExperience` (mirroring
+  `PlayerObjectImplementation::addExperience:708-717`, defaults from the new
+  `SkillManager::getDefaultXpLimit`, 2000 fallback, `prestige_` uncapped) so
+  every future XP source inherits it; a type already at its ceiling returns
+  `false` without a rejection counter, since the caller passed a valid amount
+  and the store simply had no room. Gate and rate are **call parameters**
+  (`PlayerBotKillXpParams`), not reads of global state, so the harness can
+  exercise the real gate and rate branches without mutating configuration that
+  concurrent production kills would see. Scenarios 19-28 extend the matrix;
+  scenario 28 is the call-site proof - a harness bot kills a spawned
+  `dwarf_nuna` with real rifle combat, which works with **no controller
+  change** because harness and hunter identities share one body path (rifle,
+  faction 0, `ATTACKABLE`) and `simParityTest` overrides only `IDLE`, leaving
+  the combat sockets live. Dashboard: `playerBotProgression.killXp` plus the
+  now-real `gates.awardKillXp`. **A new addressing mode inherits the async
+  lifetime of the ops it is used with** — the one defect live verification
+  found: `deleteIdentity` re-resolves its identity on *every* poll, so pruning
+  the new named ref when the request completed made the very poll that observed
+  completion fail. Positional addressing never hit it because that handler never
+  touched the positional vector. Harness reference maps are scenario-scoped and
+  are cleared wholesale by the cleanup pass; nothing may prune them mid-flight.
+  A second, cheaper lesson: `LuaObject` presence-detection is done by reading a
+  field twice with two different defaults (absent ⇒ the reads disagree), never
+  by poking the Lua stack with `lua_getfield`, which would bake in an internal
+  convention about where `LuaObject` keeps its table.
 - **Simulation-only by default, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line

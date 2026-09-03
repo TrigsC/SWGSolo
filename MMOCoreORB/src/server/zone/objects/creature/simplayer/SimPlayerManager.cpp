@@ -60,6 +60,8 @@
 #include "server/zone/managers/collision/PathFinderManager.h"
 #include "server/zone/managers/collision/CollisionManager.h"
 #include "server/zone/managers/combat/CombatManager.h"
+#include "server/zone/managers/skill/SkillManager.h"
+#include "server/zone/managers/player/PlayerManager.h"
 #include "server/zone/objects/building/BuildingObject.h"
 #include "server/zone/objects/cell/CellObject.h"
 #include "templates/SharedObjectTemplate.h"
@@ -6146,6 +6148,8 @@ void SimPlayerManager::loadLuaConfig() {
 	progressionNextDbProbeMs = 0;
 	progressionDbProbeBackoffMs = 5000;
 	progressionFlushIntervalSeconds = 60;
+	progressionAwardKillXp = false;
+	progressionKillXpRate = 1.0f;
 	progressionReaperEnabled = false;
 	progressionReaperMinAgeSeconds = 3600;
 	progressionFaultFlushDelayMs = 0;
@@ -7559,6 +7563,10 @@ static uint32 pveTrackedBuffCrcForAttribute(uint8 attribute) {
 
 void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 	progressionEnabled = config.getBooleanField("enabled", progressionEnabled);
+	progressionAwardKillXp = config.getBooleanField("awardKillXp",
+		progressionAwardKillXp);
+	progressionKillXpRate = clampFloatRange(config.getFloatField(
+		"killXpRate", progressionKillXpRate), 0.f, 100.f);
 	progressionFlushIntervalSeconds = clampMinerInt(
 		config.getIntField("flushIntervalSeconds",
 			progressionFlushIntervalSeconds), progressionFlushIntervalSeconds,
@@ -7579,9 +7587,50 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	PlayerBotParityTestStep step;
 	step.op = table.getStringField("op").trim();
 	step.identityIndex = table.getIntField("identityIndex", -1);
+	step.identityRef = table.getStringField("identityRef").trim();
 	step.identityId = table.getLongField("identityId", 0);
+	step.bodyOid = table.getLongField("bodyOid", 0);
+	step.templateName = table.getStringField("template").trim();
 	step.xpType = table.getStringField("xpType").trim();
 	step.amount = table.getLongField("amount", 0);
+	step.baseXp = table.getSignedIntField("baseXp", 0);
+	step.totalDamage = static_cast<uint32>(table.getLongField(
+		"totalDamage", 0));
+	step.damage = static_cast<uint32>(table.getLongField("damage", 0));
+	step.groupMultiplier = table.getFloatField("groupMultiplier", 1.0f);
+	step.gcwMultiplier = table.getFloatField("gcwMultiplier", 1.0f);
+	step.globalMultiplier = table.getFloatField("globalMultiplier", 1.0f);
+	// gateEnabled and rate must distinguish "absent" from "present and equal to
+	// the default", because an absent field means "use the live configuration"
+	// while an explicit false/1.0 means "use this value". Reading each field
+	// twice with two different defaults answers that using only the public
+	// LuaObject API: an absent field returns each default in turn and the two
+	// reads disagree, while a present field returns its own value both times.
+	// The alternative - poking the Lua stack directly with lua_getfield - would
+	// bake in LuaObject's internal convention about where its table sits.
+	step.gateEnabled = table.getBooleanField("gateEnabled", false);
+	step.hasGateEnabled = step.gateEnabled ==
+		table.getBooleanField("gateEnabled", true);
+	step.rate = clampFloatRange(table.getFloatField("rate", 1.0f),
+		0.0f, 100.0f);
+	step.hasRate = table.getFloatField("rate", 1.0f) ==
+		table.getFloatField("rate", 2.0f);
+	LuaObject damageByType = table.getObjectField("damageByType");
+	if (damageByType.isValidTable()) {
+		for (int i = 1; i <= damageByType.getTableSize(); ++i) {
+			LuaObject damageEntry = damageByType.getObjectAt(i);
+			if (damageEntry.isValidTable()) {
+				String damageType = damageEntry.getStringField("xpType").trim();
+				uint32 damageValue = static_cast<uint32>(
+					damageEntry.getLongField("damage", 0));
+				if (!damageType.isEmpty())
+					step.damageByType.add(Pair<String, uint32>(damageType,
+						damageValue));
+			}
+			damageEntry.pop();
+		}
+	}
+	damageByType.pop();
 	step.expect = table.getStringField("expect").trim();
 	// LuaObject::getStringField's default-value argument cannot be relied on: on a
 	// nil field it sets the pointer to the default but leaves the length at 0, so
@@ -7659,6 +7708,12 @@ void SimPlayerManager::initializePlayerBotParityTestResults() {
 	playerBotParityTestCleanupActive = false;
 	playerBotParityTestCleanupPreserveProbe = false;
 	playerBotParityTestPendingRequestId = 0;
+	playerBotParityTestIdentityRefs.removeAll();
+	playerBotParityTestKillTargetOid = 0;
+	playerBotParityTestKillTargetIdentityId = 0;
+	playerBotParityTestKillTargetBaseXp = 0;
+	playerBotParityTestKillTargetKillXpBaseline = 0;
+	playerBotParityTestKillTargetXpType = "";
 	playerBotParityTestSetupRequestActive = false;
 	playerBotParityTestCompleted = false;
 	playerBotParityTestAwaitingRestart = false;
@@ -7675,6 +7730,7 @@ void SimPlayerManager::applyPlayerBotParityTestConfig(LuaObject& config) {
 	bool currentEnabled = false;
 	String currentPlanet;
 	Vector3 currentSpawn;
+	String currentKillTargetTemplate;
 	int currentIdentityCount = 2;
 	int currentStartupDelaySeconds = 60;
 	{
@@ -7683,6 +7739,7 @@ void SimPlayerManager::applyPlayerBotParityTestConfig(LuaObject& config) {
 		currentEnabled = playerBotParityTestEnabled;
 		currentPlanet = playerBotParityTestPlanet;
 		currentSpawn = playerBotParityTestSpawn;
+		currentKillTargetTemplate = playerBotParityTestKillTargetTemplate;
 		currentIdentityCount = playerBotParityTestIdentityCount;
 		currentStartupDelaySeconds = playerBotParityTestStartupDelaySeconds;
 	}
@@ -7692,6 +7749,10 @@ void SimPlayerManager::applyPlayerBotParityTestConfig(LuaObject& config) {
 	String parsedPlanet = config.getStringField("planet").trim();
 	if (parsedPlanet.isEmpty())
 		parsedPlanet = currentPlanet;
+	String parsedKillTargetTemplate = config.getStringField(
+		"killTargetTemplate").trim();
+	if (parsedKillTargetTemplate.isEmpty())
+		parsedKillTargetTemplate = currentKillTargetTemplate;
 	int parsedIdentityCount = clampMinerInt(
 		config.getIntField("identityCount", currentIdentityCount),
 		currentIdentityCount, 1, 8);
@@ -7743,6 +7804,7 @@ void SimPlayerManager::applyPlayerBotParityTestConfig(LuaObject& config) {
 		playerBotParityTestEnabled = parsedEnabled;
 		playerBotParityTestPlanet = parsedPlanet;
 		playerBotParityTestSpawn = parsedSpawn;
+		playerBotParityTestKillTargetTemplate = parsedKillTargetTemplate;
 		playerBotParityTestIdentityCount = parsedIdentityCount;
 		playerBotParityTestStartupDelaySeconds = parsedStartupDelaySeconds;
 		// Preserve a live matrix, including per-step request state, across
@@ -9107,6 +9169,31 @@ bool SimPlayerManager::grantPlayerBotExperience(uint64 identityId,
 		progressionAwardsRejectedInvalidAmount.increment();
 		return false;
 	}
+
+	int xpCap = -1;
+	SkillManager* skillManager = SkillManager::instance();
+	if (skillManager != nullptr)
+		xpCap = skillManager->getDefaultXpLimit(normalizedType);
+
+	if (normalizedType.beginsWith("prestige_"))
+		xpCap = 2147483647;
+	else if (xpCap < 0)
+		xpCap = 2000;
+
+	int available = xpCap > current ? xpCap - current : 0;
+	if (amount > available) {
+		amount = available;
+		killXpCappedByCeiling.increment();
+	}
+
+	// A type already at its ceiling has nothing to award. Recording it as an
+	// accepted award would inflate awardsAccepted/awardsTotal and overwrite
+	// lastAwardSource for an award that never happened, and no rejection
+	// counter fires either: the caller passed a valid amount, the store simply
+	// had no room. The ceiling counter above is the only signal.
+	if (amount <= 0)
+		return false;
+
 	progression.experience.put(normalizedType, current + amount);
 	progression.lastAwardMs = System::getMiliTime();
 	progression.lastAwardSource = progressionAwardSource(source);
@@ -9220,12 +9307,124 @@ bool SimPlayerManager::recordPlayerBotSkill(uint64 identityId,
 	return true;
 }
 
-uint64 SimPlayerManager::resolvePlayerBotIdentity(uint64 bodyOid) {
+bool SimPlayerManager::resolvePlayerBotIdentityAndTier(uint64 bodyOid,
+		uint64& identityId, int& skillTier) {
+	identityId = 0;
+	skillTier = 1;
 	if (bodyOid == 0)
-		return 0;
+		return false;
+
 	Locker pveLock(&pveMutex);
-	return pveBodyIdentityIds.contains(bodyOid) ?
-		pveBodyIdentityIds.get(bodyOid) : 0;
+	if (!pveBodyIdentityIds.contains(bodyOid))
+		return false;
+
+	identityId = pveBodyIdentityIds.get(bodyOid);
+	if (pveIdentities.contains(identityId))
+		skillTier = Math::max(1, Math::min(25,
+			pveIdentities.get(identityId).skillTier));
+
+	return identityId != 0;
+}
+
+uint64 SimPlayerManager::resolvePlayerBotIdentity(uint64 bodyOid) {
+	uint64 identityId = 0;
+	int skillTier = 1;
+	return resolvePlayerBotIdentityAndTier(bodyOid, identityId, skillTier) ?
+		identityId : 0;
+}
+
+void SimPlayerManager::awardPlayerBotKillExperience(
+		const PlayerBotKillXpEvent& event) {
+	PlayerBotKillXpParams params;
+	params.enabled = isPlayerBotKillXpEnabled();
+	params.rate = progressionKillXpRate;
+	awardPlayerBotKillExperience(event, params);
+}
+
+void SimPlayerManager::awardPlayerBotKillExperience(
+		const PlayerBotKillXpEvent& event,
+		const PlayerBotKillXpParams& params) {
+	if (!params.enabled) {
+		killXpSkippedGateOff.increment();
+		return;
+	}
+
+	if (event.totalDamage == 0 || event.baseXp <= 0)
+		return;
+
+	killXpKills.increment();
+
+	for (int i = 0; i < event.attackers.size(); ++i) {
+		const PlayerBotKillXpAttacker& attacker = event.attackers.get(i);
+		killXpAttackersConsidered.increment();
+
+		uint64 identityId = 0;
+		int skillTier = 1;
+		if (!resolvePlayerBotIdentityAndTier(attacker.bodyOid,
+				identityId, skillTier)) {
+			killXpSkippedNoIdentity.increment();
+			continue;
+		}
+
+		uint32 combatXp = 0;
+
+		for (int j = 0; j < attacker.damageByType.size(); ++j) {
+			const Pair<String, uint32>& damageByType =
+				attacker.damageByType.get(j);
+			String xpType = damageByType.first;
+			uint32 damage = damageByType.second;
+
+			float xpAmount = event.baseXp;
+			xpAmount *= static_cast<float>(damage) /
+				static_cast<float>(event.totalDamage);
+
+			float levelCap = skillTier * 300.f;
+			if (xpAmount > levelCap) {
+				xpAmount = levelCap;
+				killXpCappedByLevel.increment();
+			}
+
+			xpAmount *= attacker.groupMultiplier;
+			xpAmount *= attacker.gcwMultiplier;
+
+			if (xpType != "jedi_general")
+				combatXp += xpAmount;
+			else
+				xpAmount *= 0.2f;
+
+			if (xpType == "dotDMG")
+				continue;
+
+			int truncatedXp = static_cast<int>(xpAmount);
+			int awardAmount = static_cast<int>(truncatedXp *
+				event.globalMultiplier * params.rate);
+			if (awardAmount <= 0) {
+				killXpSkippedZero.increment();
+				continue;
+			}
+
+			int awarded = 0;
+			if (grantPlayerBotExperience(identityId, xpType, awardAmount,
+					"kill", &awarded)) {
+				killXpAwardsGranted.increment();
+				killXpTotalAwarded.add(static_cast<uint64>(awarded));
+			}
+		}
+
+		int combatGeneral = static_cast<int>(combatXp * 0.1f *
+			event.globalMultiplier * params.rate);
+		if (combatGeneral <= 0) {
+			killXpSkippedZero.increment();
+			continue;
+		}
+
+		int awarded = 0;
+		if (grantPlayerBotExperience(identityId, "combat_general",
+				combatGeneral, "kill", &awarded)) {
+			killXpAwardsGranted.increment();
+			killXpTotalAwarded.add(static_cast<uint64>(awarded));
+		}
+	}
 }
 
 bool SimPlayerManager::snapshotPlayerBotProgression(uint64 identityId,
@@ -9677,6 +9876,13 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 					pveIdentityBodyOids.drop(request.identityId);
 					pveDirtyIdentityIds.drop(request.identityId);
 				}
+				// The named ref is deliberately NOT pruned here. deleteIdentity is
+				// an async op whose identity is re-resolved on every poll, so
+				// dropping the ref when the request completes makes the very poll
+				// that observes completion fail with identity_not_found. Positional
+				// deleteIdentity survives only because this handler never touched
+				// playerBotParityTestIdentityIds. Refs are scenario-scoped harness
+				// bookkeeping and are cleared wholesale in the cleanup pass.
 				reconcilePlayerBotProgression();
 				request.resultFound = true;
 				break;
@@ -9860,6 +10066,248 @@ void SimPlayerManager::destroyPlayerBotParityBody(int identityIndex,
 		" body=" + String::valueOf(bodyOid) + " reason=" + reason, true);
 }
 
+bool SimPlayerManager::spawnPlayerBotParityKillTarget(
+		const PlayerBotParityTestStep& step, String& failure) {
+	despawnPlayerBotParityKillTarget();
+
+	uint64 identityId = 0;
+	if (!getPlayerBotParityIdentityId(step, identityId)) {
+		failure = "identity_not_found";
+		return false;
+	}
+
+	uint64 botOid = 0;
+	String targetTemplate;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		targetTemplate = step.templateName.isEmpty() ?
+			playerBotParityTestKillTargetTemplate : step.templateName;
+	}
+	{
+		Locker pveLock(&pveMutex);
+		if (pveIdentityBodyOids.contains(identityId))
+			botOid = pveIdentityBodyOids.get(identityId);
+	}
+
+	Reference<SimPlayerController*> controller = botOid != 0 &&
+		controllers.contains(botOid) ? controllers.get(botOid) : nullptr;
+	ManagedReference<AiAgent*> bot = controller == nullptr ? nullptr :
+		controller->getAgent();
+	if (bot == nullptr || bot->getZone() == nullptr) {
+		failure = "kill_bot_not_in_world";
+		return false;
+	}
+
+	Zone* zone = bot->getZone();
+	Vector3 position = bot->getWorldPosition();
+	position.setX(position.getX() + 3.f);
+	float terrainZ = zone->getHeight(position.getX(), position.getY());
+	if (terrainZ != 0.f)
+		position.setZ(terrainZ);
+
+	CreatureManager* creatureManager = zone->getCreatureManager();
+	CreatureObject* creature = creatureManager == nullptr ? nullptr :
+		creatureManager->spawnCreature(targetTemplate.hashCode(), 0,
+			position.getX(), position.getZ(), position.getY(), 0);
+	AiAgent* target = creature == nullptr ? nullptr : creature->asAiAgent();
+	if (target == nullptr) {
+		failure = "kill_target_spawn_failed";
+		if (creature != nullptr) {
+			Locker creatureLock(creature);
+			if (creature->getZone() != nullptr)
+				creature->destroyObjectFromWorld(true);
+			creature->destroyObjectFromDatabase(true);
+		}
+		return false;
+	}
+
+	target->setDespawnOnNoPlayerInRange(false);
+	int baseXp = target->getBaseXp();
+	String xpType;
+	{
+		Locker botLocker(bot);
+		Reference<WeaponObject*> weapon = bot->getWeapon();
+		if (weapon != nullptr)
+			xpType = weapon->getXpType();
+	}
+	if (xpType.isEmpty())
+		xpType = "combat_rangedspecialize_rifle";
+
+	uint64 killBaseline = static_cast<uint64>(
+		playerBotParityCounterValue("killXp.kills"));
+	// Both live terms are captured BEFORE combat so the oracle and the award
+	// see the same values even if either is retuned mid-scenario.
+	ZoneServer* oracleServer = ServerCore::getZoneServer();
+	PlayerManager* oraclePlayerManager = oracleServer == nullptr ? nullptr :
+		oracleServer->getPlayerManager();
+	float globalMultiplier = oraclePlayerManager == nullptr ? 1.0f :
+		oraclePlayerManager->getExperienceMultiplier();
+	float killRate = progressionKillXpRate;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityTestKillTargetOid = target->getObjectID();
+		playerBotParityTestKillTargetIdentityId = identityId;
+		playerBotParityTestKillTargetBaseXp = baseXp;
+		playerBotParityTestKillTargetKillXpBaseline = killBaseline;
+		playerBotParityTestKillTargetXpType = xpType;
+		playerBotParityTestKillTargetGlobalMultiplier = globalMultiplier;
+		playerBotParityTestKillTargetRate = killRate;
+		playerBotParityTestKillTargetExpectedDirect = 0;
+		playerBotParityTestKillTargetExpectedCombatGeneral = 0;
+	}
+
+	if (CombatManager::instance() == nullptr ||
+			!CombatManager::instance()->startCombat(bot, target)) {
+		failure = "kill_target_start_combat_failed";
+		despawnPlayerBotParityKillTarget();
+		return false;
+	}
+
+	{
+		Locker botLocker(bot);
+		bot->activateAiBehavior(true);
+	}
+	return true;
+}
+
+bool SimPlayerManager::awaitPlayerBotParityKillTarget(
+		const PlayerBotParityTestStep& step, String& failure) {
+	uint64 targetOid = 0;
+	uint64 identityId = 0;
+	int baseXp = 0;
+	uint64 killBaseline = 0;
+	String expectedXpType;
+	float globalMultiplier = 1.0f;
+	float killRate = 1.0f;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		targetOid = playerBotParityTestKillTargetOid;
+		identityId = playerBotParityTestKillTargetIdentityId;
+		baseXp = playerBotParityTestKillTargetBaseXp;
+		killBaseline = playerBotParityTestKillTargetKillXpBaseline;
+		expectedXpType = step.xpType.isEmpty() ?
+			playerBotParityTestKillTargetXpType : step.xpType;
+		globalMultiplier = playerBotParityTestKillTargetGlobalMultiplier;
+		killRate = playerBotParityTestKillTargetRate;
+	}
+	if (targetOid == 0 || identityId == 0) {
+		failure = "kill_target_not_spawned";
+		return false;
+	}
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(targetOid);
+	bool targetDead = object == nullptr;
+	CreatureObject* target = object == nullptr ? nullptr :
+		object->asCreatureObject();
+	if (target != nullptr) {
+		Locker targetLocker(target);
+		targetDead = target->isDead() || target->getZone() == nullptr;
+	}
+
+	if (!targetDead || playerBotParityCounterValue("killXp.kills") <=
+			static_cast<int64>(killBaseline))
+		return false;
+
+	// Recompute what a correct award must be, from the victim's own baseXp and
+	// the live terms captured at spawn - never from a hardcoded literal, which a
+	// tuned globalExpMultiplier or killXpRate would falsify. The bot is the sole
+	// attacker, so its damage share is 1.0 and both per-attacker multipliers are
+	// 1.0; the arithmetic below mirrors awardPlayerBotKillExperience exactly,
+	// including its truncation shape.
+	int skillTier = 1;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveIdentities.contains(identityId))
+			skillTier = Math::max(1, Math::min(25,
+				pveIdentities.get(identityId).skillTier));
+	}
+	float cappedXp = Math::min(static_cast<float>(baseXp),
+		static_cast<float>(skillTier * 300));
+	uint32 combatXp = static_cast<uint32>(cappedXp);
+	int expectedDirect = static_cast<int>(static_cast<int>(cappedXp) *
+		globalMultiplier * killRate);
+	int expectedCombatGeneral = static_cast<int>(combatXp * 0.1f *
+		globalMultiplier * killRate);
+
+	// killXp.kills advances at the TOP of the award, before either grant, and
+	// the two grants take progressionMutex separately - so a reader can land
+	// between them. Settling on the direct row alone would let the following
+	// combat_general assertion race the task that is still writing it. Require
+	// BOTH rows, at their exact expected values.
+	if (expectedDirect > 0 || expectedCombatGeneral > 0) {
+		SimBotProgression progression;
+		if (!snapshotPlayerBotProgression(identityId, progression) ||
+				expectedXpType.isEmpty())
+			return false;
+
+		int direct = progression.experience.contains(expectedXpType) ?
+			progression.experience.get(expectedXpType) : 0;
+		int general = progression.experience.contains("combat_general") ?
+			progression.experience.get("combat_general") : 0;
+
+		if (direct != expectedDirect || general != expectedCombatGeneral)
+			return false;
+	}
+
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityTestKillTargetExpectedDirect = expectedDirect;
+		playerBotParityTestKillTargetExpectedCombatGeneral =
+			expectedCombatGeneral;
+	}
+
+	despawnPlayerBotParityKillTarget();
+	return true;
+}
+
+void SimPlayerManager::despawnPlayerBotParityKillTarget() {
+	uint64 targetOid = 0;
+	uint64 identityId = 0;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		targetOid = playerBotParityTestKillTargetOid;
+		identityId = playerBotParityTestKillTargetIdentityId;
+		playerBotParityTestKillTargetOid = 0;
+		playerBotParityTestKillTargetIdentityId = 0;
+		playerBotParityTestKillTargetBaseXp = 0;
+		playerBotParityTestKillTargetKillXpBaseline = 0;
+		playerBotParityTestKillTargetXpType = "";
+	}
+	if (targetOid == 0)
+		return;
+
+	uint64 botOid = 0;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveIdentityBodyOids.contains(identityId))
+			botOid = pveIdentityBodyOids.get(identityId);
+	}
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(targetOid);
+	CreatureObject* creature = object == nullptr ? nullptr :
+		object->asCreatureObject();
+	if (creature != nullptr) {
+		Locker creatureLock(creature);
+		creature->clearCombatState(true);
+		if (creature->getZone() != nullptr)
+			creature->destroyObjectFromWorld(true);
+		creature->destroyObjectFromDatabase(true);
+	}
+
+	Reference<SimPlayerController*> controller = botOid != 0 &&
+		controllers.contains(botOid) ? controllers.get(botOid) : nullptr;
+	ManagedReference<AiAgent*> bot = controller == nullptr ? nullptr :
+		controller->getAgent();
+	if (bot != nullptr) {
+		Locker botLock(bot);
+		bot->clearCombatState(true);
+	}
+}
+
 bool SimPlayerManager::awardToNonRosterPlayerBotBody(uint64 identityId,
 		const String& xpType, int amount, const String& source) {
 	(void)identityId;
@@ -9900,10 +10348,30 @@ bool SimPlayerManager::getPlayerBotParityIdentityId(
 		const PlayerBotParityTestStep& step, uint64& identityId) {
 	identityId = step.identityId;
 	Locker parityLock(&playerBotParityTestMutex);
-	if (step.identityIndex >= 0 && step.identityIndex <
+	if (!step.identityRef.isEmpty()) {
+		if (!playerBotParityTestIdentityRefs.contains(step.identityRef))
+			return false;
+		identityId = playerBotParityTestIdentityRefs.get(step.identityRef);
+	} else if (step.identityIndex >= 0 && step.identityIndex <
 			playerBotParityTestIdentityIds.size())
 		identityId = playerBotParityTestIdentityIds.get(step.identityIndex);
 	return identityId != 0;
+}
+
+bool SimPlayerManager::getPlayerBotParityIdentityIndex(
+		const PlayerBotParityTestStep& step, int& identityIndex) {
+	uint64 identityId = 0;
+	if (!getPlayerBotParityIdentityId(step, identityId))
+		return false;
+
+	Locker parityLock(&playerBotParityTestMutex);
+	for (int i = 0; i < playerBotParityTestIdentityIds.size(); ++i) {
+		if (playerBotParityTestIdentityIds.get(i) == identityId) {
+			identityIndex = i;
+			return true;
+		}
+	}
+	return false;
 }
 
 int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
@@ -9933,6 +10401,31 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 		return progressionFlushFailures.get();
 	if (key == "createrefusednotinroster")
 		return progressionCreateRefusedNotInRoster.get();
+	if (key == "killxp.kills" || key == "killxpkills")
+		return killXpKills.get();
+	if (key == "killxp.attackersconsidered" ||
+			key == "killxpattackersconsidered")
+		return killXpAttackersConsidered.get();
+	if (key == "killxp.skippednoidentity" ||
+			key == "killxpskippednoidentity")
+		return killXpSkippedNoIdentity.get();
+	if (key == "killxp.skippedgateoff" ||
+			key == "killxpskippedgateoff")
+		return killXpSkippedGateOff.get();
+	if (key == "killxp.skippedzero" || key == "killxpskippedzero")
+		return killXpSkippedZero.get();
+	if (key == "killxp.awardsgranted" ||
+			key == "killxpawardsgranted")
+		return killXpAwardsGranted.get();
+	if (key == "killxp.totalawarded" ||
+			key == "killxptotalawarded")
+		return killXpTotalAwarded.get();
+	if (key == "killxp.cappedbylevel" ||
+			key == "killxpcappedbylevel")
+		return killXpCappedByLevel.get();
+	if (key == "killxp.cappedbyceiling" ||
+			key == "killxpcappedbyceiling")
+		return killXpCappedByCeiling.get();
 	if (key == "harnessrowsstale") {
 		Locker parityLock(&playerBotParityTestMutex);
 		return playerBotParityTestHarnessRowsStale;
@@ -10227,13 +10720,16 @@ void SimPlayerManager::runPlayerBotParityTestRunner() {
 }
 
 void SimPlayerManager::beginPlayerBotParityTestCleanup(bool preserveProbe) {
-	Locker parityLock(&playerBotParityTestMutex);
-	playerBotParityTestCleanupActive = true;
-	playerBotParityTestCleanupPreserveProbe = preserveProbe;
-	playerBotParityTestCleanupCursor = 0;
-	playerBotParityTestCleanupBodiesDone = false;
-	playerBotParityTestCleanupRequestId = 0;
-	playerBotParityTestCleanupReaperQueued = false;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityTestCleanupActive = true;
+		playerBotParityTestCleanupPreserveProbe = preserveProbe;
+		playerBotParityTestCleanupCursor = 0;
+		playerBotParityTestCleanupBodiesDone = false;
+		playerBotParityTestCleanupRequestId = 0;
+		playerBotParityTestCleanupReaperQueued = false;
+	}
+	despawnPlayerBotParityKillTarget();
 }
 
 void SimPlayerManager::restorePlayerBotParityScenarioGate() {
@@ -10266,6 +10762,11 @@ void SimPlayerManager::resolvePlayerBotParityExpectedRejection(
 }
 
 void SimPlayerManager::cleanupPlayerBotParityTest() {
+	// The target may have survived a failed await, a scenario timeout, or a
+	// runtime harness disable. The operation is idempotent and deliberately
+	// happens before the body/row cleanup passes.
+	despawnPlayerBotParityKillTarget();
+
 	Vector<uint64> identityIds;
 	bool preserveProbe = false;
 	uint64 probeId = 0;
@@ -10388,6 +10889,7 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 		playerBotParityTestBodyOids.removeAll();
 		playerBotParityTestOracle.removeAll();
 		playerBotParityTestRequestRefs.removeAll();
+		playerBotParityTestIdentityRefs.removeAll();
 		if (!preserveProbe)
 			playerBotParityTestProbeIdentityId = 0;
 	}
@@ -10403,6 +10905,7 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 		cleanupActive = playerBotParityTestCleanupActive;
 	}
 	if (!enabledNow) {
+		despawnPlayerBotParityKillTarget();
 		if (cleanupActive)
 			cleanupPlayerBotParityTest();
 		return;
@@ -10593,7 +11096,12 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 			const String counters[] = {"awards.accepted", "rejectedNoRecord",
 				"rejectedNoIdentity", "rejectedDisabled", "rejectedInsufficient",
 				"orphanRecords", "rosterWithoutRecord", "orphansReaped",
-				"reaperRuns", "flushFailures", "createRefusedNotInRoster"};
+				"reaperRuns", "flushFailures", "createRefusedNotInRoster",
+				"killXp.kills", "killXp.attackersConsidered",
+				"killXp.skippedNoIdentity", "killXp.skippedGateOff",
+				"killXp.skippedZero", "killXp.awardsGranted",
+				"killXp.totalAwarded", "killXp.cappedByLevel",
+				"killXp.cappedByCeiling"};
 			for (unsigned int i = 0; i < sizeof(counters) / sizeof(counters[0]); ++i)
 				playerBotParityTestCounterBaselines.put(counters[i].toLowerCase(),
 					static_cast<uint64>(playerBotParityCounterValue(counters[i])));
@@ -10848,6 +11356,9 @@ bool SimPlayerManager::executePlayerBotParityRequestStep(
 		step.identityIndex = playerBotParityTestIdentityIds.size();
 		playerBotParityTestIdentityIds.add(request.identityId);
 		playerBotParityTestBodyOids.add(0);
+		if (!step.identityRef.isEmpty())
+			playerBotParityTestIdentityRefs.put(step.identityRef,
+				request.identityId);
 	}
 	if (kind == PlayerBotProgressionRequest::DeleteProgressionRow) {
 		Locker parityLock(&playerBotParityTestMutex);
@@ -10880,12 +11391,71 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			op == "assertSkill" || op == "assertDirty" || op == "assertSource" ||
 			op == "destroyBody" || op == "respawnBody" ||
 			op == "assertPersisted" || op == "deleteProgressionRow" ||
-			op == "deleteIdentity" || op == "writeRestartProbe") {
+			op == "deleteIdentity" || op == "writeRestartProbe" ||
+			(op == "simulateKillXp" && step.bodyOid == 0) ||
+			op == "spawnKillTarget") {
 		if (!getPlayerBotParityIdentityId(step, identityId)) {
 			result.status = "FAIL";
 			result.failReason = "identity_not_found";
 			return true;
 		}
+	}
+
+	if (op == "simulateKillXp") {
+		uint64 bodyOid = step.bodyOid;
+		if (bodyOid == 0) {
+			{
+				Locker pveLock(&pveMutex);
+				if (pveIdentityBodyOids.contains(identityId))
+					bodyOid = pveIdentityBodyOids.get(identityId);
+			}
+			if (bodyOid == 0) {
+				result.status = "FAIL";
+				result.failReason = "body_not_found";
+				return true;
+			}
+		}
+
+		PlayerBotKillXpEvent event;
+		event.baseXp = step.baseXp;
+		event.totalDamage = step.totalDamage;
+		event.globalMultiplier = step.globalMultiplier;
+		PlayerBotKillXpAttacker attacker;
+		attacker.bodyOid = bodyOid;
+		attacker.groupMultiplier = step.groupMultiplier;
+		attacker.gcwMultiplier = step.gcwMultiplier;
+		attacker.damageByType = step.damageByType;
+		if (attacker.damageByType.size() == 0 && !step.xpType.isEmpty()) {
+			uint32 damage = step.damage;
+			if (damage == 0 && step.amount > 0 &&
+					static_cast<uint64>(step.amount) <= 0xffffffffULL)
+				damage = static_cast<uint32>(step.amount);
+			attacker.damageByType.add(Pair<String, uint32>(step.xpType,
+				damage));
+		}
+		if (event.totalDamage == 0) {
+			uint64 totalDamage = 0;
+			for (int i = 0; i < attacker.damageByType.size(); ++i)
+				totalDamage += attacker.damageByType.get(i).second;
+			event.totalDamage = static_cast<uint32>(totalDamage);
+		}
+		if (event.baseXp <= 0 || event.totalDamage == 0 ||
+				attacker.damageByType.size() == 0) {
+			result.status = "FAIL";
+			result.failReason = "invalid_kill_xp_event";
+			return true;
+		}
+		event.attackers.add(attacker);
+		PlayerBotKillXpParams params;
+		params.enabled = step.hasGateEnabled ? step.gateEnabled :
+			isPlayerBotKillXpEnabled();
+		params.rate = step.hasRate ? step.rate : progressionKillXpRate;
+		awardPlayerBotKillExperience(event, params);
+		// Keep the existing identity-keyed oracle aligned with the production
+		// award function so later assertions still detect store drift.
+		syncPlayerBotParityOracle();
+		result.status = "PASS";
+		return true;
 	}
 
 	if (op == "grantXp") {
@@ -10961,7 +11531,19 @@ bool SimPlayerManager::executePlayerBotParityStep(
 	if (op == "assertXp" || op == "assertCredits" || op == "assertSkill" ||
 			op == "assertSource") {
 		int64 expectedValue = 0;
-		if (op != "assertSource" && op != "assertSkill" &&
+		// Scenario 28 re-asserts the kill award after a flush/reload round trip.
+		// It must compare against the SAME oracle the settle used, not a literal,
+		// so a tuned globalExpMultiplier or killXpRate cannot make a correct
+		// award look like a failure.
+		bool killTargetExpect = op == "assertXp" &&
+			(step.expect == "killTargetDirect" ||
+			step.expect == "killTargetCombatGeneral");
+		if (killTargetExpect) {
+			Locker parityLock(&playerBotParityTestMutex);
+			expectedValue = step.expect == "killTargetDirect" ?
+				playerBotParityTestKillTargetExpectedDirect :
+				playerBotParityTestKillTargetExpectedCombatGeneral;
+		} else if (op != "assertSource" && op != "assertSkill" &&
 				!parsePlayerBotParityExpected(step.expect, expectedValue)) {
 			result.status = "FAIL";
 			result.failReason = "invalid_expected_value";
@@ -11117,12 +11699,20 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		return true;
 	}
 	if (op == "destroyBody") {
-		destroyPlayerBotParityBody(step.identityIndex, "scenario_destroy");
+		int identityIndex = -1;
+		if (!getPlayerBotParityIdentityIndex(step, identityIndex)) {
+			result.status = "FAIL";
+			result.failReason = "identity_not_found";
+			return true;
+		}
+		destroyPlayerBotParityBody(identityIndex, "scenario_destroy");
 		result.status = "PASS";
 		return true;
 	}
 	if (op == "respawnBody") {
-		if (spawnPlayerBotParityBody(step.identityIndex) == nullptr) {
+		int identityIndex = -1;
+		if (!getPlayerBotParityIdentityIndex(step, identityIndex) ||
+				spawnPlayerBotParityBody(identityIndex) == nullptr) {
 			result.status = "FAIL";
 			result.failReason = "body_respawn_failed";
 			return true;
@@ -11130,6 +11720,31 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		syncPlayerBotParityOracle();
 		result.status = "PASS";
 		return true;
+	}
+	if (op == "spawnKillTarget") {
+		String failure;
+		if (!spawnPlayerBotParityKillTarget(step, failure)) {
+			result.status = "FAIL";
+			result.failReason = failure.isEmpty() ?
+				String("kill_target_spawn_failed") : failure;
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "awaitKillTargetDeath") {
+		String failure;
+		if (awaitPlayerBotParityKillTarget(step, failure)) {
+			result.status = "PASS";
+			return true;
+		}
+		if (!failure.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = failure;
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
 	}
 	if (op == "waitForFlush") {
 		uint64 baseline = 0;
@@ -11277,11 +11892,15 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	VectorMap<uint64, SimBotProgression> records;
 	int dirtyCount = 0;
 	uint64 lastFlushMs = 0;
+	uint64 lastAwardMs = 0;
 	{
 		Locker progressionLock(&progressionMutex);
 		records = progressionRecords;
 		dirtyCount = progressionDirtyIds.size();
 		lastFlushMs = progressionLastFlushMs;
+		for (int i = 0; i < records.size(); ++i)
+			lastAwardMs = Math::max(lastAwardMs,
+				records.elementAt(i).getValue().lastAwardMs);
 	}
 
 	bool rerunPending = false;
@@ -11324,10 +11943,26 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		progressionAwardsRejectedInvalidAmount.get();
 	result["awards"] = awards;
 
+	JSONSerializationType killXp = JSONSerializationType::object();
+	killXp["kills"] = killXpKills.get();
+	killXp["attackersConsidered"] = killXpAttackersConsidered.get();
+	killXp["skippedNoIdentity"] = killXpSkippedNoIdentity.get();
+	killXp["skippedGateOff"] = killXpSkippedGateOff.get();
+	killXp["skippedZero"] = killXpSkippedZero.get();
+	killXp["awardsGranted"] = killXpAwardsGranted.get();
+	killXp["totalAwarded"] = killXpTotalAwarded.get();
+	killXp["cappedByLevel"] = killXpCappedByLevel.get();
+	killXp["cappedByCeiling"] = killXpCappedByCeiling.get();
+	killXp["lastAwardAgeSeconds"] = lastAwardMs == 0 ? 0 :
+		static_cast<uint64>((nowMs > lastAwardMs ?
+			nowMs - lastAwardMs : 0) / 1000);
+	killXp["rate"] = progressionKillXpRate;
+	result["killXp"] = killXp;
+
 	JSONSerializationType gates = JSONSerializationType::object();
 	// Later P.10 chunks add their capability gates to this shared Lua block.
 	// Reporting absent gates as false keeps the dashboard fail-closed today.
-	gates["awardKillXp"] = false;
+	gates["awardKillXp"] = isPlayerBotKillXpEnabled();
 	gates["awardMissionCredits"] = false;
 	gates["lootEnabled"] = false;
 	gates["groupLoot"] = false;

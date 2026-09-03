@@ -13,6 +13,7 @@
 #include "system/util/SynchronizedVectorMap.h"
 #include "system/util/Vector.h"
 #include "system/util/VectorMap.h"
+#include "system/lang/Pair.h"
 #include "system/thread/Mutex.h"
 #include "system/thread/atomic/AtomicLong.h"
 #include "engine/util/u3d/Vector3.h"
@@ -143,6 +144,31 @@ struct SimBotProgression {
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
 
+struct PlayerBotKillXpAttacker {
+	uint64 bodyOid = 0;
+	float groupMultiplier = 1.0f;
+	float gcwMultiplier = 1.0f;
+	Vector<Pair<String, uint32> > damageByType;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotKillXpEvent {
+	int baseXp = 0;
+	uint32 totalDamage = 0;
+	float globalMultiplier = 1.0f;
+	Vector<PlayerBotKillXpAttacker> attackers;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotKillXpParams {
+	bool enabled = false;
+	float rate = 1.0f;
+};
+
 // P.10a request lane. The parity harness is a later phase; keeping its
 // vocabulary here lets it enqueue work onto the same PvE maintenance task
 // without introducing a second SQL writer.
@@ -191,9 +217,23 @@ struct PlayerBotProgressionRequest {
 struct PlayerBotParityTestStep {
 	String op;
 	int identityIndex = -1;
+	String identityRef;
 	uint64 identityId = 0;
+	uint64 bodyOid = 0;
+	String templateName;
 	String xpType;
 	int64 amount = 0;
+	int baseXp = 0;
+	uint32 totalDamage = 0;
+	uint32 damage = 0;
+	Vector<Pair<String, uint32> > damageByType;
+	float groupMultiplier = 1.0f;
+	float gcwMultiplier = 1.0f;
+	float globalMultiplier = 1.0f;
+	bool gateEnabled = false;
+	bool hasGateEnabled = false;
+	float rate = 1.0f;
+	bool hasRate = false;
 	String expect;
 	String source = "harness";
 	bool bank = false;
@@ -1847,6 +1887,8 @@ private:
 	VectorMap<uint64, bool> progressionDirtyIds;
 	Vector<uint64> progressionOrphanIds;
 	bool progressionEnabled = false;
+	bool progressionAwardKillXp = false;
+	float progressionKillXpRate = 1.0f;
 	bool progressionLoaded = false;
 	bool progressionDbAvailable = false;
 	uint64 progressionLastFlushMs = 0;
@@ -1862,6 +1904,15 @@ private:
 	AtomicLong progressionAwardsRejectedInsufficient;
 	AtomicLong progressionAwardsRejectedInvalidAmount;
 	AtomicLong progressionCreateRefusedNotInRoster;
+	AtomicLong killXpKills;
+	AtomicLong killXpAttackersConsidered;
+	AtomicLong killXpSkippedNoIdentity;
+	AtomicLong killXpSkippedGateOff;
+	AtomicLong killXpSkippedZero;
+	AtomicLong killXpAwardsGranted;
+	AtomicLong killXpTotalAwarded;
+	AtomicLong killXpCappedByLevel;
+	AtomicLong killXpCappedByCeiling;
 	AtomicLong progressionOrphanRecords;
 	AtomicLong progressionRosterWithoutRecord;
 	AtomicLong progressionOrphansReaped;
@@ -1884,6 +1935,7 @@ private:
 	Vector<uint64> playerBotParityTestBodyOids;
 	VectorMap<uint64, SimBotProgression> playerBotParityTestOracle;
 	VectorMap<String, uint64> playerBotParityTestRequestRefs;
+	VectorMap<String, uint64> playerBotParityTestIdentityRefs;
 	VectorMap<String, uint64> playerBotParityTestCounterBaselines;
 	int playerBotParityTestScenarioIndex = 0;
 	int playerBotParityTestStepCursor = 0;
@@ -1924,6 +1976,19 @@ private:
 	int playerBotParityTestStartupDelaySeconds = 60;
 	String playerBotParityTestRunId;
 	String playerBotParityTestPhase = "A";
+	String playerBotParityTestKillTargetTemplate = "dwarf_nuna";
+	uint64 playerBotParityTestKillTargetOid = 0;
+	uint64 playerBotParityTestKillTargetIdentityId = 0;
+	int playerBotParityTestKillTargetBaseXp = 0;
+	uint64 playerBotParityTestKillTargetKillXpBaseline = 0;
+	String playerBotParityTestKillTargetXpType;
+	// Captured at spawn so the oracle recomputes the award from the same live
+	// terms the production path used, instead of hardcoding a literal that any
+	// tuned multiplier or earn rate would falsify.
+	float playerBotParityTestKillTargetGlobalMultiplier = 1.0f;
+	float playerBotParityTestKillTargetRate = 1.0f;
+	int playerBotParityTestKillTargetExpectedDirect = 0;
+	int playerBotParityTestKillTargetExpectedCombatGeneral = 0;
 	uint64 playerBotParityTestProbeIdentityId = 0;
 	uint64 playerBotParityTestScenarioBaselineRecords = 0;
 	uint64 playerBotParityTestHarnessRowsStale = 0;
@@ -2173,6 +2238,8 @@ private:
 		PlayerBotProgressionRequest* completedOut = nullptr);
 	bool getPlayerBotParityIdentityId(const PlayerBotParityTestStep& step,
 		uint64& identityId);
+	bool getPlayerBotParityIdentityIndex(const PlayerBotParityTestStep& step,
+		int& identityIndex);
 	void syncPlayerBotParityOracle();
 	bool assertPlayerBotParityStore(const PlayerBotParityTestStep& step,
 		String& failure);
@@ -2187,6 +2254,11 @@ private:
 	bool findPlayerBotParityRestartProbe(uint64& identityId);
 	AiAgent* spawnPlayerBotParityBody(int identityIndex);
 	void destroyPlayerBotParityBody(int identityIndex, const String& reason);
+	bool spawnPlayerBotParityKillTarget(const PlayerBotParityTestStep& step,
+		String& failure);
+	bool awaitPlayerBotParityKillTarget(const PlayerBotParityTestStep& step,
+		String& failure);
+	void despawnPlayerBotParityKillTarget();
 	bool awardToNonRosterPlayerBotBody(uint64 identityId, const String& xpType,
 		int amount, const String& source);
 	bool playerBotProgressionAwardGateEnabled();
@@ -2784,12 +2856,20 @@ public:
 	// create one as a side effect.
 	bool grantPlayerBotExperience(uint64 identityId, const String& xpType,
 		int amount, const String& source, int* awarded = nullptr);
+	void awardPlayerBotKillExperience(const PlayerBotKillXpEvent& event);
+	void awardPlayerBotKillExperience(const PlayerBotKillXpEvent& event,
+		const PlayerBotKillXpParams& params);
 	bool grantPlayerBotCredits(uint64 identityId, int64 amount, bool bank,
 		const String& source);
 	bool spendPlayerBotCredits(uint64 identityId, int64 amount, bool bank,
 		const String& source);
 	bool recordPlayerBotSkill(uint64 identityId, const String& skillName,
 		const String& source);
+	bool isPlayerBotKillXpEnabled() const {
+		return progressionEnabled && progressionAwardKillXp;
+	}
+	bool resolvePlayerBotIdentityAndTier(uint64 bodyOid,
+		uint64& identityId, int& skillTier);
 	uint64 resolvePlayerBotIdentity(uint64 bodyOid);
 	bool snapshotPlayerBotProgression(uint64 identityId,
 		SimBotProgression& out);

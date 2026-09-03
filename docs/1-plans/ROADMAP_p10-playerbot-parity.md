@@ -193,8 +193,15 @@ F_0.9.0 store+dashboard+reaper+harness ─┬─► F_0.9.1 XP per kill ──�
   cap as max trained `Skill::getXpCap()` else that default (finalised in
   F_0.9.5 once trained skills exist). Gate
   `playerBotProgression.awardKillXp`.
-- **Engine touchpoints**: `CreatureManagerImplementation.cpp` (one call, same
-  precedent as `recordSimPresenceSpawn` in `tryToSpawn`), `SimPlayerManager`.
+- **Engine touchpoints**: **CORRECTED IN F_0.9.1's PLAN** — the branch went
+  inside `PlayerManagerImplementation::disseminateExperience` rather than at the
+  `CreatureManagerImplementation.cpp:677` call site sketched here.
+  `disseminateExperience` has two callers (single-creature death and
+  `DisseminateExperienceTask` for lairs); hooking at the CreatureManager site
+  alone silently omits every lair kill, and would have to recompute `baseXp`.
+  The P.7.4b FRS block already lives in that function and set the precedent.
+  Later chunks should inherit this decision, not the original sketch. Also
+  `SimPlayerManager`.
   Bot level for the cap: derived from trained skills in the store (fallback
   `skillTier`), never from the body template's level (a wraith is level 178).
 - **Persists**: `simbot_experience` rows.

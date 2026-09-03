@@ -586,6 +586,13 @@ class PlayerManager extends Observer implements Logger {
 	 */
 	private native boolean doEnhanceCharacter(unsigned int crc, CreatureObject player, int amount, int duration, int buffType, byte attribute);
 
+	// F_0.9.1: the P.10b kill-XP oracle needs the same server-wide multiplier
+	// awardExperience applies, so a harness assertion stays exact on a server
+	// whose multiplier has been tuned. Symmetric with setExperienceMultiplier.
+	public float getExperienceMultiplier() {
+		return globalExpMultiplier;
+	}
+
 	public int getBaseStoredCreaturePets() {
 		return baseStoredCreaturePets;
 	}

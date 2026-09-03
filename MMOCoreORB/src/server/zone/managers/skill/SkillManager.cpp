@@ -835,6 +835,10 @@ void SkillManager::updateXpLimits(PlayerObject* ghost) {
 	}
 }
 
+int SkillManager::getDefaultXpLimit(const String& xpType) {
+	return defaultXpLimits.contains(xpType) ? defaultXpLimits.get(xpType) : -1;
+}
+
 bool SkillManager::canLearnSkill(const String& skillName, CreatureObject* creature, bool noXpRequired) {
 	Skill* skill = skillMap.get(skillName.hashCode());
 

@@ -1147,6 +1147,7 @@ SimPlayerManagerConfig = {
         planet = "tatooine",
         spawn = {x=3467, y=-4890, z=5},
         identityCount = 2,
+        killTargetTemplate = "dwarf_nuna",
         startupDelaySeconds = 60,
         scenarios = {
             {name="store_boot_invariant", budgetMs=300000, steps={
@@ -1196,11 +1197,11 @@ SimPlayerManagerConfig = {
                 {op="reloadStore"},
                 {op="assertXp", identityIndex=0, xpType="harness_cadence", expect="10"}}},
             {name="retained_record_survives_restart", budgetMs=300000, steps={
-                {op="grantXp", identityIndex=1, xpType="harness_restart", amount=4242, restartPhase="A"},
+                {op="grantXp", identityIndex=1, xpType="harness_restart", amount=1234, restartPhase="A"},
                 {op="grantCredits", identityIndex=1, bank=true, amount=777, restartPhase="A"},
                 {op="writeRestartProbe", identityIndex=1, restartPhase="A"},
                 {op="flushNow", force=true, restartPhase="A"},
-                {op="assertXp", identityIndex=0, xpType="harness_restart", expect="4242", restartPhase="B"},
+                {op="assertXp", identityIndex=0, xpType="harness_restart", expect="1234", restartPhase="B"},
                 {op="assertCredits", identityIndex=0, bank=true, expect="777", restartPhase="B"},
                 {op="deleteIdentity", identityIndex=0, restartPhase="B"},
                 {op="runReaper", force=true, restartPhase="B"}}},
@@ -1274,6 +1275,107 @@ SimPlayerManagerConfig = {
                 {op="assertCounterDelta", counter="createRefusedNotInRoster", expect="0"},
                 {op="deleteIdentity", identityIndex=3},
                 {op="runReaper", force=true}}},
+            {name="kill_xp_gate_off_no_award", budgetMs=300000, steps={
+                {op="simulateKillXp", identityIndex=0, baseXp=85, totalDamage=85,
+                    xpType="harness_kill_gate", damage=85, gateEnabled=false},
+                {op="assertXp", identityIndex=0, xpType="harness_kill_gate", expect="0"},
+                {op="assertCounterDelta", counter="killXp.skippedGateOff", expect="1"},
+                {op="assertRecords", delta=0}}},
+            {name="kill_xp_formula_solo", budgetMs=300000, steps={
+                {op="simulateKillXp", identityIndex=0, baseXp=85, totalDamage=85,
+                    xpType="harness_kill_solo", damage=85, gateEnabled=true, rate=1.0},
+                {op="assertXp", identityIndex=0, xpType="harness_kill_solo", expect="85"},
+                {op="assertXp", identityIndex=0, xpType="combat_general", expect="8"}}},
+            {name="kill_xp_per_kill_level_cap", budgetMs=300000, steps={
+                {op="simulateKillXp", identityIndex=0, baseXp=1000, totalDamage=1000,
+                    xpType="harness_kill_level_cap", damage=1000, gateEnabled=true},
+                {op="assertXp", identityIndex=0, xpType="harness_kill_level_cap", expect="300"},
+                {op="assertCounterDelta", counter="killXp.cappedByLevel", expect="1"}}},
+            {name="kill_xp_group_and_gcw_multipliers", budgetMs=300000, steps={
+                {op="simulateKillXp", identityIndex=0, baseXp=100, totalDamage=100,
+                    xpType="harness_kill_group", damage=100, groupMultiplier=1.2,
+                    gateEnabled=true},
+                {op="simulateKillXp", identityIndex=0, baseXp=100, totalDamage=100,
+                    xpType="harness_kill_gcw", damage=100, gcwMultiplier=1.5,
+                    gateEnabled=true},
+                {op="simulateKillXp", identityIndex=0, baseXp=100, totalDamage=100,
+                    xpType="harness_kill_group_gcw", damage=100,
+                    groupMultiplier=1.2, gcwMultiplier=1.5, gateEnabled=true},
+                {op="assertXp", identityIndex=0, xpType="harness_kill_group", expect="120"},
+                {op="assertXp", identityIndex=0, xpType="harness_kill_gcw", expect="150"},
+                {op="assertXp", identityIndex=0, xpType="harness_kill_group_gcw", expect="180"},
+                {op="assertXp", identityIndex=0, xpType="combat_general", expect="83"}}},
+            {name="kill_xp_combat_general_and_dot", budgetMs=300000, steps={
+                {op="simulateKillXp", identityIndex=0, baseXp=100, totalDamage=100,
+                    damageByType={{xpType="harness_kill_multi", damage=60},
+                        {xpType="dotDMG", damage=40}}, gateEnabled=true},
+                {op="assertXp", identityIndex=0, xpType="harness_kill_multi", expect="60"},
+                {op="assertXp", identityIndex=0, xpType="dotDMG", expect="0"},
+                {op="assertXp", identityIndex=0, xpType="combat_general", expect="93"}}},
+            {name="kill_xp_rate_knob", budgetMs=300000, steps={
+                {op="simulateKillXp", identityIndex=0, baseXp=85, totalDamage=85,
+                    xpType="harness_kill_rate", damage=85, gateEnabled=true, rate=2.0},
+                {op="assertXp", identityIndex=0, xpType="harness_kill_rate", expect="170"},
+                {op="assertXp", identityIndex=0, xpType="combat_general", expect="110"}}},
+            {name="kill_xp_lifetime_ceiling", budgetMs=300000, steps={
+                {op="simulateKillXp", identityIndex=0, baseXp=1000, totalDamage=1000,
+                    xpType="harness_kill_ceiling", damage=1000, gateEnabled=true},
+                {op="simulateKillXp", identityIndex=0, baseXp=1000, totalDamage=1000,
+                    xpType="harness_kill_ceiling", damage=1000, gateEnabled=true},
+                {op="simulateKillXp", identityIndex=0, baseXp=1000, totalDamage=1000,
+                    xpType="harness_kill_ceiling", damage=1000, gateEnabled=true},
+                {op="simulateKillXp", identityIndex=0, baseXp=1000, totalDamage=1000,
+                    xpType="harness_kill_ceiling", damage=1000, gateEnabled=true},
+                {op="simulateKillXp", identityIndex=0, baseXp=1000, totalDamage=1000,
+                    xpType="harness_kill_ceiling", damage=1000, gateEnabled=true},
+                {op="simulateKillXp", identityIndex=0, baseXp=1000, totalDamage=1000,
+                    xpType="harness_kill_ceiling", damage=1000, gateEnabled=true},
+                {op="simulateKillXp", identityIndex=0, baseXp=1000, totalDamage=1000,
+                    xpType="harness_kill_ceiling", damage=1000, gateEnabled=true},
+                {op="assertXp", identityIndex=0, xpType="harness_kill_ceiling", expect="2000"},
+                {op="assertCounterDelta", counter="killXp.cappedByCeiling", expect="1"}}},
+            {name="kill_xp_no_identity_no_award", budgetMs=300000, steps={
+                {op="simulateKillXp", bodyOid=999999999, baseXp=85, totalDamage=85,
+                    xpType="harness_kill_no_identity", damage=85, gateEnabled=true},
+                {op="assertCounterDelta", counter="killXp.skippedNoIdentity", expect="1"},
+                {op="assertRecords", delta=0}}},
+            {name="kill_xp_zero_and_global_multiplier", budgetMs=300000, steps={
+                {op="simulateKillXp", identityIndex=0, baseXp=85, totalDamage=85,
+                    xpType="harness_kill_zero_rate", damage=85, gateEnabled=true, rate=0.0},
+                {op="simulateKillXp", identityIndex=0, baseXp=1, totalDamage=3,
+                    xpType="harness_kill_fractional", damage=1, gateEnabled=true},
+                {op="simulateKillXp", identityIndex=0, baseXp=85, totalDamage=85,
+                    xpType="harness_kill_global", damage=85, globalMultiplier=2.0,
+                    gateEnabled=true},
+                {op="assertXp", identityIndex=0, xpType="harness_kill_zero_rate", expect="0"},
+                {op="assertXp", identityIndex=0, xpType="harness_kill_fractional", expect="0"},
+                {op="assertXp", identityIndex=0, xpType="harness_kill_global", expect="170"},
+                {op="assertCounterDelta", counter="killXp.skippedZero", expect="4"},
+                {op="assertCounterDelta", counter="rejectedInvalidAmount", expect="0"}}},
+            {name="harness_bot_kills_nuna_and_earns_xp", budgetMs=600000, steps={
+                {op="mintIdentity", identityRef="killBot"},
+                {op="respawnBody", identityRef="killBot"},
+                {op="spawnKillTarget", identityRef="killBot"},
+                {op="awaitKillTargetDeath", xpType="combat_rangedspecialize_rifle",
+                    budgetMs=180000},
+                -- expect= is the oracle awaitKillTargetDeath computed from the
+                -- victim's own baseXp and the live globalExpMultiplier/killXpRate
+                -- captured before combat, NOT a literal: dwarf_nuna's baseXp 85
+                -- with a sole attacker and skillTier 1 yields 85 direct and 8
+                -- combat_general at the shipped defaults, but a tuned server
+                -- must still assert exactly rather than fail a correct award.
+                {op="assertXp", identityRef="killBot",
+                    xpType="combat_rangedspecialize_rifle", expect="killTargetDirect"},
+                {op="assertXp", identityRef="killBot", xpType="combat_general",
+                    expect="killTargetCombatGeneral"},
+                {op="flushNow", force=true},
+                {op="reloadStore"},
+                {op="assertXp", identityRef="killBot",
+                    xpType="combat_rangedspecialize_rifle", expect="killTargetDirect"},
+                {op="assertXp", identityRef="killBot", xpType="combat_general",
+                    expect="killTargetCombatGeneral"},
+                {op="deleteIdentity", identityRef="killBot"},
+                {op="runReaper", force=true}}},
         },
     },
 
@@ -1283,6 +1385,8 @@ SimPlayerManagerConfig = {
     -- The foundation is intentionally inert until its live receipt is accepted.
     playerBotProgression = {
         enabled = false,
+        awardKillXp = false,
+        killXpRate = 1.0,
         flushIntervalSeconds = 60,
         reaper = {
             enabled = false,

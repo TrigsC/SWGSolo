@@ -1065,6 +1065,8 @@
       </tr>`;
     }).join("");
     const progressionHarness = progression.harness || {};
+    const killXp = progression.killXp || {};
+    const killXpGate = progression.gates && progression.gates.awardKillXp === true;
     const progressionHarnessRows = (progressionHarness.scenarios || []).map((s) => {
       const status = String(s.status || "PENDING");
       const tone = /PASS|COMPLETE/i.test(status) ? "ok" : /FAIL/i.test(status) ? "red" : "amber";
@@ -1159,6 +1161,8 @@
             ${metric("Harness Stale", progressionHarness.harnessRowsStale, { tone: Number(progressionHarness.harnessRowsStale || 0) ? "warn" : "" })}
             ${metric("Dirty", progression.dirtyCount)}
             ${metric("Awards Accepted", (progression.awards || {}).accepted, { tone: "accent" })}
+            ${metric("Kill XP Kills", killXp.kills, { tone: "accent" })}
+            ${metric("Kill XP Awarded", killXp.totalAwarded)}
             ${metric("Flush Age", ago(progression.lastFlushAgeSeconds), { raw: true })}
           </div>
           <div class="section-gap"></div>
@@ -1169,6 +1173,11 @@
             ["Reaper", progression.reaper && progression.reaper.enabled ? "enabled" : "count-only"],
             ["Reaper runs / reaped", num(progression.reaper && progression.reaper.runs) + " / " + num(progression.reaper && progression.reaper.reaped)],
             ["Rejected: no record / disabled", num((progression.awards || {}).rejectedNoRecord) + " / " + num((progression.awards || {}).rejectedDisabled)],
+            ["Kill XP gate / rate", `${chip(killXpGate ? "enabled" : "disabled", killXpGate ? "ok" : "ghost")} · ${Number(killXp.rate || 0).toFixed(2)}x`],
+            ["Kill XP attackers", num(killXp.attackersConsidered)],
+            ["Kill XP awards / caps", num(killXp.awardsGranted) + " / " + num(killXp.cappedByLevel) + " level · " + num(killXp.cappedByCeiling) + " ceiling"],
+            ["Kill XP skips", num(killXp.skippedGateOff) + " gate · " + num(killXp.skippedNoIdentity) + " identity · " + num(killXp.skippedZero) + " zero"],
+            ["Kill XP last award", ago(killXp.lastAwardAgeSeconds)],
             ["Maintenance", num(progression.maintenance && progression.maintenance.ticksTotal) + " ticks · " + num(progression.maintenance && progression.maintenance.requestsQueued) + " queued"]
           ])}</div>
         </section>

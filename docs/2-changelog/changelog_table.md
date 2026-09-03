@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.9.1` | 8 | F_0.9.1 P.10b: roster PlayerBots earn real kill XP — player-parity award from the victim's ThreatMap via a lock-free deferred task inside disseminateExperience, with a Lua-tunable killXpRate, a lifetime ceiling inside the award API, and a live harness in which a bot kills a spawned dwarf_nuna for the exact oracle amount; all gates ship default-off |
 | `0.9.0` | 8 | F_0.9.0 P.10a: PlayerBot progression store — identity-keyed MySQL XP/credits/skills with award-requires-record semantics, atomic-swap flush and orphan reaper, plus an 18-scenario two-boot live harness; award API has no production caller and all gates ship default-off |
 | `0.8.2` | 8 | F_0.7.3 + F_0.7.5: PvE hunters reach real doctors — dual-anchor med-centre resolution and cross-building approach staging; P.9 traversal gates ship enabled |
 | `0.8.1` | 7 | F_0.8.1 P.9: production controllers adopt structure traversal — hunter and PvP building entry migrated onto the state machine (0 → 61 production agents emitting ordered phases), per-agent harness anomaly oracle, and a post-lock agent lifecycle recheck; all gates default-off |
@@ -21,6 +22,18 @@
 | `0.1.0` | 1 | chore: initialize TRIP workflow |
 
 # Changelog Summary
+
+- **v0.9.1 (Kill XP for Roster PlayerBots, F_0.9.1 P.10b - Week 8, 03-09-2026)**:
+  - **The first production caller of F_0.9.0's award API**, and the first real economy mutation in the P.10 line. Roster bots now earn combat XP for what they kill, using the engine's own player arithmetic.
+  - **No combat-side change was needed**: `ThreatMap::addDamage` already records *every* attacker, AiAgents included, keyed by that attacker's weapon `getXpType()`. Bot hunters were always in the victim's threat map — the data existed and nothing collected it.
+  - **Hook site corrected from the roadmap**: the branch went *inside* `PlayerManagerImplementation::disseminateExperience`, not at the `CreatureManagerImplementation.cpp:677` call site. That function has two callers (single kill, and `DisseminateExperienceTask` for lairs), so hooking inside covers both with one branch and reuses the already-computed `baseXp`/`totalDamage`/`gcwBonus`. The roadmap records the correction so later chunks inherit it.
+  - **Zero locks on the death path**: the corpse is already locked when `disseminateExperience` runs, so the branch only copies a POD and defers to `SimPlayerBotKillXpTask`, which resolves under `pveMutex` then writes under `progressionMutex` — never nested, never holding an agent lock, never capturing a reference to the corpse.
+  - **`getSimPlayerBot()` is a cost filter, never authority** — that is the flag that once leaked onto wild creatures (`d38877020c`). A stale true costs one task that resolves nothing; a stale false costs one kill's XP. Live verification watched 29 wildlife deaths reach the task and get rejected as non-roster, which is the fail-closed design working on production traffic.
+  - **Parity includes the rounding**: the direct path truncates *twice* (at `awardExperience`'s `int amount` boundary, then again after `globalExpMultiplier`) while `combat_general` truncates once because `combatXp` is already a `uint32`. Bot level comes from `skillTier`, never the body template — a wraith-templated body would otherwise cap at 178x300. `killXpRate` (default `1.0`) applies *after* the per-kill cap so the knob is not swallowed by it.
+  - **The lifetime ceiling moved into `grantPlayerBotExperience`** so every future XP source inherits it instead of re-implementing it; a type already at its ceiling returns `false` with no rejection counter, because the caller passed a valid amount and the store simply had no room.
+  - **Scenario 28 is the call-site proof and needed no controller change**: harness and hunter identities share one body-creation path (rifle, faction 0, `ATTACKABLE`), and `simParityTest` overrides only `IDLE` — the stock combat sockets were live all along. A bot killed a spawned `dwarf_nuna` and banked the exact oracle award, durable across flush+reload and a real process restart.
+  - **One defect only live execution could find**: `deleteIdentity` re-resolves its identity on *every* async poll, but the request handler pruned the named ref on completion — so the very poll that observed completion failed. Positional addressing never hit it, because that handler never touched the positional vector; the new named-ref mode inherited an async lifetime the old one lacked.
+  - **Measured**: 32/32 required assertions, 28/28 matrix across four boots, no crash. Gates-off is inert and was re-confirmed after restore; credits and skills stayed at zero throughout.
 
 - **v0.9.0 (PlayerBot Progression Store, F_0.9.0 P.10a - Week 8, 02-09-2026)**:
   - **Opens the P.10 player-parity line** under the owner's explicit economy-phase approval. This chunk builds only the *place* progression lives — nothing awards anything yet, and a hunter's kill pays exactly what it paid in 0.8.2.
