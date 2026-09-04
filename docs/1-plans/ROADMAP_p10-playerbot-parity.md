@@ -450,6 +450,147 @@ F_0.9.0 store+dashboard+reaper+harness ─┬─► F_0.9.1 XP per kill ──�
   `core3tests` (first P.10 code that is); harness asserts the roster's
   profession assignments match the planner output after one cadence.
 
+## 5b. Owner's end-goal restatement (2026-09-03) — bots as novice players
+
+The owner's stated end goal, after F_0.9.1 shipped: **rework the PvE bots into true
+PlayerBots that begin as a novice (marksman / brawler / artisan) and progress as a
+player would.** Most of that is already F_0.9.5 + F_0.9.8 — the training loop,
+prerequisite checking against `simbot_skills`, `applyProgressionToBody`, and the
+per-profession training plan all exist in those sections and already route around the
+ghostless-creature wall. Three things it does NOT yet cover are recorded here.
+
+### 5b.1 Starting state — mint at novice with a profession (new work)
+
+F_0.9.5 trains *upward* from wherever an identity already is; nothing mints one *at*
+novice with a profession assigned. Required: `SimBotIdentity` gains a profession
+(currently hardcoded `"hunter"`) and the mint path grants the novice box for it
+through the same `trainSkill` entry point F_0.9.5 builds — never a second code path,
+per the one-creation-function invariant (§2). Existing identities are covered by
+5b.3. The profession set the owner named is marksman / brawler / artisan; the
+allocation policy that *chooses* between them is F_0.9.8, so until that lands the
+assignment is a Lua-configured distribution.
+
+### 5b.2 Body template — a neutral base to build from (new work)
+
+Hunter bodies currently use the `death_watch_wraith` combat mob template. That is
+wrong for a novice-profession bot on two counts: it is a level-178 template (the
+reason F_0.9.1's cap derives level from `skillTier` and *never* from the body), and
+it is a factioned combat mob rather than a plausible starting character. It is also
+already an open owner item — the uncommitted nerf on `death_watch_wraith.lua` /
+`rifle_t21.lua`, and the "stormtrooper → custom template" thread.
+
+Direction (owner, 2026-09-03): **one default PlayerBot template, built up from
+there** rather than a template per profession. Appearance and gear then come from
+equipping real objects, not from swapping mobile templates.
+
+### 5b.3 Migration of the existing roster — DECIDED 2026-09-03: retire and start clean
+
+**Owner decision: retire the six existing `hunter` identities and mint fresh
+novices.** They keep no history. This is the simpler path and it removes the need for
+a backfill that would have had to invent a plausible skill set for a bot with 537
+lifetime kills and no training record.
+
+Retirement must go through the roster's existing delete path so the progression rows,
+XP rows and any body go with it — `simbot_progression` is keyed by identity id and
+F_0.9.0's reaper already counts and removes orphans, so a hunter row left behind
+would surface as `orphanRecords` rather than vanish silently.
+
+### 5b.3a First bot — ONE unarmed brawler → Teras Kasi (owner, 2026-09-03)
+
+**Owner's chosen first target: a single brawler training unarmed, aiming at Teras
+Kasi**, on the grounds that it is the easiest thing to test. That instinct is right
+for a reason worth recording — it removes the hardest unsolved piece from the first
+pass entirely.
+
+**Unarmed needs no weapon-equip code at all.**
+`bin/scripts/object/weapon/creature/creature_default_weapon.lua:62` declares
+`xpType = "combat_meleespecialize_unarmed"`. Every creature spawns holding that
+default weapon, and `ThreatMap::addDamage` keys damage off
+`tarCreo->getWeapon()->getXpType()` — so an unarmed bot already credits the correct
+XP type through the F_0.9.1 path that is shipped and verified, with no change.
+
+Concretely, the brawler body path is the hunter path *minus* work: the hunter body
+destroys the stock creature weapon and equips `rifle_cdef`
+(`SimPlayerManager.cpp:11795-11815`). A brawler simply **skips that block** and keeps
+the default weapon. That also sidesteps §5b.4's equip constraints for the first
+profession — nothing needs to be worn for the bot to be correct.
+
+**The skill ladder, verified against the character-builder terminal and trainer data**
+(names come from `datatables/skill/skills.iff` in TRE, so they are not greppable in
+`bin/scripts/skills/`):
+
+| Stage | Skill boxes |
+| --- | --- |
+| Novice brawler | `combat_brawler_novice` |
+| Unarmed branch | `combat_brawler_unarmed_01` … `_04` |
+| Master brawler | `combat_brawler_master` |
+| Novice Teras Kasi | `combat_unarmed_novice` |
+| Four elite branches | `combat_unarmed_{accuracy,speed,ability,support}_01` … `_04` |
+| Master Teras Kasi | `combat_unarmed_master` |
+
+**Naming gotcha**: the Teras Kasi tree is internally `combat_unarmed_*`, **not**
+`combat_teraskasi_*`. Searching skill names for "teraskasi" finds nothing — that
+string only appears as an *attack-list* name in mobile templates
+(`teraskasinovice` in `primaryAttacks`). Anyone wiring the training plan will hit this.
+
+This gives F_0.9.5 a single, fully-specified ladder to prove the training loop against:
+one identity, one XP type it already earns correctly, ~26 boxes with real
+prerequisites and real XP costs, and a visible end state. Broadening to marksman and
+artisan is then a Lua training-plan change, not new C++.
+
+### 5b.4 Equipping real gear — PROVEN, with one constraint that shapes the design
+
+The owner asked whether a bot could buy or loot a piece of armour and equip it, citing
+the Jedi robe work. **That precedent is real and it works.** `frs_rank_outfits.lua`
+lists genuine client-TRE wearables and `AiAgentImplementation.cpp:1128-1225` equips
+one onto an AiAgent: `createObject(iff)` → `transferObject(wearable, 4, false)` →
+`addWearableObject(wearable, false)`.
+
+The constraint is documented in that same code and decides how far the idea can go:
+
+> AiAgents use the generic `ContainerComponent`, unlike players. A successful slotted
+> transfer therefore establishes containment but does not populate the CREO6
+> equipment list. […] This deliberately avoids `PlayerContainerComponent`, so player
+> race/certification checks and robe skill-mod handling remain unchanged.
+
+Three consequences:
+
+1. **Appearance works, and is clean.** The wearable is registered without a delta, so
+   observers receive it in the creature's *initial baseline*. Equipping at spawn is
+   proven. Equipping mid-life is the open question — already-observing clients may not
+   see the change without a delta path.
+2. **Stats do not follow.** Armour equipped this way establishes containment only;
+   its protection values do not flow through the player equipment semantics. A bot
+   would *look* armoured without *being* armoured.
+3. **Player race and certification checks are bypassed**, not satisfied — the FRS code
+   logs `raceListed` but does not enforce it. A bot could wear what a player could not.
+
+**Design consequence.** Consequence 2 means "loot armour → become tougher" should
+NOT be built by leaning on the player equipment path. The cheaper and more honest
+route is the overlay F_0.9.5 already requires: it must apply
+`template baseline + trained delta` as the creature-list skill-mod value because
+`AiAgentImplementation::getSkillMod` (`:624-664`) returns the creature-list value
+whenever nonzero. Armour protection can ride that same overlay as another delta
+source, with the equipped object as its provenance. That keeps one mechanism for "why
+is this bot's stat what it is" instead of two, and keeps the wearable purely cosmetic
+at the container level where it already works.
+
+**Open question for a spike, not for a chunk plan**: whether mid-life equip can
+propagate visually without adopting `PlayerContainerComponent`. If it cannot, bots
+re-equip at respawn and the visible loadout lags a body cycle — probably acceptable,
+and worth confirming before F_0.9.3's loot chunk assumes otherwise.
+
+### 5b.5 Sequencing consequence
+
+The ghost question (§3) is upstream of more than F_0.9.5. F_0.9.3's hive item vault
+exists *because* bots have no player inventory; if bots ever gained a real
+`PlayerObject`, that chunk would simplify enormously — and would also inherit
+`isPlayerCreature()`, which fences large amounts of engine behaviour both wanted
+(loot, missions) and unwanted (the F_0.7.2 player-chat SIGABRT class, who.json player
+counts, character rows). §3 already evaluated and rejected structural typing for
+F_0.9.0's scope; **that evaluation should be revisited once, explicitly, before
+F_0.9.3's plan is written**, because that is the chunk whose shape it changes most.
+
 ## 6. engine3 policy and inventory
 
 **Inventory (2026-09-02)**: submodule at `ad80556104012c96378714274222e8b5fe5a6f21`
