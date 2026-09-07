@@ -108,6 +108,7 @@ struct SimBotIdentity {
 	String firstName;
 	String lastName;
 	String profession = "hunter";
+	String trainingPlan;
 	String homePlanet;
 	String homeCity;
 	int skillTier = 1;
@@ -139,6 +140,54 @@ struct SimBotProgression {
 	Vector<String> skills;
 	String createdAt;
 	String updatedAt;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct SimBotTrainingPlan {
+	String name;
+	String profession;
+	String goalSkill;
+	String weaponTemplate;
+	String weaponType;
+	String loadError;
+	Vector<String> orderedSkills;
+	int totalPoints = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// P.10f Phase 2: the next box is cached against the cumulative XP total, not
+// the spendable balance. The cache is manager-owned and guarded by
+// progressionMutex together with progressionTrainingPlans.
+struct SimBotTrainingStep {
+	String planName;
+	String skillName;
+	String xpType;
+	int lifetimeEarnedThreshold = 0;
+	bool valid = false;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// P.10f Phase 3: a manager-owned copy of the trained overlay. It is built
+// while progressionMutex is held and must be complete before an agent lock is
+// acquired.
+struct SimBotBodyProgression {
+	Vector<String> skills;
+	VectorMap<String, int> modDeltas;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PveNoviceDistribution {
+	String profession;
+	String trainingPlan;
+	int count = 0;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -197,6 +246,8 @@ struct PlayerBotProgressionRequest {
 	Kind kind = FlushNow;
 	State state = Queued;
 	uint64 identityId = 0;
+	String profession;
+	String trainingPlan;
 	String xpType;
 	bool force = false;
 	int faultFlushDelayMs = 0;
@@ -221,7 +272,11 @@ struct PlayerBotParityTestStep {
 	uint64 identityId = 0;
 	uint64 bodyOid = 0;
 	String templateName;
+	String profession;
+	String trainingPlan;
 	String xpType;
+	String skillName;
+	String skillMod;
 	int64 amount = 0;
 	int baseXp = 0;
 	uint32 totalDamage = 0;
@@ -232,6 +287,9 @@ struct PlayerBotParityTestStep {
 	float globalMultiplier = 1.0f;
 	bool gateEnabled = false;
 	bool hasGateEnabled = false;
+	bool freeGrant = false;
+	bool trainingGateEnabled = false;
+	bool hasTrainingGateEnabled = false;
 	float rate = 1.0f;
 	bool hasRate = false;
 	String expect;
@@ -1877,6 +1935,7 @@ private:
 	VectorMap<uint64, uint64> pveIdentityBodyOids;
 	VectorMap<uint64, uint64> pveBodyIdentityIds;
 	VectorMap<uint64, uint64> pveRespawnDueAtMs;
+	VectorMap<uint64, bool> pveRetiringIdentityIds;
 	VectorMap<uint64, bool> pveDirtyIdentityIds;
 
 	// P.10a: manager-owned progression store. The two maps are intentionally
@@ -1885,10 +1944,21 @@ private:
 	Mutex progressionMutex;
 	VectorMap<uint64, SimBotProgression> progressionRecords;
 	VectorMap<uint64, bool> progressionDirtyIds;
+	VectorMap<uint64, bool> progressionRetiringIds;
 	Vector<uint64> progressionOrphanIds;
 	bool progressionEnabled = false;
 	bool progressionAwardKillXp = false;
+	bool progressionTrainingEnabled = false;
 	float progressionKillXpRate = 1.0f;
+	VectorMap<String, SimBotTrainingPlan> progressionTrainingPlans;
+	// Guards against the per-tick config refresh resetting the sweep cursor and
+	// dropping queued training work; see buildTrainingPlansFromConfig.
+	String progressionTrainingPlanSignature;
+	VectorMap<uint64, SimBotTrainingStep> progressionTrainingNextSteps;
+	VectorMap<uint64, bool> progressionTrainingPendingIds;
+	int trainingMaxPerTick = 4;
+	int trainingSweepBatch = 64;
+	uint64 trainingSweepCursor = 0;
 	bool progressionLoaded = false;
 	bool progressionDbAvailable = false;
 	uint64 progressionLastFlushMs = 0;
@@ -1918,6 +1988,23 @@ private:
 	AtomicLong progressionOrphansReaped;
 	AtomicLong progressionReaperRuns;
 	AtomicLong progressionFlushFailures;
+	AtomicLong trainingTrained;
+	AtomicLong trainingRefusedNoRecord;
+	AtomicLong trainingRefusedGate;
+	AtomicLong trainingRefusedUnknownSkill;
+	AtomicLong trainingRefusedAlreadyTrained;
+	AtomicLong trainingRefusedPrereq;
+	AtomicLong trainingRefusedPreclusion;
+	AtomicLong trainingRefusedPoints;
+	AtomicLong trainingRefusedXp;
+	AtomicLong trainingSweepPasses;
+	AtomicLong trainingPendingHigh;
+	AtomicLong trainingTierRecomputed;
+	AtomicLong trainingWorstDrainMs;
+	AtomicLong noviceGrantsRepaired;
+	AtomicLong retirementsCompleted;
+	AtomicLong retirementsResumed;
+	String trainingLastSkill;
 	Mutex progressionRequestMutex;
 	Vector<PlayerBotProgressionRequest> progressionRequests;
 	uint64 progressionNextRequestId = 1;
@@ -1966,6 +2053,16 @@ private:
 	bool playerBotParityTestCompleted = false;
 	bool playerBotParityTestGateOverrideActive = false;
 	bool playerBotParityTestGateOverride = true;
+	bool playerBotParityTestTrainingGateOverrideActive = false;
+	bool playerBotParityTestTrainingGateOverride = false;
+	bool playerBotParityTestTrainingGateOverridePreviousActive = false;
+	bool playerBotParityTestTrainingGateOverridePrevious = false;
+	// Guarded by pveMutex alongside pveNoviceEnabled itself, deliberately NOT by
+	// playerBotParityTestMutex: readers of pveNoviceEnabled already hold
+	// pveMutex, and reaching for the parity mutex under it would invert the
+	// established lock order.
+	bool pveNoviceGateOverrideActive = false;
+	bool pveNoviceGateOverridePrevious = false;
 	bool playerBotParityTestEnabled = false;
 	bool playerBotParityTestStaleRowsScanned = false;
 	bool playerBotParityTestPhaseAFileWritten = false;
@@ -2030,6 +2127,7 @@ private:
 	uint64 pveHunterHarvestUnitsTotal = 0;
 	uint64 pveHunterHarvestMisses = 0;
 	uint64 pveHunterAnnouncementsTotal = 0;
+	AtomicLong pveBodySpawnRefusedNotReady;
 	uint64 pveHunterLastAnnounceMs = 0;
 	uint64 pveHunterLastSiteAnnounceMs = 0;
 	uint64 pveMissionLairsSpawned = 0;
@@ -2054,12 +2152,17 @@ private:
 	VectorMap<uint64, String> pveBuffLastSourceByBody;
 	VectorMap<uint64, uint64> pveHunterLastAnnounceByIdentity;
 	std::shared_ptr<const PvePresenceSnapshot> pvePresenceSnapshot;
-	Mutex pveMutex;
+	mutable Mutex pveMutex;
 	PveSpikeState pveSpike;
 	Reference<Observer*> pveSpikeObserver;
 
 	bool pveEnabled = false;
 	bool pveHunterBotsEnabled = false;
+	Vector<String> pveHuntingProfessions;
+	bool pveNoviceEnabled = false;
+	bool pveRetireLegacyHunters = false;
+	String pveNoviceBodyTemplate;
+	Vector<PveNoviceDistribution> pveNoviceDistribution;
 	bool pveMissionHuntEnabled = false;
 	bool pveMissionBoardEnabled = false;
 	bool pveRealBuffsEnabled = false;
@@ -2194,10 +2297,37 @@ private:
 
 	void applyPveConfig(LuaObject& pveConfig);
 	void applyPlayerBotProgressionConfig(LuaObject& config);
+	void buildTrainingPlansFromConfig(LuaObject& config);
+	bool computePlayerBotNextTrainingStepLocked(uint64 identityId,
+		const String& planName, const SimBotProgression& progression,
+		SimBotTrainingStep& step) const;
+	// trainingGateEnabled is a PARAMETER, not a call to
+	// playerBotTrainingGateEnabled(), because this runs with progressionMutex
+	// held and that helper takes playerBotParityTestMutex. Callers evaluate the
+	// gate before locking so the two mutexes are never nested in this order.
+	void refreshPlayerBotTrainingStepLocked(uint64 identityId,
+		const String& planName, const SimBotProgression& progression,
+		bool enqueueIfAffordable, bool trainingGateEnabled);
+	void drainPlayerBotTrainingQueue();
+	void runPlayerBotTrainingSweep();
+	SimBotBodyProgression buildBodyProgressionSnapshot(uint64 identityId);
+	// Precondition: the caller already holds the Locker for agent. This method
+	// takes no manager mutex and must never be called while one is held.
+	void applyProgressionToBody(AiAgent* agent,
+		const SimBotBodyProgression& snapshot);
+	void reapplyPlayerBotProgressionToLiveBody(uint64 identityId);
 	void applyPlayerBotParityTestConfig(LuaObject& config);
 	void loadPveIdentityRoster();
 	void mintPveIdentitiesIfNeeded();
-	bool mintPveIdentity(const String& profession, SimBotIdentity& identityOut);
+	bool mintPveIdentity(const String& profession, SimBotIdentity& identityOut,
+		const String& trainingPlan = String());
+	bool isPveHuntEligible(const SimBotIdentity& identity) const;
+	bool isGovernorManagedIdentity(const SimBotIdentity& identity) const;
+	void reconcileNoviceGrants();
+	void retirePveIdentity(uint64 identityId);
+	bool drainPveIdentityBody(uint64 identityId, uint64 nowMs);
+	void markProgressionDirtyLocked(uint64 identityId);
+	void collectPvePlanReadyIds(VectorMap<uint64, bool>& readyIds);
 	void flushPveIdentityRoster(bool force);
 	void loadPlayerBotProgressionStore();
 	bool ensurePlayerBotProgressionRecord(uint64 identityId);
@@ -2207,6 +2337,7 @@ private:
 	void flushPlayerBotProgressionStore(bool force, int faultDelayMs = 0,
 		bool faultFailNext = false);
 	void reconcilePlayerBotProgression();
+	void reconcileIdentityTiers();
 	void runPlayerBotProgressionReaper(uint64 nowMs, bool force = false);
 	void drainPlayerBotProgressionRequests();
 	uint64 enqueuePlayerBotProgressionRequest(
@@ -2262,6 +2393,13 @@ private:
 	bool awardToNonRosterPlayerBotBody(uint64 identityId, const String& xpType,
 		int amount, const String& source);
 	bool playerBotProgressionAwardGateEnabled();
+	bool playerBotTrainingGateEnabled();
+	// Restores pveNoviceEnabled to its pre-override value and drops the latch.
+	// MUST be called on every scenario exit and cleanup path: leaving the latch
+	// set makes applyPveConfig ignore the Lua value indefinitely, and a
+	// fail-fast exit after setNoviceGate(true) would otherwise leave novice
+	// behaviour live in production.
+	void restoreNoviceGateOverride();
 	void updatePveBodyLifecycles(uint64 nowMs);
 	void governPvePopulation(uint64 nowMs);
 	void runPveHunterMatchmaker(uint64 nowMs);
@@ -2854,6 +2992,19 @@ public:
 	// P.10a award surface. Callers resolve a body to a roster identity first;
 	// these functions deliberately require an already-loaded record and never
 	// create one as a side effect.
+	int availablePlayerBotXp(const SimBotProgression& progression,
+		const String& xpType) const;
+	int derivedPlayerBotSkillPoints(const SimBotProgression& progression) const;
+	int effectivePlayerBotXpCap(const SimBotProgression& progression,
+		const String& xpType) const;
+	int playerBotKillXpTier(const SimBotProgression& progression,
+		const String& xpType, int fallbackTier = 1) const;
+	int recomputeIdentitySkillTier(const SimBotProgression& progression,
+		const SimBotTrainingPlan& plan, int fallbackTier = 1) const;
+	bool trainPlayerBotSkill(uint64 identityId, const String& skillName,
+		bool freeGrant = false, String* refusalOut = nullptr);
+	bool computePlayerBotNextTrainingStep(uint64 identityId,
+		SimBotTrainingStep& step);
 	bool grantPlayerBotExperience(uint64 identityId, const String& xpType,
 		int amount, const String& source, int* awarded = nullptr);
 	void awardPlayerBotKillExperience(const PlayerBotKillXpEvent& event);

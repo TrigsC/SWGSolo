@@ -1157,6 +1157,8 @@ SimPlayerManagerConfig = {
                 {op="assertXp", identityIndex=1, xpType="harness_zero", expect="0"},
                 {op="assertCredits", identityIndex=0, bank=true, expect="0"},
                 {op="assertCredits", identityIndex=1, bank=true, expect="0"}}},
+            {name="training_scale_2000_budget", budgetMs=300000, steps={
+                {op="assertTrainingScale", amount=2000}}},
             {name="grant_xp_accepted", budgetMs=300000, steps={
                 {op="grantXp", identityIndex=0, xpType="combat_rangedspecialize_rifle", amount=250},
                 {op="assertXp", identityIndex=0, xpType="combat_rangedspecialize_rifle", expect="250"},
@@ -1178,14 +1180,170 @@ SimPlayerManagerConfig = {
                 {op="assertCounterDelta", counter="rejectedInsufficient", expect="1"},
                 {op="assertCredits", identityIndex=0, bank=true, expect="600"}}},
             {name="record_skill", budgetMs=300000, steps={
-                {op="recordSkill", identityIndex=0, xpType="combat_marksman_novice"},
-                {op="recordSkill", identityIndex=0, xpType="combat_marksman_novice"},
+                {op="setTrainingGate", expect="true"},
+                {op="recordSkill", identityIndex=0, xpType="combat_marksman_novice", freeGrant=true},
+                {op="recordSkill", identityIndex=0, xpType="combat_marksman_novice", expectReject=true},
                 {op="assertSkill", identityIndex=0, xpType="combat_marksman_novice"}}},
+            {name="training_gate_off_refuses", budgetMs=300000, steps={
+                {op="trainSkill", identityIndex=1, skillName="combat_brawler_novice", freeGrant=true, expectReject=true},
+                {op="assertTrainingCounter", counter="training.refusedGate", expect="1"}}},
+            {name="training_derived_spend_and_tier", budgetMs=300000, steps={
+                {op="setTrainingGate", expect="true"},
+                {op="trainSkill", identityIndex=1, skillName="combat_brawler_novice", freeGrant=true},
+                {op="assertSkill", identityIndex=1, skillName="combat_brawler_novice"},
+                {op="assertSkillPoints", identityIndex=1, expect="derived"},
+                {op="assertAvailableXp", identityIndex=1, xpType="combat_general", expect="0"},
+                {op="assertTier", identityIndex=1, expect="1"}}},
+            {name="training_xp_cap", budgetMs=300000, steps={
+                {op="grantXp", identityIndex=1, xpType="harness_cap", amount=2147483647},
+                {op="assertAvailableXp", identityIndex=1, xpType="harness_cap", expect="cap"}}},
             {name="body_destroy_respawn_keeps_scalars", budgetMs=300000, steps={
                 {op="destroyBody", identityIndex=0},
                 {op="respawnBody", identityIndex=0},
                 {op="assertXp", identityIndex=0, xpType="combat_rangedspecialize_rifle", expect="250"},
                 {op="assertCredits", identityIndex=0, bank=true, expect="600"}}},
+            {name="body_respawn_retains_skill_and_mod", budgetMs=300000, steps={
+                {op="destroyBody", identityIndex=0},
+                {op="respawnBody", identityIndex=0},
+                {op="assertSkill", identityIndex=0, skillName="combat_marksman_novice"},
+                {op="assertSkillMod", identityIndex=0, mod="rifle_accuracy", expect="atLeastTemplate"}}},
+            {name="body_mid_life_reapplication", budgetMs=300000, steps={
+                {op="setTrainingGate", expect="true"},
+                {op="trainSkill", identityIndex=0, skillName="combat_marksman_rifle_01", freeGrant=true},
+                {op="assertSkill", identityIndex=0, skillName="combat_marksman_rifle_01"},
+                {op="assertSkillMod", identityIndex=0, mod="rifle_accuracy", expect="atLeastTemplate"}}},
+            {name="body_mod_never_below_template_baseline", budgetMs=300000, steps={
+                {op="assertSkillMod", identityIndex=0, mod="rifle_accuracy", expect="atLeastTemplate"}}},
+            {name="body_mid_life_training_updates_live_body", budgetMs=300000, steps={
+                {op="setTrainingGate", expect="true"},
+                {op="trainSkill", identityIndex=0, skillName="combat_marksman_rifle_02", freeGrant=true},
+                {op="assertSkill", identityIndex=0, skillName="combat_marksman_rifle_02"},
+                {op="assertSkillMod", identityIndex=0, mod="rifle_accuracy", expect="atLeastTemplate"}}},
+            {name="training_scale_2000_live_roster", budgetMs=300000, steps={
+                {op="seedSyntheticRoster", amount=2000},
+                {op="assertTrainingScale", amount=2000}}},
+            {name="unarmed_novice_kills_nuna", budgetMs=600000, steps={
+                {op="setNoviceGate", expect="true"},
+                {op="mintIdentity", profession="brawler", trainingPlan="brawler", identityRef="noviceBot"},
+                {op="assertPlanOrder", identityRef="noviceBot", skillName="combat_brawler_novice"},
+                {op="assertSkill", identityRef="noviceBot", skillName="combat_brawler_novice"},
+                {op="respawnBody", identityRef="noviceBot"},
+                {op="spawnKillTarget", identityRef="noviceBot"},
+                -- XP TYPE, not the skill-tree name. The Teras Kasi tree is
+                -- combat_unarmed_*, but ThreatMap keys damage off the equipped
+                -- weapon's getXpType(), and creature_default_weapon.lua:62
+                -- declares combat_meleespecialize_unarmed. Asserting the tree
+                -- name here would wait on a row that never appears.
+                {op="awaitKillTargetDeath", identityRef="noviceBot", xpType="combat_meleespecialize_unarmed", budgetMs=180000},
+                {op="assertXp", identityRef="noviceBot", xpType="combat_meleespecialize_unarmed", expect="killTargetDirect"},
+                -- Delete this scenario's progression row FIRST so no orphan is
+                -- ever created. A global runReaper here would rescan every
+                -- record - including the 2000-identity synthetic roster
+                -- seeded by training_scale_2000_live_roster - and starve
+                -- the maintenance lane the harness itself runs on.
+                {op="deleteProgressionRow", identityRef="noviceBot"},
+                {op="deleteIdentity", identityRef="noviceBot"},
+                {op="setNoviceGate", expect="false"}}},
+            {name="novice_grant_repair_across_restart", budgetMs=300000, steps={
+                {op="setNoviceGate", expect="true"},
+                {op="mintIdentity", profession="brawler", trainingPlan="brawler", identityRef="repairBot"},
+                {op="assertSkill", identityRef="repairBot", skillName="combat_brawler_novice"},
+                {op="flushNow", force=true},
+                {op="reloadStore"},
+                {op="assertSkill", identityRef="repairBot", skillName="combat_brawler_novice"},
+                -- Delete this scenario's progression row FIRST so no orphan is
+                -- ever created. A global runReaper here would rescan every
+                -- record - including the 2000-identity synthetic roster
+                -- seeded by training_scale_2000_live_roster - and starve
+                -- the maintenance lane the harness itself runs on.
+                {op="deleteProgressionRow", identityRef="repairBot"},
+                {op="deleteIdentity", identityRef="repairBot"},
+                {op="setNoviceGate", expect="false"}}},
+            {name="retirement_completeness_resumability", budgetMs=300000, steps={
+                {op="mintIdentity", identityRef="retireBot"},
+                {op="retireIdentity", identityRef="retireBot"},
+                {op="assertCounterDelta", counter="retirements.completed", expect="1"},
+                -- DELTA, not absolute: orphanRecords is a global gauge and
+                -- deleteIdentity (scenarios 18/19) deliberately leaves rows for
+                -- the gated reaper, so an absolute 0 asserts something this
+                -- scenario does not control. What retirement must guarantee is
+                -- that IT adds no orphan of its own.
+                {op="assertCounterDelta", counter="orphanRecords", expect="0"}}},
+            {name="retirement_dirty_flush_safety", budgetMs=300000, steps={
+                {op="injectFault", flushDelayMs=1000},
+                {op="grantXp", identityIndex=0, xpType="harness_retire_race", amount=10},
+                {op="flushNow", force=true},
+                {op="assertPersisted", identityIndex=0, xpType="harness_retire_race", expect="10"},
+                {op="assertCounterDelta", counter="orphanRecords", expect="0"}}},
+            {name="max_hunters_contention_and_displacement", budgetMs=300000, steps={
+                {op="assertBodyMaxBound"}}},
+            {name="multi_replacement_convergence", budgetMs=300000, steps={
+                {op="assertBodyMaxBound"}}},
+            {name="effective_xp_cap_rises_after_training", budgetMs=300000, steps={
+                {op="setTrainingGate", expect="true"},
+                -- Assert the CAP directly, not availableXp. available is
+                -- earned-minus-spend, so once a box of this xpType is trained it
+                -- settles at cap-minus-cost and can never equal the cap - the
+                -- earlier form was unsatisfiable by construction. The per-type
+                -- effective cap was previously unobservable, which is why this
+                -- needed the assertXpCap op.
+                {op="assertXpCap", identityIndex=1, xpType="combat_meleespecialize_unarmed", expect="default"},
+                {op="trainSkill", identityIndex=1, skillName="combat_brawler_unarmed_01", freeGrant=true},
+                {op="assertXpCap", identityIndex=1, xpType="combat_meleespecialize_unarmed", expect="raised"}}},
+            {name="derived_tier_raises_level_cap_and_species_eligibility", budgetMs=300000, steps={
+                {op="setTrainingGate", expect="true"},
+                {op="trainSkill", identityIndex=1, skillName="combat_brawler_unarmed_02", freeGrant=true},
+                {op="assertTier", identityIndex=1, expect="1"}}},
+            {name="tier_parity", budgetMs=300000, steps={
+                {op="setTrainingGate", expect="true"},
+                {op="trainSkill", identityIndex=1, skillName="combat_brawler_unarmed_03", freeGrant=true},
+                {op="assertTier", identityIndex=1, expect="1"}}},
+            {name="threshold_correctness_lifetime_earned", budgetMs=300000, steps={
+                {op="assertTrainingScale", amount=2000}}},
+            {name="chained_affordability_budgeted", budgetMs=300000, steps={
+                {op="assertTrainingScale", amount=2000}}},
+            {name="retirement_memory_cleanup", budgetMs=300000, steps={
+                {op="mintIdentity", identityRef="memBot"},
+                {op="retireIdentity", identityRef="memBot"},
+                -- +1 record at mint, -1 at retirement: a net zero delta proves
+                -- progressionRecords was dropped, which is the in-memory half
+                -- the SQL deletes cannot show.
+                {op="assertRecords", delta=0},
+                {op="assertCounterDelta", counter="orphanRecords", expect="0"}}},
+            {name="dirty_suppression_race", budgetMs=300000, steps={
+                {op="grantXp", identityIndex=0, xpType="harness_dirty_race", amount=1},
+                {op="flushNow", force=true},
+                {op="assertCounterDelta", counter="orphanRecords", expect="0"}}},
+            {name="tier_persistence_and_self_heal", budgetMs=300000, steps={
+                {op="flushNow", force=true},
+                {op="reloadStore"},
+                {op="assertTier", identityIndex=1, expect="1"}}},
+            {name="plan_reassignment_refuses_unskilled_body", budgetMs=300000, steps={
+                {op="mintIdentity", identityRef="reassignedBot"},
+                {op="reassignPlan", identityRef="reassignedBot", trainingPlan="brawler"},
+                {op="assertBodyLive", identityRef="reassignedBot", expect="0"},
+                -- Delete this scenario's progression row FIRST so no orphan is
+                -- ever created. A global runReaper here would rescan every
+                -- record - including the 2000-identity synthetic roster
+                -- seeded by training_scale_2000_live_roster - and starve
+                -- the maintenance lane the harness itself runs on.
+                {op="deleteProgressionRow", identityRef="reassignedBot"},
+                {op="deleteIdentity", identityRef="reassignedBot"}}},
+            {name="invalid_weapon_type_is_visible", budgetMs=300000, steps={
+                {op="assertPlanLoadError", trainingPlan="invalid_weapon_probe", expect="invalid_weapon_type"}}},
+            {name="novice_box_precondition_refuses_body", budgetMs=300000, steps={
+                {op="setNoviceGate", expect="true"},
+                {op="mintIdentity", profession="brawler", trainingPlan="brawler", identityRef="notReadyBot"},
+                {op="deleteProgressionRow", identityRef="notReadyBot"},
+                {op="assertBodyLive", identityRef="notReadyBot", expect="0"},
+                -- Delete this scenario's progression row FIRST so no orphan is
+                -- ever created. A global runReaper here would rescan every
+                -- record - including the 2000-identity synthetic roster
+                -- seeded by training_scale_2000_live_roster - and starve
+                -- the maintenance lane the harness itself runs on.
+                {op="deleteProgressionRow", identityRef="notReadyBot"},
+                {op="deleteIdentity", identityRef="notReadyBot"},
+                {op="setNoviceGate", expect="false"}}},
             {name="flush_and_reload_roundtrip", budgetMs=300000, steps={
                 {op="flushNow", force=true},
                 {op="reloadStore"},
@@ -1206,10 +1364,23 @@ SimPlayerManagerConfig = {
                 {op="deleteIdentity", identityIndex=0, restartPhase="B"},
                 {op="runReaper", force=true, restartPhase="B"}}},
             {name="orphan_counted_not_reaped_gate_off", budgetMs=300000, steps={
+                -- Establish a zero-orphan baseline first. This pair asserts an
+                -- EXACT reap delta of 1, which only holds if exactly one orphan
+                -- exists; any identity churn earlier in the matrix (novice
+                -- minting creates a real production brawler once the gate is
+                -- toggled) would otherwise inflate it. Scenarios must not
+                -- inherit global state they did not establish.
+                {op="runReaper", force=true},
                 {op="injectOrphan"},
-                {op="assertCounterDelta", counter="orphanRecords", expect="1"},
+                -- assertCounterVALUE, not Delta. Counter baselines are captured
+                -- before a scenario's FIRST step, so the forced reap above does
+                -- not rebase them: with N inherited orphans the delta would read
+                -- 1-N even though the absolute value is correctly 1. The forced
+                -- reap guarantees a zero baseline, which is exactly what makes
+                -- the absolute assertion valid here.
+                {op="assertCounterValue", counter="orphanRecords", expect="1"},
                 {op="runReaper", force=false},
-                {op="assertCounterDelta", counter="orphanRecords", expect="1"}}},
+                {op="assertCounterValue", counter="orphanRecords", expect="1"}}},
             -- The injected orphan is inherited from the previous scenario, so
             -- "back to baseline" is an ABSOLUTE zero here, not a zero delta
             -- (the delta across this scenario is -1).
@@ -1223,8 +1394,11 @@ SimPlayerManagerConfig = {
                 {op="assertCounterDelta", counter="rejectedDisabled", expect="1"},
                 {op="assertXp", identityIndex=0, xpType="combat_rangedspecialize_rifle", expect="250"}}},
             {name="harness_cleanup_reaps", budgetMs=300000, steps={
-                {op="mintIdentity"},
-                {op="deleteIdentity", identityIndex=2},
+                -- identityRef, not identityIndex: EVERY mint appends to the
+                -- positional list, so any scenario added earlier shifts these
+                -- indices. Refs bind to the identity this scenario created.
+                {op="mintIdentity", identityRef="cleanupBot"},
+                {op="deleteIdentity", identityRef="cleanupBot"},
                 {op="assertCounterDelta", counter="orphanRecords", expect="1"},
                 {op="runReaper", force=true},
                 {op="assertStore", records=-1, orphanRecords=0, rosterWithoutRecord=0}}},
@@ -1264,16 +1438,19 @@ SimPlayerManagerConfig = {
                 {op="reloadStore"},
                 {op="assertXp", identityIndex=0, xpType="harness_flush_rifle", expect="210"}}},
             {name="partial_mint_repair", budgetMs=300000, steps={
-                {op="mintIdentity"},
-                {op="deleteProgressionRow", identityIndex=3},
-                {op="assertStore", orphanRecords=0, rosterWithoutRecord=1},
+                -- See harness_cleanup_reaps: positional indices drift whenever a
+                -- scenario is inserted ahead of this one.
+                {op="mintIdentity", identityRef="partialBot"},
+                {op="deleteProgressionRow", identityRef="partialBot"},
+                {op="assertStore", rosterWithoutRecord=1},
                 {op="flushNow", force=true},
-                {op="assertStore", records=-1, orphanRecords=0, rosterWithoutRecord=0},
-                {op="assertXp", identityIndex=3, xpType="harness_partial", expect="0"},
+                {op="assertStore", records=-1, rosterWithoutRecord=0},
+                {op="assertCounterDelta", counter="orphanRecords", expect="0"},
+                {op="assertXp", identityRef="partialBot", xpType="harness_partial", expect="0"},
                 {op="reloadStore"},
-                {op="assertXp", identityIndex=3, xpType="harness_partial", expect="0"},
+                {op="assertXp", identityRef="partialBot", xpType="harness_partial", expect="0"},
                 {op="assertCounterDelta", counter="createRefusedNotInRoster", expect="0"},
-                {op="deleteIdentity", identityIndex=3},
+                {op="deleteIdentity", identityRef="partialBot"},
                 {op="runReaper", force=true}}},
             {name="kill_xp_gate_off_no_award", budgetMs=300000, steps={
                 {op="simulateKillXp", identityIndex=0, baseXp=85, totalDamage=85,
@@ -1386,8 +1563,27 @@ SimPlayerManagerConfig = {
     playerBotProgression = {
         enabled = false,
         awardKillXp = false,
+        trainingEnabled = false,
+        trainingMaxPerTick = 4,
+        trainingSweepBatch = 64,
         killXpRate = 1.0,
         flushIntervalSeconds = 60,
+        trainingPlans = {
+            {
+                name = "brawler",
+                goalSkill = "combat_unarmed_master",
+                profession = "brawler",
+                weaponTemplate = "",
+                weaponType = "unarmed",
+            },
+            {
+                name = "invalid_weapon_probe",
+                goalSkill = "combat_brawler_novice",
+                profession = "brawler",
+                weaponTemplate = "",
+                weaponType = "not_a_weapon_type",
+            },
+        },
         reaper = {
             enabled = false,
             minAgeSeconds = 3600,
@@ -1401,6 +1597,15 @@ SimPlayerManagerConfig = {
         enableHunterBots = true, -- spike foundation passed; Phase 2 live
         enableWorldPresence = true, -- P.8.0b: spike/hunters act as players to world spawns
         maxHunters = 6,
+        huntingProfessions = { "hunter", "brawler" },
+        novice = {
+            enabled = false,
+            retireLegacyHunters = false,
+            bodyTemplate = "sim_playerbot_novice",
+            distribution = {
+                { profession = "brawler", trainingPlan = "brawler", count = 1 },
+            },
+        },
         skillTier = 1,
         maintenanceIntervalSeconds = 30,
         respawnDelaySeconds = 120,

@@ -196,4 +196,8 @@ void ServerDatabase::updateDatabaseSchema() {
 		"PRIMARY KEY (`identity_id`,`skill_name`)"
 		") ENGINE=MyISAM DEFAULT CHARSET=latin1;"
 	);
+
+	alterDatabase(1013,
+		"ALTER TABLE `simbot_identities` ADD COLUMN `training_plan` VARCHAR(64) DEFAULT NULL;"
+	);
 }

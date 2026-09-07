@@ -178,7 +178,13 @@ no new warnings before handing work back** (owner-stated standard).
   `playerBotParityTest` (the progression matrix, 28 scenarios as of F_0.9.1,
   plus `killTargetTemplate`), both default off. F_0.9.1 appends the line's first
   capability gate, `playerBotProgression.awardKillXp`, and its `killXpRate`
-  earn-rate multiplier (shipped `1.0` = exact player parity).
+  earn-rate multiplier (shipped `1.0` = exact player parity). F_0.9.5 adds
+  `playerBotProgression.trainingEnabled` plus `trainingMaxPerTick`,
+  `trainingSweepBatch` and the `trainingPlans` list (each entry a `name`,
+  `goalSkill`, `profession`, `weaponTemplate` and a validated `weaponType`),
+  and a `pveConfig.novice` block (`enabled`, `retireLegacyHunters`,
+  `bodyTemplate`, profession distribution) alongside
+  `pveConfig.huntingProfessions`. All three F_0.9.5 gates ship default-off.
   This is the primary place new simulation features expose owner-tunable,
   default-off gates.
 - **`MMOCoreORB/bin/conf/features.lua`** — global feature flags.
@@ -630,6 +636,76 @@ This is this fork's primary custom subsystem, layered on top of the stock
   field twice with two different defaults (absent ⇒ the reads disagree), never
   by poking the Lua stack with `lua_getfield`, which would bake in an internal
   convention about where `LuaObject` keeps its table.
+- **Skill training and novice PlayerBots (P.10f / F_0.9.5)** — turns F_0.9.1's
+  XP into progression, and mints roster bots as novices instead of inheriting a
+  level-178 combat mob. Four architectural points:
+  **(1) Derived spend makes training atomic.** `simbot_experience` means
+  *lifetime earned* — already what F_0.9.1 wrote, since `grantPlayerBotExperience`
+  only ever adds — so available XP is `earned − Σ getXpCost()` over trained boxes
+  of that type and `skill_points_spent` is recomputed from `simbot_skills` rather
+  than stored. Training therefore mutates exactly **one** durable row (an INSERT
+  into `simbot_skills`), which is atomic under MyISAM and self-healing at boot,
+  so no write-ahead journal is needed; the journal remains the right tool for
+  F_0.9.6's bazaar, where value is human-visible and multi-party.
+  **(2) The same skill mod is treated oppositely in two places, on purpose.**
+  Combat tier reproduces `PlayerManagerImplementation::calculatePlayerLevel`
+  (`:4655-4679`) as `min(25, private_<weapon>_combat_difficulty/100 + 1)` from
+  **trained deltas only**, because a real player has no template statistic behind
+  that mod and adding one would exceed player parity. The body overlay
+  (`applyProgressionToBody`) **must** add `npcTemplate->getStatistic(mod)`,
+  because `AiAgentImplementation::getSkillMod` (`:624-664`) returns the
+  creature-list value whenever nonzero and only then consults the template — a
+  bare delta would make a trained bot *weaker* than an untrained one. Unifying
+  these two rules is a bug in either direction.
+  **(3) The overlay is a SKILLBOX-only full reconcile.**
+  `removeAllSkillModsOfType(SKILLBOX, false)` then one `addSkillMod` per touched
+  mod, which is idempotent with no per-body bookkeeping and identical on respawn
+  and mid-life training. It is safe because `SKILLBOX` is written only by
+  `SkillManager::awardSkill` (`:380`) and cleared by `surrenderSkill` (`:582`,
+  `:726`) — ghost-gated player paths a PlayerBot body never reaches. The
+  `TEMPLATE` group is left to the Jedi archetype path so neither double-counts.
+  **(4) `pveMaxHunters` was a spawn-batch cap, not a population cap, and the
+  governor had no notion of ownership.** The old `governPvePopulation` skipped
+  identities that already had a live body *before* counting them against the
+  cap, so adding a novice to a full roster produced a seventh body rather than a
+  replacement. It is now a desired-active-set reconciler: compute the set, drain
+  at most one out-of-set body per tick via the `drainSimPresenceBodies`
+  choreography (`:12523-12580`), then spawn at most
+  `pveMaxHunters − liveBodyCount` **recounted after the drain**.
+  **A governor that only ADDS bodies never has to know which bodies it owns.**
+  Introducing a drain made ownership load-bearing, and four review findings in
+  this one function all resolved to the same shape — one membership predicate
+  written in more than one place, then drifting. The settled model:
+  `isGovernorManagedIdentity` (`profession != "harness"`) defines ownership and
+  is deliberately **independent of `isPveHuntEligible`**, because eligibility
+  reads the runtime-refreshable `pveHuntingProfessions` and tying ownership to it
+  would strand live bodies the moment a profession was removed — invisible to the
+  drain *and* uncounted against the cap. Eligibility is computed **once** into an
+  `eligible` set that both the distribution and general-fill passes filter to, so
+  those passes decide **ordering only, never membership**. The same ownership
+  predicate governs the drain, the spawn budget and the `assertBodyMaxBound`
+  harness assertion, so harness bodies sit outside the production population
+  entirely. Retirement is a separate destructive path from the body drain and
+  needs **two independently guarded flags** — `pveRetiringIdentityIds` under
+  `pveMutex` and `progressionRetiringIds` under `progressionMutex` — because the
+  dirty writers live under a different mutex than governance and nesting them is
+  forbidden; `progressionDirtyIds` is cleared *before* the row deletes so a flush
+  landing mid-teardown cannot resurrect them. Three concurrency/ordering defects
+  were caught in review rather than by the compiler, all of the same shape (state
+  shared between the PvE task, the PvP config-refresh task and the REST thread):
+  `progressionTrainingPlans` was read lock-free; a `...Locked` helper called a
+  gate taking `playerBotParityTestMutex` while holding `progressionMutex`,
+  inverting the order used everywhere else (the gate is now a parameter evaluated
+  before locking); and the per-tick config refresh reset the training sweep
+  cursor and pending queue on every PvP maintenance tick, which a derived plan
+  signature now suppresses. Gates `playerBotProgression.trainingEnabled`,
+  `pveConfig.novice.enabled` and `novice.retireLegacyHunters`, all default-off.
+  **Verification lesson worth inheriting**: two of this chunk's defects were
+  reachable only when the code *ran under the shipped default-off configuration*
+  — a capability gate that checked its own flag ahead of the test override could
+  never be exercised at all. Any future P.10 capability gate must place the
+  master gate first, the harness override second, and the configured capability
+  last (`playerBotProgressionAwardGateEnabled` is the reference shape).
 - **Simulation-only by default, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line

@@ -1051,12 +1051,16 @@
   function pageWilds(d) {
     const pve = d.pveActivity || {};
     const progression = d.playerBotProgression || {};
+    const training = progression.training || {};
+    const trainingRefusals = training.refusals || {};
+    const trainingGate = progression.gates && progression.gates.trainingEnabled === true;
     const roster = Array.isArray(pve.roster) ? pve.roster : [];
     const progressionRows = (progression.identities || []).map((r) => {
       const xp = Object.entries(r.xp || {}).map(([k, v]) => `${labelize(k)} ${compact(v)}`).join(" · ") || "none";
       return `<tr>
         <td><span class="t-main">${esc(r.name || "#" + r.identityId)}</span><span class="t-sub">${esc(r.identityId)}</span></td>
         <td>${chip(labelize(r.profession || "unknown"), r.profession === "orphan" ? "red" : "ghost")}</td>
+        <td><span class="t-main">${esc(r.trainingPlan || "none")}</span><span class="t-sub">${num(r.skillsTrained != null ? r.skillsTrained : (r.skills || []).length)} boxes · tier ${num(r.derivedTier)}</span></td>
         <td class="t-num">${compact(r.bankCredits)}</td>
         <td class="t-num">${compact(r.cashCredits)}</td>
         <td>${esc(xp)}</td>
@@ -1161,18 +1165,28 @@
             ${metric("Harness Stale", progressionHarness.harnessRowsStale, { tone: Number(progressionHarness.harnessRowsStale || 0) ? "warn" : "" })}
             ${metric("Dirty", progression.dirtyCount)}
             ${metric("Awards Accepted", (progression.awards || {}).accepted, { tone: "accent" })}
+            ${metric("Trained", training.trained, { tone: "accent" })}
+            ${metric("Tier Repairs", training.tierRecomputed)}
+            ${metric("Training Pending", training.pendingDepth)}
+            ${metric("Training Drain", training.worstDrainMs == null ? "—" : `${num(training.worstDrainMs)}ms`, { raw: true })}
             ${metric("Kill XP Kills", killXp.kills, { tone: "accent" })}
             ${metric("Kill XP Awarded", killXp.totalAwarded)}
             ${metric("Flush Age", ago(progression.lastFlushAgeSeconds), { raw: true })}
           </div>
           <div class="section-gap"></div>
-          ${table(["Identity", "Profession", "Bank", "Cash", "XP", "Skills", "Last Award"], progressionRows, { scrollKey: "progression-identities", tall: true })}
+          ${table(["Identity", "Profession", "Training", "Bank", "Cash", "XP", "Skills", "Last Award"], progressionRows, { scrollKey: "progression-identities", tall: true })}
           <div class="section-gap"></div>
           ${kvRows([
             ["Flush interval", num(progression.flushIntervalSeconds) + "s"],
             ["Reaper", progression.reaper && progression.reaper.enabled ? "enabled" : "count-only"],
             ["Reaper runs / reaped", num(progression.reaper && progression.reaper.runs) + " / " + num(progression.reaper && progression.reaper.reaped)],
             ["Rejected: no record / disabled", num((progression.awards || {}).rejectedNoRecord) + " / " + num((progression.awards || {}).rejectedDisabled)],
+            ["Training gate / trained", `${chip(trainingGate ? "enabled" : "disabled", trainingGate ? "ok" : "ghost")} · ${num(training.trained)}`],
+            ["Training pending / high", num(training.pendingDepth) + " / " + num(training.pendingHigh) + " · sweep " + num(training.sweepCursor) + " / " + num(training.sweepBatch)],
+            ["Training budget", num(training.maxPerTick) + " boxes/tick · worst " + num(training.worstDrainMs) + "ms"],
+            ["Training plans", (training.plans || []).map((p) => `${p.name || "plan"}: ${num(p.boxCount)} boxes${p.loadError ? " · " + p.loadError : ""}`).join(" · ") || "none"],
+            ["Training refusals", num(trainingRefusals.gate) + " gate · " + num(trainingRefusals.xp) + " xp · " + num(trainingRefusals.prereq) + " prereq · " + num(trainingRefusals.preclusion) + " preclusion"],
+            ["Training last skill", training.lastTrainedSkill || "none"],
             ["Kill XP gate / rate", `${chip(killXpGate ? "enabled" : "disabled", killXpGate ? "ok" : "ghost")} · ${Number(killXp.rate || 0).toFixed(2)}x`],
             ["Kill XP attackers", num(killXp.attackersConsidered)],
             ["Kill XP awards / caps", num(killXp.awardsGranted) + " / " + num(killXp.cappedByLevel) + " level · " + num(killXp.cappedByCeiling) + " ceiling"],

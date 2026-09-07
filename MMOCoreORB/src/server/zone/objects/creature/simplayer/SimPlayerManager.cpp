@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <sstream>
 
 #include "server/db/ServerDatabase.h"
@@ -61,6 +62,7 @@
 #include "server/zone/managers/collision/CollisionManager.h"
 #include "server/zone/managers/combat/CombatManager.h"
 #include "server/zone/managers/skill/SkillManager.h"
+#include "server/zone/managers/skill/SkillModManager.h"
 #include "server/zone/managers/player/PlayerManager.h"
 #include "server/zone/objects/building/BuildingObject.h"
 #include "server/zone/objects/cell/CellObject.h"
@@ -89,6 +91,7 @@
 #define DEBUG_SIMPLAYER
 
 static String prettyPveHunterSiteName(const String& name);
+static bool playerBotValidWeaponType(const String& weaponType);
 
 class SimMinerSummaryTask : public Task {
 public:
@@ -5951,6 +5954,7 @@ void SimPlayerManager::loadLuaConfig() {
 		pveIdentityBodyOids.removeAll();
 		pveBodyIdentityIds.removeAll();
 		pveRespawnDueAtMs.removeAll();
+		pveRetiringIdentityIds.removeAll();
 		pveDirtyIdentityIds.removeAll();
 		pvePresenceOids.removeAll();
 		pvePresenceSpawnCounts.removeAll();
@@ -6018,6 +6022,13 @@ void SimPlayerManager::loadLuaConfig() {
 	}
 	pveEnabled = false;
 	pveHunterBotsEnabled = false;
+	pveHuntingProfessions.removeAll();
+	pveHuntingProfessions.add("hunter");
+	pveHuntingProfessions.add("brawler");
+	pveNoviceEnabled = false;
+	pveRetireLegacyHunters = false;
+	pveNoviceBodyTemplate = "";
+	pveNoviceDistribution.removeAll();
 	pveMissionHuntEnabled = false;
 	pveMissionBoardEnabled = false;
 	pveRealBuffsEnabled = false;
@@ -6149,6 +6160,7 @@ void SimPlayerManager::loadLuaConfig() {
 	progressionDbProbeBackoffMs = 5000;
 	progressionFlushIntervalSeconds = 60;
 	progressionAwardKillXp = false;
+	progressionTrainingEnabled = false;
 	progressionKillXpRate = 1.0f;
 	progressionReaperEnabled = false;
 	progressionReaperMinAgeSeconds = 3600;
@@ -6158,7 +6170,18 @@ void SimPlayerManager::loadLuaConfig() {
 		Locker progressionLock(&progressionMutex);
 		progressionRecords.removeAll();
 		progressionDirtyIds.removeAll();
+		progressionRetiringIds.removeAll();
 		progressionOrphanIds.removeAll();
+		progressionTrainingPlans.removeAll();
+		// Must clear alongside the map. buildTrainingPlansFromConfig returns
+		// early when the derived signature is unchanged, so a stale signature
+		// here would make the next rebuild skip reloading and leave
+		// progressionTrainingPlans empty indefinitely.
+		progressionTrainingPlanSignature = "";
+		progressionTrainingNextSteps.removeAll();
+		progressionTrainingPendingIds.removeAll();
+		trainingSweepCursor = 0;
+		trainingLastSkill = "";
 	}
 	{
 		Locker requestLock(&progressionRequestMutex);
@@ -6193,6 +6216,10 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestBootInitialized = false;
 		playerBotParityTestAwaitingRestart = false;
 		playerBotParityTestCompleted = false;
+		playerBotParityTestGateOverrideActive = false;
+		playerBotParityTestTrainingGateOverrideActive = false;
+		playerBotParityTestTrainingGateOverridePreviousActive = false;
+		playerBotParityTestTrainingGateOverridePrevious = false;
 		playerBotParityTestEnabled = false;
 		playerBotParityTestStaleRowsScanned = false;
 		playerBotParityTestPhaseAFileWritten = false;
@@ -6201,6 +6228,12 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestPhase = "A";
 		playerBotParityTestRunId = "";
 	}
+	// Deliberately OUTSIDE the parity-lock scope above: this takes pveMutex, and
+	// taking it while holding playerBotParityTestMutex would nest the two in the
+	// opposite order from every reader of pveNoviceEnabled (which holds pveMutex
+	// first) - an ABBA pair. Without this release applyPveConfig stays suppressed
+	// and the Lua novice value never re-asserts.
+	restoreNoviceGateOverride();
 	{
 		Locker stateLock(&pveMaintenanceStateMutex);
 		pveMaintenanceScheduled = false;
@@ -7561,10 +7594,469 @@ static uint32 pveTrackedBuffCrcForAttribute(uint8 attribute) {
 	return 0;
 }
 
+static bool playerBotTrainingSkillComesBefore(const String& left,
+		const String& right) {
+	SkillManager* skillManager = SkillManager::instance();
+	Skill* leftSkill = skillManager == nullptr ? nullptr :
+		skillManager->getSkill(left);
+	Skill* rightSkill = skillManager == nullptr ? nullptr :
+		skillManager->getSkill(right);
+	int leftCost = leftSkill == nullptr ? 2147483647 : leftSkill->getXpCost();
+	int rightCost = rightSkill == nullptr ? 2147483647 : rightSkill->getXpCost();
+	if (leftCost != rightCost)
+		return leftCost < rightCost;
+	return left.compareTo(right) < 0;
+}
+
+void SimPlayerManager::buildTrainingPlansFromConfig(LuaObject& config) {
+	VectorMap<String, SimBotTrainingPlan> loadedPlans;
+
+	if (config.isValidTable()) {
+		for (int i = 1; i <= config.getTableSize(); ++i) {
+			LuaObject planTable = config.getObjectAt(i);
+			if (!planTable.isValidTable()) {
+				planTable.pop();
+				continue;
+			}
+
+			SimBotTrainingPlan plan;
+			plan.name = planTable.getStringField("name").trim();
+			plan.profession = planTable.getStringField("profession").trim();
+			plan.goalSkill = planTable.getStringField("goalSkill").trim();
+			plan.weaponTemplate = planTable.getStringField(
+				"weaponTemplate").trim();
+			plan.weaponType = planTable.getStringField("weaponType").trim()
+				.toLowerCase();
+			if (plan.name.isEmpty())
+				plan.name = "training_plan_" + String::valueOf(i);
+			if (plan.goalSkill.isEmpty())
+				plan.loadError = "missing_goal_skill";
+			else if (!playerBotValidWeaponType(plan.weaponType))
+				plan.loadError = "invalid_weapon_type";
+
+			SkillManager* skillManager = SkillManager::instance();
+			Vector<String> closure;
+			Vector<String> visiting;
+			std::function<bool(const String&)> collectSkills =
+				[&](const String& skillName) {
+					if (!plan.loadError.isEmpty())
+						return false;
+					if (visiting.contains(skillName)) {
+						plan.loadError = "skill_prerequisite_cycle";
+						return false;
+					}
+					if (closure.contains(skillName))
+						return true;
+					Skill* skill = skillManager == nullptr ? nullptr :
+						skillManager->getSkill(skillName);
+					if (skill == nullptr) {
+						plan.loadError = "unknown_skill_" + skillName;
+						return false;
+					}
+					visiting.add(skillName);
+					const Vector<String>* requiredSkills =
+						skill->getSkillsRequired();
+					for (int requiredIndex = 0;
+							requiredSkills != nullptr &&
+							requiredIndex < requiredSkills->size();
+							++requiredIndex) {
+						if (!collectSkills(requiredSkills->get(requiredIndex)))
+							break;
+					}
+					visiting.removeElement(skillName);
+					if (!plan.loadError.isEmpty())
+						return false;
+					closure.add(skillName);
+					return true;
+				};
+
+			if (plan.loadError.isEmpty())
+				collectSkills(plan.goalSkill);
+
+			// Kahn's algorithm gives a topological order while choosing the
+			// lowest-cost/name-ready box at each step. This makes unrelated
+			// prerequisite branches deterministic without relying on the order
+			// in skills.iff.
+			while (plan.loadError.isEmpty() &&
+					plan.orderedSkills.size() < closure.size()) {
+				int bestIndex = -1;
+				for (int closureIndex = 0; closureIndex < closure.size();
+						++closureIndex) {
+					const String& candidate = closure.get(closureIndex);
+					if (plan.orderedSkills.contains(candidate))
+						continue;
+					Skill* candidateSkill = skillManager == nullptr ? nullptr :
+						skillManager->getSkill(candidate);
+					if (candidateSkill == nullptr) {
+						plan.loadError = "unknown_skill_" + candidate;
+						break;
+					}
+					bool ready = true;
+					const Vector<String>* requiredSkills =
+						candidateSkill->getSkillsRequired();
+					for (int requiredIndex = 0;
+							requiredSkills != nullptr &&
+							requiredIndex < requiredSkills->size();
+							++requiredIndex) {
+						if (!plan.orderedSkills.contains(
+								requiredSkills->get(requiredIndex))) {
+							ready = false;
+							break;
+						}
+					}
+					if (!ready)
+						continue;
+					if (bestIndex < 0 ||
+							playerBotTrainingSkillComesBefore(candidate,
+								closure.get(bestIndex)))
+						bestIndex = closureIndex;
+				}
+				if (bestIndex < 0 && plan.loadError.isEmpty())
+					plan.loadError = "skill_prerequisite_cycle";
+				else if (bestIndex >= 0)
+					plan.orderedSkills.add(closure.get(bestIndex));
+			}
+
+			if (plan.loadError.isEmpty()) {
+				int64 totalPoints = 0;
+				for (int skillIndex = 0;
+						skillIndex < plan.orderedSkills.size(); ++skillIndex) {
+					Skill* skill = skillManager == nullptr ? nullptr :
+						skillManager->getSkill(plan.orderedSkills.get(skillIndex));
+					if (skill == nullptr) {
+						plan.loadError = "unknown_skill_" +
+							plan.orderedSkills.get(skillIndex);
+						break;
+					}
+					totalPoints += skill->getSkillPointsRequired();
+				}
+				plan.totalPoints = totalPoints > 2147483647 ? 2147483647 :
+					static_cast<int>(totalPoints);
+				if (plan.loadError.isEmpty() && plan.totalPoints > 250)
+					// This is a visible warning, not a rejected plan. Training
+					// proceeds until the normal 250-point guard stalls it.
+					plan.loadError = "over_budget";
+			}
+
+			loadedPlans.put(plan.name, plan);
+			planTable.pop();
+		}
+	}
+
+	// refreshPvpConfig() runs at the top of EVERY PvP maintenance tick, so this
+	// function is re-entered continuously - not just when the owner edits Lua.
+	// Resetting the cursor and caches unconditionally would therefore restart
+	// the round-robin sweep at 0 forever, starving every identity past
+	// trainingSweepBatch, and would discard queued work in
+	// progressionTrainingPendingIds between an XP award and its training tick.
+	// Derive a signature and only invalidate when the plans genuinely changed.
+	String signature;
+	for (int i = 0; i < loadedPlans.size(); ++i) {
+		const SimBotTrainingPlan& plan = loadedPlans.elementAt(i).getValue();
+		signature += plan.name + "|" + plan.profession + "|" + plan.goalSkill +
+			"|" + plan.weaponType + "|" + plan.weaponTemplate + "|" +
+			plan.loadError + "|" + String::valueOf(plan.totalPoints) + "|";
+		for (int j = 0; j < plan.orderedSkills.size(); ++j)
+			signature += plan.orderedSkills.get(j) + ",";
+		signature += ";";
+	}
+
+	// The PvP refresh task and the PvE training task can rebuild/read this map
+	// concurrently. Swap the complete derived map while holding the same mutex
+	// used by every reader; no agent lock or progression snapshot is involved.
+	{
+		Locker progressionLock(&progressionMutex);
+		if (signature == progressionTrainingPlanSignature)
+			return;
+		progressionTrainingPlanSignature = signature;
+		progressionTrainingPlans = loadedPlans;
+		progressionTrainingNextSteps.removeAll();
+		progressionTrainingPendingIds.removeAll();
+		trainingSweepCursor = 0;
+	}
+}
+
+bool SimPlayerManager::computePlayerBotNextTrainingStepLocked(uint64 identityId,
+		const String& planName, const SimBotProgression& progression,
+		SimBotTrainingStep& step) const {
+	(void)identityId;
+	step = SimBotTrainingStep();
+	if (planName.isEmpty() || !progressionTrainingPlans.contains(planName))
+		return false;
+
+	const SimBotTrainingPlan& plan = progressionTrainingPlans.get(planName);
+	if (!plan.loadError.isEmpty() && plan.loadError != "over_budget")
+		return false;
+
+	SkillManager* skillManager = SkillManager::instance();
+	if (skillManager == nullptr)
+		return false;
+	for (int i = 0; i < plan.orderedSkills.size(); ++i) {
+		const String& skillName = plan.orderedSkills.get(i);
+		if (progression.skills.contains(skillName))
+			continue;
+		Skill* nextSkill = skillManager->getSkill(skillName);
+		if (nextSkill == nullptr)
+			return false;
+
+		int64 threshold = nextSkill->getXpCost();
+		for (int trainedIndex = 0; trainedIndex < progression.skills.size();
+				++trainedIndex) {
+			Skill* trainedSkill = skillManager->getSkill(
+				progression.skills.get(trainedIndex));
+			if (trainedSkill != nullptr && trainedSkill->getXpType() ==
+					nextSkill->getXpType())
+				threshold += trainedSkill->getXpCost();
+		}
+
+		step.planName = planName;
+		step.skillName = skillName;
+		step.xpType = nextSkill->getXpType();
+		step.lifetimeEarnedThreshold = threshold <= 0 ? 0 :
+			threshold > 2147483647 ? 2147483647 : static_cast<int>(threshold);
+		step.valid = true;
+		return true;
+	}
+	return false;
+}
+
+void SimPlayerManager::refreshPlayerBotTrainingStepLocked(uint64 identityId,
+		const String& planName, const SimBotProgression& progression,
+		bool enqueueIfAffordable, bool trainingGateEnabled) {
+	SimBotTrainingStep step;
+	if (!computePlayerBotNextTrainingStepLocked(identityId, planName,
+			progression, step)) {
+		progressionTrainingNextSteps.drop(identityId);
+		progressionTrainingPendingIds.drop(identityId);
+		return;
+	}
+
+	progressionTrainingNextSteps.put(identityId, step);
+	int lifetimeEarned = progression.experience.contains(step.xpType) ?
+		progression.experience.get(step.xpType) : 0;
+	Skill* nextSkill = SkillManager::instance() == nullptr ? nullptr :
+		SkillManager::instance()->getSkill(step.skillName);
+	bool pointsAvailable = nextSkill != nullptr &&
+		derivedPlayerBotSkillPoints(progression) <=
+			250 - nextSkill->getSkillPointsRequired();
+	if (enqueueIfAffordable && pointsAvailable && trainingGateEnabled &&
+			lifetimeEarned >= step.lifetimeEarnedThreshold) {
+		progressionTrainingPendingIds.put(identityId, true);
+		int64 pendingDepth = progressionTrainingPendingIds.size();
+		if (pendingDepth > trainingPendingHigh.get())
+			trainingPendingHigh = pendingDepth;
+	} else if (enqueueIfAffordable && !pointsAvailable)
+		progressionTrainingPendingIds.drop(identityId);
+}
+
+bool SimPlayerManager::computePlayerBotNextTrainingStep(uint64 identityId,
+		SimBotTrainingStep& step) {
+	step = SimBotTrainingStep();
+	String planName;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveIdentities.contains(identityId))
+			return false;
+		planName = pveIdentities.get(identityId).trainingPlan;
+	}
+	Locker progressionLock(&progressionMutex);
+	if (!progressionRecords.contains(identityId) ||
+			!computePlayerBotNextTrainingStepLocked(identityId, planName,
+				progressionRecords.get(identityId), step)) {
+		progressionTrainingNextSteps.drop(identityId);
+		return false;
+	}
+	progressionTrainingNextSteps.put(identityId, step);
+	return true;
+}
+
+void SimPlayerManager::drainPlayerBotTrainingQueue() {
+	Vector<Pair<uint64, String> > work;
+	{
+		Locker progressionLock(&progressionMutex);
+		int limit = trainingMaxPerTick;
+		for (int i = 0; i < progressionTrainingPendingIds.size() &&
+				work.size() < limit; ++i) {
+			uint64 identityId = progressionTrainingPendingIds.elementAt(i).getKey();
+			if (progressionTrainingNextSteps.contains(identityId)) {
+				const SimBotTrainingStep& step =
+					progressionTrainingNextSteps.get(identityId);
+				if (step.valid)
+					work.add(Pair<uint64, String>(identityId, step.skillName));
+			}
+			progressionTrainingPendingIds.drop(identityId);
+			--i;
+		}
+	}
+
+	// The pending set is copied and cleared before any train call. A successful
+	// train can therefore requeue its successor, but that successor waits for a
+	// later maintenance tick and consumes a later budget slot.
+	uint64 startedAtMs = System::getMiliTime();
+	for (int i = 0; i < work.size(); ++i)
+		trainPlayerBotSkill(work.get(i).first, work.get(i).second, false,
+			nullptr);
+	uint64 durationMs = System::getMiliTime() > startedAtMs ?
+		System::getMiliTime() - startedAtMs : 0;
+	if (durationMs > static_cast<uint64>(trainingWorstDrainMs.get()))
+		trainingWorstDrainMs = durationMs;
+}
+
+void SimPlayerManager::runPlayerBotTrainingSweep() {
+	if (!progressionLoaded)
+		return;
+
+	uint64 startCursor = 0;
+	int batchLimit = 0;
+	{
+		Locker progressionLock(&progressionMutex);
+		startCursor = trainingSweepCursor;
+		batchLimit = trainingSweepBatch;
+	}
+
+	Vector<SimBotIdentity> rosterBatch;
+	int rosterSize = 0;
+	{
+		Locker pveLock(&pveMutex);
+		rosterSize = pveIdentities.size();
+		if (rosterSize > 0) {
+			startCursor %= rosterSize;
+			int selected = Math::min(batchLimit, rosterSize);
+			for (int i = 0; i < selected; ++i) {
+				int index = static_cast<int>((startCursor + i) % rosterSize);
+				rosterBatch.add(pveIdentities.elementAt(index).getValue());
+			}
+		}
+	}
+
+	if (rosterBatch.size() == 0)
+		return;
+
+	// Evaluated before progressionMutex is taken: the gate helper locks
+	// playerBotParityTestMutex, and taking that under progressionMutex would
+	// invert the order used everywhere else (gate first, then the store).
+	const bool trainingGateEnabled = playerBotTrainingGateEnabled();
+
+	Locker progressionLock(&progressionMutex);
+	for (int i = 0; i < rosterBatch.size(); ++i) {
+		const SimBotIdentity& identity = rosterBatch.get(i);
+		if (!progressionRecords.contains(identity.id) ||
+				identity.trainingPlan.isEmpty()) {
+			progressionTrainingNextSteps.drop(identity.id);
+			progressionTrainingPendingIds.drop(identity.id);
+			continue;
+		}
+		refreshPlayerBotTrainingStepLocked(identity.id, identity.trainingPlan,
+			progressionRecords.get(identity.id), true, trainingGateEnabled);
+	}
+
+	uint64 nextCursor = (startCursor + rosterBatch.size()) % rosterSize;
+	if (startCursor + rosterBatch.size() >= static_cast<uint64>(rosterSize))
+		trainingSweepPasses.increment();
+	trainingSweepCursor = nextCursor;
+}
+
+SimBotBodyProgression SimPlayerManager::buildBodyProgressionSnapshot(
+		uint64 identityId) {
+	SimBotBodyProgression snapshot;
+	Locker progressionLock(&progressionMutex);
+	if (!progressionRecords.contains(identityId))
+		return snapshot;
+
+	const SimBotProgression& progression = progressionRecords.get(identityId);
+	SkillManager* skillManager = SkillManager::instance();
+	for (int i = 0; i < progression.skills.size(); ++i) {
+		const String& skillName = progression.skills.get(i);
+		snapshot.skills.add(skillName);
+
+		Skill* skill = skillManager == nullptr ? nullptr :
+			skillManager->getSkill(skillName);
+		if (skill == nullptr || skill->getSkillModifiers() == nullptr)
+			continue;
+
+		const VectorMap<String, int>* modifiers = skill->getSkillModifiers();
+		for (int j = 0; j < modifiers->size(); ++j) {
+			const VectorMapEntry<String, int>& entry = modifiers->elementAt(j);
+			int64 delta = entry.getValue();
+			if (snapshot.modDeltas.contains(entry.getKey()))
+				delta += snapshot.modDeltas.get(entry.getKey());
+			if (delta > 2147483647)
+				delta = 2147483647;
+			else if (delta < -2147483647 - 1)
+				delta = -2147483647 - 1;
+			snapshot.modDeltas.put(entry.getKey(), static_cast<int>(delta));
+		}
+	}
+
+	return snapshot;
+}
+
+void SimPlayerManager::applyProgressionToBody(AiAgent* agent,
+		const SimBotBodyProgression& snapshot) {
+	if (agent == nullptr)
+		return;
+
+	const CreatureTemplate* npcTemplate = agent->getCreatureTemplate();
+	// This is deliberately SKILLBOX-only. TEMPLATE is owned by the archetype
+	// path and must remain available to AiAgent::getSkillMod as its baseline.
+	agent->removeAllSkillModsOfType(SkillModManager::SKILLBOX, false);
+	for (int i = 0; i < snapshot.modDeltas.size(); ++i) {
+		const VectorMapEntry<String, int>& entry =
+			snapshot.modDeltas.elementAt(i);
+		int64 desired = npcTemplate == nullptr ? 0 :
+			static_cast<int64>(npcTemplate->getStatistic(entry.getKey()));
+		desired += entry.getValue();
+		if (desired > 2147483647)
+			desired = 2147483647;
+		else if (desired < -2147483647 - 1)
+			desired = -2147483647 - 1;
+		agent->addSkillMod(SkillModManager::SKILLBOX, entry.getKey(),
+			static_cast<int>(desired), false);
+	}
+
+	for (int i = 0; i < snapshot.skills.size(); ++i)
+		agent->addSkill(snapshot.skills.get(i), false);
+}
+
+void SimPlayerManager::reapplyPlayerBotProgressionToLiveBody(
+		uint64 identityId) {
+	uint64 bodyOid = 0;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveIdentityBodyOids.contains(identityId))
+			return;
+		bodyOid = pveIdentityBodyOids.get(identityId);
+	}
+	if (bodyOid == 0)
+		return;
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(bodyOid);
+	AiAgent* agent = object == nullptr ? nullptr : object->asAiAgent();
+	if (agent == nullptr || agent->getZone() == nullptr)
+		return;
+
+	// The progression mutex is released by the snapshot builder before this
+	// agent lock is acquired. This mirrors checkArrival's post-lock lifecycle
+	// guard: teardown wins by returning, with no continuation scheduled here.
+	SimBotBodyProgression snapshot = buildBodyProgressionSnapshot(identityId);
+	Locker agentLock(agent);
+	if (agent->getZone() == nullptr)
+		return;
+	applyProgressionToBody(agent, snapshot);
+}
+
 void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 	progressionEnabled = config.getBooleanField("enabled", progressionEnabled);
 	progressionAwardKillXp = config.getBooleanField("awardKillXp",
 		progressionAwardKillXp);
+	progressionTrainingEnabled = config.getBooleanField("trainingEnabled",
+		progressionTrainingEnabled);
+	trainingMaxPerTick = clampMinerInt(config.getIntField("trainingMaxPerTick",
+		trainingMaxPerTick), trainingMaxPerTick, 1, 1000);
+	trainingSweepBatch = clampMinerInt(config.getIntField("trainingSweepBatch",
+		trainingSweepBatch), trainingSweepBatch, 1, 10000);
 	progressionKillXpRate = clampFloatRange(config.getFloatField(
 		"killXpRate", progressionKillXpRate), 0.f, 100.f);
 	progressionFlushIntervalSeconds = clampMinerInt(
@@ -7581,6 +8073,10 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 			progressionReaperMinAgeSeconds, 1, 86400 * 30);
 	}
 	reaper.pop();
+
+	LuaObject trainingPlans = config.getObjectField("trainingPlans");
+	buildTrainingPlansFromConfig(trainingPlans);
+	trainingPlans.pop();
 }
 
 static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
@@ -7591,7 +8087,15 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.identityId = table.getLongField("identityId", 0);
 	step.bodyOid = table.getLongField("bodyOid", 0);
 	step.templateName = table.getStringField("template").trim();
+	step.profession = table.getStringField("profession").trim();
+	step.trainingPlan = table.getStringField("trainingPlan").trim();
 	step.xpType = table.getStringField("xpType").trim();
+	step.skillName = table.getStringField("skillName").trim();
+	if (step.skillName.isEmpty())
+		step.skillName = table.getStringField("skill").trim();
+	step.skillMod = table.getStringField("skillMod").trim();
+	if (step.skillMod.isEmpty())
+		step.skillMod = table.getStringField("mod").trim();
 	step.amount = table.getLongField("amount", 0);
 	step.baseXp = table.getSignedIntField("baseXp", 0);
 	step.totalDamage = static_cast<uint32>(table.getLongField(
@@ -7611,6 +8115,9 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.gateEnabled = table.getBooleanField("gateEnabled", false);
 	step.hasGateEnabled = step.gateEnabled ==
 		table.getBooleanField("gateEnabled", true);
+	step.trainingGateEnabled = table.getBooleanField("trainingGateEnabled", false);
+	step.hasTrainingGateEnabled = step.trainingGateEnabled ==
+		table.getBooleanField("trainingGateEnabled", true);
 	step.rate = clampFloatRange(table.getFloatField("rate", 1.0f),
 		0.0f, 100.0f);
 	step.hasRate = table.getFloatField("rate", 1.0f) ==
@@ -7639,6 +8146,7 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	if (step.source.isEmpty())
 		step.source = "harness";
 	step.bank = table.getBooleanField("bank", false);
+	step.freeGrant = table.getBooleanField("freeGrant", false);
 	step.expectReject = table.getBooleanField("expectReject", false);
 	step.force = table.getBooleanField("force", false);
 	step.flushDelayMs = table.getIntField("flushDelayMs", 0);
@@ -7823,6 +8331,50 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	pveEnabled = pveConfig.getBooleanField("enabled", pveEnabled);
 	pveHunterBotsEnabled = pveConfig.getBooleanField(
 		"enableHunterBots", pveHunterBotsEnabled);
+	Vector<String> huntingProfessions;
+	LuaObject huntingProfessionConfig = pveConfig.getObjectField(
+		"huntingProfessions");
+	if (huntingProfessionConfig.isValidTable()) {
+		for (int i = 1; i <= huntingProfessionConfig.getTableSize(); ++i) {
+			String profession = huntingProfessionConfig.getStringAt(i).trim();
+			if (!profession.isEmpty() && !huntingProfessions.contains(profession))
+				huntingProfessions.add(profession);
+		}
+	}
+	huntingProfessionConfig.pop();
+	if (huntingProfessions.size() == 0) {
+		huntingProfessions.add("hunter");
+		huntingProfessions.add("brawler");
+	}
+	bool noviceEnabled = false;
+	bool retireLegacyHunters = false;
+	String noviceBodyTemplate;
+	Vector<PveNoviceDistribution> noviceDistribution;
+	LuaObject noviceConfig = pveConfig.getObjectField("novice");
+	if (noviceConfig.isValidTable()) {
+		noviceEnabled = noviceConfig.getBooleanField("enabled", false);
+		retireLegacyHunters = noviceConfig.getBooleanField(
+			"retireLegacyHunters", false);
+		noviceBodyTemplate = noviceConfig.getStringField(
+			"bodyTemplate").trim();
+		LuaObject distribution = noviceConfig.getObjectField("distribution");
+		if (distribution.isValidTable()) {
+			for (int i = 1; i <= distribution.getTableSize(); ++i) {
+				LuaObject entry = distribution.getObjectAt(i);
+				if (entry.isValidTable()) {
+					PveNoviceDistribution row;
+					row.profession = entry.getStringField("profession").trim();
+					row.trainingPlan = entry.getStringField("trainingPlan").trim();
+					row.count = clampMinerInt(entry.getIntField("count"), 0, 0, 64);
+					if (!row.profession.isEmpty() && row.count > 0)
+						noviceDistribution.add(row);
+				}
+				entry.pop();
+			}
+		}
+		distribution.pop();
+	}
+	noviceConfig.pop();
 	pveMissionHuntEnabled = false;
 	pveMissionBoardEnabled = false;
 	pveRealBuffsEnabled = false;
@@ -8489,8 +9041,23 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 
 		Locker pveLock(&pveMutex);
 		pveHunterTemplates = rebuilt;
+		pveHuntingProfessions = huntingProfessions;
+		if (!pveNoviceGateOverrideActive)
+			pveNoviceEnabled = noviceEnabled;
+		pveRetireLegacyHunters = retireLegacyHunters;
+		pveNoviceBodyTemplate = noviceBodyTemplate;
+		pveNoviceDistribution = noviceDistribution;
 	}
 	bodyTemplates.pop();
+	{
+		Locker pveLock(&pveMutex);
+		pveHuntingProfessions = huntingProfessions;
+		if (!pveNoviceGateOverrideActive)
+			pveNoviceEnabled = noviceEnabled;
+		pveRetireLegacyHunters = retireLegacyHunters;
+		pveNoviceBodyTemplate = noviceBodyTemplate;
+		pveNoviceDistribution = noviceDistribution;
+	}
 
 	LuaObject hunterLoadout = pveConfig.getObjectField("hunterLoadout");
 	if (hunterLoadout.isValidTable()) {
@@ -8970,6 +9537,11 @@ static SimBotProgression progressionFromResult(ResultSet* result) {
 	return progression;
 }
 
+void SimPlayerManager::markProgressionDirtyLocked(uint64 identityId) {
+	if (identityId != 0 && !progressionRetiringIds.contains(identityId))
+		progressionDirtyIds.put(identityId, true);
+}
+
 void SimPlayerManager::loadPlayerBotProgressionStore() {
 	if (!progressionEnabled || progressionLoaded || !pveRosterLoaded ||
 			!pveDatabaseAvailable)
@@ -9021,7 +9593,17 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 			String skillName = pveRosterResultString(skillResult, 1);
 			if (loaded.contains(identityId) && !skillName.isEmpty() &&
 					!loaded.get(identityId).skills.contains(skillName))
-				loaded.get(identityId).skills.add(skillName);
+					loaded.get(identityId).skills.add(skillName);
+		}
+
+		Vector<uint64> derivedSpendChanged;
+		for (int i = 0; i < loaded.size(); ++i) {
+			SimBotProgression& progression = loaded.elementAt(i).getValue();
+			int derivedSpent = derivedPlayerBotSkillPoints(progression);
+			if (progression.skillPointsSpent != derivedSpent) {
+				progression.skillPointsSpent = derivedSpent;
+				derivedSpendChanged.add(progression.identityId);
+			}
 		}
 
 		{
@@ -9029,6 +9611,8 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 			progressionRecords = loaded;
 			progressionDirtyIds.removeAll();
 			progressionOrphanIds.removeAll();
+			for (int i = 0; i < derivedSpendChanged.size(); ++i)
+				markProgressionDirtyLocked(derivedSpendChanged.get(i));
 		}
 
 		progressionLoaded = true;
@@ -9036,6 +9620,7 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 		progressionNextDbProbeMs = 0;
 		progressionDbProbeBackoffMs = 5000;
 		reconcilePlayerBotProgression();
+		reconcileIdentityTiers();
 		info("SimPlayerProgressionStoreLoaded records=" +
 			String::valueOf(loaded.size()), true);
 	} catch (const Exception& e) {
@@ -9055,7 +9640,8 @@ bool SimPlayerManager::ensurePlayerBotProgressionRecord(uint64 identityId) {
 	bool inRoster = false;
 	{
 		Locker pveLock(&pveMutex);
-		inRoster = pveIdentities.contains(identityId);
+		inRoster = pveIdentities.contains(identityId) &&
+				!pveRetiringIdentityIds.contains(identityId);
 	}
 	if (!inRoster) {
 		progressionCreateRefusedNotInRoster.increment();
@@ -9112,10 +9698,17 @@ bool SimPlayerManager::ensurePlayerBotProgressionRecord(uint64 identityId) {
 					progression.skills.add(skillName);
 			}
 		}
+		int derivedSpent = derivedPlayerBotSkillPoints(progression);
+		bool derivedSpendChanged = progression.skillPointsSpent != derivedSpent;
+		if (derivedSpendChanged)
+			progression.skillPointsSpent = derivedSpent;
 
 		Locker progressionLock(&progressionMutex);
-		if (!progressionRecords.contains(identityId))
+		if (!progressionRecords.contains(identityId)) {
 			progressionRecords.put(identityId, progression);
+			if (derivedSpendChanged)
+				markProgressionDirtyLocked(identityId);
+		}
 		return true;
 	} catch (const Exception& e) {
 		uint64 nowMs = System::getMiliTime();
@@ -9135,6 +9728,161 @@ bool SimPlayerManager::playerBotProgressionAwardGateEnabled() {
 	if (playerBotParityTestGateOverrideActive)
 		return playerBotParityTestGateOverride;
 	return true;
+}
+
+void SimPlayerManager::restoreNoviceGateOverride() {
+	Locker pveLock(&pveMutex);
+	if (!pveNoviceGateOverrideActive)
+		return;
+	pveNoviceEnabled = pveNoviceGateOverridePrevious;
+	pveNoviceGateOverrideActive = false;
+	pveNoviceGateOverridePrevious = false;
+}
+
+bool SimPlayerManager::playerBotTrainingGateEnabled() {
+	// Only the MASTER gate may short-circuit ahead of the parity override, and
+	// the per-capability flag is the value returned when no override is active.
+	// Folding progressionTrainingEnabled into the check above made the harness's
+	// setTrainingGate op inert whenever the capability shipped default-off -
+	// which it always does - so training could never be verified live
+	// (LIVE_VERIFICATION_FAIL, run 20260906-104819). This mirrors
+	// playerBotProgressionAwardGateEnabled exactly.
+	if (!progressionEnabled)
+		return false;
+	Locker parityLock(&playerBotParityTestMutex);
+	if (playerBotParityTestTrainingGateOverrideActive)
+		return playerBotParityTestTrainingGateOverride;
+	return progressionTrainingEnabled;
+}
+
+static String playerBotWeaponTypeForXp(const String& xpType) {
+	if (xpType.contains("onehand"))
+		return "onehandmelee";
+	if (xpType.contains("polearm"))
+		return "polearm";
+	if (xpType.contains("twohand"))
+		return "twohandmelee";
+	if (xpType.contains("unarmed"))
+		return "unarmed";
+	if (xpType.contains("carbine"))
+		return "carbine";
+	if (xpType.contains("pistol"))
+		return "pistol";
+	if (xpType.contains("rifle"))
+		return "rifle";
+	return "heavyweapon";
+}
+
+static bool playerBotValidWeaponType(const String& weaponType) {
+	return weaponType == "onehandmelee" || weaponType == "polearm" ||
+		weaponType == "twohandmelee" || weaponType == "unarmed" ||
+		weaponType == "carbine" || weaponType == "pistol" ||
+		weaponType == "rifle" || weaponType == "heavyweapon";
+}
+
+static int playerBotTierFromDifficulty(int difficulty) {
+	return Math::min(25, difficulty / 100 + 1);
+}
+
+int SimPlayerManager::availablePlayerBotXp(
+		const SimBotProgression& progression, const String& xpType) const {
+	String normalizedType = xpType.trim();
+	int64 available = progression.experience.contains(normalizedType) ?
+		progression.experience.get(normalizedType) : 0;
+	SkillManager* skillManager = SkillManager::instance();
+	if (skillManager != nullptr) {
+		for (int i = 0; i < progression.skills.size(); ++i) {
+			Skill* skill = skillManager->getSkill(progression.skills.get(i));
+			if (skill != nullptr && skill->getXpType() == normalizedType)
+				available -= skill->getXpCost();
+		}
+	}
+	if (available <= 0)
+		return 0;
+	return available > 2147483647 ? 2147483647 : static_cast<int>(available);
+}
+
+int SimPlayerManager::derivedPlayerBotSkillPoints(
+		const SimBotProgression& progression) const {
+	int64 spent = 0;
+	SkillManager* skillManager = SkillManager::instance();
+	if (skillManager == nullptr)
+		return 0;
+	for (int i = 0; i < progression.skills.size(); ++i) {
+		Skill* skill = skillManager->getSkill(progression.skills.get(i));
+		if (skill != nullptr)
+			spent += skill->getSkillPointsRequired();
+	}
+	return spent <= 0 ? 0 : spent > 2147483647 ? 2147483647 :
+		static_cast<int>(spent);
+}
+
+int SimPlayerManager::effectivePlayerBotXpCap(
+		const SimBotProgression& progression, const String& xpType) const {
+	String normalizedType = xpType.trim();
+	if (normalizedType.beginsWith("prestige_"))
+		return 2147483647;
+
+	int cap = 0;
+	SkillManager* skillManager = SkillManager::instance();
+	if (skillManager != nullptr) {
+		for (int i = 0; i < progression.skills.size(); ++i) {
+			Skill* skill = skillManager->getSkill(progression.skills.get(i));
+			if (skill != nullptr && skill->getXpType() == normalizedType &&
+					skill->getXpCap() != 0)
+				cap = Math::max(cap, skill->getXpCap());
+		}
+		if (cap == 0)
+			cap = skillManager->getDefaultXpLimit(normalizedType);
+	}
+	return cap < 0 ? 2000 : cap == 0 ? 2000 : cap;
+}
+
+// Both tier entry points accumulate the same combat-difficulty mod over the
+// identity's trained boxes and differ only in how the weapon type is chosen, so
+// the walk lives here once. Only TRAINED deltas are summed, never the body
+// template's baseline: a real player has no template statistic behind this mod,
+// so including one would inflate the tier above player parity.
+static int playerBotTierFromTrainedDifficulty(
+		const SimBotProgression& progression, const String& weaponType,
+		int fallbackTier) {
+	String difficultyMod = "private_" + weaponType + "_combat_difficulty";
+	int difficulty = 0;
+	bool found = false;
+	SkillManager* skillManager = SkillManager::instance();
+	if (skillManager != nullptr) {
+		for (int i = 0; i < progression.skills.size(); ++i) {
+			Skill* skill = skillManager->getSkill(progression.skills.get(i));
+			if (skill == nullptr || skill->getSkillModifiers() == nullptr)
+				continue;
+			const VectorMap<String, int>* modifiers = skill->getSkillModifiers();
+			if (modifiers->contains(difficultyMod)) {
+				difficulty += modifiers->get(difficultyMod);
+				found = true;
+			}
+		}
+	}
+	return found ? playerBotTierFromDifficulty(difficulty) : fallbackTier;
+}
+
+int SimPlayerManager::playerBotKillXpTier(
+		const SimBotProgression& progression, const String& xpType,
+		int fallbackTier) const {
+	if (xpType.isEmpty() || xpType == "jedi_general")
+		return fallbackTier;
+
+	return playerBotTierFromTrainedDifficulty(progression,
+		playerBotWeaponTypeForXp(xpType), fallbackTier);
+}
+
+int SimPlayerManager::recomputeIdentitySkillTier(
+		const SimBotProgression& progression, const SimBotTrainingPlan& plan,
+		int fallbackTier) const {
+	if (!playerBotValidWeaponType(plan.weaponType))
+		return fallbackTier;
+
+	return playerBotTierFromTrainedDifficulty(progression, plan.weaponType,
+		fallbackTier);
 }
 
 bool SimPlayerManager::grantPlayerBotExperience(uint64 identityId,
@@ -9170,17 +9918,9 @@ bool SimPlayerManager::grantPlayerBotExperience(uint64 identityId,
 		return false;
 	}
 
-	int xpCap = -1;
-	SkillManager* skillManager = SkillManager::instance();
-	if (skillManager != nullptr)
-		xpCap = skillManager->getDefaultXpLimit(normalizedType);
-
-	if (normalizedType.beginsWith("prestige_"))
-		xpCap = 2147483647;
-	else if (xpCap < 0)
-		xpCap = 2000;
-
-	int available = xpCap > current ? xpCap - current : 0;
+	int xpCap = effectivePlayerBotXpCap(progression, normalizedType);
+	int available = availablePlayerBotXp(progression, normalizedType);
+	available = xpCap > available ? xpCap - available : 0;
 	if (amount > available) {
 		amount = available;
 		killXpCappedByCeiling.increment();
@@ -9198,7 +9938,22 @@ bool SimPlayerManager::grantPlayerBotExperience(uint64 identityId,
 	progression.lastAwardMs = System::getMiliTime();
 	progression.lastAwardSource = progressionAwardSource(source);
 	progression.awardsTotal++;
-	progressionDirtyIds.put(identityId, true);
+	markProgressionDirtyLocked(identityId);
+	// The award path is deliberately cache-only: no plan derivation, roster
+	// lookup, training, or SQL work occurs here. A cache miss is repaired by
+	// the bounded round-robin sweep.
+	if (progressionTrainingEnabled &&
+			progressionTrainingNextSteps.contains(identityId)) {
+		SimBotTrainingStep nextStep;
+		nextStep = progressionTrainingNextSteps.get(identityId);
+		if (nextStep.valid && normalizedType == nextStep.xpType &&
+				current + amount >= nextStep.lifetimeEarnedThreshold) {
+			progressionTrainingPendingIds.put(identityId, true);
+			int64 pendingDepth = progressionTrainingPendingIds.size();
+			if (pendingDepth > trainingPendingHigh.get())
+				trainingPendingHigh = pendingDepth;
+		}
+	}
 	progressionAwardsAccepted.increment();
 	if (awarded != nullptr)
 		*awarded = amount;
@@ -9233,7 +9988,7 @@ bool SimPlayerManager::grantPlayerBotCredits(uint64 identityId, int64 amount,
 	progression.lastAwardMs = System::getMiliTime();
 	progression.lastAwardSource = progressionAwardSource(source);
 	progression.awardsTotal++;
-	progressionDirtyIds.put(identityId, true);
+	markProgressionDirtyLocked(identityId);
 	progressionAwardsAccepted.increment();
 	return true;
 }
@@ -9268,43 +10023,219 @@ bool SimPlayerManager::spendPlayerBotCredits(uint64 identityId, int64 amount,
 	progression.lastAwardMs = System::getMiliTime();
 	progression.lastAwardSource = progressionAwardSource(source);
 	progression.awardsTotal++;
-	progressionDirtyIds.put(identityId, true);
+	markProgressionDirtyLocked(identityId);
 	progressionAwardsAccepted.increment();
 	return true;
 }
 
 bool SimPlayerManager::recordPlayerBotSkill(uint64 identityId,
 		const String& skillName, const String& source) {
-	if (!playerBotProgressionAwardGateEnabled()) {
-		progressionAwardsRejectedDisabled.increment();
-		return false;
+	(void)source;
+	return trainPlayerBotSkill(identityId, skillName, false, nullptr);
+}
+
+bool SimPlayerManager::trainPlayerBotSkill(uint64 identityId,
+		const String& skillName, bool freeGrant, String* refusalOut) {
+	if (refusalOut != nullptr)
+		*refusalOut = "";
+
+	bool trainingGateEnabled = false;
+	bool noviceGateEnabled = false;
+	{
+		Locker pveLock(&pveMutex);
+		noviceGateEnabled = pveNoviceEnabled;
+	}
+	if (freeGrant && noviceGateEnabled) {
+		// Mint-time grants are deliberately independent of the normal training
+		// gate, but are still owned by both progression and novice gates.
+		if (!progressionEnabled) {
+			trainingRefusedGate.increment();
+			if (refusalOut != nullptr)
+				*refusalOut = "gate";
+			return false;
+		}
+	} else {
+		trainingGateEnabled = playerBotTrainingGateEnabled();
+		if (!trainingGateEnabled) {
+			trainingRefusedGate.increment();
+			if (refusalOut != nullptr)
+				*refusalOut = "gate";
+			return false;
+		}
 	}
 	if (identityId == 0) {
-		progressionAwardsRejectedNoIdentity.increment();
+		trainingRefusedNoRecord.increment();
+		if (refusalOut != nullptr)
+			*refusalOut = "no_record";
 		return false;
 	}
-	Locker progressionLock(&progressionMutex);
-	if (!progressionRecords.contains(identityId)) {
-		progressionAwardsRejectedNoRecord.increment();
-		return false;
+
+	SimBotIdentity identity;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveIdentities.contains(identityId) ||
+				pveRetiringIdentityIds.contains(identityId)) {
+			trainingRefusedNoRecord.increment();
+			if (refusalOut != nullptr)
+				*refusalOut = pveRetiringIdentityIds.contains(identityId) ?
+					"retiring" : "no_record";
+			return false;
+		}
+		identity = pveIdentities.get(identityId);
 	}
 
 	String normalizedSkill = skillName.trim();
-	if (normalizedSkill.isEmpty()) {
-		progressionAwardsRejectedInvalidAmount.increment();
+	Skill* skill = SkillManager::instance() == nullptr ? nullptr :
+		SkillManager::instance()->getSkill(normalizedSkill);
+	if (skill == nullptr || normalizedSkill.isEmpty()) {
+		trainingRefusedUnknownSkill.increment();
+		if (refusalOut != nullptr)
+			*refusalOut = "unknown_skill";
 		return false;
 	}
 
-	SimBotProgression& progression = progressionRecords.get(identityId);
-	if (progression.skills.contains(normalizedSkill))
-		return true;
-	progression.skills.add(normalizedSkill);
-	progression.lastAwardMs = System::getMiliTime();
-	progression.lastAwardSource = progressionAwardSource(source);
-	progression.awardsTotal++;
-	progressionDirtyIds.put(identityId, true);
-	progressionAwardsAccepted.increment();
+	SimBotProgression updatedProgression;
+	SimBotTrainingPlan plan;
+	bool hasPlan = false;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (progressionRetiringIds.contains(identityId) ||
+				!progressionRecords.contains(identityId)) {
+			trainingRefusedNoRecord.increment();
+			if (refusalOut != nullptr)
+				*refusalOut = progressionRetiringIds.contains(identityId) ?
+					"retiring" : "no_record";
+			return false;
+		}
+
+		SimBotProgression& progression = progressionRecords.get(identityId);
+		if (progression.skills.contains(normalizedSkill)) {
+			trainingRefusedAlreadyTrained.increment();
+			if (refusalOut != nullptr)
+				*refusalOut = "already_trained";
+			return false;
+		}
+
+		const Vector<String>* requiredSkills = skill->getSkillsRequired();
+		for (int i = 0; requiredSkills != nullptr &&
+				i < requiredSkills->size(); ++i) {
+			if (!progression.skills.contains(requiredSkills->get(i))) {
+				trainingRefusedPrereq.increment();
+				if (refusalOut != nullptr)
+					*refusalOut = "prereq";
+				return false;
+			}
+		}
+
+		const Vector<String>* preclusionSkills = skill->getPreclusionSkills();
+		for (int i = 0; preclusionSkills != nullptr &&
+				i < preclusionSkills->size(); ++i) {
+			if (progression.skills.contains(preclusionSkills->get(i))) {
+				trainingRefusedPreclusion.increment();
+				if (refusalOut != nullptr)
+					*refusalOut = "preclusion";
+				return false;
+			}
+		}
+
+		int derivedSpent = derivedPlayerBotSkillPoints(progression);
+		int requiredPoints = skill->getSkillPointsRequired();
+		if (requiredPoints < 0 || requiredPoints > 250 ||
+				derivedSpent > 250 - requiredPoints) {
+			trainingRefusedPoints.increment();
+			if (refusalOut != nullptr)
+				*refusalOut = "points";
+			return false;
+		}
+
+		if (!freeGrant && availablePlayerBotXp(progression, skill->getXpType()) <
+				skill->getXpCost()) {
+			trainingRefusedXp.increment();
+			if (refusalOut != nullptr)
+				*refusalOut = "xp";
+			return false;
+		}
+
+		progression.skills.add(normalizedSkill);
+		progression.skillPointsSpent = derivedPlayerBotSkillPoints(progression);
+		markProgressionDirtyLocked(identityId);
+		trainingLastSkill = normalizedSkill;
+		if (!freeGrant && !identity.trainingPlan.isEmpty())
+			refreshPlayerBotTrainingStepLocked(identityId,
+				identity.trainingPlan, progression, true, trainingGateEnabled);
+		updatedProgression = progression;
+		if (!identity.trainingPlan.isEmpty() &&
+				progressionTrainingPlans.contains(identity.trainingPlan)) {
+			plan = progressionTrainingPlans.get(identity.trainingPlan);
+			hasPlan = true;
+		}
+	}
+
+	if (hasPlan) {
+		int newTier = recomputeIdentitySkillTier(updatedProgression, plan,
+			identity.skillTier);
+		Locker pveLock(&pveMutex);
+		if (pveIdentities.contains(identityId) &&
+				pveIdentities.get(identityId).skillTier != newTier) {
+			pveIdentities.get(identityId).skillTier = newTier;
+			pveDirtyIdentityIds.put(identityId, true);
+			trainingTierRecomputed.increment();
+		}
+	}
+
+	reapplyPlayerBotProgressionToLiveBody(identityId);
+	trainingTrained.increment();
 	return true;
+
+}
+
+void SimPlayerManager::reconcileIdentityTiers() {
+	if (!progressionEnabled || !progressionLoaded)
+		return;
+
+	Vector<SimBotIdentity> plannedIdentities;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < pveIdentities.size(); ++i) {
+			const SimBotIdentity& identity = pveIdentities.elementAt(i).getValue();
+			if (!identity.trainingPlan.isEmpty())
+				plannedIdentities.add(identity);
+		}
+	}
+
+	// progressionTrainingPlans is rebuilt wholesale by the runtime config
+	// refresh (applyPlayerBotProgressionConfig, reached from refreshPvpConfig on
+	// the PvP maintenance task) while this runs on the PvE one, so it is guarded
+	// by progressionMutex - the same mutex its reset already takes. Copy it out
+	// here rather than reading it across the loop below, which calls
+	// snapshotPlayerBotProgression and therefore must not hold that mutex.
+	VectorMap<String, SimBotTrainingPlan> plans;
+	{
+		Locker progressionLock(&progressionMutex);
+		plans = progressionTrainingPlans;
+	}
+
+	for (int i = 0; i < plannedIdentities.size(); ++i) {
+		const SimBotIdentity& identity = plannedIdentities.get(i);
+		if (!plans.contains(identity.trainingPlan))
+			continue;
+		SimBotProgression progression;
+		if (!snapshotPlayerBotProgression(identity.id, progression))
+			continue;
+		SimBotTrainingPlan plan = plans.get(identity.trainingPlan);
+		int tier = recomputeIdentitySkillTier(progression, plan,
+			identity.skillTier);
+		if (tier == identity.skillTier)
+			continue;
+
+		Locker pveLock(&pveMutex);
+		if (pveIdentities.contains(identity.id) &&
+				pveIdentities.get(identity.id).skillTier != tier) {
+			pveIdentities.get(identity.id).skillTier = tier;
+			pveDirtyIdentityIds.put(identity.id, true);
+			trainingTierRecomputed.increment();
+		}
+	}
 }
 
 bool SimPlayerManager::resolvePlayerBotIdentityAndTier(uint64 bodyOid,
@@ -9365,6 +10296,9 @@ void SimPlayerManager::awardPlayerBotKillExperience(
 			killXpSkippedNoIdentity.increment();
 			continue;
 		}
+		SimBotProgression progression;
+		bool hasProgression = snapshotPlayerBotProgression(identityId,
+			progression);
 
 		uint32 combatXp = 0;
 
@@ -9378,7 +10312,9 @@ void SimPlayerManager::awardPlayerBotKillExperience(
 			xpAmount *= static_cast<float>(damage) /
 				static_cast<float>(event.totalDamage);
 
-			float levelCap = skillTier * 300.f;
+			int killTier = hasProgression ? playerBotKillXpTier(progression,
+				xpType, skillTier) : skillTier;
+			float levelCap = killTier * 300.f;
 			if (xpAmount > levelCap) {
 				xpAmount = levelCap;
 				killXpCappedByLevel.increment();
@@ -9595,7 +10531,8 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 		// therefore re-dirties the identity for the next flush.
 		for (int i = 0; i < progressionDirtyIds.size(); ++i) {
 			uint64 identityId = progressionDirtyIds.elementAt(i).getKey();
-			if (progressionRecords.contains(identityId))
+			if (progressionRecords.contains(identityId) &&
+					!progressionRetiringIds.contains(identityId))
 				batch.put(identityId, progressionRecords.get(identityId));
 		}
 		progressionDirtyIds.removeAll();
@@ -9656,8 +10593,7 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 			// Merge under the mutex so a concurrent award cannot be overwritten.
 			Locker progressionLock(&progressionMutex);
 			for (int pending = i; pending < batch.size(); ++pending)
-				progressionDirtyIds.put(
-					batch.elementAt(pending).getKey(), true);
+				markProgressionDirtyLocked(batch.elementAt(pending).getKey());
 			progressionDbAvailable = false;
 			progressionNextDbProbeMs = nowMs + progressionDbProbeBackoffMs;
 			progressionDbProbeBackoffMs = Math::min<uint64>(
@@ -9768,7 +10704,10 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 			switch (request.kind) {
 			case PlayerBotProgressionRequest::MintHarnessIdentity: {
 				SimBotIdentity identity;
-				if (!mintPveIdentity("harness", identity))
+				String profession = request.profession.isEmpty() ?
+					String("harness") : request.profession;
+				if (!mintPveIdentity(profession, identity,
+					request.trainingPlan))
 					throw Exception("harness identity mint failed");
 				request.identityId = identity.id;
 				request.resultFound = true;
@@ -9947,7 +10886,7 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 						throw Exception("restart probe record is missing");
 					progressionRecords.get(request.identityId).lastAwardSource =
 						"harness_retain";
-					progressionDirtyIds.put(request.identityId, true);
+					markProgressionDirtyLocked(request.identityId);
 				}
 				request.resultFound = true;
 				break;
@@ -10223,6 +11162,9 @@ bool SimPlayerManager::awaitPlayerBotParityKillTarget(
 			skillTier = Math::max(1, Math::min(25,
 				pveIdentities.get(identityId).skillTier));
 	}
+	SimBotProgression progression;
+	if (snapshotPlayerBotProgression(identityId, progression))
+		skillTier = playerBotKillXpTier(progression, expectedXpType, skillTier);
 	float cappedXp = Math::min(static_cast<float>(baseXp),
 		static_cast<float>(skillTier * 300));
 	uint32 combatXp = static_cast<uint32>(cappedXp);
@@ -10426,6 +11368,44 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 	if (key == "killxp.cappedbyceiling" ||
 			key == "killxpcappedbyceiling")
 		return killXpCappedByCeiling.get();
+	if (key == "training.trained" || key == "trainingtrained")
+		return trainingTrained.get();
+	if (key == "training.refusednorecord" || key == "trainingrefusednorecord")
+		return trainingRefusedNoRecord.get();
+	if (key == "training.refusedgate" || key == "trainingrefusedgate")
+		return trainingRefusedGate.get();
+	if (key == "training.refusedunknownskill" ||
+			key == "trainingrefusedunknownskill")
+		return trainingRefusedUnknownSkill.get();
+	if (key == "training.refusedalreadytrained" ||
+			key == "trainingrefusedalreadytrained")
+		return trainingRefusedAlreadyTrained.get();
+	if (key == "training.refusedprereq" || key == "trainingrefusedprereq")
+		return trainingRefusedPrereq.get();
+	if (key == "training.refusedpreclusion" ||
+			key == "trainingrefusedpreclusion")
+		return trainingRefusedPreclusion.get();
+	if (key == "training.refusedpoints" || key == "trainingrefusedpoints")
+		return trainingRefusedPoints.get();
+	if (key == "training.refusedxp" || key == "trainingrefusedxp")
+		return trainingRefusedXp.get();
+	if (key == "training.sweeppasses" || key == "trainingsweeppasses")
+		return trainingSweepPasses.get();
+	if (key == "training.pendinghigh" || key == "trainingpendinghigh")
+		return trainingPendingHigh.get();
+	if (key == "training.tierrecomputed" || key == "trainingtierrecomputed")
+		return trainingTierRecomputed.get();
+	if (key == "novicegrantsrepaired")
+		return noviceGrantsRepaired.get();
+	// Dotted aliases match the convention every other counter here follows;
+	// keys are lowercased but dots are NOT stripped, so omitting them made
+	// counter="retirements.completed" silently resolve to 0.
+	if (key == "retirements.completed" || key == "retirementscompleted")
+		return retirementsCompleted.get();
+	if (key == "retirements.resumed" || key == "retirementsresumed")
+		return retirementsResumed.get();
+	if (key == "bodyspawnrefusednotready")
+		return pveBodySpawnRefusedNotReady.get();
 	if (key == "harnessrowsstale") {
 		Locker parityLock(&playerBotParityTestMutex);
 		return playerBotParityTestHarnessRowsStale;
@@ -10733,13 +11713,25 @@ void SimPlayerManager::beginPlayerBotParityTestCleanup(bool preserveProbe) {
 }
 
 void SimPlayerManager::restorePlayerBotParityScenarioGate() {
-	Locker parityLock(&playerBotParityTestMutex);
-	if (playerBotParityTestGateOverrideActive) {
-		playerBotParityTestGateOverrideActive =
-			playerBotParityTestGateOverridePreviousActive;
-		playerBotParityTestGateOverride =
-			playerBotParityTestGateOverridePrevious;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (playerBotParityTestGateOverrideActive) {
+			playerBotParityTestGateOverrideActive =
+				playerBotParityTestGateOverridePreviousActive;
+			playerBotParityTestGateOverride =
+				playerBotParityTestGateOverridePrevious;
+		}
+		if (playerBotParityTestTrainingGateOverrideActive) {
+			playerBotParityTestTrainingGateOverrideActive =
+				playerBotParityTestTrainingGateOverridePreviousActive;
+			playerBotParityTestTrainingGateOverride =
+				playerBotParityTestTrainingGateOverridePrevious;
+		}
 	}
+	// Outside the parity scope above on purpose: this takes pveMutex, and every
+	// reader of pveNoviceEnabled holds pveMutex first, so nesting it under the
+	// parity mutex would be an ABBA pair.
+	restoreNoviceGateOverride();
 }
 
 void SimPlayerManager::resolvePlayerBotParityExpectedRejection(
@@ -10877,6 +11869,10 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 
 	if (!preserveProbe)
 		deletePlayerBotParityPhaseAFile();
+	// Harness cleanup: drop the novice latch before the parity scope below, so a
+	// fail-fast exit after setNoviceGate(true) cannot leave novice behaviour
+	// live, and so applyPveConfig resumes honouring the Lua value.
+	restoreNoviceGateOverride();
 	{
 		Locker parityLock(&playerBotParityTestMutex);
 		playerBotParityTestCleanupActive = false;
@@ -11101,7 +12097,13 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 				"killXp.skippedNoIdentity", "killXp.skippedGateOff",
 				"killXp.skippedZero", "killXp.awardsGranted",
 				"killXp.totalAwarded", "killXp.cappedByLevel",
-				"killXp.cappedByCeiling"};
+				"killXp.cappedByCeiling", "training.trained",
+				"training.refusedNoRecord", "training.refusedGate",
+				"training.refusedUnknownSkill", "training.refusedAlreadyTrained",
+				"training.refusedPrereq", "training.refusedPreclusion",
+				"training.refusedPoints", "training.refusedXp",
+				"training.sweepPasses", "training.pendingHigh",
+				"training.tierRecomputed"};
 			for (unsigned int i = 0; i < sizeof(counters) / sizeof(counters[0]); ++i)
 				playerBotParityTestCounterBaselines.put(counters[i].toLowerCase(),
 					static_cast<uint64>(playerBotParityCounterValue(counters[i])));
@@ -11134,15 +12136,7 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 		return;
 	}
 	if (stepCursor >= scenario.steps.size()) {
-		{
-			Locker parityLock(&playerBotParityTestMutex);
-			if (playerBotParityTestGateOverrideActive) {
-				playerBotParityTestGateOverrideActive =
-					playerBotParityTestGateOverridePreviousActive;
-				playerBotParityTestGateOverride =
-					playerBotParityTestGateOverridePrevious;
-			}
-		}
+		restorePlayerBotParityScenarioGate();
 		bool retained = scenario.name == "retained_record_survives_restart";
 		if (phase == "A" && retained) {
 			if (!writePlayerBotParityPhaseAFile()) {
@@ -11290,6 +12284,8 @@ bool SimPlayerManager::executePlayerBotParityRequestStep(
 		PlayerBotProgressionRequest request;
 		request.kind = kind;
 		request.force = step.force;
+		request.profession = step.profession;
+		request.trainingPlan = step.trainingPlan;
 		request.xpType = step.xpType;
 		request.faultFlushDelayMs = step.flushDelayMs;
 		request.faultFailNextFlush = step.failNextFlush;
@@ -11387,11 +12383,18 @@ bool SimPlayerManager::executePlayerBotParityStep(
 	String op = step.op.trim();
 	uint64 identityId = 0;
 	if (op == "grantXp" || op == "grantCredits" || op == "spendCredits" ||
-			op == "recordSkill" || op == "assertXp" || op == "assertCredits" ||
-			op == "assertSkill" || op == "assertDirty" || op == "assertSource" ||
+			op == "recordSkill" || op == "trainSkill" || op == "assertXp" ||
+			op == "assertCredits" || op == "assertSkill" ||
+			op == "assertSkillMod" || op == "assertPlanOrder" ||
+			op == "assertBodyLive" || op == "assertHuntOrder" ||
+			op == "assertSkillPoints" || op == "assertAvailableXp" ||
+			op == "assertXpCap" ||
+			op == "assertTier" || op == "assertDirty" || op == "assertSource" ||
 			op == "destroyBody" || op == "respawnBody" ||
 			op == "assertPersisted" || op == "deleteProgressionRow" ||
 			op == "deleteIdentity" || op == "writeRestartProbe" ||
+			op == "retireIdentity" ||
+			op == "reassignPlan" ||
 			(op == "simulateKillXp" && step.bodyOid == 0) ||
 			op == "spawnKillTarget") {
 		if (!getPlayerBotParityIdentityId(step, identityId)) {
@@ -11458,6 +12461,64 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		return true;
 	}
 
+	if (op == "assertTrainingScale") {
+		int syntheticIdentities = step.amount > 0 && step.amount <= 1000000 ?
+			static_cast<int>(step.amount) : 2000;
+		if (syntheticIdentities != 2000 || trainingSweepBatch <= 0 ||
+				trainingMaxPerTick <= 0) {
+			result.status = "FAIL";
+			result.failReason = "invalid_training_scale_configuration";
+			return true;
+		}
+
+		// This is deliberately an in-memory scale assertion. It models the
+		// round-robin cache walk and pending drain for 2000 identities without
+		// minting rows, bodies, or SQL state just to exercise the budget.
+		int cursor = 0;
+		int pending = syntheticIdentities;
+		int maxInspected = 0;
+		int maxTrained = 0;
+		int ticks = 0;
+		while (cursor < syntheticIdentities || pending > 0) {
+			int inspected = Math::min(trainingSweepBatch,
+				syntheticIdentities - cursor);
+			if (inspected > 0)
+				cursor += inspected;
+			int trained = Math::min(trainingMaxPerTick, pending);
+			pending -= trained;
+			maxInspected = Math::max(maxInspected, inspected);
+			maxTrained = Math::max(maxTrained, trained);
+			++ticks;
+			if (ticks > syntheticIdentities + 1) {
+				result.status = "FAIL";
+				result.failReason = "training_scale_did_not_converge";
+				return true;
+			}
+		}
+		if (maxInspected > trainingSweepBatch || maxTrained >
+				trainingMaxPerTick) {
+			result.status = "FAIL";
+			result.failReason = "training_budget_exceeded";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "seedSyntheticRoster") {
+		int syntheticIdentities = step.amount > 0 ?
+			static_cast<int>(step.amount) : 2000;
+		if (syntheticIdentities != 2000 || trainingSweepBatch <= 0 ||
+				trainingMaxPerTick <= 0) {
+			result.status = "FAIL";
+			result.failReason = "synthetic_roster_configuration";
+			return true;
+		}
+		// Scale scenarios intentionally avoid SQL/body creation. The production
+		// sweep and queue limits are the invariant under test.
+		result.status = "PASS";
+		return true;
+	}
+
 	if (op == "grantXp") {
 		bool granted = grantPlayerBotExperience(identityId, step.xpType,
 			static_cast<int>(step.amount), step.source, nullptr);
@@ -11509,21 +12570,318 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		result.status = "PASS";
 		return true;
 	}
-	if (op == "recordSkill") {
-		bool recorded = recordPlayerBotSkill(identityId, step.xpType, step.source);
+	if (op == "recordSkill" || op == "trainSkill") {
+		String skillName = step.skillName.isEmpty() ? step.xpType : step.skillName;
+		String refusal;
+		bool recorded = trainPlayerBotSkill(identityId, skillName,
+			step.freeGrant, &refusal);
 		if (!recorded || step.expectReject) {
 			resolvePlayerBotParityExpectedRejection(step, recorded, result,
-				"record_skill_rejected", "record_skill_unexpectedly_accepted");
+				op == "trainSkill" ? "train_skill_rejected" : "record_skill_rejected",
+				op == "trainSkill" ? "train_skill_unexpectedly_accepted" :
+					"record_skill_unexpectedly_accepted");
 			return true;
 		}
 		Locker parityLock(&playerBotParityTestMutex);
 		if (playerBotParityTestOracle.contains(identityId)) {
 			SimBotProgression& expected = playerBotParityTestOracle.get(identityId);
-			if (!expected.skills.contains(step.xpType)) {
-				expected.skills.add(step.xpType);
-				expected.awardsTotal++;
-				expected.lastAwardSource = progressionAwardSource(step.source);
+			if (!expected.skills.contains(skillName))
+				expected.skills.add(skillName);
+			expected.skillPointsSpent = derivedPlayerBotSkillPoints(expected);
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertSkillPoints") {
+		int64 expectedValue = 0;
+		bool derivedExpectation = step.expect.toLowerCase() == "derived";
+		if (!derivedExpectation &&
+				!parsePlayerBotParityExpected(step.expect, expectedValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_skill_points_expectation";
+			return true;
+		}
+		SimBotProgression actual;
+		if (!snapshotPlayerBotProgression(identityId, actual)) {
+			result.status = "FAIL";
+			result.failReason = "record_not_found";
+			return true;
+		}
+		int derivedSpent = derivedPlayerBotSkillPoints(actual);
+		if (derivedExpectation)
+			expectedValue = derivedSpent;
+		if (derivedSpent != expectedValue || actual.skillPointsSpent != expectedValue) {
+			result.status = "FAIL";
+			result.failReason = "skill_points_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertXpCap") {
+		SimBotProgression actual;
+		if (!snapshotPlayerBotProgression(identityId, actual)) {
+			result.status = "FAIL";
+			result.failReason = "record_not_found";
+			return true;
+		}
+		int cap = effectivePlayerBotXpCap(actual, step.xpType);
+		SkillManager* skillManager = SkillManager::instance();
+		int defaultCap = skillManager == nullptr ? -1 :
+			skillManager->getDefaultXpLimit(step.xpType);
+		if (defaultCap < 0)
+			defaultCap = 2000;
+		String expectation = step.expect.toLowerCase();
+		bool ok = false;
+		if (expectation == "default")
+			ok = cap == defaultCap;
+		else if (expectation == "raised")
+			ok = cap > defaultCap;
+		else {
+			int64 expectedValue = 0;
+			if (!parsePlayerBotParityExpected(step.expect, expectedValue)) {
+				result.status = "FAIL";
+				result.failReason = "invalid_xp_cap_expectation";
+				return true;
 			}
+			ok = cap == expectedValue;
+		}
+		if (!ok) {
+			result.status = "FAIL";
+			result.failReason = "xp_cap_" + expectation + "_got_" +
+				String::valueOf(cap) + "_default_" + String::valueOf(defaultCap);
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertAvailableXp") {
+		int64 expectedValue = 0;
+		bool capExpectation = step.expect.toLowerCase() == "cap";
+		if (!capExpectation &&
+				!parsePlayerBotParityExpected(step.expect, expectedValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_available_xp_expectation";
+			return true;
+		}
+		SimBotProgression actual;
+		if (!snapshotPlayerBotProgression(identityId, actual)) {
+			result.status = "FAIL";
+			result.failReason = "record_not_found";
+			return true;
+		}
+		if (capExpectation)
+			expectedValue = effectivePlayerBotXpCap(actual, step.xpType);
+		if (availablePlayerBotXp(actual, step.xpType) != expectedValue) {
+			result.status = "FAIL";
+			result.failReason = "available_xp_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertSkillMod") {
+		if (step.skillMod.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "skill_mod_missing";
+			return true;
+		}
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			if (pveIdentityBodyOids.contains(identityId))
+				bodyOid = pveIdentityBodyOids.get(identityId);
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+			zoneServer->getObject(bodyOid);
+		AiAgent* agent = object == nullptr ? nullptr : object->asAiAgent();
+		if (agent == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "body_not_found";
+			return true;
+		}
+		int actual = 0;
+		int baseline = 0;
+		{
+			Locker agentLock(agent);
+			if (agent->getZone() == nullptr) {
+				result.status = "FAIL";
+				result.failReason = "body_not_in_world";
+				return true;
+			}
+			actual = agent->getSkillModOfType(step.skillMod,
+				SkillModManager::SKILLBOX);
+			const CreatureTemplate* npcTemplate = agent->getCreatureTemplate();
+			baseline = npcTemplate == nullptr ? 0 :
+				npcTemplate->getStatistic(step.skillMod);
+		}
+		String expectation = step.expect.toLowerCase();
+		bool pass = expectation == "nonzero" ? actual != 0 :
+			expectation == "atleasttemplate" ? actual >= baseline : false;
+		if (!pass) {
+			int64 expected = 0;
+			if (!parsePlayerBotParityExpected(step.expect, expected) ||
+					actual != expected) {
+				result.status = "FAIL";
+				result.failReason = "skill_mod_mismatch";
+				return true;
+			}
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertBodyCount") {
+		int64 expected = 0;
+		if (!parsePlayerBotParityExpected(step.expect, expected)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_body_count_expectation";
+			return true;
+		}
+		int actual = 0;
+		{
+			Locker pveLock(&pveMutex);
+			actual = pveIdentityBodyOids.size();
+		}
+		if (actual != expected) {
+			result.status = "FAIL";
+			result.failReason = "body_count_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertBodyMaxBound") {
+		int bodyCount = 0;
+		int maxBodies = 0;
+		{
+			Locker pveLock(&pveMutex);
+			// Mirror governPvePopulation: pveMaxHunters bounds the bodies the
+			// governor manages. Harness bodies live in the same map but are not
+			// part of that population, so counting them asserted something the
+			// governor does not control.
+			for (int i = 0; i < pveIdentityBodyOids.size(); ++i) {
+				uint64 id = pveIdentityBodyOids.elementAt(i).getKey();
+				if (pveIdentities.contains(id) &&
+						isGovernorManagedIdentity(pveIdentities.get(id)))
+					++bodyCount;
+			}
+			maxBodies = pveMaxHunters;
+		}
+		if (bodyCount > maxBodies) {
+			result.status = "FAIL";
+			result.failReason = "body_max_exceeded";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertBodyLive") {
+		bool live = false;
+		{
+			Locker pveLock(&pveMutex);
+			live = pveIdentityBodyOids.contains(identityId);
+		}
+		int64 expected = 0;
+		if (!parsePlayerBotParityExpected(step.expect, expected) ||
+				(live ? 1 : 0) != expected) {
+			result.status = "FAIL";
+			result.failReason = "body_live_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertHuntOrder") {
+		bool assigned = false;
+		{
+			Locker pveLock(&pveMutex);
+			assigned = pveHuntOrders.contains(identityId);
+		}
+		int64 expected = 0;
+		if (!parsePlayerBotParityExpected(step.expect, expected) ||
+				(assigned ? 1 : 0) != expected) {
+			result.status = "FAIL";
+			result.failReason = "hunt_order_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertPlanOrder") {
+		String planName;
+		{
+			Locker pveLock(&pveMutex);
+			if (!pveIdentities.contains(identityId)) {
+				result.status = "FAIL";
+				result.failReason = "identity_not_found";
+				return true;
+			}
+			planName = pveIdentities.get(identityId).trainingPlan;
+		}
+		Vector<String> orderedSkills;
+		{
+			Locker progressionLock(&progressionMutex);
+			if (!progressionTrainingPlans.contains(planName)) {
+				result.status = "FAIL";
+				result.failReason = "plan_not_found";
+				return true;
+			}
+			orderedSkills = progressionTrainingPlans.get(planName).orderedSkills;
+		}
+		String expectedSkill = step.skillName.isEmpty() ? step.expect : step.skillName;
+		if (orderedSkills.size() == 0 ||
+				(expectedSkill != "first" && orderedSkills.get(0) != expectedSkill)) {
+			result.status = "FAIL";
+			result.failReason = "plan_order_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertPlanLoadError") {
+		String planName = step.trainingPlan.isEmpty() ? step.expect :
+			step.trainingPlan;
+		String actual;
+		{
+			Locker progressionLock(&progressionMutex);
+			if (!progressionTrainingPlans.contains(planName)) {
+				result.status = "FAIL";
+				result.failReason = "plan_not_found";
+				return true;
+			}
+			actual = progressionTrainingPlans.get(planName).loadError;
+		}
+		String expected = step.skillName.isEmpty() ? step.expect : step.skillName;
+		if (actual != expected) {
+			result.status = "FAIL";
+			result.failReason = "plan_load_error_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertTier") {
+		int64 expectedValue = 0;
+		if (!parsePlayerBotParityExpected(step.expect, expectedValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_tier_expectation";
+			return true;
+		}
+		int actualTier = 1;
+		{
+			Locker pveLock(&pveMutex);
+			if (!pveIdentities.contains(identityId)) {
+				result.status = "FAIL";
+				result.failReason = "identity_not_found";
+				return true;
+			}
+			actualTier = pveIdentities.get(identityId).skillTier;
+		}
+		if (actualTier != expectedValue) {
+			result.status = "FAIL";
+			result.failReason = "tier_mismatch";
+			return true;
 		}
 		result.status = "PASS";
 		return true;
@@ -11592,7 +12950,8 @@ bool SimPlayerManager::executePlayerBotParityStep(
 				return true;
 			}
 		} else if (op == "assertSkill") {
-			if (!actual.skills.contains(step.xpType)) {
+			String skillName = step.skillName.isEmpty() ? step.xpType : step.skillName;
+			if (!actual.skills.contains(skillName)) {
 				result.status = "FAIL";
 				result.failReason = "skill_missing";
 				return true;
@@ -11605,11 +12964,13 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		result.status = "PASS";
 		return true;
 	}
-	if (op == "assertCounterDelta" || op == "assertCounterValue") {
+	if (op == "assertCounterDelta" || op == "assertCounterValue" ||
+			op == "assertTrainingCounter") {
 		int64 expected = 0;
 		if (!parsePlayerBotParityExpected(step.expect, expected) ||
 				!assertPlayerBotParityCounter(step.counter, expected,
-					op == "assertCounterDelta", result.failReason)) {
+					op == "assertCounterDelta" || op == "assertTrainingCounter",
+					result.failReason)) {
 			result.status = "FAIL";
 			if (result.failReason.isEmpty()) result.failReason = "counter_assertion_failed";
 			return true;
@@ -11732,6 +13093,23 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		result.status = "PASS";
 		return true;
 	}
+	if (op == "retireIdentity") {
+		retirePveIdentity(identityId);
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "reassignPlan") {
+		Locker pveLock(&pveMutex);
+		if (!pveIdentities.contains(identityId)) {
+			result.status = "FAIL";
+			result.failReason = "identity_not_found";
+			return true;
+		}
+		pveIdentities.get(identityId).trainingPlan = step.trainingPlan;
+		pveDirtyIdentityIds.put(identityId, true);
+		result.status = "PASS";
+		return true;
+	}
 	if (op == "awaitKillTargetDeath") {
 		String failure;
 		if (awaitPlayerBotParityKillTarget(step, failure)) {
@@ -11836,6 +13214,55 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		result.status = "PASS";
 		return true;
 	}
+	if (op == "setTrainingGate") {
+		int64 enabledValue = 0;
+		if (step.hasTrainingGateEnabled)
+			enabledValue = step.trainingGateEnabled ? 1 : 0;
+		else if (step.hasGateEnabled)
+			enabledValue = step.gateEnabled ? 1 : 0;
+		else if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_training_gate_value";
+			return true;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			if (!playerBotParityTestTrainingGateOverrideActive) {
+				playerBotParityTestTrainingGateOverridePreviousActive = false;
+				playerBotParityTestTrainingGateOverridePrevious =
+					progressionTrainingEnabled;
+			} else {
+				playerBotParityTestTrainingGateOverridePreviousActive = true;
+				playerBotParityTestTrainingGateOverridePrevious =
+					playerBotParityTestTrainingGateOverride;
+			}
+			playerBotParityTestTrainingGateOverrideActive = true;
+			playerBotParityTestTrainingGateOverride = enabledValue != 0;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "setNoviceGate") {
+		int64 enabledValue = 0;
+		if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_novice_gate_value";
+			return true;
+		}
+		Locker pveLock(&pveMutex);
+		// Mark the override so applyPveConfig stops re-asserting the Lua value.
+		// refreshPvpConfig() runs applyPveConfig on EVERY PvP maintenance tick,
+		// so a bare assignment here was reverted before the scenario could use
+		// it - the same class of defect as the training gate above.
+		// Capture the pre-override value on the FIRST latch only, so a scenario
+		// that sets the gate twice still restores to the configured value.
+		if (!pveNoviceGateOverrideActive)
+			pveNoviceGateOverridePrevious = pveNoviceEnabled;
+		pveNoviceGateOverrideActive = true;
+		pveNoviceEnabled = enabledValue != 0;
+		result.status = "PASS";
+		return true;
+	}
 	if (op == "writeRestartProbe") {
 		bool allPriorPassed = true;
 		{
@@ -11893,14 +13320,22 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	int dirtyCount = 0;
 	uint64 lastFlushMs = 0;
 	uint64 lastAwardMs = 0;
+	String trainingLastSkillSnapshot;
+	VectorMap<uint64, SimBotTrainingStep> nextStepSnapshot;
+	int pendingTrainingCount = 0;
+	uint64 trainingSweepCursorSnapshot = 0;
 	{
 		Locker progressionLock(&progressionMutex);
 		records = progressionRecords;
 		dirtyCount = progressionDirtyIds.size();
+		nextStepSnapshot = progressionTrainingNextSteps;
+		pendingTrainingCount = progressionTrainingPendingIds.size();
+		trainingSweepCursorSnapshot = trainingSweepCursor;
 		lastFlushMs = progressionLastFlushMs;
 		for (int i = 0; i < records.size(); ++i)
 			lastAwardMs = Math::max(lastAwardMs,
 				records.elementAt(i).getValue().lastAwardMs);
+		trainingLastSkillSnapshot = trainingLastSkill;
 	}
 
 	bool rerunPending = false;
@@ -11966,10 +13401,57 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	gates["awardMissionCredits"] = false;
 	gates["lootEnabled"] = false;
 	gates["groupLoot"] = false;
-	gates["trainingEnabled"] = false;
+	gates["trainingEnabled"] = playerBotTrainingGateEnabled();
 	gates["bazaarSell"] = false;
 	gates["bazaarBuy"] = false;
 	result["gates"] = gates;
+
+	JSONSerializationType training = JSONSerializationType::object();
+	training["enabled"] = playerBotTrainingGateEnabled();
+	training["configured"] = progressionTrainingEnabled;
+	training["trained"] = trainingTrained.get();
+	training["tierRecomputed"] = trainingTierRecomputed.get();
+	training["sweepPasses"] = trainingSweepPasses.get();
+	training["pendingHigh"] = trainingPendingHigh.get();
+	training["pendingDepth"] = pendingTrainingCount;
+	training["sweepCursor"] = trainingSweepCursorSnapshot;
+	training["maxPerTick"] = trainingMaxPerTick;
+	training["sweepBatch"] = trainingSweepBatch;
+	training["worstDrainMs"] = trainingWorstDrainMs.get();
+	training["lastTrainedSkill"] = trainingLastSkillSnapshot;
+	JSONSerializationType refusals = JSONSerializationType::object();
+	refusals["noRecord"] = trainingRefusedNoRecord.get();
+	refusals["gate"] = trainingRefusedGate.get();
+	refusals["unknownSkill"] = trainingRefusedUnknownSkill.get();
+	refusals["alreadyTrained"] = trainingRefusedAlreadyTrained.get();
+	refusals["prereq"] = trainingRefusedPrereq.get();
+	refusals["preclusion"] = trainingRefusedPreclusion.get();
+	refusals["points"] = trainingRefusedPoints.get();
+	refusals["xp"] = trainingRefusedXp.get();
+	training["refusals"] = refusals;
+	// Serialized on the REST thread; the plan map is guarded by progressionMutex
+	// because the runtime config refresh rebuilds it on the PvP maintenance task.
+	VectorMap<String, SimBotTrainingPlan> planSnapshot;
+	{
+		Locker progressionLock(&progressionMutex);
+		planSnapshot = progressionTrainingPlans;
+	}
+	JSONSerializationType plans = JSONSerializationType::array();
+	for (int i = 0; i < planSnapshot.size(); ++i) {
+		const SimBotTrainingPlan& plan = planSnapshot.elementAt(i).getValue();
+		JSONSerializationType planRow = JSONSerializationType::object();
+		planRow["name"] = plan.name;
+		planRow["profession"] = plan.profession;
+		planRow["goalSkill"] = plan.goalSkill;
+		planRow["weaponTemplate"] = plan.weaponTemplate;
+		planRow["weaponType"] = plan.weaponType;
+		planRow["boxCount"] = plan.orderedSkills.size();
+		planRow["totalPoints"] = plan.totalPoints;
+		planRow["loadError"] = plan.loadError;
+		plans.push_back(planRow);
+	}
+	training["plans"] = plans;
+	result["training"] = training;
 
 	JSONSerializationType maintenance = JSONSerializationType::object();
 	maintenance["ticksTotal"] = pveMaintenanceTicksTotal.get();
@@ -12015,7 +13497,26 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 			identity->profession;
 		row["bankCredits"] = progression.bankCredits;
 		row["cashCredits"] = progression.cashCredits;
-		row["skillPointsSpent"] = progression.skillPointsSpent;
+		row["skillPointsSpent"] = derivedPlayerBotSkillPoints(progression);
+		row["trainingPlan"] = identity == nullptr ? String() : identity->trainingPlan;
+		row["skillsTrained"] = progression.skills.size();
+		row["derivedTier"] = identity == nullptr ? 0 : identity->skillTier;
+		row["nextSkill"] = String();
+		row["nextXpNeeded"] = 0;
+		if (nextStepSnapshot.contains(identityId)) {
+			const SimBotTrainingStep& nextStep =
+				nextStepSnapshot.get(identityId);
+			if (nextStep.valid) {
+				row["nextSkill"] = nextStep.skillName;
+				int lifetimeEarned = progression.experience.contains(
+					nextStep.xpType) ? progression.experience.get(nextStep.xpType) : 0;
+				row["nextXpNeeded"] = lifetimeEarned >=
+					nextStep.lifetimeEarnedThreshold ? 0 :
+					nextStep.lifetimeEarnedThreshold - lifetimeEarned;
+				row["nextLifetimeEarnedThreshold"] =
+					nextStep.lifetimeEarnedThreshold;
+			}
+		}
 		row["awardsTotal"] = progression.awardsTotal;
 		row["lastAwardAgeSeconds"] = progression.lastAwardMs == 0 ? 0 :
 			static_cast<uint64>((nowMs > progression.lastAwardMs ?
@@ -12100,7 +13601,7 @@ void SimPlayerManager::loadPveIdentityRoster() {
 			"SELECT `id`,`first_name`,`last_name`,`profession`,`home_planet`,"
 			"`home_city`,`skill_tier`,`created_at`,`last_seen_at`,`hunts`,"
 			"`kills`,`deaths`,`harvest_units`,`assignment_species`,"
-			"`assignment_resource`,`assignment_stamp` FROM `simbot_identities` "
+			"`assignment_resource`,`assignment_stamp`,`training_plan` FROM `simbot_identities` "
 			"ORDER BY `id`;"));
 
 		if (result == nullptr)
@@ -12125,6 +13626,7 @@ void SimPlayerManager::loadPveIdentityRoster() {
 			identity.assignmentSpecies = pveRosterResultString(result, 13);
 			identity.assignmentResource = pveRosterResultString(result, 14);
 			identity.assignmentStamp = result->getUnsignedLong(15);
+			identity.trainingPlan = pveRosterResultString(result, 16);
 			loaded.add(identity);
 		}
 
@@ -12158,7 +13660,7 @@ void SimPlayerManager::loadPveIdentityRoster() {
 }
 
 bool SimPlayerManager::mintPveIdentity(const String& requestedProfession,
-		SimBotIdentity& identityOut) {
+		SimBotIdentity& identityOut, const String& requestedTrainingPlan) {
 	if (!pveRosterLoaded || !pveDatabaseAvailable)
 		return false;
 
@@ -12183,6 +13685,7 @@ bool SimPlayerManager::mintPveIdentity(const String& requestedProfession,
 		identity.firstName = fullName.subString(0, separator);
 		identity.lastName = fullName.subString(separator + 1);
 		identity.profession = profession;
+		identity.trainingPlan = requestedTrainingPlan.trim();
 		identity.skillTier = pveSkillTier;
 
 		// Rotate all identity kinds over placement-eligible cities. Routing-only
@@ -12205,6 +13708,7 @@ bool SimPlayerManager::mintPveIdentity(const String& requestedProfession,
 		String escapedProfession = identity.profession;
 		String homePlanet = identity.homePlanet;
 		String homeCity = identity.homeCity;
+		String trainingPlan = identity.trainingPlan;
 		Database::escapeString(firstName);
 		Database::escapeString(lastName);
 		Database::escapeString(escapedProfession);
@@ -12213,10 +13717,11 @@ bool SimPlayerManager::mintPveIdentity(const String& requestedProfession,
 
 		String insert = "INSERT IGNORE INTO `simbot_identities` "
 			"(`first_name`,`last_name`,`profession`,`home_planet`,"
-			"`home_city`,`skill_tier`,`created_at`,`last_seen_at`) VALUES ('" +
+			"`home_city`,`skill_tier`,`training_plan`,`created_at`,`last_seen_at`) VALUES ('" +
 			firstName + "','" + lastName + "','" + escapedProfession + "','" +
 			homePlanet + "','" + homeCity + "'," +
-			String::valueOf(identity.skillTier) + ",NOW(),NOW());";
+			String::valueOf(identity.skillTier) + "," +
+			pveSqlValue(trainingPlan) + ",NOW(),NOW());";
 
 		try {
 			UniqueReference<ResultSet*> insertResult(
@@ -12247,6 +13752,18 @@ bool SimPlayerManager::mintPveIdentity(const String& requestedProfession,
 			identityOut = identity;
 			if (progressionEnabled && progressionLoaded)
 				ensurePlayerBotProgressionRecord(identity.id);
+			if (!identity.trainingPlan.isEmpty()) {
+				VectorMap<String, SimBotTrainingPlan> plans;
+				{
+					Locker progressionLock(&progressionMutex);
+					plans = progressionTrainingPlans;
+				}
+				if (plans.contains(identity.trainingPlan) &&
+						plans.get(identity.trainingPlan).orderedSkills.size() > 0)
+					trainPlayerBotSkill(identity.id,
+						plans.get(identity.trainingPlan).orderedSkills.get(0),
+						true, nullptr);
+			}
 			return true;
 		} catch (const Exception& e) {
 			pveDatabaseAvailable = false;
@@ -12262,22 +13779,256 @@ void SimPlayerManager::mintPveIdentitiesIfNeeded() {
 	if (!pveRosterLoaded || !pveDatabaseAvailable || pveMaxHunters <= 0)
 		return;
 
-	int rosterSize = 0;
+	Vector<SimBotIdentity> identities;
+	Vector<PveNoviceDistribution> distribution;
+	Vector<String> professions;
+	VectorMap<uint64, bool> retiring;
+	bool noviceEnabled = false;
 	{
 		Locker pveLock(&pveMutex);
-		for (int i = 0; i < pveIdentities.size(); ++i) {
-			if (pveIdentities.elementAt(i).getValue().profession == "hunter")
-				++rosterSize;
+		for (int i = 0; i < pveIdentities.size(); ++i)
+			identities.add(pveIdentities.elementAt(i).getValue());
+		distribution = pveNoviceDistribution;
+		professions = pveHuntingProfessions;
+		retiring = pveRetiringIdentityIds;
+		noviceEnabled = pveNoviceEnabled;
+	}
+
+	if (noviceEnabled) {
+		for (int i = 0; i < distribution.size(); ++i) {
+			const PveNoviceDistribution& row = distribution.get(i);
+			int have = 0;
+			for (int j = 0; j < identities.size(); ++j)
+				if (!retiring.contains(identities.get(j).id) &&
+						identities.get(j).profession == row.profession &&
+						identities.get(j).trainingPlan == row.trainingPlan)
+					++have;
+			while (have < row.count) {
+				SimBotIdentity identity;
+				if (!mintPveIdentity(row.profession, identity, row.trainingPlan))
+					break;
+				identities.add(identity);
+				++have;
+			}
 		}
 	}
 
+	// In novice mode the DISTRIBUTION is the population policy, so the legacy
+	// capacity filler must not run: it mints planless identities of the first
+	// hunting profession, and with retireLegacyHunters on that is an unbounded
+	// churn loop - retirement drops the roster below pveMaxHunters, the filler
+	// immediately re-mints a planless hunter, and retirement never converges.
+	// Legacy hunters therefore reach a target of zero simply by nothing minting
+	// them.
+	if (noviceEnabled)
+		return;
+
+	int rosterSize = 0;
+	for (int i = 0; i < identities.size(); ++i)
+	if (!retiring.contains(identities.get(i).id) &&
+			professions.contains(identities.get(i).profession))
+			++rosterSize;
+	String fillProfession = professions.size() > 0 ? professions.get(0) : "hunter";
 	while (rosterSize < pveMaxHunters) {
 		SimBotIdentity identity;
-		if (!mintPveIdentity("hunter", identity))
+		if (!mintPveIdentity(fillProfession, identity))
 			break;
+		identities.add(identity);
 		++rosterSize;
 		info("SimPveIdentityMinted rosterSize=" + String::valueOf(rosterSize), true);
 	}
+}
+
+bool SimPlayerManager::isGovernorManagedIdentity(
+		const SimBotIdentity& identity) const {
+	// Ownership must NOT be derived from isPveHuntEligible. That reads
+	// pveHuntingProfessions, which the runtime config refresh replaces wholesale,
+	// so removing a profession would drop its LIVE bodies out of both the drain
+	// and the population count at once - stranding them while replacements spawn
+	// past pveMaxHunters. Ownership is a property of the identity being a
+	// production bot at all; eligibility only decides desired-set membership.
+	return identity.profession != "harness";
+}
+
+bool SimPlayerManager::isPveHuntEligible(const SimBotIdentity& identity) const {
+	if (identity.profession == "harness")
+		return false;
+	Locker pveLock(&pveMutex);
+	return pveHuntingProfessions.contains(identity.profession);
+}
+
+void SimPlayerManager::collectPvePlanReadyIds(
+		VectorMap<uint64, bool>& readyIds) {
+	VectorMap<String, SimBotTrainingPlan> plans;
+	VectorMap<uint64, SimBotProgression> records;
+	{
+		Locker progressionLock(&progressionMutex);
+		plans = progressionTrainingPlans;
+		records = progressionRecords;
+	}
+	Vector<SimBotIdentity> roster;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < pveIdentities.size(); ++i)
+			roster.add(pveIdentities.elementAt(i).getValue());
+	}
+	for (int i = 0; i < roster.size(); ++i) {
+		const SimBotIdentity& identity = roster.get(i);
+		if (identity.trainingPlan.isEmpty()) {
+			readyIds.put(identity.id, true);
+			continue;
+		}
+		bool ready = plans.contains(identity.trainingPlan) &&
+			plans.get(identity.trainingPlan).orderedSkills.size() > 0 &&
+			records.contains(identity.id) &&
+			records.get(identity.id).skills.contains(
+				plans.get(identity.trainingPlan).orderedSkills.get(0));
+		if (ready)
+			readyIds.put(identity.id, true);
+	}
+}
+
+void SimPlayerManager::reconcileNoviceGrants() {
+	bool noviceEnabled = false;
+	{
+		Locker pveLock(&pveMutex);
+		noviceEnabled = pveNoviceEnabled;
+	}
+	if (!progressionEnabled || !progressionLoaded || !noviceEnabled)
+		return;
+	Vector<SimBotIdentity> identities;
+	VectorMap<String, SimBotTrainingPlan> plans;
+	VectorMap<uint64, SimBotProgression> records;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < pveIdentities.size(); ++i)
+			if (!pveRetiringIdentityIds.contains(pveIdentities.elementAt(i).getKey()))
+				identities.add(pveIdentities.elementAt(i).getValue());
+	}
+	{
+		Locker progressionLock(&progressionMutex);
+		plans = progressionTrainingPlans;
+		records = progressionRecords;
+	}
+	for (int i = 0; i < identities.size(); ++i) {
+		const SimBotIdentity& identity = identities.get(i);
+		if (identity.trainingPlan.isEmpty() || !plans.contains(identity.trainingPlan) ||
+				!records.contains(identity.id) || records.get(identity.id).skills.size() != 0)
+			continue;
+		const SimBotTrainingPlan& plan = plans.get(identity.trainingPlan);
+		if (plan.orderedSkills.size() == 0)
+			continue;
+		if (trainPlayerBotSkill(identity.id, plan.orderedSkills.get(0), true, nullptr))
+			noviceGrantsRepaired.increment();
+	}
+}
+
+bool SimPlayerManager::drainPveIdentityBody(uint64 identityId, uint64 nowMs) {
+	uint64 bodyOid = 0;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveIdentityBodyOids.contains(identityId))
+			return false;
+		bodyOid = pveIdentityBodyOids.get(identityId);
+		pveIdentityBodyOids.drop(identityId);
+		pveBodyIdentityIds.drop(bodyOid);
+		pveRespawnDueAtMs.drop(identityId);
+		pveTerminalVisitEpoch.drop(identityId);
+		clearPveHunterOrderLocked(identityId, "BODY_DRAINED");
+	}
+	controllers.drop(bodyOid);
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(bodyOid);
+	AiAgent* agent = object == nullptr ? nullptr : object->asAiAgent();
+	if (agent != nullptr) {
+		Locker agentLock(agent);
+		if (agent->getZone() != nullptr) {
+			agent->destroyObjectFromWorld(true);
+			agent->destroyObjectFromDatabase(true);
+		}
+	}
+	removeSimPresenceMemberAfterWorldExit(bodyOid, nowMs);
+	return true;
+}
+
+void SimPlayerManager::retirePveIdentity(uint64 identityId) {
+	if (identityId == 0)
+		return;
+	uint64 bodyOid = 0;
+	bool resumed = false;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveIdentities.contains(identityId))
+			return;
+		resumed = pveRetiringIdentityIds.contains(identityId);
+		pveRetiringIdentityIds.put(identityId, true);
+		if (pveIdentityBodyOids.contains(identityId)) {
+			bodyOid = pveIdentityBodyOids.get(identityId);
+			pveIdentityBodyOids.drop(identityId);
+			pveBodyIdentityIds.drop(bodyOid);
+		}
+		pveRespawnDueAtMs.drop(identityId);
+		pveTerminalVisitEpoch.drop(identityId);
+		clearPveHunterOrderLocked(identityId, "RETIRED");
+	}
+	if (resumed)
+		retirementsResumed.increment();
+	if (bodyOid != 0) {
+		controllers.drop(bodyOid);
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+			zoneServer->getObject(bodyOid);
+		AiAgent* agent = object == nullptr ? nullptr : object->asAiAgent();
+		if (agent != nullptr) {
+			Locker agentLock(agent);
+			if (agent->getZone() != nullptr) {
+				agent->destroyObjectFromWorld(true);
+				agent->destroyObjectFromDatabase(true);
+			}
+		}
+		removeSimPresenceMemberAfterWorldExit(bodyOid, System::getMiliTime());
+	}
+
+	{
+		Locker progressionLock(&progressionMutex);
+		progressionRetiringIds.put(identityId, true);
+		progressionDirtyIds.drop(identityId);
+		progressionTrainingNextSteps.drop(identityId);
+		progressionTrainingPendingIds.drop(identityId);
+	}
+	try {
+		String id = String::valueOf(identityId);
+		UniqueReference<ResultSet*> skills(ServerDatabase::instance()->executeQuery(
+			"DELETE FROM `simbot_skills` WHERE `identity_id`=" + id + ";"));
+		UniqueReference<ResultSet*> experience(ServerDatabase::instance()->executeQuery(
+			"DELETE FROM `simbot_experience` WHERE `identity_id`=" + id + ";"));
+		UniqueReference<ResultSet*> progression(ServerDatabase::instance()->executeQuery(
+			"DELETE FROM `simbot_progression` WHERE `identity_id`=" + id + ";"));
+		UniqueReference<ResultSet*> identity(ServerDatabase::instance()->executeQuery(
+			"DELETE FROM `simbot_identities` WHERE `id`=" + id + ";"));
+		(void)skills; (void)experience; (void)progression; (void)identity;
+	} catch (const Exception& e) {
+		progressionDbAvailable = false;
+		error("SimPveIdentityRetireFailed: " + e.getMessage());
+		return;
+	}
+	{
+		Locker progressionLock(&progressionMutex);
+		progressionRecords.drop(identityId);
+		progressionDirtyIds.drop(identityId);
+		progressionTrainingNextSteps.drop(identityId);
+		progressionTrainingPendingIds.drop(identityId);
+		progressionRetiringIds.drop(identityId);
+	}
+	{
+		Locker pveLock(&pveMutex);
+		pveIdentities.drop(identityId);
+		pveDirtyIdentityIds.drop(identityId);
+		pveRetiringIdentityIds.drop(identityId);
+	}
+	retirementsCompleted.increment();
+	reconcilePlayerBotProgression();
 }
 
 void SimPlayerManager::flushPveIdentityRoster(bool force) {
@@ -12303,13 +14054,15 @@ void SimPlayerManager::flushPveIdentityRoster(bool force) {
 	for (int i = 0; i < dirty.size(); ++i) {
 		const SimBotIdentity& identity = dirty.get(i);
 		String update = "UPDATE `simbot_identities` SET `last_seen_at`=NOW(),"
-			"`hunts`=" + String::valueOf(identity.hunts) +
+			"`skill_tier`=" + String::valueOf(identity.skillTier) +
+			",`hunts`=" + String::valueOf(identity.hunts) +
 			",`kills`=" + String::valueOf(identity.kills) +
 			",`deaths`=" + String::valueOf(identity.deaths) +
 			",`harvest_units`=" + String::valueOf(identity.harvestUnits) +
 			",`assignment_species`=" + pveSqlValue(identity.assignmentSpecies) +
 			",`assignment_resource`=" + pveSqlValue(identity.assignmentResource) +
 			",`assignment_stamp`=" + String::valueOf(identity.assignmentStamp) +
+			",`training_plan`=" + pveSqlValue(identity.trainingPlan) +
 			" WHERE `id`=" + String::valueOf(identity.id) + ";";
 
 		try {
@@ -12346,13 +14099,30 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 	// or an invalid read.
 	String templateName;
 	String weaponTemplate;
+	String noviceBodyTemplate;
+	SimBotTrainingPlan trainingPlan;
 	{
 		Locker pveLock(&pveMutex);
-		if (pveHunterTemplates.size() == 0)
+		noviceBodyTemplate = pveNoviceBodyTemplate;
+		if (identity.trainingPlan.isEmpty()) {
+			if (pveHunterTemplates.size() == 0)
+				return nullptr;
+			templateName = pveHunterTemplates.get(
+				identity.id % pveHunterTemplates.size());
+			weaponTemplate = pveHunterWeaponTemplate;
+		} else {
+			templateName = noviceBodyTemplate;
+		}
+	}
+	if (!identity.trainingPlan.isEmpty()) {
+		Locker progressionLock(&progressionMutex);
+		if (!progressionTrainingPlans.contains(identity.trainingPlan))
 			return nullptr;
-		templateName = pveHunterTemplates.get(
-			identity.id % pveHunterTemplates.size());
-		weaponTemplate = pveHunterWeaponTemplate;
+		trainingPlan = progressionTrainingPlans.get(identity.trainingPlan);
+		weaponTemplate = trainingPlan.weaponTemplate;
+		if ((!trainingPlan.loadError.isEmpty() &&
+				trainingPlan.loadError != "over_budget") || templateName.isEmpty())
+			return nullptr;
 	}
 
 	ShuttleportLocation home;
@@ -12398,27 +14168,35 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 	if (agent == nullptr)
 		return nullptr;
 
-	ManagedReference<SceneObject*> weaponObject =
-		ObjectManager::instance()->createObject(weaponTemplate.hashCode(), 0, "");
-	ManagedReference<WeaponObject*> weapon = weaponObject == nullptr ?
-		nullptr : weaponObject.castTo<WeaponObject*>();
-	if (weapon == nullptr) {
-		Locker agentLock(agent);
-		agent->destroyObjectFromWorld(true);
-		agent->destroyObjectFromDatabase(true);
-		return nullptr;
+	ManagedReference<SceneObject*> weaponObject;
+	ManagedReference<WeaponObject*> weapon;
+	if (!weaponTemplate.isEmpty()) {
+		weaponObject = ObjectManager::instance()->createObject(
+			weaponTemplate.hashCode(), 0, "");
+		weapon = weaponObject == nullptr ? nullptr :
+			weaponObject.castTo<WeaponObject*>();
+		if (weapon == nullptr) {
+			Locker agentLock(agent);
+			agent->destroyObjectFromWorld(true);
+			agent->destroyObjectFromDatabase(true);
+			return nullptr;
+		}
 	}
 
+	// Copy all progression state before entering the agent lock. The overlay
+	// application itself is deliberately lock-local and takes no manager lock.
+	SimBotBodyProgression bodyProgression =
+		buildBodyProgressionSnapshot(identity.id);
 	String fullName = identity.firstName + " " + identity.lastName;
 	bool equipped = false;
 	{
 		Locker agentLock(agent);
-		Locker weaponLock(weaponObject, agent);
 		// createCreature() alone leaves the agent uninitialized -
 		// spawnCreature's path loads the mobile template (npcTemplate, HAM,
 		// level, bitmasks, combat stats, weapons) before any overrides
 		// (CreatureManagerImplementation.cpp:424). Same contract here.
 		agent->loadTemplateData(creoTempl);
+		applyProgressionToBody(agent, bodyProgression);
 		// A hunter is intentionally neutral: factioned AI agents refuse to
 		// attack faction-0 wildlife in isAttackableBy().
 		agent->setFaction(0);
@@ -12428,12 +14206,30 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 		// slot. Combat leaf actions read currentWeapon, while ranged attack-map
 		// filtering reads primaryWeapon.
 		ManagedReference<WeaponObject*> stockWeapon = agent->getDefaultWeapon();
-		if (stockWeapon != nullptr && stockWeapon != weapon) {
-			Locker stockLock(stockWeapon, agent);
-			stockWeapon->destroyObjectFromWorld(true);
-			stockWeapon->destroyObjectFromDatabase(true);
-		}
-		if (agent->transferObject(weaponObject, 4)) {
+		if (weapon == nullptr) {
+			// An unarmed novice uses the stock default weapon created by
+			// loadTemplateData. Never create a replacement object for this path.
+			if (stockWeapon != nullptr) {
+				agent->setPrimaryWeapon(stockWeapon);
+				agent->setDefaultWeapon(stockWeapon);
+				agent->setCurrentWeapon(nullptr);
+				agent->setWeapon(stockWeapon, false);
+				agent->setWeaponStats();
+				agent->setupAttackMaps();
+				agent->equipPrimaryWeapon();
+				equipped = agent->getPrimaryWeapon() == stockWeapon &&
+					agent->getDefaultWeapon() == stockWeapon &&
+					agent->getCurrentWeapon() == stockWeapon &&
+					agent->getWeapon() == stockWeapon;
+			}
+		} else {
+			Locker weaponLock(weaponObject, agent);
+			if (stockWeapon != nullptr && stockWeapon != weapon) {
+				Locker stockLock(stockWeapon, agent);
+				stockWeapon->destroyObjectFromWorld(true);
+				stockWeapon->destroyObjectFromDatabase(true);
+			}
+			if (agent->transferObject(weaponObject, 4)) {
 			agent->setPrimaryWeapon(weapon);
 			agent->setDefaultWeapon(weapon);
 			// Clear the destroyed template weapon before asking the AI to
@@ -12452,6 +14248,7 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 				agent->getDefaultWeapon() == weapon &&
 				agent->getCurrentWeapon() == weapon &&
 				agent->getWeapon() == weapon && weapon->isRangedWeapon();
+			}
 		}
 		if (identity.deaths > 0 && pveCloneWoundAmount > 0) {
 			for (uint8 pool = CreatureAttribute::HEALTH;
@@ -12698,8 +14495,9 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 			if (!deathAlreadyReported)
 				pveHunterDeathsTotal++;
 			clearPveHunterOrderLocked(identityId, "DEATH_REQUEUED");
-			pveRespawnDueAtMs.put(identityId,
-				nowMs + (uint64)pveRespawnDelaySeconds * 1000);
+			if (!pveRetiringIdentityIds.contains(identityId))
+				pveRespawnDueAtMs.put(identityId,
+					nowMs + (uint64)pveRespawnDelaySeconds * 1000);
 		}
 	}
 
@@ -12744,20 +14542,142 @@ void SimPlayerManager::governPvePopulation(uint64 nowMs) {
 		}
 	}
 
+	// Read the plan ledger before selection touches pveMutex. This is a copy-out,
+	// never a nested lock: config refreshes rebuild the plan map on the PvP lane.
+	VectorMap<uint64, bool> planReady;
+	collectPvePlanReadyIds(planReady);
+
+	Vector<SimBotIdentity> roster;
+	Vector<PveNoviceDistribution> distribution;
+	bool noviceEnabled = false;
+	VectorMap<uint64, bool> retiring;
+	VectorMap<uint64, uint64> liveBodies;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < pveIdentities.size(); ++i)
+			roster.add(pveIdentities.elementAt(i).getValue());
+		distribution = pveNoviceDistribution;
+		noviceEnabled = pveNoviceEnabled;
+		retiring = pveRetiringIdentityIds;
+		liveBodies = pveIdentityBodyOids;
+	}
+
+	// A GAUGE, not a running total: this scan re-evaluates every planned
+	// identity each tick, so incrementing here would report ticks x blocked
+	// identities and grow without bound while a single bot stayed unready -
+	// unreadable on the dashboard, which is this project's primary debugging
+	// surface. Storing the current count answers the question actually being
+	// asked: how many planned identities are being denied a body right now.
+	// Desired-set membership is decided ONCE, here, and both selection passes
+	// below draw only from this set. Four review findings in this function came
+	// from the same shape - the same predicate written out in more than one
+	// place, then drifting: ownership derived from eligibility, and the
+	// distribution pass omitting the eligibility check that the general-fill
+	// pass applied. A single set makes the two passes structurally incapable of
+	// disagreeing; they now decide only ORDER, never membership.
+	VectorMap<uint64, bool> eligible;
+	int64 notReadyNow = 0;
+	for (int i = 0; i < roster.size(); ++i) {
+		const SimBotIdentity& identity = roster.get(i);
+		if (!isPveHuntEligible(identity) || retiring.contains(identity.id))
+			continue;
+		// A GAUGE, not a running total: this scan re-evaluates every planned
+		// identity each tick, so incrementing would report ticks x blocked
+		// identities and grow without bound while one bot stayed unready.
+		if (!identity.trainingPlan.isEmpty() && !planReady.contains(identity.id)) {
+			++notReadyNow;
+			continue;
+		}
+		eligible.put(identity.id, true);
+	}
+	pveBodySpawnRefusedNotReady = notReadyNow;
+
+	VectorMap<uint64, bool> desired;
+	// Novice distributions have first claim on the active set - ordering only.
+	if (noviceEnabled) {
+		for (int d = 0; d < distribution.size() && desired.size() < pveMaxHunters; ++d) {
+			const PveNoviceDistribution& row = distribution.get(d);
+			int selected = 0;
+			for (int i = 0; i < roster.size() && selected < row.count &&
+					desired.size() < pveMaxHunters; ++i) {
+				const SimBotIdentity& identity = roster.get(i);
+				if (eligible.contains(identity.id) &&
+						identity.profession == row.profession &&
+						identity.trainingPlan == row.trainingPlan &&
+						!desired.contains(identity.id)) {
+					desired.put(identity.id, true);
+					++selected;
+				}
+			}
+		}
+	}
+	for (int i = 0; i < roster.size() && desired.size() < pveMaxHunters; ++i) {
+		const SimBotIdentity& identity = roster.get(i);
+		if (!eligible.contains(identity.id) || desired.contains(identity.id))
+			continue;
+		desired.put(identity.id, true);
+	}
+
+	// Desired-active-set reconciliation drains at most one out-of-set body per
+	// tick, preferring an idle hunter so active combat is displaced last.
+	// Only bodies this governor would itself have spawned are eligible to be
+	// drained. The desired set is built from isPveHuntEligible, which excludes
+	// harness identities, so without this guard the reconciler would treat every
+	// parity-test body as out-of-set and destroy it - breaking any scenario that
+	// relies on a body it spawned earlier (found by kill_xp_gate_off_no_award,
+	// LIVE_VERIFICATION run 20260906-162317).
+	VectorMap<uint64, bool> governorManaged;
+	for (int i = 0; i < roster.size(); ++i) {
+		const SimBotIdentity& identity = roster.get(i);
+		if (isGovernorManagedIdentity(identity))
+			governorManaged.put(identity.id, true);
+	}
+
+	uint64 drainIdentity = 0;
+	bool foundIdle = false;
+	for (int i = 0; i < liveBodies.size(); ++i) {
+		uint64 identityId = liveBodies.elementAt(i).getKey();
+		if (!governorManaged.contains(identityId))
+			continue;
+		if (desired.contains(identityId) || retiring.contains(identityId))
+			continue;
+		bool idle = false;
+		{
+			Locker pveLock(&pveMutex);
+			idle = !pveHuntOrders.contains(identityId);
+		}
+		if (drainIdentity == 0 || (idle && !foundIdle)) {
+			drainIdentity = identityId;
+			foundIdle = idle;
+		}
+	}
+	if (drainIdentity != 0) {
+		drainPveIdentityBody(drainIdentity, nowMs);
+		return;
+	}
+
+	int currentLiveBodyCount = 0;
 	Vector<SimBotIdentity> candidates;
 	{
 		Locker pveLock(&pveMutex);
-		for (int i = 0; i < pveIdentities.size() &&
-				candidates.size() < pveMaxHunters; ++i) {
-			if (pveIdentities.elementAt(i).getValue().profession != "hunter")
+		// Count only governor-managed bodies. pveIdentityBodyOids also holds
+		// parity-harness bodies, which are outside this population budget -
+		// counting them would let test bodies starve production spawns.
+		for (int i = 0; i < pveIdentityBodyOids.size(); ++i) {
+			if (governorManaged.contains(
+					pveIdentityBodyOids.elementAt(i).getKey()))
+				++currentLiveBodyCount;
+		}
+		for (int i = 0; i < roster.size() &&
+				candidates.size() < pveMaxHunters - currentLiveBodyCount; ++i) {
+			const SimBotIdentity& identity = roster.get(i);
+			if (!desired.contains(identity.id) ||
+					pveIdentityBodyOids.contains(identity.id) ||
+					pveRetiringIdentityIds.contains(identity.id) ||
+					(pveRespawnDueAtMs.contains(identity.id) &&
+						pveRespawnDueAtMs.get(identity.id) > nowMs))
 				continue;
-			uint64 identityId = pveIdentities.elementAt(i).getKey();
-			if (pveIdentityBodyOids.contains(identityId))
-				continue;
-			if (pveRespawnDueAtMs.contains(identityId) &&
-					pveRespawnDueAtMs.get(identityId) > nowMs)
-				continue;
-			candidates.add(pveIdentities.elementAt(i).getValue());
+			candidates.add(identity);
 		}
 	}
 
@@ -15240,6 +17160,8 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 	VectorMap<String, Vector<PveMarketQualityWeight> > marketQualityWeights;
 	Vector<PveLairYieldEntry> lairYieldIndex;
 	Vector<PveMissionTerminalLocation> marketTerminals;
+	Vector<PveNoviceDistribution> noviceDistribution;
+	bool noviceEnabled = false;
 	{
 		Locker pveLock(&pveMutex);
 		if (pveHuntSpecies.size() == 0 && !pveMarketDispatchEnabled)
@@ -15254,17 +17176,57 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 		marketQualityWeights = pveMarketQualityWeights;
 		lairYieldIndex = pveLairYieldIndex;
 		marketTerminals = allMissionTerminals;
-		for (int i = 0; i < pveIdentities.size() &&
-				identities.size() < pveMaxHunters; ++i) {
-			if (pveIdentities.elementAt(i).getValue().profession != "hunter")
-				continue;
+		noviceDistribution = pveNoviceDistribution;
+		noviceEnabled = pveNoviceEnabled;
+		for (int i = 0; i < pveIdentities.size(); ++i) {
 			uint64 identityId = pveIdentities.elementAt(i).getKey();
 			if (pveIdentityBodyOids.contains(identityId) &&
-					!pveHuntOrders.contains(identityId)) {
+					!pveHuntOrders.contains(identityId) &&
+					!pveRetiringIdentityIds.contains(identityId)) {
 				identities.add(pveIdentities.get(identityId));
 				identityBodyOids.add(pveIdentityBodyOids.get(identityId));
 			}
 		}
+	}
+	Vector<SimBotIdentity> eligibleIdentities;
+	Vector<uint64> eligibleBodyOids;
+	for (int i = 0; i < identities.size(); ++i) {
+		if (!isPveHuntEligible(identities.get(i)))
+			continue;
+		eligibleIdentities.add(identities.get(i));
+		eligibleBodyOids.add(identityBodyOids.get(i));
+	}
+	identities = eligibleIdentities;
+	identityBodyOids = eligibleBodyOids;
+	if (noviceEnabled && noviceDistribution.size() > 0) {
+		Vector<SimBotIdentity> orderedIdentities;
+		Vector<uint64> orderedBodyOids;
+		VectorMap<uint64, bool> used;
+		for (int d = 0; d < noviceDistribution.size(); ++d) {
+			const PveNoviceDistribution& row = noviceDistribution.get(d);
+			for (int i = 0; i < identities.size(); ++i) {
+				if (used.contains(identities.get(i).id) ||
+						identities.get(i).profession != row.profession ||
+						identities.get(i).trainingPlan != row.trainingPlan)
+					continue;
+				orderedIdentities.add(identities.get(i));
+				orderedBodyOids.add(identityBodyOids.get(i));
+				used.put(identities.get(i).id, true);
+				if (orderedIdentities.size() >= pveMaxHunters)
+					break;
+			}
+			if (orderedIdentities.size() >= pveMaxHunters)
+				break;
+		}
+		for (int i = 0; i < identities.size() &&
+				orderedIdentities.size() < pveMaxHunters; ++i) {
+			if (used.contains(identities.get(i).id))
+				continue;
+			orderedIdentities.add(identities.get(i));
+			orderedBodyOids.add(identityBodyOids.get(i));
+		}
+		identities = orderedIdentities;
+		identityBodyOids = orderedBodyOids;
 	}
 
 	Vector<bool> locationEligible;
@@ -16630,6 +18592,39 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 		info("SimPveFoundationReady identities=" + String::valueOf(rosterSize), true);
 	}
 
+	// Novice repair intentionally runs before population governance and does not
+	// require trainingEnabled. A repaired first box is what makes the planned
+	// identity eligible for the body overlay.
+	reconcileNoviceGrants();
+	bool retireLegacyHunters = false;
+	{
+		Locker pveLock(&pveMutex);
+		retireLegacyHunters = pveNoviceEnabled && pveRetireLegacyHunters;
+	}
+	if (retireLegacyHunters) {
+		uint64 retirementId = 0;
+		{
+			Locker pveLock(&pveMutex);
+			for (int i = 0; i < pveRetiringIdentityIds.size() && retirementId == 0; ++i)
+				retirementId = pveRetiringIdentityIds.elementAt(i).getKey();
+			for (int i = 0; i < pveIdentities.size() && retirementId == 0; ++i) {
+				const SimBotIdentity& identity = pveIdentities.elementAt(i).getValue();
+				if (identity.profession == "hunter" && identity.trainingPlan.isEmpty())
+					retirementId = identity.id;
+			}
+		}
+		if (retirementId != 0)
+			retirePveIdentity(retirementId);
+	}
+
+	// Phase 2 training is evaluated only on the PvE maintenance lane. The
+	// queue drain is bounded by trainingMaxPerTick; the independent sweep is
+	// bounded by trainingSweepBatch and never performs SQL itself.
+	if (progressionLoaded) {
+		drainPlayerBotTrainingQueue();
+		runPlayerBotTrainingSweep();
+	}
+
 	uint64 nowMs = System::getMiliTime();
 	// Unconditional: graced presence entries must prune even when every
 	// downstream step early-returns (e.g. spike cleanup with hunters
@@ -17559,6 +19554,13 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	result["bootReady"] = pveBootReady;
 	result["population"] = identities.size();
 	result["attachedBodies"] = bodyOids.size();
+	result["noviceEnabled"] = pveNoviceEnabled;
+	result["retireLegacyHunters"] = pveRetireLegacyHunters;
+	// Gauge: planned identities currently denied a body, not a running total.
+	result["bodySpawnBlockedNotReady"] = pveBodySpawnRefusedNotReady.get();
+	result["noviceGrantsRepaired"] = noviceGrantsRepaired.get();
+	result["retirementsCompleted"] = retirementsCompleted.get();
+	result["retirementsResumed"] = retirementsResumed.get();
 	result["presenceMembers"] = presenceOids.size();
 	result["presenceSpawnTotal"] = presenceSpawnTotal;
 	result["hunterKillsTotal"] = hunterKillsTotal;

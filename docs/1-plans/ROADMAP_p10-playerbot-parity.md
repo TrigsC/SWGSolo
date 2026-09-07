@@ -129,13 +129,19 @@ numeric**: `alterDatabase` skips every version at or below the deployed
 `schema_version` (`ServerDatabase.cpp:63-65`), so a chunk that carries a
 schema block may only be deployed after every lower-numbered chunk's schema
 has landed — the dependency graph below shows functional dependencies, and
-the numeric rule is an additional release dependency on top of it (in
-particular F_0.9.3 (schema 1013) must deploy before F_0.9.5 (schema 1014)
-and F_0.9.6 (1015)).
+the numeric rule is an additional release dependency on top of it.
+
+**Renumbered 2026-09-04 (F_0.9.5 planning).** The original allocation gave
+F_0.9.3 schema 1013 and F_0.9.5 schema 1014, which forced the loot chunk to
+ship before skill training for no functional reason. Since nothing above 1012
+had been deployed, the numbers were still free and were reassigned to match
+priority: **F_0.9.5 takes 1013** (shipped, `training_plan`) and **F_0.9.3 moves
+to 1014**, with F_0.9.6 at 1015. The dependency that remained was an artifact
+of the numbering, not of the designs.
 
 ```
 F_0.9.0 store+dashboard+reaper+harness ─┬─► F_0.9.1 XP per kill ──► F_0.9.5 skill training ──► F_0.9.8 allocation policy
-                                        │                          ▲ (release dep: F_0.9.3 schema 1013 first)
+                                        │                            (schema 1013; no release dep)
                                         ├─► F_0.9.2 mission credits ─┐                              ▲
                                         └─► F_0.9.3 loot (solo)+vault ┼─► F_0.9.4 group dispersal   │
                                                                       ├─► F_0.9.6 bazaar SELL ───────┤
@@ -263,7 +269,8 @@ F_0.9.0 store+dashboard+reaper+harness ─┬─► F_0.9.1 XP per kill ──�
   `playerBotProgression.lootEnabled`.
 - **Engine touchpoints**: `CreatureManagerImplementation.cpp` (bot branch),
   `AiEconomyData.idl` + `AiEconomyManager`, `SimHunterController` (phase
-  `LOOT_CORPSE`), `ServerDatabase.cpp` (schema 1013).
+  `LOOT_CORPSE`), `ServerDatabase.cpp` (schema **1014** — renumbered from 1013,
+  see §5 preamble).
 - **Persists**: vault container + contents (BDB), `simbot_items`.
 - **Risk**: moderate–high. First real object movement out of a corpse; must
   mirror `lootAll`'s cross-lock (`Locker locker(ai, player)`) and the
@@ -333,7 +340,7 @@ F_0.9.0 store+dashboard+reaper+harness ─┬─► F_0.9.1 XP per kill ──�
   `playerBotProgression.trainingEnabled`.
 - **Engine touchpoints**: `SimPlayerManager`, `spawnPveIdentityBody` (`:8729`),
   `SkillManager` read-only, `ServerDatabase.cpp` + `swgemu.sql` (schema
-  **1014**: `ALTER TABLE simbot_identities ADD COLUMN training_plan
+  **1013**: `ALTER TABLE simbot_identities ADD COLUMN training_plan
   VARCHAR(64) DEFAULT NULL`) and the roster load/flush for the new field.
 - **Persists**: `simbot_skills`, `simbot_experience`, `skill_points_spent`,
   `simbot_identities.training_plan`.
@@ -459,7 +466,7 @@ prerequisite checking against `simbot_skills`, `applyProgressionToBody`, and the
 per-profession training plan all exist in those sections and already route around the
 ghostless-creature wall. Three things it does NOT yet cover are recorded here.
 
-### 5b.1 Starting state — mint at novice with a profession (new work)
+### 5b.1 Starting state — mint at novice with a profession — DELIVERED (F_0.9.5)
 
 F_0.9.5 trains *upward* from wherever an identity already is; nothing mints one *at*
 novice with a profession assigned. Required: `SimBotIdentity` gains a profession
@@ -470,7 +477,7 @@ per the one-creation-function invariant (§2). Existing identities are covered b
 allocation policy that *chooses* between them is F_0.9.8, so until that lands the
 assignment is a Lua-configured distribution.
 
-### 5b.2 Body template — a neutral base to build from (new work)
+### 5b.2 Body template — a neutral base to build from — DELIVERED (F_0.9.5)
 
 Hunter bodies currently use the `death_watch_wraith` combat mob template. That is
 wrong for a novice-profession bot on two counts: it is a level-178 template (the
@@ -483,7 +490,7 @@ Direction (owner, 2026-09-03): **one default PlayerBot template, built up from
 there** rather than a template per profession. Appearance and gear then come from
 equipping real objects, not from swapping mobile templates.
 
-### 5b.3 Migration of the existing roster — DECIDED 2026-09-03: retire and start clean
+### 5b.3 Migration of the existing roster — DECIDED 2026-09-03, DELIVERED (F_0.9.5)
 
 **Owner decision: retire the six existing `hunter` identities and mint fresh
 novices.** They keep no history. This is the simpler path and it removes the need for
@@ -495,7 +502,7 @@ XP rows and any body go with it — `simbot_progression` is keyed by identity id
 F_0.9.0's reaper already counts and removes orphans, so a hunter row left behind
 would surface as `orphanRecords` rather than vanish silently.
 
-### 5b.3a First bot — ONE unarmed brawler → Teras Kasi (owner, 2026-09-03)
+### 5b.3a First bot — ONE unarmed brawler → Teras Kasi (owner, 2026-09-03) — LADDER SHIPPED (F_0.9.5)
 
 **Owner's chosen first target: a single brawler training unarmed, aiming at Teras
 Kasi**, on the grounds that it is the easiest thing to test. That instinct is right
@@ -590,6 +597,30 @@ exists *because* bots have no player inventory; if bots ever gained a real
 counts, character rows). §3 already evaluated and rejected structural typing for
 F_0.9.0's scope; **that evaluation should be revisited once, explicitly, before
 F_0.9.3's plan is written**, because that is the chunk whose shape it changes most.
+
+### 5b.6 What F_0.9.5 actually delivered (2026-09-05)
+
+5b.1, 5b.2 and 5b.3 shipped in F_0.9.5 together with the training loop, so the
+first novice PlayerBot exists end to end rather than as a store-only capability.
+Three design points settled during that chunk are worth carrying forward:
+
+1. **Training is a single-row mutation.** `simbot_experience` means *lifetime
+   earned* (already true of what F_0.9.1 wrote), so available XP and spent skill
+   points are derived rather than debited. Training writes exactly one
+   `simbot_skills` row, which is atomic under MyISAM and self-heals at boot — no
+   write-ahead journal. A journal is still the right tool for F_0.9.6's bazaar,
+   where value is human-visible and multi-party.
+2. **Tier and body overlay treat the same mod oppositely, deliberately.** The
+   combat tier sums **trained deltas only**, because a real player has no
+   template statistic behind `private_<weapon>_combat_difficulty` and including
+   a baseline would exceed player parity. The body skill-mod overlay **must**
+   add `npcTemplate->getStatistic(mod)`, because `AiAgent::getSkillMod` returns
+   the creature-list value whenever nonzero and only then consults the template.
+   Collapsing these two into one rule is a bug in either direction.
+3. **`pveMaxHunters` was a spawn-batch cap, not a population cap.** The old
+   governor skipped live-bodied identities before counting them, so adding a
+   novice produced an extra body rather than a replacement. It is now a
+   desired-active-set reconciler and the cap is a true population bound.
 
 ## 6. engine3 policy and inventory
 
