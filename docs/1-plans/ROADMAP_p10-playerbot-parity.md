@@ -2,8 +2,11 @@
 
 **Line**: P.10 (new feature line, versions `0.9.x`)
 **Branch**: `feat/p10-playerbot-parity`, cut from `miner-ai` at `266e6d02e7` (v0.8.2)
-**Status**: ROADMAP — planning only. First chunk plan: `F_0.9.0_p10a-progression-store.plan.md`.
+**Status**: IN PROGRESS. Delivered: **F_0.9.0** (P.10a, v0.9.0), **F_0.9.1** (P.10b,
+v0.9.1), **F_0.9.5** (P.10f, v0.9.5, schema 1013 deployed). Next chunk: **F_0.9.6**
+(novice early-game loop) — see §5c for why it was inserted ahead of the bazaar work.
 **Written**: 2026-09-02 (project week 8)
+**Last updated**: 2026-09-08 — early-game chunks inserted, bazaar renumbered (§5, §5c)
 
 ## 0. Mandate
 
@@ -113,9 +116,9 @@ in that chunk's plan. Chunk 1 does not depend on either.
 
 | Store | Today | P.10 disposition | Chunk |
 | --- | --- | --- | --- |
-| **P.5 hive stockpile** (`AiEconomyManager`, `AiEconomyStockpileLot`, resource lots + finished goods) | Persisted ledger of *simulated* resource units; miners deposit, conceptual crafters consume | **Stays a shadow mirror** for resources through P.10 (it is not backed by `ResourceContainer` objects; making it real is the crafting economy phase). **Gains a real sibling**: the **hive item vault** — a persistent container object holding real loot/bazaar `TangibleObject`s, OID stored on `AiEconomyData`, ledgered per identity in `simbot_items` with an explicit **operation state** (`pending → held → listed → consumed`) so BDB containment and the MySQL ledger have one authority: an object is owned by an identity only when a `held` row says so; boot reconciliation checks **every** row state against vault containment (and `AuctionsMap` for `listed`) — a `held`/`listed` row whose object is missing or contained elsewhere is moved to a system-owned quarantine state `orphaned` (`identity_id NULL`, counted, never blocks reaping), and an unattributed vault object gets an `orphaned` row of its own. Bot-held items live there, never on a body. | vault + journal: **F_0.9.3**; listing states **F_0.9.6**; hive lots unchanged |
+| **P.5 hive stockpile** (`AiEconomyManager`, `AiEconomyStockpileLot`, resource lots + finished goods) | Persisted ledger of *simulated* resource units; miners deposit, conceptual crafters consume | **Stays a shadow mirror** for resources through P.10 (it is not backed by `ResourceContainer` objects; making it real is the crafting economy phase). **Gains a real sibling**: the **hive item vault** — a persistent container object holding real loot/bazaar `TangibleObject`s, OID stored on `AiEconomyData`, ledgered per identity in `simbot_items` with an explicit **operation state** (`pending → held → listed → consumed`) so BDB containment and the MySQL ledger have one authority: an object is owned by an identity only when a `held` row says so; boot reconciliation checks **every** row state against vault containment (and `AuctionsMap` for `listed`) — a `held`/`listed` row whose object is missing or contained elsewhere is moved to a system-owned quarantine state `orphaned` (`identity_id NULL`, counted, never blocks reaping), and an unattributed vault object gets an `orphaned` row of its own. Bot-held items live there, never on a body. | vault + journal: **F_0.9.3**; listing states **F_0.9.9**; hive lots unchanged |
 | **P.8.1c acquisition ledger** (family supply/signals, `pveSessionHarvestByFamily`) | In-memory demand signals driving hunter dispatch | **Stays shadow, unchanged.** Drives *where* bots hunt; P.10 changes what a kill *pays*. Retire/replace only when a consumer phase lands (documented debt since F_0.6.0). | — |
-| **Demand state** (`demandStateSimulationConfig`, profiles, pressure) | Conceptual demand engine | **Stays shadow, unchanged.** Chunk 9's allocation policy reads its per-profile pressure as one input, read-only. | read in **F_0.9.8** |
+| **Demand state** (`demandStateSimulationConfig`, profiles, pressure) | Conceptual demand engine | **Stays shadow, unchanged.** The allocation-policy chunk reads its per-profile pressure as one input, read-only. | read in **F_0.9.11** |
 | **Roster lifetime stats** (`simbot_identities.hunts/kills/deaths/harvest_units`) | Real MySQL rows | **Stay as-is**; the progression tables reference the same `id`. | — |
 | **Simulated credits** | None exist (F_0.5.0 pays nothing) | **Becomes real** from the first credit award. | **F_0.9.2** |
 | **Simulated harvest** (`recordPveHunterHarvest` → hive lots) | Simulated creature-resource units | **Stays shadow** in P.10 (real resource containers = crafting phase). | — |
@@ -136,16 +139,39 @@ F_0.9.3 schema 1013 and F_0.9.5 schema 1014, which forced the loot chunk to
 ship before skill training for no functional reason. Since nothing above 1012
 had been deployed, the numbers were still free and were reassigned to match
 priority: **F_0.9.5 takes 1013** (shipped, `training_plan`) and **F_0.9.3 moves
-to 1014**, with F_0.9.6 at 1015. The dependency that remained was an artifact
-of the numbering, not of the designs.
+to 1014**, with bazaar SELL at 1015. The dependency that remained was an
+artifact of the numbering, not of the designs.
+
+**Renumbered again 2026-09-08 (early-game insertion).** Three new chunks —
+**F_0.9.6 novice early-game loop**, **F_0.9.7 skill-derived combat abilities**,
+**F_0.9.8 lair tactics and mission graduation** — are inserted ahead of the
+bazaar work, which moves down to **F_0.9.9 / F_0.9.10 / F_0.9.11** (phase
+letters shift with them: bazaar SELL/BUY and allocation become P.10j/k/l).
+Motivation in §5c. **None of the three new chunks carries a schema block**, so
+the numeric deployment rule is unaffected: F_0.9.3 keeps 1014 and bazaar SELL
+keeps 1015, and the inserted chunks may deploy in any order relative to them.
+Renumbering was chosen over appending so that chunk order continues to express
+priority, as the 2026-09-04 renumber established. Note that the released
+`docs/5-tuto/tuto_0.9.5.md` refers to the bazaar chunk by its old number
+(F_0.9.6); that document is a historical artifact of its tag and is left
+unedited.
 
 ```
-F_0.9.0 store+dashboard+reaper+harness ─┬─► F_0.9.1 XP per kill ──► F_0.9.5 skill training ──► F_0.9.8 allocation policy
-                                        │                            (schema 1013; no release dep)
-                                        ├─► F_0.9.2 mission credits ─┐                              ▲
-                                        └─► F_0.9.3 loot (solo)+vault ┼─► F_0.9.4 group dispersal   │
-                                                                      ├─► F_0.9.6 bazaar SELL ───────┤
-                                                                      └─► F_0.9.7 bazaar BUY ────────┘
+F_0.9.0 store+dashboard+reaper+harness
+  |
+  +-- F_0.9.1 XP per kill --> F_0.9.5 skill training (schema 1013, DEPLOYED)
+  |                             |
+  |                             +-- F_0.9.6 novice early-game loop
+  |                                   +-- F_0.9.7 skill-derived combat abilities
+  |                                         +-- F_0.9.8 lair tactics + mission graduation
+  |                                                    ^
+  +-- F_0.9.2 mission credits ----------------------- +   (credit source; buffer sink)
+  |
+  +-- F_0.9.3 loot (solo) + vault (schema 1014)
+        +-- F_0.9.4 group loot/XP dispersal
+        +-- F_0.9.9 bazaar SELL (schema 1015)
+        +-- F_0.9.10 bazaar BUY
+              +-- F_0.9.11 allocation policy  <-- reads F_0.9.5 plans + demand pressure
 ```
 
 ### F_0.9.0 — Progression store foundation (P.10a)
@@ -328,12 +354,13 @@ F_0.9.0 store+dashboard+reaper+harness ─┬─► F_0.9.1 XP per kill ──�
   template's baseline. F_0.9.5 therefore applies `template baseline (from
   npcTemplate->getStatistic) + trained delta` as the creature-list value for
   every touched mod, and the harness asserts actual `getSkillMod` values
-  before and after training (never lower). F_0.9.8 may later move baselines
+  before and after training (never lower). F_0.9.11 may later move baselines
   into profession templates, but F_0.9.5 ships correct on its own. A Lua
   **training plan** per profession drives autonomous training on the
   maintenance tick — **only for identities with an assigned plan**: the roster
   gains `training_plan` (persisted) which is empty for every existing hunter
-  until F_0.9.8's allocator (or an explicit owner default in Lua) assigns it,
+  until F_0.9.6's canonical template, F_0.9.11's allocator, or an explicit owner
+  default in Lua assigns it,
   so production training cannot pre-empt allocation; the harness assigns plans
   to its own identities directly. Abilities/schematics are ghost-only and out
   of scope (attacks stay template-driven). Gate
@@ -350,7 +377,135 @@ F_0.9.0 store+dashboard+reaper+harness ─┬─► F_0.9.1 XP per kill ──�
   respawn → `hasSkill` true and mod present; insufficient XP → refused;
   budget exhausted → refused; gate-off → bodies unchanged.
 
-### F_0.9.6 — Bazaar SELL (P.10g) — first human-shared surface
+### F_0.9.6 — Novice early-game loop (P.10g)
+
+- **Scope**: four phases, delegated in order.
+  **P1 — multi-goal templates.** `SimBotTrainingPlan` currently holds a single
+  `String goalSkill` (`SimPlayerManager.h:151`); it becomes
+  `Vector<String> goalSkills`. The ladder builder takes the **union** of the
+  transitive closures over `getSkillsRequired()` and runs one Kahn sort over
+  that union (cheapest-XP tie-break, unchanged). This is required because a
+  real PVE template is a *set of boxes*, not one master skill, and the SWG
+  shorthand in owner templates ("Medic 2000", "Fencer 3200") names partial
+  trees by box count, not masters. Ships **one** canonical template —
+  Master Brawler / Master Swordsman / Master Pikeman / Medic 2000 /
+  Fencer 3200 — with the vector making a template library cheap later.
+  **P2 — starter loadout.** Grant and equip the novice's starting weapon from
+  the stock character-creation list (`player_creation_manager.lua:28-51`:
+  `knife_stone` 1H, `axe_heavy_duty` 2H, `lance_staff_wood_s1` polearm), which
+  maps exactly onto the Fencer / Swordsman / Pikeman lines of the template.
+  The bot equips the weapon matching whichever line it is currently advancing.
+  **P3 — the grind loop.** A self-motivated activity: leave the city, select a
+  level-appropriate creature, engage through `CombatManager::startCombat`,
+  rest and recover HAM between kills, repeat until the next box is affordable,
+  train, continue. **Novices do not consult demand.** The `signalUnits > 0`
+  gate that drives F_0.5.0 mission hunting is bypassed below a configured
+  graduation tier — see §5c for why this is the point of the chunk.
+  **P4 — thin activity arbiter.** One scoring function choosing between exactly
+  two activities (grind vs. the existing demand-driven hunt) on a slow tick.
+  Deliberately minimal: it exists so the novice can *graduate*, and so later
+  chunks have a seam to add modes to. Generalising it up front is out of scope.
+  Gate `playerBotProgression.earlyGameEnabled`.
+- **Engine touchpoints**: `SimPlayerManager` (ladder builder, plan schema,
+  arbiter), `SimHunterController` / a novice controller mode,
+  `spawnPveIdentityBody` (`:8729`) for the loadout grant,
+  `player_creation_manager.lua` read-only, `sim_player_manager.lua`
+  (`trainingPlans` gains `goalSkills`; new `earlyGame` block). **No schema
+  block** — `simbot_identities.training_plan` (1013) already stores the plan
+  name, and multi-goal is a Lua-side config shape.
+- **Persists**: nothing new. Trained boxes continue to land in `simbot_skills`;
+  loadout items live on a transient body and are re-granted at every respawn.
+- **Risk**: moderate, concentrated in P2 and P3. **P2's open question is
+  whether an equipped weapon actually drives an AiAgent's damage and XP type.**
+  5b.3a established that unarmed needs no equip because
+  `creature_default_weapon` already reports `combat_meleespecialize_unarmed`;
+  a sword or polearm has to prove both that `CombatManager` reads the equipped
+  weapon for damage and that the kill awards the matching `xpType`. If it does
+  not, P2 reduces to appearance and the template's non-unarmed lines cannot
+  progress — that must be settled in the plan, not at implementation time.
+  P3 puts bots in real combat with real creatures, so death handling and the
+  existing recovery/reaper paths need review.
+- **Invariant introduced — no cheat kills.** Server-side knowledge
+  (`getLevel()`, HAM, template statistics) may inform **target selection**
+  only; it may never influence combat outcome. A real player reads con-colour
+  and makes the same estimate. No bot may bypass `CombatManager::startCombat`,
+  short-circuit damage, or ignore HAM cost. The harness asserts that every
+  novice kill produced a real `disseminateExperience` award.
+- **Test strategy**: ladder derivation over a multi-goal set yields a valid
+  topological order containing every prerequisite exactly once and matches a
+  hand-computed box/point total; gate-off leaves bodies and behaviour
+  unchanged; a novice with a granted loadout has the expected weapon equipped
+  after respawn; live: a gated novice leaves the city, kills a
+  level-appropriate creature through real combat, XP rises, the next box
+  trains autonomously, and `demandFamilies[*].signalUnits == 0` throughout
+  (proving the loop is demand-independent).
+
+### F_0.9.7 — Skill-derived combat abilities (P.10h)
+
+- **Scope**: make training visibly change behaviour. The engine already
+  implements special attacks —
+  `AiAgentImplementation::selectSpecialAttack()` (`:2866`, `:3219`) scores
+  candidates, checks HAM affordability, and dispatches via `enqueueCommand` —
+  but **no Sim controller calls it**; `SimHunterController` fights with plain
+  auto-attack only. Two pieces: (a) build the bot's attack map from its
+  **trained skill boxes** rather than from the mobile template's static
+  `attacks` list, so a newly trained box adds a real attack; (b) wire
+  `selectSpecialAttack()` into the sim controllers' combat path. F_0.9.5
+  explicitly deferred this ("abilities/schematics are ghost-only and out of
+  scope, attacks stay template-driven"); this chunk closes that gap without
+  needing a ghost, because the attack map is an AiAgent structure.
+  Gate `playerBotProgression.combatAbilitiesEnabled`.
+- **Engine touchpoints**: `AiAgentImplementation` (attack map construction),
+  `SimHunterController` / novice controller combat path, `SkillManager`
+  read-only for the box→command mapping. No schema block.
+- **Persists**: nothing new; the attack map is derived from `simbot_skills`.
+- **Risk**: moderate. Command dispatch on an AiAgent is a path the sim bots
+  have never used; `getQueueCommand` returning null, HAM costs, and cooldowns
+  all need bounding. Must not regress the P.6.6 PvP combat path, which shares
+  these controllers.
+- **Test strategy**: a bot with box X has command Y in its attack map and a bot
+  without it does not; gate-off restores auto-attack exactly; live: a novice
+  trains a box that grants an attack and is then observed *using* that attack
+  in a subsequent kill.
+
+### F_0.9.8 — Lair tactics and mission graduation (P.10i)
+
+- **Scope**: graduate the novice from lone creatures to destroy missions, with
+  tier-appropriate lair tactics. `LairObserverImplementation` already
+  implements every mechanic this needs: three waves (`spawnNumber < 3`,
+  `:87`), damage-forced spawns (`DAMAGERECEIVED` → `checkForNewSpawns`,
+  `:70-96`), full aggro on attacking the lair
+  (`doAggro(lair, attacker, allAttack)`, `:267`), creatures healing the lair
+  (`healLair`, `:309-333`), and boss mobs once `spawnNumber >= 3` with
+  `hasBossMobs()` (`:99`). Two tactics, selected by tier/armour/buff state —
+  the tactical detail is specified in §5c:
+  **low tier** pull one creature at a time, clear the wave, damage the lair
+  until `spawnNumber` increments, then **stop attacking immediately** and
+  clear the new wave before resuming;
+  **high tier** hold position on the lair and AoE through the waves.
+  The wave boundary is an observable event, not an estimate. Credits come from
+  F_0.9.2's mission award (this chunk does not re-specify credit mechanics);
+  the first **credit sink** lands here — paying a buffer when one is available,
+  which makes credits meaningful before the bazaar chunks.
+  Gate `playerBotProgression.lairTacticsEnabled`.
+- **Engine touchpoints**: `SimHunterController` mission/lair path,
+  `LairObserver` read-only, the F_0.9.6 arbiter (gains a mission activity),
+  the existing doctor/buffer path from v0.8.2. No schema block.
+- **Persists**: credits via F_0.9.2's store; no new tables.
+- **Depends on**: F_0.9.6, F_0.9.7, and **F_0.9.2** (mission credits) for the
+  credit source. F_0.9.2 may ship before or after F_0.9.6/0.9.7 — it carries no
+  schema block either — but must precede this chunk's credit-sink phase.
+- **Risk**: moderate–high. This is the first chunk where bots fight groups
+  rather than single creatures, and the low-tier tactic depends on reacting to
+  a wave boundary within a bounded time or the bot dies. Mission-system health
+  is genuinely unknown (§5c) and may surface defects this chunk has to absorb.
+- **Test strategy**: wave-boundary detection fires exactly on `spawnNumber`
+  increment; low-tier tactic never has more than one creature engaged outside
+  a wave transition; tier gate selects the intended tactic; live: a graduated
+  bot accepts a destroy mission, clears a lair by the tier-appropriate tactic,
+  is credited, and spends on a buffer.
+
+### F_0.9.9 — Bazaar SELL (P.10j) — first human-shared surface
 
 - **Scope**: city bazaar-terminal enumeration (the P.8.2 terminal scan
   pattern, `isBazaarTerminal()`); controller phase walks the body to the
@@ -388,11 +543,11 @@ F_0.9.0 store+dashboard+reaper+harness ─┬─► F_0.9.1 XP per kill ──�
   is player-visible. Mitigations: listing cap per identity, price floor,
   duration cap, kill-switch gate drains listings on disable.
 - **Test strategy**: list → item appears in `AuctionsMap` with bot owner
-  mapping; harness "buyer" purchase path (F_0.9.7 primitive or a scripted
+  mapping; harness "buyer" purchase path (F_0.9.10 primitive or a scripted
   `doInstantBuy` by a harness identity) → seller store credited, buyer
   debited; expiry → item back in vault; gate-off → no listings exist.
 
-### F_0.9.7 — Bazaar BUY (P.10h)
+### F_0.9.10 — Bazaar BUY (P.10k)
 
 - **Scope**: need-driven purchase (gear from the training plan, consumables):
   query `AuctionsMap`, select by policy, then a sim-aware
@@ -417,10 +572,10 @@ F_0.9.0 store+dashboard+reaper+harness ─┬─► F_0.9.1 XP per kill ──�
   item in vault + ledger; insufficient credits → skipped; human-listing policy
   predicate asserted; gate-off → zero purchases.
 
-### F_0.9.8 — Profession allocation policy (P.10i)
+### F_0.9.11 — Profession allocation policy (P.10l)
 
 - **Scope**: population planner deciding which professions/templates each
-  identity pursues; feeds F_0.9.5 training plans and F_0.9.7 buy lists;
+  identity pursues; feeds F_0.9.5 training plans and F_0.9.10 buy lists;
   dashboard `population by template`. Ships with **option B templates** (§3).
   Gate `playerBotProgression.allocationPolicy = "fixed" | ...`.
 - **Options** (owner picks; all read demand state read-only):
@@ -442,7 +597,7 @@ F_0.9.0 store+dashboard+reaper+harness ─┬─► F_0.9.1 XP per kill ──�
 - **Assignment semantics (v1)**: the allocator assigns a profession +
   `training_plan` to every identity with **zero skill spend** — which, because
   F_0.9.5 trains only identities that already hold a plan, includes the whole
-  existing hunter roster at the moment F_0.9.8 is enabled (one-time
+  existing hunter roster at the moment F_0.9.11 is enabled (one-time
   assignment) as well as every new identity. An identity that has spent
   skills/points is **frozen**; respec is deferred to a later chunk with an
   atomic policy. Production candidate creation: `maxHunters` is generalised to
@@ -450,7 +605,7 @@ F_0.9.0 store+dashboard+reaper+harness ─┬─► F_0.9.1 XP per kill ──�
   (`SimPlayerManager.cpp:8586-8592`) grows the roster on the planner's
   demand, with the allocator choosing each new identity's profession at mint.
   `profession` and `training_plan` become persisted fields: the roster flush
-  today never writes `profession` (`:8697-8707`), so F_0.9.5/F_0.9.8 add
+  today never writes `profession` (`:8697-8707`), so F_0.9.5/F_0.9.11 add
   them to the UPDATE and the dashboard shows the assignment source.
 - **Risk**: low mechanically; high in tuning. No object mutation of its own.
 - **Test strategy**: planner is pure over a snapshot → unit-testable in
@@ -461,7 +616,7 @@ F_0.9.0 store+dashboard+reaper+harness ─┬─► F_0.9.1 XP per kill ──�
 
 The owner's stated end goal, after F_0.9.1 shipped: **rework the PvE bots into true
 PlayerBots that begin as a novice (marksman / brawler / artisan) and progress as a
-player would.** Most of that is already F_0.9.5 + F_0.9.8 — the training loop,
+player would.** Most of that is already F_0.9.5 + F_0.9.11 — the training loop,
 prerequisite checking against `simbot_skills`, `applyProgressionToBody`, and the
 per-profession training plan all exist in those sections and already route around the
 ghostless-creature wall. Three things it does NOT yet cover are recorded here.
@@ -474,7 +629,7 @@ novice with a profession assigned. Required: `SimBotIdentity` gains a profession
 through the same `trainSkill` entry point F_0.9.5 builds — never a second code path,
 per the one-creation-function invariant (§2). Existing identities are covered by
 5b.3. The profession set the owner named is marksman / brawler / artisan; the
-allocation policy that *chooses* between them is F_0.9.8, so until that lands the
+allocation policy that *chooses* between them is F_0.9.11, so until that lands the
 assignment is a Lua-configured distribution.
 
 ### 5b.2 Body template — a neutral base to build from — DELIVERED (F_0.9.5)
@@ -608,7 +763,7 @@ Three design points settled during that chunk are worth carrying forward:
    earned* (already true of what F_0.9.1 wrote), so available XP and spent skill
    points are derived rather than debited. Training writes exactly one
    `simbot_skills` row, which is atomic under MyISAM and self-heals at boot — no
-   write-ahead journal. A journal is still the right tool for F_0.9.6's bazaar,
+   write-ahead journal. A journal is still the right tool for F_0.9.9's bazaar,
    where value is human-visible and multi-party.
 2. **Tier and body overlay treat the same mod oppositely, deliberately.** The
    combat tier sums **trained deltas only**, because a real player has no
@@ -621,6 +776,146 @@ Three design points settled during that chunk are worth carrying forward:
    governor skipped live-bodied identities before counting them, so adding a
    novice produced an extra body rather than a replacement. It is now a
    desired-active-set reconciler and the cap is a true population bound.
+
+## 5c. Owner's early-game restatement (2026-09-08) — the grind loop
+
+### 5c.1 Why this jumped the queue — live evidence
+
+A dashboard snapshot taken 2026-09-08, with F_0.9.5 deployed:
+
+```
+pveActivity.demandFamilies[*].pressure     = 0
+pveActivity.demandFamilies[*].signalUnits  = 0
+pveActivity.missionBoard.offers            = []
+creatureKillsTotal / hunterKillsTotal      = 0 / 0
+missionsCompletedTotal / missionsAbandoned = 0 / 0
+bootBaselineHunterMeat                     = 587,107
+```
+
+The miner economy is healthy over the same window (`pressureScore ≈ 2000`
+across every demand profile). The **hunter** economy is fully saturated: 587k
+meat in stock means zero demand pressure, which means the market matchmaker
+issues no orders, which means no hunts, no kills, and therefore **no XP and no
+training**. The progression system delivered by F_0.9.0/F_0.9.1/F_0.9.5 has
+nothing feeding it and cannot be observed in production at all.
+
+This is one defect wearing three faces — miner idles when reserves fill,
+hunter idles when `signalUnits == 0`, and the F_0.9.5 novice inherits the
+hunter's gate. The structural cause is that **a controller is currently the
+bot's whole identity**: each one owns a single loop with a single gate, and
+nothing decides what a bot should do when its loop has nothing to offer.
+
+The early-game loop breaks the deadlock because a novice's motivation is
+internal: **it kills because it needs XP**, not because the market asked. That
+is why F_0.9.6 bypasses the demand gate below the graduation tier, and why
+these three chunks were inserted ahead of the bazaar work rather than after it.
+
+### 5c.2 The arc the owner specified
+
+A sim bot should spawn looking like a new player and walk the whole early game
+without assistance:
+
+1. Mint at novice with a **goal template** — the worked example is
+   Master Brawler / Master Swordsman / Master Pikeman / Medic 2000 /
+   Fencer 3200, a real PVE template. Note the SWG box-count shorthand:
+   "Medic 2000" and "Fencer 3200" are partial trees, not masters, which is
+   what forces `goalSkills` to be a set (F_0.9.6 P1).
+2. Spawn already holding the items needed to fight low-end creatures for each
+   line in the template.
+3. Pick a line to advance, equip the matching starter weapon, leave the city
+   (the worked example is a Swordsman leaving Mos Eisley), and find a
+   low-HAM creature such as a womp rat.
+4. Kill it honestly. **No cheat kills** — server knowledge may pick the
+   target, never decide the fight (invariant recorded in F_0.9.6).
+5. Take a break, recover HAM, kill again, until the next box is affordable.
+6. Train the box, **learn the attack it grants, and then use that attack** on
+   subsequent kills (F_0.9.7).
+7. As internal level and available specials grow, graduate to missions —
+   starting with non-aggro targets (F_0.9.8).
+8. Spend the resulting credits: pay a buffer when one is available, then take
+   better missions.
+9. Only then move on to buying and selling on the market (F_0.9.9 / F_0.9.10).
+
+### 5c.3 Lair tactics — owner domain knowledge, verified against the code
+
+This is player knowledge that exists nowhere in the codebase and is the
+tactical specification for F_0.9.8. Every mechanic below was confirmed present
+in `LairObserverImplementation.cpp`.
+
+- A lair holds **three waves** of creatures (`spawnNumber < 3`, `:87`).
+- **Attacking the lair aggros every living creature** at once
+  (`doAggro(lair, attacker, allAttack)`, `:267`).
+- **Damaging the lair forces the next wave out**, sooner the more damage is
+  dealt (`DAMAGERECEIVED` → `checkForNewSpawns`, `:70-96`).
+- **Creatures heal the lair** while it stands (`healLair`, `:309-333`).
+- Creature lairs with `hasBossMobs()` spawn boss mobs once `spawnNumber >= 3`
+  (`:99`).
+- XP comes from the **kills**; credits come from the **destroy mission** when
+  the lair is finally destroyed.
+
+Two viable tactics follow, and which one a bot may use is a function of tier,
+armour and buffs:
+
+**High skill — stand and AoE.** With buffs, armour and an area attack such as
+spin attack, stand on the lair, damage it continuously, and kill each wave as
+it is forced out. Fast XP and fast credits. Requires the survivability to tank
+a full aggro pull.
+
+**Low skill — pull discipline.** A novice doing the above dies. Instead:
+pull **one creature at a time** and kill it away from the lair; when the wave
+is clear, attack the lair only until the next wave pops; **stop attacking the
+lair the instant it does**, so the new wave is not aggroed as a group; clear
+that wave one at a time; repeat until the lair is destroyed.
+
+The critical implementation note is that the stop condition is **observable**:
+the wave boundary is a `spawnNumber` increment, not a heuristic or a timer.
+The failure mode to design against is reacting to that increment too slowly
+and eating a full-group aggro.
+
+### 5c.4 Mission-system health — genuinely unknown
+
+The owner's observation that missions look broken ("we saw missions being
+abandoned a lot") is **partly a telemetry artifact that has already been
+fixed**. From `SimHunterController.cpp:1923-1930`: forcing `abandoned=true` on
+a failed walk home "re-labelled successful hunts as abandonments and was the
+single dominant churn source observed live (34 of 34 abandons were
+`path_failed_TRAVEL_HOME`)". A second note at `:1528` records that the real
+abandon cause was being overwritten by a generic reason downstream, with a
+`MissionDiagLog` event added to capture it.
+
+Current counters are 0 abandoned / 0 completed — but with **zero missions
+attempted**, that is not evidence of health. Whether the mission system is
+actually sound cannot be answered until there is traffic, which F_0.9.6's
+grind loop will finally produce. F_0.9.8 should be planned on the assumption
+that it may have to absorb mission defects that surface for the first time.
+
+### 5c.5 Decisions applied, and what deferred to P.11
+
+Applied to the chunk designs above:
+
+- **Novices bypass the demand gate entirely** below a configured graduation
+  tier. Without this the grind loop inherits the exact deadlock it exists to
+  break.
+- **One canonical PVE template** ships in F_0.9.6. `goalSkills` being a vector
+  makes a template library cheap later; one template keeps the first live
+  verification honest.
+- **The arbiter stays thin** — two activities in F_0.9.6, modes added by later
+  chunks. Introducing it as a large refactor up front is the version of this
+  that breaks the working PvE and PvP controllers.
+
+Deferred to **P.11** (explicitly out of scope for P.10): players grouping with
+bots, a galaxy-wide LFG channel for requesting bots by profession template, and
+group boss content such as the Death Watch Bunker. Groundwork investigation
+done 2026-09-08 found that bot→player grouping already exists from P.6.3c
+(`GroupManager.cpp:186-196`), that player→bot grouping is a small delta because
+`inviteToGroup` already sets `groupInviterID` on any `CreatureObject` and the
+pet auto-join path (`:150-159`) is a working template, and that bots already
+post to real galaxy chat rooms via `postPvpFactionRoom`
+(`SimPlayerManager.cpp:41291`) with no player object required. **The blocker
+for group content is the open traversal egress defect (F_0.8.2)** — bots can
+enter structures but `exitStructure` is still harness-only, which makes any
+multi-cell dungeon a one-way trip. That must close before P.11 group content
+is planned.
 
 ## 6. engine3 policy and inventory
 
@@ -674,14 +969,14 @@ Modelled on `structureTraversalTest` (`sim_player_manager.lua:841`,
 
 1. **Profession allocation policy — DECIDED: option 4, the hybrid.** A
    role-class split is the hard envelope, demand-weighted allocation chooses
-   templates inside each class, and every template keeps a floor. F_0.9.8
+   templates inside each class, and every template keeps a floor. F_0.9.11
    implements exactly this.
 
 2. **Human-listing policy — DEFERRED, needs a formula.** Owner's framing:
    bots play forever while players need real time to harvest and add value, so
    the open question is whether bots become the market's *seed* (players
    consume) or its *competitor* (players are priced out). Until a formula
-   exists, F_0.9.6/F_0.9.7 ship restricted: bots trade only with bot and
+   exists, F_0.9.9/F_0.9.10 ship restricted: bots trade only with bot and
    seeded (`market_seeder.lua`) listings, never undercutting or buying a human
    listing. Those two chunk plans must open with the formula proposal
    (candidate levers: a price floor tied to real gather time, a per-family
@@ -699,7 +994,7 @@ Modelled on `structureTraversalTest` (`sim_player_manager.lua:841`,
    "is a bot" signal, and let the **roster identity** be the authority for
    anything durable — a body with no `pveBodyIdentityIds` mapping is not a
    PlayerBot for progression purposes, whatever flags it carries. `AiAgent`
-   gains nothing. F_0.9.8's profession templates are *data* (mobile template
+   gains nothing. F_0.9.11's profession templates are *data* (mobile template
    names in Lua), not new C++ classes. One resolver
    (`resolvePlayerBotIdentity`), one creation function, one award API used by
    every capability chunk; each chunk adds callers, never a parallel
