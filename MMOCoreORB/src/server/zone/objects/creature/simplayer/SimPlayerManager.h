@@ -29,6 +29,7 @@
 // would declare a DIFFERENT type and make every reference ambiguous.
 #include "server/zone/objects/tangible/LairObject.h"
 #include "server/zone/managers/creature/LairObserver.h"
+#include "server/zone/objects/creature/simplayer/SimEarlyGameDeathLog.h"
 
 using namespace server::zone;
 
@@ -148,7 +149,7 @@ struct SimBotProgression {
 struct SimBotTrainingPlan {
 	String name;
 	String profession;
-	String goalSkill;
+	Vector<String> goalSkills;
 	String weaponTemplate;
 	String weaponType;
 	String loadError;
@@ -168,6 +169,189 @@ struct SimBotTrainingStep {
 	String xpType;
 	int lifetimeEarnedThreshold = 0;
 	bool valid = false;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// P.10g: tunables for the self-motivated novice grind. The gate itself is
+// resolved by playerBotEarlyGameGateEnabled(); this snapshot contains only
+// configured capability values so a controller never reads a partially
+// refreshed Lua object.
+struct SimBotEarlyGameConfig {
+	float grindAnchorMinMeters = 400.f;
+	float grindAnchorMaxMeters = 900.f;
+	int anchorMaxAttempts = 8;
+	float anchorArriveMeters = 32.f;
+	int scanMaxAttempts = 3;
+	int scanRetrySeconds = 5;
+	float minTtkSeconds = 20.f;
+	float maxTtkSeconds = 900.f;
+	// Level band around the novice's skill tier (its level, rising as it
+	// trains): targets from tier - levelBandBelow to tier + levelBandAbove,
+	// preferring the closest level. Self-defence applies only the upper bound.
+	int levelBandBelow = 3;
+	int levelBandAbove = 3;
+	float assumedHitRate = 0.75f;
+	float fleeHamFraction = 0.30f;
+	float restHamFraction = 0.70f;
+	// Default-off movement telemetry for early-game bodies (hot-reloaded).
+	bool movementTelemetry = false;
+	// Default-off combat telemetry for early-game bodies (hot-reloaded).
+	bool combatTelemetry = false;
+	// Grind anchors avoid recent death sites; a 0 radius disables it.
+	float deathAvoidRadiusMeters = 150.f;
+	int deathAvoidMemory = 4;
+	int deathAvoidSeconds = 3600;
+	// Clone wounds on a planned novice body are capped per pool at this
+	// fraction of the pool's maximum. 0 heals every wound on death (owner rule
+	// until medic bots can heal wounds at med centers).
+	float cloneWoundMaxFraction = 0.f;
+	// Proactive target selection skips creatures that pull their group into
+	// the fight. Only PACK creatures of the same social group assist
+	// (AiAgent::notifyPackMobs); herds do not. Self-defence still fights back.
+	bool avoidGroupAggroTargets = true;
+	// Grind anchors come from the static spawner points (spawn eggs) around the
+	// novice's home city, visited in rotation; the bearing ring is the fallback.
+	bool roamCitySpawners = true;
+	float spawnerSearchRadiusMeters = 1000.f;
+	bool skipInactiveSpawners = true;
+	// Arrival distance at a spawner: close enough for the scan to cover its pod.
+	float spawnerArriveMeters = 60.f;
+	// Unreachable-target memory: a target whose path failed is skipped this
+	// long, and at most this many are remembered (the soonest-expiring entry is
+	// replaced when full).
+	int unreachableSkipSeconds = 60;
+	int unreachableSkipMaxTargets = 8;
+	Vector<String> deferredXpTypes;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// P.10g: a death-time outdoor replacement location. It is keyed by roster
+// identity, not body OID, because the body carrying the death is destroyed
+// before the replacement is spawned.
+struct SimBotSpawnOverride {
+	String planet;
+	Vector3 position;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// P.10g: where an early-game identity recently died. Kept on the manager row so
+// it survives body replacement; grind anchors avoid these sites.
+struct SimBotEarlyGameDeathZone {
+	String planet;
+	float x = 0.f;
+	float y = 0.f;
+	uint64 atMs = 0;
+	// The body that died here: one finalized death is one site, while a later
+	// body dying on the same spot is a new death.
+	uint64 bodyOid = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// P.10g: one early-game combat telemetry sample from the controller tick.
+struct SimBotEarlyGameCombatSample {
+	bool inCombat = false;
+	int health = 0;
+	int healthMax = 0;
+	int action = 0;
+	int actionMax = 0;
+	int mind = 0;
+	int mindMax = 0;
+	int defenderCount = 0;
+	// Up to three defenders as oid:template:lvl:distance:verdict, where the
+	// verdict names the first target-selection filter the defender fails.
+	String defenders;
+	String decision;
+	float decisionTtk = 0.f;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// P.10g: manager-owned dashboard state. Route mechanics remain on the
+// controller, while this in-process copy is the telemetry surface for a
+// roster identity across body replacement.
+struct SimBotEarlyGameState {
+	String activity = "grind";
+	bool graduated = false;
+	String phase = "LeaveCity";
+	uint64 targetOid = 0;
+	float targetTtkSeconds = 0.f;
+	// Current target was adopted in self-defence, not chosen by the TTK scan.
+	bool targetDefensive = false;
+	uint64 defensiveEngagements = 0;
+	uint64 defensiveFlees = 0;
+	String currentWeaponXpType;
+	Vector<String> stalledBoxes;
+	uint64 kills = 0;
+	uint64 deaths = 0;
+	uint64 flees = 0;
+	uint64 restCycles = 0;
+	uint64 respawns = 0;
+	uint64 anchorFallbacks = 0;
+	uint64 emptyScanRotations = 0;
+	// Movement telemetry, written only while earlyGame.movementTelemetry is on.
+	uint64 telemetryTicks = 0;
+	uint64 telemetryPathFailures = 0;
+	uint64 telemetryLastTickMs = 0;
+	uint64 telemetryBegins = 0;
+	uint64 telemetryNotIdentityExits = 0;
+	uint64 telemetryMoveRequests = 0;
+	uint64 telemetryLastMoveRequestMs = 0;
+	uint64 telemetryMoveRequestGeneration = 0;
+	uint64 telemetryWorkLoopGeneration = 0;
+	String telemetryLastGenerationReason;
+	String telemetryBranch;
+	String telemetryHybridDiag;
+	String telemetryMovementState;
+	uint64 telemetryMovementStateSinceMs = 0;
+	float telemetryPosX = 0.f;
+	float telemetryPosY = 0.f;
+	float telemetryAnchorX = 0.f;
+	float telemetryAnchorY = 0.f;
+	float telemetryDistanceToAnchor = 0.f;
+	// Route safety, kept while the early-game gate is on.
+	Vector<SimBotEarlyGameDeathZone> deathZones;
+	uint64 deathZoneRejects = 0;
+	// Combat telemetry, written only while earlyGame.combatTelemetry is on.
+	uint64 combatTicks = 0;
+	uint64 combatLastTickMs = 0;
+	bool combatInCombat = false;
+	uint64 combatInCombatSinceMs = 0;
+	uint64 combatEntries = 0;
+	int combatHealth = 0;
+	int combatHealthMax = 0;
+	int combatAction = 0;
+	int combatActionMax = 0;
+	int combatMind = 0;
+	int combatMindMax = 0;
+	int combatDefenderCount = 0;
+	String combatDefenders;
+	String combatDecision;
+	float combatDecisionTtk = 0.f;
+	// The last in-combat sample, and the captured death line.
+	String combatLastFight;
+	String combatLastDeath;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// P.10g Phase 4: the arbiter deliberately has only these two activities.
+// A planned identity stays on grind until every untrained, non-deferred box is
+// gone; deferred boxes remain visible as stalled rather than becoming hidden
+// graduation failures.
+struct SimBotActivityDecision {
+	String activity = "hunt";
+	bool graduated = true;
+	Vector<String> stalledBoxes;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -204,6 +388,9 @@ struct PlayerBotKillXpAttacker {
 };
 
 struct PlayerBotKillXpEvent {
+	// Diagnostic correlation only (F_0.9.6-D1 kill-XP trace); never used in
+	// the award arithmetic. Zero for harness-synthesised events.
+	uint64 victimOid = 0;
 	int baseXp = 0;
 	uint32 totalDamage = 0;
 	float globalMultiplier = 1.0f;
@@ -248,6 +435,8 @@ struct PlayerBotProgressionRequest {
 	uint64 identityId = 0;
 	String profession;
 	String trainingPlan;
+	// MintHarnessIdentity: mintIdentity{governed=true} opt-in.
+	bool governed = false;
 	String xpType;
 	bool force = false;
 	int faultFlushDelayMs = 0;
@@ -274,6 +463,9 @@ struct PlayerBotParityTestStep {
 	String templateName;
 	String profession;
 	String trainingPlan;
+	// mintIdentity only: opt a harness-minted identity back into population
+	// governor management (see isPlayerBotParityHarnessExempt).
+	bool governed = false;
 	String xpType;
 	String skillName;
 	String skillMod;
@@ -318,6 +510,19 @@ struct PlayerBotParityTestStep {
 	bool hasExpectedRecords = false;
 	bool hasExpectedOrphanRecords = false;
 	bool hasExpectedRosterWithoutRecord = false;
+	int expectedBoxCount = -1;
+	int expectedTotalPoints = -1;
+	bool hasExpectedBoxCount = false;
+	bool hasExpectedTotalPoints = false;
+	int expectedMinDamage = -1;
+	int expectedMaxDamage = -1;
+	bool hasExpectedMinDamage = false;
+	bool hasExpectedMaxDamage = false;
+	bool expectedGraduated = false;
+	bool hasExpectedGraduated = false;
+	// Optional assertActivity detail: also require this deferred box to be
+	// present in the manager state published to the dashboard.
+	String stalledBox;
 	int requestBudgetMs = 30000;
 	uint64 runtimeRequestId = 0;
 	uint64 runtimeStartedAtMs = 0;
@@ -330,6 +535,14 @@ struct PlayerBotParityTestScenario {
 	String name;
 	Vector<PlayerBotParityTestStep> steps;
 	int budgetMs = 300000;
+	// F_0.9.6-D1: capability gates this scenario CANNOT pass without. A
+	// scenario that needs a gate it neither declares nor arms itself fails
+	// fast and by name instead of polling a state that can never arrive.
+	Vector<String> requiresGates;
+	// The symmetric case: a scenario that asserts a gate-OFF branch and relies
+	// on the shipped default. Arming that gate in configuration silently
+	// inverts what the scenario tests.
+	Vector<String> requiresGatesOff;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -1073,6 +1286,13 @@ public:
 		bool logEverySimLoopTick = true;
 	};
 
+	struct SimBotCombatDiagConfig {
+		bool logging = false;
+		bool traceSpawnedTargets = true;
+		int maxLinesPerAgent = 2000;
+		int heartbeatSeconds = 30;
+	};
+
 	struct StructureTraversalConfig {
 		struct HollowScanConfig {
 			bool enabled = false;
@@ -1422,6 +1642,8 @@ public:
 private:
 	bool enabled = false;
 	CellNavDiagConfig cellNavDiagConfig;
+	SimBotCombatDiagConfig combatDiagConfig;
+	uint64 combatDiagLastHeartbeatMs = 0;
 	StructureTraversalConfig structureTraversalConfig;
 	StructureTraversalTestConfig structureTraversalTestConfig;
 	AtomicLong structureTraversalTeleportAnomalies;
@@ -1935,6 +2157,7 @@ private:
 	VectorMap<uint64, uint64> pveIdentityBodyOids;
 	VectorMap<uint64, uint64> pveBodyIdentityIds;
 	VectorMap<uint64, uint64> pveRespawnDueAtMs;
+	VectorMap<uint64, SimBotSpawnOverride> pveDeathSpawnOverrides;
 	VectorMap<uint64, bool> pveRetiringIdentityIds;
 	VectorMap<uint64, bool> pveDirtyIdentityIds;
 
@@ -1946,10 +2169,15 @@ private:
 	VectorMap<uint64, bool> progressionDirtyIds;
 	VectorMap<uint64, bool> progressionRetiringIds;
 	Vector<uint64> progressionOrphanIds;
+	VectorMap<uint64, SimBotEarlyGameState> progressionEarlyGameStates;
 	bool progressionEnabled = false;
 	bool progressionAwardKillXp = false;
 	bool progressionTrainingEnabled = false;
+	bool progressionEarlyGameEnabled = false;
+	bool progressionEarlyGameRealWeaponDamage = false;
 	float progressionKillXpRate = 1.0f;
+	SimBotEarlyGameConfig progressionEarlyGameConfig;
+	VectorMap<String, String> progressionEarlyGameWeaponsByXpType;
 	VectorMap<String, SimBotTrainingPlan> progressionTrainingPlans;
 	// Guards against the per-tick config refresh resetting the sweep cursor and
 	// dropping queued training work; see buildTrainingPlansFromConfig.
@@ -1983,6 +2211,12 @@ private:
 	AtomicLong killXpTotalAwarded;
 	AtomicLong killXpCappedByLevel;
 	AtomicLong killXpCappedByCeiling;
+	// Kill XP lost before an award is considered. Counted only while the
+	// kill-XP gate is on and a sim bot is in the victim's threat map.
+	AtomicLong killXpBotKillsSeen;
+	AtomicLong killXpDroppedNoDamage;
+	AtomicLong killXpDroppedNoBaseXp;
+	AtomicLong killXpDroppedNoSimBotAttacker;
 	AtomicLong progressionOrphanRecords;
 	AtomicLong progressionRosterWithoutRecord;
 	AtomicLong progressionOrphansReaped;
@@ -2057,6 +2291,18 @@ private:
 	bool playerBotParityTestTrainingGateOverride = false;
 	bool playerBotParityTestTrainingGateOverridePreviousActive = false;
 	bool playerBotParityTestTrainingGateOverridePrevious = false;
+	// F_0.9.6: each capability gets its OWN override pair. Sharing the award
+	// override would make setGate silently move the early-game gates too, and
+	// folding the configured flag into the override would repeat the F_0.9.5
+	// defect where a default-off capability could never be exercised live.
+	bool playerBotParityTestEarlyGameGateOverrideActive = false;
+	bool playerBotParityTestEarlyGameGateOverride = false;
+	bool playerBotParityTestEarlyGameGateOverridePreviousActive = false;
+	bool playerBotParityTestEarlyGameGateOverridePrevious = false;
+	bool playerBotParityTestRealWeaponDamageGateOverrideActive = false;
+	bool playerBotParityTestRealWeaponDamageGateOverride = false;
+	bool playerBotParityTestRealWeaponDamageGateOverridePreviousActive = false;
+	bool playerBotParityTestRealWeaponDamageGateOverridePrevious = false;
 	// Guarded by pveMutex alongside pveNoviceEnabled itself, deliberately NOT by
 	// playerBotParityTestMutex: readers of pveNoviceEnabled already hold
 	// pveMutex, and reaching for the parity mutex under it would invert the
@@ -2086,6 +2332,23 @@ private:
 	float playerBotParityTestKillTargetRate = 1.0f;
 	int playerBotParityTestKillTargetExpectedDirect = 0;
 	int playerBotParityTestKillTargetExpectedCombatGeneral = 0;
+	// Target OID the kill oracle settled on; assertXp keeps using it after the
+	// target itself has been despawned.
+	uint64 playerBotParityTestKillTargetSettledOid = 0;
+	// F_0.9.6 harness isolation. A LEAF mutex: nothing else is acquired while it
+	// is held, so it may be taken under pveMutex (governor, eligibility), under
+	// playerBotParityTestMutex, and from the kill-XP award task without
+	// touching the established pve -> parity order.
+	mutable Mutex playerBotParityHarnessMutex;
+	// Identities minted by mintIdentity -> true when the scenario opted back
+	// into governor management with governed=true.
+	VectorMap<uint64, bool> playerBotParityHarnessMintedIds;
+	// Real kill-XP grants to harness-minted identities, keyed
+	// "<identityId>|<victimOid>|<xpType>" -> awarded. Lets the kill oracle credit
+	// the spawned target separately from bystanders a cone special also kills.
+	VectorMap<String, int64> playerBotParityKillAwardLedger;
+	// Per harness identity: when its most recent kill grant was recorded.
+	VectorMap<uint64, uint64> playerBotParityKillAwardLastMs;
 	uint64 playerBotParityTestProbeIdentityId = 0;
 	uint64 playerBotParityTestScenarioBaselineRecords = 0;
 	uint64 playerBotParityTestHarnessRowsStale = 0;
@@ -2162,6 +2425,13 @@ private:
 	bool pveNoviceEnabled = false;
 	bool pveRetireLegacyHunters = false;
 	String pveNoviceBodyTemplate;
+	// Optional spawn/grind city for planned novices (shuttleport name). Empty
+	// keeps each identity's own home city. Guarded by pveMutex.
+	String pveNoviceSpawnPlanet;
+	String pveNoviceSpawnCity;
+	// HAM for every pool of a planned novice body, like a starting player.
+	// 0 keeps the mobile template. Guarded by pveMutex.
+	int pveNoviceBodyHam = 0;
 	Vector<PveNoviceDistribution> pveNoviceDistribution;
 	bool pveMissionHuntEnabled = false;
 	bool pveMissionBoardEnabled = false;
@@ -2300,14 +2570,15 @@ private:
 	void buildTrainingPlansFromConfig(LuaObject& config);
 	bool computePlayerBotNextTrainingStepLocked(uint64 identityId,
 		const String& planName, const SimBotProgression& progression,
-		SimBotTrainingStep& step) const;
+		SimBotTrainingStep& step, bool earlyGameGateEnabled) const;
 	// trainingGateEnabled is a PARAMETER, not a call to
 	// playerBotTrainingGateEnabled(), because this runs with progressionMutex
 	// held and that helper takes playerBotParityTestMutex. Callers evaluate the
 	// gate before locking so the two mutexes are never nested in this order.
 	void refreshPlayerBotTrainingStepLocked(uint64 identityId,
 		const String& planName, const SimBotProgression& progression,
-		bool enqueueIfAffordable, bool trainingGateEnabled);
+		bool enqueueIfAffordable, bool trainingGateEnabled,
+		bool earlyGameGateEnabled);
 	void drainPlayerBotTrainingQueue();
 	void runPlayerBotTrainingSweep();
 	SimBotBodyProgression buildBodyProgressionSnapshot(uint64 identityId);
@@ -2315,14 +2586,32 @@ private:
 	// takes no manager mutex and must never be called while one is held.
 	void applyProgressionToBody(AiAgent* agent,
 		const SimBotBodyProgression& snapshot);
+	// Precondition: the caller holds agent. No manager mutex may be acquired.
+	// The weapon input is a snapshot taken before the agent lock; an empty
+	// template means the stock creature weapon and an empty selection means no
+	// early-game weapon mapping was applicable.
+	bool equipPlayerBotWeaponLocked(AiAgent* agent,
+		const String& weaponTemplate, const String& expectedXpType,
+		bool restoreRealWeaponDamage, bool forceEquip = false);
+	void restorePlayerBotWeaponTemplateStats(WeaponObject* weapon);
+	bool selectPlayerBotEarlyGameWeapon(const SimBotIdentity& identity,
+		String& weaponTemplate, String& expectedXpType);
 	void reapplyPlayerBotProgressionToLiveBody(uint64 identityId);
 	void applyPlayerBotParityTestConfig(LuaObject& config);
 	void loadPveIdentityRoster();
+	void refreshPlayerBotActivityStates();
 	void mintPveIdentitiesIfNeeded();
 	bool mintPveIdentity(const String& profession, SimBotIdentity& identityOut,
 		const String& trainingPlan = String());
 	bool isPveHuntEligible(const SimBotIdentity& identity) const;
 	bool isGovernorManagedIdentity(const SimBotIdentity& identity) const;
+	bool isPlayerBotParityHarnessExempt(uint64 identityId) const;
+	void recordPlayerBotParityKillAward(uint64 identityId, uint64 victimOid,
+		const String& xpType, int awarded);
+	void readPlayerBotParityKillAwards(uint64 identityId, uint64 targetOid,
+		const String& xpType, int64& targetAwarded, bool& targetFound,
+		int64& otherAwarded);
+	uint64 getPlayerBotParityKillAwardLastMs(uint64 identityId);
 	void reconcileNoviceGrants();
 	void retirePveIdentity(uint64 identityId);
 	bool drainPveIdentityBody(uint64 identityId, uint64 nowMs);
@@ -2394,6 +2683,13 @@ private:
 		int amount, const String& source);
 	bool playerBotProgressionAwardGateEnabled();
 	bool playerBotTrainingGateEnabled();
+	// Returns false and names the offending gate when a scenario declares a
+	// requiresGates entry that is neither armed in configuration nor armed by
+	// one of the scenario's own steps.
+	bool playerBotParityScenarioPreconditionsMet(
+		const PlayerBotParityTestScenario& scenario, String& failReason);
+	bool playerBotEarlyGameGateEnabled();
+	bool playerBotRealWeaponDamageGateEnabled();
 	// Restores pveNoviceEnabled to its pre-override value and drops the latch.
 	// MUST be called on every scenario exit and cleanup path: leaving the latch
 	// set makes applyPveConfig ignore the Lua value indefinitely, and a
@@ -2405,6 +2701,12 @@ private:
 	void runPveHunterMatchmaker(uint64 nowMs);
 	void validatePveHuntGrounds();
 	void attachPveHunterController(const SimBotIdentity& identity, AiAgent* body);
+	bool resolvePveDeathSpawnOverride(uint64 bodyOid,
+		SimBotSpawnOverride& result);
+	// Planet and world position of a dead body, read under the corpse lock.
+	// Takes no manager mutex.
+	bool resolvePveDeathSite(uint64 bodyOid, String& planet,
+		Vector3& position);
 	AiAgent* spawnPveIdentityBody(const SimBotIdentity& identity,
 		const Vector3* spawnOverride = nullptr);
 	void recordPveHunterHarvest(uint64 identityId, uint64 targetOid,
@@ -2454,6 +2756,7 @@ private:
 		uint64 lairOid);
 	void buildPveLairYieldIndex();
 	JSONSerializationType getPveActivityDashboard();
+	JSONSerializationType getCombatDiagDashboard();
 	JSONSerializationType getPveSpikeDashboard();
 	JSONSerializationType getPlayerBotProgressionDashboard();
 
@@ -3010,6 +3313,12 @@ public:
 	void awardPlayerBotKillExperience(const PlayerBotKillXpEvent& event);
 	void awardPlayerBotKillExperience(const PlayerBotKillXpEvent& event,
 		const PlayerBotKillXpParams& params);
+	void recordPlayerBotKillXpBotKillSeen() {
+		killXpBotKillsSeen.increment();
+	}
+	void recordPlayerBotKillXpDrop(const String& stage, const String& reason,
+		uint64 victimOid, const String& victimTemplate, int baseXp,
+		uint32 totalDamage, int threatEntries, uint64 botOid, uint32 botDamage);
 	bool grantPlayerBotCredits(uint64 identityId, int64 amount, bool bank,
 		const String& source);
 	bool spendPlayerBotCredits(uint64 identityId, int64 amount, bool bank,
@@ -3024,6 +3333,58 @@ public:
 	uint64 resolvePlayerBotIdentity(uint64 bodyOid);
 	bool snapshotPlayerBotProgression(uint64 identityId,
 		SimBotProgression& out);
+	void scorePlayerBotActivity(const SimBotIdentity& identity,
+		SimBotActivityDecision& out);
+	void declinePveHunterOrder(uint64 identityId, uint64 bodyOid,
+		const String& reason);
+	bool isPlayerBotEarlyGameIdentity(uint64 identityId);
+	bool snapshotPlayerBotIdentity(uint64 identityId, SimBotIdentity& out);
+	void getPlayerBotEarlyGameConfig(SimBotEarlyGameConfig& out);
+	void setPlayerBotEarlyGamePhase(uint64 identityId, const String& phase,
+		uint64 targetOid, float targetTtkSeconds,
+		const String& currentWeaponXpType, bool targetDefensive);
+	void recordPlayerBotEarlyGameDefense(uint64 identityId, bool engaged);
+	void recordPlayerBotEarlyGameKill(uint64 identityId);
+	void recordPlayerBotEarlyGameDeath(uint64 identityId);
+	void recordPlayerBotEarlyGameFlee(uint64 identityId);
+	void recordPlayerBotEarlyGameRest(uint64 identityId);
+	void recordPlayerBotEarlyGameRespawn(uint64 identityId);
+	void recordPlayerBotEarlyGameAnchorFallback(uint64 identityId);
+	void recordPlayerBotEarlyGameEmptyScanRotation(uint64 identityId);
+	bool isPlayerBotEarlyGameMovementTelemetryEnabled();
+	// Home city a planned novice spawns at and grinds around: the configured
+	// novice spawn city when set and known, otherwise the identity's own.
+	// Takes pveMutex; callers must not hold it.
+	void resolvePlayerBotHomeCity(const SimBotIdentity& identity,
+		String& planet, String& city);
+	// One movement-telemetry sample from a SimHunterController early-game path.
+	// Updates an EXISTING early-game row only and is a no-op while the gate is
+	// off. Takes progressionMutex alone; callers hold no agent or manager lock.
+	void recordPlayerBotEarlyGameMovement(uint64 identityId,
+		const String& branch, bool tickEvent, bool beginEvent,
+		bool notIdentityExit, bool moveRequested, const String& movementState,
+		uint64 workLoopGeneration, const String& lastGenerationReason,
+		const Vector3& position, const Vector3& anchor,
+		const String& hybridDiag);
+	// Default-off combat telemetry (earlyGame.combatTelemetry); lock-free gate.
+	bool isPlayerBotEarlyGameCombatTelemetryEnabled();
+	// One combat sample from the early-game tick. Updates an EXISTING row only
+	// and is a no-op while the gate is off. Takes progressionMutex alone and logs
+	// a combat-entry or decision-change line after releasing it.
+	void recordPlayerBotEarlyGameCombatTick(uint64 identityId,
+		const SimBotEarlyGameCombatSample& sample);
+	// A dead early-game body: remembers the death site for anchor avoidance and,
+	// with telemetry on, publishes and logs the captured killing blow (cause may
+	// be null). Callers hold no agent or manager lock.
+	void recordPlayerBotEarlyGameDeathSite(uint64 identityId, uint64 bodyOid,
+		const String& planet, const Vector3& position,
+		const SimEarlyGameDeathCause* cause);
+	// Unexpired death sites on planet, plus the configured avoid radius.
+	void getPlayerBotEarlyGameDeathZones(uint64 identityId, const String& planet,
+		Vector<SimBotEarlyGameDeathZone>& out, float& radiusMeters);
+	void recordPlayerBotEarlyGameDeathZoneReject(uint64 identityId);
+	bool snapshotPlayerBotEarlyGameStates(
+		VectorMap<uint64, SimBotEarlyGameState>& out);
 
 	// F.0.4.11: shared travel resolvers. World scans happen without an agent
 	// lock; the resolver takes only short object snapshots and validates the
@@ -3360,6 +3721,7 @@ public:
 	// friends; it only updates in-memory spike state and never touches SQL.
 	void schedulePveFoundationMaintenanceTask();
 	void runPveFoundationMaintenanceTask();
+	void runCombatDiagHeartbeat(uint64 nowMs);
 	void handlePveDestructionHandoff(uint64 targetOid, uint64 participantOid,
 		bool participantVerified);
 	void handlePveHunterDestructionHandoff(uint64 hunterOid, uint64 targetOid,

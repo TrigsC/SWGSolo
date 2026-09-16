@@ -369,6 +369,44 @@ protected:
     HybridLeg hybridLeg;
     Vector3 hybridEgressPoint;
     uint64 workLoopGeneration;
+    // Last reason passed to advanceWorkLoopGeneration. Diagnostic only; it can
+    // be written from a path-result task, so it is guarded by its own leaf mutex.
+    String lastWorkLoopAdvanceReason;
+    mutable Mutex lastWorkLoopAdvanceReasonMutex;
+    // Hybrid-leg diagnostics for early-game movement telemetry. Written from the
+    // controller and path-result tasks, so every field is atomic.
+    std::atomic<int> hybridDiagLeg{0};
+    std::atomic<bool> hybridDiagOnMesh{false};
+    std::atomic<uint64> hybridDiagCurrentAreaOid{0};
+    std::atomic<bool> hybridDiagTargetOnSameMesh{false};
+    std::atomic<bool> hybridDiagExitResolved{false};
+    std::atomic<uint64> hybridDiagExitAreaOid{0};
+    std::atomic<uint64> hybridDiagRecastRequests{0};
+    std::atomic<uint64> hybridDiagExitResolveFailures{0};
+    std::atomic<uint64> hybridDiagNavmeshTaskFailures{0};
+    // Failure-only recast probe (enabled by the hunter while early-game movement
+    // telemetry is on). Distinguishes start-poly, end-poly and partial-route
+    // failures of a navmesh recast leg.
+    std::atomic<bool> hybridFailureProbeEnabled{false};
+    std::atomic<uint64> hybridProbeCount{0};
+    std::atomic<bool> hybridProbeStartPoly{false};
+    std::atomic<bool> hybridProbeEndPoly{false};
+    std::atomic<bool> hybridProbePartialRoute{false};
+    std::atomic<bool> hybridProbeStartInArea{false};
+    std::atomic<bool> hybridProbeEndInArea{false};
+    std::atomic<float> hybridProbeStartX{0.f};
+    std::atomic<float> hybridProbeStartY{0.f};
+    std::atomic<float> hybridProbeStartZ{0.f};
+    std::atomic<float> hybridProbeStartTerrainZ{0.f};
+    std::atomic<float> hybridProbeEndX{0.f};
+    std::atomic<float> hybridProbeEndY{0.f};
+    std::atomic<float> hybridProbeEndZ{0.f};
+    std::atomic<int> hybridProbePartialPoints{0};
+    std::atomic<float> hybridProbePartialEndX{0.f};
+    std::atomic<float> hybridProbePartialEndY{0.f};
+    std::atomic<float> hybridProbePartialEndToTarget{0.f};
+    std::atomic<float> hybridProbePartialEndFromStart{0.f};
+    std::atomic<bool> hybridProbeMidStrict{false};
     // A cell-aware provider approach is a complete base-path leg even for
     // hunters, whose normal wilderness legs use the hybrid mover.
     bool interiorApproachLeg;
@@ -579,6 +617,20 @@ public:
     // The invariant half of the template method above.
     bool acceptFoundPathInvariants(const Vector3& pathEnd);
     uint64 getWorkLoopGeneration() const { return workLoopGeneration; }
+    String getLastWorkLoopAdvanceReason() const;
+    String getHybridPathDiagLine() const;
+    void setHybridFailureProbeEnabled(bool enabled) {
+        hybridFailureProbeEnabled.store(enabled, std::memory_order_relaxed);
+    }
+    bool isHybridFailureProbeEnabled() const {
+        return hybridFailureProbeEnabled.load(std::memory_order_relaxed);
+    }
+    void recordHybridRecastFailureProbe(bool startPoly, bool endPoly,
+        bool partialRoute, bool startInArea, bool endInArea,
+        const Vector3& start, const Vector3& end, float startTerrainZ);
+    void recordHybridRecastPartialProbe(int partialPoints,
+        const Vector3& partialEnd, float partialEndToTarget,
+        float partialEndFromStart, bool midStrict);
     uint64 advanceWorkLoopGeneration(const String& reason);
     bool isWorkLoopGenerationCurrent(uint64 capturedGeneration, const String& taskType);
     

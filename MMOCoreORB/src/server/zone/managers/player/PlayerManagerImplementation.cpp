@@ -22,6 +22,7 @@
 //#include "server/zone/managers/creature/CreatureTemplateManager.h"
 #include "server/zone/objects/creature/ai/CreatureTemplate.h"
 #include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
+#include "server/zone/objects/creature/simplayer/SimCombatDiagLog.h"
 #include "server/zone/managers/object/ObjectManager.h"
 #include "server/zone/managers/faction/FactionManager.h"
 #include "server/zone/managers/frs/FrsManager.h"
@@ -1904,10 +1905,88 @@ void PlayerManagerImplementation::ejectPlayerFromBuilding(CreatureObject* player
 	}
 }
 
+// F_0.9.6-D1: why a death did or did not become a PlayerBot kill-XP event.
+// Written under the victim OID and every threat-map attacker OID; the logger
+// keeps only allowlisted OIDs, and the atomic gate keeps the default-off cost to
+// one load per death.
+static void emitSimKillXpDisseminateDiag(TangibleObject* destructedObject,
+		ThreatMap* threatMap, const String& stage, int baseXp, uint32 totalDamage) {
+	if (!SimCombatDiagLog::isLoggingEnabled() || destructedObject == nullptr)
+		return;
+
+	uint64 victimOid = destructedObject->getObjectID();
+	StringBuffer diag;
+	diag << "victimOid=" << victimOid << " stage=" << stage
+		<< " baseXp=" << baseXp << " totalDamage=" << totalDamage
+		<< " threatEntries=" << (threatMap == nullptr ? 0 : threatMap->size());
+	StringBuffer outcome;
+	outcome << "kill_xp_disseminate_" << victimOid << "_" << stage;
+
+	SimCombatDiagLog::event("KILL_XP_DISSEMINATE", victimOid, diag.toString(),
+		outcome.toString());
+	if (threatMap == nullptr)
+		return;
+	for (int i = 0; i < threatMap->size(); ++i) {
+		TangibleObject* attacker = threatMap->elementAt(i).getKey();
+		if (attacker != nullptr)
+			SimCombatDiagLog::event("KILL_XP_DISSEMINATE", attacker->getObjectID(),
+				diag.toString(), outcome.toString());
+	}
+}
+
+// F_0.9.6: the first sim bot in a victim's threat map, so kill XP that never
+// reaches an award is counted instead of vanishing. Same unlocked predicates as
+// the kill-XP attacker filter in disseminateExperience.
+static bool findSimKillXpBotEntry(ThreatMap* threatMap, uint64& botOid,
+		uint32& botDamage, TangibleObject*& botAttacker) {
+	botOid = 0;
+	botDamage = 0;
+	botAttacker = nullptr;
+	if (threatMap == nullptr)
+		return false;
+	for (int i = 0; i < threatMap->size(); ++i) {
+		TangibleObject* attacker = threatMap->elementAt(i).getKey();
+		if (attacker == nullptr || !attacker->isAiAgent())
+			continue;
+		AiAgent* attackerAgent = attacker->asAiAgent();
+		if (attackerAgent == nullptr || !attackerAgent->getSimPlayerBot())
+			continue;
+		botOid = attacker->getObjectID();
+		botDamage = threatMap->elementAt(i).getValue().getTotalDamage();
+		botAttacker = attacker;
+		return true;
+	}
+	return false;
+}
+
 void PlayerManagerImplementation::disseminateExperience(TangibleObject* destructedObject, ThreatMap* threatMap, SynchronizedVector<ManagedReference<CreatureObject*> >* spawnedCreatures,Zone* lairZone) {
 	uint32 totalDamage = threatMap->getTotalDamage();
 
+	// F_0.9.6: while the kill-XP gate is on (default off), a sim bot's kill that
+	// pays no XP is counted and logged by SimPlayerManager instead of vanishing.
+	SimPlayerManager* simKillXpManager = SimPlayerManager::instance();
+	uint64 simKillXpBotOid = 0;
+	uint32 simKillXpBotDamage = 0;
+	TangibleObject* simKillXpBot = nullptr;
+	const bool simKillXpTracked = simKillXpManager != nullptr &&
+		simKillXpManager->isPlayerBotKillXpEnabled() &&
+		findSimKillXpBotEntry(threatMap, simKillXpBotOid, simKillXpBotDamage,
+			simKillXpBot);
+	String simKillXpVictimTemplate;
+	if (simKillXpTracked) {
+		simKillXpVictimTemplate = destructedObject->getObjectTemplate() != nullptr ?
+			destructedObject->getObjectTemplate()->getFullTemplateString() :
+			String("<missing>");
+		simKillXpManager->recordPlayerBotKillXpBotKillSeen();
+	}
+
 	if (totalDamage == 0) {
+		emitSimKillXpDisseminateDiag(destructedObject, threatMap,
+			"skip_no_total_damage", 0, 0);
+		if (simKillXpTracked)
+			simKillXpManager->recordPlayerBotKillXpDrop("no_total_damage", "",
+				destructedObject->getObjectID(), simKillXpVictimTemplate, 0, 0,
+				threatMap->size(), simKillXpBotOid, simKillXpBotDamage);
 		threatMap->removeAll();
 		return;
 	}
@@ -2095,7 +2174,9 @@ void PlayerManagerImplementation::disseminateExperience(TangibleObject* destruct
 
 	if (simManager != nullptr && simManager->isPlayerBotKillXpEnabled() &&
 			baseXp > 0 && totalDamage > 0) {
+		const bool killXpDiag = SimCombatDiagLog::isLoggingEnabled();
 		PlayerBotKillXpEvent event;
+		event.victimOid = destructedObject->getObjectID();
 		event.baseXp = baseXp;
 		event.totalDamage = totalDamage;
 		event.globalMultiplier = globalExpMultiplier;
@@ -2103,6 +2184,39 @@ void PlayerManagerImplementation::disseminateExperience(TangibleObject* destruct
 		for (int i = 0; i < threatMap->size(); ++i) {
 			ThreatMapEntry* entry = &threatMap->elementAt(i).getValue();
 			TangibleObject* attacker = threatMap->elementAt(i).getKey();
+
+			// F_0.9.6-D1: the filter below drops an attacker without a trace.
+			// Re-evaluate the same predicates, in the same order, only to name
+			// which one decided; the real filter is left exactly as it was.
+			if (killXpDiag && entry != nullptr && attacker != nullptr) {
+				AiAgent* diagAgent = attacker->isAiAgent() ?
+					attacker->asAiAgent() : nullptr;
+				const char* reason = attacker->isPlayerCreature() ? "player" :
+					attacker->isPet() ? "pet" :
+					!attacker->isAiAgent() ? "not_ai" :
+					attacker->getZone() != zone ? "zone_mismatch" :
+					!destructedObject->isInRangeZoneless(attacker, 80) ?
+						"out_of_range_80m" :
+					(diagAgent == nullptr || !diagAgent->getSimPlayerBot()) ?
+						"not_sim_bot" : "included";
+				uint64 attackerOid = attacker->getObjectID();
+				StringBuffer diag;
+				diag << "victimOid=" << event.victimOid
+					<< " attackerOid=" << attackerOid
+					<< " reason=" << reason
+					<< " entryDamage=" << static_cast<uint64>(entry->getTotalDamage())
+					<< " damageTypes=" << entry->size();
+				for (int j = 0; j < entry->size(); ++j)
+					diag << " dmg_" << entry->elementAt(j).getKey() << "="
+						<< static_cast<uint64>(entry->elementAt(j).getValue());
+				StringBuffer outcome;
+				outcome << "kill_xp_candidate_" << event.victimOid << "_" <<
+					attackerOid;
+				SimCombatDiagLog::event("KILL_XP_CANDIDATE", attackerOid,
+					diag.toString(), outcome.toString());
+				SimCombatDiagLog::event("KILL_XP_CANDIDATE", event.victimOid,
+					diag.toString(), outcome.toString());
+			}
 
 			if (entry == nullptr || attacker == nullptr ||
 					attacker->isPlayerCreature() || attacker->isPet() ||
@@ -2132,12 +2246,42 @@ void PlayerManagerImplementation::disseminateExperience(TangibleObject* destruct
 		}
 
 		if (event.attackers.size() > 0) {
+			emitSimKillXpDisseminateDiag(destructedObject, threatMap,
+				"event_queued", baseXp, totalDamage);
 			Core::getTaskManager()->executeTask([event] () {
 				SimPlayerManager* awardManager = SimPlayerManager::instance();
 				if (awardManager != nullptr)
 					awardManager->awardPlayerBotKillExperience(event);
 			}, "SimPlayerBotKillXpTask");
+		} else {
+			emitSimKillXpDisseminateDiag(destructedObject, threatMap,
+				"skip_no_sim_bot_attackers", baseXp, totalDamage);
+			if (simKillXpTracked) {
+				// A bot is in the threat map but the filter above removed it.
+				const char* reason = simKillXpBot->isPet() ? "pet" :
+					simKillXpBot->getZone() != zone ? "zone_mismatch" :
+					!destructedObject->isInRangeZoneless(simKillXpBot, 80) ?
+						"out_of_range_80m" : "filtered";
+				simKillXpManager->recordPlayerBotKillXpDrop("no_sim_bot_attacker",
+					reason, destructedObject->getObjectID(), simKillXpVictimTemplate,
+					baseXp, totalDamage, threatMap->size(), simKillXpBotOid,
+					simKillXpBotDamage);
+			}
 		}
+	} else {
+		if (SimCombatDiagLog::isLoggingEnabled()) {
+			// totalDamage > 0 is already guaranteed by the early return above.
+			emitSimKillXpDisseminateDiag(destructedObject, threatMap,
+				simManager == nullptr ? "skip_no_manager" :
+				!simManager->isPlayerBotKillXpEnabled() ? "skip_gate_off" :
+				"skip_no_basexp", baseXp, totalDamage);
+		}
+		// Tracked implies the gate is on, so only a missing base XP gets here.
+		if (simKillXpTracked)
+			simKillXpManager->recordPlayerBotKillXpDrop("no_base_xp", "",
+				destructedObject->getObjectID(), simKillXpVictimTemplate, baseXp,
+				totalDamage, threatMap->size(), simKillXpBotOid,
+				simKillXpBotDamage);
 	}
 
 	Vector<uint64> playerList;

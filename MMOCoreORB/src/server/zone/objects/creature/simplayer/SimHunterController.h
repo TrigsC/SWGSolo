@@ -106,6 +106,59 @@ private:
 	int missionAddsOverCapCycles;
 	int missionAddsEngaged;
 
+	// P.10g: the self-motivated novice loop runs on the existing active tick.
+	// These route fields are transient; counters and published state live in
+	// SimPlayerManager keyed by identity.
+	enum EarlyGamePhase {
+		EARLY_LEAVE_CITY,
+		EARLY_SELECT_TARGET,
+		EARLY_ENGAGE,
+		EARLY_RECOVER,
+		EARLY_TRAIN
+	};
+	bool earlyGameActive;
+	EarlyGamePhase earlyGamePhase;
+	Vector3 earlyGameAnchor;
+	Vector3 earlyGameRestPoint;
+	int earlyGameBearingIndex;
+	int earlyGameAnchorAttempts;
+	bool earlyGameRingWidened;
+	int earlyGameScanAttempts;
+	int earlyGameScanBearingVisits;
+	uint64 earlyGameScanRetryAtMs;
+	// Earliest time LeaveCity may re-issue its walk after a path failure.
+	uint64 earlyGamePathRetryAtMs;
+	float earlyGameTargetTtkSeconds;
+	// True while the current target was adopted in self-defence rather than
+	// chosen by the TTK scan.
+	bool earlyGameTargetDefensive;
+	uint64 earlyGameRestStartedAtMs;
+	std::atomic<bool> earlyGamePathFailurePending{false};
+	std::atomic<bool> earlyGameDestructionPending{false};
+	std::atomic<uint64> earlyGameDestroyedTargetOid{0};
+	std::atomic<bool> earlyGameDestroyedParticipantVerified{false};
+	// This tick's self-defence decision, for the combat telemetry sample.
+	String earlyGameDefenseDecision;
+	float earlyGameDefenseTtk = 0.f;
+	// Last point the current recovery walk made progress from, and when.
+	Vector3 earlyGameRecoverProgressPos;
+	uint64 earlyGameRecoverProgressMs = 0;
+	// Targets whose hunt path just failed, each skipped by the scan until its
+	// own expiry (parallel vectors, same index), so unreachable creatures are
+	// not reselected in a tight loop. A single slot let two unreachable
+	// kreetles alternate for 70 min (TRIP-verify 20260915-185828). Bounded by
+	// earlyGame.unreachableSkipMaxTargets.
+	Vector<uint64> earlyGameSkipTargetOids;
+	Vector<uint64> earlyGameSkipTargetUntilMs;
+	// Reach of the weapon an early-game body actually fights with, recorded
+	// wherever that weapon is read under the agent lock (the scan and the
+	// self-defence snapshot). 0 until first read.
+	float earlyGameEngageRangeMeters = 0.f;
+	// Rotation position among the home city's spawner points, and the arrival
+	// distance of the current anchor (0 = the ring's anchorArriveMeters).
+	int earlyGameSpawnerIndex = 0;
+	float earlyGameAnchorArriveMeters = 0.f;
+
 	enum PveBuffApproachStage {
 		PVE_BUFF_APPROACH_NONE,
 		PVE_BUFF_APPROACH_MUSICIAN,
@@ -197,6 +250,37 @@ private:
 	uint64 lastTravelHeartbeatMs = 0;
 	float lastTravelHeartbeatDistance = -1.f;
 	void beginHunting();
+	void beginEarlyGame();
+	void runEarlyGameTick(AiAgent* hunter, uint64 nowMs);
+	void handleEarlyGameArrived();
+	void handleEarlyGamePathFailed();
+	void setEarlyGamePhase(EarlyGamePhase next);
+	void publishEarlyGameMovement(const String& branch, bool tickEvent,
+		bool beginEvent, bool notIdentityExit, bool moveRequested);
+	String getEarlyGamePhaseName() const;
+	String getEarlyGameWeaponXpType() const;
+	bool chooseEarlyGameAnchor(bool widenRing);
+	bool calculateEarlyGameTtk(CreatureObject* target,
+		const SimBotEarlyGameConfig& config, int skillTier,
+		WeaponObject* weapon, float rawAverageDamage, float attackPeriod,
+		float& ttkSeconds, bool allowInCombat = false) const;
+	bool isBelowEarlyGameHam(AiAgent* hunter, float fraction) const;
+	void beginEarlyGameRecovery(bool fleeing);
+	bool handleEarlyGameSelfDefense(AiAgent* hunter,
+		const SimBotEarlyGameConfig& config);
+	void handleEarlyGameTargetUnavailable();
+	void publishEarlyGameCombat(AiAgent* hunter);
+	bool isEarlyGameLegNearDeathSite(const Vector3& start,
+		const Vector3& anchor, const String& planet);
+	void capEarlyGameWounds(AiAgent* hunter, float maxFraction);
+	bool isEarlyGameRecoveryWalkStalled(AiAgent* hunter, uint64 stallMs);
+	float getEngageRangeMeters() const;
+	bool chooseEarlyGameSpawnerAnchor(const SimBotEarlyGameConfig& config);
+	void rememberEarlyGameUnreachableTarget(uint64 oid);
+	bool isEarlyGameTargetSkipped(uint64 oid, uint64 nowMs) const;
+	uint64 findUnwinnableEarlyGameAttacker(AiAgent* hunter,
+		const SimBotEarlyGameConfig& config, uint64 excludeOid);
+	float getEarlyGameArriveMeters(const SimBotEarlyGameConfig& config) const;
 	bool scanForTarget();
 	void selectTarget(AiAgent* target);
 	void engageTarget();
@@ -239,7 +323,7 @@ public:
 	bool shouldContinueArrivalChecks() const override;
 	bool usesNavmeshHybridMovement() const override { return true; }
 	bool isCombatDriverActive() const override {
-		return targetOid != 0 && (pursuing || phase == HUNTING ||
+		return targetOid != 0 && (earlyGameActive || pursuing || phase == HUNTING ||
 			phase == ENGAGING_LAIR);
 	}
 	// Only resume a hybrid travel leg while the order is genuinely active and
@@ -247,7 +331,8 @@ public:
 	// (orderActive=false) or enters cleanup, the preserved finalDestination must
 	// not revive movement toward the finished target (code-review Major).
 	bool shouldResumeHybridTravel() const override {
-		return hasFinalDestination && orderActive && !missionCleanupRequested &&
+		return hasFinalDestination &&
+			((earlyGameActive) || (orderActive && !missionCleanupRequested)) &&
 			phase != RELOCATING && phase != BUFF_TRIP;
 	}
 

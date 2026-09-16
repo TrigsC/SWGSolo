@@ -7,6 +7,7 @@
 #include "SimPvPController.h"
 #include "SimHunterController.h"
 #include "CellNavDiagLog.h"
+#include "SimCombatDiagLog.h"
 #include "StructureTraversalDiagLog.h"
 
 #include <cmath>
@@ -67,6 +68,7 @@
 #include "server/zone/objects/building/BuildingObject.h"
 #include "server/zone/objects/cell/CellObject.h"
 #include "templates/SharedObjectTemplate.h"
+#include "templates/tangible/SharedWeaponObjectTemplate.h"
 #include "templates/appearance/PortalLayout.h"
 #include "templates/appearance/FloorMesh.h"
 #include "templates/appearance/PathGraph.h"
@@ -5954,6 +5956,7 @@ void SimPlayerManager::loadLuaConfig() {
 		pveIdentityBodyOids.removeAll();
 		pveBodyIdentityIds.removeAll();
 		pveRespawnDueAtMs.removeAll();
+		pveDeathSpawnOverrides.removeAll();
 		pveRetiringIdentityIds.removeAll();
 		pveDirtyIdentityIds.removeAll();
 		pvePresenceOids.removeAll();
@@ -6028,6 +6031,9 @@ void SimPlayerManager::loadLuaConfig() {
 	pveNoviceEnabled = false;
 	pveRetireLegacyHunters = false;
 	pveNoviceBodyTemplate = "";
+	pveNoviceSpawnPlanet = "";
+	pveNoviceSpawnCity = "";
+	pveNoviceBodyHam = 0;
 	pveNoviceDistribution.removeAll();
 	pveMissionHuntEnabled = false;
 	pveMissionBoardEnabled = false;
@@ -6161,7 +6167,15 @@ void SimPlayerManager::loadLuaConfig() {
 	progressionFlushIntervalSeconds = 60;
 	progressionAwardKillXp = false;
 	progressionTrainingEnabled = false;
+	progressionEarlyGameEnabled = false;
+	progressionEarlyGameRealWeaponDamage = false;
 	progressionKillXpRate = 1.0f;
+	progressionEarlyGameConfig = SimBotEarlyGameConfig();
+	SimEarlyGameDeathLog::setEnabled(false);
+	{
+		Locker progressionLock(&progressionMutex);
+		progressionEarlyGameStates.removeAll();
+	}
 	progressionReaperEnabled = false;
 	progressionReaperMinAgeSeconds = 3600;
 	progressionFaultFlushDelayMs = 0;
@@ -6173,6 +6187,7 @@ void SimPlayerManager::loadLuaConfig() {
 		progressionRetiringIds.removeAll();
 		progressionOrphanIds.removeAll();
 		progressionTrainingPlans.removeAll();
+		progressionEarlyGameWeaponsByXpType.removeAll();
 		// Must clear alongside the map. buildTrainingPlansFromConfig returns
 		// early when the derived signature is unchanged, so a stale signature
 		// here would make the next rebuild skip reloading and leave
@@ -6198,6 +6213,12 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestOracle.removeAll();
 		playerBotParityTestRequestRefs.removeAll();
 		playerBotParityTestCounterBaselines.removeAll();
+		{
+			Locker harnessLock(&playerBotParityHarnessMutex);
+			playerBotParityHarnessMintedIds.removeAll();
+			playerBotParityKillAwardLedger.removeAll();
+			playerBotParityKillAwardLastMs.removeAll();
+		}
 		playerBotParityTestScenarioIndex = 0;
 		playerBotParityTestStepCursor = 0;
 		playerBotParityTestSetupCursor = 0;
@@ -6220,6 +6241,12 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestTrainingGateOverrideActive = false;
 		playerBotParityTestTrainingGateOverridePreviousActive = false;
 		playerBotParityTestTrainingGateOverridePrevious = false;
+		playerBotParityTestEarlyGameGateOverrideActive = false;
+		playerBotParityTestEarlyGameGateOverridePreviousActive = false;
+		playerBotParityTestEarlyGameGateOverridePrevious = false;
+		playerBotParityTestRealWeaponDamageGateOverrideActive = false;
+		playerBotParityTestRealWeaponDamageGateOverridePreviousActive = false;
+		playerBotParityTestRealWeaponDamageGateOverridePrevious = false;
 		playerBotParityTestEnabled = false;
 		playerBotParityTestStaleRowsScanned = false;
 		playerBotParityTestPhaseAFileWritten = false;
@@ -6606,6 +6633,28 @@ void SimPlayerManager::loadLuaConfig() {
             travelDiagHeartbeatSeconds, 1, 600);
     }
     travelDiagConfig.pop();
+
+    LuaObject combatDiagConfig = config.getObjectField("combatDiag");
+    if (combatDiagConfig.isValidTable()) {
+        this->combatDiagConfig.logging = combatDiagConfig.getBooleanField(
+            "logging", this->combatDiagConfig.logging);
+        this->combatDiagConfig.traceSpawnedTargets =
+            combatDiagConfig.getBooleanField("traceSpawnedTargets",
+                this->combatDiagConfig.traceSpawnedTargets);
+        this->combatDiagConfig.maxLinesPerAgent = clampMinerInt(
+            combatDiagConfig.getIntField("maxLinesPerAgent",
+                this->combatDiagConfig.maxLinesPerAgent),
+            this->combatDiagConfig.maxLinesPerAgent, 100, 100000);
+        this->combatDiagConfig.heartbeatSeconds = clampMinerInt(
+            combatDiagConfig.getIntField("heartbeatSeconds",
+                this->combatDiagConfig.heartbeatSeconds),
+            this->combatDiagConfig.heartbeatSeconds, 5, 300);
+        SimCombatDiagLog::setMaxLinesPerAgent(
+            this->combatDiagConfig.maxLinesPerAgent);
+        SimCombatDiagLog::setLoggingEnabled(
+            this->combatDiagConfig.logging);
+    }
+    combatDiagConfig.pop();
 
     LuaObject missionDiagConfig = config.getObjectField("missionDiag");
     if (missionDiagConfig.isValidTable()) {
@@ -7622,14 +7671,31 @@ void SimPlayerManager::buildTrainingPlansFromConfig(LuaObject& config) {
 			SimBotTrainingPlan plan;
 			plan.name = planTable.getStringField("name").trim();
 			plan.profession = planTable.getStringField("profession").trim();
-			plan.goalSkill = planTable.getStringField("goalSkill").trim();
+			LuaObject goalSkills = planTable.getObjectField("goalSkills");
+			bool hasGoalSkillsList = goalSkills.isValidTable();
+			if (hasGoalSkillsList) {
+				for (int goalIndex = 1;
+						goalIndex <= goalSkills.getTableSize(); ++goalIndex) {
+					String goalSkill = goalSkills.getStringAt(goalIndex).trim();
+					if (!goalSkill.isEmpty())
+						plan.goalSkills.add(goalSkill);
+				}
+			}
+			goalSkills.pop();
+			// F_0.9.5 used a scalar goalSkill. Keep accepting it so existing
+			// plans, including the parity harness configuration, remain valid.
+			if (!hasGoalSkillsList) {
+				String goalSkill = planTable.getStringField("goalSkill").trim();
+				if (!goalSkill.isEmpty())
+					plan.goalSkills.add(goalSkill);
+			}
 			plan.weaponTemplate = planTable.getStringField(
 				"weaponTemplate").trim();
 			plan.weaponType = planTable.getStringField("weaponType").trim()
 				.toLowerCase();
 			if (plan.name.isEmpty())
 				plan.name = "training_plan_" + String::valueOf(i);
-			if (plan.goalSkill.isEmpty())
+			if (plan.goalSkills.size() == 0)
 				plan.loadError = "missing_goal_skill";
 			else if (!playerBotValidWeaponType(plan.weaponType))
 				plan.loadError = "invalid_weapon_type";
@@ -7670,8 +7736,14 @@ void SimPlayerManager::buildTrainingPlansFromConfig(LuaObject& config) {
 					return true;
 				};
 
-			if (plan.loadError.isEmpty())
-				collectSkills(plan.goalSkill);
+			for (int goalIndex = 0;
+					plan.loadError.isEmpty() &&
+					goalIndex < plan.goalSkills.size(); ++goalIndex) {
+				// A cycle in one goal must not make the recursion state from that
+				// goal participate in the next goal's closure walk.
+				visiting.removeAll();
+				collectSkills(plan.goalSkills.get(goalIndex));
+			}
 
 			// Kahn's algorithm gives a topological order while choosing the
 			// lowest-cost/name-ready box at each step. This makes unrelated
@@ -7753,9 +7825,12 @@ void SimPlayerManager::buildTrainingPlansFromConfig(LuaObject& config) {
 	String signature;
 	for (int i = 0; i < loadedPlans.size(); ++i) {
 		const SimBotTrainingPlan& plan = loadedPlans.elementAt(i).getValue();
-		signature += plan.name + "|" + plan.profession + "|" + plan.goalSkill +
-			"|" + plan.weaponType + "|" + plan.weaponTemplate + "|" +
-			plan.loadError + "|" + String::valueOf(plan.totalPoints) + "|";
+		signature += plan.name + "|" + plan.profession + "|";
+		for (int j = 0; j < plan.goalSkills.size(); ++j)
+			signature += plan.goalSkills.get(j) + ",";
+		signature += "|" + plan.weaponType + "|" + plan.weaponTemplate +
+			"|" + plan.loadError + "|" + String::valueOf(plan.totalPoints) +
+			"|";
 		for (int j = 0; j < plan.orderedSkills.size(); ++j)
 			signature += plan.orderedSkills.get(j) + ",";
 		signature += ";";
@@ -7778,7 +7853,7 @@ void SimPlayerManager::buildTrainingPlansFromConfig(LuaObject& config) {
 
 bool SimPlayerManager::computePlayerBotNextTrainingStepLocked(uint64 identityId,
 		const String& planName, const SimBotProgression& progression,
-		SimBotTrainingStep& step) const {
+		SimBotTrainingStep& step, bool earlyGameGateEnabled) const {
 	(void)identityId;
 	step = SimBotTrainingStep();
 	if (planName.isEmpty() || !progressionTrainingPlans.contains(planName))
@@ -7798,6 +7873,12 @@ bool SimPlayerManager::computePlayerBotNextTrainingStepLocked(uint64 identityId,
 		Skill* nextSkill = skillManager->getSkill(skillName);
 		if (nextSkill == nullptr)
 			return false;
+		// P.10g: only an explicitly configured deferred XP source may be
+		// skipped. A source that is merely disabled is still the next box and
+		// therefore remains BLOCKED rather than silently becoming graduated.
+		if (earlyGameGateEnabled && progressionEarlyGameConfig.deferredXpTypes
+				.contains(nextSkill->getXpType()))
+			continue;
 
 		int64 threshold = nextSkill->getXpCost();
 		for (int trainedIndex = 0; trainedIndex < progression.skills.size();
@@ -7822,10 +7903,11 @@ bool SimPlayerManager::computePlayerBotNextTrainingStepLocked(uint64 identityId,
 
 void SimPlayerManager::refreshPlayerBotTrainingStepLocked(uint64 identityId,
 		const String& planName, const SimBotProgression& progression,
-		bool enqueueIfAffordable, bool trainingGateEnabled) {
+		bool enqueueIfAffordable, bool trainingGateEnabled,
+		bool earlyGameGateEnabled) {
 	SimBotTrainingStep step;
 	if (!computePlayerBotNextTrainingStepLocked(identityId, planName,
-			progression, step)) {
+			progression, step, earlyGameGateEnabled)) {
 		progressionTrainingNextSteps.drop(identityId);
 		progressionTrainingPendingIds.drop(identityId);
 		return;
@@ -7859,10 +7941,14 @@ bool SimPlayerManager::computePlayerBotNextTrainingStep(uint64 identityId,
 			return false;
 		planName = pveIdentities.get(identityId).trainingPlan;
 	}
+	// Gate resolution precedes progressionMutex; the gate helper takes the
+	// parity mutex and the reverse nesting is forbidden by the P.10f lock order.
+	const bool earlyGameGateEnabled = playerBotEarlyGameGateEnabled();
 	Locker progressionLock(&progressionMutex);
 	if (!progressionRecords.contains(identityId) ||
 			!computePlayerBotNextTrainingStepLocked(identityId, planName,
-				progressionRecords.get(identityId), step)) {
+				progressionRecords.get(identityId), step,
+				earlyGameGateEnabled)) {
 		progressionTrainingNextSteps.drop(identityId);
 		return false;
 	}
@@ -7936,6 +8022,7 @@ void SimPlayerManager::runPlayerBotTrainingSweep() {
 	// playerBotParityTestMutex, and taking that under progressionMutex would
 	// invert the order used everywhere else (gate first, then the store).
 	const bool trainingGateEnabled = playerBotTrainingGateEnabled();
+	const bool earlyGameGateEnabled = playerBotEarlyGameGateEnabled();
 
 	Locker progressionLock(&progressionMutex);
 	for (int i = 0; i < rosterBatch.size(); ++i) {
@@ -7947,7 +8034,8 @@ void SimPlayerManager::runPlayerBotTrainingSweep() {
 			continue;
 		}
 		refreshPlayerBotTrainingStepLocked(identity.id, identity.trainingPlan,
-			progressionRecords.get(identity.id), true, trainingGateEnabled);
+			progressionRecords.get(identity.id), true, trainingGateEnabled,
+			earlyGameGateEnabled);
 	}
 
 	uint64 nextCursor = (startCursor + rosterBatch.size()) % rosterSize;
@@ -8018,14 +8106,169 @@ void SimPlayerManager::applyProgressionToBody(AiAgent* agent,
 		agent->addSkill(snapshot.skills.get(i), false);
 }
 
+bool SimPlayerManager::selectPlayerBotEarlyGameWeapon(
+		const SimBotIdentity& identity, String& weaponTemplate,
+		String& expectedXpType) {
+	weaponTemplate = "";
+	expectedXpType = "";
+	if (identity.trainingPlan.isEmpty() || identity.profession == "harness" ||
+			!playerBotEarlyGameGateEnabled())
+		return false;
+
+	// The next-step cache and weapon map are both copied before the agent lock.
+	// In particular, do not recompute the ladder here: weapon selection must
+	// describe the same cached box that the training lane will fund next.
+	Locker progressionLock(&progressionMutex);
+	if (!progressionTrainingNextSteps.contains(identity.id))
+		return false;
+
+	const SimBotTrainingStep& nextStep =
+		progressionTrainingNextSteps.get(identity.id);
+	if (!nextStep.valid || nextStep.planName != identity.trainingPlan ||
+			!progressionEarlyGameWeaponsByXpType.contains(nextStep.xpType))
+		return false;
+
+	expectedXpType = nextStep.xpType;
+	weaponTemplate = progressionEarlyGameWeaponsByXpType.get(nextStep.xpType);
+	return true;
+}
+
+void SimPlayerManager::restorePlayerBotWeaponTemplateStats(
+		WeaponObject* weapon) {
+	if (weapon == nullptr || weapon->getObjectTemplate() == nullptr)
+		return;
+
+	SharedWeaponObjectTemplate* weaponTemplate = cast<
+		SharedWeaponObjectTemplate*>(weapon->getObjectTemplate());
+	if (weaponTemplate == nullptr)
+		return;
+
+	weapon->setMinDamage(weaponTemplate->getMinDamage());
+	weapon->setMaxDamage(weaponTemplate->getMaxDamage());
+	weapon->setAttackSpeed(weaponTemplate->getAttackSpeed());
+}
+
+bool SimPlayerManager::equipPlayerBotWeaponLocked(AiAgent* agent,
+		const String& weaponTemplate, const String& expectedXpType,
+		bool restoreRealWeaponDamage, bool forceEquip) {
+	if (agent == nullptr)
+		return false;
+
+	// Deliberately NOT a named-slot assertion. An agent's weapon lives in the
+	// "default_weapon" slot, not "hold_r" (createDefaultWeapon transfers with
+	// arrangement 4 and AiAgentImplementation.cpp:2144 reads it back from
+	// "default_weapon"); no AiAgent path in the tree looks in hold_r at all, so
+	// asserting it would fail the shipped unarmed novice. Containment by the
+	// agent plus every AI weapon accessor agreeing is what actually proves the
+	// agent will fight with this weapon, and the XP type is what proves the
+	// kill pays into the box the ladder is funding next.
+	auto weaponPostcondition = [&](WeaponObject* expectedWeapon,
+			const String& expectedType) {
+		return expectedWeapon != nullptr &&
+			expectedWeapon->getParent() != nullptr &&
+			expectedWeapon->getParent().get() == agent &&
+			agent->getPrimaryWeapon() == expectedWeapon &&
+			agent->getDefaultWeapon() == expectedWeapon &&
+			agent->getCurrentWeapon() == expectedWeapon &&
+			agent->getWeapon() == expectedWeapon &&
+			(expectedType.isEmpty() || expectedWeapon->getXpType() == expectedType);
+	};
+
+	ManagedReference<WeaponObject*> currentWeapon = agent->getWeapon();
+	bool currentTemplateMatches = weaponTemplate.isEmpty();
+	if (!weaponTemplate.isEmpty() && currentWeapon != nullptr &&
+			currentWeapon->getObjectTemplate() != nullptr)
+		currentTemplateMatches = currentWeapon->getObjectTemplate()->
+			getFullTemplateString() == weaponTemplate;
+	if (!forceEquip && currentWeapon != nullptr && currentTemplateMatches &&
+			(expectedXpType.isEmpty() ||
+				currentWeapon->getXpType() == expectedXpType)) {
+		if (restoreRealWeaponDamage) {
+			agent->setWeaponStats();
+			restorePlayerBotWeaponTemplateStats(currentWeapon);
+		}
+		if (weaponPostcondition(currentWeapon, expectedXpType))
+			return true;
+	}
+
+	ManagedReference<SceneObject*> weaponObject;
+	ManagedReference<WeaponObject*> weapon;
+	String objectTemplate = weaponTemplate;
+	if (objectTemplate.isEmpty() && !expectedXpType.isEmpty()) {
+		// A previous armed step may have destroyed the original stock weapon.
+		// Recreate the same stock template only when the cached next step asks
+		// for unarmed; initial unarmed equips continue to use the loaded stock.
+		objectTemplate = "object/weapon/creature/creature_default_weapon.iff";
+	}
+	if (!objectTemplate.isEmpty()) {
+		weaponObject = ObjectManager::instance()->createObject(
+			objectTemplate.hashCode(), 0, "");
+		weapon = weaponObject == nullptr ? nullptr :
+			weaponObject.castTo<WeaponObject*>();
+		if (weapon == nullptr)
+			return false;
+	}
+
+	ManagedReference<WeaponObject*> stockWeapon = agent->getDefaultWeapon();
+	if (weapon == nullptr) {
+		// An unarmed novice uses the stock default weapon created by
+		// loadTemplateData. Never create a replacement for the initial path.
+		if (stockWeapon == nullptr)
+			return false;
+
+		agent->setPrimaryWeapon(stockWeapon);
+		agent->setDefaultWeapon(stockWeapon);
+		agent->setCurrentWeapon(nullptr);
+		agent->setWeapon(stockWeapon, false);
+		agent->setWeaponStats();
+		if (restoreRealWeaponDamage)
+			restorePlayerBotWeaponTemplateStats(stockWeapon);
+		agent->setupAttackMaps();
+		agent->equipPrimaryWeapon();
+		return weaponPostcondition(stockWeapon, expectedXpType);
+	}
+
+	Locker weaponLock(weaponObject, agent);
+	if (stockWeapon != nullptr && stockWeapon != weapon) {
+		Locker stockLock(stockWeapon, agent);
+		stockWeapon->destroyObjectFromWorld(true);
+		stockWeapon->destroyObjectFromDatabase(true);
+	}
+	if (!agent->transferObject(weaponObject, 4))
+		return false;
+
+	agent->setPrimaryWeapon(weapon);
+	agent->setDefaultWeapon(weapon);
+	// Clear the destroyed template weapon before asking the AI to equip its
+	// replacement; equipPrimaryWeapon() performs the normal current-weapon
+	// transition against the new default slot.
+	agent->setCurrentWeapon(nullptr);
+	agent->setWeapon(weapon, false);
+	agent->setWeaponStats();
+	// AiAgentImplementation::setWeaponStats() is shared by every NPC. The
+	// roster-only passthrough therefore belongs immediately after that call in
+	// this sim-layer choreography, and nowhere in the shared AI implementation.
+	if (restoreRealWeaponDamage)
+		restorePlayerBotWeaponTemplateStats(weapon);
+	agent->setupAttackMaps();
+	agent->equipPrimaryWeapon();
+
+	String postconditionXpType = expectedXpType.isEmpty() ?
+		weapon->getXpType() : expectedXpType;
+	return weaponPostcondition(weapon, postconditionXpType);
+}
+
 void SimPlayerManager::reapplyPlayerBotProgressionToLiveBody(
 		uint64 identityId) {
 	uint64 bodyOid = 0;
+	SimBotIdentity identity;
 	{
 		Locker pveLock(&pveMutex);
 		if (!pveIdentityBodyOids.contains(identityId))
 			return;
 		bodyOid = pveIdentityBodyOids.get(identityId);
+		if (pveIdentities.contains(identityId))
+			identity = pveIdentities.get(identityId);
 	}
 	if (bodyOid == 0)
 		return;
@@ -8041,10 +8284,36 @@ void SimPlayerManager::reapplyPlayerBotProgressionToLiveBody(
 	// agent lock is acquired. This mirrors checkArrival's post-lock lifecycle
 	// guard: teardown wins by returning, with no continuation scheduled here.
 	SimBotBodyProgression snapshot = buildBodyProgressionSnapshot(identityId);
-	Locker agentLock(agent);
-	if (agent->getZone() == nullptr)
-		return;
-	applyProgressionToBody(agent, snapshot);
+	String weaponTemplate;
+	String expectedXpType;
+	bool weaponSelection = selectPlayerBotEarlyGameWeapon(identity,
+		weaponTemplate, expectedXpType);
+	bool restoreRealWeaponDamage = !identity.trainingPlan.isEmpty() &&
+		identity.profession != "harness" &&
+		playerBotRealWeaponDamageGateEnabled();
+	bool equipped = false;
+	{
+		Locker agentLock(agent);
+		if (agent->getZone() == nullptr)
+			return;
+		applyProgressionToBody(agent, snapshot);
+		if (weaponSelection)
+			equipped = equipPlayerBotWeaponLocked(agent, weaponTemplate,
+				expectedXpType, restoreRealWeaponDamage, true);
+	}
+
+	// Record what the body actually ends up holding, outside the agent lock so
+	// progressionMutex is never taken beneath it. The reconciliation sweep
+	// compares against this value; leaving it stale made every maintenance pass
+	// destroy and recreate an already-correct weapon until the controller
+	// happened to change phase. On a FAILED equip it is deliberately left
+	// mismatched so the next sweep retries.
+	if (equipped && !expectedXpType.isEmpty()) {
+		Locker progressionLock(&progressionMutex);
+		if (progressionEarlyGameStates.contains(identityId))
+			progressionEarlyGameStates.get(identityId).currentWeaponXpType =
+				expectedXpType;
+	}
 }
 
 void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
@@ -8053,6 +8322,141 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		progressionAwardKillXp);
 	progressionTrainingEnabled = config.getBooleanField("trainingEnabled",
 		progressionTrainingEnabled);
+	progressionEarlyGameEnabled = config.getBooleanField("earlyGameEnabled",
+		progressionEarlyGameEnabled);
+	SimBotEarlyGameConfig earlyGameConfig;
+	VectorMap<String, String> weaponsByXpType;
+	LuaObject earlyGame = config.getObjectField("earlyGame");
+	if (earlyGame.isValidTable()) {
+		progressionEarlyGameRealWeaponDamage = earlyGame.getBooleanField(
+			"realWeaponDamage", progressionEarlyGameRealWeaponDamage);
+		earlyGameConfig.grindAnchorMinMeters = clampFloatRange(
+			earlyGame.getFloatField("grindAnchorMinMeters",
+				earlyGameConfig.grindAnchorMinMeters), 50.f, 10000.f);
+		earlyGameConfig.grindAnchorMaxMeters = clampFloatRange(
+			earlyGame.getFloatField("grindAnchorMaxMeters",
+				earlyGameConfig.grindAnchorMaxMeters),
+			earlyGameConfig.grindAnchorMinMeters, 20000.f);
+		earlyGameConfig.anchorMaxAttempts = clampMinerInt(
+			earlyGame.getIntField("anchorMaxAttempts",
+				earlyGameConfig.anchorMaxAttempts),
+			earlyGameConfig.anchorMaxAttempts, 1, 64);
+		earlyGameConfig.anchorArriveMeters = clampFloatRange(
+			earlyGame.getFloatField("anchorArriveMeters",
+				earlyGameConfig.anchorArriveMeters), 2.f, 256.f);
+		earlyGameConfig.scanMaxAttempts = clampMinerInt(
+			earlyGame.getIntField("scanMaxAttempts",
+			earlyGameConfig.scanMaxAttempts),
+			earlyGameConfig.scanMaxAttempts, 1, 32);
+		earlyGameConfig.scanRetrySeconds = clampMinerInt(
+			earlyGame.getIntField("scanRetrySeconds",
+			earlyGameConfig.scanRetrySeconds),
+			earlyGameConfig.scanRetrySeconds, 1, 300);
+		earlyGameConfig.minTtkSeconds = clampFloatRange(
+			earlyGame.getFloatField("minTtkSeconds",
+				earlyGameConfig.minTtkSeconds), 0.f, 86400.f);
+		earlyGameConfig.maxTtkSeconds = clampFloatRange(
+			earlyGame.getFloatField("maxTtkSeconds",
+				earlyGameConfig.maxTtkSeconds),
+			earlyGameConfig.minTtkSeconds, 86400.f);
+		earlyGameConfig.levelBandBelow = clampMinerInt(
+			earlyGame.getIntField("levelBandBelow",
+				earlyGameConfig.levelBandBelow),
+			earlyGameConfig.levelBandBelow, 0, 25);
+		earlyGameConfig.levelBandAbove = clampMinerInt(
+			earlyGame.getIntField("levelBandAbove",
+				earlyGameConfig.levelBandAbove),
+			earlyGameConfig.levelBandAbove, 0, 25);
+		earlyGameConfig.assumedHitRate = clampFloatRange(
+			earlyGame.getFloatField("assumedHitRate",
+				earlyGameConfig.assumedHitRate), 0.05f, 1.f);
+		earlyGameConfig.fleeHamFraction = clampFloatRange(
+			earlyGame.getFloatField("fleeHamFraction",
+				earlyGameConfig.fleeHamFraction), 0.f, 0.99f);
+		earlyGameConfig.restHamFraction = clampFloatRange(
+			earlyGame.getFloatField("restHamFraction",
+				earlyGameConfig.restHamFraction),
+			earlyGameConfig.fleeHamFraction, 1.f);
+		earlyGameConfig.movementTelemetry = earlyGame.getBooleanField(
+			"movementTelemetry", false);
+		earlyGameConfig.combatTelemetry = earlyGame.getBooleanField(
+			"combatTelemetry", false);
+		earlyGameConfig.deathAvoidRadiusMeters = clampFloatRange(
+			earlyGame.getFloatField("deathAvoidRadiusMeters",
+				earlyGameConfig.deathAvoidRadiusMeters), 0.f, 2000.f);
+		earlyGameConfig.deathAvoidMemory = clampMinerInt(
+			earlyGame.getIntField("deathAvoidMemory",
+				earlyGameConfig.deathAvoidMemory),
+			earlyGameConfig.deathAvoidMemory, 1, 32);
+		earlyGameConfig.deathAvoidSeconds = clampMinerInt(
+			earlyGame.getIntField("deathAvoidSeconds",
+				earlyGameConfig.deathAvoidSeconds),
+			earlyGameConfig.deathAvoidSeconds, 60, 86400);
+		// Above 1 - restHamFraction a wounded novice could never regenerate past
+		// the rest line, and Recover would wait forever.
+		earlyGameConfig.cloneWoundMaxFraction = clampFloatRange(
+			earlyGame.getFloatField("cloneWoundMaxFraction",
+				earlyGameConfig.cloneWoundMaxFraction), 0.f,
+			Math::max(0.f, 1.f - earlyGameConfig.restHamFraction));
+		earlyGameConfig.avoidGroupAggroTargets = earlyGame.getBooleanField(
+			"avoidGroupAggroTargets", true);
+		earlyGameConfig.roamCitySpawners = earlyGame.getBooleanField(
+			"roamCitySpawners", true);
+		earlyGameConfig.spawnerSearchRadiusMeters = clampFloatRange(
+			earlyGame.getFloatField("spawnerSearchRadiusMeters",
+				earlyGameConfig.spawnerSearchRadiusMeters), 100.f, 3000.f);
+		earlyGameConfig.skipInactiveSpawners = earlyGame.getBooleanField(
+			"skipInactiveSpawners", true);
+		earlyGameConfig.spawnerArriveMeters = clampFloatRange(
+			earlyGame.getFloatField("spawnerArriveMeters",
+				earlyGameConfig.spawnerArriveMeters), 8.f, 90.f);
+		earlyGameConfig.unreachableSkipSeconds = clampMinerInt(
+			earlyGame.getIntField("unreachableSkipSeconds",
+				earlyGameConfig.unreachableSkipSeconds),
+			earlyGameConfig.unreachableSkipSeconds, 5, 3600);
+		earlyGameConfig.unreachableSkipMaxTargets = clampMinerInt(
+			earlyGame.getIntField("unreachableSkipMaxTargets",
+				earlyGameConfig.unreachableSkipMaxTargets),
+			earlyGameConfig.unreachableSkipMaxTargets, 1, 64);
+		LuaObject deferredXpTypes = earlyGame.getObjectField(
+			"deferredXpTypes");
+		if (deferredXpTypes.isValidTable()) {
+			for (int i = 1; i <= deferredXpTypes.getTableSize(); ++i) {
+				String xpType = deferredXpTypes.getStringAt(i).trim();
+				if (!xpType.isEmpty() &&
+						!earlyGameConfig.deferredXpTypes.contains(xpType))
+					earlyGameConfig.deferredXpTypes.add(xpType);
+			}
+		}
+		deferredXpTypes.pop();
+
+		LuaObject configuredWeapons = earlyGame.getObjectField(
+			"weaponsByXpType");
+		if (configuredWeapons.isValidTable()) {
+			weaponsByXpType.put("combat_meleespecialize_onehand",
+				configuredWeapons.getStringField(
+					"combat_meleespecialize_onehand").trim());
+			weaponsByXpType.put("combat_meleespecialize_twohand",
+				configuredWeapons.getStringField(
+					"combat_meleespecialize_twohand").trim());
+			weaponsByXpType.put("combat_meleespecialize_polearm",
+				configuredWeapons.getStringField(
+					"combat_meleespecialize_polearm").trim());
+			weaponsByXpType.put("combat_meleespecialize_unarmed",
+				configuredWeapons.getStringField(
+					"combat_meleespecialize_unarmed").trim());
+		}
+		configuredWeapons.pop();
+	}
+	earlyGame.pop();
+	{
+		Locker progressionLock(&progressionMutex);
+		progressionEarlyGameConfig = earlyGameConfig;
+		progressionEarlyGameWeaponsByXpType = weaponsByXpType;
+	}
+	// The death capture point runs under creature locks and reads only this
+	// lock-free mirror; turning it off also drops uncollected captures.
+	SimEarlyGameDeathLog::setEnabled(earlyGameConfig.combatTelemetry);
 	trainingMaxPerTick = clampMinerInt(config.getIntField("trainingMaxPerTick",
 		trainingMaxPerTick), trainingMaxPerTick, 1, 1000);
 	trainingSweepBatch = clampMinerInt(config.getIntField("trainingSweepBatch",
@@ -8081,6 +8485,7 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 
 static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	PlayerBotParityTestStep step;
+	const int absentExpected = -2147483647;
 	step.op = table.getStringField("op").trim();
 	step.identityIndex = table.getIntField("identityIndex", -1);
 	step.identityRef = table.getStringField("identityRef").trim();
@@ -8089,6 +8494,7 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.templateName = table.getStringField("template").trim();
 	step.profession = table.getStringField("profession").trim();
 	step.trainingPlan = table.getStringField("trainingPlan").trim();
+	step.governed = table.getBooleanField("governed", false);
 	step.xpType = table.getStringField("xpType").trim();
 	step.skillName = table.getStringField("skillName").trim();
 	if (step.skillName.isEmpty())
@@ -8122,6 +8528,26 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 		0.0f, 100.0f);
 	step.hasRate = table.getFloatField("rate", 1.0f) ==
 		table.getFloatField("rate", 2.0f);
+	step.expectedBoxCount = table.getIntField("boxCount", absentExpected);
+	step.hasExpectedBoxCount = step.expectedBoxCount != absentExpected;
+	if (!step.hasExpectedBoxCount)
+		step.expectedBoxCount = -1;
+	step.expectedTotalPoints = table.getIntField("totalPoints", absentExpected);
+	step.hasExpectedTotalPoints = step.expectedTotalPoints != absentExpected;
+	if (!step.hasExpectedTotalPoints)
+		step.expectedTotalPoints = -1;
+	step.expectedMinDamage = table.getIntField("minDamage", absentExpected);
+	step.hasExpectedMinDamage = step.expectedMinDamage != absentExpected;
+	if (!step.hasExpectedMinDamage)
+		step.expectedMinDamage = -1;
+	step.expectedMaxDamage = table.getIntField("maxDamage", absentExpected);
+	step.hasExpectedMaxDamage = step.expectedMaxDamage != absentExpected;
+	if (!step.hasExpectedMaxDamage)
+		step.expectedMaxDamage = -1;
+	step.expectedGraduated = table.getBooleanField("graduated", false);
+	step.hasExpectedGraduated = step.expectedGraduated ==
+		table.getBooleanField("graduated", true);
+	step.stalledBox = table.getStringField("stalledBox").trim();
 	LuaObject damageByType = table.getObjectField("damageByType");
 	if (damageByType.isValidTable()) {
 		for (int i = 1; i <= damageByType.getTableSize(); ++i) {
@@ -8157,7 +8583,6 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.phase = table.getStringField("phase").trim();
 	step.restartPhase = table.getStringField("restartPhase").trim();
 	step.counter = table.getStringField("counter").trim();
-	const int absentExpected = -2147483647;
 	step.expectedRecords = table.getIntField("records", absentExpected);
 	step.hasExpectedRecords = step.expectedRecords != absentExpected;
 	if (!step.hasExpectedRecords)
@@ -8291,6 +8716,28 @@ void SimPlayerManager::applyPlayerBotParityTestConfig(LuaObject& config) {
 			scenario.budgetMs = clampMinerInt(scenarioTable.getIntField(
 				"budgetMs", scenario.budgetMs), scenario.budgetMs, 1000,
 				7200000);
+			LuaObject requiresGates = scenarioTable.getObjectField(
+				"requiresGates");
+			if (requiresGates.isValidTable()) {
+				for (int j = 1; j <= requiresGates.getTableSize(); ++j) {
+					String gate = requiresGates.getStringAt(j).trim();
+					if (!gate.isEmpty() &&
+							!scenario.requiresGates.contains(gate))
+						scenario.requiresGates.add(gate);
+				}
+			}
+			requiresGates.pop();
+			LuaObject requiresGatesOff = scenarioTable.getObjectField(
+				"requiresGatesOff");
+			if (requiresGatesOff.isValidTable()) {
+				for (int j = 1; j <= requiresGatesOff.getTableSize(); ++j) {
+					String gate = requiresGatesOff.getStringAt(j).trim();
+					if (!gate.isEmpty() &&
+							!scenario.requiresGatesOff.contains(gate))
+						scenario.requiresGatesOff.add(gate);
+				}
+			}
+			requiresGatesOff.pop();
 			LuaObject steps = scenarioTable.getObjectField("steps");
 			if (steps.isValidTable()) {
 				for (int j = 1; j <= steps.getTableSize(); ++j) {
@@ -8349,6 +8796,9 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	bool noviceEnabled = false;
 	bool retireLegacyHunters = false;
 	String noviceBodyTemplate;
+	String noviceSpawnPlanet;
+	String noviceSpawnCity;
+	int noviceBodyHam = 0;
 	Vector<PveNoviceDistribution> noviceDistribution;
 	LuaObject noviceConfig = pveConfig.getObjectField("novice");
 	if (noviceConfig.isValidTable()) {
@@ -8357,6 +8807,10 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 			"retireLegacyHunters", false);
 		noviceBodyTemplate = noviceConfig.getStringField(
 			"bodyTemplate").trim();
+		noviceSpawnPlanet = noviceConfig.getStringField("spawnPlanet").trim();
+		noviceSpawnCity = noviceConfig.getStringField("spawnCity").trim();
+		noviceBodyHam = clampMinerInt(noviceConfig.getIntField("bodyHam", 0),
+			0, 0, 100000);
 		LuaObject distribution = noviceConfig.getObjectField("distribution");
 		if (distribution.isValidTable()) {
 			for (int i = 1; i <= distribution.getTableSize(); ++i) {
@@ -9046,6 +9500,9 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 			pveNoviceEnabled = noviceEnabled;
 		pveRetireLegacyHunters = retireLegacyHunters;
 		pveNoviceBodyTemplate = noviceBodyTemplate;
+		pveNoviceSpawnPlanet = noviceSpawnPlanet;
+		pveNoviceSpawnCity = noviceSpawnCity;
+		pveNoviceBodyHam = noviceBodyHam;
 		pveNoviceDistribution = noviceDistribution;
 	}
 	bodyTemplates.pop();
@@ -9056,6 +9513,9 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 			pveNoviceEnabled = noviceEnabled;
 		pveRetireLegacyHunters = retireLegacyHunters;
 		pveNoviceBodyTemplate = noviceBodyTemplate;
+		pveNoviceSpawnPlanet = noviceSpawnPlanet;
+		pveNoviceSpawnCity = noviceSpawnCity;
+		pveNoviceBodyHam = noviceBodyHam;
 		pveNoviceDistribution = noviceDistribution;
 	}
 
@@ -9755,6 +10215,115 @@ bool SimPlayerManager::playerBotTrainingGateEnabled() {
 	return progressionTrainingEnabled;
 }
 
+// F_0.9.6-D1. A scenario that needs a capability gate it never arms will not
+// fail loudly - it will poll a state that can never arrive until its step
+// budget expires. On 2026-09-11 that cost a full verification session: the two
+// real-combat scenarios need awardKillXp, the run armed only the master
+// progression gate, and the resulting `kills=0 step_budget_exceeded` was
+// mistaken for broken sim-bot combat across five runs and an A/B that repeated
+// the same misconfiguration in both arms. This turns that into an immediate,
+// named failure.
+//
+// A gate is satisfied when EITHER the live gate reads enabled OR the scenario
+// arms it with one of its own steps - a scenario that deliberately exercises
+// gate-off behaviour owns its gate and must not be pre-empted here.
+bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
+		const PlayerBotParityTestScenario& scenario, String& failReason) {
+	failReason = "";
+
+	for (int i = 0; i < scenario.requiresGates.size() +
+			scenario.requiresGatesOff.size(); ++i) {
+		bool wantEnabled = i < scenario.requiresGates.size();
+		const String& gate = wantEnabled ? scenario.requiresGates.get(i) :
+			scenario.requiresGatesOff.get(i - scenario.requiresGates.size());
+
+		// The op that hands control of this gate to the scenario itself.
+		String armingOp;
+		if (gate == "trainingEnabled")
+			armingOp = "setTrainingGate";
+		else if (gate == "earlyGameEnabled")
+			armingOp = "setEarlyGameGate";
+		else if (gate == "realWeaponDamage")
+			armingOp = "setRealWeaponDamageGate";
+		else if (gate == "novice")
+			armingOp = "setNoviceGate";
+		else if (gate == "progressionEnabled")
+			armingOp = "setGate";
+
+		bool scenarioArmsIt = false;
+		for (int j = 0; !armingOp.isEmpty() &&
+				j < scenario.steps.size(); ++j) {
+			if (scenario.steps.get(j).op == armingOp) {
+				scenarioArmsIt = true;
+				break;
+			}
+		}
+		if (scenarioArmsIt)
+			continue;
+
+		bool live = false;
+		if (gate == "awardKillXp")
+			live = isPlayerBotKillXpEnabled();
+		else if (gate == "trainingEnabled")
+			live = playerBotTrainingGateEnabled();
+		else if (gate == "earlyGameEnabled")
+			live = playerBotEarlyGameGateEnabled();
+		else if (gate == "realWeaponDamage")
+			live = playerBotRealWeaponDamageGateEnabled();
+		else if (gate == "progressionEnabled")
+			live = playerBotProgressionAwardGateEnabled();
+		else if (gate == "novice") {
+			Locker pveLock(&pveMutex);
+			live = pveNoviceEnabled;
+		} else {
+			// An unknown gate name is a harness authoring error, not a
+			// configuration problem. Say so rather than passing silently.
+			failReason = "precondition_unknown_gate_" + gate;
+			return false;
+		}
+
+		if (wantEnabled && !live) {
+			failReason = "precondition_gate_off_" + gate;
+			return false;
+		}
+		if (!wantEnabled && live) {
+			// Inverted form: the scenario asserts the gate-OFF branch, so an
+			// armed gate would make it test the opposite of its intent.
+			failReason = "precondition_gate_on_" + gate;
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool SimPlayerManager::playerBotEarlyGameGateEnabled() {
+	// Master gate first, this capability's OWN harness override second, the
+	// configured flag last - mirroring playerBotTrainingGateEnabled exactly.
+	// It must not reuse the award override: setGate would then silently move
+	// the early-game gate as a side effect.
+	if (!progressionEnabled)
+		return false;
+	Locker parityLock(&playerBotParityTestMutex);
+	if (playerBotParityTestEarlyGameGateOverrideActive)
+		return playerBotParityTestEarlyGameGateOverride;
+	return progressionEarlyGameEnabled;
+}
+
+bool SimPlayerManager::playerBotRealWeaponDamageGateEnabled() {
+	// The override is returned DIRECTLY, never ANDed with the configured flag.
+	// ANDing would leave this capability unexercisable whenever it shipped
+	// default-off - which it always does - the same defect that failed
+	// F_0.9.5's training gate live (run 20260906-104819). Production still
+	// requires both the early-game master and this sub-gate.
+	if (!progressionEnabled)
+		return false;
+	Locker parityLock(&playerBotParityTestMutex);
+	if (playerBotParityTestRealWeaponDamageGateOverrideActive)
+		return playerBotParityTestRealWeaponDamageGateOverride;
+	return progressionEarlyGameEnabled && progressionEarlyGameRealWeaponDamage;
+}
+
 static String playerBotWeaponTypeForXp(const String& xpType) {
 	if (xpType.contains("onehand"))
 		return "onehandmelee";
@@ -10041,6 +10610,7 @@ bool SimPlayerManager::trainPlayerBotSkill(uint64 identityId,
 
 	bool trainingGateEnabled = false;
 	bool noviceGateEnabled = false;
+	bool earlyGameGateEnabled = false;
 	{
 		Locker pveLock(&pveMutex);
 		noviceGateEnabled = pveNoviceEnabled;
@@ -10063,6 +10633,7 @@ bool SimPlayerManager::trainPlayerBotSkill(uint64 identityId,
 			return false;
 		}
 	}
+	earlyGameGateEnabled = playerBotEarlyGameGateEnabled();
 	if (identityId == 0) {
 		trainingRefusedNoRecord.increment();
 		if (refusalOut != nullptr)
@@ -10160,9 +10731,13 @@ bool SimPlayerManager::trainPlayerBotSkill(uint64 identityId,
 		progression.skillPointsSpent = derivedPlayerBotSkillPoints(progression);
 		markProgressionDirtyLocked(identityId);
 		trainingLastSkill = normalizedSkill;
-		if (!freeGrant && !identity.trainingPlan.isEmpty())
+		if (!identity.trainingPlan.isEmpty())
+			// Mint-time grants do not enqueue training, but they still refresh the
+			// cached successor so the first spawned body can choose its loadout
+			// from the next box.
 			refreshPlayerBotTrainingStepLocked(identityId,
-				identity.trainingPlan, progression, true, trainingGateEnabled);
+				identity.trainingPlan, progression, !freeGrant,
+				trainingGateEnabled, earlyGameGateEnabled);
 		updatedProgression = progression;
 		if (!identity.trainingPlan.isEmpty() &&
 				progressionTrainingPlans.contains(identity.trainingPlan)) {
@@ -10264,6 +10839,38 @@ uint64 SimPlayerManager::resolvePlayerBotIdentity(uint64 bodyOid) {
 		identityId : 0;
 }
 
+void SimPlayerManager::recordPlayerBotKillXpDrop(const String& stage,
+		const String& reason, uint64 victimOid, const String& victimTemplate,
+		int baseXp, uint32 totalDamage, int threatEntries, uint64 botOid,
+		uint32 botDamage) {
+	// Called inside the victim's destruction choreography: count lock-free here
+	// and leave identity resolution (manager mutexes) and the log line to a task,
+	// the same hand-off the award itself uses.
+	if (stage == "no_total_damage")
+		killXpDroppedNoDamage.increment();
+	else if (stage == "no_base_xp")
+		killXpDroppedNoBaseXp.increment();
+	else
+		killXpDroppedNoSimBotAttacker.increment();
+
+	Core::getTaskManager()->executeTask([stage, reason, victimOid,
+			victimTemplate, baseXp, totalDamage, threatEntries, botOid,
+			botDamage] () {
+		SimPlayerManager* manager = SimPlayerManager::instance();
+		if (manager == nullptr)
+			return;
+		StringBuffer line;
+		line << "SimPveKillXpDropped stage=" << stage << " reason=" <<
+			(reason.isEmpty() ? String("-") : reason) << " victim=" << victimOid <<
+			" victimTemplate=" << victimTemplate << " baseXp=" << baseXp <<
+			" totalDamage=" << static_cast<uint64>(totalDamage) <<
+			" threatEntries=" << threatEntries << " bot=" << botOid <<
+			" identity=" << manager->resolvePlayerBotIdentity(botOid) <<
+			" botDamage=" << static_cast<uint64>(botDamage);
+		manager->info(line.toString(), true);
+	}, "SimPlayerBotKillXpDropLogTask");
+}
+
 void SimPlayerManager::awardPlayerBotKillExperience(
 		const PlayerBotKillXpEvent& event) {
 	PlayerBotKillXpParams params;
@@ -10275,13 +10882,45 @@ void SimPlayerManager::awardPlayerBotKillExperience(
 void SimPlayerManager::awardPlayerBotKillExperience(
 		const PlayerBotKillXpEvent& event,
 		const PlayerBotKillXpParams& params) {
+	// F_0.9.6-D1: one simcombat.log line per award decision for a traced
+	// attacker. Several of the returns below bump no counter at all, so a real
+	// kill with no award was indistinguishable from "no award attempted".
+	// SimCombatDiagLog::event only writes for allowlisted OIDs. The outcome key
+	// carries the victim OID and stage, so the logger's 5 s repeat limit can
+	// never drop the second grant of the same kill.
+	const bool killXpDiag = SimCombatDiagLog::isLoggingEnabled();
+	auto emitKillXpDiag = [&](uint64 bodyOid, const String& stage,
+			const String& extra) {
+		if (!killXpDiag)
+			return;
+		StringBuffer diag;
+		diag << "victimOid=" << event.victimOid << " stage=" << stage;
+		if (!extra.isEmpty())
+			diag << " " << extra;
+		StringBuffer outcome;
+		outcome << "kill_xp_award_" << event.victimOid << "_" << stage;
+		SimCombatDiagLog::event("KILL_XP_AWARD", bodyOid, diag.toString(),
+			outcome.toString());
+	};
+
 	if (!params.enabled) {
 		killXpSkippedGateOff.increment();
+		for (int i = 0; i < event.attackers.size(); ++i)
+			emitKillXpDiag(event.attackers.get(i).bodyOid, "skip_gate_off", "");
 		return;
 	}
 
-	if (event.totalDamage == 0 || event.baseXp <= 0)
+	if (event.totalDamage == 0 || event.baseXp <= 0) {
+		if (killXpDiag) {
+			StringBuffer extra;
+			extra << "baseXp=" << event.baseXp
+				<< " totalDamage=" << event.totalDamage;
+			for (int i = 0; i < event.attackers.size(); ++i)
+				emitKillXpDiag(event.attackers.get(i).bodyOid,
+					"skip_no_damage_or_basexp", extra.toString());
+		}
 		return;
+	}
 
 	killXpKills.increment();
 
@@ -10294,6 +10933,7 @@ void SimPlayerManager::awardPlayerBotKillExperience(
 		if (!resolvePlayerBotIdentityAndTier(attacker.bodyOid,
 				identityId, skillTier)) {
 			killXpSkippedNoIdentity.increment();
+			emitKillXpDiag(attacker.bodyOid, "skip_no_identity", "");
 			continue;
 		}
 		SimBotProgression progression;
@@ -10328,37 +10968,80 @@ void SimPlayerManager::awardPlayerBotKillExperience(
 			else
 				xpAmount *= 0.2f;
 
-			if (xpType == "dotDMG")
+			if (xpType == "dotDMG") {
+				emitKillXpDiag(attacker.bodyOid, "skip_dotDMG", "");
 				continue;
+			}
 
 			int truncatedXp = static_cast<int>(xpAmount);
 			int awardAmount = static_cast<int>(truncatedXp *
 				event.globalMultiplier * params.rate);
+			StringBuffer grantDiag;
+			if (killXpDiag) {
+				grantDiag << "identityId=" << identityId
+					<< " xpType=" << xpType
+					<< " damage=" << static_cast<uint64>(damage)
+					<< " totalDamage=" << static_cast<uint64>(event.totalDamage)
+					<< " killTier=" << killTier
+					<< " levelCap=" << static_cast<int>(levelCap)
+					<< " xpAmount=" << truncatedXp
+					<< " awardAmount=" << awardAmount;
+			}
 			if (awardAmount <= 0) {
 				killXpSkippedZero.increment();
+				emitKillXpDiag(attacker.bodyOid, String("zero_") + xpType,
+					grantDiag.toString());
 				continue;
 			}
 
 			int awarded = 0;
-			if (grantPlayerBotExperience(identityId, xpType, awardAmount,
-					"kill", &awarded)) {
+			bool granted = grantPlayerBotExperience(identityId, xpType,
+				awardAmount, "kill", &awarded);
+			if (granted) {
 				killXpAwardsGranted.increment();
 				killXpTotalAwarded.add(static_cast<uint64>(awarded));
+				recordPlayerBotParityKillAward(identityId, event.victimOid, xpType,
+					awarded);
+			}
+			if (killXpDiag) {
+				grantDiag << " granted=" << (granted ? 1 : 0)
+					<< " awarded=" << awarded;
+				emitKillXpDiag(attacker.bodyOid, String("grant_") + xpType,
+					grantDiag.toString());
 			}
 		}
 
 		int combatGeneral = static_cast<int>(combatXp * 0.1f *
 			event.globalMultiplier * params.rate);
+		StringBuffer generalDiag;
+		if (killXpDiag) {
+			generalDiag << "identityId=" << identityId
+				<< " combatXp=" << static_cast<uint64>(combatXp)
+				<< " awardAmount=" << combatGeneral;
+		}
 		if (combatGeneral <= 0) {
 			killXpSkippedZero.increment();
+			emitKillXpDiag(attacker.bodyOid, "zero_combat_general",
+				generalDiag.toString());
 			continue;
 		}
 
 		int awarded = 0;
-		if (grantPlayerBotExperience(identityId, "combat_general",
-				combatGeneral, "kill", &awarded)) {
+		bool granted = grantPlayerBotExperience(identityId, "combat_general",
+			combatGeneral, "kill", &awarded);
+		if (granted) {
 			killXpAwardsGranted.increment();
 			killXpTotalAwarded.add(static_cast<uint64>(awarded));
+			// Recorded LAST for this attacker: the kill oracle treats this entry
+			// as the marker that the target's award is complete.
+			recordPlayerBotParityKillAward(identityId, event.victimOid,
+				"combat_general", awarded);
+		}
+		if (killXpDiag) {
+			generalDiag << " granted=" << (granted ? 1 : 0)
+				<< " awarded=" << awarded;
+			emitKillXpDiag(attacker.bodyOid, "grant_combat_general",
+				generalDiag.toString());
 		}
 	}
 }
@@ -10369,6 +11052,517 @@ bool SimPlayerManager::snapshotPlayerBotProgression(uint64 identityId,
 	if (!progressionRecords.contains(identityId))
 		return false;
 	out = progressionRecords.get(identityId);
+	return true;
+}
+
+void SimPlayerManager::scorePlayerBotActivity(
+		const SimBotIdentity& identity, SimBotActivityDecision& out) {
+	// This is the one activity/graduation predicate. It intentionally knows only
+	// the two supported activities: a planned roster bot grinds until every
+	// untrained fundable box is gone, then joins the existing demand-driven hunt.
+	// In particular, awardKillXp/training gates are not consulted here: a source
+	// is fundable unless its XP type is explicitly deferred in Lua.
+	out = SimBotActivityDecision();
+	if (!playerBotEarlyGameGateEnabled() || identity.profession == "harness" ||
+			identity.trainingPlan.isEmpty())
+		return;
+
+	Locker progressionLock(&progressionMutex);
+	if (!progressionRecords.contains(identity.id) ||
+			!progressionTrainingPlans.contains(identity.trainingPlan)) {
+		out.activity = "grind";
+		out.graduated = false;
+		return;
+	}
+
+	const SimBotTrainingPlan& plan =
+		progressionTrainingPlans.get(identity.trainingPlan);
+	if ((!plan.loadError.isEmpty() && plan.loadError != "over_budget") ||
+			plan.orderedSkills.size() == 0) {
+		out.activity = plan.orderedSkills.size() == 0 ?
+			String("hunt") : String("grind");
+		out.graduated = plan.orderedSkills.size() == 0;
+		return;
+	}
+
+	const SimBotProgression& progression = progressionRecords.get(identity.id);
+	for (int i = 0; i < plan.orderedSkills.size(); ++i) {
+		const String& skillName = plan.orderedSkills.get(i);
+		if (progression.skills.contains(skillName))
+			continue;
+
+		Skill* skill = SkillManager::instance() == nullptr ? nullptr :
+			SkillManager::instance()->getSkill(skillName);
+		if (skill == nullptr) {
+			out.graduated = false;
+			continue;
+		}
+		if (progressionEarlyGameConfig.deferredXpTypes.contains(
+				skill->getXpType()))
+			out.stalledBoxes.add(skillName);
+		else
+			out.graduated = false;
+	}
+	out.activity = out.graduated ? String("hunt") : String("grind");
+}
+
+void SimPlayerManager::refreshPlayerBotActivityStates() {
+	if (!playerBotEarlyGameGateEnabled()) {
+		Locker progressionLock(&progressionMutex);
+		progressionEarlyGameStates.removeAll();
+		return;
+	}
+
+	Vector<SimBotIdentity> roster;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < pveIdentities.size(); ++i)
+			roster.add(pveIdentities.elementAt(i).getValue());
+	}
+
+	VectorMap<uint64, SimBotActivityDecision> decisions;
+	for (int i = 0; i < roster.size(); ++i) {
+		const SimBotIdentity& identity = roster.get(i);
+		if (identity.profession == "harness" ||
+				identity.trainingPlan.isEmpty())
+			continue;
+		SimBotActivityDecision decision;
+		scorePlayerBotActivity(identity, decision);
+		decisions.put(identity.id, decision);
+	}
+
+	Vector<uint64> loadoutReconcileIds;
+	{
+		Locker progressionLock(&progressionMutex);
+		for (int i = 0; i < decisions.size(); ++i) {
+			uint64 identityId = decisions.elementAt(i).getKey();
+			if (!progressionEarlyGameStates.contains(identityId))
+				progressionEarlyGameStates.put(identityId,
+					SimBotEarlyGameState());
+			SimBotEarlyGameState& state =
+				progressionEarlyGameStates.get(identityId);
+			const SimBotActivityDecision& decision =
+				decisions.elementAt(i).getValue();
+			state.activity = decision.activity;
+			state.graduated = decision.graduated;
+			state.stalledBoxes = decision.stalledBoxes;
+		}
+	}
+
+	// The loadout is otherwise only reconciled after a SUCCESSFUL training
+	// award, which leaves two live-drift holes: a body spawned while the gate
+	// was off keeps the stock unarmed weapon after the gate is switched on, and
+	// a cached next step that changes for any other reason never re-equips.
+	// Either one makes the bot earn the WRONG xpType for the box it is funding,
+	// which stalls the ladder indefinitely rather than failing loudly. Compare
+	// the desired weapon XP type against what the body is recorded as holding
+	// and reconcile the difference here, on the existing slow tick.
+	for (int i = 0; i < decisions.size(); ++i) {
+		uint64 identityId = decisions.elementAt(i).getKey();
+		if (decisions.elementAt(i).getValue().activity != "grind")
+			continue;
+		SimBotIdentity identity;
+		if (!snapshotPlayerBotIdentity(identityId, identity))
+			continue;
+		String desiredTemplate;
+		String desiredXpType;
+		if (!selectPlayerBotEarlyGameWeapon(identity, desiredTemplate,
+				desiredXpType) || desiredXpType.isEmpty())
+			continue;
+		bool hasLiveBody = false;
+		{
+			Locker pveLock(&pveMutex);
+			hasLiveBody = pveIdentityBodyOids.contains(identityId);
+		}
+		if (!hasLiveBody)
+			continue;
+		String recordedXpType;
+		{
+			Locker progressionLock(&progressionMutex);
+			if (progressionEarlyGameStates.contains(identityId))
+				recordedXpType = progressionEarlyGameStates.get(
+					identityId).currentWeaponXpType;
+		}
+		if (recordedXpType != desiredXpType)
+			loadoutReconcileIds.add(identityId);
+	}
+
+	// Deliberately outside every manager mutex: reapply takes the agent lock,
+	// and taking it under progressionMutex or pveMutex would invert the order
+	// used by the rest of this file.
+	for (int i = 0; i < loadoutReconcileIds.size(); ++i)
+		reapplyPlayerBotProgressionToLiveBody(loadoutReconcileIds.get(i));
+}
+
+bool SimPlayerManager::isPlayerBotEarlyGameIdentity(uint64 identityId) {
+	SimBotIdentity identity;
+	if (!snapshotPlayerBotIdentity(identityId, identity))
+		return false;
+
+	SimBotActivityDecision decision;
+	scorePlayerBotActivity(identity, decision);
+	return decision.activity == "grind" && !decision.graduated;
+}
+
+bool SimPlayerManager::snapshotPlayerBotIdentity(uint64 identityId,
+		SimBotIdentity& out) {
+	Locker pveLock(&pveMutex);
+	if (!pveIdentities.contains(identityId))
+		return false;
+	out = pveIdentities.get(identityId);
+	return true;
+}
+
+void SimPlayerManager::getPlayerBotEarlyGameConfig(
+		SimBotEarlyGameConfig& out) {
+	Locker progressionLock(&progressionMutex);
+	out = progressionEarlyGameConfig;
+}
+
+void SimPlayerManager::setPlayerBotEarlyGamePhase(uint64 identityId,
+		const String& phase, uint64 targetOid, float targetTtkSeconds,
+		const String& currentWeaponXpType, bool targetDefensive) {
+	if (identityId == 0)
+		return;
+	Locker progressionLock(&progressionMutex);
+	if (!progressionEarlyGameStates.contains(identityId))
+		progressionEarlyGameStates.put(identityId, SimBotEarlyGameState());
+	SimBotEarlyGameState& state = progressionEarlyGameStates.get(identityId);
+	state.activity = "grind";
+	state.graduated = false;
+	state.phase = phase;
+	state.targetOid = targetOid;
+	state.targetTtkSeconds = targetTtkSeconds;
+	state.currentWeaponXpType = currentWeaponXpType;
+	state.targetDefensive = targetDefensive;
+}
+
+void SimPlayerManager::resolvePlayerBotHomeCity(const SimBotIdentity& identity,
+		String& planet, String& city) {
+	planet = identity.homePlanet;
+	city = identity.homeCity;
+	// Planned novices only: legacy hunters keep their homes.
+	if (identity.trainingPlan.isEmpty() || identity.profession == "harness")
+		return;
+	// A harness-minted identity can carry a production profession (a brawler)
+	// and is persisted with a rotated production home, but the harness places
+	// its body on the parity planet. Resolve it to that planet's shuttleport
+	// nearest the parity spawn, so early-game anchors and the rest point match
+	// where the body actually stands. Never the production novice city.
+	if (isPlayerBotParityHarnessExempt(identity.id)) {
+		String parityPlanet;
+		Vector3 paritySpawn;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			parityPlanet = playerBotParityTestPlanet;
+			paritySpawn = playerBotParityTestSpawn;
+		}
+		float bestDistance = -1.f;
+		for (int i = 0; i < allShuttleports.size(); ++i) {
+			const ShuttleportLocation& location = allShuttleports.get(i);
+			if (location.planet != parityPlanet)
+				continue;
+			float distance = location.spawn.distanceTo2d(paritySpawn);
+			if (bestDistance < 0.f || distance < bestDistance) {
+				bestDistance = distance;
+				planet = location.planet;
+				city = location.name;
+			}
+		}
+		return;
+	}
+	String configuredPlanet;
+	String configuredCity;
+	{
+		Locker pveLock(&pveMutex);
+		configuredPlanet = pveNoviceSpawnPlanet;
+		configuredCity = pveNoviceSpawnCity;
+	}
+	if (configuredPlanet.isEmpty() || configuredCity.isEmpty())
+		return;
+	// Only a shuttleport that actually exists may replace the identity's home;
+	// a mistyped city must not strand the novice with no spawn point.
+	for (int i = 0; i < allShuttleports.size(); ++i) {
+		const ShuttleportLocation& location = allShuttleports.get(i);
+		if (location.planet == configuredPlanet &&
+				location.name == configuredCity) {
+			planet = configuredPlanet;
+			city = configuredCity;
+			return;
+		}
+	}
+}
+
+bool SimPlayerManager::isPlayerBotEarlyGameMovementTelemetryEnabled() {
+	Locker progressionLock(&progressionMutex);
+	return progressionEarlyGameConfig.movementTelemetry;
+}
+
+void SimPlayerManager::recordPlayerBotEarlyGameMovement(uint64 identityId,
+		const String& branch, bool tickEvent, bool beginEvent,
+		bool notIdentityExit, bool moveRequested, const String& movementState,
+		uint64 workLoopGeneration, const String& lastGenerationReason,
+		const Vector3& position, const Vector3& anchor,
+		const String& hybridDiag) {
+	if (identityId == 0)
+		return;
+	uint64 nowMs = System::getMiliTime();
+	Locker progressionLock(&progressionMutex);
+	if (!progressionEarlyGameConfig.movementTelemetry ||
+			!progressionEarlyGameStates.contains(identityId))
+		return;
+	SimBotEarlyGameState& state = progressionEarlyGameStates.get(identityId);
+	if (tickEvent) {
+		state.telemetryTicks++;
+		state.telemetryLastTickMs = nowMs;
+	}
+	if (beginEvent)
+		state.telemetryBegins++;
+	if (branch == "path_failed")
+		state.telemetryPathFailures++;
+	if (notIdentityExit)
+		state.telemetryNotIdentityExits++;
+	if (moveRequested) {
+		state.telemetryMoveRequests++;
+		state.telemetryLastMoveRequestMs = nowMs;
+		state.telemetryMoveRequestGeneration = workLoopGeneration;
+	}
+	if (state.telemetryMovementState != movementState) {
+		state.telemetryMovementState = movementState;
+		state.telemetryMovementStateSinceMs = nowMs;
+	}
+	state.telemetryBranch = branch;
+	state.telemetryHybridDiag = hybridDiag;
+	state.telemetryWorkLoopGeneration = workLoopGeneration;
+	state.telemetryLastGenerationReason = lastGenerationReason;
+	state.telemetryPosX = position.getX();
+	state.telemetryPosY = position.getY();
+	state.telemetryAnchorX = anchor.getX();
+	state.telemetryAnchorY = anchor.getY();
+	state.telemetryDistanceToAnchor = position.distanceTo2d(anchor);
+}
+
+bool SimPlayerManager::isPlayerBotEarlyGameCombatTelemetryEnabled() {
+	return SimEarlyGameDeathLog::isEnabled();
+}
+
+void SimPlayerManager::recordPlayerBotEarlyGameCombatTick(uint64 identityId,
+		const SimBotEarlyGameCombatSample& sample) {
+	if (identityId == 0 || !SimEarlyGameDeathLog::isEnabled())
+		return;
+	uint64 nowMs = System::getMiliTime();
+	String transitionLine;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (!progressionEarlyGameStates.contains(identityId))
+			return;
+		SimBotEarlyGameState& state = progressionEarlyGameStates.get(identityId);
+		bool entered = sample.inCombat && !state.combatInCombat;
+		bool decisionChanged = !sample.decision.isEmpty() &&
+			sample.decision != state.combatDecision;
+		state.combatTicks++;
+		state.combatLastTickMs = nowMs;
+		if (entered) {
+			state.combatInCombatSinceMs = nowMs;
+			state.combatEntries++;
+		} else if (!sample.inCombat) {
+			state.combatInCombatSinceMs = 0;
+		}
+		state.combatInCombat = sample.inCombat;
+		state.combatHealth = sample.health;
+		state.combatHealthMax = sample.healthMax;
+		state.combatAction = sample.action;
+		state.combatActionMax = sample.actionMax;
+		state.combatMind = sample.mind;
+		state.combatMindMax = sample.mindMax;
+		state.combatDefenderCount = sample.defenderCount;
+		state.combatDefenders = sample.defenders;
+		if (!sample.decision.isEmpty()) {
+			state.combatDecision = sample.decision;
+			state.combatDecisionTtk = sample.decisionTtk;
+		}
+		if (sample.inCombat) {
+			StringBuffer fight;
+			fight << "phase=" << state.phase << " ham=" << sample.health << "/" <<
+				sample.healthMax << "," << sample.action << "/" << sample.actionMax <<
+				"," << sample.mind << "/" << sample.mindMax << " defenders=" <<
+				sample.defenderCount << " [" << sample.defenders << "] decision=" <<
+				sample.decision << " ttk=" << static_cast<int>(sample.decisionTtk) <<
+				" inCombatMs=" << (nowMs - state.combatInCombatSinceMs);
+			state.combatLastFight = fight.toString();
+			if (entered || decisionChanged)
+				transitionLine = "SimPveEarlyGameCombat identity=" +
+					String::valueOf(identityId) + " " + state.combatLastFight;
+		}
+	}
+	if (!transitionLine.isEmpty())
+		info(transitionLine, true);
+}
+
+void SimPlayerManager::recordPlayerBotEarlyGameDeathSite(uint64 identityId,
+		uint64 bodyOid, const String& planet, const Vector3& position,
+		const SimEarlyGameDeathCause* cause) {
+	if (identityId == 0 || planet.isEmpty())
+		return;
+	uint64 nowMs = System::getMiliTime();
+	String deathLine;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (!progressionEarlyGameStates.contains(identityId))
+			return;
+		SimBotEarlyGameState& state = progressionEarlyGameStates.get(identityId);
+		// onPveHunterDied records each body once; this guards any future caller.
+		// Deduplicating by body (not position) keeps a later death on the same
+		// spot visible to both route avoidance and the death log.
+		for (int i = 0; i < state.deathZones.size(); ++i) {
+			if (bodyOid != 0 && state.deathZones.get(i).bodyOid == bodyOid)
+				return;
+		}
+		SimBotEarlyGameDeathZone zone;
+		zone.bodyOid = bodyOid;
+		zone.planet = planet;
+		zone.x = position.getX();
+		zone.y = position.getY();
+		zone.atMs = nowMs;
+		state.deathZones.add(zone);
+		int memory = Math::max(1, progressionEarlyGameConfig.deathAvoidMemory);
+		while (state.deathZones.size() > memory)
+			state.deathZones.remove(0);
+
+		if (SimEarlyGameDeathLog::isEnabled()) {
+			StringBuffer line;
+			line << "SimPveEarlyGameDeath identity=" << identityId << " body=" <<
+				bodyOid << " planet=" << planet << " x=" <<
+				static_cast<int>(position.getX()) << " y=" <<
+				static_cast<int>(position.getY()) << " z=" <<
+				static_cast<int>(position.getZ());
+			if (cause == nullptr) {
+				line << " cause=uncaptured";
+			} else {
+				line << " attacker=" << cause->attackerOid << " attackerTemplate=" <<
+					(cause->attackerTemplate.isEmpty() ? String("none") :
+						cause->attackerTemplate) <<
+					" attackerLevel=" << cause->attackerLevel <<
+					" attackerSelf=" << (cause->attackerIsSelf ? 1 : 0) <<
+					" attackerCreature=" << (cause->attackerIsCreature ? 1 : 0) <<
+					" attackerPlayer=" << (cause->attackerIsPlayer ? 1 : 0) <<
+					" attackerSimBot=" << (cause->attackerIsSimBot ? 1 : 0) <<
+					" attackerInCell=" << (cause->attackerInCell ? 1 : 0) <<
+					" attackerDistance=" << static_cast<int>(cause->attackerDistance) <<
+					" combatAction=" << (cause->combatAction ? 1 : 0) <<
+					" threatEntries=" << cause->threatEntries <<
+					" totalDamage=" << cause->totalDamage <<
+					" topDamager=" << cause->topDamagerOid <<
+					" topDamagerTemplate=" <<
+					(cause->topDamagerTemplate.isEmpty() ? String("none") :
+						cause->topDamagerTemplate) <<
+					" topDamage=" << cause->topDamage;
+			}
+			line << " lastFight={" << state.combatLastFight << "}";
+			state.combatLastDeath = line.toString();
+			deathLine = state.combatLastDeath;
+		}
+	}
+	if (!deathLine.isEmpty())
+		info(deathLine, true);
+}
+
+void SimPlayerManager::getPlayerBotEarlyGameDeathZones(uint64 identityId,
+		const String& planet, Vector<SimBotEarlyGameDeathZone>& out,
+		float& radiusMeters) {
+	out.removeAll();
+	uint64 nowMs = System::getMiliTime();
+	Locker progressionLock(&progressionMutex);
+	radiusMeters = progressionEarlyGameConfig.deathAvoidRadiusMeters;
+	if (radiusMeters <= 0.f || !progressionEarlyGameStates.contains(identityId))
+		return;
+	uint64 maxAgeMs = static_cast<uint64>(
+		progressionEarlyGameConfig.deathAvoidSeconds) * 1000;
+	const SimBotEarlyGameState& state = progressionEarlyGameStates.get(identityId);
+	for (int i = 0; i < state.deathZones.size(); ++i) {
+		const SimBotEarlyGameDeathZone& zone = state.deathZones.get(i);
+		if (zone.planet != planet ||
+				(nowMs > zone.atMs && nowMs - zone.atMs > maxAgeMs))
+			continue;
+		out.add(zone);
+	}
+}
+
+void SimPlayerManager::recordPlayerBotEarlyGameDeathZoneReject(
+		uint64 identityId) {
+	Locker progressionLock(&progressionMutex);
+	if (!progressionEarlyGameStates.contains(identityId))
+		progressionEarlyGameStates.put(identityId, SimBotEarlyGameState());
+	progressionEarlyGameStates.get(identityId).deathZoneRejects++;
+}
+
+void SimPlayerManager::recordPlayerBotEarlyGameDefense(uint64 identityId,
+		bool engaged) {
+	Locker progressionLock(&progressionMutex);
+	if (!progressionEarlyGameStates.contains(identityId))
+		progressionEarlyGameStates.put(identityId, SimBotEarlyGameState());
+	SimBotEarlyGameState& state = progressionEarlyGameStates.get(identityId);
+	if (engaged)
+		state.defensiveEngagements++;
+	else
+		state.defensiveFlees++;
+}
+
+void SimPlayerManager::recordPlayerBotEarlyGameKill(uint64 identityId) {
+	Locker progressionLock(&progressionMutex);
+	if (!progressionEarlyGameStates.contains(identityId))
+		progressionEarlyGameStates.put(identityId, SimBotEarlyGameState());
+	progressionEarlyGameStates.get(identityId).kills++;
+}
+
+void SimPlayerManager::recordPlayerBotEarlyGameDeath(uint64 identityId) {
+	Locker progressionLock(&progressionMutex);
+	if (!progressionEarlyGameStates.contains(identityId))
+		progressionEarlyGameStates.put(identityId, SimBotEarlyGameState());
+	progressionEarlyGameStates.get(identityId).deaths++;
+}
+
+void SimPlayerManager::recordPlayerBotEarlyGameFlee(uint64 identityId) {
+	Locker progressionLock(&progressionMutex);
+	if (!progressionEarlyGameStates.contains(identityId))
+		progressionEarlyGameStates.put(identityId, SimBotEarlyGameState());
+	progressionEarlyGameStates.get(identityId).flees++;
+}
+
+void SimPlayerManager::recordPlayerBotEarlyGameRest(uint64 identityId) {
+	Locker progressionLock(&progressionMutex);
+	if (!progressionEarlyGameStates.contains(identityId))
+		progressionEarlyGameStates.put(identityId, SimBotEarlyGameState());
+	progressionEarlyGameStates.get(identityId).restCycles++;
+}
+
+void SimPlayerManager::recordPlayerBotEarlyGameRespawn(uint64 identityId) {
+	Locker progressionLock(&progressionMutex);
+	if (!progressionEarlyGameStates.contains(identityId))
+		progressionEarlyGameStates.put(identityId, SimBotEarlyGameState());
+	progressionEarlyGameStates.get(identityId).respawns++;
+}
+
+void SimPlayerManager::recordPlayerBotEarlyGameAnchorFallback(
+		uint64 identityId) {
+	Locker progressionLock(&progressionMutex);
+	if (!progressionEarlyGameStates.contains(identityId))
+		progressionEarlyGameStates.put(identityId, SimBotEarlyGameState());
+	progressionEarlyGameStates.get(identityId).anchorFallbacks++;
+}
+
+void SimPlayerManager::recordPlayerBotEarlyGameEmptyScanRotation(
+		uint64 identityId) {
+	Locker progressionLock(&progressionMutex);
+	if (!progressionEarlyGameStates.contains(identityId))
+		progressionEarlyGameStates.put(identityId, SimBotEarlyGameState());
+	progressionEarlyGameStates.get(identityId).emptyScanRotations++;
+}
+
+bool SimPlayerManager::snapshotPlayerBotEarlyGameStates(
+		VectorMap<uint64, SimBotEarlyGameState>& out) {
+	Locker progressionLock(&progressionMutex);
+	out = progressionEarlyGameStates;
 	return true;
 }
 
@@ -10709,6 +11903,14 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 				if (!mintPveIdentity(profession, identity,
 					request.trainingPlan))
 					throw Exception("harness identity mint failed");
+				// Register here, not when the runner later observes completion:
+				// requests drain earlier in the same PvE maintenance pass that runs
+				// governPvePopulation, so no governor tick can ever see a
+				// harness-minted identity as a production bot.
+				{
+					Locker harnessLock(&playerBotParityHarnessMutex);
+					playerBotParityHarnessMintedIds.put(identity.id, request.governed);
+				}
 				request.identityId = identity.id;
 				request.resultFound = true;
 				request.resultValue = static_cast<int64>(identity.id);
@@ -10973,6 +12175,7 @@ void SimPlayerManager::destroyPlayerBotParityBody(int identityIndex,
 	}
 	if (bodyOid == 0)
 		return;
+	SimCombatDiagLog::removeTraced(bodyOid);
 
 	Reference<SimPlayerController*> controller = controllers.contains(bodyOid) ?
 		controllers.get(bodyOid) : nullptr;
@@ -11093,10 +12296,28 @@ bool SimPlayerManager::spawnPlayerBotParityKillTarget(
 		playerBotParityTestKillTargetRate = killRate;
 		playerBotParityTestKillTargetExpectedDirect = 0;
 		playerBotParityTestKillTargetExpectedCombatGeneral = 0;
+		playerBotParityTestKillTargetSettledOid = 0;
 	}
 
-	if (CombatManager::instance() == nullptr ||
-			!CombatManager::instance()->startCombat(bot, target)) {
+	// Registration must precede startCombat: that call releases the target
+	// lock, so its first live AI tick can race immediately after it returns.
+	if (combatDiagConfig.traceSpawnedTargets)
+		SimCombatDiagLog::addTraced(target->getObjectID());
+
+	// startCombat cross-locks the defender against the attacker, and engine3's
+	// cross-lock REQUIRES the caller to already hold the attacker (its assert is
+	// compiled out by -DNDEBUG). Calling it unlocked made engine3 release the
+	// bot's rwlock from a thread that never held it whenever the fresh target was
+	// momentarily locked, corrupting the lock and hanging every later writer:
+	// REST workers, task workers and the zone thread (gdb dumps
+	// trip-diag-20260913-221000-zone-livelock). Hold the bot only for the call;
+	// the failure cleanup despawns the target and must run with no lock held.
+	bool combatStarted = false;
+	if (CombatManager::instance() != nullptr) {
+		Locker botLocker(bot);
+		combatStarted = CombatManager::instance()->startCombat(bot, target);
+	}
+	if (!combatStarted) {
 		failure = "kill_target_start_combat_failed";
 		despawnPlayerBotParityKillTarget();
 		return false;
@@ -11173,23 +12394,64 @@ bool SimPlayerManager::awaitPlayerBotParityKillTarget(
 	int expectedCombatGeneral = static_cast<int>(combatXp * 0.1f *
 		globalMultiplier * killRate);
 
+	// Attribute the award PER VICTIM. A cone or area special kills bystanders in
+	// the same swing - verification 20260913 saw strafeshot2 kill the nuna and
+	// three wild creatures - and each of those awards is correct, so the store
+	// rows legitimately exceed a sole-kill oracle. Settle on the grant the
+	// production award path recorded for THIS target, then require the rows to
+	// equal that grant plus every other grant the ledger recorded, so no XP can
+	// reach the rows outside a recorded kill award.
+	//
 	// killXp.kills advances at the TOP of the award, before either grant, and
-	// the two grants take progressionMutex separately - so a reader can land
-	// between them. Settling on the direct row alone would let the following
-	// combat_general assertion race the task that is still writing it. Require
-	// BOTH rows, at their exact expected values.
+	// the grants take progressionMutex separately. combat_general is granted
+	// and recorded last for an attacker, so its ledger entry marks the target's
+	// award complete; the row comparison retries until any in-flight bystander
+	// grant has been recorded as well.
 	if (expectedDirect > 0 || expectedCombatGeneral > 0) {
-		SimBotProgression progression;
-		if (!snapshotPlayerBotProgression(identityId, progression) ||
-				expectedXpType.isEmpty())
+		if (expectedXpType.isEmpty())
 			return false;
 
-		int direct = progression.experience.contains(expectedXpType) ?
+		int64 targetDirect = 0;
+		int64 targetGeneral = 0;
+		int64 otherDirect = 0;
+		int64 otherGeneral = 0;
+		bool directFound = false;
+		bool generalFound = false;
+		readPlayerBotParityKillAwards(identityId, targetOid, expectedXpType,
+			targetDirect, directFound, otherDirect);
+		readPlayerBotParityKillAwards(identityId, targetOid, "combat_general",
+			targetGeneral, generalFound, otherGeneral);
+		if ((expectedDirect > 0 && !directFound) ||
+				(expectedCombatGeneral > 0 && !generalFound))
+			return false;
+		if (targetDirect != expectedDirect ||
+				targetGeneral != expectedCombatGeneral) {
+			failure = "kill_target_award_mismatch";
+			return false;
+		}
+
+		// A cone kill queues one award task per victim and they finish over
+		// ~100 ms in any order, so the target's grants can land first. Settle
+		// only once this identity's award stream has gone quiet: otherwise the
+		// scenario's following flushNow can persist a partial row and
+		// reloadStore then drops the late bystander grants (verification
+		// 20260913 r3: settled at 549 ms, xp_mismatch after the reload).
+		const uint64 awardQuietMs = 2000;
+		uint64 lastAwardMs = getPlayerBotParityKillAwardLastMs(identityId);
+		if (lastAwardMs == 0 || System::getMiliTime() < lastAwardMs + awardQuietMs)
+			return false;
+
+		SimBotProgression progression;
+		if (!snapshotPlayerBotProgression(identityId, progression))
+			return false;
+
+		int64 direct = progression.experience.contains(expectedXpType) ?
 			progression.experience.get(expectedXpType) : 0;
-		int general = progression.experience.contains("combat_general") ?
+		int64 general = progression.experience.contains("combat_general") ?
 			progression.experience.get("combat_general") : 0;
 
-		if (direct != expectedDirect || general != expectedCombatGeneral)
+		if (direct != expectedDirect + otherDirect ||
+				general != expectedCombatGeneral + otherGeneral)
 			return false;
 	}
 
@@ -11198,6 +12460,7 @@ bool SimPlayerManager::awaitPlayerBotParityKillTarget(
 		playerBotParityTestKillTargetExpectedDirect = expectedDirect;
 		playerBotParityTestKillTargetExpectedCombatGeneral =
 			expectedCombatGeneral;
+		playerBotParityTestKillTargetSettledOid = targetOid;
 	}
 
 	despawnPlayerBotParityKillTarget();
@@ -11217,6 +12480,7 @@ void SimPlayerManager::despawnPlayerBotParityKillTarget() {
 		playerBotParityTestKillTargetKillXpBaseline = 0;
 		playerBotParityTestKillTargetXpType = "";
 	}
+	SimCombatDiagLog::removeTraced(targetOid);
 	if (targetOid == 0)
 		return;
 
@@ -11368,6 +12632,15 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 	if (key == "killxp.cappedbyceiling" ||
 			key == "killxpcappedbyceiling")
 		return killXpCappedByCeiling.get();
+	if (key == "killxp.botkillsseen" || key == "killxpbotkillsseen")
+		return killXpBotKillsSeen.get();
+	if (key == "killxp.droppednodamage" || key == "killxpdroppednodamage")
+		return killXpDroppedNoDamage.get();
+	if (key == "killxp.droppednobasexp" || key == "killxpdroppednobasexp")
+		return killXpDroppedNoBaseXp.get();
+	if (key == "killxp.droppednosimbotattacker" ||
+			key == "killxpdroppednosimbotattacker")
+		return killXpDroppedNoSimBotAttacker.get();
 	if (key == "training.trained" || key == "trainingtrained")
 		return trainingTrained.get();
 	if (key == "training.refusednorecord" || key == "trainingrefusednorecord")
@@ -11727,6 +13000,18 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 			playerBotParityTestTrainingGateOverride =
 				playerBotParityTestTrainingGateOverridePrevious;
 		}
+		if (playerBotParityTestEarlyGameGateOverrideActive) {
+			playerBotParityTestEarlyGameGateOverrideActive =
+				playerBotParityTestEarlyGameGateOverridePreviousActive;
+			playerBotParityTestEarlyGameGateOverride =
+				playerBotParityTestEarlyGameGateOverridePrevious;
+		}
+		if (playerBotParityTestRealWeaponDamageGateOverrideActive) {
+			playerBotParityTestRealWeaponDamageGateOverrideActive =
+				playerBotParityTestRealWeaponDamageGateOverridePreviousActive;
+			playerBotParityTestRealWeaponDamageGateOverride =
+				playerBotParityTestRealWeaponDamageGateOverridePrevious;
+		}
 	}
 	// Outside the parity scope above on purpose: this takes pveMutex, and every
 	// reader of pveNoviceEnabled holds pveMutex first, so nesting it under the
@@ -11869,6 +13154,10 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 
 	if (!preserveProbe)
 		deletePlayerBotParityPhaseAFile();
+	// The harness owns a bounded diagnostic run. Clear the complete allowlist
+	// after its bodies and target have been torn down so no test OID leaks into
+	// normal production tracing.
+	SimCombatDiagLog::clearTraced();
 	// Harness cleanup: drop the novice latch before the parity scope below, so a
 	// fail-fast exit after setNoviceGate(true) cannot leave novice behaviour
 	// live, and so applyPveConfig resumes honouring the Lua value.
@@ -11888,6 +13177,12 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 		playerBotParityTestIdentityRefs.removeAll();
 		if (!preserveProbe)
 			playerBotParityTestProbeIdentityId = 0;
+	}
+	{
+		Locker harnessLock(&playerBotParityHarnessMutex);
+		playerBotParityHarnessMintedIds.removeAll();
+		playerBotParityKillAwardLedger.removeAll();
+		playerBotParityKillAwardLastMs.removeAll();
 	}
 }
 
@@ -12079,6 +13374,35 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 		scenario = playerBotParityTestScenarios.get(scenarioConfigIndex);
 	}
 	if (!active) {
+		// Preconditions are checked BEFORE the scenario is marked active, so a
+		// misconfigured run never starts a scenario it cannot pass. Evaluated
+		// outside playerBotParityTestMutex because the gate predicates take
+		// that mutex themselves (and pveMutex for the novice gate).
+		String preconditionFailure;
+		if (!playerBotParityScenarioPreconditionsMet(scenario,
+				preconditionFailure)) {
+			uint64 failedAtMs = System::getMiliTime();
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				playerBotParityTestResults.get(scenarioConfigIndex).status =
+					"FAIL";
+				playerBotParityTestResults.get(scenarioConfigIndex).failReason =
+					preconditionFailure;
+				playerBotParityTestResults.get(scenarioConfigIndex)
+					.restartPhase = phase;
+				playerBotParityTestResults.get(scenarioConfigIndex)
+					.startedAtMs = failedAtMs;
+				playerBotParityTestResults.get(scenarioConfigIndex)
+					.finishedAtMs = failedAtMs;
+				playerBotParityTestScenarioActive = false;
+			}
+			info("SimPlayerBotParityPrecondition scenario=\"" + scenario.name +
+				"\" reason=" + preconditionFailure, true);
+			beginPlayerBotParityTestCleanup(false);
+			schedulePlayerBotParityTestRunner(0);
+			return;
+		}
+
 		uint64 nowMs = System::getMiliTime();
 		{
 			Locker parityLock(&playerBotParityTestMutex);
@@ -12097,7 +13421,9 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 				"killXp.skippedNoIdentity", "killXp.skippedGateOff",
 				"killXp.skippedZero", "killXp.awardsGranted",
 				"killXp.totalAwarded", "killXp.cappedByLevel",
-				"killXp.cappedByCeiling", "training.trained",
+				"killXp.cappedByCeiling", "killXp.botKillsSeen",
+				"killXp.droppedNoDamage", "killXp.droppedNoBaseXp",
+				"killXp.droppedNoSimBotAttacker", "training.trained",
 				"training.refusedNoRecord", "training.refusedGate",
 				"training.refusedUnknownSkill", "training.refusedAlreadyTrained",
 				"training.refusedPrereq", "training.refusedPreclusion",
@@ -12285,6 +13611,7 @@ bool SimPlayerManager::executePlayerBotParityRequestStep(
 		request.kind = kind;
 		request.force = step.force;
 		request.profession = step.profession;
+		request.governed = step.governed;
 		request.trainingPlan = step.trainingPlan;
 		request.xpType = step.xpType;
 		request.faultFlushDelayMs = step.flushDelayMs;
@@ -12386,6 +13713,8 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			op == "recordSkill" || op == "trainSkill" || op == "assertXp" ||
 			op == "assertCredits" || op == "assertSkill" ||
 			op == "assertSkillMod" || op == "assertPlanOrder" ||
+			op == "assertNextSkill" || op == "assertWeaponXpType" ||
+			op == "assertActivity" ||
 			op == "assertBodyLive" || op == "assertHuntOrder" ||
 			op == "assertSkillPoints" || op == "assertAvailableXp" ||
 			op == "assertXpCap" ||
@@ -12808,6 +14137,101 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		result.status = "PASS";
 		return true;
 	}
+	if (op == "assertPlanScale") {
+		String planName = step.trainingPlan.isEmpty() ? step.expect :
+			step.trainingPlan;
+		if (planName.isEmpty() || !step.hasExpectedBoxCount ||
+				!step.hasExpectedTotalPoints) {
+			result.status = "FAIL";
+			result.failReason = "invalid_plan_scale_expectation";
+			return true;
+		}
+
+		SimBotTrainingPlan plan;
+		{
+			Locker progressionLock(&progressionMutex);
+			if (!progressionTrainingPlans.contains(planName)) {
+				result.status = "FAIL";
+				result.failReason = "plan_not_found";
+				return true;
+			}
+			plan = progressionTrainingPlans.get(planName);
+		}
+
+		// Re-walk the configured goals independently of the production builder.
+		// The scale assertion therefore proves that the derived order contains
+		// the complete multi-goal closure, not merely the expected number of rows.
+		SkillManager* skillManager = SkillManager::instance();
+		Vector<String> closure;
+		Vector<String> visiting;
+		bool closureValid = skillManager != nullptr;
+		std::function<bool(const String&)> collectSkills =
+			[&](const String& skillName) {
+				if (!closureValid)
+					return false;
+				if (visiting.contains(skillName)) {
+					closureValid = false;
+					return false;
+				}
+				if (closure.contains(skillName))
+					return true;
+				Skill* skill = skillManager->getSkill(skillName);
+				if (skill == nullptr) {
+					closureValid = false;
+					return false;
+				}
+				visiting.add(skillName);
+				const Vector<String>* requiredSkills = skill->getSkillsRequired();
+				for (int i = 0; requiredSkills != nullptr &&
+						i < requiredSkills->size(); ++i)
+					if (!collectSkills(requiredSkills->get(i)))
+						break;
+				visiting.removeElement(skillName);
+				if (closureValid)
+					closure.add(skillName);
+				return closureValid;
+			};
+		for (int i = 0; closureValid && i < plan.goalSkills.size(); ++i) {
+			visiting.removeAll();
+			collectSkills(plan.goalSkills.get(i));
+		}
+
+		bool uniqueAndComplete = closureValid &&
+			plan.orderedSkills.size() == step.expectedBoxCount &&
+			plan.totalPoints == step.expectedTotalPoints &&
+			closure.size() == plan.orderedSkills.size();
+		for (int i = 0; uniqueAndComplete && i < plan.orderedSkills.size();
+				++i) {
+			const String& orderedSkill = plan.orderedSkills.get(i);
+			if (!closure.contains(orderedSkill))
+				uniqueAndComplete = false;
+			for (int j = 0; j < i; ++j)
+				if (plan.orderedSkills.get(j) == orderedSkill)
+					uniqueAndComplete = false;
+			Skill* skill = skillManager == nullptr ? nullptr :
+				skillManager->getSkill(orderedSkill);
+			const Vector<String>* requiredSkills = skill == nullptr ? nullptr :
+				skill->getSkillsRequired();
+			for (int j = 0; uniqueAndComplete && requiredSkills != nullptr &&
+					j < requiredSkills->size(); ++j) {
+				bool prerequisiteEarlier = false;
+				for (int k = 0; k < i; ++k)
+					if (plan.orderedSkills.get(k) == requiredSkills->get(j)) {
+						prerequisiteEarlier = true;
+						break;
+					}
+				if (!prerequisiteEarlier)
+					uniqueAndComplete = false;
+			}
+		}
+		if (!uniqueAndComplete) {
+			result.status = "FAIL";
+			result.failReason = "plan_scale_or_topology_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
 	if (op == "assertPlanOrder") {
 		String planName;
 		{
@@ -12886,6 +14310,115 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		result.status = "PASS";
 		return true;
 	}
+	if (op == "assertNextSkill") {
+		if (step.skillName.isEmpty() || step.xpType.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "invalid_next_skill_expectation";
+			return true;
+		}
+		SimBotTrainingStep actual;
+		{
+			Locker progressionLock(&progressionMutex);
+			if (!progressionTrainingNextSteps.contains(identityId)) {
+				result.status = "FAIL";
+				result.failReason = "cached_next_step_missing";
+				return true;
+			}
+			actual = progressionTrainingNextSteps.get(identityId);
+		}
+		if (!actual.valid || actual.skillName != step.skillName ||
+				actual.xpType != step.xpType) {
+			result.status = "FAIL";
+			result.failReason = "cached_next_step_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertWeaponXpType") {
+		if (step.xpType.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "weapon_xp_type_missing";
+			return true;
+		}
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			if (pveIdentityBodyOids.contains(identityId))
+				bodyOid = pveIdentityBodyOids.get(identityId);
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+			zoneServer->getObject(bodyOid);
+		AiAgent* agent = object == nullptr ? nullptr : object->asAiAgent();
+		if (agent == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "body_not_found";
+			return true;
+		}
+		String actualXpType;
+		float actualMinDamage = 0.f;
+		float actualMaxDamage = 0.f;
+		{
+			Locker agentLock(agent);
+			if (agent->getZone() == nullptr || agent->getWeapon() == nullptr) {
+				result.status = "FAIL";
+				result.failReason = "weapon_not_held";
+				return true;
+			}
+			ManagedReference<WeaponObject*> weapon = agent->getWeapon();
+			actualXpType = weapon->getXpType();
+			actualMinDamage = weapon->getMinDamage();
+			actualMaxDamage = weapon->getMaxDamage();
+		}
+		bool damageMatches = (!step.hasExpectedMinDamage ||
+				actualMinDamage == static_cast<float>(step.expectedMinDamage)) &&
+			(!step.hasExpectedMaxDamage ||
+				actualMaxDamage == static_cast<float>(step.expectedMaxDamage));
+		if (actualXpType != step.xpType || !damageMatches) {
+			result.status = "FAIL";
+			result.failReason = "weapon_xp_type_or_damage_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertActivity") {
+		if (step.expect.isEmpty() || !step.hasExpectedGraduated) {
+			result.status = "FAIL";
+			result.failReason = "invalid_activity_expectation";
+			return true;
+		}
+		SimBotIdentity identity;
+		if (!snapshotPlayerBotIdentity(identityId, identity)) {
+			result.status = "FAIL";
+			result.failReason = "identity_not_found";
+			return true;
+		}
+		SimBotActivityDecision decision;
+		scorePlayerBotActivity(identity, decision);
+		if (decision.activity != step.expect ||
+				decision.graduated != step.expectedGraduated ||
+				(!step.stalledBox.isEmpty() &&
+					!decision.stalledBoxes.contains(step.stalledBox))) {
+			result.status = "FAIL";
+			result.failReason = "activity_decision_mismatch";
+			return true;
+		}
+		VectorMap<uint64, SimBotEarlyGameState> states;
+		snapshotPlayerBotEarlyGameStates(states);
+		if (!states.contains(identityId) ||
+				states.get(identityId).activity != decision.activity ||
+				states.get(identityId).graduated != decision.graduated ||
+				(!step.stalledBox.isEmpty() &&
+					!states.get(identityId).stalledBoxes.contains(step.stalledBox))) {
+			result.status = "FAIL";
+			result.failReason = "activity_dashboard_state_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
 	if (op == "assertXp" || op == "assertCredits" || op == "assertSkill" ||
 			op == "assertSource") {
 		int64 expectedValue = 0;
@@ -12897,10 +14430,22 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			(step.expect == "killTargetDirect" ||
 			step.expect == "killTargetCombatGeneral");
 		if (killTargetExpect) {
-			Locker parityLock(&playerBotParityTestMutex);
-			expectedValue = step.expect == "killTargetDirect" ?
-				playerBotParityTestKillTargetExpectedDirect :
-				playerBotParityTestKillTargetExpectedCombatGeneral;
+			uint64 settledTargetOid = 0;
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				expectedValue = step.expect == "killTargetDirect" ?
+					playerBotParityTestKillTargetExpectedDirect :
+					playerBotParityTestKillTargetExpectedCombatGeneral;
+				settledTargetOid = playerBotParityTestKillTargetSettledOid;
+			}
+			// Same attribution as the settle: the row also carries every other
+			// kill grant the ledger recorded (for example cone bystanders).
+			int64 targetAwarded = 0;
+			bool targetFound = false;
+			int64 otherAwarded = 0;
+			readPlayerBotParityKillAwards(identityId, settledTargetOid,
+				step.xpType, targetAwarded, targetFound, otherAwarded);
+			expectedValue += otherAwarded;
 		} else if (op != "assertSource" && op != "assertSkill" &&
 				!parsePlayerBotParityExpected(step.expect, expectedValue)) {
 			result.status = "FAIL";
@@ -13242,6 +14787,57 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		result.status = "PASS";
 		return true;
 	}
+	if (op == "setEarlyGameGate" || op == "setRealWeaponDamageGate") {
+		bool earlyGame = op == "setEarlyGameGate";
+		int64 enabledValue = 0;
+		if (step.hasGateEnabled)
+			enabledValue = step.gateEnabled ? 1 : 0;
+		else if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = earlyGame ? "invalid_early_game_gate_value" :
+				"invalid_real_weapon_damage_gate_value";
+			return true;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			// Snapshot the CONFIGURED value when no override is active yet, so
+			// restore returns the gate to what Lua actually shipped rather than
+			// to a stale override value.
+			if (earlyGame) {
+				if (!playerBotParityTestEarlyGameGateOverrideActive) {
+					playerBotParityTestEarlyGameGateOverridePreviousActive =
+						false;
+					playerBotParityTestEarlyGameGateOverridePrevious =
+						progressionEarlyGameEnabled;
+				} else {
+					playerBotParityTestEarlyGameGateOverridePreviousActive =
+						true;
+					playerBotParityTestEarlyGameGateOverridePrevious =
+						playerBotParityTestEarlyGameGateOverride;
+				}
+				playerBotParityTestEarlyGameGateOverrideActive = true;
+				playerBotParityTestEarlyGameGateOverride = enabledValue != 0;
+			} else {
+				if (!playerBotParityTestRealWeaponDamageGateOverrideActive) {
+					playerBotParityTestRealWeaponDamageGateOverridePreviousActive =
+						false;
+					playerBotParityTestRealWeaponDamageGateOverridePrevious =
+						progressionEarlyGameEnabled &&
+						progressionEarlyGameRealWeaponDamage;
+				} else {
+					playerBotParityTestRealWeaponDamageGateOverridePreviousActive =
+						true;
+					playerBotParityTestRealWeaponDamageGateOverridePrevious =
+						playerBotParityTestRealWeaponDamageGateOverride;
+				}
+				playerBotParityTestRealWeaponDamageGateOverrideActive = true;
+				playerBotParityTestRealWeaponDamageGateOverride =
+					enabledValue != 0;
+			}
+		}
+		result.status = "PASS";
+		return true;
+	}
 	if (op == "setNoviceGate") {
 		int64 enabledValue = 0;
 		if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
@@ -13317,6 +14913,8 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	}
 
 	VectorMap<uint64, SimBotProgression> records;
+	VectorMap<uint64, SimBotEarlyGameState> earlyGameStateSnapshot;
+	SimBotEarlyGameConfig earlyGameConfigSnapshot;
 	int dirtyCount = 0;
 	uint64 lastFlushMs = 0;
 	uint64 lastAwardMs = 0;
@@ -13324,9 +14922,11 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	VectorMap<uint64, SimBotTrainingStep> nextStepSnapshot;
 	int pendingTrainingCount = 0;
 	uint64 trainingSweepCursorSnapshot = 0;
-	{
+		{
 		Locker progressionLock(&progressionMutex);
 		records = progressionRecords;
+		earlyGameStateSnapshot = progressionEarlyGameStates;
+		earlyGameConfigSnapshot = progressionEarlyGameConfig;
 		dirtyCount = progressionDirtyIds.size();
 		nextStepSnapshot = progressionTrainingNextSteps;
 		pendingTrainingCount = progressionTrainingPendingIds.size();
@@ -13388,6 +14988,10 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	killXp["totalAwarded"] = killXpTotalAwarded.get();
 	killXp["cappedByLevel"] = killXpCappedByLevel.get();
 	killXp["cappedByCeiling"] = killXpCappedByCeiling.get();
+	killXp["botKillsSeen"] = killXpBotKillsSeen.get();
+	killXp["droppedNoDamage"] = killXpDroppedNoDamage.get();
+	killXp["droppedNoBaseXp"] = killXpDroppedNoBaseXp.get();
+	killXp["droppedNoSimBotAttacker"] = killXpDroppedNoSimBotAttacker.get();
 	killXp["lastAwardAgeSeconds"] = lastAwardMs == 0 ? 0 :
 		static_cast<uint64>((nowMs > lastAwardMs ?
 			nowMs - lastAwardMs : 0) / 1000);
@@ -13402,6 +15006,8 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	gates["lootEnabled"] = false;
 	gates["groupLoot"] = false;
 	gates["trainingEnabled"] = playerBotTrainingGateEnabled();
+	gates["earlyGameEnabled"] = playerBotEarlyGameGateEnabled();
+	gates["realWeaponDamage"] = playerBotRealWeaponDamageGateEnabled();
 	gates["bazaarSell"] = false;
 	gates["bazaarBuy"] = false;
 	result["gates"] = gates;
@@ -13442,7 +15048,43 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		JSONSerializationType planRow = JSONSerializationType::object();
 		planRow["name"] = plan.name;
 		planRow["profession"] = plan.profession;
-		planRow["goalSkill"] = plan.goalSkill;
+		JSONSerializationType goalSkills = JSONSerializationType::array();
+		for (int j = 0; j < plan.goalSkills.size(); ++j)
+			goalSkills.push_back(plan.goalSkills.get(j));
+		planRow["goalSkills"] = goalSkills;
+		// The SWG box-count shorthand ("Fencer 32xx", "Medic 2xxx") names a
+		// branch by its in-game display name, but skills.iff lives in the
+		// client TRE archives and the code names branches accuracy/speed/
+		// ability/support. Publishing each goal box's granted mods and commands
+		// is what lets a configured branch be confirmed as the intended one
+		// (defense, knockdown defense, firstaid) from a dashboard read rather
+		// than from an assumption. Read-only, bounded by the goal count.
+		JSONSerializationType goalDetails = JSONSerializationType::array();
+		for (int j = 0; j < plan.goalSkills.size(); ++j) {
+			Skill* goalSkill = SkillManager::instance() == nullptr ? nullptr :
+				SkillManager::instance()->getSkill(plan.goalSkills.get(j));
+			if (goalSkill == nullptr)
+				continue;
+			JSONSerializationType goalRow = JSONSerializationType::object();
+			goalRow["skill"] = plan.goalSkills.get(j);
+			goalRow["xpType"] = goalSkill->getXpType();
+			goalRow["xpCost"] = goalSkill->getXpCost();
+			goalRow["skillPoints"] = goalSkill->getSkillPointsRequired();
+			JSONSerializationType mods = JSONSerializationType::object();
+			const VectorMap<String, int>* skillMods =
+				goalSkill->getSkillModifiers();
+			for (int k = 0; skillMods != nullptr && k < skillMods->size(); ++k)
+				mods[skillMods->elementAt(k).getKey().toCharArray()] =
+					skillMods->elementAt(k).getValue();
+			goalRow["skillMods"] = mods;
+			JSONSerializationType commands = JSONSerializationType::array();
+			const Vector<String>* abilities = goalSkill->getAbilities();
+			for (int k = 0; abilities != nullptr && k < abilities->size(); ++k)
+				commands.push_back(abilities->get(k));
+			goalRow["commands"] = commands;
+			goalDetails.push_back(goalRow);
+		}
+		planRow["goalSkillDetails"] = goalDetails;
 		planRow["weaponTemplate"] = plan.weaponTemplate;
 		planRow["weaponType"] = plan.weaponType;
 		planRow["boxCount"] = plan.orderedSkills.size();
@@ -13451,7 +15093,186 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		plans.push_back(planRow);
 	}
 	training["plans"] = plans;
+
+	// Deferred boxes are intentionally distinct from blocked boxes. The former
+	// are explicitly named by Lua and may be skipped by the early-game ladder;
+	// the latter remain untrained because their source is merely gated off.
+	JSONSerializationType stalledBoxes = JSONSerializationType::array();
+	JSONSerializationType blockedBoxes = JSONSerializationType::array();
+	for (int i = 0; i < records.size(); ++i) {
+		uint64 identityId = records.elementAt(i).getKey();
+		if (!roster.contains(identityId))
+			continue;
+		const SimBotIdentity& identity = roster.get(identityId);
+		if (identity.trainingPlan.isEmpty() ||
+				!planSnapshot.contains(identity.trainingPlan))
+			continue;
+		JSONSerializationType deferred = JSONSerializationType::array();
+		JSONSerializationType blocked = JSONSerializationType::array();
+		const SimBotProgression& progression = records.get(identityId);
+		const SimBotTrainingPlan& plan = planSnapshot.get(identity.trainingPlan);
+		for (int j = 0; j < plan.orderedSkills.size(); ++j) {
+			String skillName = plan.orderedSkills.get(j);
+			if (progression.skills.contains(skillName))
+				continue;
+			Skill* skill = SkillManager::instance() == nullptr ? nullptr :
+				SkillManager::instance()->getSkill(skillName);
+			if (skill == nullptr)
+				continue;
+			if (earlyGameConfigSnapshot.deferredXpTypes.contains(
+					skill->getXpType()))
+				deferred.push_back(skillName);
+			else
+				blocked.push_back(skillName);
+		}
+		if (deferred.size() > 0) {
+			JSONSerializationType row = JSONSerializationType::object();
+			row["identityId"] = identityId;
+			row["boxes"] = deferred;
+			stalledBoxes.push_back(row);
+		}
+		if (blocked.size() > 0) {
+			JSONSerializationType row = JSONSerializationType::object();
+			row["identityId"] = identityId;
+			row["boxes"] = blocked;
+			blockedBoxes.push_back(row);
+		}
+	}
+	training["stalledBoxes"] = stalledBoxes;
+	training["blockedBoxes"] = blockedBoxes;
 	result["training"] = training;
+
+	JSONSerializationType earlyGame = JSONSerializationType::object();
+	earlyGame["enabled"] = playerBotEarlyGameGateEnabled();
+	earlyGame["realWeaponDamage"] = playerBotRealWeaponDamageGateEnabled();
+	earlyGame["grindAnchorMinMeters"] =
+		earlyGameConfigSnapshot.grindAnchorMinMeters;
+	earlyGame["grindAnchorMaxMeters"] =
+		earlyGameConfigSnapshot.grindAnchorMaxMeters;
+	earlyGame["anchorMaxAttempts"] =
+		earlyGameConfigSnapshot.anchorMaxAttempts;
+	earlyGame["scanMaxAttempts"] = earlyGameConfigSnapshot.scanMaxAttempts;
+	earlyGame["scanRetrySeconds"] =
+		earlyGameConfigSnapshot.scanRetrySeconds;
+	earlyGame["combatTelemetry"] = earlyGameConfigSnapshot.combatTelemetry;
+	earlyGame["deathAvoidRadiusMeters"] =
+		earlyGameConfigSnapshot.deathAvoidRadiusMeters;
+	earlyGame["cloneWoundMaxFraction"] =
+		earlyGameConfigSnapshot.cloneWoundMaxFraction;
+	earlyGame["levelBandBelow"] = earlyGameConfigSnapshot.levelBandBelow;
+	earlyGame["avoidGroupAggroTargets"] =
+		earlyGameConfigSnapshot.avoidGroupAggroTargets;
+	earlyGame["roamCitySpawners"] = earlyGameConfigSnapshot.roamCitySpawners;
+	earlyGame["spawnerSearchRadiusMeters"] =
+		earlyGameConfigSnapshot.spawnerSearchRadiusMeters;
+	earlyGame["spawnerArriveMeters"] =
+		earlyGameConfigSnapshot.spawnerArriveMeters;
+	earlyGame["unreachableSkipSeconds"] =
+		earlyGameConfigSnapshot.unreachableSkipSeconds;
+	earlyGame["unreachableSkipMaxTargets"] =
+		earlyGameConfigSnapshot.unreachableSkipMaxTargets;
+	earlyGame["levelBandAbove"] = earlyGameConfigSnapshot.levelBandAbove;
+	JSONSerializationType earlyStates = JSONSerializationType::array();
+	for (int i = 0; i < earlyGameStateSnapshot.size(); ++i) {
+		uint64 identityId = earlyGameStateSnapshot.elementAt(i).getKey();
+		const SimBotEarlyGameState& state =
+			earlyGameStateSnapshot.elementAt(i).getValue();
+		JSONSerializationType row = JSONSerializationType::object();
+		row["identityId"] = identityId;
+		row["activity"] = state.activity;
+		row["graduated"] = state.graduated;
+		row["phase"] = state.phase;
+		row["targetOid"] = state.targetOid;
+		row["targetTtkSeconds"] = state.targetTtkSeconds;
+		row["targetDefensive"] = state.targetDefensive;
+		row["defensiveEngagements"] = state.defensiveEngagements;
+		row["defensiveFlees"] = state.defensiveFlees;
+		row["currentWeaponXpType"] = state.currentWeaponXpType;
+		JSONSerializationType stalled = JSONSerializationType::array();
+		for (int j = 0; j < state.stalledBoxes.size(); ++j)
+			stalled.push_back(state.stalledBoxes.get(j));
+		row["stalledBoxes"] = stalled;
+		row["kills"] = state.kills;
+		row["deaths"] = state.deaths;
+		row["flees"] = state.flees;
+		row["restCycles"] = state.restCycles;
+		row["respawns"] = state.respawns;
+		row["anchorFallbacks"] = state.anchorFallbacks;
+		row["emptyScanRotations"] = state.emptyScanRotations;
+		row["deathZoneRejects"] = state.deathZoneRejects;
+		JSONSerializationType deathZones = JSONSerializationType::array();
+		uint64 deathZoneNowMs = System::getMiliTime();
+		for (int j = 0; j < state.deathZones.size(); ++j) {
+			const SimBotEarlyGameDeathZone& zone = state.deathZones.get(j);
+			JSONSerializationType zoneRow = JSONSerializationType::object();
+			zoneRow["planet"] = zone.planet;
+			zoneRow["x"] = zone.x;
+			zoneRow["y"] = zone.y;
+			zoneRow["ageSeconds"] = deathZoneNowMs > zone.atMs ?
+				(deathZoneNowMs - zone.atMs) / 1000 : static_cast<uint64>(0);
+			deathZones.push_back(zoneRow);
+		}
+		row["deathZones"] = deathZones;
+		if (earlyGameConfigSnapshot.movementTelemetry) {
+			JSONSerializationType movement = JSONSerializationType::object();
+			uint64 telemetryNowMs = System::getMiliTime();
+			movement["ticks"] = state.telemetryTicks;
+			movement["pathFailures"] = state.telemetryPathFailures;
+			movement["lastTickAgeMs"] = state.telemetryLastTickMs == 0 ?
+				static_cast<uint64>(0) : (telemetryNowMs > state.telemetryLastTickMs ?
+				telemetryNowMs - state.telemetryLastTickMs : static_cast<uint64>(0));
+			movement["begins"] = state.telemetryBegins;
+			movement["notIdentityExits"] = state.telemetryNotIdentityExits;
+			movement["moveRequests"] = state.telemetryMoveRequests;
+			movement["lastMoveRequestAgeMs"] = state.telemetryLastMoveRequestMs == 0 ?
+				static_cast<uint64>(0) : (telemetryNowMs > state.telemetryLastMoveRequestMs ?
+				telemetryNowMs - state.telemetryLastMoveRequestMs : static_cast<uint64>(0));
+			movement["moveRequestGeneration"] = state.telemetryMoveRequestGeneration;
+			movement["workLoopGeneration"] = state.telemetryWorkLoopGeneration;
+			movement["lastGenerationReason"] = state.telemetryLastGenerationReason;
+			movement["branch"] = state.telemetryBranch;
+			movement["hybridDiag"] = state.telemetryHybridDiag;
+			movement["state"] = state.telemetryMovementState;
+			movement["stateAgeMs"] = state.telemetryMovementStateSinceMs == 0 ?
+				static_cast<uint64>(0) : (telemetryNowMs > state.telemetryMovementStateSinceMs ?
+				telemetryNowMs - state.telemetryMovementStateSinceMs : static_cast<uint64>(0));
+			movement["posX"] = state.telemetryPosX;
+			movement["posY"] = state.telemetryPosY;
+			movement["anchorX"] = state.telemetryAnchorX;
+			movement["anchorY"] = state.telemetryAnchorY;
+			movement["distanceToAnchor"] = state.telemetryDistanceToAnchor;
+			row["movement"] = movement;
+		}
+		if (earlyGameConfigSnapshot.combatTelemetry) {
+			JSONSerializationType combat = JSONSerializationType::object();
+			uint64 combatNowMs = System::getMiliTime();
+			combat["ticks"] = state.combatTicks;
+			combat["lastTickAgeMs"] = state.combatLastTickMs == 0 ?
+				static_cast<uint64>(0) : (combatNowMs > state.combatLastTickMs ?
+				combatNowMs - state.combatLastTickMs : static_cast<uint64>(0));
+			combat["inCombat"] = state.combatInCombat;
+			combat["inCombatForMs"] = state.combatInCombatSinceMs == 0 ?
+				static_cast<uint64>(0) : (combatNowMs > state.combatInCombatSinceMs ?
+				combatNowMs - state.combatInCombatSinceMs : static_cast<uint64>(0));
+			combat["entries"] = state.combatEntries;
+			combat["health"] = state.combatHealth;
+			combat["healthMax"] = state.combatHealthMax;
+			combat["action"] = state.combatAction;
+			combat["actionMax"] = state.combatActionMax;
+			combat["mind"] = state.combatMind;
+			combat["mindMax"] = state.combatMindMax;
+			combat["defenderCount"] = state.combatDefenderCount;
+			combat["defenders"] = state.combatDefenders;
+			combat["decision"] = state.combatDecision;
+			combat["decisionTtk"] = state.combatDecisionTtk;
+			combat["lastFight"] = state.combatLastFight;
+			combat["lastDeath"] = state.combatLastDeath;
+			row["combat"] = combat;
+		}
+		earlyStates.push_back(row);
+	}
+	earlyGame["identities"] = earlyStates;
+	result["earlyGame"] = earlyGame;
 
 	JSONSerializationType maintenance = JSONSerializationType::object();
 	maintenance["ticksTotal"] = pveMaintenanceTicksTotal.get();
@@ -13482,11 +15303,26 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	result["maintenance"] = maintenance;
 
 	JSONSerializationType identityRows = JSONSerializationType::array();
+	ZoneServer* dashboardZoneServer = ServerCore::getZoneServer();
 	for (int i = 0; i < records.size(); ++i) {
 		uint64 identityId = records.elementAt(i).getKey();
 		const SimBotProgression& progression = records.elementAt(i).getValue();
 		const SimBotIdentity* identity = roster.contains(identityId) ?
 			&roster.get(identityId) : nullptr;
+		uint64 bodyOid = bodyOids.contains(identityId) ?
+			bodyOids.get(identityId) : 0;
+		String heldWeaponXpType;
+		if (bodyOid != 0 && dashboardZoneServer != nullptr) {
+			ManagedReference<SceneObject*> body =
+				dashboardZoneServer->getObject(bodyOid);
+			AiAgent* bodyAgent = body == nullptr ? nullptr : body->asAiAgent();
+			if (bodyAgent != nullptr) {
+				Locker agentLock(bodyAgent);
+				if (bodyAgent->getZone() != nullptr &&
+						bodyAgent->getWeapon() != nullptr)
+					heldWeaponXpType = bodyAgent->getWeapon()->getXpType();
+			}
+		}
 
 		JSONSerializationType row = JSONSerializationType::object();
 		row["identityId"] = identityId;
@@ -13502,12 +15338,17 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		row["skillsTrained"] = progression.skills.size();
 		row["derivedTier"] = identity == nullptr ? 0 : identity->skillTier;
 		row["nextSkill"] = String();
+		row["nextXpType"] = String();
 		row["nextXpNeeded"] = 0;
+		row["activity"] = String("hunt");
+		row["graduated"] = true;
+		row["stalledBoxes"] = JSONSerializationType::array();
 		if (nextStepSnapshot.contains(identityId)) {
 			const SimBotTrainingStep& nextStep =
 				nextStepSnapshot.get(identityId);
 			if (nextStep.valid) {
 				row["nextSkill"] = nextStep.skillName;
+				row["nextXpType"] = nextStep.xpType;
 				int lifetimeEarned = progression.experience.contains(
 					nextStep.xpType) ? progression.experience.get(nextStep.xpType) : 0;
 				row["nextXpNeeded"] = lifetimeEarned >=
@@ -13517,13 +15358,23 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 					nextStep.lifetimeEarnedThreshold;
 			}
 		}
+		if (earlyGameStateSnapshot.contains(identityId)) {
+			const SimBotEarlyGameState& earlyState =
+				earlyGameStateSnapshot.get(identityId);
+			row["activity"] = earlyState.activity;
+			row["graduated"] = earlyState.graduated;
+			JSONSerializationType stalled = JSONSerializationType::array();
+			for (int j = 0; j < earlyState.stalledBoxes.size(); ++j)
+				stalled.push_back(earlyState.stalledBoxes.get(j));
+			row["stalledBoxes"] = stalled;
+		}
 		row["awardsTotal"] = progression.awardsTotal;
 		row["lastAwardAgeSeconds"] = progression.lastAwardMs == 0 ? 0 :
 			static_cast<uint64>((nowMs > progression.lastAwardMs ?
 				nowMs - progression.lastAwardMs : 0) / 1000);
 		row["lastAwardSource"] = progression.lastAwardSource;
-		row["bodyOid"] = bodyOids.contains(identityId) ?
-			bodyOids.get(identityId) : 0;
+		row["bodyOid"] = bodyOid;
+		row["weaponXpType"] = heldWeaponXpType;
 
 		JSONSerializationType experience = JSONSerializationType::object();
 		for (int j = 0; j < progression.experience.size(); ++j)
@@ -13632,6 +15483,9 @@ void SimPlayerManager::loadPveIdentityRoster() {
 
 		{
 			Locker pveLock(&pveMutex);
+			// Roster loading is a lifecycle boundary. Death locations belong to
+			// the body generation that set them and must not survive a reload.
+			pveDeathSpawnOverrides.removeAll();
 			for (int i = 0; i < loaded.size(); ++i) {
 				SimBotIdentity identity = loaded.get(i);
 				// Assignment state is intentionally not resumed across a process
@@ -13642,13 +15496,16 @@ void SimPlayerManager::loadPveIdentityRoster() {
 						identity.assignmentStamp != 0) {
 					identity.assignmentSpecies = "";
 					identity.assignmentResource = "";
-					identity.assignmentStamp = 0;
-					pveDirtyIdentityIds.put(identity.id, true);
-				}
-				pveIdentities.put(identity.id, identity);
+			identity.assignmentStamp = 0;
+			pveDirtyIdentityIds.put(identity.id, true);
+			}
+			pveIdentities.put(identity.id, identity);
 			}
 		}
 
+		// A roster reload is an allowlist lifecycle boundary. Bodies will
+		// re-register through the normal spawn path; stale OIDs must not survive.
+		SimCombatDiagLog::clearTraced();
 		pveDatabaseAvailable = true;
 		pveRosterLoaded = true;
 		info("SimPveRosterLoaded identities=" +
@@ -13847,11 +15704,73 @@ bool SimPlayerManager::isGovernorManagedIdentity(
 	// and the population count at once - stranding them while replacements spawn
 	// past pveMaxHunters. Ownership is a property of the identity being a
 	// production bot at all; eligibility only decides desired-set membership.
-	return identity.profession != "harness";
+	//
+	// Harness-minted identities are exempt too, whatever profession a scenario
+	// gave them: unarmed_novice_kills_nuna mints a brawler, which the governor
+	// drained at the next maintenance tick whenever a roster identity already
+	// held that novice slot (verification 20260913). A scenario that tests the
+	// governor itself opts back in with mintIdentity{governed=true}.
+	return identity.profession != "harness" &&
+		!isPlayerBotParityHarnessExempt(identity.id);
+}
+
+bool SimPlayerManager::isPlayerBotParityHarnessExempt(uint64 identityId) const {
+	Locker harnessLock(&playerBotParityHarnessMutex);
+	return playerBotParityHarnessMintedIds.contains(identityId) &&
+		!playerBotParityHarnessMintedIds.get(identityId);
+}
+
+void SimPlayerManager::recordPlayerBotParityKillAward(uint64 identityId,
+		uint64 victimOid, const String& xpType, int awarded) {
+	Locker harnessLock(&playerBotParityHarnessMutex);
+	if (!playerBotParityHarnessMintedIds.contains(identityId))
+		return;
+	StringBuffer key;
+	key << identityId << "|" << victimOid << "|" << xpType;
+	String keyString = key.toString();
+	int64 previous = playerBotParityKillAwardLedger.contains(keyString) ?
+		playerBotParityKillAwardLedger.get(keyString) : 0;
+	playerBotParityKillAwardLedger.put(keyString, previous + awarded);
+	playerBotParityKillAwardLastMs.put(identityId, System::getMiliTime());
+}
+
+uint64 SimPlayerManager::getPlayerBotParityKillAwardLastMs(uint64 identityId) {
+	Locker harnessLock(&playerBotParityHarnessMutex);
+	return playerBotParityKillAwardLastMs.contains(identityId) ?
+		playerBotParityKillAwardLastMs.get(identityId) : 0;
+}
+
+void SimPlayerManager::readPlayerBotParityKillAwards(uint64 identityId,
+		uint64 targetOid, const String& xpType, int64& targetAwarded,
+		bool& targetFound, int64& otherAwarded) {
+	targetAwarded = 0;
+	targetFound = false;
+	otherAwarded = 0;
+	StringBuffer prefix;
+	prefix << identityId << "|";
+	StringBuffer suffix;
+	suffix << "|" << xpType;
+	StringBuffer target;
+	target << identityId << "|" << targetOid << "|" << xpType;
+	String prefixString = prefix.toString();
+	String suffixString = suffix.toString();
+	String targetString = target.toString();
+	Locker harnessLock(&playerBotParityHarnessMutex);
+	for (int i = 0; i < playerBotParityKillAwardLedger.size(); ++i) {
+		const String& key = playerBotParityKillAwardLedger.elementAt(i).getKey();
+		int64 value = playerBotParityKillAwardLedger.elementAt(i).getValue();
+		if (key == targetString) {
+			targetAwarded += value;
+			targetFound = true;
+		} else if (key.beginsWith(prefixString) && key.endsWith(suffixString)) {
+			otherAwarded += value;
+		}
+	}
 }
 
 bool SimPlayerManager::isPveHuntEligible(const SimBotIdentity& identity) const {
-	if (identity.profession == "harness")
+	if (identity.profession == "harness" ||
+			isPlayerBotParityHarnessExempt(identity.id))
 		return false;
 	Locker pveLock(&pveMutex);
 	return pveHuntingProfessions.contains(identity.profession);
@@ -13933,9 +15852,11 @@ bool SimPlayerManager::drainPveIdentityBody(uint64 identityId, uint64 nowMs) {
 		pveIdentityBodyOids.drop(identityId);
 		pveBodyIdentityIds.drop(bodyOid);
 		pveRespawnDueAtMs.drop(identityId);
+		pveDeathSpawnOverrides.drop(identityId);
 		pveTerminalVisitEpoch.drop(identityId);
 		clearPveHunterOrderLocked(identityId, "BODY_DRAINED");
 	}
+	SimCombatDiagLog::removeTraced(bodyOid);
 	controllers.drop(bodyOid);
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
 	ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
@@ -13969,11 +15890,14 @@ void SimPlayerManager::retirePveIdentity(uint64 identityId) {
 			pveBodyIdentityIds.drop(bodyOid);
 		}
 		pveRespawnDueAtMs.drop(identityId);
+		pveDeathSpawnOverrides.drop(identityId);
 		pveTerminalVisitEpoch.drop(identityId);
 		clearPveHunterOrderLocked(identityId, "RETIRED");
 	}
 	if (resumed)
 		retirementsResumed.increment();
+	if (bodyOid != 0)
+		SimCombatDiagLog::removeTraced(bodyOid);
 	if (bodyOid != 0) {
 		controllers.drop(bodyOid);
 		ZoneServer* zoneServer = ServerCore::getZoneServer();
@@ -13996,6 +15920,7 @@ void SimPlayerManager::retirePveIdentity(uint64 identityId) {
 		progressionDirtyIds.drop(identityId);
 		progressionTrainingNextSteps.drop(identityId);
 		progressionTrainingPendingIds.drop(identityId);
+		progressionEarlyGameStates.drop(identityId);
 	}
 	try {
 		String id = String::valueOf(identityId);
@@ -14085,11 +16010,126 @@ void SimPlayerManager::flushPveIdentityRoster(bool force) {
 		info("SimPveRosterFlushed identities=" + String::valueOf(dirty.size()), true);
 }
 
+bool SimPlayerManager::resolvePveDeathSite(uint64 bodyOid, String& planet,
+		Vector3& position) {
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(bodyOid);
+	AiAgent* corpse = object == nullptr ? nullptr : object->asAiAgent();
+	if (corpse == nullptr)
+		return false;
+
+	Locker corpseLock(corpse);
+	Zone* zone = corpse->getZone();
+	if (zone == nullptr)
+		return false;
+	planet = zone->getZoneName();
+	position = corpse->getWorldPosition();
+	return true;
+}
+
+bool SimPlayerManager::resolvePveDeathSpawnOverride(uint64 bodyOid,
+		SimBotSpawnOverride& result) {
+	result = SimBotSpawnOverride();
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(bodyOid);
+	AiAgent* corpse = object == nullptr ? nullptr : object->asAiAgent();
+	if (corpse == nullptr)
+		return false;
+
+	Zone* zone = nullptr;
+	Vector3 corpsePosition;
+	{
+		Locker corpseLock(corpse);
+		zone = corpse->getZone();
+		corpsePosition = corpse->getWorldPosition();
+	}
+	if (zone == nullptr)
+		return false;
+
+	SortedVector<ManagedReference<SceneObject*> > locations =
+		zone->getPlanetaryObjectList("cloningfacility");
+	bool bestFacilityFound = false;
+	Vector3 bestPoint;
+	float bestDistanceSq = 0.f;
+
+	auto validOutdoorPoint = [this, zone](const Vector3& point) {
+		return !(point.getX() == 0.f && point.getY() == 0.f) &&
+			zone->isWithinBoundaries(point) &&
+			!isOverlandPointInWater(zone, point.getX(), point.getY(),
+				travelWaterMarginMeters);
+	};
+
+	for (int i = 0; i < locations.size(); ++i) {
+		ManagedReference<SceneObject*> location = locations.get(i);
+		BuildingObject* facility = location == nullptr ? nullptr :
+			location->asBuildingObject();
+		if (facility == nullptr)
+			continue;
+
+		Vector3 point;
+		Vector3 facilityPosition;
+		{
+			Locker facilityLock(facility);
+			point = facility->getEjectionPoint();
+			if (!validOutdoorPoint(point))
+				point = facility->getNearestExteriorPortalPoint(corpsePosition);
+			facilityPosition = facility->getWorldPosition();
+		}
+		if (!validOutdoorPoint(point))
+			continue;
+
+		float distanceSq = facilityPosition.squaredDistanceTo(corpsePosition);
+		if (!bestFacilityFound || distanceSq < bestDistanceSq) {
+			bestFacilityFound = true;
+			bestPoint = point;
+			bestDistanceSq = distanceSq;
+		}
+	}
+
+	if (!bestFacilityFound)
+		return false;
+	result.planet = zone->getZoneName();
+	result.position = bestPoint;
+	return true;
+}
+
 AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 		const Vector3* spawnOverride) {
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	// Planned novices may be pointed at a known-good city
+	// (pveConfig.novice.spawnPlanet/spawnCity); everyone else resolves
+	// to their own home. Resolved before any pveMutex scope below.
+	// An explicit spawnOverride (the parity harness) brings its own coordinates
+	// for the identity's own planet, so the novice city must never replace that
+	// planet underneath it.
+	String homePlanet = identity.homePlanet;
+	String homeCity = identity.homeCity;
+	if (spawnOverride == nullptr)
+		resolvePlayerBotHomeCity(identity, homePlanet, homeCity);
+	SimBotSpawnOverride deathSpawnOverride;
+	bool usingDeathSpawnOverride = false;
+	if (spawnOverride == nullptr) {
+		Locker pveLock(&pveMutex);
+		if (pveDeathSpawnOverrides.contains(identity.id)) {
+			deathSpawnOverride = pveDeathSpawnOverrides.get(identity.id);
+			pveDeathSpawnOverrides.drop(identity.id);
+			usingDeathSpawnOverride = true;
+		}
+	}
+	String spawnPlanet = usingDeathSpawnOverride ?
+		deathSpawnOverride.planet : homePlanet;
 	Zone* zone = zoneServer == nullptr ? nullptr :
-		zoneServer->getZone(identity.homePlanet);
+		zoneServer->getZone(spawnPlanet);
+	if (zone == nullptr && usingDeathSpawnOverride) {
+		// A stale override must never strand a roster identity. It was already
+		// consumed above, so fall back to today's home-city spawn.
+		usingDeathSpawnOverride = false;
+		spawnPlanet = homePlanet;
+		zone = zoneServer == nullptr ? nullptr :
+			zoneServer->getZone(spawnPlanet);
+	}
 	if (zone == nullptr)
 		return nullptr;
 
@@ -14099,11 +16139,14 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 	// or an invalid read.
 	String templateName;
 	String weaponTemplate;
+	String expectedWeaponXpType;
 	String noviceBodyTemplate;
+	int noviceBodyHam = 0;
 	SimBotTrainingPlan trainingPlan;
 	{
 		Locker pveLock(&pveMutex);
 		noviceBodyTemplate = pveNoviceBodyTemplate;
+		noviceBodyHam = pveNoviceBodyHam;
 		if (identity.trainingPlan.isEmpty()) {
 			if (pveHunterTemplates.size() == 0)
 				return nullptr;
@@ -14124,17 +16167,30 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 				trainingPlan.loadError != "over_budget") || templateName.isEmpty())
 			return nullptr;
 	}
+	if (!identity.trainingPlan.isEmpty() && identity.profession != "harness" &&
+			playerBotEarlyGameGateEnabled()) {
+		// Once early-game loadout is enabled, static per-plan weapon fields are
+		// intentionally ignored. An unmapped next XP type leaves the loaded
+		// stock weapon untouched.
+		weaponTemplate = "";
+		selectPlayerBotEarlyGameWeapon(identity,
+			weaponTemplate, expectedWeaponXpType);
+	}
+	bool restoreRealWeaponDamage = !identity.trainingPlan.isEmpty() &&
+		identity.profession != "harness" &&
+		playerBotRealWeaponDamageGateEnabled();
 
 	ShuttleportLocation home;
-	bool homeFound = spawnOverride != nullptr;
+	bool homeFound = spawnOverride != nullptr || usingDeathSpawnOverride;
 	if (homeFound) {
-		home.planet = identity.homePlanet;
-		home.spawn = *spawnOverride;
+		home.planet = spawnPlanet;
+		home.spawn = spawnOverride != nullptr ? *spawnOverride :
+			deathSpawnOverride.position;
 	} else {
 		for (int i = 0; i < allShuttleports.size(); ++i) {
 			const ShuttleportLocation& location = allShuttleports.get(i);
-			if (location.planet == identity.homePlanet &&
-					location.name == identity.homeCity) {
+			if (location.planet == homePlanet &&
+					location.name == homeCity) {
 				home = location;
 				homeFound = true;
 				break;
@@ -14143,6 +16199,31 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 	}
 	if (!homeFound)
 		return nullptr;
+	if (usingDeathSpawnOverride &&
+			(!zone->isWithinBoundaries(home.spawn) ||
+			isOverlandPointInWater(zone, home.spawn.getX(), home.spawn.getY(),
+				travelWaterMarginMeters))) {
+		// The world can change between death and respawn. A consumed but stale
+		// override falls back to the normal home-city location.
+		usingDeathSpawnOverride = false;
+		homeFound = false;
+		for (int i = 0; i < allShuttleports.size(); ++i) {
+			const ShuttleportLocation& location = allShuttleports.get(i);
+			if (location.planet == homePlanet &&
+					location.name == homeCity) {
+				home = location;
+				homeFound = true;
+				break;
+			}
+		}
+		if (!homeFound)
+			return nullptr;
+		spawnPlanet = homePlanet;
+		zone = zoneServer == nullptr ? nullptr :
+			zoneServer->getZone(spawnPlanet);
+		if (zone == nullptr)
+			return nullptr;
+	}
 
 	CreatureManager* creatureManager = zone->getCreatureManager();
 	if (creatureManager == nullptr)
@@ -14168,20 +16249,27 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 	if (agent == nullptr)
 		return nullptr;
 
-	ManagedReference<SceneObject*> weaponObject;
-	ManagedReference<WeaponObject*> weapon;
-	if (!weaponTemplate.isEmpty()) {
-		weaponObject = ObjectManager::instance()->createObject(
-			weaponTemplate.hashCode(), 0, "");
-		weapon = weaponObject == nullptr ? nullptr :
-			weaponObject.castTo<WeaponObject*>();
-		if (weapon == nullptr) {
-			Locker agentLock(agent);
-			agent->destroyObjectFromWorld(true);
-			agent->destroyObjectFromDatabase(true);
-			return nullptr;
-		}
+	// Clone wounds are a flat hunter tax sized for multi-thousand-HAM bodies. A
+	// planned novice body has ~400-500 per pool, so 500 wounds pinned every pool
+	// at 1 HP for the body's whole life (diagnosis 20260914-184412: four bodies
+	// at 1/1/1 HAM, each killed by its first hit). Novices cap them at a
+	// fraction of each pool; a negative fraction means "not a novice body".
+	float noviceCloneWoundMaxFraction = -1.f;
+	if (!identity.trainingPlan.isEmpty() && identity.profession != "harness" &&
+			playerBotEarlyGameGateEnabled()) {
+		SimBotEarlyGameConfig earlyGameConfig;
+		getPlayerBotEarlyGameConfig(earlyGameConfig);
+		noviceCloneWoundMaxFraction = earlyGameConfig.cloneWoundMaxFraction;
 	}
+	// The player-like HAM override is production policy only. Parity-harness
+	// bodies keep the template so combat parity results stay comparable:
+	// explicit harness spawn coordinates, the harness profession, or a
+	// harness-minted identity (including brawlers with a training plan).
+	// Snapshotted before the agent lock; the exemption check takes only its own
+	// leaf mutex.
+	bool parityHarnessBody = spawnOverride != nullptr ||
+		identity.profession == "harness" ||
+		isPlayerBotParityHarnessExempt(identity.id);
 
 	// Copy all progression state before entering the agent lock. The overlay
 	// application itself is deliberately lock-local and takes no manager lock.
@@ -14196,64 +16284,37 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 		// level, bitmasks, combat stats, weapons) before any overrides
 		// (CreatureManagerImplementation.cpp:424). Same contract here.
 		agent->loadTemplateData(creoTempl);
+		// A starting player has a few hundred points in every pool, secondaries
+		// included; the mobile template gives the novice 400-500 primaries and
+		// secondaries at 1/100 of that. Set all nine pools before skill mods and
+		// wounds apply. Harness bodies keep the template so parity is unchanged.
+		if (noviceBodyHam > 0 && !identity.trainingPlan.isEmpty() &&
+				!parityHarnessBody) {
+			for (int pool = 0; pool < 9; ++pool) {
+				agent->setBaseHAM(pool, noviceBodyHam);
+				agent->setMaxHAM(pool, noviceBodyHam);
+				agent->setHAM(pool, noviceBodyHam);
+			}
+		}
 		applyProgressionToBody(agent, bodyProgression);
 		// A hunter is intentionally neutral: factioned AI agents refuse to
 		// attack faction-0 wildlife in isAttackableBy().
 		agent->setFaction(0);
-		// createCreature already filled the default_weapon slot (an unarmed
-		// creature weapon), so a raw transfer to slot 4 fails. Remove the
-		// stock weapon first, then equip our rifle and align every AI weapon
-		// slot. Combat leaf actions read currentWeapon, while ranged attack-map
-		// filtering reads primaryWeapon.
-		ManagedReference<WeaponObject*> stockWeapon = agent->getDefaultWeapon();
-		if (weapon == nullptr) {
-			// An unarmed novice uses the stock default weapon created by
-			// loadTemplateData. Never create a replacement object for this path.
-			if (stockWeapon != nullptr) {
-				agent->setPrimaryWeapon(stockWeapon);
-				agent->setDefaultWeapon(stockWeapon);
-				agent->setCurrentWeapon(nullptr);
-				agent->setWeapon(stockWeapon, false);
-				agent->setWeaponStats();
-				agent->setupAttackMaps();
-				agent->equipPrimaryWeapon();
-				equipped = agent->getPrimaryWeapon() == stockWeapon &&
-					agent->getDefaultWeapon() == stockWeapon &&
-					agent->getCurrentWeapon() == stockWeapon &&
-					agent->getWeapon() == stockWeapon;
-			}
-		} else {
-			Locker weaponLock(weaponObject, agent);
-			if (stockWeapon != nullptr && stockWeapon != weapon) {
-				Locker stockLock(stockWeapon, agent);
-				stockWeapon->destroyObjectFromWorld(true);
-				stockWeapon->destroyObjectFromDatabase(true);
-			}
-			if (agent->transferObject(weaponObject, 4)) {
-			agent->setPrimaryWeapon(weapon);
-			agent->setDefaultWeapon(weapon);
-			// Clear the destroyed template weapon before asking the AI to
-			// equip its replacement; equipPrimaryWeapon() then performs the
-			// normal current-weapon transition against the new default slot.
-			agent->setCurrentWeapon(nullptr);
-			agent->setWeapon(weapon, false);
-			// Rebuild the derived combat data after replacing the template's
-			// unarmed primary. The defaultattack command is weapon-driven, and
-			// the recreated attack maps retain any ranged actions supplied by
-			// the mobile template.
-			agent->setWeaponStats();
-			agent->setupAttackMaps();
-			agent->equipPrimaryWeapon();
-			equipped = agent->getPrimaryWeapon() == weapon &&
-				agent->getDefaultWeapon() == weapon &&
-				agent->getCurrentWeapon() == weapon &&
-				agent->getWeapon() == weapon && weapon->isRangedWeapon();
-			}
-		}
+		// The same loadout helper is used at initial spawn and on ladder
+		// advance. It aligns every AI weapon pointer and validates containment
+		// plus XP type, instead of assuming every armed body is ranged.
+		equipped = equipPlayerBotWeaponLocked(agent,
+			weaponTemplate, expectedWeaponXpType, restoreRealWeaponDamage);
 		if (identity.deaths > 0 && pveCloneWoundAmount > 0) {
 			for (uint8 pool = CreatureAttribute::HEALTH;
-					pool <= CreatureAttribute::WILLPOWER; ++pool)
-				agent->addWounds(pool, pveCloneWoundAmount, true, false);
+					pool <= CreatureAttribute::WILLPOWER; ++pool) {
+				int wounds = pveCloneWoundAmount;
+				if (noviceCloneWoundMaxFraction >= 0.f)
+					wounds = Math::min(wounds, static_cast<int>(
+						agent->getMaxHAM(pool) * noviceCloneWoundMaxFraction));
+				if (wounds > 0)
+					agent->addWounds(pool, wounds, true, false);
+			}
 		}
 		agent->setCustomObjectName(fullName, true);
 		agent->setCreatureBitmask(0);
@@ -14308,11 +16369,15 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 		Locker agentLock(agent);
 		// Both identity kinds use the same production body path. Harness bodies
 		// only override IDLE; hunter bodies retain their existing combat map.
+		// Register before setAITemplate(), which arms the first behaviour event.
+		SimCombatDiagLog::addTraced(bodyOid);
 		agent->setCustomAiMap((identity.profession == "harness" ?
 			String("simParityTest") : String("simHunter")).hashCode());
 		agent->setAITemplate();
 		agent->clearPatrolPoints();
 	}
+	if (usingDeathSpawnOverride)
+		recordPlayerBotEarlyGameRespawn(identity.id);
 
 	return agent;
 }
@@ -14352,6 +16417,7 @@ void SimPlayerManager::drainSimPresenceBodies(uint64 nowMs) {
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
 	for (int i = 0; i < presenceOids.size(); ++i) {
 		uint64 oid = presenceOids.get(i);
+		SimCombatDiagLog::removeTraced(oid);
 		controllers.drop(oid);
 
 		ManagedReference<SceneObject*> object = zoneServer == nullptr ?
@@ -14395,6 +16461,7 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 			pveIdentityBodyOids.removeAll();
 			pveBodyIdentityIds.removeAll();
 			pveRespawnDueAtMs.removeAll();
+			pveDeathSpawnOverrides.removeAll();
 			Vector<uint64> assignedIdentityIds;
 			for (int i = 0; i < pveHuntOrders.size(); ++i)
 				assignedIdentityIds.add(pveHuntOrders.elementAt(i).getKey());
@@ -14412,6 +16479,7 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 
 			for (int i = 0; i < orphanBodyOids.size(); ++i) {
 				uint64 oid = orphanBodyOids.get(i);
+				SimCombatDiagLog::removeTraced(oid);
 				controllers.drop(oid);
 
 				ManagedReference<SceneObject*> obj = zoneServer == nullptr ?
@@ -14444,6 +16512,8 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 	Vector<uint64> missingIdentities;
 	Vector<uint64> removedBodyOids;
 	Vector<ManagedReference<AiAgent*> > corpses;
+	Vector<uint64> deadIdentityIds;
+	Vector<uint64> deadBodyOids;
 	for (int i = 0; i < bodySnapshot.size(); ++i) {
 		uint64 identityId = bodySnapshot.elementAt(i).getKey();
 		uint64 bodyOid = bodySnapshot.elementAt(i).getValue();
@@ -14463,8 +16533,22 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 		if (dead) {
 			missingIdentities.add(identityId);
 			corpses.add(agent);
+			deadIdentityIds.add(identityId);
+			deadBodyOids.add(bodyOid);
 		}
 	}
+
+	// Death finalization has ONE owner. Whichever observer notices first - the
+	// controller tick or this maintenance sweep - routes through
+	// onPveHunterDied, which is idempotent via pveDeathsReportedBodyOids. When
+	// the sweep won the race it previously removed the mapping and destroyed
+	// the corpse directly, so an early-game bot silently lost its cloner spawn
+	// override (and its death telemetry) and respawned at home instead. This
+	// must run BEFORE the removal loop below, while the body still exists for
+	// the override to be resolved from, and outside pveMutex because
+	// onPveHunterDied takes it.
+	for (int i = 0; i < deadIdentityIds.size(); ++i)
+		onPveHunterDied(deadIdentityIds.get(i), deadBodyOids.get(i));
 
 	for (int i = 0; i < missingIdentities.size(); ++i) {
 		uint64 identityId = missingIdentities.get(i);
@@ -14504,8 +16588,10 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 	// Retire the controller before the corpse is destroyed. Its destructor
 	// drops the target observer and combat relationship, while the manager
 	// lock above is already released and the order has been requeued.
-	for (int i = 0; i < removedBodyOids.size(); ++i)
+	for (int i = 0; i < removedBodyOids.size(); ++i) {
+		SimCombatDiagLog::removeTraced(removedBodyOids.get(i));
 		controllers.drop(removedBodyOids.get(i));
+	}
 
 	for (int i = 0; i < corpses.size(); ++i) {
 		AiAgent* corpse = corpses.get(i);
@@ -14711,6 +16797,7 @@ void SimPlayerManager::governPvePopulation(uint64 nowMs) {
 		} else {
 			// A concurrent maintenance pass won the identity slot. Do not leave
 			// an unowned presence body behind.
+			SimCombatDiagLog::removeTraced(bodyOid);
 			controllers.drop(bodyOid);
 			Locker agentLock(body);
 			body->destroyObjectFromWorld(true);
@@ -17191,6 +19278,10 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 	Vector<SimBotIdentity> eligibleIdentities;
 	Vector<uint64> eligibleBodyOids;
 	for (int i = 0; i < identities.size(); ++i) {
+		SimBotActivityDecision activity;
+		scorePlayerBotActivity(identities.get(i), activity);
+		if (activity.activity == "grind")
+			continue;
 		if (!isPveHuntEligible(identities.get(i)))
 			continue;
 		eligibleIdentities.add(identities.get(i));
@@ -17922,6 +20013,26 @@ void SimPlayerManager::clearPveHunterOrderLocked(uint64 identityId,
 	}
 }
 
+void SimPlayerManager::declinePveHunterOrder(uint64 identityId,
+		uint64 bodyOid, const String& reason) {
+	Locker pveLock(&pveMutex);
+	if (!pveHuntOrders.contains(identityId))
+		return;
+	const PveHuntOrder& order = pveHuntOrders.get(identityId);
+	if (bodyOid != 0 && order.bodyOid != bodyOid)
+		return;
+	uint64 orderBodyOid = order.bodyOid;
+	clearPveHunterOrderLocked(identityId, reason);
+	// Declining an order must release the resources that order acquired, not
+	// just the assignment. A hunter preempted mid-hunt has a spawned mission
+	// lair still registered; without this it holds active-lair capacity until
+	// the janitor timeout. Cleanup is queued (not run inline) so it stays off
+	// this lock, and it is a no-op for a decline that happened before any lair
+	// was spawned, which is the dispatch-time case.
+	if (orderBodyOid != 0)
+		queuePveHuntLairCleanup(orderBodyOid, reason);
+}
+
 void SimPlayerManager::recordPveHunterPhase(uint64 identityId,
 		uint64 bodyOid, const String& phase, uint64 targetOid) {
 	Locker pveLock(&pveMutex);
@@ -18377,18 +20488,78 @@ void SimPlayerManager::handlePveHunterDestructionHandoff(uint64 hunterOid,
 }
 
 void SimPlayerManager::onPveHunterDied(uint64 identityId, uint64 bodyOid) {
+	SimBotIdentity identitySnapshot;
+	SimBotActivityDecision activity;
+	bool earlyGameIdentity = false;
+	if (snapshotPlayerBotIdentity(identityId, identitySnapshot)) {
+		scorePlayerBotActivity(identitySnapshot, activity);
+		earlyGameIdentity = activity.activity == "grind";
+	}
+	// Resolve the replacement location BEFORE claiming the death. Claiming
+	// first published a tombstone that made the maintenance sweep skip its own
+	// finalizer and go straight to removing the mapping and destroying the
+	// corpse; if this thread was descheduled in between, the corpse lookup then
+	// failed and the cloner override was silently lost, respawning the bot at
+	// home. Resolution reads the world and takes no manager mutex, so it is
+	// safe here, and the claim below stores it atomically under one lock.
+	SimBotSpawnOverride resolvedOverride;
+	bool haveResolvedOverride = earlyGameIdentity &&
+		resolvePveDeathSpawnOverride(bodyOid, resolvedOverride);
+	// The death site (route avoidance) is read here for the same reason: a
+	// sweep-first death destroys the corpse right after this call.
+	String deathPlanet;
+	Vector3 deathPosition;
+	bool haveDeathSite = earlyGameIdentity &&
+		resolvePveDeathSite(bodyOid, deathPlanet, deathPosition);
+
+	bool countDeath = false;
 	{
 		Locker pveLock(&pveMutex);
 		if (pveDeathsReportedBodyOids.contains(bodyOid))
 			return;
+		// The maintenance sweep DROPS the tombstone when it tears a body down,
+		// and an already-running controller task keeps a strong reference to
+		// this controller, so a late tick can reach here for a body whose death
+		// was already finalized. The tombstone alone is therefore not enough.
+		// If the identity no longer maps to this body the death is done: return
+		// BEFORE counting it again and, critically, before dropping the spawn
+		// override that the first finalization just recorded.
+		if (!pveIdentityBodyOids.contains(identityId) ||
+				pveIdentityBodyOids.get(identityId) != bodyOid)
+			return;
 		pveDeathsReportedBodyOids.put(bodyOid, true);
+		pveDeathSpawnOverrides.drop(identityId);
 		pveHunterDeathsTotal++;
 		if (pveIdentities.contains(identityId)) {
 			SimBotIdentity& identity = pveIdentities.get(identityId);
 			identity.deaths++;
 			pveDirtyIdentityIds.put(identityId, true);
+			earlyGameIdentity = earlyGameIdentity &&
+				identity.profession != "harness" &&
+				!identity.trainingPlan.isEmpty();
+			countDeath = true;
+			// Stored in the SAME critical section that claims the death, so a
+			// concurrent teardown can never overtake resolution.
+			if (earlyGameIdentity && haveResolvedOverride &&
+					!pveRetiringIdentityIds.contains(identityId))
+				pveDeathSpawnOverrides.put(identityId, resolvedOverride);
 		}
 		clearPveHunterOrderLocked(identityId, "DEATH_REQUEUED");
+	}
+
+	if (countDeath) {
+		// Only the claim that counts the death collects the killing-blow capture,
+		// so a concurrent duplicate call can never take it and discard it.
+		// Collected for every hunter so no capture outlives its body.
+		SimEarlyGameDeathCause deathCause;
+		bool haveDeathCause = SimEarlyGameDeathLog::take(bodyOid, deathCause);
+		if (earlyGameIdentity && haveDeathSite)
+			recordPlayerBotEarlyGameDeathSite(identityId, bodyOid, deathPlanet,
+				deathPosition, haveDeathCause ? &deathCause : nullptr);
+	}
+	if (countDeath && earlyGameIdentity) {
+		recordPlayerBotEarlyGameDeath(identityId);
+		setPlayerBotEarlyGamePhase(identityId, "LeaveCity", 0, 0.f, "", false);
 	}
 	queuePveHuntLairCleanup(bodyOid, "hunter_died");
 	info("SimPveHunterDied identity=" + String::valueOf(identityId) +
@@ -18493,6 +20664,49 @@ void SimPlayerManager::attachPveHunterController(
 		hunter->startSimLoop();
 }
 
+void SimPlayerManager::runCombatDiagHeartbeat(uint64 nowMs) {
+	if (!SimCombatDiagLog::isLoggingEnabled()) {
+		combatDiagLastHeartbeatMs = 0;
+		return;
+	}
+
+	int maintenanceSeconds = Math::max(1, pveMaintenanceIntervalSeconds);
+	int heartbeatSeconds = Math::max(combatDiagConfig.heartbeatSeconds,
+		maintenanceSeconds);
+	uint64 heartbeatIntervalMs = static_cast<uint64>(heartbeatSeconds) * 1000;
+	if (combatDiagLastHeartbeatMs != 0 &&
+			nowMs - combatDiagLastHeartbeatMs < heartbeatIntervalMs)
+		return;
+	combatDiagLastHeartbeatMs = nowMs;
+
+	// snapshotTraced() copies the allowlist and releases its mutex before this
+	// loop takes any agent lock.  Never move an agent lock inside that logger
+	// mutex's scope: the AI trace points use the inverse agent->diagnostic
+	// ordering.
+	Vector<uint64> tracedOids = SimCombatDiagLog::snapshotTraced();
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	for (int i = 0; i < tracedOids.size(); ++i) {
+		uint64 oid = tracedOids.get(i);
+		String snapshotLine;
+		bool present = false;
+		if (zoneServer != nullptr) {
+			ManagedReference<SceneObject*> object = zoneServer->getObject(oid);
+			AiAgent* agent = object == nullptr ? nullptr : object->asAiAgent();
+			if (agent != nullptr) {
+				Locker agentLock(agent);
+				snapshotLine = agent->getCombatDiagSnapshotLine();
+				present = true;
+			}
+		}
+
+		StringBuffer diag;
+		diag << "present=" << (present ? 1 : 0)
+			<< " " << snapshotLine;
+		SimCombatDiagLog::event("AGENT_HEARTBEAT", oid, diag.toString(),
+			"AGENT_HEARTBEAT");
+	}
+}
+
 void SimPlayerManager::runPveFoundationMaintenanceTask() {
 	// This is the sole call path for the Phase 1 roster SQL. Observer and
 	// dashboard paths only publish/read memory and never query MySQL.
@@ -18516,6 +20730,8 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 		completePveFoundationMaintenanceTask(entryMs);
 		return;
 	}
+
+	runCombatDiagHeartbeat(entryMs);
 
 	// Phase 2 queues all harness SQL here. Keeping the drain ahead of the
 	// ordinary maintenance work preserves one writer for every progression and
@@ -18624,6 +20840,7 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 		drainPlayerBotTrainingQueue();
 		runPlayerBotTrainingSweep();
 	}
+	refreshPlayerBotActivityStates();
 
 	uint64 nowMs = System::getMiliTime();
 	// Unconditional: graced presence entries must prune even when every
@@ -19362,6 +21579,88 @@ JSONSerializationType SimPlayerManager::getPveSpikeDashboard() {
 	return result;
 }
 
+JSONSerializationType SimPlayerManager::getCombatDiagDashboard() {
+	JSONSerializationType result = JSONSerializationType::object();
+	bool logging = SimCombatDiagLog::isLoggingEnabled();
+	Vector<uint64> tracedOids = SimCombatDiagLog::snapshotTraced();
+	result["logging"] = logging;
+	result["tracedCount"] = tracedOids.size();
+	result["writeErrors"] = SimCombatDiagLog::writeErrors();
+	result["lastWriteError"] = SimCombatDiagLog::lastWriteError();
+
+	JSONSerializationType agents = JSONSerializationType::array();
+	const int maxRows = 64;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	for (int i = 0; i < tracedOids.size() && i < maxRows; ++i) {
+		uint64 oid = tracedOids.get(i);
+		String snapshotLine;
+		bool present = false;
+		if (zoneServer != nullptr) {
+			ManagedReference<SceneObject*> object = zoneServer->getObject(oid);
+			AiAgent* agent = object == nullptr ? nullptr : object->asAiAgent();
+			if (agent != nullptr) {
+				Locker agentLock(agent);
+				snapshotLine = agent->getCombatDiagSnapshotLine();
+				present = true;
+			}
+		}
+
+		// The accessor returns one preformatted key=value line so the IDL
+		// addition stays a single method, but the dashboard must still publish
+		// the per-agent fields the plan specifies rather than an opaque blob.
+		// Split here: the line is machine-generated key=value, so this is a
+		// parse of our own format, not of foreign input.
+		JSONSerializationType row = JSONSerializationType::object();
+		row["oid"] = oid;
+		row["present"] = present;
+		row["diag"] = snapshotLine;
+
+		StringTokenizer fields(snapshotLine);
+		fields.setDelimeter(" ");
+		while (fields.hasMoreTokens()) {
+			String pair;
+			fields.getStringToken(pair);
+			int split = pair.indexOf('=');
+			if (split <= 0)
+				continue;
+			String key = pair.subString(0, split);
+			// Two-argument form on purpose: engine3's subString(begin) throws
+			// when begin == length, and the snapshot always carries empty values
+			// such as "aiTemplate=" for sim bots. That exception escaped to the
+			// REST worker and turned the whole dashboard into HTTP 502 whenever
+			// any agent was traced.
+			String value = pair.subString(split + 1, pair.length());
+			// Numeric fields publish as numbers so the dashboard can compare
+			// them; everything else stays a string.
+			// Signed and unsigned are parsed by different helpers: HAM pools go
+			// negative on a killing blow (only SECONDARY pools are clamped at
+			// zero, CreatureObjectImplementation.cpp:1099), while object ids
+			// need the unsigned range. Routing a negative through the unsigned
+			// helper throws and silently degrades the field to a string, which
+			// makes the dashboard schema type-unstable exactly on the rows that
+			// matter most.
+			if (!value.isEmpty() && value.charAt(0) == '-') {
+				try {
+					row[key.toCharArray()] = Long::valueOf(value);
+					continue;
+				} catch (...) {
+				}
+			} else if (!value.isEmpty() && Character::isDigit(value.charAt(0))) {
+				try {
+					row[key.toCharArray()] = UnsignedLong::valueOf(value);
+					continue;
+				} catch (...) {
+				}
+			}
+			row[key.toCharArray()] = value;
+		}
+		agents.push_back(row);
+	}
+	result["agents"] = agents;
+	result["agentsTruncated"] = tracedOids.size() > maxRows;
+	return result;
+}
+
 JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	Vector<SimBotIdentity> identities;
 	VectorMap<uint64, uint64> bodyOids;
@@ -19632,6 +21931,7 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	combat["weaponRangeMeters"] = pveHunterWeaponRangeMeters;
 	combat["cloneWoundAmount"] = pveCloneWoundAmount;
 	result["combat"] = combat;
+	result["combatDiag"] = getCombatDiagDashboard();
 	JSONSerializationType buffRows = JSONSerializationType::array();
 	for (int i = 0; i < hunterBuffs.size(); ++i) {
 		const PveBuffSpec& buff = hunterBuffs.get(i);
@@ -36633,14 +38933,24 @@ void SimPlayerManager::spawnStructureTraversalTestAttacker(uint64 botOid,
         return;
     }
 
-    attacker->setFaction(0);
-    attacker->setDespawnOnNoPlayerInRange(false);
-    attacker->setCreatureBitmask(0);
+    // Same engine3 cross-lock precondition as spawnPlayerBotParityKillTarget:
+    // startCombat must be called with the attacker already locked, and the
+    // fresh creature's setup belongs under that lock too. Failure cleanup below
+    // despawns and must run with no lock held.
+    bool combatStarted = false;
+    {
+        Locker attackerLock(attacker);
+        attacker->setFaction(0);
+        attacker->setDespawnOnNoPlayerInRange(false);
+        attacker->setCreatureBitmask(0);
 
-    // Real combat or nothing: a forced defender list would produce a pause
-    // without ever proving the combat-wins path, i.e. a scenario that passes
-    // while testing nothing.
-    if (!CombatManager::instance()->startCombat(attacker, bot.get())) {
+        // Real combat or nothing: a forced defender list would produce a pause
+        // without ever proving the combat-wins path, i.e. a scenario that
+        // passes while testing nothing.
+        combatStarted = CombatManager::instance()->startCombat(attacker,
+            bot.get());
+    }
+    if (!combatStarted) {
         StructureTraversalDiagLog::write(
             "SCENARIO_ATTACKER_STARTCOMBAT_FAILED botIndex=" +
             String::valueOf(botIndex) + " attacker=" +

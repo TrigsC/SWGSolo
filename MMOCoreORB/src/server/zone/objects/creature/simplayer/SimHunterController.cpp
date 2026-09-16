@@ -26,6 +26,7 @@
 #include "templates/params/creature/CreatureAttribute.h"
 
 #include <cmath>
+#include "server/zone/objects/tangible/spawning/SpawnEggObject.h"
 
 class SimHunterActiveTickTask : public Task {
 	WeakReference<SimHunterController*> controller;
@@ -121,6 +122,25 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 	terminalResolveWaitCycles = 0;
 	missionAddsOverCapCycles = 0;
 	missionAddsEngaged = 0;
+	earlyGameActive = false;
+	earlyGamePhase = EARLY_LEAVE_CITY;
+	earlyGameAnchor = Vector3();
+	earlyGameRestPoint = Vector3();
+	earlyGameBearingIndex = 0;
+	earlyGameAnchorAttempts = 0;
+	earlyGameRingWidened = false;
+	earlyGameScanAttempts = 0;
+	earlyGameScanBearingVisits = 0;
+	earlyGameScanRetryAtMs = 0;
+	earlyGamePathRetryAtMs = 0;
+	earlyGameTargetTtkSeconds = 0.f;
+	earlyGameTargetDefensive = false;
+	earlyGameRestStartedAtMs = 0;
+	earlyGamePathFailurePending.store(false, std::memory_order_relaxed);
+	earlyGameDestructionPending.store(false, std::memory_order_relaxed);
+	earlyGameDestroyedTargetOid.store(0, std::memory_order_relaxed);
+	earlyGameDestroyedParticipantVerified.store(false,
+		std::memory_order_relaxed);
 	pveNeedDoctorBuff = false;
 	pveNeedEntertainerBuff = false;
 	pveDoctorFallbackNeeded = false;
@@ -275,9 +295,67 @@ void SimHunterController::setPhase(HuntPhase next) {
 			agent == nullptr ? 0 : agent->getObjectID(), getPhaseName(), targetOid);
 }
 
+String SimHunterController::getEarlyGamePhaseName() const {
+	switch (earlyGamePhase) {
+	case EARLY_LEAVE_CITY: return "LeaveCity";
+	case EARLY_SELECT_TARGET: return "SelectTarget";
+	case EARLY_ENGAGE: return "Engage";
+	case EARLY_RECOVER: return "Recover";
+	case EARLY_TRAIN: return "Train";
+	default: return "Unknown";
+	}
+}
+
+String SimHunterController::getEarlyGameWeaponXpType() const {
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr)
+		return "";
+
+	String xpType;
+	Locker agentLock(strongAgent);
+	WeaponObject* weapon = strongAgent->getWeapon();
+	if (weapon != nullptr)
+		xpType = weapon->getXpType();
+	return xpType;
+}
+
+void SimHunterController::setEarlyGamePhase(EarlyGamePhase next) {
+	earlyGamePhase = next;
+	if (identityId != 0)
+		SimPlayerManager::instance()->setPlayerBotEarlyGamePhase(identityId,
+			getEarlyGamePhaseName(), targetOid, earlyGameTargetTtkSeconds,
+			getEarlyGameWeaponXpType(), earlyGameTargetDefensive);
+}
+
+void SimHunterController::publishEarlyGameMovement(const String& branch,
+		bool tickEvent, bool beginEvent, bool notIdentityExit,
+		bool moveRequested) {
+	// Default-off diagnostic (earlyGame.movementTelemetry): while it is off the
+	// gate read is the only cost.
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (identityId == 0 ||
+			!manager->isPlayerBotEarlyGameMovementTelemetryEnabled()) {
+		setHybridFailureProbeEnabled(false);
+		return;
+	}
+	setHybridFailureProbeEnabled(true);
+	ManagedReference<AiAgent*> strongAgent = agent;
+	Vector3 position = strongAgent == nullptr ? Vector3() :
+		strongAgent->getWorldPosition();
+	manager->recordPlayerBotEarlyGameMovement(identityId, branch, tickEvent,
+		beginEvent, notIdentityExit, moveRequested, getDiagnosticStateName(),
+		getWorkLoopGeneration(), getLastWorkLoopAdvanceReason(), position,
+		earlyGameAnchor, getHybridPathDiagLine());
+}
+
 void SimHunterController::startSimLoop() {
 	if (agent == nullptr)
 		return;
+
+	if (SimPlayerManager::instance()->isPlayerBotEarlyGameIdentity(identityId)) {
+		beginEarlyGame();
+		return;
+	}
 
 	if (!orderActive) {
 		setPhase(IDLE_HOME);
@@ -293,6 +371,25 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 		const PveHuntSpecies& newSpecies) {
 	if (newOrder.identityId != identityId || newOrder.bodyOid == 0)
 		return;
+
+	// The manager uses the same scorer while building matchmaker candidates.
+	// Recheck at dispatch as well: an order can race a training tick and a
+	// mid-grind novice must decline it rather than let demand take over.
+	SimBotIdentity identity;
+	SimBotActivityDecision activity;
+	if (SimPlayerManager::instance()->snapshotPlayerBotIdentity(identityId,
+			identity)) {
+		SimPlayerManager::instance()->scorePlayerBotActivity(identity, activity);
+		if (activity.activity == "grind") {
+			SimPlayerManager::instance()->declinePveHunterOrder(identityId,
+				newOrder.bodyOid, "EARLY_GAME_GRIND");
+			if (!earlyGameActive)
+				startSimLoop();
+			else
+				scheduleActiveTick(100);
+			return;
+		}
+	}
 
 	if (orderActive && order.issuedAtMs == newOrder.issuedAtMs)
 		return;
@@ -405,7 +502,8 @@ void SimHunterController::onTick() {
 }
 
 bool SimHunterController::shouldContinueArrivalChecks() const {
-	return orderActive || state == MOVING || state == CALCULATING_PATH;
+	return earlyGameActive || orderActive || state == MOVING ||
+		state == CALCULATING_PATH;
 }
 
 void SimHunterController::computeBuffNeeds(bool& needDoctor,
@@ -1655,6 +1753,10 @@ void SimHunterController::onArrived() {
 		return;
 
 	uint64 nowMs = System::getMiliTime();
+	if (earlyGameActive) {
+		handleEarlyGameArrived();
+		return;
+	}
 	if (phase == BUFF_UP) {
 		// F_0.7.5: arrival at the outdoor staging anchor. The provider approach
 		// is still active, so entering here hands the normal arrival path the
@@ -1792,8 +1894,7 @@ void SimHunterController::onArrived() {
 		CreatureObject* target = nullptr;
 		AiAgent* targetAgent = nullptr;
 		if (targetIsLive(targetOid, target, targetAgent)) {
-			if (agent->getDistanceTo(target) <=
-					SimPlayerManager::instance()->getPveHunterWeaponRangeMeters())
+			if (agent->getDistanceTo(target) <= getEngageRangeMeters())
 				engageTarget();
 			else
 				moveToTarget();
@@ -1848,6 +1949,12 @@ void SimHunterController::onPathFailed() {
 	// of the !orderActive guard so an abandoned order can still tear travel down.
 	if (handleInterplanetaryTravelPathFailed())
 		return;
+
+	if (earlyGameActive) {
+		earlyGamePathFailurePending.store(true, std::memory_order_release);
+		scheduleActiveTick(100);
+		return;
+	}
 
 	if (!orderActive)
 		return;
@@ -1965,6 +2072,1182 @@ void SimHunterController::beginHunting() {
 	scheduleActiveTick(100);
 }
 
+float SimHunterController::getEarlyGameArriveMeters(
+		const SimBotEarlyGameConfig& config) const {
+	return earlyGameAnchorArriveMeters > 0.f ? earlyGameAnchorArriveMeters :
+		config.anchorArriveMeters;
+}
+
+uint64 SimHunterController::findUnwinnableEarlyGameAttacker(AiAgent* hunter,
+		const SimBotEarlyGameConfig& config, uint64 excludeOid) {
+	// Every creature attacking the novice must be one it could beat (upper level
+	// band + TTK, in-combat rules), not only the one it is fighting. Returns the
+	// first that is not, or 0. Checked on entering a fight and on every Engage
+	// tick, because pack allies join asynchronously after the fight has started
+	// (AiAgent::notifyPackMobs). Caller holds no agent lock.
+	if (hunter == nullptr)
+		return 0;
+
+	Vector<ManagedReference<CreatureObject*> > otherAttackers;
+	ManagedReference<WeaponObject*> weapon;
+	float rawDamage = 0.f;
+	float attackPeriod = 0.f;
+	{
+		Locker agentLock(hunter);
+		const DeltaVector<ManagedReference<SceneObject*> >* defenderList =
+			hunter->getDefenderList();
+		if (defenderList != nullptr) {
+			for (int i = 0; i < defenderList->size(); ++i) {
+				ManagedReference<SceneObject*> defender = defenderList->getSafe(i);
+				CreatureObject* creature = defender == nullptr ? nullptr :
+					defender->asCreatureObject();
+				if (creature != nullptr && creature != hunter &&
+						creature->getObjectID() != excludeOid)
+					otherAttackers.add(creature);
+			}
+		}
+		// A one-on-one fight - the common case - costs only this snapshot.
+		if (otherAttackers.size() == 0)
+			return 0;
+		weapon = hunter->getWeapon();
+		if (weapon != nullptr) {
+			rawDamage = (weapon->getMinDamage() + weapon->getMaxDamage()) * 0.5f;
+			attackPeriod = weapon->getAttackSpeed();
+		}
+	}
+	SimBotIdentity identity;
+	if (weapon == nullptr || !SimPlayerManager::instance()->
+			snapshotPlayerBotIdentity(identityId, identity))
+		return 0;
+
+	float attackerReach = SimPlayerManager::instance()->
+		getPveHunterScanRadiusMeters() + 24.f;
+	for (int i = 0; i < otherAttackers.size(); ++i) {
+		CreatureObject* other = otherAttackers.get(i).get();
+		AiAgent* otherAgent = other->asAiAgent();
+		if (otherAgent == nullptr || otherAgent->getSimPlayerBot() ||
+				other->isDead() || other->isIncapacitated() ||
+				hunter->getDistanceTo(other) > attackerReach)
+			continue;
+		float otherTtk = 0.f;
+		if (!calculateEarlyGameTtk(other, config, identity.skillTier, weapon,
+				rawDamage, attackPeriod, otherTtk, true))
+			return other->getObjectID();
+	}
+	return 0;
+}
+
+bool SimHunterController::chooseEarlyGameSpawnerAnchor(
+		const SimBotEarlyGameConfig& config) {
+	// A novice grinds the static spawner points around its city before taking
+	// missions, as a new player does (owner rule, 2026-09-15). The city spawner
+	// screenplays place a SpawnEggObject at each point and respawn its creature
+	// table there, so the points are found by zone query: no location is
+	// hard-coded, and whatever a spawner is producing now is what the scan finds.
+	SimBotIdentity identity;
+	if (!SimPlayerManager::instance()->snapshotPlayerBotIdentity(identityId,
+			identity))
+		return false;
+	Vector3 cantina;
+	Vector3 medCenter;
+	Vector3 cityCenter;
+	String homePlanet;
+	String homeCity;
+	SimPlayerManager::instance()->resolvePlayerBotHomeCity(identity, homePlanet,
+		homeCity);
+	if (!SimPlayerManager::instance()->getPveHomeLocations(homePlanet, homeCity,
+			cantina, medCenter, cityCenter))
+		return false;
+
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr)
+		return false;
+	Zone* zone = nullptr;
+	{
+		Locker agentLock(strongAgent);
+		zone = strongAgent->getZone();
+	}
+	if (zone == nullptr || zone->getZoneName() != homePlanet)
+		return false;
+
+	SortedVector<TreeEntry*> nearby;
+	zone->getInRangeObjects(cityCenter.getX(), cityCenter.getZ(),
+		cityCenter.getY(), config.spawnerSearchRadiusMeters, &nearby, true, true);
+
+	// Ordered by object id, so the rotation is stable between scans.
+	Vector<uint64> spawnerIds;
+	Vector<Vector3> spawnerPoints;
+	for (int i = 0; i < nearby.size(); ++i) {
+		SceneObject* object = static_cast<SceneObject*>(nearby.get(i));
+		if (object == nullptr || !object->isSpawnEggObject())
+			continue;
+		SpawnEggObject* egg = dynamic_cast<SpawnEggObject*>(object);
+		if (egg == nullptr || (config.skipInactiveSpawners && !egg->isActive()))
+			continue;
+		uint64 oid = object->getObjectID();
+		int insertAt = spawnerIds.size();
+		while (insertAt > 0 && spawnerIds.get(insertAt - 1) > oid)
+			--insertAt;
+		spawnerIds.add(insertAt, oid);
+		spawnerPoints.add(insertAt, object->getWorldPosition());
+	}
+	if (spawnerIds.size() == 0)
+		return false;
+
+	Vector3 start = strongAgent->getWorldPosition();
+	for (int tried = 0; tried < spawnerIds.size(); ++tried) {
+		int index = earlyGameSpawnerIndex % spawnerIds.size();
+		if (index < 0)
+			index += spawnerIds.size();
+		earlyGameSpawnerIndex = index + 1;
+		Vector3 point = spawnerPoints.get(index);
+		point.setZ(0.f);
+		if (!zone->isWithinBoundaries(point) ||
+				SimPlayerManager::instance()->isStructureTraversalPointInWater(zone,
+					point))
+			continue;
+		// The spawner the bot is standing at has just been scanned; move on.
+		if (start.distanceTo2d(point) <= config.spawnerArriveMeters)
+			continue;
+		if (isEarlyGameLegNearDeathSite(start, point, homePlanet)) {
+			SimPlayerManager::instance()->recordPlayerBotEarlyGameDeathZoneReject(
+				identityId);
+			continue;
+		}
+		point.setZ(zone->getHeight(point.getX(), point.getY()));
+		earlyGameAnchor = point;
+		earlyGameAnchorArriveMeters = config.spawnerArriveMeters;
+		return true;
+	}
+	return false;
+}
+
+float SimHunterController::getEngageRangeMeters() const {
+	// Legacy and mission hunters carry rifles and keep the configured engage
+	// range. An early-game body fights with whatever its training plan equipped
+	// (unarmed reaches 5 m), so it must close to its own weapon's reach: at the
+	// 48 m rifle range an unarmed novice stood 27-38 m from its target in combat,
+	// never landed a hit and fled (quick check 20260915-012448).
+	float configured = SimPlayerManager::instance()->
+		getPveHunterWeaponRangeMeters();
+	if (!earlyGameActive || earlyGameEngageRangeMeters <= 0.f)
+		return configured;
+	return Math::min(configured, earlyGameEngageRangeMeters);
+}
+
+bool SimHunterController::isEarlyGameRecoveryWalkStalled(AiAgent* hunter,
+		uint64 stallMs) {
+	// A recovery walk normally outruns the "never re-flee while walking" rule,
+	// but an attacker can pin it in place (verification 20260914-205211: a giant
+	// worrt stopped the flee ~14 m short and killed the novice standing still).
+	// Progress is measured from the last point the walk moved on from, so a walk
+	// that keeps moving is never judged stalled however long it runs.
+	const float progressMeters = 4.f;
+	if (hunter == nullptr)
+		return false;
+	Vector3 position = hunter->getWorldPosition();
+	uint64 nowMs = System::getMiliTime();
+	if (earlyGameRecoverProgressMs == 0 ||
+			position.distanceTo2d(earlyGameRecoverProgressPos) >= progressMeters) {
+		earlyGameRecoverProgressPos = position;
+		earlyGameRecoverProgressMs = nowMs;
+		return false;
+	}
+	return nowMs - earlyGameRecoverProgressMs >= stallMs;
+}
+
+void SimHunterController::capEarlyGameWounds(AiAgent* hunter,
+		float maxFraction) {
+	// The same per-pool cap spawnPveIdentityBody applies to a novice body. It is
+	// also needed for a live body: one respawned while the early-game gate was
+	// off still carries the flat hunter clone wounds, and wounds picked up later
+	// can exceed the cap too. Either way HAM regeneration stops below the rest
+	// line and Recover would wait forever. Caller holds no agent lock.
+	if (hunter == nullptr)
+		return;
+	Locker agentLock(hunter);
+	for (uint8 pool = CreatureAttribute::HEALTH;
+			pool <= CreatureAttribute::WILLPOWER; ++pool) {
+		int cap = static_cast<int>(hunter->getMaxHAM(pool) * maxFraction);
+		if (hunter->getWounds(pool) > cap)
+			hunter->setWounds(pool, cap);
+	}
+}
+
+bool SimHunterController::isEarlyGameLegNearDeathSite(const Vector3& start,
+		const Vector3& anchor, const String& planet) {
+	Vector<SimBotEarlyGameDeathZone> zones;
+	float radius = 0.f;
+	SimPlayerManager::instance()->getPlayerBotEarlyGameDeathZones(identityId,
+		planet, zones, radius);
+	if (radius <= 0.f)
+		return false;
+
+	float legX = anchor.getX() - start.getX();
+	float legY = anchor.getY() - start.getY();
+	float legLengthSq = legX * legX + legY * legY;
+	float radiusSq = radius * radius;
+	for (int i = 0; i < zones.size(); ++i) {
+		const SimBotEarlyGameDeathZone& zone = zones.get(i);
+		float fromStartX = zone.x - start.getX();
+		float fromStartY = zone.y - start.getY();
+		// A site around the start (a death beside the cloner) cannot be walked
+		// around; judging it would reject every bearing and pin the bot in town.
+		if (fromStartX * fromStartX + fromStartY * fromStartY <= radiusSq)
+			continue;
+		float along = legLengthSq <= 0.f ? 0.f :
+			Math::max(0.f, Math::min(1.f,
+				(fromStartX * legX + fromStartY * legY) / legLengthSq));
+		float offX = legX * along - fromStartX;
+		float offY = legY * along - fromStartY;
+		if (offX * offX + offY * offY <= radiusSq)
+			return true;
+	}
+	return false;
+}
+
+bool SimHunterController::chooseEarlyGameAnchor(bool widenRing) {
+	SimBotIdentity identity;
+	if (!SimPlayerManager::instance()->snapshotPlayerBotIdentity(identityId,
+			identity))
+		return false;
+
+	SimBotEarlyGameConfig config;
+	SimPlayerManager::instance()->getPlayerBotEarlyGameConfig(config);
+	Vector3 cantina;
+	Vector3 medCenter;
+	Vector3 cityCenter;
+	String homePlanet;
+	String homeCity;
+	SimPlayerManager::instance()->resolvePlayerBotHomeCity(identity, homePlanet,
+		homeCity);
+	if (!SimPlayerManager::instance()->getPveHomeLocations(
+			homePlanet, homeCity, cantina, medCenter, cityCenter))
+		return false;
+
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr)
+		return false;
+	Zone* zone = nullptr;
+	{
+		Locker agentLock(strongAgent);
+		zone = strongAgent->getZone();
+	}
+	if (zone == nullptr || zone->getZoneName() != homePlanet)
+		return false;
+
+	// Eight fixed bearings are enough to spread identities around the city while
+	// keeping the result stable across restarts. The identity seeds the first
+	// bearing; each rejected candidate advances monotonically through the ring.
+	const float bearingStep = 0.7853981633974483f;
+	const float ringSpan = Math::max(0.f,
+		config.grindAnchorMaxMeters - config.grindAnchorMinMeters);
+	float radius = widenRing ? config.grindAnchorMaxMeters + ringSpan :
+		config.grindAnchorMinMeters +
+		(static_cast<float>(identity.id % 1000) / 1000.f) * ringSpan;
+	int bearing = earlyGameBearingIndex % 8;
+	if (bearing < 0)
+		bearing += 8;
+	float angle = static_cast<float>(bearing) * bearingStep;
+	Vector3 candidate(cityCenter.getX() + std::cos(angle) * radius,
+		cityCenter.getY() + std::sin(angle) * radius, 0.f);
+	earlyGameBearingIndex = (bearing + 1) % 8;
+	++earlyGameAnchorAttempts;
+
+	// A grind anchor must be OUTDOORS: outside every NavArea, by the same test
+	// resolveHybridExit uses for its egress point. The ring is measured from the
+	// shuttle pad, so in a large city it lands inside the urban navmesh. The
+	// hybrid mover then treats it as an on-mesh destination, and recast cannot
+	// route to an arbitrary interior point: in verification run 20260914 every
+	// path from Keren failed and the novice never moved. Step outward along the
+	// same bearing to the first outdoor point, which gives the walk the proven
+	// navmesh-exit-then-overland leg. Bounded, so a malformed mesh cannot loop.
+	const float outwardStepMeters = 64.f;
+	const int maxOutwardSteps = 48;
+	const float stepX = std::cos(angle) * outwardStepMeters;
+	const float stepY = std::sin(angle) * outwardStepMeters;
+	bool outdoor = false;
+	for (int step = 0; step <= maxOutwardSteps; ++step) {
+		if (step > 0)
+			candidate = Vector3(candidate.getX() + stepX,
+				candidate.getY() + stepY, 0.f);
+		if (!zone->isWithinBoundaries(candidate))
+			return false;
+		SortedVector<ManagedReference<NavArea*> > areas;
+		zone->getInRangeNavMeshes(candidate.getX(), candidate.getY(), &areas,
+			false);
+		if (areas.size() == 0) {
+			outdoor = true;
+			break;
+		}
+	}
+	if (!outdoor || SimPlayerManager::instance()->
+			isStructureTraversalPointInWater(zone, candidate))
+		return false;
+
+	// Never walk a novice back through a place it recently died: in
+	// verification 20260914-173645 it was killed twice on one deterministic
+	// anchor route. Reject an anchor whose overland leg from here passes within
+	// the avoid radius; the ring then moves on to the next bearing.
+	if (isEarlyGameLegNearDeathSite(strongAgent->getWorldPosition(), candidate,
+			homePlanet)) {
+		SimPlayerManager::instance()->recordPlayerBotEarlyGameDeathZoneReject(
+			identityId);
+		return false;
+	}
+
+	candidate.setZ(zone->getHeight(candidate.getX(), candidate.getY()));
+	earlyGameAnchor = candidate;
+	earlyGameAnchorArriveMeters = 0.f;
+	return true;
+}
+
+void SimHunterController::beginEarlyGame() {
+	if (agent == nullptr || !SimPlayerManager::instance()->
+			isPlayerBotEarlyGameIdentity(identityId))
+		return;
+
+	SimBotIdentity identity;
+	if (!SimPlayerManager::instance()->snapshotPlayerBotIdentity(identityId,
+			identity))
+		return;
+
+	SimBotEarlyGameConfig config;
+	SimPlayerManager::instance()->getPlayerBotEarlyGameConfig(config);
+	Vector3 cantina;
+	Vector3 medCenter;
+	Vector3 cityCenter;
+	String homePlanet;
+	String homeCity;
+	SimPlayerManager::instance()->resolvePlayerBotHomeCity(identity, homePlanet,
+		homeCity);
+	if (SimPlayerManager::instance()->getPveHomeLocations(
+			homePlanet, homeCity, cantina, medCenter, cityCenter))
+		earlyGameRestPoint = cantina;
+	else
+		earlyGameRestPoint = agent->getWorldPosition();
+
+	// Entering grind mode PREEMPTS the legacy order branch in runActiveTick, so
+	// an order that was already active would never be completed or abandoned:
+	// it would sit in the manager reserving inbound supply forever and leave
+	// this controller wedged after graduation. startOrder's decline only covers
+	// orders that arrive AFTER the switch, so release the in-flight one here.
+	if (orderActive) {
+		SimPlayerManager::instance()->declinePveHunterOrder(identityId,
+			agent == nullptr ? 0 : agent->getObjectID(),
+			"EARLY_GAME_GRIND_PREEMPT");
+		orderActive = false;
+		missionHuntOrder = false;
+		missionCleanupRequested = false;
+		disengageMissionLair();
+		// disengageMissionLair only clears engagedMissionLairOid. The order's
+		// own mission identifiers must be cleared too, or a stale lair/offer id
+		// survives into grind mode. The manager destroys the lair itself: that
+		// is queued from declinePveHunterOrder above, since releasing an order
+		// must release the resources the order acquired.
+		missionTerminalResolved = false;
+		missionTerminalFallback = false;
+		missionTerminalPosition = Vector3();
+		missionLairPosition = Vector3();
+		missionLairOid = 0;
+		currentMissionOfferId = 0;
+		missionOffersGenerated = false;
+		missionOfferAttempts = 0;
+		missionOfferVisitEpoch = 0;
+		cancelPveDoctorRequest();
+		advanceWorkLoopGeneration("hunterEnterEarlyGame");
+		clearInteriorApproachLeg();
+		resetHybridMovementState(true);
+		if (SimPlayerManager::instance()->isPveMarketDispatchEnabled())
+			clearInterplanetaryTravelState();
+	}
+
+	earlyGameActive = true;
+	earlyGamePhase = EARLY_LEAVE_CITY;
+	earlyGameBearingIndex = static_cast<int>(identity.id % 8);
+	earlyGameSpawnerIndex = static_cast<int>(identity.id % 64);
+	earlyGameAnchorAttempts = 0;
+	earlyGameRingWidened = false;
+	earlyGameScanAttempts = 0;
+	earlyGameScanBearingVisits = 0;
+	earlyGameScanRetryAtMs = 0;
+	earlyGamePathRetryAtMs = 0;
+	earlyGameTargetTtkSeconds = 0.f;
+	earlyGameTargetDefensive = false;
+	earlyGameRestStartedAtMs = 0;
+	earlyGamePathFailurePending.store(false, std::memory_order_relaxed);
+	earlyGameDestructionPending.store(false, std::memory_order_relaxed);
+	earlyGameDestroyedTargetOid.store(0, std::memory_order_relaxed);
+	earlyGameDestroyedParticipantVerified.store(false,
+		std::memory_order_relaxed);
+	dropTargetObserver();
+	disengageTarget(false);
+	targetOid = 0;
+	targetMissionWave = false;
+	destructionHandled = false;
+	clearHybridMovementOnCancellation();
+	resetCombatGuard();
+
+	bool found = config.roamCitySpawners &&
+		chooseEarlyGameSpawnerAnchor(config);
+	for (int attempt = 0; attempt < config.anchorMaxAttempts && !found;
+			++attempt)
+		found = chooseEarlyGameAnchor(false);
+	if (!found) {
+		earlyGameRingWidened = true;
+		earlyGameAnchorAttempts = 0;
+		for (int attempt = 0; attempt < config.anchorMaxAttempts && !found;
+				++attempt)
+			found = chooseEarlyGameAnchor(true);
+	}
+	if (!found) {
+		earlyGameAnchor = earlyGameRestPoint;
+		earlyGameAnchorArriveMeters = 0.f;
+		SimPlayerManager::instance()->recordPlayerBotEarlyGameAnchorFallback(
+			identityId);
+	}
+
+	// The legacy HuntPhase stays HUNTING for the whole novice mode so onTick's
+	// interceptor path cannot become a second writer of targetOid/observer state.
+	setPhase(HUNTING);
+	setEarlyGamePhase(EARLY_LEAVE_CITY);
+	publishEarlyGameMovement("begin", false, true, false, false);
+	// A body that starts hurt (clone wounds, a respawn mid-fight) heals at its
+	// rest point before walking out, as a player does after cloning. Walking
+	// out at 1 HP made the first hit of any creature fatal.
+	ManagedReference<AiAgent*> strongAgent = agent;
+	// Entering the loop heals to the clone-wound cap (0 heals every wound, the
+	// owner's heal-on-death rule), covering a body respawned with the gate off.
+	capEarlyGameWounds(strongAgent.get(), config.cloneWoundMaxFraction);
+	if (strongAgent != nullptr &&
+			isBelowEarlyGameHam(strongAgent.get(), config.restHamFraction)) {
+		beginEarlyGameRecovery(false);
+		return;
+	}
+	scheduleActiveTick(100);
+}
+
+bool SimHunterController::isBelowEarlyGameHam(AiAgent* hunter,
+		float fraction) const {
+	if (hunter == nullptr)
+		return false;
+	float minimum = 1.f;
+	const uint8 hamPools[] = {CreatureAttribute::HEALTH,
+		CreatureAttribute::ACTION, CreatureAttribute::MIND};
+	for (uint8 i = 0; i < 3; ++i) {
+		int maximum = hunter->getMaxHAM(hamPools[i]);
+		if (maximum > 0)
+			minimum = Math::min(minimum, static_cast<float>(hunter->getHAM(
+				hamPools[i])) / static_cast<float>(maximum));
+	}
+	return minimum < fraction;
+}
+
+bool SimHunterController::calculateEarlyGameTtk(CreatureObject* target,
+		const SimBotEarlyGameConfig& config, int skillTier,
+		WeaponObject* weapon, float rawAverageDamage, float attackPeriod,
+		float& ttkSeconds, bool allowInCombat) const {
+	// Config, identity and weapon are IDENTICAL for every candidate in one
+	// scan, so they are snapshotted once by the caller. Taking the two manager
+	// mutexes and the agent lock per candidate made target selection O(n) in
+	// lock acquisitions across a populated wilderness cell - the cost pattern
+	// ARCHI's performance note calls out. Only the per-target read below is
+	// unavoidably per candidate.
+	ttkSeconds = 0.f;
+	if (target == nullptr || agent == nullptr || weapon == nullptr)
+		return false;
+	AiAgent* targetAgent = target->asAiAgent();
+	if (targetAgent == nullptr || target->isPlayerCreature() ||
+		target->isDead() || target->isIncapacitated() ||
+		target->getParent() != nullptr ||
+		(!allowInCombat && target->isInCombat()))
+		return false;
+
+	float effectiveHam = 0.f;
+	float averageDamage = 0.f;
+	int targetLevel = 0;
+	{
+		Locker targetLock(targetAgent);
+		int health = target->getHAM(CreatureAttribute::HEALTH);
+		int action = target->getHAM(CreatureAttribute::ACTION);
+		int mind = target->getHAM(CreatureAttribute::MIND);
+		targetLevel = targetAgent->getLevel();
+		// A creature dies when ANY primary pool is depleted - only secondaries
+		// are clamped at zero (CreatureObjectImplementation.cpp:1100-1101) - so
+		// the minimum primary pool is the fight-ending budget. Deliberately
+		// conservative: it can only make a target look easier, which is why the
+		// level ceiling below is the hard guard rather than the TTK band.
+		effectiveHam = static_cast<float>(Math::min(health,
+			Math::min(action, mind)));
+		averageDamage = CombatManager::instance()->
+			estimateDamageAfterMitigation(targetAgent, weapon,
+				rawAverageDamage);
+	}
+
+	// A level band around the novice's tier that rises as it trains. Chosen
+	// targets must sit inside tier - levelBandBelow .. tier + levelBandAbove;
+	// self-defence (allowInCombat) keeps only the upper bound, so a weaker
+	// attacker is fought, never fled from. A one-sided ceiling with a level-10
+	// floor let a tier-2 novice pick armed level 9-10 NPCs that beat it in
+	// seconds (quick check 20260915-002501).
+	if (effectiveHam <= 0.f || averageDamage <= 0.f || attackPeriod <= 0.f ||
+			config.assumedHitRate <= 0.f ||
+			targetLevel > skillTier + config.levelBandAbove ||
+			(!allowInCombat && targetLevel < skillTier - config.levelBandBelow))
+		return false;
+	ttkSeconds = effectiveHam * attackPeriod /
+		(averageDamage * config.assumedHitRate);
+	// minTtkSeconds keeps proactive selection off trivially weak targets. It
+	// must not apply to self-defence: an attacker that dies quickly is the
+	// easiest fight there is, and the owner rule is to fight weaker attackers,
+	// never flee them. The upper TTK bound still applies to both.
+	return (allowInCombat || ttkSeconds >= config.minTtkSeconds) &&
+		ttkSeconds <= config.maxTtkSeconds;
+}
+
+void SimHunterController::publishEarlyGameCombat(AiAgent* hunter) {
+	// Default-off diagnostic (earlyGame.combatTelemetry): while it is off the
+	// lock-free gate read is the only cost.
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (hunter == nullptr || identityId == 0 ||
+			!manager->isPlayerBotEarlyGameCombatTelemetryEnabled())
+		return;
+
+	SimBotEarlyGameCombatSample sample;
+	sample.decision = earlyGameDefenseDecision;
+	sample.decisionTtk = earlyGameDefenseTtk;
+	Vector<ManagedReference<SceneObject*> > defenders;
+	{
+		// Same snapshot choreography as selectActiveCombatAttacker: copy under the
+		// hunter lock, inspect the retained references after releasing it.
+		Locker agentLock(hunter);
+		sample.inCombat = hunter->isInCombat();
+		sample.health = hunter->getHAM(CreatureAttribute::HEALTH);
+		sample.healthMax = hunter->getMaxHAM(CreatureAttribute::HEALTH);
+		sample.action = hunter->getHAM(CreatureAttribute::ACTION);
+		sample.actionMax = hunter->getMaxHAM(CreatureAttribute::ACTION);
+		sample.mind = hunter->getHAM(CreatureAttribute::MIND);
+		sample.mindMax = hunter->getMaxHAM(CreatureAttribute::MIND);
+		const DeltaVector<ManagedReference<SceneObject*> >* defenderList =
+			hunter->getDefenderList();
+		if (defenderList != nullptr) {
+			sample.defenderCount = defenderList->size();
+			for (int i = 0; i < defenderList->size() && defenders.size() < 3; ++i) {
+				ManagedReference<SceneObject*> defender = defenderList->getSafe(i);
+				if (defender != nullptr)
+					defenders.add(defender);
+			}
+		}
+	}
+
+	float reachabilityRadius = manager->getPveHunterScanRadiusMeters() + 24.f;
+	StringBuffer described;
+	for (int i = 0; i < defenders.size(); ++i) {
+		SceneObject* defender = defenders.get(i).get();
+		CreatureObject* creature = defender->asCreatureObject();
+		AiAgent* creatureAgent = creature == nullptr ? nullptr :
+			creature->asAiAgent();
+		float distance = hunter->getDistanceTo(defender);
+		// The first selectActiveCombatAttacker filter this defender fails.
+		const char* verdict = "eligible";
+		if (creature == nullptr)
+			verdict = "not_creature";
+		else if (creature == hunter)
+			verdict = "self";
+		else if (creature->isPlayerCreature())
+			verdict = "player";
+		else if (creatureAgent == nullptr)
+			verdict = "not_ai";
+		else if (manager->isSimPresenceCreature(creature))
+			verdict = "presence";
+		else if (creatureAgent->getSimPlayerBot())
+			verdict = "sim_bot";
+		else if (creature->isDead())
+			verdict = "dead";
+		else if (creature->isIncapacitated())
+			verdict = "incapacitated";
+		else if (creature->getParent() != nullptr)
+			verdict = "in_cell";
+		else if (!creature->isAttackableBy(hunter))
+			verdict = "not_attackable";
+		else if (distance > reachabilityRadius)
+			verdict = "out_of_range";
+		if (i > 0)
+			described << ";";
+		described << defender->getObjectID() << ":" <<
+			(defender->getObjectTemplate() == nullptr ? String("none") :
+				defender->getObjectTemplate()->getFullTemplateString()) << ":lvl" <<
+			(creature == nullptr ? 0 : creature->getLevel()) << ":" <<
+			static_cast<int>(distance) << "m:" << verdict;
+	}
+	sample.defenders = described.toString();
+	manager->recordPlayerBotEarlyGameCombatTick(identityId, sample);
+}
+
+bool SimHunterController::handleEarlyGameSelfDefense(AiAgent* hunter,
+		const SimBotEarlyGameConfig& config) {
+	// Grind mode runs under the legacy HUNTING phase, where onTick's interceptor
+	// defence deliberately stands down, and scanForTarget ignores a bot that is
+	// already in combat. So a novice attacked on the way to its anchor neither
+	// fought back nor fled (live 20260914: killed en route with no target).
+	// Engage already owns its own fight and flee check.
+	if (hunter == nullptr)
+		return false;
+	if (earlyGamePhase == EARLY_ENGAGE) {
+		earlyGameDefenseDecision = "engage_phase";
+		return false;
+	}
+	if (!hunter->isInCombat()) {
+		phantomCombatTicks = 0;
+		earlyGameDefenseDecision = "not_in_combat";
+		return false;
+	}
+
+	ManagedReference<CreatureObject*> attacker;
+	ManagedReference<AiAgent*> attackerAgent;
+	if (!selectActiveCombatAttacker(hunter, attacker, attackerAgent)) {
+		// In combat with no eligible attacker: dead, despawned, out of range, or
+		// one target selection refuses (in a cell, not attackable, not a
+		// creature). scanForTarget and moveTo both refuse while the flag stands.
+		// A recovery walk already under way is left alone - clearing would drop
+		// its path.
+		if (earlyGamePhase == EARLY_RECOVER &&
+				(state == MOVING || state == CALCULATING_PATH)) {
+			if (!isEarlyGameRecoveryWalkStalled(hunter, 4000)) {
+				earlyGameDefenseDecision = "no_attacker_recovering";
+				return false;
+			}
+			// Pinned while something we cannot target keeps us in combat:
+			// re-issue the walk to the rest point.
+			earlyGameDefenseDecision = "no_attacker_flee_stalled";
+			SimPlayerManager::instance()->recordPlayerBotEarlyGameDefense(
+				identityId, false);
+			targetOid = 0;
+			beginEarlyGameRecovery(true);
+			return true;
+		}
+		// Something we cannot fight is wearing us down: run for the rest point
+		// instead of waiting out the phantom guard. Recover is already at or
+		// heading to safety, so it never re-flees from there.
+		if (earlyGamePhase != EARLY_RECOVER &&
+				isBelowEarlyGameHam(hunter, config.fleeHamFraction)) {
+			earlyGameDefenseDecision = "no_attacker_flee";
+			SimPlayerManager::instance()->recordPlayerBotEarlyGameDefense(
+				identityId, false);
+			targetOid = 0;
+			beginEarlyGameRecovery(true);
+			return true;
+		}
+		earlyGameDefenseDecision = "no_attacker";
+		// Otherwise age the flag out like runActiveTick's phantom-combat guard.
+		if (++phantomCombatTicks >= 6) {
+			earlyGameDefenseDecision = "no_attacker_cleared";
+			clearStaleCombat("phantom_combat");
+		}
+		return false;
+	}
+	phantomCombatTicks = 0;
+
+	// The same estimate a player makes by eye, and the same no-cheat rule as
+	// target selection: fight what the TTK window and level ceiling say is
+	// winnable, otherwise run. Already below the flee line means run regardless.
+	bool winnable = false;
+	float ttkSeconds = 0.f;
+	uint64 unwinnableAttackerOid = 0;
+	SimBotIdentity identity;
+	if (!isBelowEarlyGameHam(hunter, config.fleeHamFraction) &&
+			SimPlayerManager::instance()->snapshotPlayerBotIdentity(identityId,
+				identity)) {
+		ManagedReference<WeaponObject*> weapon;
+		float rawDamage = 0.f;
+		float attackPeriod = 0.f;
+		{
+			Locker agentLock(hunter);
+			weapon = hunter->getWeapon();
+			if (weapon != nullptr) {
+				rawDamage = (weapon->getMinDamage() + weapon->getMaxDamage()) *
+					0.5f;
+				attackPeriod = weapon->getAttackSpeed();
+				earlyGameEngageRangeMeters = Math::max(2.f,
+					static_cast<float>(weapon->getMaxRange()) - 1.f);
+			}
+		}
+		winnable = weapon != nullptr && calculateEarlyGameTtk(attacker.get(),
+			config, identity.skillTier, weapon, rawDamage, attackPeriod,
+			ttkSeconds, true);
+
+		// Judge every attacker, not only the one selected: a novice engaged a
+		// winnable creature while a level-22 womp rat beside it did the damage
+		// (quick check 20260915-143615). Fight only if all of them are winnable;
+		// otherwise run from the one that is not.
+		if (winnable) {
+			unwinnableAttackerOid = findUnwinnableEarlyGameAttacker(hunter, config,
+				attacker->getObjectID());
+			if (unwinnableAttackerOid != 0)
+				winnable = false;
+		}
+	}
+
+	earlyGameDefenseTtk = ttkSeconds;
+	if (!winnable) {
+		// Already walking away: let the recovery leg run instead of re-issuing a
+		// flee (and a path request) every tick while the attacker chases.
+		if (earlyGamePhase == EARLY_RECOVER &&
+				(state == MOVING || state == CALCULATING_PATH) &&
+				!isEarlyGameRecoveryWalkStalled(hunter, 4000)) {
+			earlyGameDefenseDecision = "flee_recovering";
+			return false;
+		}
+		// A fresh flee, or a flee walk the attacker has pinned in place: run
+		// directly away from the attacker again.
+		earlyGameDefenseDecision = earlyGamePhase == EARLY_RECOVER &&
+			(state == MOVING || state == CALCULATING_PATH) ?
+			String("flee_stalled") : String("flee");
+		if (unwinnableAttackerOid != 0)
+			earlyGameDefenseDecision = "flee_other_attacker";
+		SimPlayerManager::instance()->recordPlayerBotEarlyGameDefense(identityId,
+			false);
+		// beginEarlyGameRecovery flees directly away from targetOid: the
+		// attacker that made the fight unwinnable.
+		targetOid = unwinnableAttackerOid != 0 ? unwinnableAttackerOid :
+			attacker->getObjectID();
+		beginEarlyGameRecovery(true);
+		return true;
+	}
+
+	earlyGameDefenseDecision = "engage";
+	SimPlayerManager::instance()->recordPlayerBotEarlyGameDefense(identityId,
+		true);
+	earlyGameTargetTtkSeconds = ttkSeconds;
+	earlyGameTargetDefensive = true;
+	selectTarget(attackerAgent);
+	if (targetOid != attacker->getObjectID()) {
+		// selectTarget refused the attacker; do not stand in a fight we cannot
+		// take.
+		earlyGameDefenseDecision = "engage_refused_flee";
+		earlyGameTargetDefensive = false;
+		targetOid = attacker->getObjectID();
+		beginEarlyGameRecovery(true);
+		return true;
+	}
+	if (earlyGamePhase != EARLY_ENGAGE)
+		setEarlyGamePhase(EARLY_ENGAGE);
+	scheduleActiveTick(100);
+	return true;
+}
+
+void SimHunterController::beginEarlyGameRecovery(bool fleeing) {
+	if (!earlyGameActive || agent == nullptr)
+		return;
+
+	SimBotEarlyGameConfig config;
+	SimPlayerManager::instance()->getPlayerBotEarlyGameConfig(config);
+	Vector3 current = agent->getWorldPosition();
+	Vector3 recoveryPoint = earlyGameRestPoint;
+	CreatureObject* target = nullptr;
+	AiAgent* targetAgent = nullptr;
+	if (fleeing && targetOid != 0 && targetIsLive(targetOid, target,
+			targetAgent)) {
+		Vector3 direction = current - target->getWorldPosition();
+		direction.setZ(0.f);
+		if (direction.length2d() < 0.01f)
+			direction = Vector3::UNIT_X;
+		else
+			direction.normalize();
+		recoveryPoint = current + direction * 80.f;
+	}
+
+	dropTargetObserver();
+	disengageTarget(false);
+	targetOid = 0;
+	targetMissionWave = false;
+	destructionHandled = false;
+	clearHybridMovementOnCancellation();
+	resetCombatGuard();
+	earlyGameTargetDefensive = false;
+	if (fleeing)
+		SimPlayerManager::instance()->recordPlayerBotEarlyGameFlee(identityId);
+	earlyGameRestStartedAtMs = System::getMiliTime();
+	setEarlyGamePhase(EARLY_RECOVER);
+	if (current.distanceTo2d(recoveryPoint) > config.anchorArriveMeters) {
+		state = SimPlayerController::IDLE;
+		earlyGameRecoverProgressPos = current;
+		earlyGameRecoverProgressMs = System::getMiliTime();
+		moveTo(recoveryPoint);
+		// Like every other walking branch, Recover keeps its own 1 s tick. It
+		// used to rely on onArrived/onPathFailed alone, and a walk an attacker
+		// pinned in place fired neither: the loop froze and the novice stood
+		// still until killed (verification 20260914-205211). The Recover branch
+		// re-ticks every second while MOVING, so self-defence keeps running.
+		scheduleActiveTick(1000);
+	} else {
+		state = SimPlayerController::IDLE;
+		scheduleActiveTick(100);
+	}
+}
+
+void SimHunterController::rememberEarlyGameUnreachableTarget(uint64 oid) {
+	if (oid == 0)
+		return;
+	SimBotEarlyGameConfig config;
+	SimPlayerManager::instance()->getPlayerBotEarlyGameConfig(config);
+	uint64 nowMs = System::getMiliTime();
+
+	// Drop expired entries and any earlier entry for this target.
+	for (int i = earlyGameSkipTargetOids.size() - 1; i >= 0; --i) {
+		if (earlyGameSkipTargetOids.get(i) == oid ||
+				earlyGameSkipTargetUntilMs.get(i) <= nowMs) {
+			earlyGameSkipTargetOids.remove(i);
+			earlyGameSkipTargetUntilMs.remove(i);
+		}
+	}
+	// Full: replace the entry that would expire soonest.
+	while (earlyGameSkipTargetOids.size() > 0 &&
+			earlyGameSkipTargetOids.size() >= config.unreachableSkipMaxTargets) {
+		int soonest = 0;
+		for (int i = 1; i < earlyGameSkipTargetUntilMs.size(); ++i) {
+			if (earlyGameSkipTargetUntilMs.get(i) <
+					earlyGameSkipTargetUntilMs.get(soonest))
+				soonest = i;
+		}
+		earlyGameSkipTargetOids.remove(soonest);
+		earlyGameSkipTargetUntilMs.remove(soonest);
+	}
+	earlyGameSkipTargetOids.add(oid);
+	earlyGameSkipTargetUntilMs.add(nowMs +
+		static_cast<uint64>(config.unreachableSkipSeconds) * 1000);
+}
+
+bool SimHunterController::isEarlyGameTargetSkipped(uint64 oid,
+		uint64 nowMs) const {
+	for (int i = 0; i < earlyGameSkipTargetOids.size(); ++i) {
+		if (earlyGameSkipTargetOids.get(i) == oid &&
+				nowMs < earlyGameSkipTargetUntilMs.get(i))
+			return true;
+	}
+	return false;
+}
+
+void SimHunterController::handleEarlyGameTargetUnavailable() {
+	dropTargetObserver();
+	disengageTarget(false);
+	targetOid = 0;
+	targetMissionWave = false;
+	destructionHandled = false;
+	clearHybridMovementOnCancellation();
+	resetCombatGuard();
+	earlyGameTargetTtkSeconds = 0.f;
+	earlyGameTargetDefensive = false;
+	earlyGameScanAttempts = 0;
+	earlyGameScanRetryAtMs = 0;
+	setEarlyGamePhase(EARLY_SELECT_TARGET);
+	scheduleActiveTick(100);
+}
+
+void SimHunterController::handleEarlyGameArrived() {
+	if (!earlyGameActive)
+		return;
+	state = SimPlayerController::IDLE;
+	if (earlyGamePhase == EARLY_LEAVE_CITY) {
+		earlyGameScanAttempts = 0;
+		earlyGameScanRetryAtMs = 0;
+		setEarlyGamePhase(EARLY_SELECT_TARGET);
+	} else if (earlyGamePhase == EARLY_RECOVER) {
+		earlyGameRestStartedAtMs = System::getMiliTime();
+	}
+	scheduleActiveTick(100);
+}
+
+void SimHunterController::handleEarlyGamePathFailed() {
+	if (!earlyGameActive)
+		return;
+
+	if (earlyGamePhase == EARLY_ENGAGE) {
+		// Skip this target for earlyGame.unreachableSkipSeconds: the next scan
+		// found the same creature and re-failed its path several times a second
+		// (quick check 20260915-002501). Skips accumulate, so two unreachable
+		// creatures can no longer alternate (TRIP-verify 20260915-185828).
+		rememberEarlyGameUnreachableTarget(targetOid);
+		handleEarlyGameTargetUnavailable();
+		return;
+	}
+	if (earlyGamePhase == EARLY_RECOVER) {
+		earlyGameRestPoint = agent->getWorldPosition();
+		scheduleActiveTick(1000);
+		return;
+	}
+
+	SimBotEarlyGameConfig config;
+	SimPlayerManager::instance()->getPlayerBotEarlyGameConfig(config);
+	earlyGameAnchorAttempts = 0;
+	bool found = config.roamCitySpawners &&
+		chooseEarlyGameSpawnerAnchor(config);
+	for (int attempt = 0; attempt < config.anchorMaxAttempts && !found;
+			++attempt)
+		found = chooseEarlyGameAnchor(earlyGameRingWidened);
+	if (!found && !earlyGameRingWidened) {
+		earlyGameRingWidened = true;
+		earlyGameAnchorAttempts = 0;
+		for (int attempt = 0; attempt < config.anchorMaxAttempts && !found;
+				++attempt)
+			found = chooseEarlyGameAnchor(true);
+	}
+	if (!found) {
+		earlyGameAnchor = earlyGameRestPoint;
+		earlyGameAnchorArriveMeters = 0.f;
+		SimPlayerManager::instance()->recordPlayerBotEarlyGameAnchorFallback(
+			identityId);
+	}
+	setEarlyGamePhase(EARLY_LEAVE_CITY);
+	publishEarlyGameMovement("path_failed", false, false, false, false);
+	if (agent->getWorldPosition().distanceTo2d(earlyGameAnchor) <=
+			getEarlyGameArriveMeters(config)) {
+		handleEarlyGameArrived();
+	} else {
+		// Back off before the next walk. Re-issuing immediately turned a failing
+		// route into a tight path-request loop (~8 work-loop generations a
+		// second in run D); the LeaveCity tick re-issues the walk once the retry
+		// time has passed.
+		uint64 retryDelayMs = static_cast<uint64>(
+			Math::max(1, config.scanRetrySeconds)) * 1000;
+		earlyGamePathRetryAtMs = System::getMiliTime() + retryDelayMs;
+		scheduleActiveTick(static_cast<int>(retryDelayMs));
+	}
+}
+
+void SimHunterController::runEarlyGameTick(AiAgent* hunter, uint64 nowMs) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (!manager->isPlayerBotEarlyGameIdentity(identityId)) {
+		publishEarlyGameMovement("not_identity_exit", false, false, true, false);
+		earlyGameActive = false;
+		dropTargetObserver();
+		disengageTarget(false);
+		targetOid = 0;
+		clearHybridMovementOnCancellation();
+		earlyGamePathFailurePending.store(false, std::memory_order_release);
+		earlyGameDestructionPending.store(false, std::memory_order_release);
+		setPhase(IDLE_HOME);
+		scheduleActiveTick(30000);
+		return;
+	}
+
+	SimBotEarlyGameConfig config;
+	manager->getPlayerBotEarlyGameConfig(config);
+	publishEarlyGameMovement("tick", true, false, false, false);
+	if (earlyGameDestructionPending.exchange(false,
+			std::memory_order_acq_rel)) {
+		uint64 destroyedTargetOid = earlyGameDestroyedTargetOid.load(
+			std::memory_order_acquire);
+		bool participantVerified = earlyGameDestroyedParticipantVerified.load(
+			std::memory_order_acquire);
+		earlyGamePathFailurePending.store(false, std::memory_order_release);
+		if (destroyedTargetOid == targetOid) {
+			destructionHandled = true;
+			dropTargetObserver();
+			if (!participantVerified)
+				handleEarlyGameTargetUnavailable();
+			else {
+				manager->recordPlayerBotEarlyGameKill(identityId);
+				beginEarlyGameRecovery(false);
+			}
+			return;
+		}
+	}
+	if (earlyGamePathFailurePending.exchange(false,
+			std::memory_order_acq_rel)) {
+		handleEarlyGamePathFailed();
+		return;
+	}
+	earlyGameDefenseDecision = "";
+	earlyGameDefenseTtk = 0.f;
+	bool defended = handleEarlyGameSelfDefense(hunter, config);
+	// The all-attackers rule holds for the whole fight, not just its start:
+	// pack allies and passing aggressors join after Engage began. Decided before
+	// the combat sample so the sample carries this tick's decision.
+	uint64 unwinnableAttackerOid = 0;
+	if (!defended && earlyGamePhase == EARLY_ENGAGE) {
+		unwinnableAttackerOid = findUnwinnableEarlyGameAttacker(hunter, config,
+			targetOid);
+		if (unwinnableAttackerOid != 0)
+			earlyGameDefenseDecision = "flee_other_attacker";
+	}
+	publishEarlyGameCombat(hunter);
+	if (defended)
+		return;
+	if (unwinnableAttackerOid != 0) {
+		// Leave as soon as any attacker besides the target is one the novice
+		// could not beat; beginEarlyGameRecovery flees directly away from
+		// targetOid.
+		SimPlayerManager::instance()->recordPlayerBotEarlyGameDefense(identityId,
+			false);
+		targetOid = unwinnableAttackerOid;
+		beginEarlyGameRecovery(true);
+		return;
+	}
+	if (earlyGamePhase == EARLY_ENGAGE &&
+			isBelowEarlyGameHam(hunter, config.fleeHamFraction)) {
+		beginEarlyGameRecovery(true);
+		return;
+	}
+
+	if (earlyGamePhase == EARLY_RECOVER) {
+		if (state == MOVING || state == CALCULATING_PATH) {
+			// Self-defence above re-flees a walk pinned while in combat. A walk that
+			// stops making progress with no combat to explain it (hits that never
+			// restore the combat state after the flee's disengage, a wedged mover)
+			// is re-issued toward the rest point instead of waited on forever.
+			// Bounded: the restart resets progress, so at most once per 10 s.
+			if (isEarlyGameRecoveryWalkStalled(hunter, 10000)) {
+				beginEarlyGameRecovery(false);
+				return;
+			}
+			scheduleActiveTick(1000);
+			return;
+		}
+		if (isBelowEarlyGameHam(hunter, config.restHamFraction)) {
+			// Keep the rest line reachable while waiting (see capEarlyGameWounds).
+			// Only as far as keeps the rest line reachable: resting does not wipe
+			// wounds taken mid-life, it just must not wait forever.
+			capEarlyGameWounds(hunter,
+				Math::max(0.f, 1.f - config.restHamFraction));
+			scheduleActiveTick(1000);
+			return;
+		}
+		manager->recordPlayerBotEarlyGameRest(identityId);
+		setEarlyGamePhase(EARLY_TRAIN);
+		scheduleActiveTick(100);
+		return;
+	}
+
+	if (earlyGamePhase == EARLY_TRAIN) {
+		// Training itself remains on the existing progression maintenance lane;
+		// this phase only gives that lane a quiet transition point before the bot
+		// starts the next deterministic outdoor leg.
+		earlyGameScanAttempts = 0;
+		earlyGameScanRetryAtMs = 0;
+		earlyGameAnchorAttempts = 0;
+		setEarlyGamePhase(EARLY_LEAVE_CITY);
+		if (agent->getWorldPosition().distanceTo2d(earlyGameAnchor) <=
+				getEarlyGameArriveMeters(config))
+			setEarlyGamePhase(EARLY_SELECT_TARGET);
+		else if (state != MOVING && state != CALCULATING_PATH)
+			moveTo(earlyGameAnchor);
+		scheduleActiveTick(1000);
+		return;
+	}
+
+	if (earlyGamePhase == EARLY_ENGAGE) {
+		if (targetOid == 0) {
+			setEarlyGamePhase(EARLY_SELECT_TARGET);
+			scheduleActiveTick(100);
+			return;
+		}
+		CreatureObject* target = nullptr;
+		AiAgent* targetAgent = nullptr;
+		if (!targetIsLive(targetOid, target, targetAgent)) {
+			handleEarlyGameTargetUnavailable();
+			return;
+		}
+		if (hunter->getDistanceTo(target) <= getEngageRangeMeters())
+			engageTarget();
+		else
+			moveToTarget();
+		scheduleActiveTick(1000);
+		return;
+	}
+
+	if (earlyGamePhase == EARLY_SELECT_TARGET) {
+		if (earlyGameScanRetryAtMs != 0 && nowMs < earlyGameScanRetryAtMs) {
+			scheduleActiveTick(static_cast<int>(Math::max(100,
+				static_cast<int>(earlyGameScanRetryAtMs - nowMs))));
+			return;
+		}
+		earlyGameScanRetryAtMs = 0;
+		if (scanForTarget()) {
+			// The pursuit keeps its own 1 s tick like every other walking
+			// branch; it used to wait on arrival alone, leaving 20-40 s with no
+			// tick while closing in (quick check 20260915-002501).
+			scheduleActiveTick(1000);
+			return;
+		}
+		++earlyGameScanAttempts;
+		if (earlyGameScanAttempts < config.scanMaxAttempts) {
+			earlyGameScanRetryAtMs = nowMs +
+				static_cast<uint64>(config.scanRetrySeconds) * 1000;
+			scheduleActiveTick(config.scanRetrySeconds * 1000);
+			return;
+		}
+
+		bool completedBearingRotation = ++earlyGameScanBearingVisits >= 8;
+		if (completedBearingRotation) {
+			earlyGameScanBearingVisits = 0;
+			manager->recordPlayerBotEarlyGameEmptyScanRotation(identityId);
+		}
+		earlyGameScanAttempts = 0;
+		earlyGameAnchorAttempts = 0;
+		if (completedBearingRotation)
+			earlyGameRingWidened = true;
+		bool found = config.roamCitySpawners &&
+			chooseEarlyGameSpawnerAnchor(config);
+		for (int attempt = 0; attempt < config.anchorMaxAttempts && !found;
+				++attempt)
+			found = chooseEarlyGameAnchor(earlyGameRingWidened);
+		if (!found && !earlyGameRingWidened) {
+			earlyGameRingWidened = true;
+			earlyGameAnchorAttempts = 0;
+			for (int attempt = 0; attempt < config.anchorMaxAttempts && !found;
+					++attempt)
+				found = chooseEarlyGameAnchor(true);
+		}
+		if (!found) {
+			earlyGameAnchor = earlyGameRestPoint;
+			earlyGameAnchorArriveMeters = 0.f;
+			manager->recordPlayerBotEarlyGameAnchorFallback(identityId);
+		}
+		setEarlyGamePhase(EARLY_LEAVE_CITY);
+		if (hunter->getWorldPosition().distanceTo2d(earlyGameAnchor) <=
+				getEarlyGameArriveMeters(config))
+			handleEarlyGameArrived();
+		else
+			moveTo(earlyGameAnchor);
+		scheduleActiveTick(1000);
+		return;
+	}
+
+	// LeaveCity scans while walking, so an eligible creature encountered en route
+	// wins over the arbitrary anchor destination.
+	if (scanForTarget()) {
+		publishEarlyGameMovement("leave_city_target_found", false, false,
+			false, false);
+		scheduleActiveTick(1000);
+		return;
+	}
+	if (hunter->getWorldPosition().distanceTo2d(earlyGameAnchor) <=
+			getEarlyGameArriveMeters(config)) {
+		publishEarlyGameMovement("leave_city_arrived", false, false, false,
+			false);
+		setEarlyGamePhase(EARLY_SELECT_TARGET);
+		earlyGameScanAttempts = 0;
+		earlyGameScanRetryAtMs = 0;
+		scheduleActiveTick(100);
+		return;
+	}
+	if (earlyGamePathRetryAtMs != 0) {
+		if (nowMs < earlyGamePathRetryAtMs) {
+			uint64 waitMs = earlyGamePathRetryAtMs - nowMs;
+			scheduleActiveTick(waitMs < 100 ? 100 : static_cast<int>(waitMs));
+			return;
+		}
+		earlyGamePathRetryAtMs = 0;
+	}
+	bool moveRequested = state != MOVING && state != CALCULATING_PATH;
+	if (moveRequested)
+		moveTo(earlyGameAnchor);
+	publishEarlyGameMovement("leave_city_walk", false, false, false,
+		moveRequested);
+	scheduleActiveTick(1000);
+}
+
 void SimHunterController::runActiveTick() {
 	ManagedReference<AiAgent*> strongAgent = agent;
 	if (strongAgent == nullptr) {
@@ -2025,6 +3308,18 @@ void SimHunterController::runActiveTick() {
 			SimPlayerManager::instance()->onPveHunterDied(identityId,
 				strongAgent->getObjectID());
 		}
+		return;
+	}
+
+	// Planned novice bodies own the existing active tick while the early-game
+	// gate is on. This branch is deliberately before the legacy order idle path:
+	// no demand order, second task, or second target writer is introduced.
+	if (earlyGameActive || SimPlayerManager::instance()->
+			isPlayerBotEarlyGameIdentity(identityId)) {
+		if (!earlyGameActive)
+			beginEarlyGame();
+		else
+			runEarlyGameTick(strongAgent, nowMs);
 		return;
 	}
 
@@ -2490,8 +3785,7 @@ void SimHunterController::runActiveTick() {
 		AiAgent* targetAgent = nullptr;
 		if (!targetIsLive(targetOid, target, targetAgent))
 			handleTargetUnavailable();
-		else if (strongAgent->getDistanceTo(target) <=
-				SimPlayerManager::instance()->getPveHunterWeaponRangeMeters())
+		else if (strongAgent->getDistanceTo(target) <= getEngageRangeMeters())
 			engageTarget();
 		else
 			moveToTarget();
@@ -2582,6 +3876,8 @@ bool SimHunterController::targetMatchesSpecies(CreatureObject* target) const {
 	AiAgent* targetAgent = target->asAiAgent();
 	if (targetAgent == nullptr || targetAgent->getSimPlayerBot())
 		return false;
+	if (earlyGameActive)
+		return true;
 
 	if (missionHuntOrder && SimPlayerManager::instance()->
 			isPveMissionBoardEnabled()) {
@@ -2627,6 +3923,95 @@ bool SimHunterController::scanForTarget() {
 	SortedVector<TreeEntry*> closeObjects;
 	zone->getInRangeObjects(hunterPosition.getX(), hunterPosition.getZ(),
 		hunterPosition.getY(), scanRadius, &closeObjects, true, true);
+
+	if (earlyGameActive) {
+		// Hoisted out of the candidate loop: one config read, one identity
+		// snapshot, one agent lock for the weapon numbers.
+		SimBotEarlyGameConfig earlyConfig;
+		SimPlayerManager::instance()->getPlayerBotEarlyGameConfig(earlyConfig);
+		SimBotIdentity earlyIdentity;
+		if (!SimPlayerManager::instance()->snapshotPlayerBotIdentity(
+				identityId, earlyIdentity))
+			return false;
+		ManagedReference<WeaponObject*> earlyWeapon;
+		float earlyRawDamage = 0.f;
+		float earlyAttackPeriod = 0.f;
+		{
+			Locker agentLock(strongAgent);
+			earlyWeapon = strongAgent->getWeapon();
+			if (earlyWeapon == nullptr)
+				return false;
+			earlyRawDamage = (earlyWeapon->getMinDamage() +
+				earlyWeapon->getMaxDamage()) * 0.5f;
+			earlyAttackPeriod = earlyWeapon->getAttackSpeed();
+			// A metre inside the weapon's maximum so attacks actually connect.
+			earlyGameEngageRangeMeters = Math::max(2.f,
+				static_cast<float>(earlyWeapon->getMaxRange()) - 1.f);
+		}
+
+		ManagedReference<AiAgent*> bestTarget;
+		float bestDistance = 0.f;
+		float bestTtk = 0.f;
+		int bestLevelDiff = 0;
+		uint64 scanNowMs = System::getMiliTime();
+		for (int i = 0; i < closeObjects.size(); ++i) {
+			SceneObject* object = static_cast<SceneObject*>(closeObjects.get(i));
+			CreatureObject* candidate = object == nullptr ? nullptr :
+				object->asCreatureObject();
+			AiAgent* candidateAgent = candidate == nullptr ? nullptr :
+				candidate->asAiAgent();
+			if (candidate == nullptr || candidateAgent == nullptr ||
+					candidate == strongAgent.get() || candidate->isInCombat() ||
+					!targetMatchesSpecies(candidate) ||
+					!candidate->isAttackableBy(strongAgent.get()))
+				continue;
+
+			// hunterPosition is the snapshot taken under the agent lock above;
+			// re-reading the live world position per candidate cost an extra
+			// read for no added accuracy within a single scan.
+			float distance = hunterPosition.distanceTo(
+				candidate->getWorldPosition());
+			if (distance > scanRadius)
+				continue;
+			// Novices seek creatures that do not pull their group into the fight
+			// (owner rule). Only PACK creatures assist their social group
+			// (AiAgent::notifyPackMobs); herds such as kreetles and minor worrts
+			// fight alone and are fair game.
+			if (earlyConfig.avoidGroupAggroTargets) {
+				const CreatureTemplate* candidateTemplate =
+					candidateAgent->getCreatureTemplate();
+				if (candidateTemplate != nullptr && candidateTemplate->isPack())
+					continue;
+			}
+			if (isEarlyGameTargetSkipped(candidate->getObjectID(), scanNowMs))
+				continue;
+			// Prefer the creature closest to the novice's own level, then the
+			// nearest: the band edges are taken only when nothing closer is here.
+			int candidateLevel = candidate->getLevel();
+			int levelDiff = candidateLevel >= earlyIdentity.skillTier ?
+				candidateLevel - earlyIdentity.skillTier :
+				earlyIdentity.skillTier - candidateLevel;
+			if (bestTarget != nullptr && (levelDiff > bestLevelDiff ||
+					(levelDiff == bestLevelDiff && distance >= bestDistance)))
+				continue;
+
+			float candidateTtk = 0.f;
+			if (!calculateEarlyGameTtk(candidate, earlyConfig,
+					earlyIdentity.skillTier, earlyWeapon, earlyRawDamage,
+					earlyAttackPeriod, candidateTtk))
+				continue;
+			bestTarget = candidateAgent;
+			bestDistance = distance;
+			bestLevelDiff = levelDiff;
+			bestTtk = candidateTtk;
+		}
+		if (bestTarget == nullptr)
+			return false;
+		earlyGameTargetTtkSeconds = bestTtk;
+		earlyGameTargetDefensive = false;
+		selectTarget(bestTarget);
+		return true;
+	}
 
 	for (int i = 0; i < closeObjects.size(); ++i) {
 		SceneObject* object = static_cast<SceneObject*>(closeObjects.get(i));
@@ -2768,8 +4153,7 @@ bool SimHunterController::selectActiveCombatAttacker(AiAgent* hunter,
 	if (nearestAttacker == nullptr)
 		return false;
 
-	float weaponRange = SimPlayerManager::instance()->
-		getPveHunterWeaponRangeMeters();
+	float weaponRange = getEngageRangeMeters();
 	float hysteresis = weaponRange * 0.5f;
 	if (hasFollowedAttacker && followedDistance <= weaponRange &&
 			!(nearestDistance + hysteresis < followedDistance)) {
@@ -2831,8 +4215,7 @@ ManagedReference<CreatureObject*> SimHunterController::engageActiveAttacker(
 			currentFollow->getObjectID() == attacker->getObjectID()) {
 		if (targetOid != 0 && targetOid == attacker->getObjectID() &&
 				targetMatchesSpecies(attacker.get()) &&
-				hunter->getDistanceTo(attacker) >
-					SimPlayerManager::instance()->getPveHunterWeaponRangeMeters())
+				hunter->getDistanceTo(attacker) > getEngageRangeMeters())
 			moveToTarget();
 		return attacker;
 	}
@@ -2860,8 +4243,12 @@ void SimHunterController::selectTarget(AiAgent* target) {
 		targetMissionWave = missionHuntOrder && SimPlayerManager::instance()->
 			isPveMissionBoardEnabled() && isMissionWaveMob(target);
 		destructionHandled = false;
-		SimPlayerManager::instance()->recordPveHunterPhase(identityId,
-			agent == nullptr ? 0 : agent->getObjectID(), getPhaseName(), targetOid);
+		if (earlyGameActive) {
+			earlyGameScanBearingVisits = 0;
+			setEarlyGamePhase(EARLY_ENGAGE);
+		} else
+			SimPlayerManager::instance()->recordPveHunterPhase(identityId,
+				agent == nullptr ? 0 : agent->getObjectID(), getPhaseName(), targetOid);
 	}
 
 	moveToTarget();
@@ -2878,8 +4265,7 @@ void SimHunterController::moveToTarget() {
 		return;
 	}
 
-	if (agent->getDistanceTo(target) <=
-			SimPlayerManager::instance()->getPveHunterWeaponRangeMeters()) {
+	if (agent->getDistanceTo(target) <= getEngageRangeMeters()) {
 		pursuing = false;
 		engageTarget();
 		return;
@@ -3035,8 +4421,7 @@ void SimHunterController::engageTarget() {
 			!target->isAttackableBy(agent.get()))
 		return;
 
-	if (agent->getDistanceTo(target) >
-			SimPlayerManager::instance()->getPveHunterWeaponRangeMeters()) {
+	if (agent->getDistanceTo(target) > getEngageRangeMeters()) {
 		moveToTarget();
 		return;
 	}
@@ -3288,9 +4673,20 @@ void SimHunterController::registerTargetObserver(uint64 target) {
 
 void SimHunterController::onHuntDestruction(uint64 destroyedTargetOid,
 		bool participantVerified) {
-	if (!orderActive || destroyedTargetOid == 0 || targetOid != destroyedTargetOid ||
+	if ((!orderActive && !earlyGameActive) || destroyedTargetOid == 0 ||
+			targetOid != destroyedTargetOid ||
 			destructionHandled)
 		return;
+
+	if (earlyGameActive) {
+		earlyGameDestroyedTargetOid.store(destroyedTargetOid,
+			std::memory_order_release);
+		earlyGameDestroyedParticipantVerified.store(participantVerified,
+			std::memory_order_release);
+		earlyGameDestructionPending.store(true, std::memory_order_release);
+		scheduleActiveTick(100);
+		return;
+	}
 
 	destructionHandled = true;
 	dropTargetObserver();

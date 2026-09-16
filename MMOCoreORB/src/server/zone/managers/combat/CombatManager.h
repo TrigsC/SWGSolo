@@ -123,6 +123,14 @@ public:
 	bool startCombat(CreatureObject* attacker, TangibleObject* defender, bool lockDefender = true, bool allowIncapTarget = false) const;
 
 	/**
+	 * Estimates the damage an NPC defender takes after its armor and damage-type
+	 * resistance are applied. This is read-only combat math for simulation
+	 * decisions; it does not mutate either object.
+	 */
+	float estimateDamageAfterMitigation(AiAgent* defender,
+		WeaponObject* weapon, float rawDamage) const;
+
+	/**
 	 * Attempts to stop combat
 	 * @pre { attacker locked }
 	 * @post { attacker locked }

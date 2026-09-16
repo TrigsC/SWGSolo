@@ -665,6 +665,23 @@ SimPlayerManagerConfig = {
         heartbeatSeconds = 10,
     },
 
+    -- F_0.9.6-D1 sim-bot combat observability -> bin/log/simcombat.log.
+    -- This is read-only instrumentation for the AI decision path. It is
+    -- compiled in and free when false; flipping it needs no rebuild.
+    -- Every line is key=value: t=<ms> run=<id> ev=<EVENT> oid=<oid> ...
+    combatDiag = {
+        logging = false,
+        -- Include the parity harness kill target so the creature's own AI
+        -- scheduling path is visible alongside the sim bot.
+        traceSpawnedTargets = true,
+        -- Sized for the real 400 ms behaviour cadence plus transition and
+        -- heartbeat lines during a bounded diagnostic run.
+        maxLinesPerAgent = 2000,
+        -- The emitting lane runs at pveConfig.maintenanceIntervalSeconds;
+        -- effective cadence is clamped up to that interval.
+        heartbeatSeconds = 30,
+    },
+
     -- P.8.7 destroy-mission BOARD diagnostics -> bin/log/missiondiag.log.
     -- Offer generation rejects with bare `continue`/`return false` and the
     -- abandon reason is then flattened to the generic "abandoned" that
@@ -1184,7 +1201,11 @@ SimPlayerManagerConfig = {
                 {op="recordSkill", identityIndex=0, xpType="combat_marksman_novice", freeGrant=true},
                 {op="recordSkill", identityIndex=0, xpType="combat_marksman_novice", expectReject=true},
                 {op="assertSkill", identityIndex=0, xpType="combat_marksman_novice"}}},
-            {name="training_gate_off_refuses", budgetMs=300000, steps={
+            {name="training_gate_off_refuses", budgetMs=300000,
+                -- Asserts the gate-OFF refusal branch and arms nothing itself,
+                -- so it requires the shipped default. Arming trainingEnabled
+                -- in configuration inverts what this scenario tests.
+                requiresGatesOff={"trainingEnabled"}, steps={
                 {op="trainSkill", identityIndex=1, skillName="combat_brawler_novice", freeGrant=true, expectReject=true},
                 {op="assertTrainingCounter", counter="training.refusedGate", expect="1"}}},
             {name="training_derived_spend_and_tier", budgetMs=300000, steps={
@@ -1222,7 +1243,12 @@ SimPlayerManagerConfig = {
             {name="training_scale_2000_live_roster", budgetMs=300000, steps={
                 {op="seedSyntheticRoster", amount=2000},
                 {op="assertTrainingScale", amount=2000}}},
-            {name="unarmed_novice_kills_nuna", budgetMs=600000, steps={
+            {name="unarmed_novice_kills_nuna", budgetMs=600000,
+                -- Needs the kill-XP capability gate: awaitKillTargetDeath polls
+                -- for exact XP rows, so with awardKillXp off it can only ever
+                -- time out, which reads as broken combat rather than as the
+                -- misconfiguration it is.
+                requiresGates={"awardKillXp"}, steps={
                 {op="setNoviceGate", expect="true"},
                 {op="mintIdentity", profession="brawler", trainingPlan="brawler", identityRef="noviceBot"},
                 {op="assertPlanOrder", identityRef="noviceBot", skillName="combat_brawler_novice"},
@@ -1333,7 +1359,9 @@ SimPlayerManagerConfig = {
                 {op="assertPlanLoadError", trainingPlan="invalid_weapon_probe", expect="invalid_weapon_type"}}},
             {name="novice_box_precondition_refuses_body", budgetMs=300000, steps={
                 {op="setNoviceGate", expect="true"},
-                {op="mintIdentity", profession="brawler", trainingPlan="brawler", identityRef="notReadyBot"},
+                -- governed=true: this scenario tests the governor's plan-ready
+                -- refusal, so its identity must stay under governor management.
+                {op="mintIdentity", profession="brawler", trainingPlan="brawler", identityRef="notReadyBot", governed=true},
                 {op="deleteProgressionRow", identityRef="notReadyBot"},
                 {op="assertBodyLive", identityRef="notReadyBot", expect="0"},
                 -- Delete this scenario's progression row FIRST so no orphan is
@@ -1529,7 +1557,8 @@ SimPlayerManagerConfig = {
                 {op="assertXp", identityIndex=0, xpType="harness_kill_global", expect="170"},
                 {op="assertCounterDelta", counter="killXp.skippedZero", expect="4"},
                 {op="assertCounterDelta", counter="rejectedInvalidAmount", expect="0"}}},
-            {name="harness_bot_kills_nuna_and_earns_xp", budgetMs=600000, steps={
+            {name="harness_bot_kills_nuna_and_earns_xp", budgetMs=600000,
+                requiresGates={"awardKillXp"}, steps={
                 {op="mintIdentity", identityRef="killBot"},
                 {op="respawnBody", identityRef="killBot"},
                 {op="spawnKillTarget", identityRef="killBot"},
@@ -1553,6 +1582,124 @@ SimPlayerManagerConfig = {
                     expect="killTargetCombatGeneral"},
                 {op="deleteIdentity", identityRef="killBot"},
                 {op="runReaper", force=true}}},
+            {name="multi_goal_plan_topology_and_scale", budgetMs=300000, steps={
+                -- assertPlanScale independently walks every goal's prerequisite
+                -- closure, checks the Kahn order has no duplicates, and pins
+                -- the measured 63-box / 250-point result.
+                {op="assertPlanScale", trainingPlan="pve_melee_medic",
+                    boxCount=63, totalPoints=250}}},
+            {name="scalar_goal_skill_backward_compatibility", budgetMs=300000, steps={
+                {op="mintIdentity", profession="brawler", trainingPlan="brawler",
+                    identityRef="scalarGoalBot"},
+                {op="assertPlanOrder", identityRef="scalarGoalBot",
+                    skillName="combat_brawler_novice"},
+                {op="deleteProgressionRow", identityRef="scalarGoalBot"},
+                {op="deleteIdentity", identityRef="scalarGoalBot"}}},
+            {name="deferred_box_blocks_when_early_game_is_off", budgetMs=300000, steps={
+                {op="setTrainingGate", expect="true"},
+                {op="mintIdentity", profession="brawler",
+                    identityRef="earlyBlockedBot"},
+                {op="reassignPlan", identityRef="earlyBlockedBot",
+                    trainingPlan="test_defer_medic"},
+                {op="trainSkill", identityRef="earlyBlockedBot",
+                    skillName="science_medic_novice", freeGrant=true},
+                {op="setEarlyGameGate", expect="false"},
+                {op="flushNow", force=true},
+                -- The explicit freeGrant bootstraps science_medic_novice,
+                -- whose prerequisite-free box is not medical-funded. The
+                -- remaining injury box is still the next step when the master
+                -- gate is off: a deferred type is BLOCKED, never skipped.
+                {op="assertNextSkill", identityRef="earlyBlockedBot",
+                    skillName="science_medic_injury_01", xpType="medical"},
+                {op="deleteProgressionRow", identityRef="earlyBlockedBot"},
+                {op="deleteIdentity", identityRef="earlyBlockedBot"}}},
+            {name="deferred_box_skips_and_mobile_damage_when_on", budgetMs=600000, steps={
+                {op="setTrainingGate", expect="true"},
+                {op="setEarlyGameGate", expect="true"},
+                {op="setRealWeaponDamageGate", expect="false"},
+                {op="mintIdentity", profession="brawler",
+                    identityRef="earlyStepBot"},
+                {op="reassignPlan", identityRef="earlyStepBot",
+                    trainingPlan="test_onehand_weapon"},
+                {op="trainSkill", identityRef="earlyStepBot",
+                    skillName="combat_brawler_novice", freeGrant=true},
+                {op="flushNow", force=true},
+                {op="assertNextSkill", identityRef="earlyStepBot",
+                    skillName="combat_brawler_1handmelee_01", xpType="combat_meleespecialize_onehand"},
+                {op="respawnBody", identityRef="earlyStepBot"},
+                {op="assertWeaponXpType", identityRef="earlyStepBot",
+                    xpType="combat_meleespecialize_onehand", minDamage=25, maxDamage=40},
+                {op="mintIdentity", profession="brawler",
+                    identityRef="earlyStepMedicBot"},
+                {op="reassignPlan", identityRef="earlyStepMedicBot",
+                    trainingPlan="test_defer_medic"},
+                {op="trainSkill", identityRef="earlyStepMedicBot",
+                    skillName="science_medic_novice", freeGrant=true},
+                {op="flushNow", force=true},
+                -- With early-game deferral on, the only remaining box is
+                -- explicitly deferred medical, so the scorer graduates but
+                -- reports it.
+                {op="assertActivity", identityRef="earlyStepMedicBot", expect="hunt",
+                    graduated=true, stalledBox="science_medic_injury_01"},
+                {op="destroyBody", identityRef="earlyStepBot"},
+                {op="deleteProgressionRow", identityRef="earlyStepBot"},
+                {op="deleteIdentity", identityRef="earlyStepBot"},
+                {op="deleteProgressionRow", identityRef="earlyStepMedicBot"},
+                {op="deleteIdentity", identityRef="earlyStepMedicBot"}}},
+            {name="real_weapon_damage_template_value_when_on", budgetMs=300000, steps={
+                {op="setTrainingGate", expect="true"},
+                {op="setEarlyGameGate", expect="true"},
+                {op="setRealWeaponDamageGate", expect="true"},
+                {op="mintIdentity", profession="brawler",
+                    identityRef="realDamageBot"},
+                {op="reassignPlan", identityRef="realDamageBot",
+                    trainingPlan="test_onehand_weapon"},
+                {op="trainSkill", identityRef="realDamageBot",
+                    skillName="combat_brawler_novice", freeGrant=true},
+                {op="flushNow", force=true},
+                {op="respawnBody", identityRef="realDamageBot"},
+                {op="assertWeaponXpType", identityRef="realDamageBot",
+                    xpType="combat_meleespecialize_onehand", minDamage=20, maxDamage=30},
+                {op="destroyBody", identityRef="realDamageBot"},
+                {op="deleteProgressionRow", identityRef="realDamageBot"},
+                {op="deleteIdentity", identityRef="realDamageBot"}}},
+            {name="fundable_graduation_and_grind_order_guard", budgetMs=900000, steps={
+                {op="setTrainingGate", expect="true"},
+                {op="setEarlyGameGate", expect="true"},
+                {op="mintIdentity", profession="brawler",
+                    identityRef="midLadderBot"},
+                {op="reassignPlan", identityRef="midLadderBot",
+                    trainingPlan="test_graduation_tiny"},
+                {op="trainSkill", identityRef="midLadderBot",
+                    skillName="combat_brawler_novice", freeGrant=true},
+                {op="mintIdentity", profession="brawler",
+                    identityRef="graduatedBot"},
+                {op="reassignPlan", identityRef="graduatedBot",
+                    trainingPlan="test_graduation_tiny"},
+                -- Free-grant all three fundable boxes. The four-box union then
+                -- leaves only science_medic_injury_01 deferred.
+                {op="trainSkill", identityRef="graduatedBot",
+                    skillName="combat_brawler_novice", freeGrant=true},
+                {op="assertSkill", identityRef="graduatedBot",
+                    skillName="combat_brawler_novice"},
+                {op="trainSkill", identityRef="graduatedBot",
+                    skillName="combat_brawler_1handmelee_01", freeGrant=true},
+                {op="trainSkill", identityRef="graduatedBot",
+                    skillName="science_medic_novice", freeGrant=true},
+                {op="flushNow", force=true},
+                {op="assertActivity", identityRef="graduatedBot", expect="hunt",
+                    graduated=true, stalledBox="science_medic_injury_01"},
+                {op="assertActivity", identityRef="midLadderBot", expect="grind",
+                    graduated=false},
+                {op="respawnBody", identityRef="midLadderBot"},
+                {op="flushNow", force=true},
+                -- The same scorer predicate is applied before demand dispatch.
+                {op="assertHuntOrder", identityRef="midLadderBot", expect="0"},
+                {op="destroyBody", identityRef="midLadderBot"},
+                {op="deleteProgressionRow", identityRef="midLadderBot"},
+                {op="deleteIdentity", identityRef="midLadderBot"},
+                {op="deleteProgressionRow", identityRef="graduatedBot"},
+                {op="deleteIdentity", identityRef="graduatedBot"}}},
         },
     },
 
@@ -1564,6 +1711,87 @@ SimPlayerManagerConfig = {
         enabled = false,
         awardKillXp = false,
         trainingEnabled = false,
+        earlyGameEnabled = false,
+        earlyGame = {
+            realWeaponDamage = false,
+            -- P.10g grind-loop defaults. The master gate above remains OFF;
+            -- these values only become active when earlyGameEnabled is on.
+            grindAnchorMinMeters = 400,
+            grindAnchorMaxMeters = 900,
+            anchorMaxAttempts = 8,
+            anchorArriveMeters = 32,
+            scanMaxAttempts = 3,
+            scanRetrySeconds = 5,
+            -- No floor for novices: the weak creatures around a city (worrts,
+            -- lesser womp rats, mynocks, kreetles) die in ~5-13 s unarmed, and a
+            -- 20 s floor left no eligible target inside the level band (quick
+            -- check 20260915-162145). The band and maxTtkSeconds still guard.
+            minTtkSeconds = 0,
+            maxTtkSeconds = 900,
+            -- Level band around the novice's skill tier (its level, rising as it
+            -- trains): targets from tier - levelBandBelow to tier + levelBandAbove,
+            -- preferring the closest level and taking the band edges only when
+            -- nothing closer is in range. Self-defence uses only the upper bound.
+            -- The TTK window above still rejects fights that cannot be won.
+            levelBandBelow = 3,
+            levelBandAbove = 3,
+            -- Seek targets that do not pull their group into the fight: a novice
+            -- dies to anything that swarms it. Only PACK creatures assist their
+            -- social group (AiAgent::notifyPackMobs), so herds such as kreetles and
+            -- minor worrts are fair game. Self-defence still fights back.
+            avoidGroupAggroTargets = true,
+            -- Grind at the static spawner points around the novice's city (the spawn
+            -- eggs placed by screenplays/spawner/*_city_spawners.lua) before taking
+            -- missions: visit active ones in rotation, scan, move on; fall back to
+            -- the bearing ring when a city has none. No location is hard-coded -
+            -- whatever a spawner produces now is what the scan finds.
+            roamCitySpawners = true,
+            spawnerSearchRadiusMeters = 1000,
+            skipInactiveSpawners = true,
+            -- Close enough to a spawner for the scan to cover its pod (spawns land
+            -- within ~10 m); final path legs failed 50-70 m short in live checks.
+            spawnerArriveMeters = 60,
+            -- A creature whose path failed is skipped this long, and up to this many
+            -- are remembered at once, so several unreachable creatures around one
+            -- spot are not reselected in turn (TRIP-verify 20260915-185828).
+            unreachableSkipSeconds = 60,
+            unreachableSkipMaxTargets = 8,
+            assumedHitRate = 0.75,
+            fleeHamFraction = 0.30,
+            restHamFraction = 0.70,
+            -- Default-off movement telemetry for early-game bodies: controller
+            -- state, move requests, path generations and position on the
+            -- dashboard earlyGame row. Hot-reloaded; no restart needed.
+            movementTelemetry = false,
+            -- Default-off combat telemetry for early-game bodies: HAM, the
+            -- defender list (with the target-selection filter each one fails)
+            -- and the self-defence decision on every tick, plus the captured
+            -- killing blow at death. Dashboard earlyGame row `combat`; core3.log
+            -- SimPveEarlyGameCombat / SimPveEarlyGameDeath. Hot-reloaded.
+            combatTelemetry = false,
+            -- Grind anchors avoid places a novice recently died: an anchor whose
+            -- overland leg passes within this radius of one of the last
+            -- deathAvoidMemory deaths (younger than deathAvoidSeconds) is
+            -- skipped. 0 disables. Verification 20260914-173645: two deaths on
+            -- one deterministic route.
+            deathAvoidRadiusMeters = 150,
+            deathAvoidMemory = 4,
+            deathAvoidSeconds = 3600,
+            -- Clone wounds (pveConfig combat.cloneWoundAmount) are sized for
+            -- multi-thousand-HAM hunter bodies; 500 wounds pinned every novice
+            -- pool at 1 HP (diagnosis 20260914-184412). A planned novice body caps
+            -- them at this fraction of each pool's maximum. 0 heals every wound
+            -- on death until medic bots can heal wounds at med centers. Clamped
+            -- to at most 1 - restHamFraction so a wounded novice can finish resting.
+            cloneWoundMaxFraction = 0,
+            deferredXpTypes = {"medical"},
+            weaponsByXpType = {
+                combat_meleespecialize_onehand = "object/weapon/melee/knife/knife_stone.iff",
+                combat_meleespecialize_twohand = "object/weapon/melee/axe/axe_heavy_duty.iff",
+                combat_meleespecialize_polearm = "object/weapon/melee/polearm/lance_staff_wood_s1.iff",
+                combat_meleespecialize_unarmed = "",
+            },
+        },
         trainingMaxPerTick = 4,
         trainingSweepBatch = 64,
         killXpRate = 1.0,
@@ -1582,6 +1810,59 @@ SimPlayerManagerConfig = {
                 profession = "brawler",
                 weaponTemplate = "",
                 weaponType = "not_a_weapon_type",
+            },
+            {
+                name = "pve_melee_medic",
+                -- Explicit leaves for Brawler, Swordsman, Pikeman, Fencer
+                -- 32xx, and Medic 2xxx. The manager derives the complete
+                -- transitive union, so this remains a retunable Lua template.
+                -- Branch identity for the three partials is confirmed from
+                -- training.plans[].goalSkillDetails on the dashboard, which
+                -- publishes each goal box's granted skillMods and commands.
+                -- All four branches of a profession cost the same (measured:
+                -- 47 pts at depth 3, 44 at depth 2 for 1hsword; 20 at depth 2
+                -- for medic), so a wrong branch is a gameplay mismatch fixable
+                -- here without a rebuild, never a skill-point budget overrun.
+                goalSkills = {
+                    "combat_brawler_master",
+                    "combat_2hsword_master",
+                    "combat_polearm_master",
+                    -- Fencer 3xxx, intended: Expert Fencing Stances and Grips
+                    -- (melee + ranged defense)
+                    "combat_1hsword_accuracy_03",
+                    -- Fencer x2xx, intended: Advanced Footwork
+                    -- (knockdown defense)
+                    "combat_1hsword_speed_02",
+                    -- Medic 2xxx, intended: First Aid II (grants firstaid)
+                    "science_medic_injury_02",
+                },
+                profession = "brawler",
+                weaponTemplate = "",
+                weaponType = "unarmed",
+            },
+            {
+                name = "test_defer_medic",
+                goalSkills = { "science_medic_injury_01" },
+                profession = "brawler",
+                weaponTemplate = "",
+                weaponType = "unarmed",
+            },
+            {
+                name = "test_onehand_weapon",
+                goalSkills = { "combat_brawler_1handmelee_01" },
+                profession = "brawler",
+                weaponTemplate = "",
+                weaponType = "onehandmelee",
+            },
+            {
+                name = "test_graduation_tiny",
+                goalSkills = {
+                    "combat_brawler_1handmelee_01",
+                    "science_medic_injury_01",
+                },
+                profession = "brawler",
+                weaponTemplate = "",
+                weaponType = "unarmed",
             },
         },
         reaper = {
@@ -1602,6 +1883,17 @@ SimPlayerManagerConfig = {
             enabled = false,
             retireLegacyHunters = false,
             bodyTemplate = "sim_playerbot_novice",
+            -- HAM for every pool of a planned novice body (health/action/mind and
+            -- their secondaries), like a starting player. 0 keeps the mobile
+            -- template: 400-500 primaries, secondaries at 1/100 of that.
+            bodyHam = 800,
+            -- Where planned novices spawn and grind, overriding each identity's
+            -- own home city (a city name from the shuttleport list below).
+            -- Keren's shuttle pad sits on a navmesh island that cannot route to
+            -- the city exits (verification 20260914), so novices start from Mos
+            -- Eisley. Empty = use the identity's own home city.
+            spawnPlanet = "tatooine",
+            spawnCity = "mos_eisley",
             distribution = {
                 { profession = "brawler", trainingPlan = "brawler", count = 1 },
             },
@@ -1800,6 +2092,8 @@ SimPlayerManagerConfig = {
             resumeHamPct = 70,
             maxRetreatCycles = 3,
             retreatRangeMeters = 40,
+            -- Planned novices cap this per pool with
+            -- playerBotProgression.earlyGame.cloneWoundMaxFraction.
             cloneWoundAmount = 500,
             huntActiveTickSeconds = 2,
             huntQuota = 1,

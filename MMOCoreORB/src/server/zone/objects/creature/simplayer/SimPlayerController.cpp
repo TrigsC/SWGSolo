@@ -613,6 +613,54 @@ void SimPathFindTask::run() {
                 path = recastPath;
             } else {
                 delete recastPath;
+                // Diagnostic only, on failure only, and only while the owning
+                // controller enabled it: re-ask the same query in three narrower
+                // forms so a failed leg names its cause. getRecastPath with a
+                // null path answers "polys found and a route exists" without
+                // building one. Nothing here changes the (already null) result.
+                if (navArea != nullptr &&
+                        strongCtrl->isHybridFailureProbeEnabled()) {
+                    float probeLength = 0.f;
+                    bool startPoly = PathFinderManager::instance()->getRecastPath(
+                        recastStart, recastStart, navArea, nullptr, probeLength, true);
+                    probeLength = 0.f;
+                    bool endPoly = PathFinderManager::instance()->getRecastPath(
+                        recastEnd, recastEnd, navArea, nullptr, probeLength, true);
+                    probeLength = 0.f;
+                    bool partialRoute = PathFinderManager::instance()->getRecastPath(
+                        recastStart, recastEnd, navArea, nullptr, probeLength, true);
+                    Vector3 areaPosition = navArea->getPosition();
+                    float areaRadius = navArea->getRadius();
+                    bool startInArea = recastStart.distanceTo2d(areaPosition) <= areaRadius;
+                    bool endInArea = recastEnd.distanceTo2d(areaPosition) <= areaRadius;
+                    float startTerrainZ = zone == nullptr ? 0.f :
+                        zone->getHeight(recastStart.getX(), recastStart.getY());
+                    strongCtrl->recordHybridRecastFailureProbe(startPoly, endPoly,
+                        partialRoute, startInArea, endInArea, recastStart,
+                        recastEnd, startTerrainZ);
+
+                    // Search-limit versus disconnected-mesh discriminator: how far
+                    // the partial route actually reaches, and whether a strict route
+                    // to the midpoint exists.
+                    Vector<WorldCoordinates> partialPath;
+                    probeLength = 0.f;
+                    PathFinderManager::instance()->getRecastPath(recastStart,
+                        recastEnd, navArea, &partialPath, probeLength, true);
+                    Vector3 partialEnd = partialPath.size() > 0 ?
+                        partialPath.get(partialPath.size() - 1).getWorldPosition() :
+                        recastStart;
+                    Vector3 midpoint((recastStart.getX() + recastEnd.getX()) * 0.5f,
+                        (recastStart.getY() + recastEnd.getY()) * 0.5f,
+                        (recastStart.getZ() + recastEnd.getZ()) * 0.5f);
+                    if (zone != nullptr)
+                        midpoint.setZ(zone->getHeight(midpoint.getX(), midpoint.getY()));
+                    probeLength = 0.f;
+                    bool midStrict = PathFinderManager::instance()->getRecastPath(
+                        recastStart, midpoint, navArea, nullptr, probeLength, false);
+                    strongCtrl->recordHybridRecastPartialProbe(partialPath.size(),
+                        partialEnd, partialEnd.distanceTo2d(recastEnd),
+                        partialEnd.distanceTo2d(recastStart), midStrict);
+                }
             }
         } else if (useDirectOverlandPath) {
             // This is an explicit overland request, not a guess based on the
@@ -2295,6 +2343,7 @@ void SimPlayerController::onPathTaskFailed(bool pathUsesNavmesh) {
         onPathFailed();
         return;
     }
+    hybridDiagNavmeshTaskFailures.fetch_add(1, std::memory_order_relaxed);
 
     int retryBudget = SimPlayerManager::instance()->getPveNavmeshRepathTries();
     if (navmeshRepathAttempts < retryBudget) {
@@ -2471,7 +2520,9 @@ void SimPlayerController::requestHybridPath() {
     Zone* zone = agent->getZone();
     Vector3 currentPosition = agent->getWorldPosition();
 
+    hybridDiagOnMesh.store(onMeshMode, std::memory_order_relaxed);
     if (!onMeshMode) {
+        hybridDiagLeg.store(HYBRID_LEG_OVERLAND_FINAL, std::memory_order_relaxed);
         scheduleHybridDirectPath(finalDestination,
             HYBRID_LEG_OVERLAND_FINAL);
         return;
@@ -2479,13 +2530,17 @@ void SimPlayerController::requestHybridPath() {
 
     ManagedReference<NavArea*> currentArea;
     if (!findNavAreaAt(zone, currentPosition, currentArea)) {
+        hybridDiagCurrentAreaOid.store(0, std::memory_order_relaxed);
         onPathTaskFailed(true);
         return;
     }
+    hybridDiagCurrentAreaOid.store(currentArea->getObjectID(),
+        std::memory_order_relaxed);
 
     ManagedReference<NavArea*> targetArea;
     bool targetOnSameMesh = findNavAreaAt(zone, finalDestination, targetArea) &&
         targetArea == currentArea;
+    hybridDiagTargetOnSameMesh.store(targetOnSameMesh, std::memory_order_relaxed);
 
     Vector3 pathEnd = finalDestination;
     HybridLeg leg = HYBRID_LEG_NAVMESH_FINAL;
@@ -2495,9 +2550,14 @@ void SimPlayerController::requestHybridPath() {
         ManagedReference<NavArea*> exitArea;
         if (!resolveHybridExit(zone, currentPosition, boundary, egress,
                 exitArea)) {
+            hybridDiagExitResolved.store(false, std::memory_order_relaxed);
+            hybridDiagExitResolveFailures.fetch_add(1, std::memory_order_relaxed);
             onPathTaskFailed(true);
             return;
         }
+        hybridDiagExitResolved.store(true, std::memory_order_relaxed);
+        hybridDiagExitAreaOid.store(exitArea == nullptr ? 0 :
+            exitArea->getObjectID(), std::memory_order_relaxed);
 
         // The resolved area is the one used for the recast leg. This also
         // makes the area provenance explicit instead of inferring it from
@@ -2514,6 +2574,8 @@ void SimPlayerController::requestHybridPath() {
     destinationLocal = pathEnd;
     destinationCell = nullptr;
     hybridLeg = leg;
+    hybridDiagLeg.store(leg, std::memory_order_relaxed);
+    hybridDiagRecastRequests.fetch_add(1, std::memory_order_relaxed);
     stuckWatchdogCount = 0;
     lastWatchdogPos = currentPosition;
     state = CALCULATING_PATH;
@@ -4321,13 +4383,90 @@ void SimPlayerController::clearHybridMovementOnCancellation() {
 }
 
 uint64 SimPlayerController::advanceWorkLoopGeneration(const String& reason) {
-    (void)reason;
+    {
+        Locker reasonLock(&lastWorkLoopAdvanceReasonMutex);
+        lastWorkLoopAdvanceReason = reason;
+    }
     workLoopGeneration++;
 
     if (workLoopGeneration == 0)
         workLoopGeneration = 1;
 
     return workLoopGeneration;
+}
+
+void SimPlayerController::recordHybridRecastFailureProbe(bool startPoly,
+        bool endPoly, bool partialRoute, bool startInArea, bool endInArea,
+        const Vector3& start, const Vector3& end, float startTerrainZ) {
+    hybridProbeStartPoly.store(startPoly, std::memory_order_relaxed);
+    hybridProbeEndPoly.store(endPoly, std::memory_order_relaxed);
+    hybridProbePartialRoute.store(partialRoute, std::memory_order_relaxed);
+    hybridProbeStartInArea.store(startInArea, std::memory_order_relaxed);
+    hybridProbeEndInArea.store(endInArea, std::memory_order_relaxed);
+    hybridProbeStartX.store(start.getX(), std::memory_order_relaxed);
+    hybridProbeStartY.store(start.getY(), std::memory_order_relaxed);
+    hybridProbeStartZ.store(start.getZ(), std::memory_order_relaxed);
+    hybridProbeStartTerrainZ.store(startTerrainZ, std::memory_order_relaxed);
+    hybridProbeEndX.store(end.getX(), std::memory_order_relaxed);
+    hybridProbeEndY.store(end.getY(), std::memory_order_relaxed);
+    hybridProbeEndZ.store(end.getZ(), std::memory_order_relaxed);
+    hybridProbeCount.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SimPlayerController::recordHybridRecastPartialProbe(int partialPoints,
+        const Vector3& partialEnd, float partialEndToTarget,
+        float partialEndFromStart, bool midStrict) {
+    hybridProbePartialPoints.store(partialPoints, std::memory_order_relaxed);
+    hybridProbePartialEndX.store(partialEnd.getX(), std::memory_order_relaxed);
+    hybridProbePartialEndY.store(partialEnd.getY(), std::memory_order_relaxed);
+    hybridProbePartialEndToTarget.store(partialEndToTarget,
+        std::memory_order_relaxed);
+    hybridProbePartialEndFromStart.store(partialEndFromStart,
+        std::memory_order_relaxed);
+    hybridProbeMidStrict.store(midStrict, std::memory_order_relaxed);
+}
+
+String SimPlayerController::getHybridPathDiagLine() const {
+    StringBuffer line;
+    line << "leg=" << hybridDiagLeg.load(std::memory_order_relaxed)
+        << " onMesh=" << (hybridDiagOnMesh.load(std::memory_order_relaxed) ? 1 : 0)
+        << " currentArea=" << hybridDiagCurrentAreaOid.load(std::memory_order_relaxed)
+        << " targetOnSameMesh=" <<
+            (hybridDiagTargetOnSameMesh.load(std::memory_order_relaxed) ? 1 : 0)
+        << " exitResolved=" << (hybridDiagExitResolved.load(std::memory_order_relaxed) ? 1 : 0)
+        << " exitArea=" << hybridDiagExitAreaOid.load(std::memory_order_relaxed)
+        << " recastRequests=" << hybridDiagRecastRequests.load(std::memory_order_relaxed)
+        << " exitResolveFailures=" <<
+            hybridDiagExitResolveFailures.load(std::memory_order_relaxed)
+        << " navmeshTaskFailures=" <<
+            hybridDiagNavmeshTaskFailures.load(std::memory_order_relaxed)
+        << " probes=" << hybridProbeCount.load(std::memory_order_relaxed)
+        << " probeStartPoly=" << (hybridProbeStartPoly.load(std::memory_order_relaxed) ? 1 : 0)
+        << " probeEndPoly=" << (hybridProbeEndPoly.load(std::memory_order_relaxed) ? 1 : 0)
+        << " probePartialRoute=" << (hybridProbePartialRoute.load(std::memory_order_relaxed) ? 1 : 0)
+        << " probeStartInArea=" << (hybridProbeStartInArea.load(std::memory_order_relaxed) ? 1 : 0)
+        << " probeEndInArea=" << (hybridProbeEndInArea.load(std::memory_order_relaxed) ? 1 : 0)
+        << " start=" << hybridProbeStartX.load(std::memory_order_relaxed)
+        << "," << hybridProbeStartY.load(std::memory_order_relaxed)
+        << "," << hybridProbeStartZ.load(std::memory_order_relaxed)
+        << " startTerrainZ=" << hybridProbeStartTerrainZ.load(std::memory_order_relaxed)
+        << " end=" << hybridProbeEndX.load(std::memory_order_relaxed)
+        << "," << hybridProbeEndY.load(std::memory_order_relaxed)
+        << "," << hybridProbeEndZ.load(std::memory_order_relaxed)
+        << " partialPoints=" << hybridProbePartialPoints.load(std::memory_order_relaxed)
+        << " partialEnd=" << hybridProbePartialEndX.load(std::memory_order_relaxed)
+        << "," << hybridProbePartialEndY.load(std::memory_order_relaxed)
+        << " partialEndToTarget=" <<
+            hybridProbePartialEndToTarget.load(std::memory_order_relaxed)
+        << " partialEndFromStart=" <<
+            hybridProbePartialEndFromStart.load(std::memory_order_relaxed)
+        << " midStrict=" << (hybridProbeMidStrict.load(std::memory_order_relaxed) ? 1 : 0);
+    return line.toString();
+}
+
+String SimPlayerController::getLastWorkLoopAdvanceReason() const {
+    Locker reasonLock(&lastWorkLoopAdvanceReasonMutex);
+    return lastWorkLoopAdvanceReason;
 }
 
 bool SimPlayerController::isWorkLoopGenerationCurrent(

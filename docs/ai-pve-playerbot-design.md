@@ -522,7 +522,10 @@ The P.10 line is tracked in its own roadmap,
 `docs/1-plans/ROADMAP_p10-playerbot-parity.md`, which holds the nine-chunk
 breakdown (F_0.9.0 store → F_0.9.1 kill XP → F_0.9.2 mission credits →
 F_0.9.3 loot + item vault → F_0.9.4 group dispersal → F_0.9.5 skill training →
-F_0.9.6/F_0.9.7 bazaar → F_0.9.8 allocation policy), the engine-gap analysis
+F_0.9.6 novice early-game loop → F_0.9.7 skill-derived combat abilities →
+F_0.9.8 lair tactics → F_0.9.9/F_0.9.10 bazaar → F_0.9.11 allocation policy;
+the three early-game chunks were inserted on 2026-09-08 and the bazaar work
+renumbered down accordingly), the engine-gap analysis
 per capability, and the owner's decisions. This section records only what
 **F_0.9.0 actually built**, because that is the part the PvE line now depends
 on.
@@ -568,3 +571,90 @@ loop. When F_0.9.1 lands, kill XP is credited from the corpse's `ThreatMap`
 (which already keys every attacker's damage by the weapon's XP type) at the
 `CreatureManager::notifyDestruction` chokepoint — the same place
 `disseminateExperience` runs for players.
+
+## P.10g — Novice early-game loop (F_0.9.6)
+
+F_0.9.0/0.9.1/0.9.5 built a complete progression system and then left it with
+nothing feeding it. A live snapshot on 2026-09-08 showed `killXp.kills = 0`,
+`awards.accepted = 0`, every `demandFamilies[*].signalUnits = 0` and an empty
+mission board against a ~587k meat boot baseline: supply was saturated, so the
+matchmaker issued no orders, so no bot fought, so no XP was earned, so no box
+was ever trained. The novice minted by F_0.9.5 inherited that same demand gate
+and idled identically. This chunk gives a roster PlayerBot an **internally
+motivated** reason to fight, and is deliberately **demand-independent** — that
+is the whole point of it.
+
+**The ladder is a set, not a skill.** `SimBotTrainingPlan.goalSkill` became
+`Vector<String> goalSkills`; the builder unions each goal's transitive closure
+over `getSkillsRequired()` (resetting the cycle guard per goal) and runs one
+Kahn sort over the union. A scalar `goalSkill` still parses as a one-element
+list so the parity matrix is unaffected. The shipped `pve_melee_medic`
+template — Master Brawler, Master Swordsman, Master Pikeman, Fencer 32xx,
+Medic 2xxx — measures **63 boxes / exactly 250 skill points**, the hard cap.
+All four branches of a profession cost identically (47 pts at depth 3, 44 at
+depth 2 for 1hsword; 20 at depth 2 for medic), so which branch a box-count
+shorthand names is a gameplay choice, never a budget risk.
+
+**A weapon drives XP TYPE but not damage.** `CombatManager` reads
+`weapon->getXpType()` (`:1476`, `:1688`) when crediting the threat map, so the
+weapon determines which box a kill funds — which is why weapon selection is
+derived from the cached next training step's `xpType`, not from a static
+per-plan field. Damage is the opposite: `AiAgentImplementation::setWeaponStats()`
+(`:2186-2200`) overwrites the weapon's damage with the *mobile template's*
+values, making gear cosmetic. For roster bots the sim layer restores the
+weapon template's real `minDamage`/`maxDamage`/`attackSpeed` immediately after
+that call — in the sim-layer choreography only, never in the shared AI
+implementation. Two supporting facts: `isPlayerCreature()` reads the template
+(`CreatureObjectImplementation.cpp:4297`), so a bot is never subject to the
+uncertified-player clamp to 5-10 damage; and an agent's weapon lives in the
+`default_weapon` slot, not `hold_r`, so the equip postcondition asserts
+containment plus all four AI weapon accessors plus XP type rather than a slot
+name.
+
+**Target selection may inform, never decide.** TTK is
+`effectiveHam * attackPeriod / (averageEffectiveDamage * hitRate)` where
+`effectiveHam` is the **minimum primary pool** (a creature dies when *any*
+primary is depleted — only secondaries are clamped, `CreatureObject
+Implementation.cpp:1100-1101`) and mitigation comes from the new public
+side-effect-free `CombatManager::estimateDamageAfterMitigation`, which wraps
+both real factors: the armour-rating/piercing power law (`pow(0.50, armor-ap)`
+— a halving per armour level) and the damage-type resist. Mirroring that math
+in the sim layer was rejected as a duplicate that would drift. The estimate can
+only make a target look *easier*, so the level ceiling is the hard guard, not
+the TTK band. **No cheat kills**: server knowledge informs selection only, and
+every kill goes through `CombatManager::startCombat`.
+
+**Deferred is not the same as gated off.** Three of the 63 boxes are Medic
+boxes funded by `medical` XP, which no activity in this chunk produces. Step
+derivation is therefore skip-tolerant against an explicit
+`earlyGame.deferredXpTypes` list and surfaces `training.stalledBoxes`.
+Graduation is "no untrained box remains whose xpType is fundable" — 60 combat
+boxes. It must **never** be derived from whether an XP source is currently
+enabled: `awardKillXp` ships default-off, so a live-source test would declare
+every fresh bot instantly graduated.
+
+**Death is a spawn override, not a relocation.** PlayerBots have no
+`PlayerObject` ghost, so `sendActivateCloneRequest` returns immediately and
+there is no clone prompt. The corpse is destroyed and a *new* body spawns
+later, so `switchZone` on it would move an object about to be deleted. Instead
+the nearest facility is resolved ghost-free via
+`zone->getPlanetaryObjectList("cloningfacility")`, `BuildingObject::getEjectionPoint()`
+supplies the outdoor point, and it is recorded as a per-identity override that
+`spawnPveIdentityBody` consumes and clears. Death finalization has **one
+owner**: whichever observer notices first routes through `onPveHunterDied`,
+which is idempotent — the maintenance sweep previously destroyed corpses
+directly and silently lost the override.
+
+**The arbiter is deliberately two-activity.** One predicate,
+`scorePlayerBotActivity`, is called from both the matchmaker's candidate filter
+and `startOrder`'s dispatch-time recheck; a mid-grind novice is never offered a
+demand order and declines one that races in. Per the F_0.9.5 governor lesson,
+one membership rule written in two places is the shape that drifts. Entering
+grind mode also releases any in-flight order, which would otherwise reserve
+inbound supply forever behind the preempted order branch.
+
+Gates: `playerBotProgression.earlyGameEnabled` and
+`earlyGame.realWeaponDamage`, both default-off, each with its own dedicated
+parity override — sharing the award override or ANDing the configured flag
+reproduces the F_0.9.5 defect that failed live verification in run
+`20260906-104819`. No schema block.

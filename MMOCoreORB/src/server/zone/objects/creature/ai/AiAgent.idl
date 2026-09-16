@@ -400,6 +400,16 @@ class AiAgent extends CreatureObject {
 	@preLocked
 	public native void runBehaviorTree();
 
+	/**
+	 * Copies the state needed by the simulation combat diagnostic.  The
+	 * implementation assembles the value while holding behaviorEventMutex so
+	 * callers never receive the event pointer or reach that private mutex.
+	 */
+	@local
+	@preLocked
+	@read
+	public native string getCombatDiagSnapshotLine();
+
 	@local
 	@preLocked
 	public native void handleException(@dereferenced final Exception e, final string context);

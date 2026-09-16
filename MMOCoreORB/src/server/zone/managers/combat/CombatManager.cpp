@@ -2621,6 +2621,27 @@ int CombatManager::getArmorNpcReduction(AiAgent* defender, int damageType) const
 	return (int)resist;
 }
 
+float CombatManager::estimateDamageAfterMitigation(AiAgent* defender,
+		WeaponObject* weapon, float rawDamage) const {
+	if (defender == nullptr || weapon == nullptr)
+		return 0.f;
+
+	int armorPiercing = weapon->getArmorPiercing();
+	if (weapon->isBroken())
+		armorPiercing = 0;
+
+	float damage = rawDamage;
+	int armorReduction = getArmorNpcReduction(defender,
+		weapon->getDamageType());
+	if (armorReduction >= 0)
+		damage *= getArmorPiercing(defender, armorPiercing);
+
+	if (armorReduction > 0)
+		damage *= (1.f - (armorReduction / 100.f));
+
+	return damage;
+}
+
 int CombatManager::getArmorVehicleReduction(VehicleObject* defender, int damageType) const {
 	float resist = 0;
 

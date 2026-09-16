@@ -103,6 +103,8 @@
 #include "server/zone/objects/creature/commands/JediQueueCommand.h"
 #include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
 #include "server/zone/objects/creature/simplayer/CellNavDiagLog.h"
+#include "server/zone/objects/creature/simplayer/SimCombatDiagLog.h"
+#include "server/zone/objects/creature/simplayer/SimEarlyGameDeathLog.h"
 #include "server/zone/managers/frs/FrsManager.h"
 #include "server/zone/managers/radial/RadialOptions.h"
 
@@ -2864,6 +2866,11 @@ static bool canAffordAttackCommand(AiAgent* agent, const String& commandName) {
 }
 
 bool AiAgentImplementation::selectSpecialAttack() {
+	const bool combatDiagLogging = SimCombatDiagLog::isLoggingEnabled();
+	const uint64 combatDiagOid = combatDiagLogging ? getObjectID() : 0;
+	const bool combatDiagTraced = combatDiagLogging &&
+		SimCombatDiagLog::isTraced(combatDiagOid);
+
     // --- Thrown weapons handling (unchanged) ---
     if (System::random(100) > 95) {
         ManagedReference<WeaponObject*> thrownWeapRef = thrownWeapon.get();
@@ -2917,6 +2924,12 @@ bool AiAgentImplementation::selectSpecialAttack() {
     }
 
     if (attackMap == nullptr || attackMap->isEmpty()) {
+		if (combatDiagTraced) {
+			StringBuffer diag;
+			diag << "candidateCount=0 rejectReason=no_candidates";
+			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
+				diag.toString(), "special_no_candidates");
+		}
 #ifdef DEBUG_AI_ATTACK
         info(true) << "AI_ATTACK: selectSpecialAttack() - attackMap null/empty, "
                    << "falling back to selectDefaultAttack() for "
@@ -2996,6 +3009,7 @@ bool AiAgentImplementation::selectSpecialAttack() {
 
     int bestIdx   = -1;
     int bestScore = -9999;
+	int affordableCandidates = 0;
     
     for (int i = 0; i < attackMap->size(); ++i) {
         String key = attackMap->getCommand(i);
@@ -3004,6 +3018,7 @@ bool AiAgentImplementation::selectSpecialAttack() {
 
         if (!canAffordAttackCommand(asAiAgent(), key))
             continue;
+		affordableCandidates++;
 
         String lower = key.toLowerCase();
         int score    = 0;
@@ -3199,6 +3214,17 @@ bool AiAgentImplementation::selectSpecialAttack() {
 
     // Fallback
     if (bestIdx == -1) {
+		if (combatDiagTraced) {
+			StringBuffer diag;
+			diag << "candidateCount=" << attackMap->size()
+				<< " affordableCandidates=" << affordableCandidates
+				<< " rejectReason=" << (affordableCandidates == 0 ?
+					String("ham_unaffordable") : String("no_candidates"));
+			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
+				diag.toString(), affordableCandidates == 0 ?
+					String("special_ham_unaffordable") :
+					String("special_no_candidates"));
+		}
 #ifdef DEBUG_AI_ATTACK
         info(true) << "AI_ATTACK: selectSpecialAttack - no affordable attack, falling back to default for "
                    << getDisplayedName() << " (" << getObjectID() << ")";
@@ -3212,11 +3238,24 @@ bool AiAgentImplementation::selectSpecialAttack() {
                << " score=" << bestScore << " for "
                << getDisplayedName() << " (" << getObjectID() << ")";
 #endif
+	if (combatDiagTraced) {
+		StringBuffer diag;
+		diag << "candidateCount=" << attackMap->size()
+			<< " affordableCandidates=" << affordableCandidates
+			<< " selectedCommand=" << attackMap->getCommand(bestIdx)
+			<< " rejectReason=none";
+		SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
+			diag.toString(), "special_selected");
+	}
 
     return selectSpecialAttack(bestIdx);
 }
 
 bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
+	const bool combatDiagLogging = SimCombatDiagLog::isLoggingEnabled();
+	const uint64 combatDiagOid = combatDiagLogging ? getObjectID() : 0;
+	const bool combatDiagTraced = combatDiagLogging &&
+		SimCombatDiagLog::isTraced(combatDiagOid);
     // =================================================================
     // FIX: We cannot use generic getAttackMap() here.
     // We must select the SAME map that the scoring function used,
@@ -3258,6 +3297,12 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
     }
 
     if (attackMap == nullptr) {
+		if (combatDiagTraced) {
+			StringBuffer diag;
+			diag << "candidateCount=0 rejectReason=no_candidates";
+			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
+				diag.toString(), "special_no_candidates");
+		}
 #ifdef DEBUG_AI_ATTACK
         info(true) << "AI_ATTACK: selectSpecialAttack(" << attackNum
                    << ") - attackMap == nullptr";
@@ -3271,6 +3316,13 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
     }
 
     if (attackNum >= attackMap->size()) {
+		if (combatDiagTraced) {
+			StringBuffer diag;
+			diag << "candidateCount=" << attackMap->size()
+				<< " rejectReason=no_candidates";
+			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
+				diag.toString(), "special_no_candidates");
+		}
 #ifdef DEBUG_AI_ATTACK
         info(true) << "AI_ATTACK: selectSpecialAttack(" << attackNum
                    << ") - attackNum >= size (" << attackMap->size()
@@ -3282,6 +3334,13 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
     String cmd = attackMap->getCommand(attackNum);
 
     if (cmd.isEmpty()) {
+		if (combatDiagTraced) {
+			StringBuffer diag;
+			diag << "candidateCount=" << attackMap->size()
+				<< " rejectReason=no_candidates";
+			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
+				diag.toString(), "special_no_candidates");
+		}
         return false;
     }
 
@@ -3291,24 +3350,69 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
                << attackNum << " key=" << cmd;
 #endif
 
-    nextActionCRC = cmd.hashCode();
-    nextActionArgs = attackMap->getArguments(attackNum);
+	    nextActionCRC = cmd.hashCode();
+	    nextActionArgs = attackMap->getArguments(attackNum);
 
-    ZoneServer* zoneServer = getZoneServer();
-    if (zoneServer == nullptr) return false;
-    ObjectController* objectController = zoneServer->getObjectController();
-    if (objectController == nullptr) return false;
+	    ZoneServer* zoneServer = getZoneServer();
+	    if (zoneServer == nullptr) {
+		if (combatDiagTraced) {
+			StringBuffer diag;
+			diag << "candidateCount=" << attackMap->size()
+				<< " selectedCommand=" << cmd
+				<< " rejectReason=getQueueCommand_null";
+			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
+				diag.toString(), "special_queue_command_null");
+		}
+		return false;
+	}
+	    ObjectController* objectController = zoneServer->getObjectController();
+	    if (objectController == nullptr) {
+		if (combatDiagTraced) {
+			StringBuffer diag;
+			diag << "candidateCount=" << attackMap->size()
+				<< " selectedCommand=" << cmd
+				<< " rejectReason=getQueueCommand_null";
+			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
+				diag.toString(), "special_queue_command_null");
+		}
+		return false;
+	}
     const QueueCommand* queueCommand = objectController->getQueueCommand(nextActionCRC);
     ManagedReference<SceneObject*> followCopy = getFollowObject().get();
 
-    if (queueCommand == nullptr || followCopy == nullptr)
+	if (queueCommand == nullptr || followCopy == nullptr) {
+		if (combatDiagTraced) {
+			StringBuffer diag;
+			diag << "candidateCount=" << attackMap->size()
+				<< " selectedCommand=" << cmd
+				<< " rejectReason=" << (queueCommand == nullptr ?
+					String("getQueueCommand_null") : String("null_follow"));
+			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
+				diag.toString(), queueCommand == nullptr ?
+				String("special_queue_command_null") :
+				String("special_null_follow"));
+		}
         return false;
+	}
+
+	if (combatDiagTraced) {
+		StringBuffer diag;
+		diag << "candidateCount=" << attackMap->size()
+			<< " selectedCommand=" << cmd << " rejectReason=none";
+		SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
+			diag.toString(), "special_selected");
+	}
 
     return true;
 }
 
 bool AiAgentImplementation::selectDefaultAttack() {
+	const bool combatDiagLogging = SimCombatDiagLog::isLoggingEnabled();
+	const uint64 combatDiagOid = combatDiagLogging ? getObjectID() : 0;
+	const bool combatDiagTraced = combatDiagLogging &&
+		SimCombatDiagLog::isTraced(combatDiagOid);
     String cmd;
+	String selectionSource;
 
     // 1) Template default (may be "defaultattack" as engine fallback)
     if (npcTemplate != nullptr) {
@@ -3317,6 +3421,9 @@ bool AiAgentImplementation::selectDefaultAttack() {
 
     if (!cmd.isEmpty() && !canAffordAttackCommand(asAiAgent(), cmd))
         cmd = "";
+
+    if (!cmd.isEmpty() && cmd.hashCode() != STRING_HASHCODE("defaultattack"))
+        selectionSource = "template_default";
 
     bool treatAsUnset = cmd.isEmpty()
         || cmd.hashCode() == STRING_HASHCODE("defaultattack");
@@ -3423,6 +3530,7 @@ bool AiAgentImplementation::selectDefaultAttack() {
         if (!priorityCommands.isEmpty()) {
              int idx = System::random(priorityCommands.size() - 1);
              cmd = priorityCommands.get(idx);
+			 selectionSource = "priority";
              
              #ifdef DEBUG_AI_ATTACK
              info(true) << "AI_ATTACK: Selected PRIORITY cmd: " << cmd;
@@ -3431,6 +3539,7 @@ bool AiAgentImplementation::selectDefaultAttack() {
         // 2. Otherwise, use the best scored "filler" move
         else if (!bestHeuristicCmd.isEmpty() && bestHeuristicScore > -5) {
              cmd = bestHeuristicCmd;
+			 selectionSource = "heuristic";
              
              #ifdef DEBUG_AI_ATTACK
              info(true) << "AI_ATTACK: Selected HEURISTIC cmd: " << cmd << " (Score: " << bestHeuristicScore << ")";
@@ -3441,6 +3550,7 @@ bool AiAgentImplementation::selectDefaultAttack() {
     // 3) Final fallback
     if (cmd.isEmpty()) {
         cmd = "defaultattack";
+		selectionSource = "defaultattack";
     }
 
     nextActionCRC  = cmd.hashCode();
@@ -3448,15 +3558,51 @@ bool AiAgentImplementation::selectDefaultAttack() {
 
     // --- QUEUE STUFFER FIX (Kept from previous step) ---
     ManagedReference<SceneObject*> target = getFollowObject().get();
+	int diagnosticQueueBefore = -1;
+	int diagnosticQueueAfter = -1;
+	String diagnosticEnqueueOutcome;
     if (target != nullptr) {
         int currentQSize = getCommandQueueSize();
+		if (combatDiagTraced)
+			diagnosticQueueBefore = currentQSize;
         if (currentQSize < 2) {
              #ifdef DEBUG_AI_ATTACK
              info(true) << "AI_ATTACK: Queue low, stuffing: " << cmd;
              #endif
              enqueueCommand(nextActionCRC, 0, target->getObjectID(), "", QueueCommand::NORMAL);
+			 if (combatDiagTraced) {
+				diagnosticEnqueueOutcome = "enqueued";
+				diagnosticQueueAfter = getCommandQueueSize();
+			}
+		} else if (combatDiagTraced) {
+			diagnosticEnqueueOutcome = "suppressed_queue_full";
+			diagnosticQueueAfter = getCommandQueueSize();
         }
+	} else if (combatDiagTraced) {
+		diagnosticQueueBefore = getCommandQueueSize();
+		diagnosticQueueAfter = diagnosticQueueBefore;
+		diagnosticEnqueueOutcome = "suppressed_null_follow";
     }
+
+	if (combatDiagTraced) {
+		StringBuffer selectDiag;
+		selectDiag << "selectedCommand=" << cmd
+			<< " source=" << selectionSource
+			<< " queueSize=" << diagnosticQueueAfter
+			<< " followObjectNull=" << (target == nullptr ? 1 : 0);
+		SimCombatDiagLog::event("ATTACK_SELECT", combatDiagOid,
+			selectDiag.toString(), String("attack_select_") + selectionSource);
+
+		StringBuffer enqueueDiag;
+		enqueueDiag << "path=selectDefaultAttack"
+			<< " queueBefore=" << diagnosticQueueBefore
+			<< " queueAfter=" << diagnosticQueueAfter
+			<< " enqueue_outcome=" << diagnosticEnqueueOutcome;
+		SimCombatDiagLog::event("ATTACK_ENQUEUE", combatDiagOid,
+			enqueueDiag.toString(),
+			String("attack_enqueue_selectDefaultAttack_") +
+				diagnosticEnqueueOutcome);
+	}
 
 #ifdef DEBUG_AI_ATTACK
     info(true) << "AI_ATTACK: selectDefaultAttack final cmd=" << cmd
@@ -3467,29 +3613,84 @@ bool AiAgentImplementation::selectDefaultAttack() {
 }
 
 const QueueCommand* AiAgentImplementation::getNextAction() {
+	const bool combatDiagLogging = SimCombatDiagLog::isLoggingEnabled();
+	const uint64 combatDiagOid = combatDiagLogging ? getObjectID() : 0;
+	const bool combatDiagTraced = combatDiagLogging &&
+		SimCombatDiagLog::isTraced(combatDiagOid);
 	auto zoneServer = getZoneServer();
 
 	if (zoneServer == nullptr) {
+		if (combatDiagTraced) {
+			StringBuffer diag;
+			diag << "nextActionCRC=" << nextActionCRC
+				<< " queueCommandNull=1 reason=zone_null";
+			SimCombatDiagLog::event("NEXT_ACTION", combatDiagOid,
+				diag.toString(), "next_action_null");
+		}
 		return nullptr;
 	}
 
 	auto objectController = zoneServer->getObjectController();
 
 	if (objectController == nullptr) {
+		if (combatDiagTraced) {
+			StringBuffer diag;
+			diag << "nextActionCRC=" << nextActionCRC
+				<< " queueCommandNull=1 reason=object_controller_null";
+			SimCombatDiagLog::event("NEXT_ACTION", combatDiagOid,
+				diag.toString(), "next_action_null");
+		}
 		return nullptr;
 	}
 
-	return objectController->getQueueCommand(nextActionCRC);
+	const QueueCommand* queueCommand =
+		objectController->getQueueCommand(nextActionCRC);
+	if (combatDiagTraced) {
+		StringBuffer diag;
+		diag << "nextActionCRC=" << nextActionCRC
+			<< " queueCommandNull=" << (queueCommand == nullptr ? 1 : 0);
+		SimCombatDiagLog::event("NEXT_ACTION", combatDiagOid,
+			diag.toString(), queueCommand == nullptr ?
+			"next_action_null" : "next_action_resolved");
+	}
+
+	return queueCommand;
 }
 
 int AiAgentImplementation::enqueueAttack(int priority) {
+	const bool combatDiagLogging = SimCombatDiagLog::isLoggingEnabled();
+	const uint64 combatDiagOid = combatDiagLogging ? getObjectID() : 0;
+	const bool combatDiagTraced = combatDiagLogging &&
+		SimCombatDiagLog::isTraced(combatDiagOid);
 	ManagedReference<SceneObject*> followCopy = getFollowObject().get();
 
 	if (followCopy == nullptr) {
+		if (combatDiagTraced) {
+			int queueSize = getCommandQueueSize();
+			StringBuffer diag;
+			diag << "path=enqueueAttack queueBefore=" << queueSize
+				<< " queueAfter=" << queueSize
+				<< " enqueue_outcome=suppressed_null_follow";
+			SimCombatDiagLog::event("ATTACK_ENQUEUE", combatDiagOid,
+				diag.toString(), "attack_enqueue_suppressed_null_follow");
+		}
 		return 1;
 	}
 
+	int queueBefore = combatDiagTraced ? getCommandQueueSize() : -1;
 	enqueueCommand(nextActionCRC, 0, followCopy->getObjectID(), nextActionArgs, priority);
+	if (combatDiagTraced) {
+		int queueAfter = getCommandQueueSize();
+		String outcome = priority == QueueCommand::NORMAL && queueBefore >= 5 ?
+			String("suppressed_queue_full") : String("enqueued");
+		StringBuffer diag;
+		diag << "path=enqueueAttack queueBefore=" << queueBefore
+			<< " queueAfter=" << queueAfter
+			<< " enqueue_outcome=" << outcome;
+		SimCombatDiagLog::event("ATTACK_ENQUEUE", combatDiagOid,
+			diag.toString(),
+			String("attack_enqueue_enqueueAttack_") + outcome);
+	}
 	nextActionCRC = 0;
 	nextActionArgs = "";
 
@@ -5094,13 +5295,40 @@ float AiAgentImplementation::getWorldZ(const Vector3& position) {
 }
 
 void AiAgentImplementation::runBehaviorTree() {
+	// This atomic load must remain before the allowlist mutex check below.  The
+	// behaviour task runs for every NPC, so the default-off path must not touch
+	// a mutex or format a diagnostic line.
+	const bool combatDiagLogging = SimCombatDiagLog::isLoggingEnabled();
+	const uint64 combatDiagOid = combatDiagLogging ? getObjectID() : 0;
+	const bool combatDiagTraced = combatDiagLogging &&
+		SimCombatDiagLog::isTraced(combatDiagOid);
+
+	auto emitCombatDiag = [&](const String& event, const String& extra,
+		const String& outcome) {
+		if (combatDiagTraced)
+			SimCombatDiagLog::event(event, combatDiagOid, extra, outcome);
+	};
+
 	try {
-		if (getZoneUnsafe() == nullptr || !(getOptionsBitmask() & OptionBitmask::AIENABLED))
+		Zone* zone = getZoneUnsafe();
+		bool aiEnabled = zone != nullptr &&
+			(getOptionsBitmask() & OptionBitmask::AIENABLED) != 0;
+		if (zone == nullptr || !aiEnabled) {
+			if (combatDiagTraced) {
+				StringBuffer diag;
+				diag << "zonePresent=" << (zone != nullptr ? 1 : 0)
+					<< " aiEnabled=" << (aiEnabled ? 1 : 0);
+				emitCombatDiag("tree_early_return_noop", diag.toString(),
+					"tree_early_return_noop");
+			}
 			return;
+		}
 
 		if (isDead()) {
 			cancelBehaviorEvent();
 			setFollowObject(nullptr);
+			emitCombatDiag("tree_dead_cancelled", "isDead=1",
+				"tree_dead_cancelled");
 			return;
 		}
 
@@ -5111,10 +5339,55 @@ void AiAgentImplementation::runBehaviorTree() {
 #endif // DEBUG_AI
 
 		ZoneServer* zoneServer = getZoneServer();
+		int playersInRange = 0;
+		bool followObjectOnEntry = false;
+		bool retreating = false;
+		bool serverLoading = false;
+		bool serverShuttingDown = false;
+		bool noPlayerGate = false;
+		bool gateCancelled = false;
+		if (combatDiagTraced) {
+			playersInRange = numberOfPlayersInRange.get();
+			followObjectOnEntry = getFollowObject().get() != nullptr;
+			retreating = isRetreating();
+			serverLoading = zoneServer != nullptr &&
+				zoneServer->isServerLoading();
+			serverShuttingDown = zoneServer != nullptr &&
+				zoneServer->isServerShuttingDown();
+			noPlayerGate = !alwaysActive && playersInRange <= 0 &&
+				!followObjectOnEntry && !retreating;
+			gateCancelled = noPlayerGate || zoneServer == nullptr ||
+				serverLoading || serverShuttingDown;
+		} else {
+			// Preserve the original short-circuit evaluation when diagnostics are
+			// off; this is part of the gate-off no-behaviour-change contract.
+			gateCancelled = ((!alwaysActive &&
+				numberOfPlayersInRange.get() <= 0 &&
+				getFollowObject().get() == nullptr && !isRetreating()) ||
+				zoneServer == nullptr || zoneServer->isServerLoading() ||
+				zoneServer->isServerShuttingDown());
+		}
 
-		if ((!alwaysActive && numberOfPlayersInRange.get() <= 0 && getFollowObject().get() == nullptr && !isRetreating()) || zoneServer == nullptr || zoneServer->isServerLoading() || zoneServer->isServerShuttingDown()) {
+		if (gateCancelled) {
 			cancelBehaviorEvent();
 			setFollowObject(nullptr);
+			if (combatDiagTraced) {
+				StringBuffer diag;
+				diag << "numberOfPlayersInRange=" << playersInRange
+					<< " followObjectOnEntry=" << (followObjectOnEntry ? 1 : 0)
+					<< " isRetreating=" << (retreating ? 1 : 0)
+					<< " isServerLoading=" << (serverLoading ? 1 : 0)
+					<< " isServerShuttingDown=" << (serverShuttingDown ? 1 : 0)
+					<< " getSimAlwaysActive=" << (getSimAlwaysActive() ? 1 : 0)
+					<< " getSimPlayerBot=" << (getSimPlayerBot() ? 1 : 0)
+					<< " getDespawnOnNoPlayerInRange=" <<
+						(getDespawnOnNoPlayerInRange() ? 1 : 0)
+					<< " alwaysActive=" << (alwaysActive ? 1 : 0)
+					<< " noPlayerGate=" << (noPlayerGate ? 1 : 0)
+					<< " zonePresent=" << (zoneServer != nullptr ? 1 : 0);
+				emitCombatDiag("tree_gate_cancelled", diag.toString(),
+					"tree_gate_cancelled");
+			}
 			return;
 		}
 
@@ -5135,14 +5408,42 @@ void AiAgentImplementation::runBehaviorTree() {
 		if (actionStatus == Behavior::RUNNING)
 			popRunningChain(); // don't keep root in the running chain
 
+		if (combatDiagTraced) {
+			String status;
+			switch (actionStatus) {
+			case Behavior::INVALID: status = "invalid"; break;
+			case Behavior::SUCCESS: status = "success"; break;
+			case Behavior::FAILURE: status = "failure"; break;
+			case Behavior::RUNNING: status = "running"; break;
+			case Behavior::SUSPEND: status = "suspend"; break;
+			default: status = "unknown"; break;
+			}
+
+			// getCombatDiagSnapshotLine() already carries the running-chain,
+			// next-action, queue, follow-object and HAM fields, so reuse it
+			// rather than re-reading each member here.
+			StringBuffer diag;
+			diag << "status=" << status
+				<< " nextBehaviorInterval=" << nextBehaviorInterval
+				<< " " << getCombatDiagSnapshotLine();
+			emitCombatDiag("tree_ran", diag.toString(),
+				String("tree_ran_") + status);
+		}
+
 #ifdef DEBUG_AI
 		if (peekBlackboard("aiDebug") && readBlackboard("aiDebug") == true)
 			info("rootBehavior->doAction() took " + String::valueOf((int)startTime.miliDifference()) + "ms to complete.", true);
 #endif // DEBUG_AI
 
 		activateAiBehavior(true);
-	} catch (Exception& ex) {
-		cancelBehaviorEvent();
+		} catch (Exception& ex) {
+			cancelBehaviorEvent();
+			if (combatDiagTraced) {
+				StringBuffer diag;
+				diag << "exception=1";
+				emitCombatDiag("tree_exception_cancelled", diag.toString(),
+					"tree_exception_cancelled");
+			}
 		handleException(ex, __FUNCTION__);
 	}
 }
@@ -5187,6 +5488,59 @@ bool AiAgentImplementation::getAIDebug() {
 #else // DEBUG_AI
 	return getLogLevel() >= LogLevel::DEBUG;
 #endif // DEBUG_AI
+}
+
+String AiAgentImplementation::getCombatDiagSnapshotLine() const {
+	// One assembler for every consumer: the heartbeat, the dashboard row and
+	// the tree_ran trace line. The IDL compiler renders a custom struct return
+	// as a pointer, and a diagnostic has no business handing callers an owned
+	// object, so this returns a preformatted key=value line instead.
+	bool eventExists = false;
+	bool eventScheduled = false;
+	{
+		Locker behaviorLock(const_cast<Mutex*>(&behaviorEventMutex));
+		eventExists = behaviorEvent != nullptr;
+		eventScheduled = behaviorEvent != nullptr && behaviorEvent->isScheduled();
+	}
+
+	uint64 followOid = 0;
+	ManagedReference<SceneObject*> followCopy =
+		const_cast<AiAgentImplementation*>(this)->getFollowObject().get();
+	if (followCopy != nullptr)
+		followOid = followCopy->getObjectID();
+
+	int chainSize = runningChain.size();
+	uint32 chainTop = chainSize > 0 ? runningChain.get(chainSize - 1) : 0;
+
+	ZoneServer* zoneServer = getZoneServer();
+	ObjectController* objectController = zoneServer == nullptr ? nullptr :
+		zoneServer->getObjectController();
+	bool nextResolved = objectController != nullptr &&
+		objectController->getQueueCommand(nextActionCRC) != nullptr;
+
+	StringBuffer line;
+	line << "behaviorEventExists=" << (eventExists ? 1 : 0)
+		<< " behaviorEventScheduled=" << (eventScheduled ? 1 : 0)
+		// aiTemplate is the legacy string field and is empty for every sim bot:
+		// behaviour selection is driven by customAiMap (setCustomAiMap +
+		// setAITemplate). Emit both so an empty legacy field can never be
+		// mistaken for "no tree assigned".
+		<< " aiTemplate=" << aiTemplate
+		<< " customAiMap=" << customAiMap
+		<< " followObjectOid=" << followOid
+		<< " defenderCount=" << defenderList.size()
+		<< " commandQueueSize=" << getCommandQueueSize()
+		<< " posture=" << static_cast<int>(getPosture())
+		<< " inCombat=" << (isInCombat() ? 1 : 0)
+		<< " hamHealth=" << getHAM(CreatureAttribute::HEALTH)
+		<< " hamAction=" << getHAM(CreatureAttribute::ACTION)
+		<< " hamMind=" << getHAM(CreatureAttribute::MIND)
+		<< " nextActionCRC=" << nextActionCRC
+		<< " nextActionResolved=" << (nextResolved ? 1 : 0)
+		<< " runningChainSize=" << chainSize
+		<< " runningChainTop=" << chainTop
+		<< " waiting=" << (isWaiting() ? 1 : 0);
+	return line.toString();
 }
 
 bool AiAgentImplementation::isRunningBehavior(unsigned int id) {
@@ -5993,8 +6347,39 @@ bool AiAgentImplementation::isCamouflaged(CreatureObject* creature) {
 }
 
 void AiAgentImplementation::activateAiBehavior(bool reschedule) {
+	// Keep this atomic gate before the diagnostic allowlist mutex.  This method
+	// is called from many ordinary AI paths, including the 400 ms behaviour
+	// re-arm, and must remain dormant at the shipped default.
+	const bool combatDiagLogging = SimCombatDiagLog::isLoggingEnabled();
+	const uint64 combatDiagOid = combatDiagLogging ? getObjectID() : 0;
+	const bool combatDiagTraced = combatDiagLogging &&
+		SimCombatDiagLog::isTraced(combatDiagOid);
+	bool eventExistedOnEntry = false;
+	bool alreadyScheduledOnEntry = false;
+	if (combatDiagTraced) {
+		Locker behaviorLock(&behaviorEventMutex);
+		eventExistedOnEntry = behaviorEvent != nullptr;
+		alreadyScheduledOnEntry = behaviorEvent != nullptr &&
+			behaviorEvent->isScheduled();
+	}
+
     if (getZoneUnsafe() == nullptr || !(getOptionsBitmask() & OptionBitmask::AIENABLED))
+	{
+		if (combatDiagTraced) {
+			StringBuffer diag;
+			diag << "scheduledAfter=" <<
+				(alreadyScheduledOnEntry ? 1 : 0)
+				<< " eventExistedOnEntry=" <<
+					(eventExistedOnEntry ? 1 : 0)
+				<< " reschedule=" << (reschedule ? 1 : 0)
+				<< " zonePresent=" << (getZoneUnsafe() != nullptr ? 1 : 0)
+				<< " aiEnabled=" <<
+					((getOptionsBitmask() & OptionBitmask::AIENABLED) ? 1 : 0);
+			SimCombatDiagLog::event("early_return_noop", combatDiagOid,
+				diag.toString(), "early_return_noop");
+		}
         return;
+	}
 
 #ifdef DEBUG_AI
     bool alwaysActive = ConfigManager::instance()->getAiAgentLoadTesting();
@@ -6009,12 +6394,37 @@ void AiAgentImplementation::activateAiBehavior(bool reschedule) {
     }
 
     ZoneServer* zoneServer = getZoneServer();
+	int playersInRange = 0;
+	bool followObjectOnEntry = false;
+	bool retreating = false;
+	bool serverLoading = false;
+	bool serverShuttingDown = false;
+	bool noPlayerGate = false;
+	bool gateCancelled = false;
+	if (combatDiagTraced) {
+		playersInRange = numberOfPlayersInRange.get();
+		followObjectOnEntry = getFollowObject().get() != nullptr;
+		retreating = isRetreating();
+		serverLoading = zoneServer != nullptr &&
+			zoneServer->isServerLoading();
+		serverShuttingDown = zoneServer != nullptr &&
+			zoneServer->isServerShuttingDown();
+		noPlayerGate = !alwaysActive && playersInRange <= 0 &&
+			!followObjectOnEntry && !retreating;
+		gateCancelled = noPlayerGate || zoneServer == nullptr ||
+			serverLoading || serverShuttingDown;
+	} else {
+		// Retain activateAiBehavior's original short-circuit gate when the
+		// diagnostic is dormant.
+		gateCancelled = ((!alwaysActive &&
+			numberOfPlayersInRange.get() <= 0 &&
+			getFollowObject().get() == nullptr && !isRetreating()) ||
+			zoneServer == nullptr || zoneServer->isServerLoading() ||
+			zoneServer->isServerShuttingDown());
+	}
 
     // Original "no players nearby -> stop AI" gate, but now bypassed for sim bots / always-active.
-    if ((!alwaysActive && numberOfPlayersInRange.get() <= 0 && getFollowObject().get() == nullptr && !isRetreating())
-        || zoneServer == nullptr
-        || zoneServer->isServerLoading()
-        || zoneServer->isServerShuttingDown()) {
+	if (gateCancelled) {
 
 #ifdef DEBUG_AI
         info() << "activateAiBehavior CANCEL oid=" << getObjectID()
@@ -6027,23 +6437,89 @@ void AiAgentImplementation::activateAiBehavior(bool reschedule) {
                << " alwaysActiveVar=" << alwaysActive;
 #endif
         cancelBehaviorEvent();
+		if (combatDiagTraced) {
+			StringBuffer diag;
+			diag << "scheduledAfter=0"
+				<< " eventExistedOnEntry=" <<
+					(eventExistedOnEntry ? 1 : 0)
+				<< " alreadyScheduledOnEntry=" <<
+					(alreadyScheduledOnEntry ? 1 : 0)
+				<< " reschedule=" << (reschedule ? 1 : 0)
+				<< " numberOfPlayersInRange=" << playersInRange
+				<< " followObjectOnEntry=" << (followObjectOnEntry ? 1 : 0)
+				<< " isRetreating=" << (retreating ? 1 : 0)
+				<< " isServerLoading=" << (serverLoading ? 1 : 0)
+				<< " isServerShuttingDown=" << (serverShuttingDown ? 1 : 0)
+				<< " getSimAlwaysActive=" << (getSimAlwaysActive() ? 1 : 0)
+				<< " getSimPlayerBot=" << (getSimPlayerBot() ? 1 : 0)
+				<< " getDespawnOnNoPlayerInRange=" <<
+					(getDespawnOnNoPlayerInRange() ? 1 : 0)
+				<< " alwaysActive=" << (alwaysActive ? 1 : 0)
+				<< " noPlayerGate=" << (noPlayerGate ? 1 : 0)
+				<< " zonePresent=" << (zoneServer != nullptr ? 1 : 0);
+			SimCombatDiagLog::event("gate_cancelled", combatDiagOid,
+				diag.toString(), "gate_cancelled");
+		}
         return;
     }
 
-    Locker locker(&behaviorEventMutex);
+    String outcome;
+	bool scheduledAfter = alreadyScheduledOnEntry;
+	int scheduledInterval = Math::max(10, nextBehaviorInterval);
+	{
+		Locker locker(&behaviorEventMutex);
 
-    if (behaviorEvent == nullptr) {
-        behaviorEvent = new AiBehaviorEvent(asAiAgent());
-        behaviorEvent->schedule(Math::max(10, nextBehaviorInterval));
-    } else if (reschedule) {
-        try {
-            if (!behaviorEvent->isScheduled())
-                behaviorEvent->schedule(Math::max(10, nextBehaviorInterval));
-        } catch (IllegalArgumentException& e) {
-        }
-    }
+        if (behaviorEvent == nullptr) {
+            behaviorEvent = new AiBehaviorEvent(asAiAgent());
+            behaviorEvent->schedule(scheduledInterval);
+			outcome = "created_scheduled";
+			scheduledAfter = behaviorEvent->isScheduled();
+        } else if (reschedule) {
+            try {
+	            if (!behaviorEvent->isScheduled()) {
+	                behaviorEvent->schedule(scheduledInterval);
+				outcome = "rescheduled";
+			} else {
+				outcome = "already_scheduled_noop";
+			}
+			scheduledAfter = behaviorEvent->isScheduled();
+	        } catch (IllegalArgumentException& e) {
+			// AiBehaviorEvent::schedule owns the catch-all for scheduling
+			// failures.  Preserve this historical catch and do not invent a
+			// second, unreachable schedule_exception outcome here.
+			outcome = behaviorEvent->isScheduled() ?
+				String("already_scheduled_noop") : String("rescheduled");
+			scheduledAfter = behaviorEvent->isScheduled();
+	        }
+	    } else {
+			outcome = "existing_no_reschedule_noop";
+			scheduledAfter = behaviorEvent->isScheduled();
+	    }
 
-    nextBehaviorInterval = BEHAVIORINTERVAL;
+        nextBehaviorInterval = BEHAVIORINTERVAL;
+	}
+
+	if (combatDiagTraced) {
+		StringBuffer diag;
+		diag << "scheduledAfter=" << (scheduledAfter ? 1 : 0)
+			<< " eventExistedOnEntry=" << (eventExistedOnEntry ? 1 : 0)
+			<< " alreadyScheduledOnEntry=" <<
+				(alreadyScheduledOnEntry ? 1 : 0)
+			<< " reschedule=" << (reschedule ? 1 : 0)
+			<< " nextBehaviorInterval=" << scheduledInterval
+			<< " numberOfPlayersInRange=" << playersInRange
+			<< " followObjectOnEntry=" << (followObjectOnEntry ? 1 : 0)
+			<< " isRetreating=" << (retreating ? 1 : 0)
+			<< " isServerLoading=" << (serverLoading ? 1 : 0)
+			<< " isServerShuttingDown=" << (serverShuttingDown ? 1 : 0)
+			<< " getSimAlwaysActive=" << (getSimAlwaysActive() ? 1 : 0)
+			<< " getSimPlayerBot=" << (getSimPlayerBot() ? 1 : 0)
+			<< " getDespawnOnNoPlayerInRange=" <<
+				(getDespawnOnNoPlayerInRange() ? 1 : 0)
+			<< " alwaysActive=" << (alwaysActive ? 1 : 0);
+		SimCombatDiagLog::event(outcome, combatDiagOid, diag.toString(),
+			outcome);
+	}
 }
 
 void AiAgentImplementation::cancelBehaviorEvent() {
@@ -6136,7 +6612,58 @@ void AiAgentImplementation::broadcastNextPositionUpdate(PatrolPoint* point) {
  	broadcastMessage(msg, false);
 }
 
+// P.10g early-game combat telemetry (default-off): remember a sim bot's killing
+// blow before CreatureManager::notifyDestruction copies and clears the threat map
+// and defenders. Runs with the victim locked; reads the attacker unlocked, as
+// disseminateExperience does, and writes only the leaf SimEarlyGameDeathLog.
+static void captureSimEarlyGameDeathCause(AiAgent* victim, TangibleObject* attacker,
+		bool isCombatAction) {
+	SimEarlyGameDeathCause cause;
+	cause.capturedMs = System::getMiliTime();
+	cause.combatAction = isCombatAction;
+	if (attacker != nullptr) {
+		cause.attackerOid = attacker->getObjectID();
+		cause.attackerIsSelf = cause.attackerOid == victim->getObjectID();
+		if (attacker->getObjectTemplate() != nullptr)
+			cause.attackerTemplate = attacker->getObjectTemplate()->getFullTemplateString();
+		CreatureObject* attackerCreature = attacker->asCreatureObject();
+		cause.attackerIsCreature = attackerCreature != nullptr;
+		if (attackerCreature != nullptr) {
+			cause.attackerLevel = attackerCreature->getLevel();
+			cause.attackerIsPlayer = attackerCreature->isPlayerCreature();
+			AiAgent* attackerAgent = attackerCreature->asAiAgent();
+			cause.attackerIsSimBot = attackerAgent != nullptr && attackerAgent->getSimPlayerBot();
+		}
+		cause.attackerInCell = attacker->getParent() != nullptr;
+		cause.attackerDistance = victim->getWorldPosition().distanceTo(attacker->getWorldPosition());
+	}
+
+	ThreatMap* threatMap = victim->getThreatMap();
+	if (threatMap != nullptr) {
+		// The same copy CreatureManager::notifyDestruction takes under this lock.
+		ThreatMap copyThreatMap(*threatMap);
+		cause.threatEntries = copyThreatMap.size();
+		for (int i = 0; i < copyThreatMap.size(); ++i) {
+			TangibleObject* damager = copyThreatMap.elementAt(i).getKey();
+			uint32 damage = copyThreatMap.elementAt(i).getValue().getTotalDamage();
+			cause.totalDamage += damage;
+			if (damager == nullptr || (cause.topDamagerOid != 0 && damage <= cause.topDamage))
+				continue;
+			cause.topDamagerOid = damager->getObjectID();
+			cause.topDamage = damage;
+			cause.topDamagerTemplate = damager->getObjectTemplate() == nullptr ? String() :
+				damager->getObjectTemplate()->getFullTemplateString();
+		}
+	}
+
+	SimEarlyGameDeathLog::record(victim->getObjectID(), cause);
+}
+
 int AiAgentImplementation::notifyObjectDestructionObservers(TangibleObject* attacker, int condition, bool isCombatAction) {
+	// Only the first, killing call: notifyDestruction ignores an already-dead agent.
+	if (simPlayerBot && !isDead() && SimEarlyGameDeathLog::isEnabled())
+		captureSimEarlyGameDeathCause(asAiAgent(), attacker, isCombatAction);
+
 	sendReactionChat(attacker, ReactionManager::DEATH);
 
 	if (isPet()) {

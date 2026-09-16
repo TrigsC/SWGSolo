@@ -3,10 +3,13 @@
 **Line**: P.10 (new feature line, versions `0.9.x`)
 **Branch**: `feat/p10-playerbot-parity`, cut from `miner-ai` at `266e6d02e7` (v0.8.2)
 **Status**: IN PROGRESS. Delivered: **F_0.9.0** (P.10a, v0.9.0), **F_0.9.1** (P.10b,
-v0.9.1), **F_0.9.5** (P.10f, v0.9.5, schema 1013 deployed). Next chunk: **F_0.9.6**
-(novice early-game loop) — see §5c for why it was inserted ahead of the bazaar work.
+v0.9.1), **F_0.9.5** (P.10f, v0.9.5, schema 1013 deployed). **F_0.9.6** (P.10g,
+novice early-game loop) is IMPLEMENTED on `feat/p10g-novice-early-game-loop`,
+building warning-clean, and awaiting its live receipt — see §5c for why it was
+inserted ahead of the bazaar work. Next chunk after it: **F_0.9.7** (P.10h,
+skill-derived combat abilities).
 **Written**: 2026-09-02 (project week 8)
-**Last updated**: 2026-09-08 — early-game chunks inserted, bazaar renumbered (§5, §5c)
+**Last updated**: 2026-09-09 — F_0.9.6 implemented, pending live verification
 
 ## 0. Mandate
 

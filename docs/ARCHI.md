@@ -181,10 +181,30 @@ no new warnings before handing work back** (owner-stated standard).
   earn-rate multiplier (shipped `1.0` = exact player parity). F_0.9.5 adds
   `playerBotProgression.trainingEnabled` plus `trainingMaxPerTick`,
   `trainingSweepBatch` and the `trainingPlans` list (each entry a `name`,
-  `goalSkill`, `profession`, `weaponTemplate` and a validated `weaponType`),
-  and a `pveConfig.novice` block (`enabled`, `retireLegacyHunters`,
-  `bodyTemplate`, profession distribution) alongside
-  `pveConfig.huntingProfessions`. All three F_0.9.5 gates ship default-off.
+  legacy scalar `goalSkill`, `profession`, `weaponTemplate` and a validated
+  `weaponType`). F_0.9.6 extends entries with a `goalSkills` list while
+  retaining the scalar for compatibility, and adds the default-off
+  `playerBotProgression.earlyGameEnabled` gate with its nested `earlyGame`
+  block: the `realWeaponDamage` sub-gate and XP-type loadout map, grind anchors
+  (`grindAnchorMin/MaxMeters`, `anchorArriveMeters`, `anchorMaxAttempts`),
+  target selection (`levelBandBelow`/`levelBandAbove`,
+  `minTtkSeconds`/`maxTtkSeconds`, `assumedHitRate`, `avoidGroupAggroTargets`,
+  `scanMaxAttempts`/`scanRetrySeconds`), city-spawner roaming
+  (`roamCitySpawners`, `spawnerSearchRadiusMeters`, `skipInactiveSpawners`,
+  `spawnerArriveMeters`), the bounded unreachable-target memory
+  (`unreachableSkipSeconds`, `unreachableSkipMaxTargets`), survival tuning
+  (`fleeHamFraction`, `restHamFraction`, `cloneWoundMaxFraction`,
+  `deathAvoidRadiusMeters`/`Memory`/`Seconds`) and two default-off telemetry
+  switches (`combatTelemetry`, `movementTelemetry`). The sim layer is the only
+  place that restores roster PlayerBot weapon-template stats after shared AI
+  weapon-stat setup; synthetic harness identities remain outside that path.
+  F_0.9.5's `pveConfig.novice` block (`enabled`, `retireLegacyHunters`,
+  `bodyTemplate`, profession distribution, alongside
+  `pveConfig.huntingProfessions`) gains `bodyHam` — the per-pool HAM a planned
+  novice body is built with (800 = starting-player parity; 0 keeps the mobile
+  template). F_0.9.6-D1 adds the top-level `combatDiag` block (`logging` master
+  gate plus allowlist knobs) governing all `bin/log/simcombat.log` output. Every
+  F_0.9.5 and F_0.9.6 gate ships default-off.
   This is the primary place new simulation features expose owner-tunable,
   default-off gates.
 - **`MMOCoreORB/bin/conf/features.lua`** — global feature flags.
@@ -706,6 +726,62 @@ This is this fork's primary custom subsystem, layered on top of the stock
   never be exercised at all. Any future P.10 capability gate must place the
   master gate first, the harness override second, and the configured capability
   last (`playerBotProgressionAwardGateEnabled` is the reference shape).
+- **Novice early-game grind loop (P.10g / F_0.9.6)** — the first PlayerBot that
+  *produces* its own XP rather than consuming XP handed to it. An early-game
+  state machine on `SimHunterController`'s `runActiveTick` idle branch
+  (`LeaveCity → SelectTarget → Engage → Recover → Train`), gated by
+  `playerBotProgression.earlyGameEnabled`. Five points worth inheriting:
+  **(1) Server knowledge may inform selection, never the fight.** Targets are
+  chosen by a level band around the bot's own tier (`skillTier ± 3`) and a TTK
+  window computed from the equipped weapon's real damage and the target's
+  *minimum* primary pool — a creature dies when any primary empties — via the new
+  side-effect-free `CombatManager::estimateDamageAfterMitigation`. Combat itself
+  still goes through `CombatManager::startCombat` with no damage advantage (the
+  plan's "no cheat kills" invariant). Engage range is the weapon's own
+  `maxRange − 1`; the hunter's 48 m rifle default left an unarmed novice
+  "attacking" from 48 m.
+  **(2) Every walking branch must schedule its own tick.** `scheduleActiveTick`
+  bumps `activeTickGeneration` and supersedes in-flight tasks, so a branch that
+  relies on `onArrived`/`onPathFailed` alone simply freezes. Recover and
+  scan-pursuit each shipped that bug and each was caught only by a live run.
+  **(3) A single-slot memory is a defect when the world can present two of the
+  thing.** The Engage path-failure skip held one OID, so two creatures just off
+  the city navmesh ping-ponged it for 70 minutes with zero kills and ~15,300
+  mover exit-resolve failures. It is now a bounded set
+  (`unreachableSkipMaxTargets`, soonest-expiry eviction); when everything nearby
+  is skipped the scan comes back empty and the existing rotation re-anchors.
+  **(4) Group aggro is PACK-only.** `AiAgent::notifyPackMobs` pulls in PACK
+  creatures of the same social group within 20–25 m; HERD and a shared social
+  group do **not** assist. `avoidGroupAggroTargets` therefore tests `isPack()`
+  alone — the first cut also excluded HERD and left the novice with no eligible
+  fauna at all around Mos Eisley.
+  **(5) Self-defence judges the whole defender list, repeatedly.**
+  `findUnwinnableEarlyGameAttacker` re-checks every live non-bot defender on
+  fight entry *and* on every Engage tick, because pack allies join
+  asynchronously, and flees the first one outside the band
+  (`flee_other_attacker`).
+  Bodies: `novice.bodyHam` sets all nine pools (800 = starting player) and clone
+  wounds are healed on respawn (`cloneWoundMaxFraction` 0 — the previous
+  500-point wound pinned novice HAM at 1); parity-harness bodies are exempt via
+  `parityHarnessBody`. Where the fauna is: city `InterestAreaSpawner` screenplays
+  place `spawn_egg.iff` objects that spawn a pod within ~10 m, so
+  `chooseEarlyGameSpawnerAnchor` finds active eggs by zone query around the home
+  city and visits them in rotation, falling back to the ring anchors. Death
+  capture: `AiAgentImplementation::notifyObjectDestructionObservers` records the
+  killer into `SimEarlyGameDeathLog` (leaf mutex + atomic gate) and
+  `onPveHunterDied` is the single finalizer, de-duplicating by body OID and
+  recording short-lived death-avoid zones. **Kill XP that silently vanished is
+  now counted**: `disseminateExperience` has branches that drop a kill with no
+  counter and no log line, so while the kill-XP gate is on a sim bot in the
+  victim's threat map bumps `killXp.botKillsSeen` and, on a drop, one of
+  `droppedNoDamage`/`droppedNoBaseXp`/`droppedNoSimBotAttacker` plus a
+  `SimPveKillXpDropped` line — counted lock-free inline, with identity resolution
+  and logging on the same deferred hand-off the award uses. **F_0.9.6-D1** adds
+  the allowlist-gated `SimCombatDiagLog` (`bin/log/simcombat.log`,
+  `combatDiag.logging`, dashboard `pveActivity.combatDiag`) tracing behaviour-tree
+  ticks, attack selection/enqueue and the full kill-XP path — the instrument that
+  made these assertions checkable rather than inferred. Live receipt: 43/43 in
+  `docs/4-unit-tests/live_p10g-novice-early-game_20260915-225334-p10g-novice-early-game.md`.
 - **Simulation-only by default, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line

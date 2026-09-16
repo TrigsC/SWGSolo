@@ -10,6 +10,7 @@
 
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/managers/creature/AiMap.h"
+#include "server/zone/objects/creature/simplayer/SimCombatDiagLog.h"
 
 namespace server {
 namespace zone {
@@ -107,6 +108,17 @@ public:
 				}
 			}
 		} catch (...) {
+			// Task::schedule swallows the scheduling failure here.  This is the
+			// authoritative diagnostic signal; activateAiBehavior cannot infer
+			// failure from isScheduled(), because the timed queue clears that
+			// state as soon as it dequeues a task.
+			if (SimCombatDiagLog::isLoggingEnabled() && strongRef != nullptr) {
+				uint64 oid = strongRef->getObjectID();
+				if (SimCombatDiagLog::isTraced(oid))
+					SimCombatDiagLog::event("schedule_exception", oid,
+						"source=AiBehaviorEvent::schedule",
+						"schedule_exception");
+			}
 			AiMap::instance()->scheduledBehaviorEvents.decrement();
 		}
 	}
