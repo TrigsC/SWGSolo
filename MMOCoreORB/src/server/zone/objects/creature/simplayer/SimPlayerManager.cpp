@@ -8,6 +8,7 @@
 #include "SimHunterController.h"
 #include "CellNavDiagLog.h"
 #include "SimCombatDiagLog.h"
+#include "SimBotAbilityTiers.h"
 #include "StructureTraversalDiagLog.h"
 
 #include <cmath>
@@ -32,6 +33,7 @@
 #include "server/zone/objects/group/GroupObject.h"
 #include "server/zone/objects/creature/ai/CreatureTemplate.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
+#include "server/zone/objects/creature/commands/CombatQueueCommand.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h"
 #include "server/zone/objects/creature/buffs/Buff.h"
 #include "server/zone/objects/region/SpawnArea.h"
@@ -62,6 +64,7 @@
 #include "server/zone/managers/collision/PathFinderManager.h"
 #include "server/zone/managers/collision/CollisionManager.h"
 #include "server/zone/managers/combat/CombatManager.h"
+#include "server/zone/managers/objectcontroller/ObjectController.h"
 #include "server/zone/managers/skill/SkillManager.h"
 #include "server/zone/managers/skill/SkillModManager.h"
 #include "server/zone/managers/player/PlayerManager.h"
@@ -6168,10 +6171,12 @@ void SimPlayerManager::loadLuaConfig() {
 	progressionAwardKillXp = false;
 	progressionTrainingEnabled = false;
 	progressionEarlyGameEnabled = false;
+	progressionCombatAbilitiesEnabled = false;
 	progressionEarlyGameRealWeaponDamage = false;
 	progressionKillXpRate = 1.0f;
 	progressionEarlyGameConfig = SimBotEarlyGameConfig();
 	SimEarlyGameDeathLog::setEnabled(false);
+	SimBotAbilityUsageLog::setEnabled(false);
 	{
 		Locker progressionLock(&progressionMutex);
 		progressionEarlyGameStates.removeAll();
@@ -6188,6 +6193,10 @@ void SimPlayerManager::loadLuaConfig() {
 		progressionOrphanIds.removeAll();
 		progressionTrainingPlans.removeAll();
 		progressionEarlyGameWeaponsByXpType.removeAll();
+		progressionCombatAbilityConfig = SimBotCombatAbilityConfig();
+		progressionCombatAbilityReapplyIds.removeAll();
+		progressionCombatAbilityReserveWarningIssued = false;
+		progressionCombatAbilityReserveRefusedAtExecution = 0;
 		// Must clear alongside the map. buildTrainingPlansFromConfig returns
 		// early when the derived signature is unchanged, so a stale signature
 		// here would make the next rebuild skip reloading and leave
@@ -6219,6 +6228,8 @@ void SimPlayerManager::loadLuaConfig() {
 			playerBotParityKillAwardLedger.removeAll();
 			playerBotParityKillAwardLastMs.removeAll();
 		}
+		playerBotParityCombatAbilityHarnessOptIns.removeAll();
+		playerBotParityCombatAbilityScopedIds.removeAll();
 		playerBotParityTestScenarioIndex = 0;
 		playerBotParityTestStepCursor = 0;
 		playerBotParityTestSetupCursor = 0;
@@ -6247,6 +6258,13 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestRealWeaponDamageGateOverrideActive = false;
 		playerBotParityTestRealWeaponDamageGateOverridePreviousActive = false;
 		playerBotParityTestRealWeaponDamageGateOverridePrevious = false;
+		playerBotParityTestCombatAbilitiesGateOverrideActive = false;
+		playerBotParityTestCombatAbilitiesGateOverridePreviousActive = false;
+		playerBotParityTestCombatAbilitiesGateOverridePrevious = false;
+		playerBotParityTestCombatAbilityChanceOverrideActive = false;
+		playerBotParityTestCombatAbilityChanceOverride = 35;
+		playerBotParityTestCombatAbilityChanceOverridePreviousActive = false;
+		playerBotParityTestCombatAbilityChanceOverridePrevious = 35;
 		playerBotParityTestEnabled = false;
 		playerBotParityTestStaleRowsScanned = false;
 		playerBotParityTestPhaseAFileWritten = false;
@@ -8044,37 +8062,145 @@ void SimPlayerManager::runPlayerBotTrainingSweep() {
 	trainingSweepCursor = nextCursor;
 }
 
-SimBotBodyProgression SimPlayerManager::buildBodyProgressionSnapshot(
+void SimPlayerManager::runPlayerBotCombatAbilityReapplySweep() {
+	Vector<uint64> work;
+	{
+		Locker progressionLock(&progressionMutex);
+		int limit = trainingSweepBatch;
+		for (int i = 0; i < progressionCombatAbilityReapplyIds.size() &&
+				work.size() < limit; ++i) {
+			uint64 identityId =
+				progressionCombatAbilityReapplyIds.elementAt(i).getKey();
+			work.add(identityId);
+			progressionCombatAbilityReapplyIds.drop(identityId);
+			--i;
+		}
+	}
+
+	for (int i = 0; i < work.size(); ++i)
+		reapplyPlayerBotProgressionToLiveBody(work.get(i));
+}
+
+void SimPlayerManager::queuePlayerBotCombatAbilityReapply(uint64 identityId) {
+	Vector<uint64> liveIdentityIds;
+	int liveBodyCount = 0;
+	if (identityId != 0) {
+		Locker pveLock(&pveMutex);
+		liveBodyCount = pveIdentityBodyOids.size();
+		if (pveIdentityBodyOids.contains(identityId))
+			liveIdentityIds.add(identityId);
+	} else {
+		Locker pveLock(&pveMutex);
+		liveBodyCount = pveIdentityBodyOids.size();
+		for (int i = 0; i < pveIdentityBodyOids.size(); ++i)
+			liveIdentityIds.add(pveIdentityBodyOids.elementAt(i).getKey());
+	}
+	SimBotAbilityUsageLog::setMaxBodies(liveBodyCount);
+
+	Locker progressionLock(&progressionMutex);
+	for (int i = 0; i < liveIdentityIds.size(); ++i)
+		progressionCombatAbilityReapplyIds.put(liveIdentityIds.get(i), true);
+}
+
+bool SimPlayerManager::isPlayerBotCombatAbilityHarnessOptIn(
 		uint64 identityId) {
+	Locker parityLock(&playerBotParityTestMutex);
+	return playerBotParityCombatAbilityHarnessOptIns.contains(identityId) &&
+		playerBotParityCombatAbilityHarnessOptIns.get(identityId);
+}
+
+SimBotBodyProgression SimPlayerManager::buildBodyProgressionSnapshot(
+		uint64 identityId, const SimBotAbilityApplicability& applicability) {
 	SimBotBodyProgression snapshot;
 	Locker progressionLock(&progressionMutex);
 	if (!progressionRecords.contains(identityId))
 		return snapshot;
 
+	const SimBotCombatAbilityConfig& combatAbilityConfig =
+		progressionCombatAbilityConfig;
+	snapshot.abilitiesApplicable = applicability.gateEnabled &&
+		!applicability.trainingPlan.isEmpty() &&
+		(applicability.profession != "harness" || applicability.harnessOptIn);
+	snapshot.abilitySpecialChance =
+		applicability.specialAttackChancePercent >= 0 ?
+			applicability.specialAttackChancePercent :
+			combatAbilityConfig.specialAttackChancePercent;
+	snapshot.abilityPreferFreeState =
+		combatAbilityConfig.preferFreeStateAbilities;
+	snapshot.abilityHamReserve = combatAbilityConfig.hamReserveFraction;
+	snapshot.abilityFreeStateRetrySeconds =
+		combatAbilityConfig.freeStateRetrySeconds;
+
 	const SimBotProgression& progression = progressionRecords.get(identityId);
 	SkillManager* skillManager = SkillManager::instance();
+	ObjectController* objectController = nullptr;
+	if (snapshot.abilitiesApplicable) {
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		objectController = zoneServer == nullptr ? nullptr :
+			zoneServer->getObjectController();
+		if (skillManager == nullptr || objectController == nullptr)
+			snapshot.abilitiesApplicable = false;
+	}
+
+	Vector<String> derivedAbilities;
 	for (int i = 0; i < progression.skills.size(); ++i) {
 		const String& skillName = progression.skills.get(i);
 		snapshot.skills.add(skillName);
 
 		Skill* skill = skillManager == nullptr ? nullptr :
 			skillManager->getSkill(skillName);
-		if (skill == nullptr || skill->getSkillModifiers() == nullptr)
+		if (skill == nullptr)
 			continue;
 
 		const VectorMap<String, int>* modifiers = skill->getSkillModifiers();
-		for (int j = 0; j < modifiers->size(); ++j) {
-			const VectorMapEntry<String, int>& entry = modifiers->elementAt(j);
-			int64 delta = entry.getValue();
-			if (snapshot.modDeltas.contains(entry.getKey()))
-				delta += snapshot.modDeltas.get(entry.getKey());
-			if (delta > 2147483647)
-				delta = 2147483647;
-			else if (delta < -2147483647 - 1)
-				delta = -2147483647 - 1;
-			snapshot.modDeltas.put(entry.getKey(), static_cast<int>(delta));
+		if (modifiers != nullptr) {
+			for (int j = 0; j < modifiers->size(); ++j) {
+				const VectorMapEntry<String, int>& entry = modifiers->elementAt(j);
+				int64 delta = entry.getValue();
+				if (snapshot.modDeltas.contains(entry.getKey()))
+					delta += snapshot.modDeltas.get(entry.getKey());
+				if (delta > 2147483647)
+					delta = 2147483647;
+				else if (delta < -2147483647 - 1)
+					delta = -2147483647 - 1;
+				snapshot.modDeltas.put(entry.getKey(), static_cast<int>(delta));
+			}
+		}
+
+		if (!snapshot.abilitiesApplicable)
+			continue;
+
+		const Vector<String>* abilities = skill->getAbilities();
+		if (abilities == nullptr)
+			continue;
+		for (int j = 0; j < abilities->size(); ++j) {
+			// skills.iff spells commands in camelCase (unarmedHit1) while the
+			// ObjectController registry and creature attack lists use lower case
+			// (unarmedhit1); getQueueCommand hashes the exact string, so resolve
+			// and install the lower-case name. Only already-lower-case commands
+			// (intimidate1, taunt) resolved before this, found by the live probe.
+			const String command = abilities->get(j).toLowerCase();
+			if (combatAbilityConfig.excludedCommands.contains(command)) {
+				snapshot.excludedAbilities.add(command + ":config");
+				continue;
+			}
+
+			const CombatQueueCommand* combatCommand = cast<
+				const CombatQueueCommand*>(objectController->getQueueCommand(command));
+			if (combatCommand == nullptr) {
+				const QueueCommand* queueCommand =
+					objectController->getQueueCommand(command);
+				snapshot.excludedAbilities.add(command +
+					(queueCommand == nullptr ? ":unknown_command" : ":not_combat"));
+				continue;
+			}
+			derivedAbilities.add(command);
 		}
 	}
+
+	if (snapshot.abilitiesApplicable)
+		SimBotAbilityTiers::collapseAbilityTiers(derivedAbilities,
+			snapshot.abilities, snapshot.supersededAbilities);
 
 	return snapshot;
 }
@@ -8104,6 +8230,18 @@ void SimPlayerManager::applyProgressionToBody(AiAgent* agent,
 
 	for (int i = 0; i < snapshot.skills.size(); ++i)
 		agent->addSkill(snapshot.skills.get(i), false);
+
+	if (snapshot.abilitiesApplicable) {
+		agent->setSkillDerivedAttacks(snapshot.abilities,
+			snapshot.abilitySpecialChance, snapshot.abilityPreferFreeState,
+			snapshot.abilityHamReserve);
+		agent->setSkillAbilityFreeStateRetryMs(
+			snapshot.abilityFreeStateRetrySeconds * 1000);
+		agent->setupAttackMaps();
+	} else if (agent->hasSkillDerivedAttacks()) {
+		agent->clearSkillDerivedAttacks();
+		agent->setupAttackMaps();
+	}
 }
 
 bool SimPlayerManager::selectPlayerBotEarlyGameWeapon(
@@ -8272,6 +8410,8 @@ void SimPlayerManager::reapplyPlayerBotProgressionToLiveBody(
 	}
 	if (bodyOid == 0)
 		return;
+	const bool combatAbilitiesGateEnabled =
+		playerBotCombatAbilitiesGateEnabled(identityId);
 
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
 	ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
@@ -8283,7 +8423,16 @@ void SimPlayerManager::reapplyPlayerBotProgressionToLiveBody(
 	// The progression mutex is released by the snapshot builder before this
 	// agent lock is acquired. This mirrors checkArrival's post-lock lifecycle
 	// guard: teardown wins by returning, with no continuation scheduled here.
-	SimBotBodyProgression snapshot = buildBodyProgressionSnapshot(identityId);
+	SimBotAbilityApplicability applicability;
+	applicability.gateEnabled = combatAbilitiesGateEnabled;
+	applicability.trainingPlan = identity.trainingPlan;
+	applicability.profession = identity.profession;
+	applicability.harnessOptIn =
+		isPlayerBotCombatAbilityHarnessOptIn(identityId);
+	applicability.specialAttackChancePercent =
+		playerBotCombatAbilityChanceOverride(identityId);
+	SimBotBodyProgression snapshot = buildBodyProgressionSnapshot(identityId,
+		applicability);
 	String weaponTemplate;
 	String expectedXpType;
 	bool weaponSelection = selectPlayerBotEarlyGameWeapon(identity,
@@ -8316,7 +8465,34 @@ void SimPlayerManager::reapplyPlayerBotProgressionToLiveBody(
 	}
 }
 
+static bool simBotCombatAbilityConfigEquals(
+		const SimBotCombatAbilityConfig& left,
+		const SimBotCombatAbilityConfig& right) {
+	if (left.enabled != right.enabled ||
+			left.specialAttackChancePercent != right.specialAttackChancePercent ||
+			left.preferFreeStateAbilities != right.preferFreeStateAbilities ||
+			left.hamReserveFraction != right.hamReserveFraction ||
+			left.freeStateRetrySeconds != right.freeStateRetrySeconds ||
+			left.usageHistorySize != right.usageHistorySize ||
+			left.excludedCommands.size() != right.excludedCommands.size())
+		return false;
+
+	for (int i = 0; i < left.excludedCommands.size(); ++i) {
+		if (left.excludedCommands.get(i) != right.excludedCommands.get(i))
+			return false;
+	}
+
+	return true;
+}
+
 void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
+	const bool previousProgressionEnabled = progressionEnabled;
+	SimBotCombatAbilityConfig previousCombatAbilityConfig;
+	{
+		Locker progressionLock(&progressionMutex);
+		previousCombatAbilityConfig = progressionCombatAbilityConfig;
+	}
+
 	progressionEnabled = config.getBooleanField("enabled", progressionEnabled);
 	progressionAwardKillXp = config.getBooleanField("awardKillXp",
 		progressionAwardKillXp);
@@ -8324,6 +8500,44 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		progressionTrainingEnabled);
 	progressionEarlyGameEnabled = config.getBooleanField("earlyGameEnabled",
 		progressionEarlyGameEnabled);
+	SimBotCombatAbilityConfig combatAbilityConfig = previousCombatAbilityConfig;
+	combatAbilityConfig.enabled = config.getBooleanField(
+		"combatAbilitiesEnabled", combatAbilityConfig.enabled);
+	progressionCombatAbilitiesEnabled = combatAbilityConfig.enabled;
+	LuaObject combatAbilities = config.getObjectField("combatAbilities");
+	if (combatAbilities.isValidTable()) {
+		combatAbilityConfig.specialAttackChancePercent = clampMinerInt(
+			combatAbilities.getIntField("specialAttackChancePercent",
+				combatAbilityConfig.specialAttackChancePercent),
+				combatAbilityConfig.specialAttackChancePercent, 0, 100);
+		combatAbilityConfig.preferFreeStateAbilities = combatAbilities.getBooleanField(
+			"preferFreeStateAbilities",
+			combatAbilityConfig.preferFreeStateAbilities);
+		combatAbilityConfig.hamReserveFraction = clampFloatRange(
+			combatAbilities.getFloatField("hamReserveFraction",
+				combatAbilityConfig.hamReserveFraction), 0.f, 0.95f);
+		combatAbilityConfig.freeStateRetrySeconds = clampMinerInt(
+			combatAbilities.getIntField("freeStateRetrySeconds",
+				combatAbilityConfig.freeStateRetrySeconds),
+				combatAbilityConfig.freeStateRetrySeconds, 0, 300);
+		combatAbilityConfig.usageHistorySize = clampMinerInt(
+			combatAbilities.getIntField("usageHistorySize",
+				combatAbilityConfig.usageHistorySize),
+				combatAbilityConfig.usageHistorySize, 0, 64);
+		LuaObject excludedCommands = combatAbilities.getObjectField(
+			"excludedCommands");
+		if (excludedCommands.isValidTable()) {
+			combatAbilityConfig.excludedCommands.removeAll();
+			for (int i = 1; i <= excludedCommands.getTableSize(); ++i) {
+				String command = excludedCommands.getStringAt(i).trim().toLowerCase();
+				if (!command.isEmpty() &&
+						!combatAbilityConfig.excludedCommands.contains(command))
+					combatAbilityConfig.excludedCommands.add(command);
+			}
+		}
+		excludedCommands.pop();
+	}
+	combatAbilities.pop();
 	SimBotEarlyGameConfig earlyGameConfig;
 	VectorMap<String, String> weaponsByXpType;
 	LuaObject earlyGame = config.getObjectField("earlyGame");
@@ -8449,10 +8663,53 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		configuredWeapons.pop();
 	}
 	earlyGame.pop();
+	bool reserveWarning = false;
+	bool logReserveWarning = false;
+	if (combatAbilityConfig.hamReserveFraction <=
+			earlyGameConfig.fleeHamFraction) {
+		reserveWarning = true;
+	}
 	{
 		Locker progressionLock(&progressionMutex);
 		progressionEarlyGameConfig = earlyGameConfig;
 		progressionEarlyGameWeaponsByXpType = weaponsByXpType;
+		progressionCombatAbilityConfig = combatAbilityConfig;
+		if (reserveWarning && !progressionCombatAbilityReserveWarningIssued) {
+			logReserveWarning = true;
+			progressionCombatAbilityReserveWarningIssued = true;
+		} else if (!reserveWarning) {
+			progressionCombatAbilityReserveWarningIssued = false;
+		}
+	}
+	if (logReserveWarning)
+		warning("SimBotCombatAbilitiesHamReserveBelowFleeThreshold reserve=" +
+			String::valueOf(combatAbilityConfig.hamReserveFraction) +
+			" flee=" + String::valueOf(earlyGameConfig.fleeHamFraction));
+	SimBotAbilityUsageLog::setHistorySize(combatAbilityConfig.usageHistorySize);
+	// Configured-on OR harness-armed-on. A harness "false" override is scoped to
+	// its own identities and must never turn production logging off, because
+	// disabling clears every history and counter.
+	bool combatAbilityLoggingEnabled = combatAbilityConfig.enabled;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (playerBotParityTestCombatAbilitiesGateOverrideActive &&
+				playerBotParityTestCombatAbilitiesGateOverride)
+			combatAbilityLoggingEnabled = true;
+	}
+	SimBotAbilityUsageLog::setEnabled(combatAbilityLoggingEnabled);
+
+	if (previousProgressionEnabled != progressionEnabled ||
+			!simBotCombatAbilityConfigEquals(previousCombatAbilityConfig,
+				combatAbilityConfig)) {
+		Vector<uint64> liveIdentityIds;
+		{
+			Locker pveLock(&pveMutex);
+			for (int i = 0; i < pveIdentityBodyOids.size(); ++i)
+				liveIdentityIds.add(pveIdentityBodyOids.elementAt(i).getKey());
+		}
+		Locker progressionLock(&progressionMutex);
+		for (int i = 0; i < liveIdentityIds.size(); ++i)
+			progressionCombatAbilityReapplyIds.put(liveIdentityIds.get(i), true);
 	}
 	// The death capture point runs under creature locks and reads only this
 	// lock-free mirror; turning it off also drops uncollected captures.
@@ -8548,6 +8805,29 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.hasExpectedGraduated = step.expectedGraduated ==
 		table.getBooleanField("graduated", true);
 	step.stalledBox = table.getStringField("stalledBox").trim();
+	step.command = table.getStringField("command").trim();
+	if (step.command.isEmpty())
+		step.command = table.getStringField("ability").trim();
+	step.supersededBy = table.getStringField("supersededBy").trim();
+	step.targetState = table.getStringField("targetState").trim().toLowerCase();
+	step.combatAbilitySpecialAttackChancePercent = table.getIntField(
+		"specialAttackChancePercent", absentExpected);
+	step.hasCombatAbilitySpecialAttackChancePercent =
+		step.combatAbilitySpecialAttackChancePercent != absentExpected;
+	if (!step.hasCombatAbilitySpecialAttackChancePercent)
+		step.combatAbilitySpecialAttackChancePercent = -1;
+	else
+		step.combatAbilitySpecialAttackChancePercent = Math::max(0,
+			Math::min(100, step.combatAbilitySpecialAttackChancePercent));
+	step.combatAbilityHarnessOptIn = table.getBooleanField(
+		"harnessOptIn", false);
+	step.hasCombatAbilityHarnessOptIn = step.combatAbilityHarnessOptIn ==
+		table.getBooleanField("harnessOptIn", true);
+	if (!step.hasCombatAbilityHarnessOptIn) {
+		step.combatAbilityHarnessOptIn = table.getBooleanField("optIn", false);
+		step.hasCombatAbilityHarnessOptIn = step.combatAbilityHarnessOptIn ==
+			table.getBooleanField("optIn", true);
+	}
 	LuaObject damageByType = table.getObjectField("damageByType");
 	if (damageByType.isValidTable()) {
 		for (int i = 1; i <= damageByType.getTableSize(); ++i) {
@@ -10190,6 +10470,39 @@ bool SimPlayerManager::playerBotProgressionAwardGateEnabled() {
 	return true;
 }
 
+bool SimPlayerManager::playerBotCombatAbilitiesGateEnabled(uint64 identityId) {
+	// Same shape as playerBotTrainingGateEnabled - master gate, harness override,
+	// configured flag - with one difference: the override is identity-scoped.
+	// Unlike training, this gate changes what a body carries, so a production
+	// bot that respawned mid-scenario would otherwise keep default-off attacks
+	// after cleanup. The flag is the lock-free mirror written beside
+	// progressionTrainingEnabled, so no manager mutex nests inside
+	// playerBotParityTestMutex here.
+	if (!progressionEnabled)
+		return false;
+	Locker parityLock(&playerBotParityTestMutex);
+	if (identityId != 0 && playerBotParityTestCombatAbilitiesGateOverrideActive &&
+			playerBotParityCombatAbilityScopedIds.contains(identityId))
+		return playerBotParityTestCombatAbilitiesGateOverride;
+	return progressionCombatAbilitiesEnabled;
+}
+
+bool SimPlayerManager::playerBotCombatAbilitiesGateArmed() {
+	if (!progressionEnabled)
+		return false;
+	Locker parityLock(&playerBotParityTestMutex);
+	if (playerBotParityTestCombatAbilitiesGateOverrideActive)
+		return playerBotParityTestCombatAbilitiesGateOverride;
+	return progressionCombatAbilitiesEnabled;
+}
+
+int SimPlayerManager::playerBotCombatAbilityChanceOverride(uint64 identityId) {
+	Locker parityLock(&playerBotParityTestMutex);
+	return identityId != 0 && playerBotParityTestCombatAbilityChanceOverrideActive &&
+		playerBotParityCombatAbilityScopedIds.contains(identityId) ?
+		playerBotParityTestCombatAbilityChanceOverride : -1;
+}
+
 void SimPlayerManager::restoreNoviceGateOverride() {
 	Locker pveLock(&pveMutex);
 	if (!pveNoviceGateOverrideActive)
@@ -10245,6 +10558,8 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 			armingOp = "setEarlyGameGate";
 		else if (gate == "realWeaponDamage")
 			armingOp = "setRealWeaponDamageGate";
+		else if (gate == "combatAbilitiesEnabled")
+			armingOp = "setCombatAbilitiesGate";
 		else if (gate == "novice")
 			armingOp = "setNoviceGate";
 		else if (gate == "progressionEnabled")
@@ -10272,6 +10587,8 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 			live = playerBotRealWeaponDamageGateEnabled();
 		else if (gate == "progressionEnabled")
 			live = playerBotProgressionAwardGateEnabled();
+		else if (gate == "combatAbilitiesEnabled")
+			live = playerBotCombatAbilitiesGateArmed();
 		else if (gate == "novice") {
 			Locker pveLock(&pveMutex);
 			live = pveNoviceEnabled;
@@ -12175,6 +12492,7 @@ void SimPlayerManager::destroyPlayerBotParityBody(int identityIndex,
 	}
 	if (bodyOid == 0)
 		return;
+	SimBotAbilityUsageLog::remove(bodyOid);
 	SimCombatDiagLog::removeTraced(bodyOid);
 
 	Reference<SimPlayerController*> controller = controllers.contains(bodyOid) ?
@@ -12248,10 +12566,14 @@ bool SimPlayerManager::spawnPlayerBotParityKillTarget(
 		position.setZ(terrainZ);
 
 	CreatureManager* creatureManager = zone->getCreatureManager();
-	CreatureObject* creature = creatureManager == nullptr ? nullptr :
-		creatureManager->spawnCreature(targetTemplate.hashCode(), 0,
+	// Hold strong references for the whole setup: a raw pointer here lets the
+	// object's count touch zero between spawn and zone ownership, which clears
+	// the implementation's _this weak reference for the rest of its life.
+	ManagedReference<CreatureObject*> creature = creatureManager == nullptr ?
+		nullptr : creatureManager->spawnCreature(targetTemplate.hashCode(), 0,
 			position.getX(), position.getZ(), position.getY(), 0);
-	AiAgent* target = creature == nullptr ? nullptr : creature->asAiAgent();
+	ManagedReference<AiAgent*> target = creature == nullptr ? nullptr :
+		creature->asAiAgent();
 	if (target == nullptr) {
 		failure = "kill_target_spawn_failed";
 		if (creature != nullptr) {
@@ -12426,7 +12748,14 @@ bool SimPlayerManager::awaitPlayerBotParityKillTarget(
 			return false;
 		if (targetDirect != expectedDirect ||
 				targetGeneral != expectedCombatGeneral) {
-			failure = "kill_target_award_mismatch";
+			// Carry the numbers: a bare reason cannot tell a share split from a
+			// tier cap or a wrong xp type.
+			failure = "kill_target_award_mismatch xpType=" + expectedXpType +
+				" direct=" + String::valueOf(targetDirect) + "/" +
+				String::valueOf(expectedDirect) + " general=" +
+				String::valueOf(targetGeneral) + "/" +
+				String::valueOf(expectedCombatGeneral) + " baseXp=" +
+				String::valueOf(baseXp) + " tier=" + String::valueOf(skillTier);
 			return false;
 		}
 
@@ -12498,6 +12827,17 @@ void SimPlayerManager::despawnPlayerBotParityKillTarget() {
 		object->asCreatureObject();
 	if (creature != nullptr) {
 		Locker creatureLock(creature);
+		// A dead target already owns a pending corpse DespawnCreatureTask. That
+		// task holds the agent and later calls notifyDespawn, which dereferences
+		// the implementation's _this; destroying the object from the database
+		// underneath it left the task running on a released object (SIGSEGV in
+		// AiAgentImplementation::notifyDespawn, TRIP-verify 20260916-144849).
+		// Cancel and deregister it first, as the engine's corpse paths do.
+		Reference<Task*> pendingDespawn = creature->getPendingTask("despawn");
+		if (pendingDespawn != nullptr) {
+			pendingDespawn->cancel();
+			creature->removePendingTask("despawn");
+		}
 		creature->clearCombatState(true);
 		if (creature->getZone() != nullptr)
 			creature->destroyObjectFromWorld(true);
@@ -13012,6 +13352,18 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 			playerBotParityTestRealWeaponDamageGateOverride =
 				playerBotParityTestRealWeaponDamageGateOverridePrevious;
 		}
+		if (playerBotParityTestCombatAbilitiesGateOverrideActive) {
+			playerBotParityTestCombatAbilitiesGateOverrideActive =
+				playerBotParityTestCombatAbilitiesGateOverridePreviousActive;
+			playerBotParityTestCombatAbilitiesGateOverride =
+				playerBotParityTestCombatAbilitiesGateOverridePrevious;
+		}
+		if (playerBotParityTestCombatAbilityChanceOverrideActive) {
+			playerBotParityTestCombatAbilityChanceOverrideActive =
+				playerBotParityTestCombatAbilityChanceOverridePreviousActive;
+			playerBotParityTestCombatAbilityChanceOverride =
+				playerBotParityTestCombatAbilityChanceOverridePrevious;
+		}
 	}
 	// Outside the parity scope above on purpose: this takes pveMutex, and every
 	// reader of pveNoviceEnabled holds pveMutex first, so nesting it under the
@@ -13039,6 +13391,7 @@ void SimPlayerManager::resolvePlayerBotParityExpectedRejection(
 }
 
 void SimPlayerManager::cleanupPlayerBotParityTest() {
+	Vector<uint64> scopedAbilityIdentityIds;
 	// The target may have survived a failed await, a scenario timeout, or a
 	// runtime harness disable. The operation is idempotent and deliberately
 	// happens before the body/row cleanup passes.
@@ -13173,9 +13526,14 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 		playerBotParityTestIdentityIds.removeAll();
 		playerBotParityTestBodyOids.removeAll();
 		playerBotParityTestOracle.removeAll();
-		playerBotParityTestRequestRefs.removeAll();
-		playerBotParityTestIdentityRefs.removeAll();
-		if (!preserveProbe)
+			playerBotParityTestRequestRefs.removeAll();
+			playerBotParityTestIdentityRefs.removeAll();
+			playerBotParityCombatAbilityHarnessOptIns.removeAll();
+			for (int i = 0; i < playerBotParityCombatAbilityScopedIds.size(); ++i)
+				scopedAbilityIdentityIds.add(
+					playerBotParityCombatAbilityScopedIds.elementAt(i).getKey());
+			playerBotParityCombatAbilityScopedIds.removeAll();
+			if (!preserveProbe)
 			playerBotParityTestProbeIdentityId = 0;
 	}
 	{
@@ -13184,6 +13542,16 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 		playerBotParityKillAwardLedger.removeAll();
 		playerBotParityKillAwardLastMs.removeAll();
 	}
+	// Scope is cleared above, so these bodies now resolve the configured gate;
+	// reapply them outside every harness lock so none keeps harness attacks.
+	for (int i = 0; i < scopedAbilityIdentityIds.size(); ++i)
+		reapplyPlayerBotProgressionToLiveBody(scopedAbilityIdentityIds.get(i));
+	// Disabling clears the shared log, so only do it when production is off too
+	// (an armed harness "false" override must not count as production off).
+	const bool productionAbilitiesOn = progressionEnabled &&
+		progressionCombatAbilitiesEnabled;
+	if (!productionAbilitiesOn && !playerBotCombatAbilitiesGateArmed())
+		SimBotAbilityUsageLog::setEnabled(false);
 }
 
 void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
@@ -13719,6 +14087,9 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			op == "assertSkillPoints" || op == "assertAvailableXp" ||
 			op == "assertXpCap" ||
 			op == "assertTier" || op == "assertDirty" || op == "assertSource" ||
+			op == "assertAbility" || op == "assertAbilitySuperseded" ||
+			op == "assertAttackSource" || op == "assertAbilityUse" ||
+			op == "setCombatAbilitiesGate" ||
 			op == "destroyBody" || op == "respawnBody" ||
 			op == "assertPersisted" || op == "deleteProgressionRow" ||
 			op == "deleteIdentity" || op == "writeRestartProbe" ||
@@ -14419,6 +14790,147 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		result.status = "PASS";
 		return true;
 	}
+	if (op == "assertAbility" || op == "assertAttackSource") {
+		if (op == "assertAbility" && step.expect != "present" &&
+				step.expect != "absent") {
+			result.status = "FAIL";
+			result.failReason = "invalid_ability_expectation";
+			return true;
+		}
+		if (op == "assertAttackSource" && step.expect != "skill" &&
+				step.expect != "template") {
+			result.status = "FAIL";
+			result.failReason = "invalid_attack_source_expectation";
+			return true;
+		}
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			if (pveIdentityBodyOids.contains(identityId))
+				bodyOid = pveIdentityBodyOids.get(identityId);
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+			zoneServer->getObject(bodyOid);
+		AiAgent* agent = object == nullptr ? nullptr : object->asAiAgent();
+		if (agent == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "body_not_found";
+			return true;
+		}
+		bool sourceSkill = false;
+		Vector<String> installed;
+		{
+			Locker agentLock(agent);
+			sourceSkill = agent->hasSkillDerivedAttacks();
+			if (op == "assertAbility")
+				installed = agent->getSkillDerivedAttackCommands();
+		}
+		if (op == "assertAttackSource") {
+			if (sourceSkill != (step.expect == "skill")) {
+				result.status = "FAIL";
+				result.failReason = "attack_source_mismatch";
+				return true;
+			}
+		} else {
+			String command = step.command.isEmpty() ? step.skillName : step.command;
+			if (command.isEmpty() || installed.contains(command) !=
+					(step.expect == "present")) {
+				result.status = "FAIL";
+				result.failReason = "ability_presence_mismatch";
+				return true;
+			}
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertAbilityUse") {
+		if (step.command.isEmpty() && step.targetState.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "invalid_ability_use_command";
+			return true;
+		}
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			if (pveIdentityBodyOids.contains(identityId))
+				bodyOid = pveIdentityBodyOids.get(identityId);
+		}
+		Vector<SimBotAbilityUseEntry> entries;
+		SimBotAbilityUsageLog::snapshot(bodyOid, entries);
+		// The per-body ring holds only usageHistorySize entries, so a single early
+		// Intimidate in a long fight scrolls out. Lifetime counts and the
+		// accumulated target-state mask are the durable evidence; the ring is
+		// still consulted first for the combined command+source+state match.
+		VectorMap<String, uint64> lifetimeCounts;
+		SimBotAbilityUsageLog::snapshotCommandCounts(bodyOid, lifetimeCounts);
+		uint64 statesSeen = SimBotAbilityUsageLog::targetStatesSeen(bodyOid);
+		bool found = false;
+		for (int i = 0; i < entries.size(); ++i) {
+			const SimBotAbilityUseEntry& entry = entries.get(i);
+			if (!step.command.isEmpty() && entry.command != step.command)
+				continue;
+			if (step.expect == "special" && !entry.special)
+				continue;
+			if (step.expect == "default" && entry.special)
+				continue;
+			if (step.targetState == "intimidated" &&
+				!(entry.targetStatesBefore & CreatureState::INTIMIDATED))
+				continue;
+			found = true;
+			break;
+		}
+		if (!found) {
+			String command = step.command.toLowerCase();
+			bool commandSeen = command.isEmpty() || (lifetimeCounts.contains(command) &&
+				lifetimeCounts.get(command) > 0 &&
+				(step.expect != "default" || command == "defaultattack") &&
+				(step.expect != "special" || command != "defaultattack"));
+			bool stateSeen = step.targetState != "intimidated" ||
+				(statesSeen & CreatureState::INTIMIDATED) != 0;
+			found = commandSeen && stateSeen &&
+				(step.command.isEmpty() || step.targetState.isEmpty());
+		}
+		if (!found) {
+			result.status = "FAIL";
+			result.failReason = "ability_use_not_observed";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertAbilitySuperseded") {
+		String command = step.command.isEmpty() ? step.skillName : step.command;
+		if (command.isEmpty() || step.supersededBy.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "invalid_superseded_expectation";
+			return true;
+		}
+		SimBotIdentity identity;
+		if (!snapshotPlayerBotIdentity(identityId, identity)) {
+			result.status = "FAIL";
+			result.failReason = "identity_not_found";
+			return true;
+		}
+		SimBotAbilityApplicability applicability;
+		applicability.gateEnabled = playerBotCombatAbilitiesGateEnabled(identityId);
+		applicability.trainingPlan = identity.trainingPlan;
+		applicability.profession = identity.profession;
+		applicability.harnessOptIn =
+			isPlayerBotCombatAbilityHarnessOptIn(identityId);
+		applicability.specialAttackChancePercent =
+			playerBotCombatAbilityChanceOverride(identityId);
+		SimBotBodyProgression snapshot = buildBodyProgressionSnapshot(identityId,
+			applicability);
+		if (!snapshot.supersededAbilities.contains(command) ||
+				!snapshot.abilities.contains(step.supersededBy)) {
+			result.status = "FAIL";
+			result.failReason = "ability_supersession_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
 	if (op == "assertXp" || op == "assertCredits" || op == "assertSkill" ||
 			op == "assertSource") {
 		int64 expectedValue = 0;
@@ -14759,6 +15271,58 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		result.status = "PASS";
 		return true;
 	}
+	if (op == "setCombatAbilitiesGate") {
+		if (identityId == 0) {
+			// The override is identity-scoped by design; an unscoped arming step
+			// would silently affect nothing, so reject the authoring error.
+			result.status = "FAIL";
+			result.failReason = "combat_abilities_gate_requires_identity";
+			return true;
+		}
+		int64 enabledValue = 0;
+		if (step.hasGateEnabled)
+			enabledValue = step.gateEnabled ? 1 : 0;
+		else if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_combat_abilities_gate_value";
+			return true;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			if (!playerBotParityTestCombatAbilitiesGateOverrideActive) {
+				playerBotParityTestCombatAbilitiesGateOverridePreviousActive = false;
+				playerBotParityTestCombatAbilitiesGateOverridePrevious =
+					progressionCombatAbilitiesEnabled;
+			}
+			playerBotParityTestCombatAbilitiesGateOverrideActive = true;
+			playerBotParityTestCombatAbilitiesGateOverride = enabledValue != 0;
+			if (step.hasCombatAbilitySpecialAttackChancePercent) {
+				if (!playerBotParityTestCombatAbilityChanceOverrideActive) {
+					playerBotParityTestCombatAbilityChanceOverridePreviousActive = false;
+				}
+				playerBotParityTestCombatAbilityChanceOverrideActive = true;
+				playerBotParityTestCombatAbilityChanceOverride =
+					step.combatAbilitySpecialAttackChancePercent;
+			}
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityCombatAbilityScopedIds.put(identityId, true);
+			if (step.hasCombatAbilityHarnessOptIn)
+				playerBotParityCombatAbilityHarnessOptIns.put(identityId,
+					step.combatAbilityHarnessOptIn);
+		}
+		// Only ever switch logging ON here. Disabling clears every history and
+		// counter, which would erase production telemetry when the configured
+		// gate is on; the config refresh and cleanup own the OFF transition.
+		if (enabledValue != 0)
+			SimBotAbilityUsageLog::setEnabled(true);
+		// Apply to the scenario's own body now, as trainSkill does, so the
+		// assertion step that follows never races the maintenance sweep.
+		reapplyPlayerBotProgressionToLiveBody(identityId);
+		result.status = "PASS";
+		return true;
+	}
 	if (op == "setTrainingGate") {
 		int64 enabledValue = 0;
 		if (step.hasTrainingGateEnabled)
@@ -14901,6 +15465,498 @@ bool SimPlayerManager::executePlayerBotParityStep(
 	return true;
 }
 
+JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityId) {
+	JSONSerializationType result = JSONSerializationType::object();
+	SimBotIdentity identity;
+	if (!snapshotPlayerBotIdentity(identityId, identity))
+		return result;
+
+	SimBotProgression progression;
+	SimBotTrainingStep nextStep;
+	SimBotEarlyGameState earlyState;
+	bool haveNextStep = false;
+	bool haveEarlyState = false;
+	SimBotTrainingPlan trainingPlan;
+	bool haveTrainingPlan = false;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (progressionRecords.contains(identityId))
+			progression = progressionRecords.get(identityId);
+		if (progressionTrainingNextSteps.contains(identityId)) {
+			nextStep = progressionTrainingNextSteps.get(identityId);
+			haveNextStep = true;
+		}
+		if (progressionEarlyGameStates.contains(identityId)) {
+			earlyState = progressionEarlyGameStates.get(identityId);
+			haveEarlyState = true;
+		}
+		if (progressionTrainingPlans.contains(identity.trainingPlan)) {
+			trainingPlan = progressionTrainingPlans.get(identity.trainingPlan);
+			haveTrainingPlan = true;
+		}
+	}
+
+	JSONSerializationType identityJson = JSONSerializationType::object();
+	identityJson["id"] = identity.id;
+	identityJson["name"] = identity.firstName + " " + identity.lastName;
+	identityJson["profession"] = identity.profession;
+	identityJson["trainingPlan"] = identity.trainingPlan;
+	identityJson["homePlanet"] = identity.homePlanet;
+	identityJson["homeCity"] = identity.homeCity;
+	identityJson["skillTier"] = identity.skillTier;
+	identityJson["kills"] = identity.kills;
+	identityJson["deaths"] = identity.deaths;
+	identityJson["createdAt"] = identity.createdAt;
+	result["identity"] = identityJson;
+
+	JSONSerializationType nextJson = JSONSerializationType::object();
+	if (haveNextStep && nextStep.valid) {
+		nextJson["skill"] = nextStep.skillName;
+		nextJson["xpType"] = nextStep.xpType;
+		int lifetimeEarned = progression.experience.contains(nextStep.xpType) ?
+			progression.experience.get(nextStep.xpType) : 0;
+		nextJson["xpNeeded"] = lifetimeEarned >=
+			nextStep.lifetimeEarnedThreshold ? 0 :
+			nextStep.lifetimeEarnedThreshold - lifetimeEarned;
+		nextJson["lifetimeEarnedThreshold"] =
+			nextStep.lifetimeEarnedThreshold;
+	}
+	result["nextBox"] = nextJson;
+
+	JSONSerializationType professions = JSONSerializationType::object();
+	Vector<String> professionRoots;
+	SkillManager* skillManager = SkillManager::instance();
+	for (int i = 0; i < progression.skills.size(); ++i) {
+		String skillName = progression.skills.get(i);
+		Skill* skill = skillManager == nullptr ? nullptr :
+			skillManager->getSkill(skillName);
+		String root;
+		Skill* cursor = skill;
+		int parentDepth = 0;
+		while (cursor != nullptr && parentDepth++ < 64) {
+			if (cursor->isSkill()) {
+				root = cursor->getSkillName();
+				break;
+			}
+			cursor = cursor->getParent();
+		}
+		if (root.isEmpty()) {
+			int separator = skillName.lastIndexOf('_');
+			root = separator > 0 ? skillName.subString(0, separator) :
+				skillName;
+		}
+		if (!professionRoots.contains(root))
+			professionRoots.add(root);
+	}
+	for (int i = 0; i < professionRoots.size(); ++i) {
+		const String& root = professionRoots.get(i);
+		JSONSerializationType profession = JSONSerializationType::object();
+		JSONSerializationType boxes = JSONSerializationType::array();
+		int boxesTrained = 0;
+		for (int j = 0; j < progression.skills.size(); ++j) {
+			String skillName = progression.skills.get(j);
+			Skill* skill = skillManager == nullptr ? nullptr :
+				skillManager->getSkill(skillName);
+			String skillRoot;
+			Skill* cursor = skill;
+			int parentDepth = 0;
+			while (cursor != nullptr && parentDepth++ < 64) {
+				if (cursor->isSkill()) {
+					skillRoot = cursor->getSkillName();
+					break;
+				}
+				cursor = cursor->getParent();
+			}
+			if (skillRoot.isEmpty()) {
+				int separator = skillName.lastIndexOf('_');
+				skillRoot = separator > 0 ? skillName.subString(0, separator) :
+					skillName;
+			}
+			if (skillRoot == root) {
+				++boxesTrained;
+				boxes.push_back(skillName);
+			}
+		}
+		bool goalReached = false;
+		if (haveTrainingPlan && trainingPlan.profession == root) {
+			goalReached = true;
+			for (int j = 0; j < trainingPlan.goalSkills.size(); ++j) {
+				if (!progression.skills.contains(trainingPlan.goalSkills.get(j))) {
+					goalReached = false;
+					break;
+				}
+			}
+		}
+		profession["boxesTrained"] = boxesTrained;
+		profession["boxes"] = boxes;
+		profession["goalReached"] = goalReached;
+		professions[root.toCharArray()] = profession;
+	}
+	result["professions"] = professions;
+
+	SimBotAbilityApplicability applicability;
+	// Inspection is a read-only derivation view. Show what the trained boxes
+	// would install even while the live capability gate is off; the body source
+	// below still reports the actual installed source.
+	applicability.gateEnabled = true;
+	applicability.trainingPlan = identity.trainingPlan;
+	applicability.profession = identity.profession;
+	applicability.harnessOptIn = true;
+	SimBotBodyProgression abilitySnapshot = buildBodyProgressionSnapshot(
+		identityId, applicability);
+
+	uint64 bodyOid = 0;
+	int bodyHamOverride = 0;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveIdentityBodyOids.contains(identityId))
+			bodyOid = pveIdentityBodyOids.get(identityId);
+		bodyHamOverride = pveNoviceBodyHam;
+	}
+
+	JSONSerializationType bodyTemplate = JSONSerializationType::object();
+	JSONSerializationType appearance = JSONSerializationType::object();
+	JSONSerializationType weaponJson = JSONSerializationType::object();
+	JSONSerializationType bodyJson = JSONSerializationType::object();
+	Vector<String> installedAbilities;
+	Vector<String> usableAbilities;
+	JSONSerializationType predictedAbilityCosts = JSONSerializationType::object();
+	bool bodyAttached = false;
+	bool sourceSkill = false;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> bodyObject = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(bodyOid);
+	AiAgent* bodyAgent = bodyObject == nullptr ? nullptr : bodyObject->asAiAgent();
+	JSONSerializationType skillMods = JSONSerializationType::object();
+	if (bodyAgent != nullptr) {
+		Locker agentLock(bodyAgent);
+		Zone* bodyZone = bodyAgent->getZone();
+		bodyAttached = bodyZone != nullptr;
+		if (bodyZone != nullptr)
+			bodyJson["zone"] = bodyZone->getZoneName();
+		else
+			bodyJson["zone"] = "";
+		Vector3 position = bodyAgent->getWorldPosition();
+		JSONSerializationType positionJson = JSONSerializationType::object();
+		positionJson["x"] = position.getX();
+		positionJson["y"] = position.getY();
+		positionJson["z"] = position.getZ();
+		bodyJson["position"] = positionJson;
+		bodyJson["posture"] = bodyAgent->getPosture();
+		bodyJson["states"] = bodyAgent->getStateBitmask();
+
+		JSONSerializationType ham = JSONSerializationType::object();
+		const char* hamNames[] = {"health", "strength", "constitution", "action",
+			"quickness", "stamina", "mind", "focus", "willpower"};
+		for (int i = 0; i < 9; ++i) {
+			JSONSerializationType pool = JSONSerializationType::object();
+			pool["current"] = bodyAgent->getHAM(i);
+			pool["max"] = bodyAgent->getMaxHAM(i);
+			ham[hamNames[i]] = pool;
+		}
+		bodyJson["ham"] = ham;
+
+		const CreatureTemplate* creatureTemplate = bodyAgent->getCreatureTemplate();
+		if (creatureTemplate != nullptr) {
+			bodyTemplate["key"] = creatureTemplate->getTemplateName();
+			bodyTemplate["objectName"] = creatureTemplate->getObjectName();
+			bodyTemplate["level"] = creatureTemplate->getLevel();
+			JSONSerializationType hamRange = JSONSerializationType::object();
+			hamRange["min"] = creatureTemplate->getBaseHAM();
+			hamRange["max"] = creatureTemplate->getBaseHAMmax();
+			bodyTemplate["hamRange"] = hamRange;
+			bodyTemplate["bodyHam"] = bodyHamOverride;
+			bodyTemplate["defaultWeaponKind"] = creatureTemplate->getDefaultWeapon();
+			int templateAttacks = 0;
+			const CreatureAttackMap* primary = creatureTemplate->getPrimaryAttacks();
+			const CreatureAttackMap* secondary = creatureTemplate->getSecondaryAttacks();
+			if (primary != nullptr)
+				templateAttacks += primary->size();
+			if (secondary != nullptr)
+				templateAttacks += secondary->size();
+			bodyTemplate["attacksFromTemplate"] = templateAttacks;
+		}
+
+		if (bodyAgent->getObjectTemplate() != nullptr) {
+			appearance["iff"] = bodyAgent->getObjectTemplate()->
+				getAppearanceFilename();
+			appearance["template"] = bodyAgent->getObjectTemplate()->
+				getFullTemplateString();
+		}
+		sourceSkill = bodyAgent->hasSkillDerivedAttacks();
+		installedAbilities = bodyAgent->getSkillDerivedAttackCommands();
+		const CreatureAttackMap* currentAttackMap = bodyAgent->getAttackMap();
+		if (currentAttackMap != nullptr) {
+			for (int i = 0; i < currentAttackMap->size(); ++i)
+				usableAbilities.add(currentAttackMap->getCommand(i));
+		}
+
+		WeaponObject* weapon = bodyAgent->getWeapon();
+		if (weapon != nullptr) {
+			if (weapon->getObjectTemplate() != nullptr)
+				weaponJson["template"] = weapon->getObjectTemplate()->
+					getFullTemplateString();
+			weaponJson["xpType"] = weapon->getXpType();
+			weaponJson["minDamage"] = weapon->getMinDamage();
+			weaponJson["maxDamage"] = weapon->getMaxDamage();
+			weaponJson["range"] = weapon->getMaxRange();
+			weaponJson["speed"] = weapon->getAttackSpeed();
+			weaponJson["healthCost"] = weapon->getHealthAttackCost();
+			weaponJson["actionCost"] = weapon->getActionAttackCost();
+			weaponJson["mindCost"] = weapon->getMindAttackCost();
+			ObjectController* objectController = zoneServer == nullptr ? nullptr :
+				zoneServer->getObjectController();
+			CombatManager* combatManager = CombatManager::instance();
+			if (objectController != nullptr && combatManager != nullptr) {
+				for (int i = 0; i < abilitySnapshot.abilities.size(); ++i) {
+					const String& commandName = abilitySnapshot.abilities.get(i);
+					if (!usableAbilities.contains(commandName))
+						continue;
+					const CombatQueueCommand* command = cast<const CombatQueueCommand*>(
+						objectController->getQueueCommand(commandName));
+					if (command == nullptr)
+						continue;
+					float healthCost = 0.f;
+					float actionCost = 0.f;
+					float mindCost = 0.f;
+					combatManager->computeSpecialAttackHamCost(
+						bodyAgent->asCreatureObject(),
+						weapon, command->getHealthCostMultiplier(),
+						command->getActionCostMultiplier(),
+						command->getMindCostMultiplier(), healthCost, actionCost,
+						mindCost);
+					JSONSerializationType costs = JSONSerializationType::object();
+					costs["health"] = healthCost;
+					costs["action"] = actionCost;
+					costs["mind"] = mindCost;
+					predictedAbilityCosts[commandName.toCharArray()] = costs;
+				}
+			}
+		}
+
+		for (int i = 0; i < abilitySnapshot.modDeltas.size(); ++i) {
+			const String& modName = abilitySnapshot.modDeltas.elementAt(i).getKey();
+			JSONSerializationType mod = JSONSerializationType::object();
+			mod["templateBase"] = bodyAgent->getSkillModOfType(modName,
+				SkillModManager::TEMPLATE);
+			mod["skillboxDelta"] = bodyAgent->getSkillModOfType(modName,
+				SkillModManager::SKILLBOX);
+			mod["effective"] = bodyAgent->getSkillMod(modName);
+			skillMods[modName.toCharArray()] = mod;
+		}
+	}
+
+	bodyJson["bodyOid"] = bodyOid;
+	bodyJson["attached"] = bodyAttached;
+	bodyJson["bodyAttached"] = bodyAttached;
+	bodyJson["earlyGameActivity"] = haveEarlyState ? earlyState.activity :
+		String("unknown");
+	bodyJson["earlyGamePhase"] = haveEarlyState ? earlyState.phase : String();
+	bodyJson["earlyGameGraduated"] = haveEarlyState ? earlyState.graduated : false;
+	result["body"] = bodyJson;
+	bodyTemplate["bodyHam"] = bodyHamOverride;
+	JSONSerializationType templates = JSONSerializationType::object();
+	templates["body"] = bodyTemplate;
+	templates["appearance"] = appearance;
+	templates["aiTree"] = identity.profession == "harness" ?
+		String("simParityTest") : String("simHunter");
+	weaponJson["predictedAbilityCosts"] = predictedAbilityCosts;
+	templates["weapon"] = weaponJson;
+	templates["attackSource"] = sourceSkill ? String("skill") :
+		String("template");
+	result["templates"] = templates;
+
+	JSONSerializationType activeAbilities = JSONSerializationType::array();
+	JSONSerializationType inactiveAbilities = JSONSerializationType::array();
+	for (int i = 0; i < installedAbilities.size(); ++i) {
+		if (usableAbilities.contains(installedAbilities.get(i)))
+			activeAbilities.push_back(installedAbilities.get(i));
+		else {
+			JSONSerializationType inactive = JSONSerializationType::object();
+			inactive["command"] = installedAbilities.get(i);
+			inactive["reason"] = "not_usable_with_current_weapon";
+			inactiveAbilities.push_back(inactive);
+		}
+	}
+	JSONSerializationType supersededAbilities = JSONSerializationType::array();
+	for (int i = 0; i < abilitySnapshot.supersededAbilities.size(); ++i) {
+		const String& command = abilitySnapshot.supersededAbilities.get(i);
+		JSONSerializationType superseded = JSONSerializationType::object();
+		superseded["command"] = command;
+		String replacement;
+		SimBotAbilityTier lowerTier = SimBotAbilityTiers::parseAbilityTier(command);
+		for (int j = 0; j < abilitySnapshot.abilities.size(); ++j) {
+			SimBotAbilityTier higherTier = SimBotAbilityTiers::parseAbilityTier(
+				abilitySnapshot.abilities.get(j));
+			if (higherTier.chainKey == lowerTier.chainKey &&
+					higherTier.tier > lowerTier.tier) {
+				replacement = abilitySnapshot.abilities.get(j);
+				break;
+			}
+		}
+		superseded["replacedBy"] = replacement;
+		supersededAbilities.push_back(superseded);
+	}
+	JSONSerializationType excludedAbilities = JSONSerializationType::array();
+	for (int i = 0; i < abilitySnapshot.excludedAbilities.size(); ++i)
+		excludedAbilities.push_back(abilitySnapshot.excludedAbilities.get(i));
+	// What the trained boxes grant, independent of the gate, so the drawer and
+	// the live-derivation probe work while the capability is still off.
+	JSONSerializationType derivedAbilities = JSONSerializationType::array();
+	for (int i = 0; i < abilitySnapshot.abilities.size(); ++i)
+		derivedAbilities.push_back(abilitySnapshot.abilities.get(i));
+	String notInstalledReason;
+	if (!sourceSkill) {
+		if (!bodyAttached)
+			notInstalledReason = "no_live_body";
+		else if (!playerBotCombatAbilitiesGateEnabled(identityId))
+			notInstalledReason = "capability_gate_off";
+		else if (identity.trainingPlan.isEmpty())
+			notInstalledReason = "no_training_plan";
+		else
+			notInstalledReason = "not_applied_yet";
+	}
+	JSONSerializationType abilities = JSONSerializationType::object();
+	abilities["derived"] = derivedAbilities;
+	abilities["notInstalledReason"] = notInstalledReason;
+	abilities["active"] = activeAbilities;
+	abilities["inactiveForWeapon"] = inactiveAbilities;
+	abilities["superseded"] = supersededAbilities;
+	abilities["excluded"] = excludedAbilities;
+	result["abilities"] = abilities;
+	result["skillMods"] = skillMods;
+
+	Vector<SimBotAbilityUseEntry> recentUse;
+	SimBotAbilityUsageLog::snapshot(bodyOid, recentUse);
+	JSONSerializationType recentJson = JSONSerializationType::array();
+	uint64 nowMs = System::getMiliTime();
+	for (int i = 0; i < recentUse.size(); ++i) {
+		const SimBotAbilityUseEntry& entry = recentUse.get(i);
+		JSONSerializationType use = JSONSerializationType::object();
+		use["command"] = entry.command;
+		use["ageSeconds"] = entry.atMs == 0 ? static_cast<uint64>(0) :
+			(nowMs > entry.atMs ? (nowMs - entry.atMs) / 1000 :
+			static_cast<uint64>(0));
+		use["targetOid"] = entry.targetOid;
+		use["targetTemplate"] = entry.targetTemplate;
+		use["targetStatesBefore"] = entry.targetStatesBefore;
+		use["source"] = entry.special ? String("special") : String("default");
+		recentJson.push_back(use);
+	}
+	result["recentAbilityUse"] = recentJson;
+	VectorMap<String, uint64> useCounts;
+	SimBotAbilityUsageLog::snapshotCommandCounts(bodyOid, useCounts);
+	JSONSerializationType countJson = JSONSerializationType::object();
+	for (int i = 0; i < useCounts.size(); ++i)
+		countJson[useCounts.elementAt(i).getKey().toCharArray()] =
+			useCounts.elementAt(i).getValue();
+	result["abilityUseCounts"] = countJson;
+
+	return result;
+}
+
+String SimPlayerManager::buildPlayerBotAdminInfoText(uint64 identityId) {
+	// Same facts and lock choreography as the dashboard drawer, rendered as the
+	// plain lines an admin reads in a SUI message box.
+	JSONSerializationType inspect = getPlayerBotInspectJson(identityId);
+	if (inspect.empty())
+		return "SimBot is no longer registered.";
+
+	auto text = [](const JSONSerializationType& node, const char* key) {
+		if (!node.is_object() || !node.contains(key) || node[key].is_null())
+			return String();
+		const JSONSerializationType& value = node[key];
+		if (value.is_string())
+			return String(value.get<std::string>().c_str());
+		return String(value.dump().c_str());
+	};
+	auto joinArray = [](const JSONSerializationType& node, const char* field) {
+		StringBuffer joined;
+		if (!node.is_array() || node.empty())
+			return String("none");
+		for (size_t i = 0; i < node.size(); ++i) {
+			if (i > 0)
+				joined << ", ";
+			const JSONSerializationType& item = node[i];
+			if (item.is_string())
+				joined << item.get<std::string>().c_str();
+			else if (field != nullptr && item.is_object() && item.contains(field))
+				joined << item[field].get<std::string>().c_str();
+			else
+				joined << item.dump().c_str();
+		}
+		return joined.toString();
+	};
+
+	const JSONSerializationType& identity = inspect["identity"];
+	const JSONSerializationType& templates = inspect["templates"];
+	const JSONSerializationType& body = inspect["body"];
+	const JSONSerializationType& abilities = inspect["abilities"];
+	StringBuffer out;
+	out << "Name: " << text(identity, "name") << endl;
+	out << "Identity: " << text(identity, "id") << "  Body OID: "
+		<< text(body, "bodyOid") << endl;
+	out << "Profession: " << text(identity, "profession") << "  Plan: "
+		<< text(identity, "trainingPlan") << "  Tier: "
+		<< text(identity, "skillTier") << endl;
+	out << "Home: " << text(identity, "homePlanet") << " / "
+		<< text(identity, "homeCity") << "  Kills/Deaths: "
+		<< text(identity, "kills") << " / " << text(identity, "deaths") << endl;
+	out << "Activity: " << text(body, "earlyGameActivity") << "  Zone: "
+		<< text(body, "zone") << endl << endl;
+
+	out << "Templates:" << endl;
+	out << "  Body: " << text(templates["body"], "key") << " ("
+		<< text(templates["body"], "objectName") << "), level "
+		<< text(templates["body"], "level") << ", HAM override "
+		<< text(templates["body"], "bodyHam") << endl;
+	out << "  Weapon: " << text(templates["weapon"], "template") << " ("
+		<< text(templates["weapon"], "xpType") << ")" << endl;
+	out << "  AI: " << text(templates, "aiTree") << "  Attacks from: "
+		<< (text(templates, "attackSource") == "skill" ?
+			"trained skills" : "body template") << endl << endl;
+
+	out << "Professions:" << endl;
+	const JSONSerializationType& professions = inspect["professions"];
+	if (professions.is_object() && !professions.empty()) {
+		for (auto it = professions.begin(); it != professions.end(); ++it) {
+			out << "  " << it.key().c_str() << ": "
+				<< text(it.value(), "boxesTrained") << " boxes ("
+				<< joinArray(it.value()["boxes"], nullptr) << ")" << endl;
+		}
+	} else {
+		out << "  none" << endl;
+	}
+	const JSONSerializationType& nextBox = inspect["nextBox"];
+	out << "Next box: " << (text(nextBox, "skill").isEmpty() ? String("none") :
+		text(nextBox, "skill") + " (" + text(nextBox, "xpNeeded") + " " +
+		text(nextBox, "xpType") + " XP needed)") << endl << endl;
+
+	out << "Abilities (granted by boxes): " << joinArray(abilities["derived"], nullptr) << endl;
+	if (!text(abilities, "notInstalledReason").isEmpty())
+		out << "  Not installed: " << text(abilities, "notInstalledReason") << endl;
+	out << "Abilities (active): " << joinArray(abilities["active"], nullptr) << endl;
+	out << "Abilities (superseded): " << joinArray(abilities["superseded"],
+		"command") << endl;
+	out << "Abilities (other weapon): " << joinArray(abilities["inactiveForWeapon"],
+		"command") << endl << endl;
+
+	out << "Skill mods (base / trained / effective):" << endl;
+	const JSONSerializationType& skillMods = inspect["skillMods"];
+	if (skillMods.is_object() && !skillMods.empty()) {
+		for (auto it = skillMods.begin(); it != skillMods.end(); ++it) {
+			out << "  " << it.key().c_str() << ": "
+				<< text(it.value(), "templateBase") << " / "
+				<< text(it.value(), "skillboxDelta") << " / "
+				<< text(it.value(), "effective") << endl;
+		}
+	} else {
+		out << "  none" << endl;
+	}
+
+	return out.toString();
+}
+
 JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	// Keyed by identity id so the per-record row build below stays linear; the
 	// dashboard is polled every few seconds against a roster meant to grow.
@@ -14915,6 +15971,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	VectorMap<uint64, SimBotProgression> records;
 	VectorMap<uint64, SimBotEarlyGameState> earlyGameStateSnapshot;
 	SimBotEarlyGameConfig earlyGameConfigSnapshot;
+	SimBotCombatAbilityConfig combatAbilityConfigSnapshot;
 	int dirtyCount = 0;
 	uint64 lastFlushMs = 0;
 	uint64 lastAwardMs = 0;
@@ -14927,6 +15984,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		records = progressionRecords;
 		earlyGameStateSnapshot = progressionEarlyGameStates;
 		earlyGameConfigSnapshot = progressionEarlyGameConfig;
+		combatAbilityConfigSnapshot = progressionCombatAbilityConfig;
 		dirtyCount = progressionDirtyIds.size();
 		nextStepSnapshot = progressionTrainingNextSteps;
 		pendingTrainingCount = progressionTrainingPendingIds.size();
@@ -15008,9 +16066,12 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	gates["trainingEnabled"] = playerBotTrainingGateEnabled();
 	gates["earlyGameEnabled"] = playerBotEarlyGameGateEnabled();
 	gates["realWeaponDamage"] = playerBotRealWeaponDamageGateEnabled();
+	gates["combatAbilitiesEnabled"] = playerBotCombatAbilitiesGateArmed();
 	gates["bazaarSell"] = false;
 	gates["bazaarBuy"] = false;
 	result["gates"] = gates;
+
+	int abilityBodies = 0;
 
 	JSONSerializationType training = JSONSerializationType::object();
 	training["enabled"] = playerBotTrainingGateEnabled();
@@ -15321,6 +16382,8 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 				if (bodyAgent->getZone() != nullptr &&
 						bodyAgent->getWeapon() != nullptr)
 					heldWeaponXpType = bodyAgent->getWeapon()->getXpType();
+				if (bodyAgent->hasSkillDerivedAttacks())
+					++abilityBodies;
 			}
 		}
 
@@ -15388,6 +16451,41 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		identityRows.push_back(row);
 	}
 	result["identities"] = identityRows;
+
+	JSONSerializationType combatAbilities = JSONSerializationType::object();
+	combatAbilities["gate"] = playerBotCombatAbilitiesGateArmed();
+	combatAbilities["configured"] = combatAbilityConfigSnapshot.enabled;
+	combatAbilities["specialAttackChancePercent"] =
+		combatAbilityConfigSnapshot.specialAttackChancePercent;
+	combatAbilities["preferFreeStateAbilities"] =
+		combatAbilityConfigSnapshot.preferFreeStateAbilities;
+	combatAbilities["hamReserveFraction"] =
+		combatAbilityConfigSnapshot.hamReserveFraction;
+	combatAbilities["freeStateRetrySeconds"] =
+		combatAbilityConfigSnapshot.freeStateRetrySeconds;
+	combatAbilities["usageHistorySize"] =
+		combatAbilityConfigSnapshot.usageHistorySize;
+	combatAbilities["bodiesWithAbilities"] = abilityBodies;
+	combatAbilities["bodiesWithUsage"] =
+		SimBotAbilityUsageLog::bodiesWithHistory();
+	combatAbilities["specialsEnqueued"] =
+		SimBotAbilityUsageLog::specialsEnqueued();
+	combatAbilities["defaultsEnqueued"] =
+		SimBotAbilityUsageLog::defaultsEnqueued();
+	combatAbilities["freeStateForced"] =
+		SimBotAbilityUsageLog::freeStateForced();
+	combatAbilities["reserveSkips"] =
+		SimBotAbilityUsageLog::reserveSkips();
+	combatAbilities["reserveRefusedAtExecution"] =
+		progressionCombatAbilityReserveRefusedAtExecution.get();
+	JSONSerializationType abilityCounts = JSONSerializationType::object();
+	VectorMap<String, uint64> usageCounts;
+	SimBotAbilityUsageLog::snapshotCommandCounts(usageCounts);
+	for (int i = 0; i < usageCounts.size(); ++i)
+		abilityCounts[usageCounts.elementAt(i).getKey()] =
+			usageCounts.elementAt(i).getValue();
+	combatAbilities["abilityUseCounts"] = abilityCounts;
+	result["combatAbilities"] = combatAbilities;
 
 	JSONSerializationType harness = JSONSerializationType::object();
 	Vector<PlayerBotParityTestScenarioResult> harnessResults;
@@ -15856,6 +16954,7 @@ bool SimPlayerManager::drainPveIdentityBody(uint64 identityId, uint64 nowMs) {
 		pveTerminalVisitEpoch.drop(identityId);
 		clearPveHunterOrderLocked(identityId, "BODY_DRAINED");
 	}
+	SimBotAbilityUsageLog::remove(bodyOid);
 	SimCombatDiagLog::removeTraced(bodyOid);
 	controllers.drop(bodyOid);
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
@@ -15896,8 +16995,10 @@ void SimPlayerManager::retirePveIdentity(uint64 identityId) {
 	}
 	if (resumed)
 		retirementsResumed.increment();
-	if (bodyOid != 0)
+	if (bodyOid != 0) {
+		SimBotAbilityUsageLog::remove(bodyOid);
 		SimCombatDiagLog::removeTraced(bodyOid);
+	}
 	if (bodyOid != 0) {
 		controllers.drop(bodyOid);
 		ZoneServer* zoneServer = ServerCore::getZoneServer();
@@ -16273,8 +17374,18 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 
 	// Copy all progression state before entering the agent lock. The overlay
 	// application itself is deliberately lock-local and takes no manager lock.
+	const bool combatAbilitiesGateEnabled =
+		playerBotCombatAbilitiesGateEnabled(identity.id);
+	SimBotAbilityApplicability applicability;
+	applicability.gateEnabled = combatAbilitiesGateEnabled;
+	applicability.trainingPlan = identity.trainingPlan;
+	applicability.profession = identity.profession;
+	applicability.harnessOptIn =
+		isPlayerBotCombatAbilityHarnessOptIn(identity.id);
+	applicability.specialAttackChancePercent =
+		playerBotCombatAbilityChanceOverride(identity.id);
 	SimBotBodyProgression bodyProgression =
-		buildBodyProgressionSnapshot(identity.id);
+		buildBodyProgressionSnapshot(identity.id, applicability);
 	String fullName = identity.firstName + " " + identity.lastName;
 	bool equipped = false;
 	{
@@ -16417,6 +17528,7 @@ void SimPlayerManager::drainSimPresenceBodies(uint64 nowMs) {
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
 	for (int i = 0; i < presenceOids.size(); ++i) {
 		uint64 oid = presenceOids.get(i);
+		SimBotAbilityUsageLog::remove(oid);
 		SimCombatDiagLog::removeTraced(oid);
 		controllers.drop(oid);
 
@@ -16443,6 +17555,13 @@ void SimPlayerManager::drainSimPresenceBodies(uint64 nowMs) {
 }
 
 void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
+	int liveBodyCount = 0;
+	{
+		Locker pveLock(&pveMutex);
+		liveBodyCount = pveIdentityBodyOids.size();
+	}
+	SimBotAbilityUsageLog::setMaxBodies(liveBodyCount);
+
 	if (!pveWorldPresenceEnabled) {
 		drainSimPresenceBodies(nowMs);
 		return;
@@ -16479,6 +17598,7 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 
 			for (int i = 0; i < orphanBodyOids.size(); ++i) {
 				uint64 oid = orphanBodyOids.get(i);
+				SimBotAbilityUsageLog::remove(oid);
 				SimCombatDiagLog::removeTraced(oid);
 				controllers.drop(oid);
 
@@ -16589,6 +17709,7 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 	// drops the target observer and combat relationship, while the manager
 	// lock above is already released and the order has been requeued.
 	for (int i = 0; i < removedBodyOids.size(); ++i) {
+		SimBotAbilityUsageLog::remove(removedBodyOids.get(i));
 		SimCombatDiagLog::removeTraced(removedBodyOids.get(i));
 		controllers.drop(removedBodyOids.get(i));
 	}
@@ -20548,6 +21669,7 @@ void SimPlayerManager::onPveHunterDied(uint64 identityId, uint64 bodyOid) {
 	}
 
 	if (countDeath) {
+		SimBotAbilityUsageLog::remove(bodyOid);
 		// Only the claim that counts the death collects the killing-blow capture,
 		// so a concurrent duplicate call can never take it and discard it.
 		// Collected for every hunter so no capture outlives its body.
@@ -20840,6 +21962,7 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 		drainPlayerBotTrainingQueue();
 		runPlayerBotTrainingSweep();
 	}
+	runPlayerBotCombatAbilityReapplySweep();
 	refreshPlayerBotActivityStates();
 
 	uint64 nowMs = System::getMiliTime();

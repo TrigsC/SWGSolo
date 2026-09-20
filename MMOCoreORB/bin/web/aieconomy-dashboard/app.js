@@ -24,7 +24,15 @@
     statsPollMs: 30000,
     lastStatsMs: 0,
     mapZone: localStorage.getItem("core3_cmd_zone") || "",
-    route: (location.hash || "#/command").replace(/^#\//, "")
+    route: (location.hash || "#/command").replace(/^#\//, ""),
+    playerBot: {
+      open: false,
+      identityId: 0,
+      data: null,
+      loading: false,
+      error: "",
+      previousFocus: null
+    }
   };
 
   /* ---------------- history (trend buffer) ---------------- */
@@ -277,6 +285,146 @@
     }
   }
 
+  function ensurePlayerBotDrawer() {
+    if ($("playerbot-drawer")) return;
+    const drawer = document.createElement("aside");
+    drawer.id = "playerbot-drawer";
+    drawer.className = "playerbot-drawer";
+    drawer.setAttribute("aria-hidden", "true");
+    drawer.innerHTML = `<div class="playerbot-backdrop" data-playerbot-close="true"></div>
+      <section class="playerbot-sheet" role="dialog" aria-modal="true" aria-labelledby="playerbot-title">
+        <header class="playerbot-header"><div><span class="panel-tag">PLAYERBOT INSPECTION</span><h2 id="playerbot-title">SimBot</h2></div>
+          <button type="button" class="drawer-close" id="playerbot-close" data-playerbot-close="true" aria-label="Close PlayerBot inspection">×</button></header>
+        <div class="playerbot-content" id="playerbot-content"></div>
+      </section>`;
+    document.body.appendChild(drawer);
+  }
+
+  function playerBotList(items, empty) {
+    const list = Array.isArray(items) ? items : [];
+    return list.length ? list.map((item) => chip(item, "ghost")).join(" ")
+      : `<span class="muted small">${esc(empty || "none")}</span>`;
+  }
+
+  function renderPlayerBotDetails(data) {
+    const identity = data.identity || {};
+    const templates = data.templates || {};
+    const bodyTemplate = templates.body || {};
+    const weapon = templates.weapon || {};
+    const body = data.body || {};
+    const abilities = data.abilities || {};
+    const professions = data.professions || {};
+    const recent = Array.isArray(data.recentAbilityUse) ? data.recentAbilityUse : [];
+    const mods = data.skillMods || {};
+    const home = [identity.homePlanet, identity.homeCity].filter(Boolean).join(" / ") || "unknown";
+    const activity = body.earlyGameActivity || "unknown";
+    const position = body.position ? [body.position.x, body.position.y, body.position.z]
+      .map((v) => Number(v).toFixed(1)).join(" / ") : "unknown";
+    const ham = body.ham || {};
+    const hamText = ["health", "action", "mind"].map((key) => {
+      const pool = ham[key] || {};
+      return `${labelize(key)} ${num(pool.current)} / ${num(pool.max)}`;
+    }).join(" · ");
+    const professionCards = Object.entries(professions).map(([name, p]) => {
+      const boxes = Array.isArray(p.boxes) ? p.boxes : [];
+      const trained = Number(p.boxesTrained || 0);
+      const total = Math.max(trained, Number(p.boxCount || trained || 1));
+      return `<div class="playerbot-profession"><div class="playerbot-row"><span>${esc(labelize(name))}</span><span>${num(trained)} boxes${p.goalReached ? " · goal reached" : ""}</span></div>
+        <div class="playerbot-progress"><span style="width:${Math.min(100, Math.round((trained / total) * 100))}%"></span></div>
+        <div class="playerbot-chips">${playerBotList(boxes)}</div></div>`;
+    }).join("") || `<span class="muted small">No trained boxes.</span>`;
+    const superseded = (abilities.superseded || []).map((item) =>
+      `<span class="playerbot-ability superseded">${esc(item.command || item)}${item.replacedBy ? ` <small>replaced by ${esc(item.replacedBy)}</small>` : ""}</span>`).join(" ");
+    const inactive = (abilities.inactiveForWeapon || []).map((item) =>
+      `<span class="playerbot-ability inactive">${esc(item.command || item)} <small>${esc(item.reason || "weapon inactive")}</small></span>`).join(" ");
+    const recentRows = recent.map((item) => `<div class="playerbot-recent"><span>${esc(item.command || "unknown")}</span><span>${ago(item.ageSeconds)} · target ${esc(item.targetTemplate || item.targetOid || "unknown")}</span></div>`).join("");
+    const modRows = Object.entries(mods).map(([name, mod]) => `<tr><td>${esc(name)}</td><td>${num(mod.templateBase)}</td><td>${num(mod.skillboxDelta)}</td><td>${num(mod.effective)}</td></tr>`).join("");
+    const next = data.nextBox || {};
+    const source = templates.attackSource === "skill" ? "trained skills" : "body template";
+
+    return `<div class="playerbot-card"><h3>WHO</h3><p class="playerbot-lead">${esc(identity.name || "Unnamed SimBot")}</p>
+      ${kvRows([["Profession", esc(labelize(identity.profession || "unknown"))], ["Home", esc(home)], ["Tier", num(identity.skillTier)], ["Kills / deaths", `${num(identity.kills)} / ${num(identity.deaths)}`], ["Activity", esc(labelize(activity))], ["Body", body.attached ? `attached · ${esc(body.zone || "unknown")}` : "not attached"]])}</div>
+      <div class="playerbot-card"><h3>TEMPLATES</h3><p>Body: <b>${esc(bodyTemplate.objectName || "unknown")}</b> (<code>${esc(bodyTemplate.key || "unknown")}</code>) — level ${num(bodyTemplate.level)}; HAM ${num(bodyTemplate.bodyHam || 0)} per pool.</p>
+        <p>Weapon: <code>${esc(weapon.template || "unarmed")}</code> — earns ${esc(labelize(weapon.xpType || "unknown"))} XP.</p>
+        <p>AI: <code>${esc(templates.aiTree || "unknown")}</code> — controller moves, stock tree fights.</p><p>Attacks from: <b>${esc(source)}</b>.</p>
+        ${kvRows([["Position", esc(position)], ["HAM", esc(hamText)], ["Posture", esc(labelize(body.posture || "unknown"))], ["States", num(body.states)]])}</div>
+      <div class="playerbot-card"><h3>PROFESSIONS</h3>${professionCards}<p class="playerbot-next"><b>Next box:</b> ${esc(next.skill || "none")} · ${esc(labelize(next.xpType || "unknown"))} · ${num(next.xpNeeded)} XP needed</p></div>
+      <div class="playerbot-card"><h3>ABILITIES</h3>${abilities.notInstalledReason ? `<p class="playerbot-label">GRANTED BY BOXES · NOT INSTALLED (${esc(labelize(abilities.notInstalledReason))})</p><div class="playerbot-chips">${playerBotList(abilities.derived, "No combat abilities from trained boxes.")}</div>` : ""}
+        <p class="playerbot-label">ACTIVE</p><div class="playerbot-chips">${playerBotList(abilities.active, "No active abilities.")}</div>
+        ${inactive ? `<p class="playerbot-label">WEAPON-INACTIVE</p><div class="playerbot-chips">${inactive}</div>` : ""}
+        ${superseded ? `<p class="playerbot-label">SUPERSEDED</p><div class="playerbot-chips">${superseded}</div>` : ""}
+        ${(abilities.excluded || []).length ? `<details><summary>Excluded (${abilities.excluded.length})</summary><div class="playerbot-chips">${playerBotList(abilities.excluded)}</div></details>` : ""}</div>
+      <div class="playerbot-card"><h3>RECENT ABILITY USE</h3>${recentRows || `<span class="muted small">No recorded ability use.</span>`}</div>
+      <div class="playerbot-card"><h3>SKILL MODS</h3>${modRows ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Mod</th><th>Base</th><th>Trained</th><th>Effective</th></tr></thead><tbody>${modRows}</tbody></table></div>` : `<span class="muted small">No live skill mods.</span>`}</div>`;
+  }
+
+  function renderPlayerBotDrawer() {
+    ensurePlayerBotDrawer();
+    const drawer = $("playerbot-drawer");
+    const content = $("playerbot-content");
+    const title = $("playerbot-title");
+    const view = state.playerBot;
+    drawer.classList.toggle("open", view.open);
+    drawer.setAttribute("aria-hidden", view.open ? "false" : "true");
+    title.textContent = view.data && view.data.identity ?
+      view.data.identity.name || "SimBot" : "SimBot";
+    // A background refresh keeps the last good render; only a first load shows the spinner text.
+    if (view.loading && !view.data) content.innerHTML = `<div class="playerbot-state">Loading inspection…</div>`;
+    else if (view.error) content.innerHTML = `<div class="playerbot-state error-panel">${esc(view.error)}</div>`;
+    else if (view.data && !view.loading) content.innerHTML = renderPlayerBotDetails(view.data);
+    else if (view.data) return;
+    else content.innerHTML = `<div class="playerbot-state">Select a PlayerBot to inspect.</div>`;
+  }
+
+  async function loadPlayerBotInspection() {
+    const requestedId = state.playerBot.identityId;
+    if (!requestedId || !state.token) return;
+    state.playerBot.loading = true;
+    state.playerBot.error = "";
+    renderPlayerBotDrawer();
+    try {
+      const response = await apiGet(`/v1/aieconomy/playerbot/${encodeURIComponent(requestedId)}/`, 9000);
+      if (!state.playerBot.open || state.playerBot.identityId !== requestedId) return;
+      state.playerBot.data = response && response.result ? response.result : response;
+    } catch (e) {
+      if (!state.playerBot.open || state.playerBot.identityId !== requestedId) return;
+      state.playerBot.error = e && e.name === "AbortError" ? "Inspection request timed out." : String(e && e.message || e);
+    } finally {
+      if (state.playerBot.open && state.playerBot.identityId === requestedId) {
+        state.playerBot.loading = false;
+        renderPlayerBotDrawer();
+      }
+    }
+  }
+
+  function openPlayerBotInspection(identityId) {
+    const id = String(identityId || "");
+    if (!id) return;
+    state.playerBot.previousFocus = document.activeElement;
+    state.playerBot.open = true;
+    state.playerBot.identityId = id;
+    state.playerBot.data = null;
+    state.playerBot.error = "";
+    ensurePlayerBotDrawer();
+    renderPlayerBotDrawer();
+    $("playerbot-close").focus();
+    loadPlayerBotInspection();
+  }
+
+  function closePlayerBotInspection() {
+    const previous = state.playerBot.previousFocus;
+    state.playerBot.open = false;
+    state.playerBot.loading = false;
+    state.playerBot.previousFocus = null;
+    renderPlayerBotDrawer();
+    if (previous && typeof previous.focus === "function") previous.focus();
+  }
+
+  function refreshPlayerBotInspection() {
+    if (state.playerBot.open && !state.playerBot.loading)
+      loadPlayerBotInspection();
+  }
+
   async function doPoll() {
     if (state.fetching || document.hidden) return;
     if (!state.token) { setLink("down", "NO TOKEN"); return; }
@@ -291,6 +439,7 @@
       state.lastErr = "";
       histPush(state.data);
       render();
+      refreshPlayerBotInspection();
     } catch (e) {
       state.failures++;
       state.lastErr = e && e.name === "AbortError" ? "TIMEOUT" : String(e && e.message || e);
@@ -1053,12 +1202,13 @@
     const progression = d.playerBotProgression || {};
     const training = progression.training || {};
     const trainingRefusals = training.refusals || {};
+    const combatAbilities = progression.combatAbilities || {};
     const trainingGate = progression.gates && progression.gates.trainingEnabled === true;
     const roster = Array.isArray(pve.roster) ? pve.roster : [];
     const progressionRows = (progression.identities || []).map((r) => {
       const xp = Object.entries(r.xp || {}).map(([k, v]) => `${labelize(k)} ${compact(v)}`).join(" · ") || "none";
       return `<tr>
-        <td><span class="t-main">${esc(r.name || "#" + r.identityId)}</span><span class="t-sub">${esc(r.identityId)}</span></td>
+        <td><button type="button" class="playerbot-link" data-identity-id="${esc(r.identityId)}"><span class="t-main">${esc(r.name || "#" + r.identityId)}</span><span class="t-sub">${esc(r.identityId)}</span></button></td>
         <td>${chip(labelize(r.profession || "unknown"), r.profession === "orphan" ? "red" : "ghost")}</td>
         <td><span class="t-main">${esc(r.trainingPlan || "none")}</span><span class="t-sub">${num(r.skillsTrained != null ? r.skillsTrained : (r.skills || []).length)} boxes · tier ${num(r.derivedTier)}</span></td>
         <td class="t-num">${compact(r.bankCredits)}</td>
@@ -1129,7 +1279,7 @@
         ? `${chip(buffLabel, buffTone)}<span class="t-sub">${num(r.minBuffSecondsLeft)}s · ${esc(r.lastBuffSource || "none")}</span>`
         : `${chip("disabled", "ghost")}`;
       return `<tr>
-        <td><span class="t-main">${esc(name)}</span><span class="t-sub">${r.bodyAttached ? "body attached" : "identity only"}</span></td>
+        <td><button type="button" class="playerbot-link" data-identity-id="${esc(r.identityId)}"><span class="t-main">${esc(name)}</span><span class="t-sub">${r.bodyAttached ? "body attached" : "identity only"}</span></button></td>
         <td>${chip(labelize(phase), /HUNT|TRAVEL|RETREAT|MISSION/i.test(phase) ? "teal" : "ghost")}</td>
         <td class="wilds-offer">${offerLabel}</td>
         <td>${chip(lairAlive ? "alive" : "clear", lairAlive ? "amber" : "ghost")}</td>
@@ -1173,6 +1323,13 @@
             ${metric("Kill XP Awarded", killXp.totalAwarded)}
             ${metric("Flush Age", ago(progression.lastFlushAgeSeconds), { raw: true })}
           </div>
+          <div class="section-gap"></div>
+          ${kvRows([
+            ["Combat abilities", chip(combatAbilities.gate ? "enabled" : "disabled", combatAbilities.gate ? "ok" : "ghost")],
+            ["Ability bodies", num(combatAbilities.bodiesWithAbilities)],
+            ["Specials / defaults", num(combatAbilities.specialsEnqueued) + " / " + num(combatAbilities.defaultsEnqueued)],
+            ["Free-state forced / reserve skips", num(combatAbilities.freeStateForced) + " / " + num(combatAbilities.reserveSkips)]
+          ])}
           <div class="section-gap"></div>
           ${table(["Identity", "Profession", "Training", "Bank", "Cash", "XP", "Skills", "Last Award"], progressionRows, { scrollKey: "progression-identities", tall: true })}
           <div class="section-gap"></div>
@@ -1450,6 +1607,27 @@
     }
   };
 
+  document.addEventListener("click", (ev) => {
+    const target = ev.target;
+    if (!target || typeof target.closest !== "function") return;
+    const close = target.closest("[data-playerbot-close]");
+    if (close) {
+      ev.preventDefault();
+      closePlayerBotInspection();
+      return;
+    }
+    const playerBot = target.closest("[data-identity-id]");
+    if (playerBot) {
+      ev.preventDefault();
+      openPlayerBotInspection(playerBot.getAttribute("data-identity-id"));
+    }
+  });
+
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && state.playerBot.open)
+      closePlayerBotInspection();
+  });
+
   window.addEventListener("hashchange", () => {
     state.route = (location.hash || "#/command").replace(/^#\//, "");
     render();
@@ -1492,6 +1670,7 @@
   setInterval(poll, 1000); // gate inside poll() enforces pollMs cadence + backoff
 
   tickClock();
+  ensurePlayerBotDrawer();
   render();
   poll();
 })();

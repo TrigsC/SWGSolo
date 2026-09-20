@@ -658,3 +658,57 @@ Gates: `playerBotProgression.earlyGameEnabled` and
 parity override — sharing the award override or ANDing the configured flag
 reproduces the F_0.9.5 defect that failed live verification in run
 `20260906-104819`. No schema block.
+
+## P.10h — Skill-derived combat abilities (F_0.9.7 Phase 2)
+
+Skill-derived attacks are an additive, transient overlay on a planned PvE
+PlayerBot. The manager derives combat queue commands from the identity's
+trained boxes, collapses trailing-number tiers to the highest command, and
+hands the resulting names and policy values to the locked `AiAgent`.
+Installation requires the capability gate and a training plan; the harness
+opt-in is only an extra requirement for `profession == "harness"` identities.
+Gate-off bodies retain their template attack maps and all wild NPCs remain on
+the existing path. Command names from `skills.iff` are camelCase
+(`unarmedHit1`) while the `ObjectController` registry is lower case and
+`getQueueCommand` hashes the exact string, so derivation lower-cases every name
+before exclusion, lookup and installation — the live probe showed that without
+it only already-lower-case commands (`intimidate1`, `taunt`) survived. A weapon swap reruns the
+normal attack-map filter, so an installed ability can be visible in
+inspection while inactive for the currently equipped weapon.
+
+Attack policy: each attack decision rolls `specialAttackChancePercent`; a miss
+uses a plain `defaultattack`. The one exception is a free **control** ability
+— non-damaging (`poolsToDamage == NONE`), zero HAM and Force cost, applying a
+state the target lacks (Intimidate). It is checked before the special roll, used by name,
+exactly, and then not forced again on that target for `freeStateRetrySeconds`. Both restrictions came
+from live Run N: the unarmed default weapon has 0/0/0 base attack cost, so every
+unarmed special looked "free", and handing the forced decision to the general
+scorer picked a damaging lunge every swing.
+
+The player HAM-cost formula is shared by the normal player path and the
+skill-derived AI path through `CombatManager`; skill-derived attacks also
+recheck the configured reserve at execution time, only for pools the special
+actually spends (a free special is never refused by the reserve). A bounded leaf-mutex usage
+log records the body, command, target state before enqueue, target template,
+time, and special/default source. It evicts histories with body death or
+drain, and publishes per-command and policy counters with the progression
+dashboard. No telemetry read or write takes an agent or manager lock.
+
+The parity harness owns an **identity-scoped** combat-ability gate and chance
+override: `setCombatAbilitiesGate` requires an identity, adds it to the scoped
+set and reapplies that body synchronously, and production bodies always read
+the configured gate. Cleanup clears the scope, reapplies the scoped bodies, and
+only disables the shared usage log when production is off too. Installed abilities,
+tier supersession, attack source, and live enqueue evidence are asserted from
+the agent or manager snapshot separately. This keeps harness eligibility out
+of the production predicate while making the gate-on, tier, gate-off, and
+real-kill scenarios reproducible.
+
+Inspection is read-only and assembled on demand by
+`SimPlayerManager::getPlayerBotInspectJson`. Identity, progression, and
+early-game snapshots are copied before the body lock; live body/weapon/skill
+mod values are read under the agent lock; telemetry is copied after releasing
+that lock. The same snapshot feeds the bearer-authenticated REST endpoint,
+the WILDS dashboard drawer, and `/server playerinfo`'s deferred SimBot SUI
+message. Missing bodies produce partial identity data rather than mutating or
+respawning anything.

@@ -20,6 +20,23 @@ void APIProxyAiEconomyManager::handleDashboardGET(APIRequest& apiRequest) {
 	apiRequest.success(result);
 }
 
+void APIProxyAiEconomyManager::handlePlayerBotGET(APIRequest& apiRequest) {
+	uint64 identityId = apiRequest.getPathFieldUnsignedLong("identityId");
+	SimBotIdentity identity;
+	if (identityId == 0 ||
+			!SimPlayerManager::instance()->snapshotPlayerBotIdentity(identityId,
+				identity)) {
+		apiRequest.fail("PlayerBot not found.", "Unknown PlayerBot identity: " +
+			String::valueOf(identityId), APIRequestStatus::NotFound);
+		return;
+	}
+
+	JSONSerializationType result;
+	result["result"] = SimPlayerManager::instance()->getPlayerBotInspectJson(
+		identityId);
+	apiRequest.success(result);
+}
+
 void APIProxyAiEconomyManager::handle(APIRequest& apiRequest) {
 	if (apiRequest.isMethodGET()) {
 		handleDashboardGET(apiRequest);

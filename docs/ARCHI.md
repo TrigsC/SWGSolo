@@ -203,8 +203,11 @@ no new warnings before handing work back** (owner-stated standard).
   `pveConfig.huntingProfessions`) gains `bodyHam` — the per-pool HAM a planned
   novice body is built with (800 = starting-player parity; 0 keeps the mobile
   template). F_0.9.6-D1 adds the top-level `combatDiag` block (`logging` master
-  gate plus allowlist knobs) governing all `bin/log/simcombat.log` output. Every
-  F_0.9.5 and F_0.9.6 gate ships default-off.
+  gate plus allowlist knobs) governing all `bin/log/simcombat.log` output. F_0.9.7
+  adds `playerBotProgression.combatAbilitiesEnabled` with its nested `combatAbilities`
+  block (`specialAttackChancePercent`, `preferFreeStateAbilities`, `hamReserveFraction`,
+  `freeStateRetrySeconds`, `excludedCommands` — shipped `taunt`/`warcry1`/`warcry2` — and
+  `usageHistorySize`). Every F_0.9.5, F_0.9.6 and F_0.9.7 gate ships default-off.
   This is the primary place new simulation features expose owner-tunable,
   default-off gates.
 - **`MMOCoreORB/bin/conf/features.lua`** — global feature flags.
@@ -319,9 +322,15 @@ unfamiliar change:
   `stationTravel`, `pveActivity`, ...) consumed by the dashboard frontend. The
   SPA is hash-routed (`#/command`, `#/warfront`, `#/wilds` for live PvE hunter
   positions, ...).
+- **Per-object detail endpoints** keep the polled snapshot small: F_0.9.7 adds
+  `GET /v1/aieconomy/playerbot/(\d+)/` (`APIProxyAiEconomyManager::handlePlayerBotGET` →
+  `SimPlayerManager::getPlayerBotInspectJson`), built on demand under the same Bearer gate
+  and answering 404 for an unknown identity — the pattern to copy for any future
+  "click a row for detail" surface.
 - **Frontend**: `bin/web/aieconomy-dashboard/` — static `index.html` +
   `app.js` + `styles.css`, no build step, deployed by copying files
-  in-place (instant, no server restart needed for frontend-only changes).
+  in-place (instant, no server restart needed for frontend-only changes). Bot names on
+  `#/wilds` and the progression table open a detail drawer fed by that endpoint.
 - Ground truth for any AI-economy behavior claim is this live endpoint, not
   code inspection alone:
   ```
@@ -782,6 +791,45 @@ This is this fork's primary custom subsystem, layered on top of the stock
   ticks, attack selection/enqueue and the full kill-XP path — the instrument that
   made these assertions checkable rather than inferred. Live receipt: 43/43 in
   `docs/4-unit-tests/live_p10g-novice-early-game_20260915-225334-p10g-novice-early-game.md`.
+- **Skill-derived combat abilities (P.10h / F_0.9.7)** — the first chunk where
+  *training changes behaviour*. `buildBodyProgressionSnapshot` derives each roster bot's
+  attack list from its trained boxes (`Skill::getAbilities()`, the `commands` column of
+  `skills.iff`), keeps only the highest tier per chain (`SimBotAbilityTiers.h`, chain key =
+  name minus trailing digits) and installs it on the locked agent as a **transient**
+  `skillDerivedAttackMap`, which `setupAttackMaps` uses in place of the mobile template's
+  lists; it is cleared in `loadTemplateData` beside `simPlayerBot = false`. Four points
+  worth inheriting:
+  **(1) Two spellings of the same name.** `skills.iff` is camelCase (`unarmedHit1`), the
+  `ObjectController` registry is lower case, and `getQueueCommand` hashes the exact string —
+  so the first cut silently derived 3 abilities instead of 23, every hit/lunge/stun landing
+  in `excluded:unknown_command`. Normalise before exclusion, lookup **and** installation.
+  **(2) NPC specials are free; player specials are not.**
+  `CombatManager::applySpecialAttackCost` returns early for every AiAgent, so parity required
+  extracting the player arithmetic (`specialAttackHamCostFromInputs`) and paying it for
+  skill-derived agents only. The HAM reserve that bounds a special's own spend must test
+  **only pools that special spends** — testing all three refused free unarmed specials from a
+  merely wounded bot and stopped it attacking entirely.
+  **(3) The scorer and the behaviour tree disagree about validity.** The tree runs
+  `CheckAttackIsValid` after `SelectAttack` and aborts the tick; the scorer's heuristics do
+  not mirror `validateStateAttack` (lunge scores as knockdown, carries POSTUREDOWN), so an
+  unfiltered bot re-picked the same invalid special forever. Skill-derived scoring now skips
+  what the tree would reject.
+  **(4) Policy beats the scorer for control abilities.** A free, non-damaging ability whose
+  state the target lacks (Intimidate) is selected **by name** before the special-chance roll,
+  with a per-target `freeStateRetrySeconds` back-off; handing that decision to the scorer
+  picked a damaging lunge, and checking it only after a missed roll meant a high chance never
+  used it at all. Area-aggro commands (`taunt`, `warcry*`) ship excluded — they pull
+  bystanders onto a solo grinder.
+  Inspection is read-only and **gate-independent**: one snapshot
+  (`getPlayerBotInspectJson`) feeds the REST endpoint (§11), the dashboard drawer and
+  `/server playerinfo` on a targeted SimBot (previously it showed the admin their own
+  record), and with the capability off it still reports what the boxes *would* grant plus a
+  `notInstalledReason` — which is what let the live probe find defect (1) before anything was
+  enabled. Telemetry: `SimBotAbilityUsageLog` (leaf mutex, bounded ring plus lifetime
+  per-command counts and an accumulated target-state mask) and
+  `playerBotProgression.combatAbilities` counters. Live receipt: 27/27 in
+  `docs/4-unit-tests/live_p10h-skill-abilities_20260916-144849-p10h-skill-abilities.md`;
+  one open, unreproduced SIGSEGV is recorded there.
 - **Simulation-only by default, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line

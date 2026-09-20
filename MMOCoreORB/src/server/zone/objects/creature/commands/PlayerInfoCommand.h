@@ -15,26 +15,11 @@
 #include "server/zone/managers/player/PlayerManager.h"
 #include "server/zone/managers/mission/MissionManager.h"
 #include "server/zone/managers/player/BadgeList.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
 
 class PlayerInfoCommand {
 public:
-	static int executeCommand(CreatureObject* creature, uint64 target, const UnicodeString& arguments) {
-		ManagedReference<CreatureObject*> targetObject;
-
-		if (!arguments.isEmpty()) {
-			ManagedReference<PlayerManager*> playerManager = creature->getZoneServer()->getPlayerManager();
-
-			targetObject = playerManager->getPlayer(arguments.toString());
-		} else {
-			targetObject = creature->getZoneServer()->getObject(creature->getTargetID()).castTo<CreatureObject*>();
-		}
-
-		if (targetObject == nullptr || !targetObject->isPlayerCreature()) {
-			targetObject = creature;
-		}
-
-		Locker locker(targetObject, creature);
-
+	static int sendPlayerInfo(CreatureObject* creature, CreatureObject* targetObject) {
 		PlayerObject* ghost = targetObject->getPlayerObject();
 
 		ManagedReference<SuiMessageBox*> box = new SuiMessageBox(creature, 0);
@@ -175,6 +160,55 @@ public:
 		creature->sendMessage(box->generateMessage());
 
 		return 0;
+	}
+
+	static int executeCommand(CreatureObject* creature, uint64 target, const UnicodeString& arguments) {
+		ManagedReference<CreatureObject*> targetObject;
+
+		if (!arguments.isEmpty()) {
+			ManagedReference<PlayerManager*> playerManager = creature->getZoneServer()->getPlayerManager();
+
+			targetObject = playerManager->getPlayer(arguments.toString());
+		} else {
+			targetObject = creature->getZoneServer()->getObject(creature->getTargetID()).castTo<CreatureObject*>();
+		}
+
+		if (targetObject != nullptr && targetObject->isAiAgent()) {
+			ManagedReference<CreatureObject*> admin = creature;
+			uint64 targetObjectID = targetObject->getObjectID();
+
+			Core::getTaskManager()->executeTask([admin, targetObjectID] () {
+				if (admin == nullptr)
+					return;
+
+				SimPlayerManager* simPlayerManager = SimPlayerManager::instance();
+				uint64 identityId = simPlayerManager == nullptr ? 0 :
+					simPlayerManager->resolvePlayerBotIdentity(targetObjectID);
+				String simBotInfo;
+				if (identityId != 0)
+					simBotInfo = simPlayerManager->buildPlayerBotAdminInfoText(identityId);
+
+				Locker adminLocker(admin);
+
+				if (identityId == 0) {
+					PlayerInfoCommand::sendPlayerInfo(admin, admin);
+					return;
+				}
+
+				ManagedReference<SuiMessageBox*> box = new SuiMessageBox(admin, 0);
+				box->setPromptTitle("SimBot Info");
+				box->setPromptText(simBotInfo);
+				admin->sendMessage(box->generateMessage());
+			}, "PlayerInfoCommandSimBot");
+
+			return 0;
+		}
+
+		if (targetObject == nullptr || !targetObject->isPlayerCreature())
+			targetObject = creature;
+
+		Locker locker(targetObject, creature);
+		return sendPlayerInfo(creature, targetObject);
 	}
 };
 

@@ -78,6 +78,7 @@
 #include "server/zone/objects/creature/buffs/BuffType.h"
 #include "server/zone/objects/creature/buffs/BuffCRC.h"
 #include "server/zone/managers/skill/SkillModManager.h"
+#include "server/zone/objects/creature/commands/effect/CommandEffect.h"
 #include "server/zone/objects/creature/damageovertime/DamageOverTimeList.h"
 #include "server/zone/objects/creature/ai/events/AiBehaviorEvent.h"
 #include "server/zone/objects/creature/ai/events/AiRecoveryEvent.h"
@@ -105,6 +106,7 @@
 #include "server/zone/objects/creature/simplayer/CellNavDiagLog.h"
 #include "server/zone/objects/creature/simplayer/SimCombatDiagLog.h"
 #include "server/zone/objects/creature/simplayer/SimEarlyGameDeathLog.h"
+#include "server/zone/objects/creature/simplayer/SimBotAbilityUsageLog.h"
 #include "server/zone/managers/frs/FrsManager.h"
 #include "server/zone/managers/radial/RadialOptions.h"
 
@@ -367,6 +369,13 @@ void AiAgentImplementation::loadTemplateData(CreatureTemplate* templateData) {
 	// guarantees a template-loaded creature is never a stale bot. Legit sim
 	// bots re-assert setSimPlayerBot(true) AFTER spawnCreature/loadTemplateData.
 	simPlayerBot = false;
+	skillDerivedAttackMap = nullptr;
+	skillAbilitySpecialChance = 0;
+	skillAbilityPreferFreeState = false;
+	skillAbilityHamReserve = 0.f;
+	skillAbilityFreeStateRetryMs = 0;
+	freeStateForcedTargetOid = 0;
+	freeStateForcedAtMs = 0;
 
 	setPvpStatusBitmask(npcTemplate->getPvpBitmask());
 
@@ -2268,15 +2277,22 @@ void AiAgentImplementation::setupAttackMaps() {
         return;
 
     const CreatureAttackMap* attackMap;
+    // F_0.9.7: a roster PlayerBot's attacks come from its trained skill boxes,
+    // installed by SimPlayerManager, instead of the mobile template's lists.
+    const bool useSkillDerivedAttackMap = skillDerivedAttackMap != nullptr;
 
     // ----- PRIMARY ATTACKS -----
-    if (petDeed != nullptr)
+    if (useSkillDerivedAttackMap)
+        attackMap = skillDerivedAttackMap.get();
+    else if (petDeed != nullptr)
         attackMap = petDeed->getAttacks();
     else
         attackMap = npcTemplate->getPrimaryAttacks();
 
 #ifdef DEBUG_AI_WEAPONS
-    debugLogAttackMap(this, "Template primaryAttacks (raw)", attackMap, objectController);
+	debugLogAttackMap(this, useSkillDerivedAttackMap ?
+		"Skill-derived attacks (raw)" : "Template primaryAttacks (raw)",
+		attackMap, objectController);
 #endif
 
     Reference<WeaponObject*> defaultWeap = getDefaultWeapon();
@@ -2328,11 +2344,16 @@ void AiAgentImplementation::setupAttackMaps() {
     }
 
     // ----- SECONDARY ATTACKS -----
-    if (petDeed == nullptr) {
-        attackMap = npcTemplate->getSecondaryAttacks();
+	if (useSkillDerivedAttackMap || petDeed == nullptr) {
+		if (useSkillDerivedAttackMap)
+			attackMap = skillDerivedAttackMap.get();
+		else
+			attackMap = npcTemplate->getSecondaryAttacks();
 
 #ifdef DEBUG_AI_WEAPONS
-        debugLogAttackMap(this, "Template secondaryAttacks (raw)", attackMap, objectController);
+		debugLogAttackMap(this, useSkillDerivedAttackMap ?
+			"Skill-derived attacks (raw)" : "Template secondaryAttacks (raw)",
+			attackMap, objectController);
 #endif
 
         for (int i = 0; i < attackMap->size(); i++) {
@@ -2398,6 +2419,97 @@ void AiAgentImplementation::setupAttackMaps() {
 #endif
 
     attackMap = nullptr;
+}
+
+void AiAgentImplementation::setSkillDerivedAttacks(
+		const Vector<String>& commands, int chance, bool preferFreeState,
+		float hamReserve) {
+	skillDerivedAttackMap = new CreatureAttackMap();
+	for (int i = 0; i < commands.size(); ++i) {
+		if (!commands.get(i).isEmpty())
+			skillDerivedAttackMap->addAttack(commands.get(i), "");
+	}
+
+	skillAbilitySpecialChance = chance < 0 ? 0 : (chance > 100 ? 100 : chance);
+	skillAbilityPreferFreeState = preferFreeState;
+	skillAbilityHamReserve = hamReserve < 0.f ? 0.f :
+		(hamReserve > 0.95f ? 0.95f : hamReserve);
+}
+
+void AiAgentImplementation::clearSkillDerivedAttacks() {
+	skillDerivedAttackMap = nullptr;
+	skillAbilitySpecialChance = 0;
+	skillAbilityPreferFreeState = false;
+	skillAbilityHamReserve = 0.f;
+	skillAbilityFreeStateRetryMs = 0;
+	freeStateForcedTargetOid = 0;
+	freeStateForcedAtMs = 0;
+}
+
+void AiAgentImplementation::setSkillAbilityFreeStateRetryMs(int retryMs) {
+	skillAbilityFreeStateRetryMs = retryMs < 0 ? 0 : retryMs;
+}
+
+void AiAgentImplementation::noteFreeStateAbilityForced() {
+	ManagedReference<SceneObject*> followCopy = getFollowObject().get();
+	freeStateForcedTargetOid = followCopy == nullptr ? 0 : followCopy->getObjectID();
+	freeStateForcedAtMs = System::getMiliTime();
+}
+
+bool AiAgentImplementation::selectNamedSpecialAttack(const String& command) {
+	// The free-state path must use the exact ability that qualified, not hand
+	// the decision back to the general scorer (which preferred a damaging lunge
+	// and left the forced branch firing on every swing).
+	if (command.isEmpty())
+		return false;
+	ZoneServer* zoneServer = getZoneServer();
+	ObjectController* objectController = zoneServer == nullptr ? nullptr :
+		zoneServer->getObjectController();
+	if (objectController == nullptr ||
+			objectController->getQueueCommand(command.hashCode()) == nullptr ||
+			getFollowObject().get() == nullptr)
+		return false;
+
+	nextActionCRC = command.hashCode();
+	nextActionArgs = "";
+
+	const bool combatDiagLogging = SimCombatDiagLog::isLoggingEnabled();
+	const uint64 combatDiagOid = combatDiagLogging ? getObjectID() : 0;
+	if (combatDiagLogging && SimCombatDiagLog::isTraced(combatDiagOid)) {
+		StringBuffer diag;
+		diag << "selectedCommand=" << command
+			<< " rejectReason=none source=skill_derived_free_state";
+		SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
+			diag.toString(), "special_selected");
+	}
+	return true;
+}
+
+bool AiAgentImplementation::hasSkillDerivedAttacks() {
+	return skillDerivedAttackMap != nullptr;
+}
+
+Vector<String> AiAgentImplementation::getSkillDerivedAttackCommands() const {
+	Vector<String> commands;
+	if (skillDerivedAttackMap == nullptr)
+		return commands;
+
+	for (int i = 0; i < skillDerivedAttackMap->size(); ++i)
+		commands.add(skillDerivedAttackMap->getCommand(i));
+
+	return commands;
+}
+
+int AiAgentImplementation::getSkillAbilitySpecialChance() const {
+	return skillAbilitySpecialChance;
+}
+
+bool AiAgentImplementation::getSkillAbilityPreferFreeState() const {
+	return skillAbilityPreferFreeState;
+}
+
+float AiAgentImplementation::getSkillAbilityHamReserve() const {
+	return skillAbilityHamReserve;
 }
 
 void AiAgentImplementation::equipPrimaryWeapon() {
@@ -2865,6 +2977,124 @@ static bool canAffordAttackCommand(AiAgent* agent, const String& commandName) {
 		predictedCost, requiresForceAboveCost);
 }
 
+String AiAgentImplementation::findFreeStateAbilityForTarget() {
+	ManagedReference<SceneObject*> followCopy = getFollowObject().get();
+	if (followCopy == nullptr || !followCopy->isCreatureObject())
+		return String();
+
+	CreatureObject* target = followCopy->asCreatureObject();
+	if (target == nullptr || target->isDead())
+		return String();
+
+	// A forced control ability that did not stick (resisted, immune, or already
+	// expired) must not re-force on every behaviour tick against the same
+	// target; the normal special-chance roll still applies meanwhile.
+	if (followCopy->getObjectID() == freeStateForcedTargetOid &&
+			System::getMiliTime() - freeStateForcedAtMs <
+				static_cast<uint64>(skillAbilityFreeStateRetryMs))
+		return String();
+
+	WeaponObject* weapon = getWeapon();
+	if (weapon == nullptr)
+		return String();
+
+	String weapCat = getWeaponCategory(weapon);
+	const CreatureAttackMap* attackMap = nullptr;
+	if (weapCat == "ranged")
+		attackMap = primaryAttackMap.get();
+	else if (weapCat == "melee" || weapCat == "saber" ||
+			weapCat == "polearm")
+		attackMap = secondaryAttackMap.get();
+	else
+		attackMap = defaultAttackMap.get();
+
+	if (attackMap == nullptr || attackMap->isEmpty())
+		attackMap = getAttackMap();
+	if (attackMap == nullptr || attackMap->isEmpty())
+		return String();
+
+	ZoneServer* zoneServer = getZoneServer();
+	ObjectController* objectController = zoneServer == nullptr ? nullptr :
+		zoneServer->getObjectController();
+	CombatManager* combatManager = CombatManager::instance();
+	if (objectController == nullptr || combatManager == nullptr)
+		return String();
+
+	for (int i = 0; i < attackMap->size(); ++i) {
+		const String& commandName = attackMap->getCommand(i);
+		if (!canAffordAttackCommand(asAiAgent(), commandName))
+			continue;
+
+		const CombatQueueCommand* command = cast<const CombatQueueCommand*>(
+			objectController->getQueueCommand(commandName));
+		if (command == nullptr)
+			continue;
+
+		// Only pure control abilities (Intimidate) qualify. A damaging special is
+		// also "free" when the weapon's base attack cost is 0 - the unarmed
+		// default weapon is - and lunge's posture effect is almost never held by
+		// the target, so without this every unarmed swing was forced special
+		// (live Run N: freeStateForced 56, defaultsEnqueued 0).
+		if (command->getPoolsToDamage() != CombatManager::NONE)
+			continue;
+
+		float healthCost = 0.f;
+		float actionCost = 0.f;
+		float mindCost = 0.f;
+		combatManager->computeSpecialAttackHamCost(asCreatureObject(), weapon,
+			command->getHealthCostMultiplier(),
+			command->getActionCostMultiplier(),
+			command->getMindCostMultiplier(), healthCost, actionCost,
+			mindCost);
+		if (healthCost != 0.f || actionCost != 0.f || mindCost != 0.f ||
+				weapon->getForceCost() * command->getForceCostMultiplier() != 0.f)
+			continue;
+
+		const VectorMap<uint8, StateEffect>* effects = command->getStateEffects();
+		if (effects == nullptr)
+			continue;
+		for (int j = 0; j < effects->size(); ++j) {
+			uint8 effectType = effects->elementAt(j).getKey();
+			bool stateMissing = false;
+			switch (effectType) {
+			case CommandEffect::BLIND:
+				stateMissing = !target->hasState(CreatureState::BLINDED);
+				break;
+			case CommandEffect::DIZZY:
+				stateMissing = !target->hasState(CreatureState::DIZZY);
+				break;
+			case CommandEffect::INTIMIDATE:
+				stateMissing = !target->hasState(CreatureState::INTIMIDATED);
+				break;
+			case CommandEffect::STUN:
+				stateMissing = !target->hasState(CreatureState::STUNNED);
+				break;
+			case CommandEffect::KNOCKDOWN:
+				stateMissing = !target->isKnockedDown() &&
+					target->checkKnockdownRecovery();
+				break;
+			case CommandEffect::POSTUREUP:
+				stateMissing = !target->isStanding() &&
+					target->checkPostureUpRecovery();
+				break;
+			case CommandEffect::POSTUREDOWN:
+				stateMissing = !target->isProne() &&
+					target->checkPostureDownRecovery();
+				break;
+			case CommandEffect::NEXTATTACKDELAY:
+				stateMissing = !target->hasAttackDelay();
+				break;
+			default:
+				break;
+			}
+			if (stateMissing)
+				return commandName;
+		}
+	}
+
+	return String();
+}
+
 bool AiAgentImplementation::selectSpecialAttack() {
 	const bool combatDiagLogging = SimCombatDiagLog::isLoggingEnabled();
 	const uint64 combatDiagOid = combatDiagLogging ? getObjectID() : 0;
@@ -2907,6 +3137,7 @@ bool AiAgentImplementation::selectSpecialAttack() {
     WeaponObject* weapon = getWeapon();
     String weapCat = getWeaponCategory(weapon);
     const CreatureAttackMap* attackMap = nullptr;
+    const bool skillDerived = hasSkillDerivedAttacks();
 
     // Logic: Pick the map that matches the weapon
     if (weapCat == "ranged") {
@@ -2927,6 +3158,8 @@ bool AiAgentImplementation::selectSpecialAttack() {
 		if (combatDiagTraced) {
 			StringBuffer diag;
 			diag << "candidateCount=0 rejectReason=no_candidates";
+			if (skillDerived)
+				diag << " source=skill_derived reserveSkipped=0";
 			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
 				diag.toString(), "special_no_candidates");
 		}
@@ -3010,6 +3243,7 @@ bool AiAgentImplementation::selectSpecialAttack() {
     int bestIdx   = -1;
     int bestScore = -9999;
 	int affordableCandidates = 0;
+	int reserveSkipped = 0;
     
     for (int i = 0; i < attackMap->size(); ++i) {
         String key = attackMap->getCommand(i);
@@ -3018,6 +3252,59 @@ bool AiAgentImplementation::selectSpecialAttack() {
 
         if (!canAffordAttackCommand(asAiAgent(), key))
             continue;
+
+		if (skillDerived) {
+			ZoneServer* zoneServer = getZoneServer();
+			ObjectController* objectController = zoneServer == nullptr ? nullptr :
+				zoneServer->getObjectController();
+			CombatManager* combatManager = CombatManager::instance();
+			const CombatQueueCommand* command = objectController == nullptr ?
+				nullptr : cast<const CombatQueueCommand*>(
+					objectController->getQueueCommand(key));
+			if (weapon != nullptr && command != nullptr && combatManager != nullptr) {
+				float healthCost = 0.f;
+				float actionCost = 0.f;
+				float mindCost = 0.f;
+				combatManager->computeSpecialAttackHamCost(asCreatureObject(), weapon,
+					command->getHealthCostMultiplier(),
+					command->getActionCostMultiplier(),
+					command->getMindCostMultiplier(), healthCost, actionCost,
+					mindCost);
+				bool playerRuleRefused = getHAM(CreatureAttribute::HEALTH) <=
+					healthCost || getHAM(CreatureAttribute::ACTION) <= actionCost ||
+					getHAM(CreatureAttribute::MIND) <= mindCost;
+				// Same rule as CombatManager::applySpecialAttackCost: only a pool
+				// this special spends can push it under the reserve.
+				bool reserveRefused =
+					(healthCost > 0.f && static_cast<float>(getHAM(
+						CreatureAttribute::HEALTH)) - healthCost <
+						getSkillAbilityHamReserve() *
+						getMaxHAM(CreatureAttribute::HEALTH)) ||
+					(actionCost > 0.f && static_cast<float>(getHAM(
+						CreatureAttribute::ACTION)) - actionCost <
+						getSkillAbilityHamReserve() *
+						getMaxHAM(CreatureAttribute::ACTION)) ||
+					(mindCost > 0.f && static_cast<float>(getHAM(
+						CreatureAttribute::MIND)) - mindCost <
+						getSkillAbilityHamReserve() *
+						getMaxHAM(CreatureAttribute::MIND));
+				if (playerRuleRefused || reserveRefused) {
+					++reserveSkipped;
+					if (reserveRefused)
+						SimBotAbilityUsageLog::recordReserveSkip();
+					continue;
+				}
+			}
+			// The attack tree runs CheckAttackIsValid after SelectAttack and aborts
+			// the tick when the chosen special's state cannot apply. The scorer's
+			// state heuristics do not match validateStateAttack exactly (lunge is
+			// scored as knockdown but carries POSTUREDOWN), so without this filter a
+			// bot re-selected the same invalid lunge every tick and never attacked
+			// (TRIP-verify repro loop, abilities_used_in_kill_r04 budget exceeded).
+			if (command != nullptr && targetCreo != nullptr &&
+					!validateStateAttack(targetCreo, key.hashCode()))
+				continue;
+		}
 		affordableCandidates++;
 
         String lower = key.toLowerCase();
@@ -3220,6 +3507,8 @@ bool AiAgentImplementation::selectSpecialAttack() {
 				<< " affordableCandidates=" << affordableCandidates
 				<< " rejectReason=" << (affordableCandidates == 0 ?
 					String("ham_unaffordable") : String("no_candidates"));
+			if (skillDerived)
+				diag << " source=skill_derived reserveSkipped=" << reserveSkipped;
 			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
 				diag.toString(), affordableCandidates == 0 ?
 					String("special_ham_unaffordable") :
@@ -3244,6 +3533,8 @@ bool AiAgentImplementation::selectSpecialAttack() {
 			<< " affordableCandidates=" << affordableCandidates
 			<< " selectedCommand=" << attackMap->getCommand(bestIdx)
 			<< " rejectReason=none";
+		if (skillDerived)
+			diag << " source=skill_derived reserveSkipped=" << reserveSkipped;
 		SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
 			diag.toString(), "special_selected");
 	}
@@ -3265,6 +3556,7 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
     WeaponObject* weapon = getWeapon();
     String weapCat = getWeaponCategory(weapon);
     const CreatureAttackMap* attackMap = nullptr;
+    const bool skillDerived = hasSkillDerivedAttacks();
 
     // 1. Select the correct map based on the weapon category
     // (This matches the logic in your main selectSpecialAttack function)
@@ -3300,6 +3592,8 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
 		if (combatDiagTraced) {
 			StringBuffer diag;
 			diag << "candidateCount=0 rejectReason=no_candidates";
+			if (skillDerived)
+				diag << " source=skill_derived reserveSkipped=0";
 			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
 				diag.toString(), "special_no_candidates");
 		}
@@ -3320,6 +3614,8 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
 			StringBuffer diag;
 			diag << "candidateCount=" << attackMap->size()
 				<< " rejectReason=no_candidates";
+			if (skillDerived)
+				diag << " source=skill_derived reserveSkipped=0";
 			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
 				diag.toString(), "special_no_candidates");
 		}
@@ -3338,6 +3634,8 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
 			StringBuffer diag;
 			diag << "candidateCount=" << attackMap->size()
 				<< " rejectReason=no_candidates";
+			if (skillDerived)
+				diag << " source=skill_derived reserveSkipped=0";
 			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
 				diag.toString(), "special_no_candidates");
 		}
@@ -3360,6 +3658,8 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
 			diag << "candidateCount=" << attackMap->size()
 				<< " selectedCommand=" << cmd
 				<< " rejectReason=getQueueCommand_null";
+			if (skillDerived)
+				diag << " source=skill_derived reserveSkipped=0";
 			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
 				diag.toString(), "special_queue_command_null");
 		}
@@ -3372,6 +3672,8 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
 			diag << "candidateCount=" << attackMap->size()
 				<< " selectedCommand=" << cmd
 				<< " rejectReason=getQueueCommand_null";
+			if (skillDerived)
+				diag << " source=skill_derived reserveSkipped=0";
 			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
 				diag.toString(), "special_queue_command_null");
 		}
@@ -3387,6 +3689,8 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
 				<< " selectedCommand=" << cmd
 				<< " rejectReason=" << (queueCommand == nullptr ?
 					String("getQueueCommand_null") : String("null_follow"));
+			if (skillDerived)
+				diag << " source=skill_derived reserveSkipped=0";
 			SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
 				diag.toString(), queueCommand == nullptr ?
 				String("special_queue_command_null") :
@@ -3399,6 +3703,8 @@ bool AiAgentImplementation::selectSpecialAttack(int attackNum) {
 		StringBuffer diag;
 		diag << "candidateCount=" << attackMap->size()
 			<< " selectedCommand=" << cmd << " rejectReason=none";
+		if (skillDerived)
+			diag << " source=skill_derived reserveSkipped=0";
 		SimCombatDiagLog::event("SPECIAL_SELECT", combatDiagOid,
 			diag.toString(), "special_selected");
 	}
@@ -3414,8 +3720,13 @@ bool AiAgentImplementation::selectDefaultAttack() {
     String cmd;
 	String selectionSource;
 
+	// F_0.9.7: a skill-derived PlayerBot's default is a plain auto-attack.
+	// Specials reach it only through selectSpecialAttack, at the policy chance
+	// the SelectAttack leaf applies, so the template/map search is skipped.
+	const bool skillDerivedDefault = hasSkillDerivedAttacks();
+
     // 1) Template default (may be "defaultattack" as engine fallback)
-    if (npcTemplate != nullptr) {
+    if (!skillDerivedDefault && npcTemplate != nullptr) {
         cmd = npcTemplate->getDefaultAttack();
     }
 
@@ -3425,8 +3736,8 @@ bool AiAgentImplementation::selectDefaultAttack() {
     if (!cmd.isEmpty() && cmd.hashCode() != STRING_HASHCODE("defaultattack"))
         selectionSource = "template_default";
 
-    bool treatAsUnset = cmd.isEmpty()
-        || cmd.hashCode() == STRING_HASHCODE("defaultattack");
+    bool treatAsUnset = !skillDerivedDefault && (cmd.isEmpty()
+        || cmd.hashCode() == STRING_HASHCODE("defaultattack"));
 
 
     if (treatAsUnset) {
@@ -3545,6 +3856,11 @@ bool AiAgentImplementation::selectDefaultAttack() {
              info(true) << "AI_ATTACK: Selected HEURISTIC cmd: " << cmd << " (Score: " << bestHeuristicScore << ")";
              #endif
         }
+    }
+
+    if (skillDerivedDefault) {
+        cmd = "defaultattack";
+        selectionSource = "skill_default";
     }
 
     // 3) Final fallback
@@ -3677,10 +3993,51 @@ int AiAgentImplementation::enqueueAttack(int priority) {
 		return 1;
 	}
 
-	int queueBefore = combatDiagTraced ? getCommandQueueSize() : -1;
+	// Capture the selected command and target state before enqueueCommand can
+	// hand the target to the command queue. This is a leaf telemetry write and
+	// is intentionally limited to the skill-derived path; the stock path does
+	// not read any of the new state.
+	SimBotAbilityUseEntry abilityUse;
+	bool recordAbilityUse = SimBotAbilityUsageLog::isEnabled() &&
+		hasSkillDerivedAttacks();
+	if (recordAbilityUse) {
+		if (nextActionCRC == STRING_HASHCODE("defaultattack")) {
+			abilityUse.command = "defaultattack";
+			abilityUse.special = false;
+		} else {
+			Vector<String> commands = getSkillDerivedAttackCommands();
+			for (int i = 0; i < commands.size(); ++i) {
+				if (commands.get(i).hashCode() == nextActionCRC) {
+					abilityUse.command = commands.get(i);
+					abilityUse.special = true;
+					break;
+				}
+			}
+		}
+		if (abilityUse.command.isEmpty())
+			recordAbilityUse = false;
+		else {
+			abilityUse.bodyOid = getObjectID();
+			abilityUse.targetOid = followCopy->getObjectID();
+			abilityUse.atMs = System::getMiliTime();
+			CreatureObject* targetCreature = followCopy->asCreatureObject();
+			if (targetCreature != nullptr) {
+				abilityUse.targetStatesBefore = targetCreature->getStateBitmask();
+				if (targetCreature->getObjectTemplate() != nullptr)
+					abilityUse.targetTemplate = targetCreature->getObjectTemplate()->
+						getFullTemplateString();
+			}
+		}
+	}
+
+	int queueBefore = (combatDiagTraced || recordAbilityUse) ?
+		getCommandQueueSize() : -1;
 	enqueueCommand(nextActionCRC, 0, followCopy->getObjectID(), nextActionArgs, priority);
+	int queueAfter = (combatDiagTraced || recordAbilityUse) ?
+		getCommandQueueSize() : -1;
+	if (recordAbilityUse && queueAfter > queueBefore)
+		SimBotAbilityUsageLog::record(abilityUse);
 	if (combatDiagTraced) {
-		int queueAfter = getCommandQueueSize();
 		String outcome = priority == QueueCommand::NORMAL && queueBefore >= 5 ?
 			String("suppressed_queue_full") : String("enqueued");
 		StringBuffer diag;

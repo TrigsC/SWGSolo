@@ -16,6 +16,7 @@ namespace server {
 		}
 
 		void handle(APIRequest& apiRequest);
+		void handlePlayerBotGET(APIRequest& apiRequest);
 	private:
 		void handleDashboardGET(APIRequest& apiRequest);
 	};

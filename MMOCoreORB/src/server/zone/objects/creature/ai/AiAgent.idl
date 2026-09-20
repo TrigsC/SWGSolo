@@ -93,6 +93,13 @@ class AiAgent extends CreatureObject {
 	protected transient CreatureAttackMap primaryAttackMap;
 	protected transient CreatureAttackMap secondaryAttackMap;
 	protected transient CreatureAttackMap defaultAttackMap;
+	protected transient CreatureAttackMap skillDerivedAttackMap;
+	protected transient int skillAbilitySpecialChance;
+	protected transient boolean skillAbilityPreferFreeState;
+	protected transient float skillAbilityHamReserve;
+	protected transient int skillAbilityFreeStateRetryMs;
+	protected transient unsigned long freeStateForcedTargetOid;
+	protected transient unsigned long freeStateForcedAtMs;
 
 	@dereferenced
 	protected transient SortedVector<unsigned long> camouflagedObjects;
@@ -610,6 +617,56 @@ class AiAgent extends CreatureObject {
 
 	@local
 	public native void setupAttackMaps();
+
+	@local
+	@preLocked
+	public native void setSkillDerivedAttacks(@dereferenced final Vector<string> commands,
+		int chance, boolean preferFreeState, float hamReserve);
+
+	@local
+	@preLocked
+	public native void clearSkillDerivedAttacks();
+
+	@local
+	@preLocked
+	public native boolean hasSkillDerivedAttacks();
+
+	@local
+	@preLocked
+	@dereferenced
+	@read
+	public native Vector<string> getSkillDerivedAttackCommands();
+
+	@local
+	@preLocked
+	@read
+	public native int getSkillAbilitySpecialChance();
+
+	@local
+	@preLocked
+	@read
+	public native boolean getSkillAbilityPreferFreeState();
+
+	@local
+	@preLocked
+	@read
+	public native float getSkillAbilityHamReserve();
+
+	@local
+	@preLocked
+	public native void setSkillAbilityFreeStateRetryMs(int retryMs);
+
+	@local
+	@preLocked
+	public native string findFreeStateAbilityForTarget();
+
+	@local
+	@preLocked
+	public native boolean selectNamedSpecialAttack(final string command);
+
+	@local
+	@preLocked
+	public native void noteFreeStateAbilityForced();
 
 	@local
 	public native void unequipWeapons();

@@ -116,6 +116,10 @@ void RESTServer::registerEndpoints() {
 		mAiEconomyManager->handle(apiRequest);
 	}));
 
+	addEndpoint(RESTEndpoint("GET:/v1/aieconomy/playerbot/(\\d+)/", {"identityId"}, [this] (APIRequest& apiRequest) -> void {
+		mAiEconomyManager->handlePlayerBotGET(apiRequest);
+	}));
+
 	addEndpoint(RESTEndpoint("POST:/v1/admin/console/(\\w+)/", {"command"}, [this] (APIRequest& apiRequest) -> void {
 		StringBuffer buf;
 

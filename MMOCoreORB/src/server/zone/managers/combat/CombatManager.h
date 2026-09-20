@@ -288,6 +288,17 @@ protected:
 	 */
 	bool applySpecialAttackCost(CreatureObject* attacker, WeaponObject* weapon, const CreatureAttackData& data) const;
 
+public:
+	static void specialAttackHamCostFromInputs(float baseHealth,
+		float baseAction, float baseMind, float healthMultiplier,
+		float actionMultiplier, float mindMultiplier, float strengthAdjustment,
+		float quicknessAdjustment, float focusAdjustment, float& health,
+		float& action, float& mind);
+	void computeSpecialAttackHamCost(CreatureObject* attacker,
+		WeaponObject* weapon, float healthMultiplier, float actionMultiplier,
+		float mindMultiplier, float& health, float& action, float& mind) const;
+
+protected:
 	void applyStates(CreatureObject* creature, CreatureObject* targetCreature, DefenderHitList* hitList, const CreatureAttackData& data) const;
 
 	int getWeaponDefendResult(uint32 defendWeaponMask) const {

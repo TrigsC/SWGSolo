@@ -4,6 +4,7 @@
 #include "server/zone/objects/creature/ai/bt/Behavior.h"
 #include "server/zone/objects/creature/ai/bt/BlackboardData.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
+#include "server/zone/objects/creature/simplayer/SimBotAbilityUsageLog.h"
 #include "server/zone/managers/gcw/GCWManager.h"
 #include "server/zone/managers/reaction/ReactionManager.h"
 
@@ -262,6 +263,33 @@ public:
         if (weapon != nullptr && weapon->getAttackType() == SharedWeaponObjectTemplate::FORCEATTACK) {
             ok = agent->selectSpecialAttack(-1);
             if (!ok) {
+                ok = agent->selectDefaultAttack();
+            }
+            return ok ? SUCCESS : FAILURE;
+        }
+
+        if (agent->hasSkillDerivedAttacks()) {
+            // A free control ability (Intimidate) that the target lacks is used
+            // first, before the special roll, then not forced again on that
+            // target for the retry window. Checking it only on a missed roll meant
+            // a high special chance never applied Intimidate at all.
+            if (agent->getSkillAbilityPreferFreeState()) {
+                String freeState = agent->findFreeStateAbilityForTarget();
+                if (!freeState.isEmpty() &&
+                        agent->selectNamedSpecialAttack(freeState)) {
+                    agent->noteFreeStateAbilityForced();
+                    SimBotAbilityUsageLog::recordFreeStateForced();
+                    return SUCCESS;
+                }
+            }
+            bool wantSpecial = System::random(99) <
+                agent->getSkillAbilitySpecialChance();
+
+            if (wantSpecial) {
+                ok = agent->selectSpecialAttack(-1);
+                if (!ok)
+                    ok = agent->selectDefaultAttack();
+            } else {
                 ok = agent->selectDefaultAttack();
             }
             return ok ? SUCCESS : FAILURE;

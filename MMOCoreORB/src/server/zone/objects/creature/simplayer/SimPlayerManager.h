@@ -30,6 +30,7 @@
 #include "server/zone/objects/tangible/LairObject.h"
 #include "server/zone/managers/creature/LairObserver.h"
 #include "server/zone/objects/creature/simplayer/SimEarlyGameDeathLog.h"
+#include "server/zone/objects/creature/simplayer/SimBotAbilityUsageLog.h"
 
 using namespace server::zone;
 
@@ -158,6 +159,24 @@ struct SimBotTrainingPlan {
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct SimBotCombatAbilityConfig {
+	bool enabled = false;
+	int specialAttackChancePercent = 35;
+	bool preferFreeStateAbilities = true;
+	float hamReserveFraction = 0.40f;
+	int freeStateRetrySeconds = 10;
+	Vector<String> excludedCommands;
+	int usageHistorySize = 12;
+};
+
+struct SimBotAbilityApplicability {
+	bool gateEnabled = false;
+	String trainingPlan;
+	String profession;
+	bool harnessOptIn = false;
+	int specialAttackChancePercent = -1;
 };
 
 // P.10f Phase 2: the next box is cached against the cumulative XP total, not
@@ -363,6 +382,14 @@ struct SimBotActivityDecision {
 struct SimBotBodyProgression {
 	Vector<String> skills;
 	VectorMap<String, int> modDeltas;
+	Vector<String> abilities;
+	Vector<String> supersededAbilities;
+	Vector<String> excludedAbilities;
+	bool abilitiesApplicable = false;
+	int abilitySpecialChance = 35;
+	bool abilityPreferFreeState = true;
+	float abilityHamReserve = 0.40f;
+	int abilityFreeStateRetrySeconds = 10;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -520,6 +547,13 @@ struct PlayerBotParityTestStep {
 	bool hasExpectedMaxDamage = false;
 	bool expectedGraduated = false;
 	bool hasExpectedGraduated = false;
+	String command;
+	String supersededBy;
+	String targetState;
+	int combatAbilitySpecialAttackChancePercent = -1;
+	bool hasCombatAbilitySpecialAttackChancePercent = false;
+	bool combatAbilityHarnessOptIn = false;
+	bool hasCombatAbilityHarnessOptIn = false;
 	// Optional assertActivity detail: also require this deferred box to be
 	// present in the manager state published to the dashboard.
 	String stalledBox;
@@ -2174,9 +2208,14 @@ private:
 	bool progressionAwardKillXp = false;
 	bool progressionTrainingEnabled = false;
 	bool progressionEarlyGameEnabled = false;
+	bool progressionCombatAbilitiesEnabled = false;
 	bool progressionEarlyGameRealWeaponDamage = false;
 	float progressionKillXpRate = 1.0f;
 	SimBotEarlyGameConfig progressionEarlyGameConfig;
+	SimBotCombatAbilityConfig progressionCombatAbilityConfig;
+	VectorMap<uint64, bool> progressionCombatAbilityReapplyIds;
+	bool progressionCombatAbilityReserveWarningIssued = false;
+	AtomicLong progressionCombatAbilityReserveRefusedAtExecution;
 	VectorMap<String, String> progressionEarlyGameWeaponsByXpType;
 	VectorMap<String, SimBotTrainingPlan> progressionTrainingPlans;
 	// Guards against the per-tick config refresh resetting the sweep cursor and
@@ -2291,6 +2330,18 @@ private:
 	bool playerBotParityTestTrainingGateOverride = false;
 	bool playerBotParityTestTrainingGateOverridePreviousActive = false;
 	bool playerBotParityTestTrainingGateOverridePrevious = false;
+	bool playerBotParityTestCombatAbilitiesGateOverrideActive = false;
+	bool playerBotParityTestCombatAbilitiesGateOverride = false;
+	bool playerBotParityTestCombatAbilitiesGateOverridePreviousActive = false;
+	bool playerBotParityTestCombatAbilitiesGateOverridePrevious = false;
+	bool playerBotParityTestCombatAbilityChanceOverrideActive = false;
+	int playerBotParityTestCombatAbilityChanceOverride = 35;
+	bool playerBotParityTestCombatAbilityChanceOverridePreviousActive = false;
+	int playerBotParityTestCombatAbilityChanceOverridePrevious = 35;
+	VectorMap<uint64, bool> playerBotParityCombatAbilityHarnessOptIns;
+	// Identities a scenario's setCombatAbilitiesGate step named. The harness
+	// gate and chance overrides apply ONLY to these, never to production bodies.
+	VectorMap<uint64, bool> playerBotParityCombatAbilityScopedIds;
 	// F_0.9.6: each capability gets its OWN override pair. Sharing the award
 	// override would make setGate silently move the early-game gates too, and
 	// folding the configured flag into the override would repeat the F_0.9.5
@@ -2581,7 +2632,11 @@ private:
 		bool earlyGameGateEnabled);
 	void drainPlayerBotTrainingQueue();
 	void runPlayerBotTrainingSweep();
-	SimBotBodyProgression buildBodyProgressionSnapshot(uint64 identityId);
+	void runPlayerBotCombatAbilityReapplySweep();
+	void queuePlayerBotCombatAbilityReapply(uint64 identityId = 0);
+	bool isPlayerBotCombatAbilityHarnessOptIn(uint64 identityId);
+	SimBotBodyProgression buildBodyProgressionSnapshot(uint64 identityId,
+		const SimBotAbilityApplicability& applicability);
 	// Precondition: the caller already holds the Locker for agent. This method
 	// takes no manager mutex and must never be called while one is held.
 	void applyProgressionToBody(AiAgent* agent,
@@ -2682,6 +2737,12 @@ private:
 	bool awardToNonRosterPlayerBotBody(uint64 identityId, const String& xpType,
 		int amount, const String& source);
 	bool playerBotProgressionAwardGateEnabled();
+	// Per-identity decision: the harness override applies only to identities in
+	// playerBotParityCombatAbilityScopedIds; everyone else reads configuration.
+	bool playerBotCombatAbilitiesGateEnabled(uint64 identityId);
+	// Scenario precondition and dashboard view: override if armed, else config.
+	bool playerBotCombatAbilitiesGateArmed();
+	int playerBotCombatAbilityChanceOverride(uint64 identityId);
 	bool playerBotTrainingGateEnabled();
 	// Returns false and names the offending gate when a scenario declares a
 	// requiresGates entry that is neither armed in configuration nor armed by
@@ -3328,6 +3389,10 @@ public:
 	bool isPlayerBotKillXpEnabled() const {
 		return progressionEnabled && progressionAwardKillXp;
 	}
+	void recordPlayerBotCombatAbilityReserveRefusal() {
+		progressionCombatAbilityReserveRefusedAtExecution.increment();
+		SimBotAbilityUsageLog::recordReserveSkip();
+	}
 	bool resolvePlayerBotIdentityAndTier(uint64 bodyOid,
 		uint64& identityId, int& skillTier);
 	uint64 resolvePlayerBotIdentity(uint64 bodyOid);
@@ -3709,6 +3774,8 @@ public:
 		return minerIntelligentArrivalRadiusMeters;
 	}
 	JSONSerializationType getAiEconomyDashboardSnapshot();
+	JSONSerializationType getPlayerBotInspectJson(uint64 identityId);
+	String buildPlayerBotAdminInfoText(uint64 identityId);
 	// P.8.0b: this predicate is used by hot zone/AI paths. It returns true for
 	// real players first, then consults only the published presence snapshot for
 	// opted-in PlayerBot bodies; it never acquires pveMutex.

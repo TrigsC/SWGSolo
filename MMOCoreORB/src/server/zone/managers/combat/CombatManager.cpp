@@ -3262,6 +3262,45 @@ void CombatManager::showHitLocationFlyText(CreatureObject* attacker, CreatureObj
 
 // Special Attack Cost
 
+void CombatManager::specialAttackHamCostFromInputs(float baseHealth,
+		float baseAction, float baseMind, float healthMultiplier,
+		float actionMultiplier, float mindMultiplier, float strengthAdjustment,
+		float quicknessAdjustment, float focusAdjustment, float& health,
+		float& action, float& mind) {
+	health = baseHealth * healthMultiplier;
+	action = baseAction * actionMultiplier;
+	mind = baseMind * mindMultiplier;
+
+	health = health - (((strengthAdjustment - 300.f) / 1200.f) * health);
+	action = action - (((quicknessAdjustment - 300.f) / 1200.f) * action);
+	mind = mind - (((focusAdjustment - 300.f) / 1200.f) * mind);
+
+	if (health < 0.f)
+		health = 0.f;
+	if (action < 0.f)
+		action = 0.f;
+	if (mind < 0.f)
+		mind = 0.f;
+}
+
+void CombatManager::computeSpecialAttackHamCost(CreatureObject* attacker,
+		WeaponObject* weapon, float healthMultiplier, float actionMultiplier,
+		float mindMultiplier, float& health, float& action, float& mind) const {
+	if (attacker == nullptr || weapon == nullptr) {
+		health = 0.f;
+		action = 0.f;
+		mind = 0.f;
+		return;
+	}
+
+	specialAttackHamCostFromInputs(weapon->getHealthAttackCost(),
+		weapon->getActionAttackCost(), weapon->getMindAttackCost(),
+		healthMultiplier, actionMultiplier, mindMultiplier,
+		attacker->getHAM(CreatureAttribute::STRENGTH),
+		attacker->getHAM(CreatureAttribute::QUICKNESS),
+		attacker->getHAM(CreatureAttribute::FOCUS), health, action, mind);
+}
+
 bool CombatManager::applySpecialAttackCost(CreatureObject* attacker, WeaponObject* weapon, const CreatureAttackData& data) const {
 	// ForcePowersQueueCommand owns Force-attack checks and deductions, avoiding
 	// a double charge here.
@@ -3302,6 +3341,51 @@ bool CombatManager::applySpecialAttackCost(CreatureObject* attacker, WeaponObjec
 				data.getCommandName(), 0, currentForce, currentForce);
 		}
 
+		if (agent->hasSkillDerivedAttacks()) {
+			float health = 0.f;
+			float action = 0.f;
+			float mind = 0.f;
+			computeSpecialAttackHamCost(attacker, weapon,
+				data.getHealthCostMultiplier(), data.getActionCostMultiplier(),
+				data.getMindCostMultiplier(), health, action, mind);
+			float reserve = agent->getSkillAbilityHamReserve();
+			bool playerRuleRefused =
+				agent->getHAM(CreatureAttribute::HEALTH) <= health ||
+				agent->getHAM(CreatureAttribute::ACTION) <= action ||
+				agent->getHAM(CreatureAttribute::MIND) <= mind;
+			// The reserve limits what THIS special spends: only a pool it actually
+			// costs can refuse it. Testing every pool refused free unarmed specials
+			// whenever the bot was simply hurt below the reserve, so a 100% special
+			// policy dealt no damage at all (TRIP-verify repro run, 186 refusals).
+			bool reserveRefused =
+				(health > 0.f && static_cast<float>(agent->getHAM(
+					CreatureAttribute::HEALTH)) - health < reserve *
+					agent->getMaxHAM(CreatureAttribute::HEALTH)) ||
+				(action > 0.f && static_cast<float>(agent->getHAM(
+					CreatureAttribute::ACTION)) - action < reserve *
+					agent->getMaxHAM(CreatureAttribute::ACTION)) ||
+				(mind > 0.f && static_cast<float>(agent->getHAM(
+					CreatureAttribute::MIND)) - mind < reserve *
+					agent->getMaxHAM(CreatureAttribute::MIND));
+			if (playerRuleRefused || reserveRefused) {
+				SimPlayerManager* simPlayerManager = SimPlayerManager::instance();
+				if (simPlayerManager != nullptr)
+					simPlayerManager->recordPlayerBotCombatAbilityReserveRefusal();
+				return false;
+			}
+
+			if (health > 0.f)
+				attacker->inflictDamage(attacker, CreatureAttribute::HEALTH,
+					health, true, true, true);
+			if (action > 0.f)
+				attacker->inflictDamage(attacker, CreatureAttribute::ACTION,
+					action, true, true, true);
+			if (mind > 0.f)
+				attacker->inflictDamage(attacker, CreatureAttribute::MIND,
+					mind, true, true, true);
+			return true;
+		}
+
 		// Preserve stock NPC behavior for HAM costs; this change scopes only
 		// the previously skipped Jedi weapon Force cost.
 		return true;
@@ -3320,13 +3404,12 @@ bool CombatManager::applySpecialAttackCost(CreatureObject* attacker, WeaponObjec
 		}
 	}
 
-	float health = weapon->getHealthAttackCost() * data.getHealthCostMultiplier();
-	float action = weapon->getActionAttackCost() * data.getActionCostMultiplier();
-	float mind = weapon->getMindAttackCost() * data.getMindCostMultiplier();
-
-	health = attacker->calculateCostAdjustment(CreatureAttribute::STRENGTH, health);
-	action = attacker->calculateCostAdjustment(CreatureAttribute::QUICKNESS, action);
-	mind = attacker->calculateCostAdjustment(CreatureAttribute::FOCUS, mind);
+	float health = 0.f;
+	float action = 0.f;
+	float mind = 0.f;
+	computeSpecialAttackHamCost(attacker, weapon,
+		data.getHealthCostMultiplier(), data.getActionCostMultiplier(),
+		data.getMindCostMultiplier(), health, action, mind);
 
 	if (attacker->getHAM(CreatureAttribute::HEALTH) <= health)
 		return false;
