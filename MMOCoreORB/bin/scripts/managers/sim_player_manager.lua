@@ -1807,6 +1807,9 @@ SimPlayerManagerConfig = {
         trainingEnabled = false,
         earlyGameEnabled = false,
         combatAbilitiesEnabled = false,
+        -- Phase 0 lair diagnosis/tactics gate. Keep all new tactic behaviour
+        -- reversible until the live hold point is cleared.
+        lairTacticsEnabled = false,
         combatAbilities = {
             specialAttackChancePercent = 35,
             preferFreeStateAbilities = true,
@@ -2219,6 +2222,8 @@ SimPlayerManagerConfig = {
             maxSpawnPointTries = 32,
             maxSimultaneousAdds = 3,
             addsAbandonCycles = 8,
+            -- Phase 0: safety bound for mission-order HUNTING only.
+            missionHuntTimeoutSeconds = 600,
             terminalDwellSeconds = 5,
             terminalResolveWaitCycles = 10,
             lairTimeoutSeconds = 1800,

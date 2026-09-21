@@ -6065,6 +6065,7 @@ void SimPlayerManager::loadLuaConfig() {
 	pveMissionMaxSpawnPointTries = 32;
 	pveMissionMaxSimultaneousAdds = 3;
 	pveMissionAddsAbandonCycles = 8;
+	pveMissionHuntTimeoutMs = 600000;
 	pveMissionTerminalDwellSeconds = 5;
 	pveMissionTerminalResolveWaitCycles = 10;
 	pveMissionLairTimeoutSeconds = 1800;
@@ -6172,6 +6173,7 @@ void SimPlayerManager::loadLuaConfig() {
 	progressionTrainingEnabled = false;
 	progressionEarlyGameEnabled = false;
 	progressionCombatAbilitiesEnabled = false;
+	progressionLairTacticsEnabled = false;
 	progressionEarlyGameRealWeaponDamage = false;
 	progressionKillXpRate = 1.0f;
 	progressionEarlyGameConfig = SimBotEarlyGameConfig();
@@ -8500,6 +8502,8 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		progressionTrainingEnabled);
 	progressionEarlyGameEnabled = config.getBooleanField("earlyGameEnabled",
 		progressionEarlyGameEnabled);
+	progressionLairTacticsEnabled = config.getBooleanField("lairTacticsEnabled",
+		progressionLairTacticsEnabled);
 	SimBotCombatAbilityConfig combatAbilityConfig = previousCombatAbilityConfig;
 	combatAbilityConfig.enabled = config.getBooleanField(
 		"combatAbilitiesEnabled", combatAbilityConfig.enabled);
@@ -9192,6 +9196,12 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		pveMissionAddsAbandonCycles = clampMinerInt(
 			missionHuntConfig.getIntField("addsAbandonCycles"),
 			pveMissionAddsAbandonCycles, 1, 100);
+		int missionHuntTimeoutSeconds = clampMinerInt(
+			missionHuntConfig.getIntField("missionHuntTimeoutSeconds",
+				static_cast<int>(pveMissionHuntTimeoutMs / 1000)),
+			static_cast<int>(pveMissionHuntTimeoutMs / 1000), 60, 86400);
+		pveMissionHuntTimeoutMs = static_cast<uint64>(missionHuntTimeoutSeconds) *
+			1000;
 		pveMissionTerminalDwellSeconds = clampMinerInt(
 			missionHuntConfig.getIntField("terminalDwellSeconds"),
 			pveMissionTerminalDwellSeconds, 1, 300);
@@ -15607,11 +15617,22 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 
 	uint64 bodyOid = 0;
 	int bodyHamOverride = 0;
+	PveHuntLair missionLairSnapshot;
+	bool haveMissionLair = false;
 	{
 		Locker pveLock(&pveMutex);
 		if (pveIdentityBodyOids.contains(identityId))
 			bodyOid = pveIdentityBodyOids.get(identityId);
 		bodyHamOverride = pveNoviceBodyHam;
+		if (bodyOid != 0 && pveHuntLairs.contains(bodyOid)) {
+			missionLairSnapshot = pveHuntLairs.get(bodyOid);
+			haveMissionLair = true;
+		}
+	}
+	if (haveMissionLair) {
+		lairObserverSnapshot(bodyOid, missionLairSnapshot.lairOid);
+		if (!getPveHuntLair(bodyOid, missionLairSnapshot))
+			haveMissionLair = false;
 	}
 
 	JSONSerializationType bodyTemplate = JSONSerializationType::object();
@@ -15753,6 +15774,10 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 		String("unknown");
 	bodyJson["earlyGamePhase"] = haveEarlyState ? earlyState.phase : String();
 	bodyJson["earlyGameGraduated"] = haveEarlyState ? earlyState.graduated : false;
+	bodyJson["lairMembersAlive"] = haveMissionLair ?
+		missionLairSnapshot.lairMembersAlive : 0;
+	bodyJson["nonMemberEngagements"] = haveMissionLair ?
+		missionLairSnapshot.nonMemberEngagements : 0;
 	result["body"] = bodyJson;
 	bodyTemplate["bodyHam"] = bodyHamOverride;
 	JSONSerializationType templates = JSONSerializationType::object();
@@ -16067,6 +16092,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	gates["earlyGameEnabled"] = playerBotEarlyGameGateEnabled();
 	gates["realWeaponDamage"] = playerBotRealWeaponDamageGateEnabled();
 	gates["combatAbilitiesEnabled"] = playerBotCombatAbilitiesGateArmed();
+	gates["lairTacticsEnabled"] = isPveMissionLairTacticsEnabled();
 	gates["bazaarSell"] = false;
 	gates["bazaarBuy"] = false;
 	result["gates"] = gates;
@@ -18247,6 +18273,290 @@ bool SimPlayerManager::getPveHuntLair(uint64 bodyOid, PveHuntLair& result) {
 	return true;
 }
 
+void SimPlayerManager::recordPveHunterMissionHuntStarted(uint64 identityId,
+		uint64 bodyOid, uint64 startedAtMs) {
+	if (bodyOid == 0 || startedAtMs == 0)
+		return;
+
+	Locker pveLock(&pveMutex);
+	if (!pveHuntLairs.contains(bodyOid))
+		return;
+
+	PveHuntLair& lair = pveHuntLairs.get(bodyOid);
+	if ((identityId != 0 && lair.identityId != identityId) ||
+			lair.huntingStartedAtMs != 0)
+		return;
+	lair.huntingStartedAtMs = startedAtMs;
+}
+
+void SimPlayerManager::recordPveHunterMissionMemberKill(uint64 identityId,
+		uint64 bodyOid, uint64 offerId, uint64 lairOid, uint64 memberOid,
+		bool participantVerified) {
+	if (bodyOid == 0 || lairOid == 0 || memberOid == 0)
+		return;
+
+	uint64 actualOfferId = 0;
+	uint64 actualIdentityId = 0;
+	int membersKilled = 0;
+	int membersSpawned = 0;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveHuntLairs.contains(bodyOid))
+			return;
+
+		PveHuntLair& lair = pveHuntLairs.get(bodyOid);
+		if (lair.lairOid != lairOid ||
+				(identityId != 0 && lair.identityId != identityId) ||
+				(offerId != 0 && lair.offerId != offerId) ||
+				lair.cleanupQueued ||
+				lair.missionEndSummaryLogged ||
+				lair.memberKillOids.contains(memberOid))
+			return;
+
+		lair.memberKillOids.add(memberOid);
+		lair.membersKilled++;
+		actualOfferId = lair.offerId;
+		actualIdentityId = lair.identityId;
+		membersKilled = lair.membersKilled;
+		membersSpawned = lair.membersSpawned;
+	}
+
+	MissionDiagLog::event("LAIR_MEMBER_KILL", actualIdentityId,
+		"offerId=" + String::valueOf(actualOfferId) +
+		" lairOid=" + String::valueOf(lairOid) +
+		" memberOid=" + String::valueOf(memberOid) +
+		" participantVerified=" + String::valueOf(participantVerified) +
+		" membersKilled=" + String::valueOf(membersKilled) +
+		" membersSpawned=" + String::valueOf(membersSpawned));
+}
+
+void SimPlayerManager::recordPveHunterMissionEnd(uint64 bodyOid,
+		uint64 lairOid, const String& reason) {
+	if (bodyOid == 0 || lairOid == 0)
+		return;
+
+	uint64 identityId = 0;
+	uint64 offerId = 0;
+	uint64 huntingStartedAtMs = 0;
+	int membersSpawned = 0;
+	int membersKilled = 0;
+	ManagedReference<LairObserver*> observer;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveHuntLairs.contains(bodyOid))
+			return;
+
+		PveHuntLair& lair = pveHuntLairs.get(bodyOid);
+		if (lair.lairOid != lairOid || lair.missionEndSummaryLogged)
+			return;
+
+		lair.missionEndSummaryLogged = true;
+		identityId = lair.identityId;
+		offerId = lair.offerId;
+		huntingStartedAtMs = lair.huntingStartedAtMs;
+		membersSpawned = lair.membersSpawned;
+		membersKilled = lair.membersKilled;
+		observer = lair.waveObserver;
+	}
+	if (observer != nullptr && observer->getSpawnedCreatures() != nullptr)
+		membersSpawned = Math::max(membersSpawned,
+			observer->getSpawnedCreatures()->size());
+
+	uint64 nowMs = System::getMiliTime();
+	uint64 huntingMs = huntingStartedAtMs != 0 && nowMs >= huntingStartedAtMs ?
+		nowMs - huntingStartedAtMs : 0;
+	MissionDiagLog::event("MISSION_SUMMARY", identityId,
+		"offerId=" + String::valueOf(offerId) +
+		" lairOid=" + String::valueOf(lairOid) +
+		" membersSpawned=" + String::valueOf(membersSpawned) +
+		" membersKilled=" + String::valueOf(membersKilled) +
+		" timeInHuntingMs=" + String::valueOf(huntingMs) +
+		" endReason=" + reason);
+}
+
+bool SimPlayerManager::isKnownPveMissionLair(uint64 lairOid) {
+	if (lairOid == 0)
+		return false;
+	Locker pveLock(&pveMutex);
+	if (pveKnownMissionLairOids.contains(lairOid))
+		return true;
+	for (int i = 0; i < pveHuntLairs.size(); ++i) {
+		if (pveHuntLairs.elementAt(i).getValue().lairOid == lairOid)
+			return true;
+	}
+	return false;
+}
+
+void SimPlayerManager::recordPveMissionLairDamage(uint64 lairOid,
+		uint64 attackerOid, int amount, int conditionDamage, int maxCondition,
+		const String& source) {
+	if (lairOid == 0)
+		return;
+
+	uint64 identityId = 0;
+	uint64 bodyOid = 0;
+	uint64 offerId = 0;
+	uint64 targetOid = 0;
+	String phase;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < pveHuntLairs.size(); ++i) {
+			const PveHuntLair& lair = pveHuntLairs.elementAt(i).getValue();
+			if (lair.lairOid != lairOid)
+				continue;
+			identityId = lair.identityId;
+			bodyOid = lair.bodyOid;
+			offerId = lair.offerId;
+			if (pveHuntOrders.contains(identityId)) {
+				const PveHuntOrder& order = pveHuntOrders.get(identityId);
+				phase = order.phase;
+				targetOid = order.targetOid;
+			}
+			break;
+		}
+	}
+
+	// The same observer class serves real player destroy missions, so an
+	// unresolved event is only ours if this lair was one we revealed. Without
+	// this guard every player-mission wave spawn would emit a contextResolved=0
+	// record, indistinguishable from the raced lethal SimBot record the fallback
+	// below exists to preserve.
+	if (bodyOid == 0 && !isKnownPveMissionLair(lairOid))
+		return;
+
+	// Deliberately NO early return when the lair record is gone. The damage that
+	// DESTROYS the lair is the most interesting record of all, and it is exactly
+	// the one that races: the synchronous destruction notification queues its
+	// completion handoff, which drops the pveHuntLairs entry, and that can win
+	// against this deferred task. Returning here would silently discard the
+	// killing blow -- and, worse, a reader would see the mission end with no
+	// lethal record and conclude nothing had hit it. When the context cannot be
+	// resolved we still log, with contextResolved=0 so the missing identity and
+	// offer are visible as unknown rather than absent.
+	//
+	// The damage fields (amount, condition, source) are captured by the CALLER at
+	// the moment of the event, under whatever lock that event already holds, and
+	// never re-read here. The mission context below (identity, offer, phase,
+	// target) IS resolved on this task and is therefore best-effort.
+	//
+	// The two sources are separate call paths on purpose. Combat damage arrives
+	// as DAMAGERECEIVED. Spawn self-damage does NOT: spawnLairMobile calls
+	// lair->inflictDamage() directly and inflictDamage notifies no observers
+	// (DAMAGERECEIVED is raised only by CombatManager :1645/:1717 and AiAgent
+	// :7069/:7090), so it is reported by an explicit diagnostic hook at that
+	// call site instead. Inferring it from condition deltas between combat
+	// records does NOT work -- a delta also contains the observed hit itself and
+	// any healLair tick, and self-damage that destroys the lair is followed by
+	// no record at all. Emitting a real DAMAGERECEIVED from the spawn path would
+	// attribute it but would also drive checkForNewSpawns/healLair, which this
+	// diagnostic must not do.
+	MissionDiagLog::event("LAIR_DAMAGE", identityId,
+		"offerId=" + String::valueOf(offerId) +
+		" lairOid=" + String::valueOf(lairOid) +
+		" source=" + source +
+		" contextResolved=" + String::valueOf(bodyOid != 0) +
+		" attackerOid=" + String::valueOf(attackerOid) +
+		" isBot=" + String::valueOf(bodyOid != 0 && attackerOid == bodyOid) +
+		" amount=" + String::valueOf(amount) +
+		" subPhase=" + phase +
+		" targetOid=" + String::valueOf(targetOid) +
+		" conditionDamage=" + String::valueOf(conditionDamage) +
+		" maxCondition=" + String::valueOf(maxCondition));
+}
+
+Vector<ManagedReference<CreatureObject*> >
+SimPlayerManager::lairObserverSnapshot(uint64 bodyOid, uint64 expectedLairOid) {
+	Vector<ManagedReference<CreatureObject*> > result;
+	if (bodyOid == 0 || expectedLairOid == 0)
+		return result;
+
+	ManagedReference<LairObserver*> observer;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveHuntLairs.contains(bodyOid))
+			return result;
+		const PveHuntLair& lair = pveHuntLairs.get(bodyOid);
+		if (lair.lairOid != expectedLairOid || !lair.alive ||
+				lair.cleanupQueued)
+			return result;
+		observer = lair.waveObserver;
+	}
+
+	if (observer == nullptr)
+		return result;
+
+	SynchronizedVector<ManagedReference<CreatureObject*> >* spawnedCreatures =
+		observer->getSpawnedCreatures();
+	int membersSpawned = spawnedCreatures == nullptr ? 0 : spawnedCreatures->size();
+	if (spawnedCreatures != nullptr) {
+		for (int i = 0; i < spawnedCreatures->size(); ++i) {
+			ManagedReference<CreatureObject*> member = spawnedCreatures->get(i);
+			if (member == nullptr || member->isDead() || member->getZone() == nullptr)
+				continue;
+			result.add(member);
+		}
+	}
+
+	if (MissionDiagLog::isLoggingEnabled()) {
+		for (int i = 0; i < result.size(); ++i) {
+			ManagedReference<CreatureObject*> member = result.get(i);
+			if (member == nullptr)
+				continue;
+			uint64 memberOid = member->getObjectID();
+			bool reserveObserver = false;
+			{
+				Locker pveLock(&pveMutex);
+				if (pveHuntLairs.contains(bodyOid) &&
+						pveHuntLairs.get(bodyOid).lairOid == expectedLairOid &&
+						!pveHuntLairs.get(bodyOid).cleanupQueued &&
+						!pveHuntLairs.get(bodyOid).memberObserverOids.contains(
+							memberOid)) {
+					pveHuntLairs.get(bodyOid).memberObserverOids.add(memberOid);
+					reserveObserver = true;
+				}
+			}
+			if (!reserveObserver)
+				continue;
+
+			Reference<Observer*> memberObserver = new LambdaObserver(
+				new LambdaObserverFunction(
+					[bodyOid, expectedLairOid, memberOid](uint32, Observable*,
+							ManagedObject* arg1, uint64) -> int {
+						TangibleObject* attacker = cast<TangibleObject*>(arg1);
+						bool participantVerified = attacker != nullptr &&
+							attacker->getObjectID() == bodyOid;
+						Core::getTaskManager()->executeTask(
+							[bodyOid, expectedLairOid, memberOid,
+								participantVerified]() {
+								SimPlayerManager::instance()->
+									recordPveHunterMissionMemberKill(0, bodyOid, 0,
+										expectedLairOid, memberOid,
+										participantVerified);
+							}, "SimPveMissionMemberDestructionDiagHandoff");
+						return 1;
+					}, "SimPveMissionMemberDestructionDiagObserver"));
+			{
+				Locker memberLock(member);
+				if (member->getZone() != nullptr && !member->isDead())
+					member->registerObserver(ObserverEventType::OBJECTDESTRUCTION,
+						memberObserver);
+			}
+		}
+	}
+
+	{
+		Locker pveLock(&pveMutex);
+		if (pveHuntLairs.contains(bodyOid) &&
+				pveHuntLairs.get(bodyOid).lairOid == expectedLairOid) {
+			PveHuntLair& lair = pveHuntLairs.get(bodyOid);
+			lair.membersSpawned = Math::max(lair.membersSpawned, membersSpawned);
+			lair.lairMembersAlive = result.size();
+		}
+	}
+
+	return result;
+}
+
 void SimPlayerManager::requestPveHuntLairCleanup(uint64 bodyOid,
 		const String& reason) {
 	if (bodyOid == 0)
@@ -18287,6 +18597,9 @@ void SimPlayerManager::recordPveHunterMissionAdds(uint64 identityId,
 
 	order.missionAddsEngaged = Math::max(0, adds);
 	pveHuntOrders.put(identityId, order);
+	if (bodyOid != 0 && pveHuntLairs.contains(bodyOid) &&
+			pveHuntLairs.get(bodyOid).alive)
+		pveHuntLairs.get(bodyOid).nonMemberEngagements = Math::max(0, adds);
 }
 
 void SimPlayerManager::recordPveDoctorInteraction() {
@@ -18876,6 +19189,36 @@ void SimPlayerManager::registerPveBotMissionLairObserver(LairObject* lair,
 			}, "SimPveBotMissionLairDestroyedObserver"));
 	lair->registerObserver(ObserverEventType::OBJECTDESTRUCTION,
 		completionObserver);
+	if (MissionDiagLog::isLoggingEnabled()) {
+		Reference<Observer*> damageObserver = new LambdaObserver(
+			new LambdaObserverFunction(
+				[lairOid](uint32, Observable* observable, ManagedObject* attacker,
+						uint64 arg2) -> int {
+					if (!MissionDiagLog::isLoggingEnabled())
+						return 0;
+					TangibleObject* attackerObject = cast<TangibleObject*>(attacker);
+					uint64 attackerOid = attackerObject == nullptr ? 0 :
+						attackerObject->getObjectID();
+					// Snapshot the amount and condition HERE. The notifier holds
+					// the defender lock at this point; the deferred task does not,
+					// and by the time it runs another hit, a wave spawn or a
+					// healLair tick may already have moved the condition.
+					TangibleObject* lairTano = cast<TangibleObject*>(observable);
+					int conditionDamage = lairTano == nullptr ? 0 :
+						lairTano->getConditionDamage();
+					int maxCondition = lairTano == nullptr ? 0 :
+						lairTano->getMaxCondition();
+					int amount = static_cast<int>(arg2);
+					Core::getTaskManager()->executeTask([lairOid, attackerOid,
+							amount, conditionDamage, maxCondition]() {
+						SimPlayerManager::instance()->recordPveMissionLairDamage(
+							lairOid, attackerOid, amount, conditionDamage,
+							maxCondition, "combat");
+					}, "SimPveMissionLairDamageDiagHandoff");
+					return 0;
+				}, "SimPveMissionLairDamageDiagObserver"));
+		lair->registerObserver(ObserverEventType::DAMAGERECEIVED, damageObserver);
+	}
 }
 
 bool SimPlayerManager::generatePveBotMissionOffers(uint64 identityId,
@@ -19350,6 +19693,8 @@ void SimPlayerManager::onPveBotMissionLairDestroyed(uint64 bodyOid,
 	if (bodyOid == 0 || lairOid == 0)
 		return;
 
+	recordPveHunterMissionEnd(bodyOid, lairOid, "lair_destroyed");
+
 	uint64 identityId = 0;
 	bool missionCompleted = false;
 	bool trackedMissionLair = false;
@@ -19696,6 +20041,7 @@ SimPlayerManager::revealPveBotMissionLair(uint64 bodyOid, uint64 offerId) {
 	record.identityId = identityId;
 	record.bodyOid = bodyOid;
 	record.lairOid = lairOid;
+	record.offerId = offerId;
 	record.speciesKey = "mission_board:" + String::valueOf(offerId);
 	record.planet = offer.planet;
 	record.x = spawnPos.getX();
@@ -19728,6 +20074,20 @@ SimPlayerManager::revealPveBotMissionLair(uint64 bodyOid, uint64 offerId) {
 				record.waveObserver = lairObserver;
 				pveHuntLairs.put(bodyOid, record);
 				pveMissionLairsSpawned++;
+				// Mark this lair as ours for the diagnostic hook, and keep the
+				// set bounded by evicting the oldest entry.
+				pveKnownMissionLairOids.put(lairOid, System::getMiliTime());
+				while (pveKnownMissionLairOids.size() >
+						PVE_KNOWN_MISSION_LAIR_MAX) {
+					int oldest = 0;
+					for (int k = 1; k < pveKnownMissionLairOids.size(); ++k) {
+						if (pveKnownMissionLairOids.elementAt(k).getValue() <
+								pveKnownMissionLairOids.elementAt(oldest).getValue())
+							oldest = k;
+					}
+					pveKnownMissionLairOids.drop(
+						pveKnownMissionLairOids.elementAt(oldest).getKey());
+				}
 			}
 		}
 	}
@@ -19883,6 +20243,7 @@ void SimPlayerManager::queuePveHuntLairCleanup(uint64 bodyOid,
 
 void SimPlayerManager::finishPveHuntLairCleanup(uint64 bodyOid,
 		uint64 lairOid, const String& reason) {
+	recordPveHunterMissionEnd(bodyOid, lairOid, reason);
 	bool removed = false;
 	{
 		Locker pveLock(&pveMutex);
@@ -19927,6 +20288,7 @@ void SimPlayerManager::runPveHuntLairJanitor(uint64 nowMs) {
 		}
 
 		if (!live) {
+			recordPveHunterMissionEnd(record.bodyOid, record.lairOid, "janitor");
 			bool removed = false;
 			{
 				Locker pveLock(&pveMutex);

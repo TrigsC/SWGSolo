@@ -739,13 +739,22 @@ struct PveHuntLair {
 	uint64 identityId = 0;
 	uint64 bodyOid = 0;
 	uint64 lairOid = 0;
+	uint64 offerId = 0;
 	String speciesKey;
 	String planet;
 	float x = 0.f;
 	float y = 0.f;
 	float z = 0.f;
 	uint64 spawnedAtMs = 0;
+	uint64 huntingStartedAtMs = 0;
 	int kills = 0;
+	int membersSpawned = 0;
+	int membersKilled = 0;
+	int lairMembersAlive = 0;
+	int nonMemberEngagements = 0;
+	Vector<uint64> memberKillOids;
+	Vector<uint64> memberObserverOids;
+	bool missionEndSummaryLogged = false;
 	bool alive = false;
 	bool spawnInProgress = false;
 	bool cleanupQueued = false;
@@ -2209,6 +2218,7 @@ private:
 	bool progressionTrainingEnabled = false;
 	bool progressionEarlyGameEnabled = false;
 	bool progressionCombatAbilitiesEnabled = false;
+	bool progressionLairTacticsEnabled = false;
 	bool progressionEarlyGameRealWeaponDamage = false;
 	float progressionKillXpRate = 1.0f;
 	SimBotEarlyGameConfig progressionEarlyGameConfig;
@@ -2445,6 +2455,12 @@ private:
 	uint64 pveHunterLastAnnounceMs = 0;
 	uint64 pveHunterLastSiteAnnounceMs = 0;
 	uint64 pveMissionLairsSpawned = 0;
+	// Recently-revealed SimBot mission lair OIDs, guarded by pveMutex. Retained
+	// after the pveHuntLairs entry is dropped (bounded, oldest evicted) purely so
+	// the diagnostic hook can tell a SimBot lair from a player's destroy mission,
+	// which shares the same observer class.
+	static const int PVE_KNOWN_MISSION_LAIR_MAX = 64;
+	VectorMap<uint64, uint64> pveKnownMissionLairOids;
 	uint64 pveMissionLairsCleaned = 0;
 	uint64 pveCreatureKillsTotal = 0;
 	uint64 pveLairsDestroyedTotal = 0;
@@ -2508,6 +2524,7 @@ private:
 	int pveMissionMaxSpawnPointTries = 32;
 	int pveMissionMaxSimultaneousAdds = 3;
 	int pveMissionAddsAbandonCycles = 8;
+	uint64 pveMissionHuntTimeoutMs = 600000;
 	int pveMissionTerminalDwellSeconds = 5;
 	int pveMissionTerminalResolveWaitCycles = 10;
 	int pveMissionLairTimeoutSeconds = 1800;
@@ -3796,6 +3813,27 @@ public:
 	void onPveHunterDied(uint64 identityId, uint64 bodyOid);
 	void recordPveHunterPhase(uint64 identityId, uint64 bodyOid,
 		const String& phase, uint64 targetOid = 0);
+	void recordPveHunterMissionHuntStarted(uint64 identityId, uint64 bodyOid,
+		uint64 startedAtMs);
+	void recordPveHunterMissionMemberKill(uint64 identityId, uint64 bodyOid,
+		uint64 offerId, uint64 lairOid, uint64 memberOid,
+		bool participantVerified);
+	void recordPveHunterMissionEnd(uint64 bodyOid, uint64 lairOid,
+		const String& reason);
+	// source is "combat" (observed DAMAGERECEIVED) or "spawn_self" (the lair
+	// damaging itself as a wave spawns, which raises no observer event).
+	void recordPveMissionLairDamage(uint64 lairOid, uint64 attackerOid,
+		int amount, int conditionDamage, int maxCondition, const String& source);
+	// DestroyMissionLairObserver is ALSO installed on real player destroy
+	// missions (DestroyMissionObjectiveImplementation.cpp:229), so a diagnostic
+	// hook living in that observer must ask whether the lair is one of ours
+	// before recording anything. Entries are retained past pveHuntLairs removal
+	// so the record for the killing blow -- which races that removal -- is still
+	// attributable to a SimBot lair rather than dropped or mistaken for a
+	// player's.
+	bool isKnownPveMissionLair(uint64 lairOid);
+	Vector<ManagedReference<CreatureObject*> > lairObserverSnapshot(
+		uint64 bodyOid, uint64 expectedLairOid);
 	void recordPveHunterKill(uint64 identityId, uint64 bodyOid,
 		uint64 targetOid, const String& harvestKind,
 		const String& requestedResourceType, bool participantVerified);
@@ -3934,6 +3972,7 @@ public:
 	float getPveHunterRetreatRangeMeters() const { return pveRetreatRangeMeters; }
 	int getPveHunterActiveTickSeconds() const { return pveHunterActiveTickSeconds; }
 	int getPveHunterTimeoutSeconds() const { return pveHuntTimeoutSeconds; }
+	uint64 getPveMissionHuntTimeoutMs() const { return pveMissionHuntTimeoutMs; }
 	float getPveHunterScanRadiusMeters() const { return pveHunterScanRadiusMeters; }
 	float getPveHunterWeaponRangeMeters() const { return pveHunterWeaponRangeMeters; }
 	int getPveMissionTerminalDwellSeconds() const {
@@ -3947,6 +3986,9 @@ public:
 	}
 	int getPveMissionAddsAbandonCycles() const {
 		return pveMissionAddsAbandonCycles;
+	}
+	bool isPveMissionLairTacticsEnabled() const {
+		return progressionEnabled && progressionLairTacticsEnabled;
 	}
 	int getPveNavmeshModeDebounceTicks() const {
 		return pveNavmeshModeDebounceTicks;

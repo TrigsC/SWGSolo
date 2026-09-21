@@ -343,7 +343,7 @@
     const source = templates.attackSource === "skill" ? "trained skills" : "body template";
 
     return `<div class="playerbot-card"><h3>WHO</h3><p class="playerbot-lead">${esc(identity.name || "Unnamed SimBot")}</p>
-      ${kvRows([["Profession", esc(labelize(identity.profession || "unknown"))], ["Home", esc(home)], ["Tier", num(identity.skillTier)], ["Kills / deaths", `${num(identity.kills)} / ${num(identity.deaths)}`], ["Activity", esc(labelize(activity))], ["Body", body.attached ? `attached · ${esc(body.zone || "unknown")}` : "not attached"]])}</div>
+      ${kvRows([["Profession", esc(labelize(identity.profession || "unknown"))], ["Home", esc(home)], ["Tier", num(identity.skillTier)], ["Kills / deaths", `${num(identity.kills)} / ${num(identity.deaths)}`], ["Activity", esc(labelize(activity))], ["Body", body.attached ? `attached · ${esc(body.zone || "unknown")}` : "not attached"], ["Lair members alive", num(body.lairMembersAlive)], ["Non-member engagements", num(body.nonMemberEngagements)]])}</div>
       <div class="playerbot-card"><h3>TEMPLATES</h3><p>Body: <b>${esc(bodyTemplate.objectName || "unknown")}</b> (<code>${esc(bodyTemplate.key || "unknown")}</code>) — level ${num(bodyTemplate.level)}; HAM ${num(bodyTemplate.bodyHam || 0)} per pool.</p>
         <p>Weapon: <code>${esc(weapon.template || "unarmed")}</code> — earns ${esc(labelize(weapon.xpType || "unknown"))} XP.</p>
         <p>AI: <code>${esc(templates.aiTree || "unknown")}</code> — controller moves, stock tree fights.</p><p>Attacks from: <b>${esc(source)}</b>.</p>

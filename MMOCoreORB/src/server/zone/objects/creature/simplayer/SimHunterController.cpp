@@ -1623,6 +1623,10 @@ void SimHunterController::beginMissionCleanup(bool abandoned,
 	if (!orderActive || !missionHuntOrder)
 		return;
 
+	if (missionLairOid != 0)
+		SimPlayerManager::instance()->recordPveHunterMissionEnd(
+			agent == nullptr ? 0 : agent->getObjectID(), missionLairOid, reason);
+
 	// The REAL abandon cause. Downstream, completeOrder overwrites it with the
 	// generic "abandoned" (reached home) or "path_failed_TRAVEL_HOME" (didn't),
 	// so the dashboard abandonReasons never shows WHY the mission was dropped.
@@ -1681,12 +1685,63 @@ bool SimHunterController::checkMissionSocialAggro(AiAgent* hunter) {
 	const CreatureTemplate* targetTemplate = targetAgent->getCreatureTemplate();
 	bool socialTarget = !targetAgent->getSocialGroup().isEmpty() ||
 		(targetTemplate != nullptr && targetTemplate->isHerd());
-	const DeltaVector<ManagedReference<SceneObject*> >* defenders =
-		hunter->getDefenderList();
-	int adds = defenders == nullptr ? 0 : defenders->size();
+	// Snapshot the defender OIDs under the hunter lock and count outside it:
+	// add/removeDefender are @preLocked, so iterating the live DeltaVector
+	// unlocked races a concurrent mutation. Same choreography as
+	// findUnwinnableEarlyGameAttacker (:2141) and :4181. The lock is released
+	// before lairObserverSnapshot, which takes pveMutex -- that mutex is never
+	// nested inside an agent lock.
+	Vector<uint64> defenderOids;
+	{
+		Locker agentLock(hunter);
+		const DeltaVector<ManagedReference<SceneObject*> >* defenders =
+			hunter->getDefenderList();
+		if (defenders != nullptr) {
+			for (int i = 0; i < defenders->size(); ++i) {
+				ManagedReference<SceneObject*> defender = defenders->getSafe(i);
+				if (defender != nullptr)
+					defenderOids.add(defender->getObjectID());
+			}
+		}
+	}
+
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	PveHuntLair lair;
+	bool missionLairLive = manager->getPveHuntLair(hunter->getObjectID(), lair) &&
+		lair.alive && !lair.cleanupQueued && lair.lairOid == missionLairOid;
+	Vector<ManagedReference<CreatureObject*> > lairMembers;
+	if (missionLairLive)
+		lairMembers = manager->lairObserverSnapshot(hunter->getObjectID(),
+			missionLairOid);
+
+	// While a mission lair is live, lair members are excluded from the cap
+	// entirely: a wave is 2-5 creatures against a cap of 3, so counting them at
+	// all reproduces the abandonment this fix exists to remove. The cap's job on
+	// a mission is to notice UNRELATED attackers piling on.
+	int adds = 0;
+	for (int i = 0; i < defenderOids.size(); ++i) {
+		uint64 defenderOid = defenderOids.get(i);
+		bool isLairMember = false;
+		if (missionLairLive) {
+			for (int j = 0; j < lairMembers.size(); ++j) {
+				if (lairMembers.get(j) != nullptr &&
+						lairMembers.get(j)->getObjectID() == defenderOid) {
+					isLairMember = true;
+					break;
+				}
+			}
+		}
+		if (!isLairMember)
+			++adds;
+	}
 	updateMissionAdds(adds);
 
-	if (!socialTarget || adds <= SimPlayerManager::instance()->
+	if (missionLairLive && manager->isPveMissionLairTacticsEnabled()) {
+		missionAddsOverCapCycles = 0;
+		return false;
+	}
+
+	if (!socialTarget || adds <= manager->
 		getPveMissionMaxSimultaneousAdds()) {
 		missionAddsOverCapCycles = 0;
 		return false;
@@ -1704,6 +1759,10 @@ bool SimHunterController::checkMissionSocialAggro(AiAgent* hunter) {
 		// abandonment. Keep the same target/observer so the next HUNTING pass
 		// can resume this wave, but do not let the generic retreat cap fire
 		// before addsAbandonCycles has elapsed.
+		MissionDiagLog::event("RETREATING", identityId,
+			"reason=social_adds_cap lairOid=" +
+			String::valueOf(missionLairOid) + " adds=" +
+			String::valueOf(adds));
 		setPhase(RETREATING);
 		Vector3 current = hunter->getWorldPosition();
 		Vector3 away = current;
@@ -2066,6 +2125,16 @@ void SimHunterController::beginHunting() {
 
 	if (huntStartedAtMs == 0)
 		huntStartedAtMs = System::getMiliTime();
+	// Deliberately NOT huntStartedAtMs: that is order-level and survives
+	// beginNextMissionOffer(), so the second held offer would inherit the
+	// first's start and report a cumulative timeInHuntingMs. The lair record is
+	// created fresh per offer and recordPveHunterMissionHuntStarted ignores a
+	// second call for the same lair, so a current timestamp is the per-lair
+	// start. The order-level value stays as it is for the phase timeout.
+	if (missionHuntOrder)
+		SimPlayerManager::instance()->recordPveHunterMissionHuntStarted(
+			identityId, agent == nullptr ? 0 : agent->getObjectID(),
+			System::getMiliTime());
 
 	setPhase(HUNTING);
 	lastPatrolMoveMs = 0;
@@ -3343,6 +3412,8 @@ void SimHunterController::runActiveTick() {
 	case TRAVEL_TO_LAIR: phaseTimeoutMs = 900000; break;
 	case ENGAGING_LAIR: phaseTimeoutMs = 900000; break;
 	case AWAITING_WORLD: phaseTimeoutMs = 300000; break;
+	case HUNTING: phaseTimeoutMs = missionHuntOrder ?
+		SimPlayerManager::instance()->getPveMissionHuntTimeoutMs() : 0; break;
 	case RETREATING: phaseTimeoutMs = 180000; break;
 	case HEALING: phaseTimeoutMs = 900000; break;
 	case TRAVEL_HOME: phaseTimeoutMs = 900000; break;
@@ -3791,17 +3862,60 @@ void SimHunterController::runActiveTick() {
 			moveToTarget();
 	} else {
 		bool foundTarget = scanForTarget();
-		if (missionHuntOrder && missionLairOid != 0)
+		if (missionHuntOrder && missionLairOid != 0) {
+			SimPlayerManager* manager = SimPlayerManager::instance();
+			PveHuntLair lair;
+			Vector<ManagedReference<CreatureObject*> > lairMembers =
+				manager->lairObserverSnapshot(strongAgent->getObjectID(),
+					missionLairOid);
+			manager->getPveHuntLair(strongAgent->getObjectID(), lair);
+			uint64 targetHomeOid = 0;
+			ZoneServer* zoneServer = ServerCore::getZoneServer();
+			ManagedReference<SceneObject*> targetObject = zoneServer == nullptr ?
+				nullptr : zoneServer->getObject(targetOid);
+			CreatureObject* target = targetObject == nullptr ? nullptr :
+				targetObject->asCreatureObject();
+			if (target != nullptr) {
+				AiAgent* targetAgent = target->asAiAgent();
+				ManagedReference<SceneObject*> targetHome = targetAgent == nullptr ?
+					nullptr : targetAgent->getHomeObject().get();
+				if (targetHome != nullptr)
+					targetHomeOid = targetHome->getObjectID();
+			}
+			// Indices 0,1,2 are HEALTH, STRENGTH, CONSTITUTION -- not the primary
+			// pools. The primaries are 0, 3, 6, so a raw 0..2 loop reports a
+			// healthy bot while ACTION or MIND is empty, which is exactly the
+			// "bot too weak" case this diagnostic exists to catch. Same pool
+			// list isBelowRetreatThreshold uses (:2597).
+			float hamFraction = 1.f;
+			{
+				const uint8 hamPools[] = {CreatureAttribute::HEALTH,
+					CreatureAttribute::ACTION, CreatureAttribute::MIND};
+				Locker agentLock(strongAgent);
+				for (uint8 i = 0; i < 3; ++i) {
+					int maxHam = strongAgent->getMaxHAM(hamPools[i]);
+					int ham = strongAgent->getHAM(hamPools[i]);
+					if (maxHam > 0)
+						hamFraction = Math::min(hamFraction,
+							static_cast<float>(ham) / static_cast<float>(maxHam));
+				}
+			}
 			// DIAGNOSTIC: fires each HUNTING scan on a mission. foundTarget=1
-			// repeatedly => the field never clears (wave mobs keep respawning /
-			// in range) so the hunter never turns to attack the lair structure;
+			// repeatedly => the field remains occupied or is reacquired;
 			// foundTarget=0 with the engage gate on => it transitions to
 			// ENGAGING_LAIR (see LAIR_ENGAGE next).
 			MissionDiagLog::event("LAIR_FIELD", identityId,
 				"foundTarget=" + String::valueOf(foundTarget) +
 				" engageGate=" + String::valueOf(SimPlayerManager::instance()->
 					getPveMissionBoardLairEngageAfterFieldClear()) +
-				" lairOid=" + String::valueOf(missionLairOid));
+				" lairOid=" + String::valueOf(missionLairOid) +
+				" targetOid=" + String::valueOf(targetOid) +
+				" targetHomeOid=" + String::valueOf(targetHomeOid) +
+				" lairMembersAlive=" + String::valueOf(lairMembers.size()) +
+				" spawnNumber=" + String::valueOf(lair.waveObserver == nullptr ?
+					-1 : lair.waveObserver->getSpawnNumber()) +
+				" botHamFraction=" + String::valueOf(hamFraction));
+		}
 		if (!foundTarget && missionHuntOrder &&
 				SimPlayerManager::instance()->isPveMissionBoardEnabled() &&
 				missionLairOid != 0 && SimPlayerManager::instance()->
@@ -4690,6 +4804,11 @@ void SimHunterController::onHuntDestruction(uint64 destroyedTargetOid,
 
 	destructionHandled = true;
 	dropTargetObserver();
+	if (missionHuntOrder && targetMissionWave)
+		SimPlayerManager::instance()->recordPveHunterMissionMemberKill(
+			identityId, agent == nullptr ? 0 : agent->getObjectID(),
+			currentMissionOfferId, missionLairOid, destroyedTargetOid,
+			participantVerified);
 	if (!participantVerified) {
 		handleTargetUnavailable();
 		return;
@@ -4759,6 +4878,11 @@ void SimHunterController::beginRetreat() {
 
 	retreatCycles++;
 	order.retreatCycles = retreatCycles;
+	if (missionHuntOrder && missionLairOid != 0)
+		MissionDiagLog::event("RETREATING", identityId,
+			"reason=ham_threshold lairOid=" + String::valueOf(missionLairOid) +
+			" targetOid=" + String::valueOf(targetOid) + " retreatCycle=" +
+			String::valueOf(retreatCycles));
 	setPhase(RETREATING);
 
 	Vector3 current = agent->getWorldPosition();

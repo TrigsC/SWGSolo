@@ -9,6 +9,8 @@
 #include "server/zone/objects/creature/ai/Creature.h"
 #include "server/zone/objects/tangible/LairObject.h"
 #include "server/zone/managers/creature/SpawnLairMobileTask.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
+#include "server/zone/objects/creature/simplayer/MissionDiagLog.h"
 
 // #define DEBUG_MISSION_LAIRS
 
@@ -304,4 +306,29 @@ void DestroyMissionLairObserverImplementation::spawnLairMobile(LairObject* lair,
 #endif // DEBUG_MISSION_LAIRS
 
 	lair->inflictDamage(lair, 0, newDamage, true, true, false);
+
+	// Diagnostic-only, default-off: this is the ONE path that damages a mission
+	// lair without raising DAMAGERECEIVED, so it is invisible to the observer
+	// SimPlayerManager registers. Reported explicitly rather than inferred from
+	// condition deltas (a delta also carries the observed combat hit and any
+	// healLair tick). Deliberately NOT a notifyObservers call: that would drive
+	// checkForNewSpawns and healLair and change lair behaviour.
+	// This observer class also serves real player destroy missions, so the SimBot
+	// check is what keeps player missions out of the diagnostic entirely -- they
+	// never even queue a task.
+	if (MissionDiagLog::isLoggingEnabled() &&
+			SimPlayerManager::instance()->isKnownPveMissionLair(
+				lair->getObjectID())) {
+		uint64 lairOid = lair->getObjectID();
+		// The lair is locked here (spawnLairMobile is @arg1preLocked), so read
+		// the condition now and hand only plain values to the deferred task.
+		int conditionDamage = lair->getConditionDamage();
+		int maxCondition = lair->getMaxCondition();
+		Core::getTaskManager()->executeTask([lairOid, newDamage, conditionDamage,
+				maxCondition]() {
+			SimPlayerManager::instance()->recordPveMissionLairDamage(
+				lairOid, lairOid, newDamage, conditionDamage, maxCondition,
+				"spawn_self");
+		}, "SimPveMissionLairSelfDamageDiagHandoff");
+	}
 }
