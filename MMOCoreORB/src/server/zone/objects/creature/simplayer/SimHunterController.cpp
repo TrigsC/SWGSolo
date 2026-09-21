@@ -1587,6 +1587,7 @@ bool SimHunterController::beginNextMissionOffer() {
 	missionAddsOverCapCycles = 0;
 	updateMissionAdds(0);
 	setPhase(TRAVEL_TO_MISSION);
+	setHybridFailureProbeEnabled(MissionDiagLog::isLoggingEnabled());
 	moveTo(missionLairPosition);
 	return true;
 }
@@ -2075,6 +2076,19 @@ void SimHunterController::onPathFailed() {
 	}
 
 	if (missionHuntOrder && phase == TRAVEL_TO_MISSION) {
+		// This site had NO diagnostics, which is why the second-largest mission
+		// failure was invisible. Same evidence the terminal leg now carries: the
+		// hybrid line says whether the wilderness target was off-mesh (and so
+		// whether resolveHybridExit was even reached), and whether recast found
+		// start/end polygons.
+		MissionDiagLog::event("MISSION_PATH_FAILED", identityId,
+			MissionDiagLog::fmtVec("target", missionLairPosition) +
+			" " + MissionDiagLog::fmtVec("pos", agent == nullptr ? Vector3() :
+				agent->getWorldPosition()) +
+			" dist=" + String::valueOf(agent == nullptr ? -1.f :
+				agent->getWorldPosition().distanceTo2d(missionLairPosition)) +
+			" offerId=" + String::valueOf(currentMissionOfferId) +
+			" hybrid[" + getHybridPathDiagLine() + "]");
 		beginMissionCleanup(true, "mission_offer_path_failed");
 		return;
 	}

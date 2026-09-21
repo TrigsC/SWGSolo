@@ -5,6 +5,10 @@
 - **Branch**: `feat/p10i-lair-tactics-mission-graduation`
 - **Scope**: Phase 0 only. Phases 1–5 unimplemented; Phase 3 blocked on this run.
 - **Verdict**: **`DIAGNOSIS COMPLETE — PHASE 3 PREMISE INVALIDATED`**
+- **UPDATE 2026-09-21 (later same day)**: the diagnosed pathing defect was fixed
+  (commit `48ccf3125b`) and the mission loop now completes end to end. See
+  "Outcome after the fix" at the end of this report — it reverses the assumption
+  that lair tactics are needed for missions to complete.
 
 ## What this run was for
 
@@ -168,3 +172,60 @@ byte-for-byte backup (`~/dbbackup-panic-20260921-152205`). Five consecutive
 delta saves completed cleanly afterwards. **`core3 runUnitTests` opens this same
 environment and is the prime suspect**; it should not be run against a live
 server.
+
+
+## Outcome after the fix (2026-09-21, later)
+
+The overland-fallback fix (`48ccf3125b`) was applied and the same scenario re-run
+with mission diagnostics on.
+
+| Metric | Before | After |
+| --- | --- | --- |
+| `missionsCompletedTotal` | 0 | **5** |
+| `missionsAbandonedTotal` | every attempt | **0** |
+| `abandonReasons` | `mission_offer_path_failed` 87 of 107 | `{}` |
+| Lairs spawned / destroyed | 0 / 0 | 6 / 6 |
+| `TERM_PATH_FAILED` / `MISSION_PATH_FAILED` | 9 / (unlogged) | **0 / 0** |
+
+**Blocker 1 is fixed, and it was one defect, not two.** `mission_offer_path_failed`
+on the `TRAVEL_TO_MISSION` leg had the same cause as the terminal leg and was
+fixed by the same change. Instrumentation added specifically to catch it
+(`MISSION_PATH_FAILED`) recorded **zero** occurrences — it proved the absence of
+the bug rather than finding a second one.
+
+**Blocker 2 no longer reproduces.** `REVEAL_RELOCATE` succeeded 5 times with no
+`REVEAL_RELOCATE_DEFER` loop. The relocation ring's missing exhaustion path is
+still a real latent defect (an area where all 32 probes fail will still spin to
+the 900 s timeout) but it is not currently blocking.
+
+### The original Phase 0 question, finally answerable — and the answer is a surprise
+
+Per-offer summaries:
+
+```
+membersSpawned=10 membersKilled=3  timeInHuntingMs=35713  endReason=lair_destroyed
+membersSpawned=9  membersKilled=2  timeInHuntingMs=56050  endReason=lair_destroyed
+membersSpawned=10 membersKilled=1  timeInHuntingMs=28381  endReason=lair_destroyed
+membersSpawned=12 membersKilled=4  timeInHuntingMs=46814  endReason=lair_destroyed
+membersSpawned=12 membersKilled=4  timeInHuntingMs=100019 endReason=hunter_died
+membersSpawned=11 membersKilled=1  timeInHuntingMs=27706  endReason=lair_destroyed
+```
+
+**Bots destroy the lair while killing only 1–4 of 9–12 spawned members**, in
+27–56 seconds. They do not need to clear the field, and the "engage ratio" that
+Phase 0 set out to explain is not the limiting factor on completion at all.
+
+The `LAIR_DAMAGE` attribution explains how: **47 `combat` events vs 33
+`spawn_self`**. Roughly 40 % of lair damage is the lair damaging itself as waves
+spawn (`spawnLairMobile`'s trailing `inflictDamage`). A bot that keeps pressure
+on the lair wins partly because the lair destroys itself. Separating those two
+sources — the attribution Codex pushed for during review — is what makes this
+visible; an aggregate would have shown only "damage happened".
+
+### Consequence for F_0.9.8
+
+The re-scoping stands, but for a stronger reason than when it was written.
+Missions complete at **5 of 6 with no tactics layer at all**. Lair tactics are
+therefore an optimisation for survivability (1 of 6 ended `hunter_died`), not a
+prerequisite for mission completion. Phase 3 should be re-justified on
+death-rate and throughput, not on completion, before it is written.
