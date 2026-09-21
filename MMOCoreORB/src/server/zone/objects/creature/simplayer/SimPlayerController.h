@@ -363,7 +363,16 @@ protected:
         HYBRID_LEG_NAVMESH_FINAL,
         HYBRID_LEG_NAVMESH_EXIT,
         HYBRID_LEG_EGRESS,
-        HYBRID_LEG_OVERLAND_FINAL
+        HYBRID_LEG_OVERLAND_FINAL,
+        // An overland leg deliberately taken while the agent is STILL ON a
+        // navmesh, because the mesh cannot route to an on-mesh destination
+        // (recast returns a partial route). It is a distinct value because two
+        // guards reject HYBRID_LEG_OVERLAND_FINAL whenever agent->isInNavMesh()
+        // -- correctly, since a normal wilderness overland leg that reaches a
+        // city must be re-planned on the mesh. Reusing OVERLAND_FINAL here made
+        // those guards bounce the route straight back into requestHybridPath(),
+        // a path-task loop that ran to the phase timeout.
+        HYBRID_LEG_OVERLAND_ON_MESH
     };
 
     HybridLeg hybridLeg;
@@ -384,6 +393,10 @@ protected:
     std::atomic<uint64> hybridDiagRecastRequests{0};
     std::atomic<uint64> hybridDiagExitResolveFailures{0};
     std::atomic<uint64> hybridDiagNavmeshTaskFailures{0};
+    // Count of legs demoted to overland after the navmesh budget was exhausted.
+    // The gate itself lives on the manager (pveConfig.overlandFallbackOnNavmeshFailure),
+    // queried the same way getPveNavmeshRepathTries() is at the call site.
+    std::atomic<uint64> overlandFallbacksUsed{0};
     // Failure-only recast probe (enabled by the hunter while early-game movement
     // telemetry is on). Distinguishes start-poly, end-poly and partial-route
     // failures of a navmesh recast leg.

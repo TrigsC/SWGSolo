@@ -6063,6 +6063,7 @@ void SimPlayerManager::loadLuaConfig() {
 	pveMissionSpawnDistanceMeters = 200.f;
 	pveMissionTerminalScanRadiusMeters = 600.f;
 	pveMissionMaxSpawnPointTries = 32;
+	pveOverlandFallbackOnNavmeshFailure = false;
 	pveMissionMaxSimultaneousAdds = 3;
 	pveMissionAddsAbandonCycles = 8;
 	pveMissionHuntTimeoutMs = 600000;
@@ -9190,6 +9191,9 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		pveMissionMaxSpawnPointTries = clampMinerInt(
 			missionHuntConfig.getIntField("maxSpawnPointTries"),
 			pveMissionMaxSpawnPointTries, 1, 256);
+		pveOverlandFallbackOnNavmeshFailure = missionHuntConfig.getBooleanField(
+			"overlandFallbackOnNavmeshFailure",
+			pveOverlandFallbackOnNavmeshFailure);
 		pveMissionMaxSimultaneousAdds = clampMinerInt(
 			missionHuntConfig.getIntField("maxSimultaneousAdds"),
 			pveMissionMaxSimultaneousAdds, 0, 64);

@@ -2353,6 +2353,45 @@ void SimPlayerController::onPathTaskFailed(bool pathUsesNavmesh) {
     }
 
     navmeshRepathAttempts = 0;
+
+    // Last resort before declaring the leg dead: walk it overland.
+    //
+    // The hybrid mover already goes overland when the TARGET is off-mesh --
+    // requestHybridPath resolves a mesh exit and finishes with
+    // HYBRID_LEG_OVERLAND_FINAL. What it has no answer for is a target that IS
+    // on the same mesh but is not REACHABLE across it. Measured at dantooine
+    // mining_outpost (2026-09-21): targetOnSameMesh=1, both start and end
+    // polygons found and in-area, yet recast returns a partial route of 4 points
+    // that advances 3.81m and stops 33.72m short of a terminal 37.5m away. The
+    // mesh has a connectivity hole inside a single NavArea. Retrying the identical
+    // query cannot fix that, so the bot burned its budget and abandoned the
+    // mission -- the dominant historical failure (87 of 107 abandonments).
+    //
+    // Demote THIS leg to overland, which is the same answer P.4.2 gave miners
+    // with the directOverland trust tier. Scoped deliberately:
+    //   - outdoor destinations only; a cell target must still go through the
+    //     structure-traversal path (F_0.8.1), never a straight line into a wall;
+    //   - onMeshMode=false is leg-scoped, reset by the next moveTo from
+    //     agent->isInNavMesh(), so nothing persists past this destination;
+    //   - it cannot loop: the overland request reports pathUsesNavmesh=false, so
+    //     a second failure takes the plain onPathFailed() branch above.
+    if (SimPlayerManager::instance()->
+                isPveOverlandFallbackOnNavmeshFailureEnabled() &&
+            isHybridMovementActive() &&
+            hasFinalDestination && destinationCell == nullptr) {
+        overlandFallbacksUsed.fetch_add(1, std::memory_order_relaxed);
+        if (isCellNavDiagAgent(agent.get()))
+            CellNavDiagLog::write("HYBRID_OVERLAND_FALLBACK "
+                "reason=navmesh_unreachable_on_same_mesh");
+        onMeshMode = false;
+        hybridLeg = HYBRID_LEG_OVERLAND_ON_MESH;
+        hybridDiagLeg.store(HYBRID_LEG_OVERLAND_ON_MESH,
+            std::memory_order_relaxed);
+        scheduleHybridDirectPath(finalDestination,
+            HYBRID_LEG_OVERLAND_ON_MESH);
+        return;
+    }
+
     onPathFailed();
 }
 
@@ -4833,7 +4872,8 @@ void SimPlayerController::checkArrival() {
 
     if (isHybridMovementActive() &&
             (hybridLeg == HYBRID_LEG_NAVMESH_FINAL ||
-             hybridLeg == HYBRID_LEG_OVERLAND_FINAL)) {
+             hybridLeg == HYBRID_LEG_OVERLAND_FINAL ||
+             hybridLeg == HYBRID_LEG_OVERLAND_ON_MESH)) {
         float finalDx = currentPos.getX() - finalDestination.getX();
         float finalDy = currentPos.getY() - finalDestination.getY();
         if ((finalDx * finalDx) + (finalDy * finalDy) >= 16.0f)

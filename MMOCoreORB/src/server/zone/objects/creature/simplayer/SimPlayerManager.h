@@ -2522,6 +2522,7 @@ private:
 	float pveMissionSpawnDistanceMeters = 200.f;
 	float pveMissionTerminalScanRadiusMeters = 600.f;
 	int pveMissionMaxSpawnPointTries = 32;
+	bool pveOverlandFallbackOnNavmeshFailure = false;
 	int pveMissionMaxSimultaneousAdds = 3;
 	int pveMissionAddsAbandonCycles = 8;
 	uint64 pveMissionHuntTimeoutMs = 600000;
@@ -3992,6 +3993,14 @@ public:
 	}
 	int getPveNavmeshModeDebounceTicks() const {
 		return pveNavmeshModeDebounceTicks;
+	}
+	// F_0.9.8 diagnosis (2026-09-21): a hunter could not reach a mission terminal
+	// 37m away because recast returned a PARTIAL route across a single NavArea
+	// with a connectivity hole -- start and end polygons both found, route
+	// advancing 3.81m and stopping 33.72m short. Retrying the same query cannot
+	// help. Default OFF: gate-off is byte-for-byte the legacy failure path.
+	bool isPveOverlandFallbackOnNavmeshFailureEnabled() const {
+		return pveOverlandFallbackOnNavmeshFailure;
 	}
 	int getPveNavmeshRepathTries() const {
 		return pveNavmeshRepathTries;

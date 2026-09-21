@@ -2230,6 +2230,14 @@ SimPlayerManagerConfig = {
             maxActiveLairs = 6,
             navmeshModeDebounceTicks = 2,
             navmeshRepathTries = 3,
+            -- F_0.9.8: when the navmesh retry budget is exhausted and the
+            -- destination is OUTDOORS, walk the leg overland instead of failing.
+            -- Diagnosed at dantooine mining_outpost: recast returned a partial
+            -- route across one NavArea (both polygons found, 3.81m of progress,
+            -- 33.72m short) so a terminal 37.5m away was declared unreachable.
+            -- Off ships legacy behaviour exactly. Cell targets are never
+            -- affected -- those must still use structure traversal.
+            overlandFallbackOnNavmeshFailure = false,
         },
         -- Phase 2 real destroy-mission board. This is deliberately opt-in;
         -- the legacy terminal/lair contract remains the default path.

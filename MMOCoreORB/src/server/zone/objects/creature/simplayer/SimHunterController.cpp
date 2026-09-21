@@ -1415,6 +1415,10 @@ void SimHunterController::beginMissionTerminalLeg() {
 			" state=" + getDiagnosticStateName() +
 			" moveIssued=" + String::valueOf(moveIssued) +
 			" waitCycles=" + String::valueOf(terminalResolveWaitCycles));
+		// Arm the recast failure probe so TERM_PATH_FAILED can report which
+		// polygon lookup failed. Default-off with mission diagnostics; the probe
+		// only records, it never changes a route.
+		setHybridFailureProbeEnabled(MissionDiagLog::isLoggingEnabled());
 		if (moveIssued)
 			moveTo(missionTerminalPosition);
 		return;
@@ -2053,11 +2057,19 @@ void SimHunterController::onPathFailed() {
 	}
 
 	if (missionHuntOrder && phase == TRAVEL_TO_TERMINAL) {
+		// The hybrid mover ALREADY has an off-mesh fallback: requestHybridPath
+		// routes to a resolved mesh exit and finishes overland
+		// (HYBRID_LEG_OVERLAND_FINAL). So a terminal failure means one of its
+		// branches gave up, and getHybridPathDiagLine() names which -- was the
+		// target on the same mesh, did resolveHybridExit succeed, did recast find
+		// start/end polygons. Without this the only honest next step would be to
+		// guess at a fallback that may already exist.
 		MissionDiagLog::event("TERM_PATH_FAILED", identityId, "resolved=" +
 			String::valueOf(missionTerminalResolved) +
 			" " + MissionDiagLog::fmtVec("terminal", missionTerminalPosition) +
 			" " + MissionDiagLog::fmtVec("pos", agent == nullptr ? Vector3() :
-				agent->getWorldPosition()));
+				agent->getWorldPosition()) +
+			" hybrid[" + getHybridPathDiagLine() + "]");
 		beginMissionFallback();
 		return;
 	}
