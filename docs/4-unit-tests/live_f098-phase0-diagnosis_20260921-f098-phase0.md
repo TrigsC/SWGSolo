@@ -49,15 +49,44 @@ This is the historical dominant failure: `mission_offer_path_failed` +
 `mission_terminal_unavailable` were **87 of 107** abandonments in the 2026-07-28
 log. It is now reproducible on demand.
 
-Two candidate causes, **neither confirmed**:
-- The F_0.7.5 class (ARCHI §12) — deterministic cell-entry path failure from a
-  fixed outdoor point. F_0.7.5 fixed this for **buff providers** via
-  `realBuffs.crossBuildingStaging`; the mission-terminal approach never got it.
-- Sparse navmesh at a small POI (ARCHI §8), needing a `directOverland`-style
-  fallback on the terminal leg. The near-equal heights (terminal z=2.99 vs bot
-  z=3.15) fit this better than a building-cell target.
+**Root cause — CONFIRMED 2026-09-21, and it is not what I first proposed.**
 
-Distinguishing them is the first task of any fix.
+I initially favoured the F_0.7.5 cell-entry class. **That is disproven.**
+`GET /v1/object/7275419/` reports `TreeEntry.parent = 0` and
+`zone = dantooine`: the terminal is an **outdoor** object with no parent cell,
+so nothing about building entry applies.
+
+The actual mechanism is the hybrid mover, and it is the P.4.1/P.4.2 problem
+class in a new place:
+
+1. `SimHunterController::usesNavmeshHybridMovement()` returns **true**
+   (`SimHunterController.h:324`) — navmesh inside cities, overland in the wild.
+2. Mode is chosen by **where the bot stands**, not by whether the destination is
+   reachable: `onMeshMode = agent->isInNavMesh()`
+   (`SimPlayerController.cpp:1297`). A navmesh exists for this POI
+   (`bin/navmeshes/dantooine_city_dantooine_mining_outpost.obj`), so the bot is
+   on-mesh and navmesh pathing is selected.
+3. The terminal 37 m away is not reachable on that mesh — a small POI whose
+   coverage does not span the approach.
+4. On failure the mover retries **the same navmesh query**
+   `pveNavmeshRepathTries` times and then gives up
+   (`SimPlayerController.cpp:2342-2357`). **There is no overland fallback once
+   on-mesh.**
+
+So a bot fails to cross 37 m of open ground it could simply walk, because the
+mesh it is standing on cannot route there and nothing demotes it to overland.
+
+This is precisely what P.4.2 solved for **miners** with the `directOverland`
+trust tier, after the same discovery that `findPath` degrades off-mesh
+(ARCHI §8). Hunters never received an equivalent on the on-mesh failure path.
+
+**Shape of the fix** (not implemented): when hybrid movement exhausts its
+navmesh retry budget and the destination is outdoors, demote that leg to
+overland instead of calling `onPathFailed()` — the miner behaviour, scoped to
+hunters and gated. `terminal.terminalOid` resolution should also record the
+parent so an interior terminal is routed through `enterStructure` per the
+F_0.8.1 rule, which today it is not (`location.position =
+terminal->getWorldPosition()` with no parent captured).
 
 ### 2. Lair reveal defers forever (the one bot that got through)
 
