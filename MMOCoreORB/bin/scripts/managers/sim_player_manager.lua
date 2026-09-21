@@ -378,13 +378,27 @@ SimPlayerManagerConfig = {
         profiles = {
             composite_armor_supply = {
                 enabled = true,
-                desiredReserve = 500000,
+                -- Raised 500000 -> 900000 (owner decision 2026-09-21). At
+                -- 500000 the hunter families sat ABOVE their ceiling (meat
+                -- 587107 / hide 531093 / bone 504621), so every family read as
+                -- surplus, pressure was 0, the matchmaker issued no orders and
+                -- no mission ever ran -- the roadmap 5c.1 deadlock. This is a
+                -- stopgap: the real fix is an in-session consumer that drains
+                -- supply, at which point these should come back down.
+                desiredReserve = 900000,
                 lowStockThreshold = 0.35,
                 criticalStockThreshold = 0.10,
             },
             master_weaponsmith_staples = {
                 enabled = true,
-                desiredReserve = 500000,
+                -- Raised 500000 -> 900000 (owner decision 2026-09-21). At
+                -- 500000 the hunter families sat ABOVE their ceiling (meat
+                -- 587107 / hide 531093 / bone 504621), so every family read as
+                -- surplus, pressure was 0, the matchmaker issued no orders and
+                -- no mission ever ran -- the roadmap 5c.1 deadlock. This is a
+                -- stopgap: the real fix is an in-session consumer that drains
+                -- supply, at which point these should come back down.
+                desiredReserve = 900000,
                 lowStockThreshold = 0.35,
                 criticalStockThreshold = 0.10,
             },
@@ -396,13 +410,27 @@ SimPlayerManagerConfig = {
             },
             chef_buff_foods = {
                 enabled = true,
-                desiredReserve = 500000,
+                -- Raised 500000 -> 900000 (owner decision 2026-09-21). At
+                -- 500000 the hunter families sat ABOVE their ceiling (meat
+                -- 587107 / hide 531093 / bone 504621), so every family read as
+                -- surplus, pressure was 0, the matchmaker issued no orders and
+                -- no mission ever ran -- the roadmap 5c.1 deadlock. This is a
+                -- stopgap: the real fix is an in-session consumer that drains
+                -- supply, at which point these should come back down.
+                desiredReserve = 900000,
                 lowStockThreshold = 0.35,
                 criticalStockThreshold = 0.10,
             },
             chef_high_value_consumables = {
                 enabled = true,
-                desiredReserve = 500000,
+                -- Raised 500000 -> 900000 (owner decision 2026-09-21). At
+                -- 500000 the hunter families sat ABOVE their ceiling (meat
+                -- 587107 / hide 531093 / bone 504621), so every family read as
+                -- surplus, pressure was 0, the matchmaker issued no orders and
+                -- no mission ever ran -- the roadmap 5c.1 deadlock. This is a
+                -- stopgap: the real fix is an in-session consumer that drains
+                -- supply, at which point these should come back down.
+                desiredReserve = 900000,
                 lowStockThreshold = 0.35,
                 criticalStockThreshold = 0.10,
             },
@@ -2235,9 +2263,17 @@ SimPlayerManagerConfig = {
             -- Diagnosed at dantooine mining_outpost: recast returned a partial
             -- route across one NavArea (both polygons found, 3.81m of progress,
             -- 33.72m short) so a terminal 37.5m away was declared unreachable.
-            -- Off ships legacy behaviour exactly. Cell targets are never
-            -- affected -- those must still use structure traversal.
-            overlandFallbackOnNavmeshFailure = false,
+            -- Cell targets are never affected -- those must still use
+            -- structure traversal.
+            --
+            -- ENABLED 2026-09-21 by owner decision, after live verification:
+            -- terminal 7275419 went from 9 consecutive TERM_PATH_FAILED and 0
+            -- arrivals to 3 bots arriving ~7s after resolve, and the mission
+            -- loop then completed end to end (missionsCompleted 0 -> 5,
+            -- abandons 0, abandonReasons {}). This is DELIBERATELY true and is
+            -- not a leftover verification override; set false to restore the
+            -- pre-fix behaviour, which abandons the mission instead.
+            overlandFallbackOnNavmeshFailure = true,
         },
         -- Phase 2 real destroy-mission board. This is deliberately opt-in;
         -- the legacy terminal/lair contract remains the default path.
