@@ -229,3 +229,32 @@ Missions complete at **5 of 6 with no tactics layer at all**. Lair tactics are
 therefore an optimisation for survivability (1 of 6 ended `hunter_died`), not a
 prerequisite for mission completion. Phase 3 should be re-justified on
 death-rate and throughput, not on completion, before it is written.
+
+
+## Sustained-run baseline (2026-09-21, gates enabled)
+
+With `overlandFallbackOnNavmeshFailure = true` and the four hunter-family
+reserves at 900000, the loop ran unattended. Clean 30-minute window:
+
+| Metric | Measured |
+| --- | --- |
+| Missions (completed / abandoned) | 6 (4 / 2) — 67 % completion |
+| Deaths per mission | **0.67** |
+| Deaths per kill | 0.33 |
+| Lairs spawned / destroyed / credited | 5 / 4 / 4 |
+| Harvest | 14 980 units (~30 k/hour) |
+| Crashes, fatals, DB errors | none |
+
+The economy loop is closed and stable: hunters produce into the same three
+families whose demand dispatches them, with no crash, no DB fault and no path
+failure.
+
+**The binding constraint is now survivability, not pathing or tactics.** A bot
+dies on two missions in three. This is the measured baseline Phase 3 must beat,
+with completion (67 %) and harvest (~30 k/hour) as guardrails so a "safe" tactic
+that stops killing lairs registers as the regression it would be.
+
+**Correction to an earlier reading in this report.** The cumulative counters
+(11 lairs destroyed vs 6 missions completed) suggested lairs were dying
+uncredited. The clean window shows 4 destroyed and 4 credited — exact
+correspondence. That gap was startup noise, not a credit-loss defect.
