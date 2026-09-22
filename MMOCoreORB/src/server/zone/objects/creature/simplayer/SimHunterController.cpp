@@ -3995,6 +3995,32 @@ void SimHunterController::runActiveTick() {
 					-1 : lair.waveObserver->getSpawnNumber()) +
 				" botHamFraction=" + String::valueOf(hamFraction));
 		}
+		// "Nothing I am allowed to fight" is NOT "field clear". If every wave
+		// mob was rejected by a progression guard, entering ENGAGING_LAIR would
+		// be undone next tick by hasMissionWaveMobInRange, which does not apply
+		// those guards -- an oscillation that runs to the mission timeout.
+		// Abandon instead, and say so: an entirely over-level wave means the
+		// contract should never have been issued to this bot, which is a
+		// DISPATCH defect, and this reason is how it becomes visible.
+		if (!foundTarget && (scanRejectedOverLevel || scanRejectedPack) &&
+				missionHuntOrder && missionLairOid != 0) {
+			// The level ceiling is the more serious diagnosis -- it means the
+			// contract was mis-issued -- so it wins when both fired.
+			const String ineligibleReason = scanRejectedOverLevel ?
+				String("wave_above_level_band") : String("wave_pack_avoided");
+			int ineligibleTier = 0;
+			SimPlayerManager::instance()->isPlayerBotProgressionIdentity(
+				identityId, ineligibleTier);
+			MissionDiagLog::event("WAVE_INELIGIBLE", identityId,
+				"tier=" + String::valueOf(ineligibleTier) +
+				" lairOid=" + String::valueOf(missionLairOid) +
+				" offerId=" + String::valueOf(currentMissionOfferId) +
+				" overLevel=" + String::valueOf(scanRejectedOverLevel) +
+				" pack=" + String::valueOf(scanRejectedPack) +
+				" reason=" + ineligibleReason);
+			beginMissionCleanup(true, ineligibleReason);
+			return;
+		}
 		if (!foundTarget && missionHuntOrder &&
 				SimPlayerManager::instance()->isPveMissionBoardEnabled() &&
 				missionLairOid != 0 && SimPlayerManager::instance()->
@@ -4101,14 +4127,22 @@ bool SimHunterController::scanForTarget() {
 	// spawned/moved bots (same class of gap as NPC updateActiveAreas), so it
 	// returns an empty/stale set even when creatures are right next to the
 	// hunter (lair packs) — the cause of hunters never acquiring a target.
+	scanRejectedOverLevel = false;
+	scanRejectedPack = false;
 	Zone* zone = nullptr;
 	Vector3 hunterPosition;
+	// Snapshotted with the position under the SAME agent lock: group
+	// membership lifts pack avoidance (owner rule), and reading it per
+	// candidate would take the agent lock inside the scan loop -- the O(n)
+	// lock pattern ARCHI's performance note calls out.
+	bool inGroup = false;
 	{
 		Locker agentLock(strongAgent);
 		zone = strongAgent->getZone();
 		if (zone == nullptr)
 			return false;
 		hunterPosition = strongAgent->getWorldPosition();
+		inGroup = strongAgent->getGroup() != nullptr;
 	}
 
 	float scanRadius =
@@ -4116,6 +4150,30 @@ bool SimHunterController::scanForTarget() {
 	SortedVector<TreeEntry*> closeObjects;
 	zone->getInRangeObjects(hunterPosition.getX(), hunterPosition.getZ(),
 		hunterPosition.getY(), scanRadius, &closeObjects, true, true);
+
+	// ONE pack policy for BOTH branches. It used to be derived separately: the
+	// early-game loop read the config flag alone, so a grouped or elite-capable
+	// bot still dodged packs there while the generic loop correctly let it
+	// engage. Snapshotted once, before either branch.
+	bool progressionBot = false;
+	int progressionTier = 0;
+	bool avoidPacks = false;
+	SimBotEarlyGameConfig progressionConfig;
+	if (identityId != 0) {
+		SimPlayerManager* manager = SimPlayerManager::instance();
+		progressionBot = manager->isPlayerBotProgressionIdentity(
+			identityId, progressionTier);
+		if (progressionBot) {
+			manager->getPlayerBotEarlyGameConfig(progressionConfig);
+			// Owner rule: pack avoidance is a novice crutch. It lifts once the
+			// bot is past a novice elite profession ("xx1x Teras Kasi") or is in
+			// a group -- such a bot SHOULD take a whole lair's aggro, which is
+			// the fastest XP and credits.
+			avoidPacks = progressionConfig.avoidGroupAggroTargets &&
+				!manager->isPlayerBotEliteCapable(identityId) &&
+				!inGroup;
+		}
+	}
 
 	if (earlyGameActive) {
 		// Hoisted out of the candidate loop: one config read, one identity
@@ -4170,7 +4228,7 @@ bool SimHunterController::scanForTarget() {
 			// (owner rule). Only PACK creatures assist their social group
 			// (AiAgent::notifyPackMobs); herds such as kreetles and minor worrts
 			// fight alone and are fair game.
-			if (earlyConfig.avoidGroupAggroTargets) {
+			if (avoidPacks) {
 				const CreatureTemplate* candidateTemplate =
 					candidateAgent->getCreatureTemplate();
 				if (candidateTemplate != nullptr && candidateTemplate->isPack())
@@ -4206,6 +4264,17 @@ bool SimHunterController::scanForTarget() {
 		return true;
 	}
 
+	// A progression character keeps its novice guards AFTER graduating. They
+	// used to live only in the early-game branch above, so the moment a novice
+	// graduated to missions it silently lost both and picked fights it could not
+	// win. Observed in game 2026-09-22: a tier-6 4xxx brawler walked onto
+	// Dantooine and engaged five huurtons -- a PACK creature well above its
+	// band -- and died. Legacy planless hunters are unaffected.
+	//
+	// The level CEILING is the hard guard (the same reasoning as
+	// calculateEarlyGameTtk): it is the one that stops a bot fighting something
+	// far above it. The floor is deliberately not applied here -- a graduated
+	// bot on a contract should still be allowed to clear weak wave mobs.
 	for (int i = 0; i < closeObjects.size(); ++i) {
 		SceneObject* object = static_cast<SceneObject*>(closeObjects.get(i));
 		CreatureObject* candidate = object == nullptr ? nullptr :
@@ -4220,6 +4289,25 @@ bool SimHunterController::scanForTarget() {
 				strongAgent->getWorldPosition().distanceTo(
 					candidate->getWorldPosition()) > scanRadius)
 			continue;
+		if (progressionBot) {
+			const CreatureTemplate* candidateTemplate =
+				candidateAgent->getCreatureTemplate();
+			// BOTH predicates are evaluated before skipping. Short-circuiting on
+			// the pack branch hid the over-level condition for a mob that is
+			// both -- exactly the observed huurton case -- so an over-level pack
+			// wave would have reported only wave_pack_avoided and buried the
+			// mis-issued contract that the level ceiling is there to expose.
+			const bool packRejected = avoidPacks &&
+				candidateTemplate != nullptr && candidateTemplate->isPack();
+			const bool overLevel = candidateAgent->getLevel() >
+				progressionTier + progressionConfig.levelBandAbove;
+			if (packRejected)
+				scanRejectedPack = true;
+			if (overLevel)
+				scanRejectedOverLevel = true;
+			if (packRejected || overLevel)
+				continue;
+		}
 
 		selectTarget(candidateAgent);
 		return true;

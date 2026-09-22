@@ -1935,6 +1935,22 @@ SimPlayerManagerConfig = {
             -- the depth rule, leaving plan completion only.
             missionMinLineDepth = 4,
             missionProfessionPrefixes = { "combat_brawler", "combat_marksman" },
+            -- Owner rule 2026-09-22: pack-aggro avoidance is a NOVICE crutch.
+            -- It lifts once the bot is past a novice elite profession (one line
+            -- box in any elite tree, e.g. "xx1x Teras Kasi") OR the bot is in a
+            -- group. A capable bot SHOULD take a whole lair's aggro and spin it
+            -- down -- that is the fastest XP and credits. eliteMinLineDepth = 0
+            -- disables the lift, so avoidance would always apply.
+            eliteMinLineDepth = 1,
+            eliteProfessionPrefixes = {
+                -- Brawler elites
+                "combat_unarmed", "combat_1hsword", "combat_2hsword",
+                "combat_polearm",
+                -- Marksman elites
+                "combat_rifleman", "combat_pistol", "combat_carbine",
+                -- Hybrid / other combat elites
+                "combat_bountyhunter", "combat_smuggler", "combat_commando",
+            },
             weaponsByXpType = {
                 combat_meleespecialize_onehand = "object/weapon/melee/knife/knife_stone.iff",
                 combat_meleespecialize_twohand = "object/weapon/melee/axe/axe_heavy_duty.iff",
@@ -2034,6 +2050,12 @@ SimPlayerManagerConfig = {
         huntingProfessions = { "hunter", "brawler", "marksman" },
         novice = {
             enabled = false,
+            -- Owner decision 2026-09-22: retire the legacy hunters and give the
+            -- slots to novices. Retirement deletes one planless profession
+            -- "hunter" identity per maintenance tick and the legacy capacity
+            -- filler is skipped while novice mode is on, so the population
+            -- converges to novices only. This DELETES those identities and
+            -- their lifetime stats.
             retireLegacyHunters = false,
             bodyTemplate = "sim_playerbot_novice",
             -- HAM for every pool of a planned novice body (health/action/mind and
@@ -2048,6 +2070,8 @@ SimPlayerManagerConfig = {
             spawnPlanet = "tatooine",
             spawnCity = "mos_eisley",
             distribution = {
+                -- Raised 1 -> 6 to fill maxHunters with novices as the legacy
+                -- hunters retire; at count = 1 the roster would simply shrink.
                 { profession = "brawler", trainingPlan = "brawler", count = 1 },
             },
         },

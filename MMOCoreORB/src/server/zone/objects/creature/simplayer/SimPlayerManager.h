@@ -251,6 +251,13 @@ struct SimBotEarlyGameConfig {
 	// novice/master boxes carry no depth and never count.
 	int missionMinLineDepth = 4;
 	Vector<String> missionProfessionPrefixes;
+	// Owner rule 2026-09-22: pack-aggro avoidance is a NOVICE crutch. It is
+	// dropped once the bot is past a novice elite profession -- "xx1x Teras
+	// Kasi" -- because such a bot should be able to take a whole lair's aggro,
+	// which is the fastest way to earn XP and credits. Depth >= this in any
+	// elite prefix means capable; the elite novice box itself carries no depth.
+	int eliteMinLineDepth = 1;
+	Vector<String> eliteProfessionPrefixes;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -3842,6 +3849,12 @@ public:
 	// attributable to a SimBot lair rather than dropped or mistaken for a
 	// player's.
 	bool isKnownPveMissionLair(uint64 lairOid);
+	// True when the identity is a planned progression character (has a training
+	// plan). Its novice guards -- the level ceiling and pack avoidance -- follow
+	// the BOT, not its activity, so they survive graduation to missions.
+	bool isPlayerBotProgressionIdentity(uint64 identityId, int& skillTierOut);
+	// True once the bot has trained a line box in an elite profession.
+	bool isPlayerBotEliteCapable(uint64 identityId);
 	Vector<ManagedReference<CreatureObject*> > lairObserverSnapshot(
 		uint64 bodyOid, uint64 expectedLairOid);
 	void recordPveHunterKill(uint64 identityId, uint64 bodyOid,

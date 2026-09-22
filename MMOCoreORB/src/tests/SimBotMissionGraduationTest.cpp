@@ -100,3 +100,41 @@ TEST(SimBotMissionGraduationTest, NoListedProfessionsMeansNoDepth) {
 	EXPECT_EQ(SimBotMissionGraduation::maxLineDepth(skills({
 		"combat_brawler_unarmed_04"}), Vector<String>()), 0);
 }
+
+// The same helper decides when pack-aggro avoidance LIFTS: once the bot has a
+// line box in an elite profession ("xx1x Teras Kasi"), it is expected to hold a
+// whole lair's aggro rather than dodge pack creatures (owner rule 2026-09-22).
+
+namespace {
+
+Vector<String> elitePrefixes() {
+	Vector<String> list;
+	list.add("combat_unarmed");
+	list.add("combat_rifleman");
+	return list;
+}
+
+}
+
+TEST(SimBotMissionGraduationTest, EliteNoviceBoxAloneIsNotCapable) {
+	// A 4xxx brawler that has only just opened Teras Kasi is still a novice
+	// elite: the novice box carries no line depth, so avoidance stays on.
+	EXPECT_EQ(SimBotMissionGraduation::maxLineDepth(skills({
+		"combat_brawler_unarmed_04", "combat_unarmed_novice"}),
+		elitePrefixes()), 0);
+}
+
+TEST(SimBotMissionGraduationTest, OneEliteLineBoxMakesTheBotCapable) {
+	// "xx1x Teras Kasi" -- one box in an elite line clears the threshold of 1.
+	EXPECT_EQ(SimBotMissionGraduation::maxLineDepth(skills({
+		"combat_unarmed_novice", "combat_unarmed_speed_01"}),
+		elitePrefixes()), 1);
+}
+
+TEST(SimBotMissionGraduationTest, BasicProfessionBoxesAreNotEliteCapable) {
+	// A full 4xxx brawler with no elite training must NOT count as capable.
+	EXPECT_EQ(SimBotMissionGraduation::maxLineDepth(skills({
+		"combat_brawler_novice", "combat_brawler_unarmed_01",
+		"combat_brawler_unarmed_02", "combat_brawler_unarmed_03",
+		"combat_brawler_unarmed_04"}), elitePrefixes()), 0);
+}

@@ -117,6 +117,17 @@ private:
 	// pveAbandonReasons shows only "abandoned" and every real cause is lost --
 	// the overwrite documented at beginMissionCleanup and in roadmap 5c.4.
 	String missionAbandonReason;
+	// Set by scanForTarget when candidates WERE present but every one was
+	// rejected by a progression guard (over the level ceiling, or a pack the bot
+	// must avoid). Without this, "nothing I may fight" is indistinguishable from
+	// "field clear": HUNTING would enter ENGAGING_LAIR, and the unfiltered
+	// hasMissionWaveMobInRange would bounce it straight back, oscillating to the
+	// mission timeout.
+	// Tracked separately, not as one "ineligible" flag: the abandon reason is
+	// published on the dashboard, and an in-band PACK wave reported as
+	// "above level band" would send the next reader after the wrong defect.
+	bool scanRejectedOverLevel = false;
+	bool scanRejectedPack = false;
 	// The retained cause wins over any travel-epilogue reason: once a mission has
 	// been abandoned for a real cause, HOW the bot then got home is not why the
 	// mission was dropped. Falls back when nothing was retained.

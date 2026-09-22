@@ -8674,6 +8674,23 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 			earlyGameConfig.missionProfessionPrefixes.add("combat_marksman");
 		}
 
+		earlyGameConfig.eliteMinLineDepth = clampMinerInt(
+			earlyGame.getIntField("eliteMinLineDepth",
+				earlyGameConfig.eliteMinLineDepth),
+			earlyGameConfig.eliteMinLineDepth, 0, 4);
+		earlyGameConfig.eliteProfessionPrefixes.removeAll();
+		LuaObject elitePrefixes = earlyGame.getObjectField(
+			"eliteProfessionPrefixes");
+		if (elitePrefixes.isValidTable()) {
+			for (int i = 1; i <= elitePrefixes.getTableSize(); ++i) {
+				String prefix = elitePrefixes.getStringAt(i).trim();
+				if (!prefix.isEmpty() && !earlyGameConfig.
+						eliteProfessionPrefixes.contains(prefix))
+					earlyGameConfig.eliteProfessionPrefixes.add(prefix);
+			}
+		}
+		elitePrefixes.pop();
+
 		LuaObject configuredWeapons = earlyGame.getObjectField(
 			"weaponsByXpType");
 		if (configuredWeapons.isValidTable()) {
@@ -11580,6 +11597,30 @@ void SimPlayerManager::refreshPlayerBotActivityStates() {
 	// used by the rest of this file.
 	for (int i = 0; i < loadoutReconcileIds.size(); ++i)
 		reapplyPlayerBotProgressionToLiveBody(loadoutReconcileIds.get(i));
+}
+
+bool SimPlayerManager::isPlayerBotProgressionIdentity(uint64 identityId,
+		int& skillTierOut) {
+	skillTierOut = 0;
+	SimBotIdentity identity;
+	if (!snapshotPlayerBotIdentity(identityId, identity))
+		return false;
+	if (identity.profession == "harness" || identity.trainingPlan.isEmpty())
+		return false;
+	skillTierOut = identity.skillTier;
+	return true;
+}
+
+bool SimPlayerManager::isPlayerBotEliteCapable(uint64 identityId) {
+	Locker progressionLock(&progressionMutex);
+	if (!progressionRecords.contains(identityId))
+		return false;
+	const int minDepth = progressionEarlyGameConfig.eliteMinLineDepth;
+	if (minDepth <= 0)
+		return false;
+	return SimBotMissionGraduation::maxLineDepth(
+		progressionRecords.get(identityId).skills,
+		progressionEarlyGameConfig.eliteProfessionPrefixes) >= minDepth;
 }
 
 bool SimPlayerManager::isPlayerBotEarlyGameIdentity(uint64 identityId) {
