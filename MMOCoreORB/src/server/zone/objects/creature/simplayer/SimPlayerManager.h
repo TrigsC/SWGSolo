@@ -243,6 +243,14 @@ struct SimBotEarlyGameConfig {
 	int unreachableSkipSeconds = 60;
 	int unreachableSkipMaxTargets = 8;
 	Vector<String> deferredXpTypes;
+	// F_0.9.8 mission graduation (owner decision 2026-09-22): a planned bot may
+	// take missions once it has trained box missionMinLineDepth in ONE line of a
+	// listed profession -- the 3xxx/4xxx shorthand, e.g. combat_brawler_unarmed_04.
+	// 0 disables the depth rule and leaves only plan completion. Depth is read
+	// from the box name's trailing _0N, which is canonical for SWG line boxes;
+	// novice/master boxes carry no depth and never count.
+	int missionMinLineDepth = 4;
+	Vector<String> missionProfessionPrefixes;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }

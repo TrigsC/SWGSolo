@@ -1924,6 +1924,17 @@ SimPlayerManagerConfig = {
             -- to at most 1 - restHamFraction so a wounded novice can finish resting.
             cloneWoundMaxFraction = 0,
             deferredXpTypes = {"medical"},
+            -- F_0.9.8 mission graduation (owner decision 2026-09-22). A planned
+            -- bot may take missions once it has trained box missionMinLineDepth
+            -- in ONE line of a listed profession -- the 3xxx/4xxx shorthand, so
+            -- 4 means e.g. combat_brawler_unarmed_04 or combat_marksman_rifle_04.
+            -- A bot spread thin across lines (novice + unarmed_01 + 1hand_01)
+            -- does NOT qualify. It still graduates on completing its whole plan,
+            -- which is what the parity harness asserts. Below the threshold the
+            -- bot keeps grinding and every mission order is declined. 0 disables
+            -- the depth rule, leaving plan completion only.
+            missionMinLineDepth = 4,
+            missionProfessionPrefixes = { "combat_brawler", "combat_marksman" },
             weaponsByXpType = {
                 combat_meleespecialize_onehand = "object/weapon/melee/knife/knife_stone.iff",
                 combat_meleespecialize_twohand = "object/weapon/melee/axe/axe_heavy_duty.iff",
@@ -2017,7 +2028,10 @@ SimPlayerManagerConfig = {
         enableHunterBots = true, -- spike foundation passed; Phase 2 live
         enableWorldPresence = true, -- P.8.0b: spike/hunters act as players to world spawns
         maxHunters = 6,
-        huntingProfessions = { "hunter", "brawler" },
+        -- "marksman" added with F_0.9.8 mission graduation: a marksman that
+        -- reaches box 4 in a line qualifies for missions, and without this it
+        -- would qualify and then never be dispatched.
+        huntingProfessions = { "hunter", "brawler", "marksman" },
         novice = {
             enabled = false,
             retireLegacyHunters = false,

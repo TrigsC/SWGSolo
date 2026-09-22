@@ -9,6 +9,7 @@
 #include "CellNavDiagLog.h"
 #include "SimCombatDiagLog.h"
 #include "SimBotAbilityTiers.h"
+#include "SimBotMissionGraduation.h"
 #include "StructureTraversalDiagLog.h"
 
 #include <cmath>
@@ -8650,6 +8651,29 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		}
 		deferredXpTypes.pop();
 
+		earlyGameConfig.missionMinLineDepth = clampMinerInt(
+			earlyGame.getIntField("missionMinLineDepth",
+				earlyGameConfig.missionMinLineDepth),
+			earlyGameConfig.missionMinLineDepth, 0, 4);
+		earlyGameConfig.missionProfessionPrefixes.removeAll();
+		LuaObject missionPrefixes = earlyGame.getObjectField(
+			"missionProfessionPrefixes");
+		if (missionPrefixes.isValidTable()) {
+			for (int i = 1; i <= missionPrefixes.getTableSize(); ++i) {
+				String prefix = missionPrefixes.getStringAt(i).trim();
+				if (!prefix.isEmpty() && !earlyGameConfig.
+						missionProfessionPrefixes.contains(prefix))
+					earlyGameConfig.missionProfessionPrefixes.add(prefix);
+			}
+		}
+		missionPrefixes.pop();
+		// Fail closed on an empty list: with no professions nothing could ever
+		// qualify by depth, which silently reverts to plan-completion only.
+		if (earlyGameConfig.missionProfessionPrefixes.size() == 0) {
+			earlyGameConfig.missionProfessionPrefixes.add("combat_brawler");
+			earlyGameConfig.missionProfessionPrefixes.add("combat_marksman");
+		}
+
 		LuaObject configuredWeapons = earlyGame.getObjectField(
 			"weaponsByXpType");
 		if (configuredWeapons.isValidTable()) {
@@ -11393,15 +11417,25 @@ bool SimPlayerManager::snapshotPlayerBotProgression(uint64 identityId,
 
 void SimPlayerManager::scorePlayerBotActivity(
 		const SimBotIdentity& identity, SimBotActivityDecision& out) {
-	// This is the one activity/graduation predicate. It intentionally knows only
-	// the two supported activities: a planned roster bot grinds until every
-	// untrained fundable box is gone, then joins the existing demand-driven hunt.
-	// In particular, awardKillXp/training gates are not consulted here: a source
-	// is fundable unless its XP type is explicitly deferred in Lua.
+	// This is the one activity/graduation predicate. Every caller treats
+	// activity == "grind" as "do not dispatch", and none tests for "hunt"
+	// positively, so "grind" is the only fail-closed value.
+	//
+	// A planned bot graduates to missions on EITHER of two conditions:
+	//   - it completed every untrained, non-deferred box in its plan (the
+	//     original rule, still what the parity harness asserts); or
+	//   - it trained box missionMinLineDepth in ONE line of a listed profession
+	//     (F_0.9.8, owner decision 2026-09-22: "3xxx/4xxx brawler or marksman").
+	// Without the depth branch a novice on the 23-box Master Teras Kasi plan
+	// grinds the whole tree before its first mission.
 	out = SimBotActivityDecision();
-	if (!playerBotEarlyGameGateEnabled() || identity.profession == "harness" ||
-			identity.trainingPlan.isEmpty())
+	if (identity.profession == "harness" || identity.trainingPlan.isEmpty())
 		return;
+
+	// Evaluated BEFORE progressionMutex: the gate takes playerBotParityTestMutex,
+	// and taking that under progressionMutex inverts the lock order used
+	// everywhere else -- the defect F_0.9.5 fixed. Do not move this below the lock.
+	const bool earlyGameGate = playerBotEarlyGameGateEnabled();
 
 	Locker progressionLock(&progressionMutex);
 	if (!progressionRecords.contains(identity.id) ||
@@ -11411,17 +11445,33 @@ void SimPlayerManager::scorePlayerBotActivity(
 		return;
 	}
 
+	const SimBotProgression& progression = progressionRecords.get(identity.id);
+	const int minDepth = progressionEarlyGameConfig.missionMinLineDepth;
+	const bool depthQualified = minDepth > 0 &&
+		SimBotMissionGraduation::maxLineDepth(progression.skills,
+			progressionEarlyGameConfig.missionProfessionPrefixes) >= minDepth;
+
+	if (!earlyGameGate) {
+		// FAIL CLOSED. This branch used to return the "hunt" default for every
+		// planned bot, so an untrained novice took missions whenever the
+		// early-game gate was off. Now only the depth rule can release it; the
+		// rest stay "grind", which blocks dispatch, and isPlayerBotEarlyGame-
+		// Identity separately refuses to start the grind loop with the gate off,
+		// so such a bot idles rather than running a disabled capability.
+		out.activity = depthQualified ? String("hunt") : String("grind");
+		out.graduated = depthQualified;
+		return;
+	}
+
 	const SimBotTrainingPlan& plan =
 		progressionTrainingPlans.get(identity.trainingPlan);
 	if ((!plan.loadError.isEmpty() && plan.loadError != "over_budget") ||
 			plan.orderedSkills.size() == 0) {
-		out.activity = plan.orderedSkills.size() == 0 ?
-			String("hunt") : String("grind");
-		out.graduated = plan.orderedSkills.size() == 0;
+		out.graduated = plan.orderedSkills.size() == 0 || depthQualified;
+		out.activity = out.graduated ? String("hunt") : String("grind");
 		return;
 	}
 
-	const SimBotProgression& progression = progressionRecords.get(identity.id);
 	for (int i = 0; i < plan.orderedSkills.size(); ++i) {
 		const String& skillName = plan.orderedSkills.get(i);
 		if (progression.skills.contains(skillName))
@@ -11439,6 +11489,8 @@ void SimPlayerManager::scorePlayerBotActivity(
 		else
 			out.graduated = false;
 	}
+	if (depthQualified)
+		out.graduated = true;
 	out.activity = out.graduated ? String("hunt") : String("grind");
 }
 
@@ -11531,6 +11583,15 @@ void SimPlayerManager::refreshPlayerBotActivityStates() {
 }
 
 bool SimPlayerManager::isPlayerBotEarlyGameIdentity(uint64 identityId) {
+	// scorePlayerBotActivity now answers "grind" for a planned bot below the
+	// mission threshold even with the early-game gate off, because "grind" is
+	// the only value that blocks dispatch. This is the one entry point that
+	// STARTS the grind loop (startSimLoop and beginEarlyGame both come through
+	// here), so it enforces the gate itself: gate off means the bot idles --
+	// neither taking missions nor running a disabled capability. No lock is held
+	// here, so taking the gate's parity mutex is order-safe.
+	if (!playerBotEarlyGameGateEnabled())
+		return false;
 	SimBotIdentity identity;
 	if (!snapshotPlayerBotIdentity(identityId, identity))
 		return false;
