@@ -104,6 +104,25 @@ private:
 	Vector<uint64> missionOfferIds;
 	int terminalResolveWaitCycles;
 	int missionAddsOverCapCycles;
+	// Consecutive PVE_LAIR_REVEAL_DEFER_NO_SPAWN_POINT results for the current
+	// offer -- the PERMANENT case only (point not spawn-permitted and all 32
+	// relocation probes failed). Plain PVE_LAIR_REVEAL_DEFER is transient
+	// (capacity, registration race), is never counted here, and resets this,
+	// because capacity is only reached once a spawn point HAS been found.
+	// Measured 2026-09-21: one bot spent a full hour on 689 consecutive
+	// 2-second retries against a single point.
+	int missionLairRevealDeferCycles;
+	// The REAL cause recorded by beginMissionCleanup, kept so completeOrder can
+	// report it instead of the generic "abandoned". Without this the dashboard's
+	// pveAbandonReasons shows only "abandoned" and every real cause is lost --
+	// the overwrite documented at beginMissionCleanup and in roadmap 5c.4.
+	String missionAbandonReason;
+	// The retained cause wins over any travel-epilogue reason: once a mission has
+	// been abandoned for a real cause, HOW the bot then got home is not why the
+	// mission was dropped. Falls back when nothing was retained.
+	String epilogueAbandonReason(const String& fallback) const {
+		return missionAbandonReason.isEmpty() ? fallback : missionAbandonReason;
+	}
 	int missionAddsEngaged;
 
 	// P.10g: the self-motivated novice loop runs on the existing active tick.

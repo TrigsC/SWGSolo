@@ -6066,6 +6066,7 @@ void SimPlayerManager::loadLuaConfig() {
 	pveOverlandFallbackOnNavmeshFailure = false;
 	pveMissionMaxSimultaneousAdds = 3;
 	pveMissionAddsAbandonCycles = 8;
+	pveMissionLairRevealDeferMaxCycles = 30;
 	pveMissionHuntTimeoutMs = 600000;
 	pveMissionTerminalDwellSeconds = 5;
 	pveMissionTerminalResolveWaitCycles = 10;
@@ -9212,6 +9213,10 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		pveMissionTerminalResolveWaitCycles = clampMinerInt(
 			missionHuntConfig.getIntField("terminalResolveWaitCycles"),
 			pveMissionTerminalResolveWaitCycles, 1, 1000);
+		pveMissionLairRevealDeferMaxCycles = clampMinerInt(
+			missionHuntConfig.getIntField("lairRevealDeferMaxCycles",
+				pveMissionLairRevealDeferMaxCycles),
+			pveMissionLairRevealDeferMaxCycles, 0, 1000);
 		pveMissionLairTimeoutSeconds = clampMinerInt(
 			missionHuntConfig.getIntField("lairTimeoutSeconds"),
 			pveMissionLairTimeoutSeconds, 60, 86400);
@@ -19964,7 +19969,9 @@ SimPlayerManager::revealPveBotMissionLair(uint64 bodyOid, uint64 offerId) {
 		// path, and transient no-build occupancy typically clears.
 		if (!pveMissionBoardRevealRelocateEnabled)
 			return revealFail("spawnNotPermitted");
-		return PVE_LAIR_REVEAL_DEFER;
+		// Relocation exhausted: every ring probe failed, so this is the
+		// PERMANENT case and the caller may bound it.
+		return PVE_LAIR_REVEAL_DEFER_NO_SPAWN_POINT;
 	}
 
 	LairTemplate* lairTemplate = CreatureTemplateManager::instance()->

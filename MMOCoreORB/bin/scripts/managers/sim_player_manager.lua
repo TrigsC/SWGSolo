@@ -2254,6 +2254,16 @@ SimPlayerManagerConfig = {
             missionHuntTimeoutSeconds = 600,
             terminalDwellSeconds = 5,
             terminalResolveWaitCycles = 10,
+            -- Bound on consecutive NO_SPAWN_POINT lair-reveal deferrals for
+            -- one offer (2s cadence, so 30 is ~60s). This counts ONLY the
+            -- permanent case -- the advertised point is not spawn-permitted and
+            -- all 32 relocation probes failed. Transient deferrals (lair
+            -- capacity full, registration race) are never counted and reset the
+            -- counter, because a lair slot can legitimately be held for
+            -- lairTimeoutSeconds. Measured 2026-09-21: one bot spent an hour on
+            -- 689 retries against one point before the 900s phase timeout
+            -- released it. 0 restores the unbounded legacy retry.
+            lairRevealDeferMaxCycles = 30,
             lairTimeoutSeconds = 1800,
             maxActiveLairs = 6,
             navmeshModeDebounceTicks = 2,

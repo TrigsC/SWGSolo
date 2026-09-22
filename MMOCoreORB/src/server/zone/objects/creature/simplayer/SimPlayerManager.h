@@ -2525,6 +2525,7 @@ private:
 	bool pveOverlandFallbackOnNavmeshFailure = false;
 	int pveMissionMaxSimultaneousAdds = 3;
 	int pveMissionAddsAbandonCycles = 8;
+	int pveMissionLairRevealDeferMaxCycles = 30;
 	uint64 pveMissionHuntTimeoutMs = 600000;
 	int pveMissionTerminalDwellSeconds = 5;
 	int pveMissionTerminalResolveWaitCycles = 10;
@@ -3865,12 +3866,20 @@ public:
 	uint64 openTerminalVisit(uint64 identityId, uint64 bodyOid);
 	bool getPveBotMissionOffer(uint64 identityId, uint64 offerId,
 		PveBotMissionOffer& offer);
-	// Tri-state so a transient capacity/consistency miss defers the reveal
-	// (retry next tick) instead of abandoning a perfectly good mission.
+	// Four results. A transient capacity/consistency miss defers the reveal
+	// (retry next tick, unbounded) instead of abandoning a good mission, while
+	// relocation exhaustion is reported separately so the caller can bound it.
 	enum PveLairRevealResult {
 		PVE_LAIR_REVEAL_OK = 0,
+		// TRANSIENT: capacity full, or the offer moved under us. Retrying is
+		// correct and must NOT be bounded -- a lair slot can legitimately be
+		// held for lairTimeoutSeconds (1800s).
 		PVE_LAIR_REVEAL_DEFER = 1,
-		PVE_LAIR_REVEAL_FAILED = 2
+		PVE_LAIR_REVEAL_FAILED = 2,
+		// PERMANENT: the advertised point is not spawn-permitted and all 32
+		// relocation probes failed. Nothing about this clears, so the caller
+		// bounds its retries on this value alone.
+		PVE_LAIR_REVEAL_DEFER_NO_SPAWN_POINT = 3
 	};
 	PveLairRevealResult revealPveBotMissionLair(uint64 bodyOid, uint64 offerId);
 	void onPveBotMissionLairDestroyed(uint64 bodyOid, uint64 lairOid);
@@ -3984,6 +3993,13 @@ public:
 	}
 	int getPveMissionMaxSimultaneousAdds() const {
 		return pveMissionMaxSimultaneousAdds;
+	}
+	// 0 = unbounded (legacy). Shipped at 30 (~60s at the 2s retry cadence): a
+	// transient capacity DEFER clears within a couple of lair lifetimes, while a
+	// point whose 32 relocation probes all fail never clears and otherwise spins
+	// to the 900s phase timeout.
+	int getPveMissionLairRevealDeferMaxCycles() const {
+		return pveMissionLairRevealDeferMaxCycles;
 	}
 	int getPveMissionAddsAbandonCycles() const {
 		return pveMissionAddsAbandonCycles;

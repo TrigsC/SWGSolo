@@ -84,6 +84,7 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 	identityId = identity;
 	orderActive = false;
 	orderAbandoned = false;
+	missionAbandonReason = "";
 	deathReported = false;
 	phase = IDLE_HOME;
 	phaseStartedAtMs = System::getMiliTime();
@@ -121,6 +122,7 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 	missionOfferIds.removeAll();
 	terminalResolveWaitCycles = 0;
 	missionAddsOverCapCycles = 0;
+	missionLairRevealDeferCycles = 0;
 	missionAddsEngaged = 0;
 	earlyGameActive = false;
 	earlyGamePhase = EARLY_LEAVE_CITY;
@@ -406,6 +408,7 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	orderActive = true;
 	missionHuntOrder = SimPlayerManager::instance()->isPveMissionHuntEnabled();
 	orderAbandoned = false;
+	missionAbandonReason = "";
 	deathReported = false;
 	phase = IDLE_HOME;
 	phaseStartedAtMs = 0;
@@ -427,6 +430,7 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	missionOfferIds.removeAll();
 	terminalResolveWaitCycles = 0;
 	missionAddsOverCapCycles = 0;
+	missionLairRevealDeferCycles = 0;
 	missionAddsEngaged = 0;
 	pveBuffProviders = PveBuffProviders();
 	pveNeedDoctorBuff = false;
@@ -1585,6 +1589,8 @@ bool SimHunterController::beginNextMissionOffer() {
 	missionLairPosition = pending.get(0).advertisedPos;
 	missionLairOid = 0;
 	missionAddsOverCapCycles = 0;
+	missionLairRevealDeferCycles = 0;
+	missionAbandonReason = "";
 	updateMissionAdds(0);
 	setPhase(TRAVEL_TO_MISSION);
 	setHybridFailureProbeEnabled(MissionDiagLog::isLoggingEnabled());
@@ -1615,6 +1621,7 @@ void SimHunterController::spawnMissionLair() {
 	missionLairOid = lair.lairOid;
 	missionLairPosition = Vector3(lair.x, lair.y, lair.z);
 	missionAddsOverCapCycles = 0;
+	missionLairRevealDeferCycles = 0;
 	updateMissionAdds(0);
 	setPhase(TRAVEL_TO_LAIR);
 	SimPlayerManager::instance()->announcePveHunterEvent(
@@ -1632,9 +1639,12 @@ void SimHunterController::beginMissionCleanup(bool abandoned,
 		SimPlayerManager::instance()->recordPveHunterMissionEnd(
 			agent == nullptr ? 0 : agent->getObjectID(), missionLairOid, reason);
 
-	// The REAL abandon cause. Downstream, completeOrder overwrites it with the
-	// generic "abandoned" (reached home) or "path_failed_TRAVEL_HOME" (didn't),
-	// so the dashboard abandonReasons never shows WHY the mission was dropped.
+	// The REAL abandon cause. It used to be lost downstream: completeOrder
+	// overwrote it with the generic "abandoned" (reached home) or
+	// "path_failed_TRAVEL_HOME" (didn't), so the dashboard abandonReasons never
+	// showed WHY the mission was dropped. It is now retained in
+	// missionAbandonReason and passed through, so this log and the dashboard
+	// agree.
 	MissionDiagLog::event("MISSION_CLEANUP", identityId, "abandoned=" +
 		String::valueOf(abandoned) + " reason=" + reason +
 		" phase=" + getPhaseName() +
@@ -1643,6 +1653,8 @@ void SimHunterController::beginMissionCleanup(bool abandoned,
 			String("?") : agent->getZone()->getZoneName()));
 
 	orderAbandoned = abandoned;
+	if (abandoned)
+		missionAbandonReason = reason;
 	// Close the resume gate BEFORE disengaging so an arrival tick that acquires
 	// the agent lock right after disengage cannot revive movement toward the
 	// lair being torn down (code-review round 2).
@@ -1653,6 +1665,7 @@ void SimHunterController::beginMissionCleanup(bool abandoned,
 	targetOid = 0;
 	targetMissionWave = false;
 	missionAddsOverCapCycles = 0;
+	missionLairRevealDeferCycles = 0;
 	updateMissionAdds(0);
 	setPhase(MISSION_CLEANUP);
 	SimPlayerManager::instance()->requestPveHuntLairCleanup(
@@ -1684,6 +1697,7 @@ bool SimHunterController::checkMissionSocialAggro(AiAgent* hunter) {
 	AiAgent* targetAgent = nullptr;
 	if (!targetIsLive(targetOid, target, targetAgent)) {
 		missionAddsOverCapCycles = 0;
+	missionLairRevealDeferCycles = 0;
 		return false;
 	}
 
@@ -1743,12 +1757,14 @@ bool SimHunterController::checkMissionSocialAggro(AiAgent* hunter) {
 
 	if (missionLairLive && manager->isPveMissionLairTacticsEnabled()) {
 		missionAddsOverCapCycles = 0;
+	missionLairRevealDeferCycles = 0;
 		return false;
 	}
 
 	if (!socialTarget || adds <= manager->
 		getPveMissionMaxSimultaneousAdds()) {
 		missionAddsOverCapCycles = 0;
+	missionLairRevealDeferCycles = 0;
 		return false;
 	}
 
@@ -1975,7 +1991,8 @@ void SimHunterController::onArrived() {
 
 	if (phase == TRAVEL_HOME) {
 		if (orderAbandoned) {
-			completeOrder(true, "abandoned");
+			completeOrder(true, missionAbandonReason.isEmpty() ?
+				String("abandoned") : missionAbandonReason);
 		} else {
 			setPhase(DELIVER);
 			SimPlayerManager::instance()->announcePveHunterEvent(
@@ -2120,7 +2137,7 @@ void SimHunterController::onPathFailed() {
 	// physically home to take its next contract.
 	if (phase == TRAVEL_HOME) {
 		completeOrder(orderAbandoned, orderAbandoned ?
-			String("path_failed_TRAVEL_HOME") :
+			epilogueAbandonReason("path_failed_TRAVEL_HOME") :
 			String("travel_home_unreachable_after_success"));
 		return;
 	}
@@ -3461,7 +3478,8 @@ void SimHunterController::runActiveTick() {
 			cancelTicketCollectorTravel("phase_timeout_" + getPhaseName());
 			completeOrder(true, "phase_timeout_" + getPhaseName());
 		} else if (phase == TRAVEL_HOME)
-			completeOrder(true, "phase_timeout_" + getPhaseName());
+			completeOrder(true, epilogueAbandonReason(
+				"phase_timeout_" + getPhaseName()));
 		else if (missionHuntOrder && phase == MISSION_CLEANUP)
 			completeOrder(true, "cleanup_timeout");
 		else if (missionHuntOrder)
@@ -3653,13 +3671,48 @@ void SimHunterController::runActiveTick() {
 			SimPlayerManager::PveLairRevealResult revealResult =
 				SimPlayerManager::instance()->revealPveBotMissionLair(
 					strongAgent->getObjectID(), currentMissionOfferId);
-			if (revealResult == SimPlayerManager::PVE_LAIR_REVEAL_DEFER) {
-				// Global lair capacity is full (or the offer moved under us).
-				// The mission is still good - wait and retry rather than
-				// abandoning it and burning a terminal round trip.
+			if (revealResult ==
+					SimPlayerManager::PVE_LAIR_REVEAL_DEFER) {
+				// TRANSIENT only. Deliberately NOT counted: a lair slot can be
+				// held for lairTimeoutSeconds (1800s), far beyond the bound
+				// below, so counting capacity here would abandon missions that
+				// would have succeeded. It also RESETS the no-spawn counter:
+				// capacity is only tested after a spawn point was successfully
+				// found, so reaching here proves the no-spawn condition cleared,
+				// and separate failure runs must not accumulate.
+				missionLairRevealDeferCycles = 0;
 				scheduleActiveTick(2000);
 				return;
 			}
+			if (revealResult ==
+					SimPlayerManager::PVE_LAIR_REVEAL_DEFER_NO_SPAWN_POINT) {
+				// PERMANENT: the advertised point is not spawn-permitted and all
+				// 32 relocation probes failed (rings 16/32/48/64m x 8 bearings).
+				// Nothing about that clears, so every retry is wasted.
+				// Measured 2026-09-21: one bot burned a full hour on 689
+				// consecutive retries against a single point, ~17% of the roster
+				// doing nothing, and only escaped via the 900s phase timeout.
+				// Bounding it costs nothing the transient case needs -- capacity
+				// frees within a couple of lair lifetimes -- and releases the bot
+				// ~14 minutes earlier in the permanent case. The mission is lost
+				// either way; only the latency differs.
+				int deferMax = SimPlayerManager::instance()->
+					getPveMissionLairRevealDeferMaxCycles();
+				if (deferMax > 0 &&
+						++missionLairRevealDeferCycles >= deferMax) {
+					MissionDiagLog::event("REVEAL_DEFER_EXHAUSTED", identityId,
+						MissionDiagLog::fmtVec("advertised",
+							offer.advertisedPos) +
+						" cycles=" + String::valueOf(
+							missionLairRevealDeferCycles) +
+						" offerId=" + String::valueOf(currentMissionOfferId));
+					beginMissionCleanup(true, "lair_reveal_defer_exhausted");
+					return;
+				}
+				scheduleActiveTick(2000);
+				return;
+			}
+			missionLairRevealDeferCycles = 0;
 			if (revealResult != SimPlayerManager::PVE_LAIR_REVEAL_OK) {
 				beginMissionCleanup(true, "mission_lair_reveal_failed");
 				return;
@@ -4539,6 +4592,7 @@ void SimHunterController::onPveBotMissionLairDestroyed(uint64 lairOid) {
 	missionLairOid = 0;
 	currentMissionOfferId = 0;
 	missionAddsOverCapCycles = 0;
+	missionLairRevealDeferCycles = 0;
 	updateMissionAdds(0);
 	if (beginNextMissionOffer())
 		return;
@@ -5178,7 +5232,9 @@ void SimHunterController::beginTravelHome(bool abandoned) {
 	Vector3 home;
 	if (!SimPlayerManager::instance()->getPveHomeLocations(
 			returnPlanet, returnCity, cantina, medCenter, home)) {
-		completeOrder(abandoned, "home_location_unavailable");
+		completeOrder(abandoned, abandoned ?
+			epilogueAbandonReason("home_location_unavailable") :
+			String("home_location_unavailable"));
 		return;
 	}
 	setPhase(TRAVEL_HOME);
@@ -5224,6 +5280,7 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 			agent == nullptr ? 0 : agent->getObjectID());
 
 	orderAbandoned = false;
+	missionAbandonReason = "";
 	missionHuntOrder = false;
 	missionTerminalFallback = false;
 	missionTerminalResolved = false;
@@ -5233,6 +5290,7 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 	missionLairOid = 0;
 	terminalResolveWaitCycles = 0;
 	missionAddsOverCapCycles = 0;
+	missionLairRevealDeferCycles = 0;
 	missionAddsEngaged = 0;
 	targetOid = 0;
 	targetMissionWave = false;
