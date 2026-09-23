@@ -3993,19 +3993,33 @@ void SimHunterController::runActiveTick() {
 				" lairMembersAlive=" + String::valueOf(lairMembers.size()) +
 				" spawnNumber=" + String::valueOf(lair.waveObserver == nullptr ?
 					-1 : lair.waveObserver->getSpawnNumber()) +
-				" botHamFraction=" + String::valueOf(hamFraction));
+				" botHamFraction=" + String::valueOf(hamFraction) +
+				" exemptedOverLevel=" +
+					String::valueOf(scanExemptedOverLevel) +
+				" exemptedMaxLevel=" +
+					String::valueOf(scanExemptedMaxLevel) +
+				" levelCeiling=" + String::valueOf(scanLevelCeiling));
 		}
 		// "Nothing I am allowed to fight" is NOT "field clear". If every wave
 		// mob was rejected by a progression guard, entering ENGAGING_LAIR would
 		// be undone next tick by hasMissionWaveMobInRange, which does not apply
 		// those guards -- an oscillation that runs to the mission timeout.
-		// Abandon instead, and say so: an entirely over-level wave means the
-		// contract should never have been issued to this bot, which is a
-		// DISPATCH defect, and this reason is how it becomes visible.
+		// Abandon instead, and say so.
+		//
+		// scanRejectedOverLevel can no longer fire here: the ceiling is exempt
+		// once the lair is revealed, which is exactly this branch's condition.
+		// It is kept in the test rather than deleted so that narrowing that
+		// exemption later cannot silently reintroduce the oscillation -- and
+		// because a wave_above_level_band abandon reappearing on the dashboard
+		// is then a precise signal that the exemption stopped covering a case
+		// it used to. An earlier revision of this comment called an over-level
+		// wave proof of a DISPATCH defect; that was wrong, and the wrong
+		// conclusion is what this fix corrects. Dispatch was issuing correctly
+		// bounded contracts (difficulty 8-9 to a level-3 body) and the ceiling
+		// was rejecting their level-10 mobs on an unrelated scale.
 		if (!foundTarget && (scanRejectedOverLevel || scanRejectedPack) &&
 				missionHuntOrder && missionLairOid != 0) {
-			// The level ceiling is the more serious diagnosis -- it means the
-			// contract was mis-issued -- so it wins when both fired.
+			// Kept for the defensive case above; pack is the reachable reason.
 			const String ineligibleReason = scanRejectedOverLevel ?
 				String("wave_above_level_band") : String("wave_pack_avoided");
 			int ineligibleTier = 0;
@@ -4129,6 +4143,9 @@ bool SimHunterController::scanForTarget() {
 	// hunter (lair packs) — the cause of hunters never acquiring a target.
 	scanRejectedOverLevel = false;
 	scanRejectedPack = false;
+	scanExemptedOverLevel = 0;
+	scanExemptedMaxLevel = 0;
+	scanLevelCeiling = 0;
 	Zone* zone = nullptr;
 	Vector3 hunterPosition;
 	// Snapshotted with the position under the SAME agent lock: group
@@ -4172,8 +4189,32 @@ bool SimHunterController::scanForTarget() {
 			avoidPacks = progressionConfig.avoidGroupAggroTargets &&
 				!manager->isPlayerBotEliteCapable(identityId) &&
 				!inGroup;
+			scanLevelCeiling =
+				progressionTier + progressionConfig.levelBandAbove;
 		}
 	}
+
+	// The level ceiling is a TARGET-SELECTION guard: it stops a bot picking a
+	// fight it cannot win out in the world. It must NOT apply to the mobs of a
+	// contract the bot has already accepted and walked to. Those were bounded
+	// when the mission was issued -- selectPveBotMissionLairSpawn keeps the lair
+	// inside hunterLevel +/- 5 -- so a second ceiling on a DIFFERENT scale is
+	// pure harm: the ceiling is measured in progression TIER (6 for a graduated
+	// 4xxx brawler) while a wave mob is measured in creature LEVEL. A correctly
+	// issued difficulty-8 dantooine_bol_pigmy_neutral_small spawns
+	// lesser_plains_bol at level 10 -- ONE above the tier-6 ceiling of 9 -- so
+	// every wave was refused and every mission abandoned wave_above_level_band.
+	// Measured over ~2h on 2026-09-22 after the ceiling began following the bot:
+	// 0 kills, 14 deaths, 5 of 5 missions abandoned. The bot stood in its own
+	// lair refusing to fight back until the wave killed it.
+	//
+	// The ceiling still applies while TRAVELLING to the contract, which is the
+	// case the owner actually reported (a tier-6 bot engaging five huurtons in
+	// open country on the way to a lair). It lifts only once the lair is
+	// revealed. Pack avoidance is deliberately NOT lifted here: the owner's rule
+	// is that it stays for a solo sub-elite bot, and no observed abandon has
+	// been attributed to it (abandonReasons carried wave_above_level_band only).
+	const bool onAcceptedContract = missionHuntOrder && missionLairOid != 0;
 
 	if (earlyGameActive) {
 		// Hoisted out of the candidate loop: one config read, one identity
@@ -4274,7 +4315,9 @@ bool SimHunterController::scanForTarget() {
 	// The level CEILING is the hard guard (the same reasoning as
 	// calculateEarlyGameTtk): it is the one that stops a bot fighting something
 	// far above it. The floor is deliberately not applied here -- a graduated
-	// bot on a contract should still be allowed to clear weak wave mobs.
+	// bot on a contract should still be allowed to clear weak wave mobs -- and
+	// the ceiling itself is skipped once the bot is standing at an accepted
+	// contract's lair (onAcceptedContract, see the reasoning at its definition).
 	for (int i = 0; i < closeObjects.size(); ++i) {
 		SceneObject* object = static_cast<SceneObject*>(closeObjects.get(i));
 		CreatureObject* candidate = object == nullptr ? nullptr :
@@ -4299,8 +4342,19 @@ bool SimHunterController::scanForTarget() {
 			// mis-issued contract that the level ceiling is there to expose.
 			const bool packRejected = avoidPacks &&
 				candidateTemplate != nullptr && candidateTemplate->isPack();
-			const bool overLevel = candidateAgent->getLevel() >
+			const int candidateLevel = candidateAgent->getLevel();
+			const bool aboveBand = candidateLevel >
 				progressionTier + progressionConfig.levelBandAbove;
+			// Exempt, but counted: the ceiling does not block a mob of a
+			// contract the bot accepted, and the margin by which it would have
+			// is still published so a genuinely mis-sized contract stays
+			// diagnosable.
+			if (aboveBand && onAcceptedContract) {
+				++scanExemptedOverLevel;
+				scanExemptedMaxLevel = Math::max(scanExemptedMaxLevel,
+					candidateLevel);
+			}
+			const bool overLevel = aboveBand && !onAcceptedContract;
 			if (packRejected)
 				scanRejectedPack = true;
 			if (overLevel)

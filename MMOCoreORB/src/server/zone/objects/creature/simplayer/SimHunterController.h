@@ -128,6 +128,18 @@ private:
 	// "above level band" would send the next reader after the wrong defect.
 	bool scanRejectedOverLevel = false;
 	bool scanRejectedPack = false;
+	// Enforcement of the level ceiling is exempt inside an accepted contract,
+	// but the SIGNAL is kept: these record what the ceiling would have refused
+	// so a wildly over-level contract is still visible (LAIR_FIELD
+	// exemptedOverLevel=/exemptedMaxLevel=) instead of silently becoming a
+	// fight to the death. Dropping the enforcement must not also drop the
+	// observability -- that was the reviewable half of the objection to
+	// exempting contracts wholesale.
+	int scanExemptedOverLevel = 0;
+	int scanExemptedMaxLevel = 0;
+	// The ceiling itself, published alongside the two counters above so the
+	// margin is readable without knowing the bot's tier or the Lua band.
+	int scanLevelCeiling = 0;
 	// The retained cause wins over any travel-epilogue reason: once a mission has
 	// been abandoned for a real cause, HOW the bot then got home is not why the
 	// mission was dropped. Falls back when nothing was retained.
