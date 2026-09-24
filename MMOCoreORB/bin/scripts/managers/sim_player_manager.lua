@@ -2371,6 +2371,17 @@ SimPlayerManagerConfig = {
             minQualityScore = 0,
             maxConcurrentRelocations = 1,
             minHuntersPerActivePlanet = 1,
+            -- A relocation that never concludes used to hold the single slot
+            -- above forever, which stops EVERY other hunter being dispatched:
+            -- startedAtMs was recorded and shown on the dashboard but never
+            -- read. Measured 2026-09-24 -- identity 851 sat at leg 0 of 1 for
+            -- 51.7 minutes while both mission bots idled at the Mos Eisley
+            -- spawn point. The reaper concludes an over-age relocation through
+            -- the same failure path a refused departure already takes.
+            -- 0 disables it (pre-fix behaviour); values below 60 are raised to
+            -- 60 so a typo cannot cancel healthy legs mid-flight. Matches the
+            -- existing buffTripDeadlineSeconds safety net.
+            relocationDeadlineSeconds = 1800,
             relocationCooldownSeconds = 1800,
             relocationMinDwellSeconds = 900,
         },

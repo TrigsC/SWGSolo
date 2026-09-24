@@ -10,6 +10,7 @@
 #include "SimCombatDiagLog.h"
 #include "SimBotAbilityTiers.h"
 #include "SimBotMissionGraduation.h"
+#include "SimPveRelocationDeadline.h"
 #include "StructureTraversalDiagLog.h"
 
 #include <cmath>
@@ -9380,6 +9381,13 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 			marketDispatchConfig.getIntField("minHuntersPerActivePlanet",
 				pveMarketMinHuntersPerActivePlanet),
 			pveMarketMinHuntersPerActivePlanet, 0, 64);
+		// NOT clampMinerInt: it maps 0 to "keep the current value", which would
+		// make the documented disable value silently mean 1800. See
+		// SimPveRelocationDeadline.h.
+		pveMarketRelocationDeadlineSeconds = SimPveRelocationDeadline::normalize(
+			marketDispatchConfig.getIntField("relocationDeadlineSeconds",
+				pveMarketRelocationDeadlineSeconds),
+			pveMarketRelocationDeadlineSeconds);
 		pveMarketRelocationCooldownSeconds = clampMinerInt(
 			marketDispatchConfig.getIntField("relocationCooldownSeconds",
 				pveMarketRelocationCooldownSeconds),
@@ -19601,6 +19609,14 @@ bool SimPlayerManager::planPveHunterRelocation(uint64 identityId,
 		pveRelocations.put(identityId, relocation);
 		pveMarketLastRelocationMs.put(identityId, nowMs);
 	}
+	// Creation was silent, which is why a slot held for 51.7 minutes could only
+	// be found by reading the dashboard rather than the log: there was a record
+	// with no event that made it, and the expiry below has no "before" to pair
+	// with. Logged at the same level as the lair lifecycle events it sits
+	// beside.
+	info("SimPveRelocationStarted identity=" + String::valueOf(identityId) +
+		" from=" + fromPlanet + " to=" + targetPlanet +
+		" legs=" + String::valueOf(legs.size()) + " reason=" + reason, true);
 	return true;
 }
 
@@ -20372,6 +20388,54 @@ void SimPlayerManager::finishPveHuntLairCleanup(uint64 bodyOid,
 	if (removed)
 		info("SimPveHuntLairCleaned body=" + String::valueOf(bodyOid) +
 			" lair=" + String::valueOf(lairOid) + " reason=" + reason, true);
+}
+
+void SimPlayerManager::runPveRelocationReaper(uint64 nowMs) {
+	if (pveMarketRelocationDeadlineSeconds <= 0)
+		return;
+
+	const uint64 deadlineMs =
+		static_cast<uint64>(pveMarketRelocationDeadlineSeconds) * 1000ULL;
+
+	// Selected, dropped and counted under ONE lock. An earlier revision
+	// snapshotted, unlocked and then called finishPveHunterRelocation: between
+	// those two steps a controller can legitimately conclude the relocation, so
+	// the finalizer became a no-op while this still incremented the counter and
+	// logged an expiry that never happened -- corrupting the only evidence the
+	// reaper produces. The drop is inlined rather than delegated because
+	// finishPveHunterRelocation takes pveMutex itself and, for a failure with no
+	// actual planet, does nothing beyond the drop performed here.
+	Vector<uint64> expiredIds;
+	Vector<uint64> expiredAges;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = pveRelocations.size() - 1; i >= 0; --i) {
+			const PveRelocation& relocation =
+				pveRelocations.elementAt(i).getValue();
+			// A zero or future startedAtMs is treated as fresh rather than
+			// instantly expired: a clock that went backwards must not cancel
+			// every relocation in flight.
+			if (relocation.startedAtMs == 0 || nowMs <= relocation.startedAtMs)
+				continue;
+			uint64 ageMs = nowMs - relocation.startedAtMs;
+			if (ageMs < deadlineMs)
+				continue;
+			uint64 identityId = relocation.identityId;
+			expiredIds.add(identityId);
+			expiredAges.add(ageMs);
+			pveRelocations.drop(identityId);
+			pveRelocationsExpiredTotal++;
+		}
+	}
+
+	// Logged outside the lock: info() formats and writes, which is not work to
+	// do while every other PvE reader is blocked on pveMutex.
+	for (int i = 0; i < expiredIds.size(); ++i)
+		info("SimPveRelocationExpired identity=" +
+			String::valueOf(expiredIds.get(i)) +
+			" ageSeconds=" + String::valueOf(expiredAges.get(i) / 1000) +
+			" deadlineSeconds=" +
+			String::valueOf(pveMarketRelocationDeadlineSeconds), true);
 }
 
 void SimPlayerManager::runPveHuntLairJanitor(uint64 nowMs) {
@@ -22348,6 +22412,7 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 	// discovery is world-state plumbing, not a boot one-shot.
 	resolvePveMissionTerminals();
 	runPveHuntLairJanitor(System::getMiliTime());
+	runPveRelocationReaper(System::getMiliTime());
 
 	if (!pveBootReady) {
 		String readinessPlanet = pveSpikePlanet;
@@ -23286,6 +23351,7 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	uint64 missionLairsCleaned = 0;
 	uint64 creatureKillsTotal = 0;
 	uint64 lairsDestroyedTotal = 0;
+	uint64 relocationsExpiredSnapshot = 0;
 	uint64 missionsCompletedTotal = 0;
 	uint64 missionsAbandonedTotal = 0;
 	VectorMap<String, uint64> abandonReasons;
@@ -23334,6 +23400,7 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		missionTerminalStates = missionTerminalCityState;
 		missionOffers = pveBotMissions;
 		marketRelocations = pveRelocations;
+		relocationsExpiredSnapshot = pveRelocationsExpiredTotal;
 		buffTrips = pveBuffTrips;
 		marketDispatchEnabled = pveMarketDispatchEnabled;
 		marketDemandedFamily = pveMarketDemandedFamily;
@@ -23690,6 +23757,11 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		pveMarketMaxConcurrentRelocations;
 	marketDispatch["minHuntersPerActivePlanet"] =
 		pveMarketMinHuntersPerActivePlanet;
+	// Published next to the in-flight rows so a reader can tell at a glance
+	// whether an old startedAtMs is about to be reaped or is simply unbounded.
+	marketDispatch["relocationDeadlineSeconds"] =
+		pveMarketRelocationDeadlineSeconds;
+	marketDispatch["relocationsExpiredTotal"] = relocationsExpiredSnapshot;
 	JSONSerializationType relocationRows = JSONSerializationType::array();
 	for (int i = 0; i < marketRelocations.size(); ++i) {
 		const PveRelocation& relocation =

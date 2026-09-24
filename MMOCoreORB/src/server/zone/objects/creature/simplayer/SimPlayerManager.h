@@ -2583,6 +2583,17 @@ private:
 	int pveMarketMinHuntersPerActivePlanet = 1;
 	int pveMarketRelocationCooldownSeconds = 1800;
 	int pveMarketRelocationMinDwellSeconds = 900;
+	// A relocation that never finishes must not hold its slot forever.
+	// pveRelocations is capped by pveMarketMaxConcurrentRelocations (1 by
+	// default) and startedAtMs was recorded but never read, so a single stalled
+	// relocation blocked EVERY other hunter's dispatch indefinitely. Measured
+	// 2026-09-24: identity 851 sat at legIndex 0 of 1 for 51.7 minutes while
+	// both mission bots idled at the Mos Eisley spawn point with nothing to do.
+	// Mirrors the existing pveBuffTripDeadlineSeconds safety net.
+	int pveMarketRelocationDeadlineSeconds = 1800;
+	// Session counter for the dashboard; reset with the other PvE session
+	// counters at boot.
+	uint64 pveRelocationsExpiredTotal = 0;
 	Vector<String> pveAcquisitionLedgerCreatureFamilies;
 	Vector<String> pveAcquisitionLedgerCreatureClassMarkers;
 	VectorMap<String, uint64> pveAcquisitionLedgerFamilyReserveTargets;
@@ -2834,6 +2845,8 @@ private:
 	bool choosePveHuntSpawnPoint(const PveHuntSpecies& species,
 		const Vector3& missionPos, Vector3& spawnPos, Zone*& zoneOut);
 	void runPveHuntLairJanitor(uint64 nowMs);
+	// Frees the relocation slot held by a relocation that never concluded.
+	void runPveRelocationReaper(uint64 nowMs);
 	void queuePveHuntLairCleanup(uint64 bodyOid, const String& reason);
 	void finishPveHuntLairCleanup(uint64 bodyOid, uint64 lairOid,
 		const String& reason);
