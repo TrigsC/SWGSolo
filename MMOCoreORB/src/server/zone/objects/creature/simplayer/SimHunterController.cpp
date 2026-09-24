@@ -2098,6 +2098,32 @@ void SimHunterController::onPathFailed() {
 		// hybrid line says whether the wilderness target was off-mesh (and so
 		// whether resolveHybridExit was even reached), and whether recast found
 		// start/end polygons.
+		//
+		// The CELL is recorded because it is what separates two fixes with
+		// nothing else to tell them apart. The overnight failures all showed a
+		// stalled leg rather than a failed path-find, and a bot standing
+		// OUTDOORS that cannot move is a navmesh/collision problem the overland
+		// demotion answers, while one standing INSIDE a cell is the known
+		// cell->outdoor egress defect and belongs to that work instead. Read
+		// the same way the buff-provider check reads it (:559).
+		uint64 parentOid = 0;
+		uint64 buildingOid = 0;
+		bool inCell = false;
+		{
+			ManagedReference<AiAgent*> strongAgent = agent;
+			ManagedReference<SceneObject*> agentParent = strongAgent == nullptr ?
+				nullptr : strongAgent->getParent().get();
+			if (agentParent != nullptr) {
+				parentOid = agentParent->getObjectID();
+				inCell = agentParent->isCellObject();
+				if (inCell) {
+					ManagedReference<SceneObject*> agentBuilding =
+						agentParent->getParent().get();
+					if (agentBuilding != nullptr)
+						buildingOid = agentBuilding->getObjectID();
+				}
+			}
+		}
 		MissionDiagLog::event("MISSION_PATH_FAILED", identityId,
 			MissionDiagLog::fmtVec("target", missionLairPosition) +
 			" " + MissionDiagLog::fmtVec("pos", agent == nullptr ? Vector3() :
@@ -2105,6 +2131,9 @@ void SimHunterController::onPathFailed() {
 			" dist=" + String::valueOf(agent == nullptr ? -1.f :
 				agent->getWorldPosition().distanceTo2d(missionLairPosition)) +
 			" offerId=" + String::valueOf(currentMissionOfferId) +
+			" inCell=" + String::valueOf(inCell) +
+			" parentOid=" + String::valueOf(parentOid) +
+			" buildingOid=" + String::valueOf(buildingOid) +
 			" hybrid[" + getHybridPathDiagLine() + "]");
 		beginMissionCleanup(true, "mission_offer_path_failed");
 		return;

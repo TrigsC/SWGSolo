@@ -4479,6 +4479,10 @@ String SimPlayerController::getHybridPathDiagLine() const {
             hybridDiagExitResolveFailures.load(std::memory_order_relaxed)
         << " navmeshTaskFailures=" <<
             hybridDiagNavmeshTaskFailures.load(std::memory_order_relaxed)
+        << " stuckExhaustions=" <<
+            hybridDiagStuckExhaustions.load(std::memory_order_relaxed)
+        << " stuckDemotions=" <<
+            hybridDiagStuckDemotions.load(std::memory_order_relaxed)
         << " probes=" << hybridProbeCount.load(std::memory_order_relaxed)
         << " probeStartPoly=" << (hybridProbeStartPoly.load(std::memory_order_relaxed) ? 1 : 0)
         << " probeEndPoly=" << (hybridProbeEndPoly.load(std::memory_order_relaxed) ? 1 : 0)
@@ -5206,8 +5210,59 @@ void SimPlayerController::checkArrival() {
                     moveTo(resumeDestination, resumeLocalDestination,
                         resumeCell.get());
             } else {
+                hybridDiagStuckExhaustions.fetch_add(1,
+                    std::memory_order_relaxed);
                 if (diagnostic)
                     CellNavDiagLog::write("ARRIVAL_BRANCH=stuck_watchdog_exhausted");
+
+                // The SAME last resort as the navmesh-failure branch of
+                // onPathTaskFailed, applied to the branch that actually fires
+                // for a stalled mission leg.
+                //
+                // That earlier fallback only ever ran when a recast TASK
+                // failed. A leg that is handed a perfectly good path and then
+                // makes no forward progress never reaches it: the watchdog
+                // owns that case and gave up straight through onPathFailed().
+                // Measured 2026-09-23 over 11.4h -- 22 mission abandons, all
+                // with navmeshTaskFailures=0, exitResolved=1 and
+                // recastRequests in steps of 3 -- which is this branch. 19 of
+                // the 22 were one bot in one ~70m pocket near Tyrena.
+                //
+                // Bounded and non-looping by construction: ONLY a navmesh leg
+                // can be demoted, the destination must be outdoors so a cell
+                // target still goes through structure traversal (F_0.8.1), and
+                // rePathAttempts is already at its cap -- so a stalled overland
+                // leg falls to the onPathFailed() below on its next exhaustion
+                // rather than demoting again.
+                //
+                // The leg test is a whitelist, not "not already demoted". A
+                // blacklist of HYBRID_LEG_OVERLAND_ON_MESH alone still matched
+                // HYBRID_LEG_OVERLAND_FINAL -- the ordinary off-mesh final leg,
+                // which is ALREADY a direct path -- and would have rescheduled
+                // the identical path while counting a demotion that did not
+                // happen, corrupting the very counter added to measure this.
+                const bool legIsDemotable =
+                    hybridLeg == HYBRID_LEG_NAVMESH_FINAL ||
+                    hybridLeg == HYBRID_LEG_NAVMESH_EXIT;
+                if (SimPlayerManager::instance()->
+                            isPveOverlandFallbackOnNavmeshFailureEnabled() &&
+                        isHybridMovementActive() && hasFinalDestination &&
+                        destinationCell == nullptr && legIsDemotable) {
+                    overlandFallbacksUsed.fetch_add(1,
+                        std::memory_order_relaxed);
+                    hybridDiagStuckDemotions.fetch_add(1,
+                        std::memory_order_relaxed);
+                    if (diagnostic)
+                        CellNavDiagLog::write("HYBRID_OVERLAND_FALLBACK "
+                            "reason=stuck_watchdog_exhausted");
+                    onMeshMode = false;
+                    hybridLeg = HYBRID_LEG_OVERLAND_ON_MESH;
+                    hybridDiagLeg.store(HYBRID_LEG_OVERLAND_ON_MESH,
+                        std::memory_order_relaxed);
+                    scheduleHybridDirectPath(finalDestination,
+                        HYBRID_LEG_OVERLAND_ON_MESH);
+                    return;
+                }
 #ifdef DEBUG_SIMPVP
                 Logger::console.info("SimPlayer checkArrival: stuck; re-path budget exhausted, failing path.", true);
 #endif

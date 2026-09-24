@@ -397,6 +397,16 @@ protected:
     // The gate itself lives on the manager (pveConfig.overlandFallbackOnNavmeshFailure),
     // queried the same way getPveNavmeshRepathTries() is at the call site.
     std::atomic<uint64> overlandFallbacksUsed{0};
+    // Stuck-watchdog outcomes, split from the navmesh counters above because
+    // they are a DIFFERENT failure. Measured 2026-09-23: 22 mission abandons
+    // all carried navmeshTaskFailures=0 with recastRequests rising in steps of
+    // 3 (one initial path plus kMaxRePathAttempts re-paths), which is the
+    // watchdog exhausting in checkArrival -- not onPathTaskFailed. Without
+    // these two counters the two failures are indistinguishable on the
+    // dashboard, and the overland demotion shipped for recast partials looked
+    // like it covered a case it never ran on.
+    std::atomic<uint64> hybridDiagStuckExhaustions{0};
+    std::atomic<uint64> hybridDiagStuckDemotions{0};
     // Failure-only recast probe (enabled by the hunter while early-game movement
     // telemetry is on). Distinguishes start-poly, end-poly and partial-route
     // failures of a navmesh recast leg.
