@@ -3793,12 +3793,55 @@ void SimHunterController::runActiveTick() {
 
 	if (missionHuntOrder && phase == ENGAGING_LAIR &&
 			SimPlayerManager::instance()->isPveMissionBoardEnabled()) {
+		// The lair record can be cleared underneath a controller still standing
+		// in ENGAGING_LAIR -- a mission that ended (timeout, completion) drops
+		// it manager-side. Every path in engageMissionLair() below returns
+		// immediately on a zero oid, so without this the phase can only be left
+		// by the 900s TTL. Observed live 2026-09-25 on identities 84 and 851:
+		// both sat in ENGAGING_LAIR with lairOid=0.
+		// A zero lair oid is NOT actionable here, and deliberately does not
+		// abandon. The destruction callback clears missionLairOid AND
+		// currentMissionOfferId, in that order, from a different task-pool
+		// thread; a tick landing between those writes sees no lair and no offer
+		// to prove completion by, so ANY abandon decision made from this state
+		// can discard a mission that actually just succeeded -- and an offer-id
+		// lookup cannot close that window because the id is already gone.
+		// Rescheduling instead keeps the controller alive and leaves the
+		// outcome to whichever writer owns it: the completion transition if the
+		// mission succeeded, or the ENGAGING_LAIR TTL, which now runs because
+		// the tick is rearmed below. Bounded, and it cannot destroy a success.
+		if (missionLairOid == 0) {
+			scheduleActiveTick(1000);
+			return;
+		}
 		if (hasMissionWaveMobInRange()) {
 			disengageMissionLair();
 			setPhase(HUNTING);
 			scanForTarget();
 		} else {
+			// engageMissionLair() has several early returns -- out of weapon
+			// range, lair despawned, already following the lair -- and only ONE
+			// of them rearmed the tick. Taking any other left the controller
+			// with no scheduled task at all, which silently disables everything
+			// downstream of this branch: the ENGAGING_LAIR TTL, the
+			// !orderActive reset, the whole phase machine. Nordihi Dunaco spent
+			// 14 hours in ENGAGING_LAIR that way, stopped 2.47m outside weapon
+			// range of a lair, drifting on leftover movement with a dead
+			// controller (the mission itself had already ended: MISSION_SUMMARY
+			// endReason=timeout).
+			//
+			// Rearmed HERE rather than at each return so a future early return
+			// cannot reintroduce the same orphan. The generation check keeps an
+			// inner scheduleActiveTick() authoritative: scheduleActiveTick
+			// bumps activeTickGeneration, so an unchanged generation means
+			// nothing inside scheduled anything and this is the only rearm.
+			const uint64 tickGenerationBefore =
+				activeTickGeneration.load(std::memory_order_acquire);
 			engageMissionLair();
+			if (phase == ENGAGING_LAIR &&
+					activeTickGeneration.load(std::memory_order_acquire) ==
+						tickGenerationBefore)
+				scheduleActiveTick(1000);
 		}
 		return;
 	}
@@ -4071,7 +4114,14 @@ void SimHunterController::runActiveTick() {
 			MissionDiagLog::event("LAIR_ENGAGE", identityId,
 				MissionDiagLog::fmtVec("lair", missionLairPosition));
 			setPhase(ENGAGING_LAIR);
-			engageMissionLair();
+			// Deliberately NOT a direct engageMissionLair() call. This is the
+			// FIRST engagement attempt, and calling it here returned without
+			// rearming the tick on every one of its early-return paths -- the
+			// exact orphan the ENGAGING_LAIR branch was just fixed to prevent,
+			// reachable before that branch ever runs. Handing off through the
+			// tick makes the guarded branch the single owner of every
+			// engagement attempt, first and subsequent alike.
+			scheduleActiveTick(100);
 			return;
 		}
 		moveToPatrolPoint(nowMs);
@@ -4678,16 +4728,85 @@ void SimHunterController::engageMissionLair() {
 		return;
 	}
 
-	if (agent->getDistanceTo(lair) >
-			SimPlayerManager::instance()->getPveHunterWeaponRangeMeters()) {
+	const float weaponRange = SimPlayerManager::instance()->
+		getPveHunterWeaponRangeMeters();
+	// Approach until the STANDOFF is reached, not merely until the bot is
+	// nominally in weapon range. Gating on weaponRange alone made the standoff
+	// unreachable: a bot at the measured 50.47m needs only a couple of metres
+	// to satisfy a 48m check, so it would stop around 47m and open fire from
+	// outside the band where any lair has actually been observed to die
+	// (13.4-29.6m). Movement and combat are mutually exclusive on the shared
+	// base, so this genuinely is close-THEN-fight; an approach that cannot
+	// complete is bounded by the stuck watchdog and the ENGAGING_LAIR TTL.
+	const float standoff = weaponRange * 0.5f;
+	// The gate must absorb the mover's arrival tolerance or the approach never
+	// terminates. checkArrival declares arrival at distSq < 16.0f -- 4m -- so a
+	// leg aimed at the 24m point legitimately completes anywhere from 20m to
+	// 28m from the lair. Comparing the LAIR distance against a bare 24m would
+	// then still read "keep approaching" while the bot sits within 4m of the
+	// destination it already reached: every reissued path would arrive
+	// instantly without moving, spinning until the 900s TTL. Accepting
+	// standoff + tolerance ends the approach where the mover actually stops,
+	// and 20-28m remains inside the measured 13.4-29.6m kill band.
+	const float kMoverArrivalToleranceMeters = 4.f;
+	if (agent->getDistanceTo(lair) > standoff + kMoverArrivalToleranceMeters) {
 		// DIAGNOSTIC: hunter decided to attack the lair but is out of weapon
 		// range and is closing. A dist that never falls below range across ticks
 		// = it cannot close on the lair structure (final-approach stall).
+		// Walk to a STANDOFF point on the approach bearing, not to the lair's
+		// own position. A lair is a solid structure, so its world position is
+		// inside its collision volume: a path to that point does not resolve,
+		// no arrival callback fires, and the bot parks just outside weapon
+		// range forever. Measured 2026-09-25: dist=50.4725 against range=48 --
+		// short by 2.47m, and never closed again.
+		//
+		// Half weapon range = 24m: inside the 13.4-29.6m band where every
+		// lair destroyed in the 2026-09-24/25 run was engaged, and still far
+		// clear of any lair footprint. The band near the 48m ceiling has no
+		// confirmed kill behind it, which is the failure a pure range check
+		// cannot see.
+		const Vector3 lairPosition = lair->getWorldPosition();
+		const Vector3 agentPosition = agent->getWorldPosition();
+		const float bearingX = agentPosition.getX() - lairPosition.getX();
+		const float bearingY = agentPosition.getY() - lairPosition.getY();
+		const float bearingLength =
+			Math::sqrt(bearingX * bearingX + bearingY * bearingY);
+		Vector3 approachPoint = lairPosition;
+		if (bearingLength > 0.001f && bearingLength > standoff) {
+			const float scale = standoff / bearingLength;
+			approachPoint = Vector3(
+				lairPosition.getX() + bearingX * scale,
+				lairPosition.getY() + bearingY * scale,
+				lairPosition.getZ());
+		}
+		// Re-issuing moveTo() every tick would starve the approach it is meant
+		// to drive: moveTo() advances the work-loop generation, so a 1s rearm
+		// against a multi-second path calculation cancels each path just as it
+		// resolves and the bot never arrives -- the same starvation moveToTarget
+		// guards against at :4678. Keep the current leg unless it is not
+		// running, or the standoff point has moved materially since we pathed
+		// to it. A genuinely stalled leg is still handled by the stuck watchdog
+		// and onPathFailed.
+		const bool approachLegRunning = pursuing &&
+			(state == MOVING || state == CALCULATING_PATH);
+		const bool approachPointMoved =
+			pursuitTargetPos.distanceTo(approachPoint) >= standoff * 0.5f;
 		MissionDiagLog::event("LAIR_ATTACK", identityId, "phase=approach"
 			" dist=" + String::valueOf(agent->getDistanceTo(lair)) +
-			" range=" + String::valueOf(SimPlayerManager::instance()->
-				getPveHunterWeaponRangeMeters()));
-		moveTo(lair->getWorldPosition());
+			" range=" + String::valueOf(weaponRange) +
+			" standoff=" + String::valueOf(standoff) +
+			" legRunning=" + String::valueOf(approachLegRunning) +
+			" reissue=" + String::valueOf(
+				!approachLegRunning || approachPointMoved) +
+			" " + MissionDiagLog::fmtVec("approach", approachPoint));
+		if (approachLegRunning && !approachPointMoved)
+			return;
+		// Movement and combat are mutually exclusive on the shared base, the
+		// same reason moveToTarget() clears both before pathing.
+		disengageTarget(false);
+		pursuitTargetPos = approachPoint;
+		pursuing = true;
+		moveTo(approachPoint);
 		return;
 	}
 
