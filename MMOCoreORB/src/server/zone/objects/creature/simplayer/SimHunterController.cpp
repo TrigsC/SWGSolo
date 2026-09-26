@@ -4730,26 +4730,32 @@ void SimHunterController::engageMissionLair() {
 
 	const float weaponRange = SimPlayerManager::instance()->
 		getPveHunterWeaponRangeMeters();
-	// Approach until the STANDOFF is reached, not merely until the bot is
-	// nominally in weapon range. Gating on weaponRange alone made the standoff
-	// unreachable: a bot at the measured 50.47m needs only a couple of metres
-	// to satisfy a 48m check, so it would stop around 47m and open fire from
-	// outside the band where any lair has actually been observed to die
-	// (13.4-29.6m). Movement and combat are mutually exclusive on the shared
-	// base, so this genuinely is close-THEN-fight; an approach that cannot
-	// complete is bounded by the stuck watchdog and the ENGAGING_LAIR TTL.
+	// ENGAGE AS SOON AS THE LAIR IS IN WEAPON RANGE. An earlier revision gated
+	// this on a 24m standoff instead, and that was a measured regression:
+	//
+	//   outcome            before (118 missions)   with the 24m gate (45)
+	//   lair_destroyed     33  (28%)               2  (4%)
+	//   max_retreat_cycles  4  (3%)                22 (49%)
+	//
+	// The cause is an interaction with retreat, not with the standoff distance.
+	// retreatRangeMeters is 40, so a bot that retreats lands OUTSIDE a 28m gate
+	// and is forced into a fresh approach -- and movement and combat are
+	// mutually exclusive on the shared base, so it absorbs wave damage the whole
+	// way back without fighting, drops below the retreat threshold again, and
+	// burns all three cycles. At a 48m gate the same bot is already in range
+	// when it finishes retreating and simply resumes firing.
+	//
+	// INVARIANT for anyone tightening this again: the engage gate must stay
+	// ABOVE retreatRangeMeters, or every retreat becomes a defenceless walk.
+	//
+	// The distance band was never the problem. Bots already engaged at an
+	// average of 19.7m before the change (max 47.7) and 21.6m after (max 27.8);
+	// capping the tail bought nothing and cost the retreat interaction. The
+	// justification for the 24m gate came from reading the distances of
+	// SUCCESSFUL kills only, which is selection bias -- the failures' distances
+	// were never in the sample.
 	const float standoff = weaponRange * 0.5f;
-	// The gate must absorb the mover's arrival tolerance or the approach never
-	// terminates. checkArrival declares arrival at distSq < 16.0f -- 4m -- so a
-	// leg aimed at the 24m point legitimately completes anywhere from 20m to
-	// 28m from the lair. Comparing the LAIR distance against a bare 24m would
-	// then still read "keep approaching" while the bot sits within 4m of the
-	// destination it already reached: every reissued path would arrive
-	// instantly without moving, spinning until the 900s TTL. Accepting
-	// standoff + tolerance ends the approach where the mover actually stops,
-	// and 20-28m remains inside the measured 13.4-29.6m kill band.
-	const float kMoverArrivalToleranceMeters = 4.f;
-	if (agent->getDistanceTo(lair) > standoff + kMoverArrivalToleranceMeters) {
+	if (agent->getDistanceTo(lair) > weaponRange) {
 		// DIAGNOSTIC: hunter decided to attack the lair but is out of weapon
 		// range and is closing. A dist that never falls below range across ticks
 		// = it cannot close on the lair structure (final-approach stall).
@@ -4760,11 +4766,11 @@ void SimHunterController::engageMissionLair() {
 		// range forever. Measured 2026-09-25: dist=50.4725 against range=48 --
 		// short by 2.47m, and never closed again.
 		//
-		// Half weapon range = 24m: inside the 13.4-29.6m band where every
-		// lair destroyed in the 2026-09-24/25 run was engaged, and still far
-		// clear of any lair footprint. The band near the 48m ceiling has no
-		// confirmed kill behind it, which is the failure a pure range check
-		// cannot see.
+		// The standoff is only the MOVE TARGET, never a gate: it exists so the
+		// path has a reachable destination on open ground. The bot will engage
+		// as soon as it crosses weaponRange on the way in, so it normally never
+		// reaches this point -- which is correct, and is what keeps engagement
+		// timing identical to the pre-standoff behaviour.
 		const Vector3 lairPosition = lair->getWorldPosition();
 		const Vector3 agentPosition = agent->getWorldPosition();
 		const float bearingX = agentPosition.getX() - lairPosition.getX();
