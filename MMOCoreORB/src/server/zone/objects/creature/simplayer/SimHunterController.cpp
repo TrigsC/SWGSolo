@@ -3814,7 +3814,36 @@ void SimHunterController::runActiveTick() {
 			scheduleActiveTick(1000);
 			return;
 		}
-		if (hasMissionWaveMobInRange()) {
+		// COMMITMENT: a wave mob in range preempts the lair only BEFORE combat
+		// with the lair has started. Once engaged, the bot stays on the lair.
+		//
+		// This restores behaviour that was lost by accident. Before the tick was
+		// rearmed in this branch, the controller went silent the moment it
+		// engaged, and that silence was doing real work: the bot could not be
+		// pulled off the lair and simply hammered it until it died. Making the
+		// tick live re-enabled this check at 1Hz, and because damaging a lair
+		// spawns more waves there is almost always a mob in range, so the bot
+		// thrashed between the two and finished neither. Measured per mission:
+		//
+		//   lair hits (LAIR_DAMAGE source=combat)   13.8  ->  4.0
+		//   lair_destroyed                          28%   ->  0%
+		//   retreats per mission                    1.66  ->  2.54
+		//
+		// Both post-rearm windows were equally bad regardless of the engage
+		// gate, which is what identifies the rearm rather than the gate as the
+		// cause. Owner rule 2026-09-22: a bot that can spin a lair down while
+		// taking all the aggro SHOULD, because that is the fastest XP and
+		// credits -- which is exactly the committed behaviour.
+		//
+		// NOT paired with a retreat check here, deliberately. Retreat is only
+		// evaluated in HUNTING (guarded at :3907), so pre-rearm a committed bot
+		// never retreated either -- it won or died, and that is the state that
+		// produced the 28% kill rate. Adding a survival path here would be new,
+		// unmeasured behaviour introduced while fixing a regression that was
+		// itself caused by unmeasured behaviour. If the death rate proves too
+		// high, that becomes its own change with its own measurement.
+		const bool committedToLair = engagedMissionLairOid != 0;
+		if (hasMissionWaveMobInRange() && !committedToLair) {
 			disengageMissionLair();
 			setPhase(HUNTING);
 			scanForTarget();
