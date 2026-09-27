@@ -2131,6 +2131,7 @@ void SimHunterController::onPathFailed() {
 			" dist=" + String::valueOf(agent == nullptr ? -1.f :
 				agent->getWorldPosition().distanceTo2d(missionLairPosition)) +
 			" offerId=" + String::valueOf(currentMissionOfferId) +
+			" pathFailedSource=" + String(getPathFailedSource()) +
 			" inCell=" + String::valueOf(inCell) +
 			" parentOid=" + String::valueOf(parentOid) +
 			" buildingOid=" + String::valueOf(buildingOid) +

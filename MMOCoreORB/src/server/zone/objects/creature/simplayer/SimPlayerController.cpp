@@ -518,7 +518,7 @@ void SimPlayerController::rejectClippingPath(Vector<WorldCoordinates>* path) {
     }
 
     if (agent == nullptr || agent->getZone() == nullptr) {
-        onPathFailed();
+        failPath("traversal_no_agent_or_zone");
         return;
     }
 
@@ -1285,7 +1285,7 @@ void SimPlayerController::moveToWithOrigin(Vector3 worldPos, Vector3 localPos,
     if (!zone->isWithinBoundaries(worldPos)) {
         if (diagnostic)
             CellNavDiagLog::write("MOVE_REQUEST_REJECT reason=outside_boundaries");
-        onPathFailed();
+        failPath("moveto_target_out_of_bounds");
         return;
     }
 
@@ -2185,7 +2185,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path,
         else if (cellEgressActive)
             failCellEgress();
         else
-            onPathFailed();
+            failPath("pathfound_rejected_short_path");
         if (diagnostic)
             CellNavDiagLog::write("PATH_REJECT reason=short_path");
         return;
@@ -2212,7 +2212,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path,
         if (cellEgressActive)
             failCellEgress();
         else
-            onPathFailed();
+            failPath("pathfound_rejected_stale_end");
         return;
     }
 
@@ -2340,7 +2340,7 @@ void SimPlayerController::onPathTaskFailed(bool pathUsesNavmesh) {
     }
 
     if (!isHybridMovementActive() || !pathUsesNavmesh) {
-        onPathFailed();
+        failPath("taskfailed_leg_not_navmesh");
         return;
     }
     hybridDiagNavmeshTaskFailures.fetch_add(1, std::memory_order_relaxed);
@@ -2392,7 +2392,7 @@ void SimPlayerController::onPathTaskFailed(bool pathUsesNavmesh) {
         return;
     }
 
-    onPathFailed();
+    failPath("taskfailed_navmesh_budget_exhausted");
 }
 
 bool SimPlayerController::findNavAreaAt(Zone* zone, const Vector3& position,
@@ -2534,7 +2534,7 @@ void SimPlayerController::scheduleHybridDirectPath(const Vector3& target,
 void SimPlayerController::requestHybridPath() {
     if (agent == nullptr || agent->getZone() == nullptr ||
             !hasFinalDestination) {
-        onPathFailed();
+        failPath("requesthybrid_no_final_destination");
         return;
     }
 
@@ -2552,7 +2552,7 @@ void SimPlayerController::requestHybridPath() {
         return;
 
     if (!isHybridMovementActive()) {
-        onPathFailed();
+        failPath("requesthybrid_not_hybrid_active");
         return;
     }
 
@@ -3063,7 +3063,7 @@ void SimPlayerController::checkStructureTraversalResume(uint64 generation) {
     if (structureTraversalIntent.resumeAttempts >= resumeAttemptCap) {
         traversalResumeInProgress = false;
         SimPlayerManager::instance()->recordStructureTraversalResumeFailure();
-        onPathFailed();
+        failPath("traversal_resume_attempt_cap");
         return;
     }
 
@@ -3088,7 +3088,7 @@ void SimPlayerController::checkStructureTraversalResume(uint64 generation) {
 
         traversalResumeInProgress = false;
         SimPlayerManager::instance()->recordStructureTraversalResumeFailure();
-        onPathFailed();
+        failPath("traversal_resume_failed");
     }
 }
 
@@ -4395,7 +4395,7 @@ void SimPlayerController::failCellEgress() {
     simPathIndex = 0;
     interiorApproachLeg = false;
     state = IDLE;
-    onPathFailed();
+    failPath("cell_egress_candidates_exhausted");
 }
 
 void SimPlayerController::resetHybridMovementState(bool clearFinalDestination) {
@@ -4479,6 +4479,7 @@ String SimPlayerController::getHybridPathDiagLine() const {
             hybridDiagExitResolveFailures.load(std::memory_order_relaxed)
         << " navmeshTaskFailures=" <<
             hybridDiagNavmeshTaskFailures.load(std::memory_order_relaxed)
+        << " pathFailedSource=" << getPathFailedSource()
         << " stuckExhaustions=" <<
             hybridDiagStuckExhaustions.load(std::memory_order_relaxed)
         << " stuckDemotions=" <<
@@ -5001,7 +5002,7 @@ void SimPlayerController::checkArrival() {
                 // validated outside every NavArea before it was scheduled.
                 if (agent->isInNavMesh()) {
                     locker.release();
-                    onPathFailed();
+                    failPath("egress_leg_still_in_navmesh");
                     return;
                 }
                 onMeshMode = false;
@@ -5096,7 +5097,7 @@ void SimPlayerController::checkArrival() {
                 return;
             }
             if (escalationOutcome == HollowEscalationOutcome::Failed) {
-                onPathFailed();
+                failPath("hollow_escalation_failed");
                 return;
             }
 
@@ -5266,7 +5267,7 @@ void SimPlayerController::checkArrival() {
 #ifdef DEBUG_SIMPVP
                 Logger::console.info("SimPlayer checkArrival: stuck; re-path budget exhausted, failing path.", true);
 #endif
-                onPathFailed();
+                failPath("stuck_watchdog_exhausted");
             }
 
             return;
@@ -6070,7 +6071,7 @@ void SimMinerController::goToResource(const String& resourceName) {
         if (!zone->isWithinBoundaries(targetPos)) {
             logStateTransition("SimMinerLegacyMoveBlocked: no in-bounds fallback destination for [" +
                 resourceName + "]; retrying loop");
-            onPathFailed();
+            failPath("miner_no_inbounds_fallback");
             return;
         }
 

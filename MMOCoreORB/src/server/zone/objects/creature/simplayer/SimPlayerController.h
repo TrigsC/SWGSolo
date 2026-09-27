@@ -405,6 +405,8 @@ protected:
     // these two counters the two failures are indistinguishable on the
     // dashboard, and the overland demotion shipped for recast partials looked
     // like it covered a case it never ran on.
+    // Last onPathFailed() call site, as a string literal. See failPath().
+    std::atomic<const char*> pathFailedSource{nullptr};
     std::atomic<uint64> hybridDiagStuckExhaustions{0};
     std::atomic<uint64> hybridDiagStuckDemotions{0};
     // Failure-only recast probe (enabled by the hunter while early-game movement
@@ -668,6 +670,23 @@ public:
             bool pathUsesNavmesh = false, bool pathIsOverland = false);
     void onPathTaskFailed(bool pathUsesNavmesh);
     virtual void onPathFailed();
+
+    // onPathFailed() is reached from 15 different places and, until now,
+    // recorded nothing about WHICH -- so a mission that abandoned with
+    // mission_offer_path_failed (113 of 133 abandons on 2026-09-27, the single
+    // largest source of wasted missions) could only be attributed by
+    // elimination across every call site, which never actually settled it.
+    // failPath() stamps the site and then fails, so the next occurrence names
+    // itself. The label is always a string literal, so storing the pointer is
+    // safe and costs nothing.
+    void failPath(const char* source) {
+        pathFailedSource.store(source, std::memory_order_relaxed);
+        onPathFailed();
+    }
+    const char* getPathFailedSource() const {
+        const char* source = pathFailedSource.load(std::memory_order_relaxed);
+        return source == nullptr ? "none" : source;
+    }
 
     // Segment-by-segment probe of a path that is about to be handed to the
     // mover, aggregated worst-first (WouldBlock > Error > Truncated > Skipped).
