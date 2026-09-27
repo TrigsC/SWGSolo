@@ -3390,6 +3390,65 @@ void SimHunterController::runEarlyGameTick(AiAgent* hunter, uint64 nowMs) {
 	scheduleActiveTick(1000);
 }
 
+void SimHunterController::runBuffUpTick(AiAgent* strongAgent,
+		uint64 nowMs) {
+	if (pveBuffTripAtHub) {
+		SimPlayerManager::PveBuffTrip trip;
+		if (SimPlayerManager::instance()->getPveHunterBuffTrip(identityId,
+				trip) && trip.deadlineAtMs != 0 &&
+				nowMs >= trip.deadlineAtMs) {
+			cancelPveDoctorRequest();
+			pveDoctorFallbackNeeded = pveNeedDoctorBuff;
+			pveEntertainerFallbackNeeded = pveNeedEntertainerBuff;
+			finishPveBuffProviderFlow();
+			return;
+		}
+	}
+
+	if (pveDoctorRequestActive) {
+		bool needDoctor = false;
+		bool needEntertainer = false;
+		computeBuffNeeds(needDoctor, needEntertainer);
+		if (!needDoctor) {
+			uint64 bodyOid = 0;
+			{
+				Locker agentLock(strongAgent);
+				bodyOid = strongAgent->getObjectID();
+			}
+			pveDoctorRequestActive = false;
+			pveDoctorDeadlineSec = 0;
+			pveDoctorProviderObject = nullptr;
+			SimPlayerManager::instance()->recordPveBuffSource(
+				bodyOid, "real-doctor");
+			if (moveToNextPveBuffProvider())
+				return;
+			finishPveBuffProviderFlow();
+			return;
+		}
+
+		if (nowMs / 1000 >= pveDoctorDeadlineSec) {
+			cancelPveDoctorRequest();
+			pveDoctorFallbackNeeded = true;
+			if (moveToNextPveBuffProvider())
+				return;
+			finishPveBuffProviderFlow();
+			return;
+		}
+
+		scheduleActiveTick(1000);
+		return;
+	}
+
+	if (dwellUntilMs != 0 && nowMs >= dwellUntilMs) {
+		dwellUntilMs = 0;
+		onArrived();
+	} else {
+		scheduleActiveTick(dwellUntilMs == 0 ? 1000 :
+			(int)Math::max(100, (int)(dwellUntilMs - nowMs)));
+	}
+	return;
+}
+
 void SimHunterController::runActiveTick() {
 	ManagedReference<AiAgent*> strongAgent = agent;
 	if (strongAgent == nullptr) {
@@ -3583,60 +3642,36 @@ void SimHunterController::runActiveTick() {
 	}
 
 	if (phase == BUFF_UP) {
-		if (pveBuffTripAtHub) {
-			SimPlayerManager::PveBuffTrip trip;
-			if (SimPlayerManager::instance()->getPveHunterBuffTrip(identityId,
-					trip) && trip.deadlineAtMs != 0 &&
-					nowMs >= trip.deadlineAtMs) {
-				cancelPveDoctorRequest();
-				pveDoctorFallbackNeeded = pveNeedDoctorBuff;
-				pveEntertainerFallbackNeeded = pveNeedEntertainerBuff;
-				finishPveBuffProviderFlow();
-				return;
-			}
-		}
-
-		if (pveDoctorRequestActive) {
-			bool needDoctor = false;
-			bool needEntertainer = false;
-			computeBuffNeeds(needDoctor, needEntertainer);
-			if (!needDoctor) {
-				uint64 bodyOid = 0;
-				{
-					Locker agentLock(strongAgent);
-					bodyOid = strongAgent->getObjectID();
-				}
-				pveDoctorRequestActive = false;
-				pveDoctorDeadlineSec = 0;
-				pveDoctorProviderObject = nullptr;
-				SimPlayerManager::instance()->recordPveBuffSource(
-					bodyOid, "real-doctor");
-				if (moveToNextPveBuffProvider())
-					return;
-				finishPveBuffProviderFlow();
-				return;
-			}
-
-			if (nowMs / 1000 >= pveDoctorDeadlineSec) {
-				cancelPveDoctorRequest();
-				pveDoctorFallbackNeeded = true;
-				if (moveToNextPveBuffProvider())
-					return;
-				finishPveBuffProviderFlow();
-				return;
-			}
-
+		// Extracted verbatim so ONE guard covers every exit. The buff-provider
+		// paths issue a move (moveTo / enterStructure) and return relying on an
+		// arrival callback to restart the heartbeat; if that callback is ever
+		// lost the controller goes silent and the BUFF_UP phase TTL, which would
+		// otherwise recover it, never runs -- because the TTL lives in this same
+		// heartbeat. That is the identical shape as the ENGAGING_LAIR orphan that
+		// stranded a bot for 14 hours, found by auditing for the same pattern.
+		// Latent rather than observed: no bot has been seen stuck in BUFF_UP, so
+		// this is insurance, and it deliberately changes NOTHING about buffing --
+		// not provider choice, order, interaction or thresholds.
+		//
+		// The generation check keeps an inner scheduleActiveTick authoritative,
+		// so the existing cadences (the 1000ms doctor poll, the dwell timer) are
+		// untouched and this only fires when nothing else booked a wake-up.
+		// Deliberately NOT conditioned on the phase still being BUFF_UP.
+		// finishPveBuffProviderFlow() can transition to TRAVEL_OUT or
+		// TRAVEL_TO_TERMINAL and issue a move that books no wake-up of its own,
+		// so a phase-scoped guard would hand the silence straight to the next
+		// phase and disable ITS timeout instead -- the same bug one step later.
+		// The generation is the only thing worth testing: unchanged means
+		// nothing anywhere booked a wake-up, and whatever phase we are now in
+		// still needs one. No phase reachable from here is terminal, and the
+		// phases that do own a cadence (the doctor poll, the dwell timer) have
+		// already bumped the generation, so this cannot shorten them.
+		const uint64 tickGenerationBefore =
+			activeTickGeneration.load(std::memory_order_acquire);
+		runBuffUpTick(strongAgent, nowMs);
+		if (activeTickGeneration.load(std::memory_order_acquire) ==
+				tickGenerationBefore)
 			scheduleActiveTick(1000);
-			return;
-		}
-
-		if (dwellUntilMs != 0 && nowMs >= dwellUntilMs) {
-			dwellUntilMs = 0;
-			onArrived();
-		} else {
-			scheduleActiveTick(dwellUntilMs == 0 ? 1000 :
-				(int)Math::max(100, (int)(dwellUntilMs - nowMs)));
-		}
 		return;
 	}
 

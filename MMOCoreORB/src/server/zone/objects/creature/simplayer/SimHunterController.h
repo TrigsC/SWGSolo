@@ -247,6 +247,10 @@ private:
 
 	void scheduleActiveTick(int delayMs);
 	void runActiveTick();
+	// The BUFF_UP branch of runActiveTick, extracted so a single guard at the
+	// call site can re-arm the heartbeat on every exit. Pure extraction: the
+	// body is unchanged and no buffing behaviour is altered.
+	void runBuffUpTick(AiAgent* strongAgent, uint64 nowMs);
 	void setPhase(HuntPhase next);
 	void beginBuffUp();
 	void computeBuffNeeds(bool& needDoctor, bool& needEntertainer) const;
