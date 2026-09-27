@@ -2490,6 +2490,37 @@ bool SimPlayerController::resolveHybridExit(Zone* zone,
         // The candidate is valid only after both the ground/water snap and
         // the nav-region query agree that it is outside every NavArea.
         if (candidateAreas.size() == 0) {
+            // ...and after it is outside by MORE than the mover's arrival
+            // tolerance. Being merely outside is not enough: checkArrival
+            // accepts the leg as complete within kArrivalToleranceMeters, so an
+            // exit point only a metre or two clear of the boundary leaves the
+            // agent still inside the NavArea it was sent to cross. The EGRESS
+            // arrival check then sees isInNavMesh() and fails the whole path.
+            //
+            // That was 100% of the dominant mission failure: 10 of 10 tagged
+            // MISSION_PATH_FAILED events on 2026-09-28 carried
+            // pathFailedSource=egress_leg_still_in_navmesh, across all six bots,
+            // each one abandoning an average of 1243m from a target it had not
+            // started walking to. The probe steps outward in 8m increments, so
+            // the first candidate outside a boundary lying 7m along the ray is
+            // only 1m clear -- well inside the 4m the mover may stop short by.
+            //
+            // Tested by pulling the candidate BACK toward the mesh by the
+            // clearance and requiring that point to be outside too, which is
+            // exactly the worst case a tolerated arrival can produce. Failing
+            // this just continues the outward walk, so the only cost is a
+            // slightly longer egress leg.
+            const float clearance = kArrivalToleranceMeters + 2.f;
+            Vector3 pullback = candidate - outward * clearance;
+            pullback.setZ(CollisionManager::getWorldFloorCollision(
+                pullback.getX(), pullback.getY(), zone, true));
+
+            SortedVector<ManagedReference<NavArea*> > pullbackAreas;
+            zone->getInRangeNavMeshes(pullback.getX(), pullback.getY(),
+                &pullbackAreas, false);
+            if (pullbackAreas.size() != 0)
+                continue;
+
             egress = candidate;
             boundary = collisionPosition;
             return true;
@@ -4870,7 +4901,8 @@ void SimPlayerController::checkArrival() {
 
     bool arrived = false;
 
-    if (distSq < 16.0f) arrived = true;
+    if (distSq < kArrivalToleranceMeters * kArrivalToleranceMeters)
+        arrived = true;
     bool queueExhausted = agent->getPatrolPointSize() == 0 &&
         simPathIndex >= simPath.size();
     if (queueExhausted) arrived = true;

@@ -406,6 +406,17 @@ protected:
     // dashboard, and the overland demotion shipped for recast partials looked
     // like it covered a case it never ran on.
     // Last onPathFailed() call site, as a string literal. See failPath().
+    // The mover's arrival tolerance, in metres. checkArrival() accepts a
+    // destination as reached at distSq < kArrivalToleranceMeters^2.
+    //
+    // Named because this number has now caused three separate defects by being
+    // a bare literal that each call site rediscovered or forgot: the lair
+    // approach looped when its gate ignored it, and the hybrid egress probe
+    // abandoned missions by validating an exit point that was outside the
+    // navmesh by LESS than this, so a legitimate arrival landed back inside.
+    // Anything that reasons about "did we get there" must use this constant.
+    static constexpr float kArrivalToleranceMeters = 4.f;
+
     std::atomic<const char*> pathFailedSource{nullptr};
     std::atomic<uint64> hybridDiagStuckExhaustions{0};
     std::atomic<uint64> hybridDiagStuckDemotions{0};
