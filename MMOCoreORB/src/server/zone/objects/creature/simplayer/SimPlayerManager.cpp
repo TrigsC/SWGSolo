@@ -19841,6 +19841,12 @@ void SimPlayerManager::onPveBotMissionLairDestroyed(uint64 bodyOid,
 			trackedMissionLair = true;
 			identityId = pveHuntLairs.get(bodyOid).identityId;
 			pveHuntLairs.drop(bodyOid);
+			// The ONLY place a destroyed lair is counted. Reached from the
+			// destruction callback, so it means the lair actually died; the
+			// cleanup and janitor paths deliberately increment only the
+			// cleaned counter. Every lair that is destroyed is also cleaned,
+			// so cleaned >= destroyed is the expected relationship and the
+			// gap between them is abandoned or despawned lairs.
 			pveMissionLairsCleaned++;
 			pveLairsDestroyedTotal++;
 		}
@@ -20380,7 +20386,11 @@ void SimPlayerManager::finishPveHuntLairCleanup(uint64 bodyOid,
 				pveHuntLairs.get(bodyOid).lairOid == lairOid) {
 			pveHuntLairs.drop(bodyOid);
 			pveMissionLairsCleaned++;
-			pveLairsDestroyedTotal++;
+			// NOT pveLairsDestroyedTotal: this is a CLEANUP, not a kill. Counting
+			// it here made the two counters identical (45 == 45 on 2026-09-26)
+			// and the dashboard report every despawned or abandoned lair as
+			// destroyed -- a number I misread myself. The real kill is counted
+			// once, in onPveBotMissionLairDestroyed.
 			removed = true;
 		}
 	}
@@ -20474,7 +20484,11 @@ void SimPlayerManager::runPveHuntLairJanitor(uint64 nowMs) {
 						record.lairOid) {
 					pveHuntLairs.drop(record.bodyOid);
 					pveMissionLairsCleaned++;
-					pveLairsDestroyedTotal++;
+					// NOT pveLairsDestroyedTotal: this is a CLEANUP, not a kill. Counting
+					// it here made the two counters identical (45 == 45 on 2026-09-26)
+					// and the dashboard report every despawned or abandoned lair as
+					// destroyed -- a number I misread myself. The real kill is counted
+					// once, in onPveBotMissionLairDestroyed.
 					removed = true;
 				}
 			}
