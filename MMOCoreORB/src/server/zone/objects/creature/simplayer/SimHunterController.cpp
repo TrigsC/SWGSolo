@@ -115,6 +115,7 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 	missionLairPosition = Vector3();
 	missionLairOid = 0;
 	engagedMissionLairOid = 0;
+	lastLairRetargetMs = 0;
 	currentMissionOfferId = 0;
 	missionOffersGenerated = false;
 	missionOfferAttempts = 0;
@@ -423,6 +424,7 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	missionLairPosition = Vector3();
 	missionLairOid = 0;
 	engagedMissionLairOid = 0;
+	lastLairRetargetMs = 0;
 	currentMissionOfferId = 0;
 	missionOffersGenerated = false;
 	missionOfferAttempts = 0;
@@ -4882,31 +4884,88 @@ void SimHunterController::engageMissionLair() {
 	}
 
 	ManagedReference<SceneObject*> followed = agent->getFollowObject();
-	if (engagedMissionLairOid == missionLairOid && followed != nullptr &&
-			followed->getObjectID() == missionLairOid)
-		return;
+	const bool holdEnabled = SimPlayerManager::instance()->
+		getPveMissionBoardLairEngagementHold();
+	const bool recordMatches = engagedMissionLairOid == missionLairOid;
+	const bool followingLair = followed != nullptr &&
+		followed->getObjectID() == missionLairOid;
 
-	// WHY the held engagement was lost. Measured 2026-09-27: a bot that kills a
-	// lair issues startCombat ONCE (median 1 across 14 wins), while a bot that
-	// dies re-issues it dozens of times (median 31, up to 136) against the same
-	// encounter -- same members spawned, same members killed, MORE damage dealt.
-	// So the deaths are not attrition from a fight being lost on damage; the
-	// combat link keeps breaking and being re-formed while the wave hits the
-	// bot. These three predicates are the only ways the guard above can fail,
-	// and nothing currently records which one did.
+	if (!holdEnabled) {
+		// Gate off: byte-for-byte the previous behaviour, so flipping the gate
+		// is an exact revert rather than an approximate one.
+		if (recordMatches && followingLair)
+			return;
+	} else {
+		// Gate on: the engagement RECORD alone is never trusted. It is a cached
+		// controller field, and the re-point below can itself make the follow
+		// object the lair again -- so validating only in the hold branch would
+		// leave the plain guard above able to match a STALE record forever and
+		// return without ever calling startCombat. That is a bot standing at a
+		// lair, pointing at it, never attacking: the same orphan shape this
+		// chunk exists to remove. Both exits are validated against the real
+		// link, and lair liveness is rechecked under the lock because
+		// destruction is handed off asynchronously.
+		bool linkIntact = false;
+		float holdHamFraction = 1.f;
+		bool repointed = false;
+		const uint64 nowMs = System::getMiliTime();
+		const uint64 retargetIntervalMs = static_cast<uint64>(
+			SimPlayerManager::instance()->
+				getPveMissionBoardLairRetargetIntervalMs());
+		if (recordMatches) {
+			Locker agentLock(agent);
+			const uint8 hamPools[] = {CreatureAttribute::HEALTH,
+				CreatureAttribute::ACTION, CreatureAttribute::MIND};
+			for (uint8 i = 0; i < 3; ++i) {
+				int maxHam = agent->getMaxHAM(hamPools[i]);
+				int ham = agent->getHAM(hamPools[i]);
+				if (maxHam > 0)
+					holdHamFraction = Math::min(holdHamFraction,
+						static_cast<float>(ham) / static_cast<float>(maxHam));
+			}
+			linkIntact = lair->getZone() != nullptr &&
+				agent->isInCombat() && agent->hasDefender(lair);
+			if (linkIntact && !followingLair &&
+					(lastLairRetargetMs == 0 ||
+						nowMs - lastLairRetargetMs >= retargetIntervalMs)) {
+				lastLairRetargetMs = nowMs;
+				// Cheap re-point only. No disengage, no startCombat -- the lair
+				// is still a defender, so this just aims the bot back at it.
+				agent->setTargetObject(lair);
+				repointed = true;
+			}
+		}
+
+		if (linkIntact) {
+			if (repointed)
+				MissionDiagLog::event("LAIR_ATTACK", identityId, "phase=hold"
+					" lairOid=" + String::valueOf(missionLairOid) +
+					" followOid=" + String::valueOf(followed == nullptr ? 0 :
+						followed->getObjectID()) +
+					" hamFraction=" + String::valueOf(holdHamFraction) +
+					" intervalMs=" + String::valueOf(retargetIntervalMs));
+			return;
+		}
+		// Link genuinely lost -- fall through and rebuild it below.
+	}
+
+	// WHY the held engagement was lost, and the state it was lost in. A bot that
+	// kills a lair issues startCombat ONCE; a bot that dies re-issues it dozens
+	// of times against the same encounter. These are the only ways the guards
+	// above can fail, and nothing else records which one did.
 	const uint64 previousEngagedOid = engagedMissionLairOid;
 	const uint64 followedOid = followed == nullptr ? 0 :
 		followed->getObjectID();
 	const char* reengageCause =
 		previousEngagedOid == 0 ? "first" :
 		previousEngagedOid != missionLairOid ? "record_lost" :
-		followed == nullptr ? "follow_null" : "follow_other";
+		followed == nullptr ? "follow_null" :
+		followedOid != missionLairOid ? "follow_other" : "link_lost";
 
 	// Captured BEFORE disengageMissionLair(), which calls clearCombatState(true)
-	// and drops every defender. Snapshotting after it would have reported
-	// inCombat=false and defenders=0 on every single re-engagement regardless of
-	// what actually happened -- a diagnostic that reads as "the bot was out of
-	// combat with no attackers" for the exact failure it exists to explain.
+	// and drops every defender. Snapshotting after it would report
+	// inCombat=false and defenders=0 on every re-engagement regardless of what
+	// actually happened -- describing the failure as the opposite of what it is.
 	float hamFraction = 1.f;
 	bool inCombat = false;
 	int defenders = 0;
@@ -4964,6 +5023,7 @@ void SimHunterController::engageMissionLair() {
 	if (!combatStarted)
 		return;
 	engagedMissionLairOid = missionLairOid;
+	lastLairRetargetMs = 0;
 }
 
 void SimHunterController::disengageMissionLair() {
@@ -4991,6 +5051,7 @@ void SimHunterController::disengageMissionLair() {
 		state = SimPlayerController::IDLE;
 	}
 	engagedMissionLairOid = 0;
+	lastLairRetargetMs = 0;
 }
 
 void SimHunterController::onPveBotMissionLairDestroyed(uint64 lairOid) {

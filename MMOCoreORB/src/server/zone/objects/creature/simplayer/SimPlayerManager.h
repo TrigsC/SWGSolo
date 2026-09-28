@@ -2563,6 +2563,18 @@ private:
 	int pveMissionBoardDifficultyRandomDistance = 0;
 	float pveMissionBoardLairRevealRadiusMeters = 120.f;
 	bool pveMissionBoardLairEngageAfterFieldClear = true;
+	// F_0.9.8 lair-engagement hold. Measured 2026-09-28: 44 of 48 re-engagements
+	// were reengageCause=follow_other -- the engagement record still matched the
+	// lair and the bot was in combat 4.6m away, but its follow object had
+	// drifted to an attacker, so the guard tore the engagement down and rebuilt
+	// it every tick (up to 136 times in one mission). Holding the engagement
+	// instead and re-pointing at the lair on a bounded cadence stops that.
+	// Gated so it can be switched off with a config edit and a restart, with no
+	// rebuild, if it makes lair outcomes worse.
+	// Default OFF per the plan's gating rule: missing or invalid configuration
+	// must not activate new behaviour. Enabled live-only for the measured run.
+	bool pveMissionBoardLairEngagementHold = false;
+	int pveMissionBoardLairRetargetIntervalMs = 5000;
 	int pveMissionBoardMaxOfferAgeSeconds = 1800;
 	// A wilderness point validated at generation frequently goes stale (a
 	// no-build object appears) before the hunter arrives; when true, reveal
@@ -3971,6 +3983,12 @@ public:
 	}
 	bool getPveMissionBoardLairEngageAfterFieldClear() const {
 		return pveMissionBoardLairEngageAfterFieldClear;
+	}
+	bool getPveMissionBoardLairEngagementHold() const {
+		return pveMissionBoardLairEngagementHold;
+	}
+	int getPveMissionBoardLairRetargetIntervalMs() const {
+		return pveMissionBoardLairRetargetIntervalMs;
 	}
 	int getPveMissionBoardMaxOfferAgeSeconds() const {
 		return pveMissionBoardMaxOfferAgeSeconds;

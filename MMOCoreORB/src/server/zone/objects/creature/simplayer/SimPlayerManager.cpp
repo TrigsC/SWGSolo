@@ -9302,6 +9302,13 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		pveMissionBoardLairEngageAfterFieldClear =
 			missionBoardConfig.getBooleanField("lairEngageAfterFieldClear",
 				pveMissionBoardLairEngageAfterFieldClear);
+		pveMissionBoardLairEngagementHold =
+			missionBoardConfig.getBooleanField("lairEngagementHold",
+				pveMissionBoardLairEngagementHold);
+		pveMissionBoardLairRetargetIntervalMs = clampMinerInt(
+			missionBoardConfig.getIntField("lairRetargetIntervalMs",
+				pveMissionBoardLairRetargetIntervalMs),
+			pveMissionBoardLairRetargetIntervalMs, 500, 60000);
 		pveMissionBoardMaxOfferAgeSeconds = clampMinerInt(
 			missionBoardConfig.getIntField("maxOfferAgeSeconds"),
 			pveMissionBoardMaxOfferAgeSeconds, 60, 86400);

@@ -2336,6 +2336,24 @@ SimPlayerManagerConfig = {
             difficultyRandomDistance = 0,
             lairRevealRadiusMeters = 120,
             lairEngageAfterFieldClear = true,
+            -- F_0.9.8 lair-engagement hold. A lair fight constantly pulls the
+            -- bot's follow object onto whatever is hitting it, and the engage
+            -- guard demanded BOTH the engagement record and the follow object,
+            -- so it tore the engagement down and rebuilt it every tick --
+            -- measured up to 136 times in one mission, where a bot that KILLS a
+            -- lair does it once. Each teardown clears combat state and drops
+            -- every defender, throwing away the bot's standing with the wave
+            -- too. Holding the engagement and re-pointing at the lair on a
+            -- bounded cadence stops that.
+            --
+            -- Default OFF, like every other new capability here. Set true
+            -- and restart to enable; set false and restart to revert exactly,
+            -- with no rebuild either way.
+            lairEngagementHold = false,
+            -- How often a held engagement re-points at the lair. Deliberately
+            -- not every tick: that would replace a teardown storm with a
+            -- retarget storm fighting the agent's own combat retargeting.
+            lairRetargetIntervalMs = 5000,
             maxOfferAgeSeconds = 1800,
             -- On reveal, if the advertised wilderness point is no longer
             -- spawn-permitted (a no-build object appeared since the offer was

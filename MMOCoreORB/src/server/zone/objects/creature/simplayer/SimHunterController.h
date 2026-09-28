@@ -91,6 +91,11 @@ private:
 	Vector3 missionLairPosition;
 	uint64 missionLairOid;
 	uint64 engagedMissionLairOid;
+	// Last time the lair was re-pointed while holding an engagement whose follow
+	// object had drifted to an attacker. Bounds the re-point to the configured
+	// cadence so holding does not become a 1Hz retarget storm. Cleared wherever
+	// engagedMissionLairOid is, so a fresh engagement always re-points at once.
+	uint64 lastLairRetargetMs = 0;
 	uint64 currentMissionOfferId;
 	bool missionOffersGenerated;
 	// Bounded offer-generation retries at the terminal: on a partial/empty board
