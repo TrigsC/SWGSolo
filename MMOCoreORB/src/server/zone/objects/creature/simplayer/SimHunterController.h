@@ -96,6 +96,18 @@ private:
 	// cadence so holding does not become a 1Hz retarget storm. Cleared wherever
 	// engagedMissionLairOid is, so a fresh engagement always re-points at once.
 	uint64 lastLairRetargetMs = 0;
+	// Wave-break state, scoped to the lair it describes. waveStateLairOid is
+	// what makes that scoping sound: the other two are discarded whenever the
+	// controller is looking at a different lair, so the state can never be
+	// carried onto a lair that has not advanced a wave of its own.
+	//
+	// lastSeenSpawnNumber tracks the LAIR's wave counter -- not the engagement,
+	// which is why it survives engage and disengage. pendingWaveDisengage holds
+	// a seen advance until the creatures actually materialise, because
+	// spawnNumber moves 1-9s before they arrive.
+	uint64 waveStateLairOid = 0;
+	int lastSeenSpawnNumber = 0;
+	bool pendingWaveDisengage = false;
 	uint64 currentMissionOfferId;
 	bool missionOffersGenerated;
 	// Bounded offer-generation retries at the terminal: on a partial/empty board

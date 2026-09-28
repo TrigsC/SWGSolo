@@ -116,6 +116,8 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 	missionLairOid = 0;
 	engagedMissionLairOid = 0;
 	lastLairRetargetMs = 0;
+	lastSeenSpawnNumber = 0;
+	pendingWaveDisengage = false;
 	currentMissionOfferId = 0;
 	missionOffersGenerated = false;
 	missionOfferAttempts = 0;
@@ -425,6 +427,8 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	missionLairOid = 0;
 	engagedMissionLairOid = 0;
 	lastLairRetargetMs = 0;
+	lastSeenSpawnNumber = 0;
+	pendingWaveDisengage = false;
 	currentMissionOfferId = 0;
 	missionOffersGenerated = false;
 	missionOfferAttempts = 0;
@@ -3880,7 +3884,83 @@ void SimHunterController::runActiveTick() {
 		// unmeasured behaviour introduced while fixing a regression that was
 		// itself caused by unmeasured behaviour. If the death rate proves too
 		// high, that becomes its own change with its own measurement.
+		// SPAWN-TRIGGERED DISENGAGE. Owner game knowledge 2026-09-29: attacking
+		// a lair past a wave threshold makes the whole camp fight you AND heal
+		// the lair, so a player breaks off, clears the wave, and returns. The
+		// bot was doing neither of the two sane things -- before commitment it
+		// flipped to HUNTING on ANY mob in range, every tick, which was the 1Hz
+		// thrash; with commitment it never broke off at all and tanked waves 2
+		// and 3 while they repaired the lair.
+		//
+		// Confirmed in the log, not inferred: lair condition damage RECOVERS
+		// while the bot is committed -- 3840->1965, 2224->353, 3382->2059 --
+		// so the wave was undoing the bot's damage faster than it could deal
+		// it, while the bot sat at 5-6% HAM with three attackers on it.
+		//
+		// The trigger is the spawnNumber TRANSITION, not "a mob is in range".
+		// That is what makes this different from the thrash: it fires once per
+		// wave, on the event the owner described, instead of on every tick.
+		SimPlayerManager* waveManager = SimPlayerManager::instance();
+		PveHuntLair waveLair;
+		int waveSpawnNumber = -1;
+		if (waveManager->getPveHuntLair(strongAgent->getObjectID(), waveLair) &&
+				waveLair.lairOid == missionLairOid &&
+				waveLair.waveObserver != nullptr)
+			waveSpawnNumber = waveLair.waveObserver->getSpawnNumber();
+
+		// The wave state belongs to a SPECIFIC lair, so it carries that lair's
+		// oid and is discarded the moment the controller is looking at a
+		// different one. Resetting at each rebind site instead would have
+		// leaked across lairs: when lair A dies inside the 1-9s pending window,
+		// the completion path binds the second held offer immediately, and a
+		// member appearing at lair B would have triggered a break-off on A's
+		// latch without B ever advancing a wave. Self-scoping cannot miss a
+		// rebind site that gets added later.
+		if (waveStateLairOid != missionLairOid) {
+			waveStateLairOid = missionLairOid;
+			lastSeenSpawnNumber = 0;
+			pendingWaveDisengage = false;
+		}
+
 		const bool committedToLair = engagedMissionLairOid != 0;
+		if (waveSpawnNumber > 0) {
+			if (lastSeenSpawnNumber > 0 &&
+					waveSpawnNumber > lastSeenSpawnNumber)
+				pendingWaveDisengage = true;
+			lastSeenSpawnNumber = waveSpawnNumber;
+		}
+
+		// LATCHED, not consumed on the transition. spawnNumber advances when the
+		// lair DECIDES to spawn, but the creatures arrive on tasks delayed by
+		// 1-9s (LairObserverImplementation), so breaking off the instant the
+		// counter moves would drop combat and hand the bot an empty field --
+		// stranding it in HUNTING with nothing to scan. The latch holds until a
+		// wave member is actually visible; until then the bot keeps hitting the
+		// lair, which is also what a player does while the wave walks in.
+		if (committedToLair && pendingWaveDisengage &&
+				waveManager->getPveMissionBoardWaveDisengageEnabled()) {
+			if (hasMissionWaveMobInRange()) {
+				pendingWaveDisengage = false;
+				// DIAGNOSTIC: waves 2 and 3 were previously invisible --
+				// LAIR_FIELD only emits from the HUNTING branch, so every
+				// sample ever taken read spawnNumber=1.
+				MissionDiagLog::event("LAIR_WAVE", identityId, "event=disengage"
+					" lairOid=" + String::valueOf(missionLairOid) +
+					" spawnNumber=" + String::valueOf(waveSpawnNumber));
+				disengageMissionLair();
+				setPhase(HUNTING);
+				// Hand off through the tick rather than calling scanForTarget
+				// here: the HUNTING branch owns the no-target case, and a direct
+				// call would return without rearming -- the orphan pattern this
+				// chunk has already fixed twice.
+				scheduleActiveTick(100);
+				return;
+			}
+			MissionDiagLog::event("LAIR_WAVE", identityId, "event=pending"
+				" lairOid=" + String::valueOf(missionLairOid) +
+				" spawnNumber=" + String::valueOf(waveSpawnNumber));
+		}
+
 		if (hasMissionWaveMobInRange() && !committedToLair) {
 			disengageMissionLair();
 			setPhase(HUNTING);
@@ -5107,6 +5187,12 @@ void SimHunterController::engageMissionLair() {
 		return;
 	engagedMissionLairOid = missionLairOid;
 	lastLairRetargetMs = 0;
+	// lastSeenSpawnNumber is deliberately NOT reset here. It tracks the
+	// LAIR's wave counter, not this engagement: clearing it on engage or
+	// disengage makes the next sample a fresh baseline, so the very
+	// transition that should trigger a break-off is swallowed. It is
+	// reset LAZILY, on an oid mismatch against
+	// waveStateLairOid, not at any lair-clear site.
 }
 
 void SimHunterController::disengageMissionLair() {
@@ -5135,6 +5221,12 @@ void SimHunterController::disengageMissionLair() {
 	}
 	engagedMissionLairOid = 0;
 	lastLairRetargetMs = 0;
+	// lastSeenSpawnNumber is deliberately NOT reset here. It tracks the
+	// LAIR's wave counter, not this engagement: clearing it on engage or
+	// disengage makes the next sample a fresh baseline, so the very
+	// transition that should trigger a break-off is swallowed. It is
+	// reset LAZILY, on an oid mismatch against
+	// waveStateLairOid, not at any lair-clear site.
 }
 
 void SimHunterController::onPveBotMissionLairDestroyed(uint64 lairOid) {

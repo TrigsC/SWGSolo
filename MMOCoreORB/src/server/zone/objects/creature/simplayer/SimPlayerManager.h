@@ -2574,6 +2574,14 @@ private:
 	// Default OFF per the plan's gating rule: missing or invalid configuration
 	// must not activate new behaviour. Enabled live-only for the measured run.
 	bool pveMissionBoardLairEngagementHold = false;
+	// F_0.9.8 wave disengage. Owner game knowledge: attacking a lair past a wave
+	// threshold pulls the whole camp onto you AND they heal the lair, so a
+	// player breaks off, clears the wave and returns. Confirmed in the log --
+	// lair condition damage recovers while the bot is committed. Default off
+	// like every other capability here; the trigger is the spawnNumber
+	// transition, never mere proximity, which is what separates it from the
+	// per-tick thrash this replaces.
+	bool pveMissionBoardWaveDisengage = false;
 	int pveMissionBoardLairRetargetIntervalMs = 5000;
 	int pveMissionBoardMaxOfferAgeSeconds = 1800;
 	// A wilderness point validated at generation frequently goes stale (a
@@ -3986,6 +3994,9 @@ public:
 	}
 	bool getPveMissionBoardLairEngagementHold() const {
 		return pveMissionBoardLairEngagementHold;
+	}
+	bool getPveMissionBoardWaveDisengageEnabled() const {
+		return pveMissionBoardWaveDisengage;
 	}
 	int getPveMissionBoardLairRetargetIntervalMs() const {
 		return pveMissionBoardLairRetargetIntervalMs;

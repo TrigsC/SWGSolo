@@ -2354,6 +2354,18 @@ SimPlayerManagerConfig = {
             -- not every tick: that would replace a teardown storm with a
             -- retarget storm fighting the agent's own combat retargeting.
             lairRetargetIntervalMs = 5000,
+            -- Break off the lair when a NEW WAVE spawns, clear it, then return.
+            -- Attacking a lair past a wave threshold pulls the whole camp onto
+            -- the attacker and they heal the lair -- observed in the log as
+            -- condition damage RECOVERING (3840->1965, 2224->353) while the bot
+            -- sat at 5-6% HAM with three attackers on it. The waves are also
+            -- where the XP is: a winning mission currently kills only ~4.5 of
+            -- ~12.6 spawned creatures.
+            --
+            -- Triggered by the spawnNumber TRANSITION, not by a mob being
+            -- nearby; the latter fired every tick and was the thrash this
+            -- replaces. Default off; set true and restart to enable.
+            waveDisengage = false,
             maxOfferAgeSeconds = 1800,
             -- On reveal, if the advertised wilderness point is no longer
             -- spawn-permitted (a no-build object appeared since the offer was
