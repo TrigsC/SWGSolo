@@ -4962,6 +4962,71 @@ void SimHunterController::engageMissionLair() {
 		followed == nullptr ? "follow_null" :
 		followedOid != missionLairOid ? "follow_other" : "link_lost";
 
+	// WHAT the bot was doing with the creature it drifted onto. follow_other is
+	// ambiguous on its own: it looks identical whether the agent was yanked away
+	// by combat retargeting or was legitimately CHASING a wounded creature to
+	// finish the kill. Those want opposite fixes -- the first wants the
+	// engagement held, the second must not be interrupted at all, because the
+	// objective is to kill every wave creature AND the lair for the XP, not to
+	// reach the lair quickly. Owner correction 2026-09-29.
+	//
+	// So the follow target's own state is recorded: a low health fraction with
+	// the bot as its attacker means chasing a nearly-dead creature; full health
+	// on a fresh mob means retargeting. Bot skill tier and weapon go with it
+	// because damage output is not uniform across the roster -- a 4xxx brawler
+	// and a novice need different numbers of swings for the same creature, and
+	// every per-mission figure so far has pooled the six bots and hidden that.
+	float followHealthFraction = -1.f;
+	int followLevel = -1;
+	bool followIsLairMember = false;
+	bool followCreatureTargetsBot = false;
+	bool followBotTargetsCreature = false;
+	String botWeaponName("none");
+	float followDistance = -1.f;
+	String followName("none");
+	if (followed != nullptr) {
+		CreatureObject* followCreature = followed->asCreatureObject();
+		if (followCreature != nullptr) {
+			Locker followLock(followCreature);
+			// MIN across all three primary pools, not HEALTH alone: a creature
+			// can be driven to incapacitation through ACTION or MIND, so a
+			// health-only reading would call a nearly-dead creature healthy and
+			// invert the chasing-versus-retargeting diagnosis this exists for.
+			const uint8 followPools[] = {CreatureAttribute::HEALTH,
+				CreatureAttribute::ACTION, CreatureAttribute::MIND};
+			for (uint8 i = 0; i < 3; ++i) {
+				int maxPool = followCreature->getMaxHAM(followPools[i]);
+				if (maxPool <= 0)
+					continue;
+				float fraction = static_cast<float>(
+					followCreature->getHAM(followPools[i])) /
+					static_cast<float>(maxPool);
+				if (followHealthFraction < 0.f || fraction < followHealthFraction)
+					followHealthFraction = fraction;
+			}
+			followLevel = followCreature->getLevel();
+			followName = followCreature->getCreatureName().toString();
+			// This is the CREATURE's view: it has the bot as a defender, i.e.
+			// the creature is fighting the bot. It does NOT mean the bot has
+			// damaged it, which is the other direction and is read below under
+			// the agent lock. Logging only this one would support the opposite
+			// diagnosis just as well.
+			followCreatureTargetsBot = followCreature->hasDefender(agent);
+			AiAgent* followAgent = followCreature->asAiAgent();
+			if (followAgent != nullptr) {
+				ManagedReference<SceneObject*> home =
+					followAgent->getHomeObject().get();
+				followIsLairMember = home != nullptr &&
+					home->getObjectID() == missionLairOid;
+			}
+		}
+		followDistance = agent->getWorldPosition().distanceTo(
+			followed->getWorldPosition());
+	}
+	int botSkillTier = 0;
+	SimPlayerManager::instance()->isPlayerBotProgressionIdentity(
+		identityId, botSkillTier);
+
 	// Captured BEFORE disengageMissionLair(), which calls clearCombatState(true)
 	// and drops every defender. Snapshotting after it would report
 	// inCombat=false and defenders=0 on every re-engagement regardless of what
@@ -4987,6 +5052,15 @@ void SimHunterController::engageMissionLair() {
 			agent->getDefenderList();
 		if (defenderList != nullptr)
 			defenders = defenderList->size();
+		// The BOT's view of the same pair, read here rather than inside the
+		// creature lock above so the agent lock is never taken while holding a
+		// creature lock. Together the two directions separate "chasing
+		// something I am killing" from "something grabbed my attention".
+		if (followed != nullptr)
+			followBotTargetsCreature = agent->hasDefender(followed);
+		WeaponObject* botWeapon = agent->getWeapon();
+		if (botWeapon != nullptr)
+			botWeaponName = botWeapon->getDisplayedName();
 	}
 
 	disengageMissionLair();
@@ -5019,7 +5093,16 @@ void SimHunterController::engageMissionLair() {
 		" followOid=" + String::valueOf(followedOid) +
 		" hamFraction=" + String::valueOf(hamFraction) +
 		" inCombat=" + String::valueOf(inCombat) +
-		" defenders=" + String::valueOf(defenders));
+		" defenders=" + String::valueOf(defenders) +
+		" botTier=" + String::valueOf(botSkillTier) +
+		" followName=" + followName +
+		" followLevel=" + String::valueOf(followLevel) +
+		" followHealth=" + String::valueOf(followHealthFraction) +
+		" followDist=" + String::valueOf(followDistance) +
+		" followIsMember=" + String::valueOf(followIsLairMember) +
+		" creatureTargetsBot=" + String::valueOf(followCreatureTargetsBot) +
+		" botTargetsCreature=" + String::valueOf(followBotTargetsCreature) +
+		" botWeapon=" + botWeaponName);
 	if (!combatStarted)
 		return;
 	engagedMissionLairOid = missionLairOid;
