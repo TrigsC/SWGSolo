@@ -9308,6 +9308,9 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		pveMissionBoardWaveDisengage =
 			missionBoardConfig.getBooleanField("waveDisengage",
 				pveMissionBoardWaveDisengage);
+		pveMissionBoardWaveDeaggro =
+			missionBoardConfig.getBooleanField("waveDeaggro",
+				pveMissionBoardWaveDeaggro);
 		pveMissionBoardLairRetargetIntervalMs = clampMinerInt(
 			missionBoardConfig.getIntField("lairRetargetIntervalMs",
 				pveMissionBoardLairRetargetIntervalMs),

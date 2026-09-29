@@ -2582,6 +2582,13 @@ private:
 	// transition, never mere proximity, which is what separates it from the
 	// per-tick thrash this replaces.
 	bool pveMissionBoardWaveDisengage = false;
+	// F_0.9.8 wave de-aggro, owner-approved 2026-09-29. Sheds the previous
+	// wave's hold on the bot at a wave transition so it faces one wave at a time
+	// instead of an accumulating stack -- deaths cluster where lairMembersAlive
+	// reaches 5-6, and the bot dies ABOVE its retreat threshold, so this is a
+	// burst-exposure problem rather than an attrition one. Scoped to mission
+	// lairs, that lair's own members, and solo bots only.
+	bool pveMissionBoardWaveDeaggro = false;
 	int pveMissionBoardLairRetargetIntervalMs = 5000;
 	int pveMissionBoardMaxOfferAgeSeconds = 1800;
 	// A wilderness point validated at generation frequently goes stale (a
@@ -3997,6 +4004,9 @@ public:
 	}
 	bool getPveMissionBoardWaveDisengageEnabled() const {
 		return pveMissionBoardWaveDisengage;
+	}
+	bool getPveMissionBoardWaveDeaggroEnabled() const {
+		return pveMissionBoardWaveDeaggro;
 	}
 	int getPveMissionBoardLairRetargetIntervalMs() const {
 		return pveMissionBoardLairRetargetIntervalMs;

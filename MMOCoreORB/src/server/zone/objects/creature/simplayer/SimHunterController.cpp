@@ -3920,13 +3920,23 @@ void SimHunterController::runActiveTick() {
 			waveStateLairOid = missionLairOid;
 			lastSeenSpawnNumber = 0;
 			pendingWaveDisengage = false;
+			waveTransitionSeenAtMs = 0;
+			waveDeaggroCount = 0;
+			waveDeaggroDueAtMs = 0;
 		}
 
 		const bool committedToLair = engagedMissionLairOid != 0;
 		if (waveSpawnNumber > 0) {
 			if (lastSeenSpawnNumber > 0 &&
-					waveSpawnNumber > lastSeenSpawnNumber)
+					waveSpawnNumber > lastSeenSpawnNumber) {
 				pendingWaveDisengage = true;
+				// Anchored at the TRANSITION, not at first visibility. The
+				// LairAggroTask that re-aggros the wave is scheduled from the
+				// transition, so anchoring the scrub anywhere later leaves the
+				// re-aggroed wave hitting the bot for the difference -- which is
+				// precisely the burst window this feature exists to close.
+				waveTransitionSeenAtMs = nowMs;
+			}
 			lastSeenSpawnNumber = waveSpawnNumber;
 		}
 
@@ -3948,6 +3958,21 @@ void SimHunterController::runActiveTick() {
 					" lairOid=" + String::valueOf(missionLairOid) +
 					" spawnNumber=" + String::valueOf(waveSpawnNumber));
 				disengageMissionLair();
+				// The shed is DEFERRED, not run here. LairObserver schedules
+				// LairAggroTask AGGRO_TASK_DELAY (4s) after the transition, and
+				// wave mobs become visible from about 1s -- so a shed fired the
+				// moment a mob appears is undone three seconds later when that
+				// task re-aggros the whole wave, having spent one of the two
+				// allowed events on nothing. Breaking off still happens now;
+				// only the scrub waits until after the aggro task has run.
+				//
+				// Due time is measured from the TRANSITION, so an early-visible
+				// mob does not push the scrub past the re-aggro and leave the
+				// bot taking that wave for the difference. If visibility arrives
+				// after the deadline has already passed, the next tick sheds
+				// immediately, which is correct -- the aggro task has run.
+				waveDeaggroDueAtMs = (waveTransitionSeenAtMs != 0 ?
+					waveTransitionSeenAtMs : nowMs) + kWaveDeaggroDelayMs;
 				setPhase(HUNTING);
 				// Hand off through the tick rather than calling scanForTarget
 				// here: the HUNTING branch owns the no-target case, and a direct
@@ -4014,6 +4039,15 @@ void SimHunterController::runActiveTick() {
 			beginMissionCleanup(true, "lair_unavailable");
 			return;
 		}
+	}
+
+	// Deferred wave de-aggro: fires on the first tick at or after the due time,
+	// which is set when a wave transition breaks the bot off the lair. Checked
+	// before the phase branches because the break-off moves the controller to
+	// HUNTING, so an ENGAGING_LAIR-scoped check would never run.
+	if (waveDeaggroDueAtMs != 0 && nowMs >= waveDeaggroDueAtMs) {
+		waveDeaggroDueAtMs = 0;
+		shedWaveAggro(strongAgent, lastSeenSpawnNumber);
 	}
 
 	if (huntStartedAtMs != 0 && nowMs - huntStartedAtMs >=
@@ -5193,6 +5227,82 @@ void SimHunterController::engageMissionLair() {
 	// transition that should trigger a break-off is swallowed. It is
 	// reset LAZILY, on an oid mismatch against
 	// waveStateLairOid, not at any lair-clear site.
+}
+
+// Shed the aggro the previous wave holds on this bot, at a wave transition.
+//
+// Owner-approved scope 2026-09-29, four conditions, ALL required:
+//   1. a mission lair fight only -- never a market hunt, so krayts and other
+//      wilderness creatures are never touched;
+//   2. members of THIS lair only -- lairObserverSnapshot is keyed by the lair
+//      oid, so membership is structural rather than a predicate that could
+//      drift;
+//   3. solo only -- never while grouped with a player;
+//   4. gated, default off.
+//
+// Hard-capped at kMaxWaveDeaggroPerLair, which is 2 because the lair itself
+// cannot produce more transitions: LairObserverImplementation::checkForNewSpawns
+// increments at reveal, again on the FIRST point of damage, again past half
+// condition, then `default: return false`. Three waves, two transitions after
+// the initial spawn. The cap is deliberately a constant, not a tunable -- it is
+// a property of the upstream observer, not a preference.
+//
+// This removes the bot from each creature's defender list, which is the half
+// that persists: disengageMissionLair already called clearCombatState and so
+// cleared the BOT's list, but the creatures keep holding the bot and keep
+// attacking. Nothing is despawned, pacified or damaged, and a creature re-aggros
+// normally the moment the bot attacks it again -- this resets the current stack,
+// it does not confer immunity.
+void SimHunterController::shedWaveAggro(AiAgent* strongAgent, int spawnNumber) {
+	if (strongAgent == nullptr || !missionHuntOrder || missionLairOid == 0)
+		return;
+
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (!manager->getPveMissionBoardWaveDeaggroEnabled())
+		return;
+	if (waveDeaggroCount >= kMaxWaveDeaggroPerLair)
+		return;
+
+	bool solo = false;
+	{
+		Locker agentLock(strongAgent);
+		solo = strongAgent->getGroup() == nullptr;
+	}
+	if (!solo)
+		return;
+
+	Vector<ManagedReference<CreatureObject*> > members =
+		manager->lairObserverSnapshot(strongAgent->getObjectID(),
+			missionLairOid);
+
+	int shed = 0;
+	for (int i = 0; i < members.size(); ++i) {
+		ManagedReference<CreatureObject*> member = members.get(i);
+		if (member == nullptr || member == strongAgent)
+			continue;
+		// Locks taken and released per creature, never held across the loop:
+		// the house idiom for a bilateral defender edit is the agent lock with
+		// the other party cross-locked against it (:5314).
+		Locker agentLock(strongAgent);
+		Locker memberLock(member, strongAgent);
+		if (!member->hasDefender(strongAgent))
+			continue;
+		member->removeDefender(strongAgent);
+		strongAgent->removeDefender(member);
+		++shed;
+	}
+
+	// The cap is spent only when something was actually shed. Consuming it on a
+	// no-op would burn one of the two allowed events against an empty defender
+	// list and leave the real stack in place.
+	if (shed > 0)
+		++waveDeaggroCount;
+	MissionDiagLog::event("LAIR_WAVE", identityId, "event=deaggro"
+		" lairOid=" + String::valueOf(missionLairOid) +
+		" spawnNumber=" + String::valueOf(spawnNumber) +
+		" shed=" + String::valueOf(shed) +
+		" members=" + String::valueOf(members.size()) +
+		" deaggroCount=" + String::valueOf(waveDeaggroCount));
 }
 
 void SimHunterController::disengageMissionLair() {

@@ -2366,6 +2366,19 @@ SimPlayerManagerConfig = {
             -- nearby; the latter fired every tick and was the thrash this
             -- replaces. Default off; set true and restart to enable.
             waveDisengage = false,
+            -- Shed the previous wave's aggro at each wave transition, so the
+            -- bot faces one wave at a time instead of an accumulating stack.
+            -- Deaths cluster where 5-6 lair members are on the bot, and the bot
+            -- dies ABOVE its 30% retreat threshold -- it is burst damage inside
+            -- the 2s tick, not attrition, so a lower threshold would not help.
+            --
+            -- Owner-scoped: mission lairs only (never krayts or other
+            -- wilderness creatures), that lair's own members only, solo bots
+            -- only (never while grouped with a player). Hard-capped at 2 per
+            -- lair in code, because the lair cannot produce more than two wave
+            -- transitions: waves fire at reveal, at the FIRST point of damage,
+            -- and past half condition, then stop.
+            waveDeaggro = false,
             maxOfferAgeSeconds = 1800,
             -- On reveal, if the advertised wilderness point is no longer
             -- spawn-permitted (a no-build object appeared since the offer was

@@ -108,6 +108,21 @@ private:
 	uint64 waveStateLairOid = 0;
 	int lastSeenSpawnNumber = 0;
 	bool pendingWaveDisengage = false;
+	// De-aggro events already spent on this lair. Capped by
+	// kMaxWaveDeaggroPerLair, a constant because the lair cannot produce more
+	// than two wave transitions (see shedWaveAggro).
+	int waveDeaggroCount = 0;
+	static const int kMaxWaveDeaggroPerLair = 2;
+	// When the deferred shed becomes due, or 0 when none is pending. The delay
+	// must exceed LairObserver::AGGRO_TASK_DELAY (4s) or the scrub races that
+	// task and is undone by it; 5s is that plus a one-second margin.
+	// When the wave transition was OBSERVED. The de-aggro deadline is measured
+	// from here, not from first visibility, because LairAggroTask is scheduled
+	// from the transition -- anchoring later leaves the re-aggroed wave on the
+	// bot for the difference.
+	uint64 waveTransitionSeenAtMs = 0;
+	uint64 waveDeaggroDueAtMs = 0;
+	static const uint64 kWaveDeaggroDelayMs = 5000;
 	uint64 currentMissionOfferId;
 	bool missionOffersGenerated;
 	// Bounded offer-generation retries at the terminal: on a partial/empty board
@@ -268,6 +283,9 @@ private:
 	// call site can re-arm the heartbeat on every exit. Pure extraction: the
 	// body is unchanged and no buffing behaviour is altered.
 	void runBuffUpTick(AiAgent* strongAgent, uint64 nowMs);
+	// Sheds the previous wave's aggro at a wave transition. Owner-scoped:
+	// mission lairs only, members of that lair only, solo only, gated.
+	void shedWaveAggro(AiAgent* strongAgent, int spawnNumber);
 	void setPhase(HuntPhase next);
 	void beginBuffUp();
 	void computeBuffNeeds(bool& needDoctor, bool& needEntertainer) const;
