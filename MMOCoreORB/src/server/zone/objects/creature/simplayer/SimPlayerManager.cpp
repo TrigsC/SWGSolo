@@ -11,6 +11,7 @@
 #include "SimBotAbilityTiers.h"
 #include "SimBotMissionGraduation.h"
 #include "SimPveRelocationDeadline.h"
+#include "SimBotTrainingOrder.h"
 #include "StructureTraversalDiagLog.h"
 
 #include <cmath>
@@ -7717,6 +7718,20 @@ void SimPlayerManager::buildTrainingPlansFromConfig(LuaObject& config) {
 				"weaponTemplate").trim();
 			plan.weaponType = planTable.getStringField("weaponType").trim()
 				.toLowerCase();
+			// Owner rule 2026-09-30: both fields are opt-in per plan, so a plan
+			// that declares neither is ordered and trained exactly as before.
+			LuaObject linePriority = planTable.getObjectField("linePriority");
+			if (linePriority.isValidTable()) {
+				for (int lineIndex = 1;
+						lineIndex <= linePriority.getTableSize(); ++lineIndex) {
+					String line = linePriority.getStringAt(lineIndex).trim();
+					if (!line.isEmpty() && !plan.linePriority.contains(line))
+						plan.linePriority.add(line);
+				}
+			}
+			linePriority.pop();
+			plan.parallelXpStreams =
+				planTable.getBooleanField("parallelXpStreams");
 			if (plan.name.isEmpty())
 				plan.name = "training_plan_" + String::valueOf(i);
 			if (plan.goalSkills.size() == 0)
@@ -7802,9 +7817,22 @@ void SimPlayerManager::buildTrainingPlansFromConfig(LuaObject& config) {
 					}
 					if (!ready)
 						continue;
-					if (bestIndex < 0 ||
-							playerBotTrainingSkillComesBefore(candidate,
-								closure.get(bestIndex)))
+					if (bestIndex < 0) {
+						bestIndex = closureIndex;
+						continue;
+					}
+					// Declared line priority wins over cost among READY boxes
+					// only; prerequisites still decide what is ready, so novice
+					// stays first and master last whatever the priority says.
+					const int candidateRank = SimBotTrainingOrder::lineRank(
+						candidate, plan.linePriority);
+					const int bestRank = SimBotTrainingOrder::lineRank(
+						closure.get(bestIndex), plan.linePriority);
+					if (candidateRank != bestRank) {
+						if (candidateRank < bestRank)
+							bestIndex = closureIndex;
+					} else if (playerBotTrainingSkillComesBefore(candidate,
+							closure.get(bestIndex)))
 						bestIndex = closureIndex;
 				}
 				if (bestIndex < 0 && plan.loadError.isEmpty())
@@ -7857,6 +7885,15 @@ void SimPlayerManager::buildTrainingPlansFromConfig(LuaObject& config) {
 			"|";
 		for (int j = 0; j < plan.orderedSkills.size(); ++j)
 			signature += plan.orderedSkills.get(j) + ",";
+		// Both F_0.9.8 training options belong in the signature. linePriority
+		// usually shows up indirectly through orderedSkills, but
+		// parallelXpStreams changes SELECTION without changing the order at
+		// all, so toggling it alone produced an identical signature, hit the
+		// early return above and left the previous value in force forever.
+		signature += "|parallel=" + String(plan.parallelXpStreams ? "1" : "0") +
+			"|priority=";
+		for (int j = 0; j < plan.linePriority.size(); ++j)
+			signature += plan.linePriority.get(j) + ",";
 		signature += ";";
 	}
 
@@ -7890,6 +7927,101 @@ bool SimPlayerManager::computePlayerBotNextTrainingStepLocked(uint64 identityId,
 	SkillManager* skillManager = SkillManager::instance();
 	if (skillManager == nullptr)
 		return false;
+
+	// The lifetime-earned threshold for one box: its own cost plus every
+	// already-trained box funded by the same XP type, because XP is spent
+	// cumulatively. This MIRRORS the inline computation in the serial walk
+	// below, which is deliberately left untouched so that a plan without
+	// parallelXpStreams behaves exactly as before; the two must be kept in
+	// step if the formula ever changes.
+	auto thresholdFor = [&](Skill* box) -> int64 {
+		int64 threshold = box->getXpCost();
+		for (int trainedIndex = 0; trainedIndex < progression.skills.size();
+				++trainedIndex) {
+			Skill* trainedSkill = skillManager->getSkill(
+				progression.skills.get(trainedIndex));
+			if (trainedSkill != nullptr && trainedSkill->getXpType() ==
+					box->getXpType())
+				threshold += trainedSkill->getXpCost();
+		}
+		return threshold;
+	};
+	auto fillStep = [&](const String& skillName, Skill* box, int64 threshold) {
+		step.planName = planName;
+		step.skillName = skillName;
+		step.xpType = box->getXpType();
+		step.lifetimeEarnedThreshold = threshold <= 0 ? 0 :
+			threshold > 2147483647 ? 2147483647 : static_cast<int>(threshold);
+		step.valid = true;
+	};
+
+	if (plan.parallelXpStreams) {
+		// PARALLEL XP STREAMS (owner rule 2026-09-30). The serial trainer below
+		// waits on the first untrained box, so a box on a scarce XP type blocks
+		// every box behind it on an abundant one. Observed: Teras Kasi
+		// cheapest-first put combat_unarmed_support_01 (60k combat_general)
+		// ahead of the unarmed lines, and bots holding 370k unused unarmed XP
+		// stalled behind it with 36k of the 60k combat_general it needed.
+		//
+		// Each XP type advances as its own stream, in strict priority order
+		// within that stream; only the head of each stream is eligible, and the
+		// first affordable head is pursued (see pickParallelStep for why
+		// heads-only is what preserves the owner's line order). Prerequisites
+		// are checked explicitly because, unlike the serial walk, this can move
+		// past an earlier box -- and the buy path re-checks them regardless.
+		Vector<String> candidateNames;
+		Vector<int64> candidateThresholds;
+		std::vector<SimBotTrainingOrder::TrainingCandidate> candidates;
+		const int spentPoints = derivedPlayerBotSkillPoints(progression);
+		for (int i = 0; i < plan.orderedSkills.size(); ++i) {
+			const String& skillName = plan.orderedSkills.get(i);
+			if (progression.skills.contains(skillName))
+				continue;
+			Skill* box = skillManager->getSkill(skillName);
+			if (box == nullptr)
+				return false;
+			if (earlyGameGateEnabled && progressionEarlyGameConfig
+					.deferredXpTypes.contains(box->getXpType()))
+				continue;
+
+			bool prerequisitesMet = true;
+			const Vector<String>* requiredSkills = box->getSkillsRequired();
+			for (int requiredIndex = 0; requiredSkills != nullptr &&
+					requiredIndex < requiredSkills->size(); ++requiredIndex) {
+				if (!progression.skills.contains(
+						requiredSkills->get(requiredIndex))) {
+					prerequisitesMet = false;
+					break;
+				}
+			}
+
+			const int64 threshold = thresholdFor(box);
+			const int64 earned = progression.experience.contains(
+				box->getXpType()) ? progression.experience.get(box->getXpType()) : 0;
+			const bool pointsAvailable =
+				spentPoints <= 250 - box->getSkillPointsRequired();
+
+			SimBotTrainingOrder::TrainingCandidate candidate;
+			candidate.xpType = box->getXpType();
+			candidate.frontier = prerequisitesMet;
+			candidate.affordable = prerequisitesMet && pointsAvailable &&
+				earned >= threshold;
+			candidateNames.add(skillName);
+			candidateThresholds.add(threshold);
+			candidates.push_back(candidate);
+		}
+
+		const int pick = SimBotTrainingOrder::pickParallelStep(candidates);
+		if (pick < 0)
+			return false;
+		Skill* chosen = skillManager->getSkill(candidateNames.get(pick));
+		if (chosen == nullptr)
+			return false;
+		fillStep(candidateNames.get(pick), chosen,
+			candidateThresholds.get(pick));
+		return true;
+	}
+
 	for (int i = 0; i < plan.orderedSkills.size(); ++i) {
 		const String& skillName = plan.orderedSkills.get(i);
 		if (progression.skills.contains(skillName))

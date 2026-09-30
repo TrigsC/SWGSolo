@@ -183,7 +183,12 @@ no new warnings before handing work back** (owner-stated standard).
   `trainingSweepBatch` and the `trainingPlans` list (each entry a `name`,
   legacy scalar `goalSkill`, `profession`, `weaponTemplate` and a validated
   `weaponType`). F_0.9.6 extends entries with a `goalSkills` list while
-  retaining the scalar for compatibility, and adds the default-off
+  retaining the scalar for compatibility; F_0.9.8 adds two opt-in entry fields,
+  `linePriority` (line prefixes consulted before cost when ordering ready boxes)
+  and `parallelXpStreams` (each XP type advances as its own stream, strict
+  priority within a stream, first affordable stream head pursued), both absent
+  by default so an entry that declares neither trains exactly as before; and it
+  adds the default-off
   `playerBotProgression.earlyGameEnabled` gate with its nested `earlyGame`
   block: the `realWeaponDamage` sub-gate and XP-type loadout map, grind anchors
   (`grindAnchorMin/MaxMeters`, `anchorArriveMeters`, `anchorMaxAttempts`),

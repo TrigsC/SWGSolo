@@ -156,6 +156,14 @@ struct SimBotTrainingPlan {
 	String loadError;
 	Vector<String> orderedSkills;
 	int totalPoints = 0;
+	// Line prefixes in the order the plan should work them, e.g. Teras Kasi
+	// Speed -> Balance -> Meditation. Consulted BEFORE cost when ordering ready
+	// boxes; empty keeps the original cheapest-first order exactly.
+	Vector<String> linePriority;
+	// When true, each XP type advances independently: the trainer pursues the
+	// first AFFORDABLE box whose prerequisites are met, instead of waiting on
+	// the first untrained box in order. Off keeps the original serial trainer.
+	bool parallelXpStreams = false;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
