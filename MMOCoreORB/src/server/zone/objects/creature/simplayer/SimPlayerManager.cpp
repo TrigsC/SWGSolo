@@ -21295,6 +21295,7 @@ void SimPlayerManager::runPveProgressionDispatchPass(uint64 nowMs,
 					option.rank.lairTemplate = lair.lairTemplate;
 					option.rank.planet = planet;
 					option.rank.minDifficulty = lair.minDifficulty;
+					option.rank.isPack = lair.hasPackMobile;
 					option.rank.samePlanet = planet == currentPlanet;
 					uint64 largestAmount = 0;
 					for (int familyIndex = 0; familyIndex < 3; ++familyIndex) {
@@ -21379,6 +21380,19 @@ void SimPlayerManager::runPveProgressionDispatchPass(uint64 nowMs,
 		// keeps the pass bounded without letting four remote refusals strand a
 		// bot that has a fightable lair where it stands.
 		static const int MAX_REMOTE_REFUSALS = 2;
+		// Non-pack before pack must survive the retries: if ANY non-pack lair
+		// is in the window, pack lairs are out for this whole pass, so refused
+		// remote relocations can never leave a same-planet pack lair as the
+		// pick. If every non-pack lair is unreachable the bot grinds below.
+		std::vector<bool> candidateIsPack;
+		for (size_t i = 0; i < options.size(); ++i)
+			candidateIsPack.push_back(options[i].rank.isPack);
+		if (!SimBotDispatchPolicy::packLairsEligible(candidateIsPack)) {
+			for (size_t i = 0; i < options.size(); ++i) {
+				if (options[i].rank.isPack)
+					options[i].tried = true;
+			}
+		}
 		const ProgressionOption* chosen = nullptr;
 		bool assigned = false;
 		int remoteRefusals = 0;
@@ -21515,6 +21529,7 @@ void SimPlayerManager::runPveProgressionDispatchPass(uint64 nowMs,
 			" grindTier=" + String::valueOf(grindTier) +
 			" grindXpType=" + grindXpType +
 			" avoidPacks=" + String::valueOf(avoidPacks) +
+			" packLair=" + String::valueOf(chosen->rank.isPack) +
 			" packLairsSkipped=" + String::valueOf(packLairsSkipped) +
 			" demandMatched=" + String::valueOf(chosen->demandMatched) +
 			" family=" + chosen->family +

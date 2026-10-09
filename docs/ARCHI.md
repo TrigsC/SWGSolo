@@ -530,7 +530,7 @@ This is this fork's primary custom subsystem, layered on top of the stock
   (`SimBotDispatchPolicy::isLairFightable` = combat's pack rule, the yield index's
   `hasPackMobile`; dispatch assumes solo) within the window of the **grind tier**
   (`getPlayerBotGrindTier`: combat-difficulty tier of the weapon in hand, not
-  combat level), ranked XP fit → demand → same planet. The order pins the lair
+  combat level), ranked non-pack before pack → XP fit → demand → same planet. The order pins the lair
   (`pinnedLairTemplate`, `dispatchLevel`, `avoidPacks`) and
   `selectPveBotMissionLairSpawn` honours the pin. With nothing fightable the bot
   grinds for `grindFallbackMinutes` (`progressionGrindFallbackUntilMs`, read by

@@ -24,6 +24,7 @@
 #define SIMBOTDISPATCHPOLICY_H_
 
 #include <cstring>
+#include <vector>
 
 #include "engine/engine.h"
 
@@ -40,6 +41,9 @@ struct ProgressionCandidate {
 	String lairTemplate;
 	String planet;
 	int minDifficulty = 1;
+	// Any weighted mobile is PACK. Only an elite (or grouped) bot ever sees
+	// one; a pack-avoiding bot has them filtered out before ranking.
+	bool isPack = false;
 	// pressure * yield / time for a live demand signal this lair can serve, or
 	// 0 when it serves none -- the bot still goes, for the XP.
 	float demandScore = 0.f;
@@ -48,6 +52,11 @@ struct ProgressionCandidate {
 
 // True when `a` should be dispatched ahead of `b` for a bot grinding at
 // `grindTier`. Order, owner-ranked:
+//   0. Non-pack before pack (owner, 2026-10-09). An elite bot MAY take a pack
+//      lair, but only when no non-pack lair is in its window: Nordihi, two
+//      elite boxes, went 1 kill of 21 and 5 deaths against level-12 pack
+//      camps while level-10 HERD lairs sat unused. PACK is what makes nearby
+//      same-group creatures join the fight (notifyPackMobs); HERD does not.
 //   1. XP fit. Every lair whose minDifficulty <= grindTier beats every lair
 //      above it. Among the at-or-below lairs the HARDEST wins (most XP the bot
 //      can safely take); among the above lairs the EASIEST wins. The caller's
@@ -58,6 +67,8 @@ struct ProgressionCandidate {
 //      deterministic.
 inline bool progressionCandidateBefore(const ProgressionCandidate& a,
 		const ProgressionCandidate& b, int grindTier) {
+	if (a.isPack != b.isPack)
+		return !a.isPack;
 	const bool aAtOrBelow = a.minDifficulty <= grindTier;
 	const bool bAtOrBelow = b.minDifficulty <= grindTier;
 	if (aAtOrBelow != bAtOrBelow)
@@ -76,6 +87,18 @@ inline bool progressionCandidateBefore(const ProgressionCandidate& a,
 	if (nameOrder != 0)
 		return nameOrder < 0;
 	return strcmp(a.planet.toCharArray(), b.planet.toCharArray()) < 0;
+}
+
+// Whether pack lairs may be picked at all in this pass: only when every
+// candidate is a pack lair. Applied BEFORE relocation retries, so a refused
+// remote non-pack lair can never leave a same-planet pack lair as the pick --
+// the bot grinds instead (no_reachable_lair).
+inline bool packLairsEligible(const std::vector<bool>& candidateIsPack) {
+	for (size_t i = 0; i < candidateIsPack.size(); ++i) {
+		if (!candidateIsPack[i])
+			return false;
+	}
+	return true;
 }
 
 // Whether a template is complete, from the XP type of every UNTRAINED box in

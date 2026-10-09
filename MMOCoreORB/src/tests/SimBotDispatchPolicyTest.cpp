@@ -91,6 +91,38 @@ TEST(SimBotDispatchPolicyTest, FullTieIsDeterministic) {
 	EXPECT_FALSE(SimBotDispatchPolicy::progressionCandidateBefore(a, a, 6));
 }
 
+TEST(SimBotDispatchPolicyTest, NonPackLairBeatsPackLairForAnEliteBot) {
+	// Nordihi, tier 10: the level-10 HERD eopie lair (8-12) must win over the
+	// level-12 PACK wrix lair (10-14) even though wrix is the better XP fit.
+	ProgressionCandidate wrix = lair("talus_wrix_lair", 10, 500.f, true);
+	wrix.isPack = true;
+	ProgressionCandidate eopie = lair("tatooine_jundland_eopie_lair", 8);
+	EXPECT_TRUE(SimBotDispatchPolicy::progressionCandidateBefore(eopie, wrix, 10));
+	EXPECT_FALSE(SimBotDispatchPolicy::progressionCandidateBefore(wrix, eopie, 10));
+}
+
+TEST(SimBotDispatchPolicyTest, PackLairsStillRankAmongThemselvesByXpFit) {
+	// With only pack lairs in the window, an elite bot still gets the best fit.
+	ProgressionCandidate hard = lair("hard_pack", 10);
+	ProgressionCandidate easy = lair("easy_pack", 6);
+	hard.isPack = true;
+	easy.isPack = true;
+	EXPECT_TRUE(SimBotDispatchPolicy::progressionCandidateBefore(hard, easy, 10));
+}
+
+TEST(SimBotDispatchPolicyTest, PackLairIsNeverAFallbackWhileANonPackLairExists) {
+	// Codex regression: two remote non-pack lairs whose relocations are refused
+	// plus a same-planet pack lair. Packs are excluded before the retries, so
+	// the refusals end in no_reachable_lair (grind), never in the pack lair.
+	EXPECT_FALSE(SimBotDispatchPolicy::packLairsEligible({false, false, true}));
+	EXPECT_FALSE(SimBotDispatchPolicy::packLairsEligible({true, false}));
+}
+
+TEST(SimBotDispatchPolicyTest, PackLairsAreEligibleWhenNothingElseFits) {
+	EXPECT_TRUE(SimBotDispatchPolicy::packLairsEligible({true, true}));
+	EXPECT_TRUE(SimBotDispatchPolicy::packLairsEligible({}));
+}
+
 // ---- normalizeGrindFallbackMinutes ------------------------------------------
 
 TEST(SimBotDispatchPolicyTest, GrindFallbackWindowIsClamped) {
