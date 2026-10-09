@@ -1923,7 +1923,12 @@ SimPlayerManagerConfig = {
             -- on death until medic bots can heal wounds at med centers. Clamped
             -- to at most 1 - restHamFraction so a wounded novice can finish resting.
             cloneWoundMaxFraction = 0,
-            deferredXpTypes = {"medical"},
+            -- XP a hunting bot cannot earn from kills. A box funded by one of
+            -- these neither blocks graduation nor keeps the template
+            -- "incomplete" (F_0.9.8b). Owner 2026-10-09: medical and crafting,
+            -- e.g. Medic 444x's science_medic_crafting_04 is paid in
+            -- crafting_medicine_general.
+            deferredXpTypes = {"medical", "crafting_medicine_general", "crafting_general"},
             -- F_0.9.8 mission graduation (owner decision 2026-09-22). A planned
             -- bot may take missions once it has trained box missionMinLineDepth
             -- in ONE line of a listed profession -- the 3xxx/4xxx shorthand, so
@@ -2427,6 +2432,20 @@ SimPlayerManagerConfig = {
             relocationDeadlineSeconds = 1800,
             relocationCooldownSeconds = 1800,
             relocationMinDwellSeconds = 900,
+            -- F_0.9.8b progression-first dispatch (owner rule 2026-10-09). A bot
+            -- whose training template -- its WHOLE plan, every profession in it
+            -- -- is incomplete is sent to the lair it will actually fight (no
+            -- PACK lair while it is solo and without an elite box, the same rule
+            -- combat applies), ranked for XP at the tier of the weapon it is
+            -- grinding, with market demand only breaking ties. A
+            -- template-complete bot keeps the resource dispatch above.
+            progressionDispatch = {
+                enabled = false,
+                -- Nothing fightable on any planet: grind for this many minutes
+                -- (clamped 5..240) instead of idling, then dispatch again.
+                grindFallback = false,
+                grindFallbackMinutes = 30,
+            },
         },
         -- Each ground is a real SPAWNAREA from the planet region scripts;
         -- C++ validates the object, terrain/boundary, and P.4.1 guards once

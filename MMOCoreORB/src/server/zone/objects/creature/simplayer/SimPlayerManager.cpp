@@ -12,6 +12,9 @@
 #include "SimBotMissionGraduation.h"
 #include "SimPveRelocationDeadline.h"
 #include "SimBotTrainingOrder.h"
+#include "SimBotDispatchPolicy.h"
+
+#include <vector>
 #include "StructureTraversalDiagLog.h"
 
 #include <cmath>
@@ -6098,6 +6101,9 @@ void SimPlayerManager::loadLuaConfig() {
 	pveMissionBoardOfferRetrySeconds = 25;
 	pveMissionBoardOfferMaxAttempts = 3;
 	pveMarketDispatchEnabled = false;
+	pveProgressionDispatchEnabled = false;
+	pveProgressionGrindFallbackEnabled = false;
+	pveProgressionGrindFallbackMinutes = 30;
 	pveMarketDispatchFamilies.removeAll();
 	pveMarketDispatchFamilies.add("meat");
 	pveMarketDispatchFamilies.add("hide");
@@ -9326,6 +9332,9 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	pveMissionBoardOfferRetrySeconds = 25;
 	pveMissionBoardOfferMaxAttempts = 3;
 	pveMarketDispatchEnabled = false;
+	pveProgressionDispatchEnabled = false;
+	pveProgressionGrindFallbackEnabled = false;
+	pveProgressionGrindFallbackMinutes = 30;
 	pveMarketDispatchFamilies.removeAll();
 	pveMarketDispatchFamilies.add("meat");
 	pveMarketDispatchFamilies.add("hide");
@@ -9504,6 +9513,20 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	if (marketDispatchConfig.isValidTable()) {
 		pveMarketDispatchEnabled = marketDispatchConfig.getBooleanField(
 			"enabled", false);
+		LuaObject progressionDispatchConfig =
+			marketDispatchConfig.getObjectField("progressionDispatch");
+		if (progressionDispatchConfig.isValidTable()) {
+			pveProgressionDispatchEnabled =
+				progressionDispatchConfig.getBooleanField("enabled", false);
+			pveProgressionGrindFallbackEnabled =
+				progressionDispatchConfig.getBooleanField("grindFallback",
+					false);
+			pveProgressionGrindFallbackMinutes =
+				SimBotDispatchPolicy::normalizeGrindFallbackMinutes(
+					progressionDispatchConfig.getIntField(
+						"grindFallbackMinutes", 30));
+		}
+		progressionDispatchConfig.pop();
 		LuaObject families = marketDispatchConfig.getObjectField("families");
 		if (families.isValidTable()) {
 			pveMarketDispatchFamilies.removeAll();
@@ -11599,8 +11622,12 @@ void SimPlayerManager::scorePlayerBotActivity(
 	// Without the depth branch a novice on the 23-box Master Teras Kasi plan
 	// grinds the whole tree before its first mission.
 	out = SimBotActivityDecision();
-	if (identity.profession == "harness" || identity.trainingPlan.isEmpty())
+	if (identity.profession == "harness" || identity.trainingPlan.isEmpty()) {
+		// No template to complete: a planless (legacy) hunter belongs to the
+		// market's extraction dispatch, never the progression pass.
+		out.templateComplete = true;
 		return;
+	}
 
 	// Evaluated BEFORE progressionMutex: the gate takes playerBotParityTestMutex,
 	// and taking that under progressionMutex inverts the lock order used
@@ -11620,6 +11647,49 @@ void SimPlayerManager::scorePlayerBotActivity(
 	const bool depthQualified = minDepth > 0 &&
 		SimBotMissionGraduation::maxLineDepth(progression.skills,
 			progressionEarlyGameConfig.missionProfessionPrefixes) >= minDepth;
+	const SimBotTrainingPlan& plan =
+		progressionTrainingPlans.get(identity.trainingPlan);
+	const bool planUsable = (plan.loadError.isEmpty() ||
+		plan.loadError == "over_budget") && plan.orderedSkills.size() > 0;
+
+	// Walks the whole plan -- every profession in it, since the plan IS the
+	// template. True when every untrained box is in a deferred XP type (kills
+	// cannot earn those). Collects the deferred boxes when asked.
+	auto everyEarnableBoxTrained = [&](bool collectStalled) {
+		Vector<String> untrainedXpTypes;
+		for (int i = 0; i < plan.orderedSkills.size(); ++i) {
+			const String& skillName = plan.orderedSkills.get(i);
+			if (progression.skills.contains(skillName))
+				continue;
+
+			Skill* skill = SkillManager::instance() == nullptr ? nullptr :
+				SkillManager::instance()->getSkill(skillName);
+			// An unresolved skill is recorded as "" and always blocks.
+			String xpType = skill == nullptr ? String() : skill->getXpType();
+			untrainedXpTypes.add(xpType);
+			if (collectStalled && !xpType.isEmpty() &&
+					progressionEarlyGameConfig.deferredXpTypes.contains(xpType))
+				out.stalledBoxes.add(skillName);
+		}
+		return SimBotDispatchPolicy::isTemplateComplete(untrainedXpTypes,
+			progressionEarlyGameConfig.deferredXpTypes);
+	};
+
+	// F_0.9.8b grind fallback: no fightable mission existed when the bot was
+	// last dispatched, so it grinds for a bounded window. graduated is cleared
+	// as well because isPlayerBotEarlyGameIdentity -- the one entry point to
+	// the grind loop -- requires it; when the window ends the next early-game
+	// tick sees "hunt" and hands the bot back to dispatch.
+	auto applyGrindFallback = [&]() {
+		if (!pveProgressionGrindFallbackEnabled ||
+				!progressionGrindFallbackUntilMs.contains(identity.id))
+			return;
+		if (System::getMiliTime() >=
+				progressionGrindFallbackUntilMs.get(identity.id))
+			return;
+		out.activity = "grind";
+		out.graduated = false;
+	};
 
 	if (!earlyGameGate) {
 		// FAIL CLOSED. This branch used to return the "hunt" default for every
@@ -11630,38 +11700,22 @@ void SimPlayerManager::scorePlayerBotActivity(
 		// so such a bot idles rather than running a disabled capability.
 		out.activity = depthQualified ? String("hunt") : String("grind");
 		out.graduated = depthQualified;
+		out.templateComplete = planUsable && everyEarnableBoxTrained(false);
 		return;
 	}
 
-	const SimBotTrainingPlan& plan =
-		progressionTrainingPlans.get(identity.trainingPlan);
-	if ((!plan.loadError.isEmpty() && plan.loadError != "over_budget") ||
-			plan.orderedSkills.size() == 0) {
+	if (!planUsable) {
 		out.graduated = plan.orderedSkills.size() == 0 || depthQualified;
 		out.activity = out.graduated ? String("hunt") : String("grind");
+		out.templateComplete = plan.orderedSkills.size() == 0;
+		applyGrindFallback();
 		return;
 	}
 
-	for (int i = 0; i < plan.orderedSkills.size(); ++i) {
-		const String& skillName = plan.orderedSkills.get(i);
-		if (progression.skills.contains(skillName))
-			continue;
-
-		Skill* skill = SkillManager::instance() == nullptr ? nullptr :
-			SkillManager::instance()->getSkill(skillName);
-		if (skill == nullptr) {
-			out.graduated = false;
-			continue;
-		}
-		if (progressionEarlyGameConfig.deferredXpTypes.contains(
-				skill->getXpType()))
-			out.stalledBoxes.add(skillName);
-		else
-			out.graduated = false;
-	}
-	if (depthQualified)
-		out.graduated = true;
+	out.templateComplete = everyEarnableBoxTrained(true);
+	out.graduated = out.templateComplete || depthQualified;
 	out.activity = out.graduated ? String("hunt") : String("grind");
+	applyGrindFallback();
 }
 
 void SimPlayerManager::refreshPlayerBotActivityStates() {
@@ -11774,6 +11828,44 @@ bool SimPlayerManager::isPlayerBotEliteCapable(uint64 identityId) {
 	return SimBotMissionGraduation::maxLineDepth(
 		progressionRecords.get(identityId).skills,
 		progressionEarlyGameConfig.eliteProfessionPrefixes) >= minDepth;
+}
+
+bool SimPlayerManager::isPlayerBotPackAvoidant(uint64 identityId) {
+	// Same inputs as SimHunterController::scanForTarget's avoidPacks, minus the
+	// group (see the declaration): dispatch and combat must not disagree.
+	bool avoidGroupAggroTargets = false;
+	{
+		Locker progressionLock(&progressionMutex);
+		avoidGroupAggroTargets =
+			progressionEarlyGameConfig.avoidGroupAggroTargets;
+	}
+	return avoidGroupAggroTargets && !isPlayerBotEliteCapable(identityId);
+}
+
+int SimPlayerManager::getPlayerBotGrindTier(uint64 identityId,
+		int fallbackTier, String& grindXpType) {
+	{
+		Locker progressionLock(&progressionMutex);
+		String heldWeaponXpType;
+		if (progressionEarlyGameStates.contains(identityId))
+			heldWeaponXpType = progressionEarlyGameStates.get(
+				identityId).currentWeaponXpType;
+		String nextStepXpType;
+		bool nextStepValid = false;
+		if (progressionTrainingNextSteps.contains(identityId)) {
+			const SimBotTrainingStep& step =
+				progressionTrainingNextSteps.get(identityId);
+			nextStepXpType = step.xpType;
+			nextStepValid = step.valid;
+		}
+		grindXpType = SimBotDispatchPolicy::chooseGrindXpType(heldWeaponXpType,
+			nextStepXpType, nextStepValid);
+	}
+	SimBotProgression progression;
+	if (grindXpType.isEmpty() ||
+			!snapshotPlayerBotProgression(identityId, progression))
+		return fallbackTier;
+	return playerBotKillXpTier(progression, grindXpType, fallbackTier);
 }
 
 bool SimPlayerManager::isPlayerBotEarlyGameIdentity(uint64 identityId) {
@@ -19024,6 +19116,8 @@ void SimPlayerManager::buildPveLairYieldIndex() {
 					getTemplate(mobiles->get(mobileIndex).hashCode());
 				if (mobile == nullptr)
 					continue;
+				if (mobile->isPack())
+					entry.hasPackMobile = true;
 				const String types[] = {mobile->getMeatType(),
 					mobile->getHideType(), mobile->getBoneType()};
 				const float amounts[] = {mobile->getMeatMax(),
@@ -19054,7 +19148,8 @@ void SimPlayerManager::buildPveLairYieldIndex() {
 
 bool SimPlayerManager::selectPveBotMissionLairSpawn(
 		const String& planet, int hunterLevel, PveBotMissionOffer& offer,
-		const String& desiredFamily, const String& desiredResourceType) {
+		const String& desiredFamily, const String& desiredResourceType,
+		const String& pinnedLairTemplate, bool avoidPacks) {
 	String missionGroup = planet + "_destroy_missions";
 	// Fully qualified: this fork already has its own SimPlayerManager::SpawnGroup
 	// (the Lua spawn-config struct), which otherwise shadows the engine's
@@ -19151,10 +19246,30 @@ bool SimPlayerManager::selectPveBotMissionLairSpawn(
 		}
 		return false;
 	};
+	// F_0.9.8b: the combat pack rule, evaluated here so the board never offers
+	// a lair the bot would walk to and then refuse (61 percent of abandons).
+	auto lairHasPackMobile = [&](LairSpawn* candidate) {
+		LairTemplate* templateData = candidate == nullptr ? nullptr :
+			CreatureTemplateManager::instance()->getLairTemplate(
+				candidate->getLairTemplateName().hashCode());
+		const Vector<String>* mobiles = templateData == nullptr ? nullptr :
+			templateData->getWeightedMobiles();
+		if (mobiles == nullptr)
+			return false;
+		for (int i = 0; i < mobiles->size(); ++i) {
+			CreatureTemplate* mobile = CreatureTemplateManager::instance()->
+				getTemplate(mobiles->get(i).hashCode());
+			if (mobile != nullptr && mobile->isPack())
+				return true;
+		}
+		return false;
+	};
 	auto candidateInWindow = [&](LairSpawn* candidate, int lowerBound) {
 		return candidate != nullptr && candidate->getMinDifficulty() <=
 			hunterLevel + 5 && candidate->getMaxDifficulty() >= lowerBound &&
-			yieldsRequestedResource(candidate);
+			yieldsRequestedResource(candidate) &&
+			SimBotDispatchPolicy::isLairFightable(
+				avoidPacks && lairHasPackMobile(candidate), avoidPacks);
 	};
 
 	// Level-window relaxation mirrors MissionManager::getRandomLairSpawn, but the
@@ -19183,11 +19298,38 @@ bool SimPlayerManager::selectPveBotMissionLairSpawn(
 		}
 		return best;
 	};
-	selected = selectBest(minLevel);
 	bool relaxedTier = false;
+	if (!pinnedLairTemplate.isEmpty()) {
+		// A progression order already chose this lair for the bot's grind tier;
+		// re-deriving it here (highest yield) is how one PACK lair won every
+		// board. Same two tiers as the search, so the pin is never looser.
+		auto findPinned = [&](int lowerBound) -> LairSpawn* {
+			for (int i = 0; i < lairList.size(); ++i) {
+				LairSpawn* candidate = lairList.get(i);
+				if (candidate != nullptr &&
+						candidate->getLairTemplateName() == pinnedLairTemplate &&
+						candidateInWindow(candidate, lowerBound))
+					return candidate;
+			}
+			return nullptr;
+		};
+		selected = findPinned(minLevel);
+		if (selected == nullptr) {
+			selected = findPinned(0);
+			relaxedTier = selected != nullptr;
+		}
+		if (selected == nullptr)
+			MissionDiagLog::event("LAIR_PIN_MISS", offer.identityId,
+				"pinned=" + pinnedLairTemplate + " group=" + missionGroup +
+				" hunterLevel=" + String::valueOf(hunterLevel) +
+				" avoidPacks=" + String::valueOf(avoidPacks));
+	}
 	if (selected == nullptr) {
-		selected = selectBest(0);
-		relaxedTier = selected != nullptr;
+		selected = selectBest(minLevel);
+		if (selected == nullptr) {
+			selected = selectBest(0);
+			relaxedTier = selected != nullptr;
+		}
 	}
 	if (selected == nullptr) {
 		// Attribute the miss to a specific sub-filter. candidateInWindow ANDs
@@ -19264,6 +19406,9 @@ bool SimPlayerManager::selectPveBotMissionLairSpawn(
 
 	MissionDiagLog::event("LAIR_OK", offer.identityId, "template=" + lairTemplateName +
 		" relaxedTier=" + String::valueOf(relaxedTier) +
+		" pinned=" + String::valueOf(!pinnedLairTemplate.isEmpty() &&
+			pinnedLairTemplate == lairTemplateName) +
+		" avoidPacks=" + String::valueOf(avoidPacks) +
 		" difficulty=" + String::valueOf(difficulty) +
 		" difficultyLevel=" + String::valueOf(difficultyLevel) +
 		" window=" + String::valueOf(minDifficulty) + "-" +
@@ -19503,12 +19648,20 @@ bool SimPlayerManager::generatePveBotMissionOffers(uint64 identityId,
 	uint64 issuedAt = System::getMiliTime();
 	String desiredFamily;
 	String desiredResourceType;
+	String pinnedLairTemplate;
+	bool avoidPacks = false;
 	{
 		Locker pveLock(&pveMutex);
 		if (pveHuntOrders.contains(identityId)) {
 			const PveHuntOrder& order = pveHuntOrders.get(identityId);
 			desiredFamily = order.marketFamily;
 			desiredResourceType = order.marketResourceType;
+			pinnedLairTemplate = order.pinnedLairTemplate;
+			avoidPacks = order.avoidPacks;
+			// A progression order was ranked at the tier of the weapon being
+			// ground, so the board's level window must use the same number.
+			if (order.dispatchMode == "progression" && order.dispatchLevel > 0)
+				hunterLevel = order.dispatchLevel;
 		}
 	}
 	MissionDiagLog::event("OFFERS_BEGIN", identityId, "planet=" +
@@ -19518,7 +19671,10 @@ bool SimPlayerManager::generatePveBotMissionOffers(uint64 identityId,
 		" want=" + String::valueOf(offerCount) +
 		" family=" + (desiredFamily.isEmpty() ? String("none") : desiredFamily) +
 		" resourceType=" + (desiredResourceType.isEmpty() ? String("none") :
-			desiredResourceType));
+			desiredResourceType) +
+		" pinned=" + (pinnedLairTemplate.isEmpty() ? String("none") :
+			pinnedLairTemplate) +
+		" avoidPacks=" + String::valueOf(avoidPacks));
 
 	int failedLair = 0;
 	int failedPosition = 0;
@@ -19534,7 +19690,8 @@ bool SimPlayerManager::generatePveBotMissionOffers(uint64 identityId,
 		// distinguishable; evaluation order and semantics are identical (the
 		// position search still runs only when lair selection succeeded).
 		if (!selectPveBotMissionLairSpawn(terminal.planet, hunterLevel, offer,
-				desiredFamily, desiredResourceType)) {
+				desiredFamily, desiredResourceType, pinnedLairTemplate,
+				avoidPacks)) {
 			++failedLair;
 			continue;
 		}
@@ -21032,6 +21189,339 @@ bool SimPlayerManager::resolvePveBuffProviders(const String& planet,
 	return true;
 }
 
+void SimPlayerManager::runPveProgressionDispatchPass(uint64 nowMs,
+		const Vector<SimBotIdentity>& identities,
+		const Vector<uint64>& identityBodyOids,
+		const Vector<String>& currentPlanets,
+		const VectorMap<uint64, bool>& templateCompleteById,
+		const VectorMap<uint64, bool>& avoidPacksById,
+		const Vector<PveMissionTerminalLocation>& marketTerminals,
+		const Vector<PveLairYieldEntry>& lairYieldIndex,
+		const Vector<String>& marketFamilies,
+		Vector<DemandStateSimulationResult>& demandResults,
+		int huntQuota, uint64 huntTimeEstimate, bool grindFallbackEnabled,
+		int grindFallbackMinutes, Vector<bool>& blockedIdentity,
+		Vector<uint64>& assignedIdentityIds) {
+	// Planets a bot can be sent to: a mission terminal in a city with a
+	// starport, the same test the extraction loop applies per terminal.
+	Vector<String> dispatchPlanets;
+	VectorMap<String, String> dispatchCityByPlanet;
+	for (int terminalIndex = 0; terminalIndex < marketTerminals.size();
+			++terminalIndex) {
+		const PveMissionTerminalLocation& terminal =
+			marketTerminals.get(terminalIndex);
+		if (dispatchPlanets.contains(terminal.planet))
+			continue;
+		for (int cityIndex = 0; cityIndex < allShuttleports.size(); ++cityIndex) {
+			const ShuttleportLocation& city = allShuttleports.get(cityIndex);
+			if (city.planet == terminal.planet && city.name == terminal.city &&
+					!city.starportPoint.isEmpty()) {
+				dispatchPlanets.add(terminal.planet);
+				dispatchCityByPlanet.put(terminal.planet, terminal.city);
+				break;
+			}
+		}
+	}
+
+	{
+		Locker progressionLock(&progressionMutex);
+		for (int i = progressionGrindFallbackUntilMs.size() - 1; i >= 0; --i) {
+			if (progressionGrindFallbackUntilMs.elementAt(i).getValue() <= nowMs)
+				progressionGrindFallbackUntilMs.remove(i);
+		}
+	}
+
+	struct ProgressionOption {
+		SimBotDispatchPolicy::ProgressionCandidate rank;
+		int lairIndex = -1;
+		String family;
+		String demandProfileKey;
+		bool demandMatched = false;
+		bool tried = false;
+	};
+
+	for (int identityIndex = 0; identityIndex < identities.size();
+			++identityIndex) {
+		const SimBotIdentity& identity = identities.get(identityIndex);
+		if (blockedIdentity.get(identityIndex) ||
+				assignedIdentityIds.contains(identity.id))
+			continue;
+		// Template-complete bots belong to the extraction loop.
+		if (!templateCompleteById.contains(identity.id) ||
+				templateCompleteById.get(identity.id))
+			continue;
+		blockedIdentity.set(identityIndex, true);
+		if (identity.skillTier < 1 || currentPlanets.size() <= identityIndex)
+			continue;
+
+		const uint64 bodyOid = identityBodyOids.get(identityIndex);
+		const String& currentPlanet = currentPlanets.get(identityIndex);
+		const bool avoidPacks = avoidPacksById.contains(identity.id) &&
+			avoidPacksById.get(identity.id);
+		String grindXpType;
+		const int grindTier = getPlayerBotGrindTier(identity.id,
+			Math::max(1, identity.skillTier), grindXpType);
+
+		std::vector<ProgressionOption> options;
+		int packLairsSkipped = 0;
+		for (int planetIndex = 0; planetIndex < dispatchPlanets.size();
+				++planetIndex) {
+			const String& planet = dispatchPlanets.get(planetIndex);
+			// Same two tiers as selectPveBotMissionLairSpawn, per planet: the
+			// strict window, and only if it is empty the lower-bound-relaxed one.
+			// The terminal then finds the pinned lair in the same tier.
+			for (int tier = 0; tier < 2; ++tier) {
+				const bool strictWindow = tier == 0;
+				size_t before = options.size();
+				for (int lairIndex = 0; lairIndex < lairYieldIndex.size();
+						++lairIndex) {
+					const PveLairYieldEntry& lair = lairYieldIndex.get(lairIndex);
+					if (lair.planet != planet || lair.missionBuilding.isEmpty() ||
+							lair.minDifficulty > grindTier + 5)
+						continue;
+					const bool strictOk = lair.maxDifficulty >= Math::min(
+						grindTier - 5, lair.minLevelCeiling);
+					if (strictWindow && !strictOk)
+						continue;
+					if (!SimBotDispatchPolicy::isLairFightable(
+							lair.hasPackMobile, avoidPacks)) {
+						if (strictWindow || !strictOk)
+							++packLairsSkipped;
+						continue;
+					}
+
+					ProgressionOption option;
+					option.lairIndex = lairIndex;
+					option.rank.lairTemplate = lair.lairTemplate;
+					option.rank.planet = planet;
+					option.rank.minDifficulty = lair.minDifficulty;
+					option.rank.samePlanet = planet == currentPlanet;
+					uint64 largestAmount = 0;
+					for (int familyIndex = 0; familyIndex < 3; ++familyIndex) {
+						String family = getPveCreatureFamily(familyIndex);
+						uint64 amount = lair.amountsByFamily.contains(family) ?
+							lair.amountsByFamily.get(family) : 0;
+						if (amount == 0)
+							continue;
+						if (amount > largestAmount && !option.demandMatched) {
+							largestAmount = amount;
+							option.family = family;
+						}
+						if (!marketFamilies.contains(family))
+							continue;
+						for (int demandIndex = 0; demandIndex < demandResults.size();
+								++demandIndex) {
+							const DemandStateSimulationResult& demand =
+								demandResults.get(demandIndex);
+							if (!demand.activeProfileAvailableForPhase)
+								continue;
+							for (int signalIndex = 0;
+									signalIndex < demand.familySignals.size();
+									++signalIndex) {
+								const DemandFamilySignal& signal =
+									demand.familySignals.get(signalIndex);
+								if (signal.signalUnits == 0 ||
+										signal.family.toLowerCase().trim() != family)
+									continue;
+								float score = signal.pressure *
+									static_cast<float>(amount) /
+									static_cast<float>(huntTimeEstimate);
+								if (score > option.rank.demandScore) {
+									option.rank.demandScore = score;
+									option.family = family;
+									option.demandProfileKey = demand.profileKey;
+									option.demandMatched = true;
+								}
+							}
+						}
+					}
+					if (!option.family.isEmpty())
+						options.push_back(option);
+				}
+				if (options.size() > before)
+					break;
+			}
+		}
+
+		progressionDispatchPackLairsSkipped.add(packLairsSkipped);
+		if (options.empty()) {
+			progressionDispatchNoFightable.increment();
+			bool fellBack = false;
+			if (grindFallbackEnabled) {
+				Locker progressionLock(&progressionMutex);
+				progressionGrindFallbackUntilMs.put(identity.id, nowMs +
+					static_cast<uint64>(grindFallbackMinutes) * 60000);
+				fellBack = true;
+			}
+			if (fellBack)
+				progressionDispatchGrindFallbacks.increment();
+			info("SimPveProgressionDispatch identity=" +
+				String::valueOf(identity.id) + " result=no_fightable_lair" +
+				" grindTier=" + String::valueOf(grindTier) +
+				" grindXpType=" + grindXpType +
+				" avoidPacks=" + String::valueOf(avoidPacks) +
+				" packLairsSkipped=" + String::valueOf(packLairsSkipped) +
+				" grindFallback=" + String::valueOf(fellBack), true);
+			continue;
+		}
+
+		Reference<SimPlayerController*> ctrl = controllers.contains(bodyOid) ?
+			controllers.get(bodyOid) : nullptr;
+		SimHunterController* hunter = ctrl == nullptr ? nullptr :
+			dynamic_cast<SimHunterController*>(ctrl.get());
+		if (hunter == nullptr || !hunter->isReadyForMarketRelocation())
+			continue;
+
+		// Best first, over EVERY option. A refused relocation (concurrency,
+		// cooldown, dwell, the per-planet minimum) is almost always refused for
+		// any other planet too, so after MAX_REMOTE_REFUSALS refusals only
+		// same-planet options -- which never relocate -- are still tried. That
+		// keeps the pass bounded without letting four remote refusals strand a
+		// bot that has a fightable lair where it stands.
+		static const int MAX_REMOTE_REFUSALS = 2;
+		const ProgressionOption* chosen = nullptr;
+		bool assigned = false;
+		int remoteRefusals = 0;
+		for (;;) {
+			ProgressionOption* best = nullptr;
+			for (size_t i = 0; i < options.size(); ++i) {
+				if (options[i].tried || (remoteRefusals >= MAX_REMOTE_REFUSALS &&
+						!options[i].rank.samePlanet))
+					continue;
+				if (best == nullptr ||
+						SimBotDispatchPolicy::progressionCandidateBefore(
+							options[i].rank, best->rank, grindTier))
+					best = &options[i];
+			}
+			if (best == nullptr)
+				break;
+			best->tried = true;
+			PveRelocation relocation;
+			if (planPveHunterRelocation(identity.id, bodyOid, best->rank.planet,
+					dispatchCityByPlanet.get(best->rank.planet),
+					"progression_dispatch", relocation)) {
+				chosen = best;
+				break;
+			}
+			if (!best->rank.samePlanet)
+				++remoteRefusals;
+		}
+		if (chosen == nullptr) {
+			// Fightable lairs exist but none is reachable this pass. Grind
+			// rather than idle; dispatch looks again when the window ends.
+			bool fellBack = false;
+			if (grindFallbackEnabled) {
+				Locker progressionLock(&progressionMutex);
+				progressionGrindFallbackUntilMs.put(identity.id, nowMs +
+					static_cast<uint64>(grindFallbackMinutes) * 60000);
+				fellBack = true;
+			}
+			if (fellBack)
+				progressionDispatchGrindFallbacks.increment();
+			info("SimPveProgressionDispatch identity=" +
+				String::valueOf(identity.id) + " result=no_reachable_lair" +
+				" grindTier=" + String::valueOf(grindTier) +
+				" options=" + String::valueOf(static_cast<int>(options.size())) +
+				" remoteRefusals=" + String::valueOf(remoteRefusals) +
+				" grindFallback=" + String::valueOf(fellBack), true);
+			continue;
+		}
+
+		const PveLairYieldEntry& lair = lairYieldIndex.get(chosen->lairIndex);
+		String requestedResourceType;
+		for (int i = 0; i < lair.resourceTypes.size(); ++i) {
+			if (lair.resourceTypes.get(i).beginsWith(chosen->family + "_")) {
+				requestedResourceType = lair.resourceTypes.get(i);
+				break;
+			}
+		}
+		auto familyUnits = [&](const char* family) -> uint64 {
+			return lair.amountsByFamily.contains(family) ?
+				lair.amountsByFamily.get(family) : 0;
+		};
+
+		PveHuntSpecies species;
+		species.key = "progression_" + chosen->family + "_" + lair.planet;
+		species.planet = lair.planet;
+		species.requestedResourceType = requestedResourceType;
+		species.harvestKind = chosen->family;
+		species.lairTemplate = lair.lairTemplate;
+		species.soloable = true;
+		species.usable = true;
+		species.minSkillTier = 1;
+
+		{
+			Locker pveLock(&pveMutex);
+			if (!pveHuntOrders.contains(identity.id) &&
+					pveIdentityBodyOids.contains(identity.id)) {
+				PveHuntOrder order;
+				order.identityId = identity.id;
+				order.bodyOid = bodyOid;
+				order.issuedAtMs = nowMs;
+				order.homePlanet = identity.homePlanet;
+				order.homeCity = identity.homeCity;
+				order.speciesKey = species.key;
+				order.requestedResourceType = requestedResourceType;
+				order.harvestKind = chosen->family;
+				order.demandProfileKey = chosen->demandProfileKey;
+				order.quota = huntQuota;
+				order.expectedYieldUnits = multiplyDemandFamilyUnits(
+					familyUnits(chosen->family.toCharArray()), huntQuota);
+				order.expectedHideUnits = multiplyDemandFamilyUnits(
+					familyUnits("hide"), huntQuota);
+				order.expectedBoneUnits = multiplyDemandFamilyUnits(
+					familyUnits("bone"), huntQuota);
+				order.expectedMeatUnits = multiplyDemandFamilyUnits(
+					familyUnits("meat"), huntQuota);
+				order.marketTargetPlanet = lair.planet;
+				order.marketTargetCity = dispatchCityByPlanet.get(lair.planet);
+				// Only a demand-matched order names a market family; it steers
+				// the terminal's fallback search if the pinned lair is gone.
+				if (chosen->demandMatched)
+					order.marketFamily = chosen->family;
+				order.dispatchMode = "progression";
+				order.pinnedLairTemplate = lair.lairTemplate;
+				order.dispatchLevel = grindTier;
+				order.avoidPacks = avoidPacks;
+				order.phase = "ANNOUNCE_JOB";
+				order.status = "ASSIGNED";
+				pveHuntOrders.put(identity.id, order);
+				SimBotIdentity& mutableIdentity = pveIdentities.get(identity.id);
+				mutableIdentity.assignmentSpecies = species.key;
+				mutableIdentity.assignmentResource = requestedResourceType;
+				mutableIdentity.assignmentStamp = nowMs;
+				pveDirtyIdentityIds.put(identity.id, true);
+				assigned = true;
+			}
+		}
+		if (!assigned)
+			continue;
+
+		PveHuntOrder assignedOrder;
+		getPveHunterOrder(identity.id, assignedOrder);
+		// The bot harvests what it kills whatever the mode, so its expected
+		// units are inbound supply and must reduce what the extraction loop
+		// still sees as demand.
+		decrementPveHuntFamilySignals(demandResults, assignedOrder);
+		assignedIdentityIds.add(identity.id);
+		progressionDispatchAssigned.increment();
+
+		hunter->startOrder(assignedOrder, species);
+		info("SimPveProgressionDispatch identity=" +
+			String::valueOf(identity.id) + " result=assigned" +
+			" planet=" + lair.planet + " lair=" + lair.lairTemplate +
+			" minDifficulty=" + String::valueOf(lair.minDifficulty) +
+			" maxDifficulty=" + String::valueOf(lair.maxDifficulty) +
+			" grindTier=" + String::valueOf(grindTier) +
+			" grindXpType=" + grindXpType +
+			" avoidPacks=" + String::valueOf(avoidPacks) +
+			" packLairsSkipped=" + String::valueOf(packLairsSkipped) +
+			" demandMatched=" + String::valueOf(chosen->demandMatched) +
+			" family=" + chosen->family +
+			" options=" + String::valueOf(static_cast<int>(options.size())), true);
+	}
+}
+
 void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 	if (!pveHunterBotsEnabled || !pveWorldPresenceEnabled ||
 			pveMaxHunters <= 0)
@@ -21061,6 +21551,9 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 	bool locationBasedEligibility = false;
 	float dispatchRadiusMeters = 2500.f;
 	bool marketDispatchEnabled = false;
+	bool progressionDispatchEnabled = false;
+	bool grindFallbackEnabled = false;
+	int grindFallbackMinutes = 30;
 	bool missionBoardEnabledSnapshot = false;
 	Vector<String> marketFamilies;
 	VectorMap<String, Vector<PveMarketQualityWeight> > marketQualityWeights;
@@ -21077,6 +21570,9 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 		locationBasedEligibility = pveLocationBasedEligibility;
 		dispatchRadiusMeters = pveDispatchRadiusMeters;
 		marketDispatchEnabled = pveMarketDispatchEnabled;
+		progressionDispatchEnabled = pveProgressionDispatchEnabled;
+		grindFallbackEnabled = pveProgressionGrindFallbackEnabled;
+		grindFallbackMinutes = pveProgressionGrindFallbackMinutes;
 		missionBoardEnabledSnapshot = pveMissionBoardEnabled;
 		marketFamilies = pveMarketDispatchFamilies;
 		marketQualityWeights = pveMarketQualityWeights;
@@ -21096,11 +21592,16 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 	}
 	Vector<SimBotIdentity> eligibleIdentities;
 	Vector<uint64> eligibleBodyOids;
+	// Keyed by id, not index: the novice-distribution reorder below rebuilds
+	// the identity vector.
+	VectorMap<uint64, bool> templateCompleteById;
 	for (int i = 0; i < identities.size(); ++i) {
 		SimBotActivityDecision activity;
 		scorePlayerBotActivity(identities.get(i), activity);
 		if (activity.activity == "grind")
 			continue;
+		templateCompleteById.put(identities.get(i).id,
+			activity.templateComplete);
 		if (!isPveHuntEligible(identities.get(i)))
 			continue;
 		eligibleIdentities.add(identities.get(i));
@@ -21197,6 +21698,24 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 		uint64 huntTimeEstimate = acquisitionLedgerHuntTimeEstimateSeconds > 0 ?
 			static_cast<uint64>(acquisitionLedgerHuntTimeEstimateSeconds) : 1;
 
+		// F_0.9.8b progression pass. Owner rule 2026-10-09: a bot whose
+		// training template is incomplete is dispatched to the lair it will
+		// FIGHT that best fits the weapon it is grinding; demand only breaks
+		// ties. It runs before, and independently of, the resource snapshot, so
+		// a market miss never idles a progressing bot. Every bot it considers
+		// is withheld from the extraction loop below.
+		VectorMap<uint64, bool> avoidPacksById;
+		if (progressionDispatchEnabled) {
+			for (int i = 0; i < identities.size(); ++i)
+				avoidPacksById.put(identities.get(i).id,
+					isPlayerBotPackAvoidant(identities.get(i).id));
+			runPveProgressionDispatchPass(nowMs, identities, identityBodyOids,
+				currentPlanets, templateCompleteById, avoidPacksById,
+				marketTerminals, lairYieldIndex, marketFamilies, demandResults,
+				huntQuotaSnapshot, huntTimeEstimate, grindFallbackEnabled,
+				grindFallbackMinutes, blockedIdentity, assignedIdentityIds);
+		}
+
 		while (marketSnapshotReady &&
 				assignedIdentityIds.size() < identities.size()) {
 			PveMarketCandidate bestCandidate;
@@ -21291,6 +21810,17 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 												resource.type) ||
 											!lair.amountsByFamily.contains(family))
 										continue;
+									// F_0.9.8b: never reserve a lair combat would
+									// refuse. Only with the gate on, so the gate-off
+									// matchmaker is unchanged.
+									if (avoidPacksById.contains(identity.id) &&
+											!SimBotDispatchPolicy::isLairFightable(
+												lair.hasPackMobile,
+												avoidPacksById.get(identity.id))) {
+										progressionDispatchExtractionPackFiltered.
+											increment();
+										continue;
+									}
 									if (lair.minDifficulty > hunterLevel + 5)
 										continue;
 									if (strictWindow) {
@@ -21428,6 +21958,13 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 				order.marketFamily = bestCandidate.family;
 				order.marketResourceSpawnOid = bestCandidate.resourceSpawnOid;
 				order.marketQualityScore = bestCandidate.qualityScore;
+				// F_0.9.8b: the terminal must apply the same pack filter the
+				// matcher did, or it re-selects the lair the matcher excluded.
+				// Gate off leaves avoidPacksById empty, so these stay default.
+				if (avoidPacksById.contains(identity.id)) {
+					order.dispatchMode = "extraction";
+					order.avoidPacks = avoidPacksById.get(identity.id);
+				}
 				order.phase = "ANNOUNCE_JOB";
 				order.status = "ASSIGNED";
 				pveHuntOrders.put(identity.id, order);
@@ -21456,6 +21993,8 @@ void SimPlayerManager::runPveHunterMatchmaker(uint64 nowMs) {
 			pveMarketWinningQualityScore = bestCandidate.qualityScore;
 		}
 
+		if (avoidPacksById.contains(identity.id))
+			progressionDispatchExtractionAssigned.increment();
 		hunter->startOrder(assignedOrder, marketSpecies);
 		info("SimPveMarketHuntAssigned identity=" + String::valueOf(
 			identity.id) + " planet=" + bestCandidate.planet +
@@ -23912,6 +24451,44 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	marketDispatch["winningResourceType"] = marketWinningResourceType;
 	marketDispatch["winningPlanet"] = marketWinningPlanet;
 	marketDispatch["winningQualityScore"] = marketWinningQualityScore;
+	// F_0.9.8b progression-first dispatch (session counters).
+	JSONSerializationType progressionDispatch =
+		JSONSerializationType::object();
+	progressionDispatch["enabled"] = pveProgressionDispatchEnabled;
+	progressionDispatch["grindFallbackEnabled"] =
+		pveProgressionGrindFallbackEnabled;
+	progressionDispatch["grindFallbackMinutes"] =
+		pveProgressionGrindFallbackMinutes;
+	progressionDispatch["assignedTotal"] = progressionDispatchAssigned.get();
+	// Market (template-complete) orders issued while the gate is on.
+	progressionDispatch["extractionAssignedTotal"] =
+		progressionDispatchExtractionAssigned.get();
+	// Raw count of matcher checks that dropped a pack lair for a pack-avoiding
+	// extraction bot -- one per (lair, resource, terminal) check, not per lair.
+	progressionDispatch["extractionPackChecksFilteredTotal"] =
+		progressionDispatchExtractionPackFiltered.get();
+	progressionDispatch["packLairsSkippedTotal"] =
+		progressionDispatchPackLairsSkipped.get();
+	progressionDispatch["noFightableTotal"] =
+		progressionDispatchNoFightable.get();
+	progressionDispatch["grindFallbacksTotal"] =
+		progressionDispatchGrindFallbacks.get();
+	{
+		JSONSerializationType fallbackRows = JSONSerializationType::array();
+		uint64 fallbackNowMs = System::getMiliTime();
+		Locker progressionLock(&progressionMutex);
+		for (int i = 0; i < progressionGrindFallbackUntilMs.size(); ++i) {
+			uint64 untilMs = progressionGrindFallbackUntilMs.elementAt(i).getValue();
+			if (untilMs <= fallbackNowMs)
+				continue;
+			JSONSerializationType row = JSONSerializationType::object();
+			row["identityId"] = progressionGrindFallbackUntilMs.elementAt(i).getKey();
+			row["remainingSeconds"] = (untilMs - fallbackNowMs) / 1000;
+			fallbackRows.push_back(row);
+		}
+		progressionDispatch["activeGrindFallbacks"] = fallbackRows;
+	}
+	marketDispatch["progressionDispatch"] = progressionDispatch;
 	marketDispatch["maxConcurrentRelocations"] =
 		pveMarketMaxConcurrentRelocations;
 	marketDispatch["minHuntersPerActivePlanet"] =
@@ -24069,6 +24646,9 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 				row["requestedResourceType"] =
 					huntOrders.get(j).requestedResourceType;
 				row["harvestKind"] = huntOrders.get(j).harvestKind;
+				row["dispatchMode"] = huntOrders.get(j).dispatchMode;
+				row["pinnedLairTemplate"] = huntOrders.get(j).pinnedLairTemplate;
+				row["dispatchLevel"] = huntOrders.get(j).dispatchLevel;
 				row["quota"] = huntOrders.get(j).quota;
 				row["orderKills"] = huntOrders.get(j).kills;
 				row["retreatCycles"] = huntOrders.get(j).retreatCycles;

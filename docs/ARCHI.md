@@ -213,6 +213,10 @@ no new warnings before handing work back** (owner-stated standard).
   block (`specialAttackChancePercent`, `preferFreeStateAbilities`, `hamReserveFraction`,
   `freeStateRetrySeconds`, `excludedCommands` — shipped `taunt`/`warcry1`/`warcry2` — and
   `usageHistorySize`). Every F_0.9.5, F_0.9.6 and F_0.9.7 gate ships default-off.
+  F_0.9.8b adds `pveConfig.marketDispatch.progressionDispatch` (`enabled`,
+  `grindFallback`, `grindFallbackMinutes` clamped 5..240), default off, and widens
+  `earlyGame.deferredXpTypes` to `medical`, `crafting_medicine_general`,
+  `crafting_general` (XP kills cannot earn).
   This is the primary place new simulation features expose owner-tunable,
   default-off gates.
 - **`MMOCoreORB/bin/conf/features.lua`** — global feature flags.
@@ -517,7 +521,20 @@ This is this fork's primary custom subsystem, layered on top of the stock
   (`computeReservedInboundByProfileFamily` iterates enabled profiles × 3 families;
   both matchmaker paths run a shared intra-pass multi-family signal decrement so a
   single pass never over-dispatches a family). Effect: meat saturation alone can no
-  longer idle the whole roster — pressure spreads across families. This is a
+  longer idle the whole roster — pressure spreads across families.
+  **F_0.9.8b progression-first dispatch** (gate `progressionDispatch.enabled`):
+  a bot whose training template — its whole plan, across professions — is
+  incomplete (`SimBotActivityDecision::templateComplete`; deferred XP types do not
+  block) is dispatched by `runPveProgressionDispatchPass` BEFORE the extraction
+  loop and withheld from it. Candidates are lairs combat will fight
+  (`SimBotDispatchPolicy::isLairFightable` = combat's pack rule, the yield index's
+  `hasPackMobile`; dispatch assumes solo) within the window of the **grind tier**
+  (`getPlayerBotGrindTier`: combat-difficulty tier of the weapon in hand, not
+  combat level), ranked XP fit → demand → same planet. The order pins the lair
+  (`pinnedLairTemplate`, `dispatchLevel`, `avoidPacks`) and
+  `selectPveBotMissionLairSpawn` honours the pin. With nothing fightable the bot
+  grinds for `grindFallbackMinutes` (`progressionGrindFallbackUntilMs`, read by
+  `scorePlayerBotActivity`). Template-complete bots keep the market path. This is a
   **demand-spread** slice only: `consumeReservation` still does **not** drain
   `familySupply` in-session (supply = immutable boot baseline + monotonic
   `pveSessionHarvestByFamily`), so with no family *consumer* yet each family still

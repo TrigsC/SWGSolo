@@ -393,6 +393,10 @@ struct SimBotEarlyGameState {
 struct SimBotActivityDecision {
 	String activity = "hunt";
 	bool graduated = true;
+	// F_0.9.8b: every non-deferred box of the WHOLE plan is trained. Unlike
+	// graduated, the line-depth shortcut does not set it -- a bot that may take
+	// missions is still progressing until its template is done.
+	bool templateComplete = false;
 	Vector<String> stalledBoxes;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
@@ -751,6 +755,9 @@ struct PveLairYieldEntry {
 	// bound (which is all tier 3 enforces).
 	int minLevelCeiling = 20;
 	float size = 25.f;
+	// F_0.9.8b: any weighted mobile is a PACK creature, which a pack-avoiding
+	// bot refuses in combat -- so dispatch must not offer it.
+	bool hasPackMobile = false;
 	Vector<String> resourceTypes;
 	VectorMap<String, uint64> amountsByFamily;
 
@@ -829,6 +836,14 @@ struct PveHuntOrder {
 	String marketFamily;
 	uint64 marketResourceSpawnOid = 0;
 	float marketQualityScore = 0.f;
+	// F_0.9.8b progression-first dispatch. "progression" orders carry the lair
+	// the matchmaker chose and the grind tier it was chosen for, and the mission
+	// terminal honours both instead of re-deriving the highest-yield lair.
+	// Empty for every other order, which keeps today's terminal behaviour.
+	String dispatchMode;
+	String pinnedLairTemplate;
+	int dispatchLevel = 0;
+	bool avoidPacks = false;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -2256,6 +2271,10 @@ private:
 	String progressionTrainingPlanSignature;
 	VectorMap<uint64, SimBotTrainingStep> progressionTrainingNextSteps;
 	VectorMap<uint64, bool> progressionTrainingPendingIds;
+	// F_0.9.8b grind fallback: identity -> wall-clock ms until which the bot
+	// grinds because no fightable mission existed. Guarded by progressionMutex,
+	// which scorePlayerBotActivity already holds when it reads it.
+	VectorMap<uint64, uint64> progressionGrindFallbackUntilMs;
 	int trainingMaxPerTick = 4;
 	int trainingSweepBatch = 64;
 	uint64 trainingSweepCursor = 0;
@@ -2287,6 +2306,13 @@ private:
 	// kill-XP gate is on and a sim bot is in the victim's threat map.
 	AtomicLong killXpBotKillsSeen;
 	AtomicLong killXpDroppedNoDamage;
+	// F_0.9.8b progression-first dispatch counters (session scope).
+	AtomicLong progressionDispatchAssigned;
+	AtomicLong progressionDispatchPackLairsSkipped;
+	AtomicLong progressionDispatchGrindFallbacks;
+	AtomicLong progressionDispatchNoFightable;
+	AtomicLong progressionDispatchExtractionAssigned;
+	AtomicLong progressionDispatchExtractionPackFiltered;
 	AtomicLong killXpDroppedNoBaseXp;
 	AtomicLong killXpDroppedNoSimBotAttacker;
 	AtomicLong progressionOrphanRecords;
@@ -2597,6 +2623,15 @@ private:
 	// burst-exposure problem rather than an attrition one. Scoped to mission
 	// lairs, that lair's own members, and solo bots only.
 	bool pveMissionBoardWaveDeaggro = false;
+	// F_0.9.8b progression-first dispatch, owner rule 2026-10-09. A bot whose
+	// training template is incomplete is dispatched to lairs it will fight,
+	// ranked for XP at the tier of the weapon it is grinding; demand only breaks
+	// ties. Template-complete bots keep the market dispatch. All default off.
+	bool pveProgressionDispatchEnabled = false;
+	// With nothing fightable on any planet, send the bot to the grind loop for
+	// a bounded window instead of idling it.
+	bool pveProgressionGrindFallbackEnabled = false;
+	int pveProgressionGrindFallbackMinutes = 30;
 	int pveMissionBoardLairRetargetIntervalMs = 5000;
 	int pveMissionBoardMaxOfferAgeSeconds = 1800;
 	// A wilderness point validated at generation frequently goes stale (a
@@ -2840,6 +2875,20 @@ private:
 	void updatePveBodyLifecycles(uint64 nowMs);
 	void governPvePopulation(uint64 nowMs);
 	void runPveHunterMatchmaker(uint64 nowMs);
+	// F_0.9.8b: dispatches template-incomplete bots (see the definition).
+	void runPveProgressionDispatchPass(uint64 nowMs,
+		const Vector<SimBotIdentity>& identities,
+		const Vector<uint64>& identityBodyOids,
+		const Vector<String>& currentPlanets,
+		const VectorMap<uint64, bool>& templateCompleteById,
+		const VectorMap<uint64, bool>& avoidPacksById,
+		const Vector<PveMissionTerminalLocation>& marketTerminals,
+		const Vector<PveLairYieldEntry>& lairYieldIndex,
+		const Vector<String>& marketFamilies,
+		Vector<DemandStateSimulationResult>& demandResults,
+		int huntQuota, uint64 huntTimeEstimate, bool grindFallbackEnabled,
+		int grindFallbackMinutes, Vector<bool>& blockedIdentity,
+		Vector<uint64>& assignedIdentityIds);
 	void validatePveHuntGrounds();
 	void attachPveHunterController(const SimBotIdentity& identity, AiAgent* body);
 	bool resolvePveDeathSpawnOverride(uint64 bodyOid,
@@ -2885,9 +2934,13 @@ private:
 	void queuePveHuntLairCleanup(uint64 bodyOid, const String& reason);
 	void finishPveHuntLairCleanup(uint64 bodyOid, uint64 lairOid,
 		const String& reason);
+	// F_0.9.8b: pinnedLairTemplate (a progression order's matchmaker choice) is
+	// taken when it is in this planet's list and in window; avoidPacks drops
+	// every lair with a PACK mobile from both the pin and the fallback search.
 	bool selectPveBotMissionLairSpawn(const String& planet, int hunterLevel,
 		PveBotMissionOffer& offer, const String& desiredFamily = "",
-		const String& desiredResourceType = "");
+		const String& desiredResourceType = "",
+		const String& pinnedLairTemplate = "", bool avoidPacks = false);
 	// diagIdentityId is DIAGNOSTIC ONLY: it correlates missiondiag.log lines with
 	// the OFFERS_BEGIN that bracket them, since offer generation can run for two
 	// hunters on different threads and the lines would otherwise interleave
@@ -3903,6 +3956,17 @@ public:
 	bool isPlayerBotProgressionIdentity(uint64 identityId, int& skillTierOut);
 	// True once the bot has trained a line box in an elite profession.
 	bool isPlayerBotEliteCapable(uint64 identityId);
+	// F_0.9.8b: the combat rule, evaluated for dispatch. Dispatch cannot read the
+	// body's group without the creature lock, so it treats every bot as SOLO --
+	// the conservative direction (a grouped bot is offered fewer lairs, never a
+	// lair combat would refuse).
+	bool isPlayerBotPackAvoidant(uint64 identityId);
+	// F_0.9.8b: tier of the weapon the bot is grinding with -- the one in hand,
+	// else the one its next training box funds -- from that weapon's trained
+	// combat-difficulty mods only. Falls back to fallbackTier when neither is
+	// known or the stream has no weapon (combat_general).
+	int getPlayerBotGrindTier(uint64 identityId, int fallbackTier,
+		String& grindXpType);
 	Vector<ManagedReference<CreatureObject*> > lairObserverSnapshot(
 		uint64 bodyOid, uint64 expectedLairOid);
 	void recordPveHunterKill(uint64 identityId, uint64 bodyOid,
