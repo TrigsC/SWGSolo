@@ -6,6 +6,7 @@
 #include "SimHunterController.h"
 #include "TravelDiagLog.h"
 #include "MissionDiagLog.h"
+#include "SimHunterTravelDiag.h"
 
 #include "engine/core/Core.h"
 #include "server/ServerCore.h"
@@ -409,6 +410,8 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	order = newOrder;
 	species = newSpecies;
 	orderActive = true;
+	// One contract, one travel-combat tally (diagnostic).
+	SimHunterTravelDiag::reset(newOrder.bodyOid);
 	missionHuntOrder = SimPlayerManager::instance()->isPveMissionHuntEnabled();
 	orderAbandoned = false;
 	missionAbandonReason = "";
@@ -465,6 +468,79 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	scheduleActiveTick(100);
 }
 
+// Lowest of the three HAM pools as a fraction, the same measure LAIR_FIELD logs.
+static float simHunterMinHamFraction(AiAgent* hunter) {
+	float hamFraction = 1.f;
+	if (hunter == nullptr)
+		return hamFraction;
+	const uint8 hamPools[] = {CreatureAttribute::HEALTH,
+		CreatureAttribute::ACTION, CreatureAttribute::MIND};
+	Locker agentLock(hunter);
+	for (uint8 i = 0; i < 3; ++i) {
+		int maxHam = hunter->getMaxHAM(hamPools[i]);
+		if (maxHam > 0)
+			hamFraction = Math::min(hamFraction, static_cast<float>(
+				hunter->getHAM(hamPools[i])) / static_cast<float>(maxHam));
+	}
+	return hamFraction;
+}
+
+// F_0.9.8b diagnostic (missiondiag only): the interceptor path is about to shed
+// every defender bilaterally and clear combat. Logged BEFORE the shed so the
+// defender count and nearest distance describe what was dropped. Rate-limited
+// to one line per 5s per bot; the tally counts every occurrence.
+bool SimHunterController::isTravelDiagPhase() const {
+	// defendAgainstInterceptor is shared with the HUNTING handler; only the
+	// movement legs belong in the travel tally.
+	return phase != HUNTING && phase != ENGAGING_LAIR &&
+		phase != RETREATING && phase != HEALING;
+}
+
+void SimHunterController::logTravelDisengage(AiAgent* hunter,
+		const char* reason) {
+	if (hunter == nullptr || !MissionDiagLog::isLoggingEnabled() ||
+			!isTravelDiagPhase())
+		return;
+	float hamFraction = simHunterMinHamFraction(hunter);
+	SimHunterTravelDiag::noteDisengage(hunter->getObjectID(), hamFraction);
+
+	uint64 nowMs = System::getMiliTime();
+	if (lastTravelDisengageLogMs != 0 &&
+			nowMs - lastTravelDisengageLogMs < 5000) {
+		++suppressedTravelDisengages;
+		return;
+	}
+	int defenders = 0;
+	float nearest = -1.f;
+	{
+		Locker agentLock(hunter);
+		const DeltaVector<ManagedReference<SceneObject*> >* defenderList =
+			hunter->getDefenderList();
+		if (defenderList != nullptr) {
+			for (int i = 0; i < defenderList->size(); ++i) {
+				ManagedReference<SceneObject*> defender = defenderList->getSafe(i);
+				if (defender == nullptr)
+					continue;
+				++defenders;
+				float distance = hunter->getWorldPosition().distanceTo(
+					defender->getWorldPosition());
+				if (nearest < 0.f || distance < nearest)
+					nearest = distance;
+			}
+		}
+	}
+	MissionDiagLog::event("TRAVEL_DISENGAGE", identityId,
+		"phase=" + getPhaseName() + " reason=" + String(reason) +
+		" defenders=" + String::valueOf(defenders) +
+		" nearestDefenderM=" + String::valueOf(static_cast<int>(nearest)) +
+		" selectRadiusM=" + String::valueOf(static_cast<int>(
+			SimPlayerManager::instance()->getPveHunterScanRadiusMeters() + 24.f)) +
+		" botHamFraction=" + String::valueOf(hamFraction) +
+		" suppressedSinceLast=" + String::valueOf(suppressedTravelDisengages));
+	lastTravelDisengageLogMs = nowMs;
+	suppressedTravelDisengages = 0;
+}
+
 void SimHunterController::onTick() {
 	// Self-defense hook, run on the arrival cadence (checkArrival calls onTick),
 	// which stays live through the travel legs even when the active tick is idle.
@@ -505,10 +581,12 @@ void SimHunterController::onTick() {
 	// so resetInterceptorCombat preserves it and cannot abandon a mission target.
 	ManagedReference<CreatureObject*> attacker;
 	ManagedReference<AiAgent*> attackerAgent;
-	if (selectActiveCombatAttacker(strongAgent, attacker, attackerAgent))
+	if (selectActiveCombatAttacker(strongAgent, attacker, attackerAgent)) {
 		defendAgainstInterceptor(strongAgent, attacker.get());
-	else
+	} else {
+		logTravelDisengage(strongAgent, "no_selectable_attacker");
 		resetInterceptorCombat();
+	}
 }
 
 bool SimHunterController::shouldContinueArrivalChecks() const {
@@ -3493,6 +3571,11 @@ void SimHunterController::runActiveTick() {
 		cancelPveDoctorRequest();
 		if (!deathReported) {
 			deathReported = true;
+			// Captured first: beginMissionCleanup below re-records the phase as
+			// MISSION_CLEANUP before the death is finalized (diagnostic).
+			const String phaseAtDeath = getPhaseName();
+			SimHunterTravelDiag::notePhaseAtDeath(strongAgent->getObjectID(),
+				phaseAtDeath);
 			SimPlayerManager::instance()->finishPveHunterBuffTrip(identityId,
 				false);
 			pveBuffTripAtHub = false;
@@ -3513,7 +3596,7 @@ void SimHunterController::runActiveTick() {
 			else
 				setPhase(CLONE_HOME);
 			SimPlayerManager::instance()->onPveHunterDied(identityId,
-				strongAgent->getObjectID());
+				strongAgent->getObjectID(), "controller", phaseAtDeath);
 		}
 		return;
 	}
@@ -5838,6 +5921,9 @@ bool SimHunterController::defendAgainstInterceptor(AiAgent* hunter,
 			!attacker->isAttackableBy(hunter) ||
 			hunter->getDistanceTo(attacker) >
 				SimPlayerManager::instance()->getPveHunterScanRadiusMeters() + 24.f) {
+		logTravelDisengage(hunter, hunter->getDistanceTo(attacker) >
+			SimPlayerManager::instance()->getPveHunterScanRadiusMeters() + 24.f ?
+			"attacker_out_of_range" : "attacker_not_eligible");
 		CreatureObject* missionTarget = nullptr;
 		AiAgent* missionTargetAgent = nullptr;
 		if (targetOid != 0 && targetIsLive(targetOid, missionTarget,
@@ -5868,6 +5954,48 @@ bool SimHunterController::defendAgainstInterceptor(AiAgent* hunter,
 		hunter->activateAiBehavior(true);
 	}
 	registerEngagedTelemetry(attacker->getObjectID());
+
+	// F_0.9.8b diagnostic (missiondiag only): the bot fought back on a travel
+	// leg. It keeps walking -- retreat is evaluated only in HUNTING -- so these
+	// lines show what it powers through on the way to a lair.
+	if (MissionDiagLog::isLoggingEnabled() && isTravelDiagPhase()) {
+		AiAgent* attackerAgent = attacker->asAiAgent();
+		const CreatureTemplate* attackerTemplate = attackerAgent == nullptr ?
+			nullptr : attackerAgent->getCreatureTemplate();
+		String attackerName = attackerTemplate == nullptr ? String("unknown") :
+			attackerTemplate->getTemplateName();
+		int attackerLevel = attacker->getLevel();
+		float distance = hunter->getDistanceTo(attacker);
+		float hamFraction = simHunterMinHamFraction(hunter);
+		int defenders = 0;
+		{
+			Locker agentLock(hunter);
+			const DeltaVector<ManagedReference<SceneObject*> >* defenderList =
+				hunter->getDefenderList();
+			defenders = defenderList == nullptr ? 0 : defenderList->size();
+		}
+		SimHunterTravelDiag::noteEngage(hunter->getObjectID(), attackerName,
+			attackerLevel, hamFraction);
+		// The tally counts every engage; the log line is limited to one per 5s
+		// per bot so a shed/re-engage loop cannot flood missiondiag.log.
+		uint64 engageNowMs = System::getMiliTime();
+		if (lastTravelEngageLogMs != 0 &&
+				engageNowMs - lastTravelEngageLogMs < 5000) {
+			++suppressedTravelEngages;
+			return true;
+		}
+		lastTravelEngageLogMs = engageNowMs;
+		const int suppressedEngages = suppressedTravelEngages;
+		suppressedTravelEngages = 0;
+		MissionDiagLog::event("TRAVEL_ENGAGE", identityId,
+			"phase=" + getPhaseName() + " attacker=" + attackerName +
+			" attackerOid=" + String::valueOf(attacker->getObjectID()) +
+			" attackerLevel=" + String::valueOf(attackerLevel) +
+			" distM=" + String::valueOf(static_cast<int>(distance)) +
+			" defenders=" + String::valueOf(defenders) +
+			" botHamFraction=" + String::valueOf(hamFraction) +
+			" suppressedSinceLast=" + String::valueOf(suppressedEngages));
+	}
 
 	return true;
 }

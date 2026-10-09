@@ -329,6 +329,11 @@ private:
 	// off (checked before any lock is taken).
 	void logTravelHeartbeat(const String& phaseLabel, uint64 nowMs);
 	uint64 lastTravelHeartbeatMs = 0;
+	// F_0.9.8b travel-combat diagnostic rate limit (missiondiag only).
+	uint64 lastTravelDisengageLogMs = 0;
+	int suppressedTravelDisengages = 0;
+	uint64 lastTravelEngageLogMs = 0;
+	int suppressedTravelEngages = 0;
 	float lastTravelHeartbeatDistance = -1.f;
 	void beginHunting();
 	void beginEarlyGame();
@@ -381,6 +386,8 @@ private:
 	void shedAllDefendersBilaterally(AiAgent* hunter);
 	void resetInterceptorCombat();
 	void clearStaleCombat(const String& reason);
+	bool isTravelDiagPhase() const;
+	void logTravelDisengage(AiAgent* hunter, const char* reason);
 	bool defendAgainstInterceptor(AiAgent* hunter, CreatureObject* attacker);
 	bool isBelowRetreatThreshold(AiAgent* hunter) const;
 	bool isReadyToResume(AiAgent* hunter) const;

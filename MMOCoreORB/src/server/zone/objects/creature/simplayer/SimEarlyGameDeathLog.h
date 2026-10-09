@@ -68,13 +68,35 @@ private:
 
 public:
 	// Lock-free: the engine capture point reads only this while the gate is off.
+	// F_0.9.8b: missiondiag also wants the killing blow of MISSION bots, but
+	// must not switch on the early-game combat telemetry that isEnabled()
+	// gates. Capture runs when either is on; the store clears only when both
+	// are off.
+	static std::atomic<bool>& missionCaptureStorage() {
+		static std::atomic<bool> enabled(false);
+		return enabled;
+	}
+
 	static bool isEnabled() {
 		return enabledStorage().load(std::memory_order_acquire);
 	}
 
+	static bool isCaptureEnabled() {
+		return isEnabled() ||
+			missionCaptureStorage().load(std::memory_order_acquire);
+	}
+
 	static void setEnabled(bool value) {
 		enabledStorage().store(value, std::memory_order_release);
-		if (!value) {
+		if (!isCaptureEnabled()) {
+			Locker lock(&mutexStorage());
+			causesStorage().removeAll();
+		}
+	}
+
+	static void setMissionCaptureEnabled(bool value) {
+		missionCaptureStorage().store(value, std::memory_order_release);
+		if (!isCaptureEnabled()) {
 			Locker lock(&mutexStorage());
 			causesStorage().removeAll();
 		}

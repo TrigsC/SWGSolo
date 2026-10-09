@@ -7018,7 +7018,7 @@ static void captureSimEarlyGameDeathCause(AiAgent* victim, TangibleObject* attac
 
 int AiAgentImplementation::notifyObjectDestructionObservers(TangibleObject* attacker, int condition, bool isCombatAction) {
 	// Only the first, killing call: notifyDestruction ignores an already-dead agent.
-	if (simPlayerBot && !isDead() && SimEarlyGameDeathLog::isEnabled())
+	if (simPlayerBot && !isDead() && SimEarlyGameDeathLog::isCaptureEnabled())
 		captureSimEarlyGameDeathCause(asAiAgent(), attacker, isCombatAction);
 
 	sendReactionChat(attacker, ReactionManager::DEATH);

@@ -3928,7 +3928,11 @@ public:
 		bool participantVerified);
 	void handlePveHunterDestructionHandoff(uint64 hunterOid, uint64 targetOid,
 		bool participantVerified);
-	void onPveHunterDied(uint64 identityId, uint64 bodyOid);
+	// source names the observer that finalized it ("controller"/"sweep").
+	// controllerPhase: the phase the controller saw at death, captured before
+	// mission cleanup rewrites the order phase (empty on the sweep path).
+	void onPveHunterDied(uint64 identityId, uint64 bodyOid,
+		const char* source = "unknown", const String& controllerPhase = "");
 	void recordPveHunterPhase(uint64 identityId, uint64 bodyOid,
 		const String& phase, uint64 targetOid = 0);
 	void recordPveHunterMissionHuntStarted(uint64 identityId, uint64 bodyOid,

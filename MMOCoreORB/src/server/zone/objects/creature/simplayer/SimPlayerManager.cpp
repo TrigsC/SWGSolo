@@ -13,6 +13,7 @@
 #include "SimPveRelocationDeadline.h"
 #include "SimBotTrainingOrder.h"
 #include "SimBotDispatchPolicy.h"
+#include "SimHunterTravelDiag.h"
 
 #include <vector>
 #include "StructureTraversalDiagLog.h"
@@ -6691,6 +6692,10 @@ void SimPlayerManager::loadLuaConfig() {
     if (missionDiagConfig.isValidTable()) {
         MissionDiagLog::setLoggingEnabled(
             missionDiagConfig.getBooleanField("logging", false));
+        // F_0.9.8b: HUNTER_DEATH needs the travel tally and the killing blow.
+        SimHunterTravelDiag::setEnabled(MissionDiagLog::isLoggingEnabled());
+        SimEarlyGameDeathLog::setMissionCaptureEnabled(
+            MissionDiagLog::isLoggingEnabled());
     }
     missionDiagConfig.pop();
 
@@ -18050,7 +18055,7 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 	// the override to be resolved from, and outside pveMutex because
 	// onPveHunterDied takes it.
 	for (int i = 0; i < deadIdentityIds.size(); ++i)
-		onPveHunterDied(deadIdentityIds.get(i), deadBodyOids.get(i));
+		onPveHunterDied(deadIdentityIds.get(i), deadBodyOids.get(i), "sweep");
 
 	for (int i = 0; i < missingIdentities.size(); ++i) {
 		uint64 identityId = missingIdentities.get(i);
@@ -22860,7 +22865,8 @@ void SimPlayerManager::handlePveHunterDestructionHandoff(uint64 hunterOid,
 		hunter->onHuntDestruction(targetOid, participantVerified);
 }
 
-void SimPlayerManager::onPveHunterDied(uint64 identityId, uint64 bodyOid) {
+void SimPlayerManager::onPveHunterDied(uint64 identityId, uint64 bodyOid,
+		const char* source, const String& controllerPhase) {
 	SimBotIdentity identitySnapshot;
 	SimBotActivityDecision activity;
 	bool earlyGameIdentity = false;
@@ -22875,6 +22881,14 @@ void SimPlayerManager::onPveHunterDied(uint64 identityId, uint64 bodyOid) {
 	// failed and the cloner override was silently lost, respawning the bot at
 	// home. Resolution reads the world and takes no manager mutex, so it is
 	// safe here, and the claim below stores it atomically under one lock.
+	// F_0.9.8b diagnostic: where a MISSION bot died, read now for the same
+	// reason as the death site below -- a sweep-first death destroys the corpse.
+	const bool deathDiag = MissionDiagLog::isLoggingEnabled();
+	String diagPlanet;
+	Vector3 diagPosition;
+	bool haveDiagSite = deathDiag &&
+		resolvePveDeathSite(bodyOid, diagPlanet, diagPosition);
+
 	SimBotSpawnOverride resolvedOverride;
 	bool haveResolvedOverride = earlyGameIdentity &&
 		resolvePveDeathSpawnOverride(bodyOid, resolvedOverride);
@@ -22886,6 +22900,9 @@ void SimPlayerManager::onPveHunterDied(uint64 identityId, uint64 bodyOid) {
 		resolvePveDeathSite(bodyOid, deathPlanet, deathPosition);
 
 	bool countDeath = false;
+	String diagOrderPhase = "none";
+	uint64 diagOfferId = 0;
+	String diagLair;
 	{
 		Locker pveLock(&pveMutex);
 		if (pveDeathsReportedBodyOids.contains(bodyOid))
@@ -22917,6 +22934,14 @@ void SimPlayerManager::onPveHunterDied(uint64 identityId, uint64 bodyOid) {
 					!pveRetiringIdentityIds.contains(identityId))
 				pveDeathSpawnOverrides.put(identityId, resolvedOverride);
 		}
+		// Snapshot the order before it is cleared: the sweep path writes no
+		// MISSION_SUMMARY, so this is the only record of what the bot was doing.
+		if (pveHuntOrders.contains(identityId)) {
+			const PveHuntOrder& order = pveHuntOrders.get(identityId);
+			diagOrderPhase = order.phase;
+			diagOfferId = order.offerId;
+			diagLair = order.pinnedLairTemplate;
+		}
 		clearPveHunterOrderLocked(identityId, "DEATH_REQUEUED");
 	}
 
@@ -22930,6 +22955,47 @@ void SimPlayerManager::onPveHunterDied(uint64 identityId, uint64 bodyOid) {
 		if (earlyGameIdentity && haveDeathSite)
 			recordPlayerBotEarlyGameDeathSite(identityId, bodyOid, deathPlanet,
 				deathPosition, haveDeathCause ? &deathCause : nullptr);
+		if (deathDiag) {
+			SimHunterTravelTally tally;
+			bool haveTally = SimHunterTravelDiag::take(bodyOid, tally);
+			uint64 nowMs = System::getMiliTime();
+			// Prefer the controller's own observation (passed in, or stored before
+			// cleanup when the sweep won); fall back to the order phase.
+			String deathPhase = !controllerPhase.isEmpty() ? controllerPhase :
+				(haveTally && !tally.phaseAtDeath.isEmpty() ? tally.phaseAtDeath :
+				diagOrderPhase);
+			StringBuffer line;
+			line << "source=" << (source == nullptr ? "unknown" : source) <<
+				" body=" << bodyOid << " phase=" << deathPhase <<
+				" orderPhase=" << diagOrderPhase <<
+				" offerId=" << diagOfferId << " lair=" <<
+				(diagLair.isEmpty() ? String("none") : diagLair);
+			if (haveDiagSite)
+				line << " planet=" << diagPlanet << " x=" <<
+					static_cast<int>(diagPosition.getX()) << " y=" <<
+					static_cast<int>(diagPosition.getY());
+			if (haveDeathCause)
+				line << " killer=" << deathCause.attackerTemplate <<
+					" killerLevel=" << deathCause.attackerLevel <<
+					" killerDistM=" << static_cast<int>(deathCause.attackerDistance) <<
+					" threatEntries=" << deathCause.threatEntries <<
+					" topDamager=" << deathCause.topDamagerTemplate;
+			else
+				line << " killer=uncaptured";
+			if (haveTally)
+				line << " travelEngages=" << tally.engages <<
+					" travelDisengages=" << tally.disengages <<
+					" lastAttacker=" << tally.lastAttacker <<
+					" lastAttackerLevel=" << tally.lastAttackerLevel <<
+					" lastEngageAgoS=" << (tally.lastEngageMs == 0 ? -1 :
+						static_cast<int64>((nowMs - tally.lastEngageMs) / 1000)) <<
+					" lastDisengageAgoS=" << (tally.lastDisengageMs == 0 ? -1 :
+						static_cast<int64>((nowMs - tally.lastDisengageMs) / 1000)) <<
+					" lastHamFraction=" << tally.lastHamFraction;
+			else
+				line << " travelEngages=0 travelDisengages=0";
+			MissionDiagLog::event("HUNTER_DEATH", identityId, line.toString());
+		}
 	}
 	if (countDeath && earlyGameIdentity) {
 		recordPlayerBotEarlyGameDeath(identityId);
