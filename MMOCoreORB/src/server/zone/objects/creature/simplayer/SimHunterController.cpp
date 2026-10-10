@@ -599,6 +599,11 @@ bool SimHunterController::recognisesThreatAttackers() const {
 		(isTravelCombatGateOn() && isTravelCombatPhase());
 }
 
+void SimHunterController::armTravelCombatTick() {
+	if (isTravelCombatGateOn())
+		scheduleActiveTick(1000);
+}
+
 void SimHunterController::resumeTravelLeg(const Vector3& destination) {
 	// The terminal leg re-resolves its terminal (it may be indoors); every
 	// other leg walks to a plain world point.
@@ -1816,6 +1821,7 @@ void SimHunterController::beginMissionTerminalLeg() {
 		setHybridFailureProbeEnabled(MissionDiagLog::isLoggingEnabled());
 		if (moveIssued)
 			moveTo(missionTerminalPosition);
+		armTravelCombatTick();
 		return;
 	}
 
@@ -1986,6 +1992,7 @@ bool SimHunterController::beginNextMissionOffer() {
 	setPhase(TRAVEL_TO_MISSION);
 	setHybridFailureProbeEnabled(MissionDiagLog::isLoggingEnabled());
 	moveTo(missionLairPosition);
+	armTravelCombatTick();
 	return true;
 }
 
@@ -2019,6 +2026,7 @@ void SimHunterController::spawnMissionLair() {
 		agent->getObjectID(), species.key,
 		"Moving out to the " + species.harvestKind + " lair.");
 	moveTo(missionLairPosition);
+	armTravelCombatTick();
 }
 
 void SimHunterController::beginMissionCleanup(bool abandoned,
@@ -3975,6 +3983,12 @@ void SimHunterController::runActiveTick() {
 	case BUFF_TRIP: phaseTimeoutMs = 900000; break;
 	default: break;
 	}
+	// With travel combat the tick now runs DURING these walks, so their TTL is
+	// enforced for the first time, and a walk can legitimately include holds
+	// and rests. Give the covered legs twice the budget.
+	if (isTravelCombatGateOn() && isTravelCombatPhase() &&
+			phaseTimeoutMs == 900000)
+		phaseTimeoutMs = 1800000;
 	if (phaseTimeoutMs != 0 && phaseStartedAtMs != 0 &&
 			nowMs - phaseStartedAtMs >= phaseTimeoutMs) {
 		if (phase == RELOCATING || phase == BUFF_TRIP) {
@@ -4150,6 +4164,7 @@ void SimHunterController::runActiveTick() {
 			missionLairPosition = offer.revealedPos;
 			setPhase(TRAVEL_TO_LAIR);
 			moveTo(missionLairPosition);
+			armTravelCombatTick();
 			return;
 		}
 		// F_0.9.8c: flee or rest owns the tick; the reveal below only runs
@@ -4224,6 +4239,7 @@ void SimHunterController::runActiveTick() {
 				"Transmission Received: Mission Target has been located.  Mission waypoint has been updated to exact location");
 			setPhase(TRAVEL_TO_LAIR);
 			moveTo(missionLairPosition);
+			armTravelCombatTick();
 			return;
 		}
 		if (state != MOVING && state != CALCULATING_PATH)
@@ -6523,6 +6539,7 @@ void SimHunterController::beginTravelHome(bool abandoned) {
 	travelHomeDestinationSet = true;
 	setPhase(TRAVEL_HOME);
 	moveTo(home);
+	armTravelCombatTick();
 }
 
 void SimHunterController::completeOrder(bool abandoned, const String& reason) {

@@ -419,6 +419,11 @@ private:
 	bool weaponFightsOnTheRun(AiAgent* hunter) const;
 	void resetTravelCombat();
 	void resumeTravelLeg(const Vector3& destination);
+	// Travel combat lives in runActiveTick, but every overland leg used to be
+	// entered WITHOUT re-arming the tick: it only woke on arrival, so on the
+	// walk itself nothing evaluated HAM, the mop-up hold, or the phase TTL.
+	// Called at each leg entry; a no-op with the gate off.
+	void armTravelCombatTick();
 	// Threat-map attacker recognition is on when its own gate is, AND always on
 	// a travel-combat leg: the mop-up hold starts right after the lair's death
 	// cleared the bot's combat flag and defender list, so without it the hold
