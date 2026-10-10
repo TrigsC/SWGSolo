@@ -536,7 +536,8 @@ This is this fork's primary custom subsystem, layered on top of the stock
   grinds for `grindFallbackMinutes` (`progressionGrindFallbackUntilMs`, read by
   `scorePlayerBotActivity`). Template-complete bots keep the market path.
   **F_0.9.8c travel combat** (gate `missionBoard.travelCombat`, with `travelRestHamPct`):
-  on `TRAVEL_TO_MISSION`/`TRAVEL_TO_LAIR` a sub-mode (`SimBotTravelCombat`: MOVE / FLEE /
+  on every overland mission leg (`TRAVEL_TO_MISSION`, `TRAVEL_TO_LAIR`, `TRAVEL_TO_TERMINAL`,
+  `TRAVEL_HOME`) a sub-mode (`SimBotTravelCombat`: MOVE / FLEE /
   REST, owned by `runActiveTick`) adds a low-HAM retreat **toward the mission** (forward flee
   point, veer if the attacker is ahead, sideways near the destination) and a rest to
   `resumeHamPct` before walking on. Two base-controller hooks, both default to the old
@@ -544,6 +545,8 @@ This is this fork's primary custom subsystem, layered on top of the stock
   `moveToWithOrigin`, `onPathFound` and `checkArrival`) and `isMovementHeld()` (stops
   `checkArrival` resuming the destination). The hunter's flee arrival and path failure are
   routed back to the tick, never to `LAIR_REACHED` or a mission path failure.
+  A **mop-up hold** keeps a bot in MOVE from walking while a creature is aimed at it (the
+  lair's survivors after the lair dies); it self-releases after 180 s.
   Gate `missionBoard.attackerRecognition`: `selectActiveCombatAttacker` also takes threat-map
   creatures that are in combat and aimed at the bot, because `CombatManager::startCombat`
   never puts an attacker on the defender's own defender list. This is a

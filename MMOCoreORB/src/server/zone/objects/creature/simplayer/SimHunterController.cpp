@@ -551,8 +551,12 @@ void SimHunterController::logTravelDisengage(AiAgent* hunter,
 // HAM, toward the mission) and the recovery before walking on.
 
 bool SimHunterController::isTravelCombatPhase() const {
+	// Every overland walk of a mission order: out to the mission and the lair,
+	// and -- owner 2026-10-10 -- back to the terminal and home. The return legs
+	// start AT the lair, with its survivors still on the bot.
 	return missionHuntOrder &&
-		(phase == TRAVEL_TO_MISSION || phase == TRAVEL_TO_LAIR);
+		(phase == TRAVEL_TO_MISSION || phase == TRAVEL_TO_LAIR ||
+			phase == TRAVEL_TO_TERMINAL || phase == TRAVEL_HOME);
 }
 
 bool SimHunterController::isTravelCombatGateOn() const {
@@ -578,15 +582,40 @@ bool SimHunterController::keepsCombatOnPathAccept() const {
 }
 
 bool SimHunterController::isMovementHeld() const {
-	return isTravelCombatGateOn() && isTravelCombatPhase() &&
-		travelCombatMode.load(std::memory_order_acquire) ==
-			SimBotTravelCombat::REST;
+	if (!isTravelCombatGateOn() || !isTravelCombatPhase())
+		return false;
+	if (travelCombatMode.load(std::memory_order_acquire) ==
+			SimBotTravelCombat::REST)
+		return true;
+	// The mop-up hold is only honoured while the tick keeps refreshing it, so
+	// it can never outlive the code that decides it.
+	return travelHoldActive.load(std::memory_order_acquire) &&
+		System::getMiliTime() < travelCombatTouchedMs.load(
+			std::memory_order_acquire) + 5000;
+}
+
+bool SimHunterController::recognisesThreatAttackers() const {
+	return SimPlayerManager::instance()->getPveMissionBoardAttackerRecognition() ||
+		(isTravelCombatGateOn() && isTravelCombatPhase());
+}
+
+void SimHunterController::resumeTravelLeg(const Vector3& destination) {
+	// The terminal leg re-resolves its terminal (it may be indoors); every
+	// other leg walks to a plain world point.
+	if (phase == TRAVEL_TO_TERMINAL)
+		beginMissionTerminalLeg();
+	else
+		moveTo(destination);
 }
 
 void SimHunterController::resetTravelCombat() {
 	travelCombatMode.store(SimBotTravelCombat::MOVE, std::memory_order_release);
 	travelFleeLegEnded.store(false, std::memory_order_release);
 	travelFightOnTheRun.store(false, std::memory_order_release);
+	travelHoldActive.store(false, std::memory_order_release);
+	travelHoldStartedMs = 0;
+	travelHoldExhausted = false;
+	travelHomeDestinationSet = false;
 	travelCombatPhase = -1;
 	travelRetreats = 0;
 	travelFleeIssuedMs = 0;
@@ -621,22 +650,26 @@ bool SimHunterController::runTravelCombat(AiAgent* hunter,
 	const int current = travelCombatMode.load(std::memory_order_acquire);
 
 	if (!isTravelCombatGateOn()) {
-		// Switched off mid-flee or mid-rest: release the hold and walk on.
-		if (current != SimBotTravelCombat::MOVE) {
+		// Switched off mid-flee, mid-rest or mid-hold: release it and walk on.
+		const bool wasHolding = travelHoldActive.load(std::memory_order_acquire);
+		if (current != SimBotTravelCombat::MOVE || wasHolding) {
 			resetTravelCombat();
-			moveTo(destination);
+			resumeTravelLeg(destination);
 		}
 		return false;
 	}
+	travelCombatTouchedMs.store(System::getMiliTime(),
+		std::memory_order_release);
 
 	// A mode never carries across legs: each leg starts walking.
 	if (travelCombatPhase != static_cast<int>(phase)) {
 		travelCombatPhase = static_cast<int>(phase);
+		travelHoldActive.store(false, std::memory_order_release);
 		if (current != SimBotTravelCombat::MOVE) {
 			travelCombatMode.store(SimBotTravelCombat::MOVE,
 				std::memory_order_release);
 			travelFleeLegEnded.store(false, std::memory_order_release);
-			moveTo(destination);
+			resumeTravelLeg(destination);
 			return false;
 		}
 	}
@@ -648,8 +681,7 @@ bool SimHunterController::runTravelCombat(AiAgent* hunter,
 	ManagedReference<AiAgent*> attackerAgent;
 	// With recognition on, a creature hitting the bot counts even before the
 	// bot's own combat state says so.
-	const bool attacked = (hunter->isInCombat() || SimPlayerManager::instance()->
-		getPveMissionBoardAttackerRecognition()) &&
+	const bool attacked = (hunter->isInCombat() || recognisesThreatAttackers()) &&
 		selectActiveCombatAttacker(hunter, attacker, attackerAgent);
 	const float hamFraction = simHunterMinHamFraction(hunter);
 	const int restPct = SimPlayerManager::instance()->
@@ -694,6 +726,9 @@ bool SimHunterController::runTravelCombat(AiAgent* hunter,
 		if (hunter->getZone() != nullptr)
 			fleeTarget.setZ(hunter->getZone()->getHeight(fleeX, fleeY));
 	}
+
+	if (next != SimBotTravelCombat::MOVE)
+		travelHoldActive.store(false, std::memory_order_release);
 
 	if (next != current || reflee) {
 		if (next == SimBotTravelCombat::FLEE && current != SimBotTravelCombat::FLEE)
@@ -750,14 +785,55 @@ bool SimHunterController::runTravelCombat(AiAgent* hunter,
 		}
 		scheduleActiveTick(2000);
 		return true;
-	default:
+	default: {
 		if (current != SimBotTravelCombat::MOVE) {
 			travelCombatMode.store(SimBotTravelCombat::MOVE,
 				std::memory_order_release);
 			travelFleeLegEnded.store(false, std::memory_order_release);
-			moveTo(destination);
 		}
+		// Mop-up hold (owner 2026-10-10). A bot does not walk away while a
+		// creature is aimed at it: when the lair dies its survivors are still on
+		// the bot, and leaving for the terminal dragged them along until they
+		// killed it. Standing lets the fight finish -- onTick fights back, FLEE
+		// still takes over below the retreat threshold -- and the walk resumes
+		// once nothing is aimed at the bot. A fight-on-the-run weapon keeps
+		// walking instead.
+		static const uint64 MAX_HOLD_MS = 180000;
+		const bool wasHolding = travelHoldActive.load(std::memory_order_acquire);
+		const uint64 holdNowMs = System::getMiliTime();
+		travelHoldExhausted = SimBotTravelCombat::mopUpExhausted(attacked,
+			travelHoldExhausted, wasHolding && travelHoldStartedMs != 0 ?
+				holdNowMs - travelHoldStartedMs : 0, MAX_HOLD_MS);
+		const bool hold = SimBotTravelCombat::mopUpHold(attacked,
+			travelFightOnTheRun.load(std::memory_order_acquire),
+			travelHoldExhausted);
+		if (hold != wasHolding) {
+			travelHoldStartedMs = hold ? holdNowMs : 0;
+			travelHoldActive.store(hold, std::memory_order_release);
+			String attackerName = "none";
+			if (attackerAgent != nullptr &&
+					attackerAgent->getCreatureTemplate() != nullptr)
+				attackerName =
+					attackerAgent->getCreatureTemplate()->getTemplateName();
+			MissionDiagLog::event("TRAVEL_HOLD", identityId,
+				"phase=" + getPhaseName() +
+				" state=" + String(hold ? "begin" : "end") +
+				" exhausted=" + String::valueOf(travelHoldExhausted) +
+				" botHamFraction=" + String::valueOf(hamFraction) +
+				" attacker=" + attackerName +
+				" attackerLevel=" + String::valueOf(attacker == nullptr ? 0 :
+					attacker->getLevel()));
+		}
+		if (hold) {
+			if (!wasHolding)
+				state = SimPlayerController::IDLE;
+			scheduleActiveTick(1000);
+			return true;
+		}
+		if (wasHolding || current != SimBotTravelCombat::MOVE)
+			resumeTravelLeg(destination);
 		return false;
+	}
 	}
 }
 
@@ -787,8 +863,7 @@ void SimHunterController::onTick() {
 
 	// Attacker recognition looks past the bot's own combat state: a creature
 	// can be hitting a bot whose combat flag has already been cleared.
-	if (!strongAgent->isInCombat() && !SimPlayerManager::instance()->
-			getPveMissionBoardAttackerRecognition())
+	if (!strongAgent->isInCombat() && !recognisesThreatAttackers())
 		return;
 
 	// Concurrency: onTick (ArrivalCheckTask) and runActiveTick
@@ -4029,9 +4104,14 @@ void SimHunterController::runActiveTick() {
 	}
 
 	if (missionHuntOrder && phase == TRAVEL_TO_TERMINAL) {
+		// F_0.9.8c: this leg starts at the lair that just died. Hold, flee or
+		// rest owns the tick; it needs a resolved terminal to aim a flee at.
+		if (missionTerminalResolved &&
+				runTravelCombat(strongAgent, missionTerminalPosition))
+			return;
 		if (missionTerminalResolved &&
 				(state == MOVING || state == CALCULATING_PATH))
-			scheduleActiveTick(2000);
+			scheduleActiveTick(isTravelCombatGateOn() ? 1000 : 2000);
 		else
 			beginMissionTerminalLeg();
 		return;
@@ -4362,6 +4442,10 @@ void SimHunterController::runActiveTick() {
 	}
 
 	if (phase == TRAVEL_HOME || phase == DELIVER || phase == DONE) {
+		if (phase == TRAVEL_HOME && missionHuntOrder &&
+				travelHomeDestinationSet &&
+				runTravelCombat(strongAgent, travelHomeDestination))
+			return;
 		scheduleActiveTick(1000);
 		return;
 	}
@@ -5061,7 +5145,7 @@ bool SimHunterController::selectActiveCombatAttacker(AiAgent* hunter,
 	// -- following it or holding it as a defender -- read under the creature's
 	// own lock with the hunter's released.
 	Vector<ManagedReference<CreatureObject*> > threatCandidates;
-	if (SimPlayerManager::instance()->getPveMissionBoardAttackerRecognition()) {
+	if (recognisesThreatAttackers()) {
 		{
 			Locker agentLock(hunter);
 			ThreatMap* threatMap = hunter->getThreatMap();
@@ -6435,6 +6519,8 @@ void SimHunterController::beginTravelHome(bool abandoned) {
 			String("home_location_unavailable"));
 		return;
 	}
+	travelHomeDestination = home;
+	travelHomeDestinationSet = true;
 	setPhase(TRAVEL_HOME);
 	moveTo(home);
 }

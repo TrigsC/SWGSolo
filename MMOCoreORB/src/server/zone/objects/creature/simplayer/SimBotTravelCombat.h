@@ -84,6 +84,22 @@ inline bool weaponFightsOnTheRun(bool isMeleeWeapon, int hitWhileMovingMod) {
 	return !isMeleeWeapon && hitWhileMovingMod > 0;
 }
 
+// Mop-up hold (owner 2026-10-10): in MOVE a bot does not walk while a creature
+// is aimed at it -- the lair's survivors after the lair dies, or wildlife on the
+// road. A hold that has run maxHoldMs is EXHAUSTED and stays released until
+// nothing is aimed at the bot any more, so a creature that targets the bot but
+// can never reach it cannot pin it until the phase TTL.
+inline bool mopUpExhausted(bool attacked, bool wasExhausted,
+		unsigned long long heldMs, unsigned long long maxHoldMs) {
+	if (!attacked)
+		return false;
+	return wasExhausted || heldMs >= maxHoldMs;
+}
+
+inline bool mopUpHold(bool attacked, bool fightOnTheRun, bool exhausted) {
+	return attacked && !fightOnTheRun && !exhausted;
+}
+
 // The next flee point, on the ground plane (x east, y north).
 //  - Forward: fleeDistance along the bearing to the destination.
 //  - Attacker ahead (within 60 degrees of that bearing): veer 60 degrees to the

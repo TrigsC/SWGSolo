@@ -106,3 +106,28 @@ TEST(SimBotTravelCombatTest, AtTheDestinationFleesAwayFromTheAttacker) {
 	EXPECT_NEAR(std::sqrt(x * x + y * y), 40.f, 0.05f);
 	EXPECT_LE(y, 0.01f);
 }
+
+// ---- mop-up hold ------------------------------------------------------------
+
+TEST(SimBotTravelCombatTest, BotDoesNotWalkAwayWhileSomethingIsAimedAtIt) {
+	// The lair just died and its survivors are still on the bot.
+	EXPECT_TRUE(mopUpHold(true, false, false));
+	EXPECT_FALSE(mopUpHold(false, false, false));
+}
+
+TEST(SimBotTravelCombatTest, FightOnTheRunWeaponKeepsWalking) {
+	EXPECT_FALSE(mopUpHold(true, true, false));
+}
+
+TEST(SimBotTravelCombatTest, HoldGivesUpAfterItsLimit) {
+	EXPECT_FALSE(mopUpExhausted(true, false, 179000, 180000));
+	EXPECT_TRUE(mopUpExhausted(true, false, 180000, 180000));
+	EXPECT_FALSE(mopUpHold(true, false, true));
+}
+
+TEST(SimBotTravelCombatTest, ExhaustedHoldStaysReleasedUntilClear) {
+	// Still aimed at: stays released even though the timer restarted.
+	EXPECT_TRUE(mopUpExhausted(true, true, 0, 180000));
+	// Clear: the next attack may hold again.
+	EXPECT_FALSE(mopUpExhausted(false, true, 0, 180000));
+}

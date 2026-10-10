@@ -346,6 +346,16 @@ private:
 	int travelCombatPhase = -1;
 	int travelRetreats = 0;
 	uint64 travelFleeIssuedMs = 0;
+	// Mop-up hold: in MOVE the bot does not walk while a creature is aimed at
+	// it (the lair's survivors after the lair dies, or wildlife on the road).
+	// Atomic for the arrival-check thread; the touch time makes a hold expire
+	// by itself if the tick stops evaluating it.
+	std::atomic<bool> travelHoldActive{false};
+	std::atomic<uint64> travelCombatTouchedMs{0};
+	Vector3 travelHomeDestination;
+	bool travelHomeDestinationSet = false;
+	uint64 travelHoldStartedMs = 0;
+	bool travelHoldExhausted = false;
 	float lastTravelHeartbeatDistance = -1.f;
 	void beginHunting();
 	void beginEarlyGame();
@@ -408,6 +418,12 @@ private:
 	bool runTravelCombat(AiAgent* hunter, const Vector3& destination);
 	bool weaponFightsOnTheRun(AiAgent* hunter) const;
 	void resetTravelCombat();
+	void resumeTravelLeg(const Vector3& destination);
+	// Threat-map attacker recognition is on when its own gate is, AND always on
+	// a travel-combat leg: the mop-up hold starts right after the lair's death
+	// cleared the bot's combat flag and defender list, so without it the hold
+	// could not see the survivors it exists for.
+	bool recognisesThreatAttackers() const;
 	void logTravelDisengage(AiAgent* hunter, const char* reason);
 	bool defendAgainstInterceptor(AiAgent* hunter, CreatureObject* attacker);
 	bool isBelowRetreatThreshold(AiAgent* hunter) const;
