@@ -334,6 +334,16 @@ private:
 	int suppressedTravelDisengages = 0;
 	uint64 lastTravelEngageLogMs = 0;
 	int suppressedTravelEngages = 0;
+	// F_0.9.8c travel combat (SimBotTravelCombat::Mode). Written only by
+	// runActiveTick; the mode and the fight-on-the-run flag are atomic because
+	// the movement hooks read them from the arrival-check thread, and the
+	// flee-leg flag because onArrived/onPathFailed set it from theirs.
+	std::atomic<int> travelCombatMode{0};
+	std::atomic<bool> travelFightOnTheRun{false};
+	std::atomic<bool> travelFleeLegEnded{false};
+	int travelCombatPhase = -1;
+	int travelRetreats = 0;
+	uint64 travelFleeIssuedMs = 0;
 	float lastTravelHeartbeatDistance = -1.f;
 	void beginHunting();
 	void beginEarlyGame();
@@ -387,6 +397,12 @@ private:
 	void resetInterceptorCombat();
 	void clearStaleCombat(const String& reason);
 	bool isTravelDiagPhase() const;
+	bool isTravelCombatPhase() const;
+	bool isTravelCombatGateOn() const;
+	// Returns true when travel combat consumed this tick (FLEE or REST).
+	bool runTravelCombat(AiAgent* hunter, const Vector3& destination);
+	bool weaponFightsOnTheRun(AiAgent* hunter) const;
+	void resetTravelCombat();
 	void logTravelDisengage(AiAgent* hunter, const char* reason);
 	bool defendAgainstInterceptor(AiAgent* hunter, CreatureObject* attacker);
 	bool isBelowRetreatThreshold(AiAgent* hunter) const;
@@ -407,6 +423,9 @@ public:
 	void startSimLoop() override;
 	void onArrived() override;
 	void onPathFailed() override;
+	bool allowsMovementInCombat() const override;
+	bool isMovementHeld() const override;
+	bool keepsCombatOnPathAccept() const override;
 	void onTick() override;
 	bool shouldContinueArrivalChecks() const override;
 	bool usesNavmeshHybridMovement() const override { return true; }

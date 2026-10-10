@@ -2384,6 +2384,17 @@ SimPlayerManagerConfig = {
             -- transitions: waves fire at reveal, at the FIRST point of damage,
             -- and past half condition, then stop.
             waveDeaggro = false,
+            -- F_0.9.8c travel combat (owner 2026-10-09). On the two walking legs
+            -- of a mission, a bot whose lowest HAM pool falls below the retreat
+            -- threshold while attacked runs TOWARD the mission (veering away
+            -- from an attacker ahead, sideways near the lair), then rests to
+            -- resumeHamPct before walking on. No cap on travel retreats. A
+            -- fight that ends below travelRestHamPct also rests before walking
+            -- on (0 disables that rest). Stand-and-fight is the base mover's
+            -- existing in-combat hold; a ranged weapon with any
+            -- <weapon>_hit_while_moving fights on the run instead.
+            travelCombat = false,
+            travelRestHamPct = 50,
             maxOfferAgeSeconds = 1800,
             -- On reveal, if the advertised wilderness point is no longer
             -- spawn-permitted (a no-build object appeared since the offer was

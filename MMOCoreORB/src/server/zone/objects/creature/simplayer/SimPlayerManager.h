@@ -2623,6 +2623,11 @@ private:
 	// burst-exposure problem rather than an attrition one. Scoped to mission
 	// lairs, that lair's own members, and solo bots only.
 	bool pveMissionBoardWaveDeaggro = false;
+	// F_0.9.8c travel combat: retreat toward the mission below the retreat
+	// threshold, rest before walking on after a fight that ended below
+	// travelRestHamPct (0 disables the rest). Default off.
+	bool pveMissionBoardTravelCombat = false;
+	int pveMissionBoardTravelRestHamPct = 50;
 	// F_0.9.8b progression-first dispatch, owner rule 2026-10-09. A bot whose
 	// training template is incomplete is dispatched to lairs it will fight,
 	// ranked for XP at the tier of the weapon it is grinding; demand only breaks
@@ -4083,6 +4088,12 @@ public:
 	}
 	bool getPveMissionBoardWaveDeaggroEnabled() const {
 		return pveMissionBoardWaveDeaggro;
+	}
+	bool getPveMissionBoardTravelCombatEnabled() const {
+		return pveMissionBoardTravelCombat;
+	}
+	int getPveMissionBoardTravelRestHamPct() const {
+		return pveMissionBoardTravelRestHamPct;
 	}
 	int getPveMissionBoardLairRetargetIntervalMs() const {
 		return pveMissionBoardLairRetargetIntervalMs;

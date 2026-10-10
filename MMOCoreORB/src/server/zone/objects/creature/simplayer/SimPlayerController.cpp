@@ -1350,7 +1350,7 @@ void SimPlayerController::moveToWithOrigin(Vector3 worldPos, Vector3 localPos,
         return;
     }
 
-    if (agent->isInCombat() &&
+    if (agent->isInCombat() && !allowsMovementInCombat() &&
             !(origin == TraversalMoveOrigin::CombatDriver &&
                 traversalFeatureEnabled && isTraversalActive())) {
         state = IDLE;
@@ -2155,7 +2155,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path,
         return;
     }
 
-    if (agent->isInCombat() &&
+    if (agent->isInCombat() && !allowsMovementInCombat() &&
             !(combatDriverResult && isStructureTraversalFeatureEnabled() &&
                 isTraversalActive())) {
 #ifdef DEBUG_SIMPVP
@@ -2281,7 +2281,7 @@ void SimPlayerController::onPathFound(Vector<WorldCoordinates>* path,
 
     bool preserveCombatDriver = combatDriverResult &&
         isStructureTraversalFeatureEnabled() && isTraversalActive();
-    if (!preserveCombatDriver) {
+    if (!preserveCombatDriver && !keepsCombatOnPathAccept()) {
         agent->setFollowObject(nullptr);
         agent->setWatchObject(nullptr);
         agent->setTargetObject(nullptr);
@@ -4771,7 +4771,7 @@ void SimPlayerController::checkArrival() {
         return;
     }
 
-    if (agent->isInCombat()) {
+    if (agent->isInCombat() && !allowsMovementInCombat()) {
         state = IDLE; 
         if (diagnostic)
             CellNavDiagLog::write("ARRIVAL_BRANCH=in_combat");
@@ -4789,6 +4789,19 @@ void SimPlayerController::checkArrival() {
             structureTraversalPhase == StructureTraversalPhase::CombatPaused) {
         locker.release();
         scheduleStructureTraversalResumeMonitor();
+        return;
+    }
+
+    // F_0.9.8c: a held controller neither steps nor resumes its destination;
+    // the arrival chain just keeps ticking until the hold is released.
+    if (isMovementHeld()) {
+        state = IDLE;
+        if (diagnostic)
+            CellNavDiagLog::write("ARRIVAL_BRANCH=movement_held");
+        locker.release();
+        Reference<ArrivalCheckTask*> task =
+            new ArrivalCheckTask(this, getWorkLoopGeneration());
+        task->schedule(nextArrivalDelayMillis(1000));
         return;
     }
 

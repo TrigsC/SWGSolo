@@ -9457,6 +9457,14 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		pveMissionBoardWaveDeaggro =
 			missionBoardConfig.getBooleanField("waveDeaggro",
 				pveMissionBoardWaveDeaggro);
+		// F_0.9.8c. Explicit defaults, so removing the key turns it off.
+		pveMissionBoardTravelCombat =
+			missionBoardConfig.getBooleanField("travelCombat", false);
+		// Not clampMinerInt: that maps 0 to "keep", and 0 here disables the
+		// post-fight rest.
+		pveMissionBoardTravelRestHamPct = Math::max(0, Math::min(95,
+			static_cast<int>(missionBoardConfig.getIntField(
+				"travelRestHamPct", 50))));
 		pveMissionBoardLairRetargetIntervalMs = clampMinerInt(
 			missionBoardConfig.getIntField("lairRetargetIntervalMs",
 				pveMissionBoardLairRetargetIntervalMs),
@@ -22991,7 +22999,9 @@ void SimPlayerManager::onPveHunterDied(uint64 identityId, uint64 bodyOid,
 						static_cast<int64>((nowMs - tally.lastEngageMs) / 1000)) <<
 					" lastDisengageAgoS=" << (tally.lastDisengageMs == 0 ? -1 :
 						static_cast<int64>((nowMs - tally.lastDisengageMs) / 1000)) <<
-					" lastHamFraction=" << tally.lastHamFraction;
+					" lastHamFraction=" << tally.lastHamFraction <<
+					" travelMode=" << tally.travelMode <<
+					" travelRetreats=" << tally.travelRetreats;
 			else
 				line << " travelEngages=0 travelDisengages=0";
 			MissionDiagLog::event("HUNTER_DEATH", identityId, line.toString());

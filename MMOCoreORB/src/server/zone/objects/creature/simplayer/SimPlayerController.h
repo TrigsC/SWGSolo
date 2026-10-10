@@ -565,6 +565,19 @@ public:
     // Combat-capable controllers override this lease predicate for the
     // compound peace predicate used by the traversal resume monitor.
     virtual bool isCombatDriverActive() const { return false; }
+    // F_0.9.8c travel combat. Both default to the existing behaviour, so only
+    // a controller that overrides them changes anything.
+    // allowsMovementInCombat: keep walking while in combat (a fleeing hunter,
+    // or a ranged weapon that can fire on the move). Consulted at the three
+    // in-combat holds -- moveToWithOrigin, onPathFound and checkArrival.
+    virtual bool allowsMovementInCombat() const { return false; }
+    // isMovementHeld: stand still OUT of combat without checkArrival resuming
+    // the stored destination (a hunter resting on a travel leg).
+    virtual bool isMovementHeld() const { return false; }
+    // keepsCombatOnPathAccept: onPathFound normally clears the follow/target
+    // and the combat state when it accepts a path; a controller fighting on the
+    // run must keep its fight across a re-path.
+    virtual bool keepsCombatOnPathAccept() const { return false; }
 
     // --- Common Movement Logic ---
     // World-space target used by the existing callers.

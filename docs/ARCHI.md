@@ -534,7 +534,16 @@ This is this fork's primary custom subsystem, layered on top of the stock
   (`pinnedLairTemplate`, `dispatchLevel`, `avoidPacks`) and
   `selectPveBotMissionLairSpawn` honours the pin. With nothing fightable the bot
   grinds for `grindFallbackMinutes` (`progressionGrindFallbackUntilMs`, read by
-  `scorePlayerBotActivity`). Template-complete bots keep the market path. This is a
+  `scorePlayerBotActivity`). Template-complete bots keep the market path.
+  **F_0.9.8c travel combat** (gate `missionBoard.travelCombat`, with `travelRestHamPct`):
+  on `TRAVEL_TO_MISSION`/`TRAVEL_TO_LAIR` a sub-mode (`SimBotTravelCombat`: MOVE / FLEE /
+  REST, owned by `runActiveTick`) adds a low-HAM retreat **toward the mission** (forward flee
+  point, veer if the attacker is ahead, sideways near the destination) and a rest to
+  `resumeHamPct` before walking on. Two base-controller hooks, both default to the old
+  behaviour: `allowsMovementInCombat()` (consulted at the in-combat holds in
+  `moveToWithOrigin`, `onPathFound` and `checkArrival`) and `isMovementHeld()` (stops
+  `checkArrival` resuming the destination). The hunter's flee arrival and path failure are
+  routed back to the tick, never to `LAIR_REACHED` or a mission path failure. This is a
   **demand-spread** slice only: `consumeReservation` still does **not** drain
   `familySupply` in-session (supply = immutable boot baseline + monotonic
   `pveSessionHarvestByFamily`), so with no family *consumer* yet each family still

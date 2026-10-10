@@ -40,6 +40,9 @@ struct SimHunterTravelTally {
 	// The controller's phase when it saw the death, stored BEFORE mission
 	// cleanup rewrites the order phase, so whichever finalizer wins reads it.
 	String phaseAtDeath;
+	// F_0.9.8c travel-combat mode at the last transition, and retreats so far.
+	String travelMode = "MOVE";
+	int travelRetreats = 0;
 	int lastAttackerLevel = 0;
 	float lastHamFraction = 1.f;
 
@@ -130,6 +133,17 @@ public:
 		SimHunterTravelTally& tally = slotLocked(bodyOid);
 		tally.updatedMs = System::getMiliTime();
 		tally.phaseAtDeath = phase;
+	}
+
+	static void noteTravelMode(uint64 bodyOid, const char* mode,
+			int retreats) {
+		if (bodyOid == 0 || !isEnabled())
+			return;
+		Locker lock(&mutexStorage());
+		SimHunterTravelTally& tally = slotLocked(bodyOid);
+		tally.updatedMs = System::getMiliTime();
+		tally.travelMode = mode;
+		tally.travelRetreats = retreats;
 	}
 
 	// A new contract starts a fresh tally, so the counts describe one trip.
