@@ -20,6 +20,7 @@
 #include "server/zone/objects/creature/buffs/Buff.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/tangible/weapon/WeaponObject.h"
+#include "server/zone/objects/tangible/threat/ThreatMap.h"
 #include "server/zone/managers/combat/CombatManager.h"
 #include "server/zone/managers/player/PlayerManager.h"
 #include "server/chat/ChatManager.h"
@@ -645,7 +646,10 @@ bool SimHunterController::runTravelCombat(AiAgent* hunter,
 
 	ManagedReference<CreatureObject*> attacker;
 	ManagedReference<AiAgent*> attackerAgent;
-	const bool attacked = hunter->isInCombat() &&
+	// With recognition on, a creature hitting the bot counts even before the
+	// bot's own combat state says so.
+	const bool attacked = (hunter->isInCombat() || SimPlayerManager::instance()->
+		getPveMissionBoardAttackerRecognition()) &&
 		selectActiveCombatAttacker(hunter, attacker, attackerAgent);
 	const float hamFraction = simHunterMinHamFraction(hunter);
 	const int restPct = SimPlayerManager::instance()->
@@ -781,7 +785,10 @@ void SimHunterController::onTick() {
 				SimBotTravelCombat::FLEE)
 		return;
 
-	if (!strongAgent->isInCombat())
+	// Attacker recognition looks past the bot's own combat state: a creature
+	// can be hitting a bot whose combat flag has already been cleared.
+	if (!strongAgent->isInCombat() && !SimPlayerManager::instance()->
+			getPveMissionBoardAttackerRecognition())
 		return;
 
 	// Concurrency: onTick (ArrivalCheckTask) and runActiveTick
@@ -803,9 +810,12 @@ void SimHunterController::onTick() {
 	// so resetInterceptorCombat preserves it and cannot abandon a mission target.
 	ManagedReference<CreatureObject*> attacker;
 	ManagedReference<AiAgent*> attackerAgent;
-	if (selectActiveCombatAttacker(strongAgent, attacker, attackerAgent)) {
+	bool viaThreat = false;
+	if (selectActiveCombatAttacker(strongAgent, attacker, attackerAgent,
+			&viaThreat)) {
+		travelEngageViaThreat = viaThreat;
 		defendAgainstInterceptor(strongAgent, attacker.get());
-	} else {
+	} else if (strongAgent->isInCombat()) {
 		logTravelDisengage(strongAgent, "no_selectable_attacker");
 		resetInterceptorCombat();
 	}
@@ -4999,9 +5009,11 @@ bool SimHunterController::hasMissionWaveMobInRange() const {
 
 bool SimHunterController::selectActiveCombatAttacker(AiAgent* hunter,
 		ManagedReference<CreatureObject*>& outAttacker,
-		ManagedReference<AiAgent*>& outAttackerAgent) {
+		ManagedReference<AiAgent*>& outAttackerAgent, bool* outViaThreat) {
 	outAttacker = nullptr;
 	outAttackerAgent = nullptr;
+	if (outViaThreat != nullptr)
+		*outViaThreat = false;
 
 	if (hunter == nullptr)
 		return false;
@@ -5037,6 +5049,54 @@ bool SimHunterController::selectActiveCombatAttacker(AiAgent* hunter,
 		}
 		ManagedReference<SceneObject*> followObject = hunter->getFollowObject();
 		followedOid = followObject == nullptr ? 0 : followObject->getObjectID();
+	}
+
+	// F_0.9.8c attacker recognition. CombatManager::startCombat puts the BOT on
+	// the attacking creature's defender list and the creature on the bot's
+	// THREAT map -- never on the bot's own defender list. Read only the defender
+	// list and a creature can hit a walking bot to death unseen: in 37 of 57
+	// travel deaths the bot first registered a fight with HAM already under 30
+	// percent. Threat entries outlive a fight (clearCombatState leaves the map),
+	// so one only counts while that creature is in combat AND aimed at this bot
+	// -- following it or holding it as a defender -- read under the creature's
+	// own lock with the hunter's released.
+	Vector<ManagedReference<CreatureObject*> > threatCandidates;
+	if (SimPlayerManager::instance()->getPveMissionBoardAttackerRecognition()) {
+		{
+			Locker agentLock(hunter);
+			ThreatMap* threatMap = hunter->getThreatMap();
+			if (threatMap != nullptr) {
+				for (int i = 0; i < threatMap->size(); ++i) {
+					ManagedReference<TangibleObject*> entry =
+						threatMap->elementAt(i).getKey();
+					CreatureObject* creature = entry == nullptr ? nullptr :
+						entry->asCreatureObject();
+					if (creature != nullptr && !candidates.contains(creature))
+						threatCandidates.add(creature);
+				}
+			}
+		}
+		const uint64 hunterOid = hunter->getObjectID();
+		for (int i = 0; i < threatCandidates.size(); ++i) {
+			ManagedReference<CreatureObject*> creature = threatCandidates.get(i);
+			AiAgent* creatureAgent = creature == nullptr ? nullptr :
+				creature->asAiAgent();
+			if (creatureAgent == nullptr || creature == hunter)
+				continue;
+			bool aimedAtHunter = false;
+			{
+				Locker creatureLock(creature);
+				if (creature->isInCombat() && !creature->isDead()) {
+					ManagedReference<SceneObject*> follow =
+						creatureAgent->getFollowObject();
+					aimedAtHunter = (follow != nullptr &&
+						follow->getObjectID() == hunterOid) ||
+						creature->hasDefender(hunter);
+				}
+			}
+			if (aimedAtHunter)
+				candidates.add(creature);
+		}
 	}
 
 	if (candidates.size() == 0)
@@ -5092,6 +5152,8 @@ bool SimHunterController::selectActiveCombatAttacker(AiAgent* hunter,
 		outAttackerAgent = nearestAttackerAgent;
 	}
 
+	if (outViaThreat != nullptr && outAttacker != nullptr)
+		*outViaThreat = threatCandidates.contains(outAttacker);
 	return outAttacker != nullptr && outAttackerAgent != nullptr;
 }
 
@@ -6244,6 +6306,7 @@ bool SimHunterController::defendAgainstInterceptor(AiAgent* hunter,
 			" distM=" + String::valueOf(static_cast<int>(distance)) +
 			" defenders=" + String::valueOf(defenders) +
 			" botHamFraction=" + String::valueOf(hamFraction) +
+			" via=" + String(travelEngageViaThreat ? "threat" : "defenders") +
 			" suppressedSinceLast=" + String::valueOf(suppressedEngages));
 	}
 

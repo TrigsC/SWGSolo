@@ -2627,6 +2627,10 @@ private:
 	// threshold, rest before walking on after a fight that ended below
 	// travelRestHamPct (0 disables the rest). Default off.
 	bool pveMissionBoardTravelCombat = false;
+	// F_0.9.8c attacker recognition: a creature on the bot's threat map that is
+	// in combat and aimed at the bot counts as an attacker, not only the bot's
+	// own defender list (which startCombat never fills for the defender).
+	bool pveMissionBoardAttackerRecognition = false;
 	int pveMissionBoardTravelRestHamPct = 50;
 	// F_0.9.8b progression-first dispatch, owner rule 2026-10-09. A bot whose
 	// training template is incomplete is dispatched to lairs it will fight,
@@ -4091,6 +4095,9 @@ public:
 	}
 	bool getPveMissionBoardTravelCombatEnabled() const {
 		return pveMissionBoardTravelCombat;
+	}
+	bool getPveMissionBoardAttackerRecognition() const {
+		return pveMissionBoardAttackerRecognition;
 	}
 	int getPveMissionBoardTravelRestHamPct() const {
 		return pveMissionBoardTravelRestHamPct;

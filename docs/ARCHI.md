@@ -543,7 +543,10 @@ This is this fork's primary custom subsystem, layered on top of the stock
   behaviour: `allowsMovementInCombat()` (consulted at the in-combat holds in
   `moveToWithOrigin`, `onPathFound` and `checkArrival`) and `isMovementHeld()` (stops
   `checkArrival` resuming the destination). The hunter's flee arrival and path failure are
-  routed back to the tick, never to `LAIR_REACHED` or a mission path failure. This is a
+  routed back to the tick, never to `LAIR_REACHED` or a mission path failure.
+  Gate `missionBoard.attackerRecognition`: `selectActiveCombatAttacker` also takes threat-map
+  creatures that are in combat and aimed at the bot, because `CombatManager::startCombat`
+  never puts an attacker on the defender's own defender list. This is a
   **demand-spread** slice only: `consumeReservation` still does **not** drain
   `familySupply` in-session (supply = immutable boot baseline + monotonic
   `pveSessionHarvestByFamily`), so with no family *consumer* yet each family still

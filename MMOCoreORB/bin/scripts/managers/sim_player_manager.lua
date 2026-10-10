@@ -2395,6 +2395,13 @@ SimPlayerManagerConfig = {
             -- <weapon>_hit_while_moving fights on the run instead.
             travelCombat = false,
             travelRestHamPct = 50,
+            -- F_0.9.8c attacker recognition. Core3's startCombat puts the bot on
+            -- the attacking creature's defender list and the creature on the
+            -- bot's threat map, never on the bot's own defender list -- which is
+            -- all the bot's self-defense read, so a walking bot could be hit to
+            -- death unseen. A threat-map creature that is in combat and aimed at
+            -- the bot now counts as an attacker.
+            attackerRecognition = false,
             maxOfferAgeSeconds = 1800,
             -- On reveal, if the advertised wilderness point is no longer
             -- spawn-permitted (a no-build object appeared since the offer was

@@ -333,6 +333,8 @@ private:
 	uint64 lastTravelDisengageLogMs = 0;
 	int suppressedTravelDisengages = 0;
 	uint64 lastTravelEngageLogMs = 0;
+	// Diagnostic only: the last onTick pick came from the threat map.
+	bool travelEngageViaThreat = false;
 	int suppressedTravelEngages = 0;
 	// F_0.9.8c travel combat (SimBotTravelCombat::Mode). Written only by
 	// runActiveTick; the mode and the fight-on-the-run flag are atomic because
@@ -381,9 +383,12 @@ private:
 	void selectTarget(AiAgent* target);
 	void engageTarget();
 	void disengageTarget(bool dropObserverHandle);
+	// outViaThreat (optional): the pick came from the threat map, not the
+	// defender list (F_0.9.8c attacker recognition).
 	bool selectActiveCombatAttacker(AiAgent* hunter,
 		ManagedReference<CreatureObject*>& outAttacker,
-		ManagedReference<AiAgent*>& outAttackerAgent);
+		ManagedReference<AiAgent*>& outAttackerAgent,
+		bool* outViaThreat = nullptr);
 	ManagedReference<CreatureObject*> engageActiveAttacker(AiAgent* hunter);
 	void dropTargetObserver();
 	void registerTargetObserver(uint64 target);
