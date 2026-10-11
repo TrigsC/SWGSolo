@@ -131,3 +131,35 @@ TEST(SimBotTravelCombatTest, ExhaustedHoldStaysReleasedUntilClear) {
 	// Clear: the next attack may hold again.
 	EXPECT_FALSE(mopUpExhausted(false, true, 0, 180000));
 }
+
+// ---- lair retreat -----------------------------------------------------------
+
+TEST(SimBotTravelCombatTest, RetreatRestsWhenNothingFollowed) {
+	EXPECT_EQ(retreatLegEnded(false, 0, 5), RETREAT_REST);
+}
+
+TEST(SimBotTravelCombatTest, RetreatRunsAgainWhileChased) {
+	EXPECT_EQ(retreatLegEnded(true, 0, 5), RETREAT_REFLEE);
+	EXPECT_EQ(retreatLegEnded(true, 4, 5), RETREAT_REFLEE);
+}
+
+TEST(SimBotTravelCombatTest, RetreatLegsAreBounded) {
+	EXPECT_EQ(retreatLegEnded(true, 5, 5), RETREAT_REST);
+}
+
+TEST(SimBotTravelCombatTest, RestingBotFightsBackWhenAttacked) {
+	// Owner: it would look weird if it just waited to die.
+	EXPECT_EQ(whileResting(true, false, 0, 5), RETREAT_DEFEND);
+}
+
+TEST(SimBotTravelCombatTest, RestingBotBelowThresholdRunsAgain) {
+	EXPECT_EQ(whileResting(true, true, 1, 5), RETREAT_REFLEE);
+}
+
+TEST(SimBotTravelCombatTest, WithNoLegsLeftItFightsRatherThanStands) {
+	EXPECT_EQ(whileResting(true, true, 5, 5), RETREAT_DEFEND);
+}
+
+TEST(SimBotTravelCombatTest, UndisturbedRestKeepsResting) {
+	EXPECT_EQ(whileResting(false, true, 0, 5), RETREAT_REST);
+}

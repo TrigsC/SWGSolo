@@ -346,6 +346,8 @@ private:
 	int travelCombatPhase = -1;
 	int travelRetreats = 0;
 	uint64 travelFleeIssuedMs = 0;
+	int lairRetreatReflees = 0;
+	uint64 lastLairRetreatDefendLogMs = 0;
 	// Mop-up hold: in MOVE the bot does not walk while a creature is aimed at
 	// it (the lair's survivors after the lair dies, or wildlife on the road).
 	// Atomic for the arrival-check thread; the touch time makes a hold expire
@@ -428,6 +430,10 @@ private:
 	// must not reach. Protected while the lair is revealed and the bot is not
 	// deliberately attacking it.
 	void updateAreaAttackGuard();
+	// F_0.9.8e lair retreat: keep running while chased, fight back if attacked
+	// while resting.
+	bool isLairRetreatDefenseOn() const;
+	void lairRetreatReflee(AiAgent* hunter, CreatureObject* attacker);
 	// Threat-map attacker recognition is on when its own gate is, AND always on
 	// a travel-combat leg: the mop-up hold starts right after the lair's death
 	// cleared the bot's combat flag and defender list, so without it the hold

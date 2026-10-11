@@ -2411,6 +2411,13 @@ SimPlayerManagerConfig = {
             -- death unseen. A threat-map creature that is in combat and aimed at
             -- the bot now counts as an attacker.
             attackerRecognition = false,
+            -- F_0.9.8e lair retreat (owner 2026-10-11: "it would look weird if
+            -- they just waited to die"). A bot retreating from a lair fight
+            -- keeps running while something is still on it (up to 5 legs per
+            -- retreat) and fights back if attacked while resting. Before, the
+            -- base in-combat hold pinned it where it stood, its tick slept
+            -- until an arrival that never came, and self-defense was off.
+            lairRetreatDefense = false,
             maxOfferAgeSeconds = 1800,
             -- On reveal, if the advertised wilderness point is no longer
             -- spawn-permitted (a no-build object appeared since the offer was

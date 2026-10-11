@@ -2634,6 +2634,9 @@ private:
 	// in combat and aimed at the bot counts as an attacker, not only the bot's
 	// own defender list (which startCombat never fills for the defender).
 	bool pveMissionBoardAttackerRecognition = false;
+	// F_0.9.8e: a bot retreating from a lair keeps running while chased and
+	// fights back if attacked while resting, instead of standing still.
+	bool pveMissionBoardLairRetreatDefense = false;
 	int pveMissionBoardTravelRestHamPct = 50;
 	// F_0.9.8b progression-first dispatch, owner rule 2026-10-09. A bot whose
 	// training template is incomplete is dispatched to lairs it will fight,
@@ -4101,6 +4104,9 @@ public:
 	}
 	bool getPveMissionBoardAttackerRecognition() const {
 		return pveMissionBoardAttackerRecognition;
+	}
+	bool getPveMissionBoardLairRetreatDefense() const {
+		return pveMissionBoardLairRetreatDefense;
 	}
 	int getPveMissionBoardTravelRestHamPct() const {
 		return pveMissionBoardTravelRestHamPct;

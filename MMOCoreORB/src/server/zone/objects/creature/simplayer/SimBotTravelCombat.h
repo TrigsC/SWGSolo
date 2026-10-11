@@ -84,6 +84,37 @@ inline bool weaponFightsOnTheRun(bool isMeleeWeapon, int hitWhileMovingMod) {
 	return !isMeleeWeapon && hitWhileMovingMod > 0;
 }
 
+// ---- lair retreat (F_0.9.8e, owner 2026-10-11) ------------------------------
+// A bot retreating from a lair fight must not stand and wait to die. Seven lair
+// deaths in one run came 21-57s into a retreat, five of them to wildlife that
+// had wandered in (which the wave de-aggro, scoped to the lair's own creatures,
+// never sheds): the retreat ran one 40m leg and then rested, neither moving
+// again nor fighting back.
+
+enum RetreatStep {
+	RETREAT_REST = 0,
+	RETREAT_REFLEE = 1,
+	RETREAT_DEFEND = 2,
+};
+
+// The retreat leg just ended. Still chased: run again, up to maxReflees legs
+// per retreat. Otherwise rest.
+inline RetreatStep retreatLegEnded(bool chased, int reflees, int maxReflees) {
+	return chased && reflees < maxReflees ? RETREAT_REFLEE : RETREAT_REST;
+}
+
+// While resting. Attacked with HAM to spare: fight back. Attacked below the
+// retreat threshold: run again -- and once the legs are spent, fight anyway,
+// because standing still is the one thing a player would never do.
+inline RetreatStep whileResting(bool attacked, bool belowRetreat, int reflees,
+		int maxReflees) {
+	if (!attacked)
+		return RETREAT_REST;
+	if (belowRetreat && reflees < maxReflees)
+		return RETREAT_REFLEE;
+	return RETREAT_DEFEND;
+}
+
 // Mop-up hold (owner 2026-10-10): in MOVE a bot does not walk while a creature
 // is aimed at it -- the lair's survivors after the lair dies, or wildlife on the
 // road. A hold that has run maxHoldMs is EXHAUSTED and stays released until

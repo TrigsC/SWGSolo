@@ -564,7 +564,45 @@ bool SimHunterController::isTravelCombatGateOn() const {
 	return SimPlayerManager::instance()->getPveMissionBoardTravelCombatEnabled();
 }
 
+bool SimHunterController::isLairRetreatDefenseOn() const {
+	return SimPlayerManager::instance()->getPveMissionBoardLairRetreatDefense();
+}
+
+void SimHunterController::lairRetreatReflee(AiAgent* hunter,
+		CreatureObject* attacker) {
+	if (hunter == nullptr)
+		return;
+	++lairRetreatReflees;
+	Vector3 position = hunter->getWorldPosition();
+	Vector3 direction = attacker == nullptr ? Vector3::UNIT_X :
+		position - attacker->getWorldPosition();
+	direction.setZ(0.f);
+	if (direction.length2d() < 0.01f)
+		direction = Vector3::UNIT_X;
+	else
+		direction.normalize();
+	Vector3 away = position + direction *
+		SimPlayerManager::instance()->getPveHunterRetreatRangeMeters();
+	if (hunter->getZone() != nullptr)
+		away.setZ(hunter->getZone()->getHeight(away.getX(), away.getY()));
+	MissionDiagLog::event("LAIR_RETREAT", identityId,
+		"event=reflee leg=" + String::valueOf(lairRetreatReflees) +
+		" botHamFraction=" + String::valueOf(simHunterMinHamFraction(hunter)) +
+		" attackerLevel=" + String::valueOf(attacker == nullptr ? 0 :
+			attacker->getLevel()) +
+		" lairOid=" + String::valueOf(missionLairOid));
+	// Drop the fight so the bot runs instead of auto-attacking; the hunt target
+	// is preserved for the resume.
+	resetInterceptorCombat();
+	moveTo(away);
+	scheduleActiveTick(1000);
+}
+
 bool SimHunterController::allowsMovementInCombat() const {
+	// A lair retreat is a run; the base in-combat hold used to pin the bot where
+	// it stood for as long as anything kept hitting it.
+	if (phase == RETREATING && isLairRetreatDefenseOn())
+		return true;
 	if (!isTravelCombatGateOn() || !isTravelCombatPhase())
 		return false;
 	int mode = travelCombatMode.load(std::memory_order_acquire);
@@ -597,7 +635,9 @@ bool SimHunterController::isMovementHeld() const {
 
 bool SimHunterController::recognisesThreatAttackers() const {
 	return SimPlayerManager::instance()->getPveMissionBoardAttackerRecognition() ||
-		(isTravelCombatGateOn() && isTravelCombatPhase());
+		(isTravelCombatGateOn() && isTravelCombatPhase()) ||
+		(isLairRetreatDefenseOn() &&
+			(phase == RETREATING || phase == HEALING));
 }
 
 void SimHunterController::updateAreaAttackGuard() {
@@ -2202,6 +2242,8 @@ bool SimHunterController::checkMissionSocialAggro(AiAgent* hunter) {
 			String::valueOf(missionLairOid) + " adds=" +
 			String::valueOf(adds));
 		setPhase(RETREATING);
+		// A new root retreat: it gets its own budget of re-flee legs.
+		lairRetreatReflees = 0;
 		Vector3 current = hunter->getWorldPosition();
 		Vector3 away = current;
 		Vector3 direction = current - target->getWorldPosition();
@@ -2215,6 +2257,10 @@ bool SimHunterController::checkMissionSocialAggro(AiAgent* hunter) {
 		disengageTarget(false);
 		updateMissionAdds(0);
 		moveTo(away);
+		// Same as beginRetreat: without this the tick sleeps until an arrival
+		// that a bot held in combat never reaches.
+		if (isLairRetreatDefenseOn())
+			scheduleActiveTick(1000);
 	} else {
 		beginRetreat();
 	}
@@ -2413,7 +2459,11 @@ void SimHunterController::onArrived() {
 	}
 
 	if (phase == RETREATING) {
-		finishRetreatMove();
+		// F_0.9.8e: the tick decides whether the bot is clear or must run again.
+		if (isLairRetreatDefenseOn())
+			scheduleActiveTick(0);
+		else
+			finishRetreatMove();
 		return;
 	}
 
@@ -4527,15 +4577,65 @@ void SimHunterController::runActiveTick() {
 		return;
 	}
 
+	static const int MAX_LAIR_RETREAT_REFLEES = 5;
 	if (phase == RETREATING) {
-		if (state == MOVING || state == CALCULATING_PATH)
-			scheduleActiveTick(2000);
-		else
-			finishRetreatMove();
+		const bool retreatDefense = isLairRetreatDefenseOn();
+		if (state == MOVING || state == CALCULATING_PATH) {
+			scheduleActiveTick(retreatDefense ? 1000 : 2000);
+			return;
+		}
+		if (retreatDefense) {
+			ManagedReference<CreatureObject*> chaser;
+			ManagedReference<AiAgent*> chaserAgent;
+			const bool chased = selectActiveCombatAttacker(strongAgent, chaser,
+				chaserAgent);
+			if (SimBotTravelCombat::retreatLegEnded(chased, lairRetreatReflees,
+					MAX_LAIR_RETREAT_REFLEES) == SimBotTravelCombat::RETREAT_REFLEE) {
+				lairRetreatReflee(strongAgent, chaser.get());
+				return;
+			}
+		}
+		finishRetreatMove();
 		return;
 	}
 
 	if (phase == HEALING) {
+		if (isLairRetreatDefenseOn()) {
+			ManagedReference<CreatureObject*> attacker;
+			ManagedReference<AiAgent*> attackerAgent;
+			const bool attacked = selectActiveCombatAttacker(strongAgent, attacker,
+				attackerAgent);
+			const SimBotTravelCombat::RetreatStep step =
+				SimBotTravelCombat::whileResting(attacked,
+					isBelowRetreatThreshold(strongAgent), lairRetreatReflees,
+					MAX_LAIR_RETREAT_REFLEES);
+			if (step == SimBotTravelCombat::RETREAT_REFLEE) {
+				setPhase(RETREATING);
+				lairRetreatReflee(strongAgent, attacker.get());
+				return;
+			}
+			// Fight back rather than stand and be killed. Once HAM is back the
+			// normal resume below hands the fight to HUNTING.
+			// Honoured even at full HAM: the hunt resumes only once the bot is
+			// undisturbed, so it never turns back to its old target with an
+			// interceptor still on it.
+			if (step == SimBotTravelCombat::RETREAT_DEFEND) {
+				const bool defending = defendAgainstInterceptor(strongAgent,
+					attacker.get());
+				if (defending && (lastLairRetreatDefendLogMs == 0 ||
+						nowMs - lastLairRetreatDefendLogMs >= 5000)) {
+					lastLairRetreatDefendLogMs = nowMs;
+					MissionDiagLog::event("LAIR_RETREAT", identityId,
+						"event=defend botHamFraction=" + String::valueOf(
+							simHunterMinHamFraction(strongAgent)) +
+						" attackerLevel=" + String::valueOf(attacker->getLevel()) +
+						" reflees=" + String::valueOf(lairRetreatReflees) +
+						" lairOid=" + String::valueOf(missionLairOid));
+				}
+				scheduleActiveTick(1000);
+				return;
+			}
+		}
 		if (isReadyToResume(strongAgent)) {
 			setPhase(HUNTING);
 			if (targetOid != 0)
@@ -6232,6 +6332,7 @@ void SimHunterController::beginRetreat() {
 	}
 
 	retreatCycles++;
+	lairRetreatReflees = 0;
 	order.retreatCycles = retreatCycles;
 	if (missionHuntOrder && missionLairOid != 0)
 		MissionDiagLog::event("RETREATING", identityId,
@@ -6264,6 +6365,10 @@ void SimHunterController::beginRetreat() {
 	disengageTarget(false);
 	updateMissionAdds(0);
 	moveTo(away);
+	// F_0.9.8e: this used to wake the tick only on arrival, and a bot held in
+	// combat never arrives.
+	if (isLairRetreatDefenseOn())
+		scheduleActiveTick(1000);
 }
 
 void SimHunterController::finishRetreatMove() {

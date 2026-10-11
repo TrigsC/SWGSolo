@@ -9468,6 +9468,8 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 			missionBoardConfig.getBooleanField("travelCombat", false);
 		pveMissionBoardAttackerRecognition =
 			missionBoardConfig.getBooleanField("attackerRecognition", false);
+		pveMissionBoardLairRetreatDefense =
+			missionBoardConfig.getBooleanField("lairRetreatDefense", false);
 		// Not clampMinerInt: that maps 0 to "keep", and 0 here disables the
 		// post-fight rest.
 		pveMissionBoardTravelRestHamPct = Math::max(0, Math::min(95,
