@@ -424,6 +424,10 @@ private:
 	// walk itself nothing evaluated HAM, the mop-up hold, or the phase TTL.
 	// Called at each leg entry; a no-op with the gate off.
 	void armTravelCombatTick();
+	// F_0.9.8d: publish (or withdraw) the mission lair as a point area attacks
+	// must not reach. Protected while the lair is revealed and the bot is not
+	// deliberately attacking it.
+	void updateAreaAttackGuard();
 	// Threat-map attacker recognition is on when its own gate is, AND always on
 	// a travel-combat leg: the mop-up hold starts right after the lair's death
 	// cleared the bot's combat flag and defender list, so without it the hold

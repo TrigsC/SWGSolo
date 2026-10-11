@@ -8,6 +8,7 @@
 #include "MissionDiagLog.h"
 #include "SimHunterTravelDiag.h"
 #include "SimBotTravelCombat.h"
+#include "SimBotAreaAttackGuard.h"
 
 #include "engine/core/Core.h"
 #include "server/ServerCore.h"
@@ -597,6 +598,21 @@ bool SimHunterController::isMovementHeld() const {
 bool SimHunterController::recognisesThreatAttackers() const {
 	return SimPlayerManager::instance()->getPveMissionBoardAttackerRecognition() ||
 		(isTravelCombatGateOn() && isTravelCombatPhase());
+}
+
+void SimHunterController::updateAreaAttackGuard() {
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent == nullptr)
+		return;
+	const uint64 bodyOid = strongAgent->getObjectID();
+	// engagedMissionLairOid != 0 means the bot is hitting the lair on purpose:
+	// an area attack there is wanted, and the wave tactics pace it.
+	if (orderActive && missionHuntOrder && missionLairOid != 0 &&
+			engagedMissionLairOid == 0 && !strongAgent->isDead())
+		SimBotAreaAttackGuard::protect(bodyOid, missionLairPosition.getX(),
+			missionLairPosition.getY());
+	else
+		SimBotAreaAttackGuard::release(bodyOid);
 }
 
 void SimHunterController::armTravelCombatTick() {
@@ -2018,6 +2034,8 @@ void SimHunterController::spawnMissionLair() {
 
 	missionLairOid = lair.lairOid;
 	missionLairPosition = Vector3(lair.x, lair.y, lair.z);
+	// Publish at once: the arrival loop can self-defend before the next tick.
+	updateAreaAttackGuard();
 	missionAddsOverCapCycles = 0;
 	missionLairRevealDeferCycles = 0;
 	updateMissionAdds(0);
@@ -3891,6 +3909,7 @@ void SimHunterController::runActiveTick() {
 		~TickGuard() { flag.store(false, std::memory_order_release); }
 	} tickGuard{tickRunning};
 
+	updateAreaAttackGuard();
 	uint64 nowMs = System::getMiliTime();
 	// Entry probe: distinguishes "the controller stopped ticking entirely" from
 	// "it ticks but never reaches the phase branch". Rate-limited by the same
@@ -4162,6 +4181,7 @@ void SimHunterController::runActiveTick() {
 		if (offer.revealed) {
 			missionLairOid = offer.lairOid;
 			missionLairPosition = offer.revealedPos;
+			updateAreaAttackGuard();
 			setPhase(TRAVEL_TO_LAIR);
 			moveTo(missionLairPosition);
 			armTravelCombatTick();
@@ -4231,6 +4251,7 @@ void SimHunterController::runActiveTick() {
 			}
 			missionLairOid = revealed.lairOid;
 			missionLairPosition = revealed.revealedPos;
+			updateAreaAttackGuard();
 			// An AiAgent has no client, so sendSystemMessage() would be a no-op.
 			// Broadcast through the same spatial channel every other hunter
 			// phase uses, so the reveal is actually observable in-world.
@@ -5715,6 +5736,7 @@ void SimHunterController::engageMissionLair() {
 	if (!combatStarted)
 		return;
 	engagedMissionLairOid = missionLairOid;
+	updateAreaAttackGuard();
 	lastLairRetargetMs = 0;
 	// lastSeenSpawnNumber is deliberately NOT reset here. It tracks the
 	// LAIR's wave counter, not this engagement: clearing it on engage or
@@ -5825,6 +5847,7 @@ void SimHunterController::disengageMissionLair() {
 		state = SimPlayerController::IDLE;
 	}
 	engagedMissionLairOid = 0;
+	updateAreaAttackGuard();
 	lastLairRetargetMs = 0;
 	// lastSeenSpawnNumber is deliberately NOT reset here. It tracks the
 	// LAIR's wave counter, not this engagement: clearing it on engage or

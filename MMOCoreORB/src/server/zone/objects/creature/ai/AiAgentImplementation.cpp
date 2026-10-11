@@ -107,6 +107,7 @@
 #include "server/zone/objects/creature/simplayer/SimCombatDiagLog.h"
 #include "server/zone/objects/creature/simplayer/SimEarlyGameDeathLog.h"
 #include "server/zone/objects/creature/simplayer/SimBotAbilityUsageLog.h"
+#include "server/zone/objects/creature/simplayer/SimBotAreaAttackGuard.h"
 #include "server/zone/managers/frs/FrsManager.h"
 #include "server/zone/managers/radial/RadialOptions.h"
 
@@ -3293,6 +3294,35 @@ bool AiAgentImplementation::selectSpecialAttack() {
 					if (reserveRefused)
 						SimBotAbilityUsageLog::recordReserveSkip();
 					continue;
+				}
+			}
+			// F_0.9.8d: never clip the bot's own mission lair with an area or cone
+			// special while it is fighting the lair's creatures -- one stray hit
+			// spawns the next wave on top of the one it is still clearing. The
+			// hunter controller publishes the lair's position only while the bot is
+			// NOT deliberately attacking it.
+			if (command != nullptr &&
+					(command->isAreaAction() || command->isConeAction())) {
+				float protectedX = 0.f;
+				float protectedY = 0.f;
+				if (SimBotAreaAttackGuard::lookup(getObjectID(), protectedX,
+						protectedY)) {
+					Vector3 selfPosition = getWorldPosition();
+					float dx = selfPosition.getX() - protectedX;
+					float dy = selfPosition.getY() - protectedY;
+					float reach = SimBotAreaAttackGuard::reachMeters(
+						command->isAreaAction(), command->isConeAction(),
+						command->getAreaRange(), command->getConeRange(),
+						command->getRange(), weapon != nullptr,
+						weapon == nullptr ? 0 : weapon->getMaxRange(),
+						command->isSplashDamage(),
+						weapon != nullptr && (weapon->isThrownWeapon() ||
+							weapon->isHeavyWeapon()));
+					if (SimBotAreaAttackGuard::endangers(reach,
+							Math::sqrt(dx * dx + dy * dy))) {
+						SimBotAreaAttackGuard::recordSkip();
+						continue;
+					}
 				}
 			}
 			// The attack tree runs CheckAttackIsValid after SelectAttack and aborts

@@ -14,6 +14,7 @@
 #include "SimBotTrainingOrder.h"
 #include "SimBotDispatchPolicy.h"
 #include "SimHunterTravelDiag.h"
+#include "SimBotAreaAttackGuard.h"
 
 #include <vector>
 #include "StructureTraversalDiagLog.h"
@@ -8623,6 +8624,7 @@ static bool simBotCombatAbilityConfigEquals(
 			left.hamReserveFraction != right.hamReserveFraction ||
 			left.freeStateRetrySeconds != right.freeStateRetrySeconds ||
 			left.usageHistorySize != right.usageHistorySize ||
+			left.avoidAreaAttacksNearLair != right.avoidAreaAttacksNearLair ||
 			left.excludedCommands.size() != right.excludedCommands.size())
 		return false;
 
@@ -8675,6 +8677,8 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 			combatAbilities.getIntField("usageHistorySize",
 				combatAbilityConfig.usageHistorySize),
 				combatAbilityConfig.usageHistorySize, 0, 64);
+		combatAbilityConfig.avoidAreaAttacksNearLair =
+			combatAbilities.getBooleanField("avoidAreaAttacksNearLair", false);
 		LuaObject excludedCommands = combatAbilities.getObjectField(
 			"excludedCommands");
 		if (excludedCommands.isValidTable()) {
@@ -8877,6 +8881,8 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 			String::valueOf(combatAbilityConfig.hamReserveFraction) +
 			" flee=" + String::valueOf(earlyGameConfig.fleeHamFraction));
 	SimBotAbilityUsageLog::setHistorySize(combatAbilityConfig.usageHistorySize);
+	SimBotAreaAttackGuard::setEnabled(combatAbilityConfig.enabled &&
+		combatAbilityConfig.avoidAreaAttacksNearLair);
 	// Configured-on OR harness-armed-on. A harness "false" override is scoped to
 	// its own identities and must never turn production logging off, because
 	// disabling clears every history and counter.
@@ -16852,6 +16858,10 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	JSONSerializationType combatAbilities = JSONSerializationType::object();
 	combatAbilities["gate"] = playerBotCombatAbilitiesGateArmed();
 	combatAbilities["configured"] = combatAbilityConfigSnapshot.enabled;
+	combatAbilities["avoidAreaAttacksNearLair"] =
+		combatAbilityConfigSnapshot.avoidAreaAttacksNearLair;
+	combatAbilities["areaAttacksSkippedNearLair"] =
+		SimBotAreaAttackGuard::skips();
 	combatAbilities["specialAttackChancePercent"] =
 		combatAbilityConfigSnapshot.specialAttackChancePercent;
 	combatAbilities["preferFreeStateAbilities"] =
@@ -22957,6 +22967,7 @@ void SimPlayerManager::onPveHunterDied(uint64 identityId, uint64 bodyOid,
 
 	if (countDeath) {
 		SimBotAbilityUsageLog::remove(bodyOid);
+		SimBotAreaAttackGuard::release(bodyOid);
 		// Only the claim that counts the death collects the killing-blow capture,
 		// so a concurrent duplicate call can never take it and discard it.
 		// Collected for every hunter so no capture outlives its body.

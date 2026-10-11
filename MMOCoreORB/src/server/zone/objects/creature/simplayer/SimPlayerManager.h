@@ -177,6 +177,9 @@ struct SimBotCombatAbilityConfig {
 	int freeStateRetrySeconds = 10;
 	Vector<String> excludedCommands;
 	int usageHistorySize = 12;
+	// F_0.9.8d: skip an area/cone special whose reach would include the bot's
+	// own mission lair while it is not deliberately attacking that lair.
+	bool avoidAreaAttacksNearLair = false;
 };
 
 struct SimBotAbilityApplicability {

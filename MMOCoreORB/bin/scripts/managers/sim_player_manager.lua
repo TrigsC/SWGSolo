@@ -1849,6 +1849,15 @@ SimPlayerManagerConfig = {
             -- live repro loop saw a forced-special novice fight bystanders for
             -- its whole kill budget. Remove entries to re-enable them.
             excludedCommands = {"taunt", "warcry1", "warcry2"},
+            -- F_0.9.8d (owner 2026-10-11). A bot fighting its mission lair's
+            -- creatures must not clip the lair with an area or cone special:
+            -- one stray hit spawns the next wave on top of the one it is still
+            -- clearing. Nordihi's unarmedSpinAttack2 (16m area) made all 25 of
+            -- its lair hits that way and it went 0 for 6. Skips such a command
+            -- while the lair is within its reach (+8m) and the bot is not
+            -- deliberately attacking the lair; the ability stays available
+            -- everywhere else.
+            avoidAreaAttacksNearLair = false,
             usageHistorySize = 12,
         },
         earlyGame = {
