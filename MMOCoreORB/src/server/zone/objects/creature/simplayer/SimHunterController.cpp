@@ -4637,11 +4637,25 @@ void SimHunterController::runActiveTick() {
 			}
 		}
 		if (isReadyToResume(strongAgent)) {
+			// Neither resume call is guaranteed to book a wake-up: scanForTarget
+			// returns false with nothing scheduled when the field is empty or
+			// the bot is still in combat, and moveToTarget returns silently on
+			// an in-flight pursuit. Since F_0.9.8e the bot fights back while it
+			// retreats, so it routinely finishes the last wave member here and
+			// resumes onto an EMPTY field -- five of six bots went silent in
+			// HUNTING that way on 2026-10-11/12, outlived the mission timeout
+			// and stood in the wild for hours. Same orphan as ENGAGING_LAIR and
+			// BUFF_UP; same generation guard.
+			const uint64 tickGenerationBefore =
+				activeTickGeneration.load(std::memory_order_acquire);
 			setPhase(HUNTING);
 			if (targetOid != 0)
 				moveToTarget();
 			else
 				scanForTarget();
+			if (activeTickGeneration.load(std::memory_order_acquire) ==
+					tickGenerationBefore)
+				scheduleActiveTick(1000);
 		} else {
 			scheduleActiveTick(SimPlayerManager::instance()->
 				getPveHunterActiveTickSeconds() * 1000);
