@@ -47,7 +47,17 @@ struct Inputs {
 	bool readyToResume = false;
 	// FLEE only: the flee leg has ended (arrived, or its path failed).
 	bool fleeArrived = false;
+	// The bot has already run its allowed flee legs in this encounter and was
+	// caught again: it stops running and fights, to the death if need be
+	// (owner 2026-10-12: fighting to the death beats bouncing between running
+	// and resting until it dies without a swing).
+	bool standAndFight = false;
 };
+
+// An encounter's flee legs are spent. maxFleeLegs <= 0 means no limit.
+inline bool fleeLegsSpent(int fleeLegs, int maxFleeLegs) {
+	return maxFleeLegs > 0 && fleeLegs >= maxFleeLegs;
+}
 
 inline Mode nextMode(Mode current, const Inputs& in) {
 	if (current == FLEE) {
@@ -55,11 +65,13 @@ inline Mode nextMode(Mode current, const Inputs& in) {
 			return FLEE;
 		// Still chased at the flee point: flee again (the caller picks a new
 		// point). Otherwise recover before walking on.
-		return in.attacked ? FLEE : REST;
+		if (!in.attacked)
+			return REST;
+		return in.standAndFight ? MOVE : FLEE;
 	}
 
 	if (in.attacked && in.belowRetreat)
-		return FLEE;
+		return in.standAndFight ? MOVE : FLEE;
 
 	if (current == REST) {
 		// Attacked while resting but not yet in retreat range: fight it out

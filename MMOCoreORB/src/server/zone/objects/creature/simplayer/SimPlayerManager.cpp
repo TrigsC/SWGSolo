@@ -9475,6 +9475,10 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		pveMissionBoardTravelRestHamPct = Math::max(0, Math::min(95,
 			static_cast<int>(missionBoardConfig.getIntField(
 				"travelRestHamPct", 50))));
+		// 0 = no limit, so not clampMinerInt either.
+		pveMissionBoardTravelMaxFleeLegs = Math::max(0, Math::min(20,
+			static_cast<int>(missionBoardConfig.getIntField(
+				"travelMaxFleeLegs", 0))));
 		pveMissionBoardLairRetargetIntervalMs = clampMinerInt(
 			missionBoardConfig.getIntField("lairRetargetIntervalMs",
 				pveMissionBoardLairRetargetIntervalMs),

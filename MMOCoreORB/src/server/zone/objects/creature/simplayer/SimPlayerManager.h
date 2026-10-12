@@ -2638,6 +2638,9 @@ private:
 	// fights back if attacked while resting, instead of standing still.
 	bool pveMissionBoardLairRetreatDefense = false;
 	int pveMissionBoardTravelRestHamPct = 50;
+	// Flee legs a travelling bot may run per encounter before it turns and
+	// fights (owner 2026-10-12). 0 = no limit, the original F_0.9.8c behaviour.
+	int pveMissionBoardTravelMaxFleeLegs = 0;
 	// F_0.9.8b progression-first dispatch, owner rule 2026-10-09. A bot whose
 	// training template is incomplete is dispatched to lairs it will fight,
 	// ranked for XP at the tier of the weapon it is grinding; demand only breaks
@@ -4110,6 +4113,9 @@ public:
 	}
 	int getPveMissionBoardTravelRestHamPct() const {
 		return pveMissionBoardTravelRestHamPct;
+	}
+	int getPveMissionBoardTravelMaxFleeLegs() const {
+		return pveMissionBoardTravelMaxFleeLegs;
 	}
 	int getPveMissionBoardLairRetargetIntervalMs() const {
 		return pveMissionBoardLairRetargetIntervalMs;

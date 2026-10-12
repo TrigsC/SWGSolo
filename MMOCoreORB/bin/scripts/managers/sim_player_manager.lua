@@ -2404,6 +2404,12 @@ SimPlayerManagerConfig = {
             -- <weapon>_hit_while_moving fights on the run instead.
             travelCombat = false,
             travelRestHamPct = 50,
+            -- Flee legs a travelling bot may run per encounter before it turns
+            -- and fights, to the death if need be (owner 2026-10-12: bouncing
+            -- between running and resting until it dies looks worse than
+            -- fighting). The count resets once the bot is clear and recovered.
+            -- 0 = no limit.
+            travelMaxFleeLegs = 0,
             -- F_0.9.8c attacker recognition. Core3's startCombat puts the bot on
             -- the attacking creature's defender list and the creature on the
             -- bot's threat map, never on the bot's own defender list -- which is

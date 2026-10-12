@@ -345,6 +345,9 @@ private:
 	std::atomic<bool> travelFleeLegEnded{false};
 	int travelCombatPhase = -1;
 	int travelRetreats = 0;
+	// Flee legs run since the bot last fully recovered; at
+	// missionBoard.travelMaxFleeLegs it stops running and fights.
+	int travelFleeLegs = 0;
 	uint64 travelFleeIssuedMs = 0;
 	int lairRetreatReflees = 0;
 	uint64 lastLairRetreatDefendLogMs = 0;

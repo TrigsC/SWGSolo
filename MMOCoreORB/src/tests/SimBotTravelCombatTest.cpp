@@ -62,6 +62,42 @@ TEST(SimBotTravelCombatTest, AttackedWhileRestingWithHamFights) {
 	EXPECT_EQ(nextMode(REST, inputs(true, false, true, false)), MOVE);
 }
 
+// ---- stand and fight (owner 2026-10-12) -------------------------------------
+
+TEST(SimBotTravelCombatTest, FleeLegsSpentHonoursTheLimit) {
+	EXPECT_FALSE(fleeLegsSpent(1, 2));
+	EXPECT_TRUE(fleeLegsSpent(2, 2));
+	EXPECT_TRUE(fleeLegsSpent(3, 2));
+	// 0 keeps the original no-cap behaviour.
+	EXPECT_FALSE(fleeLegsSpent(50, 0));
+}
+
+TEST(SimBotTravelCombatTest, CaughtAfterTheLastFleeLegTurnsAndFights) {
+	Inputs in = inputs(true, true, true, false, true);
+	in.standAndFight = true;
+	EXPECT_EQ(nextMode(FLEE, in), MOVE);
+}
+
+TEST(SimBotTravelCombatTest, SpentBotDoesNotFleeAgainFromRestOrMove) {
+	Inputs in = inputs(true, true, true, false);
+	in.standAndFight = true;
+	EXPECT_EQ(nextMode(REST, in), MOVE);
+	EXPECT_EQ(nextMode(MOVE, in), MOVE);
+}
+
+TEST(SimBotTravelCombatTest, SpentBotStillFinishesAFleeLegInFlight) {
+	Inputs in = inputs(true, true, true, false, false);
+	in.standAndFight = true;
+	EXPECT_EQ(nextMode(FLEE, in), FLEE);
+}
+
+TEST(SimBotTravelCombatTest, SpentBotStillRestsOnceClear) {
+	Inputs in = inputs(false, true, true, false, true);
+	in.standAndFight = true;
+	EXPECT_EQ(nextMode(FLEE, in), REST);
+	EXPECT_EQ(nextMode(MOVE, in), REST);
+}
+
 // ---- weaponFightsOnTheRun -------------------------------------------------
 
 TEST(SimBotTravelCombatTest, MeleeNeverFightsOnTheRun) {

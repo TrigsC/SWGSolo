@@ -679,6 +679,7 @@ void SimHunterController::resetTravelCombat() {
 	travelHomeDestinationSet = false;
 	travelCombatPhase = -1;
 	travelRetreats = 0;
+	travelFleeLegs = 0;
 	travelFleeIssuedMs = 0;
 }
 
@@ -753,6 +754,13 @@ bool SimHunterController::runTravelCombat(AiAgent* hunter,
 	in.belowRetreat = isBelowRetreatThreshold(hunter);
 	in.belowRest = restPct > 0 && hamFraction < restPct / 100.f;
 	in.readyToResume = isReadyToResume(hunter);
+	// An encounter ends when the bot is clear and recovered; only then does it
+	// earn its flee legs back. Until then a bot that has run them and is caught
+	// again fights instead of bouncing between FLEE and REST.
+	if (!attacked && in.readyToResume)
+		travelFleeLegs = 0;
+	in.standAndFight = SimBotTravelCombat::fleeLegsSpent(travelFleeLegs,
+		SimPlayerManager::instance()->getPveMissionBoardTravelMaxFleeLegs());
 	// A flee leg ends on arrival or path failure (the guards in onArrived and
 	// onPathFailed), or if it is not moving 3s after it was issued -- a moveTo
 	// refused outright gets no callback, and must not pin the bot in FLEE
@@ -816,6 +824,8 @@ bool SimHunterController::runTravelCombat(AiAgent* hunter,
 			" destDistM=" + String::valueOf(static_cast<int>(
 				hunter->getWorldPosition().distanceTo2d(destination))) +
 			" retreats=" + String::valueOf(travelRetreats) +
+			" fleeLegs=" + String::valueOf(travelFleeLegs) +
+			" stand=" + String::valueOf(in.standAndFight) +
 			(next == SimBotTravelCombat::FLEE ?
 				" fleeX=" + String::valueOf(static_cast<int>(fleeTarget.getX())) +
 				" fleeY=" + String::valueOf(static_cast<int>(fleeTarget.getY())) :
@@ -833,6 +843,7 @@ bool SimHunterController::runTravelCombat(AiAgent* hunter,
 			// Drop the fight so the bot is not auto-attacking as it runs.
 			resetInterceptorCombat();
 			travelFleeIssuedMs = System::getMiliTime();
+			++travelFleeLegs;
 			moveTo(fleeTarget);
 		}
 		scheduleActiveTick(1000);
