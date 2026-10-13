@@ -217,6 +217,16 @@ no new warnings before handing work back** (owner-stated standard).
   `grindFallback`, `grindFallbackMinutes` clamped 5..240), default off, and widens
   `earlyGame.deferredXpTypes` to `medical`, `crafting_medicine_general`,
   `crafting_general` (XP kills cannot earn).
+  F_0.9.8 adds, under `pveConfig.missionBoard`: `lairEngagementHold` (+
+  `lairRetargetIntervalMs`), `waveDisengage`, `waveDeaggro`, `travelCombat`,
+  `travelRestHamPct`, `travelMaxFleeLegs` (0 = no limit), `attackerRecognition`,
+  `lairRetreatDefense`, `stockPlacement`, `revealRelocateEnabled` and
+  `lairRevealDeferMaxCycles`; `combatAbilities.avoidAreaAttacksNearLair`; and per
+  training plan `linePriority` / `parallelXpStreams`. **Owner decision 2026-10-13:
+  these F_0.9.8 gates and `progressionDispatch` are committed ON**, the first
+  exception to default-off, taken after the live runs. The `playerBotProgression`
+  master gates and `pveConfig.novice` stay off in the commit, so a fresh checkout
+  still runs no progression bots until those are armed.
   This is the primary place new simulation features expose owner-tunable,
   default-off gates.
 - **`MMOCoreORB/bin/conf/features.lua`** — global feature flags.
@@ -867,6 +877,39 @@ This is this fork's primary custom subsystem, layered on top of the stock
   `playerBotProgression.combatAbilities` counters. Live receipt: 27/27 in
   `docs/4-unit-tests/live_p10h-skill-abilities_20260916-144849-p10h-skill-abilities.md`;
   one open, unreproduced SIGSEGV is recorded there.
+- **Lair tactics and mission graduation (P.10i / F_0.9.8)** — the release where roster
+  bots first complete destroy missions. The plan's scorer and tactic sub-state machine were
+  never built; the owner's game rules, applied one live observation at a time, replaced
+  them (see the plan's "Release scope"). What a future session should inherit:
+  **(1) A transition that books no tick is a dead controller.** `SimHunterController` is
+  driven by `runActiveTick`, and the phase TTLs are enforced in that same tick. Any path
+  that does `setPhase(...)` then a move or scan and returns, trusting an arrival callback,
+  can strand the bot for hours with no timeout to rescue it. It happened at lair
+  engagement, every `BUFF_UP` exit, each overland leg, and the `HEALING` resume. The guard
+  idiom: read `activeTickGeneration` before the transition and `scheduleActiveTick` if it
+  is unchanged after (`scheduleActiveTick` always bumps it).
+  **(2) The base mover holds a bot that is in combat.** `checkArrival`, `moveTo` and
+  `onPathFound` keep it IDLE, and `onPathFound` clears combat state on every accepted path.
+  Fleeing or fighting on the run therefore goes through three hunter-only hooks:
+  `allowsMovementInCombat`, `isMovementHeld`, `keepsCombatOnPathAccept`.
+  **(3) Being attacked is not on the bot's defender list.** `CombatManager::startCombat`
+  puts the attacker on the bot's **threat map** only. `selectActiveCombatAttacker` reads
+  both, and counts a threat entry only while that creature is in combat and aimed at the
+  bot (read under the creature's lock with the hunter's released).
+  **(4) Lair waves are spawn-number transitions.** A lair spawns at reveal, at first
+  damage and below half condition. Tactics key on the `spawnNumber` change, never on "a mob
+  is near", which fired every tick. De-aggro is scoped to that lair's own members.
+  **(5) Mission lairs are placed the stock way.** The terminal checks only bounds, water
+  and city (`choosePveBotMissionPosition`); `revealPveBotMissionLair` searches on arrival
+  (`SimBotMissionPlacement.h`), and a failed search defers, bounded, instead of forcing a
+  spawn as stock does.
+  **(6) Dispatch is progression-first** for a bot whose whole training plan is incomplete
+  (`SimBotDispatchPolicy.h`): fightable, then XP at the tier of the weapon being ground,
+  then market demand. Solo non-elite bots never take PACK lairs.
+  Decisions live in pure headers with gtests (`SimBotTravelCombat.h`,
+  `SimBotAreaAttackGuard.h`, `SimBotMissionGraduation.h`, `SimBotTrainingOrder.h`, and the
+  two above); observability is `bin/log/missiondiag.log` plus `pveActivity` counters.
+  Live receipt: `docs/4-unit-tests/live_f098-lair-tactics-release_20261013-184338.md`.
 - **Simulation-only by default, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line
@@ -1002,6 +1045,11 @@ flowchart LR
   work has been live-dashboard verification before/after.
 - Mocking scaffolding (`MockBehavior.h`, `MockCompositeBehavior.h`,
   `DeadlockTestBase`) exists for behavior-tree and concurrency testing.
+- **Never run `core3 runUnitTests` while the live server is up.** The test process shares
+  the Berkeley DB environment in `bin/databases/`; twice (2026-09-21, 2026-10-13) the
+  server's next delta save panicked (`BDB0060`, `DB_RUNRECOVERY`) and the server
+  deadlocked. Run tests with the server stopped, for example just before an approved
+  restart. Recovery: stop the exact pid, back up `databases`, `db5.3_recover -h databases`.
 
 ## Performance Considerations
 

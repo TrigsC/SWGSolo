@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.9.8` | 14 | F_0.9.8 P.10i: lair tactics and mission graduation — PlayerBots complete destroy missions end to end: overland fallback and stock-style lair placement, graduation at box 4, lair hold with wave break-off and de-aggro, progression-first dispatch, travel combat with a one-leg flee cap, attacker recognition, area-attack lair guard and lair retreat defense; the proven gates ship on |
 | `0.9.7` | 10 | F_0.9.7 P.10h: skill-derived combat abilities — a PlayerBot's attack list is built from its trained boxes (highest tier only), specials cost real HAM under a spend-scoped reserve, a free control ability is used before the special roll, plus per-bot REST inspection, a dashboard drawer and `/server playerinfo`; all gates default-off |
 | `0.9.6` | 10 | F_0.9.6 P.10g + F_0.9.6-D1: novice PlayerBot early-game loop — city-spawner roaming, level-band TTK targeting, all-attackers self-defence, bounded unreachable-target skip set, 800-HAM heal-on-death novices, kill-XP drop observability and gated sim-combat diagnostics; all gates default-off |
 | `0.9.5` | 8 | F_0.9.5 P.10f: skill training and novice PlayerBots — derived-spend training store, goal-driven ladder from skills.iff, SKILLBOX body overlay, desired-active-set population governor, and a neutral novice template; all gates default-off |
@@ -25,6 +26,14 @@
 | `0.1.0` | 1 | chore: initialize TRIP workflow |
 
 # Changelog Summary
+
+- **v0.9.8 (Lair Tactics and Mission Graduation, F_0.9.8 P.10i - Week 14, 13-10-2026)**:
+  - **The mission loop completes for the first time.** Overland fallback when recast returns a partial path, a bounded lair-reveal defer, stalled-leg recovery, and a destroyed-lair counter that counts kills. Planned bots graduate to missions at box 4 of one brawler or marksman line.
+  - **Lair fights follow the owner's wave rules.** Held engagement (was rebuilt up to 136 times a mission), break off and clear each new wave, shed the previous wave's aggro, keep area specials off the lair, and keep running or fight back during a retreat.
+  - **Progression-first dispatch.** A template-incomplete bot is sent to a lair it will fight, ranked for XP at the tier of the weapon it is grinding; market demand only breaks ties.
+  - **The walk is survivable more often.** Attackers are recognised from the threat map, a low bot runs toward the mission and rests, and after one flee leg it stands and fights.
+  - **Stock-style placement.** The terminal needs only a valid waypoint; the lair point is searched for on arrival (128 m widening to 512 m, 256 tries). Terminal placement failures went from about 80% to none in the release run.
+  - **One bug class, four fixes.** A phase transition that books no tick leaves a dead controller, because the timeouts live in the same tick. The proven gates now ship on; mission credits move back to F_0.9.2.
 
 - **v0.9.7 (Skill-Derived Combat Abilities + SimBot Inspection, F_0.9.7 P.10h - Week 10, 19-09-2026)**:
   - **Training now changes how a bot fights.** A PlayerBot's attack list is derived from `simbot_skills` — the same `commands` a real player's boxes grant — and installed on the locked `AiAgent` as a transient overlay beside the SKILLBOX mod overlay. Nothing new persists; the list is re-derived at spawn, at training and on any gate change. Only the highest tier of each chain is installed (`unarmedhit1`/`2` give way to `unarmedhit3`; `unarmedheadhit1` is its own chain).

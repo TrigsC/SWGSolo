@@ -250,7 +250,10 @@ F_0.9.0 store+dashboard+reaper+harness
   harness bot **without** identity → zero rows, `noRecord` counter +1; cap
   reached → no further growth; miner/PvP bodies never appear in the store.
 
-### F_0.9.2 — Credits per completed mission (P.10c)
+### F_0.9.2 — Credits per completed mission (P.10c) — NEXT (as of 2026-10-13)
+
+> Not started. It was folded into F_0.9.8 as Phase 1 and unfolded again at the v0.9.8
+> release. The line numbers below predate F_0.9.6 to F_0.9.8 and must be re-read.
 
 - **Scope**: award **only offer-backed completions** — the mission-board
   site (`SimPlayerManager.cpp:10649`), where the completed
@@ -471,7 +474,11 @@ F_0.9.0 store+dashboard+reaper+harness
   trains a box that grants an attack and is then observed *using* that attack
   in a subsequent kill.
 
-### F_0.9.8 — Lair tactics and mission graduation (P.10i)
+### F_0.9.8 — Lair tactics and mission graduation (P.10i) — RELEASED v0.9.8 (2026-10-13)
+
+> Released. What shipped differs from the scope below: see "Release scope" at the end
+> of `F_0.9.8_p10i-lair-tactics-and-mission-graduation.plan.md`. Mission credits were
+> not built here and return to F_0.9.2.
 
 - **Scope**: graduate the novice from lone creatures to destroy missions, with
   tier-appropriate lair tactics. `LairObserverImplementation` already
