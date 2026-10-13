@@ -2431,6 +2431,13 @@ SimPlayerManagerConfig = {
             -- the waypoint instead of abandoning the mission. false = legacy
             -- strict behaviour (abandon + terminal round trip).
             revealRelocateEnabled = true,
+            -- Place mission lairs the way the stock game does (owner
+            -- 2026-10-13). The terminal only needs a waypoint that is in
+            -- bounds, dry and outside a city, drawn inside the arc; the exact
+            -- lair point is found on arrival by a random search around the
+            -- waypoint that widens every 32 tries (256 tries, capped at 512m).
+            -- false = the strict terminal check plus the 64m probe ring.
+            stockPlacement = false,
             -- Terminal offer-generation retry. On a partial (1-of-2) or empty
             -- board the hunter dwells offerRetrySeconds at the terminal and
             -- re-generates, up to offerMaxAttempts times, before accepting a

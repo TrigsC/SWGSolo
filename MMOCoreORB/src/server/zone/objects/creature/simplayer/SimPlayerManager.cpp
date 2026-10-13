@@ -6100,6 +6100,7 @@ void SimPlayerManager::loadLuaConfig() {
 	pveMissionBoardLairEngageAfterFieldClear = true;
 	pveMissionBoardMaxOfferAgeSeconds = 1800;
 	pveMissionBoardRevealRelocateEnabled = true;
+	pveMissionBoardStockPlacement = false;
 	pveMissionBoardOfferRetrySeconds = 25;
 	pveMissionBoardOfferMaxAttempts = 3;
 	pveMarketDispatchEnabled = false;
@@ -9340,6 +9341,7 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	pveMissionBoardLairEngageAfterFieldClear = true;
 	pveMissionBoardMaxOfferAgeSeconds = 1800;
 	pveMissionBoardRevealRelocateEnabled = true;
+	pveMissionBoardStockPlacement = false;
 	pveMissionBoardOfferRetrySeconds = 25;
 	pveMissionBoardOfferMaxAttempts = 3;
 	pveMarketDispatchEnabled = false;
@@ -9489,6 +9491,8 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		pveMissionBoardRevealRelocateEnabled =
 			missionBoardConfig.getBooleanField("revealRelocateEnabled",
 				pveMissionBoardRevealRelocateEnabled);
+		pveMissionBoardStockPlacement =
+			missionBoardConfig.getBooleanField("stockPlacement", false);
 		pveMissionBoardOfferRetrySeconds = clampMinerInt(
 			missionBoardConfig.getIntField("offerRetrySeconds"),
 			pveMissionBoardOfferRetrySeconds, 5, 300);
@@ -19539,11 +19543,16 @@ bool SimPlayerManager::choosePveBotMissionPosition(
 			difficultyLevel;
 		if (difficultyRandom > 0)
 			distance += System::random(difficultyRandom);
-		float candidateBearing = static_cast<float>(System::random(360));
+		// Stock placement draws the bearing inside the arc; the legacy path
+		// drew from the full circle and threw two thirds of its tries away.
+		float candidateBearing = pveMissionBoardStockPlacement ?
+			SimBotMissionPlacement::bearingInArc(terminalBearing, arc,
+				System::random(10000) / 10000.f) :
+			static_cast<float>(System::random(360));
 		float candidateDelta = std::fabs(candidateBearing - terminalBearing);
 		while (candidateDelta > 180.f)
 			candidateDelta = std::fabs(candidateDelta - 360.f);
-		if (candidateDelta > arc) {
+		if (candidateDelta > arc + 0.01f) {
 			++rejArc;
 			continue;
 		}
@@ -19580,14 +19589,21 @@ bool SimPlayerManager::choosePveBotMissionPosition(
 			++rejCity;
 			continue;
 		}
-		if (!planetManager->isSpawningPermittedAt(x, y, clearance)) {
-			++rejNoSpawn;
-			continue;
-		}
-		if (CollisionManager::checkSphereCollision(
-				Vector3(x, y, height), clearance, zone)) {
-			++rejCollision;
-			continue;
+		// The stock terminal stops here (bounds, water, city): the advertised
+		// point is only a waypoint, and whether a lair fits is settled on
+		// arrival, when it is still true. Demanding it now failed 80% of Mos
+		// Eisley searches and the point was often blocked again on arrival
+		// anyway.
+		if (!pveMissionBoardStockPlacement) {
+			if (!planetManager->isSpawningPermittedAt(x, y, clearance)) {
+				++rejNoSpawn;
+				continue;
+			}
+			if (CollisionManager::checkSphereCollision(
+					Vector3(x, y, height), clearance, zone)) {
+				++rejCollision;
+				continue;
+			}
 		}
 		position = Vector3(x, y, height);
 		bearing = candidateBearing;
@@ -20391,7 +20407,42 @@ SimPlayerManager::revealPveBotMissionLair(uint64 bodyOid, uint64 offerId) {
 					Vector3(ax, ay, 0.f))) +
 				" height=" + String::valueOf(zone->getHeight(ax, ay)));
 		}
-		if (pveMissionBoardRevealRelocateEnabled) {
+		if (pveMissionBoardStockPlacement) {
+			// The stock arrival search: random offsets around the waypoint,
+			// widening every 32 tries. Unlike stock it does not spawn on a
+			// blocked point when every try fails; that case defers below.
+			int tries = 0;
+			for (; tries < SimBotMissionPlacement::REVEAL_MAX_TRIES &&
+					!haveSpawn; ++tries) {
+				const float halfWidth =
+					SimBotMissionPlacement::revealSearchHalfWidth(tries);
+				float px = offer.advertisedPos.getX() +
+					SimBotMissionPlacement::revealOffset(halfWidth,
+						System::random(10000) / 10000.f);
+				float py = offer.advertisedPos.getY() +
+					SimBotMissionPlacement::revealOffset(halfWidth,
+						System::random(10000) / 10000.f);
+				if (!zone->isWithinBoundaries(Vector3(px, py, 0.f)))
+					continue;
+				haveSpawn = pointClear(px, py, spawnPos);
+			}
+			{
+				Locker pveLock(&pveMutex);
+				pveMissionRevealSearches++;
+				pveMissionRevealSearchTries += tries;
+				if (!haveSpawn)
+					pveMissionRevealSearchFailures++;
+			}
+			MissionDiagLog::event(
+				haveSpawn ? "REVEAL_RELOCATE" : "REVEAL_RELOCATE_DEFER",
+				identityId,
+				MissionDiagLog::fmtVec("advertised", offer.advertisedPos) +
+				(haveSpawn ? " " + MissionDiagLog::fmtVec("relocated", spawnPos) :
+					String("")) +
+				" search=stock tries=" + String::valueOf(tries) +
+				" offset=" + String::valueOf(haveSpawn ?
+					spawnPos.distanceTo2d(offer.advertisedPos) : 0.f));
+		} else if (pveMissionBoardRevealRelocateEnabled) {
 			const float radiansPerDegree = 0.017453292519943295f;
 			static const float ringRadii[] = { 16.f, 32.f, 48.f, 64.f };
 			int probes = 0;
@@ -20424,7 +20475,8 @@ SimPlayerManager::revealPveBotMissionLair(uint64 bodyOid, uint64 offerId) {
 		// disabled, preserve the legacy strict behaviour (abandon). When enabled,
 		// DEFER instead: the controller retries in 2s exactly like the capacity
 		// path, and transient no-build occupancy typically clears.
-		if (!pveMissionBoardRevealRelocateEnabled)
+		if (!pveMissionBoardRevealRelocateEnabled &&
+				!pveMissionBoardStockPlacement)
 			return revealFail("spawnNotPermitted");
 		// Relocation exhausted: every ring probe failed, so this is the
 		// PERMANENT case and the caller may bound it.
@@ -24157,6 +24209,9 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	uint64 hunterAnnouncementsTotal = 0;
 	uint64 missionLairsSpawned = 0;
 	uint64 missionLairsCleaned = 0;
+	uint64 revealSearches = 0;
+	uint64 revealSearchTries = 0;
+	uint64 revealSearchFailures = 0;
 	uint64 creatureKillsTotal = 0;
 	uint64 lairsDestroyedTotal = 0;
 	uint64 relocationsExpiredSnapshot = 0;
@@ -24229,6 +24284,9 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 		hunterAnnouncementsTotal = pveHunterAnnouncementsTotal;
 		missionLairsSpawned = pveMissionLairsSpawned;
 		missionLairsCleaned = pveMissionLairsCleaned;
+		revealSearches = pveMissionRevealSearches;
+		revealSearchTries = pveMissionRevealSearchTries;
+		revealSearchFailures = pveMissionRevealSearchFailures;
 		creatureKillsTotal = pveCreatureKillsTotal;
 		lairsDestroyedTotal = pveLairsDestroyedTotal;
 		missionsCompletedTotal = pveMissionsCompletedTotal;
@@ -24363,6 +24421,9 @@ JSONSerializationType SimPlayerManager::getPveActivityDashboard() {
 	result["realBuffs"] = realBuffs;
 	result["missionLairsSpawned"] = missionLairsSpawned;
 	result["missionLairsCleaned"] = missionLairsCleaned;
+	result["missionRevealSearches"] = revealSearches;
+	result["missionRevealSearchTries"] = revealSearchTries;
+	result["missionRevealSearchFailures"] = revealSearchFailures;
 	result["lairsDestroyedTotal"] = lairsDestroyedTotal;
 	result["missionsCompletedTotal"] = missionsCompletedTotal;
 	result["missionsAbandonedTotal"] = missionsAbandonedTotal;

@@ -31,6 +31,7 @@
 #include "server/zone/managers/creature/LairObserver.h"
 #include "server/zone/objects/creature/simplayer/SimEarlyGameDeathLog.h"
 #include "server/zone/objects/creature/simplayer/SimBotAbilityUsageLog.h"
+#include "server/zone/objects/creature/simplayer/SimBotMissionPlacement.h"
 
 using namespace server::zone;
 
@@ -2657,6 +2658,16 @@ private:
 	// relocates the lair to the nearest clear point around the advertised
 	// waypoint instead of abandoning the mission. See revealPveBotMissionLair.
 	bool pveMissionBoardRevealRelocateEnabled = true;
+	// Place mission lairs the way the stock game does (see
+	// SimBotMissionPlacement.h): the terminal only asks for a point that is in
+	// bounds, dry and outside a city, with the bearing drawn inside the arc;
+	// the exact spawn point is found on arrival by a widening random search.
+	// Default off.
+	bool pveMissionBoardStockPlacement = false;
+	// Dashboard counters for the arrival search (under pveMutex).
+	uint64 pveMissionRevealSearches = 0;
+	uint64 pveMissionRevealSearchTries = 0;
+	uint64 pveMissionRevealSearchFailures = 0;
 	// Terminal offer-generation retry: on a partial/empty board the hunter dwells
 	// this long and re-generates, up to this many attempts, before accepting a
 	// single offer or (if still empty) abandoning. See beginMissionAccept.
