@@ -1857,7 +1857,7 @@ SimPlayerManagerConfig = {
             -- while the lair is within its reach (+8m) and the bot is not
             -- deliberately attacking the lair; the ability stays available
             -- everywhere else.
-            avoidAreaAttacksNearLair = false,
+            avoidAreaAttacksNearLair = true,
             usageHistorySize = 12,
         },
         earlyGame = {
@@ -1983,6 +1983,21 @@ SimPlayerManagerConfig = {
                 profession = "brawler",
                 weaponTemplate = "",
                 weaponType = "unarmed",
+                -- Owner rule 2026-09-30 for Teras Kasi elite grinding. Mapped
+                -- from what each box GRANTS, not its id, which misleads:
+                --   xx4x Speed               combat_unarmed_ability  (unarmed_speed)
+                --   x1xx Balance Conditioning combat_unarmed_speed    (combat_equillibrium)
+                --   1xxx Meditation           combat_unarmed_accuracy (meditate)
+                --   xxx1 combat-XP tree       combat_unarmed_support  (combat_general XP)
+                linePriority = {
+                    "combat_unarmed_ability",
+                    "combat_unarmed_speed",
+                    "combat_unarmed_accuracy",
+                    "combat_unarmed_support",
+                },
+                -- The combat-XP tree spends combat_general, a different pool,
+                -- so it is "trained separately" rather than waiting its turn.
+                parallelXpStreams = true,
             },
             {
                 name = "invalid_weapon_probe",
@@ -2280,15 +2295,15 @@ SimPlayerManagerConfig = {
         },
         combat = {
             retreatHamPct = 30,
-            resumeHamPct = 70,
-            maxRetreatCycles = 3,
+            resumeHamPct = 95,
+            maxRetreatCycles = 12,
             retreatRangeMeters = 40,
             -- Planned novices cap this per pool with
             -- playerBotProgression.earlyGame.cloneWoundMaxFraction.
             cloneWoundAmount = 500,
             huntActiveTickSeconds = 2,
             huntQuota = 1,
-            huntTimeoutSeconds = 1800,
+            huntTimeoutSeconds = 2400,
             scanRadiusMeters = 96,
             weaponRangeMeters = 48,
         },
@@ -2316,7 +2331,7 @@ SimPlayerManagerConfig = {
             -- 689 retries against one point before the 900s phase timeout
             -- released it. 0 restores the unbounded legacy retry.
             lairRevealDeferMaxCycles = 30,
-            lairTimeoutSeconds = 1800,
+            lairTimeoutSeconds = 3600,
             maxActiveLairs = 6,
             navmeshModeDebounceTicks = 2,
             navmeshRepathTries = 3,
@@ -2360,10 +2375,9 @@ SimPlayerManagerConfig = {
             -- too. Holding the engagement and re-pointing at the lair on a
             -- bounded cadence stops that.
             --
-            -- Default OFF, like every other new capability here. Set true
-            -- and restart to enable; set false and restart to revert exactly,
-            -- with no rebuild either way.
-            lairEngagementHold = false,
+            -- On since the v0.9.8 release, after the live runs. Set false to
+            -- revert exactly, with no rebuild.
+            lairEngagementHold = true,
             -- How often a held engagement re-points at the lair. Deliberately
             -- not every tick: that would replace a teardown storm with a
             -- retarget storm fighting the agent's own combat retargeting.
@@ -2378,8 +2392,8 @@ SimPlayerManagerConfig = {
             --
             -- Triggered by the spawnNumber TRANSITION, not by a mob being
             -- nearby; the latter fired every tick and was the thrash this
-            -- replaces. Default off; set true and restart to enable.
-            waveDisengage = false,
+            -- replaces. On since the v0.9.8 release; set false to revert.
+            waveDisengage = true,
             -- Shed the previous wave's aggro at each wave transition, so the
             -- bot faces one wave at a time instead of an accumulating stack.
             -- Deaths cluster where 5-6 lair members are on the bot, and the bot
@@ -2392,7 +2406,7 @@ SimPlayerManagerConfig = {
             -- lair in code, because the lair cannot produce more than two wave
             -- transitions: waves fire at reveal, at the FIRST point of damage,
             -- and past half condition, then stop.
-            waveDeaggro = false,
+            waveDeaggro = true,
             -- F_0.9.8c travel combat (owner 2026-10-09). On the two walking legs
             -- of a mission, a bot whose lowest HAM pool falls below the retreat
             -- threshold while attacked runs TOWARD the mission (veering away
@@ -2402,28 +2416,28 @@ SimPlayerManagerConfig = {
             -- on (0 disables that rest). Stand-and-fight is the base mover's
             -- existing in-combat hold; a ranged weapon with any
             -- <weapon>_hit_while_moving fights on the run instead.
-            travelCombat = false,
+            travelCombat = true,
             travelRestHamPct = 50,
             -- Flee legs a travelling bot may run per encounter before it turns
             -- and fights, to the death if need be (owner 2026-10-12: bouncing
             -- between running and resting until it dies looks worse than
             -- fighting). The count resets once the bot is clear and recovered.
             -- 0 = no limit.
-            travelMaxFleeLegs = 0,
+            travelMaxFleeLegs = 1,
             -- F_0.9.8c attacker recognition. Core3's startCombat puts the bot on
             -- the attacking creature's defender list and the creature on the
             -- bot's threat map, never on the bot's own defender list -- which is
             -- all the bot's self-defense read, so a walking bot could be hit to
             -- death unseen. A threat-map creature that is in combat and aimed at
             -- the bot now counts as an attacker.
-            attackerRecognition = false,
+            attackerRecognition = true,
             -- F_0.9.8e lair retreat (owner 2026-10-11: "it would look weird if
             -- they just waited to die"). A bot retreating from a lair fight
             -- keeps running while something is still on it (up to 5 legs per
             -- retreat) and fights back if attacked while resting. Before, the
             -- base in-combat hold pinned it where it stood, its tick slept
             -- until an arrival that never came, and self-defense was off.
-            lairRetreatDefense = false,
+            lairRetreatDefense = true,
             maxOfferAgeSeconds = 1800,
             -- On reveal, if the advertised wilderness point is no longer
             -- spawn-permitted (a no-build object appeared since the offer was
@@ -2437,7 +2451,7 @@ SimPlayerManagerConfig = {
             -- lair point is found on arrival by a random search around the
             -- waypoint that widens every 32 tries (256 tries, capped at 512m).
             -- false = the strict terminal check plus the 64m probe ring.
-            stockPlacement = false,
+            stockPlacement = true,
             -- Terminal offer-generation retry. On a partial (1-of-2) or empty
             -- board the hunter dwells offerRetrySeconds at the terminal and
             -- re-generates, up to offerMaxAttempts times, before accepting a
@@ -2487,10 +2501,10 @@ SimPlayerManagerConfig = {
             -- grinding, with market demand only breaking ties. A
             -- template-complete bot keeps the resource dispatch above.
             progressionDispatch = {
-                enabled = false,
+                enabled = true,
                 -- Nothing fightable on any planet: grind for this many minutes
                 -- (clamped 5..240) instead of idling, then dispatch again.
-                grindFallback = false,
+                grindFallback = true,
                 grindFallbackMinutes = 30,
             },
         },
