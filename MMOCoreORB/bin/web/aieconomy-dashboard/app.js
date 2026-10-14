@@ -316,6 +316,7 @@
     const professions = data.professions || {};
     const recent = Array.isArray(data.recentAbilityUse) ? data.recentAbilityUse : [];
     const mods = data.skillMods || {};
+    const items = Array.isArray(data.items) ? data.items : [];
     const home = [identity.homePlanet, identity.homeCity].filter(Boolean).join(" / ") || "unknown";
     const activity = body.earlyGameActivity || "unknown";
     const position = body.position ? [body.position.x, body.position.y, body.position.z]
@@ -341,6 +342,11 @@
     const modRows = Object.entries(mods).map(([name, mod]) => `<tr><td>${esc(name)}</td><td>${num(mod.templateBase)}</td><td>${num(mod.skillboxDelta)}</td><td>${num(mod.effective)}</td></tr>`).join("");
     const next = data.nextBox || {};
     const source = templates.attackSource === "skill" ? "trained skills" : "body template";
+    const itemRows = items.map((item) => {
+      const stats = item.stats || {};
+      const kind = stats.weapon ? "weapon" : stats.armor ? "armour" : stats.attributes ? "component" : "item";
+      return `<tr><td class="t-num">${esc(item.objectId)}</td><td><span class="t-main">${esc(item.name || stats.customName || "unnamed")}</span><span class="t-sub">${esc(stats.templatePath || "unknown")}</span></td><td>${chip(labelize(item.state || "unknown"), item.state === "held" ? "ok" : "ghost")}</td><td>${esc(item.source || "—")}</td><td>${esc(kind)} · ${esc(item.acquiredAt || "—")}</td></tr>`;
+    }).join("");
 
     return `<div class="playerbot-card"><h3>WHO</h3><p class="playerbot-lead">${esc(identity.name || "Unnamed SimBot")}</p>
       ${kvRows([["Profession", esc(labelize(identity.profession || "unknown"))], ["Home", esc(home)], ["Tier", num(identity.skillTier)], ["Kills / deaths", `${num(identity.kills)} / ${num(identity.deaths)}`], ["Activity", esc(labelize(activity))], ["Body", body.attached ? `attached · ${esc(body.zone || "unknown")}` : "not attached"], ["Lair members alive", num(body.lairMembersAlive)], ["Non-member engagements", num(body.nonMemberEngagements)]])}</div>
@@ -355,6 +361,7 @@
         ${superseded ? `<p class="playerbot-label">SUPERSEDED</p><div class="playerbot-chips">${superseded}</div>` : ""}
         ${(abilities.excluded || []).length ? `<details><summary>Excluded (${abilities.excluded.length})</summary><div class="playerbot-chips">${playerBotList(abilities.excluded)}</div></details>` : ""}</div>
       <div class="playerbot-card"><h3>RECENT ABILITY USE</h3>${recentRows || `<span class="muted small">No recorded ability use.</span>`}</div>
+      <div class="playerbot-card"><h3>ITEMS (${num(data.itemsHeld)})</h3>${table(["OID", "Item", "State", "Source", "Acquired"], itemRows, { scrollKey: "playerbot-items", tall: true })}</div>
       <div class="playerbot-card"><h3>SKILL MODS</h3>${modRows ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Mod</th><th>Base</th><th>Trained</th><th>Effective</th></tr></thead><tbody>${modRows}</tbody></table></div>` : `<span class="muted small">No live skill mods.</span>`}</div>`;
   }
 
@@ -1205,6 +1212,8 @@
     const combatAbilities = progression.combatAbilities || {};
     const missionCredits = progression.missionCredits || {};
     const buffPayment = progression.buffPayment || {};
+    const loot = progression.loot || {};
+    const vault = progression.vault || {};
     const ledger = progression.ledger || {};
     const trainingGate = progression.gates && progression.gates.trainingEnabled === true;
     const roster = Array.isArray(pve.roster) ? pve.roster : [];
@@ -1215,6 +1224,7 @@
         <td><button type="button" class="playerbot-link" data-identity-id="${esc(r.identityId)}"><span class="t-main">${esc(r.name || "#" + r.identityId)}</span><span class="t-sub">${esc(r.identityId)}</span></button></td>
         <td>${chip(labelize(r.profession || "unknown"), r.profession === "orphan" ? "red" : "ghost")}</td>
         <td><span class="t-main">${esc(r.trainingPlan || "none")}</span><span class="t-sub">${num(r.skillsTrained != null ? r.skillsTrained : (r.skills || []).length)} boxes · tier ${num(r.derivedTier)}</span></td>
+        <td class="t-num">${num(r.itemsHeld)}</td>
         <td class="t-num">${compact(r.bankCredits)}</td>
         <td class="t-num">${compact(r.cashCredits)}</td>
         <td><span class="t-sub">${journal}</span></td>
@@ -1340,7 +1350,17 @@
             ["Free-state forced / reserve skips", num(combatAbilities.freeStateForced) + " / " + num(combatAbilities.reserveSkips)]
           ])}
           <div class="section-gap"></div>
-          ${table(["Identity", "Profession", "Training", "Bank", "Cash", "Recent Holdings Changes", "XP", "Skills", "Last Award"], progressionRows, { scrollKey: "progression-identities", tall: true })}
+          ${table(["Identity", "Profession", "Training", "Items", "Bank", "Cash", "Recent Holdings Changes", "XP", "Skills", "Last Award"], progressionRows, { scrollKey: "progression-identities", tall: true })}
+          <div class="section-gap"></div>
+          ${kvRows([
+            ["Loot gate", chip(loot.enabled ? "enabled" : "disabled", loot.enabled ? "ok" : "ghost") + " · " + num(loot.corpsesLooted) + " corpses · " + num(loot.itemsLooted) + " items · " + num(loot.cashLooted) + " cash"],
+            ["Loot claims", num(loot.claimsQueued) + " queued · " + num(loot.claimsEvicted) + " evicted · abandoned " + num(Object.values(loot.abandoned || {}).reduce((a, v) => a + Number(v || 0), 0))],
+            ["Loot failures", num(loot.transferFailed) + " transfer · " + num(loot.skippedVaultFull) + " cap · " + num(loot.cashDropped) + " cash dropped"],
+            ["Vault", chip(vault.available ? "available" : "unavailable", vault.available ? "ok" : "red") + " · " + num(vault.bagCount) + " bags · " + num(vault.bagItemCount) + " items · " + num(vault.looseObjectCount) + " loose"],
+            ["Vault rows", Object.entries(vault.rowsByState || {}).map(([k, v]) => `${esc(k)} ${num(v)}`).join(" · ") || "none"],
+            ["Vault reconcile", num((vault.reconcile || {}).recovered) + " recovered · " + num((vault.reconcile || {}).orphaned) + " orphaned · " + num((vault.reconcile || {}).lost) + " lost · destroy failures " + num(vault.reapDestroyFailed)],
+            ["Item rows rejected", num(vault.progressionItemRowsRejected)]
+          ])}
           <div class="section-gap"></div>
           ${kvRows([
             ["Flush interval", num(progression.flushIntervalSeconds) + "s"],

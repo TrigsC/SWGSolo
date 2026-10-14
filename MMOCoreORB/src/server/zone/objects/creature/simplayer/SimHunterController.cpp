@@ -9,6 +9,7 @@
 #include "SimHunterTravelDiag.h"
 #include "SimBotTravelCombat.h"
 #include "SimBotAreaAttackGuard.h"
+#include "SimBotLootStep.h"
 
 #include "engine/core/Core.h"
 #include "server/ServerCore.h"
@@ -405,6 +406,10 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	if (orderActive && order.issuedAtMs == newOrder.issuedAtMs)
 		return;
 
+	if (lootStepActive) {
+		SimPlayerManager::instance()->returnPlayerBotLootClaim(lootStepClaim);
+		finishPlayerBotLootStep("newOrder", false);
+	}
 	dropTargetObserver();
 	disengageTarget(false);
 	clearEngagedTelemetry();
@@ -2309,9 +2314,36 @@ void SimHunterController::updateMissionAdds(int adds) {
 		identityId, agent == nullptr ? 0 : agent->getObjectID(), adds);
 }
 
+SimHunterController::LootWalkCallback
+SimHunterController::classifyLootWalkCallback() {
+	// Serialized with finishPlayerBotLootStep: either the step is still active,
+	// or the callback was dispatched under a generation the finished corpse walk
+	// used. Either way it belongs to the loot walk, not to the phase.
+	Locker lootArrivalLock(&lootArrivalMutex);
+	const uint64 dispatched = getCallbackDispatchGeneration();
+	// While the step is active the corpse walk owns movement: a callback from
+	// before it began refers to movement the walk already replaced.
+	if (lootStepActive.load(std::memory_order_acquire))
+		return dispatched >= lootWalkFirstGeneration ? LOOT_CALLBACK_CURRENT :
+			LOOT_CALLBACK_STALE;
+	// After a finish, everything dispatched before its generation advance refers
+	// to movement the loot step superseded: the corpse walk and the leg it
+	// interrupted alike. The resumed leg and later moves are all >= end.
+	if (lootWalkEndGeneration != 0 && dispatched < lootWalkEndGeneration)
+		return LOOT_CALLBACK_STALE;
+	return LOOT_CALLBACK_NOT_LOOT;
+}
+
 void SimHunterController::onArrived() {
 	if (agent == nullptr)
 		return;
+
+	// F_0.9.3: a corpse-walk arrival ends the loot walk only; checked before
+	// every other branch (flee legs included). The tick loots and resumes.
+	if (classifyLootWalkCallback() != LOOT_CALLBACK_NOT_LOOT) {
+		scheduleActiveTick(0);
+		return;
+	}
 
 	// Cross-planet legs (RELOCATING / BUFF_TRIP) run on the SHARED ticket-collector
 	// state machine, and this callback is its ONLY advance point: the 2->3
@@ -2338,6 +2370,8 @@ void SimHunterController::onArrived() {
 		return;
 	}
 
+	// F_0.9.3: arriving at a corpse ends the loot walk only. The tick loots and
+	// resumes the interrupted phase; none of that phase's arrival logic runs.
 	uint64 nowMs = System::getMiliTime();
 	if (earlyGameActive) {
 		handleEarlyGameArrived();
@@ -2519,6 +2553,16 @@ void SimHunterController::onArrived() {
 }
 
 void SimHunterController::onPathFailed() {
+	// F_0.9.3: an unreachable corpse abandons the loot walk, never the mission or
+	// the early-game anchor; a stale corpse-walk failure is ignored entirely.
+	const LootWalkCallback lootCallback = classifyLootWalkCallback();
+	if (lootCallback != LOOT_CALLBACK_NOT_LOOT) {
+		if (lootCallback == LOOT_CALLBACK_CURRENT)
+			lootStepPathFailed.store(true, std::memory_order_release);
+		scheduleActiveTick(0);
+		return;
+	}
+
 	if (isStructureTraversalFeatureEnabled() && isTraversalActive()) {
 		SimPlayerController::onPathFailed();
 		return;
@@ -3679,6 +3723,196 @@ void SimHunterController::handleEarlyGamePathFailed() {
 	}
 }
 
+void SimHunterController::finishPlayerBotLootStep(const char* outcome,
+		bool resumeLeg) {
+	const bool interruptedLeg = lootStepInterruptedLeg;
+	MissionDiagLog::event("LOOT_STEP", identityId,
+		String("end outcome=") + outcome + " corpse=" +
+		String::valueOf(lootStepClaim.corpseOid) + " phase=" + getPhaseName() +
+		" resumeLeg=" + String::valueOf(resumeLeg && interruptedLeg));
+	{
+		// Serialized with onArrived's check. Always advance the generation (an
+		// arrival may already have set WAITING and be on its way to onArrived),
+		// stop the corpse walk, and mark every generation the walk used as
+		// stale BEFORE dropping the guard.
+		Locker lootArrivalLock(&lootArrivalMutex);
+		lootWalkEndGeneration = advanceWorkLoopGeneration("lootStepEnd");
+		if (state == MOVING || state == CALCULATING_PATH || state == WAITING)
+			state = IDLE;
+		lootStepActive = false;
+	}
+	lootStepClaim = PlayerBotLootClaim();
+	lootStepStartedAtMs = 0;
+	lootStepInterruptedLeg = false;
+	if (!resumeLeg || !interruptedLeg || !isTravelCombatPhase())
+		return;
+
+	// Put the interrupted leg back on course. TRAVEL_TO_MISSION re-issues its
+	// own move when idle; the other legs do not, so they are resumed here
+	// through the same helper travel combat uses after a flee.
+	if (phase == TRAVEL_TO_TERMINAL)
+		resumeTravelLeg(missionTerminalPosition);
+	else if (phase == TRAVEL_TO_LAIR)
+		resumeTravelLeg(missionLairPosition);
+	else if (phase == TRAVEL_HOME && travelHomeDestinationSet)
+		resumeTravelLeg(travelHomeDestination);
+}
+
+bool SimHunterController::runPlayerBotLootStep(AiAgent* hunter,
+		uint64 nowMs) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr || hunter == nullptr)
+		return false;
+
+	if (lootStepActive) {
+		bool newAttacker = targetOid != 0;
+		ManagedReference<CreatureObject*> attacker;
+		ManagedReference<AiAgent*> attackerAgent;
+		if (!newAttacker && (hunter->isInCombat() || recognisesThreatAttackers()))
+			newAttacker = selectActiveCombatAttacker(hunter, attacker,
+				attackerAgent);
+
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		bool corpsePresent = zoneServer != nullptr &&
+			zoneServer->getObject(lootStepClaim.corpseOid) != nullptr;
+		const uint64 timeoutSeconds = static_cast<uint64>(Math::max(0,
+			manager->getPlayerBotLootStepTimeoutSeconds()));
+		const uint64 deadline = timeoutSeconds == 0 || lootStepStartedAtMs == 0 ?
+			0 : lootStepStartedAtMs + timeoutSeconds * 1000;
+		SimBotLootStep::ExitReason exit = SimBotLootStep::decideExit(
+			!hunter->isDead(), newAttacker, corpsePresent, nowMs,
+			lootStepClaim.expiresAtMs, deadline);
+		if (exit == SimBotLootStep::EXIT_NONE &&
+				lootStepPathFailed.exchange(false, std::memory_order_acq_rel)) {
+			manager->recordPlayerBotLootAbandoned("pathFailed");
+			finishPlayerBotLootStep("pathFailed", true);
+			scheduleActiveTick(100);
+			return true;
+		}
+		if (exit != SimBotLootStep::EXIT_NONE) {
+			const char* outcome = "none";
+			switch (exit) {
+			case SimBotLootStep::EXIT_NEW_ATTACKER: outcome = "newAttacker"; break;
+			case SimBotLootStep::EXIT_CLAIM_EXPIRED: outcome = "expired"; break;
+			case SimBotLootStep::EXIT_CORPSE_GONE: outcome = "corpseGone"; break;
+			case SimBotLootStep::EXIT_TIMEOUT: outcome = "timeout"; break;
+			case SimBotLootStep::EXIT_BOT_DEAD: outcome = "botDeath"; break;
+			default: break;
+			}
+			if (exit == SimBotLootStep::EXIT_NEW_ATTACKER)
+				manager->returnPlayerBotLootClaim(lootStepClaim);
+			manager->recordPlayerBotLootAbandoned(outcome);
+			// Every exit but death puts the leg back at once, a new attacker
+			// included: a fight-on-the-run bot never holds, so travel combat's
+			// hold-end resume would never fire for it.
+			finishPlayerBotLootStep(outcome,
+				exit != SimBotLootStep::EXIT_BOT_DEAD);
+			if (exit == SimBotLootStep::EXIT_NEW_ATTACKER)
+				return false;
+			if (exit != SimBotLootStep::EXIT_BOT_DEAD)
+				scheduleActiveTick(100);
+			return true;
+		}
+
+		if (isTravelCombatPhase() && travelCombatMode.load(
+				std::memory_order_acquire) != SimBotTravelCombat::MOVE) {
+			scheduleActiveTick(1000);
+			return true;
+		}
+
+		Vector3 position = hunter->getWorldPosition();
+		if (position.distanceTo2d(lootStepClaim.position) <=
+				static_cast<float>(manager->getPlayerBotLootArriveMeters())) {
+			PlayerBotLootDisposition result = manager->lootPlayerBotCorpse(
+				identityId, hunter, lootStepClaim.corpseOid);
+			manager->recordPlayerBotLootResult(identityId,
+				lootStepClaim.corpseOid, result);
+			// A corpse just out of reach is retried while the claim lives. Every
+			// other result is final: a transfer or bag failure is counted and the
+			// corpse stays lootable until it despawns, with no retry loop.
+			if (result == PLAYER_BOT_LOOT_TOO_FAR)
+				manager->returnPlayerBotLootClaim(lootStepClaim);
+			finishPlayerBotLootStep("looted", true);
+			scheduleActiveTick(100);
+			return true;
+		}
+
+		if (state == MOVING || state == CALCULATING_PATH ||
+				isTraversalActive()) {
+			scheduleActiveTick(1000);
+			return true;
+		}
+
+		const uint64 generationBefore = activeTickGeneration.load(
+			std::memory_order_acquire);
+		moveTo(lootStepClaim.position);
+		if (activeTickGeneration.load(std::memory_order_acquire) ==
+				generationBefore)
+			scheduleActiveTick(1000);
+		return true;
+	}
+
+	// On a travel leg the bot is normally walking, so a walking bot may take a
+	// nearby claim there; elsewhere it must be standing idle.
+	const bool travelLeg = isTravelCombatPhase();
+	if (hunter->isDead() || hunter->isInCombat() || targetOid != 0 ||
+			isTraversalActive() ||
+			(!travelLeg && (state == MOVING || state == CALCULATING_PATH)))
+		return false;
+	if (travelLeg &&
+			travelCombatMode.load(std::memory_order_acquire) !=
+				SimBotTravelCombat::MOVE)
+		return false;
+	if (travelLeg && travelHoldActive.load(std::memory_order_acquire))
+		return false;
+	if (!travelLeg && isMovementHeld())
+		return false;
+
+	ManagedReference<CreatureObject*> attacker;
+	ManagedReference<AiAgent*> attackerAgent;
+	if ((hunter->isInCombat() || recognisesThreatAttackers()) &&
+			selectActiveCombatAttacker(hunter, attacker, attackerAgent))
+		return false;
+
+	Zone* zone = hunter->getZone();
+	if (zone == nullptr)
+		return false;
+	Vector3 position = hunter->getWorldPosition();
+	PlayerBotLootClaim claim;
+	if (!manager->takeNearestPlayerBotLootClaim(identityId,
+			zone->getZoneName(), position,
+			static_cast<float>(manager->getPlayerBotLootMaxDetourMeters()),
+			claim))
+		return false;
+
+	lootStepPathFailed.store(false, std::memory_order_release);
+	lootStepClaim = claim;
+	lootStepStartedAtMs = nowMs;
+	lootStepInterruptedLeg = travelLeg;
+	{
+		// Range and activation are published together, so a callback can never
+		// see the step active with the previous walk's range. moveTo below
+		// advances the generation; everything from here until the finish
+		// belongs to this corpse walk.
+		Locker lootArrivalLock(&lootArrivalMutex);
+		lootWalkFirstGeneration = getWorkLoopGeneration() + 1;
+		lootWalkEndGeneration = 0;
+		lootStepActive = true;
+	}
+	MissionDiagLog::event("LOOT_STEP", identityId,
+		"begin corpse=" + String::valueOf(claim.corpseOid) + " phase=" +
+		getPhaseName() + " dist=" + String::valueOf(static_cast<int>(
+			position.distanceTo2d(claim.position))) + " walking=" +
+		String::valueOf(state == MOVING || state == CALCULATING_PATH));
+	const uint64 generationBefore = activeTickGeneration.load(
+		std::memory_order_acquire);
+	moveTo(claim.position);
+	if (activeTickGeneration.load(std::memory_order_acquire) ==
+			generationBefore)
+		scheduleActiveTick(1000);
+	return true;
+}
+
 void SimHunterController::runEarlyGameTick(AiAgent* hunter, uint64 nowMs) {
 	SimPlayerManager* manager = SimPlayerManager::instance();
 	if (!manager->isPlayerBotEarlyGameIdentity(identityId)) {
@@ -3753,6 +3987,9 @@ void SimHunterController::runEarlyGameTick(AiAgent* hunter, uint64 nowMs) {
 		beginEarlyGameRecovery(true);
 		return;
 	}
+	if (earlyGamePhase == EARLY_SELECT_TARGET &&
+		runPlayerBotLootStep(hunter, nowMs))
+		return;
 
 	if (earlyGamePhase == EARLY_RECOVER) {
 		if (state == MOVING || state == CALCULATING_PATH) {
@@ -4010,6 +4247,16 @@ void SimHunterController::runActiveTick() {
 			" gen=" + String::valueOf(activeTickGeneration.load(
 				std::memory_order_relaxed)));
 	if (strongAgent->isDead()) {
+		// Every queued corpse belongs to this body's OID; the respawned body gets
+		// a new one and could never loot them, so all of them are dropped.
+		SimPlayerManager* lootManager = SimPlayerManager::instance();
+		if (lootManager != nullptr)
+			lootManager->dropPlayerBotLootClaims(identityId);
+		if (lootStepActive) {
+			if (lootManager != nullptr)
+				lootManager->recordPlayerBotLootAbandoned("botDeath");
+			finishPlayerBotLootStep("botDeath", false);
+		}
 		if (isStructureTraversalFeatureEnabled() && isTraversalActive())
 			clearStructureTraversalState("hunter_death");
 		cancelPveDoctorRequest();
@@ -4118,6 +4365,11 @@ void SimHunterController::runActiveTick() {
 			beginTravelHome(true);
 		return;
 	}
+
+	if (isTravelCombatPhase() && travelCombatMode.load(
+			std::memory_order_acquire) == SimBotTravelCombat::MOVE &&
+			runPlayerBotLootStep(strongAgent, nowMs))
+		return;
 
 	if (phase == ANNOUNCE_JOB) {
 		beginBuffUp();
@@ -4715,6 +4967,9 @@ void SimHunterController::runActiveTick() {
 	}
 
 	if (missionHuntOrder && checkMissionSocialAggro(strongAgent))
+		return;
+
+	if (runPlayerBotLootStep(strongAgent, nowMs))
 		return;
 
 	if (strongAgent->isInCombat()) {
@@ -6786,6 +7041,10 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 }
 
 void SimHunterController::teardown(const String& reason) {
+	// The body is going away, and with it the ownership of every queued corpse.
+	SimPlayerManager::instance()->dropPlayerBotLootClaims(identityId);
+	if (lootStepActive)
+		finishPlayerBotLootStep("teardown", false);
 	if (isStructureTraversalFeatureEnabled() && isTraversalActive())
 		clearStructureTraversalState("hunter_teardown");
 	activeTickGeneration++;

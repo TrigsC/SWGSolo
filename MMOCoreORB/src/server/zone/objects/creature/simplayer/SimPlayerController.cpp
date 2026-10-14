@@ -45,6 +45,15 @@ using namespace server::zone::objects::creature::ai::bt;
 
 //#define DEBUG_SIMPVP
 
+// The generation the running arrival-check or path-result task captured (0
+// when the current thread is not inside one).
+static thread_local uint64 callbackTaskGeneration = 0;
+
+uint64 SimPlayerController::getCallbackDispatchGeneration() const {
+    return callbackTaskGeneration != 0 ? callbackTaskGeneration :
+        workLoopGeneration;
+}
+
 static bool isCellNavDiagAgent(AiAgent* agent) {
     return agent != nullptr &&
         SimPlayerManager::instance()->isCellNavDiagBot(agent->getObjectID());
@@ -747,6 +756,7 @@ void SimPathFindTask::run() {
         bool zeroClipEnforcementRejected = false;
         bool zeroClipCapExhausted = false;
 
+        callbackTaskGeneration = capturedGeneration;
         if (path != nullptr) {
             if (zeroClipProbed && strongCtrl->shouldRejectClippingPath(
                     zeroClipResult, zeroClipCapExhausted)) {
@@ -758,6 +768,7 @@ void SimPathFindTask::run() {
         } else {
             strongCtrl->onPathTaskFailed(pathUsesNavmesh);
         }
+        callbackTaskGeneration = 0;
 
         // Passing the generation check is NOT the same as being walked:
         // onPathFound can still reject for hybrid cancellation, combat, a
@@ -865,7 +876,9 @@ void ArrivalCheckTask::run() {
         if (!strongCtrl->isWorkLoopGenerationCurrent(capturedGeneration, "arrival_check"))
             return;
 
+        callbackTaskGeneration = capturedGeneration;
         strongCtrl->checkArrival();
+        callbackTaskGeneration = 0;
     }, "SimPlayerArrivalLambda");
 }
 

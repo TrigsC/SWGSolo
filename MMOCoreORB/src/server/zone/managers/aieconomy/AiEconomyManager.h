@@ -11,6 +11,7 @@
 #include "system/util/VectorMap.h"
 #include "system/util/Vector.h"
 #include "server/zone/managers/aieconomy/AiEconomyData.h"
+#include "server/zone/objects/scene/SceneObject.h"
 
 struct AiEconomyStockpileInspectionLot {
 	uint64 entryID = 0;
@@ -141,6 +142,11 @@ struct HiveReservation {
 class AiEconomyManager : public Singleton<AiEconomyManager>, public Object, public Logger {
 private:
 	ManagedReference<AiEconomyData*> economyData;
+	ManagedReference<SceneObject*> itemVault;
+	AtomicBoolean itemVaultAvailable{false};
+	AtomicLong itemBagsDiscarded;
+	AtomicLong itemVaultCreated;
+	AtomicLong itemVaultLoadFailed;
 	AtomicBoolean persistenceReady{false};
 	Mutex persistenceMutationMutex;
 	VectorMap<String, uint64> conceptualMinerStartupTotals;
@@ -152,6 +158,8 @@ private:
 
 	bool loadOrCreateEconomyData(bool& created, String& failureReason, int& stockpileLotCount);
 	bool validateEconomyData(AiEconomyData* data, String& failureReason, int& stockpileLotCount);
+	void ensureItemVault();
+	void discardItemBag(SceneObject* bag, SceneObject* vault);
 	void logLoadedConceptualStockpileSummary();
 	void reconcileReservationsOnLoad();
 
@@ -160,6 +168,17 @@ public:
 
 	void initialize();
 	bool isPersistenceReady() const;
+	bool isItemVaultAvailable() const { return itemVaultAvailable.get(); }
+	static bool isItemContainer(SceneObject* object);
+	static bool isItemBag(SceneObject* object);
+	uint64 getItemBagsDiscarded() const { return itemBagsDiscarded.get(); }
+	uint64 getItemVaultCreatedCount() const { return itemVaultCreated.get(); }
+	uint64 getItemVaultLoadFailedCount() const { return itemVaultLoadFailed.get(); }
+	ManagedReference<SceneObject*> getItemVault() const { return itemVault; }
+	ManagedReference<SceneObject*> getItemBag(uint64 identityId);
+	ManagedReference<SceneObject*> getOrCreateItemBag(uint64 identityId);
+	VectorMap<uint64, uint64> getItemBagMapSnapshot();
+	bool dropItemBag(uint64 identityId);
 	bool updateConceptualMinerTotals(
 		const VectorMap<String, uint64>& totalsSnapshot,
 		int& createdLots, int& updatedLots, uint64& totalQuantity,

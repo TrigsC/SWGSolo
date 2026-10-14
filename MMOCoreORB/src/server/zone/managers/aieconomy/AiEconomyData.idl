@@ -6,15 +6,20 @@ package server.zone.managers.aieconomy;
 
 import engine.core.ManagedObject;
 import system.util.Vector;
+import system.util.VectorMap;
 include server.zone.managers.aieconomy.AiEconomyStockpileLot;
 include system.lang.Time;
 
 @json
 class AiEconomyData extends ManagedObject {
-	public static final int CURRENT_SCHEMA_VERSION = 1;
+	public static final int CURRENT_SCHEMA_VERSION = 2;
 
 	protected int schemaVersion;
 	protected unsigned long nextStockpileEntryId;
+	protected unsigned long itemVaultOid;
+
+	@dereferenced
+	protected VectorMap<unsigned long, unsigned long> itemBagOids;
 
 	@dereferenced
 	protected Time createdTimestamp;
@@ -28,6 +33,7 @@ class AiEconomyData extends ManagedObject {
 	public AiEconomyData() {
 		schemaVersion = CURRENT_SCHEMA_VERSION;
 		nextStockpileEntryId = 1;
+		itemVaultOid = 0;
 		createdTimestamp.updateToCurrentTime();
 		updatedTimestamp.updateToCurrentTime();
 	}
@@ -36,6 +42,58 @@ class AiEconomyData extends ManagedObject {
 	@preLocked
 	public int getSchemaVersion() {
 		return schemaVersion;
+	}
+
+	@dirty
+	@preLocked
+	public void setSchemaVersion(int version) {
+		schemaVersion = version;
+		updatedTimestamp.updateToCurrentTime();
+	}
+
+	@read
+	@preLocked
+	public unsigned long getItemVaultOid() {
+		return itemVaultOid;
+	}
+
+	@dirty
+	@preLocked
+	public void setItemVaultOid(unsigned long oid) {
+		itemVaultOid = oid;
+		updatedTimestamp.updateToCurrentTime();
+	}
+
+	@read
+	@preLocked
+	public unsigned long getItemBagOid(unsigned long identityId) {
+		if (!itemBagOids.contains(identityId))
+			return 0;
+
+		return itemBagOids.get(identityId);
+	}
+
+	@local
+	@preLocked
+	public VectorMap<unsigned long, unsigned long> getItemBagOids() {
+		return itemBagOids;
+	}
+
+	@dirty
+	@preLocked
+	public void putItemBagOid(unsigned long identityId, unsigned long bagOid) {
+		itemBagOids.put(identityId, bagOid);
+		updatedTimestamp.updateToCurrentTime();
+	}
+
+	@dirty
+	@preLocked
+	public boolean dropItemBagOid(unsigned long identityId) {
+		boolean dropped = itemBagOids.drop(identityId);
+		if (dropped)
+			updatedTimestamp.updateToCurrentTime();
+
+		return dropped;
 	}
 
 	@read

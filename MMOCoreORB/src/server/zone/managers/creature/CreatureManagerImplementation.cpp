@@ -38,6 +38,7 @@
 #include "server/zone/objects/building/PoiBuilding.h"
 #include "server/zone/objects/intangible/TheaterObject.h"
 #include "server/zone/objects/transaction/TransactionLog.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
 
 Mutex CreatureManagerImplementation::loadMutex;
 
@@ -606,6 +607,8 @@ int CreatureManagerImplementation::notifyDestruction(TangibleObject* destructor,
 		destructor->unlock();
 
 	bool shouldRescheduleCorpseDestruction = false;
+	bool botLootBranch = false;
+	bool botLootHasValue = false;
 
 	try {
 		SortedVector<ManagedReference<Observer* > > observers = destructedObject->getObservers(ObserverEventType::QUESTKILL);
@@ -702,11 +705,57 @@ int CreatureManagerImplementation::notifyDestruction(TangibleObject* destructor,
 			} else if (trx.isEnabled() && !trx.isAborted()) {
 				trx.abort() << "createLoot failed for ai object for unknown reason.";
 			}
+		} else if (creatureInventory != nullptr && player != nullptr &&
+				!player->isPlayerCreature() && player->isAiAgent() &&
+				player->asAiAgent() != nullptr &&
+				player->asAiAgent()->getSimPlayerBot() &&
+				!destructedObject->isEventMob()) {
+			botLootBranch = true;
+			SimPlayerManager* simPlayerManager = SimPlayerManager::instance();
+			uint64 identityId = simPlayerManager == nullptr ? 0 :
+				simPlayerManager->resolvePlayerBotLootOwner(
+					player->getObjectID());
+
+			if (identityId != 0 && simPlayerManager != nullptr) {
+				LootManager* lootManager = zoneServer->getLootManager();
+				if (destructedObject->isNonPlayerCreatureObject()) {
+					destructedObject->clearCashCredits();
+					int credits = lootManager->calculateLootCredits(
+						destructedObject->getLevel());
+					TransactionLog trx(TrxCode::NPCLOOT, destructedObject,
+						credits, true);
+					trx.addState("destructor", destructorObjectID);
+					destructedObject->addCashCredits(credits);
+				}
+
+				Locker invLocker(creatureInventory, destructedObject);
+				TransactionLog trx(TrxCode::NPCLOOT, destructedObject);
+				creatureInventory->setContainerOwnerID(player->getObjectID());
+
+				if (lootManager->createLoot(trx, creatureInventory,
+						destructedObject)) {
+					trx.commit(true);
+				} else if (trx.isEnabled() && !trx.isAborted()) {
+					trx.abort() << "createLoot failed for ai object for unknown reason.";
+				}
+
+				botLootHasValue = destructedObject->getCashCredits() > 0 ||
+					creatureInventory->getContainerObjectsSize() > 0;
+				if (botLootHasValue) {
+					Zone* corpseZone = destructedObject->getZone();
+					if (corpseZone != nullptr)
+						simPlayerManager->queuePlayerBotLootClaim(identityId,
+							destructedObject->getObjectID(),
+							corpseZone->getZoneName(),
+							destructedObject->getWorldPosition());
+				}
+			}
 		}
 
 		// Check to see if we can expedite the despawn of this corpse
 		// We can expedite the despawn when corpse has no loot, no credits, player cannot harvest, and no group members in range can harvest
-		shouldRescheduleCorpseDestruction = playerManager->shouldRescheduleCorpseDestruction(player, destructedObject);
+		if (!botLootBranch)
+			shouldRescheduleCorpseDestruction = playerManager->shouldRescheduleCorpseDestruction(player, destructedObject);
 	} catch (...) {
 		destructedObject->scheduleDespawn(10, true);
 
@@ -717,7 +766,12 @@ int CreatureManagerImplementation::notifyDestruction(TangibleObject* destructor,
 		throw;
 	}
 
-	if (shouldRescheduleCorpseDestruction) {
+	if (botLootBranch) {
+		if (botLootHasValue)
+			destructedObject->scheduleDespawn(300);
+		else
+			destructedObject->scheduleDespawn(10, true);
+	} else if (shouldRescheduleCorpseDestruction) {
 		// Corpse has nothing of value, schedule despawn for 10s
 		destructedObject->scheduleDespawn(10, true);
 	} else {

@@ -522,6 +522,10 @@ protected:
     SimState state;
 
 public:
+    bool isMovementInFlight() const {
+        return state == MOVING || state == CALCULATING_PATH;
+    }
+
     SimPlayerController(AiAgent* aiAgent);
     virtual ~SimPlayerController();
 
@@ -666,6 +670,12 @@ public:
     // The invariant half of the template method above.
     bool acceptFoundPathInvariants(const Vector3& pathEnd);
     uint64 getWorkLoopGeneration() const { return workLoopGeneration; }
+    // The generation captured by the arrival-check or path-result task that is
+    // dispatching the current onArrived()/onPathFailed() (same thread,
+    // synchronous), so a subclass can recognise a callback that belongs to
+    // movement it has since cancelled. Outside such a task it is the live
+    // generation.
+    uint64 getCallbackDispatchGeneration() const;
     String getLastWorkLoopAdvanceReason() const;
     String getHybridPathDiagLine() const;
     void setHybridFailureProbeEnabled(bool enabled) {

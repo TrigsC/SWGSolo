@@ -16,6 +16,8 @@
 #include "SimHunterTravelDiag.h"
 #include "SimBotAreaAttackGuard.h"
 #include "SimBotMissionCredits.h"
+#include "SimBotLootStep.h"
+#include "SimBotItemReconcile.h"
 
 #include <vector>
 #include "StructureTraversalDiagLog.h"
@@ -48,6 +50,8 @@
 #include "server/zone/objects/region/SpawnArea.h"
 #include "server/zone/objects/creature/VehicleObject.h"
 #include "server/zone/objects/tangible/weapon/WeaponObject.h"
+#include "server/zone/objects/tangible/component/Component.h"
+#include "server/zone/objects/tangible/wearables/ArmorObject.h"
 #include "server/zone/objects/intangible/VehicleControlDevice.h"
 #include "templates/params/creature/PlayerArrangement.h"
 #include "templates/params/creature/ObjectFlag.h"
@@ -69,6 +73,7 @@
 #include "server/zone/objects/resource/ResourceSpawn.h"
 #include "server/zone/objects/creature/buffs/BuffType.h"
 #include "server/zone/objects/creature/ai/Creature.h"
+#include "server/zone/objects/tangible/TangibleObject.h"
 #include "server/zone/managers/object/ObjectManager.h"
 #include "server/zone/objects/pathfinding/NavArea.h"
 #include "server/zone/managers/collision/PathFinderManager.h"
@@ -98,6 +103,7 @@
 #include "server/zone/managers/creature/SpawnGroup.h"
 #include "server/zone/objects/area/ActiveArea.h"
 #include "server/zone/objects/scene/SceneObject.h"
+#include "server/zone/objects/creature/events/DespawnCreatureTask.h"
 #include "templates/mobile/LairTemplate.h"
 #include "server/zone/TreeEntry.h"
 #include "system/thread/ReadLocker.h"
@@ -107,6 +113,22 @@
 
 static String prettyPveHunterSiteName(const String& name);
 static bool playerBotValidWeaponType(const String& weaponType);
+static bool isPlayerBotParityRestartScenario(const String& name) {
+	return name == "retained_record_survives_restart";
+}
+
+struct PlayerBotObservedVaultItem {
+	uint64 objectId = 0;
+	uint64 identityId = 0;
+	SimBotItemReconcile::ObjectLocation location =
+		SimBotItemReconcile::LOCATION_MISSING;
+	ManagedReference<SceneObject*> object;
+	uint32 templateCrc = 0;
+	String displayName;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
 
 class SimMinerSummaryTask : public Task {
 public:
@@ -6213,6 +6235,9 @@ void SimPlayerManager::loadLuaConfig() {
 		Locker progressionLock(&progressionMutex);
 		progressionRecords.removeAll();
 		progressionDirtyIds.removeAll();
+		progressionItems.removeAll();
+		progressionItemHeldCounts.removeAll();
+		progressionItemDirtyIds.removeAll();
 		progressionRetiringIds.removeAll();
 		progressionLedgerPending.removeAll();
 		progressionRecentLedger.removeAll();
@@ -6240,6 +6265,10 @@ void SimPlayerManager::loadLuaConfig() {
 		progressionNextRequestId = 1;
 	}
 	{
+		Locker lootLock(&lootMutex);
+		playerBotLootClaims.removeAll();
+	}
+	{
 		Locker parityLock(&playerBotParityTestMutex);
 		playerBotParityTestScenarios.removeAll();
 		playerBotParityTestResults.removeAll();
@@ -6258,6 +6287,8 @@ void SimPlayerManager::loadLuaConfig() {
 		}
 		playerBotParityCombatAbilityHarnessOptIns.removeAll();
 		playerBotParityCombatAbilityScopedIds.removeAll();
+		playerBotParityItemStatSnapshots.removeAll();
+		playerBotParityTestLootCapOverrideActive = false;
 		playerBotParityTestScenarioIndex = 0;
 		playerBotParityTestStepCursor = 0;
 		playerBotParityTestSetupCursor = 0;
@@ -6311,6 +6342,7 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestPhaseAFileInvalid = false;
 		playerBotParityTestProbeIdentityId = 0;
 		playerBotParityTestPhase = "A";
+		playerBotParityTestRestartScenario = "";
 		playerBotParityTestRunId = "";
 	}
 	// Deliberately OUTSIDE the parity-lock scope above: this takes pveMutex, and
@@ -8674,6 +8706,30 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		progressionAwardKillXp);
 	progressionAwardMissionCredits = config.getBooleanField(
 		"awardMissionCredits", progressionAwardMissionCredits);
+	progressionLootEnabled = config.getBooleanField("lootEnabled",
+		progressionLootEnabled);
+	LuaObject loot = config.getObjectField("loot");
+	if (loot.isValidTable()) {
+		progressionLootMaxItemsPerBot = clampIntRange(
+			loot.getIntField("maxItemsPerBot", progressionLootMaxItemsPerBot),
+			0, 100000);
+		progressionLootArriveMeters = clampIntRange(
+			loot.getIntField("arriveMeters", progressionLootArriveMeters),
+			0, 256);
+		progressionLootMaxDetourMeters = clampIntRange(
+			loot.getIntField("maxDetourMeters", progressionLootMaxDetourMeters),
+			0, 100000);
+		progressionLootClaimTtlSeconds = clampIntRange(
+			loot.getIntField("claimTtlSeconds", progressionLootClaimTtlSeconds),
+			0, 86400);
+		progressionLootMaxClaimsPerBot = clampIntRange(
+			loot.getIntField("maxClaimsPerBot", progressionLootMaxClaimsPerBot),
+			0, 10000);
+		progressionLootStepTimeoutSeconds = clampIntRange(
+			loot.getIntField("stepTimeoutSeconds",
+				progressionLootStepTimeoutSeconds), 0, 86400);
+	}
+	loot.pop();
 	LuaObject buffPayment = config.getObjectField("buffPayment");
 	if (buffPayment.isValidTable()) {
 		progressionBuffPaymentEnabled = buffPayment.getBooleanField(
@@ -9057,6 +9113,30 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 		step.command = table.getStringField("ability").trim();
 	step.supersededBy = table.getStringField("supersededBy").trim();
 	step.targetState = table.getStringField("targetState").trim().toLowerCase();
+	step.corpseOid = table.getLongField("corpseOid", 0);
+	step.lootTemplate = table.getStringField("lootTemplate").trim();
+	step.itemState = table.getStringField("itemState").trim().toLowerCase();
+	step.expectedItemCount = table.getIntField("itemCount", absentExpected);
+	if (step.expectedItemCount == absentExpected)
+		step.expectedItemCount = -1;
+	step.expectedCorpseItemCount = table.getIntField("corpseItemCount",
+		absentExpected);
+	if (step.expectedCorpseItemCount == absentExpected)
+		step.expectedCorpseItemCount = -1;
+	step.expectedDespawnSeconds = table.getIntField("despawnSeconds",
+		absentExpected);
+	if (step.expectedDespawnSeconds == absentExpected)
+		step.expectedDespawnSeconds = -1;
+	step.lootCap = table.getIntField("lootCap", absentExpected);
+	if (step.lootCap == absentExpected)
+		step.lootCap = -1;
+	step.lootGate = table.getBooleanField("lootGate", false);
+	step.keepCorpse = table.getBooleanField("keepCorpse", false);
+	step.bySeededItem = table.getBooleanField("bySeededItem", false);
+	step.hasLootGate = step.lootGate ==
+		table.getBooleanField("lootGate", true);
+	step.inVault = table.getBooleanField("inVault", false);
+	step.hasInVault = step.inVault == table.getBooleanField("inVault", true);
 	step.combatAbilitySpecialAttackChancePercent = table.getIntField(
 		"specialAttackChancePercent", absentExpected);
 	step.hasCombatAbilitySpecialAttackChancePercent =
@@ -9151,16 +9231,16 @@ void SimPlayerManager::initializePlayerBotParityTestResults() {
 		playerBotParityTestResults.add(result);
 	}
 	playerBotParityTestScenarioOrder.removeAll();
-	int retainedIndex = -1;
+	Vector<int> restartScenarioIndexes;
 	for (int i = 0; i < playerBotParityTestScenarios.size(); ++i) {
-		if (playerBotParityTestScenarios.get(i).name ==
-				"retained_record_survives_restart")
-			retainedIndex = i;
+		if (isPlayerBotParityRestartScenario(
+				playerBotParityTestScenarios.get(i).name))
+			restartScenarioIndexes.add(i);
 		else
 			playerBotParityTestScenarioOrder.add(i);
 	}
-	if (retainedIndex >= 0)
-		playerBotParityTestScenarioOrder.add(retainedIndex);
+	for (int i = 0; i < restartScenarioIndexes.size(); ++i)
+		playerBotParityTestScenarioOrder.add(restartScenarioIndexes.get(i));
 	playerBotParityTestScenarioIndex = 0;
 	playerBotParityTestStepCursor = 0;
 	playerBotParityTestSetupCursor = 0;
@@ -9184,6 +9264,7 @@ void SimPlayerManager::initializePlayerBotParityTestResults() {
 	playerBotParityTestPhaseAFileWritten = false;
 	playerBotParityTestPhaseAFileInvalid = false;
 	playerBotParityTestPhase = "A";
+	playerBotParityTestRestartScenario = "";
 	playerBotParityTestProbeIdentityId = 0;
 	playerBotParityTestRunId = String::valueOf(System::getMiliTime());
 }
@@ -10576,6 +10657,53 @@ static String pveSqlValue(const String& value) {
 	return "'" + escaped + "'";
 }
 
+static String progressionSqlString(const String& value) {
+	return "'" + value.escapeString() + "'";
+}
+
+static const char* playerBotItemStateName(SimBotItemState state) {
+	switch (state) {
+	case SIMBOT_ITEM_HELD:
+		return "held";
+	case SIMBOT_ITEM_ORPHANED:
+		return "orphaned";
+	case SIMBOT_ITEM_PENDING:
+		return "pending";
+	case SIMBOT_ITEM_LOST:
+		return "lost";
+	case SIMBOT_ITEM_CONSUMED:
+		return "consumed";
+	case SIMBOT_ITEM_LISTED:
+		return "listed";
+	case SIMBOT_ITEM_EQUIPPED:
+		return "equipped";
+	}
+
+	return "orphaned";
+}
+
+static bool playerBotItemStateFromName(const String& name,
+		SimBotItemState& state) {
+	if (name == "held")
+		state = SIMBOT_ITEM_HELD;
+	else if (name == "orphaned")
+		state = SIMBOT_ITEM_ORPHANED;
+	else if (name == "pending")
+		state = SIMBOT_ITEM_PENDING;
+	else if (name == "lost")
+		state = SIMBOT_ITEM_LOST;
+	else if (name == "consumed")
+		state = SIMBOT_ITEM_CONSUMED;
+	else if (name == "listed")
+		state = SIMBOT_ITEM_LISTED;
+	else if (name == "equipped")
+		state = SIMBOT_ITEM_EQUIPPED;
+	else
+		return false;
+
+	return true;
+}
+
 static String pveMissionCreditDispositionName(
 		PveMissionCreditDisposition disposition);
 
@@ -10604,15 +10732,26 @@ void SimPlayerManager::markProgressionDirtyLocked(uint64 identityId) {
 		progressionDirtyIds.put(identityId, true);
 }
 
-void SimPlayerManager::appendPlayerBotLedgerEntryLocked(uint64 identityId,
-		bool bank, int64 delta, int64 balanceAfter, const String& source,
-		uint64 refId, const String& detail) {
+void SimPlayerManager::markPlayerBotItemDirtyLocked(uint64 objectId) {
+	if (objectId == 0)
+		return;
+
+	if (progressionItems.contains(objectId)) {
+		progressionItems.get(objectId).dirty = true;
+		progressionItemDirtyIds.put(objectId, true);
+	}
+}
+
+void SimPlayerManager::appendPlayerBotLedgerEntryKindLocked(
+		uint64 identityId, const String& kind, int64 delta,
+		int64 balanceAfter, const String& source, uint64 refId,
+		const String& detail) {
 	if (identityId == 0)
 		return;
 
 	SimBotLedgerEntry entry;
 	entry.identityId = identityId;
-	entry.kind = bank ? "credits_bank" : "credits_cash";
+	entry.kind = kind;
 	entry.delta = delta;
 	entry.balanceAfter = balanceAfter;
 	entry.source = progressionAwardSource(source);
@@ -10635,6 +10774,14 @@ void SimPlayerManager::appendPlayerBotLedgerEntryLocked(uint64 identityId,
 	recent.add(entry);
 	while (recent.size() > 5)
 		recent.remove(0);
+}
+
+void SimPlayerManager::appendPlayerBotLedgerEntryLocked(uint64 identityId,
+		bool bank, int64 delta, int64 balanceAfter, const String& source,
+		uint64 refId, const String& detail) {
+	appendPlayerBotLedgerEntryKindLocked(identityId,
+		bank ? "credits_bank" : "credits_cash", delta, balanceAfter,
+		source, refId, detail);
 }
 
 void SimPlayerManager::dropPlayerBotLedgerEntriesLocked(uint64 identityId) {
@@ -10728,6 +10875,59 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 					loaded.get(identityId).skills.add(skillName);
 		}
 
+		VectorMap<uint64, SimBotItemRow> loadedItems;
+		VectorMap<uint64, uint64> loadedItemHeldCounts;
+		UniqueReference<ResultSet*> itemResult(
+			ServerDatabase::instance()->executeQuery(
+				"SELECT `object_id`,`identity_id`,`state`,`template_crc`,"
+				"`display_name`,`source`,`ref_id`,"
+				// Epoch milliseconds, the same form new in-memory rows carry, so
+				// the dashboard can order and age them without parsing a DATETIME.
+				"CAST(UNIX_TIMESTAMP(`acquired_at`) AS UNSIGNED)*1000,"
+				"CAST(UNIX_TIMESTAMP(`updated_at`) AS UNSIGNED)*1000 "
+				"FROM `simbot_items` ORDER BY `object_id`;"));
+		if (itemResult == nullptr)
+			throw Exception("progression item query returned no result");
+		while (itemResult->next()) {
+			SimBotItemRow row;
+			row.objectId = itemResult->getUnsignedLong(0);
+			String identityValue = pveRosterResultString(itemResult, 1);
+			row.identityId = identityValue.isEmpty() ? 0 :
+				Long::unsignedvalueOf(identityValue);
+			String stateName = pveRosterResultString(itemResult, 2);
+			if (!playerBotItemStateFromName(stateName, row.state)) {
+				progressionItemRowsRejected.increment();
+				error("SimPlayerItemRowRejected object=" +
+					String::valueOf(row.objectId) + " reason=unknown_state state=" +
+					stateName);
+				continue;
+			}
+			row.templateCrc = static_cast<uint32>(
+				itemResult->getUnsignedLong(3));
+			row.displayName = pveRosterResultString(itemResult, 4);
+			row.source = pveRosterResultString(itemResult, 5);
+			row.refId = itemResult->getUnsignedLong(6);
+			row.acquiredAt = pveRosterResultString(itemResult, 7);
+			row.updatedAt = pveRosterResultString(itemResult, 8);
+			row.version = 1;
+			row.dirty = false;
+
+			if (row.objectId == 0 ||
+					(row.state == SIMBOT_ITEM_HELD && row.identityId == 0)) {
+				progressionItemRowsRejected.increment();
+				error("SimPlayerItemRowRejected object=" +
+					String::valueOf(row.objectId) + " reason=held_without_owner");
+				continue;
+			}
+
+			loadedItems.put(row.objectId, row);
+			if (row.state == SIMBOT_ITEM_HELD) {
+				uint64 held = loadedItemHeldCounts.contains(row.identityId) ?
+					loadedItemHeldCounts.get(row.identityId) : 0;
+				loadedItemHeldCounts.put(row.identityId, held + 1);
+			}
+		}
+
 		Vector<SimBotLedgerEntry> mismatches;
 		UniqueReference<ResultSet*> ledgerResult(
 			ServerDatabase::instance()->executeQuery(
@@ -10775,6 +10975,9 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 			Locker progressionLock(&progressionMutex);
 			progressionRecords = loaded;
 			progressionDirtyIds.removeAll();
+			progressionItems = loadedItems;
+			progressionItemHeldCounts = loadedItemHeldCounts;
+			progressionItemDirtyIds.removeAll();
 			progressionOrphanIds.removeAll();
 			for (int i = 0; i < derivedSpendChanged.size(); ++i)
 				markProgressionDirtyLocked(derivedSpendChanged.get(i));
@@ -10788,6 +10991,7 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 		}
 
 		progressionLoaded = true;
+		progressionItemReconcilePending = true;
 		progressionDbAvailable = true;
 		progressionNextDbProbeMs = 0;
 		progressionDbProbeBackoffMs = 5000;
@@ -10893,6 +11097,157 @@ bool SimPlayerManager::ensurePlayerBotProgressionRecord(uint64 identityId) {
 	}
 }
 
+bool SimPlayerManager::depositPlayerBotItem(uint64 identityId,
+		const Vector<SimBotItemDeposit>& objects, const String& source,
+		uint64 refId) {
+	if (!progressionEnabled || !progressionLoaded || identityId == 0 ||
+			objects.size() == 0)
+		return false;
+
+	String boundedSource = progressionAwardSource(source);
+	if (boundedSource.isEmpty())
+		boundedSource = "unknown";
+
+	Locker progressionLock(&progressionMutex);
+	if (!progressionRecords.contains(identityId) ||
+			progressionRetiringIds.contains(identityId))
+		return false;
+
+	for (int i = 0; i < objects.size(); ++i) {
+		const SimBotItemDeposit& object = objects.get(i);
+		if (object.objectId == 0 || progressionItems.contains(object.objectId))
+			return false;
+
+		for (int j = 0; j < i; ++j) {
+			if (objects.get(j).objectId == object.objectId)
+				return false;
+		}
+	}
+
+	uint64 nowMs = System::getMiliTime();
+	uint64 held = progressionItemHeldCounts.contains(identityId) ?
+		progressionItemHeldCounts.get(identityId) : 0;
+	for (int i = 0; i < objects.size(); ++i) {
+		const SimBotItemDeposit& object = objects.get(i);
+		SimBotItemRow row;
+		row.objectId = object.objectId;
+		row.identityId = identityId;
+		row.state = SIMBOT_ITEM_HELD;
+		row.templateCrc = object.templateCrc;
+		row.displayName = object.displayName.trim();
+		if (row.displayName.length() > 64)
+			row.displayName = row.displayName.subString(0, 64);
+		row.source = boundedSource;
+		row.refId = refId;
+		row.acquiredAt = String::valueOf(nowMs);
+		row.updatedAt = row.acquiredAt;
+		row.version = 1;
+		row.dirty = true;
+		progressionItems.put(row.objectId, row);
+		progressionItemDirtyIds.put(row.objectId, true);
+		held++;
+		appendPlayerBotLedgerEntryKindLocked(identityId, "item", 1,
+			held, boundedSource, row.objectId, row.displayName);
+	}
+	progressionItemHeldCounts.put(identityId, held);
+	return true;
+}
+
+bool SimPlayerManager::removePlayerBotItemsForReap(uint64 identityId) {
+	if (identityId == 0)
+		return false;
+
+	Locker progressionLock(&progressionMutex);
+	bool removed = false;
+	for (int i = progressionItems.size() - 1; i >= 0; --i) {
+		if (progressionItems.elementAt(i).getValue().identityId != identityId)
+			continue;
+
+		uint64 objectId = progressionItems.elementAt(i).getKey();
+		progressionItems.drop(objectId);
+		progressionItemDirtyIds.drop(objectId);
+		removed = true;
+	}
+	progressionItemHeldCounts.drop(identityId);
+	return removed;
+}
+
+JSONSerializationType SimPlayerManager::buildPlayerBotItemStatSnapshot(
+		SceneObject* item) {
+	JSONSerializationType snapshot = JSONSerializationType::object();
+	if (item == nullptr)
+		return snapshot;
+
+	snapshot["objectId"] = item->getObjectID();
+	snapshot["templatePath"] = item->getObjectTemplate() == nullptr ?
+		String() : item->getObjectTemplate()->getFullTemplateString();
+	snapshot["customName"] = item->getCustomObjectName().toString();
+	TangibleObject* tangible = cast<TangibleObject*>(item);
+	if (tangible != nullptr) {
+		snapshot["useCount"] = tangible->getUseCount();
+		snapshot["maxCondition"] = tangible->getMaxCondition();
+		snapshot["conditionDamage"] = tangible->getConditionDamage();
+		String crafterName = tangible->getCraftersName();
+		if (!crafterName.isEmpty())
+			snapshot["crafterName"] = crafterName;
+	}
+
+	if (item->isComponent()) {
+		Component* component = cast<Component*>(item);
+		JSONSerializationType attributes = JSONSerializationType::array();
+		if (component != nullptr) {
+			for (int i = 0; i < component->getPropertyCount(); ++i) {
+				String key = component->getProperty(i);
+				JSONSerializationType attribute = JSONSerializationType::object();
+				attribute["key"] = key;
+				attribute["value"] = component->getAttributeValue(key);
+				attribute["precision"] = component->getAttributePrecision(key);
+				attribute["hidden"] = component->getAttributeHidden(key);
+				attributes.push_back(attribute);
+			}
+		}
+		snapshot["attributes"] = attributes;
+	}
+
+	if (item->isWeaponObject()) {
+		WeaponObject* weapon = cast<WeaponObject*>(item);
+		if (weapon != nullptr) {
+			JSONSerializationType weaponStats = JSONSerializationType::object();
+			weaponStats["minDamage"] = weapon->getMinDamage(false);
+			weaponStats["maxDamage"] = weapon->getMaxDamage(false);
+			weaponStats["attackSpeed"] = weapon->getAttackSpeed(false);
+			weaponStats["woundsRatio"] = weapon->getWoundsRatio(false);
+			weaponStats["maxRange"] = weapon->getMaxRange(false);
+			weaponStats["damageType"] = weapon->getDamageType();
+			weaponStats["armorPiercing"] = weapon->getArmorPiercing();
+			snapshot["weapon"] = weaponStats;
+		}
+	}
+
+	if (item->isArmorObject()) {
+		ArmorObject* armor = cast<ArmorObject*>(item);
+		if (armor != nullptr) {
+			JSONSerializationType armorStats = JSONSerializationType::object();
+			armorStats["rating"] = armor->getRating();
+			armorStats["kinetic"] = armor->getKinetic();
+			armorStats["energy"] = armor->getEnergy();
+			armorStats["blast"] = armor->getBlast();
+			armorStats["heat"] = armor->getHeat();
+			armorStats["cold"] = armor->getCold();
+			armorStats["electrical"] = armor->getElectricity();
+			armorStats["acid"] = armor->getAcid();
+			armorStats["stun"] = armor->getStun();
+			armorStats["lightSaber"] = armor->getLightSaber();
+			armorStats["healthEncumbrance"] = armor->getHealthEncumbrance();
+			armorStats["actionEncumbrance"] = armor->getActionEncumbrance();
+			armorStats["mindEncumbrance"] = armor->getMindEncumbrance();
+			snapshot["armor"] = armorStats;
+		}
+	}
+
+	return snapshot;
+}
+
 bool SimPlayerManager::playerBotProgressionAwardGateEnabled() {
 	if (!progressionEnabled)
 		return false;
@@ -10900,6 +11255,26 @@ bool SimPlayerManager::playerBotProgressionAwardGateEnabled() {
 	if (playerBotParityTestGateOverrideActive)
 		return playerBotParityTestGateOverride;
 	return true;
+}
+
+bool SimPlayerManager::playerBotLootGateEnabled(uint64 identityId) {
+	if (!progressionEnabled)
+		return false;
+
+	bool lootEnabled = progressionLootEnabled;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (identityId != 0 && playerBotParityTestLootGateOverrideActive &&
+				playerBotParityLootGateScopedIds.contains(identityId))
+			lootEnabled = playerBotParityTestLootGateOverride;
+	}
+
+	if (!lootEnabled || progressionItemReconcilePending.load())
+		return false;
+
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	return economyManager != nullptr &&
+		economyManager->isItemVaultAvailable();
 }
 
 bool SimPlayerManager::playerBotMissionCreditGateEnabled(uint64 identityId) {
@@ -11018,6 +11393,8 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 			armingOp = "setRealWeaponDamageGate";
 		else if (gate == "combatAbilitiesEnabled")
 			armingOp = "setCombatAbilitiesGate";
+		else if (gate == "lootEnabled")
+			armingOp = "setLootGate";
 		else if (gate == "novice")
 			armingOp = "setNoviceGate";
 		else if (gate == "progressionEnabled")
@@ -11051,6 +11428,8 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 			live = playerBotProgressionAwardGateEnabled();
 		else if (gate == "combatAbilitiesEnabled")
 			live = playerBotCombatAbilitiesGateArmed();
+		else if (gate == "lootEnabled")
+			live = playerBotLootGateEnabled(0);
 		else if (gate == "novice") {
 			Locker pveLock(&pveMutex);
 			live = pveNoviceEnabled;
@@ -11712,6 +12091,357 @@ uint64 SimPlayerManager::resolvePlayerBotIdentity(uint64 bodyOid) {
 	int skillTier = 1;
 	return resolvePlayerBotIdentityAndTier(bodyOid, identityId, skillTier) ?
 		identityId : 0;
+}
+
+uint64 SimPlayerManager::resolvePlayerBotLootOwner(uint64 bodyOid) {
+	uint64 identityId = 0;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveBodyIdentityIds.contains(bodyOid))
+			identityId = pveBodyIdentityIds.get(bodyOid);
+	}
+
+	if (identityId == 0) {
+		lootNotCreatedNoIdentity.increment();
+		return 0;
+	}
+
+	if (!playerBotLootGateEnabled(identityId)) {
+		lootNotCreatedGateOff.increment();
+		return 0;
+	}
+
+	{
+		Locker progressionLock(&progressionMutex);
+		if (!progressionRecords.contains(identityId)) {
+			lootNotCreatedNoRecord.increment();
+			return 0;
+		}
+	}
+
+	return identityId;
+}
+
+bool SimPlayerManager::queuePlayerBotLootClaim(uint64 identityId,
+		uint64 corpseOid, const String& zoneName, const Vector3& position) {
+	if (identityId == 0 || corpseOid == 0 || zoneName.isEmpty() ||
+			progressionLootMaxClaimsPerBot <= 0)
+		return false;
+
+	const uint64 nowMs = System::getMiliTime();
+	const uint64 ttlMs = static_cast<uint64>(Math::max(0,
+		progressionLootClaimTtlSeconds)) * 1000;
+	PlayerBotLootClaim claim;
+	claim.identityId = identityId;
+	claim.corpseOid = corpseOid;
+	claim.zoneName = zoneName;
+	claim.position = position;
+	claim.queuedAtMs = nowMs;
+	claim.expiresAtMs = nowMs + ttlMs;
+
+	{
+		Locker lootLock(&lootMutex);
+		if (!playerBotLootClaims.contains(identityId))
+			playerBotLootClaims.put(identityId, Vector<PlayerBotLootClaim>());
+
+		Vector<PlayerBotLootClaim>& claims = playerBotLootClaims.get(identityId);
+		while (claims.size() >= progressionLootMaxClaimsPerBot) {
+			claims.remove(0);
+			lootClaimsEvicted.increment();
+		}
+		claims.add(claim);
+		lootClaimsQueued.increment();
+	}
+	if (MissionDiagLog::isLoggingEnabled())
+		MissionDiagLog::event("LOOT_CLAIM", identityId,
+			"corpse=" + String::valueOf(corpseOid) + " zone=" + zoneName +
+			MissionDiagLog::fmtVec(" pos", position));
+	return true;
+}
+
+bool SimPlayerManager::takeNearestPlayerBotLootClaim(uint64 identityId,
+		const String& zoneName, const Vector3& position,
+		float maxDetourMeters, PlayerBotLootClaim& claimOut) {
+	claimOut = PlayerBotLootClaim();
+	if (identityId == 0 || zoneName.isEmpty() ||
+		!playerBotLootGateEnabled(identityId))
+		return false;
+
+	const uint64 nowMs = System::getMiliTime();
+	Locker lootLock(&lootMutex);
+	if (!playerBotLootClaims.contains(identityId))
+		return false;
+
+	Vector<PlayerBotLootClaim>& claims = playerBotLootClaims.get(identityId);
+	std::vector<SimBotLootStep::ClaimCandidate> candidates;
+	std::vector<int> candidateIndexes;
+	for (int i = claims.size() - 1; i >= 0; --i) {
+		if (SimBotLootStep::isExpired(nowMs, claims.get(i).expiresAtMs)) {
+			claims.remove(i);
+			lootAbandonedExpired.increment();
+		}
+	}
+	for (int i = 0; i < claims.size(); ++i) {
+		if (claims.get(i).zoneName != zoneName)
+			continue;
+
+		SimBotLootStep::ClaimCandidate candidate;
+		candidate.corpseOid = claims.get(i).corpseOid;
+		candidate.x = claims.get(i).position.getX();
+		candidate.y = claims.get(i).position.getY();
+		candidate.expiresAtMs = claims.get(i).expiresAtMs;
+		candidates.push_back(candidate);
+		candidateIndexes.push_back(i);
+	}
+
+	const int selected = SimBotLootStep::selectNearest(candidates,
+		position.getX(), position.getY(), maxDetourMeters, nowMs);
+	if (selected < 0)
+		return false;
+
+	claimOut = claims.get(candidateIndexes[selected]);
+	claims.remove(candidateIndexes[selected]);
+	return true;
+}
+
+bool SimPlayerManager::returnPlayerBotLootClaim(
+		const PlayerBotLootClaim& claim) {
+	if (claim.identityId == 0 || claim.corpseOid == 0 ||
+			claim.zoneName.isEmpty())
+		return false;
+
+	const uint64 nowMs = System::getMiliTime();
+	if (SimBotLootStep::isExpired(nowMs, claim.expiresAtMs)) {
+		lootAbandonedExpired.increment();
+		return false;
+	}
+	if (progressionLootMaxClaimsPerBot <= 0)
+		return false;
+
+	Locker lootLock(&lootMutex);
+	if (!playerBotLootClaims.contains(claim.identityId))
+		playerBotLootClaims.put(claim.identityId,
+			Vector<PlayerBotLootClaim>());
+	Vector<PlayerBotLootClaim>& claims =
+		playerBotLootClaims.get(claim.identityId);
+	while (claims.size() >= progressionLootMaxClaimsPerBot) {
+		claims.remove(0);
+		lootClaimsEvicted.increment();
+	}
+	claims.add(claim);
+	return true;
+}
+
+static const char* playerBotLootDispositionName(
+		PlayerBotLootDisposition disposition) {
+	switch (disposition) {
+	case PLAYER_BOT_LOOTED: return "looted";
+	case PLAYER_BOT_LOOT_PARTIAL_CAP: return "partialCap";
+	case PLAYER_BOT_LOOT_NOTHING: return "nothing";
+	case PLAYER_BOT_LOOT_CORPSE_GONE: return "corpseGone";
+	case PLAYER_BOT_LOOT_NOT_OWNER: return "notOwner";
+	case PLAYER_BOT_LOOT_TOO_FAR: return "tooFar";
+	case PLAYER_BOT_LOOT_TRANSFER_FAILED: return "transferFailed";
+	case PLAYER_BOT_LOOT_GATE_OFF: return "gateOff";
+	default: return "unknown";
+	}
+}
+
+void SimPlayerManager::dropPlayerBotLootClaims(uint64 identityId) {
+	if (identityId == 0)
+		return;
+
+	int dropped = 0;
+	{
+		Locker lootLock(&lootMutex);
+		if (playerBotLootClaims.contains(identityId)) {
+			dropped = playerBotLootClaims.get(identityId).size();
+			playerBotLootClaims.drop(identityId);
+		}
+	}
+	if (dropped > 0)
+		lootClaimsDroppedBodyGone.add(dropped);
+}
+
+void SimPlayerManager::recordPlayerBotLootResult(uint64 identityId,
+		uint64 corpseOid, PlayerBotLootDisposition disposition) {
+	const int index = static_cast<int>(disposition);
+	if (index >= 0 && index < PLAYER_BOT_LOOT_DISPOSITION_COUNT)
+		lootResults[index].increment();
+	if (disposition == PLAYER_BOT_LOOTED ||
+			disposition == PLAYER_BOT_LOOT_PARTIAL_CAP) {
+		Locker lootLock(&lootMutex);
+		lootLastLootedCorpseByIdentity.put(identityId, corpseOid);
+	}
+
+	if (MissionDiagLog::isLoggingEnabled())
+		MissionDiagLog::event("LOOT_RESULT", identityId,
+			"corpse=" + String::valueOf(corpseOid) + " result=" +
+			playerBotLootDispositionName(disposition));
+}
+
+void SimPlayerManager::recordPlayerBotLootAbandoned(const String& reason) {
+	if (reason == "pathFailed") {
+		lootAbandonedPathFailed.increment();
+		return;
+	}
+	if (reason == "newAttacker")
+		lootAbandonedNewAttacker.increment();
+	else if (reason == "expired")
+		lootAbandonedExpired.increment();
+	else if (reason == "corpseGone")
+		lootAbandonedCorpseGone.increment();
+	else if (reason == "timeout")
+		lootAbandonedTimeout.increment();
+	else if (reason == "botDeath")
+		lootAbandonedBotDeath.increment();
+}
+
+PlayerBotLootDisposition SimPlayerManager::lootPlayerBotCorpse(
+		uint64 identityId, AiAgent* body, uint64 corpseOid) {
+	if (identityId == 0 || body == nullptr || corpseOid == 0)
+		return PLAYER_BOT_LOOT_CORPSE_GONE;
+	if (!playerBotLootGateEnabled(identityId))
+		return PLAYER_BOT_LOOT_GATE_OFF;
+
+	uint64 heldCount = 0;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (progressionItemHeldCounts.contains(identityId))
+			heldCount = progressionItemHeldCounts.get(identityId);
+	}
+
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	if (economyManager == nullptr)
+		return PLAYER_BOT_LOOT_TRANSFER_FAILED;
+	ManagedReference<SceneObject*> bag =
+		economyManager->getOrCreateItemBag(identityId);
+	if (bag == nullptr)
+		return PLAYER_BOT_LOOT_TRANSFER_FAILED;
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (zoneServer == nullptr)
+		return PLAYER_BOT_LOOT_CORPSE_GONE;
+
+	Vector<SimBotItemDeposit> movedItems;
+	int skippedVaultFull = 0;
+	int transferFailed = 0;
+	int cashCredits = 0;
+
+	{
+		Locker bodyLock(body);
+		if (body->isDead() || body->getZone() == nullptr)
+			return PLAYER_BOT_LOOT_CORPSE_GONE;
+
+		ManagedReference<CreatureObject*> corpse =
+			zoneServer->getObject(corpseOid).castTo<CreatureObject*>();
+		if (corpse == nullptr)
+			return PLAYER_BOT_LOOT_CORPSE_GONE;
+
+		Locker corpseLock(corpse, body);
+		if (!corpse->isDead() || corpse->getZone() == nullptr)
+			return PLAYER_BOT_LOOT_CORPSE_GONE;
+
+		SceneObject* corpseInventory = corpse->getSlottedObject("inventory");
+		if (corpseInventory == nullptr ||
+				corpseInventory->getContainerPermissions()->getOwnerID() != body->getObjectID())
+			return PLAYER_BOT_LOOT_NOT_OWNER;
+		if (body->getDistanceTo(corpse) > 16.5f)
+			return PLAYER_BOT_LOOT_TOO_FAR;
+
+		{
+			Locker invLock(corpseInventory, corpse);
+			if (corpse->isDead() == false || body->isDead() ||
+					corpseInventory->getContainerPermissions()->getOwnerID() != body->getObjectID() ||
+					body->getDistanceTo(corpse) > 16.5f)
+				return PLAYER_BOT_LOOT_TRANSFER_FAILED;
+
+			cashCredits = corpse->getCashCredits();
+			if (cashCredits > 0)
+				corpse->clearCashCredits();
+
+			for (int i = corpseInventory->getContainerObjectsSize() - 1;
+					i >= 0; --i) {
+				ManagedReference<SceneObject*> item =
+					corpseInventory->getContainerObject(i);
+				if (item == nullptr)
+					continue;
+				if (heldCount + movedItems.size() >=
+						static_cast<uint64>(Math::max(0,
+							progressionLootMaxItemsPerBot))) {
+					++skippedVaultFull;
+					continue;
+				}
+
+				bool transferred = false;
+				SimBotItemDeposit deposit;
+				{
+					Locker itemLock(item, corpseInventory);
+					if (item->getParent().get() == corpseInventory) {
+						deposit.objectId = item->getObjectID();
+						deposit.templateCrc = item->getServerObjectCRC();
+						deposit.displayName = item->getDisplayedName();
+
+						Locker bagLock(bag, item);
+						transferred = !playerBotParityTestFailItemTransfer.get() &&
+							bag->transferObject(item, -1, false, true);
+
+						// ObjectController::transferObject's convention: a refused
+						// transfer goes back to its old parent, never left detached.
+						if (!transferred && item->getParent().get() == nullptr)
+							corpseInventory->transferObject(item, -1, false, true);
+					}
+				}
+
+				if (!transferred) {
+					++transferFailed;
+					continue;
+				}
+
+				movedItems.add(deposit);
+			}
+		}
+
+		if (corpseInventory->getContainerObjectsSize() == 0) {
+			Reference<DespawnCreatureTask*> despawn =
+				corpse->getPendingTask("despawn").castTo<DespawnCreatureTask*>();
+			if (despawn != nullptr) {
+				despawn->cancel();
+				despawn->reschedule(1000);
+			}
+		}
+	}
+
+	if (skippedVaultFull > 0)
+		lootSkippedVaultFull.add(skippedVaultFull);
+	if (transferFailed > 0)
+		lootTransferFailed.add(transferFailed);
+
+	if (movedItems.size() > 0) {
+		if (depositPlayerBotItem(identityId, movedItems, "loot", corpseOid)) {
+			lootItemsLooted.add(movedItems.size());
+		} else {
+			lootDepositNoRecord.increment();
+		}
+	}
+
+	if (cashCredits > 0) {
+		if (grantPlayerBotCredits(identityId, cashCredits, false, "loot",
+				corpseOid))
+			lootCashLooted.add(cashCredits);
+		else
+			lootCashDropped.add(cashCredits);
+	}
+
+	if (movedItems.size() > 0 || cashCredits > 0)
+		lootCorpsesLooted.increment();
+	if (transferFailed > 0)
+		return PLAYER_BOT_LOOT_TRANSFER_FAILED;
+	if (skippedVaultFull > 0)
+		return PLAYER_BOT_LOOT_PARTIAL_CAP;
+	if (movedItems.size() > 0 || cashCredits > 0)
+		return PLAYER_BOT_LOOTED;
+	return PLAYER_BOT_LOOT_NOTHING;
 }
 
 void SimPlayerManager::recordPlayerBotKillXpDrop(const String& stage,
@@ -12620,6 +13350,312 @@ void SimPlayerManager::reconcilePlayerBotProgression() {
 	}
 }
 
+void SimPlayerManager::reconcilePlayerBotItems() {
+	if (!progressionEnabled || !progressionLoaded ||
+			!progressionItemReconcilePending)
+		return;
+
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	if (economyManager == nullptr ||
+			!economyManager->isItemVaultAvailable())
+		return;
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> vault = economyManager->getItemVault();
+	if (zoneServer == nullptr || vault == nullptr)
+		return;
+
+	VectorMap<uint64, uint64> bagMap =
+		economyManager->getItemBagMapSnapshot();
+	VectorMap<uint64, bool> mappedBagOids;
+	Vector<PlayerBotObservedVaultItem> observed;
+
+	// The only locks in this snapshot phase are one bag at a time. In
+	// particular, do not hold progressionMutex while a persistent object is
+	// locked: the REST and loot paths use the inverse manager/object boundary.
+	for (int i = 0; i < bagMap.size(); ++i) {
+		uint64 identityId = bagMap.elementAt(i).getKey();
+		uint64 bagOid = bagMap.elementAt(i).getValue();
+		mappedBagOids.put(bagOid, true);
+		ManagedReference<SceneObject*> bag = zoneServer->getObject(bagOid);
+		if (bag == nullptr)
+			continue;
+
+		Vector<ManagedReference<SceneObject*> > children;
+		{
+			Locker bagLock(bag);
+			for (int j = 0; j < bag->getContainerObjectsSize(); ++j)
+				children.add(bag->getContainerObject(j));
+		}
+		for (int j = 0; j < children.size(); ++j) {
+			ManagedReference<SceneObject*> child = children.get(j);
+			if (child == nullptr)
+				continue;
+			PlayerBotObservedVaultItem item;
+			item.objectId = child->getObjectID();
+			item.identityId = identityId;
+			item.location = SimBotItemReconcile::LOCATION_IDENTITY_BAG;
+			item.object = child;
+			observed.add(item);
+		}
+	}
+
+	Vector<ManagedReference<SceneObject*> > directChildren;
+	{
+		Locker vaultLock(vault);
+		for (int i = 0; i < vault->getContainerObjectsSize(); ++i)
+			directChildren.add(vault->getContainerObject(i));
+	}
+
+	Vector<ManagedReference<SceneObject*> > unmappedBags;
+	for (int i = 0; i < directChildren.size(); ++i) {
+		ManagedReference<SceneObject*> child = directChildren.get(i);
+		if (child == nullptr || mappedBagOids.contains(child->getObjectID()))
+			continue;
+
+		if (AiEconomyManager::isItemBag(child)) {
+			unmappedBags.add(child);
+			Vector<ManagedReference<SceneObject*> > bagChildren;
+			{
+				Locker bagLock(child);
+				for (int j = 0; j < child->getContainerObjectsSize(); ++j)
+					bagChildren.add(child->getContainerObject(j));
+			}
+			for (int j = 0; j < bagChildren.size(); ++j) {
+				ManagedReference<SceneObject*> itemObject = bagChildren.get(j);
+				if (itemObject == nullptr)
+					continue;
+				PlayerBotObservedVaultItem item;
+				item.objectId = itemObject->getObjectID();
+				item.location = SimBotItemReconcile::LOCATION_UNMAPPED_BAG;
+				item.object = itemObject;
+				observed.add(item);
+			}
+		} else {
+			PlayerBotObservedVaultItem item;
+			item.objectId = child->getObjectID();
+			item.location = SimBotItemReconcile::LOCATION_DIRECT_VAULT;
+			item.object = child;
+			observed.add(item);
+		}
+	}
+
+	// Capture the fields used to reconstruct a row while no manager mutex is
+	// held. The object lock is deliberately short and independent per item.
+	for (int i = 0; i < observed.size(); ++i) {
+		PlayerBotObservedVaultItem& item = observed.get(i);
+		if (item.object == nullptr)
+			continue;
+		Locker itemLock(item.object);
+		item.templateCrc = item.object->getServerObjectCRC();
+		item.displayName = item.object->getDisplayedName();
+	}
+
+	// Empty bags which are direct children of the vault but absent from the
+	// durable map are safe to discard. Non-empty unmapped bags remain for
+	// inspection and their contents are recorded as orphaned below.
+	for (int i = 0; i < unmappedBags.size(); ++i) {
+		ManagedReference<SceneObject*> bag = unmappedBags.get(i);
+		if (bag == nullptr)
+			continue;
+		Locker bagLock(bag);
+		if (bag->getContainerObjectsSize() != 0)
+			continue;
+		bool removed = false;
+		{
+			Locker vaultLock(vault, bag);
+			removed = vault->removeObject(bag, nullptr, false, true);
+		}
+		if (removed) {
+			bag->destroyObjectFromDatabase(true);
+			vaultReconcileEmptyBagsDestroyed.increment();
+		}
+	}
+
+	int reconciledRows = 0;
+	VectorMap<uint64, bool> rowsSeen;
+	{
+		Locker progressionLock(&progressionMutex);
+		for (int i = 0; i < progressionItems.size(); ++i) {
+			SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+			rowsSeen.put(row.objectId, true);
+			uint64 previousIdentityId = row.identityId;
+			SimBotItemReconcile::ObjectLocation location =
+				SimBotItemReconcile::LOCATION_MISSING;
+			uint64 locationIdentityId = 0;
+			for (int j = 0; j < observed.size(); ++j) {
+				if (observed.get(j).objectId == row.objectId) {
+					location = observed.get(j).location;
+					locationIdentityId = observed.get(j).identityId;
+					break;
+				}
+			}
+
+			SimBotItemReconcile::RowState rowState =
+				SimBotItemReconcile::ROW_ORPHANED;
+			switch (row.state) {
+			case SIMBOT_ITEM_HELD: rowState = SimBotItemReconcile::ROW_HELD; break;
+			case SIMBOT_ITEM_PENDING: rowState = SimBotItemReconcile::ROW_PENDING; break;
+			case SIMBOT_ITEM_CONSUMED: rowState = SimBotItemReconcile::ROW_CONSUMED; break;
+			case SIMBOT_ITEM_LOST: rowState = SimBotItemReconcile::ROW_LOST; break;
+			case SIMBOT_ITEM_ORPHANED: rowState = SimBotItemReconcile::ROW_ORPHANED; break;
+			default: rowState = SimBotItemReconcile::ROW_ORPHANED; break;
+			}
+			SimBotItemReconcile::Decision decision =
+				SimBotItemReconcile::decide(rowState, row.identityId,
+					location, locationIdentityId,
+					row.identityId != 0 && progressionRecords.contains(row.identityId));
+			if (decision.state == SimBotItemReconcile::DECISION_UNCHANGED)
+				continue;
+
+			if (decision.state == SimBotItemReconcile::DECISION_LOST) {
+				row.state = SIMBOT_ITEM_LOST;
+				row.identityId = 0;
+				vaultReconcileLost.increment();
+				if (rowState == SimBotItemReconcile::ROW_PENDING)
+					vaultReconcilePendingMissing.increment();
+			} else {
+				row.state = SIMBOT_ITEM_ORPHANED;
+				row.identityId = 0;
+				vaultReconcileOrphaned.increment();
+				if (rowState == SimBotItemReconcile::ROW_HELD &&
+						location == SimBotItemReconcile::LOCATION_MISSING)
+					vaultReconcileHeldMissing.increment();
+			}
+			row.version++;
+			row.dirty = true;
+			progressionItemDirtyIds.put(row.objectId, true);
+			if (decision.ledgerDelta != 0 && previousIdentityId != 0) {
+				uint64 held = progressionItemHeldCounts.contains(previousIdentityId) ?
+					progressionItemHeldCounts.get(previousIdentityId) : 0;
+				held = held > 0 ? held - 1 : 0;
+				progressionItemHeldCounts.put(previousIdentityId, held);
+				appendPlayerBotLedgerEntryKindLocked(previousIdentityId, "item", -1,
+					held, "reconcile", row.objectId, row.displayName);
+			}
+		}
+
+		for (int i = 0; i < observed.size(); ++i) {
+			const PlayerBotObservedVaultItem& observedItem = observed.get(i);
+			if (rowsSeen.contains(observedItem.objectId))
+				continue;
+
+			SimBotItemReconcile::Decision decision =
+				SimBotItemReconcile::decideUntrackedObject(
+					observedItem.location, observedItem.identityId,
+					observedItem.identityId != 0 &&
+						progressionRecords.contains(observedItem.identityId));
+			SimBotItemRow row;
+			row.objectId = observedItem.objectId;
+			row.identityId = decision.identityId;
+			row.state = decision.state == SimBotItemReconcile::DECISION_HELD ?
+				SIMBOT_ITEM_HELD : SIMBOT_ITEM_ORPHANED;
+			row.templateCrc = observedItem.templateCrc;
+			row.displayName = observedItem.displayName;
+			row.source = "reconcile";
+			row.refId = observedItem.objectId;
+			row.acquiredAt = String::valueOf(System::getMiliTime());
+			row.updatedAt = row.acquiredAt;
+			row.version = 1;
+			row.dirty = true;
+			progressionItems.put(row.objectId, row);
+			progressionItemDirtyIds.put(row.objectId, true);
+			if (row.state == SIMBOT_ITEM_HELD) {
+				uint64 held = progressionItemHeldCounts.contains(row.identityId) ?
+					progressionItemHeldCounts.get(row.identityId) : 0;
+				progressionItemHeldCounts.put(row.identityId, held + 1);
+				appendPlayerBotLedgerEntryKindLocked(row.identityId, "item", 1,
+					held + 1, "reconcile", row.objectId, row.displayName);
+				vaultReconcileRecovered.increment();
+			} else {
+				vaultReconcileOrphaned.increment();
+				vaultReconcileUnmapped.increment();
+			}
+		}
+		reconciledRows = progressionItems.size();
+	}
+
+	progressionItemReconcilePending = false;
+	if (MissionDiagLog::isLoggingEnabled()) {
+		StringBuffer reconcileDiag;
+		reconcileDiag << "rows=" << reconciledRows <<
+			" heldMissing=" << vaultReconcileHeldMissing.get() <<
+			" recovered=" << vaultReconcileRecovered.get() <<
+			" orphaned=" << vaultReconcileOrphaned.get() <<
+			" lost=" << vaultReconcileLost.get();
+		MissionDiagLog::event("VAULT_RECONCILE", 0,
+			reconcileDiag.toString());
+	}
+	info("SimPlayerItemVaultReconciled rows=" +
+		String::valueOf(reconciledRows), true);
+}
+
+bool SimPlayerManager::destroyPlayerBotItemsAndBag(uint64 identityId) {
+	if (identityId == 0)
+		return true;
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (economyManager == nullptr)
+		return false;
+	VectorMap<uint64, uint64> bagMap =
+		economyManager->getItemBagMapSnapshot();
+	if (!bagMap.contains(identityId))
+		return true;
+	ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+		economyManager->getItemBag(identityId);
+	ManagedReference<SceneObject*> vault = economyManager == nullptr ? nullptr :
+		economyManager->getItemVault();
+	if (bag == nullptr || vault == nullptr || zoneServer == nullptr) {
+		vaultReapDestroyFailed.increment();
+		return false;
+	}
+
+	Vector<ManagedReference<SceneObject*> > children;
+	{
+		Locker bagLock(bag);
+		for (int i = 0; i < bag->getContainerObjectsSize(); ++i)
+			children.add(bag->getContainerObject(i));
+	}
+
+	for (int i = 0; i < children.size(); ++i) {
+		ManagedReference<SceneObject*> item = children.get(i);
+		if (item == nullptr)
+			continue;
+		Locker itemLock(item);
+		ManagedReference<SceneObject*> parent = item->getParent();
+		bool removed = parent == nullptr;
+		if (parent.get() == bag.get()) {
+			Locker bagLock(bag, item);
+			removed = bag->removeObject(item, nullptr, false, true);
+		}
+		if (!removed) {
+			vaultReapDestroyFailed.increment();
+			return false;
+		}
+		item->destroyObjectFromDatabase(true);
+	}
+
+	{
+		Locker bagLock(bag);
+		bool removed = false;
+		{
+			Locker vaultLock(vault, bag);
+			removed = vault->removeObject(bag, nullptr, false, true);
+		}
+		if (!removed) {
+			vaultReapDestroyFailed.increment();
+			return false;
+		}
+		bag->destroyObjectFromDatabase(true);
+	}
+
+	if (!economyManager->dropItemBag(identityId)) {
+		vaultReapDestroyFailed.increment();
+		return false;
+	}
+	return true;
+}
+
 void SimPlayerManager::runPlayerBotProgressionReaper(uint64 nowMs, bool force) {
 	if (!progressionEnabled || !progressionLoaded ||
 			(!force && !progressionReaperEnabled) || !progressionDbAvailable)
@@ -12654,6 +13690,10 @@ void SimPlayerManager::runPlayerBotProgressionReaper(uint64 nowMs, bool force) {
 			if (oldResult == nullptr || !oldResult->next())
 				continue;
 
+			if (!destroyPlayerBotItemsAndBag(identityId))
+				continue;
+			removePlayerBotItemsForReap(identityId);
+
 			UniqueReference<ResultSet*> deleteResult(
 				ServerDatabase::instance()->executeQuery(
 					"DELETE FROM `simbot_experience` WHERE `identity_id`=" +
@@ -12666,6 +13706,9 @@ void SimPlayerManager::runPlayerBotProgressionReaper(uint64 nowMs, bool force) {
 				"DELETE FROM `simbot_ledger` WHERE `identity_id`=" +
 				String::valueOf(identityId) + ";");
 			deleteResult = ServerDatabase::instance()->executeQuery(
+				"DELETE FROM `simbot_items` WHERE `identity_id`=" +
+				String::valueOf(identityId) + ";");
+			deleteResult = ServerDatabase::instance()->executeQuery(
 				"DELETE FROM `simbot_progression` WHERE `identity_id`=" +
 				String::valueOf(identityId) + ";");
 
@@ -12673,6 +13716,7 @@ void SimPlayerManager::runPlayerBotProgressionReaper(uint64 nowMs, bool force) {
 			progressionRecords.drop(identityId);
 			progressionDirtyIds.drop(identityId);
 			dropPlayerBotLedgerEntriesLocked(identityId);
+			progressionItemHeldCounts.drop(identityId);
 			for (int j = progressionOrphanIds.size() - 1; j >= 0; --j) {
 				if (progressionOrphanIds.get(j) == identityId)
 					progressionOrphanIds.remove(j);
@@ -12726,6 +13770,7 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 		return;
 
 	VectorMap<uint64, SimBotProgression> batch;
+	Vector<SimBotItemRow> itemBatch;
 	Vector<SimBotLedgerEntry> ledgerBatch;
 	bool failNextFlush = false;
 	{
@@ -12740,6 +13785,17 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 				batch.put(identityId, progressionRecords.get(identityId));
 		}
 		progressionDirtyIds.removeAll();
+		for (int i = 0; i < progressionItemDirtyIds.size(); ++i) {
+			uint64 objectId = progressionItemDirtyIds.elementAt(i).getKey();
+			if (!progressionItems.contains(objectId))
+				continue;
+
+			SimBotItemRow row = progressionItems.get(objectId);
+			row.dirty = false;
+			itemBatch.add(row);
+			progressionItems.get(objectId).dirty = false;
+		}
+		progressionItemDirtyIds.removeAll();
 		ledgerBatch = progressionLedgerPending;
 		progressionLedgerPending.removeAll();
 	}
@@ -12775,12 +13831,60 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 				progressionLedgerPending.add(0, ledgerBatch.get(pending));
 			for (int pending = 0; pending < batch.size(); ++pending)
 				markProgressionDirtyLocked(batch.elementAt(pending).getKey());
+			for (int pending = 0; pending < itemBatch.size(); ++pending) {
+				const SimBotItemRow& row = itemBatch.get(pending);
+				if (progressionItems.contains(row.objectId) &&
+						progressionItems.get(row.objectId).version == row.version)
+					markPlayerBotItemDirtyLocked(row.objectId);
+			}
 			progressionDbAvailable = false;
 			progressionNextDbProbeMs = nowMs + progressionDbProbeBackoffMs;
 			progressionDbProbeBackoffMs = Math::min<uint64>(
 				progressionDbProbeBackoffMs * 2, 300000);
 			progressionFlushFailures.increment();
 			error("SimPlayerLedgerInsertFailed: " + e.getMessage());
+			return;
+		}
+	}
+
+	for (int i = 0; i < itemBatch.size(); ++i) {
+		const SimBotItemRow& row = itemBatch.get(i);
+		try {
+			String identitySql = row.identityId == 0 ? String("NULL") :
+				String::valueOf(row.identityId);
+			String itemUpsert = "INSERT INTO `simbot_items` "
+				"(`object_id`,`identity_id`,`state`,`template_crc`,"
+				"`display_name`,`source`,`ref_id`,`acquired_at`,`updated_at`) VALUES (" +
+				String::valueOf(row.objectId) + "," + identitySql + ",'" +
+				playerBotItemStateName(row.state) + "'," +
+				String::valueOf(row.templateCrc) + "," +
+				progressionSqlString(row.displayName) + "," +
+				progressionSqlString(row.source) + "," +
+				String::valueOf(row.refId) + ",NOW(),NOW()) "
+				"ON DUPLICATE KEY UPDATE `identity_id`=VALUES(`identity_id`),"
+				"`state`=VALUES(`state`),`template_crc`=VALUES(`template_crc`),"
+				"`display_name`=VALUES(`display_name`),`source`=VALUES(`source`),"
+				"`ref_id`=VALUES(`ref_id`),`updated_at`=NOW();";
+			UniqueReference<ResultSet*> itemResult(
+				ServerDatabase::instance()->executeQuery(itemUpsert));
+			(void)itemResult;
+		} catch (const Exception& e) {
+			Locker progressionLock(&progressionMutex);
+			for (int pending = i; pending < itemBatch.size(); ++pending) {
+				const SimBotItemRow& pendingRow = itemBatch.get(pending);
+				if (progressionItems.contains(pendingRow.objectId) &&
+						progressionItems.get(pendingRow.objectId).version ==
+							pendingRow.version)
+					markPlayerBotItemDirtyLocked(pendingRow.objectId);
+			}
+			for (int pending = 0; pending < batch.size(); ++pending)
+				markProgressionDirtyLocked(batch.elementAt(pending).getKey());
+			progressionDbAvailable = false;
+			progressionNextDbProbeMs = nowMs + progressionDbProbeBackoffMs;
+			progressionDbProbeBackoffMs = Math::min<uint64>(
+				progressionDbProbeBackoffMs * 2, 300000);
+			progressionFlushFailures.increment();
+			error("SimPlayerItemFlushFailed: " + e.getMessage());
 			return;
 		}
 	}
@@ -12972,9 +14076,13 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 					Locker progressionLock(&progressionMutex);
 					progressionRecords.removeAll();
 					progressionDirtyIds.removeAll();
+					progressionItems.removeAll();
+					progressionItemHeldCounts.removeAll();
+					progressionItemDirtyIds.removeAll();
 					progressionOrphanIds.removeAll();
 				}
 				progressionLoaded = false;
+				progressionItemReconcilePending = true;
 				progressionDbAvailable = pveDatabaseAvailable;
 				progressionNextDbProbeMs = 0;
 				loadPlayerBotProgressionStore();
@@ -13109,6 +14217,19 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 				}
 				if (harnessIndex >= 0)
 					destroyPlayerBotParityBody(harnessIndex, "delete_identity");
+				if (!destroyPlayerBotItemsAndBag(request.identityId))
+					throw Exception("player bot item vault teardown failed");
+				removePlayerBotItemsForReap(request.identityId);
+				UniqueReference<ResultSet*> deletedLedger(
+					ServerDatabase::instance()->executeQuery(
+						"DELETE FROM `simbot_ledger` WHERE `identity_id`=" +
+						String::valueOf(request.identityId) + ";"));
+				UniqueReference<ResultSet*> deletedItems(
+					ServerDatabase::instance()->executeQuery(
+						"DELETE FROM `simbot_items` WHERE `identity_id`=" +
+						String::valueOf(request.identityId) + ";"));
+				(void)deletedLedger;
+				(void)deletedItems;
 				UniqueReference<ResultSet*> deleted(
 					ServerDatabase::instance()->executeQuery(
 						"DELETE FROM `simbot_identities` WHERE `id`=" +
@@ -13122,6 +14243,8 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 				}
 				{
 					Locker progressionLock(&progressionMutex);
+					progressionRecords.drop(request.identityId);
+					progressionDirtyIds.drop(request.identityId);
 					dropPlayerBotLedgerEntriesLocked(request.identityId);
 				}
 				// The named ref is deliberately NOT pruned here. deleteIdentity is
@@ -13592,11 +14715,81 @@ bool SimPlayerManager::awaitPlayerBotParityKillTarget(
 		playerBotParityTestKillTargetSettledOid = targetOid;
 	}
 
-	despawnPlayerBotParityKillTarget();
+	despawnPlayerBotParityKillTarget(step.keepCorpse);
 	return true;
 }
 
-void SimPlayerManager::despawnPlayerBotParityKillTarget() {
+// The creature provokeLootKill set on a production hunter: idempotent, run on
+// every harness cleanup and disable path so a failed or timed-out scenario never
+// leaves a hostile in the live world. A corpse is removed the same way.
+void SimPlayerManager::despawnPlayerBotParityProvokedCreature() {
+	uint64 creatureOid = 0;
+	uint64 provokedIdentity = 0;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		creatureOid = playerBotParityProvokedCreatureOid;
+		provokedIdentity = playerBotParityProvokedIdentityId;
+		playerBotParityProvokedCreatureOid = 0;
+		playerBotParityProvokedIdentityId = 0;
+		playerBotParityProvokeLootedAtMs = 0;
+	}
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> object = zoneServer == nullptr ||
+		creatureOid == 0 ? nullptr : zoneServer->getObject(creatureOid);
+	CreatureObject* creature = object == nullptr ? nullptr :
+		object->asCreatureObject();
+	if (creature == nullptr)
+		return;
+	bool wasAlive = false;
+	{
+		Locker creatureLock(creature);
+		wasAlive = !creature->isDead();
+		// Same order as despawnPlayerBotParityKillTarget: a pending corpse
+		// despawn task must be cancelled before the object is destroyed.
+		Reference<Task*> pendingDespawn = creature->getPendingTask("despawn");
+		if (pendingDespawn != nullptr) {
+			pendingDespawn->cancel();
+			creature->removePendingTask("despawn");
+		}
+		creature->clearCombatState(true);
+		if (creature->getZone() != nullptr)
+			creature->destroyObjectFromWorld(true);
+		creature->destroyObjectFromDatabase(true);
+	}
+
+	// A live opponent destroyed mid-fight can leave its defender in stale
+	// combat, as the kill-target cleanup notes. Only then is the production
+	// hunter cleared: after a won fight it may be in an unrelated one.
+	if (!wasAlive || provokedIdentity == 0)
+		return;
+	uint64 botOid = 0;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveIdentityBodyOids.contains(provokedIdentity))
+			botOid = pveIdentityBodyOids.get(provokedIdentity);
+	}
+	Reference<SimPlayerController*> controller = botOid != 0 &&
+		controllers.contains(botOid) ? controllers.get(botOid) : nullptr;
+	ManagedReference<AiAgent*> bot = controller == nullptr ? nullptr :
+		controller->getAgent();
+	if (bot != nullptr) {
+		Locker botLock(bot);
+		bot->clearCombatState(true);
+	}
+}
+
+// Seeding loot or cash onto a harness corpse makes it a corpse of value, which
+// the bot branch keeps for 300 s; the seed happens after the kill, so mirror it.
+void SimPlayerManager::extendPlayerBotParityCorpseDespawn(CreatureObject* corpse) {
+	if (corpse == nullptr)
+		return;
+	Locker corpseLock(corpse);
+	Reference<Task*> despawn = corpse->getPendingTask("despawn");
+	if (despawn != nullptr)
+		despawn->reschedule(300000);
+}
+
+void SimPlayerManager::despawnPlayerBotParityKillTarget(bool keepCorpse) {
 	uint64 targetOid = 0;
 	uint64 identityId = 0;
 	{
@@ -13625,7 +14818,9 @@ void SimPlayerManager::despawnPlayerBotParityKillTarget() {
 		zoneServer->getObject(targetOid);
 	CreatureObject* creature = object == nullptr ? nullptr :
 		object->asCreatureObject();
-	if (creature != nullptr) {
+	// A loot scenario keeps the corpse: its own despawn task removes it, exactly
+	// as for a production kill.
+	if (creature != nullptr && !keepCorpse) {
 		Locker creatureLock(creature);
 		// A dead target already owns a pending corpse DespawnCreatureTask. That
 		// task holds the agent and later calls notifyDespawn, which dereferences
@@ -13781,6 +14976,30 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 	if (key == "killxp.droppednosimbotattacker" ||
 			key == "killxpdroppednosimbotattacker")
 		return killXpDroppedNoSimBotAttacker.get();
+	if (key == "loot.claimsqueued" || key == "lootclaimsqueued")
+		return lootClaimsQueued.get();
+	if (key == "loot.claimsevicted" || key == "lootclaimsevicted")
+		return lootClaimsEvicted.get();
+	if (key == "loot.corpseslooted" || key == "lootcorpseslooted")
+		return lootCorpsesLooted.get();
+	if (key == "loot.itemslooted" || key == "lootitemslooted")
+		return lootItemsLooted.get();
+	if (key == "loot.cashlooted" || key == "lootcashlooted")
+		return lootCashLooted.get();
+	if (key == "loot.skippedvaultfull" || key == "lootskippedvaultfull")
+		return lootSkippedVaultFull.get();
+	if (key == "loot.transferfailed" || key == "loottransferfailed")
+		return lootTransferFailed.get();
+	if (key == "loot.depositnorecord" || key == "lootdepositnorecord")
+		return lootDepositNoRecord.get();
+	if (key == "loot.cashdropped" || key == "lootcashdropped")
+		return lootCashDropped.get();
+	if (key == "loot.notcreated.noidentity" || key == "lootnotcreatednoidentity")
+		return lootNotCreatedNoIdentity.get();
+	if (key == "loot.notcreated.norecord" || key == "lootnotcreatednorecord")
+		return lootNotCreatedNoRecord.get();
+	if (key == "loot.notcreated.gateoff" || key == "lootnotcreatedgateoff")
+		return lootNotCreatedGateOff.get();
 	if (key == "training.trained" || key == "trainingtrained")
 		return trainingTrained.get();
 	if (key == "training.refusednorecord" || key == "trainingrefusednorecord")
@@ -13941,21 +15160,34 @@ bool SimPlayerManager::writePlayerBotParityPhaseAFile() {
 	Vector<PlayerBotParityTestScenarioResult> results;
 	uint64 probeId = 0;
 	String runId;
+	String restartScenario;
 	{
 		Locker parityLock(&playerBotParityTestMutex);
 		results = playerBotParityTestResults;
 		probeId = playerBotParityTestProbeIdentityId;
 		runId = playerBotParityTestRunId;
+		if (playerBotParityTestScenarioIndex >= 0 &&
+				playerBotParityTestScenarioIndex <
+					playerBotParityTestScenarioOrder.size()) {
+			int scenarioIndex = playerBotParityTestScenarioOrder.get(
+				playerBotParityTestScenarioIndex);
+			if (scenarioIndex >= 0 && scenarioIndex <
+					playerBotParityTestScenarios.size())
+				restartScenario = playerBotParityTestScenarios.get(
+					scenarioIndex).name;
+		}
 	}
-	if (probeId == 0 || runId.isEmpty())
+	if (probeId == 0 || runId.isEmpty() ||
+			!isPlayerBotParityRestartScenario(restartScenario))
 		return false;
 	JSONSerializationType root = JSONSerializationType::object();
 	root["runId"] = runId;
 	root["probeIdentityId"] = probeId;
 	root["phase"] = "A";
+	root["restartScenario"] = restartScenario;
 	JSONSerializationType rows = JSONSerializationType::array();
 	for (int i = 0; i < results.size(); ++i) {
-		if (results.get(i).name == "retained_record_survives_restart")
+		if (isPlayerBotParityRestartScenario(results.get(i).name))
 			continue;
 		if (results.get(i).status != "PASS")
 			return false;
@@ -13967,6 +15199,18 @@ bool SimPlayerManager::writePlayerBotParityPhaseAFile() {
 		rows.push_back(row);
 	}
 	root["scenarios"] = rows;
+	JSONSerializationType itemStats = JSONSerializationType::object();
+	for (int i = 0; i < playerBotParityItemStatSnapshots.size(); ++i) {
+		const VectorMapEntry<uint64, String>& entry =
+			playerBotParityItemStatSnapshots.elementAt(i);
+		try {
+			itemStats[String::valueOf(entry.getKey()).toCharArray()] =
+				JSONSerializationType::parse(entry.getValue().toCharArray());
+		} catch (...) {
+			return false;
+		}
+	}
+	root["itemStats"] = itemStats;
 	String path = "log/playerbotparity-phaseA.json";
 	String tempPath = path + ".tmp." + runId;
 	std::ofstream file(tempPath.toCharArray(), std::ios::out | std::ios::trunc);
@@ -13994,13 +15238,17 @@ bool SimPlayerManager::readPlayerBotParityPhaseAFile(uint64 probeIdentityId,
 		JSONSerializationType root = JSONSerializationType::parse(contents.str());
 		if (!root.is_object() || !root.contains("runId") ||
 				!root.contains("probeIdentityId") || !root.contains("scenarios") ||
+				!root.contains("restartScenario") ||
 				!root.contains("phase") || !root["phase"].is_string() ||
 				root["phase"].get<std::string>() != "A" ||
 				!root["runId"].is_string() ||
 				(!runId.isEmpty() &&
 				root["runId"].get<std::string>() != runId.toCharArray()) ||
 				root["probeIdentityId"].get<uint64>() != probeIdentityId ||
-				!root["scenarios"].is_array()) {
+				!root["scenarios"].is_array() ||
+				!root["restartScenario"].is_string() ||
+				!isPlayerBotParityRestartScenario(String(
+					root["restartScenario"].get<std::string>().c_str()))) {
 			failure = "phase_a_record_invalid";
 			return false;
 		}
@@ -14008,6 +15256,19 @@ bool SimPlayerManager::readPlayerBotParityPhaseAFile(uint64 probeIdentityId,
 			Locker parityLock(&playerBotParityTestMutex);
 			playerBotParityTestRunId = String(
 				root["runId"].get<std::string>().c_str());
+			playerBotParityTestRestartScenario = String(
+				root["restartScenario"].get<std::string>().c_str());
+		}
+		if (root.contains("itemStats") && root["itemStats"].is_object()) {
+			for (auto it = root["itemStats"].begin();
+					it != root["itemStats"].end(); ++it) {
+				uint64 objectId = Long::unsignedvalueOf(
+					String(it.key().c_str()));
+				if (objectId == 0)
+					throw Exception("phase a item snapshot has no object id");
+				playerBotParityItemStatSnapshots.put(objectId,
+					it.value().dump().c_str());
+			}
 		}
 		Vector<String> seenNames;
 		for (auto& row : root["scenarios"]) {
@@ -14029,7 +15290,7 @@ bool SimPlayerManager::readPlayerBotParityPhaseAFile(uint64 probeIdentityId,
 				Locker parityLock(&playerBotParityTestMutex);
 				for (int i = 0; i < playerBotParityTestResults.size(); ++i) {
 					if (playerBotParityTestResults.get(i).name == name) {
-						if (name == "retained_record_survives_restart") {
+						if (isPlayerBotParityRestartScenario(name)) {
 							failure = "phase_a_record_invalid";
 							return false;
 						}
@@ -14047,8 +15308,8 @@ bool SimPlayerManager::readPlayerBotParityPhaseAFile(uint64 probeIdentityId,
 		{
 			Locker parityLock(&playerBotParityTestMutex);
 			for (int i = 0; i < playerBotParityTestResults.size(); ++i) {
-				if (playerBotParityTestResults.get(i).name !=
-						"retained_record_survives_restart" &&
+				if (!isPlayerBotParityRestartScenario(
+						playerBotParityTestResults.get(i).name) &&
 						playerBotParityTestResults.get(i).status != "PASS") {
 					failure = "phase_a_record_incomplete";
 					return false;
@@ -14123,6 +15384,7 @@ void SimPlayerManager::beginPlayerBotParityTestCleanup(bool preserveProbe) {
 		playerBotParityTestCleanupReaperQueued = false;
 	}
 	despawnPlayerBotParityKillTarget();
+	despawnPlayerBotParityProvokedCreature();
 }
 
 void SimPlayerManager::restorePlayerBotParityScenarioGate() {
@@ -14182,6 +15444,14 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 			playerBotParityTestBuffFeeOverride =
 				playerBotParityTestBuffFeeOverridePrevious;
 		}
+		playerBotParityTestLootGateOverrideActive = false;
+		playerBotParityTestLootGateOverride = false;
+		if (playerBotParityTestLootCapOverrideActive) {
+			progressionLootMaxItemsPerBot =
+				playerBotParityTestLootCapOverridePrevious;
+			playerBotParityTestLootCapOverrideActive = false;
+		}
+		playerBotParityLootGateScopedIds.removeAll();
 		playerBotParityMissionCreditScopedIds.removeAll();
 		playerBotParityBuffPaymentScopedIds.removeAll();
 	}
@@ -14189,6 +15459,7 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 	// reader of pveNoviceEnabled holds pveMutex first, so nesting it under the
 	// parity mutex would be an ABBA pair.
 	restoreNoviceGateOverride();
+	playerBotParityTestFailItemTransfer.set(false);
 }
 
 void SimPlayerManager::resolvePlayerBotParityExpectedRejection(
@@ -14216,6 +15487,7 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 	// runtime harness disable. The operation is idempotent and deliberately
 	// happens before the body/row cleanup passes.
 	despawnPlayerBotParityKillTarget();
+	despawnPlayerBotParityProvokedCreature();
 
 	Vector<uint64> identityIds;
 	bool preserveProbe = false;
@@ -14386,6 +15658,7 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 	}
 	if (!enabledNow) {
 		despawnPlayerBotParityKillTarget();
+		despawnPlayerBotParityProvokedCreature();
 		if (cleanupActive)
 			cleanupPlayerBotParityTest();
 		return;
@@ -14419,7 +15692,7 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 				playerBotParityTestBodyOids.add(0);
 				for (int i = 0; i < playerBotParityTestResults.size(); ++i) {
 					if (playerBotParityTestResults.get(i).name ==
-							"retained_record_survives_restart") {
+							playerBotParityTestRestartScenario) {
 						if (!fileValid) {
 							playerBotParityTestResults.get(i).status = "FAIL";
 							playerBotParityTestResults.get(i).failReason =
@@ -14652,7 +15925,7 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 	}
 	if (stepCursor >= scenario.steps.size()) {
 		restorePlayerBotParityScenarioGate();
-		bool retained = scenario.name == "retained_record_survives_restart";
+		bool retained = isPlayerBotParityRestartScenario(scenario.name);
 		if (phase == "A" && retained) {
 			if (!writePlayerBotParityPhaseAFile()) {
 				{
@@ -14965,7 +16238,15 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			op == "assertXpCap" ||
 			op == "assertTier" || op == "assertDirty" || op == "assertSource" ||
 			op == "assertAbility" || op == "assertAbilitySuperseded" ||
-			op == "assertAttackSource" || op == "assertAbilityUse" ||
+				op == "assertAttackSource" || op == "assertAbilityUse" ||
+				op == "setLootGate" || op == "seedCorpseLoot" ||
+				op == "lootCorpse" || op == "killBodyBeforeLoot" ||
+				op == "setLootCap" || op == "assertVaultItems" ||
+				op == "assertItemRow" || op == "assertCorpseItems" ||
+				op == "assertCorpseDespawn" || op == "forgeItemRow" ||
+				op == "assertItemStats" || op == "seedCorpseCash" ||
+				op == "assertCorpseOwner" || op == "assertItemDestroyed" ||
+				op == "assertLootOwner" ||
 				op == "setCombatAbilitiesGate" ||
 				op == "setMissionCreditGate" ||
 				op == "setBuffPaymentGate" ||
@@ -14989,6 +16270,504 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			result.failReason = "identity_not_found";
 			return true;
 		}
+	}
+
+	if (op == "setLootGate") {
+		if (identityId == 0) {
+			result.status = "FAIL";
+			result.failReason = "loot_gate_requires_identity";
+			return true;
+		}
+		int64 enabledValue = 0;
+		if (step.hasLootGate)
+			enabledValue = step.lootGate ? 1 : 0;
+		else if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_loot_gate_value";
+			return true;
+		}
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityTestLootGateOverrideActive = true;
+		playerBotParityTestLootGateOverride = enabledValue != 0;
+		playerBotParityLootGateScopedIds.put(identityId, true);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "setLootCap") {
+		int cap = step.lootCap;
+		if (cap < 0) {
+			int64 parsed = 0;
+			if (!parsePlayerBotParityExpected(step.expect, parsed)) {
+				result.status = "FAIL";
+				result.failReason = "invalid_loot_cap";
+				return true;
+			}
+			cap = static_cast<int>(parsed);
+		}
+		Locker parityLock(&playerBotParityTestMutex);
+		if (!playerBotParityTestLootCapOverrideActive) {
+			playerBotParityTestLootCapOverridePrevious =
+				progressionLootMaxItemsPerBot;
+			playerBotParityTestLootCapOverrideActive = true;
+		}
+		progressionLootMaxItemsPerBot = Math::max(0, Math::min(cap, 10000));
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "failItemTransfer") {
+		playerBotParityTestFailItemTransfer.set(true);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "killBodyBeforeLoot") {
+		int identityIndex = -1;
+		if (!getPlayerBotParityIdentityIndex(step, identityIndex)) {
+			result.status = "FAIL";
+			result.failReason = "identity_not_found";
+			return true;
+		}
+		destroyPlayerBotParityBody(identityIndex, "loot_before_body_death");
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "seedCorpseLoot") {
+		uint64 corpseOid = step.corpseOid != 0 ? step.corpseOid :
+			playerBotParityTestKillTargetSettledOid;
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<CreatureObject*> corpse = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(corpseOid).castTo<CreatureObject*>();
+		ManagedReference<SceneObject*> item = zoneServer == nullptr ||
+				step.lootTemplate.isEmpty() ? nullptr : zoneServer->createObject(
+				step.lootTemplate.hashCode(), 1);
+		if (corpse == nullptr || item == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "corpse_or_item_missing";
+			return true;
+		}
+		SceneObject* inventory = nullptr;
+		{
+			Locker corpseLock(corpse);
+			inventory = corpse->getSlottedObject("inventory");
+			if (inventory == nullptr) {
+				result.status = "FAIL";
+				result.failReason = "corpse_inventory_missing";
+				return true;
+			}
+			Locker inventoryLock(inventory, corpse);
+			Locker itemLock(item, inventory);
+			if (!inventory->transferObject(item, -1, false, true)) {
+				result.status = "FAIL";
+				result.failReason = "corpse_item_transfer_failed";
+				return true;
+			}
+		}
+		extendPlayerBotParityCorpseDespawn(corpse);
+		{
+			Locker itemLock(item);
+			playerBotParityItemStatSnapshots.put(item->getObjectID(),
+				buildPlayerBotItemStatSnapshot(item).dump().c_str());
+		}
+		playerBotParityLastSeededItemOid = item->getObjectID();
+		step.corpseOid = corpseOid;
+		result.status = "PASS";
+		return true;
+	}
+
+	// Fauna carry no cash (stock gives cash to humanoid NPCs only), so the cash
+	// path is exercised by placing a known amount on the harness corpse.
+	if (op == "seedCorpseCash") {
+		uint64 corpseOid = step.corpseOid != 0 ? step.corpseOid :
+			playerBotParityTestKillTargetSettledOid;
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<CreatureObject*> corpse = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(corpseOid).castTo<CreatureObject*>();
+		if (corpse == nullptr || step.amount <= 0) {
+			result.status = "FAIL";
+			result.failReason = "corpse_missing_or_bad_amount";
+			return true;
+		}
+		{
+			Locker corpseLock(corpse);
+			corpse->addCashCredits(static_cast<int>(step.amount));
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParitySeededCorpseCash += step.amount;
+		}
+		extendPlayerBotParityCorpseDespawn(corpse);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertCorpseOwner") {
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		uint64 corpseOid = step.corpseOid != 0 ? step.corpseOid :
+			playerBotParityTestKillTargetSettledOid;
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<CreatureObject*> corpse = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(corpseOid).castTo<CreatureObject*>();
+		uint64 ownerId = 0;
+		if (corpse != nullptr) {
+			Locker corpseLock(corpse);
+			SceneObject* inventory = corpse->getSlottedObject("inventory");
+			if (inventory != nullptr) {
+				Locker inventoryLock(inventory, corpse);
+				ownerId = inventory->getContainerPermissions()->getOwnerID();
+			}
+		}
+		if (bodyOid == 0 || ownerId != bodyOid) {
+			result.status = "FAIL";
+			result.failReason = "corpse_owner_mismatch owner=" +
+				String::valueOf(ownerId) + " body=" + String::valueOf(bodyOid);
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	// The production owner check on the identity's live body: expect="none"
+	// (no identity, no record or gate off) or expect="self".
+	if (op == "assertLootOwner") {
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		uint64 owner = bodyOid == 0 ? 0 : resolvePlayerBotLootOwner(bodyOid);
+		bool ok = step.expect == "self" ? owner == identityId :
+			(step.expect == "none" && bodyOid != 0 && owner == 0);
+		if (!ok) {
+			result.status = "FAIL";
+			result.failReason = "loot_owner_mismatch owner=" +
+				String::valueOf(owner) + " body=" + String::valueOf(bodyOid);
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertItemDestroyed") {
+		uint64 objectId = playerBotParityLastSeededItemOid;
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> item = zoneServer == nullptr ||
+			objectId == 0 ? nullptr : zoneServer->getObject(objectId);
+		bool destroyed = item == nullptr;
+		if (!destroyed) {
+			Locker itemLock(item);
+			destroyed = item->getParent().get() == nullptr &&
+				!item->isPersistent();
+		}
+		AiEconomyManager* economyManager = AiEconomyManager::instance();
+		bool bagMapped = economyManager != nullptr &&
+			economyManager->getItemBagMapSnapshot().contains(identityId);
+		bool rowPresent = false;
+		{
+			Locker progressionLock(&progressionMutex);
+			rowPresent = progressionItems.contains(objectId);
+		}
+		if (objectId == 0 || !destroyed || bagMapped || rowPresent) {
+			result.status = "FAIL";
+			result.failReason = "item_not_torn_down destroyed=" +
+				String::valueOf(destroyed) + " bagMapped=" +
+				String::valueOf(bagMapped) + " row=" + String::valueOf(rowPresent);
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "lootCorpse") {
+		uint64 bodyOid = step.bodyOid;
+		if (bodyOid == 0) {
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		uint64 corpseOid = step.corpseOid != 0 ? step.corpseOid :
+			playerBotParityTestKillTargetSettledOid;
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> bodyObject = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(bodyOid);
+		AiAgent* body = bodyObject == nullptr ? nullptr : bodyObject->asAiAgent();
+		if (body == nullptr || corpseOid == 0) {
+			if (step.expect == "NOT_CREATED") {
+				result.status = "PASS";
+				return true;
+			}
+			result.status = "FAIL";
+			result.failReason = "loot_body_or_corpse_missing";
+			return true;
+		}
+		uint64 lootOwnerId = resolvePlayerBotLootOwner(body->getObjectID());
+		if (lootOwnerId == 0) {
+			bool expectedNoCreation = step.expect == "NOT_CREATED" ||
+				step.expect == "GATE_OFF";
+			if (!expectedNoCreation) {
+				result.status = "FAIL";
+				result.failReason = "loot_owner_not_resolved";
+				return true;
+			}
+			result.status = "PASS";
+			return true;
+		}
+		PlayerBotLootDisposition disposition = lootPlayerBotCorpse(lootOwnerId,
+			body, corpseOid);
+		recordPlayerBotLootResult(lootOwnerId, corpseOid, disposition);
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			if ((disposition == PLAYER_BOT_LOOTED ||
+					disposition == PLAYER_BOT_LOOT_PARTIAL_CAP) &&
+					playerBotParityTestOracle.contains(lootOwnerId))
+				playerBotParityTestOracle.get(lootOwnerId).cashCredits +=
+					playerBotParitySeededCorpseCash;
+			playerBotParitySeededCorpseCash = 0;
+		}
+		if (!step.expect.isEmpty() &&
+				((step.expect == "LOOTED" && disposition != PLAYER_BOT_LOOTED) ||
+				(step.expect == "PARTIAL_CAP" && disposition != PLAYER_BOT_LOOT_PARTIAL_CAP) ||
+				(step.expect == "GATE_OFF" && disposition != PLAYER_BOT_LOOT_GATE_OFF))) {
+			result.status = "FAIL";
+			result.failReason = "loot_disposition_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertVaultItems") {
+		AiEconomyManager* economyManager = AiEconomyManager::instance();
+		ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+			economyManager->getItemBag(identityId);
+		int count = 0;
+		if (bag != nullptr) {
+			Locker bagLock(bag);
+			count = bag->getContainerObjectsSize();
+		}
+		int expected = step.expectedItemCount >= 0 ? step.expectedItemCount :
+			static_cast<int>(step.amount);
+		if (count != expected) {
+			result.status = "FAIL";
+			result.failReason = "vault_item_count_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertItemRow") {
+		int count = 0;
+		Locker progressionLock(&progressionMutex);
+		for (int i = 0; i < progressionItems.size(); ++i) {
+			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+			bool rowMatches = step.bySeededItem ?
+				row.objectId == playerBotParityLastSeededItemOid :
+				row.identityId == identityId;
+			if (rowMatches &&
+					playerBotItemStateName(row.state) == step.itemState)
+				++count;
+		}
+		int expected = step.expectedItemCount >= 0 ? step.expectedItemCount :
+			static_cast<int>(step.amount);
+		if (count != expected) {
+			result.status = "FAIL";
+			result.failReason = "item_row_count_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertCorpseItems") {
+		uint64 corpseOid = step.corpseOid != 0 ? step.corpseOid :
+			playerBotParityTestKillTargetSettledOid;
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<CreatureObject*> corpse = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(corpseOid).castTo<CreatureObject*>();
+		int count = -1;
+		if (corpse != nullptr) {
+			Locker corpseLock(corpse);
+			SceneObject* inventory = corpse->getSlottedObject("inventory");
+			if (inventory != nullptr) {
+				Locker inventoryLock(inventory, corpse);
+				count = inventory->getContainerObjectsSize();
+			}
+		}
+		int expected = step.expectedCorpseItemCount >= 0 ?
+			step.expectedCorpseItemCount : static_cast<int>(step.amount);
+		if (count != expected) {
+			result.status = "FAIL";
+			result.failReason = "corpse_item_count_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertCorpseDespawn") {
+		uint64 corpseOid = step.corpseOid != 0 ? step.corpseOid :
+			playerBotParityTestKillTargetSettledOid;
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<AiAgent*> corpse = zoneServer == nullptr ? nullptr :
+			zoneServer->getObject(corpseOid).castTo<AiAgent*>();
+		bool pending = false;
+		int remainingSeconds = -1;
+		if (corpse != nullptr) {
+			Locker corpseLock(corpse);
+			Reference<Task*> despawnTask = corpse->getPendingTask("despawn");
+			pending = despawnTask != nullptr;
+			if (pending && step.expectedDespawnSeconds >= 0) {
+				AtomicTime nextExecution;
+				Core::getTaskManager()->getNextExecutionTime(despawnTask,
+					nextExecution);
+				remainingSeconds = static_cast<int>(nextExecution.getMiliTime() /
+					1000) - System::getTime();
+			}
+		}
+		if (!pending) {
+			result.status = "FAIL";
+			result.failReason = "corpse_despawn_not_scheduled";
+			return true;
+		}
+		// "Due within N seconds": the settle wait before this step has already
+		// used part of a short corpse timer.
+		if (step.expectedDespawnSeconds >= 0 &&
+				remainingSeconds > step.expectedDespawnSeconds + 2) {
+			result.status = "FAIL";
+			result.failReason = "corpse_despawn_seconds_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "forgeItemRow") {
+		SimBotItemState forgedState;
+		if (!playerBotItemStateFromName(step.itemState, forgedState)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_item_state";
+			return true;
+		}
+		bool forged = false;
+		uint64 forgedObjectId = 0;
+		{
+			Locker progressionLock(&progressionMutex);
+			for (int i = 0; i < progressionItems.size(); ++i) {
+				SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+				if (row.identityId != identityId)
+					continue;
+				row.state = forgedState;
+				row.version++;
+				row.dirty = true;
+				progressionItemDirtyIds.put(row.objectId, true);
+				forgedObjectId = row.objectId;
+				forged = true;
+				break;
+			}
+		}
+		if (!forged) {
+			result.status = "FAIL";
+			result.failReason = "item_row_not_found";
+			return true;
+		}
+		if (step.hasInVault) {
+			AiEconomyManager* economyManager = AiEconomyManager::instance();
+			ZoneServer* zoneServer = ServerCore::getZoneServer();
+			ManagedReference<SceneObject*> bag = economyManager == nullptr ?
+				nullptr : economyManager->getItemBag(identityId);
+			ManagedReference<SceneObject*> vault = economyManager == nullptr ?
+				nullptr : economyManager->getItemVault();
+			ManagedReference<SceneObject*> item = zoneServer == nullptr ?
+				nullptr : zoneServer->getObject(forgedObjectId);
+			if (bag == nullptr || vault == nullptr || item == nullptr) {
+				result.status = "FAIL";
+				result.failReason = "forge_item_location_missing";
+				return true;
+			}
+			bool moved = false;
+			Locker itemLock(item);
+			if (step.inVault) {
+				Locker bagLock(bag, item);
+				if (item->getParent().get() == bag.get()) {
+					Locker vaultLock(vault, bag);
+					moved = bag->removeObject(item, nullptr, false, true) &&
+						vault->transferObject(item, -1, false, true);
+				} else {
+					moved = item->getParent().get() == vault.get();
+				}
+			} else if (item->getParent().get() == bag.get()) {
+				Locker bagLock(bag, item);
+				moved = true;
+			} else if (item->getParent().get() == vault.get()) {
+				Locker vaultLock(vault, item);
+				Locker bagLock(bag, item);
+				moved = vault->removeObject(item, nullptr, false, true) &&
+					bag->transferObject(item, -1, false, true);
+			}
+			if (!moved) {
+				result.status = "FAIL";
+				result.failReason = "forge_item_location_move_failed";
+				return true;
+			}
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "runItemReconcile") {
+		progressionItemReconcilePending = true;
+		reconcilePlayerBotItems();
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertItemStats") {
+		AiEconomyManager* economyManager = AiEconomyManager::instance();
+		ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+			economyManager->getItemBag(identityId);
+		// Every snapshotted item in the bag must match exactly, and at least one
+		// must have been compared.
+		int compared = 0;
+		int mismatched = 0;
+		if (bag != nullptr) {
+			Vector<ManagedReference<SceneObject*> > items;
+			{
+				Locker bagLock(bag);
+				for (int i = 0; i < bag->getContainerObjectsSize(); ++i)
+					items.add(bag->getContainerObject(i));
+			}
+			for (int i = 0; i < items.size(); ++i) {
+				ManagedReference<SceneObject*> item = items.get(i);
+				if (item == nullptr || !playerBotParityItemStatSnapshots.contains(
+						item->getObjectID()))
+					continue;
+				Locker itemLock(item);
+				String actualSnapshot =
+					buildPlayerBotItemStatSnapshot(item).dump().c_str();
+				++compared;
+				if (actualSnapshot != playerBotParityItemStatSnapshots.get(
+						item->getObjectID()))
+					++mismatched;
+			}
+		}
+		if (compared == 0 || mismatched != 0) {
+			result.status = "FAIL";
+			result.failReason = "item_stat_snapshot_mismatch compared=" +
+				String::valueOf(compared) + " mismatched=" +
+				String::valueOf(mismatched);
+			return true;
+		}
+		result.status = "PASS";
+		return true;
 	}
 
 	if (op == "simulateKillXp") {
@@ -16026,6 +17805,153 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		result.status = "PASS";
 		return true;
 	}
+	// Production loot walk (F_0.9.3): a REAL roster hunter -- not a parity
+	// harness body -- is attacked on a travel leg by a creature that carries
+	// loot and cash, kills it in self-defence, and must walk to the corpse, loot
+	// it and resume its leg. Waits for a hunter on a travel leg.
+	if (op == "provokeLootKill") {
+		ManagedReference<AiAgent*> bot;
+		uint64 chosenIdentity = 0;
+		const int controllerCount = controllers.size();
+		for (int i = 0; i < controllerCount && bot == nullptr; ++i) {
+			Reference<SimPlayerController*> controller =
+				controllers.get(controllers.getKey(i));
+			SimHunterController* hunter = controller == nullptr ? nullptr :
+				dynamic_cast<SimHunterController*>(controller.get());
+			if (hunter == nullptr || !hunter->isOnTravelLeg() ||
+					hunter->isLootStepRunning())
+				continue;
+			uint64 candidate = hunter->getIdentityId();
+			if (step.identityId != 0 && candidate != step.identityId)
+				continue;
+			{
+				Locker pveLock(&pveMutex);
+				if (!pveIdentities.contains(candidate) ||
+						!isGovernorManagedIdentity(pveIdentities.get(candidate)))
+					continue;
+			}
+			ManagedReference<AiAgent*> agent = hunter->getAgent();
+			if (agent == nullptr || agent->getZone() == nullptr ||
+					agent->isDead() || agent->isInCombat())
+				continue;
+			bot = agent;
+			chosenIdentity = candidate;
+		}
+		if (bot == nullptr) {
+			result.status = "WAITING";
+			return false;
+		}
+		String templateName = step.templateName.isEmpty() ? String("jawa") :
+			step.templateName;
+		Zone* zone = bot->getZone();
+		Vector3 position = bot->getWorldPosition();
+		position.setX(position.getX() + 6.f);
+		float terrainZ = zone->getHeight(position.getX(), position.getY());
+		if (terrainZ != 0.f)
+			position.setZ(terrainZ);
+		CreatureManager* creatureManager = zone->getCreatureManager();
+		ManagedReference<CreatureObject*> creature = creatureManager == nullptr ?
+			nullptr : creatureManager->spawnCreature(templateName.hashCode(), 0,
+				position.getX(), position.getZ(), position.getY(), 0);
+		ManagedReference<AiAgent*> attacker = creature == nullptr ? nullptr :
+			creature->asAiAgent();
+		if (attacker == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "provoke_spawn_failed template=" + templateName;
+			return true;
+		}
+		attacker->setDespawnOnNoPlayerInRange(false);
+		// The creature attacks the bot: hold the ATTACKER for startCombat, the
+		// same cross-lock rule spawnKillTarget documents for the bot.
+		bool started = false;
+		if (CombatManager::instance() != nullptr) {
+			Locker attackerLocker(attacker);
+			started = CombatManager::instance()->startCombat(attacker, bot);
+		}
+		if (!started) {
+			Locker creatureLock(attacker);
+			if (attacker->getZone() != nullptr)
+				attacker->destroyObjectFromWorld(true);
+			result.status = "FAIL";
+			result.failReason = "provoke_combat_not_started";
+			return true;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityProvokedIdentityId = chosenIdentity;
+			playerBotParityProvokedCreatureOid = attacker->getObjectID();
+			playerBotParityProvokeLootedAtMs = 0;
+		}
+		{
+			Locker lootLock(&lootMutex);
+			lootLastLootedCorpseByIdentity.drop(chosenIdentity);
+		}
+		info("SimParityProvokeLootKill identity=" + String::valueOf(chosenIdentity) +
+			" creature=" + String::valueOf(attacker->getObjectID()) +
+			" template=" + templateName, true);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "awaitBotLooted") {
+		uint64 provokedIdentity = 0;
+		uint64 creatureOid = 0;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			provokedIdentity = playerBotParityProvokedIdentityId;
+			creatureOid = playerBotParityProvokedCreatureOid;
+		}
+		uint64 lootedCorpse = 0;
+		{
+			Locker lootLock(&lootMutex);
+			if (lootLastLootedCorpseByIdentity.contains(provokedIdentity))
+				lootedCorpse = lootLastLootedCorpseByIdentity.get(provokedIdentity);
+		}
+		if (provokedIdentity == 0 || creatureOid == 0 || lootedCorpse != creatureOid) {
+			result.status = "WAITING";
+			return false;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityProvokeLootedAtMs = System::getMiliTime();
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	// After the loot the hunter must not be stranded at the corpse: within the
+	// step budget its controller is walking again (the interrupted leg resumed)
+	// or it has left the travel leg for a later phase.
+	if (op == "assertHunterResumed") {
+		uint64 provokedIdentity = 0;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			provokedIdentity = playerBotParityProvokedIdentityId;
+		}
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(provokedIdentity) ?
+				pveIdentityBodyOids.get(provokedIdentity) : 0;
+		}
+		Reference<SimPlayerController*> controller = bodyOid != 0 &&
+			controllers.contains(bodyOid) ? controllers.get(bodyOid) : nullptr;
+		SimHunterController* hunter = controller == nullptr ? nullptr :
+			dynamic_cast<SimHunterController*>(controller.get());
+		if (hunter == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "provoked_hunter_gone";
+			return true;
+		}
+		if (hunter->isLootStepRunning() ||
+				(hunter->isOnTravelLeg() && !hunter->isMovementInFlight())) {
+			result.status = "WAITING";
+			return false;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
 	if (op == "spawnKillTarget") {
 		String failure;
 		if (!spawnPlayerBotParityKillTarget(step, failure)) {
@@ -16532,8 +18458,8 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		{
 			Locker parityLock(&playerBotParityTestMutex);
 			for (int i = 0; i < playerBotParityTestResults.size(); ++i) {
-				if (playerBotParityTestResults.get(i).name !=
-						"retained_record_survives_restart" &&
+				if (!isPlayerBotParityRestartScenario(
+						playerBotParityTestResults.get(i).name) &&
 						playerBotParityTestResults.get(i).status != "PASS") {
 					allPriorPassed = false;
 					break;
@@ -16580,6 +18506,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 	SimBotProgression progression;
 	SimBotTrainingStep nextStep;
 	SimBotEarlyGameState earlyState;
+	Vector<SimBotItemRow> inspectItemRows;
 	bool haveNextStep = false;
 	bool haveEarlyState = false;
 	SimBotTrainingPlan trainingPlan;
@@ -16599,6 +18526,11 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 		if (progressionTrainingPlans.contains(identity.trainingPlan)) {
 			trainingPlan = progressionTrainingPlans.get(identity.trainingPlan);
 			haveTrainingPlan = true;
+		}
+		for (int i = 0; i < progressionItems.size(); ++i) {
+			const SimBotItemRow& itemRow = progressionItems.elementAt(i).getValue();
+			if (itemRow.identityId == identityId)
+				inspectItemRows.add(itemRow);
 		}
 	}
 
@@ -16973,6 +18905,32 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 			useCounts.elementAt(i).getValue();
 	result["abilityUseCounts"] = countJson;
 
+	JSONSerializationType itemRowsJson = JSONSerializationType::array();
+	int inspectHeld = 0;
+	for (int i = 0; i < inspectItemRows.size(); ++i) {
+		const SimBotItemRow& itemRow = inspectItemRows.get(i);
+		if (itemRow.state == SIMBOT_ITEM_HELD)
+			++inspectHeld;
+		JSONSerializationType itemJson = JSONSerializationType::object();
+		itemJson["objectId"] = itemRow.objectId;
+		itemJson["name"] = itemRow.displayName;
+		itemJson["state"] = playerBotItemStateName(itemRow.state);
+		itemJson["source"] = itemRow.source;
+		itemJson["refId"] = itemRow.refId;
+		itemJson["acquiredAt"] = itemRow.acquiredAt;
+		ManagedReference<SceneObject*> itemObject = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(itemRow.objectId);
+		if (itemObject != nullptr) {
+			Locker itemLock(itemObject);
+			itemJson["stats"] = buildPlayerBotItemStatSnapshot(itemObject);
+		} else {
+			itemJson["stats"] = JSONSerializationType::object();
+		}
+		itemRowsJson.push_back(itemJson);
+	}
+	result["itemsHeld"] = inspectHeld;
+	result["items"] = itemRowsJson;
+
 	return result;
 }
 
@@ -17104,6 +19062,12 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	int buffReservationsCount = 0;
 	uint64 ledgerLastPruneMs = 0;
 	VectorMap<uint64, Vector<SimBotLedgerEntry> > recentLedgerSnapshot;
+	VectorMap<uint64, Vector<SimBotItemRow> > itemRowsByIdentity;
+	VectorMap<String, uint64> itemRowsByState;
+	VectorMap<uint64, uint64> itemHeldSnapshot;
+	uint64 itemVaultBagCount = 0;
+	uint64 itemVaultBagItemCount = 0;
+	uint64 itemVaultLooseObjectCount = 0;
 		{
 		Locker progressionLock(&progressionMutex);
 		records = progressionRecords;
@@ -17118,11 +19082,59 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		buffReservationsCount = progressionBuffFeeReservations.size();
 		ledgerLastPruneMs = progressionLedgerLastPruneMs;
 		recentLedgerSnapshot = progressionRecentLedger;
+		itemHeldSnapshot = progressionItemHeldCounts;
+		for (int i = 0; i < progressionItems.size(); ++i) {
+			const SimBotItemRow& itemRow = progressionItems.elementAt(i).getValue();
+			String stateName = playerBotItemStateName(itemRow.state);
+			uint64 stateCount = itemRowsByState.contains(stateName) ?
+				itemRowsByState.get(stateName) : 0;
+			itemRowsByState.put(stateName, stateCount + 1);
+			if (itemRow.identityId != 0) {
+				if (!itemRowsByIdentity.contains(itemRow.identityId))
+					itemRowsByIdentity.put(itemRow.identityId,
+						Vector<SimBotItemRow>());
+				itemRowsByIdentity.get(itemRow.identityId).add(itemRow);
+			}
+		}
 		lastFlushMs = progressionLastFlushMs;
 		for (int i = 0; i < records.size(); ++i)
 			lastAwardMs = Math::max(lastAwardMs,
 				records.elementAt(i).getValue().lastAwardMs);
 		trainingLastSkillSnapshot = trainingLastSkill;
+	}
+
+	AiEconomyManager* dashboardEconomy = AiEconomyManager::instance();
+	ManagedReference<SceneObject*> dashboardVault = dashboardEconomy == nullptr ?
+		nullptr : dashboardEconomy->getItemVault();
+	if (dashboardVault != nullptr &&
+			dashboardEconomy->isItemVaultAvailable()) {
+		VectorMap<uint64, uint64> dashboardBagMap =
+			dashboardEconomy->getItemBagMapSnapshot();
+		itemVaultBagCount = dashboardBagMap.size();
+		ZoneServer* dashboardObjectServer = ServerCore::getZoneServer();
+		for (int i = 0; i < dashboardBagMap.size(); ++i) {
+			ManagedReference<SceneObject*> bag = dashboardObjectServer == nullptr ?
+				nullptr : dashboardObjectServer->getObject(
+					dashboardBagMap.elementAt(i).getValue());
+			if (bag == nullptr)
+				continue;
+			Locker bagLock(bag);
+			itemVaultBagItemCount += bag->getContainerObjectsSize();
+		}
+		Vector<ManagedReference<SceneObject*> > directVaultObjects;
+		{
+			Locker vaultLock(dashboardVault);
+			for (int i = 0; i < dashboardVault->getContainerObjectsSize(); ++i)
+				directVaultObjects.add(dashboardVault->getContainerObject(i));
+		}
+		VectorMap<uint64, bool> mappedBags;
+		for (int i = 0; i < dashboardBagMap.size(); ++i)
+			mappedBags.put(dashboardBagMap.elementAt(i).getValue(), true);
+		for (int i = 0; i < directVaultObjects.size(); ++i) {
+			ManagedReference<SceneObject*> object = directVaultObjects.get(i);
+			if (object != nullptr && !mappedBags.contains(object->getObjectID()))
+				++itemVaultLooseObjectCount;
+		}
 	}
 
 	bool rerunPending = false;
@@ -17202,7 +19214,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	gates["awardKillXp"] = isPlayerBotKillXpEnabled();
 	gates["awardMissionCredits"] = playerBotMissionCreditGateEnabled(0);
 	gates["buffPayment"] = playerBotBuffPaymentGateEnabled(0);
-	gates["lootEnabled"] = false;
+	gates["lootEnabled"] = playerBotLootGateEnabled(0);
 	gates["groupLoot"] = false;
 	gates["trainingEnabled"] = playerBotTrainingGateEnabled();
 	gates["earlyGameEnabled"] = playerBotEarlyGameGateEnabled();
@@ -17241,6 +19253,77 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	buffPayment["reservedNow"] = buffReservationsCount;
 	buffPayment["chargeFailed"] = buffPaymentChargeFailed.get();
 	result["buffPayment"] = buffPayment;
+
+	JSONSerializationType loot = JSONSerializationType::object();
+	loot["enabled"] = playerBotLootGateEnabled(0);
+	loot["configured"] = progressionLootEnabled;
+	loot["maxItemsPerBot"] = progressionLootMaxItemsPerBot;
+	loot["arriveMeters"] = progressionLootArriveMeters;
+	loot["maxDetourMeters"] = progressionLootMaxDetourMeters;
+	loot["claimTtlSeconds"] = progressionLootClaimTtlSeconds;
+	loot["maxClaimsPerBot"] = progressionLootMaxClaimsPerBot;
+	loot["stepTimeoutSeconds"] = progressionLootStepTimeoutSeconds;
+	loot["claimsQueued"] = lootClaimsQueued.get();
+	loot["claimsEvicted"] = lootClaimsEvicted.get();
+	loot["corpsesLooted"] = lootCorpsesLooted.get();
+	loot["itemsLooted"] = lootItemsLooted.get();
+	loot["cashLooted"] = lootCashLooted.get();
+	loot["skippedVaultFull"] = lootSkippedVaultFull.get();
+	loot["transferFailed"] = lootTransferFailed.get();
+	loot["depositNoRecord"] = lootDepositNoRecord.get();
+	loot["cashDropped"] = lootCashDropped.get();
+	JSONSerializationType notCreated = JSONSerializationType::object();
+	notCreated["noIdentity"] = lootNotCreatedNoIdentity.get();
+	notCreated["noRecord"] = lootNotCreatedNoRecord.get();
+	notCreated["gateOff"] = lootNotCreatedGateOff.get();
+	loot["notCreated"] = notCreated;
+	JSONSerializationType abandoned = JSONSerializationType::object();
+	abandoned["newAttacker"] = lootAbandonedNewAttacker.get();
+	abandoned["expired"] = lootAbandonedExpired.get();
+	abandoned["corpseGone"] = lootAbandonedCorpseGone.get();
+	abandoned["timeout"] = lootAbandonedTimeout.get();
+	abandoned["botDeath"] = lootAbandonedBotDeath.get();
+	abandoned["pathFailed"] = lootAbandonedPathFailed.get();
+	loot["abandoned"] = abandoned;
+	loot["claimsDroppedBodyGone"] = lootClaimsDroppedBodyGone.get();
+	JSONSerializationType results = JSONSerializationType::object();
+	for (int i = 0; i < PLAYER_BOT_LOOT_DISPOSITION_COUNT; ++i)
+		results[playerBotLootDispositionName(
+			static_cast<PlayerBotLootDisposition>(i))] = lootResults[i].get();
+	loot["results"] = results;
+	result["loot"] = loot;
+
+	JSONSerializationType vaultJson = JSONSerializationType::object();
+	vaultJson["available"] = dashboardEconomy != nullptr &&
+		dashboardEconomy->isItemVaultAvailable();
+	vaultJson["bagsDiscarded"] = dashboardEconomy == nullptr ? 0 :
+		dashboardEconomy->getItemBagsDiscarded();
+	vaultJson["oid"] = dashboardVault == nullptr ? 0 :
+		dashboardVault->getObjectID();
+	vaultJson["bagCount"] = itemVaultBagCount;
+	vaultJson["bagItemCount"] = itemVaultBagItemCount;
+	vaultJson["looseObjectCount"] = itemVaultLooseObjectCount;
+	JSONSerializationType rowsByState = JSONSerializationType::object();
+	for (int i = 0; i < itemRowsByState.size(); ++i)
+		rowsByState[itemRowsByState.elementAt(i).getKey()] =
+			itemRowsByState.elementAt(i).getValue();
+	vaultJson["rowsByState"] = rowsByState;
+	JSONSerializationType reconcile = JSONSerializationType::object();
+	reconcile["heldMissing"] = vaultReconcileHeldMissing.get();
+	reconcile["pendingMissing"] = vaultReconcilePendingMissing.get();
+	reconcile["recovered"] = vaultReconcileRecovered.get();
+	reconcile["orphaned"] = vaultReconcileOrphaned.get();
+	reconcile["lost"] = vaultReconcileLost.get();
+	reconcile["unmapped"] = vaultReconcileUnmapped.get();
+	reconcile["emptyBagsDestroyed"] = vaultReconcileEmptyBagsDestroyed.get();
+	vaultJson["reconcile"] = reconcile;
+	vaultJson["created"] = dashboardEconomy == nullptr ? 0 :
+		dashboardEconomy->getItemVaultCreatedCount();
+	vaultJson["loadFailed"] = dashboardEconomy == nullptr ? 0 :
+		dashboardEconomy->getItemVaultLoadFailedCount();
+	vaultJson["reapDestroyFailed"] = vaultReapDestroyFailed.get();
+	vaultJson["progressionItemRowsRejected"] = progressionItemRowsRejected.get();
+	result["vault"] = vaultJson;
 
 	int abilityBodies = 0;
 
@@ -17609,6 +19692,42 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		row["lastAwardSource"] = progression.lastAwardSource;
 		row["bodyOid"] = bodyOid;
 		row["weaponXpType"] = heldWeaponXpType;
+		row["itemsHeld"] = itemHeldSnapshot.contains(identityId) ?
+			itemHeldSnapshot.get(identityId) : 0;
+		JSONSerializationType itemRowsJson = JSONSerializationType::array();
+		if (itemRowsByIdentity.contains(identityId)) {
+			const Vector<SimBotItemRow>& identityItems =
+				itemRowsByIdentity.get(identityId);
+			VectorMap<uint64, bool> selectedItems;
+			for (int itemNumber = 0; itemNumber < 20 &&
+					itemNumber < identityItems.size(); ++itemNumber) {
+				int selectedIndex = -1;
+				uint64 selectedAt = 0;
+				for (int j = 0; j < identityItems.size(); ++j) {
+					const SimBotItemRow& candidate = identityItems.get(j);
+					if (selectedItems.contains(candidate.objectId))
+						continue;
+					uint64 acquiredAt = candidate.acquiredAt.isEmpty() ? 0 :
+						Long::unsignedvalueOf(candidate.acquiredAt);
+					if (selectedIndex < 0 || acquiredAt >= selectedAt) {
+						selectedIndex = j;
+						selectedAt = acquiredAt;
+					}
+				}
+				if (selectedIndex < 0)
+					break;
+				selectedItems.put(identityItems.get(selectedIndex).objectId, true);
+				const SimBotItemRow& itemRow = identityItems.get(selectedIndex);
+				JSONSerializationType itemJson = JSONSerializationType::object();
+				itemJson["objectId"] = itemRow.objectId;
+				itemJson["name"] = itemRow.displayName;
+				itemJson["state"] = playerBotItemStateName(itemRow.state);
+				itemJson["source"] = itemRow.source;
+				itemJson["acquiredAt"] = itemRow.acquiredAt;
+				itemRowsJson.push_back(itemJson);
+			}
+		}
+		row["items"] = itemRowsJson;
 		JSONSerializationType recentLedger = JSONSerializationType::array();
 		if (recentLedgerSnapshot.contains(identityId)) {
 			const Vector<SimBotLedgerEntry>& entries =
@@ -18219,6 +20338,9 @@ void SimPlayerManager::retirePveIdentity(uint64 identityId) {
 		progressionTrainingPendingIds.drop(identityId);
 		progressionEarlyGameStates.drop(identityId);
 	}
+	if (!destroyPlayerBotItemsAndBag(identityId))
+		return;
+	removePlayerBotItemsForReap(identityId);
 	try {
 		String id = String::valueOf(identityId);
 		UniqueReference<ResultSet*> skills(ServerDatabase::instance()->executeQuery(
@@ -18227,11 +20349,14 @@ void SimPlayerManager::retirePveIdentity(uint64 identityId) {
 			"DELETE FROM `simbot_experience` WHERE `identity_id`=" + id + ";"));
 		UniqueReference<ResultSet*> ledger(ServerDatabase::instance()->executeQuery(
 			"DELETE FROM `simbot_ledger` WHERE `identity_id`=" + id + ";"));
+		UniqueReference<ResultSet*> items(ServerDatabase::instance()->executeQuery(
+			"DELETE FROM `simbot_items` WHERE `identity_id`=" + id + ";"));
 		UniqueReference<ResultSet*> progression(ServerDatabase::instance()->executeQuery(
 			"DELETE FROM `simbot_progression` WHERE `identity_id`=" + id + ";"));
 		UniqueReference<ResultSet*> identity(ServerDatabase::instance()->executeQuery(
 			"DELETE FROM `simbot_identities` WHERE `id`=" + id + ";"));
-		(void)skills; (void)experience; (void)ledger; (void)progression; (void)identity;
+		(void)skills; (void)experience; (void)ledger; (void)items;
+		(void)progression; (void)identity;
 	} catch (const Exception& e) {
 		progressionDbAvailable = false;
 		error("SimPveIdentityRetireFailed: " + e.getMessage());
@@ -24187,6 +26312,13 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 		}
 		info("SimPveFoundationReady identities=" + String::valueOf(rosterSize), true);
 	}
+
+	// Item reconciliation is a boot-only pass and deliberately waits until
+	// both the SQL store and the economy vault have completed their load.
+	// AiEconomyManager may finish after this lane's first tick, so an
+	// unavailable vault leaves the pending bit set for the next tick.
+	if (progressionLoaded)
+		reconcilePlayerBotItems();
 
 	// Novice repair intentionally runs before population governance and does not
 	// require trainingEnabled. A repaired first box is what makes the planned

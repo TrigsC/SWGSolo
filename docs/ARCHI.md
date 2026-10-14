@@ -230,6 +230,9 @@ no new warnings before handing work back** (owner-stated standard).
   F_0.9.2 (v0.9.9) adds `playerBotProgression.awardMissionCredits`,
   `buffPayment` (`enabled`, `doctorFeeCredits`, zero = no charge) and
   `ledgerRetentionDays` (zero = keep forever); both gates default off.
+  F_0.9.3 (v0.9.10) adds `playerBotProgression.lootEnabled` (default off) and its
+  `loot` block: `maxItemsPerBot` 80, `arriveMeters`, `maxDetourMeters` 64,
+  `claimTtlSeconds`, `maxClaimsPerBot`, `stepTimeoutSeconds`.
   **The running server re-reads this file from disk on its own**: a syntax error in
   the working copy is hit live within seconds (it keeps the previous config), so
   `luac -p` any edit immediately.
@@ -945,6 +948,44 @@ This is this fork's primary custom subsystem, layered on top of the stock
   Dashboard: `playerBotProgression.missionCredits`, `.buffPayment`, `.ledger`, and
   per-identity `recentLedger[]`; diag event `MISSION_CREDIT`. Live receipt:
   `docs/4-unit-tests/live_f092-mission-credits_20261013-225200-f092-mission-credits.md`.
+- **Loot and the hive item vault (P.10d / F_0.9.3, released v0.9.10)** — the item column
+  of the holdings model. A plan-time spike kept the vault over giving bots a
+  `PlayerObject`: `isPlayerCreature()` is decided by the template type
+  (`CreatureObjectImplementation.cpp:4297`), not by having a ghost, and secure trade and
+  guild windows need a client on both sides either way.
+  **Loot**: `notifyDestruction` gains an `else if` beside the stock block. When the winner
+  is a roster bot with a record and the gate is on, the corpse gets stock loot and cash,
+  owned by the bot body. Owner resolution takes `pveMutex`, then the gate (which takes
+  `playerBotParityTestMutex`), then `progressionMutex`, one at a time under the corpse
+  lock, and queues a claim (OID only, `lootMutex`).
+  **Vault**: `AiEconomyManager` owns one persistent container (`itemVaultOid` on
+  `AiEconomyData`, IDL version 2) holding one **bag per identity** (`itemBagOids`). The
+  container is `creature_inventory.iff`, a `GENERIC` container, not `VOLUME`. Moving an
+  item into its owner's bag is one object-store change that also records the owner, so
+  the bag is the recovery source when a `simbot_items` row (schema 1015, keyed by
+  `object_id`, current state only) was not flushed. History is `simbot_ledger` with
+  `kind = item`. Lock order everywhere: body → corpse → corpse inventory → item → bag
+  → vault. A vault that fails to load keeps the gate closed, and so does a pending boot
+  reconciliation.
+  **Persistence window**: items are objects, so a fresh item survives a restart only
+  after the next 5-minute delta save (the lifecycle restart does not save). Earlier, the
+  boot reconciliation moves its row to `orphaned` and writes a −1 journal row for the
+  bot. Reconciliation is a pure table (`SimBotItemReconcile.h`); deletion paths destroy
+  each item and the bag before the rows go.
+  **The loot walk** (`SimHunterController::runPlayerBotLootStep`, decisions in
+  `SimBotLootStep.h`) must be allowed to start **while walking** on a travel leg.
+  Graduated bots kill in `ENGAGING_LAIR`, and a destroyed lair starts the next leg at
+  once, so the first build never looted in production. The walk resumes the leg through
+  `resumeTravelLeg`. **Any movement that interrupts another needs callback ownership:**
+  the arrival-check and path-result tasks publish their captured generation through a
+  thread-local (`getCallbackDispatchGeneration`), and the hunter classifies each
+  callback (current loot walk, stale, or the phase's own) under `lootArrivalMutex`
+  before any phase logic runs. **Known mover debt**: a successful path result can still
+  be applied after its movement was replaced, which affects every controller.
+  **Verification lesson**: harness bodies run `SimParityTestController`, so harness
+  scenarios never exercise hunter-controller code. `loot_production_walk` provokes a
+  real roster hunter instead. Live receipt: 23/23 in
+  `docs/4-unit-tests/live_f093-loot-vault_20261014-161558-f093-loot-vault.md`.
 - **Simulation-only by default, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line

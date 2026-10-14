@@ -217,4 +217,21 @@ void ServerDatabase::updateDatabaseSchema() {
 		"KEY `idx_simbot_ledger_created_at` (`created_at`)"
 		") ENGINE=MyISAM DEFAULT CHARSET=latin1;"
 	);
+
+	alterDatabase(1015,
+		"CREATE TABLE IF NOT EXISTS `simbot_items` ("
+		"`object_id` BIGINT NOT NULL,"
+		"`identity_id` BIGINT DEFAULT NULL,"
+		"`state` VARCHAR(12) NOT NULL,"
+		"`template_crc` INT UNSIGNED NOT NULL,"
+		"`display_name` VARCHAR(64) NOT NULL,"
+		"`source` VARCHAR(32) NOT NULL,"
+		"`ref_id` BIGINT NOT NULL DEFAULT 0,"
+		"`acquired_at` DATETIME NOT NULL,"
+		"`updated_at` DATETIME NOT NULL,"
+		"PRIMARY KEY (`object_id`),"
+		"KEY `idx_simbot_items_identity_state` (`identity_id`,`state`),"
+		"KEY `idx_simbot_items_state` (`state`)"
+		") ENGINE=MyISAM DEFAULT CHARSET=latin1;"
+	);
 }

@@ -1,10 +1,16 @@
 #include "AiEconomyManager.h"
 
+#include "server/ServerCore.h"
+#include "server/zone/ZoneServer.h"
 #include "server/zone/managers/aieconomy/AiEconomyStockpileLot.h"
 #include "server/zone/managers/object/ObjectManager.h"
+#include "server/zone/objects/scene/SceneObject.h"
+#include "server/zone/objects/scene/components/ContainerComponent.h"
 
 namespace {
 	const char* const AI_ECONOMY_DATABASE = "aieconomy";
+	const uint32 AI_ECONOMY_ITEM_VAULT_TEMPLATE =
+		STRING_HASHCODE("object/tangible/inventory/creature_inventory.iff");
 	const char* const AI_ECONOMY_LOTS_DATABASE = "aieconomylots";
 	const int MAX_STOCKPILE_LOTS = 100000;
 	const uint64 MAX_STOCKPILE_QUANTITY = 1000000000000ULL;
@@ -77,6 +83,10 @@ AiEconomyManager::AiEconomyManager() : Logger("AiEconomyManager") {
 
 void AiEconomyManager::initialize() {
 	economyData = nullptr;
+	itemVault = nullptr;
+	itemVaultAvailable.set(false);
+	itemVaultCreated = 0;
+	itemVaultLoadFailed = 0;
 	persistenceReady.set(false);
 	conceptualMinerStartupTotals.removeAll();
 	activeReservations.removeAll();
@@ -99,6 +109,7 @@ void AiEconomyManager::initialize() {
 	}
 
 	persistenceReady.set(true);
+	ensureItemVault();
 
 	int schemaVersion = 0;
 
@@ -124,6 +135,204 @@ void AiEconomyManager::initialize() {
 
 bool AiEconomyManager::isPersistenceReady() const {
 	return persistenceReady.get() && economyData != nullptr;
+}
+
+void AiEconomyManager::ensureItemVault() {
+	itemVault = nullptr;
+	itemVaultAvailable.set(false);
+
+	ManagedReference<AiEconomyData*> data = economyData;
+	if (!persistenceReady.get() || data == nullptr)
+		return;
+
+	uint64 vaultOid = 0;
+	{
+		Locker dataLocker(data);
+		vaultOid = data->getItemVaultOid();
+	}
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (zoneServer == nullptr) {
+		itemVaultLoadFailed.increment();
+		error("AiEconomyItemVaultUnavailable reason=zoneServerUnavailable");
+		return;
+	}
+
+	if (vaultOid != 0) {
+		ManagedReference<SceneObject*> existingVault =
+			zoneServer->getObject(vaultOid);
+		if (existingVault == nullptr ||
+				!isItemContainer(existingVault)) {
+			itemVaultLoadFailed.increment();
+			error("AiEconomyItemVaultUnavailable reason=loadFailed oid=" +
+				String::valueOf(vaultOid));
+			return;
+		}
+
+		itemVault = existingVault;
+		itemVaultAvailable.set(true);
+		return;
+	}
+
+	ManagedReference<SceneObject*> createdVault = zoneServer->createObject(
+		AI_ECONOMY_ITEM_VAULT_TEMPLATE, 1);
+	if (createdVault == nullptr || !isItemContainer(createdVault)) {
+		if (createdVault != nullptr) {
+			Locker vaultLock(createdVault);
+			createdVault->destroyObjectFromDatabase(true);
+		}
+		itemVaultLoadFailed.increment();
+		error("AiEconomyItemVaultUnavailable reason=createFailed");
+		return;
+	}
+
+	itemVault = createdVault;
+	{
+		Locker dataLocker(data);
+		if (data->getItemVaultOid() == 0)
+			data->setItemVaultOid(createdVault->getObjectID());
+	}
+
+	itemVaultAvailable.set(true);
+	itemVaultCreated.increment();
+	info("AiEconomyItemVaultCreated oid=" +
+		String::valueOf(createdVault->getObjectID()), true);
+}
+
+ManagedReference<SceneObject*> AiEconomyManager::getItemBag(uint64 identityId) {
+	if (identityId == 0 || !itemVaultAvailable.get())
+		return nullptr;
+
+	ManagedReference<AiEconomyData*> data = economyData;
+	if (data == nullptr)
+		return nullptr;
+
+	uint64 bagOid = 0;
+	{
+		Locker dataLocker(data);
+		bagOid = data->getItemBagOid(identityId);
+	}
+
+	if (bagOid == 0)
+		return nullptr;
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (zoneServer == nullptr)
+		return nullptr;
+
+	ManagedReference<SceneObject*> bag = zoneServer->getObject(bagOid);
+	if (bag == nullptr || !isItemBag(bag))
+		return nullptr;
+
+	return bag;
+}
+
+ManagedReference<SceneObject*> AiEconomyManager::getOrCreateItemBag(
+		uint64 identityId) {
+	if (identityId == 0 || !itemVaultAvailable.get())
+		return nullptr;
+
+	ManagedReference<SceneObject*> existingBag = getItemBag(identityId);
+	if (existingBag != nullptr)
+		return existingBag;
+
+	ManagedReference<AiEconomyData*> data = economyData;
+	ManagedReference<SceneObject*> vault = itemVault;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (data == nullptr || vault == nullptr || zoneServer == nullptr)
+		return nullptr;
+	{
+		Locker dataLocker(data);
+		if (data->getItemBagOid(identityId) != 0)
+			return nullptr;
+	}
+
+	ManagedReference<SceneObject*> bag = zoneServer->createObject(
+		AI_ECONOMY_ITEM_VAULT_TEMPLATE, 1);
+	if (bag == nullptr)
+		return nullptr;
+	if (!isItemBag(bag)) {
+		discardItemBag(bag, nullptr);
+		return nullptr;
+	}
+
+	bool transferred = false;
+	{
+		Locker bagLock(bag);
+		Locker vaultLock(vault, bag);
+		transferred = vault->transferObject(bag, -1, false, true);
+	}
+	if (!transferred) {
+		discardItemBag(bag, nullptr);
+		return nullptr;
+	}
+
+	uint64 mappedBagOid = 0;
+	{
+		Locker dataLocker(data);
+		mappedBagOid = data->getItemBagOid(identityId);
+		if (mappedBagOid == 0)
+			data->putItemBagOid(identityId, bag->getObjectID());
+	}
+	if (mappedBagOid != 0) {
+		// Another caller mapped a bag for this identity first; ours is empty.
+		discardItemBag(bag, vault);
+		return getItemBag(identityId);
+	}
+
+	return bag;
+}
+
+// The vault and the bags use creature_inventory.iff, a GENERIC container (the
+// type every corpse inventory has), so either item-accepting type is valid.
+bool AiEconomyManager::isItemContainer(SceneObject* object) {
+	if (object == nullptr)
+		return false;
+	int type = object->getContainerType();
+	return type == ContainerType::VOLUME || type == ContainerType::GENERIC;
+}
+
+// A bag is recognised by its template, never by its container type: a looted
+// item can itself be a container.
+bool AiEconomyManager::isItemBag(SceneObject* object) {
+	return isItemContainer(object) &&
+		object->getServerObjectCRC() == AI_ECONOMY_ITEM_VAULT_TEMPLATE;
+}
+
+void AiEconomyManager::discardItemBag(SceneObject* bag, SceneObject* vault) {
+	// A bag that never received an item: unlink it from the vault if it got
+	// there (bag before container, as everywhere), then delete it, so a failed
+	// install never leaves a persistent object behind.
+	Locker bagLock(bag);
+	if (vault != nullptr && bag->getParent().get() == vault) {
+		Locker vaultLock(vault, bag);
+		vault->removeObject(bag, nullptr, false, true);
+	}
+	bag->destroyObjectFromDatabase(true);
+	itemBagsDiscarded.increment();
+}
+
+VectorMap<uint64, uint64> AiEconomyManager::getItemBagMapSnapshot() {
+	VectorMap<uint64, uint64> snapshot;
+	ManagedReference<AiEconomyData*> data = economyData;
+	if (data == nullptr)
+		return snapshot;
+
+	Locker dataLocker(data);
+	VectorMap<uint64, uint64>* bags = data->getItemBagOids();
+	if (bags != nullptr) {
+		for (int i = 0; i < bags->size(); ++i)
+			snapshot.put(bags->elementAt(i).getKey(), bags->elementAt(i).getValue());
+	}
+	return snapshot;
+}
+
+bool AiEconomyManager::dropItemBag(uint64 identityId) {
+	if (identityId == 0 || economyData == nullptr)
+		return false;
+
+	Locker dataLocker(economyData);
+	return economyData->dropItemBagOid(identityId);
 }
 
 void AiEconomyManager::logLoadedConceptualStockpileSummary() {
@@ -1661,7 +1870,8 @@ bool AiEconomyManager::validateEconomyData(
 
 	stockpileLotCount = lots.size();
 
-	if (schemaVersion != AiEconomyData::CURRENT_SCHEMA_VERSION) {
+	if (schemaVersion != 1 &&
+			schemaVersion != AiEconomyData::CURRENT_SCHEMA_VERSION) {
 		failureReason = "unsupportedSchemaVersion version=" +
 			String::valueOf(schemaVersion);
 		return false;
@@ -1857,6 +2067,12 @@ bool AiEconomyManager::validateEconomyData(
 	if (highestEntryID >= nextEntryID) {
 		failureReason = "nextStockpileEntryIdNotMonotonic";
 		return false;
+	}
+
+	if (schemaVersion == 1) {
+		Locker dataLocker(data);
+		if (data->getSchemaVersion() == 1)
+			data->setSchemaVersion(AiEconomyData::CURRENT_SCHEMA_VERSION);
 	}
 
 	return true;

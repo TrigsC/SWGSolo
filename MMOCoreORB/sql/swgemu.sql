@@ -13601,6 +13601,21 @@ CREATE TABLE IF NOT EXISTS `swgemu`.`simbot_ledger` (
   KEY `idx_simbot_ledger_created_at` (`created_at`)
 ) ENGINE=MyISAM DEFAULT CHARSET=latin1;
 
+CREATE TABLE IF NOT EXISTS `swgemu`.`simbot_items` (
+  `object_id` bigint(20) NOT NULL,
+  `identity_id` bigint(20) DEFAULT NULL,
+  `state` varchar(12) NOT NULL,
+  `template_crc` int(10) unsigned NOT NULL,
+  `display_name` varchar(64) NOT NULL,
+  `source` varchar(32) NOT NULL,
+  `ref_id` bigint(20) NOT NULL DEFAULT '0',
+  `acquired_at` datetime NOT NULL,
+  `updated_at` datetime NOT NULL,
+  PRIMARY KEY (`object_id`),
+  KEY `idx_simbot_items_identity_state` (`identity_id`,`state`),
+  KEY `idx_simbot_items_state` (`state`)
+) ENGINE=MyISAM DEFAULT CHARSET=latin1;
+
 CREATE TABLE IF NOT EXISTS `swgemu`.`simbot_experience` (
   `identity_id` bigint(20) NOT NULL,
   `xp_type` varchar(64) NOT NULL,

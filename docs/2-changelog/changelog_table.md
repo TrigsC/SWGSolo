@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.9.10` | 14 | F_0.9.3 P.10d: loot from kills and the hive item vault — a roster PlayerBot's kill gets stock loot and cash, the bot walks to the corpse (even mid travel leg) and loots it: cash into its store, items into its own bag in a persistent vault with one simbot_items row each (schema 1015), boot reconciliation and teardown on deletion; gate default-off |
 | `0.9.9` | 14 | F_0.9.2 P.10c: mission credits and the holdings journal — roster PlayerBots are paid the stock destroy-mission reward into an identity-keyed bank balance, every change to what a bot holds is journaled in simbot_ledger (schema 1014), and a doctor-buff fee is the first credit sink; both gates default-off |
 | `0.9.8` | 14 | F_0.9.8 P.10i: lair tactics and mission graduation — PlayerBots complete destroy missions end to end: overland fallback and stock-style lair placement, graduation at box 4, lair hold with wave break-off and de-aggro, progression-first dispatch, travel combat with a one-leg flee cap, attacker recognition, area-attack lair guard and lair retreat defense; the proven gates ship on |
 | `0.9.7` | 10 | F_0.9.7 P.10h: skill-derived combat abilities — a PlayerBot's attack list is built from its trained boxes (highest tier only), specials cost real HAM under a spend-scoped reserve, a free control ability is used before the special roll, plus per-bot REST inspection, a dashboard drawer and `/server playerinfo`; all gates default-off |
@@ -28,6 +29,12 @@
 
 # Changelog Summary
 
+- **v0.9.10 (Loot and the Hive Item Vault, F_0.9.3 P.10d - Week 14, 14-10-2026)**:
+  - **Bot kills produce loot.** A roster PlayerBot's kill gets stock loot and cash, owned by the bot; the bot walks to the corpse, even interrupting a travel leg, loots it, and resumes.
+  - **The vault is the bot's inventory.** Items move into the bot's own bag in one persistent vault, with one `simbot_items` row each (schema 1015) and a journal row per change; cash goes to the store. Items keep their rolled stats because the same object moves. Cap 80 per bot.
+  - **Recovery.** Boot reconciliation recovers unrecorded items from their bag and marks a missing held item `orphaned`; deleting a bot destroys its items and bag. An item looted less than one 5-minute object save before a crash is lost, as for a player.
+  - **Ghost spike.** Bots keep the vault rather than a `PlayerObject`: being a player is a template type, and trade and guild windows need a client either way.
+  - **Verified live.** Harness 14 of 14, including a real bot looting a jawa mid-mission and an item surviving a restart; four defects found and fixed during verification. The gate ships off.
 - **v0.9.9 (Mission Credits and the Holdings Journal, F_0.9.2 P.10c - Week 14, 14-10-2026)**:
   - **Bots are paid for missions.** A roster PlayerBot that destroys its mission lair receives the stock destroy-mission reward (375 x lair level plus up to 15 x level on this server) into its bank balance in the progression store. The formula has one owner, `MissionManager::rollDestroyMissionReward`, which the stock generator now calls too.
   - **Holdings model and journal.** The plan fixes ten rules for anything a bot owns (identity-keyed, nothing durable on the body, one authority and one API per kind, reserve then commit or release). Every credit change writes a row to `simbot_ledger` (schema 1014) in the same flush as the balance; a mismatch after a crash is closed with a visible `reconcile` row.

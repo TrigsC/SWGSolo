@@ -206,6 +206,25 @@ private:
 	// True while the current target was adopted in self-defence rather than
 	// chosen by the TTK scan.
 	bool earlyGameTargetDefensive;
+	// The loot sub-step is transient controller state. The claim itself is a
+	// value copy; no corpse or bag reference is retained between ticks.
+	// lootStepActive is read by the path callbacks on other threads; they only
+	// raise lootStepPathFailed and hand back to the tick, which owns the rest.
+	std::atomic<bool> lootStepActive{false};
+	std::atomic<bool> lootStepPathFailed{false};
+	PlayerBotLootClaim lootStepClaim;
+	uint64 lootStepStartedAtMs = 0;
+	// True when the loot walk interrupted a travel leg, which the step must
+	// put back on course when it ends (not every leg branch re-issues its move).
+	bool lootStepInterruptedLeg = false;
+	// Stale corpse arrivals: onArrived's loot check and the step's finish are
+	// serialized by lootArrivalMutex. The finish advances the work-loop
+	// generation and records [lootWalkFirstGeneration, lootWalkEndGeneration);
+	// an arrival dispatched inside that range belongs to the corpse walk and is
+	// never handed to the interrupted phase's arrival logic.
+	Mutex lootArrivalMutex;
+	uint64 lootWalkFirstGeneration = 0;
+	uint64 lootWalkEndGeneration = 0;
 	uint64 earlyGameRestStartedAtMs;
 	std::atomic<bool> earlyGamePathFailurePending{false};
 	std::atomic<bool> earlyGameDestructionPending{false};
@@ -280,6 +299,14 @@ private:
 
 	void scheduleActiveTick(int delayMs);
 	void runActiveTick();
+	bool runPlayerBotLootStep(AiAgent* hunter, uint64 nowMs);
+	void finishPlayerBotLootStep(const char* outcome, bool resumeLeg);
+	// NOT_LOOT: the phase owns the callback. CURRENT: it belongs to the active
+	// corpse walk. STALE: it belongs to movement the loot step cancelled (the
+	// walk itself after a finish, or the interrupted leg once the walk began).
+	enum LootWalkCallback { LOOT_CALLBACK_NOT_LOOT, LOOT_CALLBACK_CURRENT,
+		LOOT_CALLBACK_STALE };
+	LootWalkCallback classifyLootWalkCallback();
 	// The BUFF_UP branch of runActiveTick, extracted so a single guard at the
 	// call site can re-arm the heartbeat on every exit. Pure extraction: the
 	// body is unchanged and no buffing behaviour is altered.
@@ -457,6 +484,10 @@ private:
 	void completeOrder(bool abandoned, const String& reason);
 
 public:
+	// Read-only views for the parity harness's production loot-walk scenario.
+	bool isOnTravelLeg() const { return isTravelCombatPhase(); }
+	bool isLootStepRunning() const { return lootStepActive.load(); }
+
 	SimHunterController(AiAgent* aiAgent, uint64 identity);
 	virtual ~SimHunterController();
 

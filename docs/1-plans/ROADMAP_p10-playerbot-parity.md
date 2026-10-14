@@ -282,7 +282,21 @@ F_0.9.0 store+dashboard+reaper+harness
   same completion function → bank delta within the formula's bounds; twice for
   the same offer id → credited once; unknown identity → rejected.
 
-### F_0.9.3 — Loot from kills, solo, and the hive item vault (P.10d)
+### F_0.9.3 — Loot from kills, solo, and the hive item vault (P.10d) — RELEASED as v0.9.10 (2026-10-14)
+
+> Released. See `F_0.9.3_p10d-loot-and-vault.plan.md`. The ghost re-evaluation asked
+> for in §5b.5 was done at plan time: the vault stays, because `isPlayerCreature()` is a
+> template type and trade and guild windows need a client either way. Departures from
+> the scope below:
+> - the vault holds **one bag per identity**, and the bag (not a `pending` row) is the
+>   write-ahead record;
+> - `simbot_items` is keyed by `object_id` and holds current state only, with history in
+>   `simbot_ledger`;
+> - only `held` and `orphaned` are written; `pending`, `lost`, `consumed`, `listed` and
+>   `equipped` are reserved for later chunks.
+>
+> The loot walk runs on travel legs too. A fresh item survives a restart only after the
+> next 5-minute object save. Next chunk: F_0.9.4 group loot, or the bazaar line.
 
 - **Scope**: (a) `AiEconomyManager` creates once and persists a **hive item
   vault** container (`ObjectManager::createObject(…, persistenceLevel 1, …)`),

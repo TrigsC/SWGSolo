@@ -164,6 +164,66 @@ struct SimBotLedgerEntry {
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
 
+enum SimBotItemState {
+	SIMBOT_ITEM_HELD = 0,
+	SIMBOT_ITEM_ORPHANED,
+	SIMBOT_ITEM_PENDING,
+	SIMBOT_ITEM_LOST,
+	SIMBOT_ITEM_CONSUMED,
+	SIMBOT_ITEM_LISTED,
+	SIMBOT_ITEM_EQUIPPED
+};
+
+struct SimBotItemDeposit {
+	uint64 objectId = 0;
+	uint32 templateCrc = 0;
+	String displayName;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct SimBotItemRow {
+	uint64 objectId = 0;
+	uint64 identityId = 0;
+	SimBotItemState state = SIMBOT_ITEM_HELD;
+	uint32 templateCrc = 0;
+	String displayName;
+	String source;
+	uint64 refId = 0;
+	String acquiredAt;
+	String updatedAt;
+	uint64 version = 0;
+	bool dirty = false;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotLootClaim {
+	uint64 identityId = 0;
+	uint64 corpseOid = 0;
+	String zoneName;
+	Vector3 position;
+	uint64 queuedAtMs = 0;
+	uint64 expiresAtMs = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+enum PlayerBotLootDisposition {
+	PLAYER_BOT_LOOTED = 0,
+	PLAYER_BOT_LOOT_PARTIAL_CAP,
+	PLAYER_BOT_LOOT_NOTHING,
+	PLAYER_BOT_LOOT_CORPSE_GONE,
+	PLAYER_BOT_LOOT_NOT_OWNER,
+	PLAYER_BOT_LOOT_TOO_FAR,
+	PLAYER_BOT_LOOT_TRANSFER_FAILED,
+	PLAYER_BOT_LOOT_GATE_OFF,
+	PLAYER_BOT_LOOT_DISPOSITION_COUNT
+};
+
 enum PveMissionCreditDisposition {
 	PVE_MISSION_CREDIT_NOT_COMPLETED = 0,
 	PVE_MISSION_CREDIT_AWARDED,
@@ -631,6 +691,22 @@ struct PlayerBotParityTestStep {
 	String command;
 	String supersededBy;
 	String targetState;
+	uint64 corpseOid = 0;
+	String lootTemplate;
+	String itemState;
+	int expectedItemCount = -1;
+	int expectedCorpseItemCount = -1;
+	int expectedDespawnSeconds = -1;
+	int lootCap = -1;
+	bool hasLootGate = false;
+	// awaitKillTargetDeath: leave the corpse in the world (loot scenarios).
+	bool keepCorpse = false;
+	// assertItemRow: match the row of the last seeded item instead of the
+	// identity (reconciliation moves a row to the system owner).
+	bool bySeededItem = false;
+	bool lootGate = false;
+	bool inVault = false;
+	bool hasInVault = false;
 	int combatAbilitySpecialAttackChancePercent = -1;
 	bool hasCombatAbilitySpecialAttackChancePercent = false;
 	bool combatAbilityHarnessOptIn = false;
@@ -2302,6 +2378,13 @@ private:
 	Mutex progressionMutex;
 	VectorMap<uint64, SimBotProgression> progressionRecords;
 	VectorMap<uint64, bool> progressionDirtyIds;
+	VectorMap<uint64, SimBotItemRow> progressionItems;
+	VectorMap<uint64, uint64> progressionItemHeldCounts;
+	VectorMap<uint64, bool> progressionItemDirtyIds;
+	// Loot claims contain values only. This is a leaf mutex: it is never held
+	// while taking an object lock or a manager mutex.
+	Mutex lootMutex;
+	VectorMap<uint64, Vector<PlayerBotLootClaim> > playerBotLootClaims;
 	VectorMap<uint64, bool> progressionRetiringIds;
 	Vector<uint64> progressionOrphanIds;
 	VectorMap<uint64, SimBotEarlyGameState> progressionEarlyGameStates;
@@ -2313,6 +2396,13 @@ private:
 	bool progressionTrainingEnabled = false;
 	bool progressionEarlyGameEnabled = false;
 	bool progressionCombatAbilitiesEnabled = false;
+	bool progressionLootEnabled = false;
+	int progressionLootMaxItemsPerBot = 80;
+	int progressionLootArriveMeters = 4;
+	int progressionLootMaxDetourMeters = 64;
+	int progressionLootClaimTtlSeconds = 280;
+	int progressionLootMaxClaimsPerBot = 8;
+	int progressionLootStepTimeoutSeconds = 90;
 	bool progressionLairTacticsEnabled = false;
 	bool progressionEarlyGameRealWeaponDamage = false;
 	float progressionKillXpRate = 1.0f;
@@ -2336,6 +2426,11 @@ private:
 	int trainingSweepBatch = 64;
 	uint64 trainingSweepCursor = 0;
 	bool progressionLoaded = false;
+	// Loot stays closed until the once-per-boot item reconciliation has run:
+	// a deposit landing between its bag snapshot and its row comparison would
+	// otherwise be misread as a held row whose object is missing. Atomic because
+	// the loot gate reads it from combat and controller threads.
+	std::atomic<bool> progressionItemReconcilePending{true};
 	bool progressionDbAvailable = false;
 	uint64 progressionLastFlushMs = 0;
 	uint64 progressionNextDbProbeMs = 0;
@@ -2381,6 +2476,35 @@ private:
 	AtomicLong progressionOrphansReaped;
 	AtomicLong progressionReaperRuns;
 	AtomicLong progressionFlushFailures;
+	AtomicLong progressionItemRowsRejected;
+	AtomicLong vaultReconcileHeldMissing;
+	AtomicLong vaultReconcilePendingMissing;
+	AtomicLong vaultReconcileRecovered;
+	AtomicLong vaultReconcileOrphaned;
+	AtomicLong vaultReconcileLost;
+	AtomicLong vaultReconcileUnmapped;
+	AtomicLong vaultReconcileEmptyBagsDestroyed;
+	AtomicLong vaultReapDestroyFailed;
+	AtomicLong lootClaimsQueued;
+	AtomicLong lootClaimsEvicted;
+	AtomicLong lootNotCreatedNoIdentity;
+	AtomicLong lootNotCreatedNoRecord;
+	AtomicLong lootNotCreatedGateOff;
+	AtomicLong lootCorpsesLooted;
+	AtomicLong lootItemsLooted;
+	AtomicLong lootCashLooted;
+	AtomicLong lootSkippedVaultFull;
+	AtomicLong lootTransferFailed;
+	AtomicLong lootDepositNoRecord;
+	AtomicLong lootCashDropped;
+	AtomicLong lootAbandonedNewAttacker;
+	AtomicLong lootAbandonedExpired;
+	AtomicLong lootAbandonedCorpseGone;
+	AtomicLong lootAbandonedTimeout;
+	AtomicLong lootAbandonedBotDeath;
+	AtomicLong lootAbandonedPathFailed;
+	AtomicLong lootClaimsDroppedBodyGone;
+	AtomicLong lootResults[PLAYER_BOT_LOOT_DISPOSITION_COUNT];
 	AtomicLong progressionLedgerWritten;
 	AtomicLong progressionLedgerDropped;
 	AtomicLong progressionLedgerBalanceMismatch;
@@ -2437,6 +2561,7 @@ private:
 	VectorMap<String, uint64> playerBotParityTestRequestRefs;
 	VectorMap<String, uint64> playerBotParityTestIdentityRefs;
 	VectorMap<String, uint64> playerBotParityTestCounterBaselines;
+	VectorMap<uint64, String> playerBotParityItemStatSnapshots;
 	int playerBotParityTestScenarioIndex = 0;
 	int playerBotParityTestStepCursor = 0;
 	int playerBotParityTestSetupCursor = 0;
@@ -2479,6 +2604,12 @@ private:
 	bool playerBotParityTestMissionCreditGateOverridePreviousActive = false;
 	bool playerBotParityTestMissionCreditGateOverridePrevious = false;
 	VectorMap<uint64, bool> playerBotParityMissionCreditScopedIds;
+	bool playerBotParityTestLootGateOverrideActive = false;
+	bool playerBotParityTestLootGateOverride = false;
+	VectorMap<uint64, bool> playerBotParityLootGateScopedIds;
+	bool playerBotParityTestLootCapOverrideActive = false;
+	int playerBotParityTestLootCapOverridePrevious = 80;
+	AtomicBoolean playerBotParityTestFailItemTransfer{false};
 	bool playerBotParityTestBuffPaymentGateOverrideActive = false;
 	bool playerBotParityTestBuffPaymentGateOverride = false;
 	bool playerBotParityTestBuffPaymentGateOverridePreviousActive = false;
@@ -2524,6 +2655,7 @@ private:
 	int playerBotParityTestStartupDelaySeconds = 60;
 	String playerBotParityTestRunId;
 	String playerBotParityTestPhase = "A";
+	String playerBotParityTestRestartScenario;
 	String playerBotParityTestKillTargetTemplate = "dwarf_nuna";
 	uint64 playerBotParityTestKillTargetOid = 0;
 	uint64 playerBotParityTestKillTargetIdentityId = 0;
@@ -2540,6 +2672,18 @@ private:
 	// Target OID the kill oracle settled on; assertXp keeps using it after the
 	// target itself has been despawned.
 	uint64 playerBotParityTestKillTargetSettledOid = 0;
+	// The newest item seedCorpseLoot placed; assertItemDestroyed checks it.
+	uint64 playerBotParityLastSeededItemOid = 0;
+	// Production loot-walk scenario: the roster hunter provoked and the creature
+	// that attacked it.
+	uint64 playerBotParityProvokedIdentityId = 0;
+	uint64 playerBotParityProvokedCreatureOid = 0;
+	uint64 playerBotParityProvokeLootedAtMs = 0;
+	// Last corpse each identity looted (LOOTED or PARTIAL_CAP), under lootMutex.
+	VectorMap<uint64, uint64> lootLastLootedCorpseByIdentity;
+	// Cash seedCorpseLoot's sibling placed on the corpse; a successful harness
+	// lootCorpse moves it into the oracle so assertCredits stays exact.
+	int64 playerBotParitySeededCorpseCash = 0;
 	// F_0.9.6 harness isolation. A LEAF mutex: nothing else is acquired while it
 	// is held, so it may be taken under pveMutex (governor, eligibility), under
 	// playerBotParityTestMutex, and from the kill-XP award task without
@@ -2906,6 +3050,10 @@ private:
 	void retirePveIdentity(uint64 identityId);
 	bool drainPveIdentityBody(uint64 identityId, uint64 nowMs);
 	void markProgressionDirtyLocked(uint64 identityId);
+	void markPlayerBotItemDirtyLocked(uint64 objectId);
+	void appendPlayerBotLedgerEntryKindLocked(uint64 identityId,
+		const String& kind, int64 delta, int64 balanceAfter,
+		const String& source, uint64 refId, const String& detail);
 	void appendPlayerBotLedgerEntryLocked(uint64 identityId, bool bank,
 		int64 delta, int64 balanceAfter, const String& source, uint64 refId,
 		const String& detail);
@@ -2923,6 +3071,9 @@ private:
 	void flushPlayerBotProgressionStore(bool force, int faultDelayMs = 0,
 		bool faultFailNext = false, bool faultFailLedgerInsert = false);
 	void reconcilePlayerBotProgression();
+	void reconcilePlayerBotItems();
+	bool destroyPlayerBotItemsAndBag(uint64 identityId);
+	JSONSerializationType buildPlayerBotItemStatSnapshot(SceneObject* item);
 	void reconcileIdentityTiers();
 	void runPlayerBotProgressionReaper(uint64 nowMs, bool force = false);
 	void drainPlayerBotProgressionRequests();
@@ -2975,10 +3126,13 @@ private:
 		String& failure);
 	bool awaitPlayerBotParityKillTarget(const PlayerBotParityTestStep& step,
 		String& failure);
-	void despawnPlayerBotParityKillTarget();
+	void despawnPlayerBotParityKillTarget(bool keepCorpse = false);
+	void extendPlayerBotParityCorpseDespawn(CreatureObject* corpse);
+	void despawnPlayerBotParityProvokedCreature();
 	bool awardToNonRosterPlayerBotBody(uint64 identityId, const String& xpType,
 		int amount, const String& source);
 	bool playerBotProgressionAwardGateEnabled();
+	bool playerBotLootGateEnabled(uint64 identityId);
 	bool playerBotMissionCreditGateEnabled(uint64 identityId);
 	bool playerBotBuffPaymentGateEnabled(uint64 identityId);
 	// Per-identity decision: the harness override applies only to identities in
@@ -3650,6 +3804,32 @@ public:
 	bool spendPlayerBotCredits(uint64 identityId, int64 amount, bool bank,
 		const String& source, uint64 refId = 0,
 		const String& detail = String());
+	bool depositPlayerBotItem(uint64 identityId,
+		const Vector<SimBotItemDeposit>& objects, const String& source,
+		uint64 refId);
+	bool removePlayerBotItemsForReap(uint64 identityId);
+	uint64 resolvePlayerBotLootOwner(uint64 bodyOid);
+	bool queuePlayerBotLootClaim(uint64 identityId, uint64 corpseOid,
+		const String& zoneName, const Vector3& position);
+	bool takeNearestPlayerBotLootClaim(uint64 identityId,
+		const String& zoneName, const Vector3& position,
+		float maxDetourMeters, PlayerBotLootClaim& claimOut);
+	bool returnPlayerBotLootClaim(const PlayerBotLootClaim& claim);
+	PlayerBotLootDisposition lootPlayerBotCorpse(uint64 identityId,
+		AiAgent* body, uint64 corpseOid);
+	void recordPlayerBotLootAbandoned(const String& reason);
+	void recordPlayerBotLootResult(uint64 identityId, uint64 corpseOid,
+		PlayerBotLootDisposition disposition);
+	void dropPlayerBotLootClaims(uint64 identityId);
+	int getPlayerBotLootArriveMeters() const {
+		return progressionLootArriveMeters;
+	}
+	int getPlayerBotLootMaxDetourMeters() const {
+		return progressionLootMaxDetourMeters;
+	}
+	int getPlayerBotLootStepTimeoutSeconds() const {
+		return progressionLootStepTimeoutSeconds;
+	}
 	PlayerBotBuffFee reservePlayerBotDoctorBuffFee(uint64 identityId);
 	bool commitPlayerBotDoctorBuffFee(uint64 identityId);
 	void releasePlayerBotDoctorBuffFee(uint64 identityId);
