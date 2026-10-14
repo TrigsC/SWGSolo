@@ -1203,16 +1203,21 @@
     const training = progression.training || {};
     const trainingRefusals = training.refusals || {};
     const combatAbilities = progression.combatAbilities || {};
+    const missionCredits = progression.missionCredits || {};
+    const buffPayment = progression.buffPayment || {};
+    const ledger = progression.ledger || {};
     const trainingGate = progression.gates && progression.gates.trainingEnabled === true;
     const roster = Array.isArray(pve.roster) ? pve.roster : [];
     const progressionRows = (progression.identities || []).map((r) => {
       const xp = Object.entries(r.xp || {}).map(([k, v]) => `${labelize(k)} ${compact(v)}`).join(" · ") || "none";
+      const journal = (r.recentLedger || []).slice().reverse().map((e) => `${Number(e.delta) >= 0 ? "+" : ""}${num(e.delta)} ${esc(e.source || "?")}${e.detail ? " (" + esc(e.detail) + ")" : ""} · ${ago(e.ageSeconds)}`).join("<br>") || "none since restart";
       return `<tr>
         <td><button type="button" class="playerbot-link" data-identity-id="${esc(r.identityId)}"><span class="t-main">${esc(r.name || "#" + r.identityId)}</span><span class="t-sub">${esc(r.identityId)}</span></button></td>
         <td>${chip(labelize(r.profession || "unknown"), r.profession === "orphan" ? "red" : "ghost")}</td>
         <td><span class="t-main">${esc(r.trainingPlan || "none")}</span><span class="t-sub">${num(r.skillsTrained != null ? r.skillsTrained : (r.skills || []).length)} boxes · tier ${num(r.derivedTier)}</span></td>
         <td class="t-num">${compact(r.bankCredits)}</td>
         <td class="t-num">${compact(r.cashCredits)}</td>
+        <td><span class="t-sub">${journal}</span></td>
         <td>${esc(xp)}</td>
         <td class="t-num">${num((r.skills || []).length)}</td>
         <td><span class="t-main">${esc(r.lastAwardSource || "none")}</span><span class="t-sub">${r.lastAwardAgeSeconds == null ? "—" : ago(r.lastAwardAgeSeconds)}</span></td>
@@ -1321,6 +1326,10 @@
             ${metric("Training Drain", training.worstDrainMs == null ? "—" : `${num(training.worstDrainMs)}ms`, { raw: true })}
             ${metric("Kill XP Kills", killXp.kills, { tone: "accent" })}
             ${metric("Kill XP Awarded", killXp.totalAwarded)}
+            ${metric("Mission Credits", missionCredits.creditsTotal, { tone: "accent" })}
+            ${metric("Mission Awards", missionCredits.awarded)}
+            ${metric("Buff Charges", buffPayment.charged)}
+            ${metric("Buff Credits Spent", buffPayment.creditsSpent)}
             ${metric("Flush Age", ago(progression.lastFlushAgeSeconds), { raw: true })}
           </div>
           <div class="section-gap"></div>
@@ -1331,10 +1340,15 @@
             ["Free-state forced / reserve skips", num(combatAbilities.freeStateForced) + " / " + num(combatAbilities.reserveSkips)]
           ])}
           <div class="section-gap"></div>
-          ${table(["Identity", "Profession", "Training", "Bank", "Cash", "XP", "Skills", "Last Award"], progressionRows, { scrollKey: "progression-identities", tall: true })}
+          ${table(["Identity", "Profession", "Training", "Bank", "Cash", "Recent Holdings Changes", "XP", "Skills", "Last Award"], progressionRows, { scrollKey: "progression-identities", tall: true })}
           <div class="section-gap"></div>
           ${kvRows([
             ["Flush interval", num(progression.flushIntervalSeconds) + "s"],
+            ["Holdings journal", `${num(ledger.written)} written · ${num(ledger.pending)} pending · retention ${Number(ledger.retentionDays || 0) ? num(ledger.retentionDays) + "d" : "forever"}`],
+            ["Journal dropped / balance mismatches", chip(num(ledger.dropped) + " / " + num(ledger.balanceMismatch), Number(ledger.dropped || 0) + Number(ledger.balanceMismatch || 0) ? "red" : "ok")],
+            ["Mission credits", `${chip(missionCredits.enabled ? "enabled" : "disabled", missionCredits.enabled ? "ok" : "ghost")} · ${num(missionCredits.awarded)} awards · rejected ${num(missionCredits.rejected)} · gate-off ${num(missionCredits.skippedGateOff)} · last ${num(missionCredits.lastAmount)} at level ${num(missionCredits.lastDifficultyLevel)}`],
+            ["Doctor-buff fee", `${chip(buffPayment.enabled ? "enabled" : "disabled", buffPayment.enabled ? "ok" : "ghost")} · fee ${num(buffPayment.doctorFeeCredits)} · charged ${num(buffPayment.charged)} · unaffordable ${num(buffPayment.skippedUnaffordable)} · released ${num(buffPayment.released)} · reserved now ${num(buffPayment.reservedNow)}`],
+            ["Doctor-buff charge failures", chip(num(buffPayment.chargeFailed), Number(buffPayment.chargeFailed || 0) ? "red" : "ok")],
             ["Reaper", progression.reaper && progression.reaper.enabled ? "enabled" : "count-only"],
             ["Reaper runs / reaped", num(progression.reaper && progression.reaper.runs) + " / " + num(progression.reaper && progression.reaper.reaped)],
             ["Rejected: no record / disabled", num((progression.awards || {}).rejectedNoRecord) + " / " + num((progression.awards || {}).rejectedDisabled)],

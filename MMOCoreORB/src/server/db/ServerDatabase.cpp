@@ -200,4 +200,21 @@ void ServerDatabase::updateDatabaseSchema() {
 	alterDatabase(1013,
 		"ALTER TABLE `simbot_identities` ADD COLUMN `training_plan` VARCHAR(64) DEFAULT NULL;"
 	);
+
+	alterDatabase(1014,
+		"CREATE TABLE IF NOT EXISTS `simbot_ledger` ("
+		"`id` BIGINT NOT NULL AUTO_INCREMENT,"
+		"`identity_id` BIGINT NOT NULL,"
+		"`kind` VARCHAR(16) NOT NULL,"
+		"`delta` BIGINT NOT NULL,"
+		"`balance_after` BIGINT NOT NULL,"
+		"`source` VARCHAR(32) NOT NULL,"
+		"`ref_id` BIGINT NOT NULL DEFAULT 0,"
+		"`detail` VARCHAR(64) DEFAULT NULL,"
+		"`created_at` DATETIME NOT NULL,"
+		"PRIMARY KEY (`id`),"
+		"KEY `idx_simbot_ledger_identity_kind` (`identity_id`,`kind`,`id`),"
+		"KEY `idx_simbot_ledger_created_at` (`created_at`)"
+		") ENGINE=MyISAM DEFAULT CHARSET=latin1;"
+	);
 }

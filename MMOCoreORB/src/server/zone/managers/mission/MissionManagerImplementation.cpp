@@ -917,8 +917,7 @@ void MissionManagerImplementation::randomizeGenericDestroyMission(CreatureObject
 	mission->setTargetTemplate(templateObject);
 	mission->setTargetOptionalTemplate(lairTemplate);
 
-	int reward = destroyMissionBaseReward + destroyMissionDifficultyRewardFactor * difficultyLevel;
-	reward += System::random(destroyMissionRandomReward) + System::random(destroyMissionDifficultyRandomReward * difficultyLevel);
+	int reward = rollDestroyMissionReward(difficultyLevel);
 	mission->setRewardCredits(reward);
 
 	mission->setMissionDifficulty(difficultyLevel, diffDisplay, difficulty);
@@ -2329,6 +2328,34 @@ int MissionManagerImplementation::getRealBountyReward(CreatureObject* creo, Play
 			return 25000;
 	}
 	return bounty->getReward();
+}
+
+int MissionManagerImplementation::rollDestroyMissionReward(int difficultyLevel) {
+	if (difficultyLevel < 1)
+		difficultyLevel = 1;
+
+	int reward = destroyMissionBaseReward +
+		destroyMissionDifficultyRewardFactor * difficultyLevel;
+	reward += System::random(destroyMissionRandomReward) +
+		System::random(destroyMissionDifficultyRandomReward * difficultyLevel);
+	return reward;
+}
+
+int MissionManagerImplementation::getDestroyMissionRewardMin(int difficultyLevel) {
+	if (difficultyLevel < 1)
+		difficultyLevel = 1;
+
+	return destroyMissionBaseReward +
+		destroyMissionDifficultyRewardFactor * difficultyLevel;
+}
+
+int MissionManagerImplementation::getDestroyMissionRewardMax(int difficultyLevel) {
+	if (difficultyLevel < 1)
+		difficultyLevel = 1;
+
+	return getDestroyMissionRewardMin(difficultyLevel) +
+		destroyMissionRandomReward +
+		destroyMissionDifficultyRandomReward * difficultyLevel;
 }
 
 String MissionManagerImplementation::getRandomBountyPlanet() {

@@ -243,6 +243,7 @@ private:
 	PveBuffProviders pveBuffProviders;
 	bool pveNeedDoctorBuff;
 	bool pveNeedEntertainerBuff;
+	bool pveDoctorFeeReserved;
 	bool pveDoctorFallbackNeeded;
 	bool pveEntertainerFallbackNeeded;
 	bool pveBuffProviderApproachActive;

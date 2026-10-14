@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.9.9` | 14 | F_0.9.2 P.10c: mission credits and the holdings journal — roster PlayerBots are paid the stock destroy-mission reward into an identity-keyed bank balance, every change to what a bot holds is journaled in simbot_ledger (schema 1014), and a doctor-buff fee is the first credit sink; both gates default-off |
 | `0.9.8` | 14 | F_0.9.8 P.10i: lair tactics and mission graduation — PlayerBots complete destroy missions end to end: overland fallback and stock-style lair placement, graduation at box 4, lair hold with wave break-off and de-aggro, progression-first dispatch, travel combat with a one-leg flee cap, attacker recognition, area-attack lair guard and lair retreat defense; the proven gates ship on |
 | `0.9.7` | 10 | F_0.9.7 P.10h: skill-derived combat abilities — a PlayerBot's attack list is built from its trained boxes (highest tier only), specials cost real HAM under a spend-scoped reserve, a free control ability is used before the special roll, plus per-bot REST inspection, a dashboard drawer and `/server playerinfo`; all gates default-off |
 | `0.9.6` | 10 | F_0.9.6 P.10g + F_0.9.6-D1: novice PlayerBot early-game loop — city-spawner roaming, level-band TTK targeting, all-attackers self-defence, bounded unreachable-target skip set, 800-HAM heal-on-death novices, kill-XP drop observability and gated sim-combat diagnostics; all gates default-off |
@@ -27,6 +28,11 @@
 
 # Changelog Summary
 
+- **v0.9.9 (Mission Credits and the Holdings Journal, F_0.9.2 P.10c - Week 14, 14-10-2026)**:
+  - **Bots are paid for missions.** A roster PlayerBot that destroys its mission lair receives the stock destroy-mission reward (375 x lair level plus up to 15 x level on this server) into its bank balance in the progression store. The formula has one owner, `MissionManager::rollDestroyMissionReward`, which the stock generator now calls too.
+  - **Holdings model and journal.** The plan fixes ten rules for anything a bot owns (identity-keyed, nothing durable on the body, one authority and one API per kind, reserve then commit or release). Every credit change writes a row to `simbot_ledger` (schema 1014) in the same flush as the balance; a mismatch after a crash is closed with a visible `reconcile` row.
+  - **First credit sink.** A configurable doctor-buff fee is reserved when a buff-up starts and charged when doctor buffs land; a bot that cannot pay goes without them.
+  - **Verified live.** 27 of 27 lair completions paid inside the stock range; balances equal journal sums in MySQL for all six bots; 7 fee charges with matching journal rows. Both gates ship off.
 - **v0.9.8 (Lair Tactics and Mission Graduation, F_0.9.8 P.10i - Week 14, 13-10-2026)**:
   - **The mission loop completes for the first time.** Overland fallback when recast returns a partial path, a bounded lair-reveal defer, stalled-leg recovery, and a destroyed-lair counter that counts kills. Planned bots graduate to missions at box 4 of one brawler or marksman line.
   - **Lair fights follow the owner's wave rules.** Held engagement (was rebuilt up to 136 times a mission), break off and clear each new wave, shed the previous wave's aggro, keep area specials off the lair, and keep running or fight back during a retreat.

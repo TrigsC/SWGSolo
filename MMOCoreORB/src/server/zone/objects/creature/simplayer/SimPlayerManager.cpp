@@ -15,6 +15,7 @@
 #include "SimBotDispatchPolicy.h"
 #include "SimHunterTravelDiag.h"
 #include "SimBotAreaAttackGuard.h"
+#include "SimBotMissionCredits.h"
 
 #include <vector>
 #include "StructureTraversalDiagLog.h"
@@ -58,6 +59,7 @@
 #include "server/zone/managers/resource/ResourceManager.h"
 #include "server/zone/managers/resource/resourcespawner/ResourceSpawner.h"
 #include "server/zone/managers/resource/resourcespawner/resourcemap/ResourceMap.h"
+#include "server/zone/managers/mission/MissionManager.h"
 #include "server/zone/managers/aieconomy/AiEconomyManager.h"
 #include "server/zone/managers/auction/AuctionManager.h"
 #include "server/zone/managers/auction/AuctionsMap.h"
@@ -6184,6 +6186,9 @@ void SimPlayerManager::loadLuaConfig() {
 	progressionDbProbeBackoffMs = 5000;
 	progressionFlushIntervalSeconds = 60;
 	progressionAwardKillXp = false;
+	progressionAwardMissionCredits = false;
+	progressionBuffPaymentEnabled = false;
+	progressionDoctorFeeCredits = 0;
 	progressionTrainingEnabled = false;
 	progressionEarlyGameEnabled = false;
 	progressionCombatAbilitiesEnabled = false;
@@ -6199,13 +6204,19 @@ void SimPlayerManager::loadLuaConfig() {
 	}
 	progressionReaperEnabled = false;
 	progressionReaperMinAgeSeconds = 3600;
+	progressionLedgerRetentionDays = 30;
+	progressionLedgerLastPruneMs = 0;
 	progressionFaultFlushDelayMs = 0;
 	progressionFaultFailNextFlush = false;
+	progressionFaultFailLedgerInsert = false;
 	{
 		Locker progressionLock(&progressionMutex);
 		progressionRecords.removeAll();
 		progressionDirtyIds.removeAll();
 		progressionRetiringIds.removeAll();
+		progressionLedgerPending.removeAll();
+		progressionRecentLedger.removeAll();
+		progressionBuffFeeReservations.removeAll();
 		progressionOrphanIds.removeAll();
 		progressionTrainingPlans.removeAll();
 		progressionEarlyGameWeaponsByXpType.removeAll();
@@ -6236,6 +6247,7 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestIdentityIds.removeAll();
 		playerBotParityTestBodyOids.removeAll();
 		playerBotParityTestOracle.removeAll();
+		playerBotParityTestCreditBaselines.removeAll();
 		playerBotParityTestRequestRefs.removeAll();
 		playerBotParityTestCounterBaselines.removeAll();
 		{
@@ -6277,6 +6289,18 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestCombatAbilitiesGateOverrideActive = false;
 		playerBotParityTestCombatAbilitiesGateOverridePreviousActive = false;
 		playerBotParityTestCombatAbilitiesGateOverridePrevious = false;
+		playerBotParityTestMissionCreditGateOverrideActive = false;
+		playerBotParityTestMissionCreditGateOverridePreviousActive = false;
+		playerBotParityTestMissionCreditGateOverridePrevious = false;
+		playerBotParityMissionCreditScopedIds.removeAll();
+		playerBotParityTestBuffPaymentGateOverrideActive = false;
+		playerBotParityTestBuffPaymentGateOverridePreviousActive = false;
+		playerBotParityTestBuffPaymentGateOverridePrevious = false;
+		playerBotParityTestBuffFeeOverrideActive = false;
+		playerBotParityTestBuffFeeOverride = 0;
+		playerBotParityTestBuffFeeOverridePreviousActive = false;
+		playerBotParityTestBuffFeeOverridePrevious = 0;
+		playerBotParityBuffPaymentScopedIds.removeAll();
 		playerBotParityTestCombatAbilityChanceOverrideActive = false;
 		playerBotParityTestCombatAbilityChanceOverride = 35;
 		playerBotParityTestCombatAbilityChanceOverridePreviousActive = false;
@@ -8648,6 +8672,18 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 	progressionEnabled = config.getBooleanField("enabled", progressionEnabled);
 	progressionAwardKillXp = config.getBooleanField("awardKillXp",
 		progressionAwardKillXp);
+	progressionAwardMissionCredits = config.getBooleanField(
+		"awardMissionCredits", progressionAwardMissionCredits);
+	LuaObject buffPayment = config.getObjectField("buffPayment");
+	if (buffPayment.isValidTable()) {
+		progressionBuffPaymentEnabled = buffPayment.getBooleanField(
+			"enabled", progressionBuffPaymentEnabled);
+		// Zero is a real value here (no charge), so no clampMinerInt.
+		progressionDoctorFeeCredits = clampIntRange(
+			buffPayment.getIntField("doctorFeeCredits",
+				progressionDoctorFeeCredits), 0, 1000000);
+	}
+	buffPayment.pop();
 	progressionTrainingEnabled = config.getBooleanField("trainingEnabled",
 		progressionTrainingEnabled);
 	progressionEarlyGameEnabled = config.getBooleanField("earlyGameEnabled",
@@ -8922,6 +8958,10 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		config.getIntField("flushIntervalSeconds",
 			progressionFlushIntervalSeconds), progressionFlushIntervalSeconds,
 		5, 3600);
+	// Zero means keep forever, so no clampMinerInt.
+	progressionLedgerRetentionDays = clampIntRange(
+		config.getIntField("ledgerRetentionDays",
+			progressionLedgerRetentionDays), 0, 3650);
 
 	LuaObject reaper = config.getObjectField("reaper");
 	if (reaper.isValidTable()) {
@@ -8958,6 +8998,15 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	if (step.skillMod.isEmpty())
 		step.skillMod = table.getStringField("mod").trim();
 	step.amount = table.getLongField("amount", 0);
+	step.difficultyLevel = clampMinerInt(table.getIntField("difficultyLevel", 1),
+		1, 1, 1000);
+	step.missions = clampMinerInt(table.getIntField("missions", 1), 1, 1, 1000000);
+	step.feeCredits = clampMinerInt(table.getIntField("feeCredits", 0), 0, 0,
+		1000000);
+	step.repeat = table.getBooleanField("repeatCall", false);
+	step.expectDisposition = table.getStringField("expectDisposition").trim();
+	step.expectRepeatDisposition = table.getStringField(
+		"expectRepeatDisposition").trim();
 	step.baseXp = table.getSignedIntField("baseXp", 0);
 	step.totalDamage = static_cast<uint32>(table.getLongField(
 		"totalDamage", 0));
@@ -9055,6 +9104,7 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.force = table.getBooleanField("force", false);
 	step.flushDelayMs = table.getIntField("flushDelayMs", 0);
 	step.failNextFlush = table.getBooleanField("failNextFlush", false);
+	step.faultFailLedgerInsert = table.getBooleanField("failLedgerInsert", false);
 	step.budgetMs = table.getIntField("budgetMs", 0);
 	step.async = table.getBooleanField("async", false);
 	step.requestRef = table.getStringField("requestRef").trim();
@@ -9077,6 +9127,8 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	if (!step.hasExpectedRosterWithoutRecord)
 		step.expectedRosterWithoutRecord = -1;
 	step.expectedDelta = table.getLongField("delta", 0);
+	step.hasLedgerDelta = step.expectedDelta != 0;
+	step.ledgerCount = table.getIntField("count", 0);
 	step.requestBudgetMs = table.getIntField("requestBudgetMs", 30000);
 	if (step.requestBudgetMs < 100)
 		step.requestBudgetMs = 100;
@@ -10524,6 +10576,9 @@ static String pveSqlValue(const String& value) {
 	return "'" + escaped + "'";
 }
 
+static String pveMissionCreditDispositionName(
+		PveMissionCreditDisposition disposition);
+
 static String progressionAwardSource(const String& source) {
 	String bounded = source.trim();
 	if (bounded.length() > 32)
@@ -10547,6 +10602,76 @@ static SimBotProgression progressionFromResult(ResultSet* result) {
 void SimPlayerManager::markProgressionDirtyLocked(uint64 identityId) {
 	if (identityId != 0 && !progressionRetiringIds.contains(identityId))
 		progressionDirtyIds.put(identityId, true);
+}
+
+void SimPlayerManager::appendPlayerBotLedgerEntryLocked(uint64 identityId,
+		bool bank, int64 delta, int64 balanceAfter, const String& source,
+		uint64 refId, const String& detail) {
+	if (identityId == 0)
+		return;
+
+	SimBotLedgerEntry entry;
+	entry.identityId = identityId;
+	entry.kind = bank ? "credits_bank" : "credits_cash";
+	entry.delta = delta;
+	entry.balanceAfter = balanceAfter;
+	entry.source = progressionAwardSource(source);
+	entry.refId = refId;
+	entry.detail = detail.trim();
+	if (entry.detail.length() > 64)
+		entry.detail = entry.detail.subString(0, 64);
+	entry.createdAtMs = System::getMiliTime();
+
+	static const int LEDGER_PENDING_CAP = 10000;
+	if (progressionLedgerPending.size() >= LEDGER_PENDING_CAP) {
+		progressionLedgerPending.remove(0);
+		progressionLedgerDropped.increment();
+	}
+	progressionLedgerPending.add(entry);
+
+	if (!progressionRecentLedger.contains(identityId))
+		progressionRecentLedger.put(identityId, Vector<SimBotLedgerEntry>());
+	Vector<SimBotLedgerEntry>& recent = progressionRecentLedger.get(identityId);
+	recent.add(entry);
+	while (recent.size() > 5)
+		recent.remove(0);
+}
+
+void SimPlayerManager::dropPlayerBotLedgerEntriesLocked(uint64 identityId) {
+	progressionBuffFeeReservations.drop(identityId);
+	for (int i = progressionLedgerPending.size() - 1; i >= 0; --i) {
+		if (progressionLedgerPending.get(i).identityId == identityId)
+			progressionLedgerPending.remove(i);
+	}
+	progressionRecentLedger.drop(identityId);
+}
+
+void SimPlayerManager::prunePlayerBotLedger(uint64 nowMs) {
+	if (!progressionDbAvailable || progressionLedgerRetentionDays <= 0)
+		return;
+	if (progressionLedgerLastPruneMs != 0 &&
+			nowMs - progressionLedgerLastPruneMs < 86400000)
+		return;
+
+	try {
+		String prune =
+			"DELETE ledger FROM `simbot_ledger` ledger "
+			"LEFT JOIN (SELECT `identity_id`,`kind`,MAX(`id`) AS `latest_id` "
+			"FROM `simbot_ledger` GROUP BY `identity_id`,`kind`) latest ON "
+			"latest.`identity_id`=ledger.`identity_id` AND "
+			"latest.`kind`=ledger.`kind` "
+			"WHERE ledger.`created_at` < DATE_SUB(NOW(), INTERVAL " +
+			String::valueOf(progressionLedgerRetentionDays) +
+			" DAY) AND ledger.`source` <> 'reconcile' AND "
+			"(latest.`latest_id` IS NULL OR ledger.`id` <> latest.`latest_id`);";
+		UniqueReference<ResultSet*> result(
+			ServerDatabase::instance()->executeQuery(prune));
+		(void)result;
+		Locker progressionLock(&progressionMutex);
+		progressionLedgerLastPruneMs = nowMs;
+	} catch (const Exception& e) {
+		error("SimPlayerLedgerRetentionFailed: " + e.getMessage());
+	}
 }
 
 void SimPlayerManager::loadPlayerBotProgressionStore() {
@@ -10603,6 +10728,39 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 					loaded.get(identityId).skills.add(skillName);
 		}
 
+		Vector<SimBotLedgerEntry> mismatches;
+		UniqueReference<ResultSet*> ledgerResult(
+			ServerDatabase::instance()->executeQuery(
+				"SELECT latest.`identity_id`,latest.`kind`,latest.`balance_after` "
+				"FROM `simbot_ledger` latest INNER JOIN (SELECT `identity_id`,"
+				"`kind`,MAX(`id`) AS `latest_id` FROM `simbot_ledger` GROUP BY "
+				"`identity_id`,`kind`) newest ON latest.`id`=newest.`latest_id` "
+				"ORDER BY latest.`identity_id`,`kind`;"));
+		if (ledgerResult == nullptr)
+			throw Exception("progression ledger query returned no result");
+		while (ledgerResult->next()) {
+			uint64 identityId = ledgerResult->getUnsignedLong(0);
+			String kind = pveRosterResultString(ledgerResult, 1);
+			if (!loaded.contains(identityId) ||
+					(kind != "credits_bank" && kind != "credits_cash"))
+				continue;
+			int64 balance = kind == "credits_bank" ?
+				loaded.get(identityId).bankCredits :
+				loaded.get(identityId).cashCredits;
+			int64 balanceAfter = ledgerResult->getLong(2);
+			if (balance == balanceAfter)
+				continue;
+			SimBotLedgerEntry entry;
+			entry.identityId = identityId;
+			entry.kind = kind;
+			entry.delta = balance - balanceAfter;
+			entry.balanceAfter = balance;
+			entry.source = "reconcile";
+			entry.detail = "kind=" + kind;
+			entry.createdAtMs = System::getMiliTime();
+			mismatches.add(entry);
+		}
+
 		Vector<uint64> derivedSpendChanged;
 		for (int i = 0; i < loaded.size(); ++i) {
 			SimBotProgression& progression = loaded.elementAt(i).getValue();
@@ -10620,6 +10778,13 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 			progressionOrphanIds.removeAll();
 			for (int i = 0; i < derivedSpendChanged.size(); ++i)
 				markProgressionDirtyLocked(derivedSpendChanged.get(i));
+			for (int i = 0; i < mismatches.size(); ++i) {
+				const SimBotLedgerEntry& entry = mismatches.get(i);
+				appendPlayerBotLedgerEntryLocked(entry.identityId,
+					entry.kind == "credits_bank", entry.delta,
+					entry.balanceAfter, entry.source, entry.refId, entry.detail);
+				progressionLedgerBalanceMismatch.increment();
+			}
 		}
 
 		progressionLoaded = true;
@@ -10737,6 +10902,28 @@ bool SimPlayerManager::playerBotProgressionAwardGateEnabled() {
 	return true;
 }
 
+bool SimPlayerManager::playerBotMissionCreditGateEnabled(uint64 identityId) {
+	if (!progressionEnabled)
+		return false;
+	Locker parityLock(&playerBotParityTestMutex);
+	if (identityId != 0 &&
+			playerBotParityTestMissionCreditGateOverrideActive &&
+			playerBotParityMissionCreditScopedIds.contains(identityId))
+		return playerBotParityTestMissionCreditGateOverride;
+	return progressionAwardMissionCredits;
+}
+
+bool SimPlayerManager::playerBotBuffPaymentGateEnabled(uint64 identityId) {
+	if (!progressionEnabled)
+		return false;
+	Locker parityLock(&playerBotParityTestMutex);
+	if (identityId != 0 &&
+			playerBotParityTestBuffPaymentGateOverrideActive &&
+			playerBotParityBuffPaymentScopedIds.contains(identityId))
+		return playerBotParityTestBuffPaymentGateOverride;
+	return progressionBuffPaymentEnabled;
+}
+
 bool SimPlayerManager::playerBotCombatAbilitiesGateEnabled(uint64 identityId) {
 	// Same shape as playerBotTrainingGateEnabled - master gate, harness override,
 	// configured flag - with one difference: the override is identity-scoped.
@@ -10821,6 +11008,10 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 		String armingOp;
 		if (gate == "trainingEnabled")
 			armingOp = "setTrainingGate";
+		else if (gate == "awardMissionCredits")
+			armingOp = "setMissionCreditGate";
+		else if (gate == "buffPayment")
+			armingOp = "setBuffPaymentGate";
 		else if (gate == "earlyGameEnabled")
 			armingOp = "setEarlyGameGate";
 		else if (gate == "realWeaponDamage")
@@ -10846,6 +11037,10 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 		bool live = false;
 		if (gate == "awardKillXp")
 			live = isPlayerBotKillXpEnabled();
+		else if (gate == "awardMissionCredits")
+			live = playerBotMissionCreditGateEnabled(0);
+		else if (gate == "buffPayment")
+			live = playerBotBuffPaymentGateEnabled(0);
 		else if (gate == "trainingEnabled")
 			live = playerBotTrainingGateEnabled();
 		else if (gate == "earlyGameEnabled")
@@ -11114,22 +11309,33 @@ bool SimPlayerManager::grantPlayerBotExperience(uint64 identityId,
 }
 
 bool SimPlayerManager::grantPlayerBotCredits(uint64 identityId, int64 amount,
-		bool bank, const String& source) {
+		bool bank, const String& source, uint64 refId, const String& detail,
+		String* refusalOut) {
+	if (refusalOut != nullptr)
+		*refusalOut = "";
 	if (!playerBotProgressionAwardGateEnabled()) {
 		progressionAwardsRejectedDisabled.increment();
+		if (refusalOut != nullptr)
+			*refusalOut = "disabled";
 		return false;
 	}
 	if (identityId == 0) {
 		progressionAwardsRejectedNoIdentity.increment();
+		if (refusalOut != nullptr)
+			*refusalOut = "no_identity";
 		return false;
 	}
 	Locker progressionLock(&progressionMutex);
 	if (!progressionRecords.contains(identityId)) {
 		progressionAwardsRejectedNoRecord.increment();
+		if (refusalOut != nullptr)
+			*refusalOut = "no_record";
 		return false;
 	}
 	if (amount <= 0) {
 		progressionAwardsRejectedInvalidAmount.increment();
+		if (refusalOut != nullptr)
+			*refusalOut = "invalid_amount";
 		return false;
 	}
 
@@ -11141,13 +11347,16 @@ bool SimPlayerManager::grantPlayerBotCredits(uint64 identityId, int64 amount,
 	progression.lastAwardMs = System::getMiliTime();
 	progression.lastAwardSource = progressionAwardSource(source);
 	progression.awardsTotal++;
+	appendPlayerBotLedgerEntryLocked(identityId, bank, amount,
+		bank ? progression.bankCredits : progression.cashCredits, source, refId,
+		detail);
 	markProgressionDirtyLocked(identityId);
 	progressionAwardsAccepted.increment();
 	return true;
 }
 
 bool SimPlayerManager::spendPlayerBotCredits(uint64 identityId, int64 amount,
-		bool bank, const String& source) {
+		bool bank, const String& source, uint64 refId, const String& detail) {
 	if (!playerBotProgressionAwardGateEnabled()) {
 		progressionAwardsRejectedDisabled.increment();
 		return false;
@@ -11168,7 +11377,9 @@ bool SimPlayerManager::spendPlayerBotCredits(uint64 identityId, int64 amount,
 
 	SimBotProgression& progression = progressionRecords.get(identityId);
 	int64& balance = bank ? progression.bankCredits : progression.cashCredits;
-	if (balance < amount) {
+	int64 reserved = bank && progressionBuffFeeReservations.contains(identityId) ?
+		progressionBuffFeeReservations.get(identityId) : 0;
+	if (balance - reserved < amount) {
 		progressionAwardsRejectedInsufficient.increment();
 		return false;
 	}
@@ -11176,9 +11387,89 @@ bool SimPlayerManager::spendPlayerBotCredits(uint64 identityId, int64 amount,
 	progression.lastAwardMs = System::getMiliTime();
 	progression.lastAwardSource = progressionAwardSource(source);
 	progression.awardsTotal++;
+	appendPlayerBotLedgerEntryLocked(identityId, bank, -amount, balance, source,
+		refId, detail);
 	markProgressionDirtyLocked(identityId);
 	progressionAwardsAccepted.increment();
 	return true;
+}
+
+PlayerBotBuffFee SimPlayerManager::reservePlayerBotDoctorBuffFee(
+		uint64 identityId) {
+	if (!playerBotBuffPaymentGateEnabled(identityId) || identityId == 0)
+		return PLAYER_BOT_BUFF_FEE_NOT_CHARGED;
+	int configuredFee = progressionDoctorFeeCredits;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (playerBotParityTestBuffFeeOverrideActive &&
+				playerBotParityBuffPaymentScopedIds.contains(identityId))
+			configuredFee = playerBotParityTestBuffFeeOverride;
+	}
+
+	Locker progressionLock(&progressionMutex);
+	if (!progressionRecords.contains(identityId) || configuredFee <= 0)
+		return PLAYER_BOT_BUFF_FEE_NOT_CHARGED;
+
+	// A new buff-up replaces a stale reservation for this identity. There is
+	// intentionally only one reservation per identity, so the old amount is
+	// returned to the spendable balance before affordability is checked.
+	progressionBuffFeeReservations.drop(identityId);
+	SimBotProgression& progression = progressionRecords.get(identityId);
+	int64 fee = configuredFee;
+	if (progression.bankCredits < fee) {
+		buffPaymentSkippedUnaffordable.increment();
+		return PLAYER_BOT_BUFF_FEE_UNAFFORDABLE;
+	}
+	progressionBuffFeeReservations.put(identityId, fee);
+	return PLAYER_BOT_BUFF_FEE_RESERVED;
+}
+
+bool SimPlayerManager::commitPlayerBotDoctorBuffFee(uint64 identityId) {
+	int64 fee = 0;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (!progressionBuffFeeReservations.contains(identityId))
+			return false;
+		fee = progressionBuffFeeReservations.get(identityId);
+		progressionBuffFeeReservations.drop(identityId);
+	}
+
+	// Recheck outside progressionMutex: the gate takes the parity mutex and
+	// must never be nested beneath the progression lock.
+	if (!playerBotBuffPaymentGateEnabled(identityId)) {
+		buffPaymentReleasedGateOff.increment();
+		return false;
+	}
+
+	Locker progressionLock(&progressionMutex);
+	if (!progressionRecords.contains(identityId)) {
+		buffPaymentChargeFailed.increment();
+		return false;
+	}
+	SimBotProgression& progression = progressionRecords.get(identityId);
+	if (progression.bankCredits < fee) {
+		buffPaymentChargeFailed.increment();
+		return false;
+	}
+	progression.bankCredits -= fee;
+	progression.lastAwardMs = System::getMiliTime();
+	progression.lastAwardSource = progressionAwardSource("doctor_buff");
+	progression.awardsTotal++;
+	appendPlayerBotLedgerEntryLocked(identityId, true, -fee,
+		progression.bankCredits, "doctor_buff", 0, String());
+	markProgressionDirtyLocked(identityId);
+	progressionAwardsAccepted.increment();
+	buffPaymentCharged.increment();
+	buffPaymentCreditsSpent.add(static_cast<uint64>(fee));
+	return true;
+}
+
+void SimPlayerManager::releasePlayerBotDoctorBuffFee(uint64 identityId) {
+	Locker progressionLock(&progressionMutex);
+	if (!progressionBuffFeeReservations.contains(identityId))
+		return;
+	progressionBuffFeeReservations.drop(identityId);
+	buffPaymentReleased.increment();
 }
 
 bool SimPlayerManager::recordPlayerBotSkill(uint64 identityId,
@@ -12372,12 +12663,16 @@ void SimPlayerManager::runPlayerBotProgressionReaper(uint64 nowMs, bool force) {
 				"DELETE FROM `simbot_skills` WHERE `identity_id`=" +
 				String::valueOf(identityId) + ";");
 			deleteResult = ServerDatabase::instance()->executeQuery(
+				"DELETE FROM `simbot_ledger` WHERE `identity_id`=" +
+				String::valueOf(identityId) + ";");
+			deleteResult = ServerDatabase::instance()->executeQuery(
 				"DELETE FROM `simbot_progression` WHERE `identity_id`=" +
 				String::valueOf(identityId) + ";");
 
 			Locker progressionLock(&progressionMutex);
 			progressionRecords.drop(identityId);
 			progressionDirtyIds.drop(identityId);
+			dropPlayerBotLedgerEntriesLocked(identityId);
 			for (int j = progressionOrphanIds.size() - 1; j >= 0; --j) {
 				if (progressionOrphanIds.get(j) == identityId)
 					progressionOrphanIds.remove(j);
@@ -12396,7 +12691,7 @@ void SimPlayerManager::runPlayerBotProgressionReaper(uint64 nowMs, bool force) {
 }
 
 void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
-		int faultDelayMs, bool faultFailNext) {
+		int faultDelayMs, bool faultFailNext, bool faultFailLedgerInsert) {
 	if (!progressionEnabled || !progressionLoaded)
 		return;
 
@@ -12431,6 +12726,7 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 		return;
 
 	VectorMap<uint64, SimBotProgression> batch;
+	Vector<SimBotLedgerEntry> ledgerBatch;
 	bool failNextFlush = false;
 	{
 		Locker progressionLock(&progressionMutex);
@@ -12444,10 +12740,50 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 				batch.put(identityId, progressionRecords.get(identityId));
 		}
 		progressionDirtyIds.removeAll();
+		ledgerBatch = progressionLedgerPending;
+		progressionLedgerPending.removeAll();
 	}
 	// Faults arrive as arguments from the FlushNow request that armed them; a
 	// routine maintenance flush passes none and can never steal one.
 	failNextFlush = faultFailNext;
+
+	// MyISAM has no transaction spanning the journal and the balance. Insert
+	// every journal row first. If one insert fails, only rows not yet inserted
+	// are requeued; rows already in MySQL must never be duplicated on retry.
+	for (int i = 0; i < ledgerBatch.size(); ++i) {
+		const SimBotLedgerEntry& entry = ledgerBatch.get(i);
+		try {
+			if (i == 0 && faultFailLedgerInsert)
+				throw Exception("player bot parity injected ledger insert failure");
+			String ledgerInsert = "INSERT INTO `simbot_ledger` "
+				"(`identity_id`,`kind`,`delta`,`balance_after`,`source`,`ref_id`,"
+				"`detail`,`created_at`) VALUES (" +
+				String::valueOf(entry.identityId) + ",'" +
+				entry.kind.escapeString() + "'," +
+				String::valueOf(entry.delta) + "," +
+				String::valueOf(entry.balanceAfter) + ",'" +
+				entry.source.escapeString() + "'," +
+				String::valueOf(entry.refId) + "," +
+				pveSqlValue(entry.detail) + ",NOW());";
+			UniqueReference<ResultSet*> ledgerResult(
+				ServerDatabase::instance()->executeQuery(ledgerInsert));
+			(void)ledgerResult;
+			progressionLedgerWritten.increment();
+		} catch (const Exception& e) {
+			Locker progressionLock(&progressionMutex);
+			for (int pending = ledgerBatch.size() - 1; pending >= i; --pending)
+				progressionLedgerPending.add(0, ledgerBatch.get(pending));
+			for (int pending = 0; pending < batch.size(); ++pending)
+				markProgressionDirtyLocked(batch.elementAt(pending).getKey());
+			progressionDbAvailable = false;
+			progressionNextDbProbeMs = nowMs + progressionDbProbeBackoffMs;
+			progressionDbProbeBackoffMs = Math::min<uint64>(
+				progressionDbProbeBackoffMs * 2, 300000);
+			progressionFlushFailures.increment();
+			error("SimPlayerLedgerInsertFailed: " + e.getMessage());
+			return;
+		}
+	}
 
 	for (int i = 0; i < batch.size(); ++i) {
 		const SimBotProgression& progression = batch.elementAt(i).getValue();
@@ -12513,6 +12849,7 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 	}
 
 	progressionLastFlushMs = nowMs;
+	prunePlayerBotLedger(nowMs);
 	reconcilePlayerBotProgression();
 	runPlayerBotProgressionReaper(nowMs);
 }
@@ -12680,6 +13017,58 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 			}
 				break;
 			}
+			case PlayerBotProgressionRequest::AssertLedger: {
+				String query = "SELECT COUNT(*),COALESCE(SUM(`delta`),0) "
+					"FROM `simbot_ledger` WHERE `identity_id`=" +
+					String::valueOf(request.identityId);
+				if (!request.ledgerSource.isEmpty())
+					query += " AND `source`='" +
+						request.ledgerSource.escapeString() + "'";
+				if (request.ledgerDelta != 0)
+					query += " AND `delta`=" +
+						String::valueOf(request.ledgerDelta);
+				query += ";";
+				UniqueReference<ResultSet*> ledgerResult(
+					ServerDatabase::instance()->executeQuery(query));
+				if (ledgerResult != nullptr && ledgerResult->next()) {
+					request.resultFound = true;
+					request.resultValue = ledgerResult->getLong(0);
+					request.ledgerSum = ledgerResult->getLong(1);
+				}
+				UniqueReference<ResultSet*> totalLedgerResult(
+					ServerDatabase::instance()->executeQuery(
+						"SELECT COALESCE(SUM(`delta`),0) FROM `simbot_ledger` "
+						"WHERE `identity_id`=" +
+						String::valueOf(request.identityId) + ";"));
+				if (totalLedgerResult != nullptr && totalLedgerResult->next())
+					request.ledgerTotalSum = totalLedgerResult->getLong(0);
+				String latestQuery = "SELECT `balance_after` FROM `simbot_ledger` "
+					"WHERE `identity_id`=" +
+					String::valueOf(request.identityId);
+				if (!request.ledgerSource.isEmpty())
+					latestQuery += " AND `source`='" +
+						request.ledgerSource.escapeString() + "'";
+				if (request.ledgerDelta != 0)
+					latestQuery += " AND `delta`=" +
+						String::valueOf(request.ledgerDelta);
+				latestQuery += " ORDER BY `id` DESC LIMIT 1;";
+				UniqueReference<ResultSet*> latestLedgerResult(
+					ServerDatabase::instance()->executeQuery(latestQuery));
+				if (latestLedgerResult != nullptr && latestLedgerResult->next())
+					request.ledgerBalanceAfter = latestLedgerResult->getLong(0);
+				break;
+			}
+			case PlayerBotProgressionRequest::WriteBankCredits: {
+				UniqueReference<ResultSet*> update(
+					ServerDatabase::instance()->executeQuery(
+						"UPDATE `simbot_progression` SET `bank_credits`=" +
+						String::valueOf(request.requestedAmount) +
+						",`updated_at`=NOW() WHERE `identity_id`=" +
+						String::valueOf(request.identityId) + ";"));
+				(void)update;
+				request.resultFound = true;
+				break;
+			}
 			case PlayerBotProgressionRequest::InjectOrphan: {
 				uint64 orphanId = 0;
 				{
@@ -12726,10 +13115,14 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 						String::valueOf(request.identityId) + ";"));
 				(void)deleted;
 				{
-					Locker pveLock(&pveMutex);
-					pveIdentities.drop(request.identityId);
-					pveIdentityBodyOids.drop(request.identityId);
-					pveDirtyIdentityIds.drop(request.identityId);
+				Locker pveLock(&pveMutex);
+				pveIdentities.drop(request.identityId);
+				pveIdentityBodyOids.drop(request.identityId);
+				pveDirtyIdentityIds.drop(request.identityId);
+				}
+				{
+					Locker progressionLock(&progressionMutex);
+					dropPlayerBotLedgerEntriesLocked(request.identityId);
 				}
 				// The named ref is deliberately NOT pruned here. deleteIdentity is
 				// an async op whose identity is re-resolved on every poll, so
@@ -12743,6 +13136,11 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 				break;
 			}
 			case PlayerBotProgressionRequest::DeleteProgressionRow: {
+				UniqueReference<ResultSet*> deletedLedger(
+					ServerDatabase::instance()->executeQuery(
+						"DELETE FROM `simbot_ledger` WHERE `identity_id`=" +
+						String::valueOf(request.identityId) + ";"));
+				(void)deletedLedger;
 				UniqueReference<ResultSet*> deleted(
 					ServerDatabase::instance()->executeQuery(
 						"DELETE FROM `simbot_progression` WHERE `identity_id`=" +
@@ -12752,6 +13150,7 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 					Locker progressionLock(&progressionMutex);
 					progressionRecords.drop(request.identityId);
 					progressionDirtyIds.drop(request.identityId);
+					dropPlayerBotLedgerEntriesLocked(request.identityId);
 				}
 				progressionRosterWithoutRecord.increment();
 				request.resultFound = true;
@@ -12766,15 +13165,18 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 				// end-of-tick flush can never steal it.
 				int pendingFaultDelayMs = 0;
 				bool pendingFaultFail = false;
+				bool pendingFaultLedgerInsert = false;
 				{
 					Locker progressionLock(&progressionMutex);
 					pendingFaultDelayMs = progressionFaultFlushDelayMs;
 					pendingFaultFail = progressionFaultFailNextFlush;
+					pendingFaultLedgerInsert = progressionFaultFailLedgerInsert;
 					progressionFaultFlushDelayMs = 0;
 					progressionFaultFailNextFlush = false;
+					progressionFaultFailLedgerInsert = false;
 				}
 				flushPlayerBotProgressionStore(request.force, pendingFaultDelayMs,
-					pendingFaultFail);
+					pendingFaultFail, pendingFaultLedgerInsert);
 				request.resultFound = true;
 				break;
 			}
@@ -12786,6 +13188,7 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 				}
 				progressionFaultFlushDelayMs = request.faultFlushDelayMs;
 				progressionFaultFailNextFlush = request.faultFailNextFlush;
+				progressionFaultFailLedgerInsert = request.faultFailLedgerInsert;
 				request.resultFound = true;
 				break;
 			case PlayerBotProgressionRequest::WriteRestartProbe: {
@@ -13761,6 +14164,26 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 			playerBotParityTestCombatAbilityChanceOverride =
 				playerBotParityTestCombatAbilityChanceOverridePrevious;
 		}
+		if (playerBotParityTestMissionCreditGateOverrideActive) {
+			playerBotParityTestMissionCreditGateOverrideActive =
+				playerBotParityTestMissionCreditGateOverridePreviousActive;
+			playerBotParityTestMissionCreditGateOverride =
+				playerBotParityTestMissionCreditGateOverridePrevious;
+		}
+		if (playerBotParityTestBuffPaymentGateOverrideActive) {
+			playerBotParityTestBuffPaymentGateOverrideActive =
+				playerBotParityTestBuffPaymentGateOverridePreviousActive;
+			playerBotParityTestBuffPaymentGateOverride =
+				playerBotParityTestBuffPaymentGateOverridePrevious;
+		}
+		if (playerBotParityTestBuffFeeOverrideActive) {
+			playerBotParityTestBuffFeeOverrideActive =
+				playerBotParityTestBuffFeeOverridePreviousActive;
+			playerBotParityTestBuffFeeOverride =
+				playerBotParityTestBuffFeeOverridePrevious;
+		}
+		playerBotParityMissionCreditScopedIds.removeAll();
+		playerBotParityBuffPaymentScopedIds.removeAll();
 	}
 	// Outside the parity scope above on purpose: this takes pveMutex, and every
 	// reader of pveNoviceEnabled holds pveMutex first, so nesting it under the
@@ -13923,6 +14346,7 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 		playerBotParityTestIdentityIds.removeAll();
 		playerBotParityTestBodyOids.removeAll();
 		playerBotParityTestOracle.removeAll();
+		playerBotParityTestCreditBaselines.removeAll();
 			playerBotParityTestRequestRefs.removeAll();
 			playerBotParityTestIdentityRefs.removeAll();
 			playerBotParityCombatAbilityHarnessOptIns.removeAll();
@@ -14381,11 +14805,18 @@ bool SimPlayerManager::executePlayerBotParityRequestStep(
 		request.xpType = step.xpType;
 		request.faultFlushDelayMs = step.flushDelayMs;
 		request.faultFailNextFlush = step.failNextFlush;
+		request.faultFailLedgerInsert = step.faultFailLedgerInsert;
+		request.ledgerSource = step.source;
+		request.ledgerDelta = step.expectedDelta;
+		request.ledgerCount = step.ledgerCount;
+		request.requestedAmount = step.amount;
 		uint64 identityId = 0;
 		if (kind == PlayerBotProgressionRequest::ReadRow ||
 				kind == PlayerBotProgressionRequest::DeleteIdentity ||
 				kind == PlayerBotProgressionRequest::DeleteProgressionRow ||
-				kind == PlayerBotProgressionRequest::WriteRestartProbe) {
+				kind == PlayerBotProgressionRequest::WriteRestartProbe ||
+				kind == PlayerBotProgressionRequest::AssertLedger ||
+				kind == PlayerBotProgressionRequest::WriteBankCredits) {
 			if (!getPlayerBotParityIdentityId(step, identityId)) {
 				result.status = "FAIL";
 				result.failReason = "identity_not_found";
@@ -14448,16 +14879,65 @@ bool SimPlayerManager::executePlayerBotParityRequestStep(
 			playerBotParityTestIdentityRefs.put(step.identityRef,
 				request.identityId);
 	}
+	if (kind == PlayerBotProgressionRequest::MintHarnessIdentity) {
+		SimBotProgression minted;
+		int64 baseline = snapshotPlayerBotProgression(request.identityId,
+			minted) ? minted.bankCredits : 0;
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityTestCreditBaselines.put(request.identityId, baseline);
+	}
 	if (kind == PlayerBotProgressionRequest::DeleteProgressionRow) {
 		Locker parityLock(&playerBotParityTestMutex);
 		playerBotParityTestOracle.drop(request.identityId);
 	}
 	if (kind == PlayerBotProgressionRequest::ReadRow && !step.expect.isEmpty()) {
+		if (step.expect.toLowerCase() == "missing") {
+			if (request.resultFound) {
+				result.status = "FAIL";
+				result.failReason = "persisted_row_should_be_missing";
+				return true;
+			}
+		} else {
 		int64 expected = 0;
-		if (!parsePlayerBotParityExpected(step.expect, expected) ||
-				!request.resultFound || request.resultValue != expected) {
+		if (step.expect.toLowerCase() != "dynamic" &&
+				(!parsePlayerBotParityExpected(step.expect, expected) ||
+				!request.resultFound || request.resultValue != expected)) {
 			result.status = "FAIL";
 			result.failReason = "persisted_row_mismatch";
+			return true;
+		}
+		if (step.expect.toLowerCase() == "dynamic") {
+			SimBotProgression current;
+			if (!request.resultFound || !snapshotPlayerBotProgression(
+					request.identityId, current) ||
+					request.resultValue != current.bankCredits) {
+				result.status = "FAIL";
+				result.failReason = "persisted_row_mismatch";
+				return true;
+			}
+		}
+		}
+	}
+	if (kind == PlayerBotProgressionRequest::AssertLedger &&
+			(!request.resultFound || request.resultValue != step.ledgerCount)) {
+		result.status = "FAIL";
+		result.failReason = "ledger_assertion_failed found=" +
+			String::valueOf(request.resultFound ? 1 : 0) + " got=" +
+			String::valueOf(request.resultValue) + " want=" +
+			String::valueOf(step.ledgerCount);
+		return true;
+	}
+	if (kind == PlayerBotProgressionRequest::AssertLedger &&
+			(step.source == "doctor_buff" || step.source == "reconcile")) {
+		SimBotProgression current;
+		if (!snapshotPlayerBotProgression(request.identityId, current) ||
+				(step.source == "doctor_buff" && step.ledgerCount == 1 &&
+					request.ledgerBalanceAfter != current.bankCredits) ||
+				(step.source == "reconcile" &&
+					(request.ledgerBalanceAfter != current.bankCredits ||
+					request.ledgerTotalSum != current.bankCredits))) {
+			result.status = "FAIL";
+			result.failReason = "ledger_balance_after_mismatch";
 			return true;
 		}
 	}
@@ -14486,7 +14966,17 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			op == "assertTier" || op == "assertDirty" || op == "assertSource" ||
 			op == "assertAbility" || op == "assertAbilitySuperseded" ||
 			op == "assertAttackSource" || op == "assertAbilityUse" ||
-			op == "setCombatAbilitiesGate" ||
+				op == "setCombatAbilitiesGate" ||
+				op == "setMissionCreditGate" ||
+				op == "setBuffPaymentGate" ||
+				op == "reserveDoctorBuffFee" ||
+				op == "commitDoctorBuffFee" ||
+				op == "releaseDoctorBuffFee" ||
+				op == "completeMission" ||
+				op == "assertCreditDeltaInBounds" ||
+				op == "assertLedger" ||
+				op == "assertLedgerPending" ||
+				op == "writeBankCredits" ||
 			op == "destroyBody" || op == "respawnBody" ||
 			op == "assertPersisted" || op == "deleteProgressionRow" ||
 			op == "deleteIdentity" || op == "writeRestartProbe" ||
@@ -15482,7 +15972,7 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			return false;
 		if (result.status == "FAIL")
 			return true;
-		if (!request.resultFound) {
+		if (!request.resultFound && step.expect.toLowerCase() != "missing") {
 			result.status = "FAIL";
 			result.failReason = "persisted_row_missing";
 			return true;
@@ -15665,6 +16155,223 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			playerBotParityTestGateOverrideActive = true;
 			playerBotParityTestGateOverride = enabledValue != 0;
 		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "setMissionCreditGate" || op == "setBuffPaymentGate") {
+		if (identityId == 0) {
+			result.status = "FAIL";
+			result.failReason = op == "setMissionCreditGate" ?
+				String("mission_credit_gate_requires_identity") :
+				String("buff_payment_gate_requires_identity");
+			return true;
+		}
+		int64 enabledValue = 0;
+		if (step.hasGateEnabled)
+			enabledValue = step.gateEnabled ? 1 : 0;
+		else if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_capability_gate_value";
+			return true;
+		}
+		Locker parityLock(&playerBotParityTestMutex);
+		if (op == "setMissionCreditGate") {
+			if (!playerBotParityTestMissionCreditGateOverrideActive) {
+				playerBotParityTestMissionCreditGateOverridePreviousActive = false;
+				playerBotParityTestMissionCreditGateOverridePrevious =
+					progressionAwardMissionCredits;
+			}
+			playerBotParityTestMissionCreditGateOverrideActive = true;
+			playerBotParityTestMissionCreditGateOverride = enabledValue != 0;
+			playerBotParityMissionCreditScopedIds.put(identityId, true);
+		} else {
+			if (!playerBotParityTestBuffPaymentGateOverrideActive) {
+				playerBotParityTestBuffPaymentGateOverridePreviousActive = false;
+				playerBotParityTestBuffPaymentGateOverridePrevious =
+					progressionBuffPaymentEnabled;
+			}
+			playerBotParityTestBuffPaymentGateOverrideActive = true;
+			playerBotParityTestBuffPaymentGateOverride = enabledValue != 0;
+			playerBotParityBuffPaymentScopedIds.put(identityId, true);
+			if (!playerBotParityTestBuffFeeOverrideActive) {
+				playerBotParityTestBuffFeeOverridePreviousActive = false;
+				playerBotParityTestBuffFeeOverridePrevious =
+					progressionDoctorFeeCredits;
+			}
+			playerBotParityTestBuffFeeOverrideActive = true;
+			playerBotParityTestBuffFeeOverride = step.feeCredits;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "completeMission") {
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			if (!pveIdentityBodyOids.contains(identityId) ||
+					pveIdentityBodyOids.get(identityId) == 0) {
+				result.status = "FAIL";
+				result.failReason = "no_body";
+				return true;
+			}
+			bodyOid = pveIdentityBodyOids.get(identityId);
+			uint64 lairOid = 900000000000ULL + identityId;
+			PveHuntLair lair;
+			lair.identityId = identityId;
+			lair.bodyOid = bodyOid;
+			lair.lairOid = lairOid;
+			lair.offerId = pveNextMissionOfferId++;
+			lair.alive = true;
+			lair.spawnedAtMs = System::getMiliTime();
+			pveHuntLairs.put(bodyOid, lair);
+			PveBotMissionOffer offer;
+			offer.offerId = lair.offerId;
+			offer.identityId = identityId;
+			offer.bodyOid = bodyOid;
+			offer.lairOid = lairOid;
+			offer.difficultyLevel = step.difficultyLevel;
+			offer.difficulty = Math::max(0, step.difficultyLevel - 1);
+			offer.issuedAtMs = System::getMiliTime();
+			Vector<PveBotMissionOffer> offers;
+			if (pveBotMissions.contains(identityId))
+				offers = pveBotMissions.get(identityId);
+			offers.add(offer);
+			pveBotMissions.put(identityId, offers);
+		}
+
+		SimBotProgression before;
+		bool hadRecord = snapshotPlayerBotProgression(identityId, before);
+		if (!hadRecord)
+			before.identityId = identityId;
+		PveMissionCreditDisposition first =
+			onPveBotMissionLairDestroyed(bodyOid,
+				900000000000ULL + identityId);
+		PveMissionCreditDisposition second =
+			PVE_MISSION_CREDIT_NOT_COMPLETED;
+		if (step.repeat)
+			second = onPveBotMissionLairDestroyed(bodyOid,
+				900000000000ULL + identityId);
+		SimBotProgression after;
+		if (!snapshotPlayerBotProgression(identityId, after)) {
+			after = before;
+		}
+		int64 delta = after.bankCredits - before.bankCredits;
+		if (!step.expectDisposition.isEmpty() &&
+				pveMissionCreditDispositionName(first) !=
+					step.expectDisposition.toUpperCase()) {
+			result.status = "FAIL";
+			result.failReason = "mission_disposition_mismatch";
+			return true;
+		}
+		if (step.repeat && !step.expectRepeatDisposition.isEmpty() &&
+				pveMissionCreditDispositionName(second) !=
+					step.expectRepeatDisposition.toUpperCase()) {
+			result.status = "FAIL";
+			result.failReason = "mission_repeat_disposition_mismatch";
+			return true;
+		}
+		if (step.expectedDelta != 0 && delta != step.expectedDelta) {
+			result.status = "FAIL";
+			result.failReason = "mission_credit_delta_mismatch";
+			return true;
+		}
+		if (snapshotPlayerBotProgression(identityId, after)) {
+			Locker parityLock(&playerBotParityTestMutex);
+			if (playerBotParityTestOracle.contains(identityId))
+				playerBotParityTestOracle.get(identityId) = after;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertCreditDeltaInBounds") {
+		SimBotProgression progression;
+		if (!snapshotPlayerBotProgression(identityId, progression)) {
+			result.status = "FAIL";
+			result.failReason = "no_record";
+			return true;
+		}
+		int64 baseline = 0;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			if (playerBotParityTestCreditBaselines.contains(identityId))
+				baseline = playerBotParityTestCreditBaselines.get(identityId);
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		MissionManager* missionManager = zoneServer == nullptr ? nullptr :
+			zoneServer->getMissionManager();
+		if (missionManager == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "mission_manager_missing";
+			return true;
+		}
+		int missions = step.missions < 1 ? 1 : step.missions;
+		int divisor = 1;
+		int minimum = SimBotMissionCredits::dividedReward(
+			missionManager->getDestroyMissionRewardMin(step.difficultyLevel),
+			divisor);
+		int maximum = SimBotMissionCredits::dividedReward(
+			missionManager->getDestroyMissionRewardMax(step.difficultyLevel),
+			divisor);
+		int64 delta = progression.bankCredits - baseline;
+		if (delta < static_cast<int64>(minimum) * missions ||
+				delta > static_cast<int64>(maximum) * missions) {
+			result.status = "FAIL";
+			result.failReason = "mission_credit_bounds_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertLedgerPending") {
+		int64 expected = 0;
+		if (!parsePlayerBotParityExpected(step.expect, expected)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_ledger_pending_expectation";
+			return true;
+		}
+		int actual = 0;
+		{
+			Locker progressionLock(&progressionMutex);
+			for (int i = 0; i < progressionLedgerPending.size(); ++i)
+				if (progressionLedgerPending.get(i).identityId == identityId)
+					++actual;
+		}
+		if (actual != expected) {
+			result.status = "FAIL";
+			result.failReason = "ledger_pending_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "reserveDoctorBuffFee") {
+		PlayerBotBuffFee fee = reservePlayerBotDoctorBuffFee(identityId);
+		String actual = fee == PLAYER_BOT_BUFF_FEE_RESERVED ? "RESERVED" :
+			fee == PLAYER_BOT_BUFF_FEE_UNAFFORDABLE ? "UNAFFORDABLE" :
+			"NOT_CHARGED";
+		if (!step.expect.isEmpty() &&
+				actual != step.expect.toUpperCase()) {
+			result.status = "FAIL";
+			result.failReason = "buff_fee_reservation_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "commitDoctorBuffFee") {
+		if (commitPlayerBotDoctorBuffFee(identityId)) {
+			SimBotProgression actual;
+			if (snapshotPlayerBotProgression(identityId, actual)) {
+				Locker parityLock(&playerBotParityTestMutex);
+				if (playerBotParityTestOracle.contains(identityId))
+					playerBotParityTestOracle.get(identityId) = actual;
+			}
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "releaseDoctorBuffFee") {
+		releasePlayerBotDoctorBuffFee(identityId);
 		result.status = "PASS";
 		return true;
 	}
@@ -15853,6 +16560,8 @@ bool SimPlayerManager::executePlayerBotParityStep(
 	else if (op == "deleteProgressionRow") requestKind = PlayerBotProgressionRequest::DeleteProgressionRow;
 	else if (op == "runReaper") requestKind = PlayerBotProgressionRequest::RunReaper;
 	else if (op == "injectFault") requestKind = PlayerBotProgressionRequest::InjectFault;
+	else if (op == "assertLedger") requestKind = PlayerBotProgressionRequest::AssertLedger;
+	else if (op == "writeBankCredits") requestKind = PlayerBotProgressionRequest::WriteBankCredits;
 	else isRequest = false;
 	if (isRequest)
 		return executePlayerBotParityRequestStep(step, result, nowMs, requestKind);
@@ -16391,6 +17100,10 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	VectorMap<uint64, SimBotTrainingStep> nextStepSnapshot;
 	int pendingTrainingCount = 0;
 	uint64 trainingSweepCursorSnapshot = 0;
+	int ledgerPendingCount = 0;
+	int buffReservationsCount = 0;
+	uint64 ledgerLastPruneMs = 0;
+	VectorMap<uint64, Vector<SimBotLedgerEntry> > recentLedgerSnapshot;
 		{
 		Locker progressionLock(&progressionMutex);
 		records = progressionRecords;
@@ -16401,6 +17114,10 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		nextStepSnapshot = progressionTrainingNextSteps;
 		pendingTrainingCount = progressionTrainingPendingIds.size();
 		trainingSweepCursorSnapshot = trainingSweepCursor;
+		ledgerPendingCount = progressionLedgerPending.size();
+		buffReservationsCount = progressionBuffFeeReservations.size();
+		ledgerLastPruneMs = progressionLedgerLastPruneMs;
+		recentLedgerSnapshot = progressionRecentLedger;
 		lastFlushMs = progressionLastFlushMs;
 		for (int i = 0; i < records.size(); ++i)
 			lastAwardMs = Math::max(lastAwardMs,
@@ -16429,6 +17146,17 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		static_cast<uint64>((nowMs > lastFlushMs ?
 			nowMs - lastFlushMs : 0) / 1000);
 	result["flushIntervalSeconds"] = progressionFlushIntervalSeconds;
+
+	JSONSerializationType ledger = JSONSerializationType::object();
+	ledger["pending"] = ledgerPendingCount;
+	ledger["written"] = progressionLedgerWritten.get();
+	ledger["dropped"] = progressionLedgerDropped.get();
+	ledger["balanceMismatch"] = progressionLedgerBalanceMismatch.get();
+	ledger["retentionDays"] = progressionLedgerRetentionDays;
+	ledger["lastPruneAgeSeconds"] = ledgerLastPruneMs == 0 ? 0 :
+		static_cast<uint64>((nowMs > ledgerLastPruneMs ?
+			nowMs - ledgerLastPruneMs : 0) / 1000);
+	result["ledger"] = ledger;
 
 	JSONSerializationType reaper = JSONSerializationType::object();
 	reaper["enabled"] = progressionReaperEnabled;
@@ -16472,7 +17200,8 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	// Later P.10 chunks add their capability gates to this shared Lua block.
 	// Reporting absent gates as false keeps the dashboard fail-closed today.
 	gates["awardKillXp"] = isPlayerBotKillXpEnabled();
-	gates["awardMissionCredits"] = false;
+	gates["awardMissionCredits"] = playerBotMissionCreditGateEnabled(0);
+	gates["buffPayment"] = playerBotBuffPaymentGateEnabled(0);
 	gates["lootEnabled"] = false;
 	gates["groupLoot"] = false;
 	gates["trainingEnabled"] = playerBotTrainingGateEnabled();
@@ -16483,6 +17212,35 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	gates["bazaarSell"] = false;
 	gates["bazaarBuy"] = false;
 	result["gates"] = gates;
+
+	JSONSerializationType missionCredits = JSONSerializationType::object();
+	missionCredits["enabled"] = playerBotMissionCreditGateEnabled(0);
+	missionCredits["awarded"] = missionCreditsAwarded.get();
+	missionCredits["creditsTotal"] = missionCreditsTotal.get();
+	missionCredits["rejected"] = missionCreditsRejected.get();
+	missionCredits["skippedGateOff"] = missionCreditsSkippedGateOff.get();
+	missionCredits["skippedNoManager"] = missionCreditsSkippedNoManager.get();
+	missionCredits["lastAmount"] = missionCreditsLastAmount.get();
+	missionCredits["lastDifficultyLevel"] =
+		missionCreditsLastDifficultyLevel.get();
+	missionCredits["lastAwardAgeSeconds"] =
+		missionCreditsLastAwardMs.get() == 0 ? 0 :
+		static_cast<uint64>((nowMs > missionCreditsLastAwardMs.get() ?
+			nowMs - missionCreditsLastAwardMs.get() : 0) / 1000);
+	result["missionCredits"] = missionCredits;
+
+	JSONSerializationType buffPayment = JSONSerializationType::object();
+	buffPayment["enabled"] = playerBotBuffPaymentGateEnabled(0);
+	buffPayment["doctorFeeCredits"] = progressionDoctorFeeCredits;
+	buffPayment["charged"] = buffPaymentCharged.get();
+	buffPayment["creditsSpent"] = buffPaymentCreditsSpent.get();
+	buffPayment["skippedUnaffordable"] =
+		buffPaymentSkippedUnaffordable.get();
+	buffPayment["released"] = buffPaymentReleased.get();
+	buffPayment["releasedGateOff"] = buffPaymentReleasedGateOff.get();
+	buffPayment["reservedNow"] = buffReservationsCount;
+	buffPayment["chargeFailed"] = buffPaymentChargeFailed.get();
+	result["buffPayment"] = buffPayment;
 
 	int abilityBodies = 0;
 
@@ -16851,6 +17609,26 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		row["lastAwardSource"] = progression.lastAwardSource;
 		row["bodyOid"] = bodyOid;
 		row["weaponXpType"] = heldWeaponXpType;
+		JSONSerializationType recentLedger = JSONSerializationType::array();
+		if (recentLedgerSnapshot.contains(identityId)) {
+			const Vector<SimBotLedgerEntry>& entries =
+				recentLedgerSnapshot.get(identityId);
+			for (int j = 0; j < entries.size(); ++j) {
+				const SimBotLedgerEntry& entry = entries.get(j);
+				JSONSerializationType ledgerRow = JSONSerializationType::object();
+				ledgerRow["kind"] = entry.kind;
+				ledgerRow["delta"] = entry.delta;
+				ledgerRow["balanceAfter"] = entry.balanceAfter;
+				ledgerRow["source"] = entry.source;
+				ledgerRow["refId"] = entry.refId;
+				ledgerRow["detail"] = entry.detail;
+				ledgerRow["ageSeconds"] = entry.createdAtMs == 0 ? 0 :
+					static_cast<uint64>((nowMs > entry.createdAtMs ?
+						nowMs - entry.createdAtMs : 0) / 1000);
+				recentLedger.push_back(ledgerRow);
+			}
+		}
+		row["recentLedger"] = recentLedger;
 
 		JSONSerializationType experience = JSONSerializationType::object();
 		for (int j = 0; j < progression.experience.size(); ++j)
@@ -17436,6 +18214,7 @@ void SimPlayerManager::retirePveIdentity(uint64 identityId) {
 		Locker progressionLock(&progressionMutex);
 		progressionRetiringIds.put(identityId, true);
 		progressionDirtyIds.drop(identityId);
+		dropPlayerBotLedgerEntriesLocked(identityId);
 		progressionTrainingNextSteps.drop(identityId);
 		progressionTrainingPendingIds.drop(identityId);
 		progressionEarlyGameStates.drop(identityId);
@@ -17446,11 +18225,13 @@ void SimPlayerManager::retirePveIdentity(uint64 identityId) {
 			"DELETE FROM `simbot_skills` WHERE `identity_id`=" + id + ";"));
 		UniqueReference<ResultSet*> experience(ServerDatabase::instance()->executeQuery(
 			"DELETE FROM `simbot_experience` WHERE `identity_id`=" + id + ";"));
+		UniqueReference<ResultSet*> ledger(ServerDatabase::instance()->executeQuery(
+			"DELETE FROM `simbot_ledger` WHERE `identity_id`=" + id + ";"));
 		UniqueReference<ResultSet*> progression(ServerDatabase::instance()->executeQuery(
 			"DELETE FROM `simbot_progression` WHERE `identity_id`=" + id + ";"));
 		UniqueReference<ResultSet*> identity(ServerDatabase::instance()->executeQuery(
 			"DELETE FROM `simbot_identities` WHERE `id`=" + id + ";"));
-		(void)skills; (void)experience; (void)progression; (void)identity;
+		(void)skills; (void)experience; (void)ledger; (void)progression; (void)identity;
 	} catch (const Exception& e) {
 		progressionDbAvailable = false;
 		error("SimPveIdentityRetireFailed: " + e.getMessage());
@@ -20164,16 +20945,84 @@ void SimPlayerManager::finishPveHunterBuffTrip(uint64 identityId,
 		++pveBuffTripsFallback;
 }
 
-void SimPlayerManager::onPveBotMissionLairDestroyed(uint64 bodyOid,
-		uint64 lairOid) {
+static String pveMissionCreditDispositionName(
+		PveMissionCreditDisposition disposition) {
+	switch (disposition) {
+	case PVE_MISSION_CREDIT_AWARDED:
+		return "AWARDED";
+	case PVE_MISSION_CREDIT_GATE_OFF:
+		return "GATE_OFF";
+	case PVE_MISSION_CREDIT_NO_MANAGER:
+		return "NO_MANAGER";
+	case PVE_MISSION_CREDIT_REJECTED_NO_RECORD:
+		return "REJECTED_NO_RECORD";
+	case PVE_MISSION_CREDIT_REJECTED_OTHER:
+		return "REJECTED_OTHER";
+	default:
+		return "NOT_COMPLETED";
+	}
+}
+
+PveMissionCreditDisposition SimPlayerManager::awardPlayerBotMissionCredits(
+		uint64 identityId, uint64 offerId, uint64 lairOid, int difficultyLevel,
+		int divisor) {
+	PveMissionCreditDisposition disposition =
+		PVE_MISSION_CREDIT_REJECTED_OTHER;
+	int amount = 0;
+	if (!playerBotMissionCreditGateEnabled(identityId)) {
+		missionCreditsSkippedGateOff.increment();
+		disposition = PVE_MISSION_CREDIT_GATE_OFF;
+	} else {
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		MissionManager* missionManager = zoneServer == nullptr ? nullptr :
+			zoneServer->getMissionManager();
+		if (missionManager == nullptr) {
+			missionCreditsSkippedNoManager.increment();
+			disposition = PVE_MISSION_CREDIT_NO_MANAGER;
+		} else {
+			amount = SimBotMissionCredits::dividedReward(
+				missionManager->rollDestroyMissionReward(difficultyLevel), divisor);
+			String refusal;
+			if (grantPlayerBotCredits(identityId, amount, true, "mission",
+					lairOid, "level=" + String::valueOf(difficultyLevel),
+					&refusal)) {
+				missionCreditsAwarded.increment();
+				missionCreditsTotal.add(static_cast<uint64>(amount));
+				missionCreditsLastAmount = static_cast<uint64>(amount);
+				missionCreditsLastDifficultyLevel =
+					static_cast<uint64>(difficultyLevel < 1 ? 1 : difficultyLevel);
+				missionCreditsLastAwardMs = System::getMiliTime();
+				disposition = PVE_MISSION_CREDIT_AWARDED;
+			} else {
+				missionCreditsRejected.increment();
+				disposition = refusal == "no_record" ?
+					PVE_MISSION_CREDIT_REJECTED_NO_RECORD :
+					PVE_MISSION_CREDIT_REJECTED_OTHER;
+			}
+		}
+	}
+
+	MissionDiagLog::event("MISSION_CREDIT", identityId,
+		"offerId=" + String::valueOf(offerId) +
+		" difficultyLevel=" + String::valueOf(difficultyLevel) +
+		" amount=" + String::valueOf(amount) +
+		" divisor=" + String::valueOf(divisor < 1 ? 1 : divisor) +
+		" result=" + pveMissionCreditDispositionName(disposition));
+	return disposition;
+}
+
+PveMissionCreditDisposition SimPlayerManager::onPveBotMissionLairDestroyed(
+		uint64 bodyOid, uint64 lairOid) {
 	if (bodyOid == 0 || lairOid == 0)
-		return;
+		return PVE_MISSION_CREDIT_NOT_COMPLETED;
 
 	recordPveHunterMissionEnd(bodyOid, lairOid, "lair_destroyed");
 
 	uint64 identityId = 0;
 	bool missionCompleted = false;
 	bool trackedMissionLair = false;
+	uint64 offerId = 0;
+	int difficultyLevel = 1;
 	// DIAGNOSTIC (built under MissionDiagLog gate): the completion counter only
 	// fires when a stored offer matches BOTH bodyOid and lairOid, while the
 	// lair-cleaned counter fires on the pveHuntLairs key alone -- so 10 cleaned /
@@ -20186,7 +21035,7 @@ void SimPlayerManager::onPveBotMissionLairDestroyed(uint64 bodyOid,
 		if (pveHuntLairs.contains(bodyOid) &&
 				pveHuntLairs.get(bodyOid).lairOid == lairOid) {
 			if (pveHuntLairs.get(bodyOid).cleanupQueued)
-				return;
+				return PVE_MISSION_CREDIT_NOT_COMPLETED;
 			trackedMissionLair = true;
 			identityId = pveHuntLairs.get(bodyOid).identityId;
 			pveHuntLairs.drop(bodyOid);
@@ -20211,6 +21060,8 @@ void SimPlayerManager::onPveBotMissionLairDestroyed(uint64 bodyOid,
 					continue;
 				identityId = pveBotMissions.elementAt(i).getKey();
 				offer.completed = true;
+				offerId = offer.offerId;
+				difficultyLevel = offer.difficultyLevel;
 				missionCompleted = true;
 				break;
 			}
@@ -20249,7 +21100,13 @@ void SimPlayerManager::onPveBotMissionLairDestroyed(uint64 bodyOid,
 	else if (trackedMissionLair)
 		MissionDiagLog::event("LAIR_DESTROYED_CREDIT", identityId,
 			"bodyOid=" + String::valueOf(bodyOid) +
-			" lairOid=" + String::valueOf(lairOid));
+				" lairOid=" + String::valueOf(lairOid));
+
+	PveMissionCreditDisposition disposition =
+		PVE_MISSION_CREDIT_NOT_COMPLETED;
+	if (missionCompleted)
+		disposition = awardPlayerBotMissionCredits(identityId, offerId, lairOid,
+			difficultyLevel, 1);
 
 	Reference<SimPlayerController*> ctrl = controllers.contains(bodyOid) ?
 		controllers.get(bodyOid) : nullptr;
@@ -20261,6 +21118,7 @@ void SimPlayerManager::onPveBotMissionLairDestroyed(uint64 bodyOid,
 	info("SimPveBotMissionLairDestroyed body=" + String::valueOf(bodyOid) +
 		" lair=" + String::valueOf(lairOid) + " completed=" +
 		String::valueOf(missionCompleted), true);
+	return disposition;
 }
 
 bool SimPlayerManager::getPveBotMissionOffer(uint64 identityId,

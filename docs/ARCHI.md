@@ -227,6 +227,12 @@ no new warnings before handing work back** (owner-stated standard).
   exception to default-off, taken after the live runs. The `playerBotProgression`
   master gates and `pveConfig.novice` stay off in the commit, so a fresh checkout
   still runs no progression bots until those are armed.
+  F_0.9.2 (v0.9.9) adds `playerBotProgression.awardMissionCredits`,
+  `buffPayment` (`enabled`, `doctorFeeCredits`, zero = no charge) and
+  `ledgerRetentionDays` (zero = keep forever); both gates default off.
+  **The running server re-reads this file from disk on its own**: a syntax error in
+  the working copy is hit live within seconds (it keeps the previous config), so
+  `luac -p` any edit immediately.
   This is the primary place new simulation features expose owner-tunable,
   default-off gates.
 - **`MMOCoreORB/bin/conf/features.lua`** — global feature flags.
@@ -910,6 +916,35 @@ This is this fork's primary custom subsystem, layered on top of the stock
   `SimBotAreaAttackGuard.h`, `SimBotMissionGraduation.h`, `SimBotTrainingOrder.h`, and the
   two above); observability is `bin/log/missiondiag.log` plus `pveActivity` counters.
   Live receipt: `docs/4-unit-tests/live_f098-lair-tactics-release_20261013-184338.md`.
+- **Mission credits and the holdings journal (P.10c / F_0.9.2, released v0.9.9)** — the
+  first thing a roster PlayerBot owns. `onPveBotMissionLairDestroyed` copies the offer's
+  id and difficulty under `pveMutex`, releases it, and `awardPlayerBotMissionCredits`
+  grants `MissionManager::rollDestroyMissionReward(level)` to the bank balance (gate
+  `awardMissionCredits`). That method owns the stock formula and the stock generator
+  calls it too. Idempotency is the existing single-shot offer transition, not a new
+  structure (offer ids restart at 1 every boot).
+  **Holdings model** (plan section of the same name; every later chunk inherits it):
+  the owner is the roster identity id; nothing durable lives on the body (equipped gear
+  will be an item row re-applied at spawn, as skills are); one authority and one manager
+  API per kind; every change carries a source and a reference and writes a journal row;
+  anything that takes time is reserve then commit or release.
+  **Journal**: `simbot_ledger` (schema 1014), appended under `progressionMutex` by
+  `grantPlayerBotCredits` / `spendPlayerBotCredits` / the fee commit, and inserted by
+  `flushPlayerBotProgressionStore` **before** the balance UPDATEs. Rows already inserted
+  are never requeued; entries not yet inserted go back to the front. No transaction
+  spans the two writes (MyISAM), so the store load compares each identity's newest
+  `balance_after` with its balance and, on a difference, appends a `reconcile` row; the
+  balance column stays the authority. The daily prune keeps `reconcile` rows and the
+  newest row per identity and kind.
+  **Doctor-buff fee** (gate `buffPayment.enabled`): `reservePlayerBotDoctorBuffFee` in
+  `beginBuffUp` snapshots the fee or returns UNAFFORDABLE (the bot skips doctor buffs);
+  the commit runs where doctor buffs land (real doctor or synthetic fallback), rechecks
+  the gate, and the release runs at flow end, order reset, death and teardown. Bots
+  with no progression record are never charged. Both gate functions take the identity
+  id so harness overrides are identity-scoped and never pay or charge a production bot.
+  Dashboard: `playerBotProgression.missionCredits`, `.buffPayment`, `.ledger`, and
+  per-identity `recentLedger[]`; diag event `MISSION_CREDIT`. Live receipt:
+  `docs/4-unit-tests/live_f092-mission-credits_20261013-225200-f092-mission-credits.md`.
 - **Simulation-only by default, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line

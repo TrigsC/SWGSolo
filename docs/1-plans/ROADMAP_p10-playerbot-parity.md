@@ -141,18 +141,20 @@ the numeric rule is an additional release dependency on top of it.
 F_0.9.3 schema 1013 and F_0.9.5 schema 1014, which forced the loot chunk to
 ship before skill training for no functional reason. Since nothing above 1012
 had been deployed, the numbers were still free and were reassigned to match
-priority: **F_0.9.5 takes 1013** (shipped, `training_plan`) and **F_0.9.3 moves
-to 1014**, with bazaar SELL at 1015. The dependency that remained was an
-artifact of the numbering, not of the designs.
+priority: **F_0.9.5 takes 1013** (shipped, `training_plan`) and the later
+mission-credit journal takes **1014**, with the loot vault at **1015** and
+bazaar SELL at **1016**. The dependency that remained was an artifact of the
+numbering, not of the designs.
 
 **Renumbered again 2026-09-08 (early-game insertion).** Three new chunks —
 **F_0.9.6 novice early-game loop**, **F_0.9.7 skill-derived combat abilities**,
 **F_0.9.8 lair tactics and mission graduation** — are inserted ahead of the
 bazaar work, which moves down to **F_0.9.9 / F_0.9.10 / F_0.9.11** (phase
 letters shift with them: bazaar SELL/BUY and allocation become P.10j/k/l).
-Motivation in §5c. **None of the three new chunks carries a schema block**, so
-the numeric deployment rule is unaffected: F_0.9.3 keeps 1014 and bazaar SELL
-keeps 1015, and the inserted chunks may deploy in any order relative to them.
+Motivation in §5c. The mission-credit chunk now carries schema 1014 for its
+holdings journal; the vault follows at 1015 and bazaar SELL at 1016. The
+inserted chunks may deploy in any order relative to those functional chunks,
+subject to the numeric schema ordering rule.
 Renumbering was chosen over appending so that chunk order continues to express
 priority, as the 2026-09-04 renumber established. Note that the released
 `docs/5-tuto/tuto_0.9.5.md` refers to the bazaar chunk by its old number
@@ -168,11 +170,11 @@ F_0.9.0 store+dashboard+reaper+harness
   |                                   +-- F_0.9.7 skill-derived combat abilities
   |                                         +-- F_0.9.8 lair tactics + mission graduation
   |                                                    ^
-  +-- F_0.9.2 mission credits ----------------------- +   (credit source; buffer sink)
+  +-- F_0.9.2 mission credits (schema 1014) -------- +   (credit source; buffer sink)
   |
-  +-- F_0.9.3 loot (solo) + vault (schema 1014)
+  +-- F_0.9.3 loot (solo) + vault (schema 1015)
         +-- F_0.9.4 group loot/XP dispersal
-        +-- F_0.9.9 bazaar SELL (schema 1015)
+        +-- F_0.9.9 bazaar SELL (schema 1016)
         +-- F_0.9.10 bazaar BUY
               +-- F_0.9.11 allocation policy  <-- reads F_0.9.5 plans + demand pressure
 ```
@@ -250,10 +252,15 @@ F_0.9.0 store+dashboard+reaper+harness
   harness bot **without** identity → zero rows, `noRecord` counter +1; cap
   reached → no further growth; miner/PvP bodies never appear in the store.
 
-### F_0.9.2 — Credits per completed mission (P.10c) — NEXT (as of 2026-10-13)
+### F_0.9.2 — Credits per completed mission (P.10c) — RELEASED as v0.9.9 (2026-10-14)
 
-> Not started. It was folded into F_0.9.8 as Phase 1 and unfolded again at the v0.9.8
-> release. The line numbers below predate F_0.9.6 to F_0.9.8 and must be re-read.
+> Released. What shipped is wider than the scope below: see
+> `F_0.9.2_p10c-mission-credits.plan.md`. It added the **holdings model** (the rules
+> every later chunk's items inherit), the `simbot_ledger` journal (schema 1014), and the
+> doctor-buff fee as the first credit sink. The reward comes from one
+> `MissionManager` method, not from copied accessors. Next: **F_0.9.3 loot and the
+> vault (schema 1015)**. Version numbers no longer match chunk ids: this chunk shipped
+> as v0.9.9, and later chunks take the next free version when they release.
 
 - **Scope**: award **only offer-backed completions** — the mission-board
   site (`SimPlayerManager.cpp:10649`), where the completed
@@ -265,9 +272,11 @@ F_0.9.0 store+dashboard+reaper+harness
   if private), the `awardReward` divisor rule (solo divisor = 1 now; group
   split lands in F_0.9.4), idempotent per `offerId`, `grantCredits(bank)`.
   Gate `playerBotProgression.awardMissionCredits`.
-- **Engine touchpoints**: `SimPlayerManager` completion sites; possibly
-  `MissionManager.idl` getters (Core3 IDL, regen). No mission objects.
-- **Persists**: `simbot_progression.bank_credits`.
+- **Engine touchpoints**: `SimPlayerManager` completion sites and holdings
+  journal; `MissionManager.idl` reward roll/bounds natives (Core3 IDL, regen);
+  `ServerDatabase.cpp` and `sql/swgemu.sql` (schema 1014). No mission objects.
+- **Persists**: `simbot_progression.bank_credits` and the `simbot_ledger`
+  holdings journal (schema 1014).
 - **Risk**: low. Pure bookkeeping at an existing event.
 - **Test strategy**: harness op `completeMission{difficultyLevel}` drives the
   same completion function → bank delta within the formula's bounds; twice for
@@ -301,7 +310,7 @@ F_0.9.0 store+dashboard+reaper+harness
   `playerBotProgression.lootEnabled`.
 - **Engine touchpoints**: `CreatureManagerImplementation.cpp` (bot branch),
   `AiEconomyData.idl` + `AiEconomyManager`, `SimHunterController` (phase
-  `LOOT_CORPSE`), `ServerDatabase.cpp` (schema **1014** — renumbered from 1013,
+  `LOOT_CORPSE`), `ServerDatabase.cpp` (schema **1015** — renumbered from 1014,
   see §5 preamble).
 - **Persists**: vault container + contents (BDB), `simbot_items`.
 - **Risk**: moderate–high. First real object movement out of a corpse; must
@@ -547,7 +556,7 @@ F_0.9.0 store+dashboard+reaper+harness
   relative to the human market?
 - **Engine touchpoints**: `AuctionManagerImplementation.cpp` (two guarded
   branches), `SimHunterController`/a small `SimMarketController` phase,
-  `ServerDatabase.cpp` (schema 1015).
+  `ServerDatabase.cpp` (schema 1016).
 - **Persists**: auction items (stock BDB), `simbot_listings`, store credits.
 - **Risk**: high (shared surface). Listings are real and visible; a bug here
   is player-visible. Mitigations: listing cap per identity, price floor,

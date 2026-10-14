@@ -148,6 +148,37 @@ struct SimBotProgression {
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
 
+// P.10c: one durable change to an identity-owned holding. The pending and
+// recent copies are manager-owned; no ledger state is attached to a body.
+struct SimBotLedgerEntry {
+	uint64 identityId = 0;
+	String kind;
+	int64 delta = 0;
+	int64 balanceAfter = 0;
+	String source;
+	uint64 refId = 0;
+	String detail;
+	uint64 createdAtMs = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+enum PveMissionCreditDisposition {
+	PVE_MISSION_CREDIT_NOT_COMPLETED = 0,
+	PVE_MISSION_CREDIT_AWARDED,
+	PVE_MISSION_CREDIT_GATE_OFF,
+	PVE_MISSION_CREDIT_NO_MANAGER,
+	PVE_MISSION_CREDIT_REJECTED_NO_RECORD,
+	PVE_MISSION_CREDIT_REJECTED_OTHER
+};
+
+enum PlayerBotBuffFee {
+	PLAYER_BOT_BUFF_FEE_NOT_CHARGED = 0,
+	PLAYER_BOT_BUFF_FEE_RESERVED,
+	PLAYER_BOT_BUFF_FEE_UNAFFORDABLE
+};
+
 struct SimBotTrainingPlan {
 	String name;
 	String profession;
@@ -477,7 +508,9 @@ struct PlayerBotProgressionRequest {
 		RunReaper,
 		FlushNow,
 		InjectFault,
-		WriteRestartProbe
+		WriteRestartProbe,
+		AssertLedger,
+		WriteBankCredits
 	};
 
 	enum State {
@@ -499,6 +532,14 @@ struct PlayerBotProgressionRequest {
 	bool force = false;
 	int faultFlushDelayMs = 0;
 	bool faultFailNextFlush = false;
+	bool faultFailLedgerInsert = false;
+	String ledgerSource;
+	int64 ledgerDelta = 0;
+	int ledgerCount = 0;
+	int64 ledgerSum = 0;
+	int64 ledgerTotalSum = 0;
+	int64 ledgerBalanceAfter = 0;
+	int64 requestedAmount = 0;
 	bool resultFound = false;
 	int64 resultValue = 0;
 	String error;
@@ -528,6 +569,14 @@ struct PlayerBotParityTestStep {
 	String skillName;
 	String skillMod;
 	int64 amount = 0;
+	int difficultyLevel = 1;
+	int missions = 1;
+	int feeCredits = 0;
+	bool repeat = false;
+	String expectDisposition;
+	String expectRepeatDisposition;
+	bool hasLedgerDelta = false;
+	int ledgerCount = 0;
 	int baseXp = 0;
 	uint32 totalDamage = 0;
 	uint32 damage = 0;
@@ -552,6 +601,7 @@ struct PlayerBotParityTestStep {
 	bool force = false;
 	int flushDelayMs = 0;
 	bool failNextFlush = false;
+	bool faultFailLedgerInsert = false;
 	int budgetMs = 0;
 	bool async = false;
 	String requestRef;
@@ -2257,6 +2307,9 @@ private:
 	VectorMap<uint64, SimBotEarlyGameState> progressionEarlyGameStates;
 	bool progressionEnabled = false;
 	bool progressionAwardKillXp = false;
+	bool progressionAwardMissionCredits = false;
+	bool progressionBuffPaymentEnabled = false;
+	int progressionDoctorFeeCredits = 0;
 	bool progressionTrainingEnabled = false;
 	bool progressionEarlyGameEnabled = false;
 	bool progressionCombatAbilitiesEnabled = false;
@@ -2290,6 +2343,10 @@ private:
 	int progressionFlushIntervalSeconds = 60;
 	bool progressionReaperEnabled = false;
 	int progressionReaperMinAgeSeconds = 3600;
+	int progressionLedgerRetentionDays = 30;
+	uint64 progressionLedgerLastPruneMs = 0;
+	Vector<SimBotLedgerEntry> progressionLedgerPending;
+	VectorMap<uint64, Vector<SimBotLedgerEntry> > progressionRecentLedger;
 	AtomicLong progressionAwardsAccepted;
 	AtomicLong progressionAwardsRejectedNoRecord;
 	AtomicLong progressionAwardsRejectedNoIdentity;
@@ -2324,6 +2381,24 @@ private:
 	AtomicLong progressionOrphansReaped;
 	AtomicLong progressionReaperRuns;
 	AtomicLong progressionFlushFailures;
+	AtomicLong progressionLedgerWritten;
+	AtomicLong progressionLedgerDropped;
+	AtomicLong progressionLedgerBalanceMismatch;
+	AtomicLong missionCreditsAwarded;
+	AtomicLong missionCreditsTotal;
+	AtomicLong missionCreditsRejected;
+	AtomicLong missionCreditsSkippedGateOff;
+	AtomicLong missionCreditsSkippedNoManager;
+	AtomicLong missionCreditsLastAmount;
+	AtomicLong missionCreditsLastDifficultyLevel;
+	AtomicLong missionCreditsLastAwardMs;
+	AtomicLong buffPaymentCharged;
+	AtomicLong buffPaymentCreditsSpent;
+	AtomicLong buffPaymentSkippedUnaffordable;
+	AtomicLong buffPaymentReleased;
+	AtomicLong buffPaymentReleasedGateOff;
+	AtomicLong buffPaymentChargeFailed;
+	VectorMap<uint64, int64> progressionBuffFeeReservations;
 	AtomicLong trainingTrained;
 	AtomicLong trainingRefusedNoRecord;
 	AtomicLong trainingRefusedGate;
@@ -2346,6 +2421,7 @@ private:
 	uint64 progressionNextRequestId = 1;
 	int progressionFaultFlushDelayMs = 0;
 	bool progressionFaultFailNextFlush = false;
+	bool progressionFaultFailLedgerInsert = false;
 
 	// P.10a parity harness. The runner owns cursor/oracle mutation; the mutex
 	// also gives the dashboard a coherent copy while the runner is between
@@ -2357,6 +2433,7 @@ private:
 	Vector<uint64> playerBotParityTestIdentityIds;
 	Vector<uint64> playerBotParityTestBodyOids;
 	VectorMap<uint64, SimBotProgression> playerBotParityTestOracle;
+	VectorMap<uint64, int64> playerBotParityTestCreditBaselines;
 	VectorMap<String, uint64> playerBotParityTestRequestRefs;
 	VectorMap<String, uint64> playerBotParityTestIdentityRefs;
 	VectorMap<String, uint64> playerBotParityTestCounterBaselines;
@@ -2397,6 +2474,20 @@ private:
 	bool playerBotParityTestCombatAbilitiesGateOverride = false;
 	bool playerBotParityTestCombatAbilitiesGateOverridePreviousActive = false;
 	bool playerBotParityTestCombatAbilitiesGateOverridePrevious = false;
+	bool playerBotParityTestMissionCreditGateOverrideActive = false;
+	bool playerBotParityTestMissionCreditGateOverride = false;
+	bool playerBotParityTestMissionCreditGateOverridePreviousActive = false;
+	bool playerBotParityTestMissionCreditGateOverridePrevious = false;
+	VectorMap<uint64, bool> playerBotParityMissionCreditScopedIds;
+	bool playerBotParityTestBuffPaymentGateOverrideActive = false;
+	bool playerBotParityTestBuffPaymentGateOverride = false;
+	bool playerBotParityTestBuffPaymentGateOverridePreviousActive = false;
+	bool playerBotParityTestBuffPaymentGateOverridePrevious = false;
+	bool playerBotParityTestBuffFeeOverrideActive = false;
+	int playerBotParityTestBuffFeeOverride = 0;
+	bool playerBotParityTestBuffFeeOverridePreviousActive = false;
+	int playerBotParityTestBuffFeeOverridePrevious = 0;
+	VectorMap<uint64, bool> playerBotParityBuffPaymentScopedIds;
 	bool playerBotParityTestCombatAbilityChanceOverrideActive = false;
 	int playerBotParityTestCombatAbilityChanceOverride = 35;
 	bool playerBotParityTestCombatAbilityChanceOverridePreviousActive = false;
@@ -2815,6 +2906,13 @@ private:
 	void retirePveIdentity(uint64 identityId);
 	bool drainPveIdentityBody(uint64 identityId, uint64 nowMs);
 	void markProgressionDirtyLocked(uint64 identityId);
+	void appendPlayerBotLedgerEntryLocked(uint64 identityId, bool bank,
+		int64 delta, int64 balanceAfter, const String& source, uint64 refId,
+		const String& detail);
+	PveMissionCreditDisposition awardPlayerBotMissionCredits(uint64 identityId,
+		uint64 offerId, uint64 lairOid, int difficultyLevel, int divisor = 1);
+	void dropPlayerBotLedgerEntriesLocked(uint64 identityId);
+	void prunePlayerBotLedger(uint64 nowMs);
 	void collectPvePlanReadyIds(VectorMap<uint64, bool>& readyIds);
 	void flushPveIdentityRoster(bool force);
 	void loadPlayerBotProgressionStore();
@@ -2823,7 +2921,7 @@ private:
 	// routine maintenance flush can never consume a fault the harness armed for
 	// its own FlushNow request.
 	void flushPlayerBotProgressionStore(bool force, int faultDelayMs = 0,
-		bool faultFailNext = false);
+		bool faultFailNext = false, bool faultFailLedgerInsert = false);
 	void reconcilePlayerBotProgression();
 	void reconcileIdentityTiers();
 	void runPlayerBotProgressionReaper(uint64 nowMs, bool force = false);
@@ -2881,6 +2979,8 @@ private:
 	bool awardToNonRosterPlayerBotBody(uint64 identityId, const String& xpType,
 		int amount, const String& source);
 	bool playerBotProgressionAwardGateEnabled();
+	bool playerBotMissionCreditGateEnabled(uint64 identityId);
+	bool playerBotBuffPaymentGateEnabled(uint64 identityId);
 	// Per-identity decision: the harness override applies only to identities in
 	// playerBotParityCombatAbilityScopedIds; everyone else reads configuration.
 	bool playerBotCombatAbilitiesGateEnabled(uint64 identityId);
@@ -3545,9 +3645,14 @@ public:
 		uint64 victimOid, const String& victimTemplate, int baseXp,
 		uint32 totalDamage, int threatEntries, uint64 botOid, uint32 botDamage);
 	bool grantPlayerBotCredits(uint64 identityId, int64 amount, bool bank,
-		const String& source);
+		const String& source, uint64 refId = 0,
+		const String& detail = String(), String* refusalOut = nullptr);
 	bool spendPlayerBotCredits(uint64 identityId, int64 amount, bool bank,
-		const String& source);
+		const String& source, uint64 refId = 0,
+		const String& detail = String());
+	PlayerBotBuffFee reservePlayerBotDoctorBuffFee(uint64 identityId);
+	bool commitPlayerBotDoctorBuffFee(uint64 identityId);
+	void releasePlayerBotDoctorBuffFee(uint64 identityId);
 	bool recordPlayerBotSkill(uint64 identityId, const String& skillName,
 		const String& source);
 	bool isPlayerBotKillXpEnabled() const {
@@ -4048,7 +4153,8 @@ public:
 		PVE_LAIR_REVEAL_DEFER_NO_SPAWN_POINT = 3
 	};
 	PveLairRevealResult revealPveBotMissionLair(uint64 bodyOid, uint64 offerId);
-	void onPveBotMissionLairDestroyed(uint64 bodyOid, uint64 lairOid);
+	PveMissionCreditDisposition onPveBotMissionLairDestroyed(uint64 bodyOid,
+		uint64 lairOid);
 	bool planPveHunterRelocation(uint64 identityId, uint64 bodyOid,
 		const String& targetPlanet, const String& targetCity,
 		const String& reason, PveRelocation& relocation);

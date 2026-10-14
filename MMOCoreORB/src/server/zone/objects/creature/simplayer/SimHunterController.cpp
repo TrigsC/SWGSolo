@@ -153,6 +153,7 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 		std::memory_order_relaxed);
 	pveNeedDoctorBuff = false;
 	pveNeedEntertainerBuff = false;
+	pveDoctorFeeReserved = false;
 	pveDoctorFallbackNeeded = false;
 	pveEntertainerFallbackNeeded = false;
 	pveBuffProviderApproachActive = false;
@@ -408,6 +409,8 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	disengageTarget(false);
 	clearEngagedTelemetry();
 	cancelPveDoctorRequest();
+	SimPlayerManager::instance()->releasePlayerBotDoctorBuffFee(identityId);
+	pveDoctorFeeReserved = false;
 	advanceWorkLoopGeneration("hunterStartOrder");
 	clearInteriorApproachLeg();
 	resetHybridMovementState(true);
@@ -449,6 +452,7 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	pveBuffProviders = PveBuffProviders();
 	pveNeedDoctorBuff = false;
 	pveNeedEntertainerBuff = false;
+	pveDoctorFeeReserved = false;
 	pveDoctorFallbackNeeded = false;
 	pveEntertainerFallbackNeeded = false;
 	pveBuffProviderApproachActive = false;
@@ -1314,6 +1318,10 @@ void SimHunterController::applyHunterBuffsForFamily(PveBuffFamily family) {
 		manager->recordPveSyntheticFallback(bodyOid);
 		manager->recordPveBuffSource(bodyOid,
 			"synthetic-fallback");
+		if (family == PVE_BUFF_FAMILY_DOCTOR && pveDoctorFeeReserved) {
+			manager->commitPlayerBotDoctorBuffFee(identityId);
+			pveDoctorFeeReserved = false;
+		}
 	}
 }
 
@@ -1328,7 +1336,7 @@ void SimHunterController::finishPveBuffProviderFlow() {
 
 	if (pveEntertainerFallbackNeeded)
 		applyHunterBuffsForFamily(PVE_BUFF_FAMILY_ENTERTAINER);
-	if (pveDoctorFallbackNeeded)
+	if (pveDoctorFallbackNeeded && pveNeedDoctorBuff)
 		applyHunterBuffsForFamily(PVE_BUFF_FAMILY_DOCTOR);
 
 	// The heal-up stop is complete (real providers and/or synthetic fallback).
@@ -1345,6 +1353,10 @@ void SimHunterController::finishPveBuffProviderFlow() {
 		float shock = strongAgent->getShockWounds();
 		if (shock > 0)
 			strongAgent->addShockWounds(-shock, true, false);
+	}
+	if (pveDoctorFeeReserved) {
+		SimPlayerManager::instance()->releasePlayerBotDoctorBuffFee(identityId);
+		pveDoctorFeeReserved = false;
 	}
 
 	// A hub provider flow is complete only after the hunter has a route back to
@@ -1520,7 +1532,7 @@ void SimHunterController::interactWithPveBuffProvider(
 	if (!schedulePveDoctorScreenplay(providerObject.get(), "botBuffRequest",
 			args)) {
 		pveDoctorRequestActive = false;
-		pveDoctorFallbackNeeded = true;
+		pveDoctorFallbackNeeded = pveNeedDoctorBuff;
 		if (moveToNextPveBuffProvider())
 			return;
 		finishPveBuffProviderFlow();
@@ -1647,6 +1659,15 @@ void SimHunterController::beginBuffUp() {
 		bool needDoctor = false;
 		bool needEntertainer = false;
 		computeBuffNeeds(needDoctor, needEntertainer);
+		pveDoctorFeeReserved = false;
+		if (needDoctor) {
+			PlayerBotBuffFee feeState = SimPlayerManager::instance()->
+				reservePlayerBotDoctorBuffFee(identityId);
+			if (feeState == PLAYER_BOT_BUFF_FEE_UNAFFORDABLE)
+				needDoctor = false;
+			else if (feeState == PLAYER_BOT_BUFF_FEE_RESERVED)
+				pveDoctorFeeReserved = true;
+		}
 		if (!needDoctor && !needEntertainer) {
 			SimPlayerManager::instance()->recordPveBuffDetourSkipped();
 			if (missionHuntOrder)
@@ -3096,6 +3117,8 @@ void SimHunterController::beginEarlyGame() {
 		missionOfferAttempts = 0;
 		missionOfferVisitEpoch = 0;
 		cancelPveDoctorRequest();
+		SimPlayerManager::instance()->releasePlayerBotDoctorBuffFee(identityId);
+		pveDoctorFeeReserved = false;
 		advanceWorkLoopGeneration("hunterEnterEarlyGame");
 		clearInteriorApproachLeg();
 		resetHybridMovementState(true);
@@ -3917,6 +3940,11 @@ void SimHunterController::runBuffUpTick(AiAgent* strongAgent,
 			pveDoctorRequestActive = false;
 			pveDoctorDeadlineSec = 0;
 			pveDoctorProviderObject = nullptr;
+			if (pveDoctorFeeReserved) {
+				SimPlayerManager::instance()->commitPlayerBotDoctorBuffFee(
+					identityId);
+				pveDoctorFeeReserved = false;
+			}
 			SimPlayerManager::instance()->recordPveBuffSource(
 				bodyOid, "real-doctor");
 			if (moveToNextPveBuffProvider())
@@ -3927,7 +3955,7 @@ void SimHunterController::runBuffUpTick(AiAgent* strongAgent,
 
 		if (nowMs / 1000 >= pveDoctorDeadlineSec) {
 			cancelPveDoctorRequest();
-			pveDoctorFallbackNeeded = true;
+			pveDoctorFallbackNeeded = pveNeedDoctorBuff;
 			if (moveToNextPveBuffProvider())
 				return;
 			finishPveBuffProviderFlow();
@@ -3985,6 +4013,8 @@ void SimHunterController::runActiveTick() {
 		if (isStructureTraversalFeatureEnabled() && isTraversalActive())
 			clearStructureTraversalState("hunter_death");
 		cancelPveDoctorRequest();
+		SimPlayerManager::instance()->releasePlayerBotDoctorBuffFee(identityId);
+		pveDoctorFeeReserved = false;
 		if (!deathReported) {
 			deathReported = true;
 			// Captured first: beginMissionCleanup below re-records the phase as
@@ -6710,6 +6740,8 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 	// otherwise acquire it right after disengage and, with orderActive still
 	// set, revive movement toward the finished route (code-review round 2).
 	cancelPveDoctorRequest();
+	SimPlayerManager::instance()->releasePlayerBotDoctorBuffFee(identityId);
+	pveDoctorFeeReserved = false;
 	SimPlayerManager::instance()->finishPveHunterBuffTrip(identityId, false);
 	pveBuffTripAtHub = false;
 	pveBuffTripReturning = false;
@@ -6759,6 +6791,8 @@ void SimHunterController::teardown(const String& reason) {
 	activeTickGeneration++;
 	advanceWorkLoopGeneration("hunterTeardown");
 	cancelPveDoctorRequest();
+	SimPlayerManager::instance()->releasePlayerBotDoctorBuffFee(identityId);
+	pveDoctorFeeReserved = false;
 	SimPlayerManager::instance()->finishPveHunterBuffTrip(identityId, false);
 	pveBuffTripAtHub = false;
 	pveBuffTripReturning = false;
