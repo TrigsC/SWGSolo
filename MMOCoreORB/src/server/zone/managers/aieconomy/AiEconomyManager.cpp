@@ -6,6 +6,11 @@
 #include "server/zone/managers/object/ObjectManager.h"
 #include "server/zone/objects/scene/SceneObject.h"
 #include "server/zone/objects/scene/components/ContainerComponent.h"
+#include "system/thread/ReadLocker.h"
+#include "server/zone/managers/auction/AuctionManager.h"
+#include "server/zone/managers/auction/AuctionsMap.h"
+#include "server/zone/managers/auction/TerminalListVector.h"
+#include "server/zone/objects/auction/AuctionItem.h"
 
 namespace {
 	const char* const AI_ECONOMY_DATABASE = "aieconomy";
@@ -75,6 +80,31 @@ namespace {
 			const String& acquisitionSource) {
 		return String::valueOf(resourceSpawnObjectID) + "|" +
 			acquisitionSource;
+	}
+
+	bool hasLiveBazaarListing(SceneObject* bag) {
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		AuctionManager* auctionManager = zoneServer == nullptr ? nullptr :
+			zoneServer->getAuctionManager();
+		if (bag == nullptr || auctionManager == nullptr ||
+				auctionManager->getAuctionMap() == nullptr)
+			return false;
+		TerminalListVector listings = auctionManager->getAuctionMap()->
+			getBazaarTerminalData("", "", nullptr);
+		for (int i = 0; i < listings.size(); ++i) {
+			Reference<TerminalItemList*> terminalItems = listings.get(i);
+			if (terminalItems == nullptr)
+				continue;
+			ReadLocker terminalLock(terminalItems);
+			for (int j = 0; j < terminalItems->size(); ++j) {
+				AuctionItem* item = terminalItems->get(j);
+				if (item != nullptr && auctionManager->isSimBotListing(item) &&
+						item->getOwnerID() == bag->getObjectID() &&
+						item->getStatus() != AuctionItem::RETRIEVED)
+					return true;
+			}
+		}
+		return false;
 	}
 }
 
@@ -300,6 +330,11 @@ bool AiEconomyManager::isItemBag(SceneObject* object) {
 }
 
 void AiEconomyManager::discardItemBag(SceneObject* bag, SceneObject* vault) {
+	if (hasLiveBazaarListing(bag)) {
+		warning("Refusing to discard item bag with a live bazaar listing: " +
+			String::valueOf(bag == nullptr ? 0 : bag->getObjectID()));
+		return;
+	}
 	// A bag that never received an item: unlink it from the vault if it got
 	// there (bag before container, as everywhere), then delete it, so a failed
 	// install never leaves a persistent object behind.

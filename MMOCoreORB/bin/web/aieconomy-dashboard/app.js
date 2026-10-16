@@ -341,12 +341,23 @@
     const recentRows = recent.map((item) => `<div class="playerbot-recent"><span>${esc(item.command || "unknown")}</span><span>${ago(item.ageSeconds)} · target ${esc(item.targetTemplate || item.targetOid || "unknown")}</span></div>`).join("");
     const modRows = Object.entries(mods).map(([name, mod]) => `<tr><td>${esc(name)}</td><td>${num(mod.templateBase)}</td><td>${num(mod.skillboxDelta)}</td><td>${num(mod.effective)}</td></tr>`).join("");
     const next = data.nextBox || {};
+    const listings = Array.isArray(data.listings) ? data.listings : [];
     const source = templates.attackSource === "skill" ? "trained skills" : "body template";
     const itemRows = items.map((item) => {
       const stats = item.stats || {};
       const kind = stats.weapon ? "weapon" : stats.armor ? "armour" : stats.attributes ? "component" : "item";
       return `<tr><td class="t-num">${esc(item.objectId)}</td><td><span class="t-main">${esc(item.name || stats.customName || "unnamed")}</span><span class="t-sub">${esc(stats.templatePath || "unknown")}</span></td><td>${chip(labelize(item.state || "unknown"), item.state === "held" ? "ok" : "ghost")}</td><td>${esc(item.source || "—")}</td><td>${esc(kind)} · ${esc(item.acquiredAt || "—")}</td></tr>`;
     }).join("");
+    const listingRows = listings.map((listing) => `<tr>
+      <td class="t-num">${esc(listing.itemOid || listing.auctionOid || "—")}</td>
+      <td><span class="t-main">${esc(listing.item || "unnamed")}</span><span class="t-sub">auction ${esc(listing.auctionOid || "—")}</span></td>
+      <td>${chip(labelize(listing.state || "unknown"), listing.state === "listed" ? "ok" : "ghost")}</td>
+      <td class="t-num">${num(listing.price)}</td>
+      <td>${esc(listing.listedAt || "—")}</td>
+      <td>${esc(listing.closedAt || "—")}</td>
+      <td>${esc(listing.releasedAt || "—")}</td>
+      <td>${esc(listing.buyer || "—")}</td>
+    </tr>`).join("");
 
     return `<div class="playerbot-card"><h3>WHO</h3><p class="playerbot-lead">${esc(identity.name || "Unnamed SimBot")}</p>
       ${kvRows([["Profession", esc(labelize(identity.profession || "unknown"))], ["Home", esc(home)], ["Tier", num(identity.skillTier)], ["Kills / deaths", `${num(identity.kills)} / ${num(identity.deaths)}`], ["Activity", esc(labelize(activity))], ["Body", body.attached ? `attached · ${esc(body.zone || "unknown")}` : "not attached"], ["Lair members alive", num(body.lairMembersAlive)], ["Non-member engagements", num(body.nonMemberEngagements)]])}</div>
@@ -362,6 +373,7 @@
         ${(abilities.excluded || []).length ? `<details><summary>Excluded (${abilities.excluded.length})</summary><div class="playerbot-chips">${playerBotList(abilities.excluded)}</div></details>` : ""}</div>
       <div class="playerbot-card"><h3>RECENT ABILITY USE</h3>${recentRows || `<span class="muted small">No recorded ability use.</span>`}</div>
       <div class="playerbot-card"><h3>ITEMS (${num(data.itemsHeld)})</h3>${table(["OID", "Item", "State", "Source", "Acquired"], itemRows, { scrollKey: "playerbot-items", tall: true })}</div>
+      <div class="playerbot-card"><h3>LISTINGS (${num(listings.length)})</h3>${table(["OID", "Item", "State", "Price", "Listed", "Closed", "Released", "Buyer"], listingRows, { scrollKey: "playerbot-listings", tall: true })}</div>
       <div class="playerbot-card"><h3>SKILL MODS</h3>${modRows ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Mod</th><th>Base</th><th>Trained</th><th>Effective</th></tr></thead><tbody>${modRows}</tbody></table></div>` : `<span class="muted small">No live skill mods.</span>`}</div>`;
   }
 
@@ -1213,6 +1225,10 @@
     const missionCredits = progression.missionCredits || {};
     const buffPayment = progression.buffPayment || {};
     const loot = progression.loot || {};
+    const bazaar = progression.bazaar || {};
+    const bazaarSkipped = bazaar.skipped || {};
+    const bazaarVisits = bazaar.visits || {};
+    const bazaarReconcile = bazaar.reconcile || {};
     const vault = progression.vault || {};
     const ledger = progression.ledger || {};
     const trainingGate = progression.gates && progression.gates.trainingEnabled === true;
@@ -1361,6 +1377,23 @@
             ["Vault reconcile", num((vault.reconcile || {}).recovered) + " recovered · " + num((vault.reconcile || {}).orphaned) + " orphaned · " + num((vault.reconcile || {}).lost) + " lost · destroy failures " + num(vault.reapDestroyFailed)],
             ["Item rows rejected", num(vault.progressionItemRowsRejected)]
           ])}
+          <div class="section-gap"></div>
+          ${panel("BAZAAR", `${chip(bazaar.configured ? "configured" : "config off", bazaar.configured ? "ok" : "ghost")} ${chip(bazaar.enabled ? "gate on" : "gate off", bazaar.enabled ? "ok" : "ghost")} ${bazaar.settlementMode ? chip("settlement mode", "amber") : ""}`, `<div class="metric-row">
+            ${metric("Live Listings", bazaar.listingsLive)}
+            ${metric("Listed", bazaar.listed, { tone: "accent" })}
+            ${metric("Sold", bazaar.sold)}
+            ${metric("Retrieved", bazaar.retrieved)}
+            ${metric("Drained", bazaar.drained)}
+            ${metric("Fees", bazaar.feesPaid)}
+            ${metric("Proceeds", bazaar.proceeds, { tone: "accent" })}
+            ${metric("Tax", bazaar.taxPaid)}
+          </div>${kvRows([
+            ["Configuration", `${num(bazaar.maxListingsPerBot)} live/bot · ${num(bazaar.maxListingsPerVisit)}/visit · ${num(bazaar.minPrice)}–${num(bazaar.maxPrice)} credits · ${num(bazaar.listingDurationHours)}h · ${num(bazaar.visitCooldownMinutes)}m cooldown · ${num(bazaar.maxDetourMeters)}m detour · ${num(bazaar.visitTimeoutSeconds)}s TTL · ${Number(bazaar.markup || 0).toFixed(1)}x markup · sweep ${num(bazaar.sweepIntervalSeconds)}s/${num(bazaar.sweepBatch)} · backlog ${num(bazaar.saleBacklogMax)} · drain ${yesno(bazaar.drainOnDisable)}`],
+            ["Visits", `${num(bazaarVisits.begun)} begun · ${num(bazaarVisits.listedAny)} listed · ${num(bazaarVisits.noOutdoorTerminal)} no outdoor terminal · ${num(bazaarVisits.timeout)} timeout · ${num(bazaarVisits.pathFailed)} path · ${num(bazaarVisits.newAttacker)} attacker`],
+            ["Skipped", `${num(bazaarSkipped.junk)} junk · ${num(bazaarSkipped.noValue)} no value · ${num(bazaarSkipped.humanAboveCap)} human cap · ${num(bazaarSkipped.cap)} listing cap · ${num(bazaarSkipped.unaffordable)} unaffordable · ${num(bazaarSkipped.noTrade)} no-trade · ${num(bazaarSkipped.transferFailed)} transfer`],
+            ["Settlement", `${num(bazaar.saleUnresolved)} unresolved · ${num(bazaar.saleBacklogOverflow)} backlog overflow · ${num(bazaar.releaseBuyerGone)} buyer gone · ${num(bazaar.deleteBlockedByListing)} delete blocked`],
+            ["Reconcile", `${num(bazaarReconcile.adopted)} adopted · ${num(bazaarReconcile.settled)} settled · ${num(bazaarReconcile.reversed)} reversed · ${num(bazaarReconcile.retrieved)} retrieved · ${num(bazaarReconcile.orphaned)} orphaned · ${num(bazaarReconcile.adoptedTaxEstimated)} tax estimated · ${num(bazaarReconcile.releasedRepaired)} releases repaired`]
+          ])}`, "span-12")}
           <div class="section-gap"></div>
           ${kvRows([
             ["Flush interval", num(progression.flushIntervalSeconds) + "s"],

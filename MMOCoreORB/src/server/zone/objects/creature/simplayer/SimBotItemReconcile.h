@@ -12,6 +12,7 @@ namespace SimBotItemReconcile {
 
 enum RowState {
 	ROW_HELD,
+	ROW_LISTED,
 	ROW_PENDING,
 	ROW_CONSUMED,
 	ROW_LOST,
@@ -21,6 +22,7 @@ enum RowState {
 enum ObjectLocation {
 	LOCATION_MISSING,
 	LOCATION_IDENTITY_BAG,
+	LOCATION_LISTED,
 	LOCATION_OTHER_BAG,
 	LOCATION_DIRECT_VAULT,
 	LOCATION_UNMAPPED_BAG
@@ -29,6 +31,7 @@ enum ObjectLocation {
 enum DecisionState {
 	DECISION_UNCHANGED,
 	DECISION_HELD,
+	DECISION_LISTED,
 	DECISION_LOST,
 	DECISION_ORPHANED
 };
@@ -40,7 +43,7 @@ struct Decision {
 };
 
 inline bool isCountedHeld(RowState state) {
-	return state == ROW_HELD;
+	return state == ROW_HELD || state == ROW_LISTED;
 }
 
 inline Decision decide(RowState rowState, uint64_t rowIdentityId,
@@ -54,8 +57,28 @@ inline Decision decide(RowState rowState, uint64_t rowIdentityId,
 		return decision;
 
 	if (rowState == ROW_HELD && location == LOCATION_IDENTITY_BAG &&
+				rowIdentityId != 0 && rowIdentityId == locationIdentityId)
+		return decision;
+
+	// A listed item is intentionally parentless in the object store.  Its
+	// AuctionItem, whose owner is the identity bag, is the ownership record.
+	// Do not turn it into an orphan merely because it is no longer a child of
+	// the bag.
+	if (rowState == ROW_LISTED && location == LOCATION_LISTED &&
 			rowIdentityId != 0 && rowIdentityId == locationIdentityId)
 		return decision;
+
+	if (rowState == ROW_HELD && location == LOCATION_LISTED &&
+			rowIdentityId != 0 && rowIdentityId == locationIdentityId) {
+		decision.state = DECISION_HELD;
+		return decision;
+	}
+
+	if (rowState == ROW_LISTED && location == LOCATION_IDENTITY_BAG &&
+			rowIdentityId != 0 && rowIdentityId == locationIdentityId) {
+		decision.state = DECISION_HELD;
+		return decision;
+	}
 
 	if ((rowState == ROW_PENDING || rowState == ROW_CONSUMED) &&
 			location == LOCATION_IDENTITY_BAG && rowIdentityId != 0 &&
@@ -72,7 +95,7 @@ inline Decision decide(RowState rowState, uint64_t rowIdentityId,
 		return decision;
 	}
 
-	if (rowState == ROW_HELD) {
+	if (rowState == ROW_HELD || rowState == ROW_LISTED) {
 		decision.state = DECISION_ORPHANED;
 		decision.identityId = 0;
 		decision.ledgerDelta = -1;
@@ -91,6 +114,12 @@ inline Decision decide(RowState rowState, uint64_t rowIdentityId,
 inline Decision decideUntrackedObject(ObjectLocation location,
 		uint64_t locationIdentityId, bool hasIdentityRecord) {
 	Decision decision;
+	if (location == LOCATION_LISTED && locationIdentityId != 0 &&
+			hasIdentityRecord) {
+		decision.state = DECISION_LISTED;
+		decision.identityId = locationIdentityId;
+		return decision;
+	}
 	if (location == LOCATION_IDENTITY_BAG && locationIdentityId != 0 &&
 			hasIdentityRecord) {
 		decision.state = DECISION_HELD;

@@ -15,6 +15,8 @@ struct lua_State;
 class MarketSeederBridge {
 public:
         static bool listOnBazaar(SceneObject* item, CreatureObject* seller, const String& planet, float x, float z, float y, int price, int durationHours);
+        static SceneObject* findBazaarTerminal(server::zone::Zone* zone, float x,
+                float z, float y, float searchRadius, bool outdoorOnly = false);
 
         static CreatureObject* getSystemSeller(server::zone::Zone* zone);
         static SceneObject* createItemForSeller(CreatureObject* seller, SceneObject* container, const String& templatePath, int slot = -1, bool allowOverflow = false);
@@ -26,7 +28,6 @@ public:
 
 private:
     static CreatureObject* ensureSystemSeller(server::zone::Zone* zone);
-    static SceneObject* findBazaarTerminal(server::zone::Zone* zone, float x, float z, float y, float searchRadius);
     static bool templateExists(const String& templatePath);
 };
 

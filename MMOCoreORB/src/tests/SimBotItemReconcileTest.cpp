@@ -26,6 +26,41 @@ TEST(SimBotItemReconcile, HeldInAnotherBagBecomesOrphaned) {
 	EXPECT_EQ(result.ledgerDelta, -1);
 }
 
+TEST(SimBotItemReconcile, ListedInOwningAuctionRemainsListed) {
+	Decision result = decide(ROW_LISTED, 7, LOCATION_LISTED, 7, true);
+	EXPECT_EQ(result.state, DECISION_UNCHANGED);
+	EXPECT_EQ(result.identityId, 7U);
+	EXPECT_EQ(result.ledgerDelta, 0);
+}
+
+TEST(SimBotItemReconcile, HeldListedObjectBecomesHeld) {
+	Decision result = decide(ROW_HELD, 7, LOCATION_LISTED, 7, true);
+	EXPECT_EQ(result.state, DECISION_HELD);
+	EXPECT_EQ(result.identityId, 7U);
+	EXPECT_EQ(result.ledgerDelta, 0);
+}
+
+TEST(SimBotItemReconcile, ListedObjectBackInBagBecomesHeld) {
+	Decision result = decide(ROW_LISTED, 7, LOCATION_IDENTITY_BAG, 7, true);
+	EXPECT_EQ(result.state, DECISION_HELD);
+	EXPECT_EQ(result.identityId, 7U);
+	EXPECT_EQ(result.ledgerDelta, 0);
+}
+
+TEST(SimBotItemReconcile, ListedMissingObjectDecrementsHoldings) {
+	Decision result = decide(ROW_LISTED, 7, LOCATION_MISSING, 0, true);
+	EXPECT_EQ(result.state, DECISION_ORPHANED);
+	EXPECT_EQ(result.identityId, 0U);
+	EXPECT_EQ(result.ledgerDelta, -1);
+}
+
+TEST(SimBotItemReconcile, UntrackedListedObjectIsAdoptedAsListed) {
+	Decision result = decideUntrackedObject(LOCATION_LISTED, 7, true);
+	EXPECT_EQ(result.state, DECISION_LISTED);
+	EXPECT_EQ(result.identityId, 7U);
+	EXPECT_EQ(result.ledgerDelta, 0);
+}
+
 TEST(SimBotItemReconcile, ReservedRowInOwningBagBecomesOrphaned) {
 	Decision pending = decide(ROW_PENDING, 7, LOCATION_IDENTITY_BAG, 7, true);
 	Decision consumed = decide(ROW_CONSUMED, 7, LOCATION_IDENTITY_BAG, 7, true);

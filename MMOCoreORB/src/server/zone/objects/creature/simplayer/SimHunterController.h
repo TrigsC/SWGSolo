@@ -34,7 +34,8 @@ public:
 		DELIVER,
 		MISSION_CLEANUP,
 		CLONE_HOME,
-		DONE
+		DONE,
+		BAZAAR_VISIT
 	};
 
 private:
@@ -47,6 +48,9 @@ private:
 	bool deathReported;
 	HuntPhase phase;
 	uint64 phaseStartedAtMs;
+	ManagedReference<SceneObject*> bazaarTerminal;
+	Vector3 bazaarTerminalPosition;
+	uint64 bazaarVisitStartedAtMs;
 	uint64 huntStartedAtMs;
 	// C1: atomic so the read-modify-write in scheduleActiveTick and the reads in
 	// SimHunterActiveTickTask/TICK_ENTRY are not a data race across task threads.
@@ -316,6 +320,8 @@ private:
 	void shedWaveAggro(AiAgent* strongAgent, int spawnNumber);
 	void setPhase(HuntPhase next);
 	void beginBuffUp();
+	bool beginBazaarVisit(AiAgent* hunter, uint64 nowMs);
+	void finishBazaarVisit(const String& outcome, bool resumeJob = true);
 	void computeBuffNeeds(bool& needDoctor, bool& needEntertainer) const;
 	bool moveToNextPveBuffProvider();
 	// Returns the OUTDOOR anchor beside the building housing this stage's

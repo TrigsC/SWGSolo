@@ -233,6 +233,10 @@ no new warnings before handing work back** (owner-stated standard).
   F_0.9.3 (v0.9.10) adds `playerBotProgression.lootEnabled` (default off) and its
   `loot` block: `maxItemsPerBot` 80, `arriveMeters`, `maxDetourMeters` 64,
   `claimTtlSeconds`, `maxClaimsPerBot`, `stepTimeoutSeconds`.
+  F_0.9.9 (v0.9.11) adds `playerBotProgression.bazaarSell` (default off),
+  `bazaarSaleBacklogMax` and the `bazaar` block: `markup` 3.0, `minPrice`, listing caps,
+  `listingDurationHours`, `visitCooldownMinutes`, `maxDetourMeters`, sweep cadence and
+  `drainOnDisable` (turning the gate off withdraws every bot listing to the vault).
   **The running server re-reads this file from disk on its own**: a syntax error in
   the working copy is hit live within seconds (it keeps the previous config), so
   `luac -p` any edit immediately.
@@ -986,6 +990,48 @@ This is this fork's primary custom subsystem, layered on top of the stock
   scenarios never exercise hunter-controller code. `loot_production_walk` provokes a
   real roster hunter instead. Live receipt: 23/23 in
   `docs/4-unit-tests/live_f093-loot-vault_20261014-161558-f093-loot-vault.md`.
+- **Bazaar SELL (P.10j / F_0.9.9, released v0.9.11)**: the first P.10 surface shared
+  with players.
+  - **The visit.** A roster hunter at `ANNOUNCE_JOB` holding sellable vault items walks to
+    the nearest *outdoor* bazaar terminal (`BAZAAR_VISIT` phase) and lists through
+    `SimPlayerManager::listPlayerBotItemsAtTerminal`.
+  - **Pricing.** `junkValue × markup`; never below the cheapest human ask for the same
+    type and name on the planet; `JUNKGENERIC` stays; a relist reuses the persisted
+    `simbot_items.ask_price` (pure policy in `SimBotBazaar.h`).
+  - **The seller is the identity's vault bag.** `AuctionItem.ownerID` = bag OID.
+    `AuctionManager::isSimBotListing` answers from the player-name map first and checks
+    the bag only for an owner the map does not know. Six guarded stock branches depend on
+    it:
+    - boot load and maintenance keep bag-owned listings;
+    - `doInstantBuy` never resolves the seller by name, because a bot can share a real
+      character's name;
+    - seller mail is suppressed;
+    - `updateAuctionOwner` skips its name short-circuit.
+    Validation and factory-crate details are shared helpers used by both listing paths.
+  - **The MyISAM rule worth inheriting: paid is decided by receipts, not by state rows.**
+    A sale is paid exactly when an *applied* `credits_bank` ledger row with
+    `source = bazaar_sale` and `ref_id` = auction exists. *Applied* means at or below the
+    identity's `bank_ledger_applied_id`, which the flush writes in the **same single-row
+    UPDATE as the balance** (schema 1016).
+    - Rows above the mark after a crash are voided at load, before anything can advance
+      the mark.
+    - Item −1 has its own receipt.
+    - Settlement and reconciliation write only the receipts that are missing.
+  - **Instant pickup (owner decision).** A bot sale is the buyer's at once. The sale POD
+    kicks the maintenance lane, which settles and force-flushes, so the payment is durable
+    within seconds. A lost POD is recovered at boot from the buyer-owned `SOLD` record,
+    or from the item under a player creature (`findBuyerOwnedBotSaleLocked`).
+  - **Gate-off safety.** With the master gate off, open listings load the store in
+    settlement mode: only flush, settle, sweep and reconcile run.
+  - **Lock order:** `AuctionItem` → item → bag → vault. No manager mutex is held across
+    object locks.
+  - **Verification lessons:**
+    - a nullable `DATETIME` read with `getUnsignedLong` throws and takes down the whole
+      store load (`COALESCE` every nullable numeric column);
+    - a "has an entry" check on a map that keeps closed entries silently blocks reuse
+      (expired items never relisted).
+  - **Live receipts:** 33/33 and 26/26
+    (`docs/4-unit-tests/live_f099-*`), plus the owner's in-client purchase.
 - **Simulation-only by default, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line

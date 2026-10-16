@@ -35,6 +35,177 @@
 #include "AuctionSearchTask.h"
 #include "server/zone/objects/factorycrate/FactoryCrate.h"
 #include "server/zone/objects/transaction/TransactionLog.h"
+#include "server/zone/managers/aieconomy/AiEconomyManager.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
+
+// Shared by player and sim bot listings so the two paths cannot drift.
+static bool hasUnsellableArrangement(SceneObject* object) {
+	for (int i = 0; i < object->getArrangementDescriptorSize(); ++i) {
+		const Vector<String>* descriptors = object->getArrangementDescriptor(i);
+		for (int j = 0; j < descriptors->size(); ++j) {
+			const String& descriptor = descriptors->get(j);
+			if (descriptor == "inventory" || descriptor == "datapad" || descriptor == "default_weapon"
+				|| descriptor == "mission_bag" || descriptor == "ghost" || descriptor == "bank" || descriptor == "hair")
+				return true;
+		}
+	}
+	return false;
+}
+
+static void applyFactoryCrateMetadata(AuctionItem* item, SceneObject* objectToSell) {
+	if (!objectToSell->isFactoryCrate())
+		return;
+	ManagedReference<FactoryCrate*> crate = cast<FactoryCrate*>(objectToSell);
+	if (crate == nullptr)
+		return;
+	ManagedReference<TangibleObject*> prototype = crate->getPrototype();
+	if (prototype == nullptr)
+		return;
+	item->setFactoryCrate(true);
+	item->setCratedItemType(prototype->getClientGameObjectType());
+	item->setUpdated(true);
+}
+
+bool AuctionManagerImplementation::isSimBotListing(AuctionItem* item) {
+	if (item == nullptr || zoneServer == nullptr)
+		return false;
+	// A player owner is answered from the name map without loading anything;
+	// only an owner the map does not know is looked up as a vault bag.
+	ManagedReference<PlayerManager*> playerManager = zoneServer->getPlayerManager();
+	if (playerManager != nullptr &&
+			!playerManager->getPlayerName(item->getOwnerID()).isEmpty())
+		return false;
+	ManagedReference<SceneObject*> owner = zoneServer->getObject(item->getOwnerID());
+	return owner != nullptr && AiEconomyManager::isItemBag(owner);
+}
+
+int AuctionManagerImplementation::listSimBotItem(SceneObject* bag,
+		const String& sellerName, SceneObject* item, SceneObject* terminal,
+		int price, unsigned int expireSeconds) {
+	if (bag == nullptr || item == nullptr || terminal == nullptr ||
+			!terminal->isBazaarTerminal() || terminal->getZone() == nullptr ||
+			!AiEconomyManager::isItemBag(bag) || price < 1 ||
+			price > AuctionManager::MAXBAZAARPRICE || item->isNoTrade() ||
+			item->containsNoTradeObjectRecursive() ||
+			(item->isIntangibleObject() && !item->isManufactureSchematic()) ||
+			hasUnsellableArrangement(item) ||
+			item->getParent().get() != bag)
+		return ItemSoldMessage::INVALIDITEM;
+
+	if (auctionMap->getItem(item->getObjectID()) != nullptr)
+		return ItemSoldMessage::ALREADYFORSALE;
+
+	// City sales tax is added to the asking price exactly as addSaleItem does.
+	ManagedReference<CityRegion*> city = terminal->getCityRegion().get();
+	if (city != nullptr)
+		price *= (1.0f + (city->getSalesTax() / 100.0f));
+
+	AuctionItem* listing = new AuctionItem(item->getObjectID());
+	if (listing == nullptr)
+		return ItemSoldMessage::UNKNOWNERROR;
+	{
+		Locker listingLock(listing);
+		listing->setVendorUID(getVendorUID(terminal));
+		listing->setOnBazaar(true);
+		listing->setVendorID(terminal->getObjectID());
+		listing->setItemName(item->getDisplayedName());
+		listing->setItemDescription("");
+		applyFactoryCrateMetadata(listing, item);
+		listing->setItemType(item->getClientGameObjectType());
+		listing->setPrice(price);
+		listing->setAuction(false);
+		listing->setStatus(AuctionItem::FORSALE);
+		listing->setBuyerID(0);
+		listing->setBidderName("");
+		listing->setOwnerID(bag->getObjectID());
+		listing->setOwnerName(sellerName);
+		listing->setSize(item->getSizeOnVendorRecursive());
+		listing->setExpireTime(time(0) + (expireSeconds == 0 ?
+			AuctionManager::COMMODITYEXPIREPERIOD :
+			Math::min<unsigned int>(expireSeconds,
+				AuctionManager::COMMODITYEXPIREPERIOD)));
+		ObjectManager::instance()->persistObject(listing, 0, "auctionitems");
+	}
+
+	TransactionLog trx(bag, terminal, item, TrxCode::AUCTIONADDSALE);
+	trx.setAutoCommit(false);
+	trx.addRelatedObject(item->getObjectID(), true);
+	trx.setExportRelatedObjects(true);
+
+	Locker listingLock(listing);
+	int result = auctionMap->addItem(nullptr, terminal, listing);
+	if (result != ItemSoldMessage::SUCCESS) {
+		trx.abort() << "failed to add sim bot listing to auctionMap, result=" <<
+			ItemSoldMessage::statusToString(result);
+		listing->destroyAuctionItemFromDatabase(false, false);
+		return result;
+	}
+	auctionMap->addToCommodityLimit(listing);
+
+	{
+		Locker itemLock(item);
+		item->destroyObjectFromWorld(true);
+	}
+	trx.commit();
+	listing->setPersistent(1);
+	return ItemSoldMessage::SUCCESS;
+}
+
+int AuctionManagerImplementation::retrieveSimBotItem(AuctionItem* item,
+		SceneObject* bag) {
+	if (item == nullptr || bag == nullptr || !isSimBotListing(item) ||
+			item->getStatus() == AuctionItem::SOLD ||
+			(item->getStatus() != AuctionItem::FORSALE &&
+				item->getStatus() != AuctionItem::EXPIRED) ||
+			item->getOwnerID() != bag->getObjectID())
+		return RetrieveAuctionItemResponseMessage::NOTALLOWED;
+	ManagedReference<SceneObject*> object = zoneServer->getObject(
+		item->getAuctionedItemObjectID());
+	if (object == nullptr)
+		return RetrieveAuctionItemResponseMessage::NOTALLOWED;
+	ManagedReference<SceneObject*> vendor = zoneServer->getObject(item->getVendorID());
+
+	// Global order: AuctionItem -> listed object -> bag (F_0.9.3 item -> bag).
+	Locker auctionLock(item);
+	if (item->getStatus() != AuctionItem::FORSALE &&
+			item->getStatus() != AuctionItem::EXPIRED)
+		return RetrieveAuctionItemResponseMessage::NOTALLOWED;
+	Locker objectLock(object, item);
+	Locker bagLock(bag, object);
+
+	TransactionLog trx(vendor, bag, object, TrxCode::AUCTIONRETRIEVE);
+	trx.addRelatedObject(object->getObjectID(), true);
+	trx.setExportRelatedObjects(true);
+	if (!bag->transferObject(object, -1, false)) {
+		trx.abort() << "transferObject to sim bot bag failed";
+		return RetrieveAuctionItemResponseMessage::NOTALLOWED;
+	}
+	trx.commit();
+	item->setStatus(AuctionItem::RETRIEVED);
+	auctionMap->deleteItem(vendor, item);
+	auctionMap->removeFromCommodityLimit(item);
+	item->setAuctionedItemObjectID(0);
+	return 0;
+}
+
+int AuctionManagerImplementation::releaseSimBotSale(AuctionItem* item) {
+	if (item == nullptr || !isSimBotListing(item) ||
+			item->getStatus() != AuctionItem::SOLD || item->getBuyerID() == 0)
+		return RetrieveAuctionItemResponseMessage::NOTALLOWED;
+	ManagedReference<SceneObject*> buyerObject = zoneServer->getObject(item->getBuyerID());
+	CreatureObject* buyer = buyerObject == nullptr ? nullptr :
+		buyerObject->asCreatureObject();
+	if (buyer != nullptr && buyer->isPlayerCreature()) {
+		updateAuctionOwner(item, buyer);
+		return 0;
+	}
+	Locker itemLock(item);
+	auctionMap->removeFromCommodityLimit(item);
+	item->setOwnerID(item->getBuyerID());
+	item->setOwnerName(item->getBidderName());
+	item->setUpdated(true);
+	return 0;
+}
 
 void AuctionManagerImplementation::initialize() {
 	Locker locker(_this.getReferenceUnsafeStaticCast());
@@ -114,9 +285,12 @@ void AuctionManagerImplementation::initialize() {
 			continue;
 		}
 
-		String ownerName = playerManager->getPlayerName(auctionItem->getOwnerID());
+		bool simBotListing = isSimBotListing(auctionItem);
+		String ownerName = simBotListing ? auctionItem->getOwnerName() :
+			playerManager->getPlayerName(auctionItem->getOwnerID());
 
-		if (ownerName.isEmpty()) {
+		if (ownerName.isEmpty() || (simBotListing &&
+				zoneServer->getObject(auctionItem->getOwnerID()) == nullptr)) {
 			error() << "Auction with invalid owner, deleting auctionItem: " << *auctionItem;
 			itemsToDelete.add(auctionItem);
 			continue;
@@ -372,9 +546,12 @@ void AuctionManagerImplementation::doAuctionMaint(TerminalListVector* items, con
 
 			ManagedReference<SceneObject*> vendor = zoneServer->getObject(item->getVendorID());
 			ManagedReference<PlayerManager*> playerManager = zoneServer->getPlayerManager();
-			String ownerName = playerManager->getPlayerName(item->getOwnerID());
+			bool simBotListing = isSimBotListing(item);
+			String ownerName = simBotListing ? item->getOwnerName() :
+				playerManager->getPlayerName(item->getOwnerID());
 
-			if(vendor == nullptr || vendor->getZone() == nullptr || ownerName.isEmpty()) {
+			if(vendor == nullptr || vendor->getZone() == nullptr || ownerName.isEmpty() ||
+					(simBotListing && zoneServer->getObject(item->getOwnerID()) == nullptr)) {
 				StringBuffer errMsg;
 
 				if (vendor == nullptr) {
@@ -910,15 +1087,8 @@ int AuctionManagerImplementation::checkSaleItem(CreatureObject* player, SceneObj
     if (object->isIntangibleObject() && !object->isManufactureSchematic())
         return ItemSoldMessage::INVALIDITEM;
 
-    for (int i = 0; i < object->getArrangementDescriptorSize(); ++i) {
-        const Vector<String>* descriptors = object->getArrangementDescriptor(i);
-        for (int j = 0; j < descriptors->size(); ++j) {
-            const String& descriptor = descriptors->get(j);
-            if (descriptor == "inventory" || descriptor == "datapad" || descriptor == "default_weapon"
-                || descriptor == "mission_bag" || descriptor == "ghost" || descriptor == "bank" || descriptor == "hair")
-                return ItemSoldMessage::INVALIDITEM;
-        }
-    }
+    if (hasUnsellableArrangement(object))
+        return ItemSoldMessage::INVALIDITEM;
 
     return ItemSoldMessage::SUCCESS;
 }
@@ -946,17 +1116,7 @@ AuctionItem* AuctionManagerImplementation::createVendorItem(CreatureObject* play
     item->setItemName(objectToSell->getDisplayedName());
     item->setItemDescription(description.toString());
 
-    if (objectToSell->isFactoryCrate()) {
-        ManagedReference<FactoryCrate*> crate = cast<FactoryCrate*>(objectToSell);
-        if (crate != nullptr) {
-            ManagedReference<TangibleObject*> prototype = crate->getPrototype();
-            if (prototype != nullptr) {
-                item->setFactoryCrate(true);
-                item->setCratedItemType(prototype->getClientGameObjectType());
-                item->setUpdated(true);
-            }
-        }
-    }
+    applyFactoryCrateMetadata(item, objectToSell);
 
     item->setItemType(objectToSell->getClientGameObjectType());
     item->setPrice(price);
@@ -1057,7 +1217,11 @@ void AuctionManagerImplementation::doInstantBuy(CreatureObject* player, AuctionI
 
 	ManagedReference<ChatManager*> cman = zoneServer->getChatManager();
 	ManagedReference<PlayerManager*> pman = zoneServer->getPlayerManager();
-	ManagedReference<CreatureObject*> seller = pman->getPlayer(item->getOwnerName());
+	bool simBotListing = isSimBotListing(item);
+	// Captured before the owner moves to the buyer: the bag is the seller.
+	uint64 simBotBagOid = simBotListing ? item->getOwnerID() : 0;
+	ManagedReference<CreatureObject*> seller = simBotListing ? nullptr :
+		pman->getPlayer(item->getOwnerName());
 
 	String sender = "auctioner";
 	String sellerName = item->getOwnerName();
@@ -1073,6 +1237,10 @@ void AuctionManagerImplementation::doInstantBuy(CreatureObject* player, AuctionI
 	else
 		availableTime = currentTime + AuctionManager::VENDOREXPIREPERIOD;
 
+	// A bot sale hands the item to the buyer at once, exactly as a player sale
+	// does (owner decision 2026-10-15: no pickup hold). updateAuctionOwner's
+	// bot branch never resolves the bag by name, so a buyer who shares the
+	// bot's name still becomes the owner.
 	updateAuctionOwner(item, player);
 
 	item->setStatus(AuctionItem::SOLD);
@@ -1149,7 +1317,8 @@ void AuctionManagerImplementation::doInstantBuy(CreatureObject* player, AuctionI
 		//Send the Mail
 		locker.release();
 		UnicodeString blankBody;
-		cman->sendMail(sender, sellerSubject, blankBody, sellerName, &sellerBodyVector, &sellerWaypointVector);
+		if (!simBotListing)
+			cman->sendMail(sender, sellerSubject, blankBody, sellerName, &sellerBodyVector, &sellerWaypointVector);
 		cman->sendMail(sender, buyerSubject, blankBody, item->getBidderName(), &buyerBodyVector, &buyerWaypointVector);
 
 		if(auctionMap->getVendorItemCount(vendor, true) == 0)
@@ -1199,9 +1368,31 @@ void AuctionManagerImplementation::doInstantBuy(CreatureObject* player, AuctionI
 
 		//Send the Mail
 		UnicodeString blankBody;
-		cman->sendMail(sender, sellerSubject, blankBody, sellerName, &sellerBodyVector, &sellerWaypointVector);
+		if (!simBotListing)
+			cman->sendMail(sender, sellerSubject, blankBody, sellerName, &sellerBodyVector, &sellerWaypointVector);
 		cman->sendMail(sender, buyerSubject, blankBody, item->getBidderName(), &buyerBodyVector, &buyerWaypointVector);
 
+	}
+
+	if (simBotListing) {
+		trx.commit();
+		if (city != nullptr && !city->isClientRegion() && tax) {
+			Locker cityLock(city);
+			city->addToCityTreasury(tax);
+		}
+		PlayerBotBazaarSale sale;
+		sale.auctionOid = item->getObjectID();
+		sale.objectId = item->getAuctionedItemObjectID();
+		sale.bagOid = simBotBagOid;
+		sale.released = true;
+		sale.buyerId = player->getObjectID();
+		sale.grossPrice = item->getPrice();
+		sale.tax = tax;
+		sale.buyerName = item->getBidderName();
+		SimPlayerManager* simPlayerManager = SimPlayerManager::instance();
+		if (simPlayerManager != nullptr)
+			simPlayerManager->enqueuePlayerBotBazaarSale(sale);
+		return;
 	}
 
 	if (seller == nullptr) {
@@ -1416,6 +1607,12 @@ int AuctionManagerImplementation::checkRetrieve(CreatureObject* player, uint64 o
 	if (item == nullptr || item->getStatus() == AuctionItem::RETRIEVED) {
 		return RetrieveAuctionItemResponseMessage::NOTALLOWED;
 	}
+
+	// A SOLD AuctionItem still owned by a bag predates instant pickup (a held
+	// sale from an older build): no player may retrieve it; the settlement
+	// sweep releases it to its buyer.
+	if (item->getStatus() == AuctionItem::SOLD && isSimBotListing(item))
+		return RetrieveAuctionItemResponseMessage::NOTALLOWED;
 
 	if(item->isAuction() && item->getStatus() == AuctionItem::FORSALE)
 		return RetrieveAuctionItemResponseMessage::NOTALLOWED;
@@ -2092,7 +2289,8 @@ void AuctionManagerImplementation::cancelItem(CreatureObject* player, uint64 obj
 			sellerBody.setTO(itemName);
 
 			//Send the Mail
-			cman->sendMail(sender, sellerSubject, sellerBody, item->getOwnerName(), waypoint);
+				if (!isSimBotListing(item))
+					cman->sendMail(sender, sellerSubject, sellerBody, item->getOwnerName(), waypoint);
 		}
 	}
 
@@ -2148,7 +2346,8 @@ void AuctionManagerImplementation::expireSale(AuctionItem* item) {
 
 	locker.release();
 
-	cman->sendMail(sender, sellerSubject, sellerBody, item->getOwnerName());
+	if (!isSimBotListing(item))
+		cman->sendMail(sender, sellerSubject, sellerBody, item->getOwnerName());
 
 	if (!item->isOnBazaar()) {
 		ManagedReference<SceneObject*> vendor = zoneServer->getObject(item->getVendorID());
@@ -2189,7 +2388,8 @@ void AuctionManagerImplementation::expireBidAuction(AuctionItem* item) {
 
 	locker.release();
 
-	cman->sendMail(sender, sellerSubject, sellerBody, item->getOwnerName());
+	if (!isSimBotListing(item))
+		cman->sendMail(sender, sellerSubject, sellerBody, item->getOwnerName());
 }
 
 void AuctionManagerImplementation::expireAuction(AuctionItem* item) {
@@ -2306,7 +2506,8 @@ void AuctionManagerImplementation::expireAuction(AuctionItem* item) {
 		locker.release();
 
 		UnicodeString blankBody;
-		cman->sendMail(sender, sellerSubject, blankBody, sellerName, &sellerBodyVector, &sellerWaypointVector);
+		if (!isSimBotListing(item))
+			cman->sendMail(sender, sellerSubject, blankBody, sellerName, &sellerBodyVector, &sellerWaypointVector);
 		cman->sendMail(sender, buyerSubject, blankBody, item->getBidderName(), &buyerBodyVector, &buyerWaypointVector);
 	}
 }
@@ -2345,7 +2546,8 @@ void AuctionManagerImplementation::deleteExpiredSale(AuctionItem* item, bool sen
 		//Send the Mail
 		locker.release();
 
-		cman->sendMail(sender, sellerSubject, sellerBody, item->getOwnerName(), waypoint);
+			if (!isSimBotListing(item))
+				cman->sendMail(sender, sellerSubject, sellerBody, item->getOwnerName(), waypoint);
 	}
 
 	TransactionLog trx(vendor, TrxCode::AUCTIONEXPIRED, zoneServer->getObject(item->getAuctionedItemObjectID()));
@@ -2371,9 +2573,11 @@ void AuctionManagerImplementation::updateAuctionOwner(AuctionItem* item, Creatur
 	Locker locker(item);
 
 	ManagedReference<PlayerManager*> pman = zoneServer->getPlayerManager();
-	ManagedReference<CreatureObject*> previousOwner = pman->getPlayer(item->getOwnerName());
+	bool simBotListing = isSimBotListing(item);
+	ManagedReference<CreatureObject*> previousOwner = simBotListing ? nullptr :
+		pman->getPlayer(item->getOwnerName());
 
-	if(player == previousOwner)
+	if(!simBotListing && player == previousOwner)
 		return;
 
 	auctionMap->removeFromCommodityLimit(item);

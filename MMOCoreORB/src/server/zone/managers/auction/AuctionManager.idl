@@ -85,6 +85,18 @@ class AuctionManager extends ManagedService implements Logger {
 	@local
 	public native int checkSaleItem(CreatureObject player, SceneObject object, SceneObject vendor, int price, boolean premium, boolean stockroomSale);
 
+	@local
+	public native boolean isSimBotListing(AuctionItem item);
+
+	@local
+	public native int listSimBotItem(SceneObject bag, final string sellerName, SceneObject item, SceneObject terminal, int price, unsigned int expireSeconds);
+
+	@local
+	public native int retrieveSimBotItem(AuctionItem item, SceneObject bag);
+
+	@local
+	public native int releaseSimBotSale(AuctionItem item);
+
 	public native void getItemAttributes(CreatureObject player, unsigned long objectid);
 
 	public native void getData(CreatureObject player, int locationType, unsigned long vendorObjectID, int searchType, unsigned int itemCategory, final unicode filterText, int minPrice, int maxPrice, boolean includeEntranceFee, int count, int offset);
@@ -171,4 +183,3 @@ class AuctionManager extends ManagedService implements Logger {
 		return zoneServer;
 	}
 }
-

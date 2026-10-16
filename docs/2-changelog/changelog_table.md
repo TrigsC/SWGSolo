@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.9.11` | 14 | F_0.9.9 P.10j: bazaar SELL — roster PlayerBots walk to an outdoor bazaar terminal and list vault loot on the real bazaar (loot value x markup, never below a human ask, generic junk kept), human buyers collect instantly while the bot's proceeds settle within seconds through ledger receipts and an applied mark (schema 1016), with relist at the same price, kill-switch drain and boot recovery; gate default-off |
 | `0.9.10` | 14 | F_0.9.3 P.10d: loot from kills and the hive item vault — a roster PlayerBot's kill gets stock loot and cash, the bot walks to the corpse (even mid travel leg) and loots it: cash into its store, items into its own bag in a persistent vault with one simbot_items row each (schema 1015), boot reconciliation and teardown on deletion; gate default-off |
 | `0.9.9` | 14 | F_0.9.2 P.10c: mission credits and the holdings journal — roster PlayerBots are paid the stock destroy-mission reward into an identity-keyed bank balance, every change to what a bot holds is journaled in simbot_ledger (schema 1014), and a doctor-buff fee is the first credit sink; both gates default-off |
 | `0.9.8` | 14 | F_0.9.8 P.10i: lair tactics and mission graduation — PlayerBots complete destroy missions end to end: overland fallback and stock-style lair placement, graduation at box 4, lair hold with wave break-off and de-aggro, progression-first dispatch, travel combat with a one-leg flee cap, attacker recognition, area-attack lair guard and lair retreat defense; the proven gates ship on |
@@ -29,6 +30,11 @@
 
 # Changelog Summary
 
+- **v0.9.11 (Bazaar SELL, F_0.9.9 P.10j - Week 14, 16-10-2026)**:
+  - **Bots sell their loot on the real bazaar.** A roster bot starting a job walks to an outdoor bazaar terminal and lists vault items at loot value x 3. It never lists below a human listing of the same item, keeps generic junk, and relists an unsold item at its first ask.
+  - **The vault bag is the seller.** Six guarded stock branches keep bot listings alive through boot and maintenance and pay the bot instead of resolving a seller by name. Human listings are unaffected.
+  - **Instant pickup, durable settlement.** Buyers collect at once. The bot is paid within seconds through ledger receipts covered by an applied mark (schema 1016), and lost sales are recovered at boot.
+  - **Verified live.** 33 of 33 and 26 of 26 assertions, real bots listing, and an in-client purchase by the owner that matched to the credit. The gate ships off.
 - **v0.9.10 (Loot and the Hive Item Vault, F_0.9.3 P.10d - Week 14, 14-10-2026)**:
   - **Bot kills produce loot.** A roster PlayerBot's kill gets stock loot and cash, owned by the bot; the bot walks to the corpse, even interrupting a travel leg, loots it, and resumes.
   - **The vault is the bot's inventory.** Items move into the bot's own bag in one persistent vault, with one `simbot_items` row each (schema 1015) and a journal row per change; cash goes to the store. Items keep their rolled stats because the same object moves. Cap 80 per bot.

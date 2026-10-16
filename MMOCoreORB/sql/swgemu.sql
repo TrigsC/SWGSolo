@@ -13583,6 +13583,8 @@ CREATE TABLE IF NOT EXISTS `swgemu`.`simbot_progression` (
   `last_award_source` varchar(32) DEFAULT NULL,
   `created_at` datetime NOT NULL,
   `updated_at` datetime NOT NULL,
+  `bank_ledger_applied_id` bigint(20) NOT NULL DEFAULT '0',
+  `cash_ledger_applied_id` bigint(20) NOT NULL DEFAULT '0',
   PRIMARY KEY (`identity_id`)
 ) ENGINE=MyISAM DEFAULT CHARSET=latin1;
 
@@ -13605,6 +13607,7 @@ CREATE TABLE IF NOT EXISTS `swgemu`.`simbot_items` (
   `object_id` bigint(20) NOT NULL,
   `identity_id` bigint(20) DEFAULT NULL,
   `state` varchar(12) NOT NULL,
+  `ask_price` int(11) NOT NULL DEFAULT '0',
   `template_crc` int(10) unsigned NOT NULL,
   `display_name` varchar(64) NOT NULL,
   `source` varchar(32) NOT NULL,
@@ -13614,6 +13617,28 @@ CREATE TABLE IF NOT EXISTS `swgemu`.`simbot_items` (
   PRIMARY KEY (`object_id`),
   KEY `idx_simbot_items_identity_state` (`identity_id`,`state`),
   KEY `idx_simbot_items_state` (`state`)
+) ENGINE=MyISAM DEFAULT CHARSET=latin1;
+
+CREATE TABLE IF NOT EXISTS `swgemu`.`simbot_listings` (
+  `auction_oid` bigint(20) NOT NULL,
+  `identity_id` bigint(20) DEFAULT NULL,
+  `object_id` bigint(20) NOT NULL,
+  `state` varchar(12) NOT NULL,
+  `price` int(11) NOT NULL DEFAULT '0',
+  `fee` int(11) NOT NULL DEFAULT '0',
+  `tax` int(11) NOT NULL DEFAULT '0',
+  `net_paid` int(11) NOT NULL DEFAULT '0',
+  `vendor_oid` bigint(20) NOT NULL DEFAULT '0',
+  `planet` varchar(32) NOT NULL DEFAULT '',
+  `buyer_name` varchar(64) NOT NULL DEFAULT '',
+  `listed_at` datetime NOT NULL,
+  `closed_at` datetime DEFAULT NULL,
+  `released_at` datetime DEFAULT NULL,
+  `updated_at` datetime NOT NULL,
+  PRIMARY KEY (`auction_oid`),
+  KEY `idx_simbot_listings_identity` (`identity_id`),
+  KEY `idx_simbot_listings_object` (`object_id`),
+  KEY `idx_simbot_listings_state` (`state`)
 ) ENGINE=MyISAM DEFAULT CHARSET=latin1;
 
 CREATE TABLE IF NOT EXISTS `swgemu`.`simbot_experience` (

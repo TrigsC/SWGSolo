@@ -135,6 +135,8 @@ struct SimBotProgression {
 	uint64 identityId = 0;
 	int64 bankCredits = 0;
 	int64 cashCredits = 0;
+	uint64 bankLedgerAppliedId = 0;
+	uint64 cashLedgerAppliedId = 0;
 	int skillPointsSpent = 0;
 	uint64 awardsTotal = 0;
 	String lastAwardSource;
@@ -187,6 +189,7 @@ struct SimBotItemRow {
 	uint64 objectId = 0;
 	uint64 identityId = 0;
 	SimBotItemState state = SIMBOT_ITEM_HELD;
+	int askPrice = 0;
 	uint32 templateCrc = 0;
 	String displayName;
 	String source;
@@ -610,6 +613,56 @@ struct PlayerBotProgressionRequest {
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
 
+struct PlayerBotBazaarListing {
+	uint64 auctionOid = 0;
+	uint64 identityId = 0;
+	uint64 objectId = 0;
+	uint64 bagOid = 0;
+	int state = 0;
+	int price = 0;
+	int fee = 0;
+	int tax = 0;
+	int64 creditReceiptSum = 0;
+	int64 itemReceiptSum = 0;
+	int netPaid = 0;
+	uint64 vendorOid = 0;
+	String planet;
+	String buyerName;
+	uint64 listedAtMs = 0;
+	uint64 closedAtMs = 0;
+	uint64 releasedAtMs = 0;
+	bool dirty = false;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotCreditReservation {
+	uint64 identityId = 0;
+	String purpose;
+	int64 amount = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotBazaarSale {
+	uint64 auctionOid = 0;
+	uint64 objectId = 0;
+	uint64 bagOid = 0;
+	uint64 buyerId = 0;
+	int grossPrice = 0;
+	int tax = 0;
+	String buyerName;
+	// The buyer already owns the AuctionItem (instant pickup, or recovered from
+	// a buyer-owned record): settlement closes the listing as released. False
+	// only for a bag-owned held sale from an older build.
+	bool released = false;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
 // P.10a parity harness configuration. Runtime request fields are kept on the
 // step so a queued SQL operation can be polled without a second runner state
 // object; the runner is the only writer of those fields.
@@ -629,6 +682,16 @@ struct PlayerBotParityTestStep {
 	String skillName;
 	String skillMod;
 	int64 amount = 0;
+	int price = 0;
+	int junkValue = 0;
+	int junkMask = 0;
+	bool noTrade = false;
+	uint64 itemOid = 0;
+	uint64 auctionOid = 0;
+	String planet;
+	bool ownerIsBag = false;
+	bool hasOwnerIsBag = false;
+	String ownerName;
 	int difficultyLevel = 1;
 	int missions = 1;
 	int feeCredits = 0;
@@ -699,14 +762,20 @@ struct PlayerBotParityTestStep {
 	int expectedDespawnSeconds = -1;
 	int lootCap = -1;
 	bool hasLootGate = false;
+	bool hasBazaarSellGate = false;
 	// awaitKillTargetDeath: leave the corpse in the world (loot scenarios).
 	bool keepCorpse = false;
 	// assertItemRow: match the row of the last seeded item instead of the
 	// identity (reconciliation moves a row to the system owner).
 	bool bySeededItem = false;
 	bool lootGate = false;
+	bool bazaarSellGate = false;
+	bool suppressBazaarSalePod = false;
+	bool bazaarPublishFault = false;
 	bool inVault = false;
 	bool hasInVault = false;
+	float bazaarMarkup = 0.f;
+	bool hasBazaarMarkup = false;
 	int combatAbilitySpecialAttackChancePercent = -1;
 	bool hasCombatAbilitySpecialAttackChancePercent = false;
 	bool combatAbilityHarnessOptIn = false;
@@ -2442,6 +2511,75 @@ private:
 	uint64 progressionLedgerLastPruneMs = 0;
 	Vector<SimBotLedgerEntry> progressionLedgerPending;
 	VectorMap<uint64, Vector<SimBotLedgerEntry> > progressionRecentLedger;
+	VectorMap<uint64, uint64> progressionInsertedBankHighWater;
+	VectorMap<uint64, uint64> progressionInsertedCashHighWater;
+	VectorMap<uint64, PlayerBotBazaarListing> progressionBazaarListings;
+	VectorMap<uint64, PlayerBotBazaarListing> progressionBazaarClosedListings;
+	VectorMap<uint64, uint64> progressionBazaarListingByAuction;
+	VectorMap<uint64, Pair<int64, int64> > progressionBazaarReceiptSums;
+	VectorMap<uint64, bool> progressionItemDeleteIds;
+	Mutex progressionBazaarSaleMutex;
+	Vector<PlayerBotBazaarSale> progressionBazaarSaleBacklog;
+	bool progressionBazaarSellEnabled = false;
+	float progressionBazaarMarkup = 3.0f;
+	int progressionBazaarMinPrice = 50;
+	int progressionBazaarMaxPrice = 20000;
+	int progressionBazaarMaxListingsPerBot = 10;
+	int progressionBazaarListingsPerVisit = 3;
+	int progressionBazaarDurationHours = 168;
+	int progressionBazaarCooldownSeconds = 120;
+	int progressionBazaarVisitCooldownMinutes = 120;
+	int progressionBazaarDetourSeconds = 300;
+	int progressionBazaarMaxDetourMeters = 300;
+	int progressionBazaarMaxListingsPerVisit = 3;
+	int progressionBazaarArriveMeters = 4;
+	int progressionBazaarTimeoutSeconds = 180;
+	int progressionBazaarSweepIntervalSeconds = 300;
+	int progressionBazaarSweepBatch = 20;
+	int progressionBazaarSaleBacklogMax = 256;
+	bool progressionBazaarDrainOnDisable = true;
+	bool progressionBazaarSettlementMode = false;
+	uint64 progressionBazaarLastSweepMs = 0;
+	std::atomic<bool> progressionListingReconcilePending{true};
+	AtomicLong bazaarListed;
+	AtomicLong bazaarSold;
+	AtomicLong bazaarRetrieved;
+	AtomicLong bazaarDrained;
+	AtomicLong bazaarFeesPaid;
+	AtomicLong bazaarProceeds;
+	AtomicLong bazaarTaxPaid;
+	AtomicLong bazaarSkippedJunk;
+	AtomicLong bazaarSkippedNoValue;
+	AtomicLong bazaarSkippedHumanAboveCap;
+	AtomicLong bazaarSkippedCap;
+	AtomicLong bazaarSkippedUnaffordable;
+	AtomicLong bazaarSkippedNoTrade;
+	AtomicLong bazaarSkippedTransferFailed;
+	AtomicLong bazaarSaleUnresolved;
+	AtomicLong bazaarReconcileSettledByEvidence;
+	// Auctions already counted in bazaarSaleUnresolved (progressionMutex): the
+	// settle, sweep and release paths revisit one sale many times.
+	VectorMap<uint64, bool> progressionBazaarUnresolvedAuctions;
+	// Set by enqueuePlayerBotBazaarSale; the maintenance lane consumes it and
+	// force-flushes so a sale's receipts are durable within seconds.
+	std::atomic<bool> progressionBazaarFlushRequested{false};
+	AtomicLong bazaarSaleBacklogOverflow;
+	AtomicLong bazaarReleaseBuyerGone;
+	AtomicLong bazaarDeleteBlockedByListing;
+	AtomicLong bazaarReconcileAdopted;
+	AtomicLong bazaarReconcileSettled;
+	AtomicLong bazaarReconcileReversed;
+	AtomicLong bazaarReconcileRetrieved;
+	AtomicLong bazaarReconcileOrphaned;
+	AtomicLong bazaarReconcileAdoptedTaxEstimated;
+	AtomicLong bazaarReconcileReleasedRepaired;
+	AtomicLong bazaarVisitsBegun;
+	AtomicLong bazaarVisitsListedAny;
+	AtomicLong bazaarVisitsNoOutdoorTerminal;
+	AtomicLong bazaarVisitsTimeout;
+	AtomicLong bazaarVisitsPathFailed;
+	AtomicLong bazaarVisitsNewAttacker;
+	VectorMap<uint64, uint64> progressionBazaarVisitCooldownUntilMs;
 	AtomicLong progressionAwardsAccepted;
 	AtomicLong progressionAwardsRejectedNoRecord;
 	AtomicLong progressionAwardsRejectedNoIdentity;
@@ -2522,7 +2660,7 @@ private:
 	AtomicLong buffPaymentReleased;
 	AtomicLong buffPaymentReleasedGateOff;
 	AtomicLong buffPaymentChargeFailed;
-	VectorMap<uint64, int64> progressionBuffFeeReservations;
+	VectorMap<String, PlayerBotCreditReservation> progressionCreditReservations;
 	AtomicLong trainingTrained;
 	AtomicLong trainingRefusedNoRecord;
 	AtomicLong trainingRefusedGate;
@@ -2589,6 +2727,9 @@ private:
 	bool playerBotParityTestBootInitialized = false;
 	bool playerBotParityTestAwaitingRestart = false;
 	bool playerBotParityTestCompleted = false;
+	bool playerBotParityTestProgressionEnabledOverrideActive = false;
+	bool playerBotParityTestProgressionEnabledOverride = true;
+	bool playerBotParityTestProgressionEnabledOverridePrevious = true;
 	bool playerBotParityTestGateOverrideActive = false;
 	bool playerBotParityTestGateOverride = true;
 	bool playerBotParityTestTrainingGateOverrideActive = false;
@@ -2607,9 +2748,18 @@ private:
 	bool playerBotParityTestLootGateOverrideActive = false;
 	bool playerBotParityTestLootGateOverride = false;
 	VectorMap<uint64, bool> playerBotParityLootGateScopedIds;
+	bool playerBotParityTestBazaarSellGateOverrideActive = false;
+	bool playerBotParityTestBazaarSellGateOverride = false;
+	VectorMap<uint64, bool> playerBotParityBazaarSellGateScopedIds;
+	bool playerBotParityTestBazaarMarkupOverrideActive = false;
+	float playerBotParityTestBazaarMarkupOverridePrevious = 3.0f;
 	bool playerBotParityTestLootCapOverrideActive = false;
 	int playerBotParityTestLootCapOverridePrevious = 80;
 	AtomicBoolean playerBotParityTestFailItemTransfer{false};
+	AtomicBoolean playerBotParityTestSuppressBazaarSalePod{false};
+	AtomicBoolean playerBotParityTestBazaarPublishFault{false};
+	uint64 playerBotParityLastBazaarAuctionOid = 0;
+	uint64 playerBotParityLastBazaarItemOid = 0;
 	bool playerBotParityTestBuffPaymentGateOverrideActive = false;
 	bool playerBotParityTestBuffPaymentGateOverride = false;
 	bool playerBotParityTestBuffPaymentGateOverridePreviousActive = false;
@@ -2679,6 +2829,10 @@ private:
 	uint64 playerBotParityProvokedIdentityId = 0;
 	uint64 playerBotParityProvokedCreatureOid = 0;
 	uint64 playerBotParityProvokeLootedAtMs = 0;
+	// Bazaar scenarios: helper buyer creatures and "human" seeded listings the
+	// harness created, removed by despawnPlayerBotParityBazaarHelpers.
+	Vector<uint64> playerBotParityBazaarHelperCreatureOids;
+	Vector<uint64> playerBotParityBazaarHumanListingItemOids;
 	// Last corpse each identity looted (LOOTED or PARTIAL_CAP), under lootMutex.
 	VectorMap<uint64, uint64> lootLastLootedCorpseByIdentity;
 	// Cash seedCorpseLoot's sibling placed on the corpse; a successful harness
@@ -3070,8 +3224,12 @@ private:
 	// its own FlushNow request.
 	void flushPlayerBotProgressionStore(bool force, int faultDelayMs = 0,
 		bool faultFailNext = false, bool faultFailLedgerInsert = false);
+	bool probePlayerBotBazaarObligations();
 	void reconcilePlayerBotProgression();
 	void reconcilePlayerBotItems();
+	void reconcilePlayerBotBazaarListings();
+	void settlePlayerBotBazaarSales();
+	void sweepPlayerBotBazaarListings(uint64 nowMs);
 	bool destroyPlayerBotItemsAndBag(uint64 identityId);
 	JSONSerializationType buildPlayerBotItemStatSnapshot(SceneObject* item);
 	void reconcileIdentityTiers();
@@ -3129,9 +3287,31 @@ private:
 	void despawnPlayerBotParityKillTarget(bool keepCorpse = false);
 	void extendPlayerBotParityCorpseDespawn(CreatureObject* corpse);
 	void despawnPlayerBotParityProvokedCreature();
+	void trackPlayerBotParityBazaarHelperCreature(CreatureObject* creature);
+	bool isPlayerBotLedgerAppliedLocked(uint64 identityId) const;
+	void countPlayerBotBazaarSaleUnresolvedLocked(uint64 auctionOid);
+	bool findBuyerOwnedBotSaleLocked(const PlayerBotBazaarListing& row,
+		AuctionManager* auctionManager, ZoneServer* zoneServer,
+		PlayerBotBazaarSale& sale);
+	bool hasPendingLedgerKindLocked(uint64 identityId, const String& kind) const;
+	uint64 playerBotLedgerMaxId(uint64 identityId, const String& kind);
+	// Inserted-but-not-yet-covered credit rows: resolved to MAX(id) by the
+	// balance UPDATE that applies them.
+	static const uint64 UNAPPLIED_HIGH_WATER = 0xFFFFFFFFFFFFFFFFULL;
+	void despawnPlayerBotParityBazaarHelpers();
 	bool awardToNonRosterPlayerBotBody(uint64 identityId, const String& xpType,
 		int amount, const String& source);
 	bool playerBotProgressionAwardGateEnabled();
+	bool playerBotBazaarSellGateEnabled(uint64 identityId);
+	String playerBotCreditReservationKey(uint64 identityId,
+		const String& purpose) const;
+	int64 reservedPlayerBotCreditsLocked(uint64 identityId, bool bank) const;
+	bool reservePlayerBotCreditsLocked(uint64 identityId, int64 amount,
+		const String& purpose);
+	bool commitPlayerBotCreditsLocked(uint64 identityId,
+		const String& purpose, bool bank, const String& source, uint64 refId,
+		const String& detail);
+	void releasePlayerBotCreditsLocked(uint64 identityId, const String& purpose);
 	bool playerBotLootGateEnabled(uint64 identityId);
 	bool playerBotMissionCreditGateEnabled(uint64 identityId);
 	bool playerBotBuffPaymentGateEnabled(uint64 identityId);
@@ -3807,6 +3987,23 @@ public:
 	bool depositPlayerBotItem(uint64 identityId,
 		const Vector<SimBotItemDeposit>& objects, const String& source,
 		uint64 refId);
+	bool enqueuePlayerBotBazaarSale(const PlayerBotBazaarSale& sale);
+	bool listPlayerBotItemAtBazaar(uint64 identityId, uint64 objectId,
+		SceneObject* terminal, int price);
+	bool listPlayerBotItemsAtTerminal(uint64 identityId, CreatureObject* body,
+		SceneObject* terminal);
+	bool shouldPlayerBotVisitBazaar(uint64 identityId);
+	bool beginPlayerBotBazaarVisit(uint64 identityId);
+	void recordPlayerBotBazaarVisit(uint64 identityId, const String& outcome);
+	int getPlayerBotBazaarMaxDetourMeters() const {
+		return progressionBazaarMaxDetourMeters;
+	}
+	int getPlayerBotBazaarArriveMeters() const {
+		return progressionBazaarArriveMeters;
+	}
+	int getPlayerBotBazaarVisitTimeoutSeconds() const {
+		return progressionBazaarTimeoutSeconds;
+	}
 	bool removePlayerBotItemsForReap(uint64 identityId);
 	uint64 resolvePlayerBotLootOwner(uint64 bodyOid);
 	bool queuePlayerBotLootClaim(uint64 identityId, uint64 corpseOid,

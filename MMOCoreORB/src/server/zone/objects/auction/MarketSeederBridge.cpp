@@ -129,7 +129,8 @@ CreatureObject* MarketSeederBridge::getSystemSeller(Zone* zone) {
         return ensureSystemSeller(zone);
 }
 
-SceneObject* MarketSeederBridge::findBazaarTerminal(Zone* zone, float x, float z, float y, float searchRadius) {
+SceneObject* MarketSeederBridge::findBazaarTerminal(Zone* zone, float x, float z,
+                float y, float searchRadius, bool outdoorOnly) {
         if (zone == nullptr)
                 return nullptr;
 
@@ -143,7 +144,8 @@ SceneObject* MarketSeederBridge::findBazaarTerminal(Zone* zone, float x, float z
                 ManagedReference<TreeEntry*> entry = nearby.get(i);
                 SceneObject* candidate = entry.castTo<SceneObject*>();
 
-                if (candidate == nullptr || !candidate->isBazaarTerminal())
+                if (candidate == nullptr || !candidate->isBazaarTerminal() ||
+                                (outdoorOnly && candidate->getParent() != nullptr))
                         continue;
 
                 float dx = candidate->getPositionX() - x;

@@ -234,4 +234,57 @@ void ServerDatabase::updateDatabaseSchema() {
 		"KEY `idx_simbot_items_state` (`state`)"
 		") ENGINE=MyISAM DEFAULT CHARSET=latin1;"
 	);
+
+	if (dbSchemaVersion < 1016) {
+		try {
+			UniqueReference<ResultSet*> result(instance()->executeQuery(
+				"CREATE TABLE IF NOT EXISTS `simbot_listings` ("
+				"`auction_oid` BIGINT NOT NULL,"
+				"`identity_id` BIGINT DEFAULT NULL,"
+				"`object_id` BIGINT NOT NULL,"
+				"`state` VARCHAR(12) NOT NULL,"
+				"`price` INT NOT NULL DEFAULT 0,"
+				"`fee` INT NOT NULL DEFAULT 0,"
+				"`tax` INT NOT NULL DEFAULT 0,"
+				"`net_paid` INT NOT NULL DEFAULT 0,"
+				"`vendor_oid` BIGINT NOT NULL DEFAULT 0,"
+				"`planet` VARCHAR(32) NOT NULL DEFAULT '',"
+				"`buyer_name` VARCHAR(64) NOT NULL DEFAULT '',"
+				"`listed_at` DATETIME NOT NULL,"
+				"`closed_at` DATETIME DEFAULT NULL,"
+				"`released_at` DATETIME DEFAULT NULL,"
+				"`updated_at` DATETIME NOT NULL,"
+				"PRIMARY KEY (`auction_oid`),"
+				"KEY `idx_simbot_listings_identity` (`identity_id`),"
+				"KEY `idx_simbot_listings_object` (`object_id`),"
+				"KEY `idx_simbot_listings_state` (`state`)"
+				") ENGINE=MyISAM DEFAULT CHARSET=latin1;"));
+			(void)result;
+			result = instance()->executeQuery(
+				"ALTER TABLE `simbot_items` ADD COLUMN IF NOT EXISTS `ask_price` INT NOT NULL DEFAULT 0 AFTER `state`;" );
+			(void)result;
+			result = instance()->executeQuery(
+				"ALTER TABLE `simbot_progression` "
+				"ADD COLUMN IF NOT EXISTS `bank_ledger_applied_id` BIGINT NOT NULL DEFAULT 0 AFTER `updated_at`,"
+				"ADD COLUMN IF NOT EXISTS `cash_ledger_applied_id` BIGINT NOT NULL DEFAULT 0 AFTER `bank_ledger_applied_id`;" );
+			(void)result;
+			result = instance()->executeQuery(
+				"UPDATE `simbot_progression` p SET "
+				"`bank_ledger_applied_id`=COALESCE((SELECT MAX(l.`id`) FROM "
+				"`simbot_ledger` l WHERE l.`identity_id`=p.`identity_id` AND "
+				"l.`kind`='credits_bank'),0),"
+				"`cash_ledger_applied_id`=COALESCE((SELECT MAX(l.`id`) FROM "
+				"`simbot_ledger` l WHERE l.`identity_id`=p.`identity_id` AND "
+				"l.`kind`='credits_cash'),0);" );
+			(void)result;
+			result = instance()->executeQuery(
+				"UPDATE `db_metadata` SET `schema_version` = 1016;" );
+			(void)result;
+			dbSchemaVersion = 1016;
+			info(true) << "Upgraded mysql database schema to version " << dbSchemaVersion;
+		} catch (const Exception& e) {
+			error(e.getMessage());
+			error() << "Failed to update database schema to 1016; bazaar sell remains unavailable until migration succeeds.";
+		}
+	}
 }

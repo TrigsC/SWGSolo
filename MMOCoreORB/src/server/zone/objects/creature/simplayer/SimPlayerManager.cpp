@@ -18,12 +18,16 @@
 #include "SimBotMissionCredits.h"
 #include "SimBotLootStep.h"
 #include "SimBotItemReconcile.h"
+#include "SimBotBazaar.h"
+#include "MissionDiagLog.h"
 
+#include <algorithm>
 #include <vector>
 #include "StructureTraversalDiagLog.h"
 
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <fstream>
 #include <functional>
 #include <sstream>
@@ -68,7 +72,9 @@
 #include "server/zone/managers/auction/AuctionManager.h"
 #include "server/zone/managers/auction/AuctionsMap.h"
 #include "server/zone/managers/auction/TerminalListVector.h"
+#include "server/zone/objects/auction/MarketSeederBridge.h"
 #include "server/zone/objects/auction/AuctionItem.h"
+#include "server/zone/packets/auction/ItemSoldMessage.h"
 #include "server/zone/objects/resource/ResourceContainer.h"
 #include "server/zone/objects/resource/ResourceSpawn.h"
 #include "server/zone/objects/creature/buffs/BuffType.h"
@@ -114,7 +120,8 @@
 static String prettyPveHunterSiteName(const String& name);
 static bool playerBotValidWeaponType(const String& weaponType);
 static bool isPlayerBotParityRestartScenario(const String& name) {
-	return name == "retained_record_survives_restart";
+	return name == "retained_record_survives_restart" ||
+		name == "bazaar_restart_probe";
 }
 
 struct PlayerBotObservedVaultItem {
@@ -125,10 +132,48 @@ struct PlayerBotObservedVaultItem {
 	ManagedReference<SceneObject*> object;
 	uint32 templateCrc = 0;
 	String displayName;
+	uint64 auctionOid = 0;
+	int askPrice = 0;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
+
+struct PlayerBotBazaarAuctionSnapshot {
+	ManagedReference<AuctionItem*> item;
+	uint64 auctionOid = 0;
+	uint64 objectId = 0;
+	uint64 bagOid = 0;
+	uint64 identityId = 0;
+	uint64 buyerId = 0;
+	uint64 vendorOid = 0;
+	int status = AuctionItem::FORSALE;
+	int price = 0;
+	int askPrice = 0;
+	uint64 expireTime = 0;
+	String buyerName;
+	String ownerName;
+	String planet;
+	bool mappedBag = false;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+static int playerBotBazaarAskPrice(ZoneServer* zoneServer,
+		AuctionItem* item) {
+	if (zoneServer == nullptr || item == nullptr)
+		return item == nullptr ? 0 : item->getPrice();
+	ManagedReference<SceneObject*> vendor = zoneServer->getObject(
+		item->getVendorID());
+	ManagedReference<CityRegion*> city = vendor == nullptr ? nullptr :
+		vendor->getCityRegion().get();
+	if (city == nullptr || city->getSalesTax() <= 0)
+		return item->getPrice();
+	int tax = item->getPrice() - static_cast<int>(item->getPrice() /
+		(1.0f + (city->getSalesTax() / 100.f)));
+	return Math::max(0, item->getPrice() - tax);
+}
 
 class SimMinerSummaryTask : public Task {
 public:
@@ -6201,6 +6246,27 @@ void SimPlayerManager::loadLuaConfig() {
 	pveDatabaseAvailable = false;
 	pveBootReady = false;
 	progressionEnabled = false;
+	progressionBazaarSellEnabled = false;
+	progressionBazaarMarkup = 3.0f;
+	progressionBazaarMinPrice = 50;
+	progressionBazaarMaxPrice = 20000;
+	progressionBazaarMaxListingsPerBot = 10;
+	progressionBazaarListingsPerVisit = 3;
+	progressionBazaarDurationHours = 168;
+	progressionBazaarCooldownSeconds = 120;
+	progressionBazaarVisitCooldownMinutes = 120;
+	progressionBazaarDetourSeconds = 300;
+	progressionBazaarMaxDetourMeters = 300;
+	progressionBazaarMaxListingsPerVisit = 3;
+	progressionBazaarArriveMeters = 4;
+	progressionBazaarTimeoutSeconds = 180;
+	progressionBazaarSweepIntervalSeconds = 300;
+	progressionBazaarSweepBatch = 20;
+	progressionBazaarSaleBacklogMax = 256;
+	progressionBazaarDrainOnDisable = true;
+	progressionBazaarSettlementMode = false;
+	progressionBazaarLastSweepMs = 0;
+	progressionListingReconcilePending = true;
 	progressionLoaded = false;
 	progressionDbAvailable = false;
 	progressionLastFlushMs = 0;
@@ -6241,7 +6307,14 @@ void SimPlayerManager::loadLuaConfig() {
 		progressionRetiringIds.removeAll();
 		progressionLedgerPending.removeAll();
 		progressionRecentLedger.removeAll();
-		progressionBuffFeeReservations.removeAll();
+		progressionInsertedBankHighWater.removeAll();
+		progressionInsertedCashHighWater.removeAll();
+		progressionBazaarListings.removeAll();
+		progressionBazaarClosedListings.removeAll();
+		progressionBazaarListingByAuction.removeAll();
+		progressionBazaarReceiptSums.removeAll();
+		progressionItemDeleteIds.removeAll();
+		progressionCreditReservations.removeAll();
 		progressionOrphanIds.removeAll();
 		progressionTrainingPlans.removeAll();
 		progressionEarlyGameWeaponsByXpType.removeAll();
@@ -6289,6 +6362,14 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityCombatAbilityScopedIds.removeAll();
 		playerBotParityItemStatSnapshots.removeAll();
 		playerBotParityTestLootCapOverrideActive = false;
+		playerBotParityTestSuppressBazaarSalePod.set(false);
+		playerBotParityTestBazaarPublishFault.set(false);
+		playerBotParityLastBazaarAuctionOid = 0;
+		playerBotParityLastBazaarItemOid = 0;
+		playerBotParityTestBazaarSellGateOverrideActive = false;
+		playerBotParityBazaarSellGateScopedIds.removeAll();
+		playerBotParityTestBazaarMarkupOverrideActive = false;
+		playerBotParityTestBazaarMarkupOverridePrevious = 3.0f;
 		playerBotParityTestScenarioIndex = 0;
 		playerBotParityTestStepCursor = 0;
 		playerBotParityTestSetupCursor = 0;
@@ -6307,6 +6388,9 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestBootInitialized = false;
 		playerBotParityTestAwaitingRestart = false;
 		playerBotParityTestCompleted = false;
+		playerBotParityTestProgressionEnabledOverrideActive = false;
+		playerBotParityTestProgressionEnabledOverride = true;
+		playerBotParityTestProgressionEnabledOverridePrevious = true;
 		playerBotParityTestGateOverrideActive = false;
 		playerBotParityTestTrainingGateOverrideActive = false;
 		playerBotParityTestTrainingGateOverridePreviousActive = false;
@@ -8701,7 +8785,19 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		previousCombatAbilityConfig = progressionCombatAbilityConfig;
 	}
 
-	progressionEnabled = config.getBooleanField("enabled", progressionEnabled);
+	bool progressionEnabledOverrideActive = false;
+	bool progressionEnabledOverride = progressionEnabled;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		progressionEnabledOverrideActive =
+			playerBotParityTestProgressionEnabledOverrideActive;
+		progressionEnabledOverride =
+			playerBotParityTestProgressionEnabledOverride;
+	}
+	if (progressionEnabledOverrideActive)
+		progressionEnabled = progressionEnabledOverride;
+	else
+		progressionEnabled = config.getBooleanField("enabled", progressionEnabled);
 	progressionAwardKillXp = config.getBooleanField("awardKillXp",
 		progressionAwardKillXp);
 	progressionAwardMissionCredits = config.getBooleanField(
@@ -8730,6 +8826,65 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 				progressionLootStepTimeoutSeconds), 0, 86400);
 	}
 	loot.pop();
+	progressionBazaarSellEnabled = config.getBooleanField("bazaarSell",
+		false);
+	progressionBazaarSaleBacklogMax = clampIntRange(
+		config.getIntField("bazaarSaleBacklogMax",
+			progressionBazaarSaleBacklogMax), 1, 100000);
+	LuaObject bazaar = config.getObjectField("bazaar");
+	if (bazaar.isValidTable()) {
+		bool bazaarMarkupOverride = false;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			bazaarMarkupOverride = playerBotParityTestBazaarMarkupOverrideActive;
+		}
+		if (!bazaarMarkupOverride)
+			progressionBazaarMarkup = clampFloatRange(
+				bazaar.getFloatField("markup", progressionBazaarMarkup), 0.1f, 100.f);
+		progressionBazaarMinPrice = clampIntRange(
+			bazaar.getIntField("minPrice", progressionBazaarMinPrice), 1,
+			AuctionManager::MAXBAZAARPRICE);
+		progressionBazaarMaxPrice = clampIntRange(
+			bazaar.getIntField("maxPrice", progressionBazaarMaxPrice),
+			progressionBazaarMinPrice, AuctionManager::MAXBAZAARPRICE);
+		progressionBazaarMaxListingsPerBot = clampIntRange(
+			bazaar.getIntField("maxListingsPerBot", progressionBazaarMaxListingsPerBot),
+			1, AuctionManager::MAXSALES);
+		progressionBazaarListingsPerVisit = clampIntRange(
+			bazaar.getIntField("maxListingsPerVisit",
+				bazaar.getIntField("listingsPerVisit", progressionBazaarListingsPerVisit)),
+			0, AuctionManager::MAXSALES);
+		progressionBazaarMaxListingsPerVisit = progressionBazaarListingsPerVisit;
+		progressionBazaarDurationHours = clampIntRange(
+			bazaar.getIntField("listingDurationHours",
+				bazaar.getIntField("durationHours", progressionBazaarDurationHours)), 1, 168);
+		progressionBazaarCooldownSeconds = clampIntRange(
+			bazaar.getIntField("cooldownSeconds", progressionBazaarCooldownSeconds), 0, 86400);
+		progressionBazaarVisitCooldownMinutes = clampIntRange(
+			bazaar.getIntField("visitCooldownMinutes",
+				progressionBazaarVisitCooldownMinutes), 0, 10080);
+		progressionBazaarDetourSeconds = clampIntRange(
+			bazaar.getIntField("detourSeconds", progressionBazaarDetourSeconds), 0, 86400);
+		progressionBazaarMaxDetourMeters = clampIntRange(
+			bazaar.getIntField("maxDetourMeters", progressionBazaarMaxDetourMeters),
+			0, 100000);
+		progressionBazaarArriveMeters = clampIntRange(
+			bazaar.getIntField("arriveMeters", progressionBazaarArriveMeters), 0, 256);
+		progressionBazaarTimeoutSeconds = clampIntRange(
+			bazaar.getIntField("visitTimeoutSeconds",
+				bazaar.getIntField("timeoutSeconds", progressionBazaarTimeoutSeconds)), 0, 86400);
+		progressionBazaarSweepIntervalSeconds = clampIntRange(
+			bazaar.getIntField("sweepIntervalSeconds", progressionBazaarSweepIntervalSeconds),
+			1, 86400);
+		progressionBazaarSweepBatch = clampIntRange(
+			bazaar.getIntField("sweepBatch", progressionBazaarSweepBatch), 1, 1000);
+		progressionBazaarSaleBacklogMax = clampIntRange(
+			bazaar.getIntField("saleBacklogMax", progressionBazaarSaleBacklogMax),
+			1, 100000);
+		progressionBazaarDrainOnDisable = bazaar.getBooleanField(
+			"drainOnDisable", progressionBazaarDrainOnDisable);
+	}
+	bazaar.pop();
 	LuaObject buffPayment = config.getObjectField("buffPayment");
 	if (buffPayment.isValidTable()) {
 		progressionBuffPaymentEnabled = buffPayment.getBooleanField(
@@ -9054,6 +9209,17 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	if (step.skillMod.isEmpty())
 		step.skillMod = table.getStringField("mod").trim();
 	step.amount = table.getLongField("amount", 0);
+	step.price = table.getIntField("price", 0);
+	step.junkValue = table.getIntField("junkValue", 0);
+	step.junkMask = table.getIntField("junkMask", 0);
+	step.noTrade = table.getBooleanField("noTrade", false);
+	step.itemOid = table.getLongField("itemOid", 0);
+	step.auctionOid = table.getLongField("auctionOid", 0);
+	step.planet = table.getStringField("planet").trim();
+	step.ownerIsBag = table.getBooleanField("ownerIsBag", false);
+	step.hasOwnerIsBag = step.ownerIsBag ==
+		table.getBooleanField("ownerIsBag", true);
+	step.ownerName = table.getStringField("ownerName").trim();
 	step.difficultyLevel = clampMinerInt(table.getIntField("difficultyLevel", 1),
 		1, 1, 1000);
 	step.missions = clampMinerInt(table.getIntField("missions", 1), 1, 1, 1000000);
@@ -9116,6 +9282,8 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.corpseOid = table.getLongField("corpseOid", 0);
 	step.lootTemplate = table.getStringField("lootTemplate").trim();
 	step.itemState = table.getStringField("itemState").trim().toLowerCase();
+	if (step.itemState.isEmpty())
+		step.itemState = table.getStringField("state").trim().toLowerCase();
 	step.expectedItemCount = table.getIntField("itemCount", absentExpected);
 	if (step.expectedItemCount == absentExpected)
 		step.expectedItemCount = -1;
@@ -9131,12 +9299,20 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	if (step.lootCap == absentExpected)
 		step.lootCap = -1;
 	step.lootGate = table.getBooleanField("lootGate", false);
+	step.bazaarSellGate = table.getBooleanField("bazaarSellGate", false);
+	step.suppressBazaarSalePod = table.getBooleanField(
+		"suppressBazaarSalePod", false);
+	step.bazaarPublishFault = table.getBooleanField("bazaarPublishFault", false);
 	step.keepCorpse = table.getBooleanField("keepCorpse", false);
 	step.bySeededItem = table.getBooleanField("bySeededItem", false);
 	step.hasLootGate = step.lootGate ==
 		table.getBooleanField("lootGate", true);
+	step.hasBazaarSellGate = step.bazaarSellGate ==
+		table.getBooleanField("bazaarSellGate", true);
 	step.inVault = table.getBooleanField("inVault", false);
 	step.hasInVault = step.inVault == table.getBooleanField("inVault", true);
+	step.bazaarMarkup = table.getFloatField("markup", 0.f);
+	step.hasBazaarMarkup = step.bazaarMarkup != 0.f;
 	step.combatAbilitySpecialAttackChancePercent = table.getIntField(
 		"specialAttackChancePercent", absentExpected);
 	step.hasCombatAbilitySpecialAttackChancePercent =
@@ -10657,6 +10833,15 @@ static String pveSqlValue(const String& value) {
 	return "'" + escaped + "'";
 }
 
+static uint64 playerBotIdentityForBag(const VectorMap<uint64, uint64>& bagMap,
+		uint64 bagOid) {
+	for (int i = 0; i < bagMap.size(); ++i) {
+		if (bagMap.elementAt(i).getValue() == bagOid)
+			return bagMap.elementAt(i).getKey();
+	}
+	return 0;
+}
+
 static String progressionSqlString(const String& value) {
 	return "'" + value.escapeString() + "'";
 }
@@ -10704,6 +10889,25 @@ static bool playerBotItemStateFromName(const String& name,
 	return true;
 }
 
+static const char* playerBotBazaarListingStateName(int state) {
+	switch (state) {
+	case SimBotBazaar::PENDING: return "pending";
+	case SimBotBazaar::LISTED: return "listed";
+	case SimBotBazaar::SOLD: return "sold";
+	case SimBotBazaar::RETRIEVED: return "retrieved";
+	case SimBotBazaar::ORPHANED: return "orphaned";
+	}
+	return "orphaned";
+}
+
+static int playerBotBazaarListingStateFromName(const String& name) {
+	if (name == "pending") return SimBotBazaar::PENDING;
+	if (name == "listed") return SimBotBazaar::LISTED;
+	if (name == "sold") return SimBotBazaar::SOLD;
+	if (name == "retrieved") return SimBotBazaar::RETRIEVED;
+	return SimBotBazaar::ORPHANED;
+}
+
 static String pveMissionCreditDispositionName(
 		PveMissionCreditDisposition disposition);
 
@@ -10719,11 +10923,13 @@ static SimBotProgression progressionFromResult(ResultSet* result) {
 	progression.identityId = result->getUnsignedLong(0);
 	progression.bankCredits = result->getLong(1);
 	progression.cashCredits = result->getLong(2);
-	progression.skillPointsSpent = result->getInt(3);
-	progression.awardsTotal = result->getUnsignedLong(4);
-	progression.lastAwardSource = pveRosterResultString(result, 5);
-	progression.createdAt = pveRosterResultString(result, 6);
-	progression.updatedAt = pveRosterResultString(result, 7);
+	progression.bankLedgerAppliedId = result->getUnsignedLong(3);
+	progression.cashLedgerAppliedId = result->getUnsignedLong(4);
+	progression.skillPointsSpent = result->getInt(5);
+	progression.awardsTotal = result->getUnsignedLong(6);
+	progression.lastAwardSource = pveRosterResultString(result, 7);
+	progression.createdAt = pveRosterResultString(result, 8);
+	progression.updatedAt = pveRosterResultString(result, 9);
 	return progression;
 }
 
@@ -10740,6 +10946,83 @@ void SimPlayerManager::markPlayerBotItemDirtyLocked(uint64 objectId) {
 		progressionItems.get(objectId).dirty = true;
 		progressionItemDirtyIds.put(objectId, true);
 	}
+}
+
+String SimPlayerManager::playerBotCreditReservationKey(uint64 identityId,
+		const String& purpose) const {
+	return String::valueOf(identityId) + "|" + purpose;
+}
+
+int64 SimPlayerManager::reservedPlayerBotCreditsLocked(uint64 identityId,
+		bool bank) const {
+	if (!bank)
+		return 0;
+
+	int64 reserved = 0;
+	for (int i = 0; i < progressionCreditReservations.size(); ++i) {
+		const PlayerBotCreditReservation& reservation =
+			progressionCreditReservations.elementAt(i).getValue();
+		if (reservation.identityId == identityId)
+			reserved += reservation.amount;
+	}
+	return reserved;
+}
+
+bool SimPlayerManager::reservePlayerBotCreditsLocked(uint64 identityId,
+		int64 amount, const String& purpose) {
+	if (identityId == 0 || amount <= 0 || purpose.isEmpty() ||
+			!progressionRecords.contains(identityId))
+		return false;
+
+	String key = playerBotCreditReservationKey(identityId, purpose);
+	if (progressionCreditReservations.contains(key))
+		return false;
+
+	SimBotProgression& progression = progressionRecords.get(identityId);
+	if (progression.bankCredits - reservedPlayerBotCreditsLocked(identityId, true) <
+			amount)
+		return false;
+
+	PlayerBotCreditReservation reservation;
+	reservation.identityId = identityId;
+	reservation.purpose = purpose;
+	reservation.amount = amount;
+	progressionCreditReservations.put(key, reservation);
+	return true;
+}
+
+bool SimPlayerManager::commitPlayerBotCreditsLocked(uint64 identityId,
+		const String& purpose, bool bank, const String& source, uint64 refId,
+		const String& detail) {
+	String key = playerBotCreditReservationKey(identityId, purpose);
+	if (!progressionCreditReservations.contains(key) ||
+			!progressionRecords.contains(identityId))
+		return false;
+
+	PlayerBotCreditReservation reservation =
+		progressionCreditReservations.get(key);
+	if (bank && progressionRecords.get(identityId).bankCredits <
+			reservation.amount)
+		return false;
+
+	progressionCreditReservations.drop(key);
+	SimBotProgression& progression = progressionRecords.get(identityId);
+	int64& balance = bank ? progression.bankCredits : progression.cashCredits;
+	balance -= reservation.amount;
+	progression.lastAwardMs = System::getMiliTime();
+	progression.lastAwardSource = progressionAwardSource(source);
+	progression.awardsTotal++;
+	appendPlayerBotLedgerEntryLocked(identityId, bank, -reservation.amount,
+		balance, source, refId, detail);
+	markProgressionDirtyLocked(identityId);
+	progressionAwardsAccepted.increment();
+	return true;
+}
+
+void SimPlayerManager::releasePlayerBotCreditsLocked(uint64 identityId,
+		const String& purpose) {
+	progressionCreditReservations.drop(
+		playerBotCreditReservationKey(identityId, purpose));
 }
 
 void SimPlayerManager::appendPlayerBotLedgerEntryKindLocked(
@@ -10768,6 +11051,28 @@ void SimPlayerManager::appendPlayerBotLedgerEntryKindLocked(
 	}
 	progressionLedgerPending.add(entry);
 
+	if (refId != 0 && (source == "bazaar_sale" ||
+			source == "bazaar_sale_reversal")) {
+		Pair<int64, int64> receipt;
+		if (progressionBazaarReceiptSums.contains(refId))
+			receipt = progressionBazaarReceiptSums.get(refId);
+		if (kind == "credits_bank")
+			receipt.first += delta;
+		else if (kind == "item")
+			receipt.second += delta;
+		progressionBazaarReceiptSums.put(refId, receipt);
+		uint64 objectId = progressionBazaarListingByAuction.contains(refId) ?
+			progressionBazaarListingByAuction.get(refId) : 0;
+		if (objectId != 0 && progressionBazaarListings.contains(objectId)) {
+			PlayerBotBazaarListing& listing =
+				progressionBazaarListings.get(objectId);
+			if (kind == "credits_bank")
+				listing.creditReceiptSum += delta;
+			else if (kind == "item")
+				listing.itemReceiptSum += delta;
+		}
+	}
+
 	if (!progressionRecentLedger.contains(identityId))
 		progressionRecentLedger.put(identityId, Vector<SimBotLedgerEntry>());
 	Vector<SimBotLedgerEntry>& recent = progressionRecentLedger.get(identityId);
@@ -10785,7 +11090,11 @@ void SimPlayerManager::appendPlayerBotLedgerEntryLocked(uint64 identityId,
 }
 
 void SimPlayerManager::dropPlayerBotLedgerEntriesLocked(uint64 identityId) {
-	progressionBuffFeeReservations.drop(identityId);
+	for (int i = progressionCreditReservations.size() - 1; i >= 0; --i) {
+		if (progressionCreditReservations.elementAt(i).getValue().identityId ==
+				identityId)
+			progressionCreditReservations.remove(i);
+	}
 	for (int i = progressionLedgerPending.size() - 1; i >= 0; --i) {
 		if (progressionLedgerPending.get(i).identityId == identityId)
 			progressionLedgerPending.remove(i);
@@ -10801,6 +11110,52 @@ void SimPlayerManager::prunePlayerBotLedger(uint64 nowMs) {
 		return;
 
 	try {
+		// Closed listings go first, so their sale receipts lose the exemption
+		// below in the same pass. Open listings and held sales are never pruned,
+		// and the retention window (days) far exceeds the 5-minute object-save
+		// window in which a closed sale could still be rolled back.
+		String listingPrune =
+			"DELETE FROM `simbot_listings` WHERE (`state` IN ('retrieved','orphaned') "
+			"OR (`state`='sold' AND `released_at` IS NOT NULL)) AND "
+			"COALESCE(`closed_at`,`updated_at`) < DATE_SUB(NOW(), INTERVAL " +
+			String::valueOf(progressionLedgerRetentionDays) + " DAY);";
+		UniqueReference<ResultSet*> listingResult(
+			ServerDatabase::instance()->executeQuery(listingPrune));
+		(void)listingResult;
+		{
+			const uint64 cutoffMs = static_cast<uint64>(
+				progressionLedgerRetentionDays) * 86400000;
+			Locker progressionLock(&progressionMutex);
+			for (int i = progressionBazaarClosedListings.size() - 1; i >= 0; --i) {
+				const PlayerBotBazaarListing& closed =
+					progressionBazaarClosedListings.elementAt(i).getValue();
+				if (!closed.dirty && closed.closedAtMs != 0 &&
+						nowMs > closed.closedAtMs && nowMs - closed.closedAtMs > cutoffMs) {
+					progressionBazaarReceiptSums.drop(closed.auctionOid);
+					progressionBazaarClosedListings.drop(
+						progressionBazaarClosedListings.elementAt(i).getKey());
+				}
+			}
+			// Closed entries still keyed in the live map (a released sale, a
+			// retrieval or an orphan whose object was never relisted) age out the
+			// same way, with their auction index and receipt sums. Open listings
+			// and unreleased held sales are never touched.
+			for (int i = progressionBazaarListings.size() - 1; i >= 0; --i) {
+				const PlayerBotBazaarListing& entry =
+					progressionBazaarListings.elementAt(i).getValue();
+				bool closedEntry = (entry.state == SimBotBazaar::SOLD &&
+					entry.releasedAtMs != 0) || entry.state == SimBotBazaar::RETRIEVED ||
+					entry.state == SimBotBazaar::ORPHANED;
+				if (!closedEntry || entry.dirty || entry.closedAtMs == 0 ||
+						nowMs <= entry.closedAtMs || nowMs - entry.closedAtMs <= cutoffMs)
+					continue;
+				progressionBazaarReceiptSums.drop(entry.auctionOid);
+				progressionBazaarListingByAuction.drop(entry.auctionOid);
+				progressionBazaarListings.drop(
+					progressionBazaarListings.elementAt(i).getKey());
+			}
+		}
+
 		String prune =
 			"DELETE ledger FROM `simbot_ledger` ledger "
 			"LEFT JOIN (SELECT `identity_id`,`kind`,MAX(`id`) AS `latest_id` "
@@ -10810,6 +11165,9 @@ void SimPlayerManager::prunePlayerBotLedger(uint64 nowMs) {
 			"WHERE ledger.`created_at` < DATE_SUB(NOW(), INTERVAL " +
 			String::valueOf(progressionLedgerRetentionDays) +
 			" DAY) AND ledger.`source` <> 'reconcile' AND "
+			"NOT (ledger.`source` IN ('bazaar_sale','bazaar_sale_reversal') "
+			"AND EXISTS (SELECT 1 FROM `simbot_listings` listing WHERE "
+			"listing.`auction_oid`=ledger.`ref_id`)) AND "
 			"(latest.`latest_id` IS NULL OR ledger.`id` <> latest.`latest_id`);";
 		UniqueReference<ResultSet*> result(
 			ServerDatabase::instance()->executeQuery(prune));
@@ -10821,8 +11179,61 @@ void SimPlayerManager::prunePlayerBotLedger(uint64 nowMs) {
 	}
 }
 
+bool SimPlayerManager::probePlayerBotBazaarObligations() {
+	if (progressionEnabled || progressionLoaded || !pveDatabaseAvailable)
+		return false;
+	try {
+		UniqueReference<ResultSet*> result(
+			ServerDatabase::instance()->executeQuery(
+				"SELECT 1 FROM `simbot_listings` listing LEFT JOIN "
+				"`simbot_progression` progression ON progression.`identity_id`="
+				"listing.`identity_id` WHERE listing.`state`='listed' OR "
+				"(listing.`state`='sold' AND listing.`released_at` IS NULL) OR "
+				"(listing.`state`='sold' AND ((SELECT COALESCE(SUM("
+				"CASE WHEN ledger.`kind`='credits_bank' AND ledger.`id` <= "
+				"COALESCE(progression.`bank_ledger_applied_id`,0) THEN "
+				"ledger.`delta` ELSE 0 END),0) FROM `simbot_ledger` ledger "
+				"WHERE ledger.`ref_id`=listing.`auction_oid` AND ledger.`source` IN "
+				"('bazaar_sale','bazaar_sale_reversal')) <= 0 OR "
+				"(SELECT COALESCE(SUM(CASE WHEN ledger.`kind`='item' THEN "
+				"ledger.`delta` ELSE 0 END),0) FROM `simbot_ledger` ledger "
+				"WHERE ledger.`ref_id`=listing.`auction_oid` AND ledger.`source` IN "
+				"('bazaar_sale','bazaar_sale_reversal')) >= 0)) LIMIT 1;"));
+		if (result != nullptr && result->next())
+			return true;
+	} catch (const Exception& e) {
+		error("SimPlayerBazaarObligationProbeFailed: " + e.getMessage());
+		return false;
+	}
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	AuctionManager* auctionManager = zoneServer == nullptr ? nullptr :
+		zoneServer->getAuctionManager();
+	if (economyManager == nullptr || auctionManager == nullptr ||
+			auctionManager->getAuctionMap() == nullptr)
+		return false;
+	VectorMap<uint64, uint64> bagMap = economyManager->getItemBagMapSnapshot();
+	TerminalListVector listings = auctionManager->getAuctionMap()->
+		getBazaarTerminalData("", "", nullptr);
+	for (int i = 0; i < listings.size(); ++i) {
+		Reference<TerminalItemList*> terminalItems = listings.get(i);
+		if (terminalItems == nullptr)
+			continue;
+		ReadLocker terminalLock(terminalItems);
+		for (int j = 0; j < terminalItems->size(); ++j) {
+			AuctionItem* item = terminalItems->get(j);
+			if (item != nullptr && auctionManager->isSimBotListing(item) &&
+					playerBotIdentityForBag(bagMap, item->getOwnerID()) != 0)
+				return true;
+		}
+	}
+	return false;
+}
+
 void SimPlayerManager::loadPlayerBotProgressionStore() {
-	if (!progressionEnabled || progressionLoaded || !pveRosterLoaded ||
+	if ((!progressionEnabled && !progressionBazaarSettlementMode) ||
+			progressionLoaded || !pveRosterLoaded ||
 			!pveDatabaseAvailable)
 		return;
 
@@ -10833,9 +11244,10 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 	try {
 		UniqueReference<ResultSet*> parentResult(
 			ServerDatabase::instance()->executeQuery(
-				"SELECT `identity_id`,`bank_credits`,`cash_credits`,"
-				"`skill_points_spent`,`awards_total`,`last_award_source`,"
-				"`created_at`,`updated_at` FROM `simbot_progression` "
+			"SELECT `identity_id`,`bank_credits`,`cash_credits`,"
+			"`bank_ledger_applied_id`,`cash_ledger_applied_id`,"
+			"`skill_points_spent`,`awards_total`,`last_award_source`,"
+			"`created_at`,`updated_at` FROM `simbot_progression` "
 				"ORDER BY `identity_id`;"));
 		if (parentResult == nullptr)
 			throw Exception("progression parent query returned no result");
@@ -10845,6 +11257,25 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 			SimBotProgression progression =
 				progressionFromResult(parentResult);
 			loaded.put(progression.identityId, progression);
+		}
+		// Rows inserted before a crash but not covered by the durable applied
+		// mark must never be replayed as credits.  Void them before exposing the
+		// loaded balances to the rest of the server.
+		for (int i = 0; i < loaded.size(); ++i) {
+			const SimBotProgression& progression = loaded.elementAt(i).getValue();
+			String identity = String::valueOf(progression.identityId);
+			String bankVoid = "UPDATE `simbot_ledger` SET `source`=CONCAT('void_',`source`) "
+				"WHERE `identity_id`=" + identity + " AND `kind`='credits_bank' AND `id`>" +
+				String::valueOf(progression.bankLedgerAppliedId) + " AND `source` NOT LIKE 'void_%';";
+			String cashVoid = "UPDATE `simbot_ledger` SET `source`=CONCAT('void_',`source`) "
+				"WHERE `identity_id`=" + identity + " AND `kind`='credits_cash' AND `id`>" +
+				String::valueOf(progression.cashLedgerAppliedId) + " AND `source` NOT LIKE 'void_%';";
+			UniqueReference<ResultSet*> bankVoidResult(
+				ServerDatabase::instance()->executeQuery(bankVoid));
+			(void)bankVoidResult;
+			UniqueReference<ResultSet*> cashVoidResult(
+				ServerDatabase::instance()->executeQuery(cashVoid));
+			(void)cashVoidResult;
 		}
 
 		UniqueReference<ResultSet*> experienceResult(
@@ -10879,7 +11310,7 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 		VectorMap<uint64, uint64> loadedItemHeldCounts;
 		UniqueReference<ResultSet*> itemResult(
 			ServerDatabase::instance()->executeQuery(
-				"SELECT `object_id`,`identity_id`,`state`,`template_crc`,"
+				"SELECT `object_id`,`identity_id`,`state`,`ask_price`,`template_crc`,"
 				"`display_name`,`source`,`ref_id`,"
 				// Epoch milliseconds, the same form new in-memory rows carry, so
 				// the dashboard can order and age them without parsing a DATETIME.
@@ -10902,13 +11333,14 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 					stateName);
 				continue;
 			}
+			row.askPrice = itemResult->getInt(3);
 			row.templateCrc = static_cast<uint32>(
-				itemResult->getUnsignedLong(3));
-			row.displayName = pveRosterResultString(itemResult, 4);
-			row.source = pveRosterResultString(itemResult, 5);
-			row.refId = itemResult->getUnsignedLong(6);
-			row.acquiredAt = pveRosterResultString(itemResult, 7);
-			row.updatedAt = pveRosterResultString(itemResult, 8);
+				itemResult->getUnsignedLong(4));
+			row.displayName = pveRosterResultString(itemResult, 5);
+			row.source = pveRosterResultString(itemResult, 6);
+			row.refId = itemResult->getUnsignedLong(7);
+			row.acquiredAt = pveRosterResultString(itemResult, 8);
+			row.updatedAt = pveRosterResultString(itemResult, 9);
 			row.version = 1;
 			row.dirty = false;
 
@@ -10921,10 +11353,111 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 			}
 
 			loadedItems.put(row.objectId, row);
-			if (row.state == SIMBOT_ITEM_HELD) {
+			if ((row.state == SIMBOT_ITEM_HELD || row.state == SIMBOT_ITEM_LISTED) &&
+					row.identityId != 0) {
 				uint64 held = loadedItemHeldCounts.contains(row.identityId) ?
 					loadedItemHeldCounts.get(row.identityId) : 0;
 				loadedItemHeldCounts.put(row.identityId, held + 1);
+			}
+		}
+
+		VectorMap<uint64, PlayerBotBazaarListing> loadedListings;
+		VectorMap<uint64, PlayerBotBazaarListing> loadedClosedListings;
+		UniqueReference<ResultSet*> listingResult(
+			ServerDatabase::instance()->executeQuery(
+				"SELECT `auction_oid`,`identity_id`,`object_id`,`state`,`price`,"
+				"`fee`,`tax`,`net_paid`,`vendor_oid`,`planet`,`buyer_name`,"
+				// closed_at/released_at are NULL on open rows; a NULL numeric
+				// column throws in ResultSet::getUnsignedLong, so map it to 0.
+				"COALESCE(CAST(UNIX_TIMESTAMP(`listed_at`) AS UNSIGNED)*1000,0),"
+				"COALESCE(CAST(UNIX_TIMESTAMP(`closed_at`) AS UNSIGNED)*1000,0),"
+				"COALESCE(CAST(UNIX_TIMESTAMP(`released_at`) AS UNSIGNED)*1000,0) "
+				"FROM `simbot_listings` ORDER BY `auction_oid`;"));
+		if (listingResult == nullptr)
+			throw Exception("progression listing query returned no result");
+		while (listingResult->next()) {
+			PlayerBotBazaarListing listing;
+			listing.auctionOid = listingResult->getUnsignedLong(0);
+			String identityValue = pveRosterResultString(listingResult, 1);
+			listing.identityId = identityValue.isEmpty() ? 0 :
+				Long::unsignedvalueOf(identityValue);
+			listing.objectId = listingResult->getUnsignedLong(2);
+			listing.state = playerBotBazaarListingStateFromName(
+				pveRosterResultString(listingResult, 3));
+			listing.price = listingResult->getInt(4);
+			listing.fee = listingResult->getInt(5);
+			listing.tax = listingResult->getInt(6);
+			listing.netPaid = listingResult->getInt(7);
+			listing.vendorOid = listingResult->getUnsignedLong(8);
+			listing.planet = pveRosterResultString(listingResult, 9);
+			listing.buyerName = pveRosterResultString(listingResult, 10);
+			listing.listedAtMs = listingResult->getUnsignedLong(11);
+			listing.closedAtMs = listingResult->getUnsignedLong(12);
+			listing.releasedAtMs = listingResult->getUnsignedLong(13);
+			if (listing.auctionOid == 0 || listing.objectId == 0)
+				continue;
+			// A sold row stays in the live map until its retrieval hold is
+			// released and both receipts are durable.  Settlement-mode sweeps
+			// must still be able to find it after a reload.
+			bool live = listing.state == SimBotBazaar::PENDING ||
+				listing.state == SimBotBazaar::LISTED ||
+				listing.state == SimBotBazaar::SOLD;
+			if (live) {
+				loadedListings.put(listing.objectId, listing);
+			} else {
+				loadedClosedListings.put(listing.auctionOid, listing);
+			}
+		}
+
+		// The listing state is only a projection.  Load the two settlement
+		// receipts from the ledger, using the durable bank mark for credits and
+		// every non-void item row.  Do not join through simbot_listings: a held
+		// sale can be adopted after its listing projection was lost.  These sums
+		// are carried forward by the in-memory append path after the store is
+		// loaded.
+		VectorMap<uint64, Pair<int64, int64> > loadedReceiptSums;
+		UniqueReference<ResultSet*> receiptResult(
+			ServerDatabase::instance()->executeQuery(
+				"SELECT `ledger`.`ref_id`,"
+				"COALESCE(SUM(CASE WHEN `ledger`.`kind`='credits_bank' AND "
+				"`ledger`.`id` <= `progression`.`bank_ledger_applied_id` THEN "
+				"`ledger`.`delta` ELSE 0 END),0),"
+				"COALESCE(SUM(CASE WHEN `ledger`.`kind`='item' THEN "
+				"`ledger`.`delta` ELSE 0 END),0) "
+				"FROM `simbot_ledger` ledger LEFT JOIN "
+				"`simbot_progression` progression ON progression.`identity_id`="
+				"ledger.`identity_id` WHERE ledger.`source` IN "
+				"('bazaar_sale','bazaar_sale_reversal') GROUP BY `ledger`.`ref_id`;"));
+		if (receiptResult == nullptr)
+			throw Exception("progression bazaar receipt query returned no result");
+		while (receiptResult->next()) {
+			uint64 auctionOid = receiptResult->getUnsignedLong(0);
+			Pair<int64, int64> receipt;
+			receipt.first = receiptResult->getLong(1);
+			receipt.second = receiptResult->getLong(2);
+			loadedReceiptSums.put(auctionOid, receipt);
+		}
+		for (int i = 0; i < loadedListings.size(); ++i) {
+			PlayerBotBazaarListing& listing = loadedListings.elementAt(i).getValue();
+			if (loadedReceiptSums.contains(listing.auctionOid)) {
+				Pair<int64, int64> receipt = loadedReceiptSums.get(
+					listing.auctionOid);
+				listing.creditReceiptSum = receipt.first;
+				listing.itemReceiptSum = receipt.second;
+			}
+		}
+		for (int i = loadedListings.size() - 1; i >= 0; --i) {
+			PlayerBotBazaarListing& listing =
+				loadedListings.elementAt(i).getValue();
+			if (listing.state == SimBotBazaar::SOLD && listing.releasedAtMs != 0 &&
+					loadedReceiptSums.contains(listing.auctionOid)) {
+				Pair<int64, int64> receipt = loadedReceiptSums.get(
+					listing.auctionOid);
+				if (SimBotBazaar::hasCreditReceipt(receipt.first) &&
+						SimBotBazaar::hasItemReceipt(receipt.second)) {
+					loadedClosedListings.put(listing.auctionOid, listing);
+					loadedListings.remove(i);
+				}
 			}
 		}
 
@@ -10935,6 +11468,7 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 				"FROM `simbot_ledger` latest INNER JOIN (SELECT `identity_id`,"
 				"`kind`,MAX(`id`) AS `latest_id` FROM `simbot_ledger` GROUP BY "
 				"`identity_id`,`kind`) newest ON latest.`id`=newest.`latest_id` "
+				"WHERE latest.`source` NOT LIKE 'void_%' "
 				"ORDER BY latest.`identity_id`,`kind`;"));
 		if (ledgerResult == nullptr)
 			throw Exception("progression ledger query returned no result");
@@ -10974,8 +11508,25 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 		{
 			Locker progressionLock(&progressionMutex);
 			progressionRecords = loaded;
+			progressionInsertedBankHighWater.removeAll();
+			progressionInsertedCashHighWater.removeAll();
+			for (int i = 0; i < loaded.size(); ++i) {
+				const SimBotProgression& p = loaded.elementAt(i).getValue();
+				progressionInsertedBankHighWater.put(p.identityId,
+					p.bankLedgerAppliedId);
+				progressionInsertedCashHighWater.put(p.identityId,
+					p.cashLedgerAppliedId);
+			}
 			progressionDirtyIds.removeAll();
 			progressionItems = loadedItems;
+			progressionBazaarListings = loadedListings;
+			progressionBazaarClosedListings = loadedClosedListings;
+			progressionBazaarReceiptSums = loadedReceiptSums;
+			progressionBazaarListingByAuction.removeAll();
+			for (int i = 0; i < loadedListings.size(); ++i)
+				progressionBazaarListingByAuction.put(
+					loadedListings.elementAt(i).getValue().auctionOid,
+					loadedListings.elementAt(i).getKey());
 			progressionItemHeldCounts = loadedItemHeldCounts;
 			progressionItemDirtyIds.removeAll();
 			progressionOrphanIds.removeAll();
@@ -10986,17 +11537,24 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 				appendPlayerBotLedgerEntryLocked(entry.identityId,
 					entry.kind == "credits_bank", entry.delta,
 					entry.balanceAfter, entry.source, entry.refId, entry.detail);
+				// The reconcile row must be covered by an applied mark like any
+				// other credit row, so the record joins the next scalar UPDATE.
+				markProgressionDirtyLocked(entry.identityId);
 				progressionLedgerBalanceMismatch.increment();
 			}
 		}
 
 		progressionLoaded = true;
+		progressionBazaarSettlementMode = !progressionEnabled;
 		progressionItemReconcilePending = true;
+		progressionListingReconcilePending = true;
 		progressionDbAvailable = true;
 		progressionNextDbProbeMs = 0;
 		progressionDbProbeBackoffMs = 5000;
-		reconcilePlayerBotProgression();
-		reconcileIdentityTiers();
+		if (progressionEnabled) {
+			reconcilePlayerBotProgression();
+			reconcileIdentityTiers();
+		}
 		info("SimPlayerProgressionStoreLoaded records=" +
 			String::valueOf(loaded.size()), true);
 	} catch (const Exception& e) {
@@ -11041,8 +11599,9 @@ bool SimPlayerManager::ensurePlayerBotProgressionRecord(uint64 identityId) {
 		SimBotProgression progression;
 		UniqueReference<ResultSet*> parentResult(
 			ServerDatabase::instance()->executeQuery(
-				"SELECT `identity_id`,`bank_credits`,`cash_credits`,"
-				"`skill_points_spent`,`awards_total`,`last_award_source`,"
+			"SELECT `identity_id`,`bank_credits`,`cash_credits`,"
+			"`bank_ledger_applied_id`,`cash_ledger_applied_id`,"
+			"`skill_points_spent`,`awards_total`,`last_award_source`,"
 				"`created_at`,`updated_at` FROM `simbot_progression` WHERE "
 				"`identity_id`=" + String::valueOf(identityId) + " LIMIT 1;"));
 		if (parentResult == nullptr || !parentResult->next())
@@ -11153,6 +11712,1267 @@ bool SimPlayerManager::depositPlayerBotItem(uint64 identityId,
 	return true;
 }
 
+bool SimPlayerManager::enqueuePlayerBotBazaarSale(
+		const PlayerBotBazaarSale& sale) {
+	if (sale.auctionOid == 0 || sale.objectId == 0 || sale.grossPrice <= 0)
+		return false;
+	if (playerBotParityTestSuppressBazaarSalePod.get()) {
+		playerBotParityTestSuppressBazaarSalePod.set(false);
+		return true;
+	}
+	Locker saleLock(&progressionBazaarSaleMutex);
+	if (progressionBazaarSaleBacklog.size() >= progressionBazaarSaleBacklogMax) {
+		bazaarSaleBacklogOverflow.increment();
+		return false;
+	}
+	for (int i = 0; i < progressionBazaarSaleBacklog.size(); ++i) {
+		if (progressionBazaarSaleBacklog.get(i).auctionOid == sale.auctionOid)
+			return true;
+	}
+	progressionBazaarSaleBacklog.add(sale);
+	saleLock.release();
+	// The buyer already owns the item (instant pickup), so the bot's receipts
+	// are the only record of the sale until they are durable. Settle and flush
+	// now instead of waiting for the routine flush interval.
+	progressionBazaarFlushRequested.store(true, std::memory_order_release);
+	kickPveMaintenanceNow();
+	return true;
+}
+
+bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
+	// The capability gate is deliberately the first operation.  In particular,
+	// do not turn a routine controller tick into a progressionMutex holder while
+	// the master or harness gate is already known to be closed.
+	if (identityId == 0 || !playerBotBazaarSellGateEnabled(identityId))
+		return false;
+
+	const uint64 nowMs = System::getMiliTime();
+	Vector<uint64> candidateObjectIds;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (progressionBazaarVisitCooldownUntilMs.contains(identityId) &&
+				progressionBazaarVisitCooldownUntilMs.get(identityId) > nowMs)
+			return false;
+		int liveListings = 0;
+		for (int i = 0; i < progressionBazaarListings.size(); ++i) {
+			const PlayerBotBazaarListing& listing =
+				progressionBazaarListings.elementAt(i).getValue();
+			if (listing.identityId == identityId &&
+					(listing.state == SimBotBazaar::PENDING ||
+					listing.state == SimBotBazaar::LISTED))
+				++liveListings;
+		}
+		if (liveListings >= progressionBazaarMaxListingsPerBot ||
+				!progressionRecords.contains(identityId))
+			return false;
+		for (int i = 0; i < progressionItems.size(); ++i) {
+			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+			if (row.identityId != identityId || row.state != SIMBOT_ITEM_HELD)
+				continue;
+			// Same rule as listPlayerBotItemsAtTerminal: an expired (retrieved)
+			// item is a relist candidate; only a pending or live listing blocks.
+			if (progressionBazaarListings.contains(row.objectId)) {
+				int state = progressionBazaarListings.get(row.objectId).state;
+				if (state == SimBotBazaar::PENDING || state == SimBotBazaar::LISTED)
+					continue;
+			}
+			candidateObjectIds.add(row.objectId);
+		}
+	}
+	if (candidateObjectIds.size() == 0)
+		return false;
+
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+		economyManager->getItemBag(identityId);
+	if (bag == nullptr)
+		return false;
+	Vector<ManagedReference<SceneObject*> > children;
+	{
+		Locker bagLock(bag);
+		for (int i = 0; i < bag->getContainerObjectsSize(); ++i)
+			children.add(bag->getContainerObject(i));
+	}
+	for (int i = 0; i < children.size(); ++i) {
+		SceneObject* object = children.get(i);
+		if (object == nullptr || !candidateObjectIds.contains(object->getObjectID()))
+			continue;
+		TangibleObject* tangible = cast<TangibleObject*>(object);
+		if (tangible == nullptr)
+			continue;
+		Locker objectLock(object);
+		if (SimBotBazaar::isSellable(tangible->getJunkValue(),
+				tangible->getJunkDealerNeeded(), tangible->isNoTrade() ||
+				tangible->containsNoTradeObjectRecursive(), true))
+			return true;
+	}
+	return false;
+}
+
+bool SimPlayerManager::beginPlayerBotBazaarVisit(uint64 identityId) {
+	if (identityId == 0 || !playerBotBazaarSellGateEnabled(identityId))
+		return false;
+	uint64 nowMs = System::getMiliTime();
+	Locker progressionLock(&progressionMutex);
+	if (progressionBazaarVisitCooldownUntilMs.contains(identityId) &&
+			progressionBazaarVisitCooldownUntilMs.get(identityId) > nowMs)
+		return false;
+	progressionBazaarVisitCooldownUntilMs.put(identityId, nowMs +
+			static_cast<uint64>(progressionBazaarVisitCooldownMinutes) * 60000);
+	bazaarVisitsBegun.increment();
+	return true;
+}
+
+void SimPlayerManager::recordPlayerBotBazaarVisit(uint64 identityId,
+		const String& outcome) {
+	(void)identityId;
+	String key = outcome.trim().toLowerCase();
+	if (key == "listed" || key == "listedany")
+		bazaarVisitsListedAny.increment();
+	else if (key == "nooutdoorterminal")
+		bazaarVisitsNoOutdoorTerminal.increment();
+	else if (key == "timeout")
+		bazaarVisitsTimeout.increment();
+	else if (key == "pathfailed")
+		bazaarVisitsPathFailed.increment();
+	else if (key == "newattacker")
+		bazaarVisitsNewAttacker.increment();
+}
+
+bool SimPlayerManager::listPlayerBotItemAtBazaar(uint64 identityId,
+		uint64 objectId, SceneObject* terminal, int price) {
+	if (!playerBotBazaarSellGateEnabled(identityId) || objectId == 0 ||
+			terminal == nullptr || price < progressionBazaarMinPrice ||
+			price > progressionBazaarMaxPrice)
+		return false;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	AuctionManager* auctionManager = zoneServer == nullptr ? nullptr :
+		zoneServer->getAuctionManager();
+	if (economyManager == nullptr || auctionManager == nullptr ||
+			auctionManager->getAuctionMap() == nullptr || zoneServer == nullptr)
+		return false;
+	ManagedReference<SceneObject*> bag = economyManager->getItemBag(identityId);
+	ManagedReference<SceneObject*> object = zoneServer->getObject(objectId);
+	if (bag == nullptr || object == nullptr || object->getParent().get() != bag.get())
+		return false;
+
+	PlayerBotBazaarListing pending;
+	pending.identityId = identityId;
+	pending.objectId = objectId;
+	pending.bagOid = bag->getObjectID();
+	pending.state = SimBotBazaar::PENDING;
+	pending.price = price;
+	pending.vendorOid = terminal->getObjectID();
+	pending.planet = terminal->getZone() == nullptr ? String() :
+		terminal->getZone()->getZoneName();
+	pending.listedAtMs = System::getMiliTime();
+	String reservationPurpose = "bazaar_fee:" + String::valueOf(objectId);
+	{
+		Locker progressionLock(&progressionMutex);
+		if (!progressionRecords.contains(identityId) ||
+				!progressionItems.contains(objectId) ||
+				progressionItems.get(objectId).state != SIMBOT_ITEM_HELD)
+			return false;
+		if (progressionBazaarListings.contains(objectId)) {
+			PlayerBotBazaarListing previous =
+				progressionBazaarListings.get(objectId);
+			if (previous.state == SimBotBazaar::PENDING ||
+					previous.state == SimBotBazaar::LISTED)
+				return false;
+			if (previous.auctionOid != 0) {
+				progressionBazaarClosedListings.put(previous.auctionOid, previous);
+				progressionBazaarListingByAuction.drop(previous.auctionOid);
+			}
+			progressionBazaarListings.drop(objectId);
+		}
+		int persistedAsk = progressionItems.get(objectId).askPrice;
+		if (persistedAsk > 0)
+			price = std::max(price, SimBotBazaar::clampPrice(persistedAsk,
+				progressionBazaarMinPrice, progressionBazaarMaxPrice));
+		if (price > progressionBazaarMaxPrice)
+			return false;
+		pending.price = price;
+		SimBotProgression& progression = progressionRecords.get(identityId);
+		bool merchant1 = progression.skills.contains("crafting_merchant_sales_01");
+		bool merchant3 = progression.skills.contains("crafting_merchant_sales_03");
+		pending.fee = SimBotBazaar::listingFee(AuctionManager::SALESFEE,
+			merchant1, merchant3);
+		if (!reservePlayerBotCreditsLocked(identityId, pending.fee,
+				reservationPurpose))
+			return false;
+		// PENDING is a progression-only listing state. Keep the item HELD until
+		// the AuctionItem is published; the item reconciler treats a missing
+		// PENDING row as LOST.
+		progressionBazaarListings.put(objectId, pending);
+	}
+
+	String sellerName;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveIdentities.contains(identityId))
+			sellerName = pveIdentities.get(identityId).firstName;
+	}
+	int result = auctionManager->listSimBotItem(bag, sellerName, object,
+		terminal, price, static_cast<unsigned int>(progressionBazaarDurationHours * 3600));
+	ManagedReference<AuctionItem*> auctionItem = auctionManager->getAuctionMap()->
+		getItem(objectId);
+	bool salePodSuppressed = false;
+	if (playerBotParityTestBazaarPublishFault.get()) {
+		// The harness hook lands at the exact hand-off boundary.  A buyer is
+		// allowed to win the published AuctionItem before the progression
+		// publish commit resumes; the normal settle-wins branch below must keep
+		// the listing SOLD and enqueue exactly one sale.
+		playerBotParityTestBazaarPublishFault.set(false);
+		playerBotParityLastBazaarItemOid = objectId;
+		Zone* terminalZone = terminal->getZone();
+		CreatureObject* buyer = terminalZone == nullptr ||
+			terminalZone->getCreatureManager() == nullptr ? nullptr :
+			terminalZone->getCreatureManager()->spawnCreature(
+			String("artisan").hashCode(), 0, terminal->getWorldPositionX(),
+			terminal->getWorldPositionZ(), terminal->getWorldPositionY(), 0);
+		trackPlayerBotParityBazaarHelperCreature(buyer);
+		if (buyer != nullptr && result == ItemSoldMessage::SUCCESS &&
+				auctionItem != nullptr) {
+			{
+				Locker buyerLock(buyer);
+				buyer->addBankCredits(price + 100000, false);
+			}
+			salePodSuppressed = playerBotParityTestSuppressBazaarSalePod.get();
+			auctionManager->doInstantBuy(buyer, auctionItem);
+		}
+	}
+	Locker progressionLock(&progressionMutex);
+	if (result != ItemSoldMessage::SUCCESS || auctionItem == nullptr) {
+		progressionBazaarListings.drop(objectId);
+		releasePlayerBotCreditsLocked(identityId, reservationPurpose);
+		bazaarSkippedTransferFailed.increment();
+		return false;
+	}
+	PlayerBotBazaarListing& listing = progressionBazaarListings.get(objectId);
+	listing.auctionOid = auctionItem->getObjectID();
+	playerBotParityLastBazaarAuctionOid = listing.auctionOid;
+	playerBotParityLastBazaarItemOid = objectId;
+	bool soldDuringPublish = auctionItem->getStatus() == AuctionItem::SOLD;
+	listing.state = static_cast<int>(SimBotBazaar::applyListingEvent(
+		static_cast<SimBotBazaar::ListingState>(listing.state),
+		soldDuringPublish ? SimBotBazaar::SOLD_EVENT : SimBotBazaar::PUBLISHED));
+	listing.buyerName = auctionItem->getBidderName();
+	listing.price = price;
+	listing.fee = pending.fee;
+	listing.dirty = true;
+	progressionBazaarListingByAuction.put(listing.auctionOid, objectId);
+	if (progressionItems.contains(objectId) &&
+			progressionItems.get(objectId).state == SIMBOT_ITEM_HELD) {
+		progressionItems.get(objectId).state = SIMBOT_ITEM_LISTED;
+		if (progressionItems.get(objectId).askPrice == 0)
+			progressionItems.get(objectId).askPrice = price;
+		progressionItems.get(objectId).version++;
+		markPlayerBotItemDirtyLocked(objectId);
+	}
+	bool feeCommitted = commitPlayerBotCreditsLocked(identityId, reservationPurpose, true,
+			"bazaar_fee", listing.auctionOid, "auction_listing_fee");
+	if (!feeCommitted) {
+		releasePlayerBotCreditsLocked(identityId, reservationPurpose);
+		bazaarSkippedUnaffordable.increment();
+	}
+	if (feeCommitted)
+		bazaarFeesPaid.add(static_cast<uint64>(pending.fee));
+	bazaarListed.increment();
+	PlayerBotBazaarSale sale;
+	if (soldDuringPublish) {
+		sale.auctionOid = listing.auctionOid;
+		sale.objectId = objectId;
+		sale.bagOid = listing.bagOid;
+		sale.buyerId = auctionItem->getBuyerID();
+		sale.grossPrice = auctionItem->getPrice();
+		sale.tax = Math::max(0, auctionItem->getPrice() - price);
+		sale.buyerName = auctionItem->getBidderName();
+	}
+	progressionLock.release();
+	if (soldDuringPublish && !salePodSuppressed)
+		enqueuePlayerBotBazaarSale(sale);
+	return true;
+}
+
+bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
+		CreatureObject* body, SceneObject* terminal) {
+	(void)body;
+	if (!playerBotBazaarSellGateEnabled(identityId) || terminal == nullptr)
+		return false;
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	AuctionManager* auctionManager = zoneServer == nullptr ? nullptr :
+		zoneServer->getAuctionManager();
+	if (zoneServer == nullptr || economyManager == nullptr ||
+			auctionManager == nullptr || auctionManager->getAuctionMap() == nullptr)
+		return false;
+
+	struct Candidate {
+		uint64 objectId = 0;
+		int junkValue = 0;
+		int junkMask = 0;
+		bool noTrade = false;
+		int askPrice = 0;
+		String key;
+	};
+
+	ManagedReference<SceneObject*> bag = economyManager->getItemBag(identityId);
+	if (bag == nullptr)
+		return false;
+	Vector<ManagedReference<SceneObject*> > children;
+	{
+		Locker bagLock(bag);
+		for (int i = 0; i < bag->getContainerObjectsSize(); ++i)
+			children.add(bag->getContainerObject(i));
+	}
+
+	std::vector<Candidate> candidates;
+	VectorMap<uint64, int> heldAsks;
+	{
+		Locker progressionLock(&progressionMutex);
+		for (int i = 0; i < progressionItems.size(); ++i) {
+			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+			if (row.identityId != identityId || row.state != SIMBOT_ITEM_HELD)
+				continue;
+			// A retrieved (expired) or orphaned entry stays keyed by the object
+			// until it is relisted; only a pending or live listing blocks it.
+			if (progressionBazaarListings.contains(row.objectId)) {
+				int state = progressionBazaarListings.get(row.objectId).state;
+				if (state == SimBotBazaar::PENDING || state == SimBotBazaar::LISTED)
+					continue;
+			}
+			heldAsks.put(row.objectId, row.askPrice);
+		}
+	}
+	for (int i = 0; i < children.size(); ++i) {
+		SceneObject* object = static_cast<SceneObject*>(children.get(i));
+		if (object == nullptr || !heldAsks.contains(object->getObjectID()))
+			continue;
+		TangibleObject* tangible = cast<TangibleObject*>(object);
+		if (tangible == nullptr)
+			continue;
+		Candidate candidate;
+		candidate.objectId = object->getObjectID();
+		candidate.askPrice = heldAsks.get(candidate.objectId);
+		{
+			Locker objectLock(object);
+			candidate.junkValue = tangible->getJunkValue();
+			candidate.junkMask = tangible->getJunkDealerNeeded();
+			candidate.noTrade = tangible->isNoTrade() ||
+				tangible->containsNoTradeObjectRecursive();
+			candidate.key = String::valueOf(
+				tangible->getClientGameObjectType()) + "|" +
+				auctionManager->removeColorCodes(tangible->getDisplayedName());
+		}
+		candidates.push_back(candidate);
+	}
+	std::sort(candidates.begin(), candidates.end(),
+		[](const Candidate& left, const Candidate& right) {
+			return left.junkValue > right.junkValue;
+		});
+
+	VectorMap<uint64, bool> bagOids;
+	VectorMap<uint64, uint64> bagMap = economyManager->getItemBagMapSnapshot();
+	for (int i = 0; i < bagMap.size(); ++i)
+		bagOids.put(bagMap.elementAt(i).getValue(), true);
+	VectorMap<String, int> humanFloors;
+	String planet = terminal->getZone() == nullptr ? String() :
+		terminal->getZone()->getZoneName();
+	TerminalListVector terminalLists = auctionManager->getAuctionMap()->
+		getBazaarTerminalData(planet, "", nullptr);
+	uint64 nowSeconds = static_cast<uint64>(time(nullptr));
+	for (int i = 0; i < terminalLists.size(); ++i) {
+		Reference<TerminalItemList*> itemList = terminalLists.get(i);
+		if (itemList == nullptr)
+			continue;
+		ReadLocker itemListLock(itemList);
+		for (int j = 0; j < itemList->size(); ++j) {
+			AuctionItem* item = itemList->get(j);
+			if (item == nullptr || item->getStatus() != AuctionItem::FORSALE ||
+					item->isAuction() || (item->getExpireTime() != 0 &&
+					item->getExpireTime() <= nowSeconds) ||
+					bagOids.contains(item->getOwnerID()))
+				continue;
+			String key = String::valueOf(item->getItemType()) + "|" +
+				auctionManager->removeColorCodes(item->getItemName());
+			int floor = humanFloors.contains(key) ? humanFloors.get(key) : 0;
+			if (floor == 0 || item->getPrice() < floor)
+				humanFloors.put(key, item->getPrice());
+		}
+	}
+
+	int liveCount = 0;
+	{
+		Locker progressionLock(&progressionMutex);
+		for (int i = 0; i < progressionBazaarListings.size(); ++i) {
+			const PlayerBotBazaarListing& listing =
+				progressionBazaarListings.elementAt(i).getValue();
+			if (listing.identityId == identityId &&
+					(listing.state == SimBotBazaar::PENDING ||
+					listing.state == SimBotBazaar::LISTED))
+				++liveCount;
+		}
+	}
+
+	int attempts = 0;
+	for (size_t i = 0; i < candidates.size() &&
+			attempts < progressionBazaarMaxListingsPerVisit; ++i) {
+		Candidate& candidate = candidates[i];
+		if ((candidate.junkMask & SimBotBazaar::JUNKGENERIC) != 0) {
+			bazaarSkippedJunk.increment();
+			MissionDiagLog::event("BAZAAR_LIST", identityId,
+				"item=" + String::valueOf(candidate.objectId) +
+				" price=0 base=0 floor=0 result=skip_junk");
+			continue;
+		}
+		if (candidate.junkValue <= 0) {
+			bazaarSkippedNoValue.increment();
+			MissionDiagLog::event("BAZAAR_LIST", identityId,
+				"item=" + String::valueOf(candidate.objectId) +
+				" price=0 base=0 floor=0 result=skip_no_value");
+			continue;
+		}
+		if (candidate.noTrade) {
+			bazaarSkippedNoTrade.increment();
+			MissionDiagLog::event("BAZAAR_LIST", identityId,
+				"item=" + String::valueOf(candidate.objectId) +
+				" price=0 base=0 floor=0 result=skip_no_trade");
+			continue;
+		}
+		if (liveCount >= progressionBazaarMaxListingsPerBot) {
+			bazaarSkippedCap.increment();
+			MissionDiagLog::event("BAZAAR_LIST", identityId,
+				"item=" + String::valueOf(candidate.objectId) +
+				" price=0 base=0 floor=0 result=skip_cap");
+			continue;
+		}
+		int floor = humanFloors.contains(candidate.key) ?
+			humanFloors.get(candidate.key) : 0;
+		SimBotBazaar::PriceDecision price = SimBotBazaar::priceListing(
+			candidate.junkValue, progressionBazaarMarkup,
+			progressionBazaarMinPrice, progressionBazaarMaxPrice, floor,
+			candidate.askPrice);
+		if (price.reason == SimBotBazaar::SKIP_HUMAN_ABOVE_CAP) {
+			bazaarSkippedHumanAboveCap.increment();
+			MissionDiagLog::event("BAZAAR_LIST", identityId,
+				"item=" + String::valueOf(candidate.objectId) +
+				" price=0 base=" + String::valueOf(price.base) +
+				" floor=" + String::valueOf(price.floor) +
+				" result=skip_human_above_cap");
+			continue;
+		}
+		if (price.reason == SimBotBazaar::SKIP_NO_VALUE) {
+			bazaarSkippedNoValue.increment();
+			MissionDiagLog::event("BAZAAR_LIST", identityId,
+				"item=" + String::valueOf(candidate.objectId) +
+				" price=0 base=" + String::valueOf(price.base) +
+				" floor=" + String::valueOf(price.floor) +
+				" result=skip_no_value");
+			continue;
+		}
+		if (price.reason != SimBotBazaar::SKIP_NONE) {
+			bazaarSkippedTransferFailed.increment();
+			MissionDiagLog::event("BAZAAR_LIST", identityId,
+				"item=" + String::valueOf(candidate.objectId) +
+				" price=0 base=" + String::valueOf(price.base) +
+				" floor=" + String::valueOf(price.floor) +
+				" result=skip");
+			continue;
+		}
+		bool listed = listPlayerBotItemAtBazaar(identityId, candidate.objectId,
+			terminal, price.price);
+		MissionDiagLog::event("BAZAAR_LIST", identityId,
+			"item=" + String::valueOf(candidate.objectId) +
+			" price=" + String::valueOf(price.price) +
+			" base=" + String::valueOf(price.base) +
+			" floor=" + String::valueOf(price.floor) +
+			" result=" + (listed ? String("listed") : String("failed")));
+		if (listed) {
+			++liveCount;
+			++attempts;
+		} else {
+			Locker progressionLock(&progressionMutex);
+			bool affordable = progressionRecords.contains(identityId);
+			if (affordable) {
+				const SimBotProgression& progression = progressionRecords.get(identityId);
+				bool merchant1 = progression.skills.contains(
+					"crafting_merchant_sales_01");
+				bool merchant3 = progression.skills.contains(
+					"crafting_merchant_sales_03");
+				int fee = SimBotBazaar::listingFee(AuctionManager::SALESFEE,
+					merchant1, merchant3);
+				affordable = progression.bankCredits -
+					reservedPlayerBotCreditsLocked(identityId, true) >= fee;
+			}
+			if (affordable)
+				bazaarSkippedTransferFailed.increment();
+			else
+				bazaarSkippedUnaffordable.increment();
+		}
+	}
+	return attempts != 0;
+}
+
+void SimPlayerManager::settlePlayerBotBazaarSales() {
+	Vector<PlayerBotBazaarSale> sales;
+	{
+		Locker saleLock(&progressionBazaarSaleMutex);
+		sales = progressionBazaarSaleBacklog;
+		progressionBazaarSaleBacklog.removeAll();
+	}
+
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	VectorMap<uint64, uint64> bagMap = economyManager == nullptr ?
+		VectorMap<uint64, uint64>() : economyManager->getItemBagMapSnapshot();
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	AuctionManager* auctionManager = zoneServer == nullptr ? nullptr :
+		zoneServer->getAuctionManager();
+	for (int i = 0; i < sales.size(); ++i) {
+		PlayerBotBazaarSale sale = sales.get(i);
+		if (sale.bagOid == 0 && auctionManager != nullptr &&
+				auctionManager->getAuctionMap() != nullptr) {
+			TerminalListVector terminalLists = auctionManager->getAuctionMap()->
+				getBazaarTerminalData("", "", nullptr);
+			for (int terminalIndex = 0; terminalIndex < terminalLists.size() &&
+					sale.bagOid == 0; ++terminalIndex) {
+				Reference<TerminalItemList*> terminalItems = terminalLists.get(terminalIndex);
+				if (terminalItems == nullptr)
+					continue;
+				ReadLocker terminalLock(terminalItems);
+				for (int itemIndex = 0; itemIndex < terminalItems->size(); ++itemIndex) {
+					AuctionItem* item = terminalItems->get(itemIndex);
+					if (item != nullptr && item->getObjectID() == sale.auctionOid) {
+						sale.bagOid = item->getOwnerID();
+						break;
+					}
+				}
+			}
+		}
+		Locker progressionLock(&progressionMutex);
+		uint64 objectId = progressionBazaarListingByAuction.contains(sale.auctionOid) ?
+			progressionBazaarListingByAuction.get(sale.auctionOid) : sale.objectId;
+		uint64 identityId = 0;
+		if (progressionBazaarListings.contains(objectId))
+			identityId = progressionBazaarListings.get(objectId).identityId;
+		PlayerBotBazaarListing closedListing;
+		bool foundClosedListing = false;
+		if (!progressionBazaarListings.contains(objectId) &&
+				progressionBazaarClosedListings.contains(sale.auctionOid)) {
+			closedListing = progressionBazaarClosedListings.get(sale.auctionOid);
+			foundClosedListing = true;
+			if (identityId == 0)
+				identityId = closedListing.identityId;
+			if (objectId == 0)
+				objectId = closedListing.objectId;
+		}
+		if (identityId == 0 && sale.bagOid != 0)
+			identityId = playerBotIdentityForBag(bagMap, sale.bagOid);
+		if (identityId == 0 || !progressionRecords.contains(identityId)) {
+			countPlayerBotBazaarSaleUnresolvedLocked(sale.auctionOid);
+			MissionDiagLog::event("BAZAAR_SALE", identityId,
+				"auction=" + String::valueOf(sale.auctionOid) +
+				" outcome=unresolved");
+			continue;
+		}
+
+		if (!progressionBazaarListings.contains(objectId)) {
+			PlayerBotBazaarListing adopted = foundClosedListing ? closedListing :
+				PlayerBotBazaarListing();
+			adopted.auctionOid = sale.auctionOid;
+			adopted.identityId = identityId;
+			adopted.objectId = sale.objectId;
+			adopted.bagOid = sale.bagOid != 0 ? sale.bagOid : adopted.bagOid;
+			adopted.state = SimBotBazaar::SOLD;
+			adopted.price = sale.grossPrice;
+			adopted.tax = sale.tax;
+			adopted.buyerName = sale.buyerName;
+			if (progressionBazaarReceiptSums.contains(sale.auctionOid)) {
+				Pair<int64, int64> receipt = progressionBazaarReceiptSums.get(
+					sale.auctionOid);
+				adopted.creditReceiptSum = receipt.first;
+				adopted.itemReceiptSum = receipt.second;
+			}
+			if (foundClosedListing)
+				progressionBazaarClosedListings.drop(sale.auctionOid);
+			adopted.dirty = true;
+			progressionBazaarListings.put(objectId, adopted);
+			progressionBazaarListingByAuction.put(sale.auctionOid, objectId);
+			bazaarReconcileAdopted.increment();
+		}
+
+		PlayerBotBazaarListing& listing = progressionBazaarListings.get(objectId);
+		int tax = sale.tax > 0 ? sale.tax : listing.tax;
+		if (tax == 0 && sale.grossPrice > listing.price)
+			tax = sale.grossPrice - listing.price;
+		int net = Math::max(0, sale.grossPrice - tax);
+		// Evaluate both receipts before writing either row. The fee has already
+		// been debited by the listing transaction and is never subtracted here.
+		SimBotBazaar::ReceiptDecision receipts = SimBotBazaar::decideReceiptWrites(
+			listing.creditReceiptSum, listing.itemReceiptSum);
+		bool writeCredit = receipts.writeCredit;
+		bool writeItem = receipts.writeItem;
+		SimBotProgression& progression = progressionRecords.get(identityId);
+		uint64 held = progressionItemHeldCounts.contains(identityId) ?
+			progressionItemHeldCounts.get(identityId) : 0;
+		if (writeCredit) {
+			progression.bankCredits += net;
+			appendPlayerBotLedgerEntryLocked(identityId, true, net,
+				progression.bankCredits, "bazaar_sale", sale.auctionOid,
+				"auction=" + String::valueOf(sale.auctionOid));
+			bazaarProceeds.add(static_cast<uint64>(net));
+		}
+		if (writeItem) {
+			if (progressionItems.contains(objectId)) {
+				SimBotItemState oldState = progressionItems.get(objectId).state;
+				if (oldState == SIMBOT_ITEM_HELD || oldState == SIMBOT_ITEM_LISTED) {
+					held = held > 0 ? held - 1 : 0;
+					progressionItemHeldCounts.put(identityId, held);
+				}
+				progressionItems.drop(objectId);
+				progressionItemDirtyIds.drop(objectId);
+				progressionItemDeleteIds.put(objectId, true);
+			} else if (progressionItemHeldCounts.contains(identityId)) {
+				held = progressionItemHeldCounts.get(identityId);
+			}
+			appendPlayerBotLedgerEntryKindLocked(identityId, "item", -1, held,
+				"bazaar_sale", sale.auctionOid, String::valueOf(objectId));
+		} else if (progressionItems.contains(objectId)) {
+			// A prior attempt can have written the item receipt but failed before
+			// deleting the row. Repair that stale row without another receipt.
+			SimBotItemState oldState = progressionItems.get(objectId).state;
+			if (oldState == SIMBOT_ITEM_HELD || oldState == SIMBOT_ITEM_LISTED) {
+				held = held > 0 ? held - 1 : 0;
+				progressionItemHeldCounts.put(identityId, held);
+			}
+			progressionItems.drop(objectId);
+			progressionItemDirtyIds.drop(objectId);
+			progressionItemDeleteIds.put(objectId, true);
+		}
+		if (tax > 0 && writeCredit)
+			bazaarTaxPaid.add(static_cast<uint64>(tax));
+		SimBotBazaar::ListingState current =
+			static_cast<SimBotBazaar::ListingState>(listing.state);
+		listing.state = static_cast<int>(SimBotBazaar::applyListingEvent(current,
+			SimBotBazaar::SOLD_EVENT));
+		listing.price = sale.grossPrice;
+		listing.tax = tax;
+		listing.netPaid = net;
+		listing.buyerName = sale.buyerName;
+		if (listing.closedAtMs == 0)
+			listing.closedAtMs = System::getMiliTime();
+		if (sale.released && listing.releasedAtMs == 0)
+			listing.releasedAtMs = System::getMiliTime();
+		listing.dirty = true;
+		markProgressionDirtyLocked(identityId);
+		if (writeCredit || writeItem)
+			bazaarSold.increment();
+		MissionDiagLog::event("BAZAAR_SALE", identityId,
+			"auction=" + String::valueOf(sale.auctionOid) +
+			" gross=" + String::valueOf(sale.grossPrice) +
+			" tax=" + String::valueOf(tax) +
+			" net=" + String::valueOf(net) +
+			" creditReceipt=" + String::valueOf(writeCredit ? 1 : 0) +
+			" itemReceipt=" + String::valueOf(writeItem ? 1 : 0));
+	}
+}
+
+void SimPlayerManager::reconcilePlayerBotBazaarListings() {
+	if (!progressionLoaded || !progressionListingReconcilePending.load() ||
+			progressionItemReconcilePending.load())
+		return;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	AuctionManager* auctionManager = zoneServer == nullptr ? nullptr :
+		zoneServer->getAuctionManager();
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	if (auctionManager == nullptr || auctionManager->getAuctionMap() == nullptr ||
+			economyManager == nullptr || !auctionManager->isMarketEnabled())
+		return;
+	VectorMap<uint64, uint64> bagMap = economyManager->getItemBagMapSnapshot();
+	Vector<PlayerBotBazaarAuctionSnapshot> auctions;
+	TerminalListVector listed = auctionManager->getAuctionMap()->
+		getBazaarTerminalData("", "", nullptr);
+	for (int i = 0; i < listed.size(); ++i) {
+		Reference<TerminalItemList*> terminalItems = listed.get(i);
+		if (terminalItems == nullptr)
+			continue;
+		ReadLocker terminalLock(terminalItems);
+		for (int j = 0; j < terminalItems->size(); ++j) {
+			AuctionItem* auctionItem = terminalItems->get(j);
+			if (auctionItem == nullptr || !auctionManager->isSimBotListing(auctionItem))
+				continue;
+			PlayerBotBazaarAuctionSnapshot snapshot;
+			snapshot.item = auctionItem;
+			snapshot.auctionOid = auctionItem->getObjectID();
+			snapshot.objectId = auctionItem->getAuctionedItemObjectID();
+			snapshot.bagOid = auctionItem->getOwnerID();
+			snapshot.identityId = playerBotIdentityForBag(bagMap,
+				snapshot.bagOid);
+			snapshot.mappedBag = snapshot.identityId != 0;
+			snapshot.buyerId = auctionItem->getBuyerID();
+			snapshot.vendorOid = auctionItem->getVendorID();
+			snapshot.status = auctionItem->getStatus();
+			snapshot.price = auctionItem->getPrice();
+			snapshot.askPrice = playerBotBazaarAskPrice(zoneServer, auctionItem);
+			snapshot.expireTime = auctionItem->getExpireTime();
+			snapshot.buyerName = auctionItem->getBidderName();
+			snapshot.ownerName = auctionItem->getOwnerName();
+			auctions.add(snapshot);
+		}
+	}
+
+	// Net acquisition history per listed object (item rows keyed by the object
+	// id; sale receipts are keyed by the auction id and so never match). A
+	// positive sum means the original +1 is already journaled and adoption must
+	// not write another.
+	VectorMap<uint64, int64> acquisitionSums;
+	if (auctions.size() > 0) {
+		StringBuffer ids;
+		for (int i = 0; i < auctions.size(); ++i) {
+			if (i > 0)
+				ids << ",";
+			ids << auctions.get(i).objectId;
+		}
+		try {
+			UniqueReference<ResultSet*> acquired(
+				ServerDatabase::instance()->executeQuery(
+					"SELECT `ref_id`,SUM(`delta`) FROM `simbot_ledger` WHERE "
+					"`kind`='item' AND `ref_id` IN (" + ids.toString() +
+					") GROUP BY `ref_id`;"));
+			while (acquired != nullptr && acquired->next())
+				acquisitionSums.put(acquired->getUnsignedLong(0),
+					acquired->getLong(1));
+		} catch (const Exception& e) {
+			// Without the history the repair could duplicate it: stay pending.
+			error("SimPlayerBazaarReconcileAcquisitionQueryFailed: " + e.getMessage());
+			return;
+		}
+	}
+
+	Vector<PlayerBotBazaarSale> sales;
+	Vector<ManagedReference<AuctionItem*> > unmappedToRetrieve;
+	VectorMap<uint64, bool> seenObjects;
+	Locker progressionLock(&progressionMutex);
+	for (int i = 0; i < auctions.size(); ++i) {
+		PlayerBotBazaarAuctionSnapshot& auction = auctions.get(i);
+		if (auction.objectId == 0)
+			continue;
+		seenObjects.put(auction.objectId, true);
+		uint64 objectId = auction.objectId;
+		if (!auction.mappedBag) {
+			if (auction.status == AuctionItem::FORSALE ||
+					auction.status == AuctionItem::EXPIRED) {
+				unmappedToRetrieve.add(auction.item);
+			}
+			if (!progressionBazaarListings.contains(objectId)) {
+				PlayerBotBazaarListing orphan;
+				orphan.auctionOid = auction.auctionOid;
+				orphan.objectId = objectId;
+				orphan.bagOid = auction.bagOid;
+				orphan.state = SimBotBazaar::ORPHANED;
+				if (orphan.closedAtMs == 0)
+					orphan.closedAtMs = System::getMiliTime();
+				orphan.price = auction.price;
+				orphan.vendorOid = auction.vendorOid;
+				orphan.buyerName = auction.buyerName;
+				orphan.dirty = true;
+				progressionBazaarListings.put(objectId, orphan);
+				progressionBazaarListingByAuction.put(auction.auctionOid, objectId);
+			}
+			if (progressionBazaarListings.contains(objectId)) {
+				PlayerBotBazaarListing& orphan = progressionBazaarListings.get(objectId);
+				orphan.state = SimBotBazaar::ORPHANED;
+				if (orphan.closedAtMs == 0)
+					orphan.closedAtMs = System::getMiliTime();
+				orphan.identityId = 0;
+				orphan.dirty = true;
+				bazaarReconcileOrphaned.increment();
+			}
+			continue;
+		}
+
+		bool hasListing = progressionBazaarListings.contains(objectId);
+		if (!hasListing && progressionBazaarClosedListings.contains(
+				auction.auctionOid)) {
+			PlayerBotBazaarListing adopted =
+				progressionBazaarClosedListings.get(auction.auctionOid);
+			progressionBazaarClosedListings.drop(auction.auctionOid);
+			adopted.auctionOid = auction.auctionOid;
+			adopted.identityId = auction.identityId;
+			adopted.objectId = objectId;
+			adopted.bagOid = auction.bagOid;
+			adopted.state = auction.status == AuctionItem::SOLD ?
+				SimBotBazaar::SOLD : SimBotBazaar::LISTED;
+			adopted.price = auction.askPrice > 0 ? auction.askPrice :
+				auction.price;
+			adopted.tax = auction.status == AuctionItem::SOLD ?
+				Math::max(0, auction.price - adopted.price) : 0;
+			adopted.vendorOid = auction.vendorOid;
+			adopted.buyerName = auction.buyerName;
+			adopted.dirty = true;
+			progressionBazaarListings.put(objectId, adopted);
+			progressionBazaarListingByAuction.put(auction.auctionOid, objectId);
+			hasListing = true;
+		}
+		if (!hasListing) {
+			PlayerBotBazaarListing adopted;
+			adopted.auctionOid = auction.auctionOid;
+			adopted.identityId = auction.identityId;
+			adopted.objectId = objectId;
+			adopted.bagOid = auction.bagOid;
+			adopted.state = auction.status == AuctionItem::SOLD ?
+				SimBotBazaar::SOLD : SimBotBazaar::LISTED;
+			adopted.price = auction.askPrice > 0 ? auction.askPrice : auction.price;
+			adopted.tax = auction.status == AuctionItem::SOLD ?
+				Math::max(0, auction.price - adopted.price) : 0;
+			adopted.vendorOid = auction.vendorOid;
+			adopted.buyerName = auction.buyerName;
+			if (progressionBazaarReceiptSums.contains(auction.auctionOid)) {
+				Pair<int64, int64> receipt = progressionBazaarReceiptSums.get(
+					auction.auctionOid);
+				adopted.creditReceiptSum = receipt.first;
+				adopted.itemReceiptSum = receipt.second;
+			}
+			adopted.dirty = true;
+			progressionBazaarListings.put(objectId, adopted);
+			progressionBazaarListingByAuction.put(auction.auctionOid, objectId);
+			bazaarReconcileAdopted.increment();
+			bool acquisitionJournaled = acquisitionSums.contains(objectId) &&
+				acquisitionSums.get(objectId) > 0;
+			if (!SimBotBazaar::hasItemReceipt(adopted.itemReceiptSum) &&
+					!progressionItems.contains(objectId)) {
+				// A live listing or held sale can predate both the item row and
+				// its acquisition ledger row. Repair ownership before applying
+				// the listing or settling the sale.
+				SimBotItemRow row;
+				row.objectId = objectId;
+				row.identityId = auction.identityId;
+				row.state = SIMBOT_ITEM_LISTED;
+				row.askPrice = auction.askPrice > 0 ? auction.askPrice :
+					auction.price;
+				row.source = "reconcile_adopt";
+				row.refId = auction.auctionOid;
+				row.acquiredAt = String::valueOf(System::getMiliTime());
+				row.updatedAt = row.acquiredAt;
+				row.version = 1;
+				row.dirty = true;
+				progressionItems.put(objectId, row);
+				progressionItemDirtyIds.put(objectId, true);
+				uint64 held = progressionItemHeldCounts.contains(auction.identityId) ?
+					progressionItemHeldCounts.get(auction.identityId) + 1 : 1;
+				progressionItemHeldCounts.put(auction.identityId, held);
+				// The row is restored either way; the +1 only when the original
+				// acquisition never reached the journal. Keyed by the object id,
+				// like every acquisition row, so the check above can see it.
+				if (!acquisitionJournaled)
+					appendPlayerBotLedgerEntryKindLocked(auction.identityId, "item", 1,
+						held, "reconcile_adopt", objectId,
+						"auction=" + String::valueOf(auction.auctionOid));
+			}
+			if (auction.status == AuctionItem::SOLD &&
+					!SimBotBazaar::hasCreditReceipt(adopted.creditReceiptSum))
+				bazaarReconcileAdoptedTaxEstimated.increment();
+		}
+		PlayerBotBazaarListing& listingRow = progressionBazaarListings.get(objectId);
+		if (!progressionBazaarListingByAuction.contains(auction.auctionOid))
+			progressionBazaarListingByAuction.put(auction.auctionOid, objectId);
+		SimBotBazaar::RowState rowState = listingRow.state == SimBotBazaar::SOLD ?
+			SimBotBazaar::ROW_SOLD : listingRow.state == SimBotBazaar::LISTED ?
+			SimBotBazaar::ROW_LISTED : SimBotBazaar::ROW_NONE;
+		SimBotBazaar::AuctionStatus auctionStatus =
+			auction.status == AuctionItem::SOLD ? SimBotBazaar::AUCTION_SOLD :
+			auction.status == AuctionItem::EXPIRED ? SimBotBazaar::AUCTION_EXPIRED :
+			SimBotBazaar::AUCTION_FORSALE;
+		SimBotBazaar::ReconcileDecision decision =
+			SimBotBazaar::decideListingReconcile(rowState, auctionStatus, true,
+				listingRow.creditReceiptSum, listingRow.itemReceiptSum,
+				SimBotBazaar::LOCATION_LISTED, true);
+		if (decision == SimBotBazaar::RECONCILE_SETTLE) {
+			PlayerBotBazaarSale sale;
+			sale.auctionOid = auction.auctionOid;
+			sale.objectId = objectId;
+			sale.bagOid = auction.bagOid;
+			sale.buyerId = auction.buyerId;
+			sale.grossPrice = auction.price;
+			sale.tax = listingRow.tax > 0 ? listingRow.tax :
+				Math::max(0, auction.price - auction.askPrice);
+			sale.buyerName = auction.buyerName;
+			sales.add(sale);
+			bazaarReconcileSettled.increment();
+		} else if (decision == SimBotBazaar::RECONCILE_REVERSE) {
+			int net = listingRow.netPaid > 0 ? listingRow.netPaid : listingRow.price;
+			if (SimBotBazaar::hasCreditReceipt(listingRow.creditReceiptSum) &&
+					progressionRecords.contains(listingRow.identityId)) {
+				SimBotProgression& progression = progressionRecords.get(
+					listingRow.identityId);
+				progression.bankCredits = Math::max<int64>(0,
+					progression.bankCredits - listingRow.creditReceiptSum);
+				appendPlayerBotLedgerEntryLocked(listingRow.identityId, true,
+					-listingRow.creditReceiptSum, progression.bankCredits,
+					"bazaar_sale_reversal", auction.auctionOid,
+					"live_listing_reversal");
+				markProgressionDirtyLocked(listingRow.identityId);
+			}
+			if (SimBotBazaar::hasItemReceipt(listingRow.itemReceiptSum)) {
+				uint64 held = progressionItemHeldCounts.contains(listingRow.identityId) ?
+					progressionItemHeldCounts.get(listingRow.identityId) : 0;
+				bool restored = false;
+				if (!progressionItems.contains(objectId)) {
+					SimBotItemRow row;
+					row.objectId = objectId;
+					row.identityId = listingRow.identityId;
+					row.state = SIMBOT_ITEM_LISTED;
+					row.askPrice = auction.askPrice > 0 ? auction.askPrice :
+						auction.price;
+					row.source = "reconcile";
+					row.refId = auction.auctionOid;
+					row.acquiredAt = String::valueOf(System::getMiliTime());
+					row.updatedAt = row.acquiredAt;
+					row.version = 1;
+					row.dirty = true;
+					progressionItems.put(objectId, row);
+					progressionItemDirtyIds.put(objectId, true);
+					progressionItemHeldCounts.put(listingRow.identityId, held + 1);
+					restored = true;
+				} else if (progressionItems.get(objectId).state != SIMBOT_ITEM_HELD &&
+						progressionItems.get(objectId).state != SIMBOT_ITEM_LISTED) {
+					progressionItems.get(objectId).state = SIMBOT_ITEM_LISTED;
+					progressionItemHeldCounts.put(listingRow.identityId, held + 1);
+					progressionItems.get(objectId).version++;
+					markPlayerBotItemDirtyLocked(objectId);
+					restored = true;
+				}
+				appendPlayerBotLedgerEntryKindLocked(listingRow.identityId, "item", 1,
+					held + (restored ? 1 : 0), "bazaar_sale_reversal", auction.auctionOid,
+					String::valueOf(objectId));
+			}
+			listingRow.netPaid = net;
+			listingRow.state = SimBotBazaar::LISTED;
+			listingRow.dirty = true;
+			bazaarReconcileReversed.increment();
+		}
+		if (auction.status == AuctionItem::SOLD && decision !=
+				SimBotBazaar::RECONCILE_SETTLE) {
+			PlayerBotBazaarSale sale;
+			sale.auctionOid = auction.auctionOid;
+			sale.objectId = objectId;
+			sale.bagOid = auction.bagOid;
+			sale.buyerId = auction.buyerId;
+			sale.grossPrice = auction.price;
+			sale.tax = listingRow.tax > 0 ? listingRow.tax :
+				Math::max(0, auction.price - auction.askPrice);
+			sale.buyerName = auction.buyerName;
+			if (!SimBotBazaar::hasCreditReceipt(listingRow.creditReceiptSum) ||
+					!SimBotBazaar::hasItemReceipt(listingRow.itemReceiptSum))
+				sales.add(sale);
+		}
+	}
+
+	// Rows can outlive their AuctionItem after retrieval or stock cleanup.
+	// Distinguish a clean retrieval from an orphan by checking the identity bag
+	// before applying the pure row decision.
+	for (int i = 0; i < progressionBazaarListings.size(); ++i) {
+		PlayerBotBazaarListing& listingRow =
+			progressionBazaarListings.elementAt(i).getValue();
+		if (seenObjects.contains(listingRow.objectId))
+			continue;
+		bool receiptsMissing = !SimBotBazaar::hasCreditReceipt(
+			listingRow.creditReceiptSum) ||
+			!SimBotBazaar::hasItemReceipt(listingRow.itemReceiptSum);
+		if ((listingRow.state == SimBotBazaar::LISTED ||
+				(listingRow.state == SimBotBazaar::SOLD && receiptsMissing))) {
+			PlayerBotBazaarSale evidence;
+			if (findBuyerOwnedBotSaleLocked(listingRow, auctionManager,
+					zoneServer, evidence)) {
+				// Settlement is receipt-checked, so a sale already paid is only
+				// repaired, never paid twice.
+				sales.add(evidence);
+				continue;
+			}
+		}
+		if (listingRow.state == SimBotBazaar::SOLD) {
+			SimBotBazaar::ReconcileDecision releasedDecision =
+				SimBotBazaar::decideListingReconcile(
+					SimBotBazaar::ROW_SOLD, SimBotBazaar::AUCTION_MISSING, false,
+					listingRow.creditReceiptSum, listingRow.itemReceiptSum,
+					SimBotBazaar::LOCATION_MISSING, false);
+			if (listingRow.releasedAtMs == 0 && releasedDecision ==
+					SimBotBazaar::RECONCILE_RELEASE) {
+				listingRow.releasedAtMs = System::getMiliTime();
+				listingRow.dirty = true;
+				bazaarReconcileReleasedRepaired.increment();
+			}
+			continue;
+		}
+		ManagedReference<SceneObject*> object = zoneServer->getObject(
+			listingRow.objectId);
+		ManagedReference<SceneObject*> bag = economyManager->getItemBag(
+			listingRow.identityId);
+		bool backInBag = object != nullptr && bag != nullptr &&
+			object->getParent().get() == bag.get();
+		SimBotBazaar::ReconcileDecision decision =
+			SimBotBazaar::decideListingReconcile(
+				listingRow.state == SimBotBazaar::LISTED ? SimBotBazaar::ROW_LISTED :
+				SimBotBazaar::ROW_NONE, SimBotBazaar::AUCTION_MISSING, false,
+				listingRow.creditReceiptSum, listingRow.itemReceiptSum,
+				backInBag ? SimBotBazaar::LOCATION_IDENTITY_BAG :
+				SimBotBazaar::LOCATION_MISSING, backInBag);
+		if (decision == SimBotBazaar::RECONCILE_RETRIEVED) {
+			listingRow.state = SimBotBazaar::RETRIEVED;
+			listingRow.closedAtMs = System::getMiliTime();
+			listingRow.dirty = true;
+			bazaarReconcileRetrieved.increment();
+		} else if (decision == SimBotBazaar::RECONCILE_ORPHANED) {
+			uint64 orphanIdentity = listingRow.identityId;
+			if (!SimBotBazaar::hasItemReceipt(listingRow.itemReceiptSum) &&
+					orphanIdentity != 0 && progressionRecords.contains(orphanIdentity)) {
+				uint64 held = progressionItemHeldCounts.contains(orphanIdentity) ?
+					progressionItemHeldCounts.get(orphanIdentity) : 0;
+				bool writeOrphanReceipt = !progressionItems.contains(
+					listingRow.objectId);
+				if (progressionItems.contains(listingRow.objectId)) {
+					SimBotItemState oldState = progressionItems.get(listingRow.objectId).state;
+					if (oldState == SIMBOT_ITEM_HELD || oldState == SIMBOT_ITEM_LISTED) {
+						held = held > 0 ? held - 1 : 0;
+						progressionItemHeldCounts.put(orphanIdentity, held);
+						writeOrphanReceipt = true;
+					}
+					progressionItems.get(listingRow.objectId).state = SIMBOT_ITEM_ORPHANED;
+					progressionItems.get(listingRow.objectId).identityId = 0;
+					progressionItems.get(listingRow.objectId).version++;
+					markPlayerBotItemDirtyLocked(listingRow.objectId);
+				}
+				if (writeOrphanReceipt)
+					appendPlayerBotLedgerEntryKindLocked(orphanIdentity, "item", -1,
+						held, "reconcile", listingRow.auctionOid,
+						String::valueOf(listingRow.objectId));
+			}
+			listingRow.state = SimBotBazaar::ORPHANED;
+			if (listingRow.closedAtMs == 0)
+				listingRow.closedAtMs = System::getMiliTime();
+			listingRow.identityId = 0;
+			listingRow.dirty = true;
+			bazaarReconcileOrphaned.increment();
+		}
+	}
+	progressionLock.release();
+
+	// Retrieval and vault-root adoption deliberately happen after the manager
+	// lock is released; AuctionManager takes the object/bag locks itself.
+	for (int i = 0; i < unmappedToRetrieve.size(); ++i) {
+		AuctionItem* item = unmappedToRetrieve.get(i);
+		uint64 objectId = item == nullptr ? 0 : item->getAuctionedItemObjectID();
+		ManagedReference<SceneObject*> bag = zoneServer->getObject(
+			item == nullptr ? 0 : item->getOwnerID());
+		if (item == nullptr || bag == nullptr ||
+			auctionManager->retrieveSimBotItem(item, bag) != 0)
+			continue;
+		ManagedReference<SceneObject*> object = zoneServer->getObject(
+			objectId);
+		ManagedReference<SceneObject*> vault = economyManager->getItemVault();
+		bool moved = false;
+		if (object != nullptr && vault != nullptr) {
+			// Same choreography as the vault forge path: object -> bag -> vault,
+			// remove from the bag, then transfer into the vault root.
+			Locker objectLock(object);
+			Locker bagLock(bag, object);
+			Locker vaultLock(vault, bag);
+			moved = object->getParent().get() == bag.get() &&
+				bag->removeObject(object, nullptr, false, true) &&
+				vault->transferObject(object, -1, false, true);
+		}
+		if (moved) {
+			Locker progressionLock(&progressionMutex);
+			if (progressionBazaarListings.contains(objectId)) {
+				PlayerBotBazaarListing& orphan = progressionBazaarListings.get(objectId);
+				orphan.state = SimBotBazaar::ORPHANED;
+				if (orphan.closedAtMs == 0)
+					orphan.closedAtMs = System::getMiliTime();
+				orphan.identityId = 0;
+				orphan.dirty = true;
+				bazaarReconcileOrphaned.increment();
+			}
+		}
+	}
+	progressionListingReconcilePending = false;
+	for (int i = 0; i < sales.size(); ++i)
+		enqueuePlayerBotBazaarSale(sales.get(i));
+}
+
+void SimPlayerManager::sweepPlayerBotBazaarListings(uint64 nowMs) {
+	if (!progressionLoaded || !progressionDbAvailable ||
+			(progressionBazaarLastSweepMs != 0 &&
+			nowMs - progressionBazaarLastSweepMs <
+			static_cast<uint64>(progressionBazaarSweepIntervalSeconds) * 1000))
+		return;
+	progressionBazaarLastSweepMs = nowMs;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	AuctionManager* auctionManager = zoneServer == nullptr ? nullptr :
+		zoneServer->getAuctionManager();
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	if (auctionManager == nullptr || auctionManager->getAuctionMap() == nullptr ||
+			economyManager == nullptr)
+		return;
+
+	VectorMap<uint64, uint64> bagMap = economyManager->getItemBagMapSnapshot();
+	Vector<PlayerBotBazaarAuctionSnapshot> auctions;
+	TerminalListVector listed = auctionManager->getAuctionMap()->
+		getBazaarTerminalData("", "", nullptr);
+	for (int i = 0; i < listed.size(); ++i) {
+		Reference<TerminalItemList*> terminalItems = listed.get(i);
+		if (terminalItems == nullptr)
+			continue;
+		ReadLocker terminalLock(terminalItems);
+		for (int j = 0; j < terminalItems->size(); ++j) {
+			AuctionItem* item = terminalItems->get(j);
+			if (item == nullptr || !auctionManager->isSimBotListing(item))
+				continue;
+			PlayerBotBazaarAuctionSnapshot snapshot;
+			snapshot.item = item;
+			snapshot.auctionOid = item->getObjectID();
+			snapshot.objectId = item->getAuctionedItemObjectID();
+			snapshot.bagOid = item->getOwnerID();
+			snapshot.identityId = playerBotIdentityForBag(bagMap, snapshot.bagOid);
+			snapshot.mappedBag = snapshot.identityId != 0;
+			snapshot.buyerId = item->getBuyerID();
+			snapshot.status = item->getStatus();
+			snapshot.price = item->getPrice();
+			snapshot.askPrice = playerBotBazaarAskPrice(zoneServer, item);
+			snapshot.expireTime = item->getExpireTime();
+			snapshot.buyerName = item->getBidderName();
+			auctions.add(snapshot);
+		}
+	}
+
+	bool configuredGateOn = progressionEnabled && progressionBazaarSellEnabled &&
+			!progressionItemReconcilePending.load() &&
+			!progressionListingReconcilePending.load() &&
+			auctionManager->isMarketEnabled();
+	Vector<PlayerBotBazaarSale> sales;
+	int processed = 0;
+	for (int i = 0; i < auctions.size() && processed < progressionBazaarSweepBatch;
+			++i) {
+		PlayerBotBazaarAuctionSnapshot& auction = auctions.get(i);
+		uint64 objectId = auction.objectId;
+		if (objectId == 0)
+			continue;
+		PlayerBotBazaarListing listing;
+		bool found = false;
+		{
+			Locker progressionLock(&progressionMutex);
+			if (progressionBazaarListingByAuction.contains(auction.auctionOid)) {
+				uint64 mappedObject = progressionBazaarListingByAuction.get(
+					auction.auctionOid);
+				if (progressionBazaarListings.contains(mappedObject)) {
+					listing = progressionBazaarListings.get(mappedObject);
+					found = true;
+				}
+			}
+		}
+		if (!found)
+			continue;
+		bool gateOn = configuredGateOn &&
+			playerBotBazaarSellGateEnabled(listing.identityId);
+		if (auction.status == AuctionItem::SOLD) {
+			if (!SimBotBazaar::hasCreditReceipt(listing.creditReceiptSum) ||
+					!SimBotBazaar::hasItemReceipt(listing.itemReceiptSum)) {
+				PlayerBotBazaarSale sale;
+				sale.auctionOid = auction.auctionOid;
+				sale.objectId = objectId;
+				sale.bagOid = auction.bagOid;
+				sale.buyerId = auction.buyerId;
+				sale.grossPrice = auction.price;
+				sale.buyerName = auction.buyerName;
+				sales.add(sale);
+			}
+			bool buyerPresent = zoneServer->getObject(auction.buyerId) != nullptr;
+			bool sellerResolvable = false;
+			bool receiptRowsFlushed = true;
+			{
+				Locker progressionLock(&progressionMutex);
+				uint64 mappedIdentity = playerBotIdentityForBag(bagMap,
+					auction.bagOid);
+				sellerResolvable = listing.identityId != 0 &&
+					mappedIdentity == listing.identityId &&
+					progressionRecords.contains(listing.identityId);
+				if (sellerResolvable &&
+						!isPlayerBotLedgerAppliedLocked(listing.identityId))
+					receiptRowsFlushed = false;
+				for (int pendingIndex = 0;
+						pendingIndex < progressionLedgerPending.size(); ++pendingIndex) {
+					const SimBotLedgerEntry& pending =
+						progressionLedgerPending.get(pendingIndex);
+					if (pending.refId == auction.auctionOid &&
+							(pending.source == "bazaar_sale" ||
+							pending.source == "bazaar_sale_reversal")) {
+						receiptRowsFlushed = false;
+						break;
+					}
+				}
+			}
+			if (listing.releasedAtMs == 0 && SimBotBazaar::mayReleaseHeldSale(
+					receiptRowsFlushed &&
+						SimBotBazaar::hasCreditReceipt(listing.creditReceiptSum),
+					receiptRowsFlushed &&
+						SimBotBazaar::hasItemReceipt(listing.itemReceiptSum),
+					sellerResolvable, buyerPresent)) {
+				if (auctionManager->releaseSimBotSale(auction.item) == 0) {
+					Locker progressionLock(&progressionMutex);
+					if (progressionBazaarListings.contains(objectId)) {
+						progressionBazaarListings.get(objectId).releasedAtMs = nowMs;
+						progressionBazaarListings.get(objectId).dirty = true;
+					}
+					if (!sellerResolvable)
+						countPlayerBotBazaarSaleUnresolvedLocked(auction.auctionOid);
+					if (!buyerPresent)
+						bazaarReleaseBuyerGone.increment();
+				}
+			}
+			++processed;
+			continue;
+		}
+
+		SimBotBazaar::AuctionStatus status = auction.status == AuctionItem::EXPIRED ?
+			SimBotBazaar::AUCTION_EXPIRED : SimBotBazaar::AUCTION_FORSALE;
+		if (!SimBotBazaar::shouldSweep(status, auction.expireTime,
+				static_cast<uint64>(nowMs / 1000), gateOn,
+				progressionBazaarDrainOnDisable))
+			continue;
+		ManagedReference<SceneObject*> bag = economyManager->getItemBag(
+			listing.identityId);
+		if (bag == nullptr || auctionManager->retrieveSimBotItem(auction.item,
+				bag) != ItemSoldMessage::SUCCESS) {
+			bazaarSkippedTransferFailed.increment();
+			++processed;
+			continue;
+		}
+		{
+			Locker progressionLock(&progressionMutex);
+			if (progressionBazaarListings.contains(objectId)) {
+				PlayerBotBazaarListing& updated = progressionBazaarListings.get(objectId);
+				updated.state = static_cast<int>(SimBotBazaar::applyListingEvent(
+					static_cast<SimBotBazaar::ListingState>(updated.state),
+					SimBotBazaar::RETRIEVED_EVENT));
+				updated.closedAtMs = nowMs;
+				updated.dirty = true;
+				if (progressionItems.contains(objectId) &&
+						progressionItems.get(objectId).state == SIMBOT_ITEM_LISTED) {
+					progressionItems.get(objectId).state = SIMBOT_ITEM_HELD;
+					progressionItems.get(objectId).version++;
+					markPlayerBotItemDirtyLocked(objectId);
+				}
+			}
+		}
+		bazaarRetrieved.increment();
+		if (!gateOn)
+			bazaarDrained.increment();
+		++processed;
+	}
+	for (int i = 0; i < sales.size(); ++i)
+		enqueuePlayerBotBazaarSale(sales.get(i));
+}
+
 bool SimPlayerManager::removePlayerBotItemsForReap(uint64 identityId) {
 	if (identityId == 0)
 		return false;
@@ -11167,6 +12987,22 @@ bool SimPlayerManager::removePlayerBotItemsForReap(uint64 identityId) {
 		progressionItems.drop(objectId);
 		progressionItemDirtyIds.drop(objectId);
 		removed = true;
+	}
+	for (int i = progressionBazaarListings.size() - 1; i >= 0; --i) {
+		if (progressionBazaarListings.elementAt(i).getValue().identityId != identityId)
+			continue;
+		uint64 objectId = progressionBazaarListings.elementAt(i).getKey();
+		uint64 auctionOid = progressionBazaarListings.elementAt(i).getValue().auctionOid;
+		progressionBazaarListings.remove(i);
+		if (auctionOid != 0)
+			progressionBazaarListingByAuction.drop(auctionOid);
+		progressionItemDeleteIds.drop(objectId);
+	}
+	for (int i = progressionBazaarClosedListings.size() - 1; i >= 0; --i) {
+		if (progressionBazaarClosedListings.elementAt(i).getValue().identityId !=
+				identityId)
+			continue;
+		progressionBazaarClosedListings.remove(i);
 	}
 	progressionItemHeldCounts.drop(identityId);
 	return removed;
@@ -11255,6 +13091,34 @@ bool SimPlayerManager::playerBotProgressionAwardGateEnabled() {
 	if (playerBotParityTestGateOverrideActive)
 		return playerBotParityTestGateOverride;
 	return true;
+}
+
+bool SimPlayerManager::playerBotBazaarSellGateEnabled(uint64 identityId) {
+	if (!progressionEnabled)
+		return false;
+	bool bazaarEnabled = progressionBazaarSellEnabled;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (identityId != 0 && playerBotParityTestBazaarSellGateOverrideActive &&
+				playerBotParityBazaarSellGateScopedIds.contains(identityId))
+			bazaarEnabled = playerBotParityTestBazaarSellGateOverride;
+	}
+	if (!bazaarEnabled || progressionItemReconcilePending.load() ||
+			progressionListingReconcilePending.load())
+		return false;
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	AuctionManager* auctionManager = zoneServer == nullptr ? nullptr :
+		zoneServer->getAuctionManager();
+	if (economyManager == nullptr || !economyManager->isItemVaultAvailable() ||
+			auctionManager == nullptr || !auctionManager->isMarketEnabled())
+		return false;
+	if (identityId == 0)
+		return true;
+	// The capability gate is intentionally complete before progressionMutex;
+	// callers use it on body/controller threads and the lock is the mutation
+	// boundary below it, never part of gate evaluation.
+	return progressionLoaded;
 }
 
 bool SimPlayerManager::playerBotLootGateEnabled(uint64 identityId) {
@@ -11395,6 +13259,8 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 			armingOp = "setCombatAbilitiesGate";
 		else if (gate == "lootEnabled")
 			armingOp = "setLootGate";
+		else if (gate == "bazaarSell")
+			armingOp = "setBazaarSellGate";
 		else if (gate == "novice")
 			armingOp = "setNoviceGate";
 		else if (gate == "progressionEnabled")
@@ -11430,6 +13296,8 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 			live = playerBotCombatAbilitiesGateArmed();
 		else if (gate == "lootEnabled")
 			live = playerBotLootGateEnabled(0);
+		else if (gate == "bazaarSell")
+			live = playerBotBazaarSellGateEnabled(0);
 		else if (gate == "novice") {
 			Locker pveLock(&pveMutex);
 			live = pveNoviceEnabled;
@@ -11756,8 +13624,7 @@ bool SimPlayerManager::spendPlayerBotCredits(uint64 identityId, int64 amount,
 
 	SimBotProgression& progression = progressionRecords.get(identityId);
 	int64& balance = bank ? progression.bankCredits : progression.cashCredits;
-	int64 reserved = bank && progressionBuffFeeReservations.contains(identityId) ?
-		progressionBuffFeeReservations.get(identityId) : 0;
+	int64 reserved = reservedPlayerBotCreditsLocked(identityId, bank);
 	if (balance - reserved < amount) {
 		progressionAwardsRejectedInsufficient.increment();
 		return false;
@@ -11790,29 +13657,18 @@ PlayerBotBuffFee SimPlayerManager::reservePlayerBotDoctorBuffFee(
 		return PLAYER_BOT_BUFF_FEE_NOT_CHARGED;
 
 	// A new buff-up replaces a stale reservation for this identity. There is
-	// intentionally only one reservation per identity, so the old amount is
-	// returned to the spendable balance before affordability is checked.
-	progressionBuffFeeReservations.drop(identityId);
-	SimBotProgression& progression = progressionRecords.get(identityId);
+	// intentionally only one doctor reservation, so the old amount is released
+	// before affordability is checked. Other purposes remain independent.
+	releasePlayerBotCreditsLocked(identityId, "doctor_buff");
 	int64 fee = configuredFee;
-	if (progression.bankCredits < fee) {
+	if (!reservePlayerBotCreditsLocked(identityId, fee, "doctor_buff")) {
 		buffPaymentSkippedUnaffordable.increment();
 		return PLAYER_BOT_BUFF_FEE_UNAFFORDABLE;
 	}
-	progressionBuffFeeReservations.put(identityId, fee);
 	return PLAYER_BOT_BUFF_FEE_RESERVED;
 }
 
 bool SimPlayerManager::commitPlayerBotDoctorBuffFee(uint64 identityId) {
-	int64 fee = 0;
-	{
-		Locker progressionLock(&progressionMutex);
-		if (!progressionBuffFeeReservations.contains(identityId))
-			return false;
-		fee = progressionBuffFeeReservations.get(identityId);
-		progressionBuffFeeReservations.drop(identityId);
-	}
-
 	// Recheck outside progressionMutex: the gate takes the parity mutex and
 	// must never be nested beneath the progression lock.
 	if (!playerBotBuffPaymentGateEnabled(identityId)) {
@@ -11821,33 +13677,32 @@ bool SimPlayerManager::commitPlayerBotDoctorBuffFee(uint64 identityId) {
 	}
 
 	Locker progressionLock(&progressionMutex);
+	if (!progressionCreditReservations.contains(
+			playerBotCreditReservationKey(identityId, "doctor_buff"))) {
+		return false;
+	}
+	PlayerBotCreditReservation reservation = progressionCreditReservations.get(
+		playerBotCreditReservationKey(identityId, "doctor_buff"));
 	if (!progressionRecords.contains(identityId)) {
 		buffPaymentChargeFailed.increment();
 		return false;
 	}
-	SimBotProgression& progression = progressionRecords.get(identityId);
-	if (progression.bankCredits < fee) {
+	if (!commitPlayerBotCreditsLocked(identityId, "doctor_buff", true,
+			"doctor_buff", 0, String())) {
 		buffPaymentChargeFailed.increment();
 		return false;
 	}
-	progression.bankCredits -= fee;
-	progression.lastAwardMs = System::getMiliTime();
-	progression.lastAwardSource = progressionAwardSource("doctor_buff");
-	progression.awardsTotal++;
-	appendPlayerBotLedgerEntryLocked(identityId, true, -fee,
-		progression.bankCredits, "doctor_buff", 0, String());
-	markProgressionDirtyLocked(identityId);
-	progressionAwardsAccepted.increment();
 	buffPaymentCharged.increment();
-	buffPaymentCreditsSpent.add(static_cast<uint64>(fee));
+	buffPaymentCreditsSpent.add(static_cast<uint64>(reservation.amount));
 	return true;
 }
 
 void SimPlayerManager::releasePlayerBotDoctorBuffFee(uint64 identityId) {
 	Locker progressionLock(&progressionMutex);
-	if (!progressionBuffFeeReservations.contains(identityId))
+	String key = playerBotCreditReservationKey(identityId, "doctor_buff");
+	if (!progressionCreditReservations.contains(key))
 		return;
-	progressionBuffFeeReservations.drop(identityId);
+	releasePlayerBotCreditsLocked(identityId, "doctor_buff");
 	buffPaymentReleased.increment();
 }
 
@@ -13351,7 +15206,8 @@ void SimPlayerManager::reconcilePlayerBotProgression() {
 }
 
 void SimPlayerManager::reconcilePlayerBotItems() {
-	if (!progressionEnabled || !progressionLoaded ||
+	if ((!progressionEnabled && !progressionBazaarSettlementMode) ||
+			!progressionLoaded ||
 			!progressionItemReconcilePending)
 		return;
 
@@ -13397,6 +15253,60 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 			item.location = SimBotItemReconcile::LOCATION_IDENTITY_BAG;
 			item.object = child;
 			observed.add(item);
+		}
+	}
+
+	// A listed item is parentless by design.  Snapshot the auction owner bag
+	// and the listed object together so the item reconcile cannot mistake a
+	// live market listing for a missing held object.
+	AuctionManager* auctionManager = zoneServer == nullptr ? nullptr :
+		zoneServer->getAuctionManager();
+	bool bazaarMarketReady = auctionManager != nullptr &&
+		auctionManager->getAuctionMap() != nullptr &&
+		auctionManager->isMarketEnabled();
+	// Until the market has loaded, a listed item is indistinguishable from a
+	// missing one. Stay pending (the loot and bazaar gates stay closed) rather
+	// than orphan every live listing.
+	if (!bazaarMarketReady)
+		return;
+	// Every bag that owns an AuctionItem (live listing or held sale), mapped or
+	// not. Such a bag is the listing's only proof of bot ownership, so it is
+	// never discarded as empty here; listing reconciliation retrieves first.
+	VectorMap<uint64, bool> listingOwnerBags;
+	{
+		TerminalListVector listed = auctionManager->getAuctionMap()->
+			getBazaarTerminalData("", "", nullptr);
+		for (int i = 0; i < listed.size(); ++i) {
+			Reference<TerminalItemList*> terminalItems = listed.get(i);
+			if (terminalItems == nullptr)
+				continue;
+			ReadLocker terminalLock(terminalItems);
+			for (int j = 0; j < terminalItems->size(); ++j) {
+				AuctionItem* auctionItem = terminalItems->get(j);
+				if (auctionItem == nullptr ||
+						!auctionManager->isSimBotListing(auctionItem))
+					continue;
+				listingOwnerBags.put(auctionItem->getOwnerID(), true);
+				uint64 identityId = playerBotIdentityForBag(bagMap,
+					auctionItem->getOwnerID());
+				if (identityId == 0)
+					continue;
+				ManagedReference<SceneObject*> listedObject = zoneServer->getObject(
+					auctionItem->getAuctionedItemObjectID());
+				if (listedObject == nullptr)
+					continue;
+				PlayerBotObservedVaultItem observedItem;
+				observedItem.objectId = listedObject->getObjectID();
+				observedItem.identityId = identityId;
+				observedItem.location = SimBotItemReconcile::LOCATION_LISTED;
+				observedItem.object = listedObject;
+				observedItem.auctionOid = auctionItem->getObjectID();
+				// AuctionItem stores the buyer-facing gross price after city tax;
+				// the progression anchor is the bot's pre-tax ask.
+				observedItem.askPrice = playerBotBazaarAskPrice(zoneServer,
+					auctionItem);
+				observed.add(observedItem);
+			}
 		}
 	}
 
@@ -13456,7 +15366,7 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 	// inspection and their contents are recorded as orphaned below.
 	for (int i = 0; i < unmappedBags.size(); ++i) {
 		ManagedReference<SceneObject*> bag = unmappedBags.get(i);
-		if (bag == nullptr)
+		if (bag == nullptr || listingOwnerBags.contains(bag->getObjectID()))
 			continue;
 		Locker bagLock(bag);
 		if (bag->getContainerObjectsSize() != 0)
@@ -13478,6 +15388,8 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 		Locker progressionLock(&progressionMutex);
 		for (int i = 0; i < progressionItems.size(); ++i) {
 			SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+			if (row.state == SIMBOT_ITEM_LISTED && !bazaarMarketReady)
+				continue;
 			rowsSeen.put(row.objectId, true);
 			uint64 previousIdentityId = row.identityId;
 			SimBotItemReconcile::ObjectLocation location =
@@ -13495,6 +15407,7 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 				SimBotItemReconcile::ROW_ORPHANED;
 			switch (row.state) {
 			case SIMBOT_ITEM_HELD: rowState = SimBotItemReconcile::ROW_HELD; break;
+			case SIMBOT_ITEM_LISTED: rowState = SimBotItemReconcile::ROW_LISTED; break;
 			case SIMBOT_ITEM_PENDING: rowState = SimBotItemReconcile::ROW_PENDING; break;
 			case SIMBOT_ITEM_CONSUMED: rowState = SimBotItemReconcile::ROW_CONSUMED; break;
 			case SIMBOT_ITEM_LOST: rowState = SimBotItemReconcile::ROW_LOST; break;
@@ -13507,6 +15420,26 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 					row.identityId != 0 && progressionRecords.contains(row.identityId));
 			if (decision.state == SimBotItemReconcile::DECISION_UNCHANGED)
 				continue;
+
+			if (decision.state == SimBotItemReconcile::DECISION_HELD) {
+				row.state = location == SimBotItemReconcile::LOCATION_LISTED ?
+					SIMBOT_ITEM_LISTED : SIMBOT_ITEM_HELD;
+				row.identityId = locationIdentityId;
+				if (location == SimBotItemReconcile::LOCATION_LISTED) {
+					for (int j = 0; j < observed.size(); ++j) {
+						if (observed.get(j).objectId == row.objectId) {
+							if (row.askPrice == 0)
+								row.askPrice = observed.get(j).askPrice;
+							row.refId = observed.get(j).auctionOid;
+							break;
+						}
+					}
+				}
+				row.version++;
+				row.dirty = true;
+				progressionItemDirtyIds.put(row.objectId, true);
+				continue;
+			}
 
 			if (decision.state == SimBotItemReconcile::DECISION_LOST) {
 				row.state = SIMBOT_ITEM_LOST;
@@ -13539,6 +15472,11 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 			const PlayerBotObservedVaultItem& observedItem = observed.get(i);
 			if (rowsSeen.contains(observedItem.objectId))
 				continue;
+			// A rowless LISTED object is adopted by reconcilePlayerBotBazaarListings,
+			// which checks the auction's item receipt before writing any +1. Doing
+			// it here too would duplicate acquisition history after a settled sale.
+			if (observedItem.location == SimBotItemReconcile::LOCATION_LISTED)
+				continue;
 
 			SimBotItemReconcile::Decision decision =
 				SimBotItemReconcile::decideUntrackedObject(
@@ -13549,7 +15487,10 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 			row.objectId = observedItem.objectId;
 			row.identityId = decision.identityId;
 			row.state = decision.state == SimBotItemReconcile::DECISION_HELD ?
-				SIMBOT_ITEM_HELD : SIMBOT_ITEM_ORPHANED;
+				SIMBOT_ITEM_HELD : (decision.state ==
+				SimBotItemReconcile::DECISION_LISTED ? SIMBOT_ITEM_LISTED :
+				SIMBOT_ITEM_ORPHANED);
+			row.askPrice = observedItem.askPrice;
 			row.templateCrc = observedItem.templateCrc;
 			row.displayName = observedItem.displayName;
 			row.source = "reconcile";
@@ -13560,7 +15501,9 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 			row.dirty = true;
 			progressionItems.put(row.objectId, row);
 			progressionItemDirtyIds.put(row.objectId, true);
-			if (row.state == SIMBOT_ITEM_HELD) {
+			if (row.state == SIMBOT_ITEM_HELD || row.state == SIMBOT_ITEM_LISTED) {
+				if (row.state == SIMBOT_ITEM_LISTED)
+					row.refId = observedItem.auctionOid;
 				uint64 held = progressionItemHeldCounts.contains(row.identityId) ?
 					progressionItemHeldCounts.get(row.identityId) : 0;
 				progressionItemHeldCounts.put(row.identityId, held + 1);
@@ -13607,6 +15550,89 @@ bool SimPlayerManager::destroyPlayerBotItemsAndBag(uint64 identityId) {
 		economyManager->getItemVault();
 	if (bag == nullptr || vault == nullptr || zoneServer == nullptr) {
 		vaultReapDestroyFailed.increment();
+		return false;
+	}
+
+	// Listed objects are deliberately parentless, so the ordinary bag-child
+	// sweep cannot recover them.  Withdraw live listings before the bag is
+	// destroyed; sold holds are released to their buyer and remain outside the
+	// identity's ownership domain.
+	AuctionManager* auctionManager = zoneServer->getAuctionManager();
+	bool listingBlocked = false;
+	if (auctionManager != nullptr && auctionManager->getAuctionMap() != nullptr) {
+		TerminalListVector listed = auctionManager->getAuctionMap()->
+			getBazaarTerminalData("", "", nullptr);
+		for (int i = 0; i < listed.size(); ++i) {
+			Reference<TerminalItemList*> terminalItems = listed.get(i);
+			if (terminalItems == nullptr)
+				continue;
+			ReadLocker terminalLock(terminalItems);
+			Vector<ManagedReference<AuctionItem*> > toRetrieve;
+			for (int j = 0; j < terminalItems->size(); ++j) {
+				AuctionItem* item = terminalItems->get(j);
+				if (item != nullptr && auctionManager->isSimBotListing(item) &&
+						item->getOwnerID() == bag->getObjectID())
+					toRetrieve.add(item);
+			}
+			terminalLock.release();
+			for (int j = 0; j < toRetrieve.size(); ++j) {
+				AuctionItem* item = toRetrieve.get(j);
+				if (item == nullptr)
+					continue;
+				if (item->getStatus() == AuctionItem::FORSALE ||
+						item->getStatus() == AuctionItem::EXPIRED) {
+					if (auctionManager->retrieveSimBotItem(item, bag) != 0)
+						listingBlocked = true;
+					else
+						bazaarRetrieved.increment();
+				} else if (item->getStatus() == AuctionItem::SOLD) {
+					PlayerBotBazaarListing listing;
+					bool hasListing = false;
+					bool sellerResolvable = false;
+					bool receiptsFlushed = true;
+					{
+						Locker progressionLock(&progressionMutex);
+						if (progressionBazaarListingByAuction.contains(
+								item->getObjectID())) {
+							uint64 objectId = progressionBazaarListingByAuction.get(
+								item->getObjectID());
+							if (progressionBazaarListings.contains(objectId)) {
+								listing = progressionBazaarListings.get(objectId);
+								hasListing = true;
+							}
+						}
+						sellerResolvable = hasListing && listing.identityId != 0 &&
+							progressionRecords.contains(listing.identityId);
+						if (sellerResolvable &&
+								!isPlayerBotLedgerAppliedLocked(listing.identityId))
+							receiptsFlushed = false;
+						for (int pendingIndex = 0;
+								pendingIndex < progressionLedgerPending.size(); ++pendingIndex) {
+							const SimBotLedgerEntry& pending =
+								progressionLedgerPending.get(pendingIndex);
+							if (pending.refId == item->getObjectID() &&
+									(pending.source == "bazaar_sale" ||
+									pending.source == "bazaar_sale_reversal")) {
+								receiptsFlushed = false;
+								break;
+							}
+						}
+					}
+					bool buyerPresent = zoneServer->getObject(item->getBuyerID()) != nullptr;
+					bool canRelease = SimBotBazaar::mayReleaseHeldSale(
+						receiptsFlushed && hasListing &&
+							SimBotBazaar::hasCreditReceipt(listing.creditReceiptSum),
+						receiptsFlushed && hasListing &&
+							SimBotBazaar::hasItemReceipt(listing.itemReceiptSum),
+						sellerResolvable, buyerPresent);
+					if (!canRelease || auctionManager->releaseSimBotSale(item) != 0)
+						listingBlocked = true;
+				}
+			}
+		}
+	}
+	if (listingBlocked) {
+		bazaarDeleteBlockedByListing.increment();
 		return false;
 	}
 
@@ -13709,6 +15735,9 @@ void SimPlayerManager::runPlayerBotProgressionReaper(uint64 nowMs, bool force) {
 				"DELETE FROM `simbot_items` WHERE `identity_id`=" +
 				String::valueOf(identityId) + ";");
 			deleteResult = ServerDatabase::instance()->executeQuery(
+				"DELETE FROM `simbot_listings` WHERE `identity_id`=" +
+				String::valueOf(identityId) + ";");
+			deleteResult = ServerDatabase::instance()->executeQuery(
 				"DELETE FROM `simbot_progression` WHERE `identity_id`=" +
 				String::valueOf(identityId) + ";");
 
@@ -13736,7 +15765,8 @@ void SimPlayerManager::runPlayerBotProgressionReaper(uint64 nowMs, bool force) {
 
 void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 		int faultDelayMs, bool faultFailNext, bool faultFailLedgerInsert) {
-	if (!progressionEnabled || !progressionLoaded)
+	if ((!progressionEnabled && !progressionBazaarSettlementMode) ||
+			!progressionLoaded)
 		return;
 
 	uint64 nowMs = System::getMiliTime();
@@ -13771,6 +15801,8 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 
 	VectorMap<uint64, SimBotProgression> batch;
 	Vector<SimBotItemRow> itemBatch;
+	Vector<uint64> itemDeleteBatch;
+	Vector<PlayerBotBazaarListing> listingBatch;
 	Vector<SimBotLedgerEntry> ledgerBatch;
 	bool failNextFlush = false;
 	{
@@ -13796,6 +15828,27 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 			progressionItems.get(objectId).dirty = false;
 		}
 		progressionItemDirtyIds.removeAll();
+		for (int i = 0; i < progressionItemDeleteIds.size(); ++i)
+			itemDeleteBatch.add(progressionItemDeleteIds.elementAt(i).getKey());
+		progressionItemDeleteIds.removeAll();
+		for (int i = 0; i < progressionBazaarListings.size(); ++i) {
+			PlayerBotBazaarListing listing =
+				progressionBazaarListings.elementAt(i).getValue();
+			if (listing.dirty && listing.state != SimBotBazaar::PENDING) {
+				listing.dirty = false;
+				listingBatch.add(listing);
+				progressionBazaarListings.elementAt(i).getValue().dirty = false;
+			}
+		}
+		for (int i = 0; i < progressionBazaarClosedListings.size(); ++i) {
+			PlayerBotBazaarListing listing =
+				progressionBazaarClosedListings.elementAt(i).getValue();
+			if (listing.dirty) {
+				listing.dirty = false;
+				listingBatch.add(listing);
+				progressionBazaarClosedListings.elementAt(i).getValue().dirty = false;
+			}
+		}
 		ledgerBatch = progressionLedgerPending;
 		progressionLedgerPending.removeAll();
 	}
@@ -13806,10 +15859,18 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 	// MyISAM has no transaction spanning the journal and the balance. Insert
 	// every journal row first. If one insert fails, only rows not yet inserted
 	// are requeued; rows already in MySQL must never be duplicated on retry.
+	int insertedRows = 0;
 	for (int i = 0; i < ledgerBatch.size(); ++i) {
 		const SimBotLedgerEntry& entry = ledgerBatch.get(i);
 		try {
-			if (i == 0 && faultFailLedgerInsert)
+			// Preserve the established single-row fault behavior for the older
+			// parity case.  Bazaar exercises deliberately batch several receipt
+			// rows, so inject that fault after the first insert; its retained
+			// high-water mark then proves the already-written row is not replayed.
+			bool failThisLedgerInsert = faultFailLedgerInsert &&
+				((ledgerBatch.size() > 1 && i == 1) ||
+				(ledgerBatch.size() == 1 && i == 0));
+			if (failThisLedgerInsert)
 				throw Exception("player bot parity injected ledger insert failure");
 			String ledgerInsert = "INSERT INTO `simbot_ledger` "
 				"(`identity_id`,`kind`,`delta`,`balance_after`,`source`,`ref_id`,"
@@ -13824,10 +15885,26 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 			UniqueReference<ResultSet*> ledgerResult(
 				ServerDatabase::instance()->executeQuery(ledgerInsert));
 			(void)ledgerResult;
+			// Nothing after the INSERT may cause this row to be re-queued. The
+			// row's id is not read back here: the identity is only marked as
+			// having inserted credit rows that no balance UPDATE covers yet
+			// (UNAPPLIED_HIGH_WATER), and the balance UPDATE below resolves the
+			// real high-water in the same statement that writes the balance.
+			insertedRows = i + 1;
+			if (entry.kind == "credits_bank" || entry.kind == "credits_cash") {
+				Locker progressionLock(&progressionMutex);
+				if (entry.kind == "credits_bank")
+					progressionInsertedBankHighWater.put(entry.identityId,
+						UNAPPLIED_HIGH_WATER);
+				else
+					progressionInsertedCashHighWater.put(entry.identityId,
+						UNAPPLIED_HIGH_WATER);
+			}
 			progressionLedgerWritten.increment();
 		} catch (const Exception& e) {
 			Locker progressionLock(&progressionMutex);
-			for (int pending = ledgerBatch.size() - 1; pending >= i; --pending)
+			// Only rows whose INSERT never completed go back to the queue.
+			for (int pending = ledgerBatch.size() - 1; pending >= insertedRows; --pending)
 				progressionLedgerPending.add(0, ledgerBatch.get(pending));
 			for (int pending = 0; pending < batch.size(); ++pending)
 				markProgressionDirtyLocked(batch.elementAt(pending).getKey());
@@ -13837,6 +15914,8 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 						progressionItems.get(row.objectId).version == row.version)
 					markPlayerBotItemDirtyLocked(row.objectId);
 			}
+			for (int pending = 0; pending < itemDeleteBatch.size(); ++pending)
+				progressionItemDeleteIds.put(itemDeleteBatch.get(pending), true);
 			progressionDbAvailable = false;
 			progressionNextDbProbeMs = nowMs + progressionDbProbeBackoffMs;
 			progressionDbProbeBackoffMs = Math::min<uint64>(
@@ -13853,16 +15932,18 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 			String identitySql = row.identityId == 0 ? String("NULL") :
 				String::valueOf(row.identityId);
 			String itemUpsert = "INSERT INTO `simbot_items` "
-				"(`object_id`,`identity_id`,`state`,`template_crc`,"
+				"(`object_id`,`identity_id`,`state`,`ask_price`,`template_crc`,"
 				"`display_name`,`source`,`ref_id`,`acquired_at`,`updated_at`) VALUES (" +
 				String::valueOf(row.objectId) + "," + identitySql + ",'" +
 				playerBotItemStateName(row.state) + "'," +
+				String::valueOf(row.askPrice) + "," +
 				String::valueOf(row.templateCrc) + "," +
 				progressionSqlString(row.displayName) + "," +
 				progressionSqlString(row.source) + "," +
 				String::valueOf(row.refId) + ",NOW(),NOW()) "
 				"ON DUPLICATE KEY UPDATE `identity_id`=VALUES(`identity_id`),"
-				"`state`=VALUES(`state`),`template_crc`=VALUES(`template_crc`),"
+				"`state`=VALUES(`state`),`ask_price`=VALUES(`ask_price`),"
+				"`template_crc`=VALUES(`template_crc`),"
 				"`display_name`=VALUES(`display_name`),`source`=VALUES(`source`),"
 				"`ref_id`=VALUES(`ref_id`),`updated_at`=NOW();";
 			UniqueReference<ResultSet*> itemResult(
@@ -13879,6 +15960,8 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 			}
 			for (int pending = 0; pending < batch.size(); ++pending)
 				markProgressionDirtyLocked(batch.elementAt(pending).getKey());
+			for (int pending = 0; pending < itemDeleteBatch.size(); ++pending)
+				progressionItemDeleteIds.put(itemDeleteBatch.get(pending), true);
 			progressionDbAvailable = false;
 			progressionNextDbProbeMs = nowMs + progressionDbProbeBackoffMs;
 			progressionDbProbeBackoffMs = Math::min<uint64>(
@@ -13889,13 +15972,107 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 		}
 	}
 
+	for (int i = 0; i < itemDeleteBatch.size(); ++i) {
+		try {
+			UniqueReference<ResultSet*> deleteResult(
+				ServerDatabase::instance()->executeQuery(
+					"DELETE FROM `simbot_items` WHERE `object_id`=" +
+					String::valueOf(itemDeleteBatch.get(i)) + ";"));
+			(void)deleteResult;
+		} catch (const Exception& e) {
+			Locker progressionLock(&progressionMutex);
+			for (int pending = i; pending < itemDeleteBatch.size(); ++pending)
+				progressionItemDeleteIds.put(itemDeleteBatch.get(pending), true);
+			for (int pending = 0; pending < batch.size(); ++pending)
+				markProgressionDirtyLocked(batch.elementAt(pending).getKey());
+			progressionDbAvailable = false;
+			progressionNextDbProbeMs = nowMs + progressionDbProbeBackoffMs;
+			progressionDbProbeBackoffMs = Math::min<uint64>(
+				progressionDbProbeBackoffMs * 2, 300000);
+			progressionFlushFailures.increment();
+			error("SimBotItemDeleteFlushFailed: " + e.getMessage());
+			return;
+		}
+	}
+
+	for (int i = 0; i < listingBatch.size(); ++i) {
+		const PlayerBotBazaarListing& listing = listingBatch.get(i);
+		try {
+			String identitySql = listing.identityId == 0 ? String("NULL") :
+				String::valueOf(listing.identityId);
+			String closedSql = listing.closedAtMs == 0 ? String("NULL") : "NOW()";
+			String releasedSql = listing.releasedAtMs == 0 ? String("NULL") : "NOW()";
+			String listingUpsert = "INSERT INTO `simbot_listings` "
+				"(`auction_oid`,`identity_id`,`object_id`,`state`,`price`,`fee`,`tax`,"
+				"`net_paid`,`vendor_oid`,`planet`,`buyer_name`,`listed_at`,`closed_at`,"
+				"`released_at`,`updated_at`) VALUES (" +
+				String::valueOf(listing.auctionOid) + "," + identitySql + "," +
+				String::valueOf(listing.objectId) + "," +
+				progressionSqlString(playerBotBazaarListingStateName(listing.state)) + "," +
+				String::valueOf(listing.price) + "," + String::valueOf(listing.fee) + "," +
+				String::valueOf(listing.tax) + "," + String::valueOf(listing.netPaid) + "," +
+				String::valueOf(listing.vendorOid) + "," + progressionSqlString(listing.planet) + "," +
+				progressionSqlString(listing.buyerName) + ",NOW()," + closedSql + "," +
+				releasedSql + ",NOW()) ON DUPLICATE KEY UPDATE "
+				"`identity_id`=VALUES(`identity_id`),`state`=VALUES(`state`),"
+				"`price`=VALUES(`price`),`fee`=VALUES(`fee`),`tax`=VALUES(`tax`),"
+				"`net_paid`=VALUES(`net_paid`),`buyer_name`=VALUES(`buyer_name`),"
+				"`closed_at`=VALUES(`closed_at`),`released_at`=VALUES(`released_at`),"
+				"`updated_at`=NOW();";
+			UniqueReference<ResultSet*> listingResult(
+				ServerDatabase::instance()->executeQuery(listingUpsert));
+			(void)listingResult;
+		} catch (const Exception& e) {
+			Locker progressionLock(&progressionMutex);
+			// This row and every row after it in the batch were never written.
+			for (int pending = i; pending < listingBatch.size(); ++pending) {
+				const PlayerBotBazaarListing& unwritten = listingBatch.get(pending);
+				if (progressionBazaarListings.contains(unwritten.objectId) &&
+						progressionBazaarListings.get(unwritten.objectId).auctionOid ==
+						unwritten.auctionOid)
+					progressionBazaarListings.get(unwritten.objectId).dirty = true;
+				if (progressionBazaarClosedListings.contains(unwritten.auctionOid))
+					progressionBazaarClosedListings.get(unwritten.auctionOid).dirty = true;
+			}
+			// The balance UPDATEs below never ran for this batch: keep every
+			// swapped record dirty so its balance and applied mark are retried.
+			for (int pending = 0; pending < batch.size(); ++pending)
+				markProgressionDirtyLocked(batch.elementAt(pending).getKey());
+			progressionDbAvailable = false;
+			progressionNextDbProbeMs = nowMs + progressionDbProbeBackoffMs;
+			progressionFlushFailures.increment();
+			error("SimPlayerBazaarListingFlushFailed: " + e.getMessage());
+			return;
+		}
+	}
+
 	for (int i = 0; i < batch.size(); ++i) {
 		const SimBotProgression& progression = batch.elementAt(i).getValue();
 		uint64 identityId = progression.identityId;
 		try {
+			uint64 bankMark = progression.bankLedgerAppliedId;
+			uint64 cashMark = progression.cashLedgerAppliedId;
+			bool resolveBank = false;
+			bool resolveCash = false;
+			{
+				Locker progressionLock(&progressionMutex);
+				resolveBank = progressionInsertedBankHighWater.contains(identityId);
+				resolveCash = progressionInsertedCashHighWater.contains(identityId);
+			}
+			// Every credit row inserted for this identity so far carries a delta
+			// already contained in this balance snapshot (rows are queued only
+			// after the in-memory balance changes, and the snapshot was taken
+			// with them), so the mark is the current MAX(id). A failure here
+			// throws before the UPDATE and the record stays dirty.
+			if (resolveBank)
+				bankMark = playerBotLedgerMaxId(identityId, "credits_bank");
+			if (resolveCash)
+				cashMark = playerBotLedgerMaxId(identityId, "credits_cash");
 			String scalarUpdate = "UPDATE `simbot_progression` SET "
 				"`bank_credits`=" + String::valueOf(progression.bankCredits) +
 				",`cash_credits`=" + String::valueOf(progression.cashCredits) +
+				",`bank_ledger_applied_id`=" + String::valueOf(bankMark) +
+				",`cash_ledger_applied_id`=" + String::valueOf(cashMark) +
 				",`skill_points_spent`=" +
 				String::valueOf(progression.skillPointsSpent) +
 				",`awards_total`=" + String::valueOf(progression.awardsTotal) +
@@ -13906,6 +16083,21 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 			UniqueReference<ResultSet*> scalarResult(
 				ServerDatabase::instance()->executeQuery(scalarUpdate));
 			(void)scalarResult;
+			{
+				Locker progressionLock(&progressionMutex);
+				if (progressionRecords.contains(identityId)) {
+					progressionRecords.get(identityId).bankLedgerAppliedId = bankMark;
+					progressionRecords.get(identityId).cashLedgerAppliedId = cashMark;
+				}
+				// Rows inserted after the snapshot was taken re-set the sentinel
+				// in a later flush; only clear what this UPDATE covered.
+				if (resolveBank && progressionInsertedBankHighWater.contains(identityId) &&
+						!hasPendingLedgerKindLocked(identityId, "credits_bank"))
+					progressionInsertedBankHighWater.put(identityId, bankMark);
+				if (resolveCash && progressionInsertedCashHighWater.contains(identityId) &&
+						!hasPendingLedgerKindLocked(identityId, "credits_cash"))
+					progressionInsertedCashHighWater.put(identityId, cashMark);
+			}
 			if (i == 0 && faultDelayMs > 0)
 				Thread::sleep(static_cast<uint64>(faultDelayMs));
 			if (i == 0 && failNextFlush)
@@ -13952,10 +16144,87 @@ void SimPlayerManager::flushPlayerBotProgressionStore(bool force,
 		}
 	}
 
+	Vector<uint64> releaseAuctions;
+	{
+		Locker progressionLock(&progressionMutex);
+		for (int i = 0; i < progressionBazaarListings.size(); ++i) {
+			const PlayerBotBazaarListing& listing =
+				progressionBazaarListings.elementAt(i).getValue();
+			if (listing.state == SimBotBazaar::SOLD &&
+					listing.releasedAtMs == 0 && listing.auctionOid != 0 &&
+					SimBotBazaar::hasCreditReceipt(listing.creditReceiptSum) &&
+					SimBotBazaar::hasItemReceipt(listing.itemReceiptSum) &&
+					isPlayerBotLedgerAppliedLocked(listing.identityId))
+				releaseAuctions.add(listing.auctionOid);
+		}
+	}
+	ZoneServer* releaseZoneServer = ServerCore::getZoneServer();
+	AuctionManager* releaseAuctionManager = releaseZoneServer == nullptr ? nullptr :
+		releaseZoneServer->getAuctionManager();
+	for (int i = 0; i < releaseAuctions.size(); ++i) {
+		if (releaseAuctionManager == nullptr ||
+				releaseAuctionManager->getAuctionMap() == nullptr)
+			break;
+		ManagedReference<AuctionItem*> auctionItem = nullptr;
+		TerminalListVector listed = releaseAuctionManager->getAuctionMap()->
+			getBazaarTerminalData("", "", nullptr);
+		for (int terminalIndex = 0; terminalIndex < listed.size() &&
+				auctionItem == nullptr; ++terminalIndex) {
+			Reference<TerminalItemList*> terminalItems = listed.get(terminalIndex);
+			if (terminalItems == nullptr)
+				continue;
+			ReadLocker terminalLock(terminalItems);
+			for (int itemIndex = 0; itemIndex < terminalItems->size(); ++itemIndex) {
+				AuctionItem* candidate = terminalItems->get(itemIndex);
+				if (candidate != nullptr && candidate->getObjectID() ==
+						releaseAuctions.get(i)) {
+					auctionItem = candidate;
+					break;
+				}
+			}
+		}
+		if (auctionItem == nullptr)
+			continue;
+		bool sellerResolvable = false;
+		{
+			Locker progressionLock(&progressionMutex);
+			if (progressionBazaarListingByAuction.contains(
+					releaseAuctions.get(i))) {
+				uint64 objectId = progressionBazaarListingByAuction.get(
+					releaseAuctions.get(i));
+				if (progressionBazaarListings.contains(objectId)) {
+					const PlayerBotBazaarListing& listing =
+						progressionBazaarListings.get(objectId);
+					sellerResolvable = listing.identityId != 0 &&
+						progressionRecords.contains(listing.identityId);
+				}
+			}
+		}
+		bool buyerPresent = releaseZoneServer != nullptr &&
+			releaseZoneServer->getObject(auctionItem->getBuyerID()) != nullptr;
+		if (releaseAuctionManager->releaseSimBotSale(auctionItem) == 0) {
+			if (!buyerPresent)
+				bazaarReleaseBuyerGone.increment();
+			Locker progressionLock(&progressionMutex);
+			if (!sellerResolvable)
+				countPlayerBotBazaarSaleUnresolvedLocked(releaseAuctions.get(i));
+			if (progressionBazaarListingByAuction.contains(releaseAuctions.get(i))) {
+				uint64 objectId = progressionBazaarListingByAuction.get(
+					releaseAuctions.get(i));
+				if (progressionBazaarListings.contains(objectId)) {
+					progressionBazaarListings.get(objectId).releasedAtMs = nowMs;
+					progressionBazaarListings.get(objectId).dirty = true;
+				}
+			}
+		}
+	}
+
 	progressionLastFlushMs = nowMs;
 	prunePlayerBotLedger(nowMs);
-	reconcilePlayerBotProgression();
-	runPlayerBotProgressionReaper(nowMs);
+	if (progressionEnabled) {
+		reconcilePlayerBotProgression();
+		runPlayerBotProgressionReaper(nowMs);
+	}
 }
 
 uint64 SimPlayerManager::enqueuePlayerBotProgressionRequest(
@@ -14083,8 +16352,12 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 				}
 				progressionLoaded = false;
 				progressionItemReconcilePending = true;
+				progressionListingReconcilePending = true;
 				progressionDbAvailable = pveDatabaseAvailable;
 				progressionNextDbProbeMs = 0;
+				if (!progressionEnabled)
+					progressionBazaarSettlementMode =
+						probePlayerBotBazaarObligations();
 				loadPlayerBotProgressionStore();
 				if (!progressionLoaded)
 					throw Exception("progression store reload failed");
@@ -14228,8 +16501,13 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 					ServerDatabase::instance()->executeQuery(
 						"DELETE FROM `simbot_items` WHERE `identity_id`=" +
 						String::valueOf(request.identityId) + ";"));
+				UniqueReference<ResultSet*> deletedListings(
+					ServerDatabase::instance()->executeQuery(
+						"DELETE FROM `simbot_listings` WHERE `identity_id`=" +
+						String::valueOf(request.identityId) + ";"));
 				(void)deletedLedger;
 				(void)deletedItems;
+				(void)deletedListings;
 				UniqueReference<ResultSet*> deleted(
 					ServerDatabase::instance()->executeQuery(
 						"DELETE FROM `simbot_identities` WHERE `id`=" +
@@ -14722,6 +17000,184 @@ bool SimPlayerManager::awaitPlayerBotParityKillTarget(
 // The creature provokeLootKill set on a production hunter: idempotent, run on
 // every harness cleanup and disable path so a failed or timed-out scenario never
 // leaves a hostile in the live world. A corpse is removed the same way.
+// True when every ledger row written for this identity is durable AND covered
+// by its balance UPDATE: nothing pending insertion, no unflushed balance, and the
+// stored applied mark has caught up with the highest inserted row. Held bazaar
+// sales are released only on this, never on in-memory receipt sums alone.
+const uint64 SimPlayerManager::UNAPPLIED_HIGH_WATER;
+
+bool SimPlayerManager::hasPendingLedgerKindLocked(uint64 identityId,
+		const String& kind) const {
+	for (int i = 0; i < progressionLedgerPending.size(); ++i) {
+		const SimBotLedgerEntry& entry = progressionLedgerPending.get(i);
+		if (entry.identityId == identityId && entry.kind == kind)
+			return true;
+	}
+	return false;
+}
+
+uint64 SimPlayerManager::playerBotLedgerMaxId(uint64 identityId,
+		const String& kind) {
+	UniqueReference<ResultSet*> result(
+		ServerDatabase::instance()->executeQuery(
+			"SELECT COALESCE(MAX(`id`),0) FROM `simbot_ledger` WHERE "
+			"`identity_id`=" + String::valueOf(identityId) + " AND `kind`='" +
+			kind.escapeString() + "';"));
+	if (result == nullptr || !result->next())
+		throw Exception("simbot_ledger high-water query returned no result");
+	return result->getUnsignedLong(0);
+}
+
+// City sales tax contained in a gross bazaar price, as doInstantBuy computes it
+// (AuctionManagerImplementation::doInstantBuy, tax = price - price/(1+rate)).
+static int playerBotBazaarCityTax(ZoneServer* zoneServer, uint64 vendorOid,
+		int grossPrice) {
+	ManagedReference<SceneObject*> vendor = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(vendorOid);
+	ManagedReference<CityRegion*> city = vendor == nullptr ? nullptr :
+		vendor->getCityRegion().get();
+	if (city == nullptr)
+		return 0;
+	return grossPrice - static_cast<int>(grossPrice /
+		(1.0f + (city->getSalesTax() / 100.f)));
+}
+
+// Instant pickup moves a sold AuctionItem to its buyer, so a sale whose POD
+// was lost (crash, backlog overflow) is no longer visible as a bag-owned
+// listing. Recover it from the buyer-owned SOLD record, or, once the buyer has
+// retrieved it, from the item sitting under a player creature.
+bool SimPlayerManager::findBuyerOwnedBotSaleLocked(
+		const PlayerBotBazaarListing& row, AuctionManager* auctionManager,
+		ZoneServer* zoneServer, PlayerBotBazaarSale& sale) {
+	if (row.objectId == 0 || row.auctionOid == 0 || auctionManager == nullptr ||
+			auctionManager->getAuctionMap() == nullptr || zoneServer == nullptr)
+		return false;
+	sale = PlayerBotBazaarSale();
+	sale.auctionOid = row.auctionOid;
+	sale.objectId = row.objectId;
+	sale.bagOid = row.bagOid;
+	sale.released = true;
+	ManagedReference<AuctionItem*> auction =
+		auctionManager->getAuctionMap()->getItem(row.objectId);
+	if (auction != nullptr) {
+		if (auction->getObjectID() != row.auctionOid ||
+				auction->getStatus() != AuctionItem::SOLD ||
+				auctionManager->isSimBotListing(auction))
+			return false;
+		sale.buyerId = auction->getBuyerID();
+		sale.buyerName = auction->getBidderName();
+		sale.grossPrice = auction->getPrice();
+		sale.tax = playerBotBazaarCityTax(zoneServer, row.vendorOid,
+			sale.grossPrice);
+		return sale.grossPrice > 0;
+	}
+	ManagedReference<SceneObject*> object = zoneServer->getObject(row.objectId);
+	ManagedReference<SceneObject*> root = object == nullptr ? nullptr :
+		object->getRootParent();
+	if (root == nullptr || !root->isPlayerCreature())
+		return false;
+	if (row.state == SimBotBazaar::SOLD && row.netPaid > 0) {
+		// A settled row already carries the buyer-facing gross split into net
+		// and tax; taxing row.price again would over-credit the bot.
+		sale.grossPrice = row.netPaid + row.tax;
+		sale.tax = row.tax;
+	} else {
+		// A LISTED row keeps the bot's pre-tax ask; rebuild the gross paid.
+		ManagedReference<SceneObject*> vendor = zoneServer->getObject(row.vendorOid);
+		ManagedReference<CityRegion*> city = vendor == nullptr ? nullptr :
+			vendor->getCityRegion().get();
+		float rate = city == nullptr ? 0.f : city->getSalesTax() / 100.f;
+		sale.grossPrice = static_cast<int>(row.price * (1.0f + rate));
+		sale.tax = sale.grossPrice - row.price;
+	}
+	sale.buyerId = root->getObjectID();
+	CreatureObject* buyer = root->asCreatureObject();
+	sale.buyerName = buyer == nullptr ? String() : buyer->getFirstName();
+	bazaarReconcileSettledByEvidence.increment();
+	return sale.grossPrice > 0;
+}
+
+void SimPlayerManager::countPlayerBotBazaarSaleUnresolvedLocked(
+		uint64 auctionOid) {
+	if (progressionBazaarUnresolvedAuctions.contains(auctionOid))
+		return;
+	progressionBazaarUnresolvedAuctions.put(auctionOid, true);
+	bazaarSaleUnresolved.increment();
+}
+
+bool SimPlayerManager::isPlayerBotLedgerAppliedLocked(uint64 identityId) const {
+	if (identityId == 0 || !progressionRecords.contains(identityId) ||
+			progressionDirtyIds.contains(identityId))
+		return false;
+	for (int i = 0; i < progressionLedgerPending.size(); ++i) {
+		if (progressionLedgerPending.get(i).identityId == identityId)
+			return false;
+	}
+	const SimBotProgression& progression = progressionRecords.get(identityId);
+	if (progressionInsertedBankHighWater.contains(identityId) &&
+			progression.bankLedgerAppliedId <
+			progressionInsertedBankHighWater.get(identityId))
+		return false;
+	if (progressionInsertedCashHighWater.contains(identityId) &&
+			progression.cashLedgerAppliedId <
+			progressionInsertedCashHighWater.get(identityId))
+		return false;
+	return true;
+}
+
+void SimPlayerManager::trackPlayerBotParityBazaarHelperCreature(
+		CreatureObject* creature) {
+	if (creature == nullptr)
+		return;
+	Locker parityLock(&playerBotParityTestMutex);
+	playerBotParityBazaarHelperCreatureOids.add(creature->getObjectID());
+}
+
+void SimPlayerManager::despawnPlayerBotParityBazaarHelpers() {
+	Vector<uint64> creatureOids;
+	Vector<uint64> listingItemOids;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		creatureOids = playerBotParityBazaarHelperCreatureOids;
+		listingItemOids = playerBotParityBazaarHumanListingItemOids;
+		playerBotParityBazaarHelperCreatureOids.removeAll();
+		playerBotParityBazaarHumanListingItemOids.removeAll();
+	}
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (zoneServer == nullptr)
+		return;
+
+	// A seeded "human" listing must not outlive its scenario: it is visible to
+	// real players. Delete it with its object, as stock expiry does.
+	AuctionManager* auctionManager = zoneServer->getAuctionManager();
+	AuctionsMap* auctionMap = auctionManager == nullptr ? nullptr :
+		auctionManager->getAuctionMap();
+	for (int i = 0; auctionMap != nullptr && i < listingItemOids.size(); ++i) {
+		ManagedReference<AuctionItem*> listing =
+			auctionMap->getItem(listingItemOids.get(i));
+		if (listing == nullptr)
+			continue;
+		ManagedReference<SceneObject*> vendor =
+			zoneServer->getObject(listing->getVendorID());
+		Locker listingLock(listing);
+		auctionMap->removeFromCommodityLimit(listing);
+		auctionMap->deleteItem(vendor, listing, true);
+	}
+
+	for (int i = 0; i < creatureOids.size(); ++i) {
+		ManagedReference<SceneObject*> object =
+			zoneServer->getObject(creatureOids.get(i));
+		CreatureObject* creature = object == nullptr ? nullptr :
+			object->asCreatureObject();
+		if (creature == nullptr)
+			continue;
+		Locker creatureLock(creature);
+		if (creature->getZone() != nullptr)
+			creature->destroyObjectFromWorld(true);
+		creature->destroyObjectFromDatabase(true);
+	}
+}
+
 void SimPlayerManager::despawnPlayerBotParityProvokedCreature() {
 	uint64 creatureOid = 0;
 	uint64 provokedIdentity = 0;
@@ -15000,6 +17456,77 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 		return lootNotCreatedNoRecord.get();
 	if (key == "loot.notcreated.gateoff" || key == "lootnotcreatedgateoff")
 		return lootNotCreatedGateOff.get();
+	if (key == "bazaar.listed" || key == "bazaarlisted")
+		return bazaarListed.get();
+	if (key == "bazaar.sold" || key == "bazaarsold")
+		return bazaarSold.get();
+	if (key == "bazaar.retrieved" || key == "bazaarretrieved")
+		return bazaarRetrieved.get();
+	if (key == "bazaar.drained" || key == "bazaardrained")
+		return bazaarDrained.get();
+	if (key == "bazaar.feepaid" || key == "bazaarfeespaid")
+		return bazaarFeesPaid.get();
+	if (key == "bazaar.proceeds" || key == "bazaarproceeds")
+		return bazaarProceeds.get();
+	if (key == "bazaar.taxpaid" || key == "bazaartaxpaid")
+		return bazaarTaxPaid.get();
+	if (key == "bazaar.skipped.junk" || key == "bazaarskippedjunk")
+		return bazaarSkippedJunk.get();
+	if (key == "bazaar.skipped.novalue" || key == "bazaarskippednovalue")
+		return bazaarSkippedNoValue.get();
+	if (key == "bazaar.skipped.humanabovecap" ||
+			key == "bazaarskippedhumanabovecap")
+		return bazaarSkippedHumanAboveCap.get();
+	if (key == "bazaar.skipped.cap" || key == "bazaarskippedcap")
+		return bazaarSkippedCap.get();
+	if (key == "bazaar.skipped.unaffordable" ||
+			key == "bazaarskippedunaffordable")
+		return bazaarSkippedUnaffordable.get();
+	if (key == "bazaar.skipped.notrade" || key == "bazaarskippednotrade")
+		return bazaarSkippedNoTrade.get();
+	if (key == "bazaar.skipped.transferfailed" ||
+			key == "bazaarskippedtransferfailed")
+		return bazaarSkippedTransferFailed.get();
+	if (key == "bazaar.visits.begun" || key == "bazaarvisitsbegun")
+		return bazaarVisitsBegun.get();
+	if (key == "bazaar.visits.listedany" || key == "bazaarvisitslistedany")
+		return bazaarVisitsListedAny.get();
+	if (key == "bazaar.visits.nooutdoorterminal" ||
+			key == "bazaarvisitsnooutdoorterminal")
+		return bazaarVisitsNoOutdoorTerminal.get();
+	if (key == "bazaar.visits.timeout" || key == "bazaarvisitstimeout")
+		return bazaarVisitsTimeout.get();
+	if (key == "bazaar.visits.pathfailed" || key == "bazaarvisitspathfailed")
+		return bazaarVisitsPathFailed.get();
+	if (key == "bazaar.visits.newattacker" ||
+			key == "bazaarvisitsnewattacker")
+		return bazaarVisitsNewAttacker.get();
+	if (key == "bazaar.saleunresolved" || key == "bazaarsaleunresolved")
+		return bazaarSaleUnresolved.get();
+	if (key == "bazaar.salebacklogoverflow" ||
+			key == "bazaarsalebacklogoverflow")
+		return bazaarSaleBacklogOverflow.get();
+	if (key == "bazaar.releasebuyergone" || key == "bazaarreleasebuyergone")
+		return bazaarReleaseBuyerGone.get();
+	if (key == "bazaar.deleteblockedbylisting" ||
+			key == "bazaardeleteblockedbylisting")
+		return bazaarDeleteBlockedByListing.get();
+	if (key == "bazaar.reconcile.adopted" || key == "bazaarreconcileadopted")
+		return bazaarReconcileAdopted.get();
+	if (key == "bazaar.reconcile.settled" || key == "bazaarreconcilesettled")
+		return bazaarReconcileSettled.get();
+	if (key == "bazaar.reconcile.reversed" || key == "bazaarreconcilereversed")
+		return bazaarReconcileReversed.get();
+	if (key == "bazaar.reconcile.retrieved" || key == "bazaarreconcileretrieved")
+		return bazaarReconcileRetrieved.get();
+	if (key == "bazaar.reconcile.orphaned" || key == "bazaarreconcileorphaned")
+		return bazaarReconcileOrphaned.get();
+	if (key == "bazaar.reconcile.adoptedtaxestimated" ||
+			key == "bazaarreconcileadoptedtaxestimated")
+		return bazaarReconcileAdoptedTaxEstimated.get();
+	if (key == "bazaar.reconcile.releasedrepaired" ||
+			key == "bazaarreconcilereleasedrepaired")
+		return bazaarReconcileReleasedRepaired.get();
 	if (key == "training.trained" || key == "trainingtrained")
 		return trainingTrained.get();
 	if (key == "training.refusednorecord" || key == "trainingrefusednorecord")
@@ -15338,7 +17865,10 @@ void SimPlayerManager::schedulePlayerBotParityTestSpawn(int delayMs) {
 void SimPlayerManager::schedulePlayerBotParityTestRunner(int delayMs) {
 	{
 		Locker parityLock(&playerBotParityTestMutex);
-		if (((!playerBotParityTestEnabled || !progressionEnabled) &&
+		bool progressionOverrideActive =
+			playerBotParityTestProgressionEnabledOverrideActive;
+		if (((!playerBotParityTestEnabled ||
+				(!progressionEnabled && !progressionOverrideActive)) &&
 				!playerBotParityTestCleanupActive) ||
 				playerBotParityTestRunnerScheduled)
 			return;
@@ -15385,11 +17915,20 @@ void SimPlayerManager::beginPlayerBotParityTestCleanup(bool preserveProbe) {
 	}
 	despawnPlayerBotParityKillTarget();
 	despawnPlayerBotParityProvokedCreature();
+	despawnPlayerBotParityBazaarHelpers();
 }
 
 void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 	{
 		Locker parityLock(&playerBotParityTestMutex);
+		if (playerBotParityTestProgressionEnabledOverrideActive) {
+			progressionEnabled =
+				playerBotParityTestProgressionEnabledOverridePrevious;
+			playerBotParityTestProgressionEnabledOverrideActive = false;
+			playerBotParityTestProgressionEnabledOverride = true;
+			if (progressionEnabled)
+				progressionBazaarSettlementMode = false;
+		}
 		if (playerBotParityTestGateOverrideActive) {
 			playerBotParityTestGateOverrideActive =
 				playerBotParityTestGateOverridePreviousActive;
@@ -15446,12 +17985,20 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 		}
 		playerBotParityTestLootGateOverrideActive = false;
 		playerBotParityTestLootGateOverride = false;
+		playerBotParityTestBazaarSellGateOverrideActive = false;
+		playerBotParityTestBazaarSellGateOverride = false;
+		if (playerBotParityTestBazaarMarkupOverrideActive) {
+			progressionBazaarMarkup =
+				playerBotParityTestBazaarMarkupOverridePrevious;
+			playerBotParityTestBazaarMarkupOverrideActive = false;
+		}
 		if (playerBotParityTestLootCapOverrideActive) {
 			progressionLootMaxItemsPerBot =
 				playerBotParityTestLootCapOverridePrevious;
 			playerBotParityTestLootCapOverrideActive = false;
 		}
 		playerBotParityLootGateScopedIds.removeAll();
+		playerBotParityBazaarSellGateScopedIds.removeAll();
 		playerBotParityMissionCreditScopedIds.removeAll();
 		playerBotParityBuffPaymentScopedIds.removeAll();
 	}
@@ -15488,6 +18035,7 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 	// happens before the body/row cleanup passes.
 	despawnPlayerBotParityKillTarget();
 	despawnPlayerBotParityProvokedCreature();
+	despawnPlayerBotParityBazaarHelpers();
 
 	Vector<uint64> identityIds;
 	bool preserveProbe = false;
@@ -15653,12 +18201,14 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 	bool cleanupActive = false;
 	{
 		Locker parityLock(&playerBotParityTestMutex);
-		enabledNow = playerBotParityTestEnabled && progressionEnabled;
+		enabledNow = playerBotParityTestEnabled && (progressionEnabled ||
+			playerBotParityTestProgressionEnabledOverrideActive);
 		cleanupActive = playerBotParityTestCleanupActive;
 	}
 	if (!enabledNow) {
 		despawnPlayerBotParityKillTarget();
 		despawnPlayerBotParityProvokedCreature();
+		despawnPlayerBotParityBazaarHelpers();
 		if (cleanupActive)
 			cleanupPlayerBotParityTest();
 		return;
@@ -15865,6 +18415,10 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 			return;
 		}
 
+		// Seeded "human" listings and helper buyers are scenario-scoped: a
+		// leftover human ask would become the next scenario's price floor.
+		despawnPlayerBotParityBazaarHelpers();
+
 		uint64 nowMs = System::getMiliTime();
 		{
 			Locker parityLock(&playerBotParityTestMutex);
@@ -15891,7 +18445,22 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 				"training.refusedPrereq", "training.refusedPreclusion",
 				"training.refusedPoints", "training.refusedXp",
 				"training.sweepPasses", "training.pendingHigh",
-				"training.tierRecomputed"};
+				"training.tierRecomputed", "bazaar.listed", "bazaar.sold",
+				"bazaar.retrieved", "bazaar.drained", "bazaar.feesPaid",
+				"bazaar.proceeds", "bazaar.taxPaid", "bazaar.skipped.junk",
+				"bazaar.skipped.noValue", "bazaar.skipped.humanAboveCap",
+				"bazaar.skipped.cap", "bazaar.skipped.unaffordable",
+				"bazaar.skipped.noTrade", "bazaar.skipped.transferFailed",
+				"bazaar.visits.begun", "bazaar.visits.listedAny",
+				"bazaar.visits.noOutdoorTerminal", "bazaar.visits.timeout",
+				"bazaar.visits.pathFailed", "bazaar.visits.newAttacker",
+				"bazaar.saleUnresolved", "bazaar.saleBacklogOverflow",
+				"bazaar.releaseBuyerGone", "bazaar.deleteBlockedByListing",
+				"bazaar.reconcile.adopted", "bazaar.reconcile.settled",
+				"bazaar.reconcile.reversed", "bazaar.reconcile.retrieved",
+				"bazaar.reconcile.orphaned",
+				"bazaar.reconcile.adoptedTaxEstimated",
+				"bazaar.reconcile.releasedRepaired"};
 			for (unsigned int i = 0; i < sizeof(counters) / sizeof(counters[0]); ++i)
 				playerBotParityTestCounterBaselines.put(counters[i].toLowerCase(),
 					static_cast<uint64>(playerBotParityCounterValue(counters[i])));
@@ -16239,7 +18808,8 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			op == "assertTier" || op == "assertDirty" || op == "assertSource" ||
 			op == "assertAbility" || op == "assertAbilitySuperseded" ||
 				op == "assertAttackSource" || op == "assertAbilityUse" ||
-				op == "setLootGate" || op == "seedCorpseLoot" ||
+				op == "setLootGate" || op == "setBazaarSellGate" ||
+				op == "seedCorpseLoot" ||
 				op == "lootCorpse" || op == "killBodyBeforeLoot" ||
 				op == "setLootCap" || op == "assertVaultItems" ||
 				op == "assertItemRow" || op == "assertCorpseItems" ||
@@ -16247,6 +18817,9 @@ bool SimPlayerManager::executePlayerBotParityStep(
 				op == "assertItemStats" || op == "seedCorpseCash" ||
 				op == "assertCorpseOwner" || op == "assertItemDestroyed" ||
 				op == "assertLootOwner" ||
+				op == "seedVaultItem" || op == "bazaarListAt" ||
+				op == "assertListing" || op == "expireListing" ||
+				op == "assertStoreDelta" || op == "forgeListingRow" ||
 				op == "setCombatAbilitiesGate" ||
 				op == "setMissionCreditGate" ||
 				op == "setBuffPaymentGate" ||
@@ -16294,6 +18867,79 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		return true;
 	}
 
+	if (op == "setBazaarSellGate") {
+		if (identityId == 0) {
+			result.status = "FAIL";
+			result.failReason = "bazaar_gate_requires_identity";
+			return true;
+		}
+		int64 enabledValue = 0;
+		if (step.hasBazaarSellGate)
+			enabledValue = step.bazaarSellGate ? 1 : 0;
+		else if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_bazaar_gate_value";
+			return true;
+		}
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityTestBazaarSellGateOverrideActive = true;
+		playerBotParityTestBazaarSellGateOverride = enabledValue != 0;
+		playerBotParityBazaarSellGateScopedIds.put(identityId, true);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "setBazaarMarkup") {
+		if (!step.hasBazaarMarkup || step.bazaarMarkup < 0.1f ||
+				step.bazaarMarkup > 100.f) {
+			result.status = "FAIL";
+			result.failReason = "invalid_bazaar_markup";
+			return true;
+		}
+		Locker parityLock(&playerBotParityTestMutex);
+		if (!playerBotParityTestBazaarMarkupOverrideActive) {
+			playerBotParityTestBazaarMarkupOverridePrevious =
+				progressionBazaarMarkup;
+			playerBotParityTestBazaarMarkupOverrideActive = true;
+		}
+		progressionBazaarMarkup = step.bazaarMarkup;
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "setProgressionEnabled") {
+		int64 enabledValue = 0;
+		if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_progression_enabled_value";
+			return true;
+		}
+		Locker parityLock(&playerBotParityTestMutex);
+		if (!playerBotParityTestProgressionEnabledOverrideActive)
+			playerBotParityTestProgressionEnabledOverridePrevious =
+				progressionEnabled;
+		playerBotParityTestProgressionEnabledOverrideActive = true;
+		playerBotParityTestProgressionEnabledOverride = enabledValue != 0;
+		progressionEnabled = enabledValue != 0;
+		if (progressionEnabled)
+			progressionBazaarSettlementMode = false;
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "suppressBazaarSalePod") {
+		playerBotParityTestSuppressBazaarSalePod.set(
+			step.suppressBazaarSalePod || step.expect.toLowerCase() == "true");
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "bazaarPublishFault") {
+		playerBotParityTestBazaarPublishFault.set(true);
+		result.status = "PASS";
+		return true;
+	}
+
 	if (op == "setLootCap") {
 		int cap = step.lootCap;
 		if (cap < 0) {
@@ -16330,6 +18976,363 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			return true;
 		}
 		destroyPlayerBotParityBody(identityIndex, "loot_before_body_death");
+		result.status = "PASS";
+		return true;
+	}
+
+	// Bazaar harness setup deliberately uses the same vault deposit path as a
+	// real loot transfer.  The object is created first, moved under the bag
+	// lock, and only then does the row/ledger become visible to the listing
+	// surface.
+	if (op == "seedVaultItem") {
+		if (step.templateName.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "bazaar_template_missing";
+			return true;
+		}
+		AiEconomyManager* economyManager = AiEconomyManager::instance();
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> bag = economyManager == nullptr ?
+			nullptr : economyManager->getOrCreateItemBag(identityId);
+		ManagedReference<SceneObject*> item = zoneServer == nullptr ? nullptr :
+			zoneServer->createObject(step.templateName.hashCode(), 1);
+		if (bag == nullptr || item == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "bazaar_seed_object_missing";
+			return true;
+		}
+		bool transferred = false;
+		{
+			Locker itemLock(item);
+			Locker bagLock(bag, item);
+			transferred = bag->transferObject(item, -1, false, true);
+			if (transferred) {
+				TangibleObject* tangible = cast<TangibleObject*>(item.get());
+				if (tangible != nullptr) {
+					tangible->setJunkValue(step.junkValue != 0 ? step.junkValue :
+					static_cast<int>(step.amount));
+					tangible->setJunkDealerNeeded(step.junkMask);
+				}
+			}
+		}
+		if (!transferred) {
+			item->destroyObjectFromDatabase(true);
+			result.status = "FAIL";
+			result.failReason = "bazaar_seed_transfer_failed";
+			return true;
+		}
+		SimBotItemDeposit deposit;
+		deposit.objectId = item->getObjectID();
+		deposit.templateCrc = item->getServerObjectCRC();
+		{
+			Locker itemLock(item);
+			deposit.displayName = item->getDisplayedName();
+		}
+		Vector<SimBotItemDeposit> deposits;
+		deposits.add(deposit);
+		if (!depositPlayerBotItem(identityId, deposits, "harness",
+			item->getObjectID())) {
+			result.status = "FAIL";
+			result.failReason = "bazaar_seed_deposit_failed";
+			return true;
+		}
+		playerBotParityLastBazaarItemOid = item->getObjectID();
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "bazaarListAt") {
+		if (!playerBotBazaarSellGateEnabled(identityId)) {
+			result.status = "PASS";
+			return true;
+		}
+		uint64 bodyOid = step.bodyOid;
+		if (bodyOid == 0) {
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> bodyObject = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(bodyOid);
+		CreatureObject* body = bodyObject == nullptr ? nullptr :
+			bodyObject->asCreatureObject();
+		if (body == nullptr || body->getZone() == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "bazaar_harness_body_missing";
+			return true;
+		}
+		Vector3 position = body->getWorldPosition();
+		SceneObject* terminal = MarketSeederBridge::findBazaarTerminal(
+			body->getZone(), position.getX(), position.getZ(), position.getY(),
+			static_cast<float>(getPlayerBotBazaarMaxDetourMeters()), true);
+		if (terminal == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "bazaar_harness_listing_failed";
+			return true;
+		}
+		// A visit with only skipped candidates is a valid harness outcome; the
+		// following assertCounterDelta/assertListing step owns that verdict.
+		listPlayerBotItemsAtTerminal(identityId, body, terminal);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "createHumanListing") {
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		String planet = step.planet.isEmpty() ? String("tatooine") : step.planet;
+		Zone* zone = zoneServer == nullptr ? nullptr : zoneServer->getZone(planet);
+		CreatureObject* seller = zone == nullptr ? nullptr :
+			MarketSeederBridge::getSystemSeller(zone);
+		if (seller == nullptr || step.templateName.isEmpty() || step.price <= 0) {
+			result.status = "FAIL";
+			result.failReason = "human_listing_setup_failed";
+			return true;
+		}
+		ManagedReference<SceneObject*> inventory =
+			seller->getSlottedObject("inventory");
+		SceneObject* item = inventory == nullptr ? nullptr :
+			MarketSeederBridge::createItemForSeller(seller, inventory,
+			step.templateName);
+		// The system seller is not in the world, so its own position finds no
+		// terminal: list at the outdoor terminal nearest the harness spawn,
+		// the one the harness bodies list at.
+		Vector3 anchor;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			anchor = playerBotParityTestSpawn;
+		}
+		SceneObject* terminal = MarketSeederBridge::findBazaarTerminal(zone,
+			anchor.getX(), anchor.getZ(), anchor.getY(),
+			static_cast<float>(getPlayerBotBazaarMaxDetourMeters()), true);
+		if (item == nullptr || terminal == nullptr ||
+			!MarketSeederBridge::listOnBazaar(item, seller, planet,
+			terminal->getWorldPositionX(), terminal->getWorldPositionZ(),
+			terminal->getWorldPositionY(), step.price,
+			step.amount > 0 ? static_cast<int>(step.amount) : 168)) {
+			result.status = "FAIL";
+			result.failReason = "human_listing_failed";
+			return true;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityBazaarHumanListingItemOids.add(item->getObjectID());
+		}
+		playerBotParityLastBazaarItemOid = item->getObjectID();
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "buyListing") {
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		AuctionManager* auctionManager = zoneServer == nullptr ? nullptr :
+			zoneServer->getAuctionManager();
+		uint64 itemOid = step.itemOid != 0 ? step.itemOid :
+			playerBotParityLastBazaarItemOid;
+		ManagedReference<AuctionItem*> listing = auctionManager == nullptr ||
+			auctionManager->getAuctionMap() == nullptr || itemOid == 0 ? nullptr :
+			auctionManager->getAuctionMap()->getItem(itemOid);
+		if (listing == nullptr || zoneServer == nullptr ||
+			listing->getVendorID() == 0) {
+			result.status = "FAIL";
+			result.failReason = "bazaar_buy_listing_missing";
+			return true;
+		}
+		Zone* zone = listing->getVendorID() == 0 ? nullptr :
+			zoneServer->getObject(listing->getVendorID()) == nullptr ? nullptr :
+			zoneServer->getObject(listing->getVendorID())->getZone();
+		CreatureObject* buyer = zone == nullptr || zone->getCreatureManager() == nullptr ?
+			nullptr : zone->getCreatureManager()->spawnCreature(
+			String("artisan").hashCode(), 0, listing->getPrice() > 0 ?
+				zoneServer->getObject(listing->getVendorID())->getPositionX() : 0.f,
+				zoneServer->getObject(listing->getVendorID())->getPositionZ(),
+				zoneServer->getObject(listing->getVendorID())->getPositionY(), 0);
+		if (buyer == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "bazaar_buyer_spawn_failed";
+			return true;
+		}
+		trackPlayerBotParityBazaarHelperCreature(buyer);
+		String buyerName = step.ownerName;
+		if (buyerName == "@seller") {
+			// Name collision: the buyer carries the selling bot's own name.
+			uint64 sellerIdentity = 0;
+			if (!getPlayerBotParityIdentityId(step, sellerIdentity)) {
+				result.status = "FAIL";
+				result.failReason = "identity_not_found";
+				return true;
+			}
+			Locker pveLock(&pveMutex);
+			buyerName = pveIdentities.contains(sellerIdentity) ?
+				pveIdentities.get(sellerIdentity).firstName : String();
+		}
+		if (!buyerName.isEmpty()) {
+			Locker buyerLock(buyer);
+			buyer->setFirstName(buyerName, true);
+		}
+		{
+			Locker buyerLock(buyer);
+			buyer->addBankCredits(listing->getPrice() + 100000, false);
+		}
+		auctionManager->doInstantBuy(buyer, listing);
+		playerBotParityLastBazaarAuctionOid = listing->getObjectID();
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "expireListing") {
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		AuctionManager* auctionManager = zoneServer == nullptr ? nullptr :
+			zoneServer->getAuctionManager();
+		uint64 itemOid = step.itemOid != 0 ? step.itemOid :
+			playerBotParityLastBazaarItemOid;
+		ManagedReference<AuctionItem*> listing = auctionManager == nullptr ||
+			auctionManager->getAuctionMap() == nullptr || itemOid == 0 ? nullptr :
+			auctionManager->getAuctionMap()->getItem(itemOid);
+		if (listing == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "bazaar_expire_listing_missing";
+			return true;
+		}
+		Locker listingLock(listing);
+		listing->setStatus(AuctionItem::EXPIRED);
+		listing->setExpireTime(static_cast<uint64>(time(nullptr)));
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "runBazaarSweep") {
+		progressionBazaarLastSweepMs = 0;
+		// The live maintenance lane settles the deferred POD before and after
+		// its bounded object-store sweep.  Keep the harness operation on that
+		// same cadence so a sale POD discovered by the sweep is observable in
+		// the following assertion instead of remaining in the private backlog.
+		settlePlayerBotBazaarSales();
+		sweepPlayerBotBazaarListings(System::getMiliTime());
+		settlePlayerBotBazaarSales();
+		// A held sale discovered by the sweep is settled after the object pass.
+		// Give the same harness tick a second object pass after callers have
+		// flushed the two receipts, so the retrieval hold is released as it is
+		// on the next live maintenance interval.
+		progressionBazaarLastSweepMs = 0;
+		sweepPlayerBotBazaarListings(System::getMiliTime());
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertListing") {
+		uint64 objectId = step.itemOid != 0 ? step.itemOid :
+			playerBotParityLastBazaarItemOid;
+		PlayerBotBazaarListing listing;
+		bool found = false;
+		{
+			Locker progressionLock(&progressionMutex);
+			if (objectId == 0) {
+				// After a restart the last-listed pointer is gone (two-boot
+				// probe phase B): fall back to this identity's own listing.
+				for (int i = 0; i < progressionBazaarListings.size(); ++i) {
+					if (progressionBazaarListings.elementAt(i).getValue().identityId ==
+							identityId) {
+						objectId = progressionBazaarListings.elementAt(i).getKey();
+						break;
+					}
+				}
+			}
+			if (progressionBazaarListings.contains(objectId)) {
+				listing = progressionBazaarListings.get(objectId);
+				found = listing.identityId == identityId;
+			}
+		}
+		if (step.expect.toLowerCase() == "missing") {
+			result.status = found ? "FAIL" : "PASS";
+			if (found) result.failReason = "bazaar_listing_unexpected";
+			return true;
+		}
+		if (!found || (!step.itemState.isEmpty() &&
+				String(playerBotBazaarListingStateName(listing.state)) !=
+				step.itemState) || (step.price > 0 && listing.price != step.price)) {
+			result.status = "FAIL";
+			result.failReason = "bazaar_listing_mismatch";
+			return true;
+		}
+		if (step.hasOwnerIsBag || !step.ownerName.isEmpty()) {
+			ZoneServer* zoneServer = ServerCore::getZoneServer();
+			AuctionManager* auctionManager = zoneServer == nullptr ? nullptr :
+				zoneServer->getAuctionManager();
+			ManagedReference<AuctionItem*> auction = auctionManager == nullptr ||
+				auctionManager->getAuctionMap() == nullptr ? nullptr :
+				auctionManager->getAuctionMap()->getItem(objectId);
+			bool ownerIsBag = auction != nullptr &&
+				auctionManager->isSimBotListing(auction);
+			if ((step.hasOwnerIsBag && ownerIsBag != step.ownerIsBag) ||
+				(!step.ownerName.isEmpty() && (auction == nullptr ||
+					auction->getOwnerName() != step.ownerName))) {
+				result.status = "FAIL";
+				result.failReason = "bazaar_listing_owner_mismatch";
+				return true;
+			}
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertStoreDelta") {
+		SimBotProgression current;
+		int64 baseline = 0;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			if (playerBotParityTestCreditBaselines.contains(identityId))
+				baseline = playerBotParityTestCreditBaselines.get(identityId);
+		}
+		if (!snapshotPlayerBotProgression(identityId, current) ||
+				current.bankCredits - baseline != step.expectedDelta) {
+			result.status = "FAIL";
+			result.failReason = "bazaar_store_delta_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "forgeListingRow") {
+		uint64 objectId = step.itemOid != 0 ? step.itemOid :
+			playerBotParityLastBazaarItemOid;
+		Locker progressionLock(&progressionMutex);
+		if (!progressionBazaarListings.contains(objectId)) {
+			result.status = "FAIL";
+			result.failReason = "bazaar_listing_row_missing";
+			return true;
+		}
+		PlayerBotBazaarListing& listing = progressionBazaarListings.get(objectId);
+		if (!step.itemState.isEmpty())
+			listing.state = playerBotBazaarListingStateFromName(step.itemState);
+		if (step.price > 0)
+			listing.price = step.price;
+		if (step.auctionOid != 0)
+			listing.auctionOid = step.auctionOid;
+		listing.releasedAtMs = step.hasInVault && step.inVault ?
+			System::getMiliTime() : listing.releasedAtMs;
+		listing.dirty = true;
+		// Forged receipt rows go through the same pending-ledger path as a real
+		// sale.  This lets the disabled-by-default matrix exercise partial rows,
+		// applied marks, and the void-row reload rule without a SQL-only backdoor.
+		String receiptSource = step.source == "harness" ?
+			String("bazaar_sale") : step.source;
+		if (step.amount != 0 && progressionRecords.contains(listing.identityId)) {
+			SimBotProgression& progression = progressionRecords.get(listing.identityId);
+			progression.bankCredits += step.amount;
+			appendPlayerBotLedgerEntryLocked(listing.identityId, true, step.amount,
+				progression.bankCredits, receiptSource, listing.auctionOid,
+				"harness_forge_credit");
+			markProgressionDirtyLocked(listing.identityId);
+		}
+		if (step.ledgerCount != 0 && progressionRecords.contains(listing.identityId)) {
+			uint64 held = progressionItemHeldCounts.contains(listing.identityId) ?
+				progressionItemHeldCounts.get(listing.identityId) : 0;
+			appendPlayerBotLedgerEntryKindLocked(listing.identityId, "item",
+				step.ledgerCount, held, receiptSource, listing.auctionOid,
+				"harness_forge_item");
+		}
 		result.status = "PASS";
 		return true;
 	}
@@ -17952,6 +20955,54 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		return true;
 	}
 
+	// This operation intentionally observes the real SimHunterController map.
+	// SimParityTestController bodies never enter HuntPhase, so a passing
+	// production-visit scenario must see the manager visit counters advance and
+	// the hunter hand back to its normal post-visit phase.
+	if (op == "resetBazaarVisitCooldowns") {
+		Locker progressionLock(&progressionMutex);
+		progressionBazaarVisitCooldownUntilMs.removeAll();
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "awaitBazaarVisit") {
+		uint64 begunBaseline = 0;
+		uint64 listedBaseline = 0;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			begunBaseline = playerBotParityTestCounterBaselines.contains(
+				"bazaar.visits.begun") ?
+				playerBotParityTestCounterBaselines.get("bazaar.visits.begun") : 0;
+			listedBaseline = playerBotParityTestCounterBaselines.contains(
+				"bazaar.visits.listedany") ?
+				playerBotParityTestCounterBaselines.get("bazaar.visits.listedany") : 0;
+		}
+		bool visitObserved = bazaarVisitsBegun.get() > begunBaseline;
+		bool listedObserved = bazaarVisitsListedAny.get() > listedBaseline;
+		bool hunterResumed = false;
+		for (int i = 0; i < controllers.size(); ++i) {
+			Reference<SimPlayerController*> controller =
+				controllers.get(controllers.getKey(i));
+			SimHunterController* hunter = controller == nullptr ? nullptr :
+				dynamic_cast<SimHunterController*>(controller.get());
+			if (hunter == nullptr || (step.identityId != 0 &&
+				hunter->getIdentityId() != step.identityId))
+				continue;
+			String phaseName = hunter->getPhaseName();
+			hunterResumed = phaseName == "BUFF_UP" ||
+				phaseName == "ANNOUNCE_JOB" || phaseName == "TRAVEL_OUT";
+			if (hunterResumed)
+				break;
+		}
+		if (visitObserved && listedObserved && hunterResumed) {
+			result.status = "PASS";
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
+	}
+
 	if (op == "spawnKillTarget") {
 		String failure;
 		if (!spawnPlayerBotParityKillTarget(step, failure)) {
@@ -18507,6 +21558,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 	SimBotTrainingStep nextStep;
 	SimBotEarlyGameState earlyState;
 	Vector<SimBotItemRow> inspectItemRows;
+	Vector<PlayerBotBazaarListing> inspectListings;
 	bool haveNextStep = false;
 	bool haveEarlyState = false;
 	SimBotTrainingPlan trainingPlan;
@@ -18531,6 +21583,18 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 			const SimBotItemRow& itemRow = progressionItems.elementAt(i).getValue();
 			if (itemRow.identityId == identityId)
 				inspectItemRows.add(itemRow);
+		}
+		for (int i = 0; i < progressionBazaarListings.size(); ++i) {
+			const PlayerBotBazaarListing& listing =
+				progressionBazaarListings.elementAt(i).getValue();
+			if (listing.identityId == identityId)
+				inspectListings.add(listing);
+		}
+		for (int i = 0; i < progressionBazaarClosedListings.size(); ++i) {
+			const PlayerBotBazaarListing& listing =
+				progressionBazaarClosedListings.elementAt(i).getValue();
+			if (listing.identityId == identityId)
+				inspectListings.add(listing);
 		}
 	}
 
@@ -18930,6 +21994,43 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 	}
 	result["itemsHeld"] = inspectHeld;
 	result["items"] = itemRowsJson;
+	JSONSerializationType listingsJson = JSONSerializationType::array();
+	for (int i = 0; i < inspectListings.size(); ++i) {
+		const PlayerBotBazaarListing& listing = inspectListings.get(i);
+		String itemName;
+		for (int j = 0; j < inspectItemRows.size(); ++j) {
+			if (inspectItemRows.get(j).objectId == listing.objectId) {
+				itemName = inspectItemRows.get(j).displayName;
+				break;
+			}
+		}
+		if (itemName.isEmpty()) {
+			ZoneServer* zoneServer = ServerCore::getZoneServer();
+			AuctionManager* auctionManager = zoneServer == nullptr ? nullptr :
+				zoneServer->getAuctionManager();
+			ManagedReference<AuctionItem*> auction = auctionManager == nullptr ||
+				auctionManager->getAuctionMap() == nullptr ? nullptr :
+				auctionManager->getAuctionMap()->getItem(listing.objectId);
+			if (auction != nullptr) {
+				Locker auctionLock(auction);
+				itemName = auctionManager->removeColorCodes(
+					auction->getItemName());
+			}
+		}
+		JSONSerializationType listingJson = JSONSerializationType::object();
+		listingJson["item"] = itemName.isEmpty() ?
+			String("object#") + String::valueOf(listing.objectId) : itemName;
+		listingJson["itemOid"] = listing.objectId;
+		listingJson["auctionOid"] = listing.auctionOid;
+		listingJson["price"] = listing.price;
+		listingJson["state"] = playerBotBazaarListingStateName(listing.state);
+		listingJson["listedAt"] = listing.listedAtMs;
+		listingJson["closedAt"] = listing.closedAtMs;
+		listingJson["releasedAt"] = listing.releasedAtMs;
+		listingJson["buyer"] = listing.buyerName;
+		listingsJson.push_back(listingJson);
+	}
+	result["listings"] = listingsJson;
 
 	return result;
 }
@@ -19065,6 +22166,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	VectorMap<uint64, Vector<SimBotItemRow> > itemRowsByIdentity;
 	VectorMap<String, uint64> itemRowsByState;
 	VectorMap<uint64, uint64> itemHeldSnapshot;
+	Vector<PlayerBotBazaarListing> bazaarListingsSnapshot;
 	uint64 itemVaultBagCount = 0;
 	uint64 itemVaultBagItemCount = 0;
 	uint64 itemVaultLooseObjectCount = 0;
@@ -19079,7 +22181,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		pendingTrainingCount = progressionTrainingPendingIds.size();
 		trainingSweepCursorSnapshot = trainingSweepCursor;
 		ledgerPendingCount = progressionLedgerPending.size();
-		buffReservationsCount = progressionBuffFeeReservations.size();
+		buffReservationsCount = progressionCreditReservations.size();
 		ledgerLastPruneMs = progressionLedgerLastPruneMs;
 		recentLedgerSnapshot = progressionRecentLedger;
 		itemHeldSnapshot = progressionItemHeldCounts;
@@ -19096,6 +22198,12 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 				itemRowsByIdentity.get(itemRow.identityId).add(itemRow);
 			}
 		}
+		for (int i = 0; i < progressionBazaarListings.size(); ++i)
+			bazaarListingsSnapshot.add(
+				progressionBazaarListings.elementAt(i).getValue());
+		for (int i = 0; i < progressionBazaarClosedListings.size(); ++i)
+			bazaarListingsSnapshot.add(
+				progressionBazaarClosedListings.elementAt(i).getValue());
 		lastFlushMs = progressionLastFlushMs;
 		for (int i = 0; i < records.size(); ++i)
 			lastAwardMs = Math::max(lastAwardMs,
@@ -19221,7 +22329,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	gates["realWeaponDamage"] = playerBotRealWeaponDamageGateEnabled();
 	gates["combatAbilitiesEnabled"] = playerBotCombatAbilitiesGateArmed();
 	gates["lairTacticsEnabled"] = isPveMissionLairTacticsEnabled();
-	gates["bazaarSell"] = false;
+	gates["bazaarSell"] = playerBotBazaarSellGateEnabled(0);
 	gates["bazaarBuy"] = false;
 	result["gates"] = gates;
 
@@ -19292,6 +22400,77 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 			static_cast<PlayerBotLootDisposition>(i))] = lootResults[i].get();
 	loot["results"] = results;
 	result["loot"] = loot;
+
+	JSONSerializationType bazaar = JSONSerializationType::object();
+	bazaar["enabled"] = playerBotBazaarSellGateEnabled(0);
+	bazaar["configured"] = progressionBazaarSellEnabled;
+	bazaar["settlementMode"] = progressionBazaarSettlementMode;
+	bazaar["maxListingsPerBot"] = progressionBazaarMaxListingsPerBot;
+	bazaar["maxListingsPerVisit"] = progressionBazaarMaxListingsPerVisit;
+	bazaar["listingDurationHours"] = progressionBazaarDurationHours;
+	bazaar["cooldownSeconds"] = progressionBazaarCooldownSeconds;
+	bazaar["visitCooldownMinutes"] = progressionBazaarVisitCooldownMinutes;
+	bazaar["detourSeconds"] = progressionBazaarDetourSeconds;
+	bazaar["maxDetourMeters"] = progressionBazaarMaxDetourMeters;
+	bazaar["arriveMeters"] = progressionBazaarArriveMeters;
+	bazaar["visitTimeoutSeconds"] = progressionBazaarTimeoutSeconds;
+	bazaar["markup"] = progressionBazaarMarkup;
+	bazaar["minPrice"] = progressionBazaarMinPrice;
+	bazaar["maxPrice"] = progressionBazaarMaxPrice;
+	bazaar["sweepIntervalSeconds"] = progressionBazaarSweepIntervalSeconds;
+	bazaar["sweepBatch"] = progressionBazaarSweepBatch;
+	bazaar["saleBacklogMax"] = progressionBazaarSaleBacklogMax;
+	bazaar["drainOnDisable"] = progressionBazaarDrainOnDisable;
+	int listingsLive = 0;
+	for (int i = 0; i < bazaarListingsSnapshot.size(); ++i) {
+		const PlayerBotBazaarListing& listing = bazaarListingsSnapshot.get(i);
+		if (listing.state == SimBotBazaar::PENDING ||
+				listing.state == SimBotBazaar::LISTED)
+			++listingsLive;
+	}
+	bazaar["listingsLive"] = listingsLive;
+	bazaar["listed"] = bazaarListed.get();
+	bazaar["sold"] = bazaarSold.get();
+	bazaar["retrieved"] = bazaarRetrieved.get();
+	bazaar["drained"] = bazaarDrained.get();
+	bazaar["feesPaid"] = bazaarFeesPaid.get();
+	bazaar["proceeds"] = bazaarProceeds.get();
+	bazaar["taxPaid"] = bazaarTaxPaid.get();
+	JSONSerializationType skipped = JSONSerializationType::object();
+	skipped["junk"] = bazaarSkippedJunk.get();
+	skipped["noValue"] = bazaarSkippedNoValue.get();
+	skipped["humanAboveCap"] = bazaarSkippedHumanAboveCap.get();
+	skipped["cap"] = bazaarSkippedCap.get();
+	skipped["unaffordable"] = bazaarSkippedUnaffordable.get();
+	skipped["noTrade"] = bazaarSkippedNoTrade.get();
+	skipped["transferFailed"] = bazaarSkippedTransferFailed.get();
+	bazaar["skipped"] = skipped;
+	JSONSerializationType visits = JSONSerializationType::object();
+	visits["begun"] = bazaarVisitsBegun.get();
+	visits["listedAny"] = bazaarVisitsListedAny.get();
+	visits["noOutdoorTerminal"] = bazaarVisitsNoOutdoorTerminal.get();
+	visits["timeout"] = bazaarVisitsTimeout.get();
+	visits["pathFailed"] = bazaarVisitsPathFailed.get();
+	visits["newAttacker"] = bazaarVisitsNewAttacker.get();
+	bazaar["visits"] = visits;
+	bazaar["saleUnresolved"] = bazaarSaleUnresolved.get();
+	bazaar["saleBacklogOverflow"] = bazaarSaleBacklogOverflow.get();
+	bazaar["releaseBuyerGone"] = bazaarReleaseBuyerGone.get();
+	bazaar["deleteBlockedByListing"] = bazaarDeleteBlockedByListing.get();
+	JSONSerializationType bazaarReconcile = JSONSerializationType::object();
+	bazaarReconcile["adopted"] = bazaarReconcileAdopted.get();
+	bazaarReconcile["settled"] = bazaarReconcileSettled.get();
+	bazaarReconcile["reversed"] = bazaarReconcileReversed.get();
+	bazaarReconcile["retrieved"] = bazaarReconcileRetrieved.get();
+	bazaarReconcile["orphaned"] = bazaarReconcileOrphaned.get();
+	bazaarReconcile["adoptedTaxEstimated"] =
+		bazaarReconcileAdoptedTaxEstimated.get();
+	bazaarReconcile["releasedRepaired"] =
+		bazaarReconcileReleasedRepaired.get();
+	bazaarReconcile["settledByEvidence"] =
+		static_cast<uint64>(bazaarReconcileSettledByEvidence.get());
+	bazaar["reconcile"] = bazaarReconcile;
+	result["bazaar"] = bazaar;
 
 	JSONSerializationType vaultJson = JSONSerializationType::object();
 	vaultJson["available"] = dashboardEconomy != nullptr &&
@@ -20351,11 +23530,13 @@ void SimPlayerManager::retirePveIdentity(uint64 identityId) {
 			"DELETE FROM `simbot_ledger` WHERE `identity_id`=" + id + ";"));
 		UniqueReference<ResultSet*> items(ServerDatabase::instance()->executeQuery(
 			"DELETE FROM `simbot_items` WHERE `identity_id`=" + id + ";"));
+		UniqueReference<ResultSet*> listings(ServerDatabase::instance()->executeQuery(
+			"DELETE FROM `simbot_listings` WHERE `identity_id`=" + id + ";"));
 		UniqueReference<ResultSet*> progression(ServerDatabase::instance()->executeQuery(
 			"DELETE FROM `simbot_progression` WHERE `identity_id`=" + id + ";"));
 		UniqueReference<ResultSet*> identity(ServerDatabase::instance()->executeQuery(
 			"DELETE FROM `simbot_identities` WHERE `id`=" + id + ";"));
-		(void)skills; (void)experience; (void)ledger; (void)items;
+		(void)skills; (void)experience; (void)ledger; (void)items; (void)listings;
 		(void)progression; (void)identity;
 	} catch (const Exception& e) {
 		progressionDbAvailable = false;
@@ -26245,8 +29426,12 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 	// Runtime config refreshes do not revisit the boot block. An enable is
 	// therefore loaded explicitly on this maintenance lane once the roster is
 	// already available.
-	if (progressionEnabled && !progressionLoaded && pveRosterLoaded &&
-			pveDatabaseAvailable)
+	if (!progressionEnabled && !progressionLoaded && pveRosterLoaded &&
+			pveDatabaseAvailable && !progressionBazaarSettlementMode)
+		progressionBazaarSettlementMode = probePlayerBotBazaarObligations();
+	if ((progressionEnabled || progressionBazaarSettlementMode) &&
+			!progressionLoaded &&
+			pveRosterLoaded && pveDatabaseAvailable)
 		loadPlayerBotProgressionStore();
 
 	// Mission terminals are a post-load world scan. Each configured city is
@@ -26272,7 +29457,11 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 			return;
 		}
 
-		if (progressionEnabled && !progressionLoaded)
+		if (!progressionEnabled && !progressionBazaarSettlementMode &&
+				pveDatabaseAvailable)
+			progressionBazaarSettlementMode = probePlayerBotBazaarObligations();
+		if ((progressionEnabled || progressionBazaarSettlementMode) &&
+				!progressionLoaded)
 			loadPlayerBotProgressionStore();
 
 		bool parityEnabled = false;
@@ -26319,17 +29508,35 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 	// unavailable vault leaves the pending bit set for the next tick.
 	if (progressionLoaded)
 		reconcilePlayerBotItems();
+	if (progressionLoaded) {
+		reconcilePlayerBotBazaarListings();
+		settlePlayerBotBazaarSales();
+		sweepPlayerBotBazaarListings(System::getMiliTime());
+		// A sale was settled since the last pass: write its receipts now rather
+		// than at the next routine flush interval.
+		if (progressionBazaarFlushRequested.exchange(false,
+				std::memory_order_acq_rel))
+			flushPlayerBotProgressionStore(true);
+	}
+	// A gate-off load is a settlement lane only.  It may flush and repair
+	// already-promised bazaar state, but it must not continue into roster
+	// population, activity, matching, awards, or training maintenance.
+	if (progressionBazaarSettlementMode && !progressionEnabled) {
+		flushPlayerBotProgressionStore(false);
+		completePveFoundationMaintenanceTask(entryMs);
+		return;
+	}
 
-	// Novice repair intentionally runs before population governance and does not
-	// require trainingEnabled. A repaired first box is what makes the planned
-	// identity eligible for the body overlay.
-	reconcileNoviceGrants();
+	// Novice repair and retirement are progression mutations, not settlement
+	// obligations. Keep them out of a gate-off settlement-only load.
+	if (progressionEnabled)
+		reconcileNoviceGrants();
 	bool retireLegacyHunters = false;
-	{
+	if (progressionEnabled) {
 		Locker pveLock(&pveMutex);
 		retireLegacyHunters = pveNoviceEnabled && pveRetireLegacyHunters;
 	}
-	if (retireLegacyHunters) {
+	if (progressionEnabled && retireLegacyHunters) {
 		uint64 retirementId = 0;
 		{
 			Locker pveLock(&pveMutex);
@@ -26348,11 +29555,12 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 	// Phase 2 training is evaluated only on the PvE maintenance lane. The
 	// queue drain is bounded by trainingMaxPerTick; the independent sweep is
 	// bounded by trainingSweepBatch and never performs SQL itself.
-	if (progressionLoaded) {
+	if (progressionEnabled && progressionLoaded) {
 		drainPlayerBotTrainingQueue();
 		runPlayerBotTrainingSweep();
 	}
-	runPlayerBotCombatAbilityReapplySweep();
+	if (progressionEnabled)
+		runPlayerBotCombatAbilityReapplySweep();
 	refreshPlayerBotActivityStates();
 
 	uint64 nowMs = System::getMiliTime();

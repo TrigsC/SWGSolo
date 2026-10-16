@@ -538,7 +538,16 @@ F_0.9.0 store+dashboard+reaper+harness
   bot accepts a destroy mission, clears a lair by the tier-appropriate tactic,
   is credited, and spends on a buffer.
 
-### F_0.9.9 — Bazaar SELL (P.10j) — first human-shared surface
+### F_0.9.9 — Bazaar SELL (P.10j) — first human-shared surface — RELEASED as v0.9.11 (2026-10-16)
+
+> Shipped in commit and tag v0.9.11. The owner made two policy calls during the chunk:
+> - **Pricing:** seed the market and never undercut a human; base price = loot value
+>   x markup; generic junk is kept; an unsold item is relisted at its first ask.
+> - **Instant pickup:** no hold for the buyer; the bot's payment is settled and
+>   force-flushed within seconds.
+>
+> The journal sketched below was replaced by ledger receipts plus an applied mark
+> written in the same UPDATE as the balance (see the plan). Next: F_0.9.10 bazaar BUY.
 
 - **Scope**: city bazaar-terminal enumeration (the P.8.2 terminal scan
   pattern, `isBazaarTerminal()`); controller phase walks the body to the
@@ -1005,16 +1014,22 @@ Modelled on `structureTraversalTest` (`sim_player_manager.lua:841`,
    templates inside each class, and every template keeps a floor. F_0.9.11
    implements exactly this.
 
-2. **Human-listing policy — DEFERRED, needs a formula.** Owner's framing:
+2. **Human-listing policy — DECIDED 2026-10-15 (the §8.2 decision).** Bots are
+   market seeders and never undercut: the initial price anchor is
+   `junkValue × markup`, every junk category except `JUNKGENERIC` is eligible,
+   and a relist uses the persisted first `ask_price` anchor (raised only by a
+   higher human floor). The journal deviation is intentional: the object store
+   is authoritative for listing/sale state, while receipt sums and the applied
+   ledger mark make the MySQL journal idempotent across partial writes. A buyer
+   collects a bot's item instantly (owner decision 2026-10-15, no pickup hold);
+   a sale settles and force-flushes within seconds, and a lost sale is recovered
+   from the buyer-owned record. The owner accepted the residual crash window
+   (bot loses that sale's credits; players are never affected).
+
+   Owner's original framing:
    bots play forever while players need real time to harvest and add value, so
-   the open question is whether bots become the market's *seed* (players
-   consume) or its *competitor* (players are priced out). Until a formula
-   exists, F_0.9.9/F_0.9.10 ship restricted: bots trade only with bot and
-   seeded (`market_seeder.lua`) listings, never undercutting or buying a human
-   listing. Those two chunk plans must open with the formula proposal
-   (candidate levers: a price floor tied to real gather time, a per-family
-   listing cap, a bot-visible market share ceiling, or bots buying only above
-   the human ask). **No bazaar chunk starts without this decision.**
+   the decision is therefore to seed supply for players to consume rather than
+   become a perpetual low-price competitor.
 
 3. **engine3 `TaskManager.h` — DECIDED: leave it alone.** It stays
    uncommitted and excluded from every P.10 commit. No P.10 chunk touches

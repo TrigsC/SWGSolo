@@ -10,6 +10,7 @@
 #include "SimBotTravelCombat.h"
 #include "SimBotAreaAttackGuard.h"
 #include "SimBotLootStep.h"
+#include "server/zone/objects/auction/MarketSeederBridge.h"
 
 #include "engine/core/Core.h"
 #include "server/ServerCore.h"
@@ -81,6 +82,7 @@ static String hunterPhaseName(SimHunterController::HuntPhase phase) {
 	case SimHunterController::MISSION_CLEANUP: return "MISSION_CLEANUP";
 	case SimHunterController::CLONE_HOME: return "CLONE_HOME";
 	case SimHunterController::DONE: return "DONE";
+	case SimHunterController::BAZAAR_VISIT: return "BAZAAR_VISIT";
 	default: return "UNKNOWN";
 	}
 }
@@ -94,6 +96,9 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 	deathReported = false;
 	phase = IDLE_HOME;
 	phaseStartedAtMs = System::getMiliTime();
+	bazaarTerminal = nullptr;
+	bazaarTerminalPosition = Vector3();
+	bazaarVisitStartedAtMs = 0;
 	huntStartedAtMs = 0;
 	activeTickGeneration = 1;
 	targetOid = 0;
@@ -305,6 +310,80 @@ void SimHunterController::setPhase(HuntPhase next) {
 	if (identityId != 0)
 		SimPlayerManager::instance()->recordPveHunterPhase(identityId,
 			agent == nullptr ? 0 : agent->getObjectID(), getPhaseName(), targetOid);
+}
+
+bool SimHunterController::beginBazaarVisit(AiAgent* hunter, uint64 nowMs) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr || hunter == nullptr || hunter->isDead() ||
+			hunter->isInCombat() || !manager->beginPlayerBotBazaarVisit(identityId))
+		return false;
+
+	Zone* zone = hunter->getZone();
+	Vector3 position = hunter->getWorldPosition();
+	if (zone == nullptr) {
+		MissionDiagLog::event("BAZAAR_VISIT", identityId,
+			"begin=1 terminal=0 distance=-1");
+		manager->recordPlayerBotBazaarVisit(identityId, "noOutdoorTerminal");
+		MissionDiagLog::event("BAZAAR_VISIT", identityId,
+			"end=1 outcome=noOutdoorTerminal terminal=0 distance=-1");
+		return false;
+	}
+
+	SceneObject* terminal = MarketSeederBridge::findBazaarTerminal(zone,
+		position.getX(), position.getZ(), position.getY(),
+		static_cast<float>(manager->getPlayerBotBazaarMaxDetourMeters()), true);
+	bazaarVisitStartedAtMs = nowMs;
+	if (terminal == nullptr) {
+		MissionDiagLog::event("BAZAAR_VISIT", identityId,
+			"begin=1 terminal=0 distance=-1");
+		manager->recordPlayerBotBazaarVisit(identityId, "noOutdoorTerminal");
+		MissionDiagLog::event("BAZAAR_VISIT", identityId,
+			"end=1 outcome=noOutdoorTerminal terminal=0 distance=-1");
+		bazaarVisitStartedAtMs = 0;
+		return false;
+	}
+
+	bazaarTerminal = terminal;
+	bazaarTerminalPosition = terminal->getWorldPosition();
+	float distance = position.distanceTo2d(bazaarTerminalPosition);
+	MissionDiagLog::event("BAZAAR_VISIT", identityId,
+		"begin=1 terminal=" + String::valueOf(terminal->getObjectID()) +
+		" distance=" + String::valueOf(distance));
+	setPhase(BAZAAR_VISIT);
+	const uint64 generationBefore = activeTickGeneration.load(
+		std::memory_order_acquire);
+	moveTo(bazaarTerminalPosition);
+	if (activeTickGeneration.load(std::memory_order_acquire) == generationBefore)
+		scheduleActiveTick(1000);
+	return true;
+}
+
+void SimHunterController::finishBazaarVisit(const String& outcome,
+		bool resumeJob) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	uint64 terminalOid = bazaarTerminal == nullptr ? 0 :
+		bazaarTerminal->getObjectID();
+	float distance = -1.f;
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent != nullptr)
+		distance = strongAgent->getWorldPosition().distanceTo2d(
+			bazaarTerminalPosition);
+	if (manager != nullptr)
+		manager->recordPlayerBotBazaarVisit(identityId, outcome);
+	MissionDiagLog::event("BAZAAR_VISIT", identityId,
+		"end=1 outcome=" + outcome + " terminal=" +
+		String::valueOf(terminalOid) + " distance=" + String::valueOf(distance));
+	bazaarTerminal = nullptr;
+	bazaarTerminalPosition = Vector3();
+	bazaarVisitStartedAtMs = 0;
+	if (!resumeJob)
+		return;
+	setPhase(ANNOUNCE_JOB);
+	const uint64 generationBefore = activeTickGeneration.load(
+		std::memory_order_acquire);
+	beginBuffUp();
+	if (activeTickGeneration.load(std::memory_order_acquire) == generationBefore)
+		scheduleActiveTick(500);
 }
 
 String SimHunterController::getEarlyGamePhaseName() const {
@@ -2377,6 +2456,13 @@ void SimHunterController::onArrived() {
 		handleEarlyGameArrived();
 		return;
 	}
+	if (phase == BAZAAR_VISIT) {
+		// The phase tick owns the distance check and publication.  Keeping the
+		// callback as a hand-off prevents an arrival thread from taking the
+		// progression/object locks used by the listing path.
+		scheduleActiveTick(0);
+		return;
+	}
 	if (phase == BUFF_UP) {
 		// F_0.7.5: arrival at the outdoor staging anchor. The provider approach
 		// is still active, so entering here hands the normal arrival path the
@@ -2598,6 +2684,10 @@ void SimHunterController::onPathFailed() {
 	if (earlyGameActive) {
 		earlyGamePathFailurePending.store(true, std::memory_order_release);
 		scheduleActiveTick(100);
+		return;
+	}
+	if (phase == BAZAAR_VISIT) {
+		finishBazaarVisit("pathFailed");
 		return;
 	}
 
@@ -4247,6 +4337,10 @@ void SimHunterController::runActiveTick() {
 			" gen=" + String::valueOf(activeTickGeneration.load(
 				std::memory_order_relaxed)));
 	if (strongAgent->isDead()) {
+		const bool bazaarVisitAtDeath = phase == BAZAAR_VISIT;
+		const String phaseAtDeath = getPhaseName();
+		if (bazaarVisitAtDeath)
+			finishBazaarVisit("botDeath", false);
 		// Every queued corpse belongs to this body's OID; the respawned body gets
 		// a new one and could never loot them, so all of them are dropped.
 		SimPlayerManager* lootManager = SimPlayerManager::instance();
@@ -4266,7 +4360,6 @@ void SimHunterController::runActiveTick() {
 			deathReported = true;
 			// Captured first: beginMissionCleanup below re-records the phase as
 			// MISSION_CLEANUP before the death is finalized (diagnostic).
-			const String phaseAtDeath = getPhaseName();
 			SimHunterTravelDiag::notePhaseAtDeath(strongAgent->getObjectID(),
 				phaseAtDeath);
 			SimPlayerManager::instance()->finishPveHunterBuffTrip(identityId,
@@ -4338,6 +4431,9 @@ void SimHunterController::runActiveTick() {
 	// but bounded so a stuck leg always resolves.
 	case RELOCATING: phaseTimeoutMs = 900000; break;
 	case BUFF_TRIP: phaseTimeoutMs = 900000; break;
+	case BAZAAR_VISIT: phaseTimeoutMs = static_cast<uint64>(
+		SimPlayerManager::instance()->getPlayerBotBazaarVisitTimeoutSeconds()) *
+		1000; break;
 	default: break;
 	}
 	// With travel combat the tick now runs DURING these walks, so their TTL is
@@ -4348,7 +4444,10 @@ void SimHunterController::runActiveTick() {
 		phaseTimeoutMs = 1800000;
 	if (phaseTimeoutMs != 0 && phaseStartedAtMs != 0 &&
 			nowMs - phaseStartedAtMs >= phaseTimeoutMs) {
-		if (phase == RELOCATING || phase == BUFF_TRIP) {
+		if (phase == BAZAAR_VISIT) {
+			finishBazaarVisit("timeout");
+			return;
+		} else if (phase == RELOCATING || phase == BUFF_TRIP) {
 			// Abandon the trip, not the hunter: cancel travel, drop the
 			// relocation/trip record, and let the matchmaker re-dispatch it on
 			// whatever planet it is actually standing on.
@@ -4372,8 +4471,48 @@ void SimHunterController::runActiveTick() {
 		return;
 
 	if (phase == ANNOUNCE_JOB) {
+		if (!strongAgent->isInCombat() && SimPlayerManager::instance()->
+				shouldPlayerBotVisitBazaar(identityId)) {
+			if (beginBazaarVisit(strongAgent, nowMs))
+				return;
+		}
 		beginBuffUp();
 		scheduleActiveTick(500);
+		return;
+	}
+
+	if (phase == BAZAAR_VISIT) {
+		ManagedReference<CreatureObject*> attacker;
+		ManagedReference<AiAgent*> attackerAgent;
+		if ((strongAgent->isInCombat() || recognisesThreatAttackers()) &&
+				selectActiveCombatAttacker(strongAgent, attacker, attackerAgent)) {
+			finishBazaarVisit("newAttacker");
+			return;
+		}
+		if (bazaarTerminal == nullptr) {
+			finishBazaarVisit("pathFailed");
+			return;
+		}
+		Vector3 position = strongAgent->getWorldPosition();
+		if (position.distanceTo2d(bazaarTerminalPosition) <=
+				static_cast<float>(SimPlayerManager::instance()->
+					getPlayerBotBazaarArriveMeters())) {
+			bool listed = SimPlayerManager::instance()->listPlayerBotItemsAtTerminal(
+				identityId, strongAgent->asCreatureObject(), bazaarTerminal);
+			finishBazaarVisit(listed ? "listed" : "listedNone");
+			return;
+		}
+		if (state == MOVING || state == CALCULATING_PATH ||
+				isTraversalActive()) {
+			scheduleActiveTick(1000);
+			return;
+		}
+		const uint64 generationBefore = activeTickGeneration.load(
+			std::memory_order_acquire);
+		moveTo(bazaarTerminalPosition);
+		if (activeTickGeneration.load(std::memory_order_acquire) ==
+				generationBefore)
+			scheduleActiveTick(1000);
 		return;
 	}
 
