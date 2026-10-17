@@ -7,10 +7,11 @@ v0.9.1), **F_0.9.5** (P.10f, v0.9.5, schema 1013 deployed). **F_0.9.6** (P.10g,
 novice early-game loop) is IMPLEMENTED on `feat/p10g-novice-early-game-loop`,
 building warning-clean, and awaiting its live receipt — see §5c for why it was
 inserted ahead of the bazaar work. **F_0.9.10** (P.10k, bazaar BUY) is RELEASED
-as v0.9.12 (2026-10-16). Next chunk after it: **F_0.9.11** (P.10l,
-profession allocation policy).
+as v0.9.12 (2026-10-16). **F_0.9.12** (P.10m, weapon loadout) was inserted next
+on the owner's request and is RELEASED as v0.9.13 (2026-10-17). Next chunk:
+**F_0.9.11** (P.10l, profession allocation policy).
 **Written**: 2026-09-02 (project week 8)
-**Last updated**: 2026-10-16 — F_0.9.10 bazaar BUY released as v0.9.12
+**Last updated**: 2026-10-17 — F_0.9.12 weapon loadout released as v0.9.13
 
 ## 0. Mandate
 
@@ -621,6 +622,15 @@ F_0.9.0 store+dashboard+reaper+harness
 - **Test strategy**: seeded listing → bot buys → store debited by price,
   item in vault + ledger; insufficient credits → skipped; human-listing policy
   predicate asserted; gate-off → zero purchases.
+
+### F_0.9.12 — Weapon loadout (P.10m) — RELEASED as v0.9.13 (2026-10-17)
+
+> Released. See `F_0.9.12_p10m-weapon-loadout.plan.md`. Inserted before F_0.9.11 by the owner once
+> bots could buy and sell. Bots wield the best certified vault weapon of the class their training
+> needs (a transient copy with the item's stats; the item stays in the vault), SELL protects it and
+> the best spare per planned class, and a sub-gate buys clearly better weapons within a share of
+> spendable credits. The reserved `equipped` item state stays unused: the selection is derived.
+> Mid-fight weapon switching is deferred; the stock primary/secondary range swap is the seam.
 
 ### F_0.9.11 — Profession allocation policy (P.10l)
 

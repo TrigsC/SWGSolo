@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.9.13` | 14 | F_0.9.12 P.10m: weapon loadout — roster PlayerBots wield the best certified weapon in their vault for the class their training needs (any class once the plan is complete) as a transient copy with the item's stats, SELL protects the equipped weapon and the best usable spare per planned class, and an optional sub-gate instant-buys a clearly better certified weapon within a share of spendable credits through the debit-first BUY path; no schema change; gates default-off |
 | `0.9.12` | 14 | F_0.9.10 P.10k: bazaar BUY — roster PlayerBots instant-buy their training plan's buy-list items from human, bot and seeded listings at or below loot value x markup (or the entry's maxPrice) while keeping a credit reserve; the debit is made durable before the object store moves, the item goes straight to the vault, sellers are paid through the stock path, and boot recovery refunds or commits from evidence; no schema change; gate default-off |
 | `0.9.11` | 14 | F_0.9.9 P.10j: bazaar SELL — roster PlayerBots walk to an outdoor bazaar terminal and list vault loot on the real bazaar (loot value x markup, never below a human ask, generic junk kept), human buyers collect instantly while the bot's proceeds settle within seconds through ledger receipts and an applied mark (schema 1016), with relist at the same price, kill-switch drain and boot recovery; gate default-off |
 | `0.9.10` | 14 | F_0.9.3 P.10d: loot from kills and the hive item vault — a roster PlayerBot's kill gets stock loot and cash, the bot walks to the corpse (even mid travel leg) and loots it: cash into its store, items into its own bag in a persistent vault with one simbot_items row each (schema 1015), boot reconciliation and teardown on deletion; gate default-off |
@@ -31,6 +32,11 @@
 
 # Changelog Summary
 
+- **v0.9.13 (Weapon loadout, F_0.9.12 P.10m - Week 14, 17-10-2026)**:
+  - **Bots use what they own.** A roster bot wields the best weapon in its vault that its trained boxes certify it for, of the class its next training box needs (any class once its plan is complete). The body carries a copy with the item's real stats; the item never leaves the vault, so a death cannot lose it. A 10 % margin prevents flip-flopping, and no weapon changes mid-fight.
+  - **Kept, not sold.** SELL never lists the equipped weapon or the best usable spare per planned class, and the buy-list keep counts that weapon first, so no duplicates pile up.
+  - **Upgrades on the bazaar.** Behind its own sub-gate, a bot instant-buys a certified weapon at least 10 % better, paying at most half its credits above the reserve, through the existing debit-first BUY path.
+  - **Verified live.** 34 of 34: all 14 loadout scenarios with the SELL and BUY regressions, and in production bot 274 equipped its vault Vibro Knuckler (130–280) within 41 s of arming and its next kill paid unarmed XP. Live runs found and fixed two product defects (a duplicate kept by two keep rules; hunting bots never re-equipping). Both gates ship off.
 - **v0.9.12 (Bazaar BUY, F_0.9.10 P.10k - Week 14, 16-10-2026)**:
   - **Bots buy what their plan needs.** Each training plan can list item templates with a quantity. At its bazaar visit a roster bot instant-buys the cheapest matching listing on the planet, from a player, another bot or the Market Seeder, at or below loot value x markup (or the entry's `maxPrice`), and always keeps a credit reserve. Needed items are never resold.
   - **Debit first, then deliver.** The bot's debit is made durable before the object store moves; the item then goes straight into its vault bag and the seller is paid through the stock path. Boot recovery refunds or commits from evidence (the auction still listed, an item receipt, or the object in the bag). No schema change.

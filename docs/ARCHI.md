@@ -241,6 +241,9 @@ no new warnings before handing work back** (owner-stated standard).
   (`reserveCredits` 5,000, `maxPurchasesPerVisit`, `maxPendingPerBot`, `candidateScanLimit` per need,
   `maxObjectLoadsPerVisit`, `executeTimeoutSeconds`) and an optional per-training-plan `buyList`
   (`template`, `quantity` 1..5, `maxPrice`; at most 8 entries; shipped empty).
+  F_0.9.12 (v0.9.13) adds `playerBotProgression.weaponLoadout` (default off) and the `loadout` block
+  (`minUpgradePercent` 10, `fullSweepMinutes`, the `bazaarUpgrades` sub-gate, `upgradeSpendFraction`
+  0.5, `upgradeScanIntervalMinutes`, `maxUpgradeLoadsPerVisit`).
   **The running server re-reads this file from disk on its own**: a syntax error in
   the working copy is hit live within seconds (it keeps the previous config), so
   `luac -p` any edit immediately.
@@ -1069,6 +1072,22 @@ This is this fork's primary custom subsystem, layered on top of the stock
     - a harness baseline taken after boot misses production work done at boot.
   - **Live receipt:** 32/32 (`docs/4-unit-tests/live_f0910-*`), plus the owner's in-client sale to
     a bot.
+- **Weapon loadout (P.10m / F_0.9.12, released v0.9.13)**: bots use what they own.
+  - **Selection is derived, never stored.** `selectPlayerBotLoadout` (pure policy `SimBotLoadout.h`)
+    picks the best certified vault weapon (certs = `cert_*` abilities of trained boxes; stock combat
+    never checks an AiAgent) of the next box's XP type, any class once `templateComplete`, with a
+    10 % margin over the current weapon, else the starter. The body gets a transient copy with the
+    item's stats; the item stays `held`, so a death cannot lose it.
+  - **Reconcile** runs on the slow tick for dirty identities (loot, purchase, training, item
+    reconcile) plus a periodic full sweep, for every activity: hunting bots were the missed case. A
+    weapon never changes mid-fight. The gate requires the early-game gate it refines.
+  - **SELL** never lists the equipped weapon or the best usable spare per planned class; the
+    buy-list keep counts that weapon first. **Upgrades** (sub-gate) reuse the F_0.9.10 debit-first
+    BUY path, buy-list purchases first, at most one pending.
+  - **Seam for later:** the stock tree already swaps primary/secondary by range
+    (`EquipStagedWeapon`); loadout bodies set no secondary.
+  - **Live receipt:** 34/34 (`docs/4-unit-tests/live_f0912-*`); bot 274 equipped its vault knuckler
+    and its kill paid unarmed XP.
 - **Simulation-only by default, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line

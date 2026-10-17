@@ -32,6 +32,7 @@
 #include "server/zone/objects/creature/simplayer/SimEarlyGameDeathLog.h"
 #include "server/zone/objects/creature/simplayer/SimBotAbilityUsageLog.h"
 #include "server/zone/objects/creature/simplayer/SimBotMissionPlacement.h"
+#include "server/zone/objects/creature/simplayer/SimBotLoadout.h"
 
 using namespace server::zone;
 
@@ -441,6 +442,8 @@ struct SimBotEarlyGameState {
 	uint64 defensiveEngagements = 0;
 	uint64 defensiveFlees = 0;
 	String currentWeaponXpType;
+	uint64 currentLoadoutSourceOid = 0;
+	bool templateComplete = false;
 	Vector<String> stalledBoxes;
 	uint64 kills = 0;
 	uint64 deaths = 0;
@@ -491,6 +494,25 @@ struct SimBotEarlyGameState {
 	// The last in-combat sample, and the captured death line.
 	String combatLastFight;
 	String combatLastDeath;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct SimBotLoadoutHarnessOptIn {
+	String desiredXpType;
+	bool templateComplete = false;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct SimBotCertificationCache {
+	int trainedSkillCount = 0;
+	String planSignature;
+	Vector<String> held;
+	Vector<String> planned;
+	bool valid = false;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -708,6 +730,10 @@ struct SimBotBazaarListingTemplate {
 	uint32 templateCrc = 0;
 	int gameObjectType = 0;
 	int junkValue = 0;
+	bool isWeapon = false;
+	String xpType;
+	float score = 0.f;
+	Vector<String> certificationsRequired;
 	uint64 lastUsedAtMs = 0;
 };
 
@@ -740,6 +766,7 @@ struct PlayerBotParityTestStep {
 	bool ownerIsBag = false;
 	bool hasOwnerIsBag = false;
 	String ownerName;
+	String ref;
 	int difficultyLevel = 1;
 	int missions = 1;
 	int feeCredits = 0;
@@ -797,6 +824,12 @@ struct PlayerBotParityTestStep {
 	int expectedMaxDamage = -1;
 	bool hasExpectedMinDamage = false;
 	bool hasExpectedMaxDamage = false;
+	float attackSpeed = 0.f;
+	bool hasAttackSpeed = false;
+	bool loadoutTemplateComplete = false;
+	bool hasLoadoutTemplateComplete = false;
+	Vector<String> certificationOverride;
+	bool hasCertificationOverride = false;
 	bool expectedGraduated = false;
 	bool hasExpectedGraduated = false;
 	String command;
@@ -2512,6 +2545,11 @@ private:
 	VectorMap<uint64, bool> progressionRetiringIds;
 	Vector<uint64> progressionOrphanIds;
 	VectorMap<uint64, SimBotEarlyGameState> progressionEarlyGameStates;
+	VectorMap<uint64, SimBotLoadout::LoadoutChoice> progressionLoadoutChoices;
+	VectorMap<uint64, SimBotCertificationCache> progressionCertificationCache;
+	VectorMap<uint64, bool> progressionLoadoutDirtyIds;
+	uint64 progressionLoadoutLastFullSweepMs = 0;
+	VectorMap<uint64, uint64> progressionBazaarUpgradeScanAtMs;
 	bool progressionEnabled = false;
 	bool progressionAwardKillXp = false;
 	bool progressionAwardMissionCredits = false;
@@ -2529,6 +2567,13 @@ private:
 	int progressionLootStepTimeoutSeconds = 90;
 	bool progressionLairTacticsEnabled = false;
 	bool progressionEarlyGameRealWeaponDamage = false;
+	bool progressionWeaponLoadout = false;
+	bool progressionBazaarUpgrades = false;
+	float progressionLoadoutMinUpgradePercent = 10.f;
+	int progressionLoadoutFullSweepMinutes = 30;
+	float progressionLoadoutUpgradeSpendFraction = 0.5f;
+	int progressionLoadoutUpgradeScanIntervalMinutes = 60;
+	int progressionLoadoutMaxUpgradeLoadsPerVisit = 8;
 	float progressionKillXpRate = 1.0f;
 	SimBotEarlyGameConfig progressionEarlyGameConfig;
 	SimBotCombatAbilityConfig progressionCombatAbilityConfig;
@@ -2660,9 +2705,23 @@ private:
 	AtomicLong bazaarBuySkippedPriceChanged;
 	AtomicLong bazaarBuySkippedTransferFailed;
 	AtomicLong bazaarBuySkippedTimeout;
+	AtomicLong bazaarBuyUpgradesDebited;
+	AtomicLong bazaarBuyUpgradesSkippedNotBetter;
+	AtomicLong bazaarBuyUpgradesSkippedUncertified;
+	AtomicLong bazaarBuyUpgradesSkippedOverBudget;
+	AtomicLong bazaarBuyUpgradesSkippedUnaffordable;
 	AtomicLong bazaarBuyReconcileCommitted;
 	AtomicLong bazaarBuyReconcileRefunded;
 	AtomicLong bazaarSkippedNeeded;
+	AtomicLong bazaarSkippedLoadout;
+	AtomicLong loadoutSelections;
+	AtomicLong loadoutVaultEquips;
+	AtomicLong loadoutStarterFallbacks;
+	AtomicLong loadoutSkippedUncertified;
+	AtomicLong loadoutSkippedWrongClass;
+	AtomicLong loadoutHysteresisHolds;
+	AtomicLong loadoutReequipsDeferredInCombat;
+	AtomicLong loadoutSellProtected;
 	AtomicLong bazaarVisitsBegun;
 	AtomicLong bazaarVisitsListedAny;
 	AtomicLong bazaarVisitsBought;
@@ -2823,6 +2882,16 @@ private:
 	bool playerBotParityTestProgressionEnabledOverridePrevious = true;
 	bool playerBotParityTestGateOverrideActive = false;
 	bool playerBotParityTestGateOverride = true;
+	bool playerBotParityTestLoadoutGateOverrideActive = false;
+	bool playerBotParityTestLoadoutGateOverride = false;
+	VectorMap<uint64, bool> playerBotParityLoadoutGateScopedIds;
+	VectorMap<uint64, bool> playerBotParityLoadoutGateValues;
+	VectorMap<uint64, bool> playerBotParityBazaarUpgradesGateScopedIds;
+	VectorMap<uint64, bool> playerBotParityBazaarUpgradesGateValues;
+	VectorMap<uint64, SimBotLoadoutHarnessOptIn>
+		playerBotParityLoadoutHarnessOptIns;
+	VectorMap<uint64, Vector<String> > playerBotParityLoadoutCertOverrides;
+	VectorMap<String, uint64> playerBotParityLoadoutWeaponRefs;
 	bool playerBotParityTestTrainingGateOverrideActive = false;
 	bool playerBotParityTestTrainingGateOverride = false;
 	bool playerBotParityTestTrainingGateOverridePreviousActive = false;
@@ -3281,10 +3350,36 @@ private:
 	// early-game weapon mapping was applicable.
 	bool equipPlayerBotWeaponLocked(AiAgent* agent,
 		const String& weaponTemplate, const String& expectedXpType,
-		bool restoreRealWeaponDamage, bool forceEquip = false);
+		bool restoreRealWeaponDamage, bool forceEquip = false,
+		const SimBotLoadout::WeaponStats* itemStats = nullptr);
 	void restorePlayerBotWeaponTemplateStats(WeaponObject* weapon);
 	bool selectPlayerBotEarlyGameWeapon(const SimBotIdentity& identity,
 		String& weaponTemplate, String& expectedXpType);
+	// preview: ignore the capability gate and record nothing (no stored
+	// choice, counters or diag event). Used by inspect before arming.
+	bool selectPlayerBotLoadout(const SimBotIdentity& identity,
+		SimBotLoadout::LoadoutChoice& out, bool preview = false);
+	void collectPlayerBotCertificationsLocked(uint64 identityId,
+		const SimBotTrainingPlan& plan, Vector<String>& held,
+		Vector<String>& planned,
+		const Vector<String>* certsOverride = nullptr);
+	bool snapshotPlayerBotLoadoutHarnessOptIn(uint64 identityId,
+		SimBotLoadoutHarnessOptIn& optIn);
+	bool snapshotPlayerBotCertificationOverride(uint64 identityId,
+		Vector<String>& certs);
+	void fillPlayerBotWeaponStats(WeaponObject* weapon,
+		SimBotLoadout::WeaponStats& stats);
+	void fillPlayerBotStarterStats(const String& weaponTemplate,
+		SimBotLoadout::WeaponStats& stats);
+	// Equipped weapon plus the best usable weapon per planned class; empty
+	// while the loadout gate is closed. Takes manager mutexes and item locks
+	// one at a time, so callers must hold none.
+	void collectPlayerBotProtectedWeaponOids(uint64 identityId,
+		VectorMap<uint64, bool>& protectedIds);
+	bool snapshotPlayerBotLoadoutCandidates(uint64 identityId,
+		Vector<SimBotLoadout::WeaponStats>& candidates,
+		Vector<String>& certsHeld, Vector<String>& certsPlanned,
+		Vector<String>& planXpTypes);
 	void reapplyPlayerBotProgressionToLiveBody(uint64 identityId);
 	void applyPlayerBotParityTestConfig(LuaObject& config);
 	void loadPveIdentityRoster();
@@ -3405,6 +3500,8 @@ private:
 	bool awardToNonRosterPlayerBotBody(uint64 identityId, const String& xpType,
 		int amount, const String& source);
 	bool playerBotProgressionAwardGateEnabled();
+	bool playerBotLoadoutGateEnabled(uint64 identityId);
+	bool playerBotBazaarUpgradesGateEnabled(uint64 identityId);
 	bool playerBotBazaarSellGateEnabled(uint64 identityId);
 	bool playerBotBazaarBuyGateEnabled(uint64 identityId);
 	int playerBotUnmetBuyNeeds(uint64 identityId);

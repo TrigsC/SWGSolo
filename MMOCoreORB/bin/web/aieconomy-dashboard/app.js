@@ -343,6 +343,10 @@
     const next = data.nextBox || {};
     const listings = Array.isArray(data.listings) ? data.listings : [];
     const purchases = Array.isArray(data.purchases) ? data.purchases : [];
+    const loadout = data.loadout || {};
+    const loadoutProtected = Array.isArray(loadout.protected) ? loadout.protected : [];
+    const loadoutCandidates = Array.isArray(loadout.candidates) ? loadout.candidates : [];
+    const protectedByOid = new Map(loadoutProtected.map((item) => [String(item.oid), item]));
     const source = templates.attackSource === "skill" ? "trained skills" : "body template";
     const itemRows = items.map((item) => {
       const stats = item.stats || {};
@@ -368,6 +372,31 @@
       <td>${esc(purchase.debitedAt || "—")}</td>
       <td>${esc(purchase.closedAt || "—")}</td>
     </tr>`).join("");
+    const loadoutCandidateRows = loadoutCandidates.map((candidate) => {
+      const protectedItem = protectedByOid.get(String(candidate.oid));
+      return `<tr>
+        <td class="t-num">${esc(candidate.oid || "—")}</td>
+        <td>${esc(candidate.template || "unknown")}</td>
+        <td>${esc(candidate.xpType || "unknown")}</td>
+        <td class="t-num">${num(candidate.dps)}</td>
+        <td>${chip(candidate.certified ? "yes" : "no", candidate.certified ? "ok" : "ghost")}</td>
+        <td>${protectedItem ? chip(labelize(protectedItem.reason || "protected"), "teal") : "—"}</td>
+      </tr>`;
+    }).join("");
+    const loadoutCurrentRow = loadout.source ? `<tr>
+      <td>${chip(labelize(loadout.source), loadout.source === "vault" ? "ok" : "ghost")}</td>
+      <td class="t-num">${esc(loadout.sourceOid || "—")}</td>
+      <td>${esc(loadout.template || "unarmed")}</td>
+      <td>${esc(loadout.xpType || "unknown")}</td>
+      <td class="t-num">${num(loadout.dps)}</td>
+      <td>${esc(loadout.desiredXpType || "any")}</td>
+      <td>${yesno(loadout.templateComplete)}</td>
+      <td class="t-num">${num(loadoutProtected.length)}</td>
+      <td class="t-num">${num(loadoutCandidates.length)}</td>
+    </tr>` : "";
+    const loadoutCurrent = loadoutCurrentRow
+      ? table(["Source", "Source OID", "Template", "XP Type", "DPS", "Desired XP Type", "Complete", "Protected", "Candidates"], loadoutCurrentRow, { scrollKey: "playerbot-loadout-summary" })
+      : `<span class="muted small">No loadout choice recorded.</span>`;
 
     return `<div class="playerbot-card"><h3>WHO</h3><p class="playerbot-lead">${esc(identity.name || "Unnamed SimBot")}</p>
       ${kvRows([["Profession", esc(labelize(identity.profession || "unknown"))], ["Home", esc(home)], ["Tier", num(identity.skillTier)], ["Kills / deaths", `${num(identity.kills)} / ${num(identity.deaths)}`], ["Activity", esc(labelize(activity))], ["Body", body.attached ? `attached · ${esc(body.zone || "unknown")}` : "not attached"], ["Lair members alive", num(body.lairMembersAlive)], ["Non-member engagements", num(body.nonMemberEngagements)]])}</div>
@@ -385,6 +414,7 @@
       <div class="playerbot-card"><h3>ITEMS (${num(data.itemsHeld)})</h3>${table(["OID", "Item", "State", "Source", "Acquired"], itemRows, { scrollKey: "playerbot-items", tall: true })}</div>
       <div class="playerbot-card"><h3>LISTINGS (${num(listings.length)})</h3>${table(["OID", "Item", "State", "Price", "Listed", "Closed", "Released", "Buyer"], listingRows, { scrollKey: "playerbot-listings", tall: true })}</div>
       <div class="playerbot-card"><h3>PURCHASES (${num(purchases.length)})</h3>${table(["Auction", "Template", "State", "Seller", "Price", "Debited", "Closed"], purchaseRows, { scrollKey: "playerbot-purchases", tall: true })}</div>
+      <div class="playerbot-card"><h3>LOADOUT</h3>${loadoutCurrent}<p class="playerbot-label">WEAPON CANDIDATES (${num(loadoutCandidates.length)}) · PROTECTED ${num(loadoutProtected.length)}</p>${table(["OID", "Template", "XP Type", "DPS", "Certified", "Protected"], loadoutCandidateRows, { scrollKey: "playerbot-loadout", tall: true })}</div>
       <div class="playerbot-card"><h3>SKILL MODS</h3>${modRows ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Mod</th><th>Base</th><th>Trained</th><th>Effective</th></tr></thead><tbody>${modRows}</tbody></table></div>` : `<span class="muted small">No live skill mods.</span>`}</div>`;
   }
 
@@ -1242,6 +1272,8 @@
     const bazaarSkipped = bazaar.skipped || {};
     const bazaarVisits = bazaar.visits || {};
     const bazaarReconcile = bazaar.reconcile || {};
+    const loadout = progression.loadout || {};
+    const loadoutUpgrades = loadout.upgrades || (bazaar.buy || {}).upgrades || {};
     const vault = progression.vault || {};
     const ledger = progression.ledger || {};
     const trainingGate = progression.gates && progression.gates.trainingEnabled === true;
@@ -1410,6 +1442,19 @@
             ["Buy reconcile", `${num((bazaarBuy.reconcile || {}).committed)} committed · ${num((bazaarBuy.reconcile || {}).refunded)} refunded`],
             ["Settlement", `${num(bazaar.saleUnresolved)} unresolved · ${num(bazaar.saleBacklogOverflow)} backlog overflow · ${num(bazaar.releaseBuyerGone)} buyer gone · ${num(bazaar.deleteBlockedByListing)} delete blocked`],
             ["Reconcile", `${num(bazaarReconcile.adopted)} adopted · ${num(bazaarReconcile.settled)} settled · ${num(bazaarReconcile.reversed)} reversed · ${num(bazaarReconcile.retrieved)} retrieved · ${num(bazaarReconcile.orphaned)} orphaned · ${num(bazaarReconcile.adoptedTaxEstimated)} tax estimated · ${num(bazaarReconcile.releasedRepaired)} releases repaired`]
+          ])}`, "span-12")}
+          <div class="section-gap"></div>
+          ${panel("LOADOUT", `${chip(loadout.configured ? "configured" : "config off", loadout.configured ? "ok" : "ghost")} ${chip(loadout.enabled ? "gate on" : "gate off", loadout.enabled ? "ok" : "ghost")}`, `<div class="metric-row">
+            ${metric("Selections", loadout.selections)}
+            ${metric("Vault Equips", loadout.vaultEquips, { tone: "accent" })}
+            ${metric("Starter Fallbacks", loadout.starterFallbacks)}
+            ${metric("Hysteresis Holds", loadout.hysteresisHolds)}
+            ${metric("Protected for SELL", loadout.sellProtected)}
+            ${metric("Upgrade Debited", loadoutUpgrades.debited, { tone: "accent" })}
+          </div>${kvRows([
+            ["Selection skips", `${num(loadout.skippedUncertified)} uncertified · ${num(loadout.skippedWrongClass)} wrong class · ${num(loadout.reequipsDeferredInCombat)} deferred in combat`],
+            ["Upgrade skips", `${num(loadoutUpgrades.skippedNotBetter)} not better · ${num(loadoutUpgrades.skippedUncertified)} uncertified · ${num(loadoutUpgrades.skippedOverBudget)} over budget · ${num(loadoutUpgrades.skippedUnaffordable)} unaffordable`],
+            ["Upgrade policy", `${num(loadout.minUpgradePercent)}% minimum · ${num(loadout.upgradeSpendFraction)} spend fraction · scan every ${num(loadout.upgradeScanIntervalMinutes)}m · ${num(loadout.maxUpgradeLoadsPerVisit)} loads/visit`]
           ])}`, "span-12")}
           <div class="section-gap"></div>
           ${kvRows([

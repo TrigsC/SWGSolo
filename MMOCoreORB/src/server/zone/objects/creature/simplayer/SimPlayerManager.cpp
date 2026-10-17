@@ -19,6 +19,7 @@
 #include "SimBotLootStep.h"
 #include "SimBotItemReconcile.h"
 #include "SimBotBazaar.h"
+#include "SimBotLoadout.h"
 #include "MissionDiagLog.h"
 
 #include <algorithm>
@@ -6293,6 +6294,13 @@ void SimPlayerManager::loadLuaConfig() {
 	progressionCombatAbilitiesEnabled = false;
 	progressionLairTacticsEnabled = false;
 	progressionEarlyGameRealWeaponDamage = false;
+	progressionWeaponLoadout = false;
+	progressionBazaarUpgrades = false;
+	progressionLoadoutMinUpgradePercent = 10.f;
+	progressionLoadoutFullSweepMinutes = 30;
+	progressionLoadoutUpgradeSpendFraction = 0.5f;
+	progressionLoadoutUpgradeScanIntervalMinutes = 60;
+	progressionLoadoutMaxUpgradeLoadsPerVisit = 8;
 	progressionKillXpRate = 1.0f;
 	progressionEarlyGameConfig = SimBotEarlyGameConfig();
 	SimEarlyGameDeathLog::setEnabled(false);
@@ -6300,6 +6308,11 @@ void SimPlayerManager::loadLuaConfig() {
 	{
 		Locker progressionLock(&progressionMutex);
 		progressionEarlyGameStates.removeAll();
+		progressionLoadoutChoices.removeAll();
+		progressionCertificationCache.removeAll();
+		progressionLoadoutDirtyIds.removeAll();
+		progressionLoadoutLastFullSweepMs = 0;
+		progressionBazaarUpgradeScanAtMs.removeAll();
 	}
 	progressionReaperEnabled = false;
 	progressionReaperMinAgeSeconds = 3600;
@@ -6343,6 +6356,11 @@ void SimPlayerManager::loadLuaConfig() {
 		progressionTrainingPlanSignature = "";
 		progressionTrainingNextSteps.removeAll();
 		progressionTrainingPendingIds.removeAll();
+		progressionLoadoutChoices.removeAll();
+		progressionCertificationCache.removeAll();
+		progressionLoadoutDirtyIds.removeAll();
+		progressionLoadoutLastFullSweepMs = 0;
+		progressionBazaarUpgradeScanAtMs.removeAll();
 		trainingSweepCursor = 0;
 		trainingLastSkill = "";
 	}
@@ -6386,6 +6404,14 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityBazaarSellGateScopedIds.removeAll();
 		playerBotParityTestBazaarBuyGateOverrideActive = false;
 		playerBotParityBazaarBuyGateScopedIds.removeAll();
+		playerBotParityTestLoadoutGateOverrideActive = false;
+		playerBotParityLoadoutGateScopedIds.removeAll();
+		playerBotParityLoadoutGateValues.removeAll();
+		playerBotParityBazaarUpgradesGateScopedIds.removeAll();
+		playerBotParityBazaarUpgradesGateValues.removeAll();
+		playerBotParityLoadoutHarnessOptIns.removeAll();
+		playerBotParityLoadoutCertOverrides.removeAll();
+		playerBotParityLoadoutWeaponRefs.removeAll();
 		playerBotParityBazaarBuyListOverrides.removeAll();
 		playerBotParityTestBazaarMarkupOverrideActive = false;
 		playerBotParityTestBazaarMarkupOverridePrevious = 3.0f;
@@ -8622,6 +8648,385 @@ bool SimPlayerManager::selectPlayerBotEarlyGameWeapon(
 	return true;
 }
 
+bool SimPlayerManager::snapshotPlayerBotLoadoutHarnessOptIn(uint64 identityId,
+		SimBotLoadoutHarnessOptIn& optIn) {
+	Locker parityLock(&playerBotParityTestMutex);
+	if (!playerBotParityLoadoutHarnessOptIns.contains(identityId))
+		return false;
+	optIn = playerBotParityLoadoutHarnessOptIns.get(identityId);
+	return true;
+}
+
+bool SimPlayerManager::snapshotPlayerBotCertificationOverride(uint64 identityId,
+		Vector<String>& certs) {
+	certs.removeAll();
+	Locker parityLock(&playerBotParityTestMutex);
+	if (!playerBotParityLoadoutCertOverrides.contains(identityId))
+		return false;
+	certs = playerBotParityLoadoutCertOverrides.get(identityId);
+	return true;
+}
+
+void SimPlayerManager::collectPlayerBotCertificationsLocked(uint64 identityId,
+		const SimBotTrainingPlan& plan, Vector<String>& held,
+		Vector<String>& planned, const Vector<String>* certsOverride) {
+	held.removeAll();
+	planned.removeAll();
+	if (!progressionRecords.contains(identityId))
+		return;
+	if (certsOverride != nullptr) {
+		held = *certsOverride;
+		planned = *certsOverride;
+		return;
+	}
+
+	const SimBotProgression& progression = progressionRecords.get(identityId);
+	const int trainedSkillCount = progression.skills.size();
+	const String cacheSignature = progressionTrainingPlanSignature + "|" +
+		plan.name;
+	if (progressionCertificationCache.contains(identityId)) {
+		const SimBotCertificationCache& cache =
+			progressionCertificationCache.get(identityId);
+		if (cache.valid && cache.trainedSkillCount == trainedSkillCount &&
+				cache.planSignature == cacheSignature) {
+			held = cache.held;
+			planned = cache.planned;
+			return;
+		}
+	}
+
+	SkillManager* skillManager = SkillManager::instance();
+	auto collect = [&](const String& skillName, Vector<String>& destination) {
+		if (skillManager == nullptr)
+			return;
+		Skill* skill = skillManager->getSkill(skillName);
+		if (skill == nullptr || skill->getAbilities() == nullptr)
+			return;
+		const Vector<String>* abilities = skill->getAbilities();
+		for (int i = 0; i < abilities->size(); ++i) {
+			const String& ability = abilities->get(i);
+			if (ability.indexOf("cert_") == 0 && !destination.contains(ability))
+				destination.add(ability);
+		}
+	};
+	for (int i = 0; i < progression.skills.size(); ++i)
+		collect(progression.skills.get(i), held);
+	for (int i = 0; i < plan.orderedSkills.size(); ++i)
+		collect(plan.orderedSkills.get(i), planned);
+
+	SimBotCertificationCache cache;
+	cache.trainedSkillCount = trainedSkillCount;
+	cache.planSignature = cacheSignature;
+	cache.held = held;
+	cache.planned = planned;
+	cache.valid = true;
+	progressionCertificationCache.put(identityId, cache);
+}
+
+void SimPlayerManager::fillPlayerBotWeaponStats(WeaponObject* weapon,
+		SimBotLoadout::WeaponStats& stats) {
+	stats = SimBotLoadout::WeaponStats();
+	if (weapon == nullptr)
+		return;
+	stats.objectId = weapon->getObjectID();
+	stats.templateCrc = weapon->getServerObjectCRC();
+	stats.templateString = weapon->getObjectTemplate() == nullptr ? String() :
+		weapon->getObjectTemplate()->getFullTemplateString();
+	stats.xpType = weapon->getXpType();
+	stats.gameObjectType = weapon->getGameObjectType();
+	stats.minDamage = weapon->getMinDamage(false);
+	stats.maxDamage = weapon->getMaxDamage(false);
+	stats.attackSpeed = weapon->getAttackSpeed(false);
+	stats.woundsRatio = weapon->getWoundsRatio(false);
+	stats.pointBlankAccuracy = weapon->getPointBlankAccuracy(false);
+	stats.idealAccuracy = weapon->getIdealAccuracy(false);
+	stats.maxRangeAccuracy = weapon->getMaxRangeAccuracy(false);
+	stats.pointBlankRange = weapon->getPointBlankRange(false);
+	stats.idealRange = weapon->getIdealRange(false);
+	stats.maxRange = weapon->getMaxRange(false);
+	stats.healthAttackCost = weapon->getHealthAttackCost(false);
+	stats.actionAttackCost = weapon->getActionAttackCost(false);
+	stats.mindAttackCost = weapon->getMindAttackCost(false);
+	SharedWeaponObjectTemplate* weaponTemplate = cast<
+		SharedWeaponObjectTemplate*>(weapon->getObjectTemplate());
+	if (weaponTemplate != nullptr && weaponTemplate->getCertificationsRequired() != nullptr)
+		stats.certificationsRequired = *weaponTemplate->getCertificationsRequired();
+}
+
+void SimPlayerManager::fillPlayerBotStarterStats(const String& weaponTemplate,
+		SimBotLoadout::WeaponStats& stats) {
+	stats = SimBotLoadout::WeaponStats();
+	// An empty starter means the stock unarmed weapon. Its stats come from the
+	// default template, but templateString stays empty so the equip path keeps
+	// using the body's stock weapon exactly as before.
+	String templateString = weaponTemplate;
+	if (templateString.isEmpty())
+		templateString = "object/weapon/creature/creature_default_weapon.iff";
+	SharedObjectTemplate* objectTemplate = TemplateManager::instance() == nullptr ?
+		nullptr : TemplateManager::instance()->getTemplate(templateString.hashCode());
+	SharedWeaponObjectTemplate* weaponTemplateData = cast<
+		SharedWeaponObjectTemplate*>(objectTemplate);
+	if (weaponTemplateData == nullptr)
+		return;
+	stats.templateString = weaponTemplate;
+	stats.templateCrc = templateString.hashCode();
+	stats.xpType = weaponTemplateData->getXpType();
+	stats.gameObjectType = weaponTemplateData->getGameObjectType();
+	stats.minDamage = weaponTemplateData->getMinDamage();
+	stats.maxDamage = weaponTemplateData->getMaxDamage();
+	stats.attackSpeed = weaponTemplateData->getAttackSpeed();
+	stats.woundsRatio = weaponTemplateData->getWoundsRatio();
+	stats.pointBlankAccuracy = weaponTemplateData->getPointBlankAccuracy();
+	stats.idealAccuracy = weaponTemplateData->getIdealAccuracy();
+	stats.maxRangeAccuracy = weaponTemplateData->getMaxRangeAccuracy();
+	stats.pointBlankRange = weaponTemplateData->getPointBlankRange();
+	stats.idealRange = weaponTemplateData->getIdealRange();
+	stats.maxRange = weaponTemplateData->getMaxRange();
+	stats.healthAttackCost = weaponTemplateData->getHealthAttackCost();
+	stats.actionAttackCost = weaponTemplateData->getActionAttackCost();
+	stats.mindAttackCost = weaponTemplateData->getMindAttackCost();
+	if (weaponTemplateData->getCertificationsRequired() != nullptr)
+		stats.certificationsRequired = *weaponTemplateData->getCertificationsRequired();
+}
+
+bool SimPlayerManager::snapshotPlayerBotLoadoutCandidates(uint64 identityId,
+		Vector<SimBotLoadout::WeaponStats>& candidates,
+		Vector<String>& certsHeld, Vector<String>& certsPlanned,
+		Vector<String>& planXpTypes) {
+	candidates.removeAll();
+	certsHeld.removeAll();
+	certsPlanned.removeAll();
+	planXpTypes.removeAll();
+	String trainingPlanName;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveIdentities.contains(identityId))
+			return false;
+		trainingPlanName = pveIdentities.get(identityId).trainingPlan;
+	}
+	if (trainingPlanName.isEmpty())
+		return false;
+
+	Vector<String> certOverride;
+	const bool hasCertOverride =
+		snapshotPlayerBotCertificationOverride(identityId, certOverride);
+	VectorMap<uint64, bool> heldObjectIds;
+	SimBotTrainingPlan plan;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (!progressionRecords.contains(identityId) ||
+				!progressionTrainingPlans.contains(trainingPlanName))
+			return false;
+		plan = progressionTrainingPlans.get(trainingPlanName);
+		collectPlayerBotCertificationsLocked(identityId, plan, certsHeld,
+			certsPlanned, hasCertOverride ? &certOverride : nullptr);
+		SkillManager* skillManager = SkillManager::instance();
+		for (int i = 0; i < plan.orderedSkills.size(); ++i) {
+			Skill* skill = skillManager == nullptr ? nullptr :
+				skillManager->getSkill(plan.orderedSkills.get(i));
+			if (skill != nullptr && !planXpTypes.contains(skill->getXpType()))
+				planXpTypes.add(skill->getXpType());
+		}
+		for (int i = 0; i < progressionItems.size(); ++i) {
+			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+			if (row.identityId == identityId && row.state == SIMBOT_ITEM_HELD)
+				heldObjectIds.put(row.objectId, true);
+		}
+	}
+
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+		economyManager->getItemBag(identityId);
+	if (bag == nullptr)
+		return true;
+	Vector<ManagedReference<SceneObject*> > children;
+	{
+		Locker bagLock(bag);
+		for (int i = 0; i < bag->getContainerObjectsSize(); ++i)
+			children.add(bag->getContainerObject(i));
+	}
+	for (int i = 0; i < children.size(); ++i) {
+		SceneObject* object = static_cast<SceneObject*>(children.get(i));
+		if (object == nullptr || !heldObjectIds.contains(object->getObjectID()) ||
+				!object->isWeaponObject())
+			continue;
+		WeaponObject* weapon = cast<WeaponObject*>(object);
+		if (weapon == nullptr)
+			continue;
+		Locker objectLock(object);
+		SimBotLoadout::WeaponStats stats;
+		fillPlayerBotWeaponStats(weapon, stats);
+		candidates.add(stats);
+	}
+	return true;
+}
+
+bool SimPlayerManager::selectPlayerBotLoadout(const SimBotIdentity& identity,
+		SimBotLoadout::LoadoutChoice& out, bool preview) {
+	// Snapshot the harness-only source before touching progressionMutex. The
+	// profession check prevents a stale harness entry from changing production.
+	SimBotLoadoutHarnessOptIn harnessOptIn;
+	const bool harnessOptedIn = identity.profession == "harness" &&
+		snapshotPlayerBotLoadoutHarnessOptIn(identity.id, harnessOptIn);
+	// This branch intentionally remains the first operation: the default-off
+	// path is today's early-game selector, including its completed-plan and
+	// harness behavior.
+	if (!preview && !playerBotLoadoutGateEnabled(identity.id)) {
+		String weaponTemplate;
+		String expectedXpType;
+		if (!selectPlayerBotEarlyGameWeapon(identity, weaponTemplate,
+				expectedXpType))
+			return false;
+		fillPlayerBotStarterStats(weaponTemplate, out.stats);
+		out.source = SimBotLoadout::STARTER;
+		out.objectId = 0;
+		out.score = SimBotLoadout::scoreWeapon(out.stats);
+		out.desiredXpType = expectedXpType;
+		out.templateComplete = false;
+		return true;
+	}
+
+	bool templateComplete = false;
+	uint64 currentSourceOid = 0;
+	String currentXpType;
+	String desiredXpType;
+	String starterTemplate;
+	SimBotTrainingPlan plan;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (!progressionTrainingPlans.contains(identity.trainingPlan))
+			return false;
+		plan = progressionTrainingPlans.get(identity.trainingPlan);
+		if (progressionEarlyGameStates.contains(identity.id)) {
+			const SimBotEarlyGameState& state =
+				progressionEarlyGameStates.get(identity.id);
+			templateComplete = state.templateComplete;
+			currentSourceOid = state.currentLoadoutSourceOid;
+			currentXpType = state.currentWeaponXpType;
+		}
+		if (harnessOptedIn && progressionLoadoutChoices.contains(identity.id)) {
+			const SimBotLoadout::LoadoutChoice& previous =
+				progressionLoadoutChoices.get(identity.id);
+			currentSourceOid = previous.objectId;
+			currentXpType = previous.stats.xpType;
+		}
+		if (harnessOptedIn) {
+			desiredXpType = harnessOptIn.desiredXpType;
+			templateComplete = harnessOptIn.templateComplete;
+			if (!desiredXpType.isEmpty() &&
+					progressionEarlyGameWeaponsByXpType.contains(desiredXpType))
+				starterTemplate = progressionEarlyGameWeaponsByXpType.get(
+					desiredXpType);
+		}
+	}
+
+	if (!harnessOptedIn && !templateComplete) {
+		// Called only after progressionMutex is released: the selector takes it.
+		// No next-step mapping means today's behaviour (stock weapon).
+		if (!selectPlayerBotEarlyGameWeapon(identity, starterTemplate,
+				desiredXpType))
+			return false;
+	} else if (!harnessOptedIn && !currentXpType.isEmpty()) {
+		Locker progressionLock(&progressionMutex);
+		if (progressionEarlyGameWeaponsByXpType.contains(currentXpType))
+			starterTemplate = progressionEarlyGameWeaponsByXpType.get(currentXpType);
+	}
+
+	Vector<SimBotLoadout::WeaponStats> candidateVector;
+	Vector<String> certsHeld;
+	Vector<String> certsPlanned;
+	Vector<String> planXpTypes;
+	if (!snapshotPlayerBotLoadoutCandidates(identity.id, candidateVector,
+			certsHeld, certsPlanned, planXpTypes))
+		return false;
+	if (templateComplete && desiredXpType.isEmpty())
+		desiredXpType = currentXpType;
+
+	SimBotLoadout::WeaponStats starter;
+	fillPlayerBotStarterStats(starterTemplate, starter);
+	std::vector<SimBotLoadout::WeaponStats> candidates;
+	for (int i = 0; i < candidateVector.size(); ++i) {
+		candidates.push_back(candidateVector.get(i));
+		const SimBotLoadout::WeaponStats& candidate = candidateVector.get(i);
+		if (preview)
+			continue;
+		if (!SimBotLoadout::classMatches(candidate, desiredXpType,
+				templateComplete))
+			loadoutSkippedWrongClass.increment();
+		else if (!SimBotLoadout::isCertified(candidate.certificationsRequired,
+				certsHeld))
+			loadoutSkippedUncertified.increment();
+	}
+	SimBotLoadout::LoadoutChoice choice = SimBotLoadout::chooseWeapon(candidates,
+		desiredXpType, templateComplete, certsHeld, starter, currentSourceOid,
+		progressionLoadoutMinUpgradePercent);
+	if (preview) {
+		out = choice;
+		return true;
+	}
+
+	bool changed = false;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (progressionLoadoutChoices.contains(identity.id)) {
+			const SimBotLoadout::LoadoutChoice& previous =
+				progressionLoadoutChoices.get(identity.id);
+			changed = previous.source != choice.source ||
+				previous.objectId != choice.objectId ||
+				previous.desiredXpType != choice.desiredXpType;
+		} else {
+			changed = true;
+		}
+		progressionLoadoutChoices.put(identity.id, choice);
+	}
+	loadoutSelections.increment();
+	if (choice.heldByHysteresis)
+		loadoutHysteresisHolds.increment();
+	if (choice.source == SimBotLoadout::VAULT)
+		loadoutVaultEquips.increment();
+	else
+		loadoutStarterFallbacks.increment();
+	if (changed)
+		MissionDiagLog::event("LOADOUT", identity.id,
+			"source=" + String(choice.source == SimBotLoadout::VAULT ?
+				"vault" : "starter") + " oid=" +
+			String::valueOf(choice.objectId) + " xp=" + desiredXpType);
+	out = choice;
+	return true;
+}
+
+void SimPlayerManager::collectPlayerBotProtectedWeaponOids(uint64 identityId,
+		VectorMap<uint64, bool>& protectedIds) {
+	protectedIds.removeAll();
+	if (!playerBotLoadoutGateEnabled(identityId))
+		return;
+	Vector<SimBotLoadout::WeaponStats> loadoutCandidates;
+	Vector<String> certsHeld;
+	Vector<String> certsPlanned;
+	Vector<String> planXpTypes;
+	if (!snapshotPlayerBotLoadoutCandidates(identityId, loadoutCandidates,
+			certsHeld, certsPlanned, planXpTypes))
+		return;
+	uint64 equippedOid = 0;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (progressionEarlyGameStates.contains(identityId))
+			equippedOid = progressionEarlyGameStates.get(identityId).
+				currentLoadoutSourceOid;
+		else if (progressionLoadoutChoices.contains(identityId) &&
+				progressionLoadoutChoices.get(identityId).source ==
+					SimBotLoadout::VAULT)
+			equippedOid = progressionLoadoutChoices.get(identityId).objectId;
+	}
+	std::vector<SimBotLoadout::WeaponStats> candidates;
+	for (int i = 0; i < loadoutCandidates.size(); ++i)
+		candidates.push_back(loadoutCandidates.get(i));
+	auto ids = SimBotLoadout::protectedSet(candidates, equippedOid,
+		planXpTypes, certsHeld, certsPlanned);
+	for (size_t i = 0; i < ids.size(); ++i)
+		protectedIds.put(ids[i], true);
+}
+
 void SimPlayerManager::restorePlayerBotWeaponTemplateStats(
 		WeaponObject* weapon) {
 	if (weapon == nullptr || weapon->getObjectTemplate() == nullptr)
@@ -8637,9 +9042,28 @@ void SimPlayerManager::restorePlayerBotWeaponTemplateStats(
 	weapon->setAttackSpeed(weaponTemplate->getAttackSpeed());
 }
 
+static void applySimBotLoadoutWeaponStats(WeaponObject* weapon,
+		const SimBotLoadout::WeaponStats& stats) {
+	if (weapon == nullptr)
+		return;
+	weapon->setMinDamage(stats.minDamage);
+	weapon->setMaxDamage(stats.maxDamage);
+	weapon->setAttackSpeed(stats.attackSpeed);
+	weapon->setWoundsRatio(stats.woundsRatio);
+	weapon->setPointBlankAccuracy(stats.pointBlankAccuracy);
+	weapon->setIdealAccuracy(stats.idealAccuracy);
+	weapon->setMaxRangeAccuracy(stats.maxRangeAccuracy);
+	weapon->setIdealRange(stats.idealRange);
+	weapon->setMaxRange(stats.maxRange);
+	weapon->setHealthAttackCost(stats.healthAttackCost);
+	weapon->setActionAttackCost(stats.actionAttackCost);
+	weapon->setMindAttackCost(stats.mindAttackCost);
+}
+
 bool SimPlayerManager::equipPlayerBotWeaponLocked(AiAgent* agent,
 		const String& weaponTemplate, const String& expectedXpType,
-		bool restoreRealWeaponDamage, bool forceEquip) {
+		bool restoreRealWeaponDamage, bool forceEquip,
+		const SimBotLoadout::WeaponStats* itemStats) {
 	if (agent == nullptr)
 		return false;
 
@@ -8672,9 +9096,12 @@ bool SimPlayerManager::equipPlayerBotWeaponLocked(AiAgent* agent,
 	if (!forceEquip && currentWeapon != nullptr && currentTemplateMatches &&
 			(expectedXpType.isEmpty() ||
 				currentWeapon->getXpType() == expectedXpType)) {
-		if (restoreRealWeaponDamage) {
+		if (restoreRealWeaponDamage || itemStats != nullptr) {
 			agent->setWeaponStats();
-			restorePlayerBotWeaponTemplateStats(currentWeapon);
+			if (itemStats != nullptr)
+				applySimBotLoadoutWeaponStats(currentWeapon, *itemStats);
+			else
+				restorePlayerBotWeaponTemplateStats(currentWeapon);
 		}
 		if (weaponPostcondition(currentWeapon, expectedXpType))
 			return true;
@@ -8710,7 +9137,9 @@ bool SimPlayerManager::equipPlayerBotWeaponLocked(AiAgent* agent,
 		agent->setCurrentWeapon(nullptr);
 		agent->setWeapon(stockWeapon, false);
 		agent->setWeaponStats();
-		if (restoreRealWeaponDamage)
+		if (itemStats != nullptr)
+			applySimBotLoadoutWeaponStats(stockWeapon, *itemStats);
+		else if (restoreRealWeaponDamage)
 			restorePlayerBotWeaponTemplateStats(stockWeapon);
 		agent->setupAttackMaps();
 		agent->equipPrimaryWeapon();
@@ -8737,7 +9166,9 @@ bool SimPlayerManager::equipPlayerBotWeaponLocked(AiAgent* agent,
 	// AiAgentImplementation::setWeaponStats() is shared by every NPC. The
 	// roster-only passthrough therefore belongs immediately after that call in
 	// this sim-layer choreography, and nowhere in the shared AI implementation.
-	if (restoreRealWeaponDamage)
+	if (itemStats != nullptr)
+		applySimBotLoadoutWeaponStats(weapon, *itemStats);
+	else if (restoreRealWeaponDamage)
 		restorePlayerBotWeaponTemplateStats(weapon);
 	agent->setupAttackMaps();
 	agent->equipPrimaryWeapon();
@@ -8786,8 +9217,19 @@ void SimPlayerManager::reapplyPlayerBotProgressionToLiveBody(
 		applicability);
 	String weaponTemplate;
 	String expectedXpType;
-	bool weaponSelection = selectPlayerBotEarlyGameWeapon(identity,
-		weaponTemplate, expectedXpType);
+	SimBotLoadout::LoadoutChoice loadoutChoice;
+	const bool loadoutEnabled = playerBotLoadoutGateEnabled(identityId);
+	bool weaponSelection = false;
+	if (loadoutEnabled) {
+		weaponSelection = selectPlayerBotLoadout(identity, loadoutChoice);
+		if (weaponSelection) {
+			weaponTemplate = loadoutChoice.stats.templateString;
+			expectedXpType = loadoutChoice.stats.xpType;
+		}
+	} else {
+		weaponSelection = selectPlayerBotEarlyGameWeapon(identity,
+			weaponTemplate, expectedXpType);
+	}
 	bool restoreRealWeaponDamage = !identity.trainingPlan.isEmpty() &&
 		identity.profession != "harness" &&
 		playerBotRealWeaponDamageGateEnabled();
@@ -8797,9 +9239,18 @@ void SimPlayerManager::reapplyPlayerBotProgressionToLiveBody(
 		if (agent->getZone() == nullptr)
 			return;
 		applyProgressionToBody(agent, snapshot);
+		// No mid-fight weapon switching: skills and abilities still apply, the
+		// weapon swap waits. The recorded loadout stays stale, so the next slow
+		// tick retries once the fight is over.
+		if (weaponSelection && loadoutEnabled && agent->isInCombat()) {
+			loadoutReequipsDeferredInCombat.increment();
+			weaponSelection = false;
+		}
 		if (weaponSelection)
 			equipped = equipPlayerBotWeaponLocked(agent, weaponTemplate,
-				expectedXpType, restoreRealWeaponDamage, true);
+				expectedXpType, restoreRealWeaponDamage, true,
+				loadoutEnabled && loadoutChoice.source == SimBotLoadout::VAULT ?
+					&loadoutChoice.stats : nullptr);
 	}
 
 	// Record what the body actually ends up holding, outside the agent lock so
@@ -8810,9 +9261,16 @@ void SimPlayerManager::reapplyPlayerBotProgressionToLiveBody(
 	// mismatched so the next sweep retries.
 	if (equipped && !expectedXpType.isEmpty()) {
 		Locker progressionLock(&progressionMutex);
-		if (progressionEarlyGameStates.contains(identityId))
+		if (progressionEarlyGameStates.contains(identityId)) {
 			progressionEarlyGameStates.get(identityId).currentWeaponXpType =
 				expectedXpType;
+			progressionEarlyGameStates.get(identityId).currentLoadoutSourceOid =
+				loadoutEnabled ? loadoutChoice.objectId : 0;
+			progressionEarlyGameStates.get(identityId).templateComplete =
+				loadoutEnabled && loadoutChoice.templateComplete;
+		}
+		if (loadoutEnabled)
+			progressionLoadoutDirtyIds.drop(identityId);
 	}
 }
 
@@ -8969,6 +9427,29 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		buy.pop();
 	}
 	bazaar.pop();
+	progressionWeaponLoadout = config.getBooleanField("weaponLoadout",
+		progressionWeaponLoadout);
+	LuaObject loadout = config.getObjectField("loadout");
+	if (loadout.isValidTable()) {
+		progressionLoadoutMinUpgradePercent = clampFloatRange(
+			loadout.getFloatField("minUpgradePercent",
+				progressionLoadoutMinUpgradePercent), 0.f, 1000.f);
+		progressionLoadoutFullSweepMinutes = clampIntRange(
+			loadout.getIntField("fullSweepMinutes",
+				progressionLoadoutFullSweepMinutes), 1, 1440);
+		progressionBazaarUpgrades = loadout.getBooleanField("bazaarUpgrades",
+			progressionBazaarUpgrades);
+		progressionLoadoutUpgradeSpendFraction = clampFloatRange(
+			loadout.getFloatField("upgradeSpendFraction",
+				progressionLoadoutUpgradeSpendFraction), 0.f, 1.f);
+		progressionLoadoutUpgradeScanIntervalMinutes = clampIntRange(
+			loadout.getIntField("upgradeScanIntervalMinutes",
+				progressionLoadoutUpgradeScanIntervalMinutes), 1, 1440);
+		progressionLoadoutMaxUpgradeLoadsPerVisit = clampIntRange(
+			loadout.getIntField("maxUpgradeLoadsPerVisit",
+				progressionLoadoutMaxUpgradeLoadsPerVisit), 1, 1000);
+	}
+	loadout.pop();
 	LuaObject buffPayment = config.getObjectField("buffPayment");
 	if (buffPayment.isValidTable()) {
 		progressionBuffPaymentEnabled = buffPayment.getBooleanField(
@@ -9304,6 +9785,7 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.hasOwnerIsBag = step.ownerIsBag ==
 		table.getBooleanField("ownerIsBag", true);
 	step.ownerName = table.getStringField("ownerName").trim();
+	step.ref = table.getStringField("ref").trim();
 	step.difficultyLevel = clampMinerInt(table.getIntField("difficultyLevel", 1),
 		1, 1, 1000);
 	step.missions = clampMinerInt(table.getIntField("missions", 1), 1, 1, 1000000);
@@ -9331,6 +9813,13 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.gateEnabled = table.getBooleanField("gateEnabled", false);
 	step.hasGateEnabled = step.gateEnabled ==
 		table.getBooleanField("gateEnabled", true);
+	if (!step.hasGateEnabled) {
+		bool enabled = table.getBooleanField("enabled", false);
+		if (enabled == table.getBooleanField("enabled", true)) {
+			step.gateEnabled = enabled;
+			step.hasGateEnabled = true;
+		}
+	}
 	step.trainingGateEnabled = table.getBooleanField("trainingGateEnabled", false);
 	step.hasTrainingGateEnabled = step.trainingGateEnabled ==
 		table.getBooleanField("trainingGateEnabled", true);
@@ -9354,6 +9843,24 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.hasExpectedMaxDamage = step.expectedMaxDamage != absentExpected;
 	if (!step.hasExpectedMaxDamage)
 		step.expectedMaxDamage = -1;
+	step.attackSpeed = table.getFloatField("attackSpeed", -1.f);
+	step.hasAttackSpeed = step.attackSpeed >= 0.f;
+	if (!step.hasAttackSpeed)
+		step.attackSpeed = 0.f;
+	step.loadoutTemplateComplete = table.getBooleanField(
+		"templateComplete", false);
+	step.hasLoadoutTemplateComplete = step.loadoutTemplateComplete ==
+		table.getBooleanField("templateComplete", true);
+	LuaObject certs = table.getObjectField("certs");
+	if (certs.isValidTable()) {
+		step.hasCertificationOverride = true;
+		for (int i = 1; i <= certs.getTableSize(); ++i) {
+			String cert = certs.getStringAt(i).trim();
+			if (!cert.isEmpty())
+				step.certificationOverride.add(cert);
+		}
+	}
+	certs.pop();
 	step.expectedGraduated = table.getBooleanField("graduated", false);
 	step.hasExpectedGraduated = step.expectedGraduated ==
 		table.getBooleanField("graduated", true);
@@ -9440,6 +9947,8 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	}
 	damageByType.pop();
 	step.expect = table.getStringField("expect").trim();
+	if (step.expect.isEmpty())
+		step.expect = table.getStringField("expected").trim();
 	// LuaObject::getStringField's default-value argument cannot be relied on: on a
 	// nil field it sets the pointer to the default but leaves the length at 0, so
 	// String(result, size) yields "". Read it plainly and apply the fallback here.
@@ -11938,6 +12447,7 @@ bool SimPlayerManager::depositPlayerBotItem(uint64 identityId,
 			held, boundedSource, row.objectId, row.displayName);
 	}
 	progressionItemHeldCounts.put(identityId, held);
+	progressionLoadoutDirtyIds.put(identityId, true);
 	return true;
 }
 
@@ -11978,6 +12488,9 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 	const bool buyGate = playerBotBazaarBuyGateEnabled(identityId);
 	if (!sellGate && !buyGate)
 		return false;
+	const bool upgradeGate = buyGate &&
+		playerBotBazaarUpgradesGateEnabled(identityId) &&
+		playerBotLoadoutGateEnabled(identityId);
 	const int unmetBuyNeeds = buyGate ?
 		playerBotUnmetBuyNeeds(identityId) : 0;
 
@@ -11993,6 +12506,9 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 	Vector<SimBotTrainingPlan::BuyListEntry> buyListOverride;
 	const bool hasBuyListOverride =
 		playerBotParityBazaarBuyListOverride(identityId, buyListOverride);
+	VectorMap<uint64, bool> loadoutProtectedIds;
+	if (sellGate)
+		collectPlayerBotProtectedWeaponOids(identityId, loadoutProtectedIds);
 	{
 		Locker progressionLock(&progressionMutex);
 		if (progressionBazaarVisitCooldownUntilMs.contains(identityId) &&
@@ -12017,6 +12533,46 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 					progressionBazaarBuyReserveCredits >= progressionBazaarMinPrice)
 				return true;
 		}
+		if (upgradeGate && progressionLoadoutChoices.contains(identityId)) {
+			bool pendingUpgrade = false;
+			int pendingPurchases = 0;
+			for (int i = 0; i < progressionBazaarPurchases.size(); ++i) {
+				const PlayerBotBazaarPurchase& purchase =
+					progressionBazaarPurchases.elementAt(i).getValue();
+				if (purchase.identityId == identityId &&
+						(purchase.state == PLAYER_BOT_PURCHASE_DEBITED ||
+						 purchase.state == PLAYER_BOT_PURCHASE_RESOLVE_PENDING)) {
+					++pendingPurchases;
+					if (SimBotLoadout::weaponClassCandidates(
+							purchase.gameObjectType).size() > 0)
+						pendingUpgrade = true;
+				}
+			}
+			const SimBotProgression& progression = progressionRecords.get(identityId);
+			const int64 spendable = progression.bankCredits -
+				reservedPlayerBotCreditsLocked(identityId, true) -
+				progressionBazaarBuyReserveCredits;
+			const int64 fractionCeiling = static_cast<int64>(std::floor(
+				std::max<int64>(0, spendable) *
+				std::max(0.f, std::min(1.f,
+					progressionLoadoutUpgradeSpendFraction))));
+			const int64 upgradeCeiling = std::min<int64>(
+				std::max(0, progressionBazaarMaxPrice), fractionCeiling);
+			const uint64 scanIntervalMs = static_cast<uint64>(
+				progressionLoadoutUpgradeScanIntervalMinutes) * 60000;
+			const bool scanDue = !progressionBazaarUpgradeScanAtMs.contains(identityId) ||
+				nowMs >= progressionBazaarUpgradeScanAtMs.get(identityId) +
+				scanIntervalMs;
+			if (!pendingUpgrade && pendingPurchases < progressionBazaarBuyMaxPendingPerBot &&
+					upgradeCeiling >= progressionBazaarMinPrice &&
+					scanDue) {
+				// The scan timestamp is the admission record, not a purchase record:
+				// an empty market and a rejected candidate both wait for the next
+				// configured scan interval.
+				progressionBazaarUpgradeScanAtMs.put(identityId, nowMs);
+				return true;
+			}
+		}
 		if (!sellGate)
 			return false;
 		Vector<SimBotTrainingPlan::BuyListEntry> buyList;
@@ -12035,10 +12591,20 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 							row.templateCrc == entry.templateCrc)
 						matching.push_back(std::make_pair(row.acquiredAt, row.objectId));
 				}
+				// A weapon the loadout already keeps satisfies the entry first, so
+				// the two keep rules never hold an extra duplicate between them.
+				// Then oldest, with the OID as a deterministic tie-break.
 				std::sort(matching.begin(), matching.end(),
-					[](const std::pair<String, uint64>& left,
+					[&loadoutProtectedIds](const std::pair<String, uint64>& left,
 							const std::pair<String, uint64>& right) {
-						return left.first.compareTo(right.first) < 0;
+						const bool leftKept = loadoutProtectedIds.contains(left.second);
+						const bool rightKept = loadoutProtectedIds.contains(right.second);
+						if (leftKept != rightKept)
+							return leftKept;
+						const int byAge = left.first.compareTo(right.first);
+						if (byAge != 0)
+							return byAge < 0;
+						return left.second < right.second;
 					});
 				for (int rowIndex = 0; rowIndex < static_cast<int>(matching.size()) &&
 						rowIndex < entry.quantity; ++rowIndex)
@@ -12060,6 +12626,8 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
 			if (row.identityId != identityId || row.state != SIMBOT_ITEM_HELD)
 				continue;
+			if (loadoutProtectedIds.contains(row.objectId))
+				neededObjectIds.put(row.objectId, true);
 			if (neededObjectIds.contains(row.objectId))
 				continue;
 			// Same rule as listPlayerBotItemsAtTerminal: an expired (retrieved)
@@ -12323,6 +12891,8 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 		for (int i = 0; i < bag->getContainerObjectsSize(); ++i)
 			children.add(bag->getContainerObject(i));
 	}
+	VectorMap<uint64, bool> loadoutProtectedIds;
+	collectPlayerBotProtectedWeaponOids(identityId, loadoutProtectedIds);
 
 	std::vector<Candidate> candidates;
 	VectorMap<uint64, int> heldAsks;
@@ -12354,10 +12924,20 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 							row.templateCrc == entry.templateCrc)
 						matching.push_back(std::make_pair(row.acquiredAt, row.objectId));
 				}
+				// A weapon the loadout already keeps satisfies the entry first, so
+				// the two keep rules never hold an extra duplicate between them.
+				// Then oldest, with the OID as a deterministic tie-break.
 				std::sort(matching.begin(), matching.end(),
-					[](const std::pair<String, uint64>& left,
+					[&loadoutProtectedIds](const std::pair<String, uint64>& left,
 							const std::pair<String, uint64>& right) {
-						return left.first.compareTo(right.first) < 0;
+						const bool leftKept = loadoutProtectedIds.contains(left.second);
+						const bool rightKept = loadoutProtectedIds.contains(right.second);
+						if (leftKept != rightKept)
+							return leftKept;
+						const int byAge = left.first.compareTo(right.first);
+						if (byAge != 0)
+							return byAge < 0;
+						return left.second < right.second;
 					});
 				for (int rowIndex = 0; rowIndex < static_cast<int>(matching.size()) &&
 						rowIndex < entry.quantity; ++rowIndex)
@@ -12367,8 +12947,15 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
 			if (row.identityId != identityId || row.state != SIMBOT_ITEM_HELD)
 				continue;
+			if (loadoutProtectedIds.contains(row.objectId))
+				neededObjectIds.put(row.objectId, true);
 			if (neededObjectIds.contains(row.objectId)) {
-				bazaarSkippedNeeded.increment();
+				if (loadoutProtectedIds.contains(row.objectId)) {
+					bazaarSkippedLoadout.increment();
+					loadoutSellProtected.increment();
+				} else {
+					bazaarSkippedNeeded.increment();
+				}
 				continue;
 			}
 			// A retrieved (expired) or orphaned entry stays keyed by the object
@@ -12581,6 +13168,8 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		identityId);
 	if (bag == nullptr)
 		return false;
+	const bool upgradeGate = playerBotBazaarUpgradesGateEnabled(identityId) &&
+		playerBotLoadoutGateEnabled(identityId);
 	{
 		Locker progressionLock(&progressionMutex);
 		if (!progressionRecords.contains(identityId) ||
@@ -12593,17 +13182,17 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		} else
 			plan = progressionTrainingPlans.get(trainingPlanName);
 	}
-	if (plan.buyList.size() == 0)
-		return false;
-
 	struct BuyCandidate {
 		ManagedReference<AuctionItem*> item;
 		uint32 templateCrc = 0;
 		int junkValue = 0;
 		int ceiling = 0;
+		bool upgrade = false;
+		SimBotLoadout::WeaponStats weaponStats;
 	};
 	struct BuyNeed {
 		SimBotTrainingPlan::BuyListEntry entry;
+		bool upgrade = false;
 		int remaining = 0;
 		std::vector<ManagedReference<AuctionItem*> > raw;
 		std::vector<BuyCandidate> candidates;
@@ -12611,6 +13200,12 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		int loads = 0;
 	};
 	std::vector<BuyNeed> needs;
+	SimBotLoadout::LoadoutChoice upgradeChoice;
+	Vector<String> upgradeCertsHeld;
+	Vector<String> upgradeCertsPlanned;
+	Vector<String> certOverride;
+	const bool hasCertOverride =
+		snapshotPlayerBotCertificationOverride(identityId, certOverride);
 	VectorMap<uint64, uint64> bagMap = economyManager->getItemBagMapSnapshot();
 	const uint64 bagOid = bag->getObjectID();
 	// Listings this bot already tried (any state) are never ranked again: a
@@ -12651,6 +13246,44 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 			if (need.remaining > 0)
 				needs.push_back(need);
 		}
+		if (upgradeGate &&
+				progressionLoadoutChoices.contains(identityId)) {
+			bool pendingUpgrade = false;
+			for (int i = 0; i < progressionBazaarPurchases.size(); ++i) {
+				const PlayerBotBazaarPurchase& purchase =
+					progressionBazaarPurchases.elementAt(i).getValue();
+				if (purchase.identityId == identityId &&
+						(purchase.state == PLAYER_BOT_PURCHASE_DEBITED ||
+						 purchase.state == PLAYER_BOT_PURCHASE_RESOLVE_PENDING) &&
+						SimBotLoadout::weaponClassCandidates(
+							purchase.gameObjectType).size() > 0) {
+					pendingUpgrade = true;
+					break;
+				}
+			}
+			const SimBotProgression& progression = progressionRecords.get(identityId);
+			const int64 spendable = progression.bankCredits -
+				reservedPlayerBotCreditsLocked(identityId, true) -
+				progressionBazaarBuyReserveCredits;
+			const int64 fractionCeiling = static_cast<int64>(std::floor(
+				std::max<int64>(0, spendable) *
+				std::max(0.f, std::min(1.f,
+					progressionLoadoutUpgradeSpendFraction))));
+			const int64 upgradeCeiling = std::min<int64>(
+				std::max(0, progressionBazaarMaxPrice), fractionCeiling);
+			if (!pendingUpgrade && upgradeCeiling >= progressionBazaarMinPrice) {
+				upgradeChoice = progressionLoadoutChoices.get(identityId);
+				collectPlayerBotCertificationsLocked(identityId, plan,
+					upgradeCertsHeld, upgradeCertsPlanned,
+					hasCertOverride ? &certOverride : nullptr);
+				BuyNeed need;
+				need.upgrade = true;
+				need.remaining = 1;
+				needs.push_back(need);
+				progressionBazaarUpgradeScanAtMs.put(identityId,
+					System::getMiliTime());
+			}
+		}
 	}
 	if (needs.empty()) {
 		bazaarBuySkippedNoNeed.increment();
@@ -12675,10 +13308,20 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 					triedAuctions.contains(item->getObjectID()))
 				continue;
 			for (size_t needIndex = 0; needIndex < needs.size(); ++needIndex) {
-				if (item->getItemType() ==
-						static_cast<unsigned int>(needs[needIndex].entry.gameObjectType) &&
-						item->getPrice() <= progressionBazaarMaxPrice)
-					needs[needIndex].raw.push_back(item);
+				BuyNeed& need = needs[needIndex];
+				if (item->getPrice() > progressionBazaarMaxPrice)
+					continue;
+				if (need.upgrade) {
+					Vector<String> classes = SimBotLoadout::weaponClassCandidates(
+						item->getItemType());
+					if (classes.size() == 0 || (!upgradeChoice.templateComplete &&
+							!classes.contains(upgradeChoice.desiredXpType)))
+						continue;
+					need.raw.push_back(item);
+				} else if (item->getItemType() ==
+						static_cast<unsigned int>(need.entry.gameObjectType)) {
+					need.raw.push_back(item);
+				}
 			}
 		}
 	}
@@ -12707,7 +13350,11 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 			BuyNeed& need = needs[needIndex];
 			// The per-need budget counts object loads; cached mismatches are
 			// skipped for free, so a later visit always reaches new listings.
-			if (need.loads >= progressionBazaarBuyCandidateScanLimit ||
+			const int maxLoadsForNeed = need.upgrade ? std::min(
+				progressionBazaarBuyCandidateScanLimit,
+				progressionLoadoutMaxUpgradeLoadsPerVisit) :
+				progressionBazaarBuyCandidateScanLimit;
+			if (need.loads >= maxLoadsForNeed ||
 					need.scanned >= static_cast<int>(need.raw.size()))
 				continue;
 			advanced = true;
@@ -12744,10 +13391,21 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 				cached.templateCrc = listedObject->getServerObjectCRC();
 				cached.gameObjectType = listedObject->getClientGameObjectType();
 				cached.junkValue = tangible->getJunkValue();
+				if (listedObject->isWeaponObject()) {
+					WeaponObject* weapon = cast<WeaponObject*>(listedObject.get());
+					if (weapon != nullptr) {
+						SimBotLoadout::WeaponStats weaponStats;
+						fillPlayerBotWeaponStats(weapon, weaponStats);
+						cached.isWeapon = true;
+						cached.xpType = weaponStats.xpType;
+						cached.score = SimBotLoadout::scoreWeapon(weaponStats);
+						cached.certificationsRequired =
+							weaponStats.certificationsRequired;
+					}
+				}
 				cached.lastUsedAtMs = System::getMiliTime();
 				Locker cacheLock(&bazaarListingTemplateCacheMutex);
-				if (!bazaarListingTemplateCache.contains(item->getObjectID()))
-					bazaarListingTemplateCache.put(item->getObjectID(), cached);
+				bazaarListingTemplateCache.put(item->getObjectID(), cached);
 				if (bazaarListingTemplateCache.size() > 4096) {
 					int oldest = 0;
 					for (int cacheIndex = 1; cacheIndex <
@@ -12758,6 +13416,42 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 					}
 					bazaarListingTemplateCache.remove(oldest);
 				}
+			}
+			if (need.upgrade) {
+				if (!cached.isWeapon)
+					continue;
+				SimBotLoadout::WeaponStats listingStats;
+				listingStats.objectId = item->getAuctionedItemObjectID();
+				listingStats.gameObjectType = cached.gameObjectType;
+				listingStats.xpType = cached.xpType;
+				listingStats.minDamage = cached.score;
+				listingStats.maxDamage = cached.score;
+				listingStats.attackSpeed = 1.f;
+				listingStats.certificationsRequired =
+					cached.certificationsRequired;
+				if (!SimBotLoadout::classMatches(listingStats,
+						upgradeChoice.desiredXpType,
+						upgradeChoice.templateComplete))
+					continue;
+				if (!SimBotLoadout::isCertified(
+						listingStats.certificationsRequired, upgradeCertsHeld)) {
+					bazaarBuyUpgradesSkippedUncertified.increment();
+					continue;
+				}
+				const float requiredScore = std::max(0.f,
+					upgradeChoice.score) * (1.f + std::max(0.f,
+					progressionLoadoutMinUpgradePercent) / 100.f);
+				if (cached.score < requiredScore) {
+					bazaarBuyUpgradesSkippedNotBetter.increment();
+					continue;
+				}
+				BuyCandidate candidate;
+				candidate.item = item;
+				candidate.templateCrc = cached.templateCrc;
+				candidate.upgrade = true;
+				candidate.weaponStats = listingStats;
+				need.candidates.push_back(candidate);
+				continue;
 			}
 			if (cached.templateCrc != need.entry.templateCrc) {
 				MissionDiagLog::event("BAZAAR_BUY", identityId,
@@ -12799,10 +13493,24 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 			break;
 	}
 	for (size_t needIndex = 0; needIndex < needs.size(); ++needIndex) {
+		if (needs[needIndex].upgrade)
+			std::sort(needs[needIndex].candidates.begin(),
+				needs[needIndex].candidates.end(),
+				[](const BuyCandidate& left, const BuyCandidate& right) {
+					const float leftScore = SimBotLoadout::scoreWeapon(
+						left.weaponStats);
+					const float rightScore = SimBotLoadout::scoreWeapon(
+						right.weaponStats);
+					if (leftScore != rightScore)
+						return leftScore > rightScore;
+					return left.item->getPrice() < right.item->getPrice();
+				});
 		if (needs[needIndex].candidates.empty())
 			bazaarBuySkippedNoListing.increment();
+		String needLabel = needs[needIndex].upgrade ? String("upgrade") :
+			String::valueOf(needs[needIndex].entry.templateCrc);
 		MissionDiagLog::event("BAZAAR_BUY", identityId,
-			"need=" + String::valueOf(needs[needIndex].entry.templateCrc) +
+			"need=" + needLabel +
 			" type=" + String::valueOf(needs[needIndex].entry.gameObjectType) +
 			" planet=" + planet +
 			" raw=" + String::valueOf(static_cast<int>(needs[needIndex].raw.size())) +
@@ -12820,7 +13528,7 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		int bestNeed = -1;
 		int bestCandidate = -1;
 		for (size_t needIndex = 0; needIndex < needs.size(); ++needIndex) {
-			if (needs[needIndex].remaining <= 0)
+			if (needs[needIndex].upgrade || needs[needIndex].remaining <= 0)
 				continue;
 			for (size_t candidateIndex = 0; candidateIndex <
 					needs[needIndex].candidates.size(); ++candidateIndex) {
@@ -12836,6 +13544,32 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 				break;
 			}
 		}
+		if (bestNeed < 0) {
+			for (size_t needIndex = 0; needIndex < needs.size(); ++needIndex) {
+				if (!needs[needIndex].upgrade || needs[needIndex].remaining <= 0)
+					continue;
+				for (size_t candidateIndex = 0; candidateIndex <
+						needs[needIndex].candidates.size(); ++candidateIndex) {
+					BuyCandidate& candidate =
+						needs[needIndex].candidates[candidateIndex];
+					if (candidate.item == nullptr || chosenAuctions.contains(
+							candidate.item->getObjectID()))
+						continue;
+					if (bestNeed < 0 ||
+							SimBotLoadout::scoreWeapon(candidate.weaponStats) >
+								SimBotLoadout::scoreWeapon(needs[bestNeed].candidates[
+									bestCandidate].weaponStats) ||
+							(SimBotLoadout::scoreWeapon(candidate.weaponStats) ==
+								SimBotLoadout::scoreWeapon(needs[bestNeed].candidates[
+									bestCandidate].weaponStats) &&
+								candidate.item->getPrice() <
+								needs[bestNeed].candidates[bestCandidate].item->getPrice())) {
+						bestNeed = static_cast<int>(needIndex);
+						bestCandidate = static_cast<int>(candidateIndex);
+					}
+				}
+			}
+		}
 		if (bestNeed < 0)
 			break;
 		BuyCandidate& candidate = needs[bestNeed].candidates[bestCandidate];
@@ -12845,10 +13579,12 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		int pendingCount = 0;
 		int templatePendingCount = 0;
 		int ownedCount = 0;
-		const uint32 templateCrc = needs[bestNeed].entry.templateCrc;
+		const bool upgrade = needs[bestNeed].upgrade;
+		const uint32 templateCrc = upgrade ? candidate.templateCrc :
+			needs[bestNeed].entry.templateCrc;
 		for (int i = 0; i < progressionItems.size(); ++i) {
 			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
-			if (row.identityId == identityId &&
+			if (!upgrade && row.identityId == identityId &&
 					(row.state == SIMBOT_ITEM_HELD || row.state == SIMBOT_ITEM_LISTED) &&
 					row.templateCrc == templateCrc)
 				++ownedCount;
@@ -12860,31 +13596,108 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 					(purchase.state == PLAYER_BOT_PURCHASE_DEBITED ||
 					 purchase.state == PLAYER_BOT_PURCHASE_RESOLVE_PENDING)) {
 				++pendingCount;
-				if (purchase.templateCrc == templateCrc)
+				if (!upgrade && purchase.templateCrc == templateCrc)
 					++templatePendingCount;
 			}
 		}
 		String purchaseKey = playerBotBazaarPurchaseKey(identityId,
 			auctionItem->getObjectID());
-		SimBotBazaar::PurchaseReason liveReason = SimBotBazaar::decidePurchase(
-			auctionItem->getPrice(), candidate.ceiling,
-			progressionRecords.get(identityId).bankCredits,
-			reservedPlayerBotCreditsLocked(identityId, true),
-			progressionBazaarBuyReserveCredits,
-			auctionItem->getOwnerID() == bagOid);
-		if (SimBotBazaar::unmetNeed(needs[bestNeed].entry.quantity,
-				ownedCount, templatePendingCount) <= 0 ||
-				pendingCount >= progressionBazaarBuyMaxPendingPerBot ||
-				progressionBazaarPurchases.contains(purchaseKey) ||
-				liveReason != SimBotBazaar::BUY) {
-			if (liveReason == SimBotBazaar::UNAFFORDABLE)
-				bazaarBuySkippedUnaffordable.increment();
-			else if (liveReason == SimBotBazaar::OWN_LISTING)
-				bazaarBuySkippedOwnListing.increment();
-			else
-				bazaarBuySkippedNoNeed.increment();
-			continue;
+		bool canBuy = true;
+		SimBotBazaar::PurchaseReason liveReason = SimBotBazaar::BUY;
+		if (upgrade) {
+			if (pendingCount >= progressionBazaarBuyMaxPendingPerBot ||
+					progressionBazaarPurchases.contains(purchaseKey) ||
+					auctionItem->getOwnerID() == bagOid) {
+				canBuy = false;
+				if (auctionItem->getOwnerID() == bagOid)
+					bazaarBuySkippedOwnListing.increment();
+				else
+					bazaarBuySkippedNoNeed.increment();
+			} else if (!progressionLoadoutChoices.contains(identityId)) {
+				canBuy = false;
+				bazaarBuyUpgradesSkippedNotBetter.increment();
+			} else {
+				Vector<String> liveCertsHeld;
+				Vector<String> liveCertsPlanned;
+				collectPlayerBotCertificationsLocked(identityId, plan,
+					liveCertsHeld, liveCertsPlanned,
+					hasCertOverride ? &certOverride : nullptr);
+				const SimBotLoadout::LoadoutChoice liveChoice =
+					progressionLoadoutChoices.get(identityId);
+				bool pendingUpgrade = false;
+				for (int i = 0; i < progressionBazaarPurchases.size(); ++i) {
+					const PlayerBotBazaarPurchase& purchase =
+						progressionBazaarPurchases.elementAt(i).getValue();
+					if (purchase.identityId == identityId &&
+							(purchase.state == PLAYER_BOT_PURCHASE_DEBITED ||
+							 purchase.state == PLAYER_BOT_PURCHASE_RESOLVE_PENDING) &&
+							SimBotLoadout::weaponClassCandidates(
+								purchase.gameObjectType).size() > 0) {
+						pendingUpgrade = true;
+						break;
+					}
+				}
+				if (pendingUpgrade) {
+					canBuy = false;
+					bazaarBuySkippedNoNeed.increment();
+				} else {
+					SimBotLoadout::UpgradeReason upgradeReason =
+						SimBotLoadout::upgradeDecision(candidate.weaponStats,
+						auctionItem->getPrice(), liveChoice.score,
+						progressionRecords.get(identityId).bankCredits,
+						reservedPlayerBotCreditsLocked(identityId, true),
+						progressionBazaarBuyReserveCredits,
+						progressionLoadoutUpgradeSpendFraction,
+						progressionBazaarMaxPrice,
+						progressionLoadoutMinUpgradePercent,
+						liveCertsHeld, liveChoice.desiredXpType,
+						liveChoice.templateComplete);
+					if (upgradeReason != SimBotLoadout::BUY) {
+						canBuy = false;
+						switch (upgradeReason) {
+						case SimBotLoadout::NOT_BETTER:
+							bazaarBuyUpgradesSkippedNotBetter.increment();
+							break;
+						case SimBotLoadout::UNCERTIFIED:
+							bazaarBuyUpgradesSkippedUncertified.increment();
+							break;
+						case SimBotLoadout::OVER_BUDGET:
+							bazaarBuyUpgradesSkippedOverBudget.increment();
+							break;
+						case SimBotLoadout::UNAFFORDABLE:
+							bazaarBuyUpgradesSkippedUnaffordable.increment();
+							break;
+						default:
+							bazaarBuyUpgradesSkippedNotBetter.increment();
+							break;
+						}
+					}
+				}
+			}
+		} else {
+			liveReason = SimBotBazaar::decidePurchase(
+				auctionItem->getPrice(), candidate.ceiling,
+				progressionRecords.get(identityId).bankCredits,
+				reservedPlayerBotCreditsLocked(identityId, true),
+				progressionBazaarBuyReserveCredits,
+				auctionItem->getOwnerID() == bagOid);
+			if (SimBotBazaar::unmetNeed(needs[bestNeed].entry.quantity,
+					ownedCount, templatePendingCount) <= 0 ||
+					pendingCount >= progressionBazaarBuyMaxPendingPerBot ||
+					progressionBazaarPurchases.contains(purchaseKey) ||
+					liveReason != SimBotBazaar::BUY)
+				canBuy = false;
+			if (!canBuy) {
+				if (liveReason == SimBotBazaar::UNAFFORDABLE)
+					bazaarBuySkippedUnaffordable.increment();
+				else if (liveReason == SimBotBazaar::OWN_LISTING)
+					bazaarBuySkippedOwnListing.increment();
+				else
+					bazaarBuySkippedNoNeed.increment();
+			}
 		}
+		if (!canBuy)
+			continue;
 		SimBotProgression& progression = progressionRecords.get(identityId);
 		progression.bankCredits -= auctionItem->getPrice();
 		progression.lastAwardMs = System::getMiliTime();
@@ -12900,7 +13713,8 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		purchase.identityId = identityId;
 		purchase.objectId = auctionItem->getAuctionedItemObjectID();
 		purchase.templateCrc = templateCrc;
-		purchase.gameObjectType = needs[bestNeed].entry.gameObjectType;
+		purchase.gameObjectType = upgrade ? candidate.weaponStats.gameObjectType :
+			needs[bestNeed].entry.gameObjectType;
 		purchase.price = auctionItem->getPrice();
 		purchase.vendorOid = auctionItem->getVendorID();
 		purchase.planet = planet;
@@ -12918,12 +13732,16 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		progressionBazaarPurchases.put(purchaseKey, purchase);
 		--needs[bestNeed].remaining;
 		bazaarBuyDebited.increment();
+		if (upgrade)
+			bazaarBuyUpgradesDebited.increment();
 		debitedAny = true;
 		progressionLock.release();
 		MissionDiagLog::event("BAZAAR_BUY", identityId,
 			"auction=" + String::valueOf(purchase.auctionOid) +
 			" object=" + String::valueOf(purchase.objectId) +
-			" price=" + String::valueOf(purchase.price) + " result=debited");
+			" price=" + String::valueOf(purchase.price) +
+			" need=" + (upgrade ? String("upgrade") : String("buy_list")) +
+			" result=debited");
 	}
 	{
 		Locker progressionLock(&progressionMutex);
@@ -13034,6 +13852,7 @@ void SimPlayerManager::commitPlayerBotBazaarPurchaseLocked(
 		purchase.itemReceiptSum += 1;
 	}
 	markProgressionDirtyLocked(purchase.identityId);
+	progressionLoadoutDirtyIds.put(purchase.identityId, true);
 	purchase.templateCrc = objectTemplateCrc;
 	purchase.gameObjectType = gameObjectType;
 	purchase.state = PLAYER_BOT_PURCHASE_COMMITTED;
@@ -14200,6 +15019,42 @@ bool SimPlayerManager::playerBotProgressionAwardGateEnabled() {
 	return true;
 }
 
+bool SimPlayerManager::playerBotLoadoutGateEnabled(uint64 identityId) {
+	// Master progression first, then the identity-scoped harness override, then
+	// the configured capability flag. The early-game gate remains a required
+	// parent because loadout only refines that weapon path.
+	if (!progressionEnabled)
+		return false;
+	bool loadoutEnabled = progressionWeaponLoadout;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (identityId != 0 &&
+				playerBotParityTestLoadoutGateOverrideActive &&
+				playerBotParityLoadoutGateScopedIds.contains(identityId))
+			loadoutEnabled = playerBotParityLoadoutGateValues.contains(identityId) ?
+				playerBotParityLoadoutGateValues.get(identityId) :
+				playerBotParityTestLoadoutGateOverride;
+	}
+	if (!loadoutEnabled ||
+			!progressionLoaded || progressionItemReconcilePending.load() ||
+			!playerBotEarlyGameGateEnabled())
+		return false;
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	return economyManager != nullptr && economyManager->isItemVaultAvailable();
+}
+
+bool SimPlayerManager::playerBotBazaarUpgradesGateEnabled(uint64 identityId) {
+	if (!progressionEnabled)
+		return false;
+	bool upgradesEnabled = progressionBazaarUpgrades;
+	Locker parityLock(&playerBotParityTestMutex);
+	if (identityId != 0 &&
+			playerBotParityBazaarUpgradesGateScopedIds.contains(identityId))
+		upgradesEnabled = playerBotParityBazaarUpgradesGateValues.contains(identityId) ?
+			playerBotParityBazaarUpgradesGateValues.get(identityId) : false;
+	return upgradesEnabled;
+}
+
 bool SimPlayerManager::playerBotBazaarSellGateEnabled(uint64 identityId) {
 	if (!progressionEnabled)
 		return false;
@@ -14454,6 +15309,10 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 			armingOp = "setBazaarSellGate";
 		else if (gate == "bazaarBuy")
 			armingOp = "setBazaarBuyGate";
+		else if (gate == "loadout")
+			armingOp = "setLoadoutGate";
+		else if (gate == "bazaarUpgrades")
+			armingOp = "setBazaarUpgradesGate";
 		else if (gate == "novice")
 			armingOp = "setNoviceGate";
 		else if (gate == "progressionEnabled")
@@ -14496,6 +15355,10 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 				!progressionItemReconcilePending.load() &&
 				!progressionListingReconcilePending.load() &&
 				!progressionPurchaseReconcilePending.load();
+		else if (gate == "loadout")
+			live = playerBotLoadoutGateEnabled(0);
+		else if (gate == "bazaarUpgrades")
+			live = playerBotBazaarUpgradesGateEnabled(0);
 		else if (gate == "novice") {
 			Locker pveLock(&pveMutex);
 			live = pveNoviceEnabled;
@@ -15037,6 +15900,8 @@ bool SimPlayerManager::trainPlayerBotSkill(uint64 identityId,
 		progression.skills.add(normalizedSkill);
 		progression.skillPointsSpent = derivedPlayerBotSkillPoints(progression);
 		markProgressionDirtyLocked(identityId);
+		progressionCertificationCache.drop(identityId);
+		progressionLoadoutDirtyIds.put(identityId, true);
 		trainingLastSkill = normalizedSkill;
 		if (!identity.trainingPlan.isEmpty())
 			// Mint-time grants do not enqueue training, but they still refresh the
@@ -15824,7 +16689,9 @@ void SimPlayerManager::scorePlayerBotActivity(
 }
 
 void SimPlayerManager::refreshPlayerBotActivityStates() {
-	if (!playerBotEarlyGameGateEnabled()) {
+	const bool earlyGameEnabled = playerBotEarlyGameGateEnabled();
+	const bool loadoutEnabled = playerBotLoadoutGateEnabled(0);
+	if (!earlyGameEnabled && !loadoutEnabled) {
 		Locker progressionLock(&progressionMutex);
 		progressionEarlyGameStates.removeAll();
 		return;
@@ -15862,6 +16729,7 @@ void SimPlayerManager::refreshPlayerBotActivityStates() {
 				decisions.elementAt(i).getValue();
 			state.activity = decision.activity;
 			state.graduated = decision.graduated;
+			state.templateComplete = decision.templateComplete;
 			state.stalledBoxes = decision.stalledBoxes;
 		}
 	}
@@ -15874,17 +16742,47 @@ void SimPlayerManager::refreshPlayerBotActivityStates() {
 	// which stalls the ladder indefinitely rather than failing loudly. Compare
 	// the desired weapon XP type against what the body is recorded as holding
 	// and reconcile the difference here, on the existing slow tick.
+	const uint64 nowMs = System::getMiliTime();
+	bool fullSweep = false;
+	if (loadoutEnabled) {
+		Locker progressionLock(&progressionMutex);
+		fullSweep = progressionLoadoutLastFullSweepMs == 0 ||
+			nowMs - progressionLoadoutLastFullSweepMs >=
+				static_cast<uint64>(progressionLoadoutFullSweepMinutes) * 60000;
+		if (fullSweep)
+			progressionLoadoutLastFullSweepMs = nowMs;
+	}
 	for (int i = 0; i < decisions.size(); ++i) {
 		uint64 identityId = decisions.elementAt(i).getKey();
-		if (decisions.elementAt(i).getValue().activity != "grind")
+		// The legacy early-game loadout only re-equips grinders. With the
+		// loadout on, every activity is reconciled: a hunting bot otherwise
+		// keeps its spawn weapon until it dies, whatever the vault holds.
+		// Combat still defers the swap (reapply), so no mid-fight switch.
+		if (!loadoutEnabled && decisions.elementAt(i).getValue().activity != "grind")
 			continue;
+		// With the loadout on, selection (a vault snapshot) runs only for an
+		// identity marked dirty by loot, purchase, training or item reconcile,
+		// or on the periodic full sweep.
+		if (loadoutEnabled && !fullSweep) {
+			Locker progressionLock(&progressionMutex);
+			if (!progressionLoadoutDirtyIds.contains(identityId))
+				continue;
+		}
 		SimBotIdentity identity;
 		if (!snapshotPlayerBotIdentity(identityId, identity))
 			continue;
 		String desiredTemplate;
 		String desiredXpType;
-		if (!selectPlayerBotEarlyGameWeapon(identity, desiredTemplate,
-				desiredXpType) || desiredXpType.isEmpty())
+		SimBotLoadout::LoadoutChoice desiredLoadout;
+		bool hasDesiredLoadout = false;
+		if (loadoutEnabled) {
+			hasDesiredLoadout = selectPlayerBotLoadout(identity, desiredLoadout);
+			desiredXpType = desiredLoadout.stats.xpType;
+		} else {
+			hasDesiredLoadout = selectPlayerBotEarlyGameWeapon(identity,
+				desiredTemplate, desiredXpType);
+		}
+		if (!hasDesiredLoadout || desiredXpType.isEmpty())
 			continue;
 		bool hasLiveBody = false;
 		{
@@ -15894,14 +16792,33 @@ void SimPlayerManager::refreshPlayerBotActivityStates() {
 		if (!hasLiveBody)
 			continue;
 		String recordedXpType;
+		uint64 recordedSourceOid = 0;
 		{
 			Locker progressionLock(&progressionMutex);
-			if (progressionEarlyGameStates.contains(identityId))
+			if (progressionEarlyGameStates.contains(identityId)) {
 				recordedXpType = progressionEarlyGameStates.get(
 					identityId).currentWeaponXpType;
+				recordedSourceOid = progressionEarlyGameStates.get(
+					identityId).currentLoadoutSourceOid;
+			}
+			// Already wearing the choice: nothing to re-equip. A mismatch keeps
+			// the mark until reapply succeeds, so a failed or combat-deferred
+			// equip is retried next tick.
+			if (loadoutEnabled && recordedXpType == desiredXpType &&
+					recordedSourceOid == desiredLoadout.objectId)
+				progressionLoadoutDirtyIds.drop(identityId);
 		}
-		if (recordedXpType != desiredXpType)
+		const bool sourceChanged = loadoutEnabled &&
+			recordedSourceOid != desiredLoadout.objectId;
+		if (recordedXpType != desiredXpType || sourceChanged) {
 			loadoutReconcileIds.add(identityId);
+			// A full-sweep mismatch must survive a combat-deferred or failed
+			// equip: the mark is what brings it back on the next ordinary tick.
+			if (loadoutEnabled) {
+				Locker progressionLock(&progressionMutex);
+				progressionLoadoutDirtyIds.put(identityId, true);
+			}
+		}
 	}
 
 	// Deliberately outside every manager mutex: reapply takes the agent lock,
@@ -16648,6 +17565,10 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 				row.version++;
 				row.dirty = true;
 				progressionItemDirtyIds.put(row.objectId, true);
+				if (previousIdentityId != 0)
+					progressionLoadoutDirtyIds.put(previousIdentityId, true);
+				if (locationIdentityId != 0)
+					progressionLoadoutDirtyIds.put(locationIdentityId, true);
 				continue;
 			}
 
@@ -16668,6 +17589,8 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 			row.version++;
 			row.dirty = true;
 			progressionItemDirtyIds.put(row.objectId, true);
+			if (previousIdentityId != 0)
+				progressionLoadoutDirtyIds.put(previousIdentityId, true);
 			if (decision.ledgerDelta != 0 && previousIdentityId != 0) {
 				uint64 held = progressionItemHeldCounts.contains(previousIdentityId) ?
 					progressionItemHeldCounts.get(previousIdentityId) : 0;
@@ -16725,6 +17648,8 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 			row.dirty = true;
 			progressionItems.put(row.objectId, row);
 			progressionItemDirtyIds.put(row.objectId, true);
+			if (row.identityId != 0)
+				progressionLoadoutDirtyIds.put(row.identityId, true);
 			if (row.state == SIMBOT_ITEM_HELD || row.state == SIMBOT_ITEM_LISTED) {
 				if (row.state == SIMBOT_ITEM_LISTED)
 					row.refId = observedItem.auctionOid;
@@ -18753,6 +19678,24 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 		return bazaarBuyReconcileCommitted.get();
 	if (key == "bazaar.buy.reconcile.refunded" || key == "bazaarbuyreconcilerefunded")
 		return bazaarBuyReconcileRefunded.get();
+	if (key == "bazaar.buy.upgrades" || key == "bazaarbuyupgrades")
+		return bazaarBuyUpgradesDebited.get();
+	if (key == "bazaar.buy.upgrades.skippednotbetter")
+		return bazaarBuyUpgradesSkippedNotBetter.get();
+	if (key == "bazaar.buy.upgrades.skippeduncertified")
+		return bazaarBuyUpgradesSkippedUncertified.get();
+	if (key == "bazaar.buy.upgrades.skippedoverbudget")
+		return bazaarBuyUpgradesSkippedOverBudget.get();
+	if (key == "bazaar.buy.upgrades.skippedunaffordable")
+		return bazaarBuyUpgradesSkippedUnaffordable.get();
+	if (key == "loadout.vaultequips")
+		return loadoutVaultEquips.get();
+	if (key == "loadout.starterfallbacks")
+		return loadoutStarterFallbacks.get();
+	if (key == "loadout.hysteresisholds")
+		return loadoutHysteresisHolds.get();
+	if (key == "loadout.sellprotected" || key == "bazaar.skipped.loadout")
+		return loadoutSellProtected.get();
 	if (key == "bazaar.visits.begun" || key == "bazaarvisitsbegun")
 		return bazaarVisitsBegun.get();
 	if (key == "bazaar.visits.listedany" || key == "bazaarvisitslistedany")
@@ -19261,6 +20204,8 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 		playerBotParityTestBazaarSellGateOverride = false;
 		playerBotParityTestBazaarBuyGateOverrideActive = false;
 		playerBotParityTestBazaarBuyGateOverride = false;
+		playerBotParityTestLoadoutGateOverrideActive = false;
+		playerBotParityTestLoadoutGateOverride = false;
 		if (playerBotParityTestBazaarMarkupOverrideActive) {
 			progressionBazaarMarkup =
 				playerBotParityTestBazaarMarkupOverridePrevious;
@@ -19274,6 +20219,13 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 	playerBotParityLootGateScopedIds.removeAll();
 	playerBotParityBazaarSellGateScopedIds.removeAll();
 	playerBotParityBazaarBuyGateScopedIds.removeAll();
+	playerBotParityLoadoutGateScopedIds.removeAll();
+	playerBotParityLoadoutGateValues.removeAll();
+	playerBotParityBazaarUpgradesGateScopedIds.removeAll();
+	playerBotParityBazaarUpgradesGateValues.removeAll();
+	playerBotParityLoadoutHarnessOptIns.removeAll();
+	playerBotParityLoadoutCertOverrides.removeAll();
+	playerBotParityLoadoutWeaponRefs.removeAll();
 	playerBotParityBazaarBuyListOverrides.removeAll();
 	playerBotParityBazaarSellerBankBaselines.removeAll();
 	playerBotParityMissionCreditScopedIds.removeAll();
@@ -19761,6 +20713,13 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 				"bazaar.buy.skipped.timeout",
 				"bazaar.buy.reconcile.committed",
 				"bazaar.buy.reconcile.refunded",
+				"bazaar.buy.upgrades",
+				"bazaar.buy.upgrades.skippedNotBetter",
+				"bazaar.buy.upgrades.skippedUncertified",
+				"bazaar.buy.upgrades.skippedOverBudget",
+				"bazaar.buy.upgrades.skippedUnaffordable",
+				"loadout.vaultEquips", "loadout.starterFallbacks",
+				"loadout.hysteresisHolds", "loadout.sellProtected",
 				"bazaar.saleUnresolved", "bazaar.saleBacklogOverflow",
 				"bazaar.releaseBuyerGone", "bazaar.deleteBlockedByListing",
 				"bazaar.reconcile.adopted", "bazaar.reconcile.settled",
@@ -20117,6 +21076,11 @@ bool SimPlayerManager::executePlayerBotParityStep(
 				op == "assertAttackSource" || op == "assertAbilityUse" ||
 				op == "setLootGate" || op == "setBazaarSellGate" ||
 				op == "setBazaarBuyGate" || op == "setBuyListOverride" ||
+				op == "setLoadoutGate" || op == "setBazaarUpgradesGate" ||
+				op == "setLoadoutHarnessOptIn" || op == "setCertsOverride" ||
+				op == "grantVaultWeapon" || op == "reapplyLoadout" ||
+				op == "assertLoadout" || op == "assertSellProtected" ||
+				op == "listHarnessWeapon" ||
 				op == "buyAtTerminal" || op == "assertPurchase" ||
 				op == "forgeDeliveredPurchase" ||
 				op == "seedCorpseLoot" ||
@@ -20217,6 +21181,96 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		playerBotParityTestBazaarBuyGateOverrideActive = true;
 		playerBotParityTestBazaarBuyGateOverride = enabledValue != 0;
 		playerBotParityBazaarBuyGateScopedIds.put(identityId, true);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "setLoadoutGate" || op == "setBazaarUpgradesGate") {
+		if (identityId == 0) {
+			result.status = "FAIL";
+			result.failReason = "loadout_gate_requires_identity";
+			return true;
+		}
+		int64 enabledValue = 0;
+		if (step.hasGateEnabled)
+			enabledValue = step.gateEnabled ? 1 : 0;
+		else if (step.hasBazaarBuyGate)
+			enabledValue = step.bazaarBuyGate ? 1 : 0;
+		else if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_loadout_gate_value";
+			return true;
+		}
+		Locker parityLock(&playerBotParityTestMutex);
+		if (op == "setLoadoutGate") {
+			playerBotParityTestLoadoutGateOverrideActive = true;
+			playerBotParityTestLoadoutGateOverride = enabledValue != 0;
+			playerBotParityLoadoutGateScopedIds.put(identityId, true);
+			playerBotParityLoadoutGateValues.put(identityId,
+				enabledValue != 0);
+		} else {
+			playerBotParityBazaarUpgradesGateScopedIds.put(identityId, true);
+			playerBotParityBazaarUpgradesGateValues.put(identityId,
+				enabledValue != 0);
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "setLoadoutHarnessOptIn") {
+		if (identityId == 0 || step.xpType.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "loadout_opt_in_requires_identity_xp_type";
+			return true;
+		}
+		SimBotIdentity identity;
+		if (!snapshotPlayerBotIdentity(identityId, identity) ||
+				identity.profession != "harness") {
+			result.status = "FAIL";
+			result.failReason = "loadout_opt_in_requires_harness_identity";
+			return true;
+		}
+		SimBotLoadoutHarnessOptIn optIn;
+		optIn.desiredXpType = step.xpType;
+		optIn.templateComplete = step.hasLoadoutTemplateComplete ?
+			step.loadoutTemplateComplete : false;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityLoadoutHarnessOptIns.put(identityId, optIn);
+		}
+		{
+			Locker progressionLock(&progressionMutex);
+			progressionLoadoutDirtyIds.put(identityId, true);
+		}
+		reapplyPlayerBotProgressionToLiveBody(identityId);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "setCertsOverride") {
+		if (identityId == 0 || !step.hasCertificationOverride) {
+			result.status = "FAIL";
+			result.failReason = "certs_override_requires_identity_and_certs";
+			return true;
+		}
+		SimBotIdentity certIdentity;
+		if (!snapshotPlayerBotIdentity(identityId, certIdentity) ||
+				certIdentity.profession != "harness") {
+			result.status = "FAIL";
+			result.failReason = "certs_override_requires_harness_identity";
+			return true;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityLoadoutCertOverrides.put(identityId,
+				step.certificationOverride);
+		}
+		{
+			Locker progressionLock(&progressionMutex);
+			progressionCertificationCache.drop(identityId);
+			progressionLoadoutDirtyIds.put(identityId, true);
+		}
+		reapplyPlayerBotProgressionToLiveBody(identityId);
 		result.status = "PASS";
 		return true;
 	}
@@ -20348,6 +21402,83 @@ bool SimPlayerManager::executePlayerBotParityStep(
 	// real loot transfer.  The object is created first, moved under the bag
 	// lock, and only then does the row/ledger become visible to the listing
 	// surface.
+	if (op == "grantVaultWeapon") {
+		if (step.templateName.isEmpty() || !step.hasExpectedMinDamage ||
+				!step.hasExpectedMaxDamage || step.ref.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "vault_weapon_requires_template_stats_ref";
+			return true;
+		}
+		SimBotIdentity weaponIdentity;
+		if (!snapshotPlayerBotIdentity(identityId, weaponIdentity) ||
+				weaponIdentity.profession != "harness") {
+			result.status = "FAIL";
+			result.failReason = "vault_weapon_requires_harness_identity";
+			return true;
+		}
+		AiEconomyManager* economyManager = AiEconomyManager::instance();
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> bag = economyManager == nullptr ?
+			nullptr : economyManager->getOrCreateItemBag(identityId);
+		ManagedReference<SceneObject*> item = zoneServer == nullptr ? nullptr :
+			zoneServer->createObject(step.templateName.hashCode(), 1);
+		if (bag == nullptr || item == nullptr || !item->isWeaponObject()) {
+			if (item != nullptr)
+				item->destroyObjectFromDatabase(true);
+			result.status = "FAIL";
+			result.failReason = "vault_weapon_object_missing";
+			return true;
+		}
+		bool transferred = false;
+		{
+			Locker itemLock(item);
+			Locker bagLock(bag, item);
+			transferred = bag->transferObject(item, -1, false, true);
+			if (transferred) {
+				WeaponObject* weapon = cast<WeaponObject*>(item.get());
+				if (weapon != nullptr) {
+					weapon->setMinDamage(static_cast<float>(step.expectedMinDamage));
+					weapon->setMaxDamage(static_cast<float>(step.expectedMaxDamage));
+					if (step.hasAttackSpeed)
+						weapon->setAttackSpeed(step.attackSpeed);
+					TangibleObject* tangible = cast<TangibleObject*>(item.get());
+					if (tangible != nullptr)
+						tangible->setJunkValue(step.junkValue > 0 ? step.junkValue : 100);
+				}
+			}
+		}
+		if (!transferred) {
+			item->destroyObjectFromDatabase(true);
+			result.status = "FAIL";
+			result.failReason = "vault_weapon_transfer_failed";
+			return true;
+		}
+		SimBotItemDeposit deposit;
+		deposit.objectId = item->getObjectID();
+		deposit.templateCrc = item->getServerObjectCRC();
+		{
+			Locker itemLock(item);
+			deposit.displayName = item->getDisplayedName();
+		}
+		Vector<SimBotItemDeposit> deposits;
+		deposits.add(deposit);
+		if (!depositPlayerBotItem(identityId, deposits, "harness",
+				item->getObjectID())) {
+			item->destroyObjectFromDatabase(true);
+			result.status = "FAIL";
+			result.failReason = "vault_weapon_deposit_failed";
+			return true;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityLoadoutWeaponRefs.put(
+				String::valueOf(identityId) + ":" + step.ref,
+				item->getObjectID());
+		}
+		result.status = "PASS";
+		return true;
+	}
+
 	if (op == "seedVaultItem") {
 		if (step.templateName.isEmpty()) {
 			result.status = "FAIL";
@@ -22531,6 +23662,223 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		result.status = "PASS";
 		return true;
 	}
+	if (op == "reapplyLoadout") {
+		reapplyPlayerBotProgressionToLiveBody(identityId);
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertLoadout") {
+		if (step.source != "vault" && step.source != "starter") {
+			result.status = "FAIL";
+			result.failReason = "invalid_loadout_source_expectation";
+			return true;
+		}
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> bodyObject = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(bodyOid);
+		AiAgent* agent = bodyObject == nullptr ? nullptr : bodyObject->asAiAgent();
+		if (agent == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "loadout_body_missing";
+			return true;
+		}
+		SimBotLoadout::LoadoutChoice choice;
+		bool haveChoice = false;
+		{
+			Locker progressionLock(&progressionMutex);
+			if (progressionLoadoutChoices.contains(identityId)) {
+				choice = progressionLoadoutChoices.get(identityId);
+				haveChoice = true;
+			}
+		}
+		String actualTemplate;
+		String actualXpType;
+		float actualMinDamage = 0.f;
+		float actualMaxDamage = 0.f;
+		{
+			Locker agentLock(agent);
+			if (agent->getZone() == nullptr || agent->getWeapon() == nullptr) {
+				result.status = "FAIL";
+				result.failReason = "loadout_weapon_missing";
+				return true;
+			}
+			WeaponObject* weapon = agent->getWeapon();
+			if (weapon->getObjectTemplate() != nullptr)
+				actualTemplate = weapon->getObjectTemplate()->getFullTemplateString();
+			actualXpType = weapon->getXpType();
+			actualMinDamage = weapon->getMinDamage();
+			actualMaxDamage = weapon->getMaxDamage();
+		}
+		if (!haveChoice || (choice.source == SimBotLoadout::VAULT) !=
+				(step.source == "vault") ||
+				(!step.templateName.isEmpty() && actualTemplate != step.templateName) ||
+				(step.templateName.isEmpty() && actualTemplate ==
+					"object/weapon/creature/creature_default_weapon.iff" &&
+					choice.stats.templateString != "") ||
+				(!step.xpType.isEmpty() && actualXpType != step.xpType) ||
+				(step.hasExpectedMinDamage && actualMinDamage !=
+					static_cast<float>(step.expectedMinDamage)) ||
+				(step.hasExpectedMaxDamage && actualMaxDamage !=
+					static_cast<float>(step.expectedMaxDamage))) {
+			result.status = "FAIL";
+			result.failReason = "loadout_assertion_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "assertSellProtected") {
+		if (step.ref.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "protected_assertion_requires_ref";
+			return true;
+		}
+		int64 expected = 0;
+		if (!parsePlayerBotParityExpected(step.expect, expected)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_protected_expectation";
+			return true;
+		}
+		uint64 objectId = 0;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			String key = String::valueOf(identityId) + ":" + step.ref;
+			if (playerBotParityLoadoutWeaponRefs.contains(key))
+				objectId = playerBotParityLoadoutWeaponRefs.get(key);
+		}
+		VectorMap<uint64, bool> protectedIds;
+		collectPlayerBotProtectedWeaponOids(identityId, protectedIds);
+		if ((protectedIds.contains(objectId) ? 1 : 0) != expected) {
+			result.status = "FAIL";
+			result.failReason = "protected_weapon_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "listHarnessWeapon") {
+		if (step.ref.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "list_harness_weapon_requires_ref";
+			return true;
+		}
+		uint64 objectId = 0;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			String key = String::valueOf(identityId) + ":" + step.ref;
+			if (playerBotParityLoadoutWeaponRefs.contains(key))
+				objectId = playerBotParityLoadoutWeaponRefs.get(key);
+		}
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> bodyObject = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(bodyOid);
+		CreatureObject* body = bodyObject == nullptr ? nullptr :
+			bodyObject->asCreatureObject();
+		if (objectId == 0 || body == nullptr || body->getZone() == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "list_harness_weapon_setup_failed";
+			return true;
+		}
+		Vector3 position = body->getWorldPosition();
+		SceneObject* terminal = MarketSeederBridge::findBazaarTerminal(
+			body->getZone(), position.getX(), position.getZ(), position.getY(),
+			static_cast<float>(getPlayerBotBazaarMaxDetourMeters()), true);
+		int price = step.price > 0 ? step.price : 100;
+		if (terminal == nullptr || !listPlayerBotItemAtBazaar(identityId,
+				objectId, terminal, price)) {
+			result.status = "FAIL";
+			result.failReason = "list_harness_weapon_failed";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+	if (op == "awaitProductionLoadout") {
+		Vector<uint64> productionIds;
+		VectorMap<uint64, uint64> bodyOids;
+		{
+			Locker pveLock(&pveMutex);
+			for (int i = 0; i < pveIdentities.size(); ++i) {
+				const SimBotIdentity& identity =
+					pveIdentities.elementAt(i).getValue();
+				if (identity.profession != "harness" &&
+						!identity.trainingPlan.isEmpty() &&
+						pveIdentityBodyOids.contains(identity.id)) {
+					productionIds.add(identity.id);
+					bodyOids.put(identity.id,
+						pveIdentityBodyOids.get(identity.id));
+				}
+			}
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		for (int i = 0; i < productionIds.size(); ++i) {
+			uint64 identityId = productionIds.get(i);
+			SimBotLoadout::LoadoutChoice choice;
+			{
+				Locker progressionLock(&progressionMutex);
+				if (!progressionLoadoutChoices.contains(identityId) ||
+						progressionLoadoutChoices.get(identityId).source !=
+							SimBotLoadout::VAULT)
+					continue;
+				choice = progressionLoadoutChoices.get(identityId);
+			}
+			ManagedReference<SceneObject*> vaultObject = zoneServer == nullptr ?
+				nullptr : zoneServer->getObject(choice.objectId);
+			ManagedReference<SceneObject*> bodyObject = zoneServer == nullptr ?
+				nullptr : zoneServer->getObject(bodyOids.get(identityId));
+			AiAgent* agent = bodyObject == nullptr ? nullptr : bodyObject->asAiAgent();
+			WeaponObject* vaultWeapon = vaultObject == nullptr ? nullptr :
+				cast<WeaponObject*>(vaultObject.get());
+			AiAgent* body = agent;
+			if (vaultWeapon == nullptr || body == nullptr)
+				continue;
+			SimBotLoadout::WeaponStats vaultStats;
+			{
+				Locker itemLock(vaultWeapon);
+				fillPlayerBotWeaponStats(vaultWeapon, vaultStats);
+			}
+			String bodyTemplate;
+			String bodyXpType;
+			float bodyMinDamage = 0.f;
+			float bodyMaxDamage = 0.f;
+			{
+				Locker agentLock(body);
+				if (body->getZone() == nullptr || body->getWeapon() == nullptr)
+					continue;
+				WeaponObject* weapon = body->getWeapon();
+				if (weapon->getObjectTemplate() != nullptr)
+					bodyTemplate = weapon->getObjectTemplate()->getFullTemplateString();
+				bodyXpType = weapon->getXpType();
+				bodyMinDamage = weapon->getMinDamage();
+				bodyMaxDamage = weapon->getMaxDamage();
+			}
+			if (bodyTemplate != vaultStats.templateString ||
+					bodyXpType != vaultStats.xpType ||
+					bodyMinDamage != vaultStats.minDamage ||
+					bodyMaxDamage != vaultStats.maxDamage) {
+				result.status = "FAIL";
+				result.failReason = "production_loadout_stats_mismatch";
+				return true;
+			}
+			result.status = "PASS";
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
+	}
+
 	// Production loot walk (F_0.9.3): a REAL roster hunter -- not a parity
 	// harness body -- is attacked on a travel leg by a creature that carries
 	// loot and cash, kills it in self-defence, and must walk to the corpse, loot
@@ -23291,6 +24639,8 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 	SimBotProgression progression;
 	SimBotTrainingStep nextStep;
 	SimBotEarlyGameState earlyState;
+	SimBotLoadout::LoadoutChoice inspectLoadoutChoice;
+	bool haveLoadoutChoice = false;
 	Vector<SimBotItemRow> inspectItemRows;
 	Vector<PlayerBotBazaarListing> inspectListings;
 	Vector<PlayerBotBazaarPurchase> inspectPurchases;
@@ -23309,6 +24659,10 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 		if (progressionEarlyGameStates.contains(identityId)) {
 			earlyState = progressionEarlyGameStates.get(identityId);
 			haveEarlyState = true;
+		}
+		if (progressionLoadoutChoices.contains(identityId)) {
+			inspectLoadoutChoice = progressionLoadoutChoices.get(identityId);
+			haveLoadoutChoice = true;
 		}
 		if (progressionTrainingPlans.contains(identity.trainingPlan)) {
 			trainingPlan = progressionTrainingPlans.get(identity.trainingPlan);
@@ -23633,6 +24987,88 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 		String("template");
 	result["templates"] = templates;
 
+	JSONSerializationType loadout = JSONSerializationType::object();
+	loadout["configured"] = progressionWeaponLoadout;
+	loadout["enabled"] = playerBotLoadoutGateEnabled(identityId);
+	loadout["certsHeld"] = JSONSerializationType::array();
+	loadout["certsHeldCount"] = 0;
+	loadout["protected"] = JSONSerializationType::array();
+	loadout["candidates"] = JSONSerializationType::array();
+	// Gate-independent like the rest of inspect: with no live choice yet, show
+	// what the loadout would be (needs the early-game mapping to resolve).
+	if (!haveLoadoutChoice) {
+		haveLoadoutChoice = selectPlayerBotLoadout(identity,
+			inspectLoadoutChoice, true);
+		loadout["preview"] = haveLoadoutChoice;
+	}
+	if (haveLoadoutChoice) {
+		loadout["source"] = inspectLoadoutChoice.source == SimBotLoadout::VAULT ?
+			String("vault") : String("starter");
+		loadout["sourceOid"] = inspectLoadoutChoice.objectId;
+		loadout["template"] = inspectLoadoutChoice.stats.templateString;
+		loadout["xpType"] = inspectLoadoutChoice.stats.xpType;
+		loadout["dps"] = inspectLoadoutChoice.score;
+		loadout["desiredXpType"] = inspectLoadoutChoice.desiredXpType;
+		loadout["templateComplete"] = inspectLoadoutChoice.templateComplete;
+	}
+	Vector<SimBotLoadout::WeaponStats> inspectCandidates;
+	Vector<String> inspectCertsHeld;
+	Vector<String> inspectCertsPlanned;
+	Vector<String> inspectPlanXpTypes;
+	if (snapshotPlayerBotLoadoutCandidates(identityId, inspectCandidates,
+			inspectCertsHeld, inspectCertsPlanned, inspectPlanXpTypes)) {
+		JSONSerializationType certs = JSONSerializationType::array();
+		for (int i = 0; i < inspectCertsHeld.size() && i < 32; ++i)
+			certs.push_back(inspectCertsHeld.get(i));
+		loadout["certsHeldCount"] = inspectCertsHeld.size();
+		loadout["certsHeld"] = certs;
+		// Built directly, not through the gated helper, so inspect shows what
+		// SELL would protect before the capability is armed.
+		const uint64 inspectEquippedOid = haveEarlyState &&
+			earlyState.currentLoadoutSourceOid != 0 ?
+			earlyState.currentLoadoutSourceOid :
+			(haveLoadoutChoice ? inspectLoadoutChoice.objectId : 0);
+		std::vector<SimBotLoadout::WeaponStats> inspectCandidateStats;
+		for (int i = 0; i < inspectCandidates.size(); ++i)
+			inspectCandidateStats.push_back(inspectCandidates.get(i));
+		auto protectedIds = SimBotLoadout::protectedSet(inspectCandidateStats,
+			inspectEquippedOid, inspectPlanXpTypes, inspectCertsHeld,
+			inspectCertsPlanned);
+		JSONSerializationType protectedJson = JSONSerializationType::array();
+		for (size_t i = 0; i < protectedIds.size(); ++i) {
+			JSONSerializationType row = JSONSerializationType::object();
+			const uint64 protectedOid = protectedIds[i];
+			row["oid"] = protectedOid;
+			row["reason"] = protectedOid == inspectEquippedOid ?
+				String("equipped") : String("planned_class");
+			for (int j = 0; j < inspectCandidates.size(); ++j) {
+				const SimBotLoadout::WeaponStats& candidate = inspectCandidates.get(j);
+				if (candidate.objectId != protectedOid)
+					continue;
+				row["template"] = candidate.templateString;
+				row["xpType"] = candidate.xpType;
+				row["dps"] = SimBotLoadout::scoreWeapon(candidate);
+				break;
+			}
+			protectedJson.push_back(row);
+		}
+		loadout["protected"] = protectedJson;
+		JSONSerializationType candidateJson = JSONSerializationType::array();
+		for (int i = 0; i < inspectCandidates.size(); ++i) {
+			const SimBotLoadout::WeaponStats& candidate = inspectCandidates.get(i);
+			JSONSerializationType row = JSONSerializationType::object();
+			row["oid"] = candidate.objectId;
+			row["template"] = candidate.templateString;
+			row["xpType"] = candidate.xpType;
+			row["dps"] = SimBotLoadout::scoreWeapon(candidate);
+			row["certified"] = SimBotLoadout::isCertified(
+				candidate.certificationsRequired, inspectCertsHeld);
+			candidateJson.push_back(row);
+		}
+		loadout["candidates"] = candidateJson;
+	}
+	result["loadout"] = loadout;
+
 	JSONSerializationType activeAbilities = JSONSerializationType::array();
 	JSONSerializationType inactiveAbilities = JSONSerializationType::array();
 	for (int i = 0; i < installedAbilities.size(); ++i) {
@@ -23898,6 +25334,16 @@ String SimPlayerManager::buildPlayerBotAdminInfoText(uint64 identityId) {
 		<< text(templates["body"], "bodyHam") << endl;
 	out << "  Weapon: " << text(templates["weapon"], "template") << " ("
 		<< text(templates["weapon"], "xpType") << ")" << endl;
+	const JSONSerializationType& loadout = inspect["loadout"];
+	out << "Loadout: " << text(loadout, "source") << " oid "
+		<< text(loadout, "sourceOid") << " ("
+		<< text(loadout, "template") << ") dps "
+		<< text(loadout, "dps") << ", desired "
+		<< text(loadout, "desiredXpType") << endl;
+	out << "  Certs held: " << joinArray(loadout["certsHeld"], nullptr)
+		<< endl;
+	out << "  Protected: " << joinArray(loadout["protected"], nullptr)
+		<< endl;
 	out << "  AI: " << text(templates, "aiTree") << "  Attacks from: "
 		<< (text(templates, "attackSource") == "skill" ?
 			"trained skills" : "body template") << endl << endl;
@@ -23956,6 +25402,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 
 	VectorMap<uint64, SimBotProgression> records;
 	VectorMap<uint64, SimBotEarlyGameState> earlyGameStateSnapshot;
+	VectorMap<uint64, SimBotLoadout::LoadoutChoice> loadoutChoiceSnapshot;
 	SimBotEarlyGameConfig earlyGameConfigSnapshot;
 	SimBotCombatAbilityConfig combatAbilityConfigSnapshot;
 	int dirtyCount = 0;
@@ -23981,6 +25428,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		Locker progressionLock(&progressionMutex);
 		records = progressionRecords;
 		earlyGameStateSnapshot = progressionEarlyGameStates;
+		loadoutChoiceSnapshot = progressionLoadoutChoices;
 		earlyGameConfigSnapshot = progressionEarlyGameConfig;
 		combatAbilityConfigSnapshot = progressionCombatAbilityConfig;
 		dirtyCount = progressionDirtyIds.size();
@@ -24149,6 +25597,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		!progressionListingReconcilePending.load() &&
 		!progressionPurchaseReconcilePending.load();
 	gates["bazaarBuy"] = bazaarBuyDashboardEnabled;
+	gates["loadout"] = playerBotLoadoutGateEnabled(0);
 	result["gates"] = gates;
 
 	JSONSerializationType missionCredits = JSONSerializationType::object();
@@ -24263,6 +25712,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	skipped["noTrade"] = bazaarSkippedNoTrade.get();
 	skipped["transferFailed"] = bazaarSkippedTransferFailed.get();
 	skipped["needed"] = bazaarSkippedNeeded.get();
+	skipped["loadout"] = bazaarSkippedLoadout.get();
 	bazaar["skipped"] = skipped;
 	JSONSerializationType visits = JSONSerializationType::object();
 	visits["begun"] = bazaarVisitsBegun.get();
@@ -24315,12 +25765,64 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	buySkipped["transferFailed"] = bazaarBuySkippedTransferFailed.get();
 	buySkipped["timeout"] = bazaarBuySkippedTimeout.get();
 	bazaarBuy["skipped"] = buySkipped;
+	JSONSerializationType upgrades = JSONSerializationType::object();
+	upgrades["debited"] = bazaarBuyUpgradesDebited.get();
+	upgrades["skippedNotBetter"] =
+		bazaarBuyUpgradesSkippedNotBetter.get();
+	upgrades["skippedUncertified"] =
+		bazaarBuyUpgradesSkippedUncertified.get();
+	upgrades["skippedOverBudget"] =
+		bazaarBuyUpgradesSkippedOverBudget.get();
+	upgrades["skippedUnaffordable"] =
+		bazaarBuyUpgradesSkippedUnaffordable.get();
+	bazaarBuy["upgrades"] = upgrades;
 	JSONSerializationType buyReconcile = JSONSerializationType::object();
 	buyReconcile["committed"] = bazaarBuyReconcileCommitted.get();
 	buyReconcile["refunded"] = bazaarBuyReconcileRefunded.get();
 	bazaarBuy["reconcile"] = buyReconcile;
 	bazaar["buy"] = bazaarBuy;
 	result["bazaar"] = bazaar;
+
+	JSONSerializationType loadout = JSONSerializationType::object();
+	loadout["configured"] = progressionWeaponLoadout;
+	loadout["enabled"] = playerBotLoadoutGateEnabled(0);
+	loadout["minUpgradePercent"] = progressionLoadoutMinUpgradePercent;
+	loadout["fullSweepMinutes"] = progressionLoadoutFullSweepMinutes;
+	loadout["upgradeSpendFraction"] = progressionLoadoutUpgradeSpendFraction;
+	loadout["upgradeScanIntervalMinutes"] =
+		progressionLoadoutUpgradeScanIntervalMinutes;
+	loadout["maxUpgradeLoadsPerVisit"] =
+		progressionLoadoutMaxUpgradeLoadsPerVisit;
+	loadout["bazaarUpgrades"] = progressionBazaarUpgrades &&
+		progressionBazaarBuyEnabled;
+	loadout["selections"] = loadoutSelections.get();
+	loadout["vaultEquips"] = loadoutVaultEquips.get();
+	loadout["starterFallbacks"] = loadoutStarterFallbacks.get();
+	loadout["skippedUncertified"] = loadoutSkippedUncertified.get();
+	loadout["skippedWrongClass"] = loadoutSkippedWrongClass.get();
+	loadout["hysteresisHolds"] = loadoutHysteresisHolds.get();
+	loadout["reequipsDeferredInCombat"] =
+		loadoutReequipsDeferredInCombat.get();
+	loadout["sellProtected"] = loadoutSellProtected.get();
+	loadout["upgrades"] = upgrades;
+	JSONSerializationType loadoutRows = JSONSerializationType::array();
+	for (int i = 0; i < loadoutChoiceSnapshot.size(); ++i) {
+		const SimBotLoadout::LoadoutChoice& choice =
+			loadoutChoiceSnapshot.elementAt(i).getValue();
+		JSONSerializationType row = JSONSerializationType::object();
+		row["identityId"] = loadoutChoiceSnapshot.elementAt(i).getKey();
+		row["source"] = choice.source == SimBotLoadout::VAULT ?
+			String("vault") : String("starter");
+		row["sourceOid"] = choice.objectId;
+		row["template"] = choice.stats.templateString;
+		row["xpType"] = choice.stats.xpType;
+		row["desiredXpType"] = choice.desiredXpType;
+		row["dps"] = choice.score;
+		row["templateComplete"] = choice.templateComplete;
+		loadoutRows.push_back(row);
+	}
+	loadout["choices"] = loadoutRows;
+	result["loadout"] = loadout;
 
 	JSONSerializationType vaultJson = JSONSerializationType::object();
 	vaultJson["available"] = dashboardEconomy != nullptr &&
@@ -24532,6 +26034,8 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		row["defensiveEngagements"] = state.defensiveEngagements;
 		row["defensiveFlees"] = state.defensiveFlees;
 		row["currentWeaponXpType"] = state.currentWeaponXpType;
+		row["currentLoadoutSourceOid"] = state.currentLoadoutSourceOid;
+		row["templateComplete"] = state.templateComplete;
 		JSONSerializationType stalled = JSONSerializationType::array();
 		for (int j = 0; j < state.stalledBoxes.size(); ++j)
 			stalled.push_back(state.stalledBoxes.get(j));
@@ -25366,6 +26870,10 @@ void SimPlayerManager::retirePveIdentity(uint64 identityId) {
 		progressionTrainingNextSteps.drop(identityId);
 		progressionTrainingPendingIds.drop(identityId);
 		progressionEarlyGameStates.drop(identityId);
+		progressionLoadoutChoices.drop(identityId);
+		progressionCertificationCache.drop(identityId);
+		progressionLoadoutDirtyIds.drop(identityId);
+		progressionBazaarUpgradeScanAtMs.drop(identityId);
 	}
 	if (!destroyPlayerBotItemsAndBag(identityId))
 		return;
@@ -25595,6 +27103,8 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 	String templateName;
 	String weaponTemplate;
 	String expectedWeaponXpType;
+	SimBotLoadout::LoadoutChoice loadoutChoice;
+	bool loadoutSelection = false;
 	String noviceBodyTemplate;
 	int noviceBodyHam = 0;
 	SimBotTrainingPlan trainingPlan;
@@ -25622,8 +27132,16 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 				trainingPlan.loadError != "over_budget") || templateName.isEmpty())
 			return nullptr;
 	}
-	if (!identity.trainingPlan.isEmpty() && identity.profession != "harness" &&
-			playerBotEarlyGameGateEnabled()) {
+	if (!identity.trainingPlan.isEmpty() &&
+			playerBotLoadoutGateEnabled(identity.id)) {
+		weaponTemplate = "";
+		loadoutSelection = selectPlayerBotLoadout(identity, loadoutChoice);
+		if (loadoutSelection) {
+			weaponTemplate = loadoutChoice.stats.templateString;
+			expectedWeaponXpType = loadoutChoice.stats.xpType;
+		}
+	} else if (!identity.trainingPlan.isEmpty() &&
+			identity.profession != "harness" && playerBotEarlyGameGateEnabled()) {
 		// Once early-game loadout is enabled, static per-plan weapon fields are
 		// intentionally ignored. An unmapped next XP type leaves the loaded
 		// stock weapon untouched.
@@ -25769,7 +27287,9 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 		// advance. It aligns every AI weapon pointer and validates containment
 		// plus XP type, instead of assuming every armed body is ranged.
 		equipped = equipPlayerBotWeaponLocked(agent,
-			weaponTemplate, expectedWeaponXpType, restoreRealWeaponDamage);
+			weaponTemplate, expectedWeaponXpType, restoreRealWeaponDamage, false,
+			loadoutSelection && loadoutChoice.source == SimBotLoadout::VAULT ?
+				&loadoutChoice.stats : nullptr);
 		if (identity.deaths > 0 && pveCloneWoundAmount > 0) {
 			for (uint8 pool = CreatureAttribute::HEALTH;
 					pool <= CreatureAttribute::WILLPOWER; ++pool) {
@@ -25804,6 +27324,17 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 		agent->destroyObjectFromWorld(true);
 		agent->destroyObjectFromDatabase(true);
 		return nullptr;
+	}
+	if (loadoutSelection) {
+		Locker progressionLock(&progressionMutex);
+		if (progressionEarlyGameStates.contains(identity.id)) {
+			progressionEarlyGameStates.get(identity.id).currentWeaponXpType =
+				loadoutChoice.stats.xpType;
+			progressionEarlyGameStates.get(identity.id).currentLoadoutSourceOid =
+				loadoutChoice.objectId;
+			progressionEarlyGameStates.get(identity.id).templateComplete =
+				loadoutChoice.templateComplete;
+		}
 	}
 
 	uint64 bodyOid = agent->getObjectID();
