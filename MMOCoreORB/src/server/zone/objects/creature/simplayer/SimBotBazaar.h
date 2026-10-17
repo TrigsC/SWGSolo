@@ -76,6 +76,59 @@ inline PriceDecision priceListing(int junkValue, float markup, int minPrice,
 	return decision;
 }
 
+enum PurchaseReason {
+	BUY,
+	OVER_CEILING,
+	NO_CEILING,
+	UNAFFORDABLE,
+	OWN_LISTING
+};
+
+inline int buyCeiling(int junkValue, float markup, int minPrice,
+		int maxPrice, int entryMaxPrice) {
+	if (maxPrice < 1)
+		return 0;
+
+	int ceiling = 0;
+	if (junkValue > 0) {
+		markup = std::max(0.1f, std::min(100.f, markup));
+		ceiling = static_cast<int>(std::lround(
+			static_cast<double>(junkValue) * markup));
+	} else if (entryMaxPrice > 0) {
+		ceiling = entryMaxPrice;
+	} else {
+		return 0;
+	}
+
+	return clampPrice(ceiling, minPrice, maxPrice);
+}
+
+inline PurchaseReason decidePurchase(int price, int ceiling, int64_t bank,
+		int64_t reserved, int64_t reserveCredits, bool ownListing) {
+	if (ownListing)
+		return OWN_LISTING;
+	if (ceiling <= 0)
+		return NO_CEILING;
+	if (price > ceiling)
+		return OVER_CEILING;
+	if (price > bank - reserved - reserveCredits)
+		return UNAFFORDABLE;
+	return BUY;
+}
+
+inline int unmetNeed(int quantity, int ownedCount, int pendingCount) {
+	return std::max(0, quantity - ownedCount - pendingCount);
+}
+
+inline bool reservedForNeed(int rank, int quantity) {
+	return rank >= 0 && rank < quantity;
+}
+
+inline bool settlementDropsItemRow(uint64_t rowIdentity,
+		uint64_t sellerIdentity) {
+	return rowIdentity == sellerIdentity;
+}
+
 inline bool isAppliedLedgerRow(uint64_t rowId, uint64_t appliedMark,
 		bool voided) {
 	return rowId != 0 && !voided && rowId <= appliedMark;
@@ -186,6 +239,7 @@ enum ObjectLocation {
 enum ReconcileDecision {
 	RECONCILE_UNCHANGED,
 	RECONCILE_SETTLE,
+	RECONCILE_SETTLE_FROM_BUYER,
 	RECONCILE_RELEASE,
 	RECONCILE_RETRIEVED,
 	RECONCILE_ORPHANED,
@@ -197,7 +251,8 @@ enum ReconcileDecision {
 inline ReconcileDecision decideListingReconcile(RowState rowState,
 		AuctionStatus auctionStatus, bool ownerIsThisBag,
 		int64_t creditReceiptSum, int64_t itemReceiptSum,
-		ObjectLocation objectLocation, bool bagMatchesIdentity) {
+		ObjectLocation objectLocation, bool bagMatchesIdentity,
+		bool buyerEvidence = false) {
 	const bool creditReceipt = creditReceiptSum > 0;
 	const bool itemReceipt = itemReceiptSum < 0;
 	const bool bothReceipts = creditReceipt && itemReceipt;
@@ -225,6 +280,9 @@ inline ReconcileDecision decideListingReconcile(RowState rowState,
 	if (rowState == ROW_LISTED && auctionStatus == AUCTION_MISSING &&
 			objectLocation == LOCATION_IDENTITY_BAG && bagMatchesIdentity)
 		return RECONCILE_RETRIEVED;
+	if (rowState == ROW_LISTED && auctionStatus == AUCTION_MISSING &&
+			objectLocation == LOCATION_OTHER_BAG && buyerEvidence)
+		return RECONCILE_SETTLE_FROM_BUYER;
 	if (rowState == ROW_LISTED && auctionStatus == AUCTION_MISSING)
 		return RECONCILE_ORPHANED;
 
@@ -247,6 +305,8 @@ enum SettlementOperation {
 	SETTLEMENT_SWEEP,
 	SETTLEMENT_RECONCILE,
 	SETTLEMENT_DELETION_RETRIEVAL,
+	SETTLEMENT_PURCHASE_RESOLVE,
+	SETTLEMENT_NEW_PURCHASE,
 	SETTLEMENT_NEW_LISTING,
 	SETTLEMENT_AWARD,
 	SETTLEMENT_TRAINING
@@ -259,7 +319,32 @@ inline bool settlementModeAllows(SettlementOperation operation) {
 	// new listing.
 	return operation == SETTLEMENT_FLUSH || operation == SETTLEMENT_SALE ||
 		operation == SETTLEMENT_SWEEP || operation == SETTLEMENT_RECONCILE ||
-		operation == SETTLEMENT_DELETION_RETRIEVAL;
+		operation == SETTLEMENT_DELETION_RETRIEVAL ||
+		operation == SETTLEMENT_PURCHASE_RESOLVE;
+}
+
+enum PurchaseReconcileDecision {
+	COMMIT,
+	ALREADY_COMMITTED,
+	REFUND,
+	DONE
+};
+
+// Boot resolution of an applied, unrefunded purchase debit. An auction OID is
+// never reused, so a listing that still carries it proves the object store
+// reverted the buy (or never ran it): refund, whatever MySQL recorded. The
+// item receipt proves a commit that later moves of the item cannot undo;
+// without one, delivery is proved only by the object sitting in the bag.
+inline PurchaseReconcileDecision decidePurchaseReconcile(int64_t netDebit,
+		bool auctionStillListed, bool objectInIdentityBag,
+		int64_t itemReceiptSum) {
+	if (netDebit >= 0)
+		return DONE;
+	if (auctionStillListed)
+		return REFUND;
+	if (itemReceiptSum > 0)
+		return ALREADY_COMMITTED;
+	return objectInIdentityBag ? COMMIT : REFUND;
 }
 
 inline bool mayReleaseHeldSale(bool creditReceiptApplied,

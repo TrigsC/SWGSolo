@@ -237,6 +237,10 @@ no new warnings before handing work back** (owner-stated standard).
   `bazaarSaleBacklogMax` and the `bazaar` block: `markup` 3.0, `minPrice`, listing caps,
   `listingDurationHours`, `visitCooldownMinutes`, `maxDetourMeters`, sweep cadence and
   `drainOnDisable` (turning the gate off withdraws every bot listing to the vault).
+  F_0.9.10 (v0.9.12) adds `playerBotProgression.bazaarBuy` (default off), the `bazaar.buy` block
+  (`reserveCredits` 5,000, `maxPurchasesPerVisit`, `maxPendingPerBot`, `candidateScanLimit` per need,
+  `maxObjectLoadsPerVisit`, `executeTimeoutSeconds`) and an optional per-training-plan `buyList`
+  (`template`, `quantity` 1..5, `maxPrice`; at most 8 entries; shipped empty).
   **The running server re-reads this file from disk on its own**: a syntax error in
   the working copy is hit live within seconds (it keeps the previous config), so
   `luac -p` any edit immediately.
@@ -1032,6 +1036,39 @@ This is this fork's primary custom subsystem, layered on top of the stock
       (expired items never relisted).
   - **Live receipts:** 33/33 and 26/26
     (`docs/4-unit-tests/live_f099-*`), plus the owner's in-client purchase.
+- **Bazaar BUY (P.10k / F_0.9.10, released v0.9.12)**: the first path where bot credits reach a
+  player's bank.
+  - **Need and price.** A bot buys only what its plan's `buyList` lacks (owned or pending counts),
+    at or below loot value x markup (else the entry's `maxPrice`), keeping a credit reserve, from
+    any seller kind. Needed items are excluded from SELL. Choice runs at the same terminal visit
+    (`buyPlayerBotItemsAtTerminal`); object loads are bounded per need and per visit, and a leaf-mutex
+    listing-template cache makes known mismatches free.
+  - **Debit first, the inverse of SELL.** No player waits on a bot's purchase, so the debit
+    (`bazaar_buy` ledger row, `ref_id` = auction, `detail` = item OID) must be at or below the
+    applied mark before the object store moves. The lane then runs
+    `AuctionManager::buySimBotItem` (`AuctionItem` -> object -> bag, the `retrieveSimBotItem` order;
+    all locks released before the seller is paid). A bot can never hold a bought item without a
+    durable debit.
+  - **Purchases are keyed `(identity, auction)`**, since two bots can debit for one listing.
+  - **Boot resolution is by evidence:**
+    - the auction OID still listed -> the object store reverted -> refund;
+    - a `bazaar_buy` item receipt -> committed, even if the item was later sold;
+    - the object in the bag -> commit;
+    - otherwise -> refund.
+    The item reconcile defers such objects, and the ledger prune never separates a debit from its
+    receipts.
+  - **One row per object.** A bot-to-bot trade converts the seller's `simbot_items` row in place,
+    and sale settlement drops a row only while the seller still owns it.
+  - **Seller payment is the stock code**, extracted from `doInstantBuy` into `payInstantSaleSeller`.
+    The seller is resolved by OID: a bag, a player creature, or a refusal. `doInstantBuy` now
+    rechecks `FORSALE`/`OFFERED` under the item lock (a stock race between buyers).
+  - **Verification lessons:**
+    - an acquisition path must create the vault bag (`getOrCreateItemBag`), or a never-looted bot
+      can never buy;
+    - `getItemBagMapSnapshot` is keyed identity -> bag;
+    - a harness baseline taken after boot misses production work done at boot.
+  - **Live receipt:** 32/32 (`docs/4-unit-tests/live_f0910-*`), plus the owner's in-client sale to
+    a bot.
 - **Simulation-only by default, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line

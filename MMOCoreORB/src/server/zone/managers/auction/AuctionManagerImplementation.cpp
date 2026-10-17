@@ -37,6 +37,7 @@
 #include "server/zone/objects/transaction/TransactionLog.h"
 #include "server/zone/managers/aieconomy/AiEconomyManager.h"
 #include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
+#include "server/zone/managers/auction/AuctionManagerBazaar.h"
 
 // Shared by player and sim bot listings so the two paths cannot drift.
 static bool hasUnsellableArrangement(SceneObject* object) {
@@ -205,6 +206,171 @@ int AuctionManagerImplementation::releaseSimBotSale(AuctionItem* item) {
 	item->setOwnerName(item->getBidderName());
 	item->setUpdated(true);
 	return 0;
+}
+
+void AuctionManagerImplementation::payInstantSaleSeller(TransactionLog& trx,
+		CreatureObject* seller, SceneObject* vendor, int grossPrice, int tax,
+		const String& sellerName, const String& buyerName, const String& itemName) {
+	if (seller == nullptr || vendor == nullptr)
+		return;
+
+	ManagedReference<CityRegion*> city = vendor->getCityRegion().get();
+	String vendorPlanetName = vendor->getZone() == nullptr ? String() :
+		String("@planet_n:") + vendor->getZone()->getZoneName();
+	String vendorRegionName = vendorPlanetName;
+	if (city != nullptr)
+		vendorRegionName = city->getCityRegionName();
+
+	ManagedReference<ChatManager*> cman = zoneServer->getChatManager();
+	StringIdChatParameterVector sellerBodyVector;
+	WaypointChatParameterVector sellerWaypointVector;
+	UnicodeString sellerSubject("@auction:subject_instant_seller");
+	StringIdChatParameter sellerBodySale("@auction:seller_success");
+	sellerBodySale.setTO(itemName);
+	sellerBodySale.setTT(buyerName);
+	sellerBodySale.setDI(grossPrice);
+	StringIdChatParameter sellerBodyLoc("@auction:seller_success_location");
+	sellerBodyLoc.setTO(vendorPlanetName);
+	sellerBodyLoc.setTT(vendorRegionName);
+	sellerBodyVector.add(sellerBodySale);
+	sellerBodyVector.add(sellerBodyLoc);
+	WaypointChatParameter waypointParam;
+	waypointParam.set(vendor->getDisplayedName(), vendor->getWorldPositionX(),
+		0, vendor->getWorldPositionY(), vendor->getPlanetCRC());
+	sellerWaypointVector.add(waypointParam);
+
+	{
+		Locker sellerLock(seller);
+		seller->addBankCredits(grossPrice);
+		trx.commit();
+		if (city != nullptr && tax > 0) {
+			TransactionLog trxFee(seller, TrxCode::CITYSALESTAX, tax, false);
+			trxFee.groupWith(trx);
+			trxFee.addState("cityRegionID", city->getObjectID());
+			seller->subtractBankCredits(tax);
+		}
+	}
+
+	if (city != nullptr && !city->isClientRegion() && tax > 0) {
+		Locker cityLock(city);
+		city->addToCityTreasury(tax);
+	}
+
+	if (cman != nullptr)
+		cman->sendMail("auctioner", sellerSubject, UnicodeString(), sellerName,
+			&sellerBodyVector, &sellerWaypointVector);
+}
+
+int AuctionManagerImplementation::buySimBotItem(AuctionItem* item,
+		SceneObject* bag, const String& buyerName, uint64 expectedObjectId,
+		int expectedPrice) {
+	if (item == nullptr || bag == nullptr || zoneServer == nullptr ||
+			!AiEconomyManager::isItemBag(bag) || !item->isOnBazaar() ||
+			item->isAuction() || item->getOwnerID() == bag->getObjectID() ||
+			auctionMap == nullptr)
+		return item != nullptr && item->getOwnerID() == bag->getObjectID() ?
+			AuctionManagerBazaar::OWN_LISTING : AuctionManagerBazaar::INVALID;
+
+	// A listing someone else already bought is gone, whoever owns it now;
+	// classify that before resolving the (new) owner as a seller. The locked
+	// recheck below remains the authority.
+	if (item->getStatus() != AuctionItem::FORSALE)
+		return AuctionManagerBazaar::GONE;
+
+	ManagedReference<SceneObject*> vendor = zoneServer->getObject(
+		item->getVendorID());
+	ManagedReference<SceneObject*> sellerObject = zoneServer->getObject(
+		item->getOwnerID());
+	if (vendor == nullptr || vendor->getZone() == nullptr || sellerObject == nullptr)
+		return AuctionManagerBazaar::SELLER_UNRESOLVED;
+	ManagedReference<SceneObject*> object = zoneServer->getObject(
+		item->getAuctionedItemObjectID());
+	if (object == nullptr)
+		return AuctionManagerBazaar::GONE;
+
+	CreatureObject* sellerCreature = sellerObject->asCreatureObject();
+	const bool sellerIsBag = AiEconomyManager::isItemBag(sellerObject);
+	if (!sellerIsBag && (sellerCreature == nullptr ||
+			!sellerCreature->isPlayerCreature()))
+		return AuctionManagerBazaar::SELLER_UNRESOLVED;
+
+	const uint64 sellerOid = sellerObject->getObjectID();
+	const uint64 auctionOid = item->getObjectID();
+	const uint64 objectOid = object->getObjectID();
+	const int grossPrice = item->getPrice();
+	const String itemName = removeColorCodes(item->getItemName());
+	int tax = 0;
+	ManagedReference<CityRegion*> city = vendor->getCityRegion().get();
+	if (city != nullptr)
+		tax = grossPrice - (grossPrice /
+			(1.0f + (city->getSalesTax() / 100.f)));
+	String sellerName = item->getOwnerName();
+	String bidderName = buyerName.toLowerCase();
+
+	TransactionLog trx(bag, sellerObject, TrxCode::INSTANTBUY, grossPrice, false);
+	trx.setAutoCommit(false);
+	trx.addRelatedObject(objectOid, true);
+	trx.setExportRelatedObjects(true);
+
+	{
+		Locker auctionLock(item);
+		if (item->getStatus() != AuctionItem::FORSALE ||
+				(item->getExpireTime() != 0 &&
+				 item->getExpireTime() <= static_cast<uint64>(time(nullptr)))) {
+			trx.abort();
+			return AuctionManagerBazaar::GONE;
+		}
+		if (item->getAuctionedItemObjectID() != expectedObjectId ||
+				item->getPrice() != expectedPrice) {
+			trx.abort();
+			return AuctionManagerBazaar::PRICE_CHANGED;
+		}
+		if (item->getOwnerID() == bag->getObjectID()) {
+			trx.abort();
+			return AuctionManagerBazaar::OWN_LISTING;
+		}
+
+		Locker objectLock(object, item);
+		Locker bagLock(bag, object);
+		if (!bag->transferObject(object, -1, false)) {
+			trx.abort() << "transferObject to sim bot buyer bag failed";
+			return AuctionManagerBazaar::TRANSFER_FAILED;
+		}
+		auctionMap->removeFromCommodityLimit(item);
+		item->setStatus(AuctionItem::SOLD);
+		item->setExpireTime(time(nullptr) + AuctionManager::COMMODITYEXPIREPERIOD);
+		item->setBuyerID(bag->getObjectID());
+		item->setBidderName(bidderName);
+		item->clearAuctionWithdraw();
+		item->setStatus(AuctionItem::RETRIEVED);
+		auctionMap->deleteItem(vendor, item);
+		item->setAuctionedItemObjectID(0);
+	}
+
+	if (sellerIsBag) {
+		trx.commit();
+		if (city != nullptr && !city->isClientRegion() && tax > 0) {
+			Locker cityLock(city);
+			city->addToCityTreasury(tax);
+		}
+		PlayerBotBazaarSale sale;
+		sale.auctionOid = auctionOid;
+		sale.objectId = objectOid;
+		sale.bagOid = sellerOid;
+		sale.buyerId = bag->getObjectID();
+		sale.grossPrice = grossPrice;
+		sale.tax = tax;
+		sale.buyerName = bidderName;
+		sale.released = true;
+		SimPlayerManager* simPlayerManager = SimPlayerManager::instance();
+		if (simPlayerManager != nullptr)
+			simPlayerManager->enqueuePlayerBotBazaarSale(sale);
+	} else {
+		payInstantSaleSeller(trx, sellerCreature, vendor, grossPrice, tax,
+			sellerName, bidderName, itemName);
+	}
+
+	return AuctionManagerBazaar::SUCCESS;
 }
 
 void AuctionManagerImplementation::initialize() {
@@ -1231,6 +1397,16 @@ void AuctionManagerImplementation::doInstantBuy(CreatureObject* player, AuctionI
 	uint64 availableTime = 0;
 
 	Locker locker(item);
+	// Recheck under the lock: a sim bot buy (or another buyer) may have taken
+	// the item after buyItem's unlocked check.
+	if (item->getStatus() != AuctionItem::FORSALE &&
+			item->getStatus() != AuctionItem::OFFERED) {
+		locker.release();
+		player->sendMessage(new BidAuctionResponseMessage(
+			item->getAuctionedItemObjectID(),
+			BidAuctionResponseMessage::PURCHASEFAILED));
+		return;
+	}
 
 	if(item->isOnBazaar() || item->getStatus() == AuctionItem::OFFERED)
 		availableTime = currentTime + AuctionManager::COMMODITYEXPIREPERIOD;
@@ -1325,26 +1501,6 @@ void AuctionManagerImplementation::doInstantBuy(CreatureObject* player, AuctionI
 			sendVendorUpdateMail(vendor, true);
 
 	} else {
-
-		StringIdChatParameterVector sellerBodyVector;
-		WaypointChatParameterVector sellerWaypointVector;
-
-		// Setup the mail to the seller
-		UnicodeString sellerSubject("@auction:subject_instant_seller"); // Instant Sale Complete
-		StringIdChatParameter sellerBodySale("@auction:seller_success"); // Your auction of %TO has been sold to %TT for %DI credits
-		sellerBodySale.setTO(itemName);
-		sellerBodySale.setTT(item->getBidderName());
-		sellerBodySale.setDI(item->getPrice());
-
-		StringIdChatParameter sellerBodyLoc("@auction:seller_success_location"); // The sale took place at %TT, on %TO.
-		sellerBodyLoc.setTO(vendorPlanetName);
-		sellerBodyLoc.setTT(vendorRegionName);
-
-		sellerBodyVector.add(sellerBodySale);
-		sellerBodyVector.add(sellerBodyLoc);
-
-		sellerWaypointVector.add(waypointParam);
-
 		// Setup the mail to the buyer
 		StringIdChatParameterVector buyerBodyVector;
 		WaypointChatParameterVector buyerWaypointVector;
@@ -1368,8 +1524,6 @@ void AuctionManagerImplementation::doInstantBuy(CreatureObject* player, AuctionI
 
 		//Send the Mail
 		UnicodeString blankBody;
-		if (!simBotListing)
-			cman->sendMail(sender, sellerSubject, blankBody, sellerName, &sellerBodyVector, &sellerWaypointVector);
 		cman->sendMail(sender, buyerSubject, blankBody, item->getBidderName(), &buyerBodyVector, &buyerWaypointVector);
 
 	}
@@ -1406,6 +1560,11 @@ void AuctionManagerImplementation::doInstantBuy(CreatureObject* player, AuctionI
 	}
 
 	locker.release();
+	if (item->isOnBazaar()) {
+		payInstantSaleSeller(trx, seller, vendor, item->getPrice(), tax,
+			sellerName, item->getBidderName(), itemName);
+		return;
+	}
 
 	Locker slocker(seller);
 	seller->addBankCredits(item->getPrice());

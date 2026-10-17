@@ -4497,9 +4497,15 @@ void SimHunterController::runActiveTick() {
 		if (position.distanceTo2d(bazaarTerminalPosition) <=
 				static_cast<float>(SimPlayerManager::instance()->
 					getPlayerBotBazaarArriveMeters())) {
-			bool listed = SimPlayerManager::instance()->listPlayerBotItemsAtTerminal(
+			SimPlayerManager* bazaarManager = SimPlayerManager::instance();
+			bool listed = bazaarManager->listPlayerBotItemsAtTerminal(
 				identityId, strongAgent->asCreatureObject(), bazaarTerminal);
-			finishBazaarVisit(listed ? "listed" : "listedNone");
+			bool bought = bazaarManager->buyPlayerBotItemsAtTerminal(identityId,
+				bazaarTerminal);
+			String outcome = listed && bought ? String("listedAndBought") :
+				listed ? String("listed") : bought ? String("bought") :
+				String("none");
+			finishBazaarVisit(outcome);
 			return;
 		}
 		if (state == MOVING || state == CALCULATING_PATH ||

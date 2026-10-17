@@ -342,6 +342,7 @@
     const modRows = Object.entries(mods).map(([name, mod]) => `<tr><td>${esc(name)}</td><td>${num(mod.templateBase)}</td><td>${num(mod.skillboxDelta)}</td><td>${num(mod.effective)}</td></tr>`).join("");
     const next = data.nextBox || {};
     const listings = Array.isArray(data.listings) ? data.listings : [];
+    const purchases = Array.isArray(data.purchases) ? data.purchases : [];
     const source = templates.attackSource === "skill" ? "trained skills" : "body template";
     const itemRows = items.map((item) => {
       const stats = item.stats || {};
@@ -357,6 +358,15 @@
       <td>${esc(listing.closedAt || "—")}</td>
       <td>${esc(listing.releasedAt || "—")}</td>
       <td>${esc(listing.buyer || "—")}</td>
+    </tr>`).join("");
+    const purchaseRows = purchases.map((purchase) => `<tr>
+      <td class="t-num">${esc(purchase.auction || purchase.auctionOid || "—")}</td>
+      <td><span class="t-main">${esc(purchase.template || "unknown")}</span><span class="t-sub">object ${esc(purchase.objectOid || "—")}</span></td>
+      <td>${chip(labelize(purchase.state || "unknown"), purchase.state === "committed" ? "ok" : purchase.state === "refunded" ? "red" : "ghost")}</td>
+      <td>${esc(labelize(purchase.sellerKind || "unknown"))}</td>
+      <td class="t-num">${num(purchase.price)}</td>
+      <td>${esc(purchase.debitedAt || "—")}</td>
+      <td>${esc(purchase.closedAt || "—")}</td>
     </tr>`).join("");
 
     return `<div class="playerbot-card"><h3>WHO</h3><p class="playerbot-lead">${esc(identity.name || "Unnamed SimBot")}</p>
@@ -374,6 +384,7 @@
       <div class="playerbot-card"><h3>RECENT ABILITY USE</h3>${recentRows || `<span class="muted small">No recorded ability use.</span>`}</div>
       <div class="playerbot-card"><h3>ITEMS (${num(data.itemsHeld)})</h3>${table(["OID", "Item", "State", "Source", "Acquired"], itemRows, { scrollKey: "playerbot-items", tall: true })}</div>
       <div class="playerbot-card"><h3>LISTINGS (${num(listings.length)})</h3>${table(["OID", "Item", "State", "Price", "Listed", "Closed", "Released", "Buyer"], listingRows, { scrollKey: "playerbot-listings", tall: true })}</div>
+      <div class="playerbot-card"><h3>PURCHASES (${num(purchases.length)})</h3>${table(["Auction", "Template", "State", "Seller", "Price", "Debited", "Closed"], purchaseRows, { scrollKey: "playerbot-purchases", tall: true })}</div>
       <div class="playerbot-card"><h3>SKILL MODS</h3>${modRows ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Mod</th><th>Base</th><th>Trained</th><th>Effective</th></tr></thead><tbody>${modRows}</tbody></table></div>` : `<span class="muted small">No live skill mods.</span>`}</div>`;
   }
 
@@ -1226,6 +1237,8 @@
     const buffPayment = progression.buffPayment || {};
     const loot = progression.loot || {};
     const bazaar = progression.bazaar || {};
+    const bazaarBuy = bazaar.buy || {};
+    const bazaarBuySkipped = bazaarBuy.skipped || {};
     const bazaarSkipped = bazaar.skipped || {};
     const bazaarVisits = bazaar.visits || {};
     const bazaarReconcile = bazaar.reconcile || {};
@@ -1389,8 +1402,12 @@
             ${metric("Tax", bazaar.taxPaid)}
           </div>${kvRows([
             ["Configuration", `${num(bazaar.maxListingsPerBot)} live/bot · ${num(bazaar.maxListingsPerVisit)}/visit · ${num(bazaar.minPrice)}–${num(bazaar.maxPrice)} credits · ${num(bazaar.listingDurationHours)}h · ${num(bazaar.visitCooldownMinutes)}m cooldown · ${num(bazaar.maxDetourMeters)}m detour · ${num(bazaar.visitTimeoutSeconds)}s TTL · ${Number(bazaar.markup || 0).toFixed(1)}x markup · sweep ${num(bazaar.sweepIntervalSeconds)}s/${num(bazaar.sweepBatch)} · backlog ${num(bazaar.saleBacklogMax)} · drain ${yesno(bazaar.drainOnDisable)}`],
-            ["Visits", `${num(bazaarVisits.begun)} begun · ${num(bazaarVisits.listedAny)} listed · ${num(bazaarVisits.noOutdoorTerminal)} no outdoor terminal · ${num(bazaarVisits.timeout)} timeout · ${num(bazaarVisits.pathFailed)} path · ${num(bazaarVisits.newAttacker)} attacker`],
-            ["Skipped", `${num(bazaarSkipped.junk)} junk · ${num(bazaarSkipped.noValue)} no value · ${num(bazaarSkipped.humanAboveCap)} human cap · ${num(bazaarSkipped.cap)} listing cap · ${num(bazaarSkipped.unaffordable)} unaffordable · ${num(bazaarSkipped.noTrade)} no-trade · ${num(bazaarSkipped.transferFailed)} transfer`],
+            ["Visits", `${num(bazaarVisits.begun)} begun · ${num(bazaarVisits.listedAny)} listed · ${num(bazaarVisits.bought)} bought · ${num(bazaarVisits.noOutdoorTerminal)} no outdoor terminal · ${num(bazaarVisits.timeout)} timeout · ${num(bazaarVisits.pathFailed)} path · ${num(bazaarVisits.newAttacker)} attacker`],
+            ["Skipped", `${num(bazaarSkipped.junk)} junk · ${num(bazaarSkipped.noValue)} no value · ${num(bazaarSkipped.humanAboveCap)} human cap · ${num(bazaarSkipped.cap)} listing cap · ${num(bazaarSkipped.needed)} needed · ${num(bazaarSkipped.unaffordable)} unaffordable · ${num(bazaarSkipped.noTrade)} no-trade · ${num(bazaarSkipped.transferFailed)} transfer`],
+            ["Buy", `${chip(bazaarBuy.configured ? "configured" : "config off", bazaarBuy.configured ? "ok" : "ghost")} · ${chip(bazaarBuy.enabled ? "gate on" : "gate off", bazaarBuy.enabled ? "ok" : "ghost")} · ${num(bazaarBuy.pending)} pending · ${num(bazaarBuy.debited)} debited · ${num(bazaarBuy.bought)} bought · ${num(bazaarBuy.refunded)} refunded · ${num(bazaarBuy.spent)} spent · reserve ${num(bazaarBuy.reserveCredits)}`],
+            ["Buy payments", `${num(bazaarBuy.paidToHumans)} human · ${num(bazaarBuy.paidToBots)} bot · ${num(bazaarBuy.paidToSeeder)} seeder`],
+            ["Buy skipped", `${num(bazaarBuySkipped.noNeed)} no need · ${num(bazaarBuySkipped.noListing)} no listing · ${num(bazaarBuySkipped.overCeiling)} ceiling · ${num(bazaarBuySkipped.noCeiling)} no ceiling · ${num(bazaarBuySkipped.unaffordable)} unaffordable · ${num(bazaarBuySkipped.ownListing)} own · ${num(bazaarBuySkipped.sellerUnresolved)} seller · ${num(bazaarBuySkipped.lostRace)} race · ${num(bazaarBuySkipped.priceChanged)} price · ${num(bazaarBuySkipped.transferFailed)} transfer · ${num(bazaarBuySkipped.timeout)} timeout`],
+            ["Buy reconcile", `${num((bazaarBuy.reconcile || {}).committed)} committed · ${num((bazaarBuy.reconcile || {}).refunded)} refunded`],
             ["Settlement", `${num(bazaar.saleUnresolved)} unresolved · ${num(bazaar.saleBacklogOverflow)} backlog overflow · ${num(bazaar.releaseBuyerGone)} buyer gone · ${num(bazaar.deleteBlockedByListing)} delete blocked`],
             ["Reconcile", `${num(bazaarReconcile.adopted)} adopted · ${num(bazaarReconcile.settled)} settled · ${num(bazaarReconcile.reversed)} reversed · ${num(bazaarReconcile.retrieved)} retrieved · ${num(bazaarReconcile.orphaned)} orphaned · ${num(bazaarReconcile.adoptedTaxEstimated)} tax estimated · ${num(bazaarReconcile.releasedRepaired)} releases repaired`]
           ])}`, "span-12")}

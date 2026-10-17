@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.9.12` | 14 | F_0.9.10 P.10k: bazaar BUY — roster PlayerBots instant-buy their training plan's buy-list items from human, bot and seeded listings at or below loot value x markup (or the entry's maxPrice) while keeping a credit reserve; the debit is made durable before the object store moves, the item goes straight to the vault, sellers are paid through the stock path, and boot recovery refunds or commits from evidence; no schema change; gate default-off |
 | `0.9.11` | 14 | F_0.9.9 P.10j: bazaar SELL — roster PlayerBots walk to an outdoor bazaar terminal and list vault loot on the real bazaar (loot value x markup, never below a human ask, generic junk kept), human buyers collect instantly while the bot's proceeds settle within seconds through ledger receipts and an applied mark (schema 1016), with relist at the same price, kill-switch drain and boot recovery; gate default-off |
 | `0.9.10` | 14 | F_0.9.3 P.10d: loot from kills and the hive item vault — a roster PlayerBot's kill gets stock loot and cash, the bot walks to the corpse (even mid travel leg) and loots it: cash into its store, items into its own bag in a persistent vault with one simbot_items row each (schema 1015), boot reconciliation and teardown on deletion; gate default-off |
 | `0.9.9` | 14 | F_0.9.2 P.10c: mission credits and the holdings journal — roster PlayerBots are paid the stock destroy-mission reward into an identity-keyed bank balance, every change to what a bot holds is journaled in simbot_ledger (schema 1014), and a doctor-buff fee is the first credit sink; both gates default-off |
@@ -30,6 +31,10 @@
 
 # Changelog Summary
 
+- **v0.9.12 (Bazaar BUY, F_0.9.10 P.10k - Week 14, 16-10-2026)**:
+  - **Bots buy what their plan needs.** Each training plan can list item templates with a quantity. At its bazaar visit a roster bot instant-buys the cheapest matching listing on the planet, from a player, another bot or the Market Seeder, at or below loot value x markup (or the entry's `maxPrice`), and always keeps a credit reserve. Needed items are never resold.
+  - **Debit first, then deliver.** The bot's debit is made durable before the object store moves; the item then goes straight into its vault bag and the seller is paid through the stock path. Boot recovery refunds or commits from evidence (the auction still listed, an item receipt, or the object in the bag). No schema change.
+  - **Verified live.** 25 of 25 functional harness scenarios including crash recovery, real bots buying from each other on two boots, and the owner's knuckler bought by a bot for exactly 400. Four product bugs were found and fixed during verification. The gate ships off.
 - **v0.9.11 (Bazaar SELL, F_0.9.9 P.10j - Week 14, 16-10-2026)**:
   - **Bots sell their loot on the real bazaar.** A roster bot starting a job walks to an outdoor bazaar terminal and lists vault items at loot value x 3. It never lists below a human listing of the same item, keeps generic junk, and relists an unsold item at its first ask.
   - **The vault bag is the seller.** Six guarded stock branches keep bot listings alive through boot and maintenance and pay the bot instead of resolving a seller by name. Human listings are unaffected.

@@ -13,6 +13,7 @@ import server.zone.managers.auction.AuctionsMap;
 import server.zone.objects.auction.AuctionItem;
 import server.zone.objects.scene.SceneObject;
 import system.util.VectorMap;
+include server.zone.objects.transaction.TransactionLog;
 include server.zone.packets.auction.AuctionQueryHeadersResponseMessage;
 include server.zone.managers.auction.TerminalListVector;
 include server.zone.managers.auction.AuctionEventsMap;
@@ -97,6 +98,10 @@ class AuctionManager extends ManagedService implements Logger {
 	@local
 	public native int releaseSimBotSale(AuctionItem item);
 
+	@local
+	public native int buySimBotItem(AuctionItem item, SceneObject bag,
+		final string buyerName, unsigned long expectedObjectId, int expectedPrice);
+
 	public native void getItemAttributes(CreatureObject player, unsigned long objectid);
 
 	public native void getData(CreatureObject player, int locationType, unsigned long vendorObjectID, int searchType, unsigned int itemCategory, final unicode filterText, int minPrice, int maxPrice, boolean includeEntranceFee, int count, int offset);
@@ -107,6 +112,10 @@ class AuctionManager extends ManagedService implements Logger {
 	private native void refundAuction(AuctionItem item);
 
 	private native void sendVendorUpdateMail(SceneObject vendor, boolean isEmpty);
+
+	private native void payInstantSaleSeller(@dereferenced TransactionLog trx,
+		CreatureObject seller, SceneObject vendor, int grossPrice, int tax,
+		final string sellerName, final string buyerName, final string itemName);
 
 	@local
 	public native int checkRetrieve(CreatureObject player, unsigned long objectIdToRetrieve, SceneObject vendor);

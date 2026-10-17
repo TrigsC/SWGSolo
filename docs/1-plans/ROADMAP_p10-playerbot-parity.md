@@ -6,10 +6,11 @@
 v0.9.1), **F_0.9.5** (P.10f, v0.9.5, schema 1013 deployed). **F_0.9.6** (P.10g,
 novice early-game loop) is IMPLEMENTED on `feat/p10g-novice-early-game-loop`,
 building warning-clean, and awaiting its live receipt — see §5c for why it was
-inserted ahead of the bazaar work. Next chunk after it: **F_0.9.7** (P.10h,
-skill-derived combat abilities).
+inserted ahead of the bazaar work. **F_0.9.10** (P.10k, bazaar BUY) is RELEASED
+as v0.9.12 (2026-10-16). Next chunk after it: **F_0.9.11** (P.10l,
+profession allocation policy).
 **Written**: 2026-09-02 (project week 8)
-**Last updated**: 2026-09-09 — F_0.9.6 implemented, pending live verification
+**Last updated**: 2026-10-16 — F_0.9.10 bazaar BUY released as v0.9.12
 
 ## 0. Mandate
 
@@ -589,7 +590,13 @@ F_0.9.0 store+dashboard+reaper+harness
   `doInstantBuy` by a harness identity) → seller store credited, buyer
   debited; expiry → item back in vault; gate-off → no listings exist.
 
-### F_0.9.10 — Bazaar BUY (P.10k)
+### F_0.9.10 — Bazaar BUY (P.10k) — RELEASED as v0.9.12 (2026-10-16)
+
+> Live receipt 32/32 plus the owner's in-client sale to a bot. Debit first (the
+> inverse of SELL), purchases keyed (identity, auction), boot resolution from evidence.
+> Implemented according to the approved F_0.9.10 plan. The implementation uses
+> ledger receipts and the applied mark for purchase recovery, with no schema change;
+> the earlier journal wording below is retained as historical design context.
 
 - **Scope**: need-driven purchase (gear from the training plan, consumables):
   query `AuctionsMap`, select by policy, then a sim-aware
@@ -602,9 +609,10 @@ F_0.9.0 store+dashboard+reaper+harness
   "Fund the body and reconcile after" is explicitly **not** an allowed design
   (it stages durable credits on a disposable body). Gate
   `playerBotProgression.bazaarBuy`.
-- **Owner policy line (needed before this chunk's plan)**: may bots **buy
-  human listings** at all, or only bot/seeded (`market_seeder.lua`) listings?
-  Recommendation until decided: **bot and seeded listings only**.
+- **Owner policy line — DECIDED 2026-10-16**: bots may buy human, bot and seeded
+  listings, but only at or below the fair-value ceiling; instant-buy only, with the
+  configured reserve retained. The committed gate and production buy lists remain
+  off/empty, while harness needs use scoped overrides.
 - **Engine touchpoints**: `AuctionManagerImplementation.cpp` (buyer branch),
   `SimPlayerManager`.
 - **Persists**: store credits, `simbot_items`, auction state.
@@ -1063,3 +1071,9 @@ Modelled on `structureTraversalTest` (`sim_player_manager.lua:841`,
    every item has a ledger row with an operation state, boot reconciliation
    validates each state against real containment, and an identity is never
    deleted while it still owns items or listings.
+
+6. **Bazaar BUY policy — DECIDED 2026-10-16.** Bots may buy human, bot and seeded
+   listings alike, but never above the fair-value ceiling. Need is a per-plan buy
+   list with quantities; bought items remain in the vault, and a reserve is kept
+   for doctor and listing fees. The capability ships default-off with empty
+   production buy lists; harness scenarios arm only identity-scoped overrides.

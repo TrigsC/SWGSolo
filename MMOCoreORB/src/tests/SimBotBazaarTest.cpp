@@ -36,6 +36,44 @@ TEST(SimBotBazaar, ZeroValueSkips) {
 	EXPECT_EQ(priceListing(0, 3.f, 50, 20000, 0).reason, SKIP_NO_VALUE);
 }
 
+TEST(SimBotBazaar, BuyCeilingUsesValueAndFallback) {
+	EXPECT_EQ(buyCeiling(100, 3.f, 50, 20000, 0), 300);
+	EXPECT_EQ(buyCeiling(0, 3.f, 50, 20000, 400), 400);
+	EXPECT_EQ(buyCeiling(0, 3.f, 50, 20000, 0), 0);
+	EXPECT_EQ(buyCeiling(10000, 3.f, 50, 20000, 0), 20000);
+}
+
+TEST(SimBotBazaar, PurchaseDecisionChecksOwnershipCeilingAndBudget) {
+	EXPECT_EQ(decidePurchase(100, 300, 1000, 0, 500, false), BUY);
+	EXPECT_EQ(decidePurchase(301, 300, 1000, 0, 500, false), OVER_CEILING);
+	EXPECT_EQ(decidePurchase(100, 0, 1000, 0, 500, false), NO_CEILING);
+	EXPECT_EQ(decidePurchase(600, 1000, 1000, 0, 500, false), UNAFFORDABLE);
+	EXPECT_EQ(decidePurchase(100, 300, 1000, 0, 500, true), OWN_LISTING);
+	EXPECT_EQ(decidePurchase(500, 500, 1000, 0, 500, false), BUY);
+}
+
+TEST(SimBotBazaar, NeedsAndReservedItemsAreBounded) {
+	EXPECT_EQ(unmetNeed(3, 1, 1), 1);
+	EXPECT_EQ(unmetNeed(1, 2, 0), 0);
+	EXPECT_TRUE(reservedForNeed(0, 2));
+	EXPECT_TRUE(reservedForNeed(1, 2));
+	EXPECT_FALSE(reservedForNeed(2, 2));
+	EXPECT_FALSE(reservedForNeed(-1, 2));
+}
+
+TEST(SimBotBazaar, PurchaseReconcileUsesDeliveryEvidence) {
+	EXPECT_EQ(decidePurchaseReconcile(-100, false, true, 0), COMMIT);
+	EXPECT_EQ(decidePurchaseReconcile(-100, false, false, 0), REFUND);
+	EXPECT_EQ(decidePurchaseReconcile(0, false, false, 0), DONE);
+	// Reverted object store: the auction is back, so refund even with receipts.
+	EXPECT_EQ(decidePurchaseReconcile(-100, true, false, 1), REFUND);
+	// Committed earlier, item since sold: never refunded.
+	EXPECT_EQ(decidePurchaseReconcile(-100, false, false, 1), ALREADY_COMMITTED);
+	EXPECT_EQ(decidePurchaseReconcile(-100, false, true, 1), ALREADY_COMMITTED);
+	EXPECT_TRUE(settlementDropsItemRow(10, 10));
+	EXPECT_FALSE(settlementDropsItemRow(11, 10));
+}
+
 TEST(SimBotBazaar, GenericJunkIsNotSellable) {
 	EXPECT_FALSE(isSellable(100, JUNKGENERIC, false, true));
 	EXPECT_FALSE(isSellable(100, JUNKGENERIC | 4, false, true));
@@ -68,6 +106,9 @@ TEST(SimBotBazaar, ReconcileListedRows) {
 		0, 0, LOCATION_OTHER_BAG, false), RECONCILE_ORPHANED);
 	EXPECT_EQ(decideListingReconcile(ROW_LISTED, AUCTION_MISSING, false,
 		0, 0, LOCATION_IDENTITY_BAG, true), RECONCILE_RETRIEVED);
+	EXPECT_EQ(decideListingReconcile(ROW_LISTED, AUCTION_MISSING, false,
+		0, 0, LOCATION_OTHER_BAG, false, true),
+		RECONCILE_SETTLE_FROM_BUYER);
 	EXPECT_EQ(decideListingReconcile(ROW_LISTED, AUCTION_MISSING, false,
 		0, 0, LOCATION_MISSING, true), RECONCILE_ORPHANED);
 	EXPECT_EQ(decideListingReconcile(ROW_LISTED, AUCTION_FORSALE, true,
@@ -134,7 +175,9 @@ TEST(SimBotBazaar, SettlementModeExcludesNewMutations) {
 	EXPECT_TRUE(settlementModeAllows(SETTLEMENT_SALE));
 	EXPECT_TRUE(settlementModeAllows(SETTLEMENT_RECONCILE));
 	EXPECT_TRUE(settlementModeAllows(SETTLEMENT_DELETION_RETRIEVAL));
+	EXPECT_TRUE(settlementModeAllows(SETTLEMENT_PURCHASE_RESOLVE));
 	EXPECT_FALSE(settlementModeAllows(SETTLEMENT_NEW_LISTING));
+	EXPECT_FALSE(settlementModeAllows(SETTLEMENT_NEW_PURCHASE));
 	EXPECT_FALSE(settlementModeAllows(SETTLEMENT_AWARD));
 }
 
@@ -154,6 +197,27 @@ TEST(SimBotBazaar, SweepHandlesExpiryAndDrain) {
 	EXPECT_TRUE(shouldSweep(AUCTION_FORSALE, 100, 10, false, true));
 	EXPECT_TRUE(shouldSweep(AUCTION_EXPIRED, 0, 0, true, false));
 	EXPECT_FALSE(shouldSweep(AUCTION_SOLD, 10, 10, false, true));
+}
+
+TEST(SimBotBazaar, SettlementOnlyDropsSellerOwnedRow) {
+	EXPECT_TRUE(settlementDropsItemRow(7, 7));
+	EXPECT_FALSE(settlementDropsItemRow(9, 7));
+	EXPECT_FALSE(settlementDropsItemRow(0, 7));
+}
+
+TEST(SimBotBazaar, ListedRowInBuyerBagSettlesFromBuyerEvidence) {
+	EXPECT_EQ(decideListingReconcile(ROW_LISTED, AUCTION_MISSING, false, 0, 0,
+		LOCATION_OTHER_BAG, false, true), RECONCILE_SETTLE_FROM_BUYER);
+	EXPECT_EQ(decideListingReconcile(ROW_LISTED, AUCTION_MISSING, false, 0, 0,
+		LOCATION_OTHER_BAG, false, false), RECONCILE_ORPHANED);
+	EXPECT_EQ(decideListingReconcile(ROW_LISTED, AUCTION_MISSING, false, 0, 0,
+		LOCATION_IDENTITY_BAG, true, true), RECONCILE_RETRIEVED);
+}
+
+TEST(SimBotBazaar, SettlementModeResolvesButNeverStartsPurchases) {
+	EXPECT_TRUE(settlementModeAllows(SETTLEMENT_PURCHASE_RESOLVE));
+	EXPECT_FALSE(settlementModeAllows(SETTLEMENT_NEW_PURCHASE));
+	EXPECT_FALSE(settlementModeAllows(SETTLEMENT_NEW_LISTING));
 }
 
 } // namespace
