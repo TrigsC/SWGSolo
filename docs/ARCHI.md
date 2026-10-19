@@ -244,6 +244,10 @@ no new warnings before handing work back** (owner-stated standard).
   F_0.9.12 (v0.9.13) adds `playerBotProgression.weaponLoadout` (default off) and the `loadout` block
   (`minUpgradePercent` 10, `fullSweepMinutes`, the `bazaarUpgrades` sub-gate, `upgradeSpendFraction`
   0.5, `upgradeScanIntervalMinutes`, `maxUpgradeLoadsPerVisit`).
+  F_0.9.13 (v0.9.14) adds `playerBotProgression.armorLoadout` (default off) and `loadout.armor`
+  (`minUpgradePercent`, `assumedArmorPiercing`, `damageTypeWeights`, `bodyRaces` as a list of
+  `{body, race}` pairs, the `bazaarUpgrades` sub-gate, `upgradeSpendFraction`,
+  `maxUpgradeLoadsPerVisit`, `bodyHamBaseline`).
   **The running server re-reads this file from disk on its own**: a syntax error in
   the working copy is hit live within seconds (it keeps the previous config), so
   `luac -p` any edit immediately.
@@ -329,6 +333,11 @@ unfamiliar change:
 - Convention: Lua is the default location for anything tunable or
   frequently-iterated; C++ is for structural/performance-critical logic
   only.
+- **`LuaObject` field reads are stack-relative.** `getBooleanField` and its siblings read the table
+  at the top of the Lua stack (`lua_gettable(L, -2)`), not their own table. A parent read while a
+  child table from `getObjectField` is still pushed silently reads the child and returns the
+  default. Read every parent field before opening a child, or after popping it (F_0.9.13:
+  `armorLoadout = true` parsed as false).
 - **Safe Lua↔C++ object wrapping (crash class).** A Lua wrapper constructor
   like `AiAgent(pObj)` / `LuaAiAgent(pObj)` `dynamic_cast`s the underlying
   scene object; in a debug build (`DYNAMIC_CAST_LUAOBJECTS`) wrapping an object
@@ -1088,6 +1097,31 @@ This is this fork's primary custom subsystem, layered on top of the stock
     (`EquipStagedWeapon`); loadout bodies set no secondary.
   - **Live receipt:** 34/34 (`docs/4-unit-tests/live_f0912-*`); bot 274 equipped its vault knuckler
     and its kill paid unarmed XP.
+- **Armor loadout (P.10n / F_0.9.13, released v0.9.14)**: bots wear what they own.
+  - **Selection and equip.** `selectPlayerBotArmor` (pure policy `SimBotArmorLoadout.h`) picks the
+    best usable vault piece per slot (player race, faction and skill rules; score = expected damage
+    absorbed) with a 10 % margin. The body wears a transient clone (`cloneObject` restores the
+    source's persistence level, so the clone is set transient explicitly). Equip mirrors
+    `PlayerContainerComponent`: wearable entry, stock encumbrance, wearable skill mods.
+  - **The buff rule.** New armor needs the buffs for every pool it encumbers; worn armor stays
+    through buff loss and is re-worn at respawn, race-checked against the new body. The worn set is
+    memory-only and has its own dirty mark (`progressionArmorDirtyIds`).
+  - **Combat seam.** The player PSG and armor blocks are shared helpers
+    (`CombatManager::applyWornArmorReduction`); only an AI defender with the transient
+    `AiAgent::simBotWornArmor` flag uses them. Stock NPC outfits that include armor objects keep
+    template values.
+  - **Visibility needs clothing-free bodies.** Stock `dressed_*` bodies bake clothing into their
+    client `.cdf`, which masks server-sent armor (weapons are not masked). Bots therefore use 20
+    vendor-based bodies (`sim_playerbot_bodies.lua`, ten species), dressed by the sim layer by
+    species under the player wear rule. Armor stows clothing off its slots and restores it on
+    removal.
+  - **Fixed look per bot.** `SimBotAppearance.h` picks body and outfit by rendezvous hashing (stable
+    keys) and features from the vendor profile with a generator seeded by the identity id.
+  - **Harness isolation.** A harness buyer only considers listings the harness created: an
+    unrelated listing bought by a harness identity is destroyed with its vault at cleanup.
+    `setBodyTemplate` pins a harness body when a scenario must not depend on species.
+  - **Live receipts:** 55/55 (pre-amendment) and 60/60 including the owner's in-client check
+    (`docs/4-unit-tests/live_f0913-*`).
 - **Simulation-only by default, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line

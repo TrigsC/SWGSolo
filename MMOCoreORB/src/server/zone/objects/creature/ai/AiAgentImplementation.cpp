@@ -371,6 +371,8 @@ void AiAgentImplementation::loadTemplateData(CreatureTemplate* templateData) {
 	// bots re-assert setSimPlayerBot(true) AFTER spawnCreature/loadTemplateData.
 	simPlayerBot = false;
 	skillDerivedAttackMap = nullptr;
+	simBotWornArmor = false;
+	simBotArmorMitigatedTotal = 0;
 	skillAbilitySpecialChance = 0;
 	skillAbilityPreferFreeState = false;
 	skillAbilityHamReserve = 0.f;

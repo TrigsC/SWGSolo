@@ -36,15 +36,30 @@ sim_playerbot_novice = Creature:new {
 	creatureBitmask = KILLER,
 	optionsBitmask = AIENABLED,
 	diet = HERBIVORE,
-	-- Appearance templates must exist in the client TRE data; LuaMobileTest
-	-- asserts every one resolves. These four are proven by heavy use across the
-	-- shipped commoner mobiles, giving the novice roster a plausible mix rather
-	-- than one repeated face.
+	-- The sim layer selects one of these clothing-free vendor bodies by identity.
+	-- Entries are keyed by template string: editing this list moves only the
+	-- bots whose rendezvous winner changes.
 	templates = {
-		"object/mobile/dressed_commoner_naboo_human_male_03.iff",
-		"object/mobile/dressed_commoner_naboo_human_male_08.iff",
-		"object/mobile/dressed_commoner_naboo_human_female_07.iff",
-		"object/mobile/dressed_commoner_old_human_female_02.iff",
+		"object/mobile/sim_playerbot_human_male.iff",
+		"object/mobile/sim_playerbot_human_female.iff",
+		"object/mobile/sim_playerbot_bothan_male.iff",
+		"object/mobile/sim_playerbot_bothan_female.iff",
+		"object/mobile/sim_playerbot_ithorian_male.iff",
+		"object/mobile/sim_playerbot_ithorian_female.iff",
+		"object/mobile/sim_playerbot_moncal_male.iff",
+		"object/mobile/sim_playerbot_moncal_female.iff",
+		"object/mobile/sim_playerbot_rodian_male.iff",
+		"object/mobile/sim_playerbot_rodian_female.iff",
+		"object/mobile/sim_playerbot_sullustan_male.iff",
+		"object/mobile/sim_playerbot_sullustan_female.iff",
+		"object/mobile/sim_playerbot_trandoshan_male.iff",
+		"object/mobile/sim_playerbot_trandoshan_female.iff",
+		"object/mobile/sim_playerbot_twilek_male.iff",
+		"object/mobile/sim_playerbot_twilek_female.iff",
+		"object/mobile/sim_playerbot_wookiee_male.iff",
+		"object/mobile/sim_playerbot_wookiee_female.iff",
+		"object/mobile/sim_playerbot_zabrak_male.iff",
+		"object/mobile/sim_playerbot_zabrak_female.iff",
 	},
 	lootGroups = {},
 	primaryWeapon = "unarmed",

@@ -2680,6 +2680,129 @@ int CombatManager::getArmorVehicleReduction(VehicleObject* defender, int damageT
 
 // Armor mitigation
 
+CombatManager::WornArmorReductionResult CombatManager::applyWornArmorReduction(
+		CreatureObject* defender, DefenderHitList* hitList, float damage,
+		int damageType, int armorPiercing, int hitLocation) const {
+	WornArmorReductionResult result;
+	float absorbed = 0.f;
+
+	// PSG
+	ManagedReference<ArmorObject*> psg = getPSGArmor(defender);
+
+	if (psg != nullptr && !psg->isVulnerable(damageType)) {
+		float armorReduction = getArmorObjectReduction(psg, damageType);
+		float dmgAbsorbed = damage;
+
+		damage *= getArmorPiercing(psg, armorPiercing);
+
+		if (armorReduction > 0)
+			damage *= 1.f - (armorReduction / 100.f);
+
+		dmgAbsorbed -= damage;
+		if (dmgAbsorbed > 0) {
+			int psgMit = hitList->getPsgMitigation();
+
+			psgMit += dmgAbsorbed;
+			hitList->setPsgMitigation(psgMit);
+			absorbed += dmgAbsorbed;
+		}
+
+		Locker plocker(psg);
+
+		psg->inflictDamage(psg, 0, damage * 0.2, true, true);
+	}
+
+	// Standard Armor
+	ManagedReference<ArmorObject*> armor = nullptr;
+
+	armor = getArmorObject(defender, hitLocation);
+
+	if (armor != nullptr && !armor->isVulnerable(damageType)) {
+		float armorReduction = getArmorObjectReduction(armor, damageType);
+		float dmgAbsorbed = damage;
+
+		// use only the damage applied to the armor for piercing (after the PSG takes some off)
+		damage *= getArmorPiercing(armor, armorPiercing);
+
+		if (armorReduction > 0) {
+			damage *= (1.f - (armorReduction / 100.f));
+			dmgAbsorbed -= damage;
+
+			int armorMit = hitList->getArmorMitigation();
+
+			armorMit += dmgAbsorbed;
+			hitList->setArmorMitigation(armorMit);
+			if (dmgAbsorbed > 0)
+				absorbed += dmgAbsorbed;
+		}
+
+		// inflict condition damage
+		Locker alocker(armor);
+
+		armor->inflictDamage(armor, 0, damage * 0.2, true, true);
+	}
+
+	result.damage = damage;
+	result.absorbed = absorbed;
+	return result;
+}
+
+CombatManager::WornArmorReductionResult CombatManager::applyWornArmorBlastReduction(
+		TangibleObject* attacker, CreatureObject* defender, float damage,
+		int armorPiercing, uint8 hitLocation) const {
+	WornArmorReductionResult result;
+	float absorbed = 0.f;
+
+	ArmorObject* psgArmor = getPSGArmor(defender);
+
+	// PSG Reduction
+	if (psgArmor != nullptr && !psgArmor->isVulnerable(SharedWeaponObjectTemplate::BLAST)) {
+		float armorReduction = psgArmor->getBlast();
+		float dmgAbsorbed = damage;
+
+		damage *= getArmorPiercing(psgArmor, armorPiercing);
+
+		if (armorReduction > 0) {
+			damage *= (1.f - (armorReduction / 100.f));
+		}
+
+		dmgAbsorbed -= damage;
+		if (dmgAbsorbed > 0)
+			absorbed += dmgAbsorbed;
+
+		Locker plocker(psgArmor, attacker);
+
+		psgArmor->inflictDamage(psgArmor, 0, damage * 0.2, true, true);
+	}
+
+	ManagedReference<ArmorObject*> armor = getArmorObject(defender, hitLocation);
+
+	// Armor Reduction
+	if (armor != nullptr && !armor->isVulnerable(SharedWeaponObjectTemplate::BLAST)) {
+		float armorReduction = getArmorObjectReduction(armor, SharedWeaponObjectTemplate::BLAST);
+		float dmgAbsorbed = damage;
+
+		// use only the damage applied to the armor for piercing (after the PSG takes some off)
+		damage *= getArmorPiercing(armor, armorPiercing);
+
+		if (armorReduction > 0) {
+			damage *= (1.f - (armorReduction / 100.f));
+			dmgAbsorbed -= damage;
+			if (dmgAbsorbed > 0)
+				absorbed += dmgAbsorbed;
+		}
+
+		// inflict condition damage
+		Locker alocker(armor, attacker);
+
+		armor->inflictDamage(armor, 0, damage * 0.2, true, true);
+	}
+
+	result.damage = damage;
+	result.absorbed = absorbed;
+	return result;
+}
+
 int CombatManager::getArmorReduction(TangibleObject* attacker, WeaponObject* weapon, CreatureObject* defender, DefenderHitList* hitList, float damage, int hitLocation, const CreatureAttackData& data) const {
 	int damageType = 0, armorPiercing = 1;
 
@@ -2784,6 +2907,27 @@ int CombatManager::getArmorReduction(TangibleObject* attacker, WeaponObject* wea
 			}
 		}
 
+		AiAgent* wornArmorDefender = defender->asAiAgent();
+		if (wornArmorDefender != nullptr &&
+				wornArmorDefender->hasSimBotWornArmor()) {
+			WornArmorReductionResult reduction = applyWornArmorReduction(
+				defender, hitList, damage, damageType, armorPiercing, hitLocation);
+
+			if (reduction.absorbed > 0.f) {
+				wornArmorDefender->addSimBotArmorMitigated(
+					static_cast<unsigned long>(reduction.absorbed));
+				SimPlayerManager* simPlayerManager = SimPlayerManager::instance();
+				if (simPlayerManager != nullptr)
+					simPlayerManager->recordSimBotArmorMitigation(
+						reduction.absorbed);
+			}
+
+			if (!defender->isPet())
+				defender->addUnmitigatedDamage(reduction.damage);
+
+			return reduction.damage;
+		}
+
 		float armorReduction = getArmorNpcReduction(cast<AiAgent*>(defender), damageType);
 
 		if (armorReduction >= 0)
@@ -2867,60 +3011,10 @@ int CombatManager::getArmorReduction(TangibleObject* attacker, WeaponObject* wea
 		}
 	}
 
-	// PSG
-	ManagedReference<ArmorObject*> psg = getPSGArmor(defender);
+	WornArmorReductionResult playerArmor = applyWornArmorReduction(
+		defender, hitList, damage, damageType, armorPiercing, hitLocation);
 
-	if (psg != nullptr && !psg->isVulnerable(damageType)) {
-		float armorReduction = getArmorObjectReduction(psg, damageType);
-		float dmgAbsorbed = damage;
-
-		damage *= getArmorPiercing(psg, armorPiercing);
-
-		if (armorReduction > 0)
-			damage *= 1.f - (armorReduction / 100.f);
-
-		dmgAbsorbed -= damage;
-		if (dmgAbsorbed > 0) {
-			int psgMit = hitList->getPsgMitigation();
-
-			psgMit += dmgAbsorbed;
-			hitList->setPsgMitigation(psgMit);
-		}
-
-		Locker plocker(psg);
-
-		psg->inflictDamage(psg, 0, damage * 0.2, true, true);
-	}
-
-	// Standard Armor
-	ManagedReference<ArmorObject*> armor = nullptr;
-
-	armor = getArmorObject(defender, hitLocation);
-
-	if (armor != nullptr && !armor->isVulnerable(damageType)) {
-		float armorReduction = getArmorObjectReduction(armor, damageType);
-		float dmgAbsorbed = damage;
-
-		// use only the damage applied to the armor for piercing (after the PSG takes some off)
-		damage *= getArmorPiercing(armor, armorPiercing);
-
-		if (armorReduction > 0) {
-			damage *= (1.f - (armorReduction / 100.f));
-			dmgAbsorbed -= damage;
-
-			int armorMit = hitList->getArmorMitigation();
-
-			armorMit += dmgAbsorbed;
-			hitList->setArmorMitigation(armorMit);
-		}
-
-		// inflict condition damage
-		Locker alocker(armor);
-
-		armor->inflictDamage(armor, 0, damage * 0.2, true, true);
-	}
-
-	return damage;
+	return playerArmor.damage;
 }
 
 int CombatManager::getArmorTurretReduction(CreatureObject* attacker, TangibleObject* defender, int damageType) const {
@@ -3062,12 +3156,30 @@ float CombatManager::doObjectDetonation(TangibleObject* attackerTanO, CreatureOb
 			auto agent = defender->asAiAgent();
 
 			if (agent != nullptr) {
-				int armorResist = agent->getBlast();
+				if (agent->hasSimBotWornArmor()) {
+					WornArmorReductionResult reduction =
+						applyWornArmorBlastReduction(attackerTanO, defender,
+							damage, armorPiercing, hitLocation);
 
-				if (armorResist > 0) {
-					damage *= getArmorPiercing(agent, armorPiercing);
+					if (reduction.absorbed > 0.f) {
+						agent->addSimBotArmorMitigated(
+							static_cast<unsigned long>(reduction.absorbed));
+						SimPlayerManager* simPlayerManager =
+							SimPlayerManager::instance();
+						if (simPlayerManager != nullptr)
+							simPlayerManager->recordSimBotArmorMitigation(
+										reduction.absorbed);
+					}
 
-					damage *= (1.f - (armorResist / 100.f));
+					damage = reduction.damage;
+				} else {
+					int armorResist = agent->getBlast();
+
+					if (armorResist > 0) {
+						damage *= getArmorPiercing(agent, armorPiercing);
+
+						damage *= (1.f - (armorResist / 100.f));
+					}
 				}
 			}
 		// Calculate player armor reduction
@@ -3077,41 +3189,10 @@ float CombatManager::doObjectDetonation(TangibleObject* attackerTanO, CreatureOb
 				damage *= 0.25;
 			}
 
-			ArmorObject* psgArmor = getPSGArmor(defender);
-
-			// PSG Reduction
-			if (psgArmor != nullptr && !psgArmor->isVulnerable(SharedWeaponObjectTemplate::BLAST)) {
-				float armorReduction = psgArmor->getBlast();
-
-				damage *= getArmorPiercing(psgArmor, armorPiercing);
-
-				if (armorReduction > 0) {
-					damage *= (1.f - (armorReduction / 100.f));
-				}
-
-				Locker plocker(psgArmor, attackerTanO);
-
-				psgArmor->inflictDamage(psgArmor, 0, damage * 0.2, true, true);
-			}
-
-			ManagedReference<ArmorObject*> armor = getArmorObject(defender, hitLocation);
-
-			// Armor Reduction
-			if (armor != nullptr && !armor->isVulnerable(SharedWeaponObjectTemplate::BLAST)) {
-				float armorReduction = getArmorObjectReduction(armor, SharedWeaponObjectTemplate::BLAST);
-
-				// use only the damage applied to the armor for piercing (after the PSG takes some off)
-				damage *= getArmorPiercing(armor, armorPiercing);
-
-				if (armorReduction > 0) {
-					damage *= (1.f - (armorReduction / 100.f));
-				}
-
-				// inflict condition damage
-				Locker alocker(armor, attackerTanO);
-
-				armor->inflictDamage(armor, 0, damage * 0.2, true, true);
-			}
+			WornArmorReductionResult playerArmor =
+				applyWornArmorBlastReduction(attackerTanO, defender, damage,
+					armorPiercing, hitLocation);
+			damage = playerArmor.damage;
 		}
 
 		// Handle spill over damage for all pools

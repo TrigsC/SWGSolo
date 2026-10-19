@@ -94,6 +94,8 @@ class AiAgent extends CreatureObject {
 	protected transient CreatureAttackMap secondaryAttackMap;
 	protected transient CreatureAttackMap defaultAttackMap;
 	protected transient CreatureAttackMap skillDerivedAttackMap;
+	protected transient boolean simBotWornArmor;
+	protected transient unsigned long simBotArmorMitigatedTotal;
 	protected transient int skillAbilitySpecialChance;
 	protected transient boolean skillAbilityPreferFreeState;
 	protected transient float skillAbilityHamReserve;
@@ -651,6 +653,31 @@ class AiAgent extends CreatureObject {
 	@preLocked
 	@read
 	public native float getSkillAbilityHamReserve();
+
+	@local
+	@preLocked
+	public void setSimBotWornArmor(boolean worn) {
+		simBotWornArmor = worn;
+	}
+
+	@local
+	@preLocked
+	public boolean hasSimBotWornArmor() {
+		return simBotWornArmor;
+	}
+
+	@local
+	@preLocked
+	public void addSimBotArmorMitigated(unsigned long amount) {
+		simBotArmorMitigatedTotal += amount;
+	}
+
+	@local
+	@preLocked
+	@read
+	public unsigned long getSimBotArmorMitigatedTotal() {
+		return simBotArmorMitigatedTotal;
+	}
 
 	@local
 	@preLocked

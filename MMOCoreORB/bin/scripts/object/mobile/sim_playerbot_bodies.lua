@@ -1,0 +1,52 @@
+-- Clothing-free PlayerBot bodies. The sim layer applies the seeded vendor
+-- features and stock outfit after loadTemplateData.
+
+object_mobile_sim_playerbot_human_male = object_mobile_vendor_shared_human_male:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_human_male, "object/mobile/sim_playerbot_human_male.iff")
+object_mobile_sim_playerbot_human_female = object_mobile_vendor_shared_human_female:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_human_female, "object/mobile/sim_playerbot_human_female.iff")
+
+object_mobile_sim_playerbot_bothan_male = object_mobile_vendor_shared_bothan_male:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_bothan_male, "object/mobile/sim_playerbot_bothan_male.iff")
+object_mobile_sim_playerbot_bothan_female = object_mobile_vendor_shared_bothan_female:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_bothan_female, "object/mobile/sim_playerbot_bothan_female.iff")
+
+object_mobile_sim_playerbot_ithorian_male = object_mobile_vendor_shared_ithorian_male:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_ithorian_male, "object/mobile/sim_playerbot_ithorian_male.iff")
+object_mobile_sim_playerbot_ithorian_female = object_mobile_vendor_shared_ithorian_female:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_ithorian_female, "object/mobile/sim_playerbot_ithorian_female.iff")
+
+object_mobile_sim_playerbot_moncal_male = object_mobile_vendor_shared_moncal_male:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_moncal_male, "object/mobile/sim_playerbot_moncal_male.iff")
+object_mobile_sim_playerbot_moncal_female = object_mobile_vendor_shared_moncal_female:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_moncal_female, "object/mobile/sim_playerbot_moncal_female.iff")
+
+object_mobile_sim_playerbot_rodian_male = object_mobile_vendor_shared_rodian_male:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_rodian_male, "object/mobile/sim_playerbot_rodian_male.iff")
+object_mobile_sim_playerbot_rodian_female = object_mobile_vendor_shared_rodian_female:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_rodian_female, "object/mobile/sim_playerbot_rodian_female.iff")
+
+object_mobile_sim_playerbot_sullustan_male = object_mobile_vendor_shared_sullustan_male:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_sullustan_male, "object/mobile/sim_playerbot_sullustan_male.iff")
+object_mobile_sim_playerbot_sullustan_female = object_mobile_vendor_shared_sullustan_female:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_sullustan_female, "object/mobile/sim_playerbot_sullustan_female.iff")
+
+object_mobile_sim_playerbot_trandoshan_male = object_mobile_vendor_shared_trandoshan_male:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_trandoshan_male, "object/mobile/sim_playerbot_trandoshan_male.iff")
+object_mobile_sim_playerbot_trandoshan_female = object_mobile_vendor_shared_trandoshan_female:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_trandoshan_female, "object/mobile/sim_playerbot_trandoshan_female.iff")
+
+object_mobile_sim_playerbot_twilek_male = object_mobile_vendor_shared_twilek_male:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_twilek_male, "object/mobile/sim_playerbot_twilek_male.iff")
+object_mobile_sim_playerbot_twilek_female = object_mobile_vendor_shared_twilek_female:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_twilek_female, "object/mobile/sim_playerbot_twilek_female.iff")
+
+object_mobile_sim_playerbot_wookiee_male = object_mobile_vendor_shared_wookiee_male:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_wookiee_male, "object/mobile/sim_playerbot_wookiee_male.iff")
+object_mobile_sim_playerbot_wookiee_female = object_mobile_vendor_shared_wookiee_female:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_wookiee_female, "object/mobile/sim_playerbot_wookiee_female.iff")
+
+object_mobile_sim_playerbot_zabrak_male = object_mobile_vendor_shared_zabrak_male:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_zabrak_male, "object/mobile/sim_playerbot_zabrak_male.iff")
+object_mobile_sim_playerbot_zabrak_female = object_mobile_vendor_shared_zabrak_female:new {}
+ObjectTemplates:addTemplate(object_mobile_sim_playerbot_zabrak_female, "object/mobile/sim_playerbot_zabrak_female.iff")

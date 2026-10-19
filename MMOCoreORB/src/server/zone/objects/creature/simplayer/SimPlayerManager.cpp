@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstdio>
 #include <ctime>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <sstream>
@@ -95,7 +96,9 @@
 #include "server/zone/objects/building/BuildingObject.h"
 #include "server/zone/objects/cell/CellObject.h"
 #include "templates/SharedObjectTemplate.h"
+#include "templates/SharedTangibleObjectTemplate.h"
 #include "templates/manager/TemplateManager.h"
+#include "templates/creature/VendorCreatureTemplate.h"
 #include "templates/tangible/SharedWeaponObjectTemplate.h"
 #include "templates/appearance/PortalLayout.h"
 #include "templates/appearance/FloorMesh.h"
@@ -6309,10 +6312,18 @@ void SimPlayerManager::loadLuaConfig() {
 		Locker progressionLock(&progressionMutex);
 		progressionEarlyGameStates.removeAll();
 		progressionLoadoutChoices.removeAll();
+		progressionArmorWorn.removeAll();
+		progressionArmorChoices.removeAll();
+		progressionArmorBlockedReason.removeAll();
 		progressionCertificationCache.removeAll();
 		progressionLoadoutDirtyIds.removeAll();
+		progressionArmorDirtyIds.removeAll();
+		progressionArmorBodyRaceCrc.removeAll();
 		progressionLoadoutLastFullSweepMs = 0;
+		progressionArmorLastFullSweepMs = 0;
+		progressionArmorPolicy = SimBotArmorPolicy();
 		progressionBazaarUpgradeScanAtMs.removeAll();
+		progressionArmorUpgradeScanAtMs.removeAll();
 	}
 	progressionReaperEnabled = false;
 	progressionReaperMinAgeSeconds = 3600;
@@ -6357,12 +6368,23 @@ void SimPlayerManager::loadLuaConfig() {
 		progressionTrainingNextSteps.removeAll();
 		progressionTrainingPendingIds.removeAll();
 		progressionLoadoutChoices.removeAll();
+		progressionArmorWorn.removeAll();
+		progressionArmorChoices.removeAll();
+		progressionArmorBlockedReason.removeAll();
 		progressionCertificationCache.removeAll();
 		progressionLoadoutDirtyIds.removeAll();
+		progressionArmorDirtyIds.removeAll();
+		progressionArmorBodyRaceCrc.removeAll();
 		progressionLoadoutLastFullSweepMs = 0;
+		progressionArmorLastFullSweepMs = 0;
 		progressionBazaarUpgradeScanAtMs.removeAll();
+		progressionArmorUpgradeScanAtMs.removeAll();
 		trainingSweepCursor = 0;
 		trainingLastSkill = "";
+	}
+	{
+		Locker clothingLock(&armorClothingMutex);
+		armorStowedClothing.removeAll();
 	}
 	{
 		Locker requestLock(&progressionRequestMutex);
@@ -6405,6 +6427,12 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestBazaarBuyGateOverrideActive = false;
 		playerBotParityBazaarBuyGateScopedIds.removeAll();
 		playerBotParityTestLoadoutGateOverrideActive = false;
+		playerBotParityTestArmorGateOverrideActive = false;
+		playerBotParityTestArmorGateOverride = false;
+		playerBotParityArmorGateScopedIds.removeAll();
+	playerBotParityBodyTemplateOverrides.removeAll();
+		playerBotParityBodyTemplateOverrides.removeAll();
+		playerBotParityArmorGateValues.removeAll();
 		playerBotParityLoadoutGateScopedIds.removeAll();
 		playerBotParityLoadoutGateValues.removeAll();
 		playerBotParityBazaarUpgradesGateScopedIds.removeAll();
@@ -8861,6 +8889,265 @@ bool SimPlayerManager::snapshotPlayerBotLoadoutCandidates(uint64 identityId,
 	return true;
 }
 
+SimBotArmorPolicy SimPlayerManager::snapshotPlayerBotArmorPolicy() {
+	Locker progressionLock(&progressionMutex);
+	return progressionArmorPolicy;
+}
+
+void SimPlayerManager::fillPlayerBotArmorStats(ArmorObject* armor,
+		SimBotArmorLoadout::ArmorStats& stats) {
+	stats = SimBotArmorLoadout::ArmorStats();
+	if (armor == nullptr)
+		return;
+
+	stats.objectId = armor->getObjectID();
+	stats.templateCrc = armor->getServerObjectCRC();
+	stats.templateString = armor->getObjectTemplate() == nullptr ? String() :
+		armor->getObjectTemplate()->getFullTemplateString();
+	stats.gameObjectType = armor->getGameObjectType();
+	stats.hitLocationMask = armor->getHitLocation();
+	stats.armorRating = armor->getRating();
+	stats.resists[SimBotArmorLoadout::KINETIC] = armor->getKinetic();
+	stats.resists[SimBotArmorLoadout::ENERGY] = armor->getEnergy();
+	stats.resists[SimBotArmorLoadout::BLAST] = armor->getBlast();
+	stats.resists[SimBotArmorLoadout::STUN] = armor->getStun();
+	stats.resists[SimBotArmorLoadout::HEAT] = armor->getHeat();
+	stats.resists[SimBotArmorLoadout::COLD] = armor->getCold();
+	stats.resists[SimBotArmorLoadout::ACID] = armor->getAcid();
+	stats.resists[SimBotArmorLoadout::ELECTRICITY] = armor->getElectricity();
+	stats.resists[SimBotArmorLoadout::LIGHTSABER] = armor->getLightSaber();
+	for (int type = SimBotArmorLoadout::KINETIC;
+			type < SimBotArmorLoadout::DAMAGE_TYPE_COUNT; ++type) {
+		if (armor->isVulnerable(
+				SimBotArmorLoadout::damageTypeMask(type)))
+			stats.vulnerabilityMask |=
+				SimBotArmorLoadout::damageTypeMask(type);
+	}
+	stats.healthEncumbrance = armor->getHealthEncumbrance();
+	stats.actionEncumbrance = armor->getActionEncumbrance();
+	stats.mindEncumbrance = armor->getMindEncumbrance();
+	stats.faction = armor->getFaction();
+	stats.condition = armor->getMaxCondition() - armor->getConditionDamage();
+	stats.maxCondition = armor->getMaxCondition();
+
+	SharedTangibleObjectTemplate* armorTemplate = cast<
+		SharedTangibleObjectTemplate*>(armor->getObjectTemplate());
+	if (armorTemplate != nullptr) {
+		const Vector<uint32>* races = armorTemplate->getPlayerRaces();
+		if (races != nullptr)
+			stats.allowedRaces = *races;
+		stats.certificationsRequired =
+			armorTemplate->getCertificationsRequired();
+	}
+
+	if (armor->getArrangementDescriptorSize() > 0) {
+		const Vector<String>* slots = armor->getArrangementDescriptor(0);
+		if (slots != nullptr) {
+			std::vector<String> sortedSlots;
+			for (int i = 0; i < slots->size(); ++i)
+				sortedSlots.push_back(slots->get(i));
+			std::sort(sortedSlots.begin(), sortedSlots.end(),
+				[](const String& left, const String& right) {
+					return left.compareTo(right) < 0;
+				});
+			StringBuffer slotKey;
+			for (size_t i = 0; i < sortedSlots.size(); ++i) {
+				if (i != 0)
+					slotKey << ",";
+				stats.slotNames.add(sortedSlots[i]);
+				slotKey << sortedSlots[i];
+			}
+			stats.slotKey = slotKey.toString();
+		}
+	}
+}
+
+bool SimPlayerManager::snapshotPlayerBotArmorCandidates(uint64 identityId,
+		Vector<SimBotArmorLoadout::ArmorStats>& candidates,
+		Vector<String>& trainedSkills) {
+	candidates.removeAll();
+	trainedSkills.removeAll();
+	String trainingPlanName;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveIdentities.contains(identityId))
+			return false;
+		trainingPlanName = pveIdentities.get(identityId).trainingPlan;
+	}
+	if (trainingPlanName.isEmpty())
+		return false;
+
+	VectorMap<uint64, bool> heldObjectIds;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (!progressionRecords.contains(identityId) ||
+				!progressionTrainingPlans.contains(trainingPlanName))
+			return false;
+		// Wearable certificationsRequired are skill box names, checked by
+		// CreatureObject::hasSkill for players; not the cert_* abilities.
+		trainedSkills = progressionRecords.get(identityId).skills;
+		for (int i = 0; i < progressionItems.size(); ++i) {
+			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+			if (row.identityId == identityId && row.state == SIMBOT_ITEM_HELD)
+				heldObjectIds.put(row.objectId, true);
+		}
+	}
+
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+		economyManager->getItemBag(identityId);
+	if (bag == nullptr)
+		return true;
+	Vector<ManagedReference<SceneObject*> > children;
+	{
+		Locker bagLock(bag);
+		for (int i = 0; i < bag->getContainerObjectsSize(); ++i)
+			children.add(bag->getContainerObject(i));
+	}
+	for (int i = 0; i < children.size(); ++i) {
+		SceneObject* object = children.get(i);
+		if (object == nullptr || !heldObjectIds.contains(object->getObjectID()) ||
+				!object->isArmorObject() || object->isPsgArmorObject())
+			continue;
+		ArmorObject* armor = cast<ArmorObject*>(object);
+		if (armor == nullptr)
+			continue;
+		Locker itemLock(object);
+		SimBotArmorLoadout::ArmorStats stats;
+		fillPlayerBotArmorStats(armor, stats);
+		candidates.add(stats);
+	}
+	return true;
+}
+
+bool SimPlayerManager::snapshotPlayerBotBodyArmorContext(uint64 identityId,
+		const SimBotArmorPolicy& policy, SimBotBodyArmorContext& context) {
+	context = SimBotBodyArmorContext();
+	{
+		Locker progressionLock(&progressionMutex);
+		if (progressionArmorWorn.contains(identityId))
+			context.wornCopies = progressionArmorWorn.get(identityId);
+	}
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveIdentityBodyOids.contains(identityId))
+			return false;
+		context.bodyOid = pveIdentityBodyOids.get(identityId);
+	}
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(context.bodyOid);
+	AiAgent* agent = object == nullptr ? nullptr : object->asAiAgent();
+	if (agent == nullptr)
+		return false;
+
+	Locker agentLock(agent);
+	if (agent->getZone() == nullptr)
+		return false;
+	String bodyTemplate = agent->getObjectTemplate() == nullptr ? String() :
+		agent->getObjectTemplate()->getFullTemplateString();
+	if (policy.bodyRaces.contains(bodyTemplate))
+		context.bodyRaceCrc = policy.bodyRaces.get(bodyTemplate);
+	const uint8 attributes[] = {
+		CreatureAttribute::STRENGTH, CreatureAttribute::CONSTITUTION,
+		CreatureAttribute::QUICKNESS, CreatureAttribute::STAMINA,
+		CreatureAttribute::FOCUS, CreatureAttribute::WILLPOWER};
+	const unsigned int pools[] = {
+		SimBotArmorLoadout::STRENGTH,
+		SimBotArmorLoadout::CONSTITUTION,
+		SimBotArmorLoadout::QUICKNESS,
+		SimBotArmorLoadout::STAMINA,
+		SimBotArmorLoadout::FOCUS,
+		SimBotArmorLoadout::WILLPOWER};
+	for (int i = 0; i < 6; ++i) {
+		context.secondaries[i] = agent->getHAM(attributes[i]);
+		context.maxSecondaries[i] = agent->getMaxHAM(attributes[i]);
+		if (agent->getBuff(pveTrackedBuffCrcForAttribute(attributes[i])) != nullptr)
+			context.buffedPools |= pools[i];
+	}
+	context.inCombat = agent->isInCombat();
+	agentLock.release();
+	Locker progressionLock(&progressionMutex);
+	progressionArmorBodyRaceCrc.put(identityId, context.bodyRaceCrc);
+	return true;
+}
+
+bool SimPlayerManager::selectPlayerBotArmor(uint64 identityId,
+		SimBotArmorLoadout::ArmorChoice& out, bool preview) {
+	if (!preview && !playerBotArmorLoadoutGateEnabled(identityId))
+		return false;
+	SimBotArmorPolicy policy = snapshotPlayerBotArmorPolicy();
+	Vector<SimBotArmorLoadout::ArmorStats> candidateVector;
+	Vector<String> trainedSkills;
+	if (!snapshotPlayerBotArmorCandidates(identityId, candidateVector,
+			trainedSkills))
+		return false;
+	SimBotBodyArmorContext context;
+	if (!snapshotPlayerBotBodyArmorContext(identityId, policy, context))
+		return false;
+
+	std::vector<SimBotArmorLoadout::ArmorStats> candidates;
+	std::vector<uint64_t> current;
+	for (int i = 0; i < candidateVector.size(); ++i)
+		candidates.push_back(candidateVector.get(i));
+	for (int i = 0; i < context.wornCopies.size(); ++i) {
+		const SimBotWornArmorPiece& worn = context.wornCopies.get(i);
+		if (!worn.pendingRemoval)
+			current.push_back(worn.sourceOid);
+	}
+	if (!preview) {
+		for (int i = 0; i < candidateVector.size(); ++i) {
+			SimBotArmorLoadout::UsableReason reason =
+				SimBotArmorLoadout::usability(candidateVector.get(i),
+					context.bodyRaceCrc, 0, trainedSkills);
+			switch (reason) {
+			case SimBotArmorLoadout::RACE: armorSkippedRace.increment(); break;
+			case SimBotArmorLoadout::FACTION: armorSkippedFaction.increment(); break;
+			case SimBotArmorLoadout::CERT: armorSkippedCert.increment(); break;
+			case SimBotArmorLoadout::NO_COVERAGE: armorSkippedNoCoverage.increment(); break;
+			default: break;
+			}
+		}
+	}
+	out = SimBotArmorLoadout::chooseArmor(candidates, current,
+		context.bodyRaceCrc, 0, trainedSkills, policy.scoring,
+		static_cast<float>(policy.minUpgradePercent));
+	if (preview)
+		return true;
+
+	bool changed = false;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (!progressionArmorChoices.contains(identityId)) {
+			changed = true;
+		} else {
+			const SimBotArmorLoadout::ArmorChoice& previous =
+				progressionArmorChoices.get(identityId);
+			if (previous.pieces.size() != out.pieces.size())
+				changed = true;
+			else {
+				for (size_t i = 0; i < out.pieces.size(); ++i) {
+					if (previous.pieces[i].stats.objectId !=
+							out.pieces[i].stats.objectId) {
+						changed = true;
+						break;
+					}
+				}
+			}
+		}
+		progressionArmorChoices.put(identityId, out);
+		progressionArmorBlockedReason.put(identityId, String());
+	}
+	armorSelections.increment();
+	for (size_t i = 0; i < out.pieces.size(); ++i)
+		if (out.pieces[i].status == SimBotArmorLoadout::HELD_BY_HYSTERESIS)
+			armorHysteresisHolds.increment();
+	if (changed)
+		MissionDiagLog::event("LOADOUT_ARMOR", identityId,
+			"pieces=" + String::valueOf(static_cast<int>(out.pieces.size())));
+	return true;
+}
+
 bool SimPlayerManager::selectPlayerBotLoadout(const SimBotIdentity& identity,
 		SimBotLoadout::LoadoutChoice& out, bool preview) {
 	// Snapshot the harness-only source before touching progressionMutex. The
@@ -9025,6 +9312,998 @@ void SimPlayerManager::collectPlayerBotProtectedWeaponOids(uint64 identityId,
 		planXpTypes, certsHeld, certsPlanned);
 	for (size_t i = 0; i < ids.size(); ++i)
 		protectedIds.put(ids[i], true);
+}
+
+bool SimPlayerManager::playerBotArmorLoadoutGateEnabled(uint64 identityId) {
+	bool masterEnabled = false;
+	bool configured = false;
+	bool loaded = false;
+	{
+		Locker progressionLock(&progressionMutex);
+		masterEnabled = progressionEnabled;
+		configured = progressionArmorPolicy.enabled;
+		loaded = progressionLoaded;
+	}
+	if (!masterEnabled)
+		return false;
+	bool enabled = configured;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (identityId != 0 && playerBotParityTestArmorGateOverrideActive &&
+				playerBotParityArmorGateScopedIds.contains(identityId))
+			enabled = playerBotParityArmorGateValues.contains(identityId) ?
+				playerBotParityArmorGateValues.get(identityId) :
+				playerBotParityTestArmorGateOverride;
+	}
+	if (!enabled || !loaded || progressionItemReconcilePending.load())
+		return false;
+	if (!playerBotEarlyGameGateEnabled())
+		return false;
+	if (identityId == 0)
+		return true;
+	SimBotIdentity identity;
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	return economyManager != nullptr && economyManager->isItemVaultAvailable() &&
+		snapshotPlayerBotIdentity(identityId, identity) &&
+		!identity.trainingPlan.isEmpty();
+}
+
+bool SimPlayerManager::playerBotArmorBazaarUpgradesGateEnabled(
+		uint64 identityId) {
+	if (!playerBotArmorLoadoutGateEnabled(identityId) ||
+			!playerBotBazaarBuyGateEnabled(identityId))
+		return false;
+	SimBotArmorPolicy policy = snapshotPlayerBotArmorPolicy();
+	bool upgradesEnabled = policy.bazaarUpgrades;
+	Locker parityLock(&playerBotParityTestMutex);
+	if (identityId != 0 &&
+			playerBotParityBazaarUpgradesGateScopedIds.contains(identityId))
+		upgradesEnabled = playerBotParityBazaarUpgradesGateValues.get(identityId);
+	return upgradesEnabled;
+}
+
+void SimPlayerManager::collectPlayerBotProtectedArmorOids(uint64 identityId,
+		VectorMap<uint64, bool>& protectedIds) {
+	SimBotArmorPolicy policy = snapshotPlayerBotArmorPolicy();
+	Vector<SimBotWornArmorPiece> worn;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (progressionArmorWorn.contains(identityId))
+			worn = progressionArmorWorn.get(identityId);
+	}
+	for (int i = 0; i < worn.size(); ++i) {
+		if (worn.get(i).sourceOid != 0 && !worn.get(i).pendingRemoval)
+			protectedIds.put(worn.get(i).sourceOid, true);
+	}
+	if (!playerBotArmorLoadoutGateEnabled(identityId))
+		return;
+
+	Vector<SimBotArmorLoadout::ArmorStats> candidateVector;
+	Vector<String> trainedSkills;
+	if (!snapshotPlayerBotArmorCandidates(identityId, candidateVector,
+			trainedSkills))
+		return;
+	uint32 bodyRaceCrc = 0;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (progressionArmorBodyRaceCrc.contains(identityId))
+			bodyRaceCrc = progressionArmorBodyRaceCrc.get(identityId);
+	}
+	std::vector<SimBotArmorLoadout::ArmorStats> candidates;
+	std::vector<uint64_t> wornOids;
+	for (int i = 0; i < candidateVector.size(); ++i)
+		candidates.push_back(candidateVector.get(i));
+	for (int i = 0; i < worn.size(); ++i)
+		if (!worn.get(i).pendingRemoval)
+			wornOids.push_back(worn.get(i).sourceOid);
+	std::vector<uint64_t> ids = SimBotArmorLoadout::protectedSet(candidates,
+		wornOids, bodyRaceCrc, 0, trainedSkills, policy.scoring);
+	for (size_t i = 0; i < ids.size(); ++i)
+		protectedIds.put(ids[i], true);
+}
+
+static String simBotAppearanceSpeciesGender(const String& bodyTemplate) {
+	static const String prefix = "object/mobile/sim_playerbot_";
+	if (!bodyTemplate.beginsWith(prefix) ||
+			!bodyTemplate.endsWith(".iff"))
+		return "";
+	return bodyTemplate.subString(prefix.length(),
+		bodyTemplate.length() - 4);
+}
+
+static String simBotAppearanceProfile(const String& bodyTemplate) {
+	String speciesGender = simBotAppearanceSpeciesGender(bodyTemplate);
+	if (speciesGender.isEmpty())
+		return "";
+	StringBuffer profile;
+	profile << "object/mobile/vendor/" << speciesGender << ".iff";
+	return profile.toString();
+}
+
+static String simBotAppearanceOutfitGroup(const String& bodyTemplate) {
+	String speciesGender = simBotAppearanceSpeciesGender(bodyTemplate);
+	if (speciesGender.beginsWith("wookiee_"))
+		return "sim_playerbot_outfit_wookiee";
+	if (speciesGender.beginsWith("ithorian_"))
+		return "sim_playerbot_outfit_ithorian";
+	return speciesGender.isEmpty() ? String() :
+		String("sim_playerbot_outfit_humanoid");
+}
+
+static String simBotAppearanceOutfitKey(MobileOutfit* outfit) {
+	StringBuffer key;
+	if (outfit == nullptr)
+		return "";
+	Vector<OutfitTangibleObject>* objects = outfit->getObjects();
+	for (int i = 0; i < objects->size(); ++i) {
+		OutfitTangibleObject* object = &objects->get(i);
+		key << object->getObjectTemplate() << "{";
+		VectorMap<String, uint8>* customization =
+			object->getCustomizationVariables();
+		std::vector<std::pair<String, int> > values;
+		for (int j = 0; j < customization->size(); ++j)
+			values.push_back(std::make_pair(customization->elementAt(j).getKey(),
+				static_cast<int>(customization->elementAt(j).getValue())));
+		std::sort(values.begin(), values.end(),
+			[](const std::pair<String, int>& left,
+					const std::pair<String, int>& right) {
+				return left.first.compareTo(right.first) > 0;
+			});
+		for (size_t j = 0; j < values.size(); ++j)
+			key << values[j].first << "=" << values[j].second << ";";
+		key << "}";
+	}
+	return key.toString();
+}
+
+void SimPlayerManager::applyPlayerBotAppearanceLocked(AiAgent* agent,
+		uint64 identityId, const String& bodyTemplate) {
+	if (agent == nullptr)
+		return;
+	String profileTemplate = simBotAppearanceProfile(bodyTemplate);
+	if (profileTemplate.isEmpty())
+		return;
+	SharedObjectTemplate* sharedProfile = TemplateManager::instance()->
+		getTemplate(profileTemplate.hashCode());
+	VendorCreatureTemplate* appearanceProfile =
+		dynamic_cast<VendorCreatureTemplate*>(sharedProfile);
+	if (appearanceProfile == nullptr)
+		return;
+
+	for (int i = 0; i < appearanceProfile->getCustomizationStringNamesSize(); ++i) {
+		if (i >= appearanceProfile->getCustomizationValuesSize())
+			continue;
+		String variableName = appearanceProfile->getCustomizationStringName(i);
+		Vector<int> values = appearanceProfile->getCustomizationValues(i);
+		if (variableName.isEmpty() || values.isEmpty())
+			continue;
+		int valueIndex = SimBotAppearance::chooseFeatureValue(identityId,
+			values.size(), static_cast<uint64>(i) + 0x100ULL);
+		int randomValue = values.get(valueIndex);
+		int separator = variableName.indexOf(',');
+		if (separator >= 0) {
+			String firstVariable = variableName.subString(0, separator);
+			String secondVariable = variableName.subString(separator + 1);
+			if (SimBotAppearance::chooseMorphSide(identityId,
+					static_cast<uint64>(i) + 0x200ULL)) {
+				agent->setCustomizationVariable(firstVariable, randomValue, false);
+				agent->setCustomizationVariable(secondVariable, 0, false);
+			} else {
+				agent->setCustomizationVariable(firstVariable, 0, false);
+				agent->setCustomizationVariable(secondVariable, randomValue, false);
+			}
+		} else {
+			agent->setCustomizationVariable(variableName, randomValue, false);
+		}
+	}
+
+	const int minScale = static_cast<int>(appearanceProfile->getMinScale() * 100.f);
+	const int maxScale = static_cast<int>(appearanceProfile->getMaxScale() * 100.f);
+	const float height = SimBotAppearance::chooseScalePercent(identityId,
+		minScale, maxScale) / 100.f;
+	if (height > 0.f)
+		agent->setHeight(height, false);
+
+	ZoneServer* zoneServer = agent->getZoneServer();
+	if (appearanceProfile->getHairSize() > 0 && zoneServer != nullptr) {
+		String hairTemplate = appearanceProfile->getHairFile(
+			SimBotAppearance::chooseFeatureValue(identityId,
+				appearanceProfile->getHairSize(), 0x300ULL));
+		if (!hairTemplate.isEmpty()) {
+			ManagedReference<TangibleObject*> hair = zoneServer->createObject(
+				hairTemplate.hashCode(), agent->getPersistenceLevel()).
+				castTo<TangibleObject*>();
+			if (hair != nullptr) {
+				Locker hairLock(hair);
+				bool hasHairSlot = false;
+				for (int descriptor = 0;
+						descriptor < hair->getArrangementDescriptorSize();
+						descriptor++) {
+					const Vector<String>* slots = hair->getArrangementDescriptor(
+						descriptor);
+					if (slots != nullptr && slots->contains("hair")) {
+						hasHairSlot = true;
+						break;
+					}
+				}
+				if (!hasHairSlot || !agent->transferObject(hair, 4, false)) {
+					hair->destroyObjectFromDatabase(true);
+				} else {
+					ManagedReference<SceneObject*> hairParent = hair->getParent();
+					if (hairParent != nullptr && hairParent.get() == agent)
+						agent->addWearableObject(hair, false);
+				}
+			}
+		}
+	}
+
+	String outfitGroupName = simBotAppearanceOutfitGroup(bodyTemplate);
+	MobileOutfitGroup* outfitGroup = outfitGroupName.isEmpty() ? nullptr :
+		CreatureTemplateManager::instance()->getMobileOutfitGroup(
+			outfitGroupName);
+	if (outfitGroup == nullptr)
+		return;
+	Vector<MobileOutfit>* outfits = outfitGroup->getOutfits();
+	std::vector<int> validIndexes;
+	std::vector<String> variantKeys;
+	for (int i = 0; i < outfits->size(); ++i) {
+		String key = simBotAppearanceOutfitKey(&outfits->get(i));
+		bool duplicate = false;
+		for (size_t j = 0; j < variantKeys.size(); ++j)
+			if (variantKeys[j] == key)
+				duplicate = true;
+		if (duplicate) {
+			warning("SimBotAppearance duplicate outfit variant group=" +
+				outfitGroupName + " index=" + String::valueOf(i));
+			continue;
+		}
+		validIndexes.push_back(i);
+		variantKeys.push_back(key);
+	}
+	int selectedVariant = SimBotAppearance::chooseOutfitVariant(identityId,
+		variantKeys);
+	if (selectedVariant < 0)
+		return;
+	MobileOutfit* outfit = &outfits->get(validIndexes[selectedVariant]);
+	Vector<OutfitTangibleObject>* objects = outfit->getObjects();
+	// The player wear rule (PlayerContainerComponent::canAddObject): a piece
+	// whose race list lacks the body's species is skipped, e.g. shoes on a
+	// Trandoshan. The AI container path never checks this itself.
+	const String speciesGender = simBotAppearanceSpeciesGender(
+		agent->getObjectTemplate() == nullptr ? String() :
+			agent->getObjectTemplate()->getFullTemplateString());
+	const uint32 playerRaceCrc = speciesGender.isEmpty() ? 0 :
+		String("object/creature/player/" + speciesGender + ".iff").hashCode();
+	for (int i = 0; i < objects->size(); ++i) {
+		OutfitTangibleObject* object = &objects->get(i);
+		String objectTemplate = object->getObjectTemplate();
+		SharedTangibleObjectTemplate* wearTemplate =
+			dynamic_cast<SharedTangibleObjectTemplate*>(
+				TemplateManager::instance()->getTemplate(
+					objectTemplate.hashCode()));
+		if (playerRaceCrc != 0 && wearTemplate != nullptr &&
+				wearTemplate->getPlayerRaces() != nullptr &&
+				!wearTemplate->getPlayerRaces()->contains(playerRaceCrc))
+			continue;
+		ManagedReference<TangibleObject*> clothing = zoneServer->createObject(
+			objectTemplate.hashCode(), agent->getPersistenceLevel()).
+			castTo<TangibleObject*>();
+		if (clothing == nullptr)
+			continue;
+		Locker clothingLock(clothing);
+		VectorMap<String, uint8>* customization =
+			object->getCustomizationVariables();
+		for (int j = 0; j < customization->size(); ++j)
+			clothing->setCustomizationVariable(customization->elementAt(j).getKey(),
+				customization->elementAt(j).getValue());
+		if (!agent->transferObject(clothing, 4, false) &&
+				clothing->isPersistent())
+			clothing->destroyObjectFromDatabase(true);
+	}
+}
+
+bool SimPlayerManager::snapshotPlayerBotAppearance(uint64 identityId,
+		String& fingerprint) {
+	fingerprint = "";
+	uint64 bodyOid = 0;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveIdentityBodyOids.contains(identityId))
+			return false;
+		bodyOid = pveIdentityBodyOids.get(identityId);
+	}
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> body = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(bodyOid);
+	AiAgent* agent = body == nullptr ? nullptr : body->asAiAgent();
+	if (agent == nullptr)
+		return false;
+	Locker agentLock(agent);
+	if (agent->getZone() == nullptr)
+		return false;
+	StringBuffer result;
+	result << (agent->getObjectTemplate() == nullptr ? String() :
+		agent->getObjectTemplate()->getFullTemplateString()) << "|";
+	result << agent->getHeight(false) << "|";
+	String customization;
+	agent->getCustomizationVariables()->getData(customization);
+	result << customization << "|";
+	VectorMap<String, ManagedReference<SceneObject*> > slots;
+	agent->getSlottedObjects(slots);
+	for (int i = 0; i < slots.size(); ++i) {
+		ManagedReference<SceneObject*> object = slots.elementAt(i).getValue();
+		if (object == nullptr)
+			continue;
+		result << slots.elementAt(i).getKey() << ":";
+		result << (object->getObjectTemplate() == nullptr ? String() :
+			object->getObjectTemplate()->getFullTemplateString()) << ":";
+		TangibleObject* tangible = cast<TangibleObject*>(object.get());
+		if (tangible != nullptr) {
+			String objectCustomization;
+			tangible->getCustomizationVariables()->getData(objectCustomization);
+			result << objectCustomization;
+		}
+		result << ";";
+	}
+	fingerprint = result.toString();
+	return true;
+}
+
+ManagedReference<ArmorObject*> SimPlayerManager::clonePlayerBotArmorSource(
+		uint64 sourceOid) {
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> source = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(sourceOid);
+	ArmorObject* armor = source == nullptr ? nullptr :
+		cast<ArmorObject*>(source.get());
+	if (armor == nullptr)
+		return nullptr;
+	Locker itemLock(armor);
+	ManagedReference<SceneObject*> cloned =
+		ObjectManager::instance()->cloneObject(armor, true);
+	itemLock.release();
+	ManagedReference<ArmorObject*> copy = cloned == nullptr ? nullptr :
+		cast<ArmorObject*>(cloned.get());
+	if (cloned == nullptr)
+		return nullptr;
+	Locker cloneLock(cloned);
+	if (copy == nullptr) {
+		cloned->destroyObjectFromWorld(true);
+		cloned->destroyObjectFromDatabase(true);
+		return nullptr;
+	}
+	// cloneObject(..., true) marks the clone transient and then reads the
+	// source's serialized fields, which restore the vault item's persistence
+	// level. A body copy must never reach the object store (live
+	// verification found persistenceLevel 1 on worn copies).
+	copy->setPersistent(0);
+	return copy;
+}
+
+bool SimPlayerManager::equipPlayerBotArmorCopyLocked(AiAgent* agent,
+		ArmorObject* copy, bool notifyClient,
+		const VectorMap<uint64, bool>& armorCopyOids) {
+	if (agent == nullptr || copy == nullptr)
+		return false;
+
+	Vector<SimBotStowedClothing> displaced;
+	VectorMap<uint64, bool> displacedIds;
+	for (int descriptor = 0;
+			descriptor < copy->getArrangementDescriptorSize(); ++descriptor) {
+		const Vector<String>* slots = copy->getArrangementDescriptor(descriptor);
+		if (slots == nullptr)
+			continue;
+		for (int slotIndex = 0; slotIndex < slots->size(); ++slotIndex) {
+			const String& slot = slots->get(slotIndex);
+			ManagedReference<SceneObject*> object =
+				agent->getSlottedObject(slot);
+			if (object == nullptr ||
+					armorCopyOids.contains(object->getObjectID()))
+				continue;
+			if (displacedIds.contains(object->getObjectID())) {
+				for (int i = 0; i < displaced.size(); ++i) {
+					if (displaced.get(i).object != nullptr &&
+							displaced.get(i).object->getObjectID() ==
+							object->getObjectID()) {
+						displaced.get(i).slots.add(slot);
+						break;
+					}
+				}
+				continue;
+			}
+			SimBotStowedClothing entry;
+			entry.object = object;
+			entry.slots.add(slot);
+			displacedIds.put(object->getObjectID(), true);
+			displaced.add(entry);
+		}
+	}
+
+	Vector<SimBotStowedClothing> notDetached;
+	for (int i = 0; i < displaced.size(); ++i) {
+		SimBotStowedClothing& entry = displaced.get(i);
+		Locker clothingLock(entry.object, agent);
+		if (!agent->removeObject(entry.object, nullptr, notifyClient, true)) {
+			notDetached.add(entry);
+			continue;
+		}
+	}
+
+	Locker copyLock(copy, agent);
+	if (!agent->transferObject(copy, 4, notifyClient)) {
+		copyLock.release();
+		Vector<SimBotStowedClothing> notRestored;
+		for (int i = 0; i < displaced.size(); ++i) {
+			SimBotStowedClothing& entry = displaced.get(i);
+			bool wasNotDetached = false;
+			for (int j = 0; j < notDetached.size(); ++j)
+				if (notDetached.get(j).object.getObjectID() ==
+						entry.object.getObjectID())
+					wasNotDetached = true;
+			if (wasNotDetached)
+				continue;
+			Locker clothingLock(entry.object, agent);
+			if (!agent->transferObject(entry.object, 4, notifyClient))
+				notRestored.add(entry);
+		}
+		if (notRestored.size() > 0) {
+			Locker clothingMapLock(&armorClothingMutex);
+			Vector<SimBotStowedClothing> retained =
+				armorStowedClothing.contains(agent->getObjectID()) ?
+				armorStowedClothing.get(agent->getObjectID()) :
+				Vector<SimBotStowedClothing>();
+			for (int i = 0; i < notRestored.size(); ++i)
+				retained.add(notRestored.get(i));
+			armorStowedClothing.put(agent->getObjectID(), retained);
+		}
+		return false;
+	}
+	ManagedReference<SceneObject*> parent = copy->getParent();
+	if (parent == nullptr || parent.get() != agent) {
+		agent->removeObject(copy, nullptr, false, true);
+		copyLock.release();
+		Vector<SimBotStowedClothing> notRestored;
+		for (int i = 0; i < displaced.size(); ++i) {
+			bool wasNotDetached = false;
+			for (int j = 0; j < notDetached.size(); ++j)
+				if (notDetached.get(j).object.getObjectID() ==
+						displaced.get(i).object.getObjectID())
+					wasNotDetached = true;
+			if (wasNotDetached)
+				continue;
+			Locker clothingLock(displaced.get(i).object, agent);
+			if (!agent->transferObject(displaced.get(i).object, 4,
+					notifyClient))
+				notRestored.add(displaced.get(i));
+		}
+		if (notRestored.size() > 0) {
+			Locker clothingMapLock(&armorClothingMutex);
+			Vector<SimBotStowedClothing> retained =
+				armorStowedClothing.contains(agent->getObjectID()) ?
+				armorStowedClothing.get(agent->getObjectID()) :
+				Vector<SimBotStowedClothing>();
+			for (int i = 0; i < notRestored.size(); ++i)
+				retained.add(notRestored.get(i));
+			armorStowedClothing.put(agent->getObjectID(), retained);
+		}
+		return false;
+	}
+	agent->addWearableObject(copy, notifyClient);
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	PlayerManager* playerManager = zoneServer == nullptr ? nullptr :
+		zoneServer->getPlayerManager();
+	if (playerManager != nullptr)
+		playerManager->applyEncumbrancies(agent, copy);
+	copy->addTemplateSkillMods(agent);
+	copy->applySkillModsTo(agent);
+	copyLock.release();
+
+	if (displaced.size() > notDetached.size()) {
+		Locker clothingMapLock(&armorClothingMutex);
+		Vector<SimBotStowedClothing> retained =
+			armorStowedClothing.contains(agent->getObjectID()) ?
+			armorStowedClothing.get(agent->getObjectID()) :
+			Vector<SimBotStowedClothing>();
+		for (int i = 0; i < displaced.size(); ++i) {
+			bool wasNotDetached = false;
+			for (int j = 0; j < notDetached.size(); ++j)
+				if (notDetached.get(j).object.getObjectID() ==
+						displaced.get(i).object.getObjectID())
+					wasNotDetached = true;
+			if (!wasNotDetached)
+				retained.add(displaced.get(i));
+		}
+		armorStowedClothing.put(agent->getObjectID(), retained);
+	}
+	return true;
+}
+
+void SimPlayerManager::removePlayerBotArmorCopyLocked(AiAgent* agent,
+		ArmorObject* copy, bool notifyClient,
+		const VectorMap<uint64, bool>& armorCopyOids) {
+	if (agent == nullptr || copy == nullptr ||
+			!armorCopyOids.contains(copy->getObjectID()))
+		return;
+	Locker copyLock(copy, agent);
+	agent->removeWearableObject(copy, notifyClient);
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	PlayerManager* playerManager = zoneServer == nullptr ? nullptr :
+		zoneServer->getPlayerManager();
+	if (playerManager != nullptr)
+		playerManager->removeEncumbrancies(agent, copy);
+	copy->removeTemplateSkillMods(agent);
+	copy->removeSkillModsFrom(agent);
+	agent->removeObject(copy, nullptr, notifyClient, true);
+	copyLock.release();
+
+	Vector<SimBotStowedClothing> stowed;
+	{
+		Locker clothingMapLock(&armorClothingMutex);
+		if (armorStowedClothing.contains(agent->getObjectID()))
+			stowed = armorStowedClothing.get(agent->getObjectID());
+	}
+	Vector<SimBotStowedClothing> remaining;
+	for (int i = 0; i < stowed.size(); ++i) {
+		SimBotStowedClothing& entry = stowed.get(i);
+		bool slotsFree = true;
+		for (int j = 0; j < entry.slots.size(); ++j) {
+			if (agent->getSlottedObject(entry.slots.get(j)) != nullptr) {
+				slotsFree = false;
+				break;
+			}
+		}
+		if (!slotsFree || entry.object == nullptr) {
+			remaining.add(entry);
+			continue;
+		}
+		Locker clothingLock(entry.object, agent);
+		if (!agent->transferObject(entry.object, 4, notifyClient))
+			remaining.add(entry);
+	}
+	{
+		Locker clothingMapLock(&armorClothingMutex);
+		if (remaining.size() > 0)
+			armorStowedClothing.put(agent->getObjectID(), remaining);
+		else
+			armorStowedClothing.drop(agent->getObjectID());
+	}
+}
+
+void SimPlayerManager::sweepPlayerBotArmorClothing() {
+	VectorMap<uint64, bool> liveBodyOids;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < pveIdentityBodyOids.size(); ++i)
+			liveBodyOids.put(pveIdentityBodyOids.elementAt(i).getValue(), true);
+	}
+	Locker clothingLock(&armorClothingMutex);
+	for (int i = armorStowedClothing.size() - 1; i >= 0; --i) {
+		if (!liveBodyOids.contains(armorStowedClothing.elementAt(i).getKey()))
+			armorStowedClothing.remove(i);
+	}
+}
+
+void SimPlayerManager::destroyPlayerBotArmorCopy(ArmorObject* copy) {
+	if (copy == nullptr)
+		return;
+	Locker copyLock(copy);
+	copy->destroyObjectFromWorld(true);
+	copy->destroyObjectFromDatabase(true);
+}
+
+void SimPlayerManager::reconcilePlayerBotArmorOnLiveBody(uint64 identityId,
+		bool respawn, bool forceDrain) {
+	SimBotArmorPolicy policy = snapshotPlayerBotArmorPolicy();
+	SimBotArmorLoadout::ArmorChoice desired;
+	if (!forceDrain) {
+		if (!playerBotArmorLoadoutGateEnabled(identityId))
+			forceDrain = true;
+		else if (!selectPlayerBotArmor(identityId, desired))
+			return;
+	}
+
+	SimBotBodyArmorContext context;
+	if (!snapshotPlayerBotBodyArmorContext(identityId, policy, context)) {
+		Locker progressionLock(&progressionMutex);
+		if (forceDrain || !progressionArmorWorn.contains(identityId)) {
+			progressionArmorWorn.drop(identityId);
+			progressionArmorChoices.drop(identityId);
+			progressionArmorBlockedReason.drop(identityId);
+			if (forceDrain)
+				progressionArmorDirtyIds.drop(identityId);
+		} else {
+			Vector<SimBotWornArmorPiece>& worn =
+				progressionArmorWorn.get(identityId);
+			for (int i = worn.size() - 1; i >= 0; --i)
+				if (worn.get(i).pendingRemoval)
+					worn.remove(i);
+		}
+		return;
+	}
+
+	Vector<SimBotWornArmorPiece> worn;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (progressionArmorWorn.contains(identityId))
+			worn = progressionArmorWorn.get(identityId);
+	}
+
+	Vector<SimBotPreparedArmorCopy> prepared;
+	Vector<String> deferredArmorSlots;
+	String blockedReason;
+	bool hasNonUnbuffedBlocker = false;
+	if (!forceDrain) {
+		if (!respawn && context.inCombat) {
+			blockedReason = "in_combat";
+			hasNonUnbuffedBlocker = true;
+			armorDeferredInCombat.increment();
+		} else {
+			// The stock check runs per piece against the stats left after the
+			// pieces before it, so plan against a running copy.
+			int running[6];
+			for (int j = 0; j < 6; ++j)
+				running[j] = context.secondaries[j];
+			for (size_t i = 0; i < desired.pieces.size(); ++i) {
+				const SimBotArmorLoadout::ArmorStats& stats =
+					desired.pieces[i].stats;
+				int oldIndex = -1;
+				for (int j = 0; j < worn.size(); ++j) {
+					if (!worn.get(j).pendingRemoval &&
+							worn.get(j).slotKey == stats.slotKey) {
+						oldIndex = j;
+						break;
+					}
+				}
+				bool sameOnBody = oldIndex >= 0 &&
+					worn.get(oldIndex).sourceOid == stats.objectId &&
+					worn.get(oldIndex).onBody;
+				if (sameOnBody)
+					continue;
+				unsigned int required =
+					SimBotArmorLoadout::requiredBuffPools(stats);
+				// Only a piece the bot already wore may go back on unbuffed.
+				bool alreadyWorn = false;
+				for (int j = 0; j < worn.size(); ++j)
+					if (!worn.get(j).pendingRemoval &&
+							worn.get(j).sourceOid == stats.objectId)
+						alreadyWorn = true;
+				if (!(respawn && alreadyWorn) &&
+						(required & ~context.buffedPools) != 0) {
+					blockedReason = "unbuffed";
+					deferredArmorSlots.add(stats.slotKey);
+					armorDeferredUnbuffed.increment();
+					continue;
+				}
+				int secondaries[6];
+				for (int j = 0; j < 6; ++j)
+					secondaries[j] = running[j];
+				if (oldIndex >= 0 && worn.get(oldIndex).onBody) {
+					secondaries[0] += Math::max(0,
+						worn.get(oldIndex).healthEncumbrance);
+					secondaries[1] += Math::max(0,
+						worn.get(oldIndex).healthEncumbrance);
+					secondaries[2] += Math::max(0,
+						worn.get(oldIndex).actionEncumbrance);
+					secondaries[3] += Math::max(0,
+						worn.get(oldIndex).actionEncumbrance);
+					secondaries[4] += Math::max(0,
+						worn.get(oldIndex).mindEncumbrance);
+					secondaries[5] += Math::max(0,
+						worn.get(oldIndex).mindEncumbrance);
+				}
+				if (!SimBotArmorLoadout::passesEncumbrance(stats, secondaries)) {
+					blockedReason = "encumbrance";
+					hasNonUnbuffedBlocker = true;
+					deferredArmorSlots.add(stats.slotKey);
+					armorDeferredEncumbrance.increment();
+					continue;
+				}
+				for (int j = 0; j < 6; ++j)
+					running[j] = secondaries[j];
+				running[0] -= Math::max(0, stats.healthEncumbrance);
+				running[1] -= Math::max(0, stats.healthEncumbrance);
+				running[2] -= Math::max(0, stats.actionEncumbrance);
+				running[3] -= Math::max(0, stats.actionEncumbrance);
+				running[4] -= Math::max(0, stats.mindEncumbrance);
+				running[5] -= Math::max(0, stats.mindEncumbrance);
+				SimBotPreparedArmorCopy copy;
+				copy.sourceOid = stats.objectId;
+				copy.stats = stats;
+				copy.copy = clonePlayerBotArmorSource(stats.objectId);
+				if (copy.copy != nullptr)
+					prepared.add(copy);
+				else {
+					blockedReason = "source_missing";
+					hasNonUnbuffedBlocker = true;
+				}
+			}
+		}
+	}
+
+	// Snapshot all armor-copy OIDs before taking the agent lock. The clothing
+	// swap must never inspect W or progression state under that lock.
+	VectorMap<uint64, bool> armorCopyOids;
+	for (int i = 0; i < worn.size(); ++i)
+		if (worn.get(i).copyOid != 0)
+			armorCopyOids.put(worn.get(i).copyOid, true);
+	for (int i = 0; i < prepared.size(); ++i)
+		if (prepared.get(i).copy != nullptr)
+			armorCopyOids.put(prepared.get(i).copy->getObjectID(), true);
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> body = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(context.bodyOid);
+	AiAgent* agent = body == nullptr ? nullptr : body->asAiAgent();
+	if (agent == nullptr) {
+		for (int i = 0; i < prepared.size(); ++i)
+			destroyPlayerBotArmorCopy(prepared.get(i).copy);
+		return;
+	}
+
+	Vector<SimBotWornArmorPiece> resultW;
+	Vector<ManagedReference<ArmorObject*> > destroyCopies;
+	int passEquips = 0;
+	int passRemovals = 0;
+	bool anyOnBody = false;
+	bool lifecycleAbort = false;
+	{
+		Locker agentLock(agent);
+		if (agent->getZone() == nullptr) {
+			lifecycleAbort = true;
+		} else {
+			VectorMap<String, ManagedReference<SceneObject*> > slots;
+			auto findCopy = [&](uint64 copyOid) -> ManagedReference<ArmorObject*> {
+				if (copyOid == 0)
+					return nullptr;
+				ManagedReference<ArmorObject*> found;
+				for (int i = 0; i < slots.size(); ++i) {
+					ManagedReference<SceneObject*> object = slots.elementAt(i).getValue();
+					if (object != nullptr && object->getObjectID() == copyOid) {
+						found = cast<ArmorObject*>(object.get());
+						break;
+					}
+				}
+				return found;
+			};
+			auto forgetCopy = [&](uint64 copyOid) {
+				for (int i = slots.size() - 1; i >= 0; --i) {
+					ManagedReference<SceneObject*> object =
+						slots.elementAt(i).getValue();
+					if (object != nullptr && object->getObjectID() == copyOid)
+						slots.remove(i);
+				}
+			};
+			agent->getSlottedObjects(slots);
+			auto retainWornPiece = [&](int wornIndex) {
+				if (wornIndex < 0 || wornIndex >= worn.size() ||
+						worn.get(wornIndex).pendingRemoval)
+					return;
+				SimBotWornArmorPiece kept = worn.get(wornIndex);
+				ManagedReference<ArmorObject*> copy = findCopy(kept.copyOid);
+				if (copy != nullptr) {
+					kept.bodyOid = context.bodyOid;
+					kept.onBody = true;
+					anyOnBody = true;
+				} else {
+					kept.copyOid = 0;
+					kept.bodyOid = 0;
+					kept.onBody = false;
+				}
+				resultW.add(kept);
+			};
+
+			if (!forceDrain) {
+				// Recheck under the final lock: the snapshot was taken before
+				// cloning, and a fight may have started since.
+				const bool inCombatNow = agent->isInCombat();
+				if (!respawn && (context.inCombat || inCombatNow)) {
+					if (!context.inCombat)
+						armorDeferredInCombat.increment();
+					blockedReason = "in_combat";
+					hasNonUnbuffedBlocker = true;
+					for (int i = 0; i < worn.size(); ++i) {
+						if (worn.get(i).pendingRemoval)
+							continue;
+						bool desiredSlot = false;
+						for (size_t j = 0; j < desired.pieces.size(); ++j) {
+							if (desired.pieces[j].stats.slotKey ==
+									worn.get(i).slotKey) {
+								desiredSlot = true;
+								break;
+							}
+						}
+						if (desiredSlot)
+							retainWornPiece(i);
+					}
+				} else for (size_t i = 0; i < desired.pieces.size(); ++i) {
+					const SimBotArmorLoadout::ArmorStats& stats =
+						desired.pieces[i].stats;
+					bool deferred = false;
+					for (int j = 0; j < deferredArmorSlots.size(); ++j) {
+						if (deferredArmorSlots.get(j) == stats.slotKey) {
+							deferred = true;
+							break;
+						}
+					}
+					int oldIndex = -1;
+					for (int j = 0; j < worn.size(); ++j)
+						if (!worn.get(j).pendingRemoval &&
+								worn.get(j).slotKey == stats.slotKey) {
+							oldIndex = j;
+							break;
+						}
+					if (deferred) {
+						retainWornPiece(oldIndex);
+						continue;
+					}
+					ManagedReference<ArmorObject*> oldCopy = oldIndex < 0 ? nullptr :
+						findCopy(worn.get(oldIndex).copyOid);
+					bool oldMatches = oldIndex >= 0 &&
+						worn.get(oldIndex).sourceOid == stats.objectId &&
+						oldCopy != nullptr;
+					if (oldMatches) {
+						SimBotWornArmorPiece kept = worn.get(oldIndex);
+						kept.bodyOid = context.bodyOid;
+						kept.onBody = true;
+						resultW.add(kept);
+						anyOnBody = true;
+						continue;
+					}
+
+					ManagedReference<ArmorObject*> newCopy;
+					for (int j = 0; j < prepared.size(); ++j)
+						if (prepared.get(j).sourceOid == stats.objectId)
+							newCopy = prepared.get(j).copy;
+					if (oldCopy != nullptr) {
+						removePlayerBotArmorCopyLocked(agent, oldCopy, true,
+							armorCopyOids);
+						forgetCopy(oldCopy->getObjectID());
+					}
+					bool injectTransferFailure =
+						playerBotParityTestFailArmorTransfer.get() &&
+						playerBotParityTestFailArmorTransferIdentity.get() == identityId;
+					if (injectTransferFailure)
+						playerBotParityTestFailArmorTransfer.set(false);
+					bool equipped = !injectTransferFailure && newCopy != nullptr &&
+						equipPlayerBotArmorCopyLocked(agent, newCopy, true,
+							armorCopyOids);
+					if (equipped) {
+						SimBotWornArmorPiece next;
+						next.sourceOid = stats.objectId;
+						next.slotKey = stats.slotKey;
+						next.healthEncumbrance = stats.healthEncumbrance;
+						next.actionEncumbrance = stats.actionEncumbrance;
+						next.mindEncumbrance = stats.mindEncumbrance;
+						next.copyOid = newCopy->getObjectID();
+						next.bodyOid = context.bodyOid;
+						next.onBody = true;
+						resultW.add(next);
+						anyOnBody = true;
+						armorEquips.increment();
+						++passEquips;
+						if (oldCopy != nullptr) {
+							destroyCopies.add(oldCopy);
+							armorRemovals.increment();
+							++passRemovals;
+						}
+					} else {
+						if (newCopy != nullptr)
+							destroyCopies.add(newCopy);
+						if (oldCopy != nullptr) {
+								bool restored = equipPlayerBotArmorCopyLocked(agent,
+									oldCopy, true, armorCopyOids);
+							if (restored) {
+								SimBotWornArmorPiece restoredPiece = worn.get(oldIndex);
+								restoredPiece.bodyOid = context.bodyOid;
+								restoredPiece.onBody = true;
+								resultW.add(restoredPiece);
+								anyOnBody = true;
+							} else {
+								destroyCopies.add(oldCopy);
+								SimBotWornArmorPiece retained = worn.get(oldIndex);
+								retained.copyOid = 0;
+								retained.bodyOid = 0;
+								retained.onBody = false;
+								resultW.add(retained);
+							}
+						} else if (oldIndex >= 0) {
+							SimBotWornArmorPiece retained = worn.get(oldIndex);
+							retained.copyOid = 0;
+							retained.bodyOid = 0;
+							retained.onBody = false;
+							resultW.add(retained);
+						}
+						blockedReason = blockedReason.isEmpty() ?
+							"equip_failed" : blockedReason;
+						hasNonUnbuffedBlocker = true;
+					}
+				}
+			}
+
+			for (int i = 0; i < worn.size(); ++i) {
+				const SimBotWornArmorPiece& old = worn.get(i);
+				bool retained = false;
+				for (int j = 0; j < resultW.size(); ++j)
+					if (resultW.get(j).sourceOid == old.sourceOid)
+						retained = true;
+				if (retained)
+					continue;
+				ManagedReference<ArmorObject*> oldCopy = findCopy(old.copyOid);
+				if (oldCopy != nullptr) {
+					removePlayerBotArmorCopyLocked(agent, oldCopy, true,
+						armorCopyOids);
+					forgetCopy(oldCopy->getObjectID());
+					destroyCopies.add(oldCopy);
+					armorRemovals.increment();
+					++passRemovals;
+				}
+			}
+			if (forceDrain) {
+				resultW.removeAll();
+				anyOnBody = false;
+			}
+			agent->setSimBotWornArmor(anyOnBody);
+		}
+	}
+
+	if (lifecycleAbort) {
+		for (int i = 0; i < prepared.size(); ++i)
+			destroyPlayerBotArmorCopy(prepared.get(i).copy);
+		return;
+	}
+	for (int i = 0; i < destroyCopies.size(); ++i)
+		destroyPlayerBotArmorCopy(destroyCopies.get(i));
+	for (int i = 0; i < prepared.size(); ++i) {
+		bool retained = false;
+		for (int j = 0; j < resultW.size(); ++j)
+			if (resultW.get(j).copyOid == prepared.get(i).copy->getObjectID())
+				retained = true;
+		if (!retained && prepared.get(i).copy != nullptr)
+			destroyPlayerBotArmorCopy(prepared.get(i).copy);
+	}
+
+	bool complete = forceDrain;
+	if (!forceDrain) {
+		complete = resultW.size() == desired.pieces.size();
+		for (size_t i = 0; complete && i < desired.pieces.size(); ++i) {
+			bool found = false;
+			for (int j = 0; j < resultW.size(); ++j)
+				if (resultW.get(j).sourceOid == desired.pieces[i].stats.objectId &&
+						resultW.get(j).onBody)
+					found = true;
+			complete = found;
+		}
+	}
+	{
+		Locker progressionLock(&progressionMutex);
+		if (forceDrain) {
+			progressionArmorWorn.drop(identityId);
+			progressionArmorChoices.drop(identityId);
+			progressionArmorBlockedReason.drop(identityId);
+			progressionArmorDirtyIds.drop(identityId);
+		} else {
+			progressionArmorWorn.put(identityId, resultW);
+			if (complete || (blockedReason == "unbuffed" &&
+					!hasNonUnbuffedBlocker))
+				progressionArmorDirtyIds.drop(identityId);
+			else
+				progressionArmorDirtyIds.put(identityId, true);
+			if (!blockedReason.isEmpty())
+				progressionArmorBlockedReason.put(identityId, blockedReason);
+			else
+				progressionArmorBlockedReason.drop(identityId);
+		}
+	}
+	if (respawn)
+		armorRewears.increment();
+	if (passEquips > 0 || passRemovals > 0)
+		MissionDiagLog::event("LOADOUT_ARMOR", identityId,
+			String(forceDrain ? "action=drain" : "action=reconcile") +
+			" equipped=" + String::valueOf(passEquips) +
+			" removed=" + String::valueOf(passRemovals));
+	if (!forceDrain && !blockedReason.isEmpty())
+		MissionDiagLog::event("LOADOUT_ARMOR", identityId,
+			"action=deferred reason=" + blockedReason);
 }
 
 void SimPlayerManager::restorePlayerBotWeaponTemplateStats(
@@ -9295,12 +10574,42 @@ static bool simBotCombatAbilityConfigEquals(
 	return true;
 }
 
+static bool simBotArmorPolicyEquals(const SimBotArmorPolicy& left,
+		const SimBotArmorPolicy& right) {
+	if (left.enabled != right.enabled ||
+			left.minUpgradePercent != right.minUpgradePercent ||
+			left.fullSweepMinutes != right.fullSweepMinutes ||
+			left.scoring.assumedArmorPiercing !=
+				right.scoring.assumedArmorPiercing ||
+			left.bazaarUpgrades != right.bazaarUpgrades ||
+			left.upgradeSpendFraction != right.upgradeSpendFraction ||
+			left.maxUpgradeLoadsPerVisit != right.maxUpgradeLoadsPerVisit ||
+			left.bodyHamBaseline != right.bodyHamBaseline ||
+			left.bodyRaces.size() != right.bodyRaces.size())
+		return false;
+
+	for (int i = 0; i < SimBotArmorLoadout::DAMAGE_TYPE_COUNT; ++i) {
+		if (left.scoring.damageTypeWeights[i] !=
+				right.scoring.damageTypeWeights[i])
+			return false;
+	}
+	for (int i = 0; i < left.bodyRaces.size(); ++i) {
+		const String& key = left.bodyRaces.elementAt(i).getKey();
+		if (!right.bodyRaces.contains(key) ||
+				right.bodyRaces.get(key) != left.bodyRaces.get(key))
+			return false;
+	}
+	return true;
+}
+
 void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 	const bool previousProgressionEnabled = progressionEnabled;
 	SimBotCombatAbilityConfig previousCombatAbilityConfig;
+	SimBotArmorPolicy armorPolicy;
 	{
 		Locker progressionLock(&progressionMutex);
 		previousCombatAbilityConfig = progressionCombatAbilityConfig;
+		armorPolicy = progressionArmorPolicy;
 	}
 
 	bool progressionEnabledOverrideActive = false;
@@ -9429,6 +10738,11 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 	bazaar.pop();
 	progressionWeaponLoadout = config.getBooleanField("weaponLoadout",
 		progressionWeaponLoadout);
+	// Read before opening the loadout child table: LuaObject field reads are
+	// stack-relative, so a parent read while a child is pushed reads the
+	// child (live verification found armorLoadout = true parsed as false).
+	armorPolicy.enabled = config.getBooleanField("armorLoadout",
+		armorPolicy.enabled);
 	LuaObject loadout = config.getObjectField("loadout");
 	if (loadout.isValidTable()) {
 		progressionLoadoutMinUpgradePercent = clampFloatRange(
@@ -9449,7 +10763,67 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 			loadout.getIntField("maxUpgradeLoadsPerVisit",
 				progressionLoadoutMaxUpgradeLoadsPerVisit), 1, 1000);
 	}
+	armorPolicy.fullSweepMinutes = progressionLoadoutFullSweepMinutes;
+	LuaObject armor = loadout.getObjectField("armor");
+	if (armor.isValidTable()) {
+		armorPolicy.minUpgradePercent = clampIntRange(
+			armor.getIntField("minUpgradePercent",
+				armorPolicy.minUpgradePercent), 0, 1000);
+		armorPolicy.fullSweepMinutes = clampIntRange(
+			armor.getIntField("fullSweepMinutes",
+				progressionLoadoutFullSweepMinutes), 1, 1440);
+		armorPolicy.scoring.assumedArmorPiercing = clampIntRange(
+			armor.getIntField("assumedArmorPiercing",
+				armorPolicy.scoring.assumedArmorPiercing), 0, 1000);
+		const char* weightNames[] = {"kinetic", "energy", "blast", "stun",
+			"heat", "cold", "acid", "electricity", "lightsaber"};
+		for (int i = 0; i < SimBotArmorLoadout::DAMAGE_TYPE_COUNT; ++i)
+			armorPolicy.scoring.damageTypeWeights[i] = clampFloatRange(
+				armor.getFloatField(weightNames[i],
+					armorPolicy.scoring.damageTypeWeights[i]), 0.f, 1.f);
+		LuaObject weights = armor.getObjectField("damageTypeWeights");
+		if (weights.isValidTable()) {
+			for (int i = 0; i < SimBotArmorLoadout::DAMAGE_TYPE_COUNT; ++i)
+				armorPolicy.scoring.damageTypeWeights[i] = clampFloatRange(
+					weights.getFloatField(weightNames[i],
+						armorPolicy.scoring.damageTypeWeights[i]), 0.f, 1.f);
+		}
+		weights.pop();
+		armorPolicy.bazaarUpgrades = armor.getBooleanField("bazaarUpgrades",
+			armorPolicy.bazaarUpgrades);
+		armorPolicy.upgradeSpendFraction = clampFloatRange(
+			armor.getFloatField("upgradeSpendFraction",
+				armorPolicy.upgradeSpendFraction), 0.f, 1.f);
+		armorPolicy.maxUpgradeLoadsPerVisit = clampIntRange(
+			armor.getIntField("maxUpgradeLoadsPerVisit",
+				armorPolicy.maxUpgradeLoadsPerVisit), 1, 1000);
+		armorPolicy.bodyHamBaseline = clampIntRange(
+			armor.getIntField("bodyHamBaseline",
+				armorPolicy.bodyHamBaseline), 0, 100000);
+		LuaObject bodyRaces = armor.getObjectField("bodyRaces");
+		if (bodyRaces.isValidTable()) {
+			armorPolicy.bodyRaces.removeAll();
+			for (int i = 1; i <= bodyRaces.getTableSize(); ++i) {
+				LuaObject entry = bodyRaces.getObjectAt(i);
+				if (entry.isValidTable()) {
+					String body = entry.getStringField("body").trim();
+					String race = entry.getStringField("race").trim();
+					if (!body.isEmpty() && !race.isEmpty())
+						armorPolicy.bodyRaces.put(body, race.hashCode());
+				}
+				entry.pop();
+			}
+		}
+		bodyRaces.pop();
+	}
+	armor.pop();
 	loadout.pop();
+	{
+		Locker progressionLock(&progressionMutex);
+		if (!simBotArmorPolicyEquals(progressionArmorPolicy, armorPolicy))
+			progressionArmorLastFullSweepMs = 0;
+		progressionArmorPolicy = armorPolicy;
+	}
 	LuaObject buffPayment = config.getObjectField("buffPayment");
 	if (buffPayment.isValidTable()) {
 		progressionBuffPaymentEnabled = buffPayment.getBooleanField(
@@ -9843,6 +11217,24 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.hasExpectedMaxDamage = step.expectedMaxDamage != absentExpected;
 	if (!step.hasExpectedMaxDamage)
 		step.expectedMaxDamage = -1;
+	step.armorRating = table.getIntField("rating", absentExpected);
+	step.hasArmorRating = step.armorRating != absentExpected;
+	if (!step.hasArmorRating)
+		step.armorRating = 0;
+	step.armorResist = table.getIntField("resist", absentExpected);
+	step.hasArmorResist = step.armorResist != absentExpected;
+	if (!step.hasArmorResist)
+		step.armorResist = 0;
+	step.armorHealthEncumbrance = table.getIntField("healthEncumbrance", 0);
+	step.armorActionEncumbrance = table.getIntField("actionEncumbrance", 0);
+	step.armorMindEncumbrance = table.getIntField("mindEncumbrance", 0);
+	step.armorCondition = table.getIntField("condition", absentExpected);
+	step.hasArmorCondition = step.armorCondition != absentExpected;
+	if (!step.hasArmorCondition)
+		step.armorCondition = 0;
+	step.armorFaction = table.getStringField("faction").trim().toLowerCase();
+	step.armorRace = table.getStringField("race").trim();
+	step.buffPool = table.getStringField("pool").trim().toLowerCase();
 	step.attackSpeed = table.getFloatField("attackSpeed", -1.f);
 	step.hasAttackSpeed = step.attackSpeed >= 0.f;
 	if (!step.hasAttackSpeed)
@@ -10029,6 +11421,7 @@ void SimPlayerManager::initializePlayerBotParityTestResults() {
 	playerBotParityTestCleanupPreserveProbe = false;
 	playerBotParityTestPendingRequestId = 0;
 	playerBotParityTestIdentityRefs.removeAll();
+	playerBotParityAppearanceSnapshots.removeAll();
 	playerBotParityTestKillTargetOid = 0;
 	playerBotParityTestKillTargetIdentityId = 0;
 	playerBotParityTestKillTargetBaseXp = 0;
@@ -12447,7 +13840,7 @@ bool SimPlayerManager::depositPlayerBotItem(uint64 identityId,
 			held, boundedSource, row.objectId, row.displayName);
 	}
 	progressionItemHeldCounts.put(identityId, held);
-	progressionLoadoutDirtyIds.put(identityId, true);
+	markPlayerBotLoadoutDirtyLocked(identityId);
 	return true;
 }
 
@@ -12488,9 +13881,12 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 	const bool buyGate = playerBotBazaarBuyGateEnabled(identityId);
 	if (!sellGate && !buyGate)
 		return false;
-	const bool upgradeGate = buyGate &&
+	const bool weaponUpgradeGate = buyGate &&
 		playerBotBazaarUpgradesGateEnabled(identityId) &&
 		playerBotLoadoutGateEnabled(identityId);
+	const bool armorUpgradeGate =
+		playerBotArmorBazaarUpgradesGateEnabled(identityId);
+	const bool upgradeGate = weaponUpgradeGate || armorUpgradeGate;
 	const int unmetBuyNeeds = buyGate ?
 		playerBotUnmetBuyNeeds(identityId) : 0;
 
@@ -12507,8 +13903,10 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 	const bool hasBuyListOverride =
 		playerBotParityBazaarBuyListOverride(identityId, buyListOverride);
 	VectorMap<uint64, bool> loadoutProtectedIds;
-	if (sellGate)
+	if (sellGate) {
 		collectPlayerBotProtectedWeaponOids(identityId, loadoutProtectedIds);
+		collectPlayerBotProtectedArmorOids(identityId, loadoutProtectedIds);
+	}
 	{
 		Locker progressionLock(&progressionMutex);
 		if (progressionBazaarVisitCooldownUntilMs.contains(identityId) &&
@@ -12533,7 +13931,8 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 					progressionBazaarBuyReserveCredits >= progressionBazaarMinPrice)
 				return true;
 		}
-		if (upgradeGate && progressionLoadoutChoices.contains(identityId)) {
+		if (upgradeGate && ((weaponUpgradeGate &&
+				progressionLoadoutChoices.contains(identityId)) || armorUpgradeGate)) {
 			bool pendingUpgrade = false;
 			int pendingPurchases = 0;
 			for (int i = 0; i < progressionBazaarPurchases.size(); ++i) {
@@ -12544,7 +13943,9 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 						 purchase.state == PLAYER_BOT_PURCHASE_RESOLVE_PENDING)) {
 					++pendingPurchases;
 					if (SimBotLoadout::weaponClassCandidates(
-							purchase.gameObjectType).size() > 0)
+							purchase.gameObjectType).size() > 0 ||
+							(purchase.gameObjectType >= 0x101 &&
+								purchase.gameObjectType <= 0x107))
 						pendingUpgrade = true;
 				}
 			}
@@ -12552,25 +13953,42 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 			const int64 spendable = progression.bankCredits -
 				reservedPlayerBotCreditsLocked(identityId, true) -
 				progressionBazaarBuyReserveCredits;
-			const int64 fractionCeiling = static_cast<int64>(std::floor(
+			const int64 weaponFractionCeiling = static_cast<int64>(std::floor(
 				std::max<int64>(0, spendable) *
 				std::max(0.f, std::min(1.f,
 					progressionLoadoutUpgradeSpendFraction))));
-			const int64 upgradeCeiling = std::min<int64>(
-				std::max(0, progressionBazaarMaxPrice), fractionCeiling);
+			const int64 weaponUpgradeCeiling = std::min<int64>(
+				std::max(0, progressionBazaarMaxPrice), weaponFractionCeiling);
+			const SimBotArmorPolicy armorPolicy = progressionArmorPolicy;
+			const int64 armorFractionCeiling = static_cast<int64>(std::floor(
+				std::max<int64>(0, spendable) *
+				std::max(0.f, std::min(1.f,
+					armorPolicy.upgradeSpendFraction))));
+			const int64 armorUpgradeCeiling = std::min<int64>(
+				std::max(0, progressionBazaarMaxPrice), armorFractionCeiling);
 			const uint64 scanIntervalMs = static_cast<uint64>(
 				progressionLoadoutUpgradeScanIntervalMinutes) * 60000;
-			const bool scanDue = !progressionBazaarUpgradeScanAtMs.contains(identityId) ||
+			const bool weaponScanDue = weaponUpgradeGate &&
+				progressionLoadoutChoices.contains(identityId) &&
+				(!progressionBazaarUpgradeScanAtMs.contains(identityId) ||
 				nowMs >= progressionBazaarUpgradeScanAtMs.get(identityId) +
-				scanIntervalMs;
-			if (!pendingUpgrade && pendingPurchases < progressionBazaarBuyMaxPendingPerBot &&
-					upgradeCeiling >= progressionBazaarMinPrice &&
-					scanDue) {
+					scanIntervalMs);
+			const bool armorScanDue = armorUpgradeGate &&
+				(!progressionArmorUpgradeScanAtMs.contains(identityId) ||
+				nowMs >= progressionArmorUpgradeScanAtMs.get(identityId) +
+					scanIntervalMs);
+			if (!pendingUpgrade && pendingPurchases < progressionBazaarBuyMaxPendingPerBot) {
 				// The scan timestamp is the admission record, not a purchase record:
 				// an empty market and a rejected candidate both wait for the next
 				// configured scan interval.
-				progressionBazaarUpgradeScanAtMs.put(identityId, nowMs);
-				return true;
+				if (weaponScanDue && weaponUpgradeCeiling >= progressionBazaarMinPrice) {
+					progressionBazaarUpgradeScanAtMs.put(identityId, nowMs);
+					return true;
+				}
+				if (armorScanDue && armorUpgradeCeiling >= progressionBazaarMinPrice) {
+					progressionArmorUpgradeScanAtMs.put(identityId, nowMs);
+					return true;
+				}
 			}
 		}
 		if (!sellGate)
@@ -12882,17 +14300,18 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 		String key;
 	};
 
+	Vector<ManagedReference<SceneObject*> > children;
+	VectorMap<uint64, bool> loadoutProtectedIds;
+	collectPlayerBotProtectedWeaponOids(identityId, loadoutProtectedIds);
+	collectPlayerBotProtectedArmorOids(identityId, loadoutProtectedIds);
 	ManagedReference<SceneObject*> bag = economyManager->getItemBag(identityId);
 	if (bag == nullptr)
 		return false;
-	Vector<ManagedReference<SceneObject*> > children;
 	{
 		Locker bagLock(bag);
 		for (int i = 0; i < bag->getContainerObjectsSize(); ++i)
 			children.add(bag->getContainerObject(i));
 	}
-	VectorMap<uint64, bool> loadoutProtectedIds;
-	collectPlayerBotProtectedWeaponOids(identityId, loadoutProtectedIds);
 
 	std::vector<Candidate> candidates;
 	VectorMap<uint64, int> heldAsks;
@@ -13162,6 +14581,7 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 	const bool hasBuyListOverride =
 		playerBotParityBazaarBuyListOverride(identityId, buyListOverride);
 	SimBotTrainingPlan plan;
+	const SimBotArmorPolicy armorPolicy = snapshotPlayerBotArmorPolicy();
 	// A bot that has never looted has no bag yet; buying is an acquisition
 	// like loot, so it creates the bag the same way.
 	ManagedReference<SceneObject*> bag = economyManager->getOrCreateItemBag(
@@ -13170,6 +14590,8 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		return false;
 	const bool upgradeGate = playerBotBazaarUpgradesGateEnabled(identityId) &&
 		playerBotLoadoutGateEnabled(identityId);
+	const bool armorUpgradeGate =
+		playerBotArmorBazaarUpgradesGateEnabled(identityId);
 	{
 		Locker progressionLock(&progressionMutex);
 		if (!progressionRecords.contains(identityId) ||
@@ -13188,11 +14610,15 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		int junkValue = 0;
 		int ceiling = 0;
 		bool upgrade = false;
+		bool armorUpgrade = false;
 		SimBotLoadout::WeaponStats weaponStats;
+		SimBotArmorLoadout::ArmorStats armorStats;
+		float armorImprovement = 0.f;
 	};
 	struct BuyNeed {
 		SimBotTrainingPlan::BuyListEntry entry;
 		bool upgrade = false;
+		bool armorUpgrade = false;
 		int remaining = 0;
 		std::vector<ManagedReference<AuctionItem*> > raw;
 		std::vector<BuyCandidate> candidates;
@@ -13201,6 +14627,45 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 	};
 	std::vector<BuyNeed> needs;
 	SimBotLoadout::LoadoutChoice upgradeChoice;
+	Vector<SimBotArmorLoadout::ArmorStats> armorCandidateVector;
+	Vector<String> armorTrainedSkills;
+	uint32 armorBodyRaceCrc = 0;
+	std::vector<SimBotArmorLoadout::ArmorStats> armorCandidates;
+	std::vector<std::pair<String, float> > armorCurrentScores;
+	int64 armorBankCredits = 0;
+	int64 armorReservedCredits = 0;
+	const bool haveArmorSnapshot = armorUpgradeGate &&
+		snapshotPlayerBotArmorCandidates(identityId, armorCandidateVector,
+			armorTrainedSkills);
+	if (haveArmorSnapshot) {
+		{
+			Locker progressionLock(&progressionMutex);
+			if (progressionArmorBodyRaceCrc.contains(identityId))
+				armorBodyRaceCrc = progressionArmorBodyRaceCrc.get(identityId);
+		}
+		for (int i = 0; i < armorCandidateVector.size(); ++i)
+			armorCandidates.push_back(armorCandidateVector.get(i));
+		for (size_t i = 0; i < armorCandidates.size(); ++i) {
+			const SimBotArmorLoadout::ArmorStats& stats = armorCandidates[i];
+			if (!SimBotArmorLoadout::isUsable(stats, armorBodyRaceCrc, 0,
+					armorTrainedSkills))
+				continue;
+			float score = SimBotArmorLoadout::scoreArmor(stats,
+				armorPolicy.scoring);
+			int slotIndex = -1;
+			for (size_t j = 0; j < armorCurrentScores.size(); ++j) {
+				if (armorCurrentScores[j].first == stats.slotKey) {
+					slotIndex = static_cast<int>(j);
+					break;
+				}
+			}
+			if (slotIndex < 0)
+				armorCurrentScores.push_back(std::make_pair(stats.slotKey, score));
+			else
+				armorCurrentScores[slotIndex].second = std::max(
+					armorCurrentScores[slotIndex].second, score);
+		}
+	}
 	Vector<String> upgradeCertsHeld;
 	Vector<String> upgradeCertsPlanned;
 	Vector<String> certOverride;
@@ -13208,6 +14673,32 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		snapshotPlayerBotCertificationOverride(identityId, certOverride);
 	VectorMap<uint64, uint64> bagMap = economyManager->getItemBagMapSnapshot();
 	const uint64 bagOid = bag->getObjectID();
+	// A harness buyer only ever buys what the harness listed: its human
+	// listings (createHumanListing) or a harness identity's bag. Live
+	// verification found a harness bot buying a real player's listing, which
+	// the cleanup pass then destroyed with the harness vault.
+	bool harnessBuyer = false;
+	VectorMap<uint64, bool> harnessSellerBags;
+	VectorMap<uint64, bool> harnessHumanItems;
+	{
+		Locker pveLock(&pveMutex);
+		harnessBuyer = pveIdentities.contains(identityId) &&
+			pveIdentities.get(identityId).profession == "harness";
+		if (harnessBuyer) {
+			for (int i = 0; i < bagMap.size(); ++i) {
+				const uint64 bagIdentity = bagMap.elementAt(i).getKey();
+				if (pveIdentities.contains(bagIdentity) &&
+						pveIdentities.get(bagIdentity).profession == "harness")
+					harnessSellerBags.put(bagMap.elementAt(i).getValue(), true);
+			}
+		}
+	}
+	if (harnessBuyer) {
+		Locker parityLock(&playerBotParityTestMutex);
+		for (int i = 0; i < playerBotParityBazaarHumanListingItemOids.size(); ++i)
+			harnessHumanItems.put(playerBotParityBazaarHumanListingItemOids.get(i),
+				true);
+	}
 	// Listings this bot already tried (any state) are never ranked again: a
 	// refunded one would otherwise block every later, valid listing.
 	VectorMap<uint64, bool> triedAuctions;
@@ -13255,8 +14746,10 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 				if (purchase.identityId == identityId &&
 						(purchase.state == PLAYER_BOT_PURCHASE_DEBITED ||
 						 purchase.state == PLAYER_BOT_PURCHASE_RESOLVE_PENDING) &&
-						SimBotLoadout::weaponClassCandidates(
-							purchase.gameObjectType).size() > 0) {
+						(SimBotLoadout::weaponClassCandidates(
+							purchase.gameObjectType).size() > 0 ||
+						(purchase.gameObjectType >= 0x101 &&
+							purchase.gameObjectType <= 0x107))) {
 					pendingUpgrade = true;
 					break;
 				}
@@ -13284,6 +14777,34 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 					System::getMiliTime());
 			}
 		}
+		if (armorUpgradeGate && haveArmorSnapshot && armorBodyRaceCrc != 0) {
+			armorBankCredits = progressionRecords.get(identityId).bankCredits;
+			armorReservedCredits = reservedPlayerBotCreditsLocked(identityId, true);
+			bool pendingUpgrade = false;
+			for (int i = 0; i < progressionBazaarPurchases.size(); ++i) {
+				const PlayerBotBazaarPurchase& purchase =
+					progressionBazaarPurchases.elementAt(i).getValue();
+				if (purchase.identityId == identityId &&
+						(purchase.state == PLAYER_BOT_PURCHASE_DEBITED ||
+						 purchase.state == PLAYER_BOT_PURCHASE_RESOLVE_PENDING) &&
+						(SimBotLoadout::weaponClassCandidates(
+							purchase.gameObjectType).size() > 0 ||
+						(purchase.gameObjectType >= 0x101 &&
+							purchase.gameObjectType <= 0x107))) {
+					pendingUpgrade = true;
+					break;
+				}
+			}
+			if (!pendingUpgrade) {
+				BuyNeed need;
+				need.upgrade = true;
+				need.armorUpgrade = true;
+				need.remaining = 1;
+				needs.push_back(need);
+				progressionArmorUpgradeScanAtMs.put(identityId,
+					System::getMiliTime());
+			}
+		}
 	}
 	if (needs.empty()) {
 		bazaarBuySkippedNoNeed.increment();
@@ -13307,16 +14828,25 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 					item->getOwnerID() == bagOid ||
 					triedAuctions.contains(item->getObjectID()))
 				continue;
+			if (harnessBuyer && !harnessSellerBags.contains(item->getOwnerID()) &&
+					!harnessHumanItems.contains(item->getAuctionedItemObjectID()))
+				continue;
 			for (size_t needIndex = 0; needIndex < needs.size(); ++needIndex) {
 				BuyNeed& need = needs[needIndex];
 				if (item->getPrice() > progressionBazaarMaxPrice)
 					continue;
 				if (need.upgrade) {
-					Vector<String> classes = SimBotLoadout::weaponClassCandidates(
-						item->getItemType());
-					if (classes.size() == 0 || (!upgradeChoice.templateComplete &&
-							!classes.contains(upgradeChoice.desiredXpType)))
-						continue;
+					if (need.armorUpgrade) {
+						if (item->getItemType() < 0x101 ||
+								item->getItemType() > 0x107)
+							continue;
+					} else {
+						Vector<String> classes = SimBotLoadout::weaponClassCandidates(
+							item->getItemType());
+						if (classes.size() == 0 || (!upgradeChoice.templateComplete &&
+								!classes.contains(upgradeChoice.desiredXpType)))
+							continue;
+					}
 					need.raw.push_back(item);
 				} else if (item->getItemType() ==
 						static_cast<unsigned int>(need.entry.gameObjectType)) {
@@ -13352,6 +14882,7 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 			// skipped for free, so a later visit always reaches new listings.
 			const int maxLoadsForNeed = need.upgrade ? std::min(
 				progressionBazaarBuyCandidateScanLimit,
+				need.armorUpgrade ? armorPolicy.maxUpgradeLoadsPerVisit :
 				progressionLoadoutMaxUpgradeLoadsPerVisit) :
 				progressionBazaarBuyCandidateScanLimit;
 			if (need.loads >= maxLoadsForNeed ||
@@ -13403,6 +14934,16 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 							weaponStats.certificationsRequired;
 					}
 				}
+				if (listedObject->isArmorObject() &&
+						!listedObject->isPsgArmorObject()) {
+					ArmorObject* armor = cast<ArmorObject*>(listedObject.get());
+					if (armor != nullptr) {
+						SimBotArmorLoadout::ArmorStats armorStats;
+						fillPlayerBotArmorStats(armor, armorStats);
+						cached.isArmor = true;
+						cached.armorStats = armorStats;
+					}
+				}
 				cached.lastUsedAtMs = System::getMiliTime();
 				Locker cacheLock(&bazaarListingTemplateCacheMutex);
 				bazaarListingTemplateCache.put(item->getObjectID(), cached);
@@ -13418,39 +14959,98 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 				}
 			}
 			if (need.upgrade) {
-				if (!cached.isWeapon)
-					continue;
-				SimBotLoadout::WeaponStats listingStats;
-				listingStats.objectId = item->getAuctionedItemObjectID();
-				listingStats.gameObjectType = cached.gameObjectType;
-				listingStats.xpType = cached.xpType;
-				listingStats.minDamage = cached.score;
-				listingStats.maxDamage = cached.score;
-				listingStats.attackSpeed = 1.f;
-				listingStats.certificationsRequired =
-					cached.certificationsRequired;
-				if (!SimBotLoadout::classMatches(listingStats,
-						upgradeChoice.desiredXpType,
-						upgradeChoice.templateComplete))
-					continue;
-				if (!SimBotLoadout::isCertified(
-						listingStats.certificationsRequired, upgradeCertsHeld)) {
-					bazaarBuyUpgradesSkippedUncertified.increment();
-					continue;
+				if (need.armorUpgrade) {
+					if (!cached.isArmor || cached.armorStats.slotKey.isEmpty())
+						continue;
+					SimBotArmorLoadout::ArmorStats listingStats = cached.armorStats;
+					listingStats.objectId = item->getAuctionedItemObjectID();
+					listingStats.score = SimBotArmorLoadout::scoreArmor(
+						listingStats, armorPolicy.scoring);
+					SimBotArmorLoadout::UsableReason usability =
+						SimBotArmorLoadout::usability(listingStats, armorBodyRaceCrc,
+							0, armorTrainedSkills);
+					float currentScore = 0.f;
+					for (size_t scoreIndex = 0;
+							scoreIndex < armorCurrentScores.size(); ++scoreIndex)
+						if (armorCurrentScores[scoreIndex].first ==
+								listingStats.slotKey)
+							currentScore = armorCurrentScores[scoreIndex].second;
+					int bodyHamBaseline = armorPolicy.bodyHamBaseline > 0 ?
+						armorPolicy.bodyHamBaseline : pveNoviceBodyHam;
+					SimBotArmorLoadout::ArmorUpgradeReason reason =
+						SimBotArmorLoadout::upgradeDecision(listingStats,
+							item->getPrice(), currentScore, armorBankCredits,
+							armorReservedCredits,
+							progressionBazaarBuyReserveCredits,
+							armorPolicy.upgradeSpendFraction,
+							progressionBazaarMaxPrice,
+							static_cast<float>(armorPolicy.minUpgradePercent),
+							usability, bodyHamBaseline, armorPolicy.scoring);
+					if (reason != SimBotArmorLoadout::BUY) {
+						switch (reason) {
+						case SimBotArmorLoadout::NOT_BETTER:
+							bazaarBuyArmorUpgradesSkippedNotBetter.increment();
+							break;
+						case SimBotArmorLoadout::UNUSABLE:
+							bazaarBuyArmorUpgradesSkippedUnusable.increment();
+							break;
+						case SimBotArmorLoadout::TOO_ENCUMBERING:
+							bazaarBuyArmorUpgradesSkippedTooEncumbering.increment();
+							break;
+						case SimBotArmorLoadout::OVER_BUDGET:
+							bazaarBuyArmorUpgradesSkippedOverBudget.increment();
+							break;
+						case SimBotArmorLoadout::UNAFFORDABLE:
+							bazaarBuyArmorUpgradesSkippedUnaffordable.increment();
+							break;
+						default:
+							break;
+						}
+						continue;
+					}
+					BuyCandidate candidate;
+					candidate.item = item;
+					candidate.templateCrc = cached.templateCrc;
+					candidate.upgrade = true;
+					candidate.armorUpgrade = true;
+					candidate.armorStats = listingStats;
+					candidate.armorImprovement = listingStats.score - currentScore;
+					need.candidates.push_back(candidate);
+				} else {
+					if (!cached.isWeapon)
+						continue;
+					SimBotLoadout::WeaponStats listingStats;
+					listingStats.objectId = item->getAuctionedItemObjectID();
+					listingStats.gameObjectType = cached.gameObjectType;
+					listingStats.xpType = cached.xpType;
+					listingStats.minDamage = cached.score;
+					listingStats.maxDamage = cached.score;
+					listingStats.attackSpeed = 1.f;
+					listingStats.certificationsRequired =
+						cached.certificationsRequired;
+					if (!SimBotLoadout::classMatches(listingStats,
+							upgradeChoice.desiredXpType,
+							upgradeChoice.templateComplete))
+						continue;
+					if (!SimBotLoadout::isCertified(
+							listingStats.certificationsRequired, upgradeCertsHeld)) {
+						bazaarBuyUpgradesSkippedUncertified.increment();
+						continue;
+					}
+					const float requiredScore = std::max(0.f,
+						upgradeChoice.score) * (1.f + std::max(0.f,
+						progressionLoadoutMinUpgradePercent) / 100.f);
+					if (cached.score < requiredScore) {
+						bazaarBuyUpgradesSkippedNotBetter.increment();
+						continue;
+					}
+					BuyCandidate candidate;
+					candidate.item = item;
+					candidate.templateCrc = cached.templateCrc;
+					candidate.upgrade = true;
+					candidate.weaponStats = listingStats;
+					need.candidates.push_back(candidate);
 				}
-				const float requiredScore = std::max(0.f,
-					upgradeChoice.score) * (1.f + std::max(0.f,
-					progressionLoadoutMinUpgradePercent) / 100.f);
-				if (cached.score < requiredScore) {
-					bazaarBuyUpgradesSkippedNotBetter.increment();
-					continue;
-				}
-				BuyCandidate candidate;
-				candidate.item = item;
-				candidate.templateCrc = cached.templateCrc;
-				candidate.upgrade = true;
-				candidate.weaponStats = listingStats;
-				need.candidates.push_back(candidate);
 				continue;
 			}
 			if (cached.templateCrc != need.entry.templateCrc) {
@@ -13497,6 +15097,13 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 			std::sort(needs[needIndex].candidates.begin(),
 				needs[needIndex].candidates.end(),
 				[](const BuyCandidate& left, const BuyCandidate& right) {
+				if (left.armorUpgrade || right.armorUpgrade) {
+					if (left.armorImprovement != right.armorImprovement)
+						return left.armorImprovement > right.armorImprovement;
+					if (left.item->getPrice() != right.item->getPrice())
+						return left.item->getPrice() < right.item->getPrice();
+					return left.item->getObjectID() < right.item->getObjectID();
+				}
 					const float leftScore = SimBotLoadout::scoreWeapon(
 						left.weaponStats);
 					const float rightScore = SimBotLoadout::scoreWeapon(
@@ -13555,15 +15162,32 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 					if (candidate.item == nullptr || chosenAuctions.contains(
 							candidate.item->getObjectID()))
 						continue;
-					if (bestNeed < 0 ||
-							SimBotLoadout::scoreWeapon(candidate.weaponStats) >
-								SimBotLoadout::scoreWeapon(needs[bestNeed].candidates[
-									bestCandidate].weaponStats) ||
-							(SimBotLoadout::scoreWeapon(candidate.weaponStats) ==
-								SimBotLoadout::scoreWeapon(needs[bestNeed].candidates[
-									bestCandidate].weaponStats) &&
-								candidate.item->getPrice() <
-								needs[bestNeed].candidates[bestCandidate].item->getPrice())) {
+					bool better = bestNeed < 0;
+					if (bestNeed >= 0) {
+						const BuyCandidate& current = needs[bestNeed].candidates[
+							bestCandidate];
+						if (candidate.armorUpgrade != current.armorUpgrade) {
+							// The need cursor gives buy-list items first, then the
+							// weapon upgrade, then the armor upgrade.  If both
+							// upgrade needs have candidates, preserve that order.
+							better = !candidate.armorUpgrade;
+						} else if (candidate.armorUpgrade && current.armorUpgrade) {
+							better = candidate.armorImprovement >
+								current.armorImprovement ||
+								(candidate.armorImprovement == current.armorImprovement &&
+								 (candidate.item->getPrice() < current.item->getPrice() ||
+								  (candidate.item->getPrice() == current.item->getPrice() &&
+								   candidate.item->getObjectID() <
+									current.item->getObjectID())));
+						} else if (!candidate.armorUpgrade && !current.armorUpgrade) {
+							better = SimBotLoadout::scoreWeapon(candidate.weaponStats) >
+								SimBotLoadout::scoreWeapon(current.weaponStats) ||
+								(SimBotLoadout::scoreWeapon(candidate.weaponStats) ==
+									SimBotLoadout::scoreWeapon(current.weaponStats) &&
+									candidate.item->getPrice() < current.item->getPrice());
+						}
+					}
+					if (better) {
 						bestNeed = static_cast<int>(needIndex);
 						bestCandidate = static_cast<int>(candidateIndex);
 					}
@@ -13605,7 +15229,80 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		bool canBuy = true;
 		SimBotBazaar::PurchaseReason liveReason = SimBotBazaar::BUY;
 		if (upgrade) {
-			if (pendingCount >= progressionBazaarBuyMaxPendingPerBot ||
+			if (candidate.armorUpgrade) {
+				bool pendingUpgrade = false;
+				for (int i = 0; i < progressionBazaarPurchases.size(); ++i) {
+					const PlayerBotBazaarPurchase& purchase =
+						progressionBazaarPurchases.elementAt(i).getValue();
+					if (purchase.identityId == identityId &&
+							(purchase.state == PLAYER_BOT_PURCHASE_DEBITED ||
+							 purchase.state == PLAYER_BOT_PURCHASE_RESOLVE_PENDING) &&
+							(SimBotLoadout::weaponClassCandidates(
+								purchase.gameObjectType).size() > 0 ||
+							(purchase.gameObjectType >= 0x101 &&
+								purchase.gameObjectType <= 0x107))) {
+						pendingUpgrade = true;
+						break;
+					}
+				}
+				if (pendingCount >= progressionBazaarBuyMaxPendingPerBot ||
+						progressionBazaarPurchases.contains(purchaseKey) ||
+						auctionItem->getOwnerID() == bagOid) {
+					canBuy = false;
+					if (auctionItem->getOwnerID() == bagOid)
+						bazaarBuySkippedOwnListing.increment();
+					else
+						bazaarBuySkippedNoNeed.increment();
+				} else if (pendingUpgrade || !haveArmorSnapshot ||
+						armorBodyRaceCrc == 0) {
+					canBuy = false;
+					bazaarBuySkippedNoNeed.increment();
+				} else {
+					float currentScore = 0.f;
+					for (size_t scoreIndex = 0;
+							scoreIndex < armorCurrentScores.size(); ++scoreIndex)
+						if (armorCurrentScores[scoreIndex].first ==
+								candidate.armorStats.slotKey)
+							currentScore = armorCurrentScores[scoreIndex].second;
+					SimBotArmorLoadout::UsableReason usability =
+						SimBotArmorLoadout::usability(candidate.armorStats,
+							armorBodyRaceCrc, 0, armorTrainedSkills);
+					int bodyHamBaseline = armorPolicy.bodyHamBaseline > 0 ?
+						armorPolicy.bodyHamBaseline : pveNoviceBodyHam;
+					SimBotArmorLoadout::ArmorUpgradeReason reason =
+						SimBotArmorLoadout::upgradeDecision(candidate.armorStats,
+							auctionItem->getPrice(), currentScore,
+							progressionRecords.get(identityId).bankCredits,
+							reservedPlayerBotCreditsLocked(identityId, true),
+							progressionBazaarBuyReserveCredits,
+							armorPolicy.upgradeSpendFraction,
+							progressionBazaarMaxPrice,
+							static_cast<float>(armorPolicy.minUpgradePercent),
+							usability, bodyHamBaseline, armorPolicy.scoring);
+					if (reason != SimBotArmorLoadout::BUY) {
+						canBuy = false;
+						switch (reason) {
+						case SimBotArmorLoadout::NOT_BETTER:
+							bazaarBuyArmorUpgradesSkippedNotBetter.increment();
+							break;
+						case SimBotArmorLoadout::UNUSABLE:
+							bazaarBuyArmorUpgradesSkippedUnusable.increment();
+							break;
+						case SimBotArmorLoadout::TOO_ENCUMBERING:
+							bazaarBuyArmorUpgradesSkippedTooEncumbering.increment();
+							break;
+						case SimBotArmorLoadout::OVER_BUDGET:
+							bazaarBuyArmorUpgradesSkippedOverBudget.increment();
+							break;
+						case SimBotArmorLoadout::UNAFFORDABLE:
+							bazaarBuyArmorUpgradesSkippedUnaffordable.increment();
+							break;
+						default:
+							break;
+						}
+					}
+				}
+			} else if (pendingCount >= progressionBazaarBuyMaxPendingPerBot ||
 					progressionBazaarPurchases.contains(purchaseKey) ||
 					auctionItem->getOwnerID() == bagOid) {
 				canBuy = false;
@@ -13631,8 +15328,10 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 					if (purchase.identityId == identityId &&
 							(purchase.state == PLAYER_BOT_PURCHASE_DEBITED ||
 							 purchase.state == PLAYER_BOT_PURCHASE_RESOLVE_PENDING) &&
-							SimBotLoadout::weaponClassCandidates(
-								purchase.gameObjectType).size() > 0) {
+							(SimBotLoadout::weaponClassCandidates(
+								purchase.gameObjectType).size() > 0 ||
+							(purchase.gameObjectType >= 0x101 &&
+								purchase.gameObjectType <= 0x107))) {
 						pendingUpgrade = true;
 						break;
 					}
@@ -13713,7 +15412,8 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		purchase.identityId = identityId;
 		purchase.objectId = auctionItem->getAuctionedItemObjectID();
 		purchase.templateCrc = templateCrc;
-		purchase.gameObjectType = upgrade ? candidate.weaponStats.gameObjectType :
+		purchase.gameObjectType = upgrade ? (candidate.armorUpgrade ?
+			candidate.armorStats.gameObjectType : candidate.weaponStats.gameObjectType) :
 			needs[bestNeed].entry.gameObjectType;
 		purchase.price = auctionItem->getPrice();
 		purchase.vendorOid = auctionItem->getVendorID();
@@ -13734,6 +15434,8 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		bazaarBuyDebited.increment();
 		if (upgrade)
 			bazaarBuyUpgradesDebited.increment();
+		if (candidate.armorUpgrade)
+			bazaarBuyArmorUpgradesDebited.increment();
 		debitedAny = true;
 		progressionLock.release();
 		MissionDiagLog::event("BAZAAR_BUY", identityId,
@@ -13852,7 +15554,7 @@ void SimPlayerManager::commitPlayerBotBazaarPurchaseLocked(
 		purchase.itemReceiptSum += 1;
 	}
 	markProgressionDirtyLocked(purchase.identityId);
-	progressionLoadoutDirtyIds.put(purchase.identityId, true);
+	markPlayerBotLoadoutDirtyLocked(purchase.identityId);
 	purchase.templateCrc = objectTemplateCrc;
 	purchase.gameObjectType = gameObjectType;
 	purchase.state = PLAYER_BOT_PURCHASE_COMMITTED;
@@ -15311,8 +17013,12 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 			armingOp = "setBazaarBuyGate";
 		else if (gate == "loadout")
 			armingOp = "setLoadoutGate";
+		else if (gate == "armorLoadout")
+			armingOp = "setArmorGate";
 		else if (gate == "bazaarUpgrades")
 			armingOp = "setBazaarUpgradesGate";
+		else if (gate == "armorBazaarUpgrades")
+			armingOp = "setArmorUpgradeGate";
 		else if (gate == "novice")
 			armingOp = "setNoviceGate";
 		else if (gate == "progressionEnabled")
@@ -15357,8 +17063,12 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 				!progressionPurchaseReconcilePending.load();
 		else if (gate == "loadout")
 			live = playerBotLoadoutGateEnabled(0);
+		else if (gate == "armorLoadout")
+			live = playerBotArmorLoadoutGateEnabled(0);
 		else if (gate == "bazaarUpgrades")
 			live = playerBotBazaarUpgradesGateEnabled(0);
+		else if (gate == "armorBazaarUpgrades")
+			live = playerBotArmorBazaarUpgradesGateEnabled(0);
 		else if (gate == "novice") {
 			Locker pveLock(&pveMutex);
 			live = pveNoviceEnabled;
@@ -15901,7 +17611,7 @@ bool SimPlayerManager::trainPlayerBotSkill(uint64 identityId,
 		progression.skillPointsSpent = derivedPlayerBotSkillPoints(progression);
 		markProgressionDirtyLocked(identityId);
 		progressionCertificationCache.drop(identityId);
-		progressionLoadoutDirtyIds.put(identityId, true);
+		markPlayerBotLoadoutDirtyLocked(identityId);
 		trainingLastSkill = normalizedSkill;
 		if (!identity.trainingPlan.isEmpty())
 			// Mint-time grants do not enqueue training, but they still refresh the
@@ -16691,7 +18401,15 @@ void SimPlayerManager::scorePlayerBotActivity(
 void SimPlayerManager::refreshPlayerBotActivityStates() {
 	const bool earlyGameEnabled = playerBotEarlyGameGateEnabled();
 	const bool loadoutEnabled = playerBotLoadoutGateEnabled(0);
-	if (!earlyGameEnabled && !loadoutEnabled) {
+	const bool armorEnabled = playerBotArmorLoadoutGateEnabled(0);
+	Vector<uint64> armorKnownIds;
+	{
+		Locker progressionLock(&progressionMutex);
+		for (int i = 0; i < progressionArmorWorn.size(); ++i)
+			armorKnownIds.add(progressionArmorWorn.elementAt(i).getKey());
+	}
+	if (!earlyGameEnabled && !loadoutEnabled && !armorEnabled &&
+			armorKnownIds.size() == 0) {
 		Locker progressionLock(&progressionMutex);
 		progressionEarlyGameStates.removeAll();
 		return;
@@ -16751,6 +18469,15 @@ void SimPlayerManager::refreshPlayerBotActivityStates() {
 				static_cast<uint64>(progressionLoadoutFullSweepMinutes) * 60000;
 		if (fullSweep)
 			progressionLoadoutLastFullSweepMs = nowMs;
+	}
+	bool armorFullSweep = false;
+	if (armorEnabled) {
+		Locker progressionLock(&progressionMutex);
+		armorFullSweep = progressionArmorLastFullSweepMs == 0 ||
+			nowMs - progressionArmorLastFullSweepMs >=
+				static_cast<uint64>(progressionArmorPolicy.fullSweepMinutes) * 60000;
+		if (armorFullSweep)
+			progressionArmorLastFullSweepMs = nowMs;
 	}
 	for (int i = 0; i < decisions.size(); ++i) {
 		uint64 identityId = decisions.elementAt(i).getKey();
@@ -16826,6 +18553,44 @@ void SimPlayerManager::refreshPlayerBotActivityStates() {
 	// used by the rest of this file.
 	for (int i = 0; i < loadoutReconcileIds.size(); ++i)
 		reapplyPlayerBotProgressionToLiveBody(loadoutReconcileIds.get(i));
+
+	Vector<uint64> armorReconcileIds;
+	Vector<uint64> armorDrainIds;
+	VectorMap<uint64, bool> decisionIds;
+	for (int i = 0; i < decisions.size(); ++i) {
+		uint64 identityId = decisions.elementAt(i).getKey();
+		decisionIds.put(identityId, true);
+		bool hasWorn = false;
+		{
+			Locker progressionLock(&progressionMutex);
+			hasWorn = progressionArmorWorn.contains(identityId) &&
+				progressionArmorWorn.get(identityId).size() > 0;
+		}
+		if (!playerBotArmorLoadoutGateEnabled(identityId)) {
+			if (hasWorn)
+				armorDrainIds.add(identityId);
+			continue;
+		}
+		bool dirty = false;
+		{
+			Locker progressionLock(&progressionMutex);
+			dirty = progressionArmorDirtyIds.contains(identityId);
+		}
+		if (armorFullSweep || dirty)
+			armorReconcileIds.add(identityId);
+	}
+	for (int i = 0; i < armorKnownIds.size(); ++i) {
+		uint64 identityId = armorKnownIds.get(i);
+		if (decisionIds.contains(identityId))
+			continue;
+		if (!playerBotArmorLoadoutGateEnabled(identityId))
+			armorDrainIds.add(identityId);
+	}
+	for (int i = 0; i < armorReconcileIds.size(); ++i)
+		reconcilePlayerBotArmorOnLiveBody(armorReconcileIds.get(i));
+	for (int i = 0; i < armorDrainIds.size(); ++i)
+		reconcilePlayerBotArmorOnLiveBody(armorDrainIds.get(i), false, true);
+	sweepPlayerBotArmorClothing();
 }
 
 bool SimPlayerManager::isPlayerBotProgressionIdentity(uint64 identityId,
@@ -17545,6 +19310,23 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 				SimBotItemReconcile::decide(rowState, row.identityId,
 					location, locationIdentityId,
 					row.identityId != 0 && progressionRecords.contains(row.identityId));
+			bool remainsHeld = location ==
+				SimBotItemReconcile::LOCATION_IDENTITY_BAG &&
+				locationIdentityId != 0 && locationIdentityId == previousIdentityId;
+			if ((row.state == SIMBOT_ITEM_HELD ||
+					row.state == SIMBOT_ITEM_LISTED) && !remainsHeld &&
+					previousIdentityId != 0 &&
+					progressionArmorWorn.contains(previousIdentityId)) {
+				Vector<SimBotWornArmorPiece>& worn =
+					progressionArmorWorn.get(previousIdentityId);
+				for (int wornIndex = 0; wornIndex < worn.size(); ++wornIndex) {
+					if (worn.get(wornIndex).sourceOid == row.objectId) {
+						worn.get(wornIndex).pendingRemoval = true;
+						progressionArmorDirtyIds.put(previousIdentityId, true);
+						break;
+					}
+				}
+			}
 			if (decision.state == SimBotItemReconcile::DECISION_UNCHANGED)
 				continue;
 
@@ -17566,9 +19348,9 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 				row.dirty = true;
 				progressionItemDirtyIds.put(row.objectId, true);
 				if (previousIdentityId != 0)
-					progressionLoadoutDirtyIds.put(previousIdentityId, true);
+					markPlayerBotLoadoutDirtyLocked(previousIdentityId);
 				if (locationIdentityId != 0)
-					progressionLoadoutDirtyIds.put(locationIdentityId, true);
+					markPlayerBotLoadoutDirtyLocked(locationIdentityId);
 				continue;
 			}
 
@@ -17590,7 +19372,7 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 			row.dirty = true;
 			progressionItemDirtyIds.put(row.objectId, true);
 			if (previousIdentityId != 0)
-				progressionLoadoutDirtyIds.put(previousIdentityId, true);
+				markPlayerBotLoadoutDirtyLocked(previousIdentityId);
 			if (decision.ledgerDelta != 0 && previousIdentityId != 0) {
 				uint64 held = progressionItemHeldCounts.contains(previousIdentityId) ?
 					progressionItemHeldCounts.get(previousIdentityId) : 0;
@@ -17649,7 +19431,7 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 			progressionItems.put(row.objectId, row);
 			progressionItemDirtyIds.put(row.objectId, true);
 			if (row.identityId != 0)
-				progressionLoadoutDirtyIds.put(row.identityId, true);
+				markPlayerBotLoadoutDirtyLocked(row.identityId);
 			if (row.state == SIMBOT_ITEM_HELD || row.state == SIMBOT_ITEM_LISTED) {
 				if (row.state == SIMBOT_ITEM_LISTED)
 					row.refId = observedItem.auctionOid;
@@ -17893,6 +19675,13 @@ void SimPlayerManager::runPlayerBotProgressionReaper(uint64 nowMs, bool force) {
 			Locker progressionLock(&progressionMutex);
 			progressionRecords.drop(identityId);
 			progressionDirtyIds.drop(identityId);
+			progressionArmorWorn.drop(identityId);
+			progressionArmorBodyRaceCrc.drop(identityId);
+			progressionArmorChoices.drop(identityId);
+			progressionArmorBlockedReason.drop(identityId);
+				progressionLoadoutDirtyIds.drop(identityId);
+				progressionArmorDirtyIds.drop(identityId);
+				progressionArmorUpgradeScanAtMs.drop(identityId);
 			dropPlayerBotLedgerEntriesLocked(identityId);
 			progressionItemHeldCounts.drop(identityId);
 			for (int j = progressionOrphanIds.size() - 1; j >= 0; --j) {
@@ -18672,6 +20461,13 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 					Locker progressionLock(&progressionMutex);
 					progressionRecords.drop(request.identityId);
 					progressionDirtyIds.drop(request.identityId);
+					progressionArmorWorn.drop(request.identityId);
+					progressionArmorBodyRaceCrc.drop(request.identityId);
+					progressionArmorChoices.drop(request.identityId);
+					progressionArmorBlockedReason.drop(request.identityId);
+					progressionLoadoutDirtyIds.drop(request.identityId);
+					progressionArmorDirtyIds.drop(request.identityId);
+					progressionArmorUpgradeScanAtMs.drop(request.identityId);
 					dropPlayerBotLedgerEntriesLocked(request.identityId);
 				}
 				// The named ref is deliberately NOT pruned here. deleteIdentity is
@@ -18700,6 +20496,13 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 					Locker progressionLock(&progressionMutex);
 					progressionRecords.drop(request.identityId);
 					progressionDirtyIds.drop(request.identityId);
+					progressionArmorWorn.drop(request.identityId);
+					progressionArmorBodyRaceCrc.drop(request.identityId);
+					progressionArmorChoices.drop(request.identityId);
+					progressionArmorBlockedReason.drop(request.identityId);
+					progressionLoadoutDirtyIds.drop(request.identityId);
+					progressionArmorDirtyIds.drop(request.identityId);
+					progressionArmorUpgradeScanAtMs.drop(request.identityId);
 					dropPlayerBotLedgerEntriesLocked(request.identityId);
 				}
 				progressionRosterWithoutRecord.increment();
@@ -19688,6 +21491,49 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 		return bazaarBuyUpgradesSkippedOverBudget.get();
 	if (key == "bazaar.buy.upgrades.skippedunaffordable")
 		return bazaarBuyUpgradesSkippedUnaffordable.get();
+	if (key == "bazaar.buy.armorupgrades" ||
+			key == "bazaarbuyarmorupgrades")
+		return bazaarBuyArmorUpgradesDebited.get();
+	if (key == "bazaar.buy.armorupgrades.skippednotbetter")
+		return bazaarBuyArmorUpgradesSkippedNotBetter.get();
+	if (key == "bazaar.buy.armorupgrades.skippedunusable")
+		return bazaarBuyArmorUpgradesSkippedUnusable.get();
+	if (key == "bazaar.buy.armorupgrades.skippedtooencumbering")
+		return bazaarBuyArmorUpgradesSkippedTooEncumbering.get();
+	if (key == "bazaar.buy.armorupgrades.skippedoverbudget")
+		return bazaarBuyArmorUpgradesSkippedOverBudget.get();
+	if (key == "bazaar.buy.armorupgrades.skippedunaffordable")
+		return bazaarBuyArmorUpgradesSkippedUnaffordable.get();
+	if (key == "armor.selections")
+		return armorSelections.get();
+	if (key == "armor.equips")
+		return armorEquips.get();
+	if (key == "armor.removals")
+		return armorRemovals.get();
+	if (key == "armor.rewears")
+		return armorRewears.get();
+	if (key == "armor.reweardeferred")
+		return armorRewearDeferred.get();
+	if (key == "armor.deferredunbuffed")
+		return armorDeferredUnbuffed.get();
+	if (key == "armor.deferredincombat")
+		return armorDeferredInCombat.get();
+	if (key == "armor.deferredencumbrance")
+		return armorDeferredEncumbrance.get();
+	if (key == "armor.skippedrace")
+		return armorSkippedRace.get();
+	if (key == "armor.skippedfaction")
+		return armorSkippedFaction.get();
+	if (key == "armor.skippedcert")
+		return armorSkippedCert.get();
+	if (key == "armor.skippednocoverage")
+		return armorSkippedNoCoverage.get();
+	if (key == "armor.hysteresisholds")
+		return armorHysteresisHolds.get();
+	if (key == "armor.mitigationhits")
+		return armorMitigationHits.get();
+	if (key == "armor.mitigateddamage")
+		return armorMitigatedDamage.get();
 	if (key == "loadout.vaultequips")
 		return loadoutVaultEquips.get();
 	if (key == "loadout.starterfallbacks")
@@ -20206,6 +22052,8 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 		playerBotParityTestBazaarBuyGateOverride = false;
 		playerBotParityTestLoadoutGateOverrideActive = false;
 		playerBotParityTestLoadoutGateOverride = false;
+		playerBotParityTestArmorGateOverrideActive = false;
+		playerBotParityTestArmorGateOverride = false;
 		if (playerBotParityTestBazaarMarkupOverrideActive) {
 			progressionBazaarMarkup =
 				playerBotParityTestBazaarMarkupOverridePrevious;
@@ -20221,11 +22069,15 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 	playerBotParityBazaarBuyGateScopedIds.removeAll();
 	playerBotParityLoadoutGateScopedIds.removeAll();
 	playerBotParityLoadoutGateValues.removeAll();
+	playerBotParityArmorGateScopedIds.removeAll();
+	playerBotParityBodyTemplateOverrides.removeAll();
+	playerBotParityArmorGateValues.removeAll();
 	playerBotParityBazaarUpgradesGateScopedIds.removeAll();
 	playerBotParityBazaarUpgradesGateValues.removeAll();
 	playerBotParityLoadoutHarnessOptIns.removeAll();
 	playerBotParityLoadoutCertOverrides.removeAll();
 	playerBotParityLoadoutWeaponRefs.removeAll();
+	playerBotParityArmorRefs.removeAll();
 	playerBotParityBazaarBuyListOverrides.removeAll();
 	playerBotParityBazaarSellerBankBaselines.removeAll();
 	playerBotParityMissionCreditScopedIds.removeAll();
@@ -20236,6 +22088,8 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 	// parity mutex would be an ABBA pair.
 	restoreNoviceGateOverride();
 	playerBotParityTestFailItemTransfer.set(false);
+	playerBotParityTestFailArmorTransfer.set(false);
+	playerBotParityTestFailArmorTransferIdentity.set(0);
 	playerBotParityTestSuppressBazaarPurchaseExecute.set(false);
 	{
 		Locker parityLock(&playerBotParityTestMutex);
@@ -20410,6 +22264,7 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 		playerBotParityTestCreditBaselines.removeAll();
 			playerBotParityTestRequestRefs.removeAll();
 			playerBotParityTestIdentityRefs.removeAll();
+			playerBotParityAppearanceSnapshots.removeAll();
 			playerBotParityCombatAbilityHarnessOptIns.removeAll();
 			for (int i = 0; i < playerBotParityCombatAbilityScopedIds.size(); ++i)
 				scopedAbilityIdentityIds.add(
@@ -20718,6 +22573,19 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 				"bazaar.buy.upgrades.skippedUncertified",
 				"bazaar.buy.upgrades.skippedOverBudget",
 				"bazaar.buy.upgrades.skippedUnaffordable",
+				"bazaar.buy.armorUpgrades",
+				"bazaar.buy.armorUpgrades.skippedNotBetter",
+				"bazaar.buy.armorUpgrades.skippedUnusable",
+				"bazaar.buy.armorUpgrades.skippedTooEncumbering",
+				"bazaar.buy.armorUpgrades.skippedOverBudget",
+				"bazaar.buy.armorUpgrades.skippedUnaffordable",
+				"armor.selections", "armor.equips", "armor.removals",
+				"armor.rewears", "armor.rewearDeferred",
+				"armor.deferredUnbuffed", "armor.deferredInCombat",
+				"armor.deferredEncumbrance", "armor.skippedRace",
+				"armor.skippedFaction", "armor.skippedCert",
+				"armor.skippedNoCoverage", "armor.hysteresisHolds",
+				"armor.mitigationHits", "armor.mitigatedDamage",
 				"loadout.vaultEquips", "loadout.starterFallbacks",
 				"loadout.hysteresisHolds", "loadout.sellProtected",
 				"bazaar.saleUnresolved", "bazaar.saleBacklogOverflow",
@@ -21077,10 +22945,19 @@ bool SimPlayerManager::executePlayerBotParityStep(
 				op == "setLootGate" || op == "setBazaarSellGate" ||
 				op == "setBazaarBuyGate" || op == "setBuyListOverride" ||
 				op == "setLoadoutGate" || op == "setBazaarUpgradesGate" ||
+				op == "setArmorGate" || op == "setArmorUpgradeGate" ||
+				op == "setBodyTemplate" ||
 				op == "setLoadoutHarnessOptIn" || op == "setCertsOverride" ||
 				op == "grantVaultWeapon" || op == "reapplyLoadout" ||
 				op == "assertLoadout" || op == "assertSellProtected" ||
 				op == "listHarnessWeapon" ||
+				op == "grantVaultArmor" || op == "applyTrackedBuffs" ||
+				op == "removeTrackedBuffs" || op == "reconcileArmor" ||
+				op == "assertArmor" || op == "assertArmorProtected" ||
+				op == "assertArmorMitigation" || op == "listHarnessArmor" ||
+				op == "assertArmorClothing" || op == "captureAppearance" ||
+				op == "assertAppearanceStable" ||
+				op == "failArmorTransfer" ||
 				op == "buyAtTerminal" || op == "assertPurchase" ||
 				op == "forgeDeliveredPurchase" ||
 				op == "seedCorpseLoot" ||
@@ -21217,6 +23094,50 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		return true;
 	}
 
+	if (op == "setArmorGate" || op == "setArmorUpgradeGate") {
+		if (identityId == 0) {
+			result.status = "FAIL";
+			result.failReason = "armor_gate_requires_identity";
+			return true;
+		}
+		int64 enabledValue = 0;
+		if (step.hasGateEnabled)
+			enabledValue = step.gateEnabled ? 1 : 0;
+		else if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_armor_gate_value";
+			return true;
+		}
+		Locker parityLock(&playerBotParityTestMutex);
+		if (op == "setArmorGate") {
+			playerBotParityTestArmorGateOverrideActive = true;
+			playerBotParityTestArmorGateOverride = enabledValue != 0;
+			playerBotParityArmorGateScopedIds.put(identityId, true);
+			playerBotParityArmorGateValues.put(identityId, enabledValue != 0);
+		} else {
+			playerBotParityBazaarUpgradesGateScopedIds.put(identityId, true);
+			playerBotParityBazaarUpgradesGateValues.put(identityId,
+				enabledValue != 0);
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "setBodyTemplate") {
+		SimBotIdentity identity;
+		if (identityId == 0 || step.templateName.isEmpty() ||
+				!snapshotPlayerBotIdentity(identityId, identity) ||
+				identity.profession != "harness") {
+			result.status = "FAIL";
+			result.failReason = "body_template_requires_harness_identity";
+			return true;
+		}
+		Locker parityLock(&playerBotParityTestMutex);
+		playerBotParityBodyTemplateOverrides.put(identityId, step.templateName);
+		result.status = "PASS";
+		return true;
+	}
+
 	if (op == "setLoadoutHarnessOptIn") {
 		if (identityId == 0 || step.xpType.isEmpty()) {
 			result.status = "FAIL";
@@ -21240,7 +23161,7 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		}
 		{
 			Locker progressionLock(&progressionMutex);
-			progressionLoadoutDirtyIds.put(identityId, true);
+			markPlayerBotLoadoutDirtyLocked(identityId);
 		}
 		reapplyPlayerBotProgressionToLiveBody(identityId);
 		result.status = "PASS";
@@ -21268,7 +23189,7 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		{
 			Locker progressionLock(&progressionMutex);
 			progressionCertificationCache.drop(identityId);
-			progressionLoadoutDirtyIds.put(identityId, true);
+			markPlayerBotLoadoutDirtyLocked(identityId);
 		}
 		reapplyPlayerBotProgressionToLiveBody(identityId);
 		result.status = "PASS";
@@ -21386,6 +23307,20 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		return true;
 	}
 
+	if (op == "failArmorTransfer") {
+		SimBotIdentity faultIdentity;
+		if (!snapshotPlayerBotIdentity(identityId, faultIdentity) ||
+				faultIdentity.profession != "harness") {
+			result.status = "FAIL";
+			result.failReason = "armor_transfer_fault_requires_harness_identity";
+			return true;
+		}
+		playerBotParityTestFailArmorTransferIdentity.set(identityId);
+		playerBotParityTestFailArmorTransfer.set(true);
+		result.status = "PASS";
+		return true;
+	}
+
 	if (op == "killBodyBeforeLoot") {
 		int identityIndex = -1;
 		if (!getPlayerBotParityIdentityIndex(step, identityIndex)) {
@@ -21474,6 +23409,322 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			playerBotParityLoadoutWeaponRefs.put(
 				String::valueOf(identityId) + ":" + step.ref,
 				item->getObjectID());
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "grantVaultArmor") {
+		if (step.templateName.isEmpty() || step.ref.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "vault_armor_requires_template_ref";
+			return true;
+		}
+		SimBotIdentity armorIdentity;
+		if (!snapshotPlayerBotIdentity(identityId, armorIdentity) ||
+				armorIdentity.profession != "harness") {
+			result.status = "FAIL";
+			result.failReason = "vault_armor_requires_harness_identity";
+			return true;
+		}
+		AiEconomyManager* economyManager = AiEconomyManager::instance();
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> bag = economyManager == nullptr ?
+			nullptr : economyManager->getOrCreateItemBag(identityId);
+		ManagedReference<SceneObject*> item = zoneServer == nullptr ? nullptr :
+			zoneServer->createObject(step.templateName.hashCode(), 1);
+		if (bag == nullptr || item == nullptr || !item->isArmorObject() ||
+				item->isPsgArmorObject()) {
+			if (item != nullptr)
+				item->destroyObjectFromDatabase(true);
+			result.status = "FAIL";
+			result.failReason = "vault_armor_object_missing";
+			return true;
+		}
+		bool transferred = false;
+		{
+			Locker itemLock(item);
+			Locker bagLock(bag, item);
+			transferred = bag->transferObject(item, -1, false, true);
+			ArmorObject* armor = cast<ArmorObject*>(item.get());
+			if (transferred && armor != nullptr) {
+				if (step.hasArmorRating)
+					armor->setRating(step.armorRating);
+				if (step.hasArmorResist) {
+					float resist = static_cast<float>(step.armorResist);
+					armor->setKinetic(resist);
+					armor->setEnergy(resist);
+					armor->setBlast(resist);
+					armor->setStun(resist);
+					armor->setHeat(resist);
+					armor->setCold(resist);
+					armor->setAcid(resist);
+					armor->setElectricity(resist);
+				}
+				armor->setHealthEncumbrance(step.armorHealthEncumbrance);
+				armor->setActionEncumbrance(step.armorActionEncumbrance);
+				armor->setMindEncumbrance(step.armorMindEncumbrance);
+				if (step.hasArmorCondition)
+					armor->setConditionDamage(Math::max(0,
+						armor->getMaxCondition() - step.armorCondition), false);
+				if (step.armorFaction == "imperial")
+					armor->setFaction(Factions::FACTIONIMPERIAL);
+				else if (step.armorFaction == "rebel")
+					armor->setFaction(Factions::FACTIONREBEL);
+				else if (step.armorFaction == "neutral")
+					armor->setFaction(Factions::FACTIONNEUTRAL);
+				TangibleObject* tangible = cast<TangibleObject*>(item.get());
+				if (tangible != nullptr)
+					tangible->setJunkValue(step.junkValue > 0 ? step.junkValue : 100);
+			}
+		}
+		if (!transferred) {
+			item->destroyObjectFromDatabase(true);
+			result.status = "FAIL";
+			result.failReason = "vault_armor_transfer_failed";
+			return true;
+		}
+		SimBotItemDeposit deposit;
+		deposit.objectId = item->getObjectID();
+		deposit.templateCrc = item->getServerObjectCRC();
+		{
+			Locker itemLock(item);
+			deposit.displayName = item->getDisplayedName();
+		}
+		Vector<SimBotItemDeposit> deposits;
+		deposits.add(deposit);
+		if (!depositPlayerBotItem(identityId, deposits, "harness",
+				item->getObjectID())) {
+			item->destroyObjectFromDatabase(true);
+			result.status = "FAIL";
+			result.failReason = "vault_armor_deposit_failed";
+			return true;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityArmorRefs.put(
+				String::valueOf(identityId) + ":" + step.ref,
+				item->getObjectID());
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "applyTrackedBuffs" || op == "removeTrackedBuffs") {
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> body = zoneServer == nullptr ? nullptr :
+			zoneServer->getObject(bodyOid);
+		AiAgent* agent = body == nullptr ? nullptr : body->asAiAgent();
+		if (agent == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "armor_buff_body_missing";
+			return true;
+		}
+		Vector<PveBuffSpec> specs;
+		getPveRealBuffFallbackSpecs(specs);
+		bool changed = false;
+		{
+			Locker agentLock(agent);
+			for (int i = 0; i < specs.size(); ++i) {
+				const PveBuffSpec& spec = specs.get(i);
+				if (spec.crc == 0)
+					continue;
+				bool selected = step.buffPool.isEmpty() || step.buffPool == "all";
+				if (!selected && step.buffPool == "health")
+					selected = spec.attribute == CreatureAttribute::STRENGTH ||
+						spec.attribute == CreatureAttribute::CONSTITUTION;
+				if (!selected && step.buffPool == "action")
+					selected = spec.attribute == CreatureAttribute::QUICKNESS ||
+						spec.attribute == CreatureAttribute::STAMINA;
+				if (!selected && step.buffPool == "mind")
+					selected = spec.attribute == CreatureAttribute::FOCUS ||
+						spec.attribute == CreatureAttribute::WILLPOWER;
+				if (!selected)
+					continue;
+				if (op == "removeTrackedBuffs") {
+					changed = agent->removeBuff(spec.crc) || changed;
+					continue;
+				}
+				agent->removeBuff(spec.crc);
+				Reference<Buff*> buff = new Buff(agent, spec.crc,
+					spec.durationSeconds, spec.buffType);
+				Locker buffLock(buff);
+				buff->setAttributeModifier(spec.attribute, spec.modifier);
+				buff->setFillAttributesOnBuff(true);
+				agent->addBuff(buff);
+				changed = true;
+			}
+		}
+		if (changed) {
+			if (op == "applyTrackedBuffs")
+				recordPveBuffSource(bodyOid, "parity-harness");
+			else {
+				Locker progressionLock(&progressionMutex);
+				progressionArmorDirtyIds.put(identityId, true);
+			}
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "reconcileArmor") {
+		reconcilePlayerBotArmorOnLiveBody(identityId);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertArmorClothing") {
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		bool stowed = false;
+		{
+			Locker clothingLock(&armorClothingMutex);
+			stowed = bodyOid != 0 && armorStowedClothing.contains(bodyOid) &&
+				armorStowedClothing.get(bodyOid).size() > 0;
+		}
+		bool expected = step.expect == "stowed" ||
+			step.expect.toLowerCase() == "true";
+		if (stowed != expected) {
+			result.status = "FAIL";
+			result.failReason = "armor_clothing_stash_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "captureAppearance" || op == "assertAppearanceStable") {
+		String fingerprint;
+		if (!snapshotPlayerBotAppearance(identityId, fingerprint)) {
+			result.status = "FAIL";
+			result.failReason = "appearance_body_missing";
+			return true;
+		}
+		if (op == "captureAppearance") {
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityAppearanceSnapshots.put(identityId, fingerprint);
+			result.status = "PASS";
+			return true;
+		}
+		bool matches = false;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			matches = playerBotParityAppearanceSnapshots.contains(identityId) &&
+				playerBotParityAppearanceSnapshots.get(identityId) == fingerprint;
+		}
+		if (!matches) {
+			result.status = "FAIL";
+			result.failReason = "appearance_changed";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertArmor" || op == "assertArmorProtected" ||
+			op == "assertArmorMitigation") {
+		Vector<SimBotWornArmorPiece> worn;
+		{
+			Locker progressionLock(&progressionMutex);
+			if (progressionArmorWorn.contains(identityId))
+				worn = progressionArmorWorn.get(identityId);
+		}
+		if (op == "assertArmorProtected") {
+			uint64 sourceOid = 0;
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				String key = String::valueOf(identityId) + ":" + step.ref;
+				if (playerBotParityArmorRefs.contains(key))
+					sourceOid = playerBotParityArmorRefs.get(key);
+			}
+			VectorMap<uint64, bool> protectedIds;
+			collectPlayerBotProtectedArmorOids(identityId, protectedIds);
+			int64 expected = 0;
+			if (!parsePlayerBotParityExpected(step.expect, expected))
+				expected = step.expect == "protected" ? 1 : 0;
+			if ((protectedIds.contains(sourceOid) ? 1 : 0) != expected) {
+				result.status = "FAIL";
+				result.failReason = "armor_protection_mismatch";
+				return true;
+			}
+			result.status = "PASS";
+			return true;
+		}
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> body = zoneServer == nullptr ? nullptr :
+			zoneServer->getObject(bodyOid);
+		AiAgent* agent = body == nullptr ? nullptr : body->asAiAgent();
+		if (agent == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "armor_assert_body_missing";
+			return true;
+		}
+		uint64 mitigated = 0;
+		bool flagged = false;
+		{
+			Locker agentLock(agent);
+			flagged = agent->hasSimBotWornArmor();
+			mitigated = agent->getSimBotArmorMitigatedTotal();
+		}
+		if (op == "assertArmorMitigation") {
+			int64 expected = 0;
+			if (!parsePlayerBotParityExpected(step.expect, expected))
+				expected = step.amount;
+			if (mitigated < static_cast<uint64>(expected < 0 ? 0 : expected)) {
+				result.status = "FAIL";
+				result.failReason = "armor_mitigation_tally_too_low";
+				return true;
+			}
+			result.status = "PASS";
+			return true;
+		}
+		int expectedCount = static_cast<int>(step.amount);
+		int64 parsedCount = 0;
+		if (parsePlayerBotParityExpected(step.expect, parsedCount))
+			expectedCount = static_cast<int>(parsedCount);
+		int actualCount = 0;
+		for (int i = 0; i < worn.size(); ++i)
+			if (worn.get(i).onBody && !worn.get(i).pendingRemoval)
+				++actualCount;
+		if (actualCount != expectedCount ||
+				flagged != (actualCount > 0)) {
+			result.status = "FAIL";
+			result.failReason = "armor_worn_state_mismatch";
+			return true;
+		}
+		if (!step.ref.isEmpty()) {
+			uint64 sourceOid = 0;
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				String key = String::valueOf(identityId) + ":" + step.ref;
+				if (playerBotParityArmorRefs.contains(key))
+					sourceOid = playerBotParityArmorRefs.get(key);
+			}
+			bool found = false;
+			for (int i = 0; i < worn.size(); ++i)
+				if (worn.get(i).sourceOid == sourceOid && worn.get(i).onBody)
+					found = true;
+			if (!found) {
+				result.status = "FAIL";
+				result.failReason = "armor_ref_not_worn";
+				return true;
+			}
 		}
 		result.status = "PASS";
 		return true;
@@ -23805,6 +26056,49 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		result.status = "PASS";
 		return true;
 	}
+	if (op == "listHarnessArmor") {
+		if (step.ref.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "list_harness_armor_requires_ref";
+			return true;
+		}
+		uint64 objectId = 0;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			String key = String::valueOf(identityId) + ":" + step.ref;
+			if (playerBotParityArmorRefs.contains(key))
+				objectId = playerBotParityArmorRefs.get(key);
+		}
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> bodyObject = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(bodyOid);
+		CreatureObject* body = bodyObject == nullptr ? nullptr :
+			bodyObject->asCreatureObject();
+		if (objectId == 0 || body == nullptr || body->getZone() == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "list_harness_armor_setup_failed";
+			return true;
+		}
+		Vector3 position = body->getWorldPosition();
+		SceneObject* terminal = MarketSeederBridge::findBazaarTerminal(
+			body->getZone(), position.getX(), position.getZ(), position.getY(),
+			static_cast<float>(getPlayerBotBazaarMaxDetourMeters()), true);
+		int price = step.price > 0 ? step.price : 100;
+		if (terminal == nullptr || !listPlayerBotItemAtBazaar(identityId,
+				objectId, terminal, price)) {
+			result.status = "FAIL";
+			result.failReason = "list_harness_armor_failed";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
 	if (op == "awaitProductionLoadout") {
 		Vector<uint64> productionIds;
 		VectorMap<uint64, uint64> bodyOids;
@@ -25069,6 +27363,150 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 	}
 	result["loadout"] = loadout;
 
+	JSONSerializationType armorJson = JSONSerializationType::object();
+	SimBotArmorPolicy inspectArmorPolicy = snapshotPlayerBotArmorPolicy();
+	armorJson["configured"] = inspectArmorPolicy.enabled;
+	armorJson["enabled"] = playerBotArmorLoadoutGateEnabled(identityId);
+	armorJson["bazaarUpgrades"] =
+		playerBotArmorBazaarUpgradesGateEnabled(identityId);
+	armorJson["preview"] = false;
+	armorJson["worn"] = JSONSerializationType::array();
+	armorJson["desired"] = JSONSerializationType::array();
+	armorJson["candidates"] = JSONSerializationType::array();
+	String inspectArmorBlockedReason;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (progressionArmorBlockedReason.contains(identityId))
+			inspectArmorBlockedReason =
+				progressionArmorBlockedReason.get(identityId);
+	}
+	SimBotArmorLoadout::ArmorChoice inspectArmorChoice;
+	Vector<SimBotArmorLoadout::ArmorStats> inspectArmorCandidates;
+	Vector<String> inspectArmorSkills;
+	SimBotBodyArmorContext inspectArmorContext;
+	bool haveArmorPreview = selectPlayerBotArmor(identityId,
+		inspectArmorChoice, true) &&
+		snapshotPlayerBotArmorCandidates(identityId, inspectArmorCandidates,
+			inspectArmorSkills) && snapshotPlayerBotBodyArmorContext(identityId,
+			inspectArmorPolicy, inspectArmorContext);
+	armorJson["preview"] = haveArmorPreview;
+	if (haveArmorPreview) {
+		auto armorReasonName = [](SimBotArmorLoadout::UsableReason reason) {
+			switch (reason) {
+			case SimBotArmorLoadout::RACE: return String("race");
+			case SimBotArmorLoadout::FACTION: return String("faction");
+			case SimBotArmorLoadout::CERT: return String("cert");
+			case SimBotArmorLoadout::NO_COVERAGE: return String("no_coverage");
+			default: return String("ok");
+			}
+		};
+		auto addArmorStats = [](JSONSerializationType& row,
+				const SimBotArmorLoadout::ArmorStats& stats) {
+			row["oid"] = stats.objectId;
+			row["template"] = stats.templateString;
+			row["slotKey"] = stats.slotKey;
+			row["rating"] = stats.armorRating;
+			row["score"] = stats.score;
+			JSONSerializationType resists = JSONSerializationType::array();
+			for (int i = 0; i < SimBotArmorLoadout::DAMAGE_TYPE_COUNT; ++i)
+				resists.push_back(stats.resists[i]);
+			row["resists"] = resists;
+			JSONSerializationType encumbrance = JSONSerializationType::object();
+			encumbrance["health"] = stats.healthEncumbrance;
+			encumbrance["action"] = stats.actionEncumbrance;
+			encumbrance["mind"] = stats.mindEncumbrance;
+			row["encumbrance"] = encumbrance;
+		};
+		JSONSerializationType candidateJson = JSONSerializationType::array();
+		for (int i = 0; i < inspectArmorCandidates.size(); ++i) {
+			const SimBotArmorLoadout::ArmorStats& stats =
+				inspectArmorCandidates.get(i);
+			JSONSerializationType row = JSONSerializationType::object();
+			addArmorStats(row, stats);
+			row["reason"] = armorReasonName(SimBotArmorLoadout::usability(
+				stats, inspectArmorContext.bodyRaceCrc, 0, inspectArmorSkills));
+			candidateJson.push_back(row);
+		}
+		armorJson["candidates"] = candidateJson;
+		JSONSerializationType desiredJson = JSONSerializationType::array();
+		for (size_t i = 0; i < inspectArmorChoice.pieces.size(); ++i) {
+			const SimBotArmorLoadout::ArmorChoicePiece& piece =
+				inspectArmorChoice.pieces[i];
+			JSONSerializationType row = JSONSerializationType::object();
+			addArmorStats(row, piece.stats);
+			row["score"] = piece.score;
+			row["status"] = piece.status == SimBotArmorLoadout::KEPT ?
+				String("kept") : piece.status == SimBotArmorLoadout::NEW ?
+				String("new") : String("held_by_hysteresis");
+			row["reason"] = armorReasonName(SimBotArmorLoadout::usability(
+				piece.stats, inspectArmorContext.bodyRaceCrc, 0,
+				inspectArmorSkills));
+			desiredJson.push_back(row);
+		}
+		armorJson["desired"] = desiredJson;
+		JSONSerializationType buffedPools = JSONSerializationType::object();
+		const char* poolNames[] = {"strength", "constitution", "quickness",
+			"stamina", "focus", "willpower"};
+		const unsigned int poolBits[] = {SimBotArmorLoadout::STRENGTH,
+			SimBotArmorLoadout::CONSTITUTION, SimBotArmorLoadout::QUICKNESS,
+			SimBotArmorLoadout::STAMINA, SimBotArmorLoadout::FOCUS,
+			SimBotArmorLoadout::WILLPOWER};
+		for (int i = 0; i < 6; ++i)
+			buffedPools[poolNames[i]] =
+				(inspectArmorContext.buffedPools & poolBits[i]) != 0;
+		armorJson["buffedPools"] = buffedPools;
+		JSONSerializationType secondaries = JSONSerializationType::object();
+		for (int i = 0; i < 6; ++i) {
+			JSONSerializationType pool = JSONSerializationType::object();
+			pool["current"] = inspectArmorContext.secondaries[i];
+			pool["max"] = inspectArmorContext.maxSecondaries[i];
+			secondaries[poolNames[i]] = pool;
+		}
+		armorJson["secondaries"] = secondaries;
+		armorJson["bodyRaceCrc"] = inspectArmorContext.bodyRaceCrc;
+		armorJson["inCombat"] = inspectArmorContext.inCombat;
+		int totalEncumbrance = 0;
+		JSONSerializationType wornJson = JSONSerializationType::array();
+		for (int i = 0; i < inspectArmorContext.wornCopies.size(); ++i) {
+			const SimBotWornArmorPiece& piece =
+				inspectArmorContext.wornCopies.get(i);
+			JSONSerializationType row = JSONSerializationType::object();
+			row["sourceOid"] = piece.sourceOid;
+			row["copyOid"] = piece.copyOid;
+			row["slotKey"] = piece.slotKey;
+			row["onBody"] = piece.onBody;
+			row["pendingRemoval"] = piece.pendingRemoval;
+			totalEncumbrance += piece.onBody ? piece.healthEncumbrance +
+				piece.actionEncumbrance + piece.mindEncumbrance : 0;
+			ManagedReference<SceneObject*> copy = zoneServer == nullptr ?
+				nullptr : zoneServer->getObject(piece.copyOid);
+			ArmorObject* armor = copy == nullptr ? nullptr :
+				cast<ArmorObject*>(copy.get());
+			if (armor != nullptr) {
+				Locker copyLock(armor);
+				SimBotArmorLoadout::ArmorStats stats;
+				fillPlayerBotArmorStats(armor, stats);
+				addArmorStats(row, stats);
+				row["condition"] = stats.condition;
+				row["maxCondition"] = stats.maxCondition;
+			}
+			wornJson.push_back(row);
+		}
+		armorJson["worn"] = wornJson;
+		armorJson["totalEncumbrance"] = totalEncumbrance;
+		bool simBotWornArmor = false;
+		uint64 mitigatedTotal = 0;
+		if (bodyAgent != nullptr) {
+			Locker agentLock(bodyAgent);
+			simBotWornArmor = bodyAgent->hasSimBotWornArmor();
+			mitigatedTotal = bodyAgent->getSimBotArmorMitigatedTotal();
+		}
+		armorJson["simBotWornArmor"] = simBotWornArmor;
+		armorJson["mitigatedTotal"] = mitigatedTotal;
+	}
+	armorJson["blockedReason"] = inspectArmorBlockedReason;
+	result["armor"] = armorJson;
+
 	JSONSerializationType activeAbilities = JSONSerializationType::array();
 	JSONSerializationType inactiveAbilities = JSONSerializationType::array();
 	for (int i = 0; i < installedAbilities.size(); ++i) {
@@ -25403,6 +27841,8 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	VectorMap<uint64, SimBotProgression> records;
 	VectorMap<uint64, SimBotEarlyGameState> earlyGameStateSnapshot;
 	VectorMap<uint64, SimBotLoadout::LoadoutChoice> loadoutChoiceSnapshot;
+	VectorMap<uint64, Vector<SimBotWornArmorPiece> > armorWornSnapshot;
+	VectorMap<uint64, String> armorBlockedSnapshot;
 	SimBotEarlyGameConfig earlyGameConfigSnapshot;
 	SimBotCombatAbilityConfig combatAbilityConfigSnapshot;
 	int dirtyCount = 0;
@@ -25429,6 +27869,8 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		records = progressionRecords;
 		earlyGameStateSnapshot = progressionEarlyGameStates;
 		loadoutChoiceSnapshot = progressionLoadoutChoices;
+		armorWornSnapshot = progressionArmorWorn;
+		armorBlockedSnapshot = progressionArmorBlockedReason;
 		earlyGameConfigSnapshot = progressionEarlyGameConfig;
 		combatAbilityConfigSnapshot = progressionCombatAbilityConfig;
 		dirtyCount = progressionDirtyIds.size();
@@ -25598,6 +28040,13 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		!progressionPurchaseReconcilePending.load();
 	gates["bazaarBuy"] = bazaarBuyDashboardEnabled;
 	gates["loadout"] = playerBotLoadoutGateEnabled(0);
+	gates["armorLoadout"] = playerBotArmorLoadoutGateEnabled(0);
+	// The per-identity BUY gate is false for identity 0 by design, so report
+	// the configured chain instead of always showing false.
+	const bool armorUpgradesDashboardEnabled =
+		playerBotArmorLoadoutGateEnabled(0) && bazaarBuyDashboardEnabled &&
+		snapshotPlayerBotArmorPolicy().bazaarUpgrades;
+	gates["armorBazaarUpgrades"] = armorUpgradesDashboardEnabled;
 	result["gates"] = gates;
 
 	JSONSerializationType missionCredits = JSONSerializationType::object();
@@ -25775,6 +28224,19 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		bazaarBuyUpgradesSkippedOverBudget.get();
 	upgrades["skippedUnaffordable"] =
 		bazaarBuyUpgradesSkippedUnaffordable.get();
+	JSONSerializationType armorUpgrades = JSONSerializationType::object();
+	armorUpgrades["debited"] = bazaarBuyArmorUpgradesDebited.get();
+	armorUpgrades["skippedNotBetter"] =
+		bazaarBuyArmorUpgradesSkippedNotBetter.get();
+	armorUpgrades["skippedUnusable"] =
+		bazaarBuyArmorUpgradesSkippedUnusable.get();
+	armorUpgrades["skippedTooEncumbering"] =
+		bazaarBuyArmorUpgradesSkippedTooEncumbering.get();
+	armorUpgrades["skippedOverBudget"] =
+		bazaarBuyArmorUpgradesSkippedOverBudget.get();
+	armorUpgrades["skippedUnaffordable"] =
+		bazaarBuyArmorUpgradesSkippedUnaffordable.get();
+	bazaarBuy["armorUpgrades"] = armorUpgrades;
 	bazaarBuy["upgrades"] = upgrades;
 	JSONSerializationType buyReconcile = JSONSerializationType::object();
 	buyReconcile["committed"] = bazaarBuyReconcileCommitted.get();
@@ -25823,6 +28285,76 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	}
 	loadout["choices"] = loadoutRows;
 	result["loadout"] = loadout;
+
+	SimBotArmorPolicy armorPolicyDashboard = snapshotPlayerBotArmorPolicy();
+	JSONSerializationType armorDashboard = JSONSerializationType::object();
+	armorDashboard["configured"] = armorPolicyDashboard.enabled;
+	armorDashboard["enabled"] = playerBotArmorLoadoutGateEnabled(0);
+	armorDashboard["bazaarUpgrades"] = armorUpgradesDashboardEnabled;
+	armorDashboard["minUpgradePercent"] =
+		armorPolicyDashboard.minUpgradePercent;
+	armorDashboard["fullSweepMinutes"] =
+		armorPolicyDashboard.fullSweepMinutes;
+	armorDashboard["upgradeSpendFraction"] =
+		armorPolicyDashboard.upgradeSpendFraction;
+	armorDashboard["maxUpgradeLoadsPerVisit"] =
+		armorPolicyDashboard.maxUpgradeLoadsPerVisit;
+	int armorWornBots = 0;
+	int armorWornPieces = 0;
+	for (int i = 0; i < armorWornSnapshot.size(); ++i) {
+		int pieces = 0;
+		const Vector<SimBotWornArmorPiece>& worn =
+			armorWornSnapshot.elementAt(i).getValue();
+		for (int j = 0; j < worn.size(); ++j)
+			if (worn.get(j).onBody && !worn.get(j).pendingRemoval)
+				++pieces;
+		if (pieces > 0)
+			++armorWornBots;
+		armorWornPieces += pieces;
+	}
+	armorDashboard["wornBots"] = armorWornBots;
+	armorDashboard["wornPieces"] = armorWornPieces;
+	armorDashboard["selections"] = armorSelections.get();
+	armorDashboard["equips"] = armorEquips.get();
+	armorDashboard["removals"] = armorRemovals.get();
+	armorDashboard["rewears"] = armorRewears.get();
+	armorDashboard["rewearDeferred"] = armorRewearDeferred.get();
+	armorDashboard["deferredUnbuffed"] = armorDeferredUnbuffed.get();
+	armorDashboard["deferredInCombat"] = armorDeferredInCombat.get();
+	armorDashboard["deferredEncumbrance"] = armorDeferredEncumbrance.get();
+	armorDashboard["skippedRace"] = armorSkippedRace.get();
+	armorDashboard["skippedFaction"] = armorSkippedFaction.get();
+	armorDashboard["skippedCert"] = armorSkippedCert.get();
+	armorDashboard["skippedNoCoverage"] = armorSkippedNoCoverage.get();
+	armorDashboard["hysteresisHolds"] = armorHysteresisHolds.get();
+	armorDashboard["mitigationHits"] = armorMitigationHits.get();
+	armorDashboard["mitigatedDamage"] = armorMitigatedDamage.get();
+	JSONSerializationType armorRows = JSONSerializationType::array();
+	for (int i = 0; i < armorWornSnapshot.size(); ++i) {
+		const Vector<SimBotWornArmorPiece>& worn =
+			armorWornSnapshot.elementAt(i).getValue();
+		for (int j = 0; j < worn.size(); ++j) {
+			const SimBotWornArmorPiece& piece = worn.get(j);
+			JSONSerializationType row = JSONSerializationType::object();
+			row["identityId"] = armorWornSnapshot.elementAt(i).getKey();
+			row["sourceOid"] = piece.sourceOid;
+			row["copyOid"] = piece.copyOid;
+			row["slotKey"] = piece.slotKey;
+			row["onBody"] = piece.onBody;
+			row["pendingRemoval"] = piece.pendingRemoval;
+			armorRows.push_back(row);
+		}
+	}
+	armorDashboard["worn"] = armorRows;
+	JSONSerializationType armorBlocked = JSONSerializationType::array();
+	for (int i = 0; i < armorBlockedSnapshot.size(); ++i) {
+		JSONSerializationType row = JSONSerializationType::object();
+		row["identityId"] = armorBlockedSnapshot.elementAt(i).getKey();
+		row["reason"] = armorBlockedSnapshot.elementAt(i).getValue();
+		armorBlocked.push_back(row);
+	}
+	armorDashboard["blocked"] = armorBlocked;
+	result["armor"] = armorDashboard;
 
 	JSONSerializationType vaultJson = JSONSerializationType::object();
 	vaultJson["available"] = dashboardEconomy != nullptr &&
@@ -26871,9 +29403,15 @@ void SimPlayerManager::retirePveIdentity(uint64 identityId) {
 		progressionTrainingPendingIds.drop(identityId);
 		progressionEarlyGameStates.drop(identityId);
 		progressionLoadoutChoices.drop(identityId);
+		progressionArmorWorn.drop(identityId);
+		progressionArmorBodyRaceCrc.drop(identityId);
+		progressionArmorChoices.drop(identityId);
+		progressionArmorBlockedReason.drop(identityId);
 		progressionCertificationCache.drop(identityId);
 		progressionLoadoutDirtyIds.drop(identityId);
+		progressionArmorDirtyIds.drop(identityId);
 		progressionBazaarUpgradeScanAtMs.drop(identityId);
+		progressionArmorUpgradeScanAtMs.drop(identityId);
 	}
 	if (!destroyPlayerBotItemsAndBag(identityId))
 		return;
@@ -26907,6 +29445,9 @@ void SimPlayerManager::retirePveIdentity(uint64 identityId) {
 		progressionDirtyIds.drop(identityId);
 		progressionTrainingNextSteps.drop(identityId);
 		progressionTrainingPendingIds.drop(identityId);
+		progressionArmorWorn.drop(identityId);
+		progressionArmorChoices.drop(identityId);
+		progressionArmorBlockedReason.drop(identityId);
 		progressionRetiringIds.drop(identityId);
 	}
 	{
@@ -27211,8 +29752,27 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 	if (creoTempl == nullptr)
 		return nullptr;
 
-	String objectTemplate = creatureManager->getTemplateToSpawn(
-		templateName.hashCode());
+	const bool plannedNoviceBody = !identity.trainingPlan.isEmpty() &&
+		!noviceBodyTemplate.isEmpty() && templateName == noviceBodyTemplate;
+	String objectTemplate;
+	if (identity.profession == "harness") {
+		Locker parityLock(&playerBotParityTestMutex);
+		if (playerBotParityBodyTemplateOverrides.contains(identity.id))
+			objectTemplate = playerBotParityBodyTemplateOverrides.get(identity.id);
+	}
+	if (plannedNoviceBody && objectTemplate.isEmpty()) {
+		const Vector<String>& bodyTemplates = creoTempl->getTemplates();
+		std::vector<String> bodyKeys;
+		for (int i = 0; i < bodyTemplates.size(); ++i)
+			bodyKeys.push_back(bodyTemplates.get(i));
+		const int selectedBody = SimBotAppearance::chooseBody(identity.id,
+			bodyKeys);
+		if (selectedBody >= 0)
+			objectTemplate = bodyKeys[selectedBody];
+	}
+	if (objectTemplate.isEmpty())
+		objectTemplate = creatureManager->getTemplateToSpawn(
+			templateName.hashCode());
 	CreatureObject* creature = creatureManager->createCreature(
 		objectTemplate.hashCode(), false, templateName.hashCode());
 	if (creature == nullptr)
@@ -27258,8 +29818,63 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 		playerBotCombatAbilityChanceOverride(identity.id);
 	SimBotBodyProgression bodyProgression =
 		buildBodyProgressionSnapshot(identity.id, applicability);
+	Vector<SimBotPreparedArmorCopy> spawnArmorCopies;
+	Vector<SimBotWornArmorPiece> spawnWorn;
+	Vector<String> spawnArmorSkills;
+	const bool armorSpawnGate =
+		playerBotArmorLoadoutGateEnabled(identity.id);
+	if (armorSpawnGate) {
+		Vector<SimBotArmorLoadout::ArmorStats> ignoredCandidates;
+		snapshotPlayerBotArmorCandidates(identity.id, ignoredCandidates,
+			spawnArmorSkills);
+		{
+			Locker progressionLock(&progressionMutex);
+			if (progressionArmorWorn.contains(identity.id))
+				spawnWorn = progressionArmorWorn.get(identity.id);
+		}
+		for (int i = 0; i < spawnWorn.size(); ++i) {
+			spawnWorn.get(i).copyOid = 0;
+			spawnWorn.get(i).bodyOid = 0;
+			spawnWorn.get(i).onBody = false;
+			if (spawnWorn.get(i).pendingRemoval ||
+					spawnWorn.get(i).sourceOid == 0)
+				continue;
+			SimBotPreparedArmorCopy prepared;
+			prepared.sourceOid = spawnWorn.get(i).sourceOid;
+			prepared.stats.healthEncumbrance = spawnWorn.get(i).healthEncumbrance;
+			prepared.stats.actionEncumbrance = spawnWorn.get(i).actionEncumbrance;
+			prepared.stats.mindEncumbrance = spawnWorn.get(i).mindEncumbrance;
+			ZoneServer* sourceZoneServer = ServerCore::getZoneServer();
+			ManagedReference<SceneObject*> source =
+				sourceZoneServer == nullptr ? nullptr :
+				sourceZoneServer->getObject(prepared.sourceOid);
+			ArmorObject* sourceArmor = source == nullptr ? nullptr :
+				cast<ArmorObject*>(source.get());
+			if (sourceArmor != nullptr) {
+				Locker sourceLock(sourceArmor);
+				fillPlayerBotArmorStats(sourceArmor, prepared.stats);
+			}
+			prepared.copy = clonePlayerBotArmorSource(prepared.sourceOid);
+			if (prepared.copy != nullptr)
+				spawnArmorCopies.add(prepared);
+		}
+	}
 	String fullName = identity.firstName + " " + identity.lastName;
 	bool equipped = false;
+	bool armorOnBody = false;
+	int spawnRewears = 0;
+	int spawnRewearDeferred = 0;
+	bool spawnArmorDirty = false;
+	bool spawnArmorIncompatible = false;
+	const SimBotArmorPolicy spawnArmorPolicy = snapshotPlayerBotArmorPolicy();
+	VectorMap<uint64, bool> spawnArmorCopyOids;
+	for (int i = 0; i < spawnWorn.size(); ++i)
+		if (spawnWorn.get(i).copyOid != 0)
+			spawnArmorCopyOids.put(spawnWorn.get(i).copyOid, true);
+	for (int i = 0; i < spawnArmorCopies.size(); ++i)
+		if (spawnArmorCopies.get(i).copy != nullptr)
+			spawnArmorCopyOids.put(spawnArmorCopies.get(i).copy->getObjectID(), true);
+	uint32 spawnBodyRaceCrc = 0;
 	{
 		Locker agentLock(agent);
 		// createCreature() alone leaves the agent uninitialized -
@@ -27267,6 +29882,8 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 		// level, bitmasks, combat stats, weapons) before any overrides
 		// (CreatureManagerImplementation.cpp:424). Same contract here.
 		agent->loadTemplateData(creoTempl);
+		if (plannedNoviceBody)
+			applyPlayerBotAppearanceLocked(agent, identity.id, objectTemplate);
 		// A starting player has a few hundred points in every pool, secondaries
 		// included; the mobile template gives the novice 400-500 primaries and
 		// secondaries at 1/100 of that. Set all nine pools before skill mods and
@@ -27290,6 +29907,53 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 			weaponTemplate, expectedWeaponXpType, restoreRealWeaponDamage, false,
 			loadoutSelection && loadoutChoice.source == SimBotLoadout::VAULT ?
 				&loadoutChoice.stats : nullptr);
+		const String bodyTemplate = agent->getObjectTemplate() == nullptr ?
+			String() : agent->getObjectTemplate()->getFullTemplateString();
+		if (spawnArmorPolicy.bodyRaces.contains(bodyTemplate))
+			spawnBodyRaceCrc = spawnArmorPolicy.bodyRaces.get(bodyTemplate);
+		// Re-wear only pieces already in W. A fresh body has no buff objects, so
+		// new vault choices wait for the ordinary buffed reconcile.
+		for (int i = 0; i < spawnArmorCopies.size(); ++i) {
+			SimBotPreparedArmorCopy& prepared = spawnArmorCopies.get(i);
+			SimBotArmorLoadout::UsableReason usability =
+				SimBotArmorLoadout::usability(prepared.stats, spawnBodyRaceCrc,
+					Factions::FACTIONNEUTRAL, spawnArmorSkills);
+			int secondaries[6] = {
+				agent->getHAM(CreatureAttribute::STRENGTH),
+				agent->getHAM(CreatureAttribute::CONSTITUTION),
+				agent->getHAM(CreatureAttribute::QUICKNESS),
+				agent->getHAM(CreatureAttribute::STAMINA),
+				agent->getHAM(CreatureAttribute::FOCUS),
+				agent->getHAM(CreatureAttribute::WILLPOWER)};
+			if (usability == SimBotArmorLoadout::RACE ||
+					usability == SimBotArmorLoadout::FACTION) {
+				spawnArmorIncompatible = true;
+				spawnArmorDirty = true;
+				++spawnRewearDeferred;
+				continue;
+			}
+			if (!SimBotArmorLoadout::passesEncumbrance(prepared.stats,
+					secondaries) || !equipPlayerBotArmorCopyLocked(agent,
+					prepared.copy, false, spawnArmorCopyOids)) {
+				spawnArmorDirty = true;
+				armorRewearDeferred.increment();
+				++spawnRewearDeferred;
+				continue;
+			}
+			armorOnBody = true;
+			armorRewears.increment();
+			++spawnRewears;
+			for (int j = 0; j < spawnWorn.size(); ++j) {
+				if (spawnWorn.get(j).sourceOid == prepared.sourceOid) {
+					spawnWorn.get(j).copyOid = prepared.copy->getObjectID();
+					spawnWorn.get(j).bodyOid = agent->getObjectID();
+					spawnWorn.get(j).onBody = true;
+					spawnWorn.get(j).pendingRemoval = false;
+					break;
+				}
+			}
+		}
+		agent->setSimBotWornArmor(armorOnBody);
 		if (identity.deaths > 0 && pveCloneWoundAmount > 0) {
 			for (uint8 pool = CreatureAttribute::HEALTH;
 					pool <= CreatureAttribute::WILLPOWER; ++pool) {
@@ -27318,12 +29982,39 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 		// combatants which use ATTACKABLE|OVERT).
 		applySimNpcPresentation(agent, ObjectFlag::PLAYER | ObjectFlag::ATTACKABLE);
 	}
+	for (int i = 0; i < spawnArmorCopies.size(); ++i) {
+		bool retained = false;
+		for (int j = 0; j < spawnWorn.size(); ++j)
+			if (spawnWorn.get(j).copyOid ==
+					spawnArmorCopies.get(i).copy->getObjectID() &&
+					spawnWorn.get(j).onBody)
+				retained = true;
+		if (!retained)
+			destroyPlayerBotArmorCopy(spawnArmorCopies.get(i).copy);
+	}
 	if (!equipped) {
 		// Never publish or place a body that combat cannot arm.
 		Locker agentLock(agent);
 		agent->destroyObjectFromWorld(true);
 		agent->destroyObjectFromDatabase(true);
 		return nullptr;
+	}
+	{
+		Locker progressionLock(&progressionMutex);
+		progressionArmorBodyRaceCrc.put(identity.id, spawnBodyRaceCrc);
+	}
+	if (spawnRewears > 0 || spawnRewearDeferred > 0)
+		MissionDiagLog::event("LOADOUT_ARMOR", identity.id,
+			"action=rewear worn=" + String::valueOf(spawnRewears) +
+			" deferred=" + String::valueOf(spawnRewearDeferred));
+	if (armorSpawnGate) {
+		Locker progressionLock(&progressionMutex);
+		if (spawnWorn.size() > 0)
+			progressionArmorWorn.put(identity.id, spawnWorn);
+		else
+			progressionArmorWorn.drop(identity.id);
+		if (spawnArmorDirty || spawnArmorIncompatible)
+			progressionArmorDirtyIds.put(identity.id, true);
 	}
 	if (loadoutSelection) {
 		Locker progressionLock(&progressionMutex);
@@ -28493,8 +31184,17 @@ void SimPlayerManager::recordPveBuffSource(uint64 bodyOid,
 	if (bodyOid == 0 || source.isEmpty())
 		return;
 
-	Locker pveLock(&pveMutex);
-	pveBuffLastSourceByBody.put(bodyOid, source);
+	uint64 identityId = 0;
+	{
+		Locker pveLock(&pveMutex);
+		pveBuffLastSourceByBody.put(bodyOid, source);
+		if (pveBodyIdentityIds.contains(bodyOid))
+			identityId = pveBodyIdentityIds.get(bodyOid);
+	}
+	if (identityId != 0) {
+		Locker progressionLock(&progressionMutex);
+		progressionArmorDirtyIds.put(identityId, true);
+	}
 }
 
 bool SimPlayerManager::choosePveHuntSpawnPoint(

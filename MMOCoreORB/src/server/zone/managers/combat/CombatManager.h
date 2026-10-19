@@ -103,6 +103,18 @@ public:
 private:
 	void initializeDefaultAttacks();
 
+	struct WornArmorReductionResult {
+		float damage = 0.f;
+		float absorbed = 0.f;
+	};
+
+	WornArmorReductionResult applyWornArmorReduction(
+		CreatureObject* defender, DefenderHitList* hitList, float damage,
+		int damageType, int armorPiercing, int hitLocation) const;
+	WornArmorReductionResult applyWornArmorBlastReduction(
+		TangibleObject* attacker, CreatureObject* defender, float damage,
+		int armorPiercing, uint8 hitLocation) const;
+
 public:
 	CombatManager() {
 		setLoggingName("CombatManager");

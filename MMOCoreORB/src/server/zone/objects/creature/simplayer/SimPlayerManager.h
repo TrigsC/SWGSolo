@@ -33,6 +33,8 @@
 #include "server/zone/objects/creature/simplayer/SimBotAbilityUsageLog.h"
 #include "server/zone/objects/creature/simplayer/SimBotMissionPlacement.h"
 #include "server/zone/objects/creature/simplayer/SimBotLoadout.h"
+#include "server/zone/objects/creature/simplayer/SimBotArmorLoadout.h"
+#include "server/zone/objects/creature/simplayer/SimBotAppearance.h"
 
 using namespace server::zone;
 
@@ -62,6 +64,75 @@ class PlayerBotParityTestRunnerTask;
 class HiveCrafterConsumerTask;
 class SimHunterController;
 class SimPveFoundationMaintenanceTask;
+
+namespace server {
+namespace zone {
+namespace objects {
+namespace tangible {
+namespace wearables {
+class ArmorObject;
+}
+}
+}
+}
+}
+
+using namespace server::zone::objects::tangible::wearables;
+
+struct SimBotWornArmorPiece {
+	uint64 sourceOid = 0;
+	String slotKey;
+	int healthEncumbrance = 0;
+	int actionEncumbrance = 0;
+	int mindEncumbrance = 0;
+	uint64 copyOid = 0;
+	uint64 bodyOid = 0;
+	bool onBody = false;
+	bool pendingRemoval = false;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct SimBotArmorPolicy {
+	bool enabled = false;
+	int minUpgradePercent = 10;
+	int fullSweepMinutes = 30;
+	SimBotArmorLoadout::ArmorScoringConfig scoring;
+	VectorMap<String, uint32> bodyRaces;
+	bool bazaarUpgrades = false;
+	float upgradeSpendFraction = 0.5f;
+	int maxUpgradeLoadsPerVisit = 8;
+	int bodyHamBaseline = 0;
+};
+
+struct SimBotBodyArmorContext {
+	uint64 bodyOid = 0;
+	uint32 bodyRaceCrc = 0;
+	int secondaries[6] = {};
+	int maxSecondaries[6] = {};
+	unsigned int buffedPools = 0;
+	bool inCombat = false;
+	Vector<SimBotWornArmorPiece> wornCopies;
+};
+
+struct SimBotPreparedArmorCopy {
+	uint64 sourceOid = 0;
+	SimBotArmorLoadout::ArmorStats stats;
+	ManagedReference<ArmorObject*> copy;
+
+	// Engine containers require these; prepared copies are never serialized.
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct SimBotStowedClothing {
+	ManagedReference<SceneObject*> object;
+	Vector<String> slots;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
 
 struct StructureTraversalTestScenario {
     String name;
@@ -731,9 +802,13 @@ struct SimBotBazaarListingTemplate {
 	int gameObjectType = 0;
 	int junkValue = 0;
 	bool isWeapon = false;
+	bool isArmor = false;
 	String xpType;
 	float score = 0.f;
 	Vector<String> certificationsRequired;
+	// Raw armor properties only; the score is computed under the live policy
+	// at use, so a hot-reloaded weighting never reads a stale cached score.
+	SimBotArmorLoadout::ArmorStats armorStats;
 	uint64 lastUsedAtMs = 0;
 };
 
@@ -824,6 +899,18 @@ struct PlayerBotParityTestStep {
 	int expectedMaxDamage = -1;
 	bool hasExpectedMinDamage = false;
 	bool hasExpectedMaxDamage = false;
+	int armorRating = 0;
+	bool hasArmorRating = false;
+	int armorResist = 0;
+	bool hasArmorResist = false;
+	int armorHealthEncumbrance = 0;
+	int armorActionEncumbrance = 0;
+	int armorMindEncumbrance = 0;
+	int armorCondition = 0;
+	bool hasArmorCondition = false;
+	String armorFaction;
+	String armorRace;
+	String buffPool;
 	float attackSpeed = 0.f;
 	bool hasAttackSpeed = false;
 	bool loadoutTemplateComplete = false;
@@ -2546,10 +2633,27 @@ private:
 	Vector<uint64> progressionOrphanIds;
 	VectorMap<uint64, SimBotEarlyGameState> progressionEarlyGameStates;
 	VectorMap<uint64, SimBotLoadout::LoadoutChoice> progressionLoadoutChoices;
+	VectorMap<uint64, Vector<SimBotWornArmorPiece> > progressionArmorWorn;
+	VectorMap<uint64, SimBotArmorLoadout::ArmorChoice> progressionArmorChoices;
+	VectorMap<uint64, String> progressionArmorBlockedReason;
+	// Clothing temporarily displaced by a sim armor copy. This leaf map is
+	// never held while taking an object or manager lock.
+	Mutex armorClothingMutex;
+	VectorMap<uint64, Vector<SimBotStowedClothing> > armorStowedClothing;
 	VectorMap<uint64, SimBotCertificationCache> progressionCertificationCache;
 	VectorMap<uint64, bool> progressionLoadoutDirtyIds;
+	// F_0.9.13: armor keeps its own retry mark so a weapon reapply never
+	// clears a deferred armor reconcile, and vice versa. Shared triggers
+	// (loot, purchase, training, item reconcile) mark both.
+	VectorMap<uint64, bool> progressionArmorDirtyIds;
+	// Body race per identity, cached at spawn and on every body-context
+	// snapshot so SELL protection never needs the agent lock.
+	VectorMap<uint64, uint32> progressionArmorBodyRaceCrc;
 	uint64 progressionLoadoutLastFullSweepMs = 0;
+	uint64 progressionArmorLastFullSweepMs = 0;
 	VectorMap<uint64, uint64> progressionBazaarUpgradeScanAtMs;
+	VectorMap<uint64, uint64> progressionArmorUpgradeScanAtMs;
+	SimBotArmorPolicy progressionArmorPolicy;
 	bool progressionEnabled = false;
 	bool progressionAwardKillXp = false;
 	bool progressionAwardMissionCredits = false;
@@ -2710,6 +2814,12 @@ private:
 	AtomicLong bazaarBuyUpgradesSkippedUncertified;
 	AtomicLong bazaarBuyUpgradesSkippedOverBudget;
 	AtomicLong bazaarBuyUpgradesSkippedUnaffordable;
+	AtomicLong bazaarBuyArmorUpgradesDebited;
+	AtomicLong bazaarBuyArmorUpgradesSkippedNotBetter;
+	AtomicLong bazaarBuyArmorUpgradesSkippedUnusable;
+	AtomicLong bazaarBuyArmorUpgradesSkippedTooEncumbering;
+	AtomicLong bazaarBuyArmorUpgradesSkippedOverBudget;
+	AtomicLong bazaarBuyArmorUpgradesSkippedUnaffordable;
 	AtomicLong bazaarBuyReconcileCommitted;
 	AtomicLong bazaarBuyReconcileRefunded;
 	AtomicLong bazaarSkippedNeeded;
@@ -2722,6 +2832,21 @@ private:
 	AtomicLong loadoutHysteresisHolds;
 	AtomicLong loadoutReequipsDeferredInCombat;
 	AtomicLong loadoutSellProtected;
+	AtomicLong armorMitigationHits;
+	AtomicLong armorMitigatedDamage;
+	AtomicLong armorSelections;
+	AtomicLong armorEquips;
+	AtomicLong armorRemovals;
+	AtomicLong armorRewears;
+	AtomicLong armorRewearDeferred;
+	AtomicLong armorDeferredUnbuffed;
+	AtomicLong armorDeferredInCombat;
+	AtomicLong armorDeferredEncumbrance;
+	AtomicLong armorSkippedRace;
+	AtomicLong armorSkippedFaction;
+	AtomicLong armorSkippedCert;
+	AtomicLong armorSkippedNoCoverage;
+	AtomicLong armorHysteresisHolds;
 	AtomicLong bazaarVisitsBegun;
 	AtomicLong bazaarVisitsListedAny;
 	AtomicLong bazaarVisitsBought;
@@ -2848,6 +2973,7 @@ private:
 	VectorMap<uint64, int64> playerBotParityTestCreditBaselines;
 	VectorMap<String, uint64> playerBotParityTestRequestRefs;
 	VectorMap<String, uint64> playerBotParityTestIdentityRefs;
+	VectorMap<uint64, String> playerBotParityAppearanceSnapshots;
 	VectorMap<String, uint64> playerBotParityTestCounterBaselines;
 	VectorMap<uint64, String> playerBotParityItemStatSnapshots;
 	int playerBotParityTestScenarioIndex = 0;
@@ -2884,6 +3010,13 @@ private:
 	bool playerBotParityTestGateOverride = true;
 	bool playerBotParityTestLoadoutGateOverrideActive = false;
 	bool playerBotParityTestLoadoutGateOverride = false;
+	bool playerBotParityTestArmorGateOverrideActive = false;
+	bool playerBotParityTestArmorGateOverride = false;
+	VectorMap<uint64, bool> playerBotParityArmorGateScopedIds;
+	// Harness-only body template per identity (setBodyTemplate): pins a
+	// species so armor scenarios do not depend on the seeded body pick.
+	VectorMap<uint64, String> playerBotParityBodyTemplateOverrides;
+	VectorMap<uint64, bool> playerBotParityArmorGateValues;
 	VectorMap<uint64, bool> playerBotParityLoadoutGateScopedIds;
 	VectorMap<uint64, bool> playerBotParityLoadoutGateValues;
 	VectorMap<uint64, bool> playerBotParityBazaarUpgradesGateScopedIds;
@@ -2892,6 +3025,7 @@ private:
 		playerBotParityLoadoutHarnessOptIns;
 	VectorMap<uint64, Vector<String> > playerBotParityLoadoutCertOverrides;
 	VectorMap<String, uint64> playerBotParityLoadoutWeaponRefs;
+	VectorMap<String, uint64> playerBotParityArmorRefs;
 	bool playerBotParityTestTrainingGateOverrideActive = false;
 	bool playerBotParityTestTrainingGateOverride = false;
 	bool playerBotParityTestTrainingGateOverridePreviousActive = false;
@@ -2921,6 +3055,8 @@ private:
 	bool playerBotParityTestLootCapOverrideActive = false;
 	int playerBotParityTestLootCapOverridePrevious = 80;
 	AtomicBoolean playerBotParityTestFailItemTransfer{false};
+	AtomicBoolean playerBotParityTestFailArmorTransfer{false};
+	AtomicLong playerBotParityTestFailArmorTransferIdentity{0};
 	AtomicBoolean playerBotParityTestSuppressBazaarSalePod{false};
 	AtomicBoolean playerBotParityTestSuppressBazaarPurchaseExecute{false};
 	bool playerBotParityTestBuyLoadLimitOverrideActive = false;
@@ -3380,6 +3516,31 @@ private:
 		Vector<SimBotLoadout::WeaponStats>& candidates,
 		Vector<String>& certsHeld, Vector<String>& certsPlanned,
 		Vector<String>& planXpTypes);
+	SimBotArmorPolicy snapshotPlayerBotArmorPolicy();
+	void fillPlayerBotArmorStats(ArmorObject* armor,
+		SimBotArmorLoadout::ArmorStats& stats);
+	bool snapshotPlayerBotArmorCandidates(uint64 identityId,
+		Vector<SimBotArmorLoadout::ArmorStats>& candidates,
+		Vector<String>& trainedSkills);
+	bool snapshotPlayerBotBodyArmorContext(uint64 identityId,
+		const SimBotArmorPolicy& policy,
+		SimBotBodyArmorContext& context);
+	bool selectPlayerBotArmor(uint64 identityId,
+		SimBotArmorLoadout::ArmorChoice& out, bool preview = false);
+	void collectPlayerBotProtectedArmorOids(uint64 identityId,
+		VectorMap<uint64, bool>& protectedIds);
+	ManagedReference<ArmorObject*> clonePlayerBotArmorSource(uint64 sourceOid);
+	bool equipPlayerBotArmorCopyLocked(AiAgent* agent, ArmorObject* copy,
+		bool notifyClient, const VectorMap<uint64, bool>& armorCopyOids);
+	void removePlayerBotArmorCopyLocked(AiAgent* agent, ArmorObject* copy,
+		bool notifyClient, const VectorMap<uint64, bool>& armorCopyOids);
+	void destroyPlayerBotArmorCopy(ArmorObject* copy);
+	void applyPlayerBotAppearanceLocked(AiAgent* agent, uint64 identityId,
+		const String& bodyTemplate);
+	bool snapshotPlayerBotAppearance(uint64 identityId, String& fingerprint);
+	void sweepPlayerBotArmorClothing();
+	void reconcilePlayerBotArmorOnLiveBody(uint64 identityId,
+		bool respawn = false, bool forceDrain = false);
 	void reapplyPlayerBotProgressionToLiveBody(uint64 identityId);
 	void applyPlayerBotParityTestConfig(LuaObject& config);
 	void loadPveIdentityRoster();
@@ -3501,6 +3662,8 @@ private:
 		int amount, const String& source);
 	bool playerBotProgressionAwardGateEnabled();
 	bool playerBotLoadoutGateEnabled(uint64 identityId);
+	bool playerBotArmorLoadoutGateEnabled(uint64 identityId);
+	bool playerBotArmorBazaarUpgradesGateEnabled(uint64 identityId);
 	bool playerBotBazaarUpgradesGateEnabled(uint64 identityId);
 	bool playerBotBazaarSellGateEnabled(uint64 identityId);
 	bool playerBotBazaarBuyGateEnabled(uint64 identityId);
@@ -4159,6 +4322,21 @@ private:
 
 public:
 	SimPlayerManager();
+
+	// Called from CombatManager's flagged-AI armor path.  This deliberately
+	// takes no manager mutex: combat may be running on a worker thread.
+	void markPlayerBotLoadoutDirtyLocked(uint64 identityId) {
+		progressionLoadoutDirtyIds.put(identityId, true);
+		progressionArmorDirtyIds.put(identityId, true);
+	}
+
+	void recordSimBotArmorMitigation(float absorbedDamage) {
+		if (absorbedDamage <= 0.f)
+			return;
+
+		armorMitigationHits.increment();
+		armorMitigatedDamage.add(static_cast<uint64>(absorbedDamage));
+	}
 
 	// P.10a award surface. Callers resolve a body to a roster identity first;
 	// these functions deliberately require an already-loaded record and never

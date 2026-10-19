@@ -8,10 +8,11 @@ novice early-game loop) is IMPLEMENTED on `feat/p10g-novice-early-game-loop`,
 building warning-clean, and awaiting its live receipt — see §5c for why it was
 inserted ahead of the bazaar work. **F_0.9.10** (P.10k, bazaar BUY) is RELEASED
 as v0.9.12 (2026-10-16). **F_0.9.12** (P.10m, weapon loadout) was inserted next
-on the owner's request and is RELEASED as v0.9.13 (2026-10-17). Next chunk:
-**F_0.9.11** (P.10l, profession allocation policy).
+on the owner's request and is RELEASED as v0.9.13 (2026-10-17), followed by **F_0.9.13** (P.10n,
+armor loadout with visible armor, ten species and a fixed look per bot), RELEASED as v0.9.14
+(2026-10-18). Next chunk: **F_0.9.11** (P.10l, profession allocation policy).
 **Written**: 2026-09-02 (project week 8)
-**Last updated**: 2026-10-17 — F_0.9.12 weapon loadout released as v0.9.13
+**Last updated**: 2026-10-18 — F_0.9.13 armor loadout released as v0.9.14
 
 ## 0. Mandate
 
@@ -622,6 +623,16 @@ F_0.9.0 store+dashboard+reaper+harness
 - **Test strategy**: seeded listing → bot buys → store debited by price,
   item in vault + ledger; insufficient credits → skipped; human-listing policy
   predicate asserted; gate-off → zero purchases.
+
+### F_0.9.13 — Armor loadout (P.10n) — RELEASED as v0.9.14 (2026-10-18)
+
+> Released. See `F_0.9.13_p10n-armor-loadout.plan.md`. Bots wear the best usable vault armor per
+> slot as transient copies that combat mitigates with the player armor math. New armor goes on only
+> while buffed, worn armor stays through buff loss and respawn, and encumbrance is real. SELL
+> protects worn armor and the best spare per slot, and a sub-gate buys clearly better pieces.
+> Amendment A (owner, after an in-client check) moved bots to clothing-free vendor bodies across
+> ten species with server clothing and a fixed per-bot look, so armor is visible. Deferred: the
+> PSG and vault-item condition decay.
 
 ### F_0.9.12 — Weapon loadout (P.10m) — RELEASED as v0.9.13 (2026-10-17)
 

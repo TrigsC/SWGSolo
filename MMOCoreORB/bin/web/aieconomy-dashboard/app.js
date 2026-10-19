@@ -344,6 +344,9 @@
     const listings = Array.isArray(data.listings) ? data.listings : [];
     const purchases = Array.isArray(data.purchases) ? data.purchases : [];
     const loadout = data.loadout || {};
+    const armor = data.armor || {};
+    const armorWorn = Array.isArray(armor.worn) ? armor.worn : [];
+    const armorDesired = Array.isArray(armor.desired) ? armor.desired : [];
     const loadoutProtected = Array.isArray(loadout.protected) ? loadout.protected : [];
     const loadoutCandidates = Array.isArray(loadout.candidates) ? loadout.candidates : [];
     const protectedByOid = new Map(loadoutProtected.map((item) => [String(item.oid), item]));
@@ -397,6 +400,23 @@
     const loadoutCurrent = loadoutCurrentRow
       ? table(["Source", "Source OID", "Template", "XP Type", "DPS", "Desired XP Type", "Complete", "Protected", "Candidates"], loadoutCurrentRow, { scrollKey: "playerbot-loadout-summary" })
       : `<span class="muted small">No loadout choice recorded.</span>`;
+    const armorRows = armorWorn.map((piece) => `<tr>
+      <td class="t-num">${esc(piece.sourceOid || "—")}</td>
+      <td class="t-num">${esc(piece.copyOid || "—")}</td>
+      <td>${esc(piece.slotKey || "unknown")}</td>
+      <td>${esc(piece.template || "unknown")}</td>
+      <td class="t-num">${num(piece.rating)}</td>
+      <td>${piece.condition == null ? "—" : `${num(piece.condition)} / ${num(piece.maxCondition)}`}</td>
+      <td>${chip(piece.onBody ? "on body" : piece.pendingRemoval ? "tombstone" : "deferred", piece.onBody ? "ok" : "ghost")}</td>
+    </tr>`).join("");
+    const armorDesiredRows = armorDesired.map((piece) => `<tr>
+      <td>${esc(piece.slotKey || "unknown")}</td>
+      <td class="t-num">${esc(piece.oid || "—")}</td>
+      <td>${esc(piece.template || "unknown")}</td>
+      <td class="t-num">${Number(piece.score || 0).toFixed(3)}</td>
+      <td>${chip(labelize(piece.status || "unknown"), piece.status === "kept" ? "ok" : "ghost")}</td>
+      <td>${esc(piece.reason || "unknown")}</td>
+    </tr>`).join("");
 
     return `<div class="playerbot-card"><h3>WHO</h3><p class="playerbot-lead">${esc(identity.name || "Unnamed SimBot")}</p>
       ${kvRows([["Profession", esc(labelize(identity.profession || "unknown"))], ["Home", esc(home)], ["Tier", num(identity.skillTier)], ["Kills / deaths", `${num(identity.kills)} / ${num(identity.deaths)}`], ["Activity", esc(labelize(activity))], ["Body", body.attached ? `attached · ${esc(body.zone || "unknown")}` : "not attached"], ["Lair members alive", num(body.lairMembersAlive)], ["Non-member engagements", num(body.nonMemberEngagements)]])}</div>
@@ -415,6 +435,7 @@
       <div class="playerbot-card"><h3>LISTINGS (${num(listings.length)})</h3>${table(["OID", "Item", "State", "Price", "Listed", "Closed", "Released", "Buyer"], listingRows, { scrollKey: "playerbot-listings", tall: true })}</div>
       <div class="playerbot-card"><h3>PURCHASES (${num(purchases.length)})</h3>${table(["Auction", "Template", "State", "Seller", "Price", "Debited", "Closed"], purchaseRows, { scrollKey: "playerbot-purchases", tall: true })}</div>
       <div class="playerbot-card"><h3>LOADOUT</h3>${loadoutCurrent}<p class="playerbot-label">WEAPON CANDIDATES (${num(loadoutCandidates.length)}) · PROTECTED ${num(loadoutProtected.length)}</p>${table(["OID", "Template", "XP Type", "DPS", "Certified", "Protected"], loadoutCandidateRows, { scrollKey: "playerbot-loadout", tall: true })}</div>
+      <div class="playerbot-card"><h3>ARMOR</h3><p class="playerbot-label">${chip(armor.enabled ? "gate on" : "gate off", armor.enabled ? "ok" : "ghost")} · ${chip(armor.simBotWornArmor ? "player mitigation" : "not flagged", armor.simBotWornArmor ? "teal" : "ghost")} · ${esc(armor.blockedReason || "no blocker")}</p>${kvRows([["Buffed pools", Object.entries(armor.buffedPools || {}).filter(([, value]) => value).map(([key]) => labelize(key)).join(", ") || "none"], ["Total encumbrance", num(armor.totalEncumbrance)], ["Mitigated total", num(armor.mitigatedTotal)], ["Race CRC", armor.bodyRaceCrc || "unknown"]])}${table(["Source OID", "Copy OID", "Slot", "Template", "Rating", "Condition", "State"], armorRows, { scrollKey: "playerbot-armor", tall: true })}<p class="playerbot-label">DESIRED SET (${num(armorDesired.length)})</p>${table(["Slot", "OID", "Template", "Score", "Status", "Usability"], armorDesiredRows, { scrollKey: "playerbot-armor-desired" })}</div>
       <div class="playerbot-card"><h3>SKILL MODS</h3>${modRows ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Mod</th><th>Base</th><th>Trained</th><th>Effective</th></tr></thead><tbody>${modRows}</tbody></table></div>` : `<span class="muted small">No live skill mods.</span>`}</div>`;
   }
 
@@ -1274,6 +1295,8 @@
     const bazaarReconcile = bazaar.reconcile || {};
     const loadout = progression.loadout || {};
     const loadoutUpgrades = loadout.upgrades || (bazaar.buy || {}).upgrades || {};
+    const armor = progression.armor || {};
+    const armorUpgrades = bazaarBuy.armorUpgrades || {};
     const vault = progression.vault || {};
     const ledger = progression.ledger || {};
     const trainingGate = progression.gates && progression.gates.trainingEnabled === true;
@@ -1439,6 +1462,7 @@
             ["Buy", `${chip(bazaarBuy.configured ? "configured" : "config off", bazaarBuy.configured ? "ok" : "ghost")} · ${chip(bazaarBuy.enabled ? "gate on" : "gate off", bazaarBuy.enabled ? "ok" : "ghost")} · ${num(bazaarBuy.pending)} pending · ${num(bazaarBuy.debited)} debited · ${num(bazaarBuy.bought)} bought · ${num(bazaarBuy.refunded)} refunded · ${num(bazaarBuy.spent)} spent · reserve ${num(bazaarBuy.reserveCredits)}`],
             ["Buy payments", `${num(bazaarBuy.paidToHumans)} human · ${num(bazaarBuy.paidToBots)} bot · ${num(bazaarBuy.paidToSeeder)} seeder`],
             ["Buy skipped", `${num(bazaarBuySkipped.noNeed)} no need · ${num(bazaarBuySkipped.noListing)} no listing · ${num(bazaarBuySkipped.overCeiling)} ceiling · ${num(bazaarBuySkipped.noCeiling)} no ceiling · ${num(bazaarBuySkipped.unaffordable)} unaffordable · ${num(bazaarBuySkipped.ownListing)} own · ${num(bazaarBuySkipped.sellerUnresolved)} seller · ${num(bazaarBuySkipped.lostRace)} race · ${num(bazaarBuySkipped.priceChanged)} price · ${num(bazaarBuySkipped.transferFailed)} transfer · ${num(bazaarBuySkipped.timeout)} timeout`],
+            ["Armor upgrades", `${num(armorUpgrades.debited)} debited · ${num(armorUpgrades.skippedNotBetter)} not better · ${num(armorUpgrades.skippedUnusable)} unusable · ${num(armorUpgrades.skippedTooEncumbering)} too encumbering · ${num(armorUpgrades.skippedOverBudget)} over budget · ${num(armorUpgrades.skippedUnaffordable)} unaffordable`],
             ["Buy reconcile", `${num((bazaarBuy.reconcile || {}).committed)} committed · ${num((bazaarBuy.reconcile || {}).refunded)} refunded`],
             ["Settlement", `${num(bazaar.saleUnresolved)} unresolved · ${num(bazaar.saleBacklogOverflow)} backlog overflow · ${num(bazaar.releaseBuyerGone)} buyer gone · ${num(bazaar.deleteBlockedByListing)} delete blocked`],
             ["Reconcile", `${num(bazaarReconcile.adopted)} adopted · ${num(bazaarReconcile.settled)} settled · ${num(bazaarReconcile.reversed)} reversed · ${num(bazaarReconcile.retrieved)} retrieved · ${num(bazaarReconcile.orphaned)} orphaned · ${num(bazaarReconcile.adoptedTaxEstimated)} tax estimated · ${num(bazaarReconcile.releasedRepaired)} releases repaired`]
@@ -1455,6 +1479,22 @@
             ["Selection skips", `${num(loadout.skippedUncertified)} uncertified · ${num(loadout.skippedWrongClass)} wrong class · ${num(loadout.reequipsDeferredInCombat)} deferred in combat`],
             ["Upgrade skips", `${num(loadoutUpgrades.skippedNotBetter)} not better · ${num(loadoutUpgrades.skippedUncertified)} uncertified · ${num(loadoutUpgrades.skippedOverBudget)} over budget · ${num(loadoutUpgrades.skippedUnaffordable)} unaffordable`],
             ["Upgrade policy", `${num(loadout.minUpgradePercent)}% minimum · ${num(loadout.upgradeSpendFraction)} spend fraction · scan every ${num(loadout.upgradeScanIntervalMinutes)}m · ${num(loadout.maxUpgradeLoadsPerVisit)} loads/visit`]
+          ])}`, "span-12")}
+          <div class="section-gap"></div>
+          ${panel("ARMOR", `${chip(armor.configured ? "configured" : "config off", armor.configured ? "ok" : "ghost")} ${chip(armor.enabled ? "gate on" : "gate off", armor.enabled ? "ok" : "ghost")} ${chip(armor.bazaarUpgrades ? "bazaar upgrades" : "no bazaar upgrades", armor.bazaarUpgrades ? "teal" : "ghost")}`, `<div class="metric-row">
+            ${metric("Wearing bots", armor.wornBots)}
+            ${metric("Worn pieces", armor.wornPieces, { tone: "accent" })}
+            ${metric("Selections", armor.selections)}
+            ${metric("Equips", armor.equips, { tone: "accent" })}
+            ${metric("Removals", armor.removals)}
+            ${metric("Rewears", armor.rewears)}
+            ${metric("Mitigation hits", armor.mitigationHits, { tone: "teal" })}
+            ${metric("Mitigated damage", armor.mitigatedDamage)}
+          </div>${kvRows([
+            ["Deferred", `${num(armor.deferredUnbuffed)} unbuffed · ${num(armor.deferredInCombat)} combat · ${num(armor.deferredEncumbrance)} encumbrance · ${num(armor.rewearDeferred)} rewear`],
+            ["Usability skips", `${num(armor.skippedRace)} race · ${num(armor.skippedFaction)} faction · ${num(armor.skippedCert)} cert · ${num(armor.skippedNoCoverage)} no coverage`],
+            ["Hysteresis", num(armor.hysteresisHolds)],
+            ["Policy", `${num(armor.minUpgradePercent)}% minimum · ${Number(armor.upgradeSpendFraction || 0).toFixed(2)} spend fraction · ${num(armor.maxUpgradeLoadsPerVisit)} loads/visit`]
           ])}`, "span-12")}
           <div class="section-gap"></div>
           ${kvRows([
