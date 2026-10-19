@@ -2,650 +2,340 @@
 
 ## 1. How to Read This Document
 
-This document describes the architecture of **SWGSolo**, a heavily-modified fork
-of **Core3** — the C++ server emulator for *Star Wars Galaxies* (Pre-CU era),
-maintained upstream by the SWGEmu project. It is written for a future
-AI-assisted development session (this project's primary collaborator is an
-LLM coding agent, not a team) picking up work on the fork without prior
-context. Read this before planning or implementing any change
-(`TRIP-1-plan` / `TRIP-2-implement` require it).
-
-Sections 2-7 are universal background on the engine as inherited from
-upstream SWGEmu. Sections 8+ cover architecture specific to this fork's
-active work: the **AI Economy simulation layer** (SimMiner NPCs, resource
-gathering, cross-planet dispatch) and the **AI PvP / Jedi archetype layer**
-(NPC squads, Force Rank System). These are the areas most likely to be
-touched by new plans — read them closely.
+**SWGSolo** is a heavily-modified fork of **Core3**, SWGEmu's C++ server emulator for *Star
+Wars Galaxies* (Pre-CU). Audience: an AI coding agent (the project's primary collaborator)
+starting without context; `TRIP-1-plan` / `TRIP-2-implement` require reading it. §2-11 are
+inherited engine background; §12-13 cover this fork's AI Economy (SimPlayers, PlayerBots) and
+AI PvP / Jedi layers, where new plans almost always land.
 
 ## 2. Overview
 
-Core3 is the server-side implementation of a 2003-era MMORPG: a persistent
-zoned game world (planets/cities), thousands of scripted NPCs, a full
-crafting/resource economy, combat, and a Lua-scripted quest/event layer,
-talking to a legacy SWG game client over a custom binary protocol. This fork
-(`TrigsC/SWGSolo`, tracking `swgemu/Core3` as `upstream`) repurposes that
-engine as a **single-player-capable, AI-driven economy sandbox**: hundreds of
-autonomous NPCs ("SimPlayers") are meant to gather resources, craft, fight,
-and progress Force ranks with no human players online, so the world stays
-"alive" unattended. That new behavior is **simulation-only by default**, with
-one approved exception: the P.10 PlayerBot player-parity line (from v0.9.0)
-may persist real progression for **roster** PlayerBots, each capability behind
-its own default-off gate. Everything else stays simulation-only until the owner
-explicitly approves an economy-mutating phase — see §12.
+Core3 serves a 2003-era MMO: zoned persistent world, scripted NPCs, crafting/resource economy,
+combat and a Lua quest layer, over SWG's binary protocol. This fork (`TrigsC/SWGSolo`, tracking
+`swgemu/Core3` as `upstream`) turns it into a **single-player-capable AI-driven economy
+sandbox**: hundreds of autonomous NPCs gather, craft, fight and rank up so the world stays alive
+with no humans online. New behavior is **simulation-only by default**; the one approved
+exception is the P.10 PlayerBot parity line (§12, "Simulation-only policy").
 
 ## 3. Technology Stack
 
-- **Language**: C++14 (server core), Lua 5.x (game logic/config/scripting), a
-  small amount of Go (`idlc-go`, a from-scratch reimplementation of the IDL
-  compiler).
-- **Build system**: CMake 3.7+ + Ninja, Clang ≥16 (preferred) or GCC ≥5.4,
-  `ccache`. 64-bit only.
-- **Persistence**: MySQL/MariaDB (`libmariadb-dev`) for accounts/characters;
-  a custom on-disk Berkeley DB (`libdb5.3`) object store (`db3`) for
-  distributed-object persistence; plus a local `navmesh.db`.
-- **Networking**: Custom binary SWG protocol (login/zone/ping/chat servers)
-  over UDP/TCP; `libcpprest` (C++ REST SDK) powers a small internal HTTPS
-  REST API (`RESTServer`) for the AI-economy dashboard, gated by Bearer
-  token, listening on TCP 44443.
-- **Testing**: GoogleTest/GoogleMock (vendored,
-  `MMOCoreORB/utils/googletest-release-1.13.0`), compiled directly into the
-  server binary (see §12).
-- **Containerization**: Docker (Debian bookworm image) is the sole supported
-  dev/build/run environment; see §6.
-- **Frontend (dashboard only)**: a small static 3-file SPA (HTML/CSS/vanilla
-  JS) served from `MMOCoreORB/bin/web/aieconomy-dashboard/`, no framework, no
-  build step.
+- **Language**: C++14 (core), Lua 5.x (logic/config), some Go (`idlc-go`, IDL compiler rewrite).
+- **Build**: CMake 3.7+ + Ninja, Clang ≥16 (preferred) or GCC ≥5.4, `ccache`, 64-bit only.
+- **Persistence**: MySQL/MariaDB (`libmariadb-dev`) for accounts/characters; Berkeley DB
+  (`libdb5.3`) object store for distributed objects; local `navmesh.db`.
+- **Networking**: custom SWG protocol (login/zone/ping/chat) over UDP/TCP; `libcpprest` powers
+  the HTTPS `RESTServer` (Bearer token, TCP 44443) for the dashboard.
+- **Testing**: GoogleTest/GoogleMock (`MMOCoreORB/utils/googletest-release-1.13.0`) compiled
+  into the server binary (see Testing Strategy).
+- **Container**: Docker (Debian bookworm) is the only supported dev/build/run environment (§6).
+- **Dashboard frontend**: static 3-file SPA (HTML/CSS/vanilla JS) in
+  `MMOCoreORB/bin/web/aieconomy-dashboard/`, no framework, no build step.
 
 ## 4. Project Structure
 
 ```
 workspace/Core3/                          # git repo root (branch: miner-ai; remotes: origin=TrigsC/SWGSolo, upstream=swgemu/Core3)
-├── docs/                                 # design docs + (new) TRIP docs
+├── docs/                                 # design docs + TRIP docs (1-plans, 2-changelog, 3-code-review, 4-unit-tests, 5-tuto)
 ├── docker/                               # Dockerfile, compose, build.sh/run.sh — the dev environment
-├── linux/, wsl2/                         # native (non-docker) bootstrap scripts, largely unused for this fork
-└── MMOCoreORB/                           # the actual server source tree
-    ├── CMakeLists.txt                    # top-level build config
+├── linux/, wsl2/                         # native bootstrap scripts, unused by this fork
+└── MMOCoreORB/                           # the server source tree
+    ├── CMakeLists.txt
     ├── src/
     │   ├── main.cpp, CoreProcess.h       # process entry point
     │   ├── server/
-    │   │   ├── zone/                     # THE GAME — see §8
-    │   │   │   ├── objects/              # every in-game entity type (creature, player, tangible, ship, resource...)
-    │   │   │   ├── managers/             # ~45 singleton subsystem managers (combat, crafting, jedi, aieconomy, ...)
-    │   │   │   └── ZoneServer / ZoneProcessServer / Zone.idl
-    │   │   ├── login/, ping/, status/, chat/   # the other network-facing servers
-    │   │   ├── web/                      # RESTServer + APIProxy* — the dashboard's backend, see §11
+    │   │   ├── zone/                     # THE GAME (§8): objects/ (entity types), managers/ (~45 singletons), Zone.idl
+    │   │   ├── login/, ping/, status/, chat/
+    │   │   ├── web/                      # RESTServer + APIProxy* (§11)
     │   │   ├── db/                       # MySqlDatabase / MantisDatabase (BDB object store)
     │   │   └── metrics/
-    │   ├── templates/                    # static game-data schema (.iff-derived): creature/tangible/resource/crafting/... templates
-    │   ├── terrain/, pathfinding/        # heightmap/procedural terrain + Recast navmesh pathfinding
-    │   ├── tre3/, client/                # client-facing asset/protocol glue
-    │   ├── autogen/                      # GENERATED from .idl files — do not hand-edit
-    │   └── tests/                        # GoogleTest sources, one binary (core3tests) linked into core3
-    ├── utils/
-    │   ├── engine3/                      # git submodule — the base engine (ORB, Lua bindings, Locker/Reference, net, containers)
-    │   └── googletest-release-1.13.0/
-    ├── bin/                              # the RUNTIME tree (also where the built `core3` binary lands)
+    │   ├── templates/                    # static game-data schema (.iff-derived)
+    │   ├── terrain/, pathfinding/        # heightmap terrain + Recast navmesh
+    │   ├── tre3/, client/                # client asset/protocol glue
+    │   ├── autogen/                      # GENERATED from .idl — never hand-edit
+    │   └── tests/                        # GoogleTest sources (core3tests, linked into core3)
+    ├── utils/engine3/                    # submodule: ORB, Lua bindings, Locker/Reference, net — never modified
+    ├── bin/                              # RUNTIME tree (built `core3` lands here)
     │   ├── conf/                         # config-local.lua, config.lua, adminusers.lst, ssl certs
-    │   ├── scripts/                      # ALL LUA — managers/, ai/, screenplays/, commands/, object/, mobile/, skills/...
-    │   ├── web/aieconomy-dashboard/      # dashboard SPA (index.html/app.js/styles.css)
-    │   ├── databases/, navmeshes/, log/
+    │   ├── scripts/                      # ALL LUA — managers/, ai/, screenplays/, commands/, object/, mobile/, skills/
+    │   ├── web/aieconomy-dashboard/      # dashboard SPA
+    │   └── databases/, navmeshes/, log/
     └── sql/                              # schema migrations
-idlc-go/                                  # separate Go module: from-scratch IDL compiler reimplementation
+idlc-go/                                  # Go IDL compiler reimplementation
 ```
 
 ## 5. Core Architecture Principles
 
-- **IDL-generated distributed objects.** Nearly every persistent/networked
-  game entity (`ChatMessage`, `Zone`, `CreatureObject`, ...) is declared once
-  in a `.idl` file (Java-like syntax) and code-generated into matching
-  `*Implementation`, stub, and adapter C++ classes under `src/autogen/`. Hand
-  edits go in the `.idl` file or an `*Implementation.cpp` companion, never in
-  generated output. See §9.
-- **Reference-counted, lock-guarded objects.** Object lifetime is managed via
-  `Reference<T>` / `ManagedReference<T>` smart pointers from engine3, and
-  concurrent access to distributed objects is guarded by an explicit
-  `Locker`/mutex discipline baked into the generated code. **This project's
-  #1 stability rule (owner-stated): match existing lock choreography exactly
-  — a mismatched lock/mount sequence has produced real regressions (the
-  P.4.4 vehicle-mount orphan bug) and is the single fastest way to crash or
-  corrupt live server state.**
-- **Manager-per-subsystem.** Game systems are singletons under
-  `server/zone/managers/*` (`CombatManager`, `CraftingManager`,
-  `ResourceManager`, `JediManager`, `AiEconomyManager`, ...), each owning its
-  slice of state and typically exposing both C++ and Lua-callable surfaces.
-- **C++ core, Lua-scripted behavior/config.** Anything that changes
-  frequently — NPC behavior trees, quest/event "screenplays", command
-  definitions, tunable config (spawn rates, AI economy knobs) — lives in Lua
-  under `bin/scripts/`, loaded at runtime, not compiled. C++ is reserved for
-  performance-sensitive or structurally-fixed logic. New tunables should
-  default to a Lua config table, not a compiled constant.
-  See §10.
-- **Docker-only, incrementally-built dev loop.** There is no local (non-container)
-  build path in active use for this fork. See §6.
+- **IDL-generated distributed objects** — entities are declared in `.idl` and generated into
+  `src/autogen/` (§9).
+- **Reference-counted, lock-guarded objects** — `Reference<T>`/`ManagedReference<T>` plus
+  explicit `Locker` discipline. **#1 stability rule (owner-stated): match the nearest existing
+  caller's lock choreography exactly.** A mismatched lock/mount sequence caused the P.4.4
+  vehicle-mount orphan regression.
+- **Manager-per-subsystem** — singletons under `server/zone/managers/*` (`CombatManager`,
+  `ResourceManager`, `JediManager`, `AiEconomyManager`, ...), each owning its state with C++ and
+  Lua surfaces.
+- **C++ core, Lua behavior/config** — behavior trees, screenplays, commands and tunables live in
+  Lua under `bin/scripts/` (§10); new tunables default to a Lua config entry, not a constant.
+- **Docker-only incremental dev loop** (§6).
 
 ## 6. Build System & Toolchain
 
-All development happens inside the `swgemu_server` Docker container (Debian
-bookworm, Clang≥16/LLD toolchain, CMake+Ninja, ccache). The host mount that
-would expose the container's source tree at
-`/srv/games/swgemu-core3/workspace` is **known to be unreliable** — do not
-assume it is live; verify with a real `ls`/`cat` before relying on it, and
-fall back to `docker cp` in/out of the container plus `chown 44400:44400`
-after any out-of-container edit (this UID:GID is what the in-container
-`swgemu` user maps to).
+Everything runs in the `swgemu_server` container. The host mount
+`/srv/games/swgemu-core3/workspace` is **unreliable**: verify with a real `ls`/`cat`, else
+`docker cp` in/out and `chown 44400:44400` (the in-container `swgemu` user).
 
 ```bash
-# Build (incremental; run from anywhere inside the container, cd's to the repo itself)
+# Build (incremental)
 docker exec -u swgemu -e TERM=xterm swgemu_server bash -lc 'build'
-#   TERM=xterm is REQUIRED — the script calls `clear` and dies without a TTY term.
-#   `build clean`   -> full rebuild (make clean-ninja-debug first)
-#   `build nocache` -> clears ccache first
-#   `build asan`    -> RelWithDebInfo + AddressSanitizer
+#   TERM=xterm is REQUIRED (the script calls `clear`).
+#   `build clean` full rebuild | `build nocache` clears ccache | `build asan` RelWithDebInfo+ASan
 
 # Run / restart the live server (~40-50s startup)
 /home/swgemu/bin/run
-#   RESTARTING THE LIVE SERVER IS THE OWNER'S CALL, not the agent's. Explicit
-#   /TRIP-verify invocation authorizes disconnecting test players and a guarded
-#   automatic restart after a green build. It tries normal GDB shutdown first,
-#   then may force-kill only the exact core3 process; all other work hands off.
+#   RESTARTING IS THE OWNER'S CALL. Sole exception: explicit /TRIP-verify, whose guarded script
+#   may disconnect test players and restart after a green build (GDB shutdown first, then
+#   force-kill only the exact core3 process).
 ```
 
-Key CMake options (top-level `MMOCoreORB/CMakeLists.txt`): `BUILD_IDL` (runs
-the IDL compiler as part of the build), `COMPILE_TESTS` (builds
-GoogleTest/Mock into the binary), `ENABLE_ASAN`/`ENABLE_TSAN`/`ENABLE_UBSAN`.
-Debug builds always pass `-Werror`-equivalent strictness — **build clean with
-no new warnings before handing work back** (owner-stated standard).
+CMake options: `BUILD_IDL`, `COMPILE_TESTS`, `ENABLE_ASAN`/`TSAN`/`UBSAN`. Debug builds are
+`-Werror`-strict — **build warning-clean before handing work back**.
 
 ## 7. Configuration
 
-- **`MMOCoreORB/bin/conf/config-local.lua`** — the primary local/runtime
-  config (DB credentials, ports, feature toggles); overrides
-  `config.lua`. Not checked in with secrets.
-- **`MMOCoreORB/bin/scripts/managers/*.lua`** — per-manager tunable config
-  (e.g. `sim_player_manager.lua` holds all AI-economy knobs: demand
-  thresholds, station-travel gates, vehicle-mechanics toggle, recovery dry-run
-  flag, `ticketCollectorTravel` interplanetary-travel gate +
-  `interiorContainmentMarginMeters`, and the `cellNavDiag` toggles —
-  `enabled` for the diagnostic test-bot spawn and `logging` as the master gate
-  for all `bin/log/cellnav.log` output, both default off). F_0.8.0/F_0.8.1 add the
-  `structureTraversal` block — `enabled`/`logging`, `hollowEscalation*`,
-  `farSideEgress`, `hollowDoorEgress.*`, the `zeroClip.*` probe and enforcement
-  knobs (`enforce`, `rejectionCap`, `walkableConfirm`,
-  `walkableToleranceRatio`), and the `structureTraversalTest` scenario matrix —
-  all default off. F_0.9.0 adds the P.10 pair: `playerBotProgression`
-  (`enabled`, `flushIntervalSeconds`, `reaper.enabled`/`reaper.minAgeSeconds`,
-  and the per-capability award gates later chunks append) and
-  `playerBotParityTest` (the progression matrix, 28 scenarios as of F_0.9.1,
-  plus `killTargetTemplate`), both default off. F_0.9.1 appends the line's first
-  capability gate, `playerBotProgression.awardKillXp`, and its `killXpRate`
-  earn-rate multiplier (shipped `1.0` = exact player parity). F_0.9.5 adds
-  `playerBotProgression.trainingEnabled` plus `trainingMaxPerTick`,
-  `trainingSweepBatch` and the `trainingPlans` list (each entry a `name`,
-  legacy scalar `goalSkill`, `profession`, `weaponTemplate` and a validated
-  `weaponType`). F_0.9.6 extends entries with a `goalSkills` list while
-  retaining the scalar for compatibility; F_0.9.8 adds two opt-in entry fields,
-  `linePriority` (line prefixes consulted before cost when ordering ready boxes)
-  and `parallelXpStreams` (each XP type advances as its own stream, strict
-  priority within a stream, first affordable stream head pursued), both absent
-  by default so an entry that declares neither trains exactly as before; and it
-  adds the default-off
-  `playerBotProgression.earlyGameEnabled` gate with its nested `earlyGame`
-  block: the `realWeaponDamage` sub-gate and XP-type loadout map, grind anchors
-  (`grindAnchorMin/MaxMeters`, `anchorArriveMeters`, `anchorMaxAttempts`),
-  target selection (`levelBandBelow`/`levelBandAbove`,
-  `minTtkSeconds`/`maxTtkSeconds`, `assumedHitRate`, `avoidGroupAggroTargets`,
-  `scanMaxAttempts`/`scanRetrySeconds`), city-spawner roaming
-  (`roamCitySpawners`, `spawnerSearchRadiusMeters`, `skipInactiveSpawners`,
-  `spawnerArriveMeters`), the bounded unreachable-target memory
-  (`unreachableSkipSeconds`, `unreachableSkipMaxTargets`), survival tuning
-  (`fleeHamFraction`, `restHamFraction`, `cloneWoundMaxFraction`,
-  `deathAvoidRadiusMeters`/`Memory`/`Seconds`) and two default-off telemetry
-  switches (`combatTelemetry`, `movementTelemetry`). The sim layer is the only
-  place that restores roster PlayerBot weapon-template stats after shared AI
-  weapon-stat setup; synthetic harness identities remain outside that path.
-  F_0.9.5's `pveConfig.novice` block (`enabled`, `retireLegacyHunters`,
-  `bodyTemplate`, profession distribution, alongside
-  `pveConfig.huntingProfessions`) gains `bodyHam` — the per-pool HAM a planned
-  novice body is built with (800 = starting-player parity; 0 keeps the mobile
-  template). F_0.9.6-D1 adds the top-level `combatDiag` block (`logging` master
-  gate plus allowlist knobs) governing all `bin/log/simcombat.log` output. F_0.9.7
-  adds `playerBotProgression.combatAbilitiesEnabled` with its nested `combatAbilities`
-  block (`specialAttackChancePercent`, `preferFreeStateAbilities`, `hamReserveFraction`,
-  `freeStateRetrySeconds`, `excludedCommands` — shipped `taunt`/`warcry1`/`warcry2` — and
-  `usageHistorySize`). Every F_0.9.5, F_0.9.6 and F_0.9.7 gate ships default-off.
-  F_0.9.8b adds `pveConfig.marketDispatch.progressionDispatch` (`enabled`,
-  `grindFallback`, `grindFallbackMinutes` clamped 5..240), default off, and widens
-  `earlyGame.deferredXpTypes` to `medical`, `crafting_medicine_general`,
-  `crafting_general` (XP kills cannot earn).
-  F_0.9.8 adds, under `pveConfig.missionBoard`: `lairEngagementHold` (+
-  `lairRetargetIntervalMs`), `waveDisengage`, `waveDeaggro`, `travelCombat`,
-  `travelRestHamPct`, `travelMaxFleeLegs` (0 = no limit), `attackerRecognition`,
-  `lairRetreatDefense`, `stockPlacement`, `revealRelocateEnabled` and
-  `lairRevealDeferMaxCycles`; `combatAbilities.avoidAreaAttacksNearLair`; and per
-  training plan `linePriority` / `parallelXpStreams`. **Owner decision 2026-10-13:
-  these F_0.9.8 gates and `progressionDispatch` are committed ON**, the first
-  exception to default-off, taken after the live runs. The `playerBotProgression`
-  master gates and `pveConfig.novice` stay off in the commit, so a fresh checkout
-  still runs no progression bots until those are armed.
-  F_0.9.2 (v0.9.9) adds `playerBotProgression.awardMissionCredits`,
-  `buffPayment` (`enabled`, `doctorFeeCredits`, zero = no charge) and
-  `ledgerRetentionDays` (zero = keep forever); both gates default off.
-  F_0.9.3 (v0.9.10) adds `playerBotProgression.lootEnabled` (default off) and its
-  `loot` block: `maxItemsPerBot` 80, `arriveMeters`, `maxDetourMeters` 64,
-  `claimTtlSeconds`, `maxClaimsPerBot`, `stepTimeoutSeconds`.
-  F_0.9.9 (v0.9.11) adds `playerBotProgression.bazaarSell` (default off),
-  `bazaarSaleBacklogMax` and the `bazaar` block: `markup` 3.0, `minPrice`, listing caps,
-  `listingDurationHours`, `visitCooldownMinutes`, `maxDetourMeters`, sweep cadence and
-  `drainOnDisable` (turning the gate off withdraws every bot listing to the vault).
-  F_0.9.10 (v0.9.12) adds `playerBotProgression.bazaarBuy` (default off), the `bazaar.buy` block
-  (`reserveCredits` 5,000, `maxPurchasesPerVisit`, `maxPendingPerBot`, `candidateScanLimit` per need,
-  `maxObjectLoadsPerVisit`, `executeTimeoutSeconds`) and an optional per-training-plan `buyList`
-  (`template`, `quantity` 1..5, `maxPrice`; at most 8 entries; shipped empty).
-  F_0.9.12 (v0.9.13) adds `playerBotProgression.weaponLoadout` (default off) and the `loadout` block
-  (`minUpgradePercent` 10, `fullSweepMinutes`, the `bazaarUpgrades` sub-gate, `upgradeSpendFraction`
-  0.5, `upgradeScanIntervalMinutes`, `maxUpgradeLoadsPerVisit`).
-  F_0.9.13 (v0.9.14) adds `playerBotProgression.armorLoadout` (default off) and `loadout.armor`
-  (`minUpgradePercent`, `assumedArmorPiercing`, `damageTypeWeights`, `bodyRaces` as a list of
-  `{body, race}` pairs, the `bazaarUpgrades` sub-gate, `upgradeSpendFraction`,
-  `maxUpgradeLoadsPerVisit`, `bodyHamBaseline`).
-  **The running server re-reads this file from disk on its own**: a syntax error in
-  the working copy is hit live within seconds (it keeps the previous config), so
-  `luac -p` any edit immediately.
-  This is the primary place new simulation features expose owner-tunable,
-  default-off gates.
-- **`MMOCoreORB/bin/conf/features.lua`** — global feature flags.
-- Compiled-in constants are the exception, not the default — prefer a Lua
-  config entry so behavior is tunable without a rebuild.
+- **`bin/conf/config-local.lua`** — runtime config (DB credentials, ports, toggles), overrides
+  `config.lua`; never committed with secrets. **`bin/conf/features.lua`** — global feature flags.
+- **`bin/scripts/managers/*.lua`** — per-manager tunables; `sim_player_manager.lua` holds every
+  AI-economy knob and is where new features expose owner-tunable, default-off gates.
+  **The running server re-reads it from disk continuously**: a syntax error is hit within
+  seconds (previous config kept), so `luac -p` any edit immediately.
+- Compiled constants are the exception; prefer Lua so behavior tunes without a rebuild.
+
+`sim_player_manager.lua` blocks by release (all default-off unless noted):
+
+| Release | Blocks / gates |
+|---|---|
+| P.4-P.9 | demand thresholds, `enableStationTravel`, `vehicleConfig.enableVehicleMechanics`, recovery `dryRun`, `ticketCollectorTravel` (+`interiorContainmentMarginMeters`), `cellNavDiag.{enabled,logging}` |
+| F_0.8.0/0.8.1 | `structureTraversal` (`enabled`, `logging`, `hollowEscalation*`, `farSideEgress`, `hollowDoorEgress.*`, `zeroClip.{enforce,rejectionCap,walkableConfirm,walkableToleranceRatio}`) + `structureTraversalTest` matrix |
+| F_0.9.0/0.9.1 | `playerBotProgression` (`enabled`, `flushIntervalSeconds`, `reaper.*`, `awardKillXp`, `killXpRate` 1.0 = parity) + `playerBotParityTest` (matrix, `killTargetTemplate`) |
+| F_0.9.5 | `trainingEnabled`, `trainingMaxPerTick`, `trainingSweepBatch`, `trainingPlans` (`name`, `goalSkill`, `profession`, `weaponTemplate`, `weaponType`); `pveConfig.novice` (`enabled`, `retireLegacyHunters`, `bodyTemplate`, distribution, `bodyHam` 800 = starting player) |
+| F_0.9.6 | plan `goalSkills`; `earlyGameEnabled` + `earlyGame` (`realWeaponDamage`, XP-type loadouts, grind anchors, level band/TTK target selection, `avoidGroupAggroTargets`, spawner roaming, `unreachableSkip*`, survival fractions, `deathAvoid*`, `combatTelemetry`, `movementTelemetry`); top-level `combatDiag` (`simcombat.log`) |
+| F_0.9.7 | `combatAbilitiesEnabled` + `combatAbilities` (`specialAttackChancePercent`, `preferFreeStateAbilities`, `hamReserveFraction`, `freeStateRetrySeconds`, `excludedCommands` = taunt/warcry1/warcry2, `usageHistorySize`, later `avoidAreaAttacksNearLair`) |
+| F_0.9.8/8b | plan `linePriority` / `parallelXpStreams` (absent = old behavior); `missionBoard.{lairEngagementHold, lairRetargetIntervalMs, waveDisengage, waveDeaggro, travelCombat, travelRestHamPct, travelMaxFleeLegs, attackerRecognition, lairRetreatDefense, stockPlacement, revealRelocateEnabled, lairRevealDeferMaxCycles}`; `pveConfig.marketDispatch.progressionDispatch` (`enabled`, `grindFallback`, `grindFallbackMinutes` 5..240); `deferredXpTypes` = medical, crafting_medicine_general, crafting_general. **Committed ON (owner, 2026-10-13)** — the first default-off exception; the progression master gates and `novice` stay off. |
+| F_0.9.2 (v0.9.9) | `awardMissionCredits`, `buffPayment` (`enabled`, `doctorFeeCredits`), `ledgerRetentionDays` (0 = forever) |
+| F_0.9.3 (v0.9.10) | `lootEnabled` + `loot` (`maxItemsPerBot` 80, `arriveMeters`, `maxDetourMeters` 64, `claimTtlSeconds`, `maxClaimsPerBot`, `stepTimeoutSeconds`) |
+| F_0.9.9 (v0.9.11) | `bazaarSell`, `bazaarSaleBacklogMax`, `bazaar` (`markup` 3.0, `minPrice`, listing caps, `listingDurationHours`, `visitCooldownMinutes`, `maxDetourMeters`, sweep cadence, `drainOnDisable`) |
+| F_0.9.10 (v0.9.12) | `bazaarBuy`, `bazaar.buy` (`reserveCredits` 5,000, `maxPurchasesPerVisit`, `maxPendingPerBot`, `candidateScanLimit`, `maxObjectLoadsPerVisit`, `executeTimeoutSeconds`); per-plan `buyList` (`template`, `quantity` 1..5, `maxPrice`; ≤8, shipped empty) |
+| F_0.9.12 (v0.9.13) | `weaponLoadout`, `loadout` (`minUpgradePercent` 10, `fullSweepMinutes`, `bazaarUpgrades`, `upgradeSpendFraction` 0.5, `upgradeScanIntervalMinutes`, `maxUpgradeLoadsPerVisit`) |
+| F_0.9.13 (v0.9.14) | `armorLoadout`, `loadout.armor` (`minUpgradePercent`, `assumedArmorPiercing`, `damageTypeWeights`, `bodyRaces` `{body, race}` pairs, `bazaarUpgrades`, `upgradeSpendFraction`, `maxUpgradeLoadsPerVisit`, `bodyHamBaseline`) |
+| F_0.9.14 (v0.9.15) | `consumablesEnabled`, `consumables` (`bazaarRestock`, `minDoses` 10, `minRecheckSeconds`, `noDoseRetrySeconds`, `restockScanIntervalMinutes`, `maxRestockLoadsPerVisit`, `restockSpendFraction`, `items` = `{template, maxPricePerDose, minDoses?}`: Vasarian brandy, pikatta pie, crispic) |
+
+The sim layer alone restores roster PlayerBot weapon-template stats after shared AI weapon-stat
+setup; synthetic harness identities stay outside that path.
 
 ---
 
 ## 8. Game World / Server Architecture
 
-- **Process model**: one `core3` binary hosts the zone server(s); separate
-  lightweight servers handle login, ping, status, and chat (all under
-  `src/server/`). `main.cpp`/`CoreProcess` wires them up at boot.
-- **Zones** (`server/zone/Zone.idl`, `GroundZone`, `SpaceZone`) are the
-  per-planet/per-instance simulation containers; `ZoneProcessServer` drives
-  their tick loop.
-- **Game objects** (`server/zone/objects/*`) form a template-driven class
-  hierarchy: `SceneObject` → `TangibleObject`/`IntangibleObject` →
-  `CreatureObject` → `AiAgent` (NPCs) / `Player` (human clients) /
-  `SimPlayer` (this fork's autonomous NPC economy actors, see §9). Static
-  game data (stats, appearance, loot tables) is loaded from `templates/`
-  (originally derived from client `.iff`/datatable files) rather than
-  hard-coded.
-- **Pathfinding/terrain**: `terrain/` (heightmap, water level, resource
-  layers) + `pathfinding/recast` (Recast/Detour navmesh). Critically for this
-  fork's AI work: **only cities/POIs are navmeshed** — open wilderness
-  (where resources spawn) has no navmesh, so `findPath` degrades to a
-  2-node "direct fallback" there. This is the root architectural constraint
-  behind the overland-reachability and station-travel work in §9.
-- **Persistence**: two-tier — MySQL for account/character rows, and a
-  Berkeley DB-backed distributed object store (`server/db`) for the
-  full object graph, keyed by ORB object IDs.
+- **Process model**: one `core3` binary hosts the zone server(s) plus login, ping, status and
+  chat servers, wired by `main.cpp`/`CoreProcess`.
+- **Zones** (`Zone.idl`, `GroundZone`, `SpaceZone`) are per-planet simulation containers ticked
+  by `ZoneProcessServer`.
+- **Objects**: `SceneObject` → `TangibleObject`/`IntangibleObject` → `CreatureObject` →
+  `AiAgent` (NPCs) / players / SimPlayers (§12). Static data comes from `templates/`.
+- **Pathfinding**: `terrain/` + `pathfinding/recast`. **Only cities/POIs are navmeshed**; in open
+  wilderness (where resources spawn) `findPath` degrades to a 2-node "direct fallback". This is
+  the root constraint behind the overland and station-travel work in §12.
+- **Persistence**: MySQL rows for accounts/characters; BDB object store (`server/db`) for the
+  object graph, keyed by ORB object IDs.
 
 ## 9. Distributed Object / IDL Codegen System
 
-The engine's most distinctive pattern, and the one most likely to trip up an
-unfamiliar change:
-
-1. Author a `.idl` file (Java-like DSL, see any `server/**/*.idl`) declaring
-   fields, methods, and annotations (`@json`, `@read`, `@dirty`, etc.) for a
-   distributed object.
-2. The IDL compiler (`BUILD_IDL` CMake step; being reimplemented in Go under
-   `idlc-go/`) generates matching C++ under `src/autogen/`: an interface, an
-   `*Implementation` skeleton (hand-filled in a co-located
-   `*Implementation.cpp`), network stub/adapter classes for RMI, and
-   GoogleMock test doubles.
-3. Objects are always held via `Reference<T>`/`ManagedReference<T>`, never
-   raw pointers/values, and mutation requires taking the object's `Locker`
-   first — the generated code enforces this pattern; **new code should mimic
-   the locking sequence of the nearest existing caller rather than invent
-   one.**
-4. **Never hand-edit files under `src/autogen/`** — edit the `.idl` or the
-   `*Implementation.cpp`/`.h` and rebuild. `src/autogen/` is **gitignored and
-   untracked**, so an additive `.idl` method costs exactly one line in a commit
-   and its stubs/adapters regenerate at build time — the reason F_0.9.1 could
-   add `PlayerManager::getExperienceMultiplier()` rather than let a test oracle
-   derive its expected value from the implementation under test. The cost is
-   build fan-out, not diff size: that one line took the incremental build from
-   17 to 89 targets.
+1. A `.idl` file (Java-like DSL) declares fields, methods and annotations (`@json`, `@read`,
+   `@dirty`, ...).
+2. The IDL compiler (`BUILD_IDL`; Go rewrite in `idlc-go/`) generates `src/autogen/`: interface,
+   `*Implementation` skeleton (hand logic in a co-located `*Implementation.cpp`), RMI
+   stub/adapter, GoogleMock doubles.
+3. Hold objects via `Reference`/`ManagedReference`, take the `Locker` before mutating, and copy
+   the nearest existing caller's lock sequence.
+4. **Never hand-edit `src/autogen/`** — it is gitignored and regenerated at build, so an additive
+   `.idl` method costs one committed line (F_0.9.1 added `PlayerManager::getExperienceMultiplier()`
+   this way). The cost is build fan-out: that one line took an incremental build from 17 to 89
+   targets.
 
 ## 10. Lua Scripting Layer
 
-- Bound into C++ via engine3's `engine/lua/*` (a Lua↔C++ bridge:
-  `LuaObject`, `LuaFunction`, exception translation).
-- **`bin/scripts/managers/`** — one Lua file per manager, holding config and
-  manager-level callbacks.
-- **`bin/scripts/ai/`** — NPC behavior trees (e.g. `simMiner.lua`, a
-  deliberately no-op tree that cedes movement entirely to this fork's C++
-  `SimPlayerController`, avoiding a dual-driver conflict with the default
-  `GeneratePatrol` wander behavior). `simHunter.lua`/`simPvp.lua` override **only**
-  the IDLE slot, so the root falls back to `rootDefault` and the combat
-  attack/target sockets stay live — the C++ controller drives movement while the
-  stock tree drives combat (the controller must call `activateAiBehavior(true)`
-  on engage to wake that tree promptly).
-- **`bin/scripts/screenplays/`** — quest/event/world-state scripts (themepark,
-  villages, spawners, custom one-offs like `market_seeder.lua`).
-- **`bin/scripts/commands/`, `object/`, `mobile/`, `skills/`** — command
-  definitions, per-object-type Lua overrides, mobile (NPC) templates, skill
-  definitions.
-- Convention: Lua is the default location for anything tunable or
-  frequently-iterated; C++ is for structural/performance-critical logic
-  only.
-- **`LuaObject` field reads are stack-relative.** `getBooleanField` and its siblings read the table
-  at the top of the Lua stack (`lua_gettable(L, -2)`), not their own table. A parent read while a
-  child table from `getObjectField` is still pushed silently reads the child and returns the
-  default. Read every parent field before opening a child, or after popping it (F_0.9.13:
-  `armorLoadout = true` parsed as false).
-- **Safe Lua↔C++ object wrapping (crash class).** A Lua wrapper constructor
-  like `AiAgent(pObj)` / `LuaAiAgent(pObj)` `dynamic_cast`s the underlying
-  scene object; in a debug build (`DYNAMIC_CAST_LUAOBJECTS`) wrapping an object
-  that is not that concrete type fires `E3_ASSERT` in `*::_setObject` →
-  `abort()`, which **`pcall`/`safeCall` cannot catch** (it is a process signal,
-  not a Lua error); a release build produces a mis-typed pointer (UB). Never
-  wrap a possibly-wrong-type object — always gate first with a safe virtual
-  predicate that takes no cast: `SceneObject(pObj):isCreatureObject()` /
-  `:isAiAgent()`. Type-specific reads that live only on `LuaAiAgent` should be
-  mirrored onto `LuaCreatureObject` using the native safe cast
-  `CreatureObject::asAiAgent()` (returns `nullptr` for non-agents) so callers
-  never need the `AiAgent()` wrap — e.g. `LuaCreatureObject::isSimPlayerBot`
-  (F_0.7.2), which fixed a SIGABRT when a real player's spatial chat reached a
-  buffer NPC's `isSimPlayerBot` gate.
+- Bridged by engine3 `engine/lua/*` (`LuaObject`, `LuaFunction`, exception translation).
+- `bin/scripts/managers/` (config + callbacks), `ai/` (behavior trees), `screenplays/`,
+  `commands/`, `object/`, `mobile/`, `skills/`.
+- **Behavior trees vs C++ controllers**: `simMiner.lua` is a deliberate no-op so
+  `SimPlayerController` is the sole mover (no dual-driver fight with `GeneratePatrol`).
+  `simHunter.lua`/`simPvp.lua` override **only** the IDLE slot: the controller drives movement,
+  the stock tree drives combat (call `activateAiBehavior(true)` on engage to wake it).
+- **`LuaObject` field reads are stack-relative.** `getBooleanField` and siblings read the table
+  on top of the stack (`lua_gettable(L, -2)`). A parent read while a child table from
+  `getObjectField` is pushed silently reads the child and returns the default. Read parent
+  fields before opening a child, or after popping it (F_0.9.13: `armorLoadout = true` parsed as
+  false). Presence detection = read a field twice with two defaults; never poke the stack with
+  `lua_getfield`.
+- **Safe Lua↔C++ wrapping (crash class).** `AiAgent(pObj)`/`LuaAiAgent(pObj)` `dynamic_cast`;
+  in debug (`DYNAMIC_CAST_LUAOBJECTS`) a wrong type fires `E3_ASSERT` → `abort()`, which
+  `pcall`/`safeCall` cannot catch (release builds: UB). Gate first with a cast-free predicate
+  (`SceneObject(pObj):isCreatureObject()` / `:isAiAgent()`), and mirror agent-only reads onto
+  `LuaCreatureObject` via `CreatureObject::asAiAgent()` (e.g. `LuaCreatureObject::isSimPlayerBot`,
+  F_0.7.2 SIGABRT fix).
 
 ## 11. Web/REST Layer (AI-Economy Dashboard)
 
-- **`src/server/web/RESTServer.{h,cpp}`** hosts a small HTTPS API
-  (`libcpprest`), Bearer-token gated, on port 44443.
-- **`APIProxy*Manager` classes** (`APIProxyAiEconomyManager`,
-  `APIProxyPlayerManager`, `APIProxyGuildManager`,
-  `APIProxyStatisticsManager`, `APIProxyConfigManager`,
-  `APIProxyChatManager`, `APIProxyObjectManager`) are thin per-manager
-  read-mostly facades — the pattern to follow for exposing any new manager's
-  state to the dashboard.
-- **`SimPlayerManager::getDashboardJson()`-style methods** (in the ~19k-line
-  `SimPlayerManager.cpp`) assemble the actual JSON payload sections
-  (`minerActivity`, `coveragePlanner`, `minerRecovery`,
-  `pathValidationDiagnostics`, `simulatedAcquisition`, `vehicleMechanics`,
-  `stationTravel`, `pveActivity`, ...) consumed by the dashboard frontend. The
-  SPA is hash-routed (`#/command`, `#/warfront`, `#/wilds` for live PvE hunter
-  positions, ...).
-- **Per-object detail endpoints** keep the polled snapshot small: F_0.9.7 adds
-  `GET /v1/aieconomy/playerbot/(\d+)/` (`APIProxyAiEconomyManager::handlePlayerBotGET` →
-  `SimPlayerManager::getPlayerBotInspectJson`), built on demand under the same Bearer gate
-  and answering 404 for an unknown identity — the pattern to copy for any future
-  "click a row for detail" surface.
-- **Frontend**: `bin/web/aieconomy-dashboard/` — static `index.html` +
-  `app.js` + `styles.css`, no build step, deployed by copying files
-  in-place (instant, no server restart needed for frontend-only changes). Bot names on
-  `#/wilds` and the progression table open a detail drawer fed by that endpoint.
-- Ground truth for any AI-economy behavior claim is this live endpoint, not
-  code inspection alone:
-  ```
-  curl -sk https://127.0.0.1:44443/v1/aieconomy/dashboard/ \
-    -H "Authorization: Bearer <token>"
-  ```
+- **`src/server/web/RESTServer`**: HTTPS (`libcpprest`), Bearer-gated, port 44443.
+- **`APIProxy*Manager`** (`AiEconomy`, `Player`, `Guild`, `Statistics`, `Config`, `Chat`,
+  `Object`): thin read-mostly per-manager facades — the pattern for exposing new state.
+- **`SimPlayerManager`** assembles the JSON sections (`minerActivity`, `coveragePlanner`,
+  `minerRecovery`, `pathValidationDiagnostics`, `simulatedAcquisition`, `vehicleMechanics`,
+  `stationTravel`, `pveActivity`, `playerBotProgression`, ...).
+- **Per-object detail endpoints** keep the poll small: `GET /v1/aieconomy/playerbot/(\d+)/`
+  (`handlePlayerBotGET` → `getPlayerBotInspectJson`, F_0.9.7), built on demand, 404 for an
+  unknown identity — copy it for any "click a row for detail" surface.
+- **Frontend** `bin/web/aieconomy-dashboard/` (`index.html`/`app.js`/`styles.css`): hash-routed
+  (`#/command`, `#/warfront`, `#/wilds`, ...), deployed by copying files (no restart). Bot names
+  open a detail drawer fed by the endpoint above.
+- The live endpoint is ground truth for any AI-economy claim:
+  `curl -sk https://127.0.0.1:44443/v1/aieconomy/dashboard/ -H "Authorization: Bearer <token>"`
 
 ## 12. AI Economy Simulation Layer (SimPlayers) — active development focus
 
-This is this fork's primary custom subsystem, layered on top of the stock
-`AiAgent`/`CreatureObject` hierarchy:
+Layered on the stock `AiAgent`/`CreatureObject` hierarchy. Living design docs:
+`docs/ai-miner-navigation-design.md` (P.4), `docs/ai-cell-navigation-design.md`,
+`docs/ai-pve-playerbot-design.md`, `docs/1-plans/ROADMAP_p10-playerbot-parity.md`.
 
-- **`server/zone/objects/creature/simplayer/SimPlayerManager.{h,cpp}`** —
-  the "economy brain": tracks all SimPlayer NPCs, drives demand/supply
-  simulation, resource targeting, cross-planet coverage planning, and
-  assembles all dashboard JSON (§11). The single largest and most
-  frequently-touched file in the fork.
-- **`SimPlayerController.{h,cpp}`** — per-NPC controller (`SimMinerController`
-  for resource gatherers): movement/pathing lifecycle, sample/gather
-  lifecycle, stuck-watchdog re-pathing, activation trust-tier gating
-  (`isActivationTrustAcceptable()` — accepts `verifiedPath` or the
-  overland-reachable `directOverland` tier). Since P.6.5b the movement
-  pipeline is **cell-aware**: `moveTo` accepts an optional target cell
-  (world position for distance math + cell-local position for the path
-  request), and path-node cells survive into `PatrolPoint`s — outdoor
-  callers (all miners) are unaffected. Caution: the engine's
-  `findNextPosition` math assumes one coordinate space per comparison; any
-  new in-cell movement must keep world/cell-local forms separate (P.6.5b
-  design doc §13.1 lesson; reinforced by the F_0.4.8–F_0.4.11 cell-nav work
-  and `tuto_0.4.11.md`). The cell-navigation stack (F_0.4.7–F_0.4.11,
-  `docs/ai-cell-navigation-design.md`) adds: POB **cell entry** (adopt the
-  cell on `findNextPosition`'s duplicate-skip branch — no teleport-into-wall
-  at a portal), a **cell-egress** leg (`SimPlayerController::beginCellEgressIfNeeded`
-  — portal-follow `findPath` to a computed building exterior, then resume the
-  original move), **nearest-exterior-portal** selection (native
-  `BuildingObject::getNearestExteriorPortalPoint`, for multi-door starports),
-  and gated **ticket-collector interplanetary travel** (`ticketCollectorTravel`,
-  default off): a bot walks through the starport interior to the collector in
-  the enclosed hollow and out of the destination hollow after boarding, with a
-  tri-state interior resolver (`resolveStarportInteriorWaypoint`, whose
-  containment test allows a bounded horizontal margin so an enclosed-hollow
-  collector baked outside the collision AABB still associates with its
-  starport), bounded retries, safe outdoor recovery, and an idempotent PvP
-  arrival OID barrier. Two `findNextPosition` direction-calc fixes (hold facing
-  on a ~zero step; wrap a negative angle by `+2*PI` not `+PI`) removed a
-  pivot-swivel. Cell-nav instrumentation (`CellNavDiagLog` → `bin/log/cellnav.log`)
-  is retained but gated by `cellNavDiag.logging` (default off).
-- **Structure traversal (P.9 / F_0.8.0)** — POB enter/exit is no longer an
-  ad-hoc `moveTo` sequence but an explicit state machine on
-  `SimPlayerController`: `StructureTraversalPhase`
-  (`Idle→ApproachDoor→InteriorRoute→Egress→Reentry→CombatPaused→Resuming`)
-  plus a `traversalGeneration` **separate from** the movement work-loop
-  generation, so combat can cancel a path task without cancelling the
-  traversal intent. Bounded **hollow escalation** recovers a bot stranded in a
-  starport's enclosed hollow. **D2b far-side egress** fixes the dominant
-  failure: from inside a starport the pathfinder answers "reach the far
-  exterior door" with a valid route out the *nearest* portal, back into the
-  hollow — a path that **succeeds while making no progress**, which the repair
-  ladder never sees because that ladder only runs on path *failure*.
-  `acceptFoundPath` rejects such a route and retargets to the nearest reachable
-  non-hollow exit **cell**. Its predicate deliberately exempts a destination
-  that is itself in the hollow: multi-hop planet transit lands a bot on the pad
-  (ticket collector) and must not be marched out the far side — see
-  `docs/ai-cell-navigation-design.md` and the `F_0.8.0-D*` proposals.
-  A **26-scenario live matrix** (`structureTraversalTest` in
-  `sim_player_manager.lua`, AI template `bin/scripts/ai/simTraversalTest.lua`)
-  is this subsystem's verification vehicle in place of unit tests, which cannot
-  reach code that needs a live zone's navmesh/PortalLayout. Its runner is a
-  single-writer state machine: ownership of the scenario cursor is held under
-  `structureTraversalTestMutex` for a whole invocation while task scheduling
-  happens **outside** the lock, because the controller notify hooks take that
-  same mutex from threads that may already hold an agent lock (harnessMutex →
-  agentLock against agentLock → harnessMutex is an ABBA deadlock).
-  Instrumentation: `StructureTraversalDiagLog` → `bin/log/structuretraversal.log`,
-  gated by `structureTraversal.logging`.
-- **Traversal adoption by production controllers (F_0.8.1)** — F_0.8.0 built the
-  state machine but nothing used it: `enterStructure()` had **exactly one caller,
-  the test harness**. Adoption is therefore a distinct architectural step from
-  the machinery, and the rule for any future controller is that a cell-bearing
-  destination is a **building entry** and belongs to `enterStructure`, not a bare
-  `moveTo`. Migrated: `SimHunterController` (buff providers) and
-  `SimPvPController` (collector approaches, starport interior waypoints).
-  Migration sites are guarded on a non-null cell — a starport hollow resolves to
-  a null cell and must stay an outdoor approach, since the hollow is frequently
-  the destination. Where the legacy call was `moveTo` rather than
-  `moveToInterior` the guard must **also** test the feature gate, because
-  `enterStructure`'s null-cell fallthrough calls `moveToInterior`; without that,
-  gate-off behaviour changes. **Miners are deliberately not migrated** — station
-  travel teleports them to an *outdoor* arrival by design, so they have no reason
-  to enter a cell. `acceptFoundPath` is now a non-virtual **template method**
-  (invariants + `virtual acceptFoundPathHook`): a subclass that overrode it
-  wholesale silently opted out of every base invariant, and that is now a compile
-  error. **`exitStructure` is NOT yet adopted** — production bots enter through
-  the state machine and leave through the legacy cell-egress ladder; see
-  `docs/1-plans/F_0.8.2_traversal-egress-adoption.plan.md`.
-- **Test-oracle vs. production telemetry (F_0.8.1)** — an architectural boundary
-  the harness originally got wrong. `SimPlayerManager`'s
-  `structureTraversal{Teleport,ZSanity}` counters are **global dashboard
-  aggregates**; the matrix must assert on **per-agent** tallies held on
-  `SimPlayerController` (monotonic, deliberately not reset by
-  `clearStructureTraversalState`, `std::atomic` because the oracle reads them
-  off-thread). Asserting on the globals lets any bot in the world fail an
-  unrelated harness scenario — latent and invisible until a production bot first
-  ran traversal. Counters belonging to a body destroyed mid-scenario are folded
-  into a per-slot carry inside `destroyStructureTraversalTestBot`, the single
-  choke point every destroy path passes through, **under the agent lock** so the
-  snapshot is final against the writer.
-- **Post-lock lifecycle recheck (F_0.8.1)** — `SimPlayerController::checkArrival`
-  guards on `agent->getZone()` *before* acquiring `Locker locker(agent)`, so a
-  task can pass the guard, block on the lock, and resume after another thread has
-  torn the agent down under that same lock (harness destruction and recovery
-  despawn both call `destroyObjectFromWorld` there). It now rechecks the same
-  predicate immediately after acquisition and returns without rescheduling. The
-  general rule: any pre-lock lifecycle guard in this controller needs a matching
-  post-lock recheck, or the work runs on a world-destroyed agent.
-- **Zero-clip movement (D7)** — an anti-clipping invariant for bot paths,
-  shipping **observe + enforce, both default-off**. The probe
-  (`SimPlayerController::probeEmittedPathClearance`) runs on the **pathfinding
-  worker thread**, before path delivery, so it never adds tick latency; results
-  are explicit (`clear`/`would_block`/`skipped`/`truncated`/`error`) and
-  aggregated worst-evidence-first so an inconclusive probe can never read as
-  clear. Enforcement refuses a conclusively obstructed route and re-asks,
-  bounded by `zeroClip.rejectionCap`, walking the route on exhaustion rather
-  than stranding the bot. It fails **open** on inconclusive probes — the
-  deliberate opposite of the harness exit assertion, which fails closed: a test
-  oracle that cannot see must not pass the subject, but a mover that cannot see
-  must still move. Two architectural facts came out of this work: the world-query
-  snapshot must be `SortedVector<ManagedReference<TreeEntry*> >`, never the raw
-  `InRangeObjectsVector`, because the probe walks it off-thread after the zone
-  lock is released; and the appearance ray tests the straight **chord** between
-  two path nodes, which for a staircase or bridge deck passes through the solid
-  mass beneath the walkable surface — `zeroClip.walkableConfirm` confirms a
-  flagged chord against the navmesh (the authority on what an agent can stand
-  on) and overruled ~half of all raw hits. `PathFinderManager::getRecastPath`'s
-  `float& len` is **not** a path length (it sums `x²+z²` of absolute
-  coordinates and is only ever a relative comparator); measure real lengths from
-  the returned points.
-- **`SimPvPController.{h,cpp}`** — the PvP/combat-oriented sibling
-  controller for AI squads (see §13).
-- **`SimHunterController.{h,cpp}`** — the PvE hunter controller (P.8). Drives a
-  market-driven mission-board hunt loop (shared travel → terminal → held offer →
-  real lair spawn → pull → kill → simulated harvest) that closes the
-  crafter→hunter demand loop via the acquisition/demand ledger. It also owns the
-  gated cross-planet buff-trip phase while `SimPlayerManager` owns offer,
-  dispatch, and route state. Combat is **real** (`CombatManager::startCombat`
-  with an AI-aligned rifle; wild creatures retaliate) but loot stays simulated.
-  Neutral hunters use player-safe targeting and defender-driven re-engagement so
-  they reject real players and follow the actual creature attacking them (the
-  player-side guard mirrors `AiAgentImplementation::isAttackableBy` and is consulted
-  by both `CombatManager::startCombat` and `getAreaTargets`, so it also stops AoE
-  splash onto players). The controller's two tick loops — `onTick` (arrival cadence)
-  and `runActiveTick` (`SimHunterActiveTickTask`) — run on independent task-pool
-  threads, so combat-target state (`targetOid`/observer) follows a single-writer rule:
-  `runActiveTick` owns it (HUNTING-scoped), while `onTick` only self-defends via the
-  interceptor path on travel legs and never writes it. Defender-list reads snapshot
-  under the hunter lock (`add`/`removeDefender` are `@preLocked`).
-  F_0.5.0 hardened the terminal mission-board handoff against those two threads: a
-  monotonic **terminal-visit epoch** (`SimPlayerManager::openTerminalVisit` /
-  `pveTerminalVisitEpoch`) is captured when a hunter opens a board and re-checked at
-  commit, so `generatePveBotMissionOffers` discards any offer set that finishes after
-  the order concluded or the body was drained; `activeTickGeneration` is an
-  `std::atomic<uint64>` (latest-wins) and `tickRunning` a non-blocking single-flight
-  guard so no two `runActiveTick` bodies run concurrently. An empty board no longer
-  abandons the trip — the hunter dwells and re-generates for a bounded
-  `offerMaxAttempts`×`offerRetrySeconds` budget.
-  Hunt dispatch is gated on **demand pressure per family**: the market matchmaker
-  only issues an order when a family's `signalUnits > 0`, i.e. accumulated supply is
-  below its `effectiveCeiling` (`familyAllocationCeiling{Units,Fraction}` in the
-  acquisition ledger). The fraction is an anti-domination cap for *multi-family*
-  profiles, set to `1.0` per family so each can fill its profile's true
-  `desiredReserve` — a lower cap silently strands the whole roster once supply
-  crosses it (F_0.5.0 saturation fix). As of **F_0.6.0** hunters supply **three
-  creature families** — `hide`, `bone`, and `meat` — not meat alone: each kill
-  credits all three via a single target-lock in `recordPveHunterHarvest`
-  (per-family deposit gated at `harvestAmount >= 3`), demand for hide/bone is
-  recognized by extending existing profiles in `demandStateProfileUsesConceptualLabel`
-  (`composite_armor_supply`→`hide*`, `master_weaponsmith_staples`→`bone*`), and a
-  hunt reserves the expected units of **all three** families on accept
-  (`computeReservedInboundByProfileFamily` iterates enabled profiles × 3 families;
-  both matchmaker paths run a shared intra-pass multi-family signal decrement so a
-  single pass never over-dispatches a family). Effect: meat saturation alone can no
-  longer idle the whole roster — pressure spreads across families.
-  **F_0.9.8b progression-first dispatch** (gate `progressionDispatch.enabled`):
-  a bot whose training template — its whole plan, across professions — is
-  incomplete (`SimBotActivityDecision::templateComplete`; deferred XP types do not
-  block) is dispatched by `runPveProgressionDispatchPass` BEFORE the extraction
-  loop and withheld from it. Candidates are lairs combat will fight
-  (`SimBotDispatchPolicy::isLairFightable` = combat's pack rule, the yield index's
-  `hasPackMobile`; dispatch assumes solo) within the window of the **grind tier**
-  (`getPlayerBotGrindTier`: combat-difficulty tier of the weapon in hand, not
-  combat level), ranked non-pack before pack → XP fit → demand → same planet. The order pins the lair
-  (`pinnedLairTemplate`, `dispatchLevel`, `avoidPacks`) and
-  `selectPveBotMissionLairSpawn` honours the pin. With nothing fightable the bot
-  grinds for `grindFallbackMinutes` (`progressionGrindFallbackUntilMs`, read by
-  `scorePlayerBotActivity`). Template-complete bots keep the market path.
-  **F_0.9.8c travel combat** (gate `missionBoard.travelCombat`, with `travelRestHamPct`):
-  on every overland mission leg (`TRAVEL_TO_MISSION`, `TRAVEL_TO_LAIR`, `TRAVEL_TO_TERMINAL`,
-  `TRAVEL_HOME`) a sub-mode (`SimBotTravelCombat`: MOVE / FLEE /
-  REST, owned by `runActiveTick`) adds a low-HAM retreat **toward the mission** (forward flee
-  point, veer if the attacker is ahead, sideways near the destination) and a rest to
-  `resumeHamPct` before walking on. Two base-controller hooks, both default to the old
-  behaviour: `allowsMovementInCombat()` (consulted at the in-combat holds in
-  `moveToWithOrigin`, `onPathFound` and `checkArrival`) and `isMovementHeld()` (stops
-  `checkArrival` resuming the destination). The hunter's flee arrival and path failure are
-  routed back to the tick, never to `LAIR_REACHED` or a mission path failure.
-  A **mop-up hold** keeps a bot in MOVE from walking while a creature is aimed at it (the
-  lair's survivors after the lair dies); it self-releases after 180 s.
-  Gate `missionBoard.attackerRecognition`: `selectActiveCombatAttacker` also takes threat-map
-  creatures that are in combat and aimed at the bot, because `CombatManager::startCombat`
-  never puts an attacker on the defender's own defender list. This is a
-  **demand-spread** slice only: `consumeReservation` still does **not** drain
-  `familySupply` in-session (supply = immutable boot baseline + monotonic
-  `pveSessionHarvestByFamily`), so with no family *consumer* yet each family still
-  re-saturates at its reserve target. An in-session consumer that closes the drain
-  loop remains the documented next economy phase (same accepted debt as meat).
-  Hunter-opt-in navmesh/overland hybrid movement (`usesNavmeshHybridMovement()`,
-  base false so miners/PvP are unchanged): navmesh inside cities, overland in the
-  wild. Bodies spawn `PLAYER | ATTACKABLE` and force faction 0 so wildlife fights
-  them while `isAttackableBy` keeps real players from attacking the neutral bot;
-  they use a neutral combat mob template (`death_watch_wraith` + `rifle_t21`,
-  configured in `sim_player_manager.lua`). Combat firing is woken via
-  `activateAiBehavior(true)` on engage. P.8.6 adds need-gated **real buffs**
-  (gated `realBuffs.enabled`, default off): the hunter walks into its home-city
-  med center / cantina and obtains buffs from the owner's real Doctor/Musician/
-  Dancer buffer NPCs (`PlayerManager::startWatch`/`startListen` observers; the
-  doctor's chat negotiation driven via a `ScreenPlayTask` since a bot's chat
-  can't reach the player-only `SPATIALCHATSENT` observer), only when a tracked
-  buff is missing or within a refresh threshold. Interior cells are reached with
-  a leg-scoped non-hybrid latch; a synthetic `realBuffs.fallbackBuffs` set covers
-  unreachable providers. Design doc: `docs/ai-pve-playerbot-design.md`.
-- **Provider anchors are SEARCH anchors, not destinations (F_0.7.3, v0.8.2)**:
-  `resolvePvpCityLocations` publishes a city's `hangout` and `medCenter` as
-  exterior points; `resolvePveBuffProviders` centres its provider scan on them,
-  but the hunter's actual move target is the provider NPC's own cell-local
-  position. The med-centre search originally ran only within
-  `pvpCantinaScanRadiusMeters` (400 m) **of the shuttle pad**, and on a miss
-  `getPveHomeLocations` silently collapses `medCenter` to the pad — so the
-  doctor scan re-ran on the same wrong point and the provider was never found.
-  It now takes a `medCenterManual` override, else scans from **both** the pad
-  and the hangout at a separate `medCenterScanRadiusMeters` (900 m). The
-  diagnostic geometry: Theed's pad is 561 m from its own cantina vs 75 m at
-  Coronet. `medCenterResolved`/`medCenterX/Y` are on the `cityLocations`
-  dashboard rows. Note `realBuffs.providerResolveState` is `doctor || musician
-  || dancer` — "resolved" does NOT mean the doctor resolved.
-- **Cross-building cell entry is not pathfindable at range (F_0.7.5, v0.8.2)**:
-  a second, independent constraint in the same class as the P.4.1/P.4.2
-  overland findings. Asking `findPath` for a cell target in ANOTHER building
-  from an ordinary outdoor point fails deterministically — measured at Theed,
-  22 of 23 attempts, always from the identical post-egress position, returning
-  in ~100 ms (a pathfinder with no route, not a bot giving up). Harness
-  isolation established it is **positional, not stateful** (it reproduces from
-  a fresh spawn), **not a localized hole** (still fails 15 m away), and **not
-  the target** (the same cell enters fine from the pad and from the building's
-  own exterior anchor). Overland *movement* from that point works — only
-  cell-entry pathfinding has no route. So `SimHunterController`'s provider
-  approach now stages through the target building's exterior anchor and enters
-  from the doorstep, gated on BOTH `isStructureTraversalFeatureEnabled()` and
-  `realBuffs.crossBuildingStaging`. Same-building and outdoor approaches are
-  unchanged. One bot went 536 `ST_FAIL path_failed` with zero doctor visits →
-  zero failures and a completed loop.
-- **P.9 traversal gates ship ENABLED as of v0.8.2** (owner decision): the
-  master gate, `zeroClip.exitSetEnabled`, `farSideEgress`,
-  `hollowEscalationEnabled`, `hollowDoorEgress.*` and `crossBuildingStaging`.
-  Still shipped off: the zeroClip probe/enforcement (~19 ms p95 per path
-  request), all traversal/cell-nav logging, and the scenario harness — which
-  means `ST_PHASE` traces are NOT available in a default deployment, and
-  turning logging on is a deliberate diagnostic step.
+### Core classes
+
+- **`server/zone/objects/creature/simplayer/SimPlayerManager.{h,cpp}`** — the "economy brain":
+  roster, demand/supply simulation, resource targeting, cross-planet coverage, the PlayerBot
+  stores, and all dashboard JSON (§11). The largest, most-touched file.
+- **`SimPlayerController.{h,cpp}`** — per-NPC movement base (`SimMinerController` for gatherers):
+  path/sample lifecycle, stuck-watchdog (bounded re-path → `onPathFailed`), activation trust
+  (`isActivationTrustAcceptable()` = `verifiedPath` or overland `directOverland`).
+- **`SimPvPController`** (§13) and **`SimHunterController`** (PvE, below) are its siblings.
+
+### Movement and cell navigation (P.4-P.9)
+
+- **Cell-aware `moveTo`** (P.6.5b): optional target cell; world position for distance math,
+  cell-local for the path request; path-node cells survive into `PatrolPoint`s. Outdoor callers
+  (all miners) are unaffected. **`findNextPosition` assumes one coordinate space per comparison**
+  — keep world and cell-local forms separate (`tuto_0.4.11.md`).
+- **Cell-nav stack** (F_0.4.7-F_0.4.11): cell entry adopts the cell on `findNextPosition`'s
+  duplicate-skip branch (no teleport-into-wall); cell egress
+  (`beginCellEgressIfNeeded`) portal-follows to an exterior then resumes; multi-door starports use
+  `BuildingObject::getNearestExteriorPortalPoint`; gated `ticketCollectorTravel` walks to the
+  collector in the enclosed hollow (`resolveStarportInteriorWaypoint`, tri-state, bounded
+  horizontal containment margin) with bounded retries, outdoor recovery and an idempotent PvP
+  arrival OID barrier. `CellNavDiagLog` → `bin/log/cellnav.log` (gate `cellNavDiag.logging`).
+- **Structure traversal (P.9 / F_0.8.0)** — explicit state machine on `SimPlayerController`:
+  `StructureTraversalPhase` (`Idle→ApproachDoor→InteriorRoute→Egress→Reentry→CombatPaused→Resuming`)
+  with a `traversalGeneration` **separate from** the movement generation, so combat can cancel a
+  path task without cancelling traversal intent. Bounded hollow escalation rescues bots stranded
+  in a starport hollow. **D2b far-side egress**: from inside a starport the pathfinder routes to
+  the far door via the *nearest* portal back into the hollow — a path that **succeeds while making
+  no progress**, invisible to the failure-only repair ladder. `acceptFoundPath` rejects it and
+  retargets to the nearest reachable non-hollow exit cell, exempting destinations in the hollow
+  (multi-hop transit lands on the pad). **Never force a bot out of a hollow that is its
+  destination.**
+- **Adoption (F_0.8.1)** — machinery is not adoption: `enterStructure()` once had only the
+  harness as caller. Rule: a cell-bearing destination is a building entry and goes through
+  `enterStructure`, not bare `moveTo`. Migrated: `SimHunterController` (buff providers),
+  `SimPvPController` (collectors, starport waypoints), guarded on a non-null cell (a hollow is a
+  null cell and stays outdoor); where the legacy call was `moveTo`, the guard also tests the gate,
+  since `enterStructure`'s null-cell fallthrough calls `moveToInterior`. **Miners are not
+  migrated** (station travel lands them outdoors). `acceptFoundPath` is a non-virtual template
+  method (invariants + `virtual acceptFoundPathHook`). **`exitStructure` is NOT adopted**:
+  production bots leave via the legacy egress ladder (`F_0.8.2_traversal-egress-adoption.plan.md`).
+- **Test-oracle vs production telemetry (F_0.8.1)** — harnesses assert on **per-agent** tallies
+  (monotonic `std::atomic` on `SimPlayerController`, not reset by `clearStructureTraversalState`),
+  never on global dashboard aggregates, which any world bot can move. A destroyed body's counters
+  fold into a per-slot carry in `destroyStructureTraversalTestBot`, under the agent lock.
+- **Post-lock lifecycle recheck (F_0.8.1)** — any pre-lock guard (e.g. `agent->getZone()` in
+  `checkArrival`) needs the same check after `Locker locker(agent)`: another thread may have
+  destroyed the agent under that lock meanwhile.
+- **Harness single-writer pattern** — the 26-scenario `structureTraversalTest` matrix (AI
+  `simTraversalTest.lua`) holds its cursor under `structureTraversalTestMutex` per invocation but
+  schedules tasks **outside** it: notify hooks take that mutex from threads holding agent locks
+  (harnessMutex → agentLock vs agentLock → harnessMutex = ABBA). Log:
+  `StructureTraversalDiagLog` → `bin/log/structuretraversal.log`.
+- **Zero-clip (D7)**, observe + enforce, default-off (~19 ms p95/path): the probe
+  (`probeEmittedPathClearance`) runs on the pathfinding worker before delivery; results are
+  explicit (`clear`/`would_block`/`skipped`/`truncated`/`error`), worst-evidence-first.
+  Enforcement re-asks up to `zeroClip.rejectionCap` then walks the route; it fails **open** (a
+  mover that cannot see must still move), while harness oracles fail **closed**. Off-thread
+  snapshots must be `SortedVector<ManagedReference<TreeEntry*> >`, never raw
+  `InRangeObjectsVector`. Chord rays through stairs/bridge decks hit solid mass;
+  `zeroClip.walkableConfirm` checks flagged chords against the navmesh. `getRecastPath`'s
+  `float& len` is **not** a length (relative comparator only).
+- **Shipped state (v0.8.2, owner)**: traversal master gate, `zeroClip.exitSetEnabled`,
+  `farSideEgress`, `hollowEscalationEnabled`, `hollowDoorEgress.*`, `crossBuildingStaging` are ON;
+  zero-clip probe/enforce, all traversal/cell-nav logging and the harness are OFF (no `ST_PHASE`
+  traces by default).
+
+### PvE hunters (`SimHunterController`, P.8)
+
+- **Loop**: market-driven mission hunt (travel → terminal → held offer → real lair → pull → kill →
+  harvest) closing the crafter→hunter demand loop; also owns the gated cross-planet buff trip.
+  `SimPlayerManager` owns offers, dispatch and routes. Combat is **real**
+  (`CombatManager::startCombat`); bodies spawn `PLAYER | ATTACKABLE`, faction 0, with player-safe
+  targeting: the `AiAgentImplementation::isAttackableBy` mirror is consulted by `startCombat` and
+  `getAreaTargets`, so no AoE splash onto players. Navmesh in cities, overland in the wild
+  (`usesNavmeshHybridMovement()`, base false). Default body `death_watch_wraith` + `rifle_t21`.
+- **Two tick threads, single writer**: `onTick` (arrival) and `runActiveTick`
+  (`SimHunterActiveTickTask`) run on independent pool threads; `runActiveTick` owns combat-target
+  state, `onTick` only self-defends on travel legs. Defender reads snapshot under the hunter lock
+  (`add`/`removeDefender` are `@preLocked`). `activeTickGeneration` is atomic latest-wins,
+  `tickRunning` a non-blocking single-flight guard.
+- **Terminal-visit epoch (F_0.5.0)**: `openTerminalVisit` / `pveTerminalVisitEpoch` captured at
+  board open and rechecked at commit, so a late offer set for a finished order or drained body is
+  discarded. An empty board retries `offerMaxAttempts`×`offerRetrySeconds`.
+- **Demand-pressure dispatch**: an order issues only while a family's `signalUnits > 0` (supply
+  below `effectiveCeiling`, `familyAllocationCeiling{Units,Fraction}`; fraction 1.0 — a lower cap
+  silently strands the roster). F_0.6.0: hunters supply **hide, bone and meat**; one kill credits
+  all three in `recordPveHunterHarvest` (≥3 units each); accept reserves all three
+  (`computeReservedInboundByProfileFamily`) with an intra-pass signal decrement. Known debt:
+  `consumeReservation` does not drain `familySupply` in-session, so families re-saturate until a
+  consumer phase exists.
+- **F_0.9.8b progression-first dispatch** (`progressionDispatch.enabled`): a bot whose whole
+  training plan is incomplete (`SimBotActivityDecision::templateComplete`; deferred XP types do not
+  block) is dispatched by `runPveProgressionDispatchPass` before the extraction loop. Candidates are
+  lairs combat will fight (`SimBotDispatchPolicy::isLairFightable` = the pack rule,
+  `hasPackMobile`; solo assumed) in the **grind tier** window (`getPlayerBotGrindTier`: weapon
+  difficulty tier, not combat level), ranked non-pack → XP fit → demand → same planet. The order
+  pins the lair (`pinnedLairTemplate`, `dispatchLevel`, `avoidPacks`), honoured by
+  `selectPveBotMissionLairSpawn`. Nothing fightable → grind for `grindFallbackMinutes`
+  (`progressionGrindFallbackUntilMs`, read by `scorePlayerBotActivity`).
+- **F_0.9.8c travel combat** (`missionBoard.travelCombat`, `travelRestHamPct`): on every overland
+  mission leg a `SimBotTravelCombat` sub-mode (MOVE/FLEE/REST, owned by `runActiveTick`) flees
+  **toward the mission** (veer if the attacker is ahead, sideways near the destination) and rests
+  to `resumeHamPct`. Base hooks (default old behavior): `allowsMovementInCombat()`
+  (`moveToWithOrigin`, `onPathFound`, `checkArrival`) and `isMovementHeld()`. Flee arrivals/path
+  failures route to the tick, never to `LAIR_REACHED`. A mop-up hold (self-release 180 s) stops
+  walking while a creature is aimed at the bot. `missionBoard.attackerRecognition`:
+  `selectActiveCombatAttacker` also takes threat-map creatures in combat and aimed at the bot.
+- **Real buffs (P.8.6, `realBuffs.enabled`)**: when a tracked buff is missing or near expiry, the
+  hunter visits its home-city med center/cantina and is buffed by real Doctor/Musician/Dancer NPCs
+  (`PlayerManager::startWatch`/`startListen`; doctor chat driven via `ScreenPlayTask`, since bot
+  chat cannot reach the player-only `SPATIALCHATSENT` observer). `realBuffs.fallbackBuffs` covers
+  unreachable providers.
+- **Provider anchors are search anchors, not destinations (v0.8.2)**: `resolvePvpCityLocations`
+  publishes `hangout`/`medCenter` exterior points; the move target is the provider NPC's own
+  cell-local position. On a miss `getPveHomeLocations` silently collapses `medCenter` to the pad,
+  so the scan now honours `medCenterManual`, else scans from pad **and** hangout at
+  `medCenterScanRadiusMeters` (900 m) (Theed's pad is 561 m from its cantina).
+  `realBuffs.providerResolveState` is `doctor || musician || dancer` — "resolved" does not mean the
+  doctor resolved.
+- **Cross-building cell entry is not pathfindable at range (v0.8.2)**: `findPath` to a cell in
+  ANOTHER building from an ordinary outdoor point fails deterministically (Theed: 22/23, ~100 ms),
+  positional, not stateful or target-specific; overland movement there works. Provider approaches
+  stage through the target building's exterior anchor (gates
+  `isStructureTraversalFeatureEnabled()` + `realBuffs.crossBuildingStaging`).
+
+### PlayerBot parity line (P.10)
+
 - **PlayerBot progression store (P.10a / F_0.9.0)** — the durable home for
   player-parity state, and the first piece of the P.10 line. XP by type,
   bank/cash credits, skill points and trained skills live in three MySQL tables
@@ -1122,7 +812,31 @@ This is this fork's primary custom subsystem, layered on top of the stock
     `setBodyTemplate` pins a harness body when a scenario must not depend on species.
   - **Live receipts:** 55/55 (pre-amendment) and 60/60 including the owner's in-client check
     (`docs/4-unit-tests/live_f0913-*`).
-- **Simulation-only by default, with one approved exception (P.10, 2026-09-02)**:
+- **Food and drink (P.10o / F_0.9.14, released v0.9.15)**: bots eat what they own.
+  - **Stomach is derived, not ticked.** Per identity, food and drink fill (max 100, 1 point per
+    18 s, as `PlayerObject`) with a clock per side, digested lazily on read (`SimBotConsumables.h`).
+    Memory only: kept through death, empty after a restart. A bot has no ghost, so the stock use
+    path (`handleObjectMenuSelect`) cannot run; `Consumable::applyConsumptionBuff` is the shared
+    buff constructor both paths call.
+  - **One entry point, three call sites.** `consumePlayerBotFoodBeforeEngage` (no lock held by the
+    caller) runs before `engageTarget`, `engageMissionLair` and `defendAgainstInterceptor`. The
+    last was added after production showed mission bots almost never start a fight. Instead of a
+    timer it stores the next moment anything can change (soonest buff expiry, digest room, no-dose
+    retry, 30 s floor); a spawn clears it. Apply order: agent lock, then `Locker(item, agent)`;
+    stomach and counters under `progressionMutex` afterwards. Doses come off the vault stack with
+    `setUseCount`, never `decreaseUseCount`; the last dose leaves through the vault removal path
+    (`item -1`, `source = consume`).
+  - **Combat seam.** Transient `AiAgent::simBotConsumableParity` follows the gate on live bodies
+    (slow-tick reconcile, which also strips food buffs when the gate closes). Defense adds the
+    BUFF-typed `dodge_attack`; accuracy adds the food to the stock AI value. **`AiAgent::getSkillMod`
+    returns the skill-mod total when nonzero, otherwise a fallback (template statistic, then
+    `100 + 2 x level` for any accuracy mod)**, so any buff on an NPC hides that fallback. The
+    fallback is `getSkillModFallback`, and a seam that adds a buff must restore it.
+  - **Restock** rides the debit-first BUY path: a need below `minDoses` with nothing pending,
+    candidates matched by the template's client game object type (an unfiltered scan spent its load
+    budget on unrelated cheap listings), ranked by price per dose. SELL protects configured food.
+  - **Live receipt:** 68/68 (`docs/4-unit-tests/live_f0914-*`).
+- **Simulation-only policy, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line
   (`docs/1-plans/ROADMAP_p10-playerbot-parity.md`), which is the owner's
@@ -1136,58 +850,31 @@ This is this fork's primary custom subsystem, layered on top of the stock
   semantics. Miners and PvP bots have no roster identity and remain
   simulation-only. New work outside P.10 still defaults to a dry-run/simulated
   code path unless its plan says otherwise.
-- **Config**: `bin/scripts/managers/sim_player_manager.lua` — all tunables
-  (demand thresholds, recovery dry-run flag, `enableStationTravel`,
-  `enableVehicleMechanics`, coverage/dispatch gates). New behavior should be
-  gated here, default-off, per the project's "reversible, gated" standard.
-- **Design doc**: `docs/ai-miner-navigation-design.md` is the living plan
-  for this subsystem (phases A/B, P.4.1-P.4.5+) — keep it current alongside
-  code changes (see `docs/ARCHI-rules.md`).
 
 ## 13. AI PvP / Jedi Archetype Layer
 
-A second major custom vertical, sharing the SimPlayer NPC infrastructure:
+Shares the SimPlayer infrastructure and §12's conventions (Lua gates, simulation defaults,
+dashboard visibility, live verification).
 
-- **PvP squads**: NPC-driven group combat (`SimPvPController`), with
-  "player-mimetic" routed travel — BFS-planned multi-leg journeys over the
-  real fare matrix, departures from actual starport ticket collectors
-  (interior where pathable), intra-planet legs via real city shuttleports,
-  cantina-derived hangouts (all three per-city locations resolved from live
-  game data with boot/navmesh-readiness guards), tactical arrival one city
-  out from contested destinations, and break-off-after-deaths cohesion —
-  design in `docs/ai-pvp-mimetic-travel-design.md` and
-  `docs/ai-pvp-squad-design.md`.
-- **Controller-driven combat engagement (P.6.6, F_0.7.0)**: an opt-in combat
-  lane that replaces the emergent stock behavior-tree combat. `SimPvpBotController`
-  scans a ~100 m radius, drives a cell-aware approach to the target (portal graph,
-  no clipping through starports), and engages/holds at weapon range with LOS
-  enforced by stock combat (`CombatManager::startCombat`). While engaged the
-  controller swaps in a `simPvpCombat` no-op-MOVE AI map (`setCustomAiMap` +
-  `setAITemplate`, formationOffset preserved) so the stock tree never double-drives
-  movement; a per-tick `driveCombatMovement` owns approach→engage→hold, and
-  `isInteriorTraversalActive()` suppresses combat while a member is mid-starport
-  traversal (traversal wins). Two hardening fixes ship with it: a shared
-  target-eligibility helper (players or enabled sim-bots only) keeps ordinary NPC
-  combat on stock self-defense, and an in-range bot engages-and-holds under LOS
-  loss (LOS is telemetry-only) instead of clearing combat and dying passively.
-- **Squad aggro-sharing / combat contagion (P.6.6b, F_0.7.1)**: default-off,
-  squad-local shared-aggro so idle squadmates converge on a teammate's fight over
-  the same cell-aware lane. Each `SimPvpSquad` keeps a small TTL-refreshed
-  shared-enemy set (`recordPvpSquadCombatTarget` / `getPvpSquadSharedCombatTargets`,
-  guarded by `pvpSquadMutex`, agent locks taken **outside** it); an idle
-  controller acquires a live shared target within a convergence-specific radius
-  (300 m) and timeout (60 s), with failed-target suppression so it never thrashes
-  an unreachable contact. Verified live at the squad level; per-member contribution
-  telemetry is recorded debt. All P.6.6/6.6b gates (`pvpConfig.combat.*`
-  `controllerDrivenEngage`, `squadAggroSharing`, `logCombatMovement`) ship
-  **default-off**; dashboard surface is `pvpActivity.combatEngagement`.
-- **Jedi/Force archetype**: NPC Jedi with a Force-power ladder and FRS
-  (Force Rank System) progression paid via the same XP hooks real players
-  use — design in `docs/ai-jedi-force-archetype-design.md` and
-  `docs/ai-jedi-frs-rank-design.md`.
-- Both layers follow the same conventions as §12: Lua-gated config,
-  simulation/dry-run defaults, dashboard visibility, verify-on-live-server
-  before declaring done.
+- **PvP squads** (`SimPvPController`): player-mimetic routed travel — BFS over the real fare
+  matrix, departures from real ticket collectors, intra-planet shuttleports, cantina-derived
+  hangouts (resolved from live data behind boot/navmesh-readiness guards), tactical arrival one
+  city out, break-off after deaths (`docs/ai-pvp-mimetic-travel-design.md`,
+  `docs/ai-pvp-squad-design.md`).
+- **Controller-driven engagement (P.6.6, F_0.7.0)**: `SimPvpBotController` scans ~100 m, makes a
+  cell-aware approach and engages/holds at weapon range (LOS enforced by `startCombat`). While
+  engaged it swaps in a `simPvpCombat` no-op-MOVE AI map (`setCustomAiMap` + `setAITemplate`,
+  formationOffset kept) so the tree never double-drives; `driveCombatMovement` owns
+  approach→engage→hold; `isInteriorTraversalActive()` suppresses combat mid-traversal. A shared
+  eligibility helper (players or enabled sim-bots only) leaves NPC combat on stock self-defense;
+  an in-range bot holds under LOS loss.
+- **Squad aggro-sharing (P.6.6b, F_0.7.1)**: per-squad TTL shared-enemy set
+  (`recordPvpSquadCombatTarget` / `getPvpSquadSharedCombatTargets` under `pvpSquadMutex`, agent
+  locks taken **outside** it); idle squadmates converge within 300 m / 60 s with failed-target
+  suppression. Gates `pvpConfig.combat.{controllerDrivenEngage,squadAggroSharing,logCombatMovement}`
+  default-off; dashboard `pvpActivity.combatEngagement`. Per-member telemetry is debt.
+- **Jedi/Force archetype** (P.7): NPC Jedi Force ladder and FRS ranks paid through the player XP
+  hooks (`docs/ai-jedi-force-archetype-design.md`, `docs/ai-jedi-frs-rank-design.md`).
 
 ---
 
@@ -1231,69 +918,44 @@ flowchart LR
 
 ## Error Handling Strategy
 
-- Native engine exceptions (`LuaCallbackException`, `LuaPanicException`,
-  ORB/RMI exceptions) are caught at manager/controller boundaries and
-  logged; a scripting error in one NPC's Lua callback should not crash the
-  zone process.
-- `SimPlayerController`'s stuck-watchdog is the model for this fork's
-  AI-layer error handling: detect a stalled/failed state (e.g. path
-  failure), bound the retry, and fall back to a safe recovery path
-  (`onPathFailed`, manager-level recovery/reset) rather than looping or
-  crashing.
-- Prefer surfacing failures into the dashboard diagnostics
-  (`pathValidationDiagnostics`, `minerRecovery`) over silent logging only —
-  this project's actual debugging workflow is reading the live dashboard.
+- Engine exceptions (`LuaCallbackException`, `LuaPanicException`, ORB/RMI) are caught and logged
+  at manager/controller boundaries; one NPC's script error must not crash the zone.
+- AI-layer model = `SimPlayerController`'s watchdog: detect a stalled state, bound the retry, fall
+  back to a safe recovery (`onPathFailed`, manager reset) — never loop or crash.
+- Surface failures in dashboard diagnostics (`pathValidationDiagnostics`, `minerRecovery`, ...),
+  not only logs: the live dashboard is the debugging workflow.
 
 ## Testing Strategy
 
-- GoogleTest/GoogleMock, compiled directly into the `core3` binary as a
-  library (`core3tests`) rather than a standalone test executable; run via
-  `core3 runUnitTests` (see `docs/4-unit-tests/TESTING.md`).
-- Existing coverage (`src/tests/*Test.cpp`) focuses on core engine
-  primitives (terrain, zones, creature objects, credit objects, Lua
-  bindings, name manager) — the AI-economy/PvP/Jedi layers are presently
-  verified primarily via the **live dashboard**, not unit tests. New unit
-  tests are welcome but the project's actual acceptance bar for AI-layer
-  work has been live-dashboard verification before/after.
-- Mocking scaffolding (`MockBehavior.h`, `MockCompositeBehavior.h`,
-  `DeadlockTestBase`) exists for behavior-tree and concurrency testing.
-- **Never run `core3 runUnitTests` while the live server is up.** The test process shares
-  the Berkeley DB environment in `bin/databases/`; twice (2026-09-21, 2026-10-13) the
-  server's next delta save panicked (`BDB0060`, `DB_RUNRECOVERY`) and the server
-  deadlocked. Run tests with the server stopped, for example just before an approved
-  restart. Recovery: stop the exact pid, back up `databases`, `db5.3_recover -h databases`.
+- GoogleTest/GoogleMock built into `core3` as `core3tests`; run via `core3 runUnitTests
+  --gtest_filter=...` (`docs/4-unit-tests/TESTING.md`). Pure-policy headers (`SimBot*.h`) carry
+  the AI layer's gtests (`SimBot*` filter).
+- AI behavior that needs a live zone (navmesh, combat, bazaar) is accepted by **live dashboard
+  verification and scenario harnesses** (`structureTraversalTest`, `playerBotParityTest`) with
+  TRIP-verify receipts. Harness bodies run `SimParityTestController`, never hunter code.
+- Scaffolding: `MockBehavior.h`, `MockCompositeBehavior.h`, `DeadlockTestBase`.
+- **Never run `core3 runUnitTests` while the live server is up**: it shares the BDB environment in
+  `bin/databases/`; twice (2026-09-21, 2026-10-13) the next delta save panicked (`BDB0060`,
+  `DB_RUNRECOVERY`) and deadlocked the server. Recovery: stop the exact pid, back up `databases`,
+  `db5.3_recover -h databases`.
+  **A test run never fully exits**: after `[  PASSED  ]` the `core3` leader becomes a zombie whose
+  worker threads keep the environment open. Run it as `timeout -s KILL 120 ./core3 runUnitTests
+  ...` with the server stopped, and confirm no `/proc/*/task/*/fd` points into `databases/` before
+  starting the server.
 
-## Performance Considerations
+## Performance, Security, Deployment
 
-- Hot paths (zone tick, pathfinding, object locking) are C++ by design;
-  keep new frequently-executed logic out of Lua.
-- `SimPlayerManager` iterates potentially hundreds of NPCs per tick for
-  dashboard/economy bookkeeping — be mindful of adding O(n²) work across the
-  SimPlayer population without profiling against the live server.
-
-## Security Considerations
-
-- The REST dashboard API is Bearer-token gated over HTTPS (self-signed cert
-  in `bin/conf/ssl.*`) — do not add unauthenticated endpoints.
-- `adminusers.lst`/`webusers.lst` gate in-game admin and web access
-  respectively.
-- Config files containing credentials (`config-local.lua`, `.my.cnf`) must
-  never be committed with real secrets.
-
-## Deployment
-
-- Single-server, self-hosted, Docker-only. There is no CI/CD pipeline or
-  staged deployment — `build` (incremental) followed by an owner-approved
-  `run`/restart against the one live container **is** the deployment
-  process. See §6.
+- **Performance**: hot paths (zone tick, pathfinding, locking) stay in C++; `SimPlayerManager`
+  iterates hundreds of NPCs per tick — no unprofiled O(n²) work over the population.
+- **Security**: the REST API is Bearer-gated HTTPS (self-signed `bin/conf/ssl.*`), never add an
+  unauthenticated endpoint; `adminusers.lst`/`webusers.lst` gate admin and web access;
+  `config-local.lua`/`.my.cnf` never committed with real secrets.
+- **Deployment**: single self-hosted container, no CI/CD. `build` then an owner-approved
+  `run`/restart **is** deployment (§6).
 
 ## Conclusion
 
-This fork inherits a mature, if idiosyncratic, C++ MMO server architecture
-(IDL-generated distributed objects, strict lock discipline, Lua-scripted
-behavior) and builds a new autonomous-NPC economy simulation on top of it
-without modifying the underlying engine's contracts. The two central
-constraints for any new work are architectural, not stylistic: (1) match
-existing `Reference`/`Locker` choreography exactly, and (2) keep new
-AI-economy/PvP/Jedi behavior gated, default-off, and simulation-only until
-the owner explicitly approves a mutating phase.
+A mature C++ MMO architecture (IDL objects, strict locking, Lua behavior) with an autonomous-NPC
+economy built on top without changing engine contracts. Two constraints govern all new work:
+(1) match existing `Reference`/`Locker` choreography exactly; (2) keep AI-economy/PvP/Jedi behavior
+gated, default-off and simulation-only unless the owner approved a mutating phase (P.10).

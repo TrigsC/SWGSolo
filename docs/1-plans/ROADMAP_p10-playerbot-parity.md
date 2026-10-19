@@ -10,9 +10,10 @@ inserted ahead of the bazaar work. **F_0.9.10** (P.10k, bazaar BUY) is RELEASED
 as v0.9.12 (2026-10-16). **F_0.9.12** (P.10m, weapon loadout) was inserted next
 on the owner's request and is RELEASED as v0.9.13 (2026-10-17), followed by **F_0.9.13** (P.10n,
 armor loadout with visible armor, ten species and a fixed look per bot), RELEASED as v0.9.14
-(2026-10-18). Next chunk: **F_0.9.11** (P.10l, profession allocation policy).
+(2026-10-18), and **F_0.9.14** (P.10o, food and drink), RELEASED as v0.9.15 (2026-10-19). Next
+chunk: **F_0.9.11** (P.10l, profession allocation policy).
 **Written**: 2026-09-02 (project week 8)
-**Last updated**: 2026-10-18 — F_0.9.13 armor loadout released as v0.9.14
+**Last updated**: 2026-10-19 — F_0.9.14 food and drink released as v0.9.15
 
 ## 0. Mandate
 
@@ -623,6 +624,15 @@ F_0.9.0 store+dashboard+reaper+harness
 - **Test strategy**: seeded listing → bot buys → store debited by price,
   item in vault + ledger; insufficient credits → skipped; human-listing policy
   predicate asserted; gate-off → zero purchases.
+
+### F_0.9.14 — Food and drink (P.10o) — RELEASED as v0.9.15 (2026-10-19)
+
+> Released. See `F_0.9.14_p10o-food-and-drink.plan.md`. Inserted before F_0.9.11 on the owner's
+> request. Roster bots have a player-parity stomach (memory only), eat Lua-listed crafted food from
+> the vault before fights they start or fight back in, and restock on the bazaar below 10 doses
+> through the debit-first BUY path, priced per dose. A flagged combat seam makes the buffs count.
+> Open: grouping commands ("take foods", "ok let's fight") are a `TODO(P.10 grouping)` at the
+> single entry point.
 
 ### F_0.9.13 — Armor loadout (P.10n) — RELEASED as v0.9.14 (2026-10-18)
 

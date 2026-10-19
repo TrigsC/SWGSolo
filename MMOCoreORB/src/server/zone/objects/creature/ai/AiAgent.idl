@@ -95,6 +95,7 @@ class AiAgent extends CreatureObject {
 	protected transient CreatureAttackMap defaultAttackMap;
 	protected transient CreatureAttackMap skillDerivedAttackMap;
 	protected transient boolean simBotWornArmor;
+	protected transient boolean simBotConsumableParity;
 	protected transient unsigned long simBotArmorMitigatedTotal;
 	protected transient int skillAbilitySpecialChance;
 	protected transient boolean skillAbilityPreferFreeState;
@@ -664,6 +665,18 @@ class AiAgent extends CreatureObject {
 	@preLocked
 	public boolean hasSimBotWornArmor() {
 		return simBotWornArmor;
+	}
+
+	@local
+	@preLocked
+	public void setSimBotConsumableParity(boolean parity) {
+		simBotConsumableParity = parity;
+	}
+
+	@local
+	@preLocked
+	public boolean hasSimBotConsumableParity() {
+		return simBotConsumableParity;
 	}
 
 	@local
@@ -1426,6 +1439,13 @@ class AiAgent extends CreatureObject {
 
 	@read 
 	public native int getSkillMod(final string skillMod);
+
+	/**
+	 * The template and level fallbacks getSkillMod returns when the creature
+	 * skill-mod total is zero.
+	 */
+	@read
+	public native int getSkillModFallback(final string skillMod);
 
 	@dirty
 	public native int getDamageMin();

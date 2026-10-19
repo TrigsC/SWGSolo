@@ -121,6 +121,42 @@ void ConsumableImplementation::updateCraftingValues(CraftingValues* values, bool
 	}
 }
 
+bool ConsumableImplementation::applyConsumptionBuff(CreatureObject* consumer) {
+	if (consumer == nullptr)
+		return false;
+
+	float newDuration = duration;
+
+	// Twi'lek race receives a 10% duration bonus
+	if (newDuration > 0 && consumer->getSpeciesName() == "twilek") {
+		newDuration *= 1.10f;
+	}
+
+	ManagedReference<Buff*> buff = nullptr;
+
+	switch (effectType) {
+	case EFFECT_ATTRIBUTE:
+		buff = new Buff(consumer, buffName.hashCode(), newDuration, BuffType::FOOD);
+		break;
+	case EFFECT_SKILL:
+		buff = new Buff(consumer, buffName.hashCode(), newDuration, BuffType::FOOD);
+		break;
+	case EFFECT_DURATION:
+		buff = new DurationBuff(consumer, buffName.hashCode(), newDuration);
+		break;
+	default:
+		return false;
+	}
+
+	Locker locker(buff);
+
+	setModifiers(buff, effectType != EFFECT_ATTRIBUTE);
+
+	consumer->addBuff(buff);
+
+	return true;
+}
+
 int ConsumableImplementation::handleObjectMenuSelect(CreatureObject* player, byte selectedID) {
 	if (!isASubChildOf(player))
 		return 0;
@@ -187,20 +223,11 @@ int ConsumableImplementation::handleObjectMenuSelect(CreatureObject* player, byt
 	ManagedReference<Buff*> buff = nullptr;
 
 	switch (effectType) {
-	case EFFECT_ATTRIBUTE: {
-		buff = new Buff(player, buffName.hashCode(), newDuration, BuffType::FOOD);
-
-		Locker locker(buff);
-
-		setModifiers(buff, false);
+	case EFFECT_ATTRIBUTE:
+		applyConsumptionBuff(player);
 		break;
-	}
 	case EFFECT_SKILL: {
-		buff = new Buff(player, buffName.hashCode(), newDuration, BuffType::FOOD);
-
-		Locker locker(buff);
-
-		setModifiers(buff, true);
+		applyConsumptionBuff(player);
 
 		// Set the sysmsg(s) for the skillmod.
 		StringIdChatParameter params("@combat_effects:skill_mod_buffed"); // Your skill in %TO has improved.
@@ -278,11 +305,7 @@ int ConsumableImplementation::handleObjectMenuSelect(CreatureObject* player, byt
 	}
 
 	case EFFECT_DURATION: {
-		buff = new DurationBuff(player, buffName.hashCode(), newDuration);
-
-		Locker locker(buff);
-
-		setModifiers(buff, true);
+		applyConsumptionBuff(player);
 		break;
 	}
 

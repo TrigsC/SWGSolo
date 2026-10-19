@@ -34,6 +34,7 @@
 #include "server/zone/objects/creature/simplayer/SimBotMissionPlacement.h"
 #include "server/zone/objects/creature/simplayer/SimBotLoadout.h"
 #include "server/zone/objects/creature/simplayer/SimBotArmorLoadout.h"
+#include "server/zone/objects/creature/simplayer/SimBotConsumables.h"
 #include "server/zone/objects/creature/simplayer/SimBotAppearance.h"
 
 using namespace server::zone;
@@ -104,6 +105,22 @@ struct SimBotArmorPolicy {
 	float upgradeSpendFraction = 0.5f;
 	int maxUpgradeLoadsPerVisit = 8;
 	int bodyHamBaseline = 0;
+};
+
+// Each side keeps its own digest clock (SimBotConsumables::digest).
+typedef SimBotConsumables::Stomach SimBotStomach;
+
+struct SimBotConsumablePolicy {
+	bool enabled = false;
+	bool bazaarRestock = false;
+	int minDoses = 10;
+	int minRecheckSeconds = 30;
+	int noDoseRetrySeconds = 300;
+	int restockScanIntervalMinutes = 15;
+	int maxRestockLoadsPerVisit = 6;
+	float restockSpendFraction = 0.25f;
+	Vector<SimBotConsumables::ConsumableEntry> items;
+	String signature;
 };
 
 struct SimBotBodyArmorContext {
@@ -911,6 +928,21 @@ struct PlayerBotParityTestStep {
 	String armorFaction;
 	String armorRace;
 	String buffPool;
+	String consumableBuff;
+	int expectedDoses = -1;
+	bool hasExpectedDoses = false;
+	int expectedFood = -1;
+	int expectedDrink = -1;
+	int stomachAgeSeconds = 0;
+	bool hasExpectedFood = false;
+	bool hasExpectedDrink = false;
+	bool hasStomachAgeSeconds = false;
+	bool expectedBuffPresent = false;
+	bool hasExpectedBuffPresent = false;
+	int expectedAccuracy = 0;
+	int expectedDefense = 0;
+	bool hasExpectedAccuracy = false;
+	bool hasExpectedDefense = false;
 	float attackSpeed = 0.f;
 	bool hasAttackSpeed = false;
 	bool loadoutTemplateComplete = false;
@@ -2654,6 +2686,21 @@ private:
 	VectorMap<uint64, uint64> progressionBazaarUpgradeScanAtMs;
 	VectorMap<uint64, uint64> progressionArmorUpgradeScanAtMs;
 	SimBotArmorPolicy progressionArmorPolicy;
+	SimBotConsumablePolicy progressionConsumablePolicy;
+	VectorMap<uint64, SimBotStomach> progressionStomach;
+	VectorMap<uint64, uint64> progressionConsumableNextCheckAtMs;
+	VectorMap<uint64, uint64> progressionConsumableRestockScanAtMs;
+	VectorMap<uint32, uint64> progressionConsumablesConsumedByTemplate;
+	VectorMap<uint64, uint32> progressionConsumablesLastConsumedByIdentity;
+	VectorMap<uint64, uint64> progressionConsumablesLastConsumedAtMs;
+	AtomicLong progressionConsumablesConsumed;
+	AtomicLong progressionConsumablesSkippedBuffActive;
+	AtomicLong progressionConsumablesSkippedStomachFull;
+	AtomicLong progressionConsumablesSkippedNoDoses;
+	AtomicLong progressionConsumablesLastDoseRemovals;
+	AtomicLong progressionConsumablesRejectedEntries;
+	AtomicLong progressionConsumablesRestockPurchases;
+	AtomicLong progressionConsumablesRestockSkips;
 	bool progressionEnabled = false;
 	bool progressionAwardKillXp = false;
 	bool progressionAwardMissionCredits = false;
@@ -2973,6 +3020,8 @@ private:
 	VectorMap<uint64, int64> playerBotParityTestCreditBaselines;
 	VectorMap<String, uint64> playerBotParityTestRequestRefs;
 	VectorMap<String, uint64> playerBotParityTestIdentityRefs;
+	VectorMap<uint64, Pair<int, int> > playerBotParityConsumableProbeBaselines;
+	VectorMap<String, uint64> playerBotParityConsumableRefs;
 	VectorMap<uint64, String> playerBotParityAppearanceSnapshots;
 	VectorMap<String, uint64> playerBotParityTestCounterBaselines;
 	VectorMap<uint64, String> playerBotParityItemStatSnapshots;
@@ -3013,6 +3062,14 @@ private:
 	bool playerBotParityTestArmorGateOverrideActive = false;
 	bool playerBotParityTestArmorGateOverride = false;
 	VectorMap<uint64, bool> playerBotParityArmorGateScopedIds;
+	bool playerBotParityTestConsumablesGateOverrideActive = false;
+	bool playerBotParityTestConsumablesGateOverride = false;
+	VectorMap<uint64, bool> playerBotParityConsumablesGateScopedIds;
+	VectorMap<uint64, bool> playerBotParityConsumablesGateValues;
+	bool playerBotParityTestConsumableRestockGateOverrideActive = false;
+	bool playerBotParityTestConsumableRestockGateOverride = false;
+	VectorMap<uint64, bool> playerBotParityConsumableRestockGateScopedIds;
+	VectorMap<uint64, bool> playerBotParityConsumableRestockGateValues;
 	// Harness-only body template per identity (setBodyTemplate): pins a
 	// species so armor scenarios do not depend on the seeded body pick.
 	VectorMap<uint64, String> playerBotParityBodyTemplateOverrides;
@@ -3517,6 +3574,13 @@ private:
 		Vector<String>& certsHeld, Vector<String>& certsPlanned,
 		Vector<String>& planXpTypes);
 	SimBotArmorPolicy snapshotPlayerBotArmorPolicy();
+	SimBotConsumablePolicy snapshotPlayerBotConsumablePolicy();
+	bool snapshotPlayerBotConsumableStacks(uint64 identityId,
+		std::vector<SimBotConsumables::HeldStack>& stacks);
+	bool removePlayerBotConsumedItem(uint64 identityId, uint64 objectId);
+	void collectPlayerBotProtectedConsumableOids(uint64 identityId,
+		VectorMap<uint64, bool>& protectedIds);
+	void reconcilePlayerBotConsumableFlags();
 	void fillPlayerBotArmorStats(ArmorObject* armor,
 		SimBotArmorLoadout::ArmorStats& stats);
 	bool snapshotPlayerBotArmorCandidates(uint64 identityId,
@@ -3663,6 +3727,8 @@ private:
 	bool playerBotProgressionAwardGateEnabled();
 	bool playerBotLoadoutGateEnabled(uint64 identityId);
 	bool playerBotArmorLoadoutGateEnabled(uint64 identityId);
+	bool playerBotConsumablesGateEnabled(uint64 identityId);
+	bool playerBotConsumableRestockGateEnabled(uint64 identityId);
 	bool playerBotArmorBazaarUpgradesGateEnabled(uint64 identityId);
 	bool playerBotBazaarUpgradesGateEnabled(uint64 identityId);
 	bool playerBotBazaarSellGateEnabled(uint64 identityId);
@@ -4280,6 +4346,7 @@ public:
 	int getTravelDiagHeartbeatSeconds() const {
 		return travelDiagHeartbeatSeconds;
 	}
+	void consumePlayerBotFoodBeforeEngage(uint64 identityId, AiAgent* agent);
 
 private:
 	bool getNearestRoutableCity(const String& planet, const Vector3& from,

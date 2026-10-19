@@ -122,6 +122,14 @@ class Consumable extends TangibleObject {
 	@arg1preLocked
 	public native void setModifiers(Buff buff, boolean skillModifiers = false);
 
+	/**
+	 * Builds this consumable's attribute, skill or duration buff and adds it to
+	 * the consumer. Shared by the player use path and the PlayerBot food path.
+	 * @pre { consumer is locked }
+	 * @return true when a buff was added
+	 */
+	public native boolean applyConsumptionBuff(CreatureObject consumer);
+
 	@read
 	public boolean isSpiceEffect() {
 		return (effectType == EFFECT_SPICE);
@@ -160,6 +168,16 @@ class Consumable extends TangibleObject {
 	@read
 	public int getDuration() {
 		return duration;
+	}
+
+	@read
+	public int getFilling() {
+		return filling;
+	}
+
+	@read
+	public unsigned int getBuffCRC() {
+		return buffCRC;
 	}
 
 	@read

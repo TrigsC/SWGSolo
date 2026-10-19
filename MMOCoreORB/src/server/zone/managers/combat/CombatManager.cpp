@@ -24,8 +24,10 @@
 #include "server/zone/managers/creature/LairObserver.h"
 #include "server/zone/managers/reaction/ReactionManager.h"
 #include "server/zone/managers/player/PlayerManager.h"
+#include "server/zone/managers/skill/SkillModManager.h"
 #include "server/zone/objects/installation/components/TurretDataComponent.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
+#include "server/zone/objects/creature/simplayer/SimBotConsumables.h"
 #include "server/zone/objects/creature/ai/CreatureTemplate.h"
 #include "server/zone/objects/creature/ai/JediFrsNpcData.h"
 #include "server/zone/objects/creature/ai/JediNpcForceAccounting.h"
@@ -1990,6 +1992,17 @@ int CombatManager::calculateTargetPostureModifier(WeaponObject* weapon, Creature
 int CombatManager::getAttackerAccuracyModifier(TangibleObject* attacker, CreatureObject* defender, WeaponObject* weapon) const {
 	if (attacker->isAiAgent()) {
 		AiAgent* agent = cast<AiAgent*>(attacker);
+
+		if (agent != nullptr && agent->hasSimBotConsumableParity()) {
+			const int buffAccuracy = agent->getSkillModOfType("attack_accuracy",
+					SkillModManager::BUFF);
+			return SimBotConsumables::foodAdjustedAiAccuracy(
+					agent->getSkillMod("attack_accuracy"), buffAccuracy,
+					agent->getSkillModFallback("attack_accuracy"),
+					agent->getChanceHit(), weapon->isMeleeWeapon() ?
+					agent->getSkillMod("melee_accuracy") :
+					agent->getSkillMod("ranged_accuracy"));
+		}
         
         // If the AI has a custom accuracy defined in Lua/getSkillMod, use it!
         int aiAccuracy = agent->getSkillMod("attack_accuracy");
@@ -2128,6 +2141,14 @@ int CombatManager::getDefenderDefenseModifier(CreatureObject* defender, WeaponOb
     if (defender->isPlayerCreature()) {
         targetDefense += defender->getSkillMod("dodge_attack");
         targetDefense += defender->getSkillMod("private_dodge_attack");
+	} else if (defender->isAiAgent()) {
+		AiAgent* aiDef = cast<AiAgent*>(defender);
+		if (aiDef != nullptr && aiDef->hasSimBotConsumableParity()) {
+			targetDefense += aiDef->getSkillModOfType("dodge_attack",
+					SkillModManager::BUFF);
+			targetDefense += aiDef->getSkillModOfType("private_dodge_attack",
+					SkillModManager::BUFF);
+		}
     }
 
 	debug() << "Target defense after state affects and cap is " << targetDefense;
@@ -2136,6 +2157,23 @@ int CombatManager::getDefenderDefenseModifier(CreatureObject* defender, WeaponOb
 	//info(msg.toString(), true);
 
 	return targetDefense;
+}
+
+SimBotConsumableCombatProbe CombatManager::getSimBotConsumableCombatProbe(
+		CreatureObject* body, CreatureObject* opponent) const {
+	SimBotConsumableCombatProbe result;
+	if (body == nullptr || opponent == nullptr)
+		return result;
+
+	ManagedReference<WeaponObject*> bodyWeapon = body->getWeapon();
+	ManagedReference<WeaponObject*> opponentWeapon = opponent->getWeapon();
+	if (bodyWeapon != nullptr)
+		result.accuracy = getAttackerAccuracyModifier(body, opponent,
+				bodyWeapon.get());
+	if (opponentWeapon != nullptr)
+		result.defense = getDefenderDefenseModifier(body, opponentWeapon.get(),
+				opponent);
+	return result;
 }
 
 int CombatManager::getDefenderSecondaryDefenseModifier(CreatureObject* defender) const {

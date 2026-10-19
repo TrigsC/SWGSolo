@@ -84,6 +84,7 @@
 #include "server/zone/objects/creature/buffs/BuffType.h"
 #include "server/zone/objects/creature/ai/Creature.h"
 #include "server/zone/objects/tangible/TangibleObject.h"
+#include "server/zone/objects/tangible/consumable/Consumable.h"
 #include "server/zone/managers/object/ObjectManager.h"
 #include "server/zone/objects/pathfinding/NavArea.h"
 #include "server/zone/managers/collision/PathFinderManager.h"
@@ -100,6 +101,7 @@
 #include "templates/manager/TemplateManager.h"
 #include "templates/creature/VendorCreatureTemplate.h"
 #include "templates/tangible/SharedWeaponObjectTemplate.h"
+#include "templates/tangible/ConsumableTemplate.h"
 #include "templates/appearance/PortalLayout.h"
 #include "templates/appearance/FloorMesh.h"
 #include "templates/appearance/PathGraph.h"
@@ -6429,10 +6431,18 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestLoadoutGateOverrideActive = false;
 		playerBotParityTestArmorGateOverrideActive = false;
 		playerBotParityTestArmorGateOverride = false;
+		playerBotParityTestConsumablesGateOverrideActive = false;
+		playerBotParityTestConsumablesGateOverride = false;
+		playerBotParityTestConsumableRestockGateOverrideActive = false;
+		playerBotParityTestConsumableRestockGateOverride = false;
 		playerBotParityArmorGateScopedIds.removeAll();
 	playerBotParityBodyTemplateOverrides.removeAll();
 		playerBotParityBodyTemplateOverrides.removeAll();
 		playerBotParityArmorGateValues.removeAll();
+		playerBotParityConsumablesGateScopedIds.removeAll();
+		playerBotParityConsumablesGateValues.removeAll();
+		playerBotParityConsumableRestockGateScopedIds.removeAll();
+		playerBotParityConsumableRestockGateValues.removeAll();
 		playerBotParityLoadoutGateScopedIds.removeAll();
 		playerBotParityLoadoutGateValues.removeAll();
 		playerBotParityBazaarUpgradesGateScopedIds.removeAll();
@@ -8894,6 +8904,298 @@ SimBotArmorPolicy SimPlayerManager::snapshotPlayerBotArmorPolicy() {
 	return progressionArmorPolicy;
 }
 
+SimBotConsumablePolicy SimPlayerManager::snapshotPlayerBotConsumablePolicy() {
+	Locker progressionLock(&progressionMutex);
+	return progressionConsumablePolicy;
+}
+
+bool SimPlayerManager::snapshotPlayerBotConsumableStacks(uint64 identityId,
+		std::vector<SimBotConsumables::HeldStack>& stacks) {
+	stacks.clear();
+	VectorMap<uint64, uint32> heldRows;
+	int maxItems = 0;
+	{
+		Locker progressionLock(&progressionMutex);
+		maxItems = progressionLootMaxItemsPerBot;
+		if (!progressionRecords.contains(identityId) ||
+				progressionConsumablePolicy.items.isEmpty())
+			return false;
+		for (int i = 0; i < progressionItems.size(); ++i) {
+			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+			if (row.identityId != identityId || row.state != SIMBOT_ITEM_HELD)
+				continue;
+			for (int itemIndex = 0;
+					itemIndex < progressionConsumablePolicy.items.size(); ++itemIndex) {
+				if (progressionConsumablePolicy.items.get(itemIndex).templateCrc ==
+						row.templateCrc) {
+					heldRows.put(row.objectId, row.templateCrc);
+					break;
+				}
+			}
+		}
+	}
+
+	if (maxItems <= 0 || heldRows.isEmpty())
+		return true;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+			economyManager->getItemBag(identityId);
+	if (zoneServer == nullptr || bag == nullptr)
+		return false;
+
+	for (int i = 0; i < heldRows.size() &&
+				static_cast<int>(stacks.size()) < maxItems; ++i) {
+		const uint64 objectId = heldRows.elementAt(i).getKey();
+		ManagedReference<SceneObject*> object = zoneServer->getObject(objectId);
+		if (object == nullptr || object->getParent().get() != bag.get())
+			continue;
+		Consumable* consumable = cast<Consumable*>(object.get());
+		if (consumable == nullptr)
+			continue;
+		Locker objectLock(object);
+		if (object->getParent().get() != bag.get() ||
+				consumable->getUseCount() == 0)
+			continue;
+		SimBotConsumables::HeldStack stack;
+		stack.objectId = objectId;
+		stack.templateCrc = heldRows.elementAt(i).getValue();
+		stack.doses = consumable->getUseCount();
+		stack.filling = consumable->getFilling();
+		stacks.push_back(stack);
+	}
+	return true;
+}
+
+bool SimPlayerManager::removePlayerBotConsumedItem(uint64 identityId,
+		uint64 objectId) {
+	if (identityId == 0 || objectId == 0)
+		return false;
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+		economyManager->getItemBag(identityId);
+	ManagedReference<SceneObject*> item = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(objectId);
+	if (bag == nullptr || item == nullptr || item->getParent().get() != bag.get())
+		return false;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (!progressionItems.contains(objectId) ||
+				progressionItems.get(objectId).identityId != identityId ||
+				progressionItems.get(objectId).state != SIMBOT_ITEM_HELD)
+			return false;
+	}
+
+	{
+		Locker itemLock(item);
+		if (item->getParent().get() != bag.get())
+			return false;
+		Locker bagLock(bag, item);
+		if (!bag->removeObject(item, nullptr, false, true))
+			return false;
+		item->destroyObjectFromWorld(true);
+		item->destroyObjectFromDatabase(true);
+	}
+
+	String displayName;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (!progressionItems.contains(objectId) ||
+				progressionItems.get(objectId).identityId != identityId ||
+				progressionItems.get(objectId).state != SIMBOT_ITEM_HELD)
+			return false;
+		displayName = progressionItems.get(objectId).displayName;
+		progressionItems.drop(objectId);
+		progressionItemDirtyIds.drop(objectId);
+		progressionItemDeleteIds.put(objectId, true);
+		uint64 held = progressionItemHeldCounts.contains(identityId) ?
+				progressionItemHeldCounts.get(identityId) : 0;
+		held = held > 0 ? held - 1 : 0;
+		progressionItemHeldCounts.put(identityId, held);
+		appendPlayerBotLedgerEntryKindLocked(identityId, "item", -1, held,
+				"consume", objectId, displayName);
+		markProgressionDirtyLocked(identityId);
+		markPlayerBotLoadoutDirtyLocked(identityId);
+		progressionConsumablesLastDoseRemovals.increment();
+	}
+	MissionDiagLog::event("CONSUME", identityId,
+			"object=" + String::valueOf(objectId) + " lastDose=1");
+	return true;
+}
+
+void SimPlayerManager::consumePlayerBotFoodBeforeEngage(uint64 identityId,
+		AiAgent* agent) {
+	// TODO(P.10 grouping): a group leader's take-food/fight command will call
+	// this same entry point once grouping lands.
+	if (agent == nullptr || !playerBotConsumablesGateEnabled(identityId))
+		return;
+
+	const uint64 nowMs = System::getMiliTime();
+	{
+		Locker progressionLock(&progressionMutex);
+		if (progressionConsumableNextCheckAtMs.contains(identityId) &&
+				progressionConsumableNextCheckAtMs.get(identityId) > nowMs)
+			return;
+	}
+
+	SimBotConsumablePolicy policy = snapshotPlayerBotConsumablePolicy();
+	std::vector<SimBotConsumables::HeldStack> stacks;
+	if (!snapshotPlayerBotConsumableStacks(identityId, stacks))
+		return;
+	std::vector<SimBotConsumables::ConsumableEntry> entries;
+	for (int i = 0; i < policy.items.size(); ++i)
+		entries.push_back(policy.items.get(i));
+
+	std::vector<bool> buffActive(entries.size(), false);
+	std::vector<uint64_t> buffRemainingMs(entries.size(), 0);
+	{
+		Locker agentLock(agent);
+		if (agent->isDead() || agent->isIncapacitated() ||
+				agent->getZone() == nullptr)
+			return;
+		for (size_t i = 0; i < entries.size(); ++i) {
+			if (entries[i].buffCrc == 0)
+				continue;
+			Buff* buff = agent->getBuff(entries[i].buffCrc);
+			if (buff == nullptr)
+				continue;
+			buffActive[i] = true;
+			buffRemainingMs[i] = static_cast<uint64>(std::max(0.f,
+					buff->getTimeLeft()) * 1000.f);
+		}
+	}
+
+	SimBotConsumables::Stomach stomach;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (progressionStomach.contains(identityId))
+			stomach = progressionStomach.get(identityId);
+	}
+	SimBotConsumables::Policy purePolicy;
+	purePolicy.minRecheckSeconds = policy.minRecheckSeconds;
+	purePolicy.noDoseRetrySeconds = policy.noDoseRetrySeconds;
+	SimBotConsumables::Decision decision =
+			SimBotConsumables::chooseConsumptions(entries, stacks, buffActive,
+					buffRemainingMs, stomach, nowMs, purePolicy);
+
+	struct AppliedConsumable {
+		SimBotConsumables::Choice choice;
+		int dosesLeft = 0;
+	};
+	std::vector<AppliedConsumable> applied;
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+			economyManager->getItemBag(identityId);
+	for (size_t i = 0; i < decision.choices.size(); ++i) {
+		const SimBotConsumables::Choice& choice = decision.choices[i];
+		ManagedReference<SceneObject*> item = zoneServer == nullptr ? nullptr :
+				zoneServer->getObject(choice.stack.objectId);
+		Consumable* consumable = item == nullptr ? nullptr :
+				cast<Consumable*>(item.get());
+		if (consumable == nullptr || bag == nullptr)
+			continue;
+
+		bool consumed = false;
+		int dosesLeft = 0;
+		{
+			Locker agentLock(agent);
+			if (agent->isDead() || agent->isIncapacitated() ||
+					agent->getZone() == nullptr)
+				break;
+			Locker itemLock(item, agent);
+			if (item->getParent().get() != bag.get() ||
+					consumable->getUseCount() == 0 ||
+					agent->hasBuff(choice.entry.buffCrc))
+				continue;
+			if (!consumable->applyConsumptionBuff(agent))
+				continue;
+			dosesLeft = consumable->getUseCount() - 1;
+			consumable->setUseCount(dosesLeft, true);
+			consumed = true;
+		}
+		if (consumed) {
+			AppliedConsumable appliedItem;
+			appliedItem.choice = choice;
+			appliedItem.dosesLeft = dosesLeft;
+			applied.push_back(appliedItem);
+		}
+	}
+
+	SimBotConsumables::Stomach stomachAfter;
+	std::vector<uint64_t> lastDoseObjects;
+	std::vector<uint64_t> actualBuffRemaining(entries.size(), 0);
+	{
+		Locker agentLock(agent);
+		for (size_t i = 0; i < entries.size(); ++i) {
+			Buff* buff = agent->getBuff(entries[i].buffCrc);
+			if (buff != nullptr)
+				actualBuffRemaining[i] = static_cast<uint64>(std::max(0.f,
+						buff->getTimeLeft()) * 1000.f);
+		}
+	}
+	{
+		Locker progressionLock(&progressionMutex);
+		SimBotConsumables::Stomach current;
+		if (progressionStomach.contains(identityId))
+			current = progressionStomach.get(identityId);
+		// Writes materialize the digest first; each side keeps its partial
+		// interval.
+		SimBotConsumables::DigestResult food =
+				SimBotConsumables::digest(current.food, nowMs);
+		SimBotConsumables::DigestResult drink =
+				SimBotConsumables::digest(current.drink, nowMs);
+		stomachAfter.food.fill = food.fill;
+		stomachAfter.food.updatedAtMs = food.updatedAtMs;
+		stomachAfter.drink.fill = drink.fill;
+		stomachAfter.drink.updatedAtMs = drink.updatedAtMs;
+		for (size_t i = 0; i < applied.size(); ++i) {
+			const SimBotConsumables::Choice& choice = applied[i].choice;
+			SimBotConsumables::StomachSide& side = choice.entry.isDrink ?
+					stomachAfter.drink : stomachAfter.food;
+			if (side.fill == 0)
+				side.updatedAtMs = nowMs;
+			side.fill = std::min(SimBotConsumables::kStomachMax,
+					side.fill + choice.stack.filling);
+			progressionConsumablesConsumed.increment();
+			uint64 consumed = progressionConsumablesConsumedByTemplate.contains(
+					choice.entry.templateCrc) ?
+					progressionConsumablesConsumedByTemplate.get(
+							choice.entry.templateCrc) : 0;
+			progressionConsumablesConsumedByTemplate.put(
+					choice.entry.templateCrc, consumed + 1);
+			progressionConsumablesLastConsumedByIdentity.put(identityId,
+				choice.entry.templateCrc);
+			progressionConsumablesLastConsumedAtMs.put(identityId, nowMs);
+			if (applied[i].dosesLeft == 0)
+				lastDoseObjects.push_back(choice.stack.objectId);
+		}
+		for (size_t i = 0; i < decision.blocked.size(); ++i) {
+			if (decision.blocked[i].reason == "buff_active")
+				progressionConsumablesSkippedBuffActive.increment();
+			else if (decision.blocked[i].reason == "stomach_full")
+				progressionConsumablesSkippedStomachFull.increment();
+			else if (decision.blocked[i].reason == "no_doses")
+				progressionConsumablesSkippedNoDoses.increment();
+		}
+		progressionStomach.put(identityId, stomachAfter);
+		progressionConsumableNextCheckAtMs.put(identityId,
+				SimBotConsumables::nextCheckAtMs(decision.blocked,
+						actualBuffRemaining,
+						stomachAfter,
+						static_cast<int>(decision.choices.size() - applied.size()),
+						nowMs, purePolicy));
+	}
+	for (size_t i = 0; i < lastDoseObjects.size(); ++i)
+		removePlayerBotConsumedItem(identityId, lastDoseObjects[i]);
+	if (!applied.empty())
+		MissionDiagLog::event("CONSUME", identityId,
+				"food=" + String::valueOf(stomachAfter.food.fill) +
+				" drink=" + String::valueOf(stomachAfter.drink.fill) +
+				" doses=" + String::valueOf(static_cast<int>(applied.size())));
+}
+
 void SimPlayerManager::fillPlayerBotArmorStats(ArmorObject* armor,
 		SimBotArmorLoadout::ArmorStats& stats) {
 	stats = SimBotArmorLoadout::ArmorStats();
@@ -9348,6 +9650,60 @@ bool SimPlayerManager::playerBotArmorLoadoutGateEnabled(uint64 identityId) {
 		!identity.trainingPlan.isEmpty();
 }
 
+bool SimPlayerManager::playerBotConsumablesGateEnabled(uint64 identityId) {
+	bool masterEnabled = false;
+	bool configured = false;
+	bool loaded = false;
+	{
+		Locker progressionLock(&progressionMutex);
+		masterEnabled = progressionEnabled;
+		configured = progressionConsumablePolicy.enabled &&
+				!progressionConsumablePolicy.items.isEmpty();
+		loaded = progressionLoaded;
+	}
+	if (!masterEnabled)
+		return false;
+	bool enabled = configured;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (identityId != 0 &&
+				playerBotParityConsumablesGateScopedIds.contains(identityId))
+			enabled = playerBotParityConsumablesGateValues.contains(identityId) ?
+				playerBotParityConsumablesGateValues.get(identityId) :
+				playerBotParityTestConsumablesGateOverride;
+	}
+	if (!enabled || !loaded || progressionItemReconcilePending.load())
+		return false;
+	if (!playerBotEarlyGameGateEnabled())
+		return false;
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	if (economyManager == nullptr || !economyManager->isItemVaultAvailable())
+		return false;
+	if (identityId == 0)
+		return true;
+	SimBotIdentity identity;
+	return snapshotPlayerBotIdentity(identityId, identity) &&
+			!identity.trainingPlan.isEmpty();
+}
+
+bool SimPlayerManager::playerBotConsumableRestockGateEnabled(
+		uint64 identityId) {
+	if (!playerBotConsumablesGateEnabled(identityId) ||
+			!playerBotBazaarBuyGateEnabled(identityId))
+		return false;
+	SimBotConsumablePolicy policy = snapshotPlayerBotConsumablePolicy();
+	bool restock = policy.bazaarRestock;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (identityId != 0 &&
+				playerBotParityConsumableRestockGateScopedIds.contains(identityId))
+			restock = playerBotParityConsumableRestockGateValues.contains(identityId) ?
+				playerBotParityConsumableRestockGateValues.get(identityId) :
+				playerBotParityTestConsumableRestockGateOverride;
+	}
+	return restock;
+}
+
 bool SimPlayerManager::playerBotArmorBazaarUpgradesGateEnabled(
 		uint64 identityId) {
 	if (!playerBotArmorLoadoutGateEnabled(identityId) ||
@@ -9400,6 +9756,29 @@ void SimPlayerManager::collectPlayerBotProtectedArmorOids(uint64 identityId,
 		wornOids, bodyRaceCrc, 0, trainedSkills, policy.scoring);
 	for (size_t i = 0; i < ids.size(); ++i)
 		protectedIds.put(ids[i], true);
+}
+
+void SimPlayerManager::collectPlayerBotProtectedConsumableOids(
+		uint64 identityId, VectorMap<uint64, bool>& protectedIds) {
+	if (!playerBotConsumablesGateEnabled(identityId))
+		return;
+
+	SimBotConsumablePolicy policy = snapshotPlayerBotConsumablePolicy();
+	if (policy.items.isEmpty())
+		return;
+
+	Locker progressionLock(&progressionMutex);
+	for (int i = 0; i < progressionItems.size(); ++i) {
+		const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+		if (row.identityId != identityId || row.state != SIMBOT_ITEM_HELD)
+			continue;
+		for (int itemIndex = 0; itemIndex < policy.items.size(); ++itemIndex) {
+			if (policy.items.get(itemIndex).templateCrc == row.templateCrc) {
+				protectedIds.put(row.objectId, true);
+				break;
+			}
+		}
+	}
 }
 
 static String simBotAppearanceSpeciesGender(const String& bodyTemplate) {
@@ -10602,14 +10981,43 @@ static bool simBotArmorPolicyEquals(const SimBotArmorPolicy& left,
 	return true;
 }
 
+static bool simBotConsumablePolicyEquals(
+		const SimBotConsumablePolicy& left,
+		const SimBotConsumablePolicy& right) {
+	if (left.enabled != right.enabled ||
+			left.bazaarRestock != right.bazaarRestock ||
+			left.minDoses != right.minDoses ||
+			left.minRecheckSeconds != right.minRecheckSeconds ||
+			left.noDoseRetrySeconds != right.noDoseRetrySeconds ||
+			left.restockScanIntervalMinutes != right.restockScanIntervalMinutes ||
+			left.maxRestockLoadsPerVisit != right.maxRestockLoadsPerVisit ||
+			left.restockSpendFraction != right.restockSpendFraction ||
+			left.signature != right.signature ||
+			left.items.size() != right.items.size())
+		return false;
+	for (int i = 0; i < left.items.size(); ++i) {
+		const SimBotConsumables::ConsumableEntry& l = left.items.get(i);
+		const SimBotConsumables::ConsumableEntry& r = right.items.get(i);
+		if (l.templateCrc != r.templateCrc || l.buffCrc != r.buffCrc ||
+				l.isDrink != r.isDrink || l.gameObjectType != r.gameObjectType ||
+				l.minDoses != r.minDoses ||
+				l.maxPricePerDose != r.maxPricePerDose ||
+				l.templatePath != r.templatePath)
+			return false;
+	}
+	return true;
+}
+
 void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 	const bool previousProgressionEnabled = progressionEnabled;
 	SimBotCombatAbilityConfig previousCombatAbilityConfig;
 	SimBotArmorPolicy armorPolicy;
+	SimBotConsumablePolicy consumablePolicy;
 	{
 		Locker progressionLock(&progressionMutex);
 		previousCombatAbilityConfig = progressionCombatAbilityConfig;
 		armorPolicy = progressionArmorPolicy;
+		consumablePolicy = progressionConsumablePolicy;
 	}
 
 	bool progressionEnabledOverrideActive = false;
@@ -10743,6 +11151,8 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 	// child (live verification found armorLoadout = true parsed as false).
 	armorPolicy.enabled = config.getBooleanField("armorLoadout",
 		armorPolicy.enabled);
+	consumablePolicy.enabled = config.getBooleanField("consumablesEnabled",
+		consumablePolicy.enabled);
 	LuaObject loadout = config.getObjectField("loadout");
 	if (loadout.isValidTable()) {
 		progressionLoadoutMinUpgradePercent = clampFloatRange(
@@ -10818,11 +11228,102 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 	}
 	armor.pop();
 	loadout.pop();
+	LuaObject consumables = config.getObjectField("consumables");
+	if (consumables.isValidTable()) {
+		consumablePolicy.bazaarRestock = consumables.getBooleanField(
+			"bazaarRestock", consumablePolicy.bazaarRestock);
+		consumablePolicy.minDoses = clampIntRange(consumables.getIntField(
+			"minDoses", consumablePolicy.minDoses), 1, 100000);
+		consumablePolicy.minRecheckSeconds = clampIntRange(
+			consumables.getIntField("minRecheckSeconds",
+				consumablePolicy.minRecheckSeconds), 1, 86400);
+		consumablePolicy.noDoseRetrySeconds = clampIntRange(
+			consumables.getIntField("noDoseRetrySeconds",
+				consumablePolicy.noDoseRetrySeconds), 1, 86400);
+		consumablePolicy.restockScanIntervalMinutes = clampIntRange(
+			consumables.getIntField("restockScanIntervalMinutes",
+				consumablePolicy.restockScanIntervalMinutes), 1, 10080);
+		consumablePolicy.maxRestockLoadsPerVisit = clampIntRange(
+			consumables.getIntField("maxRestockLoadsPerVisit",
+				consumablePolicy.maxRestockLoadsPerVisit), 1, 1000);
+		consumablePolicy.restockSpendFraction = clampFloatRange(
+			consumables.getFloatField("restockSpendFraction",
+				consumablePolicy.restockSpendFraction), 0.f, 1.f);
+		LuaObject items = consumables.getObjectField("items");
+		if (items.isValidTable()) {
+			consumablePolicy.items.removeAll();
+			StringBuffer signature;
+			signature << consumablePolicy.enabled << ":" <<
+					consumablePolicy.bazaarRestock << ":" <<
+					consumablePolicy.minDoses << ":" <<
+					consumablePolicy.minRecheckSeconds << ":" <<
+					consumablePolicy.noDoseRetrySeconds << ":" <<
+					consumablePolicy.restockScanIntervalMinutes << ":" <<
+					consumablePolicy.maxRestockLoadsPerVisit << ":" <<
+					consumablePolicy.restockSpendFraction;
+			for (int i = 1; i <= items.getTableSize(); ++i) {
+				LuaObject item = items.getObjectAt(i);
+				if (!item.isValidTable()) {
+					item.pop();
+					continue;
+				}
+				String templatePath = item.getStringField("template").trim();
+				int minDoses = clampIntRange(item.getIntField("minDoses",
+						consumablePolicy.minDoses), 1, 100000);
+				float maxPrice = item.getFloatField("maxPricePerDose", 0.f);
+				SharedObjectTemplate* objectTemplate = templatePath.isEmpty() ?
+						nullptr : TemplateManager::instance()->getTemplate(
+							templatePath.hashCode());
+				ConsumableTemplate* consumableTemplate = objectTemplate == nullptr ?
+						nullptr : dynamic_cast<ConsumableTemplate*>(objectTemplate);
+				const bool validEffect = consumableTemplate != nullptr &&
+						(consumableTemplate->getEffectType() ==
+							Consumable::EFFECT_ATTRIBUTE ||
+						consumableTemplate->getEffectType() ==
+							Consumable::EFFECT_SKILL ||
+						consumableTemplate->getEffectType() ==
+							Consumable::EFFECT_DURATION);
+				const bool validRestrictions = consumableTemplate != nullptr &&
+						consumableTemplate->getSpeciesRestriction().isEmpty() &&
+						consumableTemplate->getForagedFood() == 0;
+				if (templatePath.isEmpty() || consumableTemplate == nullptr ||
+						!validEffect || !validRestrictions || maxPrice <= 0.f) {
+					progressionConsumablesRejectedEntries.increment();
+					warning("SimBotConsumableRejected template=" + templatePath);
+					item.pop();
+					continue;
+				}
+
+				SimBotConsumables::ConsumableEntry entry;
+				entry.templatePath = templatePath;
+				entry.templateCrc = templatePath.hashCode();
+				entry.buffCrc = consumableTemplate->getBuffName().hashCode();
+				// Listings are matched like buy-list entries (client type).
+				entry.gameObjectType =
+					consumableTemplate->getClientGameObjectType();
+				entry.isDrink = consumableTemplate->getGameObjectType() ==
+					SceneObjectType::DRINK;
+				entry.minDoses = minDoses;
+				entry.maxPricePerDose = maxPrice;
+				consumablePolicy.items.add(entry);
+				signature << ":" << entry.templatePath << ":" <<
+						entry.minDoses << ":" << entry.maxPricePerDose << ":" <<
+						entry.buffCrc << ":" << entry.isDrink;
+				item.pop();
+			}
+			consumablePolicy.signature = signature.toString();
+		}
+		items.pop();
+	}
+	consumables.pop();
 	{
 		Locker progressionLock(&progressionMutex);
 		if (!simBotArmorPolicyEquals(progressionArmorPolicy, armorPolicy))
 			progressionArmorLastFullSweepMs = 0;
 		progressionArmorPolicy = armorPolicy;
+		if (!simBotConsumablePolicyEquals(progressionConsumablePolicy,
+				consumablePolicy))
+			progressionConsumablePolicy = consumablePolicy;
 	}
 	LuaObject buffPayment = config.getObjectField("buffPayment");
 	if (buffPayment.isValidTable()) {
@@ -11235,6 +11736,36 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.armorFaction = table.getStringField("faction").trim().toLowerCase();
 	step.armorRace = table.getStringField("race").trim();
 	step.buffPool = table.getStringField("pool").trim().toLowerCase();
+	step.consumableBuff = table.getStringField("buff").trim();
+	if (step.consumableBuff.isEmpty())
+		step.consumableBuff = table.getStringField("buffName").trim();
+	step.expectedDoses = table.getIntField("doses", absentExpected);
+	step.hasExpectedDoses = step.expectedDoses != absentExpected;
+	if (!step.hasExpectedDoses)
+		step.expectedDoses = -1;
+	step.expectedFood = table.getIntField("food", absentExpected);
+	step.hasExpectedFood = step.expectedFood != absentExpected;
+	if (!step.hasExpectedFood)
+		step.expectedFood = -1;
+	step.expectedDrink = table.getIntField("drink", absentExpected);
+	step.hasExpectedDrink = step.expectedDrink != absentExpected;
+	if (!step.hasExpectedDrink)
+		step.expectedDrink = -1;
+	step.stomachAgeSeconds = table.getIntField("ageSeconds", absentExpected);
+	step.hasStomachAgeSeconds = step.stomachAgeSeconds != absentExpected;
+	if (!step.hasStomachAgeSeconds)
+		step.stomachAgeSeconds = 0;
+	step.expectedBuffPresent = table.getBooleanField("present", false);
+	step.hasExpectedBuffPresent = step.expectedBuffPresent ==
+		table.getBooleanField("present", true);
+	step.expectedAccuracy = table.getIntField("accuracy", absentExpected);
+	step.hasExpectedAccuracy = step.expectedAccuracy != absentExpected;
+	if (!step.hasExpectedAccuracy)
+		step.expectedAccuracy = 0;
+	step.expectedDefense = table.getIntField("defense", absentExpected);
+	step.hasExpectedDefense = step.expectedDefense != absentExpected;
+	if (!step.hasExpectedDefense)
+		step.expectedDefense = 0;
 	step.attackSpeed = table.getFloatField("attackSpeed", -1.f);
 	step.hasAttackSpeed = step.attackSpeed >= 0.f;
 	if (!step.hasAttackSpeed)
@@ -11421,6 +11952,8 @@ void SimPlayerManager::initializePlayerBotParityTestResults() {
 	playerBotParityTestCleanupPreserveProbe = false;
 	playerBotParityTestPendingRequestId = 0;
 	playerBotParityTestIdentityRefs.removeAll();
+	playerBotParityConsumableProbeBaselines.removeAll();
+	playerBotParityConsumableRefs.removeAll();
 	playerBotParityAppearanceSnapshots.removeAll();
 	playerBotParityTestKillTargetOid = 0;
 	playerBotParityTestKillTargetIdentityId = 0;
@@ -13887,6 +14420,16 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 	const bool armorUpgradeGate =
 		playerBotArmorBazaarUpgradesGateEnabled(identityId);
 	const bool upgradeGate = weaponUpgradeGate || armorUpgradeGate;
+	const bool consumableRestockGate = buyGate &&
+		playerBotConsumableRestockGateEnabled(identityId);
+	SimBotConsumablePolicy consumablePolicy;
+	std::vector<SimBotConsumables::HeldStack> consumableStacks;
+	bool haveConsumableSnapshot = false;
+	if (consumableRestockGate) {
+		consumablePolicy = snapshotPlayerBotConsumablePolicy();
+		haveConsumableSnapshot = snapshotPlayerBotConsumableStacks(identityId,
+			consumableStacks);
+	}
 	const int unmetBuyNeeds = buyGate ?
 		playerBotUnmetBuyNeeds(identityId) : 0;
 
@@ -13906,6 +14449,7 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 	if (sellGate) {
 		collectPlayerBotProtectedWeaponOids(identityId, loadoutProtectedIds);
 		collectPlayerBotProtectedArmorOids(identityId, loadoutProtectedIds);
+		collectPlayerBotProtectedConsumableOids(identityId, loadoutProtectedIds);
 	}
 	{
 		Locker progressionLock(&progressionMutex);
@@ -13989,6 +14533,72 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 					progressionArmorUpgradeScanAtMs.put(identityId, nowMs);
 					return true;
 				}
+			}
+		}
+		if (consumableRestockGate && haveConsumableSnapshot &&
+				!consumablePolicy.items.isEmpty()) {
+			int pendingPurchases = 0;
+			for (int i = 0; i < progressionBazaarPurchases.size(); ++i) {
+				const PlayerBotBazaarPurchase& purchase =
+					progressionBazaarPurchases.elementAt(i).getValue();
+				if (purchase.identityId == identityId &&
+						(purchase.state == PLAYER_BOT_PURCHASE_DEBITED ||
+						 purchase.state == PLAYER_BOT_PURCHASE_RESOLVE_PENDING))
+					++pendingPurchases;
+			}
+			const SimBotProgression& progression = progressionRecords.get(identityId);
+			const int64 spendable = progression.bankCredits -
+				reservedPlayerBotCreditsLocked(identityId, true) -
+				progressionBazaarBuyReserveCredits;
+			const int64 spendCeiling = std::min<int64>(
+				std::max(0, progressionBazaarMaxPrice),
+				static_cast<int64>(std::floor(std::max<int64>(0, spendable) *
+					std::max(0.f, std::min(1.f,
+						consumablePolicy.restockSpendFraction)))));
+			const uint64 scanIntervalMs = static_cast<uint64>(
+				consumablePolicy.restockScanIntervalMinutes) * 60000;
+			const bool scanDue =
+				!progressionConsumableRestockScanAtMs.contains(identityId) ||
+				nowMs >= progressionConsumableRestockScanAtMs.get(identityId) +
+					scanIntervalMs;
+			bool needRestock = false;
+			for (int itemIndex = 0; itemIndex < consumablePolicy.items.size();
+					++itemIndex) {
+				const SimBotConsumables::ConsumableEntry& entry =
+					consumablePolicy.items.get(itemIndex);
+				int heldDoses = 0;
+				for (size_t stackIndex = 0; stackIndex < consumableStacks.size();
+						++stackIndex) {
+					if (consumableStacks[stackIndex].templateCrc == entry.templateCrc)
+						heldDoses += consumableStacks[stackIndex].doses;
+				}
+				bool pendingForTemplate = false;
+				for (int purchaseIndex = 0;
+						purchaseIndex < progressionBazaarPurchases.size();
+						++purchaseIndex) {
+					const PlayerBotBazaarPurchase& purchase =
+						progressionBazaarPurchases.elementAt(purchaseIndex).getValue();
+					if (purchase.identityId == identityId &&
+							purchase.templateCrc == entry.templateCrc &&
+							(purchase.state == PLAYER_BOT_PURCHASE_DEBITED ||
+							 purchase.state == PLAYER_BOT_PURCHASE_RESOLVE_PENDING)) {
+						pendingForTemplate = true;
+						break;
+					}
+				}
+				if (SimBotConsumables::restockNeed(heldDoses, entry.minDoses,
+						pendingForTemplate)) {
+					needRestock = true;
+					break;
+				}
+			}
+			if (needRestock && scanDue &&
+					pendingPurchases < progressionBazaarBuyMaxPendingPerBot &&
+					spendCeiling >= progressionBazaarMinPrice) {
+				// This timestamp records a market scan admission, not a successful
+				// purchase. Empty or rejected markets wait for the next interval.
+				progressionConsumableRestockScanAtMs.put(identityId, nowMs);
+				return true;
 			}
 		}
 		if (!sellGate)
@@ -14304,6 +14914,7 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 	VectorMap<uint64, bool> loadoutProtectedIds;
 	collectPlayerBotProtectedWeaponOids(identityId, loadoutProtectedIds);
 	collectPlayerBotProtectedArmorOids(identityId, loadoutProtectedIds);
+	collectPlayerBotProtectedConsumableOids(identityId, loadoutProtectedIds);
 	ManagedReference<SceneObject*> bag = economyManager->getItemBag(identityId);
 	if (bag == nullptr)
 		return false;
@@ -14582,6 +15193,14 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		playerBotParityBazaarBuyListOverride(identityId, buyListOverride);
 	SimBotTrainingPlan plan;
 	const SimBotArmorPolicy armorPolicy = snapshotPlayerBotArmorPolicy();
+	const bool consumableRestockGate =
+		playerBotConsumableRestockGateEnabled(identityId);
+	const SimBotConsumablePolicy consumablePolicy =
+		consumableRestockGate ? snapshotPlayerBotConsumablePolicy() :
+		SimBotConsumablePolicy();
+	std::vector<SimBotConsumables::HeldStack> consumableStacks;
+	const bool haveConsumableSnapshot = consumableRestockGate &&
+		snapshotPlayerBotConsumableStacks(identityId, consumableStacks);
 	// A bot that has never looted has no bag yet; buying is an acquisition
 	// like loot, so it creates the bag the same way.
 	ManagedReference<SceneObject*> bag = economyManager->getOrCreateItemBag(
@@ -14611,6 +15230,10 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		int ceiling = 0;
 		bool upgrade = false;
 		bool armorUpgrade = false;
+		bool consumable = false;
+		int doses = 0;
+		float pricePerDose = 0.f;
+		int gameObjectType = 0;
 		SimBotLoadout::WeaponStats weaponStats;
 		SimBotArmorLoadout::ArmorStats armorStats;
 		float armorImprovement = 0.f;
@@ -14619,6 +15242,9 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		SimBotTrainingPlan::BuyListEntry entry;
 		bool upgrade = false;
 		bool armorUpgrade = false;
+		bool consumable = false;
+		SimBotConsumables::ConsumableEntry consumableEntry;
+		int64 consumableCeiling = 0;
 		int remaining = 0;
 		std::vector<ManagedReference<AuctionItem*> > raw;
 		std::vector<BuyCandidate> candidates;
@@ -14737,6 +15363,51 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 			if (need.remaining > 0)
 				needs.push_back(need);
 		}
+		if (consumableRestockGate && haveConsumableSnapshot) {
+			const SimBotProgression& progression = progressionRecords.get(identityId);
+			const int64 spendable = progression.bankCredits -
+				reservedPlayerBotCreditsLocked(identityId, true) -
+				progressionBazaarBuyReserveCredits;
+			const int64 spendCeiling = std::min<int64>(
+				std::max(0, progressionBazaarMaxPrice),
+				static_cast<int64>(std::floor(std::max<int64>(0, spendable) *
+					std::max(0.f, std::min(1.f,
+						consumablePolicy.restockSpendFraction)))));
+			for (int itemIndex = 0; itemIndex < consumablePolicy.items.size();
+					++itemIndex) {
+				const SimBotConsumables::ConsumableEntry& entry =
+					consumablePolicy.items.get(itemIndex);
+				int heldDoses = 0;
+				for (size_t stackIndex = 0; stackIndex < consumableStacks.size();
+						++stackIndex) {
+					if (consumableStacks[stackIndex].templateCrc == entry.templateCrc)
+						heldDoses += consumableStacks[stackIndex].doses;
+				}
+				bool pendingForTemplate = false;
+				for (int purchaseIndex = 0;
+						purchaseIndex < progressionBazaarPurchases.size();
+						++purchaseIndex) {
+					const PlayerBotBazaarPurchase& purchase =
+						progressionBazaarPurchases.elementAt(purchaseIndex).getValue();
+					if (purchase.identityId == identityId &&
+							purchase.templateCrc == entry.templateCrc &&
+							(purchase.state == PLAYER_BOT_PURCHASE_DEBITED ||
+							 purchase.state == PLAYER_BOT_PURCHASE_RESOLVE_PENDING)) {
+						pendingForTemplate = true;
+						break;
+					}
+				}
+				if (!SimBotConsumables::restockNeed(heldDoses, entry.minDoses,
+						pendingForTemplate) || spendCeiling < progressionBazaarMinPrice)
+					continue;
+				BuyNeed need;
+				need.consumable = true;
+				need.consumableEntry = entry;
+				need.consumableCeiling = spendCeiling;
+				need.remaining = 1;
+				needs.push_back(need);
+			}
+		}
 		if (upgradeGate &&
 				progressionLoadoutChoices.contains(identityId)) {
 			bool pendingUpgrade = false;
@@ -14848,6 +15519,25 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 							continue;
 					}
 					need.raw.push_back(item);
+				} else if (need.consumable) {
+					// The listing index carries a game-object type, not the
+					// consumable's dose count. Other types and cached template
+					// mismatches are discarded without a load; every other candidate
+					// is loaded in the bounded scan below so its current use count is
+					// authoritative.
+					if (item->getItemType() != static_cast<unsigned int>(
+							need.consumableEntry.gameObjectType))
+						continue;
+					bool knownMismatch = false;
+					{
+						Locker cacheLock(&bazaarListingTemplateCacheMutex);
+						if (bazaarListingTemplateCache.contains(item->getObjectID()))
+							knownMismatch = bazaarListingTemplateCache.get(
+								item->getObjectID()).templateCrc !=
+								need.consumableEntry.templateCrc;
+					}
+					if (!knownMismatch)
+						need.raw.push_back(item);
 				} else if (item->getItemType() ==
 						static_cast<unsigned int>(need.entry.gameObjectType)) {
 					need.raw.push_back(item);
@@ -14873,6 +15563,8 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 	}
 	const size_t start = needs.empty() ? 0 : cursor % needs.size();
 	int totalLoads = 0;
+	// maxRestockLoadsPerVisit bounds all consumable needs together.
+	int consumableLoads = 0;
 	while (totalLoads < progressionBazaarBuyMaxObjectLoadsPerVisit) {
 		bool advanced = false;
 		for (size_t offset = 0; offset < needs.size(); ++offset) {
@@ -14880,12 +15572,16 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 			BuyNeed& need = needs[needIndex];
 			// The per-need budget counts object loads; cached mismatches are
 			// skipped for free, so a later visit always reaches new listings.
-			const int maxLoadsForNeed = need.upgrade ? std::min(
+			const int maxLoadsForNeed = need.consumable ? std::min(
+				progressionBazaarBuyCandidateScanLimit,
+				consumablePolicy.maxRestockLoadsPerVisit) : need.upgrade ? std::min(
 				progressionBazaarBuyCandidateScanLimit,
 				need.armorUpgrade ? armorPolicy.maxUpgradeLoadsPerVisit :
 				progressionLoadoutMaxUpgradeLoadsPerVisit) :
 				progressionBazaarBuyCandidateScanLimit;
 			if (need.loads >= maxLoadsForNeed ||
+					(need.consumable && consumableLoads >=
+						consumablePolicy.maxRestockLoadsPerVisit) ||
 					need.scanned >= static_cast<int>(need.raw.size()))
 				continue;
 			advanced = true;
@@ -14903,15 +15599,20 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 					cacheHit = true;
 				}
 			}
-			if (!cacheHit && totalLoads >= progressionBazaarBuyMaxObjectLoadsPerVisit) {
+			const bool forceConsumableLoad = need.consumable;
+			if ((!cacheHit || forceConsumableLoad) && totalLoads >=
+					progressionBazaarBuyMaxObjectLoadsPerVisit) {
 				--need.scanned;
 				continue;
 			}
-			if (!cacheHit) {
+			int loadedDoses = 0;
+			if (!cacheHit || forceConsumableLoad) {
 				ManagedReference<SceneObject*> listedObject = zoneServer->getObject(
 					item->getAuctionedItemObjectID());
 				++totalLoads;
 				++need.loads;
+				if (need.consumable)
+					++consumableLoads;
 				if (listedObject == nullptr)
 					continue;
 				Locker objectLock(listedObject);
@@ -14922,6 +15623,14 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 				cached.templateCrc = listedObject->getServerObjectCRC();
 				cached.gameObjectType = listedObject->getClientGameObjectType();
 				cached.junkValue = tangible->getJunkValue();
+				if (need.consumable) {
+					Consumable* consumable = cast<Consumable*>(listedObject.get());
+					if (consumable == nullptr)
+						continue;
+					loadedDoses = static_cast<int>(consumable->getUseCount());
+					if (loadedDoses <= 0)
+						continue;
+				}
 				if (listedObject->isWeaponObject()) {
 					WeaponObject* weapon = cast<WeaponObject*>(listedObject.get());
 					if (weapon != nullptr) {
@@ -14957,6 +15666,28 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 					}
 					bazaarListingTemplateCache.remove(oldest);
 				}
+			}
+			if (need.consumable) {
+				if (cached.templateCrc != need.consumableEntry.templateCrc ||
+						loadedDoses <= 0)
+					continue;
+				if (!SimBotConsumables::acceptsListing(item->getPrice(),
+						loadedDoses, need.consumableEntry.maxPricePerDose,
+						need.consumableCeiling)) {
+					progressionConsumablesRestockSkips.increment();
+					continue;
+				}
+				BuyCandidate candidate;
+				candidate.item = item;
+				candidate.templateCrc = cached.templateCrc;
+				candidate.ceiling = static_cast<int>(need.consumableCeiling);
+				candidate.consumable = true;
+				candidate.doses = loadedDoses;
+				candidate.pricePerDose = SimBotConsumables::pricePerDose(
+					item->getPrice(), loadedDoses);
+				candidate.gameObjectType = cached.gameObjectType;
+				need.candidates.push_back(candidate);
+				continue;
 			}
 			if (need.upgrade) {
 				if (need.armorUpgrade) {
@@ -15093,7 +15824,17 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 			break;
 	}
 	for (size_t needIndex = 0; needIndex < needs.size(); ++needIndex) {
-		if (needs[needIndex].upgrade)
+		if (needs[needIndex].consumable)
+			std::sort(needs[needIndex].candidates.begin(),
+				needs[needIndex].candidates.end(),
+				[](const BuyCandidate& left, const BuyCandidate& right) {
+					if (left.pricePerDose != right.pricePerDose)
+						return left.pricePerDose < right.pricePerDose;
+					if (left.item->getPrice() != right.item->getPrice())
+						return left.item->getPrice() < right.item->getPrice();
+					return left.item->getObjectID() < right.item->getObjectID();
+				});
+		else if (needs[needIndex].upgrade)
 			std::sort(needs[needIndex].candidates.begin(),
 				needs[needIndex].candidates.end(),
 				[](const BuyCandidate& left, const BuyCandidate& right) {
@@ -15143,8 +15884,17 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 				if (candidate.item == nullptr ||
 						chosenAuctions.contains(candidate.item->getObjectID()))
 					continue;
-				if (bestNeed < 0 || candidate.item->getPrice() <
-						needs[bestNeed].candidates[bestCandidate].item->getPrice()) {
+				const BuyCandidate* current = bestNeed < 0 ? nullptr :
+					&needs[bestNeed].candidates[bestCandidate];
+				const float candidateRank = candidate.consumable ?
+					candidate.pricePerDose :
+					static_cast<float>(candidate.item->getPrice());
+				const float currentRank = current == nullptr ? 0.f :
+					(current->consumable ? current->pricePerDose :
+					static_cast<float>(current->item->getPrice()));
+				if (current == nullptr || candidateRank < currentRank ||
+						(candidateRank == currentRank && candidate.item->getObjectID() <
+							current->item->getObjectID())) {
 					bestNeed = static_cast<int>(needIndex);
 					bestCandidate = static_cast<int>(candidateIndex);
 				}
@@ -15204,8 +15954,10 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		int templatePendingCount = 0;
 		int ownedCount = 0;
 		const bool upgrade = needs[bestNeed].upgrade;
+		const bool consumable = !upgrade && needs[bestNeed].consumable;
 		const uint32 templateCrc = upgrade ? candidate.templateCrc :
-			needs[bestNeed].entry.templateCrc;
+			(consumable ? needs[bestNeed].consumableEntry.templateCrc :
+			needs[bestNeed].entry.templateCrc);
 		for (int i = 0; i < progressionItems.size(); ++i) {
 			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
 			if (!upgrade && row.identityId == identityId &&
@@ -15373,6 +16125,25 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 					}
 				}
 			}
+		} else if (consumable) {
+			liveReason = SimBotBazaar::decidePurchase(
+				auctionItem->getPrice(), candidate.ceiling,
+				progressionRecords.get(identityId).bankCredits,
+				reservedPlayerBotCreditsLocked(identityId, true),
+				progressionBazaarBuyReserveCredits,
+				auctionItem->getOwnerID() == bagOid);
+			if (templatePendingCount > 0 ||
+					pendingCount >= progressionBazaarBuyMaxPendingPerBot ||
+					progressionBazaarPurchases.contains(purchaseKey) ||
+					liveReason != SimBotBazaar::BUY) {
+				canBuy = false;
+				if (liveReason == SimBotBazaar::UNAFFORDABLE)
+					bazaarBuySkippedUnaffordable.increment();
+				else if (liveReason == SimBotBazaar::OWN_LISTING)
+					bazaarBuySkippedOwnListing.increment();
+				else
+					progressionConsumablesRestockSkips.increment();
+			}
 		} else {
 			liveReason = SimBotBazaar::decidePurchase(
 				auctionItem->getPrice(), candidate.ceiling,
@@ -15414,7 +16185,8 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		purchase.templateCrc = templateCrc;
 		purchase.gameObjectType = upgrade ? (candidate.armorUpgrade ?
 			candidate.armorStats.gameObjectType : candidate.weaponStats.gameObjectType) :
-			needs[bestNeed].entry.gameObjectType;
+			(consumable ? candidate.gameObjectType :
+			needs[bestNeed].entry.gameObjectType);
 		purchase.price = auctionItem->getPrice();
 		purchase.vendorOid = auctionItem->getVendorID();
 		purchase.planet = planet;
@@ -15436,13 +16208,16 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 			bazaarBuyUpgradesDebited.increment();
 		if (candidate.armorUpgrade)
 			bazaarBuyArmorUpgradesDebited.increment();
+		if (consumable)
+			progressionConsumablesRestockPurchases.increment();
 		debitedAny = true;
 		progressionLock.release();
 		MissionDiagLog::event("BAZAAR_BUY", identityId,
 			"auction=" + String::valueOf(purchase.auctionOid) +
 			" object=" + String::valueOf(purchase.objectId) +
 			" price=" + String::valueOf(purchase.price) +
-			" need=" + (upgrade ? String("upgrade") : String("buy_list")) +
+			" need=" + (upgrade ? String("upgrade") : consumable ?
+			String("consumable") : String("buy_list")) +
 			" result=debited");
 	}
 	{
@@ -17015,6 +17790,10 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 			armingOp = "setLoadoutGate";
 		else if (gate == "armorLoadout")
 			armingOp = "setArmorGate";
+		else if (gate == "consumablesEnabled")
+			armingOp = "setConsumablesGate";
+		else if (gate == "consumableRestock")
+			armingOp = "setConsumableRestockGate";
 		else if (gate == "bazaarUpgrades")
 			armingOp = "setBazaarUpgradesGate";
 		else if (gate == "armorBazaarUpgrades")
@@ -17065,6 +17844,10 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 			live = playerBotLoadoutGateEnabled(0);
 		else if (gate == "armorLoadout")
 			live = playerBotArmorLoadoutGateEnabled(0);
+		else if (gate == "consumablesEnabled")
+			live = playerBotConsumablesGateEnabled(0);
+		else if (gate == "consumableRestock")
+			live = playerBotConsumableRestockGateEnabled(0);
 		else if (gate == "bazaarUpgrades")
 			live = playerBotBazaarUpgradesGateEnabled(0);
 		else if (gate == "armorBazaarUpgrades")
@@ -18398,6 +19181,45 @@ void SimPlayerManager::scorePlayerBotActivity(
 	applyGrindFallback();
 }
 
+void SimPlayerManager::reconcilePlayerBotConsumableFlags() {
+	// The combat flag follows the gate, so a hot-reloaded Lua toggle or a
+	// harness override reaches live bodies without a respawn. Each gate is
+	// evaluated before the agent lock (it takes manager mutexes).
+	VectorMap<uint64, uint64> bodyOids;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < pveIdentityBodyOids.size(); ++i)
+			bodyOids.put(pveIdentityBodyOids.elementAt(i).getKey(),
+					pveIdentityBodyOids.elementAt(i).getValue());
+	}
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (zoneServer == nullptr)
+		return;
+	const SimBotConsumablePolicy policy = snapshotPlayerBotConsumablePolicy();
+	for (int i = 0; i < bodyOids.size(); ++i) {
+		const bool gateEnabled =
+			playerBotConsumablesGateEnabled(bodyOids.elementAt(i).getKey());
+		ManagedReference<SceneObject*> object =
+			zoneServer->getObject(bodyOids.elementAt(i).getValue());
+		AiAgent* agent = object == nullptr ? nullptr : object->asAiAgent();
+		if (agent == nullptr)
+			continue;
+		Locker agentLock(agent);
+		if (agent->hasSimBotConsumableParity() == gateEnabled)
+			continue;
+		agent->setSimBotConsumableParity(gateEnabled);
+		if (gateEnabled)
+			continue;
+		// Unflagged, stock AI accuracy treats a food attack_accuracy buff as
+		// the whole accuracy value, so a closed gate also removes the food.
+		for (int itemIndex = 0; itemIndex < policy.items.size(); ++itemIndex) {
+			const uint32 buffCrc = policy.items.get(itemIndex).buffCrc;
+			if (buffCrc != 0 && agent->hasBuff(buffCrc))
+				agent->removeBuff(buffCrc);
+		}
+	}
+}
+
 void SimPlayerManager::refreshPlayerBotActivityStates() {
 	const bool earlyGameEnabled = playerBotEarlyGameGateEnabled();
 	const bool loadoutEnabled = playerBotLoadoutGateEnabled(0);
@@ -18408,6 +19230,7 @@ void SimPlayerManager::refreshPlayerBotActivityStates() {
 		for (int i = 0; i < progressionArmorWorn.size(); ++i)
 			armorKnownIds.add(progressionArmorWorn.elementAt(i).getKey());
 	}
+	reconcilePlayerBotConsumableFlags();
 	if (!earlyGameEnabled && !loadoutEnabled && !armorEnabled &&
 			armorKnownIds.size() == 0) {
 		Locker progressionLock(&progressionMutex);
@@ -19679,6 +20502,11 @@ void SimPlayerManager::runPlayerBotProgressionReaper(uint64 nowMs, bool force) {
 			progressionArmorBodyRaceCrc.drop(identityId);
 			progressionArmorChoices.drop(identityId);
 			progressionArmorBlockedReason.drop(identityId);
+			progressionStomach.drop(identityId);
+			progressionConsumableNextCheckAtMs.drop(identityId);
+			progressionConsumablesLastConsumedByIdentity.drop(identityId);
+			progressionConsumablesLastConsumedAtMs.drop(identityId);
+			progressionConsumableRestockScanAtMs.drop(identityId);
 				progressionLoadoutDirtyIds.drop(identityId);
 				progressionArmorDirtyIds.drop(identityId);
 				progressionArmorUpgradeScanAtMs.drop(identityId);
@@ -21640,6 +22468,26 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 	}
 	if (key == "maintenanceticks" || key == "tickstotal")
 		return pveMaintenanceTicksTotal.get();
+	if (key == "consumables.consumed" || key == "consumablesconsumed")
+		return progressionConsumablesConsumed.get();
+	if (key == "consumables.lastdoseremovals" ||
+			key == "consumableslastdoseremovals")
+		return progressionConsumablesLastDoseRemovals.get();
+	if (key == "consumables.restockpurchases" ||
+			key == "consumablesrestockpurchases")
+		return progressionConsumablesRestockPurchases.get();
+	if (key == "consumables.restockskips" ||
+			key == "consumablesrestockskips")
+		return progressionConsumablesRestockSkips.get();
+	if (key == "consumables.skippedbuffactive" ||
+			key == "consumablesskippedbuffactive")
+		return progressionConsumablesSkippedBuffActive.get();
+	if (key == "consumables.skippedstomachfull" ||
+			key == "consumablesskippedstomachfull")
+		return progressionConsumablesSkippedStomachFull.get();
+	if (key == "consumables.skippednodoses" ||
+			key == "consumablesskippednodoses")
+		return progressionConsumablesSkippedNoDoses.get();
 	return 0;
 }
 
@@ -22054,6 +22902,10 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 		playerBotParityTestLoadoutGateOverride = false;
 		playerBotParityTestArmorGateOverrideActive = false;
 		playerBotParityTestArmorGateOverride = false;
+		playerBotParityTestConsumablesGateOverrideActive = false;
+		playerBotParityTestConsumablesGateOverride = false;
+		playerBotParityTestConsumableRestockGateOverrideActive = false;
+		playerBotParityTestConsumableRestockGateOverride = false;
 		if (playerBotParityTestBazaarMarkupOverrideActive) {
 			progressionBazaarMarkup =
 				playerBotParityTestBazaarMarkupOverridePrevious;
@@ -22070,6 +22922,10 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 	playerBotParityLoadoutGateScopedIds.removeAll();
 	playerBotParityLoadoutGateValues.removeAll();
 	playerBotParityArmorGateScopedIds.removeAll();
+	playerBotParityConsumablesGateScopedIds.removeAll();
+	playerBotParityConsumablesGateValues.removeAll();
+	playerBotParityConsumableRestockGateScopedIds.removeAll();
+	playerBotParityConsumableRestockGateValues.removeAll();
 	playerBotParityBodyTemplateOverrides.removeAll();
 	playerBotParityArmorGateValues.removeAll();
 	playerBotParityBazaarUpgradesGateScopedIds.removeAll();
@@ -22078,6 +22934,7 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 	playerBotParityLoadoutCertOverrides.removeAll();
 	playerBotParityLoadoutWeaponRefs.removeAll();
 	playerBotParityArmorRefs.removeAll();
+	playerBotParityConsumableRefs.removeAll();
 	playerBotParityBazaarBuyListOverrides.removeAll();
 	playerBotParityBazaarSellerBankBaselines.removeAll();
 	playerBotParityMissionCreditScopedIds.removeAll();
@@ -22594,7 +23451,12 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 				"bazaar.reconcile.reversed", "bazaar.reconcile.retrieved",
 				"bazaar.reconcile.orphaned",
 				"bazaar.reconcile.adoptedTaxEstimated",
-				"bazaar.reconcile.releasedRepaired"};
+				"bazaar.reconcile.releasedRepaired", "consumables.consumed",
+				"consumables.lastdoseremovals",
+				"consumables.restockpurchases", "consumables.restockskips",
+				"consumables.skippedbuffactive",
+				"consumables.skippedstomachfull",
+				"consumables.skippednodoses"};
 			for (unsigned int i = 0; i < sizeof(counters) / sizeof(counters[0]); ++i)
 				playerBotParityTestCounterBaselines.put(counters[i].toLowerCase(),
 					static_cast<uint64>(playerBotParityCounterValue(counters[i])));
@@ -22946,6 +23808,16 @@ bool SimPlayerManager::executePlayerBotParityStep(
 				op == "setBazaarBuyGate" || op == "setBuyListOverride" ||
 				op == "setLoadoutGate" || op == "setBazaarUpgradesGate" ||
 				op == "setArmorGate" || op == "setArmorUpgradeGate" ||
+				op == "setConsumablesGate" ||
+				op == "setConsumableRestockGate" ||
+				op == "grantVaultConsumable" ||
+				op == "setStomach" ||
+				op == "consumeBeforeEngage" ||
+				op == "assertStomach" ||
+				op == "assertConsumableDoses" ||
+				op == "assertFoodBuff" ||
+				op == "assertConsumeCounters" ||
+				op == "assertCombatModifiers" ||
 				op == "setBodyTemplate" ||
 				op == "setLoadoutHarnessOptIn" || op == "setCertsOverride" ||
 				op == "grantVaultWeapon" || op == "reapplyLoadout" ||
@@ -22955,6 +23827,7 @@ bool SimPlayerManager::executePlayerBotParityStep(
 				op == "removeTrackedBuffs" || op == "reconcileArmor" ||
 				op == "assertArmor" || op == "assertArmorProtected" ||
 				op == "assertArmorMitigation" || op == "listHarnessArmor" ||
+				op == "listHarnessConsumable" ||
 				op == "assertArmorClothing" || op == "captureAppearance" ||
 				op == "assertAppearanceStable" ||
 				op == "failArmorTransfer" ||
@@ -23123,6 +23996,42 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		return true;
 	}
 
+	if (op == "setConsumablesGate" || op == "setConsumableRestockGate") {
+		if (identityId == 0) {
+			result.status = "FAIL";
+			result.failReason = "consumables_gate_requires_identity";
+			return true;
+		}
+		int64 enabledValue = 0;
+		if (step.hasGateEnabled)
+			enabledValue = step.gateEnabled ? 1 : 0;
+		else if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_consumables_gate_value";
+			return true;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			if (op == "setConsumablesGate") {
+				playerBotParityTestConsumablesGateOverrideActive = true;
+				playerBotParityTestConsumablesGateOverride = enabledValue != 0;
+				playerBotParityConsumablesGateScopedIds.put(identityId, true);
+				playerBotParityConsumablesGateValues.put(identityId,
+					enabledValue != 0);
+			} else {
+				playerBotParityTestConsumableRestockGateOverrideActive = true;
+				playerBotParityTestConsumableRestockGateOverride =
+					enabledValue != 0;
+				playerBotParityConsumableRestockGateScopedIds.put(identityId, true);
+				playerBotParityConsumableRestockGateValues.put(identityId,
+					enabledValue != 0);
+			}
+		}
+		reconcilePlayerBotConsumableFlags();
+		result.status = "PASS";
+		return true;
+	}
+
 	if (op == "setBodyTemplate") {
 		SimBotIdentity identity;
 		if (identityId == 0 || step.templateName.isEmpty() ||
@@ -23134,6 +24043,303 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		}
 		Locker parityLock(&playerBotParityTestMutex);
 		playerBotParityBodyTemplateOverrides.put(identityId, step.templateName);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "grantVaultConsumable") {
+		if (step.templateName.isEmpty() || step.amount <= 0) {
+			result.status = "FAIL";
+			result.failReason = "vault_consumable_requires_template_doses";
+			return true;
+		}
+		SimBotIdentity consumableIdentity;
+		if (!snapshotPlayerBotIdentity(identityId, consumableIdentity) ||
+				consumableIdentity.profession != "harness") {
+			result.status = "FAIL";
+			result.failReason = "vault_consumable_requires_harness_identity";
+			return true;
+		}
+		AiEconomyManager* economyManager = AiEconomyManager::instance();
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> bag = economyManager == nullptr ?
+			nullptr : economyManager->getOrCreateItemBag(identityId);
+		ManagedReference<SceneObject*> item = zoneServer == nullptr ? nullptr :
+			zoneServer->createObject(step.templateName.hashCode(), 1);
+		Consumable* consumable = item == nullptr ? nullptr :
+			cast<Consumable*>(item.get());
+		if (bag == nullptr || item == nullptr || consumable == nullptr) {
+			if (item != nullptr)
+				item->destroyObjectFromDatabase(true);
+			result.status = "FAIL";
+			result.failReason = "vault_consumable_object_missing";
+			return true;
+		}
+		bool transferred = false;
+		{
+			Locker itemLock(item);
+			Locker bagLock(bag, item);
+			transferred = bag->transferObject(item, -1, false, true);
+			if (transferred)
+				consumable->setUseCount(static_cast<unsigned int>(step.amount), true);
+		}
+		if (!transferred) {
+			item->destroyObjectFromDatabase(true);
+			result.status = "FAIL";
+			result.failReason = "vault_consumable_transfer_failed";
+			return true;
+		}
+		SimBotItemDeposit deposit;
+		deposit.objectId = item->getObjectID();
+		deposit.templateCrc = item->getServerObjectCRC();
+		{
+			Locker itemLock(item);
+			deposit.displayName = item->getDisplayedName();
+		}
+		Vector<SimBotItemDeposit> deposits;
+		deposits.add(deposit);
+		if (!depositPlayerBotItem(identityId, deposits, "harness",
+				item->getObjectID())) {
+			item->destroyObjectFromDatabase(true);
+			result.status = "FAIL";
+			result.failReason = "vault_consumable_deposit_failed";
+			return true;
+		}
+		if (!step.ref.isEmpty()) {
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityConsumableRefs.put(
+				String::valueOf(identityId) + ":" + step.ref,
+				item->getObjectID());
+		}
+		playerBotParityLastSeededItemOid = item->getObjectID();
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "setStomach") {
+		if (!step.hasExpectedFood || !step.hasExpectedDrink ||
+				step.expectedFood < 0 || step.expectedDrink < 0 ||
+				step.expectedFood > SimBotConsumables::kStomachMax ||
+				step.expectedDrink > SimBotConsumables::kStomachMax) {
+			result.status = "FAIL";
+			result.failReason = "invalid_stomach_values";
+			return true;
+		}
+		uint64 updatedAtMs = nowMs;
+		if (step.hasStomachAgeSeconds && step.stomachAgeSeconds > 0) {
+			updatedAtMs = nowMs - static_cast<uint64>(step.stomachAgeSeconds) * 1000;
+		}
+		Locker progressionLock(&progressionMutex);
+		SimBotStomach stomach;
+		stomach.food.fill = step.expectedFood;
+		stomach.food.updatedAtMs = updatedAtMs;
+		stomach.drink.fill = step.expectedDrink;
+		stomach.drink.updatedAtMs = updatedAtMs;
+		progressionStomach.put(identityId, stomach);
+		progressionConsumableNextCheckAtMs.drop(identityId);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "consumeBeforeEngage") {
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> body = zoneServer == nullptr ? nullptr :
+			zoneServer->getObject(bodyOid);
+		AiAgent* agent = body == nullptr ? nullptr : body->asAiAgent();
+		if (agent == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "consumable_body_missing";
+			return true;
+		}
+		consumePlayerBotFoodBeforeEngage(identityId, agent);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertStomach") {
+		SimBotStomach stomach;
+		{
+			Locker progressionLock(&progressionMutex);
+			if (progressionStomach.contains(identityId))
+				stomach = progressionStomach.get(identityId);
+		}
+		SimBotConsumables::DigestResult food =
+			SimBotConsumables::digest(stomach.food, nowMs);
+		SimBotConsumables::DigestResult drink =
+			SimBotConsumables::digest(stomach.drink, nowMs);
+		if ((step.hasExpectedFood && food.fill != step.expectedFood) ||
+				(step.hasExpectedDrink && drink.fill != step.expectedDrink)) {
+			result.status = "FAIL";
+			result.failReason = "stomach_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertConsumableDoses") {
+		if (step.templateName.isEmpty() || !step.hasExpectedDoses) {
+			result.status = "FAIL";
+			result.failReason = "consumable_dose_assert_requires_template_doses";
+			return true;
+		}
+		uint32 templateCrc = step.templateName.hashCode();
+		int actualDoses = 0;
+		Vector<uint64> doseObjectIds;
+		{
+			Locker progressionLock(&progressionMutex);
+			for (int i = 0; i < progressionItems.size(); ++i) {
+				const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+				if (row.identityId == identityId && row.state == SIMBOT_ITEM_HELD &&
+						row.templateCrc == templateCrc)
+					doseObjectIds.add(row.objectId);
+			}
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		for (int i = 0; i < doseObjectIds.size(); ++i) {
+			ManagedReference<SceneObject*> item = zoneServer == nullptr ? nullptr :
+				zoneServer->getObject(doseObjectIds.get(i));
+			Consumable* consumable = item == nullptr ? nullptr :
+				cast<Consumable*>(item.get());
+			if (consumable == nullptr)
+				continue;
+			Locker itemLock(item);
+			actualDoses += static_cast<int>(consumable->getUseCount());
+		}
+		if (actualDoses != step.expectedDoses) {
+			result.status = "FAIL";
+			result.failReason = "consumable_doses_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertFoodBuff") {
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> body = zoneServer == nullptr ? nullptr :
+			zoneServer->getObject(bodyOid);
+		AiAgent* agent = body == nullptr ? nullptr : body->asAiAgent();
+		if (agent == nullptr || step.consumableBuff.isEmpty() ||
+				!step.hasExpectedBuffPresent) {
+			result.status = "FAIL";
+			result.failReason = "food_buff_assert_requires_body_buff_present";
+			return true;
+		}
+		uint32 buffCrc = step.consumableBuff.hashCode();
+		SimBotConsumablePolicy policy = snapshotPlayerBotConsumablePolicy();
+		for (int i = 0; i < policy.items.size(); ++i) {
+			const SimBotConsumables::ConsumableEntry& entry = policy.items.get(i);
+			if (entry.templatePath == step.consumableBuff ||
+					entry.templatePath == step.templateName)
+				buffCrc = entry.buffCrc;
+		}
+		Locker agentLock(agent);
+		bool present = buffCrc != 0 && agent->hasBuff(buffCrc);
+		if (present != step.expectedBuffPresent) {
+			result.status = "FAIL";
+			result.failReason = "food_buff_presence_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertConsumeCounters") {
+		int64 expected = 0;
+		if (!parsePlayerBotParityExpected(step.expect, expected) ||
+				!assertPlayerBotParityCounter(step.counter, expected, true,
+					result.failReason)) {
+			result.status = "FAIL";
+			if (result.failReason.isEmpty())
+				result.failReason = "consume_counter_assertion_failed";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertCombatModifiers") {
+		uint64 targetOid = 0;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			targetOid = playerBotParityTestKillTargetOid;
+		}
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> bodyObject = zoneServer == nullptr ? nullptr :
+			zoneServer->getObject(bodyOid);
+		ManagedReference<SceneObject*> targetObject = zoneServer == nullptr ? nullptr :
+			zoneServer->getObject(targetOid);
+		CreatureObject* body = bodyObject == nullptr ? nullptr :
+			bodyObject->asCreatureObject();
+		CreatureObject* target = targetObject == nullptr ? nullptr :
+			targetObject->asCreatureObject();
+		CombatManager* combatManager = CombatManager::instance();
+		if (body == nullptr || target == nullptr || combatManager == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "combat_probe_objects_missing";
+			return true;
+		}
+		SimBotConsumableCombatProbe probe;
+		{
+			Locker bodyLock(body);
+			Locker targetLock(target, body);
+			// The probe reports the body's accuracy against the target and the
+			// body's defense against the target's weapon.
+			probe = combatManager->getSimBotConsumableCombatProbe(body, target);
+		}
+		String expectation = step.expect.toLowerCase();
+		if (expectation == "capture") {
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityConsumableProbeBaselines.put(identityId,
+				Pair<int, int>(probe.accuracy, probe.defense));
+		} else if (expectation == "delta") {
+			Pair<int, int> baseline;
+			bool found = false;
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				if (playerBotParityConsumableProbeBaselines.contains(identityId)) {
+					baseline = playerBotParityConsumableProbeBaselines.get(identityId);
+					found = true;
+				}
+			}
+			if (!found || (step.hasExpectedAccuracy && probe.accuracy -
+					baseline.first != step.expectedAccuracy) ||
+					(step.hasExpectedDefense && probe.defense - baseline.second !=
+					step.expectedDefense)) {
+				result.status = "FAIL";
+				result.failReason = "combat_probe_delta_mismatch accuracy=" +
+					String::valueOf(probe.accuracy - baseline.first) + " defense=" +
+					String::valueOf(probe.defense - baseline.second) + " base=" +
+					String::valueOf(baseline.first) + "/" +
+					String::valueOf(baseline.second);
+				return true;
+			}
+		} else if ((step.hasExpectedAccuracy && probe.accuracy !=
+				step.expectedAccuracy) || (step.hasExpectedDefense &&
+				probe.defense != step.expectedDefense)) {
+			result.status = "FAIL";
+			result.failReason = "combat_probe_mismatch";
+			return true;
+		}
 		result.status = "PASS";
 		return true;
 	}
@@ -24576,7 +25782,11 @@ bool SimPlayerManager::executePlayerBotParityStep(
 				!item->isPersistent();
 		}
 		AiEconomyManager* economyManager = AiEconomyManager::instance();
-		bool bagMapped = economyManager != nullptr &&
+		// expect="item_only" checks a single consumed item while its identity
+		// (and so its bag) still exists; the default also requires the bag torn
+		// down, which is what identity deletion promises.
+		const bool itemOnly = step.expect == "item_only";
+		bool bagMapped = !itemOnly && economyManager != nullptr &&
 			economyManager->getItemBagMapSnapshot().contains(identityId);
 		bool rowPresent = false;
 		{
@@ -26099,6 +27309,49 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		result.status = "PASS";
 		return true;
 	}
+	if (op == "listHarnessConsumable") {
+		if (step.ref.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "list_harness_consumable_requires_ref";
+			return true;
+		}
+		uint64 objectId = 0;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			String key = String::valueOf(identityId) + ":" + step.ref;
+			if (playerBotParityConsumableRefs.contains(key))
+				objectId = playerBotParityConsumableRefs.get(key);
+		}
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> bodyObject = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(bodyOid);
+		CreatureObject* body = bodyObject == nullptr ? nullptr :
+			bodyObject->asCreatureObject();
+		if (objectId == 0 || body == nullptr || body->getZone() == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "list_harness_consumable_setup_failed";
+			return true;
+		}
+		Vector3 position = body->getWorldPosition();
+		SceneObject* terminal = MarketSeederBridge::findBazaarTerminal(
+			body->getZone(), position.getX(), position.getZ(), position.getY(),
+			static_cast<float>(getPlayerBotBazaarMaxDetourMeters()), true);
+		int price = step.price > 0 ? step.price : 100;
+		if (terminal == nullptr || !listPlayerBotItemAtBazaar(identityId,
+				objectId, terminal, price)) {
+			result.status = "FAIL";
+			result.failReason = "list_harness_consumable_failed";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
 	if (op == "awaitProductionLoadout") {
 		Vector<uint64> productionIds;
 		VectorMap<uint64, uint64> bodyOids;
@@ -27507,6 +28760,105 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 	armorJson["blockedReason"] = inspectArmorBlockedReason;
 	result["armor"] = armorJson;
 
+	// Food inspection is intentionally gate-independent, just like abilities:
+	// it shows configured items and memory state before the capability is armed.
+	SimBotConsumablePolicy inspectConsumablePolicy =
+		snapshotPlayerBotConsumablePolicy();
+	SimBotStomach inspectStomach;
+	uint64 inspectNextConsumableCheckAtMs = 0;
+	uint32 inspectLastConsumedCrc = 0;
+	uint64 inspectLastConsumedAtMs = 0;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (progressionStomach.contains(identityId))
+			inspectStomach = progressionStomach.get(identityId);
+		if (progressionConsumableNextCheckAtMs.contains(identityId))
+			inspectNextConsumableCheckAtMs =
+				progressionConsumableNextCheckAtMs.get(identityId);
+		if (progressionConsumablesLastConsumedByIdentity.contains(identityId))
+			inspectLastConsumedCrc =
+				progressionConsumablesLastConsumedByIdentity.get(identityId);
+		if (progressionConsumablesLastConsumedAtMs.contains(identityId))
+			inspectLastConsumedAtMs =
+				progressionConsumablesLastConsumedAtMs.get(identityId);
+	}
+	SimBotConsumables::DigestResult inspectFood =
+		SimBotConsumables::digest(inspectStomach.food, System::getMiliTime());
+	SimBotConsumables::DigestResult inspectDrink =
+		SimBotConsumables::digest(inspectStomach.drink, System::getMiliTime());
+	JSONSerializationType consumablesJson = JSONSerializationType::object();
+	JSONSerializationType stomachJson = JSONSerializationType::object();
+	stomachJson["food"] = inspectFood.fill;
+	stomachJson["drink"] = inspectDrink.fill;
+	stomachJson["max"] = SimBotConsumables::kStomachMax;
+	consumablesJson["stomach"] = stomachJson;
+	std::vector<bool> inspectBuffActive(inspectConsumablePolicy.items.size(), false);
+	std::vector<uint64> inspectBuffRemaining(inspectConsumablePolicy.items.size(), 0);
+	if (bodyAgent != nullptr) {
+		Locker agentLock(bodyAgent);
+		for (int i = 0; i < inspectConsumablePolicy.items.size(); ++i) {
+			uint32 buffCrc = inspectConsumablePolicy.items.get(i).buffCrc;
+			Buff* buff = buffCrc == 0 ? nullptr : bodyAgent->getBuff(buffCrc);
+			if (buff != nullptr) {
+				inspectBuffActive[i] = true;
+				inspectBuffRemaining[i] = static_cast<uint64>(std::max(0.f,
+					buff->getTimeLeft()) * 1000.f);
+			}
+		}
+	}
+	JSONSerializationType consumableItemsJson = JSONSerializationType::array();
+	for (int entryIndex = 0; entryIndex < inspectConsumablePolicy.items.size();
+			++entryIndex) {
+		const SimBotConsumables::ConsumableEntry& entry =
+			inspectConsumablePolicy.items.get(entryIndex);
+		int doses = 0;
+		int stacks = 0;
+		for (int rowIndex = 0; rowIndex < inspectItemRows.size(); ++rowIndex) {
+			const SimBotItemRow& row = inspectItemRows.get(rowIndex);
+			if (row.state != SIMBOT_ITEM_HELD ||
+					row.templateCrc != entry.templateCrc)
+				continue;
+			ManagedReference<SceneObject*> item = zoneServer == nullptr ? nullptr :
+				zoneServer->getObject(row.objectId);
+			Consumable* consumable = item == nullptr ? nullptr :
+				cast<Consumable*>(item.get());
+			if (consumable == nullptr)
+				continue;
+			Locker itemLock(item);
+			++stacks;
+			doses += static_cast<int>(consumable->getUseCount());
+		}
+		JSONSerializationType itemJson = JSONSerializationType::object();
+		itemJson["template"] = entry.templatePath;
+		itemJson["doses"] = doses;
+		itemJson["stacks"] = stacks;
+		itemJson["buffActive"] = entryIndex < static_cast<int>(
+			inspectBuffActive.size()) && inspectBuffActive[entryIndex];
+		uint64 remainingMs = entryIndex < static_cast<int>(
+			inspectBuffRemaining.size()) ? inspectBuffRemaining[entryIndex] : 0;
+		itemJson["buffRemainingSeconds"] = remainingMs / 1000;
+		consumableItemsJson.push_back(itemJson);
+	}
+	consumablesJson["items"] = consumableItemsJson;
+	consumablesJson["nextCheckInSeconds"] =
+		inspectNextConsumableCheckAtMs > System::getMiliTime() ?
+		(inspectNextConsumableCheckAtMs - System::getMiliTime()) / 1000 : 0;
+	JSONSerializationType lastConsumedJson = JSONSerializationType::object();
+	if (inspectLastConsumedCrc != 0) {
+		String lastTemplate = String::valueOf(inspectLastConsumedCrc);
+		SharedObjectTemplate* lastTemplateData = TemplateManager::instance() == nullptr ?
+			nullptr : TemplateManager::instance()->getTemplate(inspectLastConsumedCrc);
+		if (lastTemplateData != nullptr)
+			lastTemplate = lastTemplateData->getFullTemplateString();
+		lastConsumedJson["template"] = lastTemplate;
+		lastConsumedJson["ageSeconds"] = inspectLastConsumedAtMs == 0 ?
+			static_cast<uint64>(0) : (System::getMiliTime() >
+			inspectLastConsumedAtMs ? (System::getMiliTime() -
+			inspectLastConsumedAtMs) / 1000 : static_cast<uint64>(0));
+	}
+	consumablesJson["lastConsumed"] = lastConsumedJson;
+	result["consumables"] = consumablesJson;
+
 	JSONSerializationType activeAbilities = JSONSerializationType::array();
 	JSONSerializationType inactiveAbilities = JSONSerializationType::array();
 	for (int i = 0; i < installedAbilities.size(); ++i) {
@@ -27843,6 +29195,10 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	VectorMap<uint64, SimBotLoadout::LoadoutChoice> loadoutChoiceSnapshot;
 	VectorMap<uint64, Vector<SimBotWornArmorPiece> > armorWornSnapshot;
 	VectorMap<uint64, String> armorBlockedSnapshot;
+	SimBotConsumablePolicy consumablePolicySnapshot;
+	VectorMap<uint32, uint64> consumablesConsumedSnapshot;
+	VectorMap<uint64, uint32> consumablesLastConsumedSnapshot;
+	VectorMap<uint64, uint64> consumablesLastConsumedAtSnapshot;
 	SimBotEarlyGameConfig earlyGameConfigSnapshot;
 	SimBotCombatAbilityConfig combatAbilityConfigSnapshot;
 	int dirtyCount = 0;
@@ -27871,6 +29227,12 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		loadoutChoiceSnapshot = progressionLoadoutChoices;
 		armorWornSnapshot = progressionArmorWorn;
 		armorBlockedSnapshot = progressionArmorBlockedReason;
+		consumablePolicySnapshot = progressionConsumablePolicy;
+		consumablesConsumedSnapshot = progressionConsumablesConsumedByTemplate;
+		consumablesLastConsumedSnapshot =
+			progressionConsumablesLastConsumedByIdentity;
+		consumablesLastConsumedAtSnapshot =
+			progressionConsumablesLastConsumedAtMs;
 		earlyGameConfigSnapshot = progressionEarlyGameConfig;
 		combatAbilityConfigSnapshot = progressionCombatAbilityConfig;
 		dirtyCount = progressionDirtyIds.size();
@@ -28047,6 +29409,12 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		playerBotArmorLoadoutGateEnabled(0) && bazaarBuyDashboardEnabled &&
 		snapshotPlayerBotArmorPolicy().bazaarUpgrades;
 	gates["armorBazaarUpgrades"] = armorUpgradesDashboardEnabled;
+	const bool consumablesDashboardEnabled = playerBotConsumablesGateEnabled(0);
+	const bool consumableRestockDashboardEnabled =
+		consumablesDashboardEnabled && bazaarBuyDashboardEnabled &&
+		consumablePolicySnapshot.bazaarRestock;
+	gates["consumables"] = consumablesDashboardEnabled;
+	gates["consumableRestock"] = consumableRestockDashboardEnabled;
 	result["gates"] = gates;
 
 	JSONSerializationType missionCredits = JSONSerializationType::object();
@@ -28355,6 +29723,80 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	}
 	armorDashboard["blocked"] = armorBlocked;
 	result["armor"] = armorDashboard;
+
+	JSONSerializationType consumablesDashboard = JSONSerializationType::object();
+	consumablesDashboard["configured"] = consumablePolicySnapshot.enabled &&
+		!consumablePolicySnapshot.items.isEmpty();
+	consumablesDashboard["enabled"] = consumablesDashboardEnabled;
+	consumablesDashboard["bazaarRestock"] =
+		consumableRestockDashboardEnabled;
+	consumablesDashboard["minDoses"] = consumablePolicySnapshot.minDoses;
+	consumablesDashboard["restockScanIntervalMinutes"] =
+		consumablePolicySnapshot.restockScanIntervalMinutes;
+	consumablesDashboard["maxRestockLoadsPerVisit"] =
+		consumablePolicySnapshot.maxRestockLoadsPerVisit;
+	consumablesDashboard["restockSpendFraction"] =
+		consumablePolicySnapshot.restockSpendFraction;
+	JSONSerializationType configuredConsumables = JSONSerializationType::array();
+	for (int i = 0; i < consumablePolicySnapshot.items.size(); ++i) {
+		const SimBotConsumables::ConsumableEntry& entry =
+			consumablePolicySnapshot.items.get(i);
+		JSONSerializationType row = JSONSerializationType::object();
+		row["template"] = entry.templatePath;
+		row["minDoses"] = entry.minDoses;
+		row["maxPricePerDose"] = entry.maxPricePerDose;
+		row["drink"] = entry.isDrink;
+		configuredConsumables.push_back(row);
+	}
+	consumablesDashboard["configuredItems"] = configuredConsumables;
+	JSONSerializationType consumedByTemplate = JSONSerializationType::object();
+	for (int i = 0; i < consumablesConsumedSnapshot.size(); ++i) {
+		uint32 templateCrc = consumablesConsumedSnapshot.elementAt(i).getKey();
+		String templatePath = String::valueOf(templateCrc);
+		SharedObjectTemplate* templateData = TemplateManager::instance() == nullptr ?
+			nullptr : TemplateManager::instance()->getTemplate(templateCrc);
+		if (templateData != nullptr)
+			templatePath = templateData->getFullTemplateString();
+		consumedByTemplate[templatePath.toCharArray()] =
+			consumablesConsumedSnapshot.elementAt(i).getValue();
+	}
+	consumablesDashboard["consumed"] = progressionConsumablesConsumed.get();
+	consumablesDashboard["consumedByTemplate"] = consumedByTemplate;
+	JSONSerializationType skippedConsumables = JSONSerializationType::object();
+	skippedConsumables["buffActive"] =
+		progressionConsumablesSkippedBuffActive.get();
+	skippedConsumables["stomachFull"] =
+		progressionConsumablesSkippedStomachFull.get();
+	skippedConsumables["noDoses"] = progressionConsumablesSkippedNoDoses.get();
+	consumablesDashboard["skipped"] = skippedConsumables;
+	consumablesDashboard["lastDoseRemovals"] =
+		progressionConsumablesLastDoseRemovals.get();
+	consumablesDashboard["restockPurchases"] =
+		progressionConsumablesRestockPurchases.get();
+	consumablesDashboard["restockSkips"] =
+		progressionConsumablesRestockSkips.get();
+	consumablesDashboard["rejectedEntries"] =
+		progressionConsumablesRejectedEntries.get();
+	JSONSerializationType lastConsumed = JSONSerializationType::array();
+	for (int i = 0; i < consumablesLastConsumedSnapshot.size(); ++i) {
+		uint64 identityId = consumablesLastConsumedSnapshot.elementAt(i).getKey();
+		uint32 templateCrc = consumablesLastConsumedSnapshot.elementAt(i).getValue();
+		String templatePath = String::valueOf(templateCrc);
+		SharedObjectTemplate* templateData = TemplateManager::instance() == nullptr ?
+			nullptr : TemplateManager::instance()->getTemplate(templateCrc);
+		if (templateData != nullptr)
+			templatePath = templateData->getFullTemplateString();
+		JSONSerializationType row = JSONSerializationType::object();
+		row["identityId"] = identityId;
+		row["template"] = templatePath;
+		uint64 atMs = consumablesLastConsumedAtSnapshot.contains(identityId) ?
+			consumablesLastConsumedAtSnapshot.get(identityId) : 0;
+		row["ageSeconds"] = atMs == 0 ? static_cast<uint64>(0) :
+			(nowMs > atMs ? (nowMs - atMs) / 1000 : static_cast<uint64>(0));
+		lastConsumed.push_back(row);
+	}
+	consumablesDashboard["lastConsumed"] = lastConsumed;
+	result["consumables"] = consumablesDashboard;
 
 	JSONSerializationType vaultJson = JSONSerializationType::object();
 	vaultJson["available"] = dashboardEconomy != nullptr &&
@@ -29407,6 +30849,11 @@ void SimPlayerManager::retirePveIdentity(uint64 identityId) {
 		progressionArmorBodyRaceCrc.drop(identityId);
 		progressionArmorChoices.drop(identityId);
 		progressionArmorBlockedReason.drop(identityId);
+		progressionStomach.drop(identityId);
+		progressionConsumableNextCheckAtMs.drop(identityId);
+		progressionConsumablesLastConsumedByIdentity.drop(identityId);
+		progressionConsumablesLastConsumedAtMs.drop(identityId);
+		progressionConsumableRestockScanAtMs.drop(identityId);
 		progressionCertificationCache.drop(identityId);
 		progressionLoadoutDirtyIds.drop(identityId);
 		progressionArmorDirtyIds.drop(identityId);
@@ -29448,6 +30895,11 @@ void SimPlayerManager::retirePveIdentity(uint64 identityId) {
 		progressionArmorWorn.drop(identityId);
 		progressionArmorChoices.drop(identityId);
 		progressionArmorBlockedReason.drop(identityId);
+		progressionStomach.drop(identityId);
+		progressionConsumableNextCheckAtMs.drop(identityId);
+		progressionConsumablesLastConsumedByIdentity.drop(identityId);
+		progressionConsumablesLastConsumedAtMs.drop(identityId);
+		progressionConsumableRestockScanAtMs.drop(identityId);
 		progressionRetiringIds.drop(identityId);
 	}
 	{
@@ -29823,6 +31275,12 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 	Vector<String> spawnArmorSkills;
 	const bool armorSpawnGate =
 		playerBotArmorLoadoutGateEnabled(identity.id);
+	const bool consumableSpawnGate =
+		playerBotConsumablesGateEnabled(identity.id);
+	{
+		Locker progressionLock(&progressionMutex);
+		progressionConsumableNextCheckAtMs.drop(identity.id);
+	}
 	if (armorSpawnGate) {
 		Vector<SimBotArmorLoadout::ArmorStats> ignoredCandidates;
 		snapshotPlayerBotArmorCandidates(identity.id, ignoredCandidates,
@@ -29954,6 +31412,7 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 			}
 		}
 		agent->setSimBotWornArmor(armorOnBody);
+		agent->setSimBotConsumableParity(consumableSpawnGate);
 		if (identity.deaths > 0 && pveCloneWoundAmount > 0) {
 			for (uint8 pool = CreatureAttribute::HEALTH;
 					pool <= CreatureAttribute::WILLPOWER; ++pool) {

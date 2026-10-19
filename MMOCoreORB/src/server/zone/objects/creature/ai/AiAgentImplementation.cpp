@@ -372,6 +372,7 @@ void AiAgentImplementation::loadTemplateData(CreatureTemplate* templateData) {
 	simPlayerBot = false;
 	skillDerivedAttackMap = nullptr;
 	simBotWornArmor = false;
+	simBotConsumableParity = false;
 	simBotArmorMitigatedTotal = 0;
 	skillAbilitySpecialChance = 0;
 	skillAbilityPreferFreeState = false;
@@ -653,6 +654,13 @@ int AiAgentImplementation::getSkillMod(const String& skillMod) const {
     if (baseMod != 0)
 		//Logger::console.info("baseMod != 0", true);
         return baseMod;
+
+    return getSkillModFallback(skillMod);
+}
+
+// The values AiAgent reports when the creature skill-mod total is zero. The
+// PlayerBot food seam (CombatManager) needs them while a buff hides them.
+int AiAgentImplementation::getSkillModFallback(const String& skillMod) const {
 
     // 2. Check the Lua Template (The "Character Sheet")
     if (npcTemplate != nullptr) {

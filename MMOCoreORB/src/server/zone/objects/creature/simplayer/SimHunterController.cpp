@@ -6253,6 +6253,9 @@ void SimHunterController::engageMissionLair() {
 	// releasing it -- never hold the actor lock across MissionDiagLog file I/O.
 	bool combatStarted = false;
 	float engageDist = 0.f;
+	if (!agent->isInCombat())
+		SimPlayerManager::instance()->consumePlayerBotFoodBeforeEngage(
+				identityId, agent);
 	{
 		Locker agentLock(agent);
 		engageDist = agent->getDistanceTo(lair);
@@ -6455,6 +6458,9 @@ void SimHunterController::engageTarget() {
 	if (observerTargetOid != targetOid || targetObserver == nullptr)
 		return;
 
+	if (!agent->isInCombat())
+		SimPlayerManager::instance()->consumePlayerBotFoodBeforeEngage(
+				identityId, agent);
 	{
 		Locker agentLock(agent);
 		if (!CombatManager::instance()->startCombat(agent, target))
@@ -6934,6 +6940,13 @@ bool SimHunterController::defendAgainstInterceptor(AiAgent* hunter,
 	ManagedReference<SceneObject*> current = hunter->getFollowObject();
 	if (current != nullptr && current->getObjectID() == attacker->getObjectID())
 		return true;
+
+	// Owner decision (F_0.9.14 verification): a bot turning to fight an
+	// attacker on a travel leg eats too, because mission bots rarely start a
+	// fight themselves. Called with no lock held; the deadline keeps it to once
+	// per buff or digest window.
+	SimPlayerManager::instance()->consumePlayerBotFoodBeforeEngage(
+			identityId, hunter);
 
 	// Fight back, mirroring engageTarget's real-combat contract (attacker
 	// locked; startCombat cross-locks the defender). The selector already chose

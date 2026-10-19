@@ -345,6 +345,8 @@
     const purchases = Array.isArray(data.purchases) ? data.purchases : [];
     const loadout = data.loadout || {};
     const armor = data.armor || {};
+    const consumables = data.consumables || {};
+    const consumableItems = Array.isArray(consumables.items) ? consumables.items : [];
     const armorWorn = Array.isArray(armor.worn) ? armor.worn : [];
     const armorDesired = Array.isArray(armor.desired) ? armor.desired : [];
     const loadoutProtected = Array.isArray(loadout.protected) ? loadout.protected : [];
@@ -417,6 +419,13 @@
       <td>${chip(labelize(piece.status || "unknown"), piece.status === "kept" ? "ok" : "ghost")}</td>
       <td>${esc(piece.reason || "unknown")}</td>
     </tr>`).join("");
+    const consumableRows = consumableItems.map((item) => `<tr>
+      <td>${esc(item.template || "unknown")}</td>
+      <td class="t-num">${num(item.doses)}</td>
+      <td class="t-num">${num(item.stacks)}</td>
+      <td>${chip(item.buffActive ? "active" : "ready", item.buffActive ? "teal" : "ghost")}</td>
+      <td class="t-num">${num(item.buffRemainingSeconds)}s</td>
+    </tr>`).join("");
 
     return `<div class="playerbot-card"><h3>WHO</h3><p class="playerbot-lead">${esc(identity.name || "Unnamed SimBot")}</p>
       ${kvRows([["Profession", esc(labelize(identity.profession || "unknown"))], ["Home", esc(home)], ["Tier", num(identity.skillTier)], ["Kills / deaths", `${num(identity.kills)} / ${num(identity.deaths)}`], ["Activity", esc(labelize(activity))], ["Body", body.attached ? `attached · ${esc(body.zone || "unknown")}` : "not attached"], ["Lair members alive", num(body.lairMembersAlive)], ["Non-member engagements", num(body.nonMemberEngagements)]])}</div>
@@ -436,6 +445,7 @@
       <div class="playerbot-card"><h3>PURCHASES (${num(purchases.length)})</h3>${table(["Auction", "Template", "State", "Seller", "Price", "Debited", "Closed"], purchaseRows, { scrollKey: "playerbot-purchases", tall: true })}</div>
       <div class="playerbot-card"><h3>LOADOUT</h3>${loadoutCurrent}<p class="playerbot-label">WEAPON CANDIDATES (${num(loadoutCandidates.length)}) · PROTECTED ${num(loadoutProtected.length)}</p>${table(["OID", "Template", "XP Type", "DPS", "Certified", "Protected"], loadoutCandidateRows, { scrollKey: "playerbot-loadout", tall: true })}</div>
       <div class="playerbot-card"><h3>ARMOR</h3><p class="playerbot-label">${chip(armor.enabled ? "gate on" : "gate off", armor.enabled ? "ok" : "ghost")} · ${chip(armor.simBotWornArmor ? "player mitigation" : "not flagged", armor.simBotWornArmor ? "teal" : "ghost")} · ${esc(armor.blockedReason || "no blocker")}</p>${kvRows([["Buffed pools", Object.entries(armor.buffedPools || {}).filter(([, value]) => value).map(([key]) => labelize(key)).join(", ") || "none"], ["Total encumbrance", num(armor.totalEncumbrance)], ["Mitigated total", num(armor.mitigatedTotal)], ["Race CRC", armor.bodyRaceCrc || "unknown"]])}${table(["Source OID", "Copy OID", "Slot", "Template", "Rating", "Condition", "State"], armorRows, { scrollKey: "playerbot-armor", tall: true })}<p class="playerbot-label">DESIRED SET (${num(armorDesired.length)})</p>${table(["Slot", "OID", "Template", "Score", "Status", "Usability"], armorDesiredRows, { scrollKey: "playerbot-armor-desired" })}</div>
+      <div class="playerbot-card"><h3>FOOD &amp; DRINK</h3><p class="playerbot-label">${kvRows([["Food fill", `${num((consumables.stomach || {}).food)} / ${num((consumables.stomach || {}).max)}`], ["Drink fill", `${num((consumables.stomach || {}).drink)} / ${num((consumables.stomach || {}).max)}`], ["Next check", `${num(consumables.nextCheckInSeconds)}s`], ["Last consumed", consumables.lastConsumed && consumables.lastConsumed.template ? esc(consumables.lastConsumed.template) : "none"]])}</p>${table(["Template", "Doses", "Stacks", "Buff", "Remaining"], consumableRows, { scrollKey: "playerbot-consumables" })}</div>
       <div class="playerbot-card"><h3>SKILL MODS</h3>${modRows ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Mod</th><th>Base</th><th>Trained</th><th>Effective</th></tr></thead><tbody>${modRows}</tbody></table></div>` : `<span class="muted small">No live skill mods.</span>`}</div>`;
   }
 
@@ -1296,6 +1306,8 @@
     const loadout = progression.loadout || {};
     const loadoutUpgrades = loadout.upgrades || (bazaar.buy || {}).upgrades || {};
     const armor = progression.armor || {};
+    const consumables = progression.consumables || {};
+    const consumableSkipped = consumables.skipped || {};
     const armorUpgrades = bazaarBuy.armorUpgrades || {};
     const vault = progression.vault || {};
     const ledger = progression.ledger || {};
@@ -1495,7 +1507,18 @@
             ["Usability skips", `${num(armor.skippedRace)} race · ${num(armor.skippedFaction)} faction · ${num(armor.skippedCert)} cert · ${num(armor.skippedNoCoverage)} no coverage`],
             ["Hysteresis", num(armor.hysteresisHolds)],
             ["Policy", `${num(armor.minUpgradePercent)}% minimum · ${Number(armor.upgradeSpendFraction || 0).toFixed(2)} spend fraction · ${num(armor.maxUpgradeLoadsPerVisit)} loads/visit`]
-          ])}`, "span-12")}
+          ])}`, "span-6")}
+          ${panel("FOOD &amp; DRINK", `${chip(consumables.configured ? "configured" : "config off", consumables.configured ? "ok" : "ghost")} ${chip(consumables.enabled ? "gate on" : "gate off", consumables.enabled ? "ok" : "ghost")} ${chip(consumables.bazaarRestock ? "restock on" : "no restock", consumables.bazaarRestock ? "teal" : "ghost")}`, `<div class="metric-row">
+            ${metric("Consumed", consumables.consumed, { tone: "accent" })}
+            ${metric("Last-dose removals", consumables.lastDoseRemovals)}
+            ${metric("Restock purchases", consumables.restockPurchases, { tone: "accent" })}
+            ${metric("Restock skips", consumables.restockSkips)}
+            ${metric("Rejected entries", consumables.rejectedEntries, { tone: Number(consumables.rejectedEntries || 0) ? "warn" : "" })}
+          </div>${kvRows([
+            ["Skipped", `${num(consumableSkipped.buffActive)} buff active · ${num(consumableSkipped.stomachFull)} stomach full · ${num(consumableSkipped.noDoses)} no doses`],
+            ["Policy", `${num(consumables.minDoses)} minimum doses · scan every ${num(consumables.restockScanIntervalMinutes)}m · ${num(consumables.maxRestockLoadsPerVisit)} loads/visit · ${Number(consumables.restockSpendFraction || 0).toFixed(2)} spend fraction`],
+            ["Configured templates", (consumables.configuredItems || []).map((entry) => `${esc(entry.template || "?")}${entry.drink ? " (drink)" : " (food)"}`).join(" · ") || "none"]
+          ])}`, "span-6")}
           <div class="section-gap"></div>
           ${kvRows([
             ["Flush interval", num(progression.flushIntervalSeconds) + "s"],

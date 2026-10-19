@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.9.15` | 15 | F_0.9.14 P.10o: food and drink — roster PlayerBots get a player-parity stomach and eat Lua-listed crafted consumables from their vault before fights they start or fight back in, once per buff or digest window; a flagged combat seam counts the buffs and the player use path shares the buff constructor; bots restock below 10 doses through the debit-first BUY path priced per dose, SELL protects configured food, and the last dose removes the item with a ledger row; no schema change; gates default-off |
 | `0.9.14` | 14 | F_0.9.13 P.10n: armor loadout — roster PlayerBots wear the best usable armor in their vault per slot as transient copies that combat mitigates with the player armor math, put armor on only while buffed and keep it through buff loss and respawn with real encumbrance, on clothing-free bodies across ten species with a fixed per-bot look and server clothing that armor swaps off and back; SELL protects worn armor and the best spare per slot, an optional sub-gate buys a clearly better piece through the debit-first BUY path, and harness buyers only touch harness listings; no schema change; gates default-off |
 | `0.9.13` | 14 | F_0.9.12 P.10m: weapon loadout — roster PlayerBots wield the best certified weapon in their vault for the class their training needs (any class once the plan is complete) as a transient copy with the item's stats, SELL protects the equipped weapon and the best usable spare per planned class, and an optional sub-gate instant-buys a clearly better certified weapon within a share of spendable credits through the debit-first BUY path; no schema change; gates default-off |
 | `0.9.12` | 14 | F_0.9.10 P.10k: bazaar BUY — roster PlayerBots instant-buy their training plan's buy-list items from human, bot and seeded listings at or below loot value x markup (or the entry's maxPrice) while keeping a credit reserve; the debit is made durable before the object store moves, the item goes straight to the vault, sellers are paid through the stock path, and boot recovery refunds or commits from evidence; no schema change; gate default-off |
@@ -33,6 +34,12 @@
 
 # Changelog Summary
 
+- **v0.9.15 (Food and drink, F_0.9.14 P.10o - Week 15, 19-10-2026)**:
+  - **A stomach like a player's.** Each roster bot has food and drink fill (100 each, emptying 1 point every 18 s), derived in memory, kept through death.
+  - **Eat before the fight.** Right before a fight it starts, or when it turns on an attacker while travelling, a bot eats every configured food or drink whose buff is missing and that fits its stomach. It then waits until a buff expires or digestion makes room, so it never retries in a loop.
+  - **Food that counts.** Vasarian brandy raises mind, pikatta pie adds defense and crispic adds accuracy, through a flagged combat seam for roster bots only. Stock NPCs are unchanged, and players use the same shared buff code as before.
+  - **Restock on the bazaar.** Below 10 doses of a listed item, a bot buys the cheapest stack per dose through the debit-first BUY path; food it means to eat is never sold. The item list is editable in Lua.
+  - **Verified live.** 68 of 68: 59 harness scenarios on the final build, and a production bot that bought food with its own credits and ate it before its own lair fights. Verification fixed an accuracy fallback hidden by food buffs, a restock scan wasted on non-food listings, and added eating on travel fights (owner decision). Both gates ship off.
 - **v0.9.14 (Armor loadout, F_0.9.13 P.10n - Week 14, 18-10-2026)**:
   - **Bots wear the armor they own.** A roster bot wears the best usable piece in its vault for each body slot (race, faction and skill rules as for a player), scored by how much damage it absorbs, with a 10 % margin before a swap. The body wears a transient copy; the vault item never moves.
   - **Real protection, real cost.** A flagged bot takes the stock player armor math in combat (hit location, armor rating vs piercing, resists, condition damage); stock NPCs keep their template values. Encumbrance and wearable skill mods apply exactly as for a player.

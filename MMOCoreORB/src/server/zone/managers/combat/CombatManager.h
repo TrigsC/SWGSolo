@@ -19,6 +19,11 @@
 class CreatureAttackData;
 class CombatQueueCommand;
 
+struct SimBotConsumableCombatProbe {
+	int accuracy = 0;
+	int defense = 0;
+};
+
 class CombatManager : public Singleton<CombatManager>, public Logger, public Object {
 public:
 	enum HitStatus : int {
@@ -122,6 +127,9 @@ public:
 		setLogging(false);
 		initializeDefaultAttacks();
 	}
+
+	SimBotConsumableCombatProbe getSimBotConsumableCombatProbe(
+			CreatureObject* body, CreatureObject* opponent) const;
 
 	/**
 	 * Attempts combat between 2 creature objects
