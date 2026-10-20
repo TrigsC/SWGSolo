@@ -565,6 +565,10 @@ public:
         const String& /*reason*/) {}
     virtual void onInterplanetaryTravelFinished(bool, const String&,
         const String&) {}
+    // Derived controllers may publish inherited travel-state changes into a
+    // controller-owned packed availability snapshot.  The base remains a
+    // no-op so miners and other controllers retain their existing behavior.
+    virtual void onInterplanetaryTravelAvailabilityChanged(bool) {}
     virtual void onStaleWorkLoopTaskIgnored(const String& taskType, uint64 capturedGeneration, uint64 currentGeneration);
     // Combat-capable controllers override this lease predicate for the
     // compound peace predicate used by the traversal resume monitor.
@@ -767,6 +771,9 @@ public:
     bool isInterplanetaryTravelActive() const {
         return interplanetaryTravelActive;
     }
+
+protected:
+    void setInterplanetaryTravelActive(bool active);
 
 protected:
     enum class TraversalMoveOrigin {

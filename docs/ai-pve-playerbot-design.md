@@ -518,6 +518,30 @@ keys, restore the single-family signal decrement.
 
 ## P.10 — PlayerBot player parity (F_0.9.0, the progression store)
 
+### P.10p G1 — LFB and player grouping
+
+Grouping is a manager-owned, default-off capability. When `groupingEnabled` is true, the manager
+creates a non-moderated `LFB` room under `SWG.<galaxy>` and copies room messages into queued
+request tasks. Matching is pure policy (`SimBotGrouping.h`); offers are identity-keyed records with
+a generation and expiry. A bot accepts only the player whose request produced its live offer, and
+the invite path revalidates the offer, body mapping, inviter and generation before converting it
+to a stock `GroupManager` join. A failed conversion compensates the stock membership before the
+offer is discarded.
+
+`groupingMutex` is a leaf. The manager publishes offers and grouped records, while
+`SimHunterController` is the single writer for routine suspension, grouped follow/travel ticks and
+combat. Grouped records carry a generation so reconciliation can capture state, read the world,
+recheck the record, and lease `RELEASING` safely. Death publishes `DEAD_REJOIN` before the body
+lock and stock group leave; a valid respawn rejoins the recorded player group. Gate-off, kick,
+disband, missing player membership and the offline grace window release the record.
+
+The dashboard exposes `playerBotProgression.grouping` with counters, live offers/grouped bots,
+free/live samples and a bounded unmatched-message ring; inspect JSON exposes the individual offer
+or record. LFB and group lifecycle events use the same mission diagnostic channel as `CONSUME`.
+Parity scenarios use `SimParityTestController` bodies as stand-in leaders. Production roster bots
+are selected by an identity-scoped availability override; the harness never enables the production
+gate by default. G2 adds group buff trips, G3 group missions, and G4 group tactics.
+
 The P.10 line is tracked in its own roadmap,
 `docs/1-plans/ROADMAP_p10-playerbot-parity.md`, which holds the nine-chunk
 breakdown (F_0.9.0 store → F_0.9.1 kill XP → F_0.9.2 mission credits →

@@ -10,10 +10,29 @@ inserted ahead of the bazaar work. **F_0.9.10** (P.10k, bazaar BUY) is RELEASED
 as v0.9.12 (2026-10-16). **F_0.9.12** (P.10m, weapon loadout) was inserted next
 on the owner's request and is RELEASED as v0.9.13 (2026-10-17), followed by **F_0.9.13** (P.10n,
 armor loadout with visible armor, ten species and a fixed look per bot), RELEASED as v0.9.14
-(2026-10-18), and **F_0.9.14** (P.10o, food and drink), RELEASED as v0.9.15 (2026-10-19). Next
-chunk: **F_0.9.11** (P.10l, profession allocation policy).
+(2026-10-18), **F_0.9.14** (P.10o, food and drink), RELEASED as v0.9.15 (2026-10-19), and
+**F_0.9.15** (P.10p, grouping G1, Looking For Bot), RELEASED as v0.9.16 (2026-10-20).
+Next chunk: grouping **G2** (rally and buffs), then G3/G4, before **F_0.9.11** (P.10l, profession allocation policy).
 **Written**: 2026-09-02 (project week 8)
-**Last updated**: 2026-10-19 — F_0.9.14 food and drink released as v0.9.15
+**Last updated**: 2026-10-20 — F_0.9.15 grouping G1 (LFB) released as v0.9.16
+
+## F_0.9.15 — LFB and player grouping (P.10p)
+
+G1 is RELEASED as v0.9.16 (2026-10-20) behind the default-off `groupingEnabled` gate (live
+receipt 27/27 including the owner's real-client pass; `docs/4-unit-tests/live_f0915-*`). It adds the LFB room,
+offer/revalidation lifecycle, player invites, grouped follow/travel/defense, release and death
+rejoin, dashboard observability, and a stand-in-leader parity harness. The grouping line is split
+into four owner-approved chunks:
+
+| Chunk | Scope | Status |
+| --- | --- | --- |
+| **G1** | LFB, offers, invites, grouped behavior, status/leave, release and rejoin | RELEASED v0.9.16 |
+| **G2** | buffs and meet-at-place group trips, readiness and re-buff, intra-planet shuttles (moved from G1) | next grouping chunk |
+| **G3** | group missions, waypoints and reveal/assist callouts | later |
+| **G4** | group tactics, spin-attack poll, lair unlock and take-food commands | later |
+
+G1 precedes F_0.9.11; the profession allocator remains the next non-grouping chunk after the
+grouping line.
 
 ## 0. Mandate
 
@@ -46,7 +65,7 @@ because the engine stores XP on the ghost and gates most reward paths on
 | **XP per kill** | `CreatureManager::notifyDestruction` copies the corpse's `ThreatMap` and calls `PlayerManager::disseminateExperience` (`CreatureManagerImplementation.cpp:675`). `ThreatMapEntry::addDamage(weapon->getXpType(), dmg)` (`ThreatMap.cpp:18-22, :69-102`) already keys **every attacker's** damage by the weapon's XP type — a bot with the T-21 accrues `combat_rangedspecialize_rifle` entries. Formula at `PlayerManagerImplementation.cpp:2225-2290`: `baseXp = ai->getBaseXp()` (`:2087`) × damage share, capped at `playerLevel*300`, × group multiplier, plus `combat_general` at 10 %. | `disseminateExperience` only visits `isPlayerCreature()` attackers (`:2225`), and `awardExperience` returns 0 without a ghost (`:2703-2707`). XP lives in `PlayerObject.experienceList` (`PlayerObject.idl:128`). | The threat-map data is already correct; we need a **bot branch at the same chokepoint** writing to a manager-owned store, and a bot-level source for the cap. |
 | **Credits per mission** | Real missions pay in `MissionObjectiveImplementation::awardReward` (`:317-364`): reward split by `max(rewardCreditsDivisor, groupCountInRange)`, `player->addBankCredits`. Reward amount from `MissionManagerImplementation.cpp:920` (`destroyMissionBaseReward + factor*difficultyLevel + random`, config on `MissionManager`). | Bot missions are **mimetic** (P.8.7): a `PveBotMissionOffer` (`SimPlayerManager.h:197`) with `difficultyLevel`, no `MissionObject`. Completion is counted at `pveMissionsCompletedTotal++` (`SimPlayerManager.cpp:10649`, `:12781`) and pays nothing (F_0.5.0 "no credits at all this slice"). | Compute the reward from the same formula inputs at the existing completion site; credit the store, not the body. |
 | **Loot from kills** | `notifyDestruction` creates loot into the corpse inventory via `LootManager::createLoot` (`CreatureManagerImplementation.cpp:684-705`), adds cash (`calculateLootCredits`), and keeps the corpse 300 s (`:728`). Players loot via `PlayerManager::lootAll` (`:4410`). Group rules FFA / MASTERLOOTER / LOTTERY / RANDOM in `GroupLootTask.h` + `GroupManager::createLottery/doRandomLoot/transferLoot`. | Loot is created **only** when the highest-damage group leader `isPlayerCreature()` (`:684`). A bot kill yields an empty corpse despawned in 10 s. LOTTERY is a player UI session (`LootLotterySession`). | Bot branch at the same chokepoint creates loot exactly as for a player, then a bot "loot step" moves items into a real container. Bot-group dispersal must be manager-side (RANDOM/MASTERLOOTER semantics); LOTTERY cannot apply to bots. |
-| **Group membership** | `GroupObject::addMember` accepts any `CreatureObject`; P.6.3c already lets a squad-leader NPC be an inviter (`GroupManager.cpp:193`). Group XP multiplier and mission split are group-size driven. | `inviteToGroup`/`joinGroup` are player-choreographed (system messages, chat rooms, LFG bits at `:259-300`); bot-only groups need a manager-formed group with the same lock choreography (`Locker glock(group); Locker clocker(creature, group)`). Hunters currently hunt **solo**. | Group dispersal ships behind a harness-formed bot group; production group hunting is not a P.10 deliverable. |
+| **Group membership** | `GroupObject::addMember` accepts any `CreatureObject`; P.6.3c already lets a squad-leader NPC be an inviter (`GroupManager.cpp:193`). Group XP multiplier and mission split are group-size driven. | `inviteToGroup`/`joinGroup` are player-choreographed (system messages, chat rooms, LFG bits at `:259-300`); G1 adds the gated offer and revalidation path while the controller owns grouped behavior. | G1 ships the production group lifecycle behind `groupingEnabled`; group missions and tactics remain G3/G4. |
 | **Skill training** | `SkillManager::awardSkill` (`SkillManager.cpp:326`) checks prerequisites, XP cost, 250 skill points; `CreatureObject::addSkill`/`addSkillMod` (`CreatureObject.idl:919/:961`) exist on **every** creature — NPC templates use them. Skill data (xpType, xpCost, points, prereqs) is readable from the skill map without a ghost. | `canLearnSkill` returns false without a ghost (`:867-869`); XP withdrawal, skill points, abilities and schematics are ghost operations (`:360-386`). Skill mods DO affect AiAgent combat; command abilities do not (bot attacks come from the mobile template's attack maps). | Training decision lives in the store (XP, points, prerequisites checked against `simbot_skills` with the skill map's `getSkillsRequired()` — `fulfillsSkillPrerequisites` itself rejects ghostless creatures at `SkillManager.cpp:938-940`), body application via `addSkill`/`addSkillMod` at every (re)spawn, with the `AiAgent::getSkillMod` replace-not-add caveat (§5/F_0.9.5). |
 | **Bazaar sell** | `AuctionManager::addSaleItem(player, objectid, vendor, …)` (`AuctionManagerImplementation.cpp:519`), item must be `isASubChildOf(player)`; owner recorded as `ownerID`/`ownerName` on the `AuctionItem` (`AuctionItem.idl:159/:271`). Seller paid in `doInstantBuy` via `PlayerManager::getPlayer(ownerName)` (`:1060`, null seller **aborts** at `:1207-1215`); expiry mails the owner and requires the owner to `retrieveItem` (`:1514`, owner check `AuctionItem.idl:331`). | Ownership is the **body OID** and the name lookup is the **player map**. A bot body dies and is rebuilt with a new OID, so proceeds are lost and expired items are unreachable. | Bot listings need a **durable owner mapping** (`simbot_listings`) and sim-aware branches in `AuctionManager` for payout and retrieval (Core3, no engine3). |
 | **Bazaar buy** | `doInstantBuy` (`:1038`) debits `player->subtractBankCredits` from the buyer's `CreditObject`, marks SOLD, buyer retrieves at the terminal. `AuctionsMap` is queryable without UI packets. | Bot bank credits live in the store, not on the body's `CreditObject`; the buyer is recorded and retrieval enforced by body OID (`:1442-1452`); the listing fee is also charged to the body's bank (`:739-760`). | Identity-aware sim entries in `AuctionManager` that settle straight against the store and vault; never stage credits or items on the body. |

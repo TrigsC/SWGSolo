@@ -23,6 +23,7 @@
 #include "server/zone/objects/creature/buffs/Buff.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/tangible/weapon/WeaponObject.h"
+#include "server/zone/objects/building/BuildingObject.h"
 #include "server/zone/objects/tangible/threat/ThreatMap.h"
 #include "server/zone/managers/combat/CombatManager.h"
 #include "server/zone/managers/player/PlayerManager.h"
@@ -60,6 +61,67 @@ public:
 	}
 };
 
+static_assert(static_cast<int>(SimHunterController::IDLE_HOME) ==
+		static_cast<int>(SimBotGrouping::PHASE_IDLE_HOME), "group phase code drift: IDLE_HOME");
+static_assert(static_cast<int>(SimHunterController::ANNOUNCE_JOB) ==
+		static_cast<int>(SimBotGrouping::PHASE_ANNOUNCE_JOB), "group phase code drift: ANNOUNCE_JOB");
+static_assert(static_cast<int>(SimHunterController::BUFF_UP) ==
+		static_cast<int>(SimBotGrouping::PHASE_BUFF_UP), "group phase code drift: BUFF_UP");
+static_assert(static_cast<int>(SimHunterController::RELOCATING) ==
+		static_cast<int>(SimBotGrouping::PHASE_RELOCATING), "group phase code drift: RELOCATING");
+static_assert(static_cast<int>(SimHunterController::BUFF_TRIP) ==
+		static_cast<int>(SimBotGrouping::PHASE_BUFF_TRIP), "group phase code drift: BUFF_TRIP");
+static_assert(static_cast<int>(SimHunterController::TRAVEL_OUT) ==
+		static_cast<int>(SimBotGrouping::PHASE_TRAVEL_OUT), "group phase code drift: TRAVEL_OUT");
+static_assert(static_cast<int>(SimHunterController::TRAVEL_TO_TERMINAL) ==
+		static_cast<int>(SimBotGrouping::PHASE_TRAVEL_TO_TERMINAL), "group phase code drift: TRAVEL_TO_TERMINAL");
+static_assert(static_cast<int>(SimHunterController::ACCEPT_MISSION) ==
+		static_cast<int>(SimBotGrouping::PHASE_ACCEPT_MISSION), "group phase code drift: ACCEPT_MISSION");
+static_assert(static_cast<int>(SimHunterController::TRAVEL_TO_MISSION) ==
+		static_cast<int>(SimBotGrouping::PHASE_TRAVEL_TO_MISSION), "group phase code drift: TRAVEL_TO_MISSION");
+static_assert(static_cast<int>(SimHunterController::TRAVEL_TO_LAIR) ==
+		static_cast<int>(SimBotGrouping::PHASE_TRAVEL_TO_LAIR), "group phase code drift: TRAVEL_TO_LAIR");
+static_assert(static_cast<int>(SimHunterController::ENGAGING_LAIR) ==
+		static_cast<int>(SimBotGrouping::PHASE_ENGAGING_LAIR), "group phase code drift: ENGAGING_LAIR");
+static_assert(static_cast<int>(SimHunterController::AWAITING_WORLD) ==
+		static_cast<int>(SimBotGrouping::PHASE_AWAITING_WORLD), "group phase code drift: AWAITING_WORLD");
+static_assert(static_cast<int>(SimHunterController::HUNTING) ==
+		static_cast<int>(SimBotGrouping::PHASE_HUNTING), "group phase code drift: HUNTING");
+static_assert(static_cast<int>(SimHunterController::RETREATING) ==
+		static_cast<int>(SimBotGrouping::PHASE_RETREATING), "group phase code drift: RETREATING");
+static_assert(static_cast<int>(SimHunterController::HEALING) ==
+		static_cast<int>(SimBotGrouping::PHASE_HEALING), "group phase code drift: HEALING");
+static_assert(static_cast<int>(SimHunterController::TRAVEL_HOME) ==
+		static_cast<int>(SimBotGrouping::PHASE_TRAVEL_HOME), "group phase code drift: TRAVEL_HOME");
+static_assert(static_cast<int>(SimHunterController::DELIVER) ==
+		static_cast<int>(SimBotGrouping::PHASE_DELIVER), "group phase code drift: DELIVER");
+static_assert(static_cast<int>(SimHunterController::MISSION_CLEANUP) ==
+		static_cast<int>(SimBotGrouping::PHASE_MISSION_CLEANUP), "group phase code drift: MISSION_CLEANUP");
+static_assert(static_cast<int>(SimHunterController::CLONE_HOME) ==
+		static_cast<int>(SimBotGrouping::PHASE_CLONE_HOME), "group phase code drift: CLONE_HOME");
+static_assert(static_cast<int>(SimHunterController::DONE) ==
+		static_cast<int>(SimBotGrouping::PHASE_DONE), "group phase code drift: DONE");
+static_assert(static_cast<int>(SimHunterController::BAZAAR_VISIT) ==
+		static_cast<int>(SimBotGrouping::PHASE_BAZAAR_VISIT), "group phase code drift: BAZAAR_VISIT");
+static_assert(static_cast<int>(SimHunterController::GROUP_WAIT) ==
+		static_cast<int>(SimBotGrouping::PHASE_GROUP_WAIT), "group phase code drift: GROUP_WAIT");
+static_assert(static_cast<int>(SimHunterController::GROUP_FOLLOW) ==
+		static_cast<int>(SimBotGrouping::PHASE_GROUP_FOLLOW), "group phase code drift: GROUP_FOLLOW");
+static_assert(static_cast<int>(SimHunterController::GROUP_TRAVEL) ==
+		static_cast<int>(SimBotGrouping::PHASE_GROUP_TRAVEL), "group phase code drift: GROUP_TRAVEL");
+static_assert(static_cast<int>(SimHunterController::EARLY_LEAVE_CITY) ==
+		static_cast<int>(SimBotGrouping::EARLY_LEAVE_CITY), "group early phase code drift: LEAVE_CITY");
+static_assert(static_cast<int>(SimHunterController::EARLY_SELECT_TARGET) ==
+		static_cast<int>(SimBotGrouping::EARLY_SELECT_TARGET), "group early phase code drift: SELECT_TARGET");
+static_assert(static_cast<int>(SimHunterController::EARLY_ENGAGE) ==
+		static_cast<int>(SimBotGrouping::EARLY_ENGAGE), "group early phase code drift: ENGAGE");
+static_assert(static_cast<int>(SimHunterController::EARLY_RECOVER) ==
+		static_cast<int>(SimBotGrouping::EARLY_RECOVER), "group early phase code drift: RECOVER");
+static_assert(static_cast<int>(SimHunterController::EARLY_TRAIN) ==
+		static_cast<int>(SimBotGrouping::EARLY_TRAIN), "group early phase code drift: TRAIN");
+
+static float simHunterMinHamFraction(AiAgent* hunter);
+
 static String hunterPhaseName(SimHunterController::HuntPhase phase) {
 	switch (phase) {
 	case SimHunterController::IDLE_HOME: return "IDLE_HOME";
@@ -83,6 +145,9 @@ static String hunterPhaseName(SimHunterController::HuntPhase phase) {
 	case SimHunterController::CLONE_HOME: return "CLONE_HOME";
 	case SimHunterController::DONE: return "DONE";
 	case SimHunterController::BAZAAR_VISIT: return "BAZAAR_VISIT";
+	case SimHunterController::GROUP_WAIT: return "GROUP_WAIT";
+	case SimHunterController::GROUP_FOLLOW: return "GROUP_FOLLOW";
+	case SimHunterController::GROUP_TRAVEL: return "GROUP_TRAVEL";
 	default: return "UNKNOWN";
 	}
 }
@@ -138,8 +203,13 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 	missionAddsOverCapCycles = 0;
 	missionLairRevealDeferCycles = 0;
 	missionAddsEngaged = 0;
-	earlyGameActive = false;
+	setEarlyGameActiveFlag(false);
 	earlyGamePhase = EARLY_LEAVE_CITY;
+	SimBotGrouping::AvailabilitySnapshot groupingSnapshot;
+	groupingSnapshot.phaseCode = static_cast<int>(phase);
+	groupingSnapshot.earlyGamePhaseCode = static_cast<int>(earlyGamePhase);
+	groupAvailabilitySnapshot.store(groupingSnapshot.pack(),
+		std::memory_order_release);
 	earlyGameAnchor = Vector3();
 	earlyGameRestPoint = Vector3();
 	earlyGameBearingIndex = 0;
@@ -179,6 +249,50 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 
 SimHunterController::~SimHunterController() {
 	teardown("destructor");
+}
+
+void SimHunterController::updateGroupingAvailabilityBits(uint64 mask,
+		uint64 value) {
+	uint64 current = groupAvailabilitySnapshot.load(std::memory_order_acquire);
+	for (;;) {
+		uint64 next = (current & ~mask) | (value & mask);
+		if (groupAvailabilitySnapshot.compare_exchange_weak(current, next,
+				std::memory_order_acq_rel, std::memory_order_acquire))
+			return;
+	}
+}
+
+void SimHunterController::publishGroupingCombatDead(AiAgent* body) {
+	if (body == nullptr)
+		return;
+
+	bool inCombat = false;
+	bool dead = false;
+	{
+		Locker bodyLock(body);
+		inCombat = body->isInCombat();
+		dead = body->isDead();
+	}
+	uint64 value = 0;
+	if (inCombat)
+		value |= 1ULL << 16;
+	if (dead)
+		value |= 1ULL << 17;
+	updateGroupingAvailabilityBits((1ULL << 16) | (1ULL << 17), value);
+}
+
+void SimHunterController::setEarlyGameActiveFlag(bool active) {
+	earlyGameActive = active;
+	updateGroupingAvailabilityBits(1ULL << 21, active ? 1ULL << 21 : 0);
+}
+
+void SimHunterController::setGroupingLootStepActive(bool active) {
+	lootStepActive.store(active, std::memory_order_release);
+	updateGroupingAvailabilityBits(1ULL << 19, active ? 1ULL << 19 : 0);
+}
+
+void SimHunterController::onInterplanetaryTravelAvailabilityChanged(bool active) {
+	updateGroupingAvailabilityBits(1ULL << 18, active ? 1ULL << 18 : 0);
 }
 
 bool SimHunterController::isReadyForMarketRelocation() const {
@@ -221,6 +335,42 @@ void SimHunterController::onInterplanetaryTravelFinished(bool success,
 		const String& destZone, const String& reason) {
 	(void)reason;
 	SimPlayerManager* manager = SimPlayerManager::instance();
+	PlayerBotGroupRecord groupRecord;
+	if (manager != nullptr && manager->getPlayerBotGroupRecord(identityId,
+			groupRecord)) {
+		if (groupRecord.state != PLAYER_BOT_GROUP_GROUPED) {
+			clearInterplanetaryTravelState();
+			return;
+		}
+		SimPlayerManager::PlayerBotGroupRoute route;
+		if (!manager->getPlayerBotGroupRoute(identityId, route) ||
+				route.generation != groupRecord.generation) {
+			clearInterplanetaryTravelState();
+			return;
+		}
+		if (!success) {
+			manager->recordPlayerBotGroupingTravel(identityId, true,
+				"callback=failed");
+			manager->notePlayerBotGroupReplan(identityId,
+				groupRecord.generation, System::getMiliTime());
+			setPhase(GROUP_TRAVEL);
+			scheduleActiveTick(500);
+			return;
+		}
+		if (!manager->advancePlayerBotGroupRoute(identityId,
+			groupRecord.generation)) {
+			clearInterplanetaryTravelState();
+			return;
+		}
+		setPhase(GROUP_TRAVEL);
+		scheduleActiveTick(500);
+		return;
+	}
+	if (isGroupPhase()) {
+		clearInterplanetaryTravelState();
+		scheduleActiveTick(100);
+		return;
+	}
 	if (!orderActive)
 		return;
 
@@ -307,9 +457,488 @@ void SimHunterController::setPhase(HuntPhase next) {
 
 	phase = next;
 	phaseStartedAtMs = System::getMiliTime();
+	updateGroupingAvailabilityBits(0xff, static_cast<uint64>(next));
 	if (identityId != 0)
 		SimPlayerManager::instance()->recordPveHunterPhase(identityId,
 			agent == nullptr ? 0 : agent->getObjectID(), getPhaseName(), targetOid);
+}
+
+void SimHunterController::suspendRoutineForGroup(const String& reason) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr)
+		return;
+
+	const uint64 bodyOid = agent == nullptr ? 0 : agent->getObjectID();
+	if (orderActive) {
+		manager->declinePveHunterOrder(identityId, bodyOid, reason);
+		orderActive = false;
+		orderAbandoned = false;
+		missionHuntOrder = false;
+		missionCleanupRequested = false;
+		missionTerminalResolved = false;
+		missionTerminalFallback = false;
+		missionTerminalPosition = Vector3();
+		missionLairPosition = Vector3();
+		missionLairOid = 0;
+		currentMissionOfferId = 0;
+		missionOffersGenerated = false;
+		missionOfferAttempts = 0;
+		missionOfferVisitEpoch = 0;
+		missionOfferIds.removeAll();
+		disengageMissionLair();
+	}
+
+	if (lootStepActive) {
+		manager->returnPlayerBotLootClaim(lootStepClaim);
+		finishPlayerBotLootStep("grouped", false);
+	}
+	if (phase == BAZAAR_VISIT)
+		finishBazaarVisit("grouped", false);
+
+	cancelPveDoctorRequest();
+	manager->releasePlayerBotDoctorBuffFee(identityId);
+	pveDoctorFeeReserved = false;
+	manager->finishPveHunterBuffTrip(identityId, false);
+	pveBuffTripAtHub = false;
+	pveBuffTripReturning = false;
+	if (manager->isPveMarketDispatchEnabled()) {
+		String actualPlanet;
+		if (agent != nullptr && agent->getZone() != nullptr)
+			actualPlanet = agent->getZone()->getZoneName();
+		manager->finishPveHunterRelocation(identityId, false, actualPlanet);
+	}
+	if (isInterplanetaryTravelActive())
+		clearInterplanetaryTravelState();
+
+	setEarlyGameActiveFlag(false);
+	groupFallbackMoveActive.store(false, std::memory_order_release);
+	resetTravelCombat();
+	dropTargetObserver();
+	disengageTarget(false);
+	disengageMissionLair();
+	clearEngagedTelemetry();
+	clearHybridMovementOnCancellation();
+	advanceWorkLoopGeneration("hunterGroupSuspend");
+}
+
+void SimHunterController::resumeRoutineAfterGroup(bool postLeaving) {
+	(void)postLeaving;
+	groupFallbackMoveActive.store(false, std::memory_order_release);
+	groupLastPathTarget = Vector3();
+	groupLastPathIssuedMs = 0;
+	if (isGroupPhase())
+		setPhase(IDLE_HOME);
+
+	if (SimPlayerManager::instance()->isPlayerBotEarlyGameIdentity(identityId)) {
+		setEarlyGameActiveFlag(false);
+		beginEarlyGame();
+		return;
+	}
+	if (orderActive) {
+		setPhase(ANNOUNCE_JOB);
+		scheduleActiveTick(100);
+		return;
+	}
+	scheduleActiveTick(30000);
+}
+
+void SimHunterController::leaveGroupMode() {
+	activeTickGeneration.fetch_add(1, std::memory_order_acq_rel);
+	advanceWorkLoopGeneration("hunterGroupRelease");
+	groupFallbackMoveActive.store(false, std::memory_order_release);
+	if (isInterplanetaryTravelActive())
+		clearInterplanetaryTravelState();
+	clearHybridMovementOnCancellation();
+	dropTargetObserver();
+	disengageTarget(false);
+	clearEngagedTelemetry();
+	resetTravelCombat();
+	resumeRoutineAfterGroup(false);
+}
+
+bool SimHunterController::engageDefensiveTarget(AiAgent* hunter,
+		CreatureObject* attacker, const char* reason) {
+	(void)reason;
+	return defendAgainstInterceptor(hunter, attacker);
+}
+
+void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr || hunter == nullptr) {
+		scheduleActiveTick(1000);
+		return;
+	}
+
+	PlayerBotGroupRecord record;
+	const bool hasRecord = manager->getPlayerBotGroupRecord(identityId,
+		record);
+	if (!hasRecord && !manager->hasPlayerBotGroupingState(identityId)) {
+		leaveGroupMode();
+		return;
+	}
+	if (!isGroupPhase())
+		suspendRoutineForGroup(hasRecord ? "GROUPED" : "GROUP_OFFER");
+	if (phase != GROUP_WAIT && phase != GROUP_FOLLOW && phase != GROUP_TRAVEL)
+		setPhase(GROUP_WAIT);
+	groupFallbackMoveActive.store(false, std::memory_order_release);
+	if (phase == GROUP_TRAVEL && phaseStartedAtMs != 0 &&
+			nowMs - phaseStartedAtMs >= 900000) {
+		if (isInterplanetaryTravelActive())
+			clearInterplanetaryTravelState();
+		manager->notePlayerBotGroupReplan(identityId, record.generation,
+			nowMs);
+		setPhase(GROUP_WAIT);
+		scheduleActiveTick(500);
+		return;
+	}
+
+	// Grouped bots always retain self-defence. The group-assist path below is
+	// deliberately separate so it can never apply the mission species filter.
+	ManagedReference<CreatureObject*> selfAttacker;
+	ManagedReference<AiAgent*> selfAttackerAgent;
+	if ((hunter->isInCombat() || recognisesThreatAttackers()) &&
+			selectActiveCombatAttacker(hunter, selfAttacker, selfAttackerAgent) &&
+			selfAttacker != nullptr)
+		engageDefensiveTarget(hunter, selfAttacker.get(), "self");
+
+	if (hasRecord && record.state == PLAYER_BOT_GROUP_DEAD_REJOIN) {
+		manager->tryRejoinPlayerBotGroup(identityId, hunter);
+		if (!manager->getPlayerBotGroupRecord(identityId, record)) {
+			leaveGroupMode();
+			return;
+		}
+		if (record.state != PLAYER_BOT_GROUP_GROUPED) {
+			setPhase(GROUP_WAIT);
+			scheduleActiveTick(2000);
+			return;
+		}
+	}
+
+	SimPlayerManager::PlayerBotGroupSnapshot group;
+	bool haveGroup = record.state == PLAYER_BOT_GROUP_GROUPED &&
+		record.groupOid != 0 && manager->snapshotPlayerBotGroup(record.groupOid,
+			group);
+	if (!haveGroup || record.leaderOid == 0) {
+		setPhase(GROUP_WAIT);
+		scheduleActiveTick(2000);
+		return;
+	}
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<CreatureObject*> leaderObject = zoneServer == nullptr ?
+		nullptr : zoneServer->getObject(record.leaderOid).castTo<CreatureObject*>();
+	if (leaderObject == nullptr) {
+		setPhase(GROUP_WAIT);
+		scheduleActiveTick(2000);
+		return;
+	}
+
+	String leaderPlanet;
+	Vector3 leaderPosition;
+	float leaderHeading = 0.f;
+	bool leaderIndoors = false;
+	{
+		Zone* leaderZone = leaderObject->getZone();
+		if (leaderZone == nullptr) {
+			setPhase(GROUP_WAIT);
+			scheduleActiveTick(2000);
+			return;
+		}
+		leaderPlanet = leaderZone->getZoneName();
+		leaderPosition = leaderObject->getWorldPosition();
+		leaderHeading = leaderObject->getDirection()->getRadians();
+		leaderIndoors = leaderObject->getParent() != nullptr;
+	}
+
+	// Assist only attackers of a group member. A factioned NPC, a player, or a
+	// SimBot is rejected by the pure policy before the shared defensive engage.
+	for (int memberIndex = 0; memberIndex < group.memberOids.size();
+			++memberIndex) {
+		uint64 memberOid = group.memberOids.get(memberIndex);
+		if (memberOid == hunter->getObjectID())
+			continue;
+		ManagedReference<CreatureObject*> member = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(memberOid).castTo<CreatureObject*>();
+		if (member == nullptr || member->isDead())
+			continue;
+
+		Vector<ManagedReference<CreatureObject*> > attackers;
+		{
+			Locker memberLock(member);
+			// startCombat puts an attacker on its victim's THREAT map, not the
+			// victim's defender list (see selectActiveCombatAttacker), so both are
+			// candidates; the aimed-at-member check below filters stale entries.
+			ThreatMap* threatMap = member->getThreatMap();
+			if (threatMap != nullptr) {
+				for (int i = 0; i < threatMap->size(); ++i) {
+					ManagedReference<TangibleObject*> entry =
+						threatMap->elementAt(i).getKey();
+					CreatureObject* attacker = entry == nullptr ? nullptr :
+						entry->asCreatureObject();
+					if (attacker != nullptr && !attackers.contains(attacker))
+						attackers.add(attacker);
+				}
+			}
+			const DeltaVector<ManagedReference<SceneObject*> >* defenders =
+				member->getDefenderList();
+			if (defenders != nullptr) {
+				for (int i = 0; i < defenders->size(); ++i) {
+					ManagedReference<SceneObject*> object = defenders->getSafe(i);
+					CreatureObject* attacker = object == nullptr ? nullptr :
+						object->asCreatureObject();
+					if (attacker != nullptr && !attackers.contains(attacker))
+						attackers.add(attacker);
+				}
+			}
+		}
+		if (nowMs >= groupAssistCountEventAtMs + 5000) {
+			groupAssistCountEventAtMs = nowMs;
+			MissionDiagLog::event("GROUP_ASSIST_SCAN", identityId,
+				"member=" + String::valueOf(memberOid) + " candidates=" +
+				String::valueOf(attackers.size()));
+		}
+		for (int attackerIndex = 0; attackerIndex < attackers.size();
+				++attackerIndex) {
+			ManagedReference<CreatureObject*> attacker = attackers.get(attackerIndex);
+			if (attacker == nullptr || attacker == hunter ||
+					hunter->getDistanceTo(attacker) >
+						manager->getPlayerBotGroupingAssistRadiusMeters())
+				continue;
+			bool attackingMember = false;
+			bool attackerIsSimBot = false;
+			bool attackerIsPlayer = attacker->isPlayerCreature();
+			int attackerFaction = 0;
+			{
+				Locker attackerLock(attacker);
+				AiAgent* attackerAgent = attacker->asAiAgent();
+				attackerIsSimBot = attackerAgent != nullptr &&
+					attackerAgent->getSimPlayerBot();
+				attackerFaction = attacker->getFaction();
+				ManagedReference<SceneObject*> attackerFollow = attackerAgent == nullptr ?
+					nullptr : attackerAgent->getFollowObject().get();
+				attackingMember = attacker->isInCombat() &&
+					(attacker->hasDefender(member) ||
+						(attackerFollow != nullptr &&
+							attackerFollow->getObjectID() == memberOid));
+			}
+			if (nowMs >= groupAssistEventAtMs + 5000) {
+				groupAssistEventAtMs = nowMs;
+				MissionDiagLog::event("GROUP_ASSIST_SCAN", identityId,
+					"member=" + String::valueOf(memberOid) +
+					" attacker=" + String::valueOf(attacker->getObjectID()) +
+					" aimed=" + String::valueOf(attackingMember) +
+					" faction=" + String::valueOf(attackerFaction) +
+					" dist=" + String::valueOf(hunter->getDistanceTo(attacker)));
+			}
+			if (!attackingMember)
+				continue;
+			SimBotGrouping::AssistVerdict verdict = SimBotGrouping::judgeAssist(
+				attackerIsPlayer, attackerIsSimBot, attackerFaction);
+			if (!verdict.assist) {
+				manager->recordPlayerBotGroupingAssistSkipped(identityId,
+					verdict.reason);
+				continue;
+			}
+			if (engageDefensiveTarget(hunter, attacker.get(), "group_assist")) {
+				manager->recordPlayerBotGroupingAssist(identityId);
+				break;
+			}
+		}
+	}
+
+	Zone* hunterZone = hunter->getZone();
+	String hunterPlanet = hunterZone == nullptr ? String() :
+		hunterZone->getZoneName();
+	Vector3 hunterPosition = hunter->getWorldPosition();
+	SimBotGrouping::FollowPolicy followPolicy;
+	PlayerBotGroupingConfig groupingConfig = manager->getPlayerBotGroupingConfig();
+	followPolicy.followMinMeters = groupingConfig.followMinMeters;
+	followPolicy.followMaxMeters = groupingConfig.followMaxMeters;
+	followPolicy.repathMoveMeters = groupingConfig.repathMoveMeters;
+	followPolicy.routeDistanceMeters = groupingConfig.routeDistanceMeters;
+
+	const float distance = hunterPosition.distanceTo2d(leaderPosition);
+	SimBotGrouping::TravelMode mode = SimBotGrouping::travelMode(
+		hunterPlanet == leaderPlanet, distance, leaderIndoors, followPolicy);
+	// G1 amendment: the ticket-collector machine is interplanetary only
+	// (beginInterplanetaryTravel rejects alreadyOnPlanet), so on the same planet
+	// the bot runs overland like a mission leg. Intra-planet shuttles: G2.
+	if (mode == SimBotGrouping::ROUTE && hunterPlanet == leaderPlanet)
+		mode = SimBotGrouping::WALK;
+	if (static_cast<int>(mode) != groupFollowEventMode ||
+			nowMs >= groupFollowEventAtMs + 10000) {
+		groupFollowEventMode = static_cast<int>(mode);
+		groupFollowEventAtMs = nowMs;
+		MissionDiagLog::event("GROUP_FOLLOW", identityId,
+			"mode=" + String::valueOf(static_cast<int>(mode)) +
+			" dist=" + String::valueOf(distance) +
+			" botPlanet=" + hunterPlanet + " leaderPlanet=" + leaderPlanet +
+			" leaderIndoors=" + String::valueOf(leaderIndoors) +
+			" moveState=" + String::valueOf(static_cast<int>(state)) +
+			" held=" + String::valueOf(isMovementHeld()) +
+			" sincePathMs=" + String::valueOf(groupLastPathIssuedMs == 0 ? 0 :
+				nowMs - groupLastPathIssuedMs) +
+			" inCombat=" + String::valueOf(hunter->isInCombat()) +
+			" botParent=" + String::valueOf(hunter->getParentID()) +
+			" botPos=" + String::valueOf((int)hunterPosition.getX()) + "," +
+				String::valueOf((int)hunterPosition.getY()) +
+			" leaderPos=" + String::valueOf((int)leaderPosition.getX()) + "," +
+				String::valueOf((int)leaderPosition.getY()) +
+			" hybrid=" + String::valueOf(isHybridMovementActive()) +
+			" egress=" + String::valueOf(cellEgressActive) +
+			" traversal=" + String::valueOf(isTraversalActive()));
+	}
+
+	if (mode == SimBotGrouping::HOLD) {
+		setPhase(GROUP_WAIT);
+		groupFallbackMoveActive.store(false, std::memory_order_release);
+		scheduleActiveTick(Math::max(250, groupingConfig.followTickMs));
+		return;
+	}
+
+	if (mode == SimBotGrouping::WAIT_OUTSIDE) {
+		ManagedReference<SceneObject*> parent = leaderObject->getParent().get();
+		BuildingObject* building = parent == nullptr ? nullptr :
+			(parent->isCellObject() && parent->getParent() != nullptr ?
+				parent->getParent().get().castTo<BuildingObject*>() : nullptr);
+		if (building == nullptr) {
+			setPhase(GROUP_WAIT);
+			scheduleActiveTick(2000);
+			return;
+		}
+		Vector3 exterior;
+		{
+			Locker buildingLock(building);
+			exterior = building->getNearestExteriorPortalPoint(leaderPosition);
+			if (exterior.getX() == 0.f && exterior.getY() == 0.f)
+				exterior = building->getEjectionPoint();
+		}
+		setPhase(GROUP_FOLLOW);
+		groupFallbackMoveActive.store(false, std::memory_order_release);
+		if (hunterPosition.distanceTo2d(exterior) > groupingConfig.followMaxMeters &&
+				(state != MOVING && state != CALCULATING_PATH)) {
+				const uint64 before = activeTickGeneration.load(std::memory_order_acquire);
+				moveTo(exterior);
+				groupLastPathTarget = exterior;
+				groupLastPathIssuedMs = nowMs;
+				if (activeTickGeneration.load(std::memory_order_acquire) == before)
+					scheduleActiveTick(groupingConfig.followTickMs);
+			} else
+				scheduleActiveTick(groupingConfig.followTickMs);
+		return;
+	}
+
+	if (mode == SimBotGrouping::ROUTE) {
+		SimPlayerManager::PlayerBotGroupRoute route;
+		if (!manager->getPlayerBotGroupRoute(identityId, route) ||
+				route.generation != record.generation || route.legs.size() == 0) {
+			if (!manager->planPlayerBotGroupRoute(identityId, hunterPlanet,
+					hunterPosition, leaderPlanet, leaderPosition)) {
+				setPhase(GROUP_WAIT);
+				scheduleActiveTick(2000);
+				return;
+			}
+			manager->getPlayerBotGroupRoute(identityId, route);
+		}
+		if (route.destPlanet != leaderPlanet ||
+				route.legIndex >= route.legs.size()) {
+			if (!manager->planPlayerBotGroupRoute(identityId, hunterPlanet,
+					hunterPosition, leaderPlanet, leaderPosition)) {
+				setPhase(GROUP_WAIT);
+				scheduleActiveTick(2000);
+				return;
+			}
+			manager->getPlayerBotGroupRoute(identityId, route);
+		}
+		if (route.holdUntilMs != 0 && nowMs < route.holdUntilMs) {
+			setPhase(GROUP_WAIT);
+			if (!route.holdLinePosted && manager->claimPlayerBotGroupRouteHoldLine(
+					identityId, record.generation, nowMs))
+				manager->postPlayerBotGroupChat(record.groupOid, "PlayerBot",
+					"I'll wait at " + route.fromCity + ".");
+			uint64 holdMs = route.holdUntilMs - nowMs;
+			scheduleActiveTick(static_cast<int>(holdMs < 250 ? 250 : holdMs));
+			return;
+		}
+		if (route.holdUntilMs != 0) {
+			manager->clearPlayerBotGroupRouteHold(identityId,
+				record.generation, nowMs);
+			if (!manager->planPlayerBotGroupRoute(identityId, hunterPlanet,
+					hunterPosition, leaderPlanet, leaderPosition)) {
+				setPhase(GROUP_WAIT);
+				scheduleActiveTick(2000);
+				return;
+			}
+			manager->getPlayerBotGroupRoute(identityId, route);
+		}
+		if (route.legIndex < route.legs.size()) {
+			if (isInterplanetaryTravelActive()) {
+				setPhase(GROUP_TRAVEL);
+				scheduleActiveTick(2000);
+				return;
+			}
+			const SimPlayerManager::SimTravelLeg& leg = route.legs.get(route.legIndex);
+			String travelResult;
+			if (!beginInterplanetaryTravel(leg.destPlanet, leg.departurePos,
+					leg.arrivalPos, leg.destCity, 0.f, travelResult)) {
+				manager->recordPlayerBotGroupingTravel(identityId, true,
+					"start_failed=" + travelResult);
+				// beginInterplanetaryTravel invokes the grouped travel-finished
+				// callback for every rejected start; that callback owns the single
+				// re-plan-window increment.
+				scheduleActiveTick(500);
+				return;
+			}
+			setPhase(GROUP_TRAVEL);
+			manager->recordPlayerBotGroupingTravel(identityId, false,
+				"from=" + route.fromCity + " to=" + leg.destCity);
+			manager->postPlayerBotGroupTravelLine(record.groupOid, route.fromCity);
+			scheduleActiveTick(1000);
+			return;
+		}
+	}
+
+	setPhase(GROUP_FOLLOW);
+	const int restPct = manager->getPveMissionBoardTravelRestHamPct();
+	const bool lowHam = restPct > 0 && simHunterMinHamFraction(hunter) <
+		static_cast<float>(restPct) / 100.f;
+	Vector3 slot = SimBotGrouping::followSlot(identityId, leaderPosition,
+		leaderHeading, 0, followPolicy);
+	// moveTo() advances the generation and discards the in-flight path (see
+	// the pursuit note in moveToTarget), and the mover passes through IDLE
+	// between nodes, so "far and idle" alone re-pathed every tick and the bot
+	// crawled. Re-path only for a new or materially moved slot, or a real stall.
+	const bool haveTarget = groupLastPathIssuedMs != 0;
+	const bool slotMoved = !haveTarget || slot.distanceTo(groupLastPathTarget) >
+		followPolicy.repathMoveMeters;
+	const bool farFromSlot = hunterPosition.distanceTo2d(slot) >
+		followPolicy.followMaxMeters;
+	// A path that ended short (or a stopped mover) leaves the bot idle far from
+	// an unchanged slot; re-path at most every 8 s.
+	// WAITING too: owner client pass (2026-10-20) caught both grouped bots parked
+	// in WAITING 25-33 m from the leader for 13 minutes, never re-pathing.
+	const bool stalled = haveTarget && (state == IDLE || state == WAITING) &&
+		farFromSlot && nowMs >= groupLastPathIssuedMs + 8000;
+	const bool needPath = lowHam || (farFromSlot && (slotMoved || stalled));
+	groupFallbackMoveActive.store(lowHam, std::memory_order_release);
+	// A WAITING mover is replaced only when it has stalled or when no follow
+	// path was ever issued (e.g. arriving from a cross-planet leg, which leaves
+	// the mover WAITING with the follow clock reset: final verify, 2026-10-20).
+	if (needPath && state != MOVING && state != CALCULATING_PATH &&
+			(state != WAITING || stalled || !haveTarget) && !isMovementHeld()) {
+		const uint64 before = activeTickGeneration.load(std::memory_order_acquire);
+		moveTo(slot);
+		groupLastPathTarget = slot;
+		groupLastPathIssuedMs = nowMs;
+		if (activeTickGeneration.load(std::memory_order_acquire) == before)
+			scheduleActiveTick(groupingConfig.followTickMs);
+	} else {
+		int cadence = groupingConfig.followTickMs;
+		if (groupLastPathIssuedMs != 0 && nowMs > groupLastPathIssuedMs)
+			cadence = Math::max(250, static_cast<int>(Math::min<uint64>(
+				groupingConfig.followTickMs, nowMs - groupLastPathIssuedMs)));
+		scheduleActiveTick(cadence);
+	}
 }
 
 bool SimHunterController::beginBazaarVisit(AiAgent* hunter, uint64 nowMs) {
@@ -412,6 +1041,11 @@ String SimHunterController::getEarlyGameWeaponXpType() const {
 
 void SimHunterController::setEarlyGamePhase(EarlyGamePhase next) {
 	earlyGamePhase = next;
+	uint64 earlyValue = static_cast<uint64>(next) << 8;
+	if (targetOid != 0)
+		earlyValue |= 1ULL << 20;
+	updateGroupingAvailabilityBits((0xffULL << 8) | (1ULL << 20),
+			earlyValue);
 	if (identityId != 0)
 		SimPlayerManager::instance()->setPlayerBotEarlyGamePhase(identityId,
 			getEarlyGamePhaseName(), targetOid, earlyGameTargetTtkSeconds,
@@ -443,6 +1077,12 @@ void SimHunterController::startSimLoop() {
 	if (agent == nullptr)
 		return;
 
+	if (SimPlayerManager::instance()->hasPlayerBotGroupingState(identityId)) {
+		setPhase(GROUP_WAIT);
+		scheduleActiveTick(100);
+		return;
+	}
+
 	if (SimPlayerManager::instance()->isPlayerBotEarlyGameIdentity(identityId)) {
 		beginEarlyGame();
 		return;
@@ -462,6 +1102,17 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 		const PveHuntSpecies& newSpecies) {
 	if (newOrder.identityId != identityId || newOrder.bodyOid == 0)
 		return;
+
+	// Grouping wins a dispatch race as well as the active-tick race.  The
+	// manager normally excludes these identities, but this guard keeps a stale
+	// order callback from restoring solo work after an offer or join appears.
+	if (SimPlayerManager::instance()->hasPlayerBotGroupingState(identityId)) {
+		SimPlayerManager::instance()->declinePveHunterOrder(identityId,
+			newOrder.bodyOid, "GROUPED");
+		setPhase(GROUP_WAIT);
+		scheduleActiveTick(100);
+		return;
+	}
 
 	// The manager uses the same scorer while building matchmaker candidates.
 	// Recheck at dispatch as well: an order can race a training tick and a
@@ -687,6 +1338,8 @@ void SimHunterController::lairRetreatReflee(AiAgent* hunter,
 }
 
 bool SimHunterController::allowsMovementInCombat() const {
+	if (groupFallbackMoveActive.load(std::memory_order_acquire))
+		return true;
 	// A lair retreat is a run; the base in-combat hold used to pin the bot where
 	// it stood for as long as anything kept hitting it.
 	if (phase == RETREATING && isLairRetreatDefenseOn())
@@ -700,6 +1353,8 @@ bool SimHunterController::allowsMovementInCombat() const {
 }
 
 bool SimHunterController::keepsCombatOnPathAccept() const {
+	if (groupFallbackMoveActive.load(std::memory_order_acquire))
+		return true;
 	// Only fight on the run keeps its fight across a re-path. A FLEE leg wants
 	// the fight dropped -- it shed combat itself before moving.
 	return isTravelCombatGateOn() && isTravelCombatPhase() &&
@@ -2463,6 +3118,10 @@ void SimHunterController::onArrived() {
 		scheduleActiveTick(0);
 		return;
 	}
+	if (isGroupPhase()) {
+		scheduleActiveTick(100);
+		return;
+	}
 	if (phase == BUFF_UP) {
 		// F_0.7.5: arrival at the outdoor staging anchor. The provider approach
 		// is still active, so entering here hands the normal arrival path the
@@ -2688,6 +3347,11 @@ void SimHunterController::onPathFailed() {
 	}
 	if (phase == BAZAAR_VISIT) {
 		finishBazaarVisit("pathFailed");
+		return;
+	}
+	if (isGroupPhase()) {
+		groupLastPathTarget = Vector3();
+		scheduleActiveTick(100);
 		return;
 	}
 
@@ -3260,7 +3924,7 @@ void SimHunterController::beginEarlyGame() {
 			clearInterplanetaryTravelState();
 	}
 
-	earlyGameActive = true;
+	setEarlyGameActiveFlag(true);
 	earlyGamePhase = EARLY_LEAVE_CITY;
 	earlyGameBearingIndex = static_cast<int>(identity.id % 8);
 	earlyGameSpawnerIndex = static_cast<int>(identity.id % 64);
@@ -3829,7 +4493,7 @@ void SimHunterController::finishPlayerBotLootStep(const char* outcome,
 		lootWalkEndGeneration = advanceWorkLoopGeneration("lootStepEnd");
 		if (state == MOVING || state == CALCULATING_PATH || state == WAITING)
 			state = IDLE;
-		lootStepActive = false;
+		setGroupingLootStepActive(false);
 	}
 	lootStepClaim = PlayerBotLootClaim();
 	lootStepStartedAtMs = 0;
@@ -3987,7 +4651,7 @@ bool SimHunterController::runPlayerBotLootStep(AiAgent* hunter,
 		Locker lootArrivalLock(&lootArrivalMutex);
 		lootWalkFirstGeneration = getWorkLoopGeneration() + 1;
 		lootWalkEndGeneration = 0;
-		lootStepActive = true;
+		setGroupingLootStepActive(true);
 	}
 	MissionDiagLog::event("LOOT_STEP", identityId,
 		"begin corpse=" + String::valueOf(claim.corpseOid) + " phase=" +
@@ -4007,7 +4671,7 @@ void SimHunterController::runEarlyGameTick(AiAgent* hunter, uint64 nowMs) {
 	SimPlayerManager* manager = SimPlayerManager::instance();
 	if (!manager->isPlayerBotEarlyGameIdentity(identityId)) {
 		publishEarlyGameMovement("not_identity_exit", false, false, true, false);
-		earlyGameActive = false;
+		setEarlyGameActiveFlag(false);
 		dropTargetObserver();
 		disengageTarget(false);
 		targetOid = 0;
@@ -4324,6 +4988,13 @@ void SimHunterController::runActiveTick() {
 		std::atomic<bool>& flag;
 		~TickGuard() { flag.store(false, std::memory_order_release); }
 	} tickGuard{tickRunning};
+	struct GroupingStateGuard {
+		SimHunterController* controller;
+		AiAgent* body;
+		~GroupingStateGuard() {
+			controller->publishGroupingCombatDead(body);
+		}
+	} groupingStateGuard{this, strongAgent.get()};
 
 	updateAreaAttackGuard();
 	uint64 nowMs = System::getMiliTime();
@@ -4387,6 +5058,19 @@ void SimHunterController::runActiveTick() {
 		return;
 	}
 
+	// Grouping is an external preemption lane. It owns the controller after
+	// death handling and before early-game or order work can reacquire a target.
+	SimPlayerManager* groupingManager = SimPlayerManager::instance();
+	if (groupingManager != nullptr &&
+			groupingManager->hasPlayerBotGroupingState(identityId)) {
+		runGroupTick(strongAgent, nowMs);
+		return;
+	}
+	if (isGroupPhase()) {
+		leaveGroupMode();
+		return;
+	}
+
 	// Planned novice bodies own the existing active tick while the early-game
 	// gate is on. This branch is deliberately before the legacy order idle path:
 	// no demand order, second task, or second target writer is introduced.
@@ -4431,6 +5115,10 @@ void SimHunterController::runActiveTick() {
 	// but bounded so a stuck leg always resolves.
 	case RELOCATING: phaseTimeoutMs = 900000; break;
 	case BUFF_TRIP: phaseTimeoutMs = 900000; break;
+	case GROUP_WAIT: phaseTimeoutMs = static_cast<uint64>(
+		SimPlayerManager::instance()->getPlayerBotGroupingOfferTtlSeconds() + 30) * 1000;
+		break;
+	case GROUP_TRAVEL: phaseTimeoutMs = 900000; break;
 	case BAZAAR_VISIT: phaseTimeoutMs = static_cast<uint64>(
 		SimPlayerManager::instance()->getPlayerBotBazaarVisitTimeoutSeconds()) *
 		1000; break;
@@ -7200,7 +7888,12 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 
 void SimHunterController::teardown(const String& reason) {
 	// The body is going away, and with it the ownership of every queued corpse.
-	SimPlayerManager::instance()->dropPlayerBotLootClaims(identityId);
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager != nullptr)
+		manager->preparePlayerBotGroupingDeath(identityId,
+			agent == nullptr ? 0 : agent->getObjectID(), "teardown");
+	if (manager != nullptr)
+		manager->dropPlayerBotLootClaims(identityId);
 	if (lootStepActive)
 		finishPlayerBotLootStep("teardown", false);
 	if (isStructureTraversalFeatureEnabled() && isTraversalActive())

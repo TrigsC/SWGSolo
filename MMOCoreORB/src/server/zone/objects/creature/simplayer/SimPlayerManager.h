@@ -35,6 +35,7 @@
 #include "server/zone/objects/creature/simplayer/SimBotLoadout.h"
 #include "server/zone/objects/creature/simplayer/SimBotArmorLoadout.h"
 #include "server/zone/objects/creature/simplayer/SimBotConsumables.h"
+#include "server/zone/objects/creature/simplayer/SimBotGrouping.h"
 #include "server/zone/objects/creature/simplayer/SimBotAppearance.h"
 
 using namespace server::zone;
@@ -139,6 +140,98 @@ struct SimBotPreparedArmorCopy {
 	ManagedReference<ArmorObject*> copy;
 
 	// Engine containers require these; prepared copies are never serialized.
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// F_0.9.15 G1: the Lua grouping block is copied into one manager-owned
+// snapshot.  The policy header stays pure; this mirror is the boundary where
+// Lua validation and the future room/controller work meet.
+struct PlayerBotGroupingConfig {
+	bool enabled = false;
+	String roomName = "LFB";
+	String roomTitle = "Looking For Bot: PlayerBots listen here";
+	int offerTtlSeconds = 180;
+	int defaultReplies = 2;
+	int maxRepliesCap = 10;
+	int replyDelayMinSeconds = 3;
+	int replyDelayMaxSeconds = 12;
+	int minReplyGapSeconds = 2;
+	int availabilityChancePercent = 80;
+	int requestCooldownSeconds = 20;
+	int maxRepliesPerMinute = 20;
+	int maxGroupedBots = 10;
+	int maxBotsPerLeader = 9;
+	int joinDelayMinSeconds = 2;
+	int joinDelayMaxSeconds = 5;
+	float followMinMeters = 4.f;
+	float followMaxMeters = 10.f;
+	float repathMoveMeters = 5.f;
+	int followTickMs = 1500;
+	float routeDistanceMeters = 1500.f;
+	int maxReplansPer10Min = 3;
+	float assistRadiusMeters = 40.f;
+	int leaderOfflineGraceSeconds = 120;
+	SimBotGrouping::Vocabulary vocabulary;
+	Vector<String> replyLines;
+	Vector<String> joinedLines;
+	Vector<String> declineLines;
+	Vector<String> travellingLines;
+	Vector<String> clonedLines;
+	Vector<String> followingLines;
+	Vector<String> leavingLines;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+enum PlayerBotGroupOfferState {
+	PLAYER_BOT_GROUP_OFFERED = 0,
+	PLAYER_BOT_GROUP_ACCEPTING,
+	PLAYER_BOT_GROUP_JOINING
+};
+
+enum PlayerBotGroupRecordState {
+	PLAYER_BOT_GROUP_GROUPED = 0,
+	PLAYER_BOT_GROUP_DEAD_REJOIN,
+	PLAYER_BOT_GROUP_RELEASING
+};
+
+struct PlayerBotGroupOffer {
+	uint64 identityId = 0;
+	uint64 bodyOid = 0;
+	uint64 playerOid = 0;
+	String playerName;
+	uint64 requestId = 0;
+	uint64 generation = 0;
+	int state = PLAYER_BOT_GROUP_OFFERED;
+	uint64 createdAtMs = 0;
+	uint64 expiresAtMs = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotGroupRecord {
+	uint64 identityId = 0;
+	uint64 bodyOid = 0;
+	uint64 groupOid = 0;
+	uint64 leaderOid = 0;
+	String leaderName;
+	uint64 joinedAtMs = 0;
+	int state = PLAYER_BOT_GROUP_GROUPED;
+	uint64 generation = 0;
+	uint64 leaderOfflineSinceMs = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotGroupingRateState {
+	uint64 cooldownUntilMs = 0;
+	uint64 replyWindowStartMs = 0;
+	int repliesThisWindow = 0;
+
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
@@ -674,6 +767,27 @@ struct PlayerBotKillXpEvent {
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
 
+// Phase-4 parity observations.  These are deliberately bounded and are only
+// used by the disabled grouping harness; production behavior never depends on
+// them.
+struct PlayerBotGroupingChatLine {
+	uint64 groupOid = 0;
+	String sender;
+	String text;
+	uint64 postedAtMs = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotGroupingKillXpObservation {
+	PlayerBotKillXpEvent event;
+	uint64 observedAtMs = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
 struct PlayerBotKillXpParams {
 	bool enabled = false;
 	float rate = 1.0f;
@@ -943,6 +1057,29 @@ struct PlayerBotParityTestStep {
 	int expectedDefense = 0;
 	bool hasExpectedAccuracy = false;
 	bool hasExpectedDefense = false;
+	// F_0.9.15 grouping parity operations.  These fields intentionally live on
+	// the generic step so the Lua harness remains data-only.
+	String groupingText;
+	String groupingContains;
+	String groupingTarget;
+	String groupingFaction;
+	String groupingReason;
+	String groupingReleaseReason;
+	String groupingCounter;
+	float groupingMaxDistance = 0.f;
+	String groupingLastObservation;
+	float groupingX = 0.f;
+	float groupingY = 0.f;
+	float groupingZ = 0.f;
+	bool groupingHasPosition = false;
+	bool groupingFree = true;
+	int groupingChancePercent = 100;
+	int groupingWithinSeconds = 0;
+	int groupingExpectedCount = -1;
+	int groupingMinDelta = 0;
+	bool groupingKillStarted = false;
+	uint64 groupingInitialBodyOid = 0;
+	uint64 groupingNoDamageCombatSinceMs = 0;
 	float attackSpeed = 0.f;
 	bool hasAttackSpeed = false;
 	bool loadoutTemplateComplete = false;
@@ -1891,6 +2028,34 @@ public:
 		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 	};
 
+	struct PlayerBotGroupRoute {
+		uint64 identityId = 0;
+		Vector<SimTravelLeg> legs;
+		int legIndex = 0;
+		String fromPlanet;
+		String fromCity;
+		String destPlanet;
+		String destCity;
+		uint64 generation = 0;
+		uint64 replanWindowStartMs = 0;
+		int replansInWindow = 0;
+		uint64 holdUntilMs = 0;
+		bool holdLinePosted = false;
+
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+
+	struct PlayerBotGroupSnapshot {
+		uint64 groupOid = 0;
+		uint64 leaderOid = 0;
+		String leaderName;
+		Vector<uint64> memberOids;
+
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+
 	// P.8.7: one bounded real-buff hub round trip. The manager owns the route
 	// and its lifecycle; the hunter controller owns the motion and provider
 	// interaction choreography.
@@ -2720,6 +2885,55 @@ private:
 	bool progressionEarlyGameRealWeaponDamage = false;
 	bool progressionWeaponLoadout = false;
 	bool progressionBazaarUpgrades = false;
+	// F_0.9.15 G1: capability gate and validated Lua mirror.  The gate remains
+	// default-off; later phases consume the snapshot for room/group work.
+	bool progressionGroupingEnabled = false;
+	PlayerBotGroupingConfig playerBotGroupingConfig;
+	std::atomic<bool> playerBotGroupingActive{false};
+	std::atomic<uint32> playerBotLfbRoomId{0};
+	Mutex playerBotGroupingRoomMutex;
+	// Leaf state only: never hold this mutex while taking pve, progression,
+	// creature, group, or world-object locks.
+	Mutex groupingMutex;
+	// Harness observations have their own leaf lock because kill-XP and chat
+	// callbacks can arrive from task threads unrelated to groupingMutex.
+	Mutex playerBotGroupingObservationMutex;
+	Vector<PlayerBotGroupingChatLine> playerBotGroupingRecentChat;
+	Vector<PlayerBotGroupingKillXpObservation> playerBotGroupingRecentKillXp;
+	VectorMap<uint64, PlayerBotGroupOffer> playerBotGroupOffers;
+	VectorMap<uint64, PlayerBotGroupRecord> playerBotGroupRecords;
+	VectorMap<uint64, PlayerBotGroupRoute> playerBotGroupRoutes;
+	VectorMap<uint64, PlayerBotGroupingRateState> playerBotGroupingRate;
+	Vector<String> playerBotGroupingRecentUnmatched;
+	uint64 playerBotGroupingReplyWindowStartMs = 0;
+	int playerBotGroupingRepliesThisWindow = 0;
+	uint64 nextPlayerBotGroupingRequestId = 1;
+	uint64 nextPlayerBotGroupingGeneration = 1;
+	AtomicLong playerBotGroupingRequestsSeen;
+	AtomicLong playerBotGroupingOffersCreated;
+	AtomicLong playerBotGroupingOffersExpired;
+	AtomicLong playerBotGroupingRequestsMatched;
+	AtomicLong playerBotGroupingRequestsCooldown;
+	AtomicLong playerBotGroupingRepliesScheduled;
+	AtomicLong playerBotGroupingRepliesPosted;
+	AtomicLong playerBotGroupingInvitesSeen;
+	AtomicLong playerBotGroupingInvitesAccepted;
+	AtomicLong playerBotGroupingJoinAborted;
+	AtomicLong playerBotGroupingJoinCompensated;
+	AtomicLong playerBotGroupingJoinFailed;
+	AtomicLong playerBotGroupingRejoins;
+	AtomicLong playerBotGroupingTravelLegs;
+	AtomicLong playerBotGroupingTravelFailed;
+	AtomicLong playerBotGroupingGroupChatUnhandled;
+	AtomicLong playerBotGroupingAssists;
+	VectorMap<String, uint64> playerBotGroupingReplySkipped;
+	VectorMap<String, uint64> playerBotGroupingInvitesDeclined;
+	VectorMap<String, uint64> playerBotGroupingJoinAbortedReasons;
+	VectorMap<String, uint64> playerBotGroupingReleases;
+	VectorMap<String, uint64> playerBotGroupingGroupChatCommands;
+	VectorMap<String, uint64> playerBotGroupingAssistSkipped;
+	VectorMap<uint64, SimBotGrouping::Availability> playerBotGroupingAvailabilityOverrides;
+	VectorMap<uint64, int> playerBotGroupingAvailabilityChanceOverrides;
 	float progressionLoadoutMinUpgradePercent = 10.f;
 	int progressionLoadoutFullSweepMinutes = 30;
 	float progressionLoadoutUpgradeSpendFraction = 0.5f;
@@ -3057,6 +3271,13 @@ private:
 	bool playerBotParityTestProgressionEnabledOverridePrevious = true;
 	bool playerBotParityTestGateOverrideActive = false;
 	bool playerBotParityTestGateOverride = true;
+	// A registered parity body is the stand-in player leader.  It is never a
+	// production hunter and is valid only while the harness scenario is active.
+	VectorMap<uint64, bool> playerBotParityGroupHarnessLeaderOids;
+	uint64 playerBotParityGroupLeaderOid = 0;
+	uint64 playerBotParityGroupAttackerOid = 0;
+	Vector<uint64> playerBotParityGroupAttackerOids;
+	VectorMap<uint64, uint64> playerBotParityGroupInitialBodyOids;
 	bool playerBotParityTestLoadoutGateOverrideActive = false;
 	bool playerBotParityTestLoadoutGateOverride = false;
 	bool playerBotParityTestArmorGateOverrideActive = false;
@@ -3091,6 +3312,10 @@ private:
 	bool playerBotParityTestCombatAbilitiesGateOverride = false;
 	bool playerBotParityTestCombatAbilitiesGateOverridePreviousActive = false;
 	bool playerBotParityTestCombatAbilitiesGateOverridePrevious = false;
+	// Reserved for the G1 harness gate.  Keep the same ordering as every other
+	// P.10 capability: progression master, harness override, configured flag.
+	bool playerBotParityTestGroupingGateOverrideActive = false;
+	bool playerBotParityTestGroupingGateOverride = false;
 	bool playerBotParityTestMissionCreditGateOverrideActive = false;
 	bool playerBotParityTestMissionCreditGateOverride = false;
 	bool playerBotParityTestMissionCreditGateOverridePreviousActive = false;
@@ -3198,6 +3423,9 @@ private:
 	VectorMap<uint64, int64> playerBotParityBazaarSellerBankBaselines;
 	// Last corpse each identity looted (LOOTED or PARTIAL_CAP), under lootMutex.
 	VectorMap<uint64, uint64> lootLastLootedCorpseByIdentity;
+	// F_0.9.15 harness evidence: the newest corpse a claim was queued for, per
+	// identity (the bot loot branch's own effect, recorded before any outcome).
+	VectorMap<uint64, uint64> lootLastClaimQueuedCorpseByIdentity;
 	// Cash seedCorpseLoot's sibling placed on the corpse; a successful harness
 	// lootCorpse moves it into the oracle so assertCredits stays exact.
 	int64 playerBotParitySeededCorpseCash = 0;
@@ -3725,6 +3953,35 @@ private:
 	bool awardToNonRosterPlayerBotBody(uint64 identityId, const String& xpType,
 		int amount, const String& source);
 	bool playerBotProgressionAwardGateEnabled();
+	bool playerBotGroupingGateEnabled();
+	void ensurePlayerBotLfbRoom();
+	void postPlayerBotLfbRoom(const String& sender, const String& text);
+	void runPlayerBotLfbRequestTask(uint64 senderOid, const String& senderName,
+		const String& planet, const Vector3& position, const String& text);
+	void runPlayerBotLfbReplyTask(const SimBotGrouping::LfbRequest& request,
+		uint64 requestId, uint64 playerOid, const String& playerName,
+		const String& planet, const Vector3& position, uint64 identityId);
+	void runPlayerBotInviteTask(uint64 inviterOid, uint64 targetOid);
+	void runPlayerBotJoinTask(uint64 identityId, uint64 bodyOid,
+		uint64 inviterOid, uint64 generation);
+	void expirePlayerBotGroupOffers(uint64 nowMs);
+	void reconcilePlayerBotGroups(uint64 nowMs);
+	void releasePlayerBotGroup(uint64 identityId, const String& reason);
+	void releaseAllPlayerBotGroups(const String& reason);
+	void onPlayerBotGroupChatTask(uint64 senderOid, uint64 groupId,
+		const String& text);
+	void snapshotPlayerBotGroupingReserved(VectorMap<uint64, bool>& reserved);
+	void abortPlayerBotGroupJoin(uint64 identityId, uint64 bodyOid,
+		uint64 inviterOid, uint64 generation, const String& reason);
+	bool isPlayerBotGroupingReserved(uint64 identityId);
+	// requesterOid != 0 and a registered harness stand-in: only identities the
+	// scenario overrode are candidates, so harness requests never preempt
+	// unrelated production bots.
+	void snapshotPlayerBotGroupingCandidates(
+		std::vector<SimBotGrouping::Candidate>& candidates,
+		uint64 requesterOid = 0);
+	void postPlayerBotGroupLine(uint64 groupId, const String& sender,
+		const String& text);
 	bool playerBotLoadoutGateEnabled(uint64 identityId);
 	bool playerBotArmorLoadoutGateEnabled(uint64 identityId);
 	bool playerBotConsumablesGateEnabled(uint64 identityId);
@@ -3856,6 +4113,7 @@ private:
 	JSONSerializationType getCombatDiagDashboard();
 	JSONSerializationType getPveSpikeDashboard();
 	JSONSerializationType getPlayerBotProgressionDashboard();
+	JSONSerializationType getPlayerBotGroupingDashboard();
 
 	// Lua config loading / spawning
 	void loadLuaConfig();
@@ -5229,6 +5487,54 @@ public:
 	void onPlayerSpatialChat(CreatureObject* player, const UnicodeString& message);
 	void onPvpGroupChat(CreatureObject* player, uint64 groupId,
 		const UnicodeString& message);
+
+	// F_0.9.15 G1: these hooks are intentionally data-only at the caller
+	// boundary.  Chat and group-manager callers may already hold creature
+	// locks, so they only perform an atomic gate check and queue manager work.
+	bool isPlayerBotGroupingActive() const {
+		return playerBotGroupingActive.load(std::memory_order_acquire);
+	}
+	bool isPlayerBotLfbRoom(uint32 roomID) const;
+	void onLfbRoomMessage(uint64 senderOid, const String& senderName,
+		const String& planet, const Vector3& position, const String& text);
+	void onPlayerBotInvited(uint64 inviterOid, uint64 targetOid);
+	uint64 resolveOfferedBotByName(uint64 playerOid, const String& firstName);
+	bool hasPlayerBotGroupingState(uint64 identityId) const;
+	bool getPlayerBotGroupRecord(uint64 identityId,
+		PlayerBotGroupRecord& record) const;
+	bool snapshotPlayerBotGroup(uint64 groupId,
+		PlayerBotGroupSnapshot& snapshot) const;
+	bool isPlayerBotGroup(uint64 groupId) const;
+	void onPlayerBotGroupChat(uint64 senderOid, uint64 groupId,
+		const String& text);
+	void postPlayerBotGroupChat(uint64 groupId, const String& sender,
+		const String& text);
+	void postPlayerBotGroupTravelLine(uint64 groupId, const String& city);
+	void recordPlayerBotGroupingAssist(uint64 identityId);
+	void recordPlayerBotGroupingAssistSkipped(uint64 identityId,
+		const String& reason);
+	void recordPlayerBotGroupingTravel(uint64 identityId, bool failed,
+		const String& detail = String());
+	bool isPlayerBotGroupHarnessLeader(uint64 oid) const;
+	// Publishes DEAD_REJOIN before taking the body lock and leaving its stock
+	// group.  Controller teardown uses the same ordering as manager-owned body
+	// destruction paths.
+	void preparePlayerBotGroupingDeath(uint64 identityId, uint64 bodyOid,
+		const String& reason);
+	bool tryRejoinPlayerBotGroup(uint64 identityId, AiAgent* body);
+	bool getPlayerBotGroupRoute(uint64 identityId,
+		PlayerBotGroupRoute& route) const;
+	bool planPlayerBotGroupRoute(uint64 identityId, const String& botPlanet,
+		const Vector3& botPosition, const String& leaderPlanet,
+		const Vector3& leaderPosition);
+	bool advancePlayerBotGroupRoute(uint64 identityId, uint64 generation);
+	bool notePlayerBotGroupReplan(uint64 identityId, uint64 generation,
+		uint64 nowMs);
+	bool claimPlayerBotGroupRouteHoldLine(uint64 identityId,
+		uint64 generation, uint64 nowMs);
+	bool clearPlayerBotGroupRouteHold(uint64 identityId, uint64 generation,
+		uint64 nowMs);
+	void clearPlayerBotGroupRoute(uint64 identityId, uint64 generation = 0);
 	bool isPvpSquadGroup(uint64 groupId) const;
 	// P.6.3c: gate for the joinGroup core patch - true only when grouping is
 	// enabled AND oid is a current squad leader NPC.
@@ -5236,6 +5542,15 @@ public:
 	// P.6.3c: called by the joinGroup core patch after a player ACCEPTS an
 	// invite from a squad-leader NPC (records the group + syncs the squad in).
 	void onPlayerJoinedSquadGroup(uint64 leaderOid, CreatureObject* player);
+	PlayerBotGroupingConfig getPlayerBotGroupingConfig() const {
+		return playerBotGroupingConfig;
+	}
+	float getPlayerBotGroupingAssistRadiusMeters() const {
+		return playerBotGroupingConfig.assistRadiusMeters;
+	}
+	int getPlayerBotGroupingOfferTtlSeconds() const {
+		return playerBotGroupingConfig.offerTtlSeconds;
+	}
 
 	// Read-only pvpConfig accessors for the controllers (runtime-refreshed).
 	float getPvpScanRadiusMeters() const { return pvpScanRadiusMeters; }

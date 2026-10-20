@@ -6401,11 +6401,16 @@ void SimPlayerController::completeTicketCollectorTravel() {
     ticketTravelPhase = TICKET_TRAVEL_NONE;
     String destZone = travelDestinationZone;
     onInterplanetaryTravelFinished(true, destZone, "arrived");
-    clearInterplanetaryTravelState();
+	clearInterplanetaryTravelState();
+}
+
+void SimPlayerController::setInterplanetaryTravelActive(bool active) {
+	interplanetaryTravelActive = active;
+	onInterplanetaryTravelAvailabilityChanged(active);
 }
 
 void SimPlayerController::clearInterplanetaryTravelState() {
-    interplanetaryTravelActive = false;
+	setInterplanetaryTravelActive(false);
     travelDestinationZone = "";
     travelDeparturePosition = Vector3(0, 0, 0);
     travelDestinationArrival = Vector3(0, 0, 0);
@@ -6651,12 +6656,12 @@ bool SimPlayerController::beginInterplanetaryTravel(
     // A rejected new-trip request is a terminal path for the request, not for
     // an already-running journey. Keep the active journey visible to neither
     // the miner policy callback nor any future derived controller.
-    auto notifyStartFailure = [this, &destZone](const String& reason) {
-        bool wasActive = interplanetaryTravelActive;
-        interplanetaryTravelActive = false;
-        onInterplanetaryTravelFinished(false, destZone, reason);
-        interplanetaryTravelActive = wasActive;
-    };
+	auto notifyStartFailure = [this, &destZone](const String& reason) {
+		bool wasActive = interplanetaryTravelActive;
+		setInterplanetaryTravelActive(false);
+		onInterplanetaryTravelFinished(false, destZone, reason);
+		setInterplanetaryTravelActive(wasActive);
+	};
 
     ManagedReference<AiAgent*> strongAgent = agent;
 
@@ -6708,7 +6713,7 @@ bool SimPlayerController::beginInterplanetaryTravel(
         return false;
     }
 
-    interplanetaryTravelActive = true;
+	setInterplanetaryTravelActive(true);
     travelDestinationZone = destZone;
     travelDeparturePosition = departurePos;
     travelDestinationArrival = destArrivalPos;

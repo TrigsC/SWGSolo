@@ -346,6 +346,7 @@
     const loadout = data.loadout || {};
     const armor = data.armor || {};
     const consumables = data.consumables || {};
+    const grouping = data.grouping || {};
     const consumableItems = Array.isArray(consumables.items) ? consumables.items : [];
     const armorWorn = Array.isArray(armor.worn) ? armor.worn : [];
     const armorDesired = Array.isArray(armor.desired) ? armor.desired : [];
@@ -446,6 +447,7 @@
       <div class="playerbot-card"><h3>LOADOUT</h3>${loadoutCurrent}<p class="playerbot-label">WEAPON CANDIDATES (${num(loadoutCandidates.length)}) · PROTECTED ${num(loadoutProtected.length)}</p>${table(["OID", "Template", "XP Type", "DPS", "Certified", "Protected"], loadoutCandidateRows, { scrollKey: "playerbot-loadout", tall: true })}</div>
       <div class="playerbot-card"><h3>ARMOR</h3><p class="playerbot-label">${chip(armor.enabled ? "gate on" : "gate off", armor.enabled ? "ok" : "ghost")} · ${chip(armor.simBotWornArmor ? "player mitigation" : "not flagged", armor.simBotWornArmor ? "teal" : "ghost")} · ${esc(armor.blockedReason || "no blocker")}</p>${kvRows([["Buffed pools", Object.entries(armor.buffedPools || {}).filter(([, value]) => value).map(([key]) => labelize(key)).join(", ") || "none"], ["Total encumbrance", num(armor.totalEncumbrance)], ["Mitigated total", num(armor.mitigatedTotal)], ["Race CRC", armor.bodyRaceCrc || "unknown"]])}${table(["Source OID", "Copy OID", "Slot", "Template", "Rating", "Condition", "State"], armorRows, { scrollKey: "playerbot-armor", tall: true })}<p class="playerbot-label">DESIRED SET (${num(armorDesired.length)})</p>${table(["Slot", "OID", "Template", "Score", "Status", "Usability"], armorDesiredRows, { scrollKey: "playerbot-armor-desired" })}</div>
       <div class="playerbot-card"><h3>FOOD &amp; DRINK</h3><p class="playerbot-label">${kvRows([["Food fill", `${num((consumables.stomach || {}).food)} / ${num((consumables.stomach || {}).max)}`], ["Drink fill", `${num((consumables.stomach || {}).drink)} / ${num((consumables.stomach || {}).max)}`], ["Next check", `${num(consumables.nextCheckInSeconds)}s`], ["Last consumed", consumables.lastConsumed && consumables.lastConsumed.template ? esc(consumables.lastConsumed.template) : "none"]])}</p>${table(["Template", "Doses", "Stacks", "Buff", "Remaining"], consumableRows, { scrollKey: "playerbot-consumables" })}</div>
+      <div class="playerbot-card"><h3>GROUPING</h3>${kvRows([["State", labelize(grouping.state || grouping.kind || "free")], ["Leader", grouping.leader || grouping.playerOid || "none"], ["Group", grouping.groupOid || "none"], ["Generation", num(grouping.generation)], ["Offer expires", grouping.expiresAtMs ? new Date(Number(grouping.expiresAtMs)).toLocaleTimeString() : "—"]])}</div>
       <div class="playerbot-card"><h3>SKILL MODS</h3>${modRows ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Mod</th><th>Base</th><th>Trained</th><th>Effective</th></tr></thead><tbody>${modRows}</tbody></table></div>` : `<span class="muted small">No live skill mods.</span>`}</div>`;
   }
 
@@ -1330,6 +1332,7 @@
       </tr>`;
     }).join("");
     const progressionHarness = progression.harness || {};
+    const grouping = progression.grouping || {};
     const killXp = progression.killXp || {};
     const killXpGate = progression.gates && progression.gates.awardKillXp === true;
     const progressionHarnessRows = (progressionHarness.scenarios || []).map((s) => {
@@ -1342,6 +1345,28 @@
         <td class="t-num">${num(s.durationMs)}</td>
       </tr>`;
     }).join("");
+    const groupingCounters = grouping.counters || {};
+    const groupingOfferRows = (grouping.offers || []).map((o) => `<tr>
+      <td><button type="button" class="playerbot-link" data-identity-id="${esc(o.identity)}"><span class="t-main">${esc(o.name || "unknown")}</span><span class="t-sub">${esc(o.identity)}</span></button></td>
+      <td>${esc(o.player || "—")}</td><td>${chip(labelize(o.state || "offered"), o.state === "OFFERED" ? "amber" : "teal")}</td>
+      <td class="t-num">${num(o.generation)}</td><td>${o.expiresAtMs ? esc(new Date(Number(o.expiresAtMs)).toLocaleTimeString()) : "—"}</td>
+    </tr>`).join("");
+    const groupingBotRows = (grouping.groupedBots || []).map((b) => `<tr>
+      <td><button type="button" class="playerbot-link" data-identity-id="${esc(b.identity)}"><span class="t-main">${esc(b.name || "unknown")}</span><span class="t-sub">${esc(b.identity)}</span></button></td>
+      <td>${esc(b.leader || "—")}</td><td>${esc(b.state || "GROUPED")}</td><td>${esc(b.planet || "—")}</td>
+      <td class="t-num">${b.distanceToLeader == null || Number(b.distanceToLeader) < 0 ? "—" : num(b.distanceToLeader) + "m"}</td><td class="t-num">${num(b.routeLegsLeft)}</td>
+    </tr>`).join("");
+    const groupingPanel = panel("GROUPS", `${chip(grouping.active ? "gate on" : "gate off", grouping.active ? "ok" : "ghost")} · ${esc(grouping.roomName || "LFB")}`, `<div class="metric-row">
+      ${metric("Requests", groupingCounters.requestsSeen)} ${metric("Matched", groupingCounters.requestsMatched)} ${metric("Offers", grouping.offers ? grouping.offers.length : 0, { tone: "accent" })}
+      ${metric("Grouped", grouping.groupedBots ? grouping.groupedBots.length : 0, { tone: "teal" })} ${metric("Free", grouping.freeBots)} ${metric("Live", grouping.liveBots)}
+      ${metric("Assists", groupingCounters.assists)} ${metric("Join aborted", groupingCounters.joinAborted)} ${metric("Compensated", groupingCounters.joinCompensated)}
+    </div>${kvRows([
+      ["Rooms / replies", `${num(grouping.roomId)} · ${num(groupingCounters.repliesPosted)} posted / ${num(groupingCounters.repliesScheduled)} scheduled`],
+      ["Invite / release", `${num(groupingCounters.invitesAccepted)} accepted · ${num(groupingCounters.joinFailed)} failed · ${Object.values(groupingCounters.releases || {}).reduce((a, v) => a + Number(v || 0), 0)} released`],
+      ["Skipped replies", Object.entries(groupingCounters.replySkipped || {}).map(([k, v]) => `${esc(k)} ${num(v)}`).join(" · ") || "none"],
+      ["Assist skips", Object.entries(groupingCounters.assistSkipped || {}).map(([k, v]) => `${esc(k)} ${num(v)}`).join(" · ") || "none"],
+      ["Recent unmatched", (grouping.recentUnmatched || []).map((line) => esc(line)).join(" · ") || "none"]
+    ])}<div class="section-gap"></div><p class="playerbot-label">OFFERS</p>${table(["Bot", "Player", "State", "Generation", "Expires"], groupingOfferRows, { scrollKey: "grouping-offers" })}<div class="section-gap"></div><p class="playerbot-label">GROUPED BOTS</p>${table(["Bot", "Leader", "State", "Planet", "Distance", "Legs left"], groupingBotRows, { scrollKey: "grouping-bots", tall: true })}`, "span-12");
     const offers = Array.isArray((pve.missionBoard || {}).offers)
       ? pve.missionBoard.offers : [];
     const offerFor = (r) => {
@@ -1417,6 +1442,7 @@
             ${metric("Deaths", pve.hunterDeathsTotal, { tone: Number(pve.hunterDeathsTotal || 0) ? "warn" : "" })}
           </div></div>
         </section>
+        ${groupingPanel}
         <section class="panel span-12"><header><h3>PROGRESSION LEDGER</h3>
           <span class="panel-tag">${chip(progression.enabled ? "enabled" : "disabled", progression.enabled ? "ok" : "ghost")} ${chip(progression.storeLoaded ? "loaded" : "not loaded", progression.storeLoaded ? "teal" : "ghost")} ${chip(progression.dbAvailable ? "db online" : "db unavailable", progression.dbAvailable ? "ok" : "red")}</span></header>
           <div class="panel-body"><div class="metric-row">

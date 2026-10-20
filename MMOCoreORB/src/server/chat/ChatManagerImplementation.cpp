@@ -753,6 +753,31 @@ void ChatManagerImplementation::handleChatRoomMessage(CreatureObject* sender, co
 	// All chat should adhere to player ignore list
 	channel->broadcastMessageCheckIgnore(msg, name);
 
+	// PlayerBot LFB is a passive room feed: the chat thread only checks the
+	// atomic room id and queues the parser.  Candidate snapshots and offer
+	// state never run while the caller's creature/room locks are held.
+	SimPlayerManager* simManager = SimPlayerManager::instance();
+	if (simManager != nullptr && sender->isPlayerCreature() &&
+			simManager->isPlayerBotLfbRoom(roomID)) {
+		simManager->onLfbRoomMessage(sender->getObjectID(), name,
+			zone->getZoneName(), sender->getWorldPosition(), message.toString());
+	}
+
+	// The client's Group chat tab posts to the group's own chat room through
+	// this handler, not handleGroupChat (which only serves /g), so a bot group's
+	// room is routed here too. Inert unless grouping is active and the room is
+	// the sender's bot group room; the handler only copies and queues.
+	if (simManager != nullptr && sender->isPlayerCreature() &&
+			simManager->isPlayerBotGroupingActive()) {
+		ManagedReference<GroupObject*> senderGroup = sender->getGroup();
+		ManagedReference<ChatRoom*> senderGroupChat = senderGroup == nullptr ?
+			nullptr : senderGroup->getChatRoom();
+		if (senderGroupChat != nullptr && senderGroupChat->getRoomID() == roomID &&
+				simManager->isPlayerBotGroup(senderGroup->getObjectID()))
+			simManager->onPlayerBotGroupChat(sender->getObjectID(),
+				senderGroup->getObjectID(), message.toString());
+	}
+
 	BaseMessage* amsg = new ChatOnSendRoomMessage(counter);
 	channel->broadcastMessage(amsg);
 
@@ -1678,6 +1703,9 @@ void ChatManagerImplementation::handleGroupChat(CreatureObject* sender, const Un
 		uint64 groupID = group->getObjectID();
 		if (SimPlayerManager::instance()->isPvpSquadGroup(groupID))
 			SimPlayerManager::instance()->onPvpGroupChat(sender, groupID, message);
+		if (SimPlayerManager::instance()->isPlayerBotGroup(groupID))
+			SimPlayerManager::instance()->onPlayerBotGroupChat(
+				sender->getObjectID(), groupID, message.toString());
 	}
 }
 

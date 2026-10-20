@@ -12,6 +12,7 @@
 #include "server/chat/room/ChatRoom.h"
 
 #include "server/zone/objects/creature/CreatureObject.h"
+#include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/player/PlayerObject.h"
 #include "server/zone/objects/group/GroupObject.h"
 
@@ -156,6 +157,11 @@ void GroupManager::inviteToGroup(CreatureObject* inviter, CreatureObject* target
 
 			GroupManager::instance()->joinGroup(targetRef);
 		}, "PetJoinGroupLambda", randDelay);
+	} else {
+		AiAgent* targetAgent = target->asAiAgent();
+		if (targetAgent != nullptr && targetAgent->getSimPlayerBot())
+			SimPlayerManager::instance()->onPlayerBotInvited(
+				inviter->getObjectID(), target->getObjectID());
 	}
 }
 
@@ -190,8 +196,12 @@ void GroupManager::joinGroup(CreatureObject* creature) {
 	// / addMember / chat room - already accepts any CreatureObject leader.
 	bool inviterOk = object != nullptr && object->getObjectID() != creature->getObjectID();
 
-	if (inviterOk && !object->isPlayerCreature())
-		inviterOk = SimPlayerManager::instance()->isPvpSquadLeaderNpc(object->getObjectID());
+	if (inviterOk && !object->isPlayerCreature()) {
+		SimPlayerManager* simManager = SimPlayerManager::instance();
+		inviterOk = simManager != nullptr &&
+			(simManager->isPvpSquadLeaderNpc(object->getObjectID()) ||
+				simManager->isPlayerBotGroupHarnessLeader(object->getObjectID()));
+	}
 
 	if (!inviterOk)
 		return;
@@ -930,4 +940,3 @@ void GroupManager::transferLoot(GroupObject* group, CreatureObject* winner, Scen
 		}
 
 	}
-

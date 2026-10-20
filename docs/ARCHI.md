@@ -128,6 +128,7 @@ CMake options: `BUILD_IDL`, `COMPILE_TESTS`, `ENABLE_ASAN`/`TSAN`/`UBSAN`. Debug
 | F_0.9.12 (v0.9.13) | `weaponLoadout`, `loadout` (`minUpgradePercent` 10, `fullSweepMinutes`, `bazaarUpgrades`, `upgradeSpendFraction` 0.5, `upgradeScanIntervalMinutes`, `maxUpgradeLoadsPerVisit`) |
 | F_0.9.13 (v0.9.14) | `armorLoadout`, `loadout.armor` (`minUpgradePercent`, `assumedArmorPiercing`, `damageTypeWeights`, `bodyRaces` `{body, race}` pairs, `bazaarUpgrades`, `upgradeSpendFraction`, `maxUpgradeLoadsPerVisit`, `bodyHamBaseline`) |
 | F_0.9.14 (v0.9.15) | `consumablesEnabled`, `consumables` (`bazaarRestock`, `minDoses` 10, `minRecheckSeconds`, `noDoseRetrySeconds`, `restockScanIntervalMinutes`, `maxRestockLoadsPerVisit`, `restockSpendFraction`, `items` = `{template, maxPricePerDose, minDoses?}`: Vasarian brandy, pikatta pie, crispic) |
+| F_0.9.15 (v0.9.16) | `groupingEnabled`, `grouping` (`roomName` LFB, offer TTL 180 s, `defaultReplies` 2, `maxRepliesCap`, reply delays/gap, `availabilityChancePercent`, request cooldown and room rate, `maxGroupedBots` 10, `maxBotsPerLeader` 9, join delay, `followMinMeters`/`followMaxMeters`, `repathMoveMeters` 3, `followTickMs` 750, `routeDistanceMeters`, `maxReplansPer10Min`, `assistRadiusMeters`, `leaderOfflineGraceSeconds`, `vocabulary` roles/gear/tiers/status/leave, `lines`) |
 
 The sim layer alone restores roster PlayerBot weapon-template stats after shared AI weapon-stat
 setup; synthetic harness identities stay outside that path.
@@ -836,6 +837,36 @@ Layered on the stock `AiAgent`/`CreatureObject` hierarchy. Living design docs:
     candidates matched by the template's client game object type (an unfiltered scan spent its load
     budget on unrelated cheap listings), ranked by price per dose. SELL protects configured food.
   - **Live receipt:** 68/68 (`docs/4-unit-tests/live_f0914-*`).
+- **Looking For Bot and grouping (P.10p G1 / F_0.9.15, released v0.9.16)**: bots join a real
+  player's group.
+  - **Discovery.** A custom `LFB` room (recreated each boot). `handleChatRoomMessage` copies the line
+    and queues it. Free roster bots that match (Lua vocabulary of roles, gear and tiers; DWB means a
+    complete template) answer with staggered offers, `OFFERED → ACCEPTING → JOINING` plus a
+    generation, valid for 3 minutes and bound to the requesting player.
+  - **Invite.** Stock `InviteCommand` rejects non-players, so a gated branch resolves the targeted
+    bot, or a name only among bots offered to that inviter. `inviteToGroup` already sets
+    `groupInviterID` for a non-player non-pet and stops, so a hook queues the verdict. Accept
+    revalidates in three non-nested steps, then calls stock `joinGroup` (no locks); a changed offer
+    after the join is compensated with `leaveGroup`.
+  - **Availability is a published snapshot.** One atomic per controller (phase, early phase,
+    combat, dead, travel, loot, early-game-active bits). Every writer does a masked CAS of its own
+    bits; the manager never reads controller or agent state. The early game runs under `HUNTING`, so
+    it needs its own bit to be "free between fights".
+  - **Grouped mode** preempts the order and the early game (`GROUP_WAIT`/`FOLLOW`/`TRAVEL`).
+    - **`shouldResumeHybridTravel` must admit any new movement mode.** It only admitted an active
+      order or the early game, so every follow path was silently dropped
+      (`hybrid_resume_cancelled`).
+    - **Never re-issue `moveTo` just because the mover is idle between nodes.** It discards the
+      in-flight path. Re-path on target movement or a real stall, `WAITING` included.
+    - The faction rule is in the pure verdict: never assist against a GCW attacker.
+  - **Lifecycle.** The reconcile leases by (generation, state). After a kick the bot has no group
+    pointer, so the recorded group is read and membership judged first. Death publishes
+    `DEAD_REJOIN` before leaving the group; respawn rejoins through `joinGroup`, whose
+    `group == nullptr` branch recreates a two-member group. Records are memory-only.
+  - **Chat has two client paths.** The Group tab posts to the group's room via
+    `handleChatRoomMessage`; `/g` goes through `handleGroupChat`. Hook both.
+  - **Live receipt:** 27/27 (`docs/4-unit-tests/live_f0915-*`): 77 harness scenarios plus the owner's
+    real-client pass, which alone caught three defects.
 - **Simulation-only policy, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line
@@ -934,6 +965,13 @@ flowchart LR
   verification and scenario harnesses** (`structureTraversalTest`, `playerBotParityTest`) with
   TRIP-verify receipts. Harness bodies run `SimParityTestController`, never hunter code.
 - Scaffolding: `MockBehavior.h`, `MockCompositeBehavior.h`, `DeadlockTestBase`.
+- **A harness that calls a manager entry point skips the client's path.** Grouping scenarios
+  passed while the real client's Group tab never reached the bots. Player-facing features need a
+  real-client pass.
+- **A harness kill must use `KillCommand` lock order**: killer locked, victim cross-locked. Locking
+  only the victim made `notifyDestruction` spin cross-locking the destructor and hung the server
+  (F_0.9.15, diagnosed from a GDB thread dump).
+
 - **Never run `core3 runUnitTests` while the live server is up**: it shares the BDB environment in
   `bin/databases/`; twice (2026-09-21, 2026-10-13) the next delta save panicked (`BDB0060`,
   `DB_RUNRECOVERY`) and deadlocked the server. Recovery: stop the exact pid, back up `databases`,

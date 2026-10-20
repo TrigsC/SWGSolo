@@ -8,6 +8,8 @@
 
 #include "server/zone/objects/scene/SceneObject.h"
 #include "server/zone/objects/creature/CreatureObject.h"
+#include "server/zone/objects/creature/ai/AiAgent.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
 #include "server/zone/managers/group/GroupManager.h"
 #include "server/zone/ZoneServer.h"
 
@@ -37,6 +39,32 @@ public:
 			return GENERALERROR;
 
 		auto object = zoneServer->getObject(target);
+		auto groupManager = GroupManager::instance();
+		if (groupManager == nullptr)
+			return GENERALERROR;
+
+		// G1 bot target path.  It runs before the stock player-only rejection;
+		// name fallback is restricted to a live offer belonging to this inviter.
+		SimPlayerManager* simManager = SimPlayerManager::instance();
+		if (simManager != nullptr && simManager->isPlayerBotGroupingActive()) {
+			AiAgent* botTarget = object == nullptr ? nullptr :
+				object->asAiAgent();
+			if (botTarget == nullptr || !botTarget->getSimPlayerBot()) {
+				StringTokenizer botArgs(arguments.toString());
+				String firstName;
+				if (botArgs.hasMoreTokens())
+					botArgs.getStringToken(firstName);
+				uint64 botOid = simManager->resolveOfferedBotByName(
+					creature->getObjectID(), firstName);
+				if (botOid != 0)
+					object = zoneServer->getObject(botOid);
+				botTarget = object == nullptr ? nullptr : object->asAiAgent();
+			}
+			if (botTarget != nullptr && botTarget->getSimPlayerBot()) {
+				groupManager->inviteToGroup(creature, botTarget);
+				return SUCCESS;
+			}
+		}
 
 		bool galaxyWide = ConfigManager::instance()->getBool("Core3.PlayerManager.GalaxyWideGrouping", false);
 
@@ -57,8 +85,6 @@ public:
 
 			object = playerMan->getPlayer(firstName);
 		}
-
-		auto groupManager = GroupManager::instance();
 
 		if (object == nullptr || groupManager == nullptr)
 			return GENERALERROR;

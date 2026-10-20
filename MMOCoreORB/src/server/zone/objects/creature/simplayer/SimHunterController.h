@@ -35,7 +35,10 @@ public:
 		MISSION_CLEANUP,
 		CLONE_HOME,
 		DONE,
-		BAZAAR_VISIT
+		BAZAAR_VISIT,
+		GROUP_WAIT,
+		GROUP_FOLLOW,
+		GROUP_TRAVEL
 	};
 
 private:
@@ -58,6 +61,9 @@ private:
 	// C2: non-blocking single-flight guard so two runActiveTick bodies never run
 	// concurrently for one controller (a loser reschedules instead of blocking).
 	std::atomic<bool> tickRunning{false};
+	// Published once as a packed value so grouping candidates need one atomic
+	// load and never inspect controller or agent state through the manager.
+	std::atomic<uint64> groupAvailabilitySnapshot{0};
 	uint64 targetOid;
 	uint64 observerTargetOid;
 	Reference<Observer*> targetObserver;
@@ -187,6 +193,7 @@ private:
 	// P.10g: the self-motivated novice loop runs on the existing active tick.
 	// These route fields are transient; counters and published state live in
 	// SimPlayerManager keyed by identity.
+	public:
 	enum EarlyGamePhase {
 		EARLY_LEAVE_CITY,
 		EARLY_SELECT_TARGET,
@@ -194,6 +201,7 @@ private:
 		EARLY_RECOVER,
 		EARLY_TRAIN
 	};
+	private:
 	bool earlyGameActive;
 	EarlyGamePhase earlyGamePhase;
 	Vector3 earlyGameAnchor;
@@ -210,6 +218,17 @@ private:
 	// True while the current target was adopted in self-defence rather than
 	// chosen by the TTK scan.
 	bool earlyGameTargetDefensive;
+	// Grouped movement may continue while the bot is defending itself.  This is
+	// deliberately narrower than the travel-combat lease: it is raised only for
+	// the fallback walk back to the leader's slot.
+	std::atomic<bool> groupFallbackMoveActive{false};
+	Vector3 groupLastPathTarget;
+	uint64 groupLastPathIssuedMs = 0;
+	// Rate-limits the GROUP_FOLLOW diagnostic event (one per mode change or 10 s).
+	uint64 groupFollowEventAtMs = 0;
+	int groupFollowEventMode = -1;
+	uint64 groupAssistEventAtMs = 0;
+	uint64 groupAssistCountEventAtMs = 0;
 	// The loot sub-step is transient controller state. The claim itself is a
 	// value copy; no corpse or bag reference is retained between ticks.
 	// lootStepActive is read by the path callbacks on other threads; they only
@@ -319,6 +338,18 @@ private:
 	// mission lairs only, members of that lair only, solo only, gated.
 	void shedWaveAggro(AiAgent* strongAgent, int spawnNumber);
 	void setPhase(HuntPhase next);
+	void suspendRoutineForGroup(const String& reason);
+	void runGroupTick(AiAgent* hunter, uint64 nowMs);
+	void resumeRoutineAfterGroup(bool postLeaving = false);
+	void leaveGroupMode();
+	bool isGroupPhase() const {
+		return phase == GROUP_WAIT || phase == GROUP_FOLLOW ||
+			phase == GROUP_TRAVEL;
+	}
+	void updateGroupingAvailabilityBits(uint64 mask, uint64 value);
+	void publishGroupingCombatDead(AiAgent* body);
+	void setGroupingLootStepActive(bool active);
+	void setEarlyGameActiveFlag(bool active);
 	void beginBuffUp();
 	bool beginBazaarVisit(AiAgent* hunter, uint64 nowMs);
 	void finishBazaarVisit(const String& outcome, bool resumeJob = true);
@@ -478,6 +509,8 @@ private:
 	bool recognisesThreatAttackers() const;
 	void logTravelDisengage(AiAgent* hunter, const char* reason);
 	bool defendAgainstInterceptor(AiAgent* hunter, CreatureObject* attacker);
+	bool engageDefensiveTarget(AiAgent* hunter, CreatureObject* attacker,
+		const char* reason);
 	bool isBelowRetreatThreshold(AiAgent* hunter) const;
 	bool isReadyToResume(AiAgent* hunter) const;
 	bool targetIsLive(uint64 oid, CreatureObject*& target,
@@ -514,9 +547,13 @@ public:
 	// not tearing down its lair. Once the order completes/abandons/times out
 	// (orderActive=false) or enters cleanup, the preserved finalDestination must
 	// not revive movement toward the finished target (code-review Major).
+	// F_0.9.15: a grouped bot has neither an order nor the early game (both are
+	// suspended for the group), so its follow legs are admitted by phase; without
+	// this every follow path was dropped as hybrid_resume_cancelled.
 	bool shouldResumeHybridTravel() const override {
 		return hasFinalDestination &&
-			((earlyGameActive) || (orderActive && !missionCleanupRequested)) &&
+			((earlyGameActive) || (orderActive && !missionCleanupRequested) ||
+				isGroupPhase()) &&
 			phase != RELOCATING && phase != BUFF_TRIP;
 	}
 
@@ -531,10 +568,17 @@ public:
 	uint64 getIdentityId() const { return identityId; }
 	uint64 getTargetOid() const { return targetOid; }
 	HuntPhase getPhase() const { return phase; }
+	uint64 getGroupingAvailabilitySnapshot() const {
+		return groupAvailabilitySnapshot.load(std::memory_order_acquire);
+	}
+	// Phase 2 grouping tasks use this as a cheap wake-up.  The grouped tick
+	// branch is deliberately deferred to Phase 3.
+	void notifyGroupingStateChanged() { scheduleActiveTick(100); }
 	bool isReadyForMarketRelocation() const;
 	bool canBeginInterplanetaryTravel() const override;
 	void onInterplanetaryTravelFinished(bool success, const String& destZone,
 		const String& reason) override;
+	void onInterplanetaryTravelAvailabilityChanged(bool active) override;
 };
 
 #endif /* SIMHUNTERCONTROLLER_H_ */
