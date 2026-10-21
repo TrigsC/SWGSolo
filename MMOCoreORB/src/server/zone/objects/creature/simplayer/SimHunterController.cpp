@@ -27,6 +27,7 @@
 #include "server/zone/objects/tangible/threat/ThreatMap.h"
 #include "server/zone/managers/combat/CombatManager.h"
 #include "server/zone/managers/player/PlayerManager.h"
+#include "server/zone/managers/planet/PlanetManager.h"
 #include "server/chat/ChatManager.h"
 #include "server/zone/managers/director/ScreenPlayTask.h"
 #include "templates/params/ObserverEventType.h"
@@ -109,6 +110,8 @@ static_assert(static_cast<int>(SimHunterController::GROUP_FOLLOW) ==
 		static_cast<int>(SimBotGrouping::PHASE_GROUP_FOLLOW), "group phase code drift: GROUP_FOLLOW");
 static_assert(static_cast<int>(SimHunterController::GROUP_TRAVEL) ==
 		static_cast<int>(SimBotGrouping::PHASE_GROUP_TRAVEL), "group phase code drift: GROUP_TRAVEL");
+static_assert(static_cast<int>(SimHunterController::GROUP_BUFF) ==
+		static_cast<int>(SimBotGrouping::PHASE_GROUP_BUFF), "group phase code drift: GROUP_BUFF");
 static_assert(static_cast<int>(SimHunterController::EARLY_LEAVE_CITY) ==
 		static_cast<int>(SimBotGrouping::EARLY_LEAVE_CITY), "group early phase code drift: LEAVE_CITY");
 static_assert(static_cast<int>(SimHunterController::EARLY_SELECT_TARGET) ==
@@ -148,6 +151,7 @@ static String hunterPhaseName(SimHunterController::HuntPhase phase) {
 	case SimHunterController::GROUP_WAIT: return "GROUP_WAIT";
 	case SimHunterController::GROUP_FOLLOW: return "GROUP_FOLLOW";
 	case SimHunterController::GROUP_TRAVEL: return "GROUP_TRAVEL";
+	case SimHunterController::GROUP_BUFF: return "GROUP_BUFF";
 	default: return "UNKNOWN";
 	}
 }
@@ -242,6 +246,12 @@ SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 	pveBuffTripAtHub = false;
 	pveBuffTripReturning = false;
 	pveBuffTripsThisHunt = 0;
+	groupTravelRouteEpoch = 0;
+	groupTravelLegIntraPlanet = false;
+	groupBuffActive = false;
+	groupBuffDirectiveId = 0;
+	groupBuffProvidersPending = false;
+	groupRebuffCheckAtMs = 0;
 	pveBuffStagingActive = false;
 	pveBuffStagingStage = PVE_BUFF_APPROACH_NONE;
 	setLoggingName("SimHunterController");
@@ -333,11 +343,14 @@ bool SimHunterController::canBeginInterplanetaryTravel() const {
 
 void SimHunterController::onInterplanetaryTravelFinished(bool success,
 		const String& destZone, const String& reason) {
-	(void)reason;
 	SimPlayerManager* manager = SimPlayerManager::instance();
 	PlayerBotGroupRecord groupRecord;
 	if (manager != nullptr && manager->getPlayerBotGroupRecord(identityId,
 			groupRecord)) {
+		const uint64 capturedRouteEpoch = groupTravelRouteEpoch;
+		const bool capturedIntraPlanet = groupTravelLegIntraPlanet;
+		groupTravelRouteEpoch = 0;
+		groupTravelLegIntraPlanet = false;
 		if (groupRecord.state != PLAYER_BOT_GROUP_GROUPED) {
 			clearInterplanetaryTravelState();
 			return;
@@ -351,16 +364,29 @@ void SimHunterController::onInterplanetaryTravelFinished(bool success,
 		if (!success) {
 			manager->recordPlayerBotGroupingTravel(identityId, true,
 				"callback=failed");
-			manager->notePlayerBotGroupReplan(identityId,
-				groupRecord.generation, System::getMiliTime());
+			if (capturedIntraPlanet) {
+				manager->recordPlayerBotGroupingShuttleFailed(identityId,
+					"reason=" + reason);
+				manager->suppressPlayerBotGroupShuttle(identityId,
+					groupRecord.generation, capturedRouteEpoch);
+			} else
+				manager->notePlayerBotGroupReplan(identityId,
+					groupRecord.generation, System::getMiliTime());
 			setPhase(GROUP_TRAVEL);
 			scheduleActiveTick(500);
 			return;
 		}
 		if (!manager->advancePlayerBotGroupRoute(identityId,
-			groupRecord.generation)) {
+			groupRecord.generation, capturedRouteEpoch)) {
 			clearInterplanetaryTravelState();
+			scheduleActiveTick(100);
 			return;
+		}
+		if (capturedIntraPlanet) {
+			manager->recordPlayerBotGroupingShuttleEvent(identityId,
+				"board planet=" + destZone);
+			manager->recordPlayerBotGroupingShuttleFinished(identityId,
+				"planet=" + destZone);
 		}
 		setPhase(GROUP_TRAVEL);
 		scheduleActiveTick(500);
@@ -495,6 +521,7 @@ void SimHunterController::suspendRoutineForGroup(const String& reason) {
 	if (phase == BAZAAR_VISIT)
 		finishBazaarVisit("grouped", false);
 
+	cancelGroupBuff();
 	cancelPveDoctorRequest();
 	manager->releasePlayerBotDoctorBuffFee(identityId);
 	pveDoctorFeeReserved = false;
@@ -509,6 +536,8 @@ void SimHunterController::suspendRoutineForGroup(const String& reason) {
 	}
 	if (isInterplanetaryTravelActive())
 		clearInterplanetaryTravelState();
+	groupTravelRouteEpoch = 0;
+	groupTravelLegIntraPlanet = false;
 
 	setEarlyGameActiveFlag(false);
 	groupFallbackMoveActive.store(false, std::memory_order_release);
@@ -546,8 +575,11 @@ void SimHunterController::leaveGroupMode() {
 	activeTickGeneration.fetch_add(1, std::memory_order_acq_rel);
 	advanceWorkLoopGeneration("hunterGroupRelease");
 	groupFallbackMoveActive.store(false, std::memory_order_release);
+	cancelGroupBuff();
 	if (isInterplanetaryTravelActive())
 		clearInterplanetaryTravelState();
+	groupTravelRouteEpoch = 0;
+	groupTravelLegIntraPlanet = false;
 	clearHybridMovementOnCancellation();
 	dropTargetObserver();
 	disengageTarget(false);
@@ -560,6 +592,503 @@ bool SimHunterController::engageDefensiveTarget(AiAgent* hunter,
 		CreatureObject* attacker, const char* reason) {
 	(void)reason;
 	return defendAgainstInterceptor(hunter, attacker);
+}
+
+bool SimHunterController::startGroupTravelLeg(
+		const SimPlayerManager::SimTravelLeg& leg, uint64 routeEpoch,
+		String& travelResult) {
+	// Published before either start: a rejected start fires the finish
+	// callback synchronously, which classifies the failure from these fields.
+	groupTravelRouteEpoch = routeEpoch;
+	groupTravelLegIntraPlanet = !leg.interplanetary;
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (!leg.interplanetary && manager != nullptr &&
+			manager->consumePlayerBotParityGroupShuttleFailure(identityId)) {
+		travelResult = "harnessForced";
+		onInterplanetaryTravelFinished(false, leg.destPlanet, travelResult);
+		return false;
+	}
+	return leg.interplanetary ?
+		beginInterplanetaryTravel(leg.destPlanet, leg.departurePos,
+			leg.arrivalPos, leg.destCity, 0.f, travelResult) :
+		beginIntraPlanetShuttle(leg.departurePos, leg.arrivalPos,
+			leg.destCity, travelResult);
+}
+
+bool SimHunterController::driveGroupTravel(AiAgent* hunter, uint64 nowMs,
+		const PlayerBotGroupRecord& record,
+		const GroupTravelTarget& target, uint64 destinationKey,
+		const PlayerBotGroupingConfig& groupingConfig, bool& arrived) {
+	arrived = false;
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr || hunter == nullptr || target.planet.isEmpty()) {
+		setPhase(GROUP_WAIT);
+		scheduleActiveTick(1000);
+		return false;
+	}
+	const bool directivesEnabled = manager->isPlayerBotGroupDirectivesActive(
+		identityId);
+	if (phase == GROUP_TRAVEL && phaseStartedAtMs != 0 &&
+			nowMs - phaseStartedAtMs >= 900000) {
+		if (isInterplanetaryTravelActive())
+			clearInterplanetaryTravelState();
+		if (groupTravelLegIntraPlanet) {
+			manager->suppressPlayerBotGroupShuttle(identityId,
+				record.generation, groupTravelRouteEpoch);
+			manager->recordPlayerBotGroupingTravel(identityId, true,
+				"timeout=intra_planet_shuttle");
+		} else {
+			manager->notePlayerBotGroupReplan(identityId,
+				record.generation, nowMs);
+		}
+		groupTravelRouteEpoch = 0;
+		groupTravelLegIntraPlanet = false;
+		setPhase(GROUP_WAIT);
+		scheduleActiveTick(500);
+		return false;
+	}
+	if (isInterplanetaryTravelActive()) {
+		setPhase(GROUP_TRAVEL);
+		scheduleActiveTick(1000);
+		return false;
+	}
+
+	Zone* hunterZone = hunter->getZone();
+	const String hunterPlanet = hunterZone == nullptr ? String() :
+		hunterZone->getZoneName();
+	const Vector3 hunterPosition = hunter->getWorldPosition();
+	const bool samePlanet = hunterPlanet == target.planet;
+	const float distance = hunterPosition.distanceTo2d(target.position);
+	SimBotGrouping::FollowPolicy followPolicy;
+	followPolicy.followMinMeters = groupingConfig.followMinMeters;
+	followPolicy.followMaxMeters = groupingConfig.followMaxMeters;
+	followPolicy.repathMoveMeters = groupingConfig.repathMoveMeters;
+	followPolicy.routeDistanceMeters = groupingConfig.routeDistanceMeters;
+
+	if (samePlanet && distance <= target.arrivalMeters) {
+		arrived = true;
+		return true;
+	}
+
+	SimBotGrouping::TravelMode mode = SimBotGrouping::travelMode(samePlanet,
+		distance, target.indoors, followPolicy);
+	if (static_cast<int>(mode) != groupFollowEventMode ||
+			nowMs >= groupFollowEventAtMs + 10000) {
+		groupFollowEventMode = static_cast<int>(mode);
+		groupFollowEventAtMs = nowMs;
+		MissionDiagLog::event("GROUP_DIRECTIVE_MOVE", identityId,
+			"mode=" + String::valueOf(static_cast<int>(mode)) +
+			" dist=" + String::valueOf(distance) +
+			" arrive=" + String::valueOf(target.arrivalMeters) +
+			" botPlanet=" + hunterPlanet + " targetPlanet=" + target.planet +
+			" moveState=" + String::valueOf(static_cast<int>(state)) +
+			" held=" + String::valueOf(isMovementHeld()) +
+			" sincePathMs=" + String::valueOf(groupLastPathIssuedMs == 0 ? 0 :
+				nowMs - groupLastPathIssuedMs) +
+			" traversal=" + String::valueOf(isTraversalActive()) +
+			" botPos=" + String::valueOf((int)hunterPosition.getX()) + "," +
+				String::valueOf((int)hunterPosition.getY()) +
+			" targetPos=" + String::valueOf((int)target.position.getX()) + "," +
+				String::valueOf((int)target.position.getY()));
+	}
+	// A fixed point never comes closer by itself: inside the follow radius a
+	// directive target counts as reached. HOLD here once parked a bot 6-10 m
+	// from its rally slot for 24 minutes (verify 2026-10-20).
+	if (mode == SimBotGrouping::HOLD) {
+		arrived = true;
+		return true;
+	}
+
+	if (mode == SimBotGrouping::ROUTE) {
+		SimPlayerManager::PlayerBotGroupRoute route;
+		bool haveRoute = manager->getPlayerBotGroupRoute(identityId, route) &&
+			route.generation == record.generation &&
+			route.destPlanet == target.planet &&
+			route.destKey == destinationKey &&
+			route.legIndex < route.legs.size();
+		if (!haveRoute) {
+			if (!manager->planPlayerBotGroupRoute(identityId, hunterPlanet,
+					hunterPosition, target.planet, target.position, destinationKey,
+					directivesEnabled,
+					isInterplanetaryTravelActive())) {
+				// A same-planet route is optional. If its shuttle route is not
+				// useful or has been suppressed, the defined fallback is walking.
+				if (samePlanet)
+					mode = SimBotGrouping::WALK;
+				else {
+					setPhase(GROUP_WAIT);
+					scheduleActiveTick(2000);
+					return false;
+				}
+			} else {
+				manager->getPlayerBotGroupRoute(identityId, route);
+				haveRoute = route.generation == record.generation &&
+					route.destPlanet == target.planet &&
+					route.destKey == destinationKey &&
+					route.legIndex < route.legs.size();
+			}
+		}
+
+		if (mode == SimBotGrouping::ROUTE && !haveRoute) {
+			// The manager may have installed an exhausted route while the bot
+			// arrived at its city pad. Replanning once more gives the same-planet
+			// planner a chance to select WALK at the final approach.
+			if (samePlanet)
+				mode = SimBotGrouping::WALK;
+			else {
+				setPhase(GROUP_WAIT);
+				scheduleActiveTick(2000);
+				return false;
+			}
+		}
+
+		if (mode == SimBotGrouping::ROUTE && route.holdUntilMs != 0 &&
+				nowMs < route.holdUntilMs) {
+			setPhase(GROUP_WAIT);
+			if (!route.holdLinePosted && manager->claimPlayerBotGroupRouteHoldLine(
+					identityId, record.generation, nowMs))
+				manager->postPlayerBotGroupChat(record.groupOid, "PlayerBot",
+					"I'll wait at " + route.fromCity + ".");
+			const uint64 holdMs = route.holdUntilMs - nowMs;
+			scheduleActiveTick(static_cast<int>(holdMs < 250 ? 250 : holdMs));
+			return false;
+		}
+		if (mode == SimBotGrouping::ROUTE && route.holdUntilMs != 0) {
+			manager->clearPlayerBotGroupRouteHold(identityId,
+				record.generation, nowMs);
+			if (!manager->planPlayerBotGroupRoute(identityId, hunterPlanet,
+					hunterPosition, target.planet, target.position, destinationKey,
+					directivesEnabled,
+					isInterplanetaryTravelActive())) {
+				if (samePlanet)
+					mode = SimBotGrouping::WALK;
+				else {
+					setPhase(GROUP_WAIT);
+					scheduleActiveTick(2000);
+					return false;
+				}
+			} else {
+				manager->getPlayerBotGroupRoute(identityId, route);
+			}
+		}
+
+		if (mode == SimBotGrouping::ROUTE && route.legIndex < route.legs.size()) {
+			if (isInterplanetaryTravelActive()) {
+				setPhase(GROUP_TRAVEL);
+				scheduleActiveTick(1000);
+				return false;
+			}
+			const SimPlayerManager::SimTravelLeg& leg =
+				route.legs.get(route.legIndex);
+			String travelResult;
+			const bool started = startGroupTravelLeg(leg, route.routeEpoch,
+				travelResult);
+			if (!started) {
+				groupTravelRouteEpoch = 0;
+				groupTravelLegIntraPlanet = false;
+				manager->recordPlayerBotGroupingTravel(identityId, true,
+					"start_failed=" + travelResult);
+				scheduleActiveTick(500);
+				return false;
+			}
+			setPhase(GROUP_TRAVEL);
+			manager->recordPlayerBotGroupingTravel(identityId, false,
+				"from=" + route.fromCity + " to=" + leg.destCity);
+			if (!leg.interplanetary)
+				manager->recordPlayerBotGroupingShuttleStarted(identityId,
+					"from=" + route.fromCity + " to=" + leg.destCity);
+			manager->postPlayerBotGroupTravelLine(record.groupOid, route.fromCity);
+			scheduleActiveTick(1000);
+			return false;
+		}
+	}
+
+	setPhase(GROUP_TRAVEL);
+	groupFallbackMoveActive.store(false, std::memory_order_release);
+	// The G1 follow rule (tuto_0.9.16 section 2): the mover passes through IDLE
+	// between path nodes and moveTo() discards the in-flight path, so re-path
+	// only for a new or moved target, a real stall, or the first path.
+	const bool haveTarget = groupLastPathIssuedMs != 0;
+	const bool targetMoved = !haveTarget || target.position.distanceTo(
+		groupLastPathTarget) > followPolicy.repathMoveMeters;
+	const bool stalled = haveTarget && (state == IDLE || state == WAITING) &&
+		nowMs >= groupLastPathIssuedMs + 8000;
+	if (state == MOVING || state == CALCULATING_PATH ||
+			isTraversalActive() || isMovementHeld() ||
+			(!targetMoved && !stalled)) {
+		scheduleActiveTick(groupingConfig.followTickMs);
+		return false;
+	}
+	moveTo(target.position);
+	groupLastPathTarget = target.position;
+	groupLastPathIssuedMs = nowMs;
+	scheduleActiveTick(groupingConfig.followTickMs);
+	return false;
+}
+
+void SimHunterController::runGroupDirectiveTick(AiAgent* hunter,
+		uint64 nowMs, const PlayerBotGroupRecord& record,
+		const SimPlayerManager::PlayerBotGroupSnapshot& group,
+		const String& leaderPlanet,
+		const Vector3& leaderPosition, const String& hunterPlanet,
+		const Vector3& hunterPosition, Zone* hunterZone,
+		const PlayerBotGroupingConfig& groupingConfig) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	PlayerBotGroupDirective directive;
+	if (manager == nullptr || !manager->getPlayerBotGroupDirective(identityId,
+			directive) || directive.stage == SimBotGroupRally::DONE) {
+		setPhase(GROUP_FOLLOW);
+		scheduleActiveTick(100);
+		return;
+	}
+
+	if (directive.recordGeneration != record.generation ||
+			record.state != PLAYER_BOT_GROUP_GROUPED) {
+		scheduleActiveTick(1000);
+		return;
+	}
+
+	if (directive.stage == SimBotGroupRally::PLANNING) {
+		if (isInterplanetaryTravelActive()) {
+			setPhase(GROUP_TRAVEL);
+			scheduleActiveTick(1000);
+			return;
+		}
+		bool needsDoctor = false;
+		bool needsEntertainer = false;
+		computeBuffNeeds(needsDoctor, needsEntertainer);
+		manager->planPlayerBotGroupDirective(identityId,
+			directive.directiveId, hunterPlanet, hunterPosition, needsDoctor,
+			needsEntertainer);
+		scheduleActiveTick(100);
+		return;
+	}
+
+	if (directive.stage == SimBotGroupRally::BUFF_TRAVEL) {
+		GroupTravelTarget target;
+		target.planet = directive.buffPlanet;
+		target.position = directive.buffAnchor;
+		target.arrivalMeters = groupingConfig.followMaxMeters;
+		bool arrived = false;
+		driveGroupTravel(hunter, nowMs, record, target,
+			directive.directiveId, groupingConfig, arrived);
+		if (!arrived)
+			return;
+		manager->advancePlayerBotGroupDirective(identityId,
+			directive.directiveId, SimBotGroupRally::BUFF_TRAVEL,
+			SimBotGroupRally::BUFFING, "arrival");
+		setPhase(GROUP_WAIT);
+		scheduleActiveTick(100);
+		return;
+	}
+
+	if (directive.stage == SimBotGroupRally::BUFFING) {
+		if (groupBuffActive && groupBuffDirectiveId != directive.directiveId)
+			cancelGroupBuff();
+		if (!groupBuffActive) {
+			beginGroupBuff(directive);
+			return;
+		}
+		if (directive.stageStartedAtMs != 0 &&
+			nowMs >= directive.stageStartedAtMs +
+				static_cast<uint64>(groupingConfig.groupBuffTimeoutSeconds) * 1000ULL) {
+			cancelPveDoctorRequest();
+			pveDoctorFallbackNeeded = pveNeedDoctorBuff;
+			pveEntertainerFallbackNeeded = pveNeedEntertainerBuff;
+			finishPveBuffProviderFlow();
+			return;
+		}
+		if (phase != GROUP_BUFF) {
+			setPhase(GROUP_BUFF);
+			scheduleActiveTick(1000);
+			return;
+		}
+		if (groupBuffProvidersPending) {
+			PveBuffProviders providers;
+			if (!manager->resolvePveBuffProviders(directive.buffPlanet,
+					directive.buffCity, providers)) {
+				if (providers.pending) {
+					scheduleActiveTick(5000);
+					return;
+				}
+				groupBuffProvidersPending = false;
+				pveDoctorFallbackNeeded = pveNeedDoctorBuff;
+				pveEntertainerFallbackNeeded = pveNeedEntertainerBuff;
+				finishPveBuffProviderFlow();
+				return;
+			}
+			groupBuffProvidersPending = false;
+			pveBuffProviders = providers;
+			pveDoctorFallbackNeeded = pveNeedDoctorBuff &&
+				!providers.doctor.found;
+			pveEntertainerFallbackNeeded = pveNeedEntertainerBuff &&
+				(!providers.musician.found || !providers.dancer.found);
+			if (!moveToNextPveBuffProvider()) {
+				finishPveBuffProviderFlow();
+				return;
+			}
+			scheduleActiveTick(1000);
+			return;
+		}
+		const uint64 tickGenerationBefore =
+			activeTickGeneration.load(std::memory_order_acquire);
+		runBuffUpTick(hunter, nowMs);
+		if (activeTickGeneration.load(std::memory_order_acquire) ==
+				tickGenerationBefore)
+			scheduleActiveTick(1000);
+		return;
+	}
+
+	if (directive.stage == SimBotGroupRally::RALLY_TRAVEL) {
+		if (directive.place.kind == "leader") {
+			manager->clearPlayerBotGroupDirective(identityId,
+				directive.directiveId, "leader_target");
+			setPhase(GROUP_FOLLOW);
+			scheduleActiveTick(100);
+			return;
+		}
+		int botIndex = 0;
+		for (int i = 0; i < group.memberOids.size(); ++i) {
+			if (group.memberOids.get(i) == hunter->getObjectID()) {
+				botIndex = i;
+				break;
+			}
+		}
+		SimBotGroupRally::RallySlotPolicy slotPolicy;
+		slotPolicy.rallyMinMeters = groupingConfig.rallyMinMeters;
+		slotPolicy.rallyMaxMeters = groupingConfig.rallyMaxMeters;
+		GroupTravelTarget target;
+		target.planet = directive.place.planet;
+		target.position = SimBotGroupRally::rallySlot(identityId,
+			directive.place.point, botIndex, slotPolicy);
+		target.arrivalMeters = groupingConfig.rallyArriveMeters;
+		bool arrived = false;
+		driveGroupTravel(hunter, nowMs, record, target,
+			directive.directiveId, groupingConfig, arrived);
+		if (!arrived)
+			return;
+		manager->advancePlayerBotGroupDirective(identityId,
+			directive.directiveId, SimBotGroupRally::RALLY_TRAVEL,
+			SimBotGroupRally::RALLY_HOLD, "rally_arrival");
+		setPhase(GROUP_WAIT);
+		scheduleActiveTick(100);
+		return;
+	}
+
+	if (directive.stage == SimBotGroupRally::RALLY_HOLD) {
+		maybePostGroupRebuffNotice(hunter, record, hunterZone, nowMs,
+			groupingConfig);
+		int botIndex = 0;
+		for (int i = 0; i < group.memberOids.size(); ++i) {
+			if (group.memberOids.get(i) == hunter->getObjectID()) {
+				botIndex = i;
+				break;
+			}
+		}
+		SimBotGroupRally::RallySlotPolicy slotPolicy;
+		slotPolicy.rallyMinMeters = groupingConfig.rallyMinMeters;
+		slotPolicy.rallyMaxMeters = groupingConfig.rallyMaxMeters;
+		GroupTravelTarget target;
+		target.planet = directive.place.planet;
+		target.position = SimBotGroupRally::rallySlot(identityId,
+			directive.place.point, botIndex, slotPolicy);
+		target.arrivalMeters = groupingConfig.followMaxMeters;
+		bool arrived = false;
+		driveGroupTravel(hunter, nowMs, record, target,
+			directive.directiveId, groupingConfig, arrived);
+		if (!arrived)
+			return;
+		setPhase(GROUP_WAIT);
+
+		// The body is the truth: fallback and still-buffed bots hold buffs.
+		bool holdNeedsDoctor = false;
+		bool holdNeedsEntertainer = false;
+		if (!directive.readyLinePosted)
+			computeBuffNeeds(holdNeedsDoctor, holdNeedsEntertainer);
+		const bool hasBuffs = !holdNeedsDoctor && !holdNeedsEntertainer;
+		if (!directive.readyLinePosted && manager->claimPlayerBotGroupReadyLine(
+				identityId, directive.directiveId, hasBuffs)) {
+			const Vector<String>& lines = hasBuffs ? groupingConfig.readyLines :
+				groupingConfig.readyNoBuffsLines;
+			String line = lines.size() > 0 ? lines.get(System::random(
+				lines.size() - 1)) : (hasBuffs ? String("Buffed and ready") :
+				String("Here, ready when you are"));
+			const int delayRange = Math::max(0,
+				groupingConfig.readyLineDelayMaxSeconds -
+				groupingConfig.readyLineDelayMinSeconds);
+			const uint64 delaySeconds = static_cast<uint64>(
+				groupingConfig.readyLineDelayMinSeconds) +
+				(delayRange == 0 ? 0 : static_cast<uint64>(System::random(
+					delayRange)));
+			const uint64 groupId = record.groupOid;
+			const uint64 botIdentityId = identityId;
+			Core::getTaskManager()->scheduleTask([manager, groupId, botIdentityId,
+					line]() {
+				manager->postPlayerBotGroupReply(groupId, botIdentityId, line);
+			}, "PlayerBotGroupReadyLine", delaySeconds * 1000);
+		}
+
+		const SimBotGroupRally::HoldVerdict verdict =
+			SimBotGroupRally::judgeHoldRelease(
+				leaderPlanet == directive.place.planet,
+				leaderPlanet == directive.place.planet ? leaderPosition.distanceTo2d(
+					directive.place.point) : -1.f,
+				groupingConfig.rallyReleaseMeters, false,
+				directive.holdStartedAtMs, nowMs,
+				groupingConfig.rallyHoldMaxMinutes);
+		if (verdict.release) {
+			manager->recordPlayerBotGroupingHoldRelease(verdict.reason);
+			manager->clearPlayerBotGroupDirective(identityId,
+					directive.directiveId, verdict.reason);
+			setPhase(GROUP_FOLLOW);
+			scheduleActiveTick(100);
+			return;
+		}
+		scheduleActiveTick(Math::max(250, groupingConfig.followTickMs));
+		return;
+	}
+
+	scheduleActiveTick(1000);
+}
+
+void SimHunterController::maybePostGroupRebuffNotice(AiAgent* hunter,
+		const PlayerBotGroupRecord& record, Zone* hunterZone, uint64 nowMs,
+		const PlayerBotGroupingConfig& groupingConfig) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr || !manager->isPlayerBotGroupDirectivesActive(
+			identityId) || hunter == nullptr ||
+			groupingConfig.rebuffCheckSeconds <= 0 ||
+		(nowMs < groupRebuffCheckAtMs + static_cast<uint64>(
+			groupingConfig.rebuffCheckSeconds) * 1000ULL))
+		return;
+	groupRebuffCheckAtMs = nowMs;
+	auto* planetManager = hunterZone == nullptr ? nullptr :
+		hunterZone->getPlanetManager();
+	const Vector3 position = hunter->getWorldPosition();
+	const bool inCityRegion = planetManager != nullptr &&
+		planetManager->getCityRegionAt(position.getX(), position.getY()) != nullptr;
+	bool needsDoctor = false;
+	bool needsEntertainer = false;
+	computeBuffNeeds(needsDoctor, needsEntertainer);
+	if (!manager->stepPlayerBotRebuffVisit(identityId,
+		record.generation, inCityRegion, needsDoctor || needsEntertainer,
+		nowMs))
+		return;
+	const Vector<String>& lines = groupingConfig.buffsLowLines;
+	const String line = lines.size() > 0 ? lines.get(System::random(
+		lines.size() - 1)) : String("My buffs are running low");
+	const int delayRange = Math::max(0,
+		groupingConfig.ackLineDelayMaxSeconds -
+		groupingConfig.ackLineDelayMinSeconds);
+	const uint64 delaySeconds = static_cast<uint64>(
+		groupingConfig.ackLineDelayMinSeconds) +
+		(delayRange == 0 ? 0 : static_cast<uint64>(System::random(delayRange)));
+	const uint64 groupId = record.groupOid;
+	const uint64 botIdentityId = identityId;
+	Core::getTaskManager()->scheduleTask([manager, groupId, botIdentityId,
+			line]() {
+		manager->postPlayerBotGroupReply(groupId, botIdentityId, line);
+	}, "PlayerBotGroupRebuffNotice", delaySeconds * 1000);
 }
 
 void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
@@ -578,15 +1107,34 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 	}
 	if (!isGroupPhase())
 		suspendRoutineForGroup(hasRecord ? "GROUPED" : "GROUP_OFFER");
-	if (phase != GROUP_WAIT && phase != GROUP_FOLLOW && phase != GROUP_TRAVEL)
+	if (phase != GROUP_WAIT && phase != GROUP_FOLLOW && phase != GROUP_TRAVEL &&
+			phase != GROUP_BUFF)
 		setPhase(GROUP_WAIT);
 	groupFallbackMoveActive.store(false, std::memory_order_release);
+	PlayerBotGroupDirective earlyDirective;
+	const bool haveEarlyDirective = manager->getPlayerBotGroupDirective(
+		identityId, earlyDirective) && earlyDirective.stage !=
+		SimBotGroupRally::DONE;
+	if (groupBuffActive && (!haveEarlyDirective || earlyDirective.stage !=
+			SimBotGroupRally::BUFFING))
+		cancelGroupBuff();
 	if (phase == GROUP_TRAVEL && phaseStartedAtMs != 0 &&
+			(!haveEarlyDirective ||
+				!manager->isPlayerBotGroupDirectivesActive(identityId)) &&
 			nowMs - phaseStartedAtMs >= 900000) {
 		if (isInterplanetaryTravelActive())
 			clearInterplanetaryTravelState();
-		manager->notePlayerBotGroupReplan(identityId, record.generation,
-			nowMs);
+		if (groupTravelLegIntraPlanet) {
+			manager->suppressPlayerBotGroupShuttle(identityId,
+				record.generation, groupTravelRouteEpoch);
+			manager->recordPlayerBotGroupingTravel(identityId, true,
+				"timeout=intra_planet_shuttle");
+		} else {
+			manager->notePlayerBotGroupReplan(identityId, record.generation,
+				nowMs);
+		}
+		groupTravelRouteEpoch = 0;
+		groupTravelLegIntraPlanet = false;
 		setPhase(GROUP_WAIT);
 		scheduleActiveTick(500);
 		return;
@@ -752,10 +1300,22 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 	Vector3 hunterPosition = hunter->getWorldPosition();
 	SimBotGrouping::FollowPolicy followPolicy;
 	PlayerBotGroupingConfig groupingConfig = manager->getPlayerBotGroupingConfig();
+	const bool directivesEnabled = manager->isPlayerBotGroupDirectivesActive(
+		identityId);
 	followPolicy.followMinMeters = groupingConfig.followMinMeters;
 	followPolicy.followMaxMeters = groupingConfig.followMaxMeters;
 	followPolicy.repathMoveMeters = groupingConfig.repathMoveMeters;
 	followPolicy.routeDistanceMeters = groupingConfig.routeDistanceMeters;
+
+	PlayerBotGroupDirective directive;
+	if (directivesEnabled &&
+			manager->getPlayerBotGroupDirective(identityId, directive) &&
+			directive.stage != SimBotGroupRally::DONE) {
+		runGroupDirectiveTick(hunter, nowMs, record, group, leaderPlanet,
+			leaderPosition, hunterPlanet, hunterPosition, hunterZone,
+			groupingConfig);
+		return;
+	}
 
 	const float distance = hunterPosition.distanceTo2d(leaderPosition);
 	SimBotGrouping::TravelMode mode = SimBotGrouping::travelMode(
@@ -763,7 +1323,8 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 	// G1 amendment: the ticket-collector machine is interplanetary only
 	// (beginInterplanetaryTravel rejects alreadyOnPlanet), so on the same planet
 	// the bot runs overland like a mission leg. Intra-planet shuttles: G2.
-	if (mode == SimBotGrouping::ROUTE && hunterPlanet == leaderPlanet)
+	if (mode == SimBotGrouping::ROUTE && hunterPlanet == leaderPlanet &&
+			!directivesEnabled)
 		mode = SimBotGrouping::WALK;
 	if (static_cast<int>(mode) != groupFollowEventMode ||
 			nowMs >= groupFollowEventAtMs + 10000) {
@@ -792,6 +1353,8 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 	if (mode == SimBotGrouping::HOLD) {
 		setPhase(GROUP_WAIT);
 		groupFallbackMoveActive.store(false, std::memory_order_release);
+		maybePostGroupRebuffNotice(hunter, record, hunterZone, nowMs,
+			groupingConfig);
 		scheduleActiveTick(Math::max(250, groupingConfig.followTickMs));
 		return;
 	}
@@ -815,6 +1378,8 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 		}
 		setPhase(GROUP_FOLLOW);
 		groupFallbackMoveActive.store(false, std::memory_order_release);
+		maybePostGroupRebuffNotice(hunter, record, hunterZone, nowMs,
+			groupingConfig);
 		if (hunterPosition.distanceTo2d(exterior) > groupingConfig.followMaxMeters &&
 				(state != MOVING && state != CALCULATING_PATH)) {
 				const uint64 before = activeTickGeneration.load(std::memory_order_acquire);
@@ -822,6 +1387,8 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 				groupLastPathTarget = exterior;
 				groupLastPathIssuedMs = nowMs;
 				if (activeTickGeneration.load(std::memory_order_acquire) == before)
+					scheduleActiveTick(groupingConfig.followTickMs);
+				else if (directivesEnabled)
 					scheduleActiveTick(groupingConfig.followTickMs);
 			} else
 				scheduleActiveTick(groupingConfig.followTickMs);
@@ -833,24 +1400,40 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 		if (!manager->getPlayerBotGroupRoute(identityId, route) ||
 				route.generation != record.generation || route.legs.size() == 0) {
 			if (!manager->planPlayerBotGroupRoute(identityId, hunterPlanet,
-					hunterPosition, leaderPlanet, leaderPosition)) {
+					hunterPosition, leaderPlanet, leaderPosition, 0,
+					directivesEnabled,
+					isInterplanetaryTravelActive())) {
+				if (hunterPlanet == leaderPlanet) {
+					mode = SimBotGrouping::WALK;
+				} else {
 				setPhase(GROUP_WAIT);
-				scheduleActiveTick(2000);
-				return;
+					scheduleActiveTick(2000);
+					return;
+				}
 			}
-			manager->getPlayerBotGroupRoute(identityId, route);
+			if (mode == SimBotGrouping::ROUTE)
+				manager->getPlayerBotGroupRoute(identityId, route);
 		}
-		if (route.destPlanet != leaderPlanet ||
-				route.legIndex >= route.legs.size()) {
+		if (mode == SimBotGrouping::ROUTE && (route.destPlanet != leaderPlanet ||
+				route.destKey != 0 ||
+				route.legIndex >= route.legs.size())) {
 			if (!manager->planPlayerBotGroupRoute(identityId, hunterPlanet,
-					hunterPosition, leaderPlanet, leaderPosition)) {
+				hunterPosition, leaderPlanet, leaderPosition, 0,
+					directivesEnabled,
+					isInterplanetaryTravelActive())) {
+				if (hunterPlanet == leaderPlanet) {
+					mode = SimBotGrouping::WALK;
+				} else {
 				setPhase(GROUP_WAIT);
-				scheduleActiveTick(2000);
-				return;
+					scheduleActiveTick(2000);
+					return;
+				}
 			}
-			manager->getPlayerBotGroupRoute(identityId, route);
+			if (mode == SimBotGrouping::ROUTE)
+				manager->getPlayerBotGroupRoute(identityId, route);
 		}
-		if (route.holdUntilMs != 0 && nowMs < route.holdUntilMs) {
+		if (mode == SimBotGrouping::ROUTE && route.holdUntilMs != 0 &&
+				nowMs < route.holdUntilMs) {
 			setPhase(GROUP_WAIT);
 			if (!route.holdLinePosted && manager->claimPlayerBotGroupRouteHoldLine(
 					identityId, record.generation, nowMs))
@@ -860,18 +1443,25 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 			scheduleActiveTick(static_cast<int>(holdMs < 250 ? 250 : holdMs));
 			return;
 		}
-		if (route.holdUntilMs != 0) {
+		if (mode == SimBotGrouping::ROUTE && route.holdUntilMs != 0) {
 			manager->clearPlayerBotGroupRouteHold(identityId,
 				record.generation, nowMs);
 			if (!manager->planPlayerBotGroupRoute(identityId, hunterPlanet,
-					hunterPosition, leaderPlanet, leaderPosition)) {
+				hunterPosition, leaderPlanet, leaderPosition, 0,
+					directivesEnabled,
+					isInterplanetaryTravelActive())) {
+				if (hunterPlanet == leaderPlanet) {
+					mode = SimBotGrouping::WALK;
+				} else {
 				setPhase(GROUP_WAIT);
-				scheduleActiveTick(2000);
-				return;
+					scheduleActiveTick(2000);
+					return;
+				}
 			}
-			manager->getPlayerBotGroupRoute(identityId, route);
+			if (mode == SimBotGrouping::ROUTE)
+				manager->getPlayerBotGroupRoute(identityId, route);
 		}
-		if (route.legIndex < route.legs.size()) {
+		if (mode == SimBotGrouping::ROUTE && route.legIndex < route.legs.size()) {
 			if (isInterplanetaryTravelActive()) {
 				setPhase(GROUP_TRAVEL);
 				scheduleActiveTick(2000);
@@ -879,8 +1469,11 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 			}
 			const SimPlayerManager::SimTravelLeg& leg = route.legs.get(route.legIndex);
 			String travelResult;
-			if (!beginInterplanetaryTravel(leg.destPlanet, leg.departurePos,
-					leg.arrivalPos, leg.destCity, 0.f, travelResult)) {
+			const bool started = startGroupTravelLeg(leg, route.routeEpoch,
+				travelResult);
+			if (!started) {
+				groupTravelRouteEpoch = 0;
+				groupTravelLegIntraPlanet = false;
 				manager->recordPlayerBotGroupingTravel(identityId, true,
 					"start_failed=" + travelResult);
 				// beginInterplanetaryTravel invokes the grouped travel-finished
@@ -892,6 +1485,9 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 			setPhase(GROUP_TRAVEL);
 			manager->recordPlayerBotGroupingTravel(identityId, false,
 				"from=" + route.fromCity + " to=" + leg.destCity);
+			if (!leg.interplanetary)
+				manager->recordPlayerBotGroupingShuttleStarted(identityId,
+					"from=" + route.fromCity + " to=" + leg.destCity);
 			manager->postPlayerBotGroupTravelLine(record.groupOid, route.fromCity);
 			scheduleActiveTick(1000);
 			return;
@@ -921,6 +1517,8 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 		farFromSlot && nowMs >= groupLastPathIssuedMs + 8000;
 	const bool needPath = lowHam || (farFromSlot && (slotMoved || stalled));
 	groupFallbackMoveActive.store(lowHam, std::memory_order_release);
+	maybePostGroupRebuffNotice(hunter, record, hunterZone, nowMs,
+		groupingConfig);
 	// A WAITING mover is replaced only when it has stalled or when no follow
 	// path was ever issued (e.g. arriving from a cross-planet leg, which leaves
 	// the mover WAITING with the follow clock reset: final verify, 2026-10-20).
@@ -931,6 +1529,8 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 		groupLastPathTarget = slot;
 		groupLastPathIssuedMs = nowMs;
 		if (activeTickGeneration.load(std::memory_order_acquire) == before)
+			scheduleActiveTick(groupingConfig.followTickMs);
+			else if (directivesEnabled)
 			scheduleActiveTick(groupingConfig.followTickMs);
 	} else {
 		int cadence = groupingConfig.followTickMs;
@@ -1113,6 +1713,11 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 		scheduleActiveTick(100);
 		return;
 	}
+	// A release followed at once by a dispatch (verify 2026-10-20: the order
+	// landed in the same second) leaves the phase, so the next tick never sees
+	// a group phase to leave. An unfinished group buff ends here instead of
+	// walking providers on behalf of a group that no longer exists.
+	cancelGroupBuff();
 
 	// The manager uses the same scorer while building matchmaker candidates.
 	// Recheck at dispatch as well: an order can race a training tick and a
@@ -2098,6 +2703,11 @@ void SimHunterController::finishPveBuffProviderFlow() {
 		pveDoctorFeeReserved = false;
 	}
 
+	if (groupBuffActive) {
+		finishGroupBuff();
+		return;
+	}
+
 	// A hub provider flow is complete only after the hunter has a route back to
 	// the hunt planet. Keep this handoff outside the provider/agent locks; the
 	// manager owns the route record and the controller owns the next travel leg.
@@ -2208,6 +2818,10 @@ void SimHunterController::interactWithPveBuffProvider(
 
 	// onArrived holds no agent lock across this point. Keep strong references
 	// alive while PlayerManager takes its own creature/entertainer locks.
+	if (groupBuffActive) {
+		SimPlayerManager::instance()->recordPlayerBotGroupingBuffEvent(
+			identityId, "provider=" + String::valueOf(providerOid));
+	}
 	if (stage == PVE_BUFF_APPROACH_MUSICIAN) {
 		PlayerManager* playerManager = zoneServer->getPlayerManager();
 		if (playerManager == nullptr) {
@@ -2386,6 +3000,147 @@ void SimHunterController::resumeAfterBuffTrip() {
 		setPhase(TRAVEL_OUT);
 		moveTo(species.huntGround);
 	}
+}
+
+void SimHunterController::beginGroupBuff(
+		const PlayerBotGroupDirective& directive) {
+	groupBuffActive = true;
+	groupBuffDirectiveId = directive.directiveId;
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager != nullptr)
+		manager->recordPlayerBotGroupingBuffEvent(identityId,
+			"begin stage=BUFFING city=" + directive.buffCity);
+	if (manager == nullptr) {
+		pveNeedDoctorBuff = false;
+		pveNeedEntertainerBuff = false;
+		finishGroupBuff("fallback");
+		return;
+	}
+
+	bool needDoctor = false;
+	bool needEntertainer = false;
+	computeBuffNeeds(needDoctor, needEntertainer);
+	pveDoctorFeeReserved = false;
+	if (needDoctor) {
+		PlayerBotBuffFee feeState = manager->reservePlayerBotDoctorBuffFee(
+			identityId);
+		if (feeState == PLAYER_BOT_BUFF_FEE_UNAFFORDABLE)
+			needDoctor = false;
+		else if (feeState == PLAYER_BOT_BUFF_FEE_RESERVED)
+			pveDoctorFeeReserved = true;
+	}
+	pveNeedDoctorBuff = needDoctor;
+	pveNeedEntertainerBuff = needEntertainer;
+	pveDoctorFallbackNeeded = false;
+	pveEntertainerFallbackNeeded = false;
+	if (!needDoctor && !needEntertainer) {
+		finishGroupBuff("not_needed");
+		return;
+	}
+
+	pveBuffProviders = PveBuffProviders();
+	pveBuffApproachStage = PVE_BUFF_APPROACH_NONE;
+	pveBuffStagingActive = false;
+	pveBuffStagingStage = PVE_BUFF_APPROACH_NONE;
+	pveBuffProviderApproachActive = false;
+	pveBuffInteractionDwellActive = false;
+	pveDoctorRequestActive = false;
+	pveDoctorDeadlineSec = 0;
+	pveDoctorProviderObject = nullptr;
+	pveBuffTripAtHub = false;
+	pveBuffTripReturning = false;
+	groupBuffProvidersPending = false;
+	pveBuffProviderPlanet = directive.buffPlanet;
+	pveBuffProviderCity = directive.buffCity;
+
+	if (!manager->isPveRealBuffsEnabled() ||
+			directive.buffChoiceReason == "fallback") {
+		pveDoctorFallbackNeeded = needDoctor;
+		pveEntertainerFallbackNeeded = needEntertainer;
+		finishPveBuffProviderFlow();
+		return;
+	}
+
+	PveBuffProviders providers;
+	if (!manager->resolvePveBuffProviders(pveBuffProviderPlanet,
+			pveBuffProviderCity, providers)) {
+		if (providers.pending) {
+			groupBuffProvidersPending = true;
+			setPhase(GROUP_BUFF);
+			scheduleActiveTick(5000);
+			return;
+		}
+		pveDoctorFallbackNeeded = needDoctor;
+		pveEntertainerFallbackNeeded = needEntertainer;
+		finishPveBuffProviderFlow();
+		return;
+	}
+
+	pveBuffProviders = providers;
+	groupBuffProvidersPending = false;
+	pveDoctorFallbackNeeded = needDoctor && !providers.doctor.found;
+	pveEntertainerFallbackNeeded = needEntertainer &&
+		(!providers.musician.found || !providers.dancer.found);
+	setPhase(GROUP_BUFF);
+	if (moveToNextPveBuffProvider()) {
+		scheduleActiveTick(1000);
+		return;
+	}
+	finishPveBuffProviderFlow();
+}
+
+void SimHunterController::finishGroupBuff(const String& explicitOutcome) {
+	if (!groupBuffActive)
+		return;
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	String outcome = explicitOutcome;
+	if (outcome.isEmpty()) {
+		const bool doctorFallback = pveNeedDoctorBuff &&
+			pveDoctorFallbackNeeded;
+		const bool entertainerFallback = pveNeedEntertainerBuff &&
+			pveEntertainerFallbackNeeded;
+		if (!doctorFallback && !entertainerFallback)
+			outcome = "real";
+		else if (doctorFallback && entertainerFallback)
+			outcome = "fallback";
+		else
+			outcome = "partial";
+	}
+	const uint64 directiveId = groupBuffDirectiveId;
+	groupBuffActive = false;
+	groupBuffDirectiveId = 0;
+	groupBuffProvidersPending = false;
+	if (manager != nullptr)
+		manager->advancePlayerBotGroupDirective(identityId, directiveId,
+			SimBotGroupRally::BUFFING, SimBotGroupRally::RALLY_TRAVEL, outcome);
+	if (manager != nullptr) {
+		manager->recordPlayerBotGroupingBuffOutcome(outcome);
+		manager->recordPlayerBotGroupingBuffEvent(identityId,
+			"finish outcome=" + outcome);
+	}
+	setPhase(GROUP_WAIT);
+	scheduleActiveTick(100);
+}
+
+void SimHunterController::cancelGroupBuff() {
+	if (!groupBuffActive)
+		return;
+	groupBuffActive = false;
+	groupBuffDirectiveId = 0;
+	groupBuffProvidersPending = false;
+	cancelPveDoctorRequest();
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (pveDoctorFeeReserved && manager != nullptr)
+		manager->releasePlayerBotDoctorBuffFee(identityId);
+	pveDoctorFeeReserved = false;
+	pveBuffProviderApproachActive = false;
+	pveBuffInteractionDwellActive = false;
+	pveBuffStagingActive = false;
+	pveBuffApproachStage = PVE_BUFF_APPROACH_NONE;
+	pveBuffStagingStage = PVE_BUFF_APPROACH_NONE;
+	pveDoctorProviderObject = nullptr;
+	dwellUntilMs = 0;
+	clearHybridMovementOnCancellation();
 }
 
 void SimHunterController::beginBuffUp() {
@@ -3068,6 +3823,91 @@ SimHunterController::classifyLootWalkCallback() {
 	return LOOT_CALLBACK_NOT_LOOT;
 }
 
+bool SimHunterController::handleBuffProviderArrival() {
+	if (!pveBuffStagingActive && !pveBuffInteractionDwellActive &&
+			!pveBuffProviderApproachActive)
+		return false;
+
+	if (pveBuffStagingActive) {
+		pveBuffStagingActive = false;
+		if (enterPveBuffProviderCell(pveBuffStagingStage)) {
+			if (groupBuffActive)
+				scheduleActiveTick(1000);
+			return true;
+		}
+
+		if (pveBuffStagingStage == PVE_BUFF_APPROACH_DOCTOR)
+			pveDoctorFallbackNeeded = true;
+		else
+			pveEntertainerFallbackNeeded = true;
+		pveBuffProviderApproachActive = false;
+		if (moveToNextPveBuffProvider()) {
+			if (groupBuffActive)
+				scheduleActiveTick(1000);
+			return true;
+		}
+		finishPveBuffProviderFlow();
+		return true;
+	}
+
+	if (pveBuffInteractionDwellActive) {
+		pveBuffInteractionDwellActive = false;
+		bool needDoctor = false;
+		bool needEntertainer = false;
+		computeBuffNeeds(needDoctor, needEntertainer);
+		if (needEntertainer) {
+			pveEntertainerFallbackNeeded = true;
+		} else {
+			ManagedReference<AiAgent*> strongAgent = agent;
+			uint64 bodyOid = 0;
+			if (strongAgent != nullptr) {
+				Locker agentLock(strongAgent);
+				bodyOid = strongAgent->getObjectID();
+			}
+			SimPlayerManager::instance()->recordPveBuffSource(
+				bodyOid, "real-entertainer");
+		}
+		if (moveToNextPveBuffProvider()) {
+			if (groupBuffActive)
+				scheduleActiveTick(1000);
+			return true;
+		}
+		finishPveBuffProviderFlow();
+		return true;
+	}
+
+	if (pveBuffProviderApproachActive) {
+		PveBuffApproachStage providerStage = pveBuffApproachStage;
+		pveBuffProviderApproachActive = false;
+		interactWithPveBuffProvider(providerStage);
+		if (groupBuffActive && !pveBuffInteractionDwellActive &&
+				!pveDoctorRequestActive)
+			scheduleActiveTick(1000);
+		return true;
+	}
+
+	return false;
+}
+
+bool SimHunterController::handleBuffProviderPathFailed() {
+	if (!pveBuffProviderApproachActive)
+		return false;
+	PveBuffApproachStage providerStage = pveBuffApproachStage;
+	pveBuffProviderApproachActive = false;
+	pveBuffStagingActive = false;
+	if (providerStage == PVE_BUFF_APPROACH_DOCTOR)
+		pveDoctorFallbackNeeded = true;
+	else
+		pveEntertainerFallbackNeeded = true;
+	if (moveToNextPveBuffProvider()) {
+		if (groupBuffActive)
+			scheduleActiveTick(1000);
+		return true;
+	}
+	finishPveBuffProviderFlow();
+	return true;
+}
+
 void SimHunterController::onArrived() {
 	if (agent == nullptr)
 		return;
@@ -3118,61 +3958,14 @@ void SimHunterController::onArrived() {
 		scheduleActiveTick(0);
 		return;
 	}
+	if ((phase == BUFF_UP || groupBuffActive) &&
+			handleBuffProviderArrival())
+		return;
 	if (isGroupPhase()) {
 		scheduleActiveTick(100);
 		return;
 	}
 	if (phase == BUFF_UP) {
-		// F_0.7.5: arrival at the outdoor staging anchor. The provider approach
-		// is still active, so entering here hands the normal arrival path the
-		// same state it would have had from a direct entry.
-		if (pveBuffStagingActive) {
-			pveBuffStagingActive = false;
-			if (enterPveBuffProviderCell(pveBuffStagingStage))
-				return;
-
-			// The provider vanished between staging and entry.
-			if (pveBuffStagingStage == PVE_BUFF_APPROACH_DOCTOR)
-				pveDoctorFallbackNeeded = true;
-			else
-				pveEntertainerFallbackNeeded = true;
-			pveBuffProviderApproachActive = false;
-			if (moveToNextPveBuffProvider())
-				return;
-			finishPveBuffProviderFlow();
-			return;
-		}
-
-		if (pveBuffInteractionDwellActive) {
-			pveBuffInteractionDwellActive = false;
-			bool needDoctor = false;
-			bool needEntertainer = false;
-			computeBuffNeeds(needDoctor, needEntertainer);
-			if (needEntertainer) {
-				pveEntertainerFallbackNeeded = true;
-			} else {
-				ManagedReference<AiAgent*> strongAgent = agent;
-				uint64 bodyOid = 0;
-				if (strongAgent != nullptr) {
-					Locker agentLock(strongAgent);
-					bodyOid = strongAgent->getObjectID();
-				}
-				SimPlayerManager::instance()->recordPveBuffSource(
-					bodyOid, "real-entertainer");
-			}
-			if (moveToNextPveBuffProvider())
-				return;
-			finishPveBuffProviderFlow();
-			return;
-		}
-
-		if (pveBuffProviderApproachActive) {
-			PveBuffApproachStage providerStage = pveBuffApproachStage;
-			pveBuffProviderApproachActive = false;
-			interactWithPveBuffProvider(providerStage);
-			return;
-		}
-
 		if (SimPlayerManager::instance()->isPveRealBuffsEnabled())
 			return;
 
@@ -3349,6 +4142,9 @@ void SimHunterController::onPathFailed() {
 		finishBazaarVisit("pathFailed");
 		return;
 	}
+	if ((phase == BUFF_UP || groupBuffActive) &&
+			handleBuffProviderPathFailed())
+		return;
 	if (isGroupPhase()) {
 		groupLastPathTarget = Vector3();
 		scheduleActiveTick(100);
@@ -3357,20 +4153,6 @@ void SimHunterController::onPathFailed() {
 
 	if (!orderActive)
 		return;
-
-	if (phase == BUFF_UP && pveBuffProviderApproachActive) {
-		PveBuffApproachStage providerStage = pveBuffApproachStage;
-		pveBuffProviderApproachActive = false;
-		pveBuffStagingActive = false;
-		if (providerStage == PVE_BUFF_APPROACH_DOCTOR)
-			pveDoctorFallbackNeeded = true;
-		else
-			pveEntertainerFallbackNeeded = true;
-		if (moveToNextPveBuffProvider())
-			return;
-		finishPveBuffProviderFlow();
-		return;
-	}
 
 	if (phase == BUFF_TRIP) {
 		SimPlayerManager::PveBuffTrip trip;
@@ -5024,6 +5806,7 @@ void SimHunterController::runActiveTick() {
 		}
 		if (isStructureTraversalFeatureEnabled() && isTraversalActive())
 			clearStructureTraversalState("hunter_death");
+		cancelGroupBuff();
 		cancelPveDoctorRequest();
 		SimPlayerManager::instance()->releasePlayerBotDoctorBuffFee(identityId);
 		pveDoctorFeeReserved = false;
@@ -5070,6 +5853,8 @@ void SimHunterController::runActiveTick() {
 		leaveGroupMode();
 		return;
 	}
+	// Belt and braces for any other path that left a group phase first.
+	cancelGroupBuff();
 
 	// Planned novice bodies own the existing active tick while the early-game
 	// gate is on. This branch is deliberately before the legacy order idle path:

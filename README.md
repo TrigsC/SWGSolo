@@ -1,6 +1,6 @@
 # SWGEmu Core3: Recreating the Classic Star Wars Galaxies Experience
 
-**SWGSolo fork version: 0.9.16** (see `VERSION`, `docs/2-changelog/changelog_table.md`)
+**SWGSolo fork version: 0.9.17** (see `VERSION`, `docs/2-changelog/changelog_table.md`)
 
 ## What is SWGEmu?
 

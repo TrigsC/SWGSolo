@@ -34,6 +34,22 @@ into four owner-approved chunks:
 G1 precedes F_0.9.11; the profession allocator remains the next non-grouping chunk after the
 grouping line.
 
+## F_0.9.16 — Rally and buffs (P.10p G2)
+
+G2 is implemented behind the default-off `grouping.directivesEnabled` capability. Leader-only
+group chat directives resolve validated outdoor rally places and drive a manager-owned,
+generation-bound lifecycle through buff travel, the existing doctor/entertainer provider flow,
+rally travel, and a hold for the leader. The controller keeps the G1 follow path when the
+capability is off. Same-planet shuttle legs use route epochs and suppression on failure before
+falling back to the G1 walk rule.
+
+The grouping dashboard and inspect drawer expose directive stages and lifetime counters, and the
+mission diagnostic stream emits rate-limited `GROUP_DIRECTIVE`, `GROUP_BUFF`, and `GROUP_SHUTTLE`
+events. The disabled parity harness contains twelve G2 scenarios covering rally, buff-city choice,
+cross-planet travel, follow cancellation, unknown places, re-buff notices, gate isolation,
+death/rejoin, shuttle fallback, and a directive replacing an in-flight route. Live receipt and
+the owner real-client pass remain release gates before changing the capability line.
+
 ## 0. Mandate
 
 Owner decision 2026-09-02: this line is the **explicit economy-phase approval**

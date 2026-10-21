@@ -30,6 +30,8 @@ Vocabulary vocabulary() {
 	dwb.requireTemplateComplete = true;
 	result.tiers.push_back(dwb);
 	result.status = {"status", "where", "where are you", "eta"};
+	result.follow = {"follow", "follow me", "on me"};
+	result.ready = {"ready", "everyone ready", "ready up"};
 	result.leave = {"leave", "disband bots", "bye"};
 	return result;
 }
@@ -76,7 +78,7 @@ TEST(SimBotGrouping, AvailabilityCoversEveryHunterPhase) {
 	const int busyPhases[] = {PHASE_RELOCATING, PHASE_BUFF_TRIP,
 		PHASE_TRAVEL_OUT, PHASE_ACCEPT_MISSION, PHASE_TRAVEL_TO_MISSION,
 		PHASE_TRAVEL_TO_LAIR, PHASE_ENGAGING_LAIR, PHASE_AWAITING_WORLD,
-		PHASE_HUNTING, PHASE_RETREATING, PHASE_HEALING};
+		PHASE_HUNTING, PHASE_RETREATING, PHASE_HEALING, PHASE_GROUP_BUFF};
 	for (size_t i = 0; i < sizeof(busyPhases) / sizeof(busyPhases[0]); ++i)
 		EXPECT_EQ(classifyAvailability(busyPhases[i], EARLY_SELECT_TARGET, false,
 				false, false, false).cls, BUSY);
@@ -237,6 +239,15 @@ TEST(SimBotGrouping, ParsesGroupCommandsAndNames) {
 	command = parseGroupCommand("status", names, vocab);
 	EXPECT_EQ(command.command, GROUP_COMMAND_STATUS);
 	EXPECT_TRUE(command.all);
+
+	command = parseGroupCommand("follow me", names, vocab);
+	EXPECT_EQ(command.command, GROUP_COMMAND_FOLLOW);
+	command = parseGroupCommand("everyone ready", names, vocab);
+	EXPECT_EQ(command.command, GROUP_COMMAND_READY);
+	command = parseGroupCommand("follow me, status", names, vocab);
+	EXPECT_EQ(command.command, GROUP_COMMAND_FOLLOW);
+	command = parseGroupCommand("leave and follow", names, vocab);
+	EXPECT_EQ(command.command, GROUP_COMMAND_LEAVE);
 }
 
 TEST(SimBotGrouping, JudgesAssistRules) {

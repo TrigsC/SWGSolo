@@ -59,6 +59,8 @@ struct Vocabulary {
 	std::vector<GearRule> gear;
 	std::vector<TierRule> tiers;
 	std::vector<String> status;
+	std::vector<String> follow;
+	std::vector<String> ready;
 	std::vector<String> leave;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
@@ -122,7 +124,8 @@ enum HuntPhaseCode {
 	PHASE_BAZAAR_VISIT = 20,
 	PHASE_GROUP_WAIT = 21,
 	PHASE_GROUP_FOLLOW = 22,
-	PHASE_GROUP_TRAVEL = 23
+	PHASE_GROUP_TRAVEL = 23,
+	PHASE_GROUP_BUFF = 24
 };
 
 enum EarlyGamePhaseCode {
@@ -198,6 +201,7 @@ inline Availability classifyAvailability(int phaseCode, int earlyGamePhaseCode,
 	case PHASE_GROUP_WAIT:
 	case PHASE_GROUP_FOLLOW:
 	case PHASE_GROUP_TRAVEL:
+	case PHASE_GROUP_BUFF:
 		return {BUSY, "grouped"};
 	default:
 		return {BUSY, "unknown_phase"};
@@ -748,9 +752,13 @@ enum GroupCommandType {
 	NONE = 0,
 	STATUS,
 	LEAVE,
+	FOLLOW,
+	READY,
 	GROUP_COMMAND_NONE = NONE,
 	GROUP_COMMAND_STATUS = STATUS,
-	GROUP_COMMAND_LEAVE = LEAVE
+	GROUP_COMMAND_LEAVE = LEAVE,
+	GROUP_COMMAND_FOLLOW = FOLLOW,
+	GROUP_COMMAND_READY = READY
 };
 
 struct GroupCommand {
@@ -764,15 +772,19 @@ struct GroupCommand {
 
 inline GroupCommand parseGroupCommand(const String& text,
 		const std::vector<NamedBot>& botFirstNames,
-		const Vocabulary& vocabulary) {
+		const Vocabulary& vocabulary, bool scanNamesWhenUnrecognized = false) {
 	GroupCommand result;
 	const std::vector<String> tokens = tokenize(text);
 	String matched;
 	if (containsKeyword(tokens, vocabulary.leave, &matched))
 		result.command = GROUP_COMMAND_LEAVE;
+	else if (containsKeyword(tokens, vocabulary.follow, &matched))
+		result.command = GROUP_COMMAND_FOLLOW;
 	else if (containsKeyword(tokens, vocabulary.status, &matched))
 		result.command = GROUP_COMMAND_STATUS;
-	if (result.command == GROUP_COMMAND_NONE)
+	else if (containsKeyword(tokens, vocabulary.ready, &matched))
+		result.command = GROUP_COMMAND_READY;
+	if (result.command == GROUP_COMMAND_NONE && !scanNamesWhenUnrecognized)
 		return result;
 
 	for (size_t i = 0; i < botFirstNames.size(); ++i) {

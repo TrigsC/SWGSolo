@@ -964,6 +964,7 @@ SimPlayerController::SimPlayerController(AiAgent* aiAgent) {
     rePathAttempts = 0;
     runSpeed = 3.0f;
     interplanetaryTravelActive = false;
+    travelIntraPlanetHop = false;
     travelDestinationZone = "";
     travelDeparturePosition = Vector3(0, 0, 0);
     travelDestinationArrival = Vector3(0, 0, 0);
@@ -6411,6 +6412,7 @@ void SimPlayerController::setInterplanetaryTravelActive(bool active) {
 
 void SimPlayerController::clearInterplanetaryTravelState() {
 	setInterplanetaryTravelActive(false);
+    travelIntraPlanetHop = false;
     travelDestinationZone = "";
     travelDeparturePosition = Vector3(0, 0, 0);
     travelDestinationArrival = Vector3(0, 0, 0);
@@ -6487,6 +6489,25 @@ bool SimPlayerController::handleInterplanetaryTravelPathFailed() {
     TravelDiagLog::event("PATH_FAILED", agent == nullptr ? 0 :
         agent->getObjectID(), "phase=" + String::valueOf((int)ticketTravelPhase) +
         " attempts=" + String::valueOf(ticketApproachAttempts));
+
+    if (travelIntraPlanetHop) {
+        bool nearDeparture = false;
+        if (agent != nullptr) {
+            Locker agentLocker(agent);
+            nearDeparture = agent->getWorldPosition().distanceTo(
+                travelDeparturePosition) <= travelBoardRadius * 2.f;
+        }
+
+        if (nearDeparture) {
+            boardInterplanetaryShuttle("intraPlanetPathFailedNearPad");
+        } else {
+            String destZone = travelDestinationZone;
+            onInterplanetaryTravelFinished(false, destZone,
+                "intraPlanetPathFailed");
+            clearInterplanetaryTravelState();
+        }
+        return true;
+    }
 
     if (ticketTravelPhase == TICKET_ARRIVAL_REENTER ||
             ticketTravelPhase == TICKET_ARRIVAL_EGRESS) {
@@ -6771,6 +6792,85 @@ bool SimPlayerController::beginInterplanetaryTravel(
     return true;
 }
 
+bool SimPlayerController::beginIntraPlanetShuttle(
+        const Vector3& departurePos,
+        const Vector3& destArrivalPos,
+        const String& destCity,
+        String& travelResult) {
+    travelResult = "fallback";
+    // A rejected new-trip request is a terminal path for the request, not for
+    // an already-running journey. Keep the active journey visible to neither
+    // the policy callback nor any future derived controller.
+    auto notifyStartFailure = [this](const String& reason) {
+        bool wasActive = interplanetaryTravelActive;
+        setInterplanetaryTravelActive(false);
+        onInterplanetaryTravelFinished(false, travelDestinationZone, reason);
+        setInterplanetaryTravelActive(wasActive);
+    };
+
+    ManagedReference<AiAgent*> strongAgent = agent;
+
+    if (strongAgent == nullptr) {
+        travelResult = "controllerUnavailable";
+        notifyStartFailure(travelResult);
+        return false;
+    }
+
+    if (!canBeginInterplanetaryTravel()) {
+        travelResult = "controllerBusy";
+        notifyStartFailure(travelResult);
+        return false;
+    }
+
+    String currentZoneName;
+    String validationFailure;
+    {
+        Locker agentLocker(strongAgent);
+        Zone* zone = strongAgent->getZone();
+
+        if (zone == nullptr) {
+            travelResult = "missingZone";
+            validationFailure = travelResult;
+        } else if (strongAgent->isDead() || strongAgent->isIncapacitated() ||
+                strongAgent->isInCombat()) {
+            travelResult = "controllerStateNotSafe";
+            validationFailure = travelResult;
+        } else {
+            currentZoneName = zone->getZoneName();
+        }
+    }
+
+    if (!validationFailure.isEmpty()) {
+        notifyStartFailure(validationFailure);
+        return false;
+    }
+
+    // The flag is deliberately set only after every validation has passed.
+    travelIntraPlanetHop = true;
+    setInterplanetaryTravelActive(true);
+    travelDestinationZone = currentZoneName;
+    travelDeparturePosition = departurePos;
+    travelDestinationArrival = destArrivalPos;
+    travelDestinationStarport = destCity;
+    travelStartedAtMs = System::getMiliTime();
+    // An outdoor pad, not a collector: the legacy (pre-collector) board radius.
+    travelBoardRadius = 20.f;
+    ticketTravelPhase = TICKET_TRAVEL_NONE;
+    ticketCollectorFound = false;
+    ticketArrivalCollectorFound = false;
+    ticketCollectorWorld = Vector3(0, 0, 0);
+    ticketCollectorLocal = Vector3(0, 0, 0);
+    ticketCollectorCell = nullptr;
+    ticketCollectorOid = 0;
+    ticketArrivalOutdoor = destArrivalPos;
+    ticketApproachAttempts = 0;
+
+    travelResult = "traveling";
+    prepareForInterplanetaryTravelDeparture();
+    moveTo(departurePos);
+    return true;
+}
+
 void SimPlayerController::boardInterplanetaryShuttle(const String& reason) {
     TravelDiagLog::event("BOARD", agent == nullptr ? 0 : agent->getObjectID(),
         "reason=" + reason + " destZone=" + travelDestinationZone);
@@ -6801,7 +6901,8 @@ void SimPlayerController::boardInterplanetaryShuttle(const String& reason) {
     ticketArrivalCollectorFound = false;
 
     SimPlayerManager* manager = SimPlayerManager::instance();
-    if (manager != nullptr && manager->isTicketCollectorTravelEnabled()) {
+    if (!travelIntraPlanetHop && manager != nullptr &&
+            manager->isTicketCollectorTravelEnabled()) {
         ZoneServer* zoneServer = ServerCore::getZoneServer();
         Zone* destinationZone = zoneServer == nullptr ? nullptr :
             zoneServer->getZone(destZone);

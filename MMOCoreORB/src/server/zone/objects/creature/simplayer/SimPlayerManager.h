@@ -36,6 +36,7 @@
 #include "server/zone/objects/creature/simplayer/SimBotArmorLoadout.h"
 #include "server/zone/objects/creature/simplayer/SimBotConsumables.h"
 #include "server/zone/objects/creature/simplayer/SimBotGrouping.h"
+#include "server/zone/objects/creature/simplayer/SimBotGroupRally.h"
 #include "server/zone/objects/creature/simplayer/SimBotAppearance.h"
 
 using namespace server::zone;
@@ -149,6 +150,9 @@ struct SimBotPreparedArmorCopy {
 // Lua validation and the future room/controller work meet.
 struct PlayerBotGroupingConfig {
 	bool enabled = false;
+	// F_0.9.16 G2: capability gate. It is deliberately separate from the G1
+	// grouping master gate and ships disabled.
+	bool directivesEnabled = false;
 	String roomName = "LFB";
 	String roomTitle = "Looking For Bot: PlayerBots listen here";
 	int offerTtlSeconds = 180;
@@ -172,7 +176,23 @@ struct PlayerBotGroupingConfig {
 	int maxReplansPer10Min = 3;
 	float assistRadiusMeters = 40.f;
 	int leaderOfflineGraceSeconds = 120;
+	Vector<String> buffCities;
+	float rallyArriveMeters = 6.f;
+	float rallyMinMeters = 3.f;
+	float rallyMaxMeters = 8.f;
+	float rallyReleaseMeters = 30.f;
+	int rallyHoldMaxMinutes = 0;
+	float shuttleMinSavingsMeters = 1000.f;
+	int rebuffCheckSeconds = 30;
+	int rebuffVisitResetSeconds = 120;
+	int groupBuffTimeoutSeconds = 600;
+	int readyLineDelayMinSeconds = 2;
+	int readyLineDelayMaxSeconds = 6;
+	int ackLineDelayMinSeconds = 1;
+	int ackLineDelayMaxSeconds = 4;
 	SimBotGrouping::Vocabulary vocabulary;
+	SimBotGroupRally::RallyVocabulary rallyVocabulary;
+	std::vector<SimBotGroupRally::PlaceRule> rallyPlaces;
 	Vector<String> replyLines;
 	Vector<String> joinedLines;
 	Vector<String> declineLines;
@@ -180,6 +200,14 @@ struct PlayerBotGroupingConfig {
 	Vector<String> clonedLines;
 	Vector<String> followingLines;
 	Vector<String> leavingLines;
+	Vector<String> rallyAckLines;
+	Vector<String> buffAckLines;
+	Vector<String> readyLines;
+	Vector<String> readyNoBuffsLines;
+	Vector<String> alreadyBuffedLines;
+	Vector<String> unknownPlaceLines;
+	Vector<String> buffsLowLines;
+	Vector<String> followAckLines;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -222,6 +250,46 @@ struct PlayerBotGroupRecord {
 	int state = PLAYER_BOT_GROUP_GROUPED;
 	uint64 generation = 0;
 	uint64 leaderOfflineSinceMs = 0;
+	bool rebuffNotifiedThisVisit = false;
+	uint64 outsideCitySinceMs = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct RallyPlace {
+	String planet;
+	String cityName;
+	Vector3 point;
+	String kind;
+	String label;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotGroupDirective {
+	uint64 identityId = 0;
+	uint64 groupOid = 0;
+	uint64 recordGeneration = 0;
+	uint64 directiveId = 0;
+	SimBotGroupRally::DirectiveStage stage =
+		SimBotGroupRally::PLANNING;
+	bool wantBuffs = false;
+	String buffChoiceReason = "fallback";
+	String buffPlanet;
+	String buffCity;
+	Vector3 buffAnchor;
+	RallyPlace place;
+	uint64 issuedAtMs = 0;
+	uint64 stageStartedAtMs = 0;
+	uint64 holdStartedAtMs = 0;
+	bool readyLinePosted = false;
+	// What the body held when the hold began (the bot's computeBuffNeeds);
+	// status replies use it instead of guessing from buffOutcome.
+	bool holdHasBuffs = false;
+	bool ackPosted = false;
+	String buffOutcome;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -231,6 +299,27 @@ struct PlayerBotGroupingRateState {
 	uint64 cooldownUntilMs = 0;
 	uint64 replyWindowStartMs = 0;
 	int repliesThisWindow = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotGroupingDirectiveCounters {
+	uint64 issued = 0;
+	VectorMap<String, uint64> byKind;
+	uint64 unknownPlace = 0;
+	uint64 notLeader = 0;
+	uint64 followCleared = 0;
+	VectorMap<String, uint64> buffChoice;
+	VectorMap<String, uint64> buffOutcome;
+	VectorMap<String, uint64> holdReleased;
+	uint64 readyLines = 0;
+	uint64 rebuffNotices = 0;
+	uint64 shuttleStarted = 0;
+	uint64 shuttleFinished = 0;
+	uint64 shuttleFailed = 0;
+	uint64 shuttleSuppressed = 0;
+	uint64 routeEpochMismatch = 0;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -1061,6 +1150,7 @@ struct PlayerBotParityTestStep {
 	// the generic step so the Lua harness remains data-only.
 	String groupingText;
 	String groupingContains;
+	String groupingStage;
 	String groupingTarget;
 	String groupingFaction;
 	String groupingReason;
@@ -1072,11 +1162,15 @@ struct PlayerBotParityTestStep {
 	float groupingY = 0.f;
 	float groupingZ = 0.f;
 	bool groupingHasPosition = false;
+	// G2: target the scenario bot's resolved directive point instead of x/y.
+	bool groupingToDirective = false;
 	bool groupingFree = true;
 	int groupingChancePercent = 100;
 	int groupingWithinSeconds = 0;
 	int groupingExpectedCount = -1;
 	int groupingMinDelta = 0;
+	int groupingMaxDelta = -1;
+	int groupingMinTracked = 0;
 	bool groupingKillStarted = false;
 	uint64 groupingInitialBodyOid = 0;
 	uint64 groupingNoDamageCombatSinceMs = 0;
@@ -2036,11 +2130,14 @@ public:
 		String fromCity;
 		String destPlanet;
 		String destCity;
+		uint64 destKey = 0;
+		uint64 routeEpoch = 0;
 		uint64 generation = 0;
 		uint64 replanWindowStartMs = 0;
 		int replansInWindow = 0;
 		uint64 holdUntilMs = 0;
 		bool holdLinePosted = false;
+		uint64 shuttleSuppressedUntilMs = 0;
 
 		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -2902,6 +2999,7 @@ private:
 	Vector<PlayerBotGroupingKillXpObservation> playerBotGroupingRecentKillXp;
 	VectorMap<uint64, PlayerBotGroupOffer> playerBotGroupOffers;
 	VectorMap<uint64, PlayerBotGroupRecord> playerBotGroupRecords;
+	VectorMap<uint64, PlayerBotGroupDirective> playerBotGroupDirectives;
 	VectorMap<uint64, PlayerBotGroupRoute> playerBotGroupRoutes;
 	VectorMap<uint64, PlayerBotGroupingRateState> playerBotGroupingRate;
 	Vector<String> playerBotGroupingRecentUnmatched;
@@ -2909,6 +3007,8 @@ private:
 	int playerBotGroupingRepliesThisWindow = 0;
 	uint64 nextPlayerBotGroupingRequestId = 1;
 	uint64 nextPlayerBotGroupingGeneration = 1;
+	uint64 nextPlayerBotGroupingDirectiveId = 1;
+	uint64 nextPlayerBotGroupingRouteEpoch = 1;
 	AtomicLong playerBotGroupingRequestsSeen;
 	AtomicLong playerBotGroupingOffersCreated;
 	AtomicLong playerBotGroupingOffersExpired;
@@ -2934,6 +3034,12 @@ private:
 	VectorMap<String, uint64> playerBotGroupingAssistSkipped;
 	VectorMap<uint64, SimBotGrouping::Availability> playerBotGroupingAvailabilityOverrides;
 	VectorMap<uint64, int> playerBotGroupingAvailabilityChanceOverrides;
+	PlayerBotGroupingDirectiveCounters playerBotGroupingDirectiveCounters;
+	VectorMap<uint64, String> playerBotGroupingDirectiveClearReasons;
+	VectorMap<uint64, uint64> playerBotGroupingNextReplyAtMs;
+	VectorMap<uint64, uint64> playerBotGroupingDirectiveDiagAtMs;
+	VectorMap<uint64, uint64> playerBotGroupingBuffDiagAtMs;
+	VectorMap<uint64, uint64> playerBotGroupingShuttleDiagAtMs;
 	float progressionLoadoutMinUpgradePercent = 10.f;
 	int progressionLoadoutFullSweepMinutes = 30;
 	float progressionLoadoutUpgradeSpendFraction = 0.5f;
@@ -3316,6 +3422,8 @@ private:
 	// P.10 capability: progression master, harness override, configured flag.
 	bool playerBotParityTestGroupingGateOverrideActive = false;
 	bool playerBotParityTestGroupingGateOverride = false;
+	VectorMap<uint64, bool> playerBotParityDirectivesGateOverrides;
+	VectorMap<uint64, bool> playerBotParityForceGroupShuttleFailure;
 	bool playerBotParityTestMissionCreditGateOverrideActive = false;
 	bool playerBotParityTestMissionCreditGateOverride = false;
 	bool playerBotParityTestMissionCreditGateOverridePreviousActive = false;
@@ -3742,6 +3850,7 @@ private:
 
 	void applyPveConfig(LuaObject& pveConfig);
 	void applyPlayerBotProgressionConfig(LuaObject& config);
+	void validatePlayerBotRallyPlaces(PlayerBotGroupingConfig& config);
 	void buildTrainingPlansFromConfig(LuaObject& config);
 	bool computePlayerBotNextTrainingStepLocked(uint64 identityId,
 		const String& planName, const SimBotProgression& progression,
@@ -5509,12 +5618,39 @@ public:
 		const String& text);
 	void postPlayerBotGroupChat(uint64 groupId, const String& sender,
 		const String& text);
+	void postPlayerBotGroupReply(uint64 groupId, uint64 identityId,
+		const String& text);
 	void postPlayerBotGroupTravelLine(uint64 groupId, const String& city);
 	void recordPlayerBotGroupingAssist(uint64 identityId);
 	void recordPlayerBotGroupingAssistSkipped(uint64 identityId,
 		const String& reason);
 	void recordPlayerBotGroupingTravel(uint64 identityId, bool failed,
 		const String& detail = String());
+	bool isPlayerBotGroupDirectivesActive(uint64 identityId) const;
+	void recordPlayerBotGroupingBuffChoice(const String& choice);
+	void recordPlayerBotGroupingBuffOutcome(const String& outcome);
+	void recordPlayerBotGroupingHoldRelease(const String& reason);
+	void recordPlayerBotGroupingReadyLine(uint64 identityId);
+	void recordPlayerBotGroupingRebuffNotice(uint64 identityId);
+	void recordPlayerBotGroupingShuttleStarted(uint64 identityId,
+		const String& detail = String());
+	void recordPlayerBotGroupingShuttleFinished(uint64 identityId,
+		const String& detail = String());
+	void recordPlayerBotGroupingShuttleFailed(uint64 identityId,
+		const String& detail = String());
+	void recordPlayerBotGroupingShuttleSuppressed(uint64 identityId,
+		const String& detail = String());
+	void recordPlayerBotGroupingRouteEpochMismatch(uint64 identityId,
+		const String& detail = String());
+	void recordPlayerBotGroupingDirectiveEvent(uint64 identityId,
+		const String& detail);
+	void recordPlayerBotGroupingBuffEvent(uint64 identityId,
+		const String& detail);
+	void recordPlayerBotGroupingShuttleEvent(uint64 identityId,
+		const String& detail);
+	bool consumePlayerBotParityGroupShuttleFailure(uint64 identityId);
+	bool getPlayerBotGroupingDirectiveClearReason(uint64 identityId,
+		String& reason) const;
 	bool isPlayerBotGroupHarnessLeader(uint64 oid) const;
 	// Publishes DEAD_REJOIN before taking the body lock and leaving its stock
 	// group.  Controller teardown uses the same ordering as manager-owned body
@@ -5524,10 +5660,35 @@ public:
 	bool tryRejoinPlayerBotGroup(uint64 identityId, AiAgent* body);
 	bool getPlayerBotGroupRoute(uint64 identityId,
 		PlayerBotGroupRoute& route) const;
+	bool getPlayerBotGroupDirective(uint64 identityId,
+		PlayerBotGroupDirective& directive) const;
+	bool resolvePlayerBotRallyPlace(const SimBotGroupRally::DirectiveText& text,
+		const String& leaderPlanet, const Vector3& leaderPosition,
+		RallyPlace& out);
+	uint64 issuePlayerBotGroupDirective(uint64 identityId, uint64 groupOid,
+		uint64 recordGeneration, bool wantBuffs, const RallyPlace& place);
+	bool planPlayerBotGroupDirective(uint64 identityId, uint64 directiveId,
+		const String& botPlanet, const Vector3& botPosition,
+		bool needsDoctor, bool needsEntertainer);
+	bool advancePlayerBotGroupDirective(uint64 identityId, uint64 directiveId,
+		SimBotGroupRally::DirectiveStage fromStage,
+		SimBotGroupRally::DirectiveStage toStage,
+		const String& outcome = String());
+	bool clearPlayerBotGroupDirective(uint64 identityId, uint64 directiveId = 0,
+		const String& reason = String());
+	bool claimPlayerBotGroupReadyLine(uint64 identityId, uint64 directiveId,
+		bool hasBuffs);
+	bool stepPlayerBotRebuffVisit(uint64 identityId, uint64 recordGeneration,
+		bool inCityRegion, bool buffsLow, uint64 nowMs);
 	bool planPlayerBotGroupRoute(uint64 identityId, const String& botPlanet,
-		const Vector3& botPosition, const String& leaderPlanet,
-		const Vector3& leaderPosition);
-	bool advancePlayerBotGroupRoute(uint64 identityId, uint64 generation);
+		const Vector3& botPosition, const String& destPlanet,
+		const Vector3& destPosition, uint64 destKey, bool allowShuttle,
+		bool travelInFlight);
+	bool advancePlayerBotGroupRoute(uint64 identityId, uint64 generation,
+		uint64 routeEpoch);
+	bool invalidatePlayerBotGroupRoute(uint64 identityId, uint64 generation);
+	bool suppressPlayerBotGroupShuttle(uint64 identityId, uint64 generation,
+		uint64 routeEpoch);
 	bool notePlayerBotGroupReplan(uint64 identityId, uint64 generation,
 		uint64 nowMs);
 	bool claimPlayerBotGroupRouteHoldLine(uint64 identityId,

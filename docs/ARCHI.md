@@ -129,6 +129,7 @@ CMake options: `BUILD_IDL`, `COMPILE_TESTS`, `ENABLE_ASAN`/`TSAN`/`UBSAN`. Debug
 | F_0.9.13 (v0.9.14) | `armorLoadout`, `loadout.armor` (`minUpgradePercent`, `assumedArmorPiercing`, `damageTypeWeights`, `bodyRaces` `{body, race}` pairs, `bazaarUpgrades`, `upgradeSpendFraction`, `maxUpgradeLoadsPerVisit`, `bodyHamBaseline`) |
 | F_0.9.14 (v0.9.15) | `consumablesEnabled`, `consumables` (`bazaarRestock`, `minDoses` 10, `minRecheckSeconds`, `noDoseRetrySeconds`, `restockScanIntervalMinutes`, `maxRestockLoadsPerVisit`, `restockSpendFraction`, `items` = `{template, maxPricePerDose, minDoses?}`: Vasarian brandy, pikatta pie, crispic) |
 | F_0.9.15 (v0.9.16) | `groupingEnabled`, `grouping` (`roomName` LFB, offer TTL 180 s, `defaultReplies` 2, `maxRepliesCap`, reply delays/gap, `availabilityChancePercent`, request cooldown and room rate, `maxGroupedBots` 10, `maxBotsPerLeader` 9, join delay, `followMinMeters`/`followMaxMeters`, `repathMoveMeters` 3, `followTickMs` 750, `routeDistanceMeters`, `maxReplansPer10Min`, `assistRadiusMeters`, `leaderOfflineGraceSeconds`, `vocabulary` roles/gear/tiers/status/leave, `lines`) |
+| F_0.9.16 (v0.9.17) | `grouping.directivesEnabled` (false), `buffCities`, rally `rallyArriveMeters`/`Min`/`Max`/`ReleaseMeters`/`HoldMaxMinutes`, `shuttleMinSavingsMeters` 1000, `rebuffCheckSeconds`/`rebuffVisitResetSeconds`, `groupBuffTimeoutSeconds` 600, line delays, `vocabulary.follow`/`ready`/`rally` (buff, meet, landmarks), `places` (cities, outposts, custom x/y), rally `lines` |
 
 The sim layer alone restores roster PlayerBot weapon-template stats after shared AI weapon-stat
 setup; synthetic harness identities stay outside that path.
@@ -867,6 +868,23 @@ Layered on the stock `AiAgent`/`CreatureObject` hierarchy. Living design docs:
     `handleChatRoomMessage`; `/g` goes through `handleGroupChat`. Hook both.
   - **Live receipt:** 27/27 (`docs/4-unit-tests/live_f0915-*`): 77 harness scenarios plus the owner's
     real-client pass, which alone caught three defects.
+- **Rally and buffs (P.10p G2 / F_0.9.16, released v0.9.17)**: the leader directs grouped bots.
+  - **Parse once, decide on the bot.** `SimBotGroupRally.h` (on top of `SimBotGrouping.h`, one-way)
+    parses leader lines and places. The chat task only resolves the place and issues a directive in
+    `PLANNING`; the bot's own tick plans it from its live body (`computeBuffNeeds`, position), so a
+    dead bot never plans from its corpse and death resets the directive to `PLANNING`.
+  - **Reuse the buff flow behind a context flag.** `GROUP_BUFF` drives the solo provider helpers;
+    every group-versus-solo branch tests `groupBuffActive`, never the phase, because an order can
+    land in the same second as a release and move the phase first.
+  - **Versioned routes.** A route carries `destKey` and `routeEpoch`; a leg records the epoch before
+    it starts (a rejected start calls back synchronously) and advances only by compare-and-set, so an
+    old shuttle leg cannot advance a new route. Same-planet shuttles (`beginIntraPlanetShuttle`,
+    no collectors) are taken when they save 1 km; a failure suppresses them for 10 minutes and the
+    bot walks.
+  - **A fixed target has no "hold" band.** Within the follow radius of a rally slot the bot has
+    arrived; the follow-style HOLD once parked a bot there forever.
+  - **Live receipt:** owner-accepted evidence (`docs/4-unit-tests/live_f0916-*`): every G2 scenario
+    passed; 16 boots each halted on a different G1-harness/world flake.
 - **Simulation-only policy, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line
@@ -968,6 +986,11 @@ flowchart LR
 - **A harness that calls a manager entry point skips the client's path.** Grouping scenarios
   passed while the real client's Group tab never reached the bots. Player-facing features need a
   real-client pass.
+- **A teleported harness NPC keeps its leash.** After `switchZone` an AiAgent walks back to its
+  old home, and a `LEASHING` agent is not attackable (`AiAgentImplementation::isAttackableBy`): reset
+  `setHomeLocation` and the movement state after every harness teleport. Halting on the first
+  failure across a long matrix that borrows live bots makes one clean boot unlikely; keep receipt
+  runs scoped to the code a release touches.
 - **A harness kill must use `KillCommand` lock order**: killer locked, victim cross-locked. Locking
   only the victim made `notifyDestruction` spin cross-locking the destructor and hung the server
   (F_0.9.15, diagnosed from a GDB thread dump).

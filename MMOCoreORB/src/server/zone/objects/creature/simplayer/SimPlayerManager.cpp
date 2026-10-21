@@ -6411,6 +6411,8 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestRequestRefs.removeAll();
 		playerBotParityTestCounterBaselines.removeAll();
 		playerBotParityGroupHarnessLeaderOids.removeAll();
+		playerBotParityDirectivesGateOverrides.removeAll();
+		playerBotParityForceGroupShuttleFailure.removeAll();
 		playerBotParityGroupLeaderOid = 0;
 		playerBotParityGroupAttackerOids.removeAll();
 		playerBotParityGroupInitialBodyOids.removeAll();
@@ -7820,6 +7822,11 @@ void SimPlayerManager::loadLuaConfig() {
         }
     }
     shuttles.pop();
+
+	// G2 place-city validation is done after the shuttleport registry has been
+	// rebuilt (boot, before any reader task). Later refreshes validate the
+	// local copy inside applyPlayerBotProgressionConfig.
+	validatePlayerBotRallyPlaces(playerBotGroupingConfig);
 
 	// The board registry is keyed by routable shuttleport cities, but the
 	// PvE species table is parsed before shuttleports. Re-seed once the graph
@@ -11062,6 +11069,9 @@ static void loadGroupingRuleKeywords(LuaObject& rule,
 	configured.pop();
 }
 
+// Defined with the PvP route announcements; G2 rally lines reuse it.
+static String prettyPvpCityName(const String& name);
+
 static String replaceGroupingToken(String text, const String& token,
 		const String& replacement) {
 	if (token.isEmpty())
@@ -11081,6 +11091,37 @@ static String replaceGroupingToken(String text, const String& token,
 		index = text.indexOf(token, nextStart);
 	}
 	return text;
+}
+
+void SimPlayerManager::validatePlayerBotRallyPlaces(
+		PlayerBotGroupingConfig& config) {
+	std::vector<SimBotGroupRally::PlaceRule> validPlaces;
+	for (size_t i = 0; i < config.rallyPlaces.size(); ++i) {
+		const SimBotGroupRally::PlaceRule& place = config.rallyPlaces[i];
+		if (place.city.isEmpty()) {
+			validPlaces.push_back(place);
+			continue;
+		}
+		bool knownCity = false;
+		for (int cityIndex = 0; cityIndex < allShuttleports.size();
+				++cityIndex) {
+			const ShuttleportLocation& city = allShuttleports.get(cityIndex);
+			if (city.planet.toLowerCase() == place.planet &&
+					city.name.toLowerCase() == place.city) {
+				knownCity = true;
+				break;
+			}
+		}
+		if (knownCity) {
+			validPlaces.push_back(place);
+		} else {
+			info("SimBotRallyPlaceDropped key=" + place.key +
+				" planet=" + place.planet + " city=" + place.city +
+				" reason=unknown_city", true);
+		}
+	}
+	config.rallyPlaces = validPlaces;
+	config.rallyVocabulary.places = validPlaces;
 }
 
 void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
@@ -11401,6 +11442,8 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 	groupingConfig.enabled = configuredGroupingEnabled;
 	LuaObject grouping = config.getObjectField("grouping");
 	if (grouping.isValidTable()) {
+		groupingConfig.directivesEnabled = grouping.getBooleanField(
+			"directivesEnabled", groupingConfig.directivesEnabled);
 		groupingConfig.roomName = grouping.getStringField("roomName",
 				groupingConfig.roomName.toCharArray()).trim();
 		groupingConfig.roomTitle = grouping.getStringField("roomTitle",
@@ -11454,6 +11497,47 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		groupingConfig.leaderOfflineGraceSeconds = clampIntRange(
 			grouping.getIntField("leaderOfflineGraceSeconds",
 				groupingConfig.leaderOfflineGraceSeconds), 0, 86400);
+		groupingConfig.rallyArriveMeters = clampFloatRange(
+			grouping.getFloatField("rallyArriveMeters",
+				groupingConfig.rallyArriveMeters), 1.f, 256.f);
+		groupingConfig.rallyMinMeters = clampFloatRange(
+			grouping.getFloatField("rallyMinMeters",
+				groupingConfig.rallyMinMeters), 0.f, 256.f);
+		groupingConfig.rallyMaxMeters = clampFloatRange(
+			grouping.getFloatField("rallyMaxMeters",
+				groupingConfig.rallyMaxMeters), groupingConfig.rallyMinMeters,
+				256.f);
+		groupingConfig.rallyReleaseMeters = clampFloatRange(
+			grouping.getFloatField("rallyReleaseMeters",
+				groupingConfig.rallyReleaseMeters), 1.f, 1000.f);
+		groupingConfig.rallyHoldMaxMinutes = clampIntRange(
+			grouping.getIntField("rallyHoldMaxMinutes",
+				groupingConfig.rallyHoldMaxMinutes), 0, 1440);
+		groupingConfig.shuttleMinSavingsMeters = clampFloatRange(
+			grouping.getFloatField("shuttleMinSavingsMeters",
+				groupingConfig.shuttleMinSavingsMeters), 0.f, 1000000.f);
+		groupingConfig.rebuffCheckSeconds = clampIntRange(
+			grouping.getIntField("rebuffCheckSeconds",
+				groupingConfig.rebuffCheckSeconds), 1, 86400);
+		groupingConfig.rebuffVisitResetSeconds = clampIntRange(
+			grouping.getIntField("rebuffVisitResetSeconds",
+				groupingConfig.rebuffVisitResetSeconds), 1, 86400);
+		groupingConfig.groupBuffTimeoutSeconds = clampIntRange(
+			grouping.getIntField("groupBuffTimeoutSeconds",
+				groupingConfig.groupBuffTimeoutSeconds), 1, 86400);
+		groupingConfig.minReplyGapSeconds = clampIntRange(
+			grouping.getIntField("minReplyGapSeconds",
+				groupingConfig.minReplyGapSeconds), 0, 86400);
+
+		std::vector<String> configuredBuffCities;
+		loadGroupingStringList(grouping, "buffCities", configuredBuffCities);
+		groupingConfig.buffCities.removeAll();
+		for (size_t i = 0; i < configuredBuffCities.size(); ++i)
+			groupingConfig.buffCities.add(configuredBuffCities[i]);
+		if (groupingConfig.buffCities.size() == 0) {
+			for (int i = 0; i < pveRealBuffHubKeys.size(); ++i)
+				groupingConfig.buffCities.add(pveRealBuffHubKeys.get(i));
+		}
 
 		LuaObject replyDelay = grouping.getObjectField("replyDelaySeconds");
 		if (replyDelay.isValidTable()) {
@@ -11466,9 +11550,6 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 					groupingConfig.replyDelayMinSeconds, 86400);
 		}
 		replyDelay.pop();
-		groupingConfig.minReplyGapSeconds = clampIntRange(
-			grouping.getIntField("minReplyGapSeconds",
-				groupingConfig.minReplyGapSeconds), 0, 86400);
 
 		LuaObject joinDelay = grouping.getObjectField("joinDelaySeconds");
 		if (joinDelay.isValidTable()) {
@@ -11482,6 +11563,32 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		}
 		joinDelay.pop();
 
+		LuaObject readyLineDelay = grouping.getObjectField(
+			"readyLineDelaySeconds");
+		if (readyLineDelay.isValidTable()) {
+			groupingConfig.readyLineDelayMinSeconds = clampIntRange(
+				readyLineDelay.getIntField("min",
+					groupingConfig.readyLineDelayMinSeconds), 0, 86400);
+			groupingConfig.readyLineDelayMaxSeconds = clampIntRange(
+				readyLineDelay.getIntField("max",
+					groupingConfig.readyLineDelayMaxSeconds),
+					groupingConfig.readyLineDelayMinSeconds, 86400);
+		}
+		readyLineDelay.pop();
+
+		LuaObject ackLineDelay = grouping.getObjectField(
+			"ackLineDelaySeconds");
+		if (ackLineDelay.isValidTable()) {
+			groupingConfig.ackLineDelayMinSeconds = clampIntRange(
+				ackLineDelay.getIntField("min",
+					groupingConfig.ackLineDelayMinSeconds), 0, 86400);
+			groupingConfig.ackLineDelayMaxSeconds = clampIntRange(
+				ackLineDelay.getIntField("max",
+					groupingConfig.ackLineDelayMaxSeconds),
+					groupingConfig.ackLineDelayMinSeconds, 86400);
+		}
+		ackLineDelay.pop();
+
 		LuaObject vocabulary = grouping.getObjectField("vocabulary");
 		if (vocabulary.isValidTable()) {
 			loadGroupingStringList(vocabulary, "requestPhrases",
@@ -11492,8 +11599,37 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 					groupingConfig.vocabulary.numberWords);
 			loadGroupingStringList(vocabulary, "status",
 					groupingConfig.vocabulary.status);
+			loadGroupingStringList(vocabulary, "follow",
+					groupingConfig.vocabulary.follow);
+			loadGroupingStringList(vocabulary, "ready",
+					groupingConfig.vocabulary.ready);
 			loadGroupingStringList(vocabulary, "leave",
 					groupingConfig.vocabulary.leave);
+
+			LuaObject rallyVocabulary = vocabulary.getObjectField("rally");
+			if (rallyVocabulary.isValidTable()) {
+				loadGroupingStringList(rallyVocabulary, "buff",
+						groupingConfig.rallyVocabulary.buff);
+				loadGroupingStringList(rallyVocabulary, "meet",
+						groupingConfig.rallyVocabulary.meet);
+				LuaObject landmarks = rallyVocabulary.getObjectField("landmarks");
+				if (landmarks.isValidTable()) {
+					groupingConfig.rallyVocabulary.landmarks.clear();
+					for (int i = 1; i <= landmarks.getTableSize(); ++i) {
+						LuaObject landmark = landmarks.getObjectAt(i);
+						if (landmark.isValidTable()) {
+							SimBotGroupRally::LandmarkRule parsed;
+							parsed.kind = landmark.getStringField("kind").trim().toLowerCase();
+							loadGroupingRuleKeywords(landmark, parsed.keywords);
+							if (!parsed.kind.isEmpty() && !parsed.keywords.empty())
+								groupingConfig.rallyVocabulary.landmarks.push_back(parsed);
+						}
+						landmark.pop();
+					}
+				}
+				landmarks.pop();
+			}
+			rallyVocabulary.pop();
 
 			LuaObject roles = vocabulary.getObjectField("roles");
 			if (roles.isValidTable()) {
@@ -11567,6 +11703,39 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		}
 		vocabulary.pop();
 
+		LuaObject places = grouping.getObjectField("places");
+		if (places.isValidTable()) {
+			groupingConfig.rallyPlaces.clear();
+			for (int i = 1; i <= places.getTableSize(); ++i) {
+				LuaObject place = places.getObjectAt(i);
+				if (place.isValidTable()) {
+					SimBotGroupRally::PlaceRule parsed;
+					parsed.key = place.getStringField("key").trim().toLowerCase();
+					parsed.planet = place.getStringField("planet").trim().toLowerCase();
+					parsed.city = place.getStringField("city").trim().toLowerCase();
+					const float xAbsent = place.getFloatField("x", 0.f);
+					const float xPresent = place.getFloatField("x", 1.f);
+					const float yAbsent = place.getFloatField("y", 0.f);
+					const float yPresent = place.getFloatField("y", 1.f);
+					parsed.hasPoint = xAbsent == xPresent && yAbsent == yPresent;
+					parsed.x = place.getFloatField("x", 0.f);
+					parsed.y = place.getFloatField("y", 0.f);
+					loadGroupingStringList(place, "aliases", parsed.aliases);
+					if (parsed.key.isEmpty() || parsed.planet.isEmpty() ||
+							(parsed.city.isEmpty() && !parsed.hasPoint) ||
+							(!parsed.city.isEmpty() && parsed.hasPoint)) {
+						warning("SimBotRallyPlaceRejected key=" + parsed.key +
+							" reason=invalid_city_or_point");
+					} else {
+						groupingConfig.rallyPlaces.push_back(parsed);
+					}
+				}
+				place.pop();
+			}
+		}
+		places.pop();
+		groupingConfig.rallyVocabulary.places = groupingConfig.rallyPlaces;
+
 		LuaObject lines = grouping.getObjectField("lines");
 		if (lines.isValidTable()) {
 			loadGroupingEngineStringList(lines, "reply",
@@ -11583,6 +11752,22 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 					groupingConfig.followingLines);
 			loadGroupingEngineStringList(lines, "leaving",
 					groupingConfig.leavingLines);
+			loadGroupingEngineStringList(lines, "rallyAck",
+					groupingConfig.rallyAckLines);
+			loadGroupingEngineStringList(lines, "buffAck",
+					groupingConfig.buffAckLines);
+			loadGroupingEngineStringList(lines, "ready",
+					groupingConfig.readyLines);
+			loadGroupingEngineStringList(lines, "readyNoBuffs",
+					groupingConfig.readyNoBuffsLines);
+			loadGroupingEngineStringList(lines, "alreadyBuffed",
+					groupingConfig.alreadyBuffedLines);
+			loadGroupingEngineStringList(lines, "unknownPlace",
+					groupingConfig.unknownPlaceLines);
+			loadGroupingEngineStringList(lines, "buffsLow",
+					groupingConfig.buffsLowLines);
+			loadGroupingEngineStringList(lines, "followAck",
+					groupingConfig.followAckLines);
 		}
 		lines.pop();
 	}
@@ -11595,6 +11780,10 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		groupingConfig.replyLines.add("Invite {name}");
 	progressionGroupingEnabled = configuredGroupingEnabled;
 	groupingConfig.enabled = progressionGroupingEnabled;
+	// Validated on the local copy so readers never see a second reassignment.
+	// Before the first shuttleport load loadLuaConfig validates instead.
+	if (allShuttleports.size() > 0)
+		validatePlayerBotRallyPlaces(groupingConfig);
 	playerBotGroupingConfig = groupingConfig;
 	playerBotGroupingActive.store(playerBotGroupingGateEnabled(),
 			std::memory_order_release);
@@ -11947,6 +12136,7 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.planet = table.getStringField("planet").trim();
 	step.groupingText = table.getStringField("text").trim();
 	step.groupingContains = table.getStringField("contains").trim();
+	step.groupingStage = table.getStringField("stage").trim();
 	step.groupingTarget = table.getStringField("target").trim();
 	step.groupingFaction = table.getStringField("faction").trim().toLowerCase();
 	step.groupingReason = table.getStringField("reason").trim().toLowerCase();
@@ -11959,6 +12149,7 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.groupingHasPosition = table.getFloatField("x", 0.f) != 0.f ||
 		table.getFloatField("y", 0.f) != 0.f ||
 		table.getFloatField("z", 0.f) != 0.f;
+	step.groupingToDirective = table.getBooleanField("toDirective", false);
 	step.groupingFree = table.getBooleanField("free", true);
 	step.groupingChancePercent = clampMinerInt(
 		table.getIntField("chance", 100), 0, 0, 100);
@@ -11968,6 +12159,11 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.groupingExpectedCount = table.getIntField("count", -1);
 	step.groupingMinDelta = clampMinerInt(
 		table.getIntField("minDelta", 0), 0, 0, 1000000);
+	step.groupingMaxDelta = table.getIntField("maxDelta", -1);
+	if (step.groupingMaxDelta < -1)
+		step.groupingMaxDelta = -1;
+	step.groupingMinTracked = clampMinerInt(
+		table.getIntField("minTracked", 0), 0, 0, 32);
 	step.ownerIsBag = table.getBooleanField("ownerIsBag", false);
 	step.hasOwnerIsBag = step.ownerIsBag ==
 		table.getBooleanField("ownerIsBag", true);
@@ -12269,6 +12465,8 @@ void SimPlayerManager::initializePlayerBotParityTestResults() {
 	playerBotParityTestPendingRequestId = 0;
 	playerBotParityTestIdentityRefs.removeAll();
 	playerBotParityGroupHarnessLeaderOids.removeAll();
+	playerBotParityDirectivesGateOverrides.removeAll();
+	playerBotParityForceGroupShuttleFailure.removeAll();
 	playerBotParityGroupLeaderOid = 0;
 	playerBotParityGroupAttackerOid = 0;
 	playerBotParityGroupAttackerOids.removeAll();
@@ -17835,6 +18033,36 @@ bool SimPlayerManager::playerBotGroupingGateEnabled() {
 	return progressionGroupingEnabled;
 }
 
+bool SimPlayerManager::isPlayerBotGroupDirectivesActive(uint64 identityId) const {
+	if (!playerBotGroupingActive.load(std::memory_order_acquire))
+		return false;
+	Locker parityLock(const_cast<Mutex*>(&playerBotParityTestMutex));
+	if (identityId != 0 && playerBotParityDirectivesGateOverrides.contains(
+			identityId))
+		return playerBotParityDirectivesGateOverrides.get(identityId);
+	return playerBotGroupingConfig.directivesEnabled;
+}
+
+static const char* playerBotGroupingDirectiveStageName(
+		SimBotGroupRally::DirectiveStage stage) {
+	switch (stage) {
+	case SimBotGroupRally::PLANNING: return "PLANNING";
+	case SimBotGroupRally::BUFF_TRAVEL: return "BUFF_TRAVEL";
+	case SimBotGroupRally::BUFFING: return "BUFFING";
+	case SimBotGroupRally::RALLY_TRAVEL: return "RALLY_TRAVEL";
+	case SimBotGroupRally::RALLY_HOLD: return "RALLY_HOLD";
+	case SimBotGroupRally::DONE: return "DONE";
+	default: return "UNKNOWN";
+	}
+}
+
+static void incrementPlayerBotGroupingCounter(VectorMap<String, uint64>& map,
+		const String& key) {
+	if (key.isEmpty())
+		return;
+	map.put(key, map.contains(key) ? map.get(key) + 1 : 1);
+}
+
 bool SimPlayerManager::isPlayerBotGroupingReserved(uint64 identityId) {
 	if (identityId == 0)
 		return false;
@@ -21928,6 +22156,15 @@ bool SimPlayerManager::spawnPlayerBotParityKillTarget(
 	}
 
 	target->setDespawnOnNoPlayerInRange(false);
+	// Optional deep pools (amount > 0): a fight the bot wins before the target
+	// lands a hit proves nothing for armor mitigation (armor_mitigation_live).
+	if (step.amount > 0) {
+		Locker targetLock(target);
+		for (int pool = 0; pool < 9; pool += 3) {
+			target->setMaxHAM(pool, static_cast<int>(step.amount), false);
+			target->setHAM(pool, static_cast<int>(step.amount), false);
+		}
+	}
 	int baseXp = target->getBaseXp();
 	String xpType;
 	{
@@ -22869,6 +23106,84 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 		return playerBotGroupingOffersExpired.get();
 	if (key == "grouping.repliesposted" || key == "repliesposted")
 		return playerBotGroupingRepliesPosted.get();
+	if (key == "grouping.groupchatunhandled" || key == "groupchatunhandled")
+		return playerBotGroupingGroupChatUnhandled.get();
+	if (key == "grouping.directives.issued" || key == "directives.issued") {
+		Locker groupingLock(&groupingMutex);
+		return playerBotGroupingDirectiveCounters.issued;
+	}
+	if (key == "grouping.directives.unknownplace" ||
+			key == "directives.unknownplace") {
+		Locker groupingLock(&groupingMutex);
+		return playerBotGroupingDirectiveCounters.unknownPlace;
+	}
+	if (key == "grouping.directives.notleader" || key == "directives.notleader") {
+		Locker groupingLock(&groupingMutex);
+		return playerBotGroupingDirectiveCounters.notLeader;
+	}
+	if (key == "grouping.directives.followcleared" ||
+			key == "directives.followcleared") {
+		Locker groupingLock(&groupingMutex);
+		return playerBotGroupingDirectiveCounters.followCleared;
+	}
+	if (key == "grouping.directives.readylines" || key == "directives.readylines") {
+		Locker groupingLock(&groupingMutex);
+		return playerBotGroupingDirectiveCounters.readyLines;
+	}
+	if (key == "grouping.directives.rebuffnotices" ||
+			key == "directives.rebuffnotices") {
+		Locker groupingLock(&groupingMutex);
+		return playerBotGroupingDirectiveCounters.rebuffNotices;
+	}
+	if (key == "grouping.directives.shuttlelegs.started" ||
+			key == "directives.shuttlelegs.started") {
+		Locker groupingLock(&groupingMutex);
+		return playerBotGroupingDirectiveCounters.shuttleStarted;
+	}
+	if (key == "grouping.directives.shuttlelegs.finished" ||
+			key == "directives.shuttlelegs.finished") {
+		Locker groupingLock(&groupingMutex);
+		return playerBotGroupingDirectiveCounters.shuttleFinished;
+	}
+	if (key == "grouping.directives.shuttlelegs.failed" ||
+			key == "directives.shuttlelegs.failed") {
+		Locker groupingLock(&groupingMutex);
+		return playerBotGroupingDirectiveCounters.shuttleFailed;
+	}
+	if (key == "grouping.directives.shuttlesuppressed" ||
+			key == "directives.shuttlesuppressed") {
+		Locker groupingLock(&groupingMutex);
+		return playerBotGroupingDirectiveCounters.shuttleSuppressed;
+	}
+	if (key == "grouping.directives.routeepochmismatch" ||
+			key == "directives.routeepochmismatch") {
+		Locker groupingLock(&groupingMutex);
+		return playerBotGroupingDirectiveCounters.routeEpochMismatch;
+	}
+	const String directiveMapPrefixes[] = {
+		"grouping.directives.bykind.", "directives.bykind.",
+		"grouping.directives.buffchoice.", "directives.buffchoice.",
+		"grouping.directives.buffoutcome.", "directives.buffoutcome.",
+		"grouping.directives.holdreleased.", "directives.holdreleased."};
+	for (unsigned int i = 0; i < sizeof(directiveMapPrefixes) /
+			sizeof(directiveMapPrefixes[0]); ++i) {
+		const String& prefix = directiveMapPrefixes[i];
+		if (key.length() <= prefix.length() ||
+				key.subString(0, prefix.length()) != prefix)
+			continue;
+		const String bucket = key.subString(prefix.length());
+		Locker groupingLock(&groupingMutex);
+		const VectorMap<String, uint64>* source = nullptr;
+		if (i < 2)
+			source = &playerBotGroupingDirectiveCounters.byKind;
+		else if (i < 4)
+			source = &playerBotGroupingDirectiveCounters.buffChoice;
+		else if (i < 6)
+			source = &playerBotGroupingDirectiveCounters.buffOutcome;
+		else
+			source = &playerBotGroupingDirectiveCounters.holdReleased;
+		return source->contains(bucket) ? source->get(bucket) : 0;
+	}
 	const String assistSkippedPrefix = "assistskipped.";
 	if (key.length() > assistSkippedPrefix.length() &&
 			key.subString(0, assistSkippedPrefix.length()) == assistSkippedPrefix) {
@@ -23532,6 +23847,8 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 		playerBotParityTestBodyOids.removeAll();
 		playerBotParityTestOracle.removeAll();
 		playerBotParityTestCreditBaselines.removeAll();
+		playerBotParityDirectivesGateOverrides.removeAll();
+		playerBotParityForceGroupShuttleFailure.removeAll();
 			playerBotParityTestRequestRefs.removeAll();
 			playerBotParityTestIdentityRefs.removeAll();
 			playerBotParityAppearanceSnapshots.removeAll();
@@ -23897,7 +24214,34 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 				"grouping.joinaborted", "grouping.joincompensated",
 				"grouping.joinfailed", "grouping.invitesaccepted",
 				"grouping.offerscreated", "grouping.offersexpired",
-				"grouping.repliesposted"};
+				"grouping.repliesposted", "grouping.groupChatUnhandled",
+				"grouping.directives.issued",
+				"grouping.directives.unknownPlace", "grouping.directives.notLeader",
+				"grouping.directives.followCleared", "grouping.directives.readyLines",
+				"grouping.directives.rebuffNotices",
+				"grouping.directives.shuttleLegs.started",
+				"grouping.directives.shuttleLegs.finished",
+				"grouping.directives.shuttleLegs.failed",
+				"grouping.directives.shuttleSuppressed",
+				"grouping.directives.routeEpochMismatch",
+				"grouping.directives.byKind.cantina",
+				"grouping.directives.byKind.starport",
+				"grouping.directives.byKind.shuttleport",
+				"grouping.directives.byKind.medcenter",
+				"grouping.directives.byKind.city",
+				"grouping.directives.byKind.custom",
+				"grouping.directives.byKind.leader",
+				"grouping.directives.buffChoice.meet_city",
+				"grouping.directives.buffChoice.current_city",
+				"grouping.directives.buffChoice.on_the_way",
+				"grouping.directives.buffChoice.fallback",
+				"grouping.directives.buffOutcome.real",
+				"grouping.directives.buffOutcome.partial",
+				"grouping.directives.buffOutcome.fallback",
+				"grouping.directives.buffOutcome.not_needed",
+				"grouping.directives.holdReleased.leader_arrived",
+				"grouping.directives.holdReleased.follow_command",
+				"grouping.directives.holdReleased.hold_timeout"};
 			for (unsigned int i = 0; i < sizeof(counters) / sizeof(counters[0]); ++i)
 				playerBotParityTestCounterBaselines.put(counters[i].toLowerCase(),
 					static_cast<uint64>(playerBotParityCounterValue(counters[i])));
@@ -24315,6 +24659,25 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		return true;
 	}
 
+	if (op == "setDirectivesGate") {
+		identityId = resolveGroupingIdentity();
+		if (identityId == 0) {
+			result.status = "FAIL";
+			result.failReason = "grouping_identity_not_found";
+			return true;
+		}
+		Locker parityLock(&playerBotParityTestMutex);
+		if (!playerBotParityTestEnabled || !playerBotParityTestScenarioActive) {
+			result.status = "FAIL";
+			result.failReason = "directives_gate_outside_harness";
+			return true;
+		}
+		playerBotParityDirectivesGateOverrides.put(identityId,
+			step.gateEnabled);
+		result.status = "PASS";
+		return true;
+	}
+
 	// Diagnostic: route the existing cell-nav trace (bin/log/cellnav.log, gate
 	// cellNavDiag.logging) to the scenario's bot, so a grouped bot's mover can
 	// be inspected without the dedicated diagnostic test bot.
@@ -24381,10 +24744,50 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			result.failReason = "group_leader_body_missing";
 			return true;
 		}
-		if (!step.planet.isEmpty() && step.groupingHasPosition) {
+		if (op == "spawnGroupLeaderStandIn") {
+			// The stand-in is a lvl-178 harness body with stock combat; in the
+			// defend scenarios it repeatedly killed the grouped bot it was meant
+			// to lead (verify 2026-10-21). It still draws and holds aggro, but
+			// deals no damage.
+			Locker leaderLock(leader);
+			// No real player is ever near the stand-in, and a long trip (a
+			// directive mid-leg to Theed) outlived the no-player despawn.
+			leader->setDespawnOnNoPlayerInRange(false);
+			ManagedReference<WeaponObject*> weapon = leader->getWeapon();
+			if (weapon != nullptr) {
+				Locker weaponLock(weapon, leader);
+				weapon->setMinDamage(0);
+				weapon->setMaxDamage(0);
+			}
+		}
+		if (step.groupingToDirective) {
+			// The resolver may derive a cantina exterior far from the configured
+			// hangout, so the stand-in walks to the point the bot was given.
+			PlayerBotGroupDirective directive;
+			const uint64 directiveIdentity = resolveGroupingIdentity();
+			if (directiveIdentity == 0 || !getPlayerBotGroupDirective(
+					directiveIdentity, directive) ||
+					directive.place.planet.isEmpty()) {
+				result.status = "FAIL";
+				result.failReason = "group_directive_missing";
+				return true;
+			}
+			Locker leaderLock(leader);
+			leader->switchZone(directive.place.planet, directive.place.point.getX(),
+				directive.place.point.getZ(), directive.place.point.getY(), 0);
+			// Re-home it, or the stock leash walks the stand-in back to where it
+			// spawned and a following bot chases a moving leader (verify 2026-10-21).
+			leader->setHomeLocation(directive.place.point.getX(),
+				directive.place.point.getZ(), directive.place.point.getY());
+			leader->setMovementState(AiAgent::OBLIVIOUS);
+		} else if (!step.planet.isEmpty() && step.groupingHasPosition) {
 			Locker leaderLock(leader);
 			leader->switchZone(step.planet, step.groupingX, step.groupingZ,
 				step.groupingY, 0);
+			leader->setHomeLocation(step.groupingX, step.groupingZ, step.groupingY);
+			// A teleported AiAgent can still be LEASHING home, and a leashing
+			// agent is not attackable (AiAgentImplementation::isAttackableBy).
+			leader->setMovementState(AiAgent::OBLIVIOUS);
 		}
 		result.status = "PASS";
 		return true;
@@ -24541,6 +24944,8 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			playerBotParityGroupAttackerOids.removeAll();
 			playerBotParityGroupInitialBodyOids.removeAll();
 			playerBotParityGroupHarnessLeaderOids.removeAll();
+			playerBotParityDirectivesGateOverrides.removeAll();
+			playerBotParityForceGroupShuttleFailure.removeAll();
 			playerBotParityGroupLeaderOid = 0;
 			playerBotParityGroupAttackerOid = 0;
 		}
@@ -24628,7 +25033,9 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		return false;
 	}
 
-	if (op == "assertGroupingCounter") {
+	// Re-baselines one counter mid-scenario, so a later delta counts only what
+	// happens after this step (an earlier step may already have moved it).
+	if (op == "resetGroupingCounterBaseline") {
 		const String counter = step.groupingCounter.trim().toLowerCase();
 		if (counter.isEmpty()) {
 			result.status = "FAIL";
@@ -24636,14 +25043,50 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			return true;
 		}
 		const int64 current = playerBotParityCounterValue(counter);
-		int64 baseline = 0;
 		{
 			Locker parityLock(&playerBotParityTestMutex);
-			if (playerBotParityTestCounterBaselines.contains(counter))
-				baseline = static_cast<int64>(
-					playerBotParityTestCounterBaselines.get(counter));
+			playerBotParityTestCounterBaselines.put(counter,
+				static_cast<uint64>(current < 0 ? 0 : current));
 		}
-		if (current - baseline >= step.groupingMinDelta) {
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertGroupingCounter") {
+		const String counter = step.groupingCounter.trim().toLowerCase();
+		if (counter.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "grouping_counter_name_missing";
+			return true;
+		}
+		// "a|b" sums the deltas of several counters (e.g. buff outcome real or
+		// partial, both legitimate when a provider is busy).
+		int64 delta = 0;
+		String remaining = counter;
+		while (!remaining.isEmpty()) {
+			const int bar = remaining.indexOf("|");
+			const String name = (bar < 0 ? remaining :
+				remaining.subString(0, bar)).trim();
+			remaining = bar < 0 || bar + 1 >= remaining.length() ? String() :
+				remaining.subString(bar + 1);
+			if (name.isEmpty())
+				continue;
+			const int64 current = playerBotParityCounterValue(name);
+			int64 baseline = 0;
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				if (playerBotParityTestCounterBaselines.contains(name))
+					baseline = static_cast<int64>(
+						playerBotParityTestCounterBaselines.get(name));
+			}
+			delta += current - baseline;
+		}
+		if (step.groupingMaxDelta >= 0 && delta > step.groupingMaxDelta) {
+			result.status = "FAIL";
+			result.failReason = "grouping_counter_above_delta name=" + counter;
+			return true;
+		}
+		if (delta >= step.groupingMinDelta) {
 			result.status = "PASS";
 			return true;
 		}
@@ -24660,7 +25103,10 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		op == "assertNotGrouped" || op == "assertDecline" ||
 		op == "groupInvite" || op == "groupKick" || op == "groupDisband" ||
 		op == "groupSay" ||
-		op == "assertFollowDistance" || op == "assertBotOnPlanet" ||
+		 op == "assertFollowDistance" || op == "assertBotOnPlanet" ||
+		op == "assertDirectiveStage" || op == "assertDirectiveCleared" ||
+		op == "assertBotNear" || op == "assertBotBuffed" ||
+		op == "stripBotBuffs" || op == "forceGroupShuttleFailure" ||
 		op == "killGroupedBot" || op == "assertRejoined" ||
 		op == "assertGroupChatReply" || op == "assertNoBotDamage" ||
 		op == "assertBotDamaged" || op == "assertKillXpGroupMultiplier" ||
@@ -24900,7 +25346,8 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			step.templateName.isEmpty()) { result.status = "FAIL";
 			result.failReason = "harness_attacker_spawn_failed"; return true; }
 		Zone* zone = leader->getZone();
-		Vector3 position = leader->getWorldPosition();
+		const Vector3 leaderPosition = leader->getWorldPosition();
+		Vector3 position = leaderPosition;
 		position.setX(position.getX() + 3.f);
 		CreatureManager* creatureManager = zone->getCreatureManager();
 		ManagedReference<CreatureObject*> attacker = creatureManager == nullptr ?
@@ -24910,6 +25357,12 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		if (attackerAgent == nullptr) { result.status = "FAIL";
 			result.failReason = "harness_attacker_spawn_failed"; return true; }
 		bool combatStarted = false;
+		{
+			// Never engage a leashing stand-in: it is not attackable.
+			Locker leaderLock(leader);
+			if (leader->getMovementState() == AiAgent::LEASHING)
+				leader->setMovementState(AiAgent::OBLIVIOUS);
+		}
 		if (step.groupingFaction == "imperial" || step.groupingFaction == "rebel") {
 			Locker leaderLock(leader);
 			leader->setFaction(String(step.groupingFaction == "imperial" ?
@@ -24935,17 +25388,57 @@ bool SimPlayerManager::executePlayerBotParityStep(
 				attackerAgent->setFaction(String("rebel").hashCode());
 			else
 				attackerAgent->setFaction(0);
+			// 3 m keeps the bot's attacks off the stand-in (at 0.5 m they caught
+			// it and the lvl-178 body killed the bot), but a re-homed stand-in now
+			// stays beside the cantina where one side can be behind a wall. Pick
+			// the first side with line of sight (startCombat does not check it),
+			// else keep the first side (verify 2026-10-21).
+			const float offsets[4][2] = {{3.f, 0.f}, {0.f, 3.f}, {-3.f, 0.f},
+				{0.f, -3.f}};
+			int chosenSide = -1;
+			for (int side = 0; side < 4 && chosenSide < 0; ++side) {
+				if (side > 0) {
+					const float x = leaderPosition.getX() + offsets[side][0];
+					const float y = leaderPosition.getY() + offsets[side][1];
+					attackerAgent->teleport(x, zone->getHeight(x, y), y, 0);
+				}
+				if (CollisionManager::checkLineOfSight(attackerAgent, leader))
+					chosenSide = side;
+			}
+			if (chosenSide < 0) {
+				const float x = leaderPosition.getX() + offsets[0][0];
+				const float y = leaderPosition.getY() + offsets[0][1];
+				attackerAgent->teleport(x, zone->getHeight(x, y), y, 0);
+			}
 			if (CombatManager::instance() != nullptr)
 				combatStarted = CombatManager::instance()->startCombat(
 					attackerAgent, leader);
 		}
 		if (!combatStarted) {
 			Locker attackerLock(attackerAgent);
+			// Say why: attacker locked, stand-in cross-locked (KillCommand order).
+			String why;
+			{
+				Locker leaderCross(leader, attackerAgent);
+				why = " standInAttackable=" + String::valueOf(
+						leader->isAttackableBy(attackerAgent)) +
+					" attackerAttackable=" + String::valueOf(
+						attackerAgent->isAttackableBy(leader)) +
+					" standInFaction=" + String::valueOf(leader->getFaction()) +
+					" standInFactionStatus=" + String::valueOf(
+						leader->getFactionStatus()) +
+					" attackerFaction=" + String::valueOf(attackerAgent->getFaction()) +
+					" standInDead=" + String::valueOf(leader->isDead()) +
+					" standInInCombat=" + String::valueOf(leader->isInCombat()) +
+					" dist=" + String::valueOf(attackerAgent->getDistanceTo(leader)) +
+					" los=" + String::valueOf(CollisionManager::checkLineOfSight(
+						attackerAgent, leader));
+			}
 			if (attackerAgent->getZone() != nullptr)
 				attackerAgent->destroyObjectFromWorld(true);
 			attackerAgent->destroyObjectFromDatabase(true);
 			result.status = "FAIL";
-			result.failReason = "harness_attacker_combat_not_started";
+			result.failReason = "harness_attacker_combat_not_started" + why;
 			return true;
 		}
 		{
@@ -25286,6 +25779,157 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		if (groupingStepTimeout()) { result.status = "FAIL";
 			result.failReason = "rejoin_timeout"; return true; }
 		result.status = "WAITING"; return false;
+	}
+
+	if (op == "assertDirectiveStage") {
+		PlayerBotGroupDirective directive;
+		const String expected = step.groupingStage.trim().toUpperCase();
+		if (getPlayerBotGroupDirective(identityId, directive) &&
+				String(playerBotGroupingDirectiveStageName(directive.stage)) == expected) {
+			result.status = "PASS";
+			return true;
+		}
+		if (groupingStepTimeout()) {
+			result.status = "FAIL";
+			result.failReason = "directive_stage_timeout_expected=" + expected;
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
+	}
+
+	if (op == "assertDirectiveCleared") {
+		PlayerBotGroupDirective directive;
+		String clearReason;
+		const bool hasDirective = getPlayerBotGroupDirective(identityId,
+			directive);
+		const bool haveClearReason = getPlayerBotGroupingDirectiveClearReason(
+			identityId, clearReason);
+		const bool clearObserved = !hasDirective &&
+			(step.groupingReason.isEmpty() || (haveClearReason &&
+			clearReason.toLowerCase() == step.groupingReason.toLowerCase()));
+		if (clearObserved) {
+			result.status = "PASS";
+			return true;
+		}
+		if (groupingStepTimeout()) {
+			result.status = "FAIL";
+			result.failReason = "directive_not_cleared";
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
+	}
+
+	if (op == "assertBotBuffed" || op == "stripBotBuffs") {
+		const uint64 botOid = groupBotOid(identityId);
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> body = zoneServer == nullptr || botOid == 0 ?
+			nullptr : zoneServer->getObject(botOid);
+		AiAgent* agent = body == nullptr ? nullptr : body->asAiAgent();
+		if (agent == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "group_bot_missing";
+			return true;
+		}
+		Vector<uint32> trackedCrcs;
+		getPveTrackedBuffCrcs(trackedCrcs);
+		int tracked = 0;
+		{
+			Locker bodyLock(agent);
+			for (int i = 0; i < trackedCrcs.size(); ++i)
+				if (agent->getBuff(trackedCrcs.get(i)) != nullptr)
+					++tracked;
+			if (op == "stripBotBuffs") {
+				for (int i = 0; i < trackedCrcs.size(); ++i)
+					agent->removeBuff(trackedCrcs.get(i));
+				result.status = "PASS";
+				return true;
+			}
+		}
+		if (tracked >= step.groupingMinTracked) {
+			result.status = "PASS";
+			return true;
+		}
+		if (groupingStepTimeout()) {
+			result.status = "FAIL";
+			result.failReason = "tracked_buffs_below_min=" +
+				String::valueOf(step.groupingMinTracked) + " got=" +
+				String::valueOf(tracked);
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
+	}
+
+	if (op == "forceGroupShuttleFailure") {
+		Locker parityLock(&playerBotParityTestMutex);
+		if (!playerBotParityTestEnabled || !playerBotParityTestScenarioActive) {
+			result.status = "FAIL";
+			result.failReason = "shuttle_failure_outside_harness";
+			return true;
+		}
+		playerBotParityForceGroupShuttleFailure.put(identityId, true);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertBotNear") {
+		const uint64 botOid = groupBotOid(identityId);
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> body = zoneServer == nullptr || botOid == 0 ?
+			nullptr : zoneServer->getObject(botOid);
+		CreatureObject* bot = body == nullptr ? nullptr : body->asCreatureObject();
+		if (bot == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "group_bot_missing";
+			return true;
+		}
+		String planet;
+		Vector3 position;
+		{
+			Locker botLock(bot);
+			Zone* zone = bot->getZone();
+			if (zone != nullptr) {
+				planet = zone->getZoneName();
+				position = bot->getWorldPosition();
+			}
+		}
+		String targetPlanet = step.planet;
+		Vector3 targetPoint(step.groupingX, step.groupingY, step.groupingZ);
+		if (step.groupingToDirective) {
+			PlayerBotGroupDirective directive;
+			if (!getPlayerBotGroupDirective(identityId, directive) ||
+					directive.place.planet.isEmpty()) {
+				step.groupingLastObservation = "no_directive";
+				if (groupingStepTimeout()) {
+					result.status = "FAIL";
+					result.failReason = "group_bot_near_timeout no_directive";
+					return true;
+				}
+				result.status = "WAITING";
+				return false;
+			}
+			targetPlanet = directive.place.planet;
+			targetPoint = directive.place.point;
+		}
+		const float distance = position.distanceTo2d(targetPoint);
+		const float maxDistance = step.groupingMaxDistance > 0.f ?
+			step.groupingMaxDistance : 10.f;
+		if (planet == targetPlanet && distance <= maxDistance) {
+			result.status = "PASS";
+			return true;
+		}
+		step.groupingLastObservation = "planet=" + planet + " distance=" +
+			String::valueOf(distance);
+		if (groupingStepTimeout()) {
+			result.status = "FAIL";
+			result.failReason = "group_bot_near_timeout " +
+				step.groupingLastObservation;
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
 	}
 
 	if (op == "assertFollowDistance" || op == "assertBotOnPlanet") {
@@ -26429,10 +27073,21 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			int64 expected = 0;
 			if (!parsePlayerBotParityExpected(step.expect, expected))
 				expected = step.amount;
+			// Wait for an armored hit during the fight (the step budget bounds
+			// it): checked once after the kill, a target that died before it
+			// landed a hit left the tally at 0 (the long-standing flake).
 			if (mitigated < static_cast<uint64>(expected < 0 ? 0 : expected)) {
-				result.status = "FAIL";
-				result.failReason = "armor_mitigation_tally_too_low";
-				return true;
+				const int budget = step.budgetMs > 0 ? step.budgetMs : 180000;
+				if (step.runtimeStartedAtMs == 0)
+					step.runtimeStartedAtMs = nowMs;
+				if (nowMs > step.runtimeStartedAtMs && nowMs -
+						step.runtimeStartedAtMs > static_cast<uint64>(budget)) {
+					result.status = "FAIL";
+					result.failReason = "armor_mitigation_tally_too_low";
+					return true;
+				}
+				result.status = "WAITING";
+				return false;
 			}
 			result.status = "PASS";
 			return true;
@@ -30617,6 +31272,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 	PlayerBotGroupOffer groupingOffer;
 	PlayerBotGroupRecord groupingRecord;
 	if (getPlayerBotGroupRecord(identityId, groupingRecord)) {
+		PlayerBotGroupDirective groupingDirective;
 		JSONSerializationType groupingJson = JSONSerializationType::object();
 		groupingJson["kind"] = "record";
 		groupingJson["state"] = playerBotGroupingRecordStateName(
@@ -30628,6 +31284,18 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 		groupingJson["availabilityClass"] = inspectAvailability.isFree() ?
 			"FREE" : "BUSY";
 		groupingJson["availabilityReason"] = inspectAvailability.reason;
+		if (getPlayerBotGroupDirective(identityId, groupingDirective)) {
+			JSONSerializationType directiveJson = JSONSerializationType::object();
+			directiveJson["stage"] = playerBotGroupingDirectiveStageName(
+				groupingDirective.stage);
+			directiveJson["place"] = groupingDirective.place.label;
+			directiveJson["buffCity"] = groupingDirective.buffCity;
+			const uint64 nowMs = System::getMiliTime();
+			directiveJson["sinceSeconds"] = groupingDirective.stageStartedAtMs == 0 ||
+				nowMs < groupingDirective.stageStartedAtMs ? 0 :
+				(nowMs - groupingDirective.stageStartedAtMs) / 1000;
+			groupingJson["directive"] = directiveJson;
+		}
 		result["grouping"] = groupingJson;
 	} else {
 		bool haveOffer = false;
@@ -30815,7 +31483,9 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 
 	Vector<PlayerBotGroupOffer> offers;
 	Vector<PlayerBotGroupRecord> records;
+	Vector<PlayerBotGroupDirective> directives;
 	Vector<PlayerBotGroupRoute> routes;
+	PlayerBotGroupingDirectiveCounters directiveCounters;
 	Vector<String> unmatched;
 	VectorMap<String, uint64> replySkipped;
 	VectorMap<String, uint64> inviteDeclined;
@@ -30829,8 +31499,11 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 			offers.add(playerBotGroupOffers.elementAt(i).getValue());
 		for (int i = 0; i < playerBotGroupRecords.size(); ++i)
 			records.add(playerBotGroupRecords.elementAt(i).getValue());
+		for (int i = 0; i < playerBotGroupDirectives.size(); ++i)
+			directives.add(playerBotGroupDirectives.elementAt(i).getValue());
 		for (int i = 0; i < playerBotGroupRoutes.size(); ++i)
 			routes.add(playerBotGroupRoutes.elementAt(i).getValue());
+		directiveCounters = playerBotGroupingDirectiveCounters;
 		unmatched = playerBotGroupingRecentUnmatched;
 		replySkipped = playerBotGroupingReplySkipped;
 		inviteDeclined = playerBotGroupingInvitesDeclined;
@@ -30866,6 +31539,64 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 	counters["assistSkipped"] = playerBotGroupingCounterMapJson(assistSkipped);
 	result["counters"] = counters;
 
+	JSONSerializationType directiveJson = JSONSerializationType::object();
+	const char* directiveKinds[] = {"cantina", "starport", "shuttleport",
+		"medcenter", "city", "custom", "leader"};
+	for (unsigned int i = 0; i < sizeof(directiveKinds) /
+			sizeof(directiveKinds[0]); ++i)
+		if (!directiveCounters.byKind.contains(directiveKinds[i]))
+			directiveCounters.byKind.put(directiveKinds[i], 0);
+	const char* buffChoices[] = {"meet_city", "current_city", "on_the_way",
+		"fallback"};
+	for (unsigned int i = 0; i < sizeof(buffChoices) /
+			sizeof(buffChoices[0]); ++i)
+		if (!directiveCounters.buffChoice.contains(buffChoices[i]))
+			directiveCounters.buffChoice.put(buffChoices[i], 0);
+	const char* buffOutcomes[] = {"real", "partial", "fallback", "not_needed"};
+	for (unsigned int i = 0; i < sizeof(buffOutcomes) /
+			sizeof(buffOutcomes[0]); ++i)
+		if (!directiveCounters.buffOutcome.contains(buffOutcomes[i]))
+			directiveCounters.buffOutcome.put(buffOutcomes[i], 0);
+	const char* holdReasons[] = {"leader_arrived", "follow_command",
+		"hold_timeout"};
+	for (unsigned int i = 0; i < sizeof(holdReasons) /
+			sizeof(holdReasons[0]); ++i)
+		if (!directiveCounters.holdReleased.contains(holdReasons[i]))
+			directiveCounters.holdReleased.put(holdReasons[i], 0);
+	directiveJson["issued"] = directiveCounters.issued;
+	directiveJson["byKind"] = playerBotGroupingCounterMapJson(
+		directiveCounters.byKind);
+	directiveJson["unknownPlace"] = directiveCounters.unknownPlace;
+	directiveJson["notLeader"] = directiveCounters.notLeader;
+	directiveJson["followCleared"] = directiveCounters.followCleared;
+	directiveJson["buffChoice"] = playerBotGroupingCounterMapJson(
+		directiveCounters.buffChoice);
+	directiveJson["buffOutcome"] = playerBotGroupingCounterMapJson(
+		directiveCounters.buffOutcome);
+	directiveJson["holdReleased"] = playerBotGroupingCounterMapJson(
+		directiveCounters.holdReleased);
+	directiveJson["readyLines"] = directiveCounters.readyLines;
+	directiveJson["rebuffNotices"] = directiveCounters.rebuffNotices;
+	JSONSerializationType shuttleLegs = JSONSerializationType::object();
+	shuttleLegs["started"] = directiveCounters.shuttleStarted;
+	shuttleLegs["finished"] = directiveCounters.shuttleFinished;
+	shuttleLegs["failed"] = directiveCounters.shuttleFailed;
+	directiveJson["shuttleLegs"] = shuttleLegs;
+	directiveJson["shuttleSuppressed"] = directiveCounters.shuttleSuppressed;
+	directiveJson["routeEpochMismatch"] = directiveCounters.routeEpochMismatch;
+	VectorMap<String, uint64> activeStages;
+	for (int i = 0; i < directives.size(); ++i)
+		incrementPlayerBotGroupingCounter(activeStages,
+			playerBotGroupingDirectiveStageName(directives.get(i).stage));
+	const char* directiveStages[] = {"PLANNING", "BUFF_TRAVEL", "BUFFING",
+		"RALLY_TRAVEL", "RALLY_HOLD", "DONE"};
+	for (unsigned int i = 0; i < sizeof(directiveStages) /
+			sizeof(directiveStages[0]); ++i)
+		if (!activeStages.contains(directiveStages[i]))
+			activeStages.put(directiveStages[i], 0);
+	directiveJson["active"] = playerBotGroupingCounterMapJson(activeStages);
+	result["directives"] = directiveJson;
+
 	VectorMap<uint64, SimBotIdentity> identities;
 	VectorMap<uint64, uint64> bodyOids;
 	{
@@ -30891,6 +31622,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 	result["offers"] = offerJson;
 
 	JSONSerializationType groupedJson = JSONSerializationType::array();
+	const uint64 directiveNowMs = System::getMiliTime();
 	for (int i = 0; i < records.size(); ++i) {
 		const PlayerBotGroupRecord& record = records.get(i);
 		JSONSerializationType row = JSONSerializationType::object();
@@ -30905,6 +31637,22 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 		row["planet"] = String();
 		row["distanceToLeader"] = -1.f;
 		row["routeLegsLeft"] = 0;
+		for (int directiveIndex = 0; directiveIndex < directives.size();
+				directiveIndex++) {
+			if (directives.get(directiveIndex).identityId != record.identityId)
+				continue;
+			const PlayerBotGroupDirective& directive = directives.get(directiveIndex);
+			JSONSerializationType directiveRow = JSONSerializationType::object();
+			directiveRow["stage"] = playerBotGroupingDirectiveStageName(
+				directive.stage);
+			directiveRow["place"] = directive.place.label;
+			directiveRow["buffCity"] = directive.buffCity;
+			directiveRow["sinceSeconds"] = directive.stageStartedAtMs == 0 ||
+				directiveNowMs < directive.stageStartedAtMs ? 0 :
+				(directiveNowMs - directive.stageStartedAtMs) / 1000;
+			row["directive"] = directiveRow;
+			break;
+		}
 		for (int routeIndex = 0; routeIndex < routes.size(); ++routeIndex) {
 			if (routes.get(routeIndex).identityId == record.identityId) {
 				const PlayerBotGroupRoute& route = routes.get(routeIndex);
@@ -35441,24 +36189,554 @@ bool SimPlayerManager::planPveHunterRelocation(uint64 identityId,
 	return true;
 }
 
+bool SimPlayerManager::resolvePlayerBotRallyPlace(
+		const SimBotGroupRally::DirectiveText& text,
+		const String& leaderPlanet, const Vector3& leaderPosition,
+		RallyPlace& out) {
+	out = RallyPlace();
+	if (leaderPlanet.isEmpty() || text.unknownPlaceWords)
+		return false;
+	// A copy, as the chat task does: the refresh task reassigns the config.
+	const std::vector<SimBotGroupRally::PlaceRule> rallyPlaces =
+		getPlayerBotGroupingConfig().rallyPlaces;
+
+	const String requestedKind = text.landmark.trim().toLowerCase();
+	if (requestedKind == "leader" ||
+			(text.placeKey.isEmpty() && requestedKind.isEmpty())) {
+		out.planet = leaderPlanet;
+		out.point = leaderPosition;
+		out.kind = "leader";
+		out.label = "you";
+		return true;
+	}
+
+	const SimBotGroupRally::PlaceRule* configuredPlace = nullptr;
+	for (size_t i = 0; i < rallyPlaces.size(); ++i) {
+		const SimBotGroupRally::PlaceRule& candidate = rallyPlaces[i];
+		if (!text.placeKey.isEmpty() && candidate.key == text.placeKey) {
+			configuredPlace = &candidate;
+			break;
+		}
+	}
+
+	ShuttleportLocation city;
+	bool haveCity = false;
+	if (configuredPlace != nullptr && !configuredPlace->city.isEmpty()) {
+		for (int i = 0; i < allShuttleports.size(); ++i) {
+			const ShuttleportLocation& candidate = allShuttleports.get(i);
+			if (candidate.planet.toLowerCase() == configuredPlace->planet &&
+					candidate.name.toLowerCase() == configuredPlace->city) {
+				city = candidate;
+				haveCity = true;
+				break;
+			}
+		}
+	} else if (configuredPlace == nullptr && !requestedKind.isEmpty() &&
+			requestedKind != "leader") {
+		haveCity = getNearestRoutableCity(leaderPlanet, leaderPosition, true,
+				city);
+	}
+
+	if (configuredPlace != nullptr && configuredPlace->city.isEmpty()) {
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		Zone* zone = zoneServer == nullptr ? nullptr :
+			zoneServer->getZone(configuredPlace->planet);
+		if (zone == nullptr)
+			return false;
+		Vector3 point(configuredPlace->x, configuredPlace->y,
+			zone->getHeight(configuredPlace->x, configuredPlace->y));
+		if (!zone->isWithinBoundaries(point) ||
+				isOverlandPointInWater(zone, point.getX(), point.getY(), 0.f))
+			return false;
+		out.planet = configuredPlace->planet;
+		ShuttleportLocation nearest;
+		if (getNearestRoutableCity(configuredPlace->planet, point, true,
+				nearest))
+			out.cityName = nearest.name;
+		out.point = point;
+		out.kind = "custom";
+		out.label = "the " + prettyPvpCityName(configuredPlace->key);
+		return true;
+	}
+
+	if (!haveCity)
+		return false;
+
+	PvpCityLocations locations;
+	resolvePvpCityLocations(city, locations);
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	Zone* zone = zoneServer == nullptr ? nullptr :
+		zoneServer->getZone(city.planet);
+	if (zone == nullptr)
+		return false;
+	PlanetManager* planetManager = zone->getPlanetManager();
+	Vector3 point = locations.hangout;
+	String kind = requestedKind;
+	if (kind.isEmpty())
+		kind = "city";
+	if (kind == "starport") {
+		Reference<PlanetTravelPoint*> travelPoint =
+			planetManager == nullptr || city.starportPoint.isEmpty() ? nullptr :
+			planetManager->getPlanetTravelPoint(city.starportPoint);
+		if (travelPoint == nullptr)
+			return false;
+		point = travelPoint->getArrivalPosition();
+	} else if (kind == "shuttleport") {
+		point = locations.shuttlePad;
+	} else if (kind == "medcenter") {
+		point = locations.medCenterResolved ? locations.medCenter :
+			locations.hangout;
+	} else if (kind != "cantina" && kind != "city") {
+		return false;
+	}
+
+	if (!zone->isWithinBoundaries(point) ||
+			isOverlandPointInWater(zone, point.getX(), point.getY(), 0.f))
+		return false;
+
+	const String cityLabel = prettyPvpCityName(city.name);
+	out.planet = city.planet;
+	out.cityName = city.name;
+	out.point = point;
+	out.kind = kind;
+	if (kind == "cantina")
+		out.label = "the " + cityLabel + " cantina";
+	else if (kind == "starport")
+		out.label = "the " + cityLabel + " starport";
+	else if (kind == "shuttleport")
+		out.label = "the " + cityLabel + " shuttleport";
+	else if (kind == "medcenter")
+		out.label = "the " + cityLabel + " medcenter";
+	else
+		out.label = "the " + cityLabel;
+	return true;
+}
+
+uint64 SimPlayerManager::issuePlayerBotGroupDirective(uint64 identityId,
+		uint64 groupOid, uint64 recordGeneration, bool wantBuffs,
+		const RallyPlace& place) {
+	if (identityId == 0 || !isPlayerBotGroupDirectivesActive(identityId))
+		return 0;
+
+	uint64 directiveId = 0;
+	Locker groupingLock(&groupingMutex);
+	if (!playerBotGroupRecords.contains(identityId))
+		return 0;
+	PlayerBotGroupRecord& record = playerBotGroupRecords.get(identityId);
+	if (record.generation != recordGeneration ||
+			record.state == PLAYER_BOT_GROUP_RELEASING)
+		return 0;
+
+	directiveId = nextPlayerBotGroupingDirectiveId++;
+	if (directiveId == 0)
+		directiveId = nextPlayerBotGroupingDirectiveId++;
+	PlayerBotGroupDirective directive;
+	directive.identityId = identityId;
+	directive.groupOid = groupOid == 0 ? record.groupOid : groupOid;
+	directive.recordGeneration = record.generation;
+	directive.directiveId = directiveId;
+	directive.wantBuffs = wantBuffs;
+	directive.place = place;
+	directive.issuedAtMs = System::getMiliTime();
+	directive.stageStartedAtMs = directive.issuedAtMs;
+	playerBotGroupDirectives.put(identityId, directive);
+	playerBotGroupingDirectiveClearReasons.drop(identityId);
+	playerBotGroupingDirectiveCounters.issued++;
+	incrementPlayerBotGroupingCounter(
+		playerBotGroupingDirectiveCounters.byKind, place.kind);
+
+	if (playerBotGroupRoutes.contains(identityId) &&
+			playerBotGroupRoutes.get(identityId).generation == record.generation) {
+		PlayerBotGroupRoute& route = playerBotGroupRoutes.get(identityId);
+		route.routeEpoch = nextPlayerBotGroupingRouteEpoch++;
+		if (route.routeEpoch == 0)
+			route.routeEpoch = nextPlayerBotGroupingRouteEpoch++;
+		route.legs.removeAll();
+		route.legIndex = 0;
+		route.destKey = directiveId;
+		route.holdUntilMs = 0;
+		route.holdLinePosted = false;
+	}
+	groupingLock.release();
+	recordPlayerBotGroupingDirectiveEvent(identityId,
+		"issued=1 stage=PLANNING place=" + place.label + " buffCity=");
+	return directiveId;
+}
+
+bool SimPlayerManager::getPlayerBotGroupDirective(uint64 identityId,
+		PlayerBotGroupDirective& directive) const {
+	directive = PlayerBotGroupDirective();
+	if (identityId == 0)
+		return false;
+	Locker groupingLock(const_cast<Mutex*>(&groupingMutex));
+	if (!playerBotGroupDirectives.contains(identityId))
+		return false;
+	directive = playerBotGroupDirectives.get(identityId);
+	return true;
+}
+
+bool SimPlayerManager::advancePlayerBotGroupDirective(uint64 identityId,
+		uint64 directiveId, SimBotGroupRally::DirectiveStage fromStage,
+		SimBotGroupRally::DirectiveStage toStage, const String& outcome) {
+	String detail;
+	Locker groupingLock(&groupingMutex);
+	if (!playerBotGroupDirectives.contains(identityId) ||
+			!playerBotGroupRecords.contains(identityId))
+		return false;
+	PlayerBotGroupDirective& directive =
+		playerBotGroupDirectives.get(identityId);
+	const PlayerBotGroupRecord& record = playerBotGroupRecords.get(identityId);
+	if (directive.directiveId != directiveId ||
+			directive.recordGeneration != record.generation ||
+			directive.stage != fromStage)
+		return false;
+	directive.stage = toStage;
+	directive.stageStartedAtMs = System::getMiliTime();
+	if (toStage == SimBotGroupRally::RALLY_HOLD)
+		directive.holdStartedAtMs = directive.stageStartedAtMs;
+	if (!outcome.isEmpty())
+		directive.buffOutcome = outcome;
+	detail = "advanced=1 stage=" +
+		String(playerBotGroupingDirectiveStageName(toStage)) +
+		" place=" + directive.place.label + " buffCity=" + directive.buffCity +
+		(outcome.isEmpty() ? String() : " reason=" + outcome);
+	groupingLock.release();
+	recordPlayerBotGroupingDirectiveEvent(identityId, detail);
+	return true;
+}
+
+bool SimPlayerManager::clearPlayerBotGroupDirective(uint64 identityId,
+		uint64 directiveId, const String& reason) {
+	String detail;
+	Locker groupingLock(&groupingMutex);
+	if (!playerBotGroupDirectives.contains(identityId))
+		return false;
+	PlayerBotGroupDirective directive = playerBotGroupDirectives.get(identityId);
+	if (directiveId != 0 && directive.directiveId != directiveId)
+		return false;
+	playerBotGroupDirectives.drop(identityId);
+	playerBotGroupingDirectiveClearReasons.put(identityId, reason);
+	// Invalidate rather than drop: an in-flight leg must fail its epoch CAS,
+	// and a same-planet shuttle suppression must survive the change.
+	if (playerBotGroupRoutes.contains(identityId) &&
+			playerBotGroupRoutes.get(identityId).generation ==
+				directive.recordGeneration) {
+		PlayerBotGroupRoute& route = playerBotGroupRoutes.get(identityId);
+		route.routeEpoch = nextPlayerBotGroupingRouteEpoch++;
+		if (route.routeEpoch == 0)
+			route.routeEpoch = nextPlayerBotGroupingRouteEpoch++;
+		route.legs.removeAll();
+		route.legIndex = 0;
+		route.destKey = 0;
+		route.holdUntilMs = 0;
+		route.holdLinePosted = false;
+	}
+	detail = "cleared=1 stage=" +
+		String(playerBotGroupingDirectiveStageName(directive.stage)) +
+		" place=" + directive.place.label + " buffCity=" + directive.buffCity +
+		(reason.isEmpty() ? String() : " reason=" + reason);
+	groupingLock.release();
+	recordPlayerBotGroupingDirectiveEvent(identityId, detail);
+	return true;
+}
+
+bool SimPlayerManager::claimPlayerBotGroupReadyLine(uint64 identityId,
+		uint64 directiveId, bool hasBuffs) {
+	Locker groupingLock(&groupingMutex);
+	if (!playerBotGroupDirectives.contains(identityId))
+		return false;
+	PlayerBotGroupDirective& directive =
+		playerBotGroupDirectives.get(identityId);
+	if (directive.directiveId != directiveId ||
+			directive.stage != SimBotGroupRally::RALLY_HOLD ||
+			directive.readyLinePosted)
+		return false;
+	directive.readyLinePosted = true;
+	directive.holdHasBuffs = hasBuffs;
+	playerBotGroupingDirectiveCounters.readyLines++;
+	return true;
+}
+
+bool SimPlayerManager::stepPlayerBotRebuffVisit(uint64 identityId,
+		uint64 recordGeneration, bool inCityRegion, bool buffsLow,
+		uint64 nowMs) {
+	Locker groupingLock(&groupingMutex);
+	if (!playerBotGroupRecords.contains(identityId))
+		return false;
+	PlayerBotGroupRecord& record = playerBotGroupRecords.get(identityId);
+	if (record.generation != recordGeneration)
+		return false;
+	SimBotGroupRally::RebuffVisit visit;
+	visit.notifiedThisVisit = record.rebuffNotifiedThisVisit;
+	visit.outsideSinceMs = record.outsideCitySinceMs;
+	SimBotGroupRally::RebuffVisitStep step =
+		SimBotGroupRally::stepRebuffVisit(visit, inCityRegion, buffsLow, nowMs,
+			playerBotGroupingConfig.rebuffVisitResetSeconds);
+	record.rebuffNotifiedThisVisit = step.visit.notifiedThisVisit;
+	record.outsideCitySinceMs = step.visit.outsideSinceMs;
+	if (step.notify)
+		playerBotGroupingDirectiveCounters.rebuffNotices++;
+	return step.notify;
+}
+
+bool SimPlayerManager::planPlayerBotGroupDirective(uint64 identityId,
+		uint64 directiveId, const String& botPlanet,
+		const Vector3& botPosition, bool needsDoctor, bool needsEntertainer) {
+	if (!isPlayerBotGroupDirectivesActive(identityId))
+		return false;
+	PlayerBotGroupDirective directive;
+	PlayerBotGroupRecord record;
+	if (!getPlayerBotGroupDirective(identityId, directive) ||
+			!getPlayerBotGroupRecord(identityId, record) ||
+			directive.directiveId != directiveId ||
+			directive.stage != SimBotGroupRally::PLANNING ||
+			directive.recordGeneration != record.generation ||
+			record.state != PLAYER_BOT_GROUP_GROUPED || botPlanet.isEmpty())
+		return false;
+
+	const bool needsBuffs = needsDoctor || needsEntertainer;
+	ShuttleportLocation botCity;
+	const bool haveBotCity = getNearestRoutableCity(botPlanet, botPosition,
+		true, botCity);
+	SimBotGroupRally::BuffCityInputs inputs;
+	inputs.botPlanet = botPlanet;
+	inputs.botCity = haveBotCity ? botCity.name : String();
+	inputs.meetPlanet = directive.place.planet;
+	inputs.meetCity = directive.place.cityName;
+	// A leader or custom point names no city; buffing "in the meet city" then
+	// means the city nearest that point, so meet_city can still win.
+	if (inputs.meetCity.isEmpty() && !directive.place.planet.isEmpty()) {
+		ShuttleportLocation nearestMeetCity;
+		if (getNearestRoutableCity(directive.place.planet, directive.place.point,
+				true, nearestMeetCity)) {
+			inputs.meetPlanet = nearestMeetCity.planet;
+			inputs.meetCity = nearestMeetCity.name;
+		}
+	}
+
+	std::vector<String> configuredHubs;
+	for (int i = 0; i < playerBotGroupingConfig.buffCities.size(); ++i)
+		configuredHubs.push_back(playerBotGroupingConfig.buffCities.get(i));
+	for (size_t i = 0; i < configuredHubs.size(); ++i) {
+		const String& hubKey = configuredHubs[i];
+		const int separator = hubKey.indexOf(":");
+		if (separator <= 0 || separator >= hubKey.length() - 1)
+			continue;
+		const String hubPlanet = hubKey.subString(0, separator);
+		const String hubCity = hubKey.subString(separator + 1);
+		const int hubIndex = findShuttleportIndex(hubPlanet, hubCity);
+		if (hubIndex < 0)
+			continue;
+		const ShuttleportLocation& hub = allShuttleports.get(hubIndex);
+		if (hub.routingOnly || hub.starportPoint.isEmpty())
+			continue;
+
+		SimBotGroupRally::BuffCityCandidate candidate;
+		candidate.city = hub.name;
+		candidate.planet = hub.planet;
+		candidate.sameCityAsBot = haveBotCity &&
+			botCity.name == hub.name && botCity.planet == hub.planet;
+		candidate.samePlanetAsBot = botPlanet == hub.planet;
+		candidate.sameCityAsMeet = !inputs.meetCity.isEmpty() &&
+			inputs.meetCity == hub.name && inputs.meetPlanet == hub.planet;
+		candidate.samePlanetAsMeet = !inputs.meetPlanet.isEmpty() &&
+			inputs.meetPlanet == hub.planet;
+		if (haveBotCity) {
+			if (botCity.planet == hub.planet && botCity.name == hub.name)
+				candidate.legsBotToHub = 0;
+			else {
+				Vector<SimTravelLeg> legs;
+				String summary;
+				if (planSimTravelRoute(botCity.planet, botCity.name,
+						hub.planet, hub.name, true, legs, summary))
+					candidate.legsBotToHub = legs.size();
+			}
+		}
+		if (!inputs.meetPlanet.isEmpty() && !inputs.meetCity.isEmpty()) {
+			if (hub.planet == inputs.meetPlanet && hub.name == inputs.meetCity)
+				candidate.legsHubToMeet = 0;
+			else {
+				Vector<SimTravelLeg> legs;
+				String summary;
+				if (planSimTravelRoute(hub.planet, hub.name,
+						inputs.meetPlanet, inputs.meetCity, true, legs, summary))
+					candidate.legsHubToMeet = legs.size();
+			}
+		} else {
+			// A leader/custom point has no named city in the directive. Use the
+			// nearest routable city to its live point for the graph leg.
+			ShuttleportLocation meetCity;
+			if (getNearestRoutableCity(directive.place.planet,
+					directive.place.point, true, meetCity)) {
+				inputs.meetPlanet = meetCity.planet;
+				if (hub.planet == meetCity.planet && hub.name == meetCity.name)
+					candidate.legsHubToMeet = 0;
+				else {
+					Vector<SimTravelLeg> legs;
+					String summary;
+					if (planSimTravelRoute(hub.planet, hub.name,
+							meetCity.planet, meetCity.name, true, legs, summary))
+						candidate.legsHubToMeet = legs.size();
+				}
+			}
+		}
+		inputs.candidates.push_back(candidate);
+	}
+
+	SimBotGroupRally::BuffCityChoice choice =
+		SimBotGroupRally::chooseBuffCity(inputs);
+	String buffPlanet;
+	String buffCity;
+	Vector3 buffAnchor = botPosition;
+	String buffChoiceReason = choice.reason;
+	if (directive.wantBuffs && needsBuffs && choice.found()) {
+		const SimBotGroupRally::BuffCityCandidate& candidate =
+			inputs.candidates[choice.index];
+		buffPlanet = candidate.planet;
+		buffCity = candidate.city;
+		ShuttleportLocation hub;
+		const int hubIndex = findShuttleportIndex(buffPlanet, buffCity);
+		if (hubIndex >= 0) {
+			PvpCityLocations locations;
+			resolvePvpCityLocations(allShuttleports.get(hubIndex), locations);
+			buffAnchor = locations.hangout;
+		}
+	} else if (directive.wantBuffs && needsBuffs) {
+		buffChoiceReason = "fallback";
+		buffPlanet = botPlanet;
+		buffCity = haveBotCity ? botCity.name : String();
+	}
+
+	const bool buffCityIsCurrent = !buffCity.isEmpty() && haveBotCity &&
+		buffPlanet == botCity.planet && buffCity == botCity.name;
+	const bool fallbackBuffing = directive.wantBuffs && needsBuffs &&
+		!choice.found();
+	const SimBotGroupRally::DirectiveStage first = fallbackBuffing ?
+		SimBotGroupRally::BUFFING :
+		SimBotGroupRally::firstStage(directive.wantBuffs, buffCityIsCurrent,
+			needsBuffs);
+	PlayerBotGroupingConfig config = playerBotGroupingConfig;
+	String ackLine;
+	if (first == SimBotGroupRally::BUFF_TRAVEL ||
+			first == SimBotGroupRally::BUFFING) {
+		ackLine = config.buffAckLines.size() > 0 ? config.buffAckLines.get(
+			System::random(config.buffAckLines.size() - 1)) :
+			String("Grabbing buffs in {city} first");
+	} else if (directive.wantBuffs && !needsBuffs) {
+		ackLine = config.alreadyBuffedLines.size() > 0 ?
+			config.alreadyBuffedLines.get(System::random(
+				config.alreadyBuffedLines.size() - 1)) :
+			String("Still buffed, heading to {place}");
+	} else {
+		ackLine = config.rallyAckLines.size() > 0 ? config.rallyAckLines.get(
+			System::random(config.rallyAckLines.size() - 1)) :
+			String("On my way to {place}");
+	}
+	ackLine = replaceGroupingToken(ackLine, "{city}",
+		buffCity.isEmpty() ? prettyPvpCityName(botPlanet) :
+		prettyPvpCityName(buffCity));
+	ackLine = replaceGroupingToken(ackLine, "{place}", directive.place.label);
+
+	bool committed = false;
+	uint64 groupId = directive.groupOid;
+	{
+		Locker groupingLock(&groupingMutex);
+		if (playerBotGroupDirectives.contains(identityId) &&
+				playerBotGroupRecords.contains(identityId)) {
+			PlayerBotGroupDirective& live = playerBotGroupDirectives.get(identityId);
+			const PlayerBotGroupRecord& liveRecord =
+				playerBotGroupRecords.get(identityId);
+			if (live.directiveId == directiveId &&
+					live.recordGeneration == liveRecord.generation &&
+					live.stage == SimBotGroupRally::PLANNING &&
+					liveRecord.state == PLAYER_BOT_GROUP_GROUPED) {
+				live.buffChoiceReason = buffChoiceReason;
+				live.buffPlanet = buffPlanet;
+				live.buffCity = buffCity;
+				live.buffAnchor = buffAnchor;
+				live.stage = first;
+				live.stageStartedAtMs = System::getMiliTime();
+				live.buffOutcome = !directive.wantBuffs ? "not_needed" :
+					!needsBuffs ? "not_needed" : String();
+				live.ackPosted = true;
+				groupId = live.groupOid;
+				committed = true;
+			}
+		}
+	}
+	if (!committed)
+		return false;
+	recordPlayerBotGroupingBuffChoice(buffChoiceReason);
+	if (!directive.wantBuffs || !needsBuffs)
+		recordPlayerBotGroupingBuffOutcome("not_needed");
+	recordPlayerBotGroupingDirectiveEvent(identityId,
+		"advanced=1 stage=" +
+		String(playerBotGroupingDirectiveStageName(first)) + " place=" +
+		directive.place.label + " buffCity=" + buffCity + " reason=" +
+		buffChoiceReason);
+
+	const int delayRange = Math::max(0, config.ackLineDelayMaxSeconds -
+		config.ackLineDelayMinSeconds);
+	const uint64 delaySeconds = static_cast<uint64>(config.ackLineDelayMinSeconds) +
+		(delayRange == 0 ? 0 : static_cast<uint64>(System::random(delayRange)));
+	Core::getTaskManager()->scheduleTask([this, groupId, identityId, ackLine]() {
+		postPlayerBotGroupReply(groupId, identityId, ackLine);
+	}, "PlayerBotDirectiveAck", delaySeconds * 1000);
+	return true;
+}
+
 bool SimPlayerManager::planPlayerBotGroupRoute(uint64 identityId,
 		const String& botPlanet, const Vector3& botPosition,
-		const String& leaderPlanet, const Vector3& leaderPosition) {
+		const String& destPlanet, const Vector3& destPosition,
+		uint64 destKey, bool allowShuttle, bool travelInFlight) {
 	if (!isPlayerBotGroupingActive() || identityId == 0 || botPlanet.isEmpty() ||
-			leaderPlanet.isEmpty() || botPlanet == leaderPlanet)
+			destPlanet.isEmpty() || travelInFlight ||
+			(!allowShuttle && botPlanet == destPlanet))
 		return false;
 
 	ShuttleportLocation fromCity;
 	ShuttleportLocation destinationCity;
 	if (!getNearestRoutableCity(botPlanet, botPosition, true, fromCity) ||
-			!getNearestRoutableCity(leaderPlanet, leaderPosition, true,
+			!getNearestRoutableCity(destPlanet, destPosition, true,
 				destinationCity))
 		return false;
+	if (fromCity.planet == destinationCity.planet &&
+			fromCity.name == destinationCity.name)
+		return false;
+	if (fromCity.planet == destinationCity.planet) {
+		uint64 suppressedUntilMs = 0;
+		{
+			Locker groupingLock(&groupingMutex);
+			if (playerBotGroupRoutes.contains(identityId))
+				suppressedUntilMs = playerBotGroupRoutes.get(identityId).
+					shuttleSuppressedUntilMs;
+		}
+		PvpCityLocations fromLocations;
+		PvpCityLocations destinationLocations;
+		if (!resolvePvpCityLocations(fromCity, fromLocations) ||
+				!resolvePvpCityLocations(destinationCity, destinationLocations) ||
+				!fromLocations.shuttlePadResolved ||
+				!destinationLocations.shuttlePadResolved)
+			return false;
+		const float directMeters = botPosition.distanceTo2d(destPosition);
+		const float botToPadMeters = botPosition.distanceTo2d(
+			fromLocations.shuttlePad);
+		const float padToTargetMeters = destinationLocations.shuttlePad.
+			distanceTo2d(destPosition);
+		const PlayerBotGroupingConfig config = getPlayerBotGroupingConfig();
+		if (SimBotGroupRally::samePlanetMode(directMeters,
+				botToPadMeters, padToTargetMeters,
+				config.shuttleMinSavingsMeters,
+				suppressedUntilMs > System::getMiliTime()) !=
+				SimBotGroupRally::SHUTTLE)
+			return false;
+	}
 
 	Vector<SimTravelLeg> legs;
 	String summary;
-	if (!planSimTravelRoute(botPlanet, fromCity.name, leaderPlanet,
-			destinationCity.name, false, legs, summary) || legs.size() == 0)
+	if (!planSimTravelRoute(botPlanet, fromCity.name, destPlanet,
+			destinationCity.name, allowShuttle, legs, summary) ||
+			legs.size() == 0)
 		return false;
 
 	uint64 nowMs = System::getMiliTime();
@@ -35476,8 +36754,12 @@ bool SimPlayerManager::planPlayerBotGroupRoute(uint64 identityId,
 	route.legIndex = 0;
 	route.fromPlanet = botPlanet;
 	route.fromCity = fromCity.name;
-	route.destPlanet = leaderPlanet;
+	route.destPlanet = destPlanet;
 	route.destCity = destinationCity.name;
+	route.destKey = destKey;
+	route.routeEpoch = nextPlayerBotGroupingRouteEpoch++;
+	if (route.routeEpoch == 0)
+		route.routeEpoch = nextPlayerBotGroupingRouteEpoch++;
 	route.generation = record.generation;
 	if (route.replanWindowStartMs == 0)
 		route.replanWindowStartMs = nowMs;
@@ -35488,7 +36770,7 @@ bool SimPlayerManager::planPlayerBotGroupRoute(uint64 identityId,
 }
 
 bool SimPlayerManager::advancePlayerBotGroupRoute(uint64 identityId,
-		uint64 generation) {
+		uint64 generation, uint64 routeEpoch) {
 	Locker groupingLock(&groupingMutex);
 	if (!playerBotGroupRoutes.contains(identityId) ||
 			!playerBotGroupRecords.contains(identityId))
@@ -35497,8 +36779,62 @@ bool SimPlayerManager::advancePlayerBotGroupRoute(uint64 identityId,
 	const PlayerBotGroupRecord& record = playerBotGroupRecords.get(identityId);
 	if (route.generation != generation || record.generation != generation)
 		return false;
+	if (routeEpoch != 0 && route.routeEpoch != routeEpoch) {
+		groupingLock.release();
+		recordPlayerBotGroupingRouteEpochMismatch(identityId,
+			"expected=" + String::valueOf(routeEpoch) + " current=" +
+			String::valueOf(route.routeEpoch));
+		return false;
+	}
 	if (route.legIndex < route.legs.size())
 		++route.legIndex;
+	return true;
+}
+
+bool SimPlayerManager::invalidatePlayerBotGroupRoute(uint64 identityId,
+		uint64 generation) {
+	Locker groupingLock(&groupingMutex);
+	if (!playerBotGroupRoutes.contains(identityId) ||
+			!playerBotGroupRecords.contains(identityId))
+		return false;
+	PlayerBotGroupRoute& route = playerBotGroupRoutes.get(identityId);
+	if (route.generation != generation ||
+			playerBotGroupRecords.get(identityId).generation != generation)
+		return false;
+	route.routeEpoch = nextPlayerBotGroupingRouteEpoch++;
+	if (route.routeEpoch == 0)
+		route.routeEpoch = nextPlayerBotGroupingRouteEpoch++;
+	route.legs.removeAll();
+	route.legIndex = 0;
+	route.destKey = playerBotGroupDirectives.contains(identityId) ?
+		playerBotGroupDirectives.get(identityId).directiveId : 0;
+	route.holdUntilMs = 0;
+	route.holdLinePosted = false;
+	return true;
+}
+
+bool SimPlayerManager::suppressPlayerBotGroupShuttle(uint64 identityId,
+		uint64 generation, uint64 routeEpoch) {
+	Locker groupingLock(&groupingMutex);
+	if (!playerBotGroupRoutes.contains(identityId) ||
+			!playerBotGroupRecords.contains(identityId))
+		return false;
+	PlayerBotGroupRoute& route = playerBotGroupRoutes.get(identityId);
+	if (route.generation != generation ||
+			playerBotGroupRecords.get(identityId).generation != generation ||
+			route.routeEpoch != routeEpoch)
+		return false;
+	route.shuttleSuppressedUntilMs = System::getMiliTime() + 600000;
+	// Drop the failed shuttle route too, or the next tick would reuse its legs
+	// instead of re-planning, which now yields WALK while suppressed.
+	route.routeEpoch = nextPlayerBotGroupingRouteEpoch++;
+	if (route.routeEpoch == 0)
+		route.routeEpoch = nextPlayerBotGroupingRouteEpoch++;
+	route.legs.removeAll();
+	route.legIndex = 0;
+	playerBotGroupingDirectiveCounters.shuttleSuppressed++;
+	groupingLock.release();
+	recordPlayerBotGroupingShuttleEvent(identityId, "suppressed=1");
 	return true;
 }
 
@@ -62597,6 +63933,7 @@ void SimPlayerManager::releasePlayerBotGroup(uint64 identityId,
 				playerBotGroupRecords.get(identityId).state ==
 					PLAYER_BOT_GROUP_RELEASING) {
 			playerBotGroupRecords.drop(identityId);
+			playerBotGroupDirectives.drop(identityId);
 			playerBotGroupRoutes.drop(identityId);
 			++nextPlayerBotGroupingGeneration;
 			removed = true;
@@ -62636,6 +63973,20 @@ void SimPlayerManager::reconcilePlayerBotGroups(uint64 nowMs) {
 	if (!isPlayerBotGroupingActive()) {
 		releaseAllPlayerBotGroups("gate_off");
 		return;
+	}
+	if (!playerBotGroupingConfig.directivesEnabled) {
+		Vector<uint64> directiveIdentities;
+		{
+			Locker groupingLock(&groupingMutex);
+			for (int i = 0; i < playerBotGroupDirectives.size(); ++i)
+				directiveIdentities.add(
+					playerBotGroupDirectives.elementAt(i).getKey());
+		}
+		for (int i = 0; i < directiveIdentities.size(); ++i) {
+			const uint64 identityId = directiveIdentities.get(i);
+			if (!isPlayerBotGroupDirectivesActive(identityId))
+				clearPlayerBotGroupDirective(identityId, 0, "gate_off");
+		}
 	}
 
 	Vector<PlayerBotGroupRecord> records;
@@ -62773,6 +64124,19 @@ void SimPlayerManager::preparePlayerBotGroupingDeath(uint64 identityId,
 				++live.generation;
 				if (live.generation == 0)
 					live.generation = 1;
+			}
+			if (playerBotGroupDirectives.contains(identityId)) {
+				PlayerBotGroupDirective& directive =
+					playerBotGroupDirectives.get(identityId);
+				directive.recordGeneration = live.generation;
+				if (directive.stage != SimBotGroupRally::PLANNING) {
+					directive.stage = SimBotGroupRally::PLANNING;
+					directive.stageStartedAtMs = System::getMiliTime();
+					directive.holdStartedAtMs = 0;
+					directive.readyLinePosted = false;
+					directive.ackPosted = false;
+					directive.buffOutcome = "";
+				}
 			}
 			playerBotGroupRoutes.drop(identityId);
 		}
@@ -62937,6 +64301,7 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 		uint64 groupId, const String& text) {
 	if (!isPlayerBotGroup(groupId))
 		return;
+	PlayerBotGroupingConfig config = playerBotGroupingConfig;
 	Vector<PlayerBotGroupRecord> records;
 	{
 		Locker groupingLock(&groupingMutex);
@@ -62960,9 +64325,10 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 			namedBots.push_back(named);
 		}
 	}
-	SimBotGrouping::GroupCommand command = SimBotGrouping::parseGroupCommand(
-		text, namedBots, playerBotGroupingConfig.vocabulary);
-	if (command.command == SimBotGrouping::GROUP_COMMAND_NONE) {
+	SimBotGroupRally::LeaderLine parsed = SimBotGroupRally::parseLeaderLine(
+		text, namedBots, config.vocabulary, config.rallyVocabulary);
+	SimBotGrouping::GroupCommand command = parsed.command;
+	auto rememberUnmatched = [this, &text]() {
 		playerBotGroupingGroupChatUnhandled.increment();
 		Locker groupingLock(&groupingMutex);
 		if (!text.isEmpty())
@@ -62970,33 +64336,218 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 				Math::min(256, text.length())));
 		while (playerBotGroupingRecentUnmatched.size() > 20)
 			playerBotGroupingRecentUnmatched.remove(0);
+	};
+	if (command.command == SimBotGrouping::GROUP_COMMAND_NONE &&
+			!parsed.isDirective) {
+		rememberUnmatched();
 		return;
 	}
-	String commandName = command.command == SimBotGrouping::GROUP_COMMAND_STATUS ?
-		String("status") : String("leave");
+	auto isTargeted = [&command](uint64 identityId) {
+		return command.all || std::find(command.targetIdentityIds.begin(),
+			command.targetIdentityIds.end(), identityId) !=
+			command.targetIdentityIds.end();
+	};
+	if (parsed.isDirective) {
+		bool directiveGateOpen = false;
+		for (int i = 0; i < records.size(); ++i) {
+			if (isTargeted(records.get(i).identityId) &&
+					isPlayerBotGroupDirectivesActive(records.get(i).identityId)) {
+				directiveGateOpen = true;
+				break;
+			}
+		}
+		if (!directiveGateOpen) {
+			rememberUnmatched();
+			return;
+		}
+	}
+	String commandName = parsed.isDirective ? String("directive") :
+		command.command == SimBotGrouping::GROUP_COMMAND_STATUS ? String("status") :
+		command.command == SimBotGrouping::GROUP_COMMAND_READY ? String("ready") :
+		command.command == SimBotGrouping::GROUP_COMMAND_FOLLOW ? String("follow") :
+		String("leave");
 	{
 		Locker groupingLock(&groupingMutex);
 		playerBotGroupingGroupChatCommands.put(commandName,
-			playerBotGroupingGroupChatCommands.contains(commandName) ?
+		playerBotGroupingGroupChatCommands.contains(commandName) ?
 			playerBotGroupingGroupChatCommands.get(commandName) + 1 : 1);
+	}
+	const bool leaderOnlyCommand = parsed.isDirective ||
+		command.command == SimBotGrouping::GROUP_COMMAND_FOLLOW;
+	if (leaderOnlyCommand) {
+		bool senderIsLeader = false;
+		for (int i = 0; i < records.size(); ++i)
+			senderIsLeader |= records.get(i).leaderOid == senderOid;
+		if (!senderIsLeader) {
+			Locker groupingLock(&groupingMutex);
+			playerBotGroupingDirectiveCounters.notLeader++;
+			playerBotGroupingGroupChatCommands.put("directiveNotLeader",
+				playerBotGroupingGroupChatCommands.contains("directiveNotLeader") ?
+				playerBotGroupingGroupChatCommands.get("directiveNotLeader") + 1 : 1);
+			return;
+		}
+	}
+	auto scheduleLine = [this](uint64 group, uint64 identityId,
+			const String& line, int minSeconds, int maxSeconds,
+			const char* taskName) {
+		if (line.isEmpty())
+			return;
+		const int range = Math::max(0, maxSeconds - minSeconds);
+		const uint64 delay = static_cast<uint64>(minSeconds) +
+			(range == 0 ? 0 : static_cast<uint64>(System::random(range)));
+		Core::getTaskManager()->scheduleTask([this, group, identityId, line]() {
+			postPlayerBotGroupReply(group, identityId, line);
+		}, taskName, delay * 1000);
+	};
+
+	if (parsed.isDirective) {
+		String leaderPlanet;
+		Vector3 leaderPosition;
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<CreatureObject*> leader = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(senderOid).castTo<CreatureObject*>();
+		if (leader != nullptr) {
+			Locker leaderLock(leader);
+			Zone* zone = leader->getZone();
+			if (zone != nullptr) {
+				leaderPlanet = zone->getZoneName();
+				leaderPosition = leader->getWorldPosition();
+			}
+		}
+		RallyPlace place;
+		if (parsed.directive.unknownPlaceWords ||
+				!resolvePlayerBotRallyPlace(parsed.directive, leaderPlanet,
+					leaderPosition, place)) {
+			uint64 firstTarget = 0;
+			for (int i = 0; i < records.size(); ++i) {
+				if (isTargeted(records.get(i).identityId)) {
+					firstTarget = records.get(i).identityId;
+					break;
+				}
+			}
+			if (firstTarget != 0) {
+				Locker groupingLock(&groupingMutex);
+				playerBotGroupingDirectiveCounters.unknownPlace++;
+				String line = config.unknownPlaceLines.size() > 0 ?
+					config.unknownPlaceLines.get(System::random(
+						config.unknownPlaceLines.size() - 1)) : String("Where's that?");
+				scheduleLine(groupId, firstTarget, line,
+					config.ackLineDelayMinSeconds, config.ackLineDelayMaxSeconds,
+					"PlayerBotUnknownPlace");
+			}
+			rememberUnmatched();
+			return;
+		}
+		for (int i = 0; i < records.size(); ++i) {
+			const PlayerBotGroupRecord& record = records.get(i);
+			if (!isTargeted(record.identityId))
+				continue;
+			uint64 directiveId = issuePlayerBotGroupDirective(record.identityId,
+				record.groupOid, record.generation, parsed.directive.wantBuffs,
+				place);
+			if (directiveId == 0)
+				continue;
+			if (record.state == PLAYER_BOT_GROUP_DEAD_REJOIN)
+				scheduleLine(record.groupOid, record.identityId,
+					"Cloning, I'll head back to you.",
+					config.ackLineDelayMinSeconds, config.ackLineDelayMaxSeconds,
+					"PlayerBotDirectiveClone");
+		}
+		return;
+	}
+
+	if (command.command == SimBotGrouping::GROUP_COMMAND_FOLLOW) {
+		for (int i = 0; i < records.size(); ++i) {
+			const PlayerBotGroupRecord& record = records.get(i);
+			if (!isTargeted(record.identityId))
+				continue;
+			if (clearPlayerBotGroupDirective(record.identityId, 0,
+					"follow_command")) {
+				Locker groupingLock(&groupingMutex);
+				playerBotGroupingDirectiveCounters.followCleared++;
+				groupingLock.release();
+				recordPlayerBotGroupingHoldRelease("follow_command");
+			}
+			String line = config.followAckLines.size() > 0 ?
+				config.followAckLines.get(System::random(
+					config.followAckLines.size() - 1)) : String("Following");
+			scheduleLine(record.groupOid, record.identityId, line,
+				config.ackLineDelayMinSeconds, config.ackLineDelayMaxSeconds,
+				"PlayerBotFollowAck");
+		}
+		return;
 	}
 
 	for (int i = 0; i < records.size(); ++i) {
 		const PlayerBotGroupRecord& record = records.get(i);
-		if (!command.all && std::find(command.targetIdentityIds.begin(),
-				command.targetIdentityIds.end(), record.identityId) ==
-				command.targetIdentityIds.end())
+		if (!isTargeted(record.identityId))
 			continue;
 		if (command.command == SimBotGrouping::GROUP_COMMAND_LEAVE &&
 				senderOid != record.leaderOid)
 			continue;
-		PlayerBotGroupingConfig config = playerBotGroupingConfig;
 		String line = config.followingLines.size() > 0 ?
 			config.followingLines.get(System::random(
 				config.followingLines.size() - 1)) : String("Following.");
+		bool stageLine = false;
+		PlayerBotGroupDirective directive;
+		if (command.command == SimBotGrouping::GROUP_COMMAND_STATUS ||
+				command.command == SimBotGrouping::GROUP_COMMAND_READY) {
+			if (record.state != PLAYER_BOT_GROUP_DEAD_REJOIN &&
+					getPlayerBotGroupDirective(record.identityId, directive)) {
+				if (directive.stage == SimBotGroupRally::BUFF_TRAVEL) {
+					line = "Heading to " + prettyPvpCityName(directive.buffCity) +
+						" for buffs.";
+					stageLine = true;
+				} else if (directive.stage == SimBotGroupRally::BUFFING) {
+					line = "Getting buffs in " +
+						prettyPvpCityName(directive.buffCity) + ".";
+					stageLine = true;
+				} else if (directive.stage == SimBotGroupRally::RALLY_TRAVEL) {
+					line = "On my way to " + directive.place.label;
+					ZoneServer* stageZoneServer = ServerCore::getZoneServer();
+					ManagedReference<CreatureObject*> stageBot =
+						stageZoneServer == nullptr || record.bodyOid == 0 ? nullptr :
+						stageZoneServer->getObject(record.bodyOid).
+							castTo<CreatureObject*>();
+					String stageBotPlanet;
+					float stageBotDistance = -1.f;
+					if (stageBot != nullptr) {
+						Locker stageBotLock(stageBot);
+						Zone* stageBotZone = stageBot->getZone();
+						if (stageBotZone != nullptr) {
+							stageBotPlanet = stageBotZone->getZoneName();
+							stageBotDistance = stageBot->getWorldPosition().
+								distanceTo2d(directive.place.point);
+						}
+					}
+					if (stageBotPlanet == directive.place.planet &&
+							stageBotDistance >= 0.f) {
+						const float distance = stageBotDistance;
+						line += ", about " +
+							String::valueOf(static_cast<int>(distance)) + " m";
+					} else if (!stageBotPlanet.isEmpty()) {
+						line = "On " + stageBotPlanet +
+							", heading to " + directive.place.label;
+					}
+					line += ".";
+					stageLine = true;
+				} else if (directive.stage == SimBotGroupRally::RALLY_HOLD) {
+					// Recorded by the bot from its body when the hold began.
+					const bool hasTrackedBuffs = directive.holdHasBuffs;
+					const Vector<String>& lines = hasTrackedBuffs ?
+						config.readyLines : config.readyNoBuffsLines;
+					if (lines.size() > 0)
+						line = lines.get(System::random(lines.size() - 1));
+					else
+						line = hasTrackedBuffs ? String("Buffed and ready") :
+							String("Here, ready when you are");
+					stageLine = true;
+				}
+			}
+		}
 		// Owner client pass: "Right behind you" from 200 m away is wrong. Report
 		// the real distance on the same planet, or the planet when elsewhere.
-		{
+		if (!stageLine) {
 			ZoneServer* statusZoneServer = ServerCore::getZoneServer();
 			ManagedReference<CreatureObject*> statusBot = statusZoneServer ==
 				nullptr || record.bodyOid == 0 ? nullptr :
@@ -63022,7 +64573,7 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 			}
 		}
 		PlayerBotGroupRoute route;
-		if (getPlayerBotGroupRoute(record.identityId, route)) {
+		if (!stageLine && getPlayerBotGroupRoute(record.identityId, route)) {
 			if (route.holdUntilMs != 0)
 				line = "Holding at " + route.fromCity + ".";
 			else if (route.legIndex < route.legs.size())
@@ -63030,18 +64581,12 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 					String::valueOf(route.legs.size() - route.legIndex) +
 					" legs).";
 		}
-		uint64 identityId = record.identityId;
 		if (command.command == SimBotGrouping::GROUP_COMMAND_LEAVE) {
-			releasePlayerBotGroup(identityId, "leave_command");
+			releasePlayerBotGroup(record.identityId, "leave_command");
 			continue;
 		}
-		Core::getTaskManager()->scheduleTask([this, groupId, identityId, line]() {
-			SimBotIdentity identity;
-			String sender = "PlayerBot";
-			if (snapshotPlayerBotIdentity(identityId, identity))
-				sender = identity.firstName;
-			postPlayerBotGroupChat(groupId, sender, line);
-		}, "PlayerBotGroupStatus", 1000 + System::random(2000));
+		scheduleLine(groupId, record.identityId, line, 1, 3,
+			"PlayerBotGroupStatus");
 	}
 }
 
@@ -63530,6 +65075,35 @@ void SimPlayerManager::postPlayerBotGroupChat(uint64 groupId,
 	}
 }
 
+void SimPlayerManager::postPlayerBotGroupReply(uint64 groupId,
+		uint64 identityId, const String& text) {
+	if (groupId == 0 || text.isEmpty())
+		return;
+	const uint64 nowMs = System::getMiliTime();
+	uint64 dueAtMs = nowMs;
+	{
+		Locker groupingLock(&groupingMutex);
+		const uint64 gapMs = static_cast<uint64>(Math::max(0,
+			playerBotGroupingConfig.minReplyGapSeconds)) * 1000ULL;
+		if (playerBotGroupingNextReplyAtMs.contains(groupId))
+			dueAtMs = Math::max(dueAtMs,
+				playerBotGroupingNextReplyAtMs.get(groupId));
+		playerBotGroupingNextReplyAtMs.put(groupId, dueAtMs + gapMs);
+	}
+	auto post = [this, groupId, identityId, text]() {
+		SimBotIdentity identity;
+		const String sender = snapshotPlayerBotIdentity(identityId, identity) ?
+			identity.firstName : String("PlayerBot");
+		postPlayerBotGroupChat(groupId, sender, text);
+	};
+	if (dueAtMs <= nowMs)
+		post();
+	else
+		Core::getTaskManager()->scheduleTask(post, "PlayerBotGroupReply",
+			static_cast<uint32>(Math::min<uint64>(dueAtMs - nowMs,
+				static_cast<uint64>(0xFFFFFFFFu))));
+}
+
 void SimPlayerManager::postPlayerBotGroupTravelLine(uint64 groupId,
 		const String& city) {
 	PlayerBotGroupingConfig config = playerBotGroupingConfig;
@@ -63561,6 +65135,153 @@ void SimPlayerManager::recordPlayerBotGroupingTravel(uint64 identityId,
 		playerBotGroupingTravelLegs.increment();
 	MissionDiagLog::event("GROUP_TRAVEL", identityId,
 		(failed ? String("failed=1 ") : String("leg=1 ")) + detail);
+}
+
+void SimPlayerManager::recordPlayerBotGroupingBuffChoice(const String& choice) {
+	Locker groupingLock(&groupingMutex);
+	incrementPlayerBotGroupingCounter(playerBotGroupingDirectiveCounters.buffChoice,
+		choice);
+}
+
+void SimPlayerManager::recordPlayerBotGroupingBuffOutcome(const String& outcome) {
+	Locker groupingLock(&groupingMutex);
+	incrementPlayerBotGroupingCounter(playerBotGroupingDirectiveCounters.buffOutcome,
+		outcome);
+}
+
+void SimPlayerManager::recordPlayerBotGroupingHoldRelease(const String& reason) {
+	Locker groupingLock(&groupingMutex);
+	incrementPlayerBotGroupingCounter(playerBotGroupingDirectiveCounters.holdReleased,
+		reason);
+}
+
+void SimPlayerManager::recordPlayerBotGroupingReadyLine(uint64 identityId) {
+	Locker groupingLock(&groupingMutex);
+	playerBotGroupingDirectiveCounters.readyLines++;
+	(void)identityId;
+}
+
+void SimPlayerManager::recordPlayerBotGroupingRebuffNotice(uint64 identityId) {
+	Locker groupingLock(&groupingMutex);
+	playerBotGroupingDirectiveCounters.rebuffNotices++;
+	(void)identityId;
+}
+
+void SimPlayerManager::recordPlayerBotGroupingShuttleStarted(uint64 identityId,
+		const String& detail) {
+	{
+		Locker groupingLock(&groupingMutex);
+		playerBotGroupingDirectiveCounters.shuttleStarted++;
+	}
+	recordPlayerBotGroupingShuttleEvent(identityId, "start " + detail);
+}
+
+void SimPlayerManager::recordPlayerBotGroupingShuttleFinished(uint64 identityId,
+		const String& detail) {
+	{
+		Locker groupingLock(&groupingMutex);
+		playerBotGroupingDirectiveCounters.shuttleFinished++;
+	}
+	recordPlayerBotGroupingShuttleEvent(identityId, "finish " + detail);
+}
+
+void SimPlayerManager::recordPlayerBotGroupingShuttleFailed(uint64 identityId,
+		const String& detail) {
+	{
+		Locker groupingLock(&groupingMutex);
+		playerBotGroupingDirectiveCounters.shuttleFailed++;
+	}
+	recordPlayerBotGroupingShuttleEvent(identityId, "failed " + detail);
+}
+
+void SimPlayerManager::recordPlayerBotGroupingShuttleSuppressed(uint64 identityId,
+		const String& detail) {
+	{
+		Locker groupingLock(&groupingMutex);
+		playerBotGroupingDirectiveCounters.shuttleSuppressed++;
+	}
+	recordPlayerBotGroupingShuttleEvent(identityId, "suppressed " + detail);
+}
+
+void SimPlayerManager::recordPlayerBotGroupingRouteEpochMismatch(
+		uint64 identityId, const String& detail) {
+	Locker groupingLock(&groupingMutex);
+	playerBotGroupingDirectiveCounters.routeEpochMismatch++;
+	(void)identityId;
+	(void)detail;
+}
+
+void SimPlayerManager::recordPlayerBotGroupingDirectiveEvent(uint64 identityId,
+		const String& detail) {
+	const uint64 nowMs = System::getMiliTime();
+	bool emit = false;
+	{
+		Locker groupingLock(&groupingMutex);
+		const uint64 lastMs = playerBotGroupingDirectiveDiagAtMs.contains(identityId) ?
+			playerBotGroupingDirectiveDiagAtMs.get(identityId) : 0;
+		if (lastMs == 0 || nowMs >= lastMs + 5000) {
+			playerBotGroupingDirectiveDiagAtMs.put(identityId, nowMs);
+			emit = true;
+		}
+	}
+	if (emit)
+		MissionDiagLog::event("GROUP_DIRECTIVE", identityId, detail);
+}
+
+void SimPlayerManager::recordPlayerBotGroupingBuffEvent(uint64 identityId,
+		const String& detail) {
+	const uint64 nowMs = System::getMiliTime();
+	bool emit = false;
+	{
+		Locker groupingLock(&groupingMutex);
+		const uint64 lastMs = playerBotGroupingBuffDiagAtMs.contains(identityId) ?
+			playerBotGroupingBuffDiagAtMs.get(identityId) : 0;
+		if (lastMs == 0 || nowMs >= lastMs + 5000) {
+			playerBotGroupingBuffDiagAtMs.put(identityId, nowMs);
+			emit = true;
+		}
+	}
+	if (emit)
+		MissionDiagLog::event("GROUP_BUFF", identityId, detail);
+}
+
+void SimPlayerManager::recordPlayerBotGroupingShuttleEvent(uint64 identityId,
+		const String& detail) {
+	const uint64 nowMs = System::getMiliTime();
+	bool emit = false;
+	{
+		Locker groupingLock(&groupingMutex);
+		const uint64 lastMs = playerBotGroupingShuttleDiagAtMs.contains(identityId) ?
+			playerBotGroupingShuttleDiagAtMs.get(identityId) : 0;
+		if (lastMs == 0 || nowMs >= lastMs + 5000) {
+			playerBotGroupingShuttleDiagAtMs.put(identityId, nowMs);
+			emit = true;
+		}
+	}
+	if (emit)
+		MissionDiagLog::event("GROUP_SHUTTLE", identityId, detail);
+}
+
+bool SimPlayerManager::consumePlayerBotParityGroupShuttleFailure(
+		uint64 identityId) {
+	if (identityId == 0 || !isPlayerBotGroupingActive())
+		return false;
+	Locker parityLock(&playerBotParityTestMutex);
+	if (!playerBotParityTestEnabled || !playerBotParityTestScenarioActive ||
+			!playerBotParityForceGroupShuttleFailure.contains(identityId))
+		return false;
+	playerBotParityForceGroupShuttleFailure.drop(identityId);
+	return true;
+}
+
+bool SimPlayerManager::getPlayerBotGroupingDirectiveClearReason(
+		uint64 identityId, String& reason) const {
+	reason = String();
+	Locker groupingLock(const_cast<Mutex*>(&groupingMutex));
+	if (!playerBotGroupingDirectiveClearReasons.contains(identityId))
+		return false;
+	reason = playerBotGroupingDirectiveClearReasons.get(identityId);
+	return true;
 }
 
 void SimPlayerManager::postSquadGroupChat(uint64 groupId, const String& sender,

@@ -38,7 +38,8 @@ public:
 		BAZAAR_VISIT,
 		GROUP_WAIT,
 		GROUP_FOLLOW,
-		GROUP_TRAVEL
+		GROUP_TRAVEL,
+		GROUP_BUFF
 	};
 
 private:
@@ -224,6 +225,12 @@ private:
 	std::atomic<bool> groupFallbackMoveActive{false};
 	Vector3 groupLastPathTarget;
 	uint64 groupLastPathIssuedMs = 0;
+	uint64 groupTravelRouteEpoch = 0;
+	bool groupTravelLegIntraPlanet = false;
+	bool groupBuffActive = false;
+	uint64 groupBuffDirectiveId = 0;
+	bool groupBuffProvidersPending = false;
+	uint64 groupRebuffCheckAtMs = 0;
 	// Rate-limits the GROUP_FOLLOW diagnostic event (one per mode change or 10 s).
 	uint64 groupFollowEventAtMs = 0;
 	int groupFollowEventMode = -1;
@@ -340,17 +347,42 @@ private:
 	void setPhase(HuntPhase next);
 	void suspendRoutineForGroup(const String& reason);
 	void runGroupTick(AiAgent* hunter, uint64 nowMs);
+	struct GroupTravelTarget {
+		String planet;
+		Vector3 position;
+		bool indoors = false;
+		bool leaderTarget = false;
+		float arrivalMeters = 0.f;
+	};
+	void runGroupDirectiveTick(AiAgent* hunter, uint64 nowMs,
+		const PlayerBotGroupRecord& record,
+		const SimPlayerManager::PlayerBotGroupSnapshot& group,
+		const String& leaderPlanet, const Vector3& leaderPosition,
+		const String& hunterPlanet, const Vector3& hunterPosition,
+		Zone* hunterZone,
+		const PlayerBotGroupingConfig& groupingConfig);
+	// Starts one group route leg (either kind) after publishing the epoch and
+	// leg kind the synchronous failure callback reads.
+	bool startGroupTravelLeg(const SimPlayerManager::SimTravelLeg& leg,
+		uint64 routeEpoch, String& travelResult);
+	bool driveGroupTravel(AiAgent* hunter, uint64 nowMs,
+		const PlayerBotGroupRecord& record, const GroupTravelTarget& target,
+		uint64 destinationKey,
+		const PlayerBotGroupingConfig& groupingConfig, bool& arrived);
 	void resumeRoutineAfterGroup(bool postLeaving = false);
 	void leaveGroupMode();
 	bool isGroupPhase() const {
 		return phase == GROUP_WAIT || phase == GROUP_FOLLOW ||
-			phase == GROUP_TRAVEL;
+			phase == GROUP_TRAVEL || phase == GROUP_BUFF;
 	}
 	void updateGroupingAvailabilityBits(uint64 mask, uint64 value);
 	void publishGroupingCombatDead(AiAgent* body);
 	void setGroupingLootStepActive(bool active);
 	void setEarlyGameActiveFlag(bool active);
 	void beginBuffUp();
+	void beginGroupBuff(const PlayerBotGroupDirective& directive);
+	void finishGroupBuff(const String& explicitOutcome = String());
+	void cancelGroupBuff();
 	bool beginBazaarVisit(AiAgent* hunter, uint64 nowMs);
 	void finishBazaarVisit(const String& outcome, bool resumeJob = true);
 	void computeBuffNeeds(bool& needDoctor, bool& needEntertainer) const;
@@ -371,6 +403,11 @@ private:
 		const String& method, const String& args);
 	void cancelPveDoctorRequest();
 	void finishPveBuffProviderFlow();
+	bool handleBuffProviderArrival();
+	bool handleBuffProviderPathFailed();
+	void maybePostGroupRebuffNotice(AiAgent* hunter,
+		const PlayerBotGroupRecord& record, Zone* hunterZone, uint64 nowMs,
+		const PlayerBotGroupingConfig& groupingConfig);
 	bool beginBuffTripLeg();
 	void resumeAfterBuffTrip();
 	void interactWithPveBuffProvider(PveBuffApproachStage stage);

@@ -484,6 +484,9 @@ protected:
     // P.8.7 Phase 0: shared player-mimetic ticket-collector travel. The state
     // lives here so miners and hunters use the same proven choreography.
     bool interplanetaryTravelActive;
+    // G2 same-planet shuttle leg. It deliberately bypasses the ticket
+    // collector phases while reusing the shared switchZone arrival path.
+    bool travelIntraPlanetHop;
     String travelDestinationZone;
     Vector3 travelDeparturePosition;
     Vector3 travelDestinationArrival;
@@ -767,6 +770,9 @@ public:
     bool beginInterplanetaryTravel(const String& destZone,
         const Vector3& departurePos, const Vector3& destArrivalPos,
         const String& destStarportName, float boardRadius,
+        String& travelResult);
+    bool beginIntraPlanetShuttle(const Vector3& departurePos,
+        const Vector3& destArrivalPos, const String& destCity,
         String& travelResult);
     bool isInterplanetaryTravelActive() const {
         return interplanetaryTravelActive;

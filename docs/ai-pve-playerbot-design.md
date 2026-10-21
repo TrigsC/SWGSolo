@@ -736,3 +736,35 @@ that lock. The same snapshot feeds the bearer-authenticated REST endpoint,
 the WILDS dashboard drawer, and `/server playerinfo`'s deferred SimBot SUI
 message. Missing bodies produce partial identity data rather than mutating or
 respawning anything.
+
+## P.10p — Grouping G2: rally and buffs (F_0.9.16)
+
+G2 extends the released Looking For Bot grouping path with owner-directed
+meet-and-buff trips. The `directivesEnabled` capability is separate from the
+G1 grouping gate and ships `false`; a directive is accepted only from the
+group leader and is held in `SimPlayerManager` under `groupingMutex`. The
+controller owns movement and the existing doctor/entertainer provider flow,
+while the manager owns the generation-bound directive record and its
+compare-and-set stage transitions:
+
+`PLANNING` → `BUFF_TRAVEL` → `BUFFING` → `RALLY_TRAVEL` → `RALLY_HOLD`.
+
+Rally places resolve to validated outdoor city anchors or configured points.
+Buff-city selection prefers the meet city, then the bot's current buffer city,
+then a buffer city on the route, with the existing synthetic fallback when no
+provider route is available. A rally hold posts one readiness line and ends
+when the leader reaches the place, or when `follow`/another release clears the
+directive. Same-planet travel may use the existing shuttle machinery when it
+saves the configured distance; a failed intra-planet leg invalidates the route,
+suppresses shuttle retries for the suppression window, and falls back to the G1
+walk path. Route epochs reject callbacks from replaced directives or routes.
+
+The existing follow behavior remains the gate-off path. G2 adds per-group
+directive, buff, readiness, re-buff, and shuttle counters to the grouping
+dashboard and inspect drawer, plus rate-limited `GROUP_DIRECTIVE`, `GROUP_BUFF`,
+and `GROUP_SHUTTLE` mission diagnostics. Scheduled acknowledgement, readiness,
+and re-buff messages reserve a per-group next-line time under `groupingMutex`
+so bots in one group respect `minReplyGapSeconds`. The parity harness keeps
+the capability override identity-scoped and adds rally, buff, death/rejoin,
+shuttle-failure, gate-off, and stale-route scenarios; it remains disabled in
+the shipped Lua configuration.
