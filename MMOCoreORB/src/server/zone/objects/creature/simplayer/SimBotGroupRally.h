@@ -10,7 +10,9 @@
 #define SIMBOTGROUPRALLY_H_
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -49,6 +51,219 @@ struct RallyVocabulary {
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
 
+} // namespace SimBotGroupRally
+
+// G3 keeps the mission request value types beside the G2 parser so
+// LeaderLine can carry them without a circular include.  The standalone
+// SimBotGroupMission.h header includes this file and provides the remaining
+// mission policies.
+namespace SimBotGroupMission {
+
+struct DirectionRule {
+	String word;
+	int bearingDeg = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) const { return true; }
+};
+
+struct MissionVocabulary {
+	std::vector<String> grab;
+	std::vector<String> missions;
+	std::vector<String> run;
+	std::vector<String> skip;
+	std::vector<DirectionRule> directions;
+	std::vector<String> numbers;
+	int maxGrabCount = 20;
+
+	MissionVocabulary() {
+		grab = {"grab", "get", "take", "pick up"};
+		missions = {"mission", "missions", "mish", "lair", "lairs"};
+		run = {"lets do missions", "do the missions", "next mission"};
+		skip = {"skip", "skip this one"};
+		numbers = {"one", "two", "three", "four", "five"};
+		const char* words[] = {"n", "ne", "e", "se", "s", "sw", "w", "nw",
+			"north", "northeast", "east", "southeast", "south", "southwest",
+			"west", "northwest"};
+		const int bearings[] = {0, 45, 90, 135, 180, 225, 270, 315,
+			0, 45, 90, 135, 180, 225, 270, 315};
+		for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); ++i)
+			directions.push_back({String(words[i]), bearings[i]});
+	}
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) const { return true; }
+};
+
+enum MissionCommand {
+	MISSION_NONE = 0,
+	MISSION_GRAB,
+	MISSION_RUN,
+	MISSION_SKIP
+};
+
+struct MissionRequest {
+	MissionCommand command = MISSION_NONE;
+	int count = 1;
+	String creatureWord;
+	int bearingDeg = 0;
+	bool hasBearing = false;
+	String addressedBot;
+	bool unknownCreature = false;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) const { return true; }
+};
+
+inline bool missionHasToken(const std::vector<String>& values,
+		const String& token) {
+	for (size_t i = 0; i < values.size(); ++i) {
+		if (token == values[i].trim().toLowerCase())
+			return true;
+	}
+	return false;
+}
+
+inline bool missionIsNumber(const String& token, const MissionVocabulary& vocab,
+		int& value) {
+	const char* raw = token.toCharArray();
+	if (raw != nullptr && *raw != '\0') {
+		char* end = nullptr;
+		const long parsed = std::strtol(raw, &end, 10);
+		if (end != raw && *end == '\0' && parsed > 0) {
+			value = parsed > 2147483647L ? 2147483647 :
+				static_cast<int>(parsed);
+			return true;
+		}
+	}
+	for (size_t i = 0; i < vocab.numbers.size(); ++i) {
+		if (token == vocab.numbers[i].trim().toLowerCase()) {
+			value = static_cast<int>(i) + 1;
+			return true;
+		}
+	}
+	return false;
+}
+
+inline bool missionIsDirection(const String& token,
+		const MissionVocabulary& vocab, int& bearing) {
+	for (size_t i = 0; i < vocab.directions.size(); ++i) {
+		if (token == vocab.directions[i].word.trim().toLowerCase()) {
+			bearing = ((vocab.directions[i].bearingDeg % 360) + 360) % 360;
+			return true;
+		}
+	}
+	return false;
+}
+
+inline bool missionIsFiller(const String& token,
+		const MissionVocabulary& vocab) {
+	if (token == "out" || token == "front" || token == "of" ||
+			token == "at" || token == "the" || token == "lets" ||
+			token == "let" || token == "and" || token == "please" ||
+			token == "to" || token == "me" || token == "then" ||
+			token == "us" || token == "we" || token == "all" ||
+			token == "everyone" || token == "guys" || token == "now" ||
+			token == "a" || token == "an" || token == "this" ||
+			token == "one" || token == "here" || token == "around" ||
+			token == "there")
+		return true;
+	if (missionHasToken(vocab.grab, token) ||
+			missionHasToken(vocab.missions, token) ||
+			missionHasToken(vocab.skip, token))
+		return true;
+	int value = 0;
+	return missionIsNumber(token, vocab, value) ||
+		missionIsDirection(token, vocab, value);
+}
+
+inline MissionRequest parseMissionRequest(const String& text,
+		const MissionVocabulary& vocab,
+		const std::vector<String>& nameWords = std::vector<String>(),
+		const std::vector<String>& creatureWords = std::vector<String>()) {
+	MissionRequest result;
+	const std::vector<String> tokens = SimBotGrouping::tokenize(text);
+	const bool hasGrab = SimBotGrouping::containsKeyword(tokens, vocab.grab);
+	const bool hasMission = SimBotGrouping::containsKeyword(tokens, vocab.missions);
+	if (hasGrab && hasMission)
+		result.command = MISSION_GRAB;
+	else if (SimBotGrouping::containsKeyword(tokens, vocab.run))
+		result.command = MISSION_RUN;
+	else if (SimBotGrouping::containsKeyword(tokens, vocab.skip))
+		result.command = MISSION_SKIP;
+	else
+		return result;
+
+	int parsedCount = 1;
+	for (size_t i = 0; i < tokens.size(); ++i) {
+		int value = 0;
+		if (missionIsNumber(tokens[i], vocab, value)) {
+			parsedCount = value;
+			break;
+		}
+	}
+	const int maxCount = std::max(1, vocab.maxGrabCount);
+	result.count = std::max(1, std::min(maxCount, parsedCount));
+
+	for (size_t i = 0; i < tokens.size(); ++i) {
+		const String token = tokens[i].trim().toLowerCase();
+		if (missionHasToken(nameWords, token)) {
+			if (result.addressedBot.isEmpty())
+				result.addressedBot = token;
+			continue;
+		}
+		int bearing = 0;
+		if (missionIsDirection(token, vocab, bearing)) {
+			// "south east" written as two words is SE: a north/south word
+			// followed by an east/west word combines into the intercardinal.
+			int nextBearing = 0;
+			if ((bearing == 0 || bearing == 180) && i + 1 < tokens.size() &&
+					missionIsDirection(tokens[i + 1].trim().toLowerCase(), vocab,
+						nextBearing) && (nextBearing == 90 || nextBearing == 270)) {
+				bearing = bearing == 0 ? (nextBearing == 90 ? 45 : 315) :
+					(nextBearing == 90 ? 135 : 225);
+				++i;
+			}
+			if (!result.hasBearing) {
+				result.bearingDeg = bearing;
+				result.hasBearing = true;
+			}
+			continue;
+		}
+		if (missionIsFiller(token, vocab))
+			continue;
+
+		bool knownCreature = false;
+		for (size_t creatureIndex = 0; creatureIndex < creatureWords.size();
+				++creatureIndex) {
+			const String known = creatureWords[creatureIndex].trim().toLowerCase();
+			const String tokenSingular = token.length() > 1 &&
+				token.charAt(token.length() - 1) == 's' ?
+				token.subString(0, token.length() - 1) : token;
+			const String knownSingular = known.length() > 1 &&
+				known.charAt(known.length() - 1) == 's' ?
+				known.subString(0, known.length() - 1) : known;
+			if (token == known || tokenSingular == knownSingular) {
+				knownCreature = true;
+				break;
+			}
+		}
+		if (result.creatureWord.isEmpty())
+			result.creatureWord = token;
+		if (!knownCreature)
+			result.unknownCreature = true;
+	}
+	if (result.command != MISSION_GRAB) {
+		result.creatureWord = String();
+		result.unknownCreature = false;
+	}
+	return result;
+}
+
+} // namespace SimBotGroupMission
+
+namespace SimBotGroupRally {
+
 struct DirectiveText {
 	bool wantBuffs = false;
 	bool hasMeet = false;
@@ -64,6 +279,8 @@ struct LeaderLine {
 	SimBotGrouping::GroupCommand command;
 	DirectiveText directive;
 	bool isDirective = false;
+	SimBotGroupMission::MissionRequest mission;
+	bool isMission = false;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -262,7 +479,9 @@ inline DirectiveText parseDirective(const String& text,
 inline LeaderLine parseLeaderLine(const String& text,
 		const std::vector<SimBotGrouping::NamedBot>& botFirstNames,
 		const SimBotGrouping::Vocabulary& groupingVocabulary,
-		const RallyVocabulary& rallyVocabulary) {
+		const RallyVocabulary& rallyVocabulary,
+		const SimBotGroupMission::MissionVocabulary& missionVocabulary =
+			SimBotGroupMission::MissionVocabulary()) {
 	LeaderLine result;
 	result.command = SimBotGrouping::parseGroupCommand(text, botFirstNames,
 		groupingVocabulary, true);
@@ -275,13 +494,26 @@ inline LeaderLine parseLeaderLine(const String& text,
 	result.directive = parseDirective(text, rallyVocabulary, nameWords);
 	result.isDirective = result.directive.wantBuffs ||
 		result.directive.hasMeet;
+	result.mission = SimBotGroupMission::parseMissionRequest(text,
+		missionVocabulary, nameWords);
+	result.isMission = result.mission.command !=
+		SimBotGroupMission::MISSION_NONE;
 
-	// LEAVE and FOLLOW are explicit commands and win even when a place is also
-	// mentioned.  A directive wins over STATUS/READY; the manager distinguishes
-	// it with isDirective because it needs the parsed place payload.
+	// LEAVE and FOLLOW are explicit commands and win even when a place or
+	// mission is also mentioned.  Mission commands then win over G2's
+	// STATUS/READY and directive parsing.  A directive wins over STATUS/READY;
+	// the manager distinguishes it with isDirective because it needs the parsed
+	// place payload.
+	if (result.command.command == SimBotGrouping::GROUP_COMMAND_LEAVE ||
+			result.command.command == SimBotGrouping::GROUP_COMMAND_FOLLOW)
+		result.isMission = false;
 	if (result.command.command == SimBotGrouping::GROUP_COMMAND_LEAVE ||
 			result.command.command == SimBotGrouping::GROUP_COMMAND_FOLLOW)
 		result.isDirective = false;
+	else if (result.isMission) {
+		result.command.command = SimBotGrouping::GROUP_COMMAND_NONE;
+		result.isDirective = false;
+	}
 	else if (result.isDirective)
 		result.command.command = SimBotGrouping::GROUP_COMMAND_NONE;
 	return result;
@@ -393,6 +625,12 @@ enum DirectiveStage {
 	BUFFING,
 	RALLY_TRAVEL,
 	RALLY_HOLD,
+	MISSION_GRAB_TRAVEL,
+	MISSION_GRAB,
+	MISSION_WAIT,
+	MISSION_TRAVEL,
+	MISSION_HOLD,
+	MISSION_FIGHT,
 	DONE
 };
 
@@ -401,7 +639,11 @@ enum DirectiveOutcome {
 	BUFF_DONE,
 	RALLY_ARRIVAL,
 	RELEASED,
-	FAILED
+	FAILED,
+	GRAB_DONE,
+	MISSION_ARRIVAL,
+	MISSION_DONE,
+	MISSION_ABANDONED
 };
 
 inline DirectiveStage firstStage(bool wantBuffs, bool buffCityIsCurrent,
@@ -423,6 +665,17 @@ inline DirectiveStage nextStage(DirectiveStage stage,
 			stage;
 	case RALLY_HOLD:
 		return outcome == RELEASED ? DONE : stage;
+	case MISSION_GRAB_TRAVEL:
+		return outcome == ARRIVAL ? MISSION_GRAB : stage;
+	case MISSION_GRAB:
+		return outcome == GRAB_DONE ? MISSION_WAIT : stage;
+	case MISSION_TRAVEL:
+		return outcome == MISSION_ARRIVAL ? MISSION_HOLD : stage;
+	case MISSION_HOLD:
+		return outcome == RELEASED ? MISSION_FIGHT : stage;
+	case MISSION_FIGHT:
+		return outcome == MISSION_DONE || outcome == MISSION_ABANDONED ?
+			MISSION_WAIT : stage;
 	default:
 		return stage;
 	}
@@ -442,6 +695,14 @@ inline DirectiveStage nextStage(DirectiveStage stage, const String& outcome) {
 		return nextStage(stage, RELEASED);
 	if (normalized == "failed" || normalized == "fallback")
 		return nextStage(stage, FAILED);
+	if (normalized == "grab_done" || normalized == "grab_complete")
+		return nextStage(stage, GRAB_DONE);
+	if (normalized == "mission_arrival" || normalized == "mission_arrived")
+		return nextStage(stage, MISSION_ARRIVAL);
+	if (normalized == "mission_done" || normalized == "mission_complete")
+		return nextStage(stage, MISSION_DONE);
+	if (normalized == "mission_abandoned" || normalized == "abandoned")
+		return nextStage(stage, MISSION_ABANDONED);
 	return stage;
 }
 

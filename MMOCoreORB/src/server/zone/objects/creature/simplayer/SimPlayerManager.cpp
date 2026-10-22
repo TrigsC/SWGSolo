@@ -4,6 +4,8 @@
  */
 
 #include "SimPlayerManager.h"
+#include "server/zone/objects/mission/MissionObject.h"
+#include "server/zone/objects/mission/MissionTypes.h"
 #include "SimPvPController.h"
 #include "SimHunterController.h"
 #include "CellNavDiagLog.h"
@@ -32,6 +34,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -87,6 +90,7 @@
 #include "server/zone/objects/creature/ai/Creature.h"
 #include "server/zone/objects/tangible/TangibleObject.h"
 #include "server/zone/objects/tangible/consumable/Consumable.h"
+#include "server/zone/objects/transaction/TransactionLog.h"
 #include "server/zone/managers/object/ObjectManager.h"
 #include "server/zone/objects/pathfinding/NavArea.h"
 #include "server/zone/managers/collision/PathFinderManager.h"
@@ -6410,6 +6414,10 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestCreditBaselines.removeAll();
 		playerBotParityTestRequestRefs.removeAll();
 		playerBotParityTestCounterBaselines.removeAll();
+		playerBotParityDeaths.removeAll();
+		playerBotParityBorrowedIdentityIds.removeAll();
+		playerBotParityBorrowedRefs.removeAll();
+		playerBotParityBorrowedSelectionFailed = false;
 		playerBotParityGroupHarnessLeaderOids.removeAll();
 		playerBotParityDirectivesGateOverrides.removeAll();
 		playerBotParityForceGroupShuttleFailure.removeAll();
@@ -7827,6 +7835,7 @@ void SimPlayerManager::loadLuaConfig() {
 	// rebuilt (boot, before any reader task). Later refreshes validate the
 	// local copy inside applyPlayerBotProgressionConfig.
 	validatePlayerBotRallyPlaces(playerBotGroupingConfig);
+	validatePlayerBotGroupMissions(playerBotGroupingConfig);
 
 	// The board registry is keyed by routable shuttleport cities, but the
 	// PvE species table is parsed before shuttleports. Re-seed once the graph
@@ -11071,6 +11080,8 @@ static void loadGroupingRuleKeywords(LuaObject& rule,
 
 // Defined with the PvP route announcements; G2 rally lines reuse it.
 static String prettyPvpCityName(const String& name);
+static void incrementPlayerBotGroupingCounter(VectorMap<String, uint64>& map,
+		const String& key);
 
 static String replaceGroupingToken(String text, const String& token,
 		const String& replacement) {
@@ -11124,6 +11135,16 @@ void SimPlayerManager::validatePlayerBotRallyPlaces(
 	config.rallyVocabulary.places = validPlaces;
 }
 
+void SimPlayerManager::validatePlayerBotGroupMissions(
+		PlayerBotGroupingConfig& config) {
+	if (!config.missions.vocabulary.grab.empty())
+		return;
+
+	warning("SimBotGroupMissionRejected reason=empty_grab_vocabulary");
+	config.missions = playerBotGroupingConfig.missions;
+	config.missionsEnabled = playerBotGroupingConfig.missionsEnabled;
+}
+
 void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 	const bool previousProgressionEnabled = progressionEnabled;
 	SimBotCombatAbilityConfig previousCombatAbilityConfig;
@@ -11153,6 +11174,8 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		progressionAwardKillXp);
 	progressionAwardMissionCredits = config.getBooleanField(
 		"awardMissionCredits", progressionAwardMissionCredits);
+	playerBotMissionCreditsActive.store(progressionEnabled &&
+		progressionAwardMissionCredits, std::memory_order_release);
 	progressionLootEnabled = config.getBooleanField("lootEnabled",
 		progressionLootEnabled);
 	LuaObject loot = config.getObjectField("loot");
@@ -11444,6 +11467,39 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 	if (grouping.isValidTable()) {
 		groupingConfig.directivesEnabled = grouping.getBooleanField(
 			"directivesEnabled", groupingConfig.directivesEnabled);
+		groupingConfig.missionsEnabled = grouping.getBooleanField(
+			"missionsEnabled", groupingConfig.missionsEnabled);
+		LuaObject missions = grouping.getObjectField("missions");
+		if (missions.isValidTable()) {
+			PlayerBotGroupMissionsConfig& missionConfig = groupingConfig.missions;
+			missionConfig.maxGrabCount = clampIntRange(missions.getIntField(
+				"maxGrabCount", missionConfig.maxGrabCount), 1, 32);
+			missionConfig.bearingToleranceDeg = clampIntRange(
+				missions.getIntField("bearingToleranceDeg",
+					missionConfig.bearingToleranceDeg), 0, 180);
+			missionConfig.holdShortMeters = clampFloatRange(
+				missions.getFloatField("holdShortMeters",
+					missionConfig.holdShortMeters), 1.f, 1000.f);
+			// The stock group reward range is authoritative for G3.
+			missionConfig.splitRangeMeters = 128;
+			missionConfig.leaderMissionRefreshSeconds = clampIntRange(
+				missions.getIntField("leaderMissionRefreshSeconds",
+					missionConfig.leaderMissionRefreshSeconds), 1, 86400);
+			missionConfig.missionTimeoutMinutes = clampIntRange(
+				missions.getIntField("missionTimeoutMinutes",
+					missionConfig.missionTimeoutMinutes), 1, 10080);
+			missionConfig.grabBatchTimeoutSeconds = clampIntRange(
+				missions.getIntField("grabBatchTimeoutSeconds",
+					missionConfig.grabBatchTimeoutSeconds), 1, 86400);
+			missionConfig.assistLeaderTarget = missions.getBooleanField(
+				"assistLeaderTarget", missionConfig.assistLeaderTarget);
+			missionConfig.assistLeaderRadiusMeters = clampFloatRange(
+				missions.getFloatField("assistLeaderRadiusMeters",
+					missionConfig.assistLeaderRadiusMeters), 1.f, 1000.f);
+		}
+		missions.pop();
+		groupingConfig.missions.vocabulary.maxGrabCount =
+			groupingConfig.missions.maxGrabCount;
 		groupingConfig.roomName = grouping.getStringField("roomName",
 				groupingConfig.roomName.toCharArray()).trim();
 		groupingConfig.roomTitle = grouping.getStringField("roomTitle",
@@ -11631,6 +11687,37 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 			}
 			rallyVocabulary.pop();
 
+			LuaObject missionVocabulary = vocabulary.getObjectField("mission");
+			if (missionVocabulary.isValidTable()) {
+				SimBotGroupMission::MissionVocabulary& parsed =
+					groupingConfig.missions.vocabulary;
+				loadGroupingStringList(missionVocabulary, "grab", parsed.grab);
+				loadGroupingStringList(missionVocabulary, "missions", parsed.missions);
+				loadGroupingStringList(missionVocabulary, "run", parsed.run);
+				loadGroupingStringList(missionVocabulary, "skip", parsed.skip);
+				loadGroupingStringList(missionVocabulary, "numbers", parsed.numbers);
+				LuaObject directions = missionVocabulary.getObjectField(
+					"directions");
+				if (directions.isValidTable()) {
+					parsed.directions.clear();
+					for (int i = 1; i <= directions.getTableSize(); ++i) {
+						LuaObject direction = directions.getObjectAt(i);
+						if (direction.isValidTable()) {
+							SimBotGroupMission::DirectionRule rule;
+							rule.word = direction.getStringField("word").trim().toLowerCase();
+							rule.bearingDeg = direction.getIntField("bearing", 0);
+							if (!rule.word.isEmpty()) {
+								rule.bearingDeg = ((rule.bearingDeg % 360) + 360) % 360;
+								parsed.directions.push_back(rule);
+							}
+						}
+						direction.pop();
+					}
+				}
+				directions.pop();
+			}
+			missionVocabulary.pop();
+
 			LuaObject roles = vocabulary.getObjectField("roles");
 			if (roles.isValidTable()) {
 				groupingConfig.vocabulary.roles.clear();
@@ -11748,6 +11835,8 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 					groupingConfig.travellingLines);
 			loadGroupingEngineStringList(lines, "cloned",
 					groupingConfig.clonedLines);
+			loadGroupingEngineStringList(lines, "clonedNoBuffs",
+					groupingConfig.clonedNoBuffsLines);
 			loadGroupingEngineStringList(lines, "following",
 					groupingConfig.followingLines);
 			loadGroupingEngineStringList(lines, "leaving",
@@ -11768,6 +11857,26 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 					groupingConfig.buffsLowLines);
 			loadGroupingEngineStringList(lines, "followAck",
 					groupingConfig.followAckLines);
+			loadGroupingEngineStringList(lines, "missionGrabAck",
+					groupingConfig.missions.missionGrabAckLines);
+			loadGroupingEngineStringList(lines, "missionGrabbed",
+					groupingConfig.missions.missionGrabbedLines);
+			loadGroupingEngineStringList(lines, "missionGrabCapped",
+					groupingConfig.missions.missionGrabCappedLines);
+			loadGroupingEngineStringList(lines, "missionNoneFound",
+					groupingConfig.missions.missionNoneFoundLines);
+			loadGroupingEngineStringList(lines, "missionUnknownCreature",
+					groupingConfig.missions.missionUnknownCreatureLines);
+			loadGroupingEngineStringList(lines, "missionNext",
+					groupingConfig.missions.missionNextLines);
+			loadGroupingEngineStringList(lines, "missionReveal",
+					groupingConfig.missions.missionRevealLines);
+			loadGroupingEngineStringList(lines, "missionDone",
+					groupingConfig.missions.missionDoneLines);
+			loadGroupingEngineStringList(lines, "missionAllDone",
+					groupingConfig.missions.missionAllDoneLines);
+			loadGroupingEngineStringList(lines, "missionSkipped",
+					groupingConfig.missions.missionSkippedLines);
 		}
 		lines.pop();
 	}
@@ -11784,9 +11893,16 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 	// Before the first shuttleport load loadLuaConfig validates instead.
 	if (allShuttleports.size() > 0)
 		validatePlayerBotRallyPlaces(groupingConfig);
+	validatePlayerBotGroupMissions(groupingConfig);
 	playerBotGroupingConfig = groupingConfig;
 	playerBotGroupingActive.store(playerBotGroupingGateEnabled(),
 			std::memory_order_release);
+	playerBotGroupMissionsActive.store(
+		playerBotGroupingActive.load(std::memory_order_acquire) &&
+		groupingConfig.directivesEnabled && groupingConfig.missionsEnabled,
+		std::memory_order_release);
+	playerBotMissionCreditsActive.store(progressionEnabled &&
+		progressionAwardMissionCredits, std::memory_order_release);
 
 	{
 		Locker progressionLock(&progressionMutex);
@@ -12138,6 +12254,8 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.groupingContains = table.getStringField("contains").trim();
 	step.groupingStage = table.getStringField("stage").trim();
 	step.groupingTarget = table.getStringField("target").trim();
+	step.missionEntryKind = table.getStringField("missionKind").trim().toLowerCase();
+	step.missionEntryState = table.getStringField("missionState").trim().toLowerCase();
 	step.groupingFaction = table.getStringField("faction").trim().toLowerCase();
 	step.groupingReason = table.getStringField("reason").trim().toLowerCase();
 	step.groupingReleaseReason = table.getStringField(
@@ -12150,6 +12268,7 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 		table.getFloatField("y", 0.f) != 0.f ||
 		table.getFloatField("z", 0.f) != 0.f;
 	step.groupingToDirective = table.getBooleanField("toDirective", false);
+	step.groupingToMission = table.getBooleanField("toMission", false);
 	step.groupingFree = table.getBooleanField("free", true);
 	step.groupingChancePercent = clampMinerInt(
 		table.getIntField("chance", 100), 0, 0, 100);
@@ -12429,15 +12548,26 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 
 void SimPlayerManager::initializePlayerBotParityTestResults() {
 	Locker parityLock(&playerBotParityTestMutex);
+	std::vector<String> onlyScenarios;
+	for (int i = 0; i < playerBotParityOnlyScenarios.size(); ++i)
+		onlyScenarios.push_back(playerBotParityOnlyScenarios.get(i));
 	playerBotParityTestResults.removeAll();
 	for (int i = 0; i < playerBotParityTestScenarios.size(); ++i) {
 		PlayerBotParityTestScenarioResult result;
 		result.name = playerBotParityTestScenarios.get(i).name;
+		if (!SimBotParityRunPolicy::inScope(result.name, onlyScenarios)) {
+			result.status = "SKIPPED";
+			result.failReason = "not_in_scope";
+		}
 		for (int j = 0; j < playerBotParityTestScenarios.get(i).steps.size(); ++j) {
 			PlayerBotParityTestStepResult stepResult;
 			stepResult.op = playerBotParityTestScenarios.get(i).steps.get(j).op;
 			stepResult.identityIndex = playerBotParityTestScenarios.get(i).
 				steps.get(j).identityIndex;
+			if (result.status == "SKIPPED") {
+				stepResult.status = "SKIPPED";
+				stepResult.failReason = "not_in_scope";
+			}
 			result.steps.add(stepResult);
 		}
 		playerBotParityTestResults.add(result);
@@ -12445,6 +12575,9 @@ void SimPlayerManager::initializePlayerBotParityTestResults() {
 	playerBotParityTestScenarioOrder.removeAll();
 	Vector<int> restartScenarioIndexes;
 	for (int i = 0; i < playerBotParityTestScenarios.size(); ++i) {
+		if (!SimBotParityRunPolicy::inScope(
+				playerBotParityTestScenarios.get(i).name, onlyScenarios))
+			continue;
 		if (isPlayerBotParityRestartScenario(
 				playerBotParityTestScenarios.get(i).name))
 			restartScenarioIndexes.add(i);
@@ -12465,7 +12598,9 @@ void SimPlayerManager::initializePlayerBotParityTestResults() {
 	playerBotParityTestPendingRequestId = 0;
 	playerBotParityTestIdentityRefs.removeAll();
 	playerBotParityGroupHarnessLeaderOids.removeAll();
+	playerBotParityHarnessSpawnedOids.removeAll();
 	playerBotParityDirectivesGateOverrides.removeAll();
+	playerBotParityMissionsGateOverrides.removeAll();
 	playerBotParityForceGroupShuttleFailure.removeAll();
 	playerBotParityGroupLeaderOid = 0;
 	playerBotParityGroupAttackerOid = 0;
@@ -12486,6 +12621,8 @@ void SimPlayerManager::initializePlayerBotParityTestResults() {
 	playerBotParityTestKillTargetXpType = "";
 	playerBotParityTestSetupRequestActive = false;
 	playerBotParityTestCompleted = false;
+	playerBotParityTestRunStartedAtMs = 0;
+	playerBotParityTestRunCapReached = false;
 	playerBotParityTestAwaitingRestart = false;
 	playerBotParityTestBootInitialized = false;
 	playerBotParityTestPhaseAFileWritten = false;
@@ -12504,6 +12641,9 @@ void SimPlayerManager::applyPlayerBotParityTestConfig(LuaObject& config) {
 	String currentKillTargetTemplate;
 	int currentIdentityCount = 2;
 	int currentStartupDelaySeconds = 60;
+	bool currentContinueOnFailure = false;
+	Vector<String> currentOnlyScenarios;
+	int currentMaxRunMinutes = 0;
 	{
 		Locker parityLock(&playerBotParityTestMutex);
 		hadConfiguredScenarios = playerBotParityTestScenarios.size() > 0;
@@ -12513,6 +12653,9 @@ void SimPlayerManager::applyPlayerBotParityTestConfig(LuaObject& config) {
 		currentKillTargetTemplate = playerBotParityTestKillTargetTemplate;
 		currentIdentityCount = playerBotParityTestIdentityCount;
 		currentStartupDelaySeconds = playerBotParityTestStartupDelaySeconds;
+		currentContinueOnFailure = playerBotParityContinueOnFailure;
+		currentOnlyScenarios = playerBotParityOnlyScenarios;
+		currentMaxRunMinutes = playerBotParityMaxRunMinutes;
 	}
 
 	bool parsedEnabled = config.getBooleanField("enabled", currentEnabled);
@@ -12530,6 +12673,22 @@ void SimPlayerManager::applyPlayerBotParityTestConfig(LuaObject& config) {
 	int parsedStartupDelaySeconds = clampMinerInt(
 		config.getIntField("startupDelaySeconds", currentStartupDelaySeconds),
 		currentStartupDelaySeconds, 0, 3600);
+	bool parsedContinueOnFailure = config.getBooleanField(
+		"continueOnFailure", currentContinueOnFailure);
+	Vector<String> parsedOnlyScenarios = currentOnlyScenarios;
+	LuaObject onlyScenarios = config.getObjectField("onlyScenarios");
+	if (onlyScenarios.isValidTable()) {
+		parsedOnlyScenarios.removeAll();
+		for (int i = 1; i <= onlyScenarios.getTableSize(); ++i) {
+			String scenario = onlyScenarios.getStringAt(i).trim();
+			if (!scenario.isEmpty() && !parsedOnlyScenarios.contains(scenario))
+				parsedOnlyScenarios.add(scenario);
+		}
+	}
+	onlyScenarios.pop();
+	int parsedMaxRunMinutes = clampMinerInt(config.getIntField(
+		"maxRunMinutes", currentMaxRunMinutes), currentMaxRunMinutes, 0,
+		10080);
 	Vector3 parsedSpawn = currentSpawn;
 
 	LuaObject spawn = config.getObjectField("spawn");
@@ -12600,6 +12759,9 @@ void SimPlayerManager::applyPlayerBotParityTestConfig(LuaObject& config) {
 		playerBotParityTestKillTargetTemplate = parsedKillTargetTemplate;
 		playerBotParityTestIdentityCount = parsedIdentityCount;
 		playerBotParityTestStartupDelaySeconds = parsedStartupDelaySeconds;
+		playerBotParityContinueOnFailure = parsedContinueOnFailure;
+		playerBotParityOnlyScenarios = parsedOnlyScenarios;
+		playerBotParityMaxRunMinutes = parsedMaxRunMinutes;
 		// Preserve a live matrix, including per-step request state, across
 		// periodic Lua refreshes. A new matrix is loaded on the next boot.
 		if (!hadConfiguredScenarios)
@@ -18043,6 +18205,1086 @@ bool SimPlayerManager::isPlayerBotGroupDirectivesActive(uint64 identityId) const
 	return playerBotGroupingConfig.directivesEnabled;
 }
 
+bool SimPlayerManager::isPlayerBotGroupMissionsActive(uint64 identityId) const {
+	if (!playerBotGroupingActive.load(std::memory_order_acquire))
+		return false;
+	Locker parityLock(const_cast<Mutex*>(&playerBotParityTestMutex));
+	bool directivesEnabled = playerBotGroupingConfig.directivesEnabled;
+	if (identityId != 0 && playerBotParityDirectivesGateOverrides.contains(
+			identityId))
+		directivesEnabled = playerBotParityDirectivesGateOverrides.get(identityId);
+	if (!directivesEnabled)
+		return false;
+	if (identityId != 0 && playerBotParityMissionsGateOverrides.contains(
+			identityId))
+		return playerBotParityMissionsGateOverrides.get(identityId);
+	return playerBotGroupingConfig.missionsEnabled;
+}
+
+void SimPlayerManager::setPlayerBotGroupMissionDirectiveLocked(
+		const PlayerBotGroupRecord& record,
+		const PlayerBotGroupMissionPlan& plan,
+		SimBotGroupRally::DirectiveStage stage,
+		const PlayerBotGroupMissionEntry* entry,
+		const PlayerBotGroupMissionGrabRequest* request) {
+	if (record.identityId == 0 || record.state == PLAYER_BOT_GROUP_RELEASING)
+		return;
+	PlayerBotGroupDirective directive;
+	directive.identityId = record.identityId;
+	directive.groupOid = record.groupOid;
+	directive.recordGeneration = record.generation;
+	directive.directiveId = nextPlayerBotGroupingDirectiveId++;
+	if (directive.directiveId == 0)
+		directive.directiveId = nextPlayerBotGroupingDirectiveId++;
+	directive.stage = stage;
+	directive.issuedAtMs = System::getMiliTime();
+	directive.stageStartedAtMs = directive.issuedAtMs;
+	directive.missionPlanId = plan.planId;
+	directive.missionKind = entry == nullptr ?
+		PLAYER_BOT_GROUP_MISSION_BOT_OFFER : entry->kind;
+	if (entry != nullptr) {
+		directive.missionEntryId = entry->entryId;
+		directive.missionOfferId = entry->offerId;
+		directive.missionPlanet = entry->planet;
+		directive.missionPosition = entry->position;
+	}
+	if (request != nullptr) {
+		directive.missionEntryId = request->requestId;
+		directive.missionTerminalOid = request->terminalOid;
+		directive.missionPlanet = request->terminalPlanet;
+		directive.missionPosition = request->terminalPosition;
+	}
+	playerBotGroupDirectives.put(record.identityId, directive);
+	playerBotGroupingDirectiveCounters.issued++;
+	incrementPlayerBotGroupingCounter(
+		playerBotGroupingDirectiveCounters.byKind, "mission");
+	if (playerBotGroupRoutes.contains(record.identityId) &&
+			playerBotGroupRoutes.get(record.identityId).generation ==
+				record.generation) {
+		PlayerBotGroupRoute& route = playerBotGroupRoutes.get(record.identityId);
+		route.routeEpoch = nextPlayerBotGroupingRouteEpoch++;
+		if (route.routeEpoch == 0)
+			route.routeEpoch = nextPlayerBotGroupingRouteEpoch++;
+		route.legs.removeAll();
+		route.legIndex = 0;
+		route.destKey = directive.directiveId;
+		route.holdUntilMs = 0;
+		route.holdLinePosted = false;
+	}
+}
+
+void SimPlayerManager::refreshGroupPlayerMissions(uint64 groupOid,
+		bool force) {
+	if (groupOid == 0 || !isPlayerBotGroupMissionPlanActive(groupOid))
+		return;
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<GroupObject*> group = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(groupOid).castTo<GroupObject*>();
+	if (group == nullptr)
+		return;
+	Vector<uint64> memberOids;
+	Vector<uint32> memberPlanetCRCs;
+	uint64 leaderOid = 0;
+	uint32 leaderPlanetCRC = 0;
+	String leaderPlanet;
+	Vector3 leaderPosition;
+	{
+		Locker groupLock(group);
+		CreatureObject* leader = group->getLeader();
+		if (leader != nullptr) {
+			leaderOid = leader->getObjectID();
+			Zone* leaderZone = leader->getZone();
+			if (leaderZone != nullptr) {
+				leaderPlanetCRC = leaderZone->getZoneCRC();
+				leaderPlanet = leaderZone->getZoneName();
+				leaderPosition = leader->getWorldPosition();
+			}
+		}
+		for (int i = 0; i < group->getGroupSize(); ++i) {
+			CreatureObject* member = group->getGroupMember(i);
+			if (member != nullptr && member->isPlayerCreature())
+				memberOids.add(member->getObjectID());
+		}
+	}
+
+	Vector<PlayerBotGroupMissionEntry> snapshot;
+	for (int i = 0; i < memberOids.size(); ++i) {
+		ManagedReference<CreatureObject*> member = zoneServer->getObject(
+			memberOids.get(i)).castTo<CreatureObject*>();
+		if (member == nullptr)
+			continue;
+		Locker memberLock(member);
+		Zone* zone = member->getZone();
+		if (zone != nullptr && !memberPlanetCRCs.contains(zone->getZoneCRC()))
+			memberPlanetCRCs.add(zone->getZoneCRC());
+		SceneObject* datapad = member->getSlottedObject("datapad");
+		if (datapad == nullptr)
+			continue;
+		for (int j = 0; j < datapad->getContainerObjectsSize(); ++j) {
+			Reference<MissionObject*> mission = datapad->getContainerObject(j).
+				castTo<MissionObject*>();
+			if (mission == nullptr)
+				continue;
+			WaypointObject* waypoint = mission->getWaypointToMission();
+			if (waypoint == nullptr)
+				continue;
+			PlayerBotGroupMissionEntry entry;
+			entry.kind = mission->getTypeCRC() == MissionTypes::DESTROY ?
+				PLAYER_BOT_GROUP_MISSION_PLAYER_DESTROY :
+				PLAYER_BOT_GROUP_MISSION_PLAYER_OTHER;
+			entry.ownerOid = member->getObjectID();
+			entry.missionOid = mission->getObjectID();
+			// The mission's planet is the waypoint's, not the owner's current
+			// zone: a player can carry a mission across planets.
+			entry.planet = String();
+			for (int zoneIndex = 0; zoneIndex < zoneServer->getZoneCount();
+					++zoneIndex) {
+				Zone* missionZone = zoneServer->getZone(zoneIndex);
+				if (missionZone != nullptr &&
+						missionZone->getZoneCRC() == waypoint->getPlanetCRC()) {
+					entry.planet = missionZone->getZoneName();
+					break;
+				}
+			}
+			if (entry.planet.isEmpty())
+				continue;
+			entry.position = Vector3(waypoint->getWorldPositionX(),
+				waypoint->getWorldPositionY(), waypoint->getWorldPositionZ());
+			entry.creatureLabel = mission->getTargetName();
+			entry.rewardDivisor = mission->getRewardCreditsDivisor();
+			entry.startedAtMs = System::getMiliTime();
+			snapshot.add(entry);
+		}
+	}
+
+	bool refresh = false;
+	bool standInGroup = memberOids.size() == 0 && leaderOid != 0 &&
+		isPlayerBotGroupHarnessLeader(leaderOid);
+	PlayerBotGroupMissionWaypointWinner standInWinner;
+	{
+		Locker groupingLock(&groupingMutex);
+		if (!playerBotGroupMissionPlans.contains(groupOid))
+			return;
+		PlayerBotGroupMissionPlan& plan = playerBotGroupMissionPlans.get(groupOid);
+		const uint64 nowMs = System::getMiliTime();
+		int refreshSeconds = Math::max(1,
+			playerBotGroupingConfig.missions.leaderMissionRefreshSeconds);
+		for (int i = 0; i < plan.entries.size(); ++i) {
+			const PlayerBotGroupMissionEntry& entry = plan.entries.get(i);
+			if (entry.entryId == plan.currentEntryId &&
+					entry.kind == PLAYER_BOT_GROUP_MISSION_PLAYER_DESTROY &&
+					!entry.completed && !entry.abandoned && entry.lairOid == 0) {
+				refreshSeconds = Math::min(refreshSeconds, 3);
+				break;
+			}
+		}
+		const uint64 intervalMs = static_cast<uint64>(refreshSeconds) * 1000ULL;
+		if (plan.leaderMissionsRefreshedAtMs != 0 &&
+			nowMs < plan.leaderMissionsRefreshedAtMs + intervalMs &&
+			!standInGroup && !force)
+			return;
+		plan.leaderMissionsRefreshedAtMs = nowMs;
+		refresh = true;
+		for (int i = 0; i < snapshot.size(); ++i) {
+			PlayerBotGroupMissionEntry& fresh = snapshot.get(i);
+			int existing = -1;
+			for (int j = 0; j < plan.entries.size(); ++j) {
+				if (plan.entries.get(j).missionOid == fresh.missionOid) {
+					existing = j;
+					break;
+				}
+			}
+			if (existing >= 0) {
+				PlayerBotGroupMissionEntry& entry = plan.entries.get(existing);
+				entry.kind = fresh.kind;
+				entry.ownerOid = fresh.ownerOid;
+				entry.planet = fresh.planet;
+				entry.position = fresh.position;
+				entry.completed = false;
+				entry.abandoned = false;
+			} else {
+				fresh.entryId = plan.nextEntryId++;
+				plan.entries.add(fresh);
+			}
+		}
+		for (int i = 0; i < plan.entries.size(); ++i) {
+			PlayerBotGroupMissionEntry& entry = plan.entries.get(i);
+			if ((entry.kind != PLAYER_BOT_GROUP_MISSION_PLAYER_DESTROY &&
+					entry.kind != PLAYER_BOT_GROUP_MISSION_PLAYER_OTHER) ||
+				entry.completed || entry.abandoned)
+				continue;
+			bool present = false;
+			for (int j = 0; j < snapshot.size(); ++j)
+				present |= snapshot.get(j).missionOid == entry.missionOid;
+			if (!present) {
+				entry.completed = true;
+				if (plan.currentEntryId == entry.entryId) {
+					plan.currentEntryId = 0;
+					++plan.planEpoch;
+				}
+			}
+		}
+		if (standInGroup && leaderPlanetCRC != 0) {
+			if (!memberPlanetCRCs.contains(leaderPlanetCRC))
+				memberPlanetCRCs.add(leaderPlanetCRC);
+			standInWinner.none = true;
+			standInWinner.planetCRC = leaderPlanetCRC;
+			standInWinner.leaderPlanetCRC = leaderPlanetCRC;
+			standInWinner.planet = leaderPlanet;
+			float shortest = std::numeric_limits<float>::max();
+			for (int i = 0; i < plan.entries.size(); ++i) {
+				const PlayerBotGroupMissionEntry& entry = plan.entries.get(i);
+				if (entry.kind != PLAYER_BOT_GROUP_MISSION_BOT_OFFER ||
+						entry.completed || entry.abandoned)
+					continue;
+				ZoneServer* entryServer = ServerCore::getZoneServer();
+				Zone* entryZone = entryServer == nullptr || entry.planet.isEmpty() ?
+					nullptr : entryServer->getZone(entry.planet);
+				if (entryZone == nullptr || entryZone->getZoneCRC() != leaderPlanetCRC)
+					continue;
+				const float distance = std::fabs(entry.position.getX() -
+					leaderPosition.getX()) + std::fabs(entry.position.getY() -
+					leaderPosition.getY());
+				if (distance >= shortest)
+					continue;
+				shortest = distance;
+				standInWinner.none = false;
+				standInWinner.kind = PLAYER_BOT_GROUP_MISSION_BOT_OFFER;
+				standInWinner.planId = plan.planId;
+				standInWinner.entryId = entry.entryId;
+				standInWinner.position = entry.position;
+			}
+		}
+	}
+
+	// Plan activity was checked per group at entry (harness override
+	// honoured); apply directly instead of through the global-gated entry.
+	if (standInGroup && !standInWinner.none)
+		applyGroupNearestMission(groupOid, standInWinner);
+	if (refresh) {
+		groupMissionWaypointRefreshes.increment();
+		Locker groupLock(group);
+		for (int i = 0; i < memberPlanetCRCs.size(); ++i)
+			group->scheduleUpdateNearestMissionForGroup(memberPlanetCRCs.get(i));
+	}
+}
+
+void SimPlayerManager::getGroupBotMissionTargets(uint64 groupOid,
+		uint32 planetCRC, Vector<PlayerBotGroupMissionWaypointTarget>& targets,
+		Vector<uint64>& skippedPlayerMissionOids) const {
+	targets.removeAll();
+	skippedPlayerMissionOids.removeAll();
+	if (groupOid == 0 ||
+			!playerBotGroupMissionsActive.load(std::memory_order_acquire))
+		return;
+	Locker groupingLock(const_cast<Mutex*>(&groupingMutex));
+	if (!playerBotGroupMissionPlans.contains(groupOid))
+		return;
+	const PlayerBotGroupMissionPlan& plan =
+		playerBotGroupMissionPlans.get(groupOid);
+	const uint64 nowMs = System::getMiliTime();
+	const uint64 timeoutMs = static_cast<uint64>(Math::max(1,
+		playerBotGroupingConfig.missions.missionTimeoutMinutes)) * 60000ULL;
+	for (int i = 0; i < plan.entries.size(); ++i) {
+		const PlayerBotGroupMissionEntry& entry = plan.entries.get(i);
+		if (entry.abandoned) {
+			if (entry.kind != PLAYER_BOT_GROUP_MISSION_BOT_OFFER &&
+					entry.missionOid != 0)
+				skippedPlayerMissionOids.add(entry.missionOid);
+			continue;
+		}
+		if (entry.completed)
+			continue;
+		if (entry.startedAtMs != 0 && timeoutMs > 0 && nowMs >=
+				entry.startedAtMs + timeoutMs) {
+			if (entry.kind != PLAYER_BOT_GROUP_MISSION_BOT_OFFER &&
+					entry.missionOid != 0)
+				skippedPlayerMissionOids.add(entry.missionOid);
+			continue;
+		}
+		if (entry.kind != PLAYER_BOT_GROUP_MISSION_BOT_OFFER)
+			continue;
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		Zone* entryZone = zoneServer == nullptr || entry.planet.isEmpty() ?
+			nullptr : zoneServer->getZone(entry.planet);
+		if (entryZone == nullptr || entryZone->getZoneCRC() != planetCRC)
+			continue;
+		PlayerBotGroupMissionWaypointTarget target;
+		target.position = entry.position;
+		target.planId = plan.planId;
+		target.entryId = entry.entryId;
+		targets.add(target);
+	}
+}
+
+void SimPlayerManager::publishGroupNearestMission(uint64 groupOid,
+		const PlayerBotGroupMissionWaypointWinner& winner) {
+	// Entry point for the stock UpdateNearestMissionForGroupTask, which holds
+	// the group lock: the lock-free global gate only. The harness enables
+	// missions per identity and publishes through refreshGroupPlayerMissions.
+	if (groupOid == 0 ||
+			!playerBotGroupMissionsActive.load(std::memory_order_acquire))
+		return;
+	applyGroupNearestMission(groupOid, winner);
+}
+
+// Callers have checked the gate (global, or per group with no object lock).
+void SimPlayerManager::applyGroupNearestMission(uint64 groupOid,
+		const PlayerBotGroupMissionWaypointWinner& winner) {
+	if (groupOid == 0)
+		return;
+	Locker groupingLock(&groupingMutex);
+	if (!playerBotGroupMissionPlans.contains(groupOid))
+		return;
+	PlayerBotGroupMissionPlan& plan = playerBotGroupMissionPlans.get(groupOid);
+	const bool winnerIsLeaderPlanet = winner.leaderPlanetCRC == 0 ||
+		winner.planetCRC == winner.leaderPlanetCRC;
+	auto publishDirective = [&]() {
+		for (int recordIndex = 0; recordIndex < playerBotGroupRecords.size();
+				recordIndex++) {
+			const PlayerBotGroupRecord& record =
+				playerBotGroupRecords.elementAt(recordIndex).getValue();
+			if (record.groupOid != groupOid)
+				continue;
+			const PlayerBotGroupMissionEntry* currentEntry = nullptr;
+			for (int entryIndex = 0; entryIndex < plan.entries.size();
+					entryIndex++)
+				if (plan.entries.get(entryIndex).entryId == plan.currentEntryId) {
+					currentEntry = &plan.entries.get(entryIndex);
+					break;
+				}
+			setPlayerBotGroupMissionDirectiveLocked(record, plan,
+				plan.runRequested ? SimBotGroupRally::MISSION_TRAVEL :
+				SimBotGroupRally::MISSION_WAIT, currentEntry);
+		}
+	};
+	if (!winner.none && winner.planId == plan.planId) {
+		for (int i = 0; i < plan.entries.size(); ++i) {
+			PlayerBotGroupMissionEntry& entry = plan.entries.get(i);
+			if (entry.entryId == winner.entryId && !entry.completed &&
+					!entry.abandoned) {
+				entry.position = winner.position;
+				if (winnerIsLeaderPlanet && plan.currentEntryId != entry.entryId) {
+					plan.currentEntryId = entry.entryId;
+					++plan.planEpoch;
+				}
+				if (winnerIsLeaderPlanet)
+					publishDirective();
+				return;
+			}
+		}
+		return;
+	}
+	if (!winner.none && winner.missionOid != 0) {
+		int existing = -1;
+		for (int i = 0; i < plan.entries.size(); ++i) {
+			if (plan.entries.get(i).missionOid == winner.missionOid) {
+				existing = i;
+				break;
+			}
+		}
+		if (existing < 0) {
+			PlayerBotGroupMissionEntry entry;
+			entry.entryId = plan.nextEntryId++;
+			entry.kind = winner.kind == PLAYER_BOT_GROUP_MISSION_PLAYER_DESTROY ?
+				PLAYER_BOT_GROUP_MISSION_PLAYER_DESTROY :
+				PLAYER_BOT_GROUP_MISSION_PLAYER_OTHER;
+			entry.missionOid = winner.missionOid;
+			entry.ownerOid = winner.ownerOid;
+			entry.planet = winner.planet;
+			entry.position = winner.position;
+			entry.startedAtMs = System::getMiliTime();
+			plan.entries.add(entry);
+			existing = plan.entries.size() - 1;
+		} else {
+			plan.entries.get(existing).position = winner.position;
+		}
+		PlayerBotGroupMissionEntry& entry = plan.entries.get(existing);
+		if (winnerIsLeaderPlanet && !entry.completed && !entry.abandoned &&
+				plan.currentEntryId != entry.entryId) {
+			plan.currentEntryId = entry.entryId;
+			++plan.planEpoch;
+		}
+		if (winnerIsLeaderPlanet)
+			publishDirective();
+		return;
+	}
+	if (winner.none && plan.currentEntryId != 0) {
+		plan.currentEntryId = 0;
+		++plan.planEpoch;
+		for (int recordIndex = 0; recordIndex < playerBotGroupRecords.size();
+				recordIndex++) {
+			const PlayerBotGroupRecord& record =
+				playerBotGroupRecords.elementAt(recordIndex).getValue();
+			if (record.groupOid == groupOid)
+				setPlayerBotGroupMissionDirectiveLocked(record, plan,
+					SimBotGroupRally::DONE);
+		}
+	}
+}
+
+bool SimPlayerManager::getPlayerBotGroupMissionContext(uint64 identityId,
+		PlayerBotGroupMissionContext& context) const {
+	context = PlayerBotGroupMissionContext();
+	if (identityId == 0 || !isPlayerBotGroupMissionsActive(identityId))
+		return false;
+	uint64 groupOid = 0;
+	{
+		Locker groupingLock(const_cast<Mutex*>(&groupingMutex));
+		if (!playerBotGroupRecords.contains(identityId))
+			return false;
+		const PlayerBotGroupRecord& record =
+			playerBotGroupRecords.get(identityId);
+		if (record.state != PLAYER_BOT_GROUP_GROUPED)
+			return false;
+		groupOid = record.groupOid;
+		if (!playerBotGroupMissionPlans.contains(groupOid))
+			return false;
+		PlayerBotGroupMissionPlan& plan =
+			const_cast<SimPlayerManager*>(this)->playerBotGroupMissionPlans.get(groupOid);
+		for (int i = 0; i < plan.grabRequests.size(); ++i) {
+			const PlayerBotGroupMissionGrabRequest& request =
+				plan.grabRequests.get(i);
+			if (request.identityId != identityId || request.state !=
+					PLAYER_BOT_GROUP_MISSION_GRAB_PENDING)
+				continue;
+			context.active = true;
+			context.grabTravel = true;
+			context.planId = plan.planId;
+			context.planEpoch = plan.planEpoch;
+			context.entryId = request.requestId;
+			context.terminalOid = request.terminalOid;
+			context.planet = request.terminalPlanet;
+			context.position = request.terminalPosition;
+			context.creatureWord = request.creatureWord;
+			context.bearingDeg = request.bearingDeg;
+			context.hasBearing = request.hasBearing;
+			return true;
+		}
+		// An expired batch is closed only by evaluatePlayerBotGroupMissionBatches
+		// (reconcile), which also publishes directives and refreshes the waypoint.
+		if (plan.activeGrabBatchId != 0) {
+			for (int i = 0; i < plan.grabRequests.size(); ++i) {
+				const PlayerBotGroupMissionGrabRequest& request =
+					plan.grabRequests.get(i);
+				if (request.identityId != identityId || request.batchId !=
+						plan.activeGrabBatchId)
+					continue;
+				context.active = true;
+				context.grabWaiting = request.state !=
+					PLAYER_BOT_GROUP_MISSION_GRAB_PENDING;
+				context.grabTravel = true;
+				context.planId = plan.planId;
+				context.planEpoch = plan.planEpoch;
+				context.entryId = request.requestId;
+				context.terminalOid = request.terminalOid;
+				context.planet = request.terminalPlanet;
+				context.position = request.terminalPosition;
+				context.creatureWord = request.creatureWord;
+				context.bearingDeg = request.bearingDeg;
+				context.hasBearing = request.hasBearing;
+				return true;
+			}
+			return false;
+		}
+		if (!plan.runRequested)
+			return false;
+		for (int i = 0; i < plan.entries.size(); ++i) {
+			const PlayerBotGroupMissionEntry& entry = plan.entries.get(i);
+			if (entry.entryId != plan.currentEntryId || entry.completed ||
+					entry.abandoned)
+				continue;
+			context.active = true;
+			context.holder = entry.kind == PLAYER_BOT_GROUP_MISSION_BOT_OFFER &&
+				entry.holderIdentityId == identityId;
+		context.planId = plan.planId;
+		context.planEpoch = plan.planEpoch;
+			context.entryId = entry.entryId;
+			context.offerId = entry.offerId;
+			context.lairOid = entry.lairOid;
+			context.holderIdentityId = entry.holderIdentityId;
+			context.ownerOid = entry.ownerOid == 0 ? plan.leaderOid :
+				entry.ownerOid;
+			context.kind = entry.kind;
+			context.planet = entry.planet;
+			context.position = entry.position;
+			context.revealed = entry.revealed;
+			return true;
+		}
+	}
+	return false;
+}
+
+void SimPlayerManager::updatePlayerBotGroupMissionStage(uint64 identityId,
+		uint64 planId, uint64 entryId, SimBotGroupRally::DirectiveStage stage) {
+	if (identityId == 0 || planId == 0 || entryId == 0)
+		return;
+	Locker groupingLock(&groupingMutex);
+	if (!playerBotGroupRecords.contains(identityId))
+		return;
+	const PlayerBotGroupRecord& record = playerBotGroupRecords.get(identityId);
+	if (!playerBotGroupMissionPlans.contains(record.groupOid))
+		return;
+	PlayerBotGroupMissionPlan& plan =
+		playerBotGroupMissionPlans.get(record.groupOid);
+	if (plan.planId != planId)
+		return;
+	for (int i = 0; i < plan.entries.size(); ++i) {
+		const PlayerBotGroupMissionEntry& entry = plan.entries.get(i);
+		if (entry.entryId == entryId && !entry.completed && !entry.abandoned) {
+			setPlayerBotGroupMissionDirectiveLocked(record, plan, stage, &entry);
+			return;
+		}
+	}
+}
+
+uint64 SimPlayerManager::openGroupMissionTerminalVisit(uint64 identityId,
+		uint64 bodyOid, uint64 groupOid, uint64 planEpoch) {
+	if (identityId == 0 || bodyOid == 0 || groupOid == 0)
+		return 0;
+	uint64 acceptedEpoch = 0;
+	{
+		Locker groupingLock(&groupingMutex);
+		if (!playerBotGroupMissionPlans.contains(groupOid) ||
+				!playerBotGroupRecords.contains(identityId))
+			return 0;
+		const PlayerBotGroupMissionPlan& plan =
+			playerBotGroupMissionPlans.get(groupOid);
+		const PlayerBotGroupRecord& record =
+			playerBotGroupRecords.get(identityId);
+		if (record.state != PLAYER_BOT_GROUP_GROUPED ||
+				record.groupOid != groupOid || plan.planEpoch != planEpoch ||
+				plan.activeGrabBatchId == 0 ||
+				(plan.activeGrabBatchDeadlineMs != 0 &&
+				 System::getMiliTime() >= plan.activeGrabBatchDeadlineMs))
+			return 0;
+		for (int i = 0; i < plan.grabRequests.size(); ++i) {
+			const PlayerBotGroupMissionGrabRequest& request =
+				plan.grabRequests.get(i);
+			if (request.identityId == identityId && request.state ==
+					PLAYER_BOT_GROUP_MISSION_GRAB_PENDING && request.batchId ==
+					plan.activeGrabBatchId) {
+				acceptedEpoch = plan.planEpoch;
+				break;
+			}
+		}
+	}
+	if (acceptedEpoch == 0)
+		return 0;
+	Locker pveLock(&pveMutex);
+	return pveIdentityBodyOids.contains(identityId) &&
+		pveIdentityBodyOids.get(identityId) == bodyOid ? acceptedEpoch : 0;
+}
+
+bool SimPlayerManager::generatePlayerBotGroupMissionOffers(
+		uint64 identityId, uint64 bodyOid,
+		const PveMissionTerminalLocation& terminal, int hunterLevel,
+		const String& creatureWord, int bearingDeg, bool hasBearing,
+		int wantCount, Vector<PveBotMissionOffer>& offers) {
+	offers.removeAll();
+	if (identityId == 0 || bodyOid == 0 || terminal.terminalOid == 0)
+		return false;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	MissionManager* missionManager = zoneServer == nullptr ? nullptr :
+		zoneServer->getMissionManager();
+	const int maxHeld = missionManager == nullptr ? 2 :
+		Math::max(1, missionManager->getMaxActiveMissions());
+	int held = 0;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveBotMissions.contains(identityId))
+			held = pveBotMissions.get(identityId).size();
+	}
+	// The bot takes what it was assigned, never more than the server's
+	// per-player limit leaves room for.
+	const int offerCount = Math::max(0, Math::min(wantCount, maxHeld - held));
+	for (int i = 0; i < offerCount; ++i) {
+		PveBotMissionOffer offer;
+		offer.identityId = identityId;
+		offer.bodyOid = bodyOid;
+		offer.planet = terminal.planet;
+		offer.terminalOid = terminal.terminalOid;
+		offer.terminalType = terminal.terminalType;
+		offer.issuedAtMs = System::getMiliTime();
+	if (!selectPveBotMissionLairSpawn(terminal.planet, hunterLevel, offer,
+			String(), String(), String(), false, creatureWord))
+			continue;
+		if (!choosePveBotMissionPosition(terminal, offer.difficultyLevel,
+				terminal.planet, offer.advertisedPos, offer.bearingDeg,
+				identityId, bearingDeg, hasBearing))
+			continue;
+		offers.add(offer);
+	}
+	if (offers.size() == 0)
+		return false;
+	Locker pveLock(&pveMutex);
+	Vector<PveBotMissionOffer> stored;
+	if (pveBotMissions.contains(identityId))
+		stored = pveBotMissions.get(identityId);
+	Vector<PveBotMissionOffer> committed;
+	for (int i = 0; i < offers.size() && stored.size() < maxHeld; ++i) {
+		PveBotMissionOffer offer = offers.get(i);
+		offer.offerId = pveNextMissionOfferId++;
+		if (pveNextMissionOfferId == 0)
+			pveNextMissionOfferId = 1;
+		stored.add(offer);
+		committed.add(offer);
+	}
+	pveBotMissions.put(identityId, stored);
+	offers = committed;
+	return offers.size() > 0;
+}
+
+bool SimPlayerManager::completePlayerBotGroupMissionGrab(uint64 identityId,
+		uint64 bodyOid, uint64 planId, uint64 entryId, uint64 terminalOid) {
+	PlayerBotGroupMissionGrabRequest request;
+	uint64 groupOid = 0;
+	uint64 planEpoch = 0;
+	{
+		Locker groupingLock(&groupingMutex);
+		for (int i = 0; i < playerBotGroupMissionPlans.size(); ++i) {
+			PlayerBotGroupMissionPlan& plan =
+				playerBotGroupMissionPlans.elementAt(i).getValue();
+			if (plan.planId != planId)
+				continue;
+			for (int j = 0; j < plan.grabRequests.size(); ++j) {
+				if (plan.grabRequests.get(j).identityId == identityId &&
+						plan.grabRequests.get(j).requestId == entryId &&
+						plan.grabRequests.get(j).state ==
+						PLAYER_BOT_GROUP_MISSION_GRAB_PENDING) {
+					request = plan.grabRequests.get(j);
+				groupOid = plan.groupOid;
+				planEpoch = plan.planEpoch;
+				break;
+				}
+			}
+			if (groupOid != 0)
+				break;
+		}
+	}
+	if (groupOid == 0 || openGroupMissionTerminalVisit(identityId, bodyOid,
+			groupOid, planEpoch) == 0)
+		return false;
+	auto scheduleGroupMissionRefresh = [this, groupOid]() {
+		refreshGroupPlayerMissions(groupOid, true);
+	};
+
+	PveMissionTerminalLocation terminal;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < allMissionTerminals.size(); ++i) {
+			if (allMissionTerminals.get(i).terminalOid == (terminalOid != 0 ?
+					terminalOid : request.terminalOid)) {
+				terminal = allMissionTerminals.get(i);
+				break;
+			}
+		}
+	}
+	if (terminal.terminalOid == 0)
+		return false;
+	Vector<PveBotMissionOffer> offers;
+	if (!generatePlayerBotGroupMissionOffers(identityId, bodyOid, terminal,
+		getPveBotHunterLevelForBody(bodyOid), request.creatureWord,
+		request.bearingDeg, request.hasBearing, request.count, offers)) {
+		bool batchDone = false;
+		bool allMissionsDone = false;
+		{
+			Locker groupingLock(&groupingMutex);
+			if (playerBotGroupMissionPlans.contains(groupOid)) {
+				PlayerBotGroupMissionPlan& plan =
+					playerBotGroupMissionPlans.get(groupOid);
+				for (int j = 0; j < plan.grabRequests.size(); ++j)
+					if (plan.grabRequests.get(j).requestId == entryId &&
+							plan.grabRequests.get(j).identityId == identityId)
+						plan.grabRequests.get(j).state =
+							PLAYER_BOT_GROUP_MISSION_GRAB_NONE_FOUND;
+				if (playerBotGroupRecords.contains(identityId))
+					setPlayerBotGroupMissionDirectiveLocked(
+						playerBotGroupRecords.get(identityId), plan,
+						SimBotGroupRally::MISSION_GRAB, nullptr, &request);
+				batchDone = plan.activeGrabBatchId != 0;
+				for (int j = 0; batchDone && j < plan.grabRequests.size(); ++j)
+					if (plan.grabRequests.get(j).batchId == plan.activeGrabBatchId &&
+							plan.grabRequests.get(j).state ==
+							PLAYER_BOT_GROUP_MISSION_GRAB_PENDING)
+						batchDone = false;
+				if (batchDone) {
+					plan.activeGrabBatchId = 0;
+					plan.activeGrabBatchDeadlineMs = 0;
+					plan.runRequested = true; // a closed batch sends the group out
+					++plan.planEpoch;
+					bool allDone = true;
+					for (int j = 0; j < plan.entries.size(); ++j)
+						if (!plan.entries.get(j).completed &&
+								!plan.entries.get(j).abandoned)
+							allDone = false;
+					for (int j = 0; j < playerBotGroupRecords.size(); ++j) {
+						const PlayerBotGroupRecord& record =
+							playerBotGroupRecords.elementAt(j).getValue();
+						if (record.groupOid == groupOid)
+							setPlayerBotGroupMissionDirectiveLocked(record, plan,
+								allDone ? SimBotGroupRally::DONE :
+								SimBotGroupRally::MISSION_WAIT);
+					}
+					allMissionsDone = allDone;
+				}
+			}
+		}
+		scheduleGroupMissionRefresh();
+		if (allMissionsDone) {
+			PlayerBotGroupingConfig missionConfig = playerBotGroupingConfig;
+			String line = missionConfig.missions.missionAllDoneLines.size() > 0 ?
+				missionConfig.missions.missionAllDoneLines.get(0) :
+				String("That's all of them.");
+			postPlayerBotGroupMissionLine(groupOid, 0, line);
+		}
+		return false;
+	}
+	auto discardGeneratedOffers = [this, identityId,
+			&offers]() {
+		Locker pveLock(&pveMutex);
+		if (!pveBotMissions.contains(identityId))
+			return;
+		Vector<PveBotMissionOffer>& stored = pveBotMissions.get(identityId);
+		for (int i = stored.size() - 1; i >= 0; --i)
+			for (int j = 0; j < offers.size(); ++j)
+				if (stored.get(i).offerId == offers.get(j).offerId) {
+					stored.remove(i);
+					break;
+				}
+		if (stored.size() == 0)
+			pveBotMissions.drop(identityId);
+	};
+
+	bool grabBatchDone = false;
+	bool groupAllMissionsDone = false;
+	bool staleVisit = false;
+	{
+		Locker groupingLock(&groupingMutex);
+		if (!playerBotGroupMissionPlans.contains(groupOid)) {
+			staleVisit = true;
+		} else {
+			PlayerBotGroupMissionPlan& plan = playerBotGroupMissionPlans.get(groupOid);
+			if (plan.planId != planId || plan.planEpoch != planEpoch) {
+				staleVisit = true;
+			} else {
+				for (int i = 0; i < offers.size(); ++i) {
+					const PveBotMissionOffer& offer = offers.get(i);
+					PlayerBotGroupMissionEntry entry;
+					entry.entryId = plan.nextEntryId++;
+					entry.kind = PLAYER_BOT_GROUP_MISSION_BOT_OFFER;
+					entry.holderIdentityId = identityId;
+					entry.offerId = offer.offerId;
+					entry.planet = offer.planet;
+					entry.position = offer.advertisedPos;
+					entry.creatureLabel = request.creatureWord;
+					entry.lairTemplate = offer.lairTemplate;
+					entry.startedAtMs = System::getMiliTime();
+					plan.entries.add(entry);
+				}
+				for (int i = 0; i < plan.grabRequests.size(); ++i)
+					if (plan.grabRequests.get(i).requestId == entryId)
+						plan.grabRequests.get(i).state =
+							PLAYER_BOT_GROUP_MISSION_GRAB_DONE;
+				if (playerBotGroupRecords.contains(identityId))
+					setPlayerBotGroupMissionDirectiveLocked(
+						playerBotGroupRecords.get(identityId), plan,
+						SimBotGroupRally::MISSION_GRAB, nullptr, &request);
+				grabBatchDone = plan.activeGrabBatchId != 0;
+				for (int i = 0; grabBatchDone && i < plan.grabRequests.size(); ++i)
+					if (plan.grabRequests.get(i).batchId == plan.activeGrabBatchId &&
+							plan.grabRequests.get(i).state ==
+							PLAYER_BOT_GROUP_MISSION_GRAB_PENDING)
+						grabBatchDone = false;
+				if (grabBatchDone) {
+					plan.activeGrabBatchId = 0;
+					plan.activeGrabBatchDeadlineMs = 0;
+					plan.runRequested = true; // a closed batch sends the group out
+					++plan.planEpoch;
+					groupAllMissionsDone = true;
+					for (int i = 0; i < plan.entries.size(); ++i)
+						if (!plan.entries.get(i).completed &&
+								!plan.entries.get(i).abandoned)
+							groupAllMissionsDone = false;
+					for (int i = 0; i < playerBotGroupRecords.size(); ++i) {
+						const PlayerBotGroupRecord& record =
+							playerBotGroupRecords.elementAt(i).getValue();
+						if (record.groupOid != groupOid)
+							continue;
+						setPlayerBotGroupMissionDirectiveLocked(record, plan,
+							groupAllMissionsDone ? SimBotGroupRally::DONE :
+							SimBotGroupRally::MISSION_WAIT);
+					}
+				}
+			}
+		}
+	}
+	if (staleVisit) {
+		discardGeneratedOffers();
+		return false;
+	}
+	if (!staleVisit) {
+		// Tell the group where each grabbed mission is, with coordinates: the
+		// group waypoint shows only the nearest one.
+		PlayerBotGroupingConfig grabbedConfig = playerBotGroupingConfig;
+		for (int i = 0; i < offers.size(); ++i) {
+			const PveBotMissionOffer& offer = offers.get(i);
+			String line = grabbedConfig.missions.missionGrabbedLines.size() > 0 ?
+				grabbedConfig.missions.missionGrabbedLines.get(0) :
+				String("Got a {creature} mission at {x}, {y}.");
+			const String creature = request.creatureWord.isEmpty() ?
+				offer.lairTemplate : request.creatureWord;
+			line = replaceGroupingToken(line, "{creature}", creature);
+			line = replaceGroupingToken(line, "{meters}", String::valueOf(
+				SimBotGroupMission::roundedMeters(terminal.position,
+					offer.advertisedPos)));
+			line = replaceGroupingToken(line, "{dir}", SimBotGroupMission::
+				compassWord(terminal.position, offer.advertisedPos));
+			line = replaceGroupingToken(line, "{city}", terminal.city);
+			line = replaceGroupingToken(line, "{x}", String::valueOf(
+				static_cast<int>(offer.advertisedPos.getX())));
+			line = replaceGroupingToken(line, "{y}", String::valueOf(
+				static_cast<int>(offer.advertisedPos.getY())));
+			postPlayerBotGroupMissionLine(groupOid, identityId, line);
+		}
+	}
+	if (grabBatchDone)
+		scheduleGroupMissionRefresh();
+	if (groupAllMissionsDone) {
+		PlayerBotGroupingConfig config = playerBotGroupingConfig;
+		String line = config.missions.missionAllDoneLines.size() > 0 ?
+			config.missions.missionAllDoneLines.get(0) : String("That's all of them.");
+		postPlayerBotGroupMissionLine(groupOid, 0, line);
+	}
+	return true;
+}
+
+bool SimPlayerManager::reportPlayerBotGroupMissionReveal(uint64 groupOid,
+		uint64 planId, uint64 entryId, uint64 lairOid, const Vector3& position) {
+	if (groupOid == 0 || planId == 0 || entryId == 0 || lairOid == 0 ||
+			!isPlayerBotGroupMissionPlanActive(groupOid))
+		return false;
+	String creature;
+	Vector3 revealPosition = position;
+	bool callout = false;
+	uint64 calloutSpeaker = 0;
+	{
+		Locker groupingLock(&groupingMutex);
+		if (!playerBotGroupMissionPlans.contains(groupOid))
+			return false;
+		PlayerBotGroupMissionPlan& plan = playerBotGroupMissionPlans.get(groupOid);
+		if (plan.planId != planId || plan.currentEntryId != entryId)
+			return false;
+		for (int i = 0; i < plan.entries.size(); ++i) {
+			PlayerBotGroupMissionEntry& entry = plan.entries.get(i);
+			if (entry.entryId != entryId || entry.completed || entry.abandoned)
+				continue;
+			if (entry.revealed && entry.lairOid == lairOid)
+				return true;
+			entry.revealed = true;
+			entry.lairOid = lairOid;
+			entry.position = position;
+			creature = entry.creatureLabel.isEmpty() ? entry.lairTemplate :
+				entry.creatureLabel;
+			calloutSpeaker = entry.kind == PLAYER_BOT_GROUP_MISSION_BOT_OFFER ?
+				entry.holderIdentityId : 0;
+			callout = !entry.revealCalloutPosted;
+			entry.revealCalloutPosted = true;
+			break;
+		}
+	}
+	if (callout) {
+		PlayerBotGroupingConfig config = playerBotGroupingConfig;
+		String line = config.missions.missionRevealLines.size() > 0 ?
+			config.missions.missionRevealLines.get(0) :
+			String("Mission lair's up.");
+		line = replaceGroupingToken(line, "{Creature}", creature);
+		line = replaceGroupingToken(line, "{creature}", creature);
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<GroupObject*> group = zoneServer == nullptr ? nullptr :
+			zoneServer->getObject(groupOid).castTo<GroupObject*>();
+		Vector3 leaderPosition;
+		if (group != nullptr) {
+			Locker groupLock(group);
+			CreatureObject* leader = group->getLeader();
+			if (leader != nullptr)
+				leaderPosition = leader->getWorldPosition();
+		}
+		line = replaceGroupingToken(line, "{meters}",
+			String::valueOf(SimBotGroupMission::roundedMeters(leaderPosition,
+				revealPosition)));
+		line = replaceGroupingToken(line, "{dir}",
+			SimBotGroupMission::compassWord(leaderPosition, revealPosition));
+		line = replaceGroupingToken(line, "{city}", "the group");
+		line = replaceGroupingToken(line, "{x}", String::valueOf(
+			static_cast<int>(revealPosition.getX())));
+		line = replaceGroupingToken(line, "{y}", String::valueOf(
+			static_cast<int>(revealPosition.getY())));
+		// "Follow me" comes from the holder that leads to a bot mission.
+		postPlayerBotGroupMissionLine(groupOid, calloutSpeaker, line);
+		MissionDiagLog::event("GROUP_MISSION", groupOid,
+			"entry=" + String::valueOf(entryId) + " reveal=1 lair=" +
+			String::valueOf(lairOid));
+	}
+	refreshGroupPlayerMissions(groupOid, true);
+	return true;
+}
+
+void SimPlayerManager::onGroupMissionEntryDone(uint64 groupOid, uint64 planId,
+		uint64 entryId, const String& outcome) {
+	if (groupOid == 0 || planId == 0 || entryId == 0)
+		return;
+	bool allDone = false;
+	bool found = false;
+	{
+		Locker groupingLock(&groupingMutex);
+		if (!playerBotGroupMissionPlans.contains(groupOid))
+			return;
+		PlayerBotGroupMissionPlan& plan = playerBotGroupMissionPlans.get(groupOid);
+		if (plan.planId != planId)
+			return;
+		for (int i = 0; i < plan.entries.size(); ++i) {
+			PlayerBotGroupMissionEntry& entry = plan.entries.get(i);
+			if (entry.entryId != entryId)
+				continue;
+			found = true;
+			entry.completed = outcome.toLowerCase() == "done" ||
+				outcome.toLowerCase() == "complete";
+			entry.abandoned = !entry.completed;
+			entry.abandonmentReason = entry.abandoned ? outcome : String();
+			if (plan.currentEntryId == entryId) {
+				plan.currentEntryId = 0;
+				++plan.planEpoch;
+			}
+			allDone = plan.activeGrabBatchId == 0;
+			for (int j = 0; allDone && j < plan.entries.size(); ++j)
+				if (!plan.entries.get(j).completed &&
+						!plan.entries.get(j).abandoned)
+					allDone = false;
+			for (int j = 0; j < playerBotGroupRecords.size(); ++j) {
+				const PlayerBotGroupRecord& record =
+					playerBotGroupRecords.elementAt(j).getValue();
+				if (record.groupOid != groupOid)
+					continue;
+				setPlayerBotGroupMissionDirectiveLocked(record, plan,
+					allDone ? SimBotGroupRally::DONE :
+					SimBotGroupRally::MISSION_WAIT);
+			}
+			break;
+		}
+	}
+	if (!found)
+		return;
+	PlayerBotGroupingConfig config = playerBotGroupingConfig;
+	String line;
+	if (allDone)
+		line = config.missions.missionAllDoneLines.size() > 0 ?
+			config.missions.missionAllDoneLines.get(0) : String("That's all of them.");
+	else
+		line = config.missions.missionDoneLines.size() > 0 ?
+			config.missions.missionDoneLines.get(0) : String("That one's done.");
+	postPlayerBotGroupMissionLine(groupOid, 0, line);
+	MissionDiagLog::event("GROUP_MISSION", groupOid,
+		"entry=" + String::valueOf(entryId) + " outcome=" + outcome);
+	refreshGroupPlayerMissions(groupOid, true);
+}
+
+void SimPlayerManager::onPlayerGroupMissionCompleted(uint64 missionOid) {
+	if (missionOid == 0 ||
+			!playerBotGroupMissionsActive.load(std::memory_order_acquire))
+		return;
+	// Called from the stock MissionObjectiveImplementation::awardReward with
+	// mission objects locked: hand off so no manager mutex or group lock is
+	// taken on that thread.
+	Core::getTaskManager()->executeTask([this, missionOid]() {
+		completePlayerGroupMissionEntry(missionOid);
+	}, "SimPlayerBotGroupMissionCompleted");
+}
+
+void SimPlayerManager::completePlayerGroupMissionEntry(uint64 missionOid) {
+	uint64 groupOid = 0;
+	uint64 planId = 0;
+	uint64 entryId = 0;
+	{
+		Locker groupingLock(&groupingMutex);
+		for (int i = 0; i < playerBotGroupMissionPlans.size() && groupOid == 0;
+				++i) {
+			const PlayerBotGroupMissionPlan& plan =
+				playerBotGroupMissionPlans.elementAt(i).getValue();
+			for (int j = 0; j < plan.entries.size(); ++j) {
+				const PlayerBotGroupMissionEntry& entry = plan.entries.get(j);
+				if (entry.missionOid == missionOid && !entry.completed &&
+						!entry.abandoned) {
+					groupOid = plan.groupOid;
+					planId = plan.planId;
+					entryId = entry.entryId;
+					break;
+				}
+			}
+		}
+	}
+	if (groupOid != 0)
+		onGroupMissionEntryDone(groupOid, planId, entryId, "done");
+}
+
+
+bool SimPlayerManager::isGroupMissionShareMember(CreatureObject* member) const {
+	if (member == nullptr)
+		return false;
+	AiAgent* agent = member->asAiAgent();
+	if (agent == nullptr || !agent->getSimPlayerBot())
+		return false;
+	return playerBotGroupMissionsActive.load(std::memory_order_acquire) &&
+		playerBotMissionCreditsActive.load(std::memory_order_acquire);
+}
+
+bool SimPlayerManager::grantPlayerBotMissionShare(uint64 identityId,
+		int amount, uint64 refOid, const String& detail) {
+	if (identityId == 0 || amount <= 0 ||
+			!isPlayerBotGroupMissionsActive(identityId) ||
+			!playerBotMissionCreditGateEnabled(identityId))
+		return false;
+	String refusal;
+	const bool granted = grantPlayerBotCredits(identityId, amount, true,
+		"group_mission", refOid, detail, &refusal);
+	if (granted) {
+		missionCreditsAwarded.increment();
+		missionCreditsTotal.add(static_cast<uint64>(amount));
+		missionCreditsLastAmount = static_cast<uint64>(amount);
+		missionCreditsLastAwardMs = System::getMiliTime();
+	}
+	return granted;
+}
+
+void SimPlayerManager::queueGroupMissionBotShares(
+		const Vector<uint64>& bodyOids, int amount, uint64 missionOid) {
+	if (bodyOids.size() == 0 || amount <= 0)
+		return;
+	MissionDiagLog::event("GROUP_MISSION_SPLIT", missionOid,
+		"mission=" + String::valueOf(missionOid) +
+		" share=" + String::valueOf(amount) +
+		" queued=" + String::valueOf(bodyOids.size()));
+	Vector<uint64> queued = bodyOids;
+	Core::getTaskManager()->executeTask([this, queued, amount, missionOid]() {
+		for (int i = 0; i < queued.size(); ++i) {
+			uint64 identityId = 0;
+			{
+				Locker pveLock(&pveMutex);
+				if (pveBodyIdentityIds.contains(queued.get(i)))
+					identityId = pveBodyIdentityIds.get(queued.get(i));
+			}
+			if (identityId != 0) {
+				if (grantPlayerBotMissionShare(identityId, amount, missionOid,
+						"leader_mission"))
+					groupMissionLeaderBotShares.increment();
+				else
+					groupMissionLeaderBotSharesSkipped.increment();
+			}
+		}
+	}, "SimPlayerBotGroupMissionShares");
+}
+
 static const char* playerBotGroupingDirectiveStageName(
 		SimBotGroupRally::DirectiveStage stage) {
 	switch (stage) {
@@ -18051,6 +19293,12 @@ static const char* playerBotGroupingDirectiveStageName(
 	case SimBotGroupRally::BUFFING: return "BUFFING";
 	case SimBotGroupRally::RALLY_TRAVEL: return "RALLY_TRAVEL";
 	case SimBotGroupRally::RALLY_HOLD: return "RALLY_HOLD";
+	case SimBotGroupRally::MISSION_GRAB_TRAVEL: return "MISSION_GRAB_TRAVEL";
+	case SimBotGroupRally::MISSION_GRAB: return "MISSION_GRAB";
+	case SimBotGroupRally::MISSION_WAIT: return "MISSION_WAIT";
+	case SimBotGroupRally::MISSION_TRAVEL: return "MISSION_TRAVEL";
+	case SimBotGroupRally::MISSION_HOLD: return "MISSION_HOLD";
+	case SimBotGroupRally::MISSION_FIGHT: return "MISSION_FIGHT";
 	case SimBotGroupRally::DONE: return "DONE";
 	default: return "UNKNOWN";
 	}
@@ -22189,6 +23437,7 @@ bool SimPlayerManager::spawnPlayerBotParityKillTarget(
 	{
 		Locker parityLock(&playerBotParityTestMutex);
 		playerBotParityTestKillTargetOid = target->getObjectID();
+		playerBotParityHarnessSpawnedOids.put(target->getObjectID(), true);
 		playerBotParityTestKillTargetIdentityId = identityId;
 		playerBotParityTestKillTargetBaseXp = baseXp;
 		playerBotParityTestKillTargetKillXpBaseline = killBaseline;
@@ -22724,9 +23973,15 @@ bool SimPlayerManager::getPlayerBotParityIdentityId(
 	identityId = step.identityId;
 	Locker parityLock(&playerBotParityTestMutex);
 	if (!step.identityRef.isEmpty()) {
-		if (!playerBotParityTestIdentityRefs.contains(step.identityRef))
+		// A borrowed production bot ("production", "production2") is the one
+		// this scenario's grouping steps already resolved and cached.
+		const String borrowedRef = step.identityRef.toLowerCase();
+		if (playerBotParityBorrowedRefs.contains(borrowedRef))
+			identityId = playerBotParityBorrowedRefs.get(borrowedRef);
+		else if (playerBotParityTestIdentityRefs.contains(step.identityRef))
+			identityId = playerBotParityTestIdentityRefs.get(step.identityRef);
+		else
 			return false;
-		identityId = playerBotParityTestIdentityRefs.get(step.identityRef);
 	} else if (step.identityIndex >= 0 && step.identityIndex <
 			playerBotParityTestIdentityIds.size())
 		identityId = playerBotParityTestIdentityIds.get(step.identityIndex);
@@ -23108,6 +24363,32 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 		return playerBotGroupingRepliesPosted.get();
 	if (key == "grouping.groupchatunhandled" || key == "groupchatunhandled")
 		return playerBotGroupingGroupChatUnhandled.get();
+	if (key == "groupmission.splitbotshares")
+		return groupMissionSplitBotShares.get();
+	if (key == "groupmission.splitplayershares")
+		return groupMissionSplitPlayerShares.get();
+	if (key == "groupmission.splitharnessleadershares")
+		return groupMissionSplitHarnessLeaderShares.get();
+	if (key == "groupmission.splitcreditstobots")
+		return groupMissionSplitCreditsToBots.get();
+	if (key == "groupmission.splitcreditstoplayers")
+		return groupMissionSplitCreditsToPlayers.get();
+	if (key == "groupmission.leadermissionbotshares")
+		return groupMissionLeaderBotShares.get();
+	if (key == "groupmission.leadermissionbotsharesskipped")
+		return groupMissionLeaderBotSharesSkipped.get();
+	if (key == "groupmission.grabunknowncreature")
+		return groupMissionGrabUnknownCreature.get();
+	if (key == "groupmission.capacitycapped")
+		return groupMissionCapacityCapped.get();
+	if (key == "groupmission.waypointrefreshes")
+		return groupMissionWaypointRefreshes.get();
+	if (key == "groupmission.leaderassists")
+		return groupMissionLeaderAssists.get();
+	if (key == "groupmission.leaderassistsskipped" ||
+			key == "groupmission.leaderassistskipped" ||
+			key == "groupmission.assistskipped")
+		return groupMissionLeaderAssistSkipped.get();
 	if (key == "grouping.directives.issued" || key == "directives.issued") {
 		Locker groupingLock(&groupingMutex);
 		return playerBotGroupingDirectiveCounters.issued;
@@ -23318,12 +24599,15 @@ bool SimPlayerManager::assertPlayerBotParityStore(
 
 bool SimPlayerManager::writePlayerBotParityPhaseAFile() {
 	Vector<PlayerBotParityTestScenarioResult> results;
+	std::vector<String> onlyScenarios;
 	uint64 probeId = 0;
 	String runId;
 	String restartScenario;
 	{
 		Locker parityLock(&playerBotParityTestMutex);
 		results = playerBotParityTestResults;
+		for (int i = 0; i < playerBotParityOnlyScenarios.size(); ++i)
+			onlyScenarios.push_back(playerBotParityOnlyScenarios.get(i));
 		probeId = playerBotParityTestProbeIdentityId;
 		runId = playerBotParityTestRunId;
 		if (playerBotParityTestScenarioIndex >= 0 &&
@@ -23348,6 +24632,9 @@ bool SimPlayerManager::writePlayerBotParityPhaseAFile() {
 	JSONSerializationType rows = JSONSerializationType::array();
 	for (int i = 0; i < results.size(); ++i) {
 		if (isPlayerBotParityRestartScenario(results.get(i).name))
+			continue;
+		if (!SimBotParityRunPolicy::inScope(results.get(i).name,
+				onlyScenarios))
 			continue;
 		if (results.get(i).status != "PASS")
 			return false;
@@ -23387,6 +24674,12 @@ bool SimPlayerManager::writePlayerBotParityPhaseAFile() {
 
 bool SimPlayerManager::readPlayerBotParityPhaseAFile(uint64 probeIdentityId,
 		const String& runId, String& failure) {
+	std::vector<String> onlyScenarios;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		for (int i = 0; i < playerBotParityOnlyScenarios.size(); ++i)
+			onlyScenarios.push_back(playerBotParityOnlyScenarios.get(i));
+	}
 	std::ifstream file("log/playerbotparity-phaseA.json", std::ios::in);
 	if (!file.is_open()) {
 		failure = "phase_a_record_invalid";
@@ -23440,6 +24733,8 @@ bool SimPlayerManager::readPlayerBotParityPhaseAFile(uint64 probeIdentityId,
 				return false;
 			}
 			String name(row["name"].get<std::string>().c_str());
+			if (!SimBotParityRunPolicy::inScope(name, onlyScenarios))
+				continue;
 			if (seenNames.contains(name)) {
 				failure = "phase_a_record_invalid";
 				return false;
@@ -23469,8 +24764,10 @@ bool SimPlayerManager::readPlayerBotParityPhaseAFile(uint64 probeIdentityId,
 			Locker parityLock(&playerBotParityTestMutex);
 			for (int i = 0; i < playerBotParityTestResults.size(); ++i) {
 				if (!isPlayerBotParityRestartScenario(
-						playerBotParityTestResults.get(i).name) &&
-						playerBotParityTestResults.get(i).status != "PASS") {
+					playerBotParityTestResults.get(i).name) &&
+					SimBotParityRunPolicy::inScope(
+						playerBotParityTestResults.get(i).name, onlyScenarios) &&
+					playerBotParityTestResults.get(i).status != "PASS") {
 					failure = "phase_a_record_incomplete";
 					return false;
 				}
@@ -23534,6 +24831,44 @@ void SimPlayerManager::runPlayerBotParityTestRunner() {
 	}
 	if (rerun)
 		schedulePlayerBotParityTestRunner(0);
+}
+
+void SimPlayerManager::finishFailedPlayerBotParityScenario(
+		int scenarioConfigIndex) {
+	bool more = false;
+	PlayerBotParityTestScenario scenario;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		more = playerBotParityContinueOnFailure &&
+			playerBotParityTestScenarioIndex <
+				playerBotParityTestScenarioOrder.size();
+		playerBotParityTestStepCursor = 0;
+		if (scenarioConfigIndex >= 0 &&
+				scenarioConfigIndex < playerBotParityTestScenarios.size())
+			scenario = playerBotParityTestScenarios.get(scenarioConfigIndex);
+	}
+	// The last scenario, or a halting run: the whole-run teardown, which
+	// also marks the run complete.
+	if (!more) {
+		beginPlayerBotParityTestCleanup(false);
+		return;
+	}
+	// continueOnFailure: the harness bodies stay, as between two passing
+	// scenarios. Run the failed scenario's own teardown steps ("finally"),
+	// best effort and once, then clear what any scenario may have spawned.
+	const uint64 nowMs = System::getMiliTime();
+	for (int i = 0; i < scenario.steps.size(); ++i) {
+		PlayerBotParityTestStep step = scenario.steps.get(i);
+		if (!step.op.trim().beginsWith("remove"))
+			continue;
+		PlayerBotParityTestStepResult ignored;
+		executePlayerBotParityStep(step, ignored, nowMs);
+	}
+	despawnPlayerBotParityKillTarget();
+	despawnPlayerBotParityProvokedCreature();
+	despawnPlayerBotParityBazaarHelpers();
+	// No global group release here: it would also disband real players'
+	// groups. The scenario's own remove* steps release its harness groups.
 }
 
 void SimPlayerManager::beginPlayerBotParityTestCleanup(bool preserveProbe) {
@@ -23687,6 +25022,11 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 			playerBotParityTestBuyLoadLimitOverrideActive = false;
 		}
 	}
+	playerBotGroupMissionsActive.store(
+		playerBotGroupingActive.load(std::memory_order_acquire) &&
+		playerBotGroupingConfig.directivesEnabled &&
+		playerBotGroupingConfig.missionsEnabled,
+		std::memory_order_release);
 }
 
 void SimPlayerManager::resolvePlayerBotParityExpectedRejection(
@@ -23839,6 +25179,10 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 		Locker parityLock(&playerBotParityTestMutex);
 		playerBotParityTestCleanupActive = false;
 		playerBotParityTestScenarioActive = false;
+		playerBotParityDeaths.removeAll();
+		playerBotParityBorrowedIdentityIds.removeAll();
+		playerBotParityBorrowedRefs.removeAll();
+		playerBotParityBorrowedSelectionFailed = false;
 		playerBotParityTestCleanupRequestId = 0;
 		playerBotParityTestCleanupReaperQueued = false;
 		playerBotParityTestCompleted = !preserveProbe;
@@ -23847,7 +25191,8 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 		playerBotParityTestBodyOids.removeAll();
 		playerBotParityTestOracle.removeAll();
 		playerBotParityTestCreditBaselines.removeAll();
-		playerBotParityDirectivesGateOverrides.removeAll();
+	playerBotParityDirectivesGateOverrides.removeAll();
+	playerBotParityMissionsGateOverrides.removeAll();
 		playerBotParityForceGroupShuttleFailure.removeAll();
 			playerBotParityTestRequestRefs.removeAll();
 			playerBotParityTestIdentityRefs.removeAll();
@@ -23876,6 +25221,70 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 		progressionCombatAbilitiesEnabled;
 	if (!productionAbilitiesOn && !playerBotCombatAbilitiesGateArmed())
 		SimBotAbilityUsageLog::setEnabled(false);
+}
+
+// Caller holds playerBotParityTestMutex. One predicate for the classifier and
+// the evidence string, so the two can never disagree.
+bool SimPlayerManager::isPlayerBotParityScenarioKillerLocked(
+		uint64 killerOid) const {
+	return killerOid != 0 &&
+		(playerBotParityHarnessSpawnedOids.contains(killerOid) ||
+		 killerOid == playerBotParityTestKillTargetOid ||
+		 killerOid == playerBotParityGroupLeaderOid ||
+		 killerOid == playerBotParityGroupAttackerOid ||
+		 playerBotParityGroupAttackerOids.contains(killerOid) ||
+		 playerBotParityGroupHarnessLeaderOids.contains(killerOid));
+}
+
+// Appended to a failed step's reason so the receipt shows the fact the
+// classification was made from.
+String SimPlayerManager::describePlayerBotParityBorrowedDeaths() const {
+	Locker parityLock(const_cast<Mutex*>(&playerBotParityTestMutex));
+	StringBuffer buf;
+	for (int i = 0; i < playerBotParityBorrowedIdentityIds.size(); ++i) {
+		const uint64 identityId =
+			playerBotParityBorrowedIdentityIds.elementAt(i).getKey();
+		if (!playerBotParityDeaths.contains(identityId))
+			continue;
+		const PlayerBotParityDeathFact& death =
+			playerBotParityDeaths.get(identityId);
+		buf << " borrowedDeath=" << identityId << " killer=" <<
+			(death.killerTemplate.isEmpty() ? String("unknown") :
+				death.killerTemplate) << " killerHarness=" <<
+			(isPlayerBotParityScenarioKillerLocked(death.killerOid) ? 1 : 0);
+	}
+	return buf.toString();
+}
+
+String SimPlayerManager::classifyPlayerBotParityFailure() const {
+	SimBotParityRunPolicy::FailureInputs inputs;
+	Locker parityLock(const_cast<Mutex*>(&playerBotParityTestMutex));
+	inputs.noEligibleBorrowedBot = playerBotParityBorrowedSelectionFailed;
+	const bool groupingScenario = playerBotParityGroupLeaderOid != 0 ||
+		playerBotParityGroupHarnessLeaderOids.size() > 0 ||
+		playerBotParityGroupAttackerOids.size() > 0;
+	inputs.standInInvalid = groupingScenario &&
+		(playerBotParityGroupLeaderOid == 0 ||
+		!playerBotParityGroupHarnessLeaderOids.contains(
+			playerBotParityGroupLeaderOid));
+	const uint64 scenarioStart = playerBotParityTestScenarioStartedAtMs;
+	for (int i = 0; i < playerBotParityBorrowedIdentityIds.size(); ++i) {
+		const uint64 identityId =
+			playerBotParityBorrowedIdentityIds.elementAt(i).getKey();
+		if (!playerBotParityDeaths.contains(identityId))
+			continue;
+		const PlayerBotParityDeathFact& death =
+			playerBotParityDeaths.get(identityId);
+		if (scenarioStart != 0 && death.atMs < scenarioStart)
+			continue;
+		inputs.borrowedBotDied = true;
+		inputs.killerCaptured = death.killerOid != 0 ||
+			!death.killerTemplate.isEmpty();
+		inputs.killerIsScenarioTarget =
+			isPlayerBotParityScenarioKillerLocked(death.killerOid);
+		break;
+	}
+	return SimBotParityRunPolicy::classifyParityFailure(inputs);
 }
 
 void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
@@ -23916,6 +25325,8 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 			String phaseFileFailure;
 			bool fileValid = readPlayerBotParityPhaseAFile(probeId, "",
 				phaseFileFailure);
+			const String phaseFileFailureClass =
+				classifyPlayerBotParityFailure();
 			{
 				Locker parityLock(&playerBotParityTestMutex);
 				playerBotParityTestPhase = "B";
@@ -23930,6 +25341,8 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 							playerBotParityTestResults.get(i).status = "FAIL";
 							playerBotParityTestResults.get(i).failReason =
 								phaseFileFailure;
+							playerBotParityTestResults.get(i).failClass =
+								phaseFileFailureClass;
 						}
 						for (int j = 0; j < playerBotParityTestScenarioOrder.size(); ++j) {
 							if (playerBotParityTestScenarioOrder.get(j) == i) {
@@ -23941,6 +25354,13 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 				}
 			}
 			if (!fileValid) {
+				{
+					Locker parityLock(&playerBotParityTestMutex);
+					playerBotParityTestScenarioIndex =
+						SimBotParityRunPolicy::nextIndexAfterResult(
+							playerBotParityTestScenarioIndex, "FAIL",
+							playerBotParityContinueOnFailure);
+				}
 				beginPlayerBotParityTestCleanup(false);
 				schedulePlayerBotParityTestRunner(0);
 				return;
@@ -23961,6 +25381,13 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 		}
 	}
 	bootInitialized = true;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (playerBotParityTestScenarioOrder.size() == 0) {
+			playerBotParityTestCompleted = true;
+			return;
+		}
+	}
 
 	String phase;
 	int setupCursor = 0;
@@ -23988,6 +25415,26 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 				return;
 			}
 			if (request.state == PlayerBotProgressionRequest::Failed) {
+				const String setupFailureClass =
+					classifyPlayerBotParityFailure();
+				{
+					Locker parityLock(&playerBotParityTestMutex);
+					if (playerBotParityTestScenarioIndex >= 0 &&
+						playerBotParityTestScenarioIndex <
+						playerBotParityTestScenarioOrder.size()) {
+					const int failedIndex = playerBotParityTestScenarioOrder.get(
+						playerBotParityTestScenarioIndex);
+					PlayerBotParityTestScenarioResult& failed =
+						playerBotParityTestResults.get(failedIndex);
+					failed.status = "FAIL";
+					failed.failReason = "harness_setup_request_failed";
+					failed.failClass = setupFailureClass;
+					playerBotParityTestScenarioIndex =
+						SimBotParityRunPolicy::nextIndexAfterResult(
+							playerBotParityTestScenarioIndex, "FAIL",
+							playerBotParityContinueOnFailure);
+				}
+				}
 				beginPlayerBotParityTestCleanup(false);
 				schedulePlayerBotParityTestRunner(0);
 				return;
@@ -24015,6 +25462,26 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 	}
 	if (phase == "A" && spawnCursor < identityCount) {
 		if (spawnPlayerBotParityBody(spawnCursor) == nullptr) {
+			const String spawnFailureClass =
+				classifyPlayerBotParityFailure();
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				if (playerBotParityTestScenarioIndex >= 0 &&
+					playerBotParityTestScenarioIndex <
+					playerBotParityTestScenarioOrder.size()) {
+				const int failedIndex = playerBotParityTestScenarioOrder.get(
+					playerBotParityTestScenarioIndex);
+				PlayerBotParityTestScenarioResult& failed =
+					playerBotParityTestResults.get(failedIndex);
+				failed.status = "FAIL";
+				failed.failReason = "harness_body_spawn_failed";
+				failed.failClass = spawnFailureClass;
+				playerBotParityTestScenarioIndex =
+					SimBotParityRunPolicy::nextIndexAfterResult(
+						playerBotParityTestScenarioIndex, "FAIL",
+						playerBotParityContinueOnFailure);
+				}
+			}
 			beginPlayerBotParityTestCleanup(false);
 			schedulePlayerBotParityTestRunner(0);
 			return;
@@ -24069,6 +25536,42 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 		scenario = playerBotParityTestScenarios.get(scenarioConfigIndex);
 	}
 	if (!active) {
+		uint64 runStartedAtMs = 0;
+		int maxRunMinutes = 0;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			runStartedAtMs = playerBotParityTestRunStartedAtMs;
+			maxRunMinutes = playerBotParityMaxRunMinutes;
+		}
+		if (SimBotParityRunPolicy::runCapReached(runStartedAtMs,
+				System::getMiliTime(), maxRunMinutes)) {
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				for (int i = orderPosition;
+						i < playerBotParityTestScenarioOrder.size(); ++i) {
+					const int skippedIndex = playerBotParityTestScenarioOrder.get(i);
+					PlayerBotParityTestScenarioResult& skipped =
+						playerBotParityTestResults.get(skippedIndex);
+					skipped.status = "NOT_RUN";
+					skipped.failReason = "run_cap";
+					skipped.failClass = "";
+					for (int stepIndex = 0; stepIndex < skipped.steps.size();
+							++stepIndex) {
+						skipped.steps.get(stepIndex).status = "NOT_RUN";
+						skipped.steps.get(stepIndex).failReason = "run_cap";
+					}
+				}
+				playerBotParityTestRunCapReached = true;
+				playerBotParityTestScenarioIndex =
+					playerBotParityTestScenarioOrder.size();
+				playerBotParityTestCompleted = true;
+			}
+			beginPlayerBotParityTestCleanup(false);
+			schedulePlayerBotParityTestRunner(0);
+			return;
+		}
+	}
+	if (!active) {
 		// Preconditions are checked BEFORE the scenario is marked active, so a
 		// misconfigured run never starts a scenario it cannot pass. Evaluated
 		// outside playerBotParityTestMutex because the gate predicates take
@@ -24077,12 +25580,16 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 		if (!playerBotParityScenarioPreconditionsMet(scenario,
 				preconditionFailure)) {
 			uint64 failedAtMs = System::getMiliTime();
+			const String preconditionFailureClass =
+				classifyPlayerBotParityFailure();
 			{
 				Locker parityLock(&playerBotParityTestMutex);
 				playerBotParityTestResults.get(scenarioConfigIndex).status =
 					"FAIL";
 				playerBotParityTestResults.get(scenarioConfigIndex).failReason =
 					preconditionFailure;
+				playerBotParityTestResults.get(scenarioConfigIndex).failClass =
+					preconditionFailureClass;
 				playerBotParityTestResults.get(scenarioConfigIndex)
 					.restartPhase = phase;
 				playerBotParityTestResults.get(scenarioConfigIndex)
@@ -24090,10 +25597,13 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 				playerBotParityTestResults.get(scenarioConfigIndex)
 					.finishedAtMs = failedAtMs;
 				playerBotParityTestScenarioActive = false;
+				playerBotParityTestScenarioIndex =
+					SimBotParityRunPolicy::nextIndexAfterResult(orderPosition,
+						"FAIL", playerBotParityContinueOnFailure);
 			}
 			info("SimPlayerBotParityPrecondition scenario=\"" + scenario.name +
 				"\" reason=" + preconditionFailure, true);
-			beginPlayerBotParityTestCleanup(false);
+			finishFailedPlayerBotParityScenario(scenarioConfigIndex);
 			schedulePlayerBotParityTestRunner(0);
 			return;
 		}
@@ -24127,8 +25637,13 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 					playerBotGroupingReleases.elementAt(i).getValue());
 		}
 		{
-			Locker parityLock(&playerBotParityTestMutex);
+		Locker parityLock(&playerBotParityTestMutex);
 			playerBotParityTestScenarioActive = true;
+			playerBotParityDeaths.removeAll();
+			playerBotParityHarnessSpawnedOids.removeAll();
+			playerBotParityBorrowedIdentityIds.removeAll();
+		playerBotParityBorrowedRefs.removeAll();
+			playerBotParityBorrowedSelectionFailed = false;
 			playerBotParityTestStepCursor = 0;
 			playerBotParityTestScenarioStartedAtMs = nowMs;
 			playerBotParityTestStepStartedAtMs = nowMs;
@@ -24215,6 +25730,15 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 				"grouping.joinfailed", "grouping.invitesaccepted",
 				"grouping.offerscreated", "grouping.offersexpired",
 				"grouping.repliesposted", "grouping.groupChatUnhandled",
+				"groupMission.splitBotShares", "groupMission.splitPlayerShares",
+				"groupMission.splitHarnessLeaderShares",
+				"groupMission.splitCreditsToBots",
+				"groupMission.splitCreditsToPlayers",
+				"groupMission.leaderMissionBotShares",
+				"groupMission.leaderMissionBotSharesSkipped",
+				"groupMission.grabUnknownCreature", "groupMission.capacityCapped",
+				"groupMission.waypointRefreshes", "groupMission.leaderAssists",
+				"groupMission.leaderAssistsSkipped",
 				"grouping.directives.issued",
 				"grouping.directives.unknownPlace", "grouping.directives.notLeader",
 				"grouping.directives.followCleared", "grouping.directives.readyLines",
@@ -24254,8 +25778,11 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 			playerBotParityTestCounterBaselines.put("lastflushms", progressionLastFlushMs);
 			playerBotParityTestResults.get(scenarioConfigIndex).status = "RUNNING";
 			playerBotParityTestResults.get(scenarioConfigIndex).failReason = "";
+			playerBotParityTestResults.get(scenarioConfigIndex).failClass = "scope";
 			playerBotParityTestResults.get(scenarioConfigIndex).restartPhase = phase;
 			playerBotParityTestResults.get(scenarioConfigIndex).startedAtMs = nowMs;
+			if (playerBotParityTestRunStartedAtMs == 0)
+				playerBotParityTestRunStartedAtMs = nowMs;
 		}
 		(void)scenario;
 		schedulePlayerBotParityTestRunner(0);
@@ -24266,14 +25793,21 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 	if (scenarioStartedAtMs != 0 && nowMs > scenarioStartedAtMs && nowMs -
 			scenarioStartedAtMs > static_cast<uint64>(scenario.budgetMs)) {
 		restorePlayerBotParityScenarioGate();
+		const String budgetFailureClass =
+			classifyPlayerBotParityFailure();
 		{
 			Locker parityLock(&playerBotParityTestMutex);
 			playerBotParityTestResults.get(scenarioConfigIndex).status = "FAIL";
 			playerBotParityTestResults.get(scenarioConfigIndex).failReason =
 				"scenario_budget_exceeded";
+			playerBotParityTestResults.get(scenarioConfigIndex).failClass =
+				budgetFailureClass;
 			playerBotParityTestScenarioActive = false;
+				playerBotParityTestScenarioIndex =
+					SimBotParityRunPolicy::nextIndexAfterResult(orderPosition, "FAIL",
+						playerBotParityContinueOnFailure);
 		}
-		beginPlayerBotParityTestCleanup(false);
+		finishFailedPlayerBotParityScenario(scenarioConfigIndex);
 		schedulePlayerBotParityTestRunner(0);
 		return;
 	}
@@ -24282,12 +25816,19 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 		bool retained = isPlayerBotParityRestartScenario(scenario.name);
 		if (phase == "A" && retained) {
 			if (!writePlayerBotParityPhaseAFile()) {
+				const String phaseAWriteFailureClass =
+					classifyPlayerBotParityFailure();
 				{
 					Locker parityLock(&playerBotParityTestMutex);
 					playerBotParityTestResults.get(scenarioConfigIndex).status = "FAIL";
 					playerBotParityTestResults.get(scenarioConfigIndex).failReason =
 						"phase_a_record_write_failed";
+					playerBotParityTestResults.get(scenarioConfigIndex).failClass =
+						phaseAWriteFailureClass;
 					playerBotParityTestScenarioActive = false;
+					playerBotParityTestScenarioIndex =
+						SimBotParityRunPolicy::nextIndexAfterResult(orderPosition,
+							"FAIL", playerBotParityContinueOnFailure);
 				}
 				beginPlayerBotParityTestCleanup(false);
 				schedulePlayerBotParityTestRunner(0);
@@ -24370,6 +25911,13 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 	}
 	stepResult.durationMs = nowMs > step.runtimeStartedAtMs ?
 		nowMs - step.runtimeStartedAtMs : 0;
+	// A harness_* reason is a test fixture that could not be set up (stand-in
+	// not attackable, attacker never engaged): environment, not the release.
+	const String stepFailureClass = stepResult.status != "FAIL" ? String() :
+		stepResult.failReason.beginsWith("harness_") ? String("environment") :
+		classifyPlayerBotParityFailure();
+	if (stepResult.status == "FAIL")
+		stepResult.failReason += describePlayerBotParityBorrowedDeaths();
 	{
 		Locker parityLock(&playerBotParityTestMutex);
 		playerBotParityTestScenarios.get(scenarioConfigIndex).steps.set(
@@ -24384,15 +25932,20 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 			playerBotParityTestResults.get(scenarioConfigIndex).status = "FAIL";
 			playerBotParityTestResults.get(scenarioConfigIndex).failReason =
 				stepResult.failReason;
+			playerBotParityTestResults.get(scenarioConfigIndex).failClass =
+				stepFailureClass;
 			playerBotParityTestResults.get(scenarioConfigIndex).finishedAtMs = nowMs;
 			playerBotParityTestResults.get(scenarioConfigIndex).durationMs =
 				nowMs - scenarioStartedAtMs;
 			playerBotParityTestScenarioActive = false;
+			playerBotParityTestScenarioIndex =
+				SimBotParityRunPolicy::nextIndexAfterResult(orderPosition, "FAIL",
+					playerBotParityContinueOnFailure);
 		}
 	}
 	if (stepResult.status == "FAIL") {
 		restorePlayerBotParityScenarioGate();
-		beginPlayerBotParityTestCleanup(false);
+		finishFailedPlayerBotParityScenario(scenarioConfigIndex);
 		schedulePlayerBotParityTestRunner(0);
 		return;
 	}
@@ -24591,19 +26144,109 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		uint64 resolved = 0;
 		const String identityRef = step.identityRef.toLowerCase();
 		if (identityRef == "production" || identityRef == "production2") {
+			// A scenario borrows one bot per ref for its whole run. Re-selecting
+			// per step would swap bots after a death (the recent-death rule).
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				if (playerBotParityBorrowedRefs.contains(identityRef))
+					return playerBotParityBorrowedRefs.get(identityRef);
+			}
 			const int wantedProductionIndex = identityRef == "production2" ? 1 : 0;
-			int productionIndex = 0;
-			Locker pveLock(&pveMutex);
-			for (int i = 0; i < pveIdentities.size(); ++i) {
-				const SimBotIdentity& candidate =
-					pveIdentities.elementAt(i).getValue();
-				if (candidate.profession != "harness" &&
-					pveIdentityBodyOids.contains(candidate.id) &&
-					!isPlayerBotParityHarnessExempt(candidate.id)) {
-					if (productionIndex++ == wantedProductionIndex) {
-						resolved = candidate.id;
-						break;
+			std::vector<uint64> candidates;
+			{
+				Locker pveLock(&pveMutex);
+				for (int i = 0; i < pveIdentities.size(); ++i) {
+					const SimBotIdentity& candidate =
+						pveIdentities.elementAt(i).getValue();
+					if (candidate.profession != "harness" &&
+						pveIdentityBodyOids.contains(candidate.id) &&
+						!isPlayerBotParityHarnessExempt(candidate.id))
+						candidates.push_back(candidate.id);
+				}
+			}
+			// A preference order, never a requirement: in a city with no recent
+			// death, then any recent-death-free live bot, then any live bot out
+			// of combat. Requiring the first tier left no bot at all while the
+			// roster was out hunting (verify 2026-10-21).
+			// rank 0..4: harness planet in a city, harness planet elsewhere,
+			// other planet in a city, other planet elsewhere, recent death.
+			std::vector<uint64> ranked[5];
+			ZoneServer* zoneServer = ServerCore::getZoneServer();
+			// The scenarios' stand-in spawns on the harness planet. A bot left on
+			// another planet by an earlier scenario must travel back first, which
+			// is not what a G3 scenario measures (verify 2026-10-21: a bot parked
+			// at the Theed cantina could not route home).
+			String harnessPlanet;
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				harnessPlanet = playerBotParityTestPlanet;
+			}
+			for (size_t candidateIndex = 0; candidateIndex < candidates.size();
+					++candidateIndex) {
+				const uint64 candidateId = candidates[candidateIndex];
+				uint64 bodyOid = 0;
+				{
+					Locker pveLock(&pveMutex);
+					if (pveIdentityBodyOids.contains(candidateId))
+						bodyOid = pveIdentityBodyOids.get(candidateId);
+				}
+				ManagedReference<SceneObject*> bodyObject = zoneServer == nullptr ||
+						bodyOid == 0 ? nullptr : zoneServer->getObject(bodyOid);
+				AiAgent* body = bodyObject == nullptr ? nullptr :
+					bodyObject->asAiAgent();
+				bool eligible = false;
+				bool inCity = false;
+				bool recentDeath = false;
+				String planet;
+				if (body != nullptr) {
+					Locker bodyLock(body);
+					Zone* zone = body->getZone();
+					if (!body->isDead() && !body->isIncapacitated() &&
+							!body->isInCombat() && zone != nullptr) {
+						eligible = true;
+						planet = zone->getZoneName();
+						SortedVector<ManagedReference<ActiveArea*> > activeAreas;
+						const Vector3 position = body->getWorldPosition();
+						zone->getInRangeActiveAreas(position.getX(), 0,
+							position.getY(), &activeAreas, true);
+						for (int areaIndex = 0; areaIndex < activeAreas.size();
+								++areaIndex) {
+							ActiveArea* area = activeAreas.get(areaIndex);
+							if (area != nullptr && area->isCityRegion()) {
+								inCity = true;
+								break;
+							}
+						}
 					}
+				}
+				if (eligible) {
+					const uint64 now = System::getMiliTime();
+					Locker progressionLock(&progressionMutex);
+					const uint64 lastDeathMs = playerBotLastDeathMs.contains(
+						candidateId) ? playerBotLastDeathMs.get(candidateId) : 0;
+					recentDeath = lastDeathMs != 0 && now >= lastDeathMs &&
+						now - lastDeathMs <= 600000;
+				}
+				if (!eligible)
+					continue;
+				const int rank = recentDeath ? 4 :
+					(planet == harnessPlanet ? 0 : 2) + (inCity ? 0 : 1);
+				ranked[rank].push_back(candidateId);
+			}
+			std::vector<uint64> preferred;
+			for (int rank = 0; rank < 5; ++rank)
+				preferred.insert(preferred.end(), ranked[rank].begin(),
+					ranked[rank].end());
+			if (wantedProductionIndex >= 0 &&
+					wantedProductionIndex < static_cast<int>(preferred.size()))
+				resolved = preferred[wantedProductionIndex];
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				playerBotParityBorrowedSelectionFailed =
+					playerBotParityBorrowedSelectionFailed || resolved == 0;
+				if (resolved != 0) {
+					playerBotParityBorrowedIdentityIds.put(resolved, true);
+					playerBotParityBorrowedRefs.put(identityRef, resolved);
 				}
 			}
 			return resolved;
@@ -24645,6 +26288,25 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			nowMs > step.runtimeStartedAtMs && nowMs - step.runtimeStartedAtMs >
 			static_cast<uint64>(withinSeconds) * 1000;
 	};
+	auto groupMissionPlanOid = [&]() -> uint64 {
+		uint64 requestedIdentity = 0;
+		const bool hasRequestedIdentity = step.identityId != 0 ||
+			!step.identityRef.isEmpty() || step.identityIndex >= 0;
+		if (hasRequestedIdentity)
+			requestedIdentity = resolveGroupingIdentity();
+		const uint64 leaderOid = groupLeaderOid();
+		Locker groupingLock(&groupingMutex);
+		if (requestedIdentity != 0 &&
+				playerBotGroupRecords.contains(requestedIdentity))
+			return playerBotGroupRecords.get(requestedIdentity).groupOid;
+		for (int i = 0; i < playerBotGroupMissionPlans.size(); ++i) {
+			const PlayerBotGroupMissionPlan& plan =
+				playerBotGroupMissionPlans.elementAt(i).getValue();
+			if (leaderOid != 0 && plan.leaderOid == leaderOid)
+				return plan.groupOid;
+		}
+		return 0;
+	};
 
 	if (op == "setGroupingGate") {
 		bool enabled = step.gateEnabled;
@@ -24655,8 +26317,156 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		}
 		playerBotGroupingActive.store(playerBotGroupingGateEnabled(),
 			std::memory_order_release);
+		playerBotGroupMissionsActive.store(
+			playerBotGroupingActive.load(std::memory_order_acquire) &&
+			playerBotGroupingConfig.directivesEnabled &&
+			playerBotGroupingConfig.missionsEnabled,
+			std::memory_order_release);
 		result.status = "PASS";
 		return true;
+	}
+
+	if (op == "setMissionsGate") {
+		identityId = resolveGroupingIdentity();
+		if (identityId == 0) {
+			result.status = "FAIL";
+			result.failReason = "missions_gate_requires_identity";
+			return true;
+		}
+		int64 enabledValue = 0;
+		if (step.hasGateEnabled)
+			enabledValue = step.gateEnabled ? 1 : 0;
+		else if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = "missions_gate_value_missing";
+			return true;
+		}
+		bool anyMissionOverride = false;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityMissionsGateOverrides.put(identityId,
+				enabledValue != 0);
+			for (int i = 0; i < playerBotParityMissionsGateOverrides.size(); ++i)
+				anyMissionOverride |= playerBotParityMissionsGateOverrides.
+				elementAt(i).getValue();
+		}
+		// The atomic is the fast stock-path gate.  A harness override may turn
+		// missions on for its grouped identities while the shipped Lua value
+		// remains false; identity-scoped checks still reject identities whose
+		// override is explicitly false.
+		playerBotGroupMissionsActive.store(
+			playerBotGroupingActive.load(std::memory_order_acquire) &&
+			playerBotGroupingConfig.directivesEnabled &&
+			(playerBotGroupingConfig.missionsEnabled || anyMissionOverride),
+			std::memory_order_release);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "groupMissionSay") {
+		const uint64 leaderOid = groupLeaderOid();
+		uint64 groupOid = 0;
+		{
+			Locker groupingLock(&groupingMutex);
+			for (int i = 0; i < playerBotGroupRecords.size(); ++i) {
+				const PlayerBotGroupRecord& record =
+					playerBotGroupRecords.elementAt(i).getValue();
+				if (record.leaderOid == leaderOid && record.state !=
+						PLAYER_BOT_GROUP_RELEASING) {
+					groupOid = record.groupOid;
+					break;
+				}
+			}
+		}
+		if (leaderOid == 0 || groupOid == 0) {
+			result.status = "FAIL";
+			result.failReason = "group_mission_leader_not_grouped";
+			return true;
+		}
+		onPlayerBotGroupChat(leaderOid, groupOid, step.groupingText);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertGroupMissionPlan") {
+		const uint64 groupOid = groupMissionPlanOid();
+		const bool wantPresent = step.expect.trim().toLowerCase() != "absent";
+		PlayerBotGroupMissionPlan plan;
+		bool found = false;
+		{
+			Locker groupingLock(&groupingMutex);
+			if (groupOid != 0 && playerBotGroupMissionPlans.contains(groupOid)) {
+				plan = playerBotGroupMissionPlans.get(groupOid);
+				found = true;
+			}
+		}
+		if ((!wantPresent && !found) || (wantPresent && found &&
+				(step.groupingExpectedCount < 0 ||
+					plan.entries.size() == step.groupingExpectedCount))) {
+			result.status = "PASS";
+			return true;
+		}
+		if (groupingStepTimeout()) {
+			result.status = "FAIL";
+			result.failReason = wantPresent ? "group_mission_plan_missing" :
+				"group_mission_plan_still_present";
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
+	}
+
+	if (op == "assertGroupMissionEntry") {
+		const uint64 groupOid = groupMissionPlanOid();
+		int matches = 0;
+		{
+			Locker groupingLock(&groupingMutex);
+			if (groupOid != 0 && playerBotGroupMissionPlans.contains(groupOid)) {
+				const PlayerBotGroupMissionPlan& plan =
+					playerBotGroupMissionPlans.get(groupOid);
+				for (int i = 0; i < plan.entries.size(); ++i) {
+					const PlayerBotGroupMissionEntry& entry = plan.entries.get(i);
+					if (!step.missionEntryKind.isEmpty()) {
+						String kind = entry.kind == PLAYER_BOT_GROUP_MISSION_BOT_OFFER ?
+							"bot_offer" : entry.kind ==
+							PLAYER_BOT_GROUP_MISSION_PLAYER_DESTROY ?
+							"player_destroy" : "player_other";
+						if (kind != step.missionEntryKind)
+							continue;
+					}
+					if (!step.missionEntryState.isEmpty()) {
+						const String state = entry.completed ? "completed" :
+							entry.abandoned ? "abandoned" : "active";
+						if (state != step.missionEntryState)
+							continue;
+					}
+					if (!step.groupingContains.isEmpty() &&
+							entry.creatureLabel.toLowerCase().indexOf(
+								step.groupingContains.toLowerCase()) < 0 &&
+							entry.lairTemplate.toLowerCase().indexOf(
+								step.groupingContains.toLowerCase()) < 0)
+						continue;
+					++matches;
+				}
+			}
+		}
+		const bool wantPresent = step.expect.trim().toLowerCase() != "absent";
+		const int expectedCount = step.groupingExpectedCount < 0 ? 1 :
+			step.groupingExpectedCount;
+		const bool satisfied = wantPresent ? matches >= expectedCount :
+			matches == 0;
+		if (satisfied) {
+			result.status = "PASS";
+			return true;
+		}
+		if (groupingStepTimeout()) {
+			result.status = "FAIL";
+			result.failReason = wantPresent ? "group_mission_entry_missing" :
+				"group_mission_entry_still_present";
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
 	}
 
 	if (op == "setDirectivesGate") {
@@ -24727,6 +26537,7 @@ bool SimPlayerManager::executePlayerBotParityStep(
 				leaderOid = playerBotParityTestBodyOids.get(leaderIndex);
 			if (leaderOid != 0) {
 				playerBotParityGroupHarnessLeaderOids.put(leaderOid, true);
+				playerBotParityHarnessSpawnedOids.put(leaderOid, true);
 				playerBotParityGroupLeaderOid = leaderOid;
 			}
 		}
@@ -24760,7 +26571,31 @@ bool SimPlayerManager::executePlayerBotParityStep(
 				weapon->setMaxDamage(0);
 			}
 		}
-		if (step.groupingToDirective) {
+		if (step.groupingToMission) {
+			// G3: the stand-in walks up to the bot's current mission so the hold
+			// releases (the leader is closer to the target than the bot) and the
+			// leader is inside the 128 m reward range.
+			PlayerBotGroupMissionContext missionContext;
+			const uint64 missionIdentity = resolveGroupingIdentity();
+			if (missionIdentity == 0 || !getPlayerBotGroupMissionContext(
+					missionIdentity, missionContext) || missionContext.grabTravel ||
+					missionContext.planet.isEmpty()) {
+				result.status = "FAIL";
+				result.failReason = "group_mission_context_missing";
+				return true;
+			}
+			const float x = missionContext.position.getX() + 20.f;
+			const float y = missionContext.position.getY();
+			ZoneServer* missionServer = ServerCore::getZoneServer();
+			Zone* missionZone = missionServer == nullptr ? nullptr :
+				missionServer->getZone(missionContext.planet);
+			const float z = missionZone == nullptr ? missionContext.position.getZ() :
+				missionZone->getHeight(x, y);
+			Locker leaderLock(leader);
+			leader->switchZone(missionContext.planet, x, z, y, 0);
+			leader->setHomeLocation(x, z, y);
+			leader->setMovementState(AiAgent::OBLIVIOUS);
+		} else if (step.groupingToDirective) {
 			// The resolver may derive a cantina exterior far from the configured
 			// hangout, so the stand-in walks to the point the bot was given.
 			PlayerBotGroupDirective directive;
@@ -24802,6 +26637,8 @@ bool SimPlayerManager::executePlayerBotParityStep(
 				leaderOid = playerBotParityTestBodyOids.get(step.identityIndex);
 			if (leaderOid != 0)
 				playerBotParityGroupHarnessLeaderOids.put(leaderOid, true);
+			if (leaderOid != 0)
+				playerBotParityHarnessSpawnedOids.put(leaderOid, true);
 			if (leaderOid != 0)
 				playerBotParityGroupLeaderOid = leaderOid;
 		}
@@ -24913,7 +26750,7 @@ bool SimPlayerManager::executePlayerBotParityStep(
 				standIn->setFaction(0);
 			}
 		}
-		releaseAllPlayerBotGroups("harness_remove");
+		releaseHarnessPlayerBotGroups("harness_remove");
 		VectorMap<uint64, bool> harnessLeaders;
 		{
 			Locker parityLock(&playerBotParityTestMutex);
@@ -25108,9 +26945,10 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		op == "assertBotNear" || op == "assertBotBuffed" ||
 		op == "stripBotBuffs" || op == "forceGroupShuttleFailure" ||
 		op == "killGroupedBot" || op == "assertRejoined" ||
+		op == "awaitBotOutOfCombat" ||
 		op == "assertGroupChatReply" || op == "assertNoBotDamage" ||
 		op == "assertBotDamaged" || op == "assertKillXpGroupMultiplier" ||
-		op == "assertNoBotLootBranch") {
+		op == "assertNoBotLootBranch" || op == "assertMissionStage") {
 		identityId = resolveGroupingIdentity();
 		if (identityId == 0) {
 			result.status = "FAIL";
@@ -25445,6 +27283,7 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			Locker parityLock(&playerBotParityTestMutex);
 			playerBotParityGroupAttackerOid = attackerAgent->getObjectID();
 			playerBotParityGroupAttackerOids.add(attackerAgent->getObjectID());
+			playerBotParityHarnessSpawnedOids.put(attackerAgent->getObjectID(), true);
 		}
 		result.status = "PASS"; return true;
 	}
@@ -25656,6 +27495,34 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		return false;
 	}
 
+	// The stand-in spot has city creature spawners: a scenario that measures
+	// what the bot does for the leader first waits until no wild creature is
+	// fighting the bot (self-defence correctly outranks leader assist).
+	if (op == "awaitBotOutOfCombat") {
+		uint64 botOid = groupBotOid(identityId);
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> object = zoneServer == nullptr ||
+			botOid == 0 ? nullptr : zoneServer->getObject(botOid);
+		AiAgent* bot = object == nullptr ? nullptr : object->asAiAgent();
+		bool calm = false;
+		if (bot != nullptr) {
+			Locker botLock(bot);
+			calm = !bot->isDead() && !bot->isIncapacitated() &&
+				!bot->isInCombat() && bot->getDefenderList()->size() == 0;
+		}
+		if (calm) {
+			result.status = "PASS";
+			return true;
+		}
+		if (groupingStepTimeout()) {
+			result.status = "FAIL";
+			result.failReason = "harness_bot_never_out_of_combat";
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
+	}
+
 	if (op == "killGroupedBot") {
 		uint64 botOid = groupBotOid(identityId);
 		ZoneServer* zoneServer = ServerCore::getZoneServer();
@@ -25792,6 +27659,25 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		if (groupingStepTimeout()) {
 			result.status = "FAIL";
 			result.failReason = "directive_stage_timeout_expected=" + expected;
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
+	}
+
+	if (op == "assertMissionStage") {
+		PlayerBotGroupDirective directive;
+		const String expected = step.groupingStage.trim().toUpperCase();
+		const bool found = getPlayerBotGroupDirective(identityId, directive) &&
+			String(playerBotGroupingDirectiveStageName(directive.stage)) == expected &&
+			directive.missionPlanId != 0;
+		if (found) {
+			result.status = "PASS";
+			return true;
+		}
+		if (groupingStepTimeout()) {
+			result.status = "FAIL";
+			result.failReason = "mission_stage_timeout_expected=" + expected;
 			return true;
 		}
 		result.status = "WAITING";
@@ -31493,6 +33379,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 	VectorMap<String, uint64> releases;
 	VectorMap<String, uint64> chatCommands;
 	VectorMap<String, uint64> assistSkipped;
+	Vector<PlayerBotGroupMissionPlan> missionPlans;
 	{
 		Locker groupingLock(&groupingMutex);
 		for (int i = 0; i < playerBotGroupOffers.size(); ++i)
@@ -31511,6 +33398,8 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 		releases = playerBotGroupingReleases;
 		chatCommands = playerBotGroupingGroupChatCommands;
 		assistSkipped = playerBotGroupingAssistSkipped;
+		for (int i = 0; i < playerBotGroupMissionPlans.size(); ++i)
+			missionPlans.add(playerBotGroupMissionPlans.elementAt(i).getValue());
 	}
 
 	JSONSerializationType counters = JSONSerializationType::object();
@@ -31538,6 +33427,104 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 	counters["groupChatCommands"] = playerBotGroupingCounterMapJson(chatCommands);
 	counters["assistSkipped"] = playerBotGroupingCounterMapJson(assistSkipped);
 	result["counters"] = counters;
+
+	JSONSerializationType missionsJson = JSONSerializationType::object();
+	missionsJson["enabled"] = isPlayerBotGroupMissionsActive(0);
+	uint64 grabRequests = 0;
+	uint64 grabsAssigned = 0;
+	uint64 offersGrabbed = 0;
+	uint64 grabNoneFound = 0;
+	uint64 reveals = 0;
+	uint64 callouts = 0;
+	uint64 entriesCompleted = 0;
+	uint64 entriesAbandoned = 0;
+	VectorMap<String, uint64> entriesAbandonedByReason;
+	JSONSerializationType plansJson = JSONSerializationType::array();
+	for (int i = 0; i < missionPlans.size(); ++i) {
+		const PlayerBotGroupMissionPlan& plan = missionPlans.get(i);
+		JSONSerializationType planJson = JSONSerializationType::object();
+		planJson["groupOid"] = plan.groupOid;
+		planJson["leaderOid"] = plan.leaderOid;
+		planJson["planId"] = plan.planId;
+		planJson["epoch"] = plan.planEpoch;
+		planJson["currentEntryId"] = plan.currentEntryId;
+		JSONSerializationType entriesJson = JSONSerializationType::array();
+		for (int j = 0; j < plan.grabRequests.size(); ++j) {
+			const PlayerBotGroupMissionGrabRequest& request =
+				plan.grabRequests.get(j);
+			++grabRequests;
+			if (request.state == PLAYER_BOT_GROUP_MISSION_GRAB_DONE)
+				grabsAssigned += request.count;
+			else if (request.state == PLAYER_BOT_GROUP_MISSION_GRAB_NONE_FOUND)
+				++grabNoneFound;
+		}
+		for (int j = 0; j < plan.entries.size(); ++j) {
+			const PlayerBotGroupMissionEntry& entry = plan.entries.get(j);
+			if (entry.kind == PLAYER_BOT_GROUP_MISSION_BOT_OFFER)
+				++offersGrabbed;
+			if (entry.revealed)
+				++reveals;
+			if (entry.revealCalloutPosted)
+				++callouts;
+			if (entry.completed)
+				++entriesCompleted;
+			if (entry.abandoned)
+				++entriesAbandoned;
+			if (entry.abandoned) {
+				const String reason = entry.abandonmentReason.isEmpty() ?
+					String("unknown") : entry.abandonmentReason;
+				entriesAbandonedByReason.put(reason,
+					entriesAbandonedByReason.contains(reason) ?
+					entriesAbandonedByReason.get(reason) + 1 : 1);
+			}
+			JSONSerializationType entryJson = JSONSerializationType::object();
+			entryJson["entryId"] = entry.entryId;
+			entryJson["kind"] = entry.kind;
+			entryJson["ownerOid"] = entry.ownerOid;
+			entryJson["holderIdentityId"] = entry.holderIdentityId;
+			entryJson["missionOid"] = entry.missionOid;
+			entryJson["planet"] = entry.planet;
+			entryJson["creature"] = entry.creatureLabel.isEmpty() ?
+				entry.lairTemplate : entry.creatureLabel;
+			entryJson["revealed"] = entry.revealed;
+			entryJson["completed"] = entry.completed;
+			entryJson["abandoned"] = entry.abandoned;
+			entriesJson.push_back(entryJson);
+		}
+		planJson["entries"] = entriesJson;
+		plansJson.push_back(planJson);
+	}
+	missionsJson["grabRequests"] = grabRequests;
+	missionsJson["grabsAssigned"] = grabsAssigned;
+	missionsJson["offersGrabbed"] = offersGrabbed;
+	missionsJson["grabNoneFound"] = grabNoneFound;
+	missionsJson["unknownCreature"] = groupMissionGrabUnknownCreature.get();
+	missionsJson["capacityCapped"] = groupMissionCapacityCapped.get();
+	missionsJson["groupWaypointRefreshes"] =
+		groupMissionWaypointRefreshes.get();
+	missionsJson["reveals"] = reveals;
+	missionsJson["callouts"] = callouts;
+	missionsJson["entriesCompleted"] = entriesCompleted;
+	missionsJson["entriesAbandoned"] = entriesAbandoned;
+	missionsJson["entriesAbandonedByReason"] =
+		playerBotGroupingCounterMapJson(entriesAbandonedByReason);
+	JSONSerializationType assistsJson = JSONSerializationType::object();
+	assistsJson["leaderTarget"] = groupMissionLeaderAssists.get();
+	assistsJson["leaderTargetSkipped"] =
+		groupMissionLeaderAssistSkipped.get();
+	missionsJson["assists"] = assistsJson;
+	missionsJson["splitBotShares"] = groupMissionSplitBotShares.get();
+	missionsJson["splitPlayerShares"] = groupMissionSplitPlayerShares.get();
+	missionsJson["splitHarnessLeaderShares"] =
+		groupMissionSplitHarnessLeaderShares.get();
+	missionsJson["splitCreditsToBots"] = groupMissionSplitCreditsToBots.get();
+	missionsJson["splitCreditsToPlayers"] =
+		groupMissionSplitCreditsToPlayers.get();
+	missionsJson["leaderMissionBotShares"] = groupMissionLeaderBotShares.get();
+	missionsJson["leaderMissionBotSharesSkipped"] =
+		groupMissionLeaderBotSharesSkipped.get();
+	missionsJson["plans"] = plansJson;
+	result["missions"] = missionsJson;
 
 	JSONSerializationType directiveJson = JSONSerializationType::object();
 	const char* directiveKinds[] = {"cantina", "starport", "shuttleport",
@@ -31589,7 +33576,9 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 		incrementPlayerBotGroupingCounter(activeStages,
 			playerBotGroupingDirectiveStageName(directives.get(i).stage));
 	const char* directiveStages[] = {"PLANNING", "BUFF_TRAVEL", "BUFFING",
-		"RALLY_TRAVEL", "RALLY_HOLD", "DONE"};
+		"RALLY_TRAVEL", "RALLY_HOLD", "MISSION_GRAB_TRAVEL",
+		"MISSION_GRAB", "MISSION_WAIT", "MISSION_TRAVEL", "MISSION_HOLD",
+		"MISSION_FIGHT", "DONE"};
 	for (unsigned int i = 0; i < sizeof(directiveStages) /
 			sizeof(directiveStages[0]); ++i)
 		if (!activeStages.contains(directiveStages[i]))
@@ -31653,6 +33642,40 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 			row["directive"] = directiveRow;
 			break;
 		}
+		JSONSerializationType missionRow = JSONSerializationType::object();
+		JSONSerializationType heldMissionEntries =
+			JSONSerializationType::array();
+		for (int missionPlanIndex = 0; missionPlanIndex < missionPlans.size();
+				missionPlanIndex++) {
+			const PlayerBotGroupMissionPlan& plan =
+				missionPlans.get(missionPlanIndex);
+			if (plan.groupOid != record.groupOid)
+				continue;
+			missionRow["planId"] = plan.planId;
+			missionRow["currentEntryId"] = plan.currentEntryId;
+			missionRow["runRequested"] = plan.runRequested;
+			for (int entryIndex = 0; entryIndex < plan.entries.size();
+					entryIndex++) {
+				const PlayerBotGroupMissionEntry& entry =
+					plan.entries.get(entryIndex);
+				if (entry.kind != PLAYER_BOT_GROUP_MISSION_BOT_OFFER ||
+						entry.holderIdentityId != record.identityId)
+					continue;
+				JSONSerializationType heldEntry = JSONSerializationType::object();
+				heldEntry["entryId"] = entry.entryId;
+				heldEntry["offerId"] = entry.offerId;
+				heldEntry["planet"] = entry.planet;
+				heldEntry["creature"] = entry.creatureLabel.isEmpty() ?
+					entry.lairTemplate : entry.creatureLabel;
+				heldEntry["revealed"] = entry.revealed;
+				heldEntry["lairOid"] = entry.lairOid;
+				heldEntry["completed"] = entry.completed;
+				heldEntry["abandoned"] = entry.abandoned;
+				heldMissionEntries.push_back(heldEntry);
+			}
+		}
+		missionRow["heldEntries"] = heldMissionEntries;
+		row["mission"] = missionRow;
 		for (int routeIndex = 0; routeIndex < routes.size(); ++routeIndex) {
 			if (routes.get(routeIndex).identityId == record.identityId) {
 				const PlayerBotGroupRoute& route = routes.get(routeIndex);
@@ -32860,6 +34883,11 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	String harnessRunId;
 	uint64 harnessProbeId = 0;
 	uint64 harnessRowsStale = 0;
+	bool harnessContinueOnFailure = false;
+	Vector<String> harnessOnlyScenarios;
+	int harnessMaxRunMinutes = 0;
+	uint64 harnessRunStartedAtMs = 0;
+	bool harnessRunCapReached = false;
 	{
 		Locker parityLock(&playerBotParityTestMutex);
 		harnessEnabled = playerBotParityTestEnabled;
@@ -32868,6 +34896,11 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		harnessRunId = playerBotParityTestRunId;
 		harnessProbeId = playerBotParityTestProbeIdentityId;
 		harnessRowsStale = playerBotParityTestHarnessRowsStale;
+		harnessContinueOnFailure = playerBotParityContinueOnFailure;
+		harnessOnlyScenarios = playerBotParityOnlyScenarios;
+		harnessMaxRunMinutes = playerBotParityMaxRunMinutes;
+		harnessRunStartedAtMs = playerBotParityTestRunStartedAtMs;
+		harnessRunCapReached = playerBotParityTestRunCapReached;
 		harnessResults = playerBotParityTestResults;
 	}
 	harness["enabled"] = harnessEnabled;
@@ -32876,6 +34909,35 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	harness["runId"] = harnessRunId;
 	harness["probeIdentityId"] = harnessProbeId;
 	harness["harnessRowsStale"] = harnessRowsStale;
+	harness["continueOnFailure"] = harnessContinueOnFailure;
+	harness["maxRunMinutes"] = harnessMaxRunMinutes;
+	harness["runStartedAtMs"] = harnessRunStartedAtMs;
+	harness["runCapReached"] = harnessRunCapReached;
+	JSONSerializationType onlyScenariosJson = JSONSerializationType::array();
+	for (int i = 0; i < harnessOnlyScenarios.size(); ++i)
+		onlyScenariosJson.push_back(harnessOnlyScenarios.get(i));
+	harness["onlyScenarios"] = onlyScenariosJson;
+	JSONSerializationType inScopeTotals = JSONSerializationType::object();
+	int passCount = 0;
+	int scopeFailCount = 0;
+	int environmentFailCount = 0;
+	int notRunCount = 0;
+	for (int i = 0; i < harnessResults.size(); ++i) {
+		const PlayerBotParityTestScenarioResult& scenario = harnessResults.get(i);
+		if (scenario.status == "PASS")
+			++passCount;
+		else if (scenario.status == "FAIL" && scenario.failClass == "environment")
+			++environmentFailCount;
+		else if (scenario.status == "FAIL")
+			++scopeFailCount;
+		else if (scenario.status == "NOT_RUN")
+			++notRunCount;
+	}
+	inScopeTotals["pass"] = passCount;
+	inScopeTotals["fail_scope"] = scopeFailCount;
+	inScopeTotals["fail_environment"] = environmentFailCount;
+	inScopeTotals["not_run"] = notRunCount;
+	harness["inScopeTotals"] = inScopeTotals;
 	JSONSerializationType scenarioRows = JSONSerializationType::array();
 	for (int i = 0; i < harnessResults.size(); ++i) {
 		const PlayerBotParityTestScenarioResult& scenario = harnessResults.get(i);
@@ -32883,6 +34945,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		scenarioRow["name"] = scenario.name;
 		scenarioRow["status"] = scenario.status;
 		scenarioRow["failReason"] = scenario.failReason;
+		scenarioRow["failClass"] = scenario.failClass;
 		scenarioRow["restartPhase"] = scenario.restartPhase;
 		scenarioRow["startedAtMs"] = scenario.startedAtMs;
 		scenarioRow["finishedAtMs"] = scenario.finishedAtMs;
@@ -35403,7 +37466,8 @@ void SimPlayerManager::buildPveLairYieldIndex() {
 bool SimPlayerManager::selectPveBotMissionLairSpawn(
 		const String& planet, int hunterLevel, PveBotMissionOffer& offer,
 		const String& desiredFamily, const String& desiredResourceType,
-		const String& pinnedLairTemplate, bool avoidPacks) {
+		const String& pinnedLairTemplate, bool avoidPacks,
+		const String& creatureWord) {
 	String missionGroup = planet + "_destroy_missions";
 	// Fully qualified: this fork already has its own SimPlayerManager::SpawnGroup
 	// (the Lua spawn-config struct), which otherwise shadows the engine's
@@ -35467,6 +37531,8 @@ bool SimPlayerManager::selectPveBotMissionLairSpawn(
 		return best;
 	};
 	auto yieldsRequestedResource = [&](LairSpawn* candidate) {
+		if (!creatureWord.isEmpty())
+			return true;
 		if (candidate == nullptr || desiredFamily.isEmpty())
 			return true;
 		LairTemplate* templateData = CreatureTemplateManager::instance()->
@@ -35500,6 +37566,24 @@ bool SimPlayerManager::selectPveBotMissionLairSpawn(
 		}
 		return false;
 	};
+	auto matchesCreature = [&](LairSpawn* candidate) {
+		if (creatureWord.isEmpty() || candidate == nullptr)
+			return true;
+		LairTemplate* templateData = CreatureTemplateManager::instance()->
+			getLairTemplate(candidate->getLairTemplateName().hashCode());
+		std::vector<String> mobileNames;
+		if (templateData != nullptr && templateData->getWeightedMobiles() != nullptr) {
+			const Vector<String>* mobiles = templateData->getWeightedMobiles();
+			for (int i = 0; i < mobiles->size(); ++i) {
+				CreatureTemplate* mobile = CreatureTemplateManager::instance()->
+					getTemplate(mobiles->get(i).hashCode());
+				if (mobile != nullptr)
+					mobileNames.push_back(mobile->getTemplateName());
+			}
+		}
+		return SimBotGroupMission::lairMatchesCreature(
+			candidate->getLairTemplateName(), mobileNames, creatureWord);
+	};
 	// F_0.9.8b: the combat pack rule, evaluated here so the board never offers
 	// a lair the bot would walk to and then refuse (61 percent of abandons).
 	auto lairHasPackMobile = [&](LairSpawn* candidate) {
@@ -35520,8 +37604,10 @@ bool SimPlayerManager::selectPveBotMissionLairSpawn(
 	};
 	auto candidateInWindow = [&](LairSpawn* candidate, int lowerBound) {
 		return candidate != nullptr && candidate->getMinDifficulty() <=
-			hunterLevel + 5 && candidate->getMaxDifficulty() >= lowerBound &&
+			(creatureWord.isEmpty() ? hunterLevel + 5 : 1000000) &&
+			(creatureWord.isEmpty() ? candidate->getMaxDifficulty() >= lowerBound : true) &&
 			yieldsRequestedResource(candidate) &&
+			matchesCreature(candidate) &&
 			SimBotDispatchPolicy::isLairFightable(
 				avoidPacks && lairHasPackMobile(candidate), avoidPacks);
 	};
@@ -35553,7 +37639,7 @@ bool SimPlayerManager::selectPveBotMissionLairSpawn(
 		return best;
 	};
 	bool relaxedTier = false;
-	if (!pinnedLairTemplate.isEmpty()) {
+	if (creatureWord.isEmpty() && !pinnedLairTemplate.isEmpty()) {
 		// A progression order already chose this lair for the bot's grind tier;
 		// re-deriving it here (highest yield) is how one PACK lair won every
 		// board. Same two tiers as the search, so the pin is never looser.
@@ -35712,7 +37798,7 @@ bool SimPlayerManager::selectPveBotMissionLairSpawn(
 bool SimPlayerManager::choosePveBotMissionPosition(
 		const PveMissionTerminalLocation& terminal, int difficultyLevel,
 		const String& planet, Vector3& position, float& bearing,
-		uint64 diagIdentityId) {
+		uint64 diagIdentityId, int wantedBearing, bool hasWantedBearing) {
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
 	Zone* zone = zoneServer == nullptr ? nullptr : zoneServer->getZone(planet);
 	PlanetManager* planetManager = zone == nullptr ? nullptr :
@@ -35764,14 +37850,32 @@ bool SimPlayerManager::choosePveBotMissionPosition(
 			distance += System::random(difficultyRandom);
 		// Stock placement draws the bearing inside the arc; the legacy path
 		// drew from the full circle and threw two thirds of its tries away.
-		float candidateBearing = pveMissionBoardStockPlacement ?
+		const int bearingTolerance = Math::max(0,
+			playerBotGroupingConfig.missions.bearingToleranceDeg);
+		// wantedBearing is a compass bearing (0 = N, 90 = E, clockwise); this
+		// placement works in the math convention (0 = E, 90 = N, counter-
+		// clockwise), so math = 90 - compass. Unconverted, "SE" placed NW.
+		const int wantedMathBearing = 90 - wantedBearing;
+		// System::random is unsigned: cast before mixing with a negative
+		// angle, or the sum wraps at 2^32 and every direction lands at
+		// 31..121 deg (live 2026-10-22: "west" placed north-east).
+		const int bearingJitter = bearingTolerance == 0 ? 0 :
+			static_cast<int>(System::random(bearingTolerance * 2 + 1)) -
+				bearingTolerance;
+		float candidateBearing = hasWantedBearing ?
+			static_cast<float>((((wantedMathBearing + bearingJitter) % 360) +
+				360) % 360) :
+			pveMissionBoardStockPlacement ?
 			SimBotMissionPlacement::bearingInArc(terminalBearing, arc,
 				System::random(10000) / 10000.f) :
 			static_cast<float>(System::random(360));
 		float candidateDelta = std::fabs(candidateBearing - terminalBearing);
 		while (candidateDelta > 180.f)
 			candidateDelta = std::fabs(candidateDelta - 360.f);
-		if (candidateDelta > arc + 0.01f) {
+		// A leader-named direction replaces the "away from town past the
+		// terminal" arc: "to the S" from a terminal on the north side would
+		// otherwise never place. Bounds, water, city and collision still apply.
+		if (!hasWantedBearing && candidateDelta > arc + 0.01f) {
 			++rejArc;
 			continue;
 		}
@@ -36326,6 +38430,7 @@ uint64 SimPlayerManager::issuePlayerBotGroupDirective(uint64 identityId,
 	if (record.generation != recordGeneration ||
 			record.state == PLAYER_BOT_GROUP_RELEASING)
 		return 0;
+	const uint64 directiveBodyOid = record.bodyOid;
 
 	directiveId = nextPlayerBotGroupingDirectiveId++;
 	if (directiveId == 0)
@@ -36360,6 +38465,15 @@ uint64 SimPlayerManager::issuePlayerBotGroupDirective(uint64 identityId,
 	groupingLock.release();
 	recordPlayerBotGroupingDirectiveEvent(identityId,
 		"issued=1 stage=PLANNING place=" + place.label + " buffCity=");
+	// Wake the bot now: a tick booked far ahead (a G1 route hold waits minutes)
+	// otherwise leaves the directive unplanned (verify 2026-10-22: ~3 min).
+	Reference<SimPlayerController*> controller = directiveBodyOid != 0 &&
+		controllers.contains(directiveBodyOid) ? controllers.get(directiveBodyOid) :
+		nullptr;
+	SimHunterController* hunter = controller == nullptr ? nullptr :
+		dynamic_cast<SimHunterController*>(controller.get());
+	if (hunter != nullptr)
+		hunter->notifyGroupingStateChanged();
 	return directiveId;
 }
 
@@ -37169,6 +39283,162 @@ PveMissionCreditDisposition SimPlayerManager::awardPlayerBotMissionCredits(
 	return disposition;
 }
 
+void SimPlayerManager::queueGroupMissionLairReward(uint64 identityId,
+		uint64 offerId, uint64 groupOid, uint64 lairOid, int difficultyLevel,
+		const Vector3& endPoint) {
+	if (identityId == 0 || lairOid == 0)
+		return;
+	Core::getTaskManager()->executeTask([this, identityId, offerId, groupOid,
+			lairOid, difficultyLevel, endPoint]() {
+		// The caller skipped the solo award for this completion, so every
+		// path that cannot split pays the holder alone (divisor 1).
+		auto payHolderAlone = [&]() {
+			awardPlayerBotMissionCredits(identityId, offerId, lairOid,
+				difficultyLevel, 1);
+		};
+		if (groupOid == 0 || !isPlayerBotGroupMissionsActive(identityId) ||
+				!playerBotMissionCreditGateEnabled(identityId)) {
+			payHolderAlone();
+			return;
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		MissionManager* missionManager = zoneServer == nullptr ? nullptr :
+			zoneServer->getMissionManager();
+		if (missionManager == nullptr) {
+			payHolderAlone();
+			return;
+		}
+
+		Vector<uint64> memberOids;
+		ManagedReference<GroupObject*> group = zoneServer->getObject(groupOid).
+			castTo<GroupObject*>();
+		if (group == nullptr) {
+			payHolderAlone();
+			return;
+		}
+		{
+			Locker groupLock(group);
+			for (int i = 0; i < group->getGroupSize(); ++i) {
+				CreatureObject* member = group->getGroupMember(i);
+				if (member != nullptr)
+					memberOids.add(member->getObjectID());
+			}
+		}
+
+		ManagedReference<SceneObject*> lairObject = zoneServer->getObject(lairOid);
+		Vector3 rewardEndPoint = endPoint;
+		if (lairObject != nullptr)
+			rewardEndPoint = lairObject->getWorldPosition();
+
+		std::vector<SimBotGroupMission::SplitMember> members;
+		for (int i = 0; i < memberOids.size(); ++i) {
+			ManagedReference<CreatureObject*> member = zoneServer->getObject(
+				memberOids.get(i)).castTo<CreatureObject*>();
+			if (member == nullptr)
+				continue;
+			bool isPlayer = false;
+			bool isSimBot = false;
+			Vector3 memberPosition;
+			{
+				// Stock counts every member, dead or alive (awardReward).
+				Locker memberLock(member);
+				isPlayer = member->isPlayerCreature();
+				AiAgent* agent = member->asAiAgent();
+				isSimBot = agent != nullptr && agent->getSimPlayerBot();
+				memberPosition = member->getWorldPosition();
+			}
+			const bool isHarnessLeader = isPlayerBotGroupHarnessLeader(
+				memberOids.get(i));
+			if (!isPlayer && !isSimBot && !isHarnessLeader)
+				continue;
+			const bool inRange = memberPosition.distanceTo(rewardEndPoint) < 128.f;
+			SimBotGroupMission::SplitMember splitMember;
+			splitMember.isPlayer = isPlayer;
+			splitMember.id = isPlayer || isSimBot ? memberOids.get(i) : 0;
+			if (isSimBot && !isHarnessLeader) {
+				uint64 memberIdentityId = 0;
+				{
+					Locker pveLock(&pveMutex);
+					if (pveBodyIdentityIds.contains(memberOids.get(i)))
+						memberIdentityId = pveBodyIdentityIds.get(memberOids.get(i));
+				}
+				if (memberIdentityId == 0 ||
+						!playerBotMissionCreditGateEnabled(memberIdentityId))
+					continue;
+				splitMember.id = memberOids.get(i);
+			}
+			if (isHarnessLeader)
+				splitMember.id = 0;
+			splitMember.inRange = inRange;
+			members.push_back(splitMember);
+		}
+
+		if (members.empty()) {
+			payHolderAlone();
+			return;
+		}
+		const int reward = missionManager->rollDestroyMissionReward(
+			difficultyLevel);
+		const SimBotGroupMission::RewardSplit split =
+			SimBotGroupMission::splitReward(reward, 1, members);
+		MissionDiagLog::event("GROUP_MISSION_SPLIT", identityId,
+			"lair=" + String::valueOf(lairOid) +
+			" reward=" + String::valueOf(reward) +
+			" share=" + String::valueOf(split.share) +
+			" members=" + String::valueOf(members.size()));
+		for (size_t i = 0; i < split.paid.size(); ++i) {
+			const SimBotGroupMission::SplitMember& member = split.paid[i];
+			if (member.isPlayer) {
+				ManagedReference<CreatureObject*> player = zoneServer->getObject(
+					member.id).castTo<CreatureObject*>();
+				if (player == nullptr)
+					continue;
+				StringIdChatParameter message("mission/mission_generic",
+					"success_w_amount");
+				message.setDI(split.share);
+				player->sendSystemMessage(message);
+				Locker playerLock(player);
+				TransactionLog rewardLog(TrxCode::MISSIONSYSTEMDYNAMIC,
+					player, split.share, false);
+				rewardLog.addState("missionID", lairOid);
+				player->addBankCredits(split.share, true);
+				groupMissionSplitPlayerShares.increment();
+				groupMissionSplitCreditsToPlayers.add(split.share);
+			} else {
+				if (member.id == 0) {
+					groupMissionSplitHarnessLeaderShares.increment();
+					continue;
+				}
+				uint64 memberIdentityId = 0;
+				{
+					Locker pveLock(&pveMutex);
+					if (pveBodyIdentityIds.contains(member.id))
+						memberIdentityId = pveBodyIdentityIds.get(member.id);
+				}
+				if (memberIdentityId == 0)
+					continue;
+				if (grantPlayerBotMissionShare(memberIdentityId, split.share,
+						lairOid, "holder level=" +
+						String::valueOf(difficultyLevel))) {
+					groupMissionSplitBotShares.increment();
+					groupMissionSplitCreditsToBots.add(split.share);
+				} else {
+					groupMissionLeaderBotSharesSkipped.increment();
+				}
+			}
+		}
+		for (size_t i = 0; i < split.outOfRange.size(); ++i) {
+			const SimBotGroupMission::SplitMember& member = split.outOfRange[i];
+			if (!member.isPlayer)
+				continue;
+			ManagedReference<CreatureObject*> player = zoneServer->getObject(
+				member.id).castTo<CreatureObject*>();
+			if (player != nullptr)
+				player->sendSystemMessage("@mission/mission_generic:group_too_far");
+		}
+	}, "SimPlayerBotGroupMissionPay");
+}
+
 PveMissionCreditDisposition SimPlayerManager::onPveBotMissionLairDestroyed(
 		uint64 bodyOid, uint64 lairOid) {
 	if (bodyOid == 0 || lairOid == 0)
@@ -37181,6 +39451,7 @@ PveMissionCreditDisposition SimPlayerManager::onPveBotMissionLairDestroyed(
 	bool trackedMissionLair = false;
 	uint64 offerId = 0;
 	int difficultyLevel = 1;
+	Vector3 revealedPosition;
 	// DIAGNOSTIC (built under MissionDiagLog gate): the completion counter only
 	// fires when a stored offer matches BOTH bodyOid and lairOid, while the
 	// lair-cleaned counter fires on the pveHuntLairs key alone -- so 10 cleaned /
@@ -37220,6 +39491,7 @@ PveMissionCreditDisposition SimPlayerManager::onPveBotMissionLairDestroyed(
 				offer.completed = true;
 				offerId = offer.offerId;
 				difficultyLevel = offer.difficultyLevel;
+				revealedPosition = offer.revealedPos;
 				missionCompleted = true;
 				break;
 			}
@@ -37262,16 +39534,57 @@ PveMissionCreditDisposition SimPlayerManager::onPveBotMissionLairDestroyed(
 
 	PveMissionCreditDisposition disposition =
 		PVE_MISSION_CREDIT_NOT_COMPLETED;
-	if (missionCompleted)
-		disposition = awardPlayerBotMissionCredits(identityId, offerId, lairOid,
-			difficultyLevel, 1);
+	bool groupMissionHolder = false;
+	bool groupMissionPayActive = false;
+	uint64 groupMissionGroupOid = 0;
+	if (missionCompleted && isPlayerBotGroupMissionsActive(identityId)) {
+		Locker groupingLock(&groupingMutex);
+		for (int i = 0; i < playerBotGroupRecords.size(); ++i) {
+			const PlayerBotGroupRecord& record =
+				playerBotGroupRecords.elementAt(i).getValue();
+			if (record.identityId != identityId || record.state !=
+					PLAYER_BOT_GROUP_GROUPED)
+				continue;
+			groupMissionGroupOid = record.groupOid;
+			if (!playerBotGroupMissionPlans.contains(record.groupOid))
+				break;
+			const PlayerBotGroupMissionPlan& plan =
+				playerBotGroupMissionPlans.get(record.groupOid);
+			for (int j = 0; j < plan.entries.size(); ++j) {
+				const PlayerBotGroupMissionEntry& entry = plan.entries.get(j);
+				if (entry.kind == PLAYER_BOT_GROUP_MISSION_BOT_OFFER &&
+						entry.holderIdentityId == identityId &&
+						entry.offerId == offerId && entry.lairOid == lairOid) {
+					groupMissionHolder = true;
+					break;
+				}
+			}
+			break;
+		}
+	}
+	if (groupMissionHolder)
+		groupMissionPayActive = playerBotMissionCreditGateEnabled(identityId);
+	if (missionCompleted) {
+		if (groupMissionHolder && groupMissionPayActive) {
+				queueGroupMissionLairReward(identityId, offerId,
+					groupMissionGroupOid, lairOid, difficultyLevel, revealedPosition);
+				disposition = PVE_MISSION_CREDIT_AWARDED;
+			} else {
+			disposition = awardPlayerBotMissionCredits(identityId, offerId, lairOid,
+				difficultyLevel, 1);
+		}
+	}
 
 	Reference<SimPlayerController*> ctrl = controllers.contains(bodyOid) ?
 		controllers.get(bodyOid) : nullptr;
 	SimHunterController* hunter = ctrl == nullptr ? nullptr :
 		dynamic_cast<SimHunterController*>(ctrl.get());
-	if (hunter != nullptr)
-		hunter->onPveBotMissionLairDestroyed(lairOid);
+	if (hunter != nullptr) {
+		if (groupMissionHolder)
+			hunter->onGroupMissionLairDestroyed(lairOid);
+		else
+			hunter->onPveBotMissionLairDestroyed(lairOid);
+	}
 
 	info("SimPveBotMissionLairDestroyed body=" + String::valueOf(bodyOid) +
 		" lair=" + String::valueOf(lairOid) + " completed=" +
@@ -40056,6 +42369,29 @@ void SimPlayerManager::onPveHunterDied(uint64 identityId, uint64 bodyOid,
 		// Collected for every hunter so no capture outlives its body.
 		SimEarlyGameDeathCause deathCause;
 		bool haveDeathCause = SimEarlyGameDeathLog::take(bodyOid, deathCause);
+		const uint64 deathAtMs = System::getMiliTime();
+		{
+			Locker progressionLock(&progressionMutex);
+			playerBotLastDeathMs.put(identityId, deathAtMs);
+		}
+		bool parityScenarioActive = false;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			parityScenarioActive = playerBotParityTestScenarioActive;
+		}
+		if (parityScenarioActive) {
+			PlayerBotParityDeathFact fact;
+			fact.identityId = identityId;
+			fact.atMs = deathAtMs;
+			if (haveDeathCause) {
+				fact.killerOid = deathCause.attackerOid;
+				fact.killerTemplate = deathCause.attackerTemplate.isEmpty() ?
+					deathCause.topDamagerTemplate : deathCause.attackerTemplate;
+			}
+			Locker parityLock(&playerBotParityTestMutex);
+			if (playerBotParityTestScenarioActive)
+				playerBotParityDeaths.put(identityId, fact);
+		}
 		if (earlyGameIdentity && haveDeathSite)
 			recordPlayerBotEarlyGameDeathSite(identityId, bodyOid, deathPlanet,
 				deathPosition, haveDeathCause ? &deathCause : nullptr);
@@ -63926,6 +66262,7 @@ void SimPlayerManager::releasePlayerBotGroup(uint64 identityId,
 	}
 
 	bool removed = false;
+	bool releasedLastGroupRecord = false;
 	{
 		Locker groupingLock(&groupingMutex);
 		if (playerBotGroupRecords.contains(identityId) &&
@@ -63935,12 +66272,26 @@ void SimPlayerManager::releasePlayerBotGroup(uint64 identityId,
 			playerBotGroupRecords.drop(identityId);
 			playerBotGroupDirectives.drop(identityId);
 			playerBotGroupRoutes.drop(identityId);
+			bool groupStillPresent = false;
+			for (int i = 0; i < playerBotGroupRecords.size(); ++i) {
+				const PlayerBotGroupRecord& remaining =
+					playerBotGroupRecords.elementAt(i).getValue();
+				if (remaining.groupOid == record.groupOid &&
+						remaining.state != PLAYER_BOT_GROUP_RELEASING) {
+					groupStillPresent = true;
+					break;
+				}
+			}
+			if (!groupStillPresent)
+				releasedLastGroupRecord = true;
 			++nextPlayerBotGroupingGeneration;
 			removed = true;
 		}
 	}
 	if (!removed)
 		return;
+	if (releasedLastGroupRecord)
+		teardownPlayerBotGroupMissionPlan(record.groupOid, "group_release");
 	{
 		Locker groupingLock(&groupingMutex);
 		playerBotGroupingReleases.put(reason,
@@ -63958,6 +66309,33 @@ void SimPlayerManager::releasePlayerBotGroup(uint64 identityId,
 		" reason=" + reason, true);
 }
 
+// Harness teardown: only groups led by a harness stand-in. A real player's
+// group with production bots is never touched.
+void SimPlayerManager::releaseHarnessPlayerBotGroups(const String& reason) {
+	Vector<uint64> identityIds;
+	Vector<uint64> leaderOids;
+	{
+		Locker groupingLock(&groupingMutex);
+		for (int i = 0; i < playerBotGroupRecords.size(); ++i) {
+			identityIds.add(playerBotGroupRecords.elementAt(i).getKey());
+			leaderOids.add(playerBotGroupRecords.elementAt(i).getValue().leaderOid);
+		}
+	}
+	// The stand-in set is read under the parity mutex with groupingMutex
+	// released. Not isPlayerBotGroupHarnessLeader: that also requires an
+	// active scenario, and a failed scenario is already inactive here.
+	Vector<uint64> harnessLeaders;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		for (int i = 0; i < playerBotParityGroupHarnessLeaderOids.size(); ++i)
+			harnessLeaders.add(playerBotParityGroupHarnessLeaderOids.elementAt(i).getKey());
+	}
+	for (int i = 0; i < identityIds.size(); ++i) {
+		if (leaderOids.get(i) != 0 && harnessLeaders.contains(leaderOids.get(i)))
+			releasePlayerBotGroup(identityIds.get(i), reason);
+	}
+}
+
 void SimPlayerManager::releaseAllPlayerBotGroups(const String& reason) {
 	Vector<uint64> identityIds;
 	{
@@ -63967,6 +66345,217 @@ void SimPlayerManager::releaseAllPlayerBotGroups(const String& reason) {
 	}
 	for (int i = 0; i < identityIds.size(); ++i)
 		releasePlayerBotGroup(identityIds.get(i), reason);
+}
+
+void SimPlayerManager::evaluatePlayerBotGroupMissionBatches(uint64 nowMs) {
+	Vector<uint64> expiredGroups;
+	{
+		Locker groupingLock(&groupingMutex);
+		for (int i = 0; i < playerBotGroupMissionPlans.size(); ++i) {
+			PlayerBotGroupMissionPlan& plan =
+				playerBotGroupMissionPlans.elementAt(i).getValue();
+			if (plan.activeGrabBatchId == 0 ||
+					plan.activeGrabBatchDeadlineMs == 0 ||
+					nowMs < plan.activeGrabBatchDeadlineMs)
+				continue;
+			for (int j = 0; j < plan.grabRequests.size(); ++j) {
+				PlayerBotGroupMissionGrabRequest& request =
+					plan.grabRequests.get(j);
+				if (request.batchId == plan.activeGrabBatchId &&
+						request.state == PLAYER_BOT_GROUP_MISSION_GRAB_PENDING)
+					request.state = PLAYER_BOT_GROUP_MISSION_GRAB_FAILED;
+			}
+			plan.activeGrabBatchId = 0;
+			plan.activeGrabBatchDeadlineMs = 0;
+			plan.runRequested = true; // a closed batch sends the group out
+			++plan.planEpoch;
+			bool allDone = true;
+			for (int j = 0; j < plan.entries.size(); ++j)
+				if (!plan.entries.get(j).completed &&
+						!plan.entries.get(j).abandoned)
+					allDone = false;
+			for (int j = 0; j < playerBotGroupRecords.size(); ++j) {
+				const PlayerBotGroupRecord& record =
+					playerBotGroupRecords.elementAt(j).getValue();
+				if (record.groupOid != plan.groupOid)
+					continue;
+				setPlayerBotGroupMissionDirectiveLocked(record, plan,
+					allDone ? SimBotGroupRally::DONE :
+					SimBotGroupRally::MISSION_WAIT);
+			}
+			expiredGroups.add(plan.groupOid);
+		}
+	}
+	for (int i = 0; i < expiredGroups.size(); ++i) {
+		const uint64 groupOid = expiredGroups.get(i);
+		refreshGroupPlayerMissions(groupOid, true);
+		Vector<PlayerBotGroupRecord> records;
+		{
+			Locker groupingLock(&groupingMutex);
+			for (int j = 0; j < playerBotGroupRecords.size(); ++j)
+				if (playerBotGroupRecords.elementAt(j).getValue().groupOid == groupOid)
+					records.add(playerBotGroupRecords.elementAt(j).getValue());
+		}
+		for (int j = 0; j < records.size(); ++j) {
+			Reference<SimPlayerController*> controller =
+				controllers.contains(records.get(j).bodyOid) ?
+				controllers.get(records.get(j).bodyOid) : nullptr;
+			SimHunterController* hunter = controller == nullptr ? nullptr :
+				dynamic_cast<SimHunterController*>(controller.get());
+			if (hunter != nullptr)
+				hunter->notifyGroupingStateChanged();
+		}
+	}
+}
+
+void SimPlayerManager::evaluatePlayerBotGroupMissionEntries(uint64 nowMs) {
+	const uint64 timeoutMs = static_cast<uint64>(Math::max(1,
+		playerBotGroupingConfig.missions.missionTimeoutMinutes)) * 60000ULL;
+	std::vector<std::pair<uint64, PlayerBotGroupMissionEntry> > expired;
+	{
+		Locker groupingLock(&groupingMutex);
+		for (int planIndex = 0; planIndex < playerBotGroupMissionPlans.size();
+				planIndex++) {
+			PlayerBotGroupMissionPlan& plan =
+				playerBotGroupMissionPlans.elementAt(planIndex).getValue();
+			bool changed = false;
+			for (int entryIndex = 0; entryIndex < plan.entries.size();
+					entryIndex++) {
+				PlayerBotGroupMissionEntry& entry = plan.entries.get(entryIndex);
+				if (entry.completed || entry.abandoned || entry.startedAtMs == 0 ||
+						nowMs < entry.startedAtMs + timeoutMs)
+					continue;
+				entry.abandoned = true;
+				entry.abandonmentReason = "timeout";
+				if (plan.currentEntryId == entry.entryId) {
+					plan.currentEntryId = 0;
+					++plan.planEpoch;
+				}
+				expired.push_back(std::make_pair(plan.groupOid, entry));
+				changed = true;
+			}
+			if (!changed)
+				continue;
+			bool allDone = plan.activeGrabBatchId == 0;
+			for (int entryIndex = 0; allDone && entryIndex < plan.entries.size();
+					entryIndex++)
+				if (!plan.entries.get(entryIndex).completed &&
+						!plan.entries.get(entryIndex).abandoned)
+					allDone = false;
+			for (int recordIndex = 0; recordIndex < playerBotGroupRecords.size();
+					recordIndex++) {
+				const PlayerBotGroupRecord& record =
+					playerBotGroupRecords.elementAt(recordIndex).getValue();
+				if (record.groupOid == plan.groupOid)
+					setPlayerBotGroupMissionDirectiveLocked(record, plan,
+						allDone ? SimBotGroupRally::DONE :
+						SimBotGroupRally::MISSION_WAIT);
+			}
+		}
+	}
+
+	for (size_t i = 0; i < expired.size(); ++i) {
+		const uint64 groupOid = expired[i].first;
+		const PlayerBotGroupMissionEntry& entry = expired[i].second;
+		if (entry.kind == PLAYER_BOT_GROUP_MISSION_BOT_OFFER) {
+			uint64 bodyOid = 0;
+			{
+				Locker pveLock(&pveMutex);
+				if (pveIdentityBodyOids.contains(entry.holderIdentityId))
+					bodyOid = pveIdentityBodyOids.get(entry.holderIdentityId);
+				if (!entry.revealed && entry.offerId != 0 &&
+						pveBotMissions.contains(entry.holderIdentityId)) {
+					Vector<PveBotMissionOffer>& offers =
+						pveBotMissions.get(entry.holderIdentityId);
+					for (int offerIndex = offers.size() - 1; offerIndex >= 0;
+							offerIndex--)
+						if (offers.get(offerIndex).offerId == entry.offerId &&
+								!offers.get(offerIndex).revealed)
+							offers.remove(offerIndex);
+					if (offers.size() == 0)
+						pveBotMissions.drop(entry.holderIdentityId);
+				}
+			}
+			if (entry.revealed && bodyOid != 0)
+				requestPveHuntLairCleanup(bodyOid, "group_timeout");
+		}
+		MissionDiagLog::event("GROUP_MISSION", groupOid,
+			"entry=" + String::valueOf(entry.entryId) +
+			" outcome=timeout");
+		refreshGroupPlayerMissions(groupOid, true);
+	}
+}
+
+void SimPlayerManager::teardownPlayerBotGroupMissionPlan(uint64 groupOid,
+		const String& reason) {
+	if (groupOid == 0)
+		return;
+	Vector<PlayerBotGroupMissionEntry> entries;
+	{
+		Locker groupingLock(&groupingMutex);
+		if (!playerBotGroupMissionPlans.contains(groupOid))
+			return;
+		const uint64 planId = playerBotGroupMissionPlans.get(groupOid).planId;
+		entries = playerBotGroupMissionPlans.get(groupOid).entries;
+		playerBotGroupMissionPlans.drop(groupOid);
+		for (int i = playerBotGroupDirectives.size() - 1; i >= 0; --i) {
+			const PlayerBotGroupDirective& directive =
+				playerBotGroupDirectives.elementAt(i).getValue();
+			if (directive.groupOid == groupOid && directive.missionPlanId == planId)
+				playerBotGroupDirectives.remove(i);
+		}
+	}
+	Vector<uint64> cleanupBodies;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < entries.size(); ++i) {
+			const PlayerBotGroupMissionEntry& entry = entries.get(i);
+			if (entry.kind != PLAYER_BOT_GROUP_MISSION_BOT_OFFER)
+				continue;
+			if (entry.revealed && entry.lairOid != 0 &&
+					pveIdentityBodyOids.contains(entry.holderIdentityId)) {
+				uint64 bodyOid = pveIdentityBodyOids.get(entry.holderIdentityId);
+				if (!cleanupBodies.contains(bodyOid))
+					cleanupBodies.add(bodyOid);
+			}
+			if (entry.offerId == 0 ||
+					!pveBotMissions.contains(entry.holderIdentityId))
+				continue;
+			Vector<PveBotMissionOffer>& offers =
+				pveBotMissions.get(entry.holderIdentityId);
+			for (int j = offers.size() - 1; j >= 0; --j)
+				if (offers.get(j).offerId == entry.offerId &&
+						!offers.get(j).revealed)
+					offers.remove(j);
+			if (offers.size() == 0)
+				pveBotMissions.drop(entry.holderIdentityId);
+		}
+	}
+	for (int i = 0; i < cleanupBodies.size(); ++i)
+		requestPveHuntLairCleanup(cleanupBodies.get(i), reason);
+	// The plan is gone, so refreshGroupPlayerMissions would reject the group.
+	// Ask stock directly: its next run sees no bot missions and points each
+	// player back at their own missions (or clears the waypoint).
+	{
+		ZoneServer* teardownServer = ServerCore::getZoneServer();
+		ManagedReference<GroupObject*> teardownGroup = teardownServer == nullptr ?
+			nullptr : teardownServer->getObject(groupOid).castTo<GroupObject*>();
+		if (teardownGroup != nullptr) {
+			Locker groupLock(teardownGroup);
+			Vector<uint32> planetCRCs;
+			for (int i = 0; i < teardownGroup->getGroupSize(); ++i) {
+				CreatureObject* member = teardownGroup->getGroupMember(i);
+				if (member != nullptr && member->isPlayerCreature() &&
+						member->getZone() != nullptr &&
+						!planetCRCs.contains(member->getZone()->getZoneCRC()))
+					planetCRCs.add(member->getZone()->getZoneCRC());
+			}
+			for (int i = 0; i < planetCRCs.size(); ++i)
+				teardownGroup->scheduleUpdateNearestMissionForGroup(planetCRCs.get(i));
+		}
+	}
+	MissionDiagLog::event("GROUP_MISSION", groupOid,
+		"plan_teardown=1 reason=" + reason);
 }
 
 void SimPlayerManager::reconcilePlayerBotGroups(uint64 nowMs) {
@@ -63987,6 +66576,24 @@ void SimPlayerManager::reconcilePlayerBotGroups(uint64 nowMs) {
 			if (!isPlayerBotGroupDirectivesActive(identityId))
 				clearPlayerBotGroupDirective(identityId, 0, "gate_off");
 		}
+	}
+	{
+		// Per plan, not global: the harness enables missions per identity
+		// while the shipped capability stays off.
+		Vector<uint64> missionGroupOids;
+		{
+			Locker groupingLock(&groupingMutex);
+			for (int i = 0; i < playerBotGroupMissionPlans.size(); ++i)
+				missionGroupOids.add(
+					playerBotGroupMissionPlans.elementAt(i).getKey());
+		}
+		for (int i = 0; i < missionGroupOids.size(); ++i) {
+			if (!isPlayerBotGroupMissionPlanActive(missionGroupOids.get(i)))
+				teardownPlayerBotGroupMissionPlan(missionGroupOids.get(i),
+					"gate_off");
+		}
+		evaluatePlayerBotGroupMissionBatches(nowMs);
+		evaluatePlayerBotGroupMissionEntries(nowMs);
 	}
 
 	Vector<PlayerBotGroupRecord> records;
@@ -64093,6 +66700,38 @@ void SimPlayerManager::reconcilePlayerBotGroups(uint64 nowMs) {
 		if (leased)
 			releasePlayerBotGroup(captured.identityId, verdict.reason);
 	}
+	{
+		Vector<uint64> missionGroupIds;
+		{
+			Locker groupingLock(&groupingMutex);
+			for (int i = 0; i < playerBotGroupMissionPlans.size(); ++i)
+				missionGroupIds.add(playerBotGroupMissionPlans.elementAt(i).getKey());
+		}
+		for (int i = 0; i < missionGroupIds.size(); ++i) {
+			if (isPlayerBotGroupMissionPlanActive(missionGroupIds.get(i)))
+				refreshGroupPlayerMissions(missionGroupIds.get(i));
+		}
+	}
+}
+
+bool SimPlayerManager::isPlayerBotGroupMissionPlanActive(uint64 groupOid) {
+	if (groupOid == 0)
+		return false;
+	Vector<uint64> identities;
+	{
+		Locker groupingLock(&groupingMutex);
+		for (int i = 0; i < playerBotGroupRecords.size(); ++i) {
+			if (playerBotGroupRecords.elementAt(i).getValue().groupOid == groupOid)
+				identities.add(playerBotGroupRecords.elementAt(i).getKey());
+		}
+	}
+	// The gate takes playerBotParityTestMutex: evaluated with groupingMutex
+	// released.
+	for (int i = 0; i < identities.size(); ++i) {
+		if (isPlayerBotGroupMissionsActive(identities.get(i)))
+			return true;
+	}
+	return false;
 }
 
 void SimPlayerManager::preparePlayerBotGroupingDeath(uint64 identityId,
@@ -64109,6 +66748,7 @@ void SimPlayerManager::preparePlayerBotGroupingDeath(uint64 identityId,
 	PlayerBotGroupRecord record;
 	bool hadRecord = false;
 	uint64 recordedBodyOid = bodyOid;
+	Vector<uint64> revealedMissionLairsToClean;
 	{
 		Locker groupingLock(&groupingMutex);
 		playerBotGroupOffers.drop(identityId);
@@ -64125,11 +66765,71 @@ void SimPlayerManager::preparePlayerBotGroupingDeath(uint64 identityId,
 				if (live.generation == 0)
 					live.generation = 1;
 			}
+			bool abandonedCurrentEntry = false;
+			if (playerBotGroupMissionPlans.contains(record.groupOid)) {
+				PlayerBotGroupMissionPlan& plan =
+					playerBotGroupMissionPlans.get(record.groupOid);
+				for (int i = 0; i < plan.entries.size(); ++i) {
+					PlayerBotGroupMissionEntry& entry = plan.entries.get(i);
+					if (entry.kind == PLAYER_BOT_GROUP_MISSION_BOT_OFFER &&
+							entry.holderIdentityId == identityId && entry.revealed &&
+							entry.lairOid != 0 && !entry.completed && !entry.abandoned) {
+						revealedMissionLairsToClean.add(entry.lairOid);
+						entry.abandoned = true;
+						entry.abandonmentReason = "holder_died";
+						if (plan.currentEntryId == entry.entryId) {
+							plan.currentEntryId = 0;
+							++plan.planEpoch;
+							abandonedCurrentEntry = true;
+						}
+					}
+				}
+				// Only a death that abandoned the current entry moves the group,
+				// and never a bot that is still grabbing. The dying bot itself is
+				// handled with its own directive below.
+				bool allDone = plan.activeGrabBatchId == 0;
+				for (int i = 0; allDone && i < plan.entries.size(); ++i)
+					if (!plan.entries.get(i).completed &&
+							!plan.entries.get(i).abandoned)
+						allDone = false;
+				for (int i = 0; abandonedCurrentEntry &&
+						i < playerBotGroupRecords.size(); ++i) {
+					const PlayerBotGroupRecord& memberRecord =
+						playerBotGroupRecords.elementAt(i).getValue();
+					if (memberRecord.groupOid != record.groupOid ||
+							memberRecord.identityId == identityId)
+						continue;
+					if (playerBotGroupDirectives.contains(memberRecord.identityId)) {
+						const SimBotGroupRally::DirectiveStage memberStage =
+							playerBotGroupDirectives.get(memberRecord.identityId).stage;
+						if (memberStage == SimBotGroupRally::MISSION_GRAB_TRAVEL ||
+								memberStage == SimBotGroupRally::MISSION_GRAB)
+							continue;
+					}
+					setPlayerBotGroupMissionDirectiveLocked(memberRecord, plan,
+						allDone ? SimBotGroupRally::DONE :
+						SimBotGroupRally::MISSION_WAIT);
+				}
+			}
 			if (playerBotGroupDirectives.contains(identityId)) {
 				PlayerBotGroupDirective& directive =
 					playerBotGroupDirectives.get(identityId);
 				directive.recordGeneration = live.generation;
-				if (directive.stage != SimBotGroupRally::PLANNING) {
+				const SimBotGroupRally::DirectiveStage deathStage = directive.stage;
+				if (deathStage == SimBotGroupRally::MISSION_GRAB_TRAVEL ||
+						deathStage == SimBotGroupRally::MISSION_GRAB) {
+					// The grab request stays pending: the clone walks to a
+					// terminal again instead of entering the G2 planner.
+					directive.stage = SimBotGroupRally::MISSION_GRAB_TRAVEL;
+					directive.stageStartedAtMs = System::getMiliTime();
+				} else if (deathStage == SimBotGroupRally::MISSION_WAIT ||
+						deathStage == SimBotGroupRally::MISSION_TRAVEL ||
+						deathStage == SimBotGroupRally::MISSION_HOLD ||
+						deathStage == SimBotGroupRally::MISSION_FIGHT) {
+					// Re-join the plan's current entry from the clone.
+					directive.stage = SimBotGroupRally::MISSION_WAIT;
+					directive.stageStartedAtMs = System::getMiliTime();
+				} else if (directive.stage != SimBotGroupRally::PLANNING) {
 					directive.stage = SimBotGroupRally::PLANNING;
 					directive.stageStartedAtMs = System::getMiliTime();
 					directive.holdStartedAtMs = 0;
@@ -64143,6 +66843,11 @@ void SimPlayerManager::preparePlayerBotGroupingDeath(uint64 identityId,
 	}
 	if (!hadRecord || recordedBodyOid == 0)
 		return;
+	if (revealedMissionLairsToClean.size() > 0)
+		requestPveHuntLairCleanup(recordedBodyOid, "group_holder_died");
+	if (hadRecord) {
+		refreshGroupPlayerMissions(record.groupOid, true);
+	}
 
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
 	ManagedReference<CreatureObject*> body = zoneServer == nullptr ? nullptr :
@@ -64258,6 +66963,15 @@ bool SimPlayerManager::tryRejoinPlayerBotGroup(uint64 identityId,
 		body->updateGroupInviterID(0, false);
 		return false;
 	}
+	{
+		Locker pveLock(&pveMutex);
+		if (pveBotMissions.contains(identityId)) {
+			Vector<PveBotMissionOffer>& offers = pveBotMissions.get(identityId);
+			for (int i = 0; i < offers.size(); ++i)
+				if (!offers.get(i).revealed)
+					offers.get(i).bodyOid = newBodyOid;
+		}
+	}
 	playerBotGroupingRejoins.increment();
 	MissionDiagLog::event("GROUP_REJOIN", identityId,
 		"group=" + String::valueOf(groupOid));
@@ -64285,6 +66999,16 @@ bool SimPlayerManager::tryRejoinPlayerBotGroup(uint64 identityId,
 		String("Cloned at {city}, heading back.");
 	clonedLine = replaceGroupingToken(clonedLine, "{city}", cloneCity);
 	postPlayerBotGroupChat(groupOid, botName, clonedLine);
+	// A clone has no buffs. The bot never rebuffs on its own (owner rule,
+	// G2); it says how to send it, and "<name> buff" is the G2 buff order to
+	// that bot alone (then it meets the leader).
+	if (isPlayerBotGroupDirectivesActive(identityId) &&
+			config.clonedNoBuffsLines.size() > 0) {
+		String buffLine = config.clonedNoBuffsLines.get(
+			System::random(config.clonedNoBuffsLines.size() - 1));
+		buffLine = replaceGroupingToken(buffLine, "{name}", botName);
+		postPlayerBotGroupReply(groupOid, identityId, buffLine);
+	}
 	return true;
 }
 
@@ -64326,7 +67050,8 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 		}
 	}
 	SimBotGroupRally::LeaderLine parsed = SimBotGroupRally::parseLeaderLine(
-		text, namedBots, config.vocabulary, config.rallyVocabulary);
+		text, namedBots, config.vocabulary, config.rallyVocabulary,
+		config.missions.vocabulary);
 	SimBotGrouping::GroupCommand command = parsed.command;
 	auto rememberUnmatched = [this, &text]() {
 		playerBotGroupingGroupChatUnhandled.increment();
@@ -64338,7 +67063,7 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 			playerBotGroupingRecentUnmatched.remove(0);
 	};
 	if (command.command == SimBotGrouping::GROUP_COMMAND_NONE &&
-			!parsed.isDirective) {
+			!parsed.isDirective && !parsed.isMission) {
 		rememberUnmatched();
 		return;
 	}
@@ -64372,7 +67097,7 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 		playerBotGroupingGroupChatCommands.contains(commandName) ?
 			playerBotGroupingGroupChatCommands.get(commandName) + 1 : 1);
 	}
-	const bool leaderOnlyCommand = parsed.isDirective ||
+	const bool leaderOnlyCommand = parsed.isDirective || parsed.isMission ||
 		command.command == SimBotGrouping::GROUP_COMMAND_FOLLOW;
 	if (leaderOnlyCommand) {
 		bool senderIsLeader = false;
@@ -64399,6 +67124,329 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 			postPlayerBotGroupReply(group, identityId, line);
 		}, taskName, delay * 1000);
 	};
+
+	if (parsed.isMission) {
+		bool missionGateOpen = false;
+		for (int i = 0; i < records.size(); ++i)
+			missionGateOpen |= isTargeted(records.get(i).identityId) &&
+				isPlayerBotGroupMissionsActive(records.get(i).identityId);
+		if (!missionGateOpen)
+			return;
+
+		// Creature words are built from the same destroy-mission spawn group that
+		// offer generation uses.  The list is a read-only local snapshot; no
+		// manager lock is held while the template registry is inspected.
+		String leaderPlanet;
+		Vector3 leaderPosition;
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<CreatureObject*> leader = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(senderOid).castTo<CreatureObject*>();
+		if (leader != nullptr) {
+			Locker leaderLock(leader);
+			Zone* zone = leader->getZone();
+			if (zone != nullptr) {
+				leaderPlanet = zone->getZoneName();
+				leaderPosition = leader->getWorldPosition();
+			}
+		}
+		std::vector<String> creatureWords;
+		if (!leaderPlanet.isEmpty()) {
+			auto* destroyGroup = CreatureTemplateManager::instance()->
+				getDestroyMissionGroup((leaderPlanet + "_destroy_missions").hashCode());
+			if (destroyGroup != nullptr) {
+				const auto& spawns = destroyGroup->getSpawnList();
+				for (int i = 0; i < spawns.size(); ++i) {
+					LairSpawn* spawn = spawns.get(i);
+					if (spawn == nullptr)
+						continue;
+					creatureWords.push_back(spawn->getLairTemplateName());
+					LairTemplate* lairTemplate = CreatureTemplateManager::instance()->
+						getLairTemplate(spawn->getLairTemplateName().hashCode());
+					const Vector<String>* mobiles = lairTemplate == nullptr ? nullptr :
+						lairTemplate->getWeightedMobiles();
+					if (mobiles == nullptr)
+						continue;
+					for (int j = 0; j < mobiles->size(); ++j) {
+						CreatureTemplate* mobile = CreatureTemplateManager::instance()->
+							getTemplate(mobiles->get(j).hashCode());
+						if (mobile != nullptr)
+							creatureWords.push_back(mobile->getTemplateName());
+					}
+				}
+			}
+		}
+		std::vector<String> missionNameWords;
+		for (size_t i = 0; i < namedBots.size(); ++i) {
+			const std::vector<String> parts = SimBotGrouping::keywordTokens(
+				namedBots[i].firstName);
+			missionNameWords.insert(missionNameWords.end(), parts.begin(),
+				parts.end());
+		}
+		parsed.mission = SimBotGroupMission::parseMissionRequest(text,
+			config.missions.vocabulary, missionNameWords, creatureWords);
+		if (parsed.mission.command == SimBotGroupMission::MISSION_NONE)
+			return;
+		if (parsed.mission.command == SimBotGroupMission::MISSION_GRAB) {
+			uint64 terminalOid = 0;
+			PveMissionTerminalLocation terminal;
+			int terminalState = 0;
+			if (!getNearestGeneralMissionTerminal(leaderPlanet, leaderPosition,
+				terminal, terminalState)) {
+				if (records.size() > 0)
+					scheduleLine(groupId, records.get(0).identityId,
+						"No mission terminal nearby.", 0, 0,
+						"PlayerBotMissionNoTerminal");
+				return;
+			}
+			terminalOid = terminal.terminalOid;
+			std::vector<SimBotGroupMission::GrabCandidate> candidates;
+			const int maxHeld = zoneServer == nullptr ||
+				zoneServer->getMissionManager() == nullptr ? 2 :
+				Math::max(1, zoneServer->getMissionManager()->getMaxActiveMissions());
+			VectorMap<uint64, int> pendingGrabCounts;
+			{
+				Locker groupingLock(&groupingMutex);
+				if (playerBotGroupMissionPlans.contains(groupId)) {
+					const PlayerBotGroupMissionPlan& plan =
+						playerBotGroupMissionPlans.get(groupId);
+					for (int i = 0; i < plan.grabRequests.size(); ++i) {
+						const PlayerBotGroupMissionGrabRequest& request =
+							plan.grabRequests.get(i);
+						if (request.batchId == plan.activeGrabBatchId &&
+								request.state ==
+								PLAYER_BOT_GROUP_MISSION_GRAB_PENDING)
+							pendingGrabCounts.put(request.identityId,
+								pendingGrabCounts.contains(request.identityId) ?
+								pendingGrabCounts.get(request.identityId) + request.count :
+								request.count);
+					}
+				}
+			}
+			for (int i = 0; i < records.size(); ++i) {
+				const PlayerBotGroupRecord& record = records.get(i);
+				if (!isTargeted(record.identityId) || record.state !=
+						PLAYER_BOT_GROUP_GROUPED ||
+					!isPlayerBotGroupMissionsActive(record.identityId))
+					continue;
+				uint64 held = 0;
+				uint64 bodyOid = 0;
+				{
+					Locker pveLock(&pveMutex);
+					bodyOid = pveIdentityBodyOids.contains(record.identityId) ?
+						pveIdentityBodyOids.get(record.identityId) : 0;
+					held = pveBotMissions.contains(record.identityId) ?
+						pveBotMissions.get(record.identityId).size() : 0;
+				}
+				const int pendingCount = pendingGrabCounts.contains(record.identityId) ?
+					pendingGrabCounts.get(record.identityId) : 0;
+				if (bodyOid == 0 || held + static_cast<uint64>(pendingCount) >=
+						static_cast<uint64>(maxHeld))
+					continue;
+				ManagedReference<SceneObject*> bodyObject = zoneServer->getObject(bodyOid);
+				AiAgent* body = bodyObject == nullptr ? nullptr : bodyObject->asAiAgent();
+				if (body == nullptr)
+					continue;
+				Vector3 bodyPosition;
+				String bodyPlanet;
+				bool available = false;
+				{
+					Locker bodyLock(body);
+					Zone* bodyZone = body->getZone();
+					available = !body->isDead() && !body->isInCombat() &&
+						bodyZone != nullptr;
+					if (available) {
+						bodyPosition = body->getWorldPosition();
+						bodyPlanet = bodyZone->getZoneName();
+					}
+				}
+				// A bot on another planet still takes the grab: G2 routing
+				// carries it to the terminal on the leader's planet. It only
+				// ranks after the bots already on that planet.
+				if (!available)
+					continue;
+				SimBotIdentity identity;
+				if (!snapshotPlayerBotIdentity(record.identityId, identity))
+					continue;
+				SimBotGroupMission::GrabCandidate candidate;
+				candidate.identityId = record.identityId;
+				candidate.firstName = identity.firstName;
+				candidate.distanceToTerminal = bodyPlanet == leaderPlanet ?
+					bodyPosition.distanceTo2d(terminal.position) : 1.0e9f;
+				candidate.remainingCapacity = maxHeld - static_cast<int>(held) -
+					pendingCount;
+				candidates.push_back(candidate);
+			}
+			const SimBotGroupMission::GrabAssignment assignment =
+				SimBotGroupMission::assignGrab(parsed.mission.count, candidates,
+					parsed.mission.addressedBot);
+			if (parsed.mission.unknownCreature) {
+				groupMissionGrabUnknownCreature.increment();
+				uint64 replyIdentity = records.size() > 0 ? records.get(0).identityId : 0;
+				if (replyIdentity != 0) {
+					String line = config.missions.missionUnknownCreatureLines.size() > 0 ?
+						config.missions.missionUnknownCreatureLines.get(0) :
+						String("Never heard of that creature around here.");
+					line = replaceGroupingToken(line, "{word}", parsed.mission.creatureWord);
+					scheduleLine(groupId, replyIdentity, line, 0, 0,
+						"PlayerBotMissionUnknownCreature");
+				}
+				return;
+			}
+			if (assignment.assignments.empty()) {
+				groupMissionCapacityCapped.increment();
+				if (records.size() > 0)
+					scheduleLine(groupId, records.get(0).identityId,
+						"We cannot carry another mission.", 0, 0,
+						"PlayerBotMissionCapacity");
+				return;
+			}
+			if (assignment.unassigned > 0)
+				groupMissionCapacityCapped.increment();
+			uint64 planId = 0;
+			Vector<uint64> assignedIdentities;
+			{
+				Locker groupingLock(&groupingMutex);
+				if (!playerBotGroupMissionPlans.contains(groupId)) {
+					PlayerBotGroupMissionPlan plan;
+					plan.groupOid = groupId;
+					plan.leaderOid = senderOid;
+					plan.planId = nextPlayerBotGroupMissionPlanId++;
+					plan.planEpoch = 1;
+					playerBotGroupMissionPlans.put(groupId, plan);
+				}
+				PlayerBotGroupMissionPlan& plan = playerBotGroupMissionPlans.get(groupId);
+				plan.leaderOid = senderOid;
+				if (plan.activeGrabBatchId == 0)
+					plan.activeGrabBatchId = plan.nextEntryId++;
+				plan.activeGrabBatchDeadlineMs = System::getMiliTime() +
+					static_cast<uint64>(config.missions.grabBatchTimeoutSeconds) * 1000ULL;
+				planId = plan.planId;
+				for (size_t i = 0; i < assignment.assignments.size(); ++i) {
+					const auto& assigned = assignment.assignments[i];
+					PlayerBotGroupMissionGrabRequest request;
+					request.identityId = assigned.identityId;
+					request.count = assigned.count;
+					request.creatureWord = parsed.mission.creatureWord;
+					request.bearingDeg = parsed.mission.bearingDeg;
+					request.hasBearing = parsed.mission.hasBearing;
+					request.requestId = plan.nextEntryId++;
+					request.batchId = plan.activeGrabBatchId;
+					request.issuedAtMs = System::getMiliTime();
+					request.terminalOid = terminalOid;
+				request.terminalPlanet = terminal.planet;
+				request.terminalPosition = terminal.position;
+				plan.grabRequests.add(request);
+				for (int recordIndex = 0; recordIndex < records.size();
+						recordIndex++) {
+					if (records.get(recordIndex).identityId == assigned.identityId) {
+						setPlayerBotGroupMissionDirectiveLocked(records.get(recordIndex),
+							plan, SimBotGroupRally::MISSION_GRAB_TRAVEL, nullptr,
+							&plan.grabRequests.get(plan.grabRequests.size() - 1));
+						break;
+					}
+				}
+				assignedIdentities.add(assigned.identityId);
+				}
+			}
+			for (int i = 0; i < assignedIdentities.size(); ++i) {
+				for (int j = 0; j < records.size(); ++j) {
+					if (records.get(j).identityId != assignedIdentities.get(i))
+						continue;
+					Reference<SimPlayerController*> controller = controllers.contains(
+						records.get(j).bodyOid) ? controllers.get(records.get(j).bodyOid) : nullptr;
+					SimHunterController* hunter = controller == nullptr ? nullptr :
+						dynamic_cast<SimHunterController*>(controller.get());
+					if (hunter != nullptr)
+						hunter->notifyGroupingStateChanged();
+					break;
+				}
+			}
+			if (assignedIdentities.size() > 0) {
+				String line = config.missions.missionGrabAckLines.size() > 0 ?
+					config.missions.missionGrabAckLines.get(0) :
+					String("On it, grabbing {count}.");
+				line = replaceGroupingToken(line, "{count}",
+					String::valueOf(parsed.mission.count - assignment.unassigned));
+				scheduleLine(groupId, assignedIdentities.get(0), line, 0, 0,
+					"PlayerBotMissionGrabAck");
+				MissionDiagLog::event("GROUP_MISSION", groupId,
+					"grab=1 assigned=" + String::valueOf(
+						parsed.mission.count - assignment.unassigned) +
+					" creature=" + parsed.mission.creatureWord +
+					" hasBearing=" + String::valueOf(parsed.mission.hasBearing) +
+					" bearing=" + String::valueOf(parsed.mission.bearingDeg) +
+					" text=" + text.subString(0, Math::min(80, text.length())));
+			}
+			return;
+		}
+		if (parsed.mission.command == SimBotGroupMission::MISSION_RUN) {
+			{
+				Locker groupingLock(&groupingMutex);
+				if (playerBotGroupMissionPlans.contains(groupId))
+					playerBotGroupMissionPlans.get(groupId).runRequested = true;
+			}
+			refreshGroupPlayerMissions(groupId, true);
+			for (int i = 0; i < records.size(); ++i)
+				if (isTargeted(records.get(i).identityId)) {
+					Reference<SimPlayerController*> controller = controllers.contains(
+						records.get(i).bodyOid) ? controllers.get(records.get(i).bodyOid) : nullptr;
+					SimHunterController* hunter = controller == nullptr ? nullptr :
+						dynamic_cast<SimHunterController*>(controller.get());
+					if (hunter != nullptr)
+						hunter->notifyGroupingStateChanged();
+				}
+			return;
+		}
+		if (parsed.mission.command == SimBotGroupMission::MISSION_SKIP) {
+			uint64 planId = 0;
+			uint64 entryId = 0;
+			uint64 holderBodyOid = 0;
+			uint64 holderIdentity = 0;
+			uint64 lairOid = 0;
+			uint64 offerId = 0;
+			bool offerRevealed = false;
+			{
+				Locker groupingLock(&groupingMutex);
+				if (playerBotGroupMissionPlans.contains(groupId)) {
+					PlayerBotGroupMissionPlan& plan = playerBotGroupMissionPlans.get(groupId);
+					planId = plan.planId;
+					entryId = plan.currentEntryId;
+					for (int i = 0; i < plan.entries.size(); ++i)
+						if (plan.entries.get(i).entryId == entryId) {
+							lairOid = plan.entries.get(i).lairOid;
+							holderIdentity = plan.entries.get(i).holderIdentityId;
+							offerId = plan.entries.get(i).offerId;
+							offerRevealed = plan.entries.get(i).revealed;
+						}
+				}
+			}
+			if (lairOid != 0 && holderIdentity != 0) {
+				Locker pveLock(&pveMutex);
+				if (pveIdentityBodyOids.contains(holderIdentity))
+					holderBodyOid = pveIdentityBodyOids.get(holderIdentity);
+			} else if (!offerRevealed && offerId != 0 && holderIdentity != 0) {
+				dropUnrevealedPlayerBotGroupMissionOffer(holderIdentity, offerId);
+			}
+			if (holderBodyOid != 0)
+				requestPveHuntLairCleanup(holderBodyOid, "group_skip");
+			if (planId != 0 && entryId != 0) {
+				onGroupMissionEntryDone(groupId, planId, entryId, "skipped");
+				String line = config.missions.missionSkippedLines.size() > 0 ?
+					config.missions.missionSkippedLines.get(0) :
+					String("Skipping that one.");
+				if (records.size() > 0)
+					scheduleLine(groupId, records.get(0).identityId, line, 0, 0,
+						"PlayerBotMissionSkipped");
+			} else if (records.size() > 0) {
+				String line = config.missions.missionSkippedLines.size() > 0 ?
+					config.missions.missionSkippedLines.get(0) :
+					String("Nothing to skip.");
+				scheduleLine(groupId, records.get(0).identityId, line, 0, 0,
+					"PlayerBotMissionSkipEmpty");
+			}
+			return;
+		}
+	}
 
 	if (parsed.isDirective) {
 		String leaderPlanet;
@@ -64457,6 +67505,23 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 	}
 
 	if (command.command == SimBotGrouping::GROUP_COMMAND_FOLLOW) {
+		{
+			Locker groupingLock(&groupingMutex);
+			if (playerBotGroupMissionPlans.contains(groupId)) {
+				PlayerBotGroupMissionPlan& plan =
+					playerBotGroupMissionPlans.get(groupId);
+				plan.runRequested = false;
+				plan.currentEntryId = 0;
+				for (int i = 0; i < plan.grabRequests.size(); ++i)
+					if (plan.grabRequests.get(i).state ==
+							PLAYER_BOT_GROUP_MISSION_GRAB_PENDING)
+						plan.grabRequests.get(i).state =
+							PLAYER_BOT_GROUP_MISSION_GRAB_FAILED;
+				plan.activeGrabBatchId = 0;
+				plan.activeGrabBatchDeadlineMs = 0;
+				++plan.planEpoch;
+			}
+		}
 		for (int i = 0; i < records.size(); ++i) {
 			const PlayerBotGroupRecord& record = records.get(i);
 			if (!isTargeted(record.identityId))
@@ -64738,11 +67803,35 @@ void SimPlayerManager::runPlayerBotJoinTask(uint64 identityId,
 			record.joinedAtMs = System::getMiliTime();
 			record.generation = generation;
 			playerBotGroupRecords.put(identityId, record);
+			if (!playerBotGroupMissionPlans.contains(groupOid)) {
+				PlayerBotGroupMissionPlan plan;
+				plan.groupOid = groupOid;
+				plan.leaderOid = leaderOid;
+				plan.planId = nextPlayerBotGroupMissionPlanId++;
+				if (plan.planId == 0)
+					plan.planId = nextPlayerBotGroupMissionPlanId++;
+				plan.planEpoch = 1;
+				playerBotGroupMissionPlans.put(groupOid, plan);
+			} else {
+				playerBotGroupMissionPlans.get(groupOid).leaderOid = leaderOid;
+			}
 			playerBotGroupOffers.drop(identityId);
 			committed = true;
 		}
 	}
 	if (committed) {
+		// Unrevealed group offers are identity-owned.  Rebind them to the new
+		// body before the controller's first grouped mission tick; revealed lairs
+		// remain keyed to the old body and are intentionally not resurrected.
+		{
+			Locker pveLock(&pveMutex);
+			if (pveBotMissions.contains(identityId)) {
+				Vector<PveBotMissionOffer>& offers = pveBotMissions.get(identityId);
+				for (int i = 0; i < offers.size(); ++i)
+					if (!offers.get(i).revealed)
+						offers.get(i).bodyOid = bodyOid;
+			}
+		}
 		PlayerBotGroupingConfig config = playerBotGroupingConfig;
 		String line;
 		if (config.joinedLines.size() > 0)
@@ -65105,17 +68194,68 @@ void SimPlayerManager::postPlayerBotGroupReply(uint64 groupId,
 }
 
 void SimPlayerManager::postPlayerBotGroupTravelLine(uint64 groupId,
-		const String& city) {
+		uint64 identityId, const String& city) {
 	PlayerBotGroupingConfig config = playerBotGroupingConfig;
 	String line = config.travellingLines.size() > 0 ?
 		config.travellingLines.get(System::random(config.travellingLines.size() - 1)) :
 		String("On my way from {city}.");
 	line = replaceGroupingToken(line, "{city}", city);
-	postPlayerBotGroupChat(groupId, "PlayerBot", line);
+	postPlayerBotGroupReply(groupId, identityId, line);
+}
+
+// A mission line comes from a named bot: the preferred identity when it is
+// grouped in this group, else the group's lowest grouped identity.
+// An abandoned or skipped group entry gives its unrevealed offer back, so it
+// no longer counts against the holder's mission capacity.
+void SimPlayerManager::dropUnrevealedPlayerBotGroupMissionOffer(
+		uint64 identityId, uint64 offerId) {
+	if (identityId == 0 || offerId == 0)
+		return;
+	Locker pveLock(&pveMutex);
+	if (!pveBotMissions.contains(identityId))
+		return;
+	Vector<PveBotMissionOffer>& offers = pveBotMissions.get(identityId);
+	for (int offerIndex = offers.size() - 1; offerIndex >= 0; offerIndex--)
+		if (offers.get(offerIndex).offerId == offerId &&
+				!offers.get(offerIndex).revealed)
+			offers.remove(offerIndex);
+	if (offers.size() == 0)
+		pveBotMissions.drop(identityId);
+}
+
+void SimPlayerManager::postPlayerBotGroupMissionLine(uint64 groupOid,
+		uint64 preferredIdentityId, const String& line) {
+	uint64 speaker = 0;
+	{
+		Locker groupingLock(&groupingMutex);
+		for (int i = 0; i < playerBotGroupRecords.size(); ++i) {
+			const PlayerBotGroupRecord& record =
+				playerBotGroupRecords.elementAt(i).getValue();
+			if (record.groupOid != groupOid)
+				continue;
+			if (record.identityId == preferredIdentityId) {
+				speaker = record.identityId;
+				break;
+			}
+			if (speaker == 0 || record.identityId < speaker)
+				speaker = record.identityId;
+		}
+	}
+	if (speaker != 0)
+		postPlayerBotGroupReply(groupOid, speaker, line);
 }
 
 void SimPlayerManager::recordPlayerBotGroupingAssist(uint64 identityId) {
 	playerBotGroupingAssists.increment();
+	(void)identityId;
+}
+
+void SimPlayerManager::recordPlayerBotGroupingLeaderAssist(uint64 identityId,
+		const String& reason) {
+	if (reason.isEmpty())
+		groupMissionLeaderAssists.increment();
+	else
+		groupMissionLeaderAssistSkipped.increment();
 	(void)identityId;
 }
 

@@ -265,8 +265,8 @@ void MissionManagerImplementation::handleMissionAccept(MissionTerminal* missionT
 		}
 	}
 
-	//Limit to two missions (only one of them can be a bounty mission)
-	if (missionCount >= 2 || (hasBountyMission && mission->getTypeCRC() == MissionTypes::BOUNTY)) {
+	//Limit active missions (only one of them can be a bounty mission).
+	if (missionCount >= getMaxActiveMissions() || (hasBountyMission && mission->getTypeCRC() == MissionTypes::BOUNTY)) {
 		StringIdChatParameter stringId("mission/mission_generic", "too_many_missions");
 		player->sendSystemMessage(stringId);
 		return;
@@ -293,6 +293,11 @@ void MissionManagerImplementation::handleMissionAccept(MissionTerminal* missionT
 	createMissionObjectives(mission, missionTerminal, player);
 
 	player->updateToDatabaseAllObjects(false);
+}
+
+int MissionManagerImplementation::getMaxActiveMissions() {
+	return Math::max(1, ConfigManager::instance()->getInt(
+		"Core3.MissionManager.MaxActiveMissions", 2));
 }
 
 void MissionManagerImplementation::createDestroyMissionObjectives(MissionObject* mission, MissionTerminal* missionTerminal, CreatureObject* player) {

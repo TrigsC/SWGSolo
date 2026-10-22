@@ -129,6 +129,7 @@ CMake options: `BUILD_IDL`, `COMPILE_TESTS`, `ENABLE_ASAN`/`TSAN`/`UBSAN`. Debug
 | F_0.9.13 (v0.9.14) | `armorLoadout`, `loadout.armor` (`minUpgradePercent`, `assumedArmorPiercing`, `damageTypeWeights`, `bodyRaces` `{body, race}` pairs, `bazaarUpgrades`, `upgradeSpendFraction`, `maxUpgradeLoadsPerVisit`, `bodyHamBaseline`) |
 | F_0.9.14 (v0.9.15) | `consumablesEnabled`, `consumables` (`bazaarRestock`, `minDoses` 10, `minRecheckSeconds`, `noDoseRetrySeconds`, `restockScanIntervalMinutes`, `maxRestockLoadsPerVisit`, `restockSpendFraction`, `items` = `{template, maxPricePerDose, minDoses?}`: Vasarian brandy, pikatta pie, crispic) |
 | F_0.9.15 (v0.9.16) | `groupingEnabled`, `grouping` (`roomName` LFB, offer TTL 180 s, `defaultReplies` 2, `maxRepliesCap`, reply delays/gap, `availabilityChancePercent`, request cooldown and room rate, `maxGroupedBots` 10, `maxBotsPerLeader` 9, join delay, `followMinMeters`/`followMaxMeters`, `repathMoveMeters` 3, `followTickMs` 750, `routeDistanceMeters`, `maxReplansPer10Min`, `assistRadiusMeters`, `leaderOfflineGraceSeconds`, `vocabulary` roles/gear/tiers/status/leave, `lines`) |
+| F_0.9.17 (v0.9.18) | `grouping.missionsEnabled` (false), `grouping.missions` (`maxGrabCount` 20 sanity cap, `bearingToleranceDeg` 22, `holdShortMeters` 60, `missionTimeoutMinutes`, `grabBatchTimeoutSeconds`, `assistLeaderTarget`/`assistLeaderRadiusMeters`), `vocabulary.mission` (grab, mission/lair nouns, run, skip, directions), mission and `clonedNoBuffs` lines; `bin/conf/config.lua` `Core3.MissionManager.MaxActiveMissions` (2); harness `playerBotParityTest.onlyScenarios`/`continueOnFailure`/`maxRunMinutes` |
 | F_0.9.16 (v0.9.17) | `grouping.directivesEnabled` (false), `buffCities`, rally `rallyArriveMeters`/`Min`/`Max`/`ReleaseMeters`/`HoldMaxMinutes`, `shuttleMinSavingsMeters` 1000, `rebuffCheckSeconds`/`rebuffVisitResetSeconds`, `groupBuffTimeoutSeconds` 600, line delays, `vocabulary.follow`/`ready`/`rally` (buff, meet, landmarks), `places` (cities, outposts, custom x/y), rally `lines` |
 
 The sim layer alone restores roster PlayerBot weapon-template stats after shared AI weapon-stat
@@ -885,6 +886,26 @@ Layered on the stock `AiAgent`/`CreatureObject` hierarchy. Living design docs:
     arrived; the follow-style HOLD once parked a bot there forever.
   - **Live receipt:** owner-accepted evidence (`docs/4-unit-tests/live_f0916-*`): every G2 scenario
     passed; 16 boots each halted on a different G1-harness/world flake.
+- **Group missions (P.10p G3 / F_0.9.17, released v0.9.18)**: the leader runs missions with grouped bots.
+  - **Grab.** "grab 2 bol missions to the W": `SimBotGroupMission.h` parses (count, creature, compass
+    direction); bots with room take offers from a terminal (`generatePlayerBotGroupMissionOffers`,
+    creature filter, leader-named bearing replaces the "away from town" arc). Capacity is the server's
+    per-player limit, `MissionManager::getMaxActiveMissions` (IDL native, one config key that stock
+    `handleMissionAccept` also uses). A grab batch closes before the group sets out.
+  - **One decider for "nearest".** Stock `UpdateNearestMissionForGroupTask` (the single "Nearest
+    mission for group" waypoint) also sees bot missions and publishes its winner; the bots follow
+    that winner. A harness group with no player uses the manager-side fallback.
+  - **No new tactics (G4 owns them).** The group holds short (G2 rule) until the leader reaches the
+    holder; the holder reveals by the F_0.9.8 rules, posts the real coordinates, and leads; bots only
+    defend and assist the leader's target (main-defender fallback, `judgeAssist`).
+  - **Rewards.** A player-group split within 128 m both ways: a deferred task pays bot-mission shares
+    (one roll, journaled `group_mission`), and gated `awardReward` counts and pays bots on stock missions.
+  - **Lessons.** Placement uses math angles (0 = E), chat uses compass (0 = N): convert at the boundary.
+    `System::random` is unsigned; never add it to a negative int. A stock-path gate must be lock-free
+    (atomic) but a harness override needs a per-group check, so split entry and apply.
+    A new order must wake the bot (`notifyGroupingStateChanged`); a tick booked minutes ahead hides it.
+  - **Live receipt:** scoped accumulated evidence plus the owner's in-client approval
+    (`docs/4-unit-tests/live_f0917-*`).
 - **Simulation-only policy, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line
@@ -990,7 +1011,9 @@ flowchart LR
   old home, and a `LEASHING` agent is not attackable (`AiAgentImplementation::isAttackableBy`): reset
   `setHomeLocation` and the movement state after every harness teleport. Halting on the first
   failure across a long matrix that borrows live bots makes one clean boot unlikely; keep receipt
-  runs scoped to the code a release touches.
+  runs scoped to the code a release touches: `onlyScenarios`, `continueOnFailure`, `maxRunMinutes`
+  and `failClass` (environment = harness fixture or a borrowed bot killed by a non-scenario creature).
+  The Mos Eisley stand-in spot has wild city creatures; `assertLedger` is a one-shot read (flush first).
 - **A harness kill must use `KillCommand` lock order**: killer locked, victim cross-locked. Locking
   only the victim made `notifyDestruction` spin cross-locking the destructor and hung the server
   (F_0.9.15, diagnosed from a GDB thread dump).

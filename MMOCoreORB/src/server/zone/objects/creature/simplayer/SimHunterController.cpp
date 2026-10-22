@@ -23,6 +23,7 @@
 #include "server/zone/objects/creature/buffs/Buff.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/tangible/weapon/WeaponObject.h"
+#include "server/zone/objects/tangible/LairObject.h"
 #include "server/zone/objects/building/BuildingObject.h"
 #include "server/zone/objects/tangible/threat/ThreatMap.h"
 #include "server/zone/managers/combat/CombatManager.h"
@@ -576,6 +577,7 @@ void SimHunterController::leaveGroupMode() {
 	advanceWorkLoopGeneration("hunterGroupRelease");
 	groupFallbackMoveActive.store(false, std::memory_order_release);
 	cancelGroupBuff();
+	cancelGroupMission();
 	if (isInterplanetaryTravelActive())
 		clearInterplanetaryTravelState();
 	groupTravelRouteEpoch = 0;
@@ -747,7 +749,7 @@ bool SimHunterController::driveGroupTravel(AiAgent* hunter, uint64 nowMs,
 			setPhase(GROUP_WAIT);
 			if (!route.holdLinePosted && manager->claimPlayerBotGroupRouteHoldLine(
 					identityId, record.generation, nowMs))
-				manager->postPlayerBotGroupChat(record.groupOid, "PlayerBot",
+				manager->postPlayerBotGroupReply(record.groupOid, identityId,
 					"I'll wait at " + route.fromCity + ".");
 			const uint64 holdMs = route.holdUntilMs - nowMs;
 			scheduleActiveTick(static_cast<int>(holdMs < 250 ? 250 : holdMs));
@@ -797,7 +799,8 @@ bool SimHunterController::driveGroupTravel(AiAgent* hunter, uint64 nowMs,
 			if (!leg.interplanetary)
 				manager->recordPlayerBotGroupingShuttleStarted(identityId,
 					"from=" + route.fromCity + " to=" + leg.destCity);
-			manager->postPlayerBotGroupTravelLine(record.groupOid, route.fromCity);
+			manager->postPlayerBotGroupTravelLine(record.groupOid, identityId,
+				route.fromCity);
 			scheduleActiveTick(1000);
 			return false;
 		}
@@ -826,6 +829,460 @@ bool SimHunterController::driveGroupTravel(AiAgent* hunter, uint64 nowMs,
 	return false;
 }
 
+void SimHunterController::beginGroupMission(
+		const PlayerBotGroupMissionContext& context) {
+	// Set the context before publishing any phase so the next controller tick
+	// cannot enter a solo fallback between the two writes.
+	groupMissionActive = true;
+	groupMissionIsHolder = context.holder;
+	groupMissionEntryId = context.entryId;
+	groupMissionPlanId = context.planId;
+	groupMissionLairOid = context.lairOid;
+	groupMissionKind = context.kind;
+	groupMissionLastLairScanMs = 0;
+	missionLairRevealDeferCycles = 0;
+	missionLairOid = context.lairOid;
+	missionLairPosition = context.position;
+	currentMissionOfferId = context.offerId;
+}
+
+void SimHunterController::finishGroupMission(const String& outcome) {
+	if (!groupMissionActive)
+		return;
+	PlayerBotGroupRecord record;
+	if (SimPlayerManager::instance()->getPlayerBotGroupRecord(identityId,
+			record) && record.groupOid != 0)
+		SimPlayerManager::instance()->onGroupMissionEntryDone(record.groupOid,
+			groupMissionPlanId, groupMissionEntryId, outcome);
+	cancelGroupMission();
+	setPhase(GROUP_WAIT);
+	scheduleActiveTick(1000);
+}
+
+void SimHunterController::cancelGroupMission() {
+	if (groupMissionActive && engagedMissionLairOid != 0)
+		disengageMissionLair();
+	groupMissionActive = false;
+	groupMissionIsHolder = false;
+	groupMissionEntryId = 0;
+	groupMissionPlanId = 0;
+	groupMissionLairOid = 0;
+	groupMissionKind = PLAYER_BOT_GROUP_MISSION_BOT_OFFER;
+	missionLairOid = 0;
+	currentMissionOfferId = 0;
+}
+
+void SimHunterController::maybeAssistLeaderTarget(AiAgent* hunter, uint64 nowMs,
+		const PlayerBotGroupRecord& record,
+		const SimPlayerManager::PlayerBotGroupSnapshot& group) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr || hunter == nullptr || record.leaderOid == 0 ||
+			nowMs < groupMissionLastAssistMs + 3000)
+		return;
+	PlayerBotGroupingConfig config = manager->getPlayerBotGroupingConfig();
+	if (!config.missions.assistLeaderTarget ||
+		!manager->isPlayerBotGroupMissionsActive(identityId))
+		return;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<CreatureObject*> leader = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(record.leaderOid).castTo<CreatureObject*>();
+	if (leader == nullptr)
+		return;
+	uint64 targetOid = 0;
+	bool leaderInCombat = false;
+	{
+		Locker leaderLock(leader);
+		leaderInCombat = leader->isInCombat();
+		targetOid = leader->getTargetID();
+		// No look-at target (a player who never clicked the attacker, or an AI
+		// leader): assist against the leader's main defender instead.
+		if (targetOid == 0 || targetOid == leader->getObjectID()) {
+			ManagedReference<SceneObject*> mainDefender =
+				leader->getMainDefender();
+			targetOid = mainDefender == nullptr ? 0 :
+				mainDefender->getObjectID();
+		}
+	}
+	if (!leaderInCombat || targetOid == 0 || targetOid == hunter->getObjectID())
+		return;
+	ManagedReference<CreatureObject*> target = zoneServer->getObject(targetOid).
+		castTo<CreatureObject*>();
+	if (target == nullptr || target->isDead() ||
+		hunter->getDistanceTo(target) > config.missions.assistLeaderRadiusMeters)
+		return;
+	bool player = false;
+	bool simBot = false;
+	int faction = 0;
+	bool attackable = false;
+	{
+		Locker targetLock(target);
+		player = target->isPlayerCreature();
+		AiAgent* targetAgent = target->asAiAgent();
+		simBot = targetAgent != nullptr && targetAgent->getSimPlayerBot();
+		faction = target->getFaction();
+		attackable = target->isAttackableBy(hunter);
+	}
+	if (!attackable)
+		return;
+	SimBotGrouping::AssistVerdict verdict = SimBotGrouping::judgeAssist(player,
+		simBot, faction);
+	if (!verdict.assist) {
+		manager->recordPlayerBotGroupingLeaderAssist(identityId,
+			verdict.reason);
+		manager->recordPlayerBotGroupingAssistSkipped(identityId, verdict.reason);
+		MissionDiagLog::event("GROUP_ASSIST_LEADER", identityId,
+			"result=skipped reason=" + verdict.reason);
+		groupMissionLastAssistMs = nowMs;
+		return;
+	}
+	if (engageDefensiveTarget(hunter, target.get(), "leader_assist")) {
+		manager->recordPlayerBotGroupingLeaderAssist(identityId);
+		manager->recordPlayerBotGroupingAssist(identityId);
+		MissionDiagLog::event("GROUP_ASSIST_LEADER", identityId,
+			"result=engaged target=" + String::valueOf(targetOid));
+		groupMissionLastAssistMs = nowMs;
+	}
+}
+
+void SimHunterController::runGroupMissionTick(AiAgent* hunter, uint64 nowMs,
+		const PlayerBotGroupRecord& record,
+		const SimPlayerManager::PlayerBotGroupSnapshot& group,
+		const PlayerBotGroupMissionContext& context,
+		const PlayerBotGroupingConfig& groupingConfig) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr || hunter == nullptr)
+		return;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (!groupMissionActive || groupMissionPlanId != context.planId ||
+			groupMissionEntryId != context.entryId)
+		beginGroupMission(context);
+	// The lair appears after the entry began (reveal or stock spawn); the
+	// destruction match reads groupMissionLairOid.
+	if (context.lairOid != 0)
+		groupMissionLairOid = context.lairOid;
+	if (context.grabTravel) {
+		if (context.grabWaiting) {
+			setPhase(GROUP_WAIT);
+			scheduleActiveTick(2000);
+			return;
+		}
+		GroupTravelTarget target;
+		target.planet = context.planet;
+		target.position = context.position;
+		target.arrivalMeters = groupingConfig.rallyArriveMeters;
+		bool arrived = false;
+		driveGroupTravel(hunter, nowMs, record, target, context.entryId,
+			groupingConfig, arrived);
+		if (!arrived)
+			return;
+		manager->completePlayerBotGroupMissionGrab(identityId,
+			hunter->getObjectID(), context.planId, context.entryId,
+			context.terminalOid);
+		setPhase(GROUP_WAIT);
+		scheduleActiveTick(2000);
+		return;
+	}
+	if (context.kind == PLAYER_BOT_GROUP_MISSION_PLAYER_OTHER) {
+		GroupTravelTarget target;
+		target.planet = context.planet;
+		target.position = context.position;
+		target.arrivalMeters = groupingConfig.followMaxMeters;
+		bool arrived = false;
+		driveGroupTravel(hunter, nowMs, record, target, context.entryId,
+			groupingConfig, arrived);
+		setPhase(arrived ? GROUP_WAIT : GROUP_TRAVEL);
+		if (arrived)
+			manager->updatePlayerBotGroupMissionStage(identityId, context.planId,
+				context.entryId, SimBotGroupRally::MISSION_HOLD);
+		scheduleActiveTick(arrived ? 2000 : 1000);
+		return;
+	}
+	if (context.kind == PLAYER_BOT_GROUP_MISSION_PLAYER_DESTROY &&
+			context.lairOid == 0) {
+		GroupTravelTarget target;
+		target.planet = context.planet;
+		target.position = context.position;
+		target.arrivalMeters = groupingConfig.rallyArriveMeters;
+		if (hunter->getZone() != nullptr &&
+				hunter->getZone()->getZoneName() == context.planet) {
+			Vector3 approach = hunter->getWorldPosition() - context.position;
+			approach.setZ(0.f);
+			if (approach.length2d() < 0.01f)
+				approach = Vector3::UNIT_X;
+			else
+				approach.normalize();
+			target.position = context.position + approach *
+				groupingConfig.missions.holdShortMeters;
+		}
+		bool arrived = false;
+		driveGroupTravel(hunter, nowMs, record, target, context.entryId,
+			groupingConfig, arrived);
+		if (!arrived)
+			return;
+		manager->updatePlayerBotGroupMissionStage(identityId, context.planId,
+			context.entryId, SimBotGroupRally::MISSION_HOLD);
+		if (context.ownerOid != 0 && zoneServer != nullptr) {
+			ManagedReference<CreatureObject*> owner = zoneServer->getObject(
+				context.ownerOid).castTo<CreatureObject*>();
+			if (owner != nullptr) {
+				String ownerPlanet;
+				Vector3 ownerPosition;
+				{
+					Locker ownerLock(owner);
+					Zone* ownerZone = owner->getZone();
+					if (ownerZone != nullptr) {
+						ownerPlanet = ownerZone->getZoneName();
+						ownerPosition = owner->getWorldPosition();
+					}
+				}
+				if (ownerPlanet == context.planet &&
+						ownerPosition.distanceTo2d(context.position) <
+						hunter->getWorldPosition().distanceTo2d(context.position))
+					manager->updatePlayerBotGroupMissionStage(identityId,
+						context.planId, context.entryId,
+						SimBotGroupRally::MISSION_FIGHT);
+			}
+		}
+		if (nowMs >= groupMissionLastLairScanMs + 2000) {
+			groupMissionLastLairScanMs = nowMs;
+			Zone* zone = hunter->getZone();
+			if (zone != nullptr && zone->getZoneName() == context.planet) {
+				SortedVector<TreeEntry*> closeObjects;
+				zone->getInRangeObjects(context.position.getX(),
+					context.position.getZ(), context.position.getY(), 64.f,
+					&closeObjects, true, true);
+				for (int i = 0; i < closeObjects.size(); ++i) {
+					SceneObject* object = static_cast<SceneObject*>(
+						closeObjects.get(i));
+					LairObject* lair = object == nullptr ? nullptr :
+						cast<LairObject*>(object);
+					if (lair == nullptr || lair->getZone() != zone ||
+						lair->getWorldPosition().distanceTo2d(context.position) > 64.f)
+						continue;
+					if (manager->reportPlayerBotGroupMissionReveal(record.groupOid,
+						context.planId, context.entryId, lair->getObjectID(),
+						lair->getWorldPosition()))
+						break;
+				}
+			}
+		}
+		scheduleActiveTick(1000);
+		return;
+	}
+	if (context.kind == PLAYER_BOT_GROUP_MISSION_BOT_OFFER &&
+			!context.holder && context.lairOid == 0 &&
+			context.holderIdentityId != 0) {
+		PlayerBotGroupRecord holderRecord;
+		if (manager->getPlayerBotGroupRecord(context.holderIdentityId,
+				holderRecord) && holderRecord.bodyOid != 0) {
+			ManagedReference<CreatureObject*> holder = zoneServer == nullptr ?
+				nullptr : zoneServer->getObject(holderRecord.bodyOid).
+			castTo<CreatureObject*>();
+			if (holder != nullptr) {
+				GroupTravelTarget target;
+				{
+					Locker holderLock(holder);
+					target.position = holder->getWorldPosition();
+					Zone* holderZone = holder->getZone();
+					target.planet = holderZone == nullptr ? String() :
+						holderZone->getZoneName();
+				}
+				target.arrivalMeters = groupingConfig.followMaxMeters;
+				bool arrived = false;
+				driveGroupTravel(hunter, nowMs, record, target,
+					context.entryId, groupingConfig, arrived);
+			}
+		}
+		scheduleActiveTick(1000);
+		return;
+	}
+	if (context.kind == PLAYER_BOT_GROUP_MISSION_BOT_OFFER &&
+			context.holder && !context.revealed) {
+		// G2 hold: wait short of the lair until the leader is closer to it than
+		// this bot, then walk in and reveal. Without it the holder walked
+		// straight up to the lair alone.
+		bool leaderCloser = false;
+		{
+			ZoneServer* holdServer = ServerCore::getZoneServer();
+			ManagedReference<CreatureObject*> leader = holdServer == nullptr ||
+				record.leaderOid == 0 ? nullptr :
+				holdServer->getObject(record.leaderOid).castTo<CreatureObject*>();
+			if (leader != nullptr) {
+				String leaderPlanet;
+				Vector3 leaderPosition;
+				{
+					Locker leaderLock(leader);
+					Zone* leaderZone = leader->getZone();
+					if (leaderZone != nullptr) {
+						leaderPlanet = leaderZone->getZoneName();
+						leaderPosition = leader->getWorldPosition();
+					}
+				}
+				// Released by the G2 rally rule (the leader reached the holder)
+				// or when the leader is already nearer the lair than the
+				// holder. Requiring only the second could leave a leader beside
+				// the holder and both waiting on each other.
+				// The proximity arm counts only once the holder stands at the
+				// hold point; after GRAB the leader is often beside it at the
+				// terminal, which must not skip the hold.
+				const bool holderAtHold = hunter->getWorldPosition().distanceTo2d(
+					context.position) <= groupingConfig.missions.holdShortMeters +
+						groupingConfig.rallyArriveMeters;
+				leaderCloser = leaderPlanet == context.planet &&
+					((holderAtHold &&
+						leaderPosition.distanceTo2d(hunter->getWorldPosition()) <=
+							groupingConfig.rallyReleaseMeters) ||
+					 leaderPosition.distanceTo2d(context.position) <=
+						Math::max(groupingConfig.missions.holdShortMeters,
+							hunter->getWorldPosition().distanceTo2d(context.position)));
+			}
+		}
+		if (!leaderCloser) {
+			GroupTravelTarget holdTarget;
+			holdTarget.planet = context.planet;
+			holdTarget.position = context.position;
+			holdTarget.arrivalMeters = groupingConfig.rallyArriveMeters;
+			if (hunter->getZone() != nullptr &&
+					hunter->getZone()->getZoneName() == context.planet) {
+				Vector3 approach = hunter->getWorldPosition() - context.position;
+				approach.setZ(0.f);
+				if (approach.length2d() < 0.01f)
+					approach = Vector3::UNIT_X;
+				else
+					approach.normalize();
+				holdTarget.position = context.position + approach *
+					groupingConfig.missions.holdShortMeters;
+			}
+			bool atHold = false;
+			driveGroupTravel(hunter, nowMs, record, holdTarget, context.entryId,
+				groupingConfig, atHold);
+			if (atHold)
+				manager->updatePlayerBotGroupMissionStage(identityId, context.planId,
+					context.entryId, SimBotGroupRally::MISSION_HOLD);
+			scheduleActiveTick(1000);
+			return;
+		}
+		GroupTravelTarget target;
+		target.planet = context.planet;
+		target.position = context.position;
+		target.arrivalMeters = manager->getPveMissionBoardLairRevealRadiusMeters();
+		bool arrived = false;
+		driveGroupTravel(hunter, nowMs, record, target, context.entryId,
+			groupingConfig, arrived);
+		if (!arrived) {
+			scheduleActiveTick(1000);
+			return;
+		}
+		// The F_0.9.8 solo reveal rules (TRAVEL_TO_MISSION): a transient defer
+		// retries every 2 s; no spawn point retries a bounded number of times;
+		// anything else drops the mission.
+		SimPlayerManager::PveLairRevealResult result =
+			manager->revealPveBotMissionLair(hunter->getObjectID(), context.offerId);
+		if (result == SimPlayerManager::PVE_LAIR_REVEAL_DEFER) {
+			missionLairRevealDeferCycles = 0;
+			scheduleActiveTick(2000);
+			return;
+		}
+		if (result == SimPlayerManager::PVE_LAIR_REVEAL_DEFER_NO_SPAWN_POINT) {
+			const int deferMax = manager->getPveMissionLairRevealDeferMaxCycles();
+			if (deferMax > 0 && ++missionLairRevealDeferCycles >= deferMax) {
+				missionLairRevealDeferCycles = 0;
+				manager->dropUnrevealedPlayerBotGroupMissionOffer(identityId,
+					context.offerId);
+				finishGroupMission("abandoned");
+				return;
+			}
+			scheduleActiveTick(2000);
+			return;
+		}
+		missionLairRevealDeferCycles = 0;
+		PveBotMissionOffer offer;
+		if (result != SimPlayerManager::PVE_LAIR_REVEAL_OK ||
+				!manager->getPveBotMissionOffer(identityId, context.offerId, offer) ||
+				!offer.revealed) {
+			manager->dropUnrevealedPlayerBotGroupMissionOffer(identityId,
+				context.offerId);
+			finishGroupMission("abandoned");
+			return;
+		}
+		groupMissionLairOid = offer.lairOid;
+		missionLairOid = offer.lairOid;
+		manager->reportPlayerBotGroupMissionReveal(record.groupOid,
+			context.planId, context.entryId, offer.lairOid, offer.revealedPos);
+		manager->updatePlayerBotGroupMissionStage(identityId,
+			context.planId, context.entryId, SimBotGroupRally::MISSION_FIGHT);
+		scheduleActiveTick(500);
+		return;
+	}
+	if (context.lairOid != 0) {
+		// G3 adds no lair tactics (group tactics are G4). At a revealed lair
+		// no bot attacks the lair on its own: member defence and leader assist
+		// run in runGroupTick before this dispatch, and movement is following
+		// (the holder on a bot mission, the leader otherwise).
+		manager->updatePlayerBotGroupMissionStage(identityId, context.planId,
+			context.entryId, SimBotGroupRally::MISSION_FIGHT);
+		// A bot mission's lair spawns where the reveal search put it, which
+		// only the holder knows: the holder walks there (stopping at engage
+		// range, no attack of its own) and the others follow the holder.
+		if (context.kind == PLAYER_BOT_GROUP_MISSION_BOT_OFFER) {
+			GroupTravelTarget target;
+			bool haveTarget = false;
+			if (context.holder) {
+				target.planet = context.planet;
+				target.position = context.position;
+				target.arrivalMeters = getEngageRangeMeters();
+				haveTarget = true;
+			} else if (context.holderIdentityId != 0) {
+				PlayerBotGroupRecord holderRecord;
+				ManagedReference<CreatureObject*> holder;
+				if (manager->getPlayerBotGroupRecord(context.holderIdentityId,
+						holderRecord) && holderRecord.bodyOid != 0 && zoneServer != nullptr)
+					holder = zoneServer->getObject(holderRecord.bodyOid).
+						castTo<CreatureObject*>();
+				if (holder != nullptr) {
+					Locker holderLock(holder);
+					Zone* holderZone = holder->getZone();
+					target.planet = holderZone == nullptr ? String() :
+						holderZone->getZoneName();
+					target.position = holder->getWorldPosition();
+					target.arrivalMeters = groupingConfig.followMaxMeters;
+					haveTarget = !target.planet.isEmpty();
+				}
+			}
+			if (haveTarget) {
+				bool arrived = false;
+				driveGroupTravel(hunter, nowMs, record, target, context.entryId,
+					groupingConfig, arrived);
+				scheduleActiveTick(1000);
+				return;
+			}
+		}
+		ZoneServer* followServer = ServerCore::getZoneServer();
+		ManagedReference<CreatureObject*> leader = followServer == nullptr ||
+			record.leaderOid == 0 ? nullptr :
+			followServer->getObject(record.leaderOid).castTo<CreatureObject*>();
+		if (leader != nullptr) {
+			GroupTravelTarget target;
+			{
+				Locker leaderLock(leader);
+				Zone* leaderZone = leader->getZone();
+				target.planet = leaderZone == nullptr ? String() :
+					leaderZone->getZoneName();
+				target.position = leader->getWorldPosition();
+			}
+			target.arrivalMeters = groupingConfig.followMaxMeters;
+			bool arrived = false;
+			if (!target.planet.isEmpty())
+				driveGroupTravel(hunter, nowMs, record, target, context.entryId,
+					groupingConfig, arrived);
+		}
+		scheduleActiveTick(1000);
+		return;
+	}
+	setPhase(GROUP_WAIT);
+	scheduleActiveTick(2000);
+}
+
 void SimHunterController::runGroupDirectiveTick(AiAgent* hunter,
 		uint64 nowMs, const PlayerBotGroupRecord& record,
 		const SimPlayerManager::PlayerBotGroupSnapshot& group,
@@ -845,6 +1302,24 @@ void SimHunterController::runGroupDirectiveTick(AiAgent* hunter,
 	if (directive.recordGeneration != record.generation ||
 			record.state != PLAYER_BOT_GROUP_GROUPED) {
 		scheduleActiveTick(1000);
+		return;
+	}
+	if (directive.stage == SimBotGroupRally::MISSION_GRAB_TRAVEL ||
+			directive.stage == SimBotGroupRally::MISSION_GRAB ||
+			directive.stage == SimBotGroupRally::MISSION_WAIT ||
+			directive.stage == SimBotGroupRally::MISSION_TRAVEL ||
+			directive.stage == SimBotGroupRally::MISSION_HOLD ||
+			directive.stage == SimBotGroupRally::MISSION_FIGHT) {
+		PlayerBotGroupMissionContext missionContext;
+		if (manager->getPlayerBotGroupMissionContext(identityId,
+				missionContext)) {
+			runGroupMissionTick(hunter, nowMs, record, group, missionContext,
+				groupingConfig);
+		} else {
+			setPhase(GROUP_WAIT);
+			scheduleActiveTick(directive.stage ==
+				SimBotGroupRally::MISSION_WAIT ? 2000 : 1000);
+		}
 		return;
 	}
 
@@ -1171,6 +1646,13 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 		scheduleActiveTick(2000);
 		return;
 	}
+	// Mission stages are directive stages: runGroupDirectiveTick dispatches
+	// them below, after the member-defense scan, so a bot on a mission still
+	// defends the group. Only a context that no longer exists is dropped here.
+	PlayerBotGroupMissionContext groupMissionContext;
+	if (groupMissionActive && !manager->getPlayerBotGroupMissionContext(
+			identityId, groupMissionContext))
+		cancelGroupMission();
 
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
 	ManagedReference<CreatureObject*> leaderObject = zoneServer == nullptr ?
@@ -1197,6 +1679,9 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 		leaderHeading = leaderObject->getDirection()->getRadians();
 		leaderIndoors = leaderObject->getParent() != nullptr;
 	}
+	// Self-defence wins: never switch off a creature attacking this bot.
+	if (selfAttacker == nullptr)
+		maybeAssistLeaderTarget(hunter, nowMs, record, group);
 
 	// Assist only attackers of a group member. A factioned NPC, a player, or a
 	// SimBot is rejected by the pure policy before the shared defensive engage.
@@ -1437,7 +1922,7 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 			setPhase(GROUP_WAIT);
 			if (!route.holdLinePosted && manager->claimPlayerBotGroupRouteHoldLine(
 					identityId, record.generation, nowMs))
-				manager->postPlayerBotGroupChat(record.groupOid, "PlayerBot",
+				manager->postPlayerBotGroupReply(record.groupOid, identityId,
 					"I'll wait at " + route.fromCity + ".");
 			uint64 holdMs = route.holdUntilMs - nowMs;
 			scheduleActiveTick(static_cast<int>(holdMs < 250 ? 250 : holdMs));
@@ -1488,7 +1973,8 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 			if (!leg.interplanetary)
 				manager->recordPlayerBotGroupingShuttleStarted(identityId,
 					"from=" + route.fromCity + " to=" + leg.destCity);
-			manager->postPlayerBotGroupTravelLine(record.groupOid, route.fromCity);
+			manager->postPlayerBotGroupTravelLine(record.groupOid, identityId,
+				route.fromCity);
 			scheduleActiveTick(1000);
 			return;
 		}
@@ -1718,6 +2204,7 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 	// a group phase to leave. An unfinished group buff ends here instead of
 	// walking providers on behalf of a group that no longer exists.
 	cancelGroupBuff();
+	cancelGroupMission();
 
 	// The manager uses the same scorer while building matchmaker candidates.
 	// Recheck at dispatch as well: an order can race a training tick and a
@@ -1995,7 +2482,7 @@ void SimHunterController::updateAreaAttackGuard() {
 	const uint64 bodyOid = strongAgent->getObjectID();
 	// engagedMissionLairOid != 0 means the bot is hitting the lair on purpose:
 	// an area attack there is wanted, and the wave tactics pace it.
-	if (orderActive && missionHuntOrder && missionLairOid != 0 &&
+	if (missionContextActive() && missionLairOid != 0 &&
 			engagedMissionLairOid == 0 && !strongAgent->isDead())
 		SimBotAreaAttackGuard::protect(bodyOid, missionLairPosition.getX(),
 			missionLairPosition.getY());
@@ -3673,7 +4160,7 @@ void SimHunterController::continueAfterMissionCleanup() {
 }
 
 bool SimHunterController::checkMissionSocialAggro(AiAgent* hunter) {
-	if (!missionHuntOrder || hunter == nullptr || targetOid == 0)
+	if (!missionContextActive() || hunter == nullptr || targetOid == 0)
 		return false;
 
 	CreatureObject* target = nullptr;
@@ -5807,6 +6294,7 @@ void SimHunterController::runActiveTick() {
 		if (isStructureTraversalFeatureEnabled() && isTraversalActive())
 			clearStructureTraversalState("hunter_death");
 		cancelGroupBuff();
+		cancelGroupMission();
 		cancelPveDoctorRequest();
 		SimPlayerManager::instance()->releasePlayerBotDoctorBuffFee(identityId);
 		pveDoctorFeeReserved = false;
@@ -6864,7 +7352,7 @@ bool SimHunterController::targetMatchesSpecies(CreatureObject* target) const {
 	if (earlyGameActive)
 		return true;
 
-	if (missionHuntOrder && SimPlayerManager::instance()->
+	if (missionContextActive() && SimPlayerManager::instance()->
 			isPveMissionBoardEnabled()) {
 		if (missionLairOid == 0)
 			return false;
@@ -6966,7 +7454,7 @@ bool SimHunterController::scanForTarget() {
 	// revealed. Pack avoidance is deliberately NOT lifted here: the owner's rule
 	// is that it stays for a solo sub-elite bot, and no observed abandon has
 	// been attributed to it (abandonReasons carried wave_above_level_band only).
-	const bool onAcceptedContract = missionHuntOrder && missionLairOid != 0;
+	const bool onAcceptedContract = missionContextActive() && missionLairOid != 0;
 
 	if (earlyGameActive) {
 		// Hoisted out of the candidate loop: one config read, one identity
@@ -7379,7 +7867,7 @@ void SimHunterController::selectTarget(AiAgent* target) {
 	if (targetOid != selectedOid) {
 		dropTargetObserver();
 		targetOid = selectedOid;
-		targetMissionWave = missionHuntOrder && SimPlayerManager::instance()->
+		targetMissionWave = missionContextActive() && SimPlayerManager::instance()->
 			isPveMissionBoardEnabled() && isMissionWaveMob(target);
 		destructionHandled = false;
 		if (earlyGameActive) {
@@ -7434,7 +7922,7 @@ void SimHunterController::moveToTarget() {
 }
 
 void SimHunterController::engageMissionLair() {
-	if (!orderActive || !missionHuntOrder || missionLairOid == 0 ||
+	if (!missionContextActive() || missionLairOid == 0 ||
 			agent == nullptr)
 		return;
 	ZoneServer* zoneServer = ServerCore::getZoneServer();
@@ -7449,7 +7937,10 @@ void SimHunterController::engageMissionLair() {
 			scheduleActiveTick(100);
 			return;
 		}
-		beginMissionCleanup(true, "mission_lair_unavailable");
+		if (groupMissionActive)
+			finishGroupMission("abandoned");
+		else
+			beginMissionCleanup(true, "mission_lair_unavailable");
 		return;
 	}
 
@@ -7889,6 +8380,11 @@ void SimHunterController::disengageMissionLair() {
 }
 
 void SimHunterController::onPveBotMissionLairDestroyed(uint64 lairOid) {
+	if (groupMissionActive && groupMissionIsHolder &&
+			groupMissionLairOid == lairOid) {
+		finishGroupMission("done");
+		return;
+	}
 	if (!orderActive || !missionHuntOrder || !SimPlayerManager::instance()->
 			isPveMissionBoardEnabled() || missionCleanupRequested ||
 			missionLairOid != lairOid)
@@ -7909,6 +8405,12 @@ void SimHunterController::onPveBotMissionLairDestroyed(uint64 lairOid) {
 	missionOfferIds.removeAll();
 	terminalResolveWaitCycles = 0;
 	beginMissionTerminalLeg();
+}
+
+void SimHunterController::onGroupMissionLairDestroyed(uint64 lairOid) {
+	if (!groupMissionActive || groupMissionLairOid != lairOid)
+		return;
+	finishGroupMission("done");
 }
 
 void SimHunterController::engageTarget() {
@@ -8176,7 +8678,8 @@ void SimHunterController::registerTargetObserver(uint64 target) {
 
 void SimHunterController::onHuntDestruction(uint64 destroyedTargetOid,
 		bool participantVerified) {
-	if ((!orderActive && !earlyGameActive) || destroyedTargetOid == 0 ||
+	if ((!orderActive && !earlyGameActive && !missionContextActive()) ||
+		destroyedTargetOid == 0 ||
 			targetOid != destroyedTargetOid ||
 			destructionHandled)
 		return;
@@ -8193,6 +8696,14 @@ void SimHunterController::onHuntDestruction(uint64 destroyedTargetOid,
 
 	destructionHandled = true;
 	dropTargetObserver();
+	if (groupMissionActive && groupMissionIsHolder) {
+		targetOid = 0;
+		targetMissionWave = false;
+		disengageTarget(false);
+		clearHybridMovementOnCancellation();
+		scheduleActiveTick(500);
+		return;
+	}
 	if (missionHuntOrder && targetMissionWave)
 		SimPlayerManager::instance()->recordPveHunterMissionMemberKill(
 			identityId, agent == nullptr ? 0 : agent->getObjectID(),
@@ -8202,7 +8713,7 @@ void SimHunterController::onHuntDestruction(uint64 destroyedTargetOid,
 		handleTargetUnavailable();
 		return;
 	}
-	if (missionHuntOrder && SimPlayerManager::instance()->
+	if (missionContextActive() && SimPlayerManager::instance()->
 			isPveMissionBoardEnabled()) {
 		if (!targetMissionWave) {
 			handleTargetUnavailable();

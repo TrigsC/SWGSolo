@@ -37,6 +37,8 @@
 #include "server/zone/objects/creature/simplayer/SimBotConsumables.h"
 #include "server/zone/objects/creature/simplayer/SimBotGrouping.h"
 #include "server/zone/objects/creature/simplayer/SimBotGroupRally.h"
+#include "server/zone/objects/creature/simplayer/SimBotGroupMission.h"
+#include "server/zone/objects/creature/simplayer/SimBotParityRunPolicy.h"
 #include "server/zone/objects/creature/simplayer/SimBotAppearance.h"
 
 using namespace server::zone;
@@ -145,6 +147,33 @@ struct SimBotPreparedArmorCopy {
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
 
+struct PlayerBotGroupMissionsConfig {
+	int maxGrabCount = 20;
+	int bearingToleranceDeg = 22;
+	float holdShortMeters = 60.f;
+	// Read-only mirror of the stock group reward range.
+	int splitRangeMeters = 128;
+	int leaderMissionRefreshSeconds = 15;
+	int missionTimeoutMinutes = 45;
+	int grabBatchTimeoutSeconds = 300;
+	bool assistLeaderTarget = true;
+	float assistLeaderRadiusMeters = 64.f;
+	SimBotGroupMission::MissionVocabulary vocabulary;
+	Vector<String> missionGrabAckLines;
+	Vector<String> missionGrabbedLines;
+	Vector<String> missionGrabCappedLines;
+	Vector<String> missionNoneFoundLines;
+	Vector<String> missionUnknownCreatureLines;
+	Vector<String> missionNextLines;
+	Vector<String> missionRevealLines;
+	Vector<String> missionDoneLines;
+	Vector<String> missionAllDoneLines;
+	Vector<String> missionSkippedLines;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
 // F_0.9.15 G1: the Lua grouping block is copied into one manager-owned
 // snapshot.  The policy header stays pure; this mirror is the boundary where
 // Lua validation and the future room/controller work meet.
@@ -153,6 +182,8 @@ struct PlayerBotGroupingConfig {
 	// F_0.9.16 G2: capability gate. It is deliberately separate from the G1
 	// grouping master gate and ships disabled.
 	bool directivesEnabled = false;
+	bool missionsEnabled = false;
+	PlayerBotGroupMissionsConfig missions;
 	String roomName = "LFB";
 	String roomTitle = "Looking For Bot: PlayerBots listen here";
 	int offerTtlSeconds = 180;
@@ -198,6 +229,7 @@ struct PlayerBotGroupingConfig {
 	Vector<String> declineLines;
 	Vector<String> travellingLines;
 	Vector<String> clonedLines;
+	Vector<String> clonedNoBuffsLines;
 	Vector<String> followingLines;
 	Vector<String> leavingLines;
 	Vector<String> rallyAckLines;
@@ -290,6 +322,136 @@ struct PlayerBotGroupDirective {
 	bool holdHasBuffs = false;
 	bool ackPosted = false;
 	String buffOutcome;
+	uint64 missionPlanId = 0;
+	uint64 missionEntryId = 0;
+	uint64 missionOfferId = 0;
+	uint64 missionTerminalOid = 0;
+	String missionPlanet;
+	Vector3 missionPosition;
+	int missionKind = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+enum PlayerBotGroupMissionEntryKind {
+	PLAYER_BOT_GROUP_MISSION_BOT_OFFER = 0,
+	PLAYER_BOT_GROUP_MISSION_PLAYER_DESTROY,
+	PLAYER_BOT_GROUP_MISSION_PLAYER_OTHER
+};
+
+struct PlayerBotGroupMissionEntry {
+	uint64 entryId = 0;
+	int kind = PLAYER_BOT_GROUP_MISSION_BOT_OFFER;
+	uint64 ownerOid = 0;
+	uint64 holderIdentityId = 0;
+	uint64 offerId = 0;
+	uint64 missionOid = 0;
+	String planet;
+	Vector3 position;
+	String creatureLabel;
+	String lairTemplate;
+	int rewardDivisor = 1;
+	bool revealed = false;
+	uint64 lairOid = 0;
+	bool revealCalloutPosted = false;
+	bool completed = false;
+	bool abandoned = false;
+	String abandonmentReason;
+	uint64 startedAtMs = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+enum PlayerBotGroupMissionGrabState {
+	PLAYER_BOT_GROUP_MISSION_GRAB_PENDING = 0,
+	PLAYER_BOT_GROUP_MISSION_GRAB_DONE,
+	PLAYER_BOT_GROUP_MISSION_GRAB_NONE_FOUND,
+	PLAYER_BOT_GROUP_MISSION_GRAB_FAILED
+};
+
+struct PlayerBotGroupMissionGrabRequest {
+	uint64 identityId = 0;
+	int count = 0;
+	String creatureWord;
+	int bearingDeg = 0;
+	bool hasBearing = false;
+	uint64 requestId = 0;
+	uint64 batchId = 0;
+	int state = PLAYER_BOT_GROUP_MISSION_GRAB_PENDING;
+	uint64 issuedAtMs = 0;
+	uint64 terminalOid = 0;
+	String terminalPlanet;
+	Vector3 terminalPosition;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotGroupMissionPlan {
+	uint64 groupOid = 0;
+	uint64 leaderOid = 0;
+	uint64 planId = 0;
+	uint64 planEpoch = 0;
+	Vector<PlayerBotGroupMissionEntry> entries;
+	uint64 currentEntryId = 0;
+	Vector<PlayerBotGroupMissionGrabRequest> grabRequests;
+	uint64 activeGrabBatchId = 0;
+	uint64 activeGrabBatchDeadlineMs = 0;
+	bool runRequested = false;
+	uint64 nextEntryId = 1;
+	uint64 leaderMissionsRefreshedAtMs = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotGroupMissionWaypointTarget {
+	Vector3 position;
+	uint64 planId = 0;
+	uint64 entryId = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotGroupMissionWaypointWinner {
+	int kind = -1;
+	uint64 missionOid = 0;
+	uint64 planId = 0;
+	uint64 entryId = 0;
+	uint64 ownerOid = 0;
+	Vector3 position;
+	uint32 planetCRC = 0;
+	uint32 leaderPlanetCRC = 0;
+	String planet;
+	bool none = true;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotGroupMissionContext {
+	bool active = false;
+	bool grabTravel = false;
+	bool grabWaiting = false;
+	bool holder = false;
+	uint64 holderIdentityId = 0;
+	uint64 planId = 0;
+	uint64 entryId = 0;
+	uint64 offerId = 0;
+	uint64 lairOid = 0;
+	uint64 ownerOid = 0;
+	uint64 terminalOid = 0;
+	uint64 planEpoch = 0;
+	String creatureWord;
+	int bearingDeg = 0;
+	bool hasBearing = false;
+	int kind = PLAYER_BOT_GROUP_MISSION_BOT_OFFER;
+	String planet;
+	Vector3 position;
+	bool revealed = false;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -673,6 +835,18 @@ struct SimBotEarlyGameDeathZone {
 	// The body that died here: one finalized death is one site, while a later
 	// body dying on the same spot is a new death.
 	uint64 bodyOid = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+// Parity-only death evidence.  This is separate from early-game death zones
+// because grouping scenarios may run with the early-game capability disabled.
+struct PlayerBotParityDeathFact {
+	uint64 identityId = 0;
+	uint64 atMs = 0;
+	uint64 killerOid = 0;
+	String killerTemplate;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -1156,6 +1330,8 @@ struct PlayerBotParityTestStep {
 	String groupingReason;
 	String groupingReleaseReason;
 	String groupingCounter;
+	String missionEntryKind;
+	String missionEntryState;
 	float groupingMaxDistance = 0.f;
 	String groupingLastObservation;
 	float groupingX = 0.f;
@@ -1164,6 +1340,7 @@ struct PlayerBotParityTestStep {
 	bool groupingHasPosition = false;
 	// G2: target the scenario bot's resolved directive point instead of x/y.
 	bool groupingToDirective = false;
+	bool groupingToMission = false;
 	bool groupingFree = true;
 	int groupingChancePercent = 100;
 	int groupingWithinSeconds = 0;
@@ -1261,6 +1438,7 @@ struct PlayerBotParityTestScenarioResult {
 	String name;
 	String status = "PENDING";
 	String failReason;
+	String failClass = "scope";
 	String restartPhase = "A";
 	uint64 startedAtMs = 0;
 	uint64 finishedAtMs = 0;
@@ -2987,6 +3165,11 @@ private:
 	bool progressionGroupingEnabled = false;
 	PlayerBotGroupingConfig playerBotGroupingConfig;
 	std::atomic<bool> playerBotGroupingActive{false};
+	// Lock-free mirrors used by stock group reward code while it owns the
+	// GroupObject lock. Identity-scoped harness overrides are rechecked by the
+	// deferred payment path, never from that stock lock.
+	std::atomic<bool> playerBotGroupMissionsActive{false};
+	std::atomic<bool> playerBotMissionCreditsActive{false};
 	std::atomic<uint32> playerBotLfbRoomId{0};
 	Mutex playerBotGroupingRoomMutex;
 	// Leaf state only: never hold this mutex while taking pve, progression,
@@ -3001,6 +3184,8 @@ private:
 	VectorMap<uint64, PlayerBotGroupRecord> playerBotGroupRecords;
 	VectorMap<uint64, PlayerBotGroupDirective> playerBotGroupDirectives;
 	VectorMap<uint64, PlayerBotGroupRoute> playerBotGroupRoutes;
+	VectorMap<uint64, PlayerBotGroupMissionPlan> playerBotGroupMissionPlans;
+	uint64 nextPlayerBotGroupMissionPlanId = 1;
 	VectorMap<uint64, PlayerBotGroupingRateState> playerBotGroupingRate;
 	Vector<String> playerBotGroupingRecentUnmatched;
 	uint64 playerBotGroupingReplyWindowStartMs = 0;
@@ -3296,6 +3481,18 @@ private:
 	AtomicLong missionCreditsLastAmount;
 	AtomicLong missionCreditsLastDifficultyLevel;
 	AtomicLong missionCreditsLastAwardMs;
+	AtomicLong groupMissionSplitBotShares;
+	AtomicLong groupMissionSplitPlayerShares;
+	AtomicLong groupMissionSplitHarnessLeaderShares;
+	AtomicLong groupMissionSplitCreditsToBots;
+	AtomicLong groupMissionSplitCreditsToPlayers;
+	AtomicLong groupMissionLeaderBotShares;
+	AtomicLong groupMissionLeaderBotSharesSkipped;
+	AtomicLong groupMissionGrabUnknownCreature;
+	AtomicLong groupMissionCapacityCapped;
+	AtomicLong groupMissionWaypointRefreshes;
+	AtomicLong groupMissionLeaderAssists;
+	AtomicLong groupMissionLeaderAssistSkipped;
 	AtomicLong buffPaymentCharged;
 	AtomicLong buffPaymentCreditsSpent;
 	AtomicLong buffPaymentSkippedUnaffordable;
@@ -3345,6 +3542,11 @@ private:
 	VectorMap<uint64, String> playerBotParityAppearanceSnapshots;
 	VectorMap<String, uint64> playerBotParityTestCounterBaselines;
 	VectorMap<uint64, String> playerBotParityItemStatSnapshots;
+	VectorMap<uint64, PlayerBotParityDeathFact> playerBotParityDeaths;
+	VectorMap<uint64, uint64> playerBotLastDeathMs;
+	VectorMap<uint64, bool> playerBotParityBorrowedIdentityIds;
+	VectorMap<String, uint64> playerBotParityBorrowedRefs;
+	bool playerBotParityBorrowedSelectionFailed = false;
 	int playerBotParityTestScenarioIndex = 0;
 	int playerBotParityTestStepCursor = 0;
 	int playerBotParityTestSetupCursor = 0;
@@ -3372,6 +3574,11 @@ private:
 	bool playerBotParityTestBootInitialized = false;
 	bool playerBotParityTestAwaitingRestart = false;
 	bool playerBotParityTestCompleted = false;
+	bool playerBotParityContinueOnFailure = false;
+	Vector<String> playerBotParityOnlyScenarios;
+	int playerBotParityMaxRunMinutes = 0;
+	uint64 playerBotParityTestRunStartedAtMs = 0;
+	bool playerBotParityTestRunCapReached = false;
 	bool playerBotParityTestProgressionEnabledOverrideActive = false;
 	bool playerBotParityTestProgressionEnabledOverride = true;
 	bool playerBotParityTestProgressionEnabledOverridePrevious = true;
@@ -3380,6 +3587,9 @@ private:
 	// A registered parity body is the stand-in player leader.  It is never a
 	// production hunter and is valid only while the harness scenario is active.
 	VectorMap<uint64, bool> playerBotParityGroupHarnessLeaderOids;
+	// Keep scenario-created OIDs after an entity is removed so a later failure
+	// can still distinguish its killer from an environmental attacker.
+	VectorMap<uint64, bool> playerBotParityHarnessSpawnedOids;
 	uint64 playerBotParityGroupLeaderOid = 0;
 	uint64 playerBotParityGroupAttackerOid = 0;
 	Vector<uint64> playerBotParityGroupAttackerOids;
@@ -3423,6 +3633,7 @@ private:
 	bool playerBotParityTestGroupingGateOverrideActive = false;
 	bool playerBotParityTestGroupingGateOverride = false;
 	VectorMap<uint64, bool> playerBotParityDirectivesGateOverrides;
+	VectorMap<uint64, bool> playerBotParityMissionsGateOverrides;
 	VectorMap<uint64, bool> playerBotParityForceGroupShuttleFailure;
 	bool playerBotParityTestMissionCreditGateOverrideActive = false;
 	bool playerBotParityTestMissionCreditGateOverride = false;
@@ -3851,6 +4062,7 @@ private:
 	void applyPveConfig(LuaObject& pveConfig);
 	void applyPlayerBotProgressionConfig(LuaObject& config);
 	void validatePlayerBotRallyPlaces(PlayerBotGroupingConfig& config);
+	void validatePlayerBotGroupMissions(PlayerBotGroupingConfig& config);
 	void buildTrainingPlansFromConfig(LuaObject& config);
 	bool computePlayerBotNextTrainingStepLocked(uint64 identityId,
 		const String& planName, const SimBotProgression& progression,
@@ -4008,6 +4220,9 @@ private:
 	void schedulePlayerBotParityTestRunner(int delayMs);
 	void runPlayerBotParityTestRunner();
 	void runPlayerBotParityTestRunnerBody();
+	String classifyPlayerBotParityFailure() const;
+	String describePlayerBotParityBorrowedDeaths() const;
+	bool isPlayerBotParityScenarioKillerLocked(uint64 killerOid) const;
 	void initializePlayerBotParityTestResults();
 	void beginPlayerBotParityTestCleanup(bool preserveProbe);
 	void resolvePlayerBotParityExpectedRejection(
@@ -4016,6 +4231,7 @@ private:
 		const String& unexpectedAcceptReason);
 	void cleanupPlayerBotParityTest();
 	void restorePlayerBotParityScenarioGate();
+	void finishFailedPlayerBotParityScenario(int scenarioConfigIndex);
 	bool executePlayerBotParityStep(PlayerBotParityTestStep& step,
 		PlayerBotParityTestStepResult& result, uint64 nowMs);
 	bool executePlayerBotParityRequestStep(PlayerBotParityTestStep& step,
@@ -4075,8 +4291,19 @@ private:
 		uint64 inviterOid, uint64 generation);
 	void expirePlayerBotGroupOffers(uint64 nowMs);
 	void reconcilePlayerBotGroups(uint64 nowMs);
+	void evaluatePlayerBotGroupMissionBatches(uint64 nowMs);
+	void evaluatePlayerBotGroupMissionEntries(uint64 nowMs);
+	void teardownPlayerBotGroupMissionPlan(uint64 groupOid,
+		const String& reason);
+	void setPlayerBotGroupMissionDirectiveLocked(
+		const PlayerBotGroupRecord& record,
+		const PlayerBotGroupMissionPlan& plan,
+		SimBotGroupRally::DirectiveStage stage,
+		const PlayerBotGroupMissionEntry* entry = nullptr,
+		const PlayerBotGroupMissionGrabRequest* request = nullptr);
 	void releasePlayerBotGroup(uint64 identityId, const String& reason);
 	void releaseAllPlayerBotGroups(const String& reason);
+	void releaseHarnessPlayerBotGroups(const String& reason);
 	void onPlayerBotGroupChatTask(uint64 senderOid, uint64 groupId,
 		const String& text);
 	void snapshotPlayerBotGroupingReserved(VectorMap<uint64, bool>& reserved);
@@ -4207,14 +4434,16 @@ private:
 	bool selectPveBotMissionLairSpawn(const String& planet, int hunterLevel,
 		PveBotMissionOffer& offer, const String& desiredFamily = "",
 		const String& desiredResourceType = "",
-		const String& pinnedLairTemplate = "", bool avoidPacks = false);
+		const String& pinnedLairTemplate = "", bool avoidPacks = false,
+		const String& creatureWord = "");
 	// diagIdentityId is DIAGNOSTIC ONLY: it correlates missiondiag.log lines with
 	// the OFFERS_BEGIN that bracket them, since offer generation can run for two
 	// hunters on different threads and the lines would otherwise interleave
 	// unattributably. It never affects placement.
 	bool choosePveBotMissionPosition(const PveMissionTerminalLocation& terminal,
 		int difficultyLevel, const String& planet, Vector3& position,
-		float& bearing, uint64 diagIdentityId = 0);
+		float& bearing, uint64 diagIdentityId = 0, int wantedBearing = 0,
+		bool hasWantedBearing = false);
 	void registerPveBotMissionLairObserver(LairObject* lair, uint64 bodyOid,
 		uint64 lairOid);
 	void buildPveLairYieldIndex();
@@ -5354,6 +5583,9 @@ public:
 	PveLairRevealResult revealPveBotMissionLair(uint64 bodyOid, uint64 offerId);
 	PveMissionCreditDisposition onPveBotMissionLairDestroyed(uint64 bodyOid,
 		uint64 lairOid);
+	void queueGroupMissionLairReward(uint64 identityId,
+		uint64 offerId, uint64 groupOid,
+		uint64 lairOid, int difficultyLevel, const Vector3& endPoint);
 	bool planPveHunterRelocation(uint64 identityId, uint64 bodyOid,
 		const String& targetPlanet, const String& targetCity,
 		const String& reason, PveRelocation& relocation);
@@ -5620,13 +5852,57 @@ public:
 		const String& text);
 	void postPlayerBotGroupReply(uint64 groupId, uint64 identityId,
 		const String& text);
-	void postPlayerBotGroupTravelLine(uint64 groupId, const String& city);
+	void postPlayerBotGroupTravelLine(uint64 groupId, uint64 identityId,
+		const String& city);
+	void dropUnrevealedPlayerBotGroupMissionOffer(uint64 identityId,
+		uint64 offerId);
+	void postPlayerBotGroupMissionLine(uint64 groupOid,
+		uint64 preferredIdentityId, const String& line);
 	void recordPlayerBotGroupingAssist(uint64 identityId);
 	void recordPlayerBotGroupingAssistSkipped(uint64 identityId,
 		const String& reason);
+	void recordPlayerBotGroupingLeaderAssist(uint64 identityId,
+		const String& reason = String());
 	void recordPlayerBotGroupingTravel(uint64 identityId, bool failed,
 		const String& detail = String());
 	bool isPlayerBotGroupDirectivesActive(uint64 identityId) const;
+	bool isPlayerBotGroupMissionsActive(uint64 identityId) const;
+	void getGroupBotMissionTargets(uint64 groupOid, uint32 planetCRC,
+		Vector<PlayerBotGroupMissionWaypointTarget>& targets,
+		Vector<uint64>& skippedPlayerMissionOids) const;
+	void refreshGroupPlayerMissions(uint64 groupOid, bool force = false);
+	void publishGroupNearestMission(uint64 groupOid,
+		const PlayerBotGroupMissionWaypointWinner& winner);
+	void applyGroupNearestMission(uint64 groupOid,
+		const PlayerBotGroupMissionWaypointWinner& winner);
+	bool getPlayerBotGroupMissionContext(uint64 identityId,
+		PlayerBotGroupMissionContext& context) const;
+	void updatePlayerBotGroupMissionStage(uint64 identityId, uint64 planId,
+		uint64 entryId, SimBotGroupRally::DirectiveStage stage);
+	uint64 openGroupMissionTerminalVisit(uint64 identityId, uint64 bodyOid,
+		uint64 groupOid, uint64 planEpoch);
+	bool generatePlayerBotGroupMissionOffers(uint64 identityId, uint64 bodyOid,
+		const PveMissionTerminalLocation& terminal, int hunterLevel,
+		const String& creatureWord, int bearingDeg, bool hasBearing,
+		int wantCount, Vector<PveBotMissionOffer>& offers);
+	bool completePlayerBotGroupMissionGrab(uint64 identityId,
+		uint64 bodyOid, uint64 planId, uint64 entryId,
+		uint64 terminalOid);
+	bool reportPlayerBotGroupMissionReveal(uint64 groupOid, uint64 planId,
+		uint64 entryId, uint64 lairOid, const Vector3& position);
+	void onGroupMissionEntryDone(uint64 groupOid, uint64 planId,
+		uint64 entryId, const String& outcome);
+	void onPlayerGroupMissionCompleted(uint64 missionOid);
+	void completePlayerGroupMissionEntry(uint64 missionOid);
+	bool isPlayerBotGroupMissionPlanActive(uint64 groupOid);
+	// Lock-free with respect to the group member: used by stock mission reward
+	// code while it already owns the group lock.  Identity-scoped gates are
+	// rechecked by the deferred payment task.
+	bool isGroupMissionShareMember(CreatureObject* member) const;
+	void queueGroupMissionBotShares(const Vector<uint64>& bodyOids,
+		int amount, uint64 missionOid);
+	bool grantPlayerBotMissionShare(uint64 identityId, int amount,
+		uint64 refOid, const String& detail = String());
 	void recordPlayerBotGroupingBuffChoice(const String& choice);
 	void recordPlayerBotGroupingBuffOutcome(const String& outcome);
 	void recordPlayerBotGroupingHoldRelease(const String& reason);

@@ -12,9 +12,10 @@ on the owner's request and is RELEASED as v0.9.13 (2026-10-17), followed by **F_
 armor loadout with visible armor, ten species and a fixed look per bot), RELEASED as v0.9.14
 (2026-10-18), **F_0.9.14** (P.10o, food and drink), RELEASED as v0.9.15 (2026-10-19), and
 **F_0.9.15** (P.10p, grouping G1, Looking For Bot), RELEASED as v0.9.16 (2026-10-20).
-Next chunk: grouping **G2** (rally and buffs), then G3/G4, before **F_0.9.11** (P.10l, profession allocation policy).
+**F_0.9.17** (P.10p, grouping G3, group missions) is RELEASED as v0.9.18 (2026-10-22), on scoped accumulated evidence plus the owner's in-client approval.
+Next chunk: grouping **G4** (group tactics), before **F_0.9.11** (P.10l, profession allocation policy).
 **Written**: 2026-09-02 (project week 8)
-**Last updated**: 2026-10-20 — F_0.9.15 grouping G1 (LFB) released as v0.9.16
+**Last updated**: 2026-10-22 — F_0.9.17 grouping G3 (group missions) released as v0.9.18
 
 ## F_0.9.15 — LFB and player grouping (P.10p)
 
@@ -28,7 +29,7 @@ into four owner-approved chunks:
 | --- | --- | --- |
 | **G1** | LFB, offers, invites, grouped behavior, status/leave, release and rejoin | RELEASED v0.9.16 |
 | **G2** | buffs and meet-at-place group trips, readiness and re-buff, intra-planet shuttles (moved from G1) | next grouping chunk |
-| **G3** | group missions, waypoints and reveal/assist callouts | later |
+| **G3** | group missions, waypoints and reveal/assist callouts | RELEASED v0.9.18 (F_0.9.17) |
 | **G4** | group tactics, spin-attack poll, lair unlock and take-food commands | later |
 
 G1 precedes F_0.9.11; the profession allocator remains the next non-grouping chunk after the
@@ -49,6 +50,21 @@ events. The disabled parity harness contains twelve G2 scenarios covering rally,
 cross-planet travel, follow cancellation, unknown places, re-buff notices, gate isolation,
 death/rejoin, shuttle fallback, and a directive replacing an in-flight route. Live receipt and
 the owner real-client pass remain release gates before changing the capability line.
+
+## F_0.9.17 — Group missions (P.10p G3)
+
+G3 is implemented behind the default-off `grouping.missionsEnabled` capability. A leader's
+mission line creates a manager-owned plan for bot-held offers and grouped player missions; bots
+visit the nearest terminal, report the offer and lair, follow the next-nearest mission, and assist
+the leader's target. Stock group waypoint refreshes include bot missions, and the shared
+`MissionManager.MaxActiveMissions` setting controls both player acceptance and bot capacity.
+
+Mission completion uses the stock group divisor. Bot shares are journaled in the progression ledger
+with source `group_mission`; grouped bots also count in the divisor for a player's own destroy
+mission. The dashboard Groups panel exposes the current entry, plan entries and state, split
+counters, and leader-assist counters. The disabled parity matrix contains eleven self-contained G3
+scenarios using a stand-in leader and borrowed production bots. The scoped receipt is the gate before
+changing `missionsEnabled` from its shipped default.
 
 ## 0. Mandate
 

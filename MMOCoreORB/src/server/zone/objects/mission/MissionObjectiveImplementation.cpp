@@ -21,6 +21,7 @@
 #include "server/zone/objects/mission/events/FailMissionAfterCertainTimeTask.h"
 #include "events/CompleteMissionObjectiveTask.h"
 #include "server/zone/objects/transaction/TransactionLog.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
 
 void MissionObjectiveImplementation::destroyObjectFromDatabase() {
 	for (int i = 0; i < observers.size(); ++i) {
@@ -238,6 +239,9 @@ void MissionObjectiveImplementation::awardReward() {
 	int petOutOfRangeCount = 0;
 	int petFactionCount = 0;
 	int petFactionOutOfRangeCount = 0;
+	Vector<uint64> groupMissionBotOids;
+	int groupMissionBotCount = 0;
+	int inRangeGroupMissionBotCount = 0;
 
 	if (group != nullptr) {
 		Locker lockerGroup(group, _this.getReferenceUnsafeStaticCast());
@@ -289,6 +293,14 @@ void MissionObjectiveImplementation::awardReward() {
 						petOutOfRangeCount++;
 					}
 				}
+			} else if (SimPlayerManager::instance()->isGroupMissionShareMember(
+					groupMember)) {
+				Vector3 botPosition = groupMember->getWorldPosition();
+				++groupMissionBotCount;
+				if (botPosition.distanceTo(missionEndPoint) < 128) {
+					groupMissionBotOids.add(groupMember->getObjectID());
+					++inRangeGroupMissionBotCount;
+				}
 			}
 		}
 
@@ -308,12 +320,13 @@ void MissionObjectiveImplementation::awardReward() {
 	int divisor = mission->getRewardCreditsDivisor();
 	bool expanded = false;
 
-	if (playerCount > divisor) {
-		divisor = playerCount;
+	const int expandedMemberCount = playerCount + groupMissionBotCount;
+	if (expandedMemberCount > divisor) {
+		divisor = expandedMemberCount;
 		expanded = true;
 	}
 
-	if (playerCount > players.size()) {
+	if (expandedMemberCount > players.size() + inRangeGroupMissionBotCount) {
 		owner->sendSystemMessage("@mission/mission_generic:group_too_far"); // Mission Alert! Some group members are too far away from the group to receive their reward and and are not eligible for reward.
 	}
 
@@ -334,7 +347,9 @@ void MissionObjectiveImplementation::awardReward() {
 
 	trx.addState("missionRewardCreditsDivisor", divisor);
 	trx.addState("missionPlayerInRangeCount", players.size());
-	trx.addState("missionPlayerOutOfRangeCount", playerCount - players.size());
+	trx.addState("missionPlayerOutOfRangeCount", expandedMemberCount -
+		(players.size() + inRangeGroupMissionBotCount));
+	trx.addState("missionGroupMissionBotCount", groupMissionBotCount);
 	trx.addState("missionPetCount", petCount);
 	trx.addState("missionPetOutOfRangeCount", petOutOfRangeCount);
 	trx.addState("missionPetFactionCount", petFactionCount);
@@ -365,6 +380,12 @@ void MissionObjectiveImplementation::awardReward() {
 		totalRewarded += dividedReward;
 	}
 
+	if (groupMissionBotOids.size() > 0 && inRangeGroupMissionBotCount > 0)
+		SimPlayerManager::instance()->queueGroupMissionBotShares(
+			groupMissionBotOids, dividedReward, mission->getObjectID());
+	trx.addState("missionBotSharesQueued", groupMissionBotOids.size());
+	trx.addState("missionBotShareAmount", dividedReward);
+
 	// Catch any rounding errors etc.
 	trx.addState("missionTotalRewarded", totalRewarded);
 
@@ -380,6 +401,8 @@ void MissionObjectiveImplementation::awardReward() {
 	}
 
 	StatisticsManager::instance()->completeMission(mission->getTypeCRC(), totalRewarded);
+	SimPlayerManager::instance()->onPlayerGroupMissionCompleted(
+		mission->getObjectID());
 }
 
 Vector3 MissionObjectiveImplementation::getEndPosition() {

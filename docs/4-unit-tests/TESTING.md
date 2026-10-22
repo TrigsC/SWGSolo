@@ -25,6 +25,20 @@ docker exec -u swgemu swgemu_server bash -lc 'cd ~/workspace/Core3/MMOCoreORB/bi
 # project's CMake (gcovr is installed in the container image but unused).
 ```
 
+## Scoped receipt runs
+
+The PlayerBot parity harness supports a bounded, non-halting receipt run through
+`playerBotParityTest.onlyScenarios`, `continueOnFailure = true`, and
+`maxRunMinutes`. Set `onlyScenarios` to the exact G3 contract (plus any approved
+regression subset), run one disposable server boot, and require every in-scope
+scenario to finish `PASS`. The dashboard reports the selected scope, the run
+cap, and `inScopeTotals`; a failed scenario also carries `failClass`.
+`failClass=scope` means the implementation assertion failed. `failClass=environment`
+means the borrowed bot died to a non-harness attacker, the stand-in became
+invalid, or no eligible borrowed bot was available. Report that evidence to the
+owner and decide whether to accept it, rerun that one scenario, or investigate;
+do not automatically rerun the whole matrix.
+
 ## Test Organization
 
 - All test sources live flat under `MMOCoreORB/src/tests/`, one

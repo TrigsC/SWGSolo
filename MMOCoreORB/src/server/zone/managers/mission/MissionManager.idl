@@ -163,6 +163,9 @@ class MissionManager extends Observer implements Logger {
 	public native int rollDestroyMissionReward(int difficultyLevel);
 
 	@dirty
+	public native int getMaxActiveMissions();
+
+	@dirty
 	public native int getDestroyMissionRewardMin(int difficultyLevel);
 
 	@dirty

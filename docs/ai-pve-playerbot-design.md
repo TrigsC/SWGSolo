@@ -768,3 +768,29 @@ so bots in one group respect `minReplyGapSeconds`. The parity harness keeps
 the capability override identity-scoped and adds rally, buff, death/rejoin,
 shuttle-failure, gate-off, and stale-route scenarios; it remains disabled in
 the shipped Lua configuration.
+
+### P.10p G3 — Group missions (F_0.9.17)
+
+G3 extends a grouped PlayerBot roster with a default-off `missionsEnabled`
+capability. A leader-only group line such as `grab 2 kreetle missions to the S`
+creates a manager-owned plan: eligible borrowed bots receive terminal visits and
+offers, while the plan also tracks grouped players' real destroy missions. The
+controller runs the mission stages (`MISSION_GRAB_TRAVEL`, `MISSION_GRAB`,
+`MISSION_WAIT`, `MISSION_TRAVEL`, `MISSION_HOLD`, and `MISSION_FIGHT`) and keeps
+the existing follow/defense behavior available when the mission gate is off.
+
+The manager owns plan epochs, offer expiry, next-nearest selection, stock group
+waypoint refreshes, lair reveal callouts, teardown, and the deferred completion
+callback. Bot-held mission rewards use the stock in-range divisor: each eligible
+bot receives its share in the progression ledger with source `group_mission`,
+and the stand-in leader is counted by the harness but never paid. A player's own
+mission also counts active grouped bots in the stock divisor. The same
+`MissionManager.MaxActiveMissions` value controls both the stock accept check and
+bot offers.
+
+The dashboard Groups panel exposes the active mission entry, plan entries and
+state, split counters, and leader-assist counters. The parity harness adds eleven
+self-contained G3 scenarios using a stand-in leader and borrowed production bots;
+each rebases a grouping counter and the matrix remains disabled in the shipped
+Lua configuration. `setMissionsGate` is identity-scoped for disposable receipt
+runs, so it does not turn the live capability on for the roster.

@@ -63,6 +63,11 @@ Core3 = {
 	DBInstances = 2,
 	DBSecret = "swgemus3cr37!", -- Change this! This value should be unique and of reasonable length.
 
+	------Mission Manager Config------
+	MissionManager = {
+		MaxActiveMissions = 2,
+	},
+
 	------Login Server Config------
 	LoginPort = 44453,
 	LoginProcessingThreads = 1,

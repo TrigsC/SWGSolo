@@ -123,6 +123,27 @@ TEST(SimBotGroupRallyTest, LeaderLinePrecedenceKeepsNameTargets) {
 		vocabulary());
 	EXPECT_FALSE(line.isDirective);
 	EXPECT_EQ(line.command.command, SimBotGrouping::GROUP_COMMAND_LEAVE);
+
+	line = parseLeaderLine("Paki grab 2 kreetle missions to the S", names,
+		grouping, vocabulary());
+	EXPECT_TRUE(line.isMission);
+	EXPECT_FALSE(line.isDirective);
+	EXPECT_EQ(line.mission.command, SimBotGroupMission::MISSION_GRAB);
+	EXPECT_EQ(line.mission.count, 2);
+	EXPECT_EQ(line.mission.creatureWord, "kreetle");
+	EXPECT_EQ(line.mission.bearingDeg, 180);
+	EXPECT_EQ(line.mission.addressedBot, "paki");
+
+	line = parseLeaderLine("Paki grab 2 kreetle missions and meet at Mos Eisley",
+		names, grouping, vocabulary());
+	EXPECT_TRUE(line.isMission);
+	EXPECT_FALSE(line.isDirective);
+	EXPECT_EQ(line.command.command, SimBotGrouping::GROUP_COMMAND_NONE);
+
+	line = parseLeaderLine("leave, then grab a mission", names, grouping,
+		vocabulary());
+	EXPECT_FALSE(line.isMission);
+	EXPECT_EQ(line.command.command, SimBotGrouping::GROUP_COMMAND_LEAVE);
 }
 
 BuffCityCandidate hub(const char* city, int botToHub, int hubToMeet,
@@ -191,6 +212,11 @@ TEST(SimBotGroupRallyTest, StagesAdvanceInDirectiveOrder) {
 	EXPECT_EQ(nextStage(BUFFING, BUFF_DONE), RALLY_TRAVEL);
 	EXPECT_EQ(nextStage(RALLY_TRAVEL, RALLY_ARRIVAL), RALLY_HOLD);
 	EXPECT_EQ(nextStage(RALLY_HOLD, RELEASED), DONE);
+	EXPECT_EQ(nextStage(MISSION_GRAB_TRAVEL, ARRIVAL), MISSION_GRAB);
+	EXPECT_EQ(nextStage(MISSION_GRAB, GRAB_DONE), MISSION_WAIT);
+	EXPECT_EQ(nextStage(MISSION_TRAVEL, MISSION_ARRIVAL), MISSION_HOLD);
+	EXPECT_EQ(nextStage(MISSION_HOLD, RELEASED), MISSION_FIGHT);
+	EXPECT_EQ(nextStage(MISSION_FIGHT, MISSION_DONE), MISSION_WAIT);
 }
 
 TEST(SimBotGroupRallyTest, HoldReleaseHonoursArrivalFollowAndOptionalTimeout) {

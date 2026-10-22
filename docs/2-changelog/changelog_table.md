@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.9.18` | 15 | F_0.9.17 P.10p G3: group missions — the leader says "grab 2 bol missions to the W": bots with room (the server per-player mission limit, now Core3.MissionManager.MaxActiveMissions) grab matching missions at a terminal and post their coordinates, the stock Nearest-mission-for-group waypoint also covers bot missions, the group holds short until the leader arrives, the holder reveals and leads to the real lair spawn, bots defend and assist the leader's target without new tactics, rewards split like a player group within 128 m with bot shares journaled, and a cloned bot asks before buffing; the parity harness gains onlyScenarios, continueOnFailure, maxRunMinutes and failClass; no schema change; gate default-off |
 | `0.9.17` | 15 | F_0.9.16 P.10p G2: rally and buffs — the group leader directs grouped PlayerBots in chat ("get buffs and meet at the Mos Eisley cantina", "meet at the starport", "follow me"): bots plan on their own body, buff in the meet city, their current city or the buffer city on the way, travel there (same-planet shuttles when they save 1 km), hold with a ready line until the leader arrives, answer unknown places with "Where's that?", and mention low buffs once per city visit; directives survive death and re-plan from the clone; no schema change; gate default-off |
 | `0.9.16` | 15 | F_0.9.15 P.10p G1: Looking For Bot — players /join an LFB room that roster PlayerBots watch, free bots answer matching requests with staggered offers, /invite is accepted only from the player a bot offered itself to, and grouped bots drop their routine, follow the leader loosely, travel to them across planets, defend themselves and the group but never join GCW fights, answer status and leave in group chat, rejoin after cloning and release on kick, disband or leader logout; no schema change; gate default-off |
 | `0.9.15` | 15 | F_0.9.14 P.10o: food and drink — roster PlayerBots get a player-parity stomach and eat Lua-listed crafted consumables from their vault before fights they start or fight back in, once per buff or digest window; a flagged combat seam counts the buffs and the player use path shares the buff constructor; bots restock below 10 doses through the debit-first BUY path priced per dose, SELL protects configured food, and the last dose removes the item with a ledger row; no schema change; gates default-off |
@@ -36,6 +37,12 @@
 
 # Changelog Summary
 
+- **v0.9.18 (Group missions, F_0.9.17 P.10p G3 - Week 15, 22-10-2026)**:
+  - **Grab missions in group chat.** "grab 2 bol missions to the W": bots with room grab matching missions (the server mission limit is now one setting for players and bots) and post their coordinates.
+  - **The stock group waypoint.** "Nearest mission for group" now includes bot missions; the bots go where it points.
+  - **Hold, reveal, lead.** The group waits short of the lair for the leader; the holder reveals it and leads the group to the real spawn. No new tactics (G4); bots defend and assist the leader.
+  - **Player-group rewards.** Equal shares within 128 m, both directions, journaled for bots.
+  - **Scoped verification.** The harness can run only the scenarios a release touches, continue past failures, cap the run time and label environment failures.
 - **v0.9.17 (Rally and buffs, F_0.9.16 P.10p G2 - Week 15, 21-10-2026)**:
   - **Leader directives in group chat.** "get buffs and meet at X", "meet at the starport", "regroup", "follow me". Places come from a Lua list (cities, Dantooine Mining Outpost and the other outposts, custom points) plus landmarks (cantina, starport, shuttleport, med center, "me"/"here"). An unknown place gets "Where's that?" and changes nothing. Leader only.
   - **Buff where it makes sense.** The meet city if it has buffers, else the bot's current buffer city, else the buffer city on the way (fewest legs); synthetic fallback only when nothing is reachable. The existing provider flow is reused, doctor fee included.

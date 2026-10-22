@@ -1350,6 +1350,46 @@
     const groupingBuffChoices = groupingDirectives.buffChoice || {};
     const groupingBuffOutcomes = groupingDirectives.buffOutcome || {};
     const groupingShuttles = groupingDirectives.shuttleLegs || {};
+    const groupingMissions = grouping.missions || {};
+    const groupingMissionPlans = Array.isArray(groupingMissions.plans)
+      ? groupingMissions.plans : [];
+    const groupingMissionEntries = groupingMissionPlans.flatMap((plan) =>
+      (plan.entries || []).map((entry) => {
+        const state = entry.completed ? "completed" : entry.abandoned
+          ? "abandoned" : "active";
+        const current = Number(entry.entryId) === Number(plan.currentEntryId);
+        const kind = Number(entry.kind) === 0 ? "bot offer"
+          : Number(entry.kind) === 1 ? "player destroy" : "player mission";
+        return `<tr>
+          <td class="t-num">${num(plan.groupOid)}</td>
+          <td>${current ? chip("current", "accent") : "—"}</td>
+          <td>${chip(kind, current ? "teal" : "ghost")}</td>
+          <td>${esc(entry.creature || entry.lairTemplate || "—")}</td>
+          <td>${chip(state, state === "active" ? "amber" : state === "completed" ? "ok" : "red")}</td>
+          <td>${esc(entry.planet || "—")}</td>
+        </tr>`;
+      })).join("");
+    const groupingMissionCurrent = groupingMissionPlans.flatMap((plan) =>
+      (plan.entries || []).filter((entry) =>
+        Number(entry.entryId) === Number(plan.currentEntryId))).map((entry) =>
+          `${esc(entry.creature || entry.lairTemplate || "mission")} · ${chip(entry.completed ? "completed" : entry.abandoned ? "abandoned" : "active", entry.completed ? "ok" : entry.abandoned ? "red" : "amber")}`
+        ).join(" · ") || "none";
+    const groupingMissionStrip = `<div class="section-gap"></div><div class="missions-strip">
+      <p class="playerbot-label">MISSIONS ${chip(groupingMissions.enabled ? "gate on" : "gate off", groupingMissions.enabled ? "ok" : "ghost")}</p>
+      <div class="metric-row">
+        ${metric("Plans", groupingMissionPlans.length)} ${metric("Current", groupingMissionCurrent === "none" ? 0 : 1, { tone: "accent" })}
+        ${metric("Grabbed", groupingMissions.grabsAssigned)} ${metric("Completed", groupingMissions.entriesCompleted, { tone: "teal" })}
+        ${metric("Bot shares", groupingMissions.splitBotShares)} ${metric("Player shares", groupingMissions.splitPlayerShares)}
+        ${metric("Leader shares", groupingMissions.splitHarnessLeaderShares)} ${metric("Assists", groupingMissions.assists && groupingMissions.assists.leaderTarget)}
+      </div>
+      ${kvRows([
+        ["Current entry", groupingMissionCurrent],
+        ["Split credits", `${num(groupingMissions.splitCreditsToBots)} bot · ${num(groupingMissions.splitCreditsToPlayers)} player`],
+        ["Leader assist skips", num(groupingMissions.assists && groupingMissions.assists.leaderTargetSkipped)],
+        ["Waypoint refreshes", num(groupingMissions.groupWaypointRefreshes)]
+      ])}
+      <div class="section-gap"></div>${table(["Group", "", "Entry", "Creature", "State", "Planet"], groupingMissionEntries, { scrollKey: "grouping-missions" })}
+    </div>`;
     const groupingOfferRows = (grouping.offers || []).map((o) => `<tr>
       <td><button type="button" class="playerbot-link" data-identity-id="${esc(o.identity)}"><span class="t-main">${esc(o.name || "unknown")}</span><span class="t-sub">${esc(o.identity)}</span></button></td>
       <td>${esc(o.player || "—")}</td><td>${chip(labelize(o.state || "offered"), o.state === "OFFERED" ? "amber" : "teal")}</td>
@@ -1368,7 +1408,7 @@
       ${metric("Directives", groupingDirectives.issued)} ${metric("Active", Object.values(groupingDirectives.active || {}).reduce((a, v) => a + Number(v || 0), 0), { tone: "accent" })}
       ${metric("Buff choices", Object.values(groupingBuffChoices).reduce((a, v) => a + Number(v || 0), 0))} ${metric("Buff outcomes", Object.values(groupingBuffOutcomes).reduce((a, v) => a + Number(v || 0), 0))}
       ${metric("Shuttles", `${num(groupingShuttles.finished)} / ${num(groupingShuttles.failed)}`, { tone: "teal", raw: true })} ${metric("Epoch mismatch", groupingDirectives.routeEpochMismatch)}
-    </div>${kvRows([
+    </div>${groupingMissionStrip}${kvRows([
       ["Rooms / replies", `${num(grouping.roomId)} · ${num(groupingCounters.repliesPosted)} posted / ${num(groupingCounters.repliesScheduled)} scheduled`],
       ["Invite / release", `${num(groupingCounters.invitesAccepted)} accepted · ${num(groupingCounters.joinFailed)} failed · ${Object.values(groupingCounters.releases || {}).reduce((a, v) => a + Number(v || 0), 0)} released`],
       ["Skipped replies", Object.entries(groupingCounters.replySkipped || {}).map(([k, v]) => `${esc(k)} ${num(v)}`).join(" · ") || "none"],

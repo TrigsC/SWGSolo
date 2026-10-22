@@ -32,9 +32,12 @@ public:
 	void run();
 
 private:
-	float calculateManhattanDistanceToMission(const Vector3& position, server::zone::objects::mission::MissionObject* mission);
+	float calculateManhattanDistanceToPosition(const Vector3& position,
+		const Vector3& missionPosition);
 
-	void setPlayersNearestMissionForGroupWaypoint(server::zone::objects::player::PlayerObject* ghost, server::zone::objects::mission::MissionObject* nearestMissionForGroup);
+	void setPlayersNearestMissionForGroupWaypoint(
+		server::zone::objects::player::PlayerObject* ghost,
+		const Vector3& position, uint32 planetCRC);
 };
 
 } // namespace tasks

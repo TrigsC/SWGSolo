@@ -95,6 +95,16 @@ private:
 	int stalemateDefenderHam;
 	int retreatCycles;
 	bool missionHuntOrder;
+	// G3 group-mission context.  It is independent of the solo order so the
+	// holder can reuse the lair pipeline without manufacturing an order.
+	bool groupMissionActive = false;
+	bool groupMissionIsHolder = false;
+	uint64 groupMissionEntryId = 0;
+	uint64 groupMissionPlanId = 0;
+	uint64 groupMissionLairOid = 0;
+	int groupMissionKind = PLAYER_BOT_GROUP_MISSION_BOT_OFFER;
+	uint64 groupMissionLastAssistMs = 0;
+	uint64 groupMissionLastLairScanMs = 0;
 	bool missionTerminalFallback;
 	bool missionTerminalResolved;
 	bool missionCleanupRequested;
@@ -361,6 +371,21 @@ private:
 		const String& hunterPlanet, const Vector3& hunterPosition,
 		Zone* hunterZone,
 		const PlayerBotGroupingConfig& groupingConfig);
+	void runGroupMissionTick(AiAgent* hunter, uint64 nowMs,
+		const PlayerBotGroupRecord& record,
+		const SimPlayerManager::PlayerBotGroupSnapshot& group,
+		const PlayerBotGroupMissionContext& context,
+		const PlayerBotGroupingConfig& groupingConfig);
+	void beginGroupMission(const PlayerBotGroupMissionContext& context);
+	void finishGroupMission(const String& outcome);
+	void cancelGroupMission();
+	bool missionContextActive() const {
+		return (orderActive && missionHuntOrder) ||
+			(groupMissionActive && groupMissionIsHolder);
+	}
+	void maybeAssistLeaderTarget(AiAgent* hunter, uint64 nowMs,
+		const PlayerBotGroupRecord& record,
+		const SimPlayerManager::PlayerBotGroupSnapshot& group);
 	// Starts one group route leg (either kind) after publishing the epoch and
 	// leg kind the synchronous failure callback reads.
 	bool startGroupTravelLeg(const SimPlayerManager::SimTravelLeg& leg,
@@ -599,6 +624,7 @@ public:
 	void onHuntDestruction(uint64 destroyedTargetOid,
 		bool participantVerified);
 	void onPveBotMissionLairDestroyed(uint64 lairOid);
+	void onGroupMissionLairDestroyed(uint64 lairOid);
 	void teardown(const String& reason);
 
 	String getPhaseName() const;
