@@ -157,6 +157,25 @@ static String hunterPhaseName(SimHunterController::HuntPhase phase) {
 	}
 }
 
+static String simHunterReplaceToken(String text, const String& token,
+		const String& replacement) {
+	if (token.isEmpty())
+		return text;
+	int index = text.indexOf(token);
+	while (index >= 0) {
+		const int tailStart = index + token.length();
+		String tail = tailStart < text.length() ? text.subString(tailStart) :
+			String();
+		String head = index > 0 ? text.subString(0, index) : String();
+		text = head + replacement + tail;
+		const int nextStart = index + replacement.length();
+		if (nextStart >= text.length())
+			break;
+		index = text.indexOf(token, nextStart);
+	}
+	return text;
+}
+
 SimHunterController::SimHunterController(AiAgent* aiAgent, uint64 identity)
 	: SimPlayerController(aiAgent) {
 	identityId = identity;
@@ -542,10 +561,14 @@ void SimHunterController::suspendRoutineForGroup(const String& reason) {
 
 	setEarlyGameActiveFlag(false);
 	groupFallbackMoveActive.store(false, std::memory_order_release);
+	groupPullReturnActive.store(false, std::memory_order_release);
+	groupSpinApproachActive.store(false, std::memory_order_release);
+	groupBackOffMoveActive.store(false, std::memory_order_release);
 	resetTravelCombat();
 	dropTargetObserver();
 	disengageTarget(false);
 	disengageMissionLair();
+	SimBotAreaAttackGuard::release(bodyOid);
 	clearEngagedTelemetry();
 	clearHybridMovementOnCancellation();
 	advanceWorkLoopGeneration("hunterGroupSuspend");
@@ -554,6 +577,9 @@ void SimHunterController::suspendRoutineForGroup(const String& reason) {
 void SimHunterController::resumeRoutineAfterGroup(bool postLeaving) {
 	(void)postLeaving;
 	groupFallbackMoveActive.store(false, std::memory_order_release);
+	groupPullReturnActive.store(false, std::memory_order_release);
+	groupSpinApproachActive.store(false, std::memory_order_release);
+	groupBackOffMoveActive.store(false, std::memory_order_release);
 	groupLastPathTarget = Vector3();
 	groupLastPathIssuedMs = 0;
 	if (isGroupPhase())
@@ -576,6 +602,9 @@ void SimHunterController::leaveGroupMode() {
 	activeTickGeneration.fetch_add(1, std::memory_order_acq_rel);
 	advanceWorkLoopGeneration("hunterGroupRelease");
 	groupFallbackMoveActive.store(false, std::memory_order_release);
+	groupPullReturnActive.store(false, std::memory_order_release);
+	groupSpinApproachActive.store(false, std::memory_order_release);
+	groupBackOffMoveActive.store(false, std::memory_order_release);
 	cancelGroupBuff();
 	cancelGroupMission();
 	if (isInterplanetaryTravelActive())
@@ -585,6 +614,7 @@ void SimHunterController::leaveGroupMode() {
 	clearHybridMovementOnCancellation();
 	dropTargetObserver();
 	disengageTarget(false);
+	SimBotAreaAttackGuard::release(agent == nullptr ? 0 : agent->getObjectID());
 	clearEngagedTelemetry();
 	resetTravelCombat();
 	resumeRoutineAfterGroup(false);
@@ -839,10 +869,13 @@ void SimHunterController::beginGroupMission(
 	groupMissionPlanId = context.planId;
 	groupMissionLairOid = context.lairOid;
 	groupMissionKind = context.kind;
+	groupMissionLairPosition = context.position;
 	groupMissionLastLairScanMs = 0;
 	missionLairRevealDeferCycles = 0;
-	missionLairOid = context.lairOid;
-	missionLairPosition = context.position;
+	// Only the holder owns the solo mission-lair fields; a non-holder carrying
+	// missionLairOid is refused travel (canBeginInterplanetaryTravel).
+	missionLairOid = context.holder ? context.lairOid : 0;
+	missionLairPosition = context.holder ? context.position : Vector3();
 	currentMissionOfferId = context.offerId;
 }
 
@@ -860,16 +893,34 @@ void SimHunterController::finishGroupMission(const String& outcome) {
 }
 
 void SimHunterController::cancelGroupMission() {
-	if (groupMissionActive && engagedMissionLairOid != 0)
+	endGroupSpin();
+	if (engagedMissionLairOid != 0)
 		disengageMissionLair();
 	groupMissionActive = false;
 	groupMissionIsHolder = false;
 	groupMissionEntryId = 0;
 	groupMissionPlanId = 0;
 	groupMissionLairOid = 0;
+	groupMissionLairPosition = Vector3();
+	groupBackOffLairOid = 0;
 	groupMissionKind = PLAYER_BOT_GROUP_MISSION_BOT_OFFER;
 	missionLairOid = 0;
 	currentMissionOfferId = 0;
+}
+
+void SimHunterController::endGroupSpin() {
+	ManagedReference<AiAgent*> strongAgent = agent;
+	if (strongAgent != nullptr)
+		SimBotAreaAttackGuard::endSpin(strongAgent->getObjectID());
+	groupSpinEngaged.store(false, std::memory_order_release);
+	groupSpinApproachActive.store(false, std::memory_order_release);
+	groupBackOffMoveActive.store(false, std::memory_order_release);
+	if (engagedMissionLairOid != 0 &&
+			(groupMissionActive || groupSpinLairOid != 0))
+		disengageMissionLair();
+	else if (groupMissionActive)
+		updateAreaAttackGuard();
+	groupSpinLairOid = 0;
 }
 
 void SimHunterController::maybeAssistLeaderTarget(AiAgent* hunter, uint64 nowMs,
@@ -956,10 +1007,24 @@ void SimHunterController::runGroupMissionTick(AiAgent* hunter, uint64 nowMs,
 	if (!groupMissionActive || groupMissionPlanId != context.planId ||
 			groupMissionEntryId != context.entryId)
 		beginGroupMission(context);
+	if (context.lairOid != 0 && groupMissionLairOid != 0 &&
+			groupMissionLairOid != context.lairOid)
+		endGroupSpin();
 	// The lair appears after the entry began (reveal or stock spawn); the
 	// destruction match reads groupMissionLairOid.
-	if (context.lairOid != 0)
+	if (context.lairOid != 0) {
 		groupMissionLairOid = context.lairOid;
+		groupMissionLairPosition = context.position;
+		// Only the holder owns the mission lair (G3). A non-holder carrying
+		// missionLairOid was refused every buff trip as controllerBusy
+		// (canBeginInterplanetaryTravel); its guard uses groupMissionLairPosition.
+		if (context.holder) {
+			missionLairOid = context.lairOid;
+			missionLairPosition = context.position;
+		}
+		updateAreaAttackGuard();
+	} else if (engagedMissionLairOid != 0)
+		endGroupSpin();
 	if (context.grabTravel) {
 		if (context.grabWaiting) {
 			setPhase(GROUP_WAIT);
@@ -1207,6 +1272,9 @@ void SimHunterController::runGroupMissionTick(AiAgent* hunter, uint64 nowMs,
 		}
 		groupMissionLairOid = offer.lairOid;
 		missionLairOid = offer.lairOid;
+		groupMissionLairPosition = offer.revealedPos;
+		missionLairPosition = offer.revealedPos;
+		updateAreaAttackGuard();
 		manager->reportPlayerBotGroupMissionReveal(record.groupOid,
 			context.planId, context.entryId, offer.lairOid, offer.revealedPos);
 		manager->updatePlayerBotGroupMissionStage(identityId,
@@ -1215,22 +1283,66 @@ void SimHunterController::runGroupMissionTick(AiAgent* hunter, uint64 nowMs,
 		return;
 	}
 	if (context.lairOid != 0) {
-		// G3 adds no lair tactics (group tactics are G4). At a revealed lair
-		// no bot attacks the lair on its own: member defence and leader assist
-		// run in runGroupTick before this dispatch, and movement is following
-		// (the holder on a bot mission, the leader otherwise).
 		manager->updatePlayerBotGroupMissionStage(identityId, context.planId,
 			context.entryId, SimBotGroupRally::MISSION_FIGHT);
+		PlayerBotGroupTacticsState tacticsState;
+		const bool tacticsActive = manager->isPlayerBotGroupTacticsActive(
+			identityId) && manager->isPlayerBotGroupMissionsActive(identityId) &&
+			manager->getPlayerBotGroupTacticsState(record.groupOid, tacticsState);
+		// Spin mode itself runs in runGroupSpin (any stage, owner client pass
+		// 2026-10-23); this branch keeps the G3 path and the back-off walk.
+		// "back off": every bot leaves the suppressed lair and follows the leader,
+		// moving even while still fighting what the spin pulled (lease below).
+		// Otherwise, with tactics disabled or spin mode off, this remains the G3
+		// follow path: no group bot attacks a lair on its own.
+		const bool backingOff = tacticsActive &&
+			tacticsState.spinSuppressedLairOid == context.lairOid;
+		groupBackOffMoveActive.store(backingOff, std::memory_order_release);
+		if (!backingOff)
+			groupBackOffLairOid = 0;
+		else if (groupBackOffLairOid != context.lairOid) {
+			// The first back-off tick replaces any lair-bound path at once:
+			// driveGroupTravel will not retarget a bot that is still MOVING, and
+			// moveTo() discards the in-flight path.
+			groupBackOffLairOid = context.lairOid;
+			ManagedReference<CreatureObject*> backOffLeader = zoneServer == nullptr ||
+				record.leaderOid == 0 ? nullptr : zoneServer->getObject(
+				record.leaderOid).castTo<CreatureObject*>();
+			Vector3 leaderPosition;
+			bool leaderHere = false;
+			if (backOffLeader != nullptr) {
+				Locker leaderLock(backOffLeader);
+				leaderHere = backOffLeader->getZone() != nullptr &&
+					backOffLeader->getZone()->getZoneName() == context.planet;
+				leaderPosition = backOffLeader->getWorldPosition();
+			}
+			if (leaderHere && !isTraversalActive()) {
+				moveTo(leaderPosition);
+				groupLastPathTarget = leaderPosition;
+				groupLastPathIssuedMs = nowMs;
+			}
+		}
 		// A bot mission's lair spawns where the reveal search put it, which
 		// only the holder knows: the holder walks there (stopping at engage
 		// range, no attack of its own) and the others follow the holder.
-		if (context.kind == PLAYER_BOT_GROUP_MISSION_BOT_OFFER) {
+		if (context.kind == PLAYER_BOT_GROUP_MISSION_BOT_OFFER && !backingOff) {
 			GroupTravelTarget target;
 			bool haveTarget = false;
 			if (context.holder) {
 				target.planet = context.planet;
-				target.position = context.position;
-				target.arrivalMeters = getEngageRangeMeters();
+				// Lead to a point leadStopMeters short of the lair on the holder's
+				// side, not to the lair itself: an arrival radius only stops new
+				// paths, so a path aimed at the lair walked onto it (owner client
+				// pass 2026-10-27: within 6 m). Same shape as the G2 hold-short.
+				Vector3 approach = hunter->getWorldPosition() - context.position;
+				approach.setZ(0.f);
+				if (approach.length2d() < 0.01f)
+					approach = Vector3::UNIT_X;
+				else
+					approach.normalize();
+				target.position = context.position +
+					approach * groupingConfig.missions.leadStopMeters;
+				target.arrivalMeters = groupingConfig.rallyArriveMeters;
 				haveTarget = true;
 			} else if (context.holderIdentityId != 0) {
 				PlayerBotGroupRecord holderRecord;
@@ -1275,6 +1387,9 @@ void SimHunterController::runGroupMissionTick(AiAgent* hunter, uint64 nowMs,
 			if (!target.planet.isEmpty())
 				driveGroupTravel(hunter, nowMs, record, target, context.entryId,
 					groupingConfig, arrived);
+			// Back at the leader: fight normally, no more walking through combat.
+			if (arrived)
+				groupBackOffMoveActive.store(false, std::memory_order_release);
 		}
 		scheduleActiveTick(1000);
 		return;
@@ -1323,6 +1438,10 @@ void SimHunterController::runGroupDirectiveTick(AiAgent* hunter,
 		return;
 	}
 
+	// A G2 buff or meet trip replaces the group mission on this bot: drop its
+	// mission state (lair oids included) so the trip can start.
+	if (groupMissionActive)
+		cancelGroupMission();
 	if (directive.stage == SimBotGroupRally::PLANNING) {
 		if (isInterplanetaryTravelActive()) {
 			setPhase(GROUP_TRAVEL);
@@ -1566,6 +1685,752 @@ void SimHunterController::maybePostGroupRebuffNotice(AiAgent* hunter,
 	}, "PlayerBotGroupRebuffNotice", delaySeconds * 1000);
 }
 
+// G4 spin mode, in any group stage (owner client pass 2026-10-23: spin was
+// only evaluated in the mission-fight stage, so after "follow" it never ran).
+// The lair is the leader's target when it is one, else the nearest lair within
+// spinStartMeters of the leader. Returns true when it used the tick.
+bool SimHunterController::runGroupSpin(AiAgent* hunter, uint64 nowMs,
+		const PlayerBotGroupRecord& record,
+		const PlayerBotGroupingConfig& groupingConfig) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr || hunter == nullptr)
+		return false;
+	PlayerBotGroupTacticsState tacticsState;
+	const bool tacticsActive = manager->isPlayerBotGroupTacticsActive(
+		identityId) && manager->getPlayerBotGroupTacticsState(record.groupOid,
+			tacticsState);
+	if (!tacticsActive || !tacticsState.spinMode) {
+		if (groupSpinLairOid != 0)
+			endGroupSpin();
+		groupSpinApproachActive.store(false, std::memory_order_release);
+		return false;
+	}
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<CreatureObject*> leader = zoneServer == nullptr ||
+		record.leaderOid == 0 ? nullptr : zoneServer->getObject(
+		record.leaderOid).castTo<CreatureObject*>();
+	if (leader == nullptr)
+		return false;
+	bool leaderInCombat = false;
+	uint64 leaderTargetOid = 0;
+	Vector3 leaderPosition;
+	Zone* leaderZone = nullptr;
+	{
+		Locker leaderLock(leader);
+		leaderInCombat = leader->isInCombat();
+		leaderTargetOid = leader->getTargetID();
+		leaderZone = leader->getZone();
+		leaderPosition = leader->getWorldPosition();
+	}
+	if (leaderZone == nullptr || hunter->getZone() != leaderZone)
+		return false;
+	// Outside a mission the back-off walk ends at the leader; the mission tick
+	// manages its own lease.
+	if (!groupMissionActive &&
+			groupBackOffMoveActive.load(std::memory_order_acquire) &&
+			hunter->getWorldPosition().distanceTo2d(leaderPosition) <=
+				groupingConfig.followMaxMeters)
+		groupBackOffMoveActive.store(false, std::memory_order_release);
+	const float startMeters = groupingConfig.tactics.spinStartMeters;
+	ManagedReference<LairObject*> lair;
+	if (leaderTargetOid != 0) {
+		ManagedReference<SceneObject*> targetObject =
+			zoneServer->getObject(leaderTargetOid);
+		LairObject* targetLair = targetObject == nullptr ? nullptr :
+			cast<LairObject*>(targetObject.get());
+		if (targetLair != nullptr && targetLair->getZone() == leaderZone)
+			lair = targetLair;
+	}
+	if (lair == nullptr && groupSpinLairOid != 0) {
+		ManagedReference<SceneObject*> current =
+			zoneServer->getObject(groupSpinLairOid);
+		LairObject* currentLair = current == nullptr ? nullptr :
+			cast<LairObject*>(current.get());
+		if (currentLair != nullptr && currentLair->getZone() == leaderZone)
+			lair = currentLair;
+	}
+	if (lair == nullptr) {
+		SortedVector<TreeEntry*> closeObjects;
+		leaderZone->getInRangeObjects(leaderPosition.getX(),
+			leaderPosition.getZ(), leaderPosition.getY(), startMeters,
+			&closeObjects, true, true);
+		float best = startMeters + 1.f;
+		for (int i = 0; i < closeObjects.size(); ++i) {
+			SceneObject* object = static_cast<SceneObject*>(closeObjects.get(i));
+			LairObject* candidate = object == nullptr ? nullptr :
+				cast<LairObject*>(object);
+			if (candidate == nullptr || candidate->getZone() != leaderZone)
+				continue;
+			const float distance = candidate->getWorldPosition().distanceTo2d(
+				leaderPosition);
+			if (distance < best) {
+				best = distance;
+				lair = candidate;
+			}
+		}
+	}
+	if (groupSpinLairOid != 0 && (lair == nullptr ||
+			lair->getObjectID() != groupSpinLairOid || lair->isDestroyed())) {
+		// The spun lair is gone (destroyed or despawned) or the leader moved on.
+		endGroupSpin();
+	}
+	if (lair == nullptr || lair->isDestroyed()) {
+		groupSpinApproachActive.store(false, std::memory_order_release);
+		return false;
+	}
+	const uint64 lairOid = lair->getObjectID();
+	const Vector3 lairPosition = lair->getWorldPosition();
+	// "back off": suppress the lair this bot was on (or about to spin) when the
+	// leader said it, until a later "spin the lair".
+	if (tacticsState.backOffAtMs > groupSpinSeenBackOffMs) {
+		groupSpinSeenBackOffMs = tacticsState.backOffAtMs;
+		groupSpinBackOffLairOid = groupSpinLairOid != 0 ? groupSpinLairOid :
+			lairOid;
+		// A bot spinning or still walking in turns around now: the stand-point
+		// path would otherwise run on (moveTo discards it), and the normal follow
+		// path does not replace a MOVING mover.
+		if (groupSpinLairOid != 0 ||
+				groupSpinApproachActive.load(std::memory_order_acquire)) {
+			endGroupSpin();
+			groupBackOffMoveActive.store(true, std::memory_order_release);
+			if (!isTraversalActive()) {
+				moveTo(leaderPosition);
+				groupLastPathTarget = leaderPosition;
+				groupLastPathIssuedMs = nowMs;
+			}
+			scheduleActiveTick(1000);
+			return true;
+		}
+	}
+	const bool locallySuppressed = groupSpinBackOffLairOid == lairOid &&
+		tacticsState.backOffAtMs > tacticsState.spinSetAtMs;
+	const uint64 suppressedLairOid = locallySuppressed ? lairOid :
+		tacticsState.spinSuppressedLairOid;
+	if (groupSpinLairOid != 0 && suppressedLairOid == groupSpinLairOid) {
+		endGroupSpin();
+		groupSpinApproachActive.store(false, std::memory_order_release);
+		return false;
+	}
+	if (groupSpinLairOid == lairOid && engagedMissionLairOid == lairOid) {
+		if (hunter->isInCombat()) {
+			// Spinning: the combat tree drives the attacks (area preference set).
+			setPhase(GROUP_WAIT);
+			scheduleActiveTick(1000);
+			return true;
+		}
+		// Dropped out of combat while still marked as spinning (owner client
+		// pass 2026-10-26: "attack the lair" then did nothing): start again.
+		groupSpinLairOid = 0;
+		groupSpinEngaged.store(false, std::memory_order_release);
+		disengageMissionLair();
+	}
+	SimBotBodyProgression bodySnapshot;
+	manager->getPlayerBotBodyProgressionSnapshot(identityId, bodySnapshot);
+	const float leaderToLair = leaderPosition.distanceTo2d(lairPosition);
+	const float botToLair = hunter->getWorldPosition().distanceTo2d(lairPosition);
+	// Spin only claims bots near the lair; a bot far away (owner client pass
+	// 2026-10-26: 1 km out) keeps its normal travel to the group first.
+	static const float kSpinJoinMeters = 64.f;
+	if (botToLair > kSpinJoinMeters && groupSpinLairOid == 0) {
+		groupSpinApproachActive.store(false, std::memory_order_release);
+		return false;
+	}
+	// The lair is aggro once it took damage or any of its creatures is in
+	// combat: the camp is awake, whoever woke it.
+	bool lairAggro = false;
+	{
+		Locker lairLock(lair);
+		lairAggro = lair->getConditionDamage() > 0;
+	}
+	if (!lairAggro) {
+		Vector<ManagedReference<CreatureObject*> > members =
+			manager->snapshotLairMembers(lairOid);
+		for (int i = 0; i < members.size() && !lairAggro; ++i) {
+			CreatureObject* member = members.get(i).get();
+			if (member == nullptr)
+				continue;
+			Locker memberLock(member);
+			lairAggro = member->isInCombat();
+		}
+	}
+	// "attack the lair" names one lair, bound by the manager when it is said
+	// (owner client pass 2026-10-26: it carried over to every later lair).
+	const bool goOrdered = tacticsState.spinGoAtMs != 0 &&
+		tacticsState.spinGoAtMs > tacticsState.backOffAtMs &&
+		tacticsState.spinGoLairOid != 0 && tacticsState.spinGoLairOid == lairOid;
+	const bool shouldSpin = SimBotGroupTactics::spinShouldEngage(
+		tacticsState.spinMode, bodySnapshot.hasAreaAbility, suppressedLairOid,
+		lairOid, leaderToLair, lairAggro, goOrdered, startMeters);
+	manager->recordPlayerBotGroupingTacticEvent(identityId, "spin_check lair=" +
+		String::valueOf(lairOid) + " should=" + String::valueOf(shouldSpin) +
+		" hasArea=" + String::valueOf(bodySnapshot.hasAreaAbility) +
+		" leaderInCombat=" + String::valueOf(leaderInCombat) +
+		" lairAggro=" + String::valueOf(lairAggro) +
+		" go=" + String::valueOf(goOrdered) +
+		" leaderToLair=" + String::valueOf(leaderToLair) +
+		" botToLair=" + String::valueOf(botToLair) +
+		" suppressed=" + String::valueOf(suppressedLairOid));
+	if (!shouldSpin) {
+		groupSpinApproachActive.store(false, std::memory_order_release);
+		return false;
+	}
+	const float spinStand = groupingConfig.tactics.spinStandMeters;
+	// The lair's footprint stops a bot well outside spinStandMeters of its
+	// centre (owner client pass 2026-10-23: no bot ever engaged). Engage within
+	// the stand distance plus the area guard's lair-footprint margin; the
+	// combat tree then closes on the lair itself.
+	if (!groupSpinApproachActive.load(std::memory_order_acquire))
+		groupSpinApproachStartedMs = nowMs;
+	// A blocked approach engages from where it stands after 15 s rather than
+	// leaving the bot walking (and skipping defence and assist) forever.
+	const bool approachTimedOut = groupSpinApproachStartedMs != 0 &&
+		nowMs >= groupSpinApproachStartedMs + 15000;
+	if (botToLair > spinStand + SimBotAreaAttackGuard::MARGIN_METERS &&
+			!approachTimedOut) {
+		Vector3 approach = hunter->getWorldPosition() - lairPosition;
+		approach.setZ(0.f);
+		if (approach.length2d() < 0.01f)
+			approach = Vector3::UNIT_X;
+		else
+			approach.normalize();
+		const Vector3 standPoint = lairPosition + approach * spinStand;
+		// Bots are usually already fighting here; the base mover holds a bot in
+		// combat unless this lease is up (allowsMovementInCombat). The first
+		// approach replaces any in-flight path (moveTo discards it).
+		const bool firstApproach = !groupSpinApproachActive.load(
+			std::memory_order_acquire);
+		groupSpinApproachActive.store(true, std::memory_order_release);
+		if (!isTraversalActive() && (firstApproach ||
+				(state != MOVING && state != CALCULATING_PATH))) {
+			moveTo(standPoint);
+			groupLastPathTarget = standPoint;
+			groupLastPathIssuedMs = nowMs;
+		}
+		scheduleActiveTick(1000);
+		return true;
+	}
+	engageGroupLair(hunter, lairOid);
+	scheduleActiveTick(1000);
+	return true;
+}
+
+// Entering RETURN: stop the bot's own chase so the combat tree does not pin it
+// on the creature, while the creature keeps its aggro and follows. Unlike
+// resetInterceptorCombat (FLEE), defenders are shed on the bot's side only.
+void SimHunterController::dropGroupPullChase(AiAgent* hunter, uint64 targetOid) {
+	if (hunter == nullptr)
+		return;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> target = zoneServer == nullptr ||
+		targetOid == 0 ? nullptr : zoneServer->getObject(targetOid);
+	Locker hunterLock(hunter);
+	if (target != nullptr)
+		hunter->removeDefender(target);
+	hunter->setTargetObject(nullptr);
+	hunter->setFollowObject(nullptr);
+	hunter->clearQueueActions(true);
+}
+
+// RETURN keeps the creature's aggro either way. A rifle, carbine or pistol keeps
+// shooting while it walks back (the travel-combat fight-on-the-run rule, which
+// mirrors CombatManager's moving-attack offset); any other weapon cannot hit
+// on the move, so the bot drops its own chase and runs.
+void SimHunterController::beginGroupPullReturn(AiAgent* hunter,
+		uint64 leaderOid, uint64 nowMs) {
+	if (!weaponFightsOnTheRun(hunter))
+		dropGroupPullChase(hunter, groupPullTargetOid);
+	// Replace the approach path now (moveTo discards it). The RETURN tick only
+	// re-paths when the mover is not MOVING, and a stale approach path left the
+	// bot "MOVING" in place for the whole return (verify 2026-10-23, boot 4).
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<CreatureObject*> leader = zoneServer == nullptr ||
+		leaderOid == 0 ? nullptr : zoneServer->getObject(leaderOid).
+		castTo<CreatureObject*>();
+	if (leader == nullptr || hunter == nullptr || isTraversalActive())
+		return;
+	Vector3 leaderPosition;
+	{
+		Locker leaderLock(leader);
+		Zone* leaderZone = leader->getZone();
+		if (leaderZone == nullptr || hunter->getZone() == nullptr ||
+				leaderZone->getZoneName() != hunter->getZone()->getZoneName())
+			return;
+		leaderPosition = leader->getWorldPosition();
+	}
+	moveTo(leaderPosition);
+	groupPullLastPathTarget = leaderPosition;
+	groupPullLastPathIssuedMs = nowMs;
+}
+
+void SimHunterController::finishGroupPull(const PlayerBotGroupRecord& record,
+		const String& outcome, const String& lineKey, bool timedOut) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr)
+		return;
+	groupPullReturnActive.store(false, std::memory_order_release);
+	if (!manager->completePlayerBotGroupTacticOrder(identityId,
+			record.tacticOrderGeneration))
+		return;
+	SimBotAreaAttackGuard::setForbidArea(
+		agent == nullptr ? 0 : agent->getObjectID(), false);
+	if (outcome == "returned")
+		manager->recordPlayerBotGroupingTacticOutcome(identityId,
+			"pull_returned");
+	else if (outcome == "nothing")
+		manager->recordPlayerBotGroupingTacticOutcome(identityId,
+			"pull_no_target");
+	else if (timedOut)
+		manager->recordPlayerBotGroupingTacticOutcome(identityId,
+			"pull_timed_out");
+	PlayerBotGroupingConfig config = manager->getPlayerBotGroupingConfig();
+	String line;
+	if (lineKey == "pullBack")
+		line = config.tactics.pullBackLines.size() > 0 ?
+			config.tactics.pullBackLines.get(0) : String("Got one coming.");
+	else if (lineKey == "pullNothing")
+		line = config.tactics.pullNothingLines.size() > 0 ?
+			config.tactics.pullNothingLines.get(0) : String("Nothing to pull.");
+	else
+		line = config.tactics.pullFailedLines.size() > 0 ?
+			config.tactics.pullFailedLines.get(0) : String("Can't reach it.");
+	manager->postPlayerBotGroupReply(record.groupOid, identityId, line);
+	manager->recordPlayerBotGroupingTacticEvent(identityId,
+		"pull_" + outcome + " target=" + String::valueOf(groupPullTargetOid));
+	groupPullOrderGeneration = 0;
+	groupPullTargetOid = 0;
+	groupPullStage = SimBotGroupTactics::APPROACH;
+	groupPullStartedAtMs = 0;
+	groupPullTaggedAtMs = 0;
+	groupPullTagIssued = false;
+	groupPullTargetPack = false;
+	groupPullTargetName = String();
+}
+
+bool SimHunterController::runGroupPull(AiAgent* hunter, uint64 nowMs,
+		const PlayerBotGroupRecord& record,
+		const SimPlayerManager::PlayerBotGroupSnapshot& group,
+		const ManagedReference<CreatureObject*>& selfAttacker) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr || hunter == nullptr)
+		return true;
+	PlayerBotGroupingConfig config = manager->getPlayerBotGroupingConfig();
+	if (groupPullOrderGeneration != record.tacticOrderGeneration) {
+		groupPullOrderGeneration = record.tacticOrderGeneration;
+		groupPullTargetOid = record.pullTargetOid;
+		groupPullStage = record.pullStage;
+		groupPullStartedAtMs = nowMs;
+		groupPullTaggedAtMs = 0;
+		groupPullTagIssued = false;
+		groupPullLastPathTarget = Vector3();
+		groupPullLastPathIssuedMs = 0;
+		groupPullTargetPack = false;
+		groupPullTargetName = String();
+		SimBotAreaAttackGuard::setForbidArea(hunter->getObjectID(), true);
+	}
+	if (groupPullStartedAtMs == 0)
+		groupPullStartedAtMs = nowMs;
+
+	if (selfAttacker != nullptr && (groupPullTargetOid == 0 ||
+			groupPullStage == SimBotGroupTactics::APPROACH ||
+			groupPullStage == SimBotGroupTactics::TAG)) {
+		// Something is already on the bot before the tag: that is the pull
+		// working (a pack mate of the target counts; owner client pass
+		// 2026-10-26 got "Can't reach it." from that). Bring it back.
+		if (groupPullTargetOid == 0)
+			groupPullTargetOid = selfAttacker->getObjectID();
+		groupPullStage = SimBotGroupTactics::RETURN;
+		groupPullTaggedAtMs = nowMs;
+		groupPullReturnActive.store(true, std::memory_order_release);
+		beginGroupPullReturn(hunter, group.leaderOid, nowMs);
+		manager->updatePlayerBotGroupTacticPullStage(identityId,
+			record.tacticOrderGeneration, SimBotGroupTactics::RETURN,
+			groupPullTargetOid);
+		manager->recordPlayerBotGroupingTacticEvent(identityId,
+			"pull_adopted_attacker target=" + String::valueOf(groupPullTargetOid));
+	}
+
+	Zone* hunterZone = hunter->getZone();
+	Vector3 hunterPosition = hunter->getWorldPosition();
+	String hunterPlanet = hunterZone == nullptr ? String() :
+		hunterZone->getZoneName();
+	ManagedReference<CreatureObject*> target;
+	if (groupPullTargetOid != 0) {
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		target = zoneServer == nullptr ? nullptr : zoneServer->getObject(
+			groupPullTargetOid).castTo<CreatureObject*>();
+	}
+
+	if (target == nullptr) {
+		Vector<ManagedReference<CreatureObject*> > lairMembers;
+		PlayerBotGroupMissionContext context;
+		const bool lairAnchor = groupMissionActive &&
+			manager->getPlayerBotGroupMissionContext(identityId, context) &&
+			context.lairOid != 0 && context.planet == hunterPlanet;
+		Vector3 anchor = lairAnchor ? context.position : hunterPosition;
+		bool haveAnchor = lairAnchor;
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<CreatureObject*> leader = zoneServer == nullptr ||
+				group.leaderOid == 0 ? nullptr : zoneServer->getObject(
+				group.leaderOid).castTo<CreatureObject*>();
+		if (!lairAnchor && leader != nullptr) {
+			Locker leaderLock(leader);
+			if (leader->getZone() != nullptr && leader->getZone()->getZoneName() ==
+					hunterPlanet) {
+				anchor = leader->getWorldPosition();
+				haveAnchor = true;
+			}
+		}
+		if (lairAnchor)
+			lairMembers = manager->snapshotLairMembers(context.lairOid);
+
+		std::vector<SimBotGroupTactics::PullCandidate> candidates;
+		Vector<ManagedReference<CreatureObject*> > eligibleObjects;
+		Vector<ManagedReference<CreatureObject*> > objects;
+		if (lairAnchor) {
+			for (int i = 0; i < lairMembers.size(); ++i)
+				objects.add(lairMembers.get(i));
+		} else if (hunterZone != nullptr && haveAnchor) {
+			SortedVector<TreeEntry*> closeObjects;
+			hunterZone->getInRangeObjects(anchor.getX(), anchor.getZ(),
+				anchor.getY(), config.tactics.pullRadiusMeters, &closeObjects,
+				true, true);
+			for (int i = 0; i < closeObjects.size(); ++i) {
+				SceneObject* object = static_cast<SceneObject*>(closeObjects.get(i));
+				CreatureObject* candidate = object == nullptr ? nullptr :
+					object->asCreatureObject();
+				if (candidate != nullptr)
+					objects.add(candidate);
+			}
+		}
+		for (int i = 0; i < objects.size(); ++i) {
+			ManagedReference<CreatureObject*> candidate = objects.get(i);
+			if (candidate == nullptr || candidate == hunter || candidate->isDead())
+				continue;
+			SimBotGroupTactics::PullCandidate choice;
+			{
+				Locker candidateLock(candidate);
+				if (candidate->getZone() == nullptr || candidate->getZone()->
+						getZoneName() != hunterPlanet ||
+						candidate->getWorldPosition().distanceTo2d(anchor) >
+						config.tactics.pullRadiusMeters)
+					continue;
+				AiAgent* candidateAgent = candidate->asAiAgent();
+				if (candidateAgent == nullptr)
+					continue;
+				choice.distanceToAnchor = candidate->getWorldPosition().
+					distanceTo2d(anchor);
+				choice.inCombat = candidate->isInCombat();
+				choice.attackable = candidate->isAttackableBy(hunter);
+				choice.attackerIsPlayer = candidate->isPlayerCreature();
+				choice.attackerIsSimBot = candidateAgent->getSimPlayerBot();
+				choice.attackerFaction = candidate->getFaction();
+				const CreatureTemplate* creatureTemplate =
+					candidateAgent->getCreatureTemplate();
+				choice.isPack = creatureTemplate != nullptr &&
+					creatureTemplate->isPack();
+			}
+			candidates.push_back(choice);
+			eligibleObjects.add(candidate);
+		}
+		const SimBotGroupTactics::PullTargetChoice selected =
+			SimBotGroupTactics::choosePullTarget(candidates);
+		if (!selected.found()) {
+			manager->updatePlayerBotGroupTacticPullStage(identityId,
+				record.tacticOrderGeneration, SimBotGroupTactics::ABORT);
+			finishGroupPull(record, "nothing", "pullNothing");
+			return true;
+		}
+		if (selected.index >= 0 && selected.index < eligibleObjects.size()) {
+			target = eligibleObjects.get(selected.index);
+			if (target != nullptr) {
+				Locker targetLock(target);
+				AiAgent* targetAgent = target->asAiAgent();
+				const CreatureTemplate* creatureTemplate = targetAgent == nullptr ?
+					nullptr : targetAgent->getCreatureTemplate();
+				groupPullTargetPack = creatureTemplate != nullptr &&
+					creatureTemplate->isPack();
+				groupPullTargetName = target->getDisplayedName();
+			}
+		}
+		if (target == nullptr) {
+			manager->updatePlayerBotGroupTacticPullStage(identityId,
+				record.tacticOrderGeneration, SimBotGroupTactics::ABORT);
+			finishGroupPull(record, "nothing", "pullNothing");
+			return true;
+		}
+		groupPullTargetOid = target->getObjectID();
+		manager->updatePlayerBotGroupTacticPullStage(identityId,
+			record.tacticOrderGeneration, SimBotGroupTactics::APPROACH,
+			groupPullTargetOid);
+		PlayerBotGroupingConfig lineConfig = config;
+		const Vector<String>& lines = groupPullTargetPack ?
+			lineConfig.tactics.pullingPackLines : lineConfig.tactics.pullingLines;
+		String line = lines.size() > 0 ? lines.get(0) :
+			(groupPullTargetPack ? String("Pulling a {creature} (pack).") :
+			String("Pulling a {creature}."));
+		line = simHunterReplaceToken(line, "{creature}", groupPullTargetName);
+		manager->postPlayerBotGroupReply(record.groupOid, identityId, line);
+		manager->recordPlayerBotGroupingTacticEvent(identityId,
+			"pull_target target=" + String::valueOf(groupPullTargetOid) +
+			" name=" + groupPullTargetName + " pack=" +
+			String::valueOf(groupPullTargetPack) + " lairAnchor=" +
+			String::valueOf(lairAnchor) + " candidates=" +
+			String::valueOf(static_cast<int>(candidates.size())));
+	}
+
+	if (target == nullptr)
+		return true;
+	String targetPlanet;
+	Vector3 targetPosition;
+	bool targetDead = false;
+	bool targetAimedAtBot = false;
+	bool targetDamagedByBot = false;
+	{
+		Locker targetLock(target);
+		targetDead = target->isDead();
+		Zone* targetZone = target->getZone();
+		targetPlanet = targetZone == nullptr ? String() : targetZone->getZoneName();
+		targetPosition = target->getWorldPosition();
+		// A confirmed tag is attention or real damage. startCombat alone installs
+		// both defender links and a zero-damage threat entry, so neither proves
+		// the hit landed.
+		targetAimedAtBot = target->getTargetID() == hunter->getObjectID();
+		ThreatMap* threatMap = target->getThreatMap();
+		if (threatMap != nullptr) {
+			for (int i = 0; i < threatMap->size(); ++i) {
+				ManagedReference<TangibleObject*> entry =
+					threatMap->elementAt(i).getKey();
+				if (entry != nullptr && entry->getObjectID() == hunter->getObjectID()) {
+					targetDamagedByBot =
+						threatMap->elementAt(i).getValue().getTotalDamage() > 0;
+					break;
+				}
+			}
+		}
+	}
+	const bool targetChangedPlanet = targetPlanet.isEmpty() ||
+		(!hunterPlanet.isEmpty() && targetPlanet != hunterPlanet);
+	SimBotGroupTactics::PullState current;
+	current.stage = groupPullStage;
+	current.startedAtMs = groupPullStartedAtMs;
+	current.taggedAtMs = groupPullTaggedAtMs;
+	SimBotGroupTactics::PullInputs inputs;
+	inputs.nowMs = nowMs;
+	// The pull tags from the weapon's own reach (the early-game rule): the
+	// hunter's 48 m default let an unarmed bot "tag" from 42 m.
+	float pullEngageMeters = 2.f;
+	{
+		Locker hunterLock(hunter);
+		WeaponObject* weapon = hunter->getWeapon();
+		if (weapon != nullptr)
+			pullEngageMeters = Math::max(2.f,
+				static_cast<float>(weapon->getMaxRange()) - 1.f);
+	}
+	inputs.withinEngageRange = hunterPosition.distanceTo(targetPosition) <=
+		pullEngageMeters;
+	inputs.targetAimedAtBot = targetAimedAtBot;
+	inputs.targetDamagedByBot = targetDamagedByBot;
+	inputs.targetDead = targetDead;
+	inputs.targetChangedPlanet = targetChangedPlanet;
+	inputs.botDead = hunter->isDead();
+	inputs.tagTimeoutMs = static_cast<uint64>(config.tactics.tagTimeoutSeconds) * 1000ULL;
+	inputs.pullTimeoutMs = static_cast<uint64>(config.tactics.pullTimeoutSeconds) * 1000ULL;
+	if (groupPullStage == SimBotGroupTactics::APPROACH &&
+			!inputs.withinEngageRange) {
+		const bool havePath = groupPullLastPathIssuedMs != 0;
+		const bool targetMoved = !havePath || targetPosition.distanceTo(
+			groupPullLastPathTarget) > config.repathMoveMeters;
+		const bool stalled = havePath && (state == IDLE || state == WAITING) &&
+			nowMs >= groupPullLastPathIssuedMs + 8000;
+		// The first approach path replaces whatever the bot was walking (the G1
+		// follow leg, verify 2026-10-23 trace); moveTo discards the in-flight
+		// path. Later re-paths wait for the mover, as the follow rule does.
+		const bool firstApproach = groupPullLastPathIssuedMs == 0 ||
+			groupPullLastPathIssuedMs < groupPullStartedAtMs;
+		if (!isTraversalActive() && (firstApproach ||
+				(state != MOVING && state != CALCULATING_PATH &&
+					(targetMoved || stalled)))) {
+			moveTo(targetPosition);
+			groupPullLastPathTarget = targetPosition;
+			groupPullLastPathIssuedMs = nowMs;
+		}
+	} else if (groupPullStage == SimBotGroupTactics::TAG &&
+			!groupPullTagIssued) {
+		SimBotAreaAttackGuard::setForbidArea(hunter->getObjectID(), true);
+		groupPullTagIssued = engageDefensiveTarget(hunter, target.get(),
+			"group_pull");
+	} else if (groupPullStage == SimBotGroupTactics::RETURN) {
+		groupPullReturnActive.store(true, std::memory_order_release);
+		// The creature's hits put it back on the bot's defender list, and the
+		// combat tree then fights in place (owner client pass 2026-10-23: a weak
+		// bol died before the bot got back). Keep dropping the bot's own chase.
+		if (!weaponFightsOnTheRun(hunter))
+			dropGroupPullChase(hunter, groupPullTargetOid);
+		ManagedReference<CreatureObject*> leader;
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		leader = zoneServer == nullptr || group.leaderOid == 0 ? nullptr :
+			zoneServer->getObject(group.leaderOid).castTo<CreatureObject*>();
+		if (leader != nullptr) {
+			Vector3 leaderPosition;
+			String leaderPlanet;
+			{
+				Locker leaderLock(leader);
+				leaderPosition = leader->getWorldPosition();
+				Zone* leaderZone = leader->getZone();
+				leaderPlanet = leaderZone == nullptr ? String() :
+					leaderZone->getZoneName();
+			}
+			inputs.withinFollowMax = leaderPlanet == hunterPlanet &&
+				hunterPosition.distanceTo2d(leaderPosition) <=
+				config.followMaxMeters;
+			if (nowMs >= groupPullLastReturnDiagMs + 5000) {
+				groupPullLastReturnDiagMs = nowMs;
+				manager->recordPlayerBotGroupingTacticEvent(identityId,
+					"pull_return dist=" + String::valueOf(
+						hunterPosition.distanceTo2d(leaderPosition)) +
+					" followMax=" + String::valueOf(config.followMaxMeters) +
+					" moveState=" + String::valueOf(static_cast<int>(state)) +
+					" inCombat=" + String::valueOf(hunter->isInCombat()) +
+					" held=" + String::valueOf(isMovementHeld()) +
+					" lease=" + String::valueOf(allowsMovementInCombat()));
+			}
+			if (!inputs.withinFollowMax && leaderPlanet == hunterPlanet) {
+				const bool havePath = groupPullLastPathIssuedMs != 0;
+				const bool leaderMoved = !havePath || leaderPosition.distanceTo(
+					groupPullLastPathTarget) > config.repathMoveMeters;
+				const bool stalled = havePath && (state == IDLE || state == WAITING) &&
+					nowMs >= groupPullLastPathIssuedMs + 8000;
+				if (state != MOVING && state != CALCULATING_PATH &&
+						!isTraversalActive() && (leaderMoved || stalled)) {
+					moveTo(leaderPosition);
+					groupPullLastPathTarget = leaderPosition;
+					groupPullLastPathIssuedMs = nowMs;
+				}
+			}
+		}
+	}
+	SimBotGroupTactics::PullState next = SimBotGroupTactics::pullStep(current,
+		inputs);
+	if (next.stage != groupPullStage) {
+		groupPullStage = next.stage;
+		groupPullStartedAtMs = next.startedAtMs;
+		groupPullTaggedAtMs = next.taggedAtMs;
+		manager->updatePlayerBotGroupTacticPullStage(identityId,
+			record.tacticOrderGeneration, next.stage, groupPullTargetOid);
+		if (next.stage == SimBotGroupTactics::RETURN) {
+			groupPullReturnActive.store(true, std::memory_order_release);
+			beginGroupPullReturn(hunter, group.leaderOid, nowMs);
+		}
+		if (next.stage == SimBotGroupTactics::DONE ||
+				next.stage == SimBotGroupTactics::ABORT) {
+			finishGroupPull(record, next.reason,
+				next.stage == SimBotGroupTactics::DONE ? "pullBack" :
+					"pullFailed", next.reason == "timeout");
+			return true;
+		}
+	}
+	scheduleActiveTick(1000);
+	return true;
+}
+
+bool SimHunterController::runGroupTacticOrder(AiAgent* hunter, uint64 nowMs,
+		const PlayerBotGroupRecord& record,
+		const SimPlayerManager::PlayerBotGroupSnapshot& group,
+		const PlayerBotGroupTacticsState& tacticsState,
+		const ManagedReference<CreatureObject*>& selfAttacker) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr || hunter == nullptr)
+		return true;
+	(void)tacticsState;
+	if (record.tacticOrder == SimBotGroupTactics::ORDER_PULL)
+		return runGroupPull(hunter, nowMs, record, group, selfAttacker);
+	if (record.tacticOrder == SimBotGroupTactics::ORDER_EAT) {
+		if (hunter->isInCombat()) {
+			scheduleActiveTick(1000);
+			return true;
+		}
+		PlayerBotFoodResult result = manager->consumePlayerBotFoodBeforeEngage(
+			identityId, hunter, true);
+		if (!manager->completePlayerBotGroupTacticOrder(identityId,
+				record.tacticOrderGeneration))
+			return true;
+		PlayerBotGroupingConfig config = manager->getPlayerBotGroupingConfig();
+		String line;
+		if (result.ate()) {
+			line = config.tactics.ateFoodLines.size() > 0 ?
+				config.tactics.ateFoodLines.get(0) : String("Ate {items}.");
+			String items;
+			for (int i = 0; i < result.items.size(); ++i) {
+				if (i > 0)
+					items += ", ";
+				items += result.items.get(i);
+			}
+			line = simHunterReplaceToken(line, "{items}", items);
+			manager->recordPlayerBotGroupingTacticOutcome(identityId, "eat_ate");
+		} else if (result.alreadyFed()) {
+			line = config.tactics.fullAlreadyLines.size() > 0 ?
+				config.tactics.fullAlreadyLines.get(0) : String("Already fed.");
+			manager->recordPlayerBotGroupingTacticOutcome(identityId,
+				"eat_already_fed");
+		} else {
+			line = config.tactics.noFoodLines.size() > 0 ?
+				config.tactics.noFoodLines.get(0) : String("No food on me.");
+			manager->recordPlayerBotGroupingTacticOutcome(identityId,
+				"eat_no_food");
+		}
+		manager->postPlayerBotGroupReply(record.groupOid, identityId, line);
+		manager->recordPlayerBotGroupingTacticEvent(identityId, "eat_result=" +
+			result.reason);
+		return true;
+	}
+	if (record.tacticOrder == SimBotGroupTactics::ORDER_SPIN_POLL) {
+		SimBotBodyProgression bodySnapshot;
+		manager->getPlayerBotBodyProgressionSnapshot(identityId, bodySnapshot);
+		bool needDoctor = false;
+		bool needEntertainer = false;
+		computeBuffNeeds(needDoctor, needEntertainer);
+		float hamFraction = 1.f;
+		{
+			Locker hunterLock(hunter);
+			const uint8 pools[] = {CreatureAttribute::HEALTH,
+				CreatureAttribute::ACTION, CreatureAttribute::MIND};
+			for (uint8 i = 0; i < 3; ++i) {
+				const int maxHam = hunter->getMaxHAM(pools[i]);
+				if (maxHam > 0)
+					hamFraction = Math::min(hamFraction,
+						static_cast<float>(hunter->getHAM(pools[i])) /
+						static_cast<float>(maxHam));
+			}
+		}
+		SimBotGroupTactics::SpinPollAnswer answer =
+			SimBotGroupTactics::spinPollAnswer(bodySnapshot.hasAreaAbility,
+				bodySnapshot.areaAbility, !needDoctor && !needEntertainer,
+				hamFraction, manager->getPlayerBotWornArmorPieces(identityId));
+		if (!manager->completePlayerBotGroupTacticOrder(identityId,
+				record.tacticOrderGeneration))
+			return true;
+		PlayerBotGroupingConfig config = manager->getPlayerBotGroupingConfig();
+		const Vector<String>* lines = &config.tactics.spinNoLines;
+		if (answer.lineKey == "spinYes")
+			lines = &config.tactics.spinYesLines;
+		else if (answer.lineKey == "spinYesNoBuffs")
+			lines = &config.tactics.spinYesNoBuffsLines;
+		String line = lines->size() > 0 ? lines->get(0) : String("No spin attack.");
+		line = simHunterReplaceToken(line, "{ability}", answer.ability);
+		line = simHunterReplaceToken(line, "{ham}",
+			String::valueOf(answer.hamPercent));
+		manager->postPlayerBotGroupReply(record.groupOid, identityId, line);
+		manager->recordPlayerBotGroupingTacticOutcome(identityId,
+			"spin_poll_reply");
+		manager->recordPlayerBotGroupingTacticEvent(identityId,
+			"spin_poll_reply ability=" + answer.ability + " ham=" +
+			String::valueOf(answer.hamPercent) + " armor=" +
+			String::valueOf(answer.wornArmorPieces));
+		return true;
+	}
+	return false;
+}
+
 void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 	SimPlayerManager* manager = SimPlayerManager::instance();
 	if (manager == nullptr || hunter == nullptr) {
@@ -1586,6 +2451,12 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 			phase != GROUP_BUFF)
 		setPhase(GROUP_WAIT);
 	groupFallbackMoveActive.store(false, std::memory_order_release);
+	if (record.tacticOrder != SimBotGroupTactics::ORDER_PULL &&
+			groupPullOrderGeneration != 0) {
+		groupPullReturnActive.store(false, std::memory_order_release);
+		SimBotAreaAttackGuard::setForbidArea(hunter->getObjectID(), false);
+		groupPullOrderGeneration = 0;
+	}
 	PlayerBotGroupDirective earlyDirective;
 	const bool haveEarlyDirective = manager->getPlayerBotGroupDirective(
 		identityId, earlyDirective) && earlyDirective.stage !=
@@ -1622,7 +2493,17 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 	if ((hunter->isInCombat() || recognisesThreatAttackers()) &&
 			selectActiveCombatAttacker(hunter, selfAttacker, selfAttackerAgent) &&
 			selfAttacker != nullptr)
-		engageDefensiveTarget(hunter, selfAttacker.get(), "self");
+	{
+		// A returning puller walks the creature back (a ranged bot keeps its
+		// fight on the run); re-engaging here every tick would pin it where it
+		// stands. The pull's DONE hands the creature back to normal defence.
+		// Pack mates follow a pull too; none of them may pin the bot.
+		const bool pullReturning = record.tacticOrder ==
+			SimBotGroupTactics::ORDER_PULL &&
+			groupPullStage == SimBotGroupTactics::RETURN;
+		if (!pullReturning)
+			engageDefensiveTarget(hunter, selfAttacker.get(), "self");
+	}
 
 	if (hasRecord && record.state == PLAYER_BOT_GROUP_DEAD_REJOIN) {
 		manager->tryRejoinPlayerBotGroup(identityId, hunter);
@@ -1679,6 +2560,17 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 		leaderHeading = leaderObject->getDirection()->getRadians();
 		leaderIndoors = leaderObject->getParent() != nullptr;
 	}
+	if (manager->isPlayerBotGroupTacticsActive(identityId) &&
+			record.tacticOrder != SimBotGroupTactics::ORDER_NONE) {
+		PlayerBotGroupTacticsState tacticsState;
+		manager->getPlayerBotGroupTacticsState(record.groupOid, tacticsState);
+		if (runGroupTacticOrder(hunter, nowMs, record, group, tacticsState,
+				selfAttacker))
+			return;
+	}
+	if (runGroupSpin(hunter, nowMs, record,
+			manager->getPlayerBotGroupingConfig()))
+		return;
 	// Self-defence wins: never switch off a creature attacking this bot.
 	if (selfAttacker == nullptr)
 		maybeAssistLeaderTarget(hunter, nowMs, record, group);
@@ -2430,7 +3322,10 @@ void SimHunterController::lairRetreatReflee(AiAgent* hunter,
 }
 
 bool SimHunterController::allowsMovementInCombat() const {
-	if (groupFallbackMoveActive.load(std::memory_order_acquire))
+	if (groupFallbackMoveActive.load(std::memory_order_acquire) ||
+			groupPullReturnActive.load(std::memory_order_acquire) ||
+			groupSpinApproachActive.load(std::memory_order_acquire) ||
+			groupBackOffMoveActive.load(std::memory_order_acquire))
 		return true;
 	// A lair retreat is a run; the base in-combat hold used to pin the bot where
 	// it stood for as long as anything kept hitting it.
@@ -2445,7 +3340,10 @@ bool SimHunterController::allowsMovementInCombat() const {
 }
 
 bool SimHunterController::keepsCombatOnPathAccept() const {
-	if (groupFallbackMoveActive.load(std::memory_order_acquire))
+	if (groupFallbackMoveActive.load(std::memory_order_acquire) ||
+			groupPullReturnActive.load(std::memory_order_acquire) ||
+			groupSpinApproachActive.load(std::memory_order_acquire) ||
+			groupBackOffMoveActive.load(std::memory_order_acquire))
 		return true;
 	// Only fight on the run keeps its fight across a re-path. A FLEE leg wants
 	// the fight dropped -- it shed combat itself before moving.
@@ -2480,12 +3378,22 @@ void SimHunterController::updateAreaAttackGuard() {
 	if (strongAgent == nullptr)
 		return;
 	const uint64 bodyOid = strongAgent->getObjectID();
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	const bool groupGuard = manager != nullptr && groupMissionActive &&
+		manager->isPlayerBotGroupTacticsActive(identityId) &&
+		groupMissionLairOid != 0;
+	// A spinning bot deliberately cleared the point and selected area attacks;
+	// the periodic publisher must not put the point back over that preference
+	// (or release the entry, which would drop the preference outside a mission).
+	if ((groupGuard || groupSpinLairOid != 0) && engagedMissionLairOid != 0)
+		return;
 	// engagedMissionLairOid != 0 means the bot is hitting the lair on purpose:
 	// an area attack there is wanted, and the wave tactics pace it.
-	if (missionContextActive() && missionLairOid != 0 &&
+	if ((groupGuard || (missionContextActive() && missionLairOid != 0)) &&
 			engagedMissionLairOid == 0 && !strongAgent->isDead())
-		SimBotAreaAttackGuard::protect(bodyOid, missionLairPosition.getX(),
-			missionLairPosition.getY());
+		SimBotAreaAttackGuard::protect(bodyOid,
+			groupGuard ? groupMissionLairPosition.getX() : missionLairPosition.getX(),
+			groupGuard ? groupMissionLairPosition.getY() : missionLairPosition.getY());
 	else
 		SimBotAreaAttackGuard::release(bodyOid);
 }
@@ -2782,6 +3690,17 @@ void SimHunterController::onTick() {
 	// self-defends, and only in the travel/movement legs where runActiveTick's
 	// combat handler does not run. In HUNTING, runActiveTick owns combat.
 	if (phase == HUNTING || phase == ENGAGING_LAIR)
+		return;
+	// G4: a puller walking its creature back, or a bot backing off a lair, is
+	// leaving that fight on purpose. Re-engaging here (this thread, every few
+	// seconds) re-aimed the bot at the creature and pinned it (verify boot 8).
+	// Both leases are atomics written by runActiveTick.
+	if (groupPullReturnActive.load(std::memory_order_acquire) ||
+			groupBackOffMoveActive.load(std::memory_order_acquire))
+		return;
+	// A spinning bot is in combat with its lair; with no creature on it this
+	// path used to shed that fight (no_selectable_attacker) and leave it idle.
+	if (groupSpinEngaged.load(std::memory_order_acquire))
 		return;
 
 	// Interceptor-only self-defense: fight whatever is actually attacking, via
@@ -6295,6 +7214,7 @@ void SimHunterController::runActiveTick() {
 			clearStructureTraversalState("hunter_death");
 		cancelGroupBuff();
 		cancelGroupMission();
+		SimBotAreaAttackGuard::release(strongAgent->getObjectID());
 		cancelPveDoctorRequest();
 		SimPlayerManager::instance()->releasePlayerBotDoctorBuffFee(identityId);
 		pveDoctorFeeReserved = false;
@@ -8344,6 +9264,54 @@ void SimHunterController::shedWaveAggro(AiAgent* strongAgent, int spawnNumber) {
 		" deaggroCount=" + String::valueOf(waveDeaggroCount));
 }
 
+bool SimHunterController::engageGroupLair(AiAgent* hunter, uint64 lairOid) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr || hunter == nullptr || lairOid == 0 ||
+			engagedMissionLairOid != 0)
+		return false;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(lairOid);
+	TangibleObject* lair = object == nullptr ? nullptr :
+		object->asTangibleObject();
+	// A bot already fighting (defending, assisting the leader) may still start on
+	// the lair, as the solo engageMissionLair does; spin starts mid-fight by design.
+	if (lair == nullptr || lair->getZone() == nullptr || hunter->isDead())
+		return false;
+	if (hunter->getDistanceTo(lair) > getEngageRangeMeters()) {
+		groupSpinApproachActive.store(true, std::memory_order_release);
+		moveTo(lair->getWorldPosition());
+		return false;
+	}
+	if (!hunter->isInCombat())
+		manager->consumePlayerBotFoodBeforeEngage(identityId, hunter);
+	bool combatStarted = false;
+	// Raised before combat becomes visible: onTick (another thread) must never
+	// see this bot in combat with its lair without the spin flag.
+	groupSpinEngaged.store(true, std::memory_order_release);
+	{
+		Locker agentLock(hunter);
+		combatStarted = CombatManager::instance()->startCombat(hunter, lair);
+		if (combatStarted) {
+			hunter->setTargetObject(lair);
+			hunter->activateAiBehavior(true);
+		}
+	}
+	MissionDiagLog::event("GROUP_SPIN", identityId,
+		"lairOid=" + String::valueOf(lairOid) + " started=" +
+		String::valueOf(combatStarted));
+	if (!combatStarted) {
+		groupSpinEngaged.store(false, std::memory_order_release);
+		return false;
+	}
+	engagedMissionLairOid = lairOid;
+	groupSpinLairOid = lairOid;
+	groupSpinApproachActive.store(false, std::memory_order_release);
+	SimBotAreaAttackGuard::beginSpin(hunter->getObjectID());
+	manager->recordPlayerBotGroupingTacticOutcome(identityId, "spin_engage");
+	return true;
+}
+
 void SimHunterController::disengageMissionLair() {
 	if (engagedMissionLairOid == 0) {
 		return;
@@ -9213,6 +10181,7 @@ void SimHunterController::teardown(const String& reason) {
 	clearHybridMovementOnCancellation();
 	dropTargetObserver();
 	disengageTarget(false);
+	SimBotAreaAttackGuard::release(agent == nullptr ? 0 : agent->getObjectID());
 	clearEngagedTelemetry();
 	if (orderActive)
 		SimPlayerManager::instance()->recordPveHunterAbandoned(identityId,

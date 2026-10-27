@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "SimBotGrouping.h"
+#include "SimBotGroupTactics.h"
 
 namespace SimBotGroupRally {
 
@@ -281,6 +282,8 @@ struct LeaderLine {
 	bool isDirective = false;
 	SimBotGroupMission::MissionRequest mission;
 	bool isMission = false;
+	SimBotGroupTactics::TacticRequest tactic;
+	bool isTactic = false;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -288,25 +291,6 @@ struct LeaderLine {
 
 inline bool rallyStringEquals(const String& left, const String& right) {
 	return left.trim().toLowerCase() == right.trim().toLowerCase();
-}
-
-inline bool isRallyFiller(const String& token) {
-	return token == "out" || token == "front" || token == "of" ||
-		token == "at" || token == "the" || token == "lets" ||
-		token == "let" || token == "and" || token == "please" ||
-		token == "to" || token == "me" || token == "get" ||
-		token == "then" || token == "us" || token == "we" || token == "all" ||
-		token == "everyone" || token == "guys" || token == "now";
-}
-
-inline std::vector<String> removeRallyFillers(
-		const std::vector<String>& tokens) {
-	std::vector<String> result;
-	for (size_t i = 0; i < tokens.size(); ++i) {
-		if (!isRallyFiller(tokens[i]))
-			result.push_back(tokens[i]);
-	}
-	return result;
 }
 
 struct RallyAliasMatch {
@@ -318,7 +302,7 @@ struct RallyAliasMatch {
 inline RallyAliasMatch findPlaceAlias(const std::vector<String>& tokens,
 		const RallyVocabulary& vocabulary) {
 	RallyAliasMatch result;
-	const std::vector<String> filtered = removeRallyFillers(tokens);
+	const std::vector<String> filtered = SimBotGrouping::removeRallyFillers(tokens);
 	for (size_t placeIndex = 0; placeIndex < vocabulary.places.size();
 			++placeIndex) {
 		const PlaceRule& place = vocabulary.places[placeIndex];
@@ -463,7 +447,7 @@ inline DirectiveText parseDirective(const String& text,
 				markPhrases(vocabulary.landmarks[l].keywords);
 		}
 		for (size_t i = meetEnd; i < tokens.size(); ++i) {
-			if (known[i] || isRallyFiller(tokens[i]) || tokens[i] == "up" ||
+			if (known[i] || SimBotGrouping::isRallyFiller(tokens[i]) || tokens[i] == "up" ||
 					SimBotGrouping::containsString(ignoredWords, tokens[i]))
 				continue;
 			result.unknownPlaceWords = true;
@@ -481,7 +465,9 @@ inline LeaderLine parseLeaderLine(const String& text,
 		const SimBotGrouping::Vocabulary& groupingVocabulary,
 		const RallyVocabulary& rallyVocabulary,
 		const SimBotGroupMission::MissionVocabulary& missionVocabulary =
-			SimBotGroupMission::MissionVocabulary()) {
+			SimBotGroupMission::MissionVocabulary(),
+		const SimBotGroupTactics::TacticVocabulary& tacticVocabulary =
+			SimBotGroupTactics::TacticVocabulary()) {
 	LeaderLine result;
 	result.command = SimBotGrouping::parseGroupCommand(text, botFirstNames,
 		groupingVocabulary, true);
@@ -498,10 +484,15 @@ inline LeaderLine parseLeaderLine(const String& text,
 		missionVocabulary, nameWords);
 	result.isMission = result.mission.command !=
 		SimBotGroupMission::MISSION_NONE;
+	result.tactic = SimBotGroupTactics::parseTacticCommand(text,
+		tacticVocabulary, botFirstNames);
+	result.isTactic = result.tactic.command !=
+		SimBotGroupTactics::TACTIC_NONE;
 
 	// LEAVE and FOLLOW are explicit commands and win even when a place or
 	// mission is also mentioned.  Mission commands then win over G2's
-	// STATUS/READY and directive parsing.  A directive wins over STATUS/READY;
+	// STATUS/READY, tactic and directive parsing.  A tactic wins over
+	// STATUS/READY and directive parsing;
 	// the manager distinguishes it with isDirective because it needs the parsed
 	// place payload.
 	if (result.command.command == SimBotGrouping::GROUP_COMMAND_LEAVE ||
@@ -509,8 +500,16 @@ inline LeaderLine parseLeaderLine(const String& text,
 		result.isMission = false;
 	if (result.command.command == SimBotGrouping::GROUP_COMMAND_LEAVE ||
 			result.command.command == SimBotGrouping::GROUP_COMMAND_FOLLOW)
+		result.isTactic = false;
+	if (result.command.command == SimBotGrouping::GROUP_COMMAND_LEAVE ||
+			result.command.command == SimBotGrouping::GROUP_COMMAND_FOLLOW)
 		result.isDirective = false;
 	else if (result.isMission) {
+		result.command.command = SimBotGrouping::GROUP_COMMAND_NONE;
+		result.isTactic = false;
+		result.isDirective = false;
+	}
+	else if (result.isTactic) {
 		result.command.command = SimBotGrouping::GROUP_COMMAND_NONE;
 		result.isDirective = false;
 	}

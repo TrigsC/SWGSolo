@@ -3634,6 +3634,14 @@ SimPlayerManagerConfig = {
             {name="group_mission_gate_off", budgetMs=1800000, steps={{op="resetGroupingCounterBaseline", name="groupMission.waypointRefreshes"}, {op="setGroupingGate", gateEnabled=true}, {op="setMissionsGate", identityRef="production", gateEnabled=false}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb bot"}, {op="assertOffer", identityRef="production", within=30}, {op="groupInvite", identityRef="production"}, {op="assertGrouped", identityRef="production", within=30}, {op="groupMissionSay", text="grab 1 kreetle missions to the s"}, {op="assertGroupMissionEntry", expect="absent", within=60}, {op="removeGroupLeaderStandIn"}}},
             {name="group_mission_assist_leader_target", budgetMs=3600000, steps={{op="resetGroupingCounterBaseline", name="groupMission.leaderAssists"}, {op="setGroupingGate", gateEnabled=true}, {op="setMissionsGate", identityRef="production", gateEnabled=true}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb bot"}, {op="assertOffer", identityRef="production", within=30}, {op="groupInvite", identityRef="production"}, {op="assertGrouped", identityRef="production", within=30}, {op="awaitBotOutOfCombat", identityRef="production", within=300}, {op="spawnHarnessAttacker", template="kreetle", faction="neutral", target="standIn"}, {op="assertBotDamaged", identityRef="production", target="standIn", within=60}, {op="assertGroupingCounter", name="groupMission.leaderAssists", minDelta=1, within=60}, {op="removeHarnessAttacker"}, {op="removeGroupLeaderStandIn"}}},
             {name="group_assist_leader_no_faction", budgetMs=3600000, steps={{op="resetGroupingCounterBaseline", name="groupMission.leaderAssistsSkipped"}, {op="setGroupingGate", gateEnabled=true}, {op="setMissionsGate", identityRef="production", gateEnabled=true}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb bot"}, {op="assertOffer", identityRef="production", within=30}, {op="groupInvite", identityRef="production"}, {op="assertGrouped", identityRef="production", within=30}, {op="awaitBotOutOfCombat", identityRef="production", within=300}, {op="spawnHarnessAttacker", template="stormtrooper", faction="imperial", target="standIn"}, {op="assertNoBotDamage", identityRef="production", target="standIn", within=30}, {op="assertGroupingCounter", name="groupMission.leaderAssistsSkipped", minDelta=1, within=60}, {op="removeHarnessAttacker"}, {op="removeGroupLeaderStandIn"}}},
+            -- F_0.9.18 G4 group tactics. These remain inert with the parity
+            -- harness disabled and arm only the per-scenario tactic overrides.
+            {name="group_tactics_eat", budgetMs=1800000, steps={{op="resetGroupingCounterBaseline", name="grouping.tactics.eatOrders|grouping.tactics.eatAte|grouping.tactics.eatAlreadyFed|grouping.tactics.eatNoFood"}, {op="setGroupingGate", gateEnabled=true}, {op="setTacticsGate", identityRef="production", gateEnabled=true}, {op="setConsumablesGate", identityRef="production", gateEnabled=true}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb bot"}, {op="assertOffer", identityRef="production", within=30}, {op="groupInvite", identityRef="production"}, {op="assertGrouped", identityRef="production", within=30}, {op="awaitBotOutOfCombat", identityRef="production", within=300}, {op="groupSay", text="take foods"}, {op="assertTacticCounter", name="grouping.tactics.eatOrders", minDelta=1, within=30}, {op="assertTacticCounter", name="grouping.tactics.eatAte|grouping.tactics.eatAlreadyFed|grouping.tactics.eatNoFood", minDelta=1, within=60}, {op="awaitBotOutOfCombat", identityRef="production", within=120}, {op="groupSay", text="take foods"}, {op="assertTacticCounter", name="grouping.tactics.eatAte|grouping.tactics.eatAlreadyFed|grouping.tactics.eatNoFood", minDelta=2, within=60}, {op="removeGroupLeaderStandIn"}}}, -- a production bot's vault is never seeded (harness rule); real eating is the owner's in-client check
+            {name="group_tactics_pull", budgetMs=1800000, steps={{op="resetGroupingCounterBaseline", name="grouping.tactics.pullOrders|grouping.tactics.pullsReturned"}, {op="setGroupingGate", gateEnabled=true}, {op="setTacticsGate", identityRef="production", gateEnabled=true}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb bot"}, {op="assertOffer", identityRef="production", within=30}, {op="groupInvite", identityRef="production"}, {op="assertGrouped", identityRef="production", within=30}, {op="awaitBotOutOfCombat", identityRef="production", within=300}, {op="spawnGroupPullTarget", identityRef="production", template="kreetle"}, {op="groupSay", text="pull"}, {op="assertTacticCounter", name="grouping.tactics.pullOrders", minDelta=1, within=30}, {op="assertTacticCounter", name="grouping.tactics.pullsReturned", minDelta=1, within=180}, {op="assertFollowDistance", identityRef="production", max=600, within=30}, {op="removeHarnessAttacker"}, {op="removeGroupLeaderStandIn"}}},
+            {name="group_tactics_pull_nothing", budgetMs=1500000, steps={{op="resetGroupingCounterBaseline", name="grouping.tactics.pullsNoTarget"}, {op="setGroupingGate", gateEnabled=true}, {op="setTacticsGate", identityRef="production", gateEnabled=true}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb bot"}, {op="assertOffer", identityRef="production", within=30}, {op="groupInvite", identityRef="production"}, {op="assertGrouped", identityRef="production", within=30}, {op="awaitBotOutOfCombat", identityRef="production", within=300}, {op="groupSay", text="pull"}, {op="assertTacticCounter", name="grouping.tactics.pullsNoTarget", minDelta=1, within=60}, {op="awaitBotOutOfCombat", identityRef="production", within=30}, {op="removeGroupLeaderStandIn"}}},
+            {name="group_tactics_spin_poll", budgetMs=1800000, steps={{op="resetGroupingCounterBaseline", name="grouping.tactics.spinPollReplies"}, {op="setGroupingGate", gateEnabled=true}, {op="setTacticsGate", identityRef="production", gateEnabled=true}, {op="setTacticsGate", identityRef="production2", gateEnabled=true}, {op="setMissionsGate", identityRef="production", gateEnabled=true}, {op="setMissionsGate", identityRef="production2", gateEnabled=true}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="setGroupAvailabilityOverride", identityRef="production2", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb two bots"}, {op="assertOffer", identityRef="production", within=30}, {op="assertOffer", identityRef="production2", within=30}, {op="groupInvite", identityRef="production"}, {op="groupInvite", identityRef="production2"}, {op="assertGrouped", identityRef="production", within=30}, {op="assertGrouped", identityRef="production2", within=30}, {op="awaitBotOutOfCombat", identityRef="production", within=300}, {op="groupSay", text="who has spin"}, {op="assertTacticCounter", name="grouping.tactics.spinPollReplies", minDelta=2, within=60}, {op="removeGroupLeaderStandIn"}}},
+            {name="group_tactics_spin_toggle", budgetMs=1800000, steps={{op="resetGroupingCounterBaseline", name="grouping.tactics.spinModeOn|grouping.tactics.spinModeOff"}, {op="setGroupingGate", gateEnabled=true}, {op="setTacticsGate", identityRef="production", gateEnabled=true}, {op="setTacticsGate", identityRef="production2", gateEnabled=true}, {op="setMissionsGate", identityRef="production", gateEnabled=true}, {op="setMissionsGate", identityRef="production2", gateEnabled=true}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="setGroupAvailabilityOverride", identityRef="production2", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb two bots"}, {op="assertOffer", identityRef="production", within=30}, {op="assertOffer", identityRef="production2", within=30}, {op="groupInvite", identityRef="production"}, {op="groupInvite", identityRef="production2"}, {op="assertGrouped", identityRef="production", within=30}, {op="assertGrouped", identityRef="production2", within=30}, {op="groupSay", text="spin the lair"}, {op="assertGroupTactics", identityRef="production", expect="on", within=30}, {op="assertGroupTactics", identityRef="production2", expect="on", within=30}, {op="assertTacticCounter", name="grouping.tactics.spinModeOn", minDelta=2, within=60}, {op="groupSay", text="spin off"}, {op="assertGroupTactics", identityRef="production", expect="off", within=30}, {op="assertTacticCounter", name="grouping.tactics.spinModeOff", minDelta=2, within=60}, {op="groupSay", text="spin the lair"}, {op="assertGroupTactics", identityRef="production", expect="on", within=30}, {op="groupSay", text="leave"}, {op="assertNotGrouped", identityRef="production", within=30}, {op="assertNotGrouped", identityRef="production2", within=30}, {op="assertGroupTactics", identityRef="production", expect="off", within=30}, {op="removeGroupLeaderStandIn"}}},
+            {name="group_tactics_gate_off", budgetMs=1500000, steps={{op="resetGroupingCounterBaseline", name="grouping.tactics.tacticsRejectedGate"}, {op="setGroupingGate", gateEnabled=true}, {op="setTacticsGate", identityRef="production", gateEnabled=false}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb bot"}, {op="assertOffer", identityRef="production", within=30}, {op="groupInvite", identityRef="production"}, {op="assertGrouped", identityRef="production", within=30}, {op="groupSay", text="pull"}, {op="assertTacticCounter", name="grouping.tactics.tacticsRejectedGate", minDelta=1, within=60}, {op="assertGroupTactics", identityRef="production", expect="off", within=30}, {op="removeGroupLeaderStandIn"}}},
             {name="loadout_production_equip", budgetMs=3900000, steps={
                 -- Read-only: this never grants, gates, respawns, or otherwise
                 -- mutates a production identity. It waits for the live roster
@@ -3698,9 +3706,19 @@ SimPlayerManagerConfig = {
             -- F_0.9.16 (P.10p G2): capability gate, shipped disabled.
             directivesEnabled = false,
             missionsEnabled = false,
+            tacticsEnabled = false,
+            tactics = {
+                pullRadiusMeters = 64,
+                pullTimeoutSeconds = 45,
+                tagTimeoutSeconds = 8,
+                spinStartMeters = 20,
+                spinStandMeters = 4,
+                pullReplyCooldownSeconds = 3,
+            },
             missions = {
                 maxGrabCount = 20, -- a sanity cap; the server mission limit x free bots decides
                 bearingToleranceDeg = 22, -- one compass sector: "west" means W, not NW..SW
+                leadStopMeters = 40, -- a holder stops this far from its revealed lair (not on it)
                 holdShortMeters = 60,
                 splitRangeMeters = 128,
                 leaderMissionRefreshSeconds = 15,
@@ -3792,6 +3810,15 @@ SimPlayerManagerConfig = {
                         {kind = "leader", keywords = {"me", "leader", "my location", "here"}},
                     },
                 },
+                tactics = {
+                    pull = {"pull"},
+                    spinPoll = {"who has spin", "who can spin", "has spin", "have spin"},
+                    spinOn = {"spin the lair", "spin on", "lets spin"},
+                    spinOff = {"no spin", "spin off", "stop spin", "stop spinning"},
+                    eat = {"take food", "take foods", "eat"},
+                    backOff = {"back off", "off the lair", "hold"},
+                    lairAttack = {"attack the lair", "attack lair", "hit the lair"},
+                },
             },
             places = {
                 {key = "moenia", planet = "naboo", city = "moenia", aliases = {"moenia"}},
@@ -3837,6 +3864,21 @@ SimPlayerManagerConfig = {
                 missionDone = {"That one's done."},
                 missionAllDone = {"That's all of them."},
                 missionSkipped = {"Skipping that one."},
+                pulling = {"Pulling a {creature}."},
+                pullNothing = {"Nothing to pull."},
+                pullBack = {"Got one coming."},
+                pullFailed = {"Can't reach it."},
+                lairAttack = {"On the lair."},
+                spinYes = {"Yes, {ability}. Buffed, {ham}% HAM."},
+                spinYesNoBuffs = {"I have {ability} but no buffs."},
+                spinNo = {"No spin attack."},
+                spinOn = {"Spin mode on."},
+                spinOff = {"Spin mode off."},
+                ateFood = {"Ate {items}."},
+                fullAlready = {"Already fed."},
+                noFood = {"No food on me."},
+                backOff = {"Backing off."},
+                pullingPack = {"Pulling a {creature} (pack)."},
             },
         },
         bazaarSaleBacklogMax = 256,

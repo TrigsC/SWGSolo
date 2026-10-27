@@ -35,6 +35,9 @@ struct SimBotAreaAttackProtected {
 	float x = 0.f;
 	float y = 0.f;
 	uint64 updatedMs = 0;
+	bool protectedPoint = false;
+	bool forbidArea = false;
+	bool preferArea = false;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -63,6 +66,28 @@ private:
 	static AtomicLong& skipsStorage() {
 		static AtomicLong skips;
 		return skips;
+	}
+
+	static AtomicLong& forbidSkipsStorage() {
+		static AtomicLong skips;
+		return skips;
+	}
+
+	static SimBotAreaAttackProtected& ensureEntryLocked(uint64 bodyOid) {
+		VectorMap<uint64, SimBotAreaAttackProtected>& points = pointsStorage();
+		if (!points.contains(bodyOid)) {
+			while (points.size() >= MAX_TRACKED) {
+				int oldest = 0;
+				for (int i = 1; i < points.size(); ++i) {
+					if (points.elementAt(i).getValue().updatedMs <
+							points.elementAt(oldest).getValue().updatedMs)
+						oldest = i;
+				}
+				points.remove(oldest);
+			}
+			points.put(bodyOid, SimBotAreaAttackProtected());
+		}
+		return points.get(bodyOid);
 	}
 
 public:
@@ -121,23 +146,42 @@ public:
 		if (bodyOid == 0 || !isEnabled())
 			return;
 		Locker lock(&mutexStorage());
-		VectorMap<uint64, SimBotAreaAttackProtected>& points = pointsStorage();
-		if (!points.contains(bodyOid)) {
-			while (points.size() >= MAX_TRACKED) {
-				int oldest = 0;
-				for (int i = 1; i < points.size(); ++i) {
-					if (points.elementAt(i).getValue().updatedMs <
-							points.elementAt(oldest).getValue().updatedMs)
-						oldest = i;
-				}
-				points.remove(oldest);
-			}
-			points.put(bodyOid, SimBotAreaAttackProtected());
-		}
-		SimBotAreaAttackProtected& point = points.get(bodyOid);
+		SimBotAreaAttackProtected& point = ensureEntryLocked(bodyOid);
 		point.x = x;
 		point.y = y;
+		point.protectedPoint = true;
 		point.updatedMs = System::getMiliTime();
+	}
+
+	static void setForbidArea(uint64 bodyOid, bool value) {
+		if (bodyOid == 0)
+			return;
+		Locker lock(&mutexStorage());
+		SimBotAreaAttackProtected& point = ensureEntryLocked(bodyOid);
+		point.forbidArea = value;
+		point.updatedMs = System::getMiliTime();
+	}
+
+	static void beginSpin(uint64 bodyOid) {
+		if (bodyOid == 0)
+			return;
+		Locker lock(&mutexStorage());
+		SimBotAreaAttackProtected& point = ensureEntryLocked(bodyOid);
+		point.x = 0.f;
+		point.y = 0.f;
+		point.protectedPoint = false;
+		point.forbidArea = false;
+		point.updatedMs = System::getMiliTime();
+		point.preferArea = true;
+	}
+
+	static void endSpin(uint64 bodyOid) {
+		if (bodyOid == 0)
+			return;
+		Locker lock(&mutexStorage());
+		if (!pointsStorage().contains(bodyOid))
+			return;
+		pointsStorage().get(bodyOid).preferArea = false;
 	}
 
 	static void release(uint64 bodyOid) {
@@ -146,6 +190,7 @@ public:
 	}
 
 	static bool lookup(uint64 bodyOid, float& x, float& y) {
+		// The protected point follows the F_0.9.8d gate; the pull/spin flags do not.
 		if (!isEnabled())
 			return false;
 		Locker lock(&mutexStorage());
@@ -153,13 +198,43 @@ public:
 		if (!points.contains(bodyOid))
 			return false;
 		const SimBotAreaAttackProtected& point = points.get(bodyOid);
+		if (!point.protectedPoint)
+			return false;
 		x = point.x;
 		y = point.y;
 		return true;
 	}
 
+	static bool getFlags(uint64 bodyOid, bool& forbidArea, bool& preferArea) {
+		forbidArea = false;
+		preferArea = false;
+		Locker lock(&mutexStorage());
+		if (!pointsStorage().contains(bodyOid))
+			return false;
+		const SimBotAreaAttackProtected& point = pointsStorage().get(bodyOid);
+		forbidArea = point.forbidArea;
+		preferArea = point.preferArea;
+		return true;
+	}
+
+	static bool forbidsArea(uint64 bodyOid) {
+		bool forbidArea = false;
+		bool preferArea = false;
+		getFlags(bodyOid, forbidArea, preferArea);
+		return forbidArea;
+	}
+
+	static bool prefersArea(uint64 bodyOid) {
+		bool forbidArea = false;
+		bool preferArea = false;
+		getFlags(bodyOid, forbidArea, preferArea);
+		return preferArea;
+	}
+
 	static void recordSkip() { skipsStorage().increment(); }
 	static uint64 skips() { return skipsStorage().get(); }
+	static void recordForbidSkip() { forbidSkipsStorage().increment(); }
+	static uint64 forbidSkips() { return forbidSkipsStorage().get(); }
 };
 
 #endif /* SIMBOTAREAATTACKGUARD_H_ */

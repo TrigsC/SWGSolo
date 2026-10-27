@@ -102,6 +102,7 @@ private:
 	uint64 groupMissionEntryId = 0;
 	uint64 groupMissionPlanId = 0;
 	uint64 groupMissionLairOid = 0;
+	Vector3 groupMissionLairPosition;
 	int groupMissionKind = PLAYER_BOT_GROUP_MISSION_BOT_OFFER;
 	uint64 groupMissionLastAssistMs = 0;
 	uint64 groupMissionLastLairScanMs = 0;
@@ -233,8 +234,32 @@ private:
 	// deliberately narrower than the travel-combat lease: it is raised only for
 	// the fallback walk back to the leader's slot.
 	std::atomic<bool> groupFallbackMoveActive{false};
+	std::atomic<bool> groupPullReturnActive{false};
+	// Spin walk to the lair while already in combat (G4 spin mode).
+	std::atomic<bool> groupSpinApproachActive{false};
+	// "back off": walk away from the suppressed lair while still fighting.
+	std::atomic<bool> groupBackOffMoveActive{false};
+	// Set while this bot spins a lair (read by onTick on another thread).
+	std::atomic<bool> groupSpinEngaged{false};
 	Vector3 groupLastPathTarget;
 	uint64 groupLastPathIssuedMs = 0;
+	Vector3 groupPullLastPathTarget;
+	uint64 groupPullLastPathIssuedMs = 0;
+	uint64 groupPullOrderGeneration = 0;
+	uint64 groupPullTargetOid = 0;
+	SimBotGroupTactics::PullStage groupPullStage =
+		SimBotGroupTactics::APPROACH;
+	uint64 groupPullStartedAtMs = 0;
+	uint64 groupPullTaggedAtMs = 0;
+	uint64 groupPullLastReturnDiagMs = 0;
+	bool groupPullTagIssued = false;
+	bool groupPullTargetPack = false;
+	String groupPullTargetName;
+	uint64 groupSpinLairOid = 0;
+	uint64 groupBackOffLairOid = 0;
+	uint64 groupSpinSeenBackOffMs = 0;
+	uint64 groupSpinBackOffLairOid = 0;
+	uint64 groupSpinApproachStartedMs = 0;
 	uint64 groupTravelRouteEpoch = 0;
 	bool groupTravelLegIntraPlanet = false;
 	bool groupBuffActive = false;
@@ -357,6 +382,22 @@ private:
 	void setPhase(HuntPhase next);
 	void suspendRoutineForGroup(const String& reason);
 	void runGroupTick(AiAgent* hunter, uint64 nowMs);
+	bool runGroupTacticOrder(AiAgent* hunter, uint64 nowMs,
+		const PlayerBotGroupRecord& record,
+		const SimPlayerManager::PlayerBotGroupSnapshot& group,
+		const PlayerBotGroupTacticsState& tacticsState,
+		const ManagedReference<CreatureObject*>& selfAttacker);
+	bool runGroupPull(AiAgent* hunter, uint64 nowMs,
+		const PlayerBotGroupRecord& record,
+		const SimPlayerManager::PlayerBotGroupSnapshot& group,
+		const ManagedReference<CreatureObject*>& selfAttacker);
+	void dropGroupPullChase(AiAgent* hunter, uint64 targetOid);
+	void beginGroupPullReturn(AiAgent* hunter, uint64 leaderOid, uint64 nowMs);
+	bool runGroupSpin(AiAgent* hunter, uint64 nowMs,
+		const PlayerBotGroupRecord& record,
+		const PlayerBotGroupingConfig& groupingConfig);
+	void finishGroupPull(const PlayerBotGroupRecord& record,
+		const String& outcome, const String& lineKey, bool timedOut = false);
 	struct GroupTravelTarget {
 		String planet;
 		Vector3 position;
@@ -379,6 +420,7 @@ private:
 	void beginGroupMission(const PlayerBotGroupMissionContext& context);
 	void finishGroupMission(const String& outcome);
 	void cancelGroupMission();
+	void endGroupSpin();
 	bool missionContextActive() const {
 		return (orderActive && missionHuntOrder) ||
 			(groupMissionActive && groupMissionIsHolder);
@@ -445,6 +487,7 @@ private:
 	bool beginNextMissionOffer();
 	bool beginMarketRelocationLeg();
 	void engageMissionLair();
+	bool engageGroupLair(AiAgent* hunter, uint64 lairOid);
 	void disengageMissionLair();
 	void beginMissionCleanup(bool abandoned, const String& reason);
 	void continueAfterMissionCleanup();

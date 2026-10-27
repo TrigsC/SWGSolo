@@ -36,6 +36,7 @@
 #include "server/zone/objects/creature/simplayer/SimBotArmorLoadout.h"
 #include "server/zone/objects/creature/simplayer/SimBotConsumables.h"
 #include "server/zone/objects/creature/simplayer/SimBotGrouping.h"
+#include "server/zone/objects/creature/simplayer/SimBotGroupTactics.h"
 #include "server/zone/objects/creature/simplayer/SimBotGroupRally.h"
 #include "server/zone/objects/creature/simplayer/SimBotGroupMission.h"
 #include "server/zone/objects/creature/simplayer/SimBotParityRunPolicy.h"
@@ -148,6 +149,8 @@ struct SimBotPreparedArmorCopy {
 };
 
 struct PlayerBotGroupMissionsConfig {
+	// G4: a holder leading to its revealed lair stops this far out (at least).
+	float leadStopMeters = 40.f;
 	int maxGrabCount = 20;
 	int bearingToleranceDeg = 22;
 	float holdShortMeters = 60.f;
@@ -174,6 +177,34 @@ struct PlayerBotGroupMissionsConfig {
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
 
+struct PlayerBotGroupTacticsConfig {
+	float pullRadiusMeters = 64.f;
+	int pullTimeoutSeconds = 45;
+	int tagTimeoutSeconds = 8;
+	float spinStartMeters = 20.f;
+	float spinStandMeters = 4.f;
+	int pullReplyCooldownSeconds = 3;
+	SimBotGroupTactics::TacticVocabulary vocabulary;
+	Vector<String> pullingLines;
+	Vector<String> pullNothingLines;
+	Vector<String> pullBackLines;
+	Vector<String> pullFailedLines;
+	Vector<String> spinYesLines;
+	Vector<String> spinYesNoBuffsLines;
+	Vector<String> spinNoLines;
+	Vector<String> spinOnLines;
+	Vector<String> spinOffLines;
+	Vector<String> ateFoodLines;
+	Vector<String> fullAlreadyLines;
+	Vector<String> noFoodLines;
+	Vector<String> backOffLines;
+	Vector<String> pullingPackLines;
+	Vector<String> lairAttackLines;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
 // F_0.9.15 G1: the Lua grouping block is copied into one manager-owned
 // snapshot.  The policy header stays pure; this mirror is the boundary where
 // Lua validation and the future room/controller work meet.
@@ -183,7 +214,9 @@ struct PlayerBotGroupingConfig {
 	// grouping master gate and ships disabled.
 	bool directivesEnabled = false;
 	bool missionsEnabled = false;
+	bool tacticsEnabled = false;
 	PlayerBotGroupMissionsConfig missions;
+	PlayerBotGroupTacticsConfig tactics;
 	String roomName = "LFB";
 	String roomTitle = "Looking For Bot: PlayerBots listen here";
 	int offerTtlSeconds = 180;
@@ -284,6 +317,11 @@ struct PlayerBotGroupRecord {
 	uint64 leaderOfflineSinceMs = 0;
 	bool rebuffNotifiedThisVisit = false;
 	uint64 outsideCitySinceMs = 0;
+	SimBotGroupTactics::TacticOrder tacticOrder =
+		SimBotGroupTactics::ORDER_NONE;
+	SimBotGroupTactics::PullStage pullStage = SimBotGroupTactics::APPROACH;
+	uint64 tacticOrderGeneration = 0;
+	uint64 pullTargetOid = 0;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -482,6 +520,43 @@ struct PlayerBotGroupingDirectiveCounters {
 	uint64 shuttleFailed = 0;
 	uint64 shuttleSuppressed = 0;
 	uint64 routeEpochMismatch = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotGroupTacticsState {
+	bool spinMode = false;
+	uint64 spinSetAtMs = 0;
+	uint64 spinSuppressedLairOid = 0;
+	// When the leader last said "back off"; a bot suppresses the lair it was
+	// spinning then, until a later spin-on (spinSetAtMs) re-arms it.
+	uint64 backOffAtMs = 0;
+	// "attack the lair" (spin go); a later back off or spin-on/off supersedes it.
+	uint64 spinGoAtMs = 0;
+	// The one lair "attack the lair" names (0: none near the leader).
+	uint64 spinGoLairOid = 0;
+	uint64 leaderOid = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotGroupTacticCounters {
+	uint64 pullOrders = 0;
+	uint64 pullsReturned = 0;
+	uint64 pullsNoTarget = 0;
+	uint64 pullsTimedOut = 0;
+	uint64 spinPolls = 0;
+	uint64 spinPollReplies = 0;
+	uint64 spinModeOn = 0;
+	uint64 spinModeOff = 0;
+	uint64 spinEngages = 0;
+	uint64 eatOrders = 0;
+	uint64 eatAte = 0;
+	uint64 eatAlreadyFed = 0;
+	uint64 eatNoFood = 0;
+	uint64 tacticsRejectedGate = 0;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -986,6 +1061,8 @@ struct SimBotBodyProgression {
 	Vector<String> skills;
 	VectorMap<String, int> modDeltas;
 	Vector<String> abilities;
+	bool hasAreaAbility = false;
+	String areaAbility;
 	Vector<String> supersededAbilities;
 	Vector<String> excludedAbilities;
 	bool abilitiesApplicable = false;
@@ -993,6 +1070,18 @@ struct SimBotBodyProgression {
 	bool abilityPreferFreeState = true;
 	float abilityHamReserve = 0.40f;
 	int abilityFreeStateRetrySeconds = 10;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotFoodResult {
+	Vector<String> items;
+	int dosesEaten = 0;
+	String reason = "no_food";
+
+	bool ate() const { return reason == "ate"; }
+	bool alreadyFed() const { return reason == "already_fed"; }
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -3169,6 +3258,7 @@ private:
 	// GroupObject lock. Identity-scoped harness overrides are rechecked by the
 	// deferred payment path, never from that stock lock.
 	std::atomic<bool> playerBotGroupMissionsActive{false};
+	std::atomic<bool> playerBotGroupTacticsActive{false};
 	std::atomic<bool> playerBotMissionCreditsActive{false};
 	std::atomic<uint32> playerBotLfbRoomId{0};
 	Mutex playerBotGroupingRoomMutex;
@@ -3182,6 +3272,9 @@ private:
 	Vector<PlayerBotGroupingKillXpObservation> playerBotGroupingRecentKillXp;
 	VectorMap<uint64, PlayerBotGroupOffer> playerBotGroupOffers;
 	VectorMap<uint64, PlayerBotGroupRecord> playerBotGroupRecords;
+	VectorMap<uint64, PlayerBotGroupTacticsState> playerBotGroupTacticsStates;
+	PlayerBotGroupTacticCounters playerBotGroupingTacticCounters;
+	VectorMap<uint64, uint64> playerBotGroupingTacticsDiagAtMs;
 	VectorMap<uint64, PlayerBotGroupDirective> playerBotGroupDirectives;
 	VectorMap<uint64, PlayerBotGroupRoute> playerBotGroupRoutes;
 	VectorMap<uint64, PlayerBotGroupMissionPlan> playerBotGroupMissionPlans;
@@ -3634,6 +3727,7 @@ private:
 	bool playerBotParityTestGroupingGateOverride = false;
 	VectorMap<uint64, bool> playerBotParityDirectivesGateOverrides;
 	VectorMap<uint64, bool> playerBotParityMissionsGateOverrides;
+	VectorMap<uint64, bool> playerBotParityTacticsGateOverrides;
 	VectorMap<uint64, bool> playerBotParityForceGroupShuttleFailure;
 	bool playerBotParityTestMissionCreditGateOverrideActive = false;
 	bool playerBotParityTestMissionCreditGateOverride = false;
@@ -4942,7 +5036,8 @@ public:
 	int getTravelDiagHeartbeatSeconds() const {
 		return travelDiagHeartbeatSeconds;
 	}
-	void consumePlayerBotFoodBeforeEngage(uint64 identityId, AiAgent* agent);
+	PlayerBotFoodResult consumePlayerBotFoodBeforeEngage(uint64 identityId,
+		AiAgent* agent, bool force = false);
 
 private:
 	bool getNearestRoutableCity(const String& planet, const Vector3& from,
@@ -5535,6 +5630,11 @@ public:
 		String& grindXpType);
 	Vector<ManagedReference<CreatureObject*> > lairObserverSnapshot(
 		uint64 bodyOid, uint64 expectedLairOid);
+	ManagedReference<LairObserver*> resolveLairObserver(uint64 lairOid);
+	Vector<ManagedReference<CreatureObject*> > snapshotLairMembers(uint64 lairOid);
+	bool getPlayerBotBodyProgressionSnapshot(uint64 identityId,
+		SimBotBodyProgression& snapshot);
+	int getPlayerBotWornArmorPieces(uint64 identityId) const;
 	void recordPveHunterKill(uint64 identityId, uint64 bodyOid,
 		uint64 targetOid, const String& harvestKind,
 		const String& requestedResourceType, bool participantVerified);
@@ -5843,6 +5943,13 @@ public:
 	bool hasPlayerBotGroupingState(uint64 identityId) const;
 	bool getPlayerBotGroupRecord(uint64 identityId,
 		PlayerBotGroupRecord& record) const;
+	bool completePlayerBotGroupTacticOrder(uint64 identityId,
+		uint64 orderGeneration);
+	bool updatePlayerBotGroupTacticPullStage(uint64 identityId,
+		uint64 orderGeneration, SimBotGroupTactics::PullStage stage,
+		uint64 pullTargetOid = 0);
+	bool getPlayerBotGroupTacticsState(uint64 groupId,
+		PlayerBotGroupTacticsState& state) const;
 	bool snapshotPlayerBotGroup(uint64 groupId,
 		PlayerBotGroupSnapshot& snapshot) const;
 	bool isPlayerBotGroup(uint64 groupId) const;
@@ -5867,6 +5974,7 @@ public:
 		const String& detail = String());
 	bool isPlayerBotGroupDirectivesActive(uint64 identityId) const;
 	bool isPlayerBotGroupMissionsActive(uint64 identityId) const;
+	bool isPlayerBotGroupTacticsActive(uint64 identityId) const;
 	void getGroupBotMissionTargets(uint64 groupOid, uint32 planetCRC,
 		Vector<PlayerBotGroupMissionWaypointTarget>& targets,
 		Vector<uint64>& skippedPlayerMissionOids) const;
@@ -5920,6 +6028,10 @@ public:
 		const String& detail = String());
 	void recordPlayerBotGroupingDirectiveEvent(uint64 identityId,
 		const String& detail);
+	void recordPlayerBotGroupingTacticEvent(uint64 identityId,
+		const String& detail);
+	void recordPlayerBotGroupingTacticOutcome(uint64 identityId,
+		const String& outcome);
 	void recordPlayerBotGroupingBuffEvent(uint64 identityId,
 		const String& detail);
 	void recordPlayerBotGroupingShuttleEvent(uint64 identityId,

@@ -2,6 +2,7 @@
 
 | Version | Week | Commit Message |
 | --- | --- | --- |
+| `0.9.19` | 16 | F_0.9.18 P.10p G4: group tactics — "Paki, pull" brings one lair creature back to the leader (ranged bots shoot on the run), "who has spin" polls, spin mode sends bots with an area attack onto an aggro lair or the one lair named by "attack the lair" through every wave with back-off and off switches, and "take foods" makes grouped bots eat; the area-attack lair guard covers every member; G3 fixes from the owner's client passes keep follow sticky, complete a destroyed lair's mission, hold the current lair until it dies, let buffs interrupt a run and stop the holder 40 m short; no schema change; gate default-off |
 | `0.9.18` | 15 | F_0.9.17 P.10p G3: group missions — the leader says "grab 2 bol missions to the W": bots with room (the server per-player mission limit, now Core3.MissionManager.MaxActiveMissions) grab matching missions at a terminal and post their coordinates, the stock Nearest-mission-for-group waypoint also covers bot missions, the group holds short until the leader arrives, the holder reveals and leads to the real lair spawn, bots defend and assist the leader's target without new tactics, rewards split like a player group within 128 m with bot shares journaled, and a cloned bot asks before buffing; the parity harness gains onlyScenarios, continueOnFailure, maxRunMinutes and failClass; no schema change; gate default-off |
 | `0.9.17` | 15 | F_0.9.16 P.10p G2: rally and buffs — the group leader directs grouped PlayerBots in chat ("get buffs and meet at the Mos Eisley cantina", "meet at the starport", "follow me"): bots plan on their own body, buff in the meet city, their current city or the buffer city on the way, travel there (same-planet shuttles when they save 1 km), hold with a ready line until the leader arrives, answer unknown places with "Where's that?", and mention low buffs once per city visit; directives survive death and re-plan from the clone; no schema change; gate default-off |
 | `0.9.16` | 15 | F_0.9.15 P.10p G1: Looking For Bot — players /join an LFB room that roster PlayerBots watch, free bots answer matching requests with staggered offers, /invite is accepted only from the player a bot offered itself to, and grouped bots drop their routine, follow the leader loosely, travel to them across planets, defend themselves and the group but never join GCW fights, answer status and leave in group chat, rejoin after cloning and release on kick, disband or leader logout; no schema change; gate default-off |
@@ -37,6 +38,11 @@
 
 # Changelog Summary
 
+- **v0.9.19 (Group tactics, F_0.9.18 P.10p G4 - Week 16, 27-10-2026)**:
+  - **Pull.** "Paki, pull" (or just "pull"): a bot walks to one creature of the current lair, tags it from its own weapon reach and brings it back to the leader; ranged bots keep shooting on the way, and a pack that follows counts as a good pull.
+  - **Spin.** "who has spin" polls; "spin the lair" turns spin mode on: bots with an area attack join an aggro lair the leader is at and spin through every wave. "attack the lair" sends them into that one lair now. "back off" turns them away; "no spin" / "stop spinning" turns it off. Bots never touch a quiet lair.
+  - **Take foods.** "take foods" / "eat": every grouped bot eats what it carries and says what it ate.
+  - **Group-mission fixes from the client passes.** "follow" mid-run no longer freezes the bots or strands the next mission; the group stays on a standing lair; "get buffs" interrupts a run cleanly; the holder stops 40 m short of the lair.
 - **v0.9.18 (Group missions, F_0.9.17 P.10p G3 - Week 15, 22-10-2026)**:
   - **Grab missions in group chat.** "grab 2 bol missions to the W": bots with room grab matching missions (the server mission limit is now one setting for players and bots) and post their coordinates.
   - **The stock group waypoint.** "Nearest mission for group" now includes bot missions; the bots go where it points.

@@ -702,6 +702,10 @@ class AiAgent extends CreatureObject {
 
 	@local
 	@preLocked
+	public native string findPreferredAreaAbilityForTarget();
+
+	@local
+	@preLocked
 	public native boolean selectNamedSpecialAttack(final string command);
 
 	@local

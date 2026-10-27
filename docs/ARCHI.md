@@ -130,6 +130,7 @@ CMake options: `BUILD_IDL`, `COMPILE_TESTS`, `ENABLE_ASAN`/`TSAN`/`UBSAN`. Debug
 | F_0.9.14 (v0.9.15) | `consumablesEnabled`, `consumables` (`bazaarRestock`, `minDoses` 10, `minRecheckSeconds`, `noDoseRetrySeconds`, `restockScanIntervalMinutes`, `maxRestockLoadsPerVisit`, `restockSpendFraction`, `items` = `{template, maxPricePerDose, minDoses?}`: Vasarian brandy, pikatta pie, crispic) |
 | F_0.9.15 (v0.9.16) | `groupingEnabled`, `grouping` (`roomName` LFB, offer TTL 180 s, `defaultReplies` 2, `maxRepliesCap`, reply delays/gap, `availabilityChancePercent`, request cooldown and room rate, `maxGroupedBots` 10, `maxBotsPerLeader` 9, join delay, `followMinMeters`/`followMaxMeters`, `repathMoveMeters` 3, `followTickMs` 750, `routeDistanceMeters`, `maxReplansPer10Min`, `assistRadiusMeters`, `leaderOfflineGraceSeconds`, `vocabulary` roles/gear/tiers/status/leave, `lines`) |
 | F_0.9.17 (v0.9.18) | `grouping.missionsEnabled` (false), `grouping.missions` (`maxGrabCount` 20 sanity cap, `bearingToleranceDeg` 22, `holdShortMeters` 60, `missionTimeoutMinutes`, `grabBatchTimeoutSeconds`, `assistLeaderTarget`/`assistLeaderRadiusMeters`), `vocabulary.mission` (grab, mission/lair nouns, run, skip, directions), mission and `clonedNoBuffs` lines; `bin/conf/config.lua` `Core3.MissionManager.MaxActiveMissions` (2); harness `playerBotParityTest.onlyScenarios`/`continueOnFailure`/`maxRunMinutes` |
+| F_0.9.18 (v0.9.19) | `grouping.tacticsEnabled` (false), `grouping.tactics` (`pullRadiusMeters` 64, `pullTimeoutSeconds` per phase, `tagTimeoutSeconds`, `spinStartMeters` 20, `spinStandMeters`), `vocabulary.tactics` (pull, spinPoll, spinOn, spinOff, eat, backOff, lairAttack), tactic lines, `grouping.missions.leadStopMeters` (40) |
 | F_0.9.16 (v0.9.17) | `grouping.directivesEnabled` (false), `buffCities`, rally `rallyArriveMeters`/`Min`/`Max`/`ReleaseMeters`/`HoldMaxMinutes`, `shuttleMinSavingsMeters` 1000, `rebuffCheckSeconds`/`rebuffVisitResetSeconds`, `groupBuffTimeoutSeconds` 600, line delays, `vocabulary.follow`/`ready`/`rally` (buff, meet, landmarks), `places` (cities, outposts, custom x/y), rally `lines` |
 
 The sim layer alone restores roster PlayerBot weapon-template stats after shared AI weapon-stat
@@ -906,6 +907,26 @@ Layered on the stock `AiAgent`/`CreatureObject` hierarchy. Living design docs:
     A new order must wake the bot (`notifyGroupingStateChanged`); a tick booked minutes ahead hides it.
   - **Live receipt:** scoped accumulated evidence plus the owner's in-client approval
     (`docs/4-unit-tests/live_f0917-*`).
+- **Group tactics (P.10p G4 / F_0.9.18, released v0.9.19)**: pull, spin, take foods.
+  - **Orders and settings.** `SimBotGroupTactics.h` parses (tactic tier after LEAVE/FOLLOW and missions); per-bot
+    orders (`tacticOrder` + generation, compare-and-set completion) and a per-group `PlayerBotGroupTacticsState`
+    (spin mode, back-off time, the one lair "attack the lair" names, bound by the manager when said).
+  - **Pull** is a sub-mode (`APPROACH → TAG → RETURN`, per-phase budgets) in `runGroupTick`: lair members only,
+    single-target (`SimBotAreaAttackGuard` `forbidArea`), and the walk back replaces the path at once and drops
+    the bot's own chase each tick (ranged weapons fight on the run).
+  - **Spin** (`runGroupSpin`, any group stage): only within 64 m of a lair the leader is at, and only when the lair
+    is aggro or named by "attack the lair" (owner rule: never a quiet lair). Engagement sets `preferArea`, picked
+    in `SimpleActions.h` before the special roll (`AiAgent::findPreferredAreaAbilityForTarget`).
+  - **Two threads defend.** `runActiveTick` and `onTick` both run self-defence; a G4 walk-away (pull return,
+    back off) or a spin must be exempted on **both**, through atomics (`groupPullReturnActive`,
+    `groupBackOffMoveActive`, `groupSpinEngaged`, raised before combat starts). Missing the `onTick` side
+    re-pinned the bot every few seconds.
+  - **An arrival radius never stops an in-flight path.** Aim a path at the stop point (holder lead: 40 m short),
+    never at the object.
+  - **G3 plan fixes from the client passes.** The nearest-mission refresh publishes only while the plan runs,
+    never over a G2 trip, and never switches away from a standing lair; a destroyed lair completes its entry
+    manager-side (idempotent) and resumes the run; only the holder carries the solo lair fields.
+  - **Live receipt:** scoped harness plus 11 log-diagnosed client-pass fixes (`docs/4-unit-tests/live_f0918-*`).
 - **Simulation-only policy, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line
@@ -1014,6 +1035,9 @@ flowchart LR
   runs scoped to the code a release touches: `onlyScenarios`, `continueOnFailure`, `maxRunMinutes`
   and `failClass` (environment = harness fixture or a borrowed bot killed by a non-scenario creature).
   The Mos Eisley stand-in spot has wild city creatures; `assertLedger` is a one-shot read (flush first).
+- **A harness proves the parts, the client proves the flow.** G4 passed its scoped harness, then the owner's
+  client passes found 11 defects in how pull, spin and group missions interact. Read `missiondiag.log` before
+  each fix; when a decision is invisible, add a rate-limited reason line (`spin_check`) before guessing.
 - **A harness kill must use `KillCommand` lock order**: killer locked, victim cross-locked. Locking
   only the victim made `notifyDestruction` spin cross-locking the destructor and hung the server
   (F_0.9.15, diagnosed from a GDB thread dump).

@@ -395,6 +395,25 @@ inline bool containsKeyword(const std::vector<String>& tokens,
 	return false;
 }
 
+inline bool isRallyFiller(const String& token) {
+	return token == "out" || token == "front" || token == "of" ||
+		token == "at" || token == "the" || token == "lets" ||
+		token == "let" || token == "and" || token == "please" ||
+		token == "to" || token == "me" || token == "get" ||
+		token == "then" || token == "us" || token == "we" || token == "all" ||
+		token == "everyone" || token == "guys" || token == "now";
+}
+
+inline std::vector<String> removeRallyFillers(
+		const std::vector<String>& tokens) {
+	std::vector<String> result;
+	for (size_t i = 0; i < tokens.size(); ++i) {
+		if (!isRallyFiller(tokens[i]))
+			result.push_back(tokens[i]);
+	}
+	return result;
+}
+
 inline bool parsePositiveInt(const String& token, int& value) {
 	const char* text = token.toCharArray();
 	if (text == nullptr || *text == '\0')

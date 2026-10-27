@@ -447,7 +447,7 @@
       <div class="playerbot-card"><h3>LOADOUT</h3>${loadoutCurrent}<p class="playerbot-label">WEAPON CANDIDATES (${num(loadoutCandidates.length)}) · PROTECTED ${num(loadoutProtected.length)}</p>${table(["OID", "Template", "XP Type", "DPS", "Certified", "Protected"], loadoutCandidateRows, { scrollKey: "playerbot-loadout", tall: true })}</div>
       <div class="playerbot-card"><h3>ARMOR</h3><p class="playerbot-label">${chip(armor.enabled ? "gate on" : "gate off", armor.enabled ? "ok" : "ghost")} · ${chip(armor.simBotWornArmor ? "player mitigation" : "not flagged", armor.simBotWornArmor ? "teal" : "ghost")} · ${esc(armor.blockedReason || "no blocker")}</p>${kvRows([["Buffed pools", Object.entries(armor.buffedPools || {}).filter(([, value]) => value).map(([key]) => labelize(key)).join(", ") || "none"], ["Total encumbrance", num(armor.totalEncumbrance)], ["Mitigated total", num(armor.mitigatedTotal)], ["Race CRC", armor.bodyRaceCrc || "unknown"]])}${table(["Source OID", "Copy OID", "Slot", "Template", "Rating", "Condition", "State"], armorRows, { scrollKey: "playerbot-armor", tall: true })}<p class="playerbot-label">DESIRED SET (${num(armorDesired.length)})</p>${table(["Slot", "OID", "Template", "Score", "Status", "Usability"], armorDesiredRows, { scrollKey: "playerbot-armor-desired" })}</div>
       <div class="playerbot-card"><h3>FOOD &amp; DRINK</h3><p class="playerbot-label">${kvRows([["Food fill", `${num((consumables.stomach || {}).food)} / ${num((consumables.stomach || {}).max)}`], ["Drink fill", `${num((consumables.stomach || {}).drink)} / ${num((consumables.stomach || {}).max)}`], ["Next check", `${num(consumables.nextCheckInSeconds)}s`], ["Last consumed", consumables.lastConsumed && consumables.lastConsumed.template ? esc(consumables.lastConsumed.template) : "none"]])}</p>${table(["Template", "Doses", "Stacks", "Buff", "Remaining"], consumableRows, { scrollKey: "playerbot-consumables" })}</div>
-      <div class="playerbot-card"><h3>GROUPING</h3>${kvRows([["State", labelize(grouping.state || grouping.kind || "free")], ["Leader", grouping.leader || grouping.playerOid || "none"], ["Group", grouping.groupOid || "none"], ["Generation", num(grouping.generation)], ["Directive", grouping.directive ? labelize(grouping.directive.stage || "unknown") : "none"], ["Place", grouping.directive && grouping.directive.place ? grouping.directive.place : "none"], ["Buff city", grouping.directive && grouping.directive.buffCity ? grouping.directive.buffCity : "none"], ["Directive age", grouping.directive ? ago(grouping.directive.sinceSeconds) : "—"], ["Offer expires", grouping.expiresAtMs ? new Date(Number(grouping.expiresAtMs)).toLocaleTimeString() : "—"]])}</div>
+      <div class="playerbot-card"><h3>GROUPING</h3>${kvRows([["State", labelize(grouping.state || grouping.kind || "free")], ["Leader", grouping.leader || grouping.playerOid || "none"], ["Group", grouping.groupOid || "none"], ["Generation", num(grouping.generation)], ["Directive", grouping.directive ? labelize(grouping.directive.stage || "unknown") : "none"], ["Place", grouping.directive && grouping.directive.place ? grouping.directive.place : "none"], ["Buff city", grouping.directive && grouping.directive.buffCity ? grouping.directive.buffCity : "none"], ["Directive age", grouping.directive ? ago(grouping.directive.sinceSeconds) : "—"], ["Tactic", labelize(grouping.tacticOrder || "none")], ["Pull stage", labelize(grouping.pullStage || "approach")], ["Spin", grouping.tactics && grouping.tactics.spinMode ? "on" : "off"], ["Offer expires", grouping.expiresAtMs ? new Date(Number(grouping.expiresAtMs)).toLocaleTimeString() : "—"]])}</div>
       <div class="playerbot-card"><h3>SKILL MODS</h3>${modRows ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Mod</th><th>Base</th><th>Trained</th><th>Effective</th></tr></thead><tbody>${modRows}</tbody></table></div>` : `<span class="muted small">No live skill mods.</span>`}</div>`;
   }
 
@@ -1346,6 +1346,7 @@
       </tr>`;
     }).join("");
     const groupingCounters = grouping.counters || {};
+    const groupingTactics = grouping.tactics || {};
     const groupingDirectives = grouping.directives || {};
     const groupingBuffChoices = groupingDirectives.buffChoice || {};
     const groupingBuffOutcomes = groupingDirectives.buffOutcome || {};
@@ -1390,6 +1391,23 @@
       ])}
       <div class="section-gap"></div>${table(["Group", "", "Entry", "Creature", "State", "Planet"], groupingMissionEntries, { scrollKey: "grouping-missions" })}
     </div>`;
+    const groupingTacticGroups = (groupingTactics.groups || []).map((g) =>
+      `#${esc(g.groupOid || "?")} ${g.spinMode ? "spin on" : "spin off"}${g.spinSuppressedLairOid ? " · lair suppressed" : ""}`).join(" · ") || "none";
+    const groupingTacticsStrip = `<div class="section-gap"></div><div class="missions-strip">
+      <p class="playerbot-label">TACTICS ${chip(groupingTactics.enabled ? "gate on" : "gate off", groupingTactics.enabled ? "ok" : "ghost")}</p>
+      <div class="metric-row">
+        ${metric("Pulls", groupingTactics.pullOrders)} ${metric("Returned", groupingTactics.pullsReturned, { tone: "teal" })}
+        ${metric("No target", groupingTactics.pullsNoTarget)} ${metric("Timed out", groupingTactics.pullsTimedOut, { tone: Number(groupingTactics.pullsTimedOut || 0) ? "warn" : "" })}
+        ${metric("Spin polls", groupingTactics.spinPolls)} ${metric("Poll replies", groupingTactics.spinPollReplies)}
+        ${metric("Spin engages", groupingTactics.spinEngages, { tone: "accent" })} ${metric("Eat orders", groupingTactics.eatOrders)}
+      </div>
+      ${kvRows([
+        ["Spin changes", `${num(groupingTactics.spinModeOn)} on · ${num(groupingTactics.spinModeOff)} off`],
+        ["Food results", `${num(groupingTactics.eatAte)} ate · ${num(groupingTactics.eatAlreadyFed)} already fed · ${num(groupingTactics.eatNoFood)} no food`],
+        ["Gate rejects", num(groupingTactics.tacticsRejectedGate)],
+        ["Groups", groupingTacticGroups]
+      ])}
+    </div>`;
     const groupingOfferRows = (grouping.offers || []).map((o) => `<tr>
       <td><button type="button" class="playerbot-link" data-identity-id="${esc(o.identity)}"><span class="t-main">${esc(o.name || "unknown")}</span><span class="t-sub">${esc(o.identity)}</span></button></td>
       <td>${esc(o.player || "—")}</td><td>${chip(labelize(o.state || "offered"), o.state === "OFFERED" ? "amber" : "teal")}</td>
@@ -1397,7 +1415,7 @@
     </tr>`).join("");
     const groupingBotRows = (grouping.groupedBots || []).map((b) => `<tr>
       <td><button type="button" class="playerbot-link" data-identity-id="${esc(b.identity)}"><span class="t-main">${esc(b.name || "unknown")}</span><span class="t-sub">${esc(b.identity)}</span></button></td>
-      <td>${esc(b.leader || "—")}</td><td>${b.directive ? chip(labelize(b.directive.stage || "unknown"), b.directive.stage === "RALLY_HOLD" ? "teal" : "amber") : chip("none", "ghost")}${b.directive && b.directive.place ? `<span class="t-sub">${esc(b.directive.place)}</span>` : ""}</td><td>${esc(b.state || "GROUPED")}</td><td>${esc(b.planet || "—")}</td>
+      <td>${esc(b.leader || "—")}</td><td>${b.directive ? chip(labelize(b.directive.stage || "unknown"), b.directive.stage === "RALLY_HOLD" ? "teal" : "amber") : chip("none", "ghost")}${b.directive && b.directive.place ? `<span class="t-sub">${esc(b.directive.place)}</span>` : ""}</td><td><span class="t-main">${esc(b.tacticOrder || "NONE")}</span><span class="t-sub">${esc(b.pullStage || "APPROACH")}</span></td><td>${esc(b.state || "GROUPED")}</td><td>${esc(b.planet || "—")}</td>
       <td class="t-num">${b.distanceToLeader == null || Number(b.distanceToLeader) < 0 ? "—" : num(b.distanceToLeader) + "m"}</td><td class="t-num">${num(b.routeLegsLeft)}</td>
     </tr>`).join("");
     const groupingPanel = panel("GROUPS", `${chip(grouping.active ? "gate on" : "gate off", grouping.active ? "ok" : "ghost")} · ${esc(grouping.roomName || "LFB")}`, `<div class="metric-row">
@@ -1408,13 +1426,13 @@
       ${metric("Directives", groupingDirectives.issued)} ${metric("Active", Object.values(groupingDirectives.active || {}).reduce((a, v) => a + Number(v || 0), 0), { tone: "accent" })}
       ${metric("Buff choices", Object.values(groupingBuffChoices).reduce((a, v) => a + Number(v || 0), 0))} ${metric("Buff outcomes", Object.values(groupingBuffOutcomes).reduce((a, v) => a + Number(v || 0), 0))}
       ${metric("Shuttles", `${num(groupingShuttles.finished)} / ${num(groupingShuttles.failed)}`, { tone: "teal", raw: true })} ${metric("Epoch mismatch", groupingDirectives.routeEpochMismatch)}
-    </div>${groupingMissionStrip}${kvRows([
+    </div>${groupingTacticsStrip}${groupingMissionStrip}${kvRows([
       ["Rooms / replies", `${num(grouping.roomId)} · ${num(groupingCounters.repliesPosted)} posted / ${num(groupingCounters.repliesScheduled)} scheduled`],
       ["Invite / release", `${num(groupingCounters.invitesAccepted)} accepted · ${num(groupingCounters.joinFailed)} failed · ${Object.values(groupingCounters.releases || {}).reduce((a, v) => a + Number(v || 0), 0)} released`],
       ["Skipped replies", Object.entries(groupingCounters.replySkipped || {}).map(([k, v]) => `${esc(k)} ${num(v)}`).join(" · ") || "none"],
       ["Assist skips", Object.entries(groupingCounters.assistSkipped || {}).map(([k, v]) => `${esc(k)} ${num(v)}`).join(" · ") || "none"],
       ["Recent unmatched", (grouping.recentUnmatched || []).map((line) => esc(line)).join(" · ") || "none"]
-    ])}<div class="section-gap"></div><p class="playerbot-label">OFFERS</p>${table(["Bot", "Player", "State", "Generation", "Expires"], groupingOfferRows, { scrollKey: "grouping-offers" })}<div class="section-gap"></div><p class="playerbot-label">GROUPED BOTS</p>${table(["Bot", "Leader", "Stage", "State", "Planet", "Distance", "Legs left"], groupingBotRows, { scrollKey: "grouping-bots", tall: true })}`, "span-12");
+    ])}<div class="section-gap"></div><p class="playerbot-label">OFFERS</p>${table(["Bot", "Player", "State", "Generation", "Expires"], groupingOfferRows, { scrollKey: "grouping-offers" })}<div class="section-gap"></div><p class="playerbot-label">GROUPED BOTS</p>${table(["Bot", "Leader", "Directive", "Tactic", "State", "Planet", "Distance", "Legs left"], groupingBotRows, { scrollKey: "grouping-bots", tall: true })}`, "span-12");
     const offers = Array.isArray((pve.missionBoard || {}).offers)
       ? pve.missionBoard.offers : [];
     const offerFor = (r) => {

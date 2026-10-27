@@ -4,6 +4,7 @@
 #include "server/zone/objects/creature/ai/bt/Behavior.h"
 #include "server/zone/objects/creature/ai/bt/BlackboardData.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
+#include "server/zone/objects/creature/simplayer/SimBotAreaAttackGuard.h"
 #include "server/zone/objects/creature/simplayer/SimBotAbilityUsageLog.h"
 #include "server/zone/managers/gcw/GCWManager.h"
 #include "server/zone/managers/reaction/ReactionManager.h"
@@ -269,6 +270,12 @@ public:
         }
 
         if (agent->hasSkillDerivedAttacks()) {
+			if (SimBotAreaAttackGuard::prefersArea(agent->getObjectID())) {
+				String preferredArea = agent->findPreferredAreaAbilityForTarget();
+				if (!preferredArea.isEmpty() &&
+						agent->selectNamedSpecialAttack(preferredArea))
+					return SUCCESS;
+			}
             // A free control ability (Intimidate) that the target lacks is used
             // first, before the special roll, then not forced again on that
             // target for the retry window. Checking it only on a missed roll meant

@@ -13,9 +13,10 @@ armor loadout with visible armor, ten species and a fixed look per bot), RELEASE
 (2026-10-18), **F_0.9.14** (P.10o, food and drink), RELEASED as v0.9.15 (2026-10-19), and
 **F_0.9.15** (P.10p, grouping G1, Looking For Bot), RELEASED as v0.9.16 (2026-10-20).
 **F_0.9.17** (P.10p, grouping G3, group missions) is RELEASED as v0.9.18 (2026-10-22), on scoped accumulated evidence plus the owner's in-client approval.
-Next chunk: grouping **G4** (group tactics), before **F_0.9.11** (P.10l, profession allocation policy).
+**F_0.9.18** (P.10p, grouping G4, group tactics) is RELEASED as v0.9.19 (2026-10-27), on the scoped harness plus the owner's in-client approval after 11 log-diagnosed fixes.
+Next chunk: grouping **G5** (healing), before **F_0.9.11** (P.10l, profession allocation policy).
 **Written**: 2026-09-02 (project week 8)
-**Last updated**: 2026-10-22 — F_0.9.17 grouping G3 (group missions) released as v0.9.18
+**Last updated**: 2026-10-27 — F_0.9.18 grouping G4 (group tactics) released as v0.9.19; G5 (healing) next
 
 ## F_0.9.15 — LFB and player grouping (P.10p)
 
@@ -30,7 +31,8 @@ into four owner-approved chunks:
 | **G1** | LFB, offers, invites, grouped behavior, status/leave, release and rejoin | RELEASED v0.9.16 |
 | **G2** | buffs and meet-at-place group trips, readiness and re-buff, intra-planet shuttles (moved from G1) | next grouping chunk |
 | **G3** | group missions, waypoints and reveal/assist callouts | RELEASED v0.9.18 (F_0.9.17) |
-| **G4** | group tactics, spin-attack poll, lair unlock and take-food commands | later |
+| **G4** | group tactics, spin-attack poll, lair unlock and take-food commands | RELEASED v0.9.19 (F_0.9.18) |
+| **G5** | players heal bots; Medic bots heal players and bots with real supplies and medical XP | next |
 
 G1 precedes F_0.9.11; the profession allocator remains the next non-grouping chunk after the
 grouping line.
@@ -65,6 +67,40 @@ mission. The dashboard Groups panel exposes the current entry, plan entries and 
 counters, and leader-assist counters. The disabled parity matrix contains eleven self-contained G3
 scenarios using a stand-in leader and borrowed production bots. The scoped receipt is the gate before
 changing `missionsEnabled` from its shipped default.
+
+## F_0.9.18 — Group tactics (P.10p G4)
+
+G4 is RELEASED as v0.9.19 behind the default-off `grouping.tacticsEnabled` capability. Spin follows the owner rules: bots join only an aggro lair or the one lair named by "attack the lair", with back-off and off switches (see the plan's amendments section).
+The leader can order one bot to pull a single creature back to the group, poll
+for area/cone abilities, persistently enable or disable spin mode, back off a
+current lair, and ask every addressed bot to take food. Pulls are generation-
+bound controller orders with a single-target area guard and a return-to-leader
+combat path. A grouped lair remains protected exactly as in G3 unless spin mode
+is on, the leader is engaged, and the bot has an area-capable attack; only then
+does the bot deliberately engage the lair and prefer its area special.
+
+The Groups dashboard and inspect drawer expose the tactic order, pull stage,
+spin state, suppression and counters. The disabled harness matrix contains six
+G4 scenarios for food results, pull success and no-target behavior, spin polls,
+spin toggling/lifecycle cleanup, and the gate-off rejection path. The shipped
+Lua value stays `tacticsEnabled = false`; the owner receipt remains the gate for
+the live pull and three-wave spin run.
+
+## G5 — Healing decisions recorded for the next chunk
+
+G5 is intentionally not part of G4. Healing works in both directions: players
+heal roster bots with stock medic commands and earn medical XP, while bots with
+Medic boxes heal players and bots and earn their own medical XP, removing
+`medical` from the deferred XP types. Any roster bot is eligible, grouped or
+not, subject to stock non-attackability, faction, line-of-sight, range and
+alive checks; faction rules must refuse the same cases they refuse between
+players. Supplies are real stimpacks from the bot's vault bag, one dose per
+heal, restocked through the existing debit-first bazaar BUY path.
+
+The G5 plan must address the stock blockers found during discovery: the single-
+target heal commands currently redirect non-pet AiAgent targets to the healer,
+area heals filter to players or pets, and `CreatureObjectImplementation::isHealableBy`
+requires a player healer's ghost and uses player-specific faction branches.
 
 ## 0. Mandate
 

@@ -3106,6 +3106,112 @@ String AiAgentImplementation::findFreeStateAbilityForTarget() {
 	return String();
 }
 
+// Player HAM rule plus the skill-ability reserve for a skill-derived special.
+// Same rule as CombatManager::applySpecialAttackCost: only a pool this special
+// spends can push it under the reserve. Shared by the special selector and the
+// G4 spin-mode area preference so the two can never disagree.
+static void skillDerivedSpecialHamRefusal(AiAgent* agent,
+		CombatManager* combatManager, WeaponObject* weapon,
+		const CombatQueueCommand* command, bool& playerRuleRefused,
+		bool& reserveRefused) {
+	playerRuleRefused = false;
+	reserveRefused = false;
+	if (agent == nullptr || combatManager == nullptr || weapon == nullptr ||
+			command == nullptr)
+		return;
+	float healthCost = 0.f;
+	float actionCost = 0.f;
+	float mindCost = 0.f;
+	combatManager->computeSpecialAttackHamCost(agent, weapon,
+		command->getHealthCostMultiplier(), command->getActionCostMultiplier(),
+		command->getMindCostMultiplier(), healthCost, actionCost, mindCost);
+	playerRuleRefused = agent->getHAM(CreatureAttribute::HEALTH) <= healthCost ||
+		agent->getHAM(CreatureAttribute::ACTION) <= actionCost ||
+		agent->getHAM(CreatureAttribute::MIND) <= mindCost;
+	const float reserve = agent->getSkillAbilityHamReserve();
+	reserveRefused =
+		(healthCost > 0.f && static_cast<float>(agent->getHAM(
+			CreatureAttribute::HEALTH)) - healthCost <
+			reserve * agent->getMaxHAM(CreatureAttribute::HEALTH)) ||
+		(actionCost > 0.f && static_cast<float>(agent->getHAM(
+			CreatureAttribute::ACTION)) - actionCost <
+			reserve * agent->getMaxHAM(CreatureAttribute::ACTION)) ||
+		(mindCost > 0.f && static_cast<float>(agent->getHAM(
+			CreatureAttribute::MIND)) - mindCost <
+			reserve * agent->getMaxHAM(CreatureAttribute::MIND));
+}
+
+String AiAgentImplementation::findPreferredAreaAbilityForTarget() {
+	// Spin mode targets the lair itself (a TangibleObject, set by
+	// engageGroupLair through setTargetObject, which sets the follow object), so
+	// any tangible target is ranged; the dead and state checks apply to
+	// creatures only.
+	ManagedReference<SceneObject*> followCopy = getFollowObject().get();
+	if (followCopy == nullptr || !followCopy->isTangibleObject())
+		return String();
+
+	CreatureObject* target = followCopy->asCreatureObject();
+	if (target != nullptr && target->isDead())
+		return String();
+
+	WeaponObject* weapon = getWeapon();
+	if (weapon == nullptr)
+		return String();
+
+	String weaponCategory = getWeaponCategory(weapon);
+	const CreatureAttackMap* attackMap = nullptr;
+	if (weaponCategory == "ranged")
+		attackMap = primaryAttackMap.get();
+	else if (weaponCategory == "melee" || weaponCategory == "saber" ||
+			weaponCategory == "polearm")
+		attackMap = secondaryAttackMap.get();
+	else
+		attackMap = defaultAttackMap.get();
+	if (attackMap == nullptr || attackMap->isEmpty())
+		attackMap = getAttackMap();
+	if (attackMap == nullptr || attackMap->isEmpty())
+		return String();
+
+	ZoneServer* zoneServer = getZoneServer();
+	ObjectController* objectController = zoneServer == nullptr ? nullptr :
+		zoneServer->getObjectController();
+	if (objectController == nullptr)
+		return String();
+
+	CombatManager* combatManager = CombatManager::instance();
+	const float targetDistance = getWorldPosition().distanceTo(
+		followCopy->getWorldPosition());
+	for (int i = 0; i < attackMap->size(); ++i) {
+		const String& commandName = attackMap->getCommand(i);
+		if (commandName.isEmpty() ||
+				!canAffordAttackCommand(asAiAgent(), commandName))
+			continue;
+		const CombatQueueCommand* command = cast<const CombatQueueCommand*>(
+			objectController->getQueueCommand(commandName));
+		if (command == nullptr || (!command->isAreaAction() &&
+				!command->isConeAction()))
+			continue;
+		bool playerRuleRefused = false;
+		bool reserveRefused = false;
+		skillDerivedSpecialHamRefusal(asAiAgent(), combatManager, weapon, command,
+			playerRuleRefused, reserveRefused);
+		if (playerRuleRefused || reserveRefused)
+			continue;
+		const float reach = SimBotAreaAttackGuard::reachMeters(
+			command->isAreaAction(), command->isConeAction(),
+			command->getAreaRange(), command->getConeRange(),
+			command->getRange(), weapon != nullptr,
+			weapon->getMaxRange(), command->isSplashDamage(),
+			weapon->isThrownWeapon() || weapon->isHeavyWeapon());
+		if (reach < 0.f || targetDistance > reach || (target != nullptr &&
+				!validateStateAttack(target, commandName.hashCode())))
+			continue;
+		return commandName;
+	}
+
+	return String();
+}
+
 bool AiAgentImplementation::selectSpecialAttack() {
 	const bool combatDiagLogging = SimCombatDiagLog::isLoggingEnabled();
 	const uint64 combatDiagOid = combatDiagLogging ? getObjectID() : 0;
@@ -3273,32 +3379,10 @@ bool AiAgentImplementation::selectSpecialAttack() {
 				nullptr : cast<const CombatQueueCommand*>(
 					objectController->getQueueCommand(key));
 			if (weapon != nullptr && command != nullptr && combatManager != nullptr) {
-				float healthCost = 0.f;
-				float actionCost = 0.f;
-				float mindCost = 0.f;
-				combatManager->computeSpecialAttackHamCost(asCreatureObject(), weapon,
-					command->getHealthCostMultiplier(),
-					command->getActionCostMultiplier(),
-					command->getMindCostMultiplier(), healthCost, actionCost,
-					mindCost);
-				bool playerRuleRefused = getHAM(CreatureAttribute::HEALTH) <=
-					healthCost || getHAM(CreatureAttribute::ACTION) <= actionCost ||
-					getHAM(CreatureAttribute::MIND) <= mindCost;
-				// Same rule as CombatManager::applySpecialAttackCost: only a pool
-				// this special spends can push it under the reserve.
-				bool reserveRefused =
-					(healthCost > 0.f && static_cast<float>(getHAM(
-						CreatureAttribute::HEALTH)) - healthCost <
-						getSkillAbilityHamReserve() *
-						getMaxHAM(CreatureAttribute::HEALTH)) ||
-					(actionCost > 0.f && static_cast<float>(getHAM(
-						CreatureAttribute::ACTION)) - actionCost <
-						getSkillAbilityHamReserve() *
-						getMaxHAM(CreatureAttribute::ACTION)) ||
-					(mindCost > 0.f && static_cast<float>(getHAM(
-						CreatureAttribute::MIND)) - mindCost <
-						getSkillAbilityHamReserve() *
-						getMaxHAM(CreatureAttribute::MIND));
+				bool playerRuleRefused = false;
+				bool reserveRefused = false;
+				skillDerivedSpecialHamRefusal(asAiAgent(), combatManager, weapon,
+					command, playerRuleRefused, reserveRefused);
 				if (playerRuleRefused || reserveRefused) {
 					++reserveSkipped;
 					if (reserveRefused)
@@ -3313,6 +3397,10 @@ bool AiAgentImplementation::selectSpecialAttack() {
 			// NOT deliberately attacking it.
 			if (command != nullptr &&
 					(command->isAreaAction() || command->isConeAction())) {
+				if (SimBotAreaAttackGuard::forbidsArea(getObjectID())) {
+					SimBotAreaAttackGuard::recordForbidSkip();
+					continue;
+				}
 				float protectedX = 0.f;
 				float protectedY = 0.f;
 				if (SimBotAreaAttackGuard::lookup(getObjectID(), protectedX,

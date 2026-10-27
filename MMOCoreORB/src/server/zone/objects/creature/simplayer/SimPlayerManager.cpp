@@ -115,6 +115,7 @@
 #include "templates/collision/BaseBoundingVolume.h"
 #include "server/zone/objects/region/CityRegion.h"
 #include "server/zone/objects/scene/SceneObjectType.h"
+#include "server/zone/objects/scene/ObserverType.h"
 #include "server/zone/objects/tangible/LairObject.h"
 #include "server/zone/objects/tangible/terminal/mission/MissionTerminal.h"
 #include "server/zone/managers/mission/DestroyMissionLairObserver.h"
@@ -138,6 +139,11 @@ static bool isPlayerBotParityRestartScenario(const String& name) {
 	return name == "retained_record_survives_restart" ||
 		name == "bazaar_restart_probe";
 }
+
+static const char* playerBotGroupingTacticOrderName(
+		SimBotGroupTactics::TacticOrder order);
+static const char* playerBotGroupingPullStageName(
+		SimBotGroupTactics::PullStage stage);
 
 struct PlayerBotObservedVaultItem {
 	uint64 objectId = 0;
@@ -6420,6 +6426,8 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityBorrowedSelectionFailed = false;
 		playerBotParityGroupHarnessLeaderOids.removeAll();
 		playerBotParityDirectivesGateOverrides.removeAll();
+		playerBotParityMissionsGateOverrides.removeAll();
+		playerBotParityTacticsGateOverrides.removeAll();
 		playerBotParityForceGroupShuttleFailure.removeAll();
 		playerBotParityGroupLeaderOid = 0;
 		playerBotParityGroupAttackerOids.removeAll();
@@ -8638,8 +8646,53 @@ SimBotBodyProgression SimPlayerManager::buildBodyProgressionSnapshot(
 	if (snapshot.abilitiesApplicable)
 		SimBotAbilityTiers::collapseAbilityTiers(derivedAbilities,
 			snapshot.abilities, snapshot.supersededAbilities);
+	if (snapshot.abilitiesApplicable && objectController != nullptr) {
+		for (int i = 0; i < snapshot.abilities.size(); ++i) {
+			const String& ability = snapshot.abilities.get(i);
+			const CombatQueueCommand* command = cast<const CombatQueueCommand*>(
+				objectController->getQueueCommand(ability));
+			if (command == nullptr ||
+					(!command->isAreaAction() && !command->isConeAction()))
+				continue;
+			snapshot.hasAreaAbility = true;
+			snapshot.areaAbility = ability;
+			break;
+		}
+	}
 
 	return snapshot;
+}
+
+bool SimPlayerManager::getPlayerBotBodyProgressionSnapshot(
+		uint64 identityId, SimBotBodyProgression& snapshot) {
+	snapshot = SimBotBodyProgression();
+	SimBotIdentity identity;
+	if (identityId == 0 || !snapshotPlayerBotIdentity(identityId, identity))
+		return false;
+	SimBotAbilityApplicability applicability;
+	applicability.gateEnabled = playerBotCombatAbilitiesGateEnabled(identityId);
+	applicability.trainingPlan = identity.trainingPlan;
+	applicability.profession = identity.profession;
+	applicability.harnessOptIn = isPlayerBotCombatAbilityHarnessOptIn(identityId);
+	applicability.specialAttackChancePercent =
+		playerBotCombatAbilityChanceOverride(identityId);
+	snapshot = buildBodyProgressionSnapshot(identityId, applicability);
+	return true;
+}
+
+int SimPlayerManager::getPlayerBotWornArmorPieces(uint64 identityId) const {
+	if (identityId == 0)
+		return 0;
+	int count = 0;
+	Locker progressionLock(const_cast<Mutex*>(&progressionMutex));
+	if (!progressionArmorWorn.contains(identityId))
+		return 0;
+	const Vector<SimBotWornArmorPiece>& worn = progressionArmorWorn.get(
+		identityId);
+	for (int i = 0; i < worn.size(); ++i)
+		if (!worn.get(i).pendingRemoval)
+			++count;
+	return count;
 }
 
 void SimPlayerManager::applyProgressionToBody(AiAgent* agent,
@@ -9046,25 +9099,29 @@ bool SimPlayerManager::removePlayerBotConsumedItem(uint64 identityId,
 	return true;
 }
 
-void SimPlayerManager::consumePlayerBotFoodBeforeEngage(uint64 identityId,
-		AiAgent* agent) {
-	// TODO(P.10 grouping): a group leader's take-food/fight command will call
-	// this same entry point once grouping lands.
-	if (agent == nullptr || !playerBotConsumablesGateEnabled(identityId))
-		return;
+PlayerBotFoodResult SimPlayerManager::consumePlayerBotFoodBeforeEngage(
+		uint64 identityId, AiAgent* agent, bool force) {
+	PlayerBotFoodResult result;
+	if (agent == nullptr)
+		return result;
+	if (!playerBotConsumablesGateEnabled(identityId)) {
+		result.reason = "gate_off";
+		return result;
+	}
 
 	const uint64 nowMs = System::getMiliTime();
 	{
 		Locker progressionLock(&progressionMutex);
-		if (progressionConsumableNextCheckAtMs.contains(identityId) &&
-				progressionConsumableNextCheckAtMs.get(identityId) > nowMs)
-			return;
+		if (!force && progressionConsumableNextCheckAtMs.contains(identityId) &&
+				progressionConsumableNextCheckAtMs.get(identityId) > nowMs) {
+			return result;
+		}
 	}
 
 	SimBotConsumablePolicy policy = snapshotPlayerBotConsumablePolicy();
 	std::vector<SimBotConsumables::HeldStack> stacks;
 	if (!snapshotPlayerBotConsumableStacks(identityId, stacks))
-		return;
+		return result;
 	std::vector<SimBotConsumables::ConsumableEntry> entries;
 	for (int i = 0; i < policy.items.size(); ++i)
 		entries.push_back(policy.items.get(i));
@@ -9075,7 +9132,7 @@ void SimPlayerManager::consumePlayerBotFoodBeforeEngage(uint64 identityId,
 		Locker agentLock(agent);
 		if (agent->isDead() || agent->isIncapacitated() ||
 				agent->getZone() == nullptr)
-			return;
+			return result;
 		for (size_t i = 0; i < entries.size(); ++i) {
 			if (entries[i].buffCrc == 0)
 				continue;
@@ -9211,11 +9268,24 @@ void SimPlayerManager::consumePlayerBotFoodBeforeEngage(uint64 identityId,
 	}
 	for (size_t i = 0; i < lastDoseObjects.size(); ++i)
 		removePlayerBotConsumedItem(identityId, lastDoseObjects[i]);
+	result.dosesEaten = static_cast<int>(applied.size());
+	for (size_t i = 0; i < applied.size(); ++i)
+		result.items.add(applied[i].choice.entry.templatePath);
+	if (!applied.empty()) {
+		result.reason = "ate";
+	} else {
+		bool alreadyFed = false;
+		for (size_t i = 0; i < decision.blocked.size(); ++i)
+			alreadyFed |= decision.blocked[i].reason == "buff_active" ||
+				decision.blocked[i].reason == "stomach_full";
+		result.reason = alreadyFed ? "already_fed" : "no_food";
+	}
 	if (!applied.empty())
 		MissionDiagLog::event("CONSUME", identityId,
 				"food=" + String::valueOf(stomachAfter.food.fill) +
 				" drink=" + String::valueOf(stomachAfter.drink.fill) +
 				" doses=" + String::valueOf(static_cast<int>(applied.size())));
+	return result;
 }
 
 void SimPlayerManager::fillPlayerBotArmorStats(ArmorObject* armor,
@@ -11469,9 +11539,37 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 			"directivesEnabled", groupingConfig.directivesEnabled);
 		groupingConfig.missionsEnabled = grouping.getBooleanField(
 			"missionsEnabled", groupingConfig.missionsEnabled);
+		groupingConfig.tacticsEnabled = grouping.getBooleanField(
+			"tacticsEnabled", groupingConfig.tacticsEnabled);
+		LuaObject tactics = grouping.getObjectField("tactics");
+		if (tactics.isValidTable()) {
+			PlayerBotGroupTacticsConfig& tacticConfig = groupingConfig.tactics;
+			tacticConfig.pullRadiusMeters = clampFloatRange(
+				tactics.getFloatField("pullRadiusMeters",
+					tacticConfig.pullRadiusMeters), 1.f, 256.f);
+			tacticConfig.pullTimeoutSeconds = clampIntRange(
+				tactics.getIntField("pullTimeoutSeconds",
+					tacticConfig.pullTimeoutSeconds), 1, 86400);
+			tacticConfig.tagTimeoutSeconds = clampIntRange(
+				tactics.getIntField("tagTimeoutSeconds",
+					tacticConfig.tagTimeoutSeconds), 1, 3600);
+			tacticConfig.spinStartMeters = clampFloatRange(
+				tactics.getFloatField("spinStartMeters",
+					tacticConfig.spinStartMeters), 1.f, 256.f);
+			tacticConfig.spinStandMeters = clampFloatRange(
+				tactics.getFloatField("spinStandMeters",
+					tacticConfig.spinStandMeters), 1.f, 256.f);
+			tacticConfig.pullReplyCooldownSeconds = clampIntRange(
+				tactics.getIntField("pullReplyCooldownSeconds",
+					tacticConfig.pullReplyCooldownSeconds), 0, 86400);
+		}
+		tactics.pop();
 		LuaObject missions = grouping.getObjectField("missions");
 		if (missions.isValidTable()) {
 			PlayerBotGroupMissionsConfig& missionConfig = groupingConfig.missions;
+			missionConfig.leadStopMeters = clampFloatRange(
+				missions.getFloatField("leadStopMeters",
+					missionConfig.leadStopMeters), 0.f, 128.f);
 			missionConfig.maxGrabCount = clampIntRange(missions.getIntField(
 				"maxGrabCount", missionConfig.maxGrabCount), 1, 32);
 			missionConfig.bearingToleranceDeg = clampIntRange(
@@ -11718,6 +11816,21 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 			}
 			missionVocabulary.pop();
 
+			LuaObject tacticVocabulary = vocabulary.getObjectField("tactics");
+			if (tacticVocabulary.isValidTable()) {
+				SimBotGroupTactics::TacticVocabulary& parsed =
+					groupingConfig.tactics.vocabulary;
+				loadGroupingStringList(tacticVocabulary, "pull", parsed.pull);
+				loadGroupingStringList(tacticVocabulary, "spinPoll", parsed.spinPoll);
+				loadGroupingStringList(tacticVocabulary, "spinOn", parsed.spinOn);
+				loadGroupingStringList(tacticVocabulary, "spinOff", parsed.spinOff);
+				loadGroupingStringList(tacticVocabulary, "eat", parsed.eat);
+				loadGroupingStringList(tacticVocabulary, "backOff", parsed.backOff);
+				loadGroupingStringList(tacticVocabulary, "lairAttack",
+					parsed.lairAttack);
+			}
+			tacticVocabulary.pop();
+
 			LuaObject roles = vocabulary.getObjectField("roles");
 			if (roles.isValidTable()) {
 				groupingConfig.vocabulary.roles.clear();
@@ -11877,6 +11990,36 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 					groupingConfig.missions.missionAllDoneLines);
 			loadGroupingEngineStringList(lines, "missionSkipped",
 					groupingConfig.missions.missionSkippedLines);
+			loadGroupingEngineStringList(lines, "pulling",
+					groupingConfig.tactics.pullingLines);
+			loadGroupingEngineStringList(lines, "pullNothing",
+					groupingConfig.tactics.pullNothingLines);
+			loadGroupingEngineStringList(lines, "pullBack",
+					groupingConfig.tactics.pullBackLines);
+			loadGroupingEngineStringList(lines, "pullFailed",
+					groupingConfig.tactics.pullFailedLines);
+			loadGroupingEngineStringList(lines, "spinYes",
+					groupingConfig.tactics.spinYesLines);
+			loadGroupingEngineStringList(lines, "spinYesNoBuffs",
+					groupingConfig.tactics.spinYesNoBuffsLines);
+			loadGroupingEngineStringList(lines, "spinNo",
+					groupingConfig.tactics.spinNoLines);
+			loadGroupingEngineStringList(lines, "spinOn",
+					groupingConfig.tactics.spinOnLines);
+			loadGroupingEngineStringList(lines, "spinOff",
+					groupingConfig.tactics.spinOffLines);
+			loadGroupingEngineStringList(lines, "ateFood",
+					groupingConfig.tactics.ateFoodLines);
+			loadGroupingEngineStringList(lines, "fullAlready",
+					groupingConfig.tactics.fullAlreadyLines);
+			loadGroupingEngineStringList(lines, "noFood",
+					groupingConfig.tactics.noFoodLines);
+			loadGroupingEngineStringList(lines, "backOff",
+					groupingConfig.tactics.backOffLines);
+			loadGroupingEngineStringList(lines, "pullingPack",
+					groupingConfig.tactics.pullingPackLines);
+			loadGroupingEngineStringList(lines, "lairAttack",
+					groupingConfig.tactics.lairAttackLines);
 		}
 		lines.pop();
 	}
@@ -11901,6 +12044,9 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		playerBotGroupingActive.load(std::memory_order_acquire) &&
 		groupingConfig.directivesEnabled && groupingConfig.missionsEnabled,
 		std::memory_order_release);
+	playerBotGroupTacticsActive.store(
+		playerBotGroupingActive.load(std::memory_order_acquire) &&
+		groupingConfig.tacticsEnabled, std::memory_order_release);
 	playerBotMissionCreditsActive.store(progressionEnabled &&
 		progressionAwardMissionCredits, std::memory_order_release);
 
@@ -12601,6 +12747,7 @@ void SimPlayerManager::initializePlayerBotParityTestResults() {
 	playerBotParityHarnessSpawnedOids.removeAll();
 	playerBotParityDirectivesGateOverrides.removeAll();
 	playerBotParityMissionsGateOverrides.removeAll();
+	playerBotParityTacticsGateOverrides.removeAll();
 	playerBotParityForceGroupShuttleFailure.removeAll();
 	playerBotParityGroupLeaderOid = 0;
 	playerBotParityGroupAttackerOid = 0;
@@ -18221,6 +18368,16 @@ bool SimPlayerManager::isPlayerBotGroupMissionsActive(uint64 identityId) const {
 	return playerBotGroupingConfig.missionsEnabled;
 }
 
+bool SimPlayerManager::isPlayerBotGroupTacticsActive(uint64 identityId) const {
+	if (!playerBotGroupingActive.load(std::memory_order_acquire))
+		return false;
+	Locker parityLock(const_cast<Mutex*>(&playerBotParityTestMutex));
+	if (identityId != 0 && playerBotParityTacticsGateOverrides.contains(
+			identityId))
+		return playerBotParityTacticsGateOverrides.get(identityId);
+	return playerBotGroupTacticsActive.load(std::memory_order_acquire);
+}
+
 void SimPlayerManager::setPlayerBotGroupMissionDirectiveLocked(
 		const PlayerBotGroupRecord& record,
 		const PlayerBotGroupMissionPlan& plan,
@@ -18541,11 +18698,25 @@ void SimPlayerManager::applyGroupNearestMission(uint64 groupOid,
 	const bool winnerIsLeaderPlanet = winner.leaderPlanetCRC == 0 ||
 		winner.planetCRC == winner.leaderPlanetCRC;
 	auto publishDirective = [&]() {
+		// Only a running plan steers the bots. After "follow" (runRequested
+		// false) a refresh must not put them back in MISSION_WAIT, where they
+		// hold in place: the owner's client pass (2026-10-23) saw following drop
+		// a minute after every follow command. Grab stages set their own stages.
+		if (!plan.runRequested)
+			return;
 		for (int recordIndex = 0; recordIndex < playerBotGroupRecords.size();
 				recordIndex++) {
 			const PlayerBotGroupRecord& record =
 				playerBotGroupRecords.elementAt(recordIndex).getValue();
 			if (record.groupOid != groupOid)
+				continue;
+			// A bot on a G2 buff or meet trip keeps it: the refresh used to
+			// overwrite "get buffs" with MISSION_TRAVEL while missions were
+			// still running (owner client pass 2026-10-26). Missions resume
+			// once that trip is done (directive cleared or DONE).
+			if (playerBotGroupDirectives.contains(record.identityId) &&
+					playerBotGroupDirectives.get(record.identityId).stage <
+						SimBotGroupRally::MISSION_GRAB_TRAVEL)
 				continue;
 			const PlayerBotGroupMissionEntry* currentEntry = nullptr;
 			for (int entryIndex = 0; entryIndex < plan.entries.size();
@@ -18559,6 +18730,17 @@ void SimPlayerManager::applyGroupNearestMission(uint64 groupOid,
 				SimBotGroupRally::MISSION_WAIT, currentEntry);
 		}
 	};
+	// A revealed, standing lair holds the group: the refresh may not switch the
+	// current entry away mid-fight because another mission's advertised point
+	// is nearer (owner client pass 2026-10-26: the group left lair 1 after its
+	// first wave for mission 2). The next nearest is chosen once it is done.
+	for (int i = 0; i < plan.entries.size(); ++i) {
+		const PlayerBotGroupMissionEntry& current = plan.entries.get(i);
+		if (current.entryId == plan.currentEntryId && current.revealed &&
+				current.lairOid != 0 && !current.completed && !current.abandoned &&
+				!(winner.planId == plan.planId && winner.entryId == current.entryId))
+			return;
+	}
 	if (!winner.none && winner.planId == plan.planId) {
 		for (int i = 0; i < plan.entries.size(); ++i) {
 			PlayerBotGroupMissionEntry& entry = plan.entries.get(i);
@@ -19148,6 +19330,10 @@ void SimPlayerManager::onGroupMissionEntryDone(uint64 groupOid, uint64 planId,
 			PlayerBotGroupMissionEntry& entry = plan.entries.get(i);
 			if (entry.entryId != entryId)
 				continue;
+			// Already closed (the manager-side lair completion and the holder's
+			// controller can both report it): nothing more to do or say.
+			if (entry.completed || entry.abandoned)
+				return;
 			found = true;
 			entry.completed = outcome.toLowerCase() == "done" ||
 				outcome.toLowerCase() == "complete";
@@ -19162,6 +19348,12 @@ void SimPlayerManager::onGroupMissionEntryDone(uint64 groupOid, uint64 planId,
 				if (!plan.entries.get(j).completed &&
 						!plan.entries.get(j).abandoned)
 					allDone = false;
+			// A destroyed lair resumes the run when missions remain: a "follow"
+			// said mid-mission means "come here", not "cancel the missions"
+			// (owner client pass 2026-10-23). The refresh below then publishes
+			// the next nearest as MISSION_TRAVEL.
+			if (entry.completed && !allDone)
+				plan.runRequested = true;
 			for (int j = 0; j < playerBotGroupRecords.size(); ++j) {
 				const PlayerBotGroupRecord& record =
 					playerBotGroupRecords.elementAt(j).getValue();
@@ -24363,6 +24555,35 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 		return playerBotGroupingRepliesPosted.get();
 	if (key == "grouping.groupchatunhandled" || key == "groupchatunhandled")
 		return playerBotGroupingGroupChatUnhandled.get();
+	if (key == "grouping.tactics.pullorders" || key == "tactics.pullorders")
+		return playerBotGroupingTacticCounters.pullOrders;
+	if (key == "grouping.tactics.pullsreturned" || key == "tactics.pullsreturned")
+		return playerBotGroupingTacticCounters.pullsReturned;
+	if (key == "grouping.tactics.pullsnotarget" || key == "tactics.pullsnotarget")
+		return playerBotGroupingTacticCounters.pullsNoTarget;
+	if (key == "grouping.tactics.pullstimedout" || key == "tactics.pullstimedout")
+		return playerBotGroupingTacticCounters.pullsTimedOut;
+	if (key == "grouping.tactics.spinpolls" || key == "tactics.spinpolls")
+		return playerBotGroupingTacticCounters.spinPolls;
+	if (key == "grouping.tactics.spinpollreplies" || key == "tactics.spinpollreplies")
+		return playerBotGroupingTacticCounters.spinPollReplies;
+	if (key == "grouping.tactics.spinmodeon" || key == "tactics.spinmodeon")
+		return playerBotGroupingTacticCounters.spinModeOn;
+	if (key == "grouping.tactics.spinmodeoff" || key == "tactics.spinmodeoff")
+		return playerBotGroupingTacticCounters.spinModeOff;
+	if (key == "grouping.tactics.spinengages" || key == "tactics.spinengages")
+		return playerBotGroupingTacticCounters.spinEngages;
+	if (key == "grouping.tactics.eatorders" || key == "tactics.eatorders")
+		return playerBotGroupingTacticCounters.eatOrders;
+	if (key == "grouping.tactics.eatate" || key == "tactics.eatate")
+		return playerBotGroupingTacticCounters.eatAte;
+	if (key == "grouping.tactics.eatalreadyfed" || key == "tactics.eatalreadyfed")
+		return playerBotGroupingTacticCounters.eatAlreadyFed;
+	if (key == "grouping.tactics.eatnofood" || key == "tactics.eatnofood")
+		return playerBotGroupingTacticCounters.eatNoFood;
+	if (key == "grouping.tactics.tacticsrejectedgate" ||
+			key == "tactics.tacticsrejectedgate")
+		return playerBotGroupingTacticCounters.tacticsRejectedGate;
 	if (key == "groupmission.splitbotshares")
 		return groupMissionSplitBotShares.get();
 	if (key == "groupmission.splitplayershares")
@@ -25193,6 +25414,7 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 		playerBotParityTestCreditBaselines.removeAll();
 	playerBotParityDirectivesGateOverrides.removeAll();
 	playerBotParityMissionsGateOverrides.removeAll();
+	playerBotParityTacticsGateOverrides.removeAll();
 		playerBotParityForceGroupShuttleFailure.removeAll();
 			playerBotParityTestRequestRefs.removeAll();
 			playerBotParityTestIdentityRefs.removeAll();
@@ -25765,7 +25987,14 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 				"grouping.directives.buffOutcome.not_needed",
 				"grouping.directives.holdReleased.leader_arrived",
 				"grouping.directives.holdReleased.follow_command",
-				"grouping.directives.holdReleased.hold_timeout"};
+				"grouping.directives.holdReleased.hold_timeout",
+				"grouping.tactics.pullOrders", "grouping.tactics.pullsReturned",
+				"grouping.tactics.pullsNoTarget", "grouping.tactics.pullsTimedOut",
+				"grouping.tactics.spinPolls", "grouping.tactics.spinPollReplies",
+				"grouping.tactics.spinModeOn", "grouping.tactics.spinModeOff",
+				"grouping.tactics.spinEngages", "grouping.tactics.eatOrders",
+				"grouping.tactics.eatAte", "grouping.tactics.eatAlreadyFed",
+				"grouping.tactics.eatNoFood", "grouping.tactics.tacticsRejectedGate"};
 			for (unsigned int i = 0; i < sizeof(counters) / sizeof(counters[0]); ++i)
 				playerBotParityTestCounterBaselines.put(counters[i].toLowerCase(),
 					static_cast<uint64>(playerBotParityCounterValue(counters[i])));
@@ -26256,6 +26485,14 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			return resolved;
 		}
 		if (step.identityIndex < 0) {
+			// No ref: the bot this scenario borrowed, when it has one. The first
+			// live identity is only the fallback; it can be a different bot than
+			// the one the scenario grouped (verify 2026-10-23).
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				if (playerBotParityBorrowedRefs.contains("production"))
+					return playerBotParityBorrowedRefs.get("production");
+			}
 			Locker pveLock(&pveMutex);
 			for (int i = 0; i < pveIdentities.size(); ++i) {
 				const SimBotIdentity& candidate =
@@ -26321,6 +26558,10 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			playerBotGroupingActive.load(std::memory_order_acquire) &&
 			playerBotGroupingConfig.directivesEnabled &&
 			playerBotGroupingConfig.missionsEnabled,
+			std::memory_order_release);
+		playerBotGroupTacticsActive.store(
+			playerBotGroupingActive.load(std::memory_order_acquire) &&
+			playerBotGroupingConfig.tacticsEnabled,
 			std::memory_order_release);
 		result.status = "PASS";
 		return true;
@@ -26483,6 +26724,25 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			return true;
 		}
 		playerBotParityDirectivesGateOverrides.put(identityId,
+			step.gateEnabled);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "setTacticsGate") {
+		identityId = resolveGroupingIdentity();
+		if (identityId == 0) {
+			result.status = "FAIL";
+			result.failReason = "grouping_identity_not_found";
+			return true;
+		}
+		Locker parityLock(&playerBotParityTestMutex);
+		if (!playerBotParityTestEnabled || !playerBotParityTestScenarioActive) {
+			result.status = "FAIL";
+			result.failReason = "tactics_gate_outside_harness";
+			return true;
+		}
+		playerBotParityTacticsGateOverrides.put(identityId,
 			step.gateEnabled);
 		result.status = "PASS";
 		return true;
@@ -26782,6 +27042,8 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			playerBotParityGroupInitialBodyOids.removeAll();
 			playerBotParityGroupHarnessLeaderOids.removeAll();
 			playerBotParityDirectivesGateOverrides.removeAll();
+			playerBotParityMissionsGateOverrides.removeAll();
+			playerBotParityTacticsGateOverrides.removeAll();
 			playerBotParityForceGroupShuttleFailure.removeAll();
 			playerBotParityGroupLeaderOid = 0;
 			playerBotParityGroupAttackerOid = 0;
@@ -26936,10 +27198,110 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		return false;
 	}
 
+	if (op == "assertTacticCounter") {
+		// Tactic counters use the same delta/baseline machinery as the older
+		// grouping counters; keep a dedicated operation name in the Lua matrix
+		// so a tactic scenario is self-describing.
+		const String counter = step.groupingCounter.trim().toLowerCase();
+		if (counter.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "tactic_counter_name_missing";
+			return true;
+		}
+		int64 delta = 0;
+		String remaining = counter;
+		while (!remaining.isEmpty()) {
+			const int bar = remaining.indexOf("|");
+			const String name = (bar < 0 ? remaining :
+				remaining.subString(0, bar)).trim();
+			remaining = bar < 0 || bar + 1 >= remaining.length() ? String() :
+				remaining.subString(bar + 1);
+			if (name.isEmpty())
+				continue;
+			const int64 current = playerBotParityCounterValue(name);
+			int64 baseline = 0;
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				if (playerBotParityTestCounterBaselines.contains(name))
+					baseline = static_cast<int64>(
+						playerBotParityTestCounterBaselines.get(name));
+			}
+			delta += current - baseline;
+		}
+		if (step.groupingMaxDelta >= 0 && delta > step.groupingMaxDelta) {
+			result.status = "FAIL";
+			result.failReason = "tactic_counter_above_delta name=" + counter;
+			return true;
+		}
+		if (delta >= step.groupingMinDelta) {
+			result.status = "PASS";
+			return true;
+		}
+		if (groupingStepTimeout()) {
+			result.status = "FAIL";
+			result.failReason = "tactic_counter_below_delta name=" + counter;
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
+	}
+
+	if (op == "assertGroupTactics") {
+		// This handler runs ahead of the shared grouping-identity block below.
+		identityId = resolveGroupingIdentity();
+		PlayerBotGroupRecord record;
+		const bool hasRecord = getPlayerBotGroupRecord(identityId, record) &&
+			record.state == PLAYER_BOT_GROUP_GROUPED;
+		PlayerBotGroupTacticsState state;
+		const bool hasState = hasRecord && record.groupOid != 0 &&
+			getPlayerBotGroupTacticsState(record.groupOid, state);
+		const String expected = step.expect.trim().toLowerCase();
+		bool matches = true;
+		if (expected == "on" || expected == "true")
+			matches = hasState && state.spinMode;
+		else if (expected == "off" || expected == "false" ||
+				expected == "absent")
+			matches = !hasState || !state.spinMode;
+		else if (expected == "suppressed")
+			matches = hasState && state.spinSuppressedLairOid != 0;
+		else if (expected == "pull")
+			matches = hasRecord && record.tacticOrder ==
+				SimBotGroupTactics::ORDER_PULL;
+		else if (expected == "none")
+			matches = !hasRecord || record.tacticOrder ==
+				SimBotGroupTactics::ORDER_NONE;
+		else if (!expected.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "unknown_tactic_expectation";
+			return true;
+		}
+		if (!step.groupingStage.isEmpty()) {
+			matches = matches && hasRecord &&
+				String(playerBotGroupingPullStageName(record.pullStage)).
+					toLowerCase() == step.groupingStage.trim().toLowerCase();
+		}
+		if (matches && (!expected.isEmpty() || !step.groupingStage.isEmpty())) {
+			result.status = "PASS";
+			return true;
+		}
+		if (expected.isEmpty() && step.groupingStage.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "tactic_expectation_missing";
+			return true;
+		}
+		if (groupingStepTimeout()) {
+			result.status = "FAIL";
+			result.failReason = "tactic_state_timeout";
+			return true;
+		}
+		result.status = "WAITING";
+		return false;
+	}
+
 	if (op == "assertOffer" || op == "assertGrouped" ||
 		op == "assertNotGrouped" || op == "assertDecline" ||
 		op == "groupInvite" || op == "groupKick" || op == "groupDisband" ||
-		op == "groupSay" ||
+		op == "groupSay" || op == "assertGroupTactics" ||
 		 op == "assertFollowDistance" || op == "assertBotOnPlanet" ||
 		op == "assertDirectiveStage" || op == "assertDirectiveCleared" ||
 		op == "assertBotNear" || op == "assertBotBuffed" ||
@@ -27172,6 +27534,59 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		}
 		result.status = "WAITING";
 		return false;
+	}
+
+	if (op == "spawnGroupPullTarget") {
+		uint64 leaderOid = groupLeaderOid();
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> leaderObject = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(leaderOid);
+		AiAgent* leader = leaderObject == nullptr ? nullptr :
+			leaderObject->asAiAgent();
+		String templateName = step.templateName;
+		if (templateName.isEmpty())
+			templateName = playerBotParityTestKillTargetTemplate;
+		if (leader == nullptr || leader->getZone() == nullptr ||
+			templateName.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "pull_target_spawn_failed";
+			return true;
+		}
+		Zone* zone = leader->getZone();
+		Vector3 leaderPosition = leader->getWorldPosition();
+		Vector3 position = leaderPosition;
+		position.setX(position.getX() + 40.f);
+		CreatureManager* creatureManager = zone->getCreatureManager();
+		ManagedReference<CreatureObject*> target = creatureManager == nullptr ?
+			nullptr : creatureManager->spawnCreature(templateName.hashCode(), 0,
+			position.getX(), zone->getHeight(position.getX(), position.getY()),
+			position.getY(), 0);
+		AiAgent* targetAgent = target == nullptr ? nullptr : target->asAiAgent();
+		if (targetAgent == nullptr) {
+			if (target != nullptr)
+				target->destroyObjectFromDatabase(true);
+			result.status = "FAIL";
+			result.failReason = "pull_target_spawn_failed";
+			return true;
+		}
+		{
+			Locker targetLock(targetAgent);
+			targetAgent->setDespawnOnNoPlayerInRange(false);
+			targetAgent->setMovementState(AiAgent::OBLIVIOUS);
+			targetAgent->setFaction(0);
+			for (int pool = 0; pool < 9; pool += 3) {
+				targetAgent->setMaxHAM(pool, 50000, false);
+				targetAgent->setHAM(pool, 50000, false);
+			}
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityGroupAttackerOid = targetAgent->getObjectID();
+			playerBotParityGroupAttackerOids.add(targetAgent->getObjectID());
+			playerBotParityHarnessSpawnedOids.put(targetAgent->getObjectID(), true);
+		}
+		result.status = "PASS";
+		return true;
 	}
 
 	if (op == "spawnHarnessAttacker") {
@@ -27928,7 +28343,7 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			op == "retireIdentity" ||
 			op == "reassignPlan" ||
 			(op == "simulateKillXp" && step.bodyOid == 0) ||
-			op == "spawnKillTarget") {
+			op == "spawnKillTarget" || op == "spawnGroupPullTarget") {
 		if (!getPlayerBotParityIdentityId(step, identityId)) {
 			result.status = "FAIL";
 			result.failReason = "identity_not_found";
@@ -32999,6 +33414,8 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 	abilities["inactiveForWeapon"] = inactiveAbilities;
 	abilities["superseded"] = supersededAbilities;
 	abilities["excluded"] = excludedAbilities;
+	abilities["hasAreaAbility"] = abilitySnapshot.hasAreaAbility;
+	abilities["areaAbility"] = abilitySnapshot.areaAbility;
 	result["abilities"] = abilities;
 	result["skillMods"] = skillMods;
 
@@ -33159,6 +33576,16 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 	PlayerBotGroupRecord groupingRecord;
 	if (getPlayerBotGroupRecord(identityId, groupingRecord)) {
 		PlayerBotGroupDirective groupingDirective;
+		PlayerBotGroupTacticsState tacticState;
+		bool haveTacticState = false;
+		{
+			Locker groupingLock(&groupingMutex);
+			if (playerBotGroupTacticsStates.contains(groupingRecord.groupOid)) {
+				tacticState = playerBotGroupTacticsStates.get(
+					groupingRecord.groupOid);
+				haveTacticState = true;
+			}
+		}
 		JSONSerializationType groupingJson = JSONSerializationType::object();
 		groupingJson["kind"] = "record";
 		groupingJson["state"] = playerBotGroupingRecordStateName(
@@ -33170,6 +33597,19 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 		groupingJson["availabilityClass"] = inspectAvailability.isFree() ?
 			"FREE" : "BUSY";
 		groupingJson["availabilityReason"] = inspectAvailability.reason;
+		groupingJson["tacticOrder"] = playerBotGroupingTacticOrderName(
+			groupingRecord.tacticOrder);
+		groupingJson["pullStage"] = playerBotGroupingPullStageName(
+			groupingRecord.pullStage);
+		groupingJson["pullTargetOid"] = groupingRecord.pullTargetOid;
+		if (haveTacticState) {
+			JSONSerializationType tacticJson = JSONSerializationType::object();
+			tacticJson["spinMode"] = tacticState.spinMode;
+			tacticJson["spinSetAtMs"] = tacticState.spinSetAtMs;
+			tacticJson["spinSuppressedLairOid"] =
+				tacticState.spinSuppressedLairOid;
+			groupingJson["tactics"] = tacticJson;
+		}
 		if (getPlayerBotGroupDirective(identityId, groupingDirective)) {
 			JSONSerializationType directiveJson = JSONSerializationType::object();
 			directiveJson["stage"] = playerBotGroupingDirectiveStageName(
@@ -33345,6 +33785,27 @@ static const char* playerBotGroupingRecordStateName(int state) {
 	}
 }
 
+static const char* playerBotGroupingTacticOrderName(
+		SimBotGroupTactics::TacticOrder order) {
+	switch (order) {
+	case SimBotGroupTactics::ORDER_PULL: return "PULL";
+	case SimBotGroupTactics::ORDER_SPIN_POLL: return "SPIN_POLL";
+	case SimBotGroupTactics::ORDER_EAT: return "EAT";
+	default: return "NONE";
+	}
+}
+
+static const char* playerBotGroupingPullStageName(
+		SimBotGroupTactics::PullStage stage) {
+	switch (stage) {
+	case SimBotGroupTactics::TAG: return "TAG";
+	case SimBotGroupTactics::RETURN: return "RETURN";
+	case SimBotGroupTactics::DONE: return "DONE";
+	case SimBotGroupTactics::ABORT: return "ABORT";
+	default: return "APPROACH";
+	}
+}
+
 static JSONSerializationType playerBotGroupingCounterMapJson(
 		const VectorMap<String, uint64>& source) {
 	JSONSerializationType result = JSONSerializationType::object();
@@ -33372,6 +33833,8 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 	Vector<PlayerBotGroupDirective> directives;
 	Vector<PlayerBotGroupRoute> routes;
 	PlayerBotGroupingDirectiveCounters directiveCounters;
+	VectorMap<uint64, PlayerBotGroupTacticsState> tacticStates;
+	PlayerBotGroupTacticCounters tacticCounters;
 	Vector<String> unmatched;
 	VectorMap<String, uint64> replySkipped;
 	VectorMap<String, uint64> inviteDeclined;
@@ -33391,6 +33854,8 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 		for (int i = 0; i < playerBotGroupRoutes.size(); ++i)
 			routes.add(playerBotGroupRoutes.elementAt(i).getValue());
 		directiveCounters = playerBotGroupingDirectiveCounters;
+		tacticStates = playerBotGroupTacticsStates;
+		tacticCounters = playerBotGroupingTacticCounters;
 		unmatched = playerBotGroupingRecentUnmatched;
 		replySkipped = playerBotGroupingReplySkipped;
 		inviteDeclined = playerBotGroupingInvitesDeclined;
@@ -33526,6 +33991,37 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 	missionsJson["plans"] = plansJson;
 	result["missions"] = missionsJson;
 
+	JSONSerializationType tacticsJson = JSONSerializationType::object();
+	tacticsJson["enabled"] = isPlayerBotGroupTacticsActive(0);
+	tacticsJson["pullOrders"] = tacticCounters.pullOrders;
+	tacticsJson["pullsReturned"] = tacticCounters.pullsReturned;
+	tacticsJson["pullsNoTarget"] = tacticCounters.pullsNoTarget;
+	tacticsJson["pullsTimedOut"] = tacticCounters.pullsTimedOut;
+	tacticsJson["spinPolls"] = tacticCounters.spinPolls;
+	tacticsJson["spinPollReplies"] = tacticCounters.spinPollReplies;
+	tacticsJson["spinModeOn"] = tacticCounters.spinModeOn;
+	tacticsJson["spinModeOff"] = tacticCounters.spinModeOff;
+	tacticsJson["spinEngages"] = tacticCounters.spinEngages;
+	tacticsJson["eatOrders"] = tacticCounters.eatOrders;
+	tacticsJson["eatAte"] = tacticCounters.eatAte;
+	tacticsJson["eatAlreadyFed"] = tacticCounters.eatAlreadyFed;
+	tacticsJson["eatNoFood"] = tacticCounters.eatNoFood;
+	tacticsJson["tacticsRejectedGate"] = tacticCounters.tacticsRejectedGate;
+	JSONSerializationType tacticGroups = JSONSerializationType::array();
+	for (int i = 0; i < tacticStates.size(); ++i) {
+		const PlayerBotGroupTacticsState& state =
+			tacticStates.elementAt(i).getValue();
+		JSONSerializationType groupTactics = JSONSerializationType::object();
+		groupTactics["groupOid"] = tacticStates.elementAt(i).getKey();
+		groupTactics["leaderOid"] = state.leaderOid;
+		groupTactics["spinMode"] = state.spinMode;
+		groupTactics["spinSetAtMs"] = state.spinSetAtMs;
+		groupTactics["spinSuppressedLairOid"] = state.spinSuppressedLairOid;
+		tacticGroups.push_back(groupTactics);
+	}
+	tacticsJson["groups"] = tacticGroups;
+	result["tactics"] = tacticsJson;
+
 	JSONSerializationType directiveJson = JSONSerializationType::object();
 	const char* directiveKinds[] = {"cantina", "starport", "shuttleport",
 		"medcenter", "city", "custom", "leader"};
@@ -33623,6 +34119,17 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 		row["groupOid"] = record.groupOid;
 		row["state"] = playerBotGroupingRecordStateName(record.state);
 		row["generation"] = record.generation;
+		row["tacticOrder"] = playerBotGroupingTacticOrderName(record.tacticOrder);
+		row["pullStage"] = playerBotGroupingPullStageName(record.pullStage);
+		row["pullTargetOid"] = record.pullTargetOid;
+		if (tacticStates.contains(record.groupOid)) {
+			const PlayerBotGroupTacticsState& state =
+				tacticStates.get(record.groupOid);
+			JSONSerializationType groupTactics = JSONSerializationType::object();
+			groupTactics["spinMode"] = state.spinMode;
+			groupTactics["spinSuppressedLairOid"] = state.spinSuppressedLairOid;
+			row["tactics"] = groupTactics;
+		}
 		row["planet"] = String();
 		row["distanceToLeader"] = -1.f;
 		row["routeLegsLeft"] = 0;
@@ -37221,6 +37728,47 @@ SimPlayerManager::lairObserverSnapshot(uint64 bodyOid, uint64 expectedLairOid) {
 	return result;
 }
 
+ManagedReference<LairObserver*> SimPlayerManager::resolveLairObserver(
+		uint64 lairOid) {
+	if (lairOid == 0)
+		return nullptr;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> object = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(lairOid);
+	TangibleObject* lair = object == nullptr ? nullptr :
+		object->asTangibleObject();
+	if (lair == nullptr)
+		return nullptr;
+	Locker lairLock(lair);
+	SortedVector<ManagedReference<Observer*> > observers = lair->getObservers(
+		ObserverEventType::OBJECTDESTRUCTION);
+	for (int i = 0; i < observers.size(); ++i) {
+		Observer* observer = observers.get(i).get();
+		if (observer != nullptr && observer->isObserverType(ObserverType::LAIR))
+			return cast<LairObserver*>(observer);
+	}
+	return nullptr;
+}
+
+Vector<ManagedReference<CreatureObject*> >
+SimPlayerManager::snapshotLairMembers(uint64 lairOid) {
+	Vector<ManagedReference<CreatureObject*> > result;
+	ManagedReference<LairObserver*> observer = resolveLairObserver(lairOid);
+	if (observer == nullptr)
+		return result;
+	SynchronizedVector<ManagedReference<CreatureObject*> >* spawnedCreatures =
+		observer->getSpawnedCreatures();
+	if (spawnedCreatures == nullptr)
+		return result;
+	for (int i = 0; i < spawnedCreatures->size(); ++i) {
+		ManagedReference<CreatureObject*> member = spawnedCreatures->get(i);
+		if (member == nullptr || member->isDead() || member->getZone() == nullptr)
+			continue;
+		result.add(member);
+	}
+	return result;
+}
+
 void SimPlayerManager::requestPveHuntLairCleanup(uint64 bodyOid,
 		const String& reason) {
 	if (bodyOid == 0)
@@ -39537,6 +40085,8 @@ PveMissionCreditDisposition SimPlayerManager::onPveBotMissionLairDestroyed(
 	bool groupMissionHolder = false;
 	bool groupMissionPayActive = false;
 	uint64 groupMissionGroupOid = 0;
+	uint64 groupMissionPlanId = 0;
+	uint64 groupMissionEntryId = 0;
 	if (missionCompleted && isPlayerBotGroupMissionsActive(identityId)) {
 		Locker groupingLock(&groupingMutex);
 		for (int i = 0; i < playerBotGroupRecords.size(); ++i) {
@@ -39556,6 +40106,8 @@ PveMissionCreditDisposition SimPlayerManager::onPveBotMissionLairDestroyed(
 						entry.holderIdentityId == identityId &&
 						entry.offerId == offerId && entry.lairOid == lairOid) {
 					groupMissionHolder = true;
+					groupMissionPlanId = plan.planId;
+					groupMissionEntryId = entry.entryId;
 					break;
 				}
 			}
@@ -39579,6 +40131,13 @@ PveMissionCreditDisposition SimPlayerManager::onPveBotMissionLairDestroyed(
 		controllers.get(bodyOid) : nullptr;
 	SimHunterController* hunter = ctrl == nullptr ? nullptr :
 		dynamic_cast<SimHunterController*>(ctrl.get());
+	// The plan entry completes here, not only through the holder's controller:
+	// a "follow" mid-mission clears the controller's mission context, and the
+	// entry then stayed open forever (owner client pass 2026-10-25: the group
+	// never left for the second mission). Idempotent with the controller path.
+	if (groupMissionHolder)
+		onGroupMissionEntryDone(groupMissionGroupOid, groupMissionPlanId,
+			groupMissionEntryId, "done");
 	if (hunter != nullptr) {
 		if (groupMissionHolder)
 			hunter->onGroupMissionLairDestroyed(lairOid);
@@ -66284,6 +66843,8 @@ void SimPlayerManager::releasePlayerBotGroup(uint64 identityId,
 			}
 			if (!groupStillPresent)
 				releasedLastGroupRecord = true;
+			if (!groupStillPresent)
+				playerBotGroupTacticsStates.drop(record.groupOid);
 			++nextPlayerBotGroupingGeneration;
 			removed = true;
 		}
@@ -66761,6 +67322,10 @@ void SimPlayerManager::preparePlayerBotGroupingDeath(uint64 identityId,
 			if (live.state != PLAYER_BOT_GROUP_DEAD_REJOIN) {
 				live.state = PLAYER_BOT_GROUP_DEAD_REJOIN;
 				live.bodyOid = 0;
+				live.tacticOrder = SimBotGroupTactics::ORDER_NONE;
+				live.pullStage = SimBotGroupTactics::APPROACH;
+				live.pullTargetOid = 0;
+				++live.tacticOrderGeneration;
 				++live.generation;
 				if (live.generation == 0)
 					live.generation = 1;
@@ -67051,7 +67616,7 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 	}
 	SimBotGroupRally::LeaderLine parsed = SimBotGroupRally::parseLeaderLine(
 		text, namedBots, config.vocabulary, config.rallyVocabulary,
-		config.missions.vocabulary);
+		config.missions.vocabulary, config.tactics.vocabulary);
 	SimBotGrouping::GroupCommand command = parsed.command;
 	auto rememberUnmatched = [this, &text]() {
 		playerBotGroupingGroupChatUnhandled.increment();
@@ -67063,7 +67628,7 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 			playerBotGroupingRecentUnmatched.remove(0);
 	};
 	if (command.command == SimBotGrouping::GROUP_COMMAND_NONE &&
-			!parsed.isDirective && !parsed.isMission) {
+			!parsed.isDirective && !parsed.isMission && !parsed.isTactic) {
 		rememberUnmatched();
 		return;
 	}
@@ -67087,6 +67652,7 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 		}
 	}
 	String commandName = parsed.isDirective ? String("directive") :
+		parsed.isTactic ? String("tactic") :
 		command.command == SimBotGrouping::GROUP_COMMAND_STATUS ? String("status") :
 		command.command == SimBotGrouping::GROUP_COMMAND_READY ? String("ready") :
 		command.command == SimBotGrouping::GROUP_COMMAND_FOLLOW ? String("follow") :
@@ -67098,6 +67664,7 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 			playerBotGroupingGroupChatCommands.get(commandName) + 1 : 1);
 	}
 	const bool leaderOnlyCommand = parsed.isDirective || parsed.isMission ||
+		parsed.isTactic ||
 		command.command == SimBotGrouping::GROUP_COMMAND_FOLLOW;
 	if (leaderOnlyCommand) {
 		bool senderIsLeader = false;
@@ -67448,6 +68015,362 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 		}
 	}
 
+	if (parsed.isTactic) {
+		// A bot that is cloning answers as G1 status does and keeps no order.
+		bool cloningReplied = false;
+		for (int i = 0; i < records.size(); ++i) {
+			const PlayerBotGroupRecord& record = records.get(i);
+			if (record.state != PLAYER_BOT_GROUP_DEAD_REJOIN ||
+					!isTargeted(record.identityId) ||
+					!isPlayerBotGroupTacticsActive(record.identityId))
+				continue;
+			scheduleLine(groupId, record.identityId,
+				"Cloning, I'll head back to you.", 0, 0, "PlayerBotTacticCloning");
+			cloningReplied = true;
+		}
+		bool tacticGateOpen = false;
+		for (int i = 0; i < records.size(); ++i) {
+			if (records.get(i).state != PLAYER_BOT_GROUP_GROUPED ||
+					!isTargeted(records.get(i).identityId) ||
+					!isPlayerBotGroupTacticsActive(records.get(i).identityId))
+				continue;
+			const SimBotGroupTactics::TacticCommand tactic = parsed.tactic.command;
+			if ((tactic == SimBotGroupTactics::TACTIC_SPIN_POLL ||
+					tactic == SimBotGroupTactics::TACTIC_SPIN_ON ||
+					tactic == SimBotGroupTactics::TACTIC_SPIN_GO ||
+					tactic == SimBotGroupTactics::TACTIC_SPIN_OFF ||
+					tactic == SimBotGroupTactics::TACTIC_BACK_OFF) &&
+					!isPlayerBotGroupMissionsActive(records.get(i).identityId))
+				continue;
+			tacticGateOpen = true;
+			break;
+		}
+		if (!tacticGateOpen && cloningReplied)
+			return;
+		if (!tacticGateOpen) {
+			{
+				Locker groupingLock(&groupingMutex);
+				playerBotGroupingTacticCounters.tacticsRejectedGate++;
+			}
+			if (records.size() > 0)
+				recordPlayerBotGroupingTacticEvent(records.get(0).identityId,
+					"tactic_gate_off");
+			return;
+		}
+
+		const SimBotGroupTactics::TacticCommand tactic = parsed.tactic.command;
+		std::vector<uint64> foodGateOpenIdentities;
+		if (tactic == SimBotGroupTactics::TACTIC_EAT) {
+			for (int i = 0; i < records.size(); ++i) {
+				if (records.get(i).state == PLAYER_BOT_GROUP_GROUPED &&
+						isTargeted(records.get(i).identityId) &&
+						playerBotConsumablesGateEnabled(records.get(i).identityId))
+					foodGateOpenIdentities.push_back(records.get(i).identityId);
+			}
+		}
+		uint64 selectedPullIdentity = 0;
+		int selectedPullHam = -1;
+		bool selectedPullRanged = false;
+		if (tactic == SimBotGroupTactics::TACTIC_PULL) {
+			ZoneServer* zoneServer = ServerCore::getZoneServer();
+			for (int i = 0; i < records.size(); ++i) {
+				const PlayerBotGroupRecord& record = records.get(i);
+				if (!isTargeted(record.identityId) ||
+						record.state != PLAYER_BOT_GROUP_GROUPED ||
+						record.tacticOrder == SimBotGroupTactics::ORDER_PULL)
+					continue;
+				if (zoneServer == nullptr || record.bodyOid == 0)
+					continue;
+				ManagedReference<SceneObject*> object =
+					zoneServer->getObject(record.bodyOid);
+				AiAgent* agent = object == nullptr ? nullptr : object->asAiAgent();
+				if (agent == nullptr)
+					continue;
+				bool available = false;
+				bool ranged = false;
+				int ham = -1;
+				{
+					Locker agentLock(agent);
+					available = !agent->isDead() && !agent->isInCombat() &&
+						agent->getZone() != nullptr;
+					if (available) {
+						ham = agent->getHAM(CreatureAttribute::HEALTH) +
+							agent->getHAM(CreatureAttribute::ACTION) +
+							agent->getHAM(CreatureAttribute::MIND);
+						WeaponObject* weapon = agent->getWeapon();
+						ranged = weapon != nullptr && weapon->getMaxRange() > 10;
+					}
+				}
+				if (!available)
+					continue;
+				const bool named = !parsed.tactic.all &&
+					std::find(parsed.tactic.targetIdentityIds.begin(),
+						parsed.tactic.targetIdentityIds.end(), record.identityId) !=
+						parsed.tactic.targetIdentityIds.end();
+				if (!parsed.tactic.all && !named)
+					continue;
+				if (selectedPullIdentity == 0 || named ||
+						(ranged && !selectedPullRanged) ||
+						(ranged == selectedPullRanged && ham > selectedPullHam)) {
+					selectedPullIdentity = record.identityId;
+					selectedPullHam = ham;
+					selectedPullRanged = ranged;
+					if (named)
+						break;
+				}
+			}
+		}
+
+		// "attack the lair" names one lair, bound now (owner client pass
+		// 2026-10-26: it carried over to every later lair): the leader's target
+		// if it is a lair, else the nearest lair within 64 m of the leader.
+		// None near: the order applies to no lair.
+		uint64 spinGoLairOid = 0;
+		if (tactic == SimBotGroupTactics::TACTIC_SPIN_GO) {
+			ZoneServer* zoneServer = ServerCore::getZoneServer();
+			ManagedReference<CreatureObject*> leader = zoneServer == nullptr ?
+				nullptr : zoneServer->getObject(senderOid).castTo<CreatureObject*>();
+			Zone* leaderZone = nullptr;
+			Vector3 leaderPosition;
+			uint64 leaderTargetOid = 0;
+			if (leader != nullptr) {
+				Locker leaderLock(leader);
+				leaderZone = leader->getZone();
+				leaderPosition = leader->getWorldPosition();
+				leaderTargetOid = leader->getTargetID();
+			}
+			if (leaderZone != nullptr && leaderTargetOid != 0) {
+				ManagedReference<SceneObject*> target =
+					zoneServer->getObject(leaderTargetOid);
+				LairObject* targetLair = target == nullptr ? nullptr :
+					cast<LairObject*>(target.get());
+				if (targetLair != nullptr && targetLair->getZone() == leaderZone)
+					spinGoLairOid = targetLair->getObjectID();
+			}
+			if (leaderZone != nullptr && spinGoLairOid == 0) {
+				SortedVector<TreeEntry*> closeObjects;
+				leaderZone->getInRangeObjects(leaderPosition.getX(),
+					leaderPosition.getZ(), leaderPosition.getY(), 64.f,
+					&closeObjects, true, true);
+				float best = 65.f;
+				for (int i = 0; i < closeObjects.size(); ++i) {
+					SceneObject* object = static_cast<SceneObject*>(
+						closeObjects.get(i));
+					LairObject* lair = object == nullptr ? nullptr :
+						cast<LairObject*>(object);
+					if (lair == nullptr || lair->getZone() != leaderZone)
+						continue;
+					const float distance = lair->getWorldPosition().distanceTo2d(
+						leaderPosition);
+					if (distance < best) {
+						best = distance;
+						spinGoLairOid = lair->getObjectID();
+					}
+				}
+			}
+		}
+		Vector<PlayerBotGroupRecord> wakeRecords;
+		bool pullNothing = false;
+		Vector<uint64> foodGateOffIdentities;
+		{
+			Locker groupingLock(&groupingMutex);
+			if (!playerBotGroupTacticsStates.contains(groupId))
+				playerBotGroupTacticsStates.put(groupId,
+					PlayerBotGroupTacticsState());
+			PlayerBotGroupTacticsState& tacticState =
+				playerBotGroupTacticsStates.get(groupId);
+			uint64 leaderOid = records.size() > 0 ? records.get(0).leaderOid : senderOid;
+			if (tacticState.leaderOid != 0 && tacticState.leaderOid != leaderOid)
+				tacticState = PlayerBotGroupTacticsState();
+			tacticState.leaderOid = leaderOid;
+			if (tactic == SimBotGroupTactics::TACTIC_SPIN_ON ||
+					tactic == SimBotGroupTactics::TACTIC_SPIN_GO ||
+					tactic == SimBotGroupTactics::TACTIC_SPIN_OFF) {
+				tacticState.spinMode = tactic != SimBotGroupTactics::TACTIC_SPIN_OFF;
+				tacticState.spinSetAtMs = System::getMiliTime();
+				if (tacticState.spinMode)
+					tacticState.spinSuppressedLairOid = 0;
+				// "attack the lair" is the go signal: no need to wait for aggro.
+				tacticState.spinGoAtMs = tactic == SimBotGroupTactics::TACTIC_SPIN_GO ?
+					tacticState.spinSetAtMs : 0;
+				tacticState.spinGoLairOid = tactic == SimBotGroupTactics::TACTIC_SPIN_GO ?
+					spinGoLairOid : 0;
+			}
+			if (tactic == SimBotGroupTactics::TACTIC_BACK_OFF) {
+				tacticState.backOffAtMs = System::getMiliTime();
+				if (playerBotGroupMissionPlans.contains(groupId)) {
+					const PlayerBotGroupMissionPlan& plan =
+						playerBotGroupMissionPlans.get(groupId);
+					for (int i = 0; i < plan.entries.size(); ++i) {
+						const PlayerBotGroupMissionEntry& entry = plan.entries.get(i);
+						if (entry.entryId == plan.currentEntryId && entry.revealed) {
+							tacticState.spinSuppressedLairOid = entry.lairOid;
+							break;
+						}
+					}
+				}
+			}
+			for (int i = 0; i < records.size(); ++i) {
+				if (!playerBotGroupRecords.contains(records.get(i).identityId))
+					continue;
+				PlayerBotGroupRecord& live = playerBotGroupRecords.get(
+					records.get(i).identityId);
+				if (live.groupOid != groupId || live.state ==
+						PLAYER_BOT_GROUP_RELEASING)
+					continue;
+				if (live.state != PLAYER_BOT_GROUP_GROUPED)
+					continue;
+				const bool targeted = isTargeted(live.identityId);
+				if (tactic == SimBotGroupTactics::TACTIC_BACK_OFF) {
+					live.tacticOrder = SimBotGroupTactics::ORDER_NONE;
+					live.pullStage = SimBotGroupTactics::APPROACH;
+					live.pullTargetOid = 0;
+					++live.tacticOrderGeneration;
+					if (live.tacticOrderGeneration == 0)
+						live.tacticOrderGeneration = 1;
+					wakeRecords.add(live);
+					continue;
+				}
+				if (!targeted)
+					continue;
+				if (tactic == SimBotGroupTactics::TACTIC_SPIN_ON ||
+						tactic == SimBotGroupTactics::TACTIC_SPIN_GO ||
+						tactic == SimBotGroupTactics::TACTIC_SPIN_OFF) {
+					wakeRecords.add(live);
+					continue;
+				}
+				if (tactic == SimBotGroupTactics::TACTIC_PULL) {
+					if (live.identityId == selectedPullIdentity) {
+						live.tacticOrder = SimBotGroupTactics::ORDER_PULL;
+						live.pullStage = SimBotGroupTactics::APPROACH;
+						live.tacticOrderGeneration++;
+						if (live.tacticOrderGeneration == 0)
+							live.tacticOrderGeneration = 1;
+						live.pullTargetOid = 0;
+						wakeRecords.add(live);
+						playerBotGroupingTacticCounters.pullOrders++;
+					}
+					else if (selectedPullIdentity == 0)
+						pullNothing = true;
+				}
+				else if (tactic == SimBotGroupTactics::TACTIC_SPIN_POLL) {
+					live.tacticOrder = SimBotGroupTactics::ORDER_SPIN_POLL;
+					live.pullStage = SimBotGroupTactics::APPROACH;
+					live.pullTargetOid = 0;
+					live.tacticOrderGeneration++;
+					if (live.tacticOrderGeneration == 0)
+						live.tacticOrderGeneration = 1;
+					wakeRecords.add(live);
+				}
+				else if (tactic == SimBotGroupTactics::TACTIC_EAT) {
+					const bool consumablesOpen = std::find(
+						foodGateOpenIdentities.begin(), foodGateOpenIdentities.end(),
+						live.identityId) != foodGateOpenIdentities.end();
+					if (consumablesOpen) {
+						live.tacticOrder = SimBotGroupTactics::ORDER_EAT;
+						live.pullStage = SimBotGroupTactics::APPROACH;
+						live.pullTargetOid = 0;
+						live.tacticOrderGeneration++;
+						if (live.tacticOrderGeneration == 0)
+							live.tacticOrderGeneration = 1;
+						wakeRecords.add(live);
+						playerBotGroupingTacticCounters.eatOrders++;
+					}
+					else {
+						foodGateOffIdentities.add(live.identityId);
+						playerBotGroupingTacticCounters.eatNoFood++;
+					}
+				}
+			}
+			if (tactic == SimBotGroupTactics::TACTIC_SPIN_POLL)
+				playerBotGroupingTacticCounters.spinPolls++;
+		}
+
+		Vector<uint64> responseIdentities;
+		for (int i = 0; i < records.size(); ++i)
+			if (records.get(i).state == PLAYER_BOT_GROUP_GROUPED &&
+					isTargeted(records.get(i).identityId))
+				responseIdentities.add(records.get(i).identityId);
+		if (tactic == SimBotGroupTactics::TACTIC_SPIN_ON ||
+				tactic == SimBotGroupTactics::TACTIC_SPIN_GO ||
+				tactic == SimBotGroupTactics::TACTIC_SPIN_OFF) {
+			Locker groupingLock(&groupingMutex);
+			if (tactic != SimBotGroupTactics::TACTIC_SPIN_OFF)
+				playerBotGroupingTacticCounters.spinModeOn += responseIdentities.size();
+			else
+				playerBotGroupingTacticCounters.spinModeOff += responseIdentities.size();
+		}
+		if (tactic == SimBotGroupTactics::TACTIC_SPIN_ON ||
+				tactic == SimBotGroupTactics::TACTIC_SPIN_GO ||
+				tactic == SimBotGroupTactics::TACTIC_SPIN_OFF)
+			for (int i = 0; i < responseIdentities.size(); ++i) {
+				// A bot with no area attack says so at SPIN_ON, so the leader never
+				// starts a spin run on bots that cannot spin.
+				bool noAreaAbility = false;
+				if (tactic != SimBotGroupTactics::TACTIC_SPIN_OFF) {
+					SimBotBodyProgression bodySnapshot;
+					getPlayerBotBodyProgressionSnapshot(responseIdentities.get(i),
+						bodySnapshot);
+					noAreaAbility = !bodySnapshot.hasAreaAbility;
+				}
+				const Vector<String>& lines = noAreaAbility ? config.tactics.spinNoLines :
+					tactic == SimBotGroupTactics::TACTIC_SPIN_GO ?
+					config.tactics.lairAttackLines :
+					tactic == SimBotGroupTactics::TACTIC_SPIN_ON ?
+					config.tactics.spinOnLines : config.tactics.spinOffLines;
+				String line = lines.size() > 0 ? lines.get(System::random(lines.size() - 1)) :
+					(noAreaAbility ? String("No spin attack.") :
+					tactic == SimBotGroupTactics::TACTIC_SPIN_GO ? String("On the lair.") :
+					tactic == SimBotGroupTactics::TACTIC_SPIN_ON ?
+						String("Spin mode on.") : String("Spin mode off."));
+				scheduleLine(groupId, responseIdentities.get(i), line,
+					config.ackLineDelayMinSeconds, config.ackLineDelayMaxSeconds,
+					"PlayerBotTacticSpin");
+			}
+		if (tactic == SimBotGroupTactics::TACTIC_BACK_OFF && responseIdentities.size() > 0) {
+			String line = config.tactics.backOffLines.size() > 0 ?
+				config.tactics.backOffLines.get(0) : String("Backing off.");
+			scheduleLine(groupId, responseIdentities.get(0), line,
+				config.ackLineDelayMinSeconds, config.ackLineDelayMaxSeconds,
+				"PlayerBotTacticBackOff");
+		}
+		if (pullNothing && responseIdentities.size() > 0) {
+			{
+				Locker groupingLock(&groupingMutex);
+				playerBotGroupingTacticCounters.pullsNoTarget++;
+			}
+			String line = config.tactics.pullNothingLines.size() > 0 ?
+				config.tactics.pullNothingLines.get(0) : String("Nothing to pull.");
+			scheduleLine(groupId, responseIdentities.get(0), line, 0, 0,
+				"PlayerBotTacticPullNone");
+		}
+		for (int i = 0; i < foodGateOffIdentities.size(); ++i) {
+			String line = config.tactics.noFoodLines.size() > 0 ?
+				config.tactics.noFoodLines.get(0) : String("No food on me.");
+			scheduleLine(groupId, foodGateOffIdentities.get(i), line, 0, 0,
+				"PlayerBotTacticNoFood");
+		}
+		for (int i = 0; i < wakeRecords.size(); ++i) {
+			Reference<SimPlayerController*> controller = controllers.contains(
+				wakeRecords.get(i).bodyOid) ? controllers.get(
+				wakeRecords.get(i).bodyOid) : nullptr;
+			SimHunterController* hunter = controller == nullptr ? nullptr :
+				dynamic_cast<SimHunterController*>(controller.get());
+			if (hunter != nullptr)
+				hunter->notifyGroupingStateChanged();
+		}
+		recordPlayerBotGroupingTacticEvent(responseIdentities.size() > 0 ?
+			responseIdentities.get(0) : senderOid,
+			tactic == SimBotGroupTactics::TACTIC_EAT ? "eat_order" :
+			tactic == SimBotGroupTactics::TACTIC_SPIN_POLL ? "spin_poll" :
+			tactic == SimBotGroupTactics::TACTIC_SPIN_ON ? "spin_on" :
+			tactic == SimBotGroupTactics::TACTIC_SPIN_GO ? "spin_go" :
+			tactic == SimBotGroupTactics::TACTIC_SPIN_OFF ? "spin_off" :
+			tactic == SimBotGroupTactics::TACTIC_BACK_OFF ? "spin_back_off" :
+			"pull_order");
+		return;
+	}
+
 	if (parsed.isDirective) {
 		String leaderPlanet;
 		Vector3 leaderPosition;
@@ -67505,6 +68428,7 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 	}
 
 	if (command.command == SimBotGrouping::GROUP_COMMAND_FOLLOW) {
+		Vector<uint64> followBodyOids;
 		{
 			Locker groupingLock(&groupingMutex);
 			if (playerBotGroupMissionPlans.contains(groupId)) {
@@ -67526,6 +68450,8 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 			const PlayerBotGroupRecord& record = records.get(i);
 			if (!isTargeted(record.identityId))
 				continue;
+			if (record.bodyOid != 0)
+				followBodyOids.add(record.bodyOid);
 			if (clearPlayerBotGroupDirective(record.identityId, 0,
 					"follow_command")) {
 				Locker groupingLock(&groupingMutex);
@@ -67539,6 +68465,15 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 			scheduleLine(record.groupOid, record.identityId, line,
 				config.ackLineDelayMinSeconds, config.ackLineDelayMaxSeconds,
 				"PlayerBotFollowAck");
+		}
+		for (int i = 0; i < followBodyOids.size(); ++i) {
+			Reference<SimPlayerController*> controller = controllers.contains(
+				followBodyOids.get(i)) ? controllers.get(followBodyOids.get(i)) :
+				nullptr;
+			SimHunterController* hunter = controller == nullptr ? nullptr :
+				dynamic_cast<SimHunterController*>(controller.get());
+			if (hunter != nullptr)
+				hunter->notifyGroupingStateChanged();
 		}
 		return;
 	}
@@ -67646,6 +68581,10 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 					String::valueOf(route.legs.size() - route.legIndex) +
 					" legs).";
 		}
+		PlayerBotGroupTacticsState statusTactics;
+		if (getPlayerBotGroupTacticsState(record.groupOid, statusTactics) &&
+				statusTactics.spinMode)
+			line += " Spin on.";
 		if (command.command == SimBotGrouping::GROUP_COMMAND_LEAVE) {
 			releasePlayerBotGroup(record.identityId, "leave_command");
 			continue;
@@ -67814,6 +68753,16 @@ void SimPlayerManager::runPlayerBotJoinTask(uint64 identityId,
 				playerBotGroupMissionPlans.put(groupOid, plan);
 			} else {
 				playerBotGroupMissionPlans.get(groupOid).leaderOid = leaderOid;
+			}
+			if (!playerBotGroupTacticsStates.contains(groupOid)) {
+				PlayerBotGroupTacticsState tacticState;
+				tacticState.leaderOid = leaderOid;
+				playerBotGroupTacticsStates.put(groupOid, tacticState);
+			} else if (playerBotGroupTacticsStates.get(groupOid).leaderOid !=
+					leaderOid) {
+				PlayerBotGroupTacticsState tacticState;
+				tacticState.leaderOid = leaderOid;
+				playerBotGroupTacticsStates.put(groupOid, tacticState);
 			}
 			playerBotGroupOffers.drop(identityId);
 			committed = true;
@@ -68082,6 +69031,53 @@ bool SimPlayerManager::getPlayerBotGroupRecord(uint64 identityId,
 	if (!playerBotGroupRecords.contains(identityId))
 		return false;
 	record = playerBotGroupRecords.get(identityId);
+	return true;
+}
+
+bool SimPlayerManager::completePlayerBotGroupTacticOrder(
+		uint64 identityId, uint64 orderGeneration) {
+	if (identityId == 0 || orderGeneration == 0)
+		return false;
+	Locker groupingLock(&groupingMutex);
+	if (!playerBotGroupRecords.contains(identityId))
+		return false;
+	PlayerBotGroupRecord& record = playerBotGroupRecords.get(identityId);
+	if (record.tacticOrderGeneration != orderGeneration ||
+			record.tacticOrder == SimBotGroupTactics::ORDER_NONE)
+		return false;
+	record.tacticOrder = SimBotGroupTactics::ORDER_NONE;
+	record.pullStage = SimBotGroupTactics::APPROACH;
+	record.pullTargetOid = 0;
+	return true;
+}
+
+bool SimPlayerManager::updatePlayerBotGroupTacticPullStage(
+		uint64 identityId, uint64 orderGeneration,
+		SimBotGroupTactics::PullStage stage, uint64 pullTargetOid) {
+	if (identityId == 0 || orderGeneration == 0)
+		return false;
+	Locker groupingLock(&groupingMutex);
+	if (!playerBotGroupRecords.contains(identityId))
+		return false;
+	PlayerBotGroupRecord& record = playerBotGroupRecords.get(identityId);
+	if (record.tacticOrderGeneration != orderGeneration ||
+			record.tacticOrder != SimBotGroupTactics::ORDER_PULL)
+		return false;
+	record.pullStage = stage;
+	if (pullTargetOid != 0)
+		record.pullTargetOid = pullTargetOid;
+	return true;
+}
+
+bool SimPlayerManager::getPlayerBotGroupTacticsState(uint64 groupId,
+		PlayerBotGroupTacticsState& state) const {
+	state = PlayerBotGroupTacticsState();
+	if (groupId == 0)
+		return false;
+	Locker groupingLock(const_cast<Mutex*>(&groupingMutex));
+	if (!playerBotGroupTacticsStates.contains(groupId))
+		return false;
+	state = playerBotGroupTacticsStates.get(groupId);
 	return true;
 }
 
@@ -68366,6 +69362,54 @@ void SimPlayerManager::recordPlayerBotGroupingDirectiveEvent(uint64 identityId,
 	}
 	if (emit)
 		MissionDiagLog::event("GROUP_DIRECTIVE", identityId, detail);
+}
+
+void SimPlayerManager::recordPlayerBotGroupingTacticEvent(uint64 identityId,
+		const String& detail) {
+	const uint64 nowMs = System::getMiliTime();
+	bool emit = false;
+	{
+		Locker groupingLock(&groupingMutex);
+		// Rate-limited per identity AND event kind (the detail's first token), so
+		// an order line never hides the outcome that follows it.
+		const int space = detail.indexOf(" ");
+		const String kind = space < 0 ? detail : detail.subString(0, space);
+		const uint64 key = identityId * 31ULL +
+			static_cast<uint64>(kind.hashCode());
+		const uint64 lastMs = playerBotGroupingTacticsDiagAtMs.contains(key) ?
+			playerBotGroupingTacticsDiagAtMs.get(key) : 0;
+		if (lastMs == 0 || nowMs >= lastMs + 5000) {
+			playerBotGroupingTacticsDiagAtMs.put(key, nowMs);
+			emit = true;
+		}
+	}
+	if (emit) {
+		const String event = detail.contains("spin") ? "GROUP_SPIN" :
+			detail.contains("eat") ? "GROUP_EAT" : "GROUP_PULL";
+		MissionDiagLog::event(event, identityId, detail);
+	}
+}
+
+void SimPlayerManager::recordPlayerBotGroupingTacticOutcome(
+		uint64 identityId, const String& outcome) {
+	Locker groupingLock(&groupingMutex);
+	if (outcome == "pull_returned")
+		++playerBotGroupingTacticCounters.pullsReturned;
+	else if (outcome == "pull_no_target")
+		++playerBotGroupingTacticCounters.pullsNoTarget;
+	else if (outcome == "pull_timed_out")
+		++playerBotGroupingTacticCounters.pullsTimedOut;
+	else if (outcome == "spin_poll_reply")
+		++playerBotGroupingTacticCounters.spinPollReplies;
+	else if (outcome == "spin_engage")
+		++playerBotGroupingTacticCounters.spinEngages;
+	else if (outcome == "eat_ate")
+		++playerBotGroupingTacticCounters.eatAte;
+	else if (outcome == "eat_already_fed")
+		++playerBotGroupingTacticCounters.eatAlreadyFed;
+	else if (outcome == "eat_no_food")
+		++playerBotGroupingTacticCounters.eatNoFood;
+	(void)identityId;
 }
 
 void SimPlayerManager::recordPlayerBotGroupingBuffEvent(uint64 identityId,

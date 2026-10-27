@@ -140,6 +140,26 @@ TEST(SimBotGroupRallyTest, LeaderLinePrecedenceKeepsNameTargets) {
 	EXPECT_FALSE(line.isDirective);
 	EXPECT_EQ(line.command.command, SimBotGrouping::GROUP_COMMAND_NONE);
 
+	SimBotGroupTactics::TacticVocabulary tactics;
+	line = parseLeaderLine("Paki spin the lair", names, grouping, vocabulary(),
+		SimBotGroupMission::MissionVocabulary(), tactics);
+	EXPECT_TRUE(line.isTactic);
+	EXPECT_FALSE(line.isDirective);
+	EXPECT_FALSE(line.isMission);
+	EXPECT_EQ(line.tactic.command, SimBotGroupTactics::TACTIC_SPIN_ON);
+	EXPECT_EQ(line.command.command, SimBotGrouping::GROUP_COMMAND_NONE);
+
+	line = parseLeaderLine("Paki spin the lair and meet at Mos Eisley", names,
+		grouping, vocabulary(), SimBotGroupMission::MissionVocabulary(), tactics);
+	EXPECT_TRUE(line.isTactic);
+	EXPECT_FALSE(line.isDirective);
+
+	line = parseLeaderLine("Paki grab 2 kreetle missions and spin the lair",
+		names, grouping, vocabulary(), SimBotGroupMission::MissionVocabulary(),
+		tactics);
+	EXPECT_TRUE(line.isMission);
+	EXPECT_FALSE(line.isTactic);
+
 	line = parseLeaderLine("leave, then grab a mission", names, grouping,
 		vocabulary());
 	EXPECT_FALSE(line.isMission);

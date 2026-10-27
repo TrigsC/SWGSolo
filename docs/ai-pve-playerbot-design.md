@@ -794,3 +794,38 @@ self-contained G3 scenarios using a stand-in leader and borrowed production bots
 each rebases a grouping counter and the matrix remains disabled in the shipped
 Lua configuration. `setMissionsGate` is identity-scoped for disposable receipt
 runs, so it does not turn the live capability on for the roster.
+
+### P.10p G4 — Group tactics (F_0.9.18)
+
+G4 adds the default-off `grouping.tacticsEnabled` capability to the grouped
+roster. The leader's tactic lines are parsed once by `SimBotGroupTactics` after
+leave/follow and mission precedence: `pull`, `who has spin`, `spin the lair`,
+`spin off`, and `take foods`. The manager records a generation-bound order on
+the selected bot (or every addressed bot), wakes the controller, and uses a
+compare-and-set completion so an old tick cannot consume a replacement order.
+
+Pull chooses one eligible creature near the revealed mission lair, or near the
+leader when there is no lair, preferring a non-pack target. The bot approaches,
+tags it with a single-target attack, and returns to the leader while keeping
+combat movement enabled; the existing server pack notification brings pack
+mates along. A leaf guard forbids area/cone specials for the pull and restores
+normal selection when it completes. The group guard protects every grouped bot
+from clipping its lair, so the G3 behavior remains unchanged unless spin mode is
+explicitly enabled.
+
+Spin mode is a persistent group setting. A poll reports each bot's installed
+area/cone ability, buffs, HAM and worn armour, while the leader decides whether
+to turn it on. With spin on, an area-capable bot waits for the leader to engage,
+stands just inside the lair, and then deliberately engages it; only a successful
+combat start clears the lair guard and prefers an area special. `spin off`, a
+back-off, a lair change, group end or death restores the guard. The mode is
+suppressed for the current lair by back-off and re-arms on a later lair or a
+new spin-on command. Bots without an area ability continue normal group defense.
+
+`take foods` force-runs the existing gated vault-consumable entry point outside
+its periodic check throttle and reports what was eaten, already-fed, or missing.
+The grouping dashboard and inspect drawer expose tactic orders, pull stages,
+spin state and lifetime counters. `GROUP_PULL`, `GROUP_SPIN`, and `GROUP_EAT`
+diagnostics, plus six disabled parity scenarios, make the manager/controller
+boundary observable without changing the shipped `tacticsEnabled = false`
+profile. Healing in both directions is deliberately deferred to G5.
