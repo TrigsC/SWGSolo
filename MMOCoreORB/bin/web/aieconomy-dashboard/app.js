@@ -347,6 +347,10 @@
     const armor = data.armor || {};
     const consumables = data.consumables || {};
     const grouping = data.grouping || {};
+    const healing = data.healing || {};
+    const healingItems = Array.isArray(healing.items) ? healing.items : [];
+    const healingXp = data.xp && data.xp.medical != null ? data.xp.medical :
+      data.experience && data.experience.medical != null ? data.experience.medical : null;
     const consumableItems = Array.isArray(consumables.items) ? consumables.items : [];
     const armorWorn = Array.isArray(armor.worn) ? armor.worn : [];
     const armorDesired = Array.isArray(armor.desired) ? armor.desired : [];
@@ -427,6 +431,17 @@
       <td>${chip(item.buffActive ? "active" : "ready", item.buffActive ? "teal" : "ghost")}</td>
       <td class="t-num">${num(item.buffRemainingSeconds)}s</td>
     </tr>`).join("");
+    const healingItemRows = healingItems.map((item) => `<tr>
+      <td><span class="t-main">${esc(item.template || "unknown")}</span><span class="t-sub">${num(item.stacks)} stack${Number(item.stacks || 0) === 1 ? "" : "s"}</span></td>
+      <td class="t-num">${num(item.doses)}</td>
+      <td class="t-num">${num(item.minDoses)}</td>
+    </tr>`).join("");
+    const lastHeal = healing.lastPatientOid ?
+      `${num(healing.lastHealthHealed)} health · ${num(healing.lastActionHealed)} action · ${ago(healing.lastAgeSeconds)} · ${esc(labelize(healing.lastReason || "unknown"))} · patient ${esc(healing.lastPatientOid)}` :
+      "none recorded";
+    const healOrder = healing.orderGeneration ?
+      `${esc(labelize(healing.orderReason || "ordered"))} · patient ${esc(healing.orderPatientOid || "unknown")}` :
+      "none";
 
     return `<div class="playerbot-card"><h3>WHO</h3><p class="playerbot-lead">${esc(identity.name || "Unnamed SimBot")}</p>
       ${kvRows([["Profession", esc(labelize(identity.profession || "unknown"))], ["Home", esc(home)], ["Tier", num(identity.skillTier)], ["Kills / deaths", `${num(identity.kills)} / ${num(identity.deaths)}`], ["Activity", esc(labelize(activity))], ["Body", body.attached ? `attached · ${esc(body.zone || "unknown")}` : "not attached"], ["Lair members alive", num(body.lairMembersAlive)], ["Non-member engagements", num(body.nonMemberEngagements)]])}</div>
@@ -447,6 +462,7 @@
       <div class="playerbot-card"><h3>LOADOUT</h3>${loadoutCurrent}<p class="playerbot-label">WEAPON CANDIDATES (${num(loadoutCandidates.length)}) · PROTECTED ${num(loadoutProtected.length)}</p>${table(["OID", "Template", "XP Type", "DPS", "Certified", "Protected"], loadoutCandidateRows, { scrollKey: "playerbot-loadout", tall: true })}</div>
       <div class="playerbot-card"><h3>ARMOR</h3><p class="playerbot-label">${chip(armor.enabled ? "gate on" : "gate off", armor.enabled ? "ok" : "ghost")} · ${chip(armor.simBotWornArmor ? "player mitigation" : "not flagged", armor.simBotWornArmor ? "teal" : "ghost")} · ${esc(armor.blockedReason || "no blocker")}</p>${kvRows([["Buffed pools", Object.entries(armor.buffedPools || {}).filter(([, value]) => value).map(([key]) => labelize(key)).join(", ") || "none"], ["Total encumbrance", num(armor.totalEncumbrance)], ["Mitigated total", num(armor.mitigatedTotal)], ["Race CRC", armor.bodyRaceCrc || "unknown"]])}${table(["Source OID", "Copy OID", "Slot", "Template", "Rating", "Condition", "State"], armorRows, { scrollKey: "playerbot-armor", tall: true })}<p class="playerbot-label">DESIRED SET (${num(armorDesired.length)})</p>${table(["Slot", "OID", "Template", "Score", "Status", "Usability"], armorDesiredRows, { scrollKey: "playerbot-armor-desired" })}</div>
       <div class="playerbot-card"><h3>FOOD &amp; DRINK</h3><p class="playerbot-label">${kvRows([["Food fill", `${num((consumables.stomach || {}).food)} / ${num((consumables.stomach || {}).max)}`], ["Drink fill", `${num((consumables.stomach || {}).drink)} / ${num((consumables.stomach || {}).max)}`], ["Next check", `${num(consumables.nextCheckInSeconds)}s`], ["Last consumed", consumables.lastConsumed && consumables.lastConsumed.template ? esc(consumables.lastConsumed.template) : "none"]])}</p>${table(["Template", "Doses", "Stacks", "Buff", "Remaining"], consumableRows, { scrollKey: "playerbot-consumables" })}</div>
+      <div class="playerbot-card"><h3>HEALING</h3><p class="playerbot-label">${chip(healing.enabled ? "gate on" : "gate off", healing.enabled ? "ok" : "ghost")} · ${chip(healing.isMedic ? "medic" : "not medic", healing.isMedic ? "teal" : "ghost")}</p>${kvRows([["Stims held", num(healing.stimDoses)], ["Usable stim", yesno(healing.hasUsableStim)], ["Cooldown", chip(healing.cooldownReady ? "ready" : "cooling down", healing.cooldownReady ? "ok" : "amber")], ["Healing ability", num(healing.healingAbility)], ["Medical XP", healingXp == null ? "—" : num(healingXp)], ["Last heal", lastHeal], ["Order", healOrder]])}${table(["Stim template", "Doses", "Minimum"], healingItemRows, { scrollKey: "playerbot-healing" })}</div>
       <div class="playerbot-card"><h3>GROUPING</h3>${kvRows([["State", labelize(grouping.state || grouping.kind || "free")], ["Leader", grouping.leader || grouping.playerOid || "none"], ["Group", grouping.groupOid || "none"], ["Generation", num(grouping.generation)], ["Directive", grouping.directive ? labelize(grouping.directive.stage || "unknown") : "none"], ["Place", grouping.directive && grouping.directive.place ? grouping.directive.place : "none"], ["Buff city", grouping.directive && grouping.directive.buffCity ? grouping.directive.buffCity : "none"], ["Directive age", grouping.directive ? ago(grouping.directive.sinceSeconds) : "—"], ["Tactic", labelize(grouping.tacticOrder || "none")], ["Pull stage", labelize(grouping.pullStage || "approach")], ["Spin", grouping.tactics && grouping.tactics.spinMode ? "on" : "off"], ["Offer expires", grouping.expiresAtMs ? new Date(Number(grouping.expiresAtMs)).toLocaleTimeString() : "—"]])}</div>
       <div class="playerbot-card"><h3>SKILL MODS</h3>${modRows ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Mod</th><th>Base</th><th>Trained</th><th>Effective</th></tr></thead><tbody>${modRows}</tbody></table></div>` : `<span class="muted small">No live skill mods.</span>`}</div>`;
   }
@@ -1333,6 +1349,7 @@
     }).join("");
     const progressionHarness = progression.harness || {};
     const grouping = progression.grouping || {};
+    const healing = progression.healing || {};
     const killXp = progression.killXp || {};
     const killXpGate = progression.gates && progression.gates.awardKillXp === true;
     const progressionHarnessRows = (progressionHarness.scenarios || []).map((s) => {
@@ -1351,6 +1368,9 @@
     const groupingBuffChoices = groupingDirectives.buffChoice || {};
     const groupingBuffOutcomes = groupingDirectives.buffOutcome || {};
     const groupingShuttles = groupingDirectives.shuttleLegs || {};
+    const healingByIdentity = new Map((progression.identities || []).map((identity) => [
+      String(identity.identityId), identity.healing || {}
+    ]));
     const groupingMissions = grouping.missions || {};
     const groupingMissionPlans = Array.isArray(groupingMissions.plans)
       ? groupingMissions.plans : [];
@@ -1413,11 +1433,44 @@
       <td>${esc(o.player || "—")}</td><td>${chip(labelize(o.state || "offered"), o.state === "OFFERED" ? "amber" : "teal")}</td>
       <td class="t-num">${num(o.generation)}</td><td>${o.expiresAtMs ? esc(new Date(Number(o.expiresAtMs)).toLocaleTimeString()) : "—"}</td>
     </tr>`).join("");
-    const groupingBotRows = (grouping.groupedBots || []).map((b) => `<tr>
+    const groupingBotRows = (grouping.groupedBots || []).map((b) => {
+      const botHealing = b.healing || healingByIdentity.get(String(b.identity)) || {};
+      const healStage = b.healStage || botHealing.stage ||
+        (botHealing.orderGeneration ? "ordered" : botHealing.hasUsableStim ? "ready" : "idle");
+      const lastHeal = botHealing.lastPatientOid ?
+        `${num(botHealing.lastHealthHealed)} health · ${num(botHealing.lastActionHealed)} action · ${ago(botHealing.lastAgeSeconds)} · ${labelize(botHealing.lastReason || "unknown")}` :
+        "none";
+      return `<tr>
       <td><button type="button" class="playerbot-link" data-identity-id="${esc(b.identity)}"><span class="t-main">${esc(b.name || "unknown")}</span><span class="t-sub">${esc(b.identity)}</span></button></td>
-      <td>${esc(b.leader || "—")}</td><td>${b.directive ? chip(labelize(b.directive.stage || "unknown"), b.directive.stage === "RALLY_HOLD" ? "teal" : "amber") : chip("none", "ghost")}${b.directive && b.directive.place ? `<span class="t-sub">${esc(b.directive.place)}</span>` : ""}</td><td><span class="t-main">${esc(b.tacticOrder || "NONE")}</span><span class="t-sub">${esc(b.pullStage || "APPROACH")}</span></td><td>${esc(b.state || "GROUPED")}</td><td>${esc(b.planet || "—")}</td>
+      <td>${esc(b.leader || "—")}</td><td>${b.directive ? chip(labelize(b.directive.stage || "unknown"), b.directive.stage === "RALLY_HOLD" ? "teal" : "amber") : chip("none", "ghost")}${b.directive && b.directive.place ? `<span class="t-sub">${esc(b.directive.place)}</span>` : ""}</td><td><span class="t-main">${esc(b.tacticOrder || "NONE")}</span><span class="t-sub">${esc(b.pullStage || "APPROACH")}</span></td><td>${chip(labelize(healStage), healStage === "idle" ? "ghost" : healStage === "ready" ? "teal" : "amber")}<span class="t-sub">${esc(botHealing.isMedic ? `${num(botHealing.doses)} doses` : "not medic")}</span></td><td>${esc(lastHeal)}</td><td>${esc(b.state || "GROUPED")}</td><td>${esc(b.planet || "—")}</td>
       <td class="t-num">${b.distanceToLeader == null || Number(b.distanceToLeader) < 0 ? "—" : num(b.distanceToLeader) + "m"}</td><td class="t-num">${num(b.routeLegsLeft)}</td>
-    </tr>`).join("");
+    </tr>`;
+    }).join("");
+    const healingRefusals = healing.refusals || {};
+    const healingOrders = healing.orders || {};
+    const healingPanel = panel("HEALING", `${chip(healing.enabled ? "gate on" : "gate off", healing.enabled ? "ok" : "ghost")} · ${chip(healing.playerHealsBotsActive ? "player seam active" : "player seam off", healing.playerHealsBotsActive ? "teal" : "ghost")}`, `<div class="metric-row">
+      ${metric("Player → bot", healing.playerHealsOfBots, { tone: "accent" })}
+      ${metric("Bot → others", healing.botHealsOthers, { tone: "teal" })}
+      ${metric("Self heals", healing.botHealsSelf)}
+      ${metric("Health healed", healing.healthHealed)}
+      ${metric("Action healed", healing.actionHealed)}
+      ${metric("Medical XP", healing.medicalXpAwarded, { tone: "accent" })}
+      ${metric("Stims used", healing.stimsConsumed)}
+      ${metric("Restock buys", healing.restockPurchases)}
+    </div><div class="metric-row">
+      ${metric("Orders", healingOrders.orders)}
+      ${metric("Done", healingOrders.done, { tone: "teal" })}
+      ${metric("No medic", healingOrders.noMedic)}
+      ${metric("Aborted", healingOrders.aborted, { tone: Number(healingOrders.aborted || 0) ? "warn" : "" })}
+      ${metric("Gate rejects", healingOrders.rejectedGate)}
+      ${metric("Claims", healing.claimsActive)}
+      ${metric("Expired claims", healing.claimsExpired)}
+    </div>${kvRows([
+      ["Refusals", Object.entries(healingRefusals).map(([key, value]) => `${esc(labelize(key))} ${num(value)}`).join(" · ") || "none"],
+      ["Thresholds", `${(Number(healing.groupHealThreshold || 0) * 100).toFixed(0)}% group · ${(Number(healing.selfHealThreshold || 0) * 100).toFixed(0)}% self · ${(Number(healing.selfCriticalFraction || 0) * 100).toFixed(0)}% critical`],
+      ["Configured stims", (healing.configuredItems || []).map((item) => esc(item.template || "unknown")).join(" · ") || "none"],
+      ["Policy signature", esc(healing.signature || "none")]
+    ])}`, "span-12");
     const groupingPanel = panel("GROUPS", `${chip(grouping.active ? "gate on" : "gate off", grouping.active ? "ok" : "ghost")} · ${esc(grouping.roomName || "LFB")}`, `<div class="metric-row">
       ${metric("Requests", groupingCounters.requestsSeen)} ${metric("Matched", groupingCounters.requestsMatched)} ${metric("Offers", grouping.offers ? grouping.offers.length : 0, { tone: "accent" })}
       ${metric("Grouped", grouping.groupedBots ? grouping.groupedBots.length : 0, { tone: "teal" })} ${metric("Free", grouping.freeBots)} ${metric("Live", grouping.liveBots)}
@@ -1432,7 +1485,7 @@
       ["Skipped replies", Object.entries(groupingCounters.replySkipped || {}).map(([k, v]) => `${esc(k)} ${num(v)}`).join(" · ") || "none"],
       ["Assist skips", Object.entries(groupingCounters.assistSkipped || {}).map(([k, v]) => `${esc(k)} ${num(v)}`).join(" · ") || "none"],
       ["Recent unmatched", (grouping.recentUnmatched || []).map((line) => esc(line)).join(" · ") || "none"]
-    ])}<div class="section-gap"></div><p class="playerbot-label">OFFERS</p>${table(["Bot", "Player", "State", "Generation", "Expires"], groupingOfferRows, { scrollKey: "grouping-offers" })}<div class="section-gap"></div><p class="playerbot-label">GROUPED BOTS</p>${table(["Bot", "Leader", "Directive", "Tactic", "State", "Planet", "Distance", "Legs left"], groupingBotRows, { scrollKey: "grouping-bots", tall: true })}`, "span-12");
+    ])}<div class="section-gap"></div><p class="playerbot-label">OFFERS</p>${table(["Bot", "Player", "State", "Generation", "Expires"], groupingOfferRows, { scrollKey: "grouping-offers" })}<div class="section-gap"></div><p class="playerbot-label">GROUPED BOTS</p>${table(["Bot", "Leader", "Directive", "Tactic", "Heal stage", "Last heal", "State", "Planet", "Distance", "Legs left"], groupingBotRows, { scrollKey: "grouping-bots", tall: true })}`, "span-12");
     const offers = Array.isArray((pve.missionBoard || {}).offers)
       ? pve.missionBoard.offers : [];
     const offerFor = (r) => {
@@ -1636,6 +1689,7 @@
             ["Maintenance", num(progression.maintenance && progression.maintenance.ticksTotal) + " ticks · " + num(progression.maintenance && progression.maintenance.requestsQueued) + " queued"]
           ])}</div>
         </section>
+        ${healingPanel}
         ${panel("PLAYERBOT PARITY MATRIX", progressionHarness.enabled ? "harness" : "harness disabled",
           table(["Scenario", "Status", "Reason", "Ms"], progressionHarnessRows, { scrollKey: "progression-harness" }))}
         ${panel("HUNTER POSITION FEED", `${roster.length} identities · ${active} active`,

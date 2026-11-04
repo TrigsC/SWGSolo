@@ -6,10 +6,12 @@
 #define HEALDAMAGECOMMAND_H_
 
 #include "server/zone/objects/scene/SceneObject.h"
+#include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/tangible/pharmaceutical/StimPack.h"
 #include "server/zone/objects/tangible/pharmaceutical/RangedStimPack.h"
 #include "server/zone/ZoneServer.h"
 #include "server/zone/managers/player/PlayerManager.h"
+#include "server/zone/objects/creature/simplayer/SimPlayerManager.h"
 #include "server/zone/objects/creature/events/InjuryTreatmentTask.h"
 #include "server/zone/objects/creature/buffs/DelayedBuff.h"
 #include "server/zone/packets/object/CombatAction.h"
@@ -27,7 +29,47 @@ public:
 		mindCost = 50;
 	}
 
-	void deactivateInjuryTreatment(CreatureObject* creature, bool isRangedStim) const {
+	// Side-effect-free mirror of QueueCommand's common medical checks. The
+	// stock command continues to call doCommonMedicalCommandChecks so player
+	// messages and behaviour remain unchanged.
+	int checkHealerState(CreatureObject* creature) const {
+		if (!checkStateMask(creature))
+			return INVALIDSTATE;
+
+		if (!checkInvalidLocomotions(creature))
+			return INVALIDLOCOMOTION;
+
+		if (creature->isProne() || creature->isMeditating() ||
+				creature->isSwimming() || creature->isRidingMount())
+			return GENERALERROR;
+
+		return SUCCESS;
+	}
+
+	int adjustedMindCost(CreatureObject* creature) const {
+		return creature->calculateCostAdjustment(CreatureAttribute::FOCUS,
+			mindCost);
+	}
+
+	// QueueCommand keeps these stock predicates protected because ordinary
+	// commands call them only from inside doQueueCommand. The manager heal path
+	// uses the same predicates after it has acquired the stock lock order.
+	bool checkHealDistance(CreatureObject* healer, CreatureObject* patient,
+			float healRange) const {
+		return checkDistance(healer, patient, healRange);
+	}
+
+	bool checkHealPlayerEntry(CreatureObject* healer,
+			CreatureObject* patient) const {
+		return playerEntryCheck(healer, patient);
+	}
+
+	bool checkHealArena(CreatureObject* patient) const {
+		return checkForArenaDuel(patient);
+	}
+
+	static int injuryTreatmentDelaySeconds(CreatureObject* creature,
+			bool isRangedStim) {
 		float modSkill = 0.0f;
 
 		if (isRangedStim)
@@ -38,17 +80,20 @@ public:
 		int delay = (int)round(20.0f - (modSkill / 5));
 
 		if (creature->hasBuff(BuffCRC::FOOD_HEAL_RECOVERY)) {
-			DelayedBuff* buff = cast<DelayedBuff*>( creature->getBuff(BuffCRC::FOOD_HEAL_RECOVERY));
+			DelayedBuff* buff = cast<DelayedBuff*>(creature->getBuff(
+				BuffCRC::FOOD_HEAL_RECOVERY));
 
 			if (buff != nullptr) {
 				float percent = buff->getSkillModifierValue("heal_recovery");
-
 				delay = round(delay * (100.0f - percent) / 100.0f);
 			}
 		}
 
-		//Force the delay to be at least 4 seconds.
-		delay = (delay < 4) ? 4 : delay;
+		return delay < 4 ? 4 : delay;
+	}
+
+	void deactivateInjuryTreatment(CreatureObject* creature, bool isRangedStim) const {
+		int delay = injuryTreatmentDelaySeconds(creature, isRangedStim);
 
 		StringIdChatParameter message("healing_response", "healing_response_58"); //You are now ready to heal more damage.
 		Reference<InjuryTreatmentTask*> task = new InjuryTreatmentTask(creature, message, "injuryTreatment");
@@ -396,10 +441,21 @@ public:
 		}
 
 		CreatureObject* targetCreature = cast<CreatureObject*>( object.get());
+		SimPlayerManager* simManager = SimPlayerManager::instance();
+		AiAgent* targetAgent = targetCreature == nullptr ? nullptr :
+			targetCreature->asAiAgent();
+		const bool provisionalBotTarget = simManager != nullptr &&
+			simManager->isPlayerHealsBotsActive() && targetAgent != nullptr &&
+			targetAgent->getSimPlayerBot() &&
+			simManager->isPlayerBotHealPatient(targetCreature->getObjectID());
 
 		Locker clocker(targetCreature, creature);
 
-		if ((targetCreature->isAiAgent() && !targetCreature->isPet()) || targetCreature->isDroidObject() || targetCreature->isVehicleObject() || targetCreature->isDead() || targetCreature->isRidingMount() || targetCreature->isAttackableBy(creature))
+		if (((targetCreature->isAiAgent() && !targetCreature->isPet()) &&
+				!provisionalBotTarget) || targetCreature->isDroidObject() ||
+				targetCreature->isVehicleObject() || targetCreature->isDead() ||
+				targetCreature->isRidingMount() ||
+				targetCreature->isAttackableBy(creature))
 			targetCreature = creature;
 
 		uint64 pharmaceuticalObjectID = 0;
@@ -426,10 +482,23 @@ public:
 		if (stimPack == nullptr)
 			return GENERALERROR;
 
-		int mindCostNew = creature->calculateCostAdjustment(CreatureAttribute::FOCUS, mindCost);
+		// The provisional exception is intentionally limited to melee,
+		// single-target damage stims. Ranged and area stims retain the stock
+		// redirect to the healer, even when the target is an authorized roster
+		// body.
+		if (provisionalBotTarget && (stimPack->isRangedStimPack() ||
+				stimPack->isArea()))
+			targetCreature = creature;
 
-		if (!canPerformSkill(creature, targetCreature, stimPack, mindCostNew))
+		int mindCostNew = adjustedMindCost(creature);
+
+		if (!canPerformSkill(creature, targetCreature, stimPack, mindCostNew)) {
+			if (provisionalBotTarget && targetCreature != creature &&
+					!targetCreature->isHealableBy(creature))
+				simManager->recordPlayerBotHealRefused(
+					targetCreature->getObjectID(), "faction");
 			return GENERALERROR;
+		}
 
 		float rangeToCheck = 7;
 
@@ -514,6 +583,9 @@ public:
 		creature->notifyObservers(ObserverEventType::MEDPACKUSED);
 
 		checkForTef(creature, targetCreature);
+		if (provisionalBotTarget && targetCreature != creature)
+			simManager->recordPlayerBotHealOfBot(targetCreature->getObjectID(),
+				healthHealed, actionHealed);
 
 		return SUCCESS;
 	}

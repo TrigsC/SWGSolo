@@ -51,12 +51,14 @@
 #include "server/chat/room/ChatRoom.h"
 #include "server/zone/packets/chat/ChatRoomMessage.h"
 #include "server/zone/objects/player/FactionStatus.h"
+#include "templates/faction/Factions.h"
 #include "server/zone/managers/group/GroupManager.h"
 #include "server/zone/objects/group/GroupObject.h"
 #include "server/zone/objects/creature/ai/CreatureTemplate.h"
 #include "server/zone/objects/creature/ai/AiAgent.h"
 #include "server/zone/objects/tangible/threat/ThreatMap.h"
 #include "server/zone/objects/creature/commands/CombatQueueCommand.h"
+#include "server/zone/objects/creature/commands/HealDamageCommand.h"
 #include "server/zone/objects/creature/ai/PatrolPoint.h"
 #include "server/zone/objects/creature/buffs/Buff.h"
 #include "server/zone/objects/region/SpawnArea.h"
@@ -90,6 +92,8 @@
 #include "server/zone/objects/creature/ai/Creature.h"
 #include "server/zone/objects/tangible/TangibleObject.h"
 #include "server/zone/objects/tangible/consumable/Consumable.h"
+#include "server/zone/objects/tangible/pharmaceutical/PharmaceuticalObject.h"
+#include "server/zone/objects/tangible/pharmaceutical/StimPack.h"
 #include "server/zone/objects/transaction/TransactionLog.h"
 #include "server/zone/managers/object/ObjectManager.h"
 #include "server/zone/objects/pathfinding/NavArea.h"
@@ -108,6 +112,7 @@
 #include "templates/creature/VendorCreatureTemplate.h"
 #include "templates/tangible/SharedWeaponObjectTemplate.h"
 #include "templates/tangible/ConsumableTemplate.h"
+#include "templates/tangible/StimPackTemplate.h"
 #include "templates/appearance/PortalLayout.h"
 #include "templates/appearance/FloorMesh.h"
 #include "templates/appearance/PathGraph.h"
@@ -6440,6 +6445,11 @@ void SimPlayerManager::loadLuaConfig() {
 		}
 		playerBotParityCombatAbilityHarnessOptIns.removeAll();
 		playerBotParityCombatAbilityScopedIds.removeAll();
+		playerBotParityHealingHarnessOptIns.removeAll();
+		playerBotParityHealingGateScopedIds.removeAll();
+		playerBotParityHealingGateValues.removeAll();
+		playerBotParityTestHealingGateOverrideActive = false;
+		playerBotParityTestHealingGateOverride = false;
 		playerBotParityItemStatSnapshots.removeAll();
 		playerBotParityTestLootCapOverrideActive = false;
 		playerBotParityTestSuppressBazaarSalePod.set(false);
@@ -6459,6 +6469,8 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestConsumablesGateOverride = false;
 		playerBotParityTestConsumableRestockGateOverrideActive = false;
 		playerBotParityTestConsumableRestockGateOverride = false;
+		playerBotParityTestHealingGateOverrideActive = false;
+		playerBotParityTestHealingGateOverride = false;
 		playerBotParityArmorGateScopedIds.removeAll();
 	playerBotParityBodyTemplateOverrides.removeAll();
 		playerBotParityBodyTemplateOverrides.removeAll();
@@ -6511,6 +6523,8 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestCombatAbilitiesGateOverrideActive = false;
 		playerBotParityTestCombatAbilitiesGateOverridePreviousActive = false;
 		playerBotParityTestCombatAbilitiesGateOverridePrevious = false;
+		playerBotParityTestHealingGateOverrideActive = false;
+		playerBotParityTestHealingGateOverride = false;
 		playerBotParityTestMissionCreditGateOverrideActive = false;
 		playerBotParityTestMissionCreditGateOverridePreviousActive = false;
 		playerBotParityTestMissionCreditGateOverridePrevious = false;
@@ -8234,6 +8248,14 @@ bool SimPlayerManager::computePlayerBotNextTrainingStepLocked(uint64 identityId,
 	SkillManager* skillManager = SkillManager::instance();
 	if (skillManager == nullptr)
 		return false;
+	Vector<String> effectiveDeferred = progressionEarlyGameConfig.deferredXpTypes;
+	if (progressionEnabled && progressionHealingEnabled &&
+			progressionHealingPolicy.botHeals) {
+		for (int i = effectiveDeferred.size() - 1; i >= 0; --i) {
+			if (effectiveDeferred.get(i) == "medical")
+				effectiveDeferred.remove(i);
+		}
+	}
 
 	// The lifetime-earned threshold for one box: its own cost plus every
 	// already-trained box funded by the same XP type, because XP is spent
@@ -8287,8 +8309,8 @@ bool SimPlayerManager::computePlayerBotNextTrainingStepLocked(uint64 identityId,
 			Skill* box = skillManager->getSkill(skillName);
 			if (box == nullptr)
 				return false;
-			if (earlyGameGateEnabled && progressionEarlyGameConfig
-					.deferredXpTypes.contains(box->getXpType()))
+			if (earlyGameGateEnabled && effectiveDeferred.contains(
+					box->getXpType()))
 				continue;
 
 			bool prerequisitesMet = true;
@@ -8339,8 +8361,8 @@ bool SimPlayerManager::computePlayerBotNextTrainingStepLocked(uint64 identityId,
 		// P.10g: only an explicitly configured deferred XP source may be
 		// skipped. A source that is merely disabled is still the next box and
 		// therefore remains BLOCKED rather than silently becoming graduated.
-		if (earlyGameGateEnabled && progressionEarlyGameConfig.deferredXpTypes
-				.contains(nextSkill->getXpType()))
+		if (earlyGameGateEnabled && effectiveDeferred.contains(
+				nextSkill->getXpType()))
 			continue;
 
 		int64 threshold = nextSkill->getXpCost();
@@ -8982,6 +9004,394 @@ SimBotArmorPolicy SimPlayerManager::snapshotPlayerBotArmorPolicy() {
 SimBotConsumablePolicy SimPlayerManager::snapshotPlayerBotConsumablePolicy() {
 	Locker progressionLock(&progressionMutex);
 	return progressionConsumablePolicy;
+}
+
+SimBotHealing::PlayerBotHealingPolicy
+SimPlayerManager::snapshotPlayerBotHealingPolicy() {
+	Locker progressionLock(&progressionMutex);
+	return progressionHealingPolicy;
+}
+
+SimBotHealing::PlayerBotHealingPolicy
+SimPlayerManager::getPlayerBotHealingPolicy() {
+	return snapshotPlayerBotHealingPolicy();
+}
+
+bool SimPlayerManager::isPlayerBotBotHealsActive(uint64 identityId) {
+	return playerBotBotHealsGateEnabled(identityId);
+}
+
+bool SimPlayerManager::isPlayerBotMedic(uint64 identityId) {
+	return playerBotIsMedic(identityId);
+}
+
+bool SimPlayerManager::snapshotPlayerBotHealingStimStacks(uint64 identityId,
+		std::vector<SimBotHealing::StimStack>& stacks) {
+	return snapshotPlayerBotStimStacks(identityId, stacks);
+}
+
+bool SimPlayerManager::snapshotPlayerBotStimStacks(uint64 identityId,
+		std::vector<SimBotHealing::StimStack>& stacks) {
+	stacks.clear();
+	VectorMap<uint64, uint32> heldRows;
+	int maxItems = 0;
+	{
+		Locker progressionLock(&progressionMutex);
+		maxItems = progressionLootMaxItemsPerBot;
+		if (!progressionRecords.contains(identityId) ||
+				progressionHealingPolicy.items.isEmpty())
+			return false;
+		for (int i = 0; i < progressionItems.size(); ++i) {
+			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+			if (row.identityId != identityId || row.state != SIMBOT_ITEM_HELD)
+				continue;
+			for (int itemIndex = 0;
+					itemIndex < progressionHealingPolicy.items.size(); ++itemIndex) {
+				if (progressionHealingPolicy.items.get(itemIndex).templateCrc ==
+						row.templateCrc) {
+					heldRows.put(row.objectId, row.templateCrc);
+					break;
+				}
+			}
+		}
+	}
+
+	if (maxItems <= 0 || heldRows.isEmpty())
+		return true;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+		economyManager->getItemBag(identityId);
+	if (zoneServer == nullptr || bag == nullptr)
+		return false;
+
+	for (int i = 0; i < heldRows.size() &&
+			static_cast<int>(stacks.size()) < maxItems; ++i) {
+		const uint64 objectId = heldRows.elementAt(i).getKey();
+		ManagedReference<SceneObject*> object = zoneServer->getObject(objectId);
+		if (object == nullptr || object->getParent().get() != bag.get())
+			continue;
+		PharmaceuticalObject* pharmaceutical = cast<PharmaceuticalObject*>(
+			object.get());
+		StimPack* stim = pharmaceutical == nullptr ? nullptr :
+			cast<StimPack*>(pharmaceutical);
+		if (stim == nullptr || !pharmaceutical->isStimPack() ||
+				pharmaceutical->isRangedStimPack() ||
+				pharmaceutical->isPetStimPack() ||
+				pharmaceutical->isDroidRepairKit())
+			continue;
+		Locker itemLock(object);
+		if (object->getParent().get() != bag.get() || stim->getUseCount() == 0)
+			continue;
+		SimBotHealing::StimStack stack;
+		stack.objectId = objectId;
+		stack.templateCrc = heldRows.elementAt(i).getValue();
+		stack.doses = static_cast<int>(stim->getUseCount());
+		stack.medicineUseRequired = stim->getMedicineUseRequired();
+		stack.effectiveness = static_cast<int>(stim->getEffectiveness());
+		stacks.push_back(stack);
+	}
+	return true;
+}
+
+void SimPlayerManager::recordPlayerBotHealOfBot(uint64 patientOid,
+		int healthHealed, int actionHealed) {
+	playerBotHealingPlayerHealsOfBots.increment();
+	playerBotHealingHealthHealed.add(static_cast<uint64>(Math::max(0,
+		healthHealed)));
+	playerBotHealingActionHealed.add(static_cast<uint64>(Math::max(0,
+		actionHealed)));
+	if (MissionDiagLog::isLoggingEnabled())
+		MissionDiagLog::event("HEAL", patientOid,
+			"direction=player_to_bot health=" + String::valueOf(healthHealed) +
+			" action=" + String::valueOf(actionHealed));
+}
+
+void SimPlayerManager::recordPlayerBotHealRefused(uint64 patientOid,
+		const String& reason) {
+	if (reason == "faction")
+		playerBotHealingPlayerHealRefusedFaction.increment();
+	if (MissionDiagLog::isLoggingEnabled())
+		MissionDiagLog::event("HEAL", patientOid, "direction=player_to_bot refused=" +
+			reason);
+}
+
+PlayerBotHealResult SimPlayerManager::applyPlayerBotStimHeal(uint64 identityId,
+		AiAgent* healer, CreatureObject* patient, uint64 stimOid) {
+	PlayerBotHealResult result;
+	if (identityId == 0 || healer == nullptr || patient == nullptr ||
+			!playerBotBotHealsGateEnabled(identityId)) {
+		result.reason = "gate_off";
+		return result;
+	}
+
+	uint64 mappedBodyOid = 0;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveIdentityBodyOids.contains(identityId)) {
+			result.reason = "no_body";
+			return result;
+		}
+		mappedBodyOid = pveIdentityBodyOids.get(identityId);
+	}
+	if (mappedBodyOid == 0 || mappedBodyOid != healer->getObjectID()) {
+		result.reason = "stale_body";
+		return result;
+	}
+
+	std::vector<SimBotHealing::StimStack> stacks;
+	if (!snapshotPlayerBotStimStacks(identityId, stacks)) {
+		result.reason = "no_stim";
+		playerBotHealingRefusedNoStim.increment();
+		return result;
+	}
+	const uint64 patientOid = patient->getObjectID();
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<CreatureObject*> patientObject = zoneServer == nullptr ?
+		nullptr : zoneServer->getObject(patientOid).castTo<CreatureObject*>();
+	if (patientObject == nullptr) {
+		result.reason = "patient_gone";
+		return result;
+	}
+
+	const HealDamageCommand* command = nullptr;
+	ObjectController* objectController = zoneServer == nullptr ? nullptr :
+		zoneServer->getObjectController();
+	if (objectController != nullptr)
+		command = cast<const HealDamageCommand*>(objectController->
+			getQueueCommand("healdamage"));
+	if (command == nullptr) {
+		result.reason = "no_command";
+		return result;
+	}
+
+	uint64 selectedStimOid = stimOid;
+	uint32 stimPower = 0;
+	int mindCost = 0;
+	String healerName;
+	int healthHealed = 0;
+	int actionHealed = 0;
+	int dosesLeft = 0;
+	bool selfHeal = false;
+	bool lastDose = false;
+	{
+		Locker healerLock(healer);
+		if (healer->isDead() || healer->isIncapacitated() ||
+				healer->getZone() == nullptr) {
+			result.reason = "healer_unavailable";
+			return result;
+		}
+		const int state = command->checkHealerState(healer);
+		if (state != SUCCESS) {
+			result.reason = "state";
+			return result;
+		}
+		if (!healer->canTreatInjuries()) {
+			result.reason = "cooldown";
+			playerBotHealingRefusedCooldown.increment();
+			return result;
+		}
+		mindCost = command->adjustedMindCost(healer);
+		if (healer->getHAM(CreatureAttribute::MIND) < mindCost) {
+			result.reason = "mind";
+			playerBotHealingRefusedMind.increment();
+			return result;
+		}
+
+		if (selectedStimOid == 0) {
+			std::vector<SimBotHealing::StimStack> eligible;
+			for (size_t i = 0; i < stacks.size(); ++i)
+				eligible.push_back(stacks[i]);
+			const int selected = SimBotHealing::chooseStim(eligible,
+				healer->getSkillMod("healing_ability"));
+			if (selected < 0) {
+				result.reason = "no_stim";
+				playerBotHealingRefusedNoStim.increment();
+				return result;
+			}
+			selectedStimOid = eligible[selected].objectId;
+		} else {
+			bool held = false;
+			for (size_t i = 0; i < stacks.size(); ++i) {
+				if (stacks[i].objectId == selectedStimOid && stacks[i].doses > 0 &&
+						stacks[i].medicineUseRequired <=
+						healer->getSkillMod("healing_ability")) {
+					held = true;
+					break;
+				}
+			}
+			if (!held) {
+				result.reason = "no_stim";
+				playerBotHealingRefusedNoStim.increment();
+				return result;
+			}
+		}
+
+		ManagedReference<SceneObject*> stimObject = zoneServer->getObject(
+			selectedStimOid);
+		PharmaceuticalObject* pharmaceutical = stimObject == nullptr ? nullptr :
+			cast<PharmaceuticalObject*>(stimObject.get());
+		StimPack* stim = pharmaceutical == nullptr ? nullptr :
+			cast<StimPack*>(pharmaceutical);
+		AiEconomyManager* economyManager = AiEconomyManager::instance();
+		ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+			economyManager->getItemBag(identityId);
+		if (stim == nullptr || bag == nullptr ||
+				stimObject->getParent().get() != bag.get() ||
+				!pharmaceutical->isStimPack() || pharmaceutical->isRangedStimPack() ||
+				pharmaceutical->isPetStimPack() ||
+				pharmaceutical->isDroidRepairKit()) {
+			result.reason = "no_stim";
+			playerBotHealingRefusedNoStim.increment();
+			return result;
+		}
+
+		Locker patientLock(patientObject, healer);
+		selfHeal = patientObject.get() == healer;
+		// Damage stims on players and roster bots only (G5 scope); a pet would
+		// also pay medical XP, which stock never does.
+		if (!selfHeal && (patientObject->isPet() ||
+				(!patientObject->isPlayerCreature() &&
+				 patientObject->asAiAgent() == nullptr))) {
+			result.reason = "refused";
+			return result;
+		}
+		if (patientObject->isDead()) {
+			result.reason = "patient_dead";
+			return result;
+		}
+		if (!selfHeal && !patientObject->isHealableBy(healer)) {
+			result.reason = "faction";
+			playerBotHealingRefusedFaction.increment();
+			return result;
+		}
+		if (!selfHeal && !command->checkHealDistance(healer,
+				patientObject.get(), 7.f)) {
+			result.reason = "range";
+			playerBotHealingRefusedRange.increment();
+			return result;
+		}
+		if (!selfHeal && !CollisionManager::checkLineOfSight(healer,
+				patientObject.get())) {
+			result.reason = "los";
+			playerBotHealingRefusedLos.increment();
+			return result;
+		}
+		if (!command->checkHealPlayerEntry(healer, patientObject.get())) {
+			result.reason = "range";
+			playerBotHealingRefusedRange.increment();
+			return result;
+		}
+		if (!selfHeal && command->checkHealArena(patientObject.get())) {
+			result.reason = "arena";
+			playerBotHealingRefusedArena.increment();
+			return result;
+		}
+		if (!patientObject->hasDamage(CreatureAttribute::HEALTH) &&
+				!patientObject->hasDamage(CreatureAttribute::ACTION)) {
+			result.reason = "no_damage";
+			playerBotHealingRefusedNoDamage.increment();
+			return result;
+		}
+
+		Locker itemLock(stimObject);
+		if (stimObject->getParent().get() != bag.get() || stim->getUseCount() == 0) {
+			result.reason = "no_stim";
+			playerBotHealingRefusedNoStim.increment();
+			return result;
+		}
+		stimPower = stim->calculatePower(healer, patientObject);
+		Vector<byte> attributes = stim->getAttributes();
+		bool notifyObservers = true;
+		if (attributes.contains(CreatureAttribute::HEALTH)) {
+			healthHealed = patientObject->healDamage(healer,
+				CreatureAttribute::HEALTH, stimPower);
+			notifyObservers = false;
+		}
+		if (attributes.contains(CreatureAttribute::ACTION)) {
+			if (notifyObservers) {
+				actionHealed = patientObject->healDamage(healer,
+					CreatureAttribute::ACTION, stimPower);
+				notifyObservers = false;
+			} else {
+				actionHealed = patientObject->healDamage(healer,
+					CreatureAttribute::ACTION, stimPower, true, false);
+			}
+		}
+		if (healthHealed <= 0 && actionHealed <= 0) {
+			result.reason = "no_damage";
+			playerBotHealingRefusedNoDamage.increment();
+			return result;
+		}
+		healer->inflictDamage(healer, CreatureAttribute::MIND, mindCost, false);
+		dosesLeft = static_cast<int>(stim->getUseCount()) - 1;
+		stim->setUseCount(static_cast<uint32>(Math::max(0, dosesLeft)), true);
+		lastDose = dosesLeft <= 0;
+		healerName = healer->getDisplayedName();
+	}
+
+	result.reason = "healed";
+	result.healthHealed = healthHealed;
+	result.actionHealed = actionHealed;
+	result.dosesLeft = dosesLeft;
+	result.stimOid = selectedStimOid;
+	playerBotHealingStimsConsumed.increment();
+	playerBotHealingHealthHealed.add(static_cast<uint64>(Math::max(0,
+		healthHealed)));
+	playerBotHealingActionHealed.add(static_cast<uint64>(Math::max(0,
+		actionHealed)));
+	if (selfHeal)
+		playerBotHealingBotHealsSelf.increment();
+	else
+		playerBotHealingBotHealsOthers.increment();
+
+	{
+		// Stock runs the cooldown, effects and observers with the healer locked.
+		Locker healerLock(healer);
+		command->deactivateInjuryTreatment(healer, false);
+		command->doAnimations(healer, patientObject.get());
+		healer->notifyObservers(ObserverEventType::MEDPACKUSED);
+	}
+	if (patientObject->isPlayerCreature()) {
+		StringBuffer message;
+		if (selfHeal)
+			message << "You heal yourself for " << healthHealed << " health and " <<
+				actionHealed << " action damage.";
+		else
+			message << healerName << " heals you for " << healthHealed <<
+				" health and " << actionHealed << " action damage.";
+		patientObject->sendSystemMessage(message.toString());
+	}
+	if (!selfHeal) {
+		const int requestedXp = static_cast<int>(std::round(
+			0.25f * static_cast<float>(healthHealed + actionHealed)));
+		int awarded = 0;
+		if (requestedXp > 0 && grantPlayerBotExperience(identityId, "medical",
+				requestedXp, "heal", &awarded)) {
+			result.xpAwarded = awarded;
+			playerBotHealingMedicalXpAwarded.add(static_cast<uint64>(
+				Math::max(0, awarded)));
+		}
+	}
+	if (lastDose)
+		removePlayerBotConsumedItem(identityId, selectedStimOid);
+	if (MissionDiagLog::isLoggingEnabled())
+		MissionDiagLog::event("HEAL", identityId,
+			"patient=" + String::valueOf(patientOid) + " health=" +
+			String::valueOf(healthHealed) + " action=" +
+			String::valueOf(actionHealed) + " stim=" +
+			String::valueOf(selectedStimOid));
+	{
+		Locker groupingLock(&groupingMutex);
+		PlayerBotHealObservation observation;
+		observation.patientOid = patientOid;
+		observation.atMs = System::getMiliTime();
+		observation.healthHealed = healthHealed;
+		observation.actionHealed = actionHealed;
+		observation.reason = result.reason;
+		playerBotHealingLast.put(identityId, observation);
+	}
+	return result;
 }
 
 bool SimPlayerManager::snapshotPlayerBotConsumableStacks(uint64 identityId,
@@ -9796,6 +10206,105 @@ bool SimPlayerManager::playerBotConsumableRestockGateEnabled(
 	return restock;
 }
 
+bool SimPlayerManager::playerBotHealingGateEnabled(uint64 identityId) {
+	if (!progressionEnabled)
+		return false;
+
+	bool configuredOverride = false;
+	bool hasOverride = false;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (identityId != 0 && playerBotParityHealingGateScopedIds.contains(
+				identityId)) {
+			hasOverride = true;
+			configuredOverride = playerBotParityHealingGateValues.contains(
+				identityId) ? playerBotParityHealingGateValues.get(identityId) :
+				playerBotParityTestHealingGateOverride;
+		} else if (identityId == 0 &&
+				playerBotParityTestHealingGateOverrideActive) {
+			hasOverride = true;
+			configuredOverride = playerBotParityTestHealingGateOverride;
+		}
+	}
+
+	bool enabled = false;
+	bool loaded = false;
+	{
+		Locker progressionLock(&progressionMutex);
+		enabled = progressionHealingEnabled;
+		loaded = progressionLoaded;
+	}
+	if (hasOverride)
+		enabled = configuredOverride;
+	if (!enabled || !loaded || progressionItemReconcilePending.load())
+		return false;
+	if (!playerBotEarlyGameGateEnabled())
+		return false;
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	if (economyManager == nullptr || !economyManager->isItemVaultAvailable())
+		return false;
+	if (identityId == 0)
+		return true;
+	SimBotIdentity identity;
+	return snapshotPlayerBotIdentity(identityId, identity) &&
+		!identity.trainingPlan.isEmpty();
+}
+
+bool SimPlayerManager::playerBotBotHealsGateEnabled(uint64 identityId) {
+	if (!playerBotHealingGateEnabled(identityId))
+		return false;
+	SimBotHealing::PlayerBotHealingPolicy policy =
+		snapshotPlayerBotHealingPolicy();
+	return policy.botHeals;
+}
+
+Vector<String> SimPlayerManager::effectiveDeferredXpTypes(uint64 identityId) {
+	Vector<String> deferred;
+	{
+		Locker progressionLock(&progressionMutex);
+		deferred = progressionEarlyGameConfig.deferredXpTypes;
+	}
+	if (!playerBotBotHealsGateEnabled(identityId))
+		return deferred;
+	for (int i = deferred.size() - 1; i >= 0; --i) {
+		if (deferred.get(i) == "medical")
+			deferred.remove(i);
+	}
+	return deferred;
+}
+
+bool SimPlayerManager::playerBotHealRestockGateEnabled(uint64 identityId) {
+	if (!playerBotBotHealsGateEnabled(identityId) ||
+			!playerBotBazaarBuyGateEnabled(identityId))
+		return false;
+	return snapshotPlayerBotHealingPolicy().bazaarRestock;
+}
+
+// The live body's healing_ability (trained Medic boxes), 0 when not a medic.
+// Takes pveMutex, then the body lock; call with no lock held.
+int SimPlayerManager::playerBotHealingAbility(uint64 identityId) {
+	uint64 bodyOid = 0;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveIdentityBodyOids.contains(identityId))
+			return 0;
+		bodyOid = pveIdentityBodyOids.get(identityId);
+	}
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<AiAgent*> body = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(bodyOid).castTo<AiAgent*>();
+	if (body == nullptr)
+		return 0;
+	Locker bodyLock(body);
+	if (body->isDead() || body->getZone() == nullptr)
+		return 0;
+	return Math::max(0, body->getSkillMod("healing_ability"));
+}
+
+bool SimPlayerManager::playerBotIsMedic(uint64 identityId) {
+	return playerBotHealingAbility(identityId) > 0;
+}
+
 bool SimPlayerManager::playerBotArmorBazaarUpgradesGateEnabled(
 		uint64 identityId) {
 	if (!playerBotArmorLoadoutGateEnabled(identityId) ||
@@ -9852,11 +10361,17 @@ void SimPlayerManager::collectPlayerBotProtectedArmorOids(uint64 identityId,
 
 void SimPlayerManager::collectPlayerBotProtectedConsumableOids(
 		uint64 identityId, VectorMap<uint64, bool>& protectedIds) {
-	if (!playerBotConsumablesGateEnabled(identityId))
+	const bool foodEnabled = playerBotConsumablesGateEnabled(identityId);
+	const bool healingEnabled = playerBotHealingGateEnabled(identityId);
+	if (!foodEnabled && !healingEnabled)
 		return;
 
-	SimBotConsumablePolicy policy = snapshotPlayerBotConsumablePolicy();
-	if (policy.items.isEmpty())
+	SimBotConsumablePolicy policy = foodEnabled ?
+		snapshotPlayerBotConsumablePolicy() : SimBotConsumablePolicy();
+	SimBotHealing::PlayerBotHealingPolicy healingPolicy = healingEnabled ?
+		snapshotPlayerBotHealingPolicy() :
+		SimBotHealing::PlayerBotHealingPolicy();
+	if (policy.items.isEmpty() && healingPolicy.items.isEmpty())
 		return;
 
 	Locker progressionLock(&progressionMutex);
@@ -9864,11 +10379,22 @@ void SimPlayerManager::collectPlayerBotProtectedConsumableOids(
 		const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
 		if (row.identityId != identityId || row.state != SIMBOT_ITEM_HELD)
 			continue;
+		bool protectedItem = false;
 		for (int itemIndex = 0; itemIndex < policy.items.size(); ++itemIndex) {
 			if (policy.items.get(itemIndex).templateCrc == row.templateCrc) {
-				protectedIds.put(row.objectId, true);
+				protectedItem = true;
 				break;
 			}
+		}
+		for (int itemIndex = 0; !protectedItem &&
+				itemIndex < healingPolicy.items.size(); ++itemIndex) {
+			if (healingPolicy.items.get(itemIndex).templateCrc == row.templateCrc) {
+				protectedItem = true;
+				break;
+			}
+		}
+		if (protectedItem) {
+				protectedIds.put(row.objectId, true);
 		}
 	}
 }
@@ -11220,11 +11746,13 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 	SimBotCombatAbilityConfig previousCombatAbilityConfig;
 	SimBotArmorPolicy armorPolicy;
 	SimBotConsumablePolicy consumablePolicy;
+	SimBotHealing::PlayerBotHealingPolicy healingPolicy;
 	{
 		Locker progressionLock(&progressionMutex);
 		previousCombatAbilityConfig = progressionCombatAbilityConfig;
 		armorPolicy = progressionArmorPolicy;
 		consumablePolicy = progressionConsumablePolicy;
+		healingPolicy = progressionHealingPolicy;
 	}
 
 	bool progressionEnabledOverrideActive = false;
@@ -11362,6 +11890,8 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		armorPolicy.enabled);
 	consumablePolicy.enabled = config.getBooleanField("consumablesEnabled",
 		consumablePolicy.enabled);
+	const bool healingEnabled = config.getBooleanField("healingEnabled",
+		progressionHealingEnabled);
 	LuaObject loadout = config.getObjectField("loadout");
 	if (loadout.isValidTable()) {
 		progressionLoadoutMinUpgradePercent = clampFloatRange(
@@ -11525,6 +12055,104 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		items.pop();
 	}
 	consumables.pop();
+
+	LuaObject healing = config.getObjectField("healing");
+	if (healing.isValidTable()) {
+		healingPolicy.playerHealsBots = healing.getBooleanField(
+			"playerHealsBots", healingPolicy.playerHealsBots);
+		healingPolicy.botHeals = healing.getBooleanField("botHeals",
+			healingPolicy.botHeals);
+		healingPolicy.selfHeal = healing.getBooleanField("selfHeal",
+			healingPolicy.selfHeal);
+		healingPolicy.groupHealThreshold = clampFloatRange(
+			healing.getFloatField("groupHealThreshold",
+				healingPolicy.groupHealThreshold), 0.f, 1.f);
+		healingPolicy.selfHealThreshold = clampFloatRange(
+			healing.getFloatField("selfHealThreshold",
+				healingPolicy.selfHealThreshold), 0.f, 1.f);
+		healingPolicy.selfCriticalFraction = clampFloatRange(
+			healing.getFloatField("selfCriticalFraction",
+				healingPolicy.selfCriticalFraction), 0.f, 1.f);
+		healingPolicy.maxApproachMeters = clampFloatRange(
+			healing.getFloatField("maxApproachMeters",
+				healingPolicy.maxApproachMeters), 1.f, 256.f);
+		healingPolicy.applyRangeMeters = clampFloatRange(
+			healing.getFloatField("applyRangeMeters",
+				healingPolicy.applyRangeMeters), 1.f, 256.f);
+		healingPolicy.approachTimeoutSeconds = clampIntRange(
+			healing.getIntField("approachTimeoutSeconds",
+				healingPolicy.approachTimeoutSeconds), 1, 86400);
+		healingPolicy.applyTimeoutSeconds = clampIntRange(
+			healing.getIntField("applyTimeoutSeconds",
+				healingPolicy.applyTimeoutSeconds), 1, 86400);
+		healingPolicy.bazaarRestock = healing.getBooleanField(
+			"bazaarRestock", healingPolicy.bazaarRestock);
+		healingPolicy.minDoses = clampIntRange(healing.getIntField(
+			"minDoses", healingPolicy.minDoses), 1, 100000);
+		healingPolicy.restockSpendFraction = clampFloatRange(
+			healing.getFloatField("restockSpendFraction",
+				healingPolicy.restockSpendFraction), 0.f, 1.f);
+		healingPolicy.restockScanIntervalMinutes = clampIntRange(
+			healing.getIntField("restockScanIntervalMinutes",
+				healingPolicy.restockScanIntervalMinutes), 1, 10080);
+		healingPolicy.maxRestockLoadsPerVisit = clampIntRange(
+			healing.getIntField("maxRestockLoadsPerVisit",
+				healingPolicy.maxRestockLoadsPerVisit), 1, 1000);
+		LuaObject items = healing.getObjectField("items");
+		if (items.isValidTable()) {
+			healingPolicy.items.removeAll();
+			StringBuffer signature;
+			signature << healingPolicy.playerHealsBots << ":" <<
+				healingPolicy.botHeals << ":" << healingPolicy.selfHeal << ":" <<
+				healingPolicy.groupHealThreshold << ":" <<
+				healingPolicy.selfHealThreshold << ":" <<
+				healingPolicy.selfCriticalFraction << ":" <<
+				healingPolicy.maxApproachMeters << ":" <<
+				healingPolicy.applyRangeMeters << ":" <<
+				healingPolicy.approachTimeoutSeconds << ":" <<
+				healingPolicy.applyTimeoutSeconds << ":" <<
+				healingPolicy.bazaarRestock << ":" << healingPolicy.minDoses << ":" <<
+				healingPolicy.restockSpendFraction << ":" <<
+				healingPolicy.restockScanIntervalMinutes << ":" <<
+				healingPolicy.maxRestockLoadsPerVisit;
+			for (int i = 1; i <= items.getTableSize(); ++i) {
+				LuaObject item = items.getObjectAt(i);
+				if (!item.isValidTable()) {
+					item.pop();
+					continue;
+				}
+				String templatePath = item.getStringField("template").trim();
+				float maxPrice = item.getFloatField("maxPricePerDose", 0.f);
+				SharedObjectTemplate* objectTemplate = templatePath.isEmpty() ?
+					nullptr : TemplateManager::instance()->getTemplate(
+						templatePath.hashCode());
+				StimPackTemplate* stimTemplate = objectTemplate == nullptr ?
+					nullptr : dynamic_cast<StimPackTemplate*>(objectTemplate);
+				if (templatePath.isEmpty() || stimTemplate == nullptr ||
+						!objectTemplate->isStimPackTemplate() || maxPrice <= 0.f) {
+					warning("SimBotHealingRejected template=" + templatePath);
+					item.pop();
+					continue;
+				}
+				SimBotHealing::PlayerBotHealingPolicy::StimEntry entry;
+				entry.templatePath = templatePath;
+				entry.templateCrc = templatePath.hashCode();
+				entry.gameObjectType = stimTemplate->getClientGameObjectType();
+				entry.minDoses = healingPolicy.minDoses;
+				entry.maxPricePerDose = maxPrice;
+				entry.medicineUse = stimTemplate->getMedicineUse();
+				healingPolicy.items.add(entry);
+				signature << ":" << entry.templatePath << ":" <<
+					entry.templateCrc << ":" << entry.gameObjectType << ":" <<
+					entry.minDoses << ":" << entry.maxPricePerDose << ":" <<
+					entry.medicineUse;
+				item.pop();
+			}
+			healingPolicy.signature = signature.toString();
+		}
+		items.pop();
+	}
+	healing.pop();
 
 	// F_0.9.15 G1: parse the grouping capability independently from the
 	// future room/controller behavior.  Read the parent gate before opening the
@@ -11759,6 +12387,12 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 					groupingConfig.vocabulary.ready);
 			loadGroupingStringList(vocabulary, "leave",
 					groupingConfig.vocabulary.leave);
+			loadGroupingStringList(vocabulary, "heal",
+					groupingConfig.healingVocabulary.heal);
+			loadGroupingStringList(vocabulary, "self",
+					groupingConfig.healingVocabulary.self);
+			loadGroupingStringList(vocabulary, "everyone",
+					groupingConfig.healingVocabulary.everyone);
 
 			LuaObject rallyVocabulary = vocabulary.getObjectField("rally");
 			if (rallyVocabulary.isValidTable()) {
@@ -11970,6 +12604,22 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 					groupingConfig.buffsLowLines);
 			loadGroupingEngineStringList(lines, "followAck",
 					groupingConfig.followAckLines);
+			loadGroupingEngineStringList(lines, "healOnIt",
+					groupingConfig.healOnItLines);
+			loadGroupingEngineStringList(lines, "healNoStims",
+					groupingConfig.healNoStimsLines);
+			loadGroupingEngineStringList(lines, "healNotHurt",
+					groupingConfig.healNotHurtLines);
+			loadGroupingEngineStringList(lines, "healCantReach",
+					groupingConfig.healCantReachLines);
+			loadGroupingEngineStringList(lines, "healRefused",
+					groupingConfig.healRefusedLines);
+			loadGroupingEngineStringList(lines, "healCooldown",
+					groupingConfig.healCooldownLines);
+			loadGroupingEngineStringList(lines, "healNoMedic",
+					groupingConfig.healNoMedicLines);
+			loadGroupingEngineStringList(lines, "healLowStims",
+					groupingConfig.healLowStimsLines);
 			loadGroupingEngineStringList(lines, "missionGrabAck",
 					groupingConfig.missions.missionGrabAckLines);
 			loadGroupingEngineStringList(lines, "missionGrabbed",
@@ -12049,6 +12699,9 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		groupingConfig.tacticsEnabled, std::memory_order_release);
 	playerBotMissionCreditsActive.store(progressionEnabled &&
 		progressionAwardMissionCredits, std::memory_order_release);
+	progressionHealingEnabled = healingEnabled;
+	playerHealsBotsActive.store(progressionEnabled && healingEnabled &&
+		healingPolicy.playerHealsBots, std::memory_order_release);
 
 	{
 		Locker progressionLock(&progressionMutex);
@@ -12058,6 +12711,9 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		if (!simBotConsumablePolicyEquals(progressionConsumablePolicy,
 				consumablePolicy))
 			progressionConsumablePolicy = consumablePolicy;
+		if (progressionHealingPolicy.signature != healingPolicy.signature)
+			progressionStimRestockScanAtMs.removeAll();
+		progressionHealingPolicy = healingPolicy;
 	}
 	LuaObject buffPayment = config.getObjectField("buffPayment");
 	if (buffPayment.isValidTable()) {
@@ -12626,6 +13282,19 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 		step.hasCombatAbilityHarnessOptIn = step.combatAbilityHarnessOptIn ==
 			table.getBooleanField("optIn", true);
 	}
+	step.healingHarnessOptIn = table.getBooleanField(
+		"healingHarnessOptIn", false);
+	step.hasHealingHarnessOptIn = step.healingHarnessOptIn ==
+		table.getBooleanField("healingHarnessOptIn", true);
+	if (!step.hasHealingHarnessOptIn) {
+		step.healingHarnessOptIn = table.getBooleanField("healingOptIn", false);
+		step.hasHealingHarnessOptIn = step.healingHarnessOptIn ==
+			table.getBooleanField("healingOptIn", true);
+	}
+	step.healingFactionStatus = table.getStringField("factionStatus").trim()
+		.toLowerCase();
+	step.healingHealerRef = table.getStringField("healer").trim();
+	step.healingPatientRef = table.getStringField("patient").trim();
 	LuaObject damageByType = table.getObjectField("damageByType");
 	if (damageByType.isValidTable()) {
 		for (int i = 1; i <= damageByType.getTableSize(); ++i) {
@@ -15255,13 +15924,25 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 	const bool upgradeGate = weaponUpgradeGate || armorUpgradeGate;
 	const bool consumableRestockGate = buyGate &&
 		playerBotConsumableRestockGateEnabled(identityId);
+	const int healingAbility = buyGate &&
+		playerBotHealRestockGateEnabled(identityId) ?
+		playerBotHealingAbility(identityId) : 0;
+	const bool healingRestockGate = healingAbility > 0;
 	SimBotConsumablePolicy consumablePolicy;
 	std::vector<SimBotConsumables::HeldStack> consumableStacks;
 	bool haveConsumableSnapshot = false;
 	if (consumableRestockGate) {
 		consumablePolicy = snapshotPlayerBotConsumablePolicy();
 		haveConsumableSnapshot = snapshotPlayerBotConsumableStacks(identityId,
-			consumableStacks);
+		consumableStacks);
+	}
+	SimBotHealing::PlayerBotHealingPolicy healingPolicy;
+	std::vector<SimBotHealing::StimStack> healingStacks;
+	bool haveHealingSnapshot = false;
+	if (healingRestockGate) {
+		healingPolicy = snapshotPlayerBotHealingPolicy();
+		haveHealingSnapshot = snapshotPlayerBotStimStacks(identityId,
+			healingStacks);
 	}
 	const int unmetBuyNeeds = buyGate ?
 		playerBotUnmetBuyNeeds(identityId) : 0;
@@ -15431,6 +16112,51 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 				// This timestamp records a market scan admission, not a successful
 				// purchase. Empty or rejected markets wait for the next interval.
 				progressionConsumableRestockScanAtMs.put(identityId, nowMs);
+				return true;
+			}
+		}
+		if (healingRestockGate && haveHealingSnapshot &&
+				healingPolicy.items.size() > 0) {
+			int pendingPurchases = 0;
+			for (int i = 0; i < progressionBazaarPurchases.size(); ++i) {
+				const PlayerBotBazaarPurchase& purchase =
+					progressionBazaarPurchases.elementAt(i).getValue();
+				if (purchase.identityId == identityId &&
+						(purchase.state == PLAYER_BOT_PURCHASE_DEBITED ||
+						 purchase.state == PLAYER_BOT_PURCHASE_RESOLVE_PENDING))
+					++pendingPurchases;
+			}
+			const SimBotProgression& progression = progressionRecords.get(identityId);
+			const int64 spendable = progression.bankCredits -
+				reservedPlayerBotCreditsLocked(identityId, true) -
+				progressionBazaarBuyReserveCredits;
+			const int64 spendCeiling = std::min<int64>(
+				std::max(0, progressionBazaarMaxPrice),
+				static_cast<int64>(std::floor(std::max<int64>(0, spendable) *
+					std::max(0.f, std::min(1.f,
+						healingPolicy.restockSpendFraction)))));
+			const uint64 scanIntervalMs = static_cast<uint64>(
+				healingPolicy.restockScanIntervalMinutes) * 60000ULL;
+			const bool scanDue = !progressionStimRestockScanAtMs.contains(identityId) ||
+				nowMs >= progressionStimRestockScanAtMs.get(identityId) +
+					scanIntervalMs;
+			std::vector<uint32> pendingStimCrcs;
+			for (int purchaseIndex = 0;
+					purchaseIndex < progressionBazaarPurchases.size(); ++purchaseIndex) {
+				const PlayerBotBazaarPurchase& purchase =
+					progressionBazaarPurchases.elementAt(purchaseIndex).getValue();
+				if (purchase.identityId == identityId &&
+						(purchase.state == PLAYER_BOT_PURCHASE_DEBITED ||
+						 purchase.state == PLAYER_BOT_PURCHASE_RESOLVE_PENDING))
+					pendingStimCrcs.push_back(purchase.templateCrc);
+			}
+			const bool needRestock = !SimBotHealing::stimRestockNeeds(
+				healingPolicy.items, healingStacks, healingAbility,
+				pendingStimCrcs, healingPolicy.minDoses).empty();
+			if (needRestock && scanDue &&
+					pendingPurchases < progressionBazaarBuyMaxPendingPerBot &&
+					spendCeiling >= progressionBazaarMinPrice) {
+				progressionStimRestockScanAtMs.put(identityId, nowMs);
 				return true;
 			}
 		}
@@ -16029,12 +16755,21 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 	const SimBotArmorPolicy armorPolicy = snapshotPlayerBotArmorPolicy();
 	const bool consumableRestockGate =
 		playerBotConsumableRestockGateEnabled(identityId);
+	const int healingAbility = playerBotHealRestockGateEnabled(identityId) ?
+		playerBotHealingAbility(identityId) : 0;
+	const bool healingRestockGate = healingAbility > 0;
 	const SimBotConsumablePolicy consumablePolicy =
 		consumableRestockGate ? snapshotPlayerBotConsumablePolicy() :
 		SimBotConsumablePolicy();
+	const SimBotHealing::PlayerBotHealingPolicy healingPolicy =
+		healingRestockGate ? snapshotPlayerBotHealingPolicy() :
+		SimBotHealing::PlayerBotHealingPolicy();
 	std::vector<SimBotConsumables::HeldStack> consumableStacks;
 	const bool haveConsumableSnapshot = consumableRestockGate &&
 		snapshotPlayerBotConsumableStacks(identityId, consumableStacks);
+	std::vector<SimBotHealing::StimStack> healingStacks;
+	const bool haveHealingSnapshot = healingRestockGate &&
+		snapshotPlayerBotStimStacks(identityId, healingStacks);
 	// A bot that has never looted has no bag yet; buying is an acquisition
 	// like loot, so it creates the bag the same way.
 	ManagedReference<SceneObject*> bag = economyManager->getOrCreateItemBag(
@@ -16065,6 +16800,7 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		bool upgrade = false;
 		bool armorUpgrade = false;
 		bool consumable = false;
+		bool healing = false;
 		int doses = 0;
 		float pricePerDose = 0.f;
 		int gameObjectType = 0;
@@ -16077,8 +16813,11 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		bool upgrade = false;
 		bool armorUpgrade = false;
 		bool consumable = false;
+		bool healing = false;
 		SimBotConsumables::ConsumableEntry consumableEntry;
 		int64 consumableCeiling = 0;
+		SimBotHealing::PlayerBotHealingPolicy::StimEntry healingEntry;
+		int64 healingCeiling = 0;
 		int remaining = 0;
 		std::vector<ManagedReference<AuctionItem*> > raw;
 		std::vector<BuyCandidate> candidates;
@@ -16242,6 +16981,39 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 				needs.push_back(need);
 			}
 		}
+		if (healingRestockGate && haveHealingSnapshot) {
+			const SimBotProgression& progression = progressionRecords.get(identityId);
+			const int64 spendable = progression.bankCredits -
+				reservedPlayerBotCreditsLocked(identityId, true) -
+				progressionBazaarBuyReserveCredits;
+			const int64 spendCeiling = std::min<int64>(
+				std::max(0, progressionBazaarMaxPrice),
+				static_cast<int64>(std::floor(std::max<int64>(0, spendable) *
+					std::max(0.f, std::min(1.f,
+						healingPolicy.restockSpendFraction)))));
+			std::vector<uint32> pendingStimCrcs;
+			for (int purchaseIndex = 0;
+					purchaseIndex < progressionBazaarPurchases.size(); ++purchaseIndex) {
+				const PlayerBotBazaarPurchase& purchase =
+					progressionBazaarPurchases.elementAt(purchaseIndex).getValue();
+				if (purchase.identityId == identityId &&
+						(purchase.state == PLAYER_BOT_PURCHASE_DEBITED ||
+						 purchase.state == PLAYER_BOT_PURCHASE_RESOLVE_PENDING))
+					pendingStimCrcs.push_back(purchase.templateCrc);
+			}
+			const std::vector<int> usableNeeds = spendCeiling >=
+				progressionBazaarMinPrice ? SimBotHealing::stimRestockNeeds(
+					healingPolicy.items, healingStacks, healingAbility,
+					pendingStimCrcs, healingPolicy.minDoses) : std::vector<int>();
+			for (size_t needIndex = 0; needIndex < usableNeeds.size(); ++needIndex) {
+				BuyNeed need;
+				need.healing = true;
+				need.healingEntry = healingPolicy.items.get(usableNeeds[needIndex]);
+				need.healingCeiling = spendCeiling;
+				need.remaining = 1;
+				needs.push_back(need);
+			}
+		}
 		if (upgradeGate &&
 				progressionLoadoutChoices.contains(identityId)) {
 			bool pendingUpgrade = false;
@@ -16353,14 +17125,16 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 							continue;
 					}
 					need.raw.push_back(item);
-				} else if (need.consumable) {
+					} else if (need.consumable || need.healing) {
 					// The listing index carries a game-object type, not the
 					// consumable's dose count. Other types and cached template
 					// mismatches are discarded without a load; every other candidate
 					// is loaded in the bounded scan below so its current use count is
 					// authoritative.
-					if (item->getItemType() != static_cast<unsigned int>(
-							need.consumableEntry.gameObjectType))
+					const int gameObjectType = need.consumable ?
+						need.consumableEntry.gameObjectType :
+						need.healingEntry.gameObjectType;
+					if (item->getItemType() != static_cast<unsigned int>(gameObjectType))
 						continue;
 					bool knownMismatch = false;
 					{
@@ -16368,7 +17142,8 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 						if (bazaarListingTemplateCache.contains(item->getObjectID()))
 							knownMismatch = bazaarListingTemplateCache.get(
 								item->getObjectID()).templateCrc !=
-								need.consumableEntry.templateCrc;
+								(need.consumable ? need.consumableEntry.templateCrc :
+								need.healingEntry.templateCrc);
 					}
 					if (!knownMismatch)
 						need.raw.push_back(item);
@@ -16397,8 +17172,9 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 	}
 	const size_t start = needs.empty() ? 0 : cursor % needs.size();
 	int totalLoads = 0;
-	// maxRestockLoadsPerVisit bounds all consumable needs together.
+	// Food and stim restock each have an independent load budget.
 	int consumableLoads = 0;
+	int healingLoads = 0;
 	while (totalLoads < progressionBazaarBuyMaxObjectLoadsPerVisit) {
 		bool advanced = false;
 		for (size_t offset = 0; offset < needs.size(); ++offset) {
@@ -16406,9 +17182,10 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 			BuyNeed& need = needs[needIndex];
 			// The per-need budget counts object loads; cached mismatches are
 			// skipped for free, so a later visit always reaches new listings.
-			const int maxLoadsForNeed = need.consumable ? std::min(
+			const int maxLoadsForNeed = (need.consumable || need.healing) ? std::min(
 				progressionBazaarBuyCandidateScanLimit,
-				consumablePolicy.maxRestockLoadsPerVisit) : need.upgrade ? std::min(
+				need.consumable ? consumablePolicy.maxRestockLoadsPerVisit :
+				healingPolicy.maxRestockLoadsPerVisit) : need.upgrade ? std::min(
 				progressionBazaarBuyCandidateScanLimit,
 				need.armorUpgrade ? armorPolicy.maxUpgradeLoadsPerVisit :
 				progressionLoadoutMaxUpgradeLoadsPerVisit) :
@@ -16416,6 +17193,8 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 			if (need.loads >= maxLoadsForNeed ||
 					(need.consumable && consumableLoads >=
 						consumablePolicy.maxRestockLoadsPerVisit) ||
+					(need.healing && healingLoads >=
+						healingPolicy.maxRestockLoadsPerVisit) ||
 					need.scanned >= static_cast<int>(need.raw.size()))
 				continue;
 			advanced = true;
@@ -16433,20 +17212,22 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 					cacheHit = true;
 				}
 			}
-			const bool forceConsumableLoad = need.consumable;
-			if ((!cacheHit || forceConsumableLoad) && totalLoads >=
+			const bool forceDoseLoad = need.consumable || need.healing;
+			if ((!cacheHit || forceDoseLoad) && totalLoads >=
 					progressionBazaarBuyMaxObjectLoadsPerVisit) {
 				--need.scanned;
 				continue;
 			}
 			int loadedDoses = 0;
-			if (!cacheHit || forceConsumableLoad) {
+			if (!cacheHit || forceDoseLoad) {
 				ManagedReference<SceneObject*> listedObject = zoneServer->getObject(
 					item->getAuctionedItemObjectID());
 				++totalLoads;
 				++need.loads;
 				if (need.consumable)
 					++consumableLoads;
+				if (need.healing)
+					++healingLoads;
 				if (listedObject == nullptr)
 					continue;
 				Locker objectLock(listedObject);
@@ -16462,6 +17243,20 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 					if (consumable == nullptr)
 						continue;
 					loadedDoses = static_cast<int>(consumable->getUseCount());
+					if (loadedDoses <= 0)
+						continue;
+				}
+				if (need.healing) {
+					// Stims are pharmaceuticals, not Consumables. The crafted
+					// object's own skill requirement can differ from the template.
+					StimPack* stim = listedObject->isPharmaceuticalObject() ?
+						cast<StimPack*>(listedObject.get()) : nullptr;
+					if (stim == nullptr || !stim->isStimPack() ||
+							stim->isRangedStimPack() || stim->isPetStimPack() ||
+							stim->isDroidRepairKit() ||
+							stim->getMedicineUseRequired() > healingAbility)
+						continue;
+					loadedDoses = static_cast<int>(stim->getUseCount());
 					if (loadedDoses <= 0)
 						continue;
 				}
@@ -16501,21 +17296,31 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 					bazaarListingTemplateCache.remove(oldest);
 				}
 			}
-			if (need.consumable) {
-				if (cached.templateCrc != need.consumableEntry.templateCrc ||
+			if (need.consumable || need.healing) {
+				const uint32 expectedCrc = need.consumable ?
+					need.consumableEntry.templateCrc : need.healingEntry.templateCrc;
+				if (cached.templateCrc != expectedCrc ||
 						loadedDoses <= 0)
 					continue;
-				if (!SimBotConsumables::acceptsListing(item->getPrice(),
-						loadedDoses, need.consumableEntry.maxPricePerDose,
-						need.consumableCeiling)) {
-					progressionConsumablesRestockSkips.increment();
+				if (need.consumable) {
+					if (!SimBotConsumables::acceptsListing(item->getPrice(),
+							loadedDoses, need.consumableEntry.maxPricePerDose,
+							need.consumableCeiling)) {
+						progressionConsumablesRestockSkips.increment();
+						continue;
+					}
+				} else if (item->getPrice() > need.healingCeiling ||
+						static_cast<float>(item->getPrice()) >
+						need.healingEntry.maxPricePerDose * loadedDoses) {
 					continue;
 				}
 				BuyCandidate candidate;
 				candidate.item = item;
 				candidate.templateCrc = cached.templateCrc;
-				candidate.ceiling = static_cast<int>(need.consumableCeiling);
+				candidate.ceiling = static_cast<int>(need.consumable ?
+					need.consumableCeiling : need.healingCeiling);
 				candidate.consumable = true;
+				candidate.healing = need.healing;
 				candidate.doses = loadedDoses;
 				candidate.pricePerDose = SimBotConsumables::pricePerDose(
 					item->getPrice(), loadedDoses);
@@ -16658,7 +17463,7 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 			break;
 	}
 	for (size_t needIndex = 0; needIndex < needs.size(); ++needIndex) {
-		if (needs[needIndex].consumable)
+		if (needs[needIndex].consumable || needs[needIndex].healing)
 			std::sort(needs[needIndex].candidates.begin(),
 				needs[needIndex].candidates.end(),
 				[](const BuyCandidate& left, const BuyCandidate& right) {
@@ -16788,9 +17593,12 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		int templatePendingCount = 0;
 		int ownedCount = 0;
 		const bool upgrade = needs[bestNeed].upgrade;
-		const bool consumable = !upgrade && needs[bestNeed].consumable;
+		const bool doseBased = !upgrade && (needs[bestNeed].consumable ||
+			needs[bestNeed].healing);
+		const bool healing = doseBased && needs[bestNeed].healing;
 		const uint32 templateCrc = upgrade ? candidate.templateCrc :
-			(consumable ? needs[bestNeed].consumableEntry.templateCrc :
+			(doseBased ? (healing ? needs[bestNeed].healingEntry.templateCrc :
+				needs[bestNeed].consumableEntry.templateCrc) :
 			needs[bestNeed].entry.templateCrc);
 		for (int i = 0; i < progressionItems.size(); ++i) {
 			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
@@ -16959,7 +17767,7 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 					}
 				}
 			}
-		} else if (consumable) {
+		} else if (doseBased) {
 			liveReason = SimBotBazaar::decidePurchase(
 				auctionItem->getPrice(), candidate.ceiling,
 				progressionRecords.get(identityId).bankCredits,
@@ -17019,7 +17827,7 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		purchase.templateCrc = templateCrc;
 		purchase.gameObjectType = upgrade ? (candidate.armorUpgrade ?
 			candidate.armorStats.gameObjectType : candidate.weaponStats.gameObjectType) :
-			(consumable ? candidate.gameObjectType :
+			(doseBased ? candidate.gameObjectType :
 			needs[bestNeed].entry.gameObjectType);
 		purchase.price = auctionItem->getPrice();
 		purchase.vendorOid = auctionItem->getVendorID();
@@ -17037,21 +17845,30 @@ bool SimPlayerManager::buyPlayerBotItemsAtTerminal(uint64 identityId,
 		purchase.debitedAtMs = System::getMiliTime();
 		progressionBazaarPurchases.put(purchaseKey, purchase);
 		--needs[bestNeed].remaining;
+		// Stim tiers share one pooled need: one stim purchase per visit.
+		if (needs[bestNeed].healing) {
+			for (size_t needIndex = 0; needIndex < needs.size(); ++needIndex)
+				if (needs[needIndex].healing)
+					needs[needIndex].remaining = 0;
+		}
 		bazaarBuyDebited.increment();
 		if (upgrade)
 			bazaarBuyUpgradesDebited.increment();
 		if (candidate.armorUpgrade)
 			bazaarBuyArmorUpgradesDebited.increment();
-		if (consumable)
+		if (needs[bestNeed].consumable)
 			progressionConsumablesRestockPurchases.increment();
+		if (healing)
+			playerBotHealingRestockPurchases.increment();
 		debitedAny = true;
 		progressionLock.release();
 		MissionDiagLog::event("BAZAAR_BUY", identityId,
 			"auction=" + String::valueOf(purchase.auctionOid) +
 			" object=" + String::valueOf(purchase.objectId) +
 			" price=" + String::valueOf(purchase.price) +
-			" need=" + (upgrade ? String("upgrade") : consumable ?
-			String("consumable") : String("buy_list")) +
+			" need=" + (upgrade ? String("upgrade") : healing ?
+			String("healing") : doseBased ? String("consumable") :
+			String("buy_list")) +
 			" result=debited");
 	}
 	{
@@ -19809,6 +20626,8 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 			armingOp = "setConsumablesGate";
 		else if (gate == "consumableRestock")
 			armingOp = "setConsumableRestockGate";
+		else if (gate == "healingEnabled" || gate == "healing")
+			armingOp = "setHealingGate";
 		else if (gate == "bazaarUpgrades")
 			armingOp = "setBazaarUpgradesGate";
 		else if (gate == "armorBazaarUpgrades")
@@ -19863,6 +20682,8 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 			live = playerBotConsumablesGateEnabled(0);
 		else if (gate == "consumableRestock")
 			live = playerBotConsumableRestockGateEnabled(0);
+		else if (gate == "healingEnabled" || gate == "healing")
+			live = playerBotHealingGateEnabled(0);
 		else if (gate == "bazaarUpgrades")
 			live = playerBotBazaarUpgradesGateEnabled(0);
 		else if (gate == "armorBazaarUpgrades")
@@ -20512,6 +21333,31 @@ bool SimPlayerManager::resolvePlayerBotIdentityAndTier(uint64 bodyOid,
 	return identityId != 0;
 }
 
+bool SimPlayerManager::isPlayerBotHealPatient(uint64 bodyOid) {
+	if (bodyOid == 0)
+		return false;
+
+	uint64 identityId = 0;
+	String profession;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveBodyIdentityIds.contains(bodyOid))
+			return false;
+		identityId = pveBodyIdentityIds.get(bodyOid);
+		if (identityId == 0 || !pveIdentities.contains(identityId) ||
+				!pveIdentityBodyOids.contains(identityId) ||
+				pveIdentityBodyOids.get(identityId) != bodyOid)
+			return false;
+		profession = pveIdentities.get(identityId).profession;
+	}
+
+	if (profession != "harness")
+		return true;
+	Locker parityLock(&playerBotParityTestMutex);
+	return playerBotParityHealingHarnessOptIns.contains(identityId) &&
+		playerBotParityHealingHarnessOptIns.get(identityId);
+}
+
 uint64 SimPlayerManager::resolvePlayerBotIdentity(uint64 bodyOid) {
 	uint64 identityId = 0;
 	int skillTier = 1;
@@ -21125,6 +21971,8 @@ void SimPlayerManager::scorePlayerBotActivity(
 	// and taking that under progressionMutex inverts the lock order used
 	// everywhere else -- the defect F_0.9.5 fixed. Do not move this below the lock.
 	const bool earlyGameGate = playerBotEarlyGameGateEnabled();
+	const Vector<String> effectiveDeferred =
+		effectiveDeferredXpTypes(identity.id);
 
 	Locker progressionLock(&progressionMutex);
 	if (!progressionRecords.contains(identity.id) ||
@@ -21160,11 +22008,11 @@ void SimPlayerManager::scorePlayerBotActivity(
 			String xpType = skill == nullptr ? String() : skill->getXpType();
 			untrainedXpTypes.add(xpType);
 			if (collectStalled && !xpType.isEmpty() &&
-					progressionEarlyGameConfig.deferredXpTypes.contains(xpType))
+					effectiveDeferred.contains(xpType))
 				out.stalledBoxes.add(skillName);
 		}
 		return SimBotDispatchPolicy::isTemplateComplete(untrainedXpTypes,
-			progressionEarlyGameConfig.deferredXpTypes);
+			effectiveDeferred);
 	};
 
 	// F_0.9.8b grind fallback: no fightable mission existed when the bot was
@@ -24533,6 +25381,58 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 	if (key == "consumables.skippednodoses" ||
 			key == "consumablesskippednodoses")
 		return progressionConsumablesSkippedNoDoses.get();
+	if (key == "healing.playerhealsofbot" || key == "playerhealsofbot")
+		return playerBotHealingPlayerHealsOfBots.get();
+	if (key == "healing.playerhealrefusedfaction" ||
+			key == "playerhealrefusedfaction")
+		return playerBotHealingPlayerHealRefusedFaction.get();
+	if (key == "healing.bothealsothers" || key == "bothealsothers")
+		return playerBotHealingBotHealsOthers.get();
+	if (key == "healing.bothealsself" || key == "bothealsself")
+		return playerBotHealingBotHealsSelf.get();
+	if (key == "healing.healthhealed" || key == "healthhealed")
+		return playerBotHealingHealthHealed.get();
+	if (key == "healing.actionhealed" || key == "actionhealed")
+		return playerBotHealingActionHealed.get();
+	if (key == "healing.medicalxp" || key == "healing.medicalxpawarded")
+		return playerBotHealingMedicalXpAwarded.get();
+	if (key == "healing.stimsconsumed" || key == "stimsconsumed")
+		return playerBotHealingStimsConsumed.get();
+	if (key == "healing.refusednostim" || key == "healing.nostim")
+		return playerBotHealingRefusedNoStim.get();
+	if (key == "healing.refusedcooldown" || key == "healing.cooldown")
+		return playerBotHealingRefusedCooldown.get();
+	if (key == "healing.refusedmind" || key == "healing.mind")
+		return playerBotHealingRefusedMind.get();
+	if (key == "healing.refusedrange" || key == "healing.range")
+		return playerBotHealingRefusedRange.get();
+	if (key == "healing.refusedlos" || key == "healing.los")
+		return playerBotHealingRefusedLos.get();
+	if (key == "healing.refusedfaction" || key == "healing.faction")
+		return playerBotHealingRefusedFaction.get();
+	if (key == "healing.refusednodamage" || key == "healing.nodamage")
+		return playerBotHealingRefusedNoDamage.get();
+	if (key == "healing.refusedarena" || key == "healing.arena")
+		return playerBotHealingRefusedArena.get();
+	if (key == "healing.orders" || key == "healorders")
+		return playerBotHealingOrders.get();
+	if (key == "healing.ordersnomedic")
+		return playerBotHealingOrdersNoMedic.get();
+	if (key == "healing.ordersdone" || key == "healing.orderscompleted")
+		return playerBotHealingOrdersDone.get();
+	if (key == "healing.ordersaborted")
+		return playerBotHealingOrdersAborted.get();
+	if (key == "healing.restockpurchases" ||
+			key == "healing.restock")
+		return playerBotHealingRestockPurchases.get();
+	if (key == "healing.rejectedgate" || key == "healing.gaterejected")
+		return playerBotHealingRejectedGate.get();
+	if (key == "healing.claimsexpired" || key == "healing.claimexpired")
+		return playerBotHealingClaimsExpired.get();
+	if (key == "healing.claimsactive") {
+		Locker groupingLock(&groupingMutex);
+		return playerBotHealingClaims.size();
+	}
 	if (key == "grouping.assists" || key == "assists")
 		return playerBotGroupingAssists.get();
 	if (key == "grouping.travellegs" || key == "travellegs")
@@ -25101,6 +26001,13 @@ void SimPlayerManager::beginPlayerBotParityTestCleanup(bool preserveProbe) {
 		playerBotParityTestCleanupBodiesDone = false;
 		playerBotParityTestCleanupRequestId = 0;
 		playerBotParityTestCleanupReaperQueued = false;
+		// Harness bodies are no longer production heal patients once teardown
+		// starts; the opt-in is scenario-scoped and must not survive cleanup.
+		playerBotParityHealingHarnessOptIns.removeAll();
+		playerBotParityHealingGateScopedIds.removeAll();
+		playerBotParityHealingGateValues.removeAll();
+		playerBotParityTestHealingGateOverrideActive = false;
+		playerBotParityTestHealingGateOverride = false;
 	}
 	despawnPlayerBotParityKillTarget();
 	despawnPlayerBotParityProvokedCreature();
@@ -25190,6 +26097,8 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 		playerBotParityTestConsumablesGateOverride = false;
 		playerBotParityTestConsumableRestockGateOverrideActive = false;
 		playerBotParityTestConsumableRestockGateOverride = false;
+		playerBotParityTestHealingGateOverrideActive = false;
+		playerBotParityTestHealingGateOverride = false;
 		if (playerBotParityTestBazaarMarkupOverrideActive) {
 			progressionBazaarMarkup =
 				playerBotParityTestBazaarMarkupOverridePrevious;
@@ -25210,6 +26119,9 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 	playerBotParityConsumablesGateValues.removeAll();
 	playerBotParityConsumableRestockGateScopedIds.removeAll();
 	playerBotParityConsumableRestockGateValues.removeAll();
+	playerBotParityHealingGateScopedIds.removeAll();
+	playerBotParityHealingGateValues.removeAll();
+	playerBotParityHealingHarnessOptIns.removeAll();
 	playerBotParityBodyTemplateOverrides.removeAll();
 	playerBotParityArmorGateValues.removeAll();
 	playerBotParityBazaarUpgradesGateScopedIds.removeAll();
@@ -25420,6 +26332,9 @@ void SimPlayerManager::cleanupPlayerBotParityTest() {
 			playerBotParityTestIdentityRefs.removeAll();
 			playerBotParityAppearanceSnapshots.removeAll();
 			playerBotParityCombatAbilityHarnessOptIns.removeAll();
+			playerBotParityHealingHarnessOptIns.removeAll();
+			playerBotParityHealingGateScopedIds.removeAll();
+			playerBotParityHealingGateValues.removeAll();
 			for (int i = 0; i < playerBotParityCombatAbilityScopedIds.size(); ++i)
 				scopedAbilityIdentityIds.add(
 					playerBotParityCombatAbilityScopedIds.elementAt(i).getKey());
@@ -26518,6 +27433,21 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		return pveIdentityBodyOids.contains(groupedIdentity) ?
 			pveIdentityBodyOids.get(groupedIdentity) : 0;
 	};
+	auto resolveHealingBodyOid = [&](const String& ref,
+			uint64 fallbackIdentity) -> uint64 {
+		String normalized = ref.trim().toLowerCase();
+		if (normalized == "leader" || normalized == "speaker")
+			return groupLeaderOid();
+		uint64 resolvedIdentity = fallbackIdentity;
+		if (!normalized.isEmpty()) {
+			PlayerBotParityTestStep refStep;
+			refStep.identityRef = normalized;
+			refStep.identityIndex = -1;
+			if (!getPlayerBotParityIdentityId(refStep, resolvedIdentity))
+				resolvedIdentity = 0;
+		}
+		return resolvedIdentity == 0 ? 0 : groupBotOid(resolvedIdentity);
+	};
 	auto groupingStepTimeout = [&]() -> bool {
 		const int withinSeconds = step.groupingWithinSeconds > 0 ?
 			step.groupingWithinSeconds : 30;
@@ -27141,10 +28071,20 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			result.failReason = "grouping_counter_name_missing";
 			return true;
 		}
-		const int64 current = playerBotParityCounterValue(counter);
-		{
+		// "a|b" baselines each counter, matching how assertGroupingCounter
+		// sums the per-name deltas.
+		String remaining = counter;
+		while (!remaining.isEmpty()) {
+			const int bar = remaining.indexOf("|");
+			const String name = (bar < 0 ? remaining :
+				remaining.subString(0, bar)).trim();
+			remaining = bar < 0 || bar + 1 >= remaining.length() ? String() :
+				remaining.subString(bar + 1);
+			if (name.isEmpty())
+				continue;
+			const int64 current = playerBotParityCounterValue(name);
 			Locker parityLock(&playerBotParityTestMutex);
-			playerBotParityTestCounterBaselines.put(counter,
+			playerBotParityTestCounterBaselines.put(name,
 				static_cast<uint64>(current < 0 ? 0 : current));
 		}
 		result.status = "PASS";
@@ -27445,7 +28385,41 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			result.status = "FAIL"; result.failReason = "group_not_found";
 			return true;
 		}
-		onPlayerBotGroupChat(groupLeaderOid(), record.groupOid, step.groupingText);
+		// "{production}" / "{production2}" name the scenario's borrowed bots,
+		// whose real first names are only known at run time.
+		String text = step.groupingText;
+		const char* refs[] = {"production2", "production"};
+		for (int r = 0; r < 2; ++r) {
+			const String placeholder = "{" + String(refs[r]) + "}";
+			if (text.indexOf(placeholder) < 0)
+				continue;
+			uint64 borrowedId = 0;
+			{
+				Locker parityLock(&playerBotParityTestMutex);
+				if (playerBotParityBorrowedRefs.contains(refs[r]))
+					borrowedId = playerBotParityBorrowedRefs.get(refs[r]);
+			}
+			String firstName;
+			{
+				Locker pveLock(&pveMutex);
+				if (borrowedId != 0 && pveIdentities.contains(borrowedId))
+					firstName = pveIdentities.get(borrowedId).firstName;
+			}
+			if (firstName.isEmpty()) {
+				result.status = "FAIL"; result.failReason = "borrowed_name_not_found";
+				return true;
+			}
+			// Literal replace: String::replaceAll takes a regex, and braces are
+			// regex syntax.
+			for (int at = text.indexOf(placeholder); at >= 0;
+					at = text.indexOf(placeholder)) {
+				// subString(begin) throws at begin == length.
+				const int tailAt = at + placeholder.length();
+				text = text.subString(0, at) + firstName +
+					(tailAt < text.length() ? text.subString(tailAt) : String());
+			}
+		}
+		onPlayerBotGroupChat(groupLeaderOid(), record.groupOid, text);
 		result.status = "PASS"; return true;
 	}
 
@@ -28288,6 +29262,9 @@ bool SimPlayerManager::executePlayerBotParityStep(
 				op == "assertAttackSource" || op == "assertAbilityUse" ||
 				op == "setLootGate" || op == "setBazaarSellGate" ||
 				op == "setBazaarBuyGate" || op == "setBuyListOverride" ||
+				op == "setHealingHarnessOptIn" ||
+				op == "damageBot" || op == "setBotFaction" ||
+				op == "assertHealable" ||
 				op == "setLoadoutGate" || op == "setBazaarUpgradesGate" ||
 				op == "setArmorGate" || op == "setArmorUpgradeGate" ||
 				op == "setConsumablesGate" ||
@@ -28349,6 +29326,172 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			result.failReason = "identity_not_found";
 			return true;
 		}
+	}
+
+	if (op == "setHealingGate") {
+		// Borrowed production bots resolve like every grouping op; harness
+		// identities use the positional/named lookup.
+		const String healingRef = step.identityRef.toLowerCase();
+		if (healingRef == "production" || healingRef == "production2")
+			identityId = resolveGroupingIdentity();
+		else if (!getPlayerBotParityIdentityId(step, identityId))
+			identityId = 0;
+		if (identityId == 0) {
+			result.status = "FAIL";
+			result.failReason = "healing_gate_requires_identity";
+			return true;
+		}
+		int64 enabledValue = 0;
+		if (step.hasGateEnabled)
+			enabledValue = step.gateEnabled ? 1 : 0;
+		else if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_healing_gate_value";
+			return true;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestHealingGateOverrideActive = true;
+			playerBotParityTestHealingGateOverride = enabledValue != 0;
+			playerBotParityHealingGateScopedIds.put(identityId, true);
+			playerBotParityHealingGateValues.put(identityId, enabledValue != 0);
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "setHealingHarnessOptIn") {
+		if (identityId == 0) {
+			result.status = "FAIL";
+			result.failReason = "healing_opt_in_requires_identity";
+			return true;
+		}
+		bool optIn = step.hasHealingHarnessOptIn ?
+			step.healingHarnessOptIn : step.gateEnabled;
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityHealingHarnessOptIns.put(identityId, optIn);
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "damageBot") {
+		const uint64 patientOid = resolveHealingBodyOid(
+			step.healingPatientRef, identityId);
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<CreatureObject*> patient = zoneServer == nullptr ||
+			patientOid == 0 ? nullptr : zoneServer->getObject(patientOid).
+			castTo<CreatureObject*>();
+		int amount = step.amount > 0 ? step.amount :
+			(step.damage > 0 ? static_cast<int>(step.damage) : 1000);
+		String poolName = step.buffPool.isEmpty() ? String("health") :
+			step.buffPool;
+		int pool = poolName == "action" ? CreatureAttribute::ACTION :
+			poolName == "mind" ? CreatureAttribute::MIND :
+			CreatureAttribute::HEALTH;
+		if (patient == nullptr || amount <= 0) {
+			result.status = "FAIL";
+			result.failReason = "healing_patient_missing";
+			return true;
+		}
+		{
+			Locker patientLock(patient);
+			patient->setHAM(pool, Math::max(0, patient->getHAM(pool) - amount),
+				false);
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "setBotFaction") {
+		const uint64 bodyOid = resolveHealingBodyOid(String(), identityId);
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<CreatureObject*> body = zoneServer == nullptr ||
+			bodyOid == 0 ? nullptr : zoneServer->getObject(bodyOid).
+			castTo<CreatureObject*>();
+		if (body == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "healing_body_missing";
+			return true;
+		}
+		uint32 faction = 0;
+		if (step.groupingFaction == "rebel")
+			faction = Factions::FACTIONREBEL;
+		else if (step.groupingFaction == "imperial")
+			faction = Factions::FACTIONIMPERIAL;
+		int status = FactionStatus::ONLEAVE;
+		if (step.healingFactionStatus == "covert")
+			status = FactionStatus::COVERT;
+		else if (step.healingFactionStatus == "overt")
+			status = FactionStatus::OVERT;
+		{
+			Locker bodyLock(body);
+			body->setFaction(faction);
+			body->setFactionStatus(status);
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertHealable") {
+		const uint64 healerOid = resolveHealingBodyOid(
+			step.healingHealerRef, identityId);
+		const uint64 patientOid = resolveHealingBodyOid(
+			step.healingPatientRef, identityId);
+		int64 expected = 0;
+		if (!parsePlayerBotParityExpected(step.expect, expected)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_healable_expectation";
+			return true;
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<CreatureObject*> healer = zoneServer == nullptr ||
+			healerOid == 0 ? nullptr : zoneServer->getObject(healerOid).
+			castTo<CreatureObject*>();
+		ManagedReference<CreatureObject*> patient = zoneServer == nullptr ||
+			patientOid == 0 ? nullptr : zoneServer->getObject(patientOid).
+			castTo<CreatureObject*>();
+		bool actual = false;
+		if (healer != nullptr && patient != nullptr &&
+			isPlayerBotHealPatient(patientOid)) {
+			Locker healerLock(healer);
+			Locker patientLock(patient, healer);
+			actual = patient->isHealableBy(healer);
+		}
+		if (actual != (expected != 0)) {
+			result.status = "FAIL";
+			result.failReason = "healable_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertHealCounter") {
+		if (step.counter.isEmpty()) {
+			result.status = "FAIL";
+			result.failReason = "heal_counter_name_missing";
+			return true;
+		}
+		int64 expected = 0;
+		const bool delta = step.hasLedgerDelta;
+		if (delta)
+			expected = step.expectedDelta;
+		else if (!parsePlayerBotParityExpected(step.expect, expected)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_heal_counter_expectation";
+			return true;
+		}
+		String failure;
+		if (!assertPlayerBotParityCounter(step.counter, expected, delta,
+				failure)) {
+			result.status = "FAIL";
+			result.failReason = failure;
+			return true;
+		}
+		result.status = "PASS";
+		return true;
 	}
 
 	if (op == "setLootGate") {
@@ -32774,6 +33917,12 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 	}
 	result["nextBox"] = nextJson;
 
+	JSONSerializationType experienceJson = JSONSerializationType::object();
+	for (int i = 0; i < progression.experience.size(); ++i)
+		experienceJson[progression.experience.elementAt(i).getKey()] =
+			progression.experience.elementAt(i).getValue();
+	result["xp"] = experienceJson;
+
 	JSONSerializationType professions = JSONSerializationType::object();
 	Vector<String> professionRoots;
 	SkillManager* skillManager = SkillManager::instance();
@@ -33357,6 +34506,109 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 	consumablesJson["lastConsumed"] = lastConsumedJson;
 	result["consumables"] = consumablesJson;
 
+	// Healing inspection is gate-independent: it shows the configured policy
+	// and the real vault/readiness state even while the capability is off.
+	SimBotHealing::PlayerBotHealingPolicy inspectHealingPolicy =
+		snapshotPlayerBotHealingPolicy();
+	std::vector<SimBotHealing::StimStack> inspectStimStacks;
+	const bool haveInspectStimSnapshot = snapshotPlayerBotStimStacks(identityId,
+		inspectStimStacks);
+	int inspectHealingAbility = 0;
+	bool inspectCooldownReady = false;
+	if (bodyAgent != nullptr) {
+		Locker agentLock(bodyAgent);
+		inspectHealingAbility = bodyAgent->getSkillMod("healing_ability");
+		inspectCooldownReady = bodyAgent->canTreatInjuries();
+	}
+	const int inspectUsableStim = haveInspectStimSnapshot ?
+		SimBotHealing::chooseStim(inspectStimStacks, inspectHealingAbility) : -1;
+	int inspectStimDoses = 0;
+	for (size_t i = 0; i < inspectStimStacks.size(); ++i)
+		inspectStimDoses += inspectStimStacks[i].doses;
+	PlayerBotHealReadiness inspectReadiness;
+	const bool haveInspectReadiness = snapshotPlayerBotHealReadiness(identityId,
+		inspectReadiness);
+	PlayerBotHealObservation inspectLastHeal;
+	bool haveInspectLastHeal = false;
+	PlayerBotGroupRecord inspectGroupRecord;
+	bool haveInspectGroupRecord = false;
+	{
+		Locker groupingLock(&groupingMutex);
+		if (playerBotHealingLast.contains(identityId)) {
+			inspectLastHeal = playerBotHealingLast.get(identityId);
+			haveInspectLastHeal = true;
+		}
+		if (playerBotGroupRecords.contains(identityId)) {
+			inspectGroupRecord = playerBotGroupRecords.get(identityId);
+			haveInspectGroupRecord = true;
+		}
+	}
+	JSONSerializationType healingJson = JSONSerializationType::object();
+	healingJson["configured"] = progressionHealingEnabled &&
+		!inspectHealingPolicy.items.isEmpty();
+	healingJson["enabled"] = playerBotHealingGateEnabled(identityId);
+	healingJson["playerHealsBots"] = inspectHealingPolicy.playerHealsBots;
+	healingJson["playerHealsBotsActive"] = playerHealsBotsActive.load(
+		std::memory_order_acquire);
+	healingJson["botHeals"] = inspectHealingPolicy.botHeals;
+	healingJson["selfHeal"] = inspectHealingPolicy.selfHeal;
+	healingJson["signature"] = inspectHealingPolicy.signature;
+	healingJson["isMedic"] = inspectHealingAbility > 0;
+	healingJson["healingAbility"] = inspectHealingAbility;
+	healingJson["hasUsableStim"] = inspectUsableStim >= 0;
+	healingJson["cooldownReady"] = haveInspectReadiness ?
+		inspectReadiness.cooldownReady : inspectCooldownReady;
+	healingJson["stimDoses"] = inspectStimDoses;
+	JSONSerializationType stimItemsJson = JSONSerializationType::array();
+	for (int i = 0; i < inspectHealingPolicy.items.size(); ++i) {
+		const SimBotHealing::PlayerBotHealingPolicy::StimEntry& entry =
+			inspectHealingPolicy.items.get(i);
+		JSONSerializationType itemJson = JSONSerializationType::object();
+		itemJson["template"] = entry.templatePath;
+		itemJson["minDoses"] = entry.minDoses;
+		itemJson["maxPricePerDose"] = entry.maxPricePerDose;
+		itemJson["gameObjectType"] = entry.gameObjectType;
+		int doses = 0;
+		int stacks = 0;
+		for (size_t j = 0; j < inspectStimStacks.size(); ++j) {
+			if (inspectStimStacks[j].templateCrc != entry.templateCrc)
+				continue;
+			++stacks;
+			doses += inspectStimStacks[j].doses;
+		}
+		itemJson["doses"] = doses;
+		itemJson["stacks"] = stacks;
+		stimItemsJson.push_back(itemJson);
+	}
+	healingJson["items"] = stimItemsJson;
+	if (haveInspectReadiness) {
+		healingJson["readinessDoses"] = inspectReadiness.doses;
+		healingJson["readinessHasUsableStim"] = inspectReadiness.hasUsableStim;
+		healingJson["readinessIsMedic"] = inspectReadiness.isMedic;
+		healingJson["readinessAgeSeconds"] = inspectReadiness.updatedAtMs == 0 ?
+			static_cast<uint64>(0) : (System::getMiliTime() >
+			inspectReadiness.updatedAtMs ? (System::getMiliTime() -
+			inspectReadiness.updatedAtMs) / 1000 : static_cast<uint64>(0));
+	}
+	if (haveInspectLastHeal) {
+		healingJson["lastPatientOid"] = inspectLastHeal.patientOid;
+		healingJson["lastHealthHealed"] = inspectLastHeal.healthHealed;
+		healingJson["lastActionHealed"] = inspectLastHeal.actionHealed;
+		healingJson["lastReason"] = inspectLastHeal.reason;
+		healingJson["lastAgeSeconds"] = inspectLastHeal.atMs == 0 ?
+			static_cast<uint64>(0) : (System::getMiliTime() > inspectLastHeal.atMs ?
+			(System::getMiliTime() - inspectLastHeal.atMs) / 1000 :
+			static_cast<uint64>(0));
+	}
+	if (haveInspectGroupRecord) {
+		healingJson["orderGeneration"] = inspectGroupRecord.healOrderGeneration;
+		healingJson["orderPatientOid"] = inspectGroupRecord.healPatientOid;
+		healingJson["orderPatientIdentityId"] =
+		inspectGroupRecord.healPatientIdentityId;
+		healingJson["orderReason"] = inspectGroupRecord.healOrderReason;
+	}
+	result["healing"] = healingJson;
+
 	JSONSerializationType activeAbilities = JSONSerializationType::array();
 	JSONSerializationType inactiveAbilities = JSONSerializationType::array();
 	for (int i = 0; i < installedAbilities.size(); ++i) {
@@ -33602,6 +34854,9 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 		groupingJson["pullStage"] = playerBotGroupingPullStageName(
 			groupingRecord.pullStage);
 		groupingJson["pullTargetOid"] = groupingRecord.pullTargetOid;
+		groupingJson["healStage"] = groupingRecord.healStage;
+		groupingJson["healOrderGeneration"] = groupingRecord.healOrderGeneration;
+		groupingJson["healPatientOid"] = groupingRecord.healPatientOid;
 		if (haveTacticState) {
 			JSONSerializationType tacticJson = JSONSerializationType::object();
 			tacticJson["spinMode"] = tacticState.spinMode;
@@ -34122,6 +35377,9 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 		row["tacticOrder"] = playerBotGroupingTacticOrderName(record.tacticOrder);
 		row["pullStage"] = playerBotGroupingPullStageName(record.pullStage);
 		row["pullTargetOid"] = record.pullTargetOid;
+		row["healStage"] = record.healStage;
+		row["healOrderGeneration"] = record.healOrderGeneration;
+		row["healPatientOid"] = record.healPatientOid;
 		if (tacticStates.contains(record.groupOid)) {
 			const PlayerBotGroupTacticsState& state =
 				tacticStates.get(record.groupOid);
@@ -34270,6 +35528,10 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	VectorMap<uint64, Vector<SimBotWornArmorPiece> > armorWornSnapshot;
 	VectorMap<uint64, String> armorBlockedSnapshot;
 	SimBotConsumablePolicy consumablePolicySnapshot;
+	SimBotHealing::PlayerBotHealingPolicy healingPolicySnapshot;
+	VectorMap<uint64, PlayerBotHealReadiness> healingReadinessSnapshot;
+	VectorMap<uint64, PlayerBotHealObservation> healingLastSnapshot;
+	int healingClaimsActive = 0;
 	VectorMap<uint32, uint64> consumablesConsumedSnapshot;
 	VectorMap<uint64, uint32> consumablesLastConsumedSnapshot;
 	VectorMap<uint64, uint64> consumablesLastConsumedAtSnapshot;
@@ -34302,6 +35564,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		armorWornSnapshot = progressionArmorWorn;
 		armorBlockedSnapshot = progressionArmorBlockedReason;
 		consumablePolicySnapshot = progressionConsumablePolicy;
+		healingPolicySnapshot = progressionHealingPolicy;
 		consumablesConsumedSnapshot = progressionConsumablesConsumedByTemplate;
 		consumablesLastConsumedSnapshot =
 			progressionConsumablesLastConsumedByIdentity;
@@ -34349,6 +35612,12 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 			lastAwardMs = Math::max(lastAwardMs,
 				records.elementAt(i).getValue().lastAwardMs);
 		trainingLastSkillSnapshot = trainingLastSkill;
+	}
+	{
+		Locker groupingLock(&groupingMutex);
+		healingReadinessSnapshot = playerBotHealingReadiness;
+		healingLastSnapshot = playerBotHealingLast;
+		healingClaimsActive = playerBotHealingClaims.size();
 	}
 
 	AiEconomyManager* dashboardEconomy = AiEconomyManager::instance();
@@ -34489,6 +35758,16 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		consumablePolicySnapshot.bazaarRestock;
 	gates["consumables"] = consumablesDashboardEnabled;
 	gates["consumableRestock"] = consumableRestockDashboardEnabled;
+	const bool healingDashboardEnabled = playerBotHealingGateEnabled(0);
+	const bool botHealingDashboardEnabled = playerBotBotHealsGateEnabled(0);
+	const bool healingRestockDashboardEnabled =
+		botHealingDashboardEnabled && bazaarBuyDashboardEnabled &&
+		healingPolicySnapshot.bazaarRestock;
+	gates["healing"] = healingDashboardEnabled;
+	gates["botHealing"] = botHealingDashboardEnabled;
+	gates["healingRestock"] = healingRestockDashboardEnabled;
+	gates["playerHealsBotsActive"] = playerHealsBotsActive.load(
+		std::memory_order_acquire);
 	result["gates"] = gates;
 
 	JSONSerializationType missionCredits = JSONSerializationType::object();
@@ -34872,6 +36151,118 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	consumablesDashboard["lastConsumed"] = lastConsumed;
 	result["consumables"] = consumablesDashboard;
 
+	JSONSerializationType healingDashboard = JSONSerializationType::object();
+	healingDashboard["configured"] = progressionHealingEnabled &&
+		!healingPolicySnapshot.items.isEmpty();
+	healingDashboard["enabled"] = healingDashboardEnabled;
+	healingDashboard["playerHealsBots"] = healingPolicySnapshot.playerHealsBots;
+	healingDashboard["playerHealsBotsActive"] = playerHealsBotsActive.load(
+		std::memory_order_acquire);
+	healingDashboard["botHeals"] = botHealingDashboardEnabled;
+	healingDashboard["selfHeal"] = healingPolicySnapshot.selfHeal;
+	healingDashboard["bazaarRestock"] = healingRestockDashboardEnabled;
+	healingDashboard["groupHealThreshold"] =
+		healingPolicySnapshot.groupHealThreshold;
+	healingDashboard["selfHealThreshold"] =
+		healingPolicySnapshot.selfHealThreshold;
+	healingDashboard["selfCriticalFraction"] =
+		healingPolicySnapshot.selfCriticalFraction;
+	healingDashboard["maxApproachMeters"] =
+		healingPolicySnapshot.maxApproachMeters;
+	healingDashboard["applyRangeMeters"] =
+		healingPolicySnapshot.applyRangeMeters;
+	healingDashboard["approachTimeoutSeconds"] =
+		healingPolicySnapshot.approachTimeoutSeconds;
+	healingDashboard["applyTimeoutSeconds"] =
+		healingPolicySnapshot.applyTimeoutSeconds;
+	healingDashboard["minDoses"] = healingPolicySnapshot.minDoses;
+	healingDashboard["restockScanIntervalMinutes"] =
+		healingPolicySnapshot.restockScanIntervalMinutes;
+	healingDashboard["maxRestockLoadsPerVisit"] =
+		healingPolicySnapshot.maxRestockLoadsPerVisit;
+	healingDashboard["restockSpendFraction"] =
+		healingPolicySnapshot.restockSpendFraction;
+	healingDashboard["signature"] = healingPolicySnapshot.signature;
+	JSONSerializationType configuredHealing = JSONSerializationType::array();
+	for (int i = 0; i < healingPolicySnapshot.items.size(); ++i) {
+		const SimBotHealing::PlayerBotHealingPolicy::StimEntry& entry =
+			healingPolicySnapshot.items.get(i);
+		JSONSerializationType row = JSONSerializationType::object();
+		row["template"] = entry.templatePath;
+		row["minDoses"] = entry.minDoses;
+		row["maxPricePerDose"] = entry.maxPricePerDose;
+		row["gameObjectType"] = entry.gameObjectType;
+		configuredHealing.push_back(row);
+	}
+	healingDashboard["configuredItems"] = configuredHealing;
+	healingDashboard["playerHealsOfBots"] =
+		playerBotHealingPlayerHealsOfBots.get();
+	healingDashboard["playerHealRefusedFaction"] =
+		playerBotHealingPlayerHealRefusedFaction.get();
+	healingDashboard["botHealsOthers"] = playerBotHealingBotHealsOthers.get();
+	healingDashboard["botHealsSelf"] = playerBotHealingBotHealsSelf.get();
+	healingDashboard["healthHealed"] = playerBotHealingHealthHealed.get();
+	healingDashboard["actionHealed"] = playerBotHealingActionHealed.get();
+	healingDashboard["medicalXpAwarded"] =
+		playerBotHealingMedicalXpAwarded.get();
+	healingDashboard["stimsConsumed"] = playerBotHealingStimsConsumed.get();
+	JSONSerializationType healingRefusals = JSONSerializationType::object();
+	healingRefusals["noStim"] = playerBotHealingRefusedNoStim.get();
+	healingRefusals["cooldown"] = playerBotHealingRefusedCooldown.get();
+	healingRefusals["mind"] = playerBotHealingRefusedMind.get();
+	healingRefusals["range"] = playerBotHealingRefusedRange.get();
+	healingRefusals["los"] = playerBotHealingRefusedLos.get();
+	healingRefusals["faction"] = playerBotHealingRefusedFaction.get();
+	healingRefusals["noDamage"] = playerBotHealingRefusedNoDamage.get();
+	healingRefusals["arena"] = playerBotHealingRefusedArena.get();
+	healingDashboard["refusals"] = healingRefusals;
+	JSONSerializationType healingOrders = JSONSerializationType::object();
+	healingOrders["orders"] = playerBotHealingOrders.get();
+	healingOrders["noMedic"] = playerBotHealingOrdersNoMedic.get();
+	healingOrders["done"] = playerBotHealingOrdersDone.get();
+	healingOrders["aborted"] = playerBotHealingOrdersAborted.get();
+	healingOrders["rejectedGate"] = playerBotHealingRejectedGate.get();
+	healingDashboard["orders"] = healingOrders;
+	healingDashboard["claimsActive"] = healingClaimsActive;
+	healingDashboard["claimsExpired"] = playerBotHealingClaimsExpired.get();
+	healingDashboard["restockPurchases"] =
+		playerBotHealingRestockPurchases.get();
+	JSONSerializationType healingReadiness = JSONSerializationType::array();
+	for (int i = 0; i < healingReadinessSnapshot.size(); ++i) {
+		uint64 identityId = healingReadinessSnapshot.elementAt(i).getKey();
+		const PlayerBotHealReadiness& readiness =
+			healingReadinessSnapshot.elementAt(i).getValue();
+		JSONSerializationType row = JSONSerializationType::object();
+		row["identityId"] = identityId;
+		row["hasUsableStim"] = readiness.hasUsableStim;
+		row["doses"] = readiness.doses;
+		row["cooldownReady"] = readiness.cooldownReady;
+		row["isMedic"] = readiness.isMedic;
+		row["ageSeconds"] = readiness.updatedAtMs == 0 ?
+			static_cast<uint64>(0) : (nowMs > readiness.updatedAtMs ?
+			(nowMs - readiness.updatedAtMs) / 1000 : static_cast<uint64>(0));
+		healingReadiness.push_back(row);
+	}
+	healingDashboard["readiness"] = healingReadiness;
+	JSONSerializationType healingLast = JSONSerializationType::array();
+	for (int i = 0; i < healingLastSnapshot.size(); ++i) {
+		uint64 identityId = healingLastSnapshot.elementAt(i).getKey();
+		const PlayerBotHealObservation& observation =
+			healingLastSnapshot.elementAt(i).getValue();
+		JSONSerializationType row = JSONSerializationType::object();
+		row["identityId"] = identityId;
+		row["patientOid"] = observation.patientOid;
+		row["healthHealed"] = observation.healthHealed;
+		row["actionHealed"] = observation.actionHealed;
+		row["reason"] = observation.reason;
+		row["ageSeconds"] = observation.atMs == 0 ? static_cast<uint64>(0) :
+			(nowMs > observation.atMs ? (nowMs - observation.atMs) / 1000 :
+			static_cast<uint64>(0));
+		healingLast.push_back(row);
+	}
+	healingDashboard["lastHeals"] = healingLast;
+	result["healing"] = healingDashboard;
+
 	JSONSerializationType vaultJson = JSONSerializationType::object();
 	vaultJson["available"] = dashboardEconomy != nullptr &&
 		dashboardEconomy->isItemVaultAvailable();
@@ -35003,6 +36394,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 			continue;
 		JSONSerializationType deferred = JSONSerializationType::array();
 		JSONSerializationType blocked = JSONSerializationType::array();
+		Vector<String> effectiveDeferred = effectiveDeferredXpTypes(identityId);
 		const SimBotProgression& progression = records.get(identityId);
 		const SimBotTrainingPlan& plan = planSnapshot.get(identity.trainingPlan);
 		for (int j = 0; j < plan.orderedSkills.size(); ++j) {
@@ -35013,8 +36405,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 				SkillManager::instance()->getSkill(skillName);
 			if (skill == nullptr)
 				continue;
-			if (earlyGameConfigSnapshot.deferredXpTypes.contains(
-					skill->getXpType()))
+			if (effectiveDeferred.contains(skill->getXpType()))
 				deferred.push_back(skillName);
 			else
 				blocked.push_back(skillName);
@@ -35339,6 +36730,35 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		for (int j = 0; j < progression.skills.size(); ++j)
 			skills.push_back(progression.skills.get(j));
 		row["skills"] = skills;
+		JSONSerializationType healingRow = JSONSerializationType::object();
+		if (healingReadinessSnapshot.contains(identityId)) {
+			const PlayerBotHealReadiness& readiness =
+				healingReadinessSnapshot.get(identityId);
+			healingRow["hasUsableStim"] = readiness.hasUsableStim;
+			healingRow["doses"] = readiness.doses;
+			healingRow["cooldownReady"] = readiness.cooldownReady;
+			healingRow["isMedic"] = readiness.isMedic;
+			healingRow["readinessAgeSeconds"] = readiness.updatedAtMs == 0 ?
+				static_cast<uint64>(0) : (nowMs > readiness.updatedAtMs ?
+				(nowMs - readiness.updatedAtMs) / 1000 : static_cast<uint64>(0));
+		} else {
+			healingRow["hasUsableStim"] = false;
+			healingRow["doses"] = 0;
+			healingRow["cooldownReady"] = false;
+			healingRow["isMedic"] = false;
+		}
+		if (healingLastSnapshot.contains(identityId)) {
+			const PlayerBotHealObservation& observation =
+				healingLastSnapshot.get(identityId);
+			healingRow["lastPatientOid"] = observation.patientOid;
+			healingRow["lastHealthHealed"] = observation.healthHealed;
+			healingRow["lastActionHealed"] = observation.actionHealed;
+			healingRow["lastReason"] = observation.reason;
+			healingRow["lastAgeSeconds"] = observation.atMs == 0 ?
+				static_cast<uint64>(0) : (nowMs > observation.atMs ?
+				(nowMs - observation.atMs) / 1000 : static_cast<uint64>(0));
+		}
+		row["healing"] = healingRow;
 		identityRows.push_back(row);
 	}
 	result["identities"] = identityRows;
@@ -66829,6 +68249,7 @@ void SimPlayerManager::releasePlayerBotGroup(uint64 identityId,
 				playerBotGroupRecords.get(identityId).state ==
 					PLAYER_BOT_GROUP_RELEASING) {
 			playerBotGroupRecords.drop(identityId);
+			playerBotHealingReadiness.drop(identityId);
 			playerBotGroupDirectives.drop(identityId);
 			playerBotGroupRoutes.drop(identityId);
 			bool groupStillPresent = false;
@@ -66851,6 +68272,8 @@ void SimPlayerManager::releasePlayerBotGroup(uint64 identityId,
 	}
 	if (!removed)
 		return;
+	dropPlayerBotHealClaims(record.groupOid,
+		releasedLastGroupRecord ? 0 : identityId);
 	if (releasedLastGroupRecord)
 		teardownPlayerBotGroupMissionPlan(record.groupOid, "group_release");
 	{
@@ -67120,6 +68543,20 @@ void SimPlayerManager::teardownPlayerBotGroupMissionPlan(uint64 groupOid,
 }
 
 void SimPlayerManager::reconcilePlayerBotGroups(uint64 nowMs) {
+	// Claims are manager-owned coordination state. Expire them on the group
+	// maintenance cadence so a bot that never gets another heal tick cannot
+	// hold a patient indefinitely.
+	{
+		Locker groupingLock(&groupingMutex);
+		for (int i = playerBotHealingClaims.size() - 1; i >= 0; --i) {
+			const PlayerBotHealClaim& claim =
+				playerBotHealingClaims.elementAt(i).getValue();
+			if (claim.expiresAtMs != 0 && claim.expiresAtMs <= nowMs) {
+				playerBotHealingClaims.remove(i);
+				playerBotHealingClaimsExpired.increment();
+			}
+		}
+	}
 	if (!isPlayerBotGroupingActive()) {
 		releaseAllPlayerBotGroups("gate_off");
 		return;
@@ -67175,6 +68612,7 @@ void SimPlayerManager::reconcilePlayerBotGroups(uint64 nowMs) {
 		bool leaderIsLeader = false;
 		bool playerMemberPresent = false;
 		bool groupDisbanded = true;
+		uint64 observedLeaderOid = 0;
 		if (body != nullptr) {
 			Locker bodyLock(body);
 			group = body->getGroup();
@@ -67187,6 +68625,7 @@ void SimPlayerManager::reconcilePlayerBotGroups(uint64 nowMs) {
 		if (group != nullptr) {
 			Locker groupLock(group);
 			groupDisbanded = group->getGroupSize() < 2;
+			observedLeaderOid = group->getLeaderID();
 			leaderInGroup = group->hasMember(captured.leaderOid);
 			leaderIsLeader = group->getLeaderID() == captured.leaderOid;
 			for (int memberIndex = 0; memberIndex < group->getGroupSize();
@@ -67198,6 +68637,8 @@ void SimPlayerManager::reconcilePlayerBotGroups(uint64 nowMs) {
 					playerMemberPresent = true;
 			}
 		}
+		if (observedLeaderOid != 0 && observedLeaderOid != captured.leaderOid)
+			dropPlayerBotHealClaims(captured.groupOid);
 
 		bool leaderOnline = false;
 		ManagedReference<CreatureObject*> leader = captured.leaderOid == 0 ||
@@ -67295,6 +68736,270 @@ bool SimPlayerManager::isPlayerBotGroupMissionPlanActive(uint64 groupOid) {
 	return false;
 }
 
+String SimPlayerManager::playerBotHealClaimKey(uint64 groupId,
+		uint64 patientOid) const {
+	return String::valueOf(groupId) + ":" + String::valueOf(patientOid);
+}
+
+bool SimPlayerManager::tryClaimPlayerBotHealPatient(uint64 groupId,
+		uint64 patientOid, uint64 identityId, uint64* generationOut,
+		bool automatic) {
+	if (groupId == 0 || patientOid == 0 || identityId == 0)
+		return false;
+	SimBotHealing::PlayerBotHealingPolicy policy =
+		snapshotPlayerBotHealingPolicy();
+	const uint64 nowMs = System::getMiliTime();
+	const uint64 ttlMs = static_cast<uint64>(Math::max(1,
+		policy.approachTimeoutSeconds + policy.applyTimeoutSeconds)) * 1000ULL;
+	const String key = playerBotHealClaimKey(groupId, patientOid);
+	Locker groupingLock(&groupingMutex);
+	if (playerBotHealingClaims.contains(key)) {
+		PlayerBotHealClaim& existing = playerBotHealingClaims.get(key);
+		if (existing.expiresAtMs <= nowMs) {
+			playerBotHealingClaims.drop(key);
+			playerBotHealingClaimsExpired.increment();
+		} else if (existing.healerIdentityId == identityId) {
+			if (generationOut != nullptr)
+				*generationOut = existing.generation;
+			return true;
+		} else if (!automatic && existing.automatic) {
+			// An ordered request is authoritative for the patient. Replacing an
+			// automatic claim bumps the generation below, so the old holder's
+			// compare-and-set completion cannot finish the new order.
+			playerBotHealingClaims.drop(key);
+		} else {
+			return false;
+		}
+	}
+	PlayerBotHealClaim claim;
+	claim.groupId = groupId;
+	claim.patientOid = patientOid;
+	claim.healerIdentityId = identityId;
+	claim.generation = nextPlayerBotHealingClaimGeneration++;
+	if (claim.generation == 0)
+		claim.generation = nextPlayerBotHealingClaimGeneration++;
+	claim.expiresAtMs = nowMs + ttlMs;
+	claim.automatic = automatic;
+	playerBotHealingClaims.put(key, claim);
+	if (generationOut != nullptr)
+		*generationOut = claim.generation;
+	return true;
+}
+
+bool SimPlayerManager::releasePlayerBotHealClaim(uint64 groupId,
+		uint64 patientOid, uint64 identityId, uint64 generation) {
+	if (groupId == 0 || patientOid == 0 || identityId == 0 || generation == 0)
+		return false;
+	const String key = playerBotHealClaimKey(groupId, patientOid);
+	Locker groupingLock(&groupingMutex);
+	if (!playerBotHealingClaims.contains(key))
+		return false;
+	const PlayerBotHealClaim& claim = playerBotHealingClaims.get(key);
+	if (claim.healerIdentityId != identityId || claim.generation != generation)
+		return false;
+	playerBotHealingClaims.drop(key);
+	return true;
+}
+
+void SimPlayerManager::dropPlayerBotHealClaims(uint64 groupId,
+		uint64 identityId) {
+	if (groupId == 0)
+		return;
+	Locker groupingLock(&groupingMutex);
+	for (int i = playerBotHealingClaims.size() - 1; i >= 0; --i) {
+		const PlayerBotHealClaim& claim =
+			playerBotHealingClaims.elementAt(i).getValue();
+		if (claim.groupId == groupId &&
+				(identityId == 0 || claim.healerIdentityId == identityId))
+			playerBotHealingClaims.remove(i);
+	}
+}
+
+void SimPlayerManager::publishPlayerBotHealReadiness(uint64 identityId,
+		const PlayerBotHealReadiness& readiness) {
+	if (identityId == 0)
+		return;
+	Locker groupingLock(&groupingMutex);
+	playerBotHealingReadiness.put(identityId, readiness);
+}
+
+bool SimPlayerManager::snapshotPlayerBotHealReadiness(uint64 identityId,
+		PlayerBotHealReadiness& readiness) {
+	Locker groupingLock(&groupingMutex);
+	if (!playerBotHealingReadiness.contains(identityId))
+		return false;
+	readiness = playerBotHealingReadiness.get(identityId);
+	return true;
+}
+
+bool SimPlayerManager::completePlayerBotGroupHealOrder(uint64 identityId,
+		uint64 orderGeneration, const String& reason, bool succeeded) {
+	if (identityId == 0 || orderGeneration == 0)
+		return false;
+	Locker groupingLock(&groupingMutex);
+	if (!playerBotGroupRecords.contains(identityId))
+		return false;
+	PlayerBotGroupRecord& record = playerBotGroupRecords.get(identityId);
+	if (record.healOrderGeneration != orderGeneration)
+		return false;
+	record.healOrderGeneration = 0;
+	record.healPatientOid = 0;
+	record.healPatientIdentityId = 0;
+	record.healOrderReason = reason;
+	if (succeeded)
+		playerBotHealingOrdersDone.increment();
+	else
+		playerBotHealingOrdersAborted.increment();
+	return true;
+}
+
+bool SimPlayerManager::dispatchPlayerBotGroupHeal(uint64 groupId,
+		const SimBotHealing::HealRequest& request, uint64 speakerOid) {
+	if (groupId == 0 || !request.isHeal())
+		return false;
+	PlayerBotGroupingConfig config = playerBotGroupingConfig;
+	Vector<PlayerBotGroupRecord> records;
+	{
+		Locker groupingLock(&groupingMutex);
+		for (int i = 0; i < playerBotGroupRecords.size(); ++i) {
+			const PlayerBotGroupRecord& record =
+				playerBotGroupRecords.elementAt(i).getValue();
+			if (record.groupOid == groupId && record.state !=
+					PLAYER_BOT_GROUP_RELEASING)
+				records.add(record);
+		}
+	}
+	if (records.size() == 0)
+		return false;
+	bool gateOpen = false;
+	for (int i = 0; i < records.size(); ++i)
+		if (playerBotHealingGateEnabled(records.get(i).identityId)) {
+			gateOpen = true;
+			break;
+		}
+	if (!gateOpen) {
+		playerBotHealingRejectedGate.increment();
+		return false;
+	}
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<GroupObject*> group = zoneServer == nullptr ? nullptr :
+		zoneServer->getObject(groupId).castTo<GroupObject*>();
+	Vector<uint64> memberOids;
+	if (group != nullptr) {
+		Locker groupLock(group);
+		for (int i = 0; i < group->getGroupSize(); ++i) {
+			CreatureObject* member = group->getGroupMember(i);
+			if (member != nullptr)
+				memberOids.add(member->getObjectID());
+		}
+	}
+	if (memberOids.size() == 0 && speakerOid != 0)
+		memberOids.add(speakerOid);
+
+	Vector<uint64> patients;
+	if (request.patientKind == SimBotHealing::SPEAKER) {
+		patients.add(speakerOid);
+	} else if (request.patientKind == SimBotHealing::NAMED_BOT) {
+		for (int i = 0; i < records.size(); ++i) {
+			SimBotIdentity identity;
+			if (snapshotPlayerBotIdentity(records.get(i).identityId, identity) &&
+					identity.firstName.toLowerCase() ==
+					request.patientName.toLowerCase())
+				patients.add(records.get(i).bodyOid);
+		}
+	} else {
+		const String wanted = request.patientName.toLowerCase();
+		for (int i = 0; i < memberOids.size(); ++i) {
+			ManagedReference<CreatureObject*> member = zoneServer == nullptr ?
+				nullptr : zoneServer->getObject(memberOids.get(i)).castTo<CreatureObject*>();
+			if (member == nullptr)
+				continue;
+			if (request.patientKind == SimBotHealing::EVERYONE ||
+					member->getFirstName().toLowerCase() == wanted ||
+					member->getDisplayedName().toLowerCase() == wanted)
+				patients.add(memberOids.get(i));
+		}
+	}
+	if (patients.size() == 0)
+		return false;
+
+	Vector<uint64> requestedHealers;
+	for (size_t i = 0; i < request.healerIdentityIds.size(); ++i)
+		requestedHealers.add(request.healerIdentityIds[i]);
+	Vector<uint64> assigned;
+	String firstReply;
+	uint64 firstReplyIdentity = 0;
+	for (int patientIndex = 0; patientIndex < patients.size(); ++patientIndex) {
+		uint64 healerIdentity = 0;
+		for (int recordIndex = 0; recordIndex < records.size(); ++recordIndex) {
+			const PlayerBotGroupRecord& record = records.get(recordIndex);
+			if (record.state != PLAYER_BOT_GROUP_GROUPED ||
+					(requestedHealers.size() > 0 &&
+						!requestedHealers.contains(record.identityId)) ||
+					assigned.contains(record.identityId) ||
+					!playerBotBotHealsGateEnabled(record.identityId))
+				continue;
+			PlayerBotHealReadiness readiness;
+			if (!snapshotPlayerBotHealReadiness(record.identityId, readiness) ||
+					!readiness.isMedic || !readiness.hasUsableStim ||
+					!readiness.cooldownReady)
+				continue;
+			healerIdentity = record.identityId;
+			break;
+		}
+		if (healerIdentity == 0) {
+			playerBotHealingOrdersNoMedic.increment();
+			if (firstReplyIdentity == 0)
+				firstReplyIdentity = records.get(0).identityId;
+			continue;
+		}
+		PlayerBotGroupRecord updated;
+		{
+			Locker groupingLock(&groupingMutex);
+			if (!playerBotGroupRecords.contains(healerIdentity))
+				continue;
+			PlayerBotGroupRecord& live = playerBotGroupRecords.get(healerIdentity);
+			live.healPatientOid = patients.get(patientIndex);
+			live.healPatientIdentityId = 0;
+			for (int j = 0; j < records.size(); ++j)
+				if (records.get(j).bodyOid == patients.get(patientIndex))
+					live.healPatientIdentityId = records.get(j).identityId;
+			live.healOrderGeneration++;
+			if (live.healOrderGeneration == 0)
+				live.healOrderGeneration = 1;
+			live.healOrderReason = "ordered";
+			updated = live;
+		}
+		assigned.add(healerIdentity);
+		playerBotHealingOrders.increment();
+		if (firstReplyIdentity == 0)
+			firstReplyIdentity = healerIdentity;
+		if (firstReply.isEmpty())
+			firstReply = config.healOnItLines.size() > 0 ?
+				config.healOnItLines.get(0) : String("On it.");
+		Reference<SimPlayerController*> controller = controllers.contains(
+			updated.bodyOid) ? controllers.get(updated.bodyOid) : nullptr;
+		SimHunterController* hunter = controller == nullptr ? nullptr :
+			dynamic_cast<SimHunterController*>(controller.get());
+		if (hunter != nullptr)
+			hunter->notifyGroupingStateChanged();
+	}
+	if (assigned.isEmpty()) {
+		String line = config.healNoMedicLines.size() > 0 ?
+			config.healNoMedicLines.get(0) : String("None of us can heal.");
+		postPlayerBotGroupReply(groupId, firstReplyIdentity != 0 ?
+			firstReplyIdentity : records.get(0).identityId, line);
+		MissionDiagLog::event("GROUP_HEAL", groupId, "reason=no_medic");
+		return false;
+	}
+	if (!firstReply.isEmpty())
+		postPlayerBotGroupReply(groupId, firstReplyIdentity, firstReply);
+	MissionDiagLog::event("GROUP_HEAL", groupId,
+		"orders=" + String::valueOf(assigned.size()));
+	return true;
+}
+
 void SimPlayerManager::preparePlayerBotGroupingDeath(uint64 identityId,
 		uint64 bodyOid, const String& reason) {
 	if (identityId == 0)
@@ -67326,6 +69031,10 @@ void SimPlayerManager::preparePlayerBotGroupingDeath(uint64 identityId,
 				live.pullStage = SimBotGroupTactics::APPROACH;
 				live.pullTargetOid = 0;
 				++live.tacticOrderGeneration;
+				live.healOrderGeneration = 0;
+				live.healPatientOid = 0;
+				live.healPatientIdentityId = 0;
+				live.healOrderReason = "dead";
 				++live.generation;
 				if (live.generation == 0)
 					live.generation = 1;
@@ -67406,6 +69115,8 @@ void SimPlayerManager::preparePlayerBotGroupingDeath(uint64 identityId,
 			playerBotGroupRoutes.drop(identityId);
 		}
 	}
+	if (hadRecord)
+		dropPlayerBotHealClaims(record.groupOid, identityId);
 	if (!hadRecord || recordedBodyOid == 0)
 		return;
 	if (revealedMissionLairsToClean.size() > 0)
@@ -67614,6 +69325,41 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 			namedBots.push_back(named);
 		}
 	}
+	bool senderIsLeader = false;
+	for (int i = 0; i < records.size(); ++i)
+		senderIsLeader |= records.get(i).leaderOid == senderOid;
+	SimBotHealing::HealRequest healingRequest =
+		SimBotHealing::parseHealCommand(text, config.healingVocabulary,
+			namedBots, senderIsLeader);
+	if (healingRequest.isHeal()) {
+		bool healingGateOpen = false;
+		for (int i = 0; i < records.size(); ++i) {
+			const bool addressed = healingRequest.healerIdentityIds.empty() ||
+				std::find(healingRequest.healerIdentityIds.begin(),
+					healingRequest.healerIdentityIds.end(),
+					records.get(i).identityId) !=
+					healingRequest.healerIdentityIds.end();
+			if (addressed && playerBotHealingGateEnabled(
+					records.get(i).identityId)) {
+				healingGateOpen = true;
+				break;
+			}
+		}
+		{
+			Locker groupingLock(&groupingMutex);
+			playerBotGroupingGroupChatCommands.put("heal",
+				playerBotGroupingGroupChatCommands.contains("heal") ?
+				playerBotGroupingGroupChatCommands.get("heal") + 1 : 1);
+		}
+		if (!healingGateOpen) {
+			playerBotHealingRejectedGate.increment();
+			MissionDiagLog::event("GROUP_HEAL", groupId,
+				"reason=gate_off");
+			return;
+		}
+		dispatchPlayerBotGroupHeal(groupId, healingRequest, senderOid);
+		return;
+	}
 	SimBotGroupRally::LeaderLine parsed = SimBotGroupRally::parseLeaderLine(
 		text, namedBots, config.vocabulary, config.rallyVocabulary,
 		config.missions.vocabulary, config.tactics.vocabulary);
@@ -67667,7 +69413,7 @@ void SimPlayerManager::onPlayerBotGroupChatTask(uint64 senderOid,
 		parsed.isTactic ||
 		command.command == SimBotGrouping::GROUP_COMMAND_FOLLOW;
 	if (leaderOnlyCommand) {
-		bool senderIsLeader = false;
+		senderIsLeader = false;
 		for (int i = 0; i < records.size(); ++i)
 			senderIsLeader |= records.get(i).leaderOid == senderOid;
 		if (!senderIsLeader) {
@@ -69049,6 +70795,15 @@ bool SimPlayerManager::completePlayerBotGroupTacticOrder(
 	record.pullStage = SimBotGroupTactics::APPROACH;
 	record.pullTargetOid = 0;
 	return true;
+}
+
+void SimPlayerManager::updatePlayerBotGroupHealStage(uint64 identityId,
+		const String& stage) {
+	if (identityId == 0)
+		return;
+	Locker groupingLock(&groupingMutex);
+	if (playerBotGroupRecords.contains(identityId))
+		playerBotGroupRecords.get(identityId).healStage = stage;
 }
 
 bool SimPlayerManager::updatePlayerBotGroupTacticPullStage(

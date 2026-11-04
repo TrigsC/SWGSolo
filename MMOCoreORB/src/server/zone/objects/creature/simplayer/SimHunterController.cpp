@@ -27,6 +27,7 @@
 #include "server/zone/objects/building/BuildingObject.h"
 #include "server/zone/objects/tangible/threat/ThreatMap.h"
 #include "server/zone/managers/combat/CombatManager.h"
+#include "server/zone/managers/collision/CollisionManager.h"
 #include "server/zone/managers/player/PlayerManager.h"
 #include "server/zone/managers/planet/PlanetManager.h"
 #include "server/chat/ChatManager.h"
@@ -562,6 +563,7 @@ void SimHunterController::suspendRoutineForGroup(const String& reason) {
 	setEarlyGameActiveFlag(false);
 	groupFallbackMoveActive.store(false, std::memory_order_release);
 	groupPullReturnActive.store(false, std::memory_order_release);
+	clearGroupHealState("group_suspend");
 	groupSpinApproachActive.store(false, std::memory_order_release);
 	groupBackOffMoveActive.store(false, std::memory_order_release);
 	resetTravelCombat();
@@ -578,6 +580,7 @@ void SimHunterController::resumeRoutineAfterGroup(bool postLeaving) {
 	(void)postLeaving;
 	groupFallbackMoveActive.store(false, std::memory_order_release);
 	groupPullReturnActive.store(false, std::memory_order_release);
+	clearGroupHealState("group_resume");
 	groupSpinApproachActive.store(false, std::memory_order_release);
 	groupBackOffMoveActive.store(false, std::memory_order_release);
 	groupLastPathTarget = Vector3();
@@ -603,6 +606,7 @@ void SimHunterController::leaveGroupMode() {
 	advanceWorkLoopGeneration("hunterGroupRelease");
 	groupFallbackMoveActive.store(false, std::memory_order_release);
 	groupPullReturnActive.store(false, std::memory_order_release);
+	clearGroupHealState("group_leave");
 	groupSpinApproachActive.store(false, std::memory_order_release);
 	groupBackOffMoveActive.store(false, std::memory_order_release);
 	cancelGroupBuff();
@@ -618,6 +622,120 @@ void SimHunterController::leaveGroupMode() {
 	clearEngagedTelemetry();
 	resetTravelCombat();
 	resumeRoutineAfterGroup(false);
+}
+
+void SimHunterController::clearGroupHealState(const String& reason,
+		bool completeOrder) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	uint64 groupId = groupHealClaimGroupId;
+	if (manager != nullptr && groupId == 0) {
+		PlayerBotGroupRecord record;
+		if (manager->getPlayerBotGroupRecord(identityId, record))
+			groupId = record.groupOid;
+	}
+	if (manager != nullptr && groupId != 0 && groupHealPatientOid != 0 &&
+			groupHealClaimGeneration != 0) {
+		manager->releasePlayerBotHealClaim(groupId, groupHealPatientOid,
+			identityId, groupHealClaimGeneration);
+	}
+	if (manager != nullptr && completeOrder && groupHealOrderGeneration != 0)
+		manager->completePlayerBotGroupHealOrder(identityId,
+			groupHealOrderGeneration, reason, false);
+
+	if (manager != nullptr && groupHealPatientOid != 0)
+		manager->updatePlayerBotGroupHealStage(identityId, "idle");
+	groupHealMoveActive.store(false, std::memory_order_release);
+	groupHealState = SimBotHealing::HealState();
+	groupHealOrderGeneration = 0;
+	groupHealPatientOid = 0;
+	groupHealClaimGroupId = 0;
+	groupHealClaimGeneration = 0;
+	groupHealLastPathIssuedMs = 0;
+	groupHealLastPathTarget = Vector3();
+}
+
+void SimHunterController::publishPlayerBotHealReadiness(AiAgent* hunter,
+		uint64 nowMs) {
+	if (hunter == nullptr || identityId == 0 ||
+			(lastHealReadinessAtMs != 0 && nowMs < lastHealReadinessAtMs + 30000))
+		return;
+	lastHealReadinessAtMs = nowMs;
+
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr)
+		return;
+	PlayerBotHealReadiness readiness;
+	readiness.updatedAtMs = nowMs;
+	if (manager->isPlayerBotBotHealsActive(identityId)) {
+		std::vector<SimBotHealing::StimStack> stacks;
+		const bool haveStacks = manager->snapshotPlayerBotHealingStimStacks(
+			identityId, stacks);
+		int healingAbility = 0;
+		bool cooldownReady = false;
+		{
+			Locker hunterLock(hunter);
+			if (!hunter->isDead() && hunter->getZone() != nullptr) {
+				healingAbility = hunter->getSkillMod("healing_ability");
+				cooldownReady = hunter->canTreatInjuries();
+			}
+		}
+		readiness.isMedic = healingAbility > 0;
+		readiness.cooldownReady = cooldownReady;
+		if (haveStacks && readiness.isMedic) {
+			readiness.doses = SimBotHealing::usableStimDoses(stacks,
+				healingAbility);
+			readiness.hasUsableStim = SimBotHealing::chooseStim(stacks,
+				healingAbility) >= 0;
+		}
+	}
+	if (readiness.doses >= manager->getPlayerBotHealingPolicy().minDoses)
+		groupHealLowStimsSaid = false;
+	manager->publishPlayerBotHealReadiness(identityId, readiness);
+}
+
+bool SimHunterController::trySoloPlayerBotSelfHeal(AiAgent* hunter,
+		uint64 nowMs, const SimBotHealing::PlayerBotHealingPolicy& policy) {
+	(void)nowMs;
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr || hunter == nullptr || !policy.selfHeal ||
+			!manager->isPlayerBotBotHealsActive(identityId))
+		return false;
+
+	std::vector<SimBotHealing::StimStack> stacks;
+	if (!manager->snapshotPlayerBotHealingStimStacks(identityId, stacks))
+		return false;
+
+	int healingAbility = 0;
+	bool cooldownReady = false;
+	bool needsHeal = false;
+	{
+		Locker hunterLock(hunter);
+		if (hunter->isDead() || hunter->isIncapacitated() ||
+				hunter->getZone() == nullptr)
+			return false;
+		healingAbility = hunter->getSkillMod("healing_ability");
+		cooldownReady = hunter->canTreatInjuries();
+		const int maxHealth = hunter->getMaxHAM(CreatureAttribute::HEALTH);
+		const int maxAction = hunter->getMaxHAM(CreatureAttribute::ACTION);
+		const float healthFraction = maxHealth > 0 ?
+			static_cast<float>(hunter->getHAM(CreatureAttribute::HEALTH)) /
+			static_cast<float>(maxHealth) : 1.f;
+		const float actionFraction = maxAction > 0 ?
+			static_cast<float>(hunter->getHAM(CreatureAttribute::ACTION)) /
+			static_cast<float>(maxAction) : 1.f;
+		needsHeal = SimBotHealing::needsHeal(healthFraction, actionFraction,
+			hunter->hasDamage(CreatureAttribute::HEALTH) ||
+				hunter->hasDamage(CreatureAttribute::ACTION),
+			policy.selfHealThreshold);
+	}
+	if (healingAbility <= 0 || !cooldownReady || !needsHeal ||
+			SimBotHealing::chooseStim(stacks, healingAbility) < 0)
+		return false;
+
+	// applyPlayerBotStimHeal owns the healer lock. No movement or controller
+	// lock is held across the stock-equivalent heal operation.
+	manager->applyPlayerBotStimHeal(identityId, hunter, hunter);
+	return true;
 }
 
 bool SimHunterController::engageDefensiveTarget(AiAgent* hunter,
@@ -2333,6 +2451,454 @@ bool SimHunterController::runGroupPull(AiAgent* hunter, uint64 nowMs,
 	return true;
 }
 
+bool SimHunterController::runGroupHealTick(AiAgent* hunter, uint64 nowMs,
+		const PlayerBotGroupRecord& record,
+		const SimPlayerManager::PlayerBotGroupSnapshot& group,
+		const PlayerBotGroupingConfig& groupingConfig) {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	if (manager == nullptr || hunter == nullptr)
+		return false;
+
+	const SimBotHealing::PlayerBotHealingPolicy policy =
+		manager->getPlayerBotHealingPolicy();
+	const bool ordered = record.healOrderGeneration != 0;
+	auto postHealLine = [&](const String& line, uint64 patientOid,
+			const String& reason, bool suppressAutomatic, int doses) {
+		if (line.isEmpty())
+			return;
+		if (suppressAutomatic && groupHealRefusalPatientOid == patientOid &&
+				groupHealRefusalReason == reason && groupHealLastRefusalMs != 0 &&
+				nowMs < groupHealLastRefusalMs + 60000)
+			return;
+		if (suppressAutomatic) {
+			groupHealRefusalPatientOid = patientOid;
+			groupHealRefusalReason = reason;
+			groupHealLastRefusalMs = nowMs;
+		}
+		String rendered = line;
+		String patientName = "them";
+		if (patientOid != 0) {
+			ZoneServer* zoneServer = ServerCore::getZoneServer();
+			ManagedReference<CreatureObject*> patient = zoneServer == nullptr ?
+				nullptr : zoneServer->getObject(patientOid).
+				castTo<CreatureObject*>();
+			if (patient != nullptr) {
+				Locker patientLock(patient);
+				patientName = patient->getDisplayedName();
+			}
+		}
+		rendered = simHunterReplaceToken(rendered, "%s", patientName);
+		if (doses >= 0)
+			rendered = simHunterReplaceToken(rendered, "%d",
+				String::valueOf(doses));
+		manager->postPlayerBotGroupReply(record.groupOid, identityId, rendered);
+	};
+	if (!manager->isPlayerBotBotHealsActive(identityId)) {
+		if (ordered)
+			manager->completePlayerBotGroupHealOrder(identityId,
+				record.healOrderGeneration, "gate_off", false);
+		clearGroupHealState("gate_off", false);
+		return ordered || groupHealPatientOid != 0;
+	}
+
+	// An ordered generation supersedes an automatic patient, and a changed
+	// ordered generation supersedes the old order. The compare-and-set in the
+	// manager remains the authority; this local reset only releases our claim
+	// and stops the old walking branch.
+	if (groupHealPatientOid != 0 &&
+			((ordered && groupHealOrderGeneration != record.healOrderGeneration) ||
+				(!ordered && groupHealOrderGeneration != 0)))
+		clearGroupHealState("order_changed");
+	if (ordered && (groupSpinLairOid != 0 ||
+			groupSpinApproachActive.load(std::memory_order_acquire)))
+		endGroupSpin();
+
+	if (!manager->isPlayerBotMedic(identityId)) {
+		if (ordered) {
+			const String line = groupingConfig.healNoMedicLines.size() > 0 ?
+				groupingConfig.healNoMedicLines.get(0) :
+				String("None of us can heal.");
+			manager->postPlayerBotGroupReply(record.groupOid, identityId, line);
+			manager->completePlayerBotGroupHealOrder(identityId,
+				record.healOrderGeneration, "no_medic", false);
+			clearGroupHealState("no_medic", false);
+			return true;
+		}
+		if (groupHealPatientOid != 0) {
+			clearGroupHealState("no_medic", false);
+			return true;
+		}
+		return false;
+	}
+	// Automatic heals start only with a usable stim on hand; "no stims" is an
+	// answer to an order, never a line repeated on every tick.
+	if (!ordered && groupHealPatientOid == 0) {
+		PlayerBotHealReadiness readiness;
+		if (!manager->snapshotPlayerBotHealReadiness(identityId, readiness) ||
+				!readiness.hasUsableStim)
+			return false;
+	}
+
+	Vector3 hunterPosition;
+	String hunterPlanet;
+	bool hunterDead = false;
+	{
+		Locker hunterLock(hunter);
+		hunterPosition = hunter->getWorldPosition();
+		Zone* hunterZone = hunter->getZone();
+		hunterPlanet = hunterZone == nullptr ? String() :
+			hunterZone->getZoneName();
+		hunterDead = hunter->isDead() || hunter->isIncapacitated();
+	}
+	if (hunterDead) {
+		clearGroupHealState("healer_unavailable");
+		return ordered;
+	}
+
+	std::vector<SimBotHealing::PatientCandidate> candidates;
+	Vector<ManagedReference<CreatureObject*> > candidateObjects;
+	for (int memberIndex = -1; memberIndex < group.memberOids.size();
+			++memberIndex) {
+		const uint64 memberOid = memberIndex < 0 ? hunter->getObjectID() :
+			group.memberOids.get(memberIndex);
+		if (memberOid == 0 || (memberIndex >= 0 &&
+				memberOid == hunter->getObjectID() && memberIndex != -1))
+			continue;
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<CreatureObject*> candidate = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(memberOid).castTo<CreatureObject*>();
+		if (candidate == nullptr)
+			continue;
+		// Patients are players and authorized roster bots only: never pets
+		// (stock pays no medical XP for them) or other grouped creatures. The
+		// authority lookup takes pveMutex, so it runs before any object lock.
+		if (memberIndex >= 0 && !candidate->isPlayerCreature() &&
+				!manager->isPlayerBotHealPatient(memberOid))
+			continue;
+
+		SimBotHealing::PatientCandidate snapshot;
+		snapshot.objectId = memberOid;
+		snapshot.isSelf = memberIndex < 0;
+		snapshot.orderedTarget = ordered && record.healPatientOid == memberOid;
+		bool samePlanet = false;
+		{
+			// The hunter lock is deliberately not held here. Each member gets one
+			// lock at a time, matching selectActiveCombatAttacker's cross-read
+			// choreography and keeping the candidate scan out of manager locks.
+			Locker candidateLock(candidate);
+			if (candidate->isDead() || candidate->getZone() == nullptr)
+				continue;
+			const String candidatePlanet = candidate->getZone()->getZoneName();
+			samePlanet = hunterPlanet.isEmpty() || candidatePlanet == hunterPlanet;
+			if (!samePlanet)
+				continue;
+			const Vector3 candidatePosition = candidate->getWorldPosition();
+			snapshot.distanceMeters = hunterPosition.distanceTo2d(
+				candidatePosition);
+			const int maxHealth = candidate->getMaxHAM(
+				CreatureAttribute::HEALTH);
+			const int maxAction = candidate->getMaxHAM(
+				CreatureAttribute::ACTION);
+			const int health = candidate->getHAM(CreatureAttribute::HEALTH);
+			const int action = candidate->getHAM(CreatureAttribute::ACTION);
+			snapshot.healthFraction = maxHealth > 0 ?
+				static_cast<float>(health) / static_cast<float>(maxHealth) : 1.f;
+			snapshot.actionFraction = maxAction > 0 ?
+				static_cast<float>(action) / static_cast<float>(maxAction) : 1.f;
+			snapshot.hasHealthDamage = candidate->hasDamage(
+				CreatureAttribute::HEALTH);
+			snapshot.hasActionDamage = candidate->hasDamage(
+				CreatureAttribute::ACTION);
+			snapshot.inCombat = candidate->isInCombat();
+			snapshot.healable = snapshot.isSelf || candidate->isHealableBy(hunter);
+			snapshot.losClear = snapshot.isSelf ||
+				CollisionManager::checkLineOfSight(hunter, candidate.get());
+		}
+		candidates.push_back(snapshot);
+		candidateObjects.add(candidate);
+	}
+
+	int selectedIndex = -1;
+	if (groupHealPatientOid != 0) {
+		for (size_t i = 0; i < candidates.size(); ++i) {
+			if (candidates[i].objectId == groupHealPatientOid) {
+				selectedIndex = static_cast<int>(i);
+				break;
+			}
+		}
+		if (selectedIndex < 0) {
+			if (groupHealOrderGeneration != 0)
+				manager->completePlayerBotGroupHealOrder(identityId,
+					groupHealOrderGeneration, "patient_left", false);
+			clearGroupHealState("patient_left", false);
+			return true;
+		}
+	} else {
+		// A named patient who is not a candidate (left the group, another
+		// planet, dead) ends the order; it is never "not hurt".
+		if (ordered && record.healPatientOid != 0) {
+			bool patientPresent = false;
+			for (size_t i = 0; i < candidates.size(); ++i)
+				patientPresent = patientPresent ||
+					candidates[i].objectId == record.healPatientOid;
+			if (!patientPresent) {
+				manager->completePlayerBotGroupHealOrder(identityId,
+					record.healOrderGeneration, "patient_left", false);
+				clearGroupHealState("patient_left", false);
+				return true;
+			}
+		}
+		for (;;) {
+			const SimBotHealing::PatientChoice choice =
+				SimBotHealing::chooseHealPatient(candidates, policy);
+			if (!choice.found()) {
+				String noPatientReason = choice.reason;
+				uint64 noPatientOid = record.healPatientOid;
+				if (noPatientOid == 0 && choice.reasonIndex >= 0 &&
+						choice.reasonIndex < static_cast<int>(candidates.size()))
+					noPatientOid = candidates[choice.reasonIndex].objectId;
+				// An ordered patient is present and always needs a heal, so
+				// "nothing" means nobody it covers is hurt.
+				if (ordered && noPatientReason == "nothing")
+					noPatientReason = "no_damage";
+				if (ordered) {
+					String line;
+					if (noPatientReason == "faction")
+						line = groupingConfig.healRefusedLines.size() > 0 ?
+							groupingConfig.healRefusedLines.get(0) :
+							String("I can't heal that target.");
+					else if (noPatientReason == "out_of_range" ||
+							noPatientReason == "unreachable")
+						line = groupingConfig.healCantReachLines.size() > 0 ?
+							groupingConfig.healCantReachLines.get(0) :
+							String("I can't reach them.");
+					else if (noPatientReason == "no_damage")
+						line = groupingConfig.healNotHurtLines.size() > 0 ?
+							groupingConfig.healNotHurtLines.get(0) :
+							String("They don't need a heal.");
+					postHealLine(line, noPatientOid,
+						noPatientReason.isEmpty() ? "no_damage" : noPatientReason,
+						false, -1);
+					manager->completePlayerBotGroupHealOrder(identityId,
+							record.healOrderGeneration,
+							noPatientReason.isEmpty() ? "no_damage" : noPatientReason,
+							noPatientReason == "no_damage");
+					clearGroupHealState("no_patient", false);
+					return true;
+				}
+				if (noPatientReason == "faction" ||
+						noPatientReason == "out_of_range" ||
+						noPatientReason == "unreachable") {
+					const String line = noPatientReason == "faction" ?
+						(groupingConfig.healRefusedLines.size() > 0 ?
+							groupingConfig.healRefusedLines.get(0) :
+							String("I can't heal that target.")) :
+						(groupingConfig.healCantReachLines.size() > 0 ?
+							groupingConfig.healCantReachLines.get(0) :
+							String("I can't reach them."));
+					// Say so, but never hold the tick: a medic waiting on a patient
+					// it cannot reach stops following and defending the group.
+					postHealLine(line, noPatientOid, noPatientReason, true, -1);
+				}
+				return false;
+			}
+			const int claimIndex = choice.index;
+			uint64 claimGeneration = 0;
+			if (claimIndex < 0 || claimIndex >=
+					static_cast<int>(candidateObjects.size()))
+				return false;
+			if (!manager->tryClaimPlayerBotHealPatient(group.groupOid,
+					candidates[claimIndex].objectId, identityId, &claimGeneration,
+					!ordered)) {
+				// Automatic healing skips a patient held by another medic this
+				// tick. Mark it unavailable and let chooseHealPatient consider the
+				// next damaged member.
+				candidates[claimIndex].healable = false;
+				continue;
+			}
+			selectedIndex = claimIndex;
+			groupHealPatientOid = candidates[selectedIndex].objectId;
+			groupHealClaimGroupId = group.groupOid;
+			groupHealClaimGeneration = claimGeneration;
+			groupHealOrderGeneration = ordered ? record.healOrderGeneration : 0;
+			groupHealState = SimBotHealing::HealState();
+			groupHealLastPathIssuedMs = 0;
+			groupHealLastPathTarget = Vector3();
+			break;
+		}
+	}
+
+	if (selectedIndex < 0 || selectedIndex >=
+			static_cast<int>(candidateObjects.size()))
+		return ordered;
+
+	const SimBotHealing::PatientCandidate& patientSnapshot =
+		candidates[selectedIndex];
+	ManagedReference<CreatureObject*> patient = candidateObjects.get(
+		selectedIndex);
+	const bool patientNeedsHeal = patientSnapshot.hasDamage();
+	if (!patientNeedsHeal) {
+		if (groupHealOrderGeneration != 0)
+			manager->completePlayerBotGroupHealOrder(identityId,
+				groupHealOrderGeneration, "no_damage", true);
+		clearGroupHealState("no_damage", false);
+		return true;
+	}
+	if (!patientSnapshot.healable) {
+		const String line = groupingConfig.healRefusedLines.size() > 0 ?
+			groupingConfig.healRefusedLines.get(0) :
+			String("I can't heal that target.");
+		if (groupHealOrderGeneration != 0)
+			manager->completePlayerBotGroupHealOrder(identityId,
+				groupHealOrderGeneration, "refused", false);
+		postHealLine(line, patientSnapshot.objectId, "refused",
+			groupHealOrderGeneration == 0, -1);
+		clearGroupHealState("refused", false);
+		return true;
+	}
+
+	const float applyRange = Math::max(1.f, policy.applyRangeMeters);
+	const bool withinApplyRange = patientSnapshot.distanceMeters <= applyRange;
+	if (groupHealState.stage == SimBotHealing::APPROACH) {
+		SimBotHealing::HealInputs inputs;
+		inputs.nowMs = nowMs;
+		inputs.withinApplyRange = withinApplyRange;
+		inputs.approachTimeoutMs = static_cast<uint64>(Math::max(1,
+			policy.approachTimeoutSeconds)) * 1000ULL;
+		const SimBotHealing::HealState next =
+			SimBotHealing::healStep(groupHealState, inputs);
+		groupHealState = next;
+		if (next.stage == SimBotHealing::ABORT) {
+			const String line = groupingConfig.healCantReachLines.size() > 0 ?
+				groupingConfig.healCantReachLines.get(0) :
+				String("I can't reach them.");
+			if (groupHealOrderGeneration != 0)
+				manager->completePlayerBotGroupHealOrder(identityId,
+					groupHealOrderGeneration, "unreachable", false);
+			postHealLine(line, patientSnapshot.objectId, "unreachable",
+				groupHealOrderGeneration == 0, -1);
+			clearGroupHealState("unreachable", false);
+			return true;
+		}
+		if (groupHealState.stage == SimBotHealing::APPROACH) {
+			if (!groupHealMoveActive.load(std::memory_order_acquire))
+				manager->updatePlayerBotGroupHealStage(identityId, "approach");
+			groupHealMoveActive.store(true, std::memory_order_release);
+			Vector3 patientPosition;
+			{
+				Locker patientLock(patient);
+				patientPosition = patient->getWorldPosition();
+			}
+			Vector3 direction = hunterPosition - patientPosition;
+			direction.setZ(0.f);
+			if (direction.length2d() < 0.01f)
+				direction = Vector3::UNIT_X;
+			else
+				direction.normalize();
+			const Vector3 stopPoint = patientPosition + direction *
+				Math::max(0.5f, applyRange - 1.f);
+			const bool firstApproach = groupHealLastPathIssuedMs == 0;
+			const bool patientMoved = firstApproach ||
+				patientPosition.distanceTo(groupHealLastPathTarget) >
+					groupingConfig.repathMoveMeters;
+			const bool stalled = groupHealLastPathIssuedMs != 0 &&
+				(state == IDLE || state == WAITING) && nowMs >=
+				groupHealLastPathIssuedMs + 8000;
+			if (!isTraversalActive() && (firstApproach || patientMoved ||
+					stalled)) {
+				// The first heal path replaces the in-flight follow path. Later
+				// patient movement also replaces the path so the stop point stays
+				// on the patient's current line.
+				moveTo(stopPoint);
+				groupHealLastPathTarget = patientPosition;
+				groupHealLastPathIssuedMs = nowMs;
+			}
+			scheduleActiveTick(Math::max(250, groupingConfig.followTickMs));
+			return true;
+		}
+	}
+
+	groupHealMoveActive.store(false, std::memory_order_release);
+	if (groupHealState.stage != SimBotHealing::APPLY)
+		return true;
+	manager->updatePlayerBotGroupHealStage(identityId, "apply");
+	const PlayerBotHealResult result = manager->applyPlayerBotStimHeal(
+		identityId, hunter, patient.get());
+	if (result.succeeded() || result.reason == "no_damage") {
+		// Pooled usable doses, the same count readiness re-arms the latch on.
+		if (result.succeeded() && !groupHealLowStimsSaid) {
+			std::vector<SimBotHealing::StimStack> stacks;
+			const int pooledDoses = manager->snapshotPlayerBotHealingStimStacks(
+				identityId, stacks) ? SimBotHealing::usableStimDoses(stacks,
+					manager->playerBotHealingAbility(identityId)) : 0;
+			if (pooledDoses > 0 && pooledDoses < policy.minDoses) {
+				groupHealLowStimsSaid = true;
+				postHealLine(groupingConfig.healLowStimsLines.size() > 0 ?
+					groupingConfig.healLowStimsLines.get(0) :
+					String("Down to %d stims."), patientSnapshot.objectId,
+					"low_stims", false, pooledDoses);
+			}
+		}
+		if (groupHealOrderGeneration != 0)
+			manager->completePlayerBotGroupHealOrder(identityId,
+				groupHealOrderGeneration, result.reason,
+				result.succeeded() || result.reason == "no_damage");
+		clearGroupHealState(result.reason, false);
+		return true;
+	}
+
+	if (result.reason == "cooldown" || result.reason == "mind") {
+		const uint64 timeoutMs = static_cast<uint64>(Math::max(1,
+			policy.applyTimeoutSeconds)) * 1000ULL;
+		if (nowMs < groupHealState.phaseStartedAtMs + timeoutMs) {
+			scheduleActiveTick(Math::max(250, groupingConfig.followTickMs));
+			return true;
+		}
+		if (groupHealOrderGeneration != 0) {
+			manager->postPlayerBotGroupReply(record.groupOid, identityId,
+				groupingConfig.healCooldownLines.size() > 0 ?
+					groupingConfig.healCooldownLines.get(0) :
+					String("I need a moment before I can heal again."));
+			manager->completePlayerBotGroupHealOrder(identityId,
+				groupHealOrderGeneration, result.reason, false);
+		}
+		clearGroupHealState(result.reason, false);
+		return true;
+	}
+
+	String line;
+	if (result.reason == "no_stim") {
+		// The readiness snapshot is stale; republish it on the next tick.
+		lastHealReadinessAtMs = 0;
+		if (groupHealOrderGeneration != 0)
+			line = groupingConfig.healNoStimsLines.size() > 0 ?
+				groupingConfig.healNoStimsLines.get(0) :
+				String("I have no stim packs.");
+	}
+	else if (result.reason == "faction" || result.reason == "arena" ||
+			result.reason == "los" || result.reason == "range" ||
+			result.reason == "refused")
+		line = groupingConfig.healRefusedLines.size() > 0 ?
+			groupingConfig.healRefusedLines.get(0) :
+			String("I can't heal that target.");
+	else if (result.reason == "patient_gone" || result.reason == "patient_dead")
+		line = String();
+	else
+		line = groupingConfig.healCantReachLines.size() > 0 ?
+			groupingConfig.healCantReachLines.get(0) : String("I can't reach them.");
+
+	const bool refusal = result.reason == "faction" || result.reason == "arena" ||
+		result.reason == "los" || result.reason == "range" ||
+		result.reason == "refused";
+	postHealLine(line, patientSnapshot.objectId, result.reason,
+		groupHealOrderGeneration == 0 && refusal, -1);
+	if (groupHealOrderGeneration != 0)
+		manager->completePlayerBotGroupHealOrder(identityId,
+			groupHealOrderGeneration, result.reason, false);
+	clearGroupHealState(result.reason, false);
+	return true;
+}
+
 bool SimHunterController::runGroupTacticOrder(AiAgent* hunter, uint64 nowMs,
 		const PlayerBotGroupRecord& record,
 		const SimPlayerManager::PlayerBotGroupSnapshot& group,
@@ -2451,6 +3017,12 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 			phase != GROUP_BUFF)
 		setPhase(GROUP_WAIT);
 	groupFallbackMoveActive.store(false, std::memory_order_release);
+	if (!manager->isPlayerBotBotHealsActive(identityId)) {
+		if (record.healOrderGeneration != 0)
+			manager->completePlayerBotGroupHealOrder(identityId,
+				record.healOrderGeneration, "gate_off", false);
+		clearGroupHealState("gate_off", false);
+	}
 	if (record.tacticOrder != SimBotGroupTactics::ORDER_PULL &&
 			groupPullOrderGeneration != 0) {
 		groupPullReturnActive.store(false, std::memory_order_release);
@@ -2501,7 +3073,7 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 		const bool pullReturning = record.tacticOrder ==
 			SimBotGroupTactics::ORDER_PULL &&
 			groupPullStage == SimBotGroupTactics::RETURN;
-		if (!pullReturning)
+		if (!pullReturning && !groupHealMoveActive.load(std::memory_order_acquire))
 			engageDefensiveTarget(hunter, selfAttacker.get(), "self");
 	}
 
@@ -2568,7 +3140,18 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 				selfAttacker))
 			return;
 	}
+	// An ordered heal may preempt spin engagement. An automatic heal already
+	// in progress also keeps its patient; a newly discovered automatic patient
+	// runs after the G4 spin tier below.
+	if (record.healOrderGeneration != 0 || groupHealPatientOid != 0) {
+		if (runGroupHealTick(hunter, nowMs, record, group,
+				manager->getPlayerBotGroupingConfig()))
+			return;
+	}
 	if (runGroupSpin(hunter, nowMs, record,
+			manager->getPlayerBotGroupingConfig()))
+		return;
+	if (runGroupHealTick(hunter, nowMs, record, group,
 			manager->getPlayerBotGroupingConfig()))
 		return;
 	// Self-defence wins: never switch off a creature attacking this bot.
@@ -3080,6 +3663,7 @@ void SimHunterController::startOrder(const PveHuntOrder& newOrder,
 		const PveHuntSpecies& newSpecies) {
 	if (newOrder.identityId != identityId || newOrder.bodyOid == 0)
 		return;
+	clearGroupHealState("new_order");
 
 	// Grouping wins a dispatch race as well as the active-tick race.  The
 	// manager normally excludes these identities, but this guard keeps a stale
@@ -3324,6 +3908,7 @@ void SimHunterController::lairRetreatReflee(AiAgent* hunter,
 bool SimHunterController::allowsMovementInCombat() const {
 	if (groupFallbackMoveActive.load(std::memory_order_acquire) ||
 			groupPullReturnActive.load(std::memory_order_acquire) ||
+			groupHealMoveActive.load(std::memory_order_acquire) ||
 			groupSpinApproachActive.load(std::memory_order_acquire) ||
 			groupBackOffMoveActive.load(std::memory_order_acquire))
 		return true;
@@ -3342,6 +3927,7 @@ bool SimHunterController::allowsMovementInCombat() const {
 bool SimHunterController::keepsCombatOnPathAccept() const {
 	if (groupFallbackMoveActive.load(std::memory_order_acquire) ||
 			groupPullReturnActive.load(std::memory_order_acquire) ||
+			groupHealMoveActive.load(std::memory_order_acquire) ||
 			groupSpinApproachActive.load(std::memory_order_acquire) ||
 			groupBackOffMoveActive.load(std::memory_order_acquire))
 		return true;
@@ -3696,6 +4282,7 @@ void SimHunterController::onTick() {
 	// seconds) re-aimed the bot at the creature and pinned it (verify boot 8).
 	// Both leases are atomics written by runActiveTick.
 	if (groupPullReturnActive.load(std::memory_order_acquire) ||
+			groupHealMoveActive.load(std::memory_order_acquire) ||
 			groupBackOffMoveActive.load(std::memory_order_acquire))
 		return;
 	// A spinning bot is in combat with its lair; with no creature on it this
@@ -7186,6 +7773,7 @@ void SimHunterController::runActiveTick() {
 
 	updateAreaAttackGuard();
 	uint64 nowMs = System::getMiliTime();
+	publishPlayerBotHealReadiness(strongAgent.get(), nowMs);
 	// Entry probe: distinguishes "the controller stopped ticking entirely" from
 	// "it ticks but never reaches the phase branch". Rate-limited by the same
 	// heartbeat interval and only while on a cross-planet leg, so it cannot spam.
@@ -7198,6 +7786,7 @@ void SimHunterController::runActiveTick() {
 	if (strongAgent->isDead()) {
 		const bool bazaarVisitAtDeath = phase == BAZAAR_VISIT;
 		const String phaseAtDeath = getPhaseName();
+		clearGroupHealState("bot_death");
 		if (bazaarVisitAtDeath)
 			finishBazaarVisit("botDeath", false);
 		// Every queued corpse belongs to this body's OID; the respawned body gets
@@ -7350,6 +7939,15 @@ void SimHunterController::runActiveTick() {
 			std::memory_order_acquire) == SimBotTravelCombat::MOVE &&
 			runPlayerBotLootStep(strongAgent, nowMs))
 		return;
+
+	// Self-healing is deliberately a no-movement hook. It runs before the
+	// travel-combat FLEE/REST decision and while the legacy HEALING phase is
+	// resting; the existing phase logic still owns its cadence and movement.
+	if (phase == HEALING || isTravelCombatPhase()) {
+		const SimBotHealing::PlayerBotHealingPolicy healingPolicy =
+			SimPlayerManager::instance()->getPlayerBotHealingPolicy();
+		trySoloPlayerBotSelfHeal(strongAgent.get(), nowMs, healingPolicy);
+	}
 
 	if (phase == ANNOUNCE_JOB) {
 		if (!strongAgent->isInCombat() && SimPlayerManager::instance()->
@@ -10091,6 +10689,7 @@ void SimHunterController::beginTravelHome(bool abandoned) {
 }
 
 void SimHunterController::completeOrder(bool abandoned, const String& reason) {
+	clearGroupHealState("order_complete");
 	if (!orderActive)
 		return;
 	if (isStructureTraversalFeatureEnabled() && isTraversalActive())
@@ -10153,6 +10752,7 @@ void SimHunterController::completeOrder(bool abandoned, const String& reason) {
 void SimHunterController::teardown(const String& reason) {
 	// The body is going away, and with it the ownership of every queued corpse.
 	SimPlayerManager* manager = SimPlayerManager::instance();
+	clearGroupHealState("teardown");
 	if (manager != nullptr)
 		manager->preparePlayerBotGroupingDeath(identityId,
 			agent == nullptr ? 0 : agent->getObjectID(), "teardown");

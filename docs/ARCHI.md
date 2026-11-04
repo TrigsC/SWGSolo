@@ -131,6 +131,7 @@ CMake options: `BUILD_IDL`, `COMPILE_TESTS`, `ENABLE_ASAN`/`TSAN`/`UBSAN`. Debug
 | F_0.9.15 (v0.9.16) | `groupingEnabled`, `grouping` (`roomName` LFB, offer TTL 180 s, `defaultReplies` 2, `maxRepliesCap`, reply delays/gap, `availabilityChancePercent`, request cooldown and room rate, `maxGroupedBots` 10, `maxBotsPerLeader` 9, join delay, `followMinMeters`/`followMaxMeters`, `repathMoveMeters` 3, `followTickMs` 750, `routeDistanceMeters`, `maxReplansPer10Min`, `assistRadiusMeters`, `leaderOfflineGraceSeconds`, `vocabulary` roles/gear/tiers/status/leave, `lines`) |
 | F_0.9.17 (v0.9.18) | `grouping.missionsEnabled` (false), `grouping.missions` (`maxGrabCount` 20 sanity cap, `bearingToleranceDeg` 22, `holdShortMeters` 60, `missionTimeoutMinutes`, `grabBatchTimeoutSeconds`, `assistLeaderTarget`/`assistLeaderRadiusMeters`), `vocabulary.mission` (grab, mission/lair nouns, run, skip, directions), mission and `clonedNoBuffs` lines; `bin/conf/config.lua` `Core3.MissionManager.MaxActiveMissions` (2); harness `playerBotParityTest.onlyScenarios`/`continueOnFailure`/`maxRunMinutes` |
 | F_0.9.18 (v0.9.19) | `grouping.tacticsEnabled` (false), `grouping.tactics` (`pullRadiusMeters` 64, `pullTimeoutSeconds` per phase, `tagTimeoutSeconds`, `spinStartMeters` 20, `spinStandMeters`), `vocabulary.tactics` (pull, spinPoll, spinOn, spinOff, eat, backOff, lairAttack), tactic lines, `grouping.missions.leadStopMeters` (40) |
+| F_0.9.19 (v0.9.20) | `healingEnabled` (false), `healing` (`playerHealsBots`, `botHeals`, `selfHeal`, `groupHealThreshold` 0.70, `selfHealThreshold` 0.60, `selfCriticalFraction` 0.35, `maxApproachMeters` 32, `applyRangeMeters` 6, approach/apply timeouts, `bazaarRestock`, `minDoses` 20, `restockSpendFraction`, `restockScanIntervalMinutes`, `maxRestockLoadsPerVisit`, `items` = five crafted stims `{template, maxPricePerDose}`), `grouping.vocabulary.heal`, heal lines |
 | F_0.9.16 (v0.9.17) | `grouping.directivesEnabled` (false), `buffCities`, rally `rallyArriveMeters`/`Min`/`Max`/`ReleaseMeters`/`HoldMaxMinutes`, `shuttleMinSavingsMeters` 1000, `rebuffCheckSeconds`/`rebuffVisitResetSeconds`, `groupBuffTimeoutSeconds` 600, line delays, `vocabulary.follow`/`ready`/`rally` (buff, meet, landmarks), `places` (cities, outposts, custom x/y), rally `lines` |
 
 The sim layer alone restores roster PlayerBot weapon-template stats after shared AI weapon-stat
@@ -927,6 +928,23 @@ Layered on the stock `AiAgent`/`CreatureObject` hierarchy. Living design docs:
     never over a G2 trip, and never switches away from a standing lair; a destroyed lair completes its entry
     manager-side (idempotent) and resumes the run; only the holder carries the solo lair fields.
   - **Live receipt:** scoped harness plus 11 log-diagnosed client-pass fixes (`docs/4-unit-tests/live_f0918-*`).
+- **Healing (P.10p G5 / F_0.9.19, released v0.9.20)**: damage stims in both directions, gate
+  `healingEnabled`.
+  - **Stock seams.** `HealDamageCommand` keeps a roster-bot target instead of redirecting it to the
+    healer. `isHealableBy` takes a sim-bot body (PLAYER pvp bit, no ghost) as a ghostless player for the
+    stock faction table and accepts a sim-bot healer. The ghost-only checks stay player-only.
+  - **Pure policy.** `SimBotHealing.h` parses heal chat and chooses the patient, stim and healer, runs
+    the approach and apply state machine, works out restock needs, and holds the stock faction table.
+    `chooseHealPatient` explains a miss only for a member who needs a heal (`reasonIndex`). A named
+    order considers only its patient.
+  - **Manager.** `SimPlayerManager` owns the per-group patient claims, the stim apply (vault dose
+    debit, ledger on the last dose), medical XP, a readiness snapshot, and stim restock through the F_0.9.10
+    BUY path. `medical` leaves the effective `deferredXpTypes` while the bot-heal gate is on.
+  - **Controller.** `runGroupHealTick` runs before G4 spin for an ordered or in-progress heal, and after it
+    for a new automatic patient. **A tick step that returns `true` owns the whole group tick** (follow, assist,
+    defend). An automatic miss must return `false`; holding the tick froze a medic for 3 minutes.
+  - **Live receipt:** 6/6 scoped heal scenarios plus the owner's 4-step client pass
+    (`docs/4-unit-tests/live_f0919-*`).
 - **Simulation-only policy, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line

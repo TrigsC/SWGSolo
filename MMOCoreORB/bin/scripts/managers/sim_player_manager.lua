@@ -3634,6 +3634,16 @@ SimPlayerManagerConfig = {
             {name="group_mission_gate_off", budgetMs=1800000, steps={{op="resetGroupingCounterBaseline", name="groupMission.waypointRefreshes"}, {op="setGroupingGate", gateEnabled=true}, {op="setMissionsGate", identityRef="production", gateEnabled=false}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb bot"}, {op="assertOffer", identityRef="production", within=30}, {op="groupInvite", identityRef="production"}, {op="assertGrouped", identityRef="production", within=30}, {op="groupMissionSay", text="grab 1 kreetle missions to the s"}, {op="assertGroupMissionEntry", expect="absent", within=60}, {op="removeGroupLeaderStandIn"}}},
             {name="group_mission_assist_leader_target", budgetMs=3600000, steps={{op="resetGroupingCounterBaseline", name="groupMission.leaderAssists"}, {op="setGroupingGate", gateEnabled=true}, {op="setMissionsGate", identityRef="production", gateEnabled=true}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb bot"}, {op="assertOffer", identityRef="production", within=30}, {op="groupInvite", identityRef="production"}, {op="assertGrouped", identityRef="production", within=30}, {op="awaitBotOutOfCombat", identityRef="production", within=300}, {op="spawnHarnessAttacker", template="kreetle", faction="neutral", target="standIn"}, {op="assertBotDamaged", identityRef="production", target="standIn", within=60}, {op="assertGroupingCounter", name="groupMission.leaderAssists", minDelta=1, within=60}, {op="removeHarnessAttacker"}, {op="removeGroupLeaderStandIn"}}},
             {name="group_assist_leader_no_faction", budgetMs=3600000, steps={{op="resetGroupingCounterBaseline", name="groupMission.leaderAssistsSkipped"}, {op="setGroupingGate", gateEnabled=true}, {op="setMissionsGate", identityRef="production", gateEnabled=true}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb bot"}, {op="assertOffer", identityRef="production", within=30}, {op="groupInvite", identityRef="production"}, {op="assertGrouped", identityRef="production", within=30}, {op="awaitBotOutOfCombat", identityRef="production", within=300}, {op="spawnHarnessAttacker", template="stormtrooper", faction="imperial", target="standIn"}, {op="assertNoBotDamage", identityRef="production", target="standIn", within=30}, {op="assertGroupingCounter", name="groupMission.leaderAssistsSkipped", minDelta=1, within=60}, {op="removeHarnessAttacker"}, {op="removeGroupLeaderStandIn"}}},
+            -- F_0.9.19 G5 healing. These remain inert with the parity harness
+            -- disabled; production vaults are never seeded by a scenario.
+            {name="group_heal_command_dispatch", budgetMs=1500000, steps={{op="resetGroupingCounterBaseline", name="healing.orders|healing.ordersDone|healing.ordersNoMedic|healing.refusedNoStim"}, {op="setGroupingGate", gateEnabled=true}, {op="setHealingGate", identityRef="production", gateEnabled=true}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb bot"}, {op="assertOffer", identityRef="production", within=30}, {op="groupInvite", identityRef="production"}, {op="assertGrouped", identityRef="production", within=30}, {op="groupSay", identityRef="production", text="heal me"}, {op="assertGroupingCounter", name="healing.orders|healing.ordersNoMedic", minDelta=1, maxDelta=1, within=60}, {op="assertGroupingCounter", name="healing.ordersDone|healing.ordersNoMedic|healing.refusedNoStim", minDelta=1, maxDelta=1, within=120}, {op="removeGroupLeaderStandIn"}}},
+            {name="group_heal_named", budgetMs=1500000, steps={{op="resetGroupingCounterBaseline", name="healing.orders|healing.ordersNoMedic"}, {op="setGroupingGate", gateEnabled=true}, {op="setHealingGate", identityRef="production", gateEnabled=true}, {op="setHealingGate", identityRef="production2", gateEnabled=true}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="setGroupAvailabilityOverride", identityRef="production2", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb two bots"}, {op="assertOffer", identityRef="production", within=30}, {op="assertOffer", identityRef="production2", within=30}, {op="groupInvite", identityRef="production"}, {op="groupInvite", identityRef="production2"}, {op="assertGrouped", identityRef="production", within=30}, {op="assertGrouped", identityRef="production2", within=30}, {op="groupSay", identityRef="production", text="{production}, heal {production2}"}, {op="assertGroupingCounter", name="healing.orders|healing.ordersNoMedic", minDelta=1, maxDelta=1, within=60}, {op="removeGroupLeaderStandIn"}}},
+            {name="group_heal_no_medic", budgetMs=1500000, steps={{op="resetGroupingCounterBaseline", name="healing.orders|healing.ordersNoMedic"}, {op="setGroupingGate", gateEnabled=true}, {op="setHealingGate", identityRef="production", gateEnabled=true}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb bot"}, {op="assertOffer", identityRef="production", within=30}, {op="groupInvite", identityRef="production"}, {op="assertGrouped", identityRef="production", within=30}, {op="groupSay", identityRef="production", text="heal me"}, {op="assertGroupingCounter", name="healing.ordersNoMedic", minDelta=1, maxDelta=1, within=60}, {op="assertGroupingCounter", name="healing.orders", minDelta=0, maxDelta=0}, {op="removeGroupLeaderStandIn"}}},
+            {name="heal_faction_table", budgetMs=900000, steps={{op="setHealingHarnessOptIn", identityIndex=0, healingHarnessOptIn=true}, {op="setHealingHarnessOptIn", identityIndex=1, healingHarnessOptIn=false}, {op="setBotFaction", identityIndex=0, faction="neutral", factionStatus="onleave"}, {op="setBotFaction", identityIndex=1, faction="neutral", factionStatus="onleave"}, {op="spawnGroupLeaderStandIn", identityIndex=1, planet="tatooine", x=3467, y=-4890}, {op="assertHealable", identityIndex=0, patient="leader", expect="false"}, {op="setHealingHarnessOptIn", identityIndex=1, healingHarnessOptIn=true}, {op="assertHealable", identityIndex=0, patient="leader", expect="true"}, {op="setBotFaction", identityIndex=1, faction="rebel", factionStatus="overt"}, {op="assertHealable", identityIndex=0, patient="leader", expect="false"}, {op="setBotFaction", identityIndex=0, faction="rebel", factionStatus="overt"}, {op="assertHealable", identityIndex=0, patient="leader", expect="true"}, {op="setBotFaction", identityIndex=0, faction="neutral", factionStatus="onleave"}, {op="setBotFaction", identityIndex=1, faction="neutral", factionStatus="onleave"}, {op="removeGroupLeaderStandIn"}}},
+            {name="heal_patient_authority", budgetMs=900000, steps={{op="setHealingHarnessOptIn", identityIndex=0, healingHarnessOptIn=true}, {op="setHealingHarnessOptIn", identityIndex=1, healingHarnessOptIn=false}, {op="spawnGroupLeaderStandIn", identityIndex=1, planet="tatooine", x=3467, y=-4890}, {op="assertHealable", identityIndex=0, patient="leader", expect="false"}, {op="setHealingHarnessOptIn", identityIndex=1, healingHarnessOptIn=true}, {op="assertHealable", identityIndex=0, patient="leader", expect="true"}, {op="removeGroupLeaderStandIn"}}},
+            {name="group_heal_gate_off", budgetMs=1500000, steps={{op="resetGroupingCounterBaseline", name="healing.rejectedGate|healing.orders"}, {op="setGroupingGate", gateEnabled=true}, {op="setHealingGate", identityRef="production", gateEnabled=false}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb bot"}, {op="assertOffer", identityRef="production", within=30}, {op="groupInvite", identityRef="production"}, {op="assertGrouped", identityRef="production", within=30}, {op="groupSay", identityRef="production", text="heal me"}, {op="assertGroupingCounter", name="healing.rejectedGate", minDelta=1, maxDelta=1, within=60}, {op="assertGroupingCounter", name="healing.orders", minDelta=0, maxDelta=0}, {op="removeGroupLeaderStandIn"}}},
+            -- G5 regressions are the existing group_follow, group_tactics_pull
+            -- and group_tactics_eat scenarios below; do not duplicate them.
             -- F_0.9.18 G4 group tactics. These remain inert with the parity
             -- harness disabled and arm only the per-scenario tactic overrides.
             {name="group_tactics_eat", budgetMs=1800000, steps={{op="resetGroupingCounterBaseline", name="grouping.tactics.eatOrders|grouping.tactics.eatAte|grouping.tactics.eatAlreadyFed|grouping.tactics.eatNoFood"}, {op="setGroupingGate", gateEnabled=true}, {op="setTacticsGate", identityRef="production", gateEnabled=true}, {op="setConsumablesGate", identityRef="production", gateEnabled=true}, {op="setGroupAvailabilityOverride", identityRef="production", free=true, chance=100}, {op="spawnGroupLeaderStandIn", planet="tatooine", x=3467, y=-4890}, {op="lfbSay", text="lfb bot"}, {op="assertOffer", identityRef="production", within=30}, {op="groupInvite", identityRef="production"}, {op="assertGrouped", identityRef="production", within=30}, {op="awaitBotOutOfCombat", identityRef="production", within=300}, {op="groupSay", text="take foods"}, {op="assertTacticCounter", name="grouping.tactics.eatOrders", minDelta=1, within=30}, {op="assertTacticCounter", name="grouping.tactics.eatAte|grouping.tactics.eatAlreadyFed|grouping.tactics.eatNoFood", minDelta=1, within=60}, {op="awaitBotOutOfCombat", identityRef="production", within=120}, {op="groupSay", text="take foods"}, {op="assertTacticCounter", name="grouping.tactics.eatAte|grouping.tactics.eatAlreadyFed|grouping.tactics.eatNoFood", minDelta=2, within=60}, {op="removeGroupLeaderStandIn"}}}, -- a production bot's vault is never seeded (harness rule); real eating is the owner's in-client check
@@ -3696,6 +3706,35 @@ SimPlayerManagerConfig = {
                 {template = "object/tangible/food/crafted/drink_vasarian_brandy.iff", maxPricePerDose = 1000},
                 {template = "object/tangible/food/crafted/dessert_pikatta_pie.iff", maxPricePerDose = 600},
                 {template = "object/tangible/food/crafted/dish_crispic.iff", maxPricePerDose = 400},
+            },
+        },
+        -- F_0.9.19 (P.10p G5): damage-stim healing. The capability is
+        -- deliberately default-off; when enabled, the manager removes
+        -- `medical` from earlyGame.deferredXpTypes for the affected bot so
+        -- Medic boxes graduate only as their healing XP is earned.
+        healingEnabled = false,
+        healing = {
+            playerHealsBots = true,
+            botHeals = true,
+            selfHeal = true,
+            groupHealThreshold = 0.70,
+            selfHealThreshold = 0.60,
+            selfCriticalFraction = 0.35,
+            maxApproachMeters = 32,
+            applyRangeMeters = 6,
+            approachTimeoutSeconds = 20,
+            applyTimeoutSeconds = 8,
+            bazaarRestock = true,
+            minDoses = 20,
+            restockSpendFraction = 0.25,
+            restockScanIntervalMinutes = 30,
+            maxRestockLoadsPerVisit = 12,
+            items = {
+                {template = "object/tangible/medicine/crafted/crafted_stimpack_sm_s1_a.iff", maxPricePerDose = 300},
+                {template = "object/tangible/medicine/crafted/crafted_stimpack_sm_s1_b.iff", maxPricePerDose = 500},
+                {template = "object/tangible/medicine/crafted/crafted_stimpack_sm_s1_c.iff", maxPricePerDose = 800},
+                {template = "object/tangible/medicine/crafted/crafted_stimpack_sm_s1_d.iff", maxPricePerDose = 1200},
+                {template = "object/tangible/medicine/crafted/crafted_stimpack_sm_s1_e.iff", maxPricePerDose = 1800},
             },
         },
         -- F_0.9.15 (P.10p) G1: Looking For Bot. Players /join the LFB room; free
@@ -3782,6 +3821,9 @@ SimPlayerManagerConfig = {
                 follow = {"follow", "follow me", "on me"},
                 ready = {"ready", "everyone ready", "ready up"},
                 leave = {"leave", "disband bots", "bye"},
+                heal = {"heal", "stim", "patch"},
+                self = {"me", "myself"},
+                everyone = {"everyone", "us", "group", "all"},
                 mission = {
                     grab = {"grab", "get", "take", "pick up"},
                     missions = {"mission", "missions", "mish", "lair", "lairs"},
@@ -3879,6 +3921,14 @@ SimPlayerManagerConfig = {
                 noFood = {"No food on me."},
                 backOff = {"Backing off."},
                 pullingPack = {"Pulling a {creature} (pack)."},
+                healOnIt = {"On it."},
+                healNoStims = {"No stims on me."},
+                healNotHurt = {"%s isn't hurt."},
+                healCantReach = {"Can't reach %s."},
+                healRefused = {"Can't help %s."},
+                healCooldown = {"Give me a second."},
+                healNoMedic = {"None of us can heal."},
+                healLowStims = {"Down to %d stims."},
             },
         },
         bazaarSaleBacklogMax = 256,
@@ -4075,7 +4125,8 @@ SimPlayerManagerConfig = {
             -- these neither blocks graduation nor keeps the template
             -- "incomplete" (F_0.9.8b). Owner 2026-10-09: medical and crafting,
             -- e.g. Medic 444x's science_medic_crafting_04 is paid in
-            -- crafting_medicine_general.
+            -- crafting_medicine_general. G5 removes medical from the effective
+            -- list only while healingEnabled is on for that bot.
             deferredXpTypes = {"medical", "crafting_medicine_general", "crafting_general"},
             -- F_0.9.8 mission graduation (owner decision 2026-09-22). A planned
             -- bot may take missions once it has trained box missionMinLineDepth

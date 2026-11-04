@@ -35,6 +35,7 @@
 #include "server/zone/objects/creature/simplayer/SimBotLoadout.h"
 #include "server/zone/objects/creature/simplayer/SimBotArmorLoadout.h"
 #include "server/zone/objects/creature/simplayer/SimBotConsumables.h"
+#include "server/zone/objects/creature/simplayer/SimBotHealing.h"
 #include "server/zone/objects/creature/simplayer/SimBotGrouping.h"
 #include "server/zone/objects/creature/simplayer/SimBotGroupTactics.h"
 #include "server/zone/objects/creature/simplayer/SimBotGroupRally.h"
@@ -255,6 +256,7 @@ struct PlayerBotGroupingConfig {
 	int ackLineDelayMinSeconds = 1;
 	int ackLineDelayMaxSeconds = 4;
 	SimBotGrouping::Vocabulary vocabulary;
+	SimBotHealing::HealVocabulary healingVocabulary;
 	SimBotGroupRally::RallyVocabulary rallyVocabulary;
 	std::vector<SimBotGroupRally::PlaceRule> rallyPlaces;
 	Vector<String> replyLines;
@@ -273,6 +275,14 @@ struct PlayerBotGroupingConfig {
 	Vector<String> unknownPlaceLines;
 	Vector<String> buffsLowLines;
 	Vector<String> followAckLines;
+	Vector<String> healOnItLines;
+	Vector<String> healNoStimsLines;
+	Vector<String> healNotHurtLines;
+	Vector<String> healCantReachLines;
+	Vector<String> healRefusedLines;
+	Vector<String> healCooldownLines;
+	Vector<String> healNoMedicLines;
+	Vector<String> healLowStimsLines;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -322,7 +332,60 @@ struct PlayerBotGroupRecord {
 	SimBotGroupTactics::PullStage pullStage = SimBotGroupTactics::APPROACH;
 	uint64 tacticOrderGeneration = 0;
 	uint64 pullTargetOid = 0;
+	uint64 healOrderGeneration = 0;
+	uint64 healPatientOid = 0;
+	uint64 healPatientIdentityId = 0;
+	String healOrderReason;
+	// Controller-published heal sub-mode stage: idle, approach or apply.
+	String healStage = "idle";
 
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotHealReadiness {
+	bool hasUsableStim = false;
+	int doses = 0;
+	bool cooldownReady = false;
+	bool isMedic = false;
+	uint64 updatedAtMs = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotHealClaim {
+	uint64 groupId = 0;
+	uint64 patientOid = 0;
+	uint64 healerIdentityId = 0;
+	uint64 generation = 0;
+	uint64 expiresAtMs = 0;
+	bool automatic = true;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotHealObservation {
+	uint64 patientOid = 0;
+	uint64 atMs = 0;
+	int healthHealed = 0;
+	int actionHealed = 0;
+	String reason;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotHealResult {
+	String reason = "unknown";
+	int healthHealed = 0;
+	int actionHealed = 0;
+	int dosesLeft = 0;
+	int xpAwarded = 0;
+	uint64 stimOid = 0;
+
+	bool succeeded() const { return healthHealed > 0 || actionHealed > 0; }
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
@@ -1484,6 +1547,11 @@ struct PlayerBotParityTestStep {
 	bool hasCombatAbilitySpecialAttackChancePercent = false;
 	bool combatAbilityHarnessOptIn = false;
 	bool hasCombatAbilityHarnessOptIn = false;
+	bool healingHarnessOptIn = false;
+	bool hasHealingHarnessOptIn = false;
+	String healingFactionStatus;
+	String healingHealerRef;
+	String healingPatientRef;
 	// Optional assertActivity detail: also require this deferred box to be
 	// present in the manager state published to the dashboard.
 	String stalledBox;
@@ -3216,9 +3284,11 @@ private:
 	VectorMap<uint64, uint64> progressionArmorUpgradeScanAtMs;
 	SimBotArmorPolicy progressionArmorPolicy;
 	SimBotConsumablePolicy progressionConsumablePolicy;
+	SimBotHealing::PlayerBotHealingPolicy progressionHealingPolicy;
 	VectorMap<uint64, SimBotStomach> progressionStomach;
 	VectorMap<uint64, uint64> progressionConsumableNextCheckAtMs;
 	VectorMap<uint64, uint64> progressionConsumableRestockScanAtMs;
+	VectorMap<uint64, uint64> progressionStimRestockScanAtMs;
 	VectorMap<uint32, uint64> progressionConsumablesConsumedByTemplate;
 	VectorMap<uint64, uint32> progressionConsumablesLastConsumedByIdentity;
 	VectorMap<uint64, uint64> progressionConsumablesLastConsumedAtMs;
@@ -3230,6 +3300,29 @@ private:
 	AtomicLong progressionConsumablesRejectedEntries;
 	AtomicLong progressionConsumablesRestockPurchases;
 	AtomicLong progressionConsumablesRestockSkips;
+	AtomicLong playerBotHealingPlayerHealsOfBots;
+	AtomicLong playerBotHealingPlayerHealRefusedFaction;
+	AtomicLong playerBotHealingBotHealsOthers;
+	AtomicLong playerBotHealingBotHealsSelf;
+	AtomicLong playerBotHealingHealthHealed;
+	AtomicLong playerBotHealingActionHealed;
+	AtomicLong playerBotHealingMedicalXpAwarded;
+	AtomicLong playerBotHealingStimsConsumed;
+	AtomicLong playerBotHealingRefusedNoStim;
+	AtomicLong playerBotHealingRefusedCooldown;
+	AtomicLong playerBotHealingRefusedMind;
+	AtomicLong playerBotHealingRefusedRange;
+	AtomicLong playerBotHealingRefusedLos;
+	AtomicLong playerBotHealingRefusedFaction;
+	AtomicLong playerBotHealingRefusedNoDamage;
+	AtomicLong playerBotHealingRefusedArena;
+	AtomicLong playerBotHealingOrders;
+	AtomicLong playerBotHealingOrdersNoMedic;
+	AtomicLong playerBotHealingOrdersDone;
+	AtomicLong playerBotHealingOrdersAborted;
+	AtomicLong playerBotHealingRestockPurchases;
+	AtomicLong playerBotHealingRejectedGate;
+	AtomicLong playerBotHealingClaimsExpired;
 	bool progressionEnabled = false;
 	bool progressionAwardKillXp = false;
 	bool progressionAwardMissionCredits = false;
@@ -3252,8 +3345,12 @@ private:
 	// F_0.9.15 G1: capability gate and validated Lua mirror.  The gate remains
 	// default-off; later phases consume the snapshot for room/group work.
 	bool progressionGroupingEnabled = false;
+	bool progressionHealingEnabled = false;
 	PlayerBotGroupingConfig playerBotGroupingConfig;
 	std::atomic<bool> playerBotGroupingActive{false};
+	// F_0.9.19 G5: lock-free stock-command entry gate. Published by the Lua
+	// refresh as progression master && healingEnabled && playerHealsBots.
+	std::atomic<bool> playerHealsBotsActive{false};
 	// Lock-free mirrors used by stock group reward code while it owns the
 	// GroupObject lock. Identity-scoped harness overrides are rechecked by the
 	// deferred payment path, never from that stock lock.
@@ -3277,6 +3374,10 @@ private:
 	VectorMap<uint64, uint64> playerBotGroupingTacticsDiagAtMs;
 	VectorMap<uint64, PlayerBotGroupDirective> playerBotGroupDirectives;
 	VectorMap<uint64, PlayerBotGroupRoute> playerBotGroupRoutes;
+	uint64 nextPlayerBotHealingClaimGeneration = 1;
+	VectorMap<String, PlayerBotHealClaim> playerBotHealingClaims;
+	VectorMap<uint64, PlayerBotHealReadiness> playerBotHealingReadiness;
+	VectorMap<uint64, PlayerBotHealObservation> playerBotHealingLast;
 	VectorMap<uint64, PlayerBotGroupMissionPlan> playerBotGroupMissionPlans;
 	uint64 nextPlayerBotGroupMissionPlanId = 1;
 	VectorMap<uint64, PlayerBotGroupingRateState> playerBotGroupingRate;
@@ -3700,6 +3801,11 @@ private:
 	bool playerBotParityTestConsumableRestockGateOverride = false;
 	VectorMap<uint64, bool> playerBotParityConsumableRestockGateScopedIds;
 	VectorMap<uint64, bool> playerBotParityConsumableRestockGateValues;
+	bool playerBotParityTestHealingGateOverrideActive = false;
+	bool playerBotParityTestHealingGateOverride = false;
+	VectorMap<uint64, bool> playerBotParityHealingGateScopedIds;
+	VectorMap<uint64, bool> playerBotParityHealingGateValues;
+	VectorMap<uint64, bool> playerBotParityHealingHarnessOptIns;
 	// Harness-only body template per identity (setBodyTemplate): pins a
 	// species so armor scenarios do not depend on the seeded body pick.
 	VectorMap<uint64, String> playerBotParityBodyTemplateOverrides;
@@ -4218,8 +4324,13 @@ private:
 		Vector<String>& planXpTypes);
 	SimBotArmorPolicy snapshotPlayerBotArmorPolicy();
 	SimBotConsumablePolicy snapshotPlayerBotConsumablePolicy();
+	SimBotHealing::PlayerBotHealingPolicy snapshotPlayerBotHealingPolicy();
 	bool snapshotPlayerBotConsumableStacks(uint64 identityId,
 		std::vector<SimBotConsumables::HeldStack>& stacks);
+	bool snapshotPlayerBotStimStacks(uint64 identityId,
+		std::vector<SimBotHealing::StimStack>& stacks);
+	Vector<String> effectiveDeferredXpTypes(uint64 identityId);
+	bool playerBotIsMedic(uint64 identityId);
 	bool removePlayerBotConsumedItem(uint64 identityId, uint64 objectId);
 	void collectPlayerBotProtectedConsumableOids(uint64 identityId,
 		VectorMap<uint64, bool>& protectedIds);
@@ -4373,6 +4484,11 @@ private:
 		int amount, const String& source);
 	bool playerBotProgressionAwardGateEnabled();
 	bool playerBotGroupingGateEnabled();
+	bool playerBotHealingGateEnabled(uint64 identityId);
+	bool playerBotBotHealsGateEnabled(uint64 identityId);
+	bool playerBotHealRestockGateEnabled(uint64 identityId);
+	String playerBotHealClaimKey(uint64 groupId, uint64 patientOid) const;
+	void dropPlayerBotHealClaims(uint64 groupId, uint64 identityId = 0);
 	void ensurePlayerBotLfbRoom();
 	void postPlayerBotLfbRoom(const String& sender, const String& text);
 	void runPlayerBotLfbRequestTask(uint64 senderOid, const String& senderName,
@@ -5935,6 +6051,41 @@ public:
 	bool isPlayerBotGroupingActive() const {
 		return playerBotGroupingActive.load(std::memory_order_acquire);
 	}
+	bool isPlayerHealsBotsActive() const {
+		return playerHealsBotsActive.load(std::memory_order_acquire);
+	}
+	// Controller-facing value snapshots. These wrappers keep the policy and
+	// vault traversal private to the manager while allowing the controller to
+	// make its slow-tick/readiness and per-tick healing decisions without
+	// holding a manager mutex across creature locks.
+	SimBotHealing::PlayerBotHealingPolicy getPlayerBotHealingPolicy();
+	bool isPlayerBotBotHealsActive(uint64 identityId);
+	bool isPlayerBotMedic(uint64 identityId);
+	// Live body healing_ability; pveMutex then the body lock, call unlocked.
+	int playerBotHealingAbility(uint64 identityId);
+	bool snapshotPlayerBotHealingStimStacks(uint64 identityId,
+		std::vector<SimBotHealing::StimStack>& stacks);
+	// Authority lookup for the stock heal seam. It resolves the live body to
+	// the roster map under pveMutex; the simPlayerBot flag alone is never enough.
+	bool isPlayerBotHealPatient(uint64 bodyOid);
+	void recordPlayerBotHealOfBot(uint64 patientOid, int healthHealed,
+		int actionHealed);
+	void recordPlayerBotHealRefused(uint64 patientOid, const String& reason);
+	PlayerBotHealResult applyPlayerBotStimHeal(uint64 identityId,
+		AiAgent* healer, CreatureObject* patient, uint64 stimOid = 0);
+	bool tryClaimPlayerBotHealPatient(uint64 groupId, uint64 patientOid,
+		uint64 identityId, uint64* generationOut = nullptr,
+		bool automatic = true);
+	bool releasePlayerBotHealClaim(uint64 groupId, uint64 patientOid,
+		uint64 identityId, uint64 generation);
+	void publishPlayerBotHealReadiness(uint64 identityId,
+		const PlayerBotHealReadiness& readiness);
+	bool snapshotPlayerBotHealReadiness(uint64 identityId,
+		PlayerBotHealReadiness& readiness);
+	bool completePlayerBotGroupHealOrder(uint64 identityId,
+		uint64 orderGeneration, const String& reason, bool succeeded);
+	bool dispatchPlayerBotGroupHeal(uint64 groupId,
+		const SimBotHealing::HealRequest& request, uint64 speakerOid);
 	bool isPlayerBotLfbRoom(uint32 roomID) const;
 	void onLfbRoomMessage(uint64 senderOid, const String& senderName,
 		const String& planet, const Vector3& position, const String& text);
@@ -5945,6 +6096,7 @@ public:
 		PlayerBotGroupRecord& record) const;
 	bool completePlayerBotGroupTacticOrder(uint64 identityId,
 		uint64 orderGeneration);
+	void updatePlayerBotGroupHealStage(uint64 identityId, const String& stage);
 	bool updatePlayerBotGroupTacticPullStage(uint64 identityId,
 		uint64 orderGeneration, SimBotGroupTactics::PullStage stage,
 		uint64 pullTargetOid = 0);

@@ -14,9 +14,10 @@ armor loadout with visible armor, ten species and a fixed look per bot), RELEASE
 **F_0.9.15** (P.10p, grouping G1, Looking For Bot), RELEASED as v0.9.16 (2026-10-20).
 **F_0.9.17** (P.10p, grouping G3, group missions) is RELEASED as v0.9.18 (2026-10-22), on scoped accumulated evidence plus the owner's in-client approval.
 **F_0.9.18** (P.10p, grouping G4, group tactics) is RELEASED as v0.9.19 (2026-10-27), on the scoped harness plus the owner's in-client approval after 11 log-diagnosed fixes.
-Next chunk: grouping **G5** (healing), before **F_0.9.11** (P.10l, profession allocation policy).
+**F_0.9.19** (P.10p, grouping G5, healing) is IMPLEMENTED behind default-off gates and awaits the scoped harness and owner's in-client receipt before shipping as v0.9.20.
+Next chunk after the G5 receipt: **F_0.9.11** (P.10l, profession allocation policy).
 **Written**: 2026-09-02 (project week 8)
-**Last updated**: 2026-10-27 — F_0.9.18 grouping G4 (group tactics) released as v0.9.19; G5 (healing) next
+**Last updated**: 2026-10-27 — F_0.9.19 grouping G5 (healing) implemented; receipt pending
 
 ## F_0.9.15 — LFB and player grouping (P.10p)
 
@@ -32,7 +33,7 @@ into four owner-approved chunks:
 | **G2** | buffs and meet-at-place group trips, readiness and re-buff, intra-planet shuttles (moved from G1) | next grouping chunk |
 | **G3** | group missions, waypoints and reveal/assist callouts | RELEASED v0.9.18 (F_0.9.17) |
 | **G4** | group tactics, spin-attack poll, lair unlock and take-food commands | RELEASED v0.9.19 (F_0.9.18) |
-| **G5** | players heal bots; Medic bots heal players and bots with real supplies and medical XP | next |
+| **G5** | players heal bots; Medic bots heal players and bots with real supplies and medical XP | IMPLEMENTED F_0.9.19; receipt pending |
 
 G1 precedes F_0.9.11; the profession allocator remains the next non-grouping chunk after the
 grouping line.
@@ -86,21 +87,29 @@ spin toggling/lifecycle cleanup, and the gate-off rejection path. The shipped
 Lua value stays `tacticsEnabled = false`; the owner receipt remains the gate for
 the live pull and three-wave spin run.
 
-## G5 — Healing decisions recorded for the next chunk
+## F_0.9.19 — Healing (P.10p G5)
 
-G5 is intentionally not part of G4. Healing works in both directions: players
-heal roster bots with stock medic commands and earn medical XP, while bots with
-Medic boxes heal players and bots and earn their own medical XP, removing
-`medical` from the deferred XP types. Any roster bot is eligible, grouped or
-not, subject to stock non-attackability, faction, line-of-sight, range and
-alive checks; faction rules must refuse the same cases they refuse between
-players. Supplies are real stimpacks from the bot's vault bag, one dose per
-heal, restocked through the existing debit-first bazaar BUY path.
+G5 is implemented behind the default-off `playerBotProgression.healingEnabled`
+capability. It works in both directions: players heal roster bots through the
+stock single-target damage-stim command and earn stock medical XP, while Medic
+roster bots heal grouped players/bots and themselves from real stim stacks in
+their vault. Bot healing uses the stock legality, faction, line-of-sight,
+range, cooldown and stim-power rules; the manager owns patient authority,
+claims, orders, restock and counters, and the hunter controller owns the
+approach/apply sub-mode and movement lease.
 
-The G5 plan must address the stock blockers found during discovery: the single-
-target heal commands currently redirect non-pet AiAgent targets to the healer,
-area heals filter to players or pets, and `CreatureObjectImplementation::isHealableBy`
-requires a player healer's ghost and uses player-specific faction branches.
+The player-command seam is active only when the published
+`healingEnabled && healing.playerHealsBots` capability is open. A harness may
+opt a harness identity into the patient allowlist for faction assertions, but
+scenario bodies never seed a production bot's vault. The six disabled G5
+matrix scenarios cover dispatch, named dispatch, no Medic, faction verdicts,
+patient authority and gate-off rejection; `group_follow`,
+`group_tactics_pull` and `group_tactics_eat` remain the shared regressions.
+
+This chunk supports damage stims only: wounds and injury treatment, state
+cures, revive, and bot use of ranged or area stims are deferred to later work.
+Those later heal types must reuse the same roster authority and gate instead
+of widening the current single-target seam implicitly.
 
 ## 0. Mandate
 

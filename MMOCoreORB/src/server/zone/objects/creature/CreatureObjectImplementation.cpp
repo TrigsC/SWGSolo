@@ -3698,10 +3698,23 @@ bool CreatureObjectImplementation::isHealableBy(CreatureObject* healerCreo) {
 	if (isAttackableBy(healerCreo))
 		return false;
 
-	 // healerGhost is the healer
+	AiAgent* healerAgent = healerCreo->asAiAgent();
+	const bool simBotHealer = healerAgent != nullptr &&
+		healerAgent->getSimPlayerBot();
+
+	// Roster PlayerBot bodies have the player presentation bit but no ghost.
+	// Treat that exact shape as a ghostless player for the stock faction table;
+	// the authority check for a stock command is separate and never relies on
+	// this presentation flag alone.
+	AiAgent* targetAgent = asAiAgent();
+	const bool simBotPlayerTarget = targetAgent != nullptr &&
+		targetAgent->getSimPlayerBot() &&
+		(getPvpStatusBitmask() & ObjectFlag::PLAYER) != 0;
+
+	// healerGhost is the healer
 	PlayerObject* healerGhost = healerCreo->getPlayerObject();
 
-	if (healerGhost == nullptr)
+	if (healerGhost == nullptr && !simBotHealer)
 		return false;
 
 	/* BH TEF should prevent incoming helpful actions to the TEFed individual, not prevent them helping others
@@ -3718,16 +3731,19 @@ bool CreatureObjectImplementation::isHealableBy(CreatureObject* healerCreo) {
 		}
 	}
 
-	bool thisIsPlayer = isPlayerCreature();
+	bool thisIsPlayer = isPlayerCreature() || simBotPlayerTarget;
 	bool factionChecks = healFactionChecks(healerCreo, thisIsPlayer);
 
-	if (thisIsPlayer) {
+	// A sim-bot target is deliberately the ghostless-player branch. The
+	// player-only link-dead, group-PvP and BH-TEF checks require a real ghost and
+	// therefore stay limited to ordinary player creatures.
+	if (thisIsPlayer && !simBotPlayerTarget) {
 		PlayerObject* thisGhost = getPlayerObject();
 
 		if (thisGhost == nullptr)
 			return false;
 
-		if (thisGhost->isLinkDead() && healerGhost->getAccountID() == thisGhost->getAccountID() && !ConfigManager::instance()->getBool("Core3.CombatManager.AllowSameAccountLinkDeadBeneficialActions", true))
+		if (healerGhost != nullptr && thisGhost->isLinkDead() && healerGhost->getAccountID() == thisGhost->getAccountID() && !ConfigManager::instance()->getBool("Core3.CombatManager.AllowSameAccountLinkDeadBeneficialActions", true))
 			return false;
 
 		// In the same group

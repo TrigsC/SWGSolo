@@ -828,4 +828,38 @@ The grouping dashboard and inspect drawer expose tactic orders, pull stages,
 spin state and lifetime counters. `GROUP_PULL`, `GROUP_SPIN`, and `GROUP_EAT`
 diagnostics, plus six disabled parity scenarios, make the manager/controller
 boundary observable without changing the shipped `tacticsEnabled = false`
-profile. Healing in both directions is deliberately deferred to G5.
+profile. Healing in both directions was deliberately deferred to G5.
+
+### P.10p G5 — Healing (F_0.9.19)
+
+G5 adds damage-stim healing behind the default-off
+`playerBotProgression.healingEnabled` capability. The stock single-target
+`healdamage` path can now recognize an authority-resolved roster PlayerBot as
+the patient, while preserving the existing redirect for wild or unapproved
+AiAgents. Players receive the stock medical XP for healing a bot. A roster bot
+with Medic boxes uses real stim stacks from its vault to heal a grouped player
+or bot, or itself when solo; self-heals do not award XP. One dose is consumed
+per successful heal and restock uses the existing debit-first bazaar BUY path.
+
+The manager publishes the parsed healing policy signature, player-seam state,
+readiness, claims, orders, refusals, last-heal observations and medical-XP
+counters. Its patient authority is identity-keyed under `pveMutex`; harness
+identities are excluded unless the active scenario opts them in, and the
+cleanup pass clears that opt-in. The controller gathers HAM and faction/LOS
+verdicts one member lock at a time, claims a patient before walking, approaches
+a stop point inside stim range, and applies without holding the hunter lock.
+The heal movement lease is honored by both combat self-defence tick paths, and
+all order, claim and movement state is cleared on leave, death, release and
+gate-off.
+
+The dashboard exposes a Healing counters card, grouped-bot heal stage and last
+heal, and inspect fields for Medic status, usable stim doses, cooldown, order,
+last heal and medical XP. The disabled matrix has six G5 scenarios for command
+dispatch, named dispatch, no Medic, faction rules, patient authority and
+gate-off rejection. It never seeds a production bot vault; the existing
+`group_follow`, `group_tactics_pull` and `group_tactics_eat` scenarios remain
+the regression coverage for the shared group paths.
+
+Only single-target damage stims are in scope. Wound/injury treatment, state
+cures, revive, and bot use of ranged or area stims remain deferred; later work
+must extend the same authority and capability seam explicitly.

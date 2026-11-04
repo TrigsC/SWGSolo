@@ -235,6 +235,10 @@ private:
 	// the fallback walk back to the leader's slot.
 	std::atomic<bool> groupFallbackMoveActive{false};
 	std::atomic<bool> groupPullReturnActive{false};
+	// Raised while a grouped medic walks to a patient. The arrival-check and
+	// active-tick threads both read this lease; the healing tick owns the
+	// state transitions and clears it on every exit.
+	std::atomic<bool> groupHealMoveActive{false};
 	// Spin walk to the lair while already in combat (G4 spin mode).
 	std::atomic<bool> groupSpinApproachActive{false};
 	// "back off": walk away from the suppressed lair while still fighting.
@@ -255,6 +259,19 @@ private:
 	bool groupPullTagIssued = false;
 	bool groupPullTargetPack = false;
 	String groupPullTargetName;
+	SimBotHealing::HealState groupHealState;
+	uint64 groupHealOrderGeneration = 0;
+	uint64 groupHealPatientOid = 0;
+	uint64 groupHealClaimGroupId = 0;
+	uint64 groupHealClaimGeneration = 0;
+	uint64 groupHealLastPathIssuedMs = 0;
+	Vector3 groupHealLastPathTarget;
+	uint64 groupHealLastRefusalMs = 0;
+	// "Down to N stims" is said once per restock cycle; readiness re-arms it.
+	bool groupHealLowStimsSaid = false;
+	uint64 groupHealRefusalPatientOid = 0;
+	String groupHealRefusalReason;
+	uint64 lastHealReadinessAtMs = 0;
 	uint64 groupSpinLairOid = 0;
 	uint64 groupBackOffLairOid = 0;
 	uint64 groupSpinSeenBackOffMs = 0;
@@ -391,6 +408,14 @@ private:
 		const PlayerBotGroupRecord& record,
 		const SimPlayerManager::PlayerBotGroupSnapshot& group,
 		const ManagedReference<CreatureObject*>& selfAttacker);
+	bool runGroupHealTick(AiAgent* hunter, uint64 nowMs,
+		const PlayerBotGroupRecord& record,
+		const SimPlayerManager::PlayerBotGroupSnapshot& group,
+		const PlayerBotGroupingConfig& groupingConfig);
+	void clearGroupHealState(const String& reason, bool completeOrder = true);
+	void publishPlayerBotHealReadiness(AiAgent* hunter, uint64 nowMs);
+	bool trySoloPlayerBotSelfHeal(AiAgent* hunter, uint64 nowMs,
+		const SimBotHealing::PlayerBotHealingPolicy& policy);
 	void dropGroupPullChase(AiAgent* hunter, uint64 targetOid);
 	void beginGroupPullReturn(AiAgent* hunter, uint64 leaderOid, uint64 nowMs);
 	bool runGroupSpin(AiAgent* hunter, uint64 nowMs,
