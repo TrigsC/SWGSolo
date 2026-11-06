@@ -14,10 +14,12 @@ armor loadout with visible armor, ten species and a fixed look per bot), RELEASE
 **F_0.9.15** (P.10p, grouping G1, Looking For Bot), RELEASED as v0.9.16 (2026-10-20).
 **F_0.9.17** (P.10p, grouping G3, group missions) is RELEASED as v0.9.18 (2026-10-22), on scoped accumulated evidence plus the owner's in-client approval.
 **F_0.9.18** (P.10p, grouping G4, group tactics) is RELEASED as v0.9.19 (2026-10-27), on the scoped harness plus the owner's in-client approval after 11 log-diagnosed fixes.
-**F_0.9.19** (P.10p, grouping G5, healing) is IMPLEMENTED behind default-off gates and awaits the scoped harness and owner's in-client receipt before shipping as v0.9.20.
-Next chunk after the G5 receipt: **F_0.9.11** (P.10l, profession allocation policy).
+**F_0.9.19** (P.10p, grouping G5, healing) is RELEASED as v0.9.20 (2026-11-04), on the 6 scoped heal scenarios plus the owner's 4-step client pass.
+**F_0.9.11** (P.10l, profession allocation) is **ON HOLD** (owner, 2026-11-06): bots can only earn combat and
+medical XP, so an allocator would assign professions nobody can level. Next is the **non-combat XP line (§5d)**,
+starting with **F_0.9.20 scout harvesting**.
 **Written**: 2026-09-02 (project week 8)
-**Last updated**: 2026-10-27 — F_0.9.19 grouping G5 (healing) implemented; receipt pending
+**Last updated**: 2026-11-06 — G5 released; allocator on hold; §5d non-combat XP line sequenced by the owner
 
 ## F_0.9.15 — LFB and player grouping (P.10p)
 
@@ -33,10 +35,10 @@ into four owner-approved chunks:
 | **G2** | buffs and meet-at-place group trips, readiness and re-buff, intra-planet shuttles (moved from G1) | next grouping chunk |
 | **G3** | group missions, waypoints and reveal/assist callouts | RELEASED v0.9.18 (F_0.9.17) |
 | **G4** | group tactics, spin-attack poll, lair unlock and take-food commands | RELEASED v0.9.19 (F_0.9.18) |
-| **G5** | players heal bots; Medic bots heal players and bots with real supplies and medical XP | IMPLEMENTED F_0.9.19; receipt pending |
+| **G5** | players heal bots; Medic bots heal players and bots with real supplies and medical XP | RELEASED v0.9.20 (F_0.9.19) |
 
-G1 precedes F_0.9.11; the profession allocator remains the next non-grouping chunk after the
-grouping line.
+The grouping line is complete through G5. The profession allocator (F_0.9.11) is on hold behind the
+non-combat XP line (§5d).
 
 ## F_0.9.16 — Rally and buffs (P.10p G2)
 
@@ -89,7 +91,7 @@ the live pull and three-wave spin run.
 
 ## F_0.9.19 — Healing (P.10p G5)
 
-G5 is implemented behind the default-off `playerBotProgression.healingEnabled`
+G5 is RELEASED as v0.9.20 (2026-11-04) behind the default-off `playerBotProgression.healingEnabled`
 capability. It works in both directions: players heal roster bots through the
 stock single-target damage-stim command and earn stock medical XP, while Medic
 roster bots heal grouped players/bots and themselves from real stim stacks in
@@ -219,12 +221,12 @@ in that chunk's plan. Chunk 1 does not depend on either.
 
 | Store | Today | P.10 disposition | Chunk |
 | --- | --- | --- | --- |
-| **P.5 hive stockpile** (`AiEconomyManager`, `AiEconomyStockpileLot`, resource lots + finished goods) | Persisted ledger of *simulated* resource units; miners deposit, conceptual crafters consume | **Stays a shadow mirror** for resources through P.10 (it is not backed by `ResourceContainer` objects; making it real is the crafting economy phase). **Gains a real sibling**: the **hive item vault** — a persistent container object holding real loot/bazaar `TangibleObject`s, OID stored on `AiEconomyData`, ledgered per identity in `simbot_items` with an explicit **operation state** (`pending → held → listed → consumed`) so BDB containment and the MySQL ledger have one authority: an object is owned by an identity only when a `held` row says so; boot reconciliation checks **every** row state against vault containment (and `AuctionsMap` for `listed`) — a `held`/`listed` row whose object is missing or contained elsewhere is moved to a system-owned quarantine state `orphaned` (`identity_id NULL`, counted, never blocks reaping), and an unattributed vault object gets an `orphaned` row of its own. Bot-held items live there, never on a body. | vault + journal: **F_0.9.3**; listing states **F_0.9.9**; hive lots unchanged |
+| **P.5 hive stockpile** (`AiEconomyManager`, `AiEconomyStockpileLot`, resource lots + finished goods) | Persisted ledger of *simulated* resource units; miners deposit, conceptual crafters consume | **Stays a shadow mirror** for resources through P.10 (it is not backed by `ResourceContainer` objects; making it real is the crafting economy phase). **Gains a real sibling**: the **hive item vault** — a persistent container object holding real loot/bazaar `TangibleObject`s, OID stored on `AiEconomyData`, ledgered per identity in `simbot_items` with an explicit **operation state** (`pending → held → listed → consumed`) so BDB containment and the MySQL ledger have one authority: an object is owned by an identity only when a `held` row says so; boot reconciliation checks **every** row state against vault containment (and `AuctionsMap` for `listed`) — a `held`/`listed` row whose object is missing or contained elsewhere is moved to a system-owned quarantine state `orphaned` (`identity_id NULL`, counted, never blocks reaping), and an unattributed vault object gets an `orphaned` row of its own. Bot-held items live there, never on a body. | vault + journal: **F_0.9.3**; listing states **F_0.9.9**; hive lots unchanged until crafting **F_0.9.24** (§5d) |
 | **P.8.1c acquisition ledger** (family supply/signals, `pveSessionHarvestByFamily`) | In-memory demand signals driving hunter dispatch | **Stays shadow, unchanged.** Drives *where* bots hunt; P.10 changes what a kill *pays*. Retire/replace only when a consumer phase lands (documented debt since F_0.6.0). | — |
 | **Demand state** (`demandStateSimulationConfig`, profiles, pressure) | Conceptual demand engine | **Stays shadow, unchanged.** The allocation-policy chunk reads its per-profile pressure as one input, read-only. | read in **F_0.9.11** |
 | **Roster lifetime stats** (`simbot_identities.hunts/kills/deaths/harvest_units`) | Real MySQL rows | **Stay as-is**; the progression tables reference the same `id`. | — |
 | **Simulated credits** | None exist (F_0.5.0 pays nothing) | **Becomes real** from the first credit award. | **F_0.9.2** |
-| **Simulated harvest** (`recordPveHunterHarvest` → hive lots) | Simulated creature-resource units | **Stays shadow** in P.10 (real resource containers = crafting phase). | — |
+| **Simulated harvest** (`recordPveHunterHarvest` → hive lots) | Simulated creature-resource units | **Retired for roster bots in F_0.9.20** (owner, 2026-11-06): real stock harvesting into the vault replaces it; it over-credited (all three families at full max per kill). Miner sampling follows in F_0.9.21. | **F_0.9.20** / **F_0.9.21** (§5d) |
 
 ## 5. Chunks
 
@@ -276,7 +278,17 @@ F_0.9.0 store+dashboard+reaper+harness
         +-- F_0.9.4 group loot/XP dispersal
         +-- F_0.9.9 bazaar SELL (schema 1016)
         +-- F_0.9.10 bazaar BUY
-              +-- F_0.9.11 allocation policy  <-- reads F_0.9.5 plans + demand pressure
+              +-- F_0.9.11 allocation policy  <-- ON HOLD until §5d supplies earnable XP
+
+§5d non-combat XP line (owner order, 2026-11-06; each chunk uses F_0.9.5 training,
+F_0.9.3 vault and F_0.9.9/F_0.9.10 bazaar):
+  F_0.9.20 scout harvesting (replaces the simulated hunter harvest)
+    +-- F_0.9.21 artisan surveying + sampling (replaces simulated miner sampling)
+          +-- F_0.9.22 entertainer: dancer + musician (replaces the instant buff NPCs)
+                +-- F_0.9.23 bounty hunter (droids from the market; Jedi targets)
+                      +-- F_0.9.24 crafting (design decision first: structures/factories)
+                            +-- F_0.9.25 squad leader
+                                  +-- F_0.9.11 allocation policy (resumes)
 ```
 
 ### F_0.9.0 — Progression store foundation (P.10a)
@@ -749,7 +761,14 @@ F_0.9.0 store+dashboard+reaper+harness
 > spendable credits. The reserved `equipped` item state stays unused: the selection is derived.
 > Mid-fight weapon switching is deferred; the stock primary/secondary range swap is the seam.
 
-### F_0.9.11 — Profession allocation policy (P.10l)
+### F_0.9.11 — Profession allocation policy (P.10l) — ON HOLD (owner, 2026-11-06)
+
+> **On hold.** A roster bot can earn only two kinds of XP today: kill XP (weapon type plus
+> `combat_general`, F_0.9.1) and medical XP (G5). An allocator would hand out Scout, Artisan,
+> Entertainer, Bounty Hunter or crafting templates that no bot can level. It resumes after the §5d
+> line. When it does, a template is only eligible if every XP type its plan needs has a production
+> source whose gate is on. A role class with no eligible template then stays empty instead of
+> stalling.
 
 - **Scope**: population planner deciding which professions/templates each
   identity pursues; feeds F_0.9.5 training plans and F_0.9.10 buy lists;
@@ -1093,6 +1112,139 @@ for group content is the open traversal egress defect (F_0.8.2)** — bots can
 enter structures but `exitStructure` is still harness-only, which makes any
 multi-cell dungeon a one-way trip. That must close before P.11 group content
 is planned.
+
+## 5d. Non-combat XP line (owner sequencing, 2026-11-06)
+
+### 5d.1 Why
+
+Roster bots earn XP from two sources only: kills (F_0.9.1: the weapon's XP type plus `combat_general`)
+and healing (G5: `medical`). Scout, Artisan, Entertainer, Bounty Hunter, the crafting trades and Squad
+Leader have no source, so a profession allocator (F_0.9.11) would assign templates nobody can level.
+The owner put the allocator on hold and ordered the XP sources below.
+
+Each chunk follows the same pattern as F_0.9.1 and G5:
+- Hook the **stock** XP award site; never use a parallel formula.
+- Credit through `grantPlayerBotExperience`.
+- Add one default-off `playerBotProgression.*` capability gate.
+- Ship only after a scoped harness plus owner client pass.
+- Real items go through the F_0.9.3 vault and reach the market through the F_0.9.9 SELL path.
+
+Where a chunk replaces an old simulated stand-in, the simulation is retired for roster bots in that
+same chunk, not kept running alongside.
+
+### 5d.2 Order
+
+| Chunk | Scope | Stock XP source | Replaces |
+|---|---|---|---|
+| **F_0.9.20** | Scout: harvest creatures (4x4x) | `CreatureManagerImplementation.cpp:1107`, `scout` | Simulated hunter harvest (`recordPveHunterHarvest`) |
+| **F_0.9.21** | Artisan: survey + sample (xxx4) | `ResourceSpawner.cpp`, `resource_harvesting_inorganic` | Simulated miner sampling |
+| **F_0.9.22** | Entertainer: dancer and musician | `EntertainingSessionImplementation.cpp`, `dance` / `music` / `entertainer_healing` | Instant buff NPCs in cantinas |
+| **F_0.9.23** | Bounty hunter | `BountyMissionObjectiveImplementation.cpp`, `bountyhunter` | — |
+| **F_0.9.24** | Crafting | `CraftingSessionImplementation.cpp:1386`, schematic XP type | Shadow hive crafters (P.5) |
+| **F_0.9.25** | Squad leader | `PlayerManagerImplementation.cpp:2518`, `squadleader` | — |
+| F_0.9.11 | Allocation policy (resumes) | — | — |
+
+Squad Leader deliberately comes after crafting (owner). The chunk ids are placeholders in order;
+TRIP-1 picks the version at planning time.
+
+### 5d.3 F_0.9.20 — Scout harvesting (P.10q)
+
+- **Owner scope:** the 4x4x line (creature hunting and harvesting).
+  - Trapping (x4xx) and wilderness survival (xxx4) are out: both consume crafted items (traps,
+    camp kits) and wait for crafting.
+- **What bots do:** after a kill, harvest the corpse through the stock harvest rules. Real
+  hide/meat/bone `ResourceContainer`s go into the vault bag, and the bot earns `scout` XP.
+- **Why the simulation over-harvests** (code-confirmed, 2026-11-06):
+  - `recordPveHunterHarvest` (`SimPlayerManager.cpp:43990`) credits **all three** families at the
+    template's **full** `getHideMax` / `getBoneMax` / `getMeatMax` on every kill.
+  - Stock harvesting (`CreatureManagerImplementation.cpp:~1000-1108`) takes **one** family per
+    corpse.
+  - The stock quantity is `max × creature_harvesting / 100`, with a floor of 3. It is then scaled by
+    resource density at the spot (×0.5 to ×1.25) and by the group bonus (×1.2 to ×1.4).
+  - Stock XP is `level × 5 + 19`.
+  - An untrained bot (no `creature_harvesting` mod) gets the floor of 3 units, not the full max.
+- **Retire:** the roster-bot call into the simulated harvest. Decide in the plan whether the shadow
+  hive keeps a read-only mirror of real deposits (§4) or stops receiving PvE units.
+- **Sell:** once a bot holds a configurable amount of a resource or item, it lists it through the
+  F_0.9.9 SELL path, keeping the never-undercut seeding policy.
+  - Resources are not junk loot, so SELL needs a resource-container listing category and a price
+    anchor. The owner's policy decision on that anchor goes in the plan.
+- **Open for the plan:**
+  - Which family to pick per corpse (demand pressure, or what the bot's sell list wants).
+  - Group harvest rules when bots are grouped.
+  - Scout training plan and template.
+
+### 5d.4 F_0.9.21 — Artisan surveying and sampling (P.10r)
+
+- **Owner scope:** the xxx4 surveying line. Resources are the input to all crafting, which has
+  hundreds of schematics, so a wide range of resources must be extracted.
+- **Basis:** refine and open up the existing miner work: the P.4 navigation and travel, station
+  travel, and the P.4.5b cross-planet dispatch design.
+- **Move to the roster:** miners have no roster identity today and are simulation-only (CLAUDE.md
+  persistence policy). This chunk moves them onto the roster, so they get real sampled
+  `ResourceContainer`s in the vault, `resource_harvesting_inorganic` XP, and SELL at a threshold, as
+  in F_0.9.20.
+- **Open for the plan:**
+  - Survey tool handling (bots need the tool or an equivalent seam).
+  - Resource-class coverage targets versus demand.
+  - Whether the P.5 hive keeps mirroring.
+  - Migration and retirement of the legacy miner population.
+
+### 5d.5 F_0.9.22 — Entertainer: dancer and musician (P.10s)
+
+- **Goal:** bots grind Dancer and Musician to master in cantinas, then provide the entertainer buff
+  and battle-fatigue services themselves.
+- **End state:** this eventually retires the instant-buff cantina NPCs, and G2's buff flow switches
+  to bot entertainers.
+- **Seam to resolve:** `EntertainingSession` is built around a player; it is the ghostless-body
+  question again (cf. G5's `isHealableBy` seam).
+- **Open for the plan:**
+  - Instrument items (vault, or bazaar BUY).
+  - Venue choice and population cap per cantina.
+  - Audience XP rules.
+  - The cut-over from the instant NPCs.
+
+### 5d.6 F_0.9.23 — Bounty hunter (P.10t)
+
+- **Owner flow:**
+  1. Take a bounty mission.
+  2. Talk to an informant for the target's signature; the informant tier depends on the mission
+     level.
+  3. Load the signature into a seeker/probe droid to get the target's location.
+  4. Run to the target, kill it, and collect the payout and loot ("loot is good").
+- **Droid supply:** droids come from the market, either crafted by humans or added by an admin or a
+  test.
+  - Without a supply, BH cannot hunt cross-planet, so the capability will usually be **off**
+    (default-off as always).
+  - Bots never fabricate droids.
+- **Player Jedi targets:** the owner wants BH bots to hunt player Jedi. This is the first P.10
+  capability that attacks a **human** player, so it needs its own owner policy and gate, separate
+  from NPC bounties.
+- **Open for the plan:**
+  - Bot-side informant interaction.
+  - Droid consumption.
+  - Mission-level gating.
+  - Death and loss rules on a failed hunt.
+
+### 5d.7 F_0.9.24 — Crafting (P.10u)
+
+- **Scope:** the largest chunk in the line, covering real schematics, real resources from
+  F_0.9.20/21, and crafting XP.
+- **Design decision first:** stock crafting of identical objects in quantity needs **structures**
+  (factories, manufacturing schematics, power). Before any plan is written, the owner decides how
+  bot crafters get and run structures, or what the equivalent is.
+- **Retire the P.5 shadow crafters,** which ends the shadow-hive exception for resources (§4).
+- **Unblocks:**
+  - Scout trapping (x4xx) and wilderness survival (xxx4).
+  - Bot-made BH droids and stims.
+
+### 5d.8 F_0.9.25 — Squad leader (P.10v)
+
+- **What:** pay `squadleader` XP to a bot group leader.
+- **Hook:** inside `disseminateExperience` (`PlayerManagerImplementation.cpp:2518`), the same function
+  F_0.9.1 already hooks.
+- **Why it's small:** the G1–G4 grouping makes it a small chunk. The owner sequenced it after
+  crafting.
 
 ## 6. engine3 policy and inventory
 
