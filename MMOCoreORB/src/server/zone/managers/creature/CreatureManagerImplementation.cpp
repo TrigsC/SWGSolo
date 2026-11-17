@@ -6,6 +6,7 @@
  */
 
 #include "server/zone/managers/creature/CreatureManager.h"
+#include "server/zone/managers/creature/CreatureHarvestYield.h"
 #include "server/zone/objects/creature/ai/CreatureTemplate.h"
 #include "CreatureTemplateManager.h"
 #include "SpawnAreaMap.h"
@@ -609,6 +610,8 @@ int CreatureManagerImplementation::notifyDestruction(TangibleObject* destructor,
 	bool shouldRescheduleCorpseDestruction = false;
 	bool botLootBranch = false;
 	bool botLootHasValue = false;
+	bool botHarvestable = false;
+	bool botGroupHarvestClaimQueued = false;
 
 	try {
 		SortedVector<ManagedReference<Observer* > > observers = destructedObject->getObservers(ObserverEventType::QUESTKILL);
@@ -695,15 +698,52 @@ int CreatureManagerImplementation::notifyDestruction(TangibleObject* destructor,
 				destructedObject->addCashCredits(credits);
 			}
 
-			Locker invLocker(creatureInventory, destructedObject);
+			{
+				Locker invLocker(creatureInventory, destructedObject);
 
-			TransactionLog trx(TrxCode::NPCLOOT, destructedObject);
-			creatureInventory->setContainerOwnerID(ownerID);
+				TransactionLog trx(TrxCode::NPCLOOT, destructedObject);
+				creatureInventory->setContainerOwnerID(ownerID);
 
-			if (lootManager->createLoot(trx, creatureInventory, destructedObject)) {
-				trx.commit(true);
-			} else if (trx.isEnabled() && !trx.isAborted()) {
-				trx.abort() << "createLoot failed for ai object for unknown reason.";
+				if (lootManager->createLoot(trx, creatureInventory,
+						destructedObject)) {
+					trx.commit(true);
+				} else if (trx.isEnabled() && !trx.isAborted()) {
+					trx.abort() << "createLoot failed for ai object for unknown reason.";
+				}
+			}
+
+			// A human group owns this corpse in the stock path, and stock
+			// canHarvestMe lets every member of the owning group harvest it once,
+			// damage or not.  Offer it to each roster bot in that group; the claim
+			// is harvest-only and never walks the group's loot path.
+			Creature* organicCorpse = cast<Creature*>(destructedObject);
+			SimPlayerManager* simPlayerManager = SimPlayerManager::instance();
+			ManagedReference<GroupObject*> ownerGroup = player->isGrouped() ?
+				player->getGroup() : nullptr;
+			if (ownerGroup != nullptr && organicCorpse != nullptr &&
+					organicCorpse->hasOrganics() && simPlayerManager != nullptr) {
+				Zone* corpseZone = destructedObject->getZone();
+				if (corpseZone != nullptr) {
+					for (int i = 0; i < ownerGroup->getGroupSize(); ++i) {
+						ManagedReference<CreatureObject*> member =
+							ownerGroup->getGroupMember(i);
+						if (member == nullptr || !member->isAiAgent() ||
+								member->getGroupID() != ownerID)
+							continue;
+						uint64 identityId = simPlayerManager->
+							resolvePlayerBotLootOwner(member->getObjectID());
+						if (identityId == 0 ||
+								!simPlayerManager->playerBotHarvestClaimEligible(identityId))
+							continue;
+						if (simPlayerManager->queuePlayerBotLootClaim(identityId,
+								destructedObject->getObjectID(),
+								corpseZone->getZoneName(),
+								destructedObject->getWorldPosition(), false, true)) {
+							botGroupHarvestClaimQueued = true;
+							simPlayerManager->recordPlayerBotHarvestGroupClaimQueued();
+						}
+					}
+				}
 			}
 		} else if (creatureInventory != nullptr && player != nullptr &&
 				!player->isPlayerCreature() && player->isAiAgent() &&
@@ -741,20 +781,25 @@ int CreatureManagerImplementation::notifyDestruction(TangibleObject* destructor,
 
 				botLootHasValue = destructedObject->getCashCredits() > 0 ||
 					creatureInventory->getContainerObjectsSize() > 0;
-				if (botLootHasValue) {
+				Creature* organicCorpse = cast<Creature*>(destructedObject);
+				botHarvestable = organicCorpse != nullptr &&
+					organicCorpse->hasOrganics() &&
+					simPlayerManager->playerBotHarvestClaimEligible(identityId);
+				if (botLootHasValue || botHarvestable) {
 					Zone* corpseZone = destructedObject->getZone();
 					if (corpseZone != nullptr)
 						simPlayerManager->queuePlayerBotLootClaim(identityId,
 							destructedObject->getObjectID(),
 							corpseZone->getZoneName(),
-							destructedObject->getWorldPosition());
+						destructedObject->getWorldPosition(), botLootHasValue,
+							botHarvestable);
 				}
 			}
 		}
 
 		// Check to see if we can expedite the despawn of this corpse
 		// We can expedite the despawn when corpse has no loot, no credits, player cannot harvest, and no group members in range can harvest
-		if (!botLootBranch)
+		if (!botLootBranch && !botGroupHarvestClaimQueued)
 			shouldRescheduleCorpseDestruction = playerManager->shouldRescheduleCorpseDestruction(player, destructedObject);
 	} catch (...) {
 		destructedObject->scheduleDespawn(10, true);
@@ -767,7 +812,7 @@ int CreatureManagerImplementation::notifyDestruction(TangibleObject* destructor,
 	}
 
 	if (botLootBranch) {
-		if (botLootHasValue)
+		if (botLootHasValue || botHarvestable)
 			destructedObject->scheduleDespawn(300);
 		else
 			destructedObject->scheduleDespawn(10, true);
@@ -951,7 +996,7 @@ void CreatureManagerImplementation::droidHarvest(Creature* creature, CreatureObj
 
 	ManagedReference<PlayerManager*> playerManager = zoneServer->getPlayerManager();
 
-	int xp = creature->getLevel() * 5 + 19;
+	int xp = CreatureHarvestYield::scoutExperience(creature->getLevel(), 1.f);
 
 	if(playerManager != nullptr)
 		playerManager->awardExperience(owner, "scout", xp, true);
@@ -1026,8 +1071,7 @@ void CreatureManagerImplementation::harvest(Creature* creature, CreatureObject* 
 		player->sendSystemMessage("Tried to harvest something this creature didn't have, please report this error");
 		return;
 	}
-	int quantityExtracted = int(quantity * float(player->getSkillMod("creature_harvesting") / 100.0f));
-	quantityExtracted = Math::max(quantityExtracted, 3);
+	int harvestingMod = player->getSkillMod("creature_harvesting");
 
 	ManagedReference<ResourceSpawn*> resourceSpawn = resourceManager->getCurrentSpawn(restype, player->getZone()->getZoneName());
 
@@ -1037,34 +1081,16 @@ void CreatureManagerImplementation::harvest(Creature* creature, CreatureObject* 
 	}
 
 	float density = resourceSpawn->getDensityAt(player->getZone()->getZoneName(), player->getPositionX(), player->getPositionY());
-
-	String creatureHealth = "";
-
-	if (density > 0.75f) {
-		quantityExtracted = int(quantityExtracted * 1.25f);
-		creatureHealth = "creature_quality_fat";
-	} else if (density > 0.50f) {
-		quantityExtracted = int(quantityExtracted * 1.00f);
-		creatureHealth = "creature_quality_medium";
-	} else if (density > 0.25f) {
-		quantityExtracted = int(quantityExtracted * 0.75f);
-		creatureHealth = "creature_quality_scrawny";
-	} else {
-		quantityExtracted = int(quantityExtracted * 0.50f);
-		creatureHealth = "creature_quality_skinny";
-	}
-
 	float modifier = 1;
-	int baseAmount = quantityExtracted;
-
 	if (player->isGrouped()) {
 		modifier = player->getGroup()->getGroupHarvestModifier(player);
-
-		quantityExtracted = (int)(quantityExtracted * modifier);
 	}
 
-	if (creature->getParent().get() != nullptr)
-		quantityExtracted = 1;
+	CreatureHarvestYield::Result yield = CreatureHarvestYield::calculate(
+		quantity, harvestingMod,
+		density, modifier, creature->getParent().get() != nullptr);
+	int quantityExtracted = yield.quantity;
+	String creatureHealth = yield.densityBand;
 
 	TransactionLog trx(TrxCode::HARVESTED, player, resourceSpawn);
 	resourceManager->harvestResourceToPlayer(trx, player, resourceSpawn, quantityExtracted);
@@ -1101,7 +1127,7 @@ void CreatureManagerImplementation::harvest(Creature* creature, CreatureObject* 
 
 	ManagedReference<PlayerManager*> playerManager = zoneServer->getPlayerManager();
 
-	int xp = creature->getLevel() * 5 + 19;
+	int xp = CreatureHarvestYield::scoutExperience(creature->getLevel(), 1.f);
 
 	if(playerManager != nullptr)
 		playerManager->awardExperience(player, "scout", xp, true);

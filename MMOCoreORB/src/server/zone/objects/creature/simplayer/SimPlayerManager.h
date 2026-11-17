@@ -36,6 +36,7 @@
 #include "server/zone/objects/creature/simplayer/SimBotArmorLoadout.h"
 #include "server/zone/objects/creature/simplayer/SimBotConsumables.h"
 #include "server/zone/objects/creature/simplayer/SimBotHealing.h"
+#include "server/zone/objects/creature/simplayer/SimBotHarvest.h"
 #include "server/zone/objects/creature/simplayer/SimBotGrouping.h"
 #include "server/zone/objects/creature/simplayer/SimBotGroupTactics.h"
 #include "server/zone/objects/creature/simplayer/SimBotGroupRally.h"
@@ -71,6 +72,18 @@ class PlayerBotParityTestRunnerTask;
 class HiveCrafterConsumerTask;
 class SimHunterController;
 class SimPveFoundationMaintenanceTask;
+
+namespace server {
+namespace zone {
+namespace objects {
+namespace resource {
+class ResourceSpawn;
+}
+}
+}
+}
+
+using namespace server::zone::objects::resource;
 
 namespace server {
 namespace zone {
@@ -127,6 +140,62 @@ struct SimBotConsumablePolicy {
 	float restockSpendFraction = 0.25f;
 	Vector<SimBotConsumables::ConsumableEntry> items;
 	String signature;
+};
+
+// F_0.9.20 P.10q: Lua-owned values for the real Scout harvest path.  The
+// supply snapshot is intentionally separate; Phase 1 uses the deterministic
+// corpse fallback and Phase 2 can publish real held/listed demand here.
+struct PlayerBotHarvestPolicy {
+	bool sell = true;
+	uint64 sellThresholdUnits = 10000;
+	uint64 pricePerUnit[SimBotHarvest::FAMILY_COUNT] = {4, 3, 3};
+	float minQualityFactor = 0.25f;
+	uint64 targetStockUnits[SimBotHarvest::FAMILY_COUNT] = {
+		50000, 50000, 50000};
+	int supplySnapshotSeconds = 300;
+	int maxListingLoadsPerSnapshot = 64;
+	int maxFloorLoadsPerVisit = 32;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotResourceSupplySnapshot {
+	uint64_t held[SimBotHarvest::FAMILY_COUNT] = {};
+	uint64_t listed[SimBotHarvest::FAMILY_COUNT] = {};
+	uint64_t need[SimBotHarvest::FAMILY_COUNT] = {};
+	uint64 builtAtMs = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotResourceListingCacheEntry {
+	uint64 auctionOid = 0;
+	uint64 units = 0;
+	SimBotHarvest::Family family = SimBotHarvest::NONE;
+	String resourceType;
+	uint64 observedAtMs = 0;
+	bool valid = false;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotHarvestRecord {
+	uint64 identityId = 0;
+	uint64 corpseOid = 0;
+	uint64 recordedAtMs = 0;
+	String corpseTemplate;
+	String resourceType;
+	String densityBand;
+	SimBotHarvest::Family family = SimBotHarvest::NONE;
+	int units = 0;
+	int xp = 0;
+	int disposition = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 };
 
 struct SimBotBodyArmorContext {
@@ -777,6 +846,10 @@ struct SimBotItemRow {
 struct PlayerBotLootClaim {
 	uint64 identityId = 0;
 	uint64 corpseOid = 0;
+	// Existing claims are loot claims.  Harvest-only claims are used for a
+	// group-owned corpse so they never touch the group's loot inventory.
+	bool loot = true;
+	bool harvest = false;
 	String zoneName;
 	Vector3 position;
 	uint64 queuedAtMs = 0;
@@ -784,6 +857,19 @@ struct PlayerBotLootClaim {
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+enum PlayerBotHarvestDisposition {
+	PLAYER_BOT_HARVESTED = 0,
+	PLAYER_BOT_HARVEST_GATE_OFF,
+	PLAYER_BOT_HARVEST_NO_SKILL,
+	PLAYER_BOT_HARVEST_NOT_ELIGIBLE,
+	PLAYER_BOT_HARVEST_NO_FAMILY,
+	PLAYER_BOT_HARVEST_NO_SPAWN,
+	PLAYER_BOT_HARVEST_TOO_FAR,
+	PLAYER_BOT_HARVEST_BAG_FAILED,
+	PLAYER_BOT_HARVEST_CAP_REACHED,
+	PLAYER_BOT_HARVEST_DISPOSITION_COUNT
 };
 
 enum PlayerBotLootDisposition {
@@ -1248,6 +1334,7 @@ struct PlayerBotProgressionRequest {
 	bool faultFailNextFlush = false;
 	bool faultFailLedgerInsert = false;
 	String ledgerSource;
+	String ledgerKind;
 	int64 ledgerDelta = 0;
 	int ledgerCount = 0;
 	int64 ledgerSum = 0;
@@ -1412,6 +1499,8 @@ struct PlayerBotParityTestStep {
 	bool hasRate = false;
 	String expect;
 	String source = "harness";
+	// assertLedger: optional ledger kind filter ("resource", "item", ...).
+	String ledgerKind;
 	bool bank = false;
 	// Set on a step whose award the scenario deliberately expects the API to
 	// refuse (an overspend, or an award while the gate is off). Rejection is
@@ -1515,6 +1604,13 @@ struct PlayerBotParityTestStep {
 	String supersededBy;
 	String targetState;
 	uint64 corpseOid = 0;
+	String harvestFamily;
+	String harvestResourceType;
+	bool matchHarvestRecords = false;
+	int expectedHarvestUnits = -1;
+	bool hasExpectedHarvestUnits = false;
+	int expectedHarvestXp = -1;
+	bool hasExpectedHarvestXp = false;
 	String lootTemplate;
 	String itemState;
 	String purchaseState;
@@ -2279,6 +2375,7 @@ private:
 	friend class DemandProfileSimulationTask;
 	friend class DemandStateSimulationTask;
 	friend class MarketSupplyObservationTask;
+	friend class PlayerBotHarvestSupplyTask;
 	friend class StockpileSnapshotSimulationTask;
 	friend class DemandWeightedMinerPlanSimulationTask;
 	friend class AiEconomyConceptualTotalsPersistenceTask;
@@ -3338,6 +3435,19 @@ private:
 	int progressionLootClaimTtlSeconds = 280;
 	int progressionLootMaxClaimsPerBot = 8;
 	int progressionLootStepTimeoutSeconds = 90;
+	// 0 disables bag-room discards; below this many free slots a bot discards
+	// its least valuable loot until it has the target free.
+	int progressionLootDiscardJunkBelowFreeSlots = 0;
+	int progressionLootDiscardJunkTargetFreeSlots = 0;
+	bool progressionHarvestEnabled = false;
+	PlayerBotHarvestPolicy progressionHarvestPolicy;
+	Mutex progressionHarvestMutex;
+	PlayerBotResourceSupplySnapshot progressionHarvestSupply;
+	VectorMap<uint64, PlayerBotResourceListingCacheEntry>
+		progressionHarvestListingCache;
+	Vector<PlayerBotHarvestRecord> progressionHarvestLastHarvests;
+	bool progressionHarvestSupplyTaskScheduled = false;
+	static const int progressionHarvestLastHarvestLimit = 32;
 	bool progressionLairTacticsEnabled = false;
 	bool progressionEarlyGameRealWeaponDamage = false;
 	bool progressionWeaponLoadout = false;
@@ -3483,6 +3593,8 @@ private:
 	int progressionBazaarMinPrice = 50;
 	int progressionBazaarMaxPrice = 20000;
 	int progressionBazaarMaxListingsPerBot = 10;
+	// Listing slots that only harvested resource containers may fill.
+	int progressionBazaarResourceListingReserve = 0;
 	int progressionBazaarListingsPerVisit = 3;
 	int progressionBazaarDurationHours = 168;
 	int progressionBazaarCooldownSeconds = 120;
@@ -3516,6 +3628,7 @@ private:
 	AtomicLong bazaarSkippedNoValue;
 	AtomicLong bazaarSkippedHumanAboveCap;
 	AtomicLong bazaarSkippedCap;
+	AtomicLong bazaarSkippedResourceReserve;
 	AtomicLong bazaarSkippedUnaffordable;
 	AtomicLong bazaarSkippedNoTrade;
 	AtomicLong bazaarSkippedTransferFailed;
@@ -3652,6 +3765,7 @@ private:
 	AtomicLong lootCorpsesLooted;
 	AtomicLong lootItemsLooted;
 	AtomicLong lootCashLooted;
+	AtomicLong lootJunkDiscarded;
 	AtomicLong lootSkippedVaultFull;
 	AtomicLong lootTransferFailed;
 	AtomicLong lootDepositNoRecord;
@@ -3664,6 +3778,18 @@ private:
 	AtomicLong lootAbandonedPathFailed;
 	AtomicLong lootClaimsDroppedBodyGone;
 	AtomicLong lootResults[PLAYER_BOT_LOOT_DISPOSITION_COUNT];
+	AtomicLong harvestResults[PLAYER_BOT_HARVEST_DISPOSITION_COUNT];
+	AtomicLong harvestsCompleted;
+	AtomicLong harvestUnitsTotal;
+	AtomicLong harvestFamilyUnits[SimBotHarvest::FAMILY_COUNT];
+	AtomicLong harvestXpGranted;
+	AtomicLong harvestDepositFailed;
+	AtomicLong harvestSimulationSkipped;
+	AtomicLong harvestGroupClaimsQueued;
+	AtomicLong harvestListingsCreated;
+	AtomicLong harvestListingLoads;
+	AtomicLong harvestFloorIncomplete;
+	AtomicLong harvestFloorAboveMax;
 	AtomicLong progressionLedgerWritten;
 	AtomicLong progressionLedgerDropped;
 	AtomicLong progressionLedgerBalanceMismatch;
@@ -3843,6 +3969,14 @@ private:
 	bool playerBotParityTestLootGateOverrideActive = false;
 	bool playerBotParityTestLootGateOverride = false;
 	VectorMap<uint64, bool> playerBotParityLootGateScopedIds;
+	bool playerBotParityTestHarvestGateOverrideActive = false;
+	bool playerBotParityTestHarvestGateOverride = false;
+	VectorMap<uint64, bool> playerBotParityHarvestGateScopedIds;
+	VectorMap<uint64, bool> playerBotParityHarvestGateValues;
+	// Harness-only threshold used by harvest_sell_threshold. It is identity
+	// scoped so the scenario can exercise a real listing without changing the
+	// live policy or any production bot's sell decision.
+	VectorMap<uint64, uint64> playerBotParityHarvestSellThresholdOverrides;
 	bool playerBotParityTestBazaarSellGateOverrideActive = false;
 	bool playerBotParityTestBazaarSellGateOverride = false;
 	VectorMap<uint64, bool> playerBotParityBazaarSellGateScopedIds;
@@ -4332,6 +4466,10 @@ private:
 	Vector<String> effectiveDeferredXpTypes(uint64 identityId);
 	bool playerBotIsMedic(uint64 identityId);
 	bool removePlayerBotConsumedItem(uint64 identityId, uint64 objectId);
+	bool destroyPlayerBotHeldItem(uint64 identityId, uint64 objectId,
+		const String& reason);
+	void makePlayerBotBagRoom(uint64 identityId);
+	bool isPlayerBotResourceListingLocked(uint64 objectId);
 	void collectPlayerBotProtectedConsumableOids(uint64 identityId,
 		VectorMap<uint64, bool>& protectedIds);
 	void reconcilePlayerBotConsumableFlags();
@@ -4554,6 +4692,7 @@ private:
 		const String& detail);
 	void releasePlayerBotCreditsLocked(uint64 identityId, const String& purpose);
 	bool playerBotLootGateEnabled(uint64 identityId);
+	bool playerBotHarvestGateEnabled(uint64 identityId);
 	bool playerBotMissionCreditGateEnabled(uint64 identityId);
 	bool playerBotBuffPaymentGateEnabled(uint64 identityId);
 	// Per-identity decision: the harness override applies only to identities in
@@ -4720,6 +4859,9 @@ private:
 	void applyMarketSupplyObservationConfig(LuaObject& marketSupplyConfig);
 	void observeMarketSupply();
 	void clearMarketSupplyObservationSnapshot();
+	void schedulePlayerBotHarvestSupplyTask();
+	void runPlayerBotHarvestSupplyTask();
+	void refreshPlayerBotHarvestSupplySnapshot();
 	void scheduleStockpileSnapshotSimulationTask();
 	void runStockpileSnapshotSimulationTask();
 	void refreshStockpileSnapshotSimulationConfig();
@@ -5268,14 +5410,33 @@ public:
 	}
 	bool removePlayerBotItemsForReap(uint64 identityId);
 	uint64 resolvePlayerBotLootOwner(uint64 bodyOid);
+	bool playerBotHarvestClaimEligible(uint64 identityId);
 	bool queuePlayerBotLootClaim(uint64 identityId, uint64 corpseOid,
-		const String& zoneName, const Vector3& position);
+		const String& zoneName, const Vector3& position,
+		bool loot = true, bool harvest = false);
 	bool takeNearestPlayerBotLootClaim(uint64 identityId,
 		const String& zoneName, const Vector3& position,
 		float maxDetourMeters, PlayerBotLootClaim& claimOut);
 	bool returnPlayerBotLootClaim(const PlayerBotLootClaim& claim);
 	PlayerBotLootDisposition lootPlayerBotCorpse(uint64 identityId,
 		AiAgent* body, uint64 corpseOid);
+	PlayerBotHarvestDisposition harvestPlayerBotCorpse(uint64 identityId,
+		AiAgent* body, uint64 corpseOid, int* unitsOut = nullptr,
+		int* xpOut = nullptr, SimBotHarvest::Family* familyOut = nullptr,
+		String* resourceTypeOut = nullptr, String* densityBandOut = nullptr,
+		String* corpseTemplateOut = nullptr);
+	bool depositPlayerBotResource(uint64 identityId, ResourceSpawn* spawn,
+		int units, bool* capReached = nullptr,
+		const String& zoneName = String());
+	void recordPlayerBotHarvestResult(uint64 identityId, uint64 corpseOid,
+		PlayerBotHarvestDisposition disposition, int units = 0, int xp = 0,
+		SimBotHarvest::Family family = SimBotHarvest::NONE,
+		const String& resourceType = String(),
+		const String& densityBand = String(),
+		const String& corpseTemplate = String());
+	void recordPlayerBotHarvestGroupClaimQueued() {
+		harvestGroupClaimsQueued.increment();
+	}
 	void recordPlayerBotLootAbandoned(const String& reason);
 	void recordPlayerBotLootResult(uint64 identityId, uint64 corpseOid,
 		PlayerBotLootDisposition disposition);

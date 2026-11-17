@@ -3254,6 +3254,12 @@ void SimHunterController::runGroupTick(AiAgent* hunter, uint64 nowMs) {
 		}
 	}
 
+	// A grouped bot harvests the group's kills between fights: the corpse walk
+	// yields to every defence tier above and holds the tick from follow and
+	// directives only while it is actually walking or harvesting.
+	if (runPlayerBotLootStep(hunter, nowMs))
+		return;
+
 	Zone* hunterZone = hunter->getZone();
 	String hunterPlanet = hunterZone == nullptr ? String() :
 		hunterZone->getZoneName();
@@ -7352,15 +7358,41 @@ bool SimHunterController::runPlayerBotLootStep(AiAgent* hunter,
 		Vector3 position = hunter->getWorldPosition();
 		if (position.distanceTo2d(lootStepClaim.position) <=
 				static_cast<float>(manager->getPlayerBotLootArriveMeters())) {
-			PlayerBotLootDisposition result = manager->lootPlayerBotCorpse(
-				identityId, hunter, lootStepClaim.corpseOid);
-			manager->recordPlayerBotLootResult(identityId,
-				lootStepClaim.corpseOid, result);
-			// A corpse just out of reach is retried while the claim lives. Every
-			// other result is final: a transfer or bag failure is counted and the
-			// corpse stays lootable until it despawns, with no retry loop.
-			if (result == PLAYER_BOT_LOOT_TOO_FAR)
-				manager->returnPlayerBotLootClaim(lootStepClaim);
+			bool retryLoot = false;
+			bool retryHarvest = false;
+			if (lootStepClaim.loot) {
+				PlayerBotLootDisposition result = manager->lootPlayerBotCorpse(
+					identityId, hunter, lootStepClaim.corpseOid);
+				manager->recordPlayerBotLootResult(identityId,
+					lootStepClaim.corpseOid, result);
+				// A corpse just out of reach is retried while the claim lives. Every
+				// other result is final: a transfer or bag failure is counted and the
+				// corpse stays lootable until it despawns, with no retry loop.
+				retryLoot = result == PLAYER_BOT_LOOT_TOO_FAR;
+			}
+			if (lootStepClaim.harvest) {
+				int harvestedUnits = 0;
+				int harvestedXp = 0;
+				SimBotHarvest::Family harvestedFamily = SimBotHarvest::NONE;
+				String harvestedResourceType;
+				String harvestedDensityBand;
+				String harvestedCorpseTemplate;
+				PlayerBotHarvestDisposition result = manager->harvestPlayerBotCorpse(
+					identityId, hunter, lootStepClaim.corpseOid, &harvestedUnits,
+					&harvestedXp, &harvestedFamily, &harvestedResourceType,
+					&harvestedDensityBand, &harvestedCorpseTemplate);
+				manager->recordPlayerBotHarvestResult(identityId,
+					lootStepClaim.corpseOid, result, harvestedUnits, harvestedXp,
+					harvestedFamily, harvestedResourceType, harvestedDensityBand,
+					harvestedCorpseTemplate);
+				retryHarvest = result == PLAYER_BOT_HARVEST_TOO_FAR;
+			}
+			if (retryLoot || retryHarvest) {
+				PlayerBotLootClaim retryClaim = lootStepClaim;
+				retryClaim.loot = retryLoot;
+				retryClaim.harvest = retryHarvest;
+				manager->returnPlayerBotLootClaim(retryClaim);
+			}
 			finishPlayerBotLootStep("looted", true);
 			scheduleActiveTick(100);
 			return true;

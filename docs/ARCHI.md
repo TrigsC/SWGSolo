@@ -132,6 +132,7 @@ CMake options: `BUILD_IDL`, `COMPILE_TESTS`, `ENABLE_ASAN`/`TSAN`/`UBSAN`. Debug
 | F_0.9.17 (v0.9.18) | `grouping.missionsEnabled` (false), `grouping.missions` (`maxGrabCount` 20 sanity cap, `bearingToleranceDeg` 22, `holdShortMeters` 60, `missionTimeoutMinutes`, `grabBatchTimeoutSeconds`, `assistLeaderTarget`/`assistLeaderRadiusMeters`), `vocabulary.mission` (grab, mission/lair nouns, run, skip, directions), mission and `clonedNoBuffs` lines; `bin/conf/config.lua` `Core3.MissionManager.MaxActiveMissions` (2); harness `playerBotParityTest.onlyScenarios`/`continueOnFailure`/`maxRunMinutes` |
 | F_0.9.18 (v0.9.19) | `grouping.tacticsEnabled` (false), `grouping.tactics` (`pullRadiusMeters` 64, `pullTimeoutSeconds` per phase, `tagTimeoutSeconds`, `spinStartMeters` 20, `spinStandMeters`), `vocabulary.tactics` (pull, spinPoll, spinOn, spinOff, eat, backOff, lairAttack), tactic lines, `grouping.missions.leadStopMeters` (40) |
 | F_0.9.19 (v0.9.20) | `healingEnabled` (false), `healing` (`playerHealsBots`, `botHeals`, `selfHeal`, `groupHealThreshold` 0.70, `selfHealThreshold` 0.60, `selfCriticalFraction` 0.35, `maxApproachMeters` 32, `applyRangeMeters` 6, approach/apply timeouts, `bazaarRestock`, `minDoses` 20, `restockSpendFraction`, `restockScanIntervalMinutes`, `maxRestockLoadsPerVisit`, `items` = five crafted stims `{template, maxPricePerDose}`), `grouping.vocabulary.heal`, heal lines |
+| F_0.9.20 (v0.9.21) | `harvestEnabled` (false; needs `lootEnabled`), `harvest` (`sell`, `sellThresholdUnits` 500, `pricePerUnit`, `minQualityFactor`, `targetStockUnits` 50k/family, snapshot and load caps), `loot.discardJunkBelowFreeSlots`/`discardJunkTargetFreeSlots` (5/10; 0 = off), `bazaar.resourceListingReserve` (10 of `maxListingsPerBot` 25, clamped to stock `MAXSALES`), `scout` in `earlyGame.deferredXpTypes`, brawler `goalSkills` + Scout 4x4x |
 | F_0.9.16 (v0.9.17) | `grouping.directivesEnabled` (false), `buffCities`, rally `rallyArriveMeters`/`Min`/`Max`/`ReleaseMeters`/`HoldMaxMinutes`, `shuttleMinSavingsMeters` 1000, `rebuffCheckSeconds`/`rebuffVisitResetSeconds`, `groupBuffTimeoutSeconds` 600, line delays, `vocabulary.follow`/`ready`/`rally` (buff, meet, landmarks), `places` (cities, outposts, custom x/y), rally `lines` |
 
 The sim layer alone restores roster PlayerBot weapon-template stats after shared AI weapon-stat
@@ -945,6 +946,23 @@ Layered on the stock `AiAgent`/`CreatureObject` hierarchy. Living design docs:
     defend). An automatic miss must return `false`; holding the tick froze a medic for 3 minutes.
   - **Live receipt:** 6/6 scoped heal scenarios plus the owner's 4-step client pass
     (`docs/4-unit-tests/live_f0919-*`).
+- **Scout harvesting (P.10q / F_0.9.20, released v0.9.21)**: real corpse harvesting, gate `harvestEnabled`.
+  - **Stock seam.** `CreatureHarvestYield.h` holds the stock yield and XP math; stock `harvest()` and the bot path share it.
+    A group-owned corpse is offered to every roster bot **in the owning group** (stock `canHarvestMe` is group
+    membership, not damage), as a harvest-only claim.
+  - **Manager.** `harvestPlayerBotCorpse` picks one family by real need (`SimBotHarvest.h`), extracts once under the
+    spawn lock, then deposits a `ResourceContainer` per bot per spawn into the vault bag (item row plus an audit-only
+    `resource` ledger kind). The supply snapshot (vault plus listed) feeds demand and dispatch; the simulated
+    `recordPveHunterHarvest` is skipped for gated identities.
+  - **Bag room.** Stock marks a corpse harvested before the deposit, so `makePlayerBotBagRoom` runs before each harvest
+    or loot. It discards HELD `loot` rows only (unsellable first) through `destroyPlayerBotHeldItem`, which is shared
+    with the consume path (item → bag lock, row drop, ledger `-1`).
+  - **Selling.** Stacks ≥ `sellThresholdUnits` list first in a visit, priced per unit × quality against the human floor.
+    Loot may use only `maxListingsPerBot − resourceListingReserve` slots.
+  - **Two deferred-XP copies.** The trainer (`computePlayerBotNextTrainingStepLocked`, under `progressionMutex`) mirrors
+    `effectiveDeferredXpTypes()` from the raw flags; un-deferring an XP type must change both.
+  - **Controller.** The loot/harvest step also runs in `runGroupTick`, after the defence tiers.
+  - **Live receipt:** 7/7 scoped harness plus the owner's grouped client pass (`docs/4-unit-tests/live_f0920-*`).
 - **Simulation-only policy, with one approved exception (P.10, 2026-09-02)**:
   no real inventory/credit/market/persistence mutation happens from this layer
   except through the P.10 PlayerBot player-parity line

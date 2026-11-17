@@ -348,6 +348,10 @@
     const consumables = data.consumables || {};
     const grouping = data.grouping || {};
     const healing = data.healing || {};
+    const harvest = data.harvest || {};
+    const harvestHeld = harvest.held || {};
+    const harvestListed = harvest.listed || {};
+    const harvestLast = harvest.lastHarvest || {};
     const healingItems = Array.isArray(healing.items) ? healing.items : [];
     const healingXp = data.xp && data.xp.medical != null ? data.xp.medical :
       data.experience && data.experience.medical != null ? data.experience.medical : null;
@@ -457,6 +461,7 @@
         ${(abilities.excluded || []).length ? `<details><summary>Excluded (${abilities.excluded.length})</summary><div class="playerbot-chips">${playerBotList(abilities.excluded)}</div></details>` : ""}</div>
       <div class="playerbot-card"><h3>RECENT ABILITY USE</h3>${recentRows || `<span class="muted small">No recorded ability use.</span>`}</div>
       <div class="playerbot-card"><h3>ITEMS (${num(data.itemsHeld)})</h3>${table(["OID", "Item", "State", "Source", "Acquired"], itemRows, { scrollKey: "playerbot-items", tall: true })}</div>
+      <div class="playerbot-card"><h3>HARVESTING</h3><p class="playerbot-label">${chip(harvest.enabled ? "gate on" : "gate off", harvest.enabled ? "ok" : "ghost")} · ${chip(harvestLast.result || "no harvest", harvestLast.result === "harvested" ? "teal" : "ghost")}</p>${kvRows([["Held", Object.entries(harvestHeld).map(([key, value]) => `${labelize(key)} ${num(value)}`).join(" · ") || "none"], ["Listed", Object.entries(harvestListed).map(([key, value]) => `${labelize(key)} ${num(value)}`).join(" · ") || "none"], ["Last", harvestLast.corpseTemplate ? `${esc(harvestLast.corpseTemplate)} · ${esc(labelize(harvestLast.family || "none"))} · ${num(harvestLast.units)} units · ${num(harvestLast.xp)} XP · ${ago(harvestLast.ageSeconds)}` : "none recorded"]])}</div>
       <div class="playerbot-card"><h3>LISTINGS (${num(listings.length)})</h3>${table(["OID", "Item", "State", "Price", "Listed", "Closed", "Released", "Buyer"], listingRows, { scrollKey: "playerbot-listings", tall: true })}</div>
       <div class="playerbot-card"><h3>PURCHASES (${num(purchases.length)})</h3>${table(["Auction", "Template", "State", "Seller", "Price", "Debited", "Closed"], purchaseRows, { scrollKey: "playerbot-purchases", tall: true })}</div>
       <div class="playerbot-card"><h3>LOADOUT</h3>${loadoutCurrent}<p class="playerbot-label">WEAPON CANDIDATES (${num(loadoutCandidates.length)}) · PROTECTED ${num(loadoutProtected.length)}</p>${table(["OID", "Template", "XP Type", "DPS", "Certified", "Protected"], loadoutCandidateRows, { scrollKey: "playerbot-loadout", tall: true })}</div>
@@ -1315,6 +1320,7 @@
     const missionCredits = progression.missionCredits || {};
     const buffPayment = progression.buffPayment || {};
     const loot = progression.loot || {};
+    const harvest = progression.harvest || {};
     const bazaar = progression.bazaar || {};
     const bazaarBuy = bazaar.buy || {};
     const bazaarBuySkipped = bazaarBuy.skipped || {};
@@ -1602,6 +1608,21 @@
             ["Vault reconcile", num((vault.reconcile || {}).recovered) + " recovered · " + num((vault.reconcile || {}).orphaned) + " orphaned · " + num((vault.reconcile || {}).lost) + " lost · destroy failures " + num(vault.reapDestroyFailed)],
             ["Item rows rejected", num(vault.progressionItemRowsRejected)]
           ])}
+          <div class="section-gap"></div>
+          ${panel("HARVEST", `${chip(harvest.configured ? "configured" : "config off", harvest.configured ? "ok" : "ghost")} ${chip(harvest.enabled ? "gate on" : "gate off", harvest.enabled ? "ok" : "ghost")}`, `<div class="metric-row">
+            ${metric("Completed", harvest.completed)}
+            ${metric("Units", harvest.units, { tone: "accent" })}
+            ${metric("Scout XP", harvest.xpGranted, { tone: "teal" })}
+            ${metric("Listings", harvest.listingsCreated)}
+            ${metric("Deposit failed", harvest.depositFailed, { tone: Number(harvest.depositFailed || 0) ? "warn" : "" })}
+            ${metric("Skipped legacy", harvest.simulationSkipped)}
+          </div>${kvRows([
+            ["Supply", Object.entries(harvest.held || {}).map(([key, value]) => `${labelize(key)} held ${num(value)}`).join(" · ") || "none"],
+            ["Listed / need", Object.entries(harvest.listed || {}).map(([key, value]) => `${labelize(key)} listed ${num(value)} / need ${num((harvest.need || {})[key])}`).join(" · ") || "none"],
+            ["Snapshot", `${num(harvest.snapshotAgeSeconds)}s old · ${num(harvest.listingLoads)} listing loads · ${num(harvest.floorIncomplete)} floor incomplete · ${num(harvest.floorAboveMax)} floor above max`],
+            ["Results", Object.entries(harvest.results || {}).map(([key, value]) => `${labelize(key)} ${num(value)}`).join(" · ") || "none"],
+            ["Recent", (harvest.lastHarvests || []).slice(-5).reverse().map((entry) => `${esc(entry.corpseTemplate || "corpse")} · ${esc(labelize(entry.family || "none"))} · ${num(entry.units)} units · ${num(entry.xp)} XP · ${ago(entry.ageSeconds)}`).join("<br>") || "none"]
+          ])}`, "span-12")}
           <div class="section-gap"></div>
           ${panel("BAZAAR", `${chip(bazaar.configured ? "configured" : "config off", bazaar.configured ? "ok" : "ghost")} ${chip(bazaar.enabled ? "gate on" : "gate off", bazaar.enabled ? "ok" : "ghost")} ${bazaar.settlementMode ? chip("settlement mode", "amber") : ""}`, `<div class="metric-row">
             ${metric("Live Listings", bazaar.listingsLive)}

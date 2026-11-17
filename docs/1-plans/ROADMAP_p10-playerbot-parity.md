@@ -1149,6 +1149,12 @@ TRIP-1 picks the version at planning time.
 
 ### 5d.3 F_0.9.20 — Scout harvesting (P.10q)
 
+- **Implementation status (2026-11-06):** the default-off implementation is in the working tree.
+  Phase 1 routes roster Scout harvesting through the stock yield seam into real vault resource
+  containers, grants Scout XP, and retires the shadow-hive harvest for gated identities. Phase 2
+  publishes held-plus-bazaar supply, caps family dispatch by real need and inbound reservations,
+  and sells threshold-ready resource stacks through the existing bazaar state machine. The six
+  scoped harness scenarios and the owner client pass remain verification gates before release.
 - **Owner scope:** the 4x4x line (creature hunting and harvesting).
   - Trapping (x4xx) and wilderness survival (xxx4) are out: both consume crafted items (traps,
     camp kits) and wait for crafting.

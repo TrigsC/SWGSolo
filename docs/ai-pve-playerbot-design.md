@@ -863,3 +863,25 @@ the regression coverage for the shared group paths.
 Only single-target damage stims are in scope. Wound/injury treatment, state
 cures, revive, and bot use of ranged or area stims remain deferred; later work
 must extend the same authority and capability seam explicitly.
+
+### P.10q — Scout harvesting (F_0.9.20)
+
+Scout harvesting is the first real non-combat XP source for the roster. It is behind
+`playerBotProgression.harvestEnabled`, and also requires the existing progression and loot gates.
+When the gate is open, a trained roster bot claims the corpse through the loot-step walk, applies
+the stock `canHarvestMe` checks, chooses one available hide/meat/bone family from the published
+real-supply need, and deposits the extracted `ResourceContainer` into its vault bag. The shared
+`CreatureHarvestYield` seam preserves the stock floor, density bands, group modifier and in-cell
+rule; the same seam supplies the stock Scout XP formula (`level × 5 + 19`) to the bot path.
+
+The supply snapshot is the sum of held vault containers and live bazaar listings, with bounded
+per-auction object loads. Its `target − (held + listed)` need drives both family selection and the
+existing hunter demand signal; active order reservations are counted as inbound before the signal
+is capped. A listed container remains in the bag while the auction owns it, so later harvest
+merges require a durable `simbot_items` row in the `held` state and never mutate a listed stack.
+Resource SELL candidates use the configured per-unit price and quality factor, then a ceil-based
+human floor for the exact resource class; unresolved floors are deferred rather than undercut.
+
+The progression dashboard and per-bot inspect view expose supply, need, refusal dispositions,
+Scout XP, family totals and a bounded recent-harvest ring. The six disabled-matrix harness
+scenarios and the owner client pass remain release verification, not production activity.

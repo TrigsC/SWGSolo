@@ -2207,6 +2207,138 @@ SimPlayerManagerConfig = {
                 {op="assertItemStats", identityRef="lootProbe"},
                 {op="deleteIdentity", identityRef="lootProbe"},
                 {op="runReaper", force=true}}},
+            -- P.10q scout harvesting parity. Default harness identities (rifle
+            -- body, no training plan, outside the governor), as the loot
+            -- scenarios use: a planned brawler auto-trains the free Novice
+            -- Scout box and cannot reliably kill the target in budget. These scenarios are inert with
+            -- the parity harness disabled and create only harness identities
+            -- and harness-owned listings; no production vault is seeded.
+            {name="harvest_gate_off", budgetMs=900000,
+                requiresGatesOff={"harvestEnabled"}, steps={
+                {op="mintIdentity", identityRef="harvestOff"},
+                {op="respawnBody", identityRef="harvestOff"},
+                {op="setLootGate", identityRef="harvestOff", lootGate=true},
+                {op="setHarvestGate", identityRef="harvestOff", gateEnabled=false},
+                {op="spawnKillTarget", identityRef="harvestOff"},
+                {op="awaitKillTargetDeath", identityRef="harvestOff", keepCorpse=true},
+                {op="harvestCorpse", identityRef="harvestOff", expect="gateOff"},
+                {op="assertHarvestResult", identityRef="harvestOff", expect="gateOff"},
+                {op="assertHarvestContainer", identityRef="harvestOff", expect="none", itemCount=0},
+                {op="assertXp", identityRef="harvestOff", xpType="scout", expect="0"},
+                {op="assertCounterDelta", counter="harvest.simulationskipped", expect="0"},
+                {op="assertCounterDelta", counter="harvest.results.gateoff", expect="1"}}},
+            {name="harvest_requires_scout", budgetMs=900000,
+                requiresGates={"harvestEnabled"}, steps={
+                {op="mintIdentity", identityRef="harvestNoScout"},
+                {op="respawnBody", identityRef="harvestNoScout"},
+                {op="setLootGate", identityRef="harvestNoScout", lootGate=true},
+                {op="setHarvestGate", identityRef="harvestNoScout", gateEnabled=true},
+                {op="spawnKillTarget", identityRef="harvestNoScout"},
+                {op="awaitKillTargetDeath", identityRef="harvestNoScout", keepCorpse=true},
+                {op="harvestCorpse", identityRef="harvestNoScout", expect="noSkill"},
+                {op="assertHarvestResult", identityRef="harvestNoScout", expect="noSkill"},
+                {op="assertHarvestContainer", identityRef="harvestNoScout", expect="none", itemCount=0}}},
+            {name="harvest_kill_and_deposit", budgetMs=900000,
+                requiresGates={"harvestEnabled"}, steps={
+                {op="mintIdentity", identityRef="harvestBot"},
+                {op="respawnBody", identityRef="harvestBot"},
+                {op="setTrainingGate", gateEnabled=true},
+                {op="trainSkill", identityRef="harvestBot", skillName="outdoors_scout_novice", freeGrant=true},
+                {op="setLootGate", identityRef="harvestBot", lootGate=true},
+                {op="setHarvestGate", identityRef="harvestBot", gateEnabled=true},
+                {op="spawnKillTarget", identityRef="harvestBot"},
+                {op="awaitKillTargetDeath", identityRef="harvestBot", keepCorpse=true},
+                {op="harvestCorpse", identityRef="harvestBot", expect="harvested"},
+                {op="assertHarvestResult", identityRef="harvestBot", expect="harvested"},
+                {op="assertHarvestContainer", identityRef="harvestBot", itemState="held", itemCount=1, matchHarvest=true},
+                {op="assertHarvestScoutXp", identityRef="harvestBot"},
+                {op="flushNow", force=true},
+                {op="assertItemRow", identityRef="harvestBot", itemState="held", itemCount=1},
+                {op="assertLedger", identityRef="harvestBot", source="harvest", kind="resource", count=1}}},
+            {name="harvest_stack_merge", budgetMs=1200000,
+                requiresGates={"harvestEnabled"}, steps={
+                {op="mintIdentity", identityRef="harvestStack"},
+                {op="respawnBody", identityRef="harvestStack"},
+                {op="setTrainingGate", gateEnabled=true},
+                {op="trainSkill", identityRef="harvestStack", skillName="outdoors_scout_novice", freeGrant=true},
+                {op="setLootGate", identityRef="harvestStack", lootGate=true},
+                {op="setHarvestGate", identityRef="harvestStack", gateEnabled=true},
+                {op="spawnKillTarget", identityRef="harvestStack"},
+                {op="awaitKillTargetDeath", identityRef="harvestStack", keepCorpse=true},
+                {op="harvestCorpse", identityRef="harvestStack", expect="harvested"},
+                {op="spawnKillTarget", identityRef="harvestStack"},
+                {op="awaitKillTargetDeath", identityRef="harvestStack", keepCorpse=true},
+                {op="harvestCorpse", identityRef="harvestStack", expect="harvested"},
+                {op="assertHarvestContainer", identityRef="harvestStack", itemCount=1, matchHarvest=true},
+                {op="assertItemRow", identityRef="harvestStack", itemState="held", itemCount=1}}},
+            -- The group-owned corpse path (stock branch, human group leader) is
+            -- not reachable from the harness: harness identities cannot join a
+            -- group and the stand-in leader is not a player creature. It is
+            -- verified in the owner's client pass instead.
+            {name="harvest_sell_threshold", budgetMs=1200000,
+                requiresGates={"harvestEnabled"}, steps={
+                {op="mintIdentity", identityRef="harvestSell"},
+                {op="respawnBody", identityRef="harvestSell"},
+                {op="setTrainingGate", gateEnabled=true},
+                {op="trainSkill", identityRef="harvestSell", skillName="outdoors_scout_novice", freeGrant=true},
+                {op="setLootGate", identityRef="harvestSell", lootGate=true},
+                {op="setHarvestGate", identityRef="harvestSell", gateEnabled=true},
+                {op="spawnKillTarget", identityRef="harvestSell"},
+                {op="awaitKillTargetDeath", identityRef="harvestSell", keepCorpse=true},
+                {op="harvestCorpse", identityRef="harvestSell", expect="harvested"},
+                {op="setBazaarSellGate", identityRef="harvestSell", bazaarSellGate=true},
+                {op="grantCredits", identityRef="harvestSell", bank=true, amount=1000},
+                {op="setHarvestSellThreshold", identityRef="harvestSell", amount=1},
+                {op="bazaarListAt", identityRef="harvestSell"},
+                {op="assertListing", identityRef="harvestSell", itemState="listed", ownerIsBag=true},
+                {op="assertHarvestContainer", identityRef="harvestSell", itemState="listed", itemCount=1, matchHarvest=true},
+                {op="spawnKillTarget", identityRef="harvestSell"},
+                {op="awaitKillTargetDeath", identityRef="harvestSell", keepCorpse=true},
+                {op="harvestCorpse", identityRef="harvestSell", expect="harvested"},
+                {op="assertHarvestContainer", identityRef="harvestSell", itemCount=2, matchHarvest=true},
+                -- Withdraw the harness listing so it never stays on the real bazaar.
+                {op="expireListing", identityRef="harvestSell"},
+                {op="runBazaarSweep", identityRef="harvestSell"}}},
+            -- Loot may fill maxListingsPerBot - resourceListingReserve slots; the
+            -- run sets maxListingsPerBot = 2 and resourceListingReserve = 1.
+            {name="bazaar_resource_listing_reserve", budgetMs=900000,
+                requiresGates={"bazaarSell"}, steps={
+                {op="mintIdentity", identityRef="bazaarReserve"},
+                {op="respawnBody", identityRef="bazaarReserve"},
+                {op="setBazaarSellGate", identityRef="bazaarReserve", bazaarSellGate=true},
+                {op="grantCredits", identityRef="bazaarReserve", bank=true, amount=1000},
+                {op="seedVaultItem", identityRef="bazaarReserve", template="object/tangible/component/weapon/acklay_bone_reinforcement_core.iff", amount=100},
+                {op="seedVaultItem", identityRef="bazaarReserve", template="object/tangible/component/weapon/acklay_bone_reinforcement_core.iff", amount=90},
+                {op="bazaarListAt", identityRef="bazaarReserve"},
+                {op="assertCounterDelta", counter="bazaar.listed", expect="1"},
+                {op="assertCounterDelta", counter="bazaar.skipped.resourceReserve", expect="1"},
+                {op="assertItemRow", identityRef="bazaarReserve", itemState="listed", itemCount=1},
+                {op="assertItemRow", identityRef="bazaarReserve", itemState="held", itemCount=1},
+                {op="expireListing", identityRef="bazaarReserve"},
+                {op="runBazaarSweep", identityRef="bazaarReserve"},
+                {op="deleteIdentity", identityRef="bazaarReserve"}}},
+            -- A nearly full bag discards loot before the harvest, so the corpse
+            -- is not wasted on a failed deposit.
+            {name="harvest_bag_room_discard", budgetMs=1200000,
+                requiresGates={"harvestEnabled"}, steps={
+                {op="mintIdentity", identityRef="bagRoom"},
+                {op="respawnBody", identityRef="bagRoom"},
+                {op="setTrainingGate", gateEnabled=true},
+                {op="trainSkill", identityRef="bagRoom", skillName="outdoors_scout_novice", freeGrant=true},
+                {op="setLootGate", identityRef="bagRoom", lootGate=true},
+                {op="setHarvestGate", identityRef="bagRoom", gateEnabled=true},
+                {op="spawnKillTarget", identityRef="bagRoom"},
+                {op="awaitKillTargetDeath", identityRef="bagRoom", keepCorpse=true},
+                {op="seedCorpseLoot", identityRef="bagRoom", lootTemplate="object/tangible/component/weapon/acklay_bone_reinforcement_core.iff"},
+                {op="seedCorpseLoot", identityRef="bagRoom", lootTemplate="object/tangible/component/weapon/acklay_bone_reinforcement_core.iff"},
+                {op="lootCorpse", identityRef="bagRoom", expect="LOOTED"},
+                {op="assertItemRow", identityRef="bagRoom", itemState="held", itemCount=2},
+                {op="setLootCap", identityRef="bagRoom", lootCap=3},
+                {op="harvestCorpse", identityRef="bagRoom", expect="harvested"},
+                {op="assertCounterDelta", counter="loot.junkDiscarded", expect="2"},
+                {op="assertItemRow", identityRef="bagRoom", itemState="held", itemCount=1},
+                {op="assertHarvestContainer", identityRef="bagRoom", itemCount=1, matchHarvest=true},
+                {op="deleteIdentity", identityRef="bagRoom"}}},
             -- P.10j bazaar SELL matrix.  The whole parity harness remains
             -- disabled by default; these entries are intentionally additive
             -- so the live-only progression settings above are untouched.
@@ -3680,8 +3812,27 @@ SimPlayerManagerConfig = {
             claimTtlSeconds = 280,
             maxClaimsPerBot = 8,
             stepTimeoutSeconds = 90,
+            -- F_0.9.20: below this many free bag slots a bot discards its least
+            -- valuable loot (never resources, purchases or kept gear) until it
+            -- has discardJunkTargetFreeSlots free. 0 disables.
+            discardJunkBelowFreeSlots = 5,
+            discardJunkTargetFreeSlots = 10,
         },
         bazaarSell = false,
+        -- F_0.9.20 P.10q: real Scout corpse harvesting is capability-gated
+        -- separately from loot. The live gate stays default-off until its
+        -- scoped receipt is accepted.
+        harvestEnabled = false,
+        harvest = {
+            sell = true,
+            sellThresholdUnits = 500,
+            pricePerUnit = { hide = 4, meat = 3, bone = 3 },
+            minQualityFactor = 0.25,
+            targetStockUnits = { hide = 50000, meat = 50000, bone = 50000 },
+            supplySnapshotSeconds = 300,
+            maxListingLoadsPerSnapshot = 64,
+            maxFloorLoadsPerVisit = 32,
+        },
         -- F_0.9.10 (P.10k): buy training-plan buyList items on the bazaar
         -- (instant buy only, at or below loot value x markup or the entry's
         -- maxPrice), keeping bazaar.buy.reserveCredits in the bank. A plan
@@ -3936,7 +4087,10 @@ SimPlayerManagerConfig = {
             markup = 3.0,
             minPrice = 50,
             maxPrice = 20000,
-            maxListingsPerBot = 10,
+            maxListingsPerBot = 25,
+            -- F_0.9.20: slots of maxListingsPerBot that only harvested resource
+            -- containers may fill, so loot cannot crowd resources off the bazaar.
+            resourceListingReserve = 10,
             listingsPerVisit = 3,
             durationHours = 168,
             cooldownSeconds = 120,
@@ -4127,7 +4281,7 @@ SimPlayerManagerConfig = {
             -- e.g. Medic 444x's science_medic_crafting_04 is paid in
             -- crafting_medicine_general. G5 removes medical from the effective
             -- list only while healingEnabled is on for that bot.
-            deferredXpTypes = {"medical", "crafting_medicine_general", "crafting_general"},
+            deferredXpTypes = {"medical", "crafting_medicine_general", "crafting_general", "scout"},
             -- F_0.9.8 mission graduation (owner decision 2026-09-22). A planned
             -- bot may take missions once it has trained box missionMinLineDepth
             -- in ONE line of a listed profession -- the 3xxx/4xxx shorthand, so
@@ -4169,7 +4323,11 @@ SimPlayerManagerConfig = {
         trainingPlans = {
             {
                 name = "brawler",
-                goalSkill = "combat_unarmed_master",
+                goalSkills = {
+                    "combat_unarmed_master",
+                    "outdoors_scout_movement_04",
+                    "outdoors_scout_harvest_04",
+                },
                 profession = "brawler",
                 weaponTemplate = "",
                 weaponType = "unarmed",

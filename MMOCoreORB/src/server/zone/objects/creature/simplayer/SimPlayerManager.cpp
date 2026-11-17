@@ -23,6 +23,7 @@
 #include "SimBotBazaar.h"
 #include "SimBotLoadout.h"
 #include "MissionDiagLog.h"
+#include "server/zone/managers/creature/CreatureHarvestYield.h"
 
 #include <algorithm>
 #include <vector>
@@ -262,6 +263,13 @@ public:
     void run() override {
         SimPlayerManager::instance()->runMarketSupplyObservationTask();
     }
+};
+
+class PlayerBotHarvestSupplyTask : public Task {
+public:
+	void run() override {
+		SimPlayerManager::instance()->runPlayerBotHarvestSupplyTask();
+	}
 };
 
 class StockpileSnapshotSimulationTask : public Task {
@@ -2435,7 +2443,8 @@ static void deriveDemandFamilySignals(
 		uint64 familyReserveCap,
 		const VectorMap<String, uint64>& familyAllocationCeilingUnits,
 		const VectorMap<String, float>& familyAllocationCeilingFractions,
-		float reservePressureFloor) {
+		float reservePressureFloor,
+		const VectorMap<String, uint64>* harvestNeedByFamily = nullptr) {
 	result.familySignals.removeAll();
 	result.reservedInboundSupply = 0;
 
@@ -2534,6 +2543,11 @@ static void deriveDemandFamilySignals(
 		signal.reserveComponent = Math::min(familyReserveCap, reserveHeadroom);
 		signal.signalUnits = addDemandFamilyUnits(
 			signal.allocComponent, signal.reserveComponent);
+		if (harvestNeedByFamily != nullptr &&
+				harvestNeedByFamily->contains(family))
+			signal.signalUnits = SimBotHarvest::capDispatchSignal(
+				signal.signalUnits, harvestNeedByFamily->get(family),
+				signal.familyInbound);
 		signal.pressure = result.shortagePressure *
 			static_cast<float>(signal.allocComponent) /
 			static_cast<float>(Math::max(static_cast<uint64>(1),
@@ -5999,6 +6013,7 @@ void SimPlayerManager::initialize() {
     scheduleMinerPathValidationSimulationTask();
     scheduleDemandProfileSimulationTask();
     scheduleMarketSupplyObservationTask();
+    schedulePlayerBotHarvestSupplyTask();
     scheduleStockpileSnapshotSimulationTask();
     scheduleAiEconomyPersistenceTask();
     scheduleHiveReservationSelfTestTask();
@@ -6278,6 +6293,7 @@ void SimPlayerManager::loadLuaConfig() {
 	progressionBazaarMinPrice = 50;
 	progressionBazaarMaxPrice = 20000;
 	progressionBazaarMaxListingsPerBot = 10;
+	progressionBazaarResourceListingReserve = 0;
 	progressionBazaarListingsPerVisit = 3;
 	progressionBazaarDurationHours = 168;
 	progressionBazaarCooldownSeconds = 120;
@@ -6458,6 +6474,10 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityLastBazaarAuctionOid = 0;
 		playerBotParityLastBazaarItemOid = 0;
 		playerBotParityBazaarSellerBankBaselines.removeAll();
+		playerBotParityTestHarvestGateOverrideActive = false;
+		playerBotParityTestHarvestGateOverride = false;
+		playerBotParityHarvestGateScopedIds.removeAll();
+		playerBotParityHarvestGateValues.removeAll();
 		playerBotParityTestBazaarSellGateOverrideActive = false;
 		playerBotParityBazaarSellGateScopedIds.removeAll();
 		playerBotParityTestBazaarBuyGateOverrideActive = false;
@@ -8248,13 +8268,17 @@ bool SimPlayerManager::computePlayerBotNextTrainingStepLocked(uint64 identityId,
 	SkillManager* skillManager = SkillManager::instance();
 	if (skillManager == nullptr)
 		return false;
+	// Mirrors effectiveDeferredXpTypes() from the raw flags: this runs under
+	// progressionMutex, and the gate helpers take playerBotParityTestMutex.
 	Vector<String> effectiveDeferred = progressionEarlyGameConfig.deferredXpTypes;
-	if (progressionEnabled && progressionHealingEnabled &&
-			progressionHealingPolicy.botHeals) {
-		for (int i = effectiveDeferred.size() - 1; i >= 0; --i) {
-			if (effectiveDeferred.get(i) == "medical")
-				effectiveDeferred.remove(i);
-		}
+	const bool healingUndefers = progressionEnabled &&
+		progressionHealingEnabled && progressionHealingPolicy.botHeals;
+	const bool harvestUndefers = progressionEnabled &&
+		progressionHarvestEnabled && progressionLootEnabled;
+	for (int i = effectiveDeferred.size() - 1; i >= 0; --i) {
+		if ((healingUndefers && effectiveDeferred.get(i) == "medical") ||
+				(harvestUndefers && effectiveDeferred.get(i) == "scout"))
+			effectiveDeferred.remove(i);
 	}
 
 	// The lifetime-earned threshold for one box: its own cost plus every
@@ -9454,6 +9478,18 @@ bool SimPlayerManager::snapshotPlayerBotConsumableStacks(uint64 identityId,
 
 bool SimPlayerManager::removePlayerBotConsumedItem(uint64 identityId,
 		uint64 objectId) {
+	if (!destroyPlayerBotHeldItem(identityId, objectId, "consume"))
+		return false;
+	progressionConsumablesLastDoseRemovals.increment();
+	MissionDiagLog::event("CONSUME", identityId,
+			"object=" + String::valueOf(objectId) + " lastDose=1");
+	return true;
+}
+
+// Destroys one HELD bag item and retires its row with a ledger entry.  Item
+// then bag lock, with no progression mutex held while either is locked.
+bool SimPlayerManager::destroyPlayerBotHeldItem(uint64 identityId,
+		uint64 objectId, const String& reason) {
 	if (identityId == 0 || objectId == 0)
 		return false;
 	AiEconomyManager* economyManager = AiEconomyManager::instance();
@@ -9499,14 +9535,130 @@ bool SimPlayerManager::removePlayerBotConsumedItem(uint64 identityId,
 		held = held > 0 ? held - 1 : 0;
 		progressionItemHeldCounts.put(identityId, held);
 		appendPlayerBotLedgerEntryKindLocked(identityId, "item", -1, held,
-				"consume", objectId, displayName);
+				reason, objectId, displayName);
 		markProgressionDirtyLocked(identityId);
 		markPlayerBotLoadoutDirtyLocked(identityId);
-		progressionConsumablesLastDoseRemovals.increment();
 	}
-	MissionDiagLog::event("CONSUME", identityId,
-			"object=" + String::valueOf(objectId) + " lastDose=1");
 	return true;
+}
+
+bool SimPlayerManager::isPlayerBotResourceListingLocked(uint64 objectId) {
+	return progressionItems.contains(objectId) &&
+		progressionItems.get(objectId).source == "harvest";
+}
+
+// A bot with a nearly full bag discards loot before it opens another corpse:
+// stock harvest consumes the corpse even when the deposit fails.  Only loot is
+// discarded, never a harvested resource, a purchase, a kept loadout item, a
+// training-plan buy-list item or anything with a live listing; unsellable loot
+// goes first, then the lowest junk value.
+void SimPlayerManager::makePlayerBotBagRoom(uint64 identityId) {
+	const int belowFree = progressionLootDiscardJunkBelowFreeSlots;
+	const int targetFree = Math::max(belowFree,
+		progressionLootDiscardJunkTargetFreeSlots);
+	if (identityId == 0 || belowFree <= 0)
+		return;
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+		economyManager->getItemBag(identityId);
+	if (bag == nullptr || zoneServer == nullptr)
+		return;
+	int freeSlots = 0;
+	{
+		Locker bagLock(bag);
+		freeSlots = static_cast<int>(bag->getContainerVolumeLimit()) -
+			bag->getCountableObjectsRecursive();
+	}
+
+	String trainingPlanName;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveIdentities.contains(identityId))
+			trainingPlanName = pveIdentities.get(identityId).trainingPlan;
+	}
+	VectorMap<uint64, bool> protectedIds;
+	collectPlayerBotProtectedWeaponOids(identityId, protectedIds);
+	collectPlayerBotProtectedArmorOids(identityId, protectedIds);
+	collectPlayerBotProtectedConsumableOids(identityId, protectedIds);
+
+	Vector<uint64> lootIds;
+	{
+		Locker progressionLock(&progressionMutex);
+		const uint64 held = progressionItemHeldCounts.contains(identityId) ?
+			progressionItemHeldCounts.get(identityId) : 0;
+		const int capFree = progressionLootMaxItemsPerBot -
+			static_cast<int>(std::min<uint64>(held, 100000));
+		freeSlots = Math::min(freeSlots, capFree);
+		if (freeSlots >= belowFree)
+			return;
+		VectorMap<uint32, bool> buyListCrcs;
+		if (progressionTrainingPlans.contains(trainingPlanName)) {
+			const Vector<SimBotTrainingPlan::BuyListEntry>& buyList =
+				progressionTrainingPlans.get(trainingPlanName).buyList;
+			for (int i = 0; i < buyList.size(); ++i)
+				buyListCrcs.put(buyList.get(i).templateCrc, true);
+		}
+		for (int i = 0; i < progressionItems.size(); ++i) {
+			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+			if (row.identityId != identityId || row.state != SIMBOT_ITEM_HELD ||
+					row.source != "loot" || protectedIds.contains(row.objectId) ||
+					buyListCrcs.contains(row.templateCrc))
+				continue;
+			if (progressionBazaarListings.contains(row.objectId)) {
+				const int state = progressionBazaarListings.get(row.objectId).state;
+				if (state == SimBotBazaar::PENDING || state == SimBotBazaar::LISTED)
+					continue;
+			}
+			lootIds.add(row.objectId);
+		}
+	}
+
+	struct Discard {
+		uint64 objectId;
+		bool sellable;
+		int junkValue;
+	};
+	std::vector<Discard> discards;
+	for (int i = 0; i < lootIds.size(); ++i) {
+		ManagedReference<SceneObject*> object = zoneServer->getObject(lootIds.get(i));
+		TangibleObject* tangible = object == nullptr ? nullptr :
+			cast<TangibleObject*>(object.get());
+		if (tangible == nullptr)
+			continue;
+		Locker objectLock(object);
+		if (object->getParent().get() != bag.get())
+			continue;
+		Discard discard;
+		discard.objectId = lootIds.get(i);
+		discard.junkValue = tangible->getJunkValue();
+		discard.sellable = SimBotBazaar::isSellable(discard.junkValue,
+			tangible->getJunkDealerNeeded(), tangible->isNoTrade() ||
+			tangible->containsNoTradeObjectRecursive(), true);
+		discards.push_back(discard);
+	}
+	std::sort(discards.begin(), discards.end(),
+		[](const Discard& left, const Discard& right) {
+			if (left.sellable != right.sellable)
+				return !left.sellable;
+			if (left.junkValue != right.junkValue)
+				return left.junkValue < right.junkValue;
+			return left.objectId < right.objectId;
+		});
+	int discarded = 0;
+	for (size_t i = 0; i < discards.size() && freeSlots < targetFree; ++i) {
+		if (!destroyPlayerBotHeldItem(identityId, discards[i].objectId,
+				"discard"))
+			continue;
+		++freeSlots;
+		++discarded;
+		lootJunkDiscarded.increment();
+	}
+	if (discarded > 0)
+		MissionDiagLog::event("BAG_ROOM", identityId,
+			"discarded=" + String::valueOf(discarded) +
+			" free=" + String::valueOf(freeSlots) +
+			" target=" + String::valueOf(targetFree));
 }
 
 PlayerBotFoodResult SimPlayerManager::consumePlayerBotFoodBeforeEngage(
@@ -10264,10 +10416,11 @@ Vector<String> SimPlayerManager::effectiveDeferredXpTypes(uint64 identityId) {
 		Locker progressionLock(&progressionMutex);
 		deferred = progressionEarlyGameConfig.deferredXpTypes;
 	}
-	if (!playerBotBotHealsGateEnabled(identityId))
-		return deferred;
+	const bool healingGate = playerBotBotHealsGateEnabled(identityId);
+	const bool harvestGate = playerBotHarvestGateEnabled(identityId);
 	for (int i = deferred.size() - 1; i >= 0; --i) {
-		if (deferred.get(i) == "medical")
+		if ((healingGate && deferred.get(i) == "medical") ||
+				(harvestGate && deferred.get(i) == "scout"))
 			deferred.remove(i);
 	}
 	return deferred;
@@ -11796,8 +11949,76 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		progressionLootStepTimeoutSeconds = clampIntRange(
 			loot.getIntField("stepTimeoutSeconds",
 				progressionLootStepTimeoutSeconds), 0, 86400);
+		progressionLootDiscardJunkBelowFreeSlots = clampIntRange(
+			loot.getIntField("discardJunkBelowFreeSlots",
+				progressionLootDiscardJunkBelowFreeSlots), 0, 1000);
+		progressionLootDiscardJunkTargetFreeSlots = clampIntRange(
+			loot.getIntField("discardJunkTargetFreeSlots",
+				progressionLootDiscardJunkTargetFreeSlots),
+			progressionLootDiscardJunkBelowFreeSlots, 1000);
 	}
 	loot.pop();
+	progressionHarvestEnabled = config.getBooleanField("harvestEnabled",
+		progressionHarvestEnabled);
+	PlayerBotHarvestPolicy harvestPolicy = progressionHarvestPolicy;
+	LuaObject harvest = config.getObjectField("harvest");
+	if (harvest.isValidTable()) {
+		harvestPolicy.sell = harvest.getBooleanField("sell",
+			harvestPolicy.sell);
+		harvestPolicy.sellThresholdUnits = static_cast<uint64>(clampIntRange(
+			harvest.getIntField("sellThresholdUnits",
+				static_cast<int>(Math::min<uint64>(harvestPolicy.sellThresholdUnits,
+					2147483647))), 0, 1000000000));
+		LuaObject pricePerUnit = harvest.getObjectField("pricePerUnit");
+		if (pricePerUnit.isValidTable()) {
+			harvestPolicy.pricePerUnit[SimBotHarvest::HIDE] = static_cast<uint64>(
+			clampIntRange(pricePerUnit.getIntField("hide",
+				static_cast<int>(harvestPolicy.pricePerUnit[SimBotHarvest::HIDE])),
+				0, 1000000000));
+			harvestPolicy.pricePerUnit[SimBotHarvest::MEAT] = static_cast<uint64>(
+			clampIntRange(pricePerUnit.getIntField("meat",
+				static_cast<int>(harvestPolicy.pricePerUnit[SimBotHarvest::MEAT])),
+				0, 1000000000));
+			harvestPolicy.pricePerUnit[SimBotHarvest::BONE] = static_cast<uint64>(
+			clampIntRange(pricePerUnit.getIntField("bone",
+				static_cast<int>(harvestPolicy.pricePerUnit[SimBotHarvest::BONE])),
+				0, 1000000000));
+		}
+		pricePerUnit.pop();
+		harvestPolicy.minQualityFactor = clampFloatRange(
+			harvest.getFloatField("minQualityFactor",
+				harvestPolicy.minQualityFactor), 0.f, 1.f);
+		LuaObject targetStock = harvest.getObjectField("targetStockUnits");
+		if (targetStock.isValidTable()) {
+			harvestPolicy.targetStockUnits[SimBotHarvest::HIDE] = static_cast<uint64>(
+				clampIntRange(targetStock.getIntField("hide",
+					static_cast<int>(Math::min<uint64>(harvestPolicy.targetStockUnits[
+						SimBotHarvest::HIDE], 2147483647))), 0, 1000000000));
+			harvestPolicy.targetStockUnits[SimBotHarvest::MEAT] = static_cast<uint64>(
+				clampIntRange(targetStock.getIntField("meat",
+					static_cast<int>(Math::min<uint64>(harvestPolicy.targetStockUnits[
+						SimBotHarvest::MEAT], 2147483647))), 0, 1000000000));
+			harvestPolicy.targetStockUnits[SimBotHarvest::BONE] = static_cast<uint64>(
+				clampIntRange(targetStock.getIntField("bone",
+					static_cast<int>(Math::min<uint64>(harvestPolicy.targetStockUnits[
+						SimBotHarvest::BONE], 2147483647))), 0, 1000000000));
+		}
+		targetStock.pop();
+		harvestPolicy.supplySnapshotSeconds = clampIntRange(
+			harvest.getIntField("supplySnapshotSeconds",
+				harvestPolicy.supplySnapshotSeconds), 1, 86400);
+		harvestPolicy.maxListingLoadsPerSnapshot = clampIntRange(
+			harvest.getIntField("maxListingLoadsPerSnapshot",
+				harvestPolicy.maxListingLoadsPerSnapshot), 0, 10000);
+		harvestPolicy.maxFloorLoadsPerVisit = clampIntRange(
+			harvest.getIntField("maxFloorLoadsPerVisit",
+			harvestPolicy.maxFloorLoadsPerVisit), 0, 10000);
+	}
+	harvest.pop();
+	{
+		Locker harvestLock(&progressionHarvestMutex);
+		progressionHarvestPolicy = harvestPolicy;
+	}
 	progressionBazaarSellEnabled = config.getBooleanField("bazaarSell",
 		false);
 	progressionBazaarBuyEnabled = config.getBooleanField("bazaarBuy",
@@ -11824,6 +12045,10 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		progressionBazaarMaxListingsPerBot = clampIntRange(
 			bazaar.getIntField("maxListingsPerBot", progressionBazaarMaxListingsPerBot),
 			1, AuctionManager::MAXSALES);
+		progressionBazaarResourceListingReserve = clampIntRange(
+			bazaar.getIntField("resourceListingReserve",
+				progressionBazaarResourceListingReserve),
+			0, progressionBazaarMaxListingsPerBot);
 		progressionBazaarListingsPerVisit = clampIntRange(
 			bazaar.getIntField("maxListingsPerVisit",
 				bazaar.getIntField("listingsPerVisit", progressionBazaarListingsPerVisit)),
@@ -13223,6 +13448,17 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.supersededBy = table.getStringField("supersededBy").trim();
 	step.targetState = table.getStringField("targetState").trim().toLowerCase();
 	step.corpseOid = table.getLongField("corpseOid", 0);
+	step.harvestFamily = table.getStringField("harvestFamily").trim().toLowerCase();
+	step.harvestResourceType = table.getStringField("harvestResourceType").trim();
+	step.matchHarvestRecords = table.getBooleanField("matchHarvest", false);
+	step.expectedHarvestUnits = table.getIntField("harvestUnits", absentExpected);
+	step.hasExpectedHarvestUnits = step.expectedHarvestUnits != absentExpected;
+	if (!step.hasExpectedHarvestUnits)
+		step.expectedHarvestUnits = -1;
+	step.expectedHarvestXp = table.getIntField("harvestXp", absentExpected);
+	step.hasExpectedHarvestXp = step.expectedHarvestXp != absentExpected;
+	if (!step.hasExpectedHarvestXp)
+		step.expectedHarvestXp = -1;
 	step.lootTemplate = table.getStringField("lootTemplate").trim();
 	step.itemState = table.getStringField("itemState").trim().toLowerCase();
 	if (step.itemState.isEmpty())
@@ -13320,6 +13556,7 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.source = table.getStringField("source").trim();
 	if (step.source.isEmpty())
 		step.source = "harness";
+	step.ledgerKind = table.getStringField("kind").trim().toLowerCase();
 	step.bank = table.getBooleanField("bank", false);
 	step.freeGrant = table.getBooleanField("freeGrant", false);
 	step.expectReject = table.getBooleanField("expectReject", false);
@@ -15916,6 +16153,13 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 	const bool buyGate = playerBotBazaarBuyGateEnabled(identityId);
 	if (!sellGate && !buyGate)
 		return false;
+	const bool harvestSellGate = sellGate &&
+		playerBotHarvestGateEnabled(identityId);
+	PlayerBotHarvestPolicy harvestPolicy;
+	if (harvestSellGate) {
+		Locker harvestLock(&progressionHarvestMutex);
+		harvestPolicy = progressionHarvestPolicy;
+	}
 	const bool weaponUpgradeGate = buyGate &&
 		playerBotBazaarUpgradesGateEnabled(identityId) &&
 		playerBotLoadoutGateEnabled(identityId);
@@ -15950,6 +16194,8 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 	const uint64 nowMs = System::getMiliTime();
 	Vector<uint64> candidateObjectIds;
 	VectorMap<uint64, bool> neededObjectIds;
+	int liveListings = 0;
+	int liveJunkListings = 0;
 	String trainingPlanName;
 	{
 		Locker pveLock(&pveMutex);
@@ -16197,14 +16443,16 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 						rowIndex < entry.quantity; ++rowIndex)
 					neededObjectIds.put(matching[rowIndex].second, true);
 		}
-		int liveListings = 0;
 		for (int i = 0; i < progressionBazaarListings.size(); ++i) {
 			const PlayerBotBazaarListing& listing =
 				progressionBazaarListings.elementAt(i).getValue();
 			if (listing.identityId == identityId &&
 					(listing.state == SimBotBazaar::PENDING ||
-					listing.state == SimBotBazaar::LISTED))
+					listing.state == SimBotBazaar::LISTED)) {
 				++liveListings;
+				if (!isPlayerBotResourceListingLocked(listing.objectId))
+					++liveJunkListings;
+			}
 		}
 		if (liveListings >= progressionBazaarMaxListingsPerBot ||
 				!progressionRecords.contains(identityId))
@@ -16249,7 +16497,26 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 		if (tangible == nullptr)
 			continue;
 		Locker objectLock(object);
-		if (SimBotBazaar::isSellable(tangible->getJunkValue(),
+		if (harvestSellGate && harvestPolicy.sell && liveListings <
+				progressionBazaarMaxListingsPerBot) {
+			ResourceContainer* resource = cast<ResourceContainer*>(object);
+			if (resource != nullptr) {
+				const int units = resource->getQuantity();
+				const String resourceType = resource->getSpawnType();
+				const SimBotHarvest::Family family =
+					SimBotHarvest::familyFromResourceType(
+						resourceType.toCharArray());
+				if (family != SimBotHarvest::NONE &&
+						SimBotHarvest::shouldSellStack(units < 0 ? 0 :
+							static_cast<uint64>(units),
+							harvestPolicy.sellThresholdUnits,
+							progressionBazaarMaxListingsPerBot - liveListings))
+					return true;
+			}
+		}
+		if (liveJunkListings < progressionBazaarMaxListingsPerBot -
+				progressionBazaarResourceListingReserve &&
+				SimBotBazaar::isSellable(tangible->getJunkValue(),
 				tangible->getJunkDealerNeeded(), tangible->isNoTrade() ||
 				tangible->containsNoTradeObjectRecursive(), true))
 			return true;
@@ -16466,8 +16733,13 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 		int junkValue = 0;
 		int junkMask = 0;
 		bool noTrade = false;
+		bool resource = false;
+		uint64 units = 0;
+		float qualityFactor = 0.f;
+		SimBotHarvest::Family family = SimBotHarvest::NONE;
 		int askPrice = 0;
 		String key;
+		String resourceType;
 	};
 
 	Vector<ManagedReference<SceneObject*> > children;
@@ -16487,6 +16759,18 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 	std::vector<Candidate> candidates;
 	VectorMap<uint64, int> heldAsks;
 	VectorMap<uint64, bool> neededObjectIds;
+	PlayerBotHarvestPolicy harvestPolicy;
+	{
+		Locker harvestLock(&progressionHarvestMutex);
+		harvestPolicy = progressionHarvestPolicy;
+	}
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (playerBotParityHarvestSellThresholdOverrides.contains(identityId))
+			harvestPolicy.sellThresholdUnits =
+				playerBotParityHarvestSellThresholdOverrides.get(identityId);
+	}
+	const bool harvestGateOpen = playerBotHarvestGateEnabled(identityId);
 	String trainingPlanName;
 	{
 		Locker pveLock(&pveMutex);
@@ -16568,20 +16852,58 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 		Candidate candidate;
 		candidate.objectId = object->getObjectID();
 		candidate.askPrice = heldAsks.get(candidate.objectId);
+		ResourceContainer* resource = cast<ResourceContainer*>(object);
+		ManagedReference<ResourceSpawn*> resourceSpawn;
 		{
+			Locker objectLock(object);
+			if (resource != nullptr && harvestGateOpen) {
+				candidate.resource = true;
+				candidate.units = resource->getQuantity();
+				candidate.resourceType = resource->getSpawnType();
+				candidate.family = SimBotHarvest::familyFromResourceType(
+					candidate.resourceType.toCharArray());
+				resourceSpawn = resource->getSpawnObject();
+			}
+		}
+		if (candidate.resource) {
+			if (resourceSpawn != nullptr) {
+				Locker spawnLock(resourceSpawn);
+				int attributes[10] = {
+					getResourceAttribute(resourceSpawn, "res_quality"),
+					getResourceAttribute(resourceSpawn, "res_conductivity"),
+					getResourceAttribute(resourceSpawn, "res_decay_resist"),
+					getResourceAttribute(resourceSpawn, "res_heat_resist"),
+					getResourceAttribute(resourceSpawn, "res_flavor"),
+					getResourceAttribute(resourceSpawn, "res_malleability"),
+					getResourceAttribute(resourceSpawn, "res_potential_energy"),
+					getResourceAttribute(resourceSpawn, "res_shock_resistance"),
+					getResourceAttribute(resourceSpawn, "res_toughness"),
+					getResourceAttribute(resourceSpawn, "res_cold_resist")};
+				candidate.qualityFactor =
+					SimBotHarvest::resourceQualityFactor(attributes, 10,
+						harvestPolicy.minQualityFactor);
+			}
+			candidate.noTrade = false;
+			candidate.junkValue = 0;
+			candidate.junkMask = 0;
+		} else {
 			Locker objectLock(object);
 			candidate.junkValue = tangible->getJunkValue();
 			candidate.junkMask = tangible->getJunkDealerNeeded();
 			candidate.noTrade = tangible->isNoTrade() ||
 				tangible->containsNoTradeObjectRecursive();
 			candidate.key = String::valueOf(
-				tangible->getClientGameObjectType()) + "|" +
+					tangible->getClientGameObjectType()) + "|" +
 				auctionManager->removeColorCodes(tangible->getDisplayedName());
 		}
 		candidates.push_back(candidate);
 	}
+	// Resource containers first: the per-visit listing budget must not be spent
+	// on loot while a stack waits.
 	std::sort(candidates.begin(), candidates.end(),
 		[](const Candidate& left, const Candidate& right) {
+			if (left.resource != right.resource)
+				return left.resource;
 			return left.junkValue > right.junkValue;
 		});
 
@@ -16589,7 +16911,19 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 	VectorMap<uint64, uint64> bagMap = economyManager->getItemBagMapSnapshot();
 	for (int i = 0; i < bagMap.size(); ++i)
 		bagOids.put(bagMap.elementAt(i).getValue(), true);
+	struct HumanResourceListing {
+		uint64 auctionOid = 0;
+		uint64 objectOid = 0;
+		SimBotHarvest::Family family = SimBotHarvest::NONE;
+		int price = 0;
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
 	VectorMap<String, int> humanFloors;
+	VectorMap<String, SimBotHarvest::HumanFloor> resourceFloors;
+	Vector<HumanResourceListing> resourceListings;
+	bool resourceFloorIncomplete[SimBotHarvest::FAMILY_COUNT] = {};
+	int floorLoads = 0;
 	String planet = terminal->getZone() == nullptr ? String() :
 		terminal->getZone()->getZoneName();
 	TerminalListVector terminalLists = auctionManager->getAuctionMap()->
@@ -16612,10 +16946,84 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 			int floor = humanFloors.contains(key) ? humanFloors.get(key) : 0;
 			if (floor == 0 || item->getPrice() < floor)
 				humanFloors.put(key, item->getPrice());
+
+			SimBotHarvest::Family resourceFamily =
+				SimBotHarvest::familyFromGameObjectType(item->getItemType());
+			if (resourceFamily != SimBotHarvest::NONE && harvestGateOpen) {
+				HumanResourceListing listing;
+				listing.auctionOid = item->getObjectID();
+				listing.objectOid = item->getAuctionedItemObjectID();
+				listing.family = resourceFamily;
+				listing.price = item->getPrice();
+				resourceListings.add(listing);
+			}
 		}
 	}
+	for (int i = 0; i < resourceListings.size(); ++i) {
+		const HumanResourceListing& listing = resourceListings.get(i);
+		PlayerBotResourceListingCacheEntry cached;
+		bool haveCache = false;
+		{
+			Locker harvestLock(&progressionHarvestMutex);
+			if (progressionHarvestListingCache.contains(listing.auctionOid)) {
+				cached = progressionHarvestListingCache.get(listing.auctionOid);
+				haveCache = cached.valid;
+			}
+		}
+		if (!haveCache && floorLoads < harvestPolicy.maxFloorLoadsPerVisit) {
+			++floorLoads;
+			cached = PlayerBotResourceListingCacheEntry();
+			cached.auctionOid = listing.auctionOid;
+			cached.observedAtMs = System::getMiliTime();
+			ManagedReference<SceneObject*> object = zoneServer->getObject(
+				listing.objectOid);
+			ResourceContainer* resource = object == nullptr ? nullptr :
+				cast<ResourceContainer*>(object.get());
+			if (resource != nullptr) {
+				int units = 0;
+				String type;
+				{
+					Locker resourceLock(resource);
+					units = resource->getQuantity();
+					type = resource->getSpawnType();
+				}
+				cached.resourceType = type;
+				cached.family = SimBotHarvest::familyFromResourceType(
+					type.toCharArray());
+				cached.units = units > 0 ? static_cast<uint64>(units) : 0;
+				cached.valid = cached.family != SimBotHarvest::NONE &&
+					cached.units > 0;
+			}
+			{
+				Locker harvestLock(&progressionHarvestMutex);
+				progressionHarvestListingCache.put(listing.auctionOid, cached);
+			}
+			if (!cached.valid) {
+				resourceFloorIncomplete[static_cast<int>(listing.family)] = true;
+				continue;
+			}
+		} else if (!haveCache) {
+			resourceFloorIncomplete[static_cast<int>(listing.family)] = true;
+			continue;
+		}
+		if (!cached.valid || cached.family != listing.family ||
+				cached.resourceType.isEmpty())
+			continue;
+		String resourceKey = cached.resourceType.toLowerCase().trim();
+		if (resourceKey.isEmpty())
+			continue;
+		SimBotHarvest::HumanFloor candidateFloor;
+		candidateFloor.price = listing.price;
+		candidateFloor.units = cached.units;
+		if (!resourceFloors.contains(resourceKey) ||
+				candidateFloor.price * resourceFloors.get(resourceKey).units <
+				resourceFloors.get(resourceKey).price * candidateFloor.units)
+			resourceFloors.put(resourceKey, candidateFloor);
+	}
+	harvestListingLoads.add(floorLoads);
 
 	int liveCount = 0;
+	int liveJunkCount = 0;
 	{
 		Locker progressionLock(&progressionMutex);
 		for (int i = 0; i < progressionBazaarListings.size(); ++i) {
@@ -16623,15 +17031,73 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 				progressionBazaarListings.elementAt(i).getValue();
 			if (listing.identityId == identityId &&
 					(listing.state == SimBotBazaar::PENDING ||
-					listing.state == SimBotBazaar::LISTED))
+					listing.state == SimBotBazaar::LISTED)) {
 				++liveCount;
+				if (!isPlayerBotResourceListingLocked(listing.objectId))
+					++liveJunkCount;
+			}
 		}
 	}
+	const int junkListingCap = progressionBazaarMaxListingsPerBot -
+		progressionBazaarResourceListingReserve;
 
 	int attempts = 0;
 	for (size_t i = 0; i < candidates.size() &&
 			attempts < progressionBazaarMaxListingsPerVisit; ++i) {
 		Candidate& candidate = candidates[i];
+		if (candidate.resource) {
+			if (!harvestPolicy.sell || candidate.family == SimBotHarvest::NONE ||
+					!SimBotHarvest::shouldSellStack(candidate.units,
+						harvestPolicy.sellThresholdUnits,
+						progressionBazaarMaxListingsPerBot - liveCount))
+				continue;
+			if (resourceFloorIncomplete[static_cast<int>(candidate.family)]) {
+				harvestFloorIncomplete.increment();
+				MissionDiagLog::event("BAZAAR_LIST", identityId,
+					"item=" + String::valueOf(candidate.objectId) +
+					" price=0 base=0 floor=0 result=skip_floor_incomplete");
+				continue;
+			}
+			SimBotHarvest::HumanFloor floor;
+			String resourceKey = candidate.resourceType.toLowerCase().trim();
+			if (!resourceFloors.contains(resourceKey))
+				floor = SimBotHarvest::HumanFloor();
+			else
+				floor = resourceFloors.get(resourceKey);
+			SimBotHarvest::PriceDecision price =
+				SimBotHarvest::priceResourceListing(candidate.units,
+					harvestPolicy.pricePerUnit[static_cast<int>(candidate.family)],
+					candidate.qualityFactor, floor,
+					static_cast<uint64>(Math::max(0, progressionBazaarMinPrice)),
+					static_cast<uint64>(Math::max(0, progressionBazaarMaxPrice)));
+			if (price.skipFloorAboveMax) {
+				harvestFloorAboveMax.increment();
+				MissionDiagLog::event("BAZAAR_LIST", identityId,
+					"item=" + String::valueOf(candidate.objectId) +
+					" price=0 base=" + String::valueOf(price.base) +
+					" floor=" + String::valueOf(price.floor) +
+					" result=skip_floor_above_max");
+				continue;
+			}
+			if (price.price == 0)
+				continue;
+			bool listed = listPlayerBotItemAtBazaar(identityId,
+				candidate.objectId, terminal, static_cast<int>(price.price));
+			MissionDiagLog::event("BAZAAR_LIST", identityId,
+				"item=" + String::valueOf(candidate.objectId) +
+				" price=" + String::valueOf(price.price) +
+				" base=" + String::valueOf(price.base) +
+				" floor=" + String::valueOf(price.floor) +
+				" result=" + (listed ? String("listed") : String("failed")));
+			if (listed) {
+				++liveCount;
+				++attempts;
+				harvestListingsCreated.increment();
+			} else {
+				bazaarSkippedTransferFailed.increment();
+			}
+			continue;
+		}
 		if ((candidate.junkMask & SimBotBazaar::JUNKGENERIC) != 0) {
 			bazaarSkippedJunk.increment();
 			MissionDiagLog::event("BAZAAR_LIST", identityId,
@@ -16658,6 +17124,13 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 			MissionDiagLog::event("BAZAAR_LIST", identityId,
 				"item=" + String::valueOf(candidate.objectId) +
 				" price=0 base=0 floor=0 result=skip_cap");
+			continue;
+		}
+		if (liveJunkCount >= junkListingCap) {
+			bazaarSkippedResourceReserve.increment();
+			MissionDiagLog::event("BAZAAR_LIST", identityId,
+				"item=" + String::valueOf(candidate.objectId) +
+				" price=0 base=0 floor=0 result=skip_resource_reserve");
 			continue;
 		}
 		int floor = humanFloors.contains(candidate.key) ?
@@ -16703,6 +17176,7 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 			" result=" + (listed ? String("listed") : String("failed")));
 		if (listed) {
 			++liveCount;
+			++liveJunkCount;
 			++attempts;
 		} else {
 			Locker progressionLock(&progressionMutex);
@@ -20496,6 +20970,44 @@ bool SimPlayerManager::playerBotLootGateEnabled(uint64 identityId) {
 		economyManager->isItemVaultAvailable();
 }
 
+bool SimPlayerManager::playerBotHarvestGateEnabled(uint64 identityId) {
+	// Capability gates on the P.10 line all use this ordering: master first,
+	// the identity-scoped harness override second, and the configured flag last.
+	// Harvest also depends on loot because the corpse claim/walk machinery is
+	// the shared entry point for both capabilities.
+	if (!progressionEnabled)
+		return false;
+
+	bool enabled = progressionHarvestEnabled;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (identityId != 0 && playerBotParityTestHarvestGateOverrideActive &&
+				playerBotParityHarvestGateScopedIds.contains(identityId)) {
+			enabled = playerBotParityHarvestGateValues.contains(identityId) ?
+				playerBotParityHarvestGateValues.get(identityId) :
+				playerBotParityTestHarvestGateOverride;
+		} else if (identityId == 0 &&
+				playerBotParityTestHarvestGateOverrideActive) {
+			enabled = playerBotParityTestHarvestGateOverride;
+		}
+	}
+
+	return enabled && playerBotLootGateEnabled(identityId);
+}
+
+bool SimPlayerManager::playerBotHarvestClaimEligible(uint64 identityId) {
+	if (!playerBotHarvestGateEnabled(identityId))
+		return false;
+
+	// The progression store is the cheap, locked pre-filter.  The body's live
+	// canHarvestMe check remains the authority once the corpse is reached; no
+	// body skill list is ever read unlocked from the destruction hook.
+	Locker progressionLock(&progressionMutex);
+	return progressionRecords.contains(identityId) &&
+		progressionRecords.get(identityId).skills.contains(
+			"outdoors_scout_novice");
+}
+
 bool SimPlayerManager::playerBotMissionCreditGateEnabled(uint64 identityId) {
 	if (!progressionEnabled)
 		return false;
@@ -20614,6 +21126,8 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 			armingOp = "setCombatAbilitiesGate";
 		else if (gate == "lootEnabled")
 			armingOp = "setLootGate";
+		else if (gate == "harvestEnabled")
+			armingOp = "setHarvestGate";
 		else if (gate == "bazaarSell")
 			armingOp = "setBazaarSellGate";
 		else if (gate == "bazaarBuy")
@@ -20667,6 +21181,8 @@ bool SimPlayerManager::playerBotParityScenarioPreconditionsMet(
 			live = playerBotCombatAbilitiesGateArmed();
 		else if (gate == "lootEnabled")
 			live = playerBotLootGateEnabled(0);
+		else if (gate == "harvestEnabled")
+			live = playerBotHarvestGateEnabled(0);
 		else if (gate == "bazaarSell")
 			live = playerBotBazaarSellGateEnabled(0);
 		else if (gate == "bazaarBuy")
@@ -21395,7 +21911,8 @@ uint64 SimPlayerManager::resolvePlayerBotLootOwner(uint64 bodyOid) {
 }
 
 bool SimPlayerManager::queuePlayerBotLootClaim(uint64 identityId,
-		uint64 corpseOid, const String& zoneName, const Vector3& position) {
+		uint64 corpseOid, const String& zoneName, const Vector3& position,
+		bool loot, bool harvest) {
 	if (identityId == 0 || corpseOid == 0 || zoneName.isEmpty() ||
 			progressionLootMaxClaimsPerBot <= 0)
 		return false;
@@ -21406,6 +21923,8 @@ bool SimPlayerManager::queuePlayerBotLootClaim(uint64 identityId,
 	PlayerBotLootClaim claim;
 	claim.identityId = identityId;
 	claim.corpseOid = corpseOid;
+	claim.loot = loot;
+	claim.harvest = harvest;
 	claim.zoneName = zoneName;
 	claim.position = position;
 	claim.queuedAtMs = nowMs;
@@ -21576,6 +22095,7 @@ PlayerBotLootDisposition SimPlayerManager::lootPlayerBotCorpse(
 		return PLAYER_BOT_LOOT_CORPSE_GONE;
 	if (!playerBotLootGateEnabled(identityId))
 		return PLAYER_BOT_LOOT_GATE_OFF;
+	makePlayerBotBagRoom(identityId);
 
 	uint64 heldCount = 0;
 	{
@@ -21715,6 +22235,406 @@ PlayerBotLootDisposition SimPlayerManager::lootPlayerBotCorpse(
 	if (movedItems.size() > 0 || cashCredits > 0)
 		return PLAYER_BOT_LOOTED;
 	return PLAYER_BOT_LOOT_NOTHING;
+}
+
+static const char* playerBotHarvestDispositionName(
+		PlayerBotHarvestDisposition disposition) {
+	switch (disposition) {
+	case PLAYER_BOT_HARVESTED: return "harvested";
+	case PLAYER_BOT_HARVEST_GATE_OFF: return "gateOff";
+	case PLAYER_BOT_HARVEST_NO_SKILL: return "noSkill";
+	case PLAYER_BOT_HARVEST_NOT_ELIGIBLE: return "notEligible";
+	case PLAYER_BOT_HARVEST_NO_FAMILY: return "noFamily";
+	case PLAYER_BOT_HARVEST_NO_SPAWN: return "noSpawn";
+	case PLAYER_BOT_HARVEST_TOO_FAR: return "tooFar";
+	case PLAYER_BOT_HARVEST_BAG_FAILED: return "bagFailed";
+	case PLAYER_BOT_HARVEST_CAP_REACHED: return "capReached";
+	default: return "unknown";
+	}
+}
+
+bool SimPlayerManager::depositPlayerBotResource(uint64 identityId,
+		ResourceSpawn* spawn, int units, bool* capReached,
+		const String& zoneName) {
+	if (capReached != nullptr)
+		*capReached = false;
+	if (identityId == 0 || spawn == nullptr || units <= 0 ||
+			!progressionEnabled || !progressionLoaded)
+		return false;
+
+	{
+		Locker progressionLock(&progressionMutex);
+		if (!progressionRecords.contains(identityId) ||
+				progressionRetiringIds.contains(identityId))
+			return false;
+	}
+
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+		economyManager->getOrCreateItemBag(identityId);
+	if (bag == nullptr)
+		return false;
+
+	uint64 heldCount = 0;
+	VectorMap<uint64, SimBotItemState> resourceItemStates;
+	{
+		Locker progressionLock(&progressionMutex);
+		heldCount = progressionItemHeldCounts.contains(identityId) ?
+			progressionItemHeldCounts.get(identityId) : 0;
+		for (int i = 0; i < progressionItems.size(); ++i) {
+			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+			if (row.identityId == identityId)
+				resourceItemStates.put(row.objectId, row.state);
+		}
+	}
+
+	uint64 mergedObjectId = 0;
+	int mergedQuantity = 0;
+	uint64 newObjectId = 0;
+	uint32 newTemplateCrc = 0;
+	int newQuantity = 0;
+	String newDisplayName;
+	uint64 spawnObjectId = 0;
+	String resourceType;
+	{
+		// Match stock's spawn -> bag ordering.  No progression mutex is held
+		// while either object is locked.  As in stock, the units leave the
+		// spawn once the corpse is harvested, deposited or not; every bag
+		// refusal is decided before the first bag mutation.
+		Locker spawnLock(spawn);
+		spawnObjectId = spawn->getObjectID();
+		resourceType = spawn->getType();
+		if (!zoneName.isEmpty())
+			spawn->extractResource(zoneName, units);
+		Locker bagLock(bag);
+
+		Vector<ManagedReference<ResourceContainer*> > mergeTargets;
+		int mergeRoom = 0;
+		for (int i = 0; i < bag->getContainerObjectsSize() && mergeRoom < units;
+				i++) {
+			ManagedReference<SceneObject*> object =
+				bag->getContainerObject(i);
+			if (object == nullptr || !object->isResourceContainer())
+				continue;
+			ManagedReference<ResourceContainer*> resource =
+				cast<ResourceContainer*>(object.get());
+			if (resource == nullptr || resource->getSpawnID() !=
+					spawn->getObjectID() || resource->getQuantity() >=
+					ResourceContainer::MAXSIZE)
+				continue;
+			// Bazaar publication leaves the AuctionItem in this bag, but changes
+			// the durable row to LISTED.  A listed container is single-authority
+			// inventory and must never be topped up by a later harvest.
+			if (resourceItemStates.contains(resource->getObjectID()) &&
+					resourceItemStates.get(resource->getObjectID()) !=
+					SIMBOT_ITEM_HELD)
+				continue;
+			mergeTargets.add(resource);
+			mergeRoom += ResourceContainer::MAXSIZE - resource->getQuantity();
+		}
+
+		const int newUnits = units > mergeRoom ? units - mergeRoom : 0;
+		if (newUnits > 0) {
+			if (heldCount >= static_cast<uint64>(Math::max(0,
+					progressionLootMaxItemsPerBot))) {
+				if (capReached != nullptr)
+					*capReached = true;
+				return false;
+			}
+			if (bag->isContainerFullRecursive())
+				return false;
+
+			Reference<ResourceContainer*> resource =
+				spawn->createResource(newUnits);
+			if (resource == nullptr)
+				return false;
+			if (!bag->transferObject(resource, -1, false, true)) {
+				Locker resourceLock(resource);
+				resource->destroyObjectFromDatabase(true);
+				return false;
+			}
+			newQuantity = newUnits;
+			newObjectId = resource->getObjectID();
+			newTemplateCrc = resource->getServerObjectCRC();
+			newDisplayName = resource->getDisplayedName();
+			bag->broadcastObject(resource, true);
+		}
+
+		// Nothing below can fail: commit the top-ups.
+		int remaining = units - newUnits;
+		for (int i = 0; i < mergeTargets.size() && remaining > 0; ++i) {
+			ResourceContainer* resource = mergeTargets.get(i);
+			int added = Math::min(ResourceContainer::MAXSIZE -
+				resource->getQuantity(), remaining);
+			resource->setQuantity(resource->getQuantity() + added);
+			remaining -= added;
+			mergedObjectId = resource->getObjectID();
+			mergedQuantity = resource->getQuantity();
+		}
+	}
+
+	const uint64 depositedObjectId = newObjectId != 0 ? newObjectId :
+		mergedObjectId;
+	const int depositedQuantity = newObjectId != 0 ? newQuantity :
+		mergedQuantity;
+	if (depositedObjectId == 0 || depositedQuantity <= 0)
+		return false;
+
+	Locker progressionLock(&progressionMutex);
+	if (!progressionRecords.contains(identityId) ||
+			progressionRetiringIds.contains(identityId))
+		return false;
+
+	uint64 held = progressionItemHeldCounts.contains(identityId) ?
+		progressionItemHeldCounts.get(identityId) : 0;
+	if (newObjectId != 0) {
+		// The container is already in the bag, so record it even if a
+		// concurrent acquisition crossed the cap meanwhile: refusing here would
+		// leave a vault object with no owner row.
+		SimBotItemRow row;
+		row.objectId = newObjectId;
+		row.identityId = identityId;
+		row.state = SIMBOT_ITEM_HELD;
+		row.templateCrc = newTemplateCrc;
+		row.displayName = newDisplayName.trim();
+		row.source = "harvest";
+		row.refId = spawnObjectId;
+		row.acquiredAt = String::valueOf(System::getMiliTime());
+		row.updatedAt = row.acquiredAt;
+		row.version = 1;
+		row.dirty = true;
+		progressionItems.put(newObjectId, row);
+		progressionItemDirtyIds.put(newObjectId, true);
+		++held;
+		appendPlayerBotLedgerEntryKindLocked(identityId, "item", 1, held,
+			"harvest", newObjectId, "resource_container");
+	}
+	progressionItemHeldCounts.put(identityId, held);
+	appendPlayerBotLedgerEntryKindLocked(identityId, "resource", units,
+		depositedQuantity, "harvest", depositedObjectId,
+		resourceType);
+	return true;
+}
+
+PlayerBotHarvestDisposition SimPlayerManager::harvestPlayerBotCorpse(
+		uint64 identityId, AiAgent* body, uint64 corpseOid, int* unitsOut,
+		int* xpOut, SimBotHarvest::Family* familyOut,
+		String* resourceTypeOut, String* densityBandOut,
+		String* corpseTemplateOut) {
+	if (unitsOut != nullptr)
+		*unitsOut = 0;
+	if (xpOut != nullptr)
+		*xpOut = 0;
+	if (familyOut != nullptr)
+		*familyOut = SimBotHarvest::NONE;
+	if (resourceTypeOut != nullptr)
+		*resourceTypeOut = "";
+	if (densityBandOut != nullptr)
+		*densityBandOut = "";
+	if (corpseTemplateOut != nullptr)
+		*corpseTemplateOut = "";
+	if (identityId == 0 || body == nullptr || corpseOid == 0)
+		return PLAYER_BOT_HARVEST_NOT_ELIGIBLE;
+	const uint64 harvestBodyOid = body->getObjectID();
+	if (!playerBotHarvestGateEnabled(identityId))
+		return PLAYER_BOT_HARVEST_GATE_OFF;
+	makePlayerBotBagRoom(identityId);
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	if (zoneServer == nullptr)
+		return PLAYER_BOT_HARVEST_NO_SPAWN;
+
+	ManagedReference<ResourceSpawn*> resourceSpawn;
+	String resourceType;
+	String zoneName;
+	String bodySpecies;
+	String corpseTemplate;
+	int quantity = 0;
+	int corpseLevel = 0;
+	float density = 0.f;
+	const char* densityBand = "";
+	SimBotHarvest::Family family = SimBotHarvest::NONE;
+	uint64_t need[SimBotHarvest::FAMILY_COUNT] = {};
+	{
+		Locker harvestLock(&progressionHarvestMutex);
+		for (int i = 0; i < SimBotHarvest::FAMILY_COUNT; ++i)
+			need[i] = progressionHarvestSupply.need[i];
+	}
+
+	{
+		// Match lootPlayerBotCorpse: body first, then cross-lock the corpse.
+		Locker bodyLock(body);
+		if (body->isDead() || body->getZone() == nullptr)
+			return PLAYER_BOT_HARVEST_NOT_ELIGIBLE;
+		bodySpecies = body->getSpeciesName();
+
+		ManagedReference<CreatureObject*> corpseObject =
+			zoneServer->getObject(corpseOid).castTo<CreatureObject*>();
+		Creature* corpse = corpseObject == nullptr ? nullptr :
+			cast<Creature*>(corpseObject.get());
+		if (corpse == nullptr)
+			return PLAYER_BOT_HARVEST_NOT_ELIGIBLE;
+
+		Locker corpseLock(corpseObject, body);
+		if (!corpse->isDead() || corpse->getZone() == nullptr)
+			return PLAYER_BOT_HARVEST_NOT_ELIGIBLE;
+		if (!body->hasSkill("outdoors_scout_novice"))
+			return PLAYER_BOT_HARVEST_NO_SKILL;
+		if (body->getDistanceTo(corpse) > 10.f)
+			return PLAYER_BOT_HARVEST_TOO_FAR;
+		if (!corpse->canHarvestMe(body))
+			return PLAYER_BOT_HARVEST_NOT_ELIGIBLE;
+		const CreatureTemplate* corpseCreatureTemplate =
+			corpse->getCreatureTemplate();
+		if (corpseCreatureTemplate != nullptr)
+			corpseTemplate = corpseCreatureTemplate->getTemplateName();
+
+		uint64_t available[SimBotHarvest::FAMILY_COUNT] = {
+			static_cast<uint64_t>(Math::max(0.f, corpse->getHideMax())),
+			static_cast<uint64_t>(Math::max(0.f, corpse->getMeatMax())),
+			static_cast<uint64_t>(Math::max(0.f, corpse->getBoneMax()))};
+		String types[SimBotHarvest::FAMILY_COUNT] = {
+			corpse->getHideType(), corpse->getMeatType(), corpse->getBoneType()};
+		for (int i = 0; i < SimBotHarvest::FAMILY_COUNT; ++i) {
+			if (types[i].isEmpty())
+				available[i] = 0;
+		}
+		family = SimBotHarvest::chooseFamily(available, need);
+		if (family == SimBotHarvest::NONE)
+			return PLAYER_BOT_HARVEST_NO_FAMILY;
+		resourceType = types[static_cast<int>(family)];
+
+		Zone* corpseZone = corpse->getZone();
+		zoneName = corpseZone->getZoneName();
+		ResourceManager* resourceManager = corpseZone->getZoneServer()->
+			getResourceManager();
+		if (resourceManager == nullptr)
+			return PLAYER_BOT_HARVEST_NO_SPAWN;
+		resourceSpawn = resourceManager->getCurrentSpawn(resourceType,
+			zoneName);
+		if (resourceSpawn == nullptr)
+			return PLAYER_BOT_HARVEST_NO_SPAWN;
+
+		density = resourceSpawn->getDensityAt(zoneName,
+			body->getPositionX(), body->getPositionY());
+		float groupModifier = 1.f;
+		if (body->isGrouped())
+			groupModifier = body->getGroup()->getGroupHarvestModifier(body);
+		CreatureHarvestYield::Result yield = CreatureHarvestYield::calculate(
+			static_cast<float>(available[static_cast<int>(family)]),
+			body->getSkillMod("creature_harvesting"), density, groupModifier,
+			corpse->getParent().get() != nullptr);
+		quantity = yield.quantity;
+		densityBand = yield.densityBand;
+		corpseLevel = corpse->getLevel();
+
+		// Stock marks the harvester before the resource deposit, so a full bag
+		// consumes the extracted units and cannot retry the same corpse.
+		corpse->addAlreadyHarvested(body);
+	}
+
+	if (resourceSpawn == nullptr || quantity <= 0)
+		return PLAYER_BOT_HARVEST_NO_SPAWN;
+
+	if (familyOut != nullptr)
+		*familyOut = family;
+	if (resourceTypeOut != nullptr)
+		*resourceTypeOut = resourceType;
+	if (densityBandOut != nullptr)
+		*densityBandOut = densityBand;
+	if (corpseTemplateOut != nullptr)
+		*corpseTemplateOut = corpseTemplate;
+
+	bool capReached = false;
+	bool deposited = depositPlayerBotResource(identityId, resourceSpawn, quantity,
+		&capReached, zoneName);
+	if (!deposited) {
+		harvestDepositFailed.increment();
+		return capReached ? PLAYER_BOT_HARVEST_CAP_REACHED :
+			PLAYER_BOT_HARVEST_BAG_FAILED;
+	}
+
+	PlayerManager* playerManager = zoneServer->getPlayerManager();
+	const float experienceMultiplier = playerManager == nullptr ? 1.f :
+		playerManager->getExperienceMultiplier();
+	const float speciesModifier = playerManager == nullptr ? 1.f :
+		playerManager->getSpeciesXpModifier(bodySpecies, "scout");
+	// The live body is an AiAgent without a PlayerObject/ghost, so stock's food
+	// buff and crafting-session checks do not apply.  The species and global
+	// modifiers remain the applicable awardExperience arithmetic.
+	const int scoutXp = CreatureHarvestYield::scoutExperience(corpseLevel,
+		speciesModifier, 1.f, 1.f, experienceMultiplier);
+	int awarded = 0;
+	if (scoutXp > 0)
+		grantPlayerBotExperience(identityId, "scout", scoutXp, "harvest",
+			&awarded);
+	if (awarded > 0)
+		harvestXpGranted.add(awarded);
+	if (unitsOut != nullptr)
+		*unitsOut = quantity;
+	if (xpOut != nullptr)
+		*xpOut = awarded;
+	// A gated real harvest is the authoritative inbound for the active order.
+	// Keep this leaf update under pveMutex so reservation scans see the same
+	// family and total, and leave the legacy shadow-hive path untouched.
+	{
+		Locker pveLock(&pveMutex);
+		if (pveHuntOrders.contains(identityId)) {
+			PveHuntOrder order = pveHuntOrders.get(identityId);
+			if (order.bodyOid == harvestBodyOid) {
+				order.harvestedUnits = addDemandFamilyUnits(
+					order.harvestedUnits, static_cast<uint64>(quantity));
+				if (family == SimBotHarvest::HIDE)
+					order.harvestedHideUnits = addDemandFamilyUnits(
+						order.harvestedHideUnits, static_cast<uint64>(quantity));
+				else if (family == SimBotHarvest::MEAT)
+					order.harvestedMeatUnits = addDemandFamilyUnits(
+						order.harvestedMeatUnits, static_cast<uint64>(quantity));
+				else if (family == SimBotHarvest::BONE)
+					order.harvestedBoneUnits = addDemandFamilyUnits(
+						order.harvestedBoneUnits, static_cast<uint64>(quantity));
+				pveHuntOrders.put(identityId, order);
+				pveDirtyIdentityIds.put(identityId, true);
+			}
+		}
+	}
+	harvestsCompleted.increment();
+	harvestUnitsTotal.add(quantity);
+	if (family >= SimBotHarvest::HIDE && family <= SimBotHarvest::BONE)
+		harvestFamilyUnits[static_cast<int>(family)].add(quantity);
+	return PLAYER_BOT_HARVESTED;
+}
+
+void SimPlayerManager::recordPlayerBotHarvestResult(uint64 identityId,
+		uint64 corpseOid, PlayerBotHarvestDisposition disposition, int units,
+		int xp, SimBotHarvest::Family family, const String& resourceType,
+		const String& densityBand, const String& corpseTemplate) {
+	const int index = static_cast<int>(disposition);
+	if (index >= 0 && index < PLAYER_BOT_HARVEST_DISPOSITION_COUNT)
+		harvestResults[index].increment();
+	if (MissionDiagLog::isLoggingEnabled())
+		MissionDiagLog::event("HARVEST_RESULT", identityId,
+			"corpse=" + String::valueOf(corpseOid) + " result=" +
+			playerBotHarvestDispositionName(disposition) + " units=" +
+			String::valueOf(units) + " xp=" + String::valueOf(xp));
+	PlayerBotHarvestRecord record;
+	record.identityId = identityId;
+	record.corpseOid = corpseOid;
+	record.recordedAtMs = System::getMiliTime();
+	record.corpseTemplate = corpseTemplate;
+	record.resourceType = resourceType;
+	record.densityBand = densityBand;
+	record.family = family;
+	record.units = units;
+	record.xp = xp;
+	record.disposition = static_cast<int>(disposition);
+	{
+		Locker harvestLock(&progressionHarvestMutex);
+		while (progressionHarvestLastHarvests.size() >=
+				progressionHarvestLastHarvestLimit)
+			progressionHarvestLastHarvests.remove(0);
+		progressionHarvestLastHarvests.add(record);
+	}
 }
 
 void SimPlayerManager::recordPlayerBotKillXpDrop(const String& stage,
@@ -24048,6 +24968,9 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 				if (!request.ledgerSource.isEmpty())
 					query += " AND `source`='" +
 						request.ledgerSource.escapeString() + "'";
+				if (!request.ledgerKind.isEmpty())
+					query += " AND `kind`='" +
+						request.ledgerKind.escapeString() + "'";
 				if (request.ledgerDelta != 0)
 					query += " AND `delta`=" +
 						String::valueOf(request.ledgerDelta);
@@ -24072,6 +24995,9 @@ void SimPlayerManager::drainPlayerBotProgressionRequests() {
 				if (!request.ledgerSource.isEmpty())
 					latestQuery += " AND `source`='" +
 						request.ledgerSource.escapeString() + "'";
+				if (!request.ledgerKind.isEmpty())
+					latestQuery += " AND `kind`='" +
+						request.ledgerKind.escapeString() + "'";
 				if (request.ledgerDelta != 0)
 					latestQuery += " AND `delta`=" +
 						String::valueOf(request.ledgerDelta);
@@ -25117,6 +26043,8 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 		return lootCashLooted.get();
 	if (key == "loot.skippedvaultfull" || key == "lootskippedvaultfull")
 		return lootSkippedVaultFull.get();
+	if (key == "loot.junkdiscarded" || key == "lootjunkdiscarded")
+		return lootJunkDiscarded.get();
 	if (key == "loot.transferfailed" || key == "loottransferfailed")
 		return lootTransferFailed.get();
 	if (key == "loot.depositnorecord" || key == "lootdepositnorecord")
@@ -25129,6 +26057,18 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 		return lootNotCreatedNoRecord.get();
 	if (key == "loot.notcreated.gateoff" || key == "lootnotcreatedgateoff")
 		return lootNotCreatedGateOff.get();
+	if (key == "harvest.completed" || key == "harvestscompleted")
+		return harvestsCompleted.get();
+	if (key == "harvest.simulationskipped" ||
+			key == "harvestsimulationskipped")
+		return harvestSimulationSkipped.get();
+	if (key == "harvest.results.gateoff" || key == "harvestresultsgateoff")
+		return harvestResults[PLAYER_BOT_HARVEST_GATE_OFF].get();
+	if (key == "harvest.xpgranted" || key == "harvestxpgranted")
+		return harvestXpGranted.get();
+	if (key == "harvest.listingscreated" ||
+			key == "harvestlistingscreated")
+		return harvestListingsCreated.get();
 	if (key == "bazaar.listed" || key == "bazaarlisted")
 		return bazaarListed.get();
 	if (key == "bazaar.sold" || key == "bazaarsold")
@@ -25152,6 +26092,9 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 		return bazaarSkippedHumanAboveCap.get();
 	if (key == "bazaar.skipped.cap" || key == "bazaarskippedcap")
 		return bazaarSkippedCap.get();
+	if (key == "bazaar.skipped.resourcereserve" ||
+			key == "bazaarskippedresourcereserve")
+		return bazaarSkippedResourceReserve.get();
 	if (key == "bazaar.skipped.unaffordable" ||
 			key == "bazaarskippedunaffordable")
 		return bazaarSkippedUnaffordable.get();
@@ -26085,6 +27028,8 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 		}
 		playerBotParityTestLootGateOverrideActive = false;
 		playerBotParityTestLootGateOverride = false;
+		playerBotParityTestHarvestGateOverrideActive = false;
+		playerBotParityTestHarvestGateOverride = false;
 		playerBotParityTestBazaarSellGateOverrideActive = false;
 		playerBotParityTestBazaarSellGateOverride = false;
 		playerBotParityTestBazaarBuyGateOverrideActive = false;
@@ -26110,6 +27055,9 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 			playerBotParityTestLootCapOverrideActive = false;
 		}
 	playerBotParityLootGateScopedIds.removeAll();
+	playerBotParityHarvestGateScopedIds.removeAll();
+	playerBotParityHarvestGateValues.removeAll();
+	playerBotParityHarvestSellThresholdOverrides.removeAll();
 	playerBotParityBazaarSellGateScopedIds.removeAll();
 	playerBotParityBazaarBuyGateScopedIds.removeAll();
 	playerBotParityLoadoutGateScopedIds.removeAll();
@@ -26830,6 +27778,10 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 				"bazaar.buy.skipped.timeout",
 				"bazaar.buy.reconcile.committed",
 				"bazaar.buy.reconcile.refunded",
+				"harvest.completed", "harvest.simulationskipped",
+				"harvest.results.gateoff", "harvest.xpgranted",
+				"harvest.listingscreated", "loot.junkDiscarded",
+				"bazaar.skipped.resourceReserve",
 				"bazaar.buy.upgrades",
 				"bazaar.buy.upgrades.skippedNotBetter",
 				"bazaar.buy.upgrades.skippedUncertified",
@@ -27131,6 +28083,7 @@ bool SimPlayerManager::executePlayerBotParityRequestStep(
 		request.faultFailNextFlush = step.failNextFlush;
 		request.faultFailLedgerInsert = step.faultFailLedgerInsert;
 		request.ledgerSource = step.source;
+		request.ledgerKind = step.ledgerKind;
 		request.ledgerDelta = step.expectedDelta;
 		request.ledgerCount = step.ledgerCount;
 		request.requestedAmount = step.amount;
@@ -29260,7 +30213,10 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			op == "assertTier" || op == "assertDirty" || op == "assertSource" ||
 			op == "assertAbility" || op == "assertAbilitySuperseded" ||
 				op == "assertAttackSource" || op == "assertAbilityUse" ||
-				op == "setLootGate" || op == "setBazaarSellGate" ||
+				op == "setLootGate" || op == "setHarvestGate" ||
+				op == "setHarvestSellThreshold" || op == "assertHarvestResult" ||
+				op == "assertHarvestContainer" || op == "assertHarvestScoutXp" ||
+				op == "setBazaarSellGate" ||
 				op == "setBazaarBuyGate" || op == "setBuyListOverride" ||
 				op == "setHealingHarnessOptIn" ||
 				op == "damageBot" || op == "setBotFaction" ||
@@ -29320,7 +30276,8 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			op == "retireIdentity" ||
 			op == "reassignPlan" ||
 			(op == "simulateKillXp" && step.bodyOid == 0) ||
-			op == "spawnKillTarget" || op == "spawnGroupPullTarget") {
+				op == "spawnKillTarget" || op == "spawnGroupPullTarget" ||
+				op == "harvestCorpse") {
 		if (!getPlayerBotParityIdentityId(step, identityId)) {
 			result.status = "FAIL";
 			result.failReason = "identity_not_found";
@@ -29512,6 +30469,46 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		playerBotParityTestLootGateOverrideActive = true;
 		playerBotParityTestLootGateOverride = enabledValue != 0;
 		playerBotParityLootGateScopedIds.put(identityId, true);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "setHarvestGate") {
+		if (identityId == 0) {
+			result.status = "FAIL";
+			result.failReason = "harvest_gate_requires_identity";
+			return true;
+		}
+		int64 enabledValue = 0;
+		if (step.hasGateEnabled)
+			enabledValue = step.gateEnabled ? 1 : 0;
+		else if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = "invalid_harvest_gate_value";
+			return true;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityTestHarvestGateOverrideActive = true;
+			playerBotParityTestHarvestGateOverride = enabledValue != 0;
+			playerBotParityHarvestGateScopedIds.put(identityId, true);
+			playerBotParityHarvestGateValues.put(identityId, enabledValue != 0);
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "setHarvestSellThreshold") {
+		if (identityId == 0 || step.amount < 1) {
+			result.status = "FAIL";
+			result.failReason = "harvest_threshold_requires_identity_and_amount";
+			return true;
+		}
+		{
+			Locker parityLock(&playerBotParityTestMutex);
+			playerBotParityHarvestSellThresholdOverrides.put(identityId,
+				static_cast<uint64>(step.amount));
+		}
 		result.status = "PASS";
 		return true;
 	}
@@ -31492,6 +32489,278 @@ bool SimPlayerManager::executePlayerBotParityStep(
 				(step.expect == "GATE_OFF" && disposition != PLAYER_BOT_LOOT_GATE_OFF))) {
 			result.status = "FAIL";
 			result.failReason = "loot_disposition_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "harvestCorpse") {
+		uint64 bodyOid = step.bodyOid;
+		if (bodyOid == 0) {
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		uint64 corpseOid = step.corpseOid != 0 ? step.corpseOid :
+			(playerBotParityTestKillTargetSettledOid != 0 ?
+				playerBotParityTestKillTargetSettledOid :
+				playerBotParityTestKillTargetOid);
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> bodyObject = zoneServer == nullptr ||
+				bodyOid == 0 ? nullptr : zoneServer->getObject(bodyOid);
+		AiAgent* body = bodyObject == nullptr ? nullptr : bodyObject->asAiAgent();
+		if (body == nullptr || corpseOid == 0) {
+			result.status = "FAIL";
+			result.failReason = "harvest_body_or_corpse_missing";
+			return true;
+		}
+		int units = 0;
+		int xp = 0;
+		SimBotHarvest::Family family = SimBotHarvest::NONE;
+		String resourceType;
+		String densityBand;
+		String corpseTemplate;
+		PlayerBotHarvestDisposition disposition = harvestPlayerBotCorpse(identityId,
+			body, corpseOid, &units, &xp, &family, &resourceType, &densityBand,
+			&corpseTemplate);
+		recordPlayerBotHarvestResult(identityId, corpseOid, disposition, units, xp,
+			family, resourceType, densityBand, corpseTemplate);
+		if (!step.expect.isEmpty() &&
+				String(playerBotHarvestDispositionName(disposition)).toLowerCase() !=
+				step.expect.toLowerCase()) {
+			result.status = "FAIL";
+			result.failReason = "harvest_disposition_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertHarvestResult") {
+		PlayerBotHarvestRecord latest;
+		bool found = false;
+		{
+			Locker harvestLock(&progressionHarvestMutex);
+			for (int i = progressionHarvestLastHarvests.size() - 1; i >= 0; --i) {
+				const PlayerBotHarvestRecord& candidate =
+					progressionHarvestLastHarvests.get(i);
+				if (candidate.identityId == identityId) {
+					latest = candidate;
+					found = true;
+					break;
+				}
+			}
+		}
+		if (!found) {
+			result.status = "FAIL";
+			result.failReason = "harvest_result_missing";
+			return true;
+		}
+		if (!step.expect.isEmpty() &&
+				String(playerBotHarvestDispositionName(
+					static_cast<PlayerBotHarvestDisposition>(latest.disposition))).
+					toLowerCase() != step.expect.toLowerCase()) {
+			result.status = "FAIL";
+			result.failReason = "harvest_result_disposition_mismatch";
+			return true;
+		}
+		if (step.hasExpectedHarvestUnits && latest.units !=
+				step.expectedHarvestUnits) {
+			result.status = "FAIL";
+			result.failReason = "harvest_units_mismatch";
+			return true;
+		}
+		if (step.hasExpectedHarvestXp && latest.xp != step.expectedHarvestXp) {
+			result.status = "FAIL";
+			result.failReason = "harvest_xp_mismatch";
+			return true;
+		}
+		if (!step.harvestFamily.isEmpty() &&
+				String(SimBotHarvest::familyName(latest.family)).toLowerCase() !=
+				step.harvestFamily) {
+			result.status = "FAIL";
+			result.failReason = "harvest_family_mismatch";
+			return true;
+		}
+		if (!step.harvestResourceType.isEmpty() && latest.resourceType !=
+				step.harvestResourceType) {
+			result.status = "FAIL";
+			result.failReason = "harvest_resource_type_mismatch";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertHarvestContainer") {
+		AiEconomyManager* economyManager = AiEconomyManager::instance();
+		ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+			economyManager->getItemBag(identityId);
+		// A bot that never deposited anything has no bag at all, which is the
+		// expected state for a refused harvest.
+		if (bag == nullptr && step.expect.toLowerCase() == "none") {
+			result.status = "PASS";
+			return true;
+		}
+		if (bag == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "harvest_bag_missing";
+			return true;
+		}
+		VectorMap<uint64, SimBotItemState> itemStates;
+		{
+			Locker progressionLock(&progressionMutex);
+			for (int i = 0; i < progressionItems.size(); ++i) {
+				const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+				if (row.identityId == identityId)
+					itemStates.put(row.objectId, row.state);
+			}
+		}
+		int matches = 0;
+		int totalUnits = 0;
+		uint64 actualUnitsByFamily[SimBotHarvest::FAMILY_COUNT] = {};
+		{
+			Locker bagLock(bag);
+			for (int i = 0; i < bag->getContainerObjectsSize(); ++i) {
+				ManagedReference<SceneObject*> object =
+					bag->getContainerObject(i);
+				ResourceContainer* resource = object == nullptr ? nullptr :
+					cast<ResourceContainer*>(object.get());
+				if (resource == nullptr)
+					continue;
+				const String resourceType = resource->getSpawnType();
+				const SimBotHarvest::Family family =
+					SimBotHarvest::familyFromResourceType(resourceType.toCharArray());
+				if (!step.harvestFamily.isEmpty() &&
+						String(SimBotHarvest::familyName(family)).toLowerCase() !=
+						step.harvestFamily)
+					continue;
+				if (!step.harvestResourceType.isEmpty() && resourceType !=
+						step.harvestResourceType)
+					continue;
+				if (!step.itemState.isEmpty()) {
+					if (!itemStates.contains(resource->getObjectID()) ||
+							playerBotItemStateName(itemStates.get(
+								resource->getObjectID())) != step.itemState)
+						continue;
+				}
+				++matches;
+				totalUnits += resource->getQuantity();
+				if (family >= SimBotHarvest::HIDE &&
+						family <= SimBotHarvest::BONE)
+					actualUnitsByFamily[static_cast<int>(family)] +=
+						static_cast<uint64>(Math::max(0, resource->getQuantity()));
+			}
+		}
+		if (step.matchHarvestRecords) {
+			uint64 expectedUnitsByFamily[SimBotHarvest::FAMILY_COUNT] = {};
+			{
+				Locker harvestLock(&progressionHarvestMutex);
+				for (int i = 0; i < progressionHarvestLastHarvests.size(); ++i) {
+					const PlayerBotHarvestRecord& record =
+						progressionHarvestLastHarvests.get(i);
+					if (record.identityId == identityId &&
+							record.disposition == PLAYER_BOT_HARVESTED &&
+							record.family >= SimBotHarvest::HIDE &&
+							record.family <= SimBotHarvest::BONE)
+						expectedUnitsByFamily[static_cast<int>(record.family)] +=
+							static_cast<uint64>(Math::max(0, record.units));
+				}
+			}
+			for (int i = 0; i < SimBotHarvest::FAMILY_COUNT; ++i) {
+				if (actualUnitsByFamily[i] != expectedUnitsByFamily[i]) {
+					result.status = "FAIL";
+					result.failReason = "harvest_record_units_mismatch family=" +
+						String(SimBotHarvest::familyName(
+							static_cast<SimBotHarvest::Family>(i))) + " bag=" +
+						String::valueOf(actualUnitsByFamily[i]) + " records=" +
+						String::valueOf(expectedUnitsByFamily[i]);
+					return true;
+				}
+			}
+		}
+		const int expectedCount = step.expectedItemCount >= 0 ?
+			step.expectedItemCount : (step.expect == "none" ? 0 : 1);
+		const bool unitsMatch = !step.hasExpectedHarvestUnits ||
+			(step.expect.toLowerCase() == "atleast" ?
+				totalUnits >= step.expectedHarvestUnits :
+				totalUnits == step.expectedHarvestUnits);
+		if (matches != expectedCount || !unitsMatch) {
+			result.status = "FAIL";
+			result.failReason = "harvest_container_mismatch count=" +
+				String::valueOf(matches) + " units=" + String::valueOf(totalUnits);
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertHarvestScoutXp") {
+		PlayerBotHarvestRecord latest;
+		bool found = false;
+		{
+			Locker harvestLock(&progressionHarvestMutex);
+			for (int i = progressionHarvestLastHarvests.size() - 1; i >= 0; --i) {
+				const PlayerBotHarvestRecord& candidate =
+					progressionHarvestLastHarvests.get(i);
+				if (candidate.identityId == identityId) {
+					latest = candidate;
+					found = true;
+					break;
+				}
+			}
+		}
+		if (!found || latest.disposition != PLAYER_BOT_HARVESTED) {
+			result.status = "FAIL";
+			result.failReason = "harvest_scout_xp_record_missing";
+			return true;
+		}
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> bodyObject = zoneServer == nullptr ||
+				bodyOid == 0 ? nullptr : zoneServer->getObject(bodyOid);
+		ManagedReference<SceneObject*> corpseObject = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(latest.corpseOid);
+		AiAgent* body = bodyObject == nullptr ? nullptr : bodyObject->asAiAgent();
+		CreatureObject* corpse = corpseObject == nullptr ? nullptr :
+			corpseObject->asCreatureObject();
+		if (body == nullptr || corpse == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "harvest_scout_xp_body_missing";
+			return true;
+		}
+		String species;
+		int corpseLevel = 0;
+		{
+			Locker bodyLock(body);
+			species = body->getSpeciesName();
+		}
+		{
+			Locker corpseLock(corpse);
+			corpseLevel = corpse->getLevel();
+		}
+		PlayerManager* playerManager = zoneServer->getPlayerManager();
+		const float experienceMultiplier = playerManager == nullptr ? 1.f :
+			playerManager->getExperienceMultiplier();
+		const float speciesModifier = playerManager == nullptr ? 1.f :
+			playerManager->getSpeciesXpModifier(species, "scout");
+		const int expectedXp = step.hasExpectedHarvestXp ?
+			step.expectedHarvestXp : CreatureHarvestYield::scoutExperience(
+				corpseLevel, speciesModifier, 1.f, 1.f, experienceMultiplier);
+		SimBotProgression progression;
+		const int actualXp = snapshotPlayerBotProgression(identityId, progression) &&
+				progression.experience.contains("scout") ?
+				progression.experience.get("scout") : 0;
+		if (actualXp != expectedXp || latest.xp != expectedXp) {
+			result.status = "FAIL";
+			result.failReason = "harvest_scout_xp_mismatch actual=" +
+				String::valueOf(actualXp) + " expected=" + String::valueOf(expectedXp);
 			return true;
 		}
 		result.status = "PASS";
@@ -33832,6 +35101,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 	Vector<SimBotItemRow> inspectItemRows;
 	Vector<PlayerBotBazaarListing> inspectListings;
 	Vector<PlayerBotBazaarPurchase> inspectPurchases;
+	Vector<PlayerBotHarvestRecord> inspectHarvestRecords;
 	bool haveNextStep = false;
 	bool haveEarlyState = false;
 	SimBotTrainingPlan trainingPlan;
@@ -33879,6 +35149,10 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 			if (purchase.identityId == identityId)
 				inspectPurchases.add(purchase);
 		}
+	}
+	{
+		Locker harvestLock(&progressionHarvestMutex);
+		inspectHarvestRecords = progressionHarvestLastHarvests;
 	}
 	Vector<SimBotTrainingPlan::BuyListEntry> buyListOverride;
 	const bool hasBuyListOverride =
@@ -34722,6 +35996,79 @@ JSONSerializationType SimPlayerManager::getPlayerBotInspectJson(uint64 identityI
 	}
 	result["itemsHeld"] = inspectHeld;
 	result["items"] = itemRowsJson;
+	JSONSerializationType harvestJson = JSONSerializationType::object();
+	harvestJson["configured"] = progressionHarvestEnabled;
+	harvestJson["enabled"] = playerBotHarvestGateEnabled(identityId);
+	JSONSerializationType harvestHeld = JSONSerializationType::object();
+	JSONSerializationType harvestListed = JSONSerializationType::object();
+	uint64 inspectHarvestHeld[SimBotHarvest::FAMILY_COUNT] = {};
+	uint64 inspectHarvestListed[SimBotHarvest::FAMILY_COUNT] = {};
+	for (int familyIndex = 0;
+			familyIndex < SimBotHarvest::FAMILY_COUNT; ++familyIndex) {
+		String family = SimBotHarvest::familyName(
+			static_cast<SimBotHarvest::Family>(familyIndex));
+		harvestHeld[family.toCharArray()] = inspectHarvestHeld[familyIndex];
+		harvestListed[family.toCharArray()] = inspectHarvestListed[familyIndex];
+	}
+	ZoneServer* harvestInspectZone = ServerCore::getZoneServer();
+	for (int i = 0; i < inspectItemRows.size(); ++i) {
+		const SimBotItemRow& itemRow = inspectItemRows.get(i);
+		if (itemRow.state != SIMBOT_ITEM_HELD &&
+				itemRow.state != SIMBOT_ITEM_LISTED)
+			continue;
+		ManagedReference<SceneObject*> itemObject = harvestInspectZone == nullptr ?
+			nullptr : harvestInspectZone->getObject(itemRow.objectId);
+		ResourceContainer* resource = itemObject == nullptr ? nullptr :
+			cast<ResourceContainer*>(itemObject.get());
+		if (resource == nullptr)
+			continue;
+		String type;
+		int quantity = 0;
+		{
+			Locker resourceLock(resource);
+			type = resource->getSpawnType();
+			quantity = resource->getQuantity();
+		}
+		SimBotHarvest::Family family =
+			SimBotHarvest::familyFromResourceType(type.toCharArray());
+		if (family >= SimBotHarvest::HIDE && family <= SimBotHarvest::BONE) {
+			uint64& destination = itemRow.state == SIMBOT_ITEM_HELD ?
+				inspectHarvestHeld[static_cast<int>(family)] :
+				inspectHarvestListed[static_cast<int>(family)];
+			destination += static_cast<uint64>(Math::max(0, quantity));
+		}
+	}
+	for (int familyIndex = 0;
+			familyIndex < SimBotHarvest::FAMILY_COUNT; ++familyIndex) {
+		String family = SimBotHarvest::familyName(
+			static_cast<SimBotHarvest::Family>(familyIndex));
+		harvestHeld[family.toCharArray()] = inspectHarvestHeld[familyIndex];
+		harvestListed[family.toCharArray()] = inspectHarvestListed[familyIndex];
+	}
+	harvestJson["held"] = harvestHeld;
+	harvestJson["listed"] = harvestListed;
+	JSONSerializationType lastHarvestJson = JSONSerializationType::object();
+	for (int i = inspectHarvestRecords.size() - 1; i >= 0; --i) {
+		const PlayerBotHarvestRecord& record = inspectHarvestRecords.get(i);
+		if (record.identityId != identityId)
+			continue;
+		lastHarvestJson["corpseOid"] = record.corpseOid;
+		lastHarvestJson["corpseTemplate"] = record.corpseTemplate;
+		lastHarvestJson["family"] = SimBotHarvest::familyName(record.family);
+		lastHarvestJson["resourceType"] = record.resourceType;
+		lastHarvestJson["densityBand"] = record.densityBand;
+		lastHarvestJson["units"] = record.units;
+		lastHarvestJson["xp"] = record.xp;
+		lastHarvestJson["result"] = playerBotHarvestDispositionName(
+			static_cast<PlayerBotHarvestDisposition>(record.disposition));
+		lastHarvestJson["ageSeconds"] = record.recordedAtMs == 0 ?
+			static_cast<uint64>(0) : (System::getMiliTime() > record.recordedAtMs ?
+			(System::getMiliTime() - record.recordedAtMs) / 1000 :
+			static_cast<uint64>(0));
+		break;
+	}
+	harvestJson["lastHarvest"] = lastHarvestJson;
+	result["harvest"] = harvestJson;
 	JSONSerializationType listingsJson = JSONSerializationType::array();
 	for (int i = 0; i < inspectListings.size(); ++i) {
 		const PlayerBotBazaarListing& listing = inspectListings.get(i);
@@ -35552,6 +36899,9 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	VectorMap<String, uint64> itemRowsByState;
 	VectorMap<uint64, uint64> itemHeldSnapshot;
 	Vector<PlayerBotBazaarListing> bazaarListingsSnapshot;
+	PlayerBotHarvestPolicy harvestPolicySnapshot;
+	PlayerBotResourceSupplySnapshot harvestSupplySnapshot;
+	Vector<PlayerBotHarvestRecord> harvestLastSnapshot;
 	int bazaarBuyPendingCount = 0;
 	uint64 itemVaultBagCount = 0;
 	uint64 itemVaultBagItemCount = 0;
@@ -35612,6 +36962,12 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 			lastAwardMs = Math::max(lastAwardMs,
 				records.elementAt(i).getValue().lastAwardMs);
 		trainingLastSkillSnapshot = trainingLastSkill;
+	}
+	{
+		Locker harvestLock(&progressionHarvestMutex);
+		harvestPolicySnapshot = progressionHarvestPolicy;
+		harvestSupplySnapshot = progressionHarvestSupply;
+	harvestLastSnapshot = progressionHarvestLastHarvests;
 	}
 	{
 		Locker groupingLock(&groupingMutex);
@@ -35732,6 +37088,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	gates["awardMissionCredits"] = playerBotMissionCreditGateEnabled(0);
 	gates["buffPayment"] = playerBotBuffPaymentGateEnabled(0);
 	gates["lootEnabled"] = playerBotLootGateEnabled(0);
+	gates["harvestEnabled"] = playerBotHarvestGateEnabled(0);
 	gates["groupLoot"] = false;
 	gates["trainingEnabled"] = playerBotTrainingGateEnabled();
 	gates["earlyGameEnabled"] = playerBotEarlyGameGateEnabled();
@@ -35808,6 +37165,9 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	loot["claimTtlSeconds"] = progressionLootClaimTtlSeconds;
 	loot["maxClaimsPerBot"] = progressionLootMaxClaimsPerBot;
 	loot["stepTimeoutSeconds"] = progressionLootStepTimeoutSeconds;
+	loot["discardJunkBelowFreeSlots"] = progressionLootDiscardJunkBelowFreeSlots;
+	loot["discardJunkTargetFreeSlots"] = progressionLootDiscardJunkTargetFreeSlots;
+	loot["junkDiscarded"] = lootJunkDiscarded.get();
 	loot["claimsQueued"] = lootClaimsQueued.get();
 	loot["claimsEvicted"] = lootClaimsEvicted.get();
 	loot["corpsesLooted"] = lootCorpsesLooted.get();
@@ -35838,11 +37198,87 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	loot["results"] = results;
 	result["loot"] = loot;
 
+	JSONSerializationType harvest = JSONSerializationType::object();
+	harvest["enabled"] = playerBotHarvestGateEnabled(0);
+	harvest["configured"] = progressionHarvestEnabled;
+	harvest["sell"] = harvestPolicySnapshot.sell;
+	harvest["sellThresholdUnits"] = harvestPolicySnapshot.sellThresholdUnits;
+	harvest["supplySnapshotSeconds"] =
+		harvestPolicySnapshot.supplySnapshotSeconds;
+	harvest["maxListingLoadsPerSnapshot"] =
+		harvestPolicySnapshot.maxListingLoadsPerSnapshot;
+	harvest["maxFloorLoadsPerVisit"] =
+		harvestPolicySnapshot.maxFloorLoadsPerVisit;
+	harvest["completed"] = harvestsCompleted.get();
+	harvest["units"] = harvestUnitsTotal.get();
+	harvest["xpGranted"] = harvestXpGranted.get();
+	harvest["groupClaimsQueued"] = harvestGroupClaimsQueued.get();
+	harvest["listingsCreated"] = harvestListingsCreated.get();
+	harvest["listingLoads"] = harvestListingLoads.get();
+	harvest["floorIncomplete"] = harvestFloorIncomplete.get();
+	harvest["floorAboveMax"] = harvestFloorAboveMax.get();
+	harvest["depositFailed"] = harvestDepositFailed.get();
+	harvest["simulationSkipped"] = harvestSimulationSkipped.get();
+	JSONSerializationType harvestUnitsByFamily = JSONSerializationType::object();
+	JSONSerializationType harvestHeld = JSONSerializationType::object();
+	JSONSerializationType harvestListed = JSONSerializationType::object();
+	JSONSerializationType harvestNeed = JSONSerializationType::object();
+	for (int familyIndex = 0;
+			familyIndex < SimBotHarvest::FAMILY_COUNT; ++familyIndex) {
+		String family = SimBotHarvest::familyName(
+			static_cast<SimBotHarvest::Family>(familyIndex));
+		harvestHeld[family.toCharArray()] = harvestSupplySnapshot.held[familyIndex];
+		harvestListed[family.toCharArray()] = harvestSupplySnapshot.listed[familyIndex];
+		harvestNeed[family.toCharArray()] = harvestSupplySnapshot.need[familyIndex];
+		harvestUnitsByFamily[family.toCharArray()] = 0;
+	}
+	for (int familyIndex = 0;
+			familyIndex < SimBotHarvest::FAMILY_COUNT; ++familyIndex) {
+		String family = SimBotHarvest::familyName(
+			static_cast<SimBotHarvest::Family>(familyIndex));
+		harvestUnitsByFamily[family.toCharArray()] =
+			harvestFamilyUnits[familyIndex].get();
+	}
+	harvest["unitsByFamily"] = harvestUnitsByFamily;
+	harvest["held"] = harvestHeld;
+	harvest["listed"] = harvestListed;
+	harvest["need"] = harvestNeed;
+	harvest["snapshotAgeSeconds"] = harvestSupplySnapshot.builtAtMs == 0 ?
+		static_cast<uint64>(0) : (nowMs > harvestSupplySnapshot.builtAtMs ?
+		(nowMs - harvestSupplySnapshot.builtAtMs) / 1000 : static_cast<uint64>(0));
+	JSONSerializationType harvestResultsJson = JSONSerializationType::object();
+	for (int i = 0; i < PLAYER_BOT_HARVEST_DISPOSITION_COUNT; ++i)
+		harvestResultsJson[playerBotHarvestDispositionName(
+			static_cast<PlayerBotHarvestDisposition>(i))] = harvestResults[i].get();
+	harvest["results"] = harvestResultsJson;
+	JSONSerializationType harvestLastJson = JSONSerializationType::array();
+	for (int i = 0; i < harvestLastSnapshot.size(); ++i) {
+		const PlayerBotHarvestRecord& record = harvestLastSnapshot.get(i);
+		JSONSerializationType row = JSONSerializationType::object();
+		row["identityId"] = record.identityId;
+		row["corpseOid"] = record.corpseOid;
+		row["corpseTemplate"] = record.corpseTemplate;
+		row["family"] = SimBotHarvest::familyName(record.family);
+		row["resourceType"] = record.resourceType;
+		row["densityBand"] = record.densityBand;
+		row["units"] = record.units;
+		row["xp"] = record.xp;
+		row["result"] = playerBotHarvestDispositionName(
+			static_cast<PlayerBotHarvestDisposition>(record.disposition));
+		row["ageSeconds"] = record.recordedAtMs == 0 ?
+			static_cast<uint64>(0) : (nowMs > record.recordedAtMs ?
+			(nowMs - record.recordedAtMs) / 1000 : static_cast<uint64>(0));
+		harvestLastJson.push_back(row);
+	}
+	harvest["lastHarvests"] = harvestLastJson;
+	result["harvest"] = harvest;
+
 	JSONSerializationType bazaar = JSONSerializationType::object();
 	bazaar["enabled"] = playerBotBazaarSellGateEnabled(0);
 	bazaar["configured"] = progressionBazaarSellEnabled;
 	bazaar["settlementMode"] = progressionBazaarSettlementMode;
 	bazaar["maxListingsPerBot"] = progressionBazaarMaxListingsPerBot;
+	bazaar["resourceListingReserve"] = progressionBazaarResourceListingReserve;
 	bazaar["maxListingsPerVisit"] = progressionBazaarMaxListingsPerVisit;
 	bazaar["listingDurationHours"] = progressionBazaarDurationHours;
 	bazaar["cooldownSeconds"] = progressionBazaarCooldownSeconds;
@@ -35878,6 +37314,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	skipped["noValue"] = bazaarSkippedNoValue.get();
 	skipped["humanAboveCap"] = bazaarSkippedHumanAboveCap.get();
 	skipped["cap"] = bazaarSkippedCap.get();
+	skipped["resourceReserve"] = bazaarSkippedResourceReserve.get();
 	skipped["unaffordable"] = bazaarSkippedUnaffordable.get();
 	skipped["noTrade"] = bazaarSkippedNoTrade.get();
 	skipped["transferFailed"] = bazaarSkippedTransferFailed.get();
@@ -36666,6 +38103,7 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		row["weaponXpType"] = heldWeaponXpType;
 		row["itemsHeld"] = itemHeldSnapshot.contains(identityId) ?
 			itemHeldSnapshot.get(identityId) : 0;
+		row["harvestUnits"] = identity == nullptr ? 0 : identity->harvestUnits;
 		JSONSerializationType itemRowsJson = JSONSerializationType::array();
 		if (itemRowsByIdentity.contains(identityId)) {
 			const Vector<SimBotItemRow>& identityItems =
@@ -43818,6 +45256,13 @@ void SimPlayerManager::computeReservedInboundByProfileFamily(
 		VectorMap<String, uint64>& sessionHarvestByFamily) {
 	reservedInboundByProfileFamily.removeAll();
 	sessionHarvestByFamily.removeAll();
+	const bool harvestGateOpen = playerBotHarvestGateEnabled(0);
+	uint64_t harvestNeed[SimBotHarvest::FAMILY_COUNT] = {};
+	if (harvestGateOpen) {
+		Locker harvestLock(&progressionHarvestMutex);
+		for (int i = 0; i < SimBotHarvest::FAMILY_COUNT; ++i)
+			harvestNeed[i] = progressionHarvestSupply.need[i];
+	}
 
 	Locker pveLock(&pveMutex);
 	Vector<DemandProfileDefinition> enabledProfiles;
@@ -43835,10 +45280,34 @@ void SimPlayerManager::computeReservedInboundByProfileFamily(
 
 	for (int i = 0; i < pveHuntOrders.size(); ++i) {
 		const PveHuntOrder& order = pveHuntOrders.elementAt(i).getValue();
+		uint64 gatedExpected[SimBotHarvest::FAMILY_COUNT] = {};
+		if (harvestGateOpen) {
+			const int quota = Math::max(1, order.quota);
+			uint64_t available[SimBotHarvest::FAMILY_COUNT] = {
+				order.expectedHideUnits / static_cast<uint64>(quota),
+				order.expectedMeatUnits / static_cast<uint64>(quota),
+				order.expectedBoneUnits / static_cast<uint64>(quota)};
+			SimBotHarvest::Family family = SimBotHarvest::chooseFamily(
+				available, harvestNeed);
+			if (family != SimBotHarvest::NONE) {
+				CreatureHarvestYield::Result yield =
+					CreatureHarvestYield::calculate(
+						static_cast<float>(available[static_cast<int>(family)]),
+						100, 0.75f, 1.f, false);
+				gatedExpected[static_cast<int>(family)] =
+					multiplyDemandFamilyUnits(yield.quantity, quota);
+			}
+		}
 		for (int familyIndex = 0; familyIndex < 3; familyIndex++) {
 			String family = getPveCreatureFamily(familyIndex);
 			uint64 expectedUnits = getPveHuntOrderExpectedFamilyUnits(
 				order, family);
+			if (harvestGateOpen) {
+				SimBotHarvest::Family policyFamily =
+					family == "hide" ? SimBotHarvest::HIDE :
+					family == "meat" ? SimBotHarvest::MEAT : SimBotHarvest::BONE;
+				expectedUnits = gatedExpected[static_cast<int>(policyFamily)];
+			}
 			uint64 harvestedUnits = getPveHuntOrderHarvestedFamilyUnits(
 				order, family);
 			if (expectedUnits == 0 || expectedUnits <= harvestedUnits)
@@ -44168,11 +45637,18 @@ void SimPlayerManager::recordPveHunterKill(uint64 identityId,
 		}
 	}
 
-	// The observer handoff is already outside the corpse/target lock. Resolve
-	// the corpse's actual hide/bone/meat type here, then deposit against that
-	// exact current ResourceSpawn identity; no conceptual label is substituted.
-	recordPveHunterHarvest(identityId, targetOid, harvestKind,
-		requestedResourceType);
+	// The observer handoff is already outside the corpse/target lock. Once the
+	// real harvest gate is open, the corpse path owns the resource mutation and
+	// the legacy shadow-hive feed must stop. Gate-off keeps the old path intact.
+	if (playerBotHarvestGateEnabled(identityId)) {
+		harvestSimulationSkipped.increment();
+	} else {
+		// Resolve the corpse's actual hide/bone/meat type here, then deposit
+		// against that exact current ResourceSpawn identity; no conceptual label
+		// is substituted.
+		recordPveHunterHarvest(identityId, targetOid, harvestKind,
+			requestedResourceType);
+	}
 	info("SimPveHuntKill identity=" + String::valueOf(identityId) +
 		" body=" + String::valueOf(bodyOid) + " target=" +
 		String::valueOf(targetOid) + " harvest=" + harvestKind, true);
@@ -52912,8 +54388,186 @@ void SimPlayerManager::runMarketSupplyObservationTask() {
         return;
     }
 
-    observeMarketSupply();
-    scheduleMarketSupplyObservationTask();
+	observeMarketSupply();
+	scheduleMarketSupplyObservationTask();
+}
+
+void SimPlayerManager::schedulePlayerBotHarvestSupplyTask() {
+	if (!enabled || progressionHarvestSupplyTaskScheduled)
+		return;
+
+	progressionHarvestSupplyTaskScheduled = true;
+	int intervalSeconds = 300;
+	{
+		Locker harvestLock(&progressionHarvestMutex);
+		intervalSeconds = Math::max(1,
+			progressionHarvestPolicy.supplySnapshotSeconds);
+	}
+
+	Reference<PlayerBotHarvestSupplyTask*> task =
+		new PlayerBotHarvestSupplyTask();
+	task->schedule(intervalSeconds * 1000);
+}
+
+void SimPlayerManager::runPlayerBotHarvestSupplyTask() {
+	progressionHarvestSupplyTaskScheduled = false;
+	if (!enabled)
+		return;
+
+	refreshPlayerBotHarvestSupplySnapshot();
+	schedulePlayerBotHarvestSupplyTask();
+}
+
+void SimPlayerManager::refreshPlayerBotHarvestSupplySnapshot() {
+	// Nothing reads the snapshot while the gate is closed, so a closed gate
+	// costs no bazaar scan and no object loads.
+	if (!playerBotHarvestGateEnabled(0))
+		return;
+
+	PlayerBotHarvestPolicy policy;
+	{
+		Locker harvestLock(&progressionHarvestMutex);
+		policy = progressionHarvestPolicy;
+	}
+
+	PlayerBotResourceSupplySnapshot snapshot;
+	Vector<uint64> heldObjectIds;
+	{
+		Locker progressionLock(&progressionMutex);
+		for (int i = 0; i < progressionItems.size(); ++i) {
+			const SimBotItemRow& row =
+				progressionItems.elementAt(i).getValue();
+			if (row.state == SIMBOT_ITEM_HELD && row.objectId != 0)
+				heldObjectIds.add(row.objectId);
+		}
+	}
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	for (int i = 0; zoneServer != nullptr && i < heldObjectIds.size(); ++i) {
+		ManagedReference<SceneObject*> object =
+			zoneServer->getObject(heldObjectIds.get(i));
+		ResourceContainer* resource = object == nullptr ? nullptr :
+			cast<ResourceContainer*>(object.get());
+		if (resource == nullptr)
+			continue;
+
+		int quantity = 0;
+		String type;
+		{
+			Locker resourceLock(resource);
+			quantity = resource->getQuantity();
+			type = resource->getSpawnType();
+		}
+		SimBotHarvest::Family family =
+			SimBotHarvest::familyFromResourceType(type.toCharArray());
+		if (family != SimBotHarvest::NONE && quantity > 0)
+			snapshot.held[static_cast<int>(family)] +=
+				static_cast<uint64>(quantity);
+	}
+
+	struct ListedResource {
+		uint64 auctionOid = 0;
+		uint64 objectOid = 0;
+		bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+	};
+	Vector<ListedResource> listedResources;
+	AuctionManager* auctionManager = zoneServer == nullptr ? nullptr :
+		zoneServer->getAuctionManager();
+	AuctionsMap* auctionMap = auctionManager == nullptr ? nullptr :
+		auctionManager->getAuctionMap();
+	if (auctionMap != nullptr) {
+		TerminalListVector lists = auctionMap->getBazaarTerminalData("", "", nullptr);
+		for (int listIndex = 0; listIndex < lists.size(); ++listIndex) {
+			Reference<TerminalItemList*> list = lists.get(listIndex);
+			if (list == nullptr)
+				continue;
+			ReadLocker listLock(list);
+			for (int itemIndex = 0; itemIndex < list->size(); ++itemIndex) {
+				AuctionItem* item = list->get(itemIndex);
+				if (item == nullptr || item->getStatus() != AuctionItem::FORSALE)
+					continue;
+				if (item->getExpireTime() != 0 &&
+						item->getExpireTime() <= static_cast<uint64>(time(nullptr)))
+					continue;
+				SimBotHarvest::Family family =
+					SimBotHarvest::familyFromGameObjectType(item->getItemType());
+				if (family == SimBotHarvest::NONE)
+					continue;
+				ListedResource listed;
+				listed.auctionOid = item->getObjectID();
+				listed.objectOid = item->getAuctionedItemObjectID();
+				listedResources.add(listed);
+			}
+		}
+	}
+
+	VectorMap<uint64, PlayerBotResourceListingCacheEntry> observed;
+	int listingLoads = 0;
+	const uint64 nowMs = System::getMiliTime();
+	for (int i = 0; i < listedResources.size(); ++i) {
+		const ListedResource& listed = listedResources.get(i);
+		PlayerBotResourceListingCacheEntry cached;
+		bool haveCache = false;
+		{
+			Locker harvestLock(&progressionHarvestMutex);
+			if (progressionHarvestListingCache.contains(listed.auctionOid)) {
+				cached = progressionHarvestListingCache.get(listed.auctionOid);
+				haveCache = cached.valid;
+			}
+		}
+
+		if (!haveCache && listingLoads < policy.maxListingLoadsPerSnapshot) {
+			++listingLoads;
+			ManagedReference<SceneObject*> object = zoneServer == nullptr ?
+				nullptr : zoneServer->getObject(listed.objectOid);
+			ResourceContainer* resource = object == nullptr ? nullptr :
+				cast<ResourceContainer*>(object.get());
+			cached = PlayerBotResourceListingCacheEntry();
+			cached.auctionOid = listed.auctionOid;
+			cached.observedAtMs = nowMs;
+			if (resource != nullptr) {
+				int quantity = 0;
+				String type;
+				{
+					Locker resourceLock(resource);
+					quantity = resource->getQuantity();
+					type = resource->getSpawnType();
+				}
+					cached.family = SimBotHarvest::familyFromResourceType(
+						type.toCharArray());
+				cached.resourceType = type;
+				cached.units = quantity > 0 ? static_cast<uint64>(quantity) : 0;
+				cached.valid = cached.family != SimBotHarvest::NONE &&
+					cached.units > 0;
+			}
+		} else if (!haveCache) {
+			// Keep an unresolved entry out of the published supply, but do not
+			// mark it valid: the next bounded pass must get another chance.
+			cached = PlayerBotResourceListingCacheEntry();
+			cached.auctionOid = listed.auctionOid;
+			cached.observedAtMs = nowMs;
+		}
+
+		observed.put(listed.auctionOid, cached);
+		if (cached.valid && cached.family != SimBotHarvest::NONE)
+			snapshot.listed[static_cast<int>(cached.family)] += cached.units;
+	}
+
+	for (int familyIndex = 0; familyIndex < SimBotHarvest::FAMILY_COUNT;
+			++familyIndex) {
+		snapshot.need[familyIndex] = SimBotHarvest::needUnits(
+			policy.targetStockUnits[familyIndex], snapshot.held[familyIndex],
+			snapshot.listed[familyIndex]);
+	}
+	snapshot.builtAtMs = nowMs;
+
+	{
+		Locker harvestLock(&progressionHarvestMutex);
+		progressionHarvestListingCache = observed;
+		progressionHarvestSupply = snapshot;
+	}
+	harvestListingLoads.add(listingLoads);
 }
 
 void SimPlayerManager::refreshMarketSupplyObservationConfig() {
@@ -59918,7 +61572,15 @@ void SimPlayerManager::computeDemandStateResults(
     VectorMap<String, uint64> reservedInboundByProfileFamily;
     VectorMap<String, uint64> sessionHarvestByFamily;
     VectorMap<String, uint64> familySupplyByFamily;
+    VectorMap<String, uint64> harvestNeedByFamily;
+    Vector<String> dispatchFamilies;
     bool familySupplyReady = false;
+    const bool harvestGateOpen = playerBotHarvestGateEnabled(0);
+    PlayerBotResourceSupplySnapshot harvestSupplySnapshot;
+    if (harvestGateOpen) {
+        Locker harvestLock(&progressionHarvestMutex);
+        harvestSupplySnapshot = progressionHarvestSupply;
+    }
 
     {
         Locker pveLock(&pveMutex);
@@ -59935,9 +61597,27 @@ void SimPlayerManager::computeDemandStateResults(
             pveAcquisitionLedgerReservePressureFloor;
     }
 
-    if (acquisitionLedgerEnabled) {
+    if (acquisitionLedgerEnabled || harvestGateOpen) {
         computeReservedInboundByProfileFamily(
             reservedInboundByProfileFamily, sessionHarvestByFamily);
+    }
+
+    if (harvestGateOpen) {
+        dispatchFamilies.add("hide");
+        dispatchFamilies.add("bone");
+        dispatchFamilies.add("meat");
+        for (int familyIndex = 0;
+                familyIndex < SimBotHarvest::FAMILY_COUNT; ++familyIndex) {
+            String family = SimBotHarvest::familyName(
+                static_cast<SimBotHarvest::Family>(familyIndex));
+            familySupplyByFamily.put(family,
+                addDemandFamilyUnits(harvestSupplySnapshot.held[familyIndex],
+                    harvestSupplySnapshot.listed[familyIndex]));
+            harvestNeedByFamily.put(family, harvestSupplySnapshot.need[familyIndex]);
+        }
+        familySupplyReady = true;
+    } else if (acquisitionLedgerEnabled) {
+        dispatchFamilies = acquisitionLedgerFamilies;
         familySupplyReady = preparePveCreatureFamilySupply(
             acquisitionLedgerFamilies, sessionHarvestByFamily,
             familySupplyByFamily);
@@ -60069,9 +61749,9 @@ void SimPlayerManager::computeDemandStateResults(
 
         if (familySupplyReady) {
             for (int familyIndex = 0;
-                    familyIndex < acquisitionLedgerFamilies.size();
+                    familyIndex < dispatchFamilies.size();
                     ++familyIndex) {
-                String family = acquisitionLedgerFamilies.get(familyIndex).
+                String family = dispatchFamilies.get(familyIndex).
                     toLowerCase().trim();
                 if (family.isEmpty() ||
                         !demandStateProfileUsesConceptualLabel(
@@ -60196,12 +61876,13 @@ void SimPlayerManager::computeDemandStateResults(
 
 		if (familySupplyReady) {
 			deriveDemandFamilySignals(
-				result, profile, acquisitionLedgerFamilies,
+				result, profile, dispatchFamilies,
 				familySupplyByFamily, reservedInboundByProfileFamily,
 				acquisitionLedgerReserveTargets, acquisitionLedgerReserveCap,
 				acquisitionLedgerCeilingUnits,
 				acquisitionLedgerCeilingFractions,
-				acquisitionLedgerReservePressureFloor);
+				acquisitionLedgerReservePressureFloor,
+				harvestGateOpen ? &harvestNeedByFamily : nullptr);
 		}
 
         results.add(result);
