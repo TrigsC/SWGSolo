@@ -133,6 +133,7 @@ CMake options: `BUILD_IDL`, `COMPILE_TESTS`, `ENABLE_ASAN`/`TSAN`/`UBSAN`. Debug
 | F_0.9.18 (v0.9.19) | `grouping.tacticsEnabled` (false), `grouping.tactics` (`pullRadiusMeters` 64, `pullTimeoutSeconds` per phase, `tagTimeoutSeconds`, `spinStartMeters` 20, `spinStandMeters`), `vocabulary.tactics` (pull, spinPoll, spinOn, spinOff, eat, backOff, lairAttack), tactic lines, `grouping.missions.leadStopMeters` (40) |
 | F_0.9.19 (v0.9.20) | `healingEnabled` (false), `healing` (`playerHealsBots`, `botHeals`, `selfHeal`, `groupHealThreshold` 0.70, `selfHealThreshold` 0.60, `selfCriticalFraction` 0.35, `maxApproachMeters` 32, `applyRangeMeters` 6, approach/apply timeouts, `bazaarRestock`, `minDoses` 20, `restockSpendFraction`, `restockScanIntervalMinutes`, `maxRestockLoadsPerVisit`, `items` = five crafted stims `{template, maxPricePerDose}`), `grouping.vocabulary.heal`, heal lines |
 | F_0.9.20 (v0.9.21) | `harvestEnabled` (false; needs `lootEnabled`), `harvest` (`sell`, `sellThresholdUnits` 500, `pricePerUnit`, `minQualityFactor`, `targetStockUnits` 50k/family, snapshot and load caps), `loot.discardJunkBelowFreeSlots`/`discardJunkTargetFreeSlots` (5/10; 0 = off), `bazaar.resourceListingReserve` (10 of `maxListingsPerBot` 25, clamped to stock `MAXSALES`), `scout` in `earlyGame.deferredXpTypes`, brawler `goalSkills` + Scout 4x4x |
+| F_0.9.21 (v0.9.22) | `samplingEnabled` (false; needs `lootEnabled`), `sampling.pricePerUnit` by survey-tool class, `harvest.staleStacks` (`enabled` false, `keepQualityFactor` 0.75, `sellBelowThreshold`, `discardWhenBagTight`), plan `surveyTools` + artisan plan (goal Surveying IV, inert `unarmed` weapon fields), `novice.retireLegacyMiners` (false), artisan distribution entry (count 0), `pveConfig.artisan.minerConfig` |
 | F_0.9.16 (v0.9.17) | `grouping.directivesEnabled` (false), `buffCities`, rally `rallyArriveMeters`/`Min`/`Max`/`ReleaseMeters`/`HoldMaxMinutes`, `shuttleMinSavingsMeters` 1000, `rebuffCheckSeconds`/`rebuffVisitResetSeconds`, `groupBuffTimeoutSeconds` 600, line delays, `vocabulary.follow`/`ready`/`rally` (buff, meet, landmarks), `places` (cities, outposts, custom x/y), rally `lines` |
 
 The sim layer alone restores roster PlayerBot weapon-template stats after shared AI weapon-stat
@@ -374,6 +375,7 @@ receipts (`docs/4-unit-tests/live_*`).
 | v0.9.19 (G4) | Pull, spin, take foods | `grouping.tacticsEnabled` | `SimBotGroupTactics.h`, `runGroupSpin` |
 | v0.9.20 (G5) | Healing both ways | `healingEnabled` | `SimBotHealing.h`, `HealDamageCommand`, `isHealableBy`, `runGroupHealTick` |
 | v0.9.21 (P.10q) | Scout harvesting, resource selling | `harvestEnabled` (needs `lootEnabled`) | `CreatureHarvestYield.h`, `SimBotHarvest.h`, `harvestPlayerBotCorpse`, `makePlayerBotBagRoom` |
+| v0.9.22 (P.10r) | Artisan surveying/sampling, survey tools, stale stacks, legacy-miner retirement | `samplingEnabled`, `staleStacks.enabled`, `novice.retireLegacyMiners` | `ResourceSampleYield.h`, `SimBotSampling.h`, `samplePlayerBotResource`, artisan `SimMinerController(identityId)`, `retireOneLegacyMinerIfNeeded` |
 
 **Store and holdings model** (every chunk inherits it)
 - **Owner = roster identity id**, never an object ID and never `AiAgent`. Bodies have no ghost, are rebuilt on
@@ -486,6 +488,14 @@ receipts (`docs/4-unit-tests/live_*`).
 - **Resources (v0.9.21).** Stacks ≥ `sellThresholdUnits` list first, priced per unit × quality against the human
   floor (ceil). Loot may use only `maxListingsPerBot − resourceListingReserve` slots. A container is per bot per
   spawn, and a listed one never takes a top-up.
+- **Artisans (v0.9.22)** are the first roster bots on `SimMinerController`, not the hunter controller.
+  - The governor keeps one pool per controller kind (hunters vs artisans), each with its own capacity.
+  - The controller's `targetResource` is a resource **type**; the spawn **name** is `intelligentResourceName`.
+  - Survey-tool receipts net out reconcile losses, so a tool lost before a save is re-granted exactly once.
+  - Cross-thread lifecycle changes are requests the miner completes itself at an idle point, never a claim from the
+    maintenance thread.
+- **Auction resource subtypes:** auctions store the client subtype (`ORGANICHIDE`, `INORGANICMINERAL`, ...), never
+  `RESOURCECONTAINER`; scan the `RESOURCECONTAINER..ORGANICSTRUCTURAL` range.
 - **Supply-driven demand.** Vault plus listed resources give `need = targetStockUnits − supply`, which feeds
   dispatch. The simulated `recordPveHunterHarvest` is skipped for gated bots.
 

@@ -1190,11 +1190,19 @@ TRIP-1 picks the version at planning time.
   persistence policy). This chunk moves them onto the roster, so they get real sampled
   `ResourceContainer`s in the vault, `resource_harvesting_inorganic` XP, and SELL at a threshold, as
   in F_0.9.20.
-- **Open for the plan:**
-  - Survey tool handling (bots need the tool or an equivalent seam).
-  - Resource-class coverage targets versus demand.
-  - Whether the P.5 hive keeps mirroring.
-  - Migration and retirement of the legacy miner population.
+- **Implementation status (2026-11-17):** Phase 1–3 are implemented and Phase 4
+  visibility/verification is complete in the code path. `samplingEnabled` and
+  `harvest.staleStacks` remain default-off for production. Artisan sampling uses
+  the stock sample-yield seam, real vault containers, per-class tool receipts and
+  XP; the SimMiner shadow mirror receives the real unit count. The dashboard
+  publishes disposition, tool-class, XP, recent-sample, artisan/legacy-miner and
+  stale-stack counters. The identity-scoped harness covers the gate/tool/sample
+  paths, stale discard/list/keep behavior, idempotent grants, and withdraws the
+  stale listing with `expireListing` plus a bazaar sweep.
+- **Resolved:** survey tools are real vault objects and missing tools become BUY
+  demand; resource coverage remains driven by the existing miner intelligence and
+  held-tool filter; the P.5 mirror remains a shadow signal; artisans are
+  non-attackable and replace legacy miners only after real sampled disposition.
 
 ### 5d.5 F_0.9.22 — Entertainer: dancer and musician (P.10s)
 

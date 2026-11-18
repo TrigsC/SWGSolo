@@ -885,3 +885,24 @@ human floor for the exact resource class; unresolved floors are deferred rather 
 The progression dashboard and per-bot inspect view expose supply, need, refusal dispositions,
 Scout XP, family totals and a bounded recent-harvest ring. The six disabled-matrix harness
 scenarios and the owner client pass remain release verification, not production activity.
+
+### P.10r — Artisan surveying and sampling (F_0.9.21)
+
+Artisan roster bodies reuse the SimMinerController targeting and travel loop but carry a roster
+identity, real survey tools and a vault bag. Sampling is behind the default-off
+`playerBotProgression.samplingEnabled` gate and still requires the loot vault. The manager calls
+the shared stock sample-yield seam at the body's actual position, deposits a `sample` resource
+row, and awards stock `resource_harvesting_inorganic` XP. Chemical, water and flora use the
+stock liquid, moisture and lumber tools; geothermal and fusion have no stock tool. A sample is
+eligible only when the held tool mirrors stock survey eligibility, including the inorganic-tool
+coverage of inorganic spawns.
+
+The sampling dashboard publishes disposition results, units by tool class, XP, grant receipts,
+held tools, a bounded recent-sample ring, live artisans and legacy-miner retirement counters.
+The stale-stack policy covers both harvest and sample containers: expired low-quality stacks can
+be listed below the ordinary threshold or discarded from a tight bag through the normal held-item
+destruction path, while quality at the keep floor is retained. Harness operations are
+identity-scoped and cover the gate, one-time tool grant, real sample, result assertion and forged
+stale stack without touching production identities. Nine disabled-matrix scenarios are the
+regression gate; each removes its harness identity and stale listings are explicitly expired and
+swept.

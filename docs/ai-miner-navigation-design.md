@@ -304,6 +304,29 @@ gap, navmesh for local combat. PVE hunters reach lairs/herds; PVP bots reach
 contested cities. Building travel + vehicle + guards now means combat NPCs
 inherit player-like movement instead of reinventing it.
 
+## 13.1 P.10r artisan roster hook
+
+The P.10r artisan path attaches a roster artisan to `SimMinerController` with an identity id;
+identity `0` remains the legacy simulation miner. The controller's stationed and legacy finish
+points call the manager's real sampling entry point only for an identity artisan while the
+sampling gate is open, then keep the conceptual miner and acquisition calls as a shadow mirror
+using the real unit count. Artisan bodies are `PLAYER` but not `ATTACKABLE`, and their assignment
+candidate set is filtered by the held survey-tool classes.
+
+Between assignments an artisan may take the bazaar leg. The manager chooses the nearest same-
+planet configured city that has an outdoor terminal, then the controller uses the normal station
+and overland travel callbacks to list resources and return to assignment selection. This keeps a
+wilderness sampling site from being treated as a market location. Stale sample stacks follow the
+shared harvest stale-stack policy and are either listed, discarded when the bag is tight, or kept
+above the quality floor.
+
+Legacy miners are retired one per maintenance tick only when `novice.retireLegacyMiners` is on and
+the live legacy count is above the artisan-adjusted target. An artisan counts toward replacement
+capacity only after its first `PLAYER_BOT_SAMPLED` disposition; if it is mid-sample, retirement
+waits for the next stationed boundary. Recovery uses P.4.3's `clearAssignment` and controller
+reset before the existing teardown. The controller calls the manager without holding its agent
+lock, and no progression mutex is acquired while miner-assignment locks are held.
+
 ## 14. Safety boundaries (unchanged)
 
 No real resource acquisition, no `ResourceContainer` creation, no

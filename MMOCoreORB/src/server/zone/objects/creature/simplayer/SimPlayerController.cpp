@@ -30,6 +30,8 @@
 #include "server/zone/Zone.h"
 #include "server/zone/managers/resource/ResourceManager.h"
 #include "server/zone/objects/resource/ResourceSpawn.h"
+#include "server/zone/objects/auction/MarketSeederBridge.h"
+#include "MissionDiagLog.h"
 #include "server/ServerCore.h"
 #include "server/zone/ZoneServer.h"
 #include "system/lang/System.h" 
@@ -903,6 +905,10 @@ void SimBehaviorTask::run() {
         if (capturedType == SimBehaviorTask::FINISH_SURVEY) miner->finishSurvey();
         else if (capturedType == SimBehaviorTask::FINISH_SAMPLE) miner->finishSample();
         else if (capturedType == SimBehaviorTask::START_STATIONED_SAMPLE) miner->startStationedSample();
+        else if (capturedType == SimBehaviorTask::FINISH_ARTISAN_BAZAAR_TIMEOUT)
+            miner->finishArtisanBazaarVisitTimeout(capturedGeneration);
+        else if (capturedType == SimBehaviorTask::LEGACY_RETIREMENT_CHECK)
+            miner->runLegacyRetirementCheck(false);
     }, "SimPlayerBehaviorLambda");
 }
 
@@ -5798,9 +5804,22 @@ bool SimTraversalTestController::isHarnessOutdoorsClear() const {
 SimMinerController::SimMinerController(AiAgent* aiAgent) : SimMinerController(aiAgent, SimMinerConfig()) {
 }
 
-SimMinerController::SimMinerController(AiAgent* aiAgent, const SimMinerConfig& minerConfig) : SimPlayerController(aiAgent) {
+SimMinerController::SimMinerController(AiAgent* aiAgent,
+		const SimMinerConfig& minerConfig) :
+		SimMinerController(aiAgent, minerConfig, 0) {
+}
+
+SimMinerController::SimMinerController(AiAgent* aiAgent,
+		const SimMinerConfig& minerConfig, uint64 rosterIdentityId) :
+		SimPlayerController(aiAgent) {
     retryCount = 0;
     config = minerConfig;
+    identityId = rosterIdentityId;
+    artisanBazaarLeg = ARTISAN_BAZAAR_NONE;
+    artisanBazaarGeneration = 0;
+    artisanBazaarCityPoint = Vector3(0, 0, 0);
+    artisanBazaarTerminalPoint = Vector3(0, 0, 0);
+    artisanBazaarCity = "";
     intelligentAssignmentPending = false;
     intelligentAssignmentActive = false;
     intelligentSampleActive = false;
@@ -5878,6 +5897,13 @@ void SimMinerController::onInterplanetaryTravelFinished(bool success,
 }
 
 void SimMinerController::startSimLoop() {
+    // Legacy retirement completes here, on the miner's own thread, at an idle
+    // boundary: nothing else of this miner can be running.
+    if (identityId == 0 &&
+            legacyRetirementRequested.load(std::memory_order_acquire)) {
+        if (runLegacyRetirementCheck(true))
+            return;
+    }
     String activationResult;
 
     // P.4.5b: while traveling, the run to the ticket collector is driven by
@@ -5885,6 +5911,12 @@ void SimMinerController::startSimLoop() {
     if (interplanetaryTravelActive) {
         state = WAITING;
         logLegacyLoopSuppressed("interplanetaryTravelActive");
+        return;
+    }
+
+    if (artisanBazaarLeg != ARTISAN_BAZAAR_NONE) {
+        state = MOVING;
+        logLegacyLoopSuppressed("artisanBazaarActive");
         return;
     }
 
@@ -5906,8 +5938,16 @@ void SimMinerController::startSimLoop() {
         return;
     }
 
-    if (SimPlayerManager::instance()->isIntelligentMinerWorkLoopOwnerEnabled() &&
-            !SimPlayerManager::instance()->isLegacyConceptualMinerLoopAllowed()) {
+    SimPlayerManager* manager = SimPlayerManager::instance();
+    if (identityId != 0 && manager != nullptr &&
+            manager->shouldPlayerBotVisitBazaar(identityId) &&
+            manager->beginPlayerBotBazaarVisit(identityId)) {
+        if (beginArtisanBazaarVisit())
+            return;
+    }
+
+    if (manager != nullptr && manager->isIntelligentMinerWorkLoopOwnerEnabled() &&
+			!manager->isLegacyConceptualMinerLoopAllowed()) {
         state = WAITING;
         logLegacyLoopSuppressed("waitingForIntelligentAssignment");
         return;
@@ -6143,6 +6183,169 @@ void SimMinerController::goToResource(const String& resourceName) {
     rePathAttempts = 0;
     maybeMountForTravel(targetPos);
     moveTo(targetPos);
+}
+
+void SimMinerController::requestLegacyRetirement() {
+    legacyRetirementRequested.store(true, std::memory_order_release);
+    // The generation-gated task runs only if the miner has not started new
+    // work since the request; busy miners retire at their next boundary.
+    Reference<SimBehaviorTask*> task = new SimBehaviorTask(this,
+        SimBehaviorTask::LEGACY_RETIREMENT_CHECK, getWorkLoopGeneration());
+    task->schedule(1000);
+}
+
+// Runs on the miner's work loop only at an idle point: never mid-sample, mid-
+// travel or with an assignment in flight. Re-checks the rule at teardown time;
+// a stale request keeps the miner.
+bool SimMinerController::runLegacyRetirementCheck(bool atLoopBoundary) {
+    if (identityId != 0 || intelligentAssignmentPending ||
+            intelligentAssignmentActive || intelligentSampleActive ||
+            intelligentAssignmentStationed || interplanetaryTravelActive)
+        return false;
+    // The scheduled check fires asynchronously, so it acts only on a miner that
+    // is genuinely idle (never mid-survey, mid-sample or mid-walk).
+    if (!atLoopBoundary && state != IDLE && state != WAITING)
+        return false;
+    if (!consumeLegacyRetirementRequest())
+        return false;
+    ManagedReference<AiAgent*> strongAgent = agent;
+    SimPlayerManager* retireManager = SimPlayerManager::instance();
+    if (strongAgent == nullptr || retireManager == nullptr ||
+            !retireManager->confirmLegacyMinerRetirement(
+                strongAgent->getObjectID()))
+        return false;
+    resetIntelligentAssignmentForRecovery();
+    retireManager->completeLegacyMinerRetirement(strongAgent);
+    return true;
+}
+
+bool SimMinerController::consumeLegacyRetirementRequest() {
+    return legacyRetirementRequested.exchange(false,
+        std::memory_order_acq_rel);
+}
+
+bool SimMinerController::artisanBazaarCallbackCurrent() const {
+    if (artisanBazaarLeg == ARTISAN_BAZAAR_NONE)
+        return false;
+    const uint64 callbackGeneration = getCallbackDispatchGeneration();
+    return callbackGeneration == 0 || callbackGeneration == artisanBazaarGeneration;
+}
+
+bool SimMinerController::beginArtisanBazaarVisit() {
+    SimPlayerManager* manager = SimPlayerManager::instance();
+    ManagedReference<AiAgent*> strongAgent = agent;
+    if (manager == nullptr || strongAgent == nullptr || identityId == 0)
+        return false;
+
+    String planet;
+    Vector3 origin;
+    {
+        Locker agentLocker(strongAgent);
+        Zone* zone = strongAgent->getZone();
+        if (zone == nullptr)
+            return false;
+        planet = zone->getZoneName();
+        origin = strongAgent->getWorldPosition();
+    }
+
+	if (!manager->resolveArtisanBazaarDestination(planet, origin,
+			artisanBazaarCityPoint, artisanBazaarTerminalPoint,
+			artisanBazaarCity)) {
+		MissionDiagLog::event("BAZAAR_VISIT", identityId,
+			"begin=1 terminal=0 distance=-1");
+		manager->recordPlayerBotBazaarVisit(identityId,
+			"noOutdoorTerminal");
+		MissionDiagLog::event("BAZAAR_VISIT", identityId,
+			"end=1 outcome=noOutdoorTerminal terminal=0 distance=-1");
+		return false;
+	}
+
+	manager->tryStationTravelForArtisanBazaar(strongAgent->getObjectID(),
+		planet, artisanBazaarCityPoint);
+	artisanBazaarLeg = ARTISAN_BAZAAR_TO_CITY;
+	state = MOVING;
+	maybeMountForTravel(artisanBazaarCityPoint);
+	moveTo(artisanBazaarCityPoint);
+	artisanBazaarGeneration = getWorkLoopGeneration();
+
+	scheduleArtisanBazaarTimeout();
+	MissionDiagLog::event("BAZAAR_VISIT", identityId,
+		"begin=1 city=" + artisanBazaarCity + " terminal=1");
+	logStateTransition("SimMinerArtisanBazaarStarted city=" +
+        artisanBazaarCity + " generation=" +
+        String::valueOf(artisanBazaarGeneration));
+	return true;
+}
+
+void SimMinerController::scheduleArtisanBazaarTimeout() {
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	int timeoutSeconds = manager == nullptr ? 1 :
+		manager->getPlayerBotBazaarVisitTimeoutSeconds();
+	if (timeoutSeconds < 1)
+		timeoutSeconds = 1;
+	Reference<SimBehaviorTask*> timeoutTask = new SimBehaviorTask(this,
+		SimBehaviorTask::FINISH_ARTISAN_BAZAAR_TIMEOUT,
+		artisanBazaarGeneration);
+	timeoutTask->schedule(timeoutSeconds * 1000);
+}
+
+void SimMinerController::finishArtisanBazaarVisit(const String& outcome) {
+    if (artisanBazaarLeg == ARTISAN_BAZAAR_NONE)
+        return;
+
+    SimPlayerManager* manager = SimPlayerManager::instance();
+    String visitOutcome = outcome;
+    if (manager != nullptr && outcome == "arrived") {
+        ManagedReference<AiAgent*> strongAgent = agent;
+        Zone* zone = nullptr;
+        Vector3 position(0, 0, 0);
+        if (strongAgent != nullptr) {
+            Locker agentLocker(strongAgent);
+            zone = strongAgent->getZone();
+            position = strongAgent->getWorldPosition();
+        }
+        SceneObject* terminal = zone == nullptr ? nullptr :
+            MarketSeederBridge::findBazaarTerminal(zone, position.getX(),
+                position.getZ(), position.getY(),
+                static_cast<float>(manager->getPlayerBotBazaarMaxDetourMeters()),
+                true);
+        if (terminal == nullptr) {
+            visitOutcome = "noOutdoorTerminal";
+		} else {
+			bool listed = manager->listPlayerBotItemsAtTerminal(identityId,
+				strongAgent->asCreatureObject(), terminal);
+            bool bought = manager->buyPlayerBotItemsAtTerminal(identityId,
+                terminal);
+            if (listed && bought)
+                visitOutcome = "listedAndBought";
+            else if (listed)
+                visitOutcome = "listed";
+            else if (bought)
+                visitOutcome = "bought";
+            else
+                visitOutcome = "none";
+        }
+    }
+
+	if (manager != nullptr)
+		manager->recordPlayerBotBazaarVisit(identityId, visitOutcome);
+	if (manager != nullptr)
+		MissionDiagLog::event("BAZAAR_VISIT", identityId,
+			"end=1 outcome=" + visitOutcome + " city=" + artisanBazaarCity);
+    dismountIfMounted("artisanBazaarFinished");
+    artisanBazaarLeg = ARTISAN_BAZAAR_NONE;
+    artisanBazaarGeneration = advanceWorkLoopGeneration(
+        "artisanBazaarFinished");
+    artisanBazaarCity = "";
+    state = WAITING;
+    startSimLoop();
+}
+
+void SimMinerController::finishArtisanBazaarVisitTimeout(uint64 generation) {
+    if (artisanBazaarLeg == ARTISAN_BAZAAR_NONE ||
+            generation != artisanBazaarGeneration)
+        return;
+    finishArtisanBazaarVisit("timeout");
 }
 
 bool SimPlayerController::isAtTicketCollector() const {
@@ -6525,8 +6728,30 @@ bool SimPlayerController::handleInterplanetaryTravelPathFailed() {
 }
 
 void SimMinerController::onArrived() {
-    if (handleInterplanetaryTravelArrival())
-        return;
+	if (artisanBazaarLeg != ARTISAN_BAZAAR_NONE) {
+		if (!artisanBazaarCallbackCurrent())
+			return;
+
+		if (artisanBazaarLeg == ARTISAN_BAZAAR_TO_CITY) {
+			// Invalidate the city-leg timeout before replacing its movement. The
+			// subsequent moveTo() advances the live generation again, and that
+			// generation owns the terminal-leg timeout and callbacks.
+			advanceWorkLoopGeneration("artisanBazaarCityArrived");
+			artisanBazaarLeg = ARTISAN_BAZAAR_TO_TERMINAL;
+			state = MOVING;
+			maybeMountForTravel(artisanBazaarTerminalPoint);
+			moveTo(artisanBazaarTerminalPoint);
+			artisanBazaarGeneration = getWorkLoopGeneration();
+			scheduleArtisanBazaarTimeout();
+			return;
+		}
+
+		finishArtisanBazaarVisit("arrived");
+		return;
+	}
+
+	if (handleInterplanetaryTravelArrival())
+		return;
 
     if (intelligentAssignmentActive) {
         // P.4.5c final approach: a long off-navmesh walk can terminate short of
@@ -6592,7 +6817,14 @@ void SimMinerController::onArrived() {
 }
 
 void SimMinerController::onPathFailed() {
-    if (isStructureTraversalFeatureEnabled() && isTraversalActive()) {
+	if (artisanBazaarLeg != ARTISAN_BAZAAR_NONE) {
+		if (!artisanBazaarCallbackCurrent())
+			return;
+		finishArtisanBazaarVisit("pathFailed");
+		return;
+	}
+
+	if (isStructureTraversalFeatureEnabled() && isTraversalActive()) {
         SimPlayerController::onPathFailed();
         return;
     }
@@ -7006,11 +7238,27 @@ void SimMinerController::finishSample() {
         return;
     }
 
-    String completedResource = targetResource;
-    int yieldAmount = 0;
-    bool logYield = false;
-    bool recordYield = prepareConceptualYield(completedResource, yieldAmount, logYield);
-    uint64 sourceObjectID = strongAgent->getObjectID();
+	String completedResource = targetResource;
+	int yieldAmount = 0;
+	bool logYield = false;
+	uint64 sourceObjectID = strongAgent->getObjectID();
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	bool realSample = false;
+	bool recordYield = false;
+	if (identityId != 0 && manager != nullptr) {
+		int sampledUnits = 0;
+		PlayerBotSampleDisposition disposition = manager->samplePlayerBotResource(
+			identityId, strongAgent->asCreatureObject(), completedResource, &sampledUnits,
+			nullptr);
+		if (disposition != PLAYER_BOT_SAMPLE_GATE_OFF) {
+			realSample = true;
+			yieldAmount = sampledUnits;
+			recordYield = true;
+		}
+	}
+	if (!realSample)
+		recordYield = prepareConceptualYield(completedResource, yieldAmount,
+		logYield);
 
     logStateTransition("SimMinerLegacySampleFinished resource=" + completedResource);
     strongAgent->setPosture(CreaturePosture::UPRIGHT, true);
@@ -7018,10 +7266,16 @@ void SimMinerController::finishSample() {
     startSimLoop();
 
     // Keep conceptual accounting outside the completed sample's agent work.
-    if (recordYield) {
-        SimPlayerManager::instance()->recordConceptualMinerYield(
-            completedResource, yieldAmount, sourceObjectID, logYield);
-    }
+	if (recordYield && manager != nullptr) {
+		if (realSample) {
+			if (yieldAmount > 0)
+				manager->recordIntelligentConceptualMinerYield(
+					completedResource, yieldAmount, sourceObjectID, false);
+		} else {
+			manager->recordConceptualMinerYield(completedResource, yieldAmount,
+				sourceObjectID, logYield);
+		}
+	}
 }
 
 bool SimMinerController::requestIntelligentTargetAssignment(
@@ -7103,6 +7357,12 @@ bool SimMinerController::requestIntelligentTargetAssignment(
     // P.4.5b: a traveling miner is busy (running to the shuttle); the manager must
     // not hand it a normal same-planet target mid-trip.
     if (interplanetaryTravelActive) {
+        activationResult = "controllerBusy";
+        return false;
+    }
+
+    // An artisan walking to a market owns its movement until the leg ends.
+    if (artisanBazaarLeg != ARTISAN_BAZAAR_NONE) {
         activationResult = "controllerBusy";
         return false;
     }
@@ -7277,6 +7537,14 @@ void SimMinerController::performIntelligentSample() {
     agent->setMovementState(AiAgent::OBLIVIOUS);
     agent->setPosture(CreaturePosture::CROUCHED, true);
     agent->doAnimation("sample");
+    // A roster artisan samples with a real survey tool; play that tool's stock
+    // sample effect, as ResourceSpawner::sendSample does for a player.
+    if (identityId != 0) {
+        SimPlayerManager::instance()->broadcastPlayerBotSampleEffect(
+            identityId, agent,
+            intelligentResourceName.isEmpty() ? targetResource :
+                intelligentResourceName);
+    }
 
     Reference<SimBehaviorTask*> task =
         new SimBehaviorTask(this, SimBehaviorTask::FINISH_SAMPLE,
@@ -7328,11 +7596,31 @@ void SimMinerController::finishIntelligentSample() {
         return;
     }
 
-    String completedResource = targetResource;
-    int yieldAmount = 0;
-    bool logYield = false;
-    bool recordYield = prepareConceptualYield(completedResource, yieldAmount, logYield);
-    uint64 sourceObjectID = strongAgent->getObjectID();
+	String completedResource = targetResource;
+	int yieldAmount = 0;
+	bool logYield = false;
+	uint64 sourceObjectID = strongAgent->getObjectID();
+	SimPlayerManager* manager = SimPlayerManager::instance();
+	bool realSample = false;
+	bool recordYield = false;
+	if (identityId != 0 && manager != nullptr) {
+		int sampledUnits = 0;
+		// The intelligent assignment carries the spawn name; targetResource
+		// holds the resource type.
+		const String sampleSpawnName = intelligentResourceName.isEmpty() ?
+			completedResource : intelligentResourceName;
+		PlayerBotSampleDisposition disposition = manager->samplePlayerBotResource(
+			identityId, strongAgent->asCreatureObject(), sampleSpawnName, &sampledUnits,
+			nullptr);
+		if (disposition != PLAYER_BOT_SAMPLE_GATE_OFF) {
+			realSample = true;
+			yieldAmount = sampledUnits;
+			recordYield = true;
+		}
+	}
+	if (!realSample)
+		recordYield = prepareConceptualYield(completedResource, yieldAmount,
+		logYield);
 
     logIntelligentTargetArrival("sample_finished");
     Logger::console.info(
@@ -7344,8 +7632,8 @@ void SimMinerController::finishIntelligentSample() {
             (intelligentTargetHash.isEmpty() ?
                 String("none") : intelligentTargetHash),
         true);
-    SimPlayerManager::instance()->recordMinerIntelligentTargetAssignmentLifecycleFromController(
-        sourceObjectID, "sampleFinished");
+	manager->recordMinerIntelligentTargetAssignmentLifecycleFromController(
+		sourceObjectID, "sampleFinished");
     strongAgent->setPosture(CreaturePosture::UPRIGHT, true);
     strongAgent->doAnimation("stop_sample");
 
@@ -7353,21 +7641,45 @@ void SimMinerController::finishIntelligentSample() {
     int repeatedSampleDelayMs = 0;
     String stationedReason;
     bool retainedStationed =
-        SimPlayerManager::instance()->transitionMinerIntelligentAssignmentToStationed(
+		manager->transitionMinerIntelligentAssignmentToStationed(
             sourceObjectID,
             recordYield ? yieldAmount : 0,
             scheduleRepeatedSample,
             repeatedSampleDelayMs,
             stationedReason);
 
-    if (recordYield) {
-        if (retainedStationed) {
-            SimPlayerManager::instance()->recordSimulatedAcquisitionTransactionFromController(
-                sourceObjectID, yieldAmount);
-        }
+	if (realSample) {
+		// Shadow mirror of the real deposit, on the same condition as the
+		// simulated path; a failed real sample records nothing.
+		if (yieldAmount > 0) {
+			if (retainedStationed)
+				manager->recordSimulatedAcquisitionTransactionFromController(
+					sourceObjectID, yieldAmount);
+			manager->recordIntelligentConceptualMinerYield(completedResource,
+				yieldAmount, sourceObjectID, false);
+		}
+	} else if (recordYield) {
+		if (retainedStationed)
+			manager->recordSimulatedAcquisitionTransactionFromController(
+				sourceObjectID, yieldAmount);
 
-        SimPlayerManager::instance()->recordIntelligentConceptualMinerYield(
-            completedResource, yieldAmount, sourceObjectID, logYield);
+		manager->recordIntelligentConceptualMinerYield(completedResource,
+			yieldAmount, sourceObjectID, logYield);
+	}
+
+    // A stationed miner re-samples indefinitely and never passes through
+    // startSimLoop, so an artisan with a sale due leaves its station here.
+    if (retainedStationed && identityId != 0 &&
+            manager->shouldPlayerBotVisitBazaar(identityId)) {
+        retainedStationed = false;
+        stationedReason = "artisanBazaar";
+    }
+    // A stationed legacy miner never passes through startSimLoop either; leave
+    // the station so a pending retirement completes there.
+    if (retainedStationed && identityId == 0 &&
+            legacyRetirementRequested.load(std::memory_order_acquire)) {
+        retainedStationed = false;
+        stationedReason = "legacyMinerRetired";
     }
 
     if (retainedStationed) {
@@ -7390,7 +7702,7 @@ void SimMinerController::finishIntelligentSample() {
     }
 
     clearLocalIntelligentTargetAssignment();
-    SimPlayerManager::instance()->clearMinerIntelligentTargetAssignmentFromController(
+	manager->clearMinerIntelligentTargetAssignmentFromController(
         sourceObjectID,
         stationedReason.isEmpty() ? String("sampleComplete") : stationedReason);
     startSimLoop();

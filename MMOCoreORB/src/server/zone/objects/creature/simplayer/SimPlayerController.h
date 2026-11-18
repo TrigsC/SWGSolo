@@ -286,6 +286,8 @@ public:
     static const int FINISH_SURVEY = 1;
     static const int FINISH_SAMPLE = 2;
     static const int START_STATIONED_SAMPLE = 3;
+    static const int FINISH_ARTISAN_BAZAAR_TIMEOUT = 4;
+    static const int LEGACY_RETIREMENT_CHECK = 5;
 
     SimBehaviorTask(SimPlayerController* ctrl, int t, uint64 g) : controller(ctrl), type(t), generation(g) {}
     void run() override;
@@ -1006,9 +1008,24 @@ public:
 // MINER CONTROLLER (Resource Gathering)
 // -------------------------------------------------------
 class SimMinerController : public SimPlayerController {
+    enum ArtisanBazaarLeg {
+        ARTISAN_BAZAAR_NONE,
+        ARTISAN_BAZAAR_TO_CITY,
+        ARTISAN_BAZAAR_TO_TERMINAL
+    };
     String targetResource;
     int retryCount;
     SimMinerConfig config;
+    uint64 identityId = 0;
+    // Set by the maintenance thread; the miner retires itself at its next
+    // idle boundary on its own thread, so retirement never races its work.
+    std::atomic<bool> legacyRetirementRequested{false};
+    bool consumeLegacyRetirementRequest();
+    ArtisanBazaarLeg artisanBazaarLeg = ARTISAN_BAZAAR_NONE;
+    uint64 artisanBazaarGeneration = 0;
+    Vector3 artisanBazaarCityPoint;
+    Vector3 artisanBazaarTerminalPoint;
+    String artisanBazaarCity;
     bool intelligentAssignmentPending;
     bool intelligentAssignmentActive;
     bool intelligentSampleActive;
@@ -1047,6 +1064,8 @@ class SimMinerController : public SimPlayerController {
 public:
     SimMinerController(AiAgent* aiAgent);
     SimMinerController(AiAgent* aiAgent, const SimMinerConfig& minerConfig);
+    SimMinerController(AiAgent* aiAgent, const SimMinerConfig& minerConfig,
+        uint64 rosterIdentityId);
     virtual ~SimMinerController();
 
     void startSimLoop() override;
@@ -1054,6 +1073,17 @@ public:
     void onPathFailed() override;
     bool shouldContinueArrivalChecks() const override;
     bool shouldRepathWhenStuck() const override;
+
+    uint64 getRosterIdentityId() const { return identityId; }
+    // Retirement is checked by the manager without holding an agent or
+    // assignment lock. A legacy miner may be torn down only at a boundary,
+    // never during either stock or intelligent sampling.
+    // Sets the flag and books a check on the miner's own work loop, so an idle
+    // miner (which never re-enters startSimLoop on its own) also retires.
+    void requestLegacyRetirement();
+    // atLoopBoundary: called from startSimLoop after an action completed, so
+    // the state left by that action is stale and is not consulted.
+    bool runLegacyRetirementCheck(bool atLoopBoundary);
 
     // P.4.4b mounted travel (see member comment). Both are safe to call without
     // the agent locked; they take/release their own locks and are idempotent.
@@ -1066,6 +1096,7 @@ public:
     void goToResource(const String& resourceName);
     void performSample();
     void finishSample();
+    void finishArtisanBazaarVisitTimeout(uint64 generation);
     void startStationedSample();
     bool requestIntelligentTargetAssignment(
         const String& profileKey,
@@ -1108,12 +1139,17 @@ public:
     bool isAvailableForDispatch() const {
         return !(intelligentAssignmentPending || intelligentAssignmentActive ||
                  intelligentSampleActive || intelligentAssignmentStationed ||
-                 interplanetaryTravelActive);
+                 interplanetaryTravelActive ||
+                 artisanBazaarLeg != ARTISAN_BAZAAR_NONE);
     }
 
     String pickRandomResource();
 
 private:
+    bool beginArtisanBazaarVisit();
+    void scheduleArtisanBazaarTimeout();
+    void finishArtisanBazaarVisit(const String& outcome);
+    bool artisanBazaarCallbackCurrent() const;
     void logStateTransition(const String& message) const;
     void logLegacyLoopSuppressed(const String& reason) const;
     void onStaleWorkLoopTaskIgnored(const String& taskType, uint64 capturedGeneration, uint64 currentGeneration) override;

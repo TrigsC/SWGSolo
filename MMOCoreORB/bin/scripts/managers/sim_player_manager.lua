@@ -2339,6 +2339,120 @@ SimPlayerManagerConfig = {
                 {op="assertItemRow", identityRef="bagRoom", itemState="held", itemCount=1},
                 {op="assertHarvestContainer", identityRef="bagRoom", itemCount=1, matchHarvest=true},
                 {op="deleteIdentity", identityRef="bagRoom"}}},
+            -- P.10r artisan sampling. These are harness-only and remain inert
+            -- until the parity harness itself is enabled; each gate is still
+            -- identity-scoped so the default-off sampling setting is covered.
+            {name="sample_gate_off", budgetMs=900000, steps={
+                {op="mintIdentity", identityRef="sampleOff"},
+                {op="respawnBody", identityRef="sampleOff"},
+                {op="setLootGate", identityRef="sampleOff", lootGate=true},
+                {op="setSamplingGate", identityRef="sampleOff", gateEnabled=false},
+                {op="sampleResource", identityRef="sampleOff", toolClass="mineral"},
+                {op="assertSampleResult", identityRef="sampleOff", expect="gateOff"},
+                {op="deleteIdentity", identityRef="sampleOff"}}},
+            {name="sample_requires_artisan", budgetMs=900000, steps={
+                {op="mintIdentity", identityRef="sampleNoArtisan"},
+                {op="respawnBody", identityRef="sampleNoArtisan"},
+                {op="setLootGate", identityRef="sampleNoArtisan", lootGate=true},
+                {op="setSamplingGate", identityRef="sampleNoArtisan", gateEnabled=true},
+                {op="sampleResource", identityRef="sampleNoArtisan", toolClass="mineral"},
+                {op="assertSampleResult", identityRef="sampleNoArtisan", expect="noSkill"},
+                {op="deleteIdentity", identityRef="sampleNoArtisan"}}},
+            {name="sample_requires_tool", budgetMs=900000, steps={
+                {op="mintIdentity", identityRef="sampleNoTool"},
+                {op="respawnBody", identityRef="sampleNoTool"},
+                {op="setTrainingGate", gateEnabled=true},
+                {op="trainSkill", identityRef="sampleNoTool", skillName="crafting_artisan_novice", freeGrant=true},
+                {op="setLootGate", identityRef="sampleNoTool", lootGate=true},
+                {op="setSamplingGate", identityRef="sampleNoTool", gateEnabled=true},
+                {op="sampleResource", identityRef="sampleNoTool", toolClass="mineral"},
+                {op="assertSampleResult", identityRef="sampleNoTool", expect="noTool"},
+                {op="deleteIdentity", identityRef="sampleNoTool"}}},
+            {name="sample_deposit_and_xp", budgetMs=900000, steps={
+                {op="mintIdentity", identityRef="sampleBot"},
+                {op="respawnBody", identityRef="sampleBot"},
+                {op="setTrainingGate", gateEnabled=true},
+                {op="trainSkill", identityRef="sampleBot", skillName="crafting_artisan_novice", freeGrant=true},
+                -- A novice surveyor rounds below the stock 2-unit minimum; train the line.
+                {op="trainSkill", identityRef="sampleBot", skillName="crafting_artisan_survey_01", freeGrant=true},
+                {op="trainSkill", identityRef="sampleBot", skillName="crafting_artisan_survey_02", freeGrant=true},
+                {op="trainSkill", identityRef="sampleBot", skillName="crafting_artisan_survey_03", freeGrant=true},
+                {op="trainSkill", identityRef="sampleBot", skillName="crafting_artisan_survey_04", freeGrant=true},
+                {op="setLootGate", identityRef="sampleBot", lootGate=true},
+                {op="setSamplingGate", identityRef="sampleBot", gateEnabled=true},
+                {op="grantSurveyTool", identityRef="sampleBot", toolClass="mineral"},
+                {op="sampleResource", identityRef="sampleBot", toolClass="mineral"},
+                {op="assertSampleResult", identityRef="sampleBot", expect="sampled"},
+                {op="assertItemRow", identityRef="sampleBot", itemState="held", itemCount=2},
+                {op="assertCounterDelta", counter="sampling.results.sampled", expect="1"},
+                {op="deleteIdentity", identityRef="sampleBot"}}},
+            {name="sample_stack_merge", budgetMs=1200000, steps={
+                {op="mintIdentity", identityRef="sampleStack"},
+                {op="respawnBody", identityRef="sampleStack"},
+                {op="setTrainingGate", gateEnabled=true},
+                {op="trainSkill", identityRef="sampleStack", skillName="crafting_artisan_novice", freeGrant=true},
+                -- A novice surveyor rounds below the stock 2-unit minimum; train the line.
+                {op="trainSkill", identityRef="sampleStack", skillName="crafting_artisan_survey_01", freeGrant=true},
+                {op="trainSkill", identityRef="sampleStack", skillName="crafting_artisan_survey_02", freeGrant=true},
+                {op="trainSkill", identityRef="sampleStack", skillName="crafting_artisan_survey_03", freeGrant=true},
+                {op="trainSkill", identityRef="sampleStack", skillName="crafting_artisan_survey_04", freeGrant=true},
+                {op="setLootGate", identityRef="sampleStack", lootGate=true},
+                {op="setSamplingGate", identityRef="sampleStack", gateEnabled=true},
+                {op="grantSurveyTool", identityRef="sampleStack", toolClass="mineral"},
+                {op="sampleResource", identityRef="sampleStack", toolClass="mineral"},
+                {op="sampleResource", identityRef="sampleStack", toolClass="mineral"},
+                {op="assertSampleResult", identityRef="sampleStack", expect="sampled"},
+                {op="assertItemRow", identityRef="sampleStack", itemState="held", itemCount=2},
+                {op="deleteIdentity", identityRef="sampleStack"}}},
+            {name="survey_tool_grant_idempotent", budgetMs=900000, steps={
+                {op="mintIdentity", identityRef="sampleTool"},
+                {op="respawnBody", identityRef="sampleTool"},
+                {op="setSamplingGate", identityRef="sampleTool", gateEnabled=true},
+                {op="setLootGate", identityRef="sampleTool", lootGate=true},
+                {op="grantSurveyTool", identityRef="sampleTool", toolClass="mineral"},
+                {op="grantSurveyTool", identityRef="sampleTool", toolClass="mineral"},
+                {op="assertItemRow", identityRef="sampleTool", itemState="held", itemCount=1},
+                {op="deleteIdentity", identityRef="sampleTool"}}},
+            {name="stale_stack_discard", budgetMs=900000, steps={
+                {op="mintIdentity", identityRef="staleDiscard"},
+                {op="respawnBody", identityRef="staleDiscard"},
+                {op="setLootGate", identityRef="staleDiscard", lootGate=true},
+                {op="setSamplingGate", identityRef="staleDiscard", gateEnabled=true},
+                {op="setStaleStacksGate", identityRef="staleDiscard", gateEnabled=true},
+                {op="setLootCap", identityRef="staleDiscard", lootCap=1},
+                {op="seedStaleStack", identityRef="staleDiscard", toolClass="mineral", amount=1, qualityFactor=0.25},
+                {op="sampleResource", identityRef="staleDiscard", toolClass="mineral"},
+                {op="assertCounterDelta", counter="harvest.staleDiscarded", expect="1"},
+                {op="deleteIdentity", identityRef="staleDiscard"}}},
+            {name="stale_stack_listed", budgetMs=900000, steps={
+                {op="mintIdentity", identityRef="staleListed"},
+                {op="respawnBody", identityRef="staleListed"},
+                {op="setLootGate", identityRef="staleListed", lootGate=true},
+                {op="setSamplingGate", identityRef="staleListed", gateEnabled=true},
+                {op="setStaleStacksGate", identityRef="staleListed", gateEnabled=true},
+                {op="setBazaarSellGate", identityRef="staleListed", bazaarSellGate=true},
+                {op="grantCredits", identityRef="staleListed", bank=true, amount=1000},
+                {op="seedStaleStack", identityRef="staleListed", toolClass="mineral", amount=1, qualityFactor=0.25},
+                {op="bazaarListAt", identityRef="staleListed"},
+                {op="assertListing", identityRef="staleListed", itemState="listed", ownerIsBag=true},
+                {op="assertCounterDelta", counter="harvest.staleListed", expect="1"},
+                {op="expireListing", identityRef="staleListed"},
+                {op="runBazaarSweep", identityRef="staleListed"},
+                -- The bazaar keeps the closed row; withdrawn means RETRIEVED.
+                {op="assertListing", identityRef="staleListed", itemState="retrieved"},
+                {op="deleteIdentity", identityRef="staleListed"}}},
+            {name="stale_stack_kept_high_quality", budgetMs=900000, steps={
+                {op="mintIdentity", identityRef="staleKept"},
+                {op="respawnBody", identityRef="staleKept"},
+                {op="setLootGate", identityRef="staleKept", lootGate=true},
+                {op="setSamplingGate", identityRef="staleKept", gateEnabled=true},
+                {op="setStaleStacksGate", identityRef="staleKept", gateEnabled=true},
+                {op="setLootCap", identityRef="staleKept", lootCap=1},
+                {op="seedStaleStack", identityRef="staleKept", toolClass="mineral", amount=1, qualityFactor=0.95},
+                {op="sampleResource", identityRef="staleKept", toolClass="mineral"},
+                {op="assertItemRow", identityRef="staleKept", itemState="held", itemCount=1},
+                {op="assertCounterDelta", counter="harvest.staleDiscarded", expect="0"},
+                {op="deleteIdentity", identityRef="staleKept"}}},
             -- P.10j bazaar SELL matrix.  The whole parity harness remains
             -- disabled by default; these entries are intentionally additive
             -- so the live-only progression settings above are untouched.
@@ -3832,6 +3946,21 @@ SimPlayerManagerConfig = {
             supplySnapshotSeconds = 300,
             maxListingLoadsPerSnapshot = 64,
             maxFloorLoadsPerVisit = 32,
+            staleStacks = {
+                enabled = false,
+                keepQualityFactor = 0.75,
+                sellBelowThreshold = true,
+                discardWhenBagTight = true,
+            },
+        },
+        samplingEnabled = false,
+        sampling = {
+            pricePerUnit = {
+                mineral = 3, chemical = 3, flora = 3, gas = 3,
+                water = 3, wind = 3, solar = 3, geothermal = 3,
+                fusion = 3, inorganic = 3, default = 3,
+            },
+            maxRecentSamples = 10,
         },
         -- F_0.9.10 (P.10k): buy training-plan buyList items on the bazaar
         -- (instant buy only, at or below loot value x markup or the entry's
@@ -4322,6 +4451,20 @@ SimPlayerManagerConfig = {
         flushIntervalSeconds = 60,
         trainingPlans = {
             {
+                name = "artisan",
+                goalSkills = { "crafting_artisan_survey_04" },
+                surveyTools = { "mineral", "chemical", "gas", "water" },
+                buyList = {
+                    { template = "object/tangible/survey_tool/survey_tool_mineral.iff", quantity = 1 },
+                    { template = "object/tangible/survey_tool/survey_tool_liquid.iff", quantity = 1 },
+                    { template = "object/tangible/survey_tool/survey_tool_gas.iff", quantity = 1 },
+                    { template = "object/tangible/survey_tool/survey_tool_moisture.iff", quantity = 1 },
+                },
+                profession = "artisan",
+                weaponTemplate = "",
+                weaponType = "unarmed",
+            },
+            {
                 name = "brawler",
                 goalSkills = {
                     "combat_unarmed_master",
@@ -4434,6 +4577,7 @@ SimPlayerManagerConfig = {
             -- converges to novices only. This DELETES those identities and
             -- their lifetime stats.
             retireLegacyHunters = false,
+            retireLegacyMiners = false,
             bodyTemplate = "sim_playerbot_novice",
             -- HAM for every pool of a planned novice body (health/action/mind and
             -- their secondaries), like a starting player. 0 keeps the mobile
@@ -4450,6 +4594,28 @@ SimPlayerManagerConfig = {
                 -- Raised 1 -> 6 to fill maxHunters with novices as the legacy
                 -- hunters retire; at count = 1 the roster would simply shrink.
                 { profession = "brawler", trainingPlan = "brawler", count = 1 },
+                { profession = "artisan", trainingPlan = "artisan", count = 0 },
+            },
+        },
+        artisan = {
+            minerConfig = {
+                resources = { "iron", "gas", "water", "copper" },
+                surveyDurationMs = 4000,
+                sampleDurationMs = 15000,
+                minSearchRadius = 100,
+                maxSearchRadius = 200,
+                fallbackRadius = 100,
+                logStateTransitions = false,
+                yieldConfig = {
+                    enabled = true,
+                    minAmount = 5,
+                    maxAmount = 25,
+                    logYield = true,
+                },
+                summaryConfig = {
+                    enabled = true,
+                    intervalSeconds = 30,
+                },
             },
         },
         skillTier = 1,

@@ -24,6 +24,9 @@
 #include "SimBotLoadout.h"
 #include "MissionDiagLog.h"
 #include "server/zone/managers/creature/CreatureHarvestYield.h"
+#include "server/zone/managers/resource/resourcespawner/ResourceSampleYield.h"
+#include "server/zone/packets/scene/PlayClientEffectLocMessage.h"
+#include "server/zone/objects/tangible/tool/SurveyTool.h"
 
 #include <algorithm>
 #include <vector>
@@ -5899,14 +5902,8 @@ static String formatResourceIntelligenceLine(const String& label, const Resource
     return line;
 }
 
-static void loadMinerConfig(LuaObject& group, SimMinerConfig& minerConfig) {
-    LuaObject config = group.getObjectField("minerConfig");
-
-    if (!config.isValidTable()) {
-        config.pop();
-        return;
-    }
-
+static void loadMinerConfigFields(LuaObject& config,
+        SimMinerConfig& minerConfig) {
     LuaObject resources = config.getObjectField("resources");
     if (resources.isValidTable()) {
         Vector<String> parsedResources;
@@ -5964,6 +5961,14 @@ static void loadMinerConfig(LuaObject& group, SimMinerConfig& minerConfig) {
         minerConfig.resources.add("water");
         minerConfig.resources.add("copper");
     }
+
+}
+
+static void loadMinerConfig(LuaObject& group, SimMinerConfig& minerConfig) {
+    LuaObject config = group.getObjectField("minerConfig");
+
+    if (config.isValidTable())
+        loadMinerConfigFields(config, minerConfig);
 
     config.pop();
 }
@@ -6065,8 +6070,8 @@ void SimPlayerManager::loadLuaConfig() {
         return;
     }
 
-    allShuttleports.removeAll();
-    spawnGroups.removeAll();
+	allShuttleports.removeAll();
+	spawnGroups.removeAll();
     {
         Locker squadLock(&pvpSquadMutex);
         pvpCityLocationsCache.removeAll();
@@ -6149,8 +6154,10 @@ void SimPlayerManager::loadLuaConfig() {
 	pveHuntingProfessions.removeAll();
 	pveHuntingProfessions.add("hunter");
 	pveHuntingProfessions.add("brawler");
+	pveArtisanMinerConfig = SimMinerConfig();
 	pveNoviceEnabled = false;
 	pveRetireLegacyHunters = false;
+	pveRetireLegacyMiners = false;
 	pveNoviceBodyTemplate = "";
 	pveNoviceSpawnPlanet = "";
 	pveNoviceSpawnCity = "";
@@ -6330,6 +6337,12 @@ void SimPlayerManager::loadLuaConfig() {
 	progressionTrainingEnabled = false;
 	progressionEarlyGameEnabled = false;
 	progressionCombatAbilitiesEnabled = false;
+	progressionSamplingEnabled = false;
+	progressionSamplingPolicy = PlayerBotSamplingPolicy();
+	{
+		Locker samplingLock(&progressionSamplingMutex);
+		progressionSamplingLastSamples.removeAll();
+	}
 	progressionLairTacticsEnabled = false;
 	progressionEarlyGameRealWeaponDamage = false;
 	progressionWeaponLoadout = false;
@@ -6478,6 +6491,14 @@ void SimPlayerManager::loadLuaConfig() {
 		playerBotParityTestHarvestGateOverride = false;
 		playerBotParityHarvestGateScopedIds.removeAll();
 		playerBotParityHarvestGateValues.removeAll();
+		playerBotParityTestSamplingGateOverrideActive = false;
+		playerBotParityTestSamplingGateOverride = false;
+		playerBotParitySamplingGateScopedIds.removeAll();
+		playerBotParitySamplingGateValues.removeAll();
+		playerBotParityTestStaleStacksGateOverrideActive = false;
+		playerBotParityTestStaleStacksGateOverride = false;
+		playerBotParityStaleStacksGateScopedIds.removeAll();
+		playerBotParityStaleStacksGateValues.removeAll();
 		playerBotParityTestBazaarSellGateOverrideActive = false;
 		playerBotParityBazaarSellGateScopedIds.removeAll();
 		playerBotParityTestBazaarBuyGateOverrideActive = false;
@@ -8066,6 +8087,19 @@ void SimPlayerManager::buildTrainingPlansFromConfig(LuaObject& config) {
 				}
 			}
 			buyList.pop();
+			LuaObject surveyTools = planTable.getObjectField("surveyTools");
+			if (surveyTools.isValidTable()) {
+				for (int toolIndex = 1;
+						toolIndex <= surveyTools.getTableSize(); ++toolIndex) {
+					String toolClass = surveyTools.getStringAt(toolIndex).trim()
+						.toLowerCase();
+					if (SimBotSampling::toolClassFromName(
+							std::string(toolClass.toCharArray())) != 0 &&
+							!plan.surveyTools.contains(toolClass))
+						plan.surveyTools.add(toolClass);
+				}
+			}
+			surveyTools.pop();
 			if (plan.name.isEmpty())
 				plan.name = "training_plan_" + String::valueOf(i);
 			if (plan.goalSkills.size() == 0)
@@ -8235,6 +8269,9 @@ void SimPlayerManager::buildTrainingPlansFromConfig(LuaObject& config) {
 				String::valueOf(entry.quantity) + ":" +
 				String::valueOf(entry.maxPrice) + ",";
 		}
+		signature += "|survey=";
+		for (int j = 0; j < plan.surveyTools.size(); ++j)
+			signature += plan.surveyTools.get(j) + ",";
 		signature += ";";
 	}
 
@@ -8533,6 +8570,7 @@ void SimPlayerManager::runPlayerBotTrainingSweep() {
 	const bool trainingGateEnabled = playerBotTrainingGateEnabled();
 	const bool earlyGameGateEnabled = playerBotEarlyGameGateEnabled();
 
+	{
 	Locker progressionLock(&progressionMutex);
 	for (int i = 0; i < rosterBatch.size(); ++i) {
 		const SimBotIdentity& identity = rosterBatch.get(i);
@@ -8551,6 +8589,13 @@ void SimPlayerManager::runPlayerBotTrainingSweep() {
 	if (startCursor + rosterBatch.size() >= static_cast<uint64>(rosterSize))
 		trainingSweepPasses.increment();
 	trainingSweepCursor = nextCursor;
+	}
+
+	// Tool grants run after the progression snapshot is released.  They take
+	// the vault object locks and therefore must not be nested under the manager
+	// store lock.
+	for (int i = 0; i < rosterBatch.size(); ++i)
+		ensurePlayerBotSurveyTools(rosterBatch.get(i).id);
 }
 
 void SimPlayerManager::runPlayerBotCombatAbilityReapplySweep() {
@@ -9539,12 +9584,16 @@ bool SimPlayerManager::destroyPlayerBotHeldItem(uint64 identityId,
 		markProgressionDirtyLocked(identityId);
 		markPlayerBotLoadoutDirtyLocked(identityId);
 	}
+	if (reason == "stale")
+		harvestStaleDiscarded.increment();
 	return true;
 }
 
 bool SimPlayerManager::isPlayerBotResourceListingLocked(uint64 objectId) {
-	return progressionItems.contains(objectId) &&
-		progressionItems.get(objectId).source == "harvest";
+	if (!progressionItems.contains(objectId))
+		return false;
+	const String& source = progressionItems.get(objectId).source;
+	return source == "harvest" || source == "sample";
 }
 
 // A bot with a nearly full bag discards loot before it opens another corpse:
@@ -9581,8 +9630,15 @@ void SimPlayerManager::makePlayerBotBagRoom(uint64 identityId) {
 	collectPlayerBotProtectedWeaponOids(identityId, protectedIds);
 	collectPlayerBotProtectedArmorOids(identityId, protectedIds);
 	collectPlayerBotProtectedConsumableOids(identityId, protectedIds);
+	PlayerBotHarvestPolicy harvestPolicy;
+	{
+		Locker harvestLock(&progressionHarvestMutex);
+		harvestPolicy = progressionHarvestPolicy;
+	}
+	const bool staleStacksGate = playerBotStaleStacksGateEnabled(identityId);
 
 	Vector<uint64> lootIds;
+	Vector<uint64> staleIds;
 	{
 		Locker progressionLock(&progressionMutex);
 		const uint64 held = progressionItemHeldCounts.contains(identityId) ?
@@ -9598,6 +9654,15 @@ void SimPlayerManager::makePlayerBotBagRoom(uint64 identityId) {
 				progressionTrainingPlans.get(trainingPlanName).buyList;
 			for (int i = 0; i < buyList.size(); ++i)
 				buyListCrcs.put(buyList.get(i).templateCrc, true);
+			const Vector<String>& surveyTools =
+				progressionTrainingPlans.get(trainingPlanName).surveyTools;
+			for (int i = 0; i < surveyTools.size(); ++i) {
+				int toolClass = SimBotSampling::toolClassFromName(
+					std::string(surveyTools.get(i).toCharArray()));
+				if (toolClass != 0)
+					buyListCrcs.put(String(SimBotSampling::toolTemplate(toolClass))
+						.hashCode(), true);
+			}
 		}
 		for (int i = 0; i < progressionItems.size(); ++i) {
 			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
@@ -9611,6 +9676,24 @@ void SimPlayerManager::makePlayerBotBagRoom(uint64 identityId) {
 					continue;
 			}
 			lootIds.add(row.objectId);
+		}
+		if (staleStacksGate &&
+				harvestPolicy.staleStacks.discardWhenBagTight) {
+			for (int i = 0; i < progressionItems.size(); ++i) {
+				const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+				if (row.identityId != identityId || row.state != SIMBOT_ITEM_HELD ||
+						(row.source != "harvest" && row.source != "sample") ||
+						protectedIds.contains(row.objectId) ||
+						buyListCrcs.contains(row.templateCrc))
+					continue;
+				if (progressionBazaarListings.contains(row.objectId)) {
+					const int state = progressionBazaarListings.get(row.objectId).state;
+					if (state == SimBotBazaar::PENDING ||
+							state == SimBotBazaar::LISTED)
+						continue;
+				}
+				staleIds.add(row.objectId);
+			}
 		}
 	}
 
@@ -9654,9 +9737,82 @@ void SimPlayerManager::makePlayerBotBagRoom(uint64 identityId) {
 		++discarded;
 		lootJunkDiscarded.increment();
 	}
-	if (discarded > 0)
+	struct StaleDiscard {
+		SimBotSampling::StaleStack stack;
+	};
+	std::vector<StaleDiscard> staleDiscards;
+	int staleDiscarded = 0;
+	if (staleStacksGate &&
+			harvestPolicy.staleStacks.discardWhenBagTight &&
+			freeSlots < targetFree) {
+		for (int i = 0; i < staleIds.size(); ++i) {
+			ManagedReference<SceneObject*> object = zoneServer->getObject(
+				staleIds.get(i));
+			ResourceContainer* resource = object == nullptr ? nullptr :
+				cast<ResourceContainer*>(object.get());
+			if (resource == nullptr)
+				continue;
+			uint64 units = 0;
+			ManagedReference<ResourceSpawn*> resourceSpawn;
+			bool stillHeld = false;
+			{
+				Locker objectLock(object);
+				stillHeld = object->getParent().get() == bag.get();
+				if (stillHeld) {
+					int quantity = resource->getQuantity();
+					units = quantity > 0 ? static_cast<uint64>(quantity) : 0;
+					resourceSpawn = resource->getSpawnObject();
+				}
+			}
+			if (!stillHeld || resourceSpawn == nullptr || units == 0)
+				continue;
+			bool inShift = true;
+			float qualityFactor = 0.f;
+			{
+				Locker spawnLock(resourceSpawn);
+				inShift = resourceSpawn->inShift();
+				int attributes[10] = {
+					getResourceAttribute(resourceSpawn, "res_quality"),
+					getResourceAttribute(resourceSpawn, "res_conductivity"),
+					getResourceAttribute(resourceSpawn, "res_decay_resist"),
+					getResourceAttribute(resourceSpawn, "res_heat_resist"),
+					getResourceAttribute(resourceSpawn, "res_flavor"),
+					getResourceAttribute(resourceSpawn, "res_malleability"),
+					getResourceAttribute(resourceSpawn, "res_potential_energy"),
+					getResourceAttribute(resourceSpawn, "res_shock_resistance"),
+					getResourceAttribute(resourceSpawn, "res_toughness"),
+					getResourceAttribute(resourceSpawn, "res_cold_resist")};
+				qualityFactor = SimBotHarvest::resourceQualityFactor(attributes, 10,
+					harvestPolicy.minQualityFactor);
+			}
+			if (!SimBotSampling::isStaleStack(units,
+					harvestPolicy.sellThresholdUnits, inShift, qualityFactor,
+					harvestPolicy.staleStacks.keepQualityFactor))
+				continue;
+			StaleDiscard discard;
+			discard.stack.objectId = staleIds.get(i);
+			discard.stack.units = units;
+			discard.stack.qualityFactor = qualityFactor;
+			staleDiscards.push_back(discard);
+		}
+		std::sort(staleDiscards.begin(), staleDiscards.end(),
+			[](const StaleDiscard& left, const StaleDiscard& right) {
+				return SimBotSampling::staleStackComesBefore(left.stack,
+					right.stack);
+			});
+		for (size_t i = 0; i < staleDiscards.size() && freeSlots < targetFree;
+				i++) {
+			if (!destroyPlayerBotHeldItem(identityId,
+					staleDiscards[i].stack.objectId, "stale"))
+				continue;
+			++freeSlots;
+			++staleDiscarded;
+		}
+	}
+	if (discarded > 0 || staleDiscarded > 0)
 		MissionDiagLog::event("BAG_ROOM", identityId,
 			"discarded=" + String::valueOf(discarded) +
+			" stale=" + String::valueOf(staleDiscarded) +
 			" free=" + String::valueOf(freeSlots) +
 			" target=" + String::valueOf(targetFree));
 }
@@ -12013,11 +12169,57 @@ void SimPlayerManager::applyPlayerBotProgressionConfig(LuaObject& config) {
 		harvestPolicy.maxFloorLoadsPerVisit = clampIntRange(
 			harvest.getIntField("maxFloorLoadsPerVisit",
 			harvestPolicy.maxFloorLoadsPerVisit), 0, 10000);
+		LuaObject staleStacks = harvest.getObjectField("staleStacks");
+		if (staleStacks.isValidTable()) {
+			harvestPolicy.staleStacks.enabled = staleStacks.getBooleanField(
+				"enabled", harvestPolicy.staleStacks.enabled);
+			harvestPolicy.staleStacks.keepQualityFactor = std::max(0.f,
+				std::min(1.f, static_cast<float>(staleStacks.getDoubleField(
+					"keepQualityFactor",
+					harvestPolicy.staleStacks.keepQualityFactor))));
+			harvestPolicy.staleStacks.sellBelowThreshold =
+				staleStacks.getBooleanField("sellBelowThreshold",
+					harvestPolicy.staleStacks.sellBelowThreshold);
+			harvestPolicy.staleStacks.discardWhenBagTight =
+				staleStacks.getBooleanField("discardWhenBagTight",
+					harvestPolicy.staleStacks.discardWhenBagTight);
+		}
+		staleStacks.pop();
 	}
 	harvest.pop();
 	{
 		Locker harvestLock(&progressionHarvestMutex);
 		progressionHarvestPolicy = harvestPolicy;
+	}
+	progressionSamplingEnabled = config.getBooleanField("samplingEnabled",
+		progressionSamplingEnabled);
+	PlayerBotSamplingPolicy samplingPolicy = progressionSamplingPolicy;
+	LuaObject sampling = config.getObjectField("sampling");
+	if (sampling.isValidTable()) {
+		LuaObject pricePerUnit = sampling.getObjectField("pricePerUnit");
+		if (pricePerUnit.isValidTable()) {
+			samplingPolicy.defaultPricePerUnit = static_cast<uint64>(
+				clampIntRange(pricePerUnit.getIntField("default",
+					static_cast<int>(samplingPolicy.defaultPricePerUnit)),
+					0, 1000000000));
+			for (int toolClass = SimBotSampling::SOLAR;
+					toolClass <= SimBotSampling::INORGANIC; ++toolClass) {
+				const char* className = SimBotSampling::toolClassName(toolClass);
+				samplingPolicy.pricePerUnit[toolClass] = static_cast<uint64>(
+					clampIntRange(pricePerUnit.getIntField(className,
+						static_cast<int>(samplingPolicy.pricePerUnit[toolClass])),
+						0, 1000000000));
+			}
+		}
+		pricePerUnit.pop();
+		samplingPolicy.maxRecentSamples = clampIntRange(
+			sampling.getIntField("maxRecentSamples",
+				samplingPolicy.maxRecentSamples), 1, 100);
+	}
+	sampling.pop();
+	{
+		Locker samplingLock(&progressionSamplingMutex);
+		progressionSamplingPolicy = samplingPolicy;
 	}
 	progressionBazaarSellEnabled = config.getBooleanField("bazaarSell",
 		false);
@@ -13451,6 +13653,23 @@ static PlayerBotParityTestStep parsePlayerBotParityTestStep(LuaObject& table) {
 	step.harvestFamily = table.getStringField("harvestFamily").trim().toLowerCase();
 	step.harvestResourceType = table.getStringField("harvestResourceType").trim();
 	step.matchHarvestRecords = table.getBooleanField("matchHarvest", false);
+	step.sampleResourceName = table.getStringField("resource").trim();
+	if (step.sampleResourceName.isEmpty())
+		step.sampleResourceName = table.getStringField("resourceName").trim();
+	step.sampleToolClass = table.getStringField("toolClass").trim().toLowerCase();
+	// Presence = two reads with different defaults agree (LuaObject rule).
+	const float qualityFactorA = table.getFloatField("qualityFactor", -1.f);
+	const float qualityFactorB = table.getFloatField("qualityFactor", -2.f);
+	step.hasSampleQualityFactor = qualityFactorA == qualityFactorB;
+	step.sampleQualityFactor = step.hasSampleQualityFactor ? qualityFactorA : 0.f;
+	step.expectedSampleUnits = table.getIntField("sampleUnits", absentExpected);
+	step.hasExpectedSampleUnits = step.expectedSampleUnits != absentExpected;
+	if (!step.hasExpectedSampleUnits)
+		step.expectedSampleUnits = -1;
+	step.expectedSampleXp = table.getIntField("sampleXp", absentExpected);
+	step.hasExpectedSampleXp = step.expectedSampleXp != absentExpected;
+	if (!step.hasExpectedSampleXp)
+		step.expectedSampleXp = -1;
 	step.expectedHarvestUnits = table.getIntField("harvestUnits", absentExpected);
 	step.hasExpectedHarvestUnits = step.expectedHarvestUnits != absentExpected;
 	if (!step.hasExpectedHarvestUnits)
@@ -13848,16 +14067,20 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	}
 	bool noviceEnabled = false;
 	bool retireLegacyHunters = false;
+	bool retireLegacyMiners = false;
 	String noviceBodyTemplate;
 	String noviceSpawnPlanet;
 	String noviceSpawnCity;
 	int noviceBodyHam = 0;
 	Vector<PveNoviceDistribution> noviceDistribution;
+	SimMinerConfig artisanMinerConfig;
 	LuaObject noviceConfig = pveConfig.getObjectField("novice");
 	if (noviceConfig.isValidTable()) {
 		noviceEnabled = noviceConfig.getBooleanField("enabled", false);
 		retireLegacyHunters = noviceConfig.getBooleanField(
 			"retireLegacyHunters", false);
+		retireLegacyMiners = noviceConfig.getBooleanField(
+			"retireLegacyMiners", false);
 		noviceBodyTemplate = noviceConfig.getStringField(
 			"bodyTemplate").trim();
 		noviceSpawnPlanet = noviceConfig.getStringField("spawnPlanet").trim();
@@ -13873,7 +14096,7 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 					row.profession = entry.getStringField("profession").trim();
 					row.trainingPlan = entry.getStringField("trainingPlan").trim();
 					row.count = clampMinerInt(entry.getIntField("count"), 0, 0, 64);
-					if (!row.profession.isEmpty() && row.count > 0)
+					if (!row.profession.isEmpty())
 						noviceDistribution.add(row);
 				}
 				entry.pop();
@@ -13882,6 +14105,14 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		distribution.pop();
 	}
 	noviceConfig.pop();
+	LuaObject artisanConfig = pveConfig.getObjectField("artisan");
+	if (artisanConfig.isValidTable()) {
+		LuaObject minerConfig = artisanConfig.getObjectField("minerConfig");
+		if (minerConfig.isValidTable())
+			loadMinerConfigFields(minerConfig, artisanMinerConfig);
+		minerConfig.pop();
+	}
+	artisanConfig.pop();
 	pveMissionHuntEnabled = false;
 	pveMissionBoardEnabled = false;
 	pveRealBuffsEnabled = false;
@@ -14618,9 +14849,11 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 		Locker pveLock(&pveMutex);
 		pveHunterTemplates = rebuilt;
 		pveHuntingProfessions = huntingProfessions;
+		pveArtisanMinerConfig = artisanMinerConfig;
 		if (!pveNoviceGateOverrideActive)
 			pveNoviceEnabled = noviceEnabled;
 		pveRetireLegacyHunters = retireLegacyHunters;
+		pveRetireLegacyMiners = retireLegacyMiners;
 		pveNoviceBodyTemplate = noviceBodyTemplate;
 		pveNoviceSpawnPlanet = noviceSpawnPlanet;
 		pveNoviceSpawnCity = noviceSpawnCity;
@@ -14631,9 +14864,11 @@ void SimPlayerManager::applyPveConfig(LuaObject& pveConfig) {
 	{
 		Locker pveLock(&pveMutex);
 		pveHuntingProfessions = huntingProfessions;
+		pveArtisanMinerConfig = artisanMinerConfig;
 		if (!pveNoviceGateOverrideActive)
 			pveNoviceEnabled = noviceEnabled;
 		pveRetireLegacyHunters = retireLegacyHunters;
+		pveRetireLegacyMiners = retireLegacyMiners;
 		pveNoviceBodyTemplate = noviceBodyTemplate;
 		pveNoviceSpawnPlanet = noviceSpawnPlanet;
 		pveNoviceSpawnCity = noviceSpawnCity;
@@ -15477,6 +15712,7 @@ void SimPlayerManager::prunePlayerBotLedger(uint64 nowMs) {
 			"WHERE ledger.`created_at` < DATE_SUB(NOW(), INTERVAL " +
 			String::valueOf(progressionLedgerRetentionDays) +
 			" DAY) AND ledger.`source` <> 'reconcile' AND "
+			"ledger.`source` <> 'survey_tool_grant' AND "
 			"NOT (ledger.`source` IN ('bazaar_sale','bazaar_sale_reversal') "
 			"AND EXISTS (SELECT 1 FROM `simbot_listings` listing WHERE "
 			"listing.`auction_oid`=ledger.`ref_id`)) AND "
@@ -15625,6 +15861,57 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 			(void)cashVoidResult;
 		}
 
+		// One-time survey tool grant receipts are read with the store so the
+		// tool grant never needs SQL off the maintenance lane.  A receipt
+		// counts only while a granted tool survives: grants (+1) minus the
+		// larger of the revocation rows (-1, written when the item reconcile
+		// writes a tool off) and the granted objects already written off by a
+		// reconcile row (covers losses recorded before revocation rows).
+		VectorMap<uint64, bool> loadedSurveyToolReceipts;
+		VectorMap<uint64, int64> receiptGrants;
+		VectorMap<uint64, int64> receiptRevocations;
+		VectorMap<uint64, int64> reconciledToolLosses;
+		UniqueReference<ResultSet*> surveyReceiptResult(
+			ServerDatabase::instance()->executeQuery(
+				"SELECT `identity_id`,`ref_id`,"
+				"SUM(CASE WHEN `delta`>0 THEN `delta` ELSE 0 END),"
+				"SUM(CASE WHEN `delta`<0 THEN -`delta` ELSE 0 END) "
+				"FROM `simbot_ledger` WHERE `source`='survey_tool_grant' AND "
+				"`kind`='receipt' GROUP BY `identity_id`,`ref_id`;"));
+		while (surveyReceiptResult != nullptr && surveyReceiptResult->next()) {
+			const uint64 key = playerBotSurveyToolReceiptKey(
+				surveyReceiptResult->getUnsignedLong(0),
+				static_cast<int>(surveyReceiptResult->getUnsignedLong(1)));
+			receiptGrants.put(key, surveyReceiptResult->getLong(2));
+			receiptRevocations.put(key, surveyReceiptResult->getLong(3));
+		}
+		UniqueReference<ResultSet*> lostToolResult(
+			ServerDatabase::instance()->executeQuery(
+				"SELECT grant_row.`identity_id`,grant_row.`detail`,COUNT(*) "
+				"FROM `simbot_ledger` grant_row JOIN `simbot_ledger` lost_row ON "
+				"lost_row.`identity_id`=grant_row.`identity_id` AND "
+				"lost_row.`ref_id`=grant_row.`ref_id` AND lost_row.`kind`='item' "
+				"AND lost_row.`source`='reconcile' AND lost_row.`delta`<0 "
+				"WHERE grant_row.`kind`='item' AND grant_row.`source`='grant' "
+				"GROUP BY grant_row.`identity_id`,grant_row.`detail`;"));
+		while (lostToolResult != nullptr && lostToolResult->next()) {
+			const int toolClass = playerBotSurveyToolClassForTemplate(
+				String(lostToolResult->getString(1)).hashCode());
+			if (toolClass == 0)
+				continue;
+			reconciledToolLosses.put(playerBotSurveyToolReceiptKey(
+				lostToolResult->getUnsignedLong(0), toolClass),
+				lostToolResult->getLong(2));
+		}
+		for (int i = 0; i < receiptGrants.size(); ++i) {
+			const uint64 key = receiptGrants.elementAt(i).getKey();
+			const int64 revoked = std::max(receiptRevocations.get(key),
+				reconciledToolLosses.contains(key) ?
+					reconciledToolLosses.get(key) : 0);
+			if (receiptGrants.elementAt(i).getValue() - revoked > 0)
+				loadedSurveyToolReceipts.put(key, true);
+		}
+
 		UniqueReference<ResultSet*> experienceResult(
 			ServerDatabase::instance()->executeQuery(
 				"SELECT `identity_id`,`xp_type`,`amount` FROM "
@@ -15655,6 +15942,7 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 
 		VectorMap<uint64, SimBotItemRow> loadedItems;
 		VectorMap<uint64, uint64> loadedItemHeldCounts;
+		VectorMap<uint64, bool> loadedSampledArtisans;
 		UniqueReference<ResultSet*> itemResult(
 			ServerDatabase::instance()->executeQuery(
 				"SELECT `object_id`,`identity_id`,`state`,`ask_price`,`template_crc`,"
@@ -15700,6 +15988,8 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 			}
 
 			loadedItems.put(row.objectId, row);
+			if (row.source == "sample" && row.identityId != 0)
+				loadedSampledArtisans.put(row.identityId, true);
 			if ((row.state == SIMBOT_ITEM_HELD || row.state == SIMBOT_ITEM_LISTED) &&
 					row.identityId != 0) {
 				uint64 held = loadedItemHeldCounts.contains(row.identityId) ?
@@ -15923,6 +16213,7 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 					loadedListings.elementAt(i).getValue().auctionOid,
 					loadedListings.elementAt(i).getKey());
 			progressionItemHeldCounts = loadedItemHeldCounts;
+			progressionSurveyToolReceipts = loadedSurveyToolReceipts;
 			progressionItemDirtyIds.removeAll();
 			progressionOrphanIds.removeAll();
 			for (int i = 0; i < derivedSpendChanged.size(); ++i)
@@ -15937,6 +16228,12 @@ void SimPlayerManager::loadPlayerBotProgressionStore() {
 				markProgressionDirtyLocked(entry.identityId);
 				progressionLedgerBalanceMismatch.increment();
 			}
+		}
+		{
+			Locker pveLock(&pveMutex);
+			for (int i = 0; i < loadedSampledArtisans.size(); ++i)
+				pveArtisanSampledIds.put(
+					loadedSampledArtisans.elementAt(i).getKey(), true);
 		}
 
 		progressionLoaded = true;
@@ -16155,11 +16452,14 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 		return false;
 	const bool harvestSellGate = sellGate &&
 		playerBotHarvestGateEnabled(identityId);
+	const bool samplingSellGate = sellGate &&
+		playerBotSamplingGateEnabled(identityId);
 	PlayerBotHarvestPolicy harvestPolicy;
-	if (harvestSellGate) {
+	if (sellGate) {
 		Locker harvestLock(&progressionHarvestMutex);
 		harvestPolicy = progressionHarvestPolicy;
 	}
+	const bool staleStacksGate = playerBotStaleStacksGateEnabled(identityId);
 	const bool weaponUpgradeGate = buyGate &&
 		playerBotBazaarUpgradesGateEnabled(identityId) &&
 		playerBotLoadoutGateEnabled(identityId);
@@ -16194,6 +16494,8 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 	const uint64 nowMs = System::getMiliTime();
 	Vector<uint64> candidateObjectIds;
 	VectorMap<uint64, bool> neededObjectIds;
+	VectorMap<uint64, bool> resourceCandidateIds;
+	VectorMap<uint64, bool> sampledCandidateIds;
 	int liveListings = 0;
 	int liveJunkListings = 0;
 	String trainingPlanName;
@@ -16473,6 +16775,10 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 					continue;
 			}
 			candidateObjectIds.add(row.objectId);
+			if (row.source == "harvest" || row.source == "sample")
+				resourceCandidateIds.put(row.objectId, true);
+			if (row.source == "sample")
+				sampledCandidateIds.put(row.objectId, true);
 		}
 	}
 	if (candidateObjectIds.size() == 0)
@@ -16496,30 +16802,72 @@ bool SimPlayerManager::shouldPlayerBotVisitBazaar(uint64 identityId) {
 		TangibleObject* tangible = cast<TangibleObject*>(object);
 		if (tangible == nullptr)
 			continue;
-		Locker objectLock(object);
-		if (harvestSellGate && harvestPolicy.sell && liveListings <
-				progressionBazaarMaxListingsPerBot) {
-			ResourceContainer* resource = cast<ResourceContainer*>(object);
-			if (resource != nullptr) {
-				const int units = resource->getQuantity();
-				const String resourceType = resource->getSpawnType();
-				const SimBotHarvest::Family family =
-					SimBotHarvest::familyFromResourceType(
-						resourceType.toCharArray());
-				if (family != SimBotHarvest::NONE &&
-						SimBotHarvest::shouldSellStack(units < 0 ? 0 :
-							static_cast<uint64>(units),
-							harvestPolicy.sellThresholdUnits,
-							progressionBazaarMaxListingsPerBot - liveListings))
-					return true;
+		ResourceContainer* resource = cast<ResourceContainer*>(object);
+		if (resource != nullptr) {
+			int units = 0;
+			String resourceType;
+			ManagedReference<ResourceSpawn*> resourceSpawn;
+			{
+				Locker objectLock(object);
+				units = resource->getQuantity();
+				resourceType = resource->getSpawnType();
+				resourceSpawn = resource->getSpawnObject();
 			}
+			const SimBotHarvest::Family family =
+				SimBotHarvest::familyFromResourceType(
+					resourceType.toCharArray());
+			const uint64 unitCount = units < 0 ? 0 : static_cast<uint64>(units);
+		const bool standardSell = harvestPolicy.sell &&
+				((harvestSellGate && !sampledCandidateIds.contains(
+					object->getObjectID()) && family != SimBotHarvest::NONE) ||
+					(samplingSellGate && sampledCandidateIds.contains(
+						object->getObjectID()))) &&
+				SimBotHarvest::shouldSellStack(unitCount,
+					harvestPolicy.sellThresholdUnits,
+					progressionBazaarMaxListingsPerBot - liveListings);
+		bool staleSell = false;
+		const bool sourceSellGate = sampledCandidateIds.contains(
+			object->getObjectID()) ? samplingSellGate : harvestSellGate;
+		if (sourceSellGate && harvestPolicy.sell &&
+					staleStacksGate &&
+					harvestPolicy.staleStacks.sellBelowThreshold &&
+					resourceCandidateIds.contains(object->getObjectID()) &&
+					resourceSpawn != nullptr) {
+				bool inShift = true;
+				float qualityFactor = 0.f;
+				{
+					Locker spawnLock(resourceSpawn);
+					inShift = resourceSpawn->inShift();
+					int attributes[10] = {
+						getResourceAttribute(resourceSpawn, "res_quality"),
+						getResourceAttribute(resourceSpawn, "res_conductivity"),
+						getResourceAttribute(resourceSpawn, "res_decay_resist"),
+						getResourceAttribute(resourceSpawn, "res_heat_resist"),
+						getResourceAttribute(resourceSpawn, "res_flavor"),
+						getResourceAttribute(resourceSpawn, "res_malleability"),
+						getResourceAttribute(resourceSpawn, "res_potential_energy"),
+						getResourceAttribute(resourceSpawn, "res_shock_resistance"),
+						getResourceAttribute(resourceSpawn, "res_toughness"),
+						getResourceAttribute(resourceSpawn, "res_cold_resist")};
+					qualityFactor = SimBotHarvest::resourceQualityFactor(attributes,
+						10, harvestPolicy.minQualityFactor);
+				}
+				staleSell = SimBotSampling::isStaleStack(unitCount,
+					harvestPolicy.sellThresholdUnits, inShift, qualityFactor,
+					harvestPolicy.staleStacks.keepQualityFactor) &&
+					progressionBazaarMaxListingsPerBot - liveListings > 0;
+			}
+			if (standardSell || staleSell)
+				return true;
 		}
 		if (liveJunkListings < progressionBazaarMaxListingsPerBot -
-				progressionBazaarResourceListingReserve &&
-				SimBotBazaar::isSellable(tangible->getJunkValue(),
-				tangible->getJunkDealerNeeded(), tangible->isNoTrade() ||
-				tangible->containsNoTradeObjectRecursive(), true))
+				progressionBazaarResourceListingReserve) {
+			Locker objectLock(object);
+			if (SimBotBazaar::isSellable(tangible->getJunkValue(),
+					tangible->getJunkDealerNeeded(), tangible->isNoTrade() ||
+					tangible->containsNoTradeObjectRecursive(), true))
 			return true;
+		}
 	}
 	return false;
 }
@@ -16538,6 +16886,73 @@ bool SimPlayerManager::beginPlayerBotBazaarVisit(uint64 identityId) {
 			static_cast<uint64>(progressionBazaarVisitCooldownMinutes) * 60000);
 	bazaarVisitsBegun.increment();
 	return true;
+}
+
+bool SimPlayerManager::resolveArtisanBazaarDestination(
+		const String& planet, const Vector3& origin, Vector3& cityPoint,
+		Vector3& terminalPoint, String& cityName) {
+	cityPoint = Vector3(0, 0, 0);
+	terminalPoint = Vector3(0, 0, 0);
+	cityName = "";
+	if (planet.isEmpty())
+		return false;
+
+	Vector<int> candidates;
+	for (int i = 0; i < allShuttleports.size(); ++i) {
+		if (allShuttleports.get(i).planet.toLowerCase() ==
+				planet.toLowerCase())
+			candidates.add(i);
+	}
+	for (int i = 0; i < candidates.size(); ++i) {
+		for (int j = i + 1; j < candidates.size(); ++j) {
+			float leftDistance = allShuttleports.get(candidates.get(i)).spawn
+				.distanceTo2d(origin);
+			float rightDistance = allShuttleports.get(candidates.get(j)).spawn
+				.distanceTo2d(origin);
+			if (rightDistance < leftDistance) {
+				int swap = candidates.get(i);
+				candidates.set(i, candidates.get(j));
+				candidates.set(j, swap);
+			}
+		}
+	}
+
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	for (int i = 0; i < candidates.size(); ++i) {
+		const ShuttleportLocation& city = allShuttleports.get(candidates.get(i));
+		const String key = city.planet.toLowerCase() + "|" +
+			city.name.toLowerCase();
+		bool skipped = false;
+		{
+			Locker bazaarLock(&artisanBazaarMutex);
+			skipped = artisanBazaarNoTerminalCities.contains(key);
+		}
+		if (skipped)
+			continue;
+		Zone* zone = zoneServer == nullptr ? nullptr :
+			zoneServer->getZone(city.planet);
+		if (zone == nullptr)
+			continue;
+		SceneObject* terminal = MarketSeederBridge::findBazaarTerminal(
+			zone, city.spawn.getX(), city.spawn.getZ(), city.spawn.getY(),
+			static_cast<float>(getPlayerBotBazaarMaxDetourMeters()), true);
+		if (terminal == nullptr) {
+			Locker bazaarLock(&artisanBazaarMutex);
+			artisanBazaarNoTerminalCities.put(key, true);
+			continue;
+		}
+		Vector3 foundTerminal;
+		{
+			Locker terminalLock(terminal);
+			foundTerminal = Vector3(terminal->getWorldPositionX(),
+				terminal->getWorldPositionY(), terminal->getWorldPositionZ());
+		}
+		cityPoint = city.spawn;
+		terminalPoint = foundTerminal;
+		cityName = city.name;
+		return true;
+	}
+	return false;
 }
 
 void SimPlayerManager::recordPlayerBotBazaarVisit(uint64 identityId,
@@ -16736,10 +17151,14 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 		bool resource = false;
 		uint64 units = 0;
 		float qualityFactor = 0.f;
+		bool inShift = true;
+		bool stale = false;
 		SimBotHarvest::Family family = SimBotHarvest::NONE;
 		int askPrice = 0;
 		String key;
 		String resourceType;
+		int toolClass = 0;
+		String source;
 	};
 
 	Vector<ManagedReference<SceneObject*> > children;
@@ -16758,12 +17177,14 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 
 	std::vector<Candidate> candidates;
 	VectorMap<uint64, int> heldAsks;
+	VectorMap<uint64, String> heldSources;
 	VectorMap<uint64, bool> neededObjectIds;
 	PlayerBotHarvestPolicy harvestPolicy;
 	{
 		Locker harvestLock(&progressionHarvestMutex);
 		harvestPolicy = progressionHarvestPolicy;
 	}
+	const bool staleStacksGate = playerBotStaleStacksGateEnabled(identityId);
 	{
 		Locker parityLock(&playerBotParityTestMutex);
 		if (playerBotParityHarvestSellThresholdOverrides.contains(identityId))
@@ -16771,6 +17192,12 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 				playerBotParityHarvestSellThresholdOverrides.get(identityId);
 	}
 	const bool harvestGateOpen = playerBotHarvestGateEnabled(identityId);
+	const bool samplingGateOpen = playerBotSamplingGateEnabled(identityId);
+	PlayerBotSamplingPolicy samplingPolicy;
+	{
+		Locker samplingLock(&progressionSamplingMutex);
+		samplingPolicy = progressionSamplingPolicy;
+	}
 	String trainingPlanName;
 	{
 		Locker pveLock(&pveMutex);
@@ -16817,6 +17244,27 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 						rowIndex < entry.quantity; ++rowIndex)
 					neededObjectIds.put(matching[rowIndex].second, true);
 		}
+		if (progressionTrainingPlans.contains(trainingPlanName)) {
+			const Vector<String>& surveyTools =
+				progressionTrainingPlans.get(trainingPlanName).surveyTools;
+			for (int toolIndex = 0; toolIndex < surveyTools.size(); ++toolIndex) {
+				int toolClass = SimBotSampling::toolClassFromName(
+					std::string(surveyTools.get(toolIndex).toCharArray()));
+				if (toolClass == 0)
+					continue;
+				uint32 templateCrc = String(SimBotSampling::toolTemplate(toolClass))
+					.hashCode();
+				for (int rowIndex = 0; rowIndex < progressionItems.size();
+						++rowIndex) {
+					const SimBotItemRow& row =
+						progressionItems.elementAt(rowIndex).getValue();
+					if (row.identityId == identityId &&
+							row.state == SIMBOT_ITEM_HELD &&
+							row.templateCrc == templateCrc)
+						neededObjectIds.put(row.objectId, true);
+				}
+			}
+		}
 		for (int i = 0; i < progressionItems.size(); ++i) {
 			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
 			if (row.identityId != identityId || row.state != SIMBOT_ITEM_HELD)
@@ -16840,6 +17288,7 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 					continue;
 			}
 			heldAsks.put(row.objectId, row.askPrice);
+			heldSources.put(row.objectId, row.source);
 		}
 	}
 	for (int i = 0; i < children.size(); ++i) {
@@ -16856,8 +17305,11 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 		ManagedReference<ResourceSpawn*> resourceSpawn;
 		{
 			Locker objectLock(object);
-			if (resource != nullptr && harvestGateOpen) {
+			if (resource != nullptr &&
+					(heldSources.get(candidate.objectId) == "harvest" ||
+					 heldSources.get(candidate.objectId) == "sample")) {
 				candidate.resource = true;
+				candidate.source = heldSources.get(candidate.objectId);
 				candidate.units = resource->getQuantity();
 				candidate.resourceType = resource->getSpawnType();
 				candidate.family = SimBotHarvest::familyFromResourceType(
@@ -16868,6 +17320,7 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 		if (candidate.resource) {
 			if (resourceSpawn != nullptr) {
 				Locker spawnLock(resourceSpawn);
+				candidate.inShift = resourceSpawn->inShift();
 				int attributes[10] = {
 					getResourceAttribute(resourceSpawn, "res_quality"),
 					getResourceAttribute(resourceSpawn, "res_conductivity"),
@@ -16882,7 +17335,14 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 				candidate.qualityFactor =
 					SimBotHarvest::resourceQualityFactor(attributes, 10,
 						harvestPolicy.minQualityFactor);
+				candidate.toolClass = resourceSpawn->getSurveyToolType();
 			}
+			candidate.stale = staleStacksGate &&
+				harvestPolicy.staleStacks.sellBelowThreshold &&
+				SimBotSampling::isStaleStack(candidate.units,
+					harvestPolicy.sellThresholdUnits, candidate.inShift,
+					candidate.qualityFactor,
+					harvestPolicy.staleStacks.keepQualityFactor);
 			candidate.noTrade = false;
 			candidate.junkValue = 0;
 			candidate.junkMask = 0;
@@ -16904,6 +17364,20 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 		[](const Candidate& left, const Candidate& right) {
 			if (left.resource != right.resource)
 				return left.resource;
+			if (left.stale != right.stale)
+				return left.stale;
+			if (left.stale && right.stale) {
+				SimBotSampling::StaleStack leftStack;
+				leftStack.objectId = left.objectId;
+				leftStack.units = left.units;
+				leftStack.qualityFactor = left.qualityFactor;
+				SimBotSampling::StaleStack rightStack;
+				rightStack.objectId = right.objectId;
+				rightStack.units = right.units;
+				rightStack.qualityFactor = right.qualityFactor;
+				return SimBotSampling::staleStackComesBefore(leftStack,
+					rightStack);
+			}
 			return left.junkValue > right.junkValue;
 		});
 
@@ -16923,6 +17397,9 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 	VectorMap<String, SimBotHarvest::HumanFloor> resourceFloors;
 	Vector<HumanResourceListing> resourceListings;
 	bool resourceFloorIncomplete[SimBotHarvest::FAMILY_COUNT] = {};
+	// An unloaded non-creature listing could be the cheapest ask for any
+	// sampled resource, so sampled stacks wait while any such floor is unknown.
+	bool sampledFloorIncomplete = false;
 	int floorLoads = 0;
 	String planet = terminal->getZone() == nullptr ? String() :
 		terminal->getZone()->getZoneName();
@@ -16949,7 +17426,15 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 
 			SimBotHarvest::Family resourceFamily =
 				SimBotHarvest::familyFromGameObjectType(item->getItemType());
-			if (resourceFamily != SimBotHarvest::NONE && harvestGateOpen) {
+			// Auctions carry the client subtype (ORGANICHIDE, INORGANICMINERAL,
+			// ...), never the generic RESOURCECONTAINER.
+			const uint32 itemType = item->getItemType();
+			const bool resourceListing = itemType >= SceneObjectType::RESOURCECONTAINER &&
+				itemType <= SceneObjectType::ORGANICSTRUCTURAL;
+			// Sampled flora shares the organic subtypes with creature
+			// resources, so every resource subtype is scanned for sampling.
+			if (resourceListing && ((resourceFamily != SimBotHarvest::NONE &&
+					harvestGateOpen) || samplingGateOpen)) {
 				HumanResourceListing listing;
 				listing.auctionOid = item->getObjectID();
 				listing.objectOid = item->getAuctionedItemObjectID();
@@ -16991,23 +17476,35 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 				cached.family = SimBotHarvest::familyFromResourceType(
 					type.toCharArray());
 				cached.units = units > 0 ? static_cast<uint64>(units) : 0;
-				cached.valid = cached.family != SimBotHarvest::NONE &&
-					cached.units > 0;
+				cached.valid = !cached.resourceType.isEmpty() && cached.units > 0;
 			}
 			{
 				Locker harvestLock(&progressionHarvestMutex);
 				progressionHarvestListingCache.put(listing.auctionOid, cached);
 			}
 			if (!cached.valid) {
-				resourceFloorIncomplete[static_cast<int>(listing.family)] = true;
+				// A loaded listing that is not a usable resource stack is no
+				// floor risk for a sampled stack.
+				if (listing.family != SimBotHarvest::NONE)
+					resourceFloorIncomplete[static_cast<int>(listing.family)] = true;
 				continue;
 			}
 		} else if (!haveCache) {
-			resourceFloorIncomplete[static_cast<int>(listing.family)] = true;
+			if (listing.family != SimBotHarvest::NONE)
+				resourceFloorIncomplete[static_cast<int>(listing.family)] = true;
+			// Any unresolved resource listing could be a sampled stack's floor.
+			if (samplingGateOpen)
+				sampledFloorIncomplete = true;
 			continue;
 		}
-		if (!cached.valid || cached.family != listing.family ||
-				cached.resourceType.isEmpty())
+		// The family check guards creature floors only. A sampled flora stack
+		// shares the organic subtypes but has no creature family; its floor is
+		// still valid and is keyed by its own resource type.
+		if (!cached.valid || cached.resourceType.isEmpty() ||
+				(listing.family != SimBotHarvest::NONE &&
+				cached.family != SimBotHarvest::NONE &&
+				cached.family != listing.family) ||
+				(cached.family == SimBotHarvest::NONE && !samplingGateOpen))
 			continue;
 		String resourceKey = cached.resourceType.toLowerCase().trim();
 		if (resourceKey.isEmpty())
@@ -17046,12 +17543,23 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 			attempts < progressionBazaarMaxListingsPerVisit; ++i) {
 		Candidate& candidate = candidates[i];
 		if (candidate.resource) {
-			if (!harvestPolicy.sell || candidate.family == SimBotHarvest::NONE ||
-					!SimBotHarvest::shouldSellStack(candidate.units,
+			const bool harvestedResource = candidate.source == "harvest";
+			const bool sampledResource = candidate.source == "sample";
+			const bool hasListingRoom = progressionBazaarMaxListingsPerBot -
+				liveCount > 0;
+			if ((!harvestedResource && !sampledResource) ||
+					(harvestedResource && (!harvestGateOpen ||
+						candidate.family == SimBotHarvest::NONE)) ||
+					(sampledResource && !samplingGateOpen) ||
+					!harvestPolicy.sell ||
+					(!SimBotHarvest::shouldSellStack(candidate.units,
 						harvestPolicy.sellThresholdUnits,
-						progressionBazaarMaxListingsPerBot - liveCount))
+						progressionBazaarMaxListingsPerBot - liveCount) &&
+						!(candidate.stale && hasListingRoom)))
 				continue;
-			if (resourceFloorIncomplete[static_cast<int>(candidate.family)]) {
+			if ((harvestedResource &&
+					resourceFloorIncomplete[static_cast<int>(candidate.family)]) ||
+					(sampledResource && sampledFloorIncomplete)) {
 				harvestFloorIncomplete.increment();
 				MissionDiagLog::event("BAZAAR_LIST", identityId,
 					"item=" + String::valueOf(candidate.objectId) +
@@ -17064,9 +17572,15 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 				floor = SimBotHarvest::HumanFloor();
 			else
 				floor = resourceFloors.get(resourceKey);
+			uint64 pricePerUnit = harvestedResource ?
+				harvestPolicy.pricePerUnit[static_cast<int>(candidate.family)] :
+					samplingPolicy.defaultPricePerUnit;
+			if (sampledResource && candidate.toolClass >= SimBotSampling::SOLAR &&
+					candidate.toolClass <= SimBotSampling::INORGANIC)
+				pricePerUnit = samplingPolicy.pricePerUnit[candidate.toolClass];
 			SimBotHarvest::PriceDecision price =
 				SimBotHarvest::priceResourceListing(candidate.units,
-					harvestPolicy.pricePerUnit[static_cast<int>(candidate.family)],
+					pricePerUnit,
 					candidate.qualityFactor, floor,
 					static_cast<uint64>(Math::max(0, progressionBazaarMinPrice)),
 					static_cast<uint64>(Math::max(0, progressionBazaarMaxPrice)));
@@ -17093,6 +17607,8 @@ bool SimPlayerManager::listPlayerBotItemsAtTerminal(uint64 identityId,
 				++liveCount;
 				++attempts;
 				harvestListingsCreated.increment();
+				if (candidate.stale)
+					harvestStaleListed.increment();
 			} else {
 				bazaarSkippedTransferFailed.increment();
 			}
@@ -20995,6 +21511,46 @@ bool SimPlayerManager::playerBotHarvestGateEnabled(uint64 identityId) {
 	return enabled && playerBotLootGateEnabled(identityId);
 }
 
+bool SimPlayerManager::playerBotSamplingGateEnabled(uint64 identityId) {
+	if (!progressionEnabled)
+		return false;
+
+	bool enabled = progressionSamplingEnabled;
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (identityId != 0 && playerBotParityTestSamplingGateOverrideActive &&
+				playerBotParitySamplingGateScopedIds.contains(identityId)) {
+			enabled = playerBotParitySamplingGateValues.contains(identityId) ?
+				playerBotParitySamplingGateValues.get(identityId) :
+				playerBotParityTestSamplingGateOverride;
+		} else if (identityId == 0 &&
+				playerBotParityTestSamplingGateOverrideActive) {
+			enabled = playerBotParityTestSamplingGateOverride;
+		}
+	}
+
+	return enabled && playerBotLootGateEnabled(identityId);
+}
+
+bool SimPlayerManager::playerBotStaleStacksGateEnabled(uint64 identityId) {
+	{
+		Locker parityLock(&playerBotParityTestMutex);
+		if (identityId != 0 && playerBotParityTestStaleStacksGateOverrideActive &&
+				playerBotParityStaleStacksGateScopedIds.contains(identityId))
+			return playerBotParityStaleStacksGateValues.contains(identityId) ?
+				playerBotParityStaleStacksGateValues.get(identityId) :
+				playerBotParityTestStaleStacksGateOverride;
+		if (identityId == 0 && playerBotParityTestStaleStacksGateOverrideActive)
+			return playerBotParityTestStaleStacksGateOverride;
+	}
+	PlayerBotHarvestPolicy policy;
+	{
+		Locker harvestLock(&progressionHarvestMutex);
+		policy = progressionHarvestPolicy;
+	}
+	return policy.staleStacks.enabled;
+}
+
 bool SimPlayerManager::playerBotHarvestClaimEligible(uint64 identityId) {
 	if (!playerBotHarvestGateEnabled(identityId))
 		return false;
@@ -22253,14 +22809,34 @@ static const char* playerBotHarvestDispositionName(
 	}
 }
 
+static const char* playerBotSampleDispositionName(
+		PlayerBotSampleDisposition disposition) {
+	switch (disposition) {
+	case PLAYER_BOT_SAMPLED: return "sampled";
+	case PLAYER_BOT_SAMPLE_GATE_OFF: return "gateOff";
+	case PLAYER_BOT_SAMPLE_NO_SKILL: return "noSkill";
+	case PLAYER_BOT_SAMPLE_NO_TOOL: return "noTool";
+	case PLAYER_BOT_SAMPLE_NO_SPAWN: return "noSpawn";
+	case PLAYER_BOT_SAMPLE_DENSITY_TOO_LOW: return "densityTooLow";
+	case PLAYER_BOT_SAMPLE_RATE_FAILED: return "rateFailed";
+	case PLAYER_BOT_SAMPLE_TOO_FEW_UNITS: return "tooFewUnits";
+	case PLAYER_BOT_SAMPLE_BAG_FAILED: return "bagFailed";
+	case PLAYER_BOT_SAMPLE_CAP_REACHED: return "capReached";
+	default: return "unknown";
+	}
+}
+
 bool SimPlayerManager::depositPlayerBotResource(uint64 identityId,
 		ResourceSpawn* spawn, int units, bool* capReached,
-		const String& zoneName) {
+		const String& zoneName, const String& source) {
 	if (capReached != nullptr)
 		*capReached = false;
 	if (identityId == 0 || spawn == nullptr || units <= 0 ||
 			!progressionEnabled || !progressionLoaded)
 		return false;
+	String boundedSource = progressionAwardSource(source);
+	if (boundedSource.isEmpty())
+		boundedSource = "harvest";
 
 	{
 		Locker progressionLock(&progressionMutex);
@@ -22277,6 +22853,7 @@ bool SimPlayerManager::depositPlayerBotResource(uint64 identityId,
 
 	uint64 heldCount = 0;
 	VectorMap<uint64, SimBotItemState> resourceItemStates;
+	VectorMap<uint64, String> resourceItemSources;
 	{
 		Locker progressionLock(&progressionMutex);
 		heldCount = progressionItemHeldCounts.contains(identityId) ?
@@ -22285,6 +22862,8 @@ bool SimPlayerManager::depositPlayerBotResource(uint64 identityId,
 			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
 			if (row.identityId == identityId)
 				resourceItemStates.put(row.objectId, row.state);
+			if (row.identityId == identityId)
+				resourceItemSources.put(row.objectId, row.source);
 		}
 	}
 
@@ -22328,6 +22907,9 @@ bool SimPlayerManager::depositPlayerBotResource(uint64 identityId,
 			if (resourceItemStates.contains(resource->getObjectID()) &&
 					resourceItemStates.get(resource->getObjectID()) !=
 					SIMBOT_ITEM_HELD)
+				continue;
+			if (resourceItemSources.contains(resource->getObjectID()) &&
+					resourceItemSources.get(resource->getObjectID()) != boundedSource)
 				continue;
 			mergeTargets.add(resource);
 			mergeRoom += ResourceContainer::MAXSIZE - resource->getQuantity();
@@ -22397,7 +22979,7 @@ bool SimPlayerManager::depositPlayerBotResource(uint64 identityId,
 		row.state = SIMBOT_ITEM_HELD;
 		row.templateCrc = newTemplateCrc;
 		row.displayName = newDisplayName.trim();
-		row.source = "harvest";
+		row.source = boundedSource;
 		row.refId = spawnObjectId;
 		row.acquiredAt = String::valueOf(System::getMiliTime());
 		row.updatedAt = row.acquiredAt;
@@ -22407,12 +22989,524 @@ bool SimPlayerManager::depositPlayerBotResource(uint64 identityId,
 		progressionItemDirtyIds.put(newObjectId, true);
 		++held;
 		appendPlayerBotLedgerEntryKindLocked(identityId, "item", 1, held,
-			"harvest", newObjectId, "resource_container");
+			boundedSource, newObjectId, "resource_container");
 	}
 	progressionItemHeldCounts.put(identityId, held);
 	appendPlayerBotLedgerEntryKindLocked(identityId, "resource", units,
-		depositedQuantity, "harvest", depositedObjectId,
+		depositedQuantity, boundedSource, depositedObjectId,
 		resourceType);
+	return true;
+}
+
+VectorMap<int, bool> SimPlayerManager::playerBotHeldSurveyToolClasses(
+		uint64 identityId) {
+	VectorMap<int, bool> held;
+	if (identityId == 0)
+		return held;
+	Locker progressionLock(&progressionMutex);
+	for (int i = 0; i < progressionItems.size(); ++i) {
+		const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+		if (row.identityId != identityId || row.state != SIMBOT_ITEM_HELD)
+			continue;
+		for (int toolClass = SimBotSampling::SOLAR;
+				toolClass <= SimBotSampling::INORGANIC; ++toolClass) {
+			if (SimBotSampling::toolTemplate(toolClass)[0] != '\0' &&
+					row.templateCrc == String(SimBotSampling::toolTemplate(
+						toolClass)).hashCode())
+				held.put(toolClass, true);
+		}
+	}
+	return held;
+}
+
+void SimPlayerManager::recordPlayerBotSampleResult(uint64 identityId,
+		const String& resourceName, int toolClass,
+		PlayerBotSampleDisposition disposition, int units, int xp) {
+	const int dispositionIndex = static_cast<int>(disposition);
+	if (dispositionIndex >= 0 && dispositionIndex <
+			PLAYER_BOT_SAMPLE_DISPOSITION_COUNT)
+		samplingResults[dispositionIndex].increment();
+	if (toolClass >= SimBotSampling::SOLAR &&
+			toolClass <= SimBotSampling::INORGANIC && units > 0)
+		samplingUnitsByToolClass[toolClass].add(static_cast<uint64>(units));
+	if (xp > 0)
+		samplingXpGranted.add(static_cast<uint64>(xp));
+	PlayerBotSampleRecord record;
+	record.identityId = identityId;
+	record.recordedAtMs = System::getMiliTime();
+	record.resourceType = resourceName;
+	record.toolClass = toolClass;
+	record.units = units;
+	record.xp = xp;
+	record.disposition = dispositionIndex;
+	Locker samplingLock(&progressionSamplingMutex);
+	int maxRecent = progressionSamplingPolicy.maxRecentSamples;
+	if (maxRecent < 1)
+		maxRecent = 1;
+	maxRecent = Math::min(maxRecent, static_cast<int>(progressionSamplingLastSampleLimit));
+	while (progressionSamplingLastSamples.size() >= maxRecent)
+		progressionSamplingLastSamples.remove(0);
+	progressionSamplingLastSamples.add(record);
+}
+
+PlayerBotSampleDisposition SimPlayerManager::samplePlayerBotResource(
+		uint64 identityId, CreatureObject* body, const String& resourceName,
+		int* unitsOut, int* xpOut) {
+	if (unitsOut != nullptr)
+		*unitsOut = 0;
+	if (xpOut != nullptr)
+		*xpOut = 0;
+	auto finishSample = [&](PlayerBotSampleDisposition disposition,
+			int toolClass = 0, int units = 0, int xp = 0) {
+		recordPlayerBotSampleResult(identityId, resourceName, toolClass,
+			disposition, units, xp);
+		return disposition;
+	};
+	if (!playerBotSamplingGateEnabled(identityId))
+		return finishSample(PLAYER_BOT_SAMPLE_GATE_OFF);
+	if (body == nullptr || identityId == 0 || resourceName.isEmpty())
+		return finishSample(PLAYER_BOT_SAMPLE_NO_SKILL);
+
+	// Match corpse harvesting: make room before the sample consumes spawn units.
+	makePlayerBotBagRoom(identityId);
+
+	String zoneName;
+	String bodySpecies;
+	float posX = 0.f;
+	float posY = 0.f;
+	int surveySkill = 0;
+	int sampleRateMod = 0;
+	int sampleSizeMod = 0;
+	bool missingSkill = false;
+	bool missingZone = false;
+	{
+		Locker bodyLock(body);
+		missingSkill = !body->hasSkill("crafting_artisan_novice");
+		Zone* zone = body->getZone();
+		missingZone = zone == nullptr;
+		if (!missingZone) {
+			zoneName = zone->getZoneName();
+			posX = body->getPositionX();
+			posY = body->getPositionY();
+			bodySpecies = body->getSpeciesName();
+			surveySkill = body->getSkillMod("surveying");
+			sampleRateMod = body->getSkillMod("private_spec_samplerate");
+			sampleSizeMod = body->getSkillMod("private_spec_samplesize");
+		}
+	}
+	if (missingSkill)
+		return finishSample(PLAYER_BOT_SAMPLE_NO_SKILL);
+	if (missingZone)
+		return finishSample(PLAYER_BOT_SAMPLE_NO_SPAWN);
+
+	VectorMap<int, bool> heldTools = playerBotHeldSurveyToolClasses(identityId);
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ResourceManager* resourceManager = zoneServer == nullptr ? nullptr :
+		(zoneServer->getResourceManager());
+	if (resourceManager == nullptr)
+		return finishSample(PLAYER_BOT_SAMPLE_NO_SPAWN);
+	ManagedReference<ResourceSpawn*> spawn = resourceManager->getResourceSpawn(
+		resourceName);
+	// A resource type (the legacy miner loop's target) resolves to its current
+	// spawn on this planet, as corpse harvesting does.
+	if (spawn == nullptr)
+		spawn = resourceManager->getCurrentSpawn(resourceName, zoneName);
+	if (spawn == nullptr)
+		return finishSample(PLAYER_BOT_SAMPLE_NO_SPAWN);
+
+	int spawnToolClass = 0;
+	bool spawnIsInorganic = false;
+	float density = 0.f;
+	{
+		Locker spawnLock(spawn);
+		spawnToolClass = spawn->getSurveyToolType();
+		spawnIsInorganic = spawn->isType("inorganic");
+		density = spawn->getDensityAt(zoneName, posX, posY);
+	}
+	bool sampleable = false;
+	for (int i = 0; i < heldTools.size(); ++i) {
+		if (heldTools.elementAt(i).getValue() &&
+				SimBotSampling::isSampleable(spawnToolClass, spawnIsInorganic,
+					heldTools.elementAt(i).getKey())) {
+			sampleable = true;
+			break;
+		}
+	}
+	if (!sampleable)
+		return finishSample(PLAYER_BOT_SAMPLE_NO_TOOL, spawnToolClass);
+
+	ResourceSampleYield::Input input;
+	input.density = density;
+	input.surveySkill = surveySkill;
+	input.sampleRateMod = sampleRateMod;
+	input.sampleSizeMod = sampleSizeMod;
+	if (!ResourceSampleYield::densityPasses(input))
+		return finishSample(PLAYER_BOT_SAMPLE_DENSITY_TOO_LOW,
+			spawnToolClass);
+	input.roll100 = System::random(100);
+	if (!ResourceSampleYield::sampleRatePasses(input))
+		return finishSample(PLAYER_BOT_SAMPLE_RATE_FAILED, spawnToolClass);
+	input.roll3 = System::random(3);
+	ResourceSampleYield::Result sample = ResourceSampleYield::calculate(input);
+	if (sample.outcome == ResourceSampleYield::TOO_FEW_UNITS)
+		return finishSample(PLAYER_BOT_SAMPLE_TOO_FEW_UNITS, spawnToolClass);
+	if (!sample.succeeded())
+		return finishSample(PLAYER_BOT_SAMPLE_RATE_FAILED, spawnToolClass);
+
+	bool capReached = false;
+	if (!depositPlayerBotResource(identityId, spawn, sample.units,
+			&capReached, zoneName, "sample"))
+		return finishSample(capReached ? PLAYER_BOT_SAMPLE_CAP_REACHED :
+			PLAYER_BOT_SAMPLE_BAG_FAILED, spawnToolClass);
+
+	PlayerManager* playerManager = zoneServer->getPlayerManager();
+	const float experienceMultiplier = playerManager == nullptr ? 1.f :
+		playerManager->getExperienceMultiplier();
+	const float speciesModifier = playerManager == nullptr ? 1.f :
+		playerManager->getSpeciesXpModifier(bodySpecies,
+			"resource_harvesting_inorganic");
+	const int sampleXp = static_cast<int>(sample.xp * speciesModifier *
+		experienceMultiplier);
+	int awarded = 0;
+	if (sampleXp > 0)
+		grantPlayerBotExperience(identityId, "resource_harvesting_inorganic",
+			sampleXp, "sample", &awarded);
+	if (unitsOut != nullptr)
+		*unitsOut = sample.units;
+	if (xpOut != nullptr)
+		*xpOut = awarded;
+	recordPlayerBotArtisanSampledDisposition(identityId);
+	return finishSample(PLAYER_BOT_SAMPLED, spawnToolClass, sample.units,
+		awarded);
+}
+
+void SimPlayerManager::recordPlayerBotArtisanSampledDisposition(
+		uint64 identityId) {
+	if (identityId == 0)
+		return;
+	Locker pveLock(&pveMutex);
+	if (pveIdentities.contains(identityId) &&
+			pveIdentities.get(identityId).profession == "artisan")
+		pveArtisanSampledIds.put(identityId, true);
+}
+
+uint64 SimPlayerManager::playerBotSurveyToolReceiptKey(uint64 identityId,
+		int toolClass) {
+	return (identityId << 8) | static_cast<uint64>(toolClass & 0xff);
+}
+
+// The receipt is its own ledger kind so the item history keeps one +1 per
+// object; its row is kept by the ledger prune.
+void SimPlayerManager::recordPlayerBotSurveyToolReceiptLocked(uint64 identityId,
+		int toolClass, const String& templatePath) {
+	const uint64 key = playerBotSurveyToolReceiptKey(identityId, toolClass);
+	if (progressionSurveyToolReceipts.contains(key))
+		return;
+	progressionSurveyToolReceipts.put(key, true);
+	appendPlayerBotLedgerEntryKindLocked(identityId, "receipt", 1, 1,
+		"survey_tool_grant", toolClass, templatePath);
+}
+
+int SimPlayerManager::playerBotSurveyToolClassForTemplate(uint32 templateCrc) {
+	for (int toolClass = SimBotSampling::SOLAR;
+			toolClass <= SimBotSampling::INORGANIC; ++toolClass) {
+		const char* path = SimBotSampling::toolTemplate(toolClass);
+		if (path[0] != '\0' && String(path).hashCode() == templateCrc)
+			return toolClass;
+	}
+	return 0;
+}
+
+void SimPlayerManager::revokePlayerBotSurveyToolReceiptLocked(uint64 identityId,
+		int toolClass) {
+	const uint64 key = playerBotSurveyToolReceiptKey(identityId, toolClass);
+	if (!progressionSurveyToolReceipts.contains(key))
+		return;
+	progressionSurveyToolReceipts.drop(key);
+	appendPlayerBotLedgerEntryKindLocked(identityId, "receipt", -1, 0,
+		"survey_tool_grant", toolClass, SimBotSampling::toolTemplate(toolClass));
+}
+
+// The stock sample start (ResourceSpawner::sendSample) broadcasts the active
+// survey tool's sample effect at the sampler. An artisan has no survey session,
+// so use its held tool of the spawn's class. Called without the agent locked.
+void SimPlayerManager::broadcastPlayerBotSampleEffect(uint64 identityId,
+		AiAgent* agent, const String& resourceName) {
+	if (identityId == 0 || agent == nullptr || resourceName.isEmpty() ||
+			!playerBotSamplingGateEnabled(identityId))
+		return;
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ResourceManager* resourceManager = zoneServer == nullptr ? nullptr :
+		zoneServer->getResourceManager();
+	Zone* zone = agent->getZone();
+	if (resourceManager == nullptr || zone == nullptr)
+		return;
+	const String zoneName = zone->getZoneName();
+	ManagedReference<ResourceSpawn*> spawn =
+		resourceManager->getResourceSpawn(resourceName);
+	if (spawn == nullptr)
+		spawn = resourceManager->getCurrentSpawn(resourceName, zoneName);
+	if (spawn == nullptr)
+		return;
+	int spawnToolClass = 0;
+	bool spawnIsInorganic = false;
+	{
+		Locker spawnLock(spawn);
+		spawnToolClass = spawn->getSurveyToolType();
+		spawnIsInorganic = spawn->isType("inorganic");
+	}
+
+	uint64 toolOid = 0;
+	{
+		Locker progressionLock(&progressionMutex);
+		for (int i = 0; i < progressionItems.size() && toolOid == 0; ++i) {
+			const SimBotItemRow& row = progressionItems.elementAt(i).getValue();
+			if (row.identityId != identityId || row.state != SIMBOT_ITEM_HELD)
+				continue;
+			const int toolClass = playerBotSurveyToolClassForTemplate(
+				row.templateCrc);
+			if (toolClass != 0 && SimBotSampling::isSampleable(spawnToolClass,
+					spawnIsInorganic, toolClass))
+				toolOid = row.objectId;
+		}
+	}
+	if (toolOid == 0)
+		return;
+	ManagedReference<SurveyTool*> tool =
+		zoneServer->getObject(toolOid).castTo<SurveyTool*>();
+	if (tool == nullptr)
+		return;
+	String animation;
+	{
+		Locker toolLock(tool);
+		animation = tool->getSampleAnimation();
+	}
+	if (animation.isEmpty())
+		return;
+
+	Locker agentLock(agent);
+	Zone* agentZone = agent->getZone();
+	if (agentZone == nullptr)
+		return;
+	PlayClientEffectLoc* effect = new PlayClientEffectLoc(animation,
+		agentZone->getZoneName(), agent->getPositionX(),
+		agent->getPositionZ(), agent->getPositionY());
+	agent->broadcastMessage(effect, true);
+}
+
+void SimPlayerManager::ensurePlayerBotSurveyTools(uint64 identityId) {
+	if (!playerBotSamplingGateEnabled(identityId) || identityId == 0)
+		return;
+
+	SimBotIdentity identity;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveIdentities.contains(identityId))
+			return;
+		identity = pveIdentities.get(identityId);
+	}
+	if (identity.profession != "artisan")
+		return;
+
+	Vector<String> configuredTools;
+	{
+		Locker progressionLock(&progressionMutex);
+		if (!progressionRecords.contains(identityId) ||
+				!progressionRecords.get(identityId).skills.contains(
+					"crafting_artisan_novice") ||
+				!progressionTrainingPlans.contains(identity.trainingPlan))
+			return;
+		configuredTools = progressionTrainingPlans.get(identity.trainingPlan).surveyTools;
+	}
+
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+		economyManager->getOrCreateItemBag(identityId);
+	if (bag == nullptr || zoneServer == nullptr)
+		return;
+
+	for (int i = 0; i < configuredTools.size(); ++i) {
+		int toolClass = SimBotSampling::toolClassFromName(
+			std::string(configuredTools.get(i).toCharArray()));
+		if (toolClass == 0)
+			continue;
+		const String templatePath = SimBotSampling::toolTemplate(toolClass);
+		const uint32 templateCrc = templatePath.hashCode();
+		bool receipt = false;
+		{
+			Locker progressionLock(&progressionMutex);
+			receipt = progressionSurveyToolReceipts.contains(
+				playerBotSurveyToolReceiptKey(identityId, toolClass));
+		}
+		if (receipt)
+			continue;
+
+		bool evidence = false;
+		{
+			Locker progressionLock(&progressionMutex);
+			for (int rowIndex = 0; rowIndex < progressionItems.size(); ++rowIndex) {
+				const SimBotItemRow& row = progressionItems.elementAt(rowIndex).getValue();
+				if (row.identityId == identityId && row.state == SIMBOT_ITEM_HELD &&
+						row.templateCrc == templateCrc) {
+					evidence = true;
+					break;
+				}
+			}
+		}
+		if (!evidence) {
+			Vector<ManagedReference<SceneObject*> > children;
+			{
+				Locker bagLock(bag);
+				for (int childIndex = 0; childIndex < bag->getContainerObjectsSize();
+						++childIndex)
+					children.add(bag->getContainerObject(childIndex));
+			}
+			for (int childIndex = 0; childIndex < children.size(); ++childIndex) {
+				SceneObject* object = children.get(childIndex);
+				if (object == nullptr)
+					continue;
+				Locker objectLock(object);
+				if (object->getServerObjectCRC() == templateCrc) {
+					evidence = true;
+					break;
+				}
+			}
+		}
+		if (evidence) {
+			Locker progressionLock(&progressionMutex);
+			if (progressionRecords.contains(identityId))
+				recordPlayerBotSurveyToolReceiptLocked(identityId, toolClass,
+					templatePath);
+			continue;
+		}
+
+		ManagedReference<SceneObject*> item = zoneServer->createObject(templateCrc, 1);
+		if (item == nullptr)
+			continue;
+		bool transferred = false;
+		{
+			Locker itemLock(item);
+			Locker bagLock(bag, item);
+			transferred = bag->transferObject(item, -1, false, true);
+		}
+		if (!transferred) {
+			Locker itemLock(item);
+			item->destroyObjectFromDatabase(true);
+			continue;
+		}
+		String displayName;
+		{
+			Locker itemLock(item);
+			displayName = item->getDisplayedName();
+		}
+		Locker progressionLock(&progressionMutex);
+		if (!progressionRecords.contains(identityId) ||
+				progressionRetiringIds.contains(identityId))
+			continue;
+		SimBotItemRow row;
+		row.objectId = item->getObjectID();
+		row.identityId = identityId;
+		row.state = SIMBOT_ITEM_HELD;
+		row.templateCrc = templateCrc;
+		row.displayName = displayName.trim();
+		row.source = "grant";
+		row.refId = toolClass;
+		row.acquiredAt = String::valueOf(System::getMiliTime());
+		row.updatedAt = row.acquiredAt;
+		row.version = 1;
+		row.dirty = true;
+		progressionItems.put(row.objectId, row);
+		progressionItemDirtyIds.put(row.objectId, true);
+		uint64 held = progressionItemHeldCounts.contains(identityId) ?
+			progressionItemHeldCounts.get(identityId) : 0;
+		progressionItemHeldCounts.put(identityId, held + 1);
+		appendPlayerBotLedgerEntryKindLocked(identityId, "item", 1, held + 1,
+			"grant", row.objectId, templatePath);
+		recordPlayerBotSurveyToolReceiptLocked(identityId, toolClass,
+			templatePath);
+		markPlayerBotLoadoutDirtyLocked(identityId);
+		samplingToolsGranted.increment();
+	}
+}
+
+bool SimPlayerManager::grantPlayerBotSurveyToolForHarness(uint64 identityId,
+		int toolClass) {
+	if (identityId == 0 || toolClass < SimBotSampling::SOLAR ||
+			toolClass > SimBotSampling::INORGANIC ||
+			SimBotSampling::toolTemplate(toolClass)[0] == '\0')
+		return false;
+	SimBotIdentity identity;
+	{
+		Locker pveLock(&pveMutex);
+		if (!pveIdentities.contains(identityId))
+			return false;
+		identity = pveIdentities.get(identityId);
+	}
+	if (identity.profession != "harness" ||
+			!isPlayerBotParityHarnessExempt(identityId))
+		return false;
+	const uint64 receiptKey = playerBotSurveyToolReceiptKey(identityId,
+		toolClass);
+	const String templatePath = SimBotSampling::toolTemplate(toolClass);
+	const uint32 templateCrc = templatePath.hashCode();
+	{
+		Locker progressionLock(&progressionMutex);
+		if (!progressionRecords.contains(identityId))
+			return false;
+		if (progressionSurveyToolReceipts.contains(receiptKey))
+			return true;
+	}
+	AiEconomyManager* economyManager = AiEconomyManager::instance();
+	ZoneServer* zoneServer = ServerCore::getZoneServer();
+	ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+		economyManager->getOrCreateItemBag(identityId);
+	ManagedReference<SceneObject*> item = zoneServer == nullptr ? nullptr :
+		zoneServer->createObject(templateCrc, 1);
+	if (bag == nullptr || item == nullptr)
+		return false;
+	bool transferred = false;
+	{
+		Locker itemLock(item);
+		Locker bagLock(bag, item);
+		transferred = bag->transferObject(item, -1, false, true);
+	}
+	if (!transferred) {
+		Locker itemLock(item);
+		item->destroyObjectFromDatabase(true);
+		return false;
+	}
+	String displayName;
+	{
+		Locker itemLock(item);
+		displayName = item->getDisplayedName();
+	}
+	Locker progressionLock(&progressionMutex);
+	if (!progressionRecords.contains(identityId) ||
+			progressionSurveyToolReceipts.contains(receiptKey))
+		return true;
+	SimBotItemRow row;
+	row.objectId = item->getObjectID();
+	row.identityId = identityId;
+	row.state = SIMBOT_ITEM_HELD;
+	row.templateCrc = templateCrc;
+	row.displayName = displayName.trim();
+	row.source = "grant";
+	row.refId = toolClass;
+	row.acquiredAt = String::valueOf(System::getMiliTime());
+	row.updatedAt = row.acquiredAt;
+	row.version = 1;
+	row.dirty = true;
+	progressionItems.put(row.objectId, row);
+	progressionItemDirtyIds.put(row.objectId, true);
+	uint64 held = progressionItemHeldCounts.contains(identityId) ?
+		progressionItemHeldCounts.get(identityId) : 0;
+	progressionItemHeldCounts.put(identityId, held + 1);
+	appendPlayerBotLedgerEntryKindLocked(identityId, "item", 1, held + 1,
+		"grant", row.objectId, templatePath);
+	recordPlayerBotSurveyToolReceiptLocked(identityId, toolClass, templatePath);
+	markPlayerBotLoadoutDirtyLocked(identityId);
+	samplingToolsGranted.increment();
 	return true;
 }
 
@@ -24000,6 +25094,13 @@ void SimPlayerManager::reconcilePlayerBotItems() {
 				progressionItemHeldCounts.put(previousIdentityId, held);
 				appendPlayerBotLedgerEntryKindLocked(previousIdentityId, "item", -1,
 					held, "reconcile", row.objectId, row.displayName);
+				// A survey tool written off by the reconcile (lost before a
+				// save) is re-granted, so its one-time receipt is revoked.
+				const int lostToolClass =
+					playerBotSurveyToolClassForTemplate(row.templateCrc);
+				if (lostToolClass != 0)
+					revokePlayerBotSurveyToolReceiptLocked(previousIdentityId,
+						lostToolClass);
 			}
 		}
 
@@ -26069,6 +27170,52 @@ int64 SimPlayerManager::playerBotParityCounterValue(const String& counter) {
 	if (key == "harvest.listingscreated" ||
 			key == "harvestlistingscreated")
 		return harvestListingsCreated.get();
+	if (key == "harvest.stalelisted" || key == "harveststalelisted")
+		return harvestStaleListed.get();
+	if (key == "harvest.stalediscarded" || key == "harveststalediscarded")
+		return harvestStaleDiscarded.get();
+	if (key == "sampling.xpgranted" || key == "samplingxpgranted")
+		return samplingXpGranted.get();
+	if (key == "sampling.toolsgranted" || key == "samplingtoolsgranted")
+		return samplingToolsGranted.get();
+	if (key == "sampling.results.sampled" || key == "samplingsampled")
+		return samplingResults[PLAYER_BOT_SAMPLED].get();
+	if (key == "sampling.results.gateoff" || key == "samplingresultsgateoff")
+		return samplingResults[PLAYER_BOT_SAMPLE_GATE_OFF].get();
+	if (key == "sampling.results.noskill" || key == "samplingresultsnoskill")
+		return samplingResults[PLAYER_BOT_SAMPLE_NO_SKILL].get();
+	if (key == "sampling.results.notool" || key == "samplingresultsnotool")
+		return samplingResults[PLAYER_BOT_SAMPLE_NO_TOOL].get();
+	if (key == "sampling.results.nospawn" || key == "samplingresultsnospawn")
+		return samplingResults[PLAYER_BOT_SAMPLE_NO_SPAWN].get();
+	if (key == "sampling.results.densitytoolow" ||
+			key == "samplingresultsdensitytoolow")
+		return samplingResults[PLAYER_BOT_SAMPLE_DENSITY_TOO_LOW].get();
+	if (key == "sampling.results.ratefailed" ||
+			key == "samplingresultsratefailed")
+		return samplingResults[PLAYER_BOT_SAMPLE_RATE_FAILED].get();
+	if (key == "sampling.results.toofewunits" ||
+			key == "samplingresultstoofewunits")
+		return samplingResults[PLAYER_BOT_SAMPLE_TOO_FEW_UNITS].get();
+	if (key == "sampling.results.bagfailed" ||
+			key == "samplingresultsbagfailed")
+		return samplingResults[PLAYER_BOT_SAMPLE_BAG_FAILED].get();
+	if (key == "sampling.results.capreached" ||
+			key == "samplingresultscapreached")
+		return samplingResults[PLAYER_BOT_SAMPLE_CAP_REACHED].get();
+	for (int toolClass = SimBotSampling::SOLAR;
+			toolClass <= SimBotSampling::INORGANIC; ++toolClass) {
+		String unitsKey = "sampling.units." +
+			String(SimBotSampling::toolClassName(toolClass));
+		if (key == unitsKey.toLowerCase())
+			return samplingUnitsByToolClass[toolClass].get();
+	}
+	if (key == "sampling.legacyminersretired" ||
+			key == "samplinglegacyminersretired")
+		return samplingLegacyMinersRetired.get();
+	if (key == "sampling.legacyminerslive" ||
+			key == "samplinglegacyminerslive")
+		return samplingLegacyMinersLive.get();
 	if (key == "bazaar.listed" || key == "bazaarlisted")
 		return bazaarListed.get();
 	if (key == "bazaar.sold" || key == "bazaarsold")
@@ -27030,6 +28177,10 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 		playerBotParityTestLootGateOverride = false;
 		playerBotParityTestHarvestGateOverrideActive = false;
 		playerBotParityTestHarvestGateOverride = false;
+		playerBotParityTestSamplingGateOverrideActive = false;
+		playerBotParityTestSamplingGateOverride = false;
+		playerBotParityTestStaleStacksGateOverrideActive = false;
+		playerBotParityTestStaleStacksGateOverride = false;
 		playerBotParityTestBazaarSellGateOverrideActive = false;
 		playerBotParityTestBazaarSellGateOverride = false;
 		playerBotParityTestBazaarBuyGateOverrideActive = false;
@@ -27057,6 +28208,10 @@ void SimPlayerManager::restorePlayerBotParityScenarioGate() {
 	playerBotParityLootGateScopedIds.removeAll();
 	playerBotParityHarvestGateScopedIds.removeAll();
 	playerBotParityHarvestGateValues.removeAll();
+	playerBotParitySamplingGateScopedIds.removeAll();
+	playerBotParitySamplingGateValues.removeAll();
+	playerBotParityStaleStacksGateScopedIds.removeAll();
+	playerBotParityStaleStacksGateValues.removeAll();
 	playerBotParityHarvestSellThresholdOverrides.removeAll();
 	playerBotParityBazaarSellGateScopedIds.removeAll();
 	playerBotParityBazaarBuyGateScopedIds.removeAll();
@@ -27780,7 +28935,20 @@ void SimPlayerManager::runPlayerBotParityTestRunnerBody() {
 				"bazaar.buy.reconcile.refunded",
 				"harvest.completed", "harvest.simulationskipped",
 				"harvest.results.gateoff", "harvest.xpgranted",
-				"harvest.listingscreated", "loot.junkDiscarded",
+				"harvest.listingscreated", "harvest.staleListed",
+				"harvest.staleDiscarded", "sampling.xpGranted",
+				"sampling.toolsGranted", "sampling.results.sampled",
+				"sampling.results.gateOff", "sampling.results.noSkill",
+				"sampling.results.noTool", "sampling.results.noSpawn",
+				"sampling.results.densityTooLow", "sampling.results.rateFailed",
+				"sampling.results.tooFewUnits", "sampling.results.bagFailed",
+				"sampling.results.capReached", "sampling.units.solar",
+				"sampling.units.chemical", "sampling.units.flora",
+				"sampling.units.gas", "sampling.units.geothermal",
+				"sampling.units.mineral", "sampling.units.water",
+				"sampling.units.wind", "sampling.units.fusion",
+				"sampling.units.inorganic", "sampling.legacyMinersRetired",
+				"sampling.legacyMinersLive", "loot.junkDiscarded",
 				"bazaar.skipped.resourceReserve",
 				"bazaar.buy.upgrades",
 				"bazaar.buy.upgrades.skippedNotBetter",
@@ -30214,6 +31382,9 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			op == "assertAbility" || op == "assertAbilitySuperseded" ||
 				op == "assertAttackSource" || op == "assertAbilityUse" ||
 				op == "setLootGate" || op == "setHarvestGate" ||
+				op == "setSamplingGate" || op == "setStaleStacksGate" ||
+				op == "grantSurveyTool" || op == "sampleResource" ||
+				op == "assertSampleResult" || op == "seedStaleStack" ||
 				op == "setHarvestSellThreshold" || op == "assertHarvestResult" ||
 				op == "assertHarvestContainer" || op == "assertHarvestScoutXp" ||
 				op == "setBazaarSellGate" ||
@@ -30493,6 +31664,193 @@ bool SimPlayerManager::executePlayerBotParityStep(
 			playerBotParityTestHarvestGateOverride = enabledValue != 0;
 			playerBotParityHarvestGateScopedIds.put(identityId, true);
 			playerBotParityHarvestGateValues.put(identityId, enabledValue != 0);
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "setSamplingGate" || op == "setStaleStacksGate") {
+		if (identityId == 0) {
+			result.status = "FAIL";
+			result.failReason = op == "setSamplingGate" ?
+				"sampling_gate_requires_identity" :
+				"stale_stacks_gate_requires_identity";
+			return true;
+		}
+		int64 enabledValue = 0;
+		if (step.hasGateEnabled)
+			enabledValue = step.gateEnabled ? 1 : 0;
+		else if (!parsePlayerBotParityExpected(step.expect, enabledValue)) {
+			result.status = "FAIL";
+			result.failReason = op == "setSamplingGate" ?
+				"invalid_sampling_gate_value" :
+				"invalid_stale_stacks_gate_value";
+			return true;
+		}
+		Locker parityLock(&playerBotParityTestMutex);
+		if (op == "setSamplingGate") {
+			playerBotParityTestSamplingGateOverrideActive = true;
+			playerBotParityTestSamplingGateOverride = enabledValue != 0;
+			playerBotParitySamplingGateScopedIds.put(identityId, true);
+			playerBotParitySamplingGateValues.put(identityId,
+				enabledValue != 0);
+		} else {
+			playerBotParityTestStaleStacksGateOverrideActive = true;
+			playerBotParityTestStaleStacksGateOverride = enabledValue != 0;
+			playerBotParityStaleStacksGateScopedIds.put(identityId, true);
+			playerBotParityStaleStacksGateValues.put(identityId,
+				enabledValue != 0);
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "grantSurveyTool") {
+		SimBotIdentity harnessIdentity;
+		int toolClass = SimBotSampling::toolClassFromName(
+			std::string(step.sampleToolClass.toCharArray()));
+		if (toolClass == 0 && !step.ref.isEmpty())
+			toolClass = SimBotSampling::toolClassFromName(
+				std::string(step.ref.toCharArray()));
+		if (!snapshotPlayerBotIdentity(identityId, harnessIdentity) ||
+				harnessIdentity.profession != "harness" || toolClass == 0 ||
+			!grantPlayerBotSurveyToolForHarness(identityId, toolClass)) {
+			result.status = "FAIL";
+			result.failReason = "survey_tool_grant_requires_harness";
+			return true;
+		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "sampleResource") {
+		SimBotIdentity harnessIdentity;
+		if (!snapshotPlayerBotIdentity(identityId, harnessIdentity) ||
+				harnessIdentity.profession != "harness" ||
+			!isPlayerBotParityHarnessExempt(identityId)) {
+			result.status = "FAIL";
+			result.failReason = "sample_requires_harness";
+			return true;
+		}
+		uint64 bodyOid = step.bodyOid;
+		if (bodyOid == 0) {
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		ManagedReference<SceneObject*> bodyObject = zoneServer == nullptr ?
+			nullptr : zoneServer->getObject(bodyOid);
+		CreatureObject* body = bodyObject == nullptr ? nullptr :
+			bodyObject->asCreatureObject();
+		if (body == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "sample_harness_body_missing";
+			return true;
+		}
+
+		String planet;
+		String resourceName = step.sampleResourceName;
+		float posX = 0.f;
+		float posY = 0.f;
+		{
+			Locker bodyLock(body);
+			Zone* zone = body->getZone();
+			if (zone != nullptr) {
+				planet = zone->getZoneName();
+				posX = body->getPositionX();
+				posY = body->getPositionY();
+			}
+		}
+		const int requestedToolClass = SimBotSampling::toolClassFromName(
+			std::string(step.sampleToolClass.toCharArray()));
+		// The gate-off branch deliberately does not need a resource lookup: the
+		// manager checks the capability before resolving a spawn.
+		if (resourceName.isEmpty() && playerBotSamplingGateEnabled(identityId)) {
+			Vector<ResourceIntelligenceEntry> entries;
+			String snapshotError;
+			if (!collectResourceIntelligenceSnapshot(entries, snapshotError)) {
+				result.status = "FAIL";
+				result.failReason = "sample_resource_snapshot_failed_" +
+					snapshotError;
+				return true;
+			}
+			String fallbackResourceName;
+			for (int i = 0; i < entries.size(); ++i) {
+				const ResourceIntelligenceEntry& entry = entries.get(i);
+				if (!entry.inShift || (!entry.zones.isEmpty() &&
+						!entry.zones.contains(planet)))
+					continue;
+				ManagedReference<ResourceSpawn*> spawn =
+					zoneServer->getResourceManager()->getResourceSpawn(entry.name);
+				if (spawn == nullptr)
+					continue;
+				bool inorganic = false;
+				float density = 0.f;
+				{
+					Locker spawnLock(spawn);
+					inorganic = spawn->isType("inorganic");
+					density = spawn->getDensityAt(planet, posX, posY);
+				}
+				if (requestedToolClass != 0 &&
+						!SimBotSampling::isSampleable(entry.surveyToolType,
+							inorganic, requestedToolClass))
+					continue;
+				if (fallbackResourceName.isEmpty())
+					fallbackResourceName = entry.name;
+				if (density > 0.f) {
+					resourceName = entry.name;
+					break;
+				}
+			}
+			if (resourceName.isEmpty())
+				resourceName = fallbackResourceName;
+		}
+		int units = 0;
+		int xp = 0;
+		samplePlayerBotResource(identityId, body, resourceName, &units, &xp);
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "assertSampleResult") {
+		PlayerBotSampleRecord latest;
+		bool found = false;
+		{
+			Locker samplingLock(&progressionSamplingMutex);
+			for (int i = progressionSamplingLastSamples.size() - 1; i >= 0; --i) {
+				const PlayerBotSampleRecord& candidate =
+					progressionSamplingLastSamples.get(i);
+				if (candidate.identityId == identityId) {
+					latest = candidate;
+					found = true;
+					break;
+				}
+			}
+		}
+		if (!found) {
+			result.status = "FAIL";
+			result.failReason = "sample_result_missing";
+			return true;
+		}
+		if (!step.expect.isEmpty() &&
+				String(playerBotSampleDispositionName(
+					static_cast<PlayerBotSampleDisposition>(latest.disposition))).
+					toLowerCase() != step.expect.toLowerCase()) {
+			result.status = "FAIL";
+			result.failReason = "sample_result_disposition_mismatch";
+			return true;
+		}
+		if (step.hasExpectedSampleUnits && latest.units !=
+				step.expectedSampleUnits) {
+			result.status = "FAIL";
+			result.failReason = "sample_units_mismatch";
+			return true;
+		}
+		if (step.hasExpectedSampleXp && latest.xp != step.expectedSampleXp) {
+			result.status = "FAIL";
+			result.failReason = "sample_xp_mismatch";
+			return true;
 		}
 		result.status = "PASS";
 		return true;
@@ -31565,6 +32923,185 @@ bool SimPlayerManager::executePlayerBotParityStep(
 				return true;
 			}
 		}
+		result.status = "PASS";
+		return true;
+	}
+
+	if (op == "seedStaleStack") {
+		SimBotIdentity harnessIdentity;
+		if (!snapshotPlayerBotIdentity(identityId, harnessIdentity) ||
+				harnessIdentity.profession != "harness" ||
+				!isPlayerBotParityHarnessExempt(identityId)) {
+			result.status = "FAIL";
+			result.failReason = "stale_stack_seed_requires_harness";
+			return true;
+		}
+		ZoneServer* zoneServer = ServerCore::getZoneServer();
+		if (zoneServer == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "stale_stack_seed_no_zone_server";
+			return true;
+		}
+		String planet;
+		uint64 bodyOid = 0;
+		{
+			Locker pveLock(&pveMutex);
+			bodyOid = pveIdentityBodyOids.contains(identityId) ?
+				pveIdentityBodyOids.get(identityId) : 0;
+		}
+		ManagedReference<SceneObject*> bodyObject = zoneServer->getObject(bodyOid);
+		CreatureObject* body = bodyObject == nullptr ? nullptr :
+			bodyObject->asCreatureObject();
+		if (body == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "stale_stack_seed_body_missing";
+			return true;
+		}
+		{
+			Locker bodyLock(body);
+			Zone* zone = body->getZone();
+			if (zone != nullptr)
+				planet = zone->getZoneName();
+		}
+		int requestedToolClass = SimBotSampling::toolClassFromName(
+			std::string(step.sampleToolClass.toCharArray()));
+		Vector<ResourceIntelligenceEntry> entries;
+		String snapshotError;
+		if (!collectResourceIntelligenceSnapshot(entries, snapshotError)) {
+			result.status = "FAIL";
+			result.failReason = "stale_stack_snapshot_failed_" + snapshotError;
+			return true;
+		}
+		ManagedReference<ResourceSpawn*> sourceSpawn;
+		ResourceIntelligenceEntry sourceEntry;
+		for (int i = 0; i < entries.size(); ++i) {
+			const ResourceIntelligenceEntry& entry = entries.get(i);
+			if (!entry.inShift || (!entry.zones.isEmpty() &&
+					!entry.zones.contains(planet)))
+				continue;
+			ManagedReference<ResourceSpawn*> candidate =
+				zoneServer->getResourceManager()->getResourceSpawn(entry.name);
+			if (candidate == nullptr)
+				continue;
+			bool inorganic = false;
+			{
+				Locker spawnLock(candidate);
+				inorganic = candidate->isType("inorganic");
+			}
+			if (requestedToolClass != 0 &&
+					!SimBotSampling::isSampleable(entry.surveyToolType, inorganic,
+						requestedToolClass))
+				continue;
+			sourceSpawn = candidate;
+			sourceEntry = entry;
+			break;
+		}
+		if (sourceSpawn == nullptr) {
+			result.status = "FAIL";
+			result.failReason = "stale_stack_source_missing";
+			return true;
+		}
+		int units = step.amount > static_cast<uint64>(ResourceContainer::MAXSIZE) ?
+			ResourceContainer::MAXSIZE : static_cast<int>(step.amount);
+		if (units <= 0)
+			units = 1;
+		float qualityFactor = step.hasSampleQualityFactor ?
+			std::max(0.f, std::min(1.f, step.sampleQualityFactor)) : 0.25f;
+		Reference<ResourceContainer*> resource;
+		String resourceType;
+		String resourceDisplayName;
+		int surveyToolType = sourceEntry.surveyToolType;
+		uint32 containerCrc = 0;
+		Vector<String> classes;
+		Vector<String> stfClasses;
+		{
+			Locker spawnLock(sourceSpawn);
+			resource = sourceSpawn->createResource(units);
+			resourceType = sourceSpawn->getType();
+			resourceDisplayName = sourceSpawn->getName();
+			surveyToolType = sourceSpawn->getSurveyToolType();
+			containerCrc = sourceSpawn->getContainerCRC();
+			for (int i = 0; i < 12; ++i) {
+				String value = sourceSpawn->getClass(i);
+				if (value.isEmpty())
+					break;
+				classes.add(value);
+			}
+			for (int i = 0; i < 12; ++i) {
+				String value = sourceSpawn->getStfClass(i);
+				if (value.isEmpty())
+					break;
+				stfClasses.add(value);
+			}
+		}
+		ManagedReference<ResourceSpawn*> staleSpawn = zoneServer->createObject(
+			0xb2825c5a, 1).castTo<ResourceSpawn*>();
+		if (resource == nullptr || staleSpawn == nullptr) {
+			if (resource != nullptr) {
+				Locker resourceLock(resource);
+				resource->destroyObjectFromDatabase(true);
+			}
+			result.status = "FAIL";
+			result.failReason = "stale_stack_object_create_failed";
+			return true;
+		}
+		{
+			Locker staleLock(staleSpawn);
+			staleSpawn->setName(resourceDisplayName + "_stale");
+			staleSpawn->setType(resourceType);
+			for (int i = 0; i < classes.size(); ++i)
+				staleSpawn->addClass(classes.get(i));
+			for (int i = 0; i < stfClasses.size(); ++i)
+				staleSpawn->addStfClass(stfClasses.get(i));
+			const int qualityValue = static_cast<int>(qualityFactor * 1000.f);
+			const String attributes[] = {"res_quality", "res_conductivity",
+				"res_decay_resist", "res_heat_resist", "res_flavor",
+				"res_malleability", "res_potential_energy",
+				"res_shock_resistance", "res_toughness", "res_cold_resist"};
+			for (int i = 0; i < 10; ++i)
+				staleSpawn->addAttribute(attributes[i], qualityValue);
+			staleSpawn->setSurveyToolType(surveyToolType);
+			staleSpawn->setContainerCRC(containerCrc);
+			staleSpawn->setSpawned(static_cast<uint64>(time(nullptr) - 2));
+			staleSpawn->setDespawned(static_cast<uint64>(time(nullptr) - 1));
+		}
+		{
+			Locker resourceLock(resource);
+			resource->setSpawnObject(staleSpawn);
+			resource->setQuantity(units);
+		}
+		AiEconomyManager* economyManager = AiEconomyManager::instance();
+		ManagedReference<SceneObject*> bag = economyManager == nullptr ? nullptr :
+			economyManager->getOrCreateItemBag(identityId);
+		bool transferred = false;
+		if (bag != nullptr) {
+			Locker resourceLock(resource);
+			Locker bagLock(bag, resource);
+			transferred = bag->transferObject(resource, -1, false, true);
+		}
+		if (!transferred) {
+			Locker resourceLock(resource);
+			resource->destroyObjectFromDatabase(true);
+			result.status = "FAIL";
+			result.failReason = "stale_stack_transfer_failed";
+			return true;
+		}
+		SimBotItemDeposit deposit;
+		deposit.objectId = resource->getObjectID();
+		deposit.templateCrc = resource->getServerObjectCRC();
+		{
+			Locker resourceLock(resource);
+			deposit.displayName = resource->getDisplayedName();
+		}
+		Vector<SimBotItemDeposit> deposits;
+		deposits.add(deposit);
+		if (!depositPlayerBotItem(identityId, deposits, "sample",
+				resource->getObjectID())) {
+			result.status = "FAIL";
+			result.failReason = "stale_stack_deposit_failed";
+			return true;
+		}
+		playerBotParityLastBazaarItemOid = resource->getObjectID();
 		result.status = "PASS";
 		return true;
 	}
@@ -33341,23 +34878,28 @@ bool SimPlayerManager::executePlayerBotParityStep(
 		return true;
 	}
 	if (op == "assertBodyMaxBound") {
-		int bodyCount = 0;
-		int maxBodies = 0;
+		int hunterCount = 0;
+		int artisanCount = 0;
+		int maxArtisans = 0;
 		{
 			Locker pveLock(&pveMutex);
-			// Mirror governPvePopulation: pveMaxHunters bounds the bodies the
-			// governor manages. Harness bodies live in the same map but are not
-			// part of that population, so counting them asserted something the
-			// governor does not control.
+			for (int i = 0; i < pveNoviceDistribution.size(); ++i) {
+				const PveNoviceDistribution& row = pveNoviceDistribution.get(i);
+				if (row.profession == "artisan")
+					maxArtisans += row.count;
+			}
 			for (int i = 0; i < pveIdentityBodyOids.size(); ++i) {
 				uint64 id = pveIdentityBodyOids.elementAt(i).getKey();
-				if (pveIdentities.contains(id) &&
-						isGovernorManagedIdentity(pveIdentities.get(id)))
-					++bodyCount;
+				if (!pveIdentities.contains(id) ||
+						!isGovernorManagedIdentity(pveIdentities.get(id)))
+					continue;
+				if (pveIdentities.get(id).profession == "artisan")
+					++artisanCount;
+				else
+					++hunterCount;
 			}
-			maxBodies = pveMaxHunters;
 		}
-		if (bodyCount > maxBodies) {
+		if (hunterCount > pveMaxHunters || artisanCount > maxArtisans) {
 			result.status = "FAIL";
 			result.failReason = "body_max_exceeded";
 			return true;
@@ -36861,12 +38403,20 @@ JSONSerializationType SimPlayerManager::getPlayerBotGroupingDashboard() {
 JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	// Keyed by identity id so the per-record row build below stays linear; the
 	// dashboard is polled every few seconds against a roster meant to grow.
+	int artisansLive = 0;
 	VectorMap<uint64, SimBotIdentity> roster;
 	VectorMap<uint64, uint64> bodyOids;
 	{
 		Locker pveLock(&pveMutex);
 		roster = pveIdentities;
 		bodyOids = pveIdentityBodyOids;
+		for (int i = 0; i < bodyOids.size(); ++i) {
+			uint64 identityId = bodyOids.elementAt(i).getKey();
+			if (bodyOids.elementAt(i).getValue() != 0 &&
+					roster.contains(identityId) &&
+					roster.get(identityId).profession == "artisan")
+				++artisansLive;
+		}
 	}
 
 	VectorMap<uint64, SimBotProgression> records;
@@ -36902,6 +38452,9 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	PlayerBotHarvestPolicy harvestPolicySnapshot;
 	PlayerBotResourceSupplySnapshot harvestSupplySnapshot;
 	Vector<PlayerBotHarvestRecord> harvestLastSnapshot;
+	PlayerBotSamplingPolicy samplingPolicySnapshot;
+	Vector<PlayerBotSampleRecord> samplingLastSnapshot;
+	int legacyMinersLive = 0;
 	int bazaarBuyPendingCount = 0;
 	uint64 itemVaultBagCount = 0;
 	uint64 itemVaultBagItemCount = 0;
@@ -36967,8 +38520,14 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 		Locker harvestLock(&progressionHarvestMutex);
 		harvestPolicySnapshot = progressionHarvestPolicy;
 		harvestSupplySnapshot = progressionHarvestSupply;
-	harvestLastSnapshot = progressionHarvestLastHarvests;
+		harvestLastSnapshot = progressionHarvestLastHarvests;
 	}
+	{
+		Locker samplingLock(&progressionSamplingMutex);
+		samplingPolicySnapshot = progressionSamplingPolicy;
+		samplingLastSnapshot = progressionSamplingLastSamples;
+	}
+	legacyMinersLive = countLegacyMinerControllers();
 	{
 		Locker groupingLock(&groupingMutex);
 		healingReadinessSnapshot = playerBotHealingReadiness;
@@ -37217,6 +38776,8 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	harvest["listingLoads"] = harvestListingLoads.get();
 	harvest["floorIncomplete"] = harvestFloorIncomplete.get();
 	harvest["floorAboveMax"] = harvestFloorAboveMax.get();
+	harvest["staleListed"] = harvestStaleListed.get();
+	harvest["staleDiscarded"] = harvestStaleDiscarded.get();
 	harvest["depositFailed"] = harvestDepositFailed.get();
 	harvest["simulationSkipped"] = harvestSimulationSkipped.get();
 	JSONSerializationType harvestUnitsByFamily = JSONSerializationType::object();
@@ -37272,6 +38833,71 @@ JSONSerializationType SimPlayerManager::getPlayerBotProgressionDashboard() {
 	}
 	harvest["lastHarvests"] = harvestLastJson;
 	result["harvest"] = harvest;
+
+	JSONSerializationType sampling = JSONSerializationType::object();
+	sampling["enabled"] = playerBotSamplingGateEnabled(0);
+	sampling["configured"] = progressionSamplingEnabled &&
+		samplingPolicySnapshot.maxRecentSamples > 0;
+	sampling["maxRecentSamples"] = samplingPolicySnapshot.maxRecentSamples;
+	sampling["xpGranted"] = samplingXpGranted.get();
+	sampling["toolsGranted"] = samplingToolsGranted.get();
+	sampling["artisansLive"] = artisansLive;
+	sampling["legacyMinersLive"] = legacyMinersLive;
+	sampling["legacyMinersRetired"] = samplingLegacyMinersRetired.get();
+	JSONSerializationType samplingResultsJson = JSONSerializationType::object();
+	for (int i = 0; i < PLAYER_BOT_SAMPLE_DISPOSITION_COUNT; ++i)
+		samplingResultsJson[playerBotSampleDispositionName(
+			static_cast<PlayerBotSampleDisposition>(i))] = samplingResults[i].get();
+	sampling["results"] = samplingResultsJson;
+	JSONSerializationType samplingUnitsJson = JSONSerializationType::object();
+	for (int toolClass = SimBotSampling::SOLAR;
+			toolClass <= SimBotSampling::INORGANIC; ++toolClass)
+		samplingUnitsJson[SimBotSampling::toolClassName(toolClass)] =
+			samplingUnitsByToolClass[toolClass].get();
+	sampling["unitsByToolClass"] = samplingUnitsJson;
+	JSONSerializationType heldToolsJson = JSONSerializationType::object();
+	for (int toolClass = SimBotSampling::SOLAR;
+			toolClass <= SimBotSampling::INORGANIC; ++toolClass) {
+		uint64 held = 0;
+		const char* templatePath = SimBotSampling::toolTemplate(toolClass);
+		const uint32 templateCrc = templatePath[0] == '\0' ? 0 :
+			String(templatePath).hashCode();
+		if (templateCrc == 0) {
+			heldToolsJson[SimBotSampling::toolClassName(toolClass)] = held;
+			continue;
+		}
+		for (int identityIndex = 0; identityIndex < itemRowsByIdentity.size();
+				++identityIndex) {
+			const Vector<SimBotItemRow>& rows =
+				itemRowsByIdentity.elementAt(identityIndex).getValue();
+			for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex)
+				if (rows.get(rowIndex).state == SIMBOT_ITEM_HELD &&
+						rows.get(rowIndex).templateCrc == templateCrc)
+					++held;
+		}
+		heldToolsJson[SimBotSampling::toolClassName(toolClass)] = held;
+	}
+	sampling["heldToolsByClass"] = heldToolsJson;
+	JSONSerializationType recentSamplesJson = JSONSerializationType::array();
+	for (int i = 0; i < samplingLastSnapshot.size(); ++i) {
+		const PlayerBotSampleRecord& record = samplingLastSnapshot.get(i);
+		JSONSerializationType row = JSONSerializationType::object();
+		row["identityId"] = record.identityId;
+		row["resource"] = record.resourceType;
+		row["toolClass"] = record.toolClass >= SimBotSampling::SOLAR &&
+			record.toolClass <= SimBotSampling::INORGANIC ?
+			String(SimBotSampling::toolClassName(record.toolClass)) : String();
+		row["units"] = record.units;
+		row["xp"] = record.xp;
+		row["result"] = playerBotSampleDispositionName(
+			static_cast<PlayerBotSampleDisposition>(record.disposition));
+		row["ageSeconds"] = record.recordedAtMs == 0 ? static_cast<uint64>(0) :
+			(nowMs > record.recordedAtMs ?
+			(nowMs - record.recordedAtMs) / 1000 : static_cast<uint64>(0));
+		recentSamplesJson.push_back(row);
+	}
+	sampling["lastSamples"] = recentSamplesJson;
+	result["sampling"] = sampling;
 
 	JSONSerializationType bazaar = JSONSerializationType::object();
 	bazaar["enabled"] = playerBotBazaarSellGateEnabled(0);
@@ -38525,7 +40151,7 @@ bool SimPlayerManager::mintPveIdentity(const String& requestedProfession,
 }
 
 void SimPlayerManager::mintPveIdentitiesIfNeeded() {
-	if (!pveRosterLoaded || !pveDatabaseAvailable || pveMaxHunters <= 0)
+	if (!pveRosterLoaded || !pveDatabaseAvailable)
 		return;
 
 	Vector<SimBotIdentity> identities;
@@ -38542,6 +40168,13 @@ void SimPlayerManager::mintPveIdentitiesIfNeeded() {
 		retiring = pveRetiringIdentityIds;
 		noviceEnabled = pveNoviceEnabled;
 	}
+	int artisanCapacity = 0;
+	for (int i = 0; i < distribution.size(); ++i) {
+		if (distribution.get(i).profession == "artisan")
+			artisanCapacity += distribution.get(i).count;
+	}
+	if (pveMaxHunters <= 0 && artisanCapacity <= 0)
+		return;
 
 	if (noviceEnabled) {
 		for (int i = 0; i < distribution.size(); ++i) {
@@ -38666,6 +40299,40 @@ bool SimPlayerManager::isPveHuntEligible(const SimBotIdentity& identity) const {
 		return false;
 	Locker pveLock(&pveMutex);
 	return pveHuntingProfessions.contains(identity.profession);
+}
+
+bool SimPlayerManager::isPveArtisanEligible(
+		const SimBotIdentity& identity) const {
+	if (identity.profession != "artisan" ||
+			isPlayerBotParityHarnessExempt(identity.id))
+		return false;
+	return progressionSamplingEnabled;
+}
+
+bool SimPlayerManager::isArtisanMinerResourceAllowed(
+		uint64 minerId, int surveyToolType) {
+	uint64 identityId = 0;
+	bool artisan = false;
+	{
+		Locker pveLock(&pveMutex);
+		if (pveBodyIdentityIds.contains(minerId)) {
+			identityId = pveBodyIdentityIds.get(minerId);
+			artisan = pveIdentities.contains(identityId) &&
+				pveIdentities.get(identityId).profession == "artisan";
+		}
+	}
+	if (!artisan)
+		return true;
+	// Targeting entries carry only the spawn's tool type, so an inorganic tool
+	// widens eligibility at sample time, never here.
+	VectorMap<int, bool> heldTools =
+		playerBotHeldSurveyToolClasses(identityId);
+	for (int i = 0; i < heldTools.size(); ++i) {
+		if (SimBotSampling::isSampleable(surveyToolType, false,
+				heldTools.elementAt(i).getKey()))
+			return true;
+	}
+	return false;
 }
 
 void SimPlayerManager::collectPvePlanReadyIds(
@@ -39406,15 +41073,12 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 		agent->setSimAlwaysActive(true);
 		agent->setSimPlayerBot(true);
 		// Presence-enabled bodies must carry PLAYER even when the optional
-		// client-dot presentation setting is disabled. ATTACKABLE is REQUIRED
-		// for two-way combat: AiAgent::isAttackableBy rejects any target whose
-		// pvpStatusBitmask lacks ATTACKABLE (AiAgentImplementation.cpp:6578), so
-		// without it a wild creature's inflictDamage never addDefender()s the
-		// hunter and the fight stays one-sided (no retaliation). The neutral
-		// (faction 0) hunter then passes the faction-0 AI-vs-AI checks. OVERT is
-		// a GCW flag the neutral hunter does not need (cf. the factioned sim
-		// combatants which use ATTACKABLE|OVERT).
-		applySimNpcPresentation(agent, ObjectFlag::PLAYER | ObjectFlag::ATTACKABLE);
+		// client-dot presentation setting is disabled. Combat hunters also need
+		// ATTACKABLE for two-way combat; artisans deliberately do not receive it
+		// because they are non-attackable gatherers.
+		const uint32 presentationFlags = identity.profession == "artisan" ?
+			ObjectFlag::PLAYER : ObjectFlag::PLAYER | ObjectFlag::ATTACKABLE;
+		applySimNpcPresentation(agent, presentationFlags);
 	}
 	for (int i = 0; i < spawnArmorCopies.size(); ++i) {
 		bool retained = false;
@@ -39493,7 +41157,8 @@ AiAgent* SimPlayerManager::spawnPveIdentityBody(const SimBotIdentity& identity,
 		// Register before setAITemplate(), which arms the first behaviour event.
 		SimCombatDiagLog::addTraced(bodyOid);
 		agent->setCustomAiMap((identity.profession == "harness" ?
-			String("simParityTest") : String("simHunter")).hashCode());
+			String("simParityTest") : identity.profession == "artisan" ?
+			String("simMiner") : String("simHunter")).hashCode());
 		agent->setAITemplate();
 		agent->clearPatrolPoints();
 	}
@@ -39765,8 +41430,142 @@ void SimPlayerManager::updatePveBodyLifecycles(uint64 nowMs) {
 	expirePvePresenceMembers(nowMs);
 }
 
+// Runs on the retiring miner's own task thread, after it reset itself; the
+// P.4.3 order clears the manager assignment before the teardown.
+bool SimPlayerManager::confirmLegacyMinerRetirement(uint64 oid) {
+	int legacyLive = 0;
+	int liveArtisanBodies = 0;
+	int targetLegacy = 0;
+	if (legacyMinerSurplus(legacyLive, liveArtisanBodies, targetLegacy))
+		return true;
+	// Stale request: the replacement artisan is gone or the gate closed.
+	uint64 expectedOid = oid;
+	legacyRetirementPendingOid.compare_exchange_strong(expectedOid, 0);
+	info("SimLegacyMinerRetirementCancelled body=" + String::valueOf(oid) +
+		" legacyLive=" + String::valueOf(legacyLive) +
+		" target=" + String::valueOf(targetLegacy), true);
+	return false;
+}
+
+void SimPlayerManager::completeLegacyMinerRetirement(AiAgent* agent) {
+	if (agent == nullptr)
+		return;
+	const uint64 oid = agent->getObjectID();
+	clearMinerIntelligentTargetAssignmentFromController(oid,
+		"legacyMinerRetired");
+	if (!controllers.contains(oid))
+		return;
+	toggleBot(agent);
+	uint64 expectedOid = oid;
+	legacyRetirementPendingOid.compare_exchange_strong(expectedOid, 0);
+	samplingLegacyMinersRetired.increment();
+	samplingLegacyMinersLive.set(countLegacyMinerControllers());
+	info("SimLegacyMinerRetired body=" + String::valueOf(oid) +
+		" legacyLive=" + String::valueOf(samplingLegacyMinersLive.get()), true);
+}
+
+int SimPlayerManager::countLegacyMinerControllers() {
+	int live = 0;
+	for (int i = 0; i < controllers.size(); ++i) {
+		Reference<SimPlayerController*> controller =
+			controllers.get(controllers.getKey(i));
+		SimMinerController* miner = controller == nullptr ? nullptr :
+			dynamic_cast<SimMinerController*>(controller.get());
+		if (miner != nullptr && miner->getRosterIdentityId() == 0)
+			++live;
+	}
+	samplingLegacyMinersLive.set(live);
+	return live;
+}
+
+int SimPlayerManager::countLiveSampledArtisanBodies() {
+	int live = 0;
+	Locker pveLock(&pveMutex);
+	for (int i = 0; i < pveIdentityBodyOids.size(); ++i) {
+		uint64 identityId = pveIdentityBodyOids.elementAt(i).getKey();
+		if (pveArtisanSampledIds.contains(identityId) &&
+				pveIdentities.contains(identityId) &&
+				pveIdentities.get(identityId).profession == "artisan")
+			++live;
+	}
+	return live;
+}
+
+// The one retirement rule, evaluated both when a request is issued and again
+// immediately before the teardown: retire only while the gate is on and more
+// legacy miners are live than sampled artisans have replaced.
+bool SimPlayerManager::legacyMinerSurplus(int& legacyLive, int& liveArtisanBodies,
+		int& targetLegacy) {
+	bool gate = false;
+	int artisanCapacity = 0;
+	{
+		Locker pveLock(&pveMutex);
+		gate = pveNoviceEnabled && pveRetireLegacyMiners;
+		for (int i = 0; i < pveNoviceDistribution.size(); ++i) {
+			const PveNoviceDistribution& row = pveNoviceDistribution.get(i);
+			if (row.profession == "artisan")
+				artisanCapacity += row.count;
+		}
+	}
+	legacyLive = countLegacyMinerControllers();
+	liveArtisanBodies = 0;
+	targetLegacy = legacyLive;
+	if (!gate || artisanCapacity <= 0)
+		return false;
+
+	int totalCount = 0;
+	for (int i = 0; i < spawnGroups.size(); ++i) {
+		if (spawnGroups.get(i).type.toLowerCase() == "miner")
+			totalCount += Math::max(0, spawnGroups.get(i).totalCount);
+	}
+	liveArtisanBodies = countLiveSampledArtisanBodies();
+	targetLegacy = Math::max(0, totalCount - liveArtisanBodies);
+	return legacyLive > targetLegacy;
+}
+
+void SimPlayerManager::retireOneLegacyMinerIfNeeded(uint64 nowMs) {
+	int legacyLive = 0;
+	int liveArtisanBodies = 0;
+	int targetLegacy = 0;
+	if (!legacyMinerSurplus(legacyLive, liveArtisanBodies, targetLegacy))
+		return;
+
+	// One retirement in flight: the request completes on the miner's thread.
+	const uint64 pendingOid = legacyRetirementPendingOid.load();
+	if (pendingOid != 0 && controllers.contains(pendingOid) &&
+			nowMs < legacyRetirementRequestedAtMs.load() + 600000)
+		return;
+	legacyRetirementPendingOid.store(0);
+	for (int i = 0; i < controllers.size(); ++i) {
+		uint64 oid = controllers.getKey(i);
+		Reference<SimPlayerController*> controller = controllers.get(oid);
+		SimMinerController* miner = controller == nullptr ? nullptr :
+			dynamic_cast<SimMinerController*>(controller.get());
+		if (miner == nullptr || miner->getRosterIdentityId() != 0)
+			continue;
+		miner->requestLegacyRetirement();
+		legacyRetirementPendingOid.store(oid);
+		legacyRetirementRequestedAtMs.store(nowMs);
+		info("SimLegacyMinerRetirementRequested body=" + String::valueOf(oid) +
+			" legacyLive=" + String::valueOf(legacyLive) +
+			" artisanBodies=" + String::valueOf(liveArtisanBodies) +
+			" target=" + String::valueOf(targetLegacy), true);
+		return;
+	}
+}
+
 void SimPlayerManager::governPvePopulation(uint64 nowMs) {
-	if (!pveHunterBotsEnabled || !pveWorldPresenceEnabled || pveMaxHunters <= 0)
+	int artisanCapacity = 0;
+	{
+		Locker pveLock(&pveMutex);
+		for (int i = 0; i < pveNoviceDistribution.size(); ++i) {
+			const PveNoviceDistribution& row = pveNoviceDistribution.get(i);
+			if (row.profession == "artisan")
+				artisanCapacity += row.count;
+		}
+	}
+	if (!pveHunterBotsEnabled || !pveWorldPresenceEnabled ||
+			(pveMaxHunters <= 0 && artisanCapacity <= 0))
 		return;
 	VectorMap<uint64, bool> groupingReserved;
 	snapshotPlayerBotGroupingReserved(groupingReserved);
@@ -39820,18 +41619,22 @@ void SimPlayerManager::governPvePopulation(uint64 nowMs) {
 	// distribution pass omitting the eligibility check that the general-fill
 	// pass applied. A single set makes the two passes structurally incapable of
 	// disagreeing; they now decide only ORDER, never membership.
-	VectorMap<uint64, bool> eligible;
+	VectorMap<uint64, bool> hunterEligible;
+	VectorMap<uint64, bool> artisanEligible;
 	int64 notReadyNow = 0;
 	for (int i = 0; i < roster.size(); ++i) {
 		const SimBotIdentity& identity = roster.get(i);
 		if (retiring.contains(identity.id))
 			continue;
-		if (groupingReserved.contains(identity.id) &&
+		if (identity.profession != "artisan" &&
+				groupingReserved.contains(identity.id) &&
 				isGovernorManagedIdentity(identity)) {
-			eligible.put(identity.id, true);
+			hunterEligible.put(identity.id, true);
 			continue;
 		}
-		if (!isPveHuntEligible(identity))
+		bool isArtisan = isPveArtisanEligible(identity);
+		bool isHunter = isPveHuntEligible(identity);
+		if (!isArtisan && !isHunter)
 			continue;
 		// A GAUGE, not a running total: this scan re-evaluates every planned
 		// identity each tick, so incrementing would report ticks x blocked
@@ -39840,25 +41643,37 @@ void SimPlayerManager::governPvePopulation(uint64 nowMs) {
 			++notReadyNow;
 			continue;
 		}
-		eligible.put(identity.id, true);
+		if (isArtisan)
+			artisanEligible.put(identity.id, true);
+		else
+			hunterEligible.put(identity.id, true);
 	}
 	pveBodySpawnRefusedNotReady = notReadyNow;
 
-	VectorMap<uint64, bool> desired;
+	VectorMap<uint64, bool> desiredHunters;
+	VectorMap<uint64, bool> desiredArtisans;
 	// Offers and grouped records are protected first. They remain in the
-	// governor's desired set even when the active cap is already full.
-	for (int i = 0; i < roster.size() && desired.size() < pveMaxHunters; ++i) {
+	// hunter pool's desired set even when the active cap is already full.
+	for (int i = 0; i < roster.size() &&
+			desiredHunters.size() < pveMaxHunters; ++i) {
 		const SimBotIdentity& identity = roster.get(i);
-		if (eligible.contains(identity.id) && groupingReserved.contains(identity.id))
-			desired.put(identity.id, true);
+		if (hunterEligible.contains(identity.id) &&
+				groupingReserved.contains(identity.id))
+			desiredHunters.put(identity.id, true);
 	}
-	// Novice distributions have first claim on the active set - ordering only.
+	// Novice distributions have first claim on their own pool - ordering only.
 	if (noviceEnabled) {
-		for (int d = 0; d < distribution.size() && desired.size() < pveMaxHunters; ++d) {
+		for (int d = 0; d < distribution.size(); ++d) {
 			const PveNoviceDistribution& row = distribution.get(d);
+			VectorMap<uint64, bool>& desired = row.profession == "artisan" ?
+				desiredArtisans : desiredHunters;
+			VectorMap<uint64, bool>& eligible = row.profession == "artisan" ?
+				artisanEligible : hunterEligible;
+			int poolCapacity = row.profession == "artisan" ?
+				artisanCapacity : pveMaxHunters;
 			int selected = 0;
 			for (int i = 0; i < roster.size() && selected < row.count &&
-					desired.size() < pveMaxHunters; ++i) {
+					desired.size() < poolCapacity; ++i) {
 				const SimBotIdentity& identity = roster.get(i);
 				if (eligible.contains(identity.id) &&
 						identity.profession == row.profession &&
@@ -39870,18 +41685,31 @@ void SimPlayerManager::governPvePopulation(uint64 nowMs) {
 			}
 		}
 	}
-	for (int i = 0; i < roster.size() && desired.size() < pveMaxHunters; ++i) {
+	for (int i = 0; i < roster.size() &&
+			desiredHunters.size() < pveMaxHunters; ++i) {
 		const SimBotIdentity& identity = roster.get(i);
-		if (!eligible.contains(identity.id) || desired.contains(identity.id))
+		if (!hunterEligible.contains(identity.id) ||
+			desiredHunters.contains(identity.id))
 			continue;
-		desired.put(identity.id, true);
+		desiredHunters.put(identity.id, true);
 	}
+	for (int i = 0; i < roster.size() &&
+			desiredArtisans.size() < artisanCapacity; ++i) {
+		const SimBotIdentity& identity = roster.get(i);
+		if (!artisanEligible.contains(identity.id) ||
+			desiredArtisans.contains(identity.id))
+			continue;
+		desiredArtisans.put(identity.id, true);
+	}
+	VectorMap<uint64, bool> desired = desiredHunters;
+	for (int i = 0; i < desiredArtisans.size(); ++i)
+		desired.put(desiredArtisans.elementAt(i).getKey(), true);
 
 	// Desired-active-set reconciliation drains at most one out-of-set body per
 	// tick, preferring an idle hunter so active combat is displaced last.
 	// Only bodies this governor would itself have spawned are eligible to be
-	// drained. The desired set is built from isPveHuntEligible, which excludes
-	// harness identities, so without this guard the reconciler would treat every
+	// drained. The desired set is built from the two pool predicates, which
+	// exclude harness identities, so without this guard the reconciler would treat every
 	// parity-test body as out-of-set and destroy it - breaking any scenario that
 	// relies on a body it spawned earlier (found by kill_xp_gate_off_no_award,
 	// LIVE_VERIFICATION run 20260906-162317).
@@ -39917,7 +41745,8 @@ void SimPlayerManager::governPvePopulation(uint64 nowMs) {
 		return;
 	}
 
-	int currentLiveBodyCount = 0;
+	int currentLiveHunterCount = 0;
+	int currentLiveArtisanCount = 0;
 	Vector<SimBotIdentity> candidates;
 	{
 		Locker pveLock(&pveMutex);
@@ -39925,20 +41754,42 @@ void SimPlayerManager::governPvePopulation(uint64 nowMs) {
 		// parity-harness bodies, which are outside this population budget -
 		// counting them would let test bodies starve production spawns.
 		for (int i = 0; i < pveIdentityBodyOids.size(); ++i) {
-			if (governorManaged.contains(
-					pveIdentityBodyOids.elementAt(i).getKey()))
-				++currentLiveBodyCount;
+			uint64 identityId = pveIdentityBodyOids.elementAt(i).getKey();
+			if (!governorManaged.contains(identityId))
+				continue;
+			for (int j = 0; j < roster.size(); ++j) {
+				if (roster.get(j).id != identityId)
+					continue;
+				if (roster.get(j).profession == "artisan")
+					++currentLiveArtisanCount;
+				else
+					++currentLiveHunterCount;
+				break;
+			}
 		}
-		for (int i = 0; i < roster.size() &&
-				candidates.size() < pveMaxHunters - currentLiveBodyCount; ++i) {
+		int hunterSlots = Math::max(0, pveMaxHunters - currentLiveHunterCount);
+		int artisanSlots = Math::max(0, artisanCapacity - currentLiveArtisanCount);
+		for (int i = 0; i < roster.size() && hunterSlots > 0; ++i) {
 			const SimBotIdentity& identity = roster.get(i);
-			if (!desired.contains(identity.id) ||
+			if (!desiredHunters.contains(identity.id) ||
 					pveIdentityBodyOids.contains(identity.id) ||
 					pveRetiringIdentityIds.contains(identity.id) ||
 					(pveRespawnDueAtMs.contains(identity.id) &&
 						pveRespawnDueAtMs.get(identity.id) > nowMs))
 				continue;
 			candidates.add(identity);
+			--hunterSlots;
+		}
+		for (int i = 0; i < roster.size() && artisanSlots > 0; ++i) {
+			const SimBotIdentity& identity = roster.get(i);
+			if (!desiredArtisans.contains(identity.id) ||
+					pveIdentityBodyOids.contains(identity.id) ||
+					pveRetiringIdentityIds.contains(identity.id) ||
+					(pveRespawnDueAtMs.contains(identity.id) &&
+						pveRespawnDueAtMs.get(identity.id) > nowMs))
+				continue;
+			candidates.add(identity);
+			--artisanSlots;
 		}
 	}
 
@@ -45972,6 +47823,19 @@ void SimPlayerManager::attachPveHunterController(
 		parity->startSimLoop();
 		return;
 	}
+	if (identity.profession == "artisan") {
+		SimMinerConfig artisanConfig;
+		{
+			Locker pveLock(&pveMutex);
+			artisanConfig = pveArtisanMinerConfig;
+		}
+		Reference<SimMinerController*> miner =
+			new SimMinerController(body, artisanConfig, identity.id);
+		controllers.put(bodyOid, miner.castTo<SimPlayerController*>());
+		body->activateAiBehavior(true);
+		miner->startSimLoop();
+		return;
+	}
 
 	Reference<SimHunterController*> hunter =
 		new SimHunterController(body, identity.id);
@@ -46238,6 +48102,7 @@ void SimPlayerManager::runPveFoundationMaintenanceTask() {
 	runPveSpikeIfNeeded(nowMs);
 	updatePveBodyLifecycles(nowMs);
 	governPvePopulation(nowMs);
+	retireOneLegacyMinerIfNeeded(nowMs);
 	runPveHunterMatchmaker(nowMs);
 	flushPveIdentityRoster(false);
 	flushPlayerBotProgressionStore(false);
@@ -56406,6 +58271,12 @@ bool SimPlayerManager::tryStationTravelForActivation(
     return true;
 }
 
+bool SimPlayerManager::tryStationTravelForArtisanBazaar(
+		uint64 minerId, const String& targetZone, const Vector3& target) {
+	return tryStationTravelForActivation(minerId, targetZone,
+		target.getX(), target.getY(), target.getZ());
+}
+
 // ---------------------------------------------------------------------------
 // P.4.5b: cross-planet miner dispatch (proportional rebalance, player-mimetic).
 // ---------------------------------------------------------------------------
@@ -60177,10 +62048,17 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
 		bool hasSelectedPlan = false;
 		bool usedCachedAssignment = false;
 		bool activationControlledSkip = false;
-		bool activationFailedOrFallback = false;
+        bool activationFailedOrFallback = false;
 		String activationResult = "not_attempted";
         MinerDensityTargetCandidate selectedDensityTarget;
         MinerIntelligentTargetAssignment cachedAssignment;
+        Vector<ResourceIntelligenceEntry> candidateEntries = entries;
+        for (int entryIndex = candidateEntries.size() - 1;
+                entryIndex >= 0; --entryIndex) {
+            if (!isArtisanMinerResourceAllowed(miner.objectID,
+                    candidateEntries.get(entryIndex).surveyToolType))
+                candidateEntries.remove(entryIndex);
+        }
         uint64 nowMs = System::getMiliTime();
 
 	        if (minerIntelligentTargetingAssignmentEnabled &&
@@ -60229,6 +62107,26 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
 	                        minerIntelligentTargetingAssignmentReplaceOnlyWhenExpiredOrInvalid;
 	                }
 	            }
+			if (usedCachedAssignment &&
+					cachedAssignment.targetResourceSurveyToolType == 0) {
+				for (int entryIndex = 0; entryIndex < entries.size();
+						++entryIndex) {
+					const ResourceIntelligenceEntry& entry = entries.get(entryIndex);
+					if (entry.objectID ==
+							cachedAssignment.targetResourceSpawnObjectId) {
+						cachedAssignment.targetResourceSurveyToolType =
+							entry.surveyToolType;
+						break;
+					}
+				}
+			}
+			if (usedCachedAssignment &&
+					!isArtisanMinerResourceAllowed(miner.objectID,
+						cachedAssignment.targetResourceSurveyToolType)) {
+				clearMinerIntelligentTargetAssignment(miner.objectID,
+					"heldToolUnavailable", minerIntelligentTargetingMode);
+				usedCachedAssignment = false;
+			}
 	        }
 
         if (usedCachedAssignment) {
@@ -60299,7 +62197,7 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
         } else {
             DemandWeightedPlanSelection demandSelection =
                 selectDemandWeightedMinerPlanForValidation(
-                    entries,
+	                    candidateEntries,
                     profiles,
                     pressureResults,
                     assignmentsByProfile,
@@ -60484,7 +62382,9 @@ void SimPlayerManager::logMinerIntelligentTargetingDecisions() {
                 // P.5.1: capture exact resource-spawn identity + stats so hive
                 // deposits record crafting-grade lots.
                 assignment.targetResourceSpawnObjectId = selectedResource.objectID;
-                assignment.targetResourceClassChain = selectedResource.classChain;
+				assignment.targetResourceClassChain = selectedResource.classChain;
+				assignment.targetResourceSurveyToolType =
+					selectedResource.surveyToolType;
                 // inShift = the spawn is currently active in the resource map;
                 // despawned is a future timestamp, not a boolean.
                 assignment.targetResourceActive = selectedResource.inShift;
@@ -63471,6 +65371,25 @@ void SimPlayerManager::runConfiguredSpawnTask(int groupIndex, int spawnIndex) {
     int gi = groupIndex;
     int ci = spawnIndex;
     int spawned = 0;
+	bool retireLegacyMiners = false;
+	int artisanCapacity = 0;
+	{
+		Locker pveLock(&pveMutex);
+		retireLegacyMiners = pveNoviceEnabled && pveRetireLegacyMiners;
+		for (int i = 0; i < pveNoviceDistribution.size(); ++i) {
+			const PveNoviceDistribution& row = pveNoviceDistribution.get(i);
+			if (row.profession == "artisan")
+				artisanCapacity += row.count;
+		}
+	}
+	int configuredMinerCount = 0;
+	if (retireLegacyMiners && artisanCapacity > 0) {
+		for (int i = 0; i < spawnGroups.size(); ++i) {
+			if (spawnGroups.get(i).type.toLowerCase() == "miner")
+				configuredMinerCount += Math::max(0,
+					spawnGroups.get(i).totalCount);
+		}
+	}
 
     while (gi < spawnGroups.size() && spawned < configuredSpawnBatchSize) {
         const SpawnGroup& g = spawnGroups.get(gi);
@@ -63480,6 +65399,21 @@ void SimPlayerManager::runConfiguredSpawnTask(int groupIndex, int spawnIndex) {
             ci = 0;
             continue;
         }
+
+		if (retireLegacyMiners && artisanCapacity > 0 &&
+				g.type.toLowerCase() == "miner" && configuredMinerCount > 0) {
+			const int legacyLive = countLegacyMinerControllers();
+			const int liveArtisanBodies = countLiveSampledArtisanBodies();
+			const int targetLegacy = Math::max(0,
+				configuredMinerCount - liveArtisanBodies);
+			// Once the target is full, advancing the task cursor without spawning
+			// is the retired-slot refill gate. If a non-retired miner later dies,
+			// legacyLive drops below target and the normal path is allowed to fill it.
+			if (legacyLive >= targetLegacy) {
+				++ci;
+				continue;
+			}
+		}
 
         ShuttleportLocation loc;
         if (!pickRandomShuttleport(loc))

@@ -37,6 +37,7 @@
 #include "server/zone/objects/creature/simplayer/SimBotConsumables.h"
 #include "server/zone/objects/creature/simplayer/SimBotHealing.h"
 #include "server/zone/objects/creature/simplayer/SimBotHarvest.h"
+#include "server/zone/objects/creature/simplayer/SimBotSampling.h"
 #include "server/zone/objects/creature/simplayer/SimBotGrouping.h"
 #include "server/zone/objects/creature/simplayer/SimBotGroupTactics.h"
 #include "server/zone/objects/creature/simplayer/SimBotGroupRally.h"
@@ -145,6 +146,16 @@ struct SimBotConsumablePolicy {
 // F_0.9.20 P.10q: Lua-owned values for the real Scout harvest path.  The
 // supply snapshot is intentionally separate; Phase 1 uses the deterministic
 // corpse fallback and Phase 2 can publish real held/listed demand here.
+struct PlayerBotStaleStackPolicy {
+	bool enabled = false;
+	float keepQualityFactor = 0.75f;
+	bool sellBelowThreshold = true;
+	bool discardWhenBagTight = true;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) const { return true; }
+};
+
 struct PlayerBotHarvestPolicy {
 	bool sell = true;
 	uint64 sellThresholdUnits = 10000;
@@ -155,6 +166,17 @@ struct PlayerBotHarvestPolicy {
 	int supplySnapshotSeconds = 300;
 	int maxListingLoadsPerSnapshot = 64;
 	int maxFloorLoadsPerVisit = 32;
+	PlayerBotStaleStackPolicy staleStacks;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotSamplingPolicy {
+	uint64 pricePerUnit[SimBotSampling::INORGANIC + 1] = {
+		0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3};
+	uint64 defaultPricePerUnit = 3;
+	int maxRecentSamples = 10;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -190,6 +212,19 @@ struct PlayerBotHarvestRecord {
 	String resourceType;
 	String densityBand;
 	SimBotHarvest::Family family = SimBotHarvest::NONE;
+	int units = 0;
+	int xp = 0;
+	int disposition = 0;
+
+	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
+	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
+};
+
+struct PlayerBotSampleRecord {
+	uint64 identityId = 0;
+	uint64 recordedAtMs = 0;
+	String resourceType;
+	int toolClass = 0;
 	int units = 0;
 	int xp = 0;
 	int disposition = 0;
@@ -872,6 +907,20 @@ enum PlayerBotHarvestDisposition {
 	PLAYER_BOT_HARVEST_DISPOSITION_COUNT
 };
 
+enum PlayerBotSampleDisposition {
+	PLAYER_BOT_SAMPLED = 0,
+	PLAYER_BOT_SAMPLE_GATE_OFF,
+	PLAYER_BOT_SAMPLE_NO_SKILL,
+	PLAYER_BOT_SAMPLE_NO_TOOL,
+	PLAYER_BOT_SAMPLE_NO_SPAWN,
+	PLAYER_BOT_SAMPLE_DENSITY_TOO_LOW,
+	PLAYER_BOT_SAMPLE_RATE_FAILED,
+	PLAYER_BOT_SAMPLE_TOO_FEW_UNITS,
+	PLAYER_BOT_SAMPLE_BAG_FAILED,
+	PLAYER_BOT_SAMPLE_CAP_REACHED,
+	PLAYER_BOT_SAMPLE_DISPOSITION_COUNT
+};
+
 enum PlayerBotLootDisposition {
 	PLAYER_BOT_LOOTED = 0,
 	PLAYER_BOT_LOOT_PARTIAL_CAP,
@@ -928,6 +977,7 @@ struct SimBotTrainingPlan {
 		bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
 	};
 	Vector<BuyListEntry> buyList;
+	Vector<String> surveyTools;
 
 	bool toBinaryStream(ObjectOutputStream* stream) const { return true; }
 	bool parseFromBinaryStream(ObjectInputStream* stream) { return true; }
@@ -1606,6 +1656,14 @@ struct PlayerBotParityTestStep {
 	uint64 corpseOid = 0;
 	String harvestFamily;
 	String harvestResourceType;
+	String sampleResourceName;
+	String sampleToolClass;
+	float sampleQualityFactor = 0.f;
+	bool hasSampleQualityFactor = false;
+	int expectedSampleUnits = -1;
+	bool hasExpectedSampleUnits = false;
+	int expectedSampleXp = -1;
+	bool hasExpectedSampleXp = false;
 	bool matchHarvestRecords = false;
 	int expectedHarvestUnits = -1;
 	bool hasExpectedHarvestUnits = false;
@@ -2034,6 +2092,7 @@ struct MinerIntelligentTargetAssignment {
 	// coarse conceptual label. 0 spawn id => degrade to conceptual-only.
 	uint64 targetResourceSpawnObjectId = 0;
 	String targetResourceClassChain;
+	int targetResourceSurveyToolType = 0;
 	bool targetResourceActive = true;
 	int targetResourceOq = -1;
 	int targetResourceCd = -1;
@@ -3329,6 +3388,9 @@ private:
 	uint64 nextMinerAssignmentGenerationId = 1;
 	Vector<ShuttleportLocation> allShuttleports;
 	Vector<SpawnGroup> spawnGroups;
+	SimMinerConfig pveArtisanMinerConfig;
+	VectorMap<String, bool> artisanBazaarNoTerminalCities;
+	Mutex artisanBazaarMutex;
 
 	// P.8 Phase 1: persistent PvE identity roster. The body maps are transient
 	// and are always copied before any agent is locked. pveMutex is deliberately
@@ -3337,6 +3399,10 @@ private:
 	VectorMap<uint64, SimBotIdentity> pveIdentities;
 	VectorMap<uint64, uint64> pveIdentityBodyOids;
 	VectorMap<uint64, uint64> pveBodyIdentityIds;
+	// Identity-scoped evidence that an artisan has completed at least one real
+	// PLAYER_BOT_SAMPLED disposition. It is copied before controller teardown
+	// and never read while an agent/assignment lock is held.
+	VectorMap<uint64, bool> pveArtisanSampledIds;
 	VectorMap<uint64, uint64> pveRespawnDueAtMs;
 	VectorMap<uint64, SimBotSpawnOverride> pveDeathSpawnOverrides;
 	VectorMap<uint64, bool> pveRetiringIdentityIds;
@@ -3442,12 +3508,20 @@ private:
 	bool progressionHarvestEnabled = false;
 	PlayerBotHarvestPolicy progressionHarvestPolicy;
 	Mutex progressionHarvestMutex;
+	bool progressionSamplingEnabled = false;
+	PlayerBotSamplingPolicy progressionSamplingPolicy;
+	Mutex progressionSamplingMutex;
+	// (identity << 8 | tool class) -> one-time survey tool grant receipt;
+	// loaded with the store, guarded by progressionMutex.
+	VectorMap<uint64, bool> progressionSurveyToolReceipts;
 	PlayerBotResourceSupplySnapshot progressionHarvestSupply;
 	VectorMap<uint64, PlayerBotResourceListingCacheEntry>
 		progressionHarvestListingCache;
 	Vector<PlayerBotHarvestRecord> progressionHarvestLastHarvests;
 	bool progressionHarvestSupplyTaskScheduled = false;
 	static const int progressionHarvestLastHarvestLimit = 32;
+	Vector<PlayerBotSampleRecord> progressionSamplingLastSamples;
+	static const int progressionSamplingLastSampleLimit = 100;
 	bool progressionLairTacticsEnabled = false;
 	bool progressionEarlyGameRealWeaponDamage = false;
 	bool progressionWeaponLoadout = false;
@@ -3790,6 +3864,14 @@ private:
 	AtomicLong harvestListingLoads;
 	AtomicLong harvestFloorIncomplete;
 	AtomicLong harvestFloorAboveMax;
+	AtomicLong harvestStaleListed;
+	AtomicLong harvestStaleDiscarded;
+	AtomicLong samplingXpGranted;
+	AtomicLong samplingToolsGranted;
+	AtomicLong samplingResults[PLAYER_BOT_SAMPLE_DISPOSITION_COUNT];
+	AtomicLong samplingUnitsByToolClass[SimBotSampling::INORGANIC + 1];
+	AtomicLong samplingLegacyMinersRetired;
+	AtomicLong samplingLegacyMinersLive;
 	AtomicLong progressionLedgerWritten;
 	AtomicLong progressionLedgerDropped;
 	AtomicLong progressionLedgerBalanceMismatch;
@@ -3973,6 +4055,14 @@ private:
 	bool playerBotParityTestHarvestGateOverride = false;
 	VectorMap<uint64, bool> playerBotParityHarvestGateScopedIds;
 	VectorMap<uint64, bool> playerBotParityHarvestGateValues;
+	bool playerBotParityTestSamplingGateOverrideActive = false;
+	bool playerBotParityTestSamplingGateOverride = false;
+	VectorMap<uint64, bool> playerBotParitySamplingGateScopedIds;
+	VectorMap<uint64, bool> playerBotParitySamplingGateValues;
+	bool playerBotParityTestStaleStacksGateOverrideActive = false;
+	bool playerBotParityTestStaleStacksGateOverride = false;
+	VectorMap<uint64, bool> playerBotParityStaleStacksGateScopedIds;
+	VectorMap<uint64, bool> playerBotParityStaleStacksGateValues;
 	// Harness-only threshold used by harvest_sell_threshold. It is identity
 	// scoped so the scenario can exercise a real listing without changing the
 	// live policy or any production bot's sell decision.
@@ -4177,6 +4267,7 @@ private:
 	Vector<String> pveHuntingProfessions;
 	bool pveNoviceEnabled = false;
 	bool pveRetireLegacyHunters = false;
+	bool pveRetireLegacyMiners = false;
 	String pveNoviceBodyTemplate;
 	// Optional spawn/grind city for planned novices (shuttleport name). Empty
 	// keeps each identity's own home city. Guarded by pveMutex.
@@ -4505,6 +4596,7 @@ private:
 	bool mintPveIdentity(const String& profession, SimBotIdentity& identityOut,
 		const String& trainingPlan = String());
 	bool isPveHuntEligible(const SimBotIdentity& identity) const;
+	bool isPveArtisanEligible(const SimBotIdentity& identity) const;
 	bool isGovernorManagedIdentity(const SimBotIdentity& identity) const;
 	bool isPlayerBotParityHarnessExempt(uint64 identityId) const;
 	void recordPlayerBotParityKillAward(uint64 identityId, uint64 victimOid,
@@ -4693,6 +4785,8 @@ private:
 	void releasePlayerBotCreditsLocked(uint64 identityId, const String& purpose);
 	bool playerBotLootGateEnabled(uint64 identityId);
 	bool playerBotHarvestGateEnabled(uint64 identityId);
+	bool playerBotSamplingGateEnabled(uint64 identityId);
+	bool playerBotStaleStacksGateEnabled(uint64 identityId);
 	bool playerBotMissionCreditGateEnabled(uint64 identityId);
 	bool playerBotBuffPaymentGateEnabled(uint64 identityId);
 	// Per-identity decision: the harness override applies only to identities in
@@ -4717,6 +4811,18 @@ private:
 	void restoreNoviceGateOverride();
 	void updatePveBodyLifecycles(uint64 nowMs);
 	void governPvePopulation(uint64 nowMs);
+	void retireOneLegacyMinerIfNeeded(uint64 nowMs);
+	// Written by the maintenance tick, cleared by the retiring miner's thread.
+	std::atomic<uint64> legacyRetirementPendingOid{0};
+	std::atomic<uint64> legacyRetirementRequestedAtMs{0};
+public:
+	bool confirmLegacyMinerRetirement(uint64 oid);
+	void completeLegacyMinerRetirement(AiAgent* agent);
+private:
+	int countLegacyMinerControllers();
+	bool legacyMinerSurplus(int& legacyLive, int& liveArtisanBodies,
+		int& targetLegacy);
+	int countLiveSampledArtisanBodies();
 	void runPveHunterMatchmaker(uint64 nowMs);
 	// F_0.9.8b: dispatches template-incomplete bots (see the definition).
 	void runPveProgressionDispatchPass(uint64 nowMs,
@@ -4734,6 +4840,8 @@ private:
 		Vector<uint64>& assignedIdentityIds);
 	void validatePveHuntGrounds();
 	void attachPveHunterController(const SimBotIdentity& identity, AiAgent* body);
+	bool isArtisanMinerResourceAllowed(uint64 minerId,
+		int surveyToolType);
 	bool resolvePveDeathSpawnOverride(uint64 bodyOid,
 		SimBotSpawnOverride& result);
 	// Planet and world position of a dead body, read under the corpse lock.
@@ -5395,6 +5503,11 @@ public:
 		SceneObject* terminal, int price);
 	bool listPlayerBotItemsAtTerminal(uint64 identityId, CreatureObject* body,
 		SceneObject* terminal);
+	bool resolveArtisanBazaarDestination(const String& planet,
+		const Vector3& origin, Vector3& cityPoint, Vector3& terminalPoint,
+		String& cityName);
+	bool tryStationTravelForArtisanBazaar(uint64 minerId,
+		const String& targetZone, const Vector3& target);
 	bool buyPlayerBotItemsAtTerminal(uint64 identityId, SceneObject* terminal);
 	bool shouldPlayerBotVisitBazaar(uint64 identityId);
 	bool beginPlayerBotBazaarVisit(uint64 identityId);
@@ -5425,9 +5538,27 @@ public:
 		int* xpOut = nullptr, SimBotHarvest::Family* familyOut = nullptr,
 		String* resourceTypeOut = nullptr, String* densityBandOut = nullptr,
 		String* corpseTemplateOut = nullptr);
+	PlayerBotSampleDisposition samplePlayerBotResource(uint64 identityId,
+		CreatureObject* body, const String& resourceName,
+		int* unitsOut = nullptr, int* xpOut = nullptr);
+	void recordPlayerBotSampleResult(uint64 identityId,
+		const String& resourceName, int toolClass,
+		PlayerBotSampleDisposition disposition, int units, int xp);
+	void recordPlayerBotArtisanSampledDisposition(uint64 identityId);
+	void ensurePlayerBotSurveyTools(uint64 identityId);
+	void broadcastPlayerBotSampleEffect(uint64 identityId, AiAgent* agent,
+		const String& resourceName);
+	bool grantPlayerBotSurveyToolForHarness(uint64 identityId, int toolClass);
+	static uint64 playerBotSurveyToolReceiptKey(uint64 identityId, int toolClass);
+	static int playerBotSurveyToolClassForTemplate(uint32 templateCrc);
+	void revokePlayerBotSurveyToolReceiptLocked(uint64 identityId, int toolClass);
+	void recordPlayerBotSurveyToolReceiptLocked(uint64 identityId, int toolClass,
+		const String& templatePath);
+	VectorMap<int, bool> playerBotHeldSurveyToolClasses(uint64 identityId);
 	bool depositPlayerBotResource(uint64 identityId, ResourceSpawn* spawn,
 		int units, bool* capReached = nullptr,
-		const String& zoneName = String());
+		const String& zoneName = String(),
+		const String& source = "harvest");
 	void recordPlayerBotHarvestResult(uint64 identityId, uint64 corpseOid,
 		PlayerBotHarvestDisposition disposition, int units = 0, int xp = 0,
 		SimBotHarvest::Family family = SimBotHarvest::NONE,

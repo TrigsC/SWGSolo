@@ -1321,6 +1321,7 @@
     const buffPayment = progression.buffPayment || {};
     const loot = progression.loot || {};
     const harvest = progression.harvest || {};
+    const sampling = progression.sampling || {};
     const bazaar = progression.bazaar || {};
     const bazaarBuy = bazaar.buy || {};
     const bazaarBuySkipped = bazaarBuy.skipped || {};
@@ -1503,8 +1504,22 @@
     };
     const attached = roster.filter((r) => r.bodyAttached).length;
     const active = roster.filter((r) => String(r.phase || "IDLE_HOME") !== "IDLE_HOME").length;
-    const rows = roster.map((r) => {
-      const phase = String(r.phase || "IDLE_HOME");
+    // Artisans run the miner controller, not the hunter phases: label them from
+    // the progression identity and their latest sample so they are findable.
+    const professionById = {};
+    (progression.identities || []).forEach((i) => { professionById[Number(i.identityId)] = i.profession; });
+    const lastSampleById = {};
+    (sampling.lastSamples || []).forEach((s) => { lastSampleById[Number(s.identityId)] = s; });
+    const isArtisan = (r) => (r.profession || professionById[Number(r.identityId)]) === "artisan";
+    const ordered = roster.slice().sort((a, b) =>
+      (b.bodyAttached === true) - (a.bodyAttached === true) ||
+      isArtisan(b) - isArtisan(a));
+    const rows = ordered.map((r) => {
+      const artisan = isArtisan(r);
+      const lastSample = lastSampleById[Number(r.identityId)];
+      const phase = artisan
+        ? (lastSample ? "SAMPLING " + String(lastSample.resource || "") : "ARTISAN")
+        : String(r.phase || "IDLE_HOME");
       const planet = String(r.posPlanet || "");
       const coords = [r.posX, r.posY, r.posZ].map(Number);
       const hasPosition = Boolean(planet) && coords.every((v) => Number.isFinite(v));
@@ -1540,8 +1555,8 @@
         ? `${chip(buffLabel, buffTone)}<span class="t-sub">${num(r.minBuffSecondsLeft)}s · ${esc(r.lastBuffSource || "none")}</span>`
         : `${chip("disabled", "ghost")}`;
       return `<tr>
-        <td><button type="button" class="playerbot-link" data-identity-id="${esc(r.identityId)}"><span class="t-main">${esc(name)}</span><span class="t-sub">${r.bodyAttached ? "body attached" : "identity only"}</span></button></td>
-        <td>${chip(labelize(phase), /HUNT|TRAVEL|RETREAT|MISSION/i.test(phase) ? "teal" : "ghost")}</td>
+        <td><button type="button" class="playerbot-link" data-identity-id="${esc(r.identityId)}"><span class="t-main">${esc(name)}</span><span class="t-sub">${artisan ? "artisan · " : ""}${r.bodyAttached ? "body attached" : "identity only"}</span></button></td>
+        <td>${chip(labelize(phase), /HUNT|TRAVEL|RETREAT|MISSION|SAMPLING/i.test(phase) ? "teal" : "ghost")}</td>
         <td class="wilds-offer">${offerLabel}</td>
         <td>${chip(lairAlive ? "alive" : "clear", lairAlive ? "amber" : "ghost")}</td>
         <td class="t-num wilds-waves">${esc(wavesLabel)}</td>
@@ -1614,6 +1629,8 @@
             ${metric("Units", harvest.units, { tone: "accent" })}
             ${metric("Scout XP", harvest.xpGranted, { tone: "teal" })}
             ${metric("Listings", harvest.listingsCreated)}
+            ${metric("Stale listed", harvest.staleListed)}
+            ${metric("Stale discarded", harvest.staleDiscarded)}
             ${metric("Deposit failed", harvest.depositFailed, { tone: Number(harvest.depositFailed || 0) ? "warn" : "" })}
             ${metric("Skipped legacy", harvest.simulationSkipped)}
           </div>${kvRows([
@@ -1622,6 +1639,20 @@
             ["Snapshot", `${num(harvest.snapshotAgeSeconds)}s old · ${num(harvest.listingLoads)} listing loads · ${num(harvest.floorIncomplete)} floor incomplete · ${num(harvest.floorAboveMax)} floor above max`],
             ["Results", Object.entries(harvest.results || {}).map(([key, value]) => `${labelize(key)} ${num(value)}`).join(" · ") || "none"],
             ["Recent", (harvest.lastHarvests || []).slice(-5).reverse().map((entry) => `${esc(entry.corpseTemplate || "corpse")} · ${esc(labelize(entry.family || "none"))} · ${num(entry.units)} units · ${num(entry.xp)} XP · ${ago(entry.ageSeconds)}`).join("<br>") || "none"]
+          ])}`, "span-12")}
+          ${panel("SAMPLING", `${chip(sampling.configured ? "configured" : "config off", sampling.configured ? "ok" : "ghost")} ${chip(sampling.enabled ? "gate on" : "gate off", sampling.enabled ? "ok" : "ghost")}`, `<div class="metric-row">
+            ${metric("Artisans live", sampling.artisansLive)}
+            ${metric("Legacy miners", sampling.legacyMinersLive)}
+            ${metric("Legacy retired", sampling.legacyMinersRetired)}
+            ${metric("Sampled", (sampling.results || {}).sampled, { tone: "accent" })}
+            ${metric("Units", Object.values(sampling.unitsByToolClass || {}).reduce((a, v) => a + Number(v || 0), 0), { tone: "teal" })}
+            ${metric("XP", sampling.xpGranted, { tone: "teal" })}
+            ${metric("Tools granted", sampling.toolsGranted)}
+          </div>${kvRows([
+            ["Results", Object.entries(sampling.results || {}).map(([key, value]) => `${labelize(key)} ${num(value)}`).join(" · ") || "none"],
+            ["Units by tool", Object.entries(sampling.unitsByToolClass || {}).map(([key, value]) => `${labelize(key)} ${num(value)}`).join(" · ") || "none"],
+            ["Held tools", Object.entries(sampling.heldToolsByClass || {}).map(([key, value]) => `${labelize(key)} ${num(value)}`).join(" · ") || "none"],
+            ["Recent", (sampling.lastSamples || []).slice(-10).reverse().map((entry) => `${esc(entry.resource || "resource")} · ${esc(labelize(entry.toolClass || "none"))} · ${labelize(entry.result || "unknown")} · ${num(entry.units)} units · ${num(entry.xp)} XP · ${ago(entry.ageSeconds)}`).join("<br>") || "none"]
           ])}`, "span-12")}
           <div class="section-gap"></div>
           ${panel("BAZAAR", `${chip(bazaar.configured ? "configured" : "config off", bazaar.configured ? "ok" : "ghost")} ${chip(bazaar.enabled ? "gate on" : "gate off", bazaar.enabled ? "ok" : "ghost")} ${bazaar.settlementMode ? chip("settlement mode", "amber") : ""}`, `<div class="metric-row">

@@ -18,6 +18,7 @@
 #include "server/zone/objects/player/sui/listbox/SuiListBox.h"
 #include "server/zone/objects/player/sessions/survey/SurveySession.h"
 #include "server/zone/managers/stringid/StringIdManager.h"
+#include "server/zone/managers/resource/resourcespawner/ResourceSampleYield.h"
 
 ResourceSpawner::ResourceSpawner(ManagedReference<ZoneServer*> serv,
 		ZoneProcessServer* impl) {
@@ -957,7 +958,22 @@ void ResourceSpawner::sendSampleResults(TransactionLog& trx, CreatureObject* pla
 
 	String zoneName = zne->getZoneName();
 
-	// If density is too low, we can't obtain a sample
+	ResourceSampleYield::Input sampleInput;
+	sampleInput.density = density;
+	sampleInput.surveySkill = player->getSkillMod("surveying");
+	sampleInput.sampleRateMod = player->getSkillMod("private_spec_samplerate");
+	sampleInput.sampleSizeMod = player->getSkillMod("private_spec_samplesize");
+	sampleInput.samplingMultiplier = samplingMultiplier;
+	sampleInput.gamble = session->tryGamble();
+	Coordinate* richSampleLocation = session->getRichSampleLocation();
+	sampleInput.richRateBypass = richSampleLocation != nullptr;
+	sampleInput.richLocationPresent = richSampleLocation != nullptr &&
+		richSampleLocation->getPosition() != Vector3(0, 0, 0);
+	sampleInput.richInRange = sampleInput.richLocationPresent &&
+		player->getDistanceTo(richSampleLocation) < 10;
+
+	// If density is too low, we can't obtain a sample.  Keep this branch ahead
+	// of the first random draw, exactly as the stock path does.
 	if (density < .10f) {
 		StringIdChatParameter message("survey", "efficiency_too_low");
 		message.setTO(resname);
@@ -967,10 +983,8 @@ void ResourceSpawner::sendSampleResults(TransactionLog& trx, CreatureObject* pla
 		return;
 	}
 
-	// Lower skill levels mean you can't sample lower concetrations
-	int surveySkill = player->getSkillMod("surveying");
-
-	if ((density * 100) < (32 - ((surveySkill / 20) * 6)) || density < .10) {
+	// Lower skill levels mean you can't sample lower concentrations.
+	if (!ResourceSampleYield::densityPasses(sampleInput)) {
 		StringIdChatParameter message("survey", "density_below_threshold");
 		message.setTO(resname);
 		player->sendSystemMessage(message);
@@ -979,12 +993,11 @@ void ResourceSpawner::sendSampleResults(TransactionLog& trx, CreatureObject* pla
 		return;
 	}
 
-	Coordinate* richSampleLocation = session->getRichSampleLocation();
-
-	float sampleRate = (surveySkill * density) + System::random(100) + player->getSkillMod("private_spec_samplerate");
+	sampleInput.roll100 = System::random(100);
+	float sampleRate = ResourceSampleYield::sampleRate(sampleInput);
 
 	// Was the sample successful or not
-	if (!session->tryGamble() && richSampleLocation == nullptr && sampleRate < 40) {
+	if (!sampleInput.gamble && richSampleLocation == nullptr && sampleRate < 40) {
 		StringIdChatParameter message("survey", "sample_failed");
 		message.setTO(resname);
 		player->sendSystemMessage(message);
@@ -992,42 +1005,43 @@ void ResourceSpawner::sendSampleResults(TransactionLog& trx, CreatureObject* pla
 		return;
 	}
 
-	int maxUnitsExtracted = (int) (density * (25 + System::random(3)));
+	// The max-unit draw precedes the gamble draw in the stock method.
+	sampleInput.roll3 = System::random(3);
+	if (sampleInput.gamble)
+		sampleInput.gambleRoll = System::random(2);
+	ResourceSampleYield::Result sample =
+		ResourceSampleYield::calculate(sampleInput);
+	if (sample.outcome == ResourceSampleYield::RATE_FAILED) {
+		StringIdChatParameter message("survey", "sample_failed");
+		message.setTO(resname);
+		player->sendSystemMessage(message);
+		trx.abort() << message.toString();
+		return;
+	}
 
-	float cityMultiplier = 1.f + player->getSkillMod("private_spec_samplesize") / 100.f;
-
-	int unitsExtracted = maxUnitsExtracted * (float(surveySkill) / 100.0f) * samplingMultiplier * cityMultiplier;
-	int xpcap = 40;
-
-	if (session->tryGamble()) {
-		if (System::random(2) == 1) {
+	if (sampleInput.gamble) {
+		if (sampleInput.gambleRoll == 1) {
 			player->sendSystemMessage("@survey:gamble_success");
-			unitsExtracted *= 5;
 		} else {
 			player->sendSystemMessage("@survey:gamble_fail");
 		}
 		session->clearGamble();
-		xpcap = 50;
 	}
 
-	if (richSampleLocation != nullptr && richSampleLocation->getPosition() != Vector3(0, 0, 0)) {
-		if (player->getDistanceTo(richSampleLocation) < 10) {
+	if (sampleInput.richLocationPresent) {
+		if (sampleInput.richInRange) {
 			player->sendSystemMessage("@survey:node_recovery");
-			unitsExtracted *= 5;
-
 		} else {
 			player->sendSystemMessage("@survey:node_not_close");
 		}
-
 		session->clearRichSampleLocation();
-		xpcap = 50;
 	}
 
-	if (unitsExtracted < 2) {
+	if (sample.outcome == ResourceSampleYield::TOO_FEW_UNITS) {
 		// Send message to player about trace amounts
 		StringIdChatParameter message("survey", "trace_amount");
 		message.setTO(resname);
-		message.setDI(unitsExtracted);
+		message.setDI(sample.units);
 		player->sendSystemMessage(message);
 		trx.abort() << message.toString();
 		return;
@@ -1036,7 +1050,7 @@ void ResourceSpawner::sendSampleResults(TransactionLog& trx, CreatureObject* pla
 	// Send message to player about unit extraction
 	StringIdChatParameter message("survey", "sample_located");
 	message.setTO(resname);
-	message.setDI(unitsExtracted);
+	message.setDI(sample.units);
 	player->sendSystemMessage(message);
 
 	// We need the spawn object to track extraction
@@ -1044,19 +1058,18 @@ void ResourceSpawner::sendSampleResults(TransactionLog& trx, CreatureObject* pla
 
 	Locker clocker(resourceSpawn, player);
 
-	resourceSpawn->extractResource(zoneName, unitsExtracted);
+	resourceSpawn->extractResource(zoneName, sample.units);
 
-	int xp = (int) (((float) unitsExtracted / (float) maxUnitsExtracted)
-			* xpcap);
 	ManagedReference<PlayerManager*> playerManager = server->getPlayerManager();
 
 	if (playerManager != nullptr)
-		playerManager->awardExperience(player, "resource_harvesting_inorganic", xp, true);
+		playerManager->awardExperience(player, "resource_harvesting_inorganic",
+			sample.xp, true);
 
-	addResourceToPlayerInventory(trx, player, resourceSpawn, unitsExtracted);
+	addResourceToPlayerInventory(trx, player, resourceSpawn, sample.units);
 
 	player->notifyObservers(ObserverEventType::SAMPLE, resourceSpawn, density * 100);
-	player->notifyObservers(ObserverEventType::SAMPLETAKEN, resourceSpawn, unitsExtracted);
+	player->notifyObservers(ObserverEventType::SAMPLETAKEN, resourceSpawn, sample.units);
 
 	if (resourceSpawn->isType("radioactive")) {
 		int wound = int((sampleRate / 30) - System::random(7));
